@@ -922,6 +922,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-gputest"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_sys",
+ "tapuwae",
+ "valhall",
+]
+
+[[package]]
 name = "ferros-payload-hangtest"
 version = "0.1.0"
 
@@ -3015,6 +3025,7 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "libm",
+ "valhall",
  "vsf 0.10.2",
 ]
 

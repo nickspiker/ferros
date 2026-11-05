@@ -246,18 +246,19 @@ fn ssa_test(grants: u64, arena: usize) -> ! {
     let cr = F::from_u32(px) * step + x0;
     let ci = F::from_u32(py) * step + y0;
     let z = F::splat(0.);
-    let (_, _, kf, _, _) = ssa::iterate(
+    // The tail freezes a stopped invocation's state (valhall::ssa::iterate: the stopping pass runs the tail too).
+    let (_, _, kf, _, _, _) = ssa::iterate(
         MAX_ITER,
-        (z, z, F::splat(0.), z, z),
-        |_, (zx, zy, kf, _, _)| {
+        (z, z, F::splat(0.), z, z, ssa::M::splat(true)),
+        |_, (zx, zy, kf, _, _, _)| {
             let (x2, y2) = (zx * zx, zy * zy);
             let running = !(x2 + y2).gt(F::splat(4.));
-            ((zx, zy, kf, x2, y2), running)
+            ((zx, zy, kf, x2, y2, running), running)
         },
-        |_, (zx, zy, kf, x2, y2)| {
+        |_, (zx, zy, kf, x2, y2, running)| {
             let nzy = (zx + zx) * zy + ci;
             let nzx = (x2 - y2) + cr;
-            (nzx, nzy, kf + 1., x2, y2)
+            (F::select(running, nzx, zx), F::select(running, nzy, zy), F::select(running, kf + 1., kf), x2, y2, running)
         },
     );
     ssa::store(0, 2, 0, kf.to_u32());
@@ -282,6 +283,61 @@ fn ssa_test(grants: u64, arena: usize) -> ! {
     }
     let (fg, fgot, fwant) = first.unwrap_or((0, 0, 0));
     say!(grants, "gputest: ssa mandelbrot: {} words, 64 registers {}, status {}, job {} us; {wrong} of {PIXELS} differ (first gid {fg}: {fgot} vs {fwant})\n", compiled.words.len(), compiled.regs64, reply.0, reply.1);
+    exit(0);
+}
+
+/// tapuwae's attest button, quick pass, on the GPU (tapuwae::gpu::button_quick_kernel, its own shading recorded through valhall::ssa) against the CPU's render_button_pack16 (k = 1), every pixel of the 900-pixel square (r = 448, as ahau draws it).
+fn ball_test(grants: u64, arena: usize) -> ! {
+    use tapuwae::{Look, Params};
+    let salt = *b"ferros gputest: the attest ball.";
+    let p = Params::new_placed(&salt, "handle", true);
+    let look = Look::attest();
+    let r = 448f32;
+    let side = 2 * r as usize + 4;
+    let px = side * side;
+    let t0 = ferros_sys::now();
+    let compiled = tapuwae::gpu::button_quick_kernel(r, &p, &look);
+    let compile_us = ferros_sys::us_since(t0);
+    for (i, &w) in compiled.words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+    }
+    let (gpu_out, cpu_out) = (4 << 20, 16 << 20);
+    for i in 0..px {
+        unsafe { core::ptr::write_volatile((arena + gpu_out + 8 * i) as *mut u64, u64::MAX) };
+    }
+    let preload = 0x1000u16 | if compiled.regs64 { 0x8000 } else { 0 };
+    let groups = px.div_ceil(16) as u32;
+    let reply = run_with(grants, compiled.words.len(), groups, preload, &[ARENA_VA + gpu_out as u64]);
+    let t1 = ferros_sys::now();
+    let cpu = unsafe { core::slice::from_raw_parts_mut((arena + cpu_out) as *mut u64, px) };
+    // The CPU writes only the disc's bounding square (from row and column 1): the rest must start as the GPU leaves it, 0.
+    cpu.fill(0);
+    let c = side as f32 * 0.5;
+    tapuwae::render_button_pack16(cpu, side, c, c, r, &p, &look, 1, (0, 1), &|| false);
+    let cpu_us = ferros_sys::us_since(t1);
+    let (mut same, mut near, mut far, mut worst) = (0u32, 0u32, 0u32, 0u32);
+    let mut first_far = None;
+    for i in 0..px {
+        let g = unsafe { core::ptr::read_volatile((arena + gpu_out + 8 * i) as *const u64) };
+        let w = cpu[i];
+        if g == w {
+            same += 1;
+            continue;
+        }
+        let d = (0..4).map(|ch| ((g >> (16 * ch)) as u16 as i32 - (w >> (16 * ch)) as u16 as i32).unsigned_abs()).max().unwrap_or(0);
+        worst = worst.max(d);
+        if d <= 64 {
+            near += 1;
+        } else {
+            far += 1;
+            first_far.get_or_insert(i);
+            if far <= 4 {
+                say!(grants, "gputest: ball: far at ({}, {}): GPU G#{g:016X}, CPU G#{w:016X}\n", i % side, i / side);
+            }
+        }
+    }
+    say!(grants, "gputest: ball: {} words, 64 registers {}, {} nodes ({} kept, peak {} registers), compiled in {compile_us} us; GPU job status {} in {} us, CPU {cpu_us} us\n", compiled.words.len(), compiled.regs64, compiled.nodes, compiled.kept, compiled.peak, reply.0, reply.1);
+    say!(grants, "gputest: ball: of {px} pixels {same} identical, {near} within 64 of 16384 a channel, {far} further (worst {worst}, the first further at {})\n", first_far.map_or(-1, |i| i as i64));
     exit(0);
 }
 /// One run through the service: the code at arena offset 0, `groups` workgroups of 16, preload r60 (the global id X).
@@ -336,6 +392,10 @@ extern "C" fn gputest_main(grants: u64, input: u64, input_len: u64) -> ! {
     // Input byte 1: the ops test (the builder's new instructions); none: the Mandelbrot.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 1 {
         ops_test(grants, arena);
+    }
+    // Input byte 3: tapuwae's attest ball (quick pass) on the GPU against the CPU.
+    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 3 {
+        ball_test(grants, arena);
     }
     // Input byte 2: the Mandelbrot recorded through valhall::ssa.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 2 {

@@ -4,7 +4,7 @@
 //! A recorded program has one shape: straight-line code, at most one loop at a time (no nesting) whose carried state is a `Copy` value made only of handles, and stores at the end.
 //!
 //! # The loop
-//! [`iterate`] records the loop body once. On the CPU the same hook runs `head`, leaves when no lane is still running, then runs `tail`; here both are recorded, and each carried value becomes `select(running, after tail, after head)`, which gives the values a break would have left with no branch but the backward one (the form the device ran for the Mandelbrot).
+//! [`iterate`] records the loop body once. On the CPU the same hook runs `head`, leaves when no lane is still running, then runs `tail`; here both are recorded and the tail runs on the pass that stops too, leaving the state as it was for an invocation that stopped (the several-lane code's own selects), which gives the values a break would have left with no branch but the backward one (the form the device ran for the Mandelbrot).
 //!
 //! # Registers
 //! Linear scan over the program order, a value's register freed after its last use; a value defined before the loop and used in it lives to the loop's end; the loop's carried values (its phis) keep one register each for the whole loop.
@@ -348,7 +348,8 @@ impl Shr<u32> for U {
     }
 }
 
-/// The loop hook, recorded: `head` then `tail` once each over phis for every handle in `init`, then each carried value `select(running, after tail, after head)`; round again while running and fewer than `max` passes. `head` and `tail` get the pass number as an f32. Returns the state the loop leaves with.
+/// The loop hook, recorded: `head` then `tail` once each over phis for every handle in `init`; each carried value takes what `tail` left; round again while running and fewer than `max` passes. `head` and `tail` get the pass number as an f32. Returns the state the loop leaves with.
+/// `tail` must leave a stopped invocation's state unchanged (select on `running`, as code written for several lanes does with `live`): the pass that stops runs the tail too, and leaves with what it returns.
 /// `S` must be made of handles only ([`F`], [`M`], [`U`], in tuples, arrays or structs of them): it is read and written as a row of `u32`s.
 pub fn iterate<S: Copy>(max: u32, init: S, head: impl FnOnce(F, S) -> (S, M), tail: impl FnOnce(F, S) -> S) -> S {
     let words = core::mem::size_of::<S>() / 4;
@@ -371,8 +372,8 @@ pub fn iterate<S: Copy>(max: u32, init: S, head: impl FnOnce(F, S) -> (S, M), ta
     push(Op::LoopHead);
     let (after_head, running) = head(n, from_ids(&phis));
     let after_tail = tail(n, after_head);
-    let (h, t) = (as_ids(&after_head), as_ids(&after_tail));
-    let updates: Vec<u32> = (0..words).map(|i| push(Op::Sel(running.0, t[i], h[i]))).collect();
+    // The tail leaves a stopped invocation's state as it was (its own selects on `running`, as tapuwae's several-lane code freezes a stopped lane), so its output is the update: no select here, and no second copy of the state alive to the loop's end (it ran the register file out on the attest mark, 2026-11-05).
+    let updates: Vec<u32> = as_ids(&after_tail);
     let n1 = n + 1.;
     let more = n1.lt(F::splat(max as f32));
     let cont = running & more;
@@ -385,26 +386,56 @@ pub fn iterate<S: Copy>(max: u32, init: S, head: impl FnOnce(F, S) -> (S, M), ta
     from_ids(&phis)
 }
 
-/// The compiled kernel: its words, and whether it asks for 64 registers a thread.
+/// The compiled kernel: its words, whether it asks for 64 registers a thread, and what it took (nodes recorded, nodes live after dead code goes, the most registers live at once).
 pub struct Compiled {
     pub words: Vec<u64>,
     pub regs64: bool,
+    pub nodes: usize,
+    pub kept: usize,
+    pub peak: usize,
 }
 
-const POOL: u8 = 57;
+/// The value registers: r0-r53. r54-r56 take constants at their uses, r57 the loop head's write, r58:r59 the store address, r60:r61 the global id (preloaded).
+const POOL: u8 = 54;
+const CONST_REGS: [u8; 3] = [54, 55, 56];
 const SCRATCH: u8 = 57;
 const ADDR: u8 = 58;
 
-/// The recording to Valhall words; the recording ends. Panics if the program needs more than the 57 registers the pool holds (no spilling yet).
+/// The recording to Valhall words; the recording ends.
+/// Dead code goes first (the recorder runs every block `any()` guards; what reaches no store and no loop state is dropped). Constants hold no register: each use loads its constant into r54-r56 just before the instruction, so a constant made once and used everywhere costs no register across the kernel.
+/// Panics if the program still needs more value registers than r0-r53 (no spilling yet), naming how many it needed.
 pub fn compile() -> Compiled {
     let rec = unsafe { (*(&raw mut REC)).take().expect("valhall::ssa: compile without begin") };
     let nodes = &rec.nodes;
     let n = nodes.len();
-    // Each node's last use; a loop stretches it.
+    let is_const = |i: u32| matches!(nodes[i as usize], Op::Const(_));
+    // Dead code: live from the stores, the loop ends' conditions and every loop's state, backwards.
+    let mut keep = alloc::vec![false; n];
+    for (i, op) in nodes.iter().enumerate() {
+        if matches!(op, Op::Store { .. } | Op::LoopHead | Op::LoopEnd(_)) {
+            keep[i] = true;
+        }
+    }
+    for l in &rec.loops {
+        for &(phi, upd) in &l.carried {
+            keep[phi as usize] = true;
+            keep[upd as usize] = true;
+        }
+    }
+    for i in (0..n).rev() {
+        if keep[i] {
+            nodes[i].sources(|s| keep[s as usize] = true);
+        }
+    }
+    // Each kept node's last use (constants have no register, so none); a loop stretches it.
     let mut last = alloc::vec![0usize; n];
     for (i, op) in nodes.iter().enumerate() {
-        op.sources(|s| last[s as usize] = last[s as usize].max(i));
+        if keep[i] {
+            op.sources(|s| last[s as usize] = last[s as usize].max(i));
+        }
     }
+    // An update that may take its phi's register (written after the phi's last read in the loop).
+    let mut coalesce: Vec<Option<u32>> = alloc::vec![None; n];
     let (mut head_at, mut loop_no) = (None, 0usize);
     for (i, op) in nodes.iter().enumerate() {
         match op {
@@ -412,28 +443,47 @@ pub fn compile() -> Compiled {
             Op::LoopEnd(_) => {
                 let h = head_at.take().expect("valhall::ssa: a loop end without its head");
                 for &(phi, upd) in &rec.loops[loop_no].carried {
+                    // The phi's last read inside the loop, before it is stretched to the end: its update may take its register after it (coalescing).
+                    let mut inner = h;
+                    for j in h..i {
+                        if keep[j] {
+                            nodes[j].sources(|s| {
+                                if s == phi {
+                                    inner = j;
+                                }
+                            });
+                        }
+                    }
+                    if upd != phi && (upd as usize) > h && (upd as usize) < i && !is_const(upd) && inner <= upd as usize {
+                        coalesce[upd as usize] = Some(phi);
+                    }
                     last[phi as usize] = last[phi as usize].max(i);
                     last[upd as usize] = last[upd as usize].max(i);
                 }
                 // A value from before the loop used inside it lives to the loop's end.
                 for j in h..i {
-                    nodes[j].sources(|s| {
-                        if (s as usize) < h {
-                            last[s as usize] = last[s as usize].max(i);
-                        }
-                    });
+                    if keep[j] {
+                        nodes[j].sources(|s| {
+                            if (s as usize) < h {
+                                last[s as usize] = last[s as usize].max(i);
+                            }
+                        });
+                    }
                 }
                 loop_no += 1;
             }
             _ => {}
         }
     }
-    // Registers: linear scan.
+    // Registers: linear scan over the kept nodes that hold a value (constants and the global id excepted).
     let mut reg = alloc::vec![u8::MAX; n];
     let mut free: Vec<u8> = (0..POOL).rev().collect();
     let mut live: Vec<(usize, u8)> = Vec::new();
-    let mut high = 0u8;
+    let (mut high, mut peak) = (0u8, 0usize);
     for (i, op) in nodes.iter().enumerate() {
+        if !keep[i] {
+            continue;
+        }
         live.retain(|&(end, r)| {
             if end < i {
                 free.push(r);
@@ -444,27 +494,52 @@ pub fn compile() -> Compiled {
         });
         if matches!(op, Op::Gid) {
             reg[i] = 60;
-        } else if op.has_value() {
-            let r = free.pop().expect("valhall::ssa: out of registers (no spilling yet)");
+        } else if let Some(phi) = coalesce[i] {
+            // The phi's register, which its own entry keeps to the loop's end: the update is written over the phi after the phi's last read.
+            reg[i] = reg[phi as usize];
+        } else if op.has_value() && !is_const(i as u32) {
+            let Some(r) = free.pop() else {
+                panic!("valhall::ssa: out of registers at node {i} of {n} ({} live; no spilling yet)", live.len());
+            };
             high = high.max(r);
             reg[i] = r;
             live.push((last[i].max(i), r));
+            peak = peak.max(live.len());
         }
     }
     let regs64 = high > 15;
+    let kept = keep.iter().filter(|&&k| k).count();
     // Emission.
     // SAFETY: an all-zero Kernel is the empty one (no words, no labels bound: None is the zero discriminant, no branches); built in place on the heap, its 128 KiB never on the stack.
     let mut k: Box<Kernel<16384>> = unsafe { Box::<Kernel<16384>>::new_zeroed().assume_init() };
-    let rr = |i: u32| r(reg[i as usize]);
     let mut top = None;
     let mut loop_no = 0usize;
     for (i, op) in nodes.iter().enumerate() {
+        if !keep[i] || is_const(i as u32) {
+            continue;
+        }
+        // This instruction's constant sources, each loaded into its own constant register first.
+        let mut consts = [(u32::MAX, 0u8); 3];
+        let mut nc = 0;
+        op.sources(|s| {
+            if is_const(s) && !consts[..nc].iter().any(|c| c.0 == s) {
+                consts[nc] = (s, CONST_REGS[nc]);
+                nc += 1;
+            }
+        });
+        for &(s, cr) in &consts[..nc] {
+            let Op::Const(bits) = nodes[s as usize] else { unreachable!() };
+            k.iadd_imm_i32(r(cr), Lut::ZERO, bits);
+        }
+        let rr = |s: u32| -> Reg {
+            match consts[..nc].iter().find(|c| c.0 == s) {
+                Some(c) => r(c.1),
+                None => r(reg[s as usize]),
+            }
+        };
         let d = if op.has_value() { r(reg[i]) } else { r(0) };
         match *op {
-            Op::Const(bits) => {
-                k.iadd_imm_i32(d, Lut::ZERO, bits);
-            }
-            Op::Gid => {}
+            Op::Const(_) | Op::Gid => {}
             Op::FAdd(a, b) => {
                 k.fadd_f32(d, rr(a), rr(b));
             }
@@ -534,9 +609,13 @@ pub fn compile() -> Compiled {
                 top = Some(k.here());
             }
             Op::LoopEnd(cont) => {
-                // Every update is already computed into its own register (a select): the phis take them in any order.
+                // Every update is already in its own register (a select or the counter's add): the phis take them in any order.
                 for &(phi, upd) in &rec.loops[loop_no].carried {
-                    k.mov_i32(rr(phi), rr(upd));
+                    if let Op::Const(bits) = nodes[upd as usize] {
+                        k.iadd_imm_i32(r(reg[phi as usize]), Lut::ZERO, bits);
+                    } else if upd != phi && reg[upd as usize] != reg[phi as usize] {
+                        k.mov_i32(r(reg[phi as usize]), rr(upd));
+                    }
                 }
                 k.branchz(rr(cont), top.take().expect("valhall::ssa: loop end without head")).reconverge();
                 loop_no += 1;
@@ -549,5 +628,5 @@ pub fn compile() -> Compiled {
     }
     k.last().end();
     let words = k.finish().to_vec();
-    Compiled { words, regs64 }
+    Compiled { words, regs64, nodes: n, kept, peak }
 }
