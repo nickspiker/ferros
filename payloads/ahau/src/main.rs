@@ -95,9 +95,20 @@ fn board_key(kb: &Keyboard) -> BoardKey {
 
 /// The mark thread's work: the grants (for its console line), the radius and the salt, set before it starts; and its stack.
 static mut FRESH_JOB: (u64, usize, [u8; 32]) = (0, 0, [0; 32]);
-/// The device is bound to an identity: the mark is the attest button (tapuwae `Look::attest()`, `render_disc`) of the handle as typed, not the free device's Mandelbrot (owner, 2026-11-04: the third of tapuwae's marks, designed in tools/attest-mark as "the device bonded to an identity" and never wired here). Drawn from the device's sealed salt and the typed text alone: the owner sees their own picture form as they type their handle, a swapped device or a fake screen cannot draw it, and nothing on the locked device says whose it is.
+/// The device is bound to an identity: the mark is the attest button (tapuwae `Look::attest()`, `render_button_pack16`) of the handle as typed, not the free device's Mandelbrot (owner, 2026-11-04: the third of tapuwae's marks, designed in tools/attest-mark as "the device bonded to an identity" and never wired here). Drawn from the device's sealed salt and the typed text alone: the owner sees their own picture form as they type their handle, a swapped device or a fake screen cannot draw it, and nothing on the locked device says whose it is.
 static mut BONDED: bool = false;
 static mut FRESH_STACK: [u8; 1 << 16] = [0; 1 << 16];
+/// The bonded button's helpers: three more threads on the worker cores, each drawing every fourth row of a pass (tapuwae `render_button_pack16`'s row share), the mark's thread the remaining share. The fresh mark redraws only its components, a quarter of the disc (159k of 630k pixels at 900 px), where the ball is 85 % of it (538k) at the same cost a sample, so one core that kept up with the fresh mark is about four short of the ball (1.0 to 1.4 s a pass alone, 2026-11-04).
+const HELPERS: usize = 3;
+static mut HELP_STACKS: [[u8; 1 << 16]; HELPERS] = [[0; 1 << 16]; HELPERS];
+/// How many helpers run: spawned in order at the mark's start, stopping at the first refused, so their shares (1..=HELPERS_UP) are always contiguous.
+static HELPERS_UP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// A pass for the helpers: HELP_JOB moves on once HELP_PASS holds its arguments; HELP_DONE counts the helpers through with it, HELP_STOPPED that one of them gave it up for a newer handle.
+static HELP_JOB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static HELP_DONE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static HELP_STOPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The pass: the handle's placement (on the mark thread's stack, which outlives the pass, since that thread waits for every helper before it returns), fine (4 × 4) or not, its generation, the mark's side.
+static mut HELP_PASS: (*const tapuwae::Params, bool, u64, usize) = (core::ptr::null(), false, 0, 0);
 /// Which pixels of FRESH hold any of a component (tapuwae::render_fresh's mask): what a new handle redraws.
 static mut FRESH_MASK: [u64; (1 << 20) / 64] = [0; (1 << 20) / 64];
 /// The mark's two maps (tapuwae::FreshCell, 8 bytes a sample): where the masked pixels' samples fall in the set, worked out once, so a new handle costs the balls' shading alone. Independent, so the coarse pass is a sixteenth of the fine one at boot too: the coarse map, a pixel's centre (2¹⁸ cells, 2 MiB, for the 900 px mark's 171 643 masked pixels); the fine map, 4 × 4 a pixel, filled by the first fine pass to reach each (3·2²⁰ cells, 24 MiB, for 2.75 M). Past either tapuwae works the rest out again.
@@ -1281,6 +1292,16 @@ fn start_fresh_mark(grants: u64, r: usize) {
         return;
     };
     unsafe { FRESH_JOB = (grants, r, salt) };
+    // The bonded button's helpers, before the mark's thread starts its first pass.
+    if unsafe { BONDED } {
+        for t in 0..HELPERS {
+            let stack = unsafe { &mut (*(&raw mut HELP_STACKS))[t] };
+            if ferros_sys::thread_spawn(help_thread, stack, t as u64 + 1) == ferros_sys::ERR {
+                break;
+            }
+            HELPERS_UP.store(t as u64 + 1, core::sync::atomic::Ordering::Release);
+        }
+    }
     let stack = unsafe { &mut *(&raw mut FRESH_STACK) };
     if ferros_sys::thread_spawn(fresh_thread, stack, 0) == ferros_sys::ERR {
         // No thread: the whole mark here, once, before the screen comes up; it then does not follow the handle.
@@ -1313,6 +1334,30 @@ extern "C" fn fresh_thread(_: u64) -> ! {
     }
 }
 
+/// A helper of the bonded button's passes (HELPERS): share `t` of every pass's rows, `t` from 1 (the mark's thread draws share 0). Each draws only its own rows of FRESH, so the threads never write the same pixel.
+extern "C" fn help_thread(t: u64) -> ! {
+    ferros_sys::pin(ferros_sys::CORES_WORKERS);
+    let mut seen = 0u64;
+    loop {
+        let j = HELP_JOB.load(core::sync::atomic::Ordering::Acquire);
+        if j == seen {
+            ferros_sys::wait(&HELP_JOB, j, 0);
+            continue;
+        }
+        seen = j;
+        let ((p, fine, g, side), r) = unsafe { (HELP_PASS, FRESH_JOB.1) };
+        let buf = unsafe { &mut (&mut *(&raw mut FRESH))[..side * side] };
+        let mid = side as f32 * 0.5;
+        let moved_on = || fine && FRESH_GEN.load(core::sync::atomic::Ordering::Acquire) != g;
+        let step = 1 + HELPERS_UP.load(core::sync::atomic::Ordering::Acquire) as usize;
+        if !tapuwae::render_button_pack16(buf, side, mid, mid, r as f32, unsafe { &*p }, &tapuwae::Look::attest(), if fine { 4 } else { 1 }, (t as usize, step), &moved_on) {
+            HELP_STOPPED.store(true, core::sync::atomic::Ordering::Release);
+        }
+        HELP_DONE.fetch_add(1, core::sync::atomic::Ordering::Release);
+        ferros_sys::wake(&HELP_DONE, 1);
+    }
+}
+
 /// One pass for the handle as published at generation `g` (the whole mark when `full`, else the components; coarse or `fine`), with its time on the console (never the handle); then READY. A fine pass stops when the handle has moved on, and returns false. The thread's copy of the handle is wiped when it is done with it.
 fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
     let (grants, r, salt) = unsafe { FRESH_JOB };
@@ -1330,41 +1375,27 @@ fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
     let map = unsafe { &mut *(&raw mut FRESH_MAP) };
     let moved_on = || fine && FRESH_GEN.load(core::sync::atomic::Ordering::Acquire) != g;
     let typed = core::str::from_utf8(&text[..n]).unwrap_or("");
-    // Bound: the attest button, the whole disc at every change (it has no components to redraw alone), in the surface's own pixels (`pack16`, as `render_fresh` writes them: the G2t16 encoding first used here came out nearly white). One sample a pixel (`Aa::Fixed(1)`), as the fresh mark's first pass takes: `Look::attest()` samples adaptively up to 64 a pixel (tapuwae MAX_SAMPLES, a desktop still's setting), 22 s for the first draw and 55 s a keystroke on the workers (2026-11-04). Free: the Mandelbrot mark, as before.
+    // Bound: the attest button, the whole disc at every change (it has no components to redraw alone), in the surface's own pixels (`pack16`, as `render_fresh` writes them: the G2t16 encoding first used here came out nearly white). Two passes, as the fresh mark's, through the same machinery (tapuwae `render_button_pack16`: the ball four samples to a lane call, as the fresh mark shades its components): one sample a pixel at once, then a 4 × 4 grid to clear it up, given up for a newer handle. The adaptive `Look::attest()` (up to 64 samples a pixel, one at a time) took 22 s for the first draw and 55 s a keystroke on the workers (2026-11-04).
     let done = if unsafe { BONDED } {
-        // Two passes, as the fresh mark's: a quick one at half the side (a quarter of the work, each of its pixels drawn 2 × 2) on the glass at once, then the full one in bands of 32 rows, given up the moment a newer handle is typed (the render cannot stop inside a call, and a whole disc is seconds on the workers: unstoppable, it held the cores while keys were pressed, and their highlights never reached the glass, 2026-11-04).
         let p = tapuwae::Params::new_placed(&salt, typed, true);
-        let look = tapuwae::Look { aa: tapuwae::Aa::Fixed(1), ..tapuwae::Look::attest() };
-        let newer = || FRESH_GEN.load(core::sync::atomic::Ordering::Acquire) != g;
-        if !fine {
-            let hs = side / 2;
-            // WHY: the quick pass draws into the mark buffer's tail, past the full mark; sized for husky's panel (a 904-pixel mark leaves 231k words for its 204k), a wider panel's mark would run past the buffer's end, so it goes without the quick pass.
-            let all = unsafe { &mut *(&raw mut FRESH) };
-            if side * side + hs * hs <= all.len() {
-                let (mark, tail) = all.split_at_mut(side * side);
-                let small = &mut tail[..hs * hs];
-                tapuwae::render_disc_pack16(small, hs, hs as f32 * 0.5, hs as f32 * 0.5, r as f32 * 0.5, &p, &look);
-                for y in 0..side {
-                    let src = (y / 2).min(hs - 1) * hs;
-                    for x in 0..side {
-                        mark[y * side + x] = small[src + (x / 2).min(hs - 1)];
-                    }
-                }
-            }
-            true
-        } else {
-            const BAND: usize = 32;
-            let mut y0 = 0;
-            while y0 < side {
-                if newer() {
-                    break;
-                }
-                let y1 = (y0 + BAND).min(side);
-                tapuwae::render_disc_pack16(&mut buf[y0 * side..y1 * side], side, mid, mid - y0 as f32, r as f32, &p, &look);
-                y0 = y1;
-            }
-            y0 >= side
+        // The rows shared with the helpers (HELPERS): theirs first, then this thread's own, then every helper waited for, so `p` and the pass outlive them all.
+        let up = HELPERS_UP.load(core::sync::atomic::Ordering::Acquire);
+        if up > 0 {
+            HELP_DONE.store(0, core::sync::atomic::Ordering::Relaxed);
+            HELP_STOPPED.store(false, core::sync::atomic::Ordering::Relaxed);
+            unsafe { HELP_PASS = (&p, fine, g, side) };
+            HELP_JOB.fetch_add(1, core::sync::atomic::Ordering::Release);
+            ferros_sys::wake(&HELP_JOB, up);
         }
+        let mine = tapuwae::render_button_pack16(buf, side, mid, mid, r as f32, &p, &tapuwae::Look::attest(), if fine { 4 } else { 1 }, (0, 1 + up as usize), &moved_on);
+        loop {
+            let d = HELP_DONE.load(core::sync::atomic::Ordering::Acquire);
+            if d >= up {
+                break;
+            }
+            ferros_sys::wait(&HELP_DONE, d, 0);
+        }
+        mine && !HELP_STOPPED.load(core::sync::atomic::Ordering::Acquire)
     } else {
         tapuwae::render_fresh(buf, side, mid, mid, r as f32, &salt, typed, &tapuwae::Look::fresh(), 4, mask, coarse, map, full, fine, &moved_on)
     };
