@@ -1341,6 +1341,8 @@ fn threshold(x: usize, y: usize, k: usize) -> u32 {
 /// The four phase frames (`display-phases`), each 16 MiB apart; set at start when the region is granted.
 static mut PHASE_BASE: [usize; PHASES] = [1; PHASES];
 static mut TEMPORAL: bool = false;
+/// A client has drawn (the op handler's `client_owned`, readable outside its closure): until then nothing flips, so the boot ring stays up.
+static mut CLIENT_DREW: bool = false;
 /// The phase on the layer now.
 static mut CUR_PHASE: usize = 0;
 
@@ -3049,9 +3051,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let pixels: &mut [Px] = unsafe { core::slice::from_raw_parts_mut(back as *mut Px, width * height) };
     let screen: &mut [u32] = unsafe { core::slice::from_raw_parts_mut(fb as *mut u32, width * height) };
 
-    pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
-
-    // Black until a client draws: the attest screen's window follows the boot ring within moments (the first-boot "No one yet" screen with its fixed slot line retired 2026-10-31).
+    // The layer is left on the boot ring's surface until a client's first frame: every present points it here first, so the ring stays up until the attest screen replaces it, with no black between (owner, 2026-11-05). The back buffer starts black.
     let mut damage = Damage::new();
     pixels.fill(0);
 
@@ -3164,6 +3164,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             match m.first() {
                 Some(1) => {
                     client_owned = true;
+                    unsafe { CLIENT_DREW = true };
                     // Only what the last frame drew needs clearing; the rest of the back buffer is still empty. Between frames (the clock's redraw), only the clip.
                     unsafe {
                         if { CLIP_PHASE }.is_some() {
@@ -3216,12 +3217,14 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     // The scene changed: the last frame no longer matches it, so the clock is not redrawn from it until the client sends the frame that does (a pinch's renormalise rescaled the scene under the old camera, and the replay drew a clock and scenery at the wrong scale into the clock's square, 2026-10-24).
                     unsafe { LAST_FRAME.1 = 0 };
                     client_owned = true;
+                    unsafe { CLIENT_DREW = true };
                     unsafe { SCENE_N = 0 };
                 }
                 Some(13) if m.len() >= 2 => {
                     // The scene changed: the last frame no longer matches it, so the clock is not redrawn from it until the client sends the frame that does (a pinch's renormalise rescaled the scene under the old camera, and the replay drew a clock and scenery at the wrong scale into the clock's square, 2026-10-24).
                     unsafe { LAST_FRAME.1 = 0 };
                     client_owned = true;
+                    unsafe { CLIENT_DREW = true };
                     let count = m[1] as usize;
                     let mut at = 2usize;
                     for _ in 0..count {
@@ -3242,6 +3245,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
                 Some(14) if m.len() >= 13 => {
                     client_owned = true;
+                    unsafe { CLIENT_DREW = true };
                     let clip_k = unsafe { CLIP_PHASE };
                     if clip_k.is_none() {
                         last_interaction = now();
@@ -3508,6 +3512,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
                 Some(21) => {
                     client_owned = true;
+                    unsafe { CLIENT_DREW = true };
                     // `[column u8]`: that column alone (0-8); absent or past 8: all of them.
                     let only = m.get(1).map(|&c| c as usize).filter(|&c| c < 9);
                     if ten {
@@ -3536,6 +3541,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 Some(22) if m.len() >= 18 => {
                     // A window shown or redrawn (WINDOWS.md): [x u16][y u16][w u16][h u16] the part of the screen it covers, [base u64] its surface (the client's own `dma` of it), [level u8] 0 an app, 1 input, 2 the system, and optionally [format u8] its pixels (`Win::format`: 0, the default, the display's working values; 1 fluor's 16-bit g2t). It goes in front of its level; every phase owes the whole screen; the next one is published now, the others while idle.
                     client_owned = true;
+                    unsafe { CLIENT_DREW = true };
                     last_interaction = now();
                     let v = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]) as i32;
                     let rect = draw::Rect { x0: v(1), y0: v(3), x1: v(1) + v(5), y1: v(3) + v(7) };
@@ -3782,6 +3788,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     frames += 1;
                         FRAMES.store(frames, Ordering::Relaxed);
                     client_owned = true;
+                    unsafe { CLIENT_DREW = true };
                     out[1] = moved as u8;
                     len = 2;
                 }
@@ -3831,7 +3838,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             unsafe { CLOCK_ONLY = false };
         }
         // The clock between frames (owner, 2026-10-24: its rings move at the frame rate): when this pass will flip, the clock's region alone is drawn again (`draw::CLIP`) and published into the phase the flip shows, so every phase carries the current clock while it is on the glass. Under a finger the camera ops draw it with everything else; at rest the 10 Hz flips carry it, no frame added.
-        let flip_due = unsafe { TEMPORAL } && !screen_off && ferros_sys::pref(ferros_sys::PREF_DITHER) == 0 && unsafe { PHASE_DIRTY[(CUR_PHASE + 1) % PHASES].is_empty() } && now() >= next_flip;
+        let flip_due = unsafe { CLIENT_DREW && TEMPORAL } && !screen_off && ferros_sys::pref(ferros_sys::PREF_DITHER) == 0 && unsafe { PHASE_DIRTY[(CUR_PHASE + 1) % PHASES].is_empty() } && now() >= next_flip;
         // With a widget in focus the flips run at the panel's rate; the clock keeps 10 Hz, drawn into every phase at once (owner, 2026-10-25: the focused widget at full rate, everything else at 10).
         let focus = unsafe { FOCUS } != 0;
         // The clock itself in focus runs at the panel's rate too (its last place turns over ~35 times a second).
@@ -4119,29 +4126,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             unsafe { SEC_US = [0; 8] };
             frames_last_tick = frames;
             starts_last_tick = fs;
-            if !client_owned {
-                // No client yet: the black frame presented again each second, its log line the pipe's health.
-                // The finished frame to the framebuffer: reads from cache, writes combined.
-                if ten && unsafe { TEMPORAL } { publish_next(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &tabs) } else { publish(pixels, screen) }
-                ferros_sys::dma_barrier();
-                // The layer is ours every frame: the kernel's bench ops (bridge display …) still re-point it when they run.
-                pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
-                let (moved, irq) = pipe.present(win);
-                frames += 1;
-                        FRAMES.store(frames, Ordering::Relaxed);
-                if frames == 1 || frames % 30 == 0 || !moved || irq & !(1 << 16) != 0 {
-                    log.s(b"display: frame ");
-                    log.dec(frames);
-                    log.s(if moved { b" ok, RDMA_IRQ " } else { b" NOT SHOWN, RDMA_IRQ " });
-                    log.hex(irq);
-                    log.s(b" INT_PEND ");
-                    log.hex(pipe.rd(S_DECON, INT_PEND));
-                    log.s(b"/");
-                    log.hex(pipe.rd(S_DECON, INT_PEND_EXTRA));
-                    log.s(if pipe.te() { b" TE high\n" } else { b" TE low\n" });
-                    log.flush();
-                }
-            }
+            // No client yet: nothing is presented, so the boot ring stays on the glass until a client's first frame replaces it (until 2026-11-05 a black frame went up here each second, and with the layer pointed at it at the start and the dither's black phases it blanked the screen between the ring and the attest screen).
         }
         // Asleep until the next poll or the next tick, whichever is first; the service loop has the CPU meanwhile. A sixteenth of a second at rest — a client waits at most that long — but a hundred-and-twentieth for two seconds after the map moves its camera, since a 62 ms wait per call caps a pinch at sixteen frames a second.
         // The temporal dither: the next phase frame on the layer every 100 ms, once a client owns the surface (the frames are only written by its presents). Measured 2026-10-24 with the screen on (DISPLAY-POWER.md): with the 10 Hz floor set the flips cost nothing (3.03 W against 3.05 without them) — the panel idles at its floor between them; held at 120 Hz they would cost 0.37 W.
