@@ -2172,6 +2172,25 @@ pub fn run(mut b: Boot) -> ! {
                     continue;
                 }
                 #[cfg(not(ferros_production))]
+                if cmd.params == b"cvac canvas" {
+                    // What it costs to hand the display's canvas to the GPU (GPU.md, the present stage): the GPU does not snoop the CPU's caches, so whatever the display drew must be cleaned to the point of coherency first, and EL0 cannot (SCTLR_EL2.UCI clear). Times `dc cvac` over the whole 32 MiB canvas twice: once with whatever lines the display left dirty, once with none. A clean writes back, it changes no data.
+                    let (lo, hi) = crate::cachemap::DISPLAY_CANVAS;
+                    let mut us = [0u64; 2];
+                    for pass in &mut us {
+                        let t0 = cntpct();
+                        let mut a = lo;
+                        while a < hi {
+                            unsafe { core::arch::asm!("dc cvac, {a}", a = in(reg) a as u64) };
+                            a += 64;
+                        }
+                        unsafe { core::arch::asm!("dsb sy") };
+                        *pass = cntpct().wrapping_sub(t0) * 1_000_000 / cntfrq();
+                    }
+                    resp.extend_from_slice(alloc::format!("canvas {} MiB cleaned: {} us as the display left it, {} us again (clean lines)\n", (hi - lo) >> 20, us[0], us[1]).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                #[cfg(not(ferros_production))]
                 if cmd.params == b"s2mpu deny cpucl0" {
                     // The experiment before the CPUCL0 S2MPU joins the jump's deny-all (2026-11-04): if the cores' traffic went through it, this freezes the device on the spot; if not, everything carries on and the debug subsystem is cut off from memory until the next reset.
                     let r = crate::s2mpu::deny_all(crate::s2mpu::CPUCL0_S2MPU);

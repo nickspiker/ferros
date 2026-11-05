@@ -140,3 +140,24 @@ The question: should fluor's present stage (the display server's per-pixel ODT, 
   - the GPU kept resident instead of booted per job.
 
 **The Valhall wait field, learnt here.** The flow field (bits 62:59) acts after its instruction, before the next one. A `.wait0` on the consumer of a load comes one instruction too late (it read the register's old value). It belongs on the load itself (as Mesa's test vector has it) or on the instruction just before the consumer.
+
+**The GPU's clock.** ABL leaves the GPU at its table's floor: G3D 150 MHz, G3DL2 160 MHz (zuma-gpu.dtsi `gpu_dvfs_table_v1` runs 150 to 890 MHz). Set by `diag dvfs set 8 900000` and then `set 7 890000` (the L2 first, never below the shaders), the bench on GPU-cached input:
+
+| GPU | MIF (memory) | 1M pixels | A phase (scaled) | Warm dispatch |
+|---|---|---|---|---|
+| 150 MHz | 2028 MHz | 0.69 ms | 2.8 ms | 140 us |
+| 890 MHz | 2028 MHz | 0.55 ms | 2.2 ms | 50-65 us |
+| 890 MHz | 3172 MHz (the top row's MIF floor) | 0.38-0.44 ms | about 1.6 ms | 48 us |
+
+- Memory, not the GPU's clock, sets the pace.
+- The Mandelbrot kernel (compute-bound) went 630 to 470-500 us at 890 MHz.
+- The clocks were put back to the floor afterwards; the kernel's clock policy does not touch the GPU domains, and holds MIF at 1014 MHz at rest and 2028 MHz active.
+
+**Cleaning the canvas.** `diag cvac canvas` (development builds) times the kernel's `dc cvac` over the display's whole 32 MiB canvas. EL0 cannot clean caches (SCTLR_EL2.UCI clear), so handing the canvas to the GPU needs the kernel.
+- 0.66 ms settled.
+- 2.4 ms right after a full redraw, the same with or without dirty lines, so that is contention with the display's own work, not write-back.
+- Only the dirty rectangle needs it.
+
+**So, per phase frame:**
+- **GPU:** about 1.6-2.8 ms of wall time and about none of the CPU, plus the clean of what changed and one doorbell.
+- **CPU today:** about 1.5 ms of wall time and about 6 ms of CPU across four cores.
