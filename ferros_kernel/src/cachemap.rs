@@ -87,6 +87,11 @@ pub const GPU_REGS: (usize, usize) = (0x1F00_0000, 0x2000_0000);
 /// The GPU's memory (cold only): 32 MiB of Normal non-cacheable, EL0 read/write memory the GPU driver process and the GPU share — the MCU's firmware sections, the GPU's page tables, the shared interface, rings and buffers. Non-cacheable because the GPU does not snoop the CPU's caches (GPU.md). The top 32 MiB of what was the big arc pool, just below the secure DRAM carveout at G#B600_0000 (cbff939; it is in no reserved-memory node, so the device tree does not show it: the first gpu-mem, at G#B800_0000 inside it, took writes silently and aborted every read, 2026-11-04). The GPU's S2MPU lets it reach this and nothing else (s2mpu::fence_gpu). Granted as `gpu-mem`.
 #[cfg(not(shim_handoff))]
 pub const GPU_MEM: (usize, usize) = (0xB400_0000, 0xB600_0000);
+/// Its last 2 MiB is Normal write-back on the CPU's side, the rest non-cacheable: where the GPU's I/O coherency (ACE-Lite, COHERENCY_FEATURES G#1) is tried, the CPU writing through its caches and the GPU snooping them (GPU.md "Coherency"). The GPU driver's allocator stays below it.
+#[cfg(not(shim_handoff))]
+pub const GPU_SNOOP: usize = GPU_MEM.1 - (2 << 20);
+#[cfg(shim_handoff)]
+pub const GPU_SNOOP: usize = 0;
 #[cfg(shim_handoff)]
 pub const GPU_MEM: (usize, usize) = (0, 0);
 
@@ -253,11 +258,11 @@ pub fn enable() -> bool {
         let mut next_l3 = 0;
         for (j, e) in l2.0.iter_mut().enumerate() {
             let a = gib + j * MIB2;
-            *e = if (f0 != f1 && a >= f0 && a + MIB2 <= f1) || (t0 != t1 && a >= t0 && a + MIB2 <= t1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 && a + MIB2 <= USB_DMA.0 + USB_DMA_NC) || (GPU_MEM.0 != GPU_MEM.1 && a >= GPU_MEM.0 && a + MIB2 <= GPU_MEM.1) {
+            *e = if (f0 != f1 && a >= f0 && a + MIB2 <= f1) || (t0 != t1 && a >= t0 && a + MIB2 <= t1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 && a + MIB2 <= USB_DMA.0 + USB_DMA_NC) || (GPU_MEM.0 != GPU_MEM.1 && a >= GPU_MEM.0 && a + MIB2 <= GPU_SNOOP) {
                 dma_pool(vhe, a, BLOCK)
             } else if a >= AOC_IPC.0 && a + MIB2 <= AOC_IPC.1 {
                 device_el0(vhe, a, BLOCK)
-            } else if (h0 != h1 && a >= h0 && a + MIB2 <= h1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 + USB_DMA_NC && a + MIB2 <= USB_DMA.1) {
+            } else if (h0 != h1 && a >= h0 && a + MIB2 <= h1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 + USB_DMA_NC && a + MIB2 <= USB_DMA.1) || (GPU_MEM.0 != GPU_MEM.1 && a == GPU_SNOOP) {
                 pool(vhe, a, BLOCK) | UXN
             } else if b0 != b1 && a >= b0 && a + MIB2 <= b1 {
                 // The big pool at 4 KiB granularity as well: fresh pages are data.

@@ -161,3 +161,19 @@ The question: should fluor's present stage (the display server's per-pixel ODT, 
 **So, per phase frame:**
 - **GPU:** about 1.6-2.8 ms of wall time and about none of the CPU, plus the clean of what changed and one doorbell.
 - **CPU today:** about 1.5 ms of wall time and about 6 ms of CPU across four cores.
+
+## Coherency: the GPU snoops the CPU's caches (2026-11-05)
+
+COHERENCY_FEATURES reads G#1 (ACE-Lite supported), and Google's device tree enables none. The test (`gpu.bin` input bit 3; bit 4 sets COHERENCY_ENABLE to ACE-Lite) runs over a page of `gpu-mem`'s last 2 MiB, which the kernel maps write-back on the CPU's side (cachemap `GPU_SNOOP`). The GPU sees that page twice: non-cacheable (MEMATTR index 5), and coherent (index 6, the shared memory type, shareable both ways: kbase's mapping for coherent memory). The CPU writes and reads through its caches; EL0 cannot clean them.
+
+| COHERENCY_ENABLE | GPU's view | CPU wrote, GPU read | GPU wrote, CPU read from its cache |
+|---|---|---|---|
+| 31 (none, as Linux) | non-cacheable | 0 of 16 new (stale DRAM) | 0 of 16 (stale cache) |
+| 31 (none) | coherent | **16 of 16** | **16 of 16** |
+| 0 (ACE-Lite) | either | 0 of 16 | 0 of 16 (the jobs misbehave) |
+
+Repeated three times, the same every time.
+
+**What it means.** The GPU can read what the CPU just drew, and write what the CPU then reads, with no cache maintenance and no copy, as long as the pages are mapped coherent in the GPU's tables. COHERENCY_ENABLE stays at none: setting ACE-Lite broke every access. For the present stage, the canvas needs neither the 0.7-2.4 ms clean nor a copy; what it needs is the GPU's fence widened to the canvas (and to the phases, for its output).
+
+**Not measured yet:** what snooping costs in bandwidth against non-cacheable access.

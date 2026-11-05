@@ -117,6 +117,10 @@ const IMG_H: usize = 2048;
 /// The present-stage bench: 1M pixels (a quarter of a phase frame), its output at BENCH_VA, its input the picture's buffer read as 64-bit pixels.
 const BENCH_PX: usize = 1 << 20;
 const BENCH_VA: u64 = 0x5000_0000;
+/// The snoop test (input bit 3): gpu-mem's CPU-cacheable last 2 MiB (kernel cachemap GPU_SNOOP), one page of it seen by the GPU non-cacheable and again coherent, and a non-cacheable page for what the GPU read.
+const SNOOP_NC_VA: u64 = 0x6000_0000;
+const SNOOP_CO_VA: u64 = 0x6100_0000;
+const RES_VA: u64 = 0x6200_0000;
 
 struct Gpu {
     regs: usize,
@@ -199,6 +203,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let regs = ferros_sys::dma(cap(grants, S_REGS)) as usize;
     let base = ferros_sys::dma(cap(grants, S_MEM)) as usize;
     let g = Gpu { regs, grants, f: freq() };
+    // The input's first byte, the run's switches: bit 0 show, 1 the present bench, 2 the bulk buffers GPU-cached, 3 the snoop test, 4 ACE-Lite coherency.
+    let in0 = if input_len > 0 { unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } } else { 0 };
     let mut m = Mem::new(base);
     say!(grants, "gpu: GPU_ID G#{:X}, MCU_STATUS G#{:X}\n", g.rd(GPU_ID), g.rd(MCU_STATUS));
 
@@ -223,7 +229,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         g.wr(r, g.rd(r));
     }
     g.wr(L2_MMU_CONFIG, g.rd(L2_MMU_CONFIG) & !0x0F00_0000);
-    g.wr(COHERENCY_ENABLE, 31);
+    // No coherency (31), as Linux runs it; ACE-Lite I/O coherency (0) for the snoop test (input bit 4): COHERENCY_FEATURES reads G#1, ACE-Lite supported by the GPU, whether zuma's interconnect carries it is what the test asks.
+    g.wr(COHERENCY_ENABLE, if in0 & 0x10 != 0 { 0 } else { 31 });
     g.wr(GPU_IRQ_CLEAR, IRQ_ALL);
     g.wr(GPU_IRQ_MASK, IRQ_ALL);
     g.wr(JOB_IRQ_CLEAR, 0xFFFF_FFFF);
@@ -363,12 +370,17 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     // The picture a show renders (input bit 0): 1024 x 2048 escape counts, 8 MiB. Mapped with the rest before the address space is installed: the GPU caches its page-table walks in the L2, so a page mapped after it could meet a stale table line.
     let img = m.alloc(IMG_W * IMG_H * 4 / PAGE);
     // Input bit 2: the picture and the bench's buffers cached on the GPU side (MEMATTR index 0, write-back; every compute stream ends with an L2 clean), else non-cacheable (index 5).
-    let in0 = if input_len > 0 { unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } } else { 0 };
     let bulk = if in0 & 4 != 0 { 0 } else { NC };
     as1.map(&mut m, IMG_VA, img, IMG_W * IMG_H * 4 / PAGE, PAGE_RW | bulk | NX, TABLE);
     // The present-stage bench's output (input bit 1): a 32-bit word for each of the 1M 64-bit pixels the picture's 8 MiB holds as its input.
     let bench = m.alloc(BENCH_PX * 4 / PAGE);
     as1.map(&mut m, BENCH_VA, bench, BENCH_PX * 4 / PAGE, PAGE_RW | bulk | NX, TABLE);
+    // The cacheable page: 30 MiB into gpu-mem, above anything the allocator hands out. Seen non-cacheable (index 5) and coherent (index 6, the shared type, shareable both ways: how kbase maps coherent memory).
+    let snoop = base + (30 << 20);
+    let res = m.alloc(1);
+    as1.map(&mut m, SNOOP_NC_VA, snoop, 1, PAGE_RW | NC | NX, TABLE);
+    as1.map(&mut m, SNOOP_CO_VA, snoop, 1, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
+    as1.map(&mut m, RES_VA, res, 1, PAGE_RW | NC | NX, TABLE);
     if !g.install(1, as1.root) {
         g.fail("AS1 never went idle");
     }
@@ -530,6 +542,38 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     say!(grants, "gpu: mandelbrot 64x64: sum {sum} (expect 83000), {full} pixels at {max_iter} (expect 1038), {wrong} differ from the CPU{}\n", match first_wrong { Some((g, a, b)) => alloc_free_fmt(g, a, b), None => Tail([0; 48], 0) });
     ok &= wrong == 0;
     say!(grants, "gpu: the target reads G#{:X} G#{:X} G#{:X}; {} KiB of gpu-mem used\n", rd32(dst), rd32(dst + 4), rd32(dst + 8), m.used() >> 10);
+    // Input bit 3: does the GPU see the CPU's caches (ACE-Lite I/O coherency, bit 4), so the canvas need not be cleaned or copied? Four cases over 16 words of the CPU-cacheable page, each read back by the CPU from its own caches or from a non-cacheable page.
+    if in0 & 8 != 0 {
+        let mode = if in0 & 0x10 != 0 { "ACE-Lite" } else { "none" };
+        let copy = [0x01A3_C200_2027_3C80u64, 0x0860_8482_1800_0002, 0x01A3_C200_2027_3C82, 0x7861_4402_1800_0002];
+        let w = |a: usize, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v) };
+        let r = |a: usize| unsafe { core::ptr::read_volatile(a as *const u32) };
+        let count = |f: &dyn Fn(usize) -> bool| (0..16).filter(|&i| f(i)).count();
+        // CPU to GPU: the CPU writes a pattern through its caches (no clean: EL0 cannot), the GPU copies it to a non-cacheable page; how many words arrived.
+        for (name, va, base_v) in [("non-cacheable", SNOOP_NC_VA, 0xA000_0000u32), ("coherent", SNOOP_CO_VA, 0xB000_0000)] {
+            for i in 0..16 {
+                w(snoop + 4 * i, base_v + i as u32);
+                wr32(res + 4 * i, 0);
+            }
+            let _ = (0..16).map(|i| r(snoop + 4 * i)).sum::<u32>();
+            wr32(out + 0x200, 0);
+            let n = cx.prepare(&copy, &[va, RES_VA], 1, done, &mut words);
+            run_for("snoop read", &words[..n], &|| rd32(out + 0x200) == 1, 200);
+            say!(grants, "gpu: coherency {mode}: CPU wrote, GPU read through the {name} view: {} of 16 words new (first G#{:X})\n", count(&|i| rd32(res + 4 * i) == base_v + i as u32), rd32(res));
+        }
+        // GPU to CPU: the CPU reads the page into its caches, the GPU writes it, the CPU reads it again from its caches; how many words it sees new.
+        for (name, va, imm_word) in [("non-cacheable", SNOOP_NC_VA, 0x0110_C0D0_D000_003Cu64), ("coherent", SNOOP_CO_VA, 0x0110_C0C0_FFEE_003C)] {
+            let base_v = if va == SNOOP_NC_VA { 0xD0D0_0000u32 } else { 0xC0FF_EE00 };
+            for i in 0..16 {
+                w(snoop + 4 * i, 0x1111_0000 + i as u32);
+            }
+            let _ = (0..16).map(|i| r(snoop + 4 * i)).sum::<u32>();
+            wr32(out + 0x200, 0);
+            let n = cx.prepare(&[imm_word, 0x01A3_C200_2027_3C80, 0x7861_4002_1800_0002], &[va], 1, done, &mut words);
+            run_for("snoop write", &words[..n], &|| rd32(out + 0x200) == 1, 200);
+            say!(grants, "gpu: coherency {mode}: GPU wrote through the {name} view, CPU read from its caches: {} of 16 words new (first G#{:X})\n", count(&|i| r(snoop + 4 * i) == base_v + i as u32), r(snoop));
+        }
+    }
     // Input bit 1: the present-stage bench (fluor on the GPU, measured before written): a proxy with the display's present stage's memory shape, a 64-bit pixel in and a 32-bit word out, with 0, 24 or 48 FMAs between, over 1M pixels; and the same at 16 invocations for the fixed cost of a dispatch. The kernel:
     //   SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:3      (the pixel's address)
     //   LOAD.i64.unsigned.slot0.wait0 @r4:r5, [r2:r3]   (the wait in the flow field acts after its instruction, before the next: on the consumer it came one too late, 2026-11-05)
