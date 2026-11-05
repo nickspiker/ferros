@@ -163,7 +163,7 @@ pub fn status(slot: u64, word: u64) -> u64 {
     svc(nr::STATUS, slot, word, 0, 0, 0)
 }
 
-/// The process watchdog: this process is alive and going round its main loop. Call it once a pass, at the top (never only from inside a wait: a wait that never ends is the hang it is there to catch). The kernel records the longest stretch between two pets (`diag pets`); nothing is enforced yet (owner, 2026-11-05).
+/// The process watchdog: this process is alive and going round its main loop. Call it once a pass, at the top (never only from inside a wait: a wait that never ends is the hang it is there to catch). The kernel records the longest stretch between two pets (`diag pets`), from the first pet on (the start is not counted) and less the time the petting thread spent in `wait_world` / `irq_wait_world` or blocked calling another process; nothing is enforced yet (owner, 2026-11-05; docs/RELEASE.md).
 pub fn pet() {
     svc(nr::PET, 0, 0, 0, 0, 0);
 }
@@ -631,6 +631,11 @@ pub fn wait(word: &core::sync::atomic::AtomicU64, expected: u64, deadline: u64) 
     svc(nr::WAIT, off(word as *const _ as *const u8), expected, deadline, 0, 0)
 }
 
+/// `wait` for something the world brings (traffic, credentials, a person): the process watchdog's clock is paused while it waits (`pet`). A wait on this process's own work or its own hardware is a plain `wait`, and counts.
+pub fn wait_world(word: &core::sync::atomic::AtomicU64, expected: u64, deadline: u64) -> u64 {
+    svc(nr::WAIT, off(word as *const _ as *const u8), expected, deadline, 1, 0)
+}
+
 /// Make up to `count` threads waiting on `word` runnable; returns how many.
 pub fn wake(word: &core::sync::atomic::AtomicU64, count: u64) -> u64 {
     svc(nr::WAKE, off(word as *const _ as *const u8), count, 0, 0, 0)
@@ -639,6 +644,11 @@ pub fn wake(word: &core::sync::atomic::AtomicU64, count: u64) -> u64 {
 /// Block until the interrupt line the token grants fires (0), or the counter reaches `deadline` (2; 0 = none). A line that fired while no one waited answers at once. The line stays masked until `irq_ack`; clear the device's own pending bit before acking.
 pub fn irq_wait(cap: u64, deadline: u64) -> u64 {
     svc(nr::IRQ_WAIT, cap, deadline, 0, 0, 0)
+}
+
+/// `irq_wait` for a line driven by the world (a person, the network, a peer): the process watchdog's clock is paused while it waits (`pet`). A line from hardware this driver itself asked for (a transfer done, a frame) is a plain `irq_wait`, and counts.
+pub fn irq_wait_world(cap: u64, deadline: u64) -> u64 {
+    svc(nr::IRQ_WAIT, cap, deadline, 1, 0, 0)
 }
 
 /// The device is handled: unmask its line.

@@ -114,6 +114,8 @@ pub extern "C" fn modem_main(grants: u64, input: u64, input_len: u64) -> ! {
         }
         wait_s = 16;
         while modem::online() && !modem::RESTART.swap(false, core::sync::atomic::Ordering::Relaxed) {
+            // The watchdog's pet in the service loop proper (the outer loop is the bring-up's, once per attempt).
+            ferros_sys::pet();
             modem::service_poll();
             ferros_sys::sleep_until(ferros_sys::now() + ferros_sys::freq() / 1000);
         }

@@ -113,13 +113,24 @@ pub fn kick(mask: u16) {
 fn mask_of(t: usize) -> u16 {
     k().threads.get(t).and_then(|x| x.as_ref()).map(|x| x.mask).unwrap_or(0xFFFF)
 }
+/// A thread that pets, made runnable again: its pause (a wait on the world, or a call) ends here.
+fn unpause(t: usize) {
+    if let Some(p) = proc_of(t) {
+        if p.pet_thread == t && p.paused_at != 0 {
+            p.paused += crate::platform::cntpct() - p.paused_at;
+            p.paused_at = 0;
+        }
+    }
+}
 /// A thread onto the run queue, and the idle cores that may run it told.
 fn enqueue_back(t: usize) {
+    unpause(t);
     k().runnable.push_back(t);
     runnable_sync();
     kick(mask_of(t));
 }
 fn enqueue_front(t: usize) {
+    unpause(t);
     k().runnable.push_front(t);
     runnable_sync();
     kick(mask_of(t));
@@ -430,6 +441,12 @@ struct Process {
     last_pet: u64,
     gap_max: u64,
     gap_at: u64,
+    /// From the spawn to the first pet: its start, which the watchdog does not count.
+    start: u64,
+    /// The thread that pets (the last to), and its pause: since when it has been blocked waiting on the world or on another process (0: not), and how long it has been paused since its last pet. Only that thread's waits pause the clock.
+    pet_thread: usize,
+    paused_at: u64,
+    paused: u64,
 }
 
 struct Endpoint {
@@ -1350,6 +1367,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                             f.x[0] = 2;
                             0
                         } else {
+                            // A wait on the world (x2 bit 0): the watchdog's clock paused while the thread that pets is in it.
+                            if f.x[2] & 1 != 0 && cur == p.pet_thread {
+                                p.paused_at = t_now;
+                            }
                             t.state = State::Waiting(intid as usize, deadline);
                             t.frame = *f;
                             t.frame.x[0] = 0;
@@ -1377,6 +1398,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 f.x[0] = 2;
                 0
             } else {
+                // A wait on the world (x3 bit 0): the watchdog's clock paused while the thread that pets is in it.
+                if f.x[3] & 1 != 0 && cur == p.pet_thread {
+                    p.paused_at = t_now;
+                }
                 t.state = State::Waiting(addr, deadline);
                 t.frame = *f;
                 t.frame.x[0] = 0;
@@ -1603,12 +1628,21 @@ fn el0_trap(f: &mut Frame) -> u64 {
         }
         SYS_PET => {
             let now = crate::platform::cntpct();
-            let from = if p.last_pet != 0 { p.last_pet } else { p.born };
-            if now - from > p.gap_max {
-                p.gap_max = now - from;
-                p.gap_at = now;
+            if p.last_pet == 0 {
+                // The first pet ends the start, which is not counted.
+                p.start = now - p.born;
+            } else {
+                // Since the last pet, less the time this thread was paused (waiting on the world, or on another process).
+                let gap = now - p.last_pet - p.paused;
+                if gap > p.gap_max {
+                    p.gap_max = gap;
+                    p.gap_at = now;
+                }
             }
+            p.paused = 0;
+            p.paused_at = 0;
             p.last_pet = now;
+            p.pet_thread = cur;
             p.pets += 1;
             f.x[0] = 0;
             0
@@ -1798,6 +1832,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 }
                 Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 => {
                     let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
+                    // Blocked on another process: the watchdog's clock paused for the thread that pets (that process answers for its own hang).
+                    if cur == p.pet_thread {
+                        p.paused_at = crate::platform::cntpct();
+                    }
                     t.state = State::Calling(f.x[3], f.x[4] & !CALL_LIVE);
                     t.frame = *f;
                     tr(TR_CALL, cur, ep as u64);
@@ -2325,7 +2363,7 @@ pub fn pets_report(out: &mut Vec<u8>) {
         if p.pets == 0 {
             out.extend_from_slice(alloc::format!("{name:<10} no pets, up A#{} ms\n", ms(now - p.born)).as_bytes());
         } else {
-            out.extend_from_slice(alloc::format!("{name:<10} A#{} pets, longest stretch A#{} ms (ended A#{} ms ago), last pet A#{} ms ago, up A#{} ms\n", p.pets, ms(p.gap_max), ms(now - p.gap_at), ms(now - p.last_pet), ms(now - p.born)).as_bytes());
+            out.extend_from_slice(alloc::format!("{name:<10} A#{} pets, longest stretch A#{} ms (ended A#{} ms ago), last pet A#{} ms ago{}, start A#{} ms (not counted), up A#{} ms\n", p.pets, ms(p.gap_max), ms(now - p.gap_at), ms(now - p.last_pet), if p.paused_at != 0 { " (paused now)" } else { "" }, ms(p.start), ms(now - p.born)).as_bytes());
         }
     }
     unlock();
@@ -2611,7 +2649,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0 };
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0 };
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.
     p.write(TOKENS as u64, &(p.cspace.len() as u32).to_le_bytes());
     for (i, c) in p.cspace.iter().enumerate() {

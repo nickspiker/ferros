@@ -396,7 +396,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             reply(&token, &out[..len]);
         }
         // Until the controller raises its line, a client calls (the kernel ends the wait early for the endpoint's poller), or the tick — whichever first. The line is masked from firing to `irq_done`; the drain above has emptied the FIFO by then, so INT is high again.
-        ferros_sys::irq_wait(cap(grants, S_IRQ), now() + tick);
+        // A finger is the world: the watchdog's clock paused while waiting for one (ferros_sys::irq_wait_world).
+        ferros_sys::irq_wait_world(cap(grants, S_IRQ), now() + tick);
         p.irq_done();
     }
 }
