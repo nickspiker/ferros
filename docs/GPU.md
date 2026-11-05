@@ -39,7 +39,40 @@ The grants:
 | Slot | Grant | What |
 |---|---|---|
 | 1 | `gpu-regs` (DMA) | the 16 MiB register space at G#1F00_0000, doorbells inside, EL0 Device (cachemap `GPU_REGS`, mapped as the USB controller's block is) |
-| 2 | `gpu-mem` (DMA) | 32 MiB at G#B800_0000, Normal non-cacheable, EL0 (cachemap `GPU_MEM`): free DRAM above the big arc pool, below ABL's modem image's GiB |
+| 2 | `gpu-mem` (DMA) | 32 MiB at G#B400_0000, Normal non-cacheable, EL0 (cachemap `GPU_MEM`): the top of what was the big arc pool, just below the secure DRAM carveout at G#B600_0000. The first try at G#B800_0000 sat inside that carveout, which no reserved-memory node shows: writes vanished and reads aborted. |
 | 3 | the vault scope `gpu.` | `gpu.fw`: `mali_csffw-r52p0.bin`, taken from the device's own vendor image (`/vendor/firmware`, 294912 bytes, sha-256 12ca2252…3ef0; Harbor `/mnt/Harbor/tmp/husky-gpu/`). The vendor image also carries r53p0, r54p0, r54p1 and r54p2. |
 
 First run from EL0 (2026-11-04): GPU_ID G#B8A2_1020, L2_FEATURES G#0814_0306, SHADER_PRESENT G#0111_0055, AS_PRESENT G#FF, MCU_STATUS 0, the firmware's magic G#C3F1_3A6E read from the vault.
+
+## Online (2026-11-04)
+
+`payloads/gpu` boots the CSF microcontroller and runs a command-stream job, from a cold boot and again on top of a running MCU. The sequence is kbase r52p0's (Google's tree), as an agent condensed it from the source with file and line for every value. Measured on the device:
+
+| Step | Result |
+|---|---|
+| Soft reset (GPU_COMMAND G#101, RESET_COMPLETED polled) | 10 us |
+| Quirk registers read back, L2_MMU_CONFIG limits cleared, COHERENCY_ENABLE 31, Google's slice hash (ASN_HASH G#0036_DB6D, G#005B_6DB6, 0; L2_CONFIG bit 24), L2_PWRON | L2 ready, L2_CONFIG G#0114_0000 |
+| The firmware's 7 non-protected sections into AS0 | 1.5 MiB of gpu-mem in all; the protected section skipped as kbase skips it |
+| MCU_CONTROL 2 (AUTO), JOB_IRQ bit 31 polled | booted in 115 us; GLB_VERSION G#0208_0000, 8 groups of 8 streams |
+| Global init (cores G#0111_0055, power-off 800 us, progress and eviction timers, ack mask G#4C81_0F1E) | acknowledged |
+| Ping (GLB_REQ bit 8, doorbell 0) | 15 us |
+| Group 0, stream 0, address space 1, user doorbell 1 | started; suspend buffer 26368 bytes |
+| The job: `MOVE r0:r1 = dst`, `MOVE32 r2 = G#CAFE_F00D`, `SYNC_SET32 [r0:r1] = r2` | the word reads G#CAFE_F00D 139-143 us after the doorbell |
+
+The fence (G3D's S2MPU) saw no access outside `gpu-mem`.
+
+**Memory map.**
+- AS0 (the MCU): the firmware's sections at their declared VAs, a group's suspend buffer at G#0410_0000 (64 pages), one queue's user-IO pages at G#0420_0000. Everything is mapped before the MCU starts, so no live update is needed.
+- AS1 (the group): the ring at G#1000_0000, the target at G#2000_0000, both non-cacheable (MEMATTR index 5), so the CPU and the GPU agree with no cache maintenance.
+
+**What's certain about instructions.** kbase holds no command-stream assembler. Its sync decoder confirms MOVE (G#01), MOVE32 (G#02), CALL (G#20), SYNC_ADD/SET/WAIT32 (G#25-G#27) and their 64-bit forms (G#33-G#35): the opcode is in bits 63:56, the address register pair in 47:40, the data register in 39:32. Everything else (STORE_MULTIPLE, WAIT, RUN_COMPUTE, FLUSH_CACHE2, the scoreboard entries) comes from Mesa's panfrost `genxml`, which is not on this machine, and needs checking against it before use.
+
+**Gaps:**
+- the firmware's trace buffers and its page-fault counter pointer are left at zero (kbase fills them);
+- CS_EXTRACT reads 0 after the job even though the word landed (the firmware updates it lazily, or only at idle: not looked at yet);
+- the driver polls instead of waiting on its interrupt lines (registered: `gpu-gpu`, `gpu-job`, `gpu-mmu`);
+- no idle power gating (the switch would be pd_embedded_g3d alone, whose on/off is short, flexpmu_cal_local_zuma.h `embedded_g3d_on`/`_off`; pd_g3d's own on needs its whole clock controller restored).
+
+**Next:**
+1. The driver as a resident service: a `gpu` endpoint taking command streams from processes, each process in its own address space and group, waiting on `gpu-job`.
+2. Compute: a shader (Valhall ISA) and RUN_COMPUTE, which needs Mesa's encodings or a capture of a real job. The attest mark (tapuwae) is the first customer: a pixel's 4 × 4 grid is one 16-lane warp.
