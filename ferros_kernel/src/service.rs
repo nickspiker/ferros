@@ -2366,6 +2366,10 @@ pub fn run(mut b: Boot) -> ! {
                 append_hex(&mut resp, b"BACKSTOP_WAKES=", BACKSTOP_WAKES.load(core::sync::atomic::Ordering::Relaxed) as u32);
                 append_hex(&mut resp, b"IDLE_PCT=", (asleep * 100 / cntpct().wrapping_sub(t_awake_from).max(1)) as u32);
                 append_hex(&mut resp, b"UPTIME_MS=", (cntpct().wrapping_sub(t_boot) / (freq / 1000)) as u32);
+                // The watchdog window's measurement (platform::pet_watchdogs): the longest gap between two pets from any core, when it ended (uptime), and the pets so far.
+                append_hex(&mut resp, b"WDT_GAP_MAX_US=", (crate::platform::PET_GAP_MAX.load(core::sync::atomic::Ordering::Relaxed) * 1_000_000 / freq) as u32);
+                append_hex(&mut resp, b"WDT_GAP_AT_MS=", (crate::platform::PET_GAP_AT.load(core::sync::atomic::Ordering::Relaxed).wrapping_sub(t_boot) / (freq / 1000)) as u32);
+                append_hex(&mut resp, b"WDT_PETS=", crate::platform::PETS.load(core::sync::atomic::Ordering::Relaxed) as u32);
                 append_hex(&mut resp, b"EXC=", crate::exception_count().wrapping_sub(exc_start) as u32);
                 append_hex(&mut resp, b"UFS_LOST=", ferros_hal::ufs::UFS_LOST.load(core::sync::atomic::Ordering::Relaxed));
                 // The commands the USB process has handed over (ptlink.rs).

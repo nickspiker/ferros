@@ -98,6 +98,8 @@ pub fn arm_safety() {
         write_volatile(&raw mut crate::__exc_sink, RAMOOPS_RESULT as u64);
     }
     const WDT_ARM: u32 = 0xFF00 | (3 << 3) | (1 << 5) | (1 << 0);
+    // The arm is the first pet the window measures from.
+    LAST_PET.store(cntpct(), core::sync::atomic::Ordering::Relaxed);
     for &wdt in &WATCHDOGS {
         unsafe {
             write_volatile((wdt + 0x04) as *mut u32, 0xFFFF);
@@ -111,10 +113,27 @@ pub fn arm_safety() {
 /// Set once a watchdog reset has been ordered (`reboot_to_bootloader`): from then on nothing pets the watchdogs. The vault pets them on every operation (kvault.rs), and the map writes the vault from the worker cores all the time, so the reset that `bridge reboot fastboot` waits for never came (2026-10-24: 64 s of a frozen service loop, USB gone, ferros still running after).
 static RESET_ORDERED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// The watchdog window's measurement (owner, 2026-11-05: "TIME IT!"): the counter at the last pet from any core, the longest gap between two pets and the counter when it ended, and how many pets; DIAG reports them, so the window can be set from the longest stretch the kernel really goes without petting.
+static LAST_PET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PET_GAP_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PET_GAP_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PETS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub fn pet_watchdogs() {
     if RESET_ORDERED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    use core::sync::atomic::Ordering::Relaxed;
+    let now = cntpct();
+    let prev = LAST_PET.swap(now, Relaxed);
+    // Before the arm stamps it (the shim's paths) there is no gap to measure.
+    if prev != 0 {
+        let gap = now.wrapping_sub(prev);
+        if gap > PET_GAP_MAX.fetch_max(gap, Relaxed) {
+            PET_GAP_AT.store(now, Relaxed);
+        }
+    }
+    PETS.fetch_add(1, Relaxed);
     for &wdt in &WATCHDOGS {
         unsafe { write_volatile((wdt + 0x08) as *mut u32, 0xFFFF) };
     }
