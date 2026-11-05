@@ -177,3 +177,9 @@ Repeated three times, the same every time.
 **What it means.** The GPU can read what the CPU just drew, and write what the CPU then reads, with no cache maintenance and no copy, as long as the pages are mapped coherent in the GPU's tables. COHERENCY_ENABLE stays at none: setting ACE-Lite broke every access. For the present stage, the canvas needs neither the 0.7-2.4 ms clean nor a copy; what it needs is the GPU's fence widened to the canvas (and to the phases, for its output).
 
 **Not measured yet:** what snooping costs in bandwidth against non-cacheable access.
+
+## The present stage on the GPU: bit-exact (2026-11-05)
+
+The 92-instruction kernel (hand-encoded from the display's `neon.rs`; the words and their sources are in `ferros-present-spec.md` on Harbor) produces the display's present stage on the GPU. The input is 64 full panel rows (86,016 pixels) of black, white, greys and random channels up to 4× white. The tables are built from the display's real `Odt` (`odt.rs`, shared with the display). In all four temporal phases, **every word is identical to `neon::sixteen_canvas`'s on the device: largest channel difference 0.** Six of its instructions had no Mesa test vector; all were right.
+
+At the GPU's floor clock (150 MHz) a 64-row phase took 845-885 us, about 8 ns a pixel. That's too slow for 2992 rows, and to be measured again at the GPU's own speed and over more rows before the display uses it.
