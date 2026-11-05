@@ -130,6 +130,13 @@ const S_FGTW_EP: u64 = 8;
 const S_UNLOCK: u64 = 9;
 /// Slot 10: a second surface, the keyboard's back buffer: a board that a key's tap will redraw (shift, a page, a layout) is drawn there whole while the finger is down and copied in at the lift (`prepare`), as the mark's frame is rendered ahead by its thread. Without it the lift redrew the board in place, 59 ms (2026-11-01: draw 14, the key map 37, the tint 8), and the shift showed a few frames late.
 const S_BACK: u64 = 10;
+/// Slots 11 and 12: the GPU service (`use gpu`) and the layer arena, where the mark's quick pass is drawn on the GPU (GPU.md, "The resident service, and the attest mark's path"). Without them (after a jump, no GPU service) the quick pass stays on the CPU.
+const S_GPU: u64 = 11;
+const S_LAYERS: u64 = 12;
+/// The GPU's view of the layer arena (payloads/gpu ARENA_VA), and ahau's own region of it: the kernel's words at 32 MiB, the quick pass's pixels from 33 MiB (gputest uses the first 32).
+const ARENA_VA: u64 = 0x8000_0000;
+const GPU_CODE: usize = 32 << 20;
+const GPU_OUT: usize = 33 << 20;
 
 /// The surfaces through their handles (SANDBOX.md, "Handles"): the screen draws into `BUF`, a frame-sized buffer in its own arc, and presents the rows it touched through the shown surface's handle, so the same binary runs native and masked and the drawing code (honeycomb, tapuwae, the pills) never holds a pointer outside the arc. Text is the display's to draw, into a surface it knows: the rows go to that surface first (`put_rows`), the text is asked for, and the rows come back (`get_rows`) before anything more is drawn over them. The second surface stays a display surface for that, reached through its own handle. Labels the keyboard draws are recorded while it draws and asked for after the rows are presented, or the presenting would wipe them.
 type Front = ferros_sys::Handle<S_SURF>;
@@ -201,6 +208,61 @@ unsafe impl GlobalAlloc for Bump {
 
 #[global_allocator]
 static ALLOC: Bump = Bump;
+
+/// The heap as it stands, and back to it: everything allocated between is dropped by then (the GPU compile, a keystroke's graph and words; a bump heap that never went back would run out after a dozen handles).
+/// Who has the heap: 0 no one, 1 the mark's GPU compile (gpu_quick), 2 the handle proof. A mark and reset around the compile must not span the proof's buffer, and the proof's 24.9 MB must not find the compile's pieces in the way.
+static HEAP_USE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// Whether the last pass was drawn on the GPU, for its console line.
+static GPU_DREW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn heap_mark() -> usize {
+    unsafe { HEAP_NEXT }
+}
+fn heap_reset(m: usize) {
+    unsafe { HEAP_NEXT = m };
+}
+
+/// The bonded button's quick pass on the GPU: tapuwae's own shading recorded through valhall (tapuwae::gpu), run by the GPU service into ahau's region of the layer arena, then into `buf` (side x side pack16 words, as render_button_pack16 writes them). False when there is no GPU service or arena (after a jump), or the job did not finish: the CPU draws it then.
+fn gpu_quick(grants: u64, buf: &mut [u64], side: usize, r: usize, p: &tapuwae::Params) -> bool {
+    let arena = ferros_sys::dma(cap(grants, S_LAYERS)) as usize;
+    if arena == 0 || arena == usize::MAX {
+        return false;
+    }
+    if HEAP_USE.compare_exchange(0, 1, core::sync::atomic::Ordering::Acquire, core::sync::atomic::Ordering::Relaxed).is_err() {
+        return false;
+    }
+    let mark = heap_mark();
+    let k = tapuwae::gpu::button_quick_kernel(r as f32, p, &tapuwae::Look::attest());
+    for (i, &w) in k.words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + GPU_CODE + 8 * i) as *mut u64, w) };
+    }
+    // [1][preload u16, bit 15: 64 registers][code offset u32][words u16][groups x u32][groups y u32][n u8][n × u64]: slot 0 the output, then the kernel's constants.
+    let mut msg = [0u8; 18 + 8 * 16];
+    msg[0] = 1;
+    msg[1..3].copy_from_slice(&(0x1000u16 | if k.regs64 { 0x8000 } else { 0 }).to_le_bytes());
+    msg[3..7].copy_from_slice(&(GPU_CODE as u32).to_le_bytes());
+    msg[7..9].copy_from_slice(&(k.words.len() as u16).to_le_bytes());
+    msg[9..13].copy_from_slice(&((side * side).div_ceil(16) as u32).to_le_bytes());
+    msg[13..17].copy_from_slice(&1u32.to_le_bytes());
+    let nu = 1 + k.consts.len();
+    msg[17] = nu as u8;
+    msg[18..26].copy_from_slice(&(ARENA_VA + GPU_OUT as u64).to_le_bytes());
+    for (i, c) in k.consts.iter().enumerate() {
+        msg[26 + 8 * i..34 + 8 * i].copy_from_slice(&c.to_le_bytes());
+    }
+    drop(k);
+    heap_reset(mark);
+    HEAP_USE.store(0, core::sync::atomic::Ordering::Release);
+    // `call_live`: no service receiving (after a jump, or still booting the GPU) fails at once, and the CPU draws this pass.
+    let mut reply = [1u8, 0, 0, 0, 0];
+    let n = ferros_sys::call_live(cap(grants, S_GPU), &msg[..18 + 8 * nu], &mut reply);
+    if n == ferros_sys::ERR || reply[0] != 0 {
+        return false;
+    }
+    let out = unsafe { core::slice::from_raw_parts((arena + GPU_OUT) as *const u64, side * side) };
+    buf.copy_from_slice(out);
+    true
+}
 
 /// What the screen is waiting for.
 #[derive(Clone, Copy, PartialEq)]
@@ -1092,7 +1154,12 @@ impl Ahau {
         ferros_sys::pin(ferros_sys::CORES_BIG);
         sleep_until(now() + freq() / 1000);
         let t0 = now();
+        // The heap is the proof's while it runs: a GPU compile in progress (a keystroke's, half a millisecond) finishes first (HEAP_USE).
+        while HEAP_USE.compare_exchange(0, 2, core::sync::atomic::Ordering::Acquire, core::sync::atomic::Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
         let proof = *ihi::handle_proof(&blake3::Hash::from(*seed)).as_bytes();
+        HEAP_USE.store(0, core::sync::atomic::Ordering::Release);
         let ms = ferros_sys::us_since(t0) / 1000;
         let mut l = Line::new();
         let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: handle proof in {ms} ms on the X3\n"));
@@ -1411,8 +1478,11 @@ fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
     // Bound: the attest button, the whole disc at every change (it has no components to redraw alone), in the surface's own pixels (`pack16`, as `render_fresh` writes them: the G2t16 encoding first used here came out nearly white). Two passes, as the fresh mark's, through the same machinery (tapuwae `render_button_pack16`: the ball four samples to a lane call, as the fresh mark shades its components): one sample a pixel at once, then a 4 × 4 grid to clear it up, given up for a newer handle. The adaptive `Look::attest()` (up to 64 samples a pixel, one at a time) took 22 s for the first draw and 55 s a keystroke on the workers (2026-11-04).
     let done = if unsafe { BONDED } {
         let p = tapuwae::Params::new_placed(&salt, typed, true);
+        // The quick pass on the GPU when its service is up (GPU.md), before any helper is woken: when it is drawn there the helpers have nothing to do this pass (and must not write the rows it fills).
+        let gpu_drawn = !fine && gpu_quick(grants, buf, side, r, &p);
+        GPU_DREW.store(gpu_drawn, core::sync::atomic::Ordering::Relaxed);
         // The rows shared with the helpers (HELPERS): theirs first, then this thread's own, then every helper waited for, so `p` and the pass outlive them all.
-        let up = HELPERS_UP.load(core::sync::atomic::Ordering::Acquire);
+        let up = if gpu_drawn { 0 } else { HELPERS_UP.load(core::sync::atomic::Ordering::Acquire) };
         if up > 0 {
             HELP_DONE.store(0, core::sync::atomic::Ordering::Relaxed);
             HELP_STOPPED.store(false, core::sync::atomic::Ordering::Relaxed);
@@ -1420,7 +1490,7 @@ fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
             HELP_JOB.fetch_add(1, core::sync::atomic::Ordering::Release);
             ferros_sys::wake(&HELP_JOB, up);
         }
-        let mine = tapuwae::render_button_pack16(buf, side, mid, mid, r as f32, &p, &tapuwae::Look::attest(), if fine { 4 } else { 1 }, (0, 1 + up as usize), &moved_on);
+        let mine = gpu_drawn || tapuwae::render_button_pack16(buf, side, mid, mid, r as f32, &p, &tapuwae::Look::attest(), if fine { 4 } else { 1 }, (0, 1 + up as usize), &moved_on);
         loop {
             let d = HELP_DONE.load(core::sync::atomic::Ordering::Acquire);
             if d >= up {
@@ -1442,7 +1512,7 @@ fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
         (_, true, true) => "cleared up",
         (_, true, false) => "refine stopped for a newer handle",
     };
-    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: attest mark {what} ({side} px, {}) in {} ms on the workers\n", if fine { "4x4" } else { "1" }, ferros_sys::us_since(t0) / 1000));
+    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: attest mark {what} ({side} px, {}) in {} ms {}\n", if fine { "4x4" } else { "1" }, ferros_sys::us_since(t0) / 1000, if GPU_DREW.load(core::sync::atomic::Ordering::Relaxed) { "on the GPU" } else { "on the workers" }));
     console(grants, l.as_bytes());
     unsafe { FRESH_SIDE = side };
     FRESH_STATE.store(READY, core::sync::atomic::Ordering::Release);

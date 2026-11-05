@@ -2085,7 +2085,10 @@ fn fail_orphaned_calls() {
     }
 }
 
+/// Bumped whenever a process is made, ends or is killed: what the service loop watches to act on the process table changing (the GPU's clock, service.rs), with no poll.
+pub static PROCS_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 fn end_process(pi: usize, cur: usize, value: u64) {
+    PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     let kk = k();
     let mine: Vec<usize> = kk.threads.iter().enumerate().filter(|(_, x)| matches!(x, Some(x) if x.proc == pi)).map(|(i, _)| i).collect();
     // A thread running on another core right now is left to leave at its own next trap (`drain_dying`): its arc must stay until then.
@@ -2306,6 +2309,7 @@ pub fn kill(name: &[u8]) -> bool {
     r
 }
 fn kill_locked(name: &[u8]) -> bool {
+    PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     let kk = k();
     let Some(i) = kk.procs.iter().position(|p| matches!(p, Some(p) if p.name == name)) else { return false };
     surfaces_free(kk.procs[i].as_ref().unwrap().epoch);
@@ -2662,6 +2666,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };
     let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0 };
+    PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.
     p.write(TOKENS as u64, &(p.cspace.len() as u32).to_le_bytes());
     for (i, c) in p.cspace.iter().enumerate() {

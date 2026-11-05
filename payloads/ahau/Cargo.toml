@@ -15,7 +15,7 @@ ahau_core = { path = "../../ahau_core" }
 ihi = { path = "../../../ihi", default-features = false, features = ["proof"] }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 # The attest mark (tapuwae), without std: rows one after another on this thread, float maths from libm.
-tapuwae = { path = "../../../tapuwae", default-features = false }
+tapuwae = { path = "../../../tapuwae", default-features = false, features = ["gpu"] }
 # VSF RGB's photopic luminance (through LMS), for the keys' rainbow: colours are VSF RGB, never sRGB (owner, 2026-11-01).
 vsf = { version = "0.10", path = "../../../vsf", default-features = false }
 # The attest button's squircle edge (a cube root) and the keys' hues (a cosine).

@@ -478,7 +478,7 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         // 1 serve bt, 2 the APM UART, 3 vendor_a, 4 its power, 5 entropy (payloads/bt).
         b"bt" => &[81, 82, 76, 83, 41],
         // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings (the layout switch), 8 use fgtw (the identity service's verdict and the mint), 9 the identity unlock right, 10 a second surface, the keyboard's back buffer (payloads/ahau).
-        b"ahau" => &[17, 18, 22, 51, 48, 49, 19, 47, 85, 22],
+        b"ahau" => &[17, 18, 22, 51, 48, 49, 19, 47, 85, 22, 24, 68],
         // 1 the controller's registers, 2 its DMA memory, 3 its interrupt, 4 the kernel's PT commands, 5 the `usb` power switch (payloads/usb).
         b"usb" => &[86, 87, 88, 89, 90],
         // 1 the AoC's IPC block, 2 its mailboxes, 3 the vault scope `aoc.`, 4 the Sensors right, 5 the `sensors` switch (payloads/sensors).
@@ -869,6 +869,11 @@ static mut CLOCK_POLICY_ON: bool = true;
 static mut CLOCK_SWITCHES: u32 = 0;
 static mut CLOCK_WAIT_MAX_US: u64 = 0;
 
+/// The process table'"s
+/// The process table's generation last looked at, and whether the GPU's clock is up for its service.
+static mut PROCS_SEEN: u32 = u32::MAX;
+static mut GPU_CLOCKED: bool = false;
+
 fn clock_policy(pt_busy: bool, booted_for: u64) {
     let (f, now) = (cntfrq(), cntpct());
     // After the jump from Android the clocks are whatever Android last asked for, the X3 at 377 MHz on the eleventh jump of 2026-11-03 (the attest mark took 19 s to refine, 3.6 s at the boot's clocks, and the screen looked frozen until the policy's first switch at 16 s): the active profile, the clocks a cold boot runs with, at once. The 16 s wait below is for the cold boot's firmware loads, which a jump does not run.
@@ -1221,6 +1226,21 @@ pub fn run(mut b: Boot) -> ! {
             let sl: alloc::vec::Vec<u64> = crate::process::SLICES.iter().skip(4).take(5).map(|s| s.load(core::sync::atomic::Ordering::Relaxed)).collect();
             // The log region (64 MiB) holds months of these.
             crate::flashlog::line(&alloc::format!("heartbeat: up {} s, commands from the USB process {}, slices C4-C8 {:?}", now.wrapping_sub(t_boot) / freq, st.proc_cmds, sl));
+        }
+        // The GPU's clock follows its service (owner, 2026-11-05: the attest mark within a 120 Hz frame): at its top while a `gpu` process lives, at its floor otherwise; looked at only when the process table changed (process.rs PROCS_GEN), on this core, where every ACPM call is made. The L2 first going up and last going down (GPU.md "The GPU's clock").
+        let table = crate::process::PROCS_GEN.load(core::sync::atomic::Ordering::Acquire);
+        if table != unsafe { PROCS_SEEN } {
+            unsafe { PROCS_SEEN = table };
+            let live = crate::process::running(b"gpu");
+            if live != unsafe { GPU_CLOCKED } {
+                unsafe { GPU_CLOCKED = live };
+                let r = if live {
+                    (crate::acpm::dvfs_set(8, 900_000), crate::acpm::dvfs_set(7, 890_000))
+                } else {
+                    (crate::acpm::dvfs_set(7, 150_000), crate::acpm::dvfs_set(8, 160_000))
+                };
+                crate::process::push_console(alloc::format!("gpu clock: {} ({:?})\n", if live { "G3D 890, G3DL2 900 MHz" } else { "the floor, 150 / 160 MHz" }, r).as_bytes());
+            }
         }
         // No sensors process running, whatever path ended it (its end is caught in end_process and kill as well): its block is forgotten, so the kernel never reads memory that may be another process's now. init's keeper starts it again.
         if now.wrapping_sub(sensors_check) > 4 * freq {
