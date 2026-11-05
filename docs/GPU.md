@@ -217,3 +217,39 @@ The GPU driver maps it coherent (MEMATTR index 6, shareable both ways) at GPU VA
 - the GPU driver as a resident service, taking jobs that name layers in the arena;
 - a typed Valhall instruction builder in Rust, generated from Mesa's `ISA.xml` and checked against tonight's verified words, which leads to kernels as Rust functions compiled on the device;
 - the attest screen's fresh mark as the first customer.
+
+## The resident service, and the attest mark's path (2026-11-05)
+
+**The service.**
+- `payloads/gpu` starts at every boot from init. It doesn't start after a jump, because Android ran the GPU and whether the hv cuts it off at the jump is the owner's open decision.
+- It boots the GPU once and serves `gpu`. A run names:
+  - code at an offset in the layer arena (copied into the service's 32-page executable region);
+  - a grid and a preload word;
+  - up to 16 uniforms.
+- The reply is the status and the job's µs.
+- Grants: slots 104-108, with the layer arena at 68 and `use gpu` at 24. The grants page is full at 108 slots (process.rs PREFS).
+- `payloads/gputest` is its first client. It builds the Mandelbrot through the valhall builder, runs it through the service, and checks every pixel against the CPU: 0 of 4096 differ, 1.0 ms at the 150 MHz floor.
+- **Open:** the GPU's clock. ABL leaves it at its floor and the kernel's clock policy never raises it. The service needs a clock request (DVFS domains 7 and 8, the L2 first).
+
+**The attest mark: one source (owner, 2026-11-05, "needs done").** The mark is tapuwae's attested Julia ball:
+- up to 1024 iterations a sample with eight running accumulators;
+- about 215 lines of shading a sample (ripples, two lamps, styles, engraving, arcs);
+- all f32, with tapuwae's own exp2, log2, sin and atan2;
+- one sample a pixel, then 16 per pixel in the fine pass (one 16-lane warp a pixel).
+
+A hand-encoded copy is ruled out: it would be a second implementation of tapuwae's shading. The path:
+1. **A recording lane type.** tapuwae's `orbit` and `shade` are generic over `Lane` / `Mask` / `Bits` (tapuwae lanes.rs). A GPU lane type records each operation into an SSA graph instead of computing it.
+   - Its `any()` answers yes: the blocks it guards are select-guarded inside, so running them always gives the same values.
+   - The loop's early exit is the one exception.
+2. **tapuwae's loop as a hook:** `for n in 0..MAX_ITER { …; if !running.any() { break } }` becomes a loop the lane type provides. It is a plain loop for F4 on NEON, and one recorded body with a real exit for the GPU (not 1024 unrolled copies). This is the one change in tapuwae.
+3. **The SSA layer in valhall:**
+   - instruction selection to the builder;
+   - register allocation (linear scan, values live across the loop pinned);
+   - the flow rules (waits on the instruction before a consumer, one 64-bit uniform slot an instruction).
+4. **The builder's missing instructions,** each encoded from Mesa's ISA.xml and checked on the device against the CPU, as the Mandelbrot was:
+   - select (MUX), min and max;
+   - reciprocal and reciprocal square root;
+   - float to int with rounding modes, and floor;
+   - the logic ops.
+   - `sqrt_rounded` must round correctly (one ulp moves the escape): an approximate reciprocal square root, then Newton steps, then a correction.
+5. **The ball as a kernel,** then attest drawing its mark through the service into the arena.
