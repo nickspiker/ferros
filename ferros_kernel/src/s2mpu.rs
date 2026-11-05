@@ -15,6 +15,7 @@ const BASE: usize = 0x131F_0000;
 const CTRL0: usize = 0x000;
 const CFG: usize = 0x010;
 const INTERRUPT_ENABLE_PER_VID_SET: usize = 0x020;
+const INTERRUPT_CLEAR: usize = 0x02C;
 const PROT_EN_PER_VID_SET: usize = 0x050;
 const ERR_RESP_PER_VID_SET: usize = 0x070;
 const VERSION: usize = 0x060;
@@ -91,7 +92,7 @@ fn fence_inner() -> u32 {
     if (dma.1 - 1) >> 30 != gb || (pool.0 != pool.1 && (pool.0 >> 30 != gb || (pool.1 - 1) >> 30 != gb)) {
         return 0xE3;
     }
-    fence_at(BASE, &raw mut WINDOW_TABLE, gb, 0xC, &|pa| (pa >= dma.0 && pa < dma.1) || (pa >= pool.0 && pa < pool.1))
+    fence_at(BASE, &raw mut WINDOW_TABLE, gb, 0xC, 1, &|pa| (pa >= dma.0 && pa < dma.1) || (pa >= pool.0 && pa < pool.1))
 }
 
 /// The DPU's fence (owner, 2026-11-04: bound the display's bus master as the HSI2 one is): VID 0, where the layer DMA arrives (its faults latched there), may **read** the two regions the display server points it at — `display-fb` and `display-phases` (cachemap) — and nothing else; it never writes (no write-back DMA). ABL leaves these S2MPUs off, which let the display engine read anything, the kernel included, at an address a process programs; a domain's reset turns them on over a table of power-on noise. Called at boot when the DPU is on and by the `dpu` switch after it powers the domains.
@@ -102,7 +103,7 @@ pub fn fence_dpu() -> u32 {
         0xE3
     } else {
         let allowed = |pa: usize| (pa >= fb.0 && pa < fb.1) || (pa >= ph.0 && pa < ph.1);
-        DPU_S2MPUS.iter().map(|&s| fence_at(s, &raw mut DPU_TABLE, gb, 0x4, &allowed)).find(|&r| r != 1).unwrap_or(1)
+        DPU_S2MPUS.iter().map(|&s| fence_at(s, &raw mut DPU_TABLE, gb, 0x4, 1, &allowed)).find(|&r| r != 1).unwrap_or(1)
     };
     DPU_RESULT.store(r, core::sync::atomic::Ordering::Relaxed);
     r
@@ -110,6 +111,35 @@ pub fn fence_dpu() -> u32 {
 
 /// The CPUCL0 block's S2MPU (zuma-s2mpu.dtsi s2mpu_s0_cpucl0, always on): in front of the CoreSight system's bus master (CSSYS, STM, the debug port's AXI path: the block's IPs in cmucal-sfr.c), not the cores, whose traffic reaches memory through the cluster. ABL and Android leave it open.
 pub const CPUCL0_S2MPU: usize = 0x29C5_0000;
+
+/// The HSI1 S2MPU (zuma-s2mpu.dtsi s2mpu_s0_hsi1): in front of PCIe ch0, the cellular modem's link, the one radio any base station can reach before anyone attests. ABL leaves it on with protection off (measured 2026-11-04: G#1209_0058 = 0), so the modem could DMA anywhere in DRAM, the kernel included; until then the modem driver also turned its protection off itself before the ROM boot.
+pub const MODEM_S2MPU: usize = 0x1209_0000;
+/// HSI1's power-domain status in the PMU (a plain read; bit 0 on): the S2MPU is reachable only while it is on.
+const PD_HSI1_STATUS: usize = 0x1546_2B04;
+/// The modem's carve-outs (zuma-rmem.dtsi): cp_rmem_1 (32 MiB: pktproc), cp_rmem (12 MiB: the IPC region, the boot image), cp_msi_rmem (one page: the MSI target). cp_aoc_rmem (G#197F_D000, in the AoC's SRAM) is left out: no fault has asked for it.
+const MODEM_CARVEOUTS: [(usize, usize); 3] = [(0xE800_0000, 0xEA00_0000), (0xEA40_0000, 0xEB00_0000), (0xF620_0000, 0xF620_1000)];
+static mut MODEM_TABLE: Smpt = Smpt([0; 32768]);
+static MODEM_RESULT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The modem's fence: read and write to its carve-outs as the device tree has them (zuma-rmem.dtsi: cp_rmem_1, cp_rmem, cp_msi_rmem), nothing else. Wider than the driver's own windows (cachemap `MODEM_WINDOWS`): the CP reads cp_rmem past the 4 MiB the driver maps (the first fence, to the driver's windows, faulted on a read at G#EA80_0000, 2026-11-04). VID 0, as the fault showed PCIe ch0's traffic arrives (as the WiFi chip's does on HSI2). G#E4: HSI1 not powered (left alone: an access with the domain down poisons EL3).
+pub fn fence_modem() -> u32 {
+    let w = MODEM_CARVEOUTS;
+    let gb = w[0].0 >> 30;
+    let r = if unsafe { read_volatile(PD_HSI1_STATUS as *const u32) } & 1 == 0 {
+        0xE4
+    } else if w.iter().any(|&(a, b)| a >> 30 != gb || (b - 1) >> 30 != gb) {
+        0xE3
+    } else {
+        fence_at(MODEM_S2MPU, &raw mut MODEM_TABLE, gb, 0xC, 1, &|pa| w.iter().any(|&(a, b)| pa >= a && pa < b))
+    };
+    MODEM_RESULT.store(r, core::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+/// Whether `base` is one of the DMA fences: no process writes one (process.rs SYS_MMIO_WRITE refuses it), whatever its grants; the fences are the kernel's (KERNEL-OUT.md "What stays").
+pub fn is_fence(base: usize) -> bool {
+    base == BASE || base == MODEM_S2MPU || base == CPUCL0_S2MPU || DPU_S2MPUS.contains(&base)
+}
 
 /// One S2MPU set to let no VID reach any memory (the hv's `s2mpu_deny_all` at the jump, the same steps): every context valid, every L1 entry no-access, invalidated and synced, then protection on with error responses. 1 done, G#E1 not a v9, G#E2 the sync never completed.
 pub fn deny_all(base: usize) -> u32 {
@@ -149,8 +179,8 @@ pub fn dpu_result() -> u32 {
     DPU_RESULT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// One S2MPU fenced: VID 0 reaches the pages of GiB `gb` that `allowed` names, with permission `perm` (SMPT nibble: G#4 read, G#8 write), through `table`; every other GiB and every other VID nothing.
-fn fence_at(base: usize, table: *mut Smpt, gb: usize, perm: u32, allowed: &dyn Fn(usize) -> bool) -> u32 {
+/// One S2MPU fenced: the VIDs in mask `vids` reach the pages of GiB `gb` that `allowed` names, with permission `perm` (SMPT nibble: G#4 read, G#8 write), through `table` (one table, shared by those VIDs); every other GiB and every other VID nothing.
+fn fence_at(base: usize, table: *mut Smpt, gb: usize, perm: u32, vids: u8, allowed: &dyn Fn(usize) -> bool) -> u32 {
     if rd(base, VERSION) & 0xFFFF_0000 != 0x9000_0000 {
         return 0xE1;
     }
@@ -186,7 +216,7 @@ fn fence_at(base: usize, table: *mut Smpt, gb: usize, perm: u32, allowed: &dyn F
     let tab = (table as usize >> 4) as u32;
     for vid in 0..VIDS {
         for g in (0..4).chain(34..GBS) {
-            if g == gb && vid == 0 {
+            if g == gb && vids >> vid & 1 == 1 {
                 wr(base, l1_table(vid, g), tab);
                 wr(base, l1_attr(vid, g), L2TABLE_EN);
             } else {
@@ -204,6 +234,8 @@ fn fence_at(base: usize, table: *mut Smpt, gb: usize, perm: u32, allowed: &dyn F
             return 0xE2;
         }
     }
+    // Faults latched before this fence (ABL's, a previous kernel's across a reload) cleared, so the report shows only what this fence refused.
+    wr(base, INTERRUPT_CLEAR, 0xFF);
     wr(base, ERR_RESP_PER_VID_SET, 0xFF);
     wr(base, INTERRUPT_ENABLE_PER_VID_SET, 0xFF);
     wr(base, CTRL0, 0);
@@ -217,6 +249,10 @@ pub fn report(out: &mut alloc::vec::Vec<u8>) {
     use crate::platform::append_hex;
     append_hex(out, b"S2MPU_FENCE=", result());
     faults(out, BASE);
+    append_hex(out, b"S2MPU_MODEM_FENCE=", MODEM_RESULT.load(core::sync::atomic::Ordering::Relaxed));
+    if unsafe { read_volatile(PD_HSI1_STATUS as *const u32) } & 1 == 1 {
+        faults(out, MODEM_S2MPU);
+    }
     append_hex(out, b"S2MPU_DPU_FENCE=", dpu_result());
     // The DPU's only while its domains are on: an access with a domain down poisons EL3 (display.rs).
     if crate::dpu_power::all_on() {

@@ -532,15 +532,10 @@ fn endpoint(rep: &mut Vec<u8>) -> bool {
     true
 }
 
-/// Stage 5: the ROM boot (start_normal_boot + set_cp_rom_boot_img): HSI1 S2MPU protection off so the CP can reach AP memory, BOOT section from modem.bin into G#EA41_0000, the control words and magic G#BDBD, the image address/size into the MSI page, doorbell G#1_0000, poll boot_stage for G#3FFF.
+/// Stage 5: the ROM boot (start_normal_boot + set_cp_rom_boot_img): the CP reaches AP memory through the kernel's fence on HSI1 (the shared-memory windows), BOOT section from modem.bin into G#EA41_0000, the control words and magic G#BDBD, the image address/size into the MSI page, doorbell G#1_0000, poll boot_stage for G#3FFF.
 fn rom_boot(rep: &mut Vec<u8>) {
-    // S2MPU v9: CTRL_PROT_EN_PER_VID_CLR (G#54) = all VIDs unprotected (cold_ufs did this for HSI2 before the fence).
-    if rd(S2MPU_HSI1 + 0x60) & 0xFFFF_0000 == 0x9000_0000 {
-        wr(S2MPU_HSI1 + 0x54, 0xFF);
-        kv(rep, "s2mpu_hsi1.prot_en after clear", rd(S2MPU_HSI1));
-    } else {
-        kv(rep, "s2mpu_hsi1 not v9, version", rd(S2MPU_HSI1 + 0x60));
-    }
+    // The CP reaches AP memory through HSI1's S2MPU, which the kernel fences to the shared-memory windows before this driver starts (kernel s2mpu::fence_modem); this driver may read it, never write it (2026-11-04: it turned protection off here until then). G#58 is the per-VID protection status.
+    kv(rep, "s2mpu_hsi1.prot (the kernel's fence)", rd(S2MPU_HSI1 + 0x58));
     let mut m = match crate::partfs::mount(MODEM_PART) {
         Ok(m) => m,
         Err(e) => return line(rep, alloc::format!("{e}\n")),

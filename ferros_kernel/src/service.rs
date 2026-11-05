@@ -1109,6 +1109,9 @@ pub fn run(mut b: Boot) -> ! {
     if !platform::jumped() {
         let r = crate::s2mpu::deny_all(crate::s2mpu::CPUCL0_S2MPU);
         crate::flashlog::line(&alloc::format!("cpucl0: the debug system's S2MPU denied all: G#{r:X} (1 = done)"));
+        // The modem's link fenced to its shared memory before init starts its driver (s2mpu::fence_modem). After a jump the hv has denied it all, and the modem is not started.
+        let r = crate::s2mpu::fence_modem();
+        crate::flashlog::line(&alloc::format!("modem: HSI1's S2MPU fenced to the shared-memory windows: G#{r:X} (1 = fenced)"));
     }
     // The device's opt-in to Android (ANDROID_ALLOWED), once.
     if let Some(st) = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()) {

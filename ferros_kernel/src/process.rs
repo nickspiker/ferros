@@ -1838,6 +1838,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     }
                     if off % 4 != 0 || off >= hw.size {
                         ERR
+                    } else if f.x[8] == SYS_MMIO_WRITE && crate::s2mpu::is_fence(hw.base) {
+                        // A DMA fence is the kernel's: a driver may read its own (for its report), never write it, so the device it drives cannot be let out by the code that talks to it (the modem driver turned HSI1's protection off itself until 2026-11-04).
+                        ERR
                     } else if f.x[8] == SYS_MMIO_READ {
                         // A read goes straight to the register even in a block only EL3 may write (the PMU): EL2 reads it, as the kernel's own drivers do, and the EL3 path refuses reads of what it does not list (G#FFFF_FFEA, -22: the modem driver's HSI1 power-domain status, 2026-10-29).
                         unsafe { core::ptr::read_volatile((hw.base + off) as *const u32) as u64 }
