@@ -25,3 +25,9 @@ Kernel side: `gpu-regs` (G#1F00_0000 16 MiB, EL0), `gpu-mem` (G#B400_0000 32 MiB
 **More traps:**
 - Pad every submission to 64 bytes: the CS front end caches the ring's 64-byte line, so a job that starts mid-line runs as stale NOPs.
 - A 32-bit sync object is 8 bytes: SYNC_SET32 zeroes the next word.
+
+**Coherency (2026-11-05):**
+- The GPU snoops the CPU's caches both ways when its page tables map the memory coherent (MEMATTR index 6 shared + SH both) with COHERENCY_ENABLE left at none (31). Setting ACE-Lite (0) broke all access.
+- So there's no dc cvac or copy for CPU↔GPU sharing; only the S2MPU fence must admit the region.
+- Clocks: ABL leaves the GPU at 150/160 MHz (`diag dvfs set 8 900000` then `set 7 890000` for the top). The present pass is memory-bound (MIF).
+- The present-stage kernel (92 instructions) spec is in Harbor /mnt/Harbor/tmp/mesa-panfrost/ferros-present-spec.md (with its model in the session scratchpad).
