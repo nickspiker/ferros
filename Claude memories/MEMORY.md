@@ -125,3 +125,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [f2fs roll-forward after a jump](f2fs_rollforward_after_jump.md) — jumps leave Android uncheckpointed; ferros_f2fs rolls forward read-only; `diag "part f2fs"`
 - [No baked apps](no_baked_apps.md) — one built-in circle (system settings); apps installed by the person; attest loads only attest; no identity = no device, no way past attest (owner 2026-11-04)
 - [Feedback: the jump is a killswitch](feedback_jump_is_killswitch.md) — Android is hostile once killed: never wait for or adopt what it started (UFS commands, links, DMA); crowbar it (reset/rails), then bring up fresh
+- [Radios at attest, GPS locked](radios_at_attest_gps_locked.md) — 2026-11-04: all radios up at attest (needs DMA fences, no stable IDs, signed-only actions); GPS never unattested except write-only locate; modem S2MPU open on cold boot

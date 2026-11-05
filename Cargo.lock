@@ -914,6 +914,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-gpu"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-hangtest"
 version = "0.1.0"
 
