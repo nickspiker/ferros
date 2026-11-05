@@ -159,7 +159,7 @@ pub fn start(cntfrq: u64, done: &[Item]) {
 
 // ---------------------------------------------------------------------------
 // The boot ring (owner's design 2026-10-22, redrawn to the owner's direction 2026-11-05): the attest screen's circle (ahau `mark_at`: the same centre and outer radius), a solid disc in its middle for how this boot began, and the boot's work around it.
-// - Angle is time: the full circle is the second from the press to home (the shell starts a second after the press), clockwise from 12 o'clock. Each wedge spans its step from when the step began to when it ended, so its angle is its duration. What stays black is time spent on nothing the ring shows: the ring's own drawing between wedges, then the wait for home.
+// - Angle is time: the full circle is the one-second budget from the press, clockwise from 12 o'clock. Each wedge spans its step from when the step began to when it ended, so its angle is its duration; the black between wedges is the ring's own drawing. Home starts the moment the boot path is done (the display server then takes the panel), so the ring stops where the boot did: what is left of the circle is the budget not spent.
 // - Lanes are cores: the boot path in the inner lane, work running beside it on another core (KOHI's TRNG words on worker 3) in the outer lane, at the same angles while they overlap. The two lanes have the same area, so a wedge's area is its duration whichever lane it is in.
 // - Colour is order: dark brick, brick, amber, then a bright lime, along the warm side only (nothing between magenta and green).
 // - The centre disc's colour is the boot's reason (`Reason`).
@@ -269,9 +269,6 @@ fn dir(a: i32) -> (i32, i32) {
     (sin_f(a), -sin_f(a + QUARTER))
 }
 
-/// Dev builds list each step under the ring as it comes up (owner, 2026-10-22); production shows the ring alone.
-const DEV: bool = cfg!(not(ferros_production));
-
 /// Integer square root (Newton), for the lanes' equal-area boundary.
 fn isqrt(n: i32) -> i32 {
     let mut x = n;
@@ -301,11 +298,6 @@ fn ring(p: &Panel) -> Ring {
     let mid = isqrt((r_in * r_in + r * r) / 2);
     let gap = r >> 6;
     Ring { cx: w / 2, cy: top + r, disc: r_in - (r >> 4), lanes: [(r_in, mid - gap / 2), (mid + gap - gap / 2, r)], seam: r >> 8 }
-}
-
-/// The dev list's first text row: the bottom half of the panel, at the old checklist's scale (console rows are 16 x SCALE px below a 160 px margin).
-fn list_row(p: &Panel) -> usize {
-    (p.rows / 2 - TOP) / (16 * SCALE) + 1
 }
 
 /// The colour ramp's stops, warm side only.
@@ -393,58 +385,6 @@ fn wedge(p: &Panel, g: &Ring, r1: i32, r2: i32, a0: i32, a1: i32, rgb: u32) {
     }
 }
 
-/// The drawn steps' rows for the dev list (step, µs from the ring's zero to its end, its µs, colour).
-static mut RING_ROWS: [(u8, u64, u64, u32); STEPS] = [(0, 0, 0, 0); STEPS];
-/// How many of them the list shows; the reason's row comes with the first.
-static mut ROWS_SHOWN: u32 = 0;
-/// The dev list's text, all of it on the service core (`draw_rows`). Oxanium blends over what is on the panel, and the boot surface is Device memory, so every glyph pixel is a bus read and a write: on the boot core that cost 180 ms of a 400 ms boot (2026-11-05), so the boot path draws only the wedges.
-static TEXT_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// One step's row: its name, when it ended (from the ring's zero) and how long it took, in the device's number base (tatau's digit glyphs, which the Oxanium +glyphs atlas carries).
-fn time_row(c: &Checklist, n: usize, s: u8, end_us: u64, us: u64, fg: u32) {
-    let mut t = alloc::string::String::new();
-    let _ = tatau::duration_ns(&mut t, tatau::Fmt::current(tatau::Style::Glyphs), end_us * 1000, 3);
-    let mut d = alloc::string::String::new();
-    let _ = tatau::duration_ns(&mut d, tatau::Fmt::current(tatau::Style::Glyphs), us * 1000, 3);
-    // Oxanium (text.rs): the name at the left, the times at tab stops, on rows nothing has drawn on yet.
-    let sf = surface(&c.panel);
-    let top = (TOP + (list_row(&c.panel) + n) * LINE_H) as i32;
-    sf.draw(LEFT as i32, top, STEP_NAME[s as usize], fg);
-    let pen = sf.draw((LEFT + TIME_TAB) as i32, top, "+", fg);
-    sf.draw(pen, top, &t, fg);
-    sf.draw((LEFT + DUR_TAB) as i32, top, &d, fg);
-}
-
-/// Where a step's end time starts, from the left margin (the longest name is about 21 characters wide), and where its duration starts.
-const TIME_TAB: usize = 23 * CHAR_W;
-const DUR_TAB: usize = 35 * CHAR_W;
-
-/// Dev builds: write the list rows of every step on the ring that has none yet, the reason's row above them first. The service loop calls it on every pass until home, so the rows come after the device's settings (its number base) and on the service core.
-pub fn draw_rows() {
-    let Some(c) = (unsafe { (*CHECKLIST.0.get()).as_mut() }) else {
-        return;
-    };
-    let (shown, n) = unsafe { (ROWS_SHOWN, RING_N) };
-    if !DEV || shown == n {
-        return;
-    }
-    let t0 = crate::platform::cntpct();
-    if shown == 0 {
-        // The reason in words, in the ring's brick so it reads on black.
-        let sf = surface(&c.panel);
-        let top = (TOP + (list_row(&c.panel) - 1) * LINE_H) as i32;
-        let pen = sf.draw(LEFT as i32, top, "boot: ", RAMP[1]);
-        sf.draw(pen, top, REASON_NAME[REASON.load(core::sync::atomic::Ordering::Relaxed) as usize], RAMP[1]);
-    }
-    for k in shown as usize..n as usize {
-        let (s, end_us, us, fg) = unsafe { (*(&raw const RING_ROWS))[k] };
-        time_row(c, k, s, end_us, us, fg);
-    }
-    unsafe { ROWS_SHOWN = n };
-    c.panel.present_nowait();
-    TEXT_TICKS.fetch_add(crate::platform::cntpct() - t0, core::sync::atomic::Ordering::Relaxed);
-}
-
 /// Which steps are on the ring, and how many.
 static mut RING_DRAWN: u32 = 0;
 static mut RING_N: u32 = 0;
@@ -482,10 +422,6 @@ pub fn draw_new() {
             let (r1, r2) = g.lanes[STEP_LANE[s] as usize];
             wedge(&c.panel, &g, r1, r2, a0 as i32, a1 as i32, rgb);
         }
-        // The step's row for the dev list (`draw_rows`): its name and times in its wedge's colour (the darkest lifted to brick so it reads on black).
-        let fg = if (rgb >> 16) & 0xFF < 0x80 { RAMP[1] } else { rgb };
-        let us = |t: u64| t * 1_000_000 / f;
-        unsafe { (*(&raw mut RING_ROWS))[n as usize] = (s as u8, us(e - z), us(e - b), fg) };
         unsafe { RING_N = n + 1 };
         drew = true;
     }
@@ -562,7 +498,7 @@ pub fn boot_times() -> alloc::string::String {
             s.push_str(&alloc::format!("  lane {} {:<22} {} .. {} us, A#{} us\n", STEP_LANE[k], STEP_NAME[k], at(b), at(en), us(en - b)));
         }
     }
-    s.push_str(&alloc::format!("  the ring's drawing A#{} us over A#{} steps; the dev list's text A#{} us, on the service core\n", us(DRAW_TICKS.load(Relaxed)), unsafe { RING_N }, us(TEXT_TICKS.load(Relaxed))));
+    s.push_str(&alloc::format!("  the ring's drawing A#{} us over A#{} steps\n", us(DRAW_TICKS.load(Relaxed)), unsafe { RING_N }));
     s
 }
 

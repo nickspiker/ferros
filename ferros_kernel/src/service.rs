@@ -1174,7 +1174,7 @@ pub fn run(mut b: Boot) -> ! {
         let now = cntpct();
         // A command from the USB process waiting: no sleep and no time slice before it runs.
         let inbox_full = crate::ptlink::INBOX_FULL.load(core::sync::atomic::Ordering::Relaxed);
-        // Home: a second after the press (the boot ring's time on the panel), start init and with it the shell; init starts the USB process among the rest.
+        // Home: start init (and with it the shell and the USB process) on the service loop's first pass, the moment the boot path is done. Until 2026-11-05 it waited for a second after the press (the boot ring's budget, 2026-10-22), which made every boot take at least a second whatever the work took (owner: "I CANNOT PUT BOOTS IN UNDER A SECOND IF WHEN I PRESS POWER IT TAKES EXACTLY 1S"). init's first spawn derives the wairua, which waits for KOHI's words from worker 3: that, not a timer, is what home waits on.
         // The wall clock, re-read hourly (rtc.rs), and the battery gauge every two seconds: both on this core, never inside a syscall.
         crate::rtc::poll();
         gauge_poll();
@@ -1194,16 +1194,10 @@ pub fn run(mut b: Boot) -> ! {
         }
         thermal_poll();
         if !home_started {
-            // The ring's steps that ended on other cores since (KOHI's words on worker 3), and the dev list's rows (its text kept off the boot path).
+            // Whatever the ring has that ended since the boot path (a step from another core), then home.
             crate::checklist::draw_new();
-            crate::checklist::draw_rows();
-            // From the press on a boot; from the service's start on a reload, which has no press. Until 2026-11-01 a reload started home when the host configured the kernel's own USB; without it, a reloaded kernel never started init, and so never the USB process (the first reload after the removal sat at the boot screen).
-            let press = crate::checklist::PRESS.load(core::sync::atomic::Ordering::Relaxed);
-            let from = if press != 0 { press } else { t_boot };
-            if now.wrapping_sub(from) > cntfrq() {
-                home_started = true;
-                let _ = start_home(&mut store);
-            }
+            home_started = true;
+            let _ = start_home(&mut store);
         }
 
         if now.wrapping_sub(t_heartbeat) > 64 * freq {
