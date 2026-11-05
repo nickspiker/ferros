@@ -104,6 +104,10 @@ const USER_IO_VA: u64 = 0x0420_0000;
 /// The group's own address space (1): its ring buffer and the buffer the job writes.
 const RING_VA: u64 = 0x1000_0000;
 const DST_VA: u64 = 0x2000_0000;
+/// The compute job's pages in address space 1: the shader (executable), its descriptors and uniforms, the buffer it writes and its done flag.
+const CODE_VA: u64 = 0x3000_0000;
+const DESC_VA: u64 = 0x3100_0000;
+const OUT_VA: u64 = 0x3200_0000;
 
 struct Gpu {
     regs: usize,
@@ -338,6 +342,13 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let dst = m.alloc(1);
     as1.map(&mut m, RING_VA, ring, 1, PAGE_RW | NC | NX, TABLE);
     as1.map(&mut m, DST_VA, dst, 1, PAGE_RW | NC | NX, TABLE);
+    // The compute job's pages: the shader non-cacheable and executable (the one page without execute-never), the descriptors and uniforms, the output.
+    let code = m.alloc(1);
+    let desc = m.alloc(1);
+    let out = m.alloc(1);
+    as1.map(&mut m, CODE_VA, code, 1, PAGE_RO | NC, TABLE);
+    as1.map(&mut m, DESC_VA, desc, 1, PAGE_RW | NC | NX, TABLE);
+    as1.map(&mut m, OUT_VA, out, 1, PAGE_RW | NC | NX, TABLE);
     if !g.install(1, as1.root) {
         g.fail("AS1 never went idle");
     }
@@ -432,6 +443,55 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // 0: MOVE48 r0:r1 = the destination, MOVE32 r2 = G#CAFE_F00D, SYNC_SET32 [r0:r1] = r2 (encodings kbase itself decodes, mali_kbase_csf_sync.c).
     wr32(dst, 0);
     ok &= run("sync_set", &[mv48(0, DST_VA), mv32(2, 0xCAFE_F00D), 0x26 << 56 | 0 << 40 | 2 << 32], &|| rd32(dst) == 0xCAFE_F00D);
+    // 2: compute (GPU.md "Compute"; the words from Mesa's v11 genxml, Valhall ISA.xml and its packer, cross-checked against Mesa's assembler test vectors): sixteen invocations in one workgroup, each storing G#C0FF_EE00 + its global id to out[id]; then the done flag. The shader, in Valhall:
+    //   IADD_IMM.i32 r0, r60, #G#C0FFEE00        (r60: the global id X, preloaded)
+    //   SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:2   (u0: the output's address, the first uniform)
+    //   STORE.i32.slot0.end @r0, [r2:r3], offset:0
+    for (k, w) in [0x0110_C0C0_FFEE_003Cu64, 0x01A3_C200_2027_3C80, 0x7861_4002_1800_0002].iter().enumerate() {
+        wr64(code + 8 * k, *w);
+    }
+    // The shader program descriptor (32 bytes): type 8 (shader), stage 1 (compute), 32 registers a thread; preload r60 (bit 12); the binary's address.
+    let (spd, tsd, fau) = (DESC_VA, DESC_VA + 0x40, DESC_VA + 0x80);
+    for (k, w) in [0x8000_0018u32, 0x0000_1000, CODE_VA as u32, (CODE_VA >> 32) as u32].iter().enumerate() {
+        wr32(desc + 4 * k, *w);
+    }
+    // The local storage descriptor: no thread storage, no workgroup memory (its G#8000_0000 packed as log2 31).
+    wr32(desc + 0x40 + 4, 0x1F);
+    // The uniforms: one 64-bit entry, the output's address.
+    wr64(desc + 0x80, OUT_VA);
+    for i in 0..32 {
+        wr32(out + 4 * i, 0);
+    }
+    let done = OUT_VA + 0x200;
+    let job = [
+        0x2200_0000_0000_0001u64,
+        0x1C00_0000_0000_0003,
+        0x1C00_0001_0000_0000,
+        mv48(0, 0),
+        mv32(8, fau as u32),
+        mv32(9, (fau >> 32) as u32 | 1 << 24),
+        mv48(16, spd),
+        mv48(24, tsd),
+        mv32(32, 0),
+        mv32(33, 0x8000_000F),
+        mv32(34, 0),
+        mv32(35, 0),
+        mv32(36, 0),
+        mv32(37, 1),
+        mv32(38, 1),
+        mv32(39, 1),
+        0x0400_0000_0000_8001,
+        0x0300_0000_0008_0000,
+        mv32(74, 0),
+        0x2400_4A00_0000_0211,
+        0x0300_0000_0001_0000,
+        mv48(70, done),
+        mv32(72, 1),
+        0x2600_4648_0000_0000,
+    ];
+    let all = || (0..16).all(|i| rd32(out + 4 * i) == 0xC0FF_EE00 + i as u32) && rd32(out + 0x200) == 1;
+    ok &= run("compute", &job, &all);
+    say!(grants, "gpu: compute output: G#{:X} G#{:X} G#{:X} … G#{:X}, done flag {}\n", rd32(out), rd32(out + 4), rd32(out + 8), rd32(out + 60), rd32(out + 0x200));
     say!(grants, "gpu: the target reads G#{:X} G#{:X} G#{:X}; {} KiB of gpu-mem used\n", rd32(dst), rd32(dst + 4), rd32(dst + 8), m.used() >> 10);
     exit(if ok { 0 } else { 1 });
 }
