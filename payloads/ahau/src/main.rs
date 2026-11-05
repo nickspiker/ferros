@@ -1476,7 +1476,10 @@ fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
     let moved_on = || fine && FRESH_GEN.load(core::sync::atomic::Ordering::Acquire) != g;
     let typed = core::str::from_utf8(&text[..n]).unwrap_or("");
     // Bound: the attest button, the whole disc at every change (it has no components to redraw alone), in the surface's own pixels (`pack16`, as `render_fresh` writes them: the G2t16 encoding first used here came out nearly white). Two passes, as the fresh mark's, through the same machinery (tapuwae `render_button_pack16`: the ball four samples to a lane call, as the fresh mark shades its components): one sample a pixel at once, then a 4 × 4 grid to clear it up, given up for a newer handle. The adaptive `Look::attest()` (up to 64 samples a pixel, one at a time) took 22 s for the first draw and 55 s a keystroke on the workers (2026-11-04).
-    let done = if unsafe { BONDED } {
+    // Experiment (2026-11-05, the owner watching): the CPU's 4 x 4 pass after a GPU quick pass held the workers for seconds and the mark froze behind it; skipped while the GPU draws, to confirm, until the fine passes run on the GPU too.
+    let done = if unsafe { BONDED } && fine && GPU_DREW.load(core::sync::atomic::Ordering::Relaxed) {
+        true
+    } else if unsafe { BONDED } {
         let p = tapuwae::Params::new_placed(&salt, typed, true);
         // The quick pass on the GPU when its service is up (GPU.md), before any helper is woken: when it is drawn there the helpers have nothing to do this pass (and must not write the rows it fills).
         let gpu_drawn = !fine && gpu_quick(grants, buf, side, r, &p);
