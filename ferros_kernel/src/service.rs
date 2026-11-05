@@ -1194,6 +1194,9 @@ pub fn run(mut b: Boot) -> ! {
         }
         thermal_poll();
         if !home_started {
+            // The ring's steps that ended on other cores since (KOHI's words on worker 3), and the dev list's rows (its text kept off the boot path).
+            crate::checklist::draw_new();
+            crate::checklist::draw_rows();
             // From the press on a boot; from the service's start on a reload, which has no press. Until 2026-11-01 a reload started home when the host configured the kernel's own USB; without it, a reloaded kernel never started init, and so never the USB process (the first reload after the removal sat at the boot screen).
             let press = crate::checklist::PRESS.load(core::sync::atomic::Ordering::Relaxed);
             let from = if press != 0 { press } else { t_boot };

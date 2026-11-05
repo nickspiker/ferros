@@ -1858,10 +1858,25 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     platform::crumb(0xC1);
     checklist::at("repeater read + tuned");
+    checklist::step(checklist::Step::Repeater);
     platform::pstore(b"ferros: repeater read and tuned\n");
 
+    // How this boot began, for the ring's centre: a RELOAD's tag, the hv's jump, then what the RAM kept — the previous session's report survives a warm reset and not a power-on, and its crumb says whether it ended in a panic.
+    let gate = ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed) & 0xFF;
+    checklist::set_reason(if dtb_addr & 1 == 1 {
+        checklist::Reason::Reload
+    } else if platform::jumped() || gate == 6 {
+        checklist::Reason::Jump
+    } else if prev.is_some_and(|r| r[3] >> 8 == 0xEE) {
+        checklist::Reason::Crash
+    } else if prev.is_some() || gate == 5 {
+        checklist::Reason::Restart
+    } else {
+        checklist::Reason::Cold
+    });
     // The road map on the panel (ABL's splash surface): what this boot has done so far is green.
     checklist::start(platform::cntfrq(), &[checklist::Item::Killswitch]);
+    checklist::step(checklist::Step::Panel);
     checklist::at("checklist drawn");
     platform::pstore(b"ferros: checklist drawn\n");
     // The board's CDT and MLB for the sensor registry scripts (sensorlink.rs, SYS_SENSORS op 1), while ABL's device tree is still where it put it: after the ring's first frame, so the walk (~120 ms before, uncached) is not between the press and the glass.
@@ -1874,6 +1889,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         modem::keep_bootconfig(at);
     }
     checklist::at("board read");
+    checklist::step(checklist::Step::Board);
     platform::pstore(b"ferros: board read\n");
     if cached {
         checklist::mark(checklist::Item::CacheMap);
@@ -1888,6 +1904,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // UFS: ABL leaves the flash unpowered (cold_ufs::power_on_device); bring the link up, then open the ira-rooted vault on the ferros partition exactly as the handoff path does.
     let t_ufs = platform::cntpct();
     let link_up = cold_ufs::bring_up();
+    checklist::step(checklist::Step::Disk);
     let ufs_ms = (platform::cntpct().wrapping_sub(t_ufs) / (platform::cntfrq() / 1000)) as u32;
     platform::pstore(if link_up { b"ferros: UFS link up\n" as &[u8] } else { b"ferros: UFS link DOWN\n" });
     if link_up {
@@ -1914,6 +1931,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         let ok = flashlog::init();
         flashlog::line(&alloc::format!("boot cold, flash log init {ok}"));
     }
+    checklist::step(checklist::Step::Log);
     let (probe, mut store) = vault_boot::vault_probe(link_up);
     let vault_ms = (platform::cntpct().wrapping_sub(t_vault) / (platform::cntfrq() / 1000)) as u32;
     if probe.opened == 1 {
@@ -1946,6 +1964,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         0
     };
     UFS_WP.store(ufs_wp, core::sync::atomic::Ordering::Relaxed);
+    checklist::step(checklist::Step::Protect);
 
     platform::crumb(0xE4);
     platform::pstore(b"ferros: vault opened, flash write-protect armed\n");
@@ -1961,6 +1980,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     } else {
         slot::SlotMark { slot: 0xFF, before: 0, after: 0, result: 0xFF }
     };
+    checklist::step(checklist::Step::Slot);
 
     // The device's settings (SETTINGS.md, settings.rs): one VSF document under `device`, loaded here so everything drawn from now on reads in them. Defaults first (DMS, tatau's house base; brightness 2, white about 147 cd/m²; Dvorak; everything else 0), then whatever the document carries. An identity's preferences replace them when that identity attests; nothing here ever writes them back to an identity.
     process::set_pref(process::PREF_BASE, tatau::base().code());
@@ -1977,7 +1997,6 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         }
     }
     platform::crumb(0xE5);
-    checklist::base_known();
 
     // The first process is no longer started here: the vault's `init` starts when the boot ring completes (service.rs `start_home`), holding the shell's capabilities, and starts the shell itself (owner, 2026-10-22).
     let init_exit = 0u32;
@@ -2007,6 +2026,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     ];
     // RELOAD stages at base+32 MiB (the slot the old ping-pong reload proved on hardware; base+64 MiB was fatal) and runs its copy stub 64 KiB below it, far past this image + stack + 4 MiB heap.
     platform::crumb(0xE6);
+    checklist::step(checklist::Step::Settings);
     checklist::at("service start");
     let boot = service::Boot {
         kind: service::BootKind::Cold,

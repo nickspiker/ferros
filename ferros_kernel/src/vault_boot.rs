@@ -75,6 +75,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     };
 
     crate::platform::pstore(b"ferros: tune, ASV, HPM and DVFS read\n");
+    crate::checklist::step(crate::checklist::Step::Ira);
     // No valid ira, no vault (PIPE: refuse to operate). The probe reports why.
     let Ok(ira) = ira.as_mut() else {
         return (p, None);
@@ -91,7 +92,9 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     crate::platform::pstore(b"ferros: opening the vault\n");
     crate::platform::mark_trail(0x16);
     crumb(0xE0); // before KVault::open (manifestus open ladder: bootstrap the spine, or genesis a blank pair of regions)
-    match crate::kvault::KVault::open(ira) {
+    let opened = crate::kvault::KVault::open(ira);
+    crate::checklist::step(crate::checklist::Step::Vault);
+    match opened {
         Ok(mut store) => {
             p.opened = 1;
             crate::flashlog::line(&alloc::format!("kvault open ok in {} ms: {}", (crate::platform::cntpct() - t_open) / (crate::platform::cntfrq() / 1000), store.describe()));
@@ -117,6 +120,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
                 let r = blake3::hash(store.describe().as_bytes());
                 p.root16.copy_from_slice(&r.as_bytes()[..16]);
             }
+            crate::checklist::step(crate::checklist::Step::Verify);
             kept = Some(store);
         }
         Err(e) => {

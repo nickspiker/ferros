@@ -141,11 +141,6 @@ fn surface(p: &Panel) -> crate::text::Surface {
     crate::text::Surface { fb: p.fb as *mut u32, width: p.width, height: p.rows, stride: p.stride }
 }
 
-fn redraw(c: &Checklist, item: Item) {
-    light(c, item);
-    c.panel.present_nowait();
-}
-
 /// Adopt the panel and draw the whole list; `done` items start green. No-op (and every later `mark` too) if there is no panel to drive.
 pub fn start(cntfrq: u64, done: &[Item]) {
     let mut rep = alloc::vec::Vec::new();
@@ -163,15 +158,94 @@ pub fn start(cntfrq: u64, done: &[Item]) {
 }
 
 // ---------------------------------------------------------------------------
-// The boot ring (owner's design, 2026-10-22): the moment the press lands the screen goes black with one solid dark-brick disc in the middle, no stroke; around it each boot step lights a slice, clockwise from 12 o'clock, styled on logo.svg's phase-diagram slices of iron.
-// - Angle is time: the full circle is the 1 s press-to-ready budget, and each slice spans its step, from the previous step's end to its own (a minimum width so the sub-millisecond steps still show). What stays black at the end is headroom.
-// - Bottom and top (inner and outer radius) are the kind of step, banded like phases: hardware bring-up low against the disc, the disk next, trust (vault, ira, entropy) higher, the link and the processes outermost.
+// The boot ring (owner's design 2026-10-22, redrawn to the owner's direction 2026-11-05): the attest screen's circle (ahau `mark_at`: the same centre and outer radius), a solid disc in its middle for how this boot began, and the boot's work around it.
+// - Angle is time: the full circle is the second from the press to home (the shell starts a second after the press), clockwise from 12 o'clock. Each wedge spans its step from when the step began to when it ended, so its angle is its duration. What stays black is time spent on nothing the ring shows: the ring's own drawing between wedges, then the wait for home.
+// - Lanes are cores: the boot path in the inner lane, work running beside it on another core (KOHI's TRNG words on worker 3) in the outer lane, at the same angles while they overlap. The two lanes have the same area, so a wedge's area is its duration whichever lane it is in.
 // - Colour is order: dark brick, brick, amber, then a bright lime, along the warm side only (nothing between magenta and green).
-// All integer: a Q14 quarter-wave sine table and cross products, each slice drawn only inside its own bounding box.
+// - The centre disc's colour is the boot's reason (`Reason`).
+// All integer: a Q14 quarter-wave sine table interpolated to 1/2^18 turn, and cross products, each wedge drawn only inside its own bounding box.
+
+/// How this boot began, for the centre disc (main.rs `set_reason`, before the ring is drawn).
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum Reason {
+    /// Nothing survived in RAM: the power came on.
+    Cold,
+    /// RAM survived a reset (the previous session's report is still there), or the hv's chord reset into ferros. A watchdog bite reads as this too.
+    Restart,
+    /// The hv's jump from a running Android.
+    Jump,
+    /// A RELOAD from the host: a new kernel on a device that has already booted.
+    Reload,
+    /// The previous session ended in a panic (its report's crumb G#EExx).
+    Crash,
+}
+const REASON_NAME: [&str; 5] = ["cold", "restart", "jump from Android", "reload", "after a panic"];
+const REASON_RGB: [u32; 5] = [0x003C_0200, 0x003C_2C00, 0x0000_1A3C, 0x002C_003C, 0x009C_0000];
+static REASON: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+pub fn set_reason(r: Reason) {
+    REASON.store(r as u8, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The boot's steps on the ring, in the order the boot path runs them; the last runs beside it on worker 3.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum Step {
+    Repeater,
+    Panel,
+    Board,
+    Disk,
+    Log,
+    Ira,
+    Vault,
+    Verify,
+    Protect,
+    Slot,
+    Settings,
+    Kohi,
+}
+const STEPS: usize = 12;
+const STEP_NAME: [&str; STEPS] = ["eUSB repeater tuned", "panel adopted", "board read", "disk: UFS link", "flash log", "ira", "vault opened", "vault verified", "flash write-protect", "slot marked", "settings + service", "KOHI: TRNG, worker 3"];
+/// 0: the boot path (inner lane). 1: beside it on another core (outer lane).
+const STEP_LANE: [u8; STEPS] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+static BEGIN: [core::sync::atomic::AtomicU64; STEPS] = [const { core::sync::atomic::AtomicU64::new(0) }; STEPS];
+static END: [core::sync::atomic::AtomicU64; STEPS] = [const { core::sync::atomic::AtomicU64::new(0) }; STEPS];
+/// Where the boot path's last step ended (after its wedge was drawn): the next one begins there.
+static PATH_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The ring's own drawing on the boot path (the disc, the wedges, the frame pushes), summed in counter ticks, for `diag boot`.
+static DRAW_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The ring's zero: the press, or the kernel's entry when there was none (a RELOAD).
+fn zero() -> u64 {
+    use core::sync::atomic::Ordering::Relaxed;
+    let p = PRESS.load(Relaxed);
+    if p != 0 { p } else { ENTRY.load(Relaxed) }
+}
+
+/// A boot-path step has ended: it began where the last one ended (the ring's zero for the first). Drawn now if the ring is up; the drawing's time is left out of the next step, so it shows as the black between wedges.
+pub fn step(s: Step) {
+    use core::sync::atomic::Ordering::{Relaxed, Release};
+    let b = PATH_AT.load(Relaxed);
+    BEGIN[s as usize].store(if b != 0 { b } else { zero() }, Relaxed);
+    END[s as usize].store(crate::platform::cntpct(), Release);
+    draw_new();
+    PATH_AT.store(crate::platform::cntpct(), Relaxed);
+}
+
+/// A step on another core began (stamped from any core; drawn by the boot path's or the service loop's next `draw_new` after its `end`).
+pub fn begin(s: Step) {
+    BEGIN[s as usize].store(crate::platform::cntpct(), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// A step on another core ended.
+pub fn end(s: Step) {
+    END[s as usize].store(crate::platform::cntpct(), core::sync::atomic::Ordering::Release);
+}
 
 /// Quarter-wave sine, Q14, 257 entries over 0..=90 degrees.
 const SIN_Q14: [i32; 257] = [0, 101, 201, 302, 402, 503, 603, 704, 804, 904, 1005, 1105, 1205, 1306, 1406, 1506, 1606, 1706, 1806, 1906, 2006, 2105, 2205, 2305, 2404, 2503, 2603, 2702, 2801, 2900, 2999, 3098, 3196, 3295, 3393, 3492, 3590, 3688, 3786, 3883, 3981, 4078, 4176, 4273, 4370, 4467, 4563, 4660, 4756, 4852, 4948, 5044, 5139, 5235, 5330, 5425, 5520, 5614, 5708, 5803, 5897, 5990, 6084, 6177, 6270, 6363, 6455, 6547, 6639, 6731, 6823, 6914, 7005, 7096, 7186, 7276, 7366, 7456, 7545, 7635, 7723, 7812, 7900, 7988, 8076, 8163, 8250, 8337, 8423, 8509, 8595, 8680, 8765, 8850, 8935, 9019, 9102, 9186, 9269, 9352, 9434, 9516, 9598, 9679, 9760, 9841, 9921, 10001, 10080, 10159, 10238, 10316, 10394, 10471, 10549, 10625, 10702, 10778, 10853, 10928, 11003, 11077, 11151, 11224, 11297, 11370, 11442, 11514, 11585, 11656, 11727, 11797, 11866, 11935, 12004, 12072, 12140, 12207, 12274, 12340, 12406, 12472, 12537, 12601, 12665, 12729, 12792, 12854, 12916, 12978, 13039, 13100, 13160, 13219, 13279, 13337, 13395, 13453, 13510, 13567, 13623, 13678, 13733, 13788, 13842, 13896, 13949, 14001, 14053, 14104, 14155, 14206, 14256, 14305, 14354, 14402, 14449, 14497, 14543, 14589, 14635, 14680, 14724, 14768, 14811, 14854, 14896, 14937, 14978, 15019, 15059, 15098, 15137, 15175, 15213, 15250, 15286, 15322, 15357, 15392, 15426, 15460, 15493, 15525, 15557, 15588, 15619, 15649, 15679, 15707, 15736, 15763, 15791, 15817, 15843, 15868, 15893, 15917, 15941, 15964, 15986, 16008, 16029, 16049, 16069, 16088, 16107, 16125, 16143, 16160, 16176, 16192, 16207, 16221, 16235, 16248, 16261, 16273, 16284, 16295, 16305, 16315, 16324, 16332, 16340, 16347, 16353, 16359, 16364, 16369, 16373, 16376, 16379, 16381, 16383, 16384, 16384];
-/// Angles are in 1/1024 turns, 0 at 12 o'clock, clockwise.
+/// Angles in 1/1024 turns for the table, 0 at 12 o'clock, clockwise.
 const TURN: i32 = 1024;
 fn sin_t(t: i32) -> i32 {
     let t = t.rem_euclid(TURN);
@@ -182,29 +256,51 @@ fn sin_t(t: i32) -> i32 {
         _ => -SIN_Q14[(TURN - t) as usize],
     }
 }
-/// The screen direction of angle `t`, Q14: x right, y down, 0 straight up.
-fn dir(t: i32) -> (i32, i32) {
-    (sin_t(t), -sin_t(t + 256))
+/// Fine angles: 1/2^18 turn (a quarter is 2^16), the table interpolated across its 256ths, so a wedge's angle follows its µs rather than whole milliseconds.
+const FINE: i32 = 1 << 18;
+const QUARTER: i32 = 1 << 16;
+fn sin_f(a: i32) -> i32 {
+    let (t, f) = (a >> 8, a & 255);
+    let (s0, s1) = (sin_t(t), sin_t(t + 1));
+    s0 + ((s1 - s0) * f >> 8)
+}
+/// The screen direction of fine angle `a`, Q14: x right, y down, 0 straight up.
+fn dir(a: i32) -> (i32, i32) {
+    (sin_f(a), -sin_f(a + QUARTER))
 }
 
-/// Dev builds put the ring in the top half and list each step as it comes up in the bottom half (owner, 2026-10-22); production centres the ring and shows nothing else.
+/// Dev builds list each step under the ring as it comes up (owner, 2026-10-22); production shows the ring alone.
 const DEV: bool = cfg!(not(ferros_production));
 
-/// The ring's centre: the middle of the panel, or of its top half in a dev build.
-fn centre(p: &Panel) -> (i32, i32) {
-    ((p.width / 2) as i32, if DEV { (p.rows / 4) as i32 } else { (p.rows / 2) as i32 })
+/// Integer square root (Newton), for the lanes' equal-area boundary.
+fn isqrt(n: i32) -> i32 {
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
 }
 
-/// A step's name, as the old checklist labelled it.
-fn label_of(item: Item) -> &'static str {
-    for (_, items) in GROUPS.iter() {
-        for &(it, label) in items.iter() {
-            if it as u8 == item as u8 {
-                return label;
-            }
-        }
-    }
-    "?"
+/// The ring's geometry, from the panel's width as the attest circle's (ahau `mark_at`): centre x, centre y, and the radii — the reason disc, the inner lane, the outer lane — each lane's (from, to).
+struct Ring {
+    cx: i32,
+    cy: i32,
+    disc: i32,
+    lanes: [(i32, i32); 2],
+    /// The dark line along each wedge's start, so neighbouring steps read apart.
+    seam: i32,
+}
+fn ring(p: &Panel) -> Ring {
+    let w = p.width as i32;
+    let r = w / 3;
+    let top = w * 473 / 5376 + w / 64;
+    // The lanes span r/2 to r, split where the areas match (r_mid² is the mean of r_in² and r_out²), with a gap of r/64 between them.
+    let r_in = r / 2;
+    let mid = isqrt((r_in * r_in + r * r) / 2);
+    let gap = r >> 6;
+    Ring { cx: w / 2, cy: top + r, disc: r_in - (r >> 4), lanes: [(r_in, mid - gap / 2), (mid + gap - gap / 2, r)], seam: r >> 8 }
 }
 
 /// The dev list's first text row: the bottom half of the panel, at the old checklist's scale (console rows are 16 x SCALE px below a 160 px margin).
@@ -212,23 +308,8 @@ fn list_row(p: &Panel) -> usize {
     (p.rows / 2 - TOP) / (16 * SCALE) + 1
 }
 
-const DISC: u32 = 0x003C_0200;
-/// The disc's radius and the slices' bands, in panel pixels (1344 wide).
-const R_DISC: i32 = 230;
-const BUDGET_US: u64 = 1_000_000;
-const MIN_TURN: i32 = 11;
-const GAP_TURN: i32 = 2;
 /// The colour ramp's stops, warm side only.
 const RAMP: [u32; 4] = [0x003C_0200, 0x00BB_3700, 0x00E4_B200, 0x00B4_FF00];
-
-fn band(item: Item) -> (i32, i32) {
-    match item {
-        Item::Killswitch | Item::CacheMap | Item::Panel => (250, 360),
-        Item::Disk | Item::Slot => (300, 470),
-        Item::VaultOpen | Item::VaultVerified | Item::Ira | Item::Wairua => (360, 560),
-        _ => (420, 640),
-    }
-}
 
 fn ramp(i: u32, n: u32) -> u32 {
     let n = n.max(2);
@@ -252,22 +333,25 @@ fn ring_start(p: &Panel) {
     // The gate left the screen black but for its own word and arrows: clear just those (the gate is cold-only; ready.rs is not built for the handoff).
     #[cfg(not(shim_handoff))]
     crate::ready::erase(p);
-    let (cx, cy) = centre(p);
-    for y in -R_DISC..=R_DISC {
-        for x in -R_DISC..=R_DISC {
-            if x * x + y * y <= R_DISC * R_DISC {
-                put(p, cx + x, cy + y, DISC);
+    let t_d = crate::platform::cntpct();
+    let g = ring(p);
+    let reason = REASON.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let rgb = REASON_RGB[reason];
+    for y in -g.disc..=g.disc {
+        for x in -g.disc..=g.disc {
+            if x * x + y * y <= g.disc * g.disc {
+                put(p, g.cx + x, g.cy + y, rgb);
             }
         }
     }
+    DRAW_TICKS.fetch_add(crate::platform::cntpct() - t_d, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// One slice: the annulus band [r1, r2) between angles t0 and t1 (1/1024 turns), split into pieces of at most a quarter turn so each is a convex sector the cross-product test can take.
-fn slice(p: &Panel, r1: i32, r2: i32, t0: i32, t1: i32, rgb: u32) {
-    let (cx, cy) = centre(p);
-    let mut a = t0;
-    while a < t1 {
-        let b = (a + 256).min(t1);
+/// One wedge: the annulus [r1, r2) between fine angles a0 and a1, split into pieces of at most a quarter turn so each is a convex sector the cross-product test can take. The first `seam` pixels along the start ray stay dark.
+fn wedge(p: &Panel, g: &Ring, r1: i32, r2: i32, a0: i32, a1: i32, rgb: u32) {
+    let mut a = a0;
+    while a < a1 {
+        let b = (a + QUARTER).min(a1);
         let (d0, d1) = (dir(a), dir(b));
         // Bounding box: the four corners, plus any axis extreme the piece crosses.
         let mut xs = [0i32; 8];
@@ -278,8 +362,8 @@ fn slice(p: &Panel, r1: i32, r2: i32, t0: i32, t1: i32, rgb: u32) {
             ys[n] = d.1 * r >> 14;
             n += 1;
         }
-        for q in [0, 256, 512, 768] {
-            let qa = if q < a { q + TURN } else { q };
+        for q in [0, QUARTER, 2 * QUARTER, 3 * QUARTER] {
+            let qa = if q < a { q + FINE } else { q };
             if qa > a && qa < b {
                 let d = dir(q);
                 xs[n] = d.0 * r2 >> 14;
@@ -289,6 +373,8 @@ fn slice(p: &Panel, r1: i32, r2: i32, t0: i32, t1: i32, rgb: u32) {
         }
         let (x0, x1) = (*xs[..n].iter().min().unwrap() - 1, *xs[..n].iter().max().unwrap() + 1);
         let (y0, y1) = (*ys[..n].iter().min().unwrap() - 1, *ys[..n].iter().max().unwrap() + 1);
+        // The seam on the wedge's first piece only: c0 is the distance from the start ray in Q14 (the direction is unit length in Q14).
+        let seam = if a == a0 { (g.seam as i64) << 14 } else { 0 };
         for y in y0..=y1 {
             for x in x0..=x1 {
                 let rr = x * x + y * y;
@@ -298,8 +384,8 @@ fn slice(p: &Panel, r1: i32, r2: i32, t0: i32, t1: i32, rgb: u32) {
                 // Inside the piece: on the clockwise side of its start ray and the anticlockwise side of its end ray.
                 let c0 = d0.0 as i64 * y as i64 - d0.1 as i64 * x as i64;
                 let c1 = x as i64 * d1.1 as i64 - y as i64 * d1.0 as i64;
-                if c0 >= 0 && c1 >= 0 {
-                    put(p, cx + x, cy + y, rgb);
+                if c0 >= seam && c1 >= 0 {
+                    put(p, g.cx + x, g.cy + y, rgb);
                 }
             }
         }
@@ -307,85 +393,108 @@ fn slice(p: &Panel, r1: i32, r2: i32, t0: i32, t1: i32, rgb: u32) {
     }
 }
 
-/// The lit steps' rows (item, µs since the press, colour), so the times can be drawn again in the device's base once the vault has said what it is (`base_known`).
-const TIMED: usize = 16;
-static mut RING_ROWS: [(Item, u64, u32); TIMED] = [(Item::Arcs, 0, 0); TIMED];
+/// The drawn steps' rows for the dev list (step, µs from the ring's zero to its end, its µs, colour).
+static mut RING_ROWS: [(u8, u64, u64, u32); STEPS] = [(0, 0, 0, 0); STEPS];
+/// How many of them the list shows; the reason's row comes with the first.
+static mut ROWS_SHOWN: u32 = 0;
+/// The dev list's text, all of it on the service core (`draw_rows`). Oxanium blends over what is on the panel, and the boot surface is Device memory, so every glyph pixel is a bus read and a write: on the boot core that cost 180 ms of a 400 ms boot (2026-11-05), so the boot path draws only the wedges.
+static TEXT_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// One step's row: its name and its time since the press, in the device's number base (tatau's digit glyphs, which the Oxanium +glyphs atlas carries).
-fn time_row(c: &Checklist, n: usize, item: Item, us: u64, fg: u32) {
+/// One step's row: its name, when it ended (from the ring's zero) and how long it took, in the device's number base (tatau's digit glyphs, which the Oxanium +glyphs atlas carries).
+fn time_row(c: &Checklist, n: usize, s: u8, end_us: u64, us: u64, fg: u32) {
     let mut t = alloc::string::String::new();
-    let _ = tatau::duration_ns(&mut t, tatau::Fmt::current(tatau::Style::Glyphs), us * 1000, 3);
-    // Oxanium (text.rs): the name at the left, the time at a tab stop, the row cleared first so a redraw in the device's base replaces the old one.
+    let _ = tatau::duration_ns(&mut t, tatau::Fmt::current(tatau::Style::Glyphs), end_us * 1000, 3);
+    let mut d = alloc::string::String::new();
+    let _ = tatau::duration_ns(&mut d, tatau::Fmt::current(tatau::Style::Glyphs), us * 1000, 3);
+    // Oxanium (text.rs): the name at the left, the times at tab stops, on rows nothing has drawn on yet.
     let sf = surface(&c.panel);
-    let top = TOP + (list_row(&c.panel) + n) * LINE_H;
-    sf.fill(LEFT, top, c.panel.width.saturating_sub(2 * LEFT), LINE_H, 0);
-    sf.draw(LEFT as i32, top as i32, label_of(item), fg);
-    let pen = sf.draw((LEFT + TIME_TAB) as i32, top as i32, "+", fg);
-    sf.draw(pen, top as i32, &t, fg);
+    let top = (TOP + (list_row(&c.panel) + n) * LINE_H) as i32;
+    sf.draw(LEFT as i32, top, STEP_NAME[s as usize], fg);
+    let pen = sf.draw((LEFT + TIME_TAB) as i32, top, "+", fg);
+    sf.draw(pen, top, &t, fg);
+    sf.draw((LEFT + DUR_TAB) as i32, top, &d, fg);
 }
 
-/// Where a step's time starts, from the left margin (the longest label is about 26 characters wide).
-const TIME_TAB: usize = 29 * CHAR_W;
+/// Where a step's end time starts, from the left margin (the longest name is about 21 characters wide), and where its duration starts.
+const TIME_TAB: usize = 23 * CHAR_W;
+const DUR_TAB: usize = 35 * CHAR_W;
 
-/// The device's number base is known (main.rs, after the vault): every step drawn before it was drawn in the default base, so draw their times again.
-pub fn base_known() {
+/// Dev builds: write the list rows of every step on the ring that has none yet, the reason's row above them first. The service loop calls it on every pass until home, so the rows come after the device's settings (its number base) and on the service core.
+pub fn draw_rows() {
     let Some(c) = (unsafe { (*CHECKLIST.0.get()).as_mut() }) else {
         return;
     };
-    if !DEV {
+    let (shown, n) = unsafe { (ROWS_SHOWN, RING_N) };
+    if !DEV || shown == n {
         return;
     }
-    let n = (unsafe { RING_N } as usize).min(TIMED);
-    for k in 0..n {
-        let (item, us, fg) = unsafe { (*(&raw const RING_ROWS))[k] };
-        time_row(c, k, item, us, fg);
+    let t0 = crate::platform::cntpct();
+    if shown == 0 {
+        // The reason in words, in the ring's brick so it reads on black.
+        let sf = surface(&c.panel);
+        let top = (TOP + (list_row(&c.panel) - 1) * LINE_H) as i32;
+        let pen = sf.draw(LEFT as i32, top, "boot: ", RAMP[1]);
+        sf.draw(pen, top, REASON_NAME[REASON.load(core::sync::atomic::Ordering::Relaxed) as usize], RAMP[1]);
     }
+    for k in shown as usize..n as usize {
+        let (s, end_us, us, fg) = unsafe { (*(&raw const RING_ROWS))[k] };
+        time_row(c, k, s, end_us, us, fg);
+    }
+    unsafe { ROWS_SHOWN = n };
+    c.panel.present_nowait();
+    TEXT_TICKS.fetch_add(crate::platform::cntpct() - t0, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Where the ring has got to, in 1/1024 turns, and how many slices are lit.
-static mut RING_AT: i32 = 0;
+/// Which steps are on the ring, and how many.
+static mut RING_DRAWN: u32 = 0;
 static mut RING_N: u32 = 0;
-static mut RING_LIT: u32 = 0;
-/// How many steps a cold boot lights after the press, so the ramp ends on lime at the last one: cache map, entropy, disk, vault opened, vault verified, ira, slot, USB (measured 2026-10-22).
-const RING_STEPS: u32 = 8;
 
-/// Light `item`'s slice: from where the ring has got to, to this moment's place in the 1 s budget.
-fn light(c: &Checklist, item: Item) {
-    use core::sync::atomic::Ordering::Relaxed;
-    let press = PRESS.load(Relaxed);
-    let now = crate::platform::cntpct();
-    let f = crate::platform::cntfrq();
-    let us = if press == 0 { 0 } else { now.saturating_sub(press) * 1_000_000 / f };
-    let target = ((us.min(BUDGET_US) * TURN as u64) / BUDGET_US) as i32;
-    unsafe {
-        // Each step lights once: a later `suffix` or interim-to-done redraw of the same item draws nothing new.
-        let lit = &raw mut RING_LIT;
-        if *lit & (1 << item as u8) != 0 {
-            return;
+/// Draw every step that has ended and is not on the ring yet, then push a frame if any was. The boot path calls it at each step, then the service loop on every pass until home (for the steps on other cores): one core at a time, never from an IRQ.
+pub fn draw_new() {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed};
+    let Some(c) = (unsafe { (*CHECKLIST.0.get()).as_mut() }) else {
+        return;
+    };
+    let t_draw = crate::platform::cntpct();
+    let (z, f) = (zero(), crate::platform::cntfrq());
+    let g = ring(&c.panel);
+    let mut drew = false;
+    for s in 0..STEPS {
+        let e = END[s].load(Acquire);
+        if e == 0 || unsafe { RING_DRAWN } & (1 << s) != 0 {
+            continue;
         }
-        *lit |= 1 << item as u8;
-        let (at, n) = (&raw mut RING_AT, &raw mut RING_N);
-        let t0 = *at;
-        let t1 = target.max(t0 + MIN_TURN).min(TURN);
-        if t1 > t0 {
-            let (r1, r2) = band(item);
-            let rgb = ramp(*n, RING_STEPS);
-            slice(&c.panel, r1, r2, t0, t1 - GAP_TURN, rgb);
-            if DEV {
-                // The step's name and its time since the press, in its slice's colour (the darkest lifted to brick so it reads on black).
-                let fg = if (rgb >> 16) & 0xFF < 0x80 { RAMP[1] } else { rgb };
-                if (*n as usize) < TIMED {
-                    (*(&raw mut RING_ROWS))[*n as usize] = (item, us, fg);
-                }
-                time_row(c, *n as usize, item, us, fg);
-            }
-            *at = t1;
-            *n += 1;
+        unsafe { RING_DRAWN |= 1 << s };
+        // A step that ended before the ring's zero (KOHI finishing during a long wait at the gate) took none of the boot's time: it has no wedge and no row.
+        if e <= z {
+            continue;
         }
+        // One that began before the zero (KOHI starts before the gate) is drawn from the zero: the time before the press is the person's, not the boot's.
+        let b = BEGIN[s].load(Relaxed);
+        let b = if b > z { b } else { z };
+        let fine = |t: u64| ((t - z) * FINE as u64 / f) as i64;
+        let a0 = fine(b);
+        // The circle is the second to home; a step's time past it is off the ring (`diag boot` still lists it).
+        let a1 = if fine(e) < FINE as i64 { fine(e) } else { FINE as i64 };
+        let n = unsafe { RING_N };
+        let rgb = ramp(n, STEPS as u32);
+        if a0 < a1 {
+            let (r1, r2) = g.lanes[STEP_LANE[s] as usize];
+            wedge(&c.panel, &g, r1, r2, a0 as i32, a1 as i32, rgb);
+        }
+        // The step's row for the dev list (`draw_rows`): its name and times in its wedge's colour (the darkest lifted to brick so it reads on black).
+        let fg = if (rgb >> 16) & 0xFF < 0x80 { RAMP[1] } else { rgb };
+        let us = |t: u64| t * 1_000_000 / f;
+        unsafe { (*(&raw mut RING_ROWS))[n as usize] = (s as u8, us(e - z), us(e - b), fg) };
+        unsafe { RING_N = n + 1 };
+        drew = true;
+    }
+    if drew {
+        c.panel.present_nowait();
+        DRAW_TICKS.fetch_add(crate::platform::cntpct() - t_draw, Relaxed);
     }
 }
 
-/// Turn one item green and push a frame.
 /// Boot timing: the counter when the cold kernel was entered (set right after the killswitch arms) and, per item, the counter when it was first marked. Kept apart from the drawn list so items marked before the panel is adopted still get a time. Read by `diag boot`.
 pub static ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static PRESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -443,22 +552,30 @@ pub fn boot_times() -> alloc::string::String {
     for (t, label) in v {
         s.push_str(&alloc::format!("  {label:<28} +A#{} us\n", us(t.saturating_sub(e))));
     }
+    // The ring's steps (lane 0 the boot path, 1 another core): when each began and ended, from the ring's zero, and the ring's own drawing.
+    let z = zero();
+    s.push_str(&alloc::format!("ring, from the {} (boot: {})\n", if PRESS.load(Relaxed) != 0 { "press" } else { "entry" }, REASON_NAME[REASON.load(Relaxed) as usize]));
+    for k in 0..STEPS {
+        let (b, en) = (BEGIN[k].load(Relaxed), END[k].load(Relaxed));
+        if en != 0 {
+            let at = |t: u64| if t >= z { alloc::format!("+A#{}", us(t - z)) } else { alloc::format!("-A#{}", us(z - t)) };
+            s.push_str(&alloc::format!("  lane {} {:<22} {} .. {} us, A#{} us\n", STEP_LANE[k], STEP_NAME[k], at(b), at(en), us(en - b)));
+        }
+    }
+    s.push_str(&alloc::format!("  the ring's drawing A#{} us over A#{} steps; the dev list's text A#{} us, on the service core\n", us(DRAW_TICKS.load(Relaxed)), unsafe { RING_N }, us(TEXT_TICKS.load(Relaxed))));
     s
 }
 
+/// An item is up: its time for `diag boot`. The ring draws `Step`s, not items (since 2026-11-05: an item is often known only after the work that brought it up, so its mark is not where its step began or ended).
 pub fn mark(item: Item) {
     stamp(item);
     let Some(c) = (unsafe { (*CHECKLIST.0.get()).as_mut() }) else {
         return;
     };
-    if c.done & (1 << item as u8) != 0 {
-        return;
-    }
     c.done |= 1 << item as u8;
-    redraw(c, item);
 }
 
-/// Mark an item up through a stand-in (yellow) and redraw it.
+/// Mark an item up through a stand-in (yellow).
 pub fn mark_interim(item: Item) {
     stamp(item);
     let Some(c) = (unsafe { (*CHECKLIST.0.get()).as_mut() }) else {
@@ -466,10 +583,9 @@ pub fn mark_interim(item: Item) {
     };
     c.done |= 1 << item as u8;
     c.interim |= 1 << item as u8;
-    redraw(c, item);
 }
 
-/// Put `text` after an item's label (truncated to 16 bytes) and redraw it.
+/// Put `text` after an item's label (truncated to 16 bytes).
 pub fn suffix(item: Item, text: &[u8]) {
     let Some(c) = (unsafe { (*CHECKLIST.0.get()).as_mut() }) else {
         return;
@@ -477,7 +593,6 @@ pub fn suffix(item: Item, text: &[u8]) {
     let n = text.len().min(SUFFIX_MAX);
     c.suffix[item as usize].0[..n].copy_from_slice(&text[..n]);
     c.suffix[item as usize].1 = n;
-    redraw(c, item);
 }
 
 /// Whether the checklist owns the panel on this boot (then nothing else should draw over it).

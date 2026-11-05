@@ -256,6 +256,7 @@ fn trng_early() {
     EARLY_US.store(((crate::platform::cntpct() - t0) * 1_000_000 / crate::platform::cntfrq()) as u32, core::sync::atomic::Ordering::Relaxed);
     EARLY_STATE.store(if ok { 2 } else { 3 }, core::sync::atomic::Ordering::Release);
     crate::checklist::at("KOHI: TRNG words, on worker 3");
+    crate::checklist::end(crate::checklist::Step::Kohi);
 }
 
 /// Start gathering the firmware TRNG's words on another core, as early in the boot as the page tables allow.
@@ -265,6 +266,7 @@ pub fn start_early() {
         return;
     }
     EARLY_STATE.store(1, core::sync::atomic::Ordering::Release);
+    crate::checklist::begin(crate::checklist::Step::Kohi);
     if !crate::smp::early(trng_early) {
         EARLY_STATE.store(0, core::sync::atomic::Ordering::Release);
     }

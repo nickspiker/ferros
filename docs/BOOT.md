@@ -537,3 +537,18 @@ Where the 0.66 s goes: repeater tune + checklist draw 38 ms, UFS link 96 ms, vau
 2. **Mark the slot after ready** (117 ms). It is bookkeeping for the next boot, not something this one needs.
 
 Before the press (not counted, but it is how soon "Ready?" shows): the cache map 158 ms and adopting the panel 388 ms. Both are worth a look if the wait for "Ready?" ever matters.
+
+### The boot ring (redrawn 2026-11-05)
+
+What the panel shows from the press to home (checklist.rs), drawn to the owner's direction:
+- **Where:** the attest screen's circle, the same centre and outer radius (ahau `mark_at`: r = w/3, its top at w·473/5376 + w/64), in dev and production builds alike.
+- **Angle is time:** the full circle is the second from the press to home, clockwise from 12 o'clock. Each wedge spans its step from when the step began to when it ended. Black is time the ring does not show: the ring's own drawing between wedges, then the wait for home.
+- **Lanes are cores:** the boot path in the inner lane, work beside it on another core in the outer lane (today KOHI's TRNG words on worker 3, from before the press to about 340 ms), at the same angles while they overlap. The lanes span r/2 to r and split where their areas match, so a wedge's area is its duration in either lane.
+- **Colour is order:** the warm ramp, dark brick to lime.
+- **The centre disc is the boot's reason:** cold (dark brick: nothing survived in RAM), restart (dark gold: the previous session's report survived a reset, or the hv's chord reset), jump (deep blue: the hv's jump from Android), reload (violet: a RELOAD from the host, timed from kernel entry since there is no press), after a panic (red: the previous report's crumb G#EExx). A watchdog bite reads as a restart.
+- **Steps:** the boot path calls `checklist::step` at the end of each one (eUSB repeater, panel, board read, UFS link, flash log, ira, vault opened, vault verified, flash write-protect, slot marked, settings + service), so each begins where the last ended. A step on another core stamps `begin`/`end` itself, and the service loop draws it once it has ended. `bridge diag boot` lists every step's span and lane, and what the drawing cost.
+
+Measured on slot a (2026-11-05):
+- The boot path's drawing is 24 ms over 12 steps.
+- The dev list's text is 31 ms, on the X3 after service start. Oxanium blends over the boot surface, which is Device memory, so every glyph pixel is a bus read and a write. On the boot core that text cost 180 ms, so it no longer runs there.
+- Press to service start: 235 ms, down from 338 ms.
