@@ -86,6 +86,39 @@ impl Op {
             Load { index, .. } => f(index),
         }
     }
+    /// The kind's name, for `Compiled::kinds`.
+    fn name(&self) -> &'static str {
+        use Op::*;
+        match self {
+            Const(_) => "const",
+            Gid => "gid",
+            FAdd(..) => "fadd",
+            FMul(..) => "fmul",
+            FFma(..) => "ffma",
+            FNeg(_) => "fneg",
+            FMin(..) => "fmin",
+            FMax(..) => "fmax",
+            FRcp(_) => "frcp",
+            FRsq(_) => "frsq",
+            FFloor(_) => "ffloor",
+            FCmp(..) => "fcmp",
+            Sel(..) => "sel",
+            IMul(..) => "imul",
+            And(..) => "and",
+            Or(..) => "or",
+            Xor(..) => "xor",
+            Shl(..) => "shl",
+            Shr(..) => "shr",
+            F2U(_) => "f2u",
+            F2I(_) => "f2i",
+            U2F(_) => "u2f",
+            Phi(_) => "phi",
+            LoopHead => "loophead",
+            LoopEnd(_) => "loopend",
+            Store { .. } => "store",
+            Load { .. } => "load",
+        }
+    }
     fn has_value(&self) -> bool {
         !matches!(self, Op::LoopHead | Op::LoopEnd(_) | Op::Store { .. })
     }
@@ -111,10 +144,56 @@ fn rec() -> &'static mut Rec {
     unsafe { (*(&raw mut REC)).as_mut().expect("valhall::ssa: record between begin() and compile()") }
 }
 
+/// Record `op`, or what it comes to when its inputs are constants (worked out here, in the IEEE arithmetic the GPU does for these: add, multiply, negate, compare, the integer ops and conversions), or the chosen input of a select on a constant mask. The GPU computes the same bits with fewer instructions; folding nothing whose GPU result could differ (min, max, floor, the reciprocals).
 fn push(op: Op) -> u32 {
     let r = rec();
-    r.nodes.push(op);
-    (r.nodes.len() - 1) as u32
+    let c = |i: u32| match r.nodes[i as usize] {
+        Op::Const(b) => Some(b),
+        _ => None,
+    };
+    let f = f32::from_bits;
+    let both = |a: u32, b: u32| c(a).zip(c(b));
+    let mask = |t: bool| if t { u32::MAX } else { 0 };
+    let folded: Option<Result<u32, u32>> = match op {
+        Op::FAdd(a, b) => both(a, b).map(|(x, y)| Ok((f(x) + f(y)).to_bits())),
+        Op::FMul(a, b) => both(a, b).map(|(x, y)| Ok((f(x) * f(y)).to_bits())),
+        Op::FNeg(a) => c(a).map(|x| Ok((-f(x)).to_bits())),
+        Op::FCmp(cond, a, b) => both(a, b).and_then(|(x, y)| match cond {
+            Cond::Gt => Some(Ok(mask(f(x) > f(y)))),
+            Cond::Lt => Some(Ok(mask(f(x) < f(y)))),
+            Cond::Ge => Some(Ok(mask(f(x) >= f(y)))),
+            _ => None,
+        }),
+        // A select on a constant mask is its chosen input (masks are all ones or zero; anything else is left to the GPU).
+        Op::Sel(m, a, b) => c(m).and_then(|v| if v == u32::MAX { Some(Err(a)) } else if v == 0 { Some(Err(b)) } else { None }),
+        Op::And(a, b) => both(a, b).map(|(x, y)| Ok(x & y)),
+        Op::Or(a, b) => both(a, b).map(|(x, y)| Ok(x | y)),
+        Op::Xor(a, b) => both(a, b).map(|(x, y)| Ok(x ^ y)),
+        Op::IMul(a, b) => both(a, b).map(|(x, y)| Ok(x.wrapping_mul(y))),
+        Op::Shl(a, s) => both(a, s).filter(|(_, y)| *y < 32).map(|(x, y)| Ok(x << y)),
+        Op::Shr(a, s) => both(a, s).filter(|(_, y)| *y < 32).map(|(x, y)| Ok(x >> y)),
+        Op::U2F(a) => c(a).map(|x| Ok((x as f32).to_bits())),
+        _ => None,
+    };
+    match folded {
+        Some(Ok(bits)) => {
+            r.nodes.push(Op::Const(bits));
+            (r.nodes.len() - 1) as u32
+        }
+        Some(Err(chosen)) => chosen,
+        None => {
+            r.nodes.push(op);
+            (r.nodes.len() - 1) as u32
+        }
+    }
+}
+
+/// The bits of `x` if it is a constant.
+fn const_of(x: u32) -> Option<u32> {
+    match rec().nodes[x as usize] {
+        Op::Const(b) => Some(b),
+        _ => None,
+    }
 }
 
 /// Start recording a kernel.
@@ -257,6 +336,18 @@ impl Mul for F {
 impl Div for F {
     type Output = F;
     fn div(self, o: F) -> F {
+        // By a constant: its reciprocal from here, rounded once (exact for a power of two, which then needs the multiply alone); otherwise the multiply and one correction of the quotient by its residual. Three instructions where the refined reciprocal took six, and a reciprocal one rounding from the true one.
+        if let Some(cb) = const_of(o.0) {
+            let cv = f32::from_bits(cb);
+            let rv = 1. / cv;
+            let rf = F::splat(rv);
+            if cb & 0x007F_FFFF == 0 && rv.is_normal() && cv.is_normal() {
+                return self * rf;
+            }
+            let q = self * rf;
+            let res = F::op(Op::FFma(o.neg().0, q.0, self.0));
+            return F::op(Op::FFma(res.0, rf.0, q.0));
+        }
         let r = o.rcp();
         let q = self * r;
         let res = F::op(Op::FFma(o.neg().0, q.0, self.0));
@@ -422,6 +513,8 @@ pub struct Compiled {
     pub loop_consts: usize,
     /// The uniform slots 1 and up the kernel reads its constants from: the caller passes them after slot 0 (its output address).
     pub consts: Vec<u64>,
+    /// The kept nodes by kind (`Op` names, for measuring the compiler's lowering), the most frequent first.
+    pub kinds: Vec<(&'static str, usize)>,
 }
 
 /// The value registers: r0-r53. r54-r56 take constants at their uses, r57 the loop head's write, r58:r59 the store address, r60:r61 the global id (preloaded).
@@ -435,8 +528,47 @@ const ADDR: u8 = 58;
 /// Panics if the program still needs more value registers than r0-r53 (no spilling yet), naming how many it needed.
 pub fn compile() -> Compiled {
     let rec = unsafe { (*(&raw mut REC)).take().expect("valhall::ssa: compile without begin") };
-    let nodes = &rec.nodes;
-    let n = nodes.len();
+    let n = rec.nodes.len();
+    // Negations folded into the operands of the float operations that read them (Valhall negates a float source for free): a source that is FNeg(x) becomes x with that operand's bit in `negmask` set, nested ones cancelling; a negation nothing else reads then goes with the dead code (509 of the attest ball's 4836 nodes were negations, each an instruction).
+    let mut work = rec.nodes.clone();
+    let mut negmask = alloc::vec![0u8; n];
+    for i in 0..n {
+        let mut srcs = [0u32; 3];
+        let ns = match work[i] {
+            Op::FAdd(a, b) | Op::FMul(a, b) | Op::FMin(a, b) | Op::FMax(a, b) | Op::FCmp(_, a, b) => {
+                srcs[..2].copy_from_slice(&[a, b]);
+                2
+            }
+            Op::FFma(a, b, c) => {
+                srcs = [a, b, c];
+                3
+            }
+            Op::FRcp(a) | Op::FRsq(a) | Op::FNeg(a) => {
+                srcs[0] = a;
+                1
+            }
+            _ => 0,
+        };
+        for p in 0..ns {
+            while let Op::FNeg(x) = work[srcs[p] as usize] {
+                srcs[p] = x;
+                negmask[i] ^= 1 << p;
+            }
+        }
+        work[i] = match work[i] {
+            Op::FAdd(..) => Op::FAdd(srcs[0], srcs[1]),
+            Op::FMul(..) => Op::FMul(srcs[0], srcs[1]),
+            Op::FMin(..) => Op::FMin(srcs[0], srcs[1]),
+            Op::FMax(..) => Op::FMax(srcs[0], srcs[1]),
+            Op::FCmp(c, ..) => Op::FCmp(c, srcs[0], srcs[1]),
+            Op::FFma(..) => Op::FFma(srcs[0], srcs[1], srcs[2]),
+            Op::FRcp(_) => Op::FRcp(srcs[0]),
+            Op::FRsq(_) => Op::FRsq(srcs[0]),
+            Op::FNeg(_) => Op::FNeg(srcs[0]),
+            other => other,
+        };
+    }
+    let nodes = &work;
     let is_const = |i: u32| matches!(nodes[i as usize], Op::Const(_));
     // Dead code: live from the stores, the loop ends' conditions and every loop's state, backwards.
     let mut keep = alloc::vec![false; n];
@@ -696,38 +828,43 @@ pub fn compile() -> Compiled {
                 None => Src::Reg(r(reg[s as usize])),
             }
         };
+        // A float operand as read, with the negation folded into it above.
+        let fl = |s: u32, p: u32| -> Float {
+            let f = Float { src: rr(s), neg: false, abs: false };
+            if negmask[i] >> p & 1 == 1 { f.neg() } else { f }
+        };
         let d = if op.has_value() { r(reg[i]) } else { r(0) };
         match *op {
             Op::Const(_) | Op::Gid => {}
             Op::FAdd(a, b) => {
-                k.fadd_f32(d, rr(a), rr(b));
+                k.fadd_f32(d, fl(a, 0), fl(b, 1));
             }
             Op::FMul(a, b) => {
-                k.fma_f32(d, rr(a), rr(b), Lut::ZERO.neg());
+                k.fma_f32(d, fl(a, 0), fl(b, 1), Lut::ZERO.neg());
             }
             Op::FFma(a, b, c) => {
-                k.fma_f32(d, rr(a), rr(b), rr(c));
+                k.fma_f32(d, fl(a, 0), fl(b, 1), fl(c, 2));
             }
             Op::FNeg(a) => {
-                k.fadd_f32(d, rr(a).neg(), Lut::ZERO.neg());
+                k.fadd_f32(d, fl(a, 0).neg(), Lut::ZERO.neg());
             }
             Op::FMin(a, b) => {
-                k.fmin_f32(d, rr(a), rr(b));
+                k.fmin_f32(d, fl(a, 0), fl(b, 1));
             }
             Op::FMax(a, b) => {
-                k.fmax_f32(d, rr(a), rr(b));
+                k.fmax_f32(d, fl(a, 0), fl(b, 1));
             }
             Op::FRcp(a) => {
-                k.frcp_f32(d, rr(a));
+                k.frcp_f32(d, fl(a, 0));
             }
             Op::FRsq(a) => {
-                k.frsq_f32(d, rr(a));
+                k.frsq_f32(d, fl(a, 0));
             }
             Op::FFloor(a) => {
                 k.fround_f32(d, rr(a), Round::Rtn);
             }
             Op::FCmp(c, a, b) => {
-                k.fcmp_or_f32(d, c, CmpResult::M1, rr(a), rr(b), Lut::ZERO);
+                k.fcmp_or_f32(d, c, CmpResult::M1, fl(a, 0), fl(b, 1), Lut::ZERO);
             }
             Op::Sel(m, a, b) => {
                 k.mux_i32(d, Mux::Bit, rr(a), rr(b), rr(m));
@@ -807,7 +944,18 @@ pub fn compile() -> Compiled {
     }
     k.last().end();
     let words = k.finish().to_vec();
-    Compiled { words, regs64, nodes: n, kept, peak, loop_words, loop_consts, consts }
+    let mut kinds: Vec<(&'static str, usize)> = Vec::new();
+    for (i, op) in nodes.iter().enumerate() {
+        if keep[i] {
+            let name = op.name();
+            match kinds.iter_mut().find(|k| k.0 == name) {
+                Some(k) => k.1 += 1,
+                None => kinds.push((name, 1)),
+            }
+        }
+    }
+    kinds.sort_by(|a, b| b.1.cmp(&a.1));
+    Compiled { words, regs64, nodes: n, kept, peak, loop_words, loop_consts, consts, kinds }
 }
 
 /// Whether an instruction form already reads the LUT's zero itself (a multiply's −0 addend, a negation's, a compare's `or`, the shift group's shift or second operand): it counts against the FAU's two words.

@@ -541,6 +541,88 @@ fn one_test(grants: u64, arena: usize, which: u8) -> ! {
     say!(grants, "gputest: one {which}: r = {r}, {} words, {} uniforms, {} groups, peak {}; status {}, {} us\n", k.words.len(), uniforms.len(), groups, k.peak, reply.0, reply.1);
     exit(0);
 }
+
+/// The quick pass over the circle's staged coordinates (tapuwae::gpu::button_quick_staged_kernel) against the CPU's quick pass at r = 96, then timed at r = 448.
+fn quick_staged_test(grants: u64, arena: usize) -> ! {
+    use tapuwae::{Look, Params};
+    let salt = *b"ferros gputest: the attest ball.";
+    let p = Params::new_placed(&salt, "handle", true);
+    let look = Look::attest();
+    let (frame, stage, cpu_at) = (4usize << 20, 11usize << 20, 25usize << 20);
+    for &(r, compare) in &[(96f32, true), (448f32, false)] {
+        let side = 2 * r as usize + 4;
+        let px = side * side;
+        for i in 0..px {
+            unsafe { core::ptr::write_volatile((arena + frame + 8 * i) as *mut u64, 0) };
+        }
+        let mut n = 0usize;
+        tapuwae::gpu::button_stage(r, |i| {
+            unsafe { core::ptr::write_volatile((arena + stage + 4 * n) as *mut u32, i) };
+            n += 1;
+        });
+        let mark = unsafe { HEAP_NEXT };
+        let k = tapuwae::gpu::button_quick_staged_kernel(r, &p, &look);
+        for (i, &w) in k.words.iter().enumerate() {
+            unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+        }
+        let mut uniforms = alloc::vec![ARENA_VA + frame as u64, ARENA_VA + stage as u64];
+        uniforms.extend_from_slice(&k.consts);
+        let reply = run_with(grants, k.words.len(), n.div_ceil(16) as u32, 0x1000 | if k.regs64 { 0x8000 } else { 0 }, &uniforms);
+        say!(grants, "gputest: quick staged r = {r}: {n} staged of {px}, {} words, status {}, {} us\n", k.words.len(), reply.0, reply.1);
+        drop(uniforms);
+        drop(k);
+        unsafe { HEAP_NEXT = mark };
+        if compare {
+            let cpu = unsafe { core::slice::from_raw_parts_mut((arena + cpu_at) as *mut u64, px) };
+            cpu.fill(0);
+            let c = side as f32 * 0.5;
+            tapuwae::render_button_pack16(cpu, side, c, c, r, &p, &look, 1, (0, 1), &|| false);
+            let (mut same, mut near, mut far) = (0u32, 0u32, 0u32);
+            for i in 0..px {
+                let g = unsafe { core::ptr::read_volatile((arena + frame + 8 * i) as *const u64) };
+                let w = cpu[i];
+                if g == w {
+                    same += 1;
+                    continue;
+                }
+                let d = (0..4).map(|ch| ((g >> (16 * ch)) as u16 as i32 - (w >> (16 * ch)) as u16 as i32).unsigned_abs()).max().unwrap_or(0);
+                if d <= 64 { near += 1 } else { far += 1 }
+            }
+            say!(grants, "gputest: quick staged r = {r}: of {px} pixels {same} identical, {near} within 64 of 16384 a channel, {far} further\n");
+        }
+    }
+    exit(0);
+}
+
+/// Where the quick pass's time goes (2026-11-05): at r = 448 over the stage, the whole quick pass, then the warp and orbit alone (tapuwae::gpu::button_orbit_only_kernel), each timed.
+fn split_test(grants: u64, arena: usize) -> ! {
+    use tapuwae::{Look, Params};
+    let salt = *b"ferros gputest: the attest ball.";
+    let p = Params::new_placed(&salt, "handle", true);
+    let look = Look::attest();
+    let (frame, stage) = (4usize << 20, 11usize << 20);
+    let r = 448f32;
+    let mut n = 0usize;
+    tapuwae::gpu::button_stage(r, |i| {
+        unsafe { core::ptr::write_volatile((arena + stage + 4 * n) as *mut u32, i) };
+        n += 1;
+    });
+    for which in 0..2 {
+        let mark = unsafe { HEAP_NEXT };
+        let k = if which == 0 { tapuwae::gpu::button_quick_staged_kernel(r, &p, &look) } else { tapuwae::gpu::button_orbit_only_kernel(r, &p, &look) };
+        for (i, &w) in k.words.iter().enumerate() {
+            unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+        }
+        let mut uniforms = alloc::vec![ARENA_VA + frame as u64, ARENA_VA + stage as u64];
+        uniforms.extend_from_slice(&k.consts);
+        let reply = run_with(grants, k.words.len(), n.div_ceil(16) as u32, 0x1000 | if k.regs64 { 0x8000 } else { 0 }, &uniforms);
+        say!(grants, "gputest: split {}: {} words (the loop {}), status {}, {} us\n", if which == 0 { "whole quick pass" } else { "warp + orbit only" }, k.words.len(), k.loop_words, reply.0, reply.1);
+        drop(uniforms);
+        drop(k);
+        unsafe { HEAP_NEXT = mark };
+    }
+    exit(0);
+}
 /// One run through the service: the code at arena offset 0, `groups` workgroups of 16, preload r60 (the global id X).
 fn run(grants: u64, words: usize, groups: u32, uniforms: &[u64]) -> (u8, u32) {
     run_with(grants, words, groups, 0x1000, uniforms)
@@ -593,6 +675,14 @@ extern "C" fn gputest_main(grants: u64, input: u64, input_len: u64) -> ! {
     // Input byte 1: the ops test (the builder's new instructions); none: the Mandelbrot.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 1 {
         ops_test(grants, arena);
+    }
+    // Input byte 9: where the quick pass's time goes.
+    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 9 {
+        split_test(grants, arena);
+    }
+    // Input byte 8: the quick pass over the staged coordinates against the CPU.
+    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 8 {
+        quick_staged_test(grants, arena);
     }
     // Input byte 7 then a selector: one kernel, one job, status only.
     if input_len > 1 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 7 {
