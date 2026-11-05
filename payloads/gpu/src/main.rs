@@ -6,6 +6,13 @@
 #![no_std]
 #![no_main]
 
+// The display's present stage itself (its NEON path and its tables), compiled here so the GPU's version is checked against the code the device runs.
+#[path = "../../display/src/neon.rs"]
+#[allow(dead_code)]
+mod neon;
+#[path = "../../display/src/odt.rs"]
+#[allow(dead_code)]
+mod odt;
 mod fw;
 mod mem;
 
@@ -121,6 +128,13 @@ const BENCH_VA: u64 = 0x5000_0000;
 const SNOOP_NC_VA: u64 = 0x6000_0000;
 const SNOOP_CO_VA: u64 = 0x6100_0000;
 const RES_VA: u64 = 0x6200_0000;
+/// The present-stage test: 64 rows of the panel's width (1344 = 84 x 16, so whole workgroups), and where its canvas, output words and tables sit in the group's address space.
+const PRESENT_W: usize = 1344;
+const PRESENT_H: usize = 64;
+const TAB_BYTES: usize = 131072 + 5 * 1024;
+const CANV_VA: u64 = 0x7000_0000;
+const WORDS_VA: u64 = 0x7100_0000;
+const TAB_VA: u64 = 0x7200_0000;
 
 struct Gpu {
     regs: usize,
@@ -381,6 +395,13 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     as1.map(&mut m, SNOOP_NC_VA, snoop, 1, PAGE_RW | NC | NX, TABLE);
     as1.map(&mut m, SNOOP_CO_VA, snoop, 1, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
     as1.map(&mut m, RES_VA, res, 1, PAGE_RW | NC | NX, TABLE);
+    // The present-stage test (input bit 5): 64 rows of the panel's width as a canvas, the words the kernel writes, and its table buffer (the code table, 64 Ki u16, then five 32 x 32 threshold slabs), GPU-cacheable: written once before any job reads it.
+    let canvas = m.alloc(PRESENT_W * PRESENT_H * 8 / PAGE);
+    let words_out = m.alloc(PRESENT_W * PRESENT_H * 4 / PAGE);
+    let tab = m.alloc(TAB_BYTES.div_ceil(PAGE));
+    as1.map(&mut m, CANV_VA, canvas, PRESENT_W * PRESENT_H * 8 / PAGE, PAGE_RW | NC | NX, TABLE);
+    as1.map(&mut m, WORDS_VA, words_out, PRESENT_W * PRESENT_H * 4 / PAGE, PAGE_RW | NC | NX, TABLE);
+    as1.map(&mut m, TAB_VA, tab, TAB_BYTES.div_ceil(PAGE), PAGE_RW | NX, TABLE);
     if !g.install(1, as1.root) {
         g.fail("AS1 never went idle");
     }
@@ -574,6 +595,205 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             say!(grants, "gpu: coherency {mode}: GPU wrote through the {name} view, CPU read from its caches: {} of 16 words new (first G#{:X})\n", count(&|i| r(snoop + 4 * i) == base_v + i as u32), r(snoop));
         }
     }
+    // Input bit 5: the present stage on the GPU (GPU.md "The present stage"; the kernel hand-encoded from the display's neon.rs, its words and sources in ferros-present-spec.md on Harbor), checked against the display's own NEON path compiled in here: 64 full rows, the four temporal phases, every word compared (the owner: close is fine, each channel within one code).
+    if in0 & 0x20 != 0 {
+        const PRESENT: [u64; 92] = [
+            0x00A0_C000_000A_883D,
+            0x00A0_C000_0000_3C00,
+            0x01A3_C200_2037_0080,
+            0x0060_84F4_2800_0002,
+            0x00B4_C601_108A_C03C,
+            0x00B4_C701_148B_C93D,
+            0x00B4_C601_1107_C006,
+            0x01A3_C800_2007_0686,
+            0x1860_81E2_4000_0008,
+            0x0090_C600_0014_0004,
+            0x0090_C700_1014_0004,
+            0x0090_C800_0014_0005,
+            0x0090_C600_0019_0006,
+            0x00B2_C204_00C0_8C06,
+            0x00B2_C304_00C0_0202,
+            0x00A4_C400_0000_8E03,
+            0x00B2_C400_008F_0403,
+            0x00B2_C400_0090_0403,
+            0x00B2_C500_0093_9203,
+            0x00B2_C500_0091_0503,
+            0x00B2_C500_0090_0503,
+            0x00B2_C404_00C0_0402,
+            0x009C_C300_0000_0005,
+            0x00B2_C204_00C0_0304,
+            0x00B2_C440_0004_0502,
+            0x00B2_C200_0002_0304,
+            0x00B2_C204_00C0_0202,
+            0x00B2_C204_00C0_8D02,
+            0x00A4_4C10_0000_C002,
+            0x0090_C700_0019_0007,
+            0x00B2_C204_00C0_8C07,
+            0x00B2_C304_00C0_0202,
+            0x00A4_C400_0000_8E03,
+            0x00B2_C400_008F_0403,
+            0x00B2_C400_0090_0403,
+            0x00B2_C500_0093_9203,
+            0x00B2_C500_0091_0503,
+            0x00B2_C500_0090_0503,
+            0x00B2_C404_00C0_0402,
+            0x009C_C300_0000_0005,
+            0x00B2_C204_00C0_0304,
+            0x00B2_C440_0004_0502,
+            0x00B2_C200_0002_0304,
+            0x00B2_C204_00C0_0202,
+            0x00B2_C204_00C0_8D02,
+            0x00A4_4D10_0000_C002,
+            0x0090_C800_0019_0008,
+            0x00B2_C204_00C0_8C08,
+            0x00B2_C304_00C0_0202,
+            0x00A4_C400_0000_8E03,
+            0x00B2_C400_008F_0403,
+            0x00B2_C400_0090_0403,
+            0x00B2_C500_0093_9203,
+            0x00B2_C500_0091_0503,
+            0x00B2_C500_0090_0503,
+            0x00B2_C404_00C0_0402,
+            0x009C_C300_0000_0005,
+            0x00B2_C204_00C0_0304,
+            0x00B2_C440_0004_0502,
+            0x00B2_C200_0002_0304,
+            0x00B2_C204_00C0_0202,
+            0x00B2_C204_00C0_8D02,
+            0x00A4_4E10_0000_C002,
+            0x00A1_C900_0005_0E0C,
+            0x00A5_CA10_2000_0D09,
+            0x00B3_CB04_2AC0_9409,
+            0x00B3_CB00_0A0B_950A,
+            0x00B3_CB00_3A0B_960A,
+            0x00B3_CC04_0AC0_970D,
+            0x00B3_CC00_0A0C_980A,
+            0x00B3_CC00_3A0C_990A,
+            0x0090_C600_0014_000B,
+            0x0090_C800_0014_000C,
+            0x0090_CA00_1014_000B,
+            0x01A3_C200_2017_0684,
+            0x01A3_C400_2017_0884,
+            0x01A3_CC00_2017_0A84,
+            0x0060_86A2_0800_0002,
+            0x0060_88A2_4800_0004,
+            0x3860_8AA2_8800_000C,
+            0x00A0_C600_0000_0106,
+            0x00A0_C800_0000_0108,
+            0x00A0_CA00_0000_010A,
+            0x00B4_C600_19C0_C906,
+            0x00B4_C800_19C0_C908,
+            0x00B4_CA00_19C0_C90A,
+            0x00B4_CA01_1908_CA0A,
+            0x00B4_CA01_1906_CA0A,
+            0x00B4_CA01_11C0_C90A,
+            0x0110_CA00_0000_030A,
+            0x01A3_C200_2027_0082,
+            0x7861_4A02_1800_0002,
+        ];
+        // The display's dither constants (payloads/display main.rs BAYER, TEMPORAL_RANK).
+        const BAYER: [[u16; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+        const TEMPORAL_RANK: [u32; 4] = [0, 2, 1, 3];
+        let tabs = odt::odt_tables(0.5, 1.0);
+        let ob = unsafe { core::slice::from_raw_parts(&tabs as *const neon::Odt as *const u8, core::mem::size_of::<neon::Odt>()) };
+        let u16_at = |o: usize| ob[o] as u32 | (ob[o + 1] as u32) << 8;
+        let f32_bits = |o: usize| u32::from_le_bytes([ob[o], ob[o + 1], ob[o + 2], ob[o + 3]]) as u64;
+        // The code table: every f16 bit pattern's code, as code16 computes it, capped at 16320 (the CPU's saturating narrow holds the 8-bit code at 255 there; the shader shifts without saturating, and 16384 would carry into the next channel's bit: proven exact over every code and threshold in the spec).
+        for h in 0..65536usize {
+            let e = h >> 10;
+            let (m6, m4) = ((h >> 4) & 63, (h & 15) as u32);
+            let s = if e < 32 { ob[224 + e] as u32 | (ob[192 + e] as u32) << 8 } else { 0 };
+            let n = ob[64 + m6] as u32 | (ob[m6] as u32) << 8;
+            let f = (n + ((ob[128 + m6] as u32 * m4 + 8) >> 4)) & 0xFFFF;
+            let code = ((f * s + 32768) >> 16).min(16320);
+            let a = tab + 2 * h;
+            unsafe { core::ptr::write_volatile(a as *mut u16, code as u16) };
+        }
+        // The threshold slabs: phases 0-3, and the spatial-only one.
+        for s in 0..5usize {
+            for r in 0..32usize {
+                for c in 0..32usize {
+                    let t = BAYER[r & 3][c & 3] as u32 * 4 + if s < 4 { TEMPORAL_RANK[(s + (c >> 2) + (r >> 2)) & 3] } else { 0 };
+                    unsafe { core::ptr::write_volatile((tab + 131072 + 1024 * s + 32 * r + c) as *mut u8, t as u8) };
+                }
+            }
+        }
+        // The canvas: a mix of black, white, mid greys and random channels to 4x white, so every part of the curve is crossed.
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        for i in 0..PRESENT_W * PRESENT_H {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let px = match i % 11 {
+                0 => 0,
+                1 => 0x4000 | 0x4000 << 16 | 0x4000 << 32,
+                2 => 0x2000 | 0x2000 << 16 | 0x2000 << 32,
+                _ => rng & 0x0000_FFFF_FFFF_FFFF,
+            };
+            wr64(canvas + 8 * i, px);
+        }
+        let (c0, c1) = (|i: usize| u16_at(256 + 2 * i) as u64, u16_at(272) as u64);
+        let mut worst = (0u32, 0u32);
+        for k in 0..4usize {
+            let u = [
+                CANV_VA,
+                WORDS_VA,
+                TAB_VA,
+                TAB_VA + 131072 + 1024 * k as u64,
+                PRESENT_W as u64 | ((PRESENT_W as f32).to_bits() as u64) << 32,
+                0xF | 0x1E0 << 32,
+                f32_bits(288) | f32_bits(292) << 32,
+                378f32.to_bits() as u64 | (17325f32.to_bits() as u64) << 32,
+                135135f32.to_bits() as u64 | (62370f32.to_bits() as u64) << 32,
+                28f32.to_bits() as u64 | (3150f32.to_bits() as u64) << 32,
+                (c0(0) | c0(2) << 16) | (c0(3) | c0(7) << 16) << 32,
+                (c0(4) | c1 << 16) | (c0(1) | c0(1) << 16) << 32,
+                (c0(5) | c0(5) << 16) | (c0(6) | c0(6) << 16) << 32,
+                0x3800_0000 | 1 << 32,
+            ];
+            for i in 0..PRESENT_W * PRESENT_H {
+                wr32(words_out + 4 * i, 0);
+            }
+            wr32(out + 0x200, 0);
+            let n = cx.prepare_grid(&PRESENT, &u, ((PRESENT_W / 16) as u32, PRESENT_H as u32), 0x3000, done, &mut words);
+            let t0 = now();
+            let finished = run_for("present", &words[..n], &|| rd32(out + 0x200) == 1, 500);
+            let us = ferros_sys::us_since(t0);
+            // The NEON path on the same rows, and the comparison.
+            let (mut exact, mut close, mut fixed_bad, mut first) = (0usize, 0usize, 0usize, None);
+            let mut row = [0u32; PRESENT_W];
+            for y in 0..PRESENT_H {
+                let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
+                unsafe {
+                    let thv = core::arch::aarch64::vld1q_u8(th.as_ptr());
+                    for x in (0..PRESENT_W).step_by(16) {
+                        neon::sixteen_canvas(&tabs, (canvas + 8 * (y * PRESENT_W + x)) as *const u64, row.as_mut_ptr().add(x), thv);
+                    }
+                }
+                for x in 0..PRESENT_W {
+                    let (g, c) = (rd32(words_out + 4 * (y * PRESENT_W + x)), row[x]);
+                    let ch = |w: u32, s: u32| (w >> s) & 255;
+                    let d = [4u32, 14, 24].map(|s| ch(g, s).abs_diff(ch(c, s)));
+                    let dmax = d[0].max(d[1]).max(d[2]);
+                    exact += (g == c) as usize;
+                    close += (g & 0x00C0_300F == 3 && dmax <= 1) as usize;
+                    fixed_bad += (g & 0x00C0_300F != 3) as usize;
+                    if g != c && first.is_none() {
+                        first = Some((x, y, g, c));
+                    }
+                    if dmax > worst.0 {
+                        worst = (dmax, g);
+                    }
+                }
+            }
+            let total = PRESENT_W * PRESENT_H;
+            match first {
+                Some((x, y, g, c)) => say!(grants, "gpu: present phase {k}: {} in {us} us; {exact} of {total} exact, {close} within one code, {fixed_bad} with bad fixed bits; first difference at ({x}, {y}): GPU G#{g:X}, NEON G#{c:X}\n", if finished { "done" } else { "not finished" }),
+                None => say!(grants, "gpu: present phase {k}: {} in {us} us; all {total} words exact\n", if finished { "done" } else { "not finished" }),
+            }
+        }
+        say!(grants, "gpu: present: the largest channel difference {} (in a word G#{:X})\n", worst.0, worst.1);
+    }
     // Input bit 1: the present-stage bench (fluor on the GPU, measured before written): a proxy with the display's present stage's memory shape, a 64-bit pixel in and a 32-bit word out, with 0, 24 or 48 FMAs between, over 1M pixels; and the same at 16 invocations for the fixed cost of a dispatch. The kernel:
     //   SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:3      (the pixel's address)
     //   LOAD.i64.unsigned.slot0.wait0 @r4:r5, [r2:r3]   (the wait in the flow field acts after its instruction, before the next: on the consumer it came one too late, 2026-11-05)
@@ -731,6 +951,11 @@ struct Compute {
 impl Compute {
     /// The shader `code` (Valhall words, at most a page) written and padded, its program descriptor (compute, 32 registers a thread, r60 preloaded with the global id X), no local storage, `uniforms` as 64-bit FAU entries; and into `out` the command stream for `groups` workgroups of 16 invocations in X, then a 32-bit sync object at `done` set to 1. Returns the stream's length in words.
     fn prepare(&self, code: &[u64], uniforms: &[u64], groups: u32, done: u64, out: &mut [u64; 32]) -> usize {
+        self.prepare_grid(code, uniforms, (groups, 1), 0x1000, done, out)
+    }
+
+    /// As `prepare` over a grid of `groups.0` × `groups.1` workgroups (16 invocations in X each), with the descriptor's preload word `preload` (bit 12 r60 = the global id X, bit 13 r61 = the global id Y). A grid of more than one row runs a row a task (axis Y, increment 1: Mesa's chooser allows any increment of 1 and up).
+    fn prepare_grid(&self, code: &[u64], uniforms: &[u64], groups: (u32, u32), preload: u32, done: u64, out: &mut [u64; 32]) -> usize {
         for (k, w) in code.iter().enumerate() {
             wr64(self.code + 8 * k, *w);
         }
@@ -738,7 +963,7 @@ impl Compute {
             wr64(self.code + 8 * k, 0);
         }
         let (spd, tsd, fau) = (self.desc_va, self.desc_va + 0x40, self.desc_va + 0x80);
-        for (k, w) in [0x8000_0018u32, 0x0000_1000, self.code_va as u32, (self.code_va >> 32) as u32, 0, 0, 0, 0].iter().enumerate() {
+        for (k, w) in [0x8000_0018u32, preload, self.code_va as u32, (self.code_va >> 32) as u32, 0, 0, 0, 0].iter().enumerate() {
             wr32(self.desc + 4 * k, *w);
         }
         for k in 0..8 {
@@ -748,7 +973,7 @@ impl Compute {
             wr64(self.desc + 0x80 + 8 * k, u);
         }
         // The task's axis and size, as Mesa's gallium chooses them (pan_csf.c): along X while the threads fit the core's limit; a task of every workgroup (axis Z, increment 1) when they all fit.
-        let (axis, inc) = if 16 * groups >= self.max_threads { (0u64, (self.max_threads / 16) as u64) } else { (2, 1) };
+        let (axis, inc) = if groups.1 > 1 { (1u64, 1u64) } else if 16 * groups.0 >= self.max_threads { (0, (self.max_threads / 16) as u64) } else { (2, 1) };
         let words = [
             0x2200_0000_0000_0001u64,
             0x1C00_0000_0000_0003,
@@ -763,8 +988,8 @@ impl Compute {
             mv32(34, 0),
             mv32(35, 0),
             mv32(36, 0),
-            mv32(37, groups),
-            mv32(38, 1),
+            mv32(37, groups.0),
+            mv32(38, groups.1),
             mv32(39, 1),
             0x04 << 56 | axis << 14 | inc,
             0x0300_0000_0008_0000,

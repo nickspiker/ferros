@@ -918,6 +918,7 @@ name = "ferros-payload-gpu"
 version = "0.1.0"
 dependencies = [
  "ferros_sys",
+ "libm",
 ]
 
 [[package]]
