@@ -1765,15 +1765,9 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                if cmd.params == b"gnss" || cmd.params.starts_with(b"gnss ") {
-                    // `diag gnss`: the GNSS chip's rails, lines and SPI port, read only; `diag gnss up`: power, wake and the first register reads (gnss.rs).
-                    if cmd.params == b"gnss up" {
-                        crate::gnss::up(&mut resp);
-                    } else if cmd.params == b"gnss off" {
-                        crate::gnss::off(&mut resp);
-                    } else {
-                        crate::gnss::state(&mut resp);
-                    }
+                if cmd.params == b"gnss off" {
+                    // `diag gnss off`: the chip powered down, for a GNSS driver that died with it on (gnss.rs). Everything else about the chip is the driver's (payloads/gnss, tools/husky-gnss.sh): the kernel's bring-up tools left with the move (KERNEL-OUT.md decision 4).
+                    crate::gnss::off(&mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
