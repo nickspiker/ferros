@@ -98,8 +98,19 @@ pub fn arm_safety() {
         write_volatile(&raw mut crate::__exc_sink, RAMOOPS_RESULT as u64);
     }
     const WDT_ARM: u32 = 0xFF00 | (3 << 3) | (1 << 5) | (1 << 0);
-    // The arm is the first pet the window measures from.
-    LAST_PET.store(cntpct(), core::sync::atomic::Ordering::Relaxed);
+    // The arm is the first pet the window measures from; a hand-over stamp left by the hv's jump or a reload says how long the stretch before it ran unpetted.
+    let now = cntpct();
+    unsafe {
+        let kind = read_volatile((HANDOVER_STAMP + 8) as *const u64);
+        if kind == b'J' as u64 || kind == b'R' as u64 {
+            let stamp = read_volatile(HANDOVER_STAMP as *const u64);
+            HANDOVER_GAP_US.store(now.wrapping_sub(stamp) * 1_000_000 / cntfrq(), core::sync::atomic::Ordering::Relaxed);
+            HANDOVER_KIND.store(kind, core::sync::atomic::Ordering::Relaxed);
+            write_volatile((HANDOVER_STAMP + 8) as *mut u64, 0);
+            core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) HANDOVER_STAMP as u64);
+        }
+    }
+    LAST_PET.store(now, core::sync::atomic::Ordering::Relaxed);
     for &wdt in &WATCHDOGS {
         unsafe {
             write_volatile((wdt + 0x04) as *mut u32, 0xFFFF);
@@ -118,6 +129,22 @@ static LAST_PET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 pub static PET_GAP_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static PET_GAP_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static PETS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Where a hand-over leaves its last pet for the next kernel, which no running code can pet through: the hv's re-arm at the jump ('J') and a reload's hand-off to the copy stub ('R'). The counter at G#2C0, the kind at G#2C8; the next kernel's arm_safety turns them into WDT_HANDOVER_US and clears the kind.
+pub const HANDOVER_STAMP: usize = RAMOOPS_RESULT + 0x2C0;
+/// The last hand-over's gap in microseconds and its kind (0 none), from arm_safety.
+pub static HANDOVER_GAP_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static HANDOVER_KIND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The last pet before a hand-over, stamped for the next kernel to measure from.
+pub fn handover_stamp(kind: u8) {
+    pet_watchdogs();
+    unsafe {
+        write_volatile(HANDOVER_STAMP as *mut u64, cntpct());
+        write_volatile((HANDOVER_STAMP + 8) as *mut u64, kind as u64);
+        core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) HANDOVER_STAMP as u64);
+    }
+}
 
 pub fn pet_watchdogs() {
     if RESET_ORDERED.load(core::sync::atomic::Ordering::Relaxed) {

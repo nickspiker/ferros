@@ -2535,6 +2535,12 @@ mod hvcore {
             wr(w, 0xFF00 | (3 << 3) | (1 << 5) | 1);
         }
         set(19, 1);
+        // That re-arm is the last pet before ferros's own arm_safety: stamped for it in the ramoops page (kernel platform.rs HANDOVER_STAMP, G#FD60_02C0: the counter, then the kind 'J'), so the jump's unpetted stretch is measured (WDT_HANDOVER_US, the watchdog window's size, 2026-11-05).
+        unsafe {
+            write_volatile(0xFD60_02C0 as *mut u64, crate::ticks());
+            write_volatile(0xFD60_02C8 as *mut u64, b'J' as u64);
+            asm!("dc civac, {a}", "dsb sy", a = in(reg) 0xFD60_02C0u64);
+        }
         // The jump is a killswitch (owner, 2026-11-04: "if it's mid command, hit it on the fucking head with a crowbar"): every bus master Android left running behind an always-on S2MPU is cut off from all memory before ferros is copied in — hsi1 (PCIe ch0, the modem), hsi2 (UFS and WiFi: ferros's own fence opens UFS's window again as it brings the link up), misc (its DMA engines). Masters behind the S2MPUs inside power domains (the GPU, codecs, the camera chain, the TPU) are stopped by ferros cutting those domains on its first pass (pd.rs), not here: a register access to a domain that is down hangs the bus. cpucl0's too: it guards the CoreSight system's master, not the cores (proven on the running device).
         for &s in &DENY_AT_JUMP {
             let r = s2mpu_deny_all(s);
