@@ -11,7 +11,7 @@ mod mem;
 
 use core::fmt::Write;
 use ferros_sys::{cap, console, exit, freq, now};
-use mem::{rd32, rd64, wr32, wr64, Mem, Table, PAGE};
+use mem::{rd32, wr32, wr64, Mem, Table, PAGE};
 
 const S_REGS: u64 = 1;
 const S_MEM: u64 = 2;
@@ -393,25 +393,65 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     say!(grants, "gpu: group 0 and its queue started\n");
 
-    // The job: three instructions, all from encodings kbase itself decodes (mali_kbase_csf_sync.c): MOVE r0:r1 = the destination's VA, MOVE32 r2 = G#CAFE_F00D, SYNC_SET32 [r0:r1] = r2.
-    let word: u32 = 0xCAFE_F00D;
+    // The jobs, each appended to the ring after the last and the insert pointer moved on (the ring is 4 KiB: these few jobs never wrap it).
+    let q = Queue { ring, uio, insert: core::cell::Cell::new(0), doorbell: doorbell as usize };
+    let run = |name: &str, words: &[u64], check: &dyn Fn() -> bool| -> bool {
+        let t0 = now();
+        q.submit(&g, words);
+        let ok = g.wait(100, |_| check());
+        say!(grants, "gpu: job {name}: {} in {} us; CS_STATUS_CMD_PTR G#{:X}, blocked reason {}, CS_FAULT G#{:X}, CS_FATAL G#{:X}\n", if ok { "done" } else { "did not finish" }, ferros_sys::us_since(t0), sh.rd(sout + 0x40) as u64 | (sh.rd(sout + 0x44) as u64) << 32, sh.rd(sout + 0x60), sh.rd(sout + 0x80), sh.rd(sout + 0x84));
+        say!(grants, "gpu:   CSG_REQ G#{:X} CSG_ACK G#{:X} CSG_IRQ_REQ G#{:X} CSG_IRQ_ACK G#{:X} CSG_STATUS_STATE G#{:X}; CS_REQ G#{:X} CS_ACK G#{:X}; CS_EXTRACT {} CS_ACTIVE {}; JOB_IRQ_RAWSTAT G#{:X}\n", sh.rd(cin), sh.rd(cout), sh.rd(cout + 0x0C), sh.rd(cin + 0x0C), sh.rd(cout + 0x18), sh.rd(sin), sh.rd(sout), rd32(uio + PAGE), rd32(uio + PAGE + 8), g.rd(JOB_IRQ_RAWSTAT));
+        ok
+    };
+    let mut ok = true;
+    // 1: STORE_MULTIPLE r4..r5 to [r0:r1 + 4] (Mesa genxml v11 CS STORE_MULTIPLE: offset 15:0, register mask 31:16, address pair 47:40, base register 55:48), then WAIT on every scoreboard slot so the stores are done before the queue moves on.
+    wr32(dst + 4, 0);
+    wr32(dst + 8, 0);
+    ok &= run("store_multiple", &[mv48(0, DST_VA), mv32(4, 0x5EED_0001), mv32(5, 0x5EED_0002), 0x15 << 56 | 4 << 48 | 0 << 40 | 0b11 << 16 | 4, 0x03 << 56 | 0xFFFF << 16], &|| rd32(dst + 4) == 0x5EED_0001 && rd32(dst + 8) == 0x5EED_0002);
+    // 0: MOVE48 r0:r1 = the destination, MOVE32 r2 = G#CAFE_F00D, SYNC_SET32 [r0:r1] = r2 (encodings kbase itself decodes, mali_kbase_csf_sync.c).
     wr32(dst, 0);
-    let job = [0x01u64 << 56 | DST_VA, 0x02u64 << 56 | 2 << 48 | word as u64, 0x26u64 << 56 | 0 << 40 | 2 << 32];
-    for (k, &w) in job.iter().enumerate() {
-        wr64(ring + 8 * k, w);
-    }
-    unsafe { core::arch::asm!("dmb osh") };
-    let t0 = now();
-    wr64(uio, (8 * job.len()) as u64);
-    g.doorbell(doorbell as usize);
-    let landed = g.wait(100, |_| rd32(dst) == word);
-    let extract = rd64(uio + PAGE);
-    say!(grants, "gpu: job {} in {} us: the word reads G#{:X}, CS_EXTRACT {extract} of {}, CS_STATUS_CMD_PTR G#{:X}, blocked reason {}, CS_FAULT G#{:X}, CS_FATAL G#{:X}\n", if landed { "ran" } else { "did not land" }, ferros_sys::us_since(t0), rd32(dst), 8 * job.len(), sh.rd(sout + 0x40) as u64 | (sh.rd(sout + 0x44) as u64) << 32, sh.rd(sout + 0x60), sh.rd(sout + 0x80), sh.rd(sout + 0x84));
-    say!(grants, "gpu: {} KiB of gpu-mem used\n", m.used() >> 10);
-    exit(if landed { 0 } else { 1 });
+    ok &= run("sync_set", &[mv48(0, DST_VA), mv32(2, 0xCAFE_F00D), 0x26 << 56 | 0 << 40 | 2 << 32], &|| rd32(dst) == 0xCAFE_F00D);
+    say!(grants, "gpu: the target reads G#{:X} G#{:X} G#{:X}; {} KiB of gpu-mem used\n", rd32(dst), rd32(dst + 4), rd32(dst + 8), m.used() >> 10);
+    exit(if ok { 0 } else { 1 });
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
+}
+
+/// MOVE48: register pair `r` = a 48-bit immediate.
+fn mv48(r: u64, v: u64) -> u64 {
+    0x01 << 56 | r << 48 | v
+}
+/// MOVE32: register `r` = a 32-bit immediate.
+fn mv32(r: u64, v: u32) -> u64 {
+    0x02 << 56 | r << 48 | v as u64
+}
+
+/// One queue: its ring and user-IO pages (as the CPU sees them), the bytes inserted so far, its doorbell.
+struct Queue {
+    ring: usize,
+    uio: usize,
+    insert: core::cell::Cell<usize>,
+    doorbell: usize,
+}
+
+impl Queue {
+    /// Append `words` to the ring, publish the new insert offset in the user input page, ring the queue's doorbell.
+    fn submit(&self, g: &Gpu, words: &[u64]) {
+        let at = self.insert.get();
+        for (k, &w) in words.iter().enumerate() {
+            wr64(self.ring + at + 8 * k, w);
+        }
+        // Padded with NOPs (zero words) to the next 64 bytes: the command-stream front end fetches the ring a 64-byte line at a time and keeps the line, so a job that began inside the line the last one ended in ran as the NOPs it had fetched there (2026-11-04: the second job's words consumed, CS_EXTRACT moved on, nothing done).
+        let end = (at + 8 * words.len()).next_multiple_of(64);
+        for p in (at + 8 * words.len()..end).step_by(8) {
+            wr64(self.ring + p, 0);
+        }
+        unsafe { core::arch::asm!("dmb osh") };
+        self.insert.set(end);
+        wr64(self.uio, self.insert.get() as u64);
+        g.doorbell(self.doorbell);
+    }
 }
