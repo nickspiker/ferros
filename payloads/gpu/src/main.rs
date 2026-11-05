@@ -10,7 +10,7 @@ mod fw;
 mod mem;
 
 use core::fmt::Write;
-use ferros_sys::{cap, console, exit, freq, now};
+use ferros_sys::{cap, console, exit, freq, now, window};
 use mem::{rd32, wr32, wr64, Mem, Table, PAGE};
 
 const S_REGS: u64 = 1;
@@ -110,6 +110,10 @@ const CODE_VA: u64 = 0x3000_0000;
 const DESC_VA: u64 = 0x3100_0000;
 const OUT_VA: u64 = 0x3200_0000;
 const BIG_VA: u64 = 0x3300_0000;
+/// The show's picture: its address in the group's address space and its size (the width a power of two: the kernel finds a pixel's column with a shift).
+const IMG_VA: u64 = 0x4000_0000;
+const IMG_W: usize = 1024;
+const IMG_H: usize = 2048;
 
 struct Gpu {
     regs: usize,
@@ -187,7 +191,7 @@ impl Shared {
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
+pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     let regs = ferros_sys::dma(cap(grants, S_REGS)) as usize;
     let base = ferros_sys::dma(cap(grants, S_MEM)) as usize;
@@ -353,6 +357,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     as1.map(&mut m, OUT_VA, out, 1, PAGE_RW | NC | NX, TABLE);
     let big = m.alloc(16);
     as1.map(&mut m, BIG_VA, big, 16, PAGE_RW | NC | NX, TABLE);
+    // The picture a show renders (input bit 0): 1024 x 2048 escape counts, 8 MiB. Mapped with the rest before the address space is installed: the GPU caches its page-table walks in the L2, so a page mapped after it could meet a stale table line.
+    let img = m.alloc(IMG_W * IMG_H * 4 / PAGE);
+    as1.map(&mut m, IMG_VA, img, IMG_W * IMG_H * 4 / PAGE, PAGE_RW | NC | NX, TABLE);
     if !g.install(1, as1.root) {
         g.fail("AS1 never went idle");
     }
@@ -424,10 +431,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         ferros_sys::irq_ack(irq);
         raw
     };
-    let run = |name: &str, words: &[u64], check: &dyn Fn() -> bool| -> bool {
+    let run_for = |name: &str, words: &[u64], check: &dyn Fn() -> bool, ms: u64| -> bool {
         let t0 = now();
         q.submit(&g, words);
-        let deadline = t0 + g.f / 10;
+        let deadline = t0 + g.f / 1000 * ms;
         let mut wakes = 0;
         while !check() && now() < deadline {
             if ferros_sys::irq_wait(irq, deadline) == 0 {
@@ -439,6 +446,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         say!(grants, "gpu: job {name}: {} in {} us after {wakes} interrupts; CS_FAULT G#{:X}, CS_FATAL G#{:X}; CSG_REQ G#{:X} CSG_ACK G#{:X}\n", if ok { "done" } else { "did not finish" }, ferros_sys::us_since(t0), sh.rd(sout + 0x80), sh.rd(sout + 0x84), sh.rd(cin), sh.rd(cout));
         ok
     };
+    let run = |name: &str, words: &[u64], check: &dyn Fn() -> bool| run_for(name, words, check, 100);
     let mut ok = true;
     // 1: STORE_MULTIPLE r4..r5 to [r0:r1 + 4] (Mesa genxml v11 CS STORE_MULTIPLE: offset 15:0, register mask 31:16, address pair 47:40, base register 55:48), then WAIT on every scoreboard slot so the stores are done before the queue moves on.
     wr32(dst + 4, 0);
@@ -513,6 +521,48 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     say!(grants, "gpu: mandelbrot 64x64: sum {sum} (expect 83000), {full} pixels at {max_iter} (expect 1038), {wrong} differ from the CPU{}\n", match first_wrong { Some((g, a, b)) => alloc_free_fmt(g, a, b), None => Tail([0; 48], 0) });
     ok &= wrong == 0;
     say!(grants, "gpu: the target reads G#{:X} G#{:X} G#{:X}; {} KiB of gpu-mem used\n", rd32(dst), rd32(dst + 4), rd32(dst + 8), m.used() >> 10);
+    // Input bit 0: show it (tools/husky-gpu.sh show). The GPU renders the Mandelbrot set at 1024 x 2048 (up to 256 iterations, real -2.2 to 0.8), the CPU turns the counts into grey on a surface (black in the set, brighter the faster a point escapes: gamma 2, the display's working values), and the display shows it at the system level, over everything, for 60 s. Grant slots for it: 5 use display, 6 a surface.
+    let show = input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } & 1 == 1;
+    if show {
+        let display = cap(grants, 5);
+        let surf = ferros_sys::dma(cap(grants, 6)) as usize;
+        let mut r = [0u8; 256];
+        if ferros_sys::call(display, &[5], &mut r) < 4 || surf == 0 || surf == usize::MAX {
+            say!(grants, "gpu: show: no display server or no surface\n");
+            exit(1);
+        }
+        let (w, h) = (u16::from_le_bytes([r[0], r[1]]) as usize, u16::from_le_bytes([r[2], r[3]]) as usize);
+        let max_iter = 256u32;
+        let step = 3.0f32 / IMG_W as f32;
+        let (x0, y0) = (-2.2f32, -(IMG_H as f32) * 0.5 * step);
+        wr32(out + 0x200, 0);
+        let u = [IMG_VA, IMG_W.trailing_zeros() as u64 | (max_iter as u64) << 32, x0.to_bits() as u64 | (y0.to_bits() as u64) << 32, step.to_bits() as u64];
+        let n = cx.prepare(&MANDEL, &u, (IMG_W * IMG_H / 16) as u32, done, &mut words);
+        let t0 = now();
+        let rendered = run_for("mandelbrot 1024x2048", &words[..n], &|| rd32(out + 0x200) == 1, 4000);
+        let gpu_us = ferros_sys::us_since(t0);
+        let px = surf + window::PORCH as usize;
+        let (ox, oy) = ((w - IMG_W) / 2, (h - IMG_H) / 2);
+        for y in 0..h {
+            for x in 0..w {
+                let inside = x >= ox && x < ox + IMG_W && y >= oy && y < oy + IMG_H;
+                let k = if inside { rd32(img + 4 * ((y - oy) * IMG_W + x - ox)) } else { max_iter };
+                // Linear light k / max_iter, in gamma 2 at Q14: 2^14 · √(k / max_iter).
+                let v = if k >= max_iter { 0 } else { ((k as u64) << 28) / max_iter as u64 }.isqrt();
+                wr64(px + 8 * (y * w + x), v | v << 16 | v << 32);
+            }
+        }
+        if !rendered || !window::show(display, surf as u64, 0, 0, w as u16, h as u16, window::SYSTEM) {
+            say!(grants, "gpu: show: {}\n", if rendered { "the display refused the window" } else { "the render did not finish" });
+            exit(1);
+        }
+        say!(grants, "gpu: show: the Mandelbrot set rendered by the GPU in {gpu_us} us, on the glass for 60 s\n");
+        let end = now() + 60 * g.f;
+        while now() < end {
+            ferros_sys::sleep_until(now() + g.f);
+        }
+        window::done(display, surf as u64);
+    }
     exit(if ok { 0 } else { 1 });
 }
 
