@@ -114,6 +114,9 @@ const BIG_VA: u64 = 0x3300_0000;
 const IMG_VA: u64 = 0x4000_0000;
 const IMG_W: usize = 1024;
 const IMG_H: usize = 2048;
+/// The present-stage bench: 1M pixels (a quarter of a phase frame), its output at BENCH_VA, its input the picture's buffer read as 64-bit pixels.
+const BENCH_PX: usize = 1 << 20;
+const BENCH_VA: u64 = 0x5000_0000;
 
 struct Gpu {
     regs: usize,
@@ -359,7 +362,13 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     as1.map(&mut m, BIG_VA, big, 16, PAGE_RW | NC | NX, TABLE);
     // The picture a show renders (input bit 0): 1024 x 2048 escape counts, 8 MiB. Mapped with the rest before the address space is installed: the GPU caches its page-table walks in the L2, so a page mapped after it could meet a stale table line.
     let img = m.alloc(IMG_W * IMG_H * 4 / PAGE);
-    as1.map(&mut m, IMG_VA, img, IMG_W * IMG_H * 4 / PAGE, PAGE_RW | NC | NX, TABLE);
+    // Input bit 2: the picture and the bench's buffers cached on the GPU side (MEMATTR index 0, write-back; every compute stream ends with an L2 clean), else non-cacheable (index 5).
+    let in0 = if input_len > 0 { unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } } else { 0 };
+    let bulk = if in0 & 4 != 0 { 0 } else { NC };
+    as1.map(&mut m, IMG_VA, img, IMG_W * IMG_H * 4 / PAGE, PAGE_RW | bulk | NX, TABLE);
+    // The present-stage bench's output (input bit 1): a 32-bit word for each of the 1M 64-bit pixels the picture's 8 MiB holds as its input.
+    let bench = m.alloc(BENCH_PX * 4 / PAGE);
+    as1.map(&mut m, BENCH_VA, bench, BENCH_PX * 4 / PAGE, PAGE_RW | bulk | NX, TABLE);
     if !g.install(1, as1.root) {
         g.fail("AS1 never went idle");
     }
@@ -521,6 +530,56 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     say!(grants, "gpu: mandelbrot 64x64: sum {sum} (expect 83000), {full} pixels at {max_iter} (expect 1038), {wrong} differ from the CPU{}\n", match first_wrong { Some((g, a, b)) => alloc_free_fmt(g, a, b), None => Tail([0; 48], 0) });
     ok &= wrong == 0;
     say!(grants, "gpu: the target reads G#{:X} G#{:X} G#{:X}; {} KiB of gpu-mem used\n", rd32(dst), rd32(dst + 4), rd32(dst + 8), m.used() >> 10);
+    // Input bit 1: the present-stage bench (fluor on the GPU, measured before written): a proxy with the display's present stage's memory shape, a 64-bit pixel in and a 32-bit word out, with 0, 24 or 48 FMAs between, over 1M pixels; and the same at 16 invocations for the fixed cost of a dispatch. The kernel:
+    //   SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:3      (the pixel's address)
+    //   LOAD.i64.unsigned.slot0.wait0 @r4:r5, [r2:r3]   (the wait in the flow field acts after its instruction, before the next: on the consumer it came one too late, 2026-11-05)
+    //   U32_TO_F32 r6, r4
+    //   FMA.f32 r6, r6, r6, r6   × n
+    //   SHADDX.u64 [r2:r3], u1, [r60:r61].w0, shift:2      (the word's address)
+    //   STORE.i32.slot0.end @r6, [r2:r3]
+    let bench_mode = input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } & 2 == 2;
+    if bench_mode {
+        for i in 0..BENCH_PX {
+            wr64(img + 8 * (i % (IMG_W * IMG_H / 2)), i as u64);
+        }
+        // The load alone, its word stored back raw: three forms of LOAD.i32 against the test vector's (`LOAD.i32.unsigned.slot0.wait0 @r0, [r0^:r1^]` = G#0860_8082_1800_0040).
+        let seqs: [(&str, &[u64]); 4] = [
+            ("load, SHADDX.wait0, store r4", &[0x01A3_C200_2037_3C80, 0x0060_84F4_2800_0002, 0x09A3_C200_2027_3C82, 0x7861_4402_1800_0002]),
+            ("load, MOV.wait0 r6, store r6", &[0x01A3_C200_2037_3C80, 0x0060_84F4_2800_0002, 0x0891_C600_0000_0004, 0x01A3_C200_2027_3C82, 0x7861_4602_1800_0002]),
+            ("load, CVT.wait0 r6, store r6", &[0x01A3_C200_2037_3C80, 0x0060_84F4_2800_0002, 0x0890_C600_0019_0004, 0x01A3_C200_2027_3C82, 0x7861_4602_1800_0002]),
+            ("load, SHADDX.wait0, CVT r6, store r6", &[0x01A3_C200_2037_3C80, 0x0060_84F4_2800_0002, 0x09A3_C200_2027_3C82, 0x0090_C600_0019_0004, 0x7861_4602_1800_0002]),
+        ];
+        for (name, code) in seqs {
+            for i in 0..16 {
+                wr32(bench + 4 * i, 0xDEAD_0000);
+            }
+            wr32(out + 0x200, 0);
+            let n = cx.prepare(code, &[IMG_VA, BENCH_VA], 1, done, &mut words);
+            run_for("raw load", &words[..n], &|| rd32(out + 0x200) == 1, 200);
+            say!(grants, "gpu: raw load {name}: G#{:X} G#{:X} G#{:X} (the pixels hold 0, 1, 2); AS1 FAULTSTATUS G#{:X} FAULTADDRESS G#{:X}\n", rd32(bench), rd32(bench + 4), rd32(bench + 8), g.rd(Gpu::as_reg(1, AS_FAULTSTATUS)), g.rd64(Gpu::as_reg(1, AS_FAULTADDRESS)));
+        }
+        for (fmas, px) in [(0usize, 16usize), (0, BENCH_PX), (24, BENCH_PX), (48, BENCH_PX)] {
+            let mut code = [0u64; 64];
+            let mut k = 0;
+            for w in [0x01A3_C200_2037_3C80u64, 0x0860_84F4_2800_0002, 0x0090_C600_0019_0004] {
+                code[k] = w;
+                k += 1;
+            }
+            for _ in 0..fmas {
+                code[k] = 0x00B2_C600_0006_0606;
+                k += 1;
+            }
+            code[k] = 0x01A3_C200_2027_3C82;
+            code[k + 1] = 0x7861_4602_1800_0002;
+            k += 2;
+            wr32(out + 0x200, 0);
+            let n = cx.prepare(&code[..k], &[IMG_VA, BENCH_VA], (px / 16) as u32, done, &mut words);
+            let t0 = now();
+            let finished = run_for("bench", &words[..n], &|| rd32(out + 0x200) == 1, 2000);
+            let us = ferros_sys::us_since(t0);
+            say!(grants, "gpu: bench: {px} pixels, {fmas} FMAs a pixel: {} in {us} us ({} ns a pixel); word 0 G#{:X}\n", if finished { "done" } else { "not finished" }, us * 1000 / px as u64, rd32(bench));
+        }
+    }
     // Input bit 0: show it (tools/husky-gpu.sh show). The GPU renders the Mandelbrot set at 1024 x 2048 (up to 256 iterations, real -2.2 to 0.8), the CPU turns the counts into grey on a surface (black in the set, brighter the faster a point escapes: gamma 2, the display's working values), and the display shows it at the system level, over everything, for 60 s. Grant slots for it: 5 use display, 6 a surface.
     let show = input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } & 1 == 1;
     if show {

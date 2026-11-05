@@ -109,3 +109,34 @@ This is the shape of tapuwae's work (an orbit per sample, divergent escape), so 
 **On the glass.** `tools/husky-gpu.sh show` renders the Mandelbrot set at 1024 × 2048, up to 256 iterations, in 8.7 ms on the GPU. The CPU turns the counts into grey on a surface (black in the set, gamma 2), and the display shows it at the system level for 60 s. Seen by the owner on 2026-11-05: "Looks great".
 
 **Leaving.** The driver ends with a soft reset, which leaves MCU_STATUS 0, L2_READY 0 and SHADER_READY 0, so nothing keeps running or drawing power after it until it becomes a resident service.
+
+## The present stage on the GPU? Measured first (2026-11-05)
+
+The question: should fluor's present stage (the display server's per-pixel ODT, dither and 10-bit pack into the four temporal phases) move to the GPU? The owner's answer on exactness: "bit identical-ish is totally fine".
+
+**The CPU today:**
+- A full-screen show (op 22) takes 36 ms wall.
+- Its present stage is 19 ms of NEON plus 4 ms of copying, in CPU time over 15.7 Mpx (four phases of 4 Mpx), shared by four threads.
+- That is about 1.2 ns of CPU per pixel, roughly 6 ms of CPU and 1.5 ms of wall per phase.
+
+**The GPU** (`gpu.bin` input bit 1, bit 2 for GPU-cached buffers). The proxy has the present stage's shape: a 64-bit pixel in, a 32-bit word out, with 0, 24 or 48 FMAs between, over 1M pixels (a quarter phase).
+
+| Mapping (GPU side) | 1M pixels | A whole phase (4 Mpx, scaled) |
+|---|---|---|
+| input and output non-cacheable | 1.06 ms | about 4.3 ms |
+| input cached, output non-cacheable | 0.69 ms | about 2.8 ms |
+| both cached (with the L2 clean at the end) | 0.80 ms | about 3.2 ms |
+
+- The fixed cost of a dispatch is 130-145 us warm (about 600 us cold, the MCU powering the cores).
+- 48 FMAs cost nothing measurable: the pass is bound by memory (about 17 GB/s), not arithmetic.
+- The GPU runs at whatever clock ABL left, unmeasured; DVFS through ACPM could move these numbers.
+
+**What it says:**
+- Per phase the GPU takes about the wall time the CPU does, or somewhat longer.
+- What it buys is the CPU: the 6 ms of CPU per phase (23 ms per full repaint) leaves the X3 and the workers.
+- It costs:
+  - the canvas cleaned from the CPU's caches before the GPU reads it (not yet measured);
+  - the GPU's fence widened to the display's phases (or a copy);
+  - the GPU kept resident instead of booted per job.
+
+**The Valhall wait field, learnt here.** The flow field (bits 62:59) acts after its instruction, before the next one. A `.wait0` on the consumer of a load comes one instruction too late (it read the register's old value). It belongs on the load itself (as Mesa's test vector has it) or on the instruction just before the consumer.
