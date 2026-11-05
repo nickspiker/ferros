@@ -54,16 +54,23 @@ unsafe extern "C" {
 struct Smpt([u32; 32768]);
 
 static mut WINDOW_TABLE: Smpt = Smpt([0; 32768]);
+/// The DPUF S2MPUs' table: both serve the same display, so one window.
+static mut DPU_TABLE: Smpt = Smpt([0; 32768]);
 
-fn rd(off: usize) -> u32 {
-    unsafe { read_volatile((BASE + off) as *const u32) }
+/// The DPU's S2MPUs (zuma-s2mpu.dtsi s2mpu_s0_dpuf0/1), inside the DPUF power domains: reachable only while those are on (dpu_power::all_on).
+pub const DPU_S2MPUS: [usize; 2] = [0x1987_0000, 0x19C7_0000];
+
+fn rd(base: usize, off: usize) -> u32 {
+    unsafe { read_volatile((base + off) as *const u32) }
 }
-fn wr(off: usize, v: u32) {
-    unsafe { write_volatile((BASE + off) as *mut u32, v) }
+fn wr(base: usize, off: usize, v: u32) {
+    unsafe { write_volatile((base + off) as *mut u32, v) }
 }
 
 /// What `fence` did: 1 = fenced, 0 = not yet run, G#E1 = not an S2MPU v9, G#E2 = invalidation never completed, G#E3 = the DMA memory doesn't sit in one GiB.
 static RESULT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The same for `fence_dpu` (both of the DPU's, the first failure if one failed).
+static DPU_RESULT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 pub fn result() -> u32 {
     RESULT.load(core::sync::atomic::Ordering::Relaxed)
@@ -77,9 +84,6 @@ pub fn fence() -> u32 {
 }
 
 fn fence_inner() -> u32 {
-    if rd(VERSION) & 0xFFFF_0000 != 0x9000_0000 {
-        return 0xE1;
-    }
     // The table: RW (G#C) for UFS's DMA pages and the DMA pool, nothing else in their GiB.
     let dma = unsafe { (&raw const __dma_ufs_start as usize, &raw const __dma_ufs_end as usize) };
     let pool = crate::cachemap::DMA_POOL;
@@ -87,20 +91,45 @@ fn fence_inner() -> u32 {
     if (dma.1 - 1) >> 30 != gb || (pool.0 != pool.1 && (pool.0 >> 30 != gb || (pool.1 - 1) >> 30 != gb)) {
         return 0xE3;
     }
-    let base = gb << 30;
-    let allowed = |pa: usize| (pa >= dma.0 && pa < dma.1) || (pa >= pool.0 && pa < pool.1);
-    let t = unsafe { &mut *(&raw mut WINDOW_TABLE) };
+    fence_at(BASE, &raw mut WINDOW_TABLE, gb, 0xC, &|pa| (pa >= dma.0 && pa < dma.1) || (pa >= pool.0 && pa < pool.1))
+}
+
+/// The DPU's fence (owner, 2026-11-04: bound the display's bus master as the HSI2 one is): VID 0, where the layer DMA arrives (its faults latched there), may **read** the two regions the display server points it at — `display-fb` and `display-phases` (cachemap) — and nothing else; it never writes (no write-back DMA). ABL leaves these S2MPUs off, which let the display engine read anything, the kernel included, at an address a process programs; a domain's reset turns them on over a table of power-on noise. Called at boot when the DPU is on and by the `dpu` switch after it powers the domains.
+pub fn fence_dpu() -> u32 {
+    let (fb, ph) = (crate::cachemap::DISPLAY_FB, crate::cachemap::DISPLAY_PHASES);
+    let gb = fb.0 >> 30;
+    let r = if [fb.0, fb.1 - 1, ph.0, ph.1 - 1].iter().any(|&a| a >> 30 != gb) {
+        0xE3
+    } else {
+        let allowed = |pa: usize| (pa >= fb.0 && pa < fb.1) || (pa >= ph.0 && pa < ph.1);
+        DPU_S2MPUS.iter().map(|&s| fence_at(s, &raw mut DPU_TABLE, gb, 0x4, &allowed)).find(|&r| r != 1).unwrap_or(1)
+    };
+    DPU_RESULT.store(r, core::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+pub fn dpu_result() -> u32 {
+    DPU_RESULT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// One S2MPU fenced: VID 0 reaches the pages of GiB `gb` that `allowed` names, with permission `perm` (SMPT nibble: G#4 read, G#8 write), through `table`; every other GiB and every other VID nothing.
+fn fence_at(base: usize, table: *mut Smpt, gb: usize, perm: u32, allowed: &dyn Fn(usize) -> bool) -> u32 {
+    if rd(base, VERSION) & 0xFFFF_0000 != 0x9000_0000 {
+        return 0xE1;
+    }
+    let gb_base = gb << 30;
+    let t = unsafe { &mut *table };
     for (w, e) in t.0.iter_mut().enumerate() {
         let mut v = 0u32;
         for n in 0..8 {
-            if allowed(base + ((w * 8 + n) << 12)) {
-                v |= 0xC << (4 * n);
+            if allowed(gb_base + ((w * 8 + n) << 12)) {
+                v |= perm << (4 * n);
             }
         }
         *e = v;
     }
     // Clean the table to the point of coherency: the walker reads DRAM, not the cache.
-    let (t0, t1) = (&raw const WINDOW_TABLE as usize, &raw const WINDOW_TABLE as usize + core::mem::size_of::<Smpt>());
+    let (t0, t1) = (table as usize, table as usize + core::mem::size_of::<Smpt>());
     unsafe {
         core::arch::asm!("dsb sy");
         let mut a = t0;
@@ -111,53 +140,64 @@ fn fence_inner() -> u32 {
         core::arch::asm!("dsb sy");
     }
     // Contexts: context i serves VID i, all valid (L1 writes for a VID without a context are ignored).
-    let n = (rd(NUM_CONTEXT) & 0xF) as usize;
+    let n = (rd(base, NUM_CONTEXT) & 0xF) as usize;
     let mut ctx = 0u32;
     for i in 0..n.min(VIDS) {
         ctx |= ((i as u32) | 8) << (4 * i);
     }
-    wr(CONTEXT_CFG_VALID_VID, ctx);
-    let table = (&raw const WINDOW_TABLE as usize >> 4) as u32;
+    wr(base, CONTEXT_CFG_VALID_VID, ctx);
+    let tab = (table as usize >> 4) as u32;
     for vid in 0..VIDS {
         for g in (0..4).chain(34..GBS) {
             if g == gb && vid == 0 {
-                wr(l1_table(vid, g), table);
-                wr(l1_attr(vid, g), L2TABLE_EN);
+                wr(base, l1_table(vid, g), tab);
+                wr(base, l1_attr(vid, g), L2TABLE_EN);
             } else {
-                wr(l1_attr(vid, g), 0);
+                wr(base, l1_attr(vid, g), 0);
             }
         }
     }
     unsafe { core::arch::asm!("dsb sy") };
-    wr(ALL_INVALIDATION, 1);
-    wr(SYNC_CMD, 1);
+    wr(base, ALL_INVALIDATION, 1);
+    wr(base, SYNC_CMD, 1);
     let freq = crate::platform::cntfrq();
     let t0 = crate::platform::cntpct();
-    while rd(SYNC_COMP) & 1 == 0 || rd(STATUS) & 3 == 3 {
+    while rd(base, SYNC_COMP) & 1 == 0 || rd(base, STATUS) & 3 == 3 {
         if crate::platform::cntpct().wrapping_sub(t0) > freq / 100 {
             return 0xE2;
         }
     }
-    wr(ERR_RESP_PER_VID_SET, 0xFF);
-    wr(INTERRUPT_ENABLE_PER_VID_SET, 0xFF);
-    wr(CTRL0, 0);
-    wr(PROT_EN_PER_VID_SET, 0xFF);
-    wr(CFG, 0);
+    wr(base, ERR_RESP_PER_VID_SET, 0xFF);
+    wr(base, INTERRUPT_ENABLE_PER_VID_SET, 0xFF);
+    wr(base, CTRL0, 0);
+    wr(base, PROT_EN_PER_VID_SET, 0xFF);
+    wr(base, CFG, 0);
     unsafe { core::arch::asm!("dsb sy") };
     1
 }
-
 /// DIAG lines: the fence result and any latched faults (per faulting VID: PA, info with the VID in [26:24], info2 with the stream ID in [23:0]).
 pub fn report(out: &mut alloc::vec::Vec<u8>) {
     use crate::platform::append_hex;
     append_hex(out, b"S2MPU_FENCE=", result());
-    let st = rd(FAULT_STATUS);
+    faults(out, BASE);
+    append_hex(out, b"S2MPU_DPU_FENCE=", dpu_result());
+    // The DPU's only while its domains are on: an access with a domain down poisons EL3 (display.rs).
+    if crate::dpu_power::all_on() {
+        for s in DPU_S2MPUS {
+            faults(out, s);
+        }
+    }
+}
+
+fn faults(out: &mut alloc::vec::Vec<u8>, base: usize) {
+    use crate::platform::append_hex;
+    let st = rd(base, FAULT_STATUS);
     append_hex(out, b"S2MPU_FAULT_STATUS=", st);
     for vid in 0..VIDS {
         if st & (1 << vid) != 0 {
-            append_hex(out, b"S2MPU_FAULT_PA=", rd(fault_pa_low(vid)));
-            append_hex(out, b"S2MPU_FAULT_INFO=", rd(fault_info(vid)));
-            append_hex(out, b"S2MPU_FAULT_INFO2=", rd(fault_info2(vid)));
+            append_hex(out, b"S2MPU_FAULT_PA=", rd(base, fault_pa_low(vid)));
+            append_hex(out, b"S2MPU_FAULT_INFO=", rd(base, fault_info(vid)));
+            append_hex(out, b"S2MPU_FAULT_INFO2=", rd(base, fault_info2(vid)));
         }
     }
 }
