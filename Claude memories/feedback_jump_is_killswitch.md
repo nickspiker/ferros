@@ -23,3 +23,5 @@ Related: [[hv-jump-to-ferros]], [[feedback-killswitch-irq-mask]], [[ufs-firewall
 - The UFS device's VCC is cut for 16 ms, then full init.
 - First jump: all three deny-alls took, the GPU and EH were still on and got cut, UFS came up in 222 ms (it took about 16 s when Android's command was in flight).
 - Not covered: the cpucl0 S2MPU, because what sits behind it is unknown.
+
+**cpucl0 (2026-11-04):** this S2MPU guards the CoreSight debug/trace master, not the cores (shown with deny-all on a running cold ferros). It is closed on cold boots. Closing it at the jump froze the jumped ferros after vault open, every core silent and the kill chord with them. Most likely Android's trace (ETM to ETR) was still running on the reused cores and backed up into them once the sink was cut off. Switch tracing off on every core first (TRFCR_EL1/EL2, or the ETMs), then close it. This also showed that the volume-chord killswitch dies when every core stalls. The only backstops then are the hardware watchdog and the power long-press.
