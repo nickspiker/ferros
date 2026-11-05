@@ -470,6 +470,48 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let all_big = || rd32(out + 0x200) == 1 && (0..16384).all(|i| rd32(big + 4 * i) == 0xC0FF_EE00 + i as u32);
     ok &= run("compute 16384", &words[..n], &all_big);
     say!(grants, "gpu: THREAD_MAX_THREADS {}; the last word G#{:X}\n", cx.max_threads, rd32(big + 4 * 16383));
+    // 4: a real kernel, the Mandelbrot set's escape count over a 64 x 64 image, one invocation a pixel (hand-encoded Valhall: shifts, int-to-float, FMA, float and int compares, a divergent loop closed by BRANCHZ.reconverge; GPU.md "Compute"). Uniforms: u0 the output, u1 (log2 width, max_iter), u2 (x0, y0), u3 (step, 0). Checked pixel by pixel against the same arithmetic on the CPU in single precision.
+    const MANDEL: [u64; 26] = [
+        0x00B4_CD00_11C0_823C, 0x00B4_CC01_11C0_820D, 0x00A8_CC00_0001_0C3C, 0x0090_CC00_0019_000C, 0x0090_CD00_0019_000D, 0x0091_CA00_0000_0086, 0x00B2_C600_0084_0A0C, 0x00B2_C700_0085_0A0D,
+        0x0110_C440_8000_00C0, 0x0110_C000_0000_00C0, 0x0110_C100_0000_00C0, 0x5110_C500_0000_00C0, 0x00B2_C804_00C0_0101, 0x00B2_C904_00C0_0505, 0x00A4_CA00_0000_0908, 0x00F0_CB03_80C0_8300,
+        0x00F4_CC05_80C0_040A, 0x00B4_CB01_100C_C00B, 0x00A4_CA00_0000_0101, 0x00B2_C500_0007_050A, 0x00A4_CA10_0000_0908, 0x00A4_C100_0000_060A, 0x00A8_C000_0001_0B00, 0x501F_C007_FFFF_F40B,
+        0x01A3_C200_2027_3C80, 0x7861_4002_1800_0002,
+    ];
+    let (shift, max_iter, x0, y0, step) = (6u32, 64u32, -2.0f32, -1.25f32, 0.0390625f32);
+    for i in 0..4096 {
+        wr32(big + 4 * i, 0xFFFF_FFFF);
+    }
+    wr32(out + 0x200, 0);
+    let u = [BIG_VA, shift as u64 | (max_iter as u64) << 32, x0.to_bits() as u64 | (y0.to_bits() as u64) << 32, step.to_bits() as u64];
+    let n = cx.prepare(&MANDEL, &u, 4096 / 16, done, &mut words);
+    ok &= run("mandelbrot", &words[..n], &|| rd32(out + 0x200) == 1);
+    let reference = |gid: u32| -> u32 {
+        let py = gid >> shift;
+        let px = gid - (py << shift);
+        let (cr, ci) = (px as f32 * step + x0, py as f32 * step + y0);
+        let (mut zx, mut zy, mut k) = (0f32, 0f32, 0u32);
+        loop {
+            let (x2, y2) = (zx * zx, zy * zy);
+            if k == max_iter || !(x2 + y2 <= 4.0) {
+                return k;
+            }
+            zy = (zx + zx) * zy + ci;
+            zx = (x2 - y2) + cr;
+            k += 1;
+        }
+    };
+    let (mut sum, mut full, mut wrong, mut first_wrong) = (0u32, 0u32, 0u32, None);
+    for gid in 0..4096u32 {
+        let got = rd32(big + 4 * gid as usize);
+        sum += got;
+        full += (got == max_iter) as u32;
+        if got != reference(gid) {
+            wrong += 1;
+            first_wrong.get_or_insert((gid, got, reference(gid)));
+        }
+    }
+    say!(grants, "gpu: mandelbrot 64x64: sum {sum} (expect 83000), {full} pixels at {max_iter} (expect 1038), {wrong} differ from the CPU{}\n", match first_wrong { Some((g, a, b)) => alloc_free_fmt(g, a, b), None => Tail([0; 48], 0) });
+    ok &= wrong == 0;
     say!(grants, "gpu: the target reads G#{:X} G#{:X} G#{:X}; {} KiB of gpu-mem used\n", rd32(dst), rd32(dst + 4), rd32(dst + 8), m.used() >> 10);
     exit(if ok { 0 } else { 1 });
 }
@@ -574,4 +616,27 @@ impl Compute {
         out[..words.len()].copy_from_slice(&words);
         words.len()
     }
+}
+
+/// A short formatted tail for a console line, without an allocator.
+struct Tail([u8; 48], usize);
+impl core::fmt::Display for Tail {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.write_str(core::str::from_utf8(&self.0[..self.1]).unwrap_or(""))
+    }
+}
+impl Write for Tail {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let b = s.as_bytes();
+        let n = b.len().min(self.0.len() - self.1);
+        self.0[self.1..self.1 + n].copy_from_slice(&b[..n]);
+        self.1 += n;
+        Ok(())
+    }
+}
+/// "; first at gid G: GPU n, CPU n".
+fn alloc_free_fmt(g: u32, a: u32, b: u32) -> Tail {
+    let mut t = Tail([0; 48], 0);
+    let _ = write!(t, "; first at gid {g}: GPU {a}, CPU {b}");
+    t
 }

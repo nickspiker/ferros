@@ -95,3 +95,13 @@ The shader cores run a hand-encoded Valhall compute shader. Sixteen invocations 
 - a compiler from tapuwae's shading (or a small kernel language) to Valhall, or Mesa's compiler run on the host to produce binaries checked in as data;
 - resource tables for buffers;
 - the driver as a resident service (a `gpu` endpoint, each client its own address space and group).
+
+## A real kernel: the Mandelbrot set (2026-11-04, the same night)
+
+A hand-encoded 26-instruction Valhall kernel computes the Mandelbrot set's escape count over a 64 × 64 image, one invocation per pixel. It runs integer shifts, int-to-float conversion, FMA, float and integer compares, and a divergent loop closed by `BRANCHZ.reconverge`. On the device: 708 us for 4096 pixels at up to 64 iterations; sum 83000 and 1038 pixels at 64, both as predicted. It is **bit-exact against the same arithmetic on the CPU in single precision: 0 of 4096 pixels differ.**
+
+- Uniforms: u0 the output; u1 (log2 width, max_iter); u2 (x0, y0); u3 (step, 0).
+- An ALU instruction reads at most one 64-bit uniform slot, so step goes into a register first.
+- The words, decoded field by field with their sources and expected pixel values, are in `/mnt/Harbor/tmp/mesa-panfrost/ferros-mandel-spec.md`. It also holds a branch-free fallback (8 unrolled iterations), unused.
+
+This is the shape of tapuwae's work (an orbit per sample, divergent escape), so the attest mark on the GPU is now a compiler question, not a hardware one.
