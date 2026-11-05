@@ -746,6 +746,10 @@ pub static IRQS: &[IrqLine] = &[
     IrqLine { name: "gnss-host-req", intid: 32 + 63 },
     // The USB controller (DWC3): zuma IRQ_USB32DRD_GIC_0_HSI0, SPI 402, level high.
     IrqLine { name: "usb-dwc3", intid: 32 + 402 },
+    // The GPU (zuma.h IRQ_G3D_IRQ*_G3D, zuma-gpu.dtsi, level high): its GPU-control line (resets, power transitions, cache flushes), its job line (the CSF firmware's global and group interfaces), its MMU line (page faults), SPI 346-348.
+    IrqLine { name: "gpu-gpu", intid: 32 + 346 },
+    IrqLine { name: "gpu-job", intid: 32 + 347 },
+    IrqLine { name: "gpu-mmu", intid: 32 + 348 },
 ];
 /// Set by `.Lirq` with any pending byte (and a `sev`), cleared when `wake_sleepers` has looked: an idle core looks for interrupt waiters only when this says so.
 #[unsafe(no_mangle)]

@@ -62,9 +62,9 @@ pub const POOL: (usize, usize) = (0x8300_0000, 0x8400_0000);
 #[cfg(shim_handoff)]
 pub const POOL: (usize, usize) = (0x92C0_0000, 0x92E0_0000);
 
-/// The big arc pool (cold only): 512 MiB of Normal write-back, EL0 read/write/execute DRAM at G#A000_0000, in 2 MiB blocks of the window's GiB table — arcs of 16 MiB and up (a std process: Photon's heap, a fluor frame's scratch), where the 16 MiB page pool holds the small ones and the masked ones. Nothing in the device tree reserves G#9800_0000-G#C000_0000 (the TPU, GSA and modem carveouts sit below G#9740_0000 and from G#C000_0000; ferros-ref soc-gs dts, 2026-10-27); W^X is not kept per page here — native processes only, and the whole arc is theirs to execute.
+/// The big arc pool (cold only): 320 MiB of Normal write-back, EL0 read/write/execute DRAM at G#A000_0000, in 2 MiB blocks of the window's GiB table — arcs of 16 MiB and up (a std process: Photon's heap, a fluor frame's scratch), where the 16 MiB page pool holds the small ones and the masked ones. Nothing in the device tree reserves G#9800_0000-G#C000_0000 (the TPU, GSA and modem carveouts sit below G#9740_0000 and from G#C000_0000; ferros-ref soc-gs dts, 2026-10-27); W^X is not kept per page here — native processes only, and the whole arc is theirs to execute.
 #[cfg(not(shim_handoff))]
-pub const POOL_BIG: (usize, usize) = (0xA000_0000, 0xB600_0000);
+pub const POOL_BIG: (usize, usize) = (0xA000_0000, 0xB400_0000);
 
 /// The cellular modem's shared memory, EL0-accessible Device memory for its driver process (process.rs DMA `modem-pktproc`, `modem-ipc`, `modem-msi`; zuma-rmem.dtsi carveouts): pktproc's rings and packet buffers (32 MiB), the IPC region (legacy rings, handover block, ROM image; 4 MiB), the MSI and boot-register page. Device, as the kernel's own view of them: the CP writes them over PCIe and no cache line may hide that. 2 MiB aligned, in the GiB above the window.
 pub const MODEM_WINDOWS: [(usize, usize); 3] = [(0xE800_0000, 0xEA00_0000), (0xEA40_0000, 0xEA80_0000), (0xF620_0000, 0xF640_0000)];
@@ -84,9 +84,9 @@ pub const POOL_BIG: (usize, usize) = (0, 0);
 
 /// The GPU's registers (Mali-G715 at G#1F00_0000, 16 MiB: zuma-gpu.dtsi `reg`; its doorbell pages inside, from G#1F08_0000), EL0 Device memory for the GPU driver process (GPU.md), mapped as the USB controller's block is: nothing else lives in G#1F00_0000-G#2000_0000. Granted as `gpu-regs`.
 pub const GPU_REGS: (usize, usize) = (0x1F00_0000, 0x2000_0000);
-/// The GPU's memory (cold only): 32 MiB of Normal non-cacheable, EL0 read/write memory the GPU driver process and the GPU share — the MCU's firmware sections, the GPU's page tables, the shared interface, rings and buffers. Non-cacheable because the GPU does not snoop the CPU's caches (GPU.md). Free DRAM on a cold boot: above the big arc pool (G#B600_0000), below the GiB ABL's modem image starts (G#C000_0000); no reserved-memory node lies there (zuma-rmem.dtsi). The GPU's S2MPU lets it reach this and nothing else (s2mpu::fence_gpu). Granted as `gpu-mem`.
+/// The GPU's memory (cold only): 32 MiB of Normal non-cacheable, EL0 read/write memory the GPU driver process and the GPU share — the MCU's firmware sections, the GPU's page tables, the shared interface, rings and buffers. Non-cacheable because the GPU does not snoop the CPU's caches (GPU.md). The top 32 MiB of what was the big arc pool, just below the secure DRAM carveout at G#B600_0000 (cbff939; it is in no reserved-memory node, so the device tree does not show it: the first gpu-mem, at G#B800_0000 inside it, took writes silently and aborted every read, 2026-11-04). The GPU's S2MPU lets it reach this and nothing else (s2mpu::fence_gpu). Granted as `gpu-mem`.
 #[cfg(not(shim_handoff))]
-pub const GPU_MEM: (usize, usize) = (0xB800_0000, 0xBA00_0000);
+pub const GPU_MEM: (usize, usize) = (0xB400_0000, 0xB600_0000);
 #[cfg(shim_handoff)]
 pub const GPU_MEM: (usize, usize) = (0, 0);
 
