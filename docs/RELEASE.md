@@ -21,8 +21,7 @@ What must be true before a release build ships. An item comes off this list only
   - It refuses native capsules ([SANDBOX.md](SANDBOX.md)).
   - Its "Ready?" gate waits for the press with no timer. Whether it boots at once instead is undecided (owner, 2026-11-05).
 - **The device lock** (owner): prepared freely, run only for the release, never before.
-- **The hardware watchdog across the jump:** the hv re-arms it at the jump with the longest window. Measure the jump's own hand-over stretch (`DIAG WDT_HANDOVER_US` after an owner's chord), then lower the re-arm ([POWER.md](POWER.md)).
 
 ## Done
 
-(Nothing yet.)
+- **The hardware watchdog across the jump** (2026-11-05): measured 323 ms and 291 ms from the hv's re-arm to ferros's own arm. The hv now re-arms at the kernel's 1 s (was ~87 s), verified on a chord ([POWER.md](POWER.md)).

@@ -2391,7 +2391,7 @@ pub fn run(mut b: Boot) -> ! {
                 append_hex(&mut resp, b"UPTIME_MS=", (cntpct().wrapping_sub(t_boot) / (freq / 1000)) as u32);
                 // The watchdog window's measurement (platform::pet_watchdogs): the longest gap between two pets from any core, when it ended (uptime), and the pets so far.
                 append_hex(&mut resp, b"WDT_GAP_MAX_US=", (crate::platform::PET_GAP_MAX.load(core::sync::atomic::Ordering::Relaxed) * 1_000_000 / freq) as u32);
-                append_hex(&mut resp, b"WDT_GAP_AT_MS=", (crate::platform::PET_GAP_AT.load(core::sync::atomic::Ordering::Relaxed).wrapping_sub(t_boot) / (freq / 1000)) as u32);
+                append_hex(&mut resp, b"WDT_GAP_AT_MS=", ((crate::platform::PET_GAP_AT.load(core::sync::atomic::Ordering::Relaxed) - crate::checklist::ENTRY.load(core::sync::atomic::Ordering::Relaxed)) / (freq / 1000)) as u32);
                 append_hex(&mut resp, b"WDT_PETS=", crate::platform::PETS.load(core::sync::atomic::Ordering::Relaxed) as u32);
                 append_hex(&mut resp, b"WDT_HANDOVER_US=", crate::platform::HANDOVER_GAP_US.load(core::sync::atomic::Ordering::Relaxed) as u32);
                 append_hex(&mut resp, b"WDT_HANDOVER_KIND=", crate::platform::HANDOVER_KIND.load(core::sync::atomic::Ordering::Relaxed) as u32);

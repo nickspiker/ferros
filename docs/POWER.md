@@ -163,7 +163,7 @@ Left, roughly by size:
 
 ## The watchdog and sleep (2026-11-05)
 
-The cluster watchdogs run a 1 s window (platform.rs `WDT_COUNT`, measured: 150 ticks in 200 ms, 1.333 ms a tick). The longest stretch without a pet: 213 ms on a cold boot, 75-80 ms across a reload's hand-over, about 315 ms in a reloaded kernel's start (DIAG `WDT_GAP_MAX_US`, `WDT_HANDOVER_US`). The hv's re-arm at the jump keeps the longest window until the jump's own stretch is measured.
+The cluster watchdogs run a 1 s window (platform.rs `WDT_COUNT`, measured: 150 ticks in 200 ms, 1.333 ms a tick). The longest stretch without a pet: 213 ms on a cold boot, 75-80 ms across a reload's hand-over, about 315 ms in a reloaded kernel's start (DIAG `WDT_GAP_MAX_US`, `WDT_HANDOVER_US`). The jump: from the hv's re-arm to ferros's arm_safety, 323 ms and 291 ms on two chords (2026-11-05); the longest stretch after it, 255-377 ms. The hv now re-arms at the same 1 s (`JUMP_WDT_COUNT`, was G#FFFF, ~87 s), verified on a chord with no reset.
 
 Today's dark profile keeps the X3 and the service loop running, so the pets go on and nothing changes. When real suspend comes (cores off, DRAM in self-refresh), it does as Linux's watchdog driver does:
 - **Entry:** stop the watchdogs as the very last step before the cores go down, so everything up to that point stays covered.

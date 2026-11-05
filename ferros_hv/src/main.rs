@@ -2527,11 +2527,13 @@ mod hvcore {
         }
         let (mut hd, mut hs) = ([0u8; 16], [0u8; 16]);
         super::pstore::log(&[b"ferros hv: jump -- TRNG pool: ", super::pstore::hex(drawn as u64, &mut hd), b" words, last status ", super::pstore::hex(status, &mut hs), b"\n"]);
-        // The cluster watchdogs re-armed at their longest (ferros's own arm_safety setting: prescaler G#FF, divider 128, count G#FFFF): Android's daemon ran them with its own timeout, and between the freeze and ferros's `arm_safety` (the cache clean, the copy, ferros's first steps with the MMU off) that timeout ran out on some jumps: the APC watchdog before ferros had rotated its notes (the eleventh and fourteenth jumps, 2026-11-01). Stopping them instead left a failed jump hung for good, killswitch and all (the sixteenth jump). ferros re-arms them the same way.
+        // The re-arm's count (owner, 2026-11-05: measure the jump, then lower it): 750 ticks of 1.333 ms (prescaler G#FF, divider 128), the kernel's own 1 s window (platform.rs WDT_COUNT). The jump's stretch from this re-arm to ferros's arm_safety measured 323 ms on the first chord after the stamp went in (DIAG WDT_HANDOVER_US); until then the re-arm was G#FFFF, ~87 s.
+        const JUMP_WDT_COUNT: u32 = 750;
+        // The cluster watchdogs re-armed (ferros's own arm_safety setting: prescaler G#FF, divider 128, the count above): Android's daemon ran them with its own timeout, and between the freeze and ferros's `arm_safety` (the cache clean, the copy, ferros's first steps with the MMU off) that timeout ran out on some jumps: the APC watchdog before ferros had rotated its notes (the eleventh and fourteenth jumps, 2026-11-01). Stopping them instead left a failed jump hung for good, killswitch and all (the sixteenth jump). ferros re-arms them the same way.
         for &w in &WATCHDOGS {
             wr(w, 0);
-            wr(w + 0x04, 0xFFFF);
-            wr(w + 0x08, 0xFFFF);
+            wr(w + 0x04, JUMP_WDT_COUNT);
+            wr(w + 0x08, JUMP_WDT_COUNT);
             wr(w, 0xFF00 | (3 << 3) | (1 << 5) | 1);
         }
         set(19, 1);
