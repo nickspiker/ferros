@@ -16,9 +16,9 @@ Kernel side: `gpu-regs` (G#1F00_0000 16 MiB, EL0), `gpu-mem` (G#B400_0000 32 MiB
 - The secure DRAM carveout starts at G#B600_0000 and no device-tree node shows it: writes vanish and reads take a synchronous external abort (DFSC G#10).
 - A syscall buffer is an arc offset. A pointer into a DMA region (gpu-mem) passed as a buffer gets masked into the arc and overwrites the process's own code, so read into an arc buffer and copy.
 
-**How to apply:** only the CS opcodes kbase decodes are confirmed (MOVE, MOVE32, CALL, SYNC_*). Check STORE_MULTIPLE, WAIT and RUN_COMPUTE against Mesa genxml before use.
+**How to apply:** take command-stream and descriptor layouts from Mesa's v11 genxml (on Harbor). Confirmed on the device: MOVE48, MOVE32, SYNC_SET32, STORE_MULTIPLE, WAIT, REQ_RESOURCE, SET_STATE_IMM32, RUN_COMPUTE, FLUSH_CACHE2.
 
-**Next:** a resident `gpu` endpoint driven by its IRQs, then compute shaders for tapuwae ([[tapuwae-neon-then-gpu]]).
+**Next:** a resident `gpu` endpoint (each client its own AS and group), then tapuwae as a shader ([[tapuwae-neon-then-gpu]]).
 
 **Compute works** (same night): a 3-instruction Valhall shader runs 16 invocations (G#C0FFEE00 + id). The words with their sources are at Harbor /mnt/Harbor/tmp/mesa-panfrost/ferros-compute-spec.md. Mesa's genxml (v10/v11/v12), cs_builder.h and ISA.xml are fetched there too.
 
