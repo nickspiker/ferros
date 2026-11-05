@@ -1745,10 +1745,15 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let n = take(1).first().copied().unwrap_or(0) as usize;
             let mut objects = Vec::new();
             let mut bad = false;
-            for _ in 0..n {
+            // Which of the request's tokens was refused first, for the console line (2026-11-05: init's 104th slot onward).
+            let mut bad_at = usize::MAX;
+            for j in 0..n {
                 let tok = take(32);
                 match p.lookup(&tok).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
-                    Some((Object::Reply(_), _)) | Some((Object::Console, _)) | None => bad = true,
+                    Some((Object::Reply(_), _)) | Some((Object::Console, _)) | None => {
+                        bad = true;
+                        bad_at = bad_at.min(j);
+                    }
                     // The whole surfaces region passes as one surface of it, the child's own.
                     Some((Object::Dma(i), r)) if DMA[i].name == "surfaces" => objects.push((Object::NewSurface, r)),
                     Some(o) => objects.push(o),
@@ -1766,6 +1771,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     Err(e) => {
                         kk.console.extend_from_slice(b"spawn refused: ");
                         kk.console.extend_from_slice(e.as_bytes());
+                        if bad {
+                            kk.console.extend_from_slice(alloc::format!(" (the request's token {bad_at} of {n}; the caller holds {})", p.cspace.len()).as_bytes());
+                        }
                         kk.console.push(b'\n');
                         f.x[0] = ERR;
                     }
@@ -2647,6 +2655,10 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
             o => o,
         };
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
+    }
+    // The tokens end at PREFS (G#FC0, the preferences block, then the ihi at G#FE0): a 109th slot's token was written there and overwritten by the next preferences write, so init's spawn of the GPU service was refused for a token it held (2026-11-05). Refused here, with the reason, rather than corrupted.
+    if TOKENS + 4 + 32 * cspace.len() > PREFS {
+        return Err("spawn: more grants than the grants page holds (108 slots and the console)");
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };
     let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0 };

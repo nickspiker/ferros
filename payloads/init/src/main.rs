@@ -22,10 +22,12 @@ const S_USE_DISPLAY: u64 = 17;
 const S_UNLOCK: u64 = 85;
 
 /// Each process: its name, its vault key, and which of init's slots it receives, in the order its own grant slots expect them (payloads/display, payloads/touch, payloads/map headers).
-const SHELL: [(&[u8], &[u8], &[u64]); 12] = [
+const SHELL: [(&[u8], &[u8], &[u64]); 13] = [
     // What runs before a person is present (AUTH.md, the device class): the screen, touch and the attest screen, then the network and the radios.
     (b"display", b"display", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103]),
     (b"touch", b"touch", &[14, 15, 16, 23, 91]),
+    // The GPU service (payloads/gpu, GPU.md "Layers"): it boots the GPU once and serves `gpu`, kernels for the clients' layers in the shared arena. Started ahead of the attest screen, its first client. 1 registers, 2 memory, 3 the vault scope (gpu.fw), 4 the job interrupt, 5 the layer arena, 6 serve gpu.
+    (b"gpu", b"gpu", &[105, 106, 107, 108, 68, 104]),
     // The attest screen, before anything else draws: 1 use display, 2 use touch, 3 a surface (init's `surfaces` passes as one of its own), 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings (its layout switch writes the device's layout), 8 use fgtw (the identity service's verdict on the identity, and the mint), 9 the identity unlock right, 10 a second surface (the keyboard's back buffer; `surfaces` again) (payloads/ahau).
     (b"ahau", b"ahau", &[17, 18, 22, 51, 48, 49, 19, 47, 85, 22]),
     // The USB driver (payloads/usb, USB.md): it runs the controller and serves Photon Transport to the bridge, handing each command to the kernel. 1 the controller's registers, 2 its DMA memory, 3 its interrupt, 4 the kernel's PT commands, 5 the `usb` power switch. The kernel has no USB of its own: should the driver end, the keeper below starts it again.
@@ -40,7 +42,7 @@ const SHELL: [(&[u8], &[u8], &[u64]); 12] = [
     (b"nfc", b"nfc", &[77, 78, 67, 79]),
     (b"bt", b"bt", &[81, 82, 76, 83, 41]),
     // The cellular modem's driver (payloads/modem): it powers the CP, registers and serves the data call on rmnet; ip takes it as its second link.
-    (b"modem", b"modem", &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76]),
+    (b"modem", b"modem", &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 40, 69, 70, 71, 72, 73, 74, 75, 76]),
     // What reads the person's space (the identity class), each when it may (`wait_person`). fgtw, the identity service, once an identity is unlocked: it is part of attest, looking the identity up and joining its fleet (its chain and key; not the Photon app, which a person installs): 1 use udp, 2 the vault scope `fgtw.`, 3 the ira key, 4 serve fgtw, 5 entropy (the fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right (payloads/fgtw). The map only once the device is also bound to that identity (owner, 2026-11-04: "if it's not attached to an identity, not usable"): its arrangement, 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`.
     (b"fgtw", b"fgtw", &[50, 48, 49, 46, 41, 80, 84, 85]),
     (b"map", b"map", &[17, 18, 19, 20]),
@@ -56,7 +58,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut stacks = Stacks([[0u8; KEEPER_STACK]; KEPT.len()]);
     // After the jump from a running Android (fact 31 = 6) the radios and the AoC are still in Android's state, and their drivers know only the bootloader's: the WiFi driver's first register write hung the bus (the fifth jump, 2026-11-01), as the modem's read and the AoC start had. They wait for drivers that bring their block up from any state; the shell, the screen and USB start as always.
     let jumped = ferros_sys::facts().0[31] == 6;
-    let after_jump = |n: &[u8]| jumped && matches!(n, b"pcie1" | b"nfc" | b"bt" | b"sensors" | b"modem");
+    // The GPU too: Android ran it, and whether the hv cuts it off at the jump is still the owner's open decision (KERNEL-OUT.md); the attest screen draws on the CPU without it.
+    let after_jump = |n: &[u8]| jumped && matches!(n, b"pcie1" | b"nfc" | b"bt" | b"sensors" | b"modem" | b"gpu");
     for (name, key, slots) in SHELL.iter() {
         if after_jump(name) {
             console(grants, b"init: ");

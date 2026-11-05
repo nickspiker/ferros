@@ -24,6 +24,9 @@ const S_REGS: u64 = 1;
 const S_MEM: u64 = 2;
 const S_STORE: u64 = 3;
 const S_IRQ: u64 = 4;
+/// The layer arena (slot 5) and the `gpu` endpoint this process serves (slot 6, init's grants at boot).
+const S_ARENA: u64 = 5;
+const S_GPU: u64 = 6;
 
 /// A console line in a fixed buffer.
 pub struct Line([u8; 200], usize);
@@ -138,6 +141,9 @@ const TAB_VA: u64 = 0x7200_0000;
 /// The layer arena in the group's address space (kernel cachemap LAYERS, 64 MiB).
 const ARENA_VA: u64 = 0x8000_0000;
 const ARENA_BYTES: usize = 64 << 20;
+/// The service's shader code: 32 pages, 16384 words.
+const CODE_BIG_VA: u64 = 0x3400_0000;
+const CODE_PAGES: usize = 32;
 
 struct Gpu {
     regs: usize,
@@ -406,8 +412,13 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     as1.map(&mut m, WORDS_VA, words_out, PRESENT_W * PRESENT_H * 4 / PAGE, PAGE_RW | NC | NX, TABLE);
     as1.map(&mut m, TAB_VA, tab, TAB_BYTES.div_ceil(PAGE), PAGE_RW | NX, TABLE);
     // The layer arena (input bit 6; grant slot 5, `layers`): all 64 MiB mapped coherent (the shared type, shareable both ways), so whatever the CPU has in its caches the GPU sees, and the other way (GPU.md "Coherency").
-    let arena = ferros_sys::dma(cap(grants, 5)) as usize;
-    let arena_ok = in0 & 0x40 != 0 && arena != 0 && arena != usize::MAX;
+    let arena = ferros_sys::dma(cap(grants, S_ARENA)) as usize;
+    // Started with no input (init, at boot): the resident service, which maps the layer arena whenever it is granted. With input bytes (tools/husky-gpu.sh): the test suite, the arena only on input bit 6.
+    let serving = input_len == 0;
+    let arena_ok = (serving || in0 & 0x40 != 0) && arena != 0 && arena != usize::MAX;
+    // The service's code region: up to CODE_PAGES of shader words, copied in from the arena for each run (executable, read-only to the GPU).
+    let code_big = m.alloc(CODE_PAGES);
+    as1.map(&mut m, CODE_BIG_VA, code_big, CODE_PAGES, PAGE_RO | NC, TABLE);
     if arena_ok {
         as1.map(&mut m, ARENA_VA, arena, ARENA_BYTES / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
     }
@@ -498,6 +509,46 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         ok
     };
     let run = |name: &str, words: &[u64], check: &dyn Fn() -> bool| run_for(name, words, check, 100);
+    // The resident service (GPU.md "Layers", owner 2026-11-05): kernels for the clients' layers, one at a time, until the device goes down. A run: [1][preload u16][code at an arena offset u32][code words u16][groups x u32][groups y u32][uniforms n u8][n × u64]; the code is copied from the arena into the service's own executable region, the job runs on the queue, and the reply is [status][µs u32]: 0 done, 1 a request it cannot take, 2 the job never finished (a guard, not a wait: the process watchdog will own hangs, RELEASE.md).
+    if serving {
+        let big = Compute { code: code_big, desc, code_va: CODE_BIG_VA, desc_va: DESC_VA, max_threads: g.rd(THREAD_MAX_THREADS) };
+        let flag = OUT_VA + 0x200;
+        say!(grants, "gpu: serving `gpu` (arena {})\n", if arena_ok { "mapped" } else { "not granted" });
+        let mut msg = [0u8; 4096];
+        let mut token = [0u8; 32];
+        loop {
+            let n = ferros_sys::recv(cap(grants, S_GPU), &mut msg, &mut token, false);
+            if n == ferros_sys::NOTHING || n == 0 {
+                continue;
+            }
+            let m = &msg[..(n as usize).min(msg.len())];
+            let u16_at = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]);
+            let u32_at = |i: usize| u32::from_le_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]);
+            let mut reply = [1u8, 0, 0, 0, 0];
+            // The request's own lengths checked against what was sent, the code against the arena and the region: they come from another process.
+            if m.len() >= 18 && m[0] == 1 && arena_ok {
+                let (preload, code_off, words) = (u16_at(1) as u32, u32_at(3) as usize, u16_at(7) as usize);
+                let groups = (u32_at(9), u32_at(13));
+                let nu = m[17] as usize;
+                let fits = m.len() >= 18 + 8 * nu && nu <= 16 && words > 0 && words + 16 <= CODE_PAGES * PAGE / 8 && code_off % 8 == 0 && code_off + 8 * words <= ARENA_BYTES && groups.0 > 0 && groups.1 > 0;
+                if fits {
+                    let code = unsafe { core::slice::from_raw_parts((arena + code_off) as *const u64, words) };
+                    let mut uniforms = [0u64; 16];
+                    for (k, u) in uniforms[..nu].iter_mut().enumerate() {
+                        *u = u64::from_le_bytes(m[18 + 8 * k..26 + 8 * k].try_into().unwrap());
+                    }
+                    wr32(out + 0x200, 0);
+                    let mut job = [0u64; 32];
+                    let len = big.prepare_grid(code, &uniforms[..nu], groups, preload, flag, &mut job);
+                    let t0 = now();
+                    let ok = run_for("serve", &job[..len], &|| rd32(out + 0x200) == 1, 1000);
+                    reply = [if ok { 0 } else { 2 }, 0, 0, 0, 0];
+                    reply[1..5].copy_from_slice(&(ferros_sys::us_since(t0) as u32).to_le_bytes());
+                }
+            }
+            ferros_sys::reply(&token, &reply);
+        }
+    }
     let mut ok = true;
     // 1: STORE_MULTIPLE r4..r5 to [r0:r1 + 4] (Mesa genxml v11 CS STORE_MULTIPLE: offset 15:0, register mask 31:16, address pair 47:40, base register 55:48), then WAIT on every scoreboard slot so the stores are done before the queue moves on.
     wr32(dst + 4, 0);
@@ -992,7 +1043,7 @@ impl Compute {
         for (k, w) in code.iter().enumerate() {
             wr64(self.code + 8 * k, *w);
         }
-        for k in code.len()..PAGE / 8 {
+        for k in code.len()..(code.len() + 16).max(PAGE / 8) {
             wr64(self.code + 8 * k, 0);
         }
         let (spd, tsd, fau) = (self.desc_va, self.desc_va + 0x40, self.desc_va + 0x80);

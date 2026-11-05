@@ -402,8 +402,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Store(b"map"),
         Dma(b"display-phases"),
         Dma(b"surfaces"),
-        // 23 the touch controller's interrupt line, 24 DECON0's frame-done, 25 its frame-start (KERNEL.md "Interrupts to user space").
-        Irq(b"touch-int"), Irq(b"decon0-frame-done"), Irq(b"decon0-frame-start"),
+        // 23 the touch controller's interrupt line, 25 DECON0's frame-start (KERNEL.md "Interrupts to user space"). 24 was its frame-done, which no process took: since 2026-11-05 `use gpu`, a client's (the attest screen's).
+        Irq(b"touch-int"), Use(b"gpu"), Irq(b"decon0-frame-start"),
         // 26 the display's sprite cache, 27 its canvas.
         Dma(b"display-sprites"),
         Dma(b"display-canvas"),
@@ -429,7 +429,9 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         // The modem driver (payloads/modem): 53 serve rmnet; 54-68 its hardware (PCIe ch0, HSI1, the alive GPIO bank, the PMU through EL3); 69-71 its shared-memory windows; 72-76 the partitions it reads (its image, NV, handover signature, carrier configs).
         Serve(b"rmnet"),
         Hardware(b"pcie0-elbi"), Hardware(b"pcie0-soc"), Hardware(b"pcie0-pcs"), Hardware(b"pcie0-udbg"), Hardware(b"pcie0-phy"), Hardware(b"pcie0-dbi"), Hardware(b"pcie0-cfg"), Hardware(b"pcie0-mem"),
-        Hardware(b"cmu-hsi1"), Hardware(b"hsi1-sysreg"), Hardware(b"gpio-hsi1"), Hardware(b"sysmmu-hsi1"), Hardware(b"s2mpu-hsi1"), Hardware(b"gpio-alive"), Hardware(b"pmu"),
+        Hardware(b"cmu-hsi1"), Hardware(b"hsi1-sysreg"), Hardware(b"gpio-hsi1"), Hardware(b"sysmmu-hsi1"), Hardware(b"s2mpu-hsi1"), Hardware(b"gpio-alive"),
+        // 68: was the PMU a second time (the modem takes slot 40's, the same grant, since 2026-11-05); now the layer arena (GPU.md "Layers"), for the GPU service and its clients. The grants page holds 108 slots (process.rs PREFS at G#FC0), so slots are reused, never appended past 108.
+        Dma(b"layers"),
         Dma(b"modem-pktproc"), Dma(b"modem-ipc"), Dma(b"modem-msi"),
         Part(b"modem_a"), Part(b"efs"), Part(b"persist"), Part(b"modem_userdata"), Part(b"vendor_a"),
         // The NFC driver (payloads/nfc, docs/NFC.md): 77 serve nfc, 78 hsi2c_0, 79 its power; its interrupt line is read in gpio-alive (67). 80 use nfc (Photon's, the tap's secret).
@@ -450,6 +452,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Power(b"dpu"),
         // 102 the `panel` switch (panel_power.rs: VCI and the reset pulse), 103 `panel-vddd` (VDDD after the init set): the panel from off (§8, state B).
         Power(b"panel"), Power(b"panel-vddd"),
+        // The GPU service (payloads/gpu, GPU.md "Layers"): 104 serve gpu, 105 its registers, 106 its memory, 107 the vault scope `gpu.` (its firmware), 108 its job interrupt; the layer arena is 68 and `use gpu` 24. The page is full at 108.
+        Serve(b"gpu"), Dma(b"gpu-regs"), Dma(b"gpu-mem"), Store(b"gpu"), Irq(b"gpu-job"),
         // The `android` switch (android_request) is in no one's list: the base OS has no Android launcher (owner, 2026-11-04: nothing built in but system settings). It goes to a launcher a person installs, once installing exists.
     ]
 }
@@ -460,11 +464,13 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
         b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103],
         b"touch" => &[14, 15, 16, 23, 91],
+        // The GPU service in its own slot order: 1 registers, 2 memory, 3 the vault scope, 4 the job interrupt, 5 the layer arena, 6 serve gpu.
+        b"gpu" => &[105, 106, 107, 108, 68, 104],
         b"map" => &[17, 18, 19, 20],
         b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83],
         b"ip" => &[44, 45, 41, 52],
         // The modem driver: serve rmnet, its hardware, windows and partitions (payloads/modem's slot order).
-        b"modem" => &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76],
+        b"modem" => &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 40, 69, 70, 71, 72, 73, 74, 75, 76],
         // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve fgtw, 5 entropy (the fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right (payloads/fgtw).
         b"fgtw" => &[50, 48, 49, 46, 41, 80, 84, 85],
         // 1 serve nfc, 2 hsi2c_0, 3 gpio-alive, 4 its power (payloads/nfc).
