@@ -51,4 +51,6 @@ Related: [[hv-chords-decided]], [[ufs-firewall-decided]], [[android-behind-attes
 
 **Jump keys:** hold volume up first, then power. Pressing power first is forwarded to Android, which wakes the screen.
 
-**Open:** the DPU S2MPU is left open, as ABL leaves it. Fence it to the display's DMA regions, like the HSI1 S2MPU.
+**DPU S2MPU fenced (cf2acbd):** VID 0 may read display-fb and display-phases only. It is fenced at service start when the DPU is on, and by the `dpu` switch after power-up. One fault at boot is expected: DECON is still reading ABL's splash at G#FAC0_0000.
+
+**Test trap:** `diag restart display` alone leaves the screen black once someone has attested, because the home screen only hands its scene to a display server when the home screen starts. Restart the map too, or use tools/husky-shell.sh display.
