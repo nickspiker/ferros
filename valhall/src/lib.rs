@@ -168,6 +168,13 @@ impl Lut {
     pub const fn value(self) -> u32 {
         LUT[self.0 as usize]
     }
+
+    /// Entry `i` of [`LUT`] (the SSA compiler finds constants there by value).
+    pub const fn index(i: u8) -> Lut {
+        // WHY: the table has 32 entries; a larger index would name a source byte that is not an immediate.
+        assert!(i < 32, "valhall: the LUT has 32 entries");
+        Lut(i)
+    }
 }
 
 /// A 32-bit source: a register, a uniform word, or a LUT immediate.

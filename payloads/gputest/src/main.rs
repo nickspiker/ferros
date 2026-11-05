@@ -4,6 +4,7 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
 use ferros_sys::{call, cap, console, exit};
 use valhall::*;
 
@@ -270,7 +271,9 @@ fn ssa_test(grants: u64, arena: usize) -> ! {
         unsafe { core::ptr::write_volatile((arena + OUT + 4 * i) as *mut u32, u32::MAX) };
     }
     let preload = 0x1000u16 | if compiled.regs64 { 0x8000 } else { 0 };
-    let reply = run_with(grants, compiled.words.len(), (PIXELS / 16) as u32, preload, &[ARENA_VA + OUT as u64]);
+    let mut uniforms = alloc::vec![ARENA_VA + OUT as u64];
+    uniforms.extend_from_slice(&compiled.consts);
+    let reply = run_with(grants, compiled.words.len(), (PIXELS / 16) as u32, preload, &uniforms);
     let mut wrong = 0u32;
     let mut first = None;
     for gid in 0..PIXELS as u32 {
@@ -307,7 +310,10 @@ fn ball_test(grants: u64, arena: usize) -> ! {
     }
     let preload = 0x1000u16 | if compiled.regs64 { 0x8000 } else { 0 };
     let groups = px.div_ceil(16) as u32;
-    let reply = run_with(grants, compiled.words.len(), groups, preload, &[ARENA_VA + gpu_out as u64]);
+    // Slot 0 the output, then the kernel's constants (valhall::ssa puts its most-used constants in uniforms 1 and up).
+    let mut uniforms = alloc::vec![ARENA_VA + gpu_out as u64];
+    uniforms.extend_from_slice(&compiled.consts);
+    let reply = run_with(grants, compiled.words.len(), groups, preload, &uniforms);
     let t1 = ferros_sys::now();
     let cpu = unsafe { core::slice::from_raw_parts_mut((arena + cpu_out) as *mut u64, px) };
     // The CPU writes only the disc's bounding square (from row and column 1): the rest must start as the GPU leaves it, 0.

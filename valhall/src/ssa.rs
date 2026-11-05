@@ -58,7 +58,7 @@ enum Op {
     LoopHead,
     /// The loop's bottom: each phi takes its update, and the loop goes round again while `cont` is set. Its updates are in [`Rec::loops`].
     LoopEnd(u32),
-    /// value → *(uniform slot's address + (gid << shift) + offset).
+    /// value â *(uniform slot's address + (gid << shift) + offset).
     Store { slot: u8, shift: u8, offset: i16, value: u32 },
 }
 
@@ -137,7 +137,7 @@ impl F {
         let e = F::op(Op::FFma(self.neg().0, r.0, F::splat(1.).0));
         F::op(Op::FFma(r.0, e.0, r.0))
     }
-    /// √self from the reciprocal square root, refined once (within an ulp, near or at the correctly rounded value), 0 at 0.
+    /// âself from the reciprocal square root, refined once (within an ulp, near or at the correctly rounded value), 0 at 0.
     pub fn sqrt(self) -> F {
         let rs = F::op(Op::FRsq(self.0));
         let s = self * rs;
@@ -161,7 +161,7 @@ impl F {
     pub fn floor(self) -> F {
         F::op(Op::FFloor(self.0))
     }
-    /// selfⁿ by squaring and multiplying, n known when recorded.
+    /// selfâ¿ by squaring and multiplying, n known when recorded.
     pub fn powi(self, n: i32) -> F {
         let mut e = n.unsigned_abs();
         let (mut base, mut acc) = (self, None::<F>);
@@ -393,6 +393,11 @@ pub struct Compiled {
     pub nodes: usize,
     pub kept: usize,
     pub peak: usize,
+    /// The loop body's instructions, and how many of them load a constant (the cost a pass pays, per invocation per iteration).
+    pub loop_words: usize,
+    pub loop_consts: usize,
+    /// The uniform slots 1 and up the kernel reads its constants from: the caller passes them after slot 0 (its output address).
+    pub consts: Vec<u64>,
 }
 
 /// The value registers: r0-r53. r54-r56 take constants at their uses, r57 the loop head's write, r58:r59 the store address, r60:r61 the global id (preloaded).
@@ -475,66 +480,194 @@ pub fn compile() -> Compiled {
             _ => {}
         }
     }
-    // Registers: linear scan over the kept nodes that hold a value (constants and the global id excepted).
-    let mut reg = alloc::vec![u8::MAX; n];
-    let mut free: Vec<u8> = (0..POOL).rev().collect();
-    let mut live: Vec<(usize, u8)> = Vec::new();
-    let (mut high, mut peak) = (0u8, 0usize);
-    for (i, op) in nodes.iter().enumerate() {
-        if !keep[i] {
+    // The loops' spans (head, end), and how often each constant is loaded inside each.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    {
+        let mut h = None;
+        for (i, op) in nodes.iter().enumerate() {
+            match op {
+                Op::LoopHead => h = Some(i),
+                Op::LoopEnd(_) => spans.push((h.take().unwrap_or(i), i)),
+                _ => {}
+            }
+        }
+    }
+    // Registers: linear scan over the kept nodes that hold a value (constants and the global id excepted), with `hoist[l]` the constants loop l holds in registers from its head to its end. Returns the registers, the highest used, the peak, and each loop's peak.
+    let allocate = |hoist: &[Vec<u32>]| -> Result<(Vec<u8>, u8, usize, Vec<usize>), usize> {
+        let mut reg = alloc::vec![u8::MAX; n];
+        let mut free: Vec<u8> = (0..POOL).rev().collect();
+        let mut live: Vec<(usize, u8)> = Vec::new();
+        let (mut high, mut peak) = (0u8, 0usize);
+        let mut loop_peak = alloc::vec![0usize; spans.len()];
+        for (i, op) in nodes.iter().enumerate() {
+            if !keep[i] {
+                continue;
+            }
+            live.retain(|&(end, r)| {
+                if end < i {
+                    free.push(r);
+                    false
+                } else {
+                    true
+                }
+            });
+            if let Some(l) = spans.iter().position(|s| s.0 == i) {
+                for &c in &hoist[l] {
+                    let r = free.pop().ok_or(i)?;
+                    high = high.max(r);
+                    reg[c as usize] = r;
+                    live.push((spans[l].1, r));
+                }
+            }
+            if matches!(op, Op::Gid) {
+                reg[i] = 60;
+            } else if let Some(phi) = coalesce[i] {
+                // The phi's register, which its own entry keeps to the loop's end: the update is written over the phi after the phi's last read.
+                reg[i] = reg[phi as usize];
+            } else if op.has_value() && !is_const(i as u32) {
+                let r = free.pop().ok_or(i)?;
+                high = high.max(r);
+                reg[i] = r;
+                live.push((last[i].max(i), r));
+            }
+            peak = peak.max(live.len());
+            for (l, s) in spans.iter().enumerate() {
+                if i >= s.0 && i <= s.1 {
+                    loop_peak[l] = loop_peak[l].max(live.len());
+                }
+            }
+        }
+        Ok((reg, high, peak, loop_peak))
+    };
+    // First without hoisting, for each loop's pressure; then each loop's most-loaded constants into the registers it leaves free (owner, 2026-11-05: the mark within a 120 Hz frame; 188 of the ball loop's 625 instructions were constant loads).
+    let none: Vec<Vec<u32>> = spans.iter().map(|_| Vec::new()).collect();
+    let (reg0, high0, peak0, loop_peak) = allocate(&none).unwrap_or_else(|i| panic!("valhall::ssa: out of registers at node {i} of {n} (no spilling yet)"));
+    let mut hoist: Vec<Vec<u32>> = Vec::new();
+    for (l, &(h, e)) in spans.iter().enumerate() {
+        let mut uses: Vec<(u32, usize)> = Vec::new();
+        for j in h..e {
+            if keep[j] {
+                nodes[j].sources(|s| {
+                    if is_const(s) {
+                        match uses.iter_mut().find(|u| u.0 == s) {
+                            Some(u) => u.1 += 1,
+                            None => uses.push((s, 1)),
+                        }
+                    }
+                });
+            }
+        }
+        uses.sort_by(|a, b| b.1.cmp(&a.1));
+        // The first allocation succeeded, so the loop never held more than the pool: exact.
+        let room = POOL as usize - loop_peak[l];
+        hoist.push(uses.iter().take(room).map(|u| u.0).collect());
+    }
+    let (reg, high, peak, _) = allocate(&hoist).unwrap_or((reg0, high0, peak0, loop_peak));
+    // Where each hoisted constant holds its register: from its loop's head to its end, and only there (a use before or after the loop loads it as any other constant; reading the register there read whatever value had taken it: 595 black pixels on the attest ball, 2026-11-05).
+    let mut hoist_span = alloc::vec![(usize::MAX, 0usize); n];
+    for (l, cs) in hoist.iter().enumerate() {
+        for &c in cs {
+            hoist_span[c as usize] = spans[l];
+        }
+    }
+    let hoisted_at = |s: u32, at: usize| reg[s as usize] != u8::MAX && at > hoist_span[s as usize].0 && at < hoist_span[s as usize].1;
+    // Uniform words for the constants used most (a use inside a loop counting 2^6 times one outside), slots 1 to 15 (slot 0 is the caller's output address): read by the instruction itself, no load. LUT values and hoisted ones need none.
+    let mut weight: Vec<(u32, usize)> = Vec::new();
+    for (j, op) in nodes.iter().enumerate() {
+        if !keep[j] {
             continue;
         }
-        live.retain(|&(end, r)| {
-            if end < i {
-                free.push(r);
-                false
-            } else {
-                true
+        let in_loop = spans.iter().any(|s| j > s.0 && j < s.1);
+        op.sources(|s| {
+            if is_const(s) && !hoisted_at(s, j) {
+                let Op::Const(bits) = nodes[s as usize] else { unreachable!() };
+                if !LUT.contains(&bits) {
+                    let w = if in_loop { 1 << 6 } else { 1 };
+                    match weight.iter_mut().find(|x| x.0 == s) {
+                        Some(x) => x.1 += w,
+                        None => weight.push((s, w)),
+                    }
+                }
             }
         });
-        if matches!(op, Op::Gid) {
-            reg[i] = 60;
-        } else if let Some(phi) = coalesce[i] {
-            // The phi's register, which its own entry keeps to the loop's end: the update is written over the phi after the phi's last read.
-            reg[i] = reg[phi as usize];
-        } else if op.has_value() && !is_const(i as u32) {
-            let Some(r) = free.pop() else {
-                panic!("valhall::ssa: out of registers at node {i} of {n} ({} live; no spilling yet)", live.len());
-            };
-            high = high.max(r);
-            reg[i] = r;
-            live.push((last[i].max(i), r));
-            peak = peak.max(live.len());
-        }
+    }
+    weight.sort_by(|a, b| b.1.cmp(&a.1));
+    let ufau: Vec<(u32, (u8, u8))> = weight.iter().take(30).enumerate().map(|(k, w)| (w.0, (1 + (k / 2) as u8, (k % 2) as u8))).collect();
+    let mut consts = alloc::vec![0u64; ufau.len().div_ceil(2)];
+    for &(s, (sl, w)) in &ufau {
+        let Op::Const(bits) = nodes[s as usize] else { unreachable!() };
+        consts[(sl - 1) as usize] |= (bits as u64) << (32 * w as u32);
     }
     let regs64 = high > 15;
     let kept = keep.iter().filter(|&&k| k).count();
     // Emission.
     // SAFETY: an all-zero Kernel is the empty one (no words, no labels bound: None is the zero discriminant, no branches); built in place on the heap, its 128 KiB never on the stack.
     let mut k: Box<Kernel<16384>> = unsafe { Box::<Kernel<16384>>::new_zeroed().assume_init() };
+    let (mut loop_consts, mut loop_start, mut loop_words) = (0usize, 0usize, 0usize);
     let mut top = None;
     let mut loop_no = 0usize;
     for (i, op) in nodes.iter().enumerate() {
         if !keep[i] || is_const(i as u32) {
             continue;
         }
-        // This instruction's constant sources, each loaded into its own constant register first.
-        let mut consts = [(u32::MAX, 0u8); 3];
-        let mut nc = 0;
-        op.sources(|s| {
-            if is_const(s) && !consts[..nc].iter().any(|c| c.0 == s) {
-                consts[nc] = (s, CONST_REGS[nc]);
-                nc += 1;
-            }
-        });
-        for &(s, cr) in &consts[..nc] {
-            let Op::Const(bits) = nodes[s as usize] else { unreachable!() };
-            k.iadd_imm_i32(r(cr), Lut::ZERO, bits);
+        // This instruction's constant sources, each in the cheapest place the FAU rule allows: an immediate of the LUT, a uniform word (`ufau`), or else a constant register loaded just before. The rule: one 64-bit uniform slot an instruction, and at most two distinct 32-bit uniform/LUT words, the form's own LUT zero counted (va_validate.c).
+        let mut words: [u16; 2] = [u16::MAX; 2];
+        let mut nw = 0usize;
+        let mut slot: Option<u8> = None;
+        if fixed_zero(op) {
+            words[0] = 0x100;
+            nw = 1;
         }
-        let rr = |s: u32| -> Reg {
-            match consts[..nc].iter().find(|c| c.0 == s) {
-                Some(c) => r(c.1),
-                None => r(reg[s as usize]),
+        let mut place: [(u32, Src); 3] = [(u32::MAX, Src::Lut(Lut::ZERO)); 3];
+        let mut np = 0;
+        let mut loads = 0;
+        op.sources(|s| {
+            if !is_const(s) || hoisted_at(s, i) || place[..np].iter().any(|p| p.0 == s) {
+                return;
+            }
+            let Op::Const(bits) = nodes[s as usize] else { unreachable!() };
+            let mut take = |key: u16, sl: Option<u8>| -> bool {
+                let has = words[..nw].contains(&key);
+                let slot_ok = match (sl, slot) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
+                };
+                if slot_ok && (has || nw < 2) {
+                    if !has {
+                        words[nw] = key;
+                        nw += 1;
+                    }
+                    if sl.is_some() {
+                        slot = sl;
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            let src = if let Some(li) = LUT.iter().position(|&v| v == bits) {
+                if take(0x100 | li as u16, None) { Some(Src::Lut(Lut::index(li as u8))) } else { None }
+            } else if let Some(&(sl, w)) = ufau.iter().find(|u| u.0 == s).map(|u| &u.1) {
+                if take((sl as u16) << 1 | w as u16, Some(sl)) { Some(Src::Uniform(if w == 0 { u(sl).w0() } else { u(sl).w1() })) } else { None }
+            } else {
+                None
+            };
+            let src = src.unwrap_or_else(|| {
+                let cr = CONST_REGS[loads];
+                loads += 1;
+                k.iadd_imm_i32(r(cr), Lut::ZERO, bits);
+                Src::Reg(r(cr))
+            });
+            place[np] = (s, src);
+            np += 1;
+        });
+        if top.is_some() {
+            loop_consts += loads;
+        }
+        let rr = |s: u32| -> Src {
+            match place[..np].iter().find(|p| p.0 == s) {
+                Some(p) => p.1,
+                None => Src::Reg(r(reg[s as usize])),
             }
         };
         let d = if op.has_value() { r(reg[i]) } else { r(0) };
@@ -604,9 +737,15 @@ pub fn compile() -> Compiled {
                 k.mov_i32(d, rr(init));
             }
             Op::LoopHead => {
+                // The loop's hoisted constants, once, before its top.
+                for &c in &hoist[loop_no] {
+                    let Op::Const(bits) = nodes[c as usize] else { unreachable!() };
+                    k.iadd_imm_i32(r(reg[c as usize]), Lut::ZERO, bits);
+                }
                 // The instruction before the loop's top carries reconverge (the Mandelbrot's form): a write to the scratch register.
                 k.iadd_imm_i32(r(SCRATCH), Lut::ZERO, 0).reconverge();
                 top = Some(k.here());
+                loop_start = k.len();
             }
             Op::LoopEnd(cont) => {
                 // Every update is already in its own register (a select or the counter's add): the phis take them in any order.
@@ -618,15 +757,29 @@ pub fn compile() -> Compiled {
                     }
                 }
                 k.branchz(rr(cont), top.take().expect("valhall::ssa: loop end without head")).reconverge();
+                loop_words += k.len() - loop_start;
                 loop_no += 1;
             }
             Op::Store { slot, shift, offset, value } => {
                 k.shaddx_u64(pair(ADDR), u(slot), pair(60), shift);
-                k.store_i32(rr(value), pair(ADDR), offset, Slot::S0);
+                // A store takes its value from a register only: a constant one goes through a constant register.
+                let v = match rr(value) {
+                    Src::Reg(x) => x,
+                    other => {
+                        k.mov_i32(r(CONST_REGS[2]), other);
+                        r(CONST_REGS[2])
+                    }
+                };
+                k.store_i32(v, pair(ADDR), offset, Slot::S0);
             }
         }
     }
     k.last().end();
     let words = k.finish().to_vec();
-    Compiled { words, regs64, nodes: n, kept, peak }
+    Compiled { words, regs64, nodes: n, kept, peak, loop_words, loop_consts, consts }
+}
+
+/// Whether an instruction form already reads the LUT's zero itself (a multiply's −0 addend, a negation's, a compare's `or`, the shift group's shift or second operand): it counts against the FAU's two words.
+fn fixed_zero(op: &Op) -> bool {
+    matches!(op, Op::FMul(..) | Op::FNeg(_) | Op::FCmp(..) | Op::And(..) | Op::Or(..) | Op::Xor(..) | Op::Shl(..) | Op::Shr(..))
 }
