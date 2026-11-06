@@ -12,6 +12,11 @@ core::arch::global_asm!(
     ".section .text.x3probe, \"ax\"",
     ".global ferros_x3_probe",
     "ferros_x3_probe:",
+    // The first mark, before any system register: the core reached this code (MMU off, so a plain store to the block's physical address). For telling, on a board where the X3 never reports, whether it ran at all (akita, 2026-11-06).
+    "movz x1, #0x4E49",
+    "movk x1, #0x5833, lsl #16",
+    "str x1, [x0, #72]",
+    "dsb sy",
     // x0 = the result/context block: [0] magic, [8] ticks for the dependent chain, [16] MPIDR, [24] ticks for four independent chains, [32] MAIR, [40] TCR, [48] TTBR0, [56] SCTLR, [64] HCR — CPU0's live translation, so this core runs under the same table, caches on (cachemap.rs's order: HCR, then the table, then SCTLR).
     "ldr x1, [x0, #64]",
     "msr hcr_el2, x1",
@@ -30,6 +35,11 @@ core::arch::global_asm!(
     "ldr x1, [x0, #56]",
     "msr sctlr_el2, x1",
     "isb",
+    // The second mark: CPU0's translation is on here.
+    "movz x1, #0x4D4D",
+    "movk x1, #0x5833, lsl #16",
+    "str x1, [x0, #80]",
+    "dsb sy",
     // A dependent chain: 64 adds per pass, 2^18 passes — one add a cycle on any core, so ticks give the clock.
     "mrs x2, cntpct_el0",
     "mov x3, #0",
@@ -43,6 +53,11 @@ core::arch::global_asm!(
     "mrs x5, cntpct_el0",
     "sub x5, x5, x2",
     "str x5, [x0, #8]",
+    // The third mark: the dependent chain done.
+    "movz x1, #0x3143",
+    "movk x1, #0x5833, lsl #16",
+    "str x1, [x0, #88]",
+    "dsb sy",
     // Four independent chains, the same number of adds: how wide the core is.
     "mrs x2, cntpct_el0",
     "movz x4, #0x1, lsl #16",
@@ -61,8 +76,8 @@ core::arch::global_asm!(
     "mrs x6, mpidr_el1",
     "str x6, [x0, #16]",
     "movz x7, #0x4521",
-    "movk x7, #0x524f, lsl #16",
-    "movk x7, #0x5250, lsl #32",
+    "movk x7, #0x4f42, lsl #16",
+    "movk x7, #0x5052, lsl #32",
     "movk x7, #0x5833, lsl #48",
     "str x7, [x0]",
     "dsb sy",
@@ -115,10 +130,29 @@ unsafe extern "C" {
     fn ferros_x3_probe();
 }
 
+/// PSCI AFFINITY_INFO (SMC64): 0 on, 1 off, 2 on pending.
+const PSCI_AFFINITY_INFO: u64 = 0xC400_0004;
+
+/// How far the X3 got when it did not report (`diag x3`): the marks the probe leaves (G#5833_4E49 on entry, G#5833_4D4D once the MMU is on, G#5833_3143 after the dependent chain; 0 if not reached) and PSCI's AFFINITY_INFO for it after the wait.
+pub fn trace() -> (u64, u64, u64, i64) {
+    let info = affinity_info();
+    unsafe { (read_volatile((RESULT + 72) as *const u64), read_volatile((RESULT + 80) as *const u64), read_volatile((RESULT + 88) as *const u64), info) }
+}
+
+fn affinity_info() -> i64 {
+    let info: i64;
+    unsafe { core::arch::asm!("smc #0", inout("x0") PSCI_AFFINITY_INFO => info, in("x1") 0x800u64, in("x2") 0u64) };
+    info
+}
+
+/// The probe's power timeline (`diag x3`): microseconds from CPU_ON to the X3 first reading on, and to it first reading off after that (u64::MAX: never), from AFFINITY_INFO polled through the wait.
+pub static mut TIMELINE: (u64, u64) = (u64::MAX, u64::MAX);
+
 /// Start CPU8 on the probe and wait for its report (three seconds at most: powering the cluster up took most of a second the first time). Returns (PSCI's answer, ticks for the dependent chain, ticks for the four chains, its MPIDR) — zeros if it never reported.
 pub fn probe() -> (i64, u64, u64, u64) {
     unsafe {
-        for i in 0..9 {
+        TIMELINE = (u64::MAX, u64::MAX);
+        for i in 0..12 {
             write_volatile((RESULT + i * 8) as *mut u64, 0);
         }
         let r = |n: usize, v: u64| write_volatile((RESULT + n) as *mut u64, v);
@@ -137,7 +171,20 @@ pub fn probe() -> (i64, u64, u64, u64) {
         }
         let f = crate::platform::cntfrq();
         let t0 = crate::platform::cntpct();
-        while crate::platform::cntpct() - t0 < 3 * f {
+        // Eight seconds, AFFINITY_INFO asked about every millisecond for the timeline.
+        let mut asked = t0;
+        while crate::platform::cntpct() - t0 < 8 * f {
+            let now = crate::platform::cntpct();
+            if now - asked > f / 1024 {
+                asked = now;
+                crate::platform::pet_watchdogs();
+                let us = (now - t0) * 1_000_000 / f;
+                match affinity_info() {
+                    0 if TIMELINE.0 == u64::MAX => TIMELINE.0 = us,
+                    1 if TIMELINE.0 != u64::MAX && TIMELINE.1 == u64::MAX => TIMELINE.1 = us,
+                    _ => {}
+                }
+            }
             if read_volatile(RESULT as *const u64) == MAGIC {
                 return (0, read_volatile((RESULT + 8) as *const u64), read_volatile((RESULT + 24) as *const u64), read_volatile((RESULT + 16) as *const u64));
             }

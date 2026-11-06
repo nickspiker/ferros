@@ -1949,6 +1949,9 @@ pub fn run(mut b: Boot) -> ! {
                     resp.extend_from_slice(alloc::format!("CPU0: dependent adds ~A#{} M/s (= its clock), four chains ~A#{} M/s\n", rate(d0), rate(i0)).as_bytes());
                     let (ret, d, i, mpidr) = crate::x3::probe();
                     resp.extend_from_slice(alloc::format!("CPU_ON G#{:X}; X3 (MPIDR G#{mpidr:X}): dependent adds ~A#{} M/s (= its clock), four chains ~A#{} M/s\n", ret as u64, rate(d), rate(i)).as_bytes());
+                    let (entry, mmu, chain, info) = crate::x3::trace();
+                    let (on, off) = unsafe { crate::x3::TIMELINE };
+                    resp.extend_from_slice(alloc::format!("X3 marks: entry G#{entry:X}, MMU on G#{mmu:X}, chain done G#{chain:X}; AFFINITY_INFO now {info} (0 on, 1 off, 2 on pending); read on at {} us, off at {} us after CPU_ON\n", on as i64, off as i64).as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
