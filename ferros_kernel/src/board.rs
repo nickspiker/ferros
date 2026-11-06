@@ -37,8 +37,8 @@ pub fn keys() -> Keys {
     match get() {
         // Measured by the owner, 2026-11-06.
         Board::Akita => Keys { power: (629, 797), rocker: (932, 1271) },
-        // Provisional: what reproduces the marks placed by eye (power centred at 1050, volume down at 1700); to measure with the ruler.
-        Board::Husky => Keys { power: (960, 1140), rocker: (1412, 1796) },
+        // Provisional: what reproduces the marks placed by eye (power centred at 1050, the volume-down tip at 1700); to measure with the ruler.
+        Board::Husky => Keys { power: (960, 1140), rocker: (1316, 1700) },
     }
 }
 

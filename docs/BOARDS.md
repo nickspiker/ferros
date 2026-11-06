@@ -13,9 +13,17 @@ ferros runs on two Tensor G3 (zuma) phones. The kernel tells them apart at entry
 | Type-C controller | MAX77759 at G#25 on hsi2c_11 | the same |
 | Fuel gauge | MAX77759 at G#36 on hsi2c_11 | the same |
 | Low 2 GB carve-outs | zuma's | the same (they come from the SoC's tree) |
-| Panel, touch, cutout | HK3, FTM5, 1344 × 2992 | different, not brought up |
+| Panel, touch, cutout | HK3, FTM5, 1344 × 2992 | AK3B, 1080 × 2400; touch not brought up |
+| Side keys, panel rows (board::keys) | provisional: power 960..=1140, rocker 1316..=1700 (to measure) | power 629..=797, volume rocker 932..=1271 (measured 2026-11-06) |
 
 akita's repeater tune, from its MP board overlay (`repeater_tune1..5`): G#50 = G#0A, G#70 = G#5F, G#71 = G#2E, G#73 = G#80, G#79 = G#40 (ferros_hal `AKITA_REPEATER_TUNE`).
+
+
+## Side keys (calibration)
+
+Where each side key sits, in panel rows, top and bottom edge inclusive (`board::keys`). The gate draws its marks from them: the power triangle centred on the power key and as tall as it, the volume-down chevron with its tip on the rocker's bottom edge and a quarter of the rocker tall (ready.rs `marks`). Anything else that points at a key (a hint, a press echo) takes them from there too.
+
+Measured with `ferros-bridge display ruler`: every row shows its own number in binary across the width (most significant bit left, white a 1), and the person reads the row level with each key's edge off the glass. The same screen then draws the stored edges as 1 px hairlines (power green, rocker red) to check them. akita, by the owner, 2026-11-06: power 629..=797 (001001110101..=001100011101), rocker 932..=1271 (001110100100..=010011110111); checked with the hairlines. husky: provisional values reproducing its marks placed by eye, to measure the same way.
 
 ## akita's facts, and where they came from
 
