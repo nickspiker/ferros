@@ -564,18 +564,26 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
     // akita (board.rs): storage-off, no vault and so no init; and every driver process init starts assumes husky's panel, touch and rails. The USB process alone, from the native capsule this kernel carries, so the bridge reaches the device.
     if crate::board::akita() {
         #[cfg(ferros_usb_capsule)]
-        match shell_grants(b"usb").map(|g| crate::process::spawn_capsule(b"usb", include_bytes!("../../target/akita-usb.capsule.vsf"), b"", &g, &[])) {
+        // No ira on akita yet, so no oracle secret: the capsule is checked by its signature and runs without an ihi (spawn_capsule would refuse it: "no ira: no system secret, no ihi", the first akita boots, 2026-11-06).
+        match shell_grants(b"usb").map(|g| crate::process::spawn_capsule_no_ihi(b"usb", include_bytes!("../../target/akita-usb.capsule.vsf"), b"", &g)) {
             Some(Ok(o)) => {
                 mark_ran(&o);
                 crate::process::push_console(b"home: akita, the usb process from the kernel's capsule\n");
+                crate::checklist::dot(0);
+                crate::board::probe(7);
+                crate::board::probe_starve(9);
                 crate::process::push_console(&o.console);
             }
             Some(Err(e)) => {
                 crate::process::push_console(b"home: akita, usb refused: ");
+                crate::board::probe(71);
                 crate::process::push_console(e.as_bytes());
                 crate::process::push_console(b"\n");
             }
-            None => crate::process::push_console(b"home: akita, no usb grants\n"),
+            None => {
+                crate::process::push_console(b"home: akita, no usb grants\n");
+                crate::board::probe(72);
+            }
         }
         #[cfg(not(ferros_usb_capsule))]
         crate::process::push_console(b"home: akita, but this kernel carries no usb capsule (target/akita-usb.capsule.vsf)\n");
@@ -1231,6 +1239,7 @@ pub fn run(mut b: Boot) -> ! {
             let _ = crate::wairua::draw();
             crate::checklist::step(crate::checklist::Step::Wairua);
             home_started = true;
+            crate::board::probe(6);
             let _ = start_home(&mut store);
             crate::checklist::step(crate::checklist::Step::Init);
             crate::checklist::close();

@@ -7,8 +7,20 @@ use alloc::vec::Vec;
 use ferros_hal::ufs::UfsController;
 
 const UFS_BASE: usize = 0x1320_0000;
+/// husky's place for the log (the ferros partition from 1 GiB in), and its length in blocks.
 const BASE: u32 = crate::ufs_device::FERROS_BASE_LBA + 262_144;
 const BLOCKS: u32 = 16_384;
+/// Where the log is on this boot: (LU, first block, blocks). husky's place unless `init_in` names another (akita's `klog` partition, board.rs).
+static mut REGION: (u8, u32, u32) = (0, BASE, BLOCKS);
+fn lun() -> u8 {
+    unsafe { REGION.0 }
+}
+fn base() -> u32 {
+    unsafe { REGION.1 }
+}
+fn blocks() -> u32 {
+    unsafe { REGION.2 }
+}
 const MAGIC: &[u8; 4] = b"FLOG";
 
 struct State {
@@ -25,7 +37,7 @@ fn ufs() -> UfsController {
 
 fn read(lba: u32, out: &mut [u8; 4096]) -> bool {
     let u = ufs();
-    if u.read_block_lun(0, lba) != 0 || u.last_response_status() != 0 {
+    if u.read_block_lun(lun(), lba) != 0 || u.last_response_status() != 0 {
         return false;
     }
     out.copy_from_slice(u.data_buffer());
@@ -35,7 +47,7 @@ fn read(lba: u32, out: &mut [u8; 4096]) -> bool {
 fn write(lba: u32, data: &[u8; 4096]) -> bool {
     let u = ufs();
     u.data_buffer_mut().copy_from_slice(data);
-    u.write_block_lun(0, lba) == 0 && u.last_response_status() == 0
+    u.write_block_lun(lun(), lba) == 0 && u.last_response_status() == 0
 }
 
 fn write_header(s: &State) -> bool {
@@ -44,22 +56,28 @@ fn write_header(s: &State) -> bool {
     h[4..8].copy_from_slice(&s.block.to_le_bytes());
     h[8..12].copy_from_slice(&s.used.to_le_bytes());
     h[12..16].copy_from_slice(&s.boot.to_le_bytes());
-    write(BASE, &h)
+    write(base(), &h)
 }
 
 /// Open the log (creating it if the header is missing) and count this boot. Call once, after the UFS link is up.
+/// Open the log in another place (akita's `klog` partition, found in its GPT: board.rs), then as `init`.
+pub fn init_in(lun: u8, first: u32, blocks: u32) -> bool {
+    unsafe { REGION = (lun, first, blocks) };
+    init()
+}
+
 pub fn init() -> bool {
     let mut h = [0u8; 4096];
-    if !read(BASE, &mut h) {
+    if !read(base(), &mut h) {
         return false;
     }
     let mut s = if &h[..4] == MAGIC {
         let w = |o: usize| u32::from_le_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]);
-        State { block: w(4).clamp(1, BLOCKS), used: w(8).min(4096), boot: w(12) + 1, buf: [0; 4096] }
+        State { block: w(4).clamp(1, blocks()), used: w(8).min(4096), boot: w(12) + 1, buf: [0; 4096] }
     } else {
         State { block: 1, used: 0, boot: 1, buf: [0; 4096] }
     };
-    if s.used > 0 && !read(BASE + s.block, &mut s.buf) {
+    if s.used > 0 && !read(base() + s.block, &mut s.buf) {
         return false;
     }
     let ok = write_header(&s);
@@ -73,12 +91,16 @@ pub fn line(text: &str) {
 }
 
 fn line_locked(text: &str) {
-    let Some(s) = (unsafe { (*(&raw mut STATE)).as_mut() }) else { return };
+    // No flash log (akita, storage-off: board.rs): the line goes to the RAM log instead, which a warm reset keeps and Android shows as the previous boot's console.
+    let Some(s) = (unsafe { (*(&raw mut STATE)).as_mut() }) else {
+        crate::platform::pstore(alloc::format!("flash log: {text}\n").as_bytes());
+        return;
+    };
     let ms = crate::platform::cntpct() / (crate::platform::cntfrq() / 1000);
     let full = alloc::format!("b{} t{} {}\n", s.boot, ms, text);
     for &c in full.as_bytes() {
         if s.used as usize == 4096 {
-            if s.block + 1 >= BLOCKS {
+            if s.block + 1 >= blocks() {
                 return;
             }
             s.block += 1;
@@ -89,10 +111,10 @@ fn line_locked(text: &str) {
         s.used += 1;
         // A block is written when it fills, and the tail block after every line (below).
         if s.used as usize == 4096 {
-            write(BASE + s.block, &s.buf);
+            write(base() + s.block, &s.buf);
         }
     }
-    write(BASE + s.block, &s.buf);
+    write(base() + s.block, &s.buf);
     write_header(s);
 }
 
@@ -110,7 +132,7 @@ fn tail_locked(max: usize) -> Vec<u8> {
     for blk in first..=s.block {
         if blk == s.block {
             out.extend_from_slice(&s.buf[..s.used as usize]);
-        } else if read(BASE + blk, &mut b) {
+        } else if read(base() + blk, &mut b) {
             out.extend_from_slice(&b);
         }
     }

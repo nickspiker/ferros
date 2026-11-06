@@ -112,11 +112,23 @@ pub fn busy() -> bool {
 /// The `usb` power switch (process.rs POWERS). On, as a USB process starts: the link readied — the Type-C port's USB switch closed, the eUSB2 PHY brought up again (the host sees a fresh attach), the DMA path to physical addresses open — and a command an earlier process left half-done dropped (`reset`), so this one starts clean. The process then resets and runs the controller itself. Off: nothing to give back; the process is going.
 pub fn power(on: bool) -> bool {
     if on {
+        // akita bring-up: a square on the glass after each step (checklist::dot), the last one lit is where it stopped.
+        crate::checklist::dot(1);
+        crate::board::probe(81);
         reset();
+        crate::checklist::dot(2);
+        crate::board::probe(82);
         crate::service::tcpc_usb_switch(true);
+        crate::checklist::dot(3);
+        crate::board::probe(83);
         crate::pixel8_eusb_phy_init();
+        crate::checklist::dot(4);
+        crate::board::probe(84);
         let _ = crate::platform::open_usb_dma_path();
+        crate::checklist::dot(5);
+        crate::board::probe(85);
         crate::flashlog::line("usb: the link readied for the USB process");
+        crate::board::probe_log(8);
     }
     true
 }

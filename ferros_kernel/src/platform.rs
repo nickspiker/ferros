@@ -126,6 +126,11 @@ pub fn arm_safety() {
 /// Set once a watchdog reset has been ordered (`reboot_to_bootloader`): from then on nothing pets the watchdogs. The vault pets them on every operation (kvault.rs), and the map writes the vault from the worker cores all the time, so the reset that `bridge reboot fastboot` waits for never came (2026-10-24: 64 s of a frozen service loop, USB gone, ferros still running after).
 static RESET_ORDERED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Stop every pet from here on, as an ordered reset does, but with no reboot mode stamped and the watchdogs left as they run: the next expiry resets warm and ABL boots the active slot again (board.rs `probe_starve`: an akita bring-up build that must not hang where no host can see it).
+pub fn starve_watchdogs() {
+    RESET_ORDERED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// The watchdog window's measurement (owner, 2026-11-05: "TIME IT!"): the counter at the last pet from any core, the longest gap between two pets and the counter when it ended, and how many pets; DIAG reports them, so the window can be set from the longest stretch the kernel really goes without petting.
 static LAST_PET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static PET_GAP_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

@@ -41,12 +41,18 @@ if [ "${1:-}" = --flash-a ]; then
 else
     fastboot -s "$S" boot "$IMG"
 fi
-for i in $(seq 45); do
+# Either ferros on USB, or (a FERROS_PROBE build, ferros_kernel/src/board.rs) the 8a back in fastboot: the boot reached the probe. Give fastboot time to drop off first.
+sleep 6
+for i in $(seq 60); do
     if lsusb -d 1209:4665 >/dev/null; then
-        echo "== ferros on USB after $((i * 2)) s"
+        echo "== ferros on USB after $((i * 2 + 6)) s"
+        exit 0
+    fi
+    if fastboot devices | grep -q "$S"; then
+        echo "== the 8a back in fastboot after $((i * 2 + 6)) s${FERROS_PROBE:+ (probe $FERROS_PROBE reached)}"
         exit 0
     fi
     sleep 2
 done
-echo "== ferros not on USB after 90 s" >&2
+echo "== neither ferros on USB nor fastboot after 126 s" >&2
 exit 1

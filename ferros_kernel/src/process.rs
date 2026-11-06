@@ -414,12 +414,17 @@ struct Thread {
 pub const MASK_WORKERS: u16 = 0x00F0;
 /// The X3 (core 8): the kernel's core, for the one real compute path (the display's render thread) and otherwise idle between service-loop passes.
 pub const MASK_BIG: u16 = 0x0100;
+/// The kernel's core as a mask: the X3 when the kernel moved there (board::x3), else CPU0, where it stayed. "Big" means this core: a thread pinned to the X3 runs here, and the kernel-side switches (SYS_POWER) are served here. Until 2026-11-06 it was the X3 always, so with the kernel on CPU0 (akita, or husky's FERROS_X3=0) a pinned thread waited for a core that never started and every power switch was refused.
+pub fn kernel_mask() -> u16 {
+    if crate::board::x3() { MASK_BIG } else { 0x0001 }
+}
 /// The cores that are up: the kernel's, and the workers smp.rs reports.
 fn cores_up() -> u16 {
-    MASK_BIG | ((crate::smp::UP.load(core::sync::atomic::Ordering::Relaxed) as u16) << 4)
+    kernel_mask() | ((crate::smp::UP.load(core::sync::atomic::Ordering::Relaxed) as u16) << 4)
 }
-/// Whether thread `t` may run on this core.
+/// Whether thread `t` may run on this core. A pin to the X3 means the kernel's core, wherever that is.
 fn allowed_here(mask: u16) -> bool {
+    let mask = if mask & MASK_BIG != 0 { (mask & !MASK_BIG) | kernel_mask() } else { mask };
     let here = 1u16 << core();
     mask & here != 0 || mask & cores_up() == 0
 }
@@ -1556,7 +1561,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let token = p.read(f.x[0], 32);
             let found = p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights));
             f.x[0] = match found {
-                Some((Object::Power(i), r)) if r & RIGHT_SEND != 0 && 1u16 << core() == MASK_BIG => {
+                Some((Object::Power(i), r)) if r & RIGHT_SEND != 0 && 1u16 << core() == kernel_mask() => {
                     if (POWERS[i].set)(f.x[1] == 1) { 0 } else { ERR }
                 }
                 _ => {
@@ -2094,6 +2099,8 @@ fn fail_orphaned_calls() {
 pub static PROCS_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 fn end_process(pi: usize, cur: usize, value: u64) {
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
+    // akita bring-up: a process ending (the usb process is the only one there) resets plainly in a FERROS_PROBE=8 build, so it reads apart from the power-up probes 81-85 (board.rs).
+    crate::board::probe_log(86);
     let kk = k();
     let mine: Vec<usize> = kk.threads.iter().enumerate().filter(|(_, x)| matches!(x, Some(x) if x.proc == pi)).map(|(i, _)| i).collect();
     // A thread running on another core right now is left to leave at its own next trap (`drain_dying`): its arc must stay until then.
@@ -2296,6 +2303,14 @@ pub fn push_console(bytes: &[u8]) {
     k().console.extend_from_slice(bytes);
     crate::platform::pstore(bytes);
     unlock();
+    // akita: the RAM log does not survive its resets, so the consoles go to the flash log in `klog` too (board.rs).
+    if crate::board::akita() {
+        let text = alloc::string::String::from_utf8_lossy(bytes);
+        let text = text.trim_end();
+        if !text.is_empty() {
+            crate::flashlog::line(text);
+        }
+    }
 }
 
 /// Drain what processes have sent their consoles since the last drain.
@@ -2764,4 +2779,16 @@ pub fn arcs_report() -> alloc::string::String {
     }
     unlock();
     s
+}
+
+/// A signed native capsule spawned with no ihi, for a device that has no ira yet (akita, storage-off until its partitions are backed up: board.rs). The gate still proves the signature over the content; only the oracle's ihi is missing, since it needs the system secret the ira gives. Masked code is refused (its seal needs that secret too), and so is everything on a production build.
+pub fn spawn_capsule_no_ihi(name: &[u8], capsule: &[u8], input: &[u8], grants: &[Grant]) -> Result<Outcome, &'static str> {
+    let g = crate::oracle::gate(capsule)?;
+    if g.masked {
+        return Err("gate: masked code needs the system secret (no ira here)");
+    }
+    if cfg!(ferros_production) {
+        return Err("gate: production refuses unmasked native code");
+    }
+    spawn(name, &g.code, input, grants, None, false, g.text_len, g.fixed | (g.bti as u32) << 8 | (g.exact as u32) << 9)
 }

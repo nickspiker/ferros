@@ -75,6 +75,8 @@ core::arch::global_asm!(
 );
 
 /// The same two measurements on the calling core (CPU0): (ticks for 2^24 dependent adds, ticks for 2^24 adds in four chains).
+// Never inlined: LLVM sizes inline asm by its statements, and the `.rept 64` blocks below expand to 256 instructions it counts as one, so inlined into a large caller (service::run) its branch relaxation came up short and a `tbnz` landed out of its ±32 KiB range ("fixup value out of range", the akita probe builds, 2026-11-06).
+#[inline(never)]
 pub fn local() -> (u64, u64) {
     let (d, i): (u64, u64);
     unsafe {

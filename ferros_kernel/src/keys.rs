@@ -104,7 +104,7 @@ fn scrub_stack() {
 /// The cores that run ferros now: this one and the workers that are up. Before the hop (CPU0, no workers yet) the X3 and every worker, since they will.
 fn running() -> u32 {
     let up = crate::smp::UP.load(Ordering::Acquire);
-    if me() == 0 && up == 0 && option_env!("FERROS_X3") != Some("0") { AFTER_HOP } else { (1 << me()) | up << 4 }
+    if me() == 0 && up == 0 && crate::board::x3() { AFTER_HOP } else { (1 << me()) | up << 4 }
 }
 
 /// This core's index: MPIDR Aff1 (CPU0 0, the A715 workers 4-7, the X3 8).

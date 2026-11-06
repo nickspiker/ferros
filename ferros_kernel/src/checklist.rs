@@ -660,3 +660,24 @@ pub fn suffix(item: Item, text: &[u8]) {
 pub fn active() -> bool {
     unsafe { (*CHECKLIST.0.get()).is_some() }
 }
+
+/// akita bring-up (board.rs): square `n` (0 to 15) of a row under the ring, lit green and presented at once, so a step that hangs shows on the glass as the last square lit. On akita the panel is the one channel left while USB never comes up: its bootloader clears the RAM log at every reset. Nothing on husky.
+pub fn dot(n: u32) {
+    if !crate::board::akita() {
+        return;
+    }
+    let Some(c) = (unsafe { (*CHECKLIST.0.get()).as_ref() }) else {
+        return;
+    };
+    let p = &c.panel;
+    let side = (p.width / 24) as i32;
+    let pitch = side * 3 / 2;
+    let x0 = (p.width as i32 - 16 * pitch) / 2 + n as i32 * pitch;
+    let y0 = (p.rows * 7 / 8) as i32;
+    for y in y0..y0 + side {
+        for x in x0..x0 + side {
+            put(p, x, y, 0x00_40_E0_40);
+        }
+    }
+    p.present_nowait();
+}

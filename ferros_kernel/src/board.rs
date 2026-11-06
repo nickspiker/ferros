@@ -77,3 +77,35 @@ pub fn detect(dtb: u64) {
         }
     }
 }
+
+/// akita bring-up, `FERROS_PROBE=<n>` builds only: at checkpoint `n`, back into the bootloader (platform::reboot_to_bootloader: the mode stamped through EL3, then the cluster watchdogs fired; fastboot about 20 s later). Until akita's USB comes up there is no other way out of it, and the host sees the one bit as fastboot coming back or not: the boot reached `n`, and (on akita only) the board was told right. A build without the variable never takes it.
+pub fn probe(n: u32) {
+    let want = option_env!("FERROS_PROBE").and_then(|s| s.parse::<u32>().ok());
+    // A probe also fires for its sub-probes (71 and 72 in a FERROS_PROBE=7 build): every way out of a step answers.
+    if akita() && want.is_some_and(|w| w == n || (n >= 10 && w == n / 10)) {
+        crate::platform::pstore(b"ferros: akita probe reached, to the bootloader\n");
+        crate::platform::reboot_to_bootloader();
+    }
+}
+
+/// Whether the kernel moves onto the Cortex-X3 (x3.rs): every husky build since 2026-10-22 unless `FERROS_X3=0`. Not on akita: there the kernel never came back from the hop (probes 45 and 5, 2026-11-06), so it stays on CPU0 until that is understood.
+pub fn x3() -> bool {
+    option_env!("FERROS_X3") != Some("0") && !akita()
+}
+
+/// akita bring-up, `FERROS_PROBE=<n>` builds only: at log checkpoint `n`, a plain reset (PSCI), not the bootloader. ABL boots slot a again and counts its retries down, then falls back to slot b's Android, which shows the RAM log of the last ferros session (/sys/fs/pstore; tools/husky-pstore.sh): the flash log's lines and the processes' consoles up to here, read without hands.
+pub fn probe_log(n: u32) {
+    let want = option_env!("FERROS_PROBE").and_then(|s| s.parse::<u32>().ok());
+    if akita() && want.is_some_and(|w| w == n || (n >= 10 && w == n / 10)) {
+        crate::platform::pstore(alloc::format!("ferros: akita log probe {n}, reset\n").as_bytes());
+        crate::platform::reboot();
+    }
+}
+
+/// akita bring-up, `FERROS_PROBE=<n>` builds only: at checkpoint `n` the watchdogs stop being petted and the boot goes on as it would. Whatever follows writes its lines to the RAM log; when the watchdog runs out the chip resets warm, ABL counts slot a's retries down and falls back to slot b's Android, and the log of the last session is there to read (/sys/fs/pstore). For the steps that hang rather than fail: no clock here, the hardware watchdog ends it.
+pub fn probe_starve(n: u32) {
+    if akita() && option_env!("FERROS_PROBE").and_then(|s| s.parse::<u32>().ok()) == Some(n) {
+        crate::platform::pstore(alloc::format!("ferros: akita probe {n}: the watchdogs left unpetted from here\n").as_bytes());
+        crate::platform::starve_watchdogs();
+    }
+}

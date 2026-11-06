@@ -1770,6 +1770,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // The board first (board.rs): husky's high RAM is not there on akita, and the next line reads it on husky.
     board::detect(dtb_addr);
     platform::pstore(if board::akita() { b"ferros: board akita\n" as &[u8] } else { b"ferros: board husky\n" });
+    board::probe(1);
     platform::pstore_prev_handoff();
     platform::mark_trail(0);
     platform::detect_jump();
@@ -1795,7 +1796,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     platform::stack_paint();
     platform::notes_rotate();
     // The big core, started now so its power-up overlaps the boot; the service moves to it (x3.rs) if it is parked by then.
-    if option_env!("FERROS_X3") != Some("0") {
+    if crate::board::x3() {
         x3::launch();
     }
     platform::pstore(b"ferros: X3 launched\n");
@@ -1808,6 +1809,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // The previous session's report (ramoops DRAM survives warm resets), then the safety nets: fault sink + panic reporter into the report block, cluster watchdogs.
     let prev = platform::read_report();
     platform::arm_safety();
+    board::probe(2);
     platform::crumb(0xC0);
     platform::pstore(b"ferros: safety armed\n");
     checklist::at("safety armed");
@@ -1831,6 +1833,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         (0, ready::Choice::Ferros)
     };
     let _ = pressed_at;
+    board::probe(3);
     checklist::PRESS.store(pressed_at, core::sync::atomic::Ordering::Relaxed);
 
     // eUSB2 repeater: snapshot what ABL left, then apply Google's calibrated tune (ABL never does; only the Android driver does).
@@ -1883,6 +1886,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     });
     // The road map on the panel (ABL's splash surface): what this boot has done so far is green.
     checklist::start(platform::cntfrq(), &[checklist::Item::Killswitch]);
+    board::probe(4);
     checklist::step(checklist::Step::Panel);
     checklist::at("checklist drawn");
     platform::pstore(b"ferros: checklist drawn\n");
@@ -1898,6 +1902,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     checklist::at("board read");
     checklist::step(checklist::Step::Board);
     platform::pstore(b"ferros: board read\n");
+    board::probe(41);
     if cached {
         checklist::mark(checklist::Item::CacheMap);
     }
@@ -1910,16 +1915,17 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     // UFS: ABL leaves the flash unpowered (cold_ufs::power_on_device); bring the link up, then open the ira-rooted vault on the ferros partition exactly as the handoff path does.
     let t_ufs = platform::cntpct();
-    // akita boots storage-off until its per-unit partitions are backed up (board.rs): no power to the flash, so the flash log, the gate's Android switch, the vault, the write protect and the slot mark below all find no link and do nothing.
-    let link_up = !board::akita() && cold_ufs::bring_up();
+    // akita too since its per-unit partitions are backed up (2026-11-06, /mnt/Harbor/tmp/akita-backup-2026-11-06): the link for its flash log in `klog`. Its vault, write protect, slot mark and the gate's Android switch stay off (board.rs).
+    let link_up = cold_ufs::bring_up();
     checklist::step(checklist::Step::Disk);
+    board::probe(42);
     let ufs_ms = (platform::cntpct().wrapping_sub(t_ufs) / (platform::cntfrq() / 1000)) as u32;
     platform::pstore(if link_up { b"ferros: UFS link up\n" as &[u8] } else { b"ferros: UFS link DOWN\n" });
     if link_up {
         checklist::mark(checklist::Item::Disk);
     }
     // The gate chose Android: the moment the disk answers (set-active needs devinfo and the boot LU attribute, nothing of the vault) — slot a active, then a plain reset; the bootloader boots slot a, whose hv gate takes the one-shot marker and goes to Android. The way back is a reboot: slot a's gate asks again (1 s on dev builds) and boots the ferros packed into it (tools/husky-cold.sh keeps that copy current). Android cannot boot from slot b's own partitions (product_b is empty), which is why the choice is a slot switch and not a chainload.
-    if gate_choice == ready::Choice::Android && link_up {
+    if gate_choice == ready::Choice::Android && link_up && !board::akita() {
         // Tell slot a's gate (ferros_hv/src/gate.rs) to answer "Android" this once instead of asking again and auto-choosing ferros after a second, as `diag android` does; cleaned to DRAM, since the gate reads it with the caches off. Every later boot of slot a asks again, so a reboot from Android lands on the gate and, untouched, on ferros (owner, 2026-10-22: never stuck in Android).
         unsafe {
             let p = 0xFD60_0FF8usize as *mut u64;
@@ -1936,7 +1942,15 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     platform::crumb(0xC2);
     let t_vault = platform::cntpct();
     if link_up {
-        let ok = flashlog::init();
+        // akita: in its `klog` partition (16 MiB on LU 0), found through the GPT, never at husky's fixed place; read back from Android with dd. No klog, no log.
+        let ok = if board::akita() {
+            match partfs::find("klog") {
+                Some(p) => flashlog::init_in(p.lun, p.first as u32, (p.last - p.first + 1) as u32),
+                None => false,
+            }
+        } else {
+            flashlog::init()
+        };
         flashlog::line(&alloc::format!("boot cold, flash log init {ok}"));
     }
     checklist::step(checklist::Step::Log);
@@ -1946,6 +1960,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     if let Some(doc) = store.as_mut().and_then(|s| s.get_by_key(checklist::SPAN_KEY).ok().flatten()) {
         checklist::span_from_disk(&doc);
     }
+    board::probe(43);
     let vault_ms = (platform::cntpct().wrapping_sub(t_vault) / (platform::cntfrq() / 1000)) as u32;
     if probe.opened == 1 {
         checklist::mark(checklist::Item::VaultOpen);
@@ -2040,6 +2055,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // RELOAD stages at base+32 MiB (the slot the old ping-pong reload proved on hardware; base+64 MiB was fatal) and runs its copy stub 64 KiB below it, far past this image + stack + 4 MiB heap.
     platform::crumb(0xE6);
     checklist::step(checklist::Step::Settings);
+    board::probe(44);
     checklist::at("service start");
     let boot = service::Boot {
         kind: service::BootKind::Cold,
@@ -2054,13 +2070,15 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     };
     // On the X3 if it is parked by now (every build since 2026-10-22, proven on a cold boot; FERROS_X3=0 keeps CPU0); otherwise here.
     // CPU0 is about to park: the ira and wairua it holds go sealed to the X3 and the workers, and its own registers are cleared (keys.rs).
-    if option_env!("FERROS_X3") != Some("0") && x3::parked() {
+    if crate::board::x3() && x3::parked() {
         keys::leave(keys::AFTER_HOP);
     }
-    let boot = if option_env!("FERROS_X3") != Some("0") { x3::hand_over(boot) } else { boot };
+    board::probe(45);
+    let boot = if crate::board::x3() { x3::hand_over(boot) } else { boot };
     platform::crumb(0xE7);
     platform::pstore(b"ferros: into the service\n");
     platform::mark_trail(0x18);
+    board::probe(5);
     service::run(boot)
 }
 
