@@ -49,3 +49,16 @@ What does not work as a channel on akita:
 - The panel, until it was fixed the same morning: ABL leaves akita's splash framebuffer at G#FAC0_0000 (1080 × 2400, IOVA = physical), outside the regions the display engine's fence lets it read (s2mpu::fence_dpu: display-fb and display-phases, in the GiB below). Fenced at the service's start, every scan-out read was refused: DECON went on at 60 Hz over a framebuffer the panel never saw, black a few frames into the boot. akita now draws into ferros's own framebuffer (display-fb, G#8400_0000) from the first adoption (`use_own_fb` at entry), and the panel stays lit.
 
 The probes (`FERROS_PROBE=<n>` builds, board.rs) were the channel until USB: at checkpoint n, `probe` goes to the bootloader (fastboot reappearing is the one bit), `probe_log` resets plainly (ABL counts slot a down to Android), `probe_starve` stops the watchdog pets. Checkpoints: 1 board, 2 safety armed, 3 gate, 4 ring, 41-45 board read to the X3 hop, 5 service, 6 home, 7 / 71 / 72 the usb spawn, 81-85 the USB power-up, 86 a process ending, 9 starve after the spawn. A probe taken after the usb process existed reset without stopping in fastboot, and so did `bridge reboot fastboot`: the memory scrub before every reset (platform::scrub_memory) took a permission fault on the first arc's grants page (read-only at every level, the kernel's too; FAR G#8300_0000, read back as PREV_EXC and PREV_FAULT_FAR after the next boot), and the fault's plain reset, which clears the PMU reboot mode, replaced the ordered one. The scrub now returns both pools to kernel-writable pages first (cachemap::pools_to_kernel). Since 2026-11-06, `bridge reboot fastboot` lands akita in fastboot in 37 s, so `tools/akita-boot.sh --flash-a` and the bridge make a loop that needs no hands. The same fault was waiting on husky whenever a process was alive.
+
+## akita's ferros partition (2026-11-06)
+
+Carved by `tools/pixel-carve.sh akita 32` (the `ferros-flash` library and CLI, tools/flash): userdata keeps its start and shrinks to 32 GiB, `ferros` (type BLAKE3("ferros"), A0B51225-61C5-0F5A-FFE7-1B644F9CA954) takes the rest from the next 1 MiB boundary.
+
+| | LU 0, 4 KiB LBAs | size |
+|---|---|---|
+| userdata | A#2449894..=A#10838501 | 32 GiB |
+| ferros | A#10838528..=A#31196154 | 77.7 GiB |
+
+akita's table had 34 entries, all used, and reserves four blocks for the array at each end (room for 128), so the count grew to 64 in place and nothing moved: the write was 9 bytes in each header and 48 in each array (the userdata end and the new entry). The backup header's block carries a stale copy of entries after its 92 bytes; the edit keeps it. The script saved both ends first, with hashes checked against the device (`/mnt/Harbor/tmp/akita-gpt-2026-11-06-100644/`, and the first read in `akita-gpt-2026-11-06/`), wrote the primary first and the backup last, read both back after flushing the device's cache, then `fastboot -w`. Checked by the bootloader (`partition-size:ferros` G#13_6A1F_B000) and by ferros (`diag "part find ferros"`).
+
+The vault is not on it yet: the kernel's vault still uses husky's fixed place (ufs_device FERROS_BASE_LBA), and akita's ira labels are the owner's to choose.

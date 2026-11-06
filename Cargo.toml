@@ -21,6 +21,7 @@ members = [
     "tools/handle-guard",
     "tools/ferros-mask",
     "tools/install",
+    "tools/flash",
     "payloads/hello",
     "payloads/display",
     "payloads/shelltest",

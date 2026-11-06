@@ -777,7 +777,14 @@ dependencies = [
  "nunc-time",
  "nusb",
  "tokio",
- "vsf 0.10.2",
+ "vsf 0.11.0",
+]
+
+[[package]]
+name = "ferros-flash"
+version = "0.1.0"
+dependencies = [
+ "blake3",
 ]
 
 [[package]]
@@ -803,7 +810,7 @@ dependencies = [
  "rand",
  "rsa",
  "sha2",
- "vsf 0.10.2",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -817,7 +824,7 @@ dependencies = [
  "ihi 0.0.48",
  "libm",
  "tapuwae",
- "vsf 0.10.2",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -882,7 +889,7 @@ dependencies = [
  "ferros_sys",
  "fgtw",
  "photon_core",
- "vsf 0.10.2",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -1224,7 +1231,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ferros_layout",
- "vsf 0.10.2",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -1263,7 +1270,7 @@ dependencies = [
  "ihi 0.0.48",
  "manifestus",
  "tatau",
- "vsf 0.10.2",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -1298,7 +1305,7 @@ dependencies = [
  "ferros_hal",
  "ferros_layout",
  "ihi 0.0.3",
- "vsf 0.10.2",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -1333,7 +1340,7 @@ dependencies = [
  "num-bigint",
  "rand",
  "voca 0.0.1",
- "vsf 0.10.2",
+ "vsf 0.11.0",
  "x25519-dalek",
 ]
 
@@ -1964,7 +1971,7 @@ dependencies = [
  "blake3",
  "hashbrown 0.15.5",
  "libc",
- "vsf 0.10.2",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -2420,7 +2427,7 @@ dependencies = [
  "rand_core",
  "raptorq",
  "subtle",
- "vsf 0.10.2",
+ "vsf 0.11.0",
  "zeroize",
 ]
 
@@ -3026,7 +3033,7 @@ dependencies = [
  "blake3",
  "libm",
  "valhall",
- "vsf 0.10.2",
+ "vsf 0.11.0",
 ]
 
 [[package]]
@@ -3285,7 +3292,7 @@ dependencies = [
 
 [[package]]
 name = "vsf"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "aes-gcm",
  "bitvec",
