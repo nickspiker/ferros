@@ -14,7 +14,7 @@ ferros runs on two Tensor G3 (zuma) phones. The kernel tells them apart at entry
 | Fuel gauge | MAX77759 at G#36 on hsi2c_11 | the same |
 | Low 2 GB carve-outs | zuma's | the same (they come from the SoC's tree) |
 | Panel, touch, cutout | HK3, FTM5, 1344 × 2992 | AK3B (docs/AK3B.md), 1080 × 2400; touch not brought up |
-| Touch controller | ST FTM5 on spi20, reset gpp21-2 | Goodix "nottingham" (Berlin family, `goodix_brl_spi.c`) on the same spi20 (10 MHz) and the same reset gpp21-2, interrupt gpn0-0 (falling edge), its own vdd and avdd rails (mapping to PMIC LDOs not yet read); coordinates 0-1079 × 0-2399; firmware `goodix_firmware_ak3b.bin` from Android's vendor partition |
+| Touch controller | ST FTM5 on spi20, reset gpp21-2 | Goodix "nottingham" (Berlin family, `goodix_brl_spi.c`) on the same spi20 (10 MHz) and the same reset gpp21-2, interrupt gpn0-0 (falling edge), and the same rails as husky's touch (vdd LDO25M at 1.8 V, avdd LDO4M at 3.0 V, main PMIC), so its power-up is husky's and only the protocol is new; coordinates 0-1079 × 0-2399; firmware `goodix_firmware_ak3b.bin` from Android's vendor partition |
 | Side keys, panel rows (board::keys) | power 933..=1124, volume rocker 1279..=1660 (measured 2026-11-06) | power 629..=797, volume rocker 932..=1271 (measured 2026-11-06) |
 
 akita's repeater tune, from its MP board overlay (`repeater_tune1..5`): G#50 = G#0A, G#70 = G#5F, G#71 = G#2E, G#73 = G#80, G#79 = G#40 (ferros_hal `AKITA_REPEATER_TUNE`).
