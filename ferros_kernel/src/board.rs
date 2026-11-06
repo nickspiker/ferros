@@ -25,6 +25,23 @@ pub fn akita() -> bool {
     get() == Board::Akita
 }
 
+/// Where the side keys sit, in panel rows (top and bottom, inclusive), measured with `display ruler`: the row beside each key's edge read off the binary ruler. The gate's marks are made from these (ready.rs).
+#[derive(Clone, Copy)]
+pub struct Keys {
+    pub power: (usize, usize),
+    /// The volume rocker: up is its upper half, down its lower half.
+    pub rocker: (usize, usize),
+}
+
+pub fn keys() -> Keys {
+    match get() {
+        // Measured by the owner, 2026-11-06.
+        Board::Akita => Keys { power: (629, 797), rocker: (932, 1271) },
+        // Provisional: what reproduces the marks placed by eye (power centred at 1050, volume down at 1700); to measure with the ruler.
+        Board::Husky => Keys { power: (960, 1140), rocker: (1412, 1796) },
+    }
+}
+
 /// Whether the hv's high RAM is there (husky's top, where its gate mark, the jump's mailbox and its entropy pool live).
 pub fn hv_ram() -> bool {
     get() == Board::Husky

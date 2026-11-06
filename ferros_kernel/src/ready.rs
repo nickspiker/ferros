@@ -6,10 +6,14 @@
 //!
 //! Dev builds proceed as if pressed after one second, so unattended loops keep working and every line after the gate is the same code — unless a volume key goes down during that second, which cancels the timer: the gate then waits for the power key like a production build (FERROS_PRODUCTION set at build time), which always waits. There is no remote press: USB does not exist before the press.
 
-/// Panel row the power button sits beside (the triangle's tip points here). Calibrated by eye on husky.
-const POWER_Y: usize = 1050;
-/// Panel row beside the volume-down key (the Android mark points here; the rocker sits below the power button on husky). To calibrate by eye.
-const VOL_DOWN_Y: usize = 1700;
+/// The gate's two marks from the board's measured keys (board::keys): (centre row, half height, length) of the power triangle, as tall as the power key, and of the volume-down chevron, at the middle of the rocker's lower half and a quarter of the rocker tall. The proportions are husky's marks placed by eye (a 90-high half and 140 long; 48 and 80), which its provisional spans reproduce exactly.
+fn marks() -> ((usize, usize, usize), (usize, usize, usize)) {
+    let k = crate::board::keys();
+    let ph = (k.power.1 - k.power.0) / 2;
+    let span = k.rocker.1 - k.rocker.0;
+    let vh = span / 8;
+    (((k.power.0 + k.power.1) / 2, ph, ph * 14 / 9), (k.rocker.0 + span * 3 / 4, vh, vh * 5 / 3))
+}
 /// The gate's answer: power = ferros; volume down = Android (slot a made active, then a reset; BOOT.md "Dual Boot"). Volume up only holds (the dev auto-press is cancelled; a production build waits for power anyway).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
@@ -36,30 +40,32 @@ pub fn erase(p: &crate::display::Panel) {
         }
     };
     let tip = p.width - 28;
-    rect(tip - 140, POWER_Y - 91, tip + 1, POWER_Y + 92);
-    rect(tip - 80, VOL_DOWN_Y - 49, tip + 1, VOL_DOWN_Y + 50);
+    let ((py, ph, pl), (vy, vh, vl)) = marks();
+    rect(tip - pl, py - ph - 1, tip + 1, py + ph + 2);
+    rect(tip - vl, vy - vh - 1, tip + 1, vy + vh + 2);
 }
 
 fn draw(p: &crate::display::Panel) {
     let _ = WHITE;
     // Triangle pointing right, tip near the right edge at the power button's height.
-    let (tip, half, len) = (p.width - 28, 90usize, 140usize);
+    let ((py, ph, pl), (vy, vh, vl)) = marks();
+    let (tip, half, len) = (p.width - 28, ph, pl);
     for dx in 0..len {
         let reach = half * dx / len;
         for dy in 0..=reach {
-            px(p, tip - dx, POWER_Y - dy, GREEN);
-            px(p, tip - dx, POWER_Y + dy, GREEN);
+            px(p, tip - dx, py - dy, GREEN);
+            px(p, tip - dx, py + dy, GREEN);
         }
     }
     // The Android choice at the volume-down key: a smaller chevron in Google's four colours, blue at the tip, so the key that leaves ferros is unmistakable.
     const GOOGLE: [u32; 4] = [0x004285F4, 0x00EA4335, 0x00FBBC05, 0x0034A853];
-    let (tip, half, len) = (p.width - 28, 48usize, 80usize);
+    let (tip, half, len) = (p.width - 28, vh, vl);
     for dx in 0..len {
         let reach = half * dx / len;
         let c = GOOGLE[(dx * 4 / len).min(3)];
         for dy in 0..=reach {
-            px(p, tip - dx, VOL_DOWN_Y - dy, c);
-            px(p, tip - dx, VOL_DOWN_Y + dy, c);
+            px(p, tip - dx, vy - dy, c);
+            px(p, tip - dx, vy + dy, c);
         }
     }
 }

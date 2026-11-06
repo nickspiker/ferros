@@ -139,13 +139,14 @@ pub fn show(text: &[u8], cntfrq: u64) -> alloc::vec::Vec<u8> {
     rep
 }
 
-/// A binary ruler, one frame (bridge `display ruler`), for placing what points at the side keys (owner, 2026-11-06: akita's keys sit elsewhere than husky's, and the gate's arrows missed them): every row shows its own number in binary across the width, the most significant bit on the left, white a 1 and black a 0 (row 0 all black, row 1 white in the last bit only). As many bits as the row count needs, each an equal share of the width (akita: 12 bits of 90 px). Reading the row beside a key off a photo gives its position to the pixel, in a form no font or language stands between.
+/// A binary ruler, one frame (bridge `display ruler`), for placing what points at the side keys (owner, 2026-11-06: akita's keys sit elsewhere than husky's, and the gate's arrows missed them): every row shows its own number in binary across the width, the most significant bit on the left, white a 1 and black a 0 (row 0 all black, row 1 white in the last bit only). As many bits as the row count needs, each an equal share of the width (akita: 12 bits of 90 px). Reading the row beside a key off a photo gives its position to the pixel, in a form no font or language stands between. The board's measured key edges (board::keys) are 1 px hairlines across it, power green and the rocker red, to check the measurement against the keys.
 pub fn ruler(cntfrq: u64) -> alloc::vec::Vec<u8> {
     let mut rep = alloc::vec::Vec::new();
     let Some(panel) = adopt(cntfrq, &mut rep) else {
         return rep;
     };
     let (w, rows) = (panel.width, panel.rows);
+    let k = crate::board::keys();
     let bits = usize::BITS as usize - (rows - 1).leading_zeros() as usize;
     for y in 0..rows {
         let row = panel.fb + y * panel.stride * 4;
@@ -153,6 +154,13 @@ pub fn ruler(cntfrq: u64) -> alloc::vec::Vec<u8> {
             let c = if y >> (bits - 1 - i) & 1 != 0 { 0x00FF_FFFF } else { 0 };
             for x in i * w / bits..(i + 1) * w / bits {
                 unsafe { core::ptr::write_volatile((row + x * 4) as *mut u32, c) };
+            }
+        }
+        // The board's key edges as 1 px hairlines across the width (board::keys), to check the measurement against the keys: power green, the rocker red.
+        let hair = if y == k.power.0 || y == k.power.1 { Some(0x0000_FF00) } else if y == k.rocker.0 || y == k.rocker.1 { Some(0x00FF_0000) } else { None };
+        if let Some(hair) = hair {
+            for x in 0..w {
+                unsafe { core::ptr::write_volatile((row + x * 4) as *mut u32, hair) };
             }
         }
     }
