@@ -20,3 +20,7 @@ Status 2026-11-06 midday (all in ferros docs/BOARDS.md):
 - **Hands-free loop works:** `tools/akita-boot.sh --flash-a` boots ferros on slot a (24 s); `ferros-bridge reboot fastboot` lands in fastboot (37 s, commit 8b313b1: the reset scrub faulted on read-only pool pages, husky too). So akita can be driven unattended.
 - **ferros partition carved** (commit e6e5ad0, tools/pixel-carve.sh + tools/flash `ferros-flash`): userdata 32 GiB, ferros LU0 LBA 10838528..=31196154 (77.7 GiB). GPT backups in /mnt/Harbor/tmp/akita-gpt-2026-11-06*/. userdata was wiped (`fastboot -w`): slot b's Android needs setup again, USB debugging, the Magisk app and its Shell grant (init_boot_b is still patched).
 - Not yet: vault on the partition (kernel uses husky's FERROS_BASE_LBA; owner picks akita's ira labels), init/drivers, the AK3B panel at 120 Hz (design-first: knobs inventory vs HK3), the X3 hop, the new kernel on husky.
+Later 2026-11-06:
+- Android on b set up again after the carve, Magisk app reinstalled, Shell granted by hand: root works over adb; Android sees `ferros` as sda35, userdata 32 GB. pKVM came back on with `fastboot -w` and stays on (Android's stock state; ferros boots fine either way).
+- The gate: volume down → slot b active + reset (Android; fastboot is the way back); its marks come from board::keys (akita's side keys measured with `display ruler`, in docs/BOARDS.md "Side keys"); akita's panel does not hold one frame, so the gate keeps DECON triggering for its second.
+- Open bug: on akita, power (screen off) wedges USB until a reboot.
