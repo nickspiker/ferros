@@ -101,8 +101,15 @@ pub fn wait() -> (u64, Choice) {
         crate::checklist::at("gate: panel adopted");
         draw(panel);
         crate::checklist::at("gate: drawn");
+        let from = rep.len();
         panel.present(&mut rep);
         crate::checklist::at("gate: on screen");
+        // What the present reported (frame counts, whether the shadow update was taken), kept for `diag boot`: on akita the gate is on the glass for a fraction of its second (owner, 2026-11-06), and this says whether its frame went out at all.
+        unsafe { GATE_PRESENT = Some(rep[from..].to_vec()) };
+        // akita's panel (AK3B, as ABL leaves it) does not hold a single frame: the one `present` sends goes out (shadow taken, the layer's FRAME_DONE) and the glass showed the gate for about 18 of its 60 frames (owner, 2026-11-06), the gate then answering unseen. DECON is left triggering on the panel's TE for the whole gate, a frame every refresh (62 in the second, measured), and the gate stays up its full second. husky's HK3 holds one frame, as before.
+        if crate::board::akita() {
+            panel.present_nowait();
+        }
     }
     let held_at_arm = crate::killswitch::power_held();
     crate::killswitch::arm_power_key();
@@ -145,6 +152,9 @@ pub fn wait() -> (u64, Choice) {
         let tick = freq / 10;
         unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", "wfi", t = in(reg) tick, c = out(reg) _) };
     }
+    if panel.is_some() {
+        GATE_END_FRAMES.store(crate::display::decon_frames(), core::sync::atomic::Ordering::Relaxed);
+    }
     GATE_HOW.store(how | (held_at_arm as u64) << 8 | (crate::killswitch::power_held() as u64) << 9, core::sync::atomic::Ordering::Relaxed);
     unsafe { core::arch::asm!("msr cnthp_ctl_el2, xzr", "isb") };
     (crate::platform::cntpct(), choice)
@@ -152,6 +162,9 @@ pub fn wait() -> (u64, Choice) {
 
 /// How this kernel's own gate ended, for `diag boot` (checklist.rs): bits 0-7 what answered it (0 the power key's press interrupt, 1 volume down, 2 the dev timer), bit 8 the power key already down when the gate armed, bit 9 the power key down when it answered. Measuring the owner's report of 2026-11-06 on akita, a gate gone in a third of a second where a boot nobody touched waited the full second.
 pub static GATE_HOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The gate's present report (display::Panel::present), and DECON's frame count as the gate answered, for `diag boot`.
+pub static mut GATE_PRESENT: Option<alloc::vec::Vec<u8>> = None;
+pub static GATE_END_FRAMES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// The hv's boot gate (ferros_hv/src/gate.rs) leaves this word in its report page when it hands the machine to ferros: the human has already answered "ferros", so the gate is not shown twice. Read once and cleared, so a later boot that did not come through the hv never sees a stale answer.
 const HV_GATE_MARK_ADDR: usize = 0xA_FFFF_FF10;

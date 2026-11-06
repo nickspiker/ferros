@@ -590,6 +590,11 @@ pub fn boot_times() -> alloc::string::String {
         let h = crate::ready::GATE_HOW.load(Relaxed);
         let by = ["the power key", "volume down", "the dev timer", "?"][(h & 3) as usize];
         s.push_str(&alloc::format!("  gate answered      +A#{} us, by {}{}{}\n", us(p.saturating_sub(e)), by, if h & (1 << 8) != 0 { ", power already down as it armed" } else { "" }, if h & (1 << 9) != 0 { ", power down as it answered" } else { "" }));
+        if let Some(r) = unsafe { (*(&raw const crate::ready::GATE_PRESENT)).as_ref() } {
+            s.push_str("  gate's present: ");
+            s.push_str(&alloc::string::String::from_utf8_lossy(r).replace('\n', " "));
+            s.push_str(&alloc::format!("FRAME_COUNT at the answer={:08X}\n", crate::ready::GATE_END_FRAMES.load(Relaxed)));
+        }
     }
     let mut v: alloc::vec::Vec<(u64, &'static str)> = alloc::vec::Vec::new();
     for (_, items) in GROUPS.iter() {
