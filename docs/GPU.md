@@ -288,15 +288,13 @@ Everything above is built. tapuwae's own `orbit` and `shade` record through valh
 | 16 fine passes | 404 ms | 116 ms |
 
 A keystroke now costs:
-- the handle's parameters: 2.8 ms (CPU, f64, on a worker core);
+- the handle's parameters: 1.55 ms (CPU, f64, on the worker cores; 2.8 ms before J(c)'s address points were split across ahau's three helpers and the mark's thread);
 - the compile: 1.2 ms;
 - the job: 5.9 ms.
 
 The first draw at a size adds the stage, 4.0 ms. Each part is on ahau's console line.
 
 **Still open, toward one 120 Hz frame:**
-- **The parameters.** `j_extent` is half of them: 128 address points × 256 inverse steps in f64. The choices:
-  - split it across the idle helper threads;
-  - or fewer points/steps, which would move every mark's framing (the owner's call).
+- **The parameters.** `j_extent`'s points are now split four ways. What remains is serial: the descent (`classify`) and the sprayed cycles (`cycle_point`, also independent, also splittable). Fewer points or steps would move every mark's framing (the owner's call).
 - **The compile.** Handle-dependent constants are folded at record time, so each keystroke compiles again.
 - **The shading's sin, cos and atan** are still polynomials. Valhall has FSIN_TABLE, FCOS_TABLE, FSINCOS_OFFSET and FATAN_ASSIST/TABLE.
