@@ -561,6 +561,26 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
             crate::process::push_console(alloc::format!("rescue: the vault's {name} replaced by the kernel's known-good capsule ({})\n", if r.is_ok() { "ok" } else { "failed" }).as_bytes());
         }
     }
+    // akita (board.rs): storage-off, no vault and so no init; and every driver process init starts assumes husky's panel, touch and rails. The USB process alone, from the native capsule this kernel carries, so the bridge reaches the device.
+    if crate::board::akita() {
+        #[cfg(ferros_usb_capsule)]
+        match shell_grants(b"usb").map(|g| crate::process::spawn_capsule(b"usb", include_bytes!("../../target/akita-usb.capsule.vsf"), b"", &g, &[])) {
+            Some(Ok(o)) => {
+                mark_ran(&o);
+                crate::process::push_console(b"home: akita, the usb process from the kernel's capsule\n");
+                crate::process::push_console(&o.console);
+            }
+            Some(Err(e)) => {
+                crate::process::push_console(b"home: akita, usb refused: ");
+                crate::process::push_console(e.as_bytes());
+                crate::process::push_console(b"\n");
+            }
+            None => crate::process::push_console(b"home: akita, no usb grants\n"),
+        }
+        #[cfg(not(ferros_usb_capsule))]
+        crate::process::push_console(b"home: akita, but this kernel carries no usb capsule (target/akita-usb.capsule.vsf)\n");
+        return true;
+    }
     // `home.off` in the vault (any value): no shell this boot, so the panel is the bridge's alone — a measurement session (tools/display-profile.sh) must not have the map redraw because an instrument rests on the glass. Removed with `store rm home.off`.
     if store.as_mut().and_then(|s| s.get_by_key("home.off").ok().flatten()).is_some() {
         crate::process::push_console(b"home: off (vault home.off): no shell this boot\n");

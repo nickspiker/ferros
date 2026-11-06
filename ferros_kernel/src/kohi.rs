@@ -104,6 +104,10 @@ const JUMP_POOL_MAGIC: u64 = 0x4C4F_4F50_474E_5254;
 static JUMP_POOL_NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 fn jump_pool_take(out: &mut [u64]) -> bool {
     use core::ptr::{read_volatile, write_volatile};
+    // akita has no hv and no RAM up there (board.rs).
+    if !crate::board::hv_ram() {
+        return false;
+    }
     if unsafe { read_volatile(JUMP_POOL as *const u64) } != JUMP_POOL_MAGIC {
         return false;
     }
@@ -125,6 +129,10 @@ fn jump_pool_take(out: &mut [u64]) -> bool {
 /// The pool's untaken words wiped, and the pool closed (KOHI's gather is done; nothing after it draws from the firmware on the boot path).
 pub fn wipe_jump_pool() {
     use core::ptr::{read_volatile, write_volatile};
+    // akita has no hv and no RAM up there (board.rs).
+    if !crate::board::hv_ram() {
+        return;
+    }
     if unsafe { read_volatile(JUMP_POOL as *const u64) } != JUMP_POOL_MAGIC {
         return;
     }

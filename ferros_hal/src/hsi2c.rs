@@ -63,6 +63,15 @@ pub const PIXEL8_REPEATER_TUNE: [(u8, u8); 8] = [
     (0x79, 0x40), // e_rx_adjust_port1
 ];
 
+/// The Pixel 8a's (akita) repeater tune, from its own device tree (dtbo, the MP board's `repeater_tune1..5`, 2026-11-05): five registers, same bus and address as husky.
+pub const AKITA_REPEATER_TUNE: [(u8, u8); 5] = [
+    (0x50, 0x0A), // eusb_mode_control
+    (0x70, 0x5F), // usb2_tx_adjust_port1
+    (0x71, 0x2E), // usb2_hs_rx_pre_emphasus_p1
+    (0x73, 0x80), // usb2_disconnect_squelch_port1
+    (0x79, 0x40), // eusb_rx_adjust_port1
+];
+
 pub struct Hsi2c {
     base: usize,
 }

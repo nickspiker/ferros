@@ -35,6 +35,13 @@ pub struct VaultProbe {
     pub dvfs: u8,
 }
 
+impl VaultProbe {
+    /// No probe (akita, storage-off until its partitions are backed up; board.rs): no link, nothing opened, the ira not derived (G#300, its devinfo records not read).
+    pub fn none() -> VaultProbe {
+        VaultProbe { link_up: false, opened: 0, verified: 0, sealed: 0, stage: 0, root16: [0; 16], ira_fp: [0; 8], ira_fail: 0x300, ap_tune: [0; 32], asv_nz: false, hpm_nz: false, dvfs: 0 }
+    }
+}
+
 /// The ira-keyed vault on the ferros partition, kept open by the USB service for `ferros.dev.store`.
 /// The kernel's store: manifestus (kvault.rs) since 2026-10-20; ferros_vault's Phase-1 single-file store before.
 pub type ShimStore = crate::kvault::KVault;

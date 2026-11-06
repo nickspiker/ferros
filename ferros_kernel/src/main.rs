@@ -27,6 +27,9 @@ use core::panic::PanicInfo;
 // Pixel 8 Pro (husky) modules shared by both boot paths: platform services, the USB/PT service, display adoption, the ira/wairua sources and the vault probe.
 #[cfg(feature = "pixel8")]
 mod platform;
+// Which board (husky or akita), from ABL's device tree at entry.
+#[cfg(feature = "pixel8")]
+mod board;
 mod settings;
 // Vol Up + Vol Down → power off, as the key-press interrupt itself (KILLSWITCH.md).
 #[cfg(feature = "pixel8")]
@@ -1764,6 +1767,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     }
     // The first word into the pstore ring (no heap, no cache map yet): a session that dies in its first steps (the jumps from Android, 2026-11-01) still shows it began. More marks follow through the early boot. Then whether this boot is the jump from Android, before anything starts a core (platform::start_core). Both were first written into the shim's kernel_main by mistake, so the jumps of 2026-11-02 started parked cores with PSCI.
     platform::pstore(b"\nferros: entry\n");
+    // The board first (board.rs): husky's high RAM is not there on akita, and the next line reads it on husky.
+    board::detect(dtb_addr);
+    platform::pstore(if board::akita() { b"ferros: board akita\n" as &[u8] } else { b"ferros: board husky\n" });
     platform::pstore_prev_handoff();
     platform::mark_trail(0);
     platform::detect_jump();
@@ -1841,11 +1847,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // Apply Google's calibrated repeater tune (the DT repeater_tune* table) before PHY init.
     // ABL does NOT apply it — only the Android driver does — so without this every ferros boot runs the analog path untuned (the leading suspect for the enumeration coin flip).
     // Gated on a positive REV_ID identification: the bus is shared with the PMIC chain, so if the snapshot couldn't identify the repeater we write nothing.
-    // rep_tuned: count of verified tune registers (8 = full success), G#FF = skipped (REV_ID gate).
+    // rep_tuned: count of verified tune registers (8 on husky, 5 on akita = full success), G#FF = skipped (REV_ID gate).
     let rep_tuned: u32 = if rep_snap[0] == 0x3 {
         let i2c = ferros_hal::hsi2c::Hsi2c::new(ferros_hal::hsi2c::PIXEL8_HSI2C11_BASE);
         let mut ok = 0u32;
-        for &(reg, val) in ferros_hal::hsi2c::PIXEL8_REPEATER_TUNE.iter() {
+        let tune: &[(u8, u8)] = if board::akita() { &ferros_hal::hsi2c::AKITA_REPEATER_TUNE } else { &ferros_hal::hsi2c::PIXEL8_REPEATER_TUNE };
+        for &(reg, val) in tune.iter() {
             let addr = ferros_hal::hsi2c::PIXEL8_EUSB_REPEATER_ADDR;
             if i2c.write_reg(addr, reg, val).is_ok() && i2c.read_reg(addr, reg) == Ok(val) {
                 ok += 1;
@@ -1903,7 +1910,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     // UFS: ABL leaves the flash unpowered (cold_ufs::power_on_device); bring the link up, then open the ira-rooted vault on the ferros partition exactly as the handoff path does.
     let t_ufs = platform::cntpct();
-    let link_up = cold_ufs::bring_up();
+    // akita boots storage-off until its per-unit partitions are backed up (board.rs): no power to the flash, so the flash log, the gate's Android switch, the vault, the write protect and the slot mark below all find no link and do nothing.
+    let link_up = !board::akita() && cold_ufs::bring_up();
     checklist::step(checklist::Step::Disk);
     let ufs_ms = (platform::cntpct().wrapping_sub(t_ufs) / (platform::cntfrq() / 1000)) as u32;
     platform::pstore(if link_up { b"ferros: UFS link up\n" as &[u8] } else { b"ferros: UFS link DOWN\n" });
@@ -1932,7 +1940,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         flashlog::line(&alloc::format!("boot cold, flash log init {ok}"));
     }
     checklist::step(checklist::Step::Log);
-    let (probe, mut store) = vault_boot::vault_probe(link_up);
+    // Not on akita: the ira's sources include a read of the flash (devinfo), and with no link that read could wait past the cluster watchdog.
+    let (probe, mut store) = if board::akita() { (vault_boot::VaultProbe::none(), None) } else { vault_boot::vault_probe(link_up) };
     // A power-on has no last length in RAM for the ring's scale: the disk's, now that the vault is open.
     if let Some(doc) = store.as_mut().and_then(|s| s.get_by_key(checklist::SPAN_KEY).ok().flatten()) {
         checklist::span_from_disk(&doc);

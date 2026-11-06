@@ -66,6 +66,13 @@ fn main() {
     if std::env::var("FERROS_RESCUE").is_ok() {
         println!("cargo:rustc-cfg=ferros_rescue");
     }
+    // akita's USB process (board.rs: no vault there yet, so no init and no stored capsule): the kernel carries a native usb capsule when target/akita-usb.capsule.vsf exists (tools/akita-boot.sh makes it from the current usb build), and starts it at home.
+    println!("cargo:rustc-check-cfg=cfg(ferros_usb_capsule)");
+    let usb_capsule = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../target/akita-usb.capsule.vsf");
+    println!("cargo:rerun-if-changed={}", usb_capsule.display());
+    if usb_capsule.exists() {
+        println!("cargo:rustc-cfg=ferros_usb_capsule");
+    }
     // FERROS_PRODUCTION: the "Ready?" gate waits for the power key (dev builds auto-press after two seconds).
     if std::env::var("FERROS_PRODUCTION").is_ok() {
         println!("cargo:rustc-cfg=ferros_production");

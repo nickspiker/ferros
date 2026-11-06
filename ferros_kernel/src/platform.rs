@@ -331,6 +331,10 @@ static JUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::
 
 /// Whether this boot is the jump from a running Android: the hv's gate mark with answer 6, read before `ready::answered_by_hv` takes it (the X3's launch comes first). Called once at entry; `jumped` reads the result.
 pub fn detect_jump() {
+    // akita has no hv and no RAM up there: its 8 GB end at G#A_0000_0000 (board.rs).
+    if !crate::board::hv_ram() {
+        return;
+    }
     let (mark, tel) = unsafe { (read_volatile(0xA_FFFF_FF10usize as *const u64), read_volatile(0xA_FFFF_FF18usize as *const u64)) };
     JUMPED.store(mark == 0x4741_5445_464F_5252 && tel & 0xFF == 6, core::sync::atomic::Ordering::Relaxed);
 }

@@ -147,6 +147,10 @@ const HV_GATE_MARK: u64 = 0x4741_5445_464F_5252; // "GATEFORR"
 pub static GATE_TELEMETRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn answered_by_hv() -> bool {
+    // akita has no hv and no RAM up there (board.rs).
+    if !crate::board::hv_ram() {
+        return false;
+    }
     unsafe {
         let p = HV_GATE_MARK_ADDR as *mut u64;
         let yes = core::ptr::read_volatile(p) == HV_GATE_MARK;
