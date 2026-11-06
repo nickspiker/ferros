@@ -66,6 +66,8 @@ enum Op {
     LoopHead,
     /// The loop's bottom: each phi takes its update, and the loop goes round again while `cont` is set. Its updates are in [`Rec::loops`].
     LoopEnd(u32),
+    /// After the loop's head: an invocation no longer running leaves here, its phis taking the head's outputs (in [`Loop::exits`]), as the CPU's loop returns them; the tail runs only for the ones still going.
+    LoopBreak(u32),
     /// value to *(uniform slot's address + (index << shift) + offset).
     Store { slot: u8, shift: u8, offset: i16, index: u32, value: u32 },
     /// *(uniform slot's address + (index << shift) + offset), 32 bits.
@@ -77,7 +79,7 @@ impl Op {
         use Op::*;
         match *self {
             Const(_) | Gid | LoopHead => {}
-            FNeg(a) | FRcp(a) | FRsq(a) | FFloor(a) | F2U(a) | F2I(a) | U2F(a) | S2F(a) | FrexpE(a, _, _) | FLogd(a) | Phi(a) | LoopEnd(a) => f(a),
+            FNeg(a) | FRcp(a) | FRsq(a) | FFloor(a) | F2U(a) | F2I(a) | U2F(a) | S2F(a) | FrexpE(a, _, _) | FLogd(a) | Phi(a) | LoopEnd(a) | LoopBreak(a) => f(a),
             FAddLscale(a, b) | FExp(a, b) => {
                 f(a);
                 f(b)
@@ -132,18 +134,21 @@ impl Op {
             Phi(_) => "phi",
             LoopHead => "loophead",
             LoopEnd(_) => "loopend",
+            LoopBreak(_) => "loopbreak",
             Store { .. } => "store",
             Load { .. } => "load",
         }
     }
     fn has_value(&self) -> bool {
-        !matches!(self, Op::LoopHead | Op::LoopEnd(_) | Op::Store { .. })
+        !matches!(self, Op::LoopHead | Op::LoopEnd(_) | Op::LoopBreak(_) | Op::Store { .. })
     }
 }
 
 struct Loop {
     /// (phi node, its update node).
     carried: Vec<(u32, u32)>,
+    /// (phi node, the head's output for it): what a leaving invocation's phis take at the break.
+    exits: Vec<(u32, u32)>,
 }
 
 struct Rec {
@@ -553,8 +558,11 @@ pub fn iterate<S: Copy>(max: u32, init: S, head: impl FnOnce(F, S) -> (S, M), ta
     let phis: Vec<u32> = init_ids.iter().map(|&v| push(Op::Phi(v))).collect();
     push(Op::LoopHead);
     let (after_head, running) = head(n, from_ids(&phis));
+    // An invocation that stopped leaves here with the head's state, as the CPU's loop does; the tail then runs only where it goes on (so a lane type with one lane's meaning needs no selects freezing the stopped ones).
+    let exits: Vec<(u32, u32)> = phis.iter().copied().zip(as_ids(&after_head)).collect();
+    push(Op::LoopBreak(running.0));
     let after_tail = tail(n, after_head);
-    // The tail leaves a stopped invocation's state as it was (its own selects on `running`, as tapuwae's several-lane code freezes a stopped lane), so its output is the update: no select here, and no second copy of the state alive to the loop's end (it ran the register file out on the attest mark, 2026-11-05).
+    // Only invocations still running reach the tail, so its output is the update: no select here, and no second copy of the state alive to the loop's end (it ran the register file out on the attest mark, 2026-11-05).
     let updates: Vec<u32> = as_ids(&after_tail);
     let n1 = n + 1.;
     let more = n1.lt(F::splat(max as f32));
@@ -563,7 +571,7 @@ pub fn iterate<S: Copy>(max: u32, init: S, head: impl FnOnce(F, S) -> (S, M), ta
     carried.push((n.0, n1.0));
     carried.extend(phis.iter().copied().zip(updates));
     let r = rec();
-    r.loops.push(Loop { carried });
+    r.loops.push(Loop { carried, exits });
     push(Op::LoopEnd(cont.0));
     from_ids(&phis)
 }
@@ -662,12 +670,12 @@ pub fn compile() -> Compiled {
     // Dead code: live from the stores, the loop ends' conditions and every loop's state, backwards.
     let mut keep = alloc::vec![false; n];
     for (i, op) in nodes.iter().enumerate() {
-        if matches!(op, Op::Store { .. } | Op::LoopHead | Op::LoopEnd(_)) {
+        if matches!(op, Op::Store { .. } | Op::LoopHead | Op::LoopEnd(_) | Op::LoopBreak(_)) {
             keep[i] = true;
         }
     }
     for l in &rec.loops {
-        for &(phi, upd) in &l.carried {
+        for &(phi, upd) in l.carried.iter().chain(&l.exits) {
             keep[phi as usize] = true;
             keep[upd as usize] = true;
         }
@@ -692,7 +700,48 @@ pub fn compile() -> Compiled {
             Op::LoopHead => head_at = Some(i),
             Op::LoopEnd(_) => {
                 let h = head_at.take().expect("valhall::ssa: a loop end without its head");
+                let brk = (h..i).find(|&j| matches!(nodes[j], Op::LoopBreak(_))).expect("valhall::ssa: a loop without its break");
+                // The head's outputs live to the break, where a leaving invocation's phis take them. The break writes the phis' registers for every invocation there, so a phi the head changed must not be read after it (the tail sees the head's output instead).
+                for &(phi, out) in &rec.loops[loop_no].exits {
+                    last[out as usize] = last[out as usize].max(brk);
+                    if out != phi {
+                        for j in brk + 1..i {
+                            if keep[j] {
+                                nodes[j].sources(|s| assert!(s != phi, "valhall::ssa: the tail reads a phi the head changed (node {phi} at {j})"));
+                            }
+                        }
+                    }
+                }
+                // A head output may take its phi's register when the phi is not read again after it is written (x², y², |z|² in tapuwae's orbit: the head works them out from z and nothing reads the old ones): the break's copy is then nothing. Not when the node is any other field's value too.
+                let mut head_took = alloc::vec![false; rec.loops[loop_no].exits.len()];
+                for (e, &(phi, out)) in rec.loops[loop_no].exits.iter().enumerate() {
+                    let o = out as usize;
+                    if out == phi || o <= h || o >= brk || is_const(out) || coalesce[o].is_some() {
+                        continue;
+                    }
+                    let shared = rec.loops[loop_no].exits.iter().filter(|x| x.1 == out).count() > 1 || rec.loops[loop_no].carried.iter().any(|&(p, u)| u == out && p != phi);
+                    let mut inner = h;
+                    for j in h..i {
+                        if keep[j] {
+                            nodes[j].sources(|s| {
+                                if s == phi {
+                                    inner = j;
+                                }
+                            });
+                        }
+                    }
+                    if !shared && inner <= o {
+                        coalesce[o] = Some(phi);
+                        head_took[e] = true;
+                    }
+                }
                 for &(phi, upd) in &rec.loops[loop_no].carried {
+                    // A phi whose head output holds its register: its update shares it only by being that same node.
+                    if rec.loops[loop_no].exits.iter().zip(&head_took).any(|(x, &t)| t && x.0 == phi) {
+                        last[phi as usize] = last[phi as usize].max(i);
+                        last[upd as usize] = last[upd as usize].max(i);
+                        continue;
+                    }
                     // The phi's last read inside the loop, before it is stretched to the end: its update may take its register after it (coalescing).
                     let mut inner = h;
                     for j in h..i {
@@ -706,7 +755,8 @@ pub fn compile() -> Compiled {
                     }
                     // A phi that is another field's update is read again by the loop's end copies, after every update is written: its own update may not take its register then.
                     let read_at_end = rec.loops[loop_no].carried.iter().any(|&(p, u)| u == phi && p != phi);
-                    if upd != phi && (upd as usize) > h && (upd as usize) < i && !is_const(upd) && inner <= upd as usize && !read_at_end {
+                    // Only an update written after the break: the break's copies write the phis' registers.
+                    if upd != phi && (upd as usize) > brk && (upd as usize) < i && !is_const(upd) && inner <= upd as usize && !read_at_end {
                         coalesce[upd as usize] = Some(phi);
                     }
                     last[phi as usize] = last[phi as usize].max(i);
@@ -854,6 +904,7 @@ pub fn compile() -> Compiled {
     let mut k: Box<Kernel<16384>> = unsafe { Box::<Kernel<16384>>::new_zeroed().assume_init() };
     let (mut loop_consts, mut loop_start, mut loop_words) = (0usize, 0usize, 0usize);
     let mut top = None;
+    let mut exit: Option<Label> = None;
     let mut loop_no = 0usize;
     for (i, op) in nodes.iter().enumerate() {
         if !keep[i] || is_const(i as u32) {
@@ -1016,41 +1067,25 @@ pub fn compile() -> Compiled {
                 top = Some(k.here());
                 loop_start = k.len();
             }
+            Op::LoopBreak(running) => {
+                // An invocation no longer running leaves with the head's state: the phis take the head's outputs (for every invocation here: the tail reads the head's outputs, never a phi the head changed), then the stopped ones branch out, to wait at the loop's exit for the rest (reconverge: the block ends in a conditional branch, va_insert_flow.c).
+                let ex = &rec.loops[loop_no].exits;
+                let moves = ex.iter().filter(|&&(_, o)| !is_const(o)).map(|&(p, o)| (reg[p as usize], reg[o as usize])).collect();
+                let consts: Vec<(u8, u32)> = ex.iter().filter_map(|&(p, o)| if let Op::Const(bits) = nodes[o as usize] { Some((reg[p as usize], bits)) } else { None }).collect();
+                parallel_copy(&mut k, moves, &consts);
+                let out = k.label();
+                k.branchz_eq(rr(running), out).reconverge();
+                exit = Some(out);
+            }
             Op::LoopEnd(cont) => {
-                // The phis take their updates all at once (a parallel copy): an update can be another field's phi (a fold handing back a node already recorded), so a copy waits until no other pending copy still reads its register, and a ring of them goes through the scratch register. Constants last, as nothing reads them from a register.
-                let mut moves: Vec<(u8, u8)> = Vec::new();
-                for &(phi, upd) in &rec.loops[loop_no].carried {
-                    if !is_const(upd) && reg[upd as usize] != reg[phi as usize] {
-                        let (d, s) = (reg[phi as usize], reg[upd as usize]);
-                        // Two fields with one phi register would be an allocation bug.
-                        assert!(!moves.iter().any(|m| m.0 == d), "valhall::ssa: two loop copies into r{d}");
-                        moves.push((d, s));
-                    }
-                }
-                while !moves.is_empty() {
-                    match moves.iter().position(|&(d, _)| !moves.iter().any(|&(_, s)| s == d)) {
-                        Some(j) => {
-                            let (d, s) = moves.remove(j);
-                            k.mov_i32(r(d), r(s));
-                        }
-                        None => {
-                            // A ring: park one destination's old value, which its readers then take from the scratch register.
-                            let d = moves[0].0;
-                            k.mov_i32(r(SCRATCH), r(d));
-                            for m in moves.iter_mut() {
-                                if m.1 == d {
-                                    m.1 = SCRATCH;
-                                }
-                            }
-                        }
-                    }
-                }
-                for &(phi, upd) in &rec.loops[loop_no].carried {
-                    if let Op::Const(bits) = nodes[upd as usize] {
-                        k.iadd_imm_i32(r(reg[phi as usize]), Lut::ZERO, bits);
-                    }
-                }
+                // The phis take their updates all at once.
+                let ca = &rec.loops[loop_no].carried;
+                let moves = ca.iter().filter(|&&(_, u)| !is_const(u)).map(|&(p, u)| (reg[p as usize], reg[u as usize])).collect();
+                let consts: Vec<(u8, u32)> = ca.iter().filter_map(|&(p, u)| if let Op::Const(bits) = nodes[u as usize] { Some((reg[p as usize], bits)) } else { None }).collect();
+                parallel_copy(&mut k, moves, &consts);
                 k.branchz(rr(cont), top.take().expect("valhall::ssa: loop end without head")).reconverge();
+                // The stopped invocations wait here for the rest.
+                k.bind(exit.take().expect("valhall::ssa: loop end without its break"));
                 loop_words += k.len() - loop_start;
                 loop_no += 1;
             }
@@ -1089,6 +1124,36 @@ pub fn compile() -> Compiled {
     Compiled { words, regs64, nodes: n, kept, peak, loop_words, loop_consts, consts, kinds }
 }
 
+
+/// Registers taking new values all at once (a parallel copy): each (destination, source) pair, then each (destination, constant). A copy waits until no other pending copy still reads its destination, and a ring of them goes through the scratch register; constants last, as nothing reads them from a register. Used where a loop's phis take their values: a value can be another field's phi (a fold handing back a node already recorded).
+fn parallel_copy(k: &mut Kernel<16384>, mut moves: Vec<(u8, u8)>, consts: &[(u8, u32)]) {
+    for (j, m) in moves.iter().enumerate() {
+        // Two values into one register would be an allocation bug.
+        assert!(!moves[..j].iter().any(|o| o.0 == m.0), "valhall::ssa: two loop copies into r{}", m.0);
+    }
+    moves.retain(|m| m.0 != m.1);
+    while !moves.is_empty() {
+        match moves.iter().position(|&(d, _)| !moves.iter().any(|&(_, s)| s == d)) {
+            Some(j) => {
+                let (d, s) = moves.remove(j);
+                k.mov_i32(r(d), r(s));
+            }
+            None => {
+                // A ring: park one destination's old value, which its readers then take from the scratch register.
+                let d = moves[0].0;
+                k.mov_i32(r(SCRATCH), r(d));
+                for m in moves.iter_mut() {
+                    if m.1 == d {
+                        m.1 = SCRATCH;
+                    }
+                }
+            }
+        }
+    }
+    for &(d, bits) in consts {
+        k.iadd_imm_i32(r(d), Lut::ZERO, bits);
+    }
+}
 /// Whether an instruction form already reads the LUT's zero itself (a multiply's −0 addend, a negation's, a compare's `or`, the shift group's shift or second operand): it counts against the FAU's two words.
 fn fixed_zero(op: &Op) -> bool {
     matches!(op, Op::FMul(..) | Op::FNeg(_) | Op::FCmp(..) | Op::And(..) | Op::Or(..) | Op::Xor(..) | Op::Shl(..) | Op::Shr(..))
