@@ -1919,7 +1919,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     // UFS: ABL leaves the flash unpowered (cold_ufs::power_on_device); bring the link up, then open the ira-rooted vault on the ferros partition exactly as the handoff path does.
     let t_ufs = platform::cntpct();
-    // akita too since its per-unit partitions are backed up (2026-11-06, /mnt/Harbor/tmp/akita-backup-2026-11-06): the link for its flash log in `klog`. Its vault, write protect, slot mark and the gate's Android switch stay off (board.rs).
+    // akita too since its per-unit partitions are backed up (2026-11-06, /mnt/Harbor/tmp/akita-backup-2026-11-06): the link for its flash log in `klog`. Its vault, write protect and slot mark stay off (board.rs); the gate's Android choice switches it to slot b.
     let link_up = cold_ufs::bring_up();
     checklist::step(checklist::Step::Disk);
     board::probe(42);
@@ -1929,6 +1929,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         checklist::mark(checklist::Item::Disk);
     }
     // The gate chose Android: the moment the disk answers (set-active needs devinfo and the boot LU attribute, nothing of the vault) — slot a active, then a plain reset; the bootloader boots slot a, whose hv gate takes the one-shot marker and goes to Android. The way back is a reboot: slot a's gate asks again (1 s on dev builds) and boots the ferros packed into it (tools/husky-cold.sh keeps that copy current). Android cannot boot from slot b's own partitions (product_b is empty), which is why the choice is a slot switch and not a chainload.
+    // akita has no hv and keeps Android on slot b, untouched (ferros on slot a, tools/akita-boot.sh): the choice is slot b active, then the reset. With no gate in front of Android there, the way back to ferros is fastboot (`--set-active=a`, or akita-boot.sh). Its devinfo has husky's layout (header, slot words at G#30, the flags read back as husky's measured meanings after a set-active to a: a G#0401, b G#0A02; 2026-11-06).
+    if gate_choice == ready::Choice::Android && link_up && board::akita() {
+        if slot::set_active(1) == slot::MARKED {
+            platform::crumb(0xC7);
+            platform::reboot();
+        }
+        checklist::suffix(checklist::Item::Slot, b"android: set-active failed");
+    }
     if gate_choice == ready::Choice::Android && link_up && !board::akita() {
         // Tell slot a's gate (ferros_hv/src/gate.rs) to answer "Android" this once instead of asking again and auto-choosing ferros after a second, as `diag android` does; cleaned to DRAM, since the gate reads it with the caches off. Every later boot of slot a asks again, so a reboot from Android lands on the gate and, untouched, on ferros (owner, 2026-10-22: never stuck in Android).
         unsafe {

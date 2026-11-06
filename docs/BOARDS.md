@@ -34,7 +34,7 @@ The phone itself, 2026-11-05: bootloader akita-17.0-15199481, baseband g5300o-26
 ## How akita boots for now
 
 Storage-off until 2026-11-06, when its per-unit partitions were backed up (below); since then the UFS link comes up for the flash log in `klog`, and the rest stays off:
-- the UFS link and the flash log in `klog`, but no vault, no write protect, no slot mark, no Android switch from the gate;
+- the UFS link and the flash log in `klog`, but no vault, no write protect, no slot mark; the gate's Android choice (volume down) makes slot b active and resets into its Android (since 2026-11-06, devinfo checked to have husky's layout), and fastboot is the way back;
 - no ira (its sources include a devinfo read);
 - no init: every driver process assumes husky's panel, touch and rails. The kernel starts the usb process itself, from a native capsule it carries (`target/akita-usb.capsule.vsf`, made by `tools/akita-boot.sh`).
 
@@ -49,7 +49,7 @@ ferros enumerates on akita (1209:4665) and answers the bridge: `diag`, `diag con
 3. **"The kernel's core" follows the hop** (`process::kernel_mask`): it was the X3 always, so with the kernel on CPU0 a thread pinned to big waited for a core that never started, and every `SYS_POWER` was refused. The same flaw broke husky's `FERROS_X3=0`.
 4. **No ira, no ihi**: akita has no vault yet, so no ira and no oracle secret, and `spawn_capsule` refused the usb capsule. `spawn_capsule_no_ihi` checks the signature and runs native code without an ihi (masked code and production builds still refused).
 5. **A build that did not build**: `x3::local`'s `.rept 64` asm, inlined into `service::run`, threw off LLVM's branch relaxation, and one `tbnz` landed out of its ±32 KiB range ("fixup value out of range") in some builds. `x3::local` is never inlined now.
-6. **Storage on**: the cold UFS link comes up on akita (45 ms) and its GPT reads. The flash log goes to akita's `klog` partition (LU 0, LBA 32774..=36869, found through the GPT, never husky's fixed place), and the processes' console lines follow it there. Read it back from Android with `dd if=/dev/block/by-name/klog`. Vault, write protect, slot mark and the gate's Android switch stay off on akita.
+6. **Storage on**: the cold UFS link comes up on akita (45 ms) and its GPT reads. The flash log goes to akita's `klog` partition (LU 0, LBA 32774..=36869, found through the GPT, never husky's fixed place), and the processes' console lines follow it there. Read it back from Android with `dd if=/dev/block/by-name/klog`. Vault, write protect and slot mark stay off on akita.
 
 What does not work as a channel on akita:
 - `fastboot boot`: ABL says "Booting" and stays in fastboot.
