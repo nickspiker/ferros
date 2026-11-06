@@ -75,6 +75,25 @@ fn spring(x0: f64, v0: f64, t: i32) -> (f64, f64) {
     ((x0 + a * t) * e, (v0 - SPRING * a * t) * e)
 }
 
+/// The friction on a fling, the plane's pan and a page's scroll alike: true, the owner's pixel a frame per frame that fades out as the fling stops (f = −v/√(1 + v²): 1 at any real speed, so the same reach, v²/2, and easing to nothing at the stop, the algebraic sigmoid, so the stop has no kink); false, the pixel a frame per frame exactly (owner, 2026-11-05), which stops dead (owner, 2026-11-06: "let's try b, but I'ma think we'll go for a at the end"; tried, b was "too slippery" — its friction fades with the speed, so the last pixels creep on — "let's go with a").
+const FRICTION_FADES: bool = false;
+
+/// One display frame of a fling at speed `v` (pixels a frame, signed): how far it goes and its speed after. Fading, the frame integrated in sixteen steps; at rest once under a sixteenth of a pixel a frame, when all it has left to go is under a sixteenth of a pixel.
+fn coast(v: f64) -> (f64, f64) {
+    if FRICTION_FADES {
+        const SUB: i32 = 1 << 4;
+        let dt = 1. / SUB as f64;
+        let (mut v, mut d) = (v, 0.);
+        for _ in 0..SUB {
+            d += v * dt;
+            v -= dt * v / libm::sqrt(1. + v * v);
+        }
+        (d, if v.abs() < 1. / 16. { 0. } else { v })
+    } else {
+        (v, if v.abs() <= 1. { 0. } else { v - v.signum() })
+    }
+}
+
 /// A camera flight in progress (`Map::fly`): where each part of the camera stood from the target when it began, in the space it looks even in — the centre's world offset (×256), the zoom's natural logarithm against the target's, the turn's angle from the target's in radians — each part's speed then (a display frame), and the frames since.
 #[derive(Clone, Copy)]
 struct Flight {
@@ -330,11 +349,16 @@ struct Map {
     view: View,
     /// The settings' tappable places, as laid out by the last frame: (left, right, top, bottom, what).
     rows: [(i64, i64, i64, i64, Choice); 32],
-    /// The settings page on show; the strip's offset from it in pixels (positive: dragged right, the page before it coming in), kept within half a screen by moving `page` as it passes; how far the page is scrolled up; and the fling still carrying it, pixels a frame, losing one a frame.
+    /// The settings page on show; the strip's offset from it in pixels (positive: dragged right, the page before it coming in), kept within half a screen by moving `page` as it passes; how far the page is scrolled up; and the fling still carrying it (pixels a frame, under `coast`'s friction), with the fraction of a pixel it has gone past its last whole one.
     page: usize,
     page_dx: i64,
     scroll: i64,
-    fling: i64,
+    fling: f64,
+    fling_res: f64,
+    /// The plane under one finger: the last three frames' movements on the panel, whether this touch panned it, and its fling once the finger lifts: (direction x, direction y, speed in pixels a frame, the sub-pixel left over x, y).
+    pans: [(i64, i64); 3],
+    panned: bool,
+    pan: Option<(f64, f64, f64, f64, f64)>,
     /// Each page's content height as last laid out, for how far it scrolls.
     page_h: [i64; 8],
     /// The drag on the settings: which way it is locked (0 not yet, 1 across, 2 up and down), where the strip and the scroll stood at the touch, and the last three frames' movements up and down.
@@ -1246,27 +1270,43 @@ impl Map {
         if self.swipe == 2 {
             let m = self.dys.iter().map(|d| d.abs()).max().unwrap_or(0);
             let last = self.dys.iter().rev().find(|&&d| d != 0).copied().unwrap_or(0);
-            self.fling = -last.signum() * m;
+            self.fling = -(last.signum() * m) as f64;
         }
         self.swipe = 0;
-        self.settling = self.page_dx != 0 || self.fling != 0 || self.spring.is_some();
+        self.settling = self.page_dx != 0 || self.fling != 0. || self.spring.is_some();
     }
 
-    /// One display frame of the motion after a finger lifted or a tap (owner, 2026-11-05): the camera's flight (`step_cam`), and the settings' — the strip's offset from its page halves, floored toward 0 so it lands there in a few frames (½, ¾, ⅞ of the way…); the fling carries the page by its speed and loses a pixel a frame. Returns whether anything is still moving.
+    /// One display frame of the motion after a finger lifted or a tap (owner, 2026-11-05: frame-counted): the camera's flight (`step_cam`), the settings' strip on its spring (`step_strip`), and the flings — a page's scroll and the plane's pan — carried by their speed under `coast`'s friction, whole pixels moved and the fraction kept for the next frame. Returns whether anything is still moving.
     fn step(&mut self) -> bool {
         self.step_strip();
-        if self.fling != 0 {
+        if self.fling != 0. {
             let max = self.scroll_max(self.page);
-            self.scroll += self.fling;
-            self.fling -= self.fling.signum();
+            let (d, v) = coast(self.fling);
+            self.fling_res += d;
+            let whole = libm::trunc(self.fling_res);
+            self.fling_res -= whole;
+            self.scroll += whole as i64;
+            self.fling = v;
             // WHY: the page's ends stop the fling; past them there is nothing to show.
             if self.scroll < 0 || self.scroll > max {
                 self.scroll = self.scroll.clamp(0, max);
-                self.fling = 0;
+                self.fling = 0.;
             }
         }
+        if let Some((ux, uy, v, rx, ry)) = self.pan {
+            let (d, v) = coast(v);
+            let (rx, ry) = (rx + ux * d, ry + uy * d);
+            let (ix, iy) = (libm::trunc(rx), libm::trunc(ry));
+            if ix != 0. || iy != 0. {
+                let (wx, wy) = self.cam.delta(ix as i64, iy as i64);
+                self.cam.x -= wx;
+                self.cam.y -= wy;
+                self.keep_on_screen();
+            }
+            self.pan = if v == 0. { None } else { Some((ux, uy, v, rx - ix, ry - iy)) };
+        }
         let flying = self.step_cam();
-        self.page_dx != 0 || self.fling != 0 || self.spring.is_some() || flying
+        self.page_dx != 0 || self.fling != 0. || self.spring.is_some() || self.pan.is_some() || flying
     }
 
     /// A tap: one finger or two, at a panel point. Logged with what it did, so a session can be followed from `diag console`.
@@ -1371,7 +1411,7 @@ impl Map {
                         self.page = self.wrap(self.page as isize + k as isize);
                         self.page_dx += k as i64 * self.w;
                         self.scroll = 0;
-                        self.fling = 0;
+                        self.fling = 0.;
                         self.spring = None;
                         self.settling = true;
                         self.frame_seen = None;
@@ -1436,7 +1476,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         page: 0,
         page_dx: 0,
         scroll: 0,
-        fling: 0,
+        fling: 0.,
+        fling_res: 0.,
+        pans: [(0, 0); 3],
+        panned: false,
+        pan: None,
         page_h: [0; 8],
         swipe: 0,
         drag_base: (0, 0),
@@ -1705,7 +1749,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.dys = [0; 3];
             map.dxs = [0; 3];
             map.spring = None;
-            map.fling = 0;
+            map.fling = 0.;
+            map.pans = [(0, 0); 3];
+            map.panned = false;
+            map.pan = None;
             map.settling = map.target.is_some();
         }
         if down {
@@ -1730,6 +1777,17 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 // Caught mid-snap and let go without a drag: it goes on settling.
                 map.settling = true;
                 map.frame_seen = Some(frame_count);
+            }
+            // The plane panned by one finger lifted: it goes on the way the finger last went, at the largest of its last three frames' movements, as a page's scroll does (owner, 2026-11-06). A finger that had stopped before lifting leaves no fling.
+            if map.view == View::Map && map.panned && map.target.is_none() {
+                let len = |p: (i64, i64)| libm::sqrt((p.0 * p.0 + p.1 * p.1) as f64);
+                let m = map.pans.iter().map(|&p| len(p)).fold(0., f64::max);
+                if let Some(&last) = map.pans.iter().rev().find(|p| **p != (0, 0)) {
+                    let l = len(last);
+                    map.pan = Some((last.0 as f64 / l, last.1 as f64 / l, m, 0., 0.));
+                    map.settling = true;
+                    map.frame_seen = Some(frame_count);
+                }
             }
             // A pinch on the open page lifted: its scale is the device's from now (preference 14, kept in the vault by the kernel), once, not every frame of the pinch.
             map.pinch = None;
@@ -1826,10 +1884,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     push_us += ferros_sys::us_since(t_p);
                     scene_moved = true;
                 } else {
-                    // One finger from the air: the plane follows it.
+                    // One finger from the air: the plane follows it, its last three frames' movements kept for the fling.
                     map.cam.x -= dx;
                     map.cam.y -= dy;
                     map.keep_on_screen();
+                    map.pans = [map.pans[1], map.pans[2], (cur[id].1 - prev[id].1, cur[id].2 - prev[id].2)];
+                    map.panned = true;
                 }
             } else if nb == 2 {
                 let (a, b) = (both[0], both[1]);
@@ -1929,6 +1989,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.settling = moving;
             if steps > 0 {
                 map.draw();
+            }
+            // Come to rest after the lift (a fling, a flight): the view into the vault if it moved, as the lift does for what the fingers left.
+            if !moving && map.cam != saved_view && map.save_view() {
+                saved_view = map.cam;
             }
         }
     }
