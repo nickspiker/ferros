@@ -214,26 +214,36 @@ fn px(p: &Panel, x: usize, y: usize, c: u32) {
     }
 }
 
+/// husky's side keys in panel rows, top and bottom inclusive, measured by the owner with the kernel's `display ruler` (2026-11-06; ferros_kernel board::keys holds the same, docs/BOARDS.md "Side keys").
+const POWER_KEY: (usize, usize) = (933, 1124);
+const ROCKER: (usize, usize) = (1279, 1660);
+
+/// The marks as ferros's ready.rs `marks` makes them: (centre row, half height, length) of the power triangle, centred on the power key and as tall as it, and of the volume-down chevron, its tip on the rocker's bottom edge and a quarter of the rocker tall.
+fn marks() -> ((usize, usize, usize), (usize, usize, usize)) {
+    let ph = (POWER_KEY.1 - POWER_KEY.0) / 2;
+    let vh = (ROCKER.1 - ROCKER.0) / 8;
+    (((POWER_KEY.0 + POWER_KEY.1) / 2, ph, ph * 14 / 9), (ROCKER.1, vh, vh * 5 / 3))
+}
+
 /// The same picture as ferros's ready.rs.
 fn draw(p: &Panel) {
-    const POWER_Y: usize = 1050;
-    const VOL_DOWN_Y: usize = 1700;
-    let (tip, half, len) = (p.width - 28, 90usize, 140usize);
+    let ((py, ph, pl), (vy, vh, vl)) = marks();
+    let (tip, half, len) = (p.width - 28, ph, pl);
     for dx in 0..len {
         let reach = half * dx / len;
         for dy in 0..=reach {
-            px(p, tip - dx, POWER_Y - dy, 0x0000_FF00);
-            px(p, tip - dx, POWER_Y + dy, 0x0000_FF00);
+            px(p, tip - dx, py - dy, 0x0000_FF00);
+            px(p, tip - dx, py + dy, 0x0000_FF00);
         }
     }
     const GOOGLE: [u32; 4] = [0x004285F4, 0x00EA4335, 0x00FBBC05, 0x0034A853];
-    let (tip, half, len) = (p.width - 28, 48usize, 80usize);
+    let (tip, half, len) = (p.width - 28, vh, vl);
     for dx in 0..len {
         let reach = half * dx / len;
         let c = GOOGLE[(dx * 4 / len).min(3)];
         for dy in 0..=reach {
-            px(p, tip - dx, VOL_DOWN_Y - dy, c);
-            px(p, tip - dx, VOL_DOWN_Y + dy, c);
+            px(p, tip - dx, vy - dy, c);
+            px(p, tip - dx, vy + dy, c);
         }
     }
     unsafe { asm!("dsb sy") };
@@ -241,8 +251,7 @@ fn draw(p: &Panel) {
 
 /// The gate's two marks off: the rectangles ferros's ready.rs `erase` clears. Holding volume up at the gate takes them off before the press (owner, 2026-11-05: a clean screen to film the whole boot).
 fn erase_marks(p: &Panel) {
-    const POWER_Y: usize = 1050;
-    const VOL_DOWN_Y: usize = 1700;
+    let ((py, ph, pl), (vy, vh, vl)) = marks();
     let rect = |xa: usize, ya: usize, xb: usize, yb: usize| {
         for y in ya..yb {
             for x in xa..xb {
@@ -251,8 +260,8 @@ fn erase_marks(p: &Panel) {
         }
     };
     let tip = p.width - 28;
-    rect(tip - 140, POWER_Y - 91, tip + 1, POWER_Y + 92);
-    rect(tip - 80, VOL_DOWN_Y - 49, tip + 1, VOL_DOWN_Y + 50);
+    rect(tip - pl, py - ph - 1, tip + 1, py + ph + 2);
+    rect(tip - vl, vy - vh - 1, tip + 1, vy + vh + 2);
     unsafe { asm!("dsb sy") };
 }
 

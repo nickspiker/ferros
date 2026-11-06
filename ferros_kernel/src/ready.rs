@@ -6,7 +6,7 @@
 //!
 //! Dev builds proceed as if pressed after one second, so unattended loops keep working and every line after the gate is the same code — unless a volume key goes down during that second, which cancels the timer: the gate then waits for the power key like a production build (FERROS_PRODUCTION set at build time), which always waits. There is no remote press: USB does not exist before the press.
 
-/// The gate's two marks from the board's measured keys (board::keys): (centre row, half height, length) of the power triangle, as tall as the power key, centred on the power key and as tall as it, and of the volume-down chevron, its tip on the rocker's bottom edge (owner, 2026-11-06: "the arrow tip touches the bottom of the vol rocker") and a quarter of the rocker tall. The proportions are husky's marks placed by eye (a 90-high half and 140 long; 48 and 80), which its provisional spans reproduce exactly.
+/// The gate's two marks from the board's measured keys (board::keys): (centre row, half height, length) of the power triangle, as tall as the power key, centred on the power key and as tall as it, and of the volume-down chevron, its tip on the rocker's bottom edge (owner, 2026-11-06: "the arrow tip touches the bottom of the vol rocker") and a quarter of the rocker tall. The proportions are those of husky's marks first placed by eye (a 90-high half and 140 long; 48 and 80).
 fn marks() -> ((usize, usize, usize), (usize, usize, usize)) {
     let k = crate::board::keys();
     let ph = (k.power.1 - k.power.0) / 2;
