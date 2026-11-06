@@ -8,7 +8,10 @@ use crate::platform::{crumb, LAST_CRUMB, RAMOOPS_RESULT, RESULT_MAGIC};
 const UFS_BASE: usize = 0x1320_0000;
 
 /// Display fingerprints: the first 64 bits of BLAKE3 derive_key under a context of their own, so a fingerprint is one-way and matches no other hash of the same secret anywhere.
-const IRA_FP_CONTEXT: &str = "ferros husky 2026-10-14 ira display fingerprint v1";
+/// The ira's, one per board as the ira's own context is (ira.rs `ira_context`).
+fn ira_fp_context() -> &'static str {
+    if crate::board::akita() { "ferros akita 2026-11-06 ira display fingerprint v0" } else { "ferros husky 2026-10-14 ira display fingerprint v1" }
+}
 
 fn fingerprint(context: &str, secret: &[u8; 32]) -> [u8; 8] {
     let mut fp = [0u8; 8];
@@ -59,7 +62,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
         crate::ira::keep_ira(&mut i);
     }
     let ira_fail = ira.err().unwrap_or(0);
-    let ira_fp = ira.map(|i| fingerprint(IRA_FP_CONTEXT, &i)).unwrap_or([0u8; 8]);
+    let ira_fp = ira.map(|i| fingerprint(ira_fp_context(), &i)).unwrap_or([0u8; 8]);
     crumb(0xC1); // ira derived (or refused)
     crate::platform::pstore(b"ferros: ira derived (or refused)\n");
 

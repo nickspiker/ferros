@@ -7,11 +7,11 @@ use alloc::vec::Vec;
 use ferros_hal::ufs::UfsController;
 
 const UFS_BASE: usize = 0x1320_0000;
-/// husky's place for the log (the ferros partition from 1 GiB in), and its length in blocks.
-const BASE: u32 = crate::ufs_device::FERROS_BASE_LBA + 262_144;
+/// The log's place in the ferros partition (from 1 GiB in, `ufs_device::part`), and its length in blocks.
+const OFFSET: u32 = 262_144;
 const BLOCKS: u32 = 16_384;
-/// Where the log is on this boot: (LU, first block, blocks). husky's place unless `init_in` names another (akita's `klog` partition, board.rs).
-static mut REGION: (u8, u32, u32) = (0, BASE, BLOCKS);
+/// Where the log is on this boot: (LU, first block, blocks), set by `init` (the ferros partition) or `init_in` (akita's `klog` partition, board.rs).
+static mut REGION: (u8, u32, u32) = (0, 0, 0);
 fn lun() -> u8 {
     unsafe { REGION.0 }
 }
@@ -59,14 +59,22 @@ fn write_header(s: &State) -> bool {
     write(base(), &h)
 }
 
-/// Open the log (creating it if the header is missing) and count this boot. Call once, after the UFS link is up.
-/// Open the log in another place (akita's `klog` partition, found in its GPT: board.rs), then as `init`.
+/// Open the log at (LU, first block, blocks): akita's `klog` partition (found in its GPT: board.rs), or the ferros partition's place (`init`). Call once, after the UFS link is up.
 pub fn init_in(lun: u8, first: u32, blocks: u32) -> bool {
     unsafe { REGION = (lun, first, blocks) };
-    init()
+    open()
 }
 
+/// Open the log in the ferros partition, once `ufs_device::locate` found it; no partition (or one too small for it), no log.
 pub fn init() -> bool {
+    match crate::ufs_device::part() {
+        Some((first, blocks)) if blocks >= OFFSET + BLOCKS => init_in(0, first + OFFSET, BLOCKS),
+        _ => false,
+    }
+}
+
+/// Open the log where `REGION` says (creating it if the header is missing) and count this boot.
+fn open() -> bool {
     let mut h = [0u8; 4096];
     if !read(base(), &mut h) {
         return false;

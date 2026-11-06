@@ -23,6 +23,26 @@ pub const FERROS_BASE_LBA: u32 = 28_881_920;
 pub const FERROS_LAST_LBA: u32 = 62_436_346;
 pub const FERROS_BLOCKS: u32 = FERROS_LAST_LBA - FERROS_BASE_LBA + 1; // 33_554_427
 
+/// The ferros partition as this device's GPT names it (`locate`): first LBA << 32 | blocks, on LU 0; 0 until found. The vault and the flash log take their places from it, so on akita (whose partition is elsewhere and smaller, docs/BOARDS.md) nothing lands at husky's numbers, which run past akita's last LBA into its backup GPT.
+static PART: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Find the ferros partition by name once the link is up. husky's was carved (2026-08) at the place everything there was written to, the constants above: there the GPT must agree with them, or nothing is opened anywhere new. Returns whether it is known now.
+pub fn locate() -> bool {
+    let Some(p) = crate::partfs::find("ferros") else { return false };
+    let (base, blocks) = (p.first as u32, (p.last - p.first + 1) as u32);
+    if p.lun != 0 || (!crate::board::akita() && (base != FERROS_BASE_LBA || blocks != FERROS_BLOCKS)) {
+        return false;
+    }
+    PART.store((base as u64) << 32 | blocks as u64, core::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// The ferros partition (first LBA, blocks on LU 0), once `locate` found it.
+pub fn part() -> Option<(u32, u32)> {
+    let v = PART.load(core::sync::atomic::Ordering::Relaxed);
+    if v == 0 { None } else { Some(((v >> 32) as u32, v as u32)) }
+}
+
 /// Exynos vendor HCI block base on husky (reg_hci) — holds HCI_UTRL_NEXUS_TYPE at +0x40.
 const REG_HCI: usize = 0x1320_1100;
 const NEXUS_TYPE: usize = 0x40;

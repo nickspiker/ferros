@@ -15,8 +15,15 @@ use manifestus::{Block, BlockDev, DeletePolicy, Mirror, Vault};
 
 const UFS_BASE: usize = 0x1320_0000;
 const REGION_BLOCKS: u64 = 65_536;
-const MIRROR_A: u64 = crate::ufs_device::FERROS_BASE_LBA as u64 + 524_288;
-const MIRROR_B: u64 = MIRROR_A + REGION_BLOCKS;
+/// Mirror A's offset in the ferros partition (2 GiB in); B follows it.
+const MIRROR_OFFSET: u64 = 524_288;
+/// The two mirror regions' first LBAs, in the ferros partition as the GPT names it (`ufs_device::part`): none without it, or when it is too small to hold both (the vault is refused then, never written past the partition's end).
+fn mirrors() -> Result<(u64, u64), KvError> {
+    match crate::ufs_device::part() {
+        Some((first, blocks)) if blocks as u64 >= MIRROR_OFFSET + 2 * REGION_BLOCKS => Ok((first as u64 + MIRROR_OFFSET, first as u64 + MIRROR_OFFSET + REGION_BLOCKS)),
+        _ => Err(KvError::NoPartition),
+    }
+}
 const RING_LOG2: u8 = manifestus::HOST_RING_LOG2;
 const ADDR_CONTEXT: &str = "ferros.kernel.store.addr.v0";
 const PAYLOAD_CONTEXT: &str = "ferros.kernel.store.payload.v0";
@@ -138,6 +145,8 @@ pub enum KvError {
     NoIra,
     /// The device is bound to another identity: this seed does not open its space.
     Belongs,
+    /// No ferros partition found in the GPT, or one too small for the two mirrors.
+    NoPartition,
 }
 impl From<manifestus::Error> for KvError {
     fn from(e: manifestus::Error) -> Self {
@@ -152,6 +161,8 @@ pub struct KVault {
     nonce: crate::wairua::TrngNonce,
     /// The unlocked identity, while one is: dropped when power goes or the device switches to another OS (`lock`).
     id: Option<IdKeys>,
+    /// Mirror A's first LBA, as `open` found it (`mirrors`).
+    mirror_a: u64,
 }
 
 impl KVault {
@@ -160,9 +171,10 @@ impl KVault {
         let base = ferros_vault::anchor::AnchorKey::from_ira(ira);
         let addr_key = ferros_vault::anchor::AnchorKey::derive(ADDR_CONTEXT, &base.0);
         let payload_key = ferros_vault::anchor::AnchorKey::derive(PAYLOAD_CONTEXT, &base.0);
-        let mirror = Mirror::new(Region { base: MIRROR_A, blocks: REGION_BLOCKS }, Region { base: MIRROR_B, blocks: REGION_BLOCKS }).with_events(alloc::boxed::Box::new(LogSink));
+        let (a, b) = mirrors()?;
+        let mirror = Mirror::new(Region { base: a, blocks: REGION_BLOCKS }, Region { base: b, blocks: REGION_BLOCKS }).with_events(alloc::boxed::Box::new(LogSink));
         let vault = Vault::open(mirror, RING_LOG2, now(), DeletePolicy::UnlinkOnly)?;
-        Ok(KVault { vault, addr_key, cipher: XChaCha20Poly1305::new(Key::from_slice(&payload_key)), nonce: crate::wairua::TrngNonce::new(), id: None })
+        Ok(KVault { vault, addr_key, cipher: XChaCha20Poly1305::new(Key::from_slice(&payload_key)), nonce: crate::wairua::TrngNonce::new(), id: None, mirror_a: a })
     }
 
     /// The address key for `class`: the device's always, the identity's only while one is unlocked.
@@ -504,7 +516,7 @@ impl KVault {
         let after = self.vault.engine_stats();
         let (r1, w1) = (READS.load(Relaxed), WRITES.load(Relaxed));
         out.push_str(&alloc::format!("put: {:?}; plow {} -> {}, block reads {} writes {}\n", put.map(|_| ()), before.plow, after.plow, r1 - r0, w1 - w0));
-        let mut region = Region { base: MIRROR_A, blocks: REGION_BLOCKS };
+        let mut region = Region { base: self.mirror_a, blocks: REGION_BLOCKS };
         let (mut sealed, mut unsealed) = (0u32, 0u32);
         let mut first_bad = None;
         let tract_base = 1u64 << RING_LOG2;

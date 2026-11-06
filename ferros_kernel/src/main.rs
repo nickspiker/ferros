@@ -1927,6 +1927,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     platform::pstore(if link_up { b"ferros: UFS link up\n" as &[u8] } else { b"ferros: UFS link DOWN\n" });
     if link_up {
         checklist::mark(checklist::Item::Disk);
+        // The ferros partition by its GPT name: where the flash log and the vault live (ufs_device::locate; on husky only if it is where it always was).
+        platform::pstore(if ufs_device::locate() { b"ferros: the ferros partition found\n" as &[u8] } else { b"ferros: NO ferros partition\n" });
     }
     // The gate chose Android: the moment the disk answers (set-active needs devinfo and the boot LU attribute, nothing of the vault) — slot a active, then a plain reset; the bootloader boots slot a, whose hv gate takes the one-shot marker and goes to Android. The way back is a reboot: slot a's gate asks again (1 s on dev builds) and boots the ferros packed into it (tools/husky-cold.sh keeps that copy current). Android cannot boot from slot b's own partitions (product_b is empty), which is why the choice is a slot switch and not a chainload.
     // akita has no hv and keeps Android on slot b, untouched (ferros on slot a, tools/akita-boot.sh): the choice is slot b active, then the reset. With no gate in front of Android there, the way back to ferros is fastboot (`--set-active=a`, or akita-boot.sh). Its devinfo has husky's layout (header, slot words at G#30, the flags read back as husky's measured meanings after a set-active to a: a G#0401, b G#0A02; 2026-11-06).
@@ -1966,8 +1968,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         flashlog::line(&alloc::format!("boot cold, flash log init {ok}"));
     }
     checklist::step(checklist::Step::Log);
-    // Not on akita: the ira's sources include a read of the flash (devinfo), and with no link that read could wait past the cluster watchdog.
-    let (probe, mut store) = if board::akita() { (vault_boot::VaultProbe::none(), None) } else { vault_boot::vault_probe(link_up) };
+    // akita too since 2026-11-06: its ira's sources read alike across eight boots (`diag "ira sources"`), its ira under its own context (ira.rs), its vault in its own ferros partition (ufs_device::locate; refused without one). Not with no link: the ira's sources include a read of the flash (devinfo), which could then wait past the cluster watchdog.
+    let (probe, mut store) = if board::akita() && !link_up { (vault_boot::VaultProbe::none(), None) } else { vault_boot::vault_probe(link_up) };
     // A power-on has no last length in RAM for the ring's scale: the disk's, now that the vault is open.
     if let Some(doc) = store.as_mut().and_then(|s| s.get_by_key(checklist::SPAN_KEY).ok().flatten()) {
         checklist::span_from_disk(&doc);
@@ -1989,7 +1991,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     }
 
     // The flash's power-on write protect, armed now that the link is up (BOOT.md "Dual Boot", owner's yes 2026-10-17): the bootloader's own LUs become read-only until the next reset. The bootloader does not arm it itself; fastboot runs before anything could, so flashing is untouched. Reported in DIAG as UFS_POWER_ON_WP (1 armed, 2 refused, 0 no link).
-    let ufs_wp = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() {
+    // Not on akita: with no hv there it would hold the bootloader LUs read-only across the warm reset into fastboot, and flashing ferros there is how akita is worked on.
+    let ufs_wp = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() && !board::akita() {
         let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
         // As the boot found it: whether the flag survived the reset that brought us here (a warm reset may keep it; DIAG UFS_POWER_ON_WP_BEFORE: 0/1, 2 unreadable).
         UFS_WP_BEFORE.store(match ufs.read_flag(0x03) { Some(true) => 1, Some(false) => 0, None => 2 }, core::sync::atomic::Ordering::Relaxed);
@@ -2011,7 +2014,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     platform::mark_trail(0x17);
 
     // Tell ABL this slot boots (devinfo "successful"), so its retry countdown stops and a power cycle lands here again. Only on a real ABL boot (x0 = DTB pointer, not a RELOAD tag) with the vault verified: a build that dies before this point still falls back to the other slot.
-    let mark = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() {
+    // Not on akita: its slot a stays unmarked, so ABL falls back to slot b's Android (the way out) when ferros there does not boot.
+    let mark = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() && !board::akita() {
         let m = slot::mark_booted_slot(dtb_addr);
         if m.result == slot::MARKED || m.result == slot::ALREADY {
             checklist::mark(checklist::Item::Slot);

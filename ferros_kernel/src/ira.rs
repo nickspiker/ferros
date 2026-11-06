@@ -39,8 +39,10 @@ const HPM_ASV_LEN: usize = 64;
 /// Per-die DVFS speed-bin class — one byte (gs-chipid.c `dvfs_version`, offset G#900C).
 const OFF_DVFS_VERSION: usize = 0x900C;
 
-/// BLAKE3 KDF context for the interim husky ira. Versioned: bump on any change to the material set below, since that re-keys every vault derived from it.
-const IRA_CONTEXT: &str = "ferros.ira.husky.v2";
+/// BLAKE3 KDF context for the interim ira, one per board (owner, 2026-11-06: akita its own, husky's untouched). Versioned: bump on any change to that board's material set below, since that re-keys every vault derived from it; each board's line moves on its own (akita's starts at v0, its sources proven with `diag "ira sources"` before a vault was sealed under it).
+fn ira_context() -> &'static str {
+    if crate::board::akita() { "ferros.ira.akita.v0" } else { "ferros.ira.husky.v2" }
+}
 
 /// Read husky's 16-byte hardware identity: `[product_id, unique_id0, unique_id1, revision]`, each u32 little-endian.
 ///
@@ -144,7 +146,43 @@ pub fn derive_ira() -> Result<[u8; 32], u32> {
         m.extend_from_slice(&(a[i].len() as u32).to_le_bytes());
         m.extend_from_slice(&a[i]);
     }
-    Ok(AnchorKey::derive(IRA_CONTEXT, &m))
+    Ok(AnchorKey::derive(ira_context(), &m))
+}
+
+/// `diag "ira sources"`: the stability probe a board's ira needs before a vault is sealed under it (owner, 2026-11-06, akita: "its own context, after the sources are proven"). Every source read twice as `derive_ira` reads it, and per source: its length, whether the two reads agree, whether it is degenerate (all G#00 or all G#FF), and the first 8 bytes of its BLAKE3 hash, to compare across boots and temperatures. Never the values (devinfo carries the IMEIs) and never the ira. "not read" for devinfo: its block unreadable or its required records (psn, dsn, imei1) missing.
+pub fn sources_report() -> alloc::string::String {
+    use core::fmt::Write;
+    let read = || -> [Option<alloc::vec::Vec<u8>>; 7] {
+        [
+            Some(read_hw_identity().to_vec()),
+            Some(read_ap_hw_tune().to_vec()),
+            Some(read_asv_tbl().to_vec()),
+            Some(read_hpm_asv().to_vec()),
+            Some(alloc::vec![read_dvfs_version()]),
+            read_devinfo_identity(),
+            read_ufs_serial(),
+        ]
+    };
+    let (a, b) = (read(), read());
+    const NAMES: [&str; 7] = ["hwid", "ap_hw_tune", "asv_tbl", "hpm_asv", "dvfs_version", "devinfo", "ufs_serial"];
+    let mut s = alloc::string::String::new();
+    for i in 0..7 {
+        match (&a[i], &b[i]) {
+            (Some(x), Some(y)) => {
+                let h = blake3::hash(x);
+                let degenerate = x.len() > 1 && (x.iter().all(|&v| v == 0) || x.iter().all(|&v| v == 0xFF));
+                let _ = write!(s, "{:<12} A#{:<4} {} {} G#", NAMES[i], x.len(), if x == y { "agree" } else { "DIFFER" }, if degenerate { "DEGENERATE" } else { "ok" });
+                for b in &h.as_bytes()[..8] {
+                    let _ = write!(s, "{b:02X}");
+                }
+                s.push('\n');
+            }
+            _ => {
+                let _ = writeln!(s, "{:<12} not read", NAMES[i]);
+            }
+        }
+    }
+    s
 }
 
 /// The ira as vault boot derived it, held for `SYS_IRA` (process.rs): a process with an Ira capability gets `blake3::derive_key("ferros process ira v1 " ‖ its domain, ira)` — a per-purpose key rooted in the device that survives a factory reset ([[ira_network_owns_assignment]]: the Photon device key is one), never the ira itself, and never under a context the kernel's own derivations use.

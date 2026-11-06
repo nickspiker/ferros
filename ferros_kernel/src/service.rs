@@ -1874,6 +1874,12 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                // `diag "ira sources"`: each ira source's agreement, health and short hash (ira.rs sources_report), to prove a board's sources stable across boots before a vault is sealed under them. Read-only.
+                if cmd.params == b"ira sources" {
+                    resp.extend_from_slice(crate::ira::sources_report().as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 // Slot marking lives only in the cold build: a ferros chainloaded under Android must not rewrite devinfo (slot.rs is cold-only).
                 #[cfg(not(shim_handoff))]
                 if cmd.params == b"slot" || cmd.params.starts_with(b"slot word ") {
@@ -2592,6 +2598,10 @@ pub fn run(mut b: Boot) -> ! {
                 for (label, v) in &b.extras {
                     append_hex(&mut resp, label, *v);
                 }
+                // The ferros partition as the GPT names it (ufs_device::locate): first LBA and blocks, 0 when not found.
+                let (pf, pb) = crate::ufs_device::part().unwrap_or((0, 0));
+                append_hex(&mut resp, b"FERROS_PART_FIRST=", pf);
+                append_hex(&mut resp, b"FERROS_PART_BLOCKS=", pb);
                 // Reboot mode as the bootloader will see it, read through the EL3 monitor (proves the fastboot path without rebooting; 0 = normal).
                 append_hex(&mut resp, b"PMU_REBOOT_CMD=", platform::priv_reg(platform::PMU_REBOOT_CMD, false, 0) as u32);
                 append_hex(&mut resp, b"DSS_REASON=", r(platform::DSS_HEADER + platform::DSS_OFFSET_EMERGENCY_REASON));
