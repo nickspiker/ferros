@@ -1,15 +1,14 @@
 //! The map (SHELL.md): the device is a map of your life. Every person, message, photo and app is a circle on one plane; the view is a camera over it, and the camera is the only thing that moves.
 //!
-//! The circles: one is built in, the system's own (its front is the dashboard, its back the settings). Nothing else is (owner, 2026-11-04: "For the baked in circles, there should be one. System settings, that's it. You want a clock? INSTALL IT YOURSELF!!!"): every other circle is what the person installs, and the map knows nothing about it until then. The placement below (a seeded random fit with generous air) is for when there are more.
+//! The circles: one is built in, the system's own: the device's settings, one side only (owner, 2026-11-05: "that should only have one side, it's the OS settings page"). Nothing else is (owner, 2026-11-04: "For the baked in circles, there should be one. System settings, that's it. You want a clock? INSTALL IT YOURSELF!!!"): every other circle is what the person installs, and the map knows nothing about it until then. The placement below (a seeded random fit with generous air) is for when there are more.
 //!
 //! The gestures (owner, 2026-10-22: "two finger scale/move for edits and back to a normal two finger vs one finger for the back"):
 //! - One finger dragged from the air moves the plane; dragged from a circle, it moves that circle.
 //! - Two fingers both inside one circle move and size that circle; otherwise they pinch to zoom and twist to turn the plane, about the point between them.
 //! - Only circles smaller than three quarters of the screen's width can be taken hold of: zoomed in until a circle fills the view, it is a place, and the fingers move the plane again.
-//! - A one-finger tap on a circle arrives at it: the next frame has the circle filling the screen, its front shown. A tap in the air around an arrived circle leaves it.
+//! - A one-finger tap on a circle arrives at it: the next frame has its page inscribed in the circle an app lives in (ferros_sys::active_circle, the display's hairline; owner 2026-11-05: "each active app has the same theme, circle inscribed"). A tap in the air around an arrived circle leaves it.
 //! - Whatever was moved is kept in the vault when the fingers lift (owner, 2026-10-22: arranging is always on, no mode).
 //! - Nothing is animated and nothing is timed (owner, 2026-10-22: "no animations ... instant, always, no timers"): a view is simply there on the next frame, and a tap is fingers down and up without moving, however long they rested.
-//! - A two-finger tap turns a circle over: its back, the facts about it and its few choices. Another two-finger tap turns it back.
 //!
 //! All of it integer: the camera centre in world units ×256, the zoom in 16.16, pinches by integer square roots.
 //!
@@ -38,7 +37,7 @@ struct Spec {
     icon: u8,
 }
 
-/// The one built-in circle: the system's own, its front the dashboard and its back the settings. It never lights (lit means a person sent you something).
+/// The one built-in circle: the system's own, the device's settings. It never lights (lit means a person sent you something).
 const CIRCLES: [Spec; 1] = [Spec { label: "settings", ring: 1, lit: 0, share: 250, icon: 5 }];
 const N: usize = CIRCLES.len();
 
@@ -247,12 +246,11 @@ impl Cam {
     }
 }
 
-/// What the screen is showing: the plane, or one circle's front or back, arrived at.
+/// What the screen is showing: the plane, or one circle arrived at, its page open.
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Map,
-    Front(usize),
-    Back(usize),
+    Open(usize),
 }
 
 /// The device's back: what each row does when tapped.
@@ -302,9 +300,10 @@ struct Map {
 }
 
 impl Map {
-    /// The arrived circle's radius on the panel.
-    fn arrived_r(&self) -> i64 {
-        self.w * 15 / 32
+    /// Where an arrived circle stands on the panel, centre and radius: the circle an app lives in (ferros_sys::active_circle, the display's, its hairline), so every active app's page is inscribed in the same circle (owner, 2026-11-05). Until then fifteen thirty-seconds of the width across, at the panel's centre. The zoom keeps the map's own circle within the screen's width, so the page's fill, at this radius, is what shows.
+    fn arrived(&self) -> (i64, i64, i64) {
+        let (cx, cy, r) = ferros_sys::active_circle(self.w as usize, self.h as usize);
+        (cx as i64, cy as i64, r as i64)
     }
 
     /// A circle's vault key, relative to the map's scope: `place.<label>`, so a circle keeps its place however the table grows.
@@ -718,10 +717,15 @@ impl Map {
         Cam { x: (x0 + x1) / 2, y: (y0 + y1) / 2, z, c: self.cam.c, s: self.cam.s }
     }
 
-    /// The camera that has arrived at circle i: it fills the panel's width, less a margin.
+    /// The camera that has arrived at circle i: the circle on the active circle (`arrived`). The camera's centre is the panel's, so it stands off the circle's centre by the active circle's offset from the panel's centre, in world units at the arrived zoom.
     fn at(&self, i: usize) -> Cam {
         let (lo, hi) = self.zoom_limits();
-        Cam { x: self.xs[i], y: self.ys[i], z: ((self.arrived_r() << 16) / self.rs[i].max(1)).clamp(lo, hi), c: self.cam.c, s: self.cam.s }
+        let (_, ay, ar) = self.arrived();
+        let mut cam = Cam { x: self.xs[i], y: self.ys[i], z: ((ar << 16) / self.rs[i].max(1)).clamp(lo, hi), c: self.cam.c, s: self.cam.s };
+        let (dx, dy) = cam.delta(0, self.h / 2 - ay);
+        cam.x += dx;
+        cam.y += dy;
+        cam
     }
 
     /// Go to `to`: the camera is simply there (no animation).
@@ -729,106 +733,28 @@ impl Map {
         self.cam = to;
     }
 
-    /// Draw the frame: the overlay for the view first (what is sent first is on top), then the scene under it through the camera. The one circle is the system's: its front the dashboard, its back the settings.
+    /// Draw the frame: the overlay for the view first (what is sent first is on top), then the scene under it through the camera. The one circle is the system's: the device's settings.
     fn draw(&mut self) {
         let mut b = Batch::new();
         b.op(&[1]);
         self.nrows = 0;
         match self.view {
             View::Map => {}
-            View::Front(_) => self.dashboard(&mut b),
-            View::Back(_) => self.settings(&mut b),
+            View::Open(_) => self.settings(&mut b),
         }
         b.op(&self.cam.op(true));
         b.send(self.display);
     }
 
-    /// Label and value on a row: the label right of centre's left, the value left of centre's right.
-    fn row(b: &mut Batch, cx: i64, y: i64, label: &str, value: &str) {
-        b.text(cx - 20, y, 36, grey(), 2, label);
-        b.text(cx + 20, y, 36, white(), 0, value);
-    }
-
-    /// The device's front: the state of the device in plain facts, every number in the device base.
-    fn dashboard(&self, b: &mut Batch) {
-        let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
-        let f = ferros_sys::numbers(Style::Glyphs);
-        let facts = ferros_sys::facts();
-        let mut y = cy - r * 9 / 16;
-        b.text(cx, y, 72, white(), 1, "ferros");
-        y += 120;
-        let mut v = Line::new();
-        match facts.battery_pct() {
-            Some(p) => {
-                let _ = tatau::share(&mut v, f, p, 100, 2);
-                if let Some(ua) = facts.battery_ua() {
-                    v.s(if ua > 0 { "  charging" } else { "  on battery" });
-                }
-            }
-            None => {
-                v.s("not read");
-            }
-        }
-        Map::row(b, cx, y, "battery", v.as_str());
-        y += 64;
-        let mut v = Line::new();
-        match facts.boot_us() {
-            Some(us) => {
-                let _ = tatau::duration_ns(&mut v, f, us * 1000, 1);
-            }
-            None => {
-                v.s("-");
-            }
-        }
-        Map::row(b, cx, y, "press to ready", v.as_str());
-        y += 64;
-        let mut v = Line::new();
-        // The counter runs from the SoC's reset: power on, near enough (the bootloader's seconds included).
-        let (t, hz) = (now(), freq());
-        let _ = tatau::duration_ns(&mut v, f, t / hz * 1_000_000_000 + t % hz * 1_000_000_000 / hz, 1);
-        Map::row(b, cx, y, "since power on", v.as_str());
-        y += 64;
-        Map::row(b, cx, y, "USB", match facts.usb_link() { Some(true) => "linked", Some(false) => "no link", None => "-" });
-        y += 64;
-        let mut v = Line::new();
-        if let Some(n) = facts.processes() {
-            let _ = tatau::count(&mut v, f, n, 1);
-        }
-        Map::row(b, cx, y, "processes", v.as_str());
-        y += 64;
-        let mut v = Line::new();
-        if let Some(n) = facts.vault_keys() {
-            let _ = tatau::count(&mut v, f, n, 1);
-        }
-        Map::row(b, cx, y, "in the vault", v.as_str());
-        y += 64;
-        // The hottest part of the SoC as the kernel last read it (once a second, over ACPM), and whether the kernel has the big core's clock down for it.
-        let mut v = Line::new();
-        match facts.soc_temp_c() {
-            Some(c) => {
-                let _ = tatau::count(&mut v, f, c, 1);
-                v.s(" °C");
-                if facts.throttled() == Some(true) {
-                    v.s("  throttled");
-                }
-            }
-            None => {
-                v.s("-");
-            }
-        }
-        Map::row(b, cx, y, "chip", v.as_str());
-        y += 64;
-        Map::row(b, cx, y, "numbers", base_name(ferros_sys::device_base()));
-        b.text(cx, cy + r * 3 / 4, 28, dim(), 1, "two fingers: settings");
-        b.disc(cx, cy, r - r / 25 - 1, fill());
-    }
-
-    /// The device's back: its few choices. The number base is chosen by seeing — each row is two seconds and a mebibyte (2^23 bits, a whole number of doublings) written in that base — with its name small beneath.
+    /// The device's settings, inscribed in the circle an app lives in (owner, 2026-11-05), laid out in 48ths of the screen's width (`u`, 28 px on husky): the page as it stood at 1344 px, scaled with the panel. The number base is chosen by seeing — each row is two seconds and a mebibyte (2^23 bits, a whole number of doublings) written in that base — with its name small beneath.
     fn settings(&mut self, b: &mut Batch) {
-        let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
-        let mut y = cy - r * 5 / 8;
-        b.text(cx, y, 56, white(), 1, "settings");
-        y += 96;
+        let (cx, cy, r) = self.arrived();
+        let u = self.w / 48;
+        let px = |k: i64, d: i64| (k * u / d) as u16;
+        // The block (the title's top to the dots' bottom, measured on the device 2026-11-05: 929 rows, its middle 32 below the first baseline's 14 units above centre) centred on the circle's centre.
+        let mut y = cy - 15 * u;
+        b.text(cx, y, px(2, 1), white(), 1, "settings");
+        y += 7 * u / 2;
         let now_base = ferros_sys::device_base();
         for code in BASES {
             let f = tatau::Fmt::new(tatau::Base::from_code(code).unwrap_or(tatau::Base::Dms), Style::Glyphs);
@@ -837,50 +763,49 @@ impl Map {
             v.s("   ");
             let _ = tatau::size_bits(&mut v, f, 1 << 23, 1);
             let current = code == now_base;
-            b.text(cx, y, 44, if current { white() } else { grey() }, 1, v.as_str());
-            b.text(cx, y + 38, 24, if current { grey() } else { dim() }, 1, base_name(code));
+            b.text(cx, y, px(3, 2), if current { white() } else { grey() }, 1, v.as_str());
+            b.text(cx, y + 11 * u / 8, px(7, 8), if current { grey() } else { dim() }, 1, base_name(code));
             if current {
-                b.disc(cx - r * 5 / 8, y - 14, 10, white());
+                b.disc(cx - 14 * u, y - u / 2, u / 3, white());
             }
-            self.push_row(y - 56, y + 52, Choice::Base(code));
-            y += 112;
+            self.push_row(y - 2 * u, y + 15 * u / 8, Choice::Base(code));
+            y += 4 * u;
         }
-        y += 24;
+        y += u;
         let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
-        b.text(cx, y, 36, grey(), 1, if labels { "names under circles: on" } else { "names under circles: off" });
-        self.push_row(y - 44, y + 24, Choice::Labels);
-        y += 80;
+        b.text(cx, y, px(5, 4), grey(), 1, if labels { "names under circles: on" } else { "names under circles: off" });
+        self.push_row(y - 3 * u / 2, y + u, Choice::Labels);
+        y += 3 * u;
         let spatial = ferros_sys::pref(ferros_sys::PREF_DITHER) == 1;
-        b.text(cx, y, 36, grey(), 1, if spatial { "dither: spatial (the panel rests)" } else { "dither: spatial and temporal" });
-        self.push_row(y - 44, y + 24, Choice::Dither);
-        y += 80;
+        b.text(cx, y, px(5, 4), grey(), 1, if spatial { "dither: spatial (the panel rests)" } else { "dither: spatial and temporal" });
+        self.push_row(y - 3 * u / 2, y + u, Choice::Dither);
+        y += 3 * u;
         let mut tl = Line::new();
         let _ = write!(tl, "theme: {}", ferros_sys::theme::current().name);
-        b.text(cx, y, 36, grey(), 1, tl.as_str());
-        self.push_row(y - 44, y + 24, Choice::Theme);
+        b.text(cx, y, px(5, 4), grey(), 1, tl.as_str());
+        self.push_row(y - 3 * u / 2, y + u, Choice::Theme);
         // Brightness: nine dots, a stop apart, dimmest on the left; the current one larger and white.
-        y += 80;
-        b.text(cx, y, 36, grey(), 1, "brightness");
-        y += 60;
+        y += 3 * u;
+        b.text(cx, y, px(5, 4), grey(), 1, "brightness");
+        y += 2 * u;
         let now = 8 - ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS).min(8) as i64;
-        let (x0, step) = Map::dots(cx, r);
+        let (x0, step) = Map::dots(cx, u);
         for k in 0..9 {
             let x = x0 + k * step;
             if k == now {
-                b.disc(x, y, 14, white());
+                b.disc(x, y, u / 2, white());
             } else {
-                b.disc(x, y, 8, dim());
+                b.disc(x, y, u / 4, dim());
             }
         }
-        self.push_row(y - 40, y + 40, Choice::Brightness);
-
-
-        b.disc(cx, cy, r - r / 25 - 1, fill());
+        self.push_row(y - 3 * u / 2, y + 3 * u / 2, Choice::Brightness);
+        // The page out to the circle itself, which the display's hairline draws over (until 2026-11-05 a twenty-fifth of the radius short of it).
+        b.disc(cx, cy, r, fill());
     }
 
-    /// The brightness dots' first x and spacing on the device's back.
-    fn dots(cx: i64, r: i64) -> (i64, i64) {
-        let step = r * 3 / 2 / 8;
+    /// The brightness dots' first x and spacing on the settings page: nine dots four layout units apart.
+    fn dots(cx: i64, u: i64) -> (i64, i64) {
+        let step = 4 * u;
         (cx - 4 * step, step)
     }
 
@@ -898,8 +823,7 @@ impl Map {
         let mut l = Line::new();
         let name = |v: View| match v {
             View::Map => ("map", ""),
-            View::Front(i) => ("front of ", CIRCLES[i].label),
-            View::Back(i) => ("back of ", CIRCLES[i].label),
+            View::Open(i) => ("open: ", CIRCLES[i].label),
         };
         let (a, b) = name(self.view);
         let _ = write!(l, "map: {fingers}-finger tap at {sx},{sy} -> {a}{b}{}\n", if before == self.view { " (no change)" } else { "" });
@@ -915,25 +839,26 @@ impl Map {
 
     fn tap_inner(&mut self, fingers: usize, sx: i64, sy: i64) {
         let inside = {
-            let (dx, dy) = (sx - self.w / 2, sy - self.h / 2);
-            dx * dx + dy * dy <= self.arrived_r() * self.arrived_r()
+            let (cx, cy, r) = self.arrived();
+            let (dx, dy) = (sx - cx, sy - cy);
+            dx * dx + dy * dy <= r * r
         };
         match (fingers, self.view) {
             (1, View::Map) => {
                 if let Some(i) = self.hit(sx, sy) {
                     let to = self.at(i);
                     self.fly(to);
-                    self.view = View::Front(i);
+                    self.view = View::Open(i);
                     self.draw();
                 }
             }
-            (1, View::Front(_)) | (1, View::Back(_)) => {
+            (1, View::Open(_)) => {
                 if !inside {
                     self.view = View::Map;
                     let to = self.home();
                     self.fly(to);
                     self.draw();
-                } else if matches!(self.view, View::Back(_)) {
+                } else {
                     let row = self.rows[..self.nrows].iter().find(|r| sy >= r.0 && sy < r.1).map(|r| r.2);
                     match row {
                         Some(Choice::Base(code)) => {
@@ -941,7 +866,7 @@ impl Map {
                             self.draw();
                         }
                         Some(Choice::Brightness) => {
-                            let (x0, step) = Map::dots(self.w / 2, self.arrived_r());
+                            let (x0, step) = Map::dots(self.w / 2, self.w / 48);
                             let k = ((sx - x0 + step / 2) / step).clamp(0, 8);
                             ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BRIGHTNESS, (8 - k) as u8);
                             self.draw();
@@ -965,22 +890,6 @@ impl Map {
                         None => {}
                     }
                 }
-            }
-            (2, View::Map) => {
-                if let Some(i) = self.hit(sx, sy) {
-                    let to = self.at(i);
-                    self.fly(to);
-                    self.view = View::Back(i);
-                    self.draw();
-                }
-            }
-            (2, View::Front(i)) => {
-                self.view = View::Back(i);
-                self.draw();
-            }
-            (2, View::Back(i)) => {
-                self.view = View::Front(i);
-                self.draw();
             }
             _ => {}
         }
@@ -1055,12 +964,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         console(grants, b"map: the view as it was left\n");
     }
     let mut saved_view = map.cam;
-    // A development build can start arrived somewhere, to see a front or a back without a finger: FERROS_MAP_START=f<n> or b<n> (circle n).
+    // A development build can start arrived at a circle, its page open, without a finger: FERROS_MAP_START=o<n> (circle n).
     if let Some(v) = option_env!("FERROS_MAP_START").map(str::as_bytes) {
         if v.len() == 2 && (v[1] as usize).wrapping_sub(b'0' as usize) < N {
             let i = (v[1] - b'0') as usize;
             map.cam = map.at(i);
-            map.view = if v[0] == b'b' { View::Back(i) } else { View::Front(i) };
+            map.view = View::Open(i);
         }
     }
     map.draw();
@@ -1106,7 +1015,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         map.draw();
     }
-    console(grants, b"map: home drawn; tap arrives, two fingers turn a circle over\n");
+    console(grants, b"map: home drawn; a tap on a circle opens it\n");
     // FERROS_MAP_START=crowd: 200 more circles in the display's scene only (never the vault), for timing a busy home screen.
     if option_env!("FERROS_MAP_START") == Some("crowd") {
         let placed = map.crowd(200);
@@ -1137,7 +1046,6 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut grab: Option<usize> = None;
     let mut grab_n = 0usize;
     let mut last_app_check = 0u64;
-    let mut last_dashboard = now();
     let mut last_pass = now();
     let mut draw_us = 0u64;
     let mut move_us = 0u64;
@@ -1170,11 +1078,6 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         let tm = ferros_sys::pref(ferros_sys::PREF_THEME);
         if tm != theme_seen {
             theme_seen = tm;
-            map.draw();
-        }
-        // The dashboard is live: once a second while it is showing.
-        if map.view == View::Front(0) && now().wrapping_sub(last_dashboard) > freq() {
-            last_dashboard = now();
             map.draw();
         }
 

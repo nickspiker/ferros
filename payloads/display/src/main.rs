@@ -1960,13 +1960,9 @@ fn plan_glass(width: usize, height: usize) {
     }
 }
 
-/// The bottom of the camera cutout, in panel rows: a fact of this panel, not a knob. husky's hole is centred at (672, 75) with radius 43.25 at 1344 x 2992 (Android's DisplayCutout for the physical raster), so its bottom edge is row 118.
-const CUTOUT_BOTTOM: f32 = 118.25;
-
-/// The circle an app lives in (owner, 2026-11-02): tangent to the bottom of the camera cutout and to the bottom of the screen, centred, so the corners outside it belong to the system. Its centre and radius, in pixels. (Until 2026-11-02 it was tangent to the top of the screen, through the cutout.)
+/// The circle an app lives in (ferros_sys::active_circle, shared with the apps that inscribe their pages in it): tangent to the bottom of the camera cutout and to the bottom of the screen, centred, so the corners outside it belong to the system (owner, 2026-11-02). Its centre and radius, in pixels. (Until 2026-11-02 it was tangent to the top of the screen, through the cutout.)
 fn circle(width: usize, height: usize) -> (f32, f32, f32) {
-    let r = (height as f32 - CUTOUT_BOTTOM) * 0.5;
-    (width as f32 * 0.5, CUTOUT_BOTTOM + r, r)
+    ferros_sys::active_circle(width, height)
 }
 
 /// How many rows at the top and at the bottom reach outside the circle: where the circle's chord is narrower than the screen, plus the hairline's own width and a row of slack.

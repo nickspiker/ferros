@@ -85,6 +85,15 @@ pub fn device_base() -> u8 {
     unsafe { core::ptr::read_volatile((arc_base() + PREFS + PREF_BASE) as *const u8) }
 }
 
+/// The bottom of the camera cutout, in panel rows: a fact of this panel, not a knob. husky's hole is centred at (672, 75) with radius 43.25 at 1344 x 2992 (Android's DisplayCutout for the physical raster), so its bottom edge is row 118.25.
+pub const CUTOUT_BOTTOM: f32 = 118.25;
+
+/// The circle an app lives in, on a `w` × `h` screen: centre and radius in pixels. Tangent to the bottom of the camera cutout and to the bottom of the screen, centred, so the corners outside it belong to the system (owner, 2026-11-02); the display draws its hairline, and every active app's page is inscribed in it (owner, 2026-11-05: the settings page fills it, the attest mark keeps its own smaller circle).
+pub fn active_circle(w: usize, h: usize) -> (f32, f32, f32) {
+    let r = (h as f32 - CUTOUT_BOTTOM) * 0.5;
+    (w as f32 * 0.5, CUTOUT_BOTTOM + r, r)
+}
+
 /// A number formatter in the device base, right now: `tatau::count(&mut out, ferros_sys::numbers(Style::Glyphs), n, 1)`. Glyphs where the app draws with the Oxanium +glyphs face, words elsewhere.
 pub fn numbers(style: tatau::Style) -> tatau::Fmt {
     tatau::Fmt::new(tatau::Base::from_code(device_base()).unwrap_or(tatau::Base::Dms), style)

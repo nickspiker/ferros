@@ -45,7 +45,7 @@ Each channel carries one meaning:
 
 The device measures what you do; you declare what matters. When a circle lights, the colour goes on its fill, so the ring stays as its steady weight underneath.
 
-**Built in: one circle, system settings** (owner, 2026-11-04: "For the baked in circles, there should be one. System settings, that's it. You want a clock? INSTALL IT YOURSELF!!!"). Its front is the dashboard, its back the settings. Every other circle is an app the person installs; the base OS knows nothing about it until then. The apps planned below (Photon, Mahere, Lumis, Opsin) are installs, never preloads.
+**Built in: one circle, system settings** (owner, 2026-11-04: "For the baked in circles, there should be one. System settings, that's it. You want a clock? INSTALL IT YOURSELF!!!"). It has one side, the OS settings page (owner, 2026-11-05: "that should only have one side, it's the OS settings page"); opened, its page is inscribed in the circle an app lives in (the display's hairline circle, `ferros_sys::active_circle`), as every active app's is ("each active app has the same theme, circle inscribed"). Every other circle is an app the person installs; the base OS knows nothing about it until then. The apps planned below (Photon, Mahere, Lumis, Opsin) are installs, never preloads.
 
 **An app is its icon** (owner, 2026-10-21). An app's circle shows the app's icon and no name: "icons identify just fine." Names under circles are an option in settings, off by default. This reverses the 2026-10-16 design's "No icons", which belonged to a list of rows, where a name was the whole row. Icons come from each app's own codebase — Photon's and Mahere's PNG, Lumis's Android launcher WebP, Opsin's VSF — and `tools/app-icons` brings each into linear VSF RGB, scales and cuts it to one circle there, and bundles VSF RGB gamma 2 codes into the display server at build time, so the phone decodes nothing. The PNG and WebP sources are sRGB and enter through vsf's colorimetric `SRGB2VSF_RGB`, so their white lands slightly off VSF's axis, as vsf intends.
 
@@ -99,16 +99,9 @@ Zoom is already semantic: closest, a circle opens into its content where it stan
 
 The front is what the thing is: the thread, the viewfinder, the map. The back is the facts about it, the same for every circle: who signed it and its ihi; which capabilities it holds, hardware by name; how much time it takes (its area, as a number in the device base); when it last changed and why. Turning a circle over is one gesture everywhere (proposed: a two-finger twist, the one motion that pan and pinch never make). This is where an app's permissions live: not in a settings menu far away, but on the back of the thing they govern. A circle's back is read-only facts plus the few choices that belong to it. Revoking a capability is one of them, and it takes effect at the app's next start.
 
-### The device is a circle too, and its back is the settings
+### The device is a circle too, and it is the settings
 
-The phone itself is the first circle on the map: the one the spec says first boot places, where you pair with a device you trust. Its front is the dashboard, the state of the device in plain facts:
-- battery, energy and temperature;
-- storage;
-- the radios (WiFi, cellular, the USB link);
-- the press-to-ready time;
-- the ledger of what the agent did.
-
-Every number is in the device base. Its back holds the device's few choices:
+The phone itself is the first circle on the map: the one the spec says first boot places, where you pair with a device you trust. It has one side, the device's settings (owner, 2026-11-05; until then a dashboard of facts on its front, the settings on its back). Its choices:
 - the number base, the first of them: four choices, each shown as two seconds and a megabyte written in it, so the choice is made by seeing, not by name;
 - names under circles, on or off;
 - the wake (the proximity gate);

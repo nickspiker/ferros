@@ -40,7 +40,7 @@ Every number a person reads is drawn in one of four bases (`Code/tatau`): arabic
 
 - **Kept** as the settings document's `base`: tatau's code, 10 arabic, 12 DMS, 16 hex, G#8C DLS. Absent means DMS, the house base.
 - **Loaded** by the kernel right after the vault opens, into tatau's process-wide base, so everything drawn from then on reads in it (`ferros_kernel/src/main.rs`).
-- **Set** by the person on the device — the back of the device's own circle on the map (SHELL.md), where each base is a row showing two seconds and a mebibyte written in it, and a tap chooses — or `ferros-bridge diag "pref base <code>"`, or by an attesting identity's preference.
+- **Set** by the person on the device — the device's own circle on the map, the settings page (SHELL.md), where each base is a row showing two seconds and a mebibyte written in it, and a tap chooses — or `ferros-bridge diag "pref base <code>"`, or by an attesting identity's preference.
 - **Drawn** as glyphs only where the font is ours (fluor with the Oxanium `+glyphs` face: the shell and the apps) and as words everywhere else. Terminals, bash and anything else without font control are not a supported surface for glyphs.
 
 ## Names under circles (`device.labels`)
