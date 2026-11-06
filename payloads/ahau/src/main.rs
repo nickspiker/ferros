@@ -111,6 +111,10 @@ static HELP_DONE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 static HELP_STOPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// The pass: the handle's placement (on the mark thread's stack, which outlives the pass, since that thread waits for every helper before it returns), fine (4 × 4) or not, its generation, the mark's side.
 static mut HELP_PASS: (*const tapuwae::Params, bool, u64, usize) = (core::ptr::null(), false, 0, 0);
+/// What the helpers' job is: 0 a pass (HELP_PASS), 1 J(c)'s address points for the handle's placement (HELP_EXTENT).
+static HELP_KIND: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// The placement's c and its points (on the mark thread's stack, which waits for every helper before it goes on): each thread fills every (helpers + 1)-th point from its share.
+static mut HELP_EXTENT: ((f64, f64), *mut [(f64, f64); tapuwae::EXTENT_POINTS]) = ((0., 0.), core::ptr::null_mut());
 /// Which pixels of FRESH hold any of a component (tapuwae::render_fresh's mask): what a new handle redraws.
 static mut FRESH_MASK: [u64; (1 << 20) / 64] = [0; (1 << 20) / 64];
 /// The mark's two maps (tapuwae::FreshCell, 8 bytes a sample): where the masked pixels' samples fall in the set, worked out once, so a new handle costs the balls' shading alone. Independent, so the coarse pass is a sixteenth of the fine one at boot too: the coarse map, a pixel's centre (2¹⁸ cells, 2 MiB, for the 900 px mark's 171 643 masked pixels); the fine map, 4 × 4 a pixel, filled by the first fine pass to reach each (3·2²⁰ cells, 24 MiB, for 2.75 M). Past either tapuwae works the rest out again.
@@ -321,6 +325,32 @@ fn gpu_quick(grants: u64, r: usize, p: &tapuwae::Params) -> bool {
     true
 }
 
+/// The handle's placement (tapuwae `Params::new_placed`), J(c)'s address points (half its work) shared with the helpers when they run: each thread fills every (helpers + 1)-th point, this one share 0, then it waits for them all. The same points in the same slots, so the same placement.
+fn placed(salt: &[u8; 32], text: &str) -> tapuwae::Params {
+    let up = HELPERS_UP.load(core::sync::atomic::Ordering::Acquire);
+    if up == 0 {
+        return tapuwae::Params::new_placed(salt, text, true);
+    }
+    tapuwae::Params::new_placed_with(salt, text, true, &mut |c, pts| {
+        let at: *mut [(f64, f64); tapuwae::EXTENT_POINTS] = pts;
+        HELP_DONE.store(0, core::sync::atomic::Ordering::Relaxed);
+        unsafe { HELP_EXTENT = (c, at) };
+        HELP_KIND.store(1, core::sync::atomic::Ordering::Release);
+        HELP_JOB.fetch_add(1, core::sync::atomic::Ordering::Release);
+        ferros_sys::wake(&HELP_JOB, up);
+        for i in (0..tapuwae::EXTENT_POINTS).step_by(1 + up as usize) {
+            unsafe { (*at)[i] = tapuwae::extent_point(c, i as u32) };
+        }
+        loop {
+            let d = HELP_DONE.load(core::sync::atomic::Ordering::Acquire);
+            if d >= up {
+                break;
+            }
+            ferros_sys::wait(&HELP_DONE, d, 0);
+        }
+    })
+}
+
 /// The bonded button's 4 x 4 pass on the GPU as 16 distinct passes over the circle's staged coordinates (owner, 2026-11-05; tapuwae::gpu::button_fine_kernel): each pass one more sample a pixel, its frame published as it stands, so the mark sharpens pass by pass; a newer handle leaves between passes (each ~16 ms). After pass 15 the pixels are the CPU's 4 x 4. False when it stopped for a newer handle or the GPU could not run a pass.
 fn gpu_fine_passes(g: u64, frames: &mut u64) -> bool {
     let (grants, r, salt) = unsafe { FRESH_JOB };
@@ -332,7 +362,7 @@ fn gpu_fine_passes(g: u64, frames: &mut u64) -> bool {
         text[..n].copy_from_slice(&t[..n]);
         n
     });
-    let p = tapuwae::Params::new_placed(&salt, core::str::from_utf8(&text[..n]).unwrap_or(""), true);
+    let p = placed(&salt, core::str::from_utf8(&text[..n]).unwrap_or(""));
     for b in text.iter_mut() {
         unsafe { core::ptr::write_volatile(b, 0) };
     }
@@ -1543,6 +1573,16 @@ extern "C" fn help_thread(t: u64) -> ! {
             continue;
         }
         seen = j;
+        if HELP_KIND.load(core::sync::atomic::Ordering::Acquire) == 1 {
+            let (c, pts) = unsafe { HELP_EXTENT };
+            let step = 1 + HELPERS_UP.load(core::sync::atomic::Ordering::Acquire) as usize;
+            for i in (t as usize..tapuwae::EXTENT_POINTS).step_by(step) {
+                unsafe { (*pts)[i] = tapuwae::extent_point(c, i as u32) };
+            }
+            HELP_DONE.fetch_add(1, core::sync::atomic::Ordering::Release);
+            ferros_sys::wake(&HELP_DONE, 1);
+            continue;
+        }
         let ((p, fine, g, side), r) = unsafe { (HELP_PASS, FRESH_JOB.1) };
         let buf = unsafe { &mut (&mut *(&raw mut FRESH))[..side * side] };
         let mid = side as f32 * 0.5;
@@ -1576,7 +1616,7 @@ fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
     // Bound: the attest button, the whole disc at every change (it has no components to redraw alone), in the surface's own pixels (`pack16`, as `render_fresh` writes them: the G2t16 encoding first used here came out nearly white). Two passes, as the fresh mark's, through the same machinery (tapuwae `render_button_pack16`: the ball four samples to a lane call, as the fresh mark shades its components): one sample a pixel at once, then a 4 × 4 grid to clear it up, given up for a newer handle. The adaptive `Look::attest()` (up to 64 samples a pixel, one at a time) took 22 s for the first draw and 55 s a keystroke on the workers (2026-11-04).
     let done = if unsafe { BONDED } {
         let t = now();
-        let p = tapuwae::Params::new_placed(&salt, typed, true);
+        let p = placed(&salt, typed);
         GPU_PARTS_US[0].store(ferros_sys::us_since(t), core::sync::atomic::Ordering::Relaxed);
         // The quick pass on the GPU when its service is up (GPU.md), before any helper is woken: when it is drawn there the helpers have nothing to do this pass (and must not write the rows it fills).
         let gpu_drawn = !fine && gpu_quick(grants, r, &p);
@@ -1587,6 +1627,7 @@ fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
             HELP_DONE.store(0, core::sync::atomic::Ordering::Relaxed);
             HELP_STOPPED.store(false, core::sync::atomic::Ordering::Relaxed);
             unsafe { HELP_PASS = (&p, fine, g, side) };
+            HELP_KIND.store(0, core::sync::atomic::Ordering::Release);
             HELP_JOB.fetch_add(1, core::sync::atomic::Ordering::Release);
             ferros_sys::wake(&HELP_JOB, up);
         }
