@@ -1,0 +1,10 @@
+# A host tool, kept out of the ferros workspace like app-icons: it reads logo.svg and writes logo.vsf once, at the owner's hand.
+[package]
+name = "logo-vsf"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+vsf = { path = "../../../vsf", features = ["raster"] }
