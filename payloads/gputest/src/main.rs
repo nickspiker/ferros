@@ -628,6 +628,134 @@ fn run(grants: u64, words: usize, groups: u32, uniforms: &[u64]) -> (u8, u32) {
     run_with(grants, words, groups, 0x1000, uniforms)
 }
 
+
+/// How exact the special function unit is (2026-11-05: each divide took six instructions, each square root seven): over 2^16 random pairs, FRCP and FRSQ alone in ulps from the true values, and the quotient with and without the reciprocal's own refinement against the correctly rounded one (the CPU's divide).
+fn div_test(grants: u64, arena: usize) -> ! {
+    use valhall::ssa::{self, F};
+    let (ins, outs) = (1usize << 20, 8usize << 20);
+    // Below 32 MiB: ahau keeps its code, frame and stage above.
+    let n = 1usize << 19;
+    let mut s = 0x9E37_79B9u32;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        s
+    };
+    for g in 0..n {
+        // Exponents within 2^-31 to 2^32 either sign, any mantissa: the shading's range, far from overflow and the subnormals.
+        let mut v = || {
+            let w = next();
+            (w & 0x807F_FFFF) | ((127 - 31 + (next() % 64)) << 23)
+        };
+        let (a, b) = (v(), v());
+        unsafe {
+            core::ptr::write_volatile((arena + ins + 8 * g) as *mut u32, a);
+            core::ptr::write_volatile((arena + ins + 8 * g + 4) as *mut u32, b);
+        }
+    }
+    ssa::begin();
+    ssa::reserve(2);
+    let g = ssa::gid();
+    let a = F::from_bits(ssa::load(1, g, 3, 0));
+    let b = F::from_bits(ssa::load(1, g, 3, 4));
+    let r = b.rcp_estimate();
+    let q = a * r;
+    let q1 = (-b).mul_add(q, a).mul_add(r, q);
+    let q2 = a / b;
+    let x = a.abs();
+    let rs = x.rsq_estimate();
+    let s0 = x * rs;
+    let s1 = x.sqrt();
+    for (i, v) in [r, q, q1, q2, rs, s0, s1].into_iter().enumerate() {
+        ssa::store(0, 5, (4 * i) as i16, v.to_bits());
+    }
+    let k = ssa::compile();
+    for (i, &w) in k.words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+    }
+    let mut uniforms = alloc::vec![ARENA_VA + outs as u64, ARENA_VA + ins as u64];
+    uniforms.extend_from_slice(&k.consts);
+    let reply = run_with(grants, k.words.len(), (n / 16) as u32, 0x1000 | if k.regs64 { 0x8000 } else { 0 }, &uniforms);
+    let ulps = |got: u32, want: f32| (got as i64 - want.to_bits() as i64).unsigned_abs();
+    // A float is the correctly rounded square root of x when x lies between the squares of the midpoints either side of it (each midpoint has 25 bits, its square 50, exact in f64).
+    let sqrt_ok = |x: f32, s: u32| {
+        let (lo, hi) = (f32::from_bits(s - 1) as f64, f32::from_bits(s + 1) as f64);
+        let sf = f32::from_bits(s) as f64;
+        let (ml, mh) = ((lo + sf) * 0.5, (hi + sf) * 0.5);
+        ml * ml <= x as f64 && x as f64 <= mh * mh
+    };
+    let (mut rcp_max, mut rcp_off, mut q_bad, mut q1_bad, mut q2_bad, mut rsq_max, mut rsq_off, mut s0_bad, mut s1_bad) = (0u64, 0u32, 0u32, 0u32, 0u32, 0u64, 0u32, 0u32, 0u32);
+    for gi in 0..n {
+        let rd = |o: usize| unsafe { core::ptr::read_volatile((arena + outs + 32 * gi + 4 * o) as *const u32) };
+        let a = f32::from_bits(unsafe { core::ptr::read_volatile((arena + ins + 8 * gi) as *const u32) });
+        let b = f32::from_bits(unsafe { core::ptr::read_volatile((arena + ins + 8 * gi + 4) as *const u32) });
+        // f64 holds over twice f32's bits plus two, so its quotient rounded again to f32 is the correctly rounded one.
+        let want = (a as f64 / b as f64) as f32;
+        let u = ulps(rd(0), (1. / b as f64) as f32);
+        rcp_max = rcp_max.max(u);
+        rcp_off += (u != 0) as u32;
+        q_bad += (rd(1) != want.to_bits()) as u32;
+        q1_bad += (rd(2) != want.to_bits()) as u32;
+        q2_bad += (rd(3) != want.to_bits()) as u32;
+        let x = a.abs();
+        // 1/sqrt(x) to f32 near enough to count ulps: the f64 square root by Newton from the f32 one.
+        let mut t = libm_sqrt(x) as f64;
+        t = 0.5 * (t + x as f64 / t);
+        t = 0.5 * (t + x as f64 / t);
+        let u = ulps(rd(4), (1. / t) as f32);
+        rsq_max = rsq_max.max(u);
+        rsq_off += (u != 0) as u32;
+        s0_bad += !sqrt_ok(x, rd(5)) as u32;
+        s1_bad += !sqrt_ok(x, rd(6)) as u32;
+    }
+    say!(grants, "gputest: div: status {}, {} us; FRCP {rcp_off} of {n} off, worst {rcp_max} ulp; FRSQ {rsq_off} off, worst {rsq_max} ulp\n", reply.0, reply.1);
+    say!(grants, "gputest: div: quotients not correctly rounded: a * FRCP {q_bad}, one correction on FRCP {q1_bad}, the refined divide {q2_bad}\n");
+    say!(grants, "gputest: div: square roots not correctly rounded: x * FRSQ {s0_bad}, refined {s1_bad}\n");
+    exit(0);
+}
+
+/// What the GPU reads of the attest stage at r = 448 (2026-11-05: every kernel reading it stopped finishing): the stage as the quick pass lays it out, each word copied by invocation g to a second buffer, then compared with what the CPU wrote.
+fn stage_read_test(grants: u64, arena: usize) -> ! {
+    use valhall::ssa::{self, U};
+    let (out, stage) = (16usize << 20, 11usize << 20);
+    let mut n = 0usize;
+    tapuwae::gpu::button_stage(448., |i| {
+        unsafe { core::ptr::write_volatile((arena + stage + 4 * n) as *mut u32, i) };
+        n += 1;
+    });
+    for g in 0..n {
+        unsafe { core::ptr::write_volatile((arena + out + 4 * g) as *mut u32, 0xDEAD_BEEF) };
+    }
+    ssa::begin();
+    ssa::reserve(2);
+    let g = ssa::gid();
+    let v = ssa::load(1, g, 2, 0);
+    ssa::store_at(0, g, 2, 0, v ^ U::splat(0));
+    let k = ssa::compile();
+    for (i, &w) in k.words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+    }
+    let mut uniforms = alloc::vec![ARENA_VA + out as u64, ARENA_VA + stage as u64];
+    uniforms.extend_from_slice(&k.consts);
+    let reply = run_with(grants, k.words.len(), n.div_ceil(16) as u32, 0x1000 | if k.regs64 { 0x8000 } else { 0 }, &uniforms);
+    let (mut wrong, mut untouched, mut first) = (0u32, 0u32, usize::MAX);
+    let mut max_idx = 0u32;
+    for gi in 0..n {
+        let want = unsafe { core::ptr::read_volatile((arena + stage + 4 * gi) as *const u32) };
+        let got = unsafe { core::ptr::read_volatile((arena + out + 4 * gi) as *const u32) };
+        max_idx = max_idx.max(want);
+        if got != want {
+            wrong += 1;
+            untouched += (got == 0xDEAD_BEEF) as u32;
+            if first == usize::MAX {
+                first = gi;
+            }
+        }
+    }
+    say!(grants, "gputest: stage read: {n} words (largest {max_idx}), status {}, {} us; {wrong} wrong ({untouched} never written), the first at {first}\n", reply.0, reply.1);
+    exit(0);
+}
 /// As `run` with the preload word given (bit 15: 64 registers a thread).
 fn run_with(grants: u64, words: usize, groups: u32, preload: u16, uniforms: &[u64]) -> (u8, u32) {
     let mut msg = [0u8; 18 + 8 * 16];
@@ -675,6 +803,14 @@ extern "C" fn gputest_main(grants: u64, input: u64, input_len: u64) -> ! {
     // Input byte 1: the ops test (the builder's new instructions); none: the Mandelbrot.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 1 {
         ops_test(grants, arena);
+    }
+    // Input byte 11: what the GPU reads of the attest stage.
+    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 11 {
+        stage_read_test(grants, arena);
+    }
+    // Input byte 10: how exact the special function unit is.
+    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 10 {
+        div_test(grants, arena);
     }
     // Input byte 9: where the quick pass's time goes.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 9 {

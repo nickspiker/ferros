@@ -134,6 +134,8 @@ struct Rec {
     loops: Vec<Loop>,
     /// Uniform slots 0 to reserved - 1 are the caller's (its addresses); the constants go from there.
     reserved: u8,
+    /// Divides, reciprocals and square roots refined to the CPU's correctly rounded results, and no multiply fused into an add (`exact`); otherwise the special function unit's values as they come (within an ulp) and contraction, which is faster and looks the same.
+    exact: bool,
 }
 
 /// The recording in progress. Single-threaded by construction: a kernel is recorded on one core, between [`begin`] and [`compile`].
@@ -145,6 +147,9 @@ fn rec() -> &'static mut Rec {
 }
 
 /// Record `op`, or what it comes to when its inputs are constants (worked out here, in the IEEE arithmetic the GPU does for these: add, multiply, negate, compare, the integer ops and conversions), or the chosen input of a select on a constant mask. The GPU computes the same bits with fewer instructions; folding nothing whose GPU result could differ (min, max, floor, the reciprocals).
+/// 1.0's bits.
+const ONE: u32 = 0x3F80_0000;
+
 fn push(op: Op) -> u32 {
     let r = rec();
     let c = |i: u32| match r.nodes[i as usize] {
@@ -156,7 +161,8 @@ fn push(op: Op) -> u32 {
     let mask = |t: bool| if t { u32::MAX } else { 0 };
     let folded: Option<Result<u32, u32>> = match op {
         Op::FAdd(a, b) => both(a, b).map(|(x, y)| Ok((f(x) + f(y)).to_bits())),
-        Op::FMul(a, b) => both(a, b).map(|(x, y)| Ok((f(x) * f(y)).to_bits())),
+        // A product with exactly 1 is the other factor (x · 1 = x for every x, signed zeros too).
+        Op::FMul(a, b) => both(a, b).map(|(x, y)| Ok((f(x) * f(y)).to_bits())).or_else(|| if c(b) == Some(ONE) { Some(Err(a)) } else if c(a) == Some(ONE) { Some(Err(b)) } else { None }),
         Op::FNeg(a) => c(a).map(|x| Ok((-f(x)).to_bits())),
         Op::FCmp(cond, a, b) => both(a, b).and_then(|(x, y)| match cond {
             Cond::Gt => Some(Ok(mask(f(x) > f(y)))),
@@ -198,7 +204,7 @@ fn const_of(x: u32) -> Option<u32> {
 
 /// Start recording a kernel.
 pub fn begin() {
-    unsafe { *(&raw mut REC) = Some(Rec { nodes: Vec::new(), loops: Vec::new(), reserved: 1 }) };
+    unsafe { *(&raw mut REC) = Some(Rec { nodes: Vec::new(), loops: Vec::new(), reserved: 1, exact: false }) };
 }
 
 /// The invocation's global id (X), preloaded in r60.
@@ -222,6 +228,11 @@ pub fn load(slot: u8, index: U, shift: u8, offset: i16) -> U {
     U(push(Op::Load { slot, shift, offset, index: index.0 }))
 }
 
+/// Record the exact forms (see `Rec::exact`) from here, for a test against the CPU's pixels bit for bit. Fast by default.
+pub fn exact(on: bool) {
+    rec().exact = on;
+}
+
 /// Uniform slots 0 to n - 1 for the caller (its addresses, set before `begin`'s recording uses any constant): the kernel's constants go from slot n. One by default.
 pub fn reserve(n: u8) {
     rec().reserved = n;
@@ -234,8 +245,23 @@ impl F {
     fn op(op: Op) -> F {
         F(push(op))
     }
-    /// 1 / self, refined by one Newton step from the special function unit's estimate.
+    /// The special function unit's 1 / self alone, unrefined (FRCP).
+    pub fn rcp_estimate(self) -> F {
+        F::op(Op::FRcp(self.0))
+    }
+    /// The special function unit's 1 / sqrt(self) alone, unrefined (FRSQ).
+    pub fn rsq_estimate(self) -> F {
+        F::op(Op::FRsq(self.0))
+    }
+    /// self · b + c with one rounding.
+    pub fn mul_add(self, b: F, c: F) -> F {
+        F::op(Op::FFma(self.0, b.0, c.0))
+    }
+    /// 1 / self: the special function unit's (within an ulp), refined by one Newton step when exact.
     pub fn rcp(self) -> F {
+        if !rec().exact {
+            return self.rcp_estimate();
+        }
         let r = F::op(Op::FRcp(self.0));
         let e = F::op(Op::FFma(self.neg().0, r.0, F::splat(1.).0));
         F::op(Op::FFma(r.0, e.0, r.0))
@@ -244,6 +270,10 @@ impl F {
     pub fn sqrt(self) -> F {
         let rs = F::op(Op::FRsq(self.0));
         let s = self * rs;
+        if !rec().exact {
+            // x · (1 / √x), within an ulp or so; 0 at 0 (where it would be 0 · ∞).
+            return F::select(self.gt(F::splat(0.)), s, self);
+        }
         let res = F::op(Op::FFma(s.neg().0, s.0, self.0));
         let half_rs = rs * 0.5;
         let s1 = F::op(Op::FFma(res.0, half_rs.0, s.0));
@@ -341,15 +371,19 @@ impl Div for F {
             let cv = f32::from_bits(cb);
             let rv = 1. / cv;
             let rf = F::splat(rv);
-            if cb & 0x007F_FFFF == 0 && rv.is_normal() && cv.is_normal() {
+            if !rec().exact || (cb & 0x007F_FFFF == 0 && rv.is_normal() && cv.is_normal()) {
                 return self * rf;
             }
             let q = self * rf;
             let res = F::op(Op::FFma(o.neg().0, q.0, self.0));
             return F::op(Op::FFma(res.0, rf.0, q.0));
         }
-        let r = o.rcp();
+        // Otherwise the same on the special function unit's reciprocal as it comes (within an ulp of 1 / o): on the device every one of 2^19 random quotients came out correctly rounded, the CPU's divide, without refining the reciprocal first (gputest 10, 2026-11-05). Four instructions; 1 / o three (its multiply by 1 folds away).
+        let r = o.rcp_estimate();
         let q = self * r;
+        if !rec().exact {
+            return q;
+        }
         let res = F::op(Op::FFma(o.neg().0, q.0, self.0));
         F::op(Op::FFma(res.0, r.0, q.0))
     }
@@ -568,6 +602,28 @@ pub fn compile() -> Compiled {
             other => other,
         };
     }
+    // Contraction (not when exact): an add of a product nothing else reads becomes one fused multiply-add, the product's negations carried into its factors and the add's into the sign of the product or of the addend; the multiply then goes with the dead code.
+    if !rec.exact {
+        let mut users = alloc::vec![0u32; n];
+        for op in &work {
+            op.sources(|s| users[s as usize] += 1);
+        }
+        for i in 0..n {
+            let Op::FAdd(a, b) = work[i] else { continue };
+            for (p, m, other) in [(0u32, a, b), (1, b, a)] {
+                let Op::FMul(x, y) = work[m as usize] else { continue };
+                if users[m as usize] != 1 {
+                    continue;
+                }
+                let product = (negmask[m as usize] & 3) ^ (negmask[i] >> p & 1);
+                let addend = negmask[i] >> (1 - p) & 1;
+                work[i] = Op::FFma(x, y, other);
+                negmask[i] = product | addend << 2;
+                users[m as usize] = 0;
+                break;
+            }
+        }
+    }
     let nodes = &work;
     let is_const = |i: u32| matches!(nodes[i as usize], Op::Const(_));
     // Dead code: live from the stores, the loop ends' conditions and every loop's state, backwards.
@@ -615,7 +671,9 @@ pub fn compile() -> Compiled {
                             });
                         }
                     }
-                    if upd != phi && (upd as usize) > h && (upd as usize) < i && !is_const(upd) && inner <= upd as usize {
+                    // A phi that is another field's update is read again by the loop's end copies, after every update is written: its own update may not take its register then.
+                    let read_at_end = rec.loops[loop_no].carried.iter().any(|&(p, u)| u == phi && p != phi);
+                    if upd != phi && (upd as usize) > h && (upd as usize) < i && !is_const(upd) && inner <= upd as usize && !read_at_end {
                         coalesce[upd as usize] = Some(phi);
                     }
                     last[phi as usize] = last[phi as usize].max(i);
@@ -911,12 +969,37 @@ pub fn compile() -> Compiled {
                 loop_start = k.len();
             }
             Op::LoopEnd(cont) => {
-                // Every update is already in its own register (a select or the counter's add): the phis take them in any order.
+                // The phis take their updates all at once (a parallel copy): an update can be another field's phi (a fold handing back a node already recorded), so a copy waits until no other pending copy still reads its register, and a ring of them goes through the scratch register. Constants last, as nothing reads them from a register.
+                let mut moves: Vec<(u8, u8)> = Vec::new();
+                for &(phi, upd) in &rec.loops[loop_no].carried {
+                    if !is_const(upd) && reg[upd as usize] != reg[phi as usize] {
+                        let (d, s) = (reg[phi as usize], reg[upd as usize]);
+                        // Two fields with one phi register would be an allocation bug.
+                        assert!(!moves.iter().any(|m| m.0 == d), "valhall::ssa: two loop copies into r{d}");
+                        moves.push((d, s));
+                    }
+                }
+                while !moves.is_empty() {
+                    match moves.iter().position(|&(d, _)| !moves.iter().any(|&(_, s)| s == d)) {
+                        Some(j) => {
+                            let (d, s) = moves.remove(j);
+                            k.mov_i32(r(d), r(s));
+                        }
+                        None => {
+                            // A ring: park one destination's old value, which its readers then take from the scratch register.
+                            let d = moves[0].0;
+                            k.mov_i32(r(SCRATCH), r(d));
+                            for m in moves.iter_mut() {
+                                if m.1 == d {
+                                    m.1 = SCRATCH;
+                                }
+                            }
+                        }
+                    }
+                }
                 for &(phi, upd) in &rec.loops[loop_no].carried {
                     if let Op::Const(bits) = nodes[upd as usize] {
                         k.iadd_imm_i32(r(reg[phi as usize]), Lut::ZERO, bits);
-                    } else if upd != phi && reg[upd as usize] != reg[phi as usize] {
-                        k.mov_i32(r(reg[phi as usize]), rr(upd));
                     }
                 }
                 k.branchz(rr(cont), top.take().expect("valhall::ssa: loop end without head")).reconverge();
