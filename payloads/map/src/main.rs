@@ -379,6 +379,8 @@ struct Map {
     /// Where the camera is flying (`fly`), and whether the flight leaves the open circle for the plane (the page drawn, shrinking with the circle, until it lands).
     target: Option<Cam>,
     flight: Option<Flight>,
+    /// The view a circle was opened from, flown back to when it closes (owner, 2026-11-06: "it should revert to the last view when exiting").
+    back: Option<Cam>,
     leaving: bool,
     /// A pinch on the open page: the spread it began at (sixteenths of a pixel) and the scale then; and the scale it is at now, shown live and kept as the preference when the fingers lift (64ths of an octave).
     pinch: Option<(i64, f32)>,
@@ -1340,6 +1342,8 @@ impl Map {
             (1, View::Map) => {
                 if let Some(i) = self.hit(sx, sy) {
                     let to = self.at(i);
+                    // The view to come back to when it closes.
+                    self.back = Some(self.cam);
                     self.fly(to);
                     self.view = View::Open(i);
                     self.draw();
@@ -1347,8 +1351,8 @@ impl Map {
             }
             (1, View::Open(_)) => {
                 if !inside {
-                    // Back to the plane: the page shrinks with the circle as the camera flies home, and the view is the plane once it lands (`step_cam`).
-                    let to = self.home();
+                    // Back to the plane: the page shrinks with the circle as the camera flies back to the view it was opened from (a circle open since the start has none: every circle in view), and the view is the plane once it lands (`step_cam`).
+                    let to = self.back.take().unwrap_or_else(|| self.home());
                     self.leaving = true;
                     self.fly(to);
                     self.draw();
@@ -1494,6 +1498,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         dev: false,
         target: None,
         flight: None,
+        back: None,
         leaving: false,
         pinch: None,
         scale_live: None,
@@ -1864,8 +1869,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 };
             }
             if nb >= 1 && map.view != View::Map {
-                // Moving away from an arrived circle leaves it: the overlay goes, the plane is free again.
+                // Moving away from an arrived circle leaves it: the overlay goes, the plane is free again, and the view it was opened from is not flown back to.
                 map.view = View::Map;
+                map.back = None;
             }
             if nb == 1 {
                 let id = both[0];
