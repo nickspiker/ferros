@@ -229,7 +229,7 @@ The GPU driver maps it coherent (MEMATTR index 6, shareable both ways) at GPU VA
 - The reply is the status and the job's µs.
 - Grants: slots 104-108, with the layer arena at 68 and `use gpu` at 24. The grants page is full at 108 slots (process.rs PREFS).
 - `payloads/gputest` is its first client. It builds the Mandelbrot through the valhall builder, runs it through the service, and checks every pixel against the CPU: 0 of 4096 differ, 1.0 ms at the 150 MHz floor.
-- **Open:** the GPU's clock. ABL leaves it at its floor and the kernel's clock policy never raises it. The service needs a clock request (DVFS domains 7 and 8, the L2 first).
+- **The GPU's clock:** ABL leaves it at its floor. The kernel's service loop raises it (G3D 890 MHz, G3DL2 900 MHz, DVFS domains 7 and 8, the L2 first) while a `gpu` process lives, and drops it back to the floor (150 / 160 MHz) otherwise.
 
 **The attest mark: one source (owner, 2026-11-05, "needs done").** The mark is tapuwae's attested Julia ball:
 - up to 1024 iterations a sample with eight running accumulators;
@@ -253,3 +253,50 @@ A hand-encoded copy is ruled out: it would be a second implementation of tapuwae
    - the logic ops.
    - `sqrt_rounded` must round correctly (one ulp moves the escape): an approximate reciprocal square root, then Newton steps, then a correction.
 5. **The ball as a kernel,** then attest drawing its mark through the service into the arena.
+
+### The mark on the GPU, as built and measured (2026-11-05)
+
+Everything above is built. tapuwae's own `orbit` and `shade` record through valhall's SSA (`tapuwae::gpu`) and run through the service. The owner's rule: the GPU mark has to look the same as the CPU's, not match it bit for bit.
+
+**What the kernels are.**
+- **The stage:** the index of every pixel inside the circle (`button_stage`, about 78 % of the square), made once per size. Each pass runs one invocation per staged pixel.
+- **The stage is padded to whole workgroups of 16,** using pixel 0, a corner outside the circle that comes out as the word 0. The GPU runs every invocation of the last group, and before the padding those past the list read whatever lay beyond it as a pixel index. After another job had left words there, the r = 448 pass stored outside the arena and never finished: a 1 s service timeout, then a wedged queue until `diag "restart gpu"`.
+- **Quick pass:** one sample per pixel. **Fine pass:** 16 distinct passes, one stratified jittered sample each, with per-pixel sums in the arena. Each pass's frame is shown as it lands.
+- **ahau's two outputs.** ahau keeps two outputs in its region of the arena (33 and 54 MiB). Each pass writes the one the screen isn't showing, and the screen reads straight from it: no copy, no half-written frame.
+
+**What made it fast** (staged quick pass at r = 448, gputest 08):
+
+| Step | Time |
+|---|---|
+| Staged, exact | 11.1 ms |
+| Negations folded into operand modifiers | 8.5 ms |
+| Unrefined FRCP/FRSQ, FMA contraction (`ssa::exact` keeps the refined forms) | 5.6 ms |
+| Hardware log2 and exp2 (Mesa's sequences; FREXPE's *log* form, the sqrt form is wrong here) | 4.2 ms |
+| A stopped invocation leaves after the loop's head (`LoopBreak`; tapuwae's GPU lane at one lane's meaning) | 3.6 ms |
+
+- The orbit's loop went from 207 to 89 instructions.
+- Accuracy against the CPU's pixels at r = 96: 0 further than 64/16384 per channel in the quick pass; 1 in the fine pass (on the set's edge, where one rounding moves the escape).
+- gputest 10 and 12 measure the special function unit:
+  - FRCP and FRSQ are within 1 ulp, and one correction on the raw FRCP gives the correctly rounded quotient for 2^19 random pairs;
+  - log2 and exp2 are within 1 ulp over 2^16 arguments.
+
+**In ahau, this device's mark at 900 px:**
+
+| Part | Before | Now |
+|---|---|---|
+| GPU job | 21.7 ms | 5.9 ms |
+| 16 fine passes | 404 ms | 116 ms |
+
+A keystroke now costs:
+- the handle's parameters: 2.8 ms (CPU, f64, on a worker core);
+- the compile: 1.2 ms;
+- the job: 5.9 ms.
+
+The first draw at a size adds the stage, 4.0 ms. Each part is on ahau's console line.
+
+**Still open, toward one 120 Hz frame:**
+- **The parameters.** `j_extent` is half of them: 128 address points × 256 inverse steps in f64. The choices:
+  - split it across the idle helper threads;
+  - or fewer points/steps, which would move every mark's framing (the owner's call).
+- **The compile.** Handle-dependent constants are folded at record time, so each keystroke compiles again.
+- **The shading's sin, cos and atan** are still polynomials. Valhall has FSIN_TABLE, FCOS_TABLE, FSINCOS_OFFSET and FATAN_ASSIST/TABLE.
