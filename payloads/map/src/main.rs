@@ -64,6 +64,25 @@ const SLOP: i64 = 24;
 /// One, in the rotation's Q14.
 const ONE: i64 = 1 << 14;
 
+/// The rate of every motion after a finger lifts or a tap: the halving's, ln 2 a display frame (owner, 2026-11-05: halve what is left each frame), as a critically damped spring (owner, 2026-11-06: "just needs some ease").
+const SPRING: f64 = core::f64::consts::LN_2;
+
+/// A critically damped spring to 0, `t` display frames after it started at offset `x0` with speed `v0` (a frame): its offset and speed then. x(t) = (x₀ + (v₀ + ωx₀)t)·e^(−ωt): it leaves at v₀ (from rest, easing in) and comes to 0 with every derivative going to 0, passing it at most once.
+fn spring(x0: f64, v0: f64, t: i32) -> (f64, f64) {
+    let t = t as f64;
+    let e = libm::exp(-SPRING * t);
+    let a = v0 + SPRING * x0;
+    ((x0 + a * t) * e, (v0 - SPRING * a * t) * e)
+}
+
+/// A camera flight in progress (`Map::fly`): where each part of the camera stood from the target when it began, in the space it looks even in — the centre's world offset (×256), the zoom's natural logarithm against the target's, the turn's angle from the target's in radians — each part's speed then (a display frame), and the frames since.
+#[derive(Clone, Copy)]
+struct Flight {
+    off: [f64; 4],
+    vel: [f64; 4],
+    t: i32,
+}
+
 /// A circle's radius in world units: area = share x the map's total, so r = 110 x sqrt(4 x share). Integer square root, no floats.
 fn radius_of(share: u32) -> i64 {
     isqrt(BASE_RADIUS * BASE_RADIUS * 4 * share as i64 / 1000)
@@ -324,7 +343,7 @@ struct Map {
     dys: [i64; 3],
     /// Across: the last three frames' movements, and the strip's spring to its page once the finger lifts: (offset at the start, speed at the start in pixels a frame in `page_dx`'s sense, frames gone); None at rest or under a finger.
     dxs: [i64; 3],
-    spring: Option<(f32, f32, i32)>,
+    spring: Option<(f64, f64, i32)>,
     /// Moving after the finger lifted, and the display's frame count the motion last stepped to (None: the first step is one frame).
     settling: bool,
     frame_seen: Option<u32>,
@@ -335,6 +354,7 @@ struct Map {
     dev: bool,
     /// Where the camera is flying (`fly`), and whether the flight leaves the open circle for the plane (the page drawn, shrinking with the circle, until it lands).
     target: Option<Cam>,
+    flight: Option<Flight>,
     leaving: bool,
     /// A pinch on the open page: the spread it began at (sixteenths of a pixel) and the scale then; and the scale it is at now, shown live and kept as the preference when the fingers lift (64ths of an octave).
     pinch: Option<(i64, f32)>,
@@ -777,30 +797,45 @@ impl Map {
         cam
     }
 
-    /// Go to `to`: the camera moves there a frame at a time (`step_cam`), each frame halving what is left (owner, 2026-11-05: "if I tap on a circle, should we follow the same halvzies rule and floor?" ... "Please").
+    /// Go to `to`: the camera flies there a display frame at a time (`step_cam`), each part of it on the critically damped spring (`spring`) in the space it looks even in (owner, 2026-11-05: the tap's flight follows the settings' snap; 2026-11-06: eased, as the pages are). From rest it eases in; a new target mid-flight keeps the speed the camera has, so a second tap turns the flight without a jolt.
     fn fly(&mut self, to: Cam) {
+        let vel = match (self.target, self.flight) {
+            (Some(_), Some(f)) => core::array::from_fn(|i| spring(f.off[i], f.vel[i], f.t).1),
+            _ => [0.; 4],
+        };
+        let (c, s) = (self.cam.c as f64, self.cam.s as f64);
+        let (tc, ts) = (to.c as f64, to.s as f64);
+        let off = [(self.cam.x - to.x) as f64, (self.cam.y - to.y) as f64, libm::log(self.cam.z as f64 / to.z as f64), libm::atan2(tc * s - ts * c, tc * c + ts * s)];
+        self.flight = Some(Flight { off, vel, t: 0 });
         self.target = Some(to);
         self.settling = true;
         self.frame_seen = None;
     }
 
-    /// One panel frame of the camera's flight to `target`: what is left of each part halved in the space it looks even in. The centre: the world offset, its magnitude halved and floored. The zoom: its logarithm, the geometric mean of where it is and where it goes, so a circle grows by the same factor each frame. The turn: the bisector of the two directions. Landed, exactly on the target, once what is left is under a pixel on the screen; then, leaving, the view is the plane again. Returns whether it is still flying.
+    /// One display frame of the camera's flight to `target`: each part where its spring has it now — the centre at its world offset, the zoom at the target's times e to the logarithm's offset (a circle grows by smooth factors), the turn at the target's direction turned by the angle's. Landed, exactly on the target, once every part and its speed are under half a pixel on the screen; then, leaving, the view is the plane again. Returns whether it is still flying.
     fn step_cam(&mut self) -> bool {
-        let Some(t) = self.target else { return false };
-        let half = |d: i64| d.signum() * (d.abs() >> 1);
-        let (dx, dy) = (half(t.x - self.cam.x), half(t.y - self.cam.y));
-        let z = isqrt(self.cam.z * t.z);
-        let (c, s) = (self.cam.c + t.c, self.cam.s + t.s);
-        let len = isqrt(c * c + s * s);
-        // Opposite directions have no bisector: a quarter turn first.
-        let (c, s) = if len == 0 { (-self.cam.s, self.cam.c) } else { (c * ONE / len, s * ONE / len) };
-        self.cam = Cam { x: t.x - dx, y: t.y - dy, z, c, s };
-        // Under a pixel: the centre's offset at this zoom (world ×256 at 16.16 pixels a unit), the zoom's change across the screen's width, the turn's at the same reach.
-        let px = |d: i64| (d.abs() * z) >> 24;
-        let still = px(dx) > 0 || px(dy) > 0 || (t.z - z).abs() * self.w / z.max(1) > 0 || ((c - t.c).abs() + (s - t.s).abs()) * self.w >> 14 > 0;
+        let (Some(t), Some(mut f)) = (self.target, self.flight) else { return false };
+        f.t += 1;
+        let p: [(f64, f64); 4] = core::array::from_fn(|i| spring(f.off[i], f.vel[i], f.t));
+        let z = t.z as f64 * libm::exp(p[2].0);
+        let (cs, sn) = (libm::cos(p[3].0), libm::sin(p[3].0));
+        let (tc, ts) = (t.c as f64, t.s as f64);
+        self.cam = Cam {
+            x: t.x + libm::round(p[0].0) as i64,
+            y: t.y + libm::round(p[1].0) as i64,
+            z: libm::round(z) as i64,
+            c: libm::round(tc * cs - ts * sn) as i64,
+            s: libm::round(ts * cs + tc * sn) as i64,
+        };
+        self.flight = Some(f);
+        // On the screen, in pixels: the centre's offset at this zoom (world ×256 at 16.16 pixels a unit), the zoom's and the turn's across the screen's width; each part and its speed.
+        let w = self.w as f64;
+        let px = |i: usize, v: f64| if i < 2 { v.abs() * z / (1u64 << 24) as f64 } else { v.abs() * w };
+        let still = (0..4).any(|i| px(i, p[i].0) >= 0.5 || px(i, p[i].1) >= 0.5);
         if !still {
             self.cam = t;
             self.target = None;
+            self.flight = None;
             if self.leaving {
                 self.leaving = false;
                 self.view = View::Map;
@@ -1172,25 +1207,21 @@ impl Map {
         }
     }
 
-    /// One frame of the strip on its way to its page (`page_dx` to 0; `release_settings` picked the page). The page is a detent and the strip a mass on a critically damped spring to it (owner, 2026-11-06: "it's clunky ... just needs some ease"): x(t) = (x₀ + (v₀ + ωx₀)t)·e^(−ωt), from the offset x₀ and the speed v₀ it started with, t in display frames. One curve for every case and smooth in every derivative: it leaves at the finger's speed (from rest, easing in), slides into the page with every derivative going to 0, and momentum heading away coasts out and comes back on the same curve; a flick that would pass the page swings past it once, a little, as a detent does. ω is the halving's rate, ln 2 a frame. Computed from the closed form at each frame count, so a missed frame skips a sample, never the motion. A strip left off its page with no spring (a title tapped, a snap caught and let go) starts one from rest.
+    /// One frame of the strip on its way to its page (`page_dx` to 0; `release_settings` picked the page). The page is a detent and the strip a mass on a critically damped spring to it (`spring`; owner, 2026-11-06: "it's clunky ... just needs some ease"), from the offset and the speed it started with, t in display frames. One curve for every case and smooth in every derivative: it leaves at the finger's speed (from rest, easing in), slides into the page with every derivative going to 0, and momentum heading away coasts out and comes back on the same curve; a flick that would pass the page swings past it once, a little, as a detent does. ω is the halving's rate, ln 2 a frame. Computed from the closed form at each frame count, so a missed frame skips a sample, never the motion. A strip left off its page with no spring (a title tapped, a snap caught and let go) starts one from rest.
     fn step_strip(&mut self) {
-        const W: f32 = core::f32::consts::LN_2;
         let (x0, v0, t) = match self.spring {
             Some(s) => s,
-            None if self.page_dx != 0 => (self.page_dx as f32, 0., 0),
+            None if self.page_dx != 0 => (self.page_dx as f64, 0., 0),
             None => return,
         };
         let t = t + 1;
-        let tf = t as f32;
-        let e = libm::expf(-W * tf);
-        let x = (x0 + (v0 + W * x0) * tf) * e;
-        let v = (v0 - W * (v0 + W * x0) * tf) * e;
+        let (x, v) = spring(x0, v0, t);
         // At rest on the page once both the offset and the speed are under half a pixel: nothing more would show.
         if x.abs() < 0.5 && v.abs() < 0.5 {
             self.page_dx = 0;
             self.spring = None;
         } else {
-            self.page_dx = libm::roundf(x) as i64;
+            self.page_dx = libm::round(x) as i64;
             self.spring = Some((x0, v0, t));
         }
     }
@@ -1210,7 +1241,7 @@ impl Map {
                 self.page_dx -= k * self.w;
                 self.scroll = 0;
             }
-            self.spring = if self.page_dx != 0 || vx != 0 { Some((self.page_dx as f32, vx as f32, 0)) } else { None };
+            self.spring = if self.page_dx != 0 || vx != 0 { Some((self.page_dx as f64, vx as f64, 0)) } else { None };
         }
         if self.swipe == 2 {
             let m = self.dys.iter().map(|d| d.abs()).max().unwrap_or(0);
@@ -1418,6 +1449,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         armed: false,
         dev: false,
         target: None,
+        flight: None,
         leaving: false,
         pinch: None,
         scale_live: None,
