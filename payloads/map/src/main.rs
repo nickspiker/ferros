@@ -322,10 +322,9 @@ struct Map {
     swipe: u8,
     drag_base: (i64, i64),
     dys: [i64; 3],
-    /// Across: the last three frames' movements, the strip's momentum after the lift (pixels a frame, in `page_dx`'s sense, losing one a frame), and the brake when that momentum would carry it past its page: (offset at the lift, frames to stop, frames gone).
+    /// Across: the last three frames' movements, and the strip's spring to its page once the finger lifts: (offset at the start, speed at the start in pixels a frame in `page_dx`'s sense, frames gone); None at rest or under a finger.
     dxs: [i64; 3],
-    vx: i64,
-    brake: (i64, i64, i64),
+    spring: Option<(f32, f32, i32)>,
     /// Moving after the finger lifted, and the display's frame count the motion last stepped to (None: the first step is one frame).
     settling: bool,
     frame_seen: Option<u32>,
@@ -1173,43 +1172,37 @@ impl Map {
         }
     }
 
-    /// One frame of the strip on its way to its page (`page_dx` to 0; `release_settings` set the momentum and the page). Three cases, each continuous in speed:
-    /// - braked (the momentum would pass the page): the offset falls as (1 − t/T)², speed 2d/T at the lift (the finger's) and 0 on arrival;
-    /// - momentum heading away (the resting point rounded back to this page): it coasts out losing a pixel a frame, and the page pulls it back once it rests;
-    /// - otherwise the larger of the momentum and the halving's step (the offset halved, floored toward 0): the momentum carries it while it is the faster, and the two are equal where the halving takes over. Never past the page, by construction: this case only runs with the stopping distance short of the page (else it is braked), so the speed stays under the offset, and the halving's step is at most the offset.
+    /// One frame of the strip on its way to its page (`page_dx` to 0; `release_settings` picked the page). The page is a detent and the strip a mass on a critically damped spring to it (owner, 2026-11-06: "it's clunky ... just needs some ease"): x(t) = (x₀ + (v₀ + ωx₀)t)·e^(−ωt), from the offset x₀ and the speed v₀ it started with, t in display frames. One curve for every case and smooth in every derivative: it leaves at the finger's speed (from rest, easing in), slides into the page with every derivative going to 0, and momentum heading away coasts out and comes back on the same curve; a flick that would pass the page swings past it once, a little, as a detent does. ω is the halving's rate, ln 2 a frame. Computed from the closed form at each frame count, so a missed frame skips a sample, never the motion. A strip left off its page with no spring (a title tapped, a snap caught and let go) starts one from rest.
     fn step_strip(&mut self) {
-        let x = self.page_dx;
-        let (x0, t_end, t) = self.brake;
-        if t_end > 0 {
-            let t = t + 1;
-            let left = t_end - t;
-            self.page_dx = x0 * left * left / (t_end * t_end);
-            self.brake = if left == 0 { (0, 0, 0) } else { (x0, t_end, t) };
-            self.vx = 0;
-            return;
-        }
-        if x == 0 {
-            self.vx = 0;
-            return;
-        }
-        if self.vx != 0 && self.vx.signum() == x.signum() {
-            self.page_dx += self.vx;
+        const W: f32 = core::f32::consts::LN_2;
+        let (x0, v0, t) = match self.spring {
+            Some(s) => s,
+            None if self.page_dx != 0 => (self.page_dx as f32, 0., 0),
+            None => return,
+        };
+        let t = t + 1;
+        let tf = t as f32;
+        let e = libm::expf(-W * tf);
+        let x = (x0 + (v0 + W * x0) * tf) * e;
+        let v = (v0 - W * (v0 + W * x0) * tf) * e;
+        // At rest on the page once both the offset and the speed are under half a pixel: nothing more would show.
+        if x.abs() < 0.5 && v.abs() < 0.5 {
+            self.page_dx = 0;
+            self.spring = None;
         } else {
-            let halving = x.abs() - (x.abs() >> 1);
-            let step = self.vx.abs().max(halving);
-            self.page_dx -= x.signum() * step;
+            self.page_dx = libm::roundf(x) as i64;
+            self.spring = Some((x0, v0, t));
         }
-        self.vx -= self.vx.signum();
     }
 
     /// The finger lifted from a drag on the settings. Up and down, the fling is the largest of the last three frames' movements, the page going on the way the finger last went (owner, 2026-11-05: "maintain the max of the last three distance of finger movements vertically and always subtract one pixel per frame").
-    /// Across, the same momentum carries the strip (owner, 2026-11-06: a quick swipe from 0 to 49 % must roll on to the next page; "strict first principles physics"). Losing a pixel a frame, speed v goes v + (v − 1) + … + 1 = v(v + 1)/2 pixels before it rests; the page is the one nearest that resting point, as many pages on as the fling reaches. `page` moves there now and `page_dx` becomes the strip's offset from it; `step` brings that offset to 0. When the momentum would carry the strip past its page, the page brakes it evenly from the lift, v²/2d a frame per frame, so it stops exactly there with no jump in its speed (`brake`).
+    /// Across, the same momentum decides the page (owner, 2026-11-06: a quick swipe from 0 to 49 % must roll on to the next page; "strict first principles physics"). Losing a pixel a frame, speed v goes v + (v − 1) + … + 1 = v(v + 1)/2 pixels before it rests; the page is the one nearest that resting point, as many pages on as the fling reaches. `page` moves there now and `page_dx` becomes the strip's offset from it; the spring (`step_strip`) takes it there, starting at the finger's speed.
     fn release_settings(&mut self) {
         if self.swipe == 1 {
             let m = self.dxs.iter().map(|d| d.abs()).max().unwrap_or(0);
             let last = self.dxs.iter().rev().find(|&&d| d != 0).copied().unwrap_or(0);
-            self.vx = last.signum() * m;
-            let rest = self.page_dx + self.vx.signum() * m * (m + 1) / 2;
+            let vx = last.signum() * m;
+            let rest = self.page_dx + vx.signum() * m * (m + 1) / 2;
             // The page nearest the resting point: k pages back (positive `page_dx` brings the page before in).
             let k = (rest + rest.signum() * self.w / 2) / self.w;
             if k != 0 {
@@ -1217,9 +1210,7 @@ impl Map {
                 self.page_dx -= k * self.w;
                 self.scroll = 0;
             }
-            // Moving toward the page and enough to pass it: braked to stop on it, d = the offset left, over T = 2d/v frames.
-            let d = self.page_dx.abs();
-            self.brake = if m > 0 && self.vx.signum() == -self.page_dx.signum() && m * (m + 1) / 2 >= d { (self.page_dx, (2 * d + m - 1) / m, 0) } else { (0, 0, 0) };
+            self.spring = if self.page_dx != 0 || vx != 0 { Some((self.page_dx as f32, vx as f32, 0)) } else { None };
         }
         if self.swipe == 2 {
             let m = self.dys.iter().map(|d| d.abs()).max().unwrap_or(0);
@@ -1227,7 +1218,7 @@ impl Map {
             self.fling = -last.signum() * m;
         }
         self.swipe = 0;
-        self.settling = self.page_dx != 0 || self.fling != 0 || self.vx != 0;
+        self.settling = self.page_dx != 0 || self.fling != 0 || self.spring.is_some();
     }
 
     /// One display frame of the motion after a finger lifted or a tap (owner, 2026-11-05): the camera's flight (`step_cam`), and the settings' — the strip's offset from its page halves, floored toward 0 so it lands there in a few frames (½, ¾, ⅞ of the way…); the fling carries the page by its speed and loses a pixel a frame. Returns whether anything is still moving.
@@ -1244,7 +1235,7 @@ impl Map {
             }
         }
         let flying = self.step_cam();
-        self.page_dx != 0 || self.fling != 0 || flying
+        self.page_dx != 0 || self.fling != 0 || self.spring.is_some() || flying
     }
 
     /// A tap: one finger or two, at a panel point. Logged with what it did, so a session can be followed from `diag console`.
@@ -1350,8 +1341,7 @@ impl Map {
                         self.page_dx += k as i64 * self.w;
                         self.scroll = 0;
                         self.fling = 0;
-                        self.vx = 0;
-                        self.brake = (0, 0, 0);
+                        self.spring = None;
                         self.settling = true;
                         self.frame_seen = None;
                     }
@@ -1421,8 +1411,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         drag_base: (0, 0),
         dys: [0; 3],
         dxs: [0; 3],
-        vx: 0,
-        brake: (0, 0, 0),
+        spring: None,
         settling: false,
         frame_seen: None,
         taps: 0,
@@ -1683,8 +1672,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.drag_base = (map.page_dx, map.scroll);
             map.dys = [0; 3];
             map.dxs = [0; 3];
-            map.vx = 0;
-            map.brake = (0, 0, 0);
+            map.spring = None;
             map.fling = 0;
             map.settling = map.target.is_some();
         }
