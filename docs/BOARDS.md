@@ -13,7 +13,8 @@ ferros runs on two Tensor G3 (zuma) phones. The kernel tells them apart at entry
 | Type-C controller | MAX77759 at G#25 on hsi2c_11 | the same |
 | Fuel gauge | MAX77759 at G#36 on hsi2c_11 | the same |
 | Low 2 GB carve-outs | zuma's | the same (they come from the SoC's tree) |
-| Panel, touch, cutout | HK3, FTM5, 1344 × 2992 | AK3B, 1080 × 2400; touch not brought up |
+| Panel, touch, cutout | HK3, FTM5, 1344 × 2992 | AK3B (docs/AK3B.md), 1080 × 2400; touch not brought up |
+| Touch controller | ST FTM5 on spi20, reset gpp21-2 | Goodix "nottingham" (Berlin family, `goodix_brl_spi.c`) on the same spi20 (10 MHz) and the same reset gpp21-2, interrupt gpn0-0 (falling edge), its own vdd and avdd rails (mapping to PMIC LDOs not yet read); coordinates 0-1079 × 0-2399; firmware `goodix_firmware_ak3b.bin` from Android's vendor partition |
 | Side keys, panel rows (board::keys) | power 933..=1124, volume rocker 1279..=1660 (measured 2026-11-06) | power 629..=797, volume rocker 932..=1271 (measured 2026-11-06) |
 
 akita's repeater tune, from its MP board overlay (`repeater_tune1..5`): G#50 = G#0A, G#70 = G#5F, G#71 = G#2E, G#73 = G#80, G#79 = G#40 (ferros_hal `AKITA_REPEATER_TUNE`).
@@ -26,6 +27,8 @@ Where each side key sits, in panel rows, top and bottom edge inclusive (`board::
 Measured with `ferros-bridge display ruler`: every row shows its own number in binary across the width (most significant bit left, white a 1), and the person reads the row level with each key's edge off the glass. The same screen then draws the stored edges as 1 px hairlines (power green, rocker red) to check them. akita, by the owner, 2026-11-06: power 629..=797 (001001110101..=001100011101), rocker 932..=1271 (001110100100..=010011110111); checked with the hairlines. husky, by the owner, 2026-11-06: power 933..=1124 (001110100101..=010001100100), rocker 1279..=1660 (010011111111..=011001111100); its marks placed by eye had sat at 1050 and 1700, the chevron 40 rows below the rocker. On husky the hv draws the gate (ferros_hv gate.rs), with the same spans and the same derivation.
 
 ## akita's facts, and where they came from
+
+Google's sources for akita's own parts, in the reference tree: the panel driver (`/mnt/Harbor/ferros-ref/kdev-akita`, kernel/devices/google/akita, branch android-gs-akita-android16) and the touch driver (`/mnt/Harbor/ferros-ref/touch-goodix`, kernel/google-modules/touch/goodix_touch, the same branch).
 
 From its factory image (CP2A.260805.005, `/mnt/Harbor/tmp/akita-factory/`, SHA-256 checked against Google's): `vendor_kernel_boot.img` carries four zuma base trees, `dtbo.img` nineteen akita board overlays (DEV, Proto, EVT, DVT, PVT, MP); this phone is the MP one. Dumped to text in `/mnt/Harbor/tmp/akita-factory/dt/` by a scratch walker (no `dtc` on the host).
 
