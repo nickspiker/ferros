@@ -7,7 +7,7 @@
 //!
 //! The `display` endpoint (SHELL.md: the shell draws lists, this process paints). One op per call, first byte the op, coordinates u16 little-endian in panel pixels, colours u32 little-endian G#00RRGGBB, one status byte back (0 = ok, 1 = bad message, 2 = too big):
 //! - 1 `begin`: a new frame — the whole surface transparent. Until a client's first `begin`, this process paints its own first-boot screen.
-//! - 2 `text [x][y baseline][px][colour][align: 0 left, 1 centre at x, 2 right edge at x][utf-8…]`.
+//! - 2 `text [x i16][y baseline i16][px][colour][align: 0 left, 1 centre at x, 2 right edge at x][utf-8…]`: x and y signed (since 2026-11-05: the settings pages slide off either edge), so text may start off the screen and is clipped by pixel.
 //! - 3 `rect [x][y][w][h][colour]` (w or h = 0: a one-pixel rule).
 //! - 4 `present`: the frame goes to the panel (what nothing painted shows black). Reply byte 1 = whether DECON advanced.
 //! - 5 `info` → `[w u16][h u16][frames u32][uptime s u32]`.
@@ -3218,8 +3218,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     }
                 }
                 Some(2) if m.len() >= 12 => {
-                    let x = u16::from_le_bytes([m[1], m[2]]) as f32;
-                    let y = u16::from_le_bytes([m[3], m[4]]) as f32;
+                    let x = i16::from_le_bytes([m[1], m[2]]) as f32;
+                    let y = i16::from_le_bytes([m[3], m[4]]) as f32;
                     let px = u16::from_le_bytes([m[5], m[6]]) as f32;
                     let colour = 0xFF00_0000 | u32::from_le_bytes([m[7], m[8], m[9], m[10]]) & 0x00FF_FFFF;
                     let align = m[11];

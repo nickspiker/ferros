@@ -101,12 +101,24 @@ The front is what the thing is: the thread, the viewfinder, the map. The back is
 
 ### The device is a circle too, and it is the settings
 
-The phone itself is the first circle on the map: the one the spec says first boot places, where you pair with a device you trust. It has one side, the device's settings (owner, 2026-11-05; until then a dashboard of facts on its front, the settings on its back). Its choices:
-- the number base, the first of them: four choices, each shown as two seconds and a megabyte written in it, so the choice is made by seeing, not by name;
-- names under circles, on or off;
-- the wake (the proximity gate);
-- validate-on-demand for the firmware, with its disclaimer;
-- pairing.
+The phone itself is the first circle on the map: the one the spec says first boot places, where you pair with a device you trust. It has one side, the device's settings (owner, 2026-11-05; until then a dashboard of facts on its front, the settings on its back).
+
+Its pages are Photon's split (photon docs/settings-panel.md), a ring a swipe goes round:
+
+| Page | What it holds now | Later |
+|---|---|---|
+| Appearance | theme (four swatches), brightness, names under circles | |
+| Numbers | the base: four rows, each two seconds and a mebibyte written in it, so the choice is made by seeing | |
+| Keyboard | layout: Dvorak or QWERTY | shape writing |
+| Security | unlock at boot, two taps to turn on, the theft warning under it | lock, wipe |
+| Power | proximity wake | |
+| Connections | the links' states | choosing a WiFi network, Bluetooth accessories, the NFC tag |
+| About | version, press to ready, since power on, battery, processes, the vault, the chip | validate-on-demand for the firmware |
+| Developer | dither, light scope | |
+
+The page's title is large at the top, its neighbours' small and dim either side; a swipe across goes round the ring, a tap on a neighbour's title goes there. Under a lifted finger the strip snaps to a page, its offset halving each frame (floored, so it lands), and a fling scrolls a page longer than its band by the largest of the last three frames' movements, losing a pixel a frame; both counted in the panel's frames, not in frames drawn (owner, 2026-11-05).
+
+Developer is a page on development builds. On release builds twelve taps in a row on About's version line make it one (kept in the vault); a hint shows from the fourth tap and counts down, and any other tap starts the count again. No time window.
 
 That is the whole of settings: the device's own choices on the device's own circle, and each app's choices on the app's circle. Nothing is two levels deep.
 

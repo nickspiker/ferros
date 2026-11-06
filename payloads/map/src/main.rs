@@ -175,8 +175,9 @@ impl Batch {
     fn text(&mut self, x: i64, y: i64, px: u16, colour: u32, align: u8, t: &str) {
         let mut m = [0u8; 140];
         m[0] = 2;
-        m[1..3].copy_from_slice(&(x.clamp(0, 65535) as u16).to_le_bytes());
-        m[3..5].copy_from_slice(&(y.clamp(0, 65535) as u16).to_le_bytes());
+        // Signed, as the display reads them (a page sliding off the left edge has its text at negative x); the clamp is the field's own range.
+        m[1..3].copy_from_slice(&(x.clamp(-32768, 32767) as i16).to_le_bytes());
+        m[3..5].copy_from_slice(&(y.clamp(-32768, 32767) as i16).to_le_bytes());
         m[5..7].copy_from_slice(&px.to_le_bytes());
         m[7..11].copy_from_slice(&colour.to_le_bytes());
         m[11] = align;
@@ -253,16 +254,37 @@ enum View {
     Open(usize),
 }
 
-/// The device's back: what each row does when tapped.
-#[derive(Clone, Copy)]
+/// What a tap on the settings does: each row's own, kept with its rectangle as the last frame laid it out.
+#[derive(Clone, Copy, PartialEq)]
 enum Choice {
     Base(u8),
     Labels,
     Dither,
-    Theme,
+    /// One of the theme swatches.
+    Theme(u8),
     /// The brightness dots: which one is decided by x.
     Brightness,
+    /// The keyboard's layout (honeycomb::LAYOUTS: 0 Dvorak, 1 QWERTY).
+    Layout(u8),
+    UnlockAtBoot,
+    ProxWake,
+    /// The light scope's channel, round 0 (off) to 6.
+    Scope,
+    /// About's version line: twelve taps in a row and Developer is a page.
+    Version,
+    /// A neighbour page's title: one page that way.
+    Page(i8),
 }
+
+/// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"). Developer is a page only on development builds, or once the twelve taps made it one.
+const PAGES: [&str; 8] = ["appearance", "numbers", "keyboard", "security", "power", "connections", "about", "developer"];
+/// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
+const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
+/// Taps in a row on About's version line that make Developer a page (owner, 2026-11-05: "twelve"), and the tap from which the hint shows and counts down ("don't show a toast hint until four taps"). No time window: any other tap starts the count again.
+const DEV_TAPS: u8 = 12;
+const DEV_HINT: u8 = 4;
+/// The radios and USB in the kernel's facts order (facts 33 + 8 · link, ferros_sys::measure), as the Connections page names them.
+const LINKS: [&str; 6] = ["cellular", "WiFi", "Bluetooth", "NFC", "GNSS", "USB"];
 
 /// The four bases in the order the chooser shows them: the house base first.
 const BASES: [u8; 4] = [12, 0x8C, 10, 16];
@@ -287,8 +309,27 @@ struct Map {
     rs: [i64; N],
     cam: Cam,
     view: View,
-    /// The device back's rows, as laid out by the last frame: (top, bottom, what).
-    rows: [(i64, i64, Choice); 8],
+    /// The settings' tappable places, as laid out by the last frame: (left, right, top, bottom, what).
+    rows: [(i64, i64, i64, i64, Choice); 32],
+    /// The settings page on show; the strip's offset from it in pixels (positive: dragged right, the page before it coming in), kept within half a screen by moving `page` as it passes; how far the page is scrolled up; and the fling still carrying it, pixels a frame, losing one a frame.
+    page: usize,
+    page_dx: i64,
+    scroll: i64,
+    fling: i64,
+    /// Each page's content height as last laid out, for how far it scrolls.
+    page_h: [i64; 8],
+    /// The drag on the settings: which way it is locked (0 not yet, 1 across, 2 up and down), where the strip and the scroll stood at the touch, and the last three frames' movements up and down.
+    swipe: u8,
+    drag_base: (i64, i64),
+    dys: [i64; 3],
+    /// Moving after the finger lifted, and the display's frame count the motion last stepped to (None: the first step is one frame).
+    settling: bool,
+    frame_seen: Option<u32>,
+    /// Taps in a row on About's version line; the unlock-at-boot row armed by its first tap.
+    taps: u8,
+    armed: bool,
+    /// Developer made a page by the twelve taps (the vault, `map.dev`).
+    dev: bool,
     nrows: usize,
     /// Each circle's own turn (its icon), (cos, sin) in Q14; two fingers in a circle twist it.
     rc: [i64; N],
@@ -746,74 +787,364 @@ impl Map {
         b.send(self.display);
     }
 
-    /// The device's settings, inscribed in the circle an app lives in (owner, 2026-11-05), laid out in 48ths of the screen's width (`u`, 28 px on husky): the page as it stood at 1344 px, scaled with the panel. The number base is chosen by seeing — each row is two seconds and a mebibyte (2^23 bits, a whole number of doublings) written in that base — with its name small beneath.
+    /// How many settings pages there are now: Developer the last of them on development builds, or once the twelve taps made it one.
+    fn pages(&self) -> usize {
+        if DEV || self.dev { PAGES.len() } else { PAGES.len() - 1 }
+    }
+    /// Page `p`, round the ring either way.
+    fn wrap(&self, p: isize) -> usize {
+        p.rem_euclid(self.pages() as isize) as usize
+    }
+    /// The settings' layout unit: a 48th of the screen's width (28 px on husky), the page as it stood at 1344 px scaled with the panel.
+    fn unit(&self) -> i64 {
+        self.w / 48
+    }
+    /// The settings' bands on the panel: the titles' baseline under the camera, and the band the page lives in (top, bottom).
+    fn bands(&self) -> (i64, i64, i64) {
+        let u = self.unit();
+        let title = ferros_sys::CUTOUT_BOTTOM as i64 + 4 * u;
+        (title, title + 3 * u, self.h - 4 * u)
+    }
+    /// How far page `p` scrolls: what of it does not fit its band.
+    fn scroll_max(&self, p: usize) -> i64 {
+        let (_, top, bottom) = self.bands();
+        (self.page_h[p] - (bottom - top)).max(0)
+    }
+
+    /// The settings (owner, 2026-11-05): the pages a ring, the page on show inscribed in the circle an app lives in, its title large at the top with its neighbours' small and dim either side; a swipe across goes round the ring, up and down scrolls a page longer than its band. Laid out in 48ths of the width (`unit`).
     fn settings(&mut self, b: &mut Batch) {
         let (cx, cy, r) = self.arrived();
-        let u = self.w / 48;
-        let px = |k: i64, d: i64| (k * u / d) as u16;
-        // The block (the title's top to the dots' bottom, measured on the device 2026-11-05: 929 rows, its middle 32 below the first baseline's 14 units above centre) centred on the circle's centre.
-        let mut y = cy - 15 * u;
-        b.text(cx, y, px(2, 1), white(), 1, "settings");
-        y += 7 * u / 2;
-        let now_base = ferros_sys::device_base();
-        for code in BASES {
-            let f = tatau::Fmt::new(tatau::Base::from_code(code).unwrap_or(tatau::Base::Dms), Style::Glyphs);
-            let mut v = Line::new();
-            let _ = tatau::duration_ns(&mut v, f, 2_000_000_000, 1);
-            v.s("   ");
-            let _ = tatau::size_bits(&mut v, f, 1 << 23, 1);
-            let current = code == now_base;
-            b.text(cx, y, px(3, 2), if current { white() } else { grey() }, 1, v.as_str());
-            b.text(cx, y + 11 * u / 8, px(7, 8), if current { grey() } else { dim() }, 1, base_name(code));
-            if current {
-                b.disc(cx - 14 * u, y - u / 2, u / 3, white());
-            }
-            self.push_row(y - 2 * u, y + 15 * u / 8, Choice::Base(code));
-            y += 4 * u;
-        }
-        y += u;
-        let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
-        b.text(cx, y, px(5, 4), grey(), 1, if labels { "names under circles: on" } else { "names under circles: off" });
-        self.push_row(y - 3 * u / 2, y + u, Choice::Labels);
-        y += 3 * u;
-        let spatial = ferros_sys::pref(ferros_sys::PREF_DITHER) == 1;
-        b.text(cx, y, px(5, 4), grey(), 1, if spatial { "dither: spatial (the panel rests)" } else { "dither: spatial and temporal" });
-        self.push_row(y - 3 * u / 2, y + u, Choice::Dither);
-        y += 3 * u;
-        let mut tl = Line::new();
-        let _ = write!(tl, "theme: {}", ferros_sys::theme::current().name);
-        b.text(cx, y, px(5, 4), grey(), 1, tl.as_str());
-        self.push_row(y - 3 * u / 2, y + u, Choice::Theme);
-        // Brightness: nine dots, a stop apart, dimmest on the left; the current one larger and white.
-        y += 3 * u;
-        b.text(cx, y, px(5, 4), grey(), 1, "brightness");
-        y += 2 * u;
-        let now = 8 - ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS).min(8) as i64;
-        let (x0, step) = Map::dots(cx, u);
-        for k in 0..9 {
-            let x = x0 + k * step;
-            if k == now {
-                b.disc(x, y, u / 2, white());
-            } else {
-                b.disc(x, y, u / 4, dim());
+        let u = self.unit();
+        let (title_y, _, _) = self.bands();
+        // The titles: a strip three eighths of the screen apart, moving with the pages at that fraction of their speed; size and colour from the distance to the centre by span² / (span² + 8 d²), C∞, 1 on the centre and a ninth a neighbour away.
+        let span = self.w * 3 / 8;
+        let (big, small) = (2 * u, u * 5 / 4);
+        let (hi, lo) = (white(), dim());
+        for k in -2isize..=2 {
+            let p = self.wrap(self.page as isize + k);
+            let x = cx + k as i64 * span + self.page_dx * span / self.w;
+            let d = x - cx;
+            let (num, den) = (span * span, span * span + 8 * d * d);
+            let size = small + (big - small) * num / den;
+            let mix = |s: u32| {
+                let (a, b) = (((lo >> s) & 255) as i64, ((hi >> s) & 255) as i64);
+                ((a + (b - a) * num / den) as u32) << s
+            };
+            b.text(x, title_y, size as u16, mix(16) | mix(8) | mix(0), 1, PAGES[p]);
+            if k == -1 || k == 1 {
+                self.push_row(x - span / 2, x + span / 2, title_y - 2 * u, title_y + u, Choice::Page(k as i8));
             }
         }
-        self.push_row(y - 3 * u / 2, y + 3 * u / 2, Choice::Brightness);
-        // The page out to the circle itself, which the display's hairline draws over (until 2026-11-05 a twenty-fifth of the radius short of it).
+        let cur = self.page;
+        // A page never laid out yet has no height to be centred by: laid out once into a batch that is not sent (not live, so no rows), then drawn (the first frame at a page centred it as empty, 2026-11-05).
+        for k in -1isize..=1 {
+            let p = self.wrap(cur as isize + k);
+            if self.page_h[p] == 0 {
+                self.draw_page(&mut Batch::new(), p, cx, false);
+            }
+        }
+        self.draw_page(b, cur, cx + self.page_dx, true);
+        if self.page_dx > 0 {
+            let p = self.wrap(cur as isize - 1);
+            self.draw_page(b, p, cx + self.page_dx - self.w, false);
+        } else if self.page_dx < 0 {
+            let p = self.wrap(cur as isize + 1);
+            self.draw_page(b, p, cx + self.page_dx + self.w, false);
+        }
+        // The page out to the circle itself, which the display's hairline draws over.
         b.disc(cx, cy, r, fill());
     }
 
-    /// The brightness dots' first x and spacing on the settings page: nine dots four layout units apart.
+    /// Page `p` centred on x = `cx`: centred in its band when it fits, else from the band's top less the scroll. `live`: the page on show, whose rows a tap reaches (only once the strip has settled on it).
+    fn draw_page(&mut self, b: &mut Batch, p: usize, cx: i64, live: bool) {
+        let u = self.unit();
+        let (_, top, bottom) = self.bands();
+        let fits = self.page_h[p] <= bottom - top;
+        let y0 = if fits { (top + bottom - self.page_h[p]) / 2 } else { top - if live { self.scroll } else { 0 } };
+        let hit = live && self.page_dx == 0;
+        let half = self.w / 2;
+        let mut y = y0 + 2 * u;
+        // One row of text, centred, tappable when `what` is given.
+        let row = |m: &mut Map, b: &mut Batch, y: &mut i64, px: i64, colour: u32, t: &str, what: Option<Choice>| {
+            b.text(cx, *y, px as u16, colour, 1, t);
+            if let (true, Some(c)) = (hit, what) {
+                m.push_row(cx - half, cx + half, *y - 2 * u, *y + u, c);
+            }
+            *y += 3 * u;
+        };
+        // A fact: its name right of the centre's left, its value left of the centre's right.
+        let fact = |b: &mut Batch, y: &mut i64, name: &str, value: &str| {
+            b.text(cx - u, *y, (u * 5 / 4) as u16, grey(), 2, name);
+            b.text(cx + u, *y, (u * 5 / 4) as u16, white(), 0, value);
+            *y += 2 * u + u / 4;
+        };
+        let small = u * 5 / 4;
+        let note = u * 7 / 8;
+        let on_off = |v: bool| if v { "on" } else { "off" };
+        match PAGES[p] {
+            "appearance" => {
+                // The themes as swatches: each its ground with its ring around it, the one in use with its lit colour at the centre, its name beneath.
+                let now_t = ferros_sys::theme::index();
+                for (i, t) in ferros_sys::theme::THEMES.iter().enumerate() {
+                    let x = cx + (2 * i as i64 - 3) * 3 * u;
+                    if i == now_t {
+                        b.disc(x, y, u / 2, t.lit);
+                    }
+                    b.disc(x, y, 2 * u - u / 4, t.plane);
+                    b.disc(x, y, 2 * u, t.ring);
+                    b.text(x, y + 3 * u + u / 2, note as u16, if i == now_t { white() } else { grey() }, 1, t.name);
+                    if hit {
+                        self.push_row(x - 3 * u, x + 3 * u, y - 2 * u - u / 2, y + 4 * u, Choice::Theme(i as u8));
+                    }
+                }
+                y += 7 * u;
+                b.text(cx, y, small as u16, grey(), 1, "brightness");
+                y += 2 * u;
+                // Brightness: nine dots, a stop apart, dimmest on the left; the current one larger and white.
+                let now = 8 - ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS).min(8) as i64;
+                let (x0, step) = Map::dots(cx, u);
+                for k in 0..9 {
+                    let x = x0 + k * step;
+                    if k == now {
+                        b.disc(x, y, u / 2, white());
+                    } else {
+                        b.disc(x, y, u / 4, dim());
+                    }
+                }
+                if hit {
+                    self.push_row(cx - half, cx + half, y - 3 * u / 2, y + 3 * u / 2, Choice::Brightness);
+                }
+                y += 4 * u;
+                let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
+                let mut l = Line::new();
+                let _ = write!(l, "names under circles: {}", on_off(labels));
+                row(self, b, &mut y, small, grey(), l.as_str(), Some(Choice::Labels));
+            }
+            "numbers" => {
+                // The number base is chosen by seeing: each row is two seconds and a mebibyte (2^23 bits, a whole number of doublings) written in that base, its name small beneath.
+                let now_base = ferros_sys::device_base();
+                for code in BASES {
+                    let f = tatau::Fmt::new(tatau::Base::from_code(code).unwrap_or(tatau::Base::Dms), Style::Glyphs);
+                    let mut v = Line::new();
+                    let _ = tatau::duration_ns(&mut v, f, 2_000_000_000, 1);
+                    v.s("   ");
+                    let _ = tatau::size_bits(&mut v, f, 1 << 23, 1);
+                    let current = code == now_base;
+                    b.text(cx, y, (u * 3 / 2) as u16, if current { white() } else { grey() }, 1, v.as_str());
+                    b.text(cx, y + 11 * u / 8, note as u16, if current { grey() } else { dim() }, 1, base_name(code));
+                    if current {
+                        b.disc(cx - 14 * u, y - u / 2, u / 3, white());
+                    }
+                    if hit {
+                        self.push_row(cx - half, cx + half, y - 2 * u, y + 15 * u / 8, Choice::Base(code));
+                    }
+                    y += 4 * u;
+                }
+            }
+            "keyboard" => {
+                b.text(cx, y, note as u16, dim(), 1, "layout");
+                y += 2 * u;
+                let now_l = ferros_sys::pref(ferros_sys::PREF_LAYOUT);
+                for (i, name) in ["Dvorak", "QWERTY"].iter().enumerate() {
+                    let current = now_l == i as u8;
+                    if current {
+                        b.disc(cx - 7 * u, y - u / 2, u / 3, white());
+                    }
+                    row(self, b, &mut y, 3 * u / 2, if current { white() } else { grey() }, name, Some(Choice::Layout(i as u8)));
+                }
+            }
+            "security" => {
+                // Unlock at boot: off by default. Turning it on takes two taps, the first arming it with the reason it is off (AUTH.md: a stolen device then holds the identity).
+                let on = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1;
+                let mut l = Line::new();
+                if self.armed {
+                    l.s("tap again: unlock at boot");
+                } else {
+                    let _ = write!(l, "unlock at boot: {}", on_off(on));
+                }
+                row(self, b, &mut y, small, if self.armed { white() } else { grey() }, l.as_str(), Some(Choice::UnlockAtBoot));
+                b.text(cx, y - u, note as u16, dim(), 1, "on, the device opens without your handle:");
+                b.text(cx, y + u / 2, note as u16, dim(), 1, "whoever holds it holds your identity");
+                y += 3 * u;
+            }
+            "power" => {
+                let on = ferros_sys::pref(ferros_sys::PREF_PROX_WAKE) == 1;
+                let mut l = Line::new();
+                let _ = write!(l, "proximity wake: {}", on_off(on));
+                row(self, b, &mut y, small, grey(), l.as_str(), Some(Choice::ProxWake));
+                b.text(cx, y - u, note as u16, dim(), 1, "on, the power key lights the screen");
+                b.text(cx, y + u / 2, note as u16, dim(), 1, "only when nothing covers the sensor");
+                y += 3 * u;
+            }
+            "connections" => {
+                // Each link as its driver says it (measure STATE): read here, chosen elsewhere until the radios have choices of their own.
+                let facts = ferros_sys::facts();
+                for (k, name) in LINKS.iter().enumerate() {
+                    let state = facts.0[33 + 8 * k..41 + 8 * k].iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::STATE).map(|m| m.1);
+                    fact(b, &mut y, name, match state {
+                        Some(0) => "off",
+                        Some(1) => "on, no link",
+                        Some(2) => "connected",
+                        _ => "-",
+                    });
+                }
+            }
+            "about" => {
+                let f = ferros_sys::numbers(Style::Glyphs);
+                let facts = ferros_sys::facts();
+                b.text(cx, y, (2 * u) as u16, white(), 1, "ferros");
+                y += 3 * u;
+                row(self, b, &mut y, small, grey(), if DEV { "version Zil, development build" } else { "version Zil" }, Some(Choice::Version));
+                // The hint from the fourth tap on, counting down to Developer; it stays until the next tap changes it (no timers).
+                if self.taps >= DEV_HINT {
+                    let mut l = Line::new();
+                    if DEV || self.dev {
+                        l.s("Developer is a page already");
+                    } else {
+                        let _ = tatau::count(&mut l, f, (DEV_TAPS - self.taps) as u64, 1);
+                        l.s(" taps to Developer");
+                    }
+                    b.text(cx, y - u, note as u16, white(), 1, l.as_str());
+                    y += 2 * u;
+                }
+                y += u;
+                let mut v = Line::new();
+                match facts.battery_pct() {
+                    Some(p) => {
+                        let _ = tatau::share(&mut v, f, p, 100, 2);
+                        if let Some(ua) = facts.battery_ua() {
+                            v.s(if ua > 0 { "  charging" } else { "  on battery" });
+                        }
+                    }
+                    None => {
+                        v.s("not read");
+                    }
+                }
+                fact(b, &mut y, "battery", v.as_str());
+                let mut v = Line::new();
+                match facts.boot_us() {
+                    Some(us) => {
+                        let _ = tatau::duration_ns(&mut v, f, us * 1000, 1);
+                    }
+                    None => {
+                        v.s("-");
+                    }
+                }
+                fact(b, &mut y, "press to ready", v.as_str());
+                let mut v = Line::new();
+                // The counter runs from the SoC's reset: power on, near enough (the bootloader's seconds included).
+                let (t, hz) = (now(), freq());
+                let _ = tatau::duration_ns(&mut v, f, t / hz * 1_000_000_000 + t % hz * 1_000_000_000 / hz, 1);
+                fact(b, &mut y, "since power on", v.as_str());
+                let mut v = Line::new();
+                if let Some(n) = facts.processes() {
+                    let _ = tatau::count(&mut v, f, n, 1);
+                }
+                fact(b, &mut y, "processes", v.as_str());
+                let mut v = Line::new();
+                if let Some(n) = facts.vault_keys() {
+                    let _ = tatau::count(&mut v, f, n, 1);
+                }
+                fact(b, &mut y, "in the vault", v.as_str());
+                // The hottest part of the SoC as the kernel last read it, and whether the kernel has the big core's clock down for it.
+                let mut v = Line::new();
+                match facts.soc_temp_c() {
+                    Some(c) => {
+                        let _ = tatau::count(&mut v, f, c, 1);
+                        v.s(" °C");
+                        if facts.throttled() == Some(true) {
+                            v.s("  throttled");
+                        }
+                    }
+                    None => {
+                        v.s("-");
+                    }
+                }
+                fact(b, &mut y, "chip", v.as_str());
+            }
+            _ => {
+                // Developer: the panel's and the sensors' knobs.
+                let spatial = ferros_sys::pref(ferros_sys::PREF_DITHER) == 1;
+                row(self, b, &mut y, small, grey(), if spatial { "dither: spatial (the panel rests)" } else { "dither: spatial and temporal" }, Some(Choice::Dither));
+                let sc = ferros_sys::pref(ferros_sys::PREF_SCOPE);
+                let mut l = Line::new();
+                if sc == 0 {
+                    l.s("light scope: off");
+                } else {
+                    let _ = write!(l, "light scope: channel {}", ["red", "visible", "blue", "green", "IR", "clear"][(sc as usize - 1) % 6]);
+                }
+                row(self, b, &mut y, small, grey(), l.as_str(), Some(Choice::Scope));
+            }
+        }
+        self.page_h[p] = y - y0;
+    }
+
+    /// The brightness dots' first x and spacing: nine dots four layout units apart.
     fn dots(cx: i64, u: i64) -> (i64, i64) {
         let step = 4 * u;
         (cx - 4 * step, step)
     }
 
-    fn push_row(&mut self, top: i64, bottom: i64, what: Choice) {
+    fn push_row(&mut self, x0: i64, x1: i64, top: i64, bottom: i64, what: Choice) {
         if self.nrows < self.rows.len() {
-            self.rows[self.nrows] = (top, bottom, what);
+            self.rows[self.nrows] = (x0, x1, top, bottom, what);
             self.nrows += 1;
         }
+    }
+
+    /// A finger dragging on the open settings, at `cur` having been at `prev` last frame and touched down at `start`: locked across or up and down by its first movement past the slop. Across, the strip follows it, the page changing as the strip passes half a screen; up and down, the page scrolls with it, its last three frames' movements kept for the fling.
+    fn drag_settings(&mut self, start: (bool, i64, i64), prev: (bool, i64, i64), cur: (bool, i64, i64)) {
+        let (dx, dy) = (cur.1 - start.1, cur.2 - start.2);
+        if self.swipe == 0 {
+            self.swipe = if dx.abs() >= dy.abs() { 1 } else { 2 };
+        }
+        if self.swipe == 1 {
+            self.page_dx = self.drag_base.0 + dx;
+            while self.page_dx > self.w / 2 {
+                self.page = self.wrap(self.page as isize - 1);
+                self.page_dx -= self.w;
+                self.drag_base.0 -= self.w;
+                self.scroll = 0;
+            }
+            while self.page_dx < -self.w / 2 {
+                self.page = self.wrap(self.page as isize + 1);
+                self.page_dx += self.w;
+                self.drag_base.0 += self.w;
+                self.scroll = 0;
+            }
+        } else {
+            // WHY the bounds: a page scrolls only as far as it is longer than its band; past either end there is nothing to show.
+            self.scroll = (self.drag_base.1 - dy).clamp(0, self.scroll_max(self.page));
+            let moved = if prev.0 { cur.2 - prev.2 } else { 0 };
+            self.dys = [self.dys[1], self.dys[2], moved];
+        }
+    }
+
+    /// The finger lifted from a drag on the settings: across, the strip snaps to the page nearest (the drag already moved `page` past half a screen); up and down, the fling is the largest of the last three frames' movements, the page going on the way the finger last went (owner, 2026-11-05: "maintain the max of the last three distance of finger movements vertically and always subtract one pixel per frame").
+    fn release_settings(&mut self) {
+        if self.swipe == 2 {
+            let m = self.dys.iter().map(|d| d.abs()).max().unwrap_or(0);
+            let last = self.dys.iter().rev().find(|&&d| d != 0).copied().unwrap_or(0);
+            self.fling = -last.signum() * m;
+        }
+        self.swipe = 0;
+        self.settling = self.page_dx != 0 || self.fling != 0;
+    }
+
+    /// One display frame of the settings' motion after the finger lifted (owner, 2026-11-05): the strip's offset from its page halves, floored toward 0 so it lands there in a few frames (½, ¾, ⅞ of the way…); the fling carries the page by its speed and loses a pixel a frame. Returns whether anything is still moving.
+    fn step(&mut self) -> bool {
+        self.page_dx = self.page_dx.signum() * (self.page_dx.abs() >> 1);
+        if self.fling != 0 {
+            let max = self.scroll_max(self.page);
+            self.scroll += self.fling;
+            self.fling -= self.fling.signum();
+            // WHY: the page's ends stop the fling; past them there is nothing to show.
+            if self.scroll < 0 || self.scroll > max {
+                self.scroll = self.scroll.clamp(0, max);
+                self.fling = 0;
+            }
+        }
+        self.page_dx != 0 || self.fling != 0
     }
 
     /// A tap: one finger or two, at a panel point. Logged with what it did, so a session can be followed from `diag console`.
@@ -858,38 +1189,72 @@ impl Map {
                     let to = self.home();
                     self.fly(to);
                     self.draw();
-                } else {
-                    let row = self.rows[..self.nrows].iter().find(|r| sy >= r.0 && sy < r.1).map(|r| r.2);
-                    match row {
-                        Some(Choice::Base(code)) => {
-                            ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BASE, code);
-                            self.draw();
-                        }
-                        Some(Choice::Brightness) => {
-                            let (x0, step) = Map::dots(self.w / 2, self.w / 48);
-                            let k = ((sx - x0 + step / 2) / step).clamp(0, 8);
-                            ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BRIGHTNESS, (8 - k) as u8);
-                            self.draw();
-                        }
-                        Some(Choice::Theme) => {
-                            let next = (ferros_sys::theme::index() + 1) % ferros_sys::theme::THEMES.len();
-                            ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_THEME, next as u8);
-                            self.draw();
-                        }
-                        Some(Choice::Dither) => {
-                            let spatial = ferros_sys::pref(ferros_sys::PREF_DITHER) == 1;
-                            ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_DITHER, (!spatial) as u8);
-                            self.draw();
-                        }
-                        Some(Choice::Labels) => {
-                            let on = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
-                            ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_LABELS, (!on) as u8);
-                            self.send_scene();
-                            self.draw();
-                        }
-                        None => {}
-                    }
+                    return;
                 }
+                let row = self.rows[..self.nrows].iter().find(|r| sx >= r.0 && sx < r.1 && sy >= r.2 && sy < r.3).map(|r| r.4);
+                // Any other tap starts the version count again, and disarms unlock at boot.
+                if row != Some(Choice::Version) {
+                    self.taps = 0;
+                }
+                if row != Some(Choice::UnlockAtBoot) {
+                    self.armed = false;
+                }
+                let set = |m: &Map, pref: u64, v: u8| {
+                    ferros_sys::set_pref(cap(m.grants, S_SETTINGS), pref, v);
+                };
+                match row {
+                    Some(Choice::Base(code)) => set(self, ferros_sys::PREF_BASE, code),
+                    Some(Choice::Brightness) => {
+                        let (x0, step) = Map::dots(self.w / 2, self.unit());
+                        // WHY: the dots' row reaches past the first and last dot; a tap there means that end dot.
+                        let k = ((sx - x0 + step / 2) / step).clamp(0, 8);
+                        set(self, ferros_sys::PREF_BRIGHTNESS, (8 - k) as u8);
+                    }
+                    Some(Choice::Theme(i)) => set(self, ferros_sys::PREF_THEME, i),
+                    Some(Choice::Dither) => set(self, ferros_sys::PREF_DITHER, (ferros_sys::pref(ferros_sys::PREF_DITHER) != 1) as u8),
+                    Some(Choice::Labels) => {
+                        set(self, ferros_sys::PREF_LABELS, (ferros_sys::pref(ferros_sys::PREF_LABELS) != 1) as u8);
+                        self.send_scene();
+                    }
+                    Some(Choice::Layout(i)) => set(self, ferros_sys::PREF_LAYOUT, i),
+                    Some(Choice::ProxWake) => set(self, ferros_sys::PREF_PROX_WAKE, (ferros_sys::pref(ferros_sys::PREF_PROX_WAKE) != 1) as u8),
+                    Some(Choice::Scope) => set(self, ferros_sys::PREF_SCOPE, (ferros_sys::pref(ferros_sys::PREF_SCOPE) + 1) % 7),
+                    // Off in one tap; on in two, the first arming it with the warning.
+                    Some(Choice::UnlockAtBoot) => {
+                        if ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1 {
+                            set(self, ferros_sys::PREF_UNLOCK_AT_BOOT, 0);
+                        } else if self.armed {
+                            set(self, ferros_sys::PREF_UNLOCK_AT_BOOT, 1);
+                            self.armed = false;
+                        } else {
+                            self.armed = true;
+                        }
+                    }
+                    Some(Choice::Version) => {
+                        // WHY the stop at twelve: the count means nothing past it, and held there an endless run of taps cannot wrap the u8 back under the hint.
+                        if self.taps < DEV_TAPS {
+                            self.taps += 1;
+                        }
+                        // The twelfth tap on a release build: Developer is a page from now on, kept in the vault.
+                        if self.taps == DEV_TAPS && !DEV && !self.dev {
+                            self.dev = true;
+                            if !ferros_sys::store_set(cap(self.grants, S_STORE), b"dev", &[1]) {
+                                console(self.grants, b"map: the vault did not take Developer\n");
+                            }
+                        }
+                    }
+                    // A neighbour's title: that page, coming in from its side and settling as a swipe does.
+                    Some(Choice::Page(k)) => {
+                        self.page = self.wrap(self.page as isize + k as isize);
+                        self.page_dx += k as i64 * self.w;
+                        self.scroll = 0;
+                        self.fling = 0;
+                        self.settling = true;
+                        self.frame_seen = None;
+                    }
+                    None => {}
+                }
+                self.draw();
             }
             _ => {}
         }
@@ -943,7 +1308,20 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         rs,
         cam: Cam { x: 0, y: 0, z: 1 << 16, c: ONE, s: 0 },
         view: View::Map,
-        rows: [(0, 0, Choice::Labels); 8],
+        rows: [(0, 0, 0, 0, Choice::Labels); 32],
+        page: 0,
+        page_dx: 0,
+        scroll: 0,
+        fling: 0,
+        page_h: [0; 8],
+        swipe: 0,
+        drag_base: (0, 0),
+        dys: [0; 3],
+        settling: false,
+        frame_seen: None,
+        taps: 0,
+        armed: false,
+        dev: false,
         nrows: 0,
         rc: [ONE; N],
         rsn: [0; N],
@@ -963,6 +1341,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     if map.load_view() {
         console(grants, b"map: the view as it was left\n");
     }
+    // Developer, once the twelve taps made it a page (release builds; always one on development builds).
+    let mut dv = [0u8; 4];
+    map.dev = matches!(ferros_sys::store_get(cap(grants, S_STORE), b"dev", &mut dv), Some(n) if n >= 1 && dv[0] == 1);
     let mut saved_view = map.cam;
     // A development build can start arrived at a circle, its page open, without a finger: FERROS_MAP_START=o<n> (circle n).
     if let Some(v) = option_env!("FERROS_MAP_START").map(str::as_bytes) {
@@ -1046,6 +1427,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut grab: Option<usize> = None;
     let mut grab_n = 0usize;
     let mut last_app_check = 0u64;
+    let mut last_facts = 0u64;
     let mut last_pass = now();
     let mut draw_us = 0u64;
     let mut move_us = 0u64;
@@ -1078,6 +1460,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         let tm = ferros_sys::pref(ferros_sys::PREF_THEME);
         if tm != theme_seen {
             theme_seen = tm;
+            map.draw();
+        }
+
+        // The open settings' live facts (About, Connections): drawn again once a second while they show (live data, not motion).
+        if matches!(map.view, View::Open(_)) && matches!(PAGES[map.page], "about" | "connections") && !map.settling && now().wrapping_sub(last_facts) > freq() {
+            last_facts = now();
             map.draw();
         }
 
@@ -1173,6 +1561,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             start = [(false, 0, 0); 16];
             grab = None;
             grab_n = 0;
+            // A finger on the open settings catches the strip and the page where they are: the motion stops under it.
+            map.swipe = 0;
+            map.drag_base = (map.page_dx, map.scroll);
+            map.dys = [0; 3];
+            map.fling = 0;
+            map.settling = false;
         }
         if down {
             most = most.max(held);
@@ -1188,6 +1582,15 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         if held == 0 && down {
             down = false;
+            // A drag on the open settings lifted: the strip snaps, the fling carries on, stepped from the last frame the drag saw.
+            if matches!(map.view, View::Open(_)) && map.swipe != 0 {
+                map.release_settings();
+                map.frame_seen = Some(frame_count);
+            } else if matches!(map.view, View::Open(_)) && map.page_dx != 0 {
+                // Caught mid-snap and let go without a drag: it goes on settling.
+                map.settling = true;
+                map.frame_seen = Some(frame_count);
+            }
             // Fingers up: the world back to zoom one, then whatever moved (or everything, after a rescale) into the vault, and the view if it changed. The same picture is drawn once more in the rescaled world, so the display holds a frame that matches its scene (its clock redraws replay it).
             map.renormalise();
             map.draw();
@@ -1214,7 +1617,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
 
         // Drags and pinches, once the fingers have moved past the slop: the contacts present both now and last frame are the ones that moved.
-        if moved {
+        // One finger on the open settings: across goes round the pages, up and down scrolls the page (owner, 2026-11-05); two fingers still leave for the plane.
+        if moved && held == 1 && matches!(map.view, View::Open(_)) {
+            let id = ids[0];
+            map.drag_settings(start[id], prev[id], cur[id]);
+            map.draw();
+        } else if moved {
             let mut both = [0usize; 2];
             let mut nb = 0usize;
             for &id in ids[..held].iter() {
@@ -1334,12 +1742,31 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         push_us = 0;
         prev = cur;
         // Locked to the panel while a finger is down: each pass starts when the display's next frame has started (op 24, `frame wait`), so the touch is read fresh right after a refresh begins and the update is ready for the next one — one update a refresh while it fits, every other refresh (steady, no beat) when it does not. Was a fixed 1/120 s after the work: a period of work + 8.3 ms, about 60 a second (2026-10-24); the display replies to a frame before drawing it, so the frame call itself paces nothing. A thirtieth at rest.
-        if held == 0 {
+        if held == 0 && !map.settling {
             sleep_until(now() + freq() / 30);
         } else {
             let mut fr = [0u8; 4];
             call(display, &[24], &mut fr);
             frame_count = u32::from_le_bytes(fr);
+        }
+        // The settings moving after the lift, stepped once per frame the panel started since the last step (owner, 2026-11-05: "count frames and not rendered frames so the animation stays smooth if we miss a frame"): a pass that missed frames steps them all, then draws once. Each draw arms the next frame, so the count moves while anything does. Settled, the loop goes back to resting.
+        if held == 0 && map.settling {
+            let steps = match map.frame_seen {
+                Some(f) => frame_count.wrapping_sub(f),
+                None => 1,
+            };
+            map.frame_seen = Some(frame_count);
+            let mut moving = true;
+            for _ in 0..steps {
+                moving = map.step();
+                if !moving {
+                    break;
+                }
+            }
+            map.settling = moving;
+            if steps > 0 {
+                map.draw();
+            }
         }
     }
 }
