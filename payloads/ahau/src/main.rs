@@ -137,6 +137,15 @@ const S_LAYERS: u64 = 12;
 const ARENA_VA: u64 = 0x8000_0000;
 const GPU_CODE: usize = 32 << 20;
 const GPU_OUT: usize = 33 << 20;
+/// The GPU's second output, past the fine passes' sums (43 MiB, 16 bytes a staged pixel): the passes alternate between the two, so the screen shows one while the GPU writes the other.
+const GPU_OUT2: usize = 54 << 20;
+/// Where the mark is drawn from (`draw_mark`): 0 for FRESH (the CPU drew it), else the address of the GPU output the last pass landed in. No copy out of the arena (1.3 ms a pass for a 900 px mark, 2026-11-05), and no frame showing a pass half written.
+static MARK_FRONT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The GPU output the next pass writes: whichever of the two the screen is not showing.
+fn gpu_back(arena: usize) -> usize {
+    if MARK_FRONT.load(core::sync::atomic::Ordering::Acquire) == arena + GPU_OUT { GPU_OUT2 } else { GPU_OUT }
+}
 
 /// The surfaces through their handles (SANDBOX.md, "Handles"): the screen draws into `BUF`, a frame-sized buffer in its own arc, and presents the rows it touched through the shown surface's handle, so the same binary runs native and masked and the drawing code (honeycomb, tapuwae, the pills) never holds a pointer outside the arc. Text is the display's to draw, into a surface it knows: the rows go to that surface first (`put_rows`), the text is asked for, and the rows come back (`get_rows`) before anything more is drawn over them. The second surface stays a display surface for that, reached through its own handle. Labels the keyboard draws are recorded while it draws and asked for after the rows are presented, or the presenting would wipe them.
 type Front = ferros_sys::Handle<S_SURF>;
@@ -232,6 +241,8 @@ static mut STAGED: (usize, usize) = (0, 0);
 /// The last GPU run's compile and job times (µs), for the mark's console line.
 static GPU_COMPILE_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static GPU_JOB_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The last quick pass's other parts (µs): the handle's parameters, the stage (0 when it was already made), the whole GPU call.
+static GPU_PARTS_US: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
 
 fn gpu_run(grants: u64, arena: usize, addrs: &[u64], groups: u32, make: impl FnOnce() -> tapuwae::gpu::Compiled) -> bool {
     if HEAP_USE.compare_exchange(0, 1, core::sync::atomic::Ordering::Acquire, core::sync::atomic::Ordering::Relaxed).is_err() {
@@ -270,8 +281,12 @@ fn gpu_run(grants: u64, arena: usize, addrs: &[u64], groups: u32, make: impl FnO
 fn ensure_stage(arena: usize, r: usize) -> usize {
     if unsafe { STAGED.1 } != r {
         let side = 2 * r + 4;
-        for i in 0..side * side {
-            unsafe { core::ptr::write_volatile((arena + GPU_OUT + 8 * i) as *mut u64, 0) };
+        // Both outputs zeroed (no pass writes outside the circle); the screen back on FRESH until a pass lands at this size.
+        MARK_FRONT.store(0, core::sync::atomic::Ordering::Release);
+        for out in [GPU_OUT, GPU_OUT2] {
+            for i in 0..side * side {
+                unsafe { core::ptr::write_volatile((arena + out + 8 * i) as *mut u64, 0) };
+            }
         }
         let mut n = 0usize;
         tapuwae::gpu::button_stage(r as f32, |i| {
@@ -289,16 +304,20 @@ fn arena(grants: u64) -> Option<usize> {
     if a == 0 || a == usize::MAX { None } else { Some(a) }
 }
 
-/// The bonded button's quick pass on the GPU: tapuwae's own shading recorded through valhall (tapuwae::gpu), run by the GPU service into ahau's region of the layer arena, then into `buf` (side x side pack16 words, as render_button_pack16 writes them). False when the GPU did not draw it: the CPU draws it then.
-fn gpu_quick(grants: u64, buf: &mut [u64], side: usize, r: usize, p: &tapuwae::Params) -> bool {
+/// The bonded button's quick pass on the GPU: tapuwae's own shading recorded through valhall (tapuwae::gpu), run by the GPU service into the output of ahau's region of the layer arena the screen is not showing (side x side pack16 words, as render_button_pack16 writes them), which it shows from then (MARK_FRONT). False when the GPU did not draw it: the CPU draws it then.
+fn gpu_quick(grants: u64, r: usize, p: &tapuwae::Params) -> bool {
     let Some(arena) = arena(grants) else { return false };
     // Over the circle's stage only: nothing outside it is computed (~22 % of the square).
+    let t = now();
     let staged = ensure_stage(arena, r);
-    if !gpu_run(grants, arena, &[ARENA_VA + GPU_OUT as u64, ARENA_VA + GPU_STAGE as u64], staged.div_ceil(16) as u32, || tapuwae::gpu::button_quick_staged_kernel(r as f32, p, &tapuwae::Look::attest())) {
+    GPU_PARTS_US[1].store(ferros_sys::us_since(t), core::sync::atomic::Ordering::Relaxed);
+    let t = now();
+    let back = gpu_back(arena);
+    if !gpu_run(grants, arena, &[ARENA_VA + back as u64, ARENA_VA + GPU_STAGE as u64], staged.div_ceil(16) as u32, || tapuwae::gpu::button_quick_staged_kernel(r as f32, p, &tapuwae::Look::attest())) {
         return false;
     }
-    let out = unsafe { core::slice::from_raw_parts((arena + GPU_OUT) as *const u64, side * side) };
-    buf.copy_from_slice(out);
+    GPU_PARTS_US[2].store(ferros_sys::us_since(t), core::sync::atomic::Ordering::Relaxed);
+    MARK_FRONT.store(arena + back, core::sync::atomic::Ordering::Release);
     true
 }
 
@@ -318,17 +337,16 @@ fn gpu_fine_passes(g: u64, frames: &mut u64) -> bool {
         unsafe { core::ptr::write_volatile(b, 0) };
     }
     let t0 = now();
-    let buf = unsafe { &mut (&mut *(&raw mut FRESH))[..side * side] };
-    let addrs = [ARENA_VA + GPU_OUT as u64, ARENA_VA + GPU_STAGE as u64, ARENA_VA + GPU_SUMS as u64];
     for m in 0..16u32 {
         if FRESH_GEN.load(core::sync::atomic::Ordering::Acquire) != g {
             return false;
         }
+        let back = gpu_back(arena);
+        let addrs = [ARENA_VA + back as u64, ARENA_VA + GPU_STAGE as u64, ARENA_VA + GPU_SUMS as u64];
         if !gpu_run(grants, arena, &addrs, staged.div_ceil(16) as u32, || tapuwae::gpu::button_fine_kernel(r as f32, &p, &tapuwae::Look::attest(), m)) {
             return false;
         }
-        let out = unsafe { core::slice::from_raw_parts((arena + GPU_OUT) as *const u64, side * side) };
-        buf.copy_from_slice(out);
+        MARK_FRONT.store(arena + back, core::sync::atomic::Ordering::Release);
         *frames += 1;
         FRESH_DONE_GEN.store(g, core::sync::atomic::Ordering::Release);
         FRESH_DONE.store(*frames, core::sync::atomic::Ordering::Release);
@@ -1557,9 +1575,11 @@ fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
     let typed = core::str::from_utf8(&text[..n]).unwrap_or("");
     // Bound: the attest button, the whole disc at every change (it has no components to redraw alone), in the surface's own pixels (`pack16`, as `render_fresh` writes them: the G2t16 encoding first used here came out nearly white). Two passes, as the fresh mark's, through the same machinery (tapuwae `render_button_pack16`: the ball four samples to a lane call, as the fresh mark shades its components): one sample a pixel at once, then a 4 × 4 grid to clear it up, given up for a newer handle. The adaptive `Look::attest()` (up to 64 samples a pixel, one at a time) took 22 s for the first draw and 55 s a keystroke on the workers (2026-11-04).
     let done = if unsafe { BONDED } {
+        let t = now();
         let p = tapuwae::Params::new_placed(&salt, typed, true);
+        GPU_PARTS_US[0].store(ferros_sys::us_since(t), core::sync::atomic::Ordering::Relaxed);
         // The quick pass on the GPU when its service is up (GPU.md), before any helper is woken: when it is drawn there the helpers have nothing to do this pass (and must not write the rows it fills).
-        let gpu_drawn = !fine && gpu_quick(grants, buf, side, r, &p);
+        let gpu_drawn = !fine && gpu_quick(grants, r, &p);
         GPU_DREW.store(gpu_drawn, core::sync::atomic::Ordering::Relaxed);
         // The rows shared with the helpers (HELPERS): theirs first, then this thread's own, then every helper waited for, so `p` and the pass outlive them all.
         let up = if gpu_drawn { 0 } else { HELPERS_UP.load(core::sync::atomic::Ordering::Acquire) };
@@ -1582,6 +1602,10 @@ fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
     } else {
         tapuwae::render_fresh(buf, side, mid, mid, r as f32, &salt, typed, &tapuwae::Look::fresh(), 4, mask, coarse, map, full, fine, &moved_on)
     };
+    // A pass the CPU drew is in FRESH: the screen shows it from here (a GPU pass already moved MARK_FRONT to its output).
+    if !GPU_DREW.load(core::sync::atomic::Ordering::Relaxed) {
+        MARK_FRONT.store(0, core::sync::atomic::Ordering::Release);
+    }
     for b in text.iter_mut() {
         unsafe { core::ptr::write_volatile(b, 0) };
     }
@@ -1592,7 +1616,7 @@ fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
         (_, true, true) => "cleared up",
         (_, true, false) => "refine stopped for a newer handle",
     };
-    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: attest mark {what} ({side} px, {}) in {} ms {}{}\n", if fine { "4x4" } else { "1" }, ferros_sys::us_since(t0) / 1000, if GPU_DREW.load(core::sync::atomic::Ordering::Relaxed) { "on the GPU" } else { "on the workers" }, if GPU_DREW.load(core::sync::atomic::Ordering::Relaxed) { alloc::format!(" (compile {} us, GPU job {} us)", GPU_COMPILE_US.load(core::sync::atomic::Ordering::Relaxed), GPU_JOB_US.load(core::sync::atomic::Ordering::Relaxed)) } else { alloc::string::String::new() }));
+    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: attest mark {what} ({side} px, {}) in {} ms {}{}\n", if fine { "4x4" } else { "1" }, ferros_sys::us_since(t0) / 1000, if GPU_DREW.load(core::sync::atomic::Ordering::Relaxed) { "on the GPU" } else { "on the workers" }, if GPU_DREW.load(core::sync::atomic::Ordering::Relaxed) { { let q = |i: usize| GPU_PARTS_US[i].load(core::sync::atomic::Ordering::Relaxed); alloc::format!(" (params {} us, stage {} us, GPU call {} us: compile {} us, job {} us)", q(0), q(1), q(2), GPU_COMPILE_US.load(core::sync::atomic::Ordering::Relaxed), GPU_JOB_US.load(core::sync::atomic::Ordering::Relaxed)) } } else { alloc::string::String::new() }));
     console(grants, l.as_bytes());
     unsafe { FRESH_SIDE = side };
     FRESH_STATE.store(READY, core::sync::atomic::Ordering::Release);
@@ -1645,7 +1669,8 @@ fn draw_mark(s: &mut [u64], w: usize, cx: usize, cy: usize, r: usize) {
         _ => return,
     }
     let side = unsafe { FRESH_SIDE };
-    let buf = unsafe { &(&*(&raw const FRESH))[..side * side] };
+    let front = MARK_FRONT.load(core::sync::atomic::Ordering::Acquire);
+    let buf = if front == 0 { unsafe { &(&*(&raw const FRESH))[..side * side] } } else { unsafe { core::slice::from_raw_parts(front as *const u64, side * side) } };
     let (x0, y0) = (cx - side / 2, cy - side / 2);
     for y in 0..side {
         for x in 0..side {
@@ -1800,13 +1825,13 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
 
 /// A console line in a fixed buffer.
 struct Line {
-    b: [u8; 96],
+    b: [u8; 256],
     n: usize,
 }
 
 impl Line {
     fn new() -> Line {
-        Line { b: [0; 96], n: 0 }
+        Line { b: [0; 256], n: 0 }
     }
     fn as_bytes(&self) -> &[u8] {
         &self.b[..self.n]
