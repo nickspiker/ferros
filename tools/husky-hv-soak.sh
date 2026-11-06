@@ -2,6 +2,9 @@
 # Overnight soak of Android under the hv (HV.md, the Mahere freeze that stopped reproducing on 2026-10-18): every few minutes launch Mahere, pan, screen off and on, stop it; after any freeze wait for the watchdog reboot, keep the frozen run's pstore log with the hv's stats timeline, go on. At the deadline, put stock Android back on slot a (the boot_a backup, slot a active) so the morning starts without the hv.
 # Usage: tools/husky-hv-soak.sh <stop at HH:MM (24 h)>   e.g. 06:30
 set -u
+# Only husky: every fastboot and adb call goes to it, and fastboot refuses a phone that is not (tools/lib/devices.sh).
+. /mnt/Harbor/Code/ferros/tools/lib/devices.sh
+device_pin husky || exit 1
 cd "$(dirname "$0")/.."
 STOP=${1:-06:30}; OUT=target/hv/soak; mkdir -p $OUT; BACKUP=/mnt/Harbor/tmp/husky-backup-2026-10-13/boot_a.img
 log() { echo "$(date +%H:%M:%S) $*"; }

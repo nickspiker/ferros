@@ -7,6 +7,9 @@
 #   tools/husky-mirror-slot-b.sh             Android must be up with root (from ferros: bridge diag android)
 #   tools/husky-mirror-slot-b.sh --factory   the old behaviour, slot b from the factory zip: only for a stock slot a (Android from slot b then needs a factory kernel in the gate)
 set -eu
+# Only husky: every fastboot and adb call goes to it, and fastboot refuses a phone that is not (tools/lib/devices.sh).
+. /mnt/Harbor/Code/ferros/tools/lib/devices.sh
+device_pin husky || exit 1
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 PARTS="init_boot dtbo vendor_boot vendor_kernel_boot pvmfw vbmeta_system vbmeta_vendor"
 

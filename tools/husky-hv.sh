@@ -5,6 +5,9 @@
 # The boot gate (ferros_hv/src/gate.rs): by default the blob also carries the cold ferros image, packed past Linux's image_size (rounded up to 2 MiB) behind a 4 KiB header {"FERROSGT", u64 length}; the hv then shows "Ready?" before Linux: power (or 1 s on dev builds) = ferros, volume down = Android, volume up = hold. --no-ferros leaves it out (the hv boots Android straight away, as before: oracle captures).
 # Usage: tools/husky-hv.sh [--image <Linux Image>] [--no-ferros] [--flash]
 set -eu
+# Only husky: every fastboot and adb call goes to it, and fastboot refuses a phone that is not (tools/lib/devices.sh).
+. /mnt/Harbor/Code/ferros/tools/lib/devices.sh
+device_pin husky || exit 1
 cd "$(dirname "$0")/.."
 BACKUP=/mnt/Harbor/tmp/husky-backup-2026-10-13/boot_a.img
 W=target/hv; mkdir -p $W

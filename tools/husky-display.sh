@@ -2,6 +2,9 @@
 # Bring the display server up on cold ferros (slot b): build the payloads, reload the kernel, spawn the server with its grants, then the home-screen client.
 # Usage: tools/husky-display.sh [--no-reload] [--no-shell]
 set -uo pipefail
+# Only husky: every fastboot and adb call goes to it, and fastboot refuses a phone that is not (tools/lib/devices.sh).
+. /mnt/Harbor/Code/ferros/tools/lib/devices.sh
+device_pin husky || exit 1
 REPO=/mnt/Harbor/Code/ferros
 B=$REPO/target/debug/ferros-bridge
 K=$REPO/target/aarch64-unknown-none/release

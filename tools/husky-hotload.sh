@@ -17,6 +17,9 @@
 #   tools/husky-hotload.sh --read     # print the last report again
 #   tools/husky-hotload.sh --live ... # hand off from RUNNING Android (screen woken and kept on) via /sys/kernel/ferros/go instead of `adb reboot ferros`: no Android shutdown, so the display pipeline is still live for ferros to adopt. Filesystems are synced first; otherwise it is a sudden power loss to Android.
 set -euo pipefail
+# Only husky: every fastboot and adb call goes to it, and fastboot refuses a phone that is not (tools/lib/devices.sh).
+. /mnt/Harbor/Code/ferros/tools/lib/devices.sh
+device_pin husky || exit 1
 
 REPO=/mnt/Harbor/Code/ferros
 DEV_BIN=/data/local/tmp/ferros.bin

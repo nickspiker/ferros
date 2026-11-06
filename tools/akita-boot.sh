@@ -10,15 +10,8 @@ B=target/debug/ferros-bridge
 ELF=target/aarch64-unknown-none/release/ferros_kernel
 IMG=target/akita/ferros_cold.img
 
-# The 8a's serial: whichever device in fastboot says product akita.
-akita() {
-    for s in $(fastboot devices | awk '{print $1}'); do
-        if [ "$(fastboot -s "$s" getvar product 2>&1 | awk '/^product:/{print $2}')" = akita ]; then
-            echo "$s"
-            return
-        fi
-    done
-}
+# Only the 8a: every fastboot and adb call goes to it, and fastboot refuses a phone that is not (tools/lib/devices.sh).
+. /mnt/Harbor/Code/ferros/tools/lib/devices.sh
 
 cargo el0 -q -p ferros-payload-usb
 aarch64-linux-gnu-objcopy -O binary $R/usb $R/usb.bin
@@ -29,11 +22,8 @@ mkdir -p target/akita
 cargo run -q -p ferros-mkimg -- boot "$ELF" --pad 16 -o "$IMG"
 echo "== image: $IMG ($(stat -c%s "$IMG") bytes)"
 
-S=$(akita)
-if [ -z "$S" ]; then
-    echo "no akita in fastboot" >&2
-    exit 1
-fi
+device_pin akita || exit 1
+S=$ANDROID_SERIAL
 if [ "${1:-}" = --flash-a ]; then
     fastboot -s "$S" flash boot_a "$IMG"
     fastboot -s "$S" --set-active=a

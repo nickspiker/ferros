@@ -4,6 +4,9 @@
 # Fallback: fastboot (`adb reboot bootloader`, `--set-active=b`, reboot), which does the same switch from inside the bootloader.
 # Usage: tools/husky-to-ferros.sh [--fastboot]
 set -u
+# Only husky: every fastboot and adb call goes to it, and fastboot refuses a phone that is not (tools/lib/devices.sh).
+. /mnt/Harbor/Code/ferros/tools/lib/devices.sh
+device_pin husky || exit 1
 cd "$(dirname "$0")/.."
 wait_ferros() { for i in $(seq 60); do lsusb -d 1209:4665 >/dev/null 2>&1 && { echo "== ferros on USB after $((i*2)) s"; return 0; }; sleep 2; done; echo "== ferros did not enumerate in 120 s"; return 1; }
 via_fastboot() {

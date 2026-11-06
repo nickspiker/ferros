@@ -22,6 +22,9 @@
 #   tools/husky-probe-boot.sh --flash    # also: fastboot flash vendor_kernel_boot + reboot
 #   tools/husky-probe-boot.sh --read     # read the ferros scan line back from dmesg/pstore
 set -euo pipefail
+# Only husky: every fastboot and adb call goes to it, and fastboot refuses a phone that is not (tools/lib/devices.sh).
+. /mnt/Harbor/Code/ferros/tools/lib/devices.sh
+device_pin husky || exit 1
 
 HK=/mnt/Harbor/husky-kernel
 DIST=$HK/out/shusky/dist

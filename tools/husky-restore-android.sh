@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Stock Android back on slot a (no hypervisor): from fastboot, adb or ferros, flash the boot_a backup, make slot a active (fresh retries), reboot, confirm adb.
 set -u
+# Only husky: every fastboot and adb call goes to it, and fastboot refuses a phone that is not (tools/lib/devices.sh).
+. /mnt/Harbor/Code/ferros/tools/lib/devices.sh
+device_pin husky || exit 1
 cd "$(dirname "$0")/.."
 BACKUP=${1:-/mnt/Harbor/tmp/husky-backup-2026-10-13/boot_a.img}
 [ -f "$BACKUP" ] || { echo "no backup at $BACKUP"; exit 1; }
