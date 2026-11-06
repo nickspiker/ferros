@@ -78,6 +78,11 @@ pub fn vol_down_held() -> bool {
     rd(GPA4_DAT) & (1 << VOL_DOWN_PIN) == 0
 }
 
+/// The power key held right now (gpa4-0, active low). The gate records it as it arms (ready.rs GATE_HOW).
+pub fn power_held() -> bool {
+    rd(GPA4_DAT) & (1 << POWER_PIN) == 0
+}
+
 /// Volume up held (active low). At the gate it holds: the dev auto-press is off for good.
 pub fn vol_up_held() -> bool {
     rd(GPA6_DAT) & (1 << VOL_UP_PIN) == 0

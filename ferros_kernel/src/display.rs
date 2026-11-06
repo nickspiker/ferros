@@ -139,7 +139,29 @@ pub fn show(text: &[u8], cntfrq: u64) -> alloc::vec::Vec<u8> {
     rep
 }
 
-/// A solid G#00RRGGBB over the whole surface, one frame: the controlled scene power profiling needs (bridge `display fill`).
+/// A binary ruler, one frame (bridge `display ruler`), for placing what points at the side keys (owner, 2026-11-06: akita's keys sit elsewhere than husky's, and the gate's arrows missed them): every row shows its own number in binary across the width, the most significant bit on the left, white a 1 and black a 0 (row 0 all black, row 1 white in the last bit only). As many bits as the row count needs, each an equal share of the width (akita: 12 bits of 90 px). Reading the row beside a key off a photo gives its position to the pixel, in a form no font or language stands between.
+pub fn ruler(cntfrq: u64) -> alloc::vec::Vec<u8> {
+    let mut rep = alloc::vec::Vec::new();
+    let Some(panel) = adopt(cntfrq, &mut rep) else {
+        return rep;
+    };
+    let (w, rows) = (panel.width, panel.rows);
+    let bits = usize::BITS as usize - (rows - 1).leading_zeros() as usize;
+    for y in 0..rows {
+        let row = panel.fb + y * panel.stride * 4;
+        for i in 0..bits {
+            let c = if y >> (bits - 1 - i) & 1 != 0 { 0x00FF_FFFF } else { 0 };
+            for x in i * w / bits..(i + 1) * w / bits {
+                unsafe { core::ptr::write_volatile((row + x * 4) as *mut u32, c) };
+            }
+        }
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    panel.present(&mut rep);
+    rep.extend_from_slice(alloc::format!("ruler: A#{rows} rows, A#{bits} bits across A#{w} px\n").as_bytes());
+    rep
+}
+
 pub fn fill(rgb: u32, cntfrq: u64) -> alloc::vec::Vec<u8> {
     let mut rep = alloc::vec::Vec::new();
     let Some(panel) = adopt(cntfrq, &mut rep) else {

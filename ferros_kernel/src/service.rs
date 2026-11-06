@@ -2769,6 +2769,11 @@ pub fn run(mut b: Boot) -> ! {
                         let rep = crate::display::patch_raw(diam, w(2), w(6), freq);
                         queue_pt_response(&mut pt_out_data, &rep);
                     }
+                    // G#15 = the binary ruler: every row its own number in binary across the width (bridge `display ruler`).
+                    Some((21, _)) => {
+                        let rep = crate::display::ruler(freq);
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
                     // G#0C [r] [g] [b] = a solid colour over the whole panel (bridge `display fill rrggbb`).
                     Some((12, args)) if args.len() >= 3 => {
                         let rep = crate::display::fill((args[0] as u32) << 16 | (args[1] as u32) << 8 | args[2] as u32, freq);

@@ -587,7 +587,9 @@ pub fn boot_times() -> alloc::string::String {
     let mut s = alloc::format!("entry A#{} ms after reset\n", us(e) / 1000);
     let p = PRESS.load(Relaxed);
     if p != 0 {
-        s.push_str(&alloc::format!("  gate answered      +A#{} us\n", us(p.saturating_sub(e))));
+        let h = crate::ready::GATE_HOW.load(Relaxed);
+        let by = ["the power key", "volume down", "the dev timer", "?"][(h & 3) as usize];
+        s.push_str(&alloc::format!("  gate answered      +A#{} us, by {}{}{}\n", us(p.saturating_sub(e)), by, if h & (1 << 8) != 0 { ", power already down as it armed" } else { "" }, if h & (1 << 9) != 0 { ", power down as it answered" } else { "" }));
     }
     let mut v: alloc::vec::Vec<(u64, &'static str)> = alloc::vec::Vec::new();
     for (_, items) in GROUPS.iter() {

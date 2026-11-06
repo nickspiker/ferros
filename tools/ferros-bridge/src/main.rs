@@ -171,6 +171,7 @@ async fn main() {
             cmd_display_raw(&m).await;
         }
         "display" if args.get(2).map(String::as_str) == Some("terate") => cmd_display_raw(&[5]).await,
+        "display" if args.get(2).map(String::as_str) == Some("ruler") => cmd_display_raw(&[21]).await,
         "display" if args.get(2).map(String::as_str) == Some("tune") => cmd_display_raw(&[7]).await,
         "display" => {
             // --hold: keep the message up (the device's 512 s idle exit is disabled until a REBOOT; both volume keys still power it off).

@@ -99,6 +99,7 @@ pub fn wait() -> (u64, Choice) {
         panel.present(&mut rep);
         crate::checklist::at("gate: on screen");
     }
+    let held_at_arm = crate::killswitch::power_held();
     crate::killswitch::arm_power_key();
     crate::killswitch::enable_ppi(26);
     let t0 = crate::platform::cntpct();
@@ -108,15 +109,18 @@ pub fn wait() -> (u64, Choice) {
     // Dev: a volume key cancels the one-second auto-press for good (the keys' edge interrupts wake the WFI below, so a tap is seen at once).
     let mut held = false;
     let mut wiped = false;
+    let mut how = 3u64;
     let mut choice = Choice::Ferros;
     loop {
         crate::platform::pet_watchdogs();
         if unsafe { core::ptr::read_volatile(&raw const crate::__power_pressed) } != 0 {
+            how = 0;
             break;
         }
         // Volume down alone chooses Android (both keys together is the killswitch and never reaches here); volume up holds.
         if crate::killswitch::vol_down_held() && !crate::killswitch::vol_up_held() {
             choice = Choice::Android;
+            how = 1;
             break;
         }
         // Volume up takes the marks off, once (owner, 2026-11-05: a clean screen to film the whole boot); the hv's gate does the same.
@@ -129,15 +133,20 @@ pub fn wait() -> (u64, Choice) {
         }
         held |= crate::killswitch::volume_key_down();
         if cfg!(not(ferros_production)) && !held && crate::platform::cntpct().wrapping_sub(t0) > freq {
+            how = 2;
             break;
         }
         // Sleep until the next interrupt: the press, or a timer wake every 100 ms to pet the watchdogs.
         let tick = freq / 10;
         unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", "wfi", t = in(reg) tick, c = out(reg) _) };
     }
+    GATE_HOW.store(how | (held_at_arm as u64) << 8 | (crate::killswitch::power_held() as u64) << 9, core::sync::atomic::Ordering::Relaxed);
     unsafe { core::arch::asm!("msr cnthp_ctl_el2, xzr", "isb") };
     (crate::platform::cntpct(), choice)
 }
+
+/// How this kernel's own gate ended, for `diag boot` (checklist.rs): bits 0-7 what answered it (0 the power key's press interrupt, 1 volume down, 2 the dev timer), bit 8 the power key already down when the gate armed, bit 9 the power key down when it answered. Measuring the owner's report of 2026-11-06 on akita, a gate gone in a third of a second where a boot nobody touched waited the full second.
+pub static GATE_HOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The hv's boot gate (ferros_hv/src/gate.rs) leaves this word in its report page when it hands the machine to ferros: the human has already answered "ferros", so the gate is not shown twice. Read once and cleared, so a later boot that did not come through the hv never sees a stale answer.
 const HV_GATE_MARK_ADDR: usize = 0xA_FFFF_FF10;
