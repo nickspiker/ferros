@@ -74,6 +74,13 @@ pub const PREF_PROX_WAKE: u64 = 6;
 pub const PREF_LAYOUT: u64 = 12;
 /// Preference 13: unlock at boot, 0 off (the default: the handle is typed each boot, nothing of the identity on disk) or 1 on (the seed is stored so the device unlocks without typing — a stolen device then holds the identity).
 pub const PREF_UNLOCK_AT_BOOT: u64 = 13;
+/// Preference 14: the UI scale an active app lays its page out by, a signed byte of 64ths of an octave: its layout unit times 2^(s/64), 0 one, -64 a half, 64 twice (a pinch inside an open circle sets it; owner, 2026-11-05).
+pub const PREF_SCALE: u64 = 14;
+
+/// The UI scale as set (preference 14): 64ths of an octave, signed; the factor is 2^(s/64).
+pub fn ui_scale() -> i8 {
+    pref(PREF_SCALE) as i8
+}
 
 /// A preference byte as this process's copy holds it now.
 pub fn pref(index: u64) -> u8 {

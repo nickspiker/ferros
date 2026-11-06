@@ -5,14 +5,14 @@ use alloc::vec::Vec;
 use vsf::schema::{SectionBuilder, SectionSchema, TypeConstraint};
 use vsf::VsfType;
 
-use crate::process::{PREF_BASE, PREF_BRIGHTNESS, PREF_DITHER, PREF_LABELS, PREF_LAYOUT, PREF_PROX_WAKE, PREF_SCOPE, PREF_THEME, PREF_UNLOCK_AT_BOOT};
+use crate::process::{PREF_BASE, PREF_BRIGHTNESS, PREF_DITHER, PREF_LABELS, PREF_LAYOUT, PREF_PROX_WAKE, PREF_SCALE, PREF_SCOPE, PREF_THEME, PREF_UNLOCK_AT_BOOT};
 
 /// The vault key and the section name.
 pub const KEY: &str = "device";
 const SECTION: &str = "device";
 
 /// Each kept preference: its field name and its index in the preferences block. The screen's on/off (preference 2) is not kept: it is the power key's, every boot starts lit.
-pub const FIELDS: [(&str, usize); 9] = [
+pub const FIELDS: [(&str, usize); 10] = [
     ("base", PREF_BASE),
     ("labels", PREF_LABELS),
     ("brightness", PREF_BRIGHTNESS),
@@ -22,6 +22,7 @@ pub const FIELDS: [(&str, usize); 9] = [
     ("scope", PREF_SCOPE),
     ("layout", PREF_LAYOUT),
     ("unlock_at_boot", PREF_UNLOCK_AT_BOOT),
+    ("scale", PREF_SCALE),
 ];
 /// The time zone: seconds east of UTC.
 const TZ: &str = "tz";

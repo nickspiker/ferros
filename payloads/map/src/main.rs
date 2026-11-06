@@ -330,6 +330,12 @@ struct Map {
     armed: bool,
     /// Developer made a page by the twelve taps (the vault, `map.dev`).
     dev: bool,
+    /// Where the camera is flying (`fly`), and whether the flight leaves the open circle for the plane (the page drawn, shrinking with the circle, until it lands).
+    target: Option<Cam>,
+    leaving: bool,
+    /// A pinch on the open page: the spread it began at (sixteenths of a pixel) and the scale then; and the scale it is at now, shown live and kept as the preference when the fingers lift (64ths of an octave).
+    pinch: Option<(i64, f32)>,
+    scale_live: Option<f32>,
     nrows: usize,
     /// Each circle's own turn (its icon), (cos, sin) in Q14; two fingers in a circle twist it.
     rc: [i64; N],
@@ -758,20 +764,46 @@ impl Map {
         Cam { x: (x0 + x1) / 2, y: (y0 + y1) / 2, z, c: self.cam.c, s: self.cam.s }
     }
 
-    /// The camera that has arrived at circle i: the circle on the active circle (`arrived`). The camera's centre is the panel's, so it stands off the circle's centre by the active circle's offset from the panel's centre, in world units at the arrived zoom.
+    /// The camera that has arrived at circle i: the circle on the active circle (`arrived`), the circle an app lives in, however much larger than the screen that is (no zoom limit here: arriving, the map's own circle becomes the app's). The camera's centre is the panel's, so it stands off the circle's centre by the active circle's offset from the panel's centre, in world units at the arrived zoom.
     fn at(&self, i: usize) -> Cam {
-        let (lo, hi) = self.zoom_limits();
         let (_, ay, ar) = self.arrived();
-        let mut cam = Cam { x: self.xs[i], y: self.ys[i], z: ((ar << 16) / self.rs[i].max(1)).clamp(lo, hi), c: self.cam.c, s: self.cam.s };
+        let mut cam = Cam { x: self.xs[i], y: self.ys[i], z: (ar << 16) / self.rs[i].max(1), c: self.cam.c, s: self.cam.s };
         let (dx, dy) = cam.delta(0, self.h / 2 - ay);
         cam.x += dx;
         cam.y += dy;
         cam
     }
 
-    /// Go to `to`: the camera is simply there (no animation).
+    /// Go to `to`: the camera moves there a frame at a time (`step_cam`), each frame halving what is left (owner, 2026-11-05: "if I tap on a circle, should we follow the same halvzies rule and floor?" ... "Please").
     fn fly(&mut self, to: Cam) {
-        self.cam = to;
+        self.target = Some(to);
+        self.settling = true;
+        self.frame_seen = None;
+    }
+
+    /// One panel frame of the camera's flight to `target`: what is left of each part halved in the space it looks even in. The centre: the world offset, its magnitude halved and floored. The zoom: its logarithm, the geometric mean of where it is and where it goes, so a circle grows by the same factor each frame. The turn: the bisector of the two directions. Landed, exactly on the target, once what is left is under a pixel on the screen; then, leaving, the view is the plane again. Returns whether it is still flying.
+    fn step_cam(&mut self) -> bool {
+        let Some(t) = self.target else { return false };
+        let half = |d: i64| d.signum() * (d.abs() >> 1);
+        let (dx, dy) = (half(t.x - self.cam.x), half(t.y - self.cam.y));
+        let z = isqrt(self.cam.z * t.z);
+        let (c, s) = (self.cam.c + t.c, self.cam.s + t.s);
+        let len = isqrt(c * c + s * s);
+        // Opposite directions have no bisector: a quarter turn first.
+        let (c, s) = if len == 0 { (-self.cam.s, self.cam.c) } else { (c * ONE / len, s * ONE / len) };
+        self.cam = Cam { x: t.x - dx, y: t.y - dy, z, c, s };
+        // Under a pixel: the centre's offset at this zoom (world ×256 at 16.16 pixels a unit), the zoom's change across the screen's width, the turn's at the same reach.
+        let px = |d: i64| (d.abs() * z) >> 24;
+        let still = px(dx) > 0 || px(dy) > 0 || (t.z - z).abs() * self.w / z.max(1) > 0 || ((c - t.c).abs() + (s - t.s).abs()) * self.w >> 14 > 0;
+        if !still {
+            self.cam = t;
+            self.target = None;
+            if self.leaving {
+                self.leaving = false;
+                self.view = View::Map;
+            }
+        }
+        still
     }
 
     /// Draw the frame: the overlay for the view first (what is sent first is on top), then the scene under it through the camera. The one circle is the system's: the device's settings.
@@ -795,15 +827,30 @@ impl Map {
     fn wrap(&self, p: isize) -> usize {
         p.rem_euclid(self.pages() as isize) as usize
     }
-    /// The settings' layout unit: a 48th of the screen's width (28 px on husky), the page as it stood at 1344 px scaled with the panel.
-    fn unit(&self) -> i64 {
-        self.w / 48
+    /// Where the open page stands on the panel now: centre, radius and its layout unit in 256ths of a pixel. While the camera flies, on the circle as the camera shows it, so the page grows and shrinks with it and nothing pops in on arrival; landed, exactly the arrived circle. The unit is a 48th of the width at the circle's arrived size (28 px on husky: the page as it stood at 1344 px), times the UI scale, 2^(s/64): the device's (preference 14), or the pinch's while one goes on.
+    fn page_frame(&self) -> (i64, i64, i64, i64) {
+        let (ax, ay, ar) = self.arrived();
+        let s = self.scale_live.unwrap_or(ferros_sys::ui_scale() as f32);
+        let k = libm::exp2f(s / 64.);
+        let unit = |r: i64| ((self.w << 8) * r / (48 * ar)) as f32 * k;
+        match (self.view, self.target) {
+            (View::Open(i), Some(_)) => {
+                let (sx, sy) = self.cam.screen(self.w, self.h, self.xs[i], self.ys[i]);
+                let r = (self.rs[i] * self.cam.z) >> 16;
+                (sx, sy, r, unit(r) as i64)
+            }
+            _ => (ax, ay, ar, unit(ar) as i64),
+        }
     }
-    /// The settings' bands on the panel: the titles' baseline under the camera, and the band the page lives in (top, bottom).
+    /// The settings' layout unit in 256ths of a pixel, as the page stands now (`page_frame`).
+    fn unit(&self) -> i64 {
+        self.page_frame().3
+    }
+    /// The settings' bands, from the circle as the page stands now: the titles' baseline just under its top (under the camera, landed), and the band the page lives in (top, bottom).
     fn bands(&self) -> (i64, i64, i64) {
-        let u = self.unit();
-        let title = ferros_sys::CUTOUT_BOTTOM as i64 + 4 * u;
-        (title, title + 3 * u, self.h - 4 * u)
+        let (_, cy, r, uq) = self.page_frame();
+        let title = cy - r + (4 * uq >> 8);
+        (title, title + (3 * uq >> 8), cy + r - (4 * uq >> 8))
     }
     /// How far page `p` scrolls: what of it does not fit its band.
     fn scroll_max(&self, p: usize) -> i64 {
@@ -813,12 +860,13 @@ impl Map {
 
     /// The settings (owner, 2026-11-05): the pages a ring, the page on show inscribed in the circle an app lives in, its title large at the top with its neighbours' small and dim either side; a swipe across goes round the ring, up and down scrolls a page longer than its band. Laid out in 48ths of the width (`unit`).
     fn settings(&mut self, b: &mut Batch) {
-        let (cx, cy, r) = self.arrived();
-        let u = self.unit();
+        let (cx, cy, r, uq) = self.page_frame();
+        // Lengths in the unit, from its 256ths (uq): k units over d, rounded once, so the page scales smoothly through a flight or a pinch.
+        let uu = |n: i64, d: i64| n * uq / (d << 8);
         let (title_y, _, _) = self.bands();
-        // The titles: a strip three eighths of the screen apart, moving with the pages at that fraction of their speed; size and colour from the distance to the centre by span² / (span² + 8 d²), C∞, 1 on the centre and a ninth a neighbour away.
-        let span = self.w * 3 / 8;
-        let (big, small) = (2 * u, u * 5 / 4);
+        // The titles: a strip eighteen units apart (three eighths of the screen, landed), moving with the pages at that fraction of their speed; size and colour from the distance to the centre by span² / (span² + 8 d²), C∞, 1 on the centre and a ninth a neighbour away.
+        let span = uu(18, 1);
+        let (big, small) = (uu(2, 1), uu(5, 4));
         let (hi, lo) = (white(), dim());
         for k in -2isize..=2 {
             let p = self.wrap(self.page as isize + k);
@@ -832,16 +880,14 @@ impl Map {
             };
             b.text(x, title_y, size as u16, mix(16) | mix(8) | mix(0), 1, PAGES[p]);
             if k == -1 || k == 1 {
-                self.push_row(x - span / 2, x + span / 2, title_y - 2 * u, title_y + u, Choice::Page(k as i8));
+                self.push_row(x - span / 2, x + span / 2, title_y - uu(2, 1), title_y + uu(1, 1), Choice::Page(k as i8));
             }
         }
         let cur = self.page;
-        // A page never laid out yet has no height to be centred by: laid out once into a batch that is not sent (not live, so no rows), then drawn (the first frame at a page centred it as empty, 2026-11-05).
+        // Each page's height at the unit it is drawn at, laid out first into a batch that is not sent (not live, so no rows): its centring needs it, and the unit changes every frame of a flight (a page never laid out was centred as empty, 2026-11-05).
         for k in -1isize..=1 {
             let p = self.wrap(cur as isize + k);
-            if self.page_h[p] == 0 {
-                self.draw_page(&mut Batch::new(), p, cx, false);
-            }
+            self.draw_page(&mut Batch::new(), p, cx, false);
         }
         self.draw_page(b, cur, cx + self.page_dx, true);
         if self.page_dx > 0 {
@@ -857,64 +903,65 @@ impl Map {
 
     /// Page `p` centred on x = `cx`: centred in its band when it fits, else from the band's top less the scroll. `live`: the page on show, whose rows a tap reaches (only once the strip has settled on it).
     fn draw_page(&mut self, b: &mut Batch, p: usize, cx: i64, live: bool) {
-        let u = self.unit();
+        let uq = self.unit();
+        let uu = |n: i64, d: i64| n * uq / (d << 8);
         let (_, top, bottom) = self.bands();
         let fits = self.page_h[p] <= bottom - top;
         let y0 = if fits { (top + bottom - self.page_h[p]) / 2 } else { top - if live { self.scroll } else { 0 } };
         let hit = live && self.page_dx == 0;
         let half = self.w / 2;
-        let mut y = y0 + 2 * u;
+        let mut y = y0 + uu(2, 1);
         // One row of text, centred, tappable when `what` is given.
         let row = |m: &mut Map, b: &mut Batch, y: &mut i64, px: i64, colour: u32, t: &str, what: Option<Choice>| {
             b.text(cx, *y, px as u16, colour, 1, t);
             if let (true, Some(c)) = (hit, what) {
-                m.push_row(cx - half, cx + half, *y - 2 * u, *y + u, c);
+                m.push_row(cx - half, cx + half, *y - uu(2, 1), *y + uu(1, 1), c);
             }
-            *y += 3 * u;
+            *y += uu(3, 1);
         };
         // A fact: its name right of the centre's left, its value left of the centre's right.
         let fact = |b: &mut Batch, y: &mut i64, name: &str, value: &str| {
-            b.text(cx - u, *y, (u * 5 / 4) as u16, grey(), 2, name);
-            b.text(cx + u, *y, (u * 5 / 4) as u16, white(), 0, value);
-            *y += 2 * u + u / 4;
+            b.text(cx - uu(1, 1), *y, (uu(5, 4)) as u16, grey(), 2, name);
+            b.text(cx + uu(1, 1), *y, (uu(5, 4)) as u16, white(), 0, value);
+            *y += uu(2, 1) + uu(1, 4);
         };
-        let small = u * 5 / 4;
-        let note = u * 7 / 8;
+        let small = uu(5, 4);
+        let note = uu(7, 8);
         let on_off = |v: bool| if v { "on" } else { "off" };
         match PAGES[p] {
             "appearance" => {
                 // The themes as swatches: each its ground with its ring around it, the one in use with its lit colour at the centre, its name beneath.
                 let now_t = ferros_sys::theme::index();
                 for (i, t) in ferros_sys::theme::THEMES.iter().enumerate() {
-                    let x = cx + (2 * i as i64 - 3) * 3 * u;
+                    let x = cx + (2 * i as i64 - 3) * uu(3, 1);
                     if i == now_t {
-                        b.disc(x, y, u / 2, t.lit);
+                        b.disc(x, y, uu(1, 2), t.lit);
                     }
-                    b.disc(x, y, 2 * u - u / 4, t.plane);
-                    b.disc(x, y, 2 * u, t.ring);
-                    b.text(x, y + 3 * u + u / 2, note as u16, if i == now_t { white() } else { grey() }, 1, t.name);
+                    b.disc(x, y, uu(2, 1) - uu(1, 4), t.plane);
+                    b.disc(x, y, uu(2, 1), t.ring);
+                    b.text(x, y + uu(3, 1) + uu(1, 2), note as u16, if i == now_t { white() } else { grey() }, 1, t.name);
                     if hit {
-                        self.push_row(x - 3 * u, x + 3 * u, y - 2 * u - u / 2, y + 4 * u, Choice::Theme(i as u8));
+                        self.push_row(x - uu(3, 1), x + uu(3, 1), y - uu(2, 1) - uu(1, 2), y + uu(4, 1), Choice::Theme(i as u8));
                     }
                 }
-                y += 7 * u;
+                y += uu(7, 1);
                 b.text(cx, y, small as u16, grey(), 1, "brightness");
-                y += 2 * u;
+                y += uu(2, 1);
                 // Brightness: nine dots, a stop apart, dimmest on the left; the current one larger and white.
                 let now = 8 - ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS).min(8) as i64;
-                let (x0, step) = Map::dots(cx, u);
+                let (x0, step) = Map::dots(cx, uq);
                 for k in 0..9 {
                     let x = x0 + k * step;
                     if k == now {
-                        b.disc(x, y, u / 2, white());
+                        b.disc(x, y, uu(1, 2), white());
                     } else {
-                        b.disc(x, y, u / 4, dim());
+                        b.disc(x, y, uu(1, 4), dim());
                     }
                 }
                 if hit {
-                    self.push_row(cx - half, cx + half, y - 3 * u / 2, y + 3 * u / 2, Choice::Brightness);
+                    self.push_row(cx - half, cx + half, y - uu(3, 2), y + uu(3, 2), Choice::Brightness);
                 }
-                y += 4 * u;
+                y += uu(4, 1);
                 let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
                 let mut l = Line::new();
                 let _ = write!(l, "names under circles: {}", on_off(labels));
@@ -930,27 +977,27 @@ impl Map {
                     v.s("   ");
                     let _ = tatau::size_bits(&mut v, f, 1 << 23, 1);
                     let current = code == now_base;
-                    b.text(cx, y, (u * 3 / 2) as u16, if current { white() } else { grey() }, 1, v.as_str());
-                    b.text(cx, y + 11 * u / 8, note as u16, if current { grey() } else { dim() }, 1, base_name(code));
+                    b.text(cx, y, (uu(3, 2)) as u16, if current { white() } else { grey() }, 1, v.as_str());
+                    b.text(cx, y + uu(11, 8), note as u16, if current { grey() } else { dim() }, 1, base_name(code));
                     if current {
-                        b.disc(cx - 14 * u, y - u / 2, u / 3, white());
+                        b.disc(cx - uu(14, 1), y - uu(1, 2), uu(1, 3), white());
                     }
                     if hit {
-                        self.push_row(cx - half, cx + half, y - 2 * u, y + 15 * u / 8, Choice::Base(code));
+                        self.push_row(cx - half, cx + half, y - uu(2, 1), y + uu(15, 8), Choice::Base(code));
                     }
-                    y += 4 * u;
+                    y += uu(4, 1);
                 }
             }
             "keyboard" => {
                 b.text(cx, y, note as u16, dim(), 1, "layout");
-                y += 2 * u;
+                y += uu(2, 1);
                 let now_l = ferros_sys::pref(ferros_sys::PREF_LAYOUT);
                 for (i, name) in ["Dvorak", "QWERTY"].iter().enumerate() {
                     let current = now_l == i as u8;
                     if current {
-                        b.disc(cx - 7 * u, y - u / 2, u / 3, white());
+                        b.disc(cx - uu(7, 1), y - uu(1, 2), uu(1, 3), white());
                     }
-                    row(self, b, &mut y, 3 * u / 2, if current { white() } else { grey() }, name, Some(Choice::Layout(i as u8)));
+                    row(self, b, &mut y, uu(3, 2), if current { white() } else { grey() }, name, Some(Choice::Layout(i as u8)));
                 }
             }
             "security" => {
@@ -963,18 +1010,18 @@ impl Map {
                     let _ = write!(l, "unlock at boot: {}", on_off(on));
                 }
                 row(self, b, &mut y, small, if self.armed { white() } else { grey() }, l.as_str(), Some(Choice::UnlockAtBoot));
-                b.text(cx, y - u, note as u16, dim(), 1, "on, the device opens without your handle:");
-                b.text(cx, y + u / 2, note as u16, dim(), 1, "whoever holds it holds your identity");
-                y += 3 * u;
+                b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "on, the device opens without your handle:");
+                b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "whoever holds it holds your identity");
+                y += uu(3, 1);
             }
             "power" => {
                 let on = ferros_sys::pref(ferros_sys::PREF_PROX_WAKE) == 1;
                 let mut l = Line::new();
                 let _ = write!(l, "proximity wake: {}", on_off(on));
                 row(self, b, &mut y, small, grey(), l.as_str(), Some(Choice::ProxWake));
-                b.text(cx, y - u, note as u16, dim(), 1, "on, the power key lights the screen");
-                b.text(cx, y + u / 2, note as u16, dim(), 1, "only when nothing covers the sensor");
-                y += 3 * u;
+                b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "on, the power key lights the screen");
+                b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "only when nothing covers the sensor");
+                y += uu(3, 1);
             }
             "connections" => {
                 // Each link as its driver says it (measure STATE): read here, chosen elsewhere until the radios have choices of their own.
@@ -992,8 +1039,8 @@ impl Map {
             "about" => {
                 let f = ferros_sys::numbers(Style::Glyphs);
                 let facts = ferros_sys::facts();
-                b.text(cx, y, (2 * u) as u16, white(), 1, "ferros");
-                y += 3 * u;
+                b.text(cx, y, (uu(2, 1)) as u16, white(), 1, "ferros");
+                y += uu(3, 1);
                 row(self, b, &mut y, small, grey(), if DEV { "version Zil, development build" } else { "version Zil" }, Some(Choice::Version));
                 // The hint from the fourth tap on, counting down to Developer; it stays until the next tap changes it (no timers).
                 if self.taps >= DEV_HINT {
@@ -1004,10 +1051,10 @@ impl Map {
                         let _ = tatau::count(&mut l, f, (DEV_TAPS - self.taps) as u64, 1);
                         l.s(" taps to Developer");
                     }
-                    b.text(cx, y - u, note as u16, white(), 1, l.as_str());
-                    y += 2 * u;
+                    b.text(cx, y - uu(1, 1), note as u16, white(), 1, l.as_str());
+                    y += uu(2, 1);
                 }
-                y += u;
+                y += uu(1, 1);
                 let mut v = Line::new();
                 match facts.battery_pct() {
                     Some(p) => {
@@ -1079,9 +1126,9 @@ impl Map {
         self.page_h[p] = y - y0;
     }
 
-    /// The brightness dots' first x and spacing: nine dots four layout units apart.
-    fn dots(cx: i64, u: i64) -> (i64, i64) {
-        let step = 4 * u;
+    /// The brightness dots' first x and spacing: nine dots four layout units apart (`uq`, the unit in 256ths of a pixel).
+    fn dots(cx: i64, uq: i64) -> (i64, i64) {
+        let step = 4 * uq >> 8;
         (cx - 4 * step, step)
     }
 
@@ -1131,7 +1178,7 @@ impl Map {
         self.settling = self.page_dx != 0 || self.fling != 0;
     }
 
-    /// One display frame of the settings' motion after the finger lifted (owner, 2026-11-05): the strip's offset from its page halves, floored toward 0 so it lands there in a few frames (½, ¾, ⅞ of the way…); the fling carries the page by its speed and loses a pixel a frame. Returns whether anything is still moving.
+    /// One display frame of the motion after a finger lifted or a tap (owner, 2026-11-05): the camera's flight (`step_cam`), and the settings' — the strip's offset from its page halves, floored toward 0 so it lands there in a few frames (½, ¾, ⅞ of the way…); the fling carries the page by its speed and loses a pixel a frame. Returns whether anything is still moving.
     fn step(&mut self) -> bool {
         self.page_dx = self.page_dx.signum() * (self.page_dx.abs() >> 1);
         if self.fling != 0 {
@@ -1144,7 +1191,8 @@ impl Map {
                 self.fling = 0;
             }
         }
-        self.page_dx != 0 || self.fling != 0
+        let flying = self.step_cam();
+        self.page_dx != 0 || self.fling != 0 || flying
     }
 
     /// A tap: one finger or two, at a panel point. Logged with what it did, so a session can be followed from `diag console`.
@@ -1185,8 +1233,9 @@ impl Map {
             }
             (1, View::Open(_)) => {
                 if !inside {
-                    self.view = View::Map;
+                    // Back to the plane: the page shrinks with the circle as the camera flies home, and the view is the plane once it lands (`step_cam`).
                     let to = self.home();
+                    self.leaving = true;
                     self.fly(to);
                     self.draw();
                     return;
@@ -1322,6 +1371,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         taps: 0,
         armed: false,
         dev: false,
+        target: None,
+        leaving: false,
+        pinch: None,
+        scale_live: None,
         nrows: 0,
         rc: [ONE; N],
         rsn: [0; N],
@@ -1415,6 +1468,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     say_base(grants, base);
     let mut labels = ferros_sys::pref(ferros_sys::PREF_LABELS);
     let mut theme_seen = ferros_sys::pref(ferros_sys::PREF_THEME);
+    let mut scale_seen = ferros_sys::pref(ferros_sys::PREF_SCALE);
 
     // The previous frame's held contacts, by contact id: present, x, y.
     let mut prev = [(false, 0i64, 0i64); 16];
@@ -1460,6 +1514,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         let tm = ferros_sys::pref(ferros_sys::PREF_THEME);
         if tm != theme_seen {
             theme_seen = tm;
+            map.draw();
+        }
+        // A new UI scale (preference 14, from a pinch here or from the bridge): the page laid out again at it.
+        let sc = ferros_sys::pref(ferros_sys::PREF_SCALE);
+        if sc != scale_seen {
+            scale_seen = sc;
             map.draw();
         }
 
@@ -1566,7 +1626,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.drag_base = (map.page_dx, map.scroll);
             map.dys = [0; 3];
             map.fling = 0;
-            map.settling = false;
+            map.settling = map.target.is_some();
         }
         if down {
             most = most.max(held);
@@ -1591,8 +1651,22 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 map.settling = true;
                 map.frame_seen = Some(frame_count);
             }
+            // A pinch on the open page lifted: its scale is the device's from now (preference 14, kept in the vault by the kernel), once, not every frame of the pinch.
+            map.pinch = None;
+            if let Some(s) = map.scale_live.take() {
+                ferros_sys::set_pref(cap(grants, S_SETTINGS), ferros_sys::PREF_SCALE, libm::roundf(s) as i8 as u8);
+                map.draw();
+            }
+            // A flight a touch paused goes on from this frame.
+            if map.target.is_some() {
+                map.settling = true;
+                map.frame_seen = Some(frame_count);
+            }
             // Fingers up: the world back to zoom one, then whatever moved (or everything, after a rescale) into the vault, and the view if it changed. The same picture is drawn once more in the rescaled world, so the display holds a frame that matches its scene (its clock redraws replay it).
-            map.renormalise();
+            // Not while a circle is open or the camera flies: the rescale would move the world under the page and the flight's target.
+            if map.view == View::Map && map.target.is_none() {
+                map.renormalise();
+            }
             map.draw();
             map.save_arranged();
             if map.cam != saved_view {
@@ -1621,6 +1695,15 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         if moved && held == 1 && matches!(map.view, View::Open(_)) {
             let id = ids[0];
             map.drag_settings(start[id], prev[id], cur[id]);
+            map.draw();
+        } else if moved && held == 2 && matches!(map.view, View::Open(_)) {
+            // Two fingers on the open page: the UI scale follows their spread, 64ths of an octave by log₂ of how far they have opened since they began (owner, 2026-11-05: "makes it so you can easily scale any app any time"), shown live and kept when they lift.
+            let (a, b) = (ids[0], ids[1]);
+            // WHY the floor of 1: two fingers on one spot have no spread, and log₂ of 0 (or a ratio over 0) is infinite.
+            let d = dist16((cur[a].1, cur[a].2), (cur[b].1, cur[b].2)).max(1);
+            let (d0, s0) = *map.pinch.get_or_insert((d, map.scale_live.unwrap_or(ferros_sys::ui_scale() as f32)));
+            // WHY the bounds: the preference's own range, half to twice (the kernel refuses anything past it; SCALE_REACH).
+            map.scale_live = Some((s0 + 64. * libm::log2f(d as f32 / d0 as f32)).clamp(-64., 64.));
             map.draw();
         } else if moved {
             let mut both = [0usize; 2];
