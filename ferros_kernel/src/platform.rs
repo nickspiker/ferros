@@ -502,6 +502,7 @@ pub fn scrub_memory() {
     // Said before the zeroing: the allocator's own lists are in the heap, so nothing may allocate after it (the first cut formatted its line after, and the reset path died short of the EL3 reboot-mode stamp: two reboots to fastboot that landed as plain boots, 2026-11-03).
     pstore(alloc::format!("memory scrub before the reset: {} MiB\n", total >> 20).as_bytes());
     crate::smp::stop_all();
+    crate::cachemap::pools_to_kernel();
     reset_step(3);
     let t0 = cntpct();
     for &(lo, hi) in &regions {

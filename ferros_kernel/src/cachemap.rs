@@ -511,6 +511,21 @@ pub fn guard_pages(base: usize, len: usize, on: bool) {
     }
 }
 
+/// Every page of both pools back to kernel-only writable data, for the scrub before a reset (platform::scrub_memory): a grants page and a masked process's code are read-only at every level, the kernel's too, and the scrub's first `dc zva` into one took a permission fault, so the fault's plain reset replaced the ordered one and `bridge reboot fastboot` booted ferros again (akita, 2026-11-06: FAR G#8300_0000, the first arc's grants page). Only after the workers are stopped: no process runs again before the reset.
+pub fn pools_to_kernel() {
+    if !vhe() {
+        return;
+    }
+    for (lo, hi) in [POOL, POOL_BIG] {
+        let mut a = lo;
+        while a < hi {
+            *page_entry(a).unwrap() = a as u64 | TABLE_OR_PAGE | ATTR_NORMAL | SH_INNER | AF | PXN | UXN;
+            a += PAGE;
+        }
+    }
+    unsafe { asm!("dsb ish", "tlbi vmalle1is", "dsb ish", "isb") };
+}
+
 /// The level-3 entry of the pool page at `a`, in either pool; None outside both.
 fn page_entry(a: usize) -> Option<&'static mut u64> {
     let (p0, p1) = POOL;
