@@ -1770,6 +1770,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // The board first (board.rs): husky's high RAM is not there on akita, and the next line reads it on husky.
     board::detect(dtb_addr);
     platform::pstore(if board::akita() { b"ferros: board akita\n" as &[u8] } else { b"ferros: board husky\n" });
+    // akita's ABL leaves its splash at G#FAC0_0000, outside the regions the display engine's fence lets it read (s2mpu::fence_dpu: display-fb and display-phases, one GiB lower): fenced at the service's start, every scan-out read of it was refused and the panel went black a few frames into the boot (2026-11-06). So akita draws into ferros's own framebuffer from the first adoption (the layer re-pointed at display-fb; translation is off on a cold boot).
+    if board::akita() {
+        display::use_own_fb(true);
+    }
     board::probe(1);
     platform::pstore_prev_handoff();
     platform::mark_trail(0);
