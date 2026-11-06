@@ -105,9 +105,9 @@ pub fn probe(n: u32) {
     }
 }
 
-/// Whether the kernel moves onto the Cortex-X3 (x3.rs): every husky build since 2026-10-22 unless `FERROS_X3=0`. Not on akita: there the kernel never came back from the hop (probes 45 and 5, 2026-11-06), so it stays on CPU0 until that is understood.
+/// Whether the kernel moves onto the Cortex-X3 (x3.rs): every build unless `FERROS_X3=0`, husky since 2026-10-22 and akita since 2026-11-06. akita stayed on CPU0 that morning on a misreading: the "never came back from the hop" was read from probe 5, which a successful hop never reaches (CPU0 parks), while three other faults could stop its boot; its X3 probe looked dead too, but only because the probe's completion word never matched (x3.rs). With those fixed, the hop works there: the service on the X3 at ~2.9 GHz, the vault, the store and `reboot fastboot` checked.
 pub fn x3() -> bool {
-    option_env!("FERROS_X3") != Some("0") && !akita()
+    option_env!("FERROS_X3") != Some("0")
 }
 
 /// akita bring-up, `FERROS_PROBE=<n>` builds only: at log checkpoint `n`, a plain reset (PSCI), not the bootloader. ABL boots slot a again and counts its retries down, then falls back to slot b's Android, which shows the RAM log of the last ferros session (/sys/fs/pstore; tools/husky-pstore.sh): the flash log's lines and the processes' consoles up to here, read without hands.
