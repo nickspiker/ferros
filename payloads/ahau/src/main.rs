@@ -99,6 +99,9 @@ static mut FRESH_JOB: (u64, usize, [u8; 32]) = (0, 0, [0; 32]);
 static mut BONDED: bool = false;
 /// The last lift's stages in microseconds (retint, board, tint pass, present), for its console line while the lift's lag is looked at.
 static mut LIFT_US: [u64; 4] = [0; 4];
+/// Keys type at the press (owner, 2026-11-05: "try 2 and then maybe go to 1"): the handle, the keys' rainbow and the mark move at the press, and a finger sliding off types the key all the same. False: the mark renders a preview at the press and the lift types it (a slide-off then leaves the handle as it was).
+const COMMIT_AT_PRESS: bool = true;
+
 static mut FRESH_STACK: [u8; 1 << 16] = [0; 1 << 16];
 /// The bonded button's helpers: three more threads on the worker cores, each drawing every fourth row of a pass (tapuwae `render_button_pack16`'s row share), the mark's thread the remaining share. The fresh mark redraws only its components, a quarter of the disc (159k of 630k pixels at 900 px), where the ball is 85 % of it (538k) at the same cost a sample, so one core that kept up with the fresh mark is about four short of the ball (1.0 to 1.4 s a pass alone, 2026-11-04).
 const HELPERS: usize = 3;
@@ -1778,6 +1781,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // Every key exact: a rolling finger still types where it landed.
     touches.trace_words = false;
     let mut held = [(0u8, 0i64, 0i64); 16];
+    // The key typed at its press (COMMIT_AT_PRESS), whose tap at the lift is then only its letting go.
+    let mut pressed: Option<Key> = None;
     // The last frame of the mark put on the glass (FRESH_DONE's count).
     let mut mark_shown = 0u64;
     loop {
@@ -1821,17 +1826,32 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     let mut l = Line::new();
                     let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: key lit in {} us\n", ferros_sys::us_since(t0)));
                     console(a.grants, l.as_bytes());
-                    // The free device's mark previews the key under the finger (its components redraw in a fraction of a second); the bonded device's whole disc waits for the tap, so a press does not start a render the tap replaces.
-                    if !unsafe { BONDED } {
+                    a.prepare(key);
+                    if COMMIT_AT_PRESS {
+                        // The stroke at the press: the handle, the keys' rainbow and the mark all move now; the lift only lets the key go.
+                        let t0 = now();
+                        a.tap(key);
+                        a.light(key, true);
+                        pressed = Some(key);
+                        let mut l = Line::new();
+                        let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: typed at the press in {} us (retint {}, board {}, tint {}, present {})\n", ferros_sys::us_since(t0), unsafe { LIFT_US[0] }, unsafe { LIFT_US[1] }, unsafe { LIFT_US[2] }, unsafe { LIFT_US[3] }));
+                        console(a.grants, l.as_bytes());
+                    } else {
+                        // The mark previews the key under the finger, shown once the lift makes it the typed handle.
                         a.preview(key);
                     }
-                    a.prepare(key);
                 }
                 Touch::Unlight(key) => {
                     slid = Some(key);
                 }
                 Touch::Scrolled => {
                     a.show_board();
+                }
+                // Already typed at its press: the lift lets the key go.
+                Touch::Tap(key) if pressed == Some(key) => {
+                    pressed = None;
+                    a.light(key, false);
+                    slid = None;
                 }
                 Touch::Tap(key) => {
                     let t0 = now();
@@ -1851,6 +1871,9 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
         }
         if let Some(key) = slid {
+            if pressed == Some(key) {
+                pressed = None;
+            }
             a.light(key, false);
             publish_fresh_text(&a.handle[..a.len], true);
         }
