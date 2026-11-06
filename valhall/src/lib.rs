@@ -942,6 +942,46 @@ impl<const N: usize> Kernel<N> {
         self.push(i)
     }
 
+    /// `FREXPE.f32 dst, a`: a's exponent as an integer (ISA.xml:2216-2249, opcode G#99, opcode2 2), the `sqrt` (bit 24) and `log` (bit 25) forms adjusting the split to Valhall's argument reductions.
+    pub fn frexpe_f32(&mut self, dst: impl Into<Dst>, a: impl Into<Src>, sqrt: bool, log: bool) -> Placed<'_> {
+        let mut i = Ins::new(0x099);
+        i.bits(0x2, 16);
+        i.bits(sqrt as u64, 24);
+        i.bits(log as u64, 25);
+        i.src(a, 0);
+        i.dst(dst);
+        self.push(i)
+    }
+
+    /// `FLOGD.f32 dst, a`: the special function unit's logarithm, which needs the argument reduction of Mesa's `bi_flog2_32` around it (ISA.xml:2280, opcode2 8 under G#9C).
+    pub fn flogd_f32(&mut self, dst: impl Into<Dst>, a: impl Into<Float>) -> Placed<'_> {
+        let mut i = Ins::new(0x09C);
+        i.bits(0x8, 16);
+        i.float(a, 0);
+        i.dst(dst);
+        self.push(i)
+    }
+
+    /// `FADD_LSCALE.f32 dst, a, b`: the addition specialised for the logarithm's reduction (ISA.xml:2477-2488, opcode G#A4, opcode2 9).
+    pub fn fadd_lscale_f32(&mut self, dst: impl Into<Dst>, a: impl Into<Float>, b: impl Into<Float>) -> Placed<'_> {
+        let mut i = Ins::new(0x0A4);
+        i.bits(0x9, 16);
+        i.float(a, 0);
+        i.float(b, 1);
+        i.dst(dst);
+        self.push(i)
+    }
+
+    /// `FEXP.f32 dst, fixed, x`: 2 to the power of `fixed`, an 8:24 fixed-point number; `x` is the same argument as a float, for the special cases (ISA.xml:2462-2475, opcode G#A4, opcode2 8).
+    pub fn fexp_f32(&mut self, dst: impl Into<Dst>, fixed: impl Into<Src>, x: impl Into<Float>) -> Placed<'_> {
+        let mut i = Ins::new(0x0A4);
+        i.bits(0x8, 16);
+        i.src(fixed, 0);
+        i.float(x, 1);
+        i.dst(dst);
+        self.push(i)
+    }
+
     /// `FMIN.f32 dst, a, b` (ISA.xml:2382-2398, opcode G#A4 with opcode2 2 at 19:16).
     pub fn fmin_f32(&mut self, dst: impl Into<Dst>, a: impl Into<Float>, b: impl Into<Float>) -> Placed<'_> {
         let mut i = Ins::new(0x0A4);

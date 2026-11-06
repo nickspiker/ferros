@@ -52,6 +52,14 @@ enum Op {
     F2U(u32),
     F2I(u32),
     U2F(u32),
+    /// Signed integer to float.
+    S2F(u32),
+    /// FREXPE: the exponent as an integer, with the `sqrt` and `log` forms.
+    FrexpE(u32, bool, bool),
+    /// FLOGD, FADD_LSCALE, FEXP (fixed, float): the special function unit's logarithm and exponent pieces.
+    FLogd(u32),
+    FAddLscale(u32, u32),
+    FExp(u32, u32),
     /// A loop-carried value: its value before the loop.
     Phi(u32),
     /// The loop's top (after its phis).
@@ -69,7 +77,11 @@ impl Op {
         use Op::*;
         match *self {
             Const(_) | Gid | LoopHead => {}
-            FNeg(a) | FRcp(a) | FRsq(a) | FFloor(a) | F2U(a) | F2I(a) | U2F(a) | Phi(a) | LoopEnd(a) => f(a),
+            FNeg(a) | FRcp(a) | FRsq(a) | FFloor(a) | F2U(a) | F2I(a) | U2F(a) | S2F(a) | FrexpE(a, _, _) | FLogd(a) | Phi(a) | LoopEnd(a) => f(a),
+            FAddLscale(a, b) | FExp(a, b) => {
+                f(a);
+                f(b)
+            }
             FAdd(a, b) | FMul(a, b) | FMin(a, b) | FMax(a, b) | FCmp(_, a, b) | IMul(a, b) | And(a, b) | Or(a, b) | Xor(a, b) | Shl(a, b) | Shr(a, b) => {
                 f(a);
                 f(b)
@@ -112,6 +124,11 @@ impl Op {
             F2U(_) => "f2u",
             F2I(_) => "f2i",
             U2F(_) => "u2f",
+            S2F(_) => "s2f",
+            FrexpE(..) => "frexpe",
+            FLogd(_) => "flogd",
+            FAddLscale(..) => "faddlscale",
+            FExp(..) => "fexp",
             Phi(_) => "phi",
             LoopHead => "loophead",
             LoopEnd(_) => "loopend",
@@ -338,6 +355,22 @@ impl F {
     /// `as i32 as u32`: toward zero, negatives in two's complement.
     pub fn to_i32(self) -> U {
         U(push(Op::F2I(self.0)))
+    }
+    /// log₂ self on the special function unit, Mesa's Valhall sequence (`bi_flog2_32`): FREXPE's exponent as a float, plus FLOGD times FADD_LSCALE(−1, self). Four instructions where a polynomial takes about twenty; within an ulp of the true value over 2^16 arguments 2^-40 to 2^40 with the `log` form (gputest 12, 2026-11-05; the other forms are wrong). `sqrt` and `log` are FREXPE's two forms.
+    pub fn log2_hw_with(self, sqrt: bool, log: bool) -> F {
+        let e = F::op(Op::S2F(push(Op::FrexpE(self.0, sqrt, log))));
+        let add = F::op(Op::FAddLscale(F::splat(-1.).0, self.0));
+        let l = F::op(Op::FLogd(self.0));
+        F::op(Op::FFma(l.0, add.0, e.0))
+    }
+    pub fn log2_hw(self) -> F {
+        self.log2_hw_with(false, true)
+    }
+    /// 2 to the power self on the special function unit, Mesa's sequence (`bi_fexp_32`): self as 8:24 fixed point, then FEXP. Three instructions.
+    pub fn exp2_hw(self) -> F {
+        let scaled = self * F::splat((1u32 << 24) as f32);
+        let fixed = push(Op::F2I(scaled.0));
+        F::op(Op::FExp(fixed, scaled.0))
     }
     pub fn from_u32(u: U) -> F {
         F::op(Op::U2F(u.0))
@@ -953,6 +986,21 @@ pub fn compile() -> Compiled {
             }
             Op::U2F(a) => {
                 k.u32_to_f32(d, rr(a));
+            }
+            Op::S2F(a) => {
+                k.s32_to_f32(d, rr(a));
+            }
+            Op::FrexpE(a, sqrt, log) => {
+                k.frexpe_f32(d, rr(a), sqrt, log);
+            }
+            Op::FLogd(a) => {
+                k.flogd_f32(d, rr(a));
+            }
+            Op::FAddLscale(a, b) => {
+                k.fadd_lscale_f32(d, rr(a), rr(b));
+            }
+            Op::FExp(a, b) => {
+                k.fexp_f32(d, rr(a), rr(b));
             }
             Op::Phi(init) => {
                 k.mov_i32(d, rr(init));

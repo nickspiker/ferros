@@ -756,6 +756,99 @@ fn stage_read_test(grants: u64, arena: usize) -> ! {
     say!(grants, "gputest: stage read: {n} words (largest {max_idx}), status {}, {} us; {wrong} wrong ({untouched} never written), the first at {first}\n", reply.0, reply.1);
     exit(0);
 }
+
+/// log₂ in f64 for the comparison: the exponent from the bits, the mantissa's from atanh's series (t = (m − 1)/(m + 1), |t| < 0.172, 2^-53 by 16 terms).
+fn log2_f64(x: f64) -> f64 {
+    let b = x.to_bits();
+    let e = ((b >> 52) & 0x7FF) as i64 - 1023;
+    let m = f64::from_bits((b & 0x000F_FFFF_FFFF_FFFF) | 0x3FF0_0000_0000_0000);
+    let (m, e) = if m > core::f64::consts::SQRT_2 { (m * 0.5, e + 1) } else { (m, e) };
+    let t = (m - 1.) / (m + 1.);
+    let (t2, mut p, mut s) = (t * t, t, 0f64);
+    for k in 0..16 {
+        s += p / (2 * k + 1) as f64;
+        p *= t2;
+    }
+    e as f64 + 2. * s / core::f64::consts::LN_2
+}
+
+/// 2^x in f64: the integer part into the exponent, e^(f ln 2) by its series (|f| ≤ ½, 2^-53 by 20 terms).
+fn exp2_f64(x: f64) -> f64 {
+    let n = if x >= 0. { (x + 0.5) as i64 } else { -((-x + 0.5) as i64) };
+    let f = (x - n as f64) * core::f64::consts::LN_2;
+    let (mut term, mut s) = (1f64, 1f64);
+    for k in 1..20 {
+        term *= f / k as f64;
+        s += term;
+    }
+    s * f64::from_bits(((n + 1023) as u64) << 52)
+}
+
+/// The special function unit's log₂ and 2^x (2026-11-05, for the attest mark's shading): over 2^16 random arguments, Mesa's sequences against f64, in ulps of the f32 result: log₂ with each of FREXPE's forms, and 2^x.
+fn hw_test(grants: u64, arena: usize) -> ! {
+    use valhall::ssa::{self, F};
+    let (ins, outs) = (1usize << 20, 8usize << 20);
+    let n = 1usize << 16;
+    let mut s = 0x2545_F491u32;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        s
+    };
+    for g in 0..n {
+        // log₂'s arguments: positive, 2^-40 to 2^40; 2^x's: −100 to 100.
+        let l = (next() & 0x007F_FFFF) | ((127 - 40 + next() % 80) << 23);
+        let x = (next() as f32 / u32::MAX as f32 - 0.5) * 200.;
+        unsafe {
+            core::ptr::write_volatile((arena + ins + 8 * g) as *mut u32, l);
+            core::ptr::write_volatile((arena + ins + 8 * g + 4) as *mut u32, x.to_bits());
+        }
+    }
+    ssa::begin();
+    ssa::reserve(2);
+    let g = ssa::gid();
+    let l = F::from_bits(ssa::load(1, g, 3, 0));
+    let x = F::from_bits(ssa::load(1, g, 3, 4));
+    let outs_v = [l.log2_hw_with(true, false), l.log2_hw_with(false, true), l.log2_hw_with(false, false), x.exp2_hw()];
+    for (i, v) in outs_v.into_iter().enumerate() {
+        ssa::store(0, 4, (4 * i) as i16, v.to_bits());
+    }
+    let k = ssa::compile();
+    for (i, &w) in k.words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+    }
+    let mut uniforms = alloc::vec![ARENA_VA + outs as u64, ARENA_VA + ins as u64];
+    uniforms.extend_from_slice(&k.consts);
+    let reply = run_with(grants, k.words.len(), (n / 16) as u32, 0x1000 | if k.regs64 { 0x8000 } else { 0 }, &uniforms);
+    // Ulps between two f32 of one sign (all of these results are positive, or log₂'s either sign: compared through the ordered integer line).
+    let ord = |b: u32| if b >> 31 == 1 { -((b & 0x7FFF_FFFF) as i64) } else { b as i64 };
+    let mut worst = [0u64; 4];
+    let mut off = [0u32; 4];
+    let mut sample = [0u32; 4];
+    for gi in 0..n {
+        let rd = |o: usize| unsafe { core::ptr::read_volatile((arena + outs + 16 * gi + 4 * o) as *const u32) };
+        let l = f32::from_bits(unsafe { core::ptr::read_volatile((arena + ins + 8 * gi) as *const u32) });
+        let x = f32::from_bits(unsafe { core::ptr::read_volatile((arena + ins + 8 * gi + 4) as *const u32) });
+        let want = [log2_f64(l as f64) as f32, log2_f64(l as f64) as f32, log2_f64(l as f64) as f32, exp2_f64(x as f64) as f32];
+        for i in 0..4 {
+            let u = (ord(rd(i)) - ord(want[i].to_bits())).unsigned_abs();
+            if u > worst[i] {
+                worst[i] = u;
+                sample[i] = gi as u32;
+            }
+            off[i] += (u != 0) as u32;
+        }
+    }
+    say!(grants, "gputest: hw: status {}, {} us, {} words\n", reply.0, reply.1, k.words.len());
+    for (i, name) in ["log2 FREXPE sqrt", "log2 FREXPE log", "log2 FREXPE plain", "exp2"].iter().enumerate() {
+        let gi = sample[i] as usize;
+        let got = unsafe { core::ptr::read_volatile((arena + outs + 16 * gi + 4 * i) as *const u32) };
+        let arg = unsafe { core::ptr::read_volatile((arena + ins + 8 * gi + 4 * (i / 3)) as *const u32) };
+        say!(grants, "gputest: hw: {name}: {} of {n} off, worst {} ulp (argument G#{:X}, got G#{:X})\n", off[i], worst[i], arg, got);
+    }
+    exit(0);
+}
 /// As `run` with the preload word given (bit 15: 64 registers a thread).
 fn run_with(grants: u64, words: usize, groups: u32, preload: u16, uniforms: &[u64]) -> (u8, u32) {
     let mut msg = [0u8; 18 + 8 * 16];
@@ -803,6 +896,10 @@ extern "C" fn gputest_main(grants: u64, input: u64, input_len: u64) -> ! {
     // Input byte 1: the ops test (the builder's new instructions); none: the Mandelbrot.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 1 {
         ops_test(grants, arena);
+    }
+    // Input byte 12: the special function unit's log2 and exp2.
+    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 12 {
+        hw_test(grants, arena);
     }
     // Input byte 11: what the GPU reads of the attest stage.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 11 {
