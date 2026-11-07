@@ -47,6 +47,7 @@ pub mod nr {
     pub const SENSORS: u64 = 26;
     pub const STATUS: u64 = 27;
     pub const PET: u64 = 28;
+    pub const BLOCK: u64 = 29;
 }
 /// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
 pub const CORES_WORKERS: u64 = 0x00F0;
@@ -288,6 +289,15 @@ pub fn store_get(cap: u64, key: &[u8], buf: &mut [u8]) -> Option<usize> {
     if r == ERR || r == NOTHING { None } else { Some(r as usize) }
 }
 
+/// Blocks of a window on the ferros partition (a Blocks capability; the vault process's disk, VAULT-OUT.md): `buf.len() / 4096` blocks (1 to 16) from block `at` of the window, read into `buf`. Returns 0, or ERR (not a window this process holds, out of it, or the UFS command failed).
+pub fn block_read(cap: u64, at: u64, buf: &mut [u8]) -> u64 {
+    svc(nr::BLOCK, cap, ((buf.len() as u64 >> 12) & 0xFF) << 8, at, off(buf.as_mut_ptr()), 0)
+}
+
+/// `block_read`'s other half: `buf.len() / 4096` blocks written from `buf` at block `at` of the window.
+pub fn block_write(cap: u64, at: u64, buf: &[u8]) -> u64 {
+    svc(nr::BLOCK, cap, 1 | ((buf.len() as u64 >> 12) & 0xFF) << 8, at, off(buf.as_ptr()), 0)
+}
 /// Read part of a value larger than one transfer: `buf.len()` bytes (at most 4096) from `offset` of the value under `key`. Returns the value's whole length (the kernel keeps the value between such reads, so walking a large one costs one vault read).
 pub fn store_get_at(cap: u64, key: &[u8], offset: usize, buf: &mut [u8]) -> Option<usize> {
     let r = svc(nr::STORE, cap, 2 | (buf.len() as u64) << 8 | (offset as u64) << 32, off(key.as_ptr()), key.len() as u64, off(buf.as_mut_ptr()));

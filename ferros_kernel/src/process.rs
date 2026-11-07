@@ -314,6 +314,8 @@ pub enum Object {
     Pt,
     /// Served by the kernel: the sensors process's way to publish what it reads (`SYS_SENSORS`, sensorlink.rs): the block the kernel answers SYS_FACTS and SYS_LIGHT from, and the board's identity for the registry.
     Sensors,
+    /// Served by the kernel: a window of 4 KiB blocks on the ferros partition (index into `WINDOWS`), read and written by block number within it (`SYS_BLOCK`): the vault process's disk (VAULT-OUT.md).
+    Blocks(usize),
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -355,6 +357,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Unlock => (14, 0),
         Object::Pt => (15, 0),
         Object::Sensors => (16, 0),
+        Object::Blocks(i) => (17, i as u64),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -669,6 +672,16 @@ impl Process {
             unsafe { core::ptr::write_volatile((self.arc.base + ((off as usize + i) & m)) as *mut u8, b) };
         }
     }
+    /// `write` in one copy when the range does not wrap the arc's mask, as a well-formed caller's never does: a block read hands back 4 KiB at a time (SYS_BLOCK).
+    fn write_from(&self, off: u64, src: &[u8]) {
+        let m = self.arc.mask();
+        let start = off as usize & m;
+        if start + src.len() <= m + 1 {
+            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), (self.arc.base + start) as *mut u8, src.len()) };
+        } else {
+            self.write(off, src);
+        }
+    }
     /// Find the capability for a presented token: compare against every entry without an early exit, so the time taken says nothing about which (if any) matched. Returns the entry index.
     fn lookup(&self, token: &[u8]) -> Option<usize> {
         let mut hit = None;
@@ -753,6 +766,10 @@ const SYS_STATUS: u64 = 27;
 pub static STATUS: [[core::sync::atomic::AtomicU64; 8]; 6] = [const { [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 8] }; 6];
 /// pet(): the process is alive and going round its main loop (the process watchdog, measuring: the kernel records the longest stretch between two pets, `diag pets`). → 0.
 const SYS_PET: u64 = 28;
+/// block(cap, op, block, buf): 4 KiB blocks of a window on the ferros partition (`WINDOWS`), by number within it: op bit 0 write (else read), bits 8-15 the count (1 to BLOCK_MAX), `buf` the count × 4 KiB in the caller's arc. → 0, or ERR (no such window, out of it, or the UFS command failed).
+const SYS_BLOCK: u64 = 29;
+/// The most blocks one `SYS_BLOCK` moves.
+const BLOCK_MAX: u64 = 1 << 4;
 const SYS_LAST: u64 = 22;
 
 /// A named interrupt line a spawn can grant (`bridge spawn --irq NAME`): the GIC INTID (SPI + 32). Enabled and routed to the kernel's core when granted; `.Lirq` (main.rs) masks a line that fires and marks it pending; the waiting thread handles the device and acks. The kernel's own lines (the keys, the slice timer) are not here.
@@ -1075,6 +1092,16 @@ pub struct StoreScope {
     pub name: &'static str,
     pub prefix: &'static str,
 }
+/// A window of the ferros partition (LU 0) that a process may read and write by block, through `SYS_BLOCK`: `blocks` 4 KiB blocks from `offset` blocks into the partition.
+pub struct BlockWindow {
+    pub name: &'static str,
+    pub offset: u64,
+    pub blocks: u64,
+}
+
+/// The windows (VAULT-OUT.md, block window first cut): the kernel keeps the UFS driver and moves blocks; it does not hold values, parse them or seal them. `vault`: the vault process's two mirrors, 8 GiB each, from 4 GiB into the partition (past the flash log at 1 GiB and the kernel's own vault at 2 GiB to 2.5 GiB; every ferros partition is at least 77 GiB).
+pub static WINDOWS: &[BlockWindow] = &[BlockWindow { name: "vault", offset: 1 << 20, blocks: 1 << 22 }];
+
 pub static STORES: &[StoreScope] = &[
     // The map's own state: the arrangement the owner made by hand.
     StoreScope { name: "map", prefix: "map." },
@@ -1442,6 +1469,41 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 }
             }
             f.x[0] = n;
+            0
+        }
+        SYS_BLOCK => {
+            let token = p.read(f.x[0], 32);
+            let window = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+                Some((Object::Blocks(i), r)) if r & RIGHT_SEND != 0 => WINDOWS.get(i),
+                _ => None,
+            };
+            let (write, count, at, buf) = (f.x[1] & 1 != 0, (f.x[1] >> 8) & 0xFF, f.x[2], f.x[3]);
+            f.x[0] = match (window, crate::ufs_device::part()) {
+                // WHY the bounds: the block number and count are the process's; a window is all it may touch, and the partition must hold the window (the same refusal the kernel's own vault makes).
+                (Some(w), Some((first, blocks))) if (1..=BLOCK_MAX).contains(&count) && at < w.blocks && count <= w.blocks - at && w.offset + w.blocks <= blocks as u64 => {
+                    let u = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                    let base = first as u64 + w.offset + at;
+                    let mut ok = true;
+                    for k in 0..count {
+                        let off = buf + (k << 12);
+                        let lba = (base + k) as u32;
+                        if write {
+                            p.read_into(off, u.data_buffer_mut());
+                            ok = u.write_block_lun(0, lba) == 0 && u.last_response_status() == 0;
+                        } else {
+                            ok = u.read_block_lun(0, lba) == 0 && u.last_response_status() == 0;
+                            if ok {
+                                p.write_from(off, u.data_buffer());
+                            }
+                        }
+                        if !ok {
+                            break;
+                        }
+                    }
+                    if ok { 0 } else { ERR }
+                }
+                _ => ERR,
+            };
             0
         }
         SYS_STORE => {
@@ -2482,6 +2544,8 @@ pub enum Grant<'a> {
     Pt,
     /// Publishing the sensors' block, for the sensors process (syscall 26).
     Sensors,
+    /// A window of blocks on the ferros partition, by name (`WINDOWS`, syscall 29).
+    Blocks(&'a [u8]),
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -2638,6 +2702,10 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
             },
             Grant::Ira => (Object::Ira, RIGHT_SEND),
             Grant::Unlock => (Object::Unlock, RIGHT_SEND),
+            Grant::Blocks(n) => match WINDOWS.iter().position(|w| w.name.as_bytes() == *n) {
+                Some(i) => (Object::Blocks(i), RIGHT_SEND),
+                None => return Err("no such block window"),
+            },
             Grant::Pt => (Object::Pt, RIGHT_SEND),
             Grant::Sensors => (Object::Sensors, RIGHT_SEND),
             Grant::Part(n) => match PARTS.iter().position(|p| p.as_bytes() == *n) {

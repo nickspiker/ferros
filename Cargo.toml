@@ -68,6 +68,8 @@ members = [
     "payloads/nettest",
     "payloads/httptest",
     "payloads/fgtw",
+    "payloads/vault",
+    "payloads/vaulttest",
     "payloads/pqprobe",
     "payloads/wxtest",
     "payloads/beamtest",

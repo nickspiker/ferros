@@ -1,6 +1,6 @@
 # The vault out of the kernel
 
-Status: decided with the owner, 2026-11-07 (the three questions below, and the permission rule). Nothing here is built yet; the build order is at the end.
+Status: decided with the owner, 2026-11-07 (the three questions below, and the permission rule). Built so far is listed below; the build order is at the end.
 
 ## Why
 
@@ -77,6 +77,15 @@ The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by t
   - The last head and piece opened are kept, keyed by address and sealing key.
   - Each domain keeps its own books under names callers cannot use: its list of names, and a pending list that `sweep` clears after an interrupted write.
   - Every call takes the domain's keys; nothing derives one.
+- **The block window and the vault process (2026-11-07), proven on the Pro:**
+  - The kernel's `SYS_BLOCK` (29): a `Blocks` capability names a window of the ferros partition (`process.rs` `WINDOWS`), and the call moves 1 to 16 blocks of 4 KiB by number within it. The kernel checks the window and moves bytes; it does not hold, parse or seal them. `bridge spawn --blocks vault` grants it.
+  - `vault`: 2 × 8 GiB from 4 GiB into the partition (past the flash log at 1 GiB and the kernel's vault at 2 to 2.5 GiB).
+  - `payloads/vault` opens manifestus over the window (mirror A from block 0, mirror B from half way, each 512 MiB to start) and serves `ferros_store` in op-byte messages (set in pieces, get at an offset, delete, names, sweep). The keys are fixed, non-secret test domains until the kernel issues real ones (step 3).
+  - `payloads/vaulttest` is its client. On the Pro:
+    - a blank region opens in 21 s (read whole once, before the first commit), and a committed one reopens in 6 ms;
+    - 1 MiB is written in 154 ms (4000-byte messages) and read back in 45 ms, the same by BLAKE3;
+    - names follow the puts and the delete, domain 2 finds nothing of domain 1, and sweep runs;
+    - after the vault process is killed and spawned again, the 1 MiB value reads back whole (50 ms).
 
 ## Found while mapping the kernel's vault (2026-11-07)
 

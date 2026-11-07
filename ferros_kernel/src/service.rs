@@ -3075,6 +3075,7 @@ pub fn run(mut b: Boot) -> ! {
                             11 => crate::process::Grant::Unlock,
                             12 => crate::process::Grant::Pt,
                             13 => crate::process::Grant::Sensors,
+                            14 => crate::process::Grant::Blocks(g),
                             _ => crate::process::Grant::Use(g),
                         });
                     }
