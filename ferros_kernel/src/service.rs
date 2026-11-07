@@ -2437,9 +2437,11 @@ pub fn run(mut b: Boot) -> ! {
                     continue;
                 }
                 }
+                resp.extend_from_slice(if crate::board::akita() { b"ferros on Pixel 8a (Tensor G3), ".as_slice() } else { b"ferros on Pixel 8 Pro (Tensor G3), ".as_slice() });
                 resp.extend_from_slice(match b.kind {
-                    BootKind::Handoff => b"ferros on Pixel 8 Pro (Tensor G3), chainloaded from Linux\n".as_slice(),
-                    BootKind::Cold => b"ferros on Pixel 8 Pro (Tensor G3), cold boot from ABL\n",
+                    BootKind::Handoff => b"chainloaded from Linux\n".as_slice(),
+                    BootKind::Cold if crate::ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed) != 0 => b"through the hv's gate\n",
+                    BootKind::Cold => b"cold boot from ABL\n",
                 });
                 let r = |a: usize| unsafe { read_volatile(a as *const u32) };
                 append_hex(&mut resp, b"GEN=", generation as u32);
