@@ -401,6 +401,8 @@ fn icon_decode() -> [u16; 256] {
 
 /// The apps' icons, bundled by tools/app-icons: b"ICN3" (gamma2tanh codes; ICN2: gamma 2), count u8, size u16 LE, then per icon size x size RGBA, already cut to a circle, followed by its size x size grey (photopic luminance), all VSF RGB gamma 2 codes. Empty when the build had no bundle.
 static ICONS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icons.bin"));
+/// The ferros icon's number (tools/app-icons' order, counted from one as the map's `icon` field counts them): drawn from logo.vsf's geometry (`draw::logo`), not from its raster in the bundle.
+const ICON_FERROS: u8 = 5;
 
 /// The n-th icon (from 1): its RGBA, its grey, and its side, if the bundle has it.
 fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
@@ -2560,7 +2562,7 @@ fn helm_draw(width: usize, height: usize) -> bool {
     let ink = g2t_colour((9000.0, 9000.0, 9000.0));
     // A stroke 2 pixels wide: covered whole within 1 pixel of its centre line, the step across the 2 pixels beyond.
     const HALF: f32 = 1.0;
-    let stroke = |d: f32| bump_step((HALF + 1.0 - d) * 0.5);
+    let stroke = |d: f32| draw::bump_step((HALF + 1.0 - d) * 0.5);
     let (circles, n) = corner_layout(width, height);
     for &(x, y, r, what) in &circles[..n] {
         if y < height as f32 * 0.5 {
@@ -2636,19 +2638,6 @@ fn bar_decode(b0: usize, rows: usize, width: usize) {
         }
         span[yy] = if l < rr { (l as u16, rr as u16) } else { (0, 0) };
     }
-}
-
-/// A C∞ step from 0 at t ≤ 0 to 1 at t ≥ 1: the bump exp(−1/t) against its mirror. Every derivative is zero at both ends, so a disc's edge has no kink and leaves nothing past itself (the bump is defined as 0 for t ≤ 0; the two tests are its definition, not a clamp).
-#[inline]
-fn bump_step(t: f32) -> f32 {
-    if t <= 0.0 {
-        return 0.0;
-    }
-    if t >= 1.0 {
-        return 1.0;
-    }
-    let (a, b) = (libm::expf(-1.0 / t), libm::expf(-1.0 / (1.0 - t)));
-    a / (a + b)
 }
 
 /// A colour in working values (gamma 2, white at Q14) as fluor's 16-bit darkness, straight (α is the caller's): each channel's `g2t` code is 2¹⁶ · tanh(v / 2¹⁴), the inverse of `G2T16_Q14`, and its darkness the complement. The console's colours are all under white, where tanh stays below 0.77, so the code never reaches 2¹⁶.
@@ -2841,7 +2830,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             for px in x0..=x1 {
                 let Some(i) = at(px, py) else { continue };
                 let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
-                let cov = bump_step((r + 1.0 - libm::sqrtf(dx * dx + dy * dy)) * 0.5);
+                let cov = draw::bump_step((r + 1.0 - libm::sqrtf(dx * dx + dy * dy)) * 0.5);
                 console[i] = console[i].under(fill | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
             }
         }
@@ -3669,6 +3658,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                                 let c = ((d as i64 / 2) << 8) | 128;
                                 // The fill only where there is no art: under an icon it showed as a dark rim along the edge.
                                 match mp {
+                                    _ if cir.icon == ICON_FERROS => {
+                                        draw::logo(px, d, d, c, c, ri, tc, ts, lit);
+                                    }
                                     Some(mp) => {
                                         draw::icon(px, d, d, c, c, ri, tc, ts, mp, lit);
                                     }
@@ -3683,12 +3675,14 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             blit(pixels, width, height, spr, ext, d, (sx >> 8) - d as i64 / 2, (sy >> 8) - d as i64 / 2);
                             unsafe { SCENE_US[1] += ferros_sys::us_since(t_b) };
                         } else {
-                            if let Some(mp) = mp {
+                            if cir.icon == ICON_FERROS {
+                                draw::logo(pixels, width, height, sx, sy, ri, tc, ts, lit);
+                            } else if let Some(mp) = mp {
                                 draw::icon(pixels, width, height, sx, sy, ri, tc, ts, mp, lit);
                             }
                             let t_d = now();
                             unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
-                            if mp.is_none() {
+                            if mp.is_none() && cir.icon != ICON_FERROS {
                                 draw::disc(pixels, width, height, sx, sy, ri, fill);
                             }
                             r = draw::Rect::EMPTY;

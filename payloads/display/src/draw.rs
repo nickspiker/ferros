@@ -699,3 +699,84 @@ pub fn icon(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
     });
     Rect { x0: ((cx - r) >> 8) as i32 - 2, y0: ((cy - r) >> 8) as i32 - 2, x1: ((cx + r) >> 8) as i32 + 3, y1: ((cy + r) >> 8) as i32 + 3 }.clip(width, height)
 }
+
+/// A C∞ step from 0 at t ≤ 0 to 1 at t ≥ 1: the bump exp(−1/t) against its mirror. Every derivative is zero at both ends, so a disc's edge has no kink and leaves nothing past itself (the bump is defined as 0 for t ≤ 0; the two tests are its definition, not a clamp).
+#[inline]
+pub fn bump_step(t: f32) -> f32 {
+    if t <= 0.0 {
+        return 0.0;
+    }
+    if t >= 1.0 {
+        return 1.0;
+    }
+    let (a, b) = (libm::expf(-1.0 / t), libm::expf(-1.0 / (1.0 - t)));
+    a / (a + b)
+}
+
+
+include!(concat!(env!("OUT_DIR"), "/logo.rs"));
+
+/// The ferros mark inside the disc of radius `r` (Q8) at (cx, cy), turned by (c, s) Q14 (screen to mark is the inverse turn, as `icon` has it), under what is there: its pieces (`LOGO`, build.rs from logo.vsf) drawn from their geometry at this size, so it is sharp at every zoom, in place of the bundle's raster (owner, 2026-11-07). A piece's coverage at a pixel is the product of its edges' C∞ steps (`bump_step` across two pixels centred on the edge, slope 1 there as area coverage rises): its outer arc, its inner arc if it is a ring, and its two radial sides if it does not go all the way round, each side by the pixel's perpendicular distance to that side's line. Where two pieces meet they share the edge and their steps sum to exactly one, and pieces never overlap, so their coverages add into one layer (premultiplied, its α their sum) and that layer goes under the pixel: no seam, and nothing laid over anything. `lit`: the mark's own colours, else its grey (the map at rest). Returns the rectangle it touched.
+pub fn logo(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, c: i64, s: i64, lit: bool) -> Rect {
+    if r < 256 {
+        return Rect::EMPTY;
+    }
+    let (rf, cxf, cyf) = (r as f32 * (1.0 / 256.0), cx as f32 * (1.0 / 256.0), cy as f32 * (1.0 / 256.0));
+    let (cf, sf) = (c as f32 * (1.0 / 16384.0), s as f32 * (1.0 / 16384.0));
+    let edge = |d: f32| bump_step((d + 1.0) * 0.5);
+    let tau = core::f32::consts::TAU;
+    // WHY the bounds: the disc follows the map's camera and is often partly off the screen (or the clip); its box is cut to them so no index lands outside the canvas.
+    let (bx0, by0, bx1, by1) = bounds(width, height);
+    let (x0, x1) = (((cxf - rf - 2.0) as i64).max(bx0), ((cxf + rf + 2.0) as i64).min(bx1 - 1));
+    let (y0, y1) = (((cyf - rf - 2.0) as i64).max(by0), ((cyf + rf + 2.0) as i64).min(by1 - 1));
+    if x0 > x1 || y0 > y1 {
+        return Rect::EMPTY;
+    }
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let (dx, dy) = (x as f32 + 0.5 - cxf, y as f32 + 0.5 - cyf);
+            // Into the mark's own frame: the inverse turn.
+            let (u, v) = (cf * dx + sf * dy, cf * dy - sf * dx);
+            let rho = libm::sqrtf(u * u + v * v);
+            if rho > rf + 1.0 {
+                continue;
+            }
+            // The pixel's angle in turns from +x toward +y, 0 to 1.
+            let th = libm::atan2f(v, u) * (1.0 / core::f32::consts::TAU);
+            let th = th - libm::floorf(th);
+            let (mut lr, mut lg, mut lb, mut la) = (0f32, 0f32, 0f32, 0f32);
+            for &(inner, outer, start, sweep, colour, grey) in LOGO.iter() {
+                let (rin, rout) = (inner * rf, outer * rf);
+                if rho > rout + 1.0 || rho < rin - 1.0 {
+                    continue;
+                }
+                let mut cov = edge(rout - rho);
+                if inner > 0.0 {
+                    cov *= edge(rho - rin);
+                }
+                if sweep < 1.0 {
+                    // How far into the piece from its start, in turns, 0 to 1; inside while under its sweep. A side's distance is the pixel's perpendicular distance to that side's line (ρ sin of the angle between), positive inside; past a quarter turn the pixel is far from that side, and ρ stands for it.
+                    let a = th - start;
+                    let a = a - libm::floorf(a);
+                    let side = |t: f32| if libm::fabsf(t) < 0.25 { rho * libm::sinf(t * tau) } else if t > 0.0 { rho } else { -rho };
+                    let (d0, d1) = if a <= sweep { (side(a), side(sweep - a)) } else if a - sweep < 1.0 - a { (rho, side(sweep - a)) } else { (side(a - 1.0), rho) };
+                    cov *= edge(d0) * edge(d1);
+                }
+                if cov > 0.0 {
+                    let (cr, cg, cb) = if lit { (colour[0], colour[1], colour[2]) } else { (grey, grey, grey) };
+                    lr += cov * cr as f32;
+                    lg += cov * cg as f32;
+                    lb += cov * cb as f32;
+                    la += cov;
+                }
+            }
+            if la > 0.0 {
+                // The casts saturate (a float to an integer stops at the type's ends): the steps sum to one only to the float's last bit, and α must not carry past its field.
+                let layer = (lr as u16 as u64) | (lg as u16 as u64) << 16 | (lb as u16 as u64) << 32 | ((la * 65535.0) as u16 as u64) << 48;
+                let i = y as usize * width + x as usize;
+                px[i] = under(px[i], layer);
+            }
+        }
+    }
+    Rect { x0: x0 as i32, y0: y0 as i32, x1: x1 as i32 + 1, y1: y1 as i32 + 1 }
+}

@@ -17,3 +17,7 @@ fluor = { path = "../../../fluor", default-features = false, features = ["host-b
 # Text: swash in no_std (its libm feature), native f32 — outlines transformed before rasterising, so text turns at any angle (glyphs.rs). fontdue is gone.
 swash = { version = "0.2.9", default-features = false, features = ["scale", "render", "libm"] }
 libm = "0.2"
+
+[build-dependencies]
+# The ferros mark read from logo.vsf on the host into a table (build.rs, draw::logo).
+vsf = { path = "../../../vsf" }
