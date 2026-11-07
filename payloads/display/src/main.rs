@@ -996,8 +996,6 @@ static mut PASSES: [u64; 3] = [0; 3];
 static mut CUR_OP: u8 = 0xEE;
 static mut FIRST_SHOWS: [(u64, u8); 4] = [(0, 0); 4];
 static mut FIRST_SHOWS_N: usize = 0;
-/// The first chrome draw, µs: [the discs, the whole] (the text is the rest), with op 22's line.
-static mut CHROME_US: [u64; 2] = [0; 2];
 /// The camera op's last phases, microseconds: the scene, the arena reset, the copy to the framebuffer, the present.
 static mut PHASE_US: [u64; 4] = [1; 4];
 /// Inside the scene: icons, discs, labels (µs, the last camera op).
@@ -1514,9 +1512,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
     let (x0, x1) = ((r.x0 as usize) & !15, ((r.x1 as usize + 15) & !15).min(width & !15));
     let mut row = [0u32; 1344];
     let line = hairline();
-    let top = unsafe { CHROME_TOP };
     let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
-    let (bar_w, bar_span) = unsafe { (core::slice::from_raw_parts(BAR_W as *const u64, top * width), core::slice::from_raw_parts(BAR_SPAN as *const (u16, u16), top)) };
     for k in 0..PHASES {
         if mask >> k & 1 == 0 {
             continue;
@@ -1529,7 +1525,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
             let row_px = &plan[g.first as usize..];
             let edge_px = &row_px[row_px.iter().position(|e| e.1 == SHAPE_EDGE).unwrap_or(row_px.len())..];
             let (el, er) = edge_cols(g, edge_px, width);
-            let (cl, cr) = if y < top { (bar_span[y].0 as usize, bar_span[y].1 as usize) } else { (0, 0) };
+            let ((cl, cr), bw) = bar_line(y, width, height);
             let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
             let t_n = now();
             unsafe {
@@ -1541,7 +1537,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                         let mut front = [0u64; 16];
                         for j in 0..16 {
                             let xx = x + j;
-                            let c = if xx >= cl && xx < cr { bar_w[y * width + xx] } else { CLEAR };
+                            let c = if xx >= cl && xx < cr { bw[xx] } else { CLEAR };
                             // The canvas word's fourth lane is its alpha, not flags: off, so its pixels keep their dither.
                             front[j] = glass_front(xx, g, edge_px, line, c, *(src.add(xx) as *const u64) & ((1 << 48) - 1));
                         }
@@ -1728,19 +1724,35 @@ static mut WINS: [Option<Win>; SURFACES] = [None; SURFACES];
 static mut RAISES: u32 = 0;
 /// Bit 63 of a surface pixel: see-through.
 const CLEAR: u64 = 1 << 63;
-/// The corners outside the circle (the system's: the clock now, signal and navigation later): the top `CHROME_TOP` rows then the bottom `CHROME_BOT` rows, 64-bit pixels like a surface. Drawn by `chrome_draw`.
-static mut CHROME: usize = 1;
+/// The rows outside the app's circle at the top and at the bottom (`chrome_rows`): the bars' rows.
 static mut CHROME_TOP: usize = 0;
 static mut CHROME_BOT: usize = 0;
-/// The minute the corners' clock last drew, so it redraws once a minute.
-static mut CHROME_KEY: i64 = -1;
-/// The console (owner, 2026-11-07): the circles at the top of the screen, the radios' switches and the system's indicators. It is the frontmost layer, over the home screen and every app alike, and lives in screen coordinates, so nothing transforms it. Drawn as fluor draws: front to back from empty, into fluor's 16-bit α + darkness (`G2T16`) over the `CHROME_TOP` rows, each circle's text and then its disc under it, by fluor's one `under`. Redrawn only when what it shows changes (`console_draw`).
+/// The bars (owner, 2026-11-07): the console, the circles at the top of the screen (the radios' switches and the system's indicators), over the `CHROME_TOP` rows, then the helm, home and back at the bottom, over the `CHROME_BOT` rows. They are the frontmost layer but the glass's edge, over the home screen and every app alike, in screen coordinates, so nothing transforms them. Drawn as fluor draws: front to back from empty, into fluor's 16-bit α + darkness (`G2T16`), by fluor's one `under`; redrawn only when what they show changes (`console_draw`, `helm_draw`).
 static mut BAR: usize = 1;
-/// The console decoded once a redraw to working values with their transparency (`working`), so a publish folds the scene under it with no table walk; and each row's columns holding any of it, (from, to), so the rest of a row passes untouched.
+/// The bars decoded once a redraw to working values with their transparency (`working`), so a publish folds the scene under them with no table walk; and each row's columns holding any of them, (from, to), so the rest of a row passes untouched.
 static mut BAR_W: usize = 1;
 static mut BAR_SPAN: usize = 1;
 /// What the console last drew (the minute, the radios, their measures, the switches), so it redraws when one changes.
 static mut CONSOLE_KEY: i64 = -1;
+
+/// A screen row's row in the bars (`BAR`): the console's `CHROME_TOP` rows first, then the helm's `CHROME_BOT`; none for the rows between.
+#[inline]
+fn bar_row(y: usize, height: usize) -> Option<usize> {
+    let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
+    if y < top { Some(y) } else if y >= height - bot { Some(top + y - (height - bot)) } else { None }
+}
+
+/// The bars at screen row `y`: the columns holding any of them (from, to) and the row's decoded pixels (`BAR_W`); an empty span and no pixels off their rows.
+#[inline]
+fn bar_line(y: usize, width: usize, height: usize) -> ((usize, usize), &'static [u64]) {
+    match bar_row(y, height) {
+        Some(b) => unsafe {
+            let s = *(BAR_SPAN as *const (u16, u16)).add(b);
+            ((s.0 as usize, s.1 as usize), core::slice::from_raw_parts((BAR_W as *const u64).add(b * width), width))
+        },
+        None => ((0, 0), &[]),
+    }
+}
 
 /// Surface k's pixels.
 fn surface(k: usize, width: usize, height: usize) -> &'static mut [u64] {
@@ -2038,23 +2050,6 @@ fn hairline() -> u64 {
     }
 }
 
-/// Two working pixels mixed on their codes, `wb` (Q16, 65536 whole) of the second: how a hairline's weight is laid, as it was drawn and judged (owner, 2026-11-02). The second's no-dither bit is kept.
-#[inline]
-fn mix_code(a: u64, b: u64, wb: u64) -> u64 {
-    let ch = |sh: u32| (((a >> sh & 0xFFFF) * (65536 - wb) + (b >> sh & 0xFFFF) * wb) >> 16) << sh;
-    (b & 1 << 48) | ch(0) | ch(16) | ch(32)
-}
-
-/// Two working pixels mixed in light, `wb` (Q16) of the second: coverage is an area, so it weighs light, and a working value is a gamma-2 code, so the mix is on the squares and back to a code by the root. The second's no-dither bit is kept.
-#[inline]
-fn mix_light(a: u64, b: u64, wb: u64) -> u64 {
-    let ch = |sh: u32| {
-        let (la, lb) = ((a >> sh & 0xFFFF) * (a >> sh & 0xFFFF), (b >> sh & 0xFFFF) * (b >> sh & 0xFFFF));
-        (libm::sqrt(((la * (65536 - wb) + lb * wb) >> 16) as f64) as u64) << sh
-    };
-    (b & 1 << 48) | ch(0) | ch(16) | ch(32)
-}
-
 /// A plan weight as Q16 with 65536 whole (the plan keeps full as G#FFFF in its u16).
 #[inline]
 fn q16(v: u16) -> u64 {
@@ -2118,10 +2113,7 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
     unsafe {
         PHASE_CLOCK[k] = None;
     }
-    let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
-    let chrome = unsafe { core::slice::from_raw_parts(CHROME as *const u64, (top + bot) * width) };
     let line = hairline();
-    let (bar_w, bar_span) = unsafe { (core::slice::from_raw_parts(BAR_W as *const u64, top * width), core::slice::from_raw_parts(BAR_SPAN as *const (u16, u16), top)) };
     let mut row = [3u32; 1344];
     let mut px = [0u64; 1344];
     let (xa, xb) = (r.x0 as usize, r.x1 as usize);
@@ -2180,19 +2172,17 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                 }
             }
         }
-        // The glass's shape, from the plan (`plan_glass`): the circle's outside copies the chrome row, the edge's outside takes the mask colour (black on release builds; the hairline's orange one stop darker on development builds), and the listed pixels take their hairline at its alpha, then their base by their coverage's complement. The circle's hairline is `line`; the edge's is the orange on development builds and on release builds the mask colour itself, as Photon's release build on Android draws its hairline black so the glass's corner is black to the curve. A chrome row is read only where the plan put chrome; elsewhere it is empty and a wrong plan would say so.
+        // The glass's shape, from the plan (`plan_glass`), front to back: outside the app's circle is black (nothing of the windows shows there); on the circle's listed pixels its hairline is in front, then the windows by the circle's coverage, then that black; then over everything so made the glass's edge, the bars (the console and the helm), and that pixel last (`glass_front`), on the columns either touches. The circle's hairline is `line`.
         {
             let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
             let g = &rows[y];
             let (first, next) = (g.first as usize, rows[y + 1].first as usize);
             let (cl, cr, ml, mr) = (g.chrome_l as usize, g.chrome_r as usize, g.mask_l as usize, g.mask_r as usize);
             if cl > 0 || cr < width || ml > 0 || mr < width || first != next {
-                let crow = if y < top { &chrome[y * width..(y + 1) * width] } else if y >= height - bot { &chrome[(top + y - (height - bot)) * width..(top + y - (height - bot) + 1) * width] } else { &chrome[..0] };
-                px[xa..xb.min(cl)].copy_from_slice(&crow[xa..xb.min(cl)]);
+                px[xa..xb.min(cl)].fill(0);
                 if xa.max(cr) < xb {
-                    px[xa.max(cr)..xb].copy_from_slice(&crow[xa.max(cr)..xb]);
+                    px[xa.max(cr)..xb].fill(0);
                 }
-                // In the order the shapes stack: the circle over the windows and its chrome, the edge over everything. The row's circle pixels come first in the list, so the mask runs go in between.
                 let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), next) };
                 let row_px = &plan[first..next];
                 let split = row_px.iter().position(|e| e.1 == SHAPE_EDGE).unwrap_or(row_px.len());
@@ -2201,17 +2191,15 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                     if x < xa || x >= xb {
                         continue;
                     }
-                    let p = px[x];
-                    // The circle: coverage first (the content over the chrome, in light), the hairline over both sides after (on the codes, as before the plan: a pixel centred on the radius carries the whole line, a straddling pair its profile on each side).
-                    px[x] = mix_code(mix_light(crow[x], p, q16(c)), line, q16(h));
+                    let (acc, t) = under_pm(0, 16384, scale_q16(line, q16(h)), 16384 - (q16(h) >> 2));
+                    px[x] = under_pm(acc, t, scale_q16(px[x] & ((1 << 48) - 1), q16(c)), 0).0;
                 }
-                // Then, front to back over what the windows and the circle made: the glass's edge, the console, and that pixel last (`glass_front`), on the columns either touches.
                 let edge_px = &row_px[split..];
                 let (el, er) = edge_cols(g, edge_px, width);
-                let (bl, br) = if y < top { (bar_span[y].0 as usize, bar_span[y].1 as usize) } else { (0, 0) };
+                let ((bl, br), bw) = bar_line(y, width, height);
                 for x in xa..xb {
                     if x < el || x >= er || (x >= bl && x < br) {
-                        let c = if x >= bl && x < br { bar_w[y * width + x] } else { CLEAR };
+                        let c = if x >= bl && x < br { bw[x] } else { CLEAR };
                         px[x] = glass_front(x, g, edge_px, line, c, px[x]);
                     }
                 }
@@ -2277,6 +2265,7 @@ enum Corner {
     Usb,
     Battery,
     Home,
+    Back,
     Spare,
 }
 
@@ -2331,7 +2320,7 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
     let jobs = [
         (true, true, Corner::Clock, Corner::Battery, Corner::Usb, Some(Corner::Gnss)),
         (false, true, Corner::Cellular, Corner::Wifi, Corner::Nfc, Some(Corner::Bluetooth)),
-        (true, false, Corner::Spare, Corner::Spare, Corner::Spare, None),
+        (true, false, Corner::Back, Corner::Spare, Corner::Spare, None),
         (false, false, Corner::Home, Corner::Spare, Corner::Spare, None),
     ];
     for &(left, top, mid_what, hor_what, ver_what, next_what) in &jobs {
@@ -2548,114 +2537,101 @@ fn measure_text(t: &mut Txt, kind: u16, v: i64) {
     };
 }
 
-/// A disc's coverage at signed distance `d` (pixels inside the edge, negative outside): the algebraic sigmoid x/√(1+x²) over about a pixel, C∞ (no clamp, GUI continuity).
-#[inline]
-fn soft(d: f32) -> f32 {
-    let x = 2.0 * d;
-    0.5 + 0.5 * x / libm::sqrtf(1.0 + x * x)
-}
+/// Whether the helm has been drawn (it shows nothing that changes; drawn once, at the first pass).
+static mut HELM_DRAWN: bool = false;
 
-/// The corners' circles into the chrome when the minute or a radio's state changed (or `force`). Returns whether it drew.
-fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
-    let t_all = now();
-    let mut tb = [0u8; 32];
-    let (_, _, _, key, _) = clock_state(&mut tb);
-    let facts = ferros_sys::facts().0;
-    let radios = facts[32];
-    // The battery's (facts 1-4) and the links' measures (facts 33-80) folded into the key too: the chrome redraws when one changes, at most every two seconds (the drivers' pace).
-    let mut mh = 0u64;
-    for &m in facts[1..5].iter().chain(&facts[33..81]) {
-        mh = (mh.rotate_left(7) ^ m).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-    let k = ((key / 60) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64;
-    if !force && k == unsafe { CHROME_KEY } {
+/// The helm (owner, 2026-11-07): the bottom corners' marks into the bars' bottom rows, front to back from empty in fluor's α + darkness, then decoded. Home, at the bottom right: a 2-pixel stroked circle tangent to the glass's edge and the app's circle (the corner's middle circle, which `corner_layout` solved tangent to both), the stroke inside it. Back, at the bottom left: a left arrow, 2-pixel strokes, on that corner's middle circle. A stroke's coverage is the C∞ step across two pixels on each side (`bump_step`, slope 1 at its edge as area coverage), from the distance to its centre line. Returns whether it drew.
+fn helm_draw(width: usize, height: usize) -> bool {
+    use fluor::pixel::{Blend, BlendMode};
+    if unsafe { HELM_DRAWN } {
         return false;
     }
-    unsafe { CHROME_KEY = k };
-    let (rows, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
-    let chrome = unsafe { core::slice::from_raw_parts_mut(CHROME as *mut u64, (rows + bot) * width) };
-    chrome.fill(0);
-    // A screen pixel's place in the chrome: the top rows, then the bottom rows.
-    let at = |x: i64, y: i64| -> Option<usize> {
-        if x < 0 || x >= width as i64 || y < 0 {
-            return None;
-        }
-        let y = y as usize;
-        if y < rows {
-            Some(y * width + x as usize)
-        } else if y >= height - bot && y < height {
-            Some((rows + y - (height - bot)) * width + x as usize)
-        } else {
-            None
-        }
-    };
-    // Working values (gamma 2, white at Q14): the face, and the ring of a thing that does not run.
-    const FACE: f32 = 1800.0;
-    const RING_OFF: f32 = 3200.0;
+    unsafe { HELM_DRAWN = true };
+    let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
+    let bar = unsafe { core::slice::from_raw_parts_mut((BAR as *mut u64).add(top * width), bot * width) };
+    bar.fill(0);
+    // The strokes' grey: the console's lit grey (working values, white at Q14).
+    let ink = g2t_colour((9000.0, 9000.0, 9000.0));
+    // A stroke 2 pixels wide: covered whole within 1 pixel of its centre line, the step across the 2 pixels beyond.
+    const HALF: f32 = 1.0;
+    let stroke = |d: f32| bump_step((HALF + 1.0 - d) * 0.5);
     let (circles, n) = corner_layout(width, height);
     for &(x, y, r, what) in &circles[..n] {
-        // The top circles are the console's (`console_draw`); the chrome keeps the bottom corners.
         if y < height as f32 * 0.5 {
             continue;
         }
-        let live = match what {
-            Corner::Clock | Corner::Home => true,
-            Corner::Cellular => radios & 1 != 0,
-            Corner::Wifi => radios & 2 != 0,
-            Corner::Bluetooth => radios & 4 != 0,
-            Corner::Nfc => radios & 8 != 0,
-            Corner::Gnss => radios & 16 != 0,
-            // The usb driver's own word (its measure STATE): connected once the host configured it.
-            Corner::Usb => ferros_sys::measure_of(facts[33 + 8 * 5]) == Some((ferros_sys::measure::STATE, 2)),
-            // The gauge answered (facts 1-4, the kernel's two-second poll of the MAX77759 on hsi2c_11).
-            Corner::Battery => facts[1] != u64::MAX,
-            Corner::Spare => false,
+        // Home and back are the bottom corners' middle circles (both solved the same way, tangent to the glass and the app's circle); the corners' other circles show nothing.
+        let back = match what {
+            Corner::Home => false,
+            Corner::Back => true,
+            _ => continue,
         };
-        let ring_w = r / 16.0;
-        // The radio's state as its driver says it (measure STATE): connected the flavour's full ring, up and searching one stop darker; a driver that says nothing, its ring by whether it runs.
-        let state = match what {
-            Corner::Cellular => Some(0),
-            Corner::Wifi => Some(1),
-            Corner::Bluetooth => Some(2),
-            Corner::Nfc => Some(3),
-            Corner::Gnss => Some(4),
-            Corner::Usb => Some(5),
-            _ => None,
-        }
-        .and_then(|ri: usize| facts[33 + 8 * ri..41 + 8 * ri].iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::STATE).map(|m| m.1));
-        let (ring_c, _) = flavour(what);
-        let ring = if !live {
-            (RING_OFF, RING_OFF, RING_OFF)
-        } else if state == Some(1) {
-            (ring_c.0 * core::f32::consts::FRAC_1_SQRT_2, ring_c.1 * core::f32::consts::FRAC_1_SQRT_2, ring_c.2 * core::f32::consts::FRAC_1_SQRT_2)
-        } else {
-            ring_c
+        // The distance from a point to the mark's centre line.
+        let dist = |px: f32, py: f32| -> f32 {
+            if !back {
+                // The ring's centre line one half-stroke inside the radius, so its outer edge is the tangent circle.
+                return libm::fabsf(libm::sqrtf((px - x) * (px - x) + (py - y) * (py - y)) - (r - HALF));
+            }
+            // The arrow: a shaft across 1.2 r, its tip on the left, and two heads 0.5 r long at 45° back from the tip.
+            let seg = |ax: f32, ay: f32, bx: f32, by: f32| {
+                let (vx, vy, wx, wy) = (bx - ax, by - ay, px - ax, py - ay);
+                let t = (vx * wx + vy * wy) / (vx * vx + vy * vy);
+                // The nearest point of the segment: the projection's parameter held to the segment's own ends (the segment's definition).
+                let t = if t < 0.0 { 0.0 } else if t > 1.0 { 1.0 } else { t };
+                let (dx, dy) = (wx - vx * t, wy - vy * t);
+                libm::sqrtf(dx * dx + dy * dy)
+            };
+            let (tip, tail, head) = (x - 0.6 * r, x + 0.6 * r, 0.5 * r * core::f32::consts::FRAC_1_SQRT_2);
+            seg(tip, y, tail, y).min(seg(tip, y, tip + head, y - head)).min(seg(tip, y, tip + head, y + head))
         };
-        let t_disc = now();
         let (x0, x1, y0, y1) = ((x - r - 2.0) as i64, (x + r + 2.0) as i64, (y - r - 2.0) as i64, (y + r + 2.0) as i64);
         for py in y0..=y1 {
+            // WHY the test: the mark's box comes from the layout's float geometry and can reach past the screen's sides or bottom; an index from there would land in another row or past the buffer.
+            if px_out(py, height) {
+                continue;
+            }
+            let row = py as usize - (height - bot);
             for px in x0..=x1 {
-                let Some(i) = at(px, py) else { continue };
-                let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
-                let d = r - libm::sqrtf(dx * dx + dy * dy);
-                // The disc, then the ring over it: the ring is the band within ring_w of the edge.
-                let disc = soft(d);
-                let band = disc - soft(d - ring_w);
-                // Over what is there already, by the disc's own coverage: a neighbour's pixels outside this disc stay as they were.
-                let ch = |sh: u32, ring: f32| ((((chrome[i] >> sh) & 0xFFFF) as f32 * (1.0 - disc) + FACE * (disc - band) + ring * band) as u64) << sh;
-                chrome[i] = ch(0, ring.0) | ch(16, ring.1) | ch(32, ring.2);
+                if px < 0 || px >= width as i64 {
+                    continue;
+                }
+                let cov = stroke(dist(px as f32 + 0.5, py as f32 + 0.5));
+                if cov > 0.0 {
+                    let i = row * width + px as usize;
+                    bar[i] = bar[i].under(ink | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
+                }
             }
         }
-        unsafe { CHROME_US[0] += ferros_sys::us_since(t_disc) };
     }
-    ALLOC.reset();
-    unsafe {
-        if CHROME_US[1] == 0 {
-            CHROME_US[1] = ferros_sys::us_since(t_all);
-        }
-    }
+    bar_decode(top, bot, width);
     true
 }
+
+/// Whether screen row `y` is off the helm's rows (above them or past the screen's bottom).
+#[inline]
+fn px_out(y: i64, height: usize) -> bool {
+    y < (height - unsafe { CHROME_BOT }) as i64 || y >= height as i64
+}
+
+/// The bars' rows `b0..b0 + rows` decoded for publishing (`BAR_W`, by `working`), and each row's columns holding any of them (`BAR_SPAN`).
+fn bar_decode(b0: usize, rows: usize, width: usize) {
+    let (bar, cw, span) = unsafe { (core::slice::from_raw_parts((BAR as *const u64).add(b0 * width), rows * width), core::slice::from_raw_parts_mut((BAR_W as *mut u64).add(b0 * width), rows * width), core::slice::from_raw_parts_mut((BAR_SPAN as *mut (u16, u16)).add(b0), rows)) };
+    for yy in 0..rows {
+        let (mut l, mut rr) = (width, 0);
+        for xx in 0..width {
+            let i = yy * width + xx;
+            cw[i] = working(bar[i], G2T16);
+            if bar[i] >> 48 != 0 {
+                if l == width {
+                    l = xx;
+                }
+                rr = xx + 1;
+            }
+        }
+        span[yy] = if l < rr { (l as u16, rr as u16) } else { (0, 0) };
+    }
+}
+
 /// A C∞ step from 0 at t ≤ 0 to 1 at t ≥ 1: the bump exp(−1/t) against its mirror. Every derivative is zero at both ends, so a disc's edge has no kink and leaves nothing past itself (the bump is defined as 0 for t ≤ 0; the two tests are its definition, not a clamp).
 #[inline]
 fn bump_step(t: f32) -> f32 {
@@ -2728,7 +2704,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             Corner::Usb => ferros_sys::measure_of(facts[33 + 8 * 5]) == Some((ferros_sys::measure::STATE, 2)),
             // The gauge answered (facts 1-4, the kernel's two-second poll of the MAX77759 on hsi2c_11).
             Corner::Battery => facts[1] != u64::MAX,
-            Corner::Home | Corner::Spare => false,
+            Corner::Home | Corner::Back | Corner::Spare => false,
         };
         // The radio's measures, as its driver published them (facts 33 + 8 · radio): every one shown as itself, in its unit, a line each; none folded into a level, no bars (owner, 2026-11-03).
         let radio = match what {
@@ -2810,7 +2786,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 Corner::Usb => "usb",
                 Corner::Battery if charge.n > 0 => charge.str(),
                 Corner::Battery => "batt",
-                Corner::Home | Corner::Spare => "",
+                Corner::Home | Corner::Back | Corner::Spare => "",
             };
             if !name.is_empty() {
                 lines[0].s(name);
@@ -2857,21 +2833,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
     }
     ALLOC.reset();
     // Decoded once for every publish, and each row's columns that hold any of it.
-    let (cw, span) = unsafe { (core::slice::from_raw_parts_mut(BAR_W as *mut u64, rows * width), core::slice::from_raw_parts_mut(BAR_SPAN as *mut (u16, u16), rows)) };
-    for yy in 0..rows {
-        let (mut l, mut rr) = (width, 0);
-        for xx in 0..width {
-            let i = yy * width + xx;
-            cw[i] = working(console[i], G2T16);
-            if console[i] >> 48 != 0 {
-                if l == width {
-                    l = xx;
-                }
-                rr = xx + 1;
-            }
-        }
-        span[yy] = if l < rr { (l as u16, rr as u16) } else { (0, 0) };
-    }
+    bar_decode(0, rows, width);
     true
 }
 
@@ -3287,15 +3249,14 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             ARENA = alloc::vec![0u64; ARENA_WORDS].leak().as_mut_ptr() as usize;
         }
         ARENA_NEXT = 0;
-        // The corners' chrome, kept across calls (before the mark).
+        // The bars' rows and buffers, kept across calls (before the mark).
         let (top, bot) = chrome_rows(width, height);
         CHROME_TOP = top;
         CHROME_BOT = bot;
         plan_glass(width, height);
-        CHROME = alloc::vec![0u64; (top + bot) * width].leak().as_mut_ptr() as usize;
-        BAR = alloc::vec![0u64; top * width].leak().as_mut_ptr() as usize;
-        BAR_W = alloc::vec![CLEAR; top * width].leak().as_mut_ptr() as usize;
-        BAR_SPAN = alloc::vec![(0u16, 0u16); top].leak().as_mut_ptr() as usize;
+        BAR = alloc::vec![0u64; (top + bot) * width].leak().as_mut_ptr() as usize;
+        BAR_W = alloc::vec![CLEAR; (top + bot) * width].leak().as_mut_ptr() as usize;
+        BAR_SPAN = alloc::vec![(0u16, 0u16); top + bot].leak().as_mut_ptr() as usize;
     }
     ALLOC.mark();
     log.s(b"display: present table (E peak ");
@@ -3829,12 +3790,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             let same = unsafe { WINS[sk] }.is_some_and(|w| w.generation == generation && w.rect == rect && w.level == m[17] && w.mode == mode) && unsafe { APP }.is_some();
                             let changed = if m.len() >= 27 && same { draw::Rect { x0: v(19), y0: v(21), x1: v(19) + v(23), y1: v(21) + v(25) }.intersect(rect) } else { full };
                             let t22 = now();
-                            let mut t_chrome = t22;
+                            let t_chrome = now();
                             unsafe {
-                                if { APP }.is_none() {
-                                    chrome_draw(width, height, true);
-                                }
-                                t_chrome = now();
                                 if !same || m.len() < 27 {
                                     RAISES += 1;
                                     WINS[sk] = Some(Win { generation, level: m[17], order: RAISES, rect, format: if m.len() > 18 { m[18] } else { 0 }, mode });
@@ -3977,17 +3934,16 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         // The home screen: each row as `publish_band` composes it for the glass (the edge, then the console, then the canvas), in working values, into the free surface.
                         (false, Some(k)) => {
                             let s = surface(k, width, height);
-                            let (top, line) = (unsafe { CHROME_TOP }, hairline());
+                            let line = hairline();
                             let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
-                            let (bar_w, bar_span) = unsafe { (core::slice::from_raw_parts(BAR_W as *const u64, top * width), core::slice::from_raw_parts(BAR_SPAN as *const (u16, u16), top)) };
                             for y in 0..height {
                                 let g = &rows[y];
                                 let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), rows[y + 1].first as usize) };
                                 let row_px = &plan[g.first as usize..];
                                 let edge_px = &row_px[row_px.iter().position(|e| e.1 == SHAPE_EDGE).unwrap_or(row_px.len())..];
-                                let (cl, cr) = if y < top { (bar_span[y].0 as usize, bar_span[y].1 as usize) } else { (0, 0) };
+                                let ((cl, cr), bw) = bar_line(y, width, height);
                                 for x in 0..width {
-                                    let c = if x >= cl && x < cr { bar_w[y * width + x] } else { CLEAR };
+                                    let c = if x >= cl && x < cr { bw[x] } else { CLEAR };
                                     s[y * width + x] = glass_front(x, g, edge_px, line, c, pixels[y * width + x] & ((1 << 48) - 1));
                                 }
                             }
@@ -4273,20 +4229,24 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 // The idle fill republishes every phase within an eighth of a second of the last window op.
                 windows_changed(width, height);
             }
-            // The console on every screen (it is in front of the home screen and of every app), the chrome's bottom corners while an app is up.
-            let chrome_new = { APP }.is_some() && chrome_draw(width, height, false);
+            // The bars on every screen (in front of the home screen and of every app): each redrawn when what it shows changed, and its rows into every phase.
             let console_new = console_draw(width, height, false);
+            let helm_new = helm_draw(width, height);
             let top = draw::Rect { x0: 0, y0: 0, x1: width as i32, y1: CHROME_TOP as i32 };
-            if { APP }.is_some() && (chrome_new || console_new) {
-                let bottom = draw::Rect { x0: 0, y0: (height - CHROME_BOT) as i32, x1: width as i32, y1: height as i32 };
-                for k in 0..PHASES {
-                    publish_app(top, &tabs, k, width, height);
-                    publish_app(bottom, &tabs, k, width, height);
+            let bottom = draw::Rect { x0: 0, y0: (height - CHROME_BOT) as i32, x1: width as i32, y1: height as i32 };
+            for (new, r) in [(console_new, top), (helm_new, bottom)] {
+                if !new {
+                    continue;
                 }
-            } else if console_new {
-                // The home screen: the canvas by its address (`pixels` is held by the request handler's closure here), its top rows into every phase with the console in front.
-                let canvas = core::slice::from_raw_parts(back as *const Px, width * height);
-                publish10x4(canvas, width, height, &tabs, (1 << PHASES) - 1, top);
+                if { APP }.is_some() {
+                    for k in 0..PHASES {
+                        publish_app(r, &tabs, k, width, height);
+                    }
+                } else {
+                    // The home screen: the canvas by its address (`pixels` is held by the request handler's closure here).
+                    let canvas = core::slice::from_raw_parts(back as *const Px, width * height);
+                    publish10x4(canvas, width, height, &tabs, (1 << PHASES) - 1, r);
+                }
             }
         }
         // Clients first: every request the receive thread has queued, oldest first. The slot is copied out and released before it is run, so the receive thread can refill it meanwhile.
@@ -4384,11 +4344,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         tlog.s(name);
                         tlog.dec(us / 1000);
                     }
-                    tlog.s(b" ms (chrome discs ");
-                    tlog.dec(unsafe { CHROME_US[0] } / 1000);
-                    tlog.s(b" ms of ");
-                    tlog.dec(unsafe { CHROME_US[1] } / 1000);
-                    tlog.s(b" ms, the rest text");
+                    tlog.s(b" ms");
                     tlog.s(b", armed at counter ");
                     tlog.hex(unsafe { OP22_AT });
                     for k in 0..unsafe { FIRST_SHOWS_N } {
