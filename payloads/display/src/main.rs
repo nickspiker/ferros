@@ -1506,7 +1506,7 @@ fn publish10x4(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask:
     fps_dot(mask, width, height);
 }
 
-/// The home screen's rows into the phases `mask` names: each row front to back, the glass's edge, then the console (its rows only), then the canvas. A 16-pixel step that neither touches is the canvas straight through the NEON present; one that does is composed first (`edge_over`, `console_over`) and goes through the app's present, which leaves the mask's pixels undithered.
+/// The home screen's rows into the phases `mask` names: each row front to back, the glass's edge, then the console (its rows only), then the canvas. A 16-pixel step that neither touches is the canvas straight through the NEON present; one that does is composed first (`edge_over`, `under_bar`) and goes through the app's present, which leaves the mask's pixels undithered.
 fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask: u32, r: draw::Rect) {
     if r.is_empty() {
         return;
@@ -1516,7 +1516,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
     let line = hairline();
     let top = unsafe { CHROME_TOP };
     let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
-    let (console_w, console_span) = unsafe { (core::slice::from_raw_parts(CONSOLE_W as *const u64, top * width), core::slice::from_raw_parts(CONSOLE_SPAN as *const (u16, u16), top)) };
+    let (bar_w, bar_span) = unsafe { (core::slice::from_raw_parts(BAR_W as *const u64, top * width), core::slice::from_raw_parts(BAR_SPAN as *const (u16, u16), top)) };
     for k in 0..PHASES {
         if mask >> k & 1 == 0 {
             continue;
@@ -1533,7 +1533,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                 let x = e.0 as usize;
                 if x < width / 2 { el = el.max(x + 1) } else { er = er.min(x) }
             }
-            let (cl, cr) = if y < top { (console_span[y].0 as usize, console_span[y].1 as usize) } else { (0, 0) };
+            let (cl, cr) = if y < top { (bar_span[y].0 as usize, bar_span[y].1 as usize) } else { (0, 0) };
             let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
             let t_n = now();
             unsafe {
@@ -1547,7 +1547,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                             let xx = x + j;
                             let mut p = *(src.add(xx) as *const u64) & ((1 << 48) - 1);
                             if xx >= cl && xx < cr {
-                                p = console_over(console_w[y * width + xx], p);
+                                p = under_bar(bar_w[y * width + xx], p);
                             }
                             over[j] = edge_over(p, xx, g, edge_px, line);
                         }
@@ -1713,7 +1713,7 @@ const G2T16: u8 = 1;
 /// A 16-bit `g2t` code's working value, `16384 × atanh(code / 2¹⁶)` (VSF: light = atanh(code / 2ⁿ)², and gamma 2 is its root), every code, built once at start; the top 79 codes decode past the working value's 4.0 and stop there. Fluor's own present for the display (fluor host/panel.rs `q14_from_g2t16`) is this table.
 static mut G2T16_Q14: *const u16 = core::ptr::null();
 
-/// A surface pixel as the display's working value, by its window's format: its own unchanged; a G2T16 one composited over black as fluor's present does (each channel's visible code, the top code less its darkness, scaled by α), thru `G2T16_Q14`, and α 0 see-through.
+/// A surface pixel as the display's working value, by its window's format: its own unchanged; a G2T16 one composited over black, thru `G2T16_Q14`, and α 0 see-through. fluor's pixels hold premultiplied darkness (`under` deposits darkness × α, so darkness ≤ α): what is still transparent is white in darkness space until something is put under it, and black under it adds darkness 1 − α, so the light over black is α − darkness, channel by channel. (Until 2026-11-07 this took the darkness as straight, (1 − darkness) × α: right only where α is whole, and every partly covered pixel came out too bright, a bright fringe on every translucent edge.)
 #[inline]
 fn working(p: u64, format: u8) -> u64 {
     if format != G2T16 {
@@ -1725,8 +1725,8 @@ fn working(p: u64, format: u8) -> u64 {
         return CLEAR;
     }
     let t = unsafe { core::slice::from_raw_parts(G2T16_Q14, 1 << 16) };
-    // (65535 − d) × α + 32767 stays under 2³², as fluor's present computes it.
-    let ch = |sh: u32| t[(((0xFFFF - (p >> sh & 0xFFFF)) * a + 0x7FFF) / 0xFFFF) as usize] as u64;
+    // WHY the saturating subtract: a G2T16 window is another process's memory, and darkness ≤ α is the invariant fluor's `under` keeps for it, not one the display can prove; a pixel breaking it would underflow into an index past the table and take the display server down for every app. Kept pixels decode exactly.
+    let ch = |sh: u32| t[a.saturating_sub(p >> sh & 0xFFFF) as usize] as u64;
     // Its transparency, Q14 in bits 49-62 (`trans`), so a chain can fold what is behind it by what its alpha left; a working surface's own pixels carry only the bit.
     ch(32) | ch(16) << 16 | ch(0) << 32 | (16384 - (a >> 2)) << 49
 }
@@ -1741,10 +1741,10 @@ static mut CHROME_BOT: usize = 0;
 /// The minute the corners' clock last drew, so it redraws once a minute.
 static mut CHROME_KEY: i64 = -1;
 /// The console (owner, 2026-11-07): the circles at the top of the screen, the radios' switches and the system's indicators. It is the frontmost layer, over the home screen and every app alike, and lives in screen coordinates, so nothing transforms it. Drawn as fluor draws: front to back from empty, into fluor's 16-bit α + darkness (`G2T16`) over the `CHROME_TOP` rows, each circle's text and then its disc under it, by fluor's one `under`. Redrawn only when what it shows changes (`console_draw`).
-static mut CONSOLE: usize = 1;
+static mut BAR: usize = 1;
 /// The console decoded once a redraw to working values with their transparency (`working`), so a publish folds the scene under it with no table walk; and each row's columns holding any of it, (from, to), so the rest of a row passes untouched.
-static mut CONSOLE_W: usize = 1;
-static mut CONSOLE_SPAN: usize = 1;
+static mut BAR_W: usize = 1;
+static mut BAR_SPAN: usize = 1;
 /// What the console last drew (the minute, the radios, their measures, the switches), so it redraws when one changes.
 static mut CONSOLE_KEY: i64 = -1;
 
@@ -2082,7 +2082,7 @@ fn edge_over(p: u64, x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], l
 
 /// The console over a scene pixel `p` (a working value taken as opaque; its flag bits above 48 are not light): the console's decoded pixel `c` in front, the scene folded under it by fluor's under on working values (`fold`). Where the console is clear, the scene as it was.
 #[inline]
-fn console_over(c: u64, p: u64) -> u64 {
+fn under_bar(c: u64, p: u64) -> u64 {
     if c >> 63 != 0 {
         return p;
     }
@@ -2103,7 +2103,7 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
     let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
     let chrome = unsafe { core::slice::from_raw_parts(CHROME as *const u64, (top + bot) * width) };
     let line = hairline();
-    let (console_w, console_span) = unsafe { (core::slice::from_raw_parts(CONSOLE_W as *const u64, top * width), core::slice::from_raw_parts(CONSOLE_SPAN as *const (u16, u16), top)) };
+    let (bar_w, bar_span) = unsafe { (core::slice::from_raw_parts(BAR_W as *const u64, top * width), core::slice::from_raw_parts(BAR_SPAN as *const (u16, u16), top)) };
     let mut row = [3u32; 1344];
     let mut px = [0u64; 1344];
     let (xa, xb) = (r.x0 as usize, r.x1 as usize);
@@ -2189,9 +2189,9 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                 }
                 // The console in front of the windows, the circle and its hairline; only the glass's edge is in front of it.
                 if y < top {
-                    let (l, rr) = console_span[y];
+                    let (l, rr) = bar_span[y];
                     for x in (l as usize).max(xa)..(rr as usize).min(xb) {
-                        px[x] = console_over(console_w[y * width + x], px[x]);
+                        px[x] = under_bar(bar_w[y * width + x], px[x]);
                     }
                 }
                 for x in xa..xb.min(ml) {
@@ -2669,7 +2669,7 @@ fn g2t_colour(c: (f32, f32, f32)) -> u64 {
     dark(c.0) << 32 | dark(c.1) << 16 | dark(c.2)
 }
 
-/// The console (`CONSOLE`): when the minute, a radio's state, a measure or a switch changed (or `force`), every top circle drawn again, front to back from empty in fluor's α + darkness, each by fluor's `under` and nothing else: its text first, in front, then its disc under the text. A disc is solid, no stroke, no glow (owner, 2026-11-07): the radio's flavour while it is on and linked, one stop darker while up and searching, grey when it does not run, and grey and darker with no text once switched off by a tap (preference 15). The text is dark on a lit disc, light on a grey one. Then the layer is decoded once into `CONSOLE_W` and each row's columns into `CONSOLE_SPAN`. Returns whether it drew.
+/// The console (`BAR`): when the minute, a radio's state, a measure or a switch changed (or `force`), every top circle drawn again, front to back from empty in fluor's α + darkness, each by fluor's `under` and nothing else: its text first, in front, then its disc under the text. A disc is solid, no stroke, no glow (owner, 2026-11-07): the radio's flavour while it is on and linked, one stop darker while up and searching, grey when it does not run, and grey and darker with no text once switched off by a tap (preference 15). The text is dark on a lit disc, light on a grey one. Then the layer is decoded once into `BAR_W` and each row's columns into `BAR_SPAN`. Returns whether it drew.
 fn console_draw(width: usize, height: usize, force: bool) -> bool {
     use fluor::pixel::{Blend, BlendMode};
     let mut tb = [0u8; 32];
@@ -2688,7 +2688,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
     }
     unsafe { CONSOLE_KEY = k };
     let rows = unsafe { CHROME_TOP };
-    let console = unsafe { core::slice::from_raw_parts_mut(CONSOLE as *mut u64, rows * width) };
+    let console = unsafe { core::slice::from_raw_parts_mut(BAR as *mut u64, rows * width) };
     console.fill(0);
     // A screen pixel's place in the console. WHY the test: glyph and disc positions come from the layout's float geometry, and a disc's box or a glyph's edge can reach past the screen's sides or below the console's rows; an index from there would land in another row or past the buffer.
     let at = |x: i64, y: i64| -> Option<usize> {
@@ -2837,21 +2837,21 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 }
             }
         }
-        // Then the disc, under its text: solid, its edge a C∞ step across one pixel centred on the radius.
+        // Then the disc, under its text: solid, its edge the C∞ step across two pixels centred on the radius, where its slope is 1, as a pixel's area coverage rises across an edge (over one pixel its slope there was 2, half a pixel of edge, and the circles stair-stepped).
         let fill = g2t_colour(fill);
         let (x0, x1, y0, y1) = ((x - r - 1.0) as i64, (x + r + 1.0) as i64, (y - r - 1.0) as i64, (y + r + 1.0) as i64);
         for py in y0..=y1 {
             for px in x0..=x1 {
                 let Some(i) = at(px, py) else { continue };
                 let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
-                let cov = bump_step(r + 0.5 - libm::sqrtf(dx * dx + dy * dy));
+                let cov = bump_step((r + 1.0 - libm::sqrtf(dx * dx + dy * dy)) * 0.5);
                 console[i] = console[i].under(fill | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
             }
         }
     }
     ALLOC.reset();
     // Decoded once for every publish, and each row's columns that hold any of it.
-    let (cw, span) = unsafe { (core::slice::from_raw_parts_mut(CONSOLE_W as *mut u64, rows * width), core::slice::from_raw_parts_mut(CONSOLE_SPAN as *mut (u16, u16), rows)) };
+    let (cw, span) = unsafe { (core::slice::from_raw_parts_mut(BAR_W as *mut u64, rows * width), core::slice::from_raw_parts_mut(BAR_SPAN as *mut (u16, u16), rows)) };
     for yy in 0..rows {
         let (mut l, mut rr) = (width, 0);
         for xx in 0..width {
@@ -3287,9 +3287,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         CHROME_BOT = bot;
         plan_glass(width, height);
         CHROME = alloc::vec![0u64; (top + bot) * width].leak().as_mut_ptr() as usize;
-        CONSOLE = alloc::vec![0u64; top * width].leak().as_mut_ptr() as usize;
-        CONSOLE_W = alloc::vec![CLEAR; top * width].leak().as_mut_ptr() as usize;
-        CONSOLE_SPAN = alloc::vec![(0u16, 0u16); top].leak().as_mut_ptr() as usize;
+        BAR = alloc::vec![0u64; top * width].leak().as_mut_ptr() as usize;
+        BAR_W = alloc::vec![CLEAR; top * width].leak().as_mut_ptr() as usize;
+        BAR_SPAN = alloc::vec![(0u16, 0u16); top].leak().as_mut_ptr() as usize;
     }
     ALLOC.mark();
     log.s(b"display: present table (E peak ");
@@ -3973,17 +3973,17 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             let s = surface(k, width, height);
                             let (top, line) = (unsafe { CHROME_TOP }, hairline());
                             let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
-                            let (console_w, console_span) = unsafe { (core::slice::from_raw_parts(CONSOLE_W as *const u64, top * width), core::slice::from_raw_parts(CONSOLE_SPAN as *const (u16, u16), top)) };
+                            let (bar_w, bar_span) = unsafe { (core::slice::from_raw_parts(BAR_W as *const u64, top * width), core::slice::from_raw_parts(BAR_SPAN as *const (u16, u16), top)) };
                             for y in 0..height {
                                 let g = &rows[y];
                                 let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), rows[y + 1].first as usize) };
                                 let row_px = &plan[g.first as usize..];
                                 let edge_px = &row_px[row_px.iter().position(|e| e.1 == SHAPE_EDGE).unwrap_or(row_px.len())..];
-                                let (cl, cr) = if y < top { (console_span[y].0 as usize, console_span[y].1 as usize) } else { (0, 0) };
+                                let (cl, cr) = if y < top { (bar_span[y].0 as usize, bar_span[y].1 as usize) } else { (0, 0) };
                                 for x in 0..width {
                                     let mut p = pixels[y * width + x] & ((1 << 48) - 1);
                                     if x >= cl && x < cr {
-                                        p = console_over(console_w[y * width + x], p);
+                                        p = under_bar(bar_w[y * width + x], p);
                                     }
                                     s[y * width + x] = edge_over(p, x, g, edge_px, line);
                                 }
