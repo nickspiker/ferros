@@ -65,7 +65,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: reservation proof is memblock](feedback_reservation_proof_is_memblock.md) — a DT reserved-memory node proves nothing; check memblock (hv 64 MiB sat in the page allocator 2026-10-17→19)
 - [TTL 63 everywhere](cellular_ttl_63.md) — TTL/hop limit 63 for all ferros traffic, both families, both links (`HOP` in payloads/ip); Android kernel built the same
 - [husky factory partitions backup](husky_factory_partitions_backup.md) — persist + efs/efs_backup imaged and hash-verified 2026-10-19 to /mnt/Harbor/tmp; local only
-- [husky camera bring-up](husky_camera_bringup.md) — ferros powers the main camera cold, sensor answers G#08EF (2026-10-19); traps: ACPM, HS-I2C timeout/error IRQs, camera-PMIC chip select high, program voltages before enables
+- [husky camera bring-up](husky_camera_bringup.md) — ferros powers the main camera cold, sensor answers G#08EF (2026-10-19); traps: ACPM, HS-I2C timeout/error IRQs, camera-PMIC chip select high, program voltages before enables; front wired + captured 2026-11-06, still NACKs (sub-PMIC suspect)
 - [Feedback: oracle capture integrity](feedback_oracle_capture_integrity.md) — pstore captures lose lines (hv + kernel race the ring); quiet console to level 4, stats off, decoder checks each transfer vs AUTO_CONF length before any replay
 - [husky touch bring-up](husky_touch_bringup.md) — FTM5 touch up from cold (2026-10-19): diag touch up/watch/paint; capture = boot probe at loglevel=4, never fts unbind (panics); axes finger test pending
 - [Feedback: vsf concurrent edits](feedback_vsf_concurrent_edits.md) — vsf is edited live: a build break inside vsf = wait or message that session, never touch it, never pin
@@ -131,3 +131,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [FGTW is a DUNA; buyers are the rūnanga](fgtw_duna_runanga.md) — Wyoming DUNA, nobody owns it; service buyers = assembly members; member unit open (2026-11-05)
 - [Feedback: Photon is the full app](feedback_photon_is_the_full_app.md) — one Photon on every platform (std/photon); no photon_core/stripped copy; FGTW = attest, identity, OS sync (2026-11-05)
 - [Pixel 8a (akita)](akita_pixel8a.md) — second ferros device (unlocked, pKVM off, "could be anyone's"); per-unit partitions backed up 2026-11-06; Magisk root on slot b; board split + probes in docs/BOARDS.md; hv runs on slot b (flash with an AVB footer: ferros-mkimg avb-footer)
+- [Pro flash paths](husky_flash_paths.md) — fastboot 64 MiB send fails on the Pro (2026-11-06); prefix flash with unchanged footer, or Android dd when the hv has no UFS firewall

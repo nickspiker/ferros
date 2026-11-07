@@ -66,3 +66,7 @@ Full detail: ferros/docs/oracle/CAMERA.md.
 **Tools:** `tools/camera-pull.sh`, `tools/camera-raw10.py`, `tools/camera-raw2vsf`; `cam pdma af= exp= gain= sweep=<a>:<step> view=<s> snap fast`.
 
 **Next:** the other three cameras; a re-runnable capture without a cold boot; the exact exposure time (pixel clock) for absolute-IDT comparison with the Android captures; screen calibration with the owner.
+
+## 2026-11-06 night: front captured and wired, front + tele still silent from ferros
+
+Front (dokkaebi, hsi2c_2 G#10, ID G#30A1) fully captured hands-free (I2C init, ISP front end, PDMA list 3) and wired as `diag cam front up` / `cam pdma front` (FERROS_CAM_FRONT=target/cam/front; CSI link 0, csis0 lanes, SYSREG 500 = 1). It NACKs from ferros; camera-PMIC writes, voltages, pins and USI clocks all measured equal to Android's, so the sub-PMIC (ACPM) side is the suspect. Tele's init captured; it needs a bright scene to stream (5x is a main-sensor crop in dim light). Capture traps: ARM_AFTER_MS counts from the last reset; a clean reboot wipes the console zone (crash reset keeps it); read the zone from ferros (`bridge read FD3FF000 200000`, order from the write pointer at +4); the app always reopens the rear camera. Detail in docs/oracle/CAMERA.md. Flashing that night: [[husky-flash-paths]].
