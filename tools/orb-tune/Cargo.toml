@@ -1,0 +1,27 @@
+[package]
+name = "ferros-orb-tune"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "The console's radio circles on the desktop: the vessel (Lumis's camera-button profile, made radial) and the orb inside it, every dimension a slider, judged large and at the panel's true size."
+
+# Standalone: fluor's host build (winit, cosmic-text, rayon) stays out of the ferros workspace lock.
+[workspace]
+
+[dependencies]
+fluor = { path = "../../../fluor", features = ["host-winit"] }
+# The g2t encoder (tanh √L) for every layer's colour, and the VSF visual that --dump writes.
+vsf = { path = "../../../vsf" }
+rayon = "1"
+
+# fluor's own development profile, mirrored: profiles come from the binary's crate, not the dependency's, and fluor's paint code relies on wrapping arithmetic (its dev and release profiles both build with overflow checks off). The orb is per-pixel iteration, so the optimisation level matters too.
+[profile.dev]
+opt-level = 2
+overflow-checks = false
+debug = false
+debug-assertions = false
+incremental = true
+
+# The same for release builds (the tool's usual build): no overflow checks under fluor's paint code.
+[profile.release]
+overflow-checks = false
