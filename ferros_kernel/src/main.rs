@@ -1848,7 +1848,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     checklist::PRESS.store(pressed_at, core::sync::atomic::Ordering::Relaxed);
 
     // eUSB2 repeater: snapshot what ABL left, then apply Google's calibrated tune (ABL never does; only the Android driver does).
-    let rep_snap: [u32; 9] = {
+    // Not after the jump: Android's driver has tuned the repeater already, and its bus (hsi2c_11, shared with the TCPC and the PMIC chain) is still in Android's state. The jump of 2026-11-07 morning died right here (crumbs: C0 set, C1 never; the cluster watchdog reset it), before any of the boot's I2C (feedback: the jump is a killswitch, never adopt what Android started). G#FFFF_FFFF marks the snapshot as not taken, and rep_tuned G#FE as skipped for the jump.
+    let rep_snap: [u32; 9] = if platform::jumped() { [0xFFFF_FFFF; 9] } else {
         let i2c = ferros_hal::hsi2c::Hsi2c::new(ferros_hal::hsi2c::PIXEL8_HSI2C11_BASE);
         i2c.init();
         let rep = |reg: u8| match i2c.read_reg(ferros_hal::hsi2c::PIXEL8_EUSB_REPEATER_ADDR, reg) {
@@ -1873,6 +1874,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             }
         }
         ok
+    } else if platform::jumped() {
+        0xFE
     } else {
         0xFF
     };
