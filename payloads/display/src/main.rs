@@ -2470,16 +2470,17 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
     (out, n)
 }
 
-/// Each radio's flavour (owner, 2026-11-03: "throw some of that in the design"), picked in VSF RGB and scaled to the light of the grey they replace by VSF's photopic weights (R 0.2584, G 0.6346, B 0.1070, vsf_rgb_to_photopic_f32): the ring at RING_ON's light (0.3017 linear), the name at INK's (0.4507; periwinkle tops out at 0.388, its blue full). As working values, gamma 2 white at Q14. Cellular amber, a warm thing that carries far; WiFi sea teal, the near water; Bluetooth periwinkle; NFC lime, a touch; GPS dusk magenta, the sky it listens to. The rest grey, equal codes (illuminant E).
+/// Each radio's flavour (owner, 2026-11-07): WiFi 497 nm, cellular 598 nm, Bluetooth VSF blue, NFC VSF RGB 7F00FF (gamma-2 codes), GPS VSF green, USB VSF red. A wavelength is its cone response (vsf LMS_2000_10DEG_1NM) in VSF RGB, moved toward white (E, equal codes) just far enough that no channel is negative: the same hue at the most saturation the primaries reach, its third channel black. Each scaled to the light of the grey it replaces by VSF's photopic weights (R 0.2584, G 0.6346, B 0.1070): the ring at RING_ON's light (0.3017 linear), the name at INK's (0.4507), or as far as the colour goes with its brightest channel full (blue 0.107, NFC 0.171, red 0.258; cellular's name stops at its red). As working values, gamma 2, white at Q14. The rest grey, equal codes.
 fn flavour(what: Corner) -> ((f32, f32, f32), (f32, f32, f32)) {
     const RING_ON: f32 = 9000.0;
     const INK: f32 = 11000.0;
     match what {
-        Corner::Cellular => ((12107.0, 8121.0, 3424.0), (14797.0, 9926.0, 4185.0)),
-        Corner::Wifi => ((2706.0, 10480.0, 9373.0), (3307.0, 12809.0, 11456.0)),
-        Corner::Bluetooth => ((8549.0, 7915.0, 14451.0), (9693.0, 8974.0, 16384.0)),
-        Corner::Nfc => ((6893.0, 10276.0, 3980.0), (8425.0, 12560.0, 4864.0)),
-        Corner::Gps => ((12831.0, 6415.0, 10735.0), (15682.0, 7841.0, 13121.0)),
+        Corner::Cellular => ((13932.0, 6972.0, 0.0), (16384.0, 8199.0, 0.0)),
+        Corner::Wifi => ((0.0, 10918.0, 7075.0), (0.0, 13344.0, 8647.0)),
+        Corner::Bluetooth => ((0.0, 0.0, 16384.0), (0.0, 0.0, 16384.0)),
+        Corner::Nfc => ((8160.0, 0.0, 16384.0), (8160.0, 0.0, 16384.0)),
+        Corner::Gps => ((0.0, 11298.0, 0.0), (0.0, 13808.0, 0.0)),
+        Corner::Usb => ((16384.0, 0.0, 0.0), (16384.0, 0.0, 0.0)),
         _ => ((RING_ON, RING_ON, RING_ON), (INK, INK, INK)),
     }
 }
@@ -2940,7 +2941,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             (OFF_GREY * stop, OFF_GREY * stop, OFF_GREY * stop)
         } else if !live {
             (OFF_GREY, OFF_GREY, OFF_GREY)
-        } else if radio.is_none() || what == Corner::Usb {
+        } else if radio.is_none() {
             (LIT_GREY, LIT_GREY, LIT_GREY)
         } else if state == Some(1) {
             (flav.0 * stop, flav.1 * stop, flav.2 * stop)
