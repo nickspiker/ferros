@@ -50,6 +50,7 @@ members = [
     "payloads/epcall",
     "payloads/keytest",
     "honeycomb",
+    "wallpaper",
     "ahau_core",
     "payloads/threads",
     "payloads/echo_client",
@@ -104,6 +105,10 @@ opt-level = 3
 
 # The attest screen's mark (tapuwae, four samples at a time): at "s" LLVM's vectoriser is off and it runs on scalar float, so it builds for speed (2026-10-29: no `.4s` ops at "s", 1850 at 3).
 [profile.release.package.ferros-payload-ahau]
+opt-level = 3
+
+# The wallpaper (wallpaper/): a Julia set worked out per pixel at attest, its orbits four lanes at a time on NEON; built for speed wherever it is linked.
+[profile.release.package.wallpaper]
 opt-level = 3
 
 # The USB driver's packet path (KERNEL-OUT.md, USB.md): per-chunk BLAKE3 and the copies around it are its CPU time, 81 ms of every 2 MiB received at "s"; built for speed, with BLAKE3 itself, wherever it is linked.

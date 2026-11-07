@@ -1299,8 +1299,18 @@ impl Ahau {
         proof
     }
 
+    /// The person's wallpaper (owner, 2026-11-07: handle entry unlocks it): their wallpaper seed to the display (op 42), which makes their wallpaper from it unless they set their own. The seed is one-way from their identity seed (BLAKE3's key derivation under a context of its own), so it shows nothing of the handle, and it is the same on every device of theirs and theirs alone. It is kept in their space (`ahau.wallpaper`) for a boot that unlocks without the handle being typed (`send_wallpaper`).
+    fn wallpaper(&self, seed: &[u8; 32]) {
+        let ws = blake3::derive_key("ferros 2026-11-07 wallpaper seed", seed);
+        if !self.put(S_AHAU, b"wallpaper", &ws) {
+            console(self.grants, b"ahau: the wallpaper seed was not kept\n");
+        }
+        send_wallpaper(self.display, &ws);
+    }
+
     /// A person this device knows: the screen closes now, then the handle proof is made behind it and the roots go to the identity service (fgtw) (made again until it takes them: it starts once the space is open), then this process ends.
     fn unlocked_known(&mut self, seed: [u8; 32]) -> ! {
+        self.wallpaper(&seed);
         self.wipe();
         console(self.grants, b"ahau: unlocked (this device knows the identity); the screen goes, the proof follows\n");
         window::done(self.display, self.base);
@@ -1315,6 +1325,9 @@ impl Ahau {
     }
 
     fn attested(&mut self) -> ! {
+        if let Some(seed) = self.session_seed {
+            self.wallpaper(&seed);
+        }
         self.wipe();
         console(self.grants, b"ahau: attested\n");
         window::done(self.display, self.base);
@@ -1751,6 +1764,11 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // Unlocked and bound already (unlock at boot, `device.unlock_at_boot`, AUTH.md: the kernel unlocked the device's own identity from the seed it kept, before init started anything): no attest screen; the identity service (fgtw) loads its own from that space. Unlocked but not bound is a join in progress (this screen restarted mid-way): the screen comes back, and the handle typed again is recognized at once.
     if ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true) && ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true) {
         console(grants, b"ahau: the identity was unlocked at boot; no attest screen\n");
+        // The person's wallpaper from the seed kept when they last typed their handle (`wallpaper`).
+        let mut ws = [0u8; 32];
+        if ferros_sys::store_get(cap(grants, S_AHAU), b"wallpaper", &mut ws) == Some(32) {
+            send_wallpaper(cap(grants, S_DISPLAY), &ws);
+        }
         exit(0);
     }
     let mode = Mode::Fresh;
@@ -1917,4 +1935,13 @@ impl core::fmt::Write for Line {
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
+}
+
+/// The wallpaper seed to the display server (its op 42, `wallpaper`): it makes the person's wallpaper from it, or shows their own.
+fn send_wallpaper(display: u64, ws: &[u8; 32]) {
+    let mut m = [0u8; 33];
+    m[0] = 42;
+    m[1..].copy_from_slice(ws);
+    let mut r = [0u8; 16];
+    let _ = ferros_sys::call(display, &m, &mut r);
 }

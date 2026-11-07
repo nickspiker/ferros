@@ -1,0 +1,13 @@
+[package]
+name = "wallpaper"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A person's default wallpaper: a Julia set drawn from a 32-byte seed, the same image bit for bit on every device, into the display's 64-bit working values; no I/O"
+
+[dependencies]
+libm = "0.2"
+
+# The host example writes a seed's wallpaper as a VSF visual to look at (examples/render.rs), the way tools/screencap writes the screen.
+[dev-dependencies]
+vsf = { path = "../../vsf" }

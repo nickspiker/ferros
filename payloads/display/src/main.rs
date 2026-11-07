@@ -117,6 +117,8 @@ const S_DPU_POWER: u64 = 23;
 /// The panel's switches (kernel panel_power.rs, grants 102 and 103): VCI and the reset pulse; VDDD after the init set.
 const S_PANEL_POWER: u64 = 24;
 const S_PANEL_VDDD: u64 = 25;
+/// 26: the vault scope `map.` (the person's space, AUTH.md: readable only once they attest), for their own wallpaper, `map.wallpaper` (a VSF visual); the display reads nothing else there.
+const S_MAP_SCOPE: u64 = 26;
 const INT_EN: u64 = 0x0060;
 const INT_EN_FRAME_START: u32 = 1 << 12;
 static FRAME_STARTS: AtomicU64 = AtomicU64::new(0);
@@ -1515,6 +1517,8 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
     let mut row = [0u32; 1344];
     let line = hairline();
     let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
+    // The finished wallpaper's base, 0 while there is none.
+    let wall = unsafe { if WALL_ON { WALL_BUF } else { 0 } };
     for k in 0..PHASES {
         if mask >> k & 1 == 0 {
             continue;
@@ -1535,17 +1539,28 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                 let src = back.as_ptr().add(y * width);
                 let mut x = x0;
                 while x < x1 {
+                    // The scene: the canvas, and the wallpaper under it where there is one (the canvas's pixels are premultiplied with their alpha, so the wallpaper shows in exactly the room each leaves: a circle's edge, a glow).
+                    let mut scene = [0u64; 16];
+                    let scene_at = if wall != 0 {
+                        core::ptr::copy_nonoverlapping(src.add(x) as *const u64, scene.as_mut_ptr(), 16);
+                        for j in (0..16).step_by(2) {
+                            neon::under2(scene.as_mut_ptr().add(j), (wall as *const u64).add(y * width + x + j));
+                        }
+                        scene.as_ptr()
+                    } else {
+                        src.add(x) as *const u64
+                    };
                     if x < el || x + 16 > er || (x + 16 > cl && x < cr) {
                         let mut front = [0u64; 16];
                         for j in 0..16 {
                             let xx = x + j;
                             let c = if xx >= cl && xx < cr { bw[xx] } else { CLEAR };
                             // The canvas word's fourth lane is its alpha, not flags: off, so its pixels keep their dither.
-                            front[j] = glass_front(xx, g, edge_px, line, c, *(src.add(xx) as *const u64) & ((1 << 48) - 1));
+                            front[j] = glass_front(xx, g, edge_px, line, c, *scene_at.add(j) & ((1 << 48) - 1));
                         }
                         neon::sixteen_app(tabs, front.as_ptr(), row.as_mut_ptr().add(x), neon::thresholds_at(thv, x));
                     } else {
-                        neon::sixteen_canvas(tabs, src.add(x), row.as_mut_ptr().add(x), thv);
+                        neon::sixteen_canvas(tabs, scene_at as *const Px, row.as_mut_ptr().add(x), thv);
                     }
                     x += 16;
                 }
@@ -1604,6 +1619,12 @@ static mut ARENA: usize = 1;
 static mut ARENA_NEXT: usize = 1;
 /// The arena's size in words: the `display-sprites` region's 32 MiB when granted (a screen packed with circles needs ~20 MB of square sprites; 6 MiB thrashed at 200, 2026-10-24), else 6 MiB of the heap (the 16 MiB below the back buffer, where the 256-px icon mips, 4.4 MB, and the glyph cache, 2 MiB, left no room for 10, 2026-10-23).
 static mut ARENA_WORDS: usize = (6 << 20) / 8;
+/// The wallpaper (owner, 2026-11-07): under everything on the home screen, a full screen of working values (premultiplied, opaque) in the upper half of the `display-sprites` region; 0 when there is no region for it. Unlocked with the person: it is made from their wallpaper seed (op 42, from the attest screen: the `wallpaper` crate's Julia set, the same on every device of theirs and theirs alone) unless they set their own (`map.wallpaper` in their space, a VSF visual), and before attest there is none.
+static mut WALL_BUF: usize = 0;
+/// Whether `WALL_BUF` holds a finished wallpaper (publishing puts it under the canvas only then).
+static mut WALL_ON: bool = false;
+/// The wallpaper being made from a seed, a band of rows each pass of the render loop so nothing waits on it: what the seed decided (`wallpaper::params`, worked out once) and the next row.
+static mut WALL_MAKING: Option<(wallpaper::Params, usize)> = None;
 const SPRITE_MAX: usize = 1100;
 
 /// Circle i's sprite for this key: reused if it is current, else drawn (into its own space if that is big enough, otherwise new space, the arena started over when full). The sprite is d × d pixels with the circle at its centre pixel, followed by d words of row extents (first | last << 16, both inclusive; first > last for an empty row). Returns the sprite's words and extents.
@@ -2545,6 +2566,85 @@ fn measure_text(t: &mut Txt, kind: u16, v: i64) {
     };
 }
 
+/// Rows of the wallpaper made each pass of the render loop while it is being made from a seed (`WALL_MAKING`).
+const WALL_ROWS: usize = 1 << 6;
+
+/// The wallpaper is finished: publishing puts it under the canvas from now, and every phase owes the whole screen so the next frames show it.
+fn wall_ready(width: usize, height: usize) {
+    unsafe {
+        WALL_ON = true;
+        PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
+    }
+}
+
+/// The vault as a byte source for vsf's container (`Document`): the value under `key` in a store scope, read in the kernel's pieces of at most 4 KiB (it keeps the value between such reads, so walking a large one costs one vault read). vsf reads only what it needs: the header, then the rows asked for.
+struct VaultSource {
+    cap: u64,
+    key: &'static [u8],
+    len: u64,
+}
+
+impl vsf::container::ByteSource for VaultSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), vsf::container::SourceError> {
+        let mut at = 0;
+        while at < buf.len() {
+            // The kernel hands over at most 4 KiB a read (ferros_sys::store_get_at).
+            let n = (buf.len() - at).min(1 << 12);
+            if ferros_sys::store_get_at(self.cap, self.key, offset as usize + at, &mut buf[at..at + n]).is_none() {
+                return Err(vsf::container::SourceError::Io("the vault refused a read".into()));
+            }
+            at += n;
+        }
+        Ok(())
+    }
+}
+
+/// The person's own wallpaper (`map.wallpaper` in their space: a VSF visual, one plane of VSF RGB gamma2tanh codes at 16 bits, planar [3, height, width], as tools/wallpaper and tools/screencap write one) into `WALL_BUF`, if they set one; whether it did. vsf's container locates the plane over the vault (`VaultSource`) and reads it a band of rows a channel at a time, so nothing of its size passes through the heap; each code becomes a working value by the display's own g2t table (`G2T16_Q14`).
+fn wall_own(grants: u64, width: usize, height: usize) -> bool {
+    let c = cap(grants, S_MAP_SCOPE);
+    let Some(len) = ferros_sys::store_get(c, b"wallpaper", &mut []) else { return false };
+    let mut l = Log { grants, buf: [0; 256], n: 0 };
+    let doc = match vsf::container::Document::open(VaultSource { cap: c, key: b"wallpaper", len: len as u64 }) {
+        Ok(d) => d,
+        Err(_) => {
+            l.s(b"display: the person's own wallpaper is not a VSF document; theirs from the seed shows\n");
+            l.flush();
+            return false;
+        }
+    };
+    let span = doc.entries().iter().find(|e| e.name.starts_with("plane.")).and_then(|e| doc.packed(e, "samples").ok().flatten());
+    let Some(span) = span.filter(|s| s.bit_depth == 16 && s.shape[..] == [3, height, width]) else {
+        l.s(b"display: the person's own wallpaper is not one 16-bit plane of this screen's size; theirs from the seed shows\n");
+        l.flush();
+        return false;
+    };
+    let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, width * height) };
+    let table = unsafe { core::slice::from_raw_parts(G2T16_Q14, 1 << 16) };
+    let mut y0 = 0;
+    while y0 < height {
+        // The last band stops at the screen's bottom.
+        let y1 = (y0 + WALL_ROWS).min(height);
+        let band = &mut buf[y0 * width..y1 * width];
+        // Opaque, its channels filled one plane at a time.
+        band.fill(0xFFFF << 48);
+        for ch in 0..3 {
+            let Ok(s) = doc.packed_range_u16(&span, ch * height * width + y0 * width, (y1 - y0) * width) else {
+                l.s(b"display: the person's own wallpaper could not be read whole; theirs from the seed shows\n");
+                l.flush();
+                return false;
+            };
+            for (p, &code) in band.iter_mut().zip(&s) {
+                *p |= (table[code as usize] as u64) << (16 * ch);
+            }
+        }
+        y0 = y1;
+    }
+    true
+}
+
 /// Whether the helm has been drawn (it shows nothing that changes; drawn once, at the first pass).
 static mut HELM_DRAWN: bool = false;
 
@@ -3247,8 +3347,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe {
         let sprites = ferros_sys::dma(cap(grants, S_SPRITES));
         if sprites != 0 && sprites != ferros_sys::ERR {
+            // The region's lower 32 MiB are the sprites', its upper 32 MiB the wallpaper's (a full screen of working values, 1344 × 2992 × 8 bytes, just fits).
             ARENA = sprites as usize;
-            ARENA_WORDS = (64 << 20) / 8;
+            ARENA_WORDS = (32 << 20) / 8;
+            WALL_BUF = sprites as usize + (32 << 20);
         } else {
             ARENA = alloc::vec![0u64; ARENA_WORDS].leak().as_mut_ptr() as usize;
         }
@@ -3953,6 +4055,23 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     }
                 }
                 // 30 `capture`: the frame as it is composed for the panel (windows, the corners, the glass) but in working values, before the panel's table and dither, into a surface no window holds; replies its physical address as text, `G#…` (tools/screencap reads it; the reply holds 16 bytes). With no window up the canvas is the screen: replies `canvas`.
+                // 42 `wallpaper` [seed 32]: a person attested, and this is their wallpaper seed (the attest screen derives it from their identity seed; the same on every device of theirs). Their own wallpaper if they set one (`map.wallpaper`, in their space, readable now), else the one made from the seed, a band of rows a pass (`WALL_MAKING`); until it is ready the home screen shows none. Replies 0, or 1 with no wallpaper buffer.
+                Some(42) if m.len() >= 33 => {
+                    if unsafe { WALL_BUF } == 0 {
+                        out[0] = 1;
+                    } else {
+                        let mut seed = [0u8; 32];
+                        seed.copy_from_slice(&m[1..33]);
+                        unsafe { WALL_ON = false };
+                        if wall_own(grants, width, height) {
+                            console(grants, b"display: wallpaper: the person's own\n");
+                            wall_ready(width, height);
+                        } else {
+                            console(grants, b"display: wallpaper: made from the person's seed\n");
+                            unsafe { WALL_MAKING = Some((wallpaper::params(&seed, width, height), 0)) };
+                        }
+                    }
+                }
                 Some(30) => {
                     let free = (0..SURFACES).find(|&k| unsafe { (*(&raw const WINS))[k] }.is_none());
                     let text: alloc::string::String = match (unsafe { APP }.is_some(), free) {
@@ -3969,7 +4088,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                                 let ((cl, cr), bw) = bar_line(y, width, height);
                                 for x in 0..width {
                                     let c = if x >= cl && x < cr { bw[x] } else { CLEAR };
-                                    s[y * width + x] = glass_front(x, g, edge_px, line, c, pixels[y * width + x] & ((1 << 48) - 1));
+                                    // The canvas with the wallpaper under it, as publish_band puts it.
+                                    let scene = if unsafe { WALL_ON } { draw::under(pixels[y * width + x], unsafe { *(WALL_BUF as *const u64).add(y * width + x) }) } else { pixels[y * width + x] };
+                                    s[y * width + x] = glass_front(x, g, edge_px, line, c, scene & ((1 << 48) - 1));
                                 }
                             }
                             alloc::format!("G#{:X}\n", s.as_ptr() as usize)
@@ -4253,6 +4374,16 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             if gone {
                 // The idle fill republishes every phase within an eighth of a second of the last window op.
                 windows_changed(width, height);
+            }
+            // The person's wallpaper being made from their seed: a band of rows a pass, so the loop never waits on it; finished, it is ready (`wall_ready`). The last band stops at the screen's bottom.
+            if let Some((p, row)) = WALL_MAKING {
+                let next = (row + WALL_ROWS).min(height);
+                let band = core::slice::from_raw_parts_mut((WALL_BUF as *mut u64).add(row * width), (next - row) * width);
+                wallpaper::render_rows(&p, row..next, band);
+                WALL_MAKING = if next < height { Some((p, next)) } else { None };
+                if next == height {
+                    wall_ready(width, height);
+                }
             }
             // The bars on every screen (in front of the home screen and of every app): each redrawn when what it shows changed, and its rows into every phase.
             let console_new = console_draw(width, height, false);
