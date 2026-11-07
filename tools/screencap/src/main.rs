@@ -10,8 +10,8 @@ use vsf::visual::{Encoding, Plane, Primaries, Visual};
 
 const CANVAS: usize = 0xC800_0000;
 
-/// Where the finished frame is: the display server composes it into a free surface on op 30 (the windows, the corners, the glass, in working values) and says where; the `capture` process (payloads/capture, a display client: the kernel has no door to the display server) asks it and prints the answer. With no window up the canvas is the screen, and the status circles come as a band of rows composed over its top (`G#<band> G#<rows>`: every surface held), read after the canvas and laid over it.
-fn source(bridge: &std::path::Path) -> (usize, Option<(usize, usize)>) {
+/// Where the finished frame is: the display server composes it into a free surface on op 30 (the windows, the corners, the glass, in working values) and says where; the `capture` process (payloads/capture, a display client: the kernel has no door to the display server) asks it and prints the answer. With no window up the canvas is the screen.
+fn source(bridge: &std::path::Path) -> usize {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let elf = repo.join("target/el0/aarch64-unknown-none/release/capture");
     let bin = repo.join("target/el0/aarch64-unknown-none/release/capture.bin");
@@ -20,37 +20,13 @@ fn source(bridge: &std::path::Path) -> (usize, Option<(usize, usize)>) {
     let out = Command::new(bridge).arg("spawn").arg(&bin).args(["--use", "display"]).output().expect("ferros-bridge");
     // The capture's reply, `proc: G#…`, anywhere in a line: other processes' console lines run into it when they have no newline of their own yet (2026-11-03: four captures read the canvas while the modem's log was streaming).
     let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-    let Some(reply) = text.split("proc: G#").nth(1) else { return (CANVAS, None) };
-    let hex = |s: &str| s.chars().take_while(|c| c.is_ascii_hexdigit()).collect::<String>();
-    let first = hex(reply);
-    if first.is_empty() {
-        return (CANVAS, None);
-    }
-    let addr = usize::from_str_radix(&first, 16).expect("capture address");
-    match reply[first.len()..].strip_prefix(" G#").map(hex).filter(|h| !h.is_empty()) {
-        Some(rows) => (CANVAS, Some((addr, usize::from_str_radix(&rows, 16).expect("band rows")))),
-        None => (addr, None),
+    let hex = text.split("proc: G#").nth(1).map(|s| s.chars().take_while(|c| c.is_ascii_hexdigit()).collect::<String>());
+    match hex.filter(|h| !h.is_empty()) {
+        Some(h) => usize::from_str_radix(&h, 16).expect("capture address"),
+        None => CANVAS,
     }
 }
 const CHUNK: usize = 4 << 20;
-
-/// `bytes` of DRAM from `base` over the bridge, a chunk a read; the reads it took.
-fn read(bridge: &std::path::Path, tmp: &std::path::Path, base: usize, bytes: usize) -> (Vec<u8>, usize) {
-    let mut raw = Vec::with_capacity(bytes);
-    let mut reads = 0;
-    while raw.len() < bytes {
-        let want = (bytes - raw.len()).min(CHUNK);
-        let st = Command::new(bridge).args(["read", &format!("{:X}", base + raw.len()), &format!("{want:X}"), tmp.to_str().unwrap()]).output().expect("ferros-bridge");
-        let got = std::fs::read(tmp).unwrap_or_default();
-        if !st.status.success() || got.is_empty() {
-            eprintln!("read failed at G#{:X}+G#{:X}: {}", base, raw.len(), String::from_utf8_lossy(&st.stderr).lines().last().unwrap_or(""));
-            std::process::exit(1);
-        }
-        raw.extend_from_slice(&got[..got.len().min(bytes - raw.len())]);
-        reads += 1;
-    }
-    (raw, reads)
-}
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -68,15 +44,20 @@ fn main() {
     let bytes = w * h * 8;
     let tmp = std::env::temp_dir().join("screencap.part");
     let t0 = std::time::Instant::now();
-    let (base, band) = source(&bridge);
-    eprintln!("reading G#{base:X}{}", if base == CANVAS && band.is_none() { " (the canvas: the capture named no surface)" } else { "" });
-    let (mut raw, mut reads) = read(&bridge, &tmp, base, bytes);
-    // The status circles: the band composed over the canvas's top rows, laid over what was read of them.
-    if let Some((at, rows)) = band {
-        eprintln!("the circles: G#{rows:X} rows from G#{at:X}");
-        let (top, n) = read(&bridge, &tmp, at, rows * w * 8);
-        raw[..rows * w * 8].copy_from_slice(&top);
-        reads += n;
+    let base = source(&bridge);
+    eprintln!("reading G#{base:X}{}", if base == CANVAS { " (the canvas: the capture named no surface)" } else { "" });
+    let mut raw = Vec::with_capacity(bytes);
+    let mut reads = 0;
+    while raw.len() < bytes {
+        let want = (bytes - raw.len()).min(CHUNK);
+        let st = Command::new(&bridge).args(["read", &format!("{:X}", base + raw.len()), &format!("{want:X}"), tmp.to_str().unwrap()]).output().expect("ferros-bridge");
+        let got = std::fs::read(&tmp).unwrap_or_default();
+        if !st.status.success() || got.is_empty() {
+            eprintln!("read failed at +{:#x}: {}", raw.len(), String::from_utf8_lossy(&st.stderr).lines().last().unwrap_or(""));
+            std::process::exit(1);
+        }
+        raw.extend_from_slice(&got[..got.len().min(bytes - raw.len())]);
+        reads += 1;
     }
     let _ = std::fs::remove_file(&tmp);
     let read_ms = t0.elapsed().as_millis();

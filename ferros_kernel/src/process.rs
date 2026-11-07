@@ -852,8 +852,6 @@ pub const LAYOUTS: u8 = 2;
 pub const PREF_UNLOCK_AT_BOOT: usize = 13;
 /// Preference 14: the UI scale every active app lays its page out by (owner, 2026-11-05: a pinch inside an open circle, "you can easily scale any app any time"), a signed byte of 64ths of an octave: the unit times 2^(s/64), 0 the default (one), from -64 (a half) to 64 (twice).
 pub const PREF_SCALE: usize = 14;
-/// Preference 15: the radios switched off (ferros_sys::PREF_RADIOS_OFF), a bit each: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GNSS. Kept in the device document; the service loop stops and starts the drivers by it.
-pub const PREF_RADIOS_OFF: usize = 15;
 /// The UI scale's reach either way, 64ths of an octave: half to twice (proposed 2026-11-05, the owner's to change).
 pub const SCALE_REACH: i8 = 64;
 /// How many themes ferros_sys carries (ferros_sys::theme::THEMES): the valid range of PREF_THEME.
@@ -979,8 +977,6 @@ fn pref_valid(index: usize, value: u8) -> bool {
         PREF_LAYOUT => value < LAYOUTS,
         PREF_UNLOCK_AT_BOOT => value <= 1,
         PREF_SCALE => (value as i8).unsigned_abs() <= SCALE_REACH as u8,
-        // Five radios, a bit each.
-        PREF_RADIOS_OFF => value < 1 << 5,
         _ => false,
     }
 }

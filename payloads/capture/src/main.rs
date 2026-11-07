@@ -37,14 +37,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         console(grants, b"capture: the display server did not answer\n");
         exit(1);
     }
-    let n = (n as usize).min(r.len() - 1);
-    // A full 16-byte reply has no room for its newline (the home band, `G#<band> G#<rows>`): ended here so the next process's output starts a line of its own.
-    if r[n - 1] != b'\n' {
-        r[n] = b'\n';
-        console(grants, &r[..n + 1]);
-    } else {
-        console(grants, &r[..n]);
-    }
+    console(grants, &r[..(n as usize).min(r.len())]);
     exit(0);
 }
 

@@ -61,12 +61,6 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The GPU too: Android ran it, and whether the hv cuts it off at the jump is still the owner's open decision (KERNEL-OUT.md); the attest screen draws on the CPU without it.
     let after_jump = |n: &[u8]| jumped && matches!(n, b"pcie1" | b"nfc" | b"bt" | b"sensors" | b"modem" | b"gpu");
     for (name, key, slots) in SHELL.iter() {
-        if switched_off(name) {
-            console(grants, b"init: ");
-            console(grants, name);
-            console(grants, b" not started: switched off (a status circle)\n");
-            continue;
-        }
         if after_jump(name) {
             console(grants, b"init: ");
             console(grants, name);
@@ -125,10 +119,6 @@ extern "C" fn keeper(arg: u64) -> ! {
             continue;
         }
         let Some((n, key, slots)) = SHELL.iter().find(|s| s.0 == name) else { continue };
-        // A radio switched off by its status circle stays off: the kernel stopped it on purpose.
-        if switched_off(n) {
-            continue;
-        }
         match ferros_sys::spawn_unique(grants, n, key, slots) {
             ferros_sys::NOTHING => {
                 if wait > first && now() - started > most * f {
@@ -147,12 +137,6 @@ extern "C" fn keeper(arg: u64) -> ! {
             }
         }
     }
-}
-
-/// Whether a radio's driver is switched off (preference 15, the status circles; owner 2026-11-07): the bit in the facts' order, cellular, WiFi, Bluetooth, NFC, GNSS. Not a radio: never.
-fn switched_off(name: &[u8]) -> bool {
-    const RADIOS: [&[u8]; 5] = [b"modem", b"pcie1", b"bt", b"nfc", b"gnss"];
-    RADIOS.iter().position(|r| *r == name).is_some_and(|i| ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) >> i & 1 == 1)
 }
 
 /// The person's space opens only with them (AUTH.md). fgtw, the identity service, starts once an identity is unlocked (`bound` false): it is the attest's own, looking the identity up and joining its fleet. The map starts only once the device is also bound to that identity (`bound` true): a device not attached to an identity is not usable, nothing to save settings into and no point to it (owner, 2026-11-04). At once with unlock at boot (the kernel unlocked a bound device before init started), else when someone attests and, for the map, the fleet binds the device or a mint makes it the identity's first. No timeout: without a person there is nothing of theirs to show. Fails closed: an answer the kernel cannot give (no Unlock right) waits forever, where it once started everything.
