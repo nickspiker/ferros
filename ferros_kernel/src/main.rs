@@ -75,6 +75,7 @@ mod camera_close;
 mod camera_rx;
 #[cfg(feature = "pixel8")]
 mod camera_rx_uw;
+mod camera_rx_front;
 #[cfg(feature = "pixel8")]
 mod spi;
 #[cfg(feature = "pixel8")]

@@ -284,8 +284,10 @@ pub struct Module {
     pub switch: u16,
     /// Its enable line on the sub-PMIC, if it has one (GPIO number in the sub block).
     pub sub_enable: Option<u8>,
-    /// Whether it takes the sub-PMIC's LDO26 as well as LDO12: the two rear modules do, the other two do not (their device-tree supply lists).
+    /// Whether it takes the sub-PMIC's LDO26 as well as LDO12: the main and the front camera do (the front for its lens actuator), the other two do not (their device-tree supply lists).
     pub sub_ldo26: bool,
+    /// Whether its enable line comes late, after its load switch, then the master clock and the reset, as its device-tree power-up sequence orders it (`power-up-seqs`): the front camera's ("shared-enable", which also powers its lens actuator), where the main's comes second.
+    pub enable_late: bool,
 }
 
 /// GPP bank offsets inside GPIO_PERIC0, as the pin names map to them.
@@ -299,10 +301,10 @@ const GPP8: usize = 0x100;
 const GPP9: usize = 0x120;
 
 pub const MODULES: [Module; 4] = [
-    Module { name: "boitata", role: "main wide", bus: 0x1088_0000, bus_bank: GPP2, addr: 0x3D, reset_bank: GPP2, reset_pin: 2, mclk_bank: GPP9, usi_off: 0x0, clock: "CIS_CLK3 26 MHz", wide_regs: true, rails: &[0, 3, 4, 7], switch: 0x1713, sub_enable: Some(2), sub_ldo26: true },
-    Module { name: "dokkaebi", role: "tele", bus: 0x1089_0000, bus_bank: GPP4, addr: 0x10, reset_bank: GPP4, reset_pin: 2, mclk_bank: GPP5, usi_off: 0x4, clock: "CIS_CLK1 24 MHz", wide_regs: true, rails: &[0, 7], switch: 0x1712, sub_enable: Some(4), sub_ldo26: true },
-    Module { name: "oksoko", role: "ultrawide", bus: 0x108A_0000, bus_bank: GPP6, addr: 0x1A, reset_bank: GPP6, reset_pin: 3, mclk_bank: GPP3, usi_off: 0x8, clock: "CIS_CLK0 24 MHz", wide_regs: false, rails: &[0, 1, 3, 5, 7], switch: 0x1711, sub_enable: None, sub_ldo26: false },
-    Module { name: "kraken", role: "front", bus: 0x108B_0000, bus_bank: GPP8, addr: 0x2D, reset_bank: GPP6, reset_pin: 2, mclk_bank: GPP7, usi_off: 0xC, clock: "CIS_CLK2 24 MHz", wide_regs: true, rails: &[0, 2, 4, 6, 7], switch: 0x1710, sub_enable: None, sub_ldo26: false },
+    Module { name: "boitata", role: "main wide", bus: 0x1088_0000, bus_bank: GPP2, addr: 0x3D, reset_bank: GPP2, reset_pin: 2, mclk_bank: GPP9, usi_off: 0x0, clock: "CIS_CLK3 26 MHz", wide_regs: true, rails: &[0, 3, 4, 7], switch: 0x1713, sub_enable: Some(2), sub_ldo26: true, enable_late: false },
+    Module { name: "dokkaebi", role: "front", bus: 0x1089_0000, bus_bank: GPP4, addr: 0x10, reset_bank: GPP4, reset_pin: 2, mclk_bank: GPP5, usi_off: 0x4, clock: "CIS_CLK1 24 MHz", wide_regs: true, rails: &[0, 7], switch: 0x1712, sub_enable: Some(4), sub_ldo26: true, enable_late: true },
+    Module { name: "oksoko", role: "ultrawide", bus: 0x108A_0000, bus_bank: GPP6, addr: 0x1A, reset_bank: GPP6, reset_pin: 3, mclk_bank: GPP3, usi_off: 0x8, clock: "CIS_CLK0 24 MHz", wide_regs: false, rails: &[0, 1, 3, 5, 7], switch: 0x1711, sub_enable: None, sub_ldo26: false, enable_late: false },
+    Module { name: "kraken", role: "tele", bus: 0x108B_0000, bus_bank: GPP8, addr: 0x2D, reset_bank: GPP6, reset_pin: 2, mclk_bank: GPP7, usi_off: 0xC, clock: "CIS_CLK2 24 MHz", wide_regs: true, rails: &[0, 2, 4, 6, 7], switch: 0x1710, sub_enable: None, sub_ldo26: false, enable_late: false },
 ];
 
 /// The front end's own CSIS core, configured by ferros alone: every write Linux makes into G#1C32_xxxx, in its order, and nothing else.
@@ -944,7 +946,7 @@ fn power_module(rep: &mut Vec<u8>, m: &Module) -> bool {
     // LDO1 (the shared analogue rail) and LDO8 (the shared core) bracket the module's enable line, as the captured sequence does.
     if !step(rep, "LDO1 on", ldo(0)) { return false }
     spin_us(500);
-    if let Some(g) = m.sub_enable {
+    if let Some(g) = m.sub_enable.filter(|_| !m.enable_late) {
         if !step(rep, "module enable (sub GPIO)", sub_gpio_high(g as u32).map(|_| alloc::string::String::from("high")).map_err(hex)) { return false }
         spin_us(10);
     }
@@ -958,15 +960,29 @@ fn power_module(rep: &mut Vec<u8>, m: &Module) -> bool {
             spin_us(1000);
         }
     }
+    // A late enable (the front camera): its load switch, 500 µs, the enable line, 500 µs, then the clock and the reset below, the device tree's order and delays.
+    if m.enable_late {
+        let sw = pmic_read(m.switch).and_then(|v| pmic_write(m.switch, v | 1).map(|_| v)).map_err(hex).map(|v| alloc::format!("G#{v:02X} -> on"));
+        if !step(rep, "load switch", sw) { return false }
+        spin_us(500);
+        if let Some(g) = m.sub_enable {
+            if !step(rep, "module enable (sub GPIO, late)", sub_gpio_high(g as u32).map(|_| alloc::string::String::from("high")).map_err(hex)) { return false }
+        }
+        spin_us(500);
+    }
     // The master clock out on this module's pin: drive and no pull as Linux runs it, then function 2. The CIS clocks themselves already run on a cold boot.
     let mc = GPIO_PERIC0 + m.mclk_bank;
     pin_field(mc + 0xC, 0, 2);
     pin_field(mc + 0x8, 0, 0);
     pin_field(mc, 0, 2);
     line(rep, alloc::format!("    master clock pin: CON G#{:X} ({})\n", rd(mc), m.clock));
-    let sw = pmic_read(m.switch).and_then(|v| pmic_write(m.switch, v | 1).map(|_| v)).map_err(hex).map(|v| alloc::format!("G#{v:02X} -> on"));
-    if !step(rep, "load switch", sw) { return false }
-    spin_us(1000);
+    if m.enable_late {
+        spin_us(1000);
+    } else {
+        let sw = pmic_read(m.switch).and_then(|v| pmic_write(m.switch, v | 1).map(|_| v)).map_err(hex).map(|v| alloc::format!("G#{v:02X} -> on"));
+        if !step(rep, "load switch", sw) { return false }
+        spin_us(1000);
+    }
     pin_out(m.reset_bank, m.reset_pin, true);
     line(rep, alloc::format!("    reset released: DAT G#{:X}\n", rd(GPIO_PERIC0 + m.reset_bank + 4)));
     spin_us(9000);
@@ -2409,12 +2425,13 @@ const SWEEP_PA: usize = 0x9800_0000;
 const PDMA_BUFS: usize = 32;
 
 /// `diag cam pdma`: the receive side as `cam frame` brings it up, the CPU's own setup writes from the capture, and the front end's register program handed to the **PDMA engine** rather than replayed by the CPU — the only way to reach the G#1C36_xxxx region the CPU cannot write (docs/oracle/CAMERA.md). The job comes from a build-time blob ('CPR3': physical address + bytes per piece).
-/// Which camera `cam pdma` drives: the main (link 1, its bundles FERROS_CAM_FRAME / FERROS_CAM_PDMA) or the ultrawide (`uw`: link 2, FERROS_CAM_UW).
+/// Which camera `cam pdma` drives: the main (link 1, its bundles FERROS_CAM_FRAME / FERROS_CAM_PDMA), the ultrawide (`uw`: link 2, FERROS_CAM_UW) or the front camera (`front`: link 0, FERROS_CAM_FRONT).
 #[derive(Clone, Copy, Default, PartialEq)]
 pub enum Cam {
     #[default]
     Main,
     Ultrawide,
+    Front,
 }
 
 impl Cam {
@@ -2423,6 +2440,7 @@ impl Cam {
         match self {
             Cam::Main => (SENSOR_BUS.base, SENSOR_ADDR),
             Cam::Ultrawide => (MODULES[2].bus, MODULES[2].addr),
+            Cam::Front => (MODULES[1].bus, MODULES[1].addr),
         }
     }
     /// Stream on and off as each sensor's Linux driver writes them: the main's carries image orientation (G#0101 = 3) in the same write, the ultrawide's is G#0100 alone (capture, 2026-10-22).
@@ -2432,6 +2450,8 @@ impl Cam {
             (Cam::Main, false) => &[0x01, 0x00, 0x00, 0x00],
             (Cam::Ultrawide, true) => &[0x01, 0x00, 0x01],
             (Cam::Ultrawide, false) => &[0x01, 0x00, 0x00],
+            (Cam::Front, true) => &[0x01, 0x00, 0x01, 0x00],
+            (Cam::Front, false) => &[0x01, 0x00, 0x00, 0x00],
         }
     }
     /// The identifier and where it lives: the main answers G#08EF at G#0000; the ultrawide (Sony IMX787) G#0787 at the CCS sensor register G#0016.
@@ -2439,18 +2459,21 @@ impl Cam {
         match self {
             Cam::Main => (0x0000, [0x08, 0xEF]),
             Cam::Ultrawide => (0x0016, [0x07, 0x87]),
+            Cam::Front => (0x0000, [0x30, 0xA1]),
         }
     }
     fn rx_start(self) -> &'static [(usize, u32)] {
         match self {
             Cam::Main => &crate::camera_rx::RX_START,
             Cam::Ultrawide => &crate::camera_rx_uw::RX_START_UW,
+            Cam::Front => &crate::camera_rx_front::RX_START_FRONT,
         }
     }
     fn job(self) -> &'static [u8] {
         match self {
             Cam::Main => if cfg!(cam_pdma_blob) { include_bytes!(concat!(env!("OUT_DIR"), "/cam_pdma.bin")) } else { &[] },
             Cam::Ultrawide => include_bytes!(concat!(env!("OUT_DIR"), "/uw_pdma.bin")),
+            Cam::Front => include_bytes!(concat!(env!("OUT_DIR"), "/front_pdma.bin")),
         }
     }
     /// The ultrawide's init table and CPU setup (FERROS_CAM_UW), when built in.
@@ -2461,6 +2484,36 @@ impl Cam {
             (None, None)
         }
     }
+    /// The front camera's init table and CPU setup (FERROS_CAM_FRONT), when built in.
+    pub fn front_bundle() -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        if cfg!(cam_front_blob) {
+            (Some(include_bytes!(concat!(env!("OUT_DIR"), "/front_init.bin")).to_vec()), Some(include_bytes!(concat!(env!("OUT_DIR"), "/front_cpr2.bin")).to_vec()))
+        } else {
+            (None, None)
+        }
+    }
+}
+
+/// `diag cam front up`: as `cam uw up`, for the front camera (dokkaebi on hsi2c_2, G#10): powered in its own sequence (`power_module`) and its identifier read at G#0000, where Linux reads G#30A1 (capture, 2026-11-06 night).
+pub fn front_up(rep: &mut Vec<u8>) {
+    let gpp16 = GPIO_PERIC0 + 0x220;
+    for pin in 0..2 {
+        pin_field(gpp16, pin, 2);
+        pin_field(gpp16 + 8, pin, 0);
+    }
+    wr(USI14_MUX, rd(USI14_MUX) & !(1 << 4));
+    crate::hsi2c::bring_up(PMIC_BUS.base, PMIC_BUS.usi_mode, FS_DIV, 0xFF_FFFF);
+    buses_all(rep);
+    pmic_power_on(rep);
+    power_down_all(rep);
+    let m = &MODULES[1];
+    if !power_module(rep, m) {
+        return line(rep, alloc::format!("front camera power-up failed\n"));
+    }
+    crate::hsi2c::bring_up(m.bus, SYSREG_PERIC0 + m.usi_off, FS_DIV, 0x2_0000);
+    let mut b = [0u8; 2];
+    let r = crate::hsi2c::write_read(m.bus, m.addr, &[0x00, 0x00], &mut b);
+    line(rep, alloc::format!("front camera (G#{:02X}) identifier at G#0000: {r:?} G#{:02X}{:02X}{}\n", m.addr, b[0], b[1], if b == [0x30, 0xA1] { " — as Linux reads it" } else { "" }));
 }
 
 /// `diag cam uw up`: the camera-PMIC bus and all four sensor buses up, every module's rails off, then the ultrawide powered in its own sequence (`power_module`) and its identifier read (G#0016, Sony IMX787 answers G#0787).
@@ -2508,7 +2561,7 @@ pub fn uw_scan(rep: &mut Vec<u8>, after_init: bool) {
 /// Picture settings for `cam pdma`, from `exp=<lines> gain=<code> af=<position>` after the command (all optional; 0 = leave as captured).
 #[derive(Clone, Copy, Default)]
 pub struct Shot {
-    /// `uw`: drive the ultrawide instead of the main camera.
+    /// `uw` / `front`: drive the ultrawide or the front camera instead of the main camera.
     pub cam: Cam,
     /// CCS coarse_integration_time (G#0202), in lines. The captured mode uses 20, out of a frame of 10584.
     pub exp: u32,
@@ -2558,6 +2611,9 @@ impl Shot {
         if params.split(|&c| c == b' ').any(|t| t == b"uw") {
             s.cam = Cam::Ultrawide;
         }
+        if params.split(|&c| c == b' ').any(|t| t == b"front") {
+            s.cam = Cam::Front;
+        }
         s.rate = params.split(|&c| c == b' ').any(|t| t == b"rate");
         s
     }
@@ -2574,6 +2630,7 @@ fn focus_on(rep: &mut Vec<u8>, cam: Cam, pos: u32) {
     let (bus, act) = match cam {
         Cam::Main => (SENSOR_BUS.base, ACTUATOR),
         Cam::Ultrawide => (MODULES[2].bus, 0x0F),
+        Cam::Front => (MODULES[1].bus, 0x0C),
     };
     let w = |r: u8, v: u8| crate::hsi2c::write_bytes(bus, act, &[r, v]);
     // The reset (02 <- G#40) needs time: Linux has OIS and ToF traffic between it and the next write, and straight after it every write came back unacknowledged (error 4).
@@ -2792,9 +2849,9 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
         0x1C35_0058, 0x1C35_0088, 0x1C35_00B8, 0x1C35_00E8, 0x1C35_0118, 0x1C35_01AC,
         0x1C33_1300, 0x1C33_3300, 0x1C33_5300, 0x1C33_7300, 0x1C33_9300, 0x1C33_B300, 0x1C33_C300, 0x1C33_D300, 0x1C33_E300,
     ];
-    let ack: &[usize] = if shot.cam == Cam::Ultrawide { &FRAME_ACK_UW } else { &FRAME_ACK };
-    // How often the front end is answered: faster than the sensor's frame period, or frames arrive unanswered and it stops taking them. The main runs at ~14.5 fps (69 ms), so 50 ms is enough; the ultrawide runs at ~30 fps (33 ms), and at 50 ms it took one frame and stopped (2026-10-22).
-    let tick_us: u64 = if shot.cam == Cam::Ultrawide { 15_000 } else { 50_000 };
+    let ack: &[usize] = if shot.cam != Cam::Main { &FRAME_ACK_UW } else { &FRAME_ACK };
+    // How often the front end is answered: faster than the sensor's frame period, or frames arrive unanswered and it stops taking them. The main runs at ~14.5 fps (69 ms), so 50 ms is enough; the ultrawide runs at ~30 fps (33 ms), and at 50 ms it took one frame and stopped (2026-10-22). The front camera takes the ultrawide's period and acknowledgements until its own stream says otherwise.
+    let tick_us: u64 = if shot.cam != Cam::Main { 15_000 } else { 50_000 };
     crate::flashlog::line("cam pdma: sampling the G#1C32 per-frame status words while the engine runs");
     let mut status = [[0u32; FRAME_STATUS.len()]; 10];
     for f in 1..=(if fast { 0 } else { 10u32 }) {
