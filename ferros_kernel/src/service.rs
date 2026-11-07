@@ -1157,6 +1157,8 @@ pub fn run(mut b: Boot) -> ! {
     let keys_settle = cntpct() + cntfrq() / 4;
     let mut keys_settled = false;
     let mut ipc_marked = false;
+    // The radios switched off (preference 15) as the loop last applied them: init started only the ones left on.
+    let mut radios_applied = crate::process::pref(crate::process::PREF_RADIOS_OFF) & 0x1F;
     // The panel's VCI as ABL or Android left it (SYS_FACTS 81): the display server reads it to know a panel it must power up (state B).
     crate::panel_power::read_state();
     // The display engine fenced to its own regions when the DPU is up already (ABL's splash, or a jump from a lit Android); a DPU that is down is fenced by the `dpu` switch as it powers it (s2mpu::fence_dpu). Before init starts the display server, so it never runs unfenced.
@@ -1186,6 +1188,29 @@ pub fn run(mut b: Boot) -> ! {
     platform::mark(0x3A);
     loop {
         platform::pet_watchdogs();
+        // A status circle tapped (preference 15, owner 2026-11-07): a radio switched off has its driver stopped and, where the kernel holds its power switch (Bluetooth, NFC, GNSS), its chip powered down; switched on, its driver starts again from its capsule. Cellular and WiFi have no kernel switch: their drivers stop, the modem staying as it was until a power-down of its own exists.
+        let radios_off = crate::process::pref(crate::process::PREF_RADIOS_OFF) & 0x1F;
+        if radios_off != radios_applied {
+            const DRIVERS: [&[u8]; 5] = [b"modem", b"pcie1", b"bt", b"nfc", b"gnss"];
+            for (i, name) in DRIVERS.iter().enumerate() {
+                let bit = 1u8 << i;
+                if radios_off & bit != 0 && radios_applied & bit == 0 {
+                    let killed = crate::process::kill(name);
+                    let powered_down = match i {
+                        2 => crate::bt::power(false),
+                        3 => crate::nfc::power(false),
+                        4 => crate::gnss::power(false),
+                        _ => false,
+                    };
+                    crate::flashlog::line(&alloc::format!("radio {} switched off: driver {}, power {}", core::str::from_utf8(name).unwrap_or("?"), if killed { "stopped" } else { "was not running" }, if powered_down { "down" } else { "left" }));
+                } else if radios_off & bit == 0 && radios_applied & bit != 0 {
+                    let mut rep = alloc::vec::Vec::new();
+                    restart(&mut store, name, &mut rep);
+                    crate::flashlog::line(&alloc::format!("radio {} switched on: {}", core::str::from_utf8(name).unwrap_or("?"), core::str::from_utf8(&rep).unwrap_or("").trim_end()));
+                }
+            }
+            radios_applied = radios_off;
+        }
         // Released (a completed departure): restart, so the device comes back at the attest screen with nothing of the identity left.
         if RELEASE_RESET.swap(false, core::sync::atomic::Ordering::AcqRel) {
             crate::flashlog::line("identity released: restarting at the attest screen");

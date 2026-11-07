@@ -1512,6 +1512,10 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
     }
     let (x0, x1) = ((r.x0 as usize) & !15, ((r.x1 as usize + 15) & !15).min(width & !15));
     let mut row = [0u32; 1344];
+    // The home screen's top rows with the status circles over the map (owner, 2026-11-07): the chrome's pixel wherever a circle drew one (the chrome is clear elsewhere), the map's everywhere else. Never while an app is in front: its own publish takes the chrome.
+    // Sixteen pixels at a time (the NEON stage's width): this runs on the publish workers' small stacks too, and a whole row of u64 there (10.7 KiB) overflowed them and crashed the display (2026-11-07).
+    let (top, chrome_on) = unsafe { (CHROME_TOP, CHROME != 1 && (*(&raw const APP)).is_none()) };
+    let mut over = [0u64; 16];
     for k in 0..PHASES {
         if mask >> k & 1 == 0 {
             continue;
@@ -1523,9 +1527,20 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
             unsafe {
                 let thv = core::arch::aarch64::vld1q_u8(th.as_ptr());
                 let src = back.as_ptr().add(y * width);
+                let cover = chrome_on && y < top;
+                let crow = (CHROME as *const u64).add(if cover { y * width } else { 0 });
+                let arow = (CHROME_A as *const u16).add(if cover { y * width } else { 0 });
                 let mut x = x0;
                 while x < x1 {
-                    neon::sixteen_canvas(tabs, src.add(x), row.as_mut_ptr().add(x), thv);
+                    let s = if cover {
+                        for j in 0..16 {
+                            over[j] = chrome_over(*crow.add(x + j), *arow.add(x + j), *src.add(x + j));
+                        }
+                        over.as_ptr()
+                    } else {
+                        src.add(x)
+                    };
+                    neon::sixteen_canvas(tabs, s, row.as_mut_ptr().add(x), thv);
                     x += 16;
                 }
             }
@@ -1708,6 +1723,10 @@ const CLEAR: u64 = 1 << 63;
 /// The corners outside the circle (the system's: the clock now, signal and navigation later): the top `CHROME_TOP` rows then the bottom `CHROME_BOT` rows, 64-bit pixels like a surface. Drawn by `chrome_draw`.
 static mut CHROME: usize = 1;
 static mut CHROME_TOP: usize = 0;
+/// The chrome's coverage, a u16 a pixel beside `CHROME` (Q16: 0 clear, 65535 opaque): the circles' discs and their glow, so the home screen takes them over the map by coverage rather than by replacing pixels (owner, 2026-11-07: "you can glow and opacity in darkness space and it looks good if you do it right"). The chrome's colour is premultiplied by it.
+static mut CHROME_A: usize = 1;
+/// Where op 30 composes the top band (the canvas with the circles over it) when every surface is held: `CHROME_TOP` rows, allocated at the first such capture and kept; 0 until then.
+static mut CAPTURE_BAND: usize = 0;
 static mut CHROME_BOT: usize = 0;
 /// The minute the corners' clock last drew, so it redraws once a minute.
 static mut CHROME_KEY: i64 = -1;
@@ -2462,6 +2481,18 @@ fn measure_text(t: &mut Txt, kind: u16, v: i64) {
     };
 }
 
+/// The status circles' glow: its width as a fraction of the circle's radius (2^-2), and how dark it is at the edge (3/4).
+const GLOW_WIDTH: f32 = 1.0 / (1 << 2) as f32;
+const GLOW_DEPTH: f32 = 0.75;
+
+/// A chrome pixel over the canvas by its coverage `a` (Q16): its premultiplied colour plus what it leaves of the canvas, channel by channel in the working codes (gamma 2: the glow is darkness laid in those codes), the canvas pixel's flags (bits 48-63) kept. No channel carries into the next: the chrome's colours stay under Q14 white and are premultiplied by a coverage no larger than `a`, so colour + canvas × (1 − a) never passes 65535.
+#[inline(always)]
+fn chrome_over(c: u64, a: u16, b: u64) -> u64 {
+    let keep = 65535 - a as u64;
+    let ch = |sh: u32| (((c >> sh) & 0xFFFF) + (((b >> sh) & 0xFFFF) * keep >> 16)) << sh;
+    ch(0) | ch(16) | ch(32) | (b & 0xFFFF << 48)
+}
+
 /// A disc's coverage at signed distance `d` (pixels inside the edge, negative outside): the algebraic sigmoid x/√(1+x²) over about a pixel, C∞ (no clamp, GUI continuity).
 #[inline]
 fn soft(d: f32) -> f32 {
@@ -2481,7 +2512,7 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
     for &m in facts[1..5].iter().chain(&facts[33..81]) {
         mh = (mh.rotate_left(7) ^ m).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
-    let k = ((key / 60) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64;
+    let k = (((key / 60) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64) ^ (ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) as i64) << 40;
     if !force && k == unsafe { CHROME_KEY } {
         return false;
     }
@@ -2489,6 +2520,8 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
     let (rows, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
     let chrome = unsafe { core::slice::from_raw_parts_mut(CHROME as *mut u64, (rows + bot) * width) };
     chrome.fill(0);
+    let cover = unsafe { core::slice::from_raw_parts_mut(CHROME_A as *mut u16, (rows + bot) * width) };
+    cover.fill(0);
     // A screen pixel's place in the chrome: the top rows, then the bottom rows.
     let at = |x: i64, y: i64| -> Option<usize> {
         if x < 0 || x >= width as i64 || y < 0 {
@@ -2539,16 +2572,31 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
             _ => None,
         }
         .and_then(|ri: usize| facts[33 + 8 * ri..41 + 8 * ri].iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::STATE).map(|m| m.1));
+        // Switched off by a tap (preference 15, owner 2026-11-07): grey and darker, no text, until the full redesign of the top.
+        let switched_off = match what {
+            Corner::Cellular => 1u8,
+            Corner::Wifi => 2,
+            Corner::Bluetooth => 4,
+            Corner::Nfc => 8,
+            Corner::Gnss => 16,
+            _ => 0,
+        } & ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) != 0;
         let (ring_c, ink_c) = flavour(what);
-        let ring = if !live {
+        let ring = if switched_off {
+            (RING_OFF * 0.5, RING_OFF * 0.5, RING_OFF * 0.5)
+        } else if !live {
             (RING_OFF, RING_OFF, RING_OFF)
         } else if state == Some(1) {
             (ring_c.0 * core::f32::consts::FRAC_1_SQRT_2, ring_c.1 * core::f32::consts::FRAC_1_SQRT_2, ring_c.2 * core::f32::consts::FRAC_1_SQRT_2)
         } else {
             ring_c
         };
+        let face = if switched_off { FACE * 0.5 } else { FACE };
         let t_disc = now();
-        let (x0, x1, y0, y1) = ((x - r - 2.0) as i64, (x + r + 2.0) as i64, (y - r - 2.0) as i64, (y + r + 2.0) as i64);
+        // The glow: darkness around the disc, falling off as exp(-(d/g)²) from the edge (C∞, no step anywhere), to three widths out.
+        let g = r * GLOW_WIDTH;
+        let reach = r + 3.0 * g + 2.0;
+        let (x0, x1, y0, y1) = ((x - reach) as i64, (x + reach) as i64, (y - reach) as i64, (y + reach) as i64);
         for py in y0..=y1 {
             for px in x0..=x1 {
                 let Some(i) = at(px, py) else { continue };
@@ -2557,12 +2605,21 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
                 // The disc, then the ring over it: the ring is the band within ring_w of the edge.
                 let disc = soft(d);
                 let band = disc - soft(d - ring_w);
-                // Over what is there already, by the disc's own coverage: a neighbour's pixels outside this disc stay as they were.
-                let ch = |sh: u32, ring: f32| ((((chrome[i] >> sh) & 0xFFFF) as f32 * (1.0 - disc) + FACE * (disc - band) + ring * band) as u64) << sh;
+                // The glow: black at GLOW_DEPTH of full by the edge, falling off outside it. It goes UNDER what is drawn already (a neighbour's disc is not darkened by it): premultiplied black adds coverage only where the chrome leaves some, and no colour.
+                let out = if d < 0.0 { d / g } else { 0.0 };
+                let glow = GLOW_DEPTH * libm::expf(-(out * out));
+                let was = cover[i] as f32 * (1.0 / 65535.0);
+                let under = was + (1.0 - was) * glow;
+                // Then the disc OVER it all, by its own coverage: a neighbour's pixels outside this disc stay as they were.
+                let ch = |sh: u32, ring: f32| ((((chrome[i] >> sh) & 0xFFFF) as f32 * (1.0 - disc) + face * (disc - band) + ring * band) as u64) << sh;
                 chrome[i] = ch(0, ring.0) | ch(16, ring.1) | ch(32, ring.2);
+                cover[i] = ((disc + under * (1.0 - disc)) * 65535.0) as u16;
             }
         }
         unsafe { CHROME_US[0] += ferros_sys::us_since(t_disc) };
+        if switched_off {
+            continue;
+        }
         // The radio's measures, as its driver published them (facts 33 + 8 · radio): every one shown as itself, in its unit, a line each; none folded into a level, no bars (owner, 2026-11-03).
         let radio = match what {
             Corner::Cellular => Some(0),
@@ -2833,6 +2890,27 @@ extern "C" fn receive(grants: u64) -> ! {
             ferros_sys::reply(&tok, &[yes as u8]);
             continue;
         }
+        if op == 41 && n >= 5 {
+            // Which status circle is at this point: [x u16][y u16] → the radio's bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GNSS), or G#FF for none or a circle that is not a radio. The map asks it on a tap in the top rows, to switch that radio (preference 15).
+            let (w, h) = unsafe { SCREEN_WH };
+            let (x, y) = (u16::from_le_bytes([msg[1], msg[2]]) as f32 + 0.5, u16::from_le_bytes([msg[3], msg[4]]) as f32 + 0.5);
+            let (circles, cn) = corner_layout(w as usize, h as usize);
+            let mut hit = 0xFFu8;
+            for &(cx, cy, r, what) in &circles[..cn] {
+                if (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r * r {
+                    hit = match what {
+                        Corner::Cellular => 0,
+                        Corner::Wifi => 1,
+                        Corner::Bluetooth => 2,
+                        Corner::Nfc => 3,
+                        Corner::Gnss => 4,
+                        _ => 0xFF,
+                    };
+                }
+            }
+            ferros_sys::reply(&tok, &[hit]);
+            continue;
+        }
         if op == 24 {
             // Answered here, never queued: the wait is the reply (op 24 above). Another client's call waits behind it at most a refresh.
             let seen = FRAME_STARTS.load(Ordering::Acquire);
@@ -3064,6 +3142,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         CHROME_BOT = bot;
         plan_glass(width, height);
         CHROME = alloc::vec![0u64; (top + bot) * width].leak().as_mut_ptr() as usize;
+        CHROME_A = alloc::vec![0u16; (top + bot) * width].leak().as_mut_ptr() as usize;
     }
     ALLOC.mark();
     log.s(b"display: present table (E peak ");
@@ -3738,11 +3817,42 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         out[0] = 1;
                     }
                 }
-                // 30 `capture`: the frame as it is composed for the panel (windows, the corners, the glass) but in working values, before the panel's table and dither, into a surface no window holds; replies its physical address as text, `G#…` (tools/screencap reads it; the reply holds 16 bytes). With no window up the canvas is the screen: replies `canvas`.
+                // 30 `capture`: the frame as it is composed for the panel (windows, the corners, the glass) but in working values, before the panel's table and dither, into a surface no window holds; replies its physical address as text, `G#…` (tools/screencap reads it; the reply holds 16 bytes). On the home screen the canvas with the circles over it; with every surface held, only the band the circles cover (below). `canvas` when there are no circles.
                 Some(30) => {
                     let free = (0..SURFACES).find(|&k| unsafe { (*(&raw const WINS))[k] }.is_none());
                     let text: alloc::string::String = match (unsafe { APP }.is_some(), free) {
-                        (false, _) => "canvas\n".into(),
+                        // The home screen: the canvas with the status circles over it (`chrome_over`, as publish_band lays them), into the free surface, so a screencap is what the glass shows from every screen (owner, 2026-11-07).
+                        (false, Some(k)) => {
+                            let s = surface(k, width, height);
+                            s.copy_from_slice(&pixels[..width * height]);
+                            let top = unsafe { CHROME_TOP };
+                            if unsafe { CHROME } != 1 {
+                                let c = unsafe { core::slice::from_raw_parts(CHROME as *const u64, top * width) };
+                                let a = unsafe { core::slice::from_raw_parts(CHROME_A as *const u16, top * width) };
+                                for i in 0..top * width {
+                                    s[i] = chrome_over(c[i], a[i], s[i]);
+                                }
+                            }
+                            alloc::format!("G#{:X}\n", s.as_ptr() as usize)
+                        }
+                        // Every surface held (the home screen with apps parked behind it): the canvas is read where it is and only its top band, with the circles over it, is composed, into a buffer kept for it; the reply names the band and its rows, `G#<band> G#<rows>` (no newline: a reply holds 16 bytes; the capture process ends the line), and the tool lays the band over the canvas's top.
+                        (false, None) => {
+                            let top = unsafe { CHROME_TOP };
+                            if unsafe { CHROME } == 1 || top == 0 {
+                                "canvas\n".into()
+                            } else {
+                                if unsafe { CAPTURE_BAND } == 0 {
+                                    unsafe { CAPTURE_BAND = alloc::vec![0u64; top * width].leak().as_mut_ptr() as usize };
+                                }
+                                let s = unsafe { core::slice::from_raw_parts_mut(CAPTURE_BAND as *mut u64, top * width) };
+                                let c = unsafe { core::slice::from_raw_parts(CHROME as *const u64, top * width) };
+                                let a = unsafe { core::slice::from_raw_parts(CHROME_A as *const u16, top * width) };
+                                for i in 0..top * width {
+                                    s[i] = chrome_over(c[i], a[i], pixels[i]);
+                                }
+                                alloc::format!("G#{:X} G#{:X}", s.as_ptr() as usize, top)
+                            }
+                        }
                         (true, None) => "no free surface\n".into(),
                         (true, Some(k)) => {
                             let s = surface(k, width, height);
@@ -4022,12 +4132,19 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 // The idle fill republishes every phase within an eighth of a second of the last window op.
                 windows_changed(width, height);
             }
-            if { APP }.is_some() && chrome_draw(width, height, false) {
+            // The status circles: around an app in front, and over the home screen as well, pinned at the top in screen space (owner, 2026-11-07: "staying above everything ... that do not transform with the home screen").
+            if chrome_draw(width, height, false) {
                 let top = draw::Rect { x0: 0, y0: 0, x1: width as i32, y1: CHROME_TOP as i32 };
-                let bottom = draw::Rect { x0: 0, y0: (height - CHROME_BOT) as i32, x1: width as i32, y1: height as i32 };
-                for k in 0..PHASES {
-                    publish_app(top, &tabs, k, width, height);
-                    publish_app(bottom, &tabs, k, width, height);
+                if { APP }.is_some() {
+                    let bottom = draw::Rect { x0: 0, y0: (height - CHROME_BOT) as i32, x1: width as i32, y1: height as i32 };
+                    for k in 0..PHASES {
+                        publish_app(top, &tabs, k, width, height);
+                        publish_app(bottom, &tabs, k, width, height);
+                    }
+                } else {
+                    // The canvas by its address: `pixels` is held by the request handler's closure here.
+                    let canvas = unsafe { core::slice::from_raw_parts(back as *const Px, width * height) };
+                    publish10x4(canvas, width, height, &tabs, (1 << PHASES) - 1, top);
                 }
             }
         }

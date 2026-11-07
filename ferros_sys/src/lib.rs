@@ -76,6 +76,8 @@ pub const PREF_LAYOUT: u64 = 12;
 pub const PREF_UNLOCK_AT_BOOT: u64 = 13;
 /// Preference 14: the UI scale an active app lays its page out by, a signed byte of 64ths of an octave: its layout unit times 2^(s/64), 0 one, -64 a half, 64 twice (a pinch inside an open circle sets it; owner, 2026-11-05).
 pub const PREF_SCALE: u64 = 14;
+/// Preference 15: the radios switched off, a bit each in the facts' order (fact 32: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GNSS); the status circles toggle them (owner, 2026-11-07). The kernel stops a radio's driver while its bit is set and starts it again when it clears.
+pub const PREF_RADIOS_OFF: u64 = 15;
 
 /// The UI scale as set (preference 14): 64ths of an octave, signed; the factor is 2^(s/64).
 pub fn ui_scale() -> i8 {

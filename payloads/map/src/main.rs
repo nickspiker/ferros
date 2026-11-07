@@ -1197,6 +1197,11 @@ impl Map {
                 let facts = ferros_sys::facts();
                 for (k, name) in LINKS.iter().enumerate() {
                     let state = facts.0[33 + 8 * k..41 + 8 * k].iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::STATE).map(|m| m.1);
+                    // Switched off by its status circle (preference 15; USB, the sixth, has no switch): the driver's last word outlives it, so the switch is read first.
+                    if k < 5 && ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) >> k & 1 == 1 {
+                        fact(b, &mut y, name, "switched off");
+                        continue;
+                    }
                     fact(b, &mut y, name, match state {
                         Some(0) => "off",
                         Some(1) => "on, no link",
@@ -1419,6 +1424,21 @@ impl Map {
     /// A tap: one finger or two, at a panel point. Logged with what it did, so a session can be followed from `diag console`.
     fn tap(&mut self, fingers: usize, sx: i64, sy: i64) {
         let before = self.view;
+        // A status circle first (owner, 2026-11-07): they sit over everything at the top, so a one-finger tap on a radio's switches that radio (preference 15) and goes no further. The display knows where they are (op 41).
+        if fingers == 1 && sx >= 0 && sy >= 0 && sy < self.h / 4 {
+            let mut m = [41u8, 0, 0, 0, 0];
+            m[1..3].copy_from_slice(&(sx as u16).to_le_bytes());
+            m[3..5].copy_from_slice(&(sy as u16).to_le_bytes());
+            let mut r = [0xFFu8; 1];
+            if call(self.display, &m, &mut r) == 1 && r[0] < 5 {
+                let off = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) ^ (1 << r[0]);
+                ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_RADIOS_OFF, off);
+                let mut l = Line::new();
+                let _ = write!(l, "map: status circle {} tapped: radios off G#{off:02X}\n", r[0]);
+                console(self.grants, l.as_str().as_bytes());
+                return;
+            }
+        }
         self.tap_inner(fingers, sx, sy);
         let mut l = Line::new();
         let name = |v: View| match v {
