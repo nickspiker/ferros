@@ -477,7 +477,7 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
 fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'static>>> {
     let slots: &[usize] = match name {
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
-        b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103],
+        b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103, 20],
         b"touch" => &[14, 15, 16, 23, 91],
         // The GPU service in its own slot order: 1 registers, 2 memory, 3 the vault scope, 4 the job interrupt, 5 the layer arena, 6 serve gpu.
         b"gpu" => &[105, 106, 107, 108, 68, 104],
