@@ -21,11 +21,14 @@ cargo build -q -p ferros_kernel --target aarch64-unknown-none --release
 mkdir -p target/akita
 cargo run -q -p ferros-mkimg -- boot "$ELF" --pad 16 -o "$IMG"
 echo "== image: $IMG ($(stat -c%s "$IMG") bytes)"
+# Flashed whole, with its own AVB footer (ferros-mkimg avb-footer; docs/BOARDS.md "The hv on akita"): a bare image leaves Google's footer at the partition's end, and once anything has buried the vbmeta it points at, ABL refuses the slot ("invalid vbmeta header"). Google's slot-b boot image sizes the partition and lends its properties (slot a's is the same size).
+cargo build -q -p ferros-mkimg
+target/debug/ferros-mkimg avb-footer --key /mnt/Harbor/Code/keys/avb.vsf --google-boot /mnt/Harbor/tmp/akita-boot-b-2026-11-06/boot_b.img --image "$IMG" -o "${IMG%.img}_part.img"
 
 device_pin akita || exit 1
 S=$ANDROID_SERIAL
 if [ "${1:-}" = --flash-a ]; then
-    fastboot -s "$S" flash boot_a "$IMG"
+    fastboot -s "$S" flash boot_a "${IMG%.img}_part.img"
     fastboot -s "$S" --set-active=a
     fastboot -s "$S" reboot
 else
