@@ -10,7 +10,7 @@ const UFS_BASE: usize = 0x1320_0000;
 /// The log's place in the ferros partition (from 1 GiB in, `ufs_device::part`), and its length in blocks.
 const OFFSET: u32 = 262_144;
 const BLOCKS: u32 = 16_384;
-/// Where the log is on this boot: (LU, first block, blocks), set by `init` (the ferros partition) or `init_in` (akita's `klog` partition, board.rs).
+/// Where the log is on this boot: (LU, first block, blocks), set by `init` (the ferros partition) or `init_in` (another place: never a partition the bootloader owns, such as akita's `klog`, main.rs).
 static mut REGION: (u8, u32, u32) = (0, 0, 0);
 fn lun() -> u8 {
     unsafe { REGION.0 }
@@ -59,7 +59,7 @@ fn write_header(s: &State) -> bool {
     write(base(), &h)
 }
 
-/// Open the log at (LU, first block, blocks): akita's `klog` partition (found in its GPT: board.rs), or the ferros partition's place (`init`). Call once, after the UFS link is up.
+/// Open the log at (LU, first block, blocks): the ferros partition's place (`init`) or another the caller names. Call once, after the UFS link is up.
 pub fn init_in(lun: u8, first: u32, blocks: u32) -> bool {
     unsafe { REGION = (lun, first, blocks) };
     open()

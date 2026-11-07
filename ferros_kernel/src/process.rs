@@ -2303,7 +2303,7 @@ pub fn push_console(bytes: &[u8]) {
     k().console.extend_from_slice(bytes);
     crate::platform::pstore(bytes);
     unlock();
-    // akita: the RAM log does not survive its resets, so the consoles go to the flash log in `klog` too (board.rs).
+    // akita: the RAM log does not survive its resets, so the consoles go to the flash log too (in the ferros partition, board.rs).
     if crate::board::akita() {
         let text = alloc::string::String::from_utf8_lossy(bytes);
         let text = text.trim_end();

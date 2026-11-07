@@ -1968,15 +1968,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     platform::crumb(0xC2);
     let t_vault = platform::cntpct();
     if link_up {
-        // akita: in its `klog` partition (16 MiB on LU 0), found through the GPT, never at husky's fixed place; read back from Android with dd. No klog, no log.
-        let ok = if board::akita() {
-            match partfs::find("klog") {
-                Some(p) => flashlog::init_in(p.lun, p.first as u32, (p.last - p.first + 1) as u32),
-                None => false,
-            }
-        } else {
-            flashlog::init()
-        };
+        // In the ferros partition (1 GiB in, ufs_device::locate), on both boards. Never akita's `klog` again (2026-11-06): that partition is the bootloader's, its first block ABL's own record, which the flash log's header overwrote at every boot; ABL then booted without its persistent record ("unable to get a real pram"), left the display down, and every ferros boot died before its gate, a power cycle not helping. `klog` was put back from the morning's backup.
+        let ok = flashlog::init();
         flashlog::line(&alloc::format!("boot cold, flash log init {ok}"));
     }
     checklist::step(checklist::Step::Log);
