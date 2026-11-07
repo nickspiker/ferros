@@ -1925,7 +1925,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     // UFS: ABL leaves the flash unpowered (cold_ufs::power_on_device); bring the link up, then open the ira-rooted vault on the ferros partition exactly as the handoff path does.
     let t_ufs = platform::cntpct();
-    // akita too since its per-unit partitions are backed up (2026-11-06, /mnt/Harbor/tmp/akita-backup-2026-11-06): the link for its flash log in `klog`. Its vault, write protect and slot mark stay off (board.rs); the gate's Android choice switches it to slot b.
+    // akita too since its per-unit partitions are backed up (2026-11-06, /mnt/Harbor/tmp/akita-backup-2026-11-06): the link for its flash log and its vault, both in its ferros partition. Write protect stays off there, and its slot is marked only through the hv's gate (below).
     let link_up = cold_ufs::bring_up();
     checklist::step(checklist::Step::Disk);
     board::probe(42);
@@ -1937,9 +1937,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         platform::pstore(if ufs_device::locate() { b"ferros: the ferros partition found\n" as &[u8] } else { b"ferros: NO ferros partition\n" });
     }
     // The gate chose Android: the moment the disk answers (set-active needs devinfo and the boot LU attribute, nothing of the vault) — slot a active, then a plain reset; the bootloader boots slot a, whose hv gate takes the one-shot marker and goes to Android. The way back is a reboot: slot a's gate asks again (1 s on dev builds) and boots the ferros packed into it (tools/husky-cold.sh keeps that copy current). Android cannot boot from slot b's own partitions (product_b is empty), which is why the choice is a slot switch and not a chainload.
-    // akita has no hv and keeps Android on slot b, untouched (ferros on slot a, tools/akita-boot.sh): the choice is slot b active, then the reset. With no gate in front of Android there, the way back to ferros is fastboot (`--set-active=a`, or akita-boot.sh). Its devinfo has husky's layout (header, slot words at G#30, the flags read back as husky's measured meanings after a set-active to a: a G#0401, b G#0A02; 2026-11-06).
+    // akita keeps Android on slot b, and since 2026-11-06 the hv there (tools/akita-hv.sh, as husky's slot a): the choice is ANDROID_ONCE for the hv's gate, slot b active (a bare ferros on slot a hands over the slot as well), then the reset. Its devinfo has husky's layout (header, slot words at G#30, the flags read back as husky's measured meanings after a set-active to a: a G#0401, b G#0A02; 2026-11-06).
     if gate_choice == ready::Choice::Android && link_up && board::akita() {
-        // Slot b carries the hv now (tools/akita-hv.sh, as husky's slot a does): its gate takes this word and goes to Android once, as on husky. With no hv there, nothing reads it.
+        // The hv's gate takes this word and goes to Android once, as on husky; a bare ferros on slot a has no gate to read it, and slot b's own does.
         unsafe {
             let p = 0xFD60_0FF8usize as *mut u64;
             core::ptr::write_volatile(p, 0x414E_4452_4F49_4431);
@@ -1996,7 +1996,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     }
 
     // The flash's power-on write protect, armed now that the link is up (BOOT.md "Dual Boot", owner's yes 2026-10-17): the bootloader's own LUs become read-only until the next reset. The bootloader does not arm it itself; fastboot runs before anything could, so flashing is untouched. Reported in DIAG as UFS_POWER_ON_WP (1 armed, 2 refused, 0 no link).
-    // Not on akita: with no hv there it would hold the bootloader LUs read-only across the warm reset into fastboot, and flashing ferros there is how akita is worked on.
+    // Not on akita: it would hold the bootloader LUs read-only across the warm reset into fastboot, and flashing is how akita is worked on.
     let ufs_wp = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() && !board::akita() {
         let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
         // As the boot found it: whether the flag survived the reset that brought us here (a warm reset may keep it; DIAG UFS_POWER_ON_WP_BEFORE: 0/1, 2 unreadable).
