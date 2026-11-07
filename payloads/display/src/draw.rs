@@ -201,7 +201,7 @@ fn log2_q16(q: u64) -> i64 {
     (((63 - lz) as i64) << 16) + m + ((m * (65536 - m) >> 16) * 89 >> 8)
 }
 
-/// The glow, falling off in log distance (owner, 2026-10-24: no divide, no table): down by the same step every octave of q = d² − r² (the squared distance past the edge), from full `peak` to exactly zero over 2^`oct_log2` octaves — no floor, no tail cut — and reaching 1/`frac` of the radius past the edge, whatever the size (owner: smaller circle, thinner glow; the glow is part of the circle's shape at every zoom). At d = r(1 + 1/frac), q = r²·(2·frac + 1)/frac², which fixes where it ends; full light holds to that over 2^(2^oct_log2). Added to the gamma-2 values, into the room each pixel has left (255 − alpha), so a circle's opaque interior takes nothing and needs no test (the linear-light try looked worse, 2026-10-24).
+/// The glow, falling off in log distance (owner, 2026-10-24: no divide, no table): down by the same step every octave of q = d² − r² (the squared distance past the edge), from full `peak` to exactly zero over 2^`oct_log2` octaves — no floor, no tail cut — and reaching 1/`frac` of the radius past the edge, whatever the size (owner: smaller circle, thinner glow; the glow is part of the circle's shape at every zoom). At d = r(1 + 1/frac), q = r²·(2·frac + 1)/frac², which fixes where it ends; full light holds to that over 2^(2^oct_log2). A layer of the glow's colour at α = its intensity, put under what is there (`under`, gamma-2 values), so a circle's opaque interior takes nothing and needs no test (the linear-light try looked worse, 2026-10-24).
 pub fn glow_log(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32, peak: u32, frac: i64, oct_log2: u32) -> Rect {
     if r < 128 || peak == 0 {
         return Rect::EMPTY;
@@ -214,7 +214,6 @@ pub fn glow_log(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r:
     let l0 = log2_q16(q0 as u64);
     let span = 1i64 << (16 + oct_log2);
     let reach = r + r / frac + 256;
-    let (cr, cg, cb) = (wide8(colour >> 16) as i64, wide8(colour >> 8) as i64, wide8(colour) as i64);
     let peak = peak as i64;
     spans(cx, cy, reach, |y, xo0, xo1, _, _| {
         if y < by0 || y >= by1 {
@@ -233,15 +232,9 @@ pub fn glow_log(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r:
             let t = (log2_q16(q as u64) - l0).clamp(0, span);
             // The intensity in 2⁻⁸ steps of `peak`'s (16 bits, as the canvas): whole steps of 1/255 banded the glows' long gradients.
             let i = (peak << 8) * (span - t) >> (16 + oct_log2);
+            // The glow is a layer of its own colour at α = its intensity (i in 2⁻⁸ steps of 255, at most peak · 2⁸ ≤ G#FF00), under what is there (owner, 2026-11-07, option 3): over black the light is what the additive glow gave, overlapping glows stack as 1 − (1 − a)(1 − b) and never pass white, and the pixel carries the glow's opacity, so whatever goes under it later (a wallpaper) shows in exactly the room it leaves.
             let p = &mut px[rowb + x as usize];
-            let room = 0xFFFF - (*p >> 48) as i64;
-            // Added into the room the pixel has left, held at white (the glow does not reach above it).
-            // WHY/PROOF the `min`: it is the look (glows stack additively up to white and no further; a channel already past white gains nothing), and it is also the only thing that keeps the sum in its 16-bit field. All in i64, no float: c ≤ 16384, i ≤ peak · 2⁸ with peak ≤ G#FF (the themes' `glow_peak`), room ≤ G#FFFF, so the product is under 2⁴⁶ and the gain under 16384 · peak / 255 ≤ 16384; `have` + gain alone reaches G#13FFF on a canvas pixel near 4.0 and would carry into the next channel (or α) after the shift, but the result is at most max(have, 16384) ≤ G#FFFF, so it never does.
-            let add = |c: i64, sh: u32| -> u64 {
-                let have = (*p >> sh & 0xFFFF) as i64;
-                ((have + c * i * room / (255 * 256 * 0xFFFF)).min(have.max(16384)) as u64) << sh
-            };
-            *p = (*p & ALPHA) | add(cr, 0) | add(cg, 16) | add(cb, 32);
+            *p = under(*p, at_cover16(colour, (i * 0xFFFF / (255 << 8)) as u32));
             true
         };
         let mut left_stop = x1 + 1;
@@ -274,7 +267,6 @@ pub fn glow(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
     // The farthest q that is still at or above the floor, and a radius that surely contains it: q ≥ 2r·e, so e ≤ q / 2r.
     let q_max = num / floor.max(1) as i64;
     let reach = r + q_max / (2 * r) + 256;
-    let (cr, cg, cb) = (wide8(colour >> 16) as i64, wide8(colour >> 8) as i64, wide8(colour) as i64);
     spans(cx, cy, reach, |y, xo0, xo1, _, _| {
         if y < by0 || y >= by1 {
             return;
@@ -294,20 +286,10 @@ pub fn glow(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
                 return true;
             }
             let p = &mut px[rowb + x as usize];
-            let a = (*p >> 48) as i64;
-            if a == 0xFFFF {
-                return true;
-            }
-            // The intensity in 2⁻⁸ steps of `peak`'s (16 bits, as the canvas): whole steps of 1/255 banded the glows' long gradients.
+            // The intensity in 2⁻⁸ steps of `peak`'s (16 bits, as the canvas): whole steps of 1/255 banded the glows' long gradients. The `min` is the falloff's own peak: 1/distance grows without bound toward the edge and the glow holds its peak there.
             let i = ((num << 8) / q).min((peak as i64) << 8);
-            // Into the room the pixel has left (opaque − alpha), added per channel and held at white; alpha untouched.
-            // WHY/PROOF the `min`: as in `glow_log`, the hold at white is the look and the field's bound at once (i ≤ peak · 2⁸ here by its own `min`, so the gain is at most 16384 and the result at most max(have, 16384) ≤ G#FFFF: no carry into the next channel).
-            let room = 0xFFFF - a;
-            let add = |c: i64, sh: u32| -> u64 {
-                let have = (*p >> sh & 0xFFFF) as i64;
-                ((have + c * i * room / (255 * 256 * 0xFFFF)).min(have.max(16384)) as u64) << sh
-            };
-            *p = (*p & ALPHA) | add(cr, 0) | add(cg, 16) | add(cb, 32);
+            // A layer of its own colour at α = its intensity, under what is there, as in `glow_log` (owner, 2026-11-07, option 3).
+            *p = under(*p, at_cover16(colour, (i * 0xFFFF / (255 << 8)) as u32));
             true
         };
         // From each end of the row inward to the circle's edge: the interior is never visited (zoomed in, it is most of the screen, and visiting it pixel by pixel was the lag, 2026-10-23).
