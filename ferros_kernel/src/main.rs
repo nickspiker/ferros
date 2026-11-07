@@ -2019,8 +2019,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     platform::mark_trail(0x17);
 
     // Tell ABL this slot boots (devinfo "successful"), so its retry countdown stops and a power cycle lands here again. Only on a real ABL boot (x0 = DTB pointer, not a RELOAD tag) with the vault verified: a build that dies before this point still falls back to the other slot.
-    // Not on akita: its slot a stays unmarked, so ABL falls back to slot b's Android (the way out) when ferros there does not boot.
-    let mark = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() && !board::akita() {
+    // On akita only through the hv's gate, which shares Android's slot (b) as husky's does: there an unmarked slot loses a retry at every ferros boot, and ABL retires Android's slot with it. A bare ferros (tools/akita-boot.sh, slot a) stays unmarked, so ABL falls back to slot b's Android (the way out) when it does not boot.
+    let through_hv = ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed) != 0;
+    let mark = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() && (!board::akita() || through_hv) {
         let m = slot::mark_booted_slot(dtb_addr);
         if m.result == slot::MARKED || m.result == slot::ALREADY {
             checklist::mark(checklist::Item::Slot);
