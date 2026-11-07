@@ -1,0 +1,12 @@
+# A host tool, kept out of the ferros workspace like screencap: it reads a Rec.2020 / Rec.1886 TIFF and writes a VSF visual for a wallpaper, at the owner's hand.
+[package]
+name = "wallpaper"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+vsf = { path = "../../../vsf" }
+# Pure Rust TIFF decoding, read-only ingest; uncompressed, LZW and PackBits only (no JPEG, deflate or fax codecs pulled in).
+tiff = { version = "0.11", default-features = false, features = ["lzw"] }
