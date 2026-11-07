@@ -106,8 +106,8 @@ mod cold_ufs;
 // Cold boot from ABL: mark the booted A/B slot successful in devinfo, so ABL keeps booting it.
 #[cfg(all(feature = "pixel8", not(shim_handoff)))]
 mod slot;
-// Cold boot: the HSI2 S2MPU fence (what UFS and the WiFi chip may DMA into).
-#[cfg(all(feature = "pixel8", not(shim_handoff)))]
+// Cold boot: the HSI2 S2MPU fence (what UFS and the WiFi chip may DMA into). Compiled into the handoff build too: the service and the drivers it shares with the cold boot call it (2026-11-06: the shim build had stopped compiling).
+#[cfg(feature = "pixel8")]
 mod s2mpu;
 // The static cache map: one identity table at boot so ferros's own memory is cacheable (KERNEL.md, Execution Model).
 #[cfg(feature = "pixel8")]
@@ -130,8 +130,8 @@ mod oracle;
 // Processes: EL0 in an arc, capabilities, the syscall boundary.
 #[cfg(feature = "pixel8")]
 mod process;
-// The "Ready?" gate: the boot proper starts at the power key's press (BOOT.md).
-#[cfg(all(feature = "pixel8", not(shim_handoff)))]
+// The "Ready?" gate: the boot proper starts at the power key's press (BOOT.md). Compiled into the handoff build too, for the gate telemetry and marks the shared service reads.
+#[cfg(feature = "pixel8")]
 mod ready;
 // Bring-up checklist on the panel: red until done, green once done.
 #[cfg(feature = "pixel8")]
