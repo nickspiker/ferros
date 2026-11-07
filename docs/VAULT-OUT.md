@@ -64,6 +64,35 @@ The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by t
 4. Migration of the existing vault, on first run.
 5. First use: the person's wallpaper (below), stored once at bind.
 
+## Built so far
+
+- **`ferros_store` (2026-11-07):** the vault's values of any size over manifestus, no_std, host-tested.
+  - A value is a head (a VSF document: length, value id, or the value inline when it fits one piece) and 64 KiB pieces. Each is sealed on its own under the domain's sealing key, with its own address as associated data.
+  - Ranged reads open only the pieces they touch. Writes stream a piece at a time. Rewrites are atomic (a fresh id; the head moves in the same commit as the last piece).
+  - The last head and piece opened are kept, keyed by address and sealing key.
+  - Each domain keeps its own books under names callers cannot use: its list of names, and a pending list that `sweep` clears after an interrupted write.
+  - Every call takes the domain's keys; nothing derives one.
+
+## Found while mapping the kernel's vault (2026-11-07)
+
+- **The layout is manifestus**, not the `vault/` crate (`ferros_vault`): the kernel uses `ferros_vault` only for `AnchorKey`. `ferros_vault/` at the repo root is not a crate at all (no Cargo.toml; a host-file prototype).
+- **The UFS link is shared:** the flash log, the ira (devinfo on LUN 3), slot marking, partfs (the modem's partition grants), the write-protect flag and the `diag ufs` tools all use it, under the kernel lock. The vault process cannot own the link outright until those have somewhere to go.
+- **The kernel reads the vault itself:** `init`, `sealed`, `device`, `boot`, `genesis`, `android.allowed`, `home.off`, `aoc.fw.*`, `cam.*`. It needs a client channel of its own to the vault process.
+- **`vault_probe` stays in the kernel:** it derives the ira, puts it in the key registers and sets the oracle's system secret before anything is stored.
+- **Two grant bugs:** a display restarted with `diag restart` gets no `map.` scope (`service.rs` `shell_grants` lacks it; init's list has it), and `std/probe` asks for a `photon` scope that does not exist.
+
+## The interfaces still to settle (proposal, for the owner)
+
+1. **Blocks, first cut:** the kernel keeps its UFS driver for now and grants the vault process a block window: its two mirror regions only, 4 KiB reads and writes by block number through a new call. The kernel moves blocks; it does not hold values, parse or seal. UFS moves out entirely later, with a block service for the flash log, the ira, slots and partfs. This defers part of decision 0 ("the kernel keeps no disk code") and needs the owner's word.
+2. **Keys:** a new call, open only to the vault process. Given the call token of a request it is serving, the kernel derives and returns that request's domain keys:
+   - the kist's own domain: through the oracle, from the caller's verified developer key and option, under the device or the person's key;
+   - or the common area's keys, if the caller holds the grant for that name.
+   It refuses for a token the vault is not serving, and for the person's domains while no one is unlocked.
+3. **Stamping:** `recv` already returns a reply token. The kernel adds to it what the caller is (its kist identity, and which common names it holds), so the vault never takes a caller's word for who it is.
+4. **The protocol:** the vault serves the operations processes use today (`ferros_sys::store_*`: get and get at an offset, set in pieces, delete, list names, the address-named entries kete uses), as op-byte messages like the display's. A scope's prefix becomes a domain, so existing callers keep their calls and change only whom they call.
+5. **The kernel's own channel:** a client endpoint the kernel alone calls, at boot and in the service loop, for the names it reads today, served from the device domain.
+6. **Migration:** the vault process opens the existing manifestus vault. Its first run reads each old entry through the kernel's old sealing (the kernel issues the old class keys once, for this) and writes it again into its domain in pieces.
+
 ## First use
 
 The person's wallpaper (owner, 2026-11-07: "we don't want to be recomputing the wallpaper every attest"): made once, when the device binds to their fleet (on the GPU once its kernel exists; the display's four wallpaper threads until then, 5.1 s drawn and 33.4 s refined on the Pro), and stored in their space for that device (owner, 2026-11-07: per device, since each has its own size and aspect; the MacBook's is not the Pro's), a VSF visual of the screen's size (24 MB at 16 bits on the Pro). At every attest the display reads it in bands (`wall_own`); nothing is drawn again. The person changes it from settings: their own picture (tools/wallpaper converts one), or a fresh one made from a new seed.
