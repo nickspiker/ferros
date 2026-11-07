@@ -1506,7 +1506,7 @@ fn publish10x4(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask:
     fps_dot(mask, width, height);
 }
 
-/// The home screen's rows into the phases `mask` names: each row front to back, the glass's edge, then the console (its rows only), then the canvas. A 16-pixel step that neither touches is the canvas straight through the NEON present; one that does is composed first (`edge_over`, `under_bar`) and goes through the app's present, which leaves the mask's pixels undithered.
+/// The home screen's rows into the phases `mask` names, each pixel front to back (`glass_front`): the glass's edge, then the console (its rows only), then the canvas. A 16-pixel step that touches neither is the canvas straight through the NEON present; one that does is composed first and goes through the app's present, which leaves the mask's own pixels undithered.
 fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask: u32, r: draw::Rect) {
     if r.is_empty() {
         return;
@@ -1528,11 +1528,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
             let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), rows[y + 1].first as usize) };
             let row_px = &plan[g.first as usize..];
             let edge_px = &row_px[row_px.iter().position(|e| e.1 == SHAPE_EDGE).unwrap_or(row_px.len())..];
-            let (mut el, mut er) = (g.mask_l as usize, g.mask_r as usize);
-            for e in edge_px {
-                let x = e.0 as usize;
-                if x < width / 2 { el = el.max(x + 1) } else { er = er.min(x) }
-            }
+            let (el, er) = edge_cols(g, edge_px, width);
             let (cl, cr) = if y < top { (bar_span[y].0 as usize, bar_span[y].1 as usize) } else { (0, 0) };
             let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
             let t_n = now();
@@ -1542,16 +1538,14 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                 let mut x = x0;
                 while x < x1 {
                     if x < el || x + 16 > er || (x + 16 > cl && x < cr) {
-                        let mut over = [0u64; 16];
+                        let mut front = [0u64; 16];
                         for j in 0..16 {
                             let xx = x + j;
-                            let mut p = *(src.add(xx) as *const u64) & ((1 << 48) - 1);
-                            if xx >= cl && xx < cr {
-                                p = under_bar(bar_w[y * width + xx], p);
-                            }
-                            over[j] = edge_over(p, xx, g, edge_px, line);
+                            let c = if xx >= cl && xx < cr { bar_w[y * width + xx] } else { CLEAR };
+                            // The canvas word's fourth lane is its alpha, not flags: off, so its pixels keep their dither.
+                            front[j] = glass_front(xx, g, edge_px, line, c, *(src.add(xx) as *const u64) & ((1 << 48) - 1));
                         }
-                        neon::sixteen_app(tabs, over.as_ptr(), row.as_mut_ptr().add(x), neon::thresholds_at(thv, x));
+                        neon::sixteen_app(tabs, front.as_ptr(), row.as_mut_ptr().add(x), neon::thresholds_at(thv, x));
                     } else {
                         neon::sixteen_canvas(tabs, src.add(x), row.as_mut_ptr().add(x), thv);
                     }
@@ -2067,29 +2061,53 @@ fn q16(v: u16) -> u64 {
     if v == 0xFFFF { 65536 } else { v as u64 }
 }
 
-/// The glass's edge over one pixel of row `rows[y]` (the plan, `plan_glass`): outside the masked columns the mask colour, and the row's listed edge pixels (`SHAPE_EDGE`) their hairline at its alpha then the mask by their coverage's complement, both in light (owner, 2026-11-02: "as long as the edge renders gamma proper-ish and trims it to black on production"). The edge is in front of everything: the console, the windows, the home screen. The edge's hairline is the orange on development builds and on release builds the mask colour itself, as Photon's release build on Android draws its hairline black so the glass's corner is black to the curve.
+/// A premultiplied working pixel's channels scaled by `q` (Q16, 65536 whole); the product fits u32 (65535 × 65536 < 2³²).
 #[inline]
-fn edge_over(p: u64, x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], line: u64) -> u64 {
+fn scale_q16(p: u64, q: u64) -> u64 {
+    let ch = |sh: u32| ((p >> sh & 0xFFFF) * q >> 16) << sh;
+    ch(0) | ch(16) | ch(32)
+}
+
+/// fluor's under on premultiplied working values: the composite so far `acc` with transparency `t` (Q14) gains the layer's channels by what is still transparent, and the transparency is the product with the layer's own `lt`. The layers sum to at most one whole, so no channel passes its field.
+#[inline]
+fn under_pm(acc: u64, t: u64, layer: u64, lt: u64) -> (u64, u64) {
+    let ch = |sh: u32| ((acc >> sh & 0xFFFF) + ((layer >> sh & 0xFFFF) * t >> 14)) << sh;
+    (ch(0) | ch(16) | ch(32), t * lt >> 14)
+}
+
+/// The columns of a row the glass's edge touches: everything left of `el` and from `er` on (its masked columns and its listed edge pixels).
+fn edge_cols(g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], width: usize) -> (usize, usize) {
+    let (mut el, mut er) = (g.mask_l as usize, g.mask_r as usize);
+    for e in edge_px {
+        let x = e.0 as usize;
+        if x < width / 2 { el = el.max(x + 1) } else { er = er.min(x) }
+    }
+    (el, er)
+}
+
+/// What the glass shows at column `x` of a row (`g`, its listed edge pixels `edge_px`), front to back, each layer under the ones before (`under_pm`): the glass's edge first, then the console's decoded pixel `c` (`CLEAR` where it has none), then the scene `p` (working values, opaque) last. Outside the masked columns the mask is opaque, so nothing behind it is read. On a listed edge pixel the mask is in front by its coverage's complement, and the edge's hairline under it: the orange on development builds, the mask colour itself on release builds (as Photon's release build on Android draws its hairline black, so the glass's corner is black to the curve).
+#[inline]
+fn glass_front(x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], line: u64, c: u64, p: u64) -> u64 {
     if x < g.mask_l as usize || x >= g.mask_r as usize {
         return EDGE_MASK;
     }
-    let edge_line = if DEV { line } else { EDGE_MASK };
-    match edge_px.iter().find(|e| e.0 as usize == x) {
-        Some(&(_, _, c, h)) => mix_light(EDGE_MASK, mix_light(p, edge_line, q16(h)), q16(c)),
-        None => p,
-    }
-}
-
-/// The console over a scene pixel `p` (a working value taken as opaque; its flag bits above 48 are not light): the console's decoded pixel `c` in front, the scene folded under it by fluor's under on working values (`fold`). Where the console is clear, the scene as it was.
-#[inline]
-fn under_bar(c: u64, p: u64) -> u64 {
-    if c >> 63 != 0 {
+    let edge = edge_px.iter().find(|e| e.0 as usize == x);
+    // Nothing in front here: the pixel as it came, its flag bits (no dither) kept.
+    if edge.is_none() && c >> 63 != 0 {
         return p;
     }
-    let (acc, _) = fold(c, trans(c), p & ((1 << 48) - 1), 0);
-    acc & !(0x7FFF << 49)
+    let (mut acc, mut t) = (0u64, 16384u64);
+    if let Some(&(_, _, cov, h)) = edge {
+        acc = scale_q16(EDGE_MASK, 65536 - q16(cov));
+        t = q16(cov) >> 2;
+        let edge_line = if DEV { line } else { EDGE_MASK };
+        (acc, t) = under_pm(acc, t, scale_q16(edge_line, q16(h)), 16384 - (q16(h) >> 2));
+    }
+    if c >> 63 == 0 {
+        (acc, t) = under_pm(acc, t, c & ((1 << 48) - 1), trans(c));
+    }
+    under_pm(acc, t, p & ((1 << 48) - 1), 0).0
 }
-
 /// The windows into phase `k` over `r` (screen coordinates): each row composed frontmost first (a pixel comes from the first window that covers it; nothing behind the windows but black), cut to the circle with its edge antialiased, the corners from the chrome; then each pixel's R, G, B (bits 0-15, 16-31, 32-47, working values: gamma 2, white = Q14) through the one table, E's gains and the dither, bit 48 set = no dither for that pixel.
 fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: usize) {
     let r = r.clip(width, height);
@@ -2187,27 +2205,15 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                     // The circle: coverage first (the content over the chrome, in light), the hairline over both sides after (on the codes, as before the plan: a pixel centred on the radius carries the whole line, a straddling pair its profile on each side).
                     px[x] = mix_code(mix_light(crow[x], p, q16(c)), line, q16(h));
                 }
-                // The console in front of the windows, the circle and its hairline; only the glass's edge is in front of it.
-                if y < top {
-                    let (l, rr) = bar_span[y];
-                    for x in (l as usize).max(xa)..(rr as usize).min(xb) {
-                        px[x] = under_bar(bar_w[y * width + x], px[x]);
+                // Then, front to back over what the windows and the circle made: the glass's edge, the console, and that pixel last (`glass_front`), on the columns either touches.
+                let edge_px = &row_px[split..];
+                let (el, er) = edge_cols(g, edge_px, width);
+                let (bl, br) = if y < top { (bar_span[y].0 as usize, bar_span[y].1 as usize) } else { (0, 0) };
+                for x in xa..xb {
+                    if x < el || x >= er || (x >= bl && x < br) {
+                        let c = if x >= bl && x < br { bar_w[y * width + x] } else { CLEAR };
+                        px[x] = glass_front(x, g, edge_px, line, c, px[x]);
                     }
-                }
-                for x in xa..xb.min(ml) {
-                    px[x] = EDGE_MASK;
-                }
-                for x in xa.max(mr)..xb {
-                    px[x] = EDGE_MASK;
-                }
-                for &(x, _, c, h) in &row_px[split..] {
-                    let x = x as usize;
-                    if x < xa || x >= xb {
-                        continue;
-                    }
-                    let p = px[x];
-                    // The edge: both mixes in light (owner, 2026-11-02: "as long as the edge renders gamma proper-ish and trims it to black on production"); on a production build the hairline is the mask's black, so the two pixels are one coverage ramp of the content toward black.
-                    px[x] = mix_light(EDGE_MASK, mix_light(p, if DEV { line } else { EDGE_MASK }, q16(h)), q16(c));
                 }
             }
         }
@@ -3981,11 +3987,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                                 let edge_px = &row_px[row_px.iter().position(|e| e.1 == SHAPE_EDGE).unwrap_or(row_px.len())..];
                                 let (cl, cr) = if y < top { (bar_span[y].0 as usize, bar_span[y].1 as usize) } else { (0, 0) };
                                 for x in 0..width {
-                                    let mut p = pixels[y * width + x] & ((1 << 48) - 1);
-                                    if x >= cl && x < cr {
-                                        p = under_bar(bar_w[y * width + x], p);
-                                    }
-                                    s[y * width + x] = edge_over(p, x, g, edge_px, line);
+                                    let c = if x >= cl && x < cr { bar_w[y * width + x] } else { CLEAR };
+                                    s[y * width + x] = glass_front(x, g, edge_px, line, c, pixels[y * width + x] & ((1 << 48) - 1));
                                 }
                             }
                             alloc::format!("G#{:X}\n", s.as_ptr() as usize)
