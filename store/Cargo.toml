@@ -1,0 +1,12 @@
+[package]
+name = "ferros_store"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# The vault's values of any size (docs/VAULT-OUT.md): a head and its pieces, each sealed on its own, over manifestus. no_std + alloc, for the vault process; host-tested.
+[dependencies]
+manifestus = { path = "../../manifestus", default-features = false }
+vsf = { path = "../../vsf", default-features = false }
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }

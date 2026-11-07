@@ -12,6 +12,7 @@ members = [
     "ferros_dsi",
     "ferros_hal_m1",
     "vault",
+    "store",
     "ferros_ledger",
     "ferros_pt",
     "ferros_heap",
