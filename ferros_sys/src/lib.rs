@@ -48,6 +48,7 @@ pub mod nr {
     pub const STATUS: u64 = 27;
     pub const PET: u64 = 28;
     pub const BLOCK: u64 = 29;
+    pub const VAULT: u64 = 30;
 }
 /// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
 pub const CORES_WORKERS: u64 = 0x00F0;
@@ -297,6 +298,21 @@ pub fn block_read(cap: u64, at: u64, buf: &mut [u8]) -> u64 {
 /// `block_read`'s other half: `buf.len() / 4096` blocks written from `buf` at block `at` of the window.
 pub fn block_write(cap: u64, at: u64, buf: &[u8]) -> u64 {
     svc(nr::BLOCK, cap, 1 | ((buf.len() as u64 >> 12) & 0xFF) << 8, at, off(buf.as_ptr()), 0)
+}
+
+/// The vault process's own call (a Vault capability; VAULT-OUT.md, migration): the `skip`-th entry of the kernel's vault still to move into `buf`, as [class: 1 the person's][the domain's address and sealing keys][the scope prefix's length][the full name]. Its length, NOTHING when none is left, ERR.
+pub fn vault_next(cap: u64, skip: u64, buf: &mut [u8]) -> u64 {
+    svc(nr::VAULT, cap, (buf.len() as u64) << 8, skip, 0, off(buf.as_mut_ptr()))
+}
+
+/// An old entry's value from `offset` into `buf`: its whole length, NOTHING if it is gone, ERR.
+pub fn vault_read(cap: u64, name: &[u8], offset: u64, buf: &mut [u8]) -> u64 {
+    svc(nr::VAULT, cap, 1 | (buf.len() as u64) << 8 | offset << 32, off(name.as_ptr()), name.len() as u64, off(buf.as_mut_ptr()))
+}
+
+/// An old entry written and committed in its domain: removed from the kernel's vault. 0, NOTHING if it was not there, ERR.
+pub fn vault_done(cap: u64, name: &[u8]) -> u64 {
+    svc(nr::VAULT, cap, 2, off(name.as_ptr()), name.len() as u64, 0)
 }
 /// Read part of a value larger than one transfer: `buf.len()` bytes (at most 4096) from `offset` of the value under `key`. Returns the value's whole length (the kernel keeps the value between such reads, so walking a large one costs one vault read).
 pub fn store_get_at(cap: u64, key: &[u8], offset: usize, buf: &mut [u8]) -> Option<usize> {

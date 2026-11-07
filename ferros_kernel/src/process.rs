@@ -316,6 +316,8 @@ pub enum Object {
     Sensors,
     /// Served by the kernel: a window of 4 KiB blocks on the ferros partition (index into `WINDOWS`), read and written by block number within it (`SYS_BLOCK`): the vault process's disk (VAULT-OUT.md).
     Blocks(usize),
+    /// Served by the kernel: the vault process's own call (`SYS_VAULT`): the old entries of the kernel's vault, to move into its domains (VAULT-OUT.md, migration). With it, and only with it, a spawn may serve the `vault` endpoint.
+    Vault,
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -358,6 +360,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Pt => (15, 0),
         Object::Sensors => (16, 0),
         Object::Blocks(i) => (17, i as u64),
+        Object::Vault => (18, 0),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -770,6 +773,8 @@ const SYS_PET: u64 = 28;
 const SYS_BLOCK: u64 = 29;
 /// The most blocks one `SYS_BLOCK` moves.
 const BLOCK_MAX: u64 = 1 << 4;
+/// vault(cap, op, x2, x3, buf): the vault process's own call (`Object::Vault`), moving the kernel's vault's old entries into its domains (VAULT-OUT.md, migration); x1 bits 0-7 the op, 8-31 the buffer's length, 32-63 an offset. Op 0: the x2-th entry still to move (a skip past ones that would not move) into `buf` as [class: 1 the person's][the domain's address and sealing keys][the scope prefix's length][the full name] → its length, NOTHING when none is left. Op 1: the value of the entry named at x2/x3, from the offset → its whole length. Op 2: that entry moved, removed from the kernel's vault → 0, NOTHING if it was not there. ERR otherwise.
+const SYS_VAULT: u64 = 30;
 const SYS_LAST: u64 = 22;
 
 /// A named interrupt line a spawn can grant (`bridge spawn --irq NAME`): the GIC INTID (SPI + 32). Enabled and routed to the kernel's core when granted; `.Lirq` (main.rs) masks a line that fires and marks it pending; the waiting thread handles the device and acks. The kernel's own lines (the keys, the slice timer) are not here.
@@ -1117,6 +1122,8 @@ pub static STORES: &[StoreScope] = &[
     StoreScope { name: "aoc", prefix: "aoc." },
     // The GPU driver's (payloads/gpu): the CSF firmware (`gpu.fw`, mali_csffw-r52p0.bin from the device's own vendor image, Arm's: the vault and Harbor, never the repo).
     StoreScope { name: "gpu", prefix: "gpu." },
+    // The vault process's proof (payloads/vaulttest): scratch, nothing kept.
+    StoreScope { name: "test", prefix: "test." },
 ];
 /// The vault behind `SYS_STORE`, registered by whoever owns it (service.rs): (full key, None = get / Some(value) = set) -> Ok(the value for a get, None if absent) or Err.
 pub static mut STORE: Option<fn(&str, Option<&[u8]>) -> Result<Option<Vec<u8>>, ()>> = None;
@@ -1142,6 +1149,245 @@ static mut STORE_STAGE: Option<(Vec<u8>, Vec<u8>)> = None;
 static mut STORE_CACHE: Option<(Vec<u8>, Vec<u8>)> = None;
 /// The largest value `SYS_STORE` moves either way.
 pub const STORE_MAX: usize = 4096;
+
+/// The vault process's endpoint (VAULT-OUT.md, step 3). While a process receives on it, every `SYS_STORE` call is forwarded there (`store_forward`), stamped by the kernel with the domain keys of the caller's scope; while none does, the kernel's own vault answers as before. Nothing may call it directly (a message on it is the kernel's), and only a spawn holding the vault right (`Grant::Vault`) may serve it.
+const VAULT_EP: &[u8] = b"vault";
+/// Names under a scope that stay in the kernel's vault because the kernel reads them itself (aoc.rs: the AoC firmware): never forwarded, never migrated.
+const KERNEL_HELD: [&str; 1] = ["aoc.fw."];
+/// The domain bases, registered by the vault's owner (service.rs): (the identity's?) -> the class's base key, None while that class is locked.
+pub static mut DOMAIN_BASE: Option<fn(bool) -> Option<[u8; 32]>> = None;
+const DOMAIN_ADDR_CONTEXT: &str = "ferros 2026-11-07 vault domain address";
+const DOMAIN_SEAL_CONTEXT: &str = "ferros 2026-11-07 vault domain seal";
+/// Entries may wait in the kernel's vault for the vault process to take (`SYS_VAULT`): set from boot, by a bridge `store put` of a scoped name, and at unlock; cleared when the vault process asks and finds none. The stamp's flag bit 0.
+pub static MIGRATE_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// Moved at every identity lock (kvault `lock`): the stamp carries it, and the vault process drops what it holds of the person's (its cache's plaintext) when it changes.
+pub static LOCK_EPOCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Bit 62 of a `Calling` state's reply length: the call is a forwarded `SYS_STORE`, whose reply is [the syscall's value u64 LE][the bytes for the caller's buffer].
+const STORE_REPLY: u64 = 1 << 62;
+/// The last old entry read for migration (name, value), so a large one is fetched from the kernel's vault once.
+static mut MIGRATE_CACHE: Option<(Vec<u8>, Vec<u8>)> = None;
+
+/// The vault endpoint, while a live process holds the right to serve it: from its spawn, not its first receive, so a call made while it opens waits for it (the GPU asked for `gpu.fw` 145 ms into a boot, before the vault served, and the kernel's vault, which no longer held it, said absent, 2026-11-07). Should it die first, the waiting calls get ERR (`fail_orphaned_calls`).
+fn vault_ep() -> Option<usize> {
+    let kk = k();
+    let ep = kk.endpoints.iter().position(|e| e.name == VAULT_EP)?;
+    let serving = kk.procs.iter().flatten().any(|p| !p.dying && p.cspace.iter().any(|c| matches!(c.object, Object::Endpoint(e) if e == ep) && c.rights & RIGHT_RECV != 0));
+    serving.then_some(ep)
+}
+
+/// The scope a full name belongs to, if it may live in the vault process (not reserved, not kept by the kernel).
+fn scope_of(name: &str) -> Option<&'static StoreScope> {
+    if name.starts_with('\0') || KERNEL_HELD.iter().any(|h| name.starts_with(h)) {
+        return None;
+    }
+    STORES.iter().find(|s| name.starts_with(s.prefix))
+}
+
+/// A scope's domain keys in one class (the kernel derives every key; the vault process seals with them, VAULT-OUT.md): the address key, then the sealing key. None while the class is locked.
+fn domain_keys(prefix: &str, identity: bool) -> Option<[u8; 64]> {
+    let mut base = unsafe { DOMAIN_BASE }?(identity)?;
+    let mut out = [0u8; 64];
+    for (i, ctx) in [DOMAIN_ADDR_CONTEXT, DOMAIN_SEAL_CONTEXT].iter().enumerate() {
+        let mut h = blake3::Hasher::new_derive_key(ctx);
+        h.update(&base);
+        h.update(prefix.as_bytes());
+        out[i << 5..(i + 1) << 5].copy_from_slice(h.finalize().as_bytes());
+    }
+    base.fill(0);
+    Some(out)
+}
+
+/// `cur` calls endpoint `ep` with `msg` and waits for the reply, which lands at `roff` (at most `rcap` bytes, the flags above `CALL_LIVE` and `STORE_REPLY` kept with it): queued, handed to a server already receiving, or a polling server woken. SYS_CALL's path, and SYS_STORE's when it is forwarded.
+fn call_endpoint(f: &mut Frame, cur: usize, ep: usize, msg: Vec<u8>, roff: u64, rcap: u64) -> u64 {
+    let kk = k();
+    let (Some(p), Some(t)) = (proc_of(cur), th(cur)) else {
+        f.x[0] = ERR;
+        return 0;
+    };
+    // Blocked on another process: the watchdog's clock paused for the thread that pets (that process answers for its own hang).
+    if cur == p.pet_thread {
+        p.paused_at = crate::platform::cntpct();
+    }
+    t.state = State::Calling(roff, rcap);
+    t.frame = *f;
+    tr(TR_CALL, cur, ep as u64);
+    kk.endpoints[ep].queue.push_back((cur, msg));
+    // A server thread already waiting on this endpoint takes it now.
+    if let Some(server) = kk.threads.iter().position(|q| matches!(q, Some(q) if matches!(q.state, State::Receiving(e, ..) if e == ep))) {
+        deliver(server, ep);
+    } else if let Some(s) = kk.endpoints[ep].poller {
+        // A polling server asleep between polls: wake it now (its sleep returns early, which a poll loop reads as "look again").
+        if let Some(q) = th(s) {
+            // Asleep, or in a timed interrupt wait (a driver that serves an endpoint and waits for its device in one loop): back with 2, as at its deadline.
+            if matches!(q.state, State::Sleeping(_)) || matches!(q.state, State::Waiting(a, _) if a < 1024) {
+                if matches!(q.state, State::Waiting(..)) {
+                    q.frame.x[0] = 2;
+                }
+                q.state = State::Runnable;
+                enqueue_back(s);
+                tr(TR_WAKE_POLL, s, ep as u64);
+            }
+        }
+    }
+    if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
+}
+
+/// `SYS_VAULT` op 0: the `skip`-th entry of the kernel's vault that belongs in the vault process (a scope's, not one the kernel keeps, its class open), with its domain's keys: the one exception to keys only against a live call (VAULT-OUT.md, migration), once per old entry. None left: the pending mark is cleared.
+fn migrate_next(p: &Process, skip: usize, buf: u64, len: usize) -> u64 {
+    let Some(Ok(names)) = unsafe { STORE_KEYS }.map(|keys| keys()) else { return ERR };
+    let mut seen = 0;
+    for name in names {
+        let Some(sc) = scope_of(&name) else { continue };
+        let identity = crate::kvault::identity_class(&name);
+        let Some(mut keys) = domain_keys(sc.prefix, identity) else { continue };
+        if seen < skip {
+            seen += 1;
+            keys.fill(0);
+            continue;
+        }
+        let mut out = Vec::with_capacity(66 + name.len());
+        out.push(identity as u8);
+        out.extend_from_slice(&keys);
+        keys.fill(0);
+        out.push(sc.prefix.len() as u8);
+        out.extend_from_slice(name.as_bytes());
+        let n = out.len();
+        if n <= len {
+            p.write(buf, &out);
+        }
+        out.fill(0);
+        return if n <= len { n as u64 } else { ERR };
+    }
+    MIGRATE_PENDING.store(false, core::sync::atomic::Ordering::Release);
+    NOTHING
+}
+
+/// `SYS_VAULT` op 1: an old entry's value from `offset` (fetched once, kept until another is asked for or it moves).
+fn migrate_read(p: &Process, name: &str, offset: usize, buf: u64, len: usize) -> u64 {
+    if scope_of(name).is_none() {
+        return ERR;
+    }
+    let cache = unsafe { &mut *(&raw mut MIGRATE_CACHE) };
+    if cache.as_ref().is_none_or(|(k, _)| k != name.as_bytes()) {
+        *cache = match unsafe { STORE }.map(|store| store(name, None)) {
+            Some(Ok(Some(v))) => Some((name.as_bytes().to_vec(), v)),
+            Some(Ok(None)) => return NOTHING,
+            _ => return ERR,
+        };
+    }
+    let Some((_, v)) = cache.as_ref() else { return ERR };
+    // WHY: the offset is the vault process's and may lie past the end (nothing to copy then).
+    let from = offset.min(v.len());
+    let to = (offset + len).min(v.len());
+    p.write(buf, &v[from..to]);
+    v.len() as u64
+}
+
+/// `SYS_VAULT` op 2: an old entry the vault process has written and committed, removed from the kernel's vault.
+fn migrate_done(name: &str) -> u64 {
+    if scope_of(name).is_none() {
+        return ERR;
+    }
+    unsafe { *(&raw mut MIGRATE_CACHE) = None };
+    match unsafe { STORE_REMOVE }.map(|rm| rm(name)) {
+        Some(Ok(true)) => 0,
+        Some(Ok(false)) => NOTHING,
+        _ => ERR,
+    }
+}
+
+/// A bridge `store put` (service.rs) of a name the vault process holds: it waits in the kernel's vault until the vault process takes it.
+pub fn note_old_put(name: &str) {
+    if scope_of(name).is_some() {
+        MIGRATE_PENDING.store(true, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Where a `SYS_STORE` goes: to the vault process (its endpoint and the caller's scope) while it serves and the name is not one the kernel keeps; None, the kernel's own vault.
+fn store_route(p: &Process, f: &Frame) -> Option<(usize, &'static StoreScope)> {
+    let ep = vault_ep()?;
+    let token = p.read(f.x[0], 32);
+    let sc = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+        Some((Object::Store(i), r)) if r & RIGHT_SEND != 0 => STORES.get(i)?,
+        _ => return None,
+    };
+    if f.x[1] & 32 == 0 {
+        let mut full = alloc::string::String::from(sc.prefix);
+        full.extend(p.read(f.x[2], (f.x[3] as usize).min(97)).iter().map(|&b| b as char));
+        if KERNEL_HELD.iter().any(|h| full.starts_with(h)) {
+            return None;
+        }
+    }
+    Some((ep, sc))
+}
+
+/// `SYS_STORE` while the vault process serves (VAULT-OUT.md, step 3): the request, stamped with the domain keys of the caller's scope, goes to the vault as a call from the caller, who waits for the reply as for any call. The kernel copies one transfer each way and keeps nothing; keys for the person's domain only while they are unlocked.
+///
+/// The stamped message: [op: 0 set, 1 get, 2 delete, 3 list][flags: bit 0 old entries pending][lock epoch u32 LE][domains][per domain: class (1 the person's) and the address and sealing keys, 65 bytes][name length][name: the name within the scope, or 1 and the 32-byte address][rest]. Rest: set [offset u64][more u8][bytes]; get [offset u64][length u32]; list [offset u64][length u32][addresses u8]; delete nothing.
+fn store_forward(f: &mut Frame, cur: usize, ep: usize, sc: &StoreScope) -> u64 {
+    let Some(p) = proc_of(cur) else {
+        f.x[0] = ERR;
+        return 0;
+    };
+    let (set, more, del, list, raw) = (f.x[1] & 1 != 0, f.x[1] & 4 != 0, f.x[1] & 8 != 0, f.x[1] & 16 != 0, f.x[1] & 32 != 0);
+    let offset = if f.x[1] & 2 != 0 { f.x[1] >> 32 } else { 0 };
+    let len = ((f.x[1] >> 8) & 0xFF_FFFF) as usize;
+    let rel = p.read(f.x[2], (f.x[3] as usize).min(97));
+    // WHY: the name and the length are the caller's; the same refusals as the kernel's own path (a name of printable ASCII up to 96 bytes or a 32-byte address; one transfer at most).
+    let rel_ok = if raw { rel.len() == 32 || list } else { rel.len() <= 96 && rel.iter().all(|&b| (0x21..0x7F).contains(&b)) && (!rel.is_empty() || list) };
+    if !rel_ok || len > STORE_MAX {
+        f.x[0] = ERR;
+        return 0;
+    }
+    let mut name = Vec::with_capacity(33);
+    if raw && !list {
+        name.push(1);
+    }
+    if !list {
+        name.extend_from_slice(&rel);
+    }
+    let mut full = alloc::string::String::from(sc.prefix);
+    if !raw {
+        full.extend(rel.iter().map(|&b| b as char));
+    }
+    // The classes the request covers: a listing both where the scope holds the person's names (the device's always), anything else its own name's.
+    let classes: &[bool] = if list && crate::kvault::identity_within(sc.prefix) { &[false, true] } else if crate::kvault::identity_class(&full) { &[true] } else { &[false] };
+    let mut msg = Vec::with_capacity(8 + 2 * 65 + 34 + 13 + len);
+    msg.push(if list { 3 } else if del { 2 } else if set { 0 } else { 1 });
+    msg.push(MIGRATE_PENDING.load(core::sync::atomic::Ordering::Acquire) as u8);
+    msg.extend_from_slice(&LOCK_EPOCH.load(core::sync::atomic::Ordering::Acquire).to_le_bytes());
+    let at_count = msg.len();
+    msg.push(0);
+    for &identity in classes {
+        // A listing leaves out the person's domain while they are locked; anything else is refused, as the kernel's vault refuses it.
+        let Some(mut keys) = domain_keys(sc.prefix, identity) else {
+            if list && identity {
+                continue;
+            }
+            f.x[0] = ERR;
+            return 0;
+        };
+        msg.push(identity as u8);
+        msg.extend_from_slice(&keys);
+        keys.fill(0);
+        msg[at_count] += 1;
+    }
+    msg.push(name.len() as u8);
+    msg.extend_from_slice(&name);
+    if set {
+        msg.extend_from_slice(&offset.to_le_bytes());
+        msg.push(more as u8);
+        msg.extend_from_slice(&p.read(f.x[4], len));
+    } else if !del {
+        msg.extend_from_slice(&offset.to_le_bytes());
+        msg.extend_from_slice(&(len as u32).to_le_bytes());
+        if list {
+            msg.push(raw as u8);
+        }
+    }
+    let rcap = if set || del { 0 } else { len as u64 };
+    call_endpoint(f, cur, ep, msg, f.x[4], rcap | STORE_REPLY)
+}
 
 const ENTROPY_CONTEXT: &str = "ferros husky 2026-10-15 entropy syscall v1";
 static ENTROPY_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1238,12 +1484,14 @@ pub const PARKED: u64 = 0xB10C << 48;
 /// Copy the head of an endpoint's queue into a server waiting in recv: message into its buffer, a fresh single-use reply token into its arc and cspace, x0 = message length. The server becomes runnable.
 fn deliver(server: usize, ep: usize) {
     let kk = k();
-    let Some((caller, msg)) = kk.endpoints[ep].queue.pop_front() else { return };
+    let Some((caller, mut msg)) = kk.endpoints[ep].queue.pop_front() else { return };
     let Some(st) = th(server) else { return };
     let Some(sp) = proc_of(server) else { return };
     let State::Receiving(_, buf, cap, tok_off) = st.state else { return };
     let n = msg.len().min(cap as usize);
     sp.write(buf, &msg[..n]);
+    // Wiped once delivered: a forwarded store call carries domain keys (`store_forward`), which must not outlive it in the kernel's heap.
+    msg.fill(0);
     let token = mint(Object::Reply(caller), RIGHT_SEND, sp.epoch);
     sp.cspace.push(CapEntry { token, object: Object::Reply(caller), rights: RIGHT_SEND });
     sp.write(tok_off, &token);
@@ -1505,6 +1753,29 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 _ => ERR,
             };
             0
+        }
+        // The vault process serving: the call goes to it, stamped (VAULT-OUT.md, step 3).
+        SYS_VAULT => {
+            let token = p.read(f.x[0], 32);
+            let ok = matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Vault, r)) if r & RIGHT_SEND != 0);
+            let (op, len, offset) = (f.x[1] & 0xFF, ((f.x[1] >> 8) & 0xFF_FFFF) as usize, (f.x[1] >> 32) as usize);
+            // WHY: the length and the name are the vault process's: one transfer at most, a name as long as a scope's prefix and the longest name the kernel's path accepts.
+            let name = || alloc::string::String::from_utf8(p.read(f.x[2], (f.x[3] as usize).min(1 << 7))).unwrap_or_default();
+            f.x[0] = if !ok || len > STORE_MAX {
+                ERR
+            } else {
+                match op {
+                    0 => migrate_next(p, f.x[2] as usize, f.x[4], len),
+                    1 => migrate_read(p, &name(), offset, f.x[4], len),
+                    2 => migrate_done(&name()),
+                    _ => ERR,
+                }
+            };
+            0
+        }
+        SYS_STORE if store_route(p, f).is_some() => {
+            let (ep, sc) = store_route(p, f).unwrap();
+            store_forward(f, cur, ep, sc)
         }
         SYS_STORE => {
             let token = p.read(f.x[0], 32);
@@ -1926,32 +2197,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 }
                 Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 => {
                     let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
-                    // Blocked on another process: the watchdog's clock paused for the thread that pets (that process answers for its own hang).
-                    if cur == p.pet_thread {
-                        p.paused_at = crate::platform::cntpct();
-                    }
-                    t.state = State::Calling(f.x[3], f.x[4] & !CALL_LIVE);
-                    t.frame = *f;
-                    tr(TR_CALL, cur, ep as u64);
-                    kk.endpoints[ep].queue.push_back((cur, msg));
-                    // A server thread already waiting on this endpoint takes it now.
-                    if let Some(server) = kk.threads.iter().position(|q| matches!(q, Some(q) if matches!(q.state, State::Receiving(e, ..) if e == ep))) {
-                        deliver(server, ep);
-                    } else if let Some(s) = kk.endpoints[ep].poller {
-                        // A polling server asleep between polls: wake it now (its sleep returns early, which a poll loop reads as "look again").
-                        if let Some(q) = th(s) {
-                            // Asleep, or in a timed interrupt wait (a driver that serves an endpoint and waits for its device in one loop): back with 2, as at its deadline.
-                            if matches!(q.state, State::Sleeping(_)) || matches!(q.state, State::Waiting(a, _) if a < 1024) {
-                                if matches!(q.state, State::Waiting(..)) {
-                                    q.frame.x[0] = 2;
-                                }
-                                q.state = State::Runnable;
-                                enqueue_back(s);
-                                tr(TR_WAKE_POLL, s, ep as u64);
-                            }
-                        }
-                    }
-                    if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
+                    // A caller cannot ask for a store reply's decoding (bit 62): only `store_forward` sets it.
+                    call_endpoint(f, cur, ep, msg, f.x[3], f.x[4] & !(CALL_LIVE | STORE_REPLY))
                 }
                 _ => {
                     f.x[0] = ERR;
@@ -2063,13 +2310,22 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     let Object::Reply(caller) = p.cspace[i].object else { unreachable!() };
                     // Single use: the token leaves the cspace before anything else happens.
                     p.cspace.swap_remove(i);
-                    let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
+                    // One transfer, and a forwarded store reply's 8-byte value ahead of it (`store_forward`); a plain caller still gets at most what it asked for.
+                    let msg = p.read(f.x[1], (f.x[2] as usize).min(STORE_MAX + 8));
                     let mut handed = false;
                     if let (Some(ct), Some(cp)) = (th(caller), proc_of(caller)) {
                         if let State::Calling(roff, rcap) = ct.state {
-                            let n = msg.len().min(rcap as usize);
-                            cp.write(roff, &msg[..n]);
-                            ct.frame.x[0] = n as u64;
+                            if rcap & STORE_REPLY != 0 {
+                                // A forwarded store call (`store_forward`): the vault's reply is the syscall's value, then the bytes for the caller's buffer, as many as it asked for. WHY the checks: the reply is the vault process's, its length its own.
+                                let data = msg.get(8..).unwrap_or(&[]);
+                                let n = data.len().min((rcap & !STORE_REPLY) as usize);
+                                cp.write(roff, &data[..n]);
+                                ct.frame.x[0] = msg.get(..8).map(|v| u64::from_le_bytes(v.try_into().unwrap())).unwrap_or(ERR);
+                            } else {
+                                let n = msg.len().min(rcap as usize);
+                                cp.write(roff, &msg[..n]);
+                                ct.frame.x[0] = n as u64;
+                            }
                             ct.state = State::Runnable;
                             // The caller runs now: it waited. The server goes to the back of the queue (KERNEL.md "Threads, interrupts and cores": direct hand-off both ways).
                             enqueue_front(caller);
@@ -2149,7 +2405,8 @@ fn has_receiver(ep: usize) -> bool {
 fn fail_orphaned_calls() {
     let kk = k();
     for ep in 0..kk.endpoints.len() {
-        if has_receiver(ep) {
+        // The vault, alive and still opening, has not received yet: the store calls queued for it wait.
+        if has_receiver(ep) || vault_ep() == Some(ep) {
             continue;
         }
         // No server left: one started again must receive before CALL_LIVE counts it.
@@ -2160,7 +2417,8 @@ fn fail_orphaned_calls() {
         let queued: Vec<usize> = kk.endpoints[ep].queue.iter().map(|q| q.0).collect();
         for caller in queued {
             if let Some(ct) = th(caller) {
-                if matches!(ct.state, State::Calling(..)) && ct.frame.x[4] & CALL_LIVE != 0 {
+                // A forwarded store call waits as CALL_LIVE does: its frame's x4 is the caller's buffer, so the mark is in the state.
+                if matches!(ct.state, State::Calling(..)) && ct.frame.x[4] & CALL_LIVE != 0 || matches!(ct.state, State::Calling(_, c) if c & STORE_REPLY != 0) {
                     ct.frame.x[0] = ERR;
                     ct.state = State::Runnable;
                     enqueue_back(caller);
@@ -2546,6 +2804,8 @@ pub enum Grant<'a> {
     Sensors,
     /// A window of blocks on the ferros partition, by name (`WINDOWS`, syscall 29).
     Blocks(&'a [u8]),
+    /// The vault process's right (syscall 30), and with it the right to serve `vault`.
+    Vault,
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -2674,8 +2934,12 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
     let mut v = Vec::new();
     for g in grants {
         v.push(match g {
+            // The vault endpoint carries domain keys (`store_forward`): served only by a spawn that holds the vault right, called only by the kernel.
+            Grant::Serve(n) if *n == VAULT_EP && !grants.iter().any(|g| matches!(g, Grant::Vault)) => return Err("serving the vault needs the vault right"),
+            Grant::Use(n) if *n == VAULT_EP => return Err("the vault endpoint is the kernel's to call"),
             Grant::Serve(n) => (Object::Endpoint(endpoint(n)), RIGHT_RECV),
             Grant::Use(n) => (Object::Endpoint(endpoint(n)), RIGHT_SEND),
+            Grant::Vault => (Object::Vault, RIGHT_SEND),
             Grant::Hardware(n) => match HARDWARE.iter().position(|h| h.name.as_bytes() == *n) {
                 Some(i) => (Object::Hardware(i), RIGHT_SEND | RIGHT_RECV),
                 None => return Err("no such hardware block"),

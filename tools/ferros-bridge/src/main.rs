@@ -287,6 +287,8 @@ async fn main() {
                     "--sensors" => { grants.push((13, String::new())); i += 1; }
                     // --blocks NAME: a window of blocks on the ferros partition (syscall 29; process.rs WINDOWS: vault).
                     "--blocks" => { grants.push((14, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
+                    // --vault: the vault process's own call (syscall 30, the kernel's old entries to move) and with it the right to serve `vault`.
+                    "--vault" => { grants.push((15, String::new())); i += 1; }
                     // --entropy: the right to draw randomness from the session's wairua (syscall 6).
                     "--entropy" => { grants.push((4, String::new())); i += 1; }
                     // --dma NAME: a DMA region from the kernel's registry (syscall 7 gives its base).

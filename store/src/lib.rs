@@ -146,7 +146,7 @@ pub struct Store<A: BlockDev, B: BlockDev, N: Nonces> {
     nonces: N,
     /// The time each commit is stamped with (Eagle time, oscillations).
     now: fn() -> i64,
-    /// The last head and the last piece opened, by address and the sealing key that opened them (the address alone is not enough: a caller with the right address key and the wrong sealing key must not be served what it could not open, which the tests caught): a large value is read a few KiB at a time (the kernel hands a process 4 KiB a call), and without these every read opened its head again and a 64 KiB piece sixteen times over. Dropped whenever a value is written or removed.
+    /// The last head and the last piece opened, by address and a hash of the sealing key that opened them (the address alone is not enough: a caller with the right address key and the wrong sealing key must not be served what it could not open, which the tests caught; a hash, so no key outlives the request it came with, VAULT-OUT.md): a large value is read a few KiB at a time (the kernel hands a process 4 KiB a call), and without these every read opened its head again and a 64 KiB piece sixteen times over. Dropped whenever a value is written or removed.
     last_head: Option<([u8; 32], [u8; 32], Head)>,
     last_piece: Option<([u8; 32], [u8; 32], Vec<u8>)>,
 }
@@ -203,28 +203,34 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
     fn head(&mut self, d: &Domain, name: &[u8]) -> Result<Option<([u8; 32], Head)>> {
         let at = Self::head_addr(d, name);
         if let Some((a, k, h)) = &self.last_head {
-            if *a == at && *k == d.seal {
+            if *a == at && *k == Self::key_id(d) {
                 return Ok(Some((at, h.clone())));
             }
         }
         let Some(sealed) = self.vault.get(&at)? else { return Ok(None) };
         let h = Head::decode(&Self::open(d, &at, sealed)?)?;
-        self.last_head = Some((at, d.seal, h.clone()));
+        self.last_head = Some((at, Self::key_id(d), h.clone()));
         Ok(Some((at, h)))
     }
 
     /// Piece `k` of value `id`, opened (the last one opened is kept).
     fn piece(&mut self, d: &Domain, id: &[u8; 32], k: u64) -> Result<&[u8]> {
         let addr = Self::piece_addr(d, id, k);
-        if !matches!(&self.last_piece, Some((a, k, _)) if *a == addr && *k == d.seal) {
+        let id_k = Self::key_id(d);
+        if !matches!(&self.last_piece, Some((a, k, _)) if *a == addr && *k == id_k) {
             let sealed = self.vault.get(&addr)?.ok_or(Error::Format)?;
-            self.last_piece = Some((addr, d.seal, Self::open(d, &addr, sealed)?));
+            self.last_piece = Some((addr, id_k, Self::open(d, &addr, sealed)?));
         }
         Ok(&self.last_piece.as_ref().ok_or(Error::Format)?.2)
     }
 
-    /// Forget the kept head and piece (a value changed).
-    fn forget(&mut self) {
+    /// What the cache knows a sealing key by.
+    fn key_id(d: &Domain) -> [u8; 32] {
+        *blake3::hash(&d.seal).as_bytes()
+    }
+
+    /// Forget the kept head and piece: a value changed, or (the vault process, at a lock) the plaintext they hold must go.
+    pub fn forget(&mut self) {
         self.last_head = None;
         self.last_piece = None;
     }

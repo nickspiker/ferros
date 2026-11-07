@@ -1,6 +1,6 @@
-//! The vault process's proof on the device (VAULT-OUT.md, step 1): a client of `vault` that, in test domain 1, writes a small value and a 1 MiB one in 4 KiB messages, reads both back (the large one checked by its BLAKE3), lists the domain's names, deletes one, sees that domain 2 finds nothing, and sweeps; each step's result and time on the console. With input 01 it only reads the large value back, for after the vault process is restarted.
+//! The vault process's proof on the device (VAULT-OUT.md): a process with the `test` store scope, using the store calls every process uses, which the kernel forwards to the vault process. It writes a small value and a 6 MiB one (past the kernel's old 3 MiB limit) in 4 KiB transfers, reads both back (the large one checked by its BLAKE3), lists the names, deletes one and finds it gone. With input 01 it only reads the large value back, for after the vault process is restarted.
 //!
-//! Grant slots: 0 console, 1 use `vault`.
+//! Grant slots: 0 console, 1 store test.
 #![no_std]
 #![no_main]
 
@@ -8,9 +8,9 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use ferros_sys::{call, cap, console, freq, now, ERR};
+use ferros_sys::{cap, console, freq, now};
 
-const HEAP_BYTES: usize = 4 << 20;
+const HEAP_BYTES: usize = 16 << 20;
 
 #[repr(C, align(16))]
 struct Region<const N: usize>(UnsafeCell<[u8; N]>);
@@ -39,7 +39,9 @@ _entry:
 #[global_allocator]
 static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
 
-const S_VAULT: u64 = 1;
+const S_STORE: u64 = 1;
+/// The large value's size: 6 MiB.
+const BIG: usize = 6 << 20;
 static mut GRANTS: u64 = 0;
 
 struct Log {
@@ -65,73 +67,49 @@ macro_rules! say {
     }};
 }
 
-/// One request to the vault: [op][domain][name length][name][rest]; returns the reply's length into `r`.
-fn ask(op: u8, dom: u8, name: &[u8], rest: &[u8], r: &mut [u8]) -> usize {
-    let mut m = Vec::with_capacity(3 + name.len() + rest.len());
-    m.extend_from_slice(&[op, dom, name.len() as u8]);
-    m.extend_from_slice(name);
-    m.extend_from_slice(rest);
-    let n = call(cap(unsafe { GRANTS }, S_VAULT), &m, r);
-    if n == ERR { 0 } else { n as usize }
+fn store() -> u64 {
+    cap(unsafe { GRANTS }, S_STORE)
 }
 
-/// The whole value written in messages of up to `chunk` bytes; whether every one was taken.
-fn put(dom: u8, name: &[u8], v: &[u8], chunk: usize) -> bool {
-    let mut r = [0u8; 16];
+/// The whole value written in pieces of up to `chunk` bytes, as any process writes a large one.
+fn put(name: &[u8], v: &[u8], chunk: usize) -> bool {
+    if v.len() <= chunk {
+        return ferros_sys::store_set(store(), name, v);
+    }
     let mut off = 0;
-    loop {
+    while off < v.len() {
         let end = (off + chunk).min(v.len());
-        let more = end < v.len();
-        let mut rest = Vec::with_capacity(9 + end - off);
-        rest.extend_from_slice(&(off as u64).to_le_bytes());
-        rest.push(more as u8);
-        rest.extend_from_slice(&v[off..end]);
-        if ask(0, dom, name, &rest, &mut r) != 1 || r[0] != 0 {
+        if !ferros_sys::store_set_at(store(), name, off, &v[off..end], end < v.len()) {
             return false;
         }
         off = end;
-        if !more {
-            return true;
-        }
     }
+    true
 }
 
-/// The whole value read back; None if it is absent or a read failed.
-fn get(dom: u8, name: &[u8]) -> Option<Vec<u8>> {
+/// The whole value read back in 4 KiB transfers; None if it is absent or a read failed.
+fn get(name: &[u8]) -> Option<Vec<u8>> {
     let mut r = alloc::vec![0u8; 4096];
-    let mut v = Vec::new();
-    loop {
-        let n = ask(1, dom, name, &(v.len() as u64).to_le_bytes(), &mut r);
-        if n < 9 || r[0] != 0 {
+    let whole = ferros_sys::store_get_at(store(), name, 0, &mut r)?;
+    let mut v = Vec::with_capacity(whole);
+    v.extend_from_slice(&r[..whole.min(r.len())]);
+    while v.len() < whole {
+        let n = ferros_sys::store_get_at(store(), name, v.len(), &mut r)?;
+        if n != whole {
             return None;
         }
-        let whole = u64::from_le_bytes(r[1..9].try_into().ok()?) as usize;
-        if v.is_empty() {
-            v.reserve_exact(whole);
-        }
-        v.extend_from_slice(&r[9..n]);
-        if v.len() >= whole {
-            return Some(v);
-        }
-        if n == 9 {
-            return None;
-        }
+        let take = (whole - v.len()).min(r.len());
+        v.extend_from_slice(&r[..take]);
     }
+    Some(v)
 }
 
-fn names(dom: u8) -> Vec<Vec<u8>> {
+/// The scope's names, sorted.
+fn names() -> Vec<Vec<u8>> {
     let mut r = alloc::vec![0u8; 4096];
-    let n = ask(3, dom, b"", &0u32.to_le_bytes(), &mut r);
-    let mut out = Vec::new();
-    if n < 5 || r[0] != 0 {
-        return out;
-    }
-    let mut at = 5;
-    while at < n {
-        let l = r[at] as usize;
-        out.push(r[at + 1..at + 1 + l].to_vec());
-        at += 1 + l;
-    }
+    let Some(n) = ferros_sys::store_keys(store(), 0, &mut r) else { return Vec::new() };
+    let mut out: Vec<Vec<u8>> = r[..n.min(r.len())].split(|&b| b == b'\n').filter(|s| !s.is_empty()).map(|s| s.to_vec()).collect();
+    out.sort();
     out
 }
 
@@ -144,40 +122,36 @@ pub extern "C" fn test_main(g: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     unsafe { GRANTS = g };
-    let big: Vec<u8> = (0..1u32 << 20).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    // Past the kernel's old 3 MiB limit on a value (service.rs STORE_VALUE_MAX).
+    let big: Vec<u8> = (0..BIG as u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
     let want = blake3::hash(&big);
     // Input 01: only look, after the vault process was restarted: the value the last run left is still there, whole.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 1 {
         let t = now();
-        let back = get(1, b"big");
+        let back = get(b"big");
         let same = back.as_ref().is_some_and(|b| blake3::hash(b) == want);
-        let listed = names(1) == [b"big".to_vec()];
-        say!("vaulttest: after a restart, 1 MiB read back {} in {} ms, the same by BLAKE3: {}, names {}", back.is_some(), ms(t), same, listed);
+        let listed = names() == [b"big".to_vec()];
+        say!("vaulttest: after a restart, {} MiB read back {} in {} ms, the same by BLAKE3: {}, names {}", BIG >> 20, back.is_some(), ms(t), same, listed);
         ferros_sys::exit(if same && listed { 0 } else { 1 })
     }
     let t = now();
-    let small_ok = put(1, b"small", b"hello vault", 4000) && get(1, b"small").as_deref() == Some(&b"hello vault"[..]);
+    let small_ok = put(b"small", b"hello vault", 4096) && get(b"small").as_deref() == Some(&b"hello vault"[..]);
     say!("vaulttest: small value written and read back: {} ({} ms)", small_ok, ms(t));
     let t = now();
-    let wrote = put(1, b"big", &big, 4000);
+    let wrote = put(b"big", &big, 4096);
     let tw = ms(t);
     let t = now();
-    let back = get(1, b"big");
+    let back = get(b"big");
     let tr = ms(t);
     let same = back.as_ref().is_some_and(|b| blake3::hash(b) == want);
-    say!("vaulttest: 1 MiB written {} in {} ms, read back {} in {} ms, the same by BLAKE3: {}", wrote, tw, back.is_some(), tr, same);
-    let mut n = names(1);
-    n.sort();
-    let listed = n == [b"big".to_vec(), b"small".to_vec()];
-    let mut r = [0u8; 16];
-    let deleted = ask(2, 1, b"small", b"", &mut r) == 2 && r[0] == 0 && r[1] == 1;
-    let after = names(1) == [b"big".to_vec()];
-    say!("vaulttest: names listed {}, small deleted {}, names after {}", listed, deleted, after);
-    let other = ask(1, 2, b"big", &0u64.to_le_bytes(), &mut r) == 1 && r[0] == 1;
-    let mut s = [0u8; 16];
-    let swept = ask(4, 1, b"", b"", &mut s) == 9 && s[0] == 0;
-    say!("vaulttest: domain 2 finds nothing {}, sweep ran {} ({} pieces)", other, swept, u64::from_le_bytes(s[1..9].try_into().unwrap_or([0; 8])));
-    let all = small_ok && wrote && same && listed && deleted && after && other && swept;
+    say!("vaulttest: {} MiB written {} in {} ms, read back {} in {} ms, the same by BLAKE3: {}", BIG >> 20, wrote, tw, back.is_some(), tr, same);
+    let listed = names() == [b"big".to_vec(), b"small".to_vec()];
+    let deleted = ferros_sys::store_delete(store(), b"small") == Some(true);
+    let again = ferros_sys::store_delete(store(), b"small") == Some(false);
+    let after = names() == [b"big".to_vec()];
+    let absent = get(b"small").is_none();
+    say!("vaulttest: names listed {}, small deleted {} (and gone: {} {}), names after {}", listed, deleted, again, absent, after);
+    let all = small_ok && wrote && same && listed && deleted && again && after && absent;
     say!("vaulttest: {}", if all { "all passed" } else { "FAILED" });
     ferros_sys::exit(if all { 0 } else { 1 })
 }

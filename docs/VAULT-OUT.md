@@ -80,12 +80,34 @@ The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by t
 - **The block window and the vault process (2026-11-07), proven on the Pro:**
   - The kernel's `SYS_BLOCK` (29): a `Blocks` capability names a window of the ferros partition (`process.rs` `WINDOWS`), and the call moves 1 to 16 blocks of 4 KiB by number within it. The kernel checks the window and moves bytes; it does not hold, parse or seal them. `bridge spawn --blocks vault` grants it.
   - `vault`: 2 × 8 GiB from 4 GiB into the partition (past the flash log at 1 GiB and the kernel's vault at 2 to 2.5 GiB).
-  - `payloads/vault` opens manifestus over the window (mirror A from block 0, mirror B from half way, each 512 MiB to start) and serves `ferros_store` in op-byte messages (set in pieces, get at an offset, delete, names, sweep). The keys are fixed, non-secret test domains until the kernel issues real ones (step 3).
+  - `payloads/vault` opens manifestus over the window (mirror A from block 0, mirror B from half way, each 512 MiB to start) and serves `ferros_store`. In this first cut its keys were fixed, non-secret test domains; the next entry replaced them.
   - `payloads/vaulttest` is its client. On the Pro:
     - a blank region opens in 21 s (read whole once, before the first commit), and a committed one reopens in 6 ms;
     - 1 MiB is written in 154 ms (4000-byte messages) and read back in 45 ms, the same by BLAKE3;
     - names follow the puts and the delete, domain 2 finds nothing of domain 1, and sweep runs;
     - after the vault process is killed and spawned again, the 1 MiB value reads back whole (50 ms).
+- **Every store call goes to the vault process, keyed by the kernel (2026-11-07), proven on the Pro:**
+  - **Forwarding.** While a live process holds the right to serve `vault`, the kernel forwards every `SYS_STORE` call there as an IPC call from the caller (`process.rs` `store_forward`). The caller waits as for any call; no process changes its calls. With no vault process, the kernel's vault answers, as before.
+  - **The stamp.** The kernel stamps each call with its scope's domain keys, one domain per (scope, class):
+    - the device's keys derive from the ira;
+    - the person's derive from their unlock, and exist only while they are unlocked (kvault `identity_domain`, wiped at lock);
+    - a listing of a scope that holds both classes carries both;
+    - the lock epoch rides along, and when it moves the vault drops its cache's plaintext and any write of the person's in progress.
+  - **Keys never outlive their request.** The kernel wipes each message once delivered; the vault zeroes the keys after the request; the store's cache knows a key only by its hash.
+  - **The endpoint is the kernel's.** Nothing may be granted `use vault`. Serving it needs the vault right (`Grant::Vault`, `bridge spawn --vault`). A call made while the vault opens waits for it.
+  - **Migration.** The vault right's call (`SYS_VAULT`, 30) hands the vault each old entry of a scope with its domain keys (the one exception to keys only against a live call). The vault writes the entry into its domain and, once committed, the kernel removes it from its own vault. It runs before the first request after anything may have left old entries: boot, a bridge `store put` of a scoped name, a write while no vault served, an unlock. Names the kernel reads itself (`aoc.fw.*`) stay in the kernel's vault.
+  - **Boot.** The kernel starts the vault before init (`start_home`; init's grants page is full) from the capsule `vault` in its own vault. `diag restart vault` restarts it.
+  - **Measured.** 21 device entries (the WiFi, GPU and GNSS files and the AoC registry scripts, 2.98 MB) moved in 594 ms. `payloads/vaulttest`, through the ordinary store calls on a `test` scope:
+    - a 6 MiB value (past the old 3 MiB limit) written in 843 ms and read back in 648 ms, the same by BLAKE3;
+    - names, delete and absent all hold.
+  - **After a reboot.** The vault opens in 139 ms; the GPU boots from `gpu.fw` and the sensors process loads its 15 scripts, both from the vault.
+- **Still to do:**
+  - the person's entries moving at the first attest (built, not yet seen on the device);
+  - the identity export for a departure (`SYS_UNLOCK` op 5), which still reads the kernel's vault and so finds nothing that moved;
+  - the bridge's `store` commands, which still read and write the kernel's vault (a `put` moves at the next request; `ls` and `get` of a moved name find nothing);
+  - per-kist domains through the oracle and the common area's named grants (step 3's rest);
+  - the vault's capsule in the kernel image;
+  - the kernel's own names moved behind a channel of its own, then `kvault`, `vault_boot` and `ufs_device` retired (step 4).
 
 ## Found while mapping the kernel's vault (2026-11-07)
 

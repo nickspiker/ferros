@@ -38,6 +38,10 @@ const IDENTITY: [&str; 5] = ["map.", "fgtw.", "ahau.", "wifi.cred", "gnss.last"]
 pub fn identity_class(name: &str) -> bool {
     IDENTITY.iter().any(|p| name.starts_with(p))
 }
+/// Whether a scope (its prefix) holds any identity-class names: a listing of it covers the person's domain as well as the device's.
+pub fn identity_within(prefix: &str) -> bool {
+    IDENTITY.iter().any(|p| p.starts_with(prefix) || prefix.starts_with(p))
+}
 /// The device-only secret mixed into every identity key: 32 bytes from this session's wairua the first time an identity is unlocked, kept in the device class. Google has no record of it and Android cannot read the partition it is on (the hypervisor's net, AUTH.md), so the identity key needs more than the chip's published values and a guessed handle.
 const ID_SECRET: &str = "\0id.secret";
 /// The seed kept for unlock at boot (`device.unlock_at_boot`, SETTINGS.md): only while that setting is on, in the device class, deleted at the first boot with it off. Whoever holds the device then holds the identity — the warning the setting carries.
@@ -46,13 +50,15 @@ const ID_UNLOCK: &str = "\0id.unlock";
 const ID_NAMES: &str = "\0id.names";
 /// Whether an identity is unlocked now (a person is present): the vault's own `id`, mirrored lock-free for SYS_FACTS 83, which any process may ask, so the radios' drivers can refuse while locked without holding the unlock right (AUTH.md "Radios while locked").
 pub static PERSON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// One identity per device (AUTH.md; the network owns the assignment): set when the unlocked identity'"'"'s fleet binds this device, cleared on release (a completed departure). While set, only that identity unlocks.
+/// One identity per device (AUTH.md; the network owns the assignment): set when the unlocked identity's fleet binds this device, cleared on release (a completed departure). While set, only that identity unlocks.
 const ID_BOUND: &str = "\0id.bound";
-/// Every identity-class entry'"'"'s vault address, 32 bytes each, in the device class: opaque (no names, no contents, nothing but a count), so the identity class can be wiped whole without its key — on release, and when a different handle unlocks a device that is not bound yet.
+/// Every identity-class entry's vault address, 32 bytes each, in the device class: opaque (no names, no contents, nothing but a count), so the identity class can be wiped whole without its key — on release, and when a different handle unlocks a device that is not bound yet.
 const ID_ADDRS: &str = "\0id.addrs";
 const ID_CONTEXT: &str = "ferros identity vault v1";
 const ID_ADDR_CONTEXT: &str = "ferros identity vault addr v1";
 const ID_PAYLOAD_CONTEXT: &str = "ferros identity vault payload v1";
+/// The base the kernel derives the person's vault domains from (process.rs `domain_keys`, VAULT-OUT.md): one per unlock, wiped at lock.
+const ID_DOMAIN_CONTEXT: &str = "ferros 2026-11-07 identity vault domain";
 const ID_SECRET_CONTEXT: &str = "ferros identity secret v1";
 
 /// Which keys an entry is sealed under.
@@ -70,6 +76,8 @@ struct IdKeys {
     addr_key: [u8; 32],
     /// Plain bytes, the cipher built from them per use: a stored cipher's key is not wiped when it is dropped, and these must be (`lock`).
     payload_key: [u8; 32],
+    /// The base of the person's vault domains (the vault process's, VAULT-OUT.md).
+    domain: [u8; 32],
 }
 
 /// Block I/O counters for `selftest`.
@@ -390,12 +398,15 @@ impl KVault {
         let mut k = *h.finalize().as_bytes();
         let addr_key = blake3::derive_key(ID_ADDR_CONTEXT, &k);
         let payload_key = blake3::derive_key(ID_PAYLOAD_CONTEXT, &k);
-        self.id = Some(IdKeys { addr_key, payload_key });
+        let domain = blake3::derive_key(ID_DOMAIN_CONTEXT, &k);
+        self.id = Some(IdKeys { addr_key, payload_key, domain });
+        // What the person had in the kernel's vault may now move to the vault process.
+        crate::process::MIGRATE_PENDING.store(true, core::sync::atomic::Ordering::Release);
         PERSON.store(true, core::sync::atomic::Ordering::Release);
         for b in [&mut secret, &mut base, &mut k] {
             b.fill(0);
         }
-        // One identity per device: a seed whose key opens no name list is not the bound identity'"'"'s (refused), or, on a device not bound yet, a different handle from the last one (whose leftovers go).
+        // One identity per device: a seed whose key opens no name list is not the bound identity's (refused), or, on a device not bound yet, a different handle from the last one (whose leftovers go).
         if self.raw_get_in(Class::Identity, ID_NAMES)?.is_none() {
             if self.bound()? {
                 self.lock();
@@ -412,9 +423,12 @@ impl KVault {
     /// Lock the identity: its keys dropped, their bytes overwritten first. What it had stored stays sealed on disk.
     pub fn lock(&mut self) {
         PERSON.store(false, core::sync::atomic::Ordering::Release);
+        // The vault process drops what it holds of the person's when it sees this change (the stamp carries it).
+        crate::process::LOCK_EPOCH.fetch_add(1, core::sync::atomic::Ordering::Release);
         if let Some(mut k) = self.id.take() {
             k.addr_key.fill(0);
             k.payload_key.fill(0);
+            k.domain.fill(0);
             core::hint::black_box(&k);
         }
     }
@@ -423,12 +437,17 @@ impl KVault {
         self.id.is_some()
     }
 
-    /// Whether an identity'"'"'s fleet has bound this device.
+    /// The base of the unlocked person's vault domains; None while locked.
+    pub fn identity_domain(&self) -> Option<[u8; 32]> {
+        self.id.as_ref().map(|k| k.domain)
+    }
+
+    /// Whether an identity's fleet has bound this device.
     pub fn bound(&mut self) -> Result<bool, KvError> {
         Ok(self.raw_get(ID_BOUND)?.is_some())
     }
 
-    /// The unlocked identity'"'"'s fleet has bound this device: from now on only it unlocks here, until release.
+    /// The unlocked identity's fleet has bound this device: from now on only it unlocks here, until release.
     pub fn bind(&mut self) -> Result<(), KvError> {
         if self.id.is_none() {
             return Err(KvError::Locked);
@@ -437,7 +456,7 @@ impl KVault {
         Ok(())
     }
 
-    /// Release the device (a completed departure, or the developer'"'"'s `diag "identity release"`): every identity-class entry deleted, the binding and any kept seed gone, the identity locked, and the device-only secret deleted so a new one is made at the next unlock — anything the address list missed can no longer be opened by anyone.
+    /// Release the device (a completed departure, or the developer's `diag "identity release"`): every identity-class entry deleted, the binding and any kept seed gone, the identity locked, and the device-only secret deleted so a new one is made at the next unlock — anything the address list missed can no longer be opened by anyone.
     pub fn release(&mut self) -> Result<usize, KvError> {
         let n = self.wipe_identity()?;
         for name in [ID_BOUND, ID_UNLOCK, ID_SECRET] {
@@ -463,7 +482,7 @@ impl KVault {
         Ok(list.len() / 32)
     }
 
-    /// Keep `ID_ADDRS` in step with the identity class'"'"'s entries.
+    /// Keep `ID_ADDRS` in step with the identity class's entries.
     fn track(&mut self, a: &[u8; 32], add: bool) -> Result<(), KvError> {
         let list = self.raw_get(ID_ADDRS)?.unwrap_or_default();
         let has = list.chunks_exact(32).any(|c| c == a);

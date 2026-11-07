@@ -150,6 +150,7 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                 return alloc::vec![5];
             }
             crate::flashlog::line(&alloc::format!("store set {key:?} {len} bytes"));
+            crate::process::note_old_put(&key);
             match store.set(&key, &params[2 + klen..]) {
                 Ok(h) => {
                     // The settings document set from the bridge applies at once, as a change on the device does (SYS_SET_PREF): every live process sees it on its next frame.
@@ -288,11 +289,27 @@ fn store_scoped(key: &str, value: Option<&[u8]>) -> Result<Option<alloc::vec::Ve
     match value {
         Some(v) => {
             crate::flashlog::line(&alloc::format!("store set {key:?} {} bytes (process)", v.len()));
+            // Written here while no vault process serves (it is opening, or not started): it moves there later.
+            crate::process::note_old_put(key);
             st.set(key, v).map(|_| None).map_err(|_| ())
         }
         None => st.get_by_key(key).map_err(|_| ()),
     }
 }
+
+/// The base of a class's vault domains (process.rs `domain_keys`, VAULT-OUT.md): the device's from the ira, derived once; the person's from their unlock, None while locked.
+fn domain_base(identity: bool) -> Option<[u8; 32]> {
+    if identity {
+        return unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut())?.identity_domain();
+    }
+    let base = unsafe { &mut *(&raw mut DEVICE_DOMAIN) };
+    if base.is_none() {
+        *base = crate::ira::derive(DEVICE_DOMAIN_CONTEXT);
+    }
+    *base
+}
+const DEVICE_DOMAIN_CONTEXT: &str = "ferros 2026-11-07 device vault domain";
+static mut DEVICE_DOMAIN: Option<[u8; 32]> = None;
 
 /// Before any reset the kernel orders: the identity's key dropped (AUTH.md: it locks when power goes or the device switches OS, and a warm reset keeps DRAM).
 fn lock_before_reset() {
@@ -473,8 +490,17 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     ]
 }
 
+/// The vault process's capabilities (payloads/vault: 1 serve `vault`, 2 the `vault` block window, 3 entropy, 4 the vault right). Not init's to hand out: the kernel starts it before init (VAULT-OUT.md, decision 0), and init's grants page is full.
+fn vault_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
+    use crate::process::Grant::*;
+    alloc::vec![Serve(b"vault"), Blocks(b"vault"), Entropy, Vault]
+}
+
 /// Each shell process's capabilities, as init hands them out (payloads/init: the slots of `home_grants`, 1-based), for restarting one from the vault without a reboot.
 fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'static>>> {
+    if name == b"vault" {
+        return Some(vault_grants());
+    }
     let slots: &[usize] = match name {
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
         b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103, 20],
@@ -614,6 +640,16 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
         return true;
     };
     let sealed = store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten()).unwrap_or_default();
+    // The vault process first (VAULT-OUT.md, decision 0), so it is serving when the processes init starts ask for what they keep; until it is, the kernel's vault answers them. Its capsule rides in the kernel's vault for now (`vault`, kept by the kernel: never forwarded, never moved); the kernel image carries it once the kernel keeps no disk of its own. None stored: every store call is the kernel's vault's, as before.
+    if let Some(vc) = store.as_mut().and_then(|s| s.get_by_key("vault").ok().flatten()) {
+        match crate::process::spawn_capsule(b"vault", &vc, b"", &vault_grants(), &sealed) {
+            Ok(o) => {
+                mark_ran(&o);
+                crate::process::push_console(&o.console);
+            }
+            Err(e) => crate::process::push_console(alloc::format!("home: vault refused: {e}\n").as_bytes()),
+        }
+    }
     // The pipe stays at ABL's 8 bpc here: the display server takes it to the 10 bpc blend at its start (payloads/display modeset.rs; KERNEL-OUT.md decision 6, 2026-11-01).
     // The touch controller is the touch process's to bring up (its `touch` power switch, then the ready event and scan mode: payloads/touch; KERNEL-OUT.md move 1).
     match crate::process::spawn_capsule(b"init", &capsule, b"", &home_grants(), &sealed) {
@@ -1078,6 +1114,7 @@ pub fn run(mut b: Boot) -> ! {
         crate::process::STORE_REMOVE = Some(store_remove);
         crate::process::STORE_KEYS = Some(store_keys);
         crate::process::STORE_ADDR = Some(store_addr);
+        crate::process::DOMAIN_BASE = Some(domain_base);
         crate::process::UNLOCK = Some(store_unlock);
         crate::process::EXPORT = Some(store_export);
         crate::platform::BEFORE_RESET = Some(lock_before_reset);
@@ -3076,6 +3113,7 @@ pub fn run(mut b: Boot) -> ! {
                             12 => crate::process::Grant::Pt,
                             13 => crate::process::Grant::Sensors,
                             14 => crate::process::Grant::Blocks(g),
+                            15 => crate::process::Grant::Vault,
                             _ => crate::process::Grant::Use(g),
                         });
                     }

@@ -1,17 +1,14 @@
-//! The vault process (docs/VAULT-OUT.md): the vault out of the kernel. It owns its disk (a window of blocks the kernel moves for it, `ferros_sys::block_read`/`block_write`), the layout (manifestus: the rotating ring, the tract, the HAMT, two mirrors), and the values of any size, sealed in pieces (`ferros_store`); the kernel only moves blocks and, from step 3, issues each request's domain keys.
-//!
-//! Step 1 (2026-11-07): this process runs beside the kernel's own vault, on a new, empty region, and serves test domains whose keys are fixed and not secret (`test_domain`), so its disk path and its store can be proven on the device before anything depends on it. Nothing of a person's goes here until the kernel issues real keys.
+//! The vault process (docs/VAULT-OUT.md): the vault out of the kernel. It owns its disk (a window of blocks the kernel moves for it, `ferros_sys::block_read`/`block_write`), the layout (manifestus: the rotating ring, the tract, the HAMT, two mirrors), and the values of any size, sealed in pieces (`ferros_store`). The kernel moves blocks and issues each request's domain keys; it holds, parses and seals no value.
 //!
 //! The mirrors: A from block 0 of the window, B from half way (the window is 2 × 8 GiB, process.rs WINDOWS); each starts at MIRROR blocks (512 MiB) and grows into its half later (manifestus `grow`), because a blank vault is read whole before its first commit and 8 GiB would be four million reads.
 //!
-//! Requests (≤ 4 KiB, op-byte messages as the display's): [op][domain][name length][name][rest]; the reply's first byte is the status (0 done, 1 absent, 2 failed, 3 a bad request).
-//! - 0 set: rest [offset u64 LE][more u8][bytes]: the value's bytes from `offset`, in order from 0; the piece without `more` finishes it.
-//! - 1 get: rest [offset u64 LE]: reply [status][whole length u64 LE][the bytes from offset, as many as fit].
-//! - 2 delete: reply [status][whether it was there].
-//! - 3 names: rest [index u32 LE]: reply [status][count u32 LE][from that index, each name as its length then its bytes, as many as fit].
-//! - 4 sweep: reply [status][pieces removed u64 LE].
+//! Requests come only from the kernel (process.rs `store_forward`): each is a process's `SYS_STORE` call, stamped with the domain keys of its scope, one transfer at most. [op: 0 set, 1 get, 2 delete, 3 list][flags: bit 0 old entries wait in the kernel's vault][lock epoch u32 LE][domains][per domain: class (1 the person's), address key, sealing key][name length][name: within the scope, or 1 and a 32-byte address][rest]. Rest: set [offset u64][more u8][bytes]; get [offset u64][length u32]; list [offset u64][length u32][addresses u8]. The reply: [the syscall's value u64 LE][the bytes for the caller's buffer].
 //!
-//! Grant slots: 0 console, 1 serve `vault`, 2 the `vault` block window, 3 entropy.
+//! Keys live for the request they came with: zeroed after it, and the store's cache knows a key only by its hash. When the lock epoch moves (the person locked), the cache's plaintext and any write of the person's in progress go.
+//!
+//! Migration (VAULT-OUT.md): whenever a stamp says old entries wait (from boot, after a bridge `store put`, at unlock), the vault takes each old entry of the kernel's vault that belongs here (`SYS_VAULT`): its domain keys and its value, written into its domain, then removed from the kernel's vault once committed.
+//!
+//! Grant slots: 0 console, 1 serve `vault`, 2 the `vault` block window, 3 entropy, 4 the vault right.
 #![no_std]
 #![no_main]
 
@@ -58,6 +55,7 @@ static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
 const S_SERVE: u64 = 1;
 const S_BLOCKS: u64 = 2;
 const S_ENTROPY: u64 = 3;
+const S_VAULT: u64 = 4;
 
 /// Each mirror's size to start with, in 4 KiB blocks (512 MiB), and where B starts in the window (its second half).
 const MIRROR: u64 = 1 << 17;
@@ -162,11 +160,6 @@ fn seconds() -> i64 {
     (now() / freq()) as i64
 }
 
-/// Step 1's test domains: keys fixed by the domain's number and not secret, for proving the disk path and the store on the device. Gone once the kernel issues real keys (VAULT-OUT.md, step 3).
-fn test_domain(n: u8) -> Domain {
-    Domain { addr: blake3::derive_key("ferros vault process step 1 test domain addresses", &[n]), seal: blake3::derive_key("ferros vault process step 1 test domain seal", &[n]) }
-}
-
 struct Log {
     b: [u8; 256],
     n: usize,
@@ -200,6 +193,17 @@ pub extern "C" fn vault_main(g: u64, _input: u64, _input_len: u64) -> ! {
     ferros_sys::thread_exit(0)
 }
 
+/// A value being written a piece at a time: its domain (by a hash of the address key: no key outlives its request), whether it is the person's, its name, the next offset expected, the writer.
+struct Pending {
+    domain: [u8; 32],
+    person: bool,
+    name: Vec<u8>,
+    next: u64,
+    w: Writer,
+}
+
+type St = Store<Half, Half, Entropy>;
+
 extern "C" fn work(_: u64) -> ! {
     let t0 = now();
     let mirror = Mirror::new(Half { base: 0, blocks: MIRROR }, Half { base: HALF, blocks: MIRROR });
@@ -212,132 +216,207 @@ extern "C" fn work(_: u64) -> ! {
     };
     let mut store = Store::new(vault, Entropy { pool: [0; 4096], at: 4096 }, seconds);
     say!("vault: open in {} ms, serving", (now() - t0) * 1000 / freq());
-    let mut msg = alloc::vec![0u8; 4096];
-    let mut out = alloc::vec![0u8; 4096];
+    // One transfer and its stamp each way, with room to spare.
+    let mut msg = alloc::vec![0u8; 8 << 10];
+    let mut out = alloc::vec![0u8; 8 << 10];
     let mut token = [0u8; 32];
-    // Values being written a piece at a time: (domain, name, the next offset expected, the writer).
-    let mut writers: Vec<(u8, Vec<u8>, u64, Writer)> = Vec::new();
+    let mut writers: Vec<Pending> = Vec::new();
+    let mut epoch: Option<u32> = None;
     loop {
         let n = ferros_sys::recv(cap(grants(), S_SERVE), &mut msg, &mut token, false);
         if n == ERR {
             continue;
         }
-        let len = serve(&mut store, &mut writers, &msg[..n as usize], &mut out);
+        let m = &mut msg[..n as usize];
+        let e = u32::from_le_bytes(m[2..6].try_into().unwrap());
+        if epoch.is_some_and(|x| x != e) {
+            // The person locked (or unlocked) since the last request: what this process holds of theirs goes.
+            store.forget();
+            writers.retain(|p| !p.person);
+        }
+        epoch = Some(e);
+        // Old entries wait in the kernel's vault: they move before this request is served, so it never finds a name between the two vaults (gone from the kernel's, not yet here).
+        if m[1] & 1 != 0 {
+            migrate(&mut store);
+        }
+        let len = serve(&mut store, &mut writers, m, &mut out);
+        m.fill(0);
         ferros_sys::reply(&token, &out[..len]);
     }
 }
 
-/// One request into `out`; returns the reply's length.
-fn serve(store: &mut Store<Half, Half, Entropy>, writers: &mut Vec<(u8, Vec<u8>, u64, Writer)>, m: &[u8], out: &mut [u8]) -> usize {
-    // A message is the caller's: every length in it is checked against what it holds.
-    if m.len() < 3 || m.len() < 3 + m[2] as usize {
-        out[0] = 3;
-        return 1;
-    }
-    let (op, dn, name, rest) = (m[0], m[1], &m[3..3 + m[2] as usize], &m[3 + m[2] as usize..]);
-    let d = test_domain(dn);
-    let u64_at = |b: &[u8]| -> Option<u64> { b.get(..8).map(|s| u64::from_le_bytes(s.try_into().unwrap_or([0; 8]))) };
-    match op {
-        0 if !name.is_empty() && rest.len() >= 9 => {
-            let (offset, more, bytes) = (u64_at(rest).unwrap_or(0), rest[8] != 0, &rest[9..]);
-            let i = match writers.iter().position(|w| w.0 == dn && w.1 == name) {
-                Some(i) if offset == writers[i].2 => i,
-                // A value starts at offset 0; one restarted from 0 starts afresh (its earlier pieces are left for the sweep).
-                Some(i) if offset == 0 => {
+/// The domain at `at` of a stamp: (the person's?, the domain).
+fn domain_at(m: &[u8], at: usize) -> (bool, Domain) {
+    let mut d = Domain { addr: [0; 32], seal: [0; 32] };
+    d.addr.copy_from_slice(&m[at + 1..at + 33]);
+    d.seal.copy_from_slice(&m[at + 33..at + 65]);
+    (m[at] != 0, d)
+}
+
+fn wipe(d: &mut Domain) {
+    d.addr.fill(0);
+    d.seal.fill(0);
+    core::hint::black_box(d);
+}
+
+/// One stamped request into `out` (the reply: the syscall's value, then the caller's bytes); returns the reply's length.
+fn serve(store: &mut St, writers: &mut Vec<Pending>, m: &[u8], out: &mut [u8]) -> usize {
+    const NOTHING: u64 = ferros_sys::NOTHING;
+    let (op, count) = (m[0], m[6] as usize);
+    let at_name = 7 + count * 65;
+    let name = &m[at_name + 1..at_name + 1 + m[at_name] as usize];
+    let rest = &m[at_name + 1 + name.len()..];
+    let u64_at = |b: &[u8]| u64::from_le_bytes(b[..8].try_into().unwrap());
+    let mut data = 0;
+    let ret = if op == 3 {
+        // A listing over every domain stamped: names one per line, or with the address flag the 32-byte addresses.
+        let (offset, len, raw) = (u64_at(rest) as usize, u32::from_le_bytes(rest[8..12].try_into().unwrap()) as usize, rest[12] != 0);
+        let mut all = Vec::new();
+        let mut ok = true;
+        for i in 0..count {
+            let (_, mut d) = domain_at(m, 7 + i * 65);
+            match store.names(&d) {
+                Ok(names) => {
+                    for nm in names {
+                        match (raw, nm.first()) {
+                            (true, Some(1)) if nm.len() == 33 => all.extend_from_slice(&nm[1..]),
+                            (false, Some(&c)) if c != 1 => {
+                                all.extend_from_slice(&nm);
+                                all.push(b'\n');
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(_) => ok = false,
+            }
+            wipe(&mut d);
+        }
+        if ok {
+            // WHY: the offset is the caller's and may lie past the end (nothing to send then).
+            let from = offset.min(all.len());
+            data = (all.len() - from).min(len);
+            out[8..8 + data].copy_from_slice(&all[from..from + data]);
+            all.len() as u64
+        } else {
+            ERR
+        }
+    } else {
+        let (person, mut d) = domain_at(m, 7);
+        let id = *blake3::hash(&d.addr).as_bytes();
+        let r = match op {
+            0 => {
+                let (offset, more, bytes) = (u64_at(rest), rest[8] != 0, &rest[9..]);
+                let i = match writers.iter().position(|p| p.domain == id && p.name == name) {
+                    Some(i) if offset == writers[i].next => Some(i),
+                    // A value starts at offset 0; one restarted from 0 starts afresh (its earlier pieces are left for the sweep).
+                    Some(i) if offset == 0 => {
+                        writers.swap_remove(i);
+                        None
+                    }
+                    None if offset == 0 => None,
+                    _ => {
+                        wipe(&mut d);
+                        return reply(out, ERR, 0);
+                    }
+                };
+                let i = i.unwrap_or_else(|| {
+                    writers.push(Pending { domain: id, person, name: name.to_vec(), next: 0, w: store.begin(&d, name) });
+                    writers.len() - 1
+                });
+                let ok = store.write(&d, &mut writers[i].w, bytes).is_ok();
+                writers[i].next += bytes.len() as u64;
+                if !ok {
                     writers.swap_remove(i);
-                    writers.push((dn, name.to_vec(), 0, store.begin(&d, name)));
-                    writers.len() - 1
+                    ERR
+                } else if !more {
+                    let w = writers.swap_remove(i).w;
+                    if store.finish(&d, w).is_ok() { 0 } else { ERR }
+                } else {
+                    0
                 }
-                None if offset == 0 => {
-                    writers.push((dn, name.to_vec(), 0, store.begin(&d, name)));
-                    writers.len() - 1
+            }
+            1 => {
+                let (offset, len) = (u64_at(rest), u32::from_le_bytes(rest[8..12].try_into().unwrap()) as usize);
+                match store.read(&d, name, offset, &mut out[8..8 + len]) {
+                    Ok(Some(whole)) => {
+                        // WHY: the offset is the caller's and may lie past the end (nothing to send then: the subtraction stops at 0).
+                        data = (whole.saturating_sub(offset) as usize).min(len);
+                        whole
+                    }
+                    Ok(None) => NOTHING,
+                    Err(e) => {
+                        say!("vault: read failed: {:?}", e);
+                        ERR
+                    }
                 }
-                _ => {
-                    out[0] = 3;
-                    return 1;
+            }
+            2 => {
+                writers.retain(|p| !(p.domain == id && p.name == name));
+                match store.delete(&d, name) {
+                    Ok(true) => 0,
+                    Ok(false) => NOTHING,
+                    Err(_) => ERR,
                 }
-            };
-            let ok = store.write(&d, &mut writers[i].3, bytes).is_ok();
-            writers[i].2 += bytes.len() as u64;
-            out[0] = if !ok {
-                writers.swap_remove(i);
-                2
-            } else if !more {
-                let w = writers.swap_remove(i).3;
-                if store.finish(&d, w).is_ok() { 0 } else { 2 }
-            } else {
-                0
-            };
-            1
+            }
+            _ => ERR,
+        };
+        wipe(&mut d);
+        r
+    };
+    reply(out, ret, data)
+}
+
+fn reply(out: &mut [u8], ret: u64, data: usize) -> usize {
+    out[..8].copy_from_slice(&ret.to_le_bytes());
+    8 + data
+}
+
+/// Every old entry of the kernel's vault that belongs here, written into its domain and then removed from the kernel's vault. One that will not move is skipped (and left where it is).
+fn migrate(store: &mut St) {
+    let c = cap(grants(), S_VAULT);
+    let (mut skip, mut moved, mut bytes) = (0u64, 0u32, 0u64);
+    let t0 = now();
+    let mut head = [0u8; 512];
+    let mut piece = alloc::vec![0u8; 4096];
+    loop {
+        let n = ferros_sys::vault_next(c, skip, &mut head);
+        if n == ferros_sys::NOTHING || n == ERR {
+            break;
         }
-        1 => {
-            let offset = u64_at(rest).unwrap_or(0);
-            let room = out.len() - 9;
-            match store.read(&d, name, offset, &mut out[9..]) {
-                Ok(Some(whole)) => {
-                    out[0] = 0;
-                    out[1..9].copy_from_slice(&whole.to_le_bytes());
-                    // WHY: the offset is the caller's and may lie past the end (nothing to send then: the subtraction stops at 0), and a reply holds what fits in 4 KiB after its header.
-                    9 + (whole.saturating_sub(offset) as usize).min(room)
-                }
-                Ok(None) => {
-                    out[0] = 1;
-                    1
-                }
-                Err(e) => {
-                    say!("vault: read failed: {:?}", e);
-                    out[0] = 2;
-                    1
-                }
+        let n = n as usize;
+        let (_, mut d) = domain_at(&head, 0);
+        let full = head[66..n].to_vec();
+        let rel = &full[head[65] as usize..];
+        head.fill(0);
+        let mut w = store.begin(&d, rel);
+        let mut offset = 0u64;
+        let ok = loop {
+            let whole = ferros_sys::vault_read(c, &full, offset, &mut piece);
+            if whole == ERR || whole == ferros_sys::NOTHING {
+                break false;
             }
+            let take = ((whole - offset) as usize).min(piece.len());
+            if store.write(&d, &mut w, &piece[..take]).is_err() {
+                break false;
+            }
+            offset += take as u64;
+            if offset == whole {
+                break store.finish(&d, w).is_ok();
+            }
+        };
+        wipe(&mut d);
+        piece.fill(0);
+        if ok && ferros_sys::vault_done(c, &full) == 0 {
+            moved += 1;
+            bytes += offset;
+        } else {
+            say!("vault: {} did not move; left in the kernel's vault", core::str::from_utf8(&full).unwrap_or("?"));
+            skip += 1;
         }
-        2 => match store.delete(&d, name) {
-            Ok(was) => {
-                out[0] = 0;
-                out[1] = was as u8;
-                2
-            }
-            Err(_) => {
-                out[0] = 2;
-                1
-            }
-        },
-        3 => {
-            let from = rest.get(..4).map(|b| u32::from_le_bytes(b.try_into().unwrap_or([0; 4]))).unwrap_or(0) as usize;
-            let Ok(names) = store.names(&d) else {
-                out[0] = 2;
-                return 1;
-            };
-            out[0] = 0;
-            let mut at = 5;
-            let mut count = 0u32;
-            for nm in names.iter().skip(from) {
-                if at + 1 + nm.len() > out.len() {
-                    break;
-                }
-                out[at] = nm.len() as u8;
-                out[at + 1..at + 1 + nm.len()].copy_from_slice(nm);
-                at += 1 + nm.len();
-                count += 1;
-            }
-            out[1..5].copy_from_slice(&count.to_le_bytes());
-            at
-        }
-        4 => match store.sweep(&d) {
-            Ok(n) => {
-                out[0] = 0;
-                out[1..9].copy_from_slice(&n.to_le_bytes());
-                9
-            }
-            Err(_) => {
-                out[0] = 2;
-                1
-            }
-        },
-        _ => {
-            out[0] = 3;
-            1
-        }
+    }
+    if moved > 0 || skip > 0 {
+        say!("vault: moved {} entries ({} bytes) from the kernel's vault in {} ms, {} left", moved, bytes, (now() - t0) * 1000 / freq(), skip);
     }
 }
 
