@@ -64,6 +64,11 @@ The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by t
 4. Migration of the existing vault, on first run.
 5. First use: the person's wallpaper (below), stored once at bind.
 
+## Wear and bad blocks (owner, 2026-11-07)
+
+- The vault keeps manifestus in plain mode on managed flash (UFS, NVMe): everything rotates (the spine's slot is `generation & (N−1)`, the tract is a log and its reap moves even cold data once a lap), so no block is rewritten in place. Ordinary filesystems leave fixed blocks that the controller's leveling cannot spread; ours has none, so the controller levels evenly, and its own bad-block remap comes with it at no cost to us.
+- Relocating bad blocks ourselves (manifestus's designed, unbuilt relocation: a corrupt read falling back to the other mirror, a failed write-verify landing elsewhere) is left as a future option, not built now. The migrating root ring and a bad-block tombstone map belong to raw flash with no controller (PIPE, a raw SD), when we get there.
+
 ## Built so far
 
 - **`ferros_store` (2026-11-07):** the vault's values of any size over manifestus, no_std, host-tested.
