@@ -13,7 +13,7 @@
 //!
 //! Colour: each pixel's orbit gives its smooth escape count n and its distance d to the set (the exterior distance estimate |z| ln|z| / |dz/dz₀|).
 //! d, measured in spans of the frame, draws the filaments and their halo, so their width is the same fraction of the frame on every display; log₂(1 + n), normalised to the survey's median and 99th percentile, shades the field and lights the hottest filaments white and the knots warm.
-//! Every layer is a colour mixed over what is below it in linear light, by a weight that is a C∞ function of d and n (a Cauchy bump, an algebraic sigmoid); nothing is clamped.
+//! The layers go front to back (AGENT.md "Compositing: Front to Back, `under` Only"): each a colour at a weight that is a C∞ function of d, n and the relief (a Cauchy bump, an algebraic sigmoid), taking its share of the light still uncovered; nothing is clamped. Behind the near set, the same set again zoomed out, turned and shifted, drawn as a soft dim glow, gives depth; a seeded lamp lights the set's relief (the potential's gradient), Lambert and a sheen, over a low ambient so the picture stays dark.
 //! Each colour is a VSF RGB colour, written as its working value (√light, white at Q14) and mixed as light.
 //!
 //! Output: the display's working values, a u64 per pixel, R, G and B in bits 0-15, 16-31 and 32-47 as √light × 16384, α G#FFFF in bits 48-63.
@@ -22,6 +22,7 @@
 
 use core::f32::consts::{PI, TAU};
 use core::ops::Range;
+use vsf::colour::{LMS2PHOTOPIC, LMS2VSF_RGB, VSF_RGB2LMS};
 
 /// The most iterations a pixel's orbit is followed.
 pub const MAX_ITER: u32 = 1 << 9;
@@ -46,9 +47,10 @@ const BACK_STEPS: u32 = 1 << 4;
 /// How far the view's centre is pulled from that point toward the set's centre (0), and the view's size in the plane per span of the frame.
 const PULL: [f32; 2] = [0.1, 0.7];
 const VIEW_SPAN: [f32; 2] = [0.6, 1.4];
-/// The seeded turn of the palette about the grey axis: from 7.5° toward cyan to 15° toward violet (a positive turn takes blue toward red), so every palette stays in the blue-violet family; and of the warm sparks on their own, 15° either way.
-const HUE: [f32; 2] = [-PI / 24., PI / 12.];
+/// The warm sparks turn with the palette (they stay its complement) and a seeded 15° either way on their own.
 const WARM_HUE: [f32; 2] = [-PI / 12., PI / 12.];
+/// The hue is drawn from its own stream of the seed (this number in place of an attempt's), so it is the same whichever attempt's composition is kept, and uniform round the whole circle.
+const HUE_STREAM: u32 = u32::MAX;
 
 /// A candidate passes when the fraction of its frame near the set lies between these, each third holds at least `NEAR_THIRD`, and under `INSIDE` never escapes.
 const NEAR: [f32; 2] = [0.25, 0.6];
@@ -58,7 +60,7 @@ const INSIDE: f32 = 1. / (1u32 << 6) as f32;
 const NEAR_SPAN: f32 = 1. / (1u32 << 7) as f32;
 
 /// The palette, as working values (√light, white = 16384): the background's two ends, the field's shade, the halo, the filament, its white-hot core and the warm spark.
-const BG: [[u16; 3]; 2] = [[2785, 2785, 6390], [3768, 3932, 8028]];
+const BG: [[u16; 3]; 2] = [[2437, 2437, 5591], [3297, 3441, 7025]];
 const SHADE: [u16; 3] = [5243, 5079, 8520];
 const HALO: [u16; 3] = [4588, 5407, 11469];
 const FIL: [u16; 3] = [5898, 7209, 14090];
@@ -66,19 +68,64 @@ const HOT: [u16; 3] = [10158, 11469, 14090];
 const WARM: [u16; 3] = [13107, 11141, 6226];
 
 /// How strongly each layer is laid on, where it sits and how sharply it turns on: the field's shade by the normalised count v, the halo and filament by distance (their widths as the inverse of a span fraction), and the hot and warm cores by v.
-const SHADE_A: f32 = 5. / 8.;
+const SHADE_A: f32 = 1. / 8.;
 const SHADE_V: f32 = 3. / 8.;
 const SHADE_K: f32 = 3.;
-const HALO_A: f32 = 1. / 2.;
-const HALO_INV: f32 = (3u32 << 7) as f32;
+const RAYS_A: f32 = 1. / 2.;
+const RAYS_K: f32 = 8.;
+const RAYS_MID: f32 = 3. / 8.;
+const GLOW_INV: f32 = (1u32 << 4) as f32;
+const HALO_A: f32 = 5. / 8.;
+const HALO_INV: f32 = (1u32 << 7) as f32;
 const FIL_A: f32 = 3. / 4.;
 const CORE_INV: f32 = (1u32 << 12) as f32;
 const HOT_V: f32 = 1.;
 const HOT_K: f32 = 4.;
+const WARM_INV: f32 = (1u32 << 11) as f32;
 const WARM_V: f32 = 9. / 8.;
 const WARM_K: f32 = 8.;
 /// The background's gradient: how far its ends sit apart along the seeded direction, in spans.
 const GRAD_SPANS: f32 = 2.;
+
+/// The far layer (owner, 2026-11-07: "more layers"): the same set seen again behind the flames, zoomed out by a seeded factor, offset and turned, drawn only as a wide soft glow (defocused), dim, in its own colour: depth behind the flower.
+const FAR: [u16; 3] = [4588, 5100, 10650];
+const FAR_ZOOM: [f32; 2] = [2., 4.];
+const FAR_TURN: [f32; 2] = [PI / 8., PI / 2.];
+/// How far the far view's centre sits from the near one's, in the far view's spans.
+const FAR_SHIFT: f32 = 1. / 4.;
+/// The far glow's width (the inverse of a span fraction, of the far view's own span) and how strongly it is laid on.
+const FAR_INV: f32 = (1u32 << 2) as f32;
+const FAR_A: f32 = 3. / 8.;
+/// The far layer's hue sits a seeded way off the palette's, within this either side.
+const FAR_HUE: [f32; 2] = [-PI / 4., PI / 4.];
+
+/// The lighting (owner, 2026-11-07: "a little bit of lighting/shading"): a lamp from a seeded direction lights the set's relief (`Orbit::u`).
+/// Lambert, smooth: (u·l + LAMP_H) / (1 + LAMP_H), from (LAMP_H − 1)/(LAMP_H + 1) facing away to 1 facing the lamp, a C∞ function of the normal (no max); the halo keeps AMBIENT of its light whatever the facing, so it stays dark rather than black.
+const LAMP_H: f32 = 2.;
+const AMBIENT: f32 = 1. / 4.;
+/// A sheen where the relief faces the lamp: ((u·l + 1)/2)^16, the light's colour laid over the halo by this much at most.
+const SHEEN_A: f32 = 1. / 2.;
+
+/// The density gradient map (owner, 2026-11-07: "density gradient map, mix shit together"; "each one is very monochromatic"): STOPS colours from the field's dark to the filament's light, each its own hue, the seed walking the hue circle from stop to stop by a seeded step either way, so every wallpaper is several hues, not one. Every layer takes its colour from the map at a density of its own (where escape is slow, how near the set, the flames, the far layer), so the hues mix through the picture.
+const STOPS: usize = 6;
+const STOP_CODES: [[u16; 3]; STOPS] = [BG[0], BG[1], SHADE, FAR, HALO, FIL];
+const HUE_STEP: [f32; 2] = [PI / 4., 2. * PI / 3.];
+/// How sharply the map's stops hold their colour between neighbours: each stop's weight is a Cauchy bump 1/(1 + ((t − t_k)·GM_K)²), the weights normalised: a C∞ partition of unity, so the map's colour has no kink anywhere.
+const GM_K: f32 = 8.;
+/// Where each layer reads the map: the field across its dark end (by the background's gradient and the slow-escape shade), the far layer and the flames in the middle, the halo above them (drifting with escape speed), the filament at the bright end.
+const FIELD_T: f32 = 3. / 8.;
+const FAR_T: [f32; 2] = [3. / 8., 5. / 8.];
+const RAYS_T: [f32; 2] = [1. / 4., 5. / 8.];
+const HALO_T: [f32; 2] = [5. / 8., 7. / 8.];
+
+/// The flames' tongues (owner, 2026-11-07: "more flames"): along the flame's real part, sin 2π·Re·FLAME_F made into tongues by an algebraic sigmoid of steepness FLAME_K, laid on by FLAME_A at most; their colour from the map by the imaginary part's own wave, between FLAME_T's ends.
+const FLAME_F: f32 = (1u32 << 3) as f32;
+const FLAME_K: f32 = 8.;
+const FLAME_A: f32 = 3. / 4.;
+const FLAME_T: [f32; 2] = [1. / 8., 3. / 4.];
+
+/// Saturation from the seed too (owner, 2026-11-07: "balanced around grey, saturation/hue dependent upon hash"): the palette's chroma times a seeded factor in this range, muted to rich, so over all people the colours average to grey.
+const SAT: [f32; 2] = [1. / 2., 1.];
 
 /// Everything a wallpaper is drawn from: the seed's choices, worked out once (`params`) and shared by every core that draws rows of it.
 #[derive(Clone, Copy, Debug)]
@@ -93,8 +140,15 @@ pub struct Params {
     pub step: [f32; 2],
     /// The background gradient's direction, scaled so a span is 1 / GRAD_SPANS.
     pub grad: [f32; 2],
-    /// The colours in linear light: background ends, shade, halo, filament, hot, warm.
-    pub light: [[f32; 3]; 7],
+    /// The density gradient map's colours in linear light, dark to light, each its own hue (`STOPS`); and the white-hot core's and the warm sparks'.
+    pub stops: [[f32; 3]; STOPS],
+    pub hot: [f32; 3],
+    pub warm: [f32; 3],
+    /// The far layer's view: the plane at the frame's centre and its step per pixel along x.
+    pub far_centre: [f32; 2],
+    pub far_step: [f32; 2],
+    /// The lamp's direction in the plane (a unit vector).
+    pub lamp: [f32; 2],
     /// log₂(1 + n) at the survey's median, and the inverse of its spread to the 99th percentile: v = (log₂(1 + n) − l_lo) · l_inv.
     pub l_lo: f32,
     pub l_inv: f32,
@@ -172,25 +226,46 @@ pub fn pack(c: [f32; 3]) -> u64 {
     q(c[0]) | q(c[1]) << 16 | q(c[2]) << 32 | 0xFFFF << 48
 }
 
-/// One pixel's orbit under z ↦ z² + c from (zx, zy): its smooth escape count, and its distance to the set in plane units.
+/// What a pixel's orbit gives: its smooth escape count, its distance to the set in plane units, its stripe average (the field's rays), and the set's relief there: the unit direction of z / (dz/dz₀) at the escape, the potential's gradient, which lighting takes as the surface's normal (zero inside the set).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Orbit {
+    pub n: f32,
+    pub d: f32,
+    pub s: f32,
+    pub u: [f32; 2],
+    /// The flame (mandelbrot-exploder's, as tapuwae colours it): (conj(fc) − fq)·ln(n)/2⁴, fq the orbit's mean direction weighted by step² and fc its mean 1/z weighted by 1/|z| (owner, 2026-11-07: "more flames"); zero inside the set.
+    pub f: [f32; 2],
+}
+
+/// An orbit that never escaped: the count's own limit, on the set, no rays.
+const INSIDE_ORBIT: Orbit = Orbit { n: (MAX_ITER + 1) as f32, d: 0., s: 0., u: [0., 0.], f: [0., 0.] };
+
+/// One pixel's orbit under z ↦ z² + c from (zx, zy).
 /// The count runs continuously from i to i + 1 across the iteration where the orbit escapes, and an orbit that never escapes gets MAX_ITER + 1, the count's own limit, and distance 0.
 /// dz/dz₀ grows by 2|z| ≤ 512 a step; once |dz|² passes 2^62 it is scaled down by 2^32 (exact, a power of two) and the scale kept in `e`, so it never overflows f32.
+/// The stripe average (Härkönen's): sin 4·arg z_k averaged over the orbit from z₁ on, blended across the escaping step by the count's fraction so it runs on continuously where the escape time steps; it draws rays out of the set through the field.
 /// `orbit4` is the same orbit for four pixels side by side, operation for operation, so the two agree bit for bit (tested).
 #[inline]
-pub fn orbit(zx: f32, zy: f32, cx: f32, cy: f32) -> (f32, f32) {
+pub fn orbit(zx: f32, zy: f32, cx: f32, cy: f32) -> Orbit {
     let (mut x, mut y) = (zx, zy);
     let (mut dx, mut dy) = (1f32, 0f32);
     let mut e = 0i32;
+    let mut sum = 0f32;
+    let mut fl = Flame::default();
     let mut i = 0u32;
     loop {
         let (xx, yy) = (x * x, y * y);
         let r2 = xx + yy;
         if r2 > R2 {
-            return escaped(i, r2, dx, dy, e);
+            return escaped(i, x, y, dx, dy, e, sum, fl);
         }
         if i == MAX_ITER {
-            return ((MAX_ITER + 1) as f32, 0.);
+            return INSIDE_ORBIT;
         }
+        if i > 0 {
+            sum += stripe(x, y, xx, yy, r2);
+        }
+        fl = fl.step(x, y, r2, i);
         let ndx = 2. * (x * dx - y * dy);
         dy = 2. * (x * dy + y * dx);
         dx = ndx;
@@ -205,31 +280,97 @@ pub fn orbit(zx: f32, zy: f32, cx: f32, cy: f32) -> (f32, f32) {
     }
 }
 
+/// The flame's sums over an orbit (tapuwae's, from mandelbrot-exploder): z's direction weighted by the step's number squared, and that weight; z̄ / |z|² weighted by 1/|z|, and that weight.
+/// The z-flame's weight tapers to nothing as the orbit nears the bailout (`taper`), so the sums run on continuously where the escape step changes from pixel to pixel; without it the flames came out as blocky tiles (2026-11-07).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Flame {
+    q: [f32; 2],
+    qw: f32,
+    c: [f32; 2],
+    cw: f32,
+}
+
+/// Added to |z| under the flame's division: z = 0 exactly (a preimage of −c can land there) would divide by zero; anywhere |z| > 2^-76 it is below f32's resolution of |z| and changes nothing.
+const FLAME_EPS: f32 = STRIPE_EPS;
+
+/// The z-flame's taper at |z|² = r2 (tapuwae's, from mandelbrot-exploder): 1 while |z|² ≤ 4, then (1 − t²)³ with t = (ln ln |z|² − ln(2 ln 2)) / ln ln bail, which for this bailout (2^16) is (log₂ log₂ |z|² − 1) / 3, from 0 at |z|² = 4 to 1 at the bailout, where the weight reaches 0 with its slope.
+/// Only the last few steps of an orbit pass |z|² = 4, so its two logarithms are rare; `orbit4_neon` takes it lane by lane from this same function.
+#[inline]
+pub fn taper(r2: f32) -> f32 {
+    if r2 <= 4. {
+        return 1.;
+    }
+    let t = (libm::log2f(libm::log2f(r2)) - 1.) * (1. / 3.);
+    let u = 1. - t * t;
+    u * u * u
+}
+
+impl Flame {
+    /// One step at z = (x, y), |z|² = r2, the `i`-th (from 0). `orbit4`'s lanes take these operations in this order, so every lane's sums are `orbit`'s.
+    #[inline]
+    fn step(self, x: f32, y: f32, r2: f32, i: u32) -> Flame {
+        let inv = 1. / (libm::sqrtf(r2) + FLAME_EPS);
+        let inv2 = inv * inv;
+        let it = (i + 1) as f32;
+        let wt = it * it * taper(r2);
+        let wq = wt * inv;
+        Flame { q: [self.q[0] + x * wq, self.q[1] + y * wq], qw: self.qw + wt, c: [self.c[0] + x * inv2, self.c[1] - y * inv2], cw: self.cw + inv }
+    }
+    /// The flame at the escape, after `n` (the smooth count): (conj(fc) − fq)·ln(n)/2⁴, as tapuwae has it.
+    #[inline]
+    fn value(self, n: f32) -> [f32; 2] {
+        // An orbit escapes only after at least one step from the frame's view (it starts within a few units of the set, |z| < 256), so both weights are above zero.
+        let (fq, fc) = ([self.q[0] / self.qw, self.q[1] / self.qw], [self.c[0] / self.cw, self.c[1] / self.cw]);
+        let g = libm::logf(n) * (1. / (1 << 4) as f32);
+        [(fc[0] - fq[0]) * g, (-fc[1] - fq[1]) * g]
+    }
+}
+
 /// |dz|² past which dz is scaled down, and the scale (2^-32, exact).
 const DZ_BIG: f32 = (1u64 << 62) as f32;
 const DZ_SCALE: f32 = 1. / (1u64 << 32) as f32;
+/// Added to |z|⁴ under the stripe's division: z = 0 exactly (a preimage of −c can land there) would otherwise make it 0/0, a NaN that colours the pixel; with it the stripe there is 0, and anywhere |z| > 2^-24 the term is below f32's resolution of |z|⁴, so it changes nothing else.
+const STRIPE_EPS: f32 = 1. / (1u128 << 100) as f32;
 
-/// The smooth count and distance of an orbit that escaped after `i` steps with |z|² = r2 and dz/dz₀ = (dx, dy)·2^e.
+/// sin 4·arg z = Im z⁴ / |z|⁴, without a trigonometric function.
 #[inline]
-fn escaped(i: u32, r2: f32, dx: f32, dy: f32, e: i32) -> (f32, f32) {
-    // log₂|z|² > 16 here, so the count's log is of a value above 4 and the count lands in [i, i + 1).
+fn stripe(x: f32, y: f32, xx: f32, yy: f32, r2: f32) -> f32 {
+    4. * x * y * (xx - yy) / (r2 * r2 + STRIPE_EPS)
+}
+
+/// The orbit that escaped after `i` steps at z = (x, y), with dz/dz₀ = (dx, dy)·2^e and the stripe sum over z₁ … z_{i−1}.
+#[inline]
+fn escaped(i: u32, x: f32, y: f32, dx: f32, dy: f32, e: i32, sum: f32, fl: Flame) -> Orbit {
+    let (xx, yy) = (x * x, y * y);
+    let r2 = xx + yy;
+    // log₂|z|² > 16 here, so the count's log is of a value above 4 and its fraction 5 − log₂ log₂|z|² lies in [0, 1).
     let l2 = libm::log2f(r2);
-    let n = (i + 5) as f32 - libm::log2f(l2);
+    let frac = 5. - libm::log2f(l2);
+    let n = i as f32 + frac;
     let dz = libm::sqrtf(dx * dx + dy * dy);
     let d = libm::sqrtf(r2) * (0.5 * core::f32::consts::LN_2) * l2 / dz;
-    (n, if e == 0 { d } else { libm::ldexpf(d, -e) })
+    // The average with this step's term and without it, each over a prior of two zero terms (so neither divides by zero): an orbit that escapes just past the bailout (fraction near 1) takes the first, one that escaped a step later from far out (fraction near 0) the second, and the two meet.
+    let all = sum + stripe(x, y, xx, yy, r2);
+    let with = all / (i + 2) as f32;
+    let without = sum / (i + 1) as f32;
+    // z / dz's direction, z·conj(dz) normalised (the scale 2^e does not turn it); both are far from zero here (|z| > 256, and dz has grown every step), so the length is never zero.
+    let (ux, uy) = (x * dx + y * dy, y * dx - x * dy);
+    let um = libm::sqrtf(ux * ux + uy * uy);
+    Orbit { n, d: if e == 0 { d } else { libm::ldexpf(d, -e) }, s: without + (with - without) * frac, u: [ux / um, uy / um], f: fl.value(n) }
 }
 
 /// Four orbits side by side (four pixels of a row): every lane takes the same steps as `orbit`, and a lane that has escaped keeps its state while the others run on, so each lane's result is `orbit`'s.
 /// Four independent chains hide the multiply's latency, and the lanes map onto one NEON register.
 #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
 #[inline]
-pub fn orbit4(zx: [f32; 4], zy: [f32; 4], cx: f32, cy: f32) -> [(f32, f32); 4] {
+pub fn orbit4(zx: [f32; 4], zy: [f32; 4], cx: f32, cy: f32) -> [Orbit; 4] {
     let (mut x, mut y) = (zx, zy);
     let (mut dx, mut dy) = ([1f32; 4], [0f32; 4]);
     let mut e = [0u32; 4];
+    let mut fl = [Flame::default(); 4];
+    let mut sum = [0f32; 4];
     let mut i = [0u32; 4];
-    for _ in 0..MAX_ITER {
+    for k in 0..MAX_ITER {
         let mut live = [false; 4];
         for j in 0..4 {
             live[j] = x[j] * x[j] + y[j] * y[j] <= R2;
@@ -239,6 +380,7 @@ pub fn orbit4(zx: [f32; 4], zy: [f32; 4], cx: f32, cy: f32) -> [(f32, f32); 4] {
         }
         for j in 0..4 {
             let (xx, yy) = (x[j] * x[j], y[j] * y[j]);
+            let t = stripe(x[j], y[j], xx, yy, xx + yy);
             let mut ndx = 2. * (x[j] * dx[j] - y[j] * dy[j]);
             let mut ndy = 2. * (x[j] * dy[j] + y[j] * dx[j]);
             let big = ndx * ndx + ndy * ndy > DZ_BIG;
@@ -249,6 +391,10 @@ pub fn orbit4(zx: [f32; 4], zy: [f32; 4], cx: f32, cy: f32) -> [(f32, f32); 4] {
             let ny = 2. * x[j] * y[j] + cy;
             let nx = xx - yy + cx;
             let l = live[j];
+            // A live lane's step count is k, so `k > 0` is `orbit`'s `i > 0`.
+            sum[j] = if l && k > 0 { sum[j] + t } else { sum[j] };
+            // A live lane's step number is k, as `orbit`'s i.
+            fl[j] = if l { fl[j].step(x[j], y[j], xx + yy, k) } else { fl[j] };
             x[j] = if l { nx } else { x[j] };
             y[j] = if l { ny } else { y[j] };
             dx[j] = if l { ndx } else { dx[j] };
@@ -257,21 +403,21 @@ pub fn orbit4(zx: [f32; 4], zy: [f32; 4], cx: f32, cy: f32) -> [(f32, f32); 4] {
             i[j] += l as u32;
         }
     }
-    finish4(x, y, dx, dy, e, i)
+    finish4(x, y, dx, dy, e, sum, i, fl)
 }
 
-/// `orbit4` on NEON: the same steps in one register per quantity, each operation the lane-wise IEEE twin of the scalar one (fmul, fadd, fsub, never a fused fmla; AArch64's vector floating point rounds exactly as its scalar does, under the same FPCR), so every lane is `orbit`'s result bit for bit.
+/// `orbit4` on NEON: the same steps in one register per quantity, each operation the lane-wise IEEE twin of the scalar one (fmul, fadd, fsub, fdiv, never a fused fmla; AArch64's vector floating point rounds exactly as its scalar does, under the same FPCR), so every lane is `orbit`'s result bit for bit.
 /// LLVM does not vectorise the portable form (its data-dependent exit and per-lane selects), so the lanes are written out.
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 #[inline]
-pub fn orbit4(zx: [f32; 4], zy: [f32; 4], cx: f32, cy: f32) -> [(f32, f32); 4] {
+pub fn orbit4(zx: [f32; 4], zy: [f32; 4], cx: f32, cy: f32) -> [Orbit; 4] {
     // SAFETY: the only requirement of a `target_feature` function is that the CPU has the feature, and this is compiled only where `neon` is part of the target itself (aarch64-unknown-none has it; every AArch64 core does).
     unsafe { orbit4_neon(zx, zy, cx, cy) }
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 #[target_feature(enable = "neon")]
-fn orbit4_neon(zx: [f32; 4], zy: [f32; 4], cx: f32, cy: f32) -> [(f32, f32); 4] {
+fn orbit4_neon(zx: [f32; 4], zy: [f32; 4], cx: f32, cy: f32) -> [Orbit; 4] {
     use core::arch::aarch64::*;
     let lanes = |a: [f32; 4]| {
         let v = vdupq_n_f32(a[0]);
@@ -279,20 +425,50 @@ fn orbit4_neon(zx: [f32; 4], zy: [f32; 4], cx: f32, cy: f32) -> [(f32, f32); 4] 
         let v = vsetq_lane_f32::<2>(a[2], v);
         vsetq_lane_f32::<3>(a[3], v)
     };
+    let get = |v: float32x4_t| [vgetq_lane_f32::<0>(v), vgetq_lane_f32::<1>(v), vgetq_lane_f32::<2>(v), vgetq_lane_f32::<3>(v)];
     let (mut x, mut y) = (lanes(zx), lanes(zy));
     let (cxv, cyv) = (vdupq_n_f32(cx), vdupq_n_f32(cy));
-    let (two, one) = (vdupq_n_f32(2.), vdupq_n_f32(1.));
-    let (r2max, big, scale) = (vdupq_n_f32(R2), vdupq_n_f32(DZ_BIG), vdupq_n_f32(DZ_SCALE));
+    let (two, four, one) = (vdupq_n_f32(2.), vdupq_n_f32(4.), vdupq_n_f32(1.));
+    let (r2max, big, scale, eps) = (vdupq_n_f32(R2), vdupq_n_f32(DZ_BIG), vdupq_n_f32(DZ_SCALE), vdupq_n_f32(STRIPE_EPS));
     let (mut dx, mut dy) = (one, vdupq_n_f32(0.));
+    let mut sum = vdupq_n_f32(0.);
     let mut e = vdupq_n_u32(0);
     let mut i = vdupq_n_u32(0);
-    for _ in 0..MAX_ITER {
+    // The flame's sums (`Flame`), lane by lane.
+    let epsv = vdupq_n_f32(FLAME_EPS);
+    let (mut q0, mut q1, mut qw) = (vdupq_n_f32(0.), vdupq_n_f32(0.), vdupq_n_f32(0.));
+    let (mut c0, mut c1, mut cw) = (vdupq_n_f32(0.), vdupq_n_f32(0.), vdupq_n_f32(0.));
+    for k in 0..MAX_ITER {
         let xx = vmulq_f32(x, x);
         let yy = vmulq_f32(y, y);
-        let live = vcleq_f32(vaddq_f32(xx, yy), r2max);
+        let r2 = vaddq_f32(xx, yy);
+        let live = vcleq_f32(r2, r2max);
         if vmaxvq_u32(live) == 0 {
             break;
         }
+        if k > 0 {
+            let t = vdivq_f32(vmulq_f32(vmulq_f32(vmulq_f32(four, x), y), vsubq_f32(xx, yy)), vaddq_f32(vmulq_f32(r2, r2), eps));
+            sum = vbslq_f32(live, vaddq_f32(sum, t), sum);
+        }
+        // `Flame::step`, operation for operation: a live lane's step number is k.
+        let inv = vdivq_f32(one, vaddq_f32(vsqrtq_f32(r2), epsv));
+        let inv2 = vmulq_f32(inv, inv);
+        let it = vdupq_n_f32((k + 1) as f32);
+        // The taper lane by lane from `taper` itself, and only on a step where some lane is past |z|² = 4 (it is 1 everywhere else).
+        let tp = if vmaxvq_u32(vcgtq_f32(r2, four)) == 0 {
+            one
+        } else {
+            let r = get(r2);
+            lanes([taper(r[0]), taper(r[1]), taper(r[2]), taper(r[3])])
+        };
+        let wt = vmulq_f32(vmulq_f32(it, it), tp);
+        let wq = vmulq_f32(wt, inv);
+        q0 = vbslq_f32(live, vaddq_f32(q0, vmulq_f32(x, wq)), q0);
+        q1 = vbslq_f32(live, vaddq_f32(q1, vmulq_f32(y, wq)), q1);
+        qw = vbslq_f32(live, vaddq_f32(qw, wt), qw);
+        c0 = vbslq_f32(live, vaddq_f32(c0, vmulq_f32(x, inv2)), c0);
+        c1 = vbslq_f32(live, vsubq_f32(c1, vmulq_f32(y, inv2)), c1);
+        cw = vbslq_f32(live, vaddq_f32(cw, inv), cw);
         let ndx = vmulq_f32(two, vsubq_f32(vmulq_f32(x, dx), vmulq_f32(y, dy)));
         let ndy = vmulq_f32(two, vaddq_f32(vmulq_f32(x, dy), vmulq_f32(y, dx)));
         let bigm = vcgtq_f32(vaddq_f32(vmulq_f32(ndx, ndx), vmulq_f32(ndy, ndy)), big);
@@ -307,18 +483,21 @@ fn orbit4_neon(zx: [f32; 4], zy: [f32; 4], cx: f32, cy: f32) -> [(f32, f32); 4] 
         // A live lane's mask is all ones, −1 as an integer: subtracting it counts the step.
         i = vsubq_u32(i, live);
     }
-    let get = |v: float32x4_t| [vgetq_lane_f32::<0>(v), vgetq_lane_f32::<1>(v), vgetq_lane_f32::<2>(v), vgetq_lane_f32::<3>(v)];
     let geti = |v: uint32x4_t| [vgetq_lane_u32::<0>(v), vgetq_lane_u32::<1>(v), vgetq_lane_u32::<2>(v), vgetq_lane_u32::<3>(v)];
-    finish4(get(x), get(y), get(dx), get(dy), geti(e), geti(i))
+    let (q0, q1, qw, c0, c1, cw) = (get(q0), get(q1), get(qw), get(c0), get(c1), get(cw));
+    let fl = core::array::from_fn(|j| Flame { q: [q0[j], q1[j]], qw: qw[j], c: [c0[j], c1[j]], cw: cw[j] });
+    finish4(get(x), get(y), get(dx), get(dy), geti(e), get(sum), geti(i), fl)
 }
 
 /// Each lane's result from its final state, as `orbit` gives it.
 #[inline]
-fn finish4(x: [f32; 4], y: [f32; 4], dx: [f32; 4], dy: [f32; 4], e: [u32; 4], i: [u32; 4]) -> [(f32, f32); 4] {
-    let mut out = [(0f32, 0f32); 4];
+fn finish4(x: [f32; 4], y: [f32; 4], dx: [f32; 4], dy: [f32; 4], e: [u32; 4], sum: [f32; 4], i: [u32; 4], fl: [Flame; 4]) -> [Orbit; 4] {
+    let mut out = [INSIDE_ORBIT; 4];
     for j in 0..4 {
         let r2 = x[j] * x[j] + y[j] * y[j];
-        out[j] = if r2 > R2 { escaped(i[j], r2, dx[j], dy[j], e[j] as i32) } else { ((MAX_ITER + 1) as f32, 0.) };
+        if r2 > R2 {
+            out[j] = escaped(i[j], x[j], y[j], dx[j], dy[j], e[j] as i32, sum[j], fl[j]);
+        }
     }
     out
 }
@@ -338,28 +517,32 @@ fn lerp(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 struct Frame<'a> {
     p: &'a Params,
     half: [f32; 2],
-    /// From plane distance to spans of the frame.
-    ds: f32,
+    /// The near view and the far one: each its plane at the frame's centre, its step per pixel along x, and the factor from plane distance to spans of the frame.
+    views: [([f32; 2], [f32; 2], f32); 2],
 }
+
+/// Which of the frame's views an orbit is taken in.
+const NEAR_VIEW: usize = 0;
+const FAR_VIEW: usize = 1;
 
 impl<'a> Frame<'a> {
     fn new(p: &'a Params) -> Frame<'a> {
-        let px = libm::sqrtf(p.step[0] * p.step[0] + p.step[1] * p.step[1]);
-        Frame { p, half: [p.width as f32 * 0.5, p.height as f32 * 0.5], ds: 1. / (px * span(p.width, p.height)) }
+        let ds = |s: [f32; 2]| 1. / (libm::sqrtf(s[0] * s[0] + s[1] * s[1]) * span(p.width, p.height));
+        Frame { p, half: [p.width as f32 * 0.5, p.height as f32 * 0.5], views: [(p.centre, p.step, ds(p.step)), (p.far_centre, p.far_step, ds(p.far_step))] }
     }
 
-    /// The plane under pixel (x, y).
+    /// The plane under pixel (x, y) in view `v`.
     #[inline]
-    fn z(&self, x: usize, y: usize) -> (f32, f32) {
-        let p = self.p;
+    fn z(&self, v: usize, x: usize, y: usize) -> (f32, f32) {
+        let (centre, step, _) = self.views[v];
         let fx = x as f32 + 0.5 - self.half[0];
         let fy = y as f32 + 0.5 - self.half[1];
-        (p.centre[0] + fx * p.step[0] - fy * p.step[1], p.centre[1] + fx * p.step[1] + fy * p.step[0])
+        (centre[0] + fx * step[0] - fy * step[1], centre[1] + fx * step[1] + fy * step[0])
     }
 
-    /// Row y's orbits, each handed to `f` with its column: four pixels at a time through `orbit4`, any left over one at a time through `orbit` (the same values).
+    /// Row y's orbits in view `v`, each handed to `f` with its column: four pixels at a time through `orbit4`, any left over one at a time through `orbit` (the same values).
     #[inline]
-    fn each(&self, y: usize, mut f: impl FnMut(usize, f32, f32)) {
+    fn each(&self, v: usize, y: usize, mut f: impl FnMut(usize, Orbit)) {
         let p = self.p;
         let quads = p.width / 4;
         for q in 0..quads {
@@ -367,45 +550,93 @@ impl<'a> Frame<'a> {
             let mut zx = [0f32; 4];
             let mut zy = [0f32; 4];
             for j in 0..4 {
-                (zx[j], zy[j]) = self.z(x0 + j, y);
+                (zx[j], zy[j]) = self.z(v, x0 + j, y);
             }
             let o = orbit4(zx, zy, p.c[0], p.c[1]);
             for j in 0..4 {
-                f(x0 + j, o[j].0, o[j].1);
+                f(x0 + j, o[j]);
             }
         }
         for x in quads * 4..p.width {
-            let (zx, zy) = self.z(x, y);
-            let (n, d) = orbit(zx, zy, p.c[0], p.c[1]);
-            f(x, n, d);
+            let (zx, zy) = self.z(v, x, y);
+            f(x, orbit(zx, zy, p.c[0], p.c[1]));
         }
     }
 
-    /// Row y into `line`.
+    /// Row y into `line`, in two passes over the row: the far layer's weight first, kept in each pixel's slot (its f32's bits) until the near pass reads it as it colours the pixel.
     fn row(&self, y: usize, line: &mut [u64]) {
-        self.each(y, |x, n, d| line[x] = pack(self.colour(x, y, n, d)));
+        let far_ds = self.views[FAR_VIEW].2;
+        self.each(FAR_VIEW, y, |x, o| {
+            let t = o.d * far_ds * FAR_INV;
+            line[x] = (1. / (1. + t * t)).to_bits() as u64;
+        });
+        self.each(NEAR_VIEW, y, |x, o| line[x] = pack(self.colour(x, y, o, f32::from_bits(line[x] as u32))));
     }
 
-    /// Pixel (x, y)'s linear light, from its orbit's count n and distance d.
+    /// Pixel (x, y)'s linear light, from its near orbit and the far layer's weight there.
+    /// Front to back (owner's rule, AGENT.md "Compositing: Front to Back, `under` Only"): each layer a colour at its weight α, taking its share of the light that is still uncovered (`t`), which it then covers by α; the frontmost goes first: the warm sparks, the white-hot core, the filament, the sheen, the halo, the flame's glow, the far layer, the field's shade, and the background last, opaque, so every pixel's light is a convex sum of the palette's.
     #[inline]
-    fn colour(&self, x: usize, y: usize, n: f32, d: f32) -> [f32; 3] {
+    fn colour(&self, x: usize, y: usize, o: Orbit, far: f32) -> [f32; 3] {
         let p = self.p;
         let fx = x as f32 + 0.5 - self.half[0];
         let fy = y as f32 + 0.5 - self.half[1];
-        let [bg0, bg1, shade, halo, fil, hot, warm] = p.light;
-        let mut col = lerp(bg0, bg1, sig(fx * p.grad[0] + fy * p.grad[1]));
-        let v = (libm::log2f(1. + n) - p.l_lo) * p.l_inv;
-        col = lerp(col, shade, SHADE_A * sig((v - SHADE_V) * SHADE_K));
-        let ds = d * self.ds;
-        let th = ds * HALO_INV;
-        col = lerp(col, halo, HALO_A / (1. + th * th));
+        let v = (libm::log2f(1. + o.n) - p.l_lo) * p.l_inv;
+        let ds = o.d * self.views[NEAR_VIEW].2;
+        let map = |t: f32| gmap(&p.stops, t);
+        // The lamp on the relief: Lambert, smooth, and the sheen where the relief faces it.
+        let l = o.u[0] * p.lamp[0] + o.u[1] * p.lamp[1];
+        let lam = (l + LAMP_H) * (1. / (1. + LAMP_H));
+        let s = (l + 1.) * 0.5;
+        let (s2, s4) = (s * s, s * s * s * s);
+        let sheen = s4 * s4 * s2 * s2 * s4;
+        let lit = |c: [f32; 3], k: f32| [c[0] * k, c[1] * k, c[2] * k];
+        let mut acc = [0f32; 3];
+        let mut t = 1f32;
+        let mut put = |c: [f32; 3], a: f32| {
+            let w = a * t;
+            acc = [acc[0] + c[0] * w, acc[1] + c[1] * w, acc[2] + c[2] * w];
+            t *= 1. - a;
+        };
+        let slow = sig((v - SHADE_V) * SHADE_K);
+        let tw = ds * WARM_INV;
+        put(p.warm, sig((v - WARM_V) * WARM_K) / (1. + tw * tw));
         let tc = ds * CORE_INV;
         let core = 1. / (1. + tc * tc);
         let core = core * core;
-        col = lerp(col, fil, FIL_A * core);
-        col = lerp(col, hot, core * sig((v - HOT_V) * HOT_K));
-        lerp(col, warm, core * sig((v - WARM_V) * WARM_K))
+        put(p.hot, core * sig((v - HOT_V) * HOT_K));
+        put(lit(map(1.), lam), FIL_A * core);
+        let th = ds * HALO_INV;
+        let near_halo = 1. / (1. + th * th);
+        put(p.hot, SHEEN_A * sheen * near_halo);
+        put(lit(map(HALO_T[0] + (HALO_T[1] - HALO_T[0]) * slow), AMBIENT + (1. - AMBIENT) * lam), HALO_A * near_halo);
+        let tg = ds * GLOW_INV;
+        let rays = sig((o.s - RAYS_MID) * RAYS_K);
+        // The flame's glow is not lit: far from the set the potential's gradient spins round its critical points, and lit it drew small dark stars in the open field.
+        put(map(RAYS_T[0] + (RAYS_T[1] - RAYS_T[0]) * rays), RAYS_A * rays / (1. + tg * tg));
+        // The flames' tongues, behind the glow and in front of the far layer.
+        let fr = libm::sinf(o.f[0] * FLAME_F * TAU);
+        let fi = libm::sinf(o.f[1] * FLAME_F * TAU);
+        put(map(FLAME_T[0] + (FLAME_T[1] - FLAME_T[0]) * (0.5 + 0.5 * fi)), FLAME_A * sig(fr * FLAME_K));
+        put(map(FAR_T[0] + (FAR_T[1] - FAR_T[0]) * far), FAR_A * far);
+        // The field, opaque, last: the map's dark end, by the background's seeded gradient and where escape is slow.
+        let pos = sig(fx * p.grad[0] + fy * p.grad[1]);
+        put(map(FIELD_T * (pos + SHADE_A * slow) * (1. / (1. + SHADE_A))), 1.);
+        acc
     }
+}
+
+/// The density gradient map at `t` (0 the dark end, 1 the light): each stop weighted by a Cauchy bump about its place, the weights normalised, so the colour is a convex sum of the stops' and C∞ in t.
+#[inline]
+fn gmap(stops: &[[f32; 3]; STOPS], t: f32) -> [f32; 3] {
+    let mut c = [0f32; 3];
+    let mut sum = 0f32;
+    for (k, s) in stops.iter().enumerate() {
+        let d = (t - k as f32 * (1. / (STOPS - 1) as f32)) * GM_K;
+        let w = 1. / (1. + d * d);
+        c = [c[0] + s[0] * w, c[1] + s[1] * w, c[2] + s[2] * w];
+        sum += w;
+    }
+    [c[0] / sum, c[1] / sum, c[2] / sum]
 }
 
 /// The frame's span: the harmonic mean of its sides, 2wh / (w + h).
@@ -454,21 +685,43 @@ fn csqrt(x: f32, y: f32) -> (f32, f32) {
     (re, if y < 0. { -im } else { im })
 }
 
-/// Turns a working value by `a` about the grey axis (Rodrigues' rotation about (1, 1, 1)/√3) and returns its light.
-/// A rotation keeps a colour's grey (its mean) and its distance from the grey axis; for every palette colour at 15° the channels stay within their mean ± that distance·√(2/3), which lies inside [0, 1] (the darkest, the background's dark end, keeps at least 1/16 of white in its working value), so no channel can go negative or past white.
-fn turn(code: [u16; 3], a: f32) -> [f32; 3] {
+/// The opponent space colours are turned in: q = √(l, m, s) (VSF RGB through vsf's cone matrix, white at (1, 1, 1)), and from it a lightness J (the cones' photopic shares, vsf's LMS2PHOTOPIC) and two opponent axes, red-green and yellow-blue (IPT's, Ebner and Fairchild 1998, where equal angles look about equally far apart in hue).
+/// A turn moves only the opponent pair, so J, the colour's lightness, is the same at every hue; white and every grey sit on the axis and never move.
+const OPP: [[f32; 3]; 3] = [[LMS2PHOTOPIC[0], LMS2PHOTOPIC[1], LMS2PHOTOPIC[2]], [4.455, -4.851, 0.396], [0.8056, 0.3572, -1.1628]];
+/// Chroma kept through the turn: the palette's own chroma times this stays inside VSF RGB at every hue (the darkest, the background, has the least room; `palette_in_gamut_all_round` checks 4096 hues).
+const CHROMA: f32 = 7. / 8.;
+
+/// Column-major 3×3 (vsf's layout: a column per input) times a vector.
+fn cols(m: &[f32; 9], v: [f32; 3]) -> [f32; 3] {
+    [m[0] * v[0] + m[3] * v[1] + m[6] * v[2], m[1] * v[0] + m[4] * v[1] + m[7] * v[2], m[2] * v[0] + m[5] * v[1] + m[8] * v[2]]
+}
+
+/// Row-major 3×3 times a vector.
+fn rows(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+    [m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2], m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2], m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2]]
+}
+
+/// The inverse of a row-major 3×3 by cofactors (OPP's determinant is far from zero).
+fn inverse(m: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let [[a, b, c], [d, e, f], [g, h, i]] = *m;
+    let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    let k = 1. / det;
+    [[(e * i - f * h) * k, (c * h - b * i) * k, (b * f - c * e) * k], [(f * g - d * i) * k, (a * i - c * g) * k, (c * d - a * f) * k], [(d * h - e * g) * k, (b * g - a * h) * k, (a * e - b * d) * k]]
+}
+
+/// A working value turned `a` round the hue circle at its own lightness, its chroma times CHROMA and the seed's saturation `sat` (at most 1), returned as light.
+fn turn(code: [u16; 3], a: f32, sat: f32) -> [f32; 3] {
+    turned(code, a, CHROMA * sat).1
+}
+
+/// `turn` at chroma factor `chroma`, with the turned colour's q as well (the gamut is checked at the most chroma a seed can give, CHROMA; less only moves a colour toward its grey): both must stay in range (q ≥ 0, else squaring it would fold a negative cone response back positive; light within [0, 1]), which the tests check all round the circle.
+fn turned(code: [u16; 3], a: f32, chroma: f32) -> ([f32; 3], [f32; 3]) {
     let v = [code[0] as f32 / 16384., code[1] as f32 / 16384., code[2] as f32 / 16384.];
-    let (c, s) = (libm::cosf(a), libm::sinf(a));
-    let k = 1. / libm::sqrtf(3.);
-    let dot = (v[0] + v[1] + v[2]) * k;
-    // k × v for k = (1, 1, 1)/√3.
-    let cr = [k * (v[2] - v[1]), k * (v[0] - v[2]), k * (v[1] - v[0])];
-    let mut out = [0f32; 3];
-    for j in 0..3 {
-        let t = v[j] * c + cr[j] * s + k * dot * (1. - c);
-        out[j] = t * t;
-    }
-    out
+    let lms = cols(&VSF_RGB2LMS, [v[0] * v[0], v[1] * v[1], v[2] * v[2]]);
+    let o = rows(&OPP, [libm::sqrtf(lms[0]), libm::sqrtf(lms[1]), libm::sqrtf(lms[2])]);
+    let (c, s) = (libm::cosf(a) * chroma, libm::sinf(a) * chroma);
+    let q = rows(&inverse(&OPP), [o[0], o[1] * c - o[2] * s, o[1] * s + o[2] * c]);
+    (q, cols(&LMS2VSF_RGB, [q[0] * q[0], q[1] * q[1], q[2] * q[2]]))
 }
 
 /// The seed's candidate for one attempt: c, the view and the colours.
@@ -504,8 +757,25 @@ pub fn candidate(seed: &[u8; 32], attempt: u32, width: usize, height: usize) -> 
     let sc = r.range(VIEW_SPAN) / span(width, height);
     let view_turn = r.unit() * TAU;
     let grad_turn = r.unit() * TAU;
-    let hue = r.range(HUE);
-    let warm_hue = r.range(WARM_HUE);
+    // The far layer: zoomed out, turned and shifted from the near view, all seeded.
+    let far_sc = sc * r.range(FAR_ZOOM);
+    let far_turn = view_turn + r.range(FAR_TURN) * if r.next() & 1 == 0 { 1. } else { -1. };
+    let shift_turn = r.unit() * TAU;
+    let shift = FAR_SHIFT * far_sc * span(width, height);
+    let lamp_turn = r.unit() * TAU;
+    let mut hr = Rng::new(seed, HUE_STREAM);
+    let hue = hr.unit() * TAU;
+    let warm_hue = hue + hr.range(WARM_HUE);
+    let far_hue = hue + hr.range(FAR_HUE);
+    let sat = hr.range(SAT);
+    // The map's hues: a walk round the circle from the seed's hue, a seeded step either way at each stop.
+    let mut stops = [[0f32; 3]; STOPS];
+    let mut h = hue;
+    for k in 0..STOPS {
+        stops[k] = turn(STOP_CODES[k], h, sat);
+        let s = hr.range(HUE_STEP);
+        h += if hr.next() & 1 == 0 { s } else { -s };
+    }
     let g = 1. / (GRAD_SPANS * span(width, height));
     Params {
         width,
@@ -514,7 +784,12 @@ pub fn candidate(seed: &[u8; 32], attempt: u32, width: usize, height: usize) -> 
         centre: [zx * pull, zy * pull],
         step: [sc * libm::cosf(view_turn), sc * libm::sinf(view_turn)],
         grad: [g * libm::cosf(grad_turn), g * libm::sinf(grad_turn)],
-        light: [turn(BG[0], hue), turn(BG[1], hue), turn(SHADE, hue), turn(HALO, hue), turn(FIL, hue), turn(HOT, hue), turn(WARM, warm_hue)],
+        stops,
+        hot: turn(HOT, far_hue, sat),
+        warm: turn(WARM, warm_hue, sat),
+        far_centre: [zx * pull + shift * libm::cosf(shift_turn), zy * pull + shift * libm::sinf(shift_turn)],
+        far_step: [far_sc * libm::cosf(far_turn), far_sc * libm::sinf(far_turn)],
+        lamp: [libm::cosf(lamp_turn), libm::sinf(lamp_turn)],
         l_lo: 0.,
         l_inv: 1.,
         attempt,
@@ -538,8 +813,9 @@ pub fn survey(p: &Params) -> Survey {
     q.width = w;
     q.height = h;
     q.step = [p.step[0] * PREVIEW as f32, p.step[1] * PREVIEW as f32];
+    q.far_step = [p.far_step[0] * PREVIEW as f32, p.far_step[1] * PREVIEW as f32];
     let f = Frame::new(&q);
-    let near_d = NEAR_SPAN / f.ds;
+    let near_d = NEAR_SPAN / f.views[NEAR_VIEW].2;
     let lmax = libm::log2f((MAX_ITER + 2) as f32);
     // An escaped count is below MAX_ITER + 1, so its bin is below BINS; the extra bin takes a value that rounds up to the top edge, so no index is ever out of range.
     let mut hist = [0u32; BINS + 1];
@@ -547,7 +823,8 @@ pub fn survey(p: &Params) -> Survey {
     let (mut near, mut inside, mut outside) = (0u32, 0u32, 0u32);
     let long = if h >= w { h } else { w };
     for y in 0..h {
-        f.each(y, |x, n, d| {
+        f.each(NEAR_VIEW, y, |x, o| {
+            let (n, d) = (o.n, o.d);
             if d < near_d {
                 near += 1;
                 thirds[if h >= w { y } else { x } * 3 / long] += 1;
@@ -601,6 +878,7 @@ mod tests {
     #[test]
     fn lanes_match_scalar() {
         let cs = [(-0.835f32, -0.2321f32), (0.285, 0.01), (-0.12, 0.75), (-0.75, 0.11), (0.3773, 0.1933), (-1.2, 0.)];
+        let bits = |o: Orbit| (o.n.to_bits(), o.d.to_bits(), o.s.to_bits(), o.u[0].to_bits(), o.u[1].to_bits(), o.f[0].to_bits(), o.f[1].to_bits());
         for &(cx, cy) in &cs {
             for k in 0..(1 << 12) {
                 let mut zx = [0f32; 4];
@@ -612,26 +890,26 @@ mod tests {
                 }
                 let o = orbit4(zx, zy, cx, cy);
                 for j in 0..4 {
-                    let (n, d) = orbit(zx[j], zy[j], cx, cy);
-                    assert_eq!((o[j].0.to_bits(), o[j].1.to_bits()), (n.to_bits(), d.to_bits()), "c {cx} {cy} z {} {}", zx[j], zy[j]);
+                    assert_eq!(bits(o[j]), bits(orbit(zx[j], zy[j], cx, cy)), "c {cx} {cy} z {} {}", zx[j], zy[j]);
                 }
             }
         }
     }
 
-    /// Every palette colour, turned to either end of its hue range, keeps every channel within black and white.
+    /// Every palette colour, turned to any of 4096 hues round the whole circle (and the warm sparks past it by their jitter), stays a real colour: no negative cone response, every channel within black and white; and its lightness J is unchanged.
     #[test]
-    fn turned_palette_in_range() {
-        for code in [BG[0], BG[1], SHADE, HALO, FIL, HOT] {
-            for a in [HUE[0], HUE[1], 0.] {
-                for c in turn(code, a) {
-                    assert!((0. ..=1.).contains(&c), "{code:?} at {a}: {c}");
-                }
-            }
-        }
-        for a in [WARM_HUE[0], WARM_HUE[1]] {
-            for c in turn(WARM, a) {
-                assert!((0. ..=1.).contains(&c));
+    fn palette_in_gamut_all_round() {
+        for code in [BG[0], BG[1], SHADE, HALO, FIL, HOT, WARM, FAR] {
+            let v = [code[0] as f32 / 16384., code[1] as f32 / 16384., code[2] as f32 / 16384.];
+            let lms = cols(&VSF_RGB2LMS, [v[0] * v[0], v[1] * v[1], v[2] * v[2]]);
+            let j0 = rows(&OPP, [libm::sqrtf(lms[0]), libm::sqrtf(lms[1]), libm::sqrtf(lms[2])])[0];
+            for k in 0..(1 << 12) {
+                let a = k as f32 * (TAU / (1u32 << 12) as f32);
+                let (q, rgb) = turned(code, a, CHROMA);
+                assert!(q.iter().all(|&c| c >= 0.), "{code:?} at {a}: q {q:?}");
+                assert!(rgb.iter().all(|c| (0. ..=1.).contains(c)), "{code:?} at {a}: {rgb:?}");
+                let j = rows(&OPP, q)[0];
+                assert!((j - j0).abs() < 1. / (1u32 << 16) as f32, "{code:?} at {a}: J {j0} to {j}");
             }
         }
     }

@@ -7,6 +7,8 @@ description = "A person's default wallpaper: a Julia set drawn from a 32-byte se
 
 [dependencies]
 libm = "0.2"
+# The cone matrices and photopic shares the palette is turned round the hue circle with (no_std).
+vsf = { path = "../../vsf", default-features = false }
 
 # The host example writes a seed's wallpaper as a VSF visual to look at (examples/render.rs), the way tools/screencap writes the screen.
 [dev-dependencies]
