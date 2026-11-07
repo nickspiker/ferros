@@ -1,6 +1,6 @@
 # The vault out of the kernel
 
-Status: proposal, 2026-11-07, for the owner's OK. Nothing here is built yet.
+Status: decided with the owner, 2026-11-07 (the three questions below, and the permission rule). Nothing here is built yet; the build order is at the end.
 
 ## Why
 
@@ -41,12 +41,29 @@ The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by t
 - **Boot:** the kernel spawns the vault process first, from a capsule it can reach without the vault (open question 0), then init and everything after it from the vault as today.
 - **Migration:** the existing vault is opened by the process with the same crate. Entries move into their domains on first run: device class to the device domain, identity class to the person's common area, and each kist's own entries to its domain once kists exist.
 
-## Open questions for the owner
+## Decided (owner, 2026-11-07)
 
-0. Where the vault's own capsule lives at boot: in the boot image beside the kernel, or at a fixed place on the vault's LU the kernel reads raw.
-1. Whether the kernel hands the vault a domain key per request, or opens a sealed piece straight into the caller's buffer itself, so the vault process never holds a key or the person's plaintext (stronger, more kernel work).
-2. The common area's access rule: which kists may read and write which names there (the display reads `wallpaper`; the map writes it when the person picks one).
+0. **The vault's capsule rides with the kernel**: in the boot image on husky and akita, in the kernel's ring entry on the seed's path, embedded at build time. Whatever verifies the kernel verifies it, and the kernel's signature gate checks it again as a capsule. The kernel keeps no disk code: the vault process owns the UFS link, so `ufs_device` and `vault_boot` leave the kernel too. Kernel and vault ship and roll back together (A/B is the recovery path). Development restarts the vault process from a capsule pushed over PT, as `husky-shell` restarts the others.
+1. **The kernel hands the vault a domain key; the vault encrypts.** The kernel stays out of the data path (no value in its heap, no size cap) and never hands out a root. A key is issued only against a live call from the kist whose domain it is (the kernel stamps every call with its caller, so the vault cannot ask for a kist that is not asking), and a person's keys only while their space is unlocked. Keys are bound to the unlock: at lock or release the kernel tells the vault to drop them and issues none until the next attest; the vault zeroes a key after the request it came with.
+2. **The common area is named, and access is a grant per name, read and write apart.** A small documented vocabulary (`wallpaper` first; `images`, `contacts`, `theme` as they come), never a kist's private data (that is its own domain). Nothing sees the common area by default. System kists get their grants from init (the display reads `wallpaper`, settings writes it). Installed kists ask for named grants at install. The vault enforces the grant on every call. A name means the same to every kist granted it: no first-writer ownership. Write implies read.
+
+## Permissions are asked once, ever (owner, 2026-11-07)
+
+"If Lumis asks access to store images in the shared images location, that should only ask once, ever, for all my devices, ever ever, until I change it. 1 means 1."
+
+- A permission is the person's answer to a kist's request (a named grant in the common area, or any other right a kist asks for). It is asked once per person, per kist, per permission.
+- The answer is stored in the person's own space (identity class), so it travels with them: every device of their fleet already knows it, a new device included, and none asks again.
+- Reinstalling the kist, installing it on another device, an update, a reset of the device: none of these asks again. Only the person changing it in settings changes it.
+- The answer is keyed by the kist's identity as the gate sees it (its developer key and option, ORACLE.md), so a different developer's app of the same name is a different kist and is asked on its own.
+
+## Build order
+
+1. The vault process (`payloads/vault`): the `ferros_vault` layout, values in pieces, block I/O on its LU, the scope calls it serves today, keyed by the kernel per request.
+2. The kernel: embed and spawn the vault capsule first; issue domain keys against live calls; stamp callers; drop `kvault`'s storage path, `vault_boot` and `ufs_device`.
+3. Domains and the common area: per-kist keys through the oracle, the named grants, the permission answers in the person's space.
+4. Migration of the existing vault, on first run.
+5. First use: the person's wallpaper (below), stored once at bind.
 
 ## First use
 
-The person's wallpaper: a VSF visual of the screen's size (24 MB at 16 bits), in the person's common area as `wallpaper`. The display reads it a band of rows at a time (`wall_own`), unlocked at handle entry. Until the vault is out, the default wallpaper (made on the device from a 32-byte seed) is what shows.
+The person's wallpaper (owner, 2026-11-07: "we don't want to be recomputing the wallpaper every attest"): made once, when the device binds to their fleet (on the GPU once its kernel exists; the display's four wallpaper threads until then, 5.1 s drawn and 33.4 s refined on the Pro), and stored in their common area as `wallpaper`, a VSF visual of the screen's size (24 MB at 16 bits). At every attest the display reads it in bands (`wall_own`); nothing is drawn again. The person changes it from settings: their own picture (tools/wallpaper converts one), or a fresh one made from a new seed.
