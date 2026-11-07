@@ -2539,6 +2539,8 @@ impl Txt {
 }
 
 /// One measure as a person reads it: the value in its unit, the kind named where the unit alone does not say it.
+// Kept for the radios' detail pages (tap a circle, slide to the centre, release: owner, 2026-11-07), where the numbers live now that the circles carry none.
+#[allow(dead_code)]
 fn measure_text(t: &mut Txt, kind: u16, v: i64) {
     use ferros_sys::measure as k;
     let _ = match kind {
@@ -2855,6 +2857,31 @@ fn g2t_colour(c: (f32, f32, f32)) -> u64 {
 }
 
 /// The console (`BAR`): when the minute, a radio's state, a measure or a switch changed (or `force`), every top circle drawn again, front to back from empty in fluor's α + darkness, each by fluor's `under` and nothing else: its text first, in front, then its disc under the text. A disc is solid, no stroke, no glow (owner, 2026-11-07): the radio's flavour while it is on and linked, one stop darker while up and searching, grey when it does not run, and grey and darker with no text once switched off by a tap (preference 15). The text is dark on a lit disc, light on a grey one. Then the layer is decoded once into `BAR_W` and each row's columns into `BAR_SPAN`. Returns whether it drew.
+/// The battery's colour (owner, 2026-11-07): the spectrum between VSF red (703 nm, empty) and VSF blue (462 nm, full), its wavelength log-spaced by the charge (703 · (462/703)^(charge/100) nm). A wavelength is its cone response (vsf's 1 nm table, linear between its samples) in VSF RGB, moved toward white (E) by its most negative channel (a spectral colour lies outside the primaries' gamut but at the primaries themselves, where that channel is 0): the hue exact, the most saturation the primaries reach. Then, as the radios' flavours, at the grey's photopic light (RING_ON's) where the colour reaches it, else its brightest channel full. As working values, gamma 2, white at Q14.
+fn battery_flavour(charge: u64) -> (f32, f32, f32) {
+    use vsf::colour::spectral::constants::{LMS2VSF_RGB, LMS_2000_10DEG_1NM};
+    let nm = 703.0 * libm::powf(462.0 / 703.0, charge as f32 * (1.0 / 100.0));
+    let s = &LMS_2000_10DEG_1NM;
+    let f = nm - s.start_nm;
+    let (i, w) = (f as usize, f - (f as usize) as f32);
+    let lms = [0, 1, 2].map(|c| s.data[3 * i + c] * (1.0 - w) + s.data[3 * i + 3 + c] * w);
+    let rgb = vsf::colour::convert::apply_matrix_3x3_f32(&LMS2VSF_RGB, &lms);
+    let m = rgb[0].min(rgb[1]).min(rgb[2]);
+    let lin = rgb.map(|v| v - m);
+    let light = 0.2584 * lin[0] + 0.6346 * lin[1] + 0.1070 * lin[2];
+    let k = (9000.0f32 / 16384.0) * (9000.0 / 16384.0) / light;
+    // WHY the cap: a colour whose photopic weight is low (deep red, deep blue) cannot reach the grey's light within the primaries; its brightest channel stops at full, as the radios' flavours do.
+    let top = lin[0].max(lin[1]).max(lin[2]) * k;
+    let k = if top > 1.0 { k / top } else { k };
+    let code = |v: f32| libm::sqrtf(v * k) * 16384.0;
+    (code(lin[0]), code(lin[1]), code(lin[2]))
+}
+
+/// The vessel's rim, in the circle's radius (tools/orb-tune's defaults, Lumis's proportions: its rings at 0.052h, 0.048h, 0.039h of a box h tall): the green ring's depth from the edge, each ring's width σ, and the channels' separation (blue that much further out, red half of it further in; orb-tune's default at its band 1, 0.018 widened half a stop).
+const VESSEL_DEPTH: f32 = 0.096;
+const VESSEL_SIGMA: f32 = 0.011;
+const VESSEL_SEP: f32 = 0.018 * core::f32::consts::SQRT_2;
+
 fn console_draw(width: usize, height: usize, force: bool) -> bool {
     use fluor::pixel::{Blend, BlendMode};
     let mut tb = [0u8; 32];
@@ -2898,7 +2925,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
     // Working values (gamma 2, white at Q14): the grey of a lit indicator that is no radio, the grey of one that does not run, and the dark and light inks.
     const LIT_GREY: f32 = 9000.0;
     const OFF_GREY: f32 = 3200.0;
-    const DARK_INK: f32 = 1800.0;
+    const LIVE_INK: f32 = 11000.0;
     const LIGHT_INK: f32 = 7000.0;
     let (circles, n) = corner_layout(width, height);
     for &(x, y, r, what) in &circles[..n] {
@@ -2941,6 +2968,8 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             (OFF_GREY * stop, OFF_GREY * stop, OFF_GREY * stop)
         } else if !live {
             (OFF_GREY, OFF_GREY, OFF_GREY)
+        } else if what == Corner::Battery {
+            battery_flavour(facts[1])
         } else if radio.is_none() {
             (LIT_GREY, LIT_GREY, LIT_GREY)
         } else if state == Some(1) {
@@ -2948,9 +2977,10 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         } else {
             flav
         };
-        let ink = g2t_colour(if live && !switched_off { (DARK_INK, DARK_INK, DARK_INK) } else { (LIGHT_INK, LIGHT_INK, LIGHT_INK) });
-        // The text first: it is in front of its disc.
-        if !switched_off {
+        // Light ink on the vessel's dark body: brighter while the circle is live.
+        let ink = g2t_colour(if live && !switched_off { (LIVE_INK, LIVE_INK, LIVE_INK) } else { (LIGHT_INK, LIGHT_INK, LIGHT_INK) });
+        // The text first: it is in front of its vessel. A radio's circle carries words only while it is off, its name alone (owner, 2026-11-07: "it will only show text when off"); on, its orb speaks for it, and its numbers are on its detail page. The clock and the battery keep theirs.
+        if radio.is_none() || switched_off || !live {
             let mut lines = [Txt::new(); 9];
             let mut nl = 1;
             // The battery: its charge as the name, then the cell's voltage, the current (+ charging), their product and the temperature, as the gauge measures them (facts 1-4: per cent, hundredths of a degree, µV, µA).
@@ -2977,10 +3007,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                     match kind {
                         ferros_sys::measure::STATE => {}
                         ferros_sys::measure::TECH => tech = Some(v),
-                        _ => {
-                            measure_text(&mut lines[nl], kind, v);
-                            nl += 1;
-                        }
+                        _ => {}
                     }
                 }
             }
@@ -3031,15 +3058,34 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 }
             }
         }
-        // Then the disc, under its text: solid, its edge the C∞ step across two pixels centred on the radius, where its slope is 1, as a pixel's area coverage rises across an edge (over one pixel its slope there was 2, half a pixel of edge, and the circles stair-stepped).
-        let fill = g2t_colour(fill);
+        // Then the vessel, under its text (tools/orb-tune `sample`, its defaults; owner, 2026-11-07: Lumis's camera-picker button made round): each channel of the fill a ring of its own at its own depth from the edge (blue outermost, red innermost: a prism; a channel the fill does not have draws nothing), a Gaussian widened by the pixel's footprint, cut by a logistic at the circle's edge so nothing is drawn outside; then under them the body, the fill four stops darker, opaque but for a sixteenth, rising by a logistic under the green ring. Between the edge and the body the scene shows through. Every term C∞.
+        let fl = [fill.0, fill.1, fill.2].map(|v| { let c = v * (1.0 / 16384.0); c * c });
+        let sep = VESSEL_SEP;
+        let ring_d = [VESSEL_DEPTH + sep * 0.5, VESSEL_DEPTH, VESSEL_DEPTH - sep];
+        let fs = 1.0 / r;
+        let se = libm::sqrtf(VESSEL_SIGMA * VESSEL_SIGMA + fs * fs * (1.0 / 12.0));
+        let ew = libm::sqrtf(fs * fs + VESSEL_SIGMA * VESSEL_SIGMA * (1.0 / (1 << 6) as f32));
+        let body_l = fl.map(|v| v * (1.0 / (1 << 4) as f32));
+        let body = g2t_colour((libm::sqrtf(body_l[0]) * 16384.0, libm::sqrtf(body_l[1]) * 16384.0, libm::sqrtf(body_l[2]) * 16384.0));
         let (x0, x1, y0, y1) = ((x - r - 1.0) as i64, (x + r + 1.0) as i64, (y - r - 1.0) as i64, (y + r + 1.0) as i64);
         for py in y0..=y1 {
             for px in x0..=x1 {
                 let Some(i) = at(px, py) else { continue };
                 let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
-                let cov = draw::bump_step((r + 1.0 - libm::sqrtf(dx * dx + dy * dy)) * 0.5);
-                console[i] = console[i].under(fill | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
+                let d = 1.0 - libm::sqrtf(dx * dx + dy * dy) * fs;
+                let edge = 1.0 / (1.0 + libm::expf(-d * 2.0 / ew));
+                let amp = VESSEL_SIGMA / se * edge;
+                // Each ring's light as its g2t code (tanh √L), and the layer's α as t₀ + (1 − t₀)(t₁ + (1 − t₁)t₂) (every term non-negative: the product form cancels in f32 on a ring's faint tail and leaves α 0 beside light); each channel's colour t/α, darkness its complement. No light: α 0, t/α NaN, which the cast takes to 0.
+                let t = [0, 1, 2].map(|c| {
+                    let u = (d - ring_d[c]) / se;
+                    libm::tanhf(libm::sqrtf(fl[c] * amp * libm::expf(-u * u)))
+                });
+                let a = t[0] + (1.0 - t[0]) * (t[1] + (1.0 - t[1]) * t[2]);
+                let dark = |v: f32| 65535 - (v / a * 65535.0) as u64;
+                let ring = ((a * 65535.0) as u64) << 48 | dark(t[0]) << 32 | dark(t[1]) << 16 | dark(t[2]);
+                console[i] = console[i].under(ring, BlendMode::Normal);
+                let body_a = (1.0 - 1.0 / (1 << 4) as f32) / (1.0 + libm::expf(-(d - VESSEL_DEPTH) * 2.0 / se));
+                console[i] = console[i].under(body | ((body_a * 65535.0) as u64) << 48, BlendMode::Normal);
             }
         }
     }
