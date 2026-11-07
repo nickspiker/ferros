@@ -54,6 +54,11 @@ pub fn identity_seed(handle: &str) -> Result<[u8; 32], Untypeable> {
     Ok(*h.finalize().as_bytes())
 }
 
+/// The person's wallpaper seed (owner, 2026-11-07: by default each person has their own wallpaper, the same on every device of theirs): BLAKE3's key derivation of the identity seed under a context of its own, so it shows nothing of the handle. ahau sends it to the display at attest; tools/attest-mark shows the wallpaper it makes (mode 4).
+pub fn wallpaper_seed(identity_seed: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("ferros 2026-11-07 wallpaper seed", identity_seed)
+}
+
 /// Two 32-byte values equal, in time that does not depend on where they differ.
 pub fn same(a: &[u8; 32], b: &[u8; 32]) -> bool {
     a.iter().zip(b.iter()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0

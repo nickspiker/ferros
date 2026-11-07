@@ -12,6 +12,9 @@ description = "The attest recognition mark on the desktop: type in the box and w
 fluor = { path = "../../../fluor", features = ["host-winit"] }
 blake3 = "1"
 tapuwae = { path = "../../../tapuwae" }
+# Mode 4: the identity's wallpaper, from the typed handle as the attest screen derives it.
+ahau_core = { path = "../../ahau_core" }
+wallpaper = { path = "../../wallpaper" }
 
 # fluor's own development profile, mirrored: profiles come from the binary's crate, not the dependency's, and fluor's paint code relies on wrapping arithmetic (its dev and release profiles both build with overflow checks off). The mark is per-pixel iteration, so the optimisation level matters too.
 [profile.dev]

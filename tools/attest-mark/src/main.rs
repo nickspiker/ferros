@@ -4,7 +4,7 @@
 //! On the phone this becomes ahau's attest screen, where the salt is the device's own, sealed under its ira, so a swapped phone cannot draw the owner's picture for the owner's handle.
 //! Here the salt is a stand-in: Ctrl+R steps to the next stand-in device, to see how different devices' families look.
 //! Ctrl+arrows nudge the colouring's complex offset and Ctrl+PageUp/PageDown double or halve the relief's depth (both printed), to tune the look for the final sphere; Ctrl+L toggles one fixed light against each device's own, Ctrl+B toggles each key's choices between progressive (walking from the device's own, every character half the nudge of the one before) and free. Ctrl+M, Ctrl+E, Ctrl+F and Ctrl+S step the material, the engraving, the mirror and the style (soft, medal, enamel, lacquer) through every kind and back to the device's own; Ctrl+O toggles the button's wrapping.
-//! Ctrl+1, Ctrl+2 and Ctrl+3 pick which of the three marks is drawn: the Photon avatar (`Look::avatar()`), the device bonded to an identity (the attest button, `Look::attest()`), and the device free of one (the Mandelbrot set with the attest ball in every component, `render_fresh` in `Look::fresh()`, as ahau draws it, with its maps the phone's sizes and its two passes timed). Each pick starts from that mark's own look; the keys above tune it from there (the free mark's outline is the set's alone, so only the balls follow them and the text).
+//! Ctrl+1, Ctrl+2 and Ctrl+3 pick which of the three marks is drawn (and Ctrl+4 the identity's wallpaper, the whole window, for debugging: owner, 2026-11-07): the Photon avatar (`Look::avatar()`), the device bonded to an identity (the attest button, `Look::attest()`), and the device free of one (the Mandelbrot set with the attest ball in every component, `render_fresh` in `Look::fresh()`, as ahau draws it, with its maps the phone's sizes and its two passes timed). Each pick starts from that mark's own look; the keys above tune it from there (the free mark's outline is the set's alone, so only the balls follow them and the text).
 //! With the textbox unfocused (click the mark, or Esc; click the box to type again) the same keys work without Ctrl: R, 1, 2, 3, the arrows, and the rest.
 //! Layout: the textbox at the top, the mark's sphere centred between it and the bottom, and a tiny grey Mandelbrot set in the top-right gap with a white pixel at the Julia set's c.
 //! The text is never printed or stored.
@@ -30,7 +30,7 @@ const DEV_SALT_SEED: &[u8; 32] = b"ferros attest mark dev salt 0000";
 const PANEL_W: u32 = 1344;
 const PANEL_H: u32 = 2992;
 
-/// The three marks (Ctrl+1, Ctrl+2, Ctrl+3).
+/// The three marks and the wallpaper (Ctrl+1, Ctrl+2, Ctrl+3, Ctrl+4).
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     /// Photon's avatar: `render_disc` in `Look::avatar()`.
@@ -39,6 +39,8 @@ enum Mode {
     Bonded,
     /// A device no identity has attested on yet: `render_fresh` in `Look::fresh()`.
     Free,
+    /// The identity's default wallpaper (owner, 2026-11-07, for debugging): the typed handle's identity seed, its wallpaper seed (ahau_core::wallpaper_seed, as ahau sends the display), and the `wallpaper` crate's Julia set at the window's size, as the home screen shows it.
+    Wallpaper,
 }
 
 impl Mode {
@@ -47,6 +49,7 @@ impl Mode {
             Mode::Avatar => mark::Look::avatar(),
             Mode::Bonded => mark::Look::attest(),
             Mode::Free => mark::Look::fresh(),
+            Mode::Wallpaper => mark::Look::attest(),
         }
     }
     fn name(self) -> &'static str {
@@ -54,6 +57,7 @@ impl Mode {
             Mode::Avatar => "avatar (Photon)",
             Mode::Bonded => "device bonded (attest button)",
             Mode::Free => "device free (Mandelbrot)",
+            Mode::Wallpaper => "the identity's wallpaper",
         }
     }
 }
@@ -158,6 +162,20 @@ fn textbox_bottom(span: Coord) -> Coord {
 fn smooth_min(a: f32, b: f32) -> f32 {
     let d = a.max(b) * (1. / (1 << 4) as f32);
     0.5 * (a + b - ((a - b) * (a - b) + d * d).sqrt())
+}
+
+/// The identity's wallpaper into `buf` (rows of `w`, α + darkness), the whole window: the typed text's identity seed (ahau_core, as the attest screen derives it), its wallpaper seed, and the `wallpaper` crate's picture at this size. Each pixel's working value (√light × 2¹⁴) becomes its 8-bit `g2t` code, tanh of it in white's units (VSF: light = atanh(code / 2⁸)²), and the darkness is its complement. Text the keyboard cannot type has no identity, and leaves the window empty.
+fn render_wallpaper(buf: &mut [u32], w: usize, h: usize, text: &str) {
+    let Ok(id) = ahau_core::identity_seed(text) else { return };
+    let p = wallpaper::params(&ahau_core::wallpaper_seed(&id), w, h);
+    let mut px = vec![0u64; w * h];
+    wallpaper::render_rows(&p, 0..h, &mut px);
+    // The code is under 256 for any working value: tanh stays below one.
+    let code = |v: u64| ((v as f64 / 16384.).tanh() * 256.) as u32;
+    for (d, &s) in buf.iter_mut().zip(&px) {
+        let (r, g, b) = (code(s & 0xFFFF), code(s >> 16 & 0xFFFF), code(s >> 32 & 0xFFFF));
+        *d = 0xFF00_0000 | (255 - r) << 16 | (255 - g) << 8 | (255 - b);
+    }
 }
 
 /// A tiny grey Mandelbrot set in the box (x0, y0, bw, bh) of `buf` (rows of `w`, α + darkness): the set's whole extent [−2, X_RIGHT] × [−1.15, 1.15], imaginary axis up, fitted inside the box; the set a dim grey, the field around it fainter still by escape speed, and a full white pixel at `c`.
@@ -310,12 +328,13 @@ impl FluorApp for App {
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
-                // Ctrl+1 / Ctrl+2 / Ctrl+3: the avatar, the bonded device's mark, the free device's mark, each from its own look.
+                // Ctrl+1 / Ctrl+2 / Ctrl+3: the avatar, the bonded device's mark, the free device's mark, each from its own look; Ctrl+4 the identity's wallpaper.
                 if cmd {
                     let mode = match &kev.logical_key {
                         Key::Character(s) if s == "1" => Some(Mode::Avatar),
                         Key::Character(s) if s == "2" => Some(Mode::Bonded),
                         Key::Character(s) if s == "3" => Some(Mode::Free),
+                        Key::Character(s) if s == "4" => Some(Mode::Wallpaper),
                         _ => None,
                     };
                     if let Some(m) = mode {
@@ -457,7 +476,10 @@ impl FluorApp for App {
             let room = h as f32 - top;
             let r = 0.5 * smooth_min(w as f32, room) * (1. - 1. / (1 << 4) as f32);
             self.mark.fill(0);
-            if self.mode == Mode::Free {
+            if self.mode == Mode::Wallpaper {
+                let text = self.text();
+                render_wallpaper(&mut self.mark, w, h, &text);
+            } else if self.mode == Mode::Free {
                 self.render_free(w, top + room * 0.5, r);
             } else {
                 mark::render_disc(&mut self.mark, w, w as f32 * 0.5, top + room * 0.5, r, &p, &self.look);

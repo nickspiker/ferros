@@ -1301,7 +1301,7 @@ impl Ahau {
 
     /// The person's wallpaper (owner, 2026-11-07: handle entry unlocks it): their wallpaper seed to the display (op 42), which makes their wallpaper from it unless they set their own. The seed is one-way from their identity seed (BLAKE3's key derivation under a context of its own), so it shows nothing of the handle, and it is the same on every device of theirs and theirs alone. It is kept in their space (`ahau.wallpaper`) for a boot that unlocks without the handle being typed (`send_wallpaper`).
     fn wallpaper(&self, seed: &[u8; 32]) {
-        let ws = blake3::derive_key("ferros 2026-11-07 wallpaper seed", seed);
+        let ws = ahau_core::wallpaper_seed(seed);
         if !self.put(S_AHAU, b"wallpaper", &ws) {
             console(self.grants, b"ahau: the wallpaper seed was not kept\n");
         }
