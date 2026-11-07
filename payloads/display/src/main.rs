@@ -1762,6 +1762,11 @@ static mut BAR_W: usize = 1;
 static mut BAR_SPAN: usize = 1;
 /// What the console last drew (the minute, the radios, their measures, the switches), so it redraws when one changes.
 static mut CONSOLE_KEY: i64 = -1;
+/// Measuring the console's redraws: the parts of its key at the last draw, how often each has moved, the draws' summed time and their count.
+static mut CONSOLE_PARTS: [u64; 5] = [0; 5];
+static mut CONSOLE_WHY: [u32; 5] = [0; 5];
+static mut CONSOLE_US: [u64; 2] = [0; 2];
+static mut CONSOLE_SLOW: [u64; 3] = [0; 3];
 
 /// A screen row's row in the bars (`BAR`): the console's `CHROME_TOP` rows first, then the helm's `CHROME_BOT`; none for the rows between.
 #[inline]
@@ -2886,7 +2891,9 @@ const VESSEL_SEP: f32 = 0.018 * core::f32::consts::SQRT_2;
 fn console_draw(width: usize, height: usize, force: bool) -> bool {
     use fluor::pixel::{Blend, BlendMode};
     let mut tb = [0u8; 32];
+    let t_cs = ferros_sys::now();
     let (_, _, tn, _, _) = clock_state(&mut tb);
+    let cs_us = ferros_sys::us_since(t_cs);
     // The clock's circle shows the time's first two places (h:mm, or the dozenal hour and its twelfth), without trailing zils as the face's centre writes them (noon is Lun, not Lun:Zil): the face drops them only when every lower place is zil too, so the cut drops its own (it showed "Lun" for a few seconds, then "Lun:Zil" for the rest of the twelfth). A dozenal place is one byte (U+0010 to U+001B), and no decimal digit is that byte.
     let line = tb[..tn].split(|&c| c == b'\n').next().unwrap_or(&[]);
     let mut colons = 0;
@@ -2895,7 +2902,25 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         end -= 2;
     }
     let time = core::str::from_utf8(&line[..end]).unwrap_or("");
+    let t_f = ferros_sys::now();
     let facts = ferros_sys::facts().0;
+    let f_us = ferros_sys::us_since(t_f);
+    // Measuring: a slow time or facts call, said once in 64.
+    unsafe {
+        CONSOLE_SLOW[0] = CONSOLE_SLOW[0].max(cs_us);
+        CONSOLE_SLOW[1] = CONSOLE_SLOW[1].max(f_us);
+        CONSOLE_SLOW[2] += 1;
+        if CONSOLE_SLOW[2] == 64 {
+            let mut l = Log { grants: PANIC_GRANTS, buf: [0; 256], n: 0 };
+            l.s(b"display: console key: the longest of 64, clock_state ");
+            l.dec(CONSOLE_SLOW[0]);
+            l.s(b" us, facts ");
+            l.dec(CONSOLE_SLOW[1]);
+            l.s(b" us\n");
+            l.flush();
+            CONSOLE_SLOW = [0; 3];
+        }
+    }
     let radios = facts[32];
     let off = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF);
     // The battery's (facts 1-4) and the links' measures (facts 33-80) folded into the key, with the switches: the console redraws when one changes, at most every two seconds (the drivers' pace).
@@ -2913,6 +2938,19 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         return false;
     }
     unsafe { CONSOLE_KEY = k };
+    // Measuring (owner, 2026-11-07: the UI is slow, and the bars took 49 ms a pass): what moved since the last draw, counted by part (the time, the radios running, the battery, a link's measures, the switches), and the draw's own time, reported every 32 draws.
+    let mut lh = 0u64;
+    for &m in &facts[33..81] {
+        lh = (lh.rotate_left(7) ^ m).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    let parts = [time_h, radios, facts[1] ^ facts[2] << 8 ^ facts[3] << 24 ^ facts[4] << 40, lh, off as u64];
+    unsafe {
+        for j in 0..5 {
+            CONSOLE_WHY[j] += (parts[j] != CONSOLE_PARTS[j]) as u32;
+        }
+        CONSOLE_PARTS = parts;
+    }
+    let t_draw = ferros_sys::now();
     let rows = unsafe { CHROME_TOP };
     let console = unsafe { core::slice::from_raw_parts_mut(BAR as *mut u64, rows * width) };
     console.fill(0);
@@ -3070,31 +3108,57 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         let ew = libm::sqrtf(fs * fs + VESSEL_LAMBDA * VESSEL_LAMBDA * (1.0 / (1 << 6) as f32));
         let body_l = fl.map(|v| v * (1.0 / (1 << 4) as f32));
         let body = g2t_colour((libm::sqrtf(body_l[0]) * 16384.0, libm::sqrtf(body_l[1]) * 16384.0, libm::sqrtf(body_l[2]) * 16384.0));
+        // The vessel depends on the distance from the centre alone, so its two layers (the rings, the body) are worked out once a draw for each sixteenth of a pixel of radius, and each pixel is then a root and a lookup. Worked out per pixel, the transcendentals cost 33 ms a console draw (2026-11-07, measured), a stutter at every battery reading.
+        const SUB: f32 = (1 << 4) as f32;
+        let n = ((r + 2.0) * SUB) as usize;
+        let mut lut = alloc::vec![(0u64, 0u64); n];
+        for (j, e) in lut.iter_mut().enumerate() {
+            let d = 1.0 - (j as f32 + 0.5) * (1.0 / SUB) * fs;
+            let edge = 1.0 / (1.0 + libm::expf(-d * 2.0 / ew));
+            let amp = VESSEL_LAMBDA / le * edge;
+            // Each ring's light as its g2t code (tanh √L), and the layer's α as t₀ + (1 − t₀)(t₁ + (1 − t₁)t₂) (every term non-negative: the product form cancels in f32 on a ring's faint tail and leaves α 0 beside light); each channel's colour t/α, darkness its complement. No light: α 0, t/α NaN, which the cast takes to 0.
+            let t = [0, 1, 2].map(|c| {
+                let t = (ring_d[c] - d) / le;
+                libm::tanhf(libm::sqrtf(fl[c] * amp * libm::expf(-s * (libm::expf(t / s) - 1.0 - t / s))))
+            });
+            let a = t[0] + (1.0 - t[0]) * (t[1] + (1.0 - t[1]) * t[2]);
+            let dark = |v: f32| 65535 - (v / a * 65535.0) as u64;
+            let ring = ((a * 65535.0) as u64) << 48 | dark(t[0]) << 32 | dark(t[1]) << 16 | dark(t[2]);
+            let body_a = (1.0 - 1.0 / (1 << 4) as f32) / (1.0 + libm::expf(-(d - VESSEL_DEPTH) * 2.0 / le));
+            *e = (ring, body | ((body_a * 65535.0) as u64) << 48);
+        }
         let (x0, x1, y0, y1) = ((x - r - 1.0) as i64, (x + r + 1.0) as i64, (y - r - 1.0) as i64, (y + r + 1.0) as i64);
         for py in y0..=y1 {
             for px in x0..=x1 {
                 let Some(i) = at(px, py) else { continue };
                 let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
-                let d = 1.0 - libm::sqrtf(dx * dx + dy * dy) * fs;
-                let edge = 1.0 / (1.0 + libm::expf(-d * 2.0 / ew));
-                let amp = VESSEL_LAMBDA / le * edge;
-                // Each ring's light as its g2t code (tanh √L), and the layer's α as t₀ + (1 − t₀)(t₁ + (1 − t₁)t₂) (every term non-negative: the product form cancels in f32 on a ring's faint tail and leaves α 0 beside light); each channel's colour t/α, darkness its complement. No light: α 0, t/α NaN, which the cast takes to 0.
-                let t = [0, 1, 2].map(|c| {
-                    let t = (ring_d[c] - d) / le;
-                    libm::tanhf(libm::sqrtf(fl[c] * amp * libm::expf(-s * (libm::expf(t / s) - 1.0 - t / s))))
-                });
-                let a = t[0] + (1.0 - t[0]) * (t[1] + (1.0 - t[1]) * t[2]);
-                let dark = |v: f32| 65535 - (v / a * 65535.0) as u64;
-                let ring = ((a * 65535.0) as u64) << 48 | dark(t[0]) << 32 | dark(t[1]) << 16 | dark(t[2]);
-                console[i] = console[i].under(ring, BlendMode::Normal);
-                let body_a = (1.0 - 1.0 / (1 << 4) as f32) / (1.0 + libm::expf(-(d - VESSEL_DEPTH) * 2.0 / le));
-                console[i] = console[i].under(body | ((body_a * 65535.0) as u64) << 48, BlendMode::Normal);
+                // The box's corners lie past r + 2 (outside the circle, where the vessel is nothing): their entries are past the table's end.
+                let Some(&(ring, body)) = lut.get((libm::sqrtf(dx * dx + dy * dy) * SUB) as usize) else { continue };
+                console[i] = console[i].under(ring, BlendMode::Normal).under(body, BlendMode::Normal);
             }
         }
     }
     ALLOC.reset();
     // Decoded once for every publish, and each row's columns that hold any of it.
     bar_decode(0, rows, width);
+    unsafe {
+        CONSOLE_US[0] += ferros_sys::us_since(t_draw);
+        CONSOLE_US[1] += 1;
+        if CONSOLE_US[1] == 32 {
+            let mut l = Log { grants: PANIC_GRANTS, buf: [0; 256], n: 0 };
+            l.s(b"display: console: 32 draws, ");
+            l.dec(CONSOLE_US[0] / 32);
+            l.s(b" us each; moved: time ");
+            for (j, name) in [b"" as &[u8], b", radios ", b", battery ", b", links ", b", switches "].iter().enumerate() {
+                l.s(name);
+                l.dec(CONSOLE_WHY[j] as u64);
+            }
+            l.s(b"\n");
+            l.flush();
+            CONSOLE_US = [0; 2];
+            CONSOLE_WHY = [0; 5];
+        }
+    }
     true
 }
 
@@ -4388,6 +4452,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         // A pass of this loop that runs long holds every client up (touch reads wait for the core): timed, and logged when over 30 ms with its parts.
         let t_pass = now();
         let mut calls_us = 0u64;
+        // Where a long pass went (measuring, owner 2026-11-07: "why is the UI stupidly slow"): everything before the wallpaper's step (the clock and scope between frames, gravity, windows), the wallpaper's step, the bars drawn and published.
+        let mut stage_us = [0u64; 3];
         let mut ncalls = 0u32;
         // A clock on the screen, spatial dither only (no flips): a new second, the last plain frame drawn again, as if the map had sent it (the clock reads the time as it draws).
         // The last frame again: a camera op, or each op of a batch in order.
@@ -4541,8 +4607,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 // The idle fill republishes every phase within an eighth of a second of the last window op.
                 windows_changed(width, height);
             }
+            stage_us[0] = ferros_sys::us_since(t_pass);
             // The person's wallpaper: its job started, shown and finished from here (`wall_step`); its threads do the drawing.
+            let t_w = now();
             wall_step(grants, width, height);
+            stage_us[1] = ferros_sys::us_since(t_w);
+            let t_bars = now();
             // The bars on every screen (in front of the home screen and of every app): each redrawn when what it shows changed, and its rows into every phase.
             let console_new = console_draw(width, height, false);
             let helm_new = helm_draw(width, height);
@@ -4562,6 +4632,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     publish10x4(canvas, width, height, &tabs, (1 << PHASES) - 1, r);
                 }
             }
+            stage_us[2] = ferros_sys::us_since(t_bars);
         }
         // Clients first: every request the receive thread has queued, oldest first. The slot is copied out and released before it is run, so the receive thread can refill it meanwhile.
         loop {
@@ -4854,6 +4925,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             tlog.dec(idle_us / 1000);
             tlog.s(b" ms, flip ");
             tlog.dec(flip_us / 1000);
+            tlog.s(b" ms; before the bars ");
+            tlog.dec(stage_us[0] / 1000);
+            tlog.s(b" ms, wallpaper ");
+            tlog.dec(stage_us[1] / 1000);
+            tlog.s(b" ms, bars ");
+            tlog.dec(stage_us[2] / 1000);
             tlog.s(b" ms\n");
             tlog.flush();
         }
