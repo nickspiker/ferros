@@ -77,13 +77,15 @@ static FRESH_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 const PENDING: u64 = 0;
 const READY: u64 = 1;
 const RING: u64 = 2;
-/// A board as drawn untinted, its rows from `kb.top` to the bar's foot (owner, 2026-10-29: a mask and an index to fill): each pixel's grey (one channel: it is all grey), its key (`Keyboard::tint_index`; 0 off the keys, where the weight is 0), and how much of its key's tint it takes (Q14): whole on the key and its edge (at or below the key's grey), none on the label (at its grey, LABEL) and off the keys, in between across the label's anti-aliased edge, so the labels stay white. 2²⁰ pixels hold the 1344-wide board's 621 rows.
+/// A board as drawn untinted, its rows from `kb.top` to `kb.bottom`, the bar's foot at its lowest (owner, 2026-10-29: a mask and an index to fill): each pixel's grey (one channel: it is all grey), its key (`Keyboard::tint_index`; 0 off the keys, where the weight is 0), and how much of its key's tint it takes (Q14): whole on the key and its edge (at or below the key's grey), none on the label (at its grey, LABEL) and off the keys, in between across the label's anti-aliased edge, so the labels stay white.
+/// 2²⁰ + 2¹⁸ pixels: the 1344-wide board is 788 rows since its foot follows the app's circle down to the screen's bottom (owner, 2026-11-07; 1059072 pixels, past 2²⁰), and this holds 975 of them.
+const BOARD_PIXELS: usize = (1 << 20) + (1 << 18);
 struct Board {
-    base: [u16; 1 << 20],
-    weight: [u16; 1 << 20],
-    index: [u8; 1 << 20],
+    base: [u16; BOARD_PIXELS],
+    weight: [u16; BOARD_PIXELS],
+    index: [u8; BOARD_PIXELS],
 }
-const NO_BOARD: Board = Board { base: [0; 1 << 20], weight: [0; 1 << 20], index: [0; 1 << 20] };
+const NO_BOARD: Board = Board { base: [0; BOARD_PIXELS], weight: [0; BOARD_PIXELS], index: [0; BOARD_PIXELS] };
 /// Two boards kept (owner, 2026-11-01: copy and tint): the one on show and the one a held key will leave, or the other case, so a shift, a letter or a lift is one tint pass and a copy, with no label drawn. A board missing is drawn once into the slot not on show (`Ahau::board`); `Ahau::boards` says which board each slot holds.
 static mut BOARDS: [Board; 2] = [NO_BOARD; 2];
 /// What a board's untinted pixels follow: its layout, its view, upper case or not, the bar's left key's label. The shift key's own look (off, once, lock) is drawn over it at every paint.
@@ -791,7 +793,7 @@ impl Ahau {
         true
     }
 
-    /// Photon's blinkey (fluor `paint::draw_blinkey`, owner 2026-11-01: "steal the vertical blinkey"): a caret `h` high from `top` at column `x`, its brightness a wave down its height peaking toward the top or the bottom (`wave_top`; each tick flips it), smeared sideways at half the brightness per step, added onto what is there. The wave peaks at (8/9)(16/9) × 100 ≈ 158 of 255, Photon's CURSOR_BRIGHTNESS, here in the working values (white Q14). The smear scales with the text: fluor halves it every pixel over 7 at Photon's 16-20 px text, a hairline beside the entry's 84 px letters, so here a step is a thirty-second of the text's size `px` (a sixteenth read as a bloom, 2026-11-01), over 7 steps either side, added in linear light.
+    /// Photon's blinkey (fluor `paint::draw_blinkey`, owner 2026-11-01: "steal the vertical blinkey"): a caret `h` high from `top` at column `x`, its brightness a wave down its height peaking toward the top or the bottom (`wave_top`; each tick flips it), smeared sideways at half the brightness per step, in front of what is there (the letters and the line under it). The wave peaks at (8/9)(16/9) × 100 ≈ 158 of 255, Photon's CURSOR_BRIGHTNESS, here in the working values (white Q14). The smear scales with the text: fluor halves it every pixel over 7 at Photon's 16-20 px text, a hairline beside the entry's 84 px letters, so here a step is a thirty-second of the text's size `px` (a sixteenth read as a bloom, 2026-11-01), over 7 steps either side, composed in linear light.
     fn blinkey(&self, s: &mut [u64], x: usize, top: usize, h: usize, px: usize) {
         let step = px as f32 / (1 << 5) as f32;
         let reach = (7. * step) as usize;
@@ -813,9 +815,10 @@ impl Ahau {
                 }
                 let i = y * self.w + (x as i64 + dx) as usize;
                 let p = s[i];
-                // Light adds in linear light: the working values are gamma 2, so the caret's brightness w joins a pixel v as √(v² + w²) — over black the same as adding w, over the letters and the line no brighter than their light and the caret's together. WHY/PROOF the min: not a guard — brightening stops at white, as Photon's caret stops at no darkness; past it the value would carry into the next channel.
-                let add = |c: u64| (c * c + w * w).isqrt().min(honeycomb::WHITE);
-                s[i] = add(p & 0xFFFF) | add(p >> 16 & 0xFFFF) << 16 | add(p >> 32 & 0xFFFF) << 32;
+                // Front to back: the caret is the front layer, white light at α = w²/WHITE² in linear light (the working values are gamma 2, so light is the square), into the empty accumulator first; the letters and the line behind it go under through what it leaves, WHITE² − w² (WHITE² is 2²⁸, a shift). Over black it is w; over white, white. Nothing comes out brighter than white or than what was there, so no clamp: the wave peaks at 27/16 × 100 (at t = −1/2 or 1/2), so w ≤ 10800 < WHITE and the term left is never negative.
+                let (front, left) = (w * w, honeycomb::WHITE * honeycomb::WHITE - w * w);
+                let under = |c: u64| (front + (c * c * left >> 28)).isqrt();
+                s[i] = under(p & 0xFFFF) | under(p >> 16 & 0xFFFF) << 16 | under(p >> 32 & 0xFFFF) << 32;
             }
         }
     }
@@ -970,13 +973,13 @@ impl Ahau {
                 *p = ch(*p) | ch(*p >> 16) << 16 | ch(*p >> 32) << 32;
             }
         }
-        // The blinkey where the caret is, while it is in the window: a drag can carry it out (typing brings it back, `chase`).
-        if (w0..w1).contains(&(x + caret_px)) {
-            self.blinkey(s, (x + caret_px) as usize, b - px * 7 / 8, px * 17 / 16, px);
-        }
         // The line: three quarters of the width, a single pixel, grey at a quarter in gamma 2 (owner, 2026-10-29).
         let (x0, x1, y) = (self.w / 8, self.w * 7 / 8, b + px / 4);
         s[y * self.w + x0..y * self.w + x1].fill(grey(LINE));
+        // The blinkey where the caret is, while it is in the window: a drag can carry it out (typing brings it back, `chase`). In front of the letters and the line, both already in the rows it composes over.
+        if (w0..w1).contains(&(x + caret_px)) {
+            self.blinkey(s, (x + caret_px) as usize, b - px * 7 / 8, px * 17 / 16, px);
+        }
         self.present(r0 / self.w, r1 / self.w);
     }
 
@@ -992,9 +995,9 @@ impl Ahau {
         self.show_board();
     }
 
-    /// The keyboard's rows: from its top to the bar's foot.
+    /// The keyboard's rows: from its top to the bar's foot at its lowest (on the app's circle, its bottom).
     fn kb_rows(&self) -> (usize, usize) {
-        (self.kb.top, self.h - honeycomb::corner_rows(self.w, self.h))
+        (self.kb.top, self.kb.bottom)
     }
 
     /// One key drawn lit or at rest, onto the glass: into the frame buffer, its label drawn in by the display (on the board's target, then read back, as `board` bakes its labels, so a later present of these rows keeps it), then the keyboard's rows presented and shown.
@@ -1003,7 +1006,7 @@ impl Ahau {
     fn light(&self, key: Key, lit: bool) {
         let (y0, y1) = self.kb.key_rows(key);
         let (top, bottom) = self.kb_rows();
-        if (bottom - top) * self.w <= 1 << 20 {
+        if (bottom - top) * self.w <= BOARD_PIXELS {
             self.lay_board(self.shown_board.get(), y0, y1);
         }
         unsafe { NLABELS = 0 };
@@ -1077,7 +1080,7 @@ impl Ahau {
         let (top, bottom) = self.kb_rows();
         let n = (bottom - top) * self.w;
         // WHY: the board's size follows the panel's; one too big for BOARDS is drawn tinted the slow way (every key and label again) instead of indexing past it.
-        if n > 1 << 20 {
+        if n > BOARD_PIXELS {
             self.kb.draw(self.surf(), &mut self.label());
             self.present(top, self.h);
             self.replay_labels(self.base);
@@ -1122,7 +1125,7 @@ impl Ahau {
 
     /// Board `kb` drawn ahead into BOARDS. Only into the back surface: drawn on the screen it would show untinted. And only one that fits (`show_board`'s check).
     fn prepare_board(&self, kb: &Keyboard) {
-        if self.back != 0 && (self.kb_rows().1 - self.kb_rows().0) * self.w <= 1 << 20 {
+        if self.back != 0 && (self.kb_rows().1 - self.kb_rows().0) * self.w <= BOARD_PIXELS {
             self.board(kb);
         }
     }
@@ -1751,7 +1754,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         exit(0);
     }
     let mode = Mode::Fresh;
-    let mut kb = Keyboard::new(w, h);
+    let mut kb = Keyboard::new(w, ferros_sys::active_circle(w, h));
     kb.left = "clear";
     // The device's layout; a value from a newer build than this one falls back to the default.
     let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;

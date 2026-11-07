@@ -4,7 +4,9 @@
 //!
 //! Hit testing: a point belongs to the nearest key centre (the honeycomb is exactly the nearest-centre map of its centres, the gaps included). The point's row and the row below are the only candidates, and on each row the nearest column is one division; the closer of the two by squared distance wins. A key at a row's end owns the margin beyond it.
 //!
-//! The extent scrolls in whole rows (no animation, owner 2026-10-22): two fingers drag it 1:1, a row per row pitch, and the page key on the symbol row moves it a page (four rows) at a time, back to the letters after the last. The whole keyboard sits inside the circle an app lives in (owner, 2026-10-27): the bar's bottom is where the circle's chord first spans the screen, so the corners stay the system's.
+//! The extent scrolls in whole rows (no animation, owner 2026-10-22): two fingers drag it 1:1, a row per row pitch, and the page key on the symbol row moves it a page (four rows) at a time, back to the letters after the last. The whole keyboard sits inside the circle an app lives in (owner, 2026-10-27; the host passes it, ferros_sys::active_circle): the bar's bottom is where the circle's chord first spans the screen, so the corners stay the system's.
+//!
+//! The keyboard's bottom lies on the circle (owner, 2026-11-07: "vertically offset the honeycomb so it touches the circle ... so the bottom of the keyboard touches the whole big circle rather than the bottom two corners"): every pixel column of the keys and the bar is moved down by the circle's bottom at that column less its bottom at the screen's edge (`sag`), so the bar's foot follows the circle's bottom arc edge to edge, the keys above it moved with their column. The labels and the shift key's ▲ are not bent ("text itself will still render unskewed"): each is placed by its key's centre column, moved by that column's sag. Hit testing undoes the same sag first, so a pixel drawn is still its own key's.
 #![no_std]
 
 pub mod shape;
@@ -110,11 +112,17 @@ pub struct Keyboard {
     a: i64,
     r: i64,
     gap: i64,
-    /// The bar's top and bottom.
+    /// The bar's top and bottom at the screen's edges (unmoved: a column's sag adds to both).
     bar0: i64,
     bar1: i64,
-    /// The keyboard's top edge, in pixels: everything from here down is the keyboard's.
+    /// The app's circle: its centre's x, its radius squared (Q16), and its half chord at the screen's edge (how far below its centre the bar's foot sits there).
+    ccx: i64,
+    rr: i64,
+    edge: i64,
+    /// The keyboard's top edge, in pixels: everything from here down is the keyboard's (the top row at the screen's edges, where nothing is moved down).
     pub top: usize,
+    /// The row after the keyboard's lowest, in pixels: the circle's bottom, where the bar's foot sags to at the circle's centre column.
+    pub bottom: usize,
     /// The extent row at the bottom of the view.
     pub view: usize,
     pub shift: Shift,
@@ -126,25 +134,36 @@ pub struct Keyboard {
     pub tint: Option<[[u16; 3]; 64]>,
 }
 
-/// The rows of the circle's corners: how far the circle (tangent to the screen's top and bottom) stays narrower than the screen at the bottom.
-pub fn corner_rows(w: usize, h: usize) -> usize {
-    let (cx, r) = (w / 2, h / 2);
-    r - (r * r - cx * cx).isqrt() + 1
-}
-
 impl Keyboard {
-    /// A keyboard for a `w` × `h` screen: ten columns across, the bar on the circle's full-width line, the honeycomb over it.
-    pub fn new(w: usize, h: usize) -> Keyboard {
+    /// A keyboard for a screen `w` pixels wide inside the app's `circle` (centre x, centre y, radius, in pixels: ferros_sys::active_circle): ten columns across, the bar's foot on the circle where its chord spans the screen, the honeycomb over it, every column then sagged onto the circle (`sag`). The circle is wider than the screen's half width at its centre row and its bottom is on the screen, so every column's sag is a real chord and the keyboard stays on the screen.
+    pub fn new(w: usize, circle: (f32, f32, f32)) -> Keyboard {
+        let q8 = |v: f32| (v * (1 << 8) as f32) as i64;
+        let (ccx, ccy, cr) = (q8(circle.0), q8(circle.1), q8(circle.2));
+        let rr = cr * cr;
+        let edge = ((rr - ccx * ccx) as u64).isqrt() as i64;
         let px = ((w as i64) << 8) / 10;
         let py = px * HALF_SQRT3 >> 16;
         let cell_r = px * INV_SQRT3 >> 16;
         let gap = px >> 4;
-        let bar1 = ((h - corner_rows(w, h)) as i64) << 8;
+        let bar1 = ccy + edge;
         let bar0 = bar1 - py;
         let cy3 = bar0 - cell_r;
         let cy0 = cy3 - (VIS as i64 - 1) * py;
         let a = px / 2 - gap / 2;
-        Keyboard { w, px, py, cy0, a, r: a * TWO_OVER_SQRT3 >> 16, gap, bar0, bar1, top: ((cy0 - cell_r) >> 8) as usize, view: 0, shift: Shift::Off, layout: 0, left: BAR_KEYS[B_MAP], tint: None }
+        let bottom = ((ccy + cr - 1) >> 8) as usize + 1;
+        Keyboard { w, px, py, cy0, a, r: a * TWO_OVER_SQRT3 >> 16, gap, bar0, bar1, ccx, rr, edge, top: ((cy0 - cell_r) >> 8) as usize, bottom, view: 0, shift: Shift::Off, layout: 0, left: BAR_KEYS[B_MAP], tint: None }
+    }
+
+    /// How far column `fx` (Q8) is moved down: the circle's bottom there less its bottom at the screen's edge. 0 at the edges, the circle's bottom less the bar's foot at its centre column, smooth between (a circle's arc). One root a column, never one a pixel.
+    fn sag(&self, fx: i64) -> i64 {
+        let dx = fx - self.ccx;
+        ((self.rr - dx * dx) as u64).isqrt() as i64 - self.edge
+    }
+
+    /// The least and the most sag over columns `x0` to `x1` (Q8): the sag is least at the end farther from the circle's centre and most at its centre column if the span holds it, else at the nearer end. The min and max pick an extreme of the interval, they constrain nothing.
+    fn sags(&self, x0: i64, x1: i64) -> (i64, i64) {
+        let (s0, s1) = (self.sag(x0), self.sag(x1));
+        (s0.min(s1), if x0 <= self.ccx && self.ccx <= x1 { self.sag(self.ccx) } else { s0.max(s1) })
     }
 
     /// The row pitch in pixels: a two-finger drag of this far scrolls one row.
@@ -196,7 +215,9 @@ impl Keyboard {
 
     /// The key under a finger at pixel (x, y).
     pub fn hit(&self, x: i64, y: i64) -> Key {
-        let (fx, fy) = ((x << 8) + 128, (y << 8) + 128);
+        // The column's sag undone first: the rest is the unbent keyboard's map.
+        let fx = (x << 8) + 128;
+        let fy = (y << 8) + 128 - self.sag(fx);
         if fy >= self.bar1 {
             return Key::None;
         }
@@ -204,7 +225,7 @@ impl Keyboard {
             let half = fx * 2 / self.px;
             return Key::Bar(BAR_EDGE.iter().position(|&e| half < e).unwrap_or(BAR_KEYS.len() - 1));
         }
-        if y < self.top as i64 {
+        if fy < ((self.top as i64) << 8) + 128 {
             return Key::None;
         }
         let rf = (fy - self.cy0).div_euclid(self.py);
@@ -268,9 +289,9 @@ impl Keyboard {
         changed
     }
 
-    /// The whole keyboard: its area cleared to black (the surface's rows from `top` to the bar's bottom), every key, every label through `label(x, baseline, size px, value, text)`, x the label's centre: the host centres it by its ink (ferros_sys window::text_centred).
+    /// The whole keyboard: its area cleared to black (the surface's rows from `top` to `bottom`), every key, every label through `label(x, baseline, size px, value, text)`, x the label's centre: the host centres it by its ink (ferros_sys window::text_centred).
     pub fn draw(&self, s: &mut [u64], label: &mut dyn FnMut(i64, i64, u16, u16, &str)) {
-        s[self.top * self.w..((self.bar1 >> 8) as usize) * self.w].fill(0);
+        s[self.top * self.w..self.bottom * self.w].fill(0);
         for k in 0..self.hexes() {
             self.draw_key(s, Key::Hex(k), false, label);
         }
@@ -296,15 +317,20 @@ impl Keyboard {
         }
     }
 
-    /// The rows `draw_key` draws `key` into, its label included: a hex's height (cy ± r, Q8) or the bar's, with a row either side for the edge's antialiasing.
+    /// The rows `draw_key` draws `key` into, its label included: a hex's height (cy ± r, Q8) or the bar's, from its columns' least sag to their most, with a row either side for the edge's antialiasing.
     pub fn key_rows(&self, key: Key) -> (usize, usize) {
         let (y0, y1) = match key {
             Key::Hex(k) => {
                 let (row, col) = self.place(k);
-                let (_, cy) = self.centre(row, col);
-                (cy - self.r, cy + self.r)
+                let (cx, cy) = self.centre(row, col);
+                let (lo, hi) = self.sags(cx - self.a, cx + self.a);
+                (cy - self.r + lo, cy + self.r + hi)
             }
-            Key::Bar(_) => (self.bar0 + self.gap / 2, self.bar1 - self.gap / 2),
+            Key::Bar(b) => {
+                let (x0, x1) = self.bar_x(b);
+                let (lo, hi) = self.sags(x0, x1);
+                (self.bar0 + self.gap / 2 + lo, self.bar1 - self.gap / 2 + hi)
+            }
             Key::None => return (0, 0),
         };
         (((y0 >> 8) - 1) as usize, ((y1 >> 8) + 2) as usize)
@@ -322,18 +348,24 @@ impl Keyboard {
                 let (tl, half) = ((g * g + BEVEL * BEVEL).isqrt(), (g * g + BEVEL * BEVEL / 2).isqrt());
                 // The shadows are the lights' mirror in ratio: the bottom-right line as much darker than the face as the top-left is lighter (g²/tl), the right and bottom-left as the half lines (g²/half).
                 let lit = [tl, half, g * g / half, g * g / tl].map(|v| self.colour(key, v));
-                hex(s, self.w, cx, cy, a, r, self.colour(key, g), lit);
+                hex(s, self.w, cx, cy, a, r, self.colour(key, g), lit, &|fx| self.sag(fx));
                 let c = self.cell(k);
                 let mut b = [0u8; 4];
                 let (t, size) = if c == PAGE { ("page", size * 5 / 8) } else { (&*c.encode_utf8(&mut b), size) };
-                centred(cx, cy, size, t, label);
+                // The label unbent, moved down by its key's centre column's sag.
+                centred(cx, cy + self.sag(cx), size, t, label);
             }
             Key::Bar(b) => {
                 let on = lit || (b == B_SHIFT && self.shift != Shift::Off);
                 let (x0, x1) = self.bar_x(b);
                 let (y0, y1) = (self.bar0 + self.gap / 2, self.bar1 - self.gap / 2);
-                shape(s, self.w, x0, x1, self.colour(key, if on { LIT } else { BAR_KEY }), |_| (y0, y1));
-                let (cx, cy) = ((x0 + x1) / 2, (self.bar0 + self.bar1) / 2);
+                let face = self.colour(key, if on { LIT } else { BAR_KEY });
+                shape(s, self.w, x0, x1, face, |fx| {
+                    let d = self.sag(fx);
+                    (y0 + d, y1 + d)
+                });
+                let cx = (x0 + x1) / 2;
+                let cy = (self.bar0 + self.bar1) / 2 + self.sag(cx);
                 if b == B_SHIFT {
                     // ▲ (owner, 2026-11-01): the label's grey off, white once, black in caps lock (on the lit key all three).
                     let g = match self.shift {
@@ -341,7 +373,7 @@ impl Keyboard {
                         Shift::Once => WHITE,
                         Shift::Lock => 0,
                     };
-                    up_triangle(s, self.w, cx, cy, (y1 - y0) * 3 >> 3, g);
+                    up_triangle(s, self.w, cx, cy, (y1 - y0) * 3 >> 3, g, face);
                 } else {
                     centred(cx, cy, size * 5 / 7, if b == B_MAP { self.left } else { BAR_KEYS[b] }, label);
                 }
@@ -485,7 +517,7 @@ fn centred(cx: i64, cy: i64, px: u16, s: &str, label: &mut dyn FnMut(i64, i64, u
     label(cx, cy + p * 35 / 100, px, LABEL, s);
 }
 
-/// A round dot of radius `r` pixels at (x, y) (a tracing finger's trail): coverage from the squared distance, a root only on the one-pixel edge band. The caller keeps it on the surface.
+/// A round dot of radius `r` pixels at (x, y) (a tracing finger's trail), a layer in front of what the surface holds: coverage from the squared distance, roots only on the one-pixel edge band (inside it the dot is opaque and nothing behind is read). The caller keeps it on the surface.
 pub fn dot(s: &mut [u64], w: usize, x: i64, y: i64, r: i64, v: u64) {
     let (cx, cy, rq) = ((x << 8) + 128, (y << 8) + 128, r << 8);
     let (lo, hi) = (rq - 128, rq + 128);
@@ -504,12 +536,16 @@ pub fn dot(s: &mut [u64], w: usize, x: i64, y: i64, r: i64, v: u64) {
             if px < 0 || py < 0 || px >= w as i64 || (py as usize + 1) * w > s.len() {
                 continue;
             }
+            // Front to back: the trail is a layer in front of the keys, grey `v` at α = cov/256 in linear light (the working values are gamma 2, so light is the square). It goes into the empty accumulator first, then what is behind (the keys, their labels, the trail's earlier dots) under it through what the dot leaves, 256 − cov.
             let p = &mut s[py as usize * w + px as usize];
-            let g = grey(v * ((cov as u64) << 8).isqrt() >> 8);
-            // Over whatever is there, the brighter channel wins (the trail sits on the keys).
-            if g & 0xFFFF > *p & 0xFFFF {
-                *p = g;
+            // Opaque stops the walk.
+            if cov == 256 {
+                *p = grey(v);
+                continue;
             }
+            let (front, left) = (v * v * cov as u64, 256 - cov as u64);
+            let under = |c: u64| ((front + c * c * left) >> 8).isqrt();
+            *p = under(*p & 0xFFFF) | under(*p >> 16 & 0xFFFF) << 16 | under(*p >> 32 & 0xFFFF) << 32;
         }
     }
 }
@@ -532,8 +568,8 @@ fn column(s: &mut [u64], w: usize, x: usize, top: i64, bot: i64, cov_x: u32, v: 
     s[yb * w + x] = shade(cb);
 }
 
-/// The shift key's ▲: an equilateral triangle pointing up, centred at (`cx`, `cy`) and `h` high (Q8), in grey `g` over the key under it, each pixel blended in linear light by its coverage (4 × 4 samples). Not text: the host's labels can only brighten what is under them, and the caps-lock ▲ is black. Not `shape`: that writes a key's pixels outright, where this lies on one.
-fn up_triangle(s: &mut [u64], w: usize, cx: i64, cy: i64, h: i64, g: u64) {
+/// The shift key's ▲: an equilateral triangle pointing up, centred at (`cx`, `cy`) and `h` high (Q8), in grey `g`, composed front to back with the key's face `key` behind it: the ▲ first into an empty accumulator at α = its coverage (4 × 4 samples, in sixteenths), then the face under it through what the ▲ leaves, in linear light. The ▲ stands well inside the face's flat span (3/8 of its height, centred), so the face behind it is `key` and the surface is not read: each pixel is written whole, after `shape` has drawn the face. Not text: the host's labels can only brighten what is under them, and the caps-lock ▲ is black.
+fn up_triangle(s: &mut [u64], w: usize, cx: i64, cy: i64, h: i64, g: u64, key: [u64; 3]) {
     // Half the base: h/√3 (37/64).
     let hw = h * 37 >> 6;
     let (top, bot) = (cy - h / 2, cy + h / 2);
@@ -547,17 +583,18 @@ fn up_triangle(s: &mut [u64], w: usize, cx: i64, cy: i64, h: i64, g: u64) {
             if n == 0 {
                 continue;
             }
-            let i = y as usize * w + x as usize;
-            let p = s[i];
-            let mix = |c: u64| ((c * c * (16 - n) + g * g * n) >> 4).isqrt();
-            s[i] = mix(p & 0xFFFF) | mix(p >> 16 & 0xFFFF) << 16 | mix(p >> 32 & 0xFFFF) << 32;
+            // The ▲'s light premultiplied by its coverage, and what it leaves for the face behind.
+            let (front, left) = (g * g * n, 16 - n);
+            let under = |c: u64| ((front + c * c * left) >> 4).isqrt();
+            s[y as usize * w + x as usize] = under(key[0]) | under(key[1]) << 16 | under(key[2]) << 32;
         }
     }
 }
 
 /// A pointy-topped hex key at (`cx`, `cy`), half width `a` and circumradius `r` (Q8), in colour `key`, with its bevel (BEVEL), a line a pixel thick inside each side: `lit` = [top-left, left and top-right, right and bottom-left, bottom-right]. Every pixel is its areas' light added in linear light against black (the way `column` covers an edge): the top side's line, the bottom side's, the left or right line, and the key's face.
+/// Each pixel column is moved down by `sag` at its centre (`Keyboard::sag`: the keyboard bent onto the circle).
 /// The overlaps below are lengths of intervals (a pixel's span against the key's, a line's), the coverage itself, not a bound on anything.
-fn hex(s: &mut [u64], w: usize, cx: i64, cy: i64, a: i64, r: i64, key: [u64; 3], lit: [[u64; 3]; 4]) {
+fn hex(s: &mut [u64], w: usize, cx: i64, cy: i64, a: i64, r: i64, key: [u64; 3], lit: [[u64; 3]; 4], sag: &dyn Fn(i64) -> i64) {
     let (left, right) = (cx - a, cx + a);
     // Down a 30° side, a line one pixel thick across it is 2/√3 of a pixel tall.
     let th = 256 * TWO_OVER_SQRT3 >> 16;
@@ -571,7 +608,8 @@ fn hex(s: &mut [u64], w: usize, cx: i64, cy: i64, a: i64, r: i64, key: [u64; 3],
         let (lx, rx) = (ov(x0, x1, left, left + 256), ov(x0, x1, right - 256, right));
         let fx = x0 + 128;
         let t = (fx - cx).abs() * INV_SQRT3 >> 16;
-        let (top, bot) = (cy - r + t, cy + r - t);
+        let d = sag(fx);
+        let (top, bot) = (cy - r + t + d, cy + r - t + d);
         let (up, down) = if fx < cx { (tl2, d2) } else { (h2, br2) };
         for y in (top >> 8)..=((bot - 1) >> 8) {
             let (y0, y1) = (y << 8, (y + 1) << 8);
@@ -606,10 +644,13 @@ mod tests {
     extern crate std;
     use super::*;
 
+    /// The app's circle on husky's 1344 × 2992 panel, as ferros_sys::active_circle gives it: tangent to the cutout's bottom (row 118.25) and the screen's bottom.
+    pub const HUSKY: (f32, f32, f32) = (672., 118.25 + 1436.875, 1436.875);
+
     /// The shift cycles off, once, caps lock, off; once lasts one letter, caps lock every letter.
     #[test]
     fn shift_cycle() {
-        let mut kb = Keyboard::new(1344, 2992);
+        let mut kb = Keyboard::new(1344, HUSKY);
         let letter = (0..kb.hexes()).find(|&k| kb.cell(k).is_alphabetic()).unwrap();
         assert_eq!(kb.tap(Key::Bar(B_SHIFT)), Some(Event::Redraw));
         assert_eq!(kb.shift, Shift::Once);
@@ -629,7 +670,7 @@ mod tests {
     #[test]
     fn drawing_matches_hit_testing() {
         let (w, h) = (1344usize, 2992usize);
-        let mut kb = Keyboard::new(w, h);
+        let mut kb = Keyboard::new(w, HUSKY);
         let mut none = |_: i64, _: i64, _: u16, _: u16, _: &str| {};
         for (layout, view) in (0..LAYOUTS).flat_map(|l| (0..=MAX_VIEW).map(move |v| (l, v))) {
             kb.layout = layout;
@@ -647,21 +688,26 @@ mod tests {
         }
     }
 
-    /// The bar sits inside the circle: its corners are inside the circle tangent to the screen's top and bottom.
+    /// The bar's foot lies on the app's circle in every column: the foot is the circle's bottom at that column (within the root's rounding), from the screen's edges to the circle's bottom row at its centre, and the keyboard ends on the screen.
     #[test]
-    fn bar_inside_the_circle() {
+    fn bar_on_the_circle() {
         let (w, h) = (1344usize, 2992usize);
-        let kb = Keyboard::new(w, h);
-        let (cx, cy, r) = (w as i64 / 2, h as i64 / 2, h as i64 / 2);
-        let y = (kb.bar1 >> 8) - 1;
-        for x in [0i64, w as i64 - 1] {
-            assert!((x - cx).pow(2) + (y - cy).pow(2) <= r * r);
+        let kb = Keyboard::new(w, HUSKY);
+        let q8 = |v: f32| (v * 256.) as i64;
+        let (cx, cy, r) = (q8(HUSKY.0), q8(HUSKY.1), q8(HUSKY.2));
+        for x in 0..w as i64 {
+            let fx = (x << 8) + 128;
+            let foot = kb.bar1 + kb.sag(fx);
+            let arc = cy + ((r * r - (fx - cx).pow(2)) as u64).isqrt() as i64;
+            assert!((foot - arc).abs() <= 1, "column {x}: foot {foot}, circle {arc}");
         }
+        assert_eq!(kb.bottom, h);
+        assert_eq!(kb.sag(cx), cy + r - kb.bar1);
     }
 
     #[test]
     fn page_cycles() {
-        let mut kb = Keyboard::new(1344, 2992);
+        let mut kb = Keyboard::new(1344, HUSKY);
         kb.view = 1;
         let page = (0..kb.hexes()).find(|&k| kb.cell(k) == PAGE).unwrap();
         assert_eq!(kb.tap(Key::Hex(page)), Some(Event::Redraw));

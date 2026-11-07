@@ -100,12 +100,13 @@ fn mean_sq(a: &[(i64, i64); N], b: &[(i64, i64); N]) -> i64 {
 }
 
 impl Keyboard {
-    /// A letter's key centre (Q8) in the letters view.
+    /// A letter's key centre (Q8) in the letters view, where it is drawn: moved down by its column's sag, as the finger sees it.
     fn letter_at(&self, c: u8) -> Option<(i64, i64)> {
         for row in 0..crate::VIS {
             let cells = self.extent_row(row);
             if let Some(col) = cells.iter().position(|&k| k == c as char) {
-                return Some(self.centre(row, col));
+                let (x, y) = self.centre(row, col);
+                return Some((x, y + self.sag(x)));
             }
         }
         None
@@ -198,7 +199,7 @@ mod tests {
     /// A trace drawn through a word's keys, with a wobble, decodes to that word, ahead of neighbours that share its ends.
     #[test]
     fn traces_decode() {
-        let kb = Keyboard::new(1344, 2992);
+        let kb = Keyboard::new(1344, crate::tests::HUSKY);
         let words = ["the", "tie", "toe", "hello", "help", "hell", "word", "world", "would", "keyboard", "kind", "good", "food", "there", "three", "trace"];
         let bytes = lexicon(&words);
         let lex = Lexicon(&bytes);
@@ -268,7 +269,7 @@ mod real {
         let Some(bytes) = rhe_lexicon() else { return };
         let lex = Lexicon(&bytes);
         for layout in 0..crate::LAYOUTS {
-        let mut kb = Keyboard::new(1344, 2992);
+        let mut kb = Keyboard::new(1344, crate::tests::HUSKY);
         kb.layout = layout;
         let (mut n, mut first, mut three) = (0, 0, 0);
         let t0 = std::time::Instant::now();

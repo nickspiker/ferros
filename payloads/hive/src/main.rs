@@ -289,7 +289,7 @@ extern "C" fn hive_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         console(grants, b"hive: no surface\n");
         exit(2);
     }
-    let mut kb = Keyboard::new(w, h);
+    let mut kb = Keyboard::new(w, ferros_sys::active_circle(w, h));
     // The device's layout (SETTINGS.md); a value from a newer build falls back to the default.
     let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
     kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };

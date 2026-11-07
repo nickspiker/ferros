@@ -64,7 +64,7 @@ impl Surface {
         }
     }
 
-    /// Draw `s` with its line's top at `top` and its pen starting at `x`, in `rgb` blended over what is there; returns where the pen ends.
+    /// Draw `s` with its line's top at `top` and its pen starting at `x`, in `rgb` in front of what is there (each glyph pixel composed front to back, the framebuffer under it); returns where the pen ends.
     pub fn draw(&self, x: i32, top: i32, s: &str, rgb: u32) -> i32 {
         let base = top + ascent();
         let mut pen = x;
@@ -86,9 +86,11 @@ impl Surface {
                         continue;
                     }
                     let p = unsafe { self.fb.add(y as usize * self.stride + x as usize) };
-                    let under = unsafe { core::ptr::read_volatile(p) };
-                    let mix = |sh: u32| (((rgb >> sh) & 0xFF) * a + ((under >> sh) & 0xFF) * (255 - a)) / 255 << sh;
-                    unsafe { core::ptr::write_volatile(p, mix(16) | mix(8) | mix(0)) };
+                    // Front to back: the glyph first into an empty accumulator (its colour at coverage a), then the framebuffer's pixel under it through what the glyph leaves (255 − a).
+                    let behind = unsafe { core::ptr::read_volatile(p) };
+                    let (front, left) = (a, 255 - a);
+                    let under = |sh: u32| (((rgb >> sh) & 0xFF) * front + ((behind >> sh) & 0xFF) * left) / 255 << sh;
+                    unsafe { core::ptr::write_volatile(p, under(16) | under(8) | under(0)) };
                 }
             }
             pen += g.advance;
