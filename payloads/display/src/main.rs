@@ -2835,8 +2835,8 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                     let base = top_y + lh * 0.5 + px * 0.36;
                     eng.cover(text, x - tw * 0.5, base, px, (1.0, 0.0), |gx, gy, a| {
                         if let Some(i) = at(gx, gy) {
-                            // A glyph's coverage byte as a 16-bit α (× 257 takes 255 to 65535).
-                            console[i] = console[i].under(ink | (a as u64 * 257) << 48, BlendMode::Normal);
+                            // The glyph's 16-bit coverage is the ink's α.
+                            console[i] = console[i].under(ink | (a as u64) << 48, BlendMode::Normal);
                         }
                     });
                     top_y += lh;
@@ -3914,7 +3914,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                                 if x < 0 || y < 0 || x >= width as i64 || y >= height as i64 {
                                     return;
                                 }
-                                let v = (val * a / 255).min(0xFFFF) as u64;
+                                let v = (val as u64 * a as u64 / 65535).min(0xFFFF);
                                 let d = &mut surf[y as usize * width + x as usize];
                                 let have = if *d & CLEAR != 0 { 0 } else { *d & 0xFFFF };
                                 if v > have {

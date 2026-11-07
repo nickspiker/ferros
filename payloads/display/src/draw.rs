@@ -101,13 +101,19 @@ pub fn under(dst: Px, src: Px) -> Px {
     mix(48) | mix(32) | mix(16) | mix(0)
 }
 
-/// An opaque colour (G#RRGGBB, 8-bit codes) at coverage `cov` (0-255), premultiplied.
+/// An opaque colour (G#RRGGBB, 8-bit codes) at coverage `cov` (0-255), premultiplied: the 16-bit form at `cov` × 257 (255 to 65535).
 #[inline(always)]
 pub fn at_coverage(colour: u32, cov: u32) -> Px {
-    if cov >= 255 {
+    at_cover16(colour, cov * 257)
+}
+
+/// An opaque colour (G#RRGGBB, 8-bit codes) at 16-bit coverage `cov` (0-65535: the glyph engine's), premultiplied.
+#[inline(always)]
+pub fn at_cover16(colour: u32, cov: u32) -> Px {
+    if cov >= 65535 {
         return opaque(colour);
     }
-    let a = cov as u64 * 257;
+    let a = cov as u64;
     let m = |c: u32| (wide8(c) * a + 0x7FFF) / 0xFFFF;
     a << 48 | m(colour >> 16) | m(colour >> 8) << 16 | m(colour) << 32
 }
