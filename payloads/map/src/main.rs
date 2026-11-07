@@ -14,7 +14,7 @@
 //!
 //! Positions are deterministic until the person arranges by hand; then each moved circle is kept in the vault (`map.place.<name>`) and wins over the seeded place from then on.
 //!
-//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`.
+//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page).
 
 #![no_std]
 #![no_main]
@@ -27,6 +27,8 @@ const S_DISPLAY: u64 = 1;
 const S_TOUCH: u64 = 2;
 const S_SETTINGS: u64 = 3;
 const S_STORE: u64 = 4;
+/// The identity service (payloads/fgtw): the Fleet page asks it the fleet's state and members, and starts this device's departure.
+const S_FGTW: u64 = 5;
 
 /// One circle: its label, its weight of ring (0 none, 1 thin, 2 heavy — importance), whether it is lit (changed since last seen), its share of the map's area in thousandths, and its icon in the display server's bundle (tools/app-icons order).
 struct Spec {
@@ -160,6 +162,62 @@ fn place(rs: &[i64], xs: &mut [i64], ys: &mut [i64]) {
             // Widen the search slowly, so the circles stay as close as the air allows rather than scattering.
             spread += 4;
         }
+    }
+}
+
+/// The Fleet page's view of the identity service (payloads/fgtw ops 1 and 6), asked once a second while the page shows and after its taps.
+#[derive(Clone, Copy)]
+struct Fleet {
+    /// None until the service answered at all (it starts only once a person has attested).
+    state: Option<u8>,
+    words: [u8; 64],
+    words_n: usize,
+    keys: [[u8; 8]; 16],
+    me: [bool; 16],
+    n: usize,
+    /// The remove row's first tap: what goes with the device is shown, and the next tap on it starts the departure.
+    confirm: bool,
+    /// What the last departure request answered (fgtw `leave`: 0 started, 1 not a member, 2 a bad intent, 3 the request did not build).
+    leave_result: Option<u8>,
+}
+
+impl Fleet {
+    const fn new() -> Self {
+        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], n: 0, confirm: false, leave_result: None }
+    }
+
+    /// The service's state and words (`[state][siblings heard][words]`), then its members (`[count][count × (8 key bytes, flags)]`). CALL_LIVE: a service that is not running answers at once instead of holding the page.
+    fn poll(&mut self, svc: u64) {
+        let mut r = [0u8; 80];
+        let n = ferros_sys::call_live(svc, &[1], &mut r);
+        if n == ferros_sys::ERR || n < 2 {
+            self.state = None;
+            return;
+        }
+        self.state = Some(r[0]);
+        let w = (n as usize - 2).min(self.words.len());
+        self.words[..w].copy_from_slice(&r[2..2 + w]);
+        self.words_n = w;
+        let mut m = [0u8; 1 + 16 * 9];
+        let k = ferros_sys::call_live(svc, &[6], &mut m);
+        if k != ferros_sys::ERR && k >= 1 {
+            // WHY: the count is the service's word; the rows read are those that both fit the reply and the table.
+            let cnt = (m[0] as usize).min(16).min((k as usize - 1) / 9);
+            for i in 0..cnt {
+                self.keys[i].copy_from_slice(&m[1 + i * 9..9 + i * 9]);
+                self.me[i] = m[9 + i * 9] & 1 == 1;
+            }
+            self.n = cnt;
+        }
+    }
+
+    /// Start this device's departure (fgtw op 5, intent 1: to a new owner, so the approver also frees the device for another fleet).
+    fn leave(&mut self, svc: u64) {
+        let mut r = [0u8; 80];
+        let n = ferros_sys::call_live(svc, &[5, 1], &mut r);
+        self.leave_result = if n == ferros_sys::ERR || n < 1 { None } else { Some(r[0]) };
+        self.confirm = false;
+        self.poll(svc);
     }
 }
 
@@ -312,10 +370,12 @@ enum Choice {
     Version,
     /// A neighbour page's title: one page that way.
     Page(i8),
+    /// The Fleet page's "remove this device": the first tap shows what goes with it, the second starts the departure.
+    FleetRemove,
 }
 
 /// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"). Developer is a page only on development builds, or once the twelve taps made it one.
-const PAGES: [&str; 8] = ["appearance", "numbers", "keyboard", "security", "power", "connections", "about", "developer"];
+const PAGES: [&str; 9] = ["appearance", "numbers", "keyboard", "security", "fleet", "power", "connections", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Taps in a row on About's version line that make Developer a page (owner, 2026-11-05: "twelve"), and the tap from which the hint shows and counts down ("don't show a toast hint until four taps"). No time window: any other tap starts the count again.
@@ -360,7 +420,7 @@ struct Map {
     panned: bool,
     pan: Option<(f64, f64, f64, f64, f64)>,
     /// Each page's content height as last laid out, for how far it scrolls.
-    page_h: [i64; 8],
+    page_h: [i64; 9],
     /// The drag on the settings: which way it is locked (0 not yet, 1 across, 2 up and down), where the strip and the scroll stood at the touch, and the last three frames' movements up and down.
     swipe: u8,
     drag_base: (i64, i64),
@@ -376,6 +436,8 @@ struct Map {
     armed: bool,
     /// Developer made a page by the twelve taps (the vault, `map.dev`).
     dev: bool,
+    /// The Fleet page as the identity service last answered: its state (payloads/fgtw: 0 no identity, 1 joining, 2 bound waiting for the key, 3 a member with the key, 4-7 looking up, 8 leaving), the approval words while leaving, the members (key prefixes, which one is this device), and the remove row armed by its first tap.
+    fleet: Fleet,
     /// Where the camera is flying (`fly`), and whether the flight leaves the open circle for the plane (the page drawn, shrinking with the circle, until it lands).
     target: Option<Cam>,
     flight: Option<Flight>,
@@ -1078,6 +1140,49 @@ impl Map {
                 b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "whoever holds it holds your identity");
                 y += uu(3, 1);
             }
+            "fleet" => {
+                // The fleet this identity's devices make (payloads/fgtw): where this device stands, the members, and removing this device. Removing wipes the identity's things from it (AUTH.md: the identity class) and it restarts at the attest screen once a device of the fleet approves.
+                let f = self.fleet;
+                let state = match f.state {
+                    None => "the identity service is not running",
+                    Some(0) => "no identity here",
+                    Some(1) => "joining: confirm on one of your devices",
+                    Some(2) => "in the fleet, waiting for its key",
+                    Some(3) => "in the fleet",
+                    Some(8) => "leaving the fleet",
+                    Some(_) => "looking the identity up",
+                };
+                row(self, b, &mut y, small, white(), state, None);
+                for i in 0..f.n {
+                    let mut l = Line::new();
+                    for x in &f.keys[i][..4] {
+                        let _ = write!(l, "{x:02x}");
+                    }
+                    if f.me[i] {
+                        l.s("  this device");
+                    }
+                    row(self, b, &mut y, small, if f.me[i] { white() } else { grey() }, l.as_str(), None);
+                }
+                if f.state == Some(8) {
+                    // The departure waits for a device of the fleet: its person types these words there (Photon: Devices).
+                    b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "approve on one of your devices with:");
+                    y += uu(1, 1);
+                    let words = core::str::from_utf8(&f.words[..f.words_n]).unwrap_or("");
+                    row(self, b, &mut y, uu(3, 2), white(), words, None);
+                    b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "then this device wipes and restarts");
+                    y += uu(2, 1);
+                } else if matches!(f.state, Some(2) | Some(3)) {
+                    row(self, b, &mut y, small, if f.confirm { white() } else { grey() }, if f.confirm { "tap again: remove this device" } else { "remove this device" }, Some(Choice::FleetRemove));
+                    if f.confirm {
+                        b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "wipes from this device: the map's arrangement,");
+                        b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "WiFi networks, the last location; not saved");
+                        y += uu(3, 1);
+                    }
+                    if f.leave_result.is_some_and(|r| r != 0) {
+                        row(self, b, &mut y, small, white(), "the departure did not start", None);
+                    }
+                }
+            }
             "power" => {
                 let on = ferros_sys::pref(ferros_sys::PREF_PROX_WAKE) == 1;
                 let mut l = Line::new();
@@ -1366,6 +1471,9 @@ impl Map {
                 if row != Some(Choice::UnlockAtBoot) {
                     self.armed = false;
                 }
+                if row != Some(Choice::FleetRemove) {
+                    self.fleet.confirm = false;
+                }
                 let set = |m: &Map, pref: u64, v: u8| {
                     ferros_sys::set_pref(cap(m.grants, S_SETTINGS), pref, v);
                 };
@@ -1395,6 +1503,14 @@ impl Map {
                             self.armed = false;
                         } else {
                             self.armed = true;
+                        }
+                    }
+                    // Remove this device: the first tap shows what goes with it, the second starts the departure (the words then show here).
+                    Some(Choice::FleetRemove) => {
+                        if self.fleet.confirm {
+                            self.fleet.leave(cap(self.grants, S_FGTW));
+                        } else {
+                            self.fleet.confirm = true;
                         }
                     }
                     Some(Choice::Version) => {
@@ -1485,7 +1601,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         pans: [(0, 0); 3],
         panned: false,
         pan: None,
-        page_h: [0; 8],
+        page_h: [0; 9],
         swipe: 0,
         drag_base: (0, 0),
         dys: [0; 3],
@@ -1496,6 +1612,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         taps: 0,
         armed: false,
         dev: false,
+        fleet: Fleet::new(),
         target: None,
         flight: None,
         back: None,
@@ -1651,8 +1768,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
 
         // The open settings' live facts (About, Connections): drawn again once a second while they show (live data, not motion).
-        if matches!(map.view, View::Open(_)) && matches!(PAGES[map.page], "about" | "connections") && !map.settling && now().wrapping_sub(last_facts) > freq() {
+        if matches!(map.view, View::Open(_)) && matches!(PAGES[map.page], "about" | "connections" | "fleet") && !map.settling && now().wrapping_sub(last_facts) > freq() {
             last_facts = now();
+            if PAGES[map.page] == "fleet" {
+                map.fleet.poll(cap(map.grants, S_FGTW));
+            }
             map.draw();
         }
 

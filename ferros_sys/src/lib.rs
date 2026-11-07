@@ -1021,6 +1021,14 @@ pub fn release_identity(cap: u64) -> bool {
     svc(nr::UNLOCK, cap, 4, 0, 0, 0) == 0
 }
 
+/// The unlocked identity's own entries on this device as one VSF document (section `identity_export`, an `entry` field per vault name: the name and its stored bytes), written into `buf`, for saving them to the fleet before a departure. The document's length, or None while locked or when it does not fit.
+pub fn export_identity(cap: u64, buf: &mut [u8]) -> Option<usize> {
+    match svc(nr::UNLOCK, cap, 5, off(buf.as_ptr()), buf.len() as u64, 0) {
+        ERR => None,
+        n => Some(n as usize),
+    }
+}
+
 /// A granted region reached through its handle (SANDBOX.md, "Handles"): slot `SLOT`'s pair in the handle table at the arc's start (its base and its mask, written by the kernel, read-only to the process), every access `base + (offset & mask)` in exactly the instruction forms the sandbox checker admits: the pair load `ldp x23, x22, [x28, #16·SLOT]`, the masked offset `and x21, off, x22`, the access `[x23, x21]`. Native and masked code run the same instructions; a masked process can reach a granted region no other way. An offset past the region wraps inside it. A grant with no region (an endpoint, a right) has a zero pair: every access lands on address 0 and faults, which is the right answer.
 pub struct Handle<const SLOT: u64>;
 

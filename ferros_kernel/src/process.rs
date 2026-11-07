@@ -1094,6 +1094,8 @@ pub static mut STORE_REMOVE: Option<fn(&str) -> Result<bool, ()>> = None;
 pub static mut STORE_KEYS: Option<fn() -> Result<Vec<alloc::string::String>, ()>> = None;
 /// The vault's identity half behind `SYS_UNLOCK`, registered with the store (service.rs): (op 0 query, 1 unlock with the seed, 2 lock) -> Ok(unlocked after the op) or Err.
 pub static mut UNLOCK: Option<fn(u8, Option<&[u8; 32]>) -> Result<u64, ()>> = None;
+/// The identity's entries as one VSF document (service.rs `store_export`), for SYS_UNLOCK op 5.
+pub static mut EXPORT: Option<fn() -> Option<alloc::vec::Vec<u8>>> = None;
 /// An entry kept by 32-byte address rather than by name (SYS_STORE bit 5): kete on ferros keeps its vaults this way — the address is kete's, the kernel scopes it (kvault `addr_scoped`).
 pub enum AddrOp<'a> {
     Get,
@@ -1592,6 +1594,14 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         r.unwrap_or(ERR)
                     }
                     2..=4 => unlock(op as u8, None).unwrap_or(ERR),
+                    // Op 5: the identity's own entries as one VSF document into the caller's buffer (x2, x3 its length), for saving them to the fleet before a departure; the document's length, or ERR while locked or when it does not fit.
+                    5 => match unsafe { EXPORT }.and_then(|e| e()) {
+                        Some(doc) if doc.len() as u64 <= f.x[3] => {
+                            p.write(f.x[2], &doc);
+                            doc.len() as u64
+                        }
+                        _ => ERR,
+                    },
                     _ => ERR,
                 },
                 _ => ERR,

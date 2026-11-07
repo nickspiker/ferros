@@ -2604,6 +2604,14 @@ impl Online {
                     self.camp_seen[k] |= bit;
                     line(rep, alloc::format!("t={} ms: ch A#{ch} first indication G#{id:04X} {}\n", since_us(t0) / 1000, sit_name(id)));
                 }
+                // NITZ, every time, whole: the network's time, its zone and daylight-saving offset, for the clock (layout read from these dumps; SIT is closed).
+                if id == 0x0905 {
+                    let mut l = alloc::string::String::new();
+                    for i in 12..flen.min(12 + 96) {
+                        let _ = core::fmt::Write::write_fmt(&mut l, format_args!("{:02X}", at(i)));
+                    }
+                    line(rep, alloc::format!("t={} ms: NITZ ({flen} bytes) {l}\n", since_us(t0) / 1000));
+                }
             }
             if quiet {
                 // Counted in per_ch only.

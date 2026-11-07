@@ -259,6 +259,8 @@ static mut SPAWN_STORE: *mut Option<ShimStore> = core::ptr::null_mut();
 pub static ANDROID_ALLOWED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// A launch the `android` switch accepted, for the service loop's next pass.
 static ANDROID_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// A completed departure released the identity (SYS_UNLOCK op 4): the service loop restarts the device, which comes back at the attest screen (AUTH.md's "no way back to the attest screen" gap, closed the plain way).
+static RELEASE_RESET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// The `android` switch (process.rs POWERS): accepted only on a device that allows Android and while a person is present (the vault's identity class unlocked: the kernel's own state, set by an attest through SYS_UNLOCK, never a process's word). Nothing in the base OS holds it (owner, 2026-11-04: nothing is built in but system settings): it is for an Android launcher a person installs, and this check is the lock whoever holds it. The service loop then does the gate's Android path: ANDROID_ONCE, slot a, the reset with its scrub (`diag android`'s sequence).
 pub fn android_request(on: bool) -> bool {
@@ -330,12 +332,25 @@ fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
         (4, _) => {
             let n = st.release().map_err(|_| ())?;
             crate::flashlog::line(&alloc::format!("identity released: {n} entries deleted, the device-only secret renewed"));
+            RELEASE_RESET.store(true, core::sync::atomic::Ordering::Release);
             Ok(0)
         }
         _ => Ok(st.unlocked() as u64 | (st.bound().unwrap_or(false) as u64) << 1),
     }
 }
 
+
+/// The identity's own entries on this device as one VSF document, for the identity service to seal into its fleet before a departure (SYS_UNLOCK op 5; the Fleet page's "save first"): section `identity_export`, one `entry` field per vault name, its values the name (`d`) and the stored bytes (`v'r'`). None while locked.
+fn store_export() -> Option<alloc::vec::Vec<u8>> {
+    let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut())?;
+    let entries = st.identity_export().ok()?;
+    let mut section = vsf::VsfSection::new("identity_export");
+    for (name, value) in &entries {
+        section.add_field_multi("entry", alloc::vec![vsf::VsfType::d(name.clone()), vsf::VsfType::v(b'r', value.clone())]);
+    }
+    crate::flashlog::line(&alloc::format!("identity export: {} entries", entries.len()));
+    vsf::VsfBuilder::new().creation_time_oscillations(crate::settings::eagle_now()).provenance_only().add_section_direct(section).build().ok()
+}
 fn store_remove(key: &str) -> Result<bool, ()> {
     let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
     crate::flashlog::line(&alloc::format!("store remove {key:?} (process)"));
@@ -1064,6 +1079,7 @@ pub fn run(mut b: Boot) -> ! {
         crate::process::STORE_KEYS = Some(store_keys);
         crate::process::STORE_ADDR = Some(store_addr);
         crate::process::UNLOCK = Some(store_unlock);
+        crate::process::EXPORT = Some(store_export);
         crate::platform::BEFORE_RESET = Some(lock_before_reset);
     }
     let mut home_started = !matches!(b.kind, BootKind::Cold);
@@ -1170,6 +1186,11 @@ pub fn run(mut b: Boot) -> ! {
     platform::mark(0x3A);
     loop {
         platform::pet_watchdogs();
+        // Released (a completed departure): restart, so the device comes back at the attest screen with nothing of the identity left.
+        if RELEASE_RESET.swap(false, core::sync::atomic::Ordering::AcqRel) {
+            crate::flashlog::line("identity released: restarting at the attest screen");
+            platform::reboot();
+        }
         // A launch of Android the `android` switch accepted: the gate's Android path, as `diag android` takes it. The person is checked again here; the reset scrubs ferros's memory on its way (platform::before_reset).
         #[cfg(not(shim_handoff))]
         if ANDROID_REQ.swap(false, core::sync::atomic::Ordering::AcqRel) && unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).is_some_and(|s| s.unlocked()) {

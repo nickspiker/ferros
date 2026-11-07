@@ -478,6 +478,23 @@ impl KVault {
         Ok(())
     }
 
+    /// The unlocked identity's entries on this device, for saving to its fleet before a departure (the Fleet page's "save first"): every identity-class name and value except the identity service's own (`fgtw.`: the chain and key, which the fleet already holds) and the attest screen's (`ahau.`: re-derived at every attest). Refused while locked.
+    pub fn identity_export(&mut self) -> Result<Vec<(String, Vec<u8>)>, KvError> {
+        if self.id.is_none() {
+            return Err(KvError::Locked);
+        }
+        let mut out = Vec::new();
+        for name in self.names_in(Class::Identity)? {
+            if name.starts_with("fgtw.") || name.starts_with("ahau.") {
+                continue;
+            }
+            if let Some(v) = self.get_by_key(&name)? {
+                out.push((name, v));
+            }
+        }
+        Ok(out)
+    }
+
     /// How many entries the unlocked identity has on this device (0 while locked): a person who has used this device before finds a space that is not empty.
     pub fn identity_entries(&mut self) -> usize {
         if self.id.is_none() {

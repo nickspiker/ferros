@@ -438,6 +438,8 @@ struct Client {
     hp: Option<[u8; 32]>,
     bound: bool,
     fleet_key: Option<[u8; 32]>,
+    /// The fleet's members as the last chain this client adopted folds them (the Fleet page's list, op 6): device keys, this one among them.
+    members: Vec<[u8; 32]>,
     pt: Pt,
     sponsors: Vec<Sponsor>,
     /// This device's current binding request and its stamp (re-minted every 210 s while unbound, as the app re-posts).
@@ -535,6 +537,7 @@ impl Client {
                 if n <= chain.len() {
                     if let Ok((blob, bound)) = join::adopt_chain(&hp, &seed, &self.me, &chain[..n]) {
                         self.bound = bound;
+                        self.note_members(&blob);
                         self.log.put(b"fgtw: chain held, ");
                         self.log.dec(blob.ops.len() as u64);
                         self.log.put(if bound { b" op(s), this device is a member" } else { b" op(s), this device is not in it" });
@@ -694,7 +697,8 @@ impl Client {
     fn hold_chain(&mut self, chain: &[u8]) -> bool {
         let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return false };
         match join::adopt_chain(&hp, &seed, &self.me, chain) {
-            Ok((_, true)) => {
+            Ok((blob, true)) => {
+                self.note_members(&blob);
                 self.persist_set(b"chain", chain);
                 self.became_bound();
                 self.bound
@@ -703,6 +707,44 @@ impl Client {
         }
     }
 
+
+    /// Keep the members a chain folds to (the Fleet page's list).
+    fn note_members(&mut self, blob: &fgtw::fleet::MembershipBlob) {
+        if let Ok(m) = blob.fold() {
+            self.members = m;
+        }
+    }
+
+    /// Op 6, the Fleet page's list: `[count][count × (the device key's first 8 bytes, flags: bit 0 this device)]`. Bound with no list yet (the chain only in RAM since unlock-at-boot is off, and none adopted this session), the seed's copy is read first.
+    fn members_reply(&mut self) -> Vec<u8> {
+        if self.members.is_empty() && self.bound {
+            if let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) {
+                fgtw::set_clock(eagle());
+                let (fetched, ip) = {
+                    let s = self.seed();
+                    let r = fgtw::client::fetch(&s, &hp);
+                    (r, s.ip.get())
+                };
+                self.seed_ip = ip;
+                if let Ok(Some(b)) = fetched {
+                    if let Ok(bytes) = b.to_vsf_bytes() {
+                        if let Ok((blob, _)) = join::adopt_chain(&hp, &seed, &self.me, &bytes) {
+                            self.note_members(&blob);
+                        }
+                    }
+                }
+            }
+        }
+        // WHY the cap: the reply's count is one byte and the Fleet page lays out at most 16 rows.
+        let n = self.members.len().min(16);
+        let mut r = Vec::with_capacity(1 + n * 9);
+        r.push(n as u8);
+        for k in &self.members[..n] {
+            r.extend_from_slice(&k[..8]);
+            r.push((*k == self.me) as u8);
+        }
+        r
+    }
     /// Op 5: leave the fleet (pairing-v2's bilateral removal, the app's sign-out): this device's consent eggs over the departure bytes, three fresh approval words, and the signed `depart_req` (fgtw::protocol) handed to every sibling heard on this network, and to each one heard later. A surviving device's user types the words shown here and publishes the consented Remove; once the chain no longer holds this device, the identity is forgotten here (`depart_check`). `intent` is 1 (to a new owner: the approver also releases the device, so another fleet can bind it) or 2 (to the desk). Returns 0 started, 1 not a member of a fleet, 2 an intent that is neither, 3 the frame did not build.
     fn leave(&mut self, intent: u8) -> u8 {
         let Some(hp) = self.hp else { return 1 };
@@ -813,6 +855,7 @@ impl Client {
         self.hp = None;
         self.bound = false;
         self.fleet_key = None;
+        self.members.clear();
         self.sponsors.clear();
         self.request_t = 0;
         self.request_frame.clear();
@@ -1208,6 +1251,12 @@ impl Client {
             if n != ERR && n != ferros_sys::NOTHING {
                 busy = true;
                 let mut reply = Vec::with_capacity(400);
+                // Op 6: the fleet's members, for the Fleet page (`members_reply`): its own reply, nothing of the state after it.
+                if n >= 1 && req[0] == 6 {
+                    let r = self.members_reply();
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
                 // Op 2: mint (the attest screen, after the permanence warning and the retype) → [result: 0 minted, else why not], then the state as op 1 gives it.
                 if n >= 1 && req[0] == 2 {
                     let r = self.mint();
@@ -1386,7 +1435,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0 };
     c.run()
 }
 
