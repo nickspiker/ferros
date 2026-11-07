@@ -73,11 +73,11 @@ A two-bit field, value = the chip's vitality on the four-pair redundancy scale (
 ## The kernel
 
 - **kernel** — the one privileged program: it owns the hardware, allocates arcs and enforces grants (on ARM it runs at EL2).
-- **app** / **process** — an app is the installed unit, a process is one running instance of it. Everything outside the kernel is a process; there is no "userspace", since the device has one identity and what differs between processes is only their grants.
+- **app** / **kist** / **process** — an app is what a person installs; its **kist** is what ferros runs of it: the developer's capsule taken in by this device, its signature checked, compiled once on the device into checked, optimised native code, and sealed into the vault ([KERNEL.md](KERNEL.md), "Install, compile, seal, go"). Photon and Lumis are about to be the first installed kists; the system settings is the one built in. A process is one running instance of a kist. Everything outside the kernel is a process; there is no "userspace", since the device has one identity and what differs between processes is only their grants. On the map each kist is a circle, a *kist circle* ([SHELL.md](SHELL.md)).
 - **arc** — one base–limit pair: a contiguous span (offset and extent) on the wrapping ISOMEM address space, a piece of the ring, never a ring itself. A process holds one or more arcs (fragments are just more arcs), and a hardware grant is an arc of registers.
 - **ring** — only for things that are literally circular: the vault's on-disk layout, and the two's-complement address space ISOMEM wraps (ring memory).
 - **grant** — a permission held by a process; a process's grants are its capability space.
-- **capsule** — the signed binary ([ORACLE.md](ORACLE.md)); what a process is recognised to be is its *ihi*, not an "identity" of its own.
+- **capsule** — the signed binary as the developer ships it ([ORACLE.md](ORACLE.md)); installed, it becomes a kist. What a process is recognised to be is its *ihi*, not an "identity" of its own.
 - **levels** — numbered from 0 = most fundamental, as in PT where L0 is the medium. ARM's exception levels count the other way (EL0 least privileged), so EL names appear only where code touches the hardware.
 
 ---

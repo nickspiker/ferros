@@ -1,6 +1,6 @@
 //! The map (SHELL.md): the device is a map of your life. Every person, message, photo and app is a circle on one plane; the view is a camera over it, and the camera is the only thing that moves.
 //!
-//! The circles: one is built in, the system's own: the device's settings, one side only (owner, 2026-11-05: "that should only have one side, it's the OS settings page"). Nothing else is (owner, 2026-11-04: "For the baked in circles, there should be one. System settings, that's it. You want a clock? INSTALL IT YOURSELF!!!"): every other circle is what the person installs, and the map knows nothing about it until then. The placement below (a seeded random fit with generous air) is for when there are more.
+//! The circles: one is built in, the system's own: the device's settings, one side only (owner, 2026-11-05: "that should only have one side, it's the OS settings page"). Nothing else is (owner, 2026-11-04: "For the baked in circles, there should be one. System settings, that's it. You want a clock? INSTALL IT YOURSELF!!!"): every other circle is a kist the person installs (docs/GLOSSARY.md: the signed capsule as this device checked, compiled and sealed it), a kist circle, and the map knows nothing about it until then. The placement below (a seeded random fit with generous air) is for when there are more.
 //!
 //! The gestures (owner, 2026-10-22: "two finger scale/move for edits and back to a normal two finger vs one finger for the back"):
 //! - One finger dragged from the air moves the plane; dragged from a circle, it moves that circle.
@@ -600,9 +600,9 @@ impl Map {
 
     /// The radius circle `i` may take, given the others: within RADIUS_RATIO of the smallest and the largest of them.
     fn radius_limits(&self, i: usize) -> (i64, i64) {
-        // Alone, a circle has nothing to be within a ratio of (the search below would leave lo at i64::MAX and lo × RADIUS_RATIO would overflow), and sizing the only circle is the same as zooming: it keeps its size.
+        // Alone, a circle has nothing to be within a ratio of (the search below would leave lo at i64::MAX and lo × RADIUS_RATIO would overflow), so the screen bounds it instead, at the zoom it is held at: from a 64th of the screen's width across to the width itself (past three quarters of the width it is a place, and the fingers move the plane anyway). Two fingers on a kist circle size it, the only one too (owner, 2026-11-07: until then a lone circle kept its size and only turned).
         if N == 1 {
-            return (self.rs[i], self.rs[i]);
+            return (((self.w >> 7) << 16) / self.cam.z, ((self.w >> 1) << 16) / self.cam.z);
         }
         let (mut lo, mut hi) = (i64::MAX, 1i64);
         for j in 0..N {

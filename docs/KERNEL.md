@@ -265,7 +265,7 @@ future front ends  (an RPN / AI-tailored Rust fork, ...)          → toka ┘
 1. **Install:** verify the capsule — the developer's ed25519 signature over its BLAKE3 hash ([ORACLE.md](ORACLE.md)).
 2. **Compile once, on device:** toka → aarch64. Accesses the compiler proves in range carry no check (a row is carved once; the loop inside it is proven). The rest are masked, `base + (addr & mask)`: one AND, no branch, and no speculative out-of-bounds read.
 3. **Seal:** the native code is stored in the vault, authenticated by a keyed BLAKE3 MAC under an ira-derived key, bound to (bytecode hash, compiler hash). Only this device ever verifies it, so a public-key signature buys nothing; a compiler update invalidates every seal and code is recompiled. The seal is not an identity: the process's *ihi* still comes from the developer's capsule.
-4. **Go:** load the arc base and mask registers, set the entry point, `eret` to EL0. Switching processes is switching those registers: no table switch, no TLB, no flush.
+4. **Go:** what the first three steps leave is a **kist** (owner, 2026-11-07: the signed, checked, optimised capsule ferros runs; Photon and Lumis are about to be the first). Load the arc base and mask registers, set the entry point, `eret` to EL0. Switching processes is switching those registers: no table switch, no TLB, no flush.
 
 ### Registers and EL0
 
