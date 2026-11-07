@@ -716,67 +716,148 @@ pub fn bump_step(t: f32) -> f32 {
 
 include!(concat!(env!("OUT_DIR"), "/logo.rs"));
 
-/// The ferros mark inside the disc of radius `r` (Q8) at (cx, cy), turned by (c, s) Q14 (screen to mark is the inverse turn, as `icon` has it), under what is there: its pieces (`LOGO`, build.rs from logo.vsf) drawn from their geometry at this size, so it is sharp at every zoom, in place of the bundle's raster (owner, 2026-11-07). A piece's coverage at a pixel is the product of its edges' C∞ steps (`bump_step` across two pixels centred on the edge, slope 1 there as area coverage rises): its outer arc, its inner arc if it is a ring, and its two radial sides if it does not go all the way round, each side by the pixel's perpendicular distance to that side's line. Where two pieces meet they share the edge and their steps sum to exactly one, and pieces never overlap, so their coverages add into one layer (premultiplied, its α their sum) and that layer goes under the pixel: no seam, and nothing laid over anything. `lit`: the mark's own colours, else its grey (the map at rest). Returns the rectangle it touched.
+/// The ferros mark inside the disc of radius `r` (Q8) at (cx, cy), turned by (c, s) Q14 (screen to mark is the inverse turn, as `icon` has it), under what is there: its pieces (`LOGO`, build.rs from logo.vsf) drawn from their geometry at this size, so it is sharp at every zoom, in place of the bundle's raster (owner, 2026-11-07).
+/// A piece's coverage at a pixel is the product of its edges' C∞ steps (`bump_step` across two pixels centred on the edge, slope 1 there as area coverage rises): its outer arc, its inner arc if it is a ring, and its two radial sides if it does not go all the way round, each side a half-plane through the centre (both for a piece under half a turn, either for one over). Where two pieces meet they share the edge and their steps sum to exactly one, and pieces never overlap, so their coverages add into one layer (premultiplied, its α their sum) and that layer goes under the pixel: no seam, and nothing laid over anything.
+/// By spans, row by row: only the pixels within a step of some edge (an arc's band, a side's band) are worked out one by one; between them nothing changes, so each run takes the value of its first pixel and is filled. The first cut worked out every pixel with an arctangent and a sine per piece, about 46 ms a frame at a large zoom (2026-11-07).
+/// `lit`: the mark's own colours, else its grey (the map at rest). Returns the rectangle it touched.
 pub fn logo(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, c: i64, s: i64, lit: bool) -> Rect {
+    const N: usize = LOGO.len();
+    // The longest row this draws into: the screen's width, or a sprite's side (SPRITE_MAX).
+    const ROW: usize = 2048;
+    assert!(width <= ROW, "logo: a row wider than its edge map");
     if r < 256 {
         return Rect::EMPTY;
     }
     let (rf, cxf, cyf) = (r as f32 * (1.0 / 256.0), cx as f32 * (1.0 / 256.0), cy as f32 * (1.0 / 256.0));
     let (cf, sf) = (c as f32 * (1.0 / 16384.0), s as f32 * (1.0 / 16384.0));
     let edge = |d: f32| bump_step((d + 1.0) * 0.5);
-    let tau = core::f32::consts::TAU;
-    // WHY the bounds: the disc follows the map's camera and is often partly off the screen (or the clip); its box is cut to them so no index lands outside the canvas.
-    let (bx0, by0, bx1, by1) = bounds(width, height);
-    let (x0, x1) = (((cxf - rf - 2.0) as i64).max(bx0), ((cxf + rf + 2.0) as i64).min(bx1 - 1));
-    let (y0, y1) = (((cyf - rf - 2.0) as i64).max(by0), ((cyf + rf + 2.0) as i64).min(by1 - 1));
-    if x0 > x1 || y0 > y1 {
-        return Rect::EMPTY;
+    // Each piece in screen pixels: its radii, its sides' inward normals turned onto the screen (start side toward increasing angle, end side toward decreasing; d = n · (dx, dy)), whether it goes all the way round, whether its sides are a union (over half a turn), and its colour.
+    let turn = |nx: f32, ny: f32| (cf * nx - sf * ny, sf * nx + cf * ny);
+    let mut pieces = [(0f32, 0f32, (0f32, 0f32), (0f32, 0f32), false, false, [0u16; 3]); N];
+    for (k, &(inner, outer, start, sweep, colour, grey)) in LOGO.iter().enumerate() {
+        let (a0, a1) = (start * core::f32::consts::TAU, (start + sweep) * core::f32::consts::TAU);
+        let n0 = turn(-libm::sinf(a0), libm::cosf(a0));
+        let n1 = turn(libm::sinf(a1), -libm::cosf(a1));
+        pieces[k] = (inner * rf, outer * rf, n0, n1, sweep >= 1.0, sweep > 0.5, if lit { colour } else { [grey; 3] });
     }
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            let (dx, dy) = (x as f32 + 0.5 - cxf, y as f32 + 0.5 - cyf);
-            // Into the mark's own frame: the inverse turn.
-            let (u, v) = (cf * dx + sf * dy, cf * dy - sf * dx);
-            let rho = libm::sqrtf(u * u + v * v);
-            if rho > rf + 1.0 {
+    // The exact layer at an offset from the centre.
+    let exact = |dx: f32, dy: f32| -> Px {
+        let rho = libm::sqrtf(dx * dx + dy * dy);
+        let (mut lr, mut lg, mut lb, mut la) = (0f32, 0f32, 0f32, 0f32);
+        for &(rin, rout, n0, n1, whole, union, col) in &pieces {
+            if rho > rout + 1.0 || rho < rin - 1.0 {
                 continue;
             }
-            // The pixel's angle in turns from +x toward +y, 0 to 1.
-            let th = libm::atan2f(v, u) * (1.0 / core::f32::consts::TAU);
-            let th = th - libm::floorf(th);
-            let (mut lr, mut lg, mut lb, mut la) = (0f32, 0f32, 0f32, 0f32);
-            for &(inner, outer, start, sweep, colour, grey) in LOGO.iter() {
-                let (rin, rout) = (inner * rf, outer * rf);
-                if rho > rout + 1.0 || rho < rin - 1.0 {
-                    continue;
-                }
-                let mut cov = edge(rout - rho);
-                if inner > 0.0 {
-                    cov *= edge(rho - rin);
-                }
-                if sweep < 1.0 {
-                    // How far into the piece from its start, in turns, 0 to 1; inside while under its sweep. A side's distance is the pixel's perpendicular distance to that side's line (ρ sin of the angle between), positive inside; past a quarter turn the pixel is far from that side, and ρ stands for it.
-                    let a = th - start;
-                    let a = a - libm::floorf(a);
-                    let side = |t: f32| if libm::fabsf(t) < 0.25 { rho * libm::sinf(t * tau) } else if t > 0.0 { rho } else { -rho };
-                    let (d0, d1) = if a <= sweep { (side(a), side(sweep - a)) } else if a - sweep < 1.0 - a { (rho, side(sweep - a)) } else { (side(a - 1.0), rho) };
-                    cov *= edge(d0) * edge(d1);
-                }
-                if cov > 0.0 {
-                    let (cr, cg, cb) = if lit { (colour[0], colour[1], colour[2]) } else { (grey, grey, grey) };
-                    lr += cov * cr as f32;
-                    lg += cov * cg as f32;
-                    lb += cov * cb as f32;
-                    la += cov;
-                }
+            let mut cov = edge(rout - rho);
+            if rin > 0.0 {
+                cov *= edge(rho - rin);
             }
-            if la > 0.0 {
-                // The casts saturate (a float to an integer stops at the type's ends): the steps sum to one only to the float's last bit, and α must not carry past its field.
-                let layer = (lr as u16 as u64) | (lg as u16 as u64) << 16 | (lb as u16 as u64) << 32 | ((la * 65535.0) as u16 as u64) << 48;
-                let i = y as usize * width + x as usize;
-                px[i] = under(px[i], layer);
+            if !whole {
+                let (e0, e1) = (edge(n0.0 * dx + n0.1 * dy), edge(n1.0 * dx + n1.1 * dy));
+                cov *= if union { e0 + e1 - e0 * e1 } else { e0 * e1 };
+            }
+            lr += cov * col[0] as f32;
+            lg += cov * col[1] as f32;
+            lb += cov * col[2] as f32;
+            la += cov;
+        }
+        // The casts saturate (a float to an integer stops at the type's ends): the steps sum to one only to the float's last bit, and α must not carry past its field.
+        (lr as u16 as u64) | (lg as u16 as u64) << 16 | (lb as u16 as u64) << 32 | ((la * 65535.0) as u16 as u64) << 48
+    };
+    // The arcs' radii, each once, and the sides' normals, each once (pieces that meet share them).
+    let (mut radii, mut nr) = ([0f32; 2 * N], 0);
+    let (mut sides, mut ns) = ([(0f32, 0f32); 2 * N], 0);
+    for &(rin, rout, n0, n1, whole, _, _) in &pieces {
+        for rr in [rin, rout] {
+            if rr > 0.0 && !radii[..nr].iter().any(|&q| libm::fabsf(q - rr) < 1e-3) {
+                radii[nr] = rr;
+                nr += 1;
+            }
+        }
+        if !whole {
+            for n in [n0, n1] {
+                // A side's line, either way round: the end side of one piece is the start side of the next, its normal reversed.
+                if !sides[..ns].iter().any(|&q| libm::fabsf(q.0 - n.0) + libm::fabsf(q.1 - n.1) < 1e-3 || libm::fabsf(q.0 + n.0) + libm::fabsf(q.1 + n.1) < 1e-3) {
+                    sides[ns] = n;
+                    ns += 1;
+                }
             }
         }
     }
-    Rect { x0: x0 as i32, y0: y0 as i32, x1: x1 as i32 + 1, y1: y1 as i32 + 1 }
+    // WHY the bounds: the disc follows the map's camera and is often partly off the screen (or the clip); its box is cut to them so no index lands outside the canvas.
+    let (bx0, by0, bx1, by1) = bounds(width, height);
+    let (y0, y1) = (((cyf - rf - 2.0) as i64).max(by0), ((cyf + rf + 2.0) as i64).min(by1 - 1));
+    let (mut tx0, mut tx1) = (i64::MAX, i64::MIN);
+    let mut near = [false; ROW];
+    for y in y0..=y1 {
+        let dy = y as f32 + 0.5 - cyf;
+        let reach = rf + 1.0;
+        if dy * dy >= reach * reach {
+            continue;
+        }
+        let half = libm::sqrtf(reach * reach - dy * dy);
+        let (xa, xb) = (((cxf - half - 1.0) as i64).max(bx0), ((cxf + half + 1.0) as i64).min(bx1 - 1));
+        if xa > xb {
+            continue;
+        }
+        let (xa, xb) = (xa as usize, xb as usize);
+        near[xa..=xb].fill(false);
+        // The columns within a step of an edge, a pixel wider each way: x's centre is at dx = x + 0.5 − cx.
+        let mut mark = |lo: f32, hi: f32| {
+            let (a, b) = ((cxf + lo - 1.5) as i64, (cxf + hi + 0.5) as i64);
+            let (a, b) = (a.max(xa as i64), b.min(xb as i64));
+            if a <= b {
+                near[a as usize..=b as usize].fill(true);
+            }
+        };
+        for &rr in &radii[..nr] {
+            // The band ρ ∈ (rr − 1, rr + 1) on this row: |dx| from √((rr − 1)² − dy²) to √((rr + 1)² − dy²).
+            let (o2, i2) = ((rr + 1.0) * (rr + 1.0) - dy * dy, (rr - 1.0) * (rr - 1.0) - dy * dy);
+            if o2 > 0.0 {
+                let (o, i) = (libm::sqrtf(o2), if i2 > 0.0 { libm::sqrtf(i2) } else { 0.0 });
+                mark(-o, -i);
+                mark(i, o);
+            }
+        }
+        for &(nx, ny) in &sides[..ns] {
+            // The band |nx·dx + ny·dy| < 1 on this row; a side nearly along the row covers it whole where it is within a step.
+            if libm::fabsf(nx) > 1e-6 {
+                let (p, q) = ((-1.0 - ny * dy) / nx, (1.0 - ny * dy) / nx);
+                if p < q { mark(p, q) } else { mark(q, p) }
+            } else if libm::fabsf(ny * dy) < 1.0 {
+                mark(-half - 1.0, half + 1.0);
+            }
+        }
+        // Runs: a pixel near an edge on its own, else the run to the next one at its first pixel's value.
+        let row = y as usize * width;
+        let mut x = xa;
+        while x <= xb {
+            let dx = x as f32 + 0.5 - cxf;
+            if near[x] {
+                let l = exact(dx, dy);
+                if l >> 48 != 0 {
+                    px[row + x] = under(px[row + x], l);
+                }
+                x += 1;
+                continue;
+            }
+            let mut e = x;
+            while e + 1 <= xb && !near[e + 1] {
+                e += 1;
+            }
+            let l = exact(dx, dy);
+            if l >> 48 != 0 {
+                for p in &mut px[row + x..=row + e] {
+                    *p = under(*p, l);
+                }
+            }
+            x = e + 1;
+        }
+        tx0 = tx0.min(xa as i64);
+        tx1 = tx1.max(xb as i64);
+    }
+    if tx0 > tx1 {
+        return Rect::EMPTY;
+    }
+    Rect { x0: tx0 as i32, y0: y0 as i32, x1: tx1 as i32 + 1, y1: y1 as i32 + 1 }
 }
