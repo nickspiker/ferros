@@ -106,8 +106,10 @@ pub struct Look {
     pub radio: usize,
     /// The green ring's depth from the circle's edge, in r.
     pub depth: f32,
-    /// Each ring's Gaussian width σ, in r.
+    /// Each ring's inner tail, in r: inward of its peak it fades e-fold every λ (Lumis's v = k³w⁹ moves e-fold every 0.0063 of the button's height, 0.0126 r).
     pub width: f32,
+    /// How hard each ring drops on its outer side, toward the edge: the profile exp(−s(e^{t/s} − 1 − t/s)), t the depth above the peak in λ; small s a cliff (at s = ¼ it is down to 0.5 % where Lumis's reaches zero, 0.81 λ out), s = 1 as soft out as in.
+    pub sharp: f32,
     /// Channel separation: blue sits this much further out than green, red half of it further in, in r.
     pub sep: f32,
     /// The rings' peak light against the flavour's, in stops.
@@ -147,8 +149,8 @@ impl Look {
             radio,
             // Lumis's rings for a box of height h sit at 0.052h (red), 0.048h (green), 0.039h (blue): the diameter 2r for h, so green at 0.096r, blue 0.018r further out, red 0.008r further in (here half the separation, 0.009r).
             depth: 0.096,
-            // Lumis's tent is about 0.009h = 0.018r across at half height: σ = FWHM / 1.665.
-            width: 0.011,
+            width: 0.0126,
+            sharp: 0.25,
             sep: 0.018,
             rim_stops: 0.,
             // Lumis's body is c²/1024 a channel against the rim's c: about two stops of code, four of light.
@@ -295,7 +297,8 @@ fn vm_mean(kappa: f64) -> f64 {
 pub struct Prep {
     /// Each channel's ring centre depth, in r (R, G, B).
     ring_d: [f32; 3],
-    sigma: f32,
+    lambda: f32,
+    sharp: f32,
     /// Each channel's ring peak light (its own channel only).
     ring_l: [f32; 3],
     body_l: [f32; 3],
@@ -430,7 +433,8 @@ impl Prep {
         }
         Prep {
             ring_d,
-            sigma: k.width,
+            lambda: k.width,
+            sharp: k.sharp,
             ring_l: [fl[0] * rim, fl[1] * rim, fl[2] * rim],
             body_l: fl.map(|v| v * body),
             body_edge: k.depth,
@@ -510,15 +514,16 @@ const BLACK: G2t16 = u64::MAX;
 fn sample(p: &Prep, x: f32, y: f32, fs: f32, text: G2t16) -> G2t16 {
     let rho2 = x * x + y * y;
     let d = 1. - rho2.sqrt();
-    // The rings: each channel a Gaussian at its own depth, widened by the footprint's box (variance fs²/12) with its area kept.
-    let se = (p.sigma * p.sigma + fs * fs / 12.).sqrt();
-    // The circle's own edge: a logistic (C∞) about a footprint wide at d = 0 (plus an eighth of σ, so it never becomes a step), so a ring pushed out by a wide separation is cut there and nothing is drawn outside.
-    let ew = (fs * fs + p.sigma * p.sigma / (1 << 6) as f32).sqrt();
+    // The rings, Lumis's shape made smooth: each channel peaks at its own depth, drops off a cliff on its outer side and fades e-fold every λ on its inner, exp(−s(e^{t/s} − 1 − t/s)) with t the depth above the peak in λ (C∞, its peak rounded where Lumis's is a point). The footprint widens λ by its box (variance fs²/12, the ring's light kept), and s so the cliff is never under a footprint.
+    let le = (p.lambda * p.lambda + fs * fs / 12.).sqrt();
+    let s = (p.sharp * p.sharp + fs * fs / (le * le * 12.)).sqrt();
+    // The circle's own edge: a logistic (C∞) about a footprint wide at d = 0 (plus an eighth of λ, so it never becomes a step), so a ring pushed out by a wide separation is cut there and nothing is drawn outside.
+    let ew = (fs * fs + p.lambda * p.lambda / (1 << 6) as f32).sqrt();
     let edge = 1. / (1. + (-d * 2. / ew).exp());
-    let amp = p.sigma / se * edge;
+    let amp = p.lambda / le * edge;
     let ring = [0, 1, 2].map(|c| {
-        let u = (d - p.ring_d[c]) / se;
-        p.ring_l[c] * amp * (-u * u).exp()
+        let t = (p.ring_d[c] - d) / le;
+        p.ring_l[c] * amp * (-s * ((t / s).exp() - 1. - t / s)).exp()
     });
     let mut acc: G2t16 = 0;
     acc = acc.under(light_layer(ring), BlendMode::Normal);
@@ -527,7 +532,7 @@ fn sample(p: &Prep, x: f32, y: f32, fs: f32, text: G2t16) -> G2t16 {
         acc = acc.under(light_layer(orb(p, x, y, rho2, fs)), BlendMode::Normal);
     }
     // The body: its tint, opaque but for 2⁻⁴ of the background, rising by a logistic (C∞) under the green ring, so nothing is drawn outside.
-    let body_a = (1. - 1. / (1 << 4) as f32) / (1. + (-(d - p.body_edge) * 2. / se).exp());
+    let body_a = (1. - 1. / (1 << 4) as f32) / (1. + (-(d - p.body_edge) * 2. / le).exp());
     acc = acc.under(tint_layer(p.body_l, body_a), BlendMode::Normal);
     acc.under(BLACK, BlendMode::Normal)
 }

@@ -31,10 +31,10 @@ struct Knob {
     step: f32,
 }
 
-const KNOBS: [Knob; 24] = [
+const KNOBS: [Knob; 25] = [
     Knob { key: "radio", label: "radio", lo: 0., hi: 6., step: 1. },
     Knob { key: "depth", label: "rim depth", lo: 0., hi: 1. / (1 << 2) as f32, step: 0. },
-    Knob { key: "width", label: "rim width σ", lo: 1. / (1 << 9) as f32, hi: 1. / (1 << 4) as f32, step: 0. },
+    Knob { key: "width", label: "rim tail λ", lo: 1. / (1 << 9) as f32, hi: 1. / (1 << 4) as f32, step: 0. },
     Knob { key: "sep", label: "channel separation", lo: 0., hi: 1. / (1 << 4) as f32, step: 0. },
     Knob { key: "rim", label: "rim light", lo: -4., hi: 4., step: 0. },
     Knob { key: "body", label: "body darkness", lo: 0., hi: 12., step: 0. },
@@ -56,6 +56,7 @@ const KNOBS: [Knob; 24] = [
     Knob { key: "orbr", label: "orb size", lo: 1. / (1 << 2) as f32, hi: 1., step: 0. },
     Knob { key: "plane", label: "plane half-width", lo: 1. / (1 << 1) as f32, hi: 4., step: 0. },
     Knob { key: "knee", label: "soft knee", lo: -4., hi: 2., step: 0. },
+    Knob { key: "sharp", label: "rim sharpness s", lo: 1. / (1 << 4) as f32, hi: 1., step: 0. },
 ];
 const N_KNOBS: usize = KNOBS.len();
 const K_RADIO: usize = 0;
@@ -84,7 +85,8 @@ fn get(k: &Look, i: usize) -> f32 {
         20 => k.frame as f32,
         21 => k.orb_r,
         22 => k.plane,
-        _ => k.knee_stops,
+        23 => k.knee_stops,
+        _ => k.sharp,
     }
 }
 
@@ -117,7 +119,8 @@ fn set(k: &mut Look, i: usize, v: f32) {
         20 => k.frame = v as u32,
         21 => k.orb_r = v,
         22 => k.plane = v,
-        _ => k.knee_stops = v,
+        23 => k.knee_stops = v,
+        _ => k.sharp = v,
     }
 }
 
@@ -143,7 +146,8 @@ fn show(k: &Look, i: usize) -> String {
         20 => format!("{}", k.frame),
         21 => format!("{v:.3} r"),
         22 => format!("{v:.3}"),
-        _ => format!("{v:+.2} stops"),
+        23 => format!("{v:+.2} stops"),
+        _ => format!("{v:.3}"),
     }
 }
 

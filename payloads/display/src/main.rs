@@ -2877,9 +2877,10 @@ fn battery_flavour(charge: u64) -> (f32, f32, f32) {
     (code(lin[0]), code(lin[1]), code(lin[2]))
 }
 
-/// The vessel's rim, in the circle's radius (tools/orb-tune's defaults, Lumis's proportions: its rings at 0.052h, 0.048h, 0.039h of a box h tall): the green ring's depth from the edge, each ring's width σ, and the channels' separation (blue that much further out, red half of it further in; orb-tune's default at its band 1, 0.018 widened half a stop).
+/// The vessel's rim, in the circle's radius (tools/orb-tune's defaults, Lumis's proportions: its rings at 0.052h, 0.048h, 0.039h of a box h tall): the green ring's depth from the edge; each ring's inner tail λ (it fades e-fold every λ inward: Lumis's v = k³w⁹ moves e-fold every 0.0063h) and its outer sharpness s (the profile exp(−s(e^{t/s} − 1 − t/s)), at s = ¼ down to 0.5 % where Lumis's reaches zero); and the channels' separation (blue that much further out, red half of it further in; orb-tune's default at its band 1, 0.018 widened half a stop).
 const VESSEL_DEPTH: f32 = 0.096;
-const VESSEL_SIGMA: f32 = 0.011;
+const VESSEL_LAMBDA: f32 = 0.0126;
+const VESSEL_SHARP: f32 = 1.0 / (1 << 2) as f32;
 const VESSEL_SEP: f32 = 0.018 * core::f32::consts::SQRT_2;
 
 fn console_draw(width: usize, height: usize, force: bool) -> bool {
@@ -3058,13 +3059,15 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 }
             }
         }
-        // Then the vessel, under its text (tools/orb-tune `sample`, its defaults; owner, 2026-11-07: Lumis's camera-picker button made round): each channel of the fill a ring of its own at its own depth from the edge (blue outermost, red innermost: a prism; a channel the fill does not have draws nothing), a Gaussian widened by the pixel's footprint, cut by a logistic at the circle's edge so nothing is drawn outside; then under them the body, the fill four stops darker, opaque but for a sixteenth, rising by a logistic under the green ring. Between the edge and the body the scene shows through. Every term C∞.
+        // Then the vessel, under its text (tools/orb-tune `sample`, its defaults; owner, 2026-11-07: Lumis's camera-picker button made round): each channel of the fill a ring of its own at its own depth from the edge (blue outermost, red innermost: a prism; a channel the fill does not have draws nothing), Lumis's shape made smooth (a cliff on its outer side, a tail e-folding every λ on its inner) widened by the pixel's footprint, cut by a logistic at the circle's edge so nothing is drawn outside; then under them the body, the fill four stops darker, opaque but for a sixteenth, rising by a logistic under the green ring. Between the edge and the body the scene shows through. Every term C∞.
         let fl = [fill.0, fill.1, fill.2].map(|v| { let c = v * (1.0 / 16384.0); c * c });
         let sep = VESSEL_SEP;
         let ring_d = [VESSEL_DEPTH + sep * 0.5, VESSEL_DEPTH, VESSEL_DEPTH - sep];
         let fs = 1.0 / r;
-        let se = libm::sqrtf(VESSEL_SIGMA * VESSEL_SIGMA + fs * fs * (1.0 / 12.0));
-        let ew = libm::sqrtf(fs * fs + VESSEL_SIGMA * VESSEL_SIGMA * (1.0 / (1 << 6) as f32));
+        // The footprint's box (variance fs²/12) widens λ, the ring's light kept, and s, so the cliff is never under a pixel.
+        let le = libm::sqrtf(VESSEL_LAMBDA * VESSEL_LAMBDA + fs * fs * (1.0 / 12.0));
+        let s = libm::sqrtf(VESSEL_SHARP * VESSEL_SHARP + fs * fs / (le * le * 12.0));
+        let ew = libm::sqrtf(fs * fs + VESSEL_LAMBDA * VESSEL_LAMBDA * (1.0 / (1 << 6) as f32));
         let body_l = fl.map(|v| v * (1.0 / (1 << 4) as f32));
         let body = g2t_colour((libm::sqrtf(body_l[0]) * 16384.0, libm::sqrtf(body_l[1]) * 16384.0, libm::sqrtf(body_l[2]) * 16384.0));
         let (x0, x1, y0, y1) = ((x - r - 1.0) as i64, (x + r + 1.0) as i64, (y - r - 1.0) as i64, (y + r + 1.0) as i64);
@@ -3074,17 +3077,17 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
                 let d = 1.0 - libm::sqrtf(dx * dx + dy * dy) * fs;
                 let edge = 1.0 / (1.0 + libm::expf(-d * 2.0 / ew));
-                let amp = VESSEL_SIGMA / se * edge;
+                let amp = VESSEL_LAMBDA / le * edge;
                 // Each ring's light as its g2t code (tanh √L), and the layer's α as t₀ + (1 − t₀)(t₁ + (1 − t₁)t₂) (every term non-negative: the product form cancels in f32 on a ring's faint tail and leaves α 0 beside light); each channel's colour t/α, darkness its complement. No light: α 0, t/α NaN, which the cast takes to 0.
                 let t = [0, 1, 2].map(|c| {
-                    let u = (d - ring_d[c]) / se;
-                    libm::tanhf(libm::sqrtf(fl[c] * amp * libm::expf(-u * u)))
+                    let t = (ring_d[c] - d) / le;
+                    libm::tanhf(libm::sqrtf(fl[c] * amp * libm::expf(-s * (libm::expf(t / s) - 1.0 - t / s))))
                 });
                 let a = t[0] + (1.0 - t[0]) * (t[1] + (1.0 - t[1]) * t[2]);
                 let dark = |v: f32| 65535 - (v / a * 65535.0) as u64;
                 let ring = ((a * 65535.0) as u64) << 48 | dark(t[0]) << 32 | dark(t[1]) << 16 | dark(t[2]);
                 console[i] = console[i].under(ring, BlendMode::Normal);
-                let body_a = (1.0 - 1.0 / (1 << 4) as f32) / (1.0 + libm::expf(-(d - VESSEL_DEPTH) * 2.0 / se));
+                let body_a = (1.0 - 1.0 / (1 << 4) as f32) / (1.0 + libm::expf(-(d - VESSEL_DEPTH) * 2.0 / le));
                 console[i] = console[i].under(body | ((body_a * 65535.0) as u64) << 48, BlendMode::Normal);
             }
         }
