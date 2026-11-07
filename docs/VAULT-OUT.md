@@ -104,6 +104,7 @@ The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by t
 - **Still to do:**
   - the person's entries moving at the first attest (built, not yet seen on the device);
   - the identity export for a departure (`SYS_UNLOCK` op 5), which still reads the kernel's vault and so finds nothing that moved;
+  - release (a completed departure) deletes the person's entries only from the kernel's vault: those in the vault process stay on disk, unopenable once the device-only secret is renewed, until the kernel tells the vault to drop the person's domains;
   - the bridge's `store` commands, which still read and write the kernel's vault (a `put` moves at the next request; `ls` and `get` of a moved name find nothing);
   - per-kist domains through the oracle and the common area's named grants (step 3's rest);
   - the vault's capsule in the kernel image;
