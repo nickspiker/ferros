@@ -157,6 +157,8 @@ pub mod measure {
     pub const SATS_SEEN: u16 = 19;
     pub const SATS_USED: u16 = 20;
     pub const CN0: u16 = 21;
+    /// GNSS: the fix's horizontal error estimate, mm.
+    pub const ACCURACY: u16 = 22;
 }
 pub const MEASURE_NONE: u64 = u64::MAX;
 pub const TECH_NONE: u8 = 0;

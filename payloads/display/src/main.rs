@@ -2567,6 +2567,7 @@ fn measure_text(t: &mut Txt, kind: u16, v: i64) {
         k::SATS_SEEN => t.num(v, 1, 0).s(" seen"),
         k::SATS_USED => t.num(v, 1, 0).s(" in fix"),
         k::CN0 => t.num(v, 1000, 0).s(" dB-Hz"),
+        k::ACCURACY => t.s("\u{B1}").num(v, 1000, 0).s(" m"),
         _ => t.s("kind ").num(kind as i64, 1, 0).s(": ").num(v, 1, 0),
     };
 }

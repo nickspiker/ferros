@@ -648,6 +648,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let mut kept_at = 0u64;
     // (HOST_REQ seen, MCU_RESP not answering, bytes read), and when they were last reported.
     let (mut asks, mut silent, mut bytes, mut said) = (0u32, 0u32, 0usize, now());
+    // The corners' GNSS circle (ferros_sys::measure): on and searching, then holding a fix with its error estimate; published when either changes.
+    let mut published: Option<(u8, u32)> = None;
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
@@ -682,6 +684,13 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 kept_at = now();
             }
             shown = d.fixes;
+        }
+        let now_shown = if d.fixes > 0 { (2, d.fix.err) } else { (1, 0) };
+        if published != Some(now_shown) {
+            use ferros_sys::{measure as k, measure_word as w, status, MEASURE_NONE};
+            status(0, w(k::STATE, now_shown.0 as i64));
+            status(1, if d.fixes > 0 { w(k::ACCURACY, now_shown.1 as i64 * 1000) } else { MEASURE_NONE });
+            published = Some(now_shown);
         }
         if d.fixes > 0 && now().wrapping_sub(kept_at) > 64 * f {
             keep_last(grants, &d);
