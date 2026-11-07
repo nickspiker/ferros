@@ -164,9 +164,9 @@ fn smooth_min(a: f32, b: f32) -> f32 {
     0.5 * (a + b - ((a - b) * (a - b) + d * d).sqrt())
 }
 
-/// The identity's wallpaper into `buf` (rows of `w`, α + darkness), the whole window: the typed text's identity seed (ahau_core, as the attest screen derives it), its wallpaper seed, and the `wallpaper` crate's picture at this size. Each pixel's working value (√light × 2¹⁴) becomes its 8-bit `g2t` code, tanh of it in white's units (VSF: light = atanh(code / 2⁸)²), and the darkness is its complement. Text the keyboard cannot type has no identity, and leaves the window empty.
-fn render_wallpaper(buf: &mut [u32], w: usize, h: usize, text: &str) {
-    let Ok(id) = ahau_core::identity_seed(text) else { return };
+/// The identity's wallpaper into `buf` (rows of `w`, α + darkness), the whole window, returning its Julia set's c (for the little Mandelbrot map): the typed text's identity seed (ahau_core, as the attest screen derives it), its wallpaper seed, and the `wallpaper` crate's picture at this size. Each pixel's working value (√light × 2¹⁴) becomes its 8-bit `g2t` code, tanh of it in white's units (VSF: light = atanh(code / 2⁸)²), and the darkness is its complement. Text the keyboard cannot type has no identity, and leaves the window empty.
+fn render_wallpaper(buf: &mut [u32], w: usize, h: usize, text: &str) -> Option<(f64, f64)> {
+    let Ok(id) = ahau_core::identity_seed(text) else { return None };
     let p = wallpaper::params(&ahau_core::wallpaper_seed(&id), w, h);
     let mut px = vec![0u64; w * h];
     wallpaper::render_rows(&p, 0..h, &mut px);
@@ -176,6 +176,7 @@ fn render_wallpaper(buf: &mut [u32], w: usize, h: usize, text: &str) {
         let (r, g, b) = (code(s & 0xFFFF), code(s >> 16 & 0xFFFF), code(s >> 32 & 0xFFFF));
         *d = 0xFF00_0000 | (255 - r) << 16 | (255 - g) << 8 | (255 - b);
     }
+    Some((p.c[0] as f64, p.c[1] as f64))
 }
 
 /// A tiny grey Mandelbrot set in the box (x0, y0, bw, bh) of `buf` (rows of `w`, α + darkness): the set's whole extent [−2, X_RIGHT] × [−1.15, 1.15], imaginary axis up, fitted inside the box; the set a dim grey, the field around it fainter still by escape speed, and a full white pixel at `c`.
@@ -476,9 +477,11 @@ impl FluorApp for App {
             let room = h as f32 - top;
             let r = 0.5 * smooth_min(w as f32, room) * (1. - 1. / (1 << 4) as f32);
             self.mark.fill(0);
+            // In mode 4 the map marks the wallpaper's c, not the mark's.
+            let mut wall_c = None;
             if self.mode == Mode::Wallpaper {
                 let text = self.text();
-                render_wallpaper(&mut self.mark, w, h, &text);
+                wall_c = render_wallpaper(&mut self.mark, w, h, &text);
             } else if self.mode == Mode::Free {
                 self.render_free(w, top + room * 0.5, r);
             } else {
@@ -488,7 +491,7 @@ impl FluorApp for App {
             let mb_w = (span / (1 << 2) as f32) as usize;
             let mb_h = (mb_w as f32 * 2.3 / (mark::X_RIGHT as f32 + 2.)) as usize + 1;
             let margin = (span / (1 << 6) as f32) as usize;
-            render_minibrot(&mut self.mark, w, w - margin - mb_w, top as usize + margin, mb_w, mb_h, c);
+            render_minibrot(&mut self.mark, w, w - margin - mb_w, top as usize + margin, mb_w, mb_h, wall_c.unwrap_or(c));
             for px in self.mark.iter_mut() {
                 *px = px.under(0xFF_FF_FF_FF, BlendMode::Normal);
             }
