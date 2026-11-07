@@ -1135,6 +1135,12 @@ fn boot_el() -> u64 {
     unsafe { core::ptr::read_volatile(&raw const __boot_el) }
 }
 
+/// The SCTLR the entry asm found at boot (0 when the MMU was already off and nothing was saved): whether the bootloader handed over with its MMU and caches on.
+#[cfg_attr(not(feature = "pixel8"), allow(dead_code))]
+fn boot_sctlr() -> u64 {
+    unsafe { core::ptr::read_volatile(&raw const __boot_sctlr) }
+}
+
 // ---------------------------------------------------------------------------
 // M1 kernel entry
 // ---------------------------------------------------------------------------
@@ -1933,6 +1939,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // The gate chose Android: the moment the disk answers (set-active needs devinfo and the boot LU attribute, nothing of the vault) — slot a active, then a plain reset; the bootloader boots slot a, whose hv gate takes the one-shot marker and goes to Android. The way back is a reboot: slot a's gate asks again (1 s on dev builds) and boots the ferros packed into it (tools/husky-cold.sh keeps that copy current). Android cannot boot from slot b's own partitions (product_b is empty), which is why the choice is a slot switch and not a chainload.
     // akita has no hv and keeps Android on slot b, untouched (ferros on slot a, tools/akita-boot.sh): the choice is slot b active, then the reset. With no gate in front of Android there, the way back to ferros is fastboot (`--set-active=a`, or akita-boot.sh). Its devinfo has husky's layout (header, slot words at G#30, the flags read back as husky's measured meanings after a set-active to a: a G#0401, b G#0A02; 2026-11-06).
     if gate_choice == ready::Choice::Android && link_up && board::akita() {
+        // Slot b carries the hv now (tools/akita-hv.sh, as husky's slot a does): its gate takes this word and goes to Android once, as on husky. With no hv there, nothing reads it.
+        unsafe {
+            let p = 0xFD60_0FF8usize as *mut u64;
+            core::ptr::write_volatile(p, 0x414E_4452_4F49_4431);
+            core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
+        }
         if slot::set_active(1) == slot::MARKED {
             platform::crumb(0xC7);
             platform::reboot();

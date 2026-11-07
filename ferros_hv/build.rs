@@ -1,11 +1,22 @@
 fn main() {
+    // The board (FERROS_HV_BOARD=akita, else husky): where the hv's 64 MiB lives, husky's the last of its 12 GB (G#A_FC00_0000), akita's at G#9_0000_0000, the middle of its high bank: on akita's August boot chain (slot b, CP2A.260805.005) the top of DRAM cannot be touched at the handoff, not even read (2026-11-06: a read of G#9_FFFF_FF10 at entry hung core 0 into an APC watchdog; July's slot a does not mind). One number, written for the linker script (hv_base.ld, INCLUDEd by hv.ld) and the same choice made in main.rs by the cfg, so the two cannot drift.
+    println!("cargo:rerun-if-env-changed=FERROS_HV_BOARD");
+    println!("cargo:rustc-check-cfg=cfg(hv_akita)");
+    let akita = std::env::var("FERROS_HV_BOARD").map(|v| v == "akita").unwrap_or(false);
+    if akita {
+        println!("cargo:rustc-cfg=hv_akita");
+    }
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    // With it the image size its headers declare (the ARM64 header and the PE stub's three fields, header.s): the pad (G#18_0000) and the board's Android kernel's image_size, rounded up to 2 MiB (husky's G#226_0000 gives G#240_0000; akita's G#22A_0000 gives G#260_0000). One number for all four fields: an ARM64 size that disagrees with the PE stub's hangs akita's bootloader before the hv's first instruction (2026-11-06). `ferros-mkimg gate` checks it against the Image it packs.
+    std::fs::write(std::path::Path::new(&out_dir).join("hv_base.ld"), if akita { "HV_BASE = 0x900000000;\n__hv_image_size = 0x2600000;\n" } else { "HV_BASE = 0xAFC000000;\n__hv_image_size = 0x2400000;\n" }).unwrap();
+    println!("cargo:rustc-link-arg=-L{out_dir}");
     println!("cargo:rustc-link-arg=-Tferros_hv/hv.ld");
     println!("cargo:rerun-if-changed=ferros_hv/hv.ld");
     println!("cargo:rerun-if-changed=ferros_hv/src/header.s");
     // Bisection knobs (HV.md): FERROS_HV_NO_WINDOW=1 forwards every SMC from EL2 (no native re-execution window); FERROS_HV_NO_ATA=1 leaves HCR_EL2.ATA clear; FERROS_HV_ACTLR_KEEP=1 leaves ACTLR_EL2 as found; FERROS_HV_LINUX_AT_EL2=1 hands Linux the machine at EL2 after the relocation and DTB work (the hv vanishes: tests the memory map alone); FERROS_HV_TSC_OFF_AFTER_BOOT=1 stops trapping SMCs on each core once eight CPU_ONs have passed (Linux at EL1 with an inert hv; needs deep idle disabled from Android or power-down wakes land in Linux at EL2).
     // A build tag in the banner: the knobs set, so the pstore log names the variant that wrote it (2026-10-17: a log was read as a stats build's when the flash had not happened).
     let mut tag = String::new();
-    for (env, cfg) in [("FERROS_HV_NO_ATA", "hv_no_ata"), ("FERROS_HV_ACTLR_KEEP", "hv_actlr_keep"), ("FERROS_HV_LINUX_AT_EL2", "hv_linux_at_el2"), ("FERROS_HV_TSC_OFF_AFTER_BOOT", "hv_tsc_off_after_boot"), ("FERROS_HV_NO_CHORD_POLL", "hv_no_chord_poll"), ("FERROS_HV_NO_REPORT", "hv_no_report"), ("FERROS_HV_LEAN_RESUME", "hv_lean_resume"), ("FERROS_HV_STAGE2", "hv_stage2"), ("FERROS_HV_UFS", "hv_ufs"), ("FERROS_HV_SHADOW", "hv_shadow"), ("FERROS_HV_CORE", "hv_core"), ("FERROS_HV_NO_PMU_READ", "hv_no_pmu_read"), ("FERROS_HV_ORACLE", "hv_oracle"), ("FERROS_HV_PDMA_DUMP", "hv_pdma_dump"), ("FERROS_HV_ORACLE_SMC", "hv_oracle_smc"), ("FERROS_HV_MODEM_RING", "hv_modem_ring"), ("FERROS_HV_ORACLE_STEP", "hv_oracle_step"), ("FERROS_HV_SNAPSHOT", "hv_snapshot"), ("FERROS_HV_XPLANT", "hv_xplant")] {
+    for (env, cfg) in [("FERROS_HV_NO_ATA", "hv_no_ata"), ("FERROS_HV_ACTLR_KEEP", "hv_actlr_keep"), ("FERROS_HV_LINUX_AT_EL2", "hv_linux_at_el2"), ("FERROS_HV_TSC_OFF_AFTER_BOOT", "hv_tsc_off_after_boot"), ("FERROS_HV_NO_CHORD_POLL", "hv_no_chord_poll"), ("FERROS_HV_NO_REPORT", "hv_no_report"), ("FERROS_HV_LEAN_RESUME", "hv_lean_resume"), ("FERROS_HV_STAGE2", "hv_stage2"), ("FERROS_HV_UFS", "hv_ufs"), ("FERROS_HV_SHADOW", "hv_shadow"), ("FERROS_HV_CORE", "hv_core"), ("FERROS_HV_NO_PMU_READ", "hv_no_pmu_read"), ("FERROS_HV_ORACLE", "hv_oracle"), ("FERROS_HV_PDMA_DUMP", "hv_pdma_dump"), ("FERROS_HV_ORACLE_SMC", "hv_oracle_smc"), ("FERROS_HV_MODEM_RING", "hv_modem_ring"), ("FERROS_HV_ORACLE_STEP", "hv_oracle_step"), ("FERROS_HV_SNAPSHOT", "hv_snapshot"), ("FERROS_HV_XPLANT", "hv_xplant"), ("FERROS_HV_NO_EARLY_FASTBOOT", "hv_no_early_fastboot")] {
         println!("cargo:rustc-check-cfg=cfg({cfg})");
         println!("cargo:rerun-if-env-changed={env}");
         if std::env::var(env).map(|v| v == "1").unwrap_or(false) {

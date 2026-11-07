@@ -42,9 +42,21 @@ pub fn keys() -> Keys {
     }
 }
 
-/// Whether the hv's high RAM is there (husky's top, where its gate mark, the jump's mailbox and its entropy pool live).
-pub fn hv_ram() -> bool {
-    get() == Board::Husky
+/// The hv's reserved 64 MiB (ferros_hv main.rs HV_BASE, the same per-board choice there): husky's the last of its 12 GB; akita's at G#9_0000_0000, since on its August boot chain the top of DRAM hangs the core that touches it at the handoff (2026-11-06), even a read. The words the hv leaves for ferros sit at fixed offsets in it.
+pub fn hv_base() -> usize {
+    if akita() { 0x9_0000_0000 } else { 0xA_FC00_0000 }
+}
+/// The hv's gate mark ("GATEFORR", then its telemetry word), in its report page (ferros_hv gate.rs GATE_MARK_ADDR).
+pub fn hv_gate_mark() -> usize {
+    hv_base() + 0x3FF_FF10
+}
+/// The jump's mailbox: one 32-byte slot per core (ferros_hv hvcore::MAILBOX).
+pub fn hv_mailbox() -> usize {
+    hv_base() + 0x3FE_0000
+}
+/// The firmware TRNG's words the hv drew before the jump (ferros_hv hvcore::TRNG_POOL).
+pub fn hv_trng_pool() -> usize {
+    hv_base() + 0x3E0_0000
 }
 
 /// The board from the device tree at `dtb` (ABL's x0): akita when the root `model` says AKITA. A RELOAD's tag (an odd x0) or no tree keeps what is set.

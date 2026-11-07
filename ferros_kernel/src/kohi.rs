@@ -99,26 +99,21 @@ pub fn health(buf: &[u64]) -> Health {
 const SMCCC_TRNG_RND64: u64 = 0xC400_0053;
 
 /// After the jump from Android, the firmware TRNG's words come from the pool the hv drew just before ferros started (ferros_hv hvcore::TRNG_POOL): ferros's own TRNG_RND64 after a jump hung inside the firmware on about one jump in five (2026-11-03), the hv's never. Each word is wiped as it is taken; a request the pool cannot fill is refused (false), never served from the firmware.
-const JUMP_POOL: usize = 0xA_FFE0_0000;
 const JUMP_POOL_MAGIC: u64 = 0x4C4F_4F50_474E_5254;
 static JUMP_POOL_NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 fn jump_pool_take(out: &mut [u64]) -> bool {
     use core::ptr::{read_volatile, write_volatile};
-    // akita has no hv and no RAM up there (board.rs).
-    if !crate::board::hv_ram() {
+    if unsafe { read_volatile(crate::board::hv_trng_pool() as *const u64) } != JUMP_POOL_MAGIC {
         return false;
     }
-    if unsafe { read_volatile(JUMP_POOL as *const u64) } != JUMP_POOL_MAGIC {
-        return false;
-    }
-    let have = unsafe { read_volatile((JUMP_POOL + 8) as *const u64) } as usize;
+    let have = unsafe { read_volatile((crate::board::hv_trng_pool() + 8) as *const u64) } as usize;
     let at = JUMP_POOL_NEXT.fetch_add(out.len(), core::sync::atomic::Ordering::AcqRel);
     if at + out.len() > have {
         crate::platform::pstore(b"ferros: keys: the jump's TRNG pool is spent\n");
         return false;
     }
     for (k, o) in out.iter_mut().enumerate() {
-        let p = (JUMP_POOL + 16 + (at + k) * 8) as *mut u64;
+        let p = (crate::board::hv_trng_pool() + 16 + (at + k) * 8) as *mut u64;
         unsafe {
             *o = read_volatile(p);
             write_volatile(p, 0);
@@ -129,20 +124,16 @@ fn jump_pool_take(out: &mut [u64]) -> bool {
 /// The pool's untaken words wiped, and the pool closed (KOHI's gather is done; nothing after it draws from the firmware on the boot path).
 pub fn wipe_jump_pool() {
     use core::ptr::{read_volatile, write_volatile};
-    // akita has no hv and no RAM up there (board.rs).
-    if !crate::board::hv_ram() {
+    if unsafe { read_volatile(crate::board::hv_trng_pool() as *const u64) } != JUMP_POOL_MAGIC {
         return;
     }
-    if unsafe { read_volatile(JUMP_POOL as *const u64) } != JUMP_POOL_MAGIC {
-        return;
-    }
-    let have = unsafe { read_volatile((JUMP_POOL + 8) as *const u64) } as usize;
+    let have = unsafe { read_volatile((crate::board::hv_trng_pool() + 8) as *const u64) } as usize;
     for k in 0..have {
-        unsafe { write_volatile((JUMP_POOL + 16 + k * 8) as *mut u64, 0) };
+        unsafe { write_volatile((crate::board::hv_trng_pool() + 16 + k * 8) as *mut u64, 0) };
     }
     unsafe {
-        write_volatile((JUMP_POOL + 8) as *mut u64, 0);
-        write_volatile(JUMP_POOL as *mut u64, 0);
+        write_volatile((crate::board::hv_trng_pool() + 8) as *mut u64, 0);
+        write_volatile(crate::board::hv_trng_pool() as *mut u64, 0);
         core::arch::asm!("dsb sy");
     }
 }

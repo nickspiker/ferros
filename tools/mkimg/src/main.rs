@@ -1014,6 +1014,12 @@ fn cmd_gate(args: &[String]) {
     }
     let image_size = le64(16);
     let mut blob = hv.clone();
+    // The hv's own ARM64 header (offset G#10) says how much ABL must keep clear: the pad and this Linux Image's image_size, rounded up to 2 MiB. The hv's build sets it per board (ferros_hv build.rs), in all four header fields at once; here it is only checked against the Image packed. Patching this one field once left the PE stub's three disagreeing, and akita's bootloader hung before the hv's first instruction (2026-11-06).
+    let want = ((PAD + image_size + 0x1F_FFFF) & !0x1F_FFFF) as u64;
+    let have = u64::from_le_bytes(blob[16..24].try_into().unwrap());
+    if have != want {
+        die("hv", format!("its header declares image_size G#{have:X}, this Image needs G#{want:X} (build the hv for this board: FERROS_HV_BOARD)"));
+    }
     blob.resize(PAD, 0);
     blob.extend_from_slice(&img);
     if let Some(fer) = &ferros {
@@ -1030,7 +1036,9 @@ fn cmd_gate(args: &[String]) {
         eprintln!("ferros {} B packed at G#{:X}", fer.len(), LOAD + at);
     }
     let kernel = lz4_legacy_compress(&blob);
-    let boot = boot_img_v4(&kernel, 0, &cmdline);
+    // --os-version <hex>: the header's os_version (0 unless given, as mkbootimg.py wrote; the cold image carries G#2000_01A3).
+    let os_version = args.iter().position(|a| a == "--os-version").and_then(|i| args.get(i + 1)).map(|v| u32::from_str_radix(v.trim_start_matches("G#").trim_start_matches("0x").replace('_', "").as_str(), 16).unwrap_or_else(|e| die("--os-version", e))).unwrap_or(0);
+    let boot = boot_img_v4(&kernel, os_version, &cmdline);
     fs::write(&out, &boot).unwrap_or_else(|e| die(&out, e));
     eprintln!("hv {} B, Image {} B (image_size G#{:X}), blob {} B, lz4 {} B, boot {} B", hv.len(), img.len(), image_size, blob.len(), kernel.len(), boot.len());
 }

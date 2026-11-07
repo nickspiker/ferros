@@ -2559,6 +2559,7 @@ pub fn run(mut b: Boot) -> ! {
                 append_hex(&mut resp, b"RUNNING_AT=", &raw const _start as usize as u32);
                 append_hex(&mut resp, b"STAGE=", b.stage as u32);
                 append_hex(&mut resp, b"BOOT_EL=", crate::boot_el() as u32);
+                append_hex(&mut resp, b"BOOT_SCTLR=", crate::boot_sctlr() as u32);
                 append_hex(&mut resp, b"HEAP_END=", heap_end as u32);
                 // The kernel heap now: free bytes, free blocks, the largest (what a big vault value needs in one piece).
                 if let Some((free, blocks, largest)) = crate::heap_stats() {

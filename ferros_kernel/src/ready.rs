@@ -167,23 +167,18 @@ pub static mut GATE_PRESENT: Option<alloc::vec::Vec<u8>> = None;
 pub static GATE_END_FRAMES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// The hv's boot gate (ferros_hv/src/gate.rs) leaves this word in its report page when it hands the machine to ferros: the human has already answered "ferros", so the gate is not shown twice. Read once and cleared, so a later boot that did not come through the hv never sees a stale answer.
-const HV_GATE_MARK_ADDR: usize = 0xA_FFFF_FF10;
 const HV_GATE_MARK: u64 = 0x4741_5445_464F_5252; // "GATEFORR"
 
 /// The hv gate's telemetry (gate.rs gate_telemetry): how it was answered (1 power, 2 timer, 3 volume down) in bits 0-7, ms from the screen in bits 8-31, ms the power pin read pressed from the start in bits 32-63. Kept for DIAG (GATE_ANSWER, GATE_MS, GATE_POWER_HELD_MS).
 pub static GATE_TELEMETRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn answered_by_hv() -> bool {
-    // akita has no hv and no RAM up there (board.rs).
-    if !crate::board::hv_ram() {
-        return false;
-    }
     unsafe {
-        let p = HV_GATE_MARK_ADDR as *mut u64;
+        let p = crate::board::hv_gate_mark() as *mut u64;
         let yes = core::ptr::read_volatile(p) == HV_GATE_MARK;
         if yes {
-            GATE_TELEMETRY.store(core::ptr::read_volatile((HV_GATE_MARK_ADDR + 8) as *const u64), core::sync::atomic::Ordering::Relaxed);
-            core::ptr::write_volatile((HV_GATE_MARK_ADDR + 8) as *mut u64, 0);
+            GATE_TELEMETRY.store(core::ptr::read_volatile((crate::board::hv_gate_mark() + 8) as *const u64), core::sync::atomic::Ordering::Relaxed);
+            core::ptr::write_volatile((crate::board::hv_gate_mark() + 8) as *mut u64, 0);
             core::ptr::write_volatile(p, 0);
             core::arch::asm!("dsb sy");
         }

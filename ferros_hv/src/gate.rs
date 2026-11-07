@@ -36,7 +36,7 @@ const LINUX_ENTRY: usize = 0x8020_0000;
 const FERROS_LINK: usize = 0x8008_0000;
 const FERROS_MAGIC: &[u8; 8] = b"FERROSGT";
 /// In the hv's report page: "gate answered, ferros" for ferros's ready.rs; ferros clears it.
-pub const GATE_MARK_ADDR: usize = 0xA_FFFF_FF10;
+pub const GATE_MARK_ADDR: usize = crate::HV_BASE as usize + 0x3FF_FF10;
 pub const GATE_MARK: u64 = 0x4741_5445_464F_5252; // "GATEFORR"
 /// In the ramoops result block, the end of its first page (the hv report page at G#A_FFFF_0000 does not survive a PSCI reset; this block does, measured 2026-10-21): ferros's `diag android` leaves this word before resetting, so the next gate answers "Android" by itself, once, with the screen untouched: the host can switch between the two without anyone at the keys.
 pub const ANDROID_ONCE_ADDR: usize = 0xFD60_0FF8;
@@ -48,7 +48,7 @@ pub const RECOVERY_ONCE: u64 = 0x5245_434F_5645_5231; // "RECOVER1"
 pub const FERROS_ONCE_ADDR: usize = 0xFD60_0FE8;
 pub const FERROS_ONCE: u64 = 0x4645_5252_4F53_5F31; // "FERROS_1"
 /// Where ABL's splash pixels wait while the gate is on screen: inside the hv's own reservation, above its code and stacks.
-const SPLASH_SAVE: usize = 0xA_FD00_0000;
+const SPLASH_SAVE: usize = crate::HV_BASE as usize + 0x100_0000;
 const SPLASH_SAVE_MAX: usize = 0x200_0000;
 
 /// The packed ferros image, if this boot image carries one: (address, length).
@@ -204,8 +204,11 @@ fn present(p: &Panel) {
     wr(DECON0 + TRIG_CON, (t & !HW_TRIG_MASK_DECON) | HW_TRIG_EN);
     let t0 = now();
     while rd(DECON0 + FRAME_COUNT) == f0 && now() - t0 < freq() / 4 {}
-    let t = rd(DECON0 + TRIG_CON);
-    wr(DECON0 + TRIG_CON, (t & !HW_TRIG_EN) | HW_TRIG_MASK_DECON);
+    // akita's panel (AK3B, as ABL leaves it) does not hold one frame: the gate showed for about 18 of its 60 (ferros ready.rs, 2026-11-06). There the trigger stays on, a frame every TE, until `restore` puts ABL's back for Android or ferros adopts the pipe.
+    if !cfg!(hv_akita) {
+        let t = rd(DECON0 + TRIG_CON);
+        wr(DECON0 + TRIG_CON, (t & !HW_TRIG_EN) | HW_TRIG_MASK_DECON);
+    }
 }
 
 fn px(p: &Panel, x: usize, y: usize, c: u32) {
@@ -214,9 +217,9 @@ fn px(p: &Panel, x: usize, y: usize, c: u32) {
     }
 }
 
-/// husky's side keys in panel rows, top and bottom inclusive, measured by the owner with the kernel's `display ruler` (2026-11-06; ferros_kernel board::keys holds the same, docs/BOARDS.md "Side keys").
-const POWER_KEY: (usize, usize) = (933, 1124);
-const ROCKER: (usize, usize) = (1279, 1660);
+/// The side keys in panel rows, top and bottom inclusive, measured by the owner with the kernel's `display ruler` (2026-11-06; ferros_kernel board::keys holds the same, docs/BOARDS.md "Side keys"): husky's, or akita's on its build.
+const POWER_KEY: (usize, usize) = if cfg!(hv_akita) { (629, 797) } else { (933, 1124) };
+const ROCKER: (usize, usize) = if cfg!(hv_akita) { (932, 1271) } else { (1279, 1660) };
 
 /// The marks as ferros's ready.rs `marks` makes them: (centre row, half height, length) of the power triangle, centred on the power key and as tall as it, and of the volume-down chevron, its tip on the rocker's bottom edge and a quarter of the rocker tall.
 fn marks() -> ((usize, usize, usize), (usize, usize, usize)) {
@@ -516,6 +519,10 @@ fn recovery(dtb: usize) -> bool {
 
 /// Android from whichever slot this gate is on. Only slot a holds an Android (slot b's own system partitions are stock or empty), and ABL names the booted slot to the kernel in bootconfig, `androidboot.slot_suffix = "_b"`, the blob at the end of the initrd (data, LE u32 size, LE u32 byte-sum checksum, "#BOOTCONFIG\n"). Rewrite the suffix to `_a` there and lower the checksum by one, so Android mounts slot a's partitions and the choice is a jump, not a slot switch and a reboot (owner, 2026-10-23: identical slots, no flags). The initrd bounds come from the DTB's /chosen. Returns whether a suffix was rewritten (already `_a`, or nothing found: untouched).
 pub fn android_from_slot_a(dtb: usize) -> bool {
+    // akita keeps Android on slot b and the hv on boot_b, so the bootconfig already names the slot Android lives on: nothing to rewrite.
+    if cfg!(hv_akita) {
+        return false;
+    }
     let Some((data, size, csum_at)) = bootconfig(dtb) else { return false };
     let le32 = |a: usize| u32::from_le_bytes(unsafe { read_volatile(a as *const [u8; 4]) });
     // Every assignment of slot b, in each form bootconfig allows. ABL writes the override form, `androidboot.slot_suffix:=_b`, after an `_a` from vendor_boot's own bootconfig, and the last assignment wins (read from RAM after an Android boot, 2026-10-28: the gate had matched only `= "_b"`, so Android launched from slot b ran on slot b's partitions). The `_b` is the key's last byte but one or its last byte.

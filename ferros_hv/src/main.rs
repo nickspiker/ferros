@@ -13,7 +13,8 @@ use core::arch::{asm, global_asm};
 use core::ptr::{read_volatile, write_volatile};
 
 /// 64 MiB in the LOW DRAM bank, just under the secure carveout at G#B620_0000 and clear of where ABL stages the boot images (G#A000_0000..G#AA00_0000) and keeps its heap (G#F8B3_C000). It was the last 64 MiB of DRAM (G#A_FC00_0000) first: the high bank reads as decayed cells after every reset, and Android under the hv lost cores to silent hangs after a minute of idling with nothing in the hv's log — consistent with that bank, or the hv's part of it, not being kept refreshed under deep idle either (2026-10-17).
-const HV_BASE: u64 = 0xA_FC00_0000;
+/// The board (build.rs, FERROS_HV_BOARD): the last 64 MiB of husky's 12 GB, or akita's middle of the high bank (the top of its DRAM is out of reach at the handoff on its August boot chain, build.rs). Every other address in the reservation below is an offset from it, and ferros reads the same offsets (ferros_kernel board.rs hv_base).
+const HV_BASE: u64 = if cfg!(hv_akita) { 0x9_0000_0000 } else { 0xA_FC00_0000 };
 const HV_SIZE: u64 = 0x400_0000;
 /// Where the patched DTB goes: the megabyte below the reserved region, ordinary RAM that Linux reserves itself once it has read the tree from there.
 const DTB_COPY: u64 = HV_BASE - 0x10_0000;
@@ -21,7 +22,7 @@ const DTB_COPY_MAX: usize = 0x10_0000;
 /// The Linux Image: right after the hv's pad in the blob ABL loaded, 2 MiB aligned as its header demands (its flags say "place anywhere").
 const LINUX_ENTRY: u64 = 0x8020_0000;
 /// The hv's report page: the last 64 KiB of its own reserved region. It sat at G#B610_0000 for a day, a page right under the secure DRAM carveout at G#B620_0000 — and the freezes under real use resolved into an asynchronous SError (bus error, syndrome G#BE000011) delivered to whichever core trapped next, which is what a write into a protected window looks like when the hv writes this page on every trap (2026-10-19). Nothing needs this page to survive a reset any more: the hv's words go into Android's pstore ring.
-const REPORT: usize = 0xA_FFFF_0000;
+const REPORT: usize = (HV_BASE + 0x3FF_0000) as usize;
 const REPORT_RESERVE: u64 = 0x10_0000;
 /// Marker at REPORT + G#FF00: the previous boot ran the oracle (see stage2_base).
 const ORACLE_ONESHOT: u64 = 0x4F52_4143_4C45_3131;
@@ -45,6 +46,12 @@ global_asm!(
 _entry:
     msr     daifset, #0xF
     mov     x19, x0                     // DTB from ABL
+    // Entry marks in the ramoops page (G#FD60_0FD8, MMU off so plain DRAM stores, surviving a watchdog reset): G#E0 here, G#E1 after the copy, G#E2 once running at HV_BASE, G#E3 in Rust before the first store into the reservation (akita, 2026-11-06: core 0 hung before the first stage mark).
+    mov     x9, #0x0FD8
+    movk    x9, #0xFD60, lsl #16
+    mov     x10, #0xE0
+    str     x10, [x9]
+    dsb     sy
     // Copy [_start, __hv_copy_end) to HV_BASE. PC-relative source, absolute destination; the MMU is off so these are plain DRAM writes.
     adrp    x1, _start
     add     x1, x1, :lo12:_start
@@ -56,12 +63,20 @@ _entry:
     cmp     x2, x3
     b.lo    1b
     dsb     sy
+    mov     x10, #0xE1
+    str     x10, [x9]
+    dsb     sy
     ic      iallu
     dsb     sy
     isb
     ldr     x4, =.Lrelocated
     br      x4
 .Lrelocated:
+    mov     x9, #0x0FD8
+    movk    x9, #0xFD60, lsl #16
+    mov     x10, #0xE2
+    str     x10, [x9]
+    dsb     sy
     // Zero bss, take the primary stack, enter Rust.
     ldr     x1, =__bss_start
     ldr     x2, =__bss_end
@@ -226,7 +241,7 @@ fn trail(s: u64) {
     unsafe {
         let p = STAGE_TRAIL as *mut u64;
         write_volatile(p, read_volatile(p) << 8 | (s & 0xFF));
-        asm!("dsb sy");
+        asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
     }
 }
 
@@ -490,7 +505,7 @@ static mut PDMA_DUMPS: u32 = 0;
 
 /// Physical addresses the walk may read: husky's DRAM (G#8000_0000 upward, below G#C_0000_0000). A table or target outside it is refused: a read into a hole or a register block can hang the core (the first version of this dump did, reading context registers that do not exist).
 fn in_dram(pa: u64) -> bool {
-    (0x8000_0000..0xC_0000_0000).contains(&pa)
+    (0x8000_0000..if cfg!(hv_akita) { 0xA_0000_0000 } else { 0xC_0000_0000 }).contains(&pa)
 }
 
 /// Translate one IOVA through a SYSMMU page table rooted at `flpt` (physical); None if unmapped or if any step leaves DRAM.
@@ -1022,6 +1037,8 @@ unsafe fn eret_to(entry: u64, x0: u64, paint: bool) -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn hv_primary(dtb: u64) -> ! {
     unsafe {
+        write_volatile(0xFD60_0FD8 as *mut u64, 0xE3);
+        asm!("dc civac, {a}", "dsb sy", a = in(reg) 0xFD60_0FD8u64);
         write_volatile(REPORT as *mut u64, 0x4645_5252_4F53_5F48); // "FERROS_H"
     }
     stage(STAGE_ENTERED);
@@ -1652,6 +1669,10 @@ mod chord {
 
     /// The dev escape: both volume keys held while the hv starts (before Linux) send the phone to fastboot — the fastboot reboot mode stamped through EL3 and the cluster watchdogs fired, the path measured to land there (~20 s). A broken slot-a build otherwise retries forever (the slot is marked successful). Never returns.
     pub fn early_to_fastboot_if_held() {
+        // FERROS_HV_NO_EARLY_FASTBOOT=1: the escape off, for telling whether it is what sends a board to fastboot (akita, 2026-11-06).
+        if cfg!(hv_no_early_fastboot) {
+            return;
+        }
         // The inputs can read "pressed" for a moment after a reset (watchdog reboots went to fastboot with nobody touching the phone, 2026-10-17 21:50): let the pull-ups settle, then demand both keys down on every one of 32 polls over a third of a second.
         ms(100);
         for _ in 0..32 {
@@ -1853,7 +1874,7 @@ mod fdt {
         let head = insert_at - src;
         copy(dst, src, head);
         let mut q = dst + head;
-        for (name, base, size) in [(b"hv@afc000000\0\0\0\0", super::HV_BASE, super::HV_SIZE)] {
+        for (name, base, size) in [(if cfg!(hv_akita) { b"hv@900000000\0\0\0\0" } else { b"hv@afc000000\0\0\0\0" }, super::HV_BASE, super::HV_SIZE)] {
             wr32(q, BEGIN_NODE);
             q += 4;
             for (k, &c) in name.iter().enumerate() {
@@ -2229,11 +2250,11 @@ mod hvcore {
 
     // ---- the jump to ferros (power + volume up): no reset, no bootloader ----
     // At boot, before Linux runs, the hv keeps what ferros reads at entry and Linux will reuse: the packed image, ABL's device tree, and the bootconfig at the end of the initrd (the copy's /chosen initrd range pointed at the kept tail). In the hv's reservation, above the gate's splash save (G#A_FD00_0000, 32 MiB) and below the report page.
-    const JUMP_IMAGE: usize = 0xA_FF00_0000;
+    const JUMP_IMAGE: usize = crate::HV_BASE as usize + 0x300_0000;
     const JUMP_IMAGE_MAX: usize = 0xC0_0000;
-    const JUMP_DTB: usize = 0xA_FFC0_0000;
+    const JUMP_DTB: usize = crate::HV_BASE as usize + 0x3C0_0000;
     const JUMP_DTB_MAX: usize = 0x10_0000;
-    const JUMP_BOOTCONFIG: usize = 0xA_FFD0_0000;
+    const JUMP_BOOTCONFIG: usize = crate::HV_BASE as usize + 0x3D0_0000;
     /// The bootconfig text and its 12-byte trailer sit at the initrd's end and run to a few KiB; the last 64 KiB are kept (all of it when the initrd is shorter).
     const JUMP_BOOTCONFIG_MAX: u64 = 0x1_0000;
     const FERROS_LINK: usize = 0x8008_0000;
@@ -2332,10 +2353,10 @@ mod hvcore {
 
     /// The jump's mailbox (2026-11-02), in the hv's reservation below the report page: one 32-byte slot per core, [entry, context, state]. A parked core sets state 1 and waits; ferros, started by the jump, starts a core by writing its context and then its entry (ferros_kernel platform::start_core) instead of calling PSCI CPU_ON.
     /// The jump's TRNG pool for ferros (see `jump`): G#A_FFE0_0000, between the jump's bootconfig and the mailbox. [magic "TRNGPOOL", words drawn, words].
-    pub const TRNG_POOL: usize = 0xA_FFE0_0000;
+    pub const TRNG_POOL: usize = crate::HV_BASE as usize + 0x3E0_0000;
     pub const TRNG_POOL_MAGIC: u64 = 0x4C4F_4F50_474E_5254;
     const TRNG_POOL_WORDS: usize = 1278;
-    pub const MAILBOX: usize = 0xA_FFFE_0000;
+    pub const MAILBOX: usize = crate::HV_BASE as usize + 0x3FE_0000;
     /// The hand-off's trace in the ramoops page (survives the warm reset a failed jump ends in; the mailbox does not): per core, when ferros asked (+G#80), when the parked core took its entry (+G#0), when it reached ferros's Rust (-G#80, written by ferros). Cleared at each jump.
     pub const TRACE: usize = 0xFD60_0C00;
 

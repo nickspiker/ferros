@@ -330,17 +330,12 @@ pub fn priv_reg(addr: u64, write: bool, val: u32) -> u64 {
 pub const PMU_REBOOT_CMD: u64 = 0x1546_0810;
 
 /// This core's power-mode hint (PMU CPU_INFORM, G#1546_0860 + 4 per core: 0 none, 1 C2, 2 cluster power-down) cleared, as Linux's online does (pmucal_cpu_enable) on each core it starts. A no-op after the bootloader, whose hints read 0; after the jump from Android the hv leaves 1 on each core it parked, and a core started with its hint still set could be powered down by the PMU whenever it idles.
-/// The jump's mailbox in the hv's reservation (ferros_hv `hvcore::MAILBOX`): one 32-byte slot per core, [entry, context, state]; state 1 = an Android core parked there, powered, waiting at EL2.
-const JUMP_MAILBOX: usize = 0xA_FFFE_0000;
 static JUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Whether this boot is the jump from a running Android: the hv's gate mark with answer 6, read before `ready::answered_by_hv` takes it (the X3's launch comes first). Called once at entry; `jumped` reads the result.
 pub fn detect_jump() {
-    // akita has no hv and no RAM up there: its 8 GB end at G#A_0000_0000 (board.rs).
-    if !crate::board::hv_ram() {
-        return;
-    }
-    let (mark, tel) = unsafe { (read_volatile(0xA_FFFF_FF10usize as *const u64), read_volatile(0xA_FFFF_FF18usize as *const u64)) };
+    let g = crate::board::hv_gate_mark();
+    let (mark, tel) = unsafe { (read_volatile(g as *const u64), read_volatile((g + 8) as *const u64)) };
     JUMPED.store(mark == 0x4741_5445_464F_5252 && tel & 0xFF == 6, core::sync::atomic::Ordering::Relaxed);
 }
 pub fn jumped() -> bool {
@@ -350,7 +345,7 @@ pub fn jumped() -> bool {
 /// Start core `aff1` (MPIDR Aff1; `mpidr` its whole affinity) at `entry` with x0 = `ctx`: PSCI CPU_ON, or after the jump the hv's mailbox. The jump leaves Android's cores parked and powered, because powering them back on through the secure firmware hung on one jump in two (2026-11-01/02); the context is written before the entry, which the parked core polls. A core that is not parked there (Android had it off) gets PSCI CPU_ON.
 pub fn start_core(aff1: usize, mpidr: u64, entry: u64, ctx: u64) -> i64 {
     // A core Android had already taken offline is not on the mailbox: PSCI CPU_ON below, Linux's own way back from its own offline.
-    let slot = JUMP_MAILBOX + aff1 * 32;
+    let slot = crate::board::hv_mailbox() + aff1 * 32;
     if jumped() && unsafe { read_volatile((slot + 16) as *const u64) } == 1 {
         unsafe {
             write_volatile((0xFD60_0C80usize + aff1 * 8) as *mut u64, cntpct() | 1);
