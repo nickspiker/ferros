@@ -1515,7 +1515,6 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
     }
     let (x0, x1) = ((r.x0 as usize) & !15, ((r.x1 as usize + 15) & !15).min(width & !15));
     let mut row = [0u32; 1344];
-    let line = hairline();
     let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
     // The finished wallpaper's base, 0 while there is none.
     let wall = unsafe { if WALL_ON { WALL_BUF } else { 0 } };
@@ -1556,7 +1555,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                             let xx = x + j;
                             let c = if xx >= cl && xx < cr { bw[xx] } else { CLEAR };
                             // The canvas word's fourth lane is its alpha, not flags: off, so its pixels keep their dither.
-                            front[j] = glass_front(xx, g, edge_px, line, c, *scene_at.add(j) & ((1 << 48) - 1));
+                            front[j] = glass_front(xx, g, edge_px, c, *scene_at.add(j) & ((1 << 48) - 1));
                         }
                         neon::sixteen_app(tabs, front.as_ptr(), row.as_mut_ptr().add(x), neon::thresholds_at(thv, x));
                     } else {
@@ -1864,9 +1863,9 @@ fn fold(acc: u64, t: u64, p: u64, mode: u8) -> (u64, u64) {
 
 /// The glass's own corner radius, in panel pixels: a fact of this panel to be tuned on the device (owner, 2026-11-02: "we'll fine tune the radius on this device to squeeze as much out of it"). Android reports 68 at its 1008-wide frame, 91 at the full raster.
 const GLASS_RADIUS: f32 = 80.0;
-/// Whether this is a development build (the hairlines, the orange).
+/// Whether this is a development build (the orange outside the edge).
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
-/// Outside the screen's edge: black on release; on development builds the hairline's orange one stop darker (each channel's code over the root of two: half the light at gamma 2), so a dev image is told at a glance and the mask is still a mask.
+/// Outside the screen's edge: black on release; on development builds an orange (full red over the root of two, green at half: VSF RGB codes, half the light of full orange at gamma 2), so a dev image is told at a glance and the mask is still a mask. The edge's hairline is drawn in it too (`glass_front`).
 const EDGE_MASK: u64 = if DEV { 1 << 48 | 11585 | 8192 << 16 } else { 1 << 48 };
 
 /// The glass's shape, planned once per screen size (owner, 2026-11-02: "maintain a global compressed mask since most will be opaque for the OS in general"): the circle an app lives in (the corners outside it are the system's chrome) and the screen's own edge, as Photon draws its window on Android glass (fluor paint/edge.rs `glass_corner_params`, Nick 2026-09-17: a superellipse corner inside the glass's circular arc, cutting one and a half glass insets deeper at the diagonal, exponent 6 or the first lower one whose corners fit, nine tenths of the fitted size; the top-left and bottom-right corners twice the top-right and bottom-left, the 2:1 asymmetry).
@@ -2115,9 +2114,9 @@ fn edge_cols(g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], width: usize) -> (u
     (el, er)
 }
 
-/// What the glass shows at column `x` of a row (`g`, its listed edge pixels `edge_px`), front to back, each layer under the ones before (`under_pm`): the glass's edge first, then the console's decoded pixel `c` (`CLEAR` where it has none), then the scene `p` (working values, opaque) last. Outside the masked columns the mask is opaque, so nothing behind it is read. On a listed edge pixel the mask is in front by its coverage's complement, and the edge's hairline under it: the orange on development builds, the mask colour itself on release builds (as Photon's release build on Android draws its hairline black, so the glass's corner is black to the curve).
+/// What the glass shows at column `x` of a row (`g`, its listed edge pixels `edge_px`), front to back, each layer under the ones before (`under_pm`): the glass's edge first, then the console's decoded pixel `c` (`CLEAR` where it has none), then the scene `p` (working values, opaque) last. Outside the masked columns the mask is opaque, so nothing behind it is read. On a listed edge pixel the mask is in front by its coverage's complement, and the edge's hairline under it in the mask's own colour (as Photon's release build on Android draws its hairline black, so the glass's corner is black to the curve). On development builds too, since the mask itself turned orange: a full-light orange hairline there stood a stop brighter than the mask beside it, a bright jagged stroke along the curve (owner, 2026-11-07).
 #[inline]
-fn glass_front(x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], line: u64, c: u64, p: u64) -> u64 {
+fn glass_front(x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], c: u64, p: u64) -> u64 {
     if x < g.mask_l as usize || x >= g.mask_r as usize {
         return EDGE_MASK;
     }
@@ -2130,8 +2129,7 @@ fn glass_front(x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], line: u
     if let Some(&(_, _, cov, h)) = edge {
         acc = scale_q16(EDGE_MASK, 65536 - q16(cov));
         t = q16(cov) >> 2;
-        let edge_line = if DEV { line } else { EDGE_MASK };
-        (acc, t) = under_pm(acc, t, scale_q16(edge_line, q16(h)), 16384 - (q16(h) >> 2));
+        (acc, t) = under_pm(acc, t, scale_q16(EDGE_MASK, q16(h)), 16384 - (q16(h) >> 2));
     }
     if c >> 63 == 0 {
         (acc, t) = under_pm(acc, t, c & ((1 << 48) - 1), trans(c));
@@ -2148,6 +2146,7 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
     unsafe {
         PHASE_CLOCK[k] = None;
     }
+    // The app circle's ring hairline (the edge's is the mask's own colour, `glass_front`).
     let line = hairline();
     let mut row = [3u32; 1344];
     let mut px = [0u64; 1344];
@@ -2235,7 +2234,7 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                 for x in xa..xb {
                     if x < el || x >= er || (x >= bl && x < br) {
                         let c = if x >= bl && x < br { bw[x] } else { CLEAR };
-                        px[x] = glass_front(x, g, edge_px, line, c, px[x]);
+                        px[x] = glass_front(x, g, edge_px, c, px[x]);
                     }
                 }
             }
@@ -3874,8 +3873,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                                 let c = ((d as i64 / 2) << 8) | 128;
                                 // The fill only where there is no art: under an icon it showed as a dark rim along the edge.
                                 match mp {
+                                    // The ferros mark in its own colours, on black (owner, 2026-11-07): the mark first, the black disc under it.
                                     _ if cir.icon == ICON_FERROS => {
-                                        draw::logo(px, d, d, c, c, ri, tc, ts, lit);
+                                        draw::logo(px, d, d, c, c, ri, tc, ts, true);
+                                        draw::disc(px, d, d, c, c, ri, 0);
                                     }
                                     Some(mp) => {
                                         draw::icon(px, d, d, c, c, ri, tc, ts, mp, lit);
@@ -3892,7 +3893,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             unsafe { SCENE_US[1] += ferros_sys::us_since(t_b) };
                         } else {
                             if cir.icon == ICON_FERROS {
-                                draw::logo(pixels, width, height, sx, sy, ri, tc, ts, lit);
+                                draw::logo(pixels, width, height, sx, sy, ri, tc, ts, true);
+                                draw::disc(pixels, width, height, sx, sy, ri, 0);
                             } else if let Some(mp) = mp {
                                 draw::icon(pixels, width, height, sx, sy, ri, tc, ts, mp, lit);
                             }
@@ -4192,7 +4194,6 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         // The home screen: each row as `publish_band` composes it for the glass (the edge, then the console, then the canvas), in working values, into the free surface.
                         (false, Some(k)) => {
                             let s = surface(k, width, height);
-                            let line = hairline();
                             let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
                             for y in 0..height {
                                 let g = &rows[y];
@@ -4204,7 +4205,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                                     let c = if x >= cl && x < cr { bw[x] } else { CLEAR };
                                     // The canvas with the wallpaper under it, as publish_band puts it.
                                     let scene = if unsafe { WALL_ON } { draw::under(pixels[y * width + x], unsafe { *(WALL_BUF as *const u64).add(y * width + x) }) } else { pixels[y * width + x] };
-                                    s[y * width + x] = glass_front(x, g, edge_px, line, c, scene & ((1 << 48) - 1));
+                                    s[y * width + x] = glass_front(x, g, edge_px, c, scene & ((1 << 48) - 1));
                                 }
                             }
                             alloc::format!("G#{:X}\n", s.as_ptr() as usize)

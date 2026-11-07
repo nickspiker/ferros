@@ -19,7 +19,20 @@ fn source(bridge: &std::path::Path) -> usize {
     let _ = Command::new("aarch64-linux-gnu-objcopy").args(["-O", "binary"]).arg(&elf).arg(&bin).status();
     let out = Command::new(bridge).arg("spawn").arg(&bin).args(["--use", "display"]).output().expect("ferros-bridge");
     // The capture's reply, `proc: G#…`, anywhere in a line: other processes' console lines run into it when they have no newline of their own yet (2026-11-03: four captures read the canvas while the modem's log was streaming).
-    let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    // The capture waits on the display server, so the spawn can come back before its answer does (2026-11-07: parked, its `proc:` line on the console a moment later): then the console is asked, a few times a second apart, and its last answer taken.
+    for _ in 0..4 {
+        if text.contains("proc: G#") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if let Ok(o) = Command::new(bridge).args(["diag", "console"]).output() {
+            let console = String::from_utf8_lossy(&o.stdout).into_owned();
+            if let Some(last) = console.rsplit("proc: G#").next().filter(|_| console.contains("proc: G#")) {
+                text = format!("proc: G#{last}");
+            }
+        }
+    }
     let hex = text.split("proc: G#").nth(1).map(|s| s.chars().take_while(|c| c.is_ascii_hexdigit()).collect::<String>());
     match hex.filter(|h| !h.is_empty()) {
         Some(h) => usize::from_str_radix(&h, 16).expect("capture address"),
