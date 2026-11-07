@@ -236,6 +236,7 @@ pub fn glow_log(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r:
             let p = &mut px[rowb + x as usize];
             let room = 0xFFFF - (*p >> 48) as i64;
             // Added into the room the pixel has left, held at white (the glow does not reach above it).
+            // WHY/PROOF the `min`: it is the look (glows stack additively up to white and no further; a channel already past white gains nothing), and it is also the only thing that keeps the sum in its 16-bit field. All in i64, no float: c ≤ 16384, i ≤ peak · 2⁸ with peak ≤ G#FF (the themes' `glow_peak`), room ≤ G#FFFF, so the product is under 2⁴⁶ and the gain under 16384 · peak / 255 ≤ 16384; `have` + gain alone reaches G#13FFF on a canvas pixel near 4.0 and would carry into the next channel (or α) after the shift, but the result is at most max(have, 16384) ≤ G#FFFF, so it never does.
             let add = |c: i64, sh: u32| -> u64 {
                 let have = (*p >> sh & 0xFFFF) as i64;
                 ((have + c * i * room / (255 * 256 * 0xFFFF)).min(have.max(16384)) as u64) << sh
@@ -300,6 +301,7 @@ pub fn glow(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
             // The intensity in 2⁻⁸ steps of `peak`'s (16 bits, as the canvas): whole steps of 1/255 banded the glows' long gradients.
             let i = ((num << 8) / q).min((peak as i64) << 8);
             // Into the room the pixel has left (opaque − alpha), added per channel and held at white; alpha untouched.
+            // WHY/PROOF the `min`: as in `glow_log`, the hold at white is the look and the field's bound at once (i ≤ peak · 2⁸ here by its own `min`, so the gain is at most 16384 and the result at most max(have, 16384) ≤ G#FFFF: no carry into the next channel).
             let room = 0xFFFF - a;
             let add = |c: i64, sh: u32| -> u64 {
                 let have = (*p >> sh & 0xFFFF) as i64;
@@ -373,11 +375,12 @@ pub fn clock_dir(dirs: &[(i64, i64); 60], frac_q16: u32) -> (i64, i64) {
     (a.0 + ((b.0 - a.0) * t >> 16), a.1 + ((b.1 - a.1) * t >> 16))
 }
 
-/// Blend two colours by `c` of 256 (the first at c = 256).
-fn mix(a: u32, b: u32, c: i64) -> u32 {
-    let c = c.clamp(0, 256) as u32;
-    let m = |sh: u32| (((a >> sh & 0xFF) * c + (b >> sh & 0xFF) * (256 - c)) >> 8) << sh;
-    m(16) | m(8) | m(0)
+/// A premultiplied pixel at coverage `cov` (Q16, 0 to 65536 whole): every lane, α included, scaled. Each lane stays in its field (G#FFFF × 2¹⁶ >> 16).
+#[inline(always)]
+fn at_cov(p: Px, cov: i64) -> Px {
+    let c = cov as u64;
+    let s = |sh: u32| ((p >> sh & 0xFFFF) * c >> 16) << sh;
+    s(48) | s(32) | s(16) | s(0)
 }
 
 /// The clock face (the map's clock circle) at (cx, cy), radius r, Q8 pixels: three rings, each a sweep from 12:00 in the fill colour over the face colour, separated by black strokes, with white ticks; under what is there (the caller writes the time in the centre first). All squared distances and cross products — no root, no angle: a pixel is inside a sweep of angle θ when it is anticlockwise of θ's direction (one cross product), on the right half for θ ≤ ½ turn, either for more. `dirs[k]` is the unit direction (sin, −cos) of k/60 of a turn, Q14. Returns the rectangle it touched.
@@ -466,29 +469,39 @@ pub fn clock(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i6
         (a.0 + ((b.0 - a.0) * t >> 16), a.1 + ((b.1 - a.1) * t >> 16), f > 1 << 15)
     });
     let full: [bool; 6] = core::array::from_fn(|i| rings.get(i).map(|r| r.frac_q16 >= 1 << 16).unwrap_or(false));
-    // A ring's colour at a pixel: the sweep's coverage (antialiased on its leading edge and along 12:00), fill or face by the period's direction.
-    let ring_colour = |i: usize, dx: i64, dy: i64| -> u32 {
+    // The face's colours as opaque canvas pixels, 16 bits a channel: everything below composes on these, front to back, and nothing is rounded back to 8 bits.
+    let (face_px, fill_px, fill_pm_px, stroke_px) = (opaque(clock_face), opaque(clock_fill), opaque(clock_fill_pm), opaque(clock_stroke));
+    // A ring at a pixel: the sweep's fill in front at its coverage (antialiased on its leading edge and along 12:00, Q16), the face under it.
+    let ring_px = |i: usize, dx: i64, dy: i64| -> Px {
         // Into the face's own frame (the turn undone), where 12:00 is up.
         let (dx, dy) = ((dx * tc + dy * ts) >> 14, (dy * tc - dx * ts) >> 14);
         let (bx, by, past_half) = bound[i];
-        let cov_x = (dx + 128).clamp(0, 256);
-        let cov_line = (-((bx * dy - by * dx) >> 14) + 128).clamp(0, 256);
-        let swept = if full[i] { 256 } else if rings[i].frac_q16 == 0 { 0 } else if past_half { cov_x.max(cov_line) } else { cov_x.min(cov_line) };
-        mix(if rings[i].lighter { clock_fill_pm } else { clock_fill }, clock_face, swept)
-    };
-    // Each band's colour, by index: even below the centre the rings, odd the strokes, `cb` the centre.
-    let band_colour = |b: usize, dx: i64, dy: i64| -> u32 {
-        if b >= cb {
-            clock_face
-        } else if b % 2 == 0 {
-            ring_colour(b / 2, dx, dy)
+        // WHY the clamps: a half-plane's coverage of a pixel is its signed distance from the pixel's centre plus half a pixel, and it covers the pixel wholly (or not at all) from half a pixel on; these are the coverage's definition, not a guard (distances in Q8, coverage in Q16).
+        let cov_x = ((dx << 8) + (1 << 15)).clamp(0, 1 << 16);
+        let cov_line = ((-((bx * dy - by * dx) >> 14) << 8) + (1 << 15)).clamp(0, 1 << 16);
+        let swept = if full[i] { 1 << 16 } else if rings[i].frac_q16 == 0 { 0 } else if past_half { cov_x.max(cov_line) } else { cov_x.min(cov_line) };
+        let fill = if rings[i].lighter { fill_pm_px } else { fill_px };
+        if swept == 0 {
+            face_px
+        } else if swept == 1 << 16 {
+            fill
         } else {
-            clock_stroke
+            under(at_cov(fill, swept), face_px)
+        }
+    };
+    // Each band at a pixel, by index: even below the centre the rings, odd the strokes, `cb` the centre.
+    let band_px = |b: usize, dx: i64, dy: i64| -> Px {
+        if b >= cb {
+            face_px
+        } else if b % 2 == 0 {
+            ring_px(b / 2, dx, dy)
+        } else {
+            stroke_px
         }
     };
     let r2: [i64; 13] = core::array::from_fn(|i| rad[i] * rad[i]);
-    // 255 / (2 rad) in Q24 per boundary, as in `disc`: the first-order distance to a boundary from d² with a multiply.
-    let kb: [i64; 13] = core::array::from_fn(|i| ((255i64 << 24) / (2 * rad[i].max(1))) >> 8);
+    // 2¹⁶ / (2 rad) in Q24 per boundary, as in `disc` at 16 bits: the first-order distance to a boundary from d² with a multiply, as Q16 coverage.
+    let kb: [i64; 13] = core::array::from_fn(|i| ((1i64 << 40) / (2 * rad[i].max(1))) >> 8);
     spans(cx, cy, r, |y, xo0, xo1, _, _| {
         if y < by0 || y >= by1 {
             return;
@@ -511,25 +524,26 @@ pub fn clock(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i6
             while b > 0 && d2 > r2[b] {
                 b -= 1;
             }
-            // Its coverage across the nearer boundary: outside the face (b = 0's outer edge) fades to nothing; elsewhere it blends with the neighbouring band.
-            let out_cov = 128 - ((d2 - r2[b]) * kb[b] >> 24);
-            let in_cov = if b < cb { 128 + ((d2 - r2[b + 1]) * kb[b + 1] >> 24) } else { 256 };
-            let here = band_colour(b, dx, dy);
-            let (colour, alpha) = if out_cov < 256 && (b > 0 || out_cov > 0) {
-                if b == 0 {
-                    (here, out_cov.clamp(0, 255))
-                } else {
-                    (mix(here, band_colour(b - 1, dx, dy), out_cov), 255)
-                }
-            } else if in_cov < 256 && b < cb {
-                (mix(here, band_colour(b + 1, dx, dy), in_cov), 255)
-            } else {
-                (here, 255)
-            };
-            if alpha <= 0 {
+            // Its coverage across the nearer boundary, Q16 (at least half: the pixel's centre is inside its band, except outside the face). Outside the face (b = 0's outer edge) it fades to nothing; elsewhere the band is in front at its coverage and its neighbour across that boundary under it, so the face stays opaque.
+            let out_cov = (1 << 15) - ((d2 - r2[b]) * kb[b] >> 24);
+            let in_cov = if b < cb { (1 << 15) + ((d2 - r2[b + 1]) * kb[b + 1] >> 24) } else { 1 << 16 };
+            // Half a pixel or more past the face's edge: nothing. (Until 2026-11-07 such a pixel fell through to the band's own colour, opaque: the walk reaches a pixel past the edge, so a hard rim stood outside the antialiased one, the face's edge stepped.)
+            if b == 0 && out_cov <= 0 {
                 continue;
             }
-            *p = under(*p, at_coverage(colour, alpha as u32));
+            let here = band_px(b, dx, dy);
+            let face = if out_cov < 1 << 16 {
+                if b == 0 {
+                    at_cov(here, out_cov)
+                } else {
+                    under(at_cov(here, out_cov), band_px(b - 1, dx, dy))
+                }
+            } else if in_cov < 1 << 16 && b < cb {
+                under(at_cov(here, in_cov), band_px(b + 1, dx, dy))
+            } else {
+                here
+            };
+            *p = under(*p, face);
         }
     });
     Rect { x0: ((cx - r) >> 8) as i32 - 2, y0: ((cy - r) >> 8) as i32 - 2, x1: ((cx + r) >> 8) as i32 + 3, y1: ((cy + r) >> 8) as i32 + 3 }.clip(width, height)

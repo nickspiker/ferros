@@ -1805,22 +1805,28 @@ fn layout_build(width: usize, height: usize) {
     unsafe { NBANDS = fluor::layout::layout(&layers[..n], width, height, core::slice::from_raw_parts_mut(&raw mut BANDS as *mut Band, 2 * SURFACES + 1)) };
 }
 
-/// A working pixel's transparency, Q14: 0 opaque, 16384 clear (bit 63, the see-through bit every working surface may set), between from bits 49-62 (a decoded fluor surface's alpha; a working surface declares only the bit).
+/// A working pixel's transparency, Q14: 0 opaque, 16384 clear (bit 63, the see-through bit every working surface may set), between from bits 49-62 (a decoded fluor surface's alpha; a working surface's own clients declare only the bit, and the display's text ops leave a glyph's fringe over a clear pixel there, premultiplied as a decoded fluor pixel is).
 #[inline]
 fn trans(p: u64) -> u64 {
     if p >> 63 != 0 { 16384 } else { p >> 49 & 0x3FFF }
 }
 
 /// One layer folded under the composite so far (`acc` with transparency `t`), as fluor's `Blend::under` does it front to back, on the working values: each channel gains the mode's value of (composite, layer) by what the layer's alpha fills of what was still transparent, and the transparency is the product. The mode is the one of the layer above (how that layer sits on what is beneath it). Modes are defined against white (Q14 16384) as fluor's are against the top code; brighter working values (the canvas goes to four times white) are taken as the math gives, and a channel saturates at the field: 16 bits is what a working value holds, and Add past the field is the mode's own definition, as fluor's Add saturates at its one.
+/// The composite `acc` is premultiplied (what is still transparent is black), and so is the layer: `working` decodes a fluor pixel as its light over black, α − darkness. fluor's `under` takes its top as the accumulated value and its bottom's colour straight (the bottom's α comes in once, through `consumed`), so the mode here sees the layer straight, b / α with α = 1 − its transparency, and its value is deposited by t · α. Written out, mode(a, b / α) · α is fluor's `visible` on (a · α, b) with α itself as the unit, the same function scaled: Normal gives b, Multiply a·b, Screen α − (1 − a)(α − b), Add a·α + b and so on, so no division by α is ever taken and Normal is exactly `acc + b · t`, `under_pm`. (Until 2026-11-07 the layer went in as it was decoded, premultiplied, and was multiplied by its α again: a translucent fluor window behind another came out too dark, and the other modes ran on premultiplied colour.) A working surface's pixel is opaque or see-through, α 1 or nothing, so it folds exactly as before.
 #[inline]
 fn fold(acc: u64, t: u64, p: u64, mode: u8) -> (u64, u64) {
     let tp = trans(p);
-    let consumed = (t * (16384 - tp)) >> 14;
+    // The layer's α, Q14.
+    let la = 16384 - tp;
+    // WHY: a see-through layer pixel (bit 63; a fluor pixel whose α is under a Q14 step decodes the same, `working`) adds nothing and leaves the transparency as it was, and `visible` with α 0 as its unit would divide by zero in Multiply, Screen and Overlay (a panic in the display server for every app).
+    if la == 0 {
+        return (acc, t);
+    }
     let ch = |sh: u32| -> u64 {
         let (a, b) = ((acc >> sh & 0xFFFF) as i64, (p >> sh & 0xFFFF) as i64);
-        // The mode's value on the visible operands: fluor's one definition of the eight modes (BlendMode::visible), white at Q14.
-        let m = fluor::pixel::BlendMode::from_byte(mode).visible(a, b, 16384);
-        let v = a + (m * consumed as i64 >> 14);
+        // The mode's value on the composite and the straight layer, times the layer's α: fluor's one definition of the eight modes (BlendMode::visible) with the layer's α as its white.
+        let m = fluor::pixel::BlendMode::from_byte(mode).visible(a * la as i64 >> 14, b, la as i64);
+        let v = a + (m * t as i64 >> 14);
         (if v < 0 { 0 } else if v > 0xFFFF { 0xFFFF } else { v } as u64) << sh
     };
     let t2 = (t * tp) >> 14;
@@ -2655,7 +2661,15 @@ fn g2t_colour(c: (f32, f32, f32)) -> u64 {
 fn console_draw(width: usize, height: usize, force: bool) -> bool {
     use fluor::pixel::{Blend, BlendMode};
     let mut tb = [0u8; 32];
-    let (_, _, tn, key, _) = clock_state(&mut tb);
+    let (_, _, tn, _, _) = clock_state(&mut tb);
+    // The clock's circle shows the time's first two places (h:mm, or the dozenal hour and its twelfth), without trailing zils as the face's centre writes them (noon is Lun, not Lun:Zil): the face drops them only when every lower place is zil too, so the cut drops its own (it showed "Lun" for a few seconds, then "Lun:Zil" for the rest of the twelfth). A dozenal place is one byte (U+0010 to U+001B), and no decimal digit is that byte.
+    let line = tb[..tn].split(|&c| c == b'\n').next().unwrap_or(&[]);
+    let mut colons = 0;
+    let mut end = line.iter().position(|&c| { colons += (c == b':') as u32; colons == 2 }).unwrap_or(line.len());
+    while end >= 2 && line[end - 2] == b':' && line[end - 1] == 0x10 {
+        end -= 2;
+    }
+    let time = core::str::from_utf8(&line[..end]).unwrap_or("");
     let facts = ferros_sys::facts().0;
     let radios = facts[32];
     let off = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF);
@@ -2664,7 +2678,12 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
     for &m in facts[1..5].iter().chain(&facts[33..81]) {
         mh = (mh.rotate_left(7) ^ m).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
-    let k = (((key / 60) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64) ^ (off as i64) << 40;
+    // The time by what it shows, not by the clock's count: the count is seconds only for decimal (a dozenal count is in 50/12 s, and its sixtieths never lined up with the twelfth the circle shows, which turned over up to four minutes late).
+    let mut time_h = 0u64;
+    for &c in time.as_bytes() {
+        time_h = (time_h.rotate_left(7) ^ c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    let k = (((time_h >> 9) as i64) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64 ^ (off as i64) << 40;
     if !force && k == unsafe { CONSOLE_KEY } {
         return false;
     }
@@ -2684,10 +2703,6 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
     const OFF_GREY: f32 = 3200.0;
     const DARK_INK: f32 = 1800.0;
     const LIGHT_INK: f32 = 7000.0;
-    let line = tb[..tn].split(|&c| c == b'\n').next().unwrap_or(&[]);
-    let mut colons = 0;
-    let end = line.iter().position(|&c| { colons += (c == b':') as u32; colons == 2 }).unwrap_or(line.len());
-    let time = core::str::from_utf8(&line[..end]).unwrap_or("");
     let (circles, n) = corner_layout(width, height);
     for &(x, y, r, what) in &circles[..n] {
         if y >= height as f32 * 0.5 {
@@ -3845,7 +3860,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     out[1..5].copy_from_slice(&w.to_le_bytes());
                     len = 5;
                 }
-                // Text into a window's surface, in its 16-bit working values: [base u64] the surface, [x i16][baseline i16][size u16 px][value u16 Q14, white = 16384][utf8…] in screen coordinates (a surface is the whole screen). Glyph coverage times the value, grey, taking the brighter of itself and what is there (so labels sit on black), and clearing the see-through bit where it draws. The app shows the window (op 22) when it is done drawing. Apps have no font of their own yet; the display's is the one typeface (SHELL.md). Synchronous, so the text is in the surface before the app writes it again. Was op 24 until 2026-10-27: the frame wait took that number on 2026-10-24 (answered by the receive thread, never queued), and every text call since had been a frame wait that drew nothing.
+                // Text into a window's surface, in its 16-bit working values: [base u64] the surface, [x i16][baseline i16][size u16 px][value u16 Q14, white = 16384][utf8…] in screen coordinates (a surface is the whole screen). The text is the front layer where it draws, grey at its glyph coverage, and what the surface held goes under it by what the coverage leaves (until 2026-11-07 the brighter grey of the two won, a painter's choice that dropped the colour under a glyph's fringe and hid dark text); in a G2T16 window's surface the same in fluor's α + darkness. The app shows the window (op 22) when it is done drawing. Apps have no font of their own yet; the display's is the one typeface (SHELL.md). Synchronous, so the text is in the surface before the app writes it again. Was op 24 until 2026-10-27: the frame wait took that number on 2026-10-24 (answered by the receive thread, never queued), and every text call since had been a frame wait that drew nothing.
                 // Op 29, the same with x the centre of the text's ink (window::text_centred, the keyboard's labels, 2026-11-01): the glyphs' coverage found once at a pen of 0 (the cache keeps them for the draw), its leftmost and rightmost pixels' middle put on x. Left and right only: the baseline stays where it is asked.
                 Some(op @ (26 | 29)) if m.len() >= 17 => {
                     let i16le = |k: usize| i16::from_le_bytes([m[k], m[k + 1]]) as i32;
@@ -3867,15 +3882,31 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             } else {
                                 x0
                             };
+                            // The surface's format, by its window; a surface not shown yet (an app draws before op 22) is taken as working values, the format every caller of these ops uses.
+                            let g2t = unsafe { WINS[sk] }.is_some_and(|w| w.format == G2T16);
+                            // The text's grey as fluor's straight 16-bit darkness, for a G2T16 surface: the code 2¹⁶ · tanh(v / 2¹⁴) (`G2T16_Q14` inverted, as `g2t_colour`), its complement the darkness. tanh stays under 1 for every value the u16 can hold, so the code stays under 2¹⁶.
+                            let ink = 65535 - (libm::tanhf(val as f32 * (1.0 / 16384.0)) * 65536.0) as u64;
                             glyph_engine().cover(t, x0 as f32, base as f32, px, (1.0, 0.0), |x, y, a| {
                                 if x < 0 || y < 0 || x >= width as i64 || y >= height as i64 {
                                     return;
                                 }
-                                let v = (val as u64 * a as u64 / 65535).min(0xFFFF);
+                                if a == 0 {
+                                    return;
+                                }
                                 let d = &mut surf[y as usize * width + x as usize];
-                                let have = if *d & CLEAR != 0 { 0 } else { *d & 0xFFFF };
-                                if v > have {
-                                    *d = (*d & 1 << 48) | v | v << 16 | v << 32;
+                                // The text is the front layer of its pixels, the surface's pixel under it (owner, 2026-11-07: front to back, `under` only): the text at its coverage first, then what was there by what the text leaves, as fluor's `under` steps (2¹⁶ − coverage, so a whole glyph pixel leaves nothing). A see-through pixel adds nothing under the text, which then stands over nothing at its own coverage.
+                                let (a, room) = (a as u64, 65536 - a as u64);
+                                if g2t {
+                                    // α + premultiplied darkness: α the coverage plus the old α by the room, each darkness the ink by the coverage plus the old darkness by the room. Neither passes 2¹⁶ − 1 (the floor proof on fluor's `under`): the old field by the room is at most 2¹⁶ − 1 − coverage, and the text's share at most the coverage (α) or one under it (darkness, ink < 2¹⁶), whether or not the pixel keeps darkness ≤ α.
+                                    let f = |sh: u32, top: u64| (top + ((*d >> sh & 0xFFFF) * room >> 16)) << sh;
+                                    let dk = ink * a >> 16;
+                                    *d = f(48, a) | f(32, dk) | f(16, dk) | f(0, dk);
+                                } else {
+                                    // Working values, premultiplied: the text's grey by its coverage, the pixel under it by the room with its own transparency (`working` empties a see-through pixel's channels), the transparency the product. Each channel is a weighted mean of two values in the field, so it stays in it. A working surface's pixel is opaque or clear; a glyph's fringe over a clear one keeps what the glyph leaves as transparency (bits 49-62, `trans`), which a chain folds by and the plain path, by the see-through bit alone, shows over black.
+                                    let old = working(*d, 0);
+                                    let v = val as u64 * a >> 16;
+                                    let (acc, tr) = under_pm(v | v << 16 | v << 32, room >> 2, old & ((1 << 48) - 1), trans(old));
+                                    *d = (*d & 1 << 48) | acc | tr << 49;
                                 }
                             });
                             ALLOC.reset();
