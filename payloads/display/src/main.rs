@@ -3066,7 +3066,37 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 Corner::Battery => "batt",
                 Corner::Home | Corner::Back | Corner::Spare => "",
             };
-            if !name.is_empty() {
+            if what == Corner::Gps {
+                // GPS switched off shows its symbol, not its name (owner, 2026-11-07: "the classic teardrop with a hole punch"): a map pin, the convex hull of a round head and the tip below it (its sides the tangents from the tip), a hole through the head's centre, in the ink, its edge the C∞ step across two pixels. By its signed distance, so it is sharp at any size.
+                let (a, l, hole) = (r * 0.3, r * 0.6, r * 0.12);
+                // The head's centre, so the pin from the head's top to the tip sits centred in the circle.
+                let (cx, cy) = (x, y - (l - a) * 0.5);
+                // The tangent point on the head (right side; the pin is symmetric): the angle α from the downward axis with cos α = a / l.
+                let (ca, sa) = (a / l, libm::sqrtf(1.0 - (a / l) * (a / l)));
+                let (kx, ky) = (a * sa, a * ca);
+                let (tlen, dirx, diry) = { let (vx, vy) = (-kx, l - ky); let m = libm::sqrtf(vx * vx + vy * vy); (m, vx / m, vy / m) };
+                let pin = |qx: f32, qy: f32| -> f32 {
+                    let (qx, qy) = (libm::fabsf(qx), qy);
+                    let s = (qx - kx) * dirx + (qy - ky) * diry;
+                    let body = if s <= 0.0 {
+                        libm::sqrtf(qx * qx + qy * qy) - a
+                    } else if s >= tlen {
+                        libm::sqrtf(qx * qx + (qy - l) * (qy - l))
+                    } else {
+                        (qx - kx) * sa + (qy - ky) * ca
+                    };
+                    // The hole punched out of the head.
+                    body.max(hole - libm::sqrtf(qx * qx + qy * qy))
+                };
+                let (x0, x1, y0, y1) = ((cx - a - 2.0) as i64, (cx + a + 2.0) as i64, (cy - a - 2.0) as i64, (cy + l + 2.0) as i64);
+                for py in y0..=y1 {
+                    for px in x0..=x1 {
+                        let Some(i) = at(px, py) else { continue };
+                        let cov = draw::bump_step((1.0 - pin(px as f32 + 0.5 - cx, py as f32 + 0.5 - cy)) * 0.5);
+                        console[i] = console[i].under(ink | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
+                    }
+                }
+            } else if !name.is_empty() {
                 lines[0].s(name);
                 let eng = glyph_engine();
                 // The lines stacked about the centre, a pitch each; each line as large as fits its own chord (seven tenths of the circle's width at the line's far edge), the name half again as large as a measure.
