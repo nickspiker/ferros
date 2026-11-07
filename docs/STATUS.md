@@ -45,14 +45,14 @@ A snapshot of what runs on the Pixel 8 Pro (husky) today and what's next. Area d
   - On a cold boot the modem's S2MPU (HSI1) and BLK_MISC's were open, and the modem driver had been switching its own protection off.
   - The kernel now fences the modem to its device-tree carve-outs and denies BLK_MISC everything. No process may write any S2MPU.
   - Verified on a cold boot: registration, the data call, an HTTP fetch over cellular, no faults.
-- **Location is the person's (GNSS.md).** `gnss.last` is identity class, and the replays' captured position is zeroed. Owner rule: no GPS while unattested, locate excepted (designed, not built).
+- **Location is the person's (GPS.md).** `gps.last` is identity class, and the replays' captured position is zeroed. Owner rule: no GPS while unattested, locate excepted (designed, not built).
 - **Nothing acts on the radios while locked.** SYS_FACTS 83 says whether a person is present. `ip` serves applications only their addresses while nobody is, `bt` refuses the beacon, `nfc` refuses the tap secret.
 - **The GPU is online (GPU.md "Online").**
   - `payloads/gpu` boots the CSF microcontroller from the device's own firmware (115 us) and answers a ping (15 us).
   - It runs one group and queue, with jobs waited for on the GPU's job interrupt: SYNC_SET32 and STORE_MULTIPLE + WAIT confirmed against Mesa's v11 encodings.
   - **The shader cores compute:** a hand-encoded Valhall compute shader, 16 invocations each writing G#C0FF_EE00 + its id, then 16384 invocations; then **the Mandelbrot set**, a 26-instruction kernel with a divergent float loop, 64 x 64 in 708 us, bit-exact against the CPU (GPU.md "A real kernel").
   - The kernel holds its fence (to `gpu-mem`) and leaves it powered. The secure DRAM carveout at G#B600_0000 is now written down twice.
-- **Kernel out.** The GNSS bring-up tools left. The rest of the list needs owner decisions (KERNEL-OUT.md 3, 5, 7-10).
+- **Kernel out.** The GPS bring-up tools left. The rest of the list needs owner decisions (KERNEL-OUT.md 3, 5, 7-10).
 - **Attest keys:** the press highlights work again (broken since the sandbox's own frame buffer), plus a bevel.
 
 ## Needs the owner (can't be finished solo)
@@ -64,7 +64,7 @@ A snapshot of what runs on the Pixel 8 Pro (husky) today and what's next. Area d
 **Hardware bring-up, the night of 2026-10-24/25 (each with its diag, doc and commit):**
 - **Sensors (SENSORS.md):** 39 of the AoC's 41 sensors stream under ferros from every boot (rails, firmware, registry push with the board CDT, the display's state and TE2 for the under-display light/proximity sensor). Gravity turns the clock; proximity carries its raw counts; the proximity wake is built, off until tuned (`device.prox_wake`).
 - **Haptics:** the CS40L26 answers (rev A1, ROM firmware); `diag haptic play <n>` queues a ROM waveform — not yet felt.
-- **GNSS (GNSS.md):** the BCM4776 powers and answers its wake handshake and SPI framing; since 2026-10-25 it gives fixes (below).
+- **GPS (GPS.md):** the BCM4776 powers and answers its wake handshake and SPI framing; since 2026-10-25 it gives fixes (below).
 - **Modem (docs/oracle/MODEM-BOOT-RECON.md):** the boot channel runs through — TOC, MAIN (98 MB, CRC accepted), VSS, APM; stopped on purpose before the per-unit NV and START.
 - **GPU (GPU.md):** Mali-G715 r1p2, 7 cores, answers; the CSF bring-up plan written (after toka).
 - **TPU (TPU.md):** firmware loaded through GSA, started through Trusty, its first KCI exchange answered (changelist 836291931). Next: the in-kernel VII path (a captured model replayed).
@@ -73,7 +73,7 @@ A snapshot of what runs on the Pixel 8 Pro (husky) today and what's next. Area d
 **2026-10-25 (day and night):**
 - **Power (POWER.md):** screen on at rest 3.5 → **1.21–1.26 W** (Android 1.16), screen off cable in **0.58 W**: the clock policy (rest / active / dark operating points, every request acked before the next), the UFS link hibernating after 16 ms idle (0.65 W), the unused SoC power domains gated at boot through EL3 (0.35 W), the kernel's event stream and idle backstop, the worker cores off while dark (35 mW). The PMICs' rail meters read from ferros (`diag odpm`) and compared with Android's own rail by rail; BB_HLDO's 324 mW is the meter's, not a load.
 - **USB:** the replug wedge was the phone's TCPC USB switch left open after a detach; the re-init closes it.
-- **GNSS (GNSS.md): fixes under ferros.** The chip's transport decoded from captures of lhd (tools/gtrace); ferros powers it, downloads its patch and replays gpsd's on-chip session from the vault with the time aiding rewritten from the RTC; the chip's own engine reports a fix a second, the first 11–18 s after power-up, settling at ±8 m. `diag gnss boot [s]`, `fix`, `off`. Open: an indoor offset of ~150 m against Android's host engine (the same engine under Android agrees with ferros), and independence from the captured aiding.
+- **GPS (GPS.md): fixes under ferros.** The chip's transport decoded from captures of lhd (tools/gtrace); ferros powers it, downloads its patch and replays gpsd's on-chip session from the vault with the time aiding rewritten from the RTC; the chip's own engine reports a fix a second, the first 11–18 s after power-up, settling at ±8 m. `diag gps boot [s]`, `fix`, `off`. Open: an indoor offset of ~150 m against Android's host engine (the same engine under Android agrees with ferros), and independence from the captured aiding.
 - **Modem (docs/oracle/MODEM-BOOT-RECON.md):** `ferros_f2fs` reads the per-unit NV files (efs, modem_userdata; hashes match Android's own reads); the boot channel now carries TOC, MAIN, VSS, APM and the three NV sections, every frame acked. START (G#A400) waits for the owner.
 
 

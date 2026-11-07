@@ -1,13 +1,13 @@
-//! The GNSS driver (GNSS.md): an EL0 process that runs the BCM4776 — its SPI transport, the session replay with ferros's own aiding, the chip's on-chip fixes — and serves them on the `gnss` endpoint. What was the kernel's `gnss.rs` session, as a process.
+//! The GPS driver (GPS.md): an EL0 process that runs the BCM4776 — its SPI transport, the session replay with ferros's own aiding, the chip's on-chip fixes — and serves them on the `gps` endpoint. What was the kernel's `gps.rs` session, as a process.
 //!
-//! The kernel keeps only what a process cannot do: the chip's three rails (ACPM), the SPI port's clocks and USI mode, and the lines' pin modes, behind the `gnss` power capability (`SYS_POWER`, kernel gnss.rs `power`). Everything else is here, through MMIO grants: the port's registers, and the data bits of the four lines (HOST_REQ gpa5-3, MCU_REQ gpp4-3, MCU_RESP gph3-2, nSTANDBY gph3-3).
+//! The kernel keeps only what a process cannot do: the chip's three rails (ACPM), the SPI port's clocks and USI mode, and the lines' pin modes, behind the `gps` power capability (`SYS_POWER`, kernel gps.rs `power`). Everything else is here, through MMIO grants: the port's registers, and the data bits of the four lines (HOST_REQ gpa5-3, MCU_REQ gpp4-3, MCU_RESP gph3-2, nSTANDBY gph3-3).
 //!
-//! The session: the vault's `gnss.replay` (or `gnss.replay.sky`, the same without the LTO orbits) is gpsd's on-chip session cut from a capture — the patch download, the second firmware stage, the configuration, the aiding — played record by record, each reliable packet waiting for the chip's ack. Before it goes out, the aiding is ferros's own: the time from the RTC, the position from the last fix (`gnss.last`). Then the chip navigates alone and sends a fix a second; the latest is kept, and written back to `gnss.last` with the first fix and every 64 s.
+//! The session: the vault's `gps.replay` (or `gps.replay.sky`, the same without the LTO orbits) is gpsd's on-chip session cut from a capture — the patch download, the second firmware stage, the configuration, the aiding — played record by record, each reliable packet waiting for the chip's ack. Before it goes out, the aiding is ferros's own: the time from the RTC, the position from the last fix (`gps.last`). Then the chip navigates alone and sends a fix a second; the latest is kept, and written back to `gps.last` with the first fix and every 64 s.
 //!
-//! Spawn: ferros-bridge spawn gnss.bin <flags> --name gnss --serve gnss --hw usi3-spi --hw gpio-far-alive --hw gpio-gpp0 --hw gpio-hsi2 --store gnss --power gnss --irq gnss-host-req
-//! Grant slots, in that order: 0 console, 1 the `gnss` endpoint (serve), 2 the SPI port, 3 gpio-far-alive, 4 gpio-gpp0 (PERIC0), 5 gpio-hsi2, 6 the vault scope `gnss.`, 7 the power switch, 8 HOST_REQ's interrupt. Input byte 0: bit 0 = the sky replay.
+//! Spawn: ferros-bridge spawn gps.bin <flags> --name gps --serve gps --hw usi3-spi --hw gpio-far-alive --hw gpio-gpp0 --hw gpio-hsi2 --store gps --power gps --irq gps-host-req
+//! Grant slots, in that order: 0 console, 1 the `gps` endpoint (serve), 2 the SPI port, 3 gpio-far-alive, 4 gpio-gpp0 (PERIC0), 5 gpio-hsi2, 6 the vault scope `gps.`, 7 the power switch, 8 HOST_REQ's interrupt. Input byte 0: bit 0 = the sky replay.
 //!
-//! The `gnss` endpoint, first byte the op:
+//! The `gps` endpoint, first byte the op:
 //! - `0` FIX: `valid u8`, `fixes u32`, `age ms u32` (since the latest), `lat i32`, `lon i32` (2⁻²³ degrees), `alt i32` (m), `err u32` (m), `speed i32`, `track i32` (1/64 m/s, 1/64 °) — little-endian, 33 bytes.
 //! - `1` STOP: the chip powered down, the last fix kept; the process exits after replying.
 #![no_std]
@@ -16,14 +16,14 @@
 use core::fmt::Write;
 use ferros_sys::{cap, console, freq, mmio_read, mmio_write, now, recv, reply, store_get_at, store_set, store_set_at, NOTHING};
 
-const S_GNSS: u64 = 1;
+const S_GPS: u64 = 1;
 const S_SPI: u64 = 2;
 const S_FAR: u64 = 3;
 const S_PERIC0: u64 = 4;
 const S_HSI2: u64 = 5;
 const S_STORE: u64 = 6;
 const S_POWER: u64 = 7;
-/// HOST_REQ's interrupt (kernel `gnss-host-req`): the loop sleeps on it instead of polling the line, which missed the chip's requests (2026-10-26: a fix, then nothing).
+/// HOST_REQ's interrupt (kernel `gps-host-req`): the loop sleeps on it instead of polling the line, which missed the chip's requests (2026-10-26: a fix, then nothing).
 const S_IRQ: u64 = 8;
 /// The far-alive bank's external-interrupt registers (pinctrl-exynos.h; gpa5 is the bank's only one): control (a nibble per pin, 1 = high level), mask, pending.
 const EINT_CON: u64 = 0x700;
@@ -218,7 +218,7 @@ fn payload_start(f: &[u8]) -> usize {
     k
 }
 
-/// One on-chip fix (kernel gnss.rs `Fix`): lat/lon in 2⁻²³ degrees, altitude and error in metres, speed and track in 1/64ths, Lms the chip's millisecond clock.
+/// One on-chip fix (kernel gps.rs `Fix`): lat/lon in 2⁻²³ degrees, altitude and error in metres, speed and track in 1/64ths, Lms the chip's millisecond clock.
 #[derive(Clone, Copy, Default)]
 struct Fix {
     lms: u32,
@@ -243,7 +243,7 @@ fn sbits(b: &[u8], o: usize, n: usize) -> i32 {
     (bits(b, o, n) << (32 - n)) as i32 >> (32 - n)
 }
 
-/// A fix from a chip payload: the inner `c0 c1 … c0 c4` frame (G#C0 escaped as `c0 c0`), class `01 81`, id G#16, the position-valid, altitude and speed flags set (bits 210, 212, 215; GNSS.md "The on-chip engine").
+/// A fix from a chip payload: the inner `c0 c1 … c0 c4` frame (G#C0 escaped as `c0 c0`), class `01 81`, id G#16, the position-valid, altitude and speed flags set (bits 210, 212, 215; GPS.md "The on-chip engine").
 fn parse_fix(p: &[u8]) -> Option<Fix> {
     let c = p.iter().take(8).zip(p.iter().skip(1)).position(|(&a, &b)| a == 0xC0 && b == 0xC1)?;
     let mut m = [0u8; 512];
@@ -333,7 +333,7 @@ impl Deframer {
     }
 }
 
-// ── Aiding: what the chip is told before it looks at the sky (GNSS.md "Aiding") ──
+// ── Aiding: what the chip is told before it looks at the sky (GPS.md "Aiding") ──
 //
 // The replay carries gpsd's aiding from the capture: the time (rewritten below), the last position, the ephemerides gpsd kept, and an LTO file.
 // LTO ("Long Term Orbits") is Broadcom's (from Global Locate, hence glpals.com and gpsd's Gl* names): every satellite's orbit and clock predicted days ahead, so a start without fresh ephemerides takes seconds instead of a cold search.
@@ -342,7 +342,7 @@ impl Deframer {
 // Variants on the same path: 7day/v2 59 KB, v3 103 KB, v4 146 KB, v5 188 KB, 4day/v5 123 KB (gpsd's compiled-in URL is the 4day one; growing with the constellations covered, by inference); http://gllto.glpals.com/rtistatus5.dat (240 bytes, real-time satellite health); gpsd's rto.dat (real-time orbits) URL answers 404.
 // The file as read: magic ff ca de 00, u32 length (file − 8), u32 1, 16 bytes that change per file (likely the "LTO file id" gpsd logs), u32 G#75A0DE5 and u32 5292 (the header's end) in every variant, u32 70, then 70 × (index u32, offset u32) into G#44-byte records before the bulk; gpsd logs "LTO under license to 'google', license #69" when it reads one.
 // Our stance: the file is published openly, unposted and unauthenticated, as the Pixel itself fetches it; ferros fetches it the same way for its own chip, and if Broadcom or Google ask, this comes down.
-// Not done yet: feeding a fresh file to the chip. gpsd's upload (`82 81`) is not the file but window blocks computed from it (GNSS.md "Aiding"); the plan is gpsd's own routine run in an aarch64 interpreter capsule.
+// Not done yet: feeding a fresh file to the chip. gpsd's upload (`82 81`) is not the file but window blocks computed from it (GPS.md "Aiding"); the plan is gpsd's own routine run in an aarch64 interpreter capsule.
 
 /// GPS time now from the wall clock in the preferences block (the kernel's base: unix seconds × frequency − the counter): milliseconds since 1980-01-06, UTC + 18 leap seconds.
 fn gps_ms_now() -> Option<u64> {
@@ -354,7 +354,7 @@ fn gps_ms_now() -> Option<u64> {
     Some((t / f * 1000 + t % f * 1000 / f).checked_sub(315_964_800_000)? + 18_000)
 }
 
-/// gpsd's aiding in a record rewritten with ferros's own (kernel gnss.rs `patch_aiding`): `87 81` time (week at +8, time of week at +10 from the inner `c0 c1`), `d0 81` position and time (latitude u32 2⁻¹⁶ ° at +10, longitude u32 2⁻¹⁵ ° west-positive at +22, week +58, time of week +62). The inner checksum moves by the bytes' difference; a value whose bytes would need the C0 escape moves on by one unit. Returns the new record's length in `out`, or None when nothing changed.
+/// gpsd's aiding in a record rewritten with ferros's own (kernel gps.rs `patch_aiding`): `87 81` time (week at +8, time of week at +10 from the inner `c0 c1`), `d0 81` position and time (latitude u32 2⁻¹⁶ ° at +10, longitude u32 2⁻¹⁵ ° west-positive at +22, week +58, time of week +62). The inner checksum moves by the bytes' difference; a value whose bytes would need the C0 escape moves on by one unit. Returns the new record's length in `out`, or None when nothing changed.
 fn patch_aiding(rec: &[u8], pos: Option<(i32, i32)>, out: &mut [u8]) -> Option<usize> {
     let now = gps_ms_now()?;
     let (mut i, mut o, mut changed) = (0usize, 0usize, false);
@@ -507,14 +507,14 @@ fn keep_last(grants: u64, d: &Deframer) {
     store_set(cap(grants, S_STORE), b"last", &v);
 }
 
-/// The capture's place out of a stored replay (owner, 2026-11-04: no place in the device's half, and no GPS while nobody has attested): every `d0 81` position zeroed through `patch_aiding` (its checksum and CRC redone, as at every run; the time fields take the clock's now, which every run rewrites anyway), the replay written back in pieces. The chip is never powered: this takes no fix. The message stays in the replay: cut or zeroed the chip waits 5-8 minutes alike (GNSS.md), and zeroed keeps the record sequence the chip acknowledges; the person's own last fix (`gnss.last`, the identity class) fills it whenever there is one.
+/// The capture's place out of a stored replay (owner, 2026-11-04: no place in the device's half, and no GPS while nobody has attested): every `d0 81` position zeroed through `patch_aiding` (its checksum and CRC redone, as at every run; the time fields take the clock's now, which every run rewrites anyway), the replay written back in pieces. The chip is never powered: this takes no fix. The message stays in the replay: cut or zeroed the chip waits 5-8 minutes alike (GPS.md), and zeroed keeps the record sequence the chip acknowledges; the person's own last fix (`gps.last`, the identity class) fills it whenever there is one.
 fn scrub(grants: u64, store: u64, key: &[u8]) {
     let mut head = [0u8; 4];
     let Some(total) = store_get_at(store, key, 0, &mut head) else {
-        return say!(grants, "gnss: scrub: no {} in the vault\n", core::str::from_utf8(key).unwrap_or("?"));
+        return say!(grants, "gps: scrub: no {} in the vault\n", core::str::from_utf8(key).unwrap_or("?"));
     };
     if &head != b"GNR1" || gps_ms_now().is_none() {
-        return say!(grants, "gnss: scrub: {} is not GNR1, or the clock is not set: left as it was\n", core::str::from_utf8(key).unwrap_or("?"));
+        return say!(grants, "gps: scrub: {} is not GNR1, or the clock is not set: left as it was\n", core::str::from_utf8(key).unwrap_or("?"));
     }
     let mut ok = store_set_at(store, key, 0, b"GNR1", true);
     let (mut at, mut out_at, mut places) = (4usize, 4usize, 0u32);
@@ -543,7 +543,7 @@ fn scrub(grants: u64, store: u64, key: &[u8]) {
         ok &= store_set_at(store, key, out_at + 4, body, at + 4 <= total);
         out_at += 4 + body.len();
     }
-    say!(grants, "gnss: scrub: {}: {} position messages zeroed, {} B written back ({})\n", core::str::from_utf8(key).unwrap_or("?"), places, out_at, if ok { "stored" } else { "the vault refused a piece" });
+    say!(grants, "gps: scrub: {}: {} position messages zeroed, {} B written back ({})\n", core::str::from_utf8(key).unwrap_or("?"), places, out_at, if ok { "stored" } else { "the vault refused a piece" });
 }
 
 #[unsafe(no_mangle)]
@@ -565,20 +565,20 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let pos = (ferros_sys::store_get(store, b"last", &mut last) == Some(8)).then(|| (i32::from_le_bytes([last[0], last[1], last[2], last[3]]), i32::from_le_bytes([last[4], last[5], last[6], last[7]])));
     let mut head = [0u8; 4];
     let Some(total) = store_get_at(store, key, 0, &mut head) else {
-        say!(grants, "gnss: no {} in the vault\n", if sky { "gnss.replay.sky" } else { "gnss.replay" });
+        say!(grants, "gps: no {} in the vault\n", if sky { "gps.replay.sky" } else { "gps.replay" });
         ferros_sys::exit(1);
     };
     if &head != b"GNR1" {
-        say!(grants, "gnss: the replay is not GNR1\n");
+        say!(grants, "gps: the replay is not GNR1\n");
         ferros_sys::exit(1);
     }
     if !ferros_sys::power(cap(grants, S_POWER), true) {
-        say!(grants, "gnss: power on failed\n");
+        say!(grants, "gps: power on failed\n");
     }
     chip.set(NSTANDBY, true);
     sleep_ms(250);
     let woke = chip.wake(100);
-    say!(grants, "gnss: powered, the chip {} its wake; replaying {} B ({}), position from {}\n", if woke { "answered" } else { "did not answer" }, total, if sky { "without the LTO" } else { "with the capture's LTO" }, if pos.is_some() { "the last fix" } else { "none (the replay's is zeroed: no place is kept in the device's half)" });
+    say!(grants, "gps: powered, the chip {} its wake; replaying {} B ({}), position from {}\n", if woke { "answered" } else { "did not answer" }, total, if sky { "without the LTO" } else { "with the capture's LTO" }, if pos.is_some() { "the last fix" } else { "none (the replay's is zeroed: no place is kept in the device's half)" });
 
     let t_all = now();
     let f = freq();
@@ -633,7 +633,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         }
     }
     chip.set(MCU_REQ, false);
-    say!(grants, "gnss: replayed {} records in {} ms ({} SPI errors, {} not acked in time); the chip: {} frames, {} CRC failures\n", recs, now().wrapping_sub(t_all) * 1000 / f, errs, late, d.frames, d.crc_bad);
+    say!(grants, "gps: replayed {} records in {} ms ({} SPI errors, {} not acked in time); the chip: {} frames, {} CRC failures\n", recs, now().wrapping_sub(t_all) * 1000 / f, errs, late, d.frames, d.crc_bad);
 
     // HOST_REQ as a level-high external interrupt: pin function EINT (G#F), its control nibble 1, pending cleared, unmasked.
     let far = cap(grants, S_FAR);
@@ -648,7 +648,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let mut kept_at = 0u64;
     // (HOST_REQ seen, MCU_RESP not answering, bytes read), and when they were last reported.
     let (mut asks, mut silent, mut bytes, mut said) = (0u32, 0u32, 0usize, now());
-    // The corners' GNSS circle (ferros_sys::measure): on and searching, then holding a fix with its error estimate; published when either changes.
+    // The corners' GPS circle (ferros_sys::measure): on and searching, then holding a fix with its error estimate; published when either changes.
     let mut published: Option<(u8, u32)> = None;
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
@@ -673,13 +673,13 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         mmio_write(far, EINT_PEND, 1 << 3);
         ferros_sys::irq_ack(cap(grants, S_IRQ));
         if now().wrapping_sub(said) > 32 * f {
-            say!(grants, "gnss: the last 32 s: HOST_REQ {} times, MCU_RESP silent {}, {} bytes read; {} frames, {} fixes in all\n", asks, silent, bytes, d.frames, d.fixes);
+            say!(grants, "gps: the last 32 s: HOST_REQ {} times, MCU_RESP silent {}, {} bytes read; {} frames, {} fixes in all\n", asks, silent, bytes, d.frames, d.fixes);
             (asks, silent, bytes, said) = (0, 0, 0, now());
         }
         if d.fixes > shown {
             if shown == 0 {
                 // Coarse on the console on purpose: the precise fix is for the endpoint, not the log.
-                say!(grants, "gnss: first fix {} ms after power-up, ±{} m (lat {}.{} lon {}.{})\n", d.fix_at.wrapping_sub(t_all) * 1000 / f, d.fix.err, d.fix.lat >> 23, ((d.fix.lat.unsigned_abs() & 0x7F_FFFF) * 10) >> 23, d.fix.lon >> 23, ((d.fix.lon.unsigned_abs() & 0x7F_FFFF) * 10) >> 23);
+                say!(grants, "gps: first fix {} ms after power-up, ±{} m (lat {}.{} lon {}.{})\n", d.fix_at.wrapping_sub(t_all) * 1000 / f, d.fix.err, d.fix.lat >> 23, ((d.fix.lat.unsigned_abs() & 0x7F_FFFF) * 10) >> 23, d.fix.lon >> 23, ((d.fix.lon.unsigned_abs() & 0x7F_FFFF) * 10) >> 23);
                 keep_last(grants, &d);
                 kept_at = now();
             }
@@ -696,7 +696,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             keep_last(grants, &d);
             kept_at = now();
         }
-        let n = recv(cap(grants, S_GNSS), &mut msg, &mut token, true);
+        let n = recv(cap(grants, S_GPS), &mut msg, &mut token, true);
         if n != NOTHING && n != ferros_sys::ERR && n > 0 {
             match msg[0] {
                 0 => {
@@ -714,7 +714,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     chip.set(NSTANDBY, false);
                     let ok = ferros_sys::power(cap(grants, S_POWER), false);
                     reply(&token, &[ok as u8]);
-                    say!(grants, "gnss: stopped after {} fixes\n", d.fixes);
+                    say!(grants, "gps: stopped after {} fixes\n", d.fixes);
                     ferros_sys::exit(0);
                 }
                 _ => {

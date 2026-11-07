@@ -78,7 +78,7 @@ pub const PREF_LAYOUT: u64 = 12;
 pub const PREF_UNLOCK_AT_BOOT: u64 = 13;
 /// Preference 14: the UI scale an active app lays its page out by, a signed byte of 64ths of an octave: its layout unit times 2^(s/64), 0 one, -64 a half, 64 twice (a pinch inside an open circle sets it; owner, 2026-11-05).
 pub const PREF_SCALE: u64 = 14;
-/// Preference 15: the radios switched off, a bit each in the facts' order (fact 32: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GNSS); the status circles toggle them (owner, 2026-11-07). The kernel stops a radio's driver while its bit is set and starts it again when it clears.
+/// Preference 15: the radios switched off, a bit each in the facts' order (fact 32: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS); the status circles toggle them (owner, 2026-11-07). The kernel stops a radio's driver while its bit is set and starts it again when it clears.
 pub const PREF_RADIOS_OFF: u64 = 15;
 
 /// The UI scale as set (preference 14): 64ths of an octave, signed; the factor is 2^(s/64).
@@ -153,11 +153,11 @@ pub mod measure {
     /// The modulation and coding scheme index, and the spatial streams.
     pub const MCS: u16 = 17;
     pub const STREAMS: u16 = 18;
-    /// GNSS: satellites tracked, satellites in the fix, the best carrier to noise (milli-dB-Hz).
+    /// GPS: satellites tracked, satellites in the fix, the best carrier to noise (milli-dB-Hz).
     pub const SATS_SEEN: u16 = 19;
     pub const SATS_USED: u16 = 20;
     pub const CN0: u16 = 21;
-    /// GNSS: the fix's horizontal error estimate, mm.
+    /// GPS: the fix's horizontal error estimate, mm.
     pub const ACCURACY: u16 = 22;
 }
 pub const MEASURE_NONE: u64 = u64::MAX;
@@ -170,7 +170,7 @@ pub const TECH_LTE: u8 = 14;
 pub const TECH_NR: u8 = 20;
 pub const TECH_BT: u8 = 32;
 pub const TECH_NFC: u8 = 33;
-pub const TECH_GNSS: u8 = 34;
+pub const TECH_GPS: u8 = 34;
 pub const TECH_USB: u8 = 35;
 /// One measure's word: the kind, and the value in its low 48 bits (two's complement; a driver's measures fit, the widest being a rate in bit/s).
 pub fn measure_word(kind: u16, value: i64) -> u64 {
@@ -180,7 +180,7 @@ pub fn measure_word(kind: u16, value: i64) -> u64 {
 pub fn measure_of(w: u64) -> Option<(u16, i64)> {
     if w == MEASURE_NONE { None } else { Some(((w >> 48) as u16, (w << 16) as i64 >> 16)) }
 }
-/// Set this driver's measure slot `slot` (0-7) to `word` (`measure_word`, or `MEASURE_NONE` to empty it). Only the modem, pcie1, bt, nfc, gnss and usb drivers have slots; anyone else gets ERR.
+/// Set this driver's measure slot `slot` (0-7) to `word` (`measure_word`, or `MEASURE_NONE` to empty it). Only the modem, pcie1, bt, nfc, gps and usb drivers have slots; anyone else gets ERR.
 pub fn status(slot: u64, word: u64) -> u64 {
     svc(nr::STATUS, slot, word, 0, 0, 0)
 }

@@ -26,13 +26,13 @@ The personality of each USI (UART/SPI/I2C) is a 3-bit SW_CONF field in its sysco
 The hunt is by elimination: the unclaimed controllers are spi_0, spi_5, spi_6, spi_9, spi_10, spi_11, spi_13, spi_15 and spi_22; whichever of those the secure world has switched to SPI (with Trusty live) is the fingerprint's.
 
 ## The hunt: which USI, by elimination
-ferros already drives this exact s3c64xx IP on the HSI0 bus (spi.rs: touch on USI2, the amps on USI1, GNSS on USI3), so once the fingerprint's controller is known, driving it is just a new `Port` with that bus's clock path.
+ferros already drives this exact s3c64xx IP on the HSI0 bus (spi.rs: touch on USI2, the amps on USI1, GPS on USI3), so once the fingerprint's controller is known, driving it is just a new `Port` with that bus's clock path.
 The problem is finding it: the sensor's SPI pins are not in the tree, so we identify the controller by elimination.
 
 `diag fp` (fp.rs) scans every USI the normal world can name across PERIC0, PERIC1 and HSI0, read-only:
 0. It reads a known normal-world block (USI0 UART, the console) as a control, so a fault in the scan cannot be blamed on a broken probe.
 1. For each USI it reads the SW_CONF personality from the syscon (always clocked), and for any USI that is configured (SW_CONF non-zero, hence clocked) it also reads the SPI block's CH_CFG/MODE_CFG/STATUS.
-2. It flags any controller in SPI mode that no known device owns (the camera's I2C USIs, the eSE, UWB, amps, touch and GNSS are labelled) - the odd one out is the fingerprint.
+2. It flags any controller in SPI mode that no known device owns (the camera's I2C USIs, the eSE, UWB, amps, touch and GPS are labelled) - the odd one out is the fingerprint.
 
 On the handoff build the synchronous-abort fault sink is terminal by design (main.rs `.Lexc_recover` warm-resets to preserve the report).
 fp.rs disarms that sink for the window of each read and restores it after, so a secure-locked read skip-and-counts and `probe32` reports it as a fault instead of resetting the phone.
@@ -69,7 +69,7 @@ Getting raw frames means reversing that protocol (logic analyser or careful regi
 ## Result (2026-10-29, scan run with Trusty + Android live)
 The handoff USB service watchdog-resets during bring-up (it never enumerates to answer `diag fp` interactively), so the scan was carried out in the ramoops report block instead: `fp::scan_to_report` (behind `FERROS_FP_SCAN`) writes each USI's SW_CONF into r[6..8] early in `entry_usb`, and the watchdog bounce back to Android prints it.
 
-The scan validated against all eleven known controllers: the camera's I2C (spi_1/2/3/4/14) read I2C, and the eSE (spi_12), UWB (spi_18), amps (spi_19), touch (spi_20), GNSS (spi_21) read SPI.
+The scan validated against all eleven known controllers: the camera's I2C (spi_1/2/3/4/14) read I2C, and the eSE (spi_12), UWB (spi_18), amps (spi_19), touch (spi_20), GPS (spi_21) read SPI.
 
 **No unclaimed USI is in SPI mode, even with the secure world live.** The unclaimed controllers read: spi_5/6/13/15/22 reset/none; spi_0/9/11 I2C (other buses); and spi_10 (PERIC1, gpp20) **faulted** — its SW_CONF at sysreg_peric1+0x08 is not readable from NS-EL2 while its neighbours (spi_0 +0x00, spi_9 +0x04) read fine.
 

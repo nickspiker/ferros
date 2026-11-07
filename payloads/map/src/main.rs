@@ -382,7 +382,7 @@ const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 const DEV_TAPS: u8 = 12;
 const DEV_HINT: u8 = 4;
 /// The radios and USB in the kernel's facts order (facts 33 + 8 · link, ferros_sys::measure), as the Connections page names them.
-const LINKS: [&str; 6] = ["cellular", "WiFi", "Bluetooth", "NFC", "GNSS", "USB"];
+const LINKS: [&str; 6] = ["cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB"];
 
 /// The four bases in the order the chooser shows them: the house base first.
 const BASES: [u8; 4] = [12, 0x8C, 10, 16];

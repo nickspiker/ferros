@@ -2295,7 +2295,7 @@ enum Corner {
     Wifi,
     Bluetooth,
     Nfc,
-    Gnss,
+    Gps,
     Usb,
     Battery,
     Home,
@@ -2352,7 +2352,7 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
     let mut n = 0;
     // Each corner: (left?, top?, middle, along the horizontal edge, along the vertical edge, the next along the horizontal edge). The indicators up top, navigation at the bottom (owner, 2026-11-03); IP is no radio, its measures are the links'. Bluetooth has more to show than NFC, so it takes the larger place, the next along the top (owner, 2026-11-04).
     let jobs = [
-        (true, true, Corner::Clock, Corner::Battery, Corner::Usb, Some(Corner::Gnss)),
+        (true, true, Corner::Clock, Corner::Battery, Corner::Usb, Some(Corner::Gps)),
         (false, true, Corner::Cellular, Corner::Wifi, Corner::Nfc, Some(Corner::Bluetooth)),
         (true, false, Corner::Back, Corner::Spare, Corner::Spare, None),
         (false, false, Corner::Home, Corner::Spare, Corner::Spare, None),
@@ -2470,7 +2470,7 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
     (out, n)
 }
 
-/// Each radio's flavour (owner, 2026-11-03: "throw some of that in the design"), picked in VSF RGB and scaled to the light of the grey they replace by VSF's photopic weights (R 0.2584, G 0.6346, B 0.1070, vsf_rgb_to_photopic_f32): the ring at RING_ON's light (0.3017 linear), the name at INK's (0.4507; periwinkle tops out at 0.388, its blue full). As working values, gamma 2 white at Q14. Cellular amber, a warm thing that carries far; WiFi sea teal, the near water; Bluetooth periwinkle; NFC lime, a touch; GNSS dusk magenta, the sky it listens to. The rest grey, equal codes (illuminant E).
+/// Each radio's flavour (owner, 2026-11-03: "throw some of that in the design"), picked in VSF RGB and scaled to the light of the grey they replace by VSF's photopic weights (R 0.2584, G 0.6346, B 0.1070, vsf_rgb_to_photopic_f32): the ring at RING_ON's light (0.3017 linear), the name at INK's (0.4507; periwinkle tops out at 0.388, its blue full). As working values, gamma 2 white at Q14. Cellular amber, a warm thing that carries far; WiFi sea teal, the near water; Bluetooth periwinkle; NFC lime, a touch; GPS dusk magenta, the sky it listens to. The rest grey, equal codes (illuminant E).
 fn flavour(what: Corner) -> ((f32, f32, f32), (f32, f32, f32)) {
     const RING_ON: f32 = 9000.0;
     const INK: f32 = 11000.0;
@@ -2479,7 +2479,7 @@ fn flavour(what: Corner) -> ((f32, f32, f32), (f32, f32, f32)) {
         Corner::Wifi => ((2706.0, 10480.0, 9373.0), (3307.0, 12809.0, 11456.0)),
         Corner::Bluetooth => ((8549.0, 7915.0, 14451.0), (9693.0, 8974.0, 16384.0)),
         Corner::Nfc => ((6893.0, 10276.0, 3980.0), (8425.0, 12560.0, 4864.0)),
-        Corner::Gnss => ((12831.0, 6415.0, 10735.0), (15682.0, 7841.0, 13121.0)),
+        Corner::Gps => ((12831.0, 6415.0, 10735.0), (15682.0, 7841.0, 13121.0)),
         _ => ((RING_ON, RING_ON, RING_ON), (INK, INK, INK)),
     }
 }
@@ -2910,7 +2910,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             Corner::Wifi => radios & 2 != 0,
             Corner::Bluetooth => radios & 4 != 0,
             Corner::Nfc => radios & 8 != 0,
-            Corner::Gnss => radios & 16 != 0,
+            Corner::Gps => radios & 16 != 0,
             // The usb driver's own word (its measure STATE): connected once the host configured it.
             Corner::Usb => ferros_sys::measure_of(facts[33 + 8 * 5]) == Some((ferros_sys::measure::STATE, 2)),
             // The gauge answered (facts 1-4, the kernel's two-second poll of the MAX77759 on hsi2c_11).
@@ -2923,7 +2923,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             Corner::Wifi => Some(1),
             Corner::Bluetooth => Some(2),
             Corner::Nfc => Some(3),
-            Corner::Gnss => Some(4),
+            Corner::Gps => Some(4),
             Corner::Usb => Some(5),
             _ => None,
         };
@@ -2993,7 +2993,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 Corner::Wifi => "wifi",
                 Corner::Bluetooth => "bt",
                 Corner::Nfc => "nfc",
-                Corner::Gnss => "gnss",
+                Corner::Gps => "gps",
                 Corner::Usb => "usb",
                 Corner::Battery if charge.n > 0 => charge.str(),
                 Corner::Battery => "batt",
@@ -3215,7 +3215,7 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         if op == 41 && n >= 5 {
-            // Which console circle is at this point: [x u16][y u16] → the radio's bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GNSS), or G#FF for none or a circle that is not a radio. The map asks it on a tap in the top rows, to switch that radio (preference 15).
+            // Which console circle is at this point: [x u16][y u16] → the radio's bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS), or G#FF for none or a circle that is not a radio. The map asks it on a tap in the top rows, to switch that radio (preference 15).
             let (w, h) = unsafe { SCREEN_WH };
             let (x, y) = (u16::from_le_bytes([msg[1], msg[2]]) as f32 + 0.5, u16::from_le_bytes([msg[3], msg[4]]) as f32 + 0.5);
             let (circles, cn) = corner_layout(w as usize, h as usize);
@@ -3227,7 +3227,7 @@ extern "C" fn receive(grants: u64) -> ! {
                         Corner::Wifi => 1,
                         Corner::Bluetooth => 2,
                         Corner::Nfc => 3,
-                        Corner::Gnss => 4,
+                        Corner::Gps => 4,
                         _ => 0xFF,
                     };
                 }

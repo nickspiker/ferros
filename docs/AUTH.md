@@ -10,7 +10,7 @@ The vault holds two classes of entry.
 
 | What | Vault names |
 |---|---|
-| Drivers and firmware | the capsules (`display`, `touch`, `pcie1`, `ip`, `modem`, `nfc`, `bt`, …), `wifi.fw`, `wifi.nvram`, `wifi.clm`, `gnss.*` |
+| Drivers and firmware | the capsules (`display`, `touch`, `pcie1`, `ip`, `modem`, `nfc`, `bt`, …), `wifi.fw`, `wifi.nvram`, `wifi.clm`, `gps.*` |
 | The attest front end | the `display`, `touch`, `ahau` capsules |
 | Hardware-owned settings | `device` (SETTINGS.md): language, number base, time zone, keyboard layout, brightness, dither, theme, proximity wake, unlock at boot |
 | The device's own bookkeeping | `sealed`, the kernel's reserved names (`\0…`): the name list, the device-only secret, the binding flag, the identity class's address list |
@@ -23,7 +23,7 @@ The vault holds two classes of entry.
 | fgtw (the identity service) | `fgtw.*`: the chain and fleet key when kept, its phonebook |
 | The attest screen's own | `ahau.*` |
 | Networks | `wifi.cred` (networks travel with the person; the per-network MAC stays the device's, from the ira) |
-| Where the device has been | `gnss.last`, the GNSS driver's last fix (2026-11-04). No GPS runs while nobody has attested. The replays the chip is aided from (`gnss.replay`, `gnss.replay.sky`) stay device class: Broadcom's firmware, gpsd's configuration and the orbits. Their position messages are zeroed (the gnss driver's scrub, input G#02), so they keep no place. |
+| Where the device has been | `gps.last`, the GPS driver's last fix (2026-11-04). No GPS runs while nobody has attested. The replays the chip is aided from (`gps.replay`, `gps.replay.sky`) stay device class: Broadcom's firmware, gpsd's configuration and the orbits. Their position messages are zeroed (the gps driver's scrub, input G#02), so they keep no place. |
 | Next | the person's installed apps (their capsules), device pairings (car, headphones), every app's data |
 
 The rule is in `kvault.rs` `IDENTITY`: a name under one of those prefixes is identity class, and everything else is device class.
@@ -160,7 +160,7 @@ No GPS runs while nobody has attested, with one exception: locate, for a lost or
   - It sends the sealed fix over the cellular link: while locked, `ip` lets only the locate responder open a connection, and only to fgtw.org.
   - It then drops the fix from memory and powers the GPS off. Nothing readable is ever stored.
   - With no network, it may keep the sealed fix to send later: the device cannot open it, only the fleet's private key can.
-- **A cold start.** There is no remembered position while locked (`gnss.last` is the person's), so the first fix starts cold (5-8 minutes, GNSS.md). The WiFi access points and cell towers it sees can go in the same sealed answer for a rough place indoors.
+- **A cold start.** There is no remembered position while locked (`gps.last` is the person's), so the first fix starts cold (5-8 minutes, GPS.md). The WiFi access points and cell towers it sees can go in the same sealed answer for a rough place indoors.
 - **Later: a crowd relay over BLE.** The locked device beacons under rotating keys that only its fleet can link. Other ferros and Photon devices that hear it report their own position, sealed to that fleet. This works with no network on the lost device at all.
 - **Only a bound device has locate.** An unbound one has no fleet to answer to.
 

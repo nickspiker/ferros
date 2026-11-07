@@ -93,7 +93,7 @@ pub const RADIOS: [Radio; 7] = [
     Radio { name: "NR", console_r: 109., flavour: q14(12107., 8121., 3424.), turn: 0.75, conj: true, phase: 0.75, bands: ["FR1 low", "FR1 mid", "FR2 mmWave"] },
     Radio { name: "Bluetooth", console_r: 67., flavour: q14(8549., 7915., 14451.), turn: 0.125, conj: true, phase: 0.125, bands: ["LE 1M", "LE 2M", "LE coded"] },
     Radio { name: "NFC", console_r: 33., flavour: q14(6893., 10276., 3980.), turn: 0., conj: false, phase: 0., bands: ["A", "B", "F"] },
-    Radio { name: "GNSS", console_r: 65., flavour: q14(12831., 6415., 10735.), turn: 0.375, conj: false, phase: 0.625, bands: ["L1", "L5", "L1 + L5"] },
+    Radio { name: "GPS", console_r: 65., flavour: q14(12831., 6415., 10735.), turn: 0.375, conj: false, phase: 0.625, bands: ["L1", "L5", "L1 + L5"] },
     Radio { name: "USB", console_r: 49., flavour: q14(9000., 9000., 9000.), turn: 0.5, conj: true, phase: 0.375, bands: ["USB 2", "USB 3", "USB 3 x2"] },
 ];
 

@@ -97,7 +97,7 @@ The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by t
   - **The endpoint is the kernel's.** Nothing may be granted `use vault`. Serving it needs the vault right (`Grant::Vault`, `bridge spawn --vault`). A call made while the vault opens waits for it.
   - **Migration.** The vault right's call (`SYS_VAULT`, 30) hands the vault each old entry of a scope with its domain keys (the one exception to keys only against a live call). The vault writes the entry into its domain and, once committed, the kernel removes it from its own vault. It runs before the first request after anything may have left old entries: boot, a bridge `store put` of a scoped name, a write while no vault served, an unlock. Names the kernel reads itself (`aoc.fw.*`) stay in the kernel's vault.
   - **Boot.** The kernel starts the vault before init (`start_home`; init's grants page is full) from the capsule `vault` in its own vault. `diag restart vault` restarts it.
-  - **Measured.** 21 device entries (the WiFi, GPU and GNSS files and the AoC registry scripts, 2.98 MB) moved in 594 ms. `payloads/vaulttest`, through the ordinary store calls on a `test` scope:
+  - **Measured.** 21 device entries (the WiFi, GPU and GPS files and the AoC registry scripts, 2.98 MB) moved in 594 ms. `payloads/vaulttest`, through the ordinary store calls on a `test` scope:
     - a 6 MiB value (past the old 3 MiB limit) written in 843 ms and read back in 648 ms, the same by BLAKE3;
     - names, delete and absent all hold.
   - **After a reboot.** The vault opens in 139 ms; the GPU boots from `gpu.fw` and the sensors process loads its 15 scripts, both from the vault.

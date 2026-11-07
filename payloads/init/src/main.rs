@@ -149,9 +149,9 @@ extern "C" fn keeper(arg: u64) -> ! {
     }
 }
 
-/// Whether a radio's driver is switched off (preference 15, the status circles; owner 2026-11-07): the bit in the facts' order, cellular, WiFi, Bluetooth, NFC, GNSS. Not a radio: never.
+/// Whether a radio's driver is switched off (preference 15, the status circles; owner 2026-11-07): the bit in the facts' order, cellular, WiFi, Bluetooth, NFC, GPS. Not a radio: never.
 fn switched_off(name: &[u8]) -> bool {
-    const RADIOS: [&[u8]; 5] = [b"modem", b"pcie1", b"bt", b"nfc", b"gnss"];
+    const RADIOS: [&[u8]; 5] = [b"modem", b"pcie1", b"bt", b"nfc", b"gps"];
     RADIOS.iter().position(|r| *r == name).is_some_and(|i| ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) >> i & 1 == 1)
 }
 

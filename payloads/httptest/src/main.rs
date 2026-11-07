@@ -1,7 +1,7 @@
 //! A TCP client on ferros's network stack: looks a host up (AAAA first, over the IPv6 DNS server when ip has one; then A) through the DNS server ip reports (UDP), fetches a path over plain HTTP (the `ip` process's client TCP), and prints the status line, the byte count, the time and an FNV-1a 64 of the body to compare with a fetch on the host.
 //!
 //! Spawn after `ip`: ferros-bridge spawn httptest.bin [hex of "host/path"] --name httptest --use udp
-//! With no input it fetches Broadcom's GNSS orbit file, gllto2.glpals.com/7day/v5/latest/lto2.dat (GNSS.md). Grant slots: 0 console, 1 udp (use).
+//! With no input it fetches Broadcom's GPS orbit file, gllto2.glpals.com/7day/v5/latest/lto2.dat (GPS.md). Grant slots: 0 console, 1 udp (use).
 //! Prefixes on the input: `!` the cellular link only (ip's LINK mode, given back at the end), `~` IPv4 only.
 
 #![no_std]

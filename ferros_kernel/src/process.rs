@@ -764,7 +764,7 @@ const SYS_PT: u64 = 25;
 const DMA_ADDR: u64 = 1 << 63;
 /// sensors(cap, op, offset, len): the sensors process (sensorlink.rs). Op 0 publishes the block of `len` bytes at `offset` in the caller's arc (at least sensorlink `BYTES`) → 0 or ERR. Op 1 → the board's CDT | MLB << 32 from the device tree (usf.rs `read_board`), for the registry scripts.
 const SYS_SENSORS: u64 = 26;
-/// status(slot, word): one of a radio driver's eight measure slots for the corners' circles (WINDOWS.md), SYS_FACTS 33-80, eight words a link: the link is the caller's own, by its name (modem, pcie1, bt, nfc, gnss, usb), so no capability; anyone else, or a slot past 7, gets ERR. A word is a tagged measure (ferros_sys::measure: the kind in bits 48-63, the value in its unit below), all ones empty; the kernel keeps the words and reads none of them.
+/// status(slot, word): one of a radio driver's eight measure slots for the corners' circles (WINDOWS.md), SYS_FACTS 33-80, eight words a link: the link is the caller's own, by its name (modem, pcie1, bt, nfc, gps, usb), so no capability; anyone else, or a slot past 7, gets ERR. A word is a tagged measure (ferros_sys::measure: the kind in bits 48-63, the value in its unit below), all ones empty; the kernel keeps the words and reads none of them.
 const SYS_STATUS: u64 = 27;
 pub static STATUS: [[core::sync::atomic::AtomicU64; 8]; 6] = [const { [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 8] }; 6];
 /// pet(): the process is alive and going round its main loop (the process watchdog, measuring: the kernel records the longest stretch between two pets, `diag pets`). → 0.
@@ -794,8 +794,8 @@ pub static IRQS: &[IrqLine] = &[
     IrqLine { name: "decon0-frame-done", intid: IRQ_DECON0_FRAME_DONE },
     // DECON0's frame-start: the trigger took and the frame is going out (what the display's `settle` waits for).
     IrqLine { name: "decon0-frame-start", intid: IRQ_DECON0_FRAME_START },
-    // The GNSS chip's HOST_REQ ("I have data"): gpa5-3, EINT53 in the far-alive bank, its own line (zuma.h IRQ_ALIVE_EINT53 = SPI 63), level high.
-    IrqLine { name: "gnss-host-req", intid: 32 + 63 },
+    // The GPS chip's HOST_REQ ("I have data"): gpa5-3, EINT53 in the far-alive bank, its own line (zuma.h IRQ_ALIVE_EINT53 = SPI 63), level high.
+    IrqLine { name: "gps-host-req", intid: 32 + 63 },
     // The USB controller (DWC3): zuma IRQ_USB32DRD_GIC_0_HSI0, SPI 402, level high.
     IrqLine { name: "usb-dwc3", intid: 32 + 402 },
     // The GPU (zuma.h IRQ_G3D_IRQ*_G3D, zuma-gpu.dtsi, level high): its GPU-control line (resets, power transitions, cache flushes), its job line (the CSF firmware's global and group interfaces), its MMU line (page faults), SPI 346-348.
@@ -874,7 +874,7 @@ pub const LAYOUTS: u8 = 2;
 pub const PREF_UNLOCK_AT_BOOT: usize = 13;
 /// Preference 14: the UI scale every active app lays its page out by (owner, 2026-11-05: a pinch inside an open circle, "you can easily scale any app any time"), a signed byte of 64ths of an octave: the unit times 2^(s/64), 0 the default (one), from -64 (a half) to 64 (twice).
 pub const PREF_SCALE: usize = 14;
-/// Preference 15: the radios switched off (ferros_sys::PREF_RADIOS_OFF), a bit each: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GNSS. Kept in the device document; the service loop stops and starts the drivers by it.
+/// Preference 15: the radios switched off (ferros_sys::PREF_RADIOS_OFF), a bit each: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS. Kept in the device document; the service loop stops and starts the drivers by it.
 pub const PREF_RADIOS_OFF: usize = 15;
 /// The UI scale's reach either way, 64ths of an octave: half to twice (proposed 2026-11-05, the owner's to change).
 pub const SCALE_REACH: i8 = 64;
@@ -1110,8 +1110,8 @@ pub static WINDOWS: &[BlockWindow] = &[BlockWindow { name: "vault", offset: 1 <<
 pub static STORES: &[StoreScope] = &[
     // The map's own state: the arrangement the owner made by hand.
     StoreScope { name: "map", prefix: "map." },
-    // The GNSS driver's: its session replay (`gnss.replay`, `gnss.replay.sky`) and its last fix (`gnss.last`).
-    StoreScope { name: "gnss", prefix: "gnss." },
+    // The GPS driver's: its session replay (`gps.replay`, `gps.replay.sky`) and its last fix (`gps.last`).
+    StoreScope { name: "gps", prefix: "gps." },
     // The WiFi driver's: its firmware (`wifi.fw`), NVRAM text (`wifi.nvram`), CLM blob (`wifi.clm`) and the network credential (`wifi.cred`; secret, never printed).
     StoreScope { name: "wifi", prefix: "wifi." },
     // The identity service's (payloads/fgtw, part of attest): the identity roots pushed at pairing (`fgtw.identity_seed`, `fgtw.handle_proof`; secret), the fleet chain and key once bound (`fgtw.chain`, `fgtw.fleet_key`).
@@ -1455,7 +1455,7 @@ pub static HARDWARE: &[Hw] = &[
     // Its clocks, rails and reset are not here on purpose: they are the `touch` power switch (`POWERS`, touch.rs `power`: ACPM and the HSI0 CMU).
     Hw { name: "usi2-spi", base: 0x111D_0000, size: 0x1000, via_el3: false },
     Hw { name: "gpio-gpn0", base: 0x1506_0000, size: 0x1000, via_el3: false },
-    // The GNSS chip (GNSS.md): HSI0 USI3's SPI port (spi_21). Its lines are in banks already above: HOST_REQ in gpio-far-alive (gpa5), MCU_REQ in gpio-gpp0 (gpp4, +G#80), MCU_RESP and nSTANDBY in gpio-hsi2 (gph3). Rails, clocks and pin modes are the kernel's (`POWERS`).
+    // The GPS chip (GPS.md): HSI0 USI3's SPI port (spi_21). Its lines are in banks already above: HOST_REQ in gpio-far-alive (gpa5), MCU_REQ in gpio-gpp0 (gpp4, +G#80), MCU_RESP and nSTANDBY in gpio-hsi2 (gph3). Rails, clocks and pin modes are the kernel's (`POWERS`).
     Hw { name: "usi3-spi", base: 0x111E_0000, size: 0x1000, via_el3: false },
     // The NFC controller (docs/NFC.md): hsi2c_0, the bus it shares with the vibration motor (whose driver is the kernel's diag, never running beside the `nfc` process). Its interrupt line gpa7-6 is read in gpio-alive, above. Pin modes, the reset and the clock pad are the kernel's (`POWERS`).
     Hw { name: "hsi2c0", base: 0x10C8_0000, size: 0x1000, via_el3: false },
@@ -1468,7 +1468,7 @@ pub struct PowerSwitch {
     pub name: &'static str,
     pub set: fn(bool) -> bool,
 }
-pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gnss", set: crate::gnss::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }];
+pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gps", set: crate::gps::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }];
 const ERR: u64 = u64::MAX;
 /// What a polling `recv` returns when no message is waiting.
 pub const NOTHING: u64 = u64::MAX - 1;
@@ -2005,7 +2005,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
             0
         }
         SYS_STATUS => {
-            let slot = [b"modem" as &[u8], b"pcie1", b"bt", b"nfc", b"gnss", b"usb"].iter().position(|n| *n == p.name.as_slice());
+            let slot = [b"modem" as &[u8], b"pcie1", b"bt", b"nfc", b"gps", b"usb"].iter().position(|n| *n == p.name.as_slice());
             f.x[0] = match slot {
                 // The slot comes from the process: bounded so a bad one is refused, not a write past the radio's eight.
                 Some(i) if f.x[0] < 8 => {

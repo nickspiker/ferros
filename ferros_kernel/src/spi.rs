@@ -24,8 +24,8 @@ const SYSREG_HSI0: usize = 0x1102_0000;
 pub const TOUCH: Port = Port { base: 0x111D_0000, usi_mode: SYSREG_HSI0 + 0x101C, mux: CMU_HSI0 + 0x101C, div: CMU_HSI0 + 0x181C, gates: [CMU_HSI0 + 0x2120, CMU_HSI0 + 0x20FC, CMU_HSI0 + 0x2100, CMU_HSI0 + 0x20BC], qch: CMU_HSI0 + 0x30CC, mode: 0, fb: 0 };
 /// spi_19, HSI0 USI1: the two CS35L41 speaker amplifiers (CS0 native, CS1 = gpn1-0).
 pub const AMPS: Port = Port { base: 0x111C_0000, usi_mode: SYSREG_HSI0 + 0x1018, mux: CMU_HSI0 + 0x1018, div: CMU_HSI0 + 0x1818, gates: [CMU_HSI0 + 0x211C, CMU_HSI0 + 0x20F4, CMU_HSI0 + 0x20F8, CMU_HSI0 + 0x20B0], qch: CMU_HSI0 + 0x30C8, mode: 0, fb: 0 };
-/// spi_21, HSI0 USI3: the GNSS chip (BCM4776; zuma-board-gps.dtsi: mode 3, feedback delay 1, 26 MHz at most; cmucal-sfr.c for the clock path).
-pub const GNSS: Port = Port { base: 0x111E_0000, usi_mode: SYSREG_HSI0 + 0x1020, mux: CMU_HSI0 + 0x1020, div: CMU_HSI0 + 0x1820, gates: [CMU_HSI0 + 0x2124, CMU_HSI0 + 0x2104, CMU_HSI0 + 0x2108, CMU_HSI0 + 0x20D0], qch: CMU_HSI0 + 0x30D0, mode: 0xC, fb: 1 };
+/// spi_21, HSI0 USI3: the GPS chip (BCM4776; zuma-board-gps.dtsi: mode 3, feedback delay 1, 26 MHz at most; cmucal-sfr.c for the clock path).
+pub const GPS: Port = Port { base: 0x111E_0000, usi_mode: SYSREG_HSI0 + 0x1020, mux: CMU_HSI0 + 0x1020, div: CMU_HSI0 + 0x1820, gates: [CMU_HSI0 + 0x2124, CMU_HSI0 + 0x2104, CMU_HSI0 + 0x2108, CMU_HSI0 + 0x20D0], qch: CMU_HSI0 + 0x30D0, mode: 0xC, fb: 1 };
 
 /// Chip select: the controller's own nSS, or a GPIO (bank base, pin), active low, with the native nSS held inactive.
 #[derive(Clone, Copy)]
@@ -167,7 +167,7 @@ impl Port {
         Ok(())
     }
 
-    /// Full duplex, one chip-select-wrapped transfer of up to 64 bytes: `tx` out while `rx` (same length) comes in — for protocols that answer in the same clocks (the GNSS chip's SSI framing).
+    /// Full duplex, one chip-select-wrapped transfer of up to 64 bytes: `tx` out while `rx` (same length) comes in — for protocols that answer in the same clocks (the GPS chip's SSI framing).
     pub fn duplex(&self, cs: Cs, tx: &[u8], rx: &mut [u8]) -> Result<(), &'static str> {
         let b = self.base;
         let n = tx.len().min(rx.len());
@@ -205,7 +205,7 @@ impl Port {
         r
     }
 
-    /// Full duplex of any length under one native chip select: `tx` out and as many bytes into `rx`, the FIFOs topped up and drained as they go (at most 32 bytes in flight, inside either FIFO) — `duplex` loads the whole transfer into the TX FIFO at once and is for transfers that fit it. The GNSS chip's SSI frames run to 8 KB (gnss.rs).
+    /// Full duplex of any length under one native chip select: `tx` out and as many bytes into `rx`, the FIFOs topped up and drained as they go (at most 32 bytes in flight, inside either FIFO) — `duplex` loads the whole transfer into the TX FIFO at once and is for transfers that fit it. The GPS chip's SSI frames run to 8 KB (gps.rs).
     pub fn stream(&self, tx: &[u8], rx: &mut [u8]) -> Result<(), &'static str> {
         let b = self.base;
         let n = tx.len().min(rx.len());

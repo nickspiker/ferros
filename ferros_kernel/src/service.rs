@@ -712,8 +712,8 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     v[31] = crate::ready::GATE_TELEMETRY.load(Relaxed) & 0xFF;
     // 30: whether the DPU's power domains are on (2) or down (1: Android's DECON hibernation at a jump, or ferros's own `dpu off`; never touch DECON or DSIM then, the EL3 poison rule in display.rs, until the `dpu` switch has powered it). Read through EL3, which is safe.
     v[30] = 1 + crate::display::dpu_on() as u64;
-    // 32: the radios' drivers running, a bit each (the corners' circles, WINDOWS.md): 0 modem (cellular), 1 pcie1 (WiFi), 2 bt, 3 nfc, 4 gnss, 5 ip.
-    v[32] = crate::process::named_alive_locked(&[b"modem", b"pcie1", b"bt", b"nfc", b"gnss", b"ip"]);
+    // 32: the radios' drivers running, a bit each (the corners' circles, WINDOWS.md): 0 modem (cellular), 1 pcie1 (WiFi), 2 bt, 3 nfc, 4 gps, 5 ip.
+    v[32] = crate::process::named_alive_locked(&[b"modem", b"pcie1", b"bt", b"nfc", b"gps", b"ip"]);
     // 83: whether a person is present (an identity unlocked: 2 yes, 1 no; kvault PERSON), so the radios' drivers can refuse what only a person may start while locked (AUTH.md "Radios while locked").
     v[83] = 1 + crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) as u64;
     // 84: which board (ferros_kernel board.rs): 1 husky (Pixel 8 Pro), 2 akita (Pixel 8a). For the drivers whose part differs between them (the touch controller).
@@ -1225,10 +1225,10 @@ pub fn run(mut b: Boot) -> ! {
     platform::mark(0x3A);
     loop {
         platform::pet_watchdogs();
-        // A status circle tapped (preference 15, owner 2026-11-07): a radio switched off has its driver stopped and, where the kernel holds its power switch (Bluetooth, NFC, GNSS), its chip powered down; switched on, its driver starts again from its capsule. Cellular and WiFi have no kernel switch: their drivers stop, the modem staying as it was until a power-down of its own exists.
+        // A status circle tapped (preference 15, owner 2026-11-07): a radio switched off has its driver stopped and, where the kernel holds its power switch (Bluetooth, NFC, GPS), its chip powered down; switched on, its driver starts again from its capsule. Cellular and WiFi have no kernel switch: their drivers stop, the modem staying as it was until a power-down of its own exists.
         let radios_off = crate::process::pref(crate::process::PREF_RADIOS_OFF) & 0x1F;
         if radios_off != radios_applied {
-            const DRIVERS: [&[u8]; 5] = [b"modem", b"pcie1", b"bt", b"nfc", b"gnss"];
+            const DRIVERS: [&[u8]; 5] = [b"modem", b"pcie1", b"bt", b"nfc", b"gps"];
             for (i, name) in DRIVERS.iter().enumerate() {
                 let bit = 1u8 << i;
                 if radios_off & bit != 0 && radios_applied & bit == 0 {
@@ -1236,7 +1236,7 @@ pub fn run(mut b: Boot) -> ! {
                     let powered_down = match i {
                         2 => crate::bt::power(false),
                         3 => crate::nfc::power(false),
-                        4 => crate::gnss::power(false),
+                        4 => crate::gps::power(false),
                         _ => false,
                     };
                     crate::flashlog::line(&alloc::format!("radio {} switched off: driver {}, power {}", core::str::from_utf8(name).unwrap_or("?"), if killed { "stopped" } else { "was not running" }, if powered_down { "down" } else { "left" }));
@@ -1918,9 +1918,9 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                if cmd.params == b"gnss off" {
-                    // `diag gnss off`: the chip powered down, for a GNSS driver that died with it on (gnss.rs). Everything else about the chip is the driver's (payloads/gnss, tools/husky-gnss.sh): the kernel's bring-up tools left with the move (KERNEL-OUT.md decision 4).
-                    crate::gnss::off(&mut resp);
+                if cmd.params == b"gps off" {
+                    // `diag gps off`: the chip powered down, for a GPS driver that died with it on (gps.rs). Everything else about the chip is the driver's (payloads/gps, tools/husky-gps.sh): the kernel's bring-up tools left with the move (KERNEL-OUT.md decision 4).
+                    crate::gps::off(&mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }

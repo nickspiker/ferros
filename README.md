@@ -101,7 +101,7 @@ Half of MITRE's vulnerability database becomes **irrelevant**, not mitigated.
 - **Microkernel isolation** - Drivers in userspace, can't crash kernel
 - **No cleanup required** - Failed drivers simply restart
 - **Hot-swap support** - Load/unload without system impact
-- **Rust drivers, vendor firmware behind them** - Every driver is Rust in its own process. The radios (WiFi, cellular, Bluetooth, NFC, GNSS) and the sensor hub run their vendors' closed firmware on their own cores; ferros loads it as data, grants the device its memory window, and trusts nothing it says
+- **Rust drivers, vendor firmware behind them** - Every driver is Rust in its own process. The radios (WiFi, cellular, Bluetooth, NFC, GPS) and the sensor hub run their vendors' closed firmware on their own cores; ferros loads it as data, grants the device its memory window, and trusts nothing it says
 
 ### Cryptographic Stack
 - **Keys in hardware** - Never in RAM, even encrypted
@@ -147,7 +147,7 @@ ferros targets ARM devices today and custom silicon tomorrow. x86 is explicitly 
 - **Identity:** the ira from on-die entropy sources, keys held in CPU registers, an attest screen at boot, no identity = no device
 - **Storage:** the vault on UFS (two mirrored regions, sealed values), and Android's f2fs read-only
 - **Display:** the display server owns the panel (every mode, 60/120 Hz, AOD, 10 bpc), with a home map of circles and the honeycomb keyboard
-- **Radios:** WiFi (WPA2, IPv4/IPv6, UDP and TCP), cellular data (Verizon LTE/NR), Bluetooth, NFC, GNSS fixes
+- **Radios:** WiFi (WPA2, IPv4/IPv6, UDP and TCP), cellular data (Verizon LTE/NR), Bluetooth, NFC, GPS fixes
 - **Peripherals:** touch, 39 of 41 sensors through the AoC, the main camera (RAW10 into VSF), haptics, the TPU's firmware
 - **GPU:** the Mali-G715 runs as a resident service, with Valhall kernels built from Rust and the attest mark drawn on the GPU
 - **Apps:** Rust std on the device; the full Photon app runs on it

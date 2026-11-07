@@ -1,6 +1,6 @@
-//! gtrace: a freestanding ptrace syscall tracer for aarch64 Linux (Android, no libc, no NDK), for capturing what Broadcom's lhd says to the GNSS chip.
+//! gtrace: a freestanding ptrace syscall tracer for aarch64 Linux (Android, no libc, no NDK), for capturing what Broadcom's lhd says to the GPS chip.
 //! Usage: gtrace <out file> <seconds> <program> [args...]
-//! Spawns the program under ptrace (following its threads and children), logs every openat/close, and for files whose path names the chip (ttyBCM, bbd, gnss, gps, nstandby, spi) every read/write/pread/pwrite with its bytes and every ioctl, as text lines:
+//! Spawns the program under ptrace (following its threads and children), logs every openat/close, and for files whose path names the chip (ttyBCM, bbd, gps, gps, nstandby, spi) every read/write/pread/pwrite with its bytes and every ioctl, as text lines:
 //!   <monotonic ns> <tid> <call> fd=<fd> <path> ret=<ret> [<hex bytes>]
 //! After <seconds> it kills the program and exits.
 #![no_std]

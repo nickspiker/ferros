@@ -1,4 +1,4 @@
-//! GNSS: the Broadcom BCM4776 (L1 + L5) on spi_21 (HSI0 USI3, G#111E_0000, mode 3), Google's bcm47765 driver (google-modules/gps/broadcom/bcm47765) and the board's zuma-board-gps.dtsi; the plan and its evidence in GNSS.md.
+//! GPS: the Broadcom BCM4776 (L1 + L5) on spi_21 (HSI0 USI3, G#111E_0000, mode 3), Google's bcm47765 driver (google-modules/gps/broadcom/bcm47765) and the board's zuma-board-gps.dtsi; the plan and its evidence in GPS.md.
 //!
 //! The chip runs from ROM plus a RAM patch the host downloads every boot (/vendor/firmware/SensorHub.patch). Four lines: HOST_REQ gpa5-3 (in, the chip has data), MCU_REQ gpp4-3 (out, the AP wants the chip awake), MCU_RESP gph3-2 (in, the chip is awake), nSTANDBY gph3-3 (out, high = run; its only power/reset control). Three sub-PMIC rails: L9S_GNSS_CORE (G#37), L10S_GNSS_RF (G#38), L11S_GNSS_AUX (G#39) — enable bit 7, voltage bits 5:0.
 
@@ -36,7 +36,7 @@ fn set_dat(p: (usize, u32), high: bool) {
     let (bank, n) = p;
     wr(bank + 4, if high { rd(bank + 4) | 1 << n } else { rd(bank + 4) & !(1 << n) });
 }
-/// The GNSS driver's power switch (process.rs `POWERS`, `SYS_POWER`): on = the lines' modes (MCU_REQ and nSTANDBY outputs, low; MCU_RESP and HOST_REQ inputs), the three rails on at their programmed voltages, the SPI port's clocks and USI mode; the driver then raises nSTANDBY itself. Off = MCU_REQ and nSTANDBY low, the rails off.
+/// The GPS driver's power switch (process.rs `POWERS`, `SYS_POWER`): on = the lines' modes (MCU_REQ and nSTANDBY outputs, low; MCU_RESP and HOST_REQ inputs), the three rails on at their programmed voltages, the SPI port's clocks and USI mode; the driver then raises nSTANDBY itself. Off = MCU_REQ and nSTANDBY low, the rails off.
 pub fn power(on: bool) -> bool {
     set_dat(MCU_REQ, false);
     set_dat(NSTANDBY, false);
@@ -54,13 +54,13 @@ pub fn power(on: bool) -> bool {
     }
     if on {
         ms(5);
-        crate::spi::GNSS.up();
+        crate::spi::GPS.up();
     }
     ok
 }
 
-/// `diag gnss off`: the chip powered down (the driver's own STOP does the same; this is for a driver that died with the chip on).
+/// `diag gps off`: the chip powered down (the driver's own STOP does the same; this is for a driver that died with the chip on).
 pub fn off(out: &mut alloc::vec::Vec<u8>) {
     let ok = power(false);
-    out.extend_from_slice(alloc::format!("GNSS rails off: {ok}\n").as_bytes());
+    out.extend_from_slice(alloc::format!("GPS rails off: {ok}\n").as_bytes());
 }

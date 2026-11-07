@@ -130,7 +130,7 @@ The device circle never lights. Lit means a person sent you something, and the d
 2. **Lumis.** The camera works cold: a live viewfinder in its circle, a tap to take, the frame kept as VSF with the camera's own IDT. The camera code moves out of the kernel's diagnostics into a driver process that serves frames, and Lumis holds that capability. The hardware chord for capture (2026-10-16) opens Lumis from anywhere.
 3. **Opsin**, the recording side: what Lumis kept, viewed in its true colour (the IDT and the pinned panel profile), once sound or a sequence of frames is there to record.
 4. **Photon**: people and threads as circles, placed beside each other once and never moved. It needs WiFi (up), photon_core (host-tested), and the owner's enrollment. Each person is a circle; a thread opens in place.
-5. **Mahere**, the map: needs position (GNSS, not yet up) and its tiles.
+5. **Mahere**, the map: needs position (GPS, not yet up) and its tiles.
 
 ### The open questions above, answered as proposals
 

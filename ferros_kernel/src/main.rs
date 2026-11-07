@@ -64,7 +64,7 @@ mod smp;
 mod rtc;
 mod aoc;
 mod haptics;
-mod gnss;
+mod gps;
 mod nfc;
 mod bt;
 mod gsa;
