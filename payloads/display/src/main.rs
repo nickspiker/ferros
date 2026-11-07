@@ -1623,8 +1623,14 @@ static mut ARENA_WORDS: usize = (6 << 20) / 8;
 static mut WALL_BUF: usize = 0;
 /// Whether `WALL_BUF` holds a finished wallpaper (publishing puts it under the canvas only then).
 static mut WALL_ON: bool = false;
-/// The wallpaper being made from a seed, a band of rows each pass of the render loop so nothing waits on it: what the seed decided (`wallpaper::params`, worked out once) and the next row.
-static mut WALL_MAKING: Option<(wallpaper::Params, usize)> = None;
+/// A seed waiting to be made into the wallpaper: the render loop starts the job when none is running (one job at a time, so its threads never write a wallpaper being replaced).
+static mut WALL_PENDING: Option<[u8; 32]> = None;
+/// The job's choices (`wallpaper::params`, worked out once by the render loop as it starts the job), read by its threads.
+static mut WALL_P: Option<wallpaper::Params> = None;
+/// The refining mask (a bit a pixel, `wallpaper::mask_stride` bytes a row), allocated at the first job and kept.
+static mut WALL_MASK: usize = 0;
+/// Whether a job is running (set by the render loop as it starts one, cleared when it sees the job done).
+static mut WALL_RUNNING: bool = false;
 const SPRITE_MAX: usize = 1100;
 
 /// Circle i's sprite for this key: reused if it is current, else drawn (into its own space if that is big enough, otherwise new space, the arena started over when full). The sprite is d × d pixels with the circle at its centre pixel, followed by d words of row extents (first | last << 16, both inclusive; first > last for an empty row). Returns the sprite's words and extents.
@@ -2566,8 +2572,109 @@ fn measure_text(t: &mut Txt, kind: u16, v: i64) {
     };
 }
 
-/// Rows of the wallpaper made each pass of the render loop while it is being made from a seed (`WALL_MAKING`).
+/// Rows read a band when the person's own wallpaper is read from the vault (`wall_own`).
 const WALL_ROWS: usize = 1 << 6;
+
+/// The wallpaper's threads (owner, 2026-11-07: twelve seconds on the render thread alone was too long). Besides the render loop, which never waits on them, they take bands of rows of the job's three passes: drawing (one sample a pixel), marking (the pixels whose colour differs from a neighbour's, `wallpaper::mark_rows`), and refining (those again at 4 × 4 samples, `wallpaper::refine_rows`). A band is claimed by a compare-and-swap on (pass, next band), so the cores' different rates even out, and whoever finishes a pass's last band moves the job to the next pass and wakes the others. Marking reads the finished first pass and writes only its own rows' bits; refining writes only its own rows; no band ever writes what another reads, and the picture is the same however the bands fall.
+const WALL_THREADS: usize = 4;
+/// Rows a band.
+const WALL_BAND: usize = 1 << 5;
+static mut WALL_STACKS: [[u8; 1 << 15]; WALL_THREADS] = [[0; 1 << 15]; WALL_THREADS];
+/// The pass (bits 16-23: 0 drawing, 1 marking, 2 refining, 3 none running) and its next band (bits 0-15).
+static WALL_CLAIM: AtomicU64 = AtomicU64::new(3 << 16);
+/// Bands of the current pass finished.
+static WALL_DONE: AtomicU64 = AtomicU64::new(0);
+/// Passes finished, ever: the render loop counts from the job's start to see the first pass done and the last.
+static WALL_PASSES: AtomicU64 = AtomicU64::new(0);
+/// `WALL_PASSES` when the running job started, and the counter then (for its timing line).
+static mut WALL_BASE: (u64, u64) = (0, 0);
+
+extern "C" fn wall_thread(_idx: u64) -> ! {
+    loop {
+        let c = WALL_CLAIM.load(Ordering::Acquire);
+        let (pass, band) = ((c >> 16) & 0xFF, (c & 0xFFFF) as usize);
+        if pass >= 3 {
+            ferros_sys::wait(&WALL_CLAIM, c, 0);
+            continue;
+        }
+        // The job's choices, set by the render loop before it opened the first pass.
+        let Some(p) = (unsafe { WALL_P }) else { panic!("wallpaper: a pass with no job") };
+        let bands = p.height.div_ceil(WALL_BAND);
+        if band >= bands {
+            ferros_sys::wait(&WALL_CLAIM, c, 0);
+            continue;
+        }
+        if WALL_CLAIM.compare_exchange(c, c + 1, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            continue;
+        }
+        wall_band(&p, pass, band);
+        if WALL_DONE.fetch_add(1, Ordering::AcqRel) + 1 == bands as u64 {
+            // The pass's last band: every band of it is claimed and finished, so the count starts again for the next.
+            WALL_DONE.store(0, Ordering::Release);
+            WALL_CLAIM.store((pass + 1) << 16, Ordering::Release);
+            WALL_PASSES.fetch_add(1, Ordering::AcqRel);
+            ferros_sys::wake(&WALL_CLAIM, WALL_THREADS as u64);
+        }
+    }
+}
+
+/// One band of one pass of the wallpaper job `p`.
+fn wall_band(p: &wallpaper::Params, pass: u64, band: usize) {
+    let (w, h) = (p.width, p.height);
+    // The last band stops at the frame's bottom.
+    let rows = band * WALL_BAND..((band + 1) * WALL_BAND).min(h);
+    let stride = wallpaper::mask_stride(w);
+    let (buf, mask) = unsafe { (WALL_BUF as *mut u64, WALL_MASK as *mut u8) };
+    let n = rows.len();
+    unsafe {
+        let mine = core::slice::from_raw_parts_mut(buf.add(rows.start * w), n * w);
+        let bits = core::slice::from_raw_parts_mut(mask.add(rows.start * stride), n * stride);
+        match pass {
+            0 => wallpaper::render_rows(p, rows, mine),
+            1 => wallpaper::mark_rows(p, core::slice::from_raw_parts(buf, w * h), rows, bits),
+            _ => wallpaper::refine_rows(p, rows, bits, mine),
+        }
+    }
+}
+
+/// The render loop's side of the wallpaper job, each pass of the loop: a waiting seed starts a job when none runs; the first pass done shows the wallpaper, the refining done shows it again. Each with its time to the console.
+fn wall_step(grants: u64, width: usize, height: usize) {
+    unsafe {
+        if !WALL_RUNNING {
+            let Some(seed) = (*(&raw mut WALL_PENDING)).take() else { return };
+            if WALL_MASK == 0 {
+                WALL_MASK = alloc::vec![0u8; wallpaper::mask_stride(width) * height].leak().as_mut_ptr() as usize;
+            }
+            WALL_ON = false;
+            WALL_P = Some(wallpaper::params(&seed, width, height));
+            WALL_BASE = (WALL_PASSES.load(Ordering::Acquire), now());
+            WALL_RUNNING = true;
+            WALL_DONE.store(0, Ordering::Release);
+            WALL_CLAIM.store(0, Ordering::Release);
+            ferros_sys::wake(&WALL_CLAIM, WALL_THREADS as u64);
+            return;
+        }
+        let done = WALL_PASSES.load(Ordering::Acquire) - WALL_BASE.0;
+        let ms = |l: &mut Log| l.dec(ferros_sys::us_since(WALL_BASE.1) / 1000);
+        if done >= 1 && !WALL_ON {
+            wall_ready(width, height);
+            let mut l = Log { grants, buf: [0; 256], n: 0 };
+            l.s(b"display: wallpaper drawn in ");
+            ms(&mut l);
+            l.s(b" ms; refining\n");
+            l.flush();
+        }
+        if done >= 3 {
+            wall_ready(width, height);
+            WALL_RUNNING = false;
+            let mut l = Log { grants, buf: [0; 256], n: 0 };
+            l.s(b"display: wallpaper refined in ");
+            ms(&mut l);
+            l.s(b" ms\n");
+            l.flush();
+        }
+    }
+}
 
 /// The wallpaper is finished: publishing puts it under the canvas from now, and every phase owes the whole screen so the next frames show it.
 fn wall_ready(width: usize, height: usize) {
@@ -3475,6 +3582,13 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         log.s(b"display: no panel thread\n");
         log.flush();
     }
+    // The wallpaper's threads, idle until a job (`wall_thread`); spawned before the render thread pins itself to the big core, so they run on any.
+    for i in 0..WALL_THREADS {
+        if ferros_sys::thread_spawn(wall_thread, unsafe { &mut (*(&raw mut WALL_STACKS))[i] }, i as u64) != 0 {
+            log.s(b"display: no wallpaper thread\n");
+            log.flush();
+        }
+    }
     for i in 0..PUB_WORKERS {
         if ferros_sys::thread_spawn(pub_worker, unsafe { &mut (*(&raw mut PUB_STACKS))[i] }, i as u64) != 0 {
             log.s(b"display: no publish worker\n");
@@ -4055,7 +4169,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     }
                 }
                 // 30 `capture`: the frame as it is composed for the panel (windows, the corners, the glass) but in working values, before the panel's table and dither, into a surface no window holds; replies its physical address as text, `G#…` (tools/screencap reads it; the reply holds 16 bytes). With no window up the canvas is the screen: replies `canvas`.
-                // 42 `wallpaper` [seed 32]: a person attested, and this is their wallpaper seed (the attest screen derives it from their identity seed; the same on every device of theirs). Their own wallpaper if they set one (`map.wallpaper`, in their space, readable now), else the one made from the seed, a band of rows a pass (`WALL_MAKING`); until it is ready the home screen shows none. Replies 0, or 1 with no wallpaper buffer.
+                // 42 `wallpaper` [seed 32]: a person attested, and this is their wallpaper seed (the attest screen derives it from their identity seed; the same on every device of theirs). Their own wallpaper if they set one (`map.wallpaper`, in their space, readable now), else the one made from the seed, by its threads (`wall_thread`, started from the render loop: `wall_step`); until the first pass is drawn the home screen shows none. Replies 0, or 1 with no wallpaper buffer.
                 Some(42) if m.len() >= 33 => {
                     if unsafe { WALL_BUF } == 0 {
                         out[0] = 1;
@@ -4068,7 +4182,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             wall_ready(width, height);
                         } else {
                             console(grants, b"display: wallpaper: made from the person's seed\n");
-                            unsafe { WALL_MAKING = Some((wallpaper::params(&seed, width, height), 0)) };
+                            unsafe { WALL_PENDING = Some(seed) };
                         }
                     }
                 }
@@ -4375,16 +4489,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 // The idle fill republishes every phase within an eighth of a second of the last window op.
                 windows_changed(width, height);
             }
-            // The person's wallpaper being made from their seed: a band of rows a pass, so the loop never waits on it; finished, it is ready (`wall_ready`). The last band stops at the screen's bottom.
-            if let Some((p, row)) = WALL_MAKING {
-                let next = (row + WALL_ROWS).min(height);
-                let band = core::slice::from_raw_parts_mut((WALL_BUF as *mut u64).add(row * width), (next - row) * width);
-                wallpaper::render_rows(&p, row..next, band);
-                WALL_MAKING = if next < height { Some((p, next)) } else { None };
-                if next == height {
-                    wall_ready(width, height);
-                }
-            }
+            // The person's wallpaper: its job started, shown and finished from here (`wall_step`); its threads do the drawing.
+            wall_step(grants, width, height);
             // The bars on every screen (in front of the home screen and of every app): each redrawn when what it shows changed, and its rows into every phase.
             let console_new = console_draw(width, height, false);
             let helm_new = helm_draw(width, height);

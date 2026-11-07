@@ -218,6 +218,73 @@ pub fn render_rows(p: &Params, rows: Range<usize>, out: &mut [u64]) {
     }
 }
 
+/// The refining pass's samples a side in a marked pixel (4 × 4, owner 2026-11-07).
+pub const REFINE: usize = 1 << 2;
+/// A pixel is marked for refining when any channel differs from one of its four neighbours' by more than this, in working value units (white is 16384): 1/64 of white.
+const EDGE: u64 = 1 << 8;
+
+/// The bytes a row of the refining mask takes: a bit a pixel.
+pub fn mask_stride(width: usize) -> usize {
+    (width + 7) / 8
+}
+
+/// Marks the pixels of `rows` that the refining pass samples again: those whose colour in the finished first pass (`frame`, the whole frame) differs from one of their four neighbours' by more than EDGE in any channel. A bit each into `mask`, which holds exactly these rows (`rows.len() × mask_stride(width)` bytes, first row first). It reads only the frame and writes only these rows' bits, so bands are marked side by side, and the marks are the same however the bands are shared out.
+pub fn mark_rows(p: &Params, frame: &[u64], rows: Range<usize>, mask: &mut [u8]) {
+    let (w, h, stride) = (p.width, p.height, mask_stride(p.width));
+    // A mismatched buffer is the caller's bug: fail loud.
+    assert_eq!(frame.len(), w * h);
+    assert_eq!(mask.len(), rows.len() * stride);
+    mask.fill(0);
+    let differ = |a: u64, b: u64| (0..3).any(|c| ((a >> (16 * c)) & 0xFFFF).abs_diff((b >> (16 * c)) & 0xFFFF) > EDGE);
+    for (k, y) in rows.enumerate() {
+        for x in 0..w {
+            let a = frame[y * w + x];
+            // The neighbours that exist: a pixel on the frame's edge has fewer.
+            let edge = (x > 0 && differ(a, frame[y * w + x - 1])) || (x + 1 < w && differ(a, frame[y * w + x + 1])) || (y > 0 && differ(a, frame[(y - 1) * w + x])) || (y + 1 < h && differ(a, frame[(y + 1) * w + x]));
+            if edge {
+                mask[k * stride + x / 8] |= 1 << (x % 8);
+            }
+        }
+    }
+}
+
+/// The refining pass over `rows`: each pixel marked in `mask` (these rows' bits, as `mark_rows` made them) drawn again as the mean of REFINE × REFINE samples spread evenly across it, into `out` (these rows' pixels). The far layer is a soft glow, so it is sampled once at the pixel's centre. The mean is of working codes, as the layers are mixed.
+pub fn refine_rows(p: &Params, rows: Range<usize>, mask: &[u8], out: &mut [u64]) {
+    let (w, stride) = (p.width, mask_stride(p.width));
+    assert_eq!(out.len(), rows.len() * w);
+    assert_eq!(mask.len(), rows.len() * stride);
+    let f = Frame::new(p);
+    let far_ds = f.views[FAR_VIEW].2;
+    let n = (REFINE * REFINE) as f32;
+    for (k, y) in rows.enumerate() {
+        for x in 0..w {
+            if mask[k * stride + x / 8] >> (x % 8) & 1 == 0 {
+                continue;
+            }
+            let (cx, cy) = (x as f32 + 0.5 - f.half[0], y as f32 + 0.5 - f.half[1]);
+            let (zx, zy) = f.z_at(FAR_VIEW, cx, cy);
+            let t = orbit(zx, zy, p.c[0], p.c[1]).d * far_ds * FAR_INV;
+            let far = 1. / (1. + t * t);
+            let mut sum = [0f32; 3];
+            // A row of samples at a time through `orbit4` (REFINE is its four lanes).
+            for j in 0..REFINE {
+                let fy = y as f32 + (j as f32 + 0.5) / REFINE as f32 - f.half[1];
+                let fxs: [f32; REFINE] = core::array::from_fn(|i| x as f32 + (i as f32 + 0.5) / REFINE as f32 - f.half[0]);
+                let (mut zx, mut zy) = ([0f32; 4], [0f32; 4]);
+                for i in 0..REFINE {
+                    (zx[i], zy[i]) = f.z_at(NEAR_VIEW, fxs[i], fy);
+                }
+                let o = orbit4(zx, zy, p.c[0], p.c[1]);
+                for i in 0..REFINE {
+                    let c = f.colour(fxs[i], fy, o[i], far);
+                    sum = [sum[0] + c[0], sum[1] + c[1], sum[2] + c[2]];
+                }
+            }
+            out[k * w + x] = pack([sum[0] / n, sum[1] / n, sum[2] / n]);
+        }
+    }
+}
+
 /// Packs a colour in working codes (√light, white at 1) into a working value: the code × 16384, opaque.
 /// Every colour mixed is a convex combination of the palette's codes, at most 1, times factors at most 1 (the lamp, the flame's darkening), so each channel is at most 16384 and fits its 16 bits.
 #[inline]
@@ -536,9 +603,13 @@ impl<'a> Frame<'a> {
     /// The plane under pixel (x, y) in view `v`.
     #[inline]
     fn z(&self, v: usize, x: usize, y: usize) -> (f32, f32) {
+        self.z_at(v, x as f32 + 0.5 - self.half[0], y as f32 + 0.5 - self.half[1])
+    }
+
+    /// The plane in view `v` at (fx, fy) pixels from the frame's centre (any fraction: the refining pass samples inside a pixel).
+    #[inline]
+    fn z_at(&self, v: usize, fx: f32, fy: f32) -> (f32, f32) {
         let (centre, step, _) = self.views[v];
-        let fx = x as f32 + 0.5 - self.half[0];
-        let fy = y as f32 + 0.5 - self.half[1];
         (centre[0] + fx * step[0] - fy * step[1], centre[1] + fx * step[1] + fy * step[0])
     }
 
@@ -572,16 +643,14 @@ impl<'a> Frame<'a> {
             let t = o.d * far_ds * FAR_INV;
             line[x] = (1. / (1. + t * t)).to_bits() as u64;
         });
-        self.each(NEAR_VIEW, y, |x, o| line[x] = pack(self.colour(x, y, o, f32::from_bits(line[x] as u32))));
+        self.each(NEAR_VIEW, y, |x, o| line[x] = pack(self.colour(x as f32 + 0.5 - self.half[0], y as f32 + 0.5 - self.half[1], o, f32::from_bits(line[x] as u32))));
     }
 
     /// Pixel (x, y)'s linear light, from its near orbit and the far layer's weight there.
     /// Front to back (owner's rule, AGENT.md "Compositing: Front to Back, `under` Only"): each layer a colour at its weight α, taking its share of the light that is still uncovered (`t`), which it then covers by α; the frontmost goes first: the warm sparks, the white-hot core, the filament, the sheen, the halo, the flame's glow, the far layer, the field's shade, and the background last, opaque, so every pixel's light is a convex sum of the palette's.
     #[inline]
-    fn colour(&self, x: usize, y: usize, o: Orbit, far: f32) -> [f32; 3] {
+    fn colour(&self, fx: f32, fy: f32, o: Orbit, far: f32) -> [f32; 3] {
         let p = self.p;
-        let fx = x as f32 + 0.5 - self.half[0];
-        let fy = y as f32 + 0.5 - self.half[1];
         let v = (libm::log2f(1. + o.n) - p.l_lo) * p.l_inv;
         let ds = o.d * self.views[NEAR_VIEW].2;
         let map = |t: f32| gmap(&p.stops, t);
@@ -946,6 +1015,36 @@ mod tests {
                 assert!((px >> (16 * c)) & 0xFFFF <= 16384);
             }
         }
+    }
+
+    /// Marking and refining in bands gives the same pixels as over the whole frame, refining changes only marked pixels, and the share refined is reported.
+    #[test]
+    fn refine_banded() {
+        let (w, h) = (336, 748);
+        let p = params(&seed_of(23), w, h);
+        let mut first = vec![0u64; w * h];
+        render_rows(&p, 0..h, &mut first);
+        let s = mask_stride(w);
+        let mut mask = vec![0u8; h * s];
+        mark_rows(&p, &first, 0..h, &mut mask);
+        let mut whole = first.clone();
+        refine_rows(&p, 0..h, &mask, &mut whole);
+        let mut banded = first.clone();
+        for y0 in (0..h).step_by(64) {
+            let y1 = (y0 + 64).min(h);
+            let mut m = vec![0u8; (y1 - y0) * s];
+            mark_rows(&p, &first, y0..y1, &mut m);
+            assert_eq!(m[..], mask[y0 * s..y1 * s]);
+            refine_rows(&p, y0..y1, &m, &mut banded[y0 * w..y1 * w]);
+        }
+        assert_eq!(hash(&whole), hash(&banded));
+        let marked = mask.iter().map(|b| b.count_ones()).sum::<u32>();
+        for i in 0..w * h {
+            if mask[i / w * s + (i % w) / 8] >> (i % w % 8) & 1 == 0 {
+                assert_eq!(whole[i], first[i]);
+            }
+        }
+        println!("refined {} of {} pixels ({:.1} %)", marked, w * h, 100. * marked as f64 / (w * h) as f64);
     }
 
     /// The device's composition, for a handful of seeds: each passes the survey (the example `validate` runs many more, built for speed).
