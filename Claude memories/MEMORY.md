@@ -130,3 +130,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [GPU role: layers](gpu_role_layers.md) — owner 2026-11-05: GPU produces compute-dense layers (Mandelbrot/tapuwae, glows) into a shared CPU-cacheable/GPU-coherent arena; under + present stay NEON; no wholesale switching
 - [FGTW is a DUNA; buyers are the rūnanga](fgtw_duna_runanga.md) — Wyoming DUNA, nobody owns it; service buyers = assembly members; member unit open (2026-11-05)
 - [Feedback: Photon is the full app](feedback_photon_is_the_full_app.md) — one Photon on every platform (std/photon); no photon_core/stripped copy; FGTW = attest, identity, OS sync (2026-11-05)
+- [Pixel 8a (akita)](akita_pixel8a.md) — second ferros device (unlocked, pKVM off, "could be anyone's"); per-unit partitions backed up 2026-11-06; Magisk root on slot b; board split + probes in docs/BOARDS.md; hv runs on slot b (flash with an AVB footer: ferros-mkimg avb-footer)
