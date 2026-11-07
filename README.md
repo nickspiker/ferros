@@ -10,6 +10,13 @@ ferros is a mobile operating system distilled down to what an OS is, written in 
 
 **Not Android with modifications. Not Linux for mobile. The inherited assumptions removed until only the operating system is left.**
 
+## Daily Use
+
+ferros is the author's daily driver on a Pixel 8 Pro, alongside Android on the same device. Android runs under ferros's own hypervisor, and one chord (power + volume up) freezes it and jumps to ferros.
+
+- **On ferros:** Photon, the full app built for ferros's Rust std target, plus Mahere and Lumis. No phone number exists on this side: the cellular link is data only, so the only people who can reach you are the ones Photon knows. Friends and family get through, telemarketers don't.
+- **On Android, until the APK sandbox lands:** apps that only ship for Android (school messaging, Chrome, Google Voice for a phone number). Android stays behind ferros's attestation; APKs will later be compiled on the device at install and run sandboxed under ferros instead.
+
 ## Key Innovations
 
 ### 🔄 Ring Memory Architecture
@@ -108,7 +115,7 @@ Half of MITRE's vulnerability database becomes **irrelevant**, not mitigated.
 ferros targets ARM devices today and custom silicon tomorrow. x86 is explicitly out of scope — Intel ME and AMD PSP are architectural backdoors, not bugs. RISC-V is the long-term target for fully auditable hardware.
 
 ### Development Targets
-- **Pixel 8 (Tensor G3)** - Primary dev target. ARMv9, `fastboot oem pkvm disable` gives EL2 ownership, full hardware access without fighting TrustZone
+- **Pixel 8 Pro (husky, Tensor G3)** - Primary target and daily driver. ARMv9, `fastboot oem pkvm disable` gives EL2 ownership, full hardware access without fighting TrustZone
 - **Apple M1 / Asahi** - Secondary dev target. m1n1 proxy gives live hardware exploration at EL2 without reflashing
 - **Any ARM device** - HAL trait abstraction means drivers are portable across supported hardware
 
@@ -132,38 +139,29 @@ ferros targets ARM devices today and custom silicon tomorrow. x86 is explicitly 
 
 ## Project Status
 
-**Current Phase:** ARM bring-up — Pixel 8 (Tensor G3) primary target
+**Running on the Pixel 8 Pro (husky) every day.** [docs/STATUS.md](docs/STATUS.md) has the detail and the dates; each subsystem has its own doc in [docs/](docs/).
 
-### Established on ARM (QCM6490 / Qualcomm)
-- Bare-metal aarch64 kernel boots (PE/COFF via ABL)
-- Framebuffer console (8x16 VGA font, 2x scaling, 1224x2700 AMOLED)
-- GENI UART TX
-- Pstore/ramoops log pipeline (warm reboot preserves DRAM)
-- SPMI PMIC access (flash LED, observer channel reads)
-- DPU register reads (splash framebuffer)
-- USB device enumeration (DWC3, VID G#1209 PID G#4665)
-- Bidirectional Photon Transport over USB (blast mode, per-chunk BLAKE3)
-- Hot-reload over USB (72KB kernel binary in <1s, no fastboot needed)
-- SD card read/write (4-bit bus, 400KHz, multi-block)
-- GCC clock controller, RPMh TCS power enable via cmd-db
-- DTB parsing for reserved-memory, bootargs, ramoops address
+### Works today
+- **Boot:** a cold boot straight from the bootloader (slot b, no Linux), killswitch armed first (Vol Up + Vol Down cuts power), an owner-key-signed boot gate, and the hypervisor's jump from a running Android into ferros
+- **Kernel:** EL0 processes with capability IPC on five cores (the kernel on the Cortex-X3), signed capsules, an install-time instruction checker with W^X arcs, and every DMA master fenced to ferros's own memory
+- **Identity:** the ira from on-die entropy sources, keys held in CPU registers, an attest screen at boot, no identity = no device
+- **Storage:** the vault on UFS (two mirrored regions, sealed values), and Android's f2fs read-only
+- **Display:** the display server owns the panel (every mode, 60/120 Hz, AOD, 10 bpc), with a home map of circles and the honeycomb keyboard
+- **Radios:** WiFi (WPA2, IPv4/IPv6, UDP and TCP), cellular data (Verizon LTE/NR), Bluetooth, NFC, GNSS fixes
+- **Peripherals:** touch, 39 of 41 sensors through the AoC, the main camera (RAW10 into VSF), haptics, the TPU's firmware
+- **GPU:** the Mali-G715 runs as a resident service, with Valhall kernels built from Rust and the attest mark drawn on the GPU
+- **Apps:** Rust std on the device; the full Photon app runs on it
+- **Power:** screen-on idle about 1.2 W (Android: 1.16 W)
 
-### In Progress (Pixel 8 / Tensor G3)
-- Comms bring-up: PT transport + ferros-bridge over USB
-- HAL trait split: `ferros_hal` traits, `ferros_hal_pixel8` implementation
-- Ledger: append-only VSF event ring (spec complete, implementation started)
-- USB driver: TRB ring for throughput, proper endpoint state machine
+### Next
+- 📋 The APK sandbox, so the remaining Android apps run under ferros
+- 📋 Audio out, the tele and front cameras
+- 📋 Drivers still in the kernel move out to processes (docs/KERNEL-OUT.md)
 
-### Planned (Next 6 Months)
-- 📋 VSF compositor alpha
-- 📋 Photon messenger beta
+### Planned (hardware)
 - 📋 Crypto coprocessor design (RISC-V extension or mesh)
-- 📋 Silicon layout (Chisel → RTL → GDS)
-
-### Planned (Next 12 Months)
-- 📋 Tapeout (RISC-V or mesh + crypto coprocessor)
-- 📋 Founders Edition manufacturing (1,000 units)
-- 📋 fgtw.org/portal opens for purchases
+- 📋 Silicon layout (Chisel → RTL → GDS) and tapeout
+- 📋 Founders Edition manufacturing (1,000 units), fgtw.org/portal opens for purchases
 - 📋 Production beta (Elite Edition, 10,000 units)
 
 ## Development Roadmap
@@ -197,25 +195,19 @@ ferros targets ARM devices today and custom silicon tomorrow. x86 is explicitly 
 **Requirements:**
 - Rust nightly (for inline assembly, no_std kernel)
 - aarch64-unknown-none target (`rustup target add aarch64-unknown-none`)
-- Android fastboot (for initial flash to ARM device)
-- nusb (Rust USB library, pulled by cargo)
+- Android platform tools (fastboot, adb)
+- A Pixel 8 Pro with an unlocked bootloader and `fastboot oem pkvm disable` (repeat it after every wipe)
 
 **Build kernel:**
 ```bash
 cargo build -p ferros_kernel --target aarch64-unknown-none --release
 ```
 
-**Create boot image:**
+**Build, sign, flash and boot (Pixel 8 Pro):**
 ```bash
-cargo run -p ferros-mkimg -- boot target/aarch64-unknown-none/release/ferros_kernel -o ferros.img
+tools/husky-cold.sh
 ```
-
-**Flash to device (Pixel 8 example):**
-```bash
-fastboot flash boot_a ferros.img
-fastboot set_active a
-fastboot reboot
-```
+This builds the image, flashes slot b (the gate plus ferros, signed), boots it, then flashes slot a. `tools/husky-cold.sh --android` makes slot a active and goes back to Android.
 
 **Hot-reload (no reboot needed):**
 ```bash
