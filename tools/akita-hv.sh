@@ -28,14 +28,16 @@ cargo build -q -p ferros_kernel --target aarch64-unknown-none --release
 aarch64-linux-gnu-objcopy -O binary target/aarch64-unknown-none/release/ferros_kernel $W/ferros.bin
 $MKIMG gate --hv $W/hv.bin --image $W/Image $([ $FERROS = 1 ] && echo --ferros $W/ferros.bin) --cmdline "${HV_CMDLINE:-}" -o $W/boot_b_hv.img
 echo "== image: $W/boot_b_hv.img ($(stat -c %s $W/boot_b_hv.img) bytes)"
+# The gate image with its own AVB footer, as the whole partition (mkimg avb-footer): bare, it would leave Google's footer at the partition's end pointing at G#FD_C000, inside this image, and ABL refuses the slot ("invalid vbmeta header", 2026-11-06).
+$MKIMG avb-footer --key /mnt/Harbor/Code/keys/avb.vsf --google-boot $BACKUP --image $W/boot_b_hv.img -o $W/boot_b_hv_part.img
 [ $FLASH = 1 ] || { echo "not flashing (add --flash)"; exit 0; }
 # To fastboot from wherever the 8a is.
 if lsusb -d 1209:4665 >/dev/null 2>&1; then timeout 60 target/debug/ferros-bridge reboot fastboot >/dev/null 2>&1 || true
 elif adb devices | grep -q "^$S"; then adb -s $S reboot bootloader || true; fi
 for i in $(seq 90); do command fastboot devices | grep -q "$S" && break; sleep 2; done
 command fastboot devices | grep -q "$S" || { echo "no fastboot"; exit 1; }
-if fastboot oem pkvm status 2>&1 | grep -q "pKVM is enabled"; then fastboot oem pkvm disable 2>&1 | grep -i pkvm || true; fi
-fastboot flash boot_b $W/boot_b_hv.img 2>&1 | tail -1
+[ "${SKIP_PKVM_CHECK:-0}" = 1 ] || if fastboot oem pkvm status 2>&1 | grep -q "pKVM is enabled"; then fastboot oem pkvm disable 2>&1 | grep -i pkvm || true; fi
+fastboot flash boot_b $W/boot_b_hv_part.img 2>&1 | tail -1
 fastboot --set-active=b 2>&1 | tail -1
 fastboot reboot >/dev/null 2>&1
 echo "== slot b under the hv: waiting for ferros (the gate's dev timer) or Android"

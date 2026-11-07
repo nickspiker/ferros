@@ -64,6 +64,7 @@ fn main() {
         "vbmeta-info" => cmd_vbmeta_info(&args[2..]),
         "avb-pubkey" => cmd_avb_pubkey(&args[2..]),
         "avb-sign" => cmd_avb_sign(&args[2..]),
+        "avb-footer" => cmd_avb_footer(&args[2..]),
         "gate" => cmd_gate(&args[2..]),
         "unpack-kernel" => cmd_unpack_kernel(&args[2..]),
         "help" | "--help" | "-h" => usage(),
@@ -90,6 +91,7 @@ fn usage() {
     eprintln!("  ferros-mkimg vbmeta-info <vbmeta.img>");
     eprintln!("  ferros-mkimg gate --hv <hv.bin> --image <Linux Image> [--ferros <ferros.bin>] [--cmdline <s>] -o <boot.img>");
     eprintln!("  ferros-mkimg unpack-kernel --boot <boot.img> -o <Image>");
+    eprintln!("  ferros-mkimg avb-footer --key <avb.vsf> --google-boot <boot.img> --image <boot.img> -o <partition.img>   (the image with its own footer, for an unlocked device)");
     eprintln!("  ferros-mkimg avb-sign --key <avb.vsf> --google-vbmeta <vbmeta.img> --google-boot <boot.img> --gate <gate.img> --out-vbmeta <vbmeta.img> --out-boot <boot.img>");
 }
 
@@ -852,6 +854,32 @@ fn cmd_vbmeta_info(args: &[String]) {
 }
 
 /// Both images a slot needs, made together so they cannot drift: the gate image as a whole boot partition with its own signed footer, and the top-level vbmeta whose boot chain names the same key. Each is checked as ABL will check it before anything is written.
+/// Any boot image as a whole `boot` partition with its own footer and signed vbmeta (avb::boot_partition), the partition as large as Google's boot image, nothing else touched: no top-level vbmeta, no avb_custom_key. For an unlocked device whose `boot` partition still ends in Google's footer (akita, 2026-11-06): flashing a bare image over it leaves that footer pointing at Google's vbmeta offset (G#FD_C000 on akita's slot b), and an image reaching past it buries that vbmeta under its own bytes, so ABL reads "invalid vbmeta header" and refuses the slot (`boot failure`) for that image and every smaller one flashed after it, until Google's whole image goes back. With a footer of its own the image always verifies to a key the device does not chain to, which an unlocked ABL lets boot (orange state); and ABL loads exactly the image's length, which a stale descriptor's would not.
+fn cmd_avb_footer(args: &[String]) {
+    let key = avb::load(&fs::read(arg(args, "--key")).unwrap_or_else(|e| die("key", e))).unwrap_or_else(|e| die("key", e));
+    let google_boot = fs::read(arg(args, "--google-boot")).unwrap_or_else(|e| die("google boot", e));
+    let image = fs::read(arg(args, "--image")).unwrap_or_else(|e| die("image", e));
+    let out = arg(args, "-o");
+    let (gb, _) = avb::find(&google_boot).unwrap_or_else(|e| die("google boot", e));
+    let gb = avb::parse(gb).unwrap_or_else(|e| die("google boot", e));
+    let salt: [u8; 32] = rand::random();
+    let part = avb::boot_partition(&image, google_boot.len(), &gb, &key, &salt).unwrap_or_else(|e| die("boot", e));
+    // Read back as ABL will: the footer finds the vbmeta, its hash and signature hold, and its digest is the image's.
+    let (bv, size) = avb::find(&part).unwrap_or_else(|e| die("boot (check)", e));
+    let bp = avb::parse(bv).unwrap();
+    let digest_ok = bp.descriptors.iter().filter_map(|d| avb::hash_of(d)).any(|(name, n, salt, digest)| {
+        let mut h = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut h, &salt);
+        sha2::Digest::update(&mut h, &part[..n as usize]);
+        name == "boot" && n as usize == image.len() && Some(n) == size && sha2::Digest::finalize(h).as_slice() == digest.as_slice()
+    });
+    if avb::hash_ok(bv) != Some(true) || !avb::signature_ok(bv).unwrap_or(false) || !digest_ok {
+        die("boot (check)", "the footer's vbmeta does not verify");
+    }
+    fs::write(&out, &part).unwrap_or_else(|e| die("write", e));
+    eprintln!("Wrote {out}: {} bytes of image in a {}-byte partition, footer and vbmeta checked", image.len(), part.len());
+}
+
 fn cmd_avb_sign(args: &[String]) {
     let key = avb::load(&fs::read(arg(args, "--key")).unwrap_or_else(|e| die("key", e))).unwrap_or_else(|e| die("key", e));
     let google_vbmeta = fs::read(arg(args, "--google-vbmeta")).unwrap_or_else(|e| die("google vbmeta", e));
