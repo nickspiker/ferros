@@ -80,6 +80,9 @@ pub struct Radio {
     pub phase: f64,
     /// The three bands' names.
     pub bands: [&'static str; 3],
+    /// A typical channel width, MHz, and constellation, bits a symbol (the knobs' starting points for this radio).
+    pub bw_mhz: f32,
+    pub qam_bits: u32,
 }
 
 const fn q14(r: f32, g: f32, b: f32) -> [f32; 3] {
@@ -88,13 +91,13 @@ const fn q14(r: f32, g: f32, b: f32) -> [f32; 3] {
 
 /// The seven radios, keys 0 to 6.
 pub const RADIOS: [Radio; 7] = [
-    Radio { name: "WiFi", console_r: 81., flavour: q14(0., 10918., 7075.), turn: 0., conj: false, phase: 0.5, bands: ["2.4 GHz", "5 GHz", "6 GHz"] },
-    Radio { name: "LTE", console_r: 109., flavour: q14(13932., 6972., 0.), turn: 0.25, conj: false, phase: 0.25, bands: ["low", "mid", "high"] },
-    Radio { name: "NR", console_r: 109., flavour: q14(13932., 6972., 0.), turn: 0.75, conj: true, phase: 0.75, bands: ["FR1 low", "FR1 mid", "FR2 mmWave"] },
-    Radio { name: "Bluetooth", console_r: 67., flavour: q14(0., 0., 16384.), turn: 0.125, conj: true, phase: 0.125, bands: ["LE 1M", "LE 2M", "LE coded"] },
-    Radio { name: "NFC", console_r: 33., flavour: q14(8160., 0., 16384.), turn: 0., conj: false, phase: 0., bands: ["A", "B", "F"] },
-    Radio { name: "GPS", console_r: 65., flavour: q14(0., 11298., 0.), turn: 0.375, conj: false, phase: 0.625, bands: ["L1", "L5", "L1 + L5"] },
-    Radio { name: "USB", console_r: 49., flavour: q14(16384., 0., 0.), turn: 0.5, conj: true, phase: 0.375, bands: ["USB 2", "USB 3", "USB 3 x2"] },
+    Radio { name: "WiFi", console_r: 81., flavour: q14(0., 10918., 7075.), turn: 0., conj: false, phase: 0.5, bands: ["2.4 GHz", "5 GHz", "6 GHz"], bw_mhz: 80., qam_bits: 8 },
+    Radio { name: "LTE", console_r: 109., flavour: q14(13932., 6972., 0.), turn: 0.25, conj: false, phase: 0.25, bands: ["low", "mid", "high"], bw_mhz: 20., qam_bits: 6 },
+    Radio { name: "NR", console_r: 109., flavour: q14(13932., 6972., 0.), turn: 0.75, conj: true, phase: 0.75, bands: ["FR1 low", "FR1 mid", "FR2 mmWave"], bw_mhz: 100., qam_bits: 8 },
+    Radio { name: "Bluetooth", console_r: 67., flavour: q14(0., 0., 16384.), turn: 0.125, conj: true, phase: 0.125, bands: ["LE 1M", "LE 2M", "LE coded"], bw_mhz: 2., qam_bits: 2 },
+    Radio { name: "NFC", console_r: 33., flavour: q14(8160., 0., 16384.), turn: 0., conj: false, phase: 0., bands: ["A", "B", "F"], bw_mhz: 1., qam_bits: 2 },
+    Radio { name: "GPS", console_r: 65., flavour: q14(0., 11298., 0.), turn: 0.375, conj: false, phase: 0.625, bands: ["L1", "L5", "L1 + L5"], bw_mhz: 2., qam_bits: 2 },
+    Radio { name: "USB", console_r: 49., flavour: q14(16384., 0., 0.), turn: 0.5, conj: true, phase: 0.375, bands: ["USB 2", "USB 3", "USB 3 x2"], bw_mhz: 512., qam_bits: 2 },
 ];
 
 /// Every knob, in its own unit.
@@ -122,12 +125,20 @@ pub struct Look {
     pub rssi_dbm: f32,
     pub noise_dbm: f32,
     pub band: u32,
+    /// The channel's width, log₂ of MHz: how far the phase swings the hue.
+    pub bw_log2: f32,
+    /// The constellation's bits a symbol (QAM 2^bits points on a square lattice).
+    pub qam_bits: u32,
     pub loss_pct: f32,
+    /// Multipath delay spread, ns: the interference fringes' spatial frequency.
+    pub delay_ns: f32,
     pub frame: u32,
     /// Where the orb has faded to e⁻¹, in r.
     pub orb_r: f32,
     /// The Julia plane's half-width at that radius.
     pub plane: f32,
+    /// The soft knee's light, stops from white: the orb's light L becomes W·L/(W + L), so nothing reaches a ceiling.
+    pub knee_stops: f32,
 }
 
 impl Look {
@@ -150,17 +161,16 @@ impl Look {
             rssi_dbm: -55.,
             noise_dbm: -92.,
             band: 1,
+            bw_log2: RADIOS[radio].bw_mhz.log2(),
+            qam_bits: RADIOS[radio].qam_bits,
             loss_pct: 0.,
+            delay_ns: (1 << 5) as f32,
             frame: 0,
             orb_r: 0.75,
             plane: 1.5,
+            knee_stops: -1.,
         }
     }
-}
-
-/// The light of a VSF RGB colour as the eye sees it (photopic, white 1): the display's own weights (vsf_rgb_to_photopic_f32).
-fn photopic(l: [f32; 3]) -> f32 {
-    0.2584 * l[0] + 0.6346 * l[1] + 0.1070 * l[2]
 }
 
 /// A gamma-2 colour turned about the grey axis by `a` radians (Rodrigues), then squared to light: the square keeps every channel's light non-negative, and the whole map is C∞ in `a`.
@@ -207,8 +217,9 @@ pub fn nucleus(p: u32) -> C {
 }
 
 /// The c whose period-p cycle has multiplier λ, in the bulb whose nucleus is `nuc` (the bulb's interior coordinate: λ = 0 the nucleus, |λ| = 1 its boundary, |λ| > 1 just past it).
+/// Returns c and the cycle's point z it converged on.
 /// Newton in (z, c) on f_c^p(z) = z and (f_c^p)'(z) = λ, continued from the nucleus (where z = 0 is on the cycle) along λ in 2⁶ steps so it stays on this bulb's branch.
-pub fn interior(p: u32, lam: C, nuc: C) -> C {
+pub fn interior(p: u32, lam: C, nuc: C) -> (C, C) {
     let (mut z, mut c) = (C::new(0., 0.), nuc);
     let steps = 1 << 6;
     for j in 1..=steps {
@@ -235,7 +246,7 @@ pub fn interior(p: u32, lam: C, nuc: C) -> C {
             }
         }
     }
-    c
+    (c, z)
 }
 
 /// A spark: where it is on its way from the core to the rim, and its light (a bump in its progress).
@@ -243,6 +254,41 @@ struct Spark {
     x: f32,
     y: f32,
     light: f32,
+}
+
+/// A plane wave across the orb in r units: wavenumber (kx, ky) and phase.
+#[derive(Clone, Copy)]
+struct Wave {
+    kx: f32,
+    ky: f32,
+    ph: f32,
+}
+
+impl Wave {
+    fn at(&self, x: f32, y: f32) -> f32 {
+        self.kx * x + self.ky * y + self.ph
+    }
+}
+
+/// The orbit is iterated at most 2¹⁰ times, and its sums (nuclei, I/Q phasor, constellation) run over its first 2⁵ points, the same count for every pixel so the sums never step where the escape or settle count does.
+const N_MAX: u32 = 1 << 10;
+const N_SUM: u32 = 1 << 5;
+
+/// The light of VSF grey at the console ring's working value 9000 (Q14): the flavours are at this photopic light (or their brightest channel full), so the orb takes it as its unit.
+const RING_LIGHT: f32 = (9000. / (1 << 14) as f32) * (9000. / (1 << 14) as f32);
+
+/// e^{−κ}I₀(κ), the mean of e^{κ(cos θ − 1)} over a turn (von Mises), by I₀'s series: normalises a constellation point so a sharp one is bright and a smeared one a dim haze of the same symbols.
+fn vm_mean(kappa: f64) -> f64 {
+    let (mut term, mut sum) = (1f64, 1f64);
+    let q = kappa * kappa / 4.;
+    for j in 1..1 << 8 {
+        term *= q / (j * j) as f64;
+        sum += term;
+        if term < sum * 1e-17 {
+            break;
+        }
+    }
+    (-kappa).exp() * sum
 }
 
 /// Everything one render needs, worked out once from the knobs.
@@ -256,6 +302,12 @@ pub struct Prep {
     body_edge: f32,
     orb: bool,
     c: C,
+    /// The attracting cycle's point the orbits are tested against, the cycle's multiplier's argument, and its period.
+    z_star: C,
+    lam_arg: f64,
+    /// ln(1/|λ|): how many e-folds the cycle pulls an orbit in a period (positive while it attracts).
+    lam_ln: f64,
+    period: f64,
     /// Plane coordinates from r units: rotation and scale.
     rot: C,
     warp_a: f64,
@@ -263,13 +315,29 @@ pub struct Prep {
     warp_ph: f64,
     gain: f32,
     glow_w: f32,
-    /// z units to r units, for the distance estimate.
+    /// z units to r units, for the distance estimates.
     z_to_r: f32,
     env_inv: f32,
-    /// The orb's flavour as gamma-2 values with the band's turn applied, and the light normaliser that puts its photopic light at 1.
+    /// The orb's flavour as gamma-2 values with the band's turn applied, and the light that puts the flavour's own light at the unit.
     hue_g: [f32; 3],
     hue_norm: f32,
+    /// The I/Q phase's hue swing (radians at full phase), and the carrier's rotation this frame.
+    swing: f32,
+    carrier: C,
+    /// Noise grain in the hue: amplitude (radians) and three fine waves.
+    grain_a: f32,
+    grain: [Wave; 3],
+    /// Multipath: two echoes' amplitudes and waves, and the mean power that normalises the fringes.
+    echo_a: [f32; 2],
+    echo: [Wave; 2],
+    echo_norm: f32,
+    /// The constellation: lattice spacing and half-extent (z units), sharpness κ, and the gain that normalises a point by its mean.
+    qam_d: f64,
+    qam_half: f64,
+    qam_k: f64,
+    qam_gain: f32,
     plasma: f32,
+    knee: f32,
     sparks: Vec<Spark>,
     spark_s: f32,
 }
@@ -291,31 +359,59 @@ impl Prep {
     pub fn new(k: &Look) -> Prep {
         let radio = &RADIOS[k.radio];
         let fl = k.flavour.map(|g| g * g);
+        let tau = std::f32::consts::TAU;
+        let frame = k.frame as f32;
         // The band widens the rim's prism: half a stop of separation a band.
         let sep = k.sep * ((k.band as f32) * 0.5).exp2();
         let ring_d = [k.depth + sep * 0.5, k.depth, k.depth - sep];
         let rim = k.rim_stops.exp2();
         let body = (-k.body_stops).exp2();
         let connected = k.state == 2;
-        // Searching: c walks its circle four times as fast, with a quarter of the light, no plasma and no sparks.
+        // Searching: c walks its circle four times as fast, with a quarter of the light, no plasma, no constellation and no sparks.
         let speed = if connected { 1. } else { 4. };
         let m = (1. + 1. / (1 << 4) as f64) * (-(k.snr_db as f64) / 8.).exp2();
         let phase = radio.phase + k.frame as f64 * speed / (1 << 8) as f64;
-        let lam = C::cis(TAU * phase).scale(m);
-        let mut c = interior(k.period, lam, nucleus(k.period));
+        let mut lam = C::cis(TAU * phase).scale(m);
+        let (mut c, mut z_star) = interior(k.period, lam, nucleus(k.period));
         if radio.conj {
-            c = c.conj();
+            (c, z_star, lam) = (c.conj(), z_star.conj(), lam.conj());
         }
         let r = k.orb_r as f64;
         let rot = C::cis(TAU * radio.turn).scale(k.plane as f64 / r);
         let warp_a = ((k.noise_dbm as f64 + 90.) / 8.).exp2() / (1 << 6) as f64;
-        let gain = ((k.rssi_dbm + 60.) / 10. - 2.).exp2() * if connected { 1. } else { 1. / (1 << 2) as f32 };
+        let gain = ((k.rssi_dbm + 60.) / 10. - 1.).exp2() * if connected { 1. } else { 1. / (1 << 2) as f32 };
         let glow_w = ((k.rssi_dbm + 60.) / 16.).exp2() / (1 << 6) as f32;
         let hue_g = {
-            let l = turn_hue(k.flavour, (k.band as f32 - 1.) * std::f32::consts::TAU / (1 << 4) as f32);
+            let l = turn_hue(k.flavour, (k.band as f32 - 1.) * tau / (1 << 4) as f32);
             l.map(|v| v.sqrt())
         };
-        let hue_norm = 1. / photopic(turn_hue(hue_g, 0.));
+        // Bandwidth: a 20 MHz channel swings the hue 2⁻⁵ of a turn either way, nearly one colour; 160 MHz a quarter turn, 320 MHz half.
+        let swing = tau * k.bw_log2.exp2() / 20. / (1 << 5) as f32;
+        // The carrier turns the I/Q plane 2⁻⁵ of a turn a frame.
+        let carrier = C::cis(TAU * k.frame as f64 / (1 << 5) as f64);
+        // Noise: 2⁻⁶ of a turn of grain at −90 dBm, a stop more every 8 dB; three fine waves (2⁵ to 2⁵ + 2⁴ cycles a radius), drifting a frame at a time.
+        let grain_a = tau * ((k.noise_dbm + 90.) / 8.).exp2() / (1 << 6) as f32;
+        let grain = [(0., 0.), (1. / 3., 1. / 8.), (2. / 3., 1. / 4.)].map(|(turn, extra): (f32, f32)| {
+            let kk = tau * (1 << 5) as f32 * (1. + extra);
+            Wave { kx: kk * (tau * turn).cos(), ky: kk * (tau * turn).sin(), ph: frame * tau * (1. / (1 << 3) as f32 + extra) }
+        });
+        // Multipath: two echoes at half and a quarter amplitude, their fringes one cycle a radius per 2⁶ ns of delay spread, Doppler-shifted a frame at a time (2⁻⁶ and 3·2⁻⁷ of a turn).
+        let echo_a = [0.5, 0.25];
+        let kd = tau * k.delay_ns / (1 << 6) as f32;
+        let t0 = radio.turn as f32;
+        let echo = [(t0 + 1. / 8., 1., 1. / (1 << 6) as f32), (t0 + 5. / 8., 1.5, 3. / (1 << 7) as f32)].map(|(turn, scale, dop): (f32, f32, f32)| Wave {
+            kx: kd * scale * (tau * turn).cos(),
+            ky: kd * scale * (tau * turn).sin(),
+            ph: tau * dop * frame,
+        });
+        let echo_norm = 1. / (1. + echo_a[0] * echo_a[0] + echo_a[1] * echo_a[1]);
+        // The constellation: 2^bits points, √M a side, on [−1, 1]² of the plane; each point's spread σ is the noise's amplitude over the signal's, 2^(−SNR/6 dB) of the spacing (10^(−SNR/20)), so κ = 1/(2πσ)².
+        let side = (1u32 << (k.qam_bits / 2)) as f64;
+        let qam_half = 1.;
+        let qam_d = 2. * qam_half / side;
+        let sig = (-(k.snr_db as f64) / 6.).exp2();
+        let qam_k = 1. / (TAU * sig * TAU * sig);
+        let qam_gain = if connected { (1. / ((1 << 3) as f64 * vm_mean(qam_k) * vm_mean(qam_k))) as f32 } else { 0. };
         let mut sparks = Vec::new();
         let spark_s = 1. / (1 << 6) as f32;
         if connected {
@@ -340,6 +436,10 @@ impl Prep {
             body_edge: k.depth,
             orb: k.orb && k.state != 0,
             c,
+            z_star,
+            lam_arg: lam.im.atan2(lam.re),
+            lam_ln: -lam.abs().ln(),
+            period: k.period as f64,
             rot,
             warp_a,
             warp_k: (1 << 3) as f64,
@@ -349,8 +449,20 @@ impl Prep {
             z_to_r: (r / k.plane as f64) as f32,
             env_inv: 1. / (k.orb_r * k.orb_r),
             hue_g,
-            hue_norm,
+            hue_norm: 1. / RING_LIGHT,
+            swing,
+            carrier,
+            grain_a,
+            grain,
+            echo_a,
+            echo,
+            echo_norm,
+            qam_d,
+            qam_half,
+            qam_k,
+            qam_gain,
             plasma: if connected { (1 << 3) as f32 } else { 0. },
+            knee: k.knee_stops.exp2(),
             sparks,
             spark_s,
         }
@@ -358,6 +470,15 @@ impl Prep {
 
     pub fn c(&self) -> C {
         self.c
+    }
+
+    /// The constellation's trap at z: a von Mises bump at every lattice point (C∞ and periodic), the lattice's square extent a super-Gaussian (x⁸), all ≤ 1.
+    fn qam(&self, z: C) -> f64 {
+        let (u, v) = ((z.re + self.qam_half) / self.qam_d - 0.5, (z.im + self.qam_half) / self.qam_d - 0.5);
+        let (ex, ey) = (z.re / self.qam_half, z.im / self.qam_half);
+        let (ex2, ey2) = (ex * ex, ey * ey);
+        let edge = (ex2 * ex2) * (ex2 * ex2) + (ey2 * ey2) * (ey2 * ey2);
+        (self.qam_k * ((TAU * u).cos() + (TAU * v).cos() - 2.) - edge).exp()
     }
 }
 
@@ -411,52 +532,95 @@ fn sample(p: &Prep, x: f32, y: f32, fs: f32, text: G2t16) -> G2t16 {
     acc.under(BLACK, BlendMode::Normal)
 }
 
-/// The orb's light at (x, y): the Julia set z ← z² + c of the prepared c, its filaments by the distance estimate, its interior a plasma lit at the critical point's preimages (an orbit trap at 0, summed with falling weights), sparks, all under a C∞ envelope that ends before the rim.
+/// The orb's light at (x, y), with the Julia plane read as the link's I/Q plane.
+/// The orbit z ← z² + c from the warped z₀ either escapes, settles onto the attracting cycle (tested at one of its points, z*), or neither within 2¹⁰ steps.
+/// Each side of the set's boundary has its own measure that runs to the boundary smoothly: outside the distance estimate |z| ln|z| / |dz|, falling to 0 at the boundary; inside the smooth settle time s = n − p·ln(ε/|w|)/ln(1/|λ|) (w = z − z*), which the cycle's linear part keeps continuous where the settle count steps by a period, and which grows without bound toward the boundary.
+/// The edge glow is a C∞ function of each, 1 at the boundary from both sides (the undecided count as boundary), so the set has no hard edge.
+/// Inside, away from the glow: a dim plasma with veins along the Koenigs phase (arg w less the cycle's turning, continuous the same way), and white-hot nuclei where orbits settle fastest (2^(−s/2), the preimages of the cycle).
+/// Over all of it: the orbit's I/Q phasor turns the hue around the flavour by the bandwidth's swing, noise adds grain to that hue, the constellation trap lights where orbits pass the QAM lattice, multipath fringes modulate it, and the summed light goes through a soft knee.
 fn orb(p: &Prep, x: f32, y: f32, rho2: f32, fs: f32) -> [f32; 3] {
-    let n_max = 1 << 8;
     let bail = (1 << 8) as f64;
-    let w = C::new(x as f64, y as f64) * p.rot;
+    let eps = 1. / (1u64 << 20) as f64;
+    let w0 = C::new(x as f64, y as f64) * p.rot;
     // Turbulence: a small smooth warp of z₀, its phase stepped per frame.
-    let w = C::new(w.re + p.warp_a * (p.warp_k * w.im + p.warp_ph).sin(), w.im + p.warp_a * (p.warp_k * w.re + p.warp_ph).cos());
-    let (mut z, mut dz) = (w, C::new(1., 0.));
-    let (mut trap, mut wk) = (0f64, 1f64);
+    let w0 = C::new(w0.re + p.warp_a * (p.warp_k * w0.im + p.warp_ph).sin(), w0.im + p.warp_a * (p.warp_k * w0.re + p.warp_ph).cos());
+    let (mut z, mut dz) = (w0, C::new(1., 0.));
+    let (mut iq, mut qam, mut wk) = (C::new(0., 0.), 0f64, 1f64);
     let decay = (-1f64 / (1 << 3) as f64).exp2();
-    let trap_inv = (1 << 6) as f64;
-    let mut escaped = None;
-    for n in 0..n_max {
+    // Outside: the distance estimate (z units). Inside: the settle time and the Koenigs phase.
+    enum Fate {
+        Out(f64),
+        In(f64, f64),
+    }
+    let mut fate = None;
+    for n in 0..N_MAX {
         let r2 = z.norm2();
-        // Past 2⁴ the term is under e⁻¹⁶, below a 16-bit code's step; skipping it saves the exp, it shapes nothing.
-        let u = r2 * trap_inv;
-        if u < 16. {
-            trap += wk * (-u).exp();
+        if n < N_SUM {
+            iq = iq + z.scale(wk * (-r2 / 4.).exp());
+            // Past |z| = 2 the lattice's extent term is under e⁻²⁵⁶: skipping it shapes nothing.
+            if r2 < 4. {
+                qam += wk * p.qam(z);
+            }
+            wk *= decay;
         }
-        if r2 > bail {
-            escaped = Some(n);
+        if fate.is_none() {
+            if r2 > bail {
+                let az = r2.sqrt();
+                fate = Some(Fate::Out(az * az.ln() / dz.abs()));
+                // Escaped: every sum's later terms are under e⁻⁶⁴ (|z| > 2⁴), so stopping here changes none of them.
+                break;
+            }
+            let w = z - p.z_star;
+            let aw = w.abs();
+            if aw < eps {
+                let s = n as f64 - p.period * (eps / aw).ln() / p.lam_ln;
+                let koenigs = w.im.atan2(w.re) - n as f64 / p.period * p.lam_arg;
+                fate = Some(Fate::In(s, koenigs));
+            }
+        } else if n >= N_SUM {
             break;
         }
         dz = (z * dz).scale(2.);
         z = z.sq() + p.c;
-        wk *= decay;
     }
-    let trap = (trap * (1. - decay)) as f32 * p.plasma;
-    let (glow, mu) = match escaped {
-        Some(n) => {
-            let az = z.abs();
-            let de = (az * az.ln() / dz.abs()) as f32 * p.z_to_r;
-            let mu = n as f64 + 1. - az.ln().ln() / std::f64::consts::LN_2;
-            let u = de / p.glow_w;
+    let on = p.plasma / (1 << 3) as f32;
+    let (glow, body, nuc) = match fate {
+        Some(Fate::Out(d)) => {
+            let u = d as f32 * p.z_to_r / p.glow_w;
             let g = 1. / (1. + u * u);
-            (g * g, mu as f32)
+            (g * g, 0., 0.)
         }
-        // The bounded interior sits a stop under the filaments, so the set's boundary reads as the bright edge; the step there is the Julia set's own boundary (a fractal, with no smooth version), softened only by the samples.
-        None => (1. / (1 << 1) as f32, n_max as f32),
+        Some(Fate::In(s, ph)) => {
+            // The inside's glow: q⁴/(1 + q⁴) of the settle time in units of 2⁴ periods, 0 at the nuclei and 1 toward the boundary.
+            let q = (s / (p.period * (1 << 4) as f64)) as f32;
+            let q4 = (q * q) * (q * q);
+            let g = q4 / (1. + q4);
+            // Between: a plasma 2⁻⁴, veins along the Koenigs phase (p of them around each nucleus) to 2⁻³ over it, fading into the glow.
+            let vein = ((1 << 3) as f64 * ((ph * p.period).cos() - 1.)).exp() as f32;
+            let body = (1. - g) * (1. / (1 << 4) as f32 + vein / (1 << 3) as f32) * on;
+            (g, body, (-(s as f32) / 2.).exp2() * on)
+        }
+        None => (1., 0., 0.),
     };
-    // The filaments' hue drifts with the smooth escape count, a sixteenth of a turn either way.
-    let col = turn_hue(p.hue_g, (mu / (1 << 3) as f32).sin() * std::f32::consts::TAU / (1 << 4) as f32).map(|v| v * p.hue_norm);
+    let qam = (qam * (1. - decay)) as f32 * p.qam_gain;
+    // The phase: the orbit's I/Q phasor turned by the carrier, its quadrature over its length (softened by 2⁻⁶ so it is smooth through zero), times the bandwidth's swing; plus the noise's grain.
+    let iq = iq * p.carrier;
+    let quad = (iq.im / (iq.norm2() + 1. / (1 << 12) as f64).sqrt()) as f32;
+    let grain = p.grain.iter().map(|w| w.at(x, y).sin()).sum::<f32>() / 3.;
+    // Multipath: |1 + Σ aⱼ e^{iθⱼ}|² over its mean, and its phase nudging the hue a little.
+    let (mut fr, mut fi) = (1f32, 0f32);
+    for (a, w) in p.echo_a.iter().zip(&p.echo) {
+        let (s, c) = w.at(x, y).sin_cos();
+        fr += a * c;
+        fi += a * s;
+    }
+    let fade = (fr * fr + fi * fi) * p.echo_norm;
+    let hue = p.swing * quad + p.grain_a * grain + fi / (1 << 3) as f32;
+    let col = turn_hue(p.hue_g, hue).map(|v| v * p.hue_norm);
     let e = rho2 * p.env_inv;
-    let env = (-(e * e) * (e * e)).exp() * p.gain;
-    let white = glow * glow * glow * glow / (1 << 2) as f32 + trap * trap * trap;
-    let mut l = col.map(|v| env * (v * (glow + trap) + white));
+    let env = (-(e * e) * (e * e)).exp() * p.gain * fade;
+    let white = glow * glow * glow * glow / (1 << 3) as f32 + nuc * nuc * nuc;
+    let mut l = col.map(|v| env * (v * (glow + body + nuc + qam) + white));
     // Sparks: Gaussian points of white-flavoured light, widened by the footprint like the rings.
     let s2 = p.spark_s * p.spark_s + fs * fs / 12.;
     let k = p.spark_s * p.spark_s / s2 * p.gain;
@@ -467,7 +631,8 @@ fn orb(p: &Prep, x: f32, y: f32, rho2: f32, fs: f32) -> [f32; 3] {
             l[i] += b * (col[i] + 1.);
         }
     }
-    l
+    // The soft knee: W·L/(W + L), C∞ for L ≥ 0, below W however hot the core.
+    l.map(|v| p.knee * v / (p.knee + v))
 }
 
 /// One circle of radius `r` pixels in a square of side 2⌈r⌉ + 4, `ss` × `ss` samples a pixel (ss a power of two), with the name's layer `text` (a composite of the same size, or empty).
@@ -519,3 +684,4 @@ pub fn name_layer(text: &mut fluor::text::TextRenderer, k: &Look, r: f32, side: 
     text.draw_text_center(&mut canvas, name, mid, mid, &style, None, None);
     buf
 }
+

@@ -31,7 +31,7 @@ struct Knob {
     step: f32,
 }
 
-const KNOBS: [Knob; 20] = [
+const KNOBS: [Knob; 24] = [
     Knob { key: "radio", label: "radio", lo: 0., hi: 6., step: 1. },
     Knob { key: "depth", label: "rim depth", lo: 0., hi: 1. / (1 << 2) as f32, step: 0. },
     Knob { key: "width", label: "rim width σ", lo: 1. / (1 << 9) as f32, hi: 1. / (1 << 4) as f32, step: 0. },
@@ -48,14 +48,18 @@ const KNOBS: [Knob; 20] = [
     Knob { key: "rssi", label: "signal", lo: -100., hi: -20., step: 0. },
     Knob { key: "noise", label: "noise floor", lo: -100., hi: -60., step: 0. },
     Knob { key: "band", label: "band", lo: 0., hi: 2., step: 1. },
+    Knob { key: "bw", label: "bandwidth", lo: 0., hi: 9., step: 0. },
+    Knob { key: "qam", label: "constellation (MCS)", lo: 2., hi: 12., step: 2. },
     Knob { key: "loss", label: "loss", lo: 0., hi: 32., step: 0. },
+    Knob { key: "delay", label: "delay spread", lo: 0., hi: (1 << 9) as f32, step: 0. },
     Knob { key: "frame", label: "frame (Space)", lo: 0., hi: 1023., step: 1. },
     Knob { key: "orbr", label: "orb size", lo: 1. / (1 << 2) as f32, hi: 1., step: 0. },
     Knob { key: "plane", label: "plane half-width", lo: 1. / (1 << 1) as f32, hi: 4., step: 0. },
+    Knob { key: "knee", label: "soft knee", lo: -4., hi: 2., step: 0. },
 ];
 const N_KNOBS: usize = KNOBS.len();
 const K_RADIO: usize = 0;
-const K_FRAME: usize = 17;
+const K_FRAME: usize = 20;
 
 fn get(k: &Look, i: usize) -> f32 {
     match i {
@@ -73,19 +77,25 @@ fn get(k: &Look, i: usize) -> f32 {
         13 => k.rssi_dbm,
         14 => k.noise_dbm,
         15 => k.band as f32,
-        16 => k.loss_pct,
-        17 => k.frame as f32,
-        18 => k.orb_r,
-        _ => k.plane,
+        16 => k.bw_log2,
+        17 => k.qam_bits as f32,
+        18 => k.loss_pct,
+        19 => k.delay_ns,
+        20 => k.frame as f32,
+        21 => k.orb_r,
+        22 => k.plane,
+        _ => k.knee_stops,
     }
 }
 
-/// Set knob `i`; a new radio brings its own flavour.
+/// Set knob `i`; a new radio brings its own flavour, channel width and constellation.
 fn set(k: &mut Look, i: usize, v: f32) {
     match i {
         0 => {
             k.radio = v as usize;
             k.flavour = RADIOS[k.radio].flavour;
+            k.bw_log2 = RADIOS[k.radio].bw_mhz.log2();
+            k.qam_bits = RADIOS[k.radio].qam_bits;
         }
         1 => k.depth = v,
         2 => k.width = v,
@@ -100,10 +110,14 @@ fn set(k: &mut Look, i: usize, v: f32) {
         13 => k.rssi_dbm = v,
         14 => k.noise_dbm = v,
         15 => k.band = v as u32,
-        16 => k.loss_pct = v,
-        17 => k.frame = v as u32,
-        18 => k.orb_r = v,
-        _ => k.plane = v,
+        16 => k.bw_log2 = v,
+        17 => k.qam_bits = v as u32,
+        18 => k.loss_pct = v,
+        19 => k.delay_ns = v,
+        20 => k.frame = v as u32,
+        21 => k.orb_r = v,
+        22 => k.plane = v,
+        _ => k.knee_stops = v,
     }
 }
 
@@ -122,10 +136,14 @@ fn show(k: &Look, i: usize) -> String {
         12 => format!("{v:.1} dB"),
         13 | 14 => format!("{v:.1} dBm"),
         15 => RADIOS[k.radio].bands[k.band as usize].to_string(),
-        16 => format!("{v:.1} %"),
-        17 => format!("{}", k.frame),
-        18 => format!("{v:.3} r"),
-        _ => format!("{v:.3}"),
+        16 => format!("{:.1} MHz", v.exp2()),
+        17 => format!("{}-QAM", 1u32 << k.qam_bits),
+        18 => format!("{v:.1} %"),
+        19 => format!("{v:.0} ns"),
+        20 => format!("{}", k.frame),
+        21 => format!("{v:.3} r"),
+        22 => format!("{v:.3}"),
+        _ => format!("{v:+.2} stops"),
     }
 }
 
@@ -292,7 +310,7 @@ impl App {
     fn roll(&mut self) {
         let radio = (self.next_rand() * 7.) as usize;
         set(&mut self.look, K_RADIO, radio as f32);
-        for i in 11..=16 {
+        for i in 11..=19 {
             let u = self.next_rand();
             set(&mut self.look, i, from_unit(i, u));
         }
@@ -641,6 +659,10 @@ fn dump(out: &str, args: &[String]) {
             samples[c * n + i] = (G2t16::ONE - ch[c]) as u16;
         }
     }
+    // Clipping check: the brightest code of any channel, and how many samples sit within 2⁻⁸ of the top.
+    let top = samples.iter().copied().max().unwrap_or(0);
+    let near = samples.iter().filter(|&&s| s as u32 >= G2t16::ONE - (G2t16::ONE >> 8)).count();
+    println!("max code {top} of {} ({:.1} %), {near} samples within 2⁻⁸ of the top", G2t16::ONE, 100. * top as f32 / G2t16::ONE as f32);
     use vsf::types::BitPackedTensor;
     use vsf::visual::{Encoding, Plane, Primaries, Visual};
     let mut plane = Plane::encoded("display", "orb", w, h, Primaries::Vsf, Encoding::Gamma2Tanh, BitPackedTensor::pack(16, vec![3, h, w], &samples));
