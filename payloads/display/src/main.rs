@@ -1506,18 +1506,34 @@ fn publish10x4(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask:
     fps_dot(mask, width, height);
 }
 
+/// The home screen's rows into the phases `mask` names: each row front to back, the glass's edge, then the console (its rows only), then the canvas. A 16-pixel step that neither touches is the canvas straight through the NEON present; one that does is composed first (`edge_over`, `console_over`) and goes through the app's present, which leaves the mask's pixels undithered.
 fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask: u32, r: draw::Rect) {
     if r.is_empty() {
         return;
     }
     let (x0, x1) = ((r.x0 as usize) & !15, ((r.x1 as usize + 15) & !15).min(width & !15));
     let mut row = [0u32; 1344];
+    let line = hairline();
+    let top = unsafe { CHROME_TOP };
+    let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
+    let (console_w, console_span) = unsafe { (core::slice::from_raw_parts(CONSOLE_W as *const u64, top * width), core::slice::from_raw_parts(CONSOLE_SPAN as *const (u16, u16), top)) };
     for k in 0..PHASES {
         if mask >> k & 1 == 0 {
             continue;
         }
         let dst = phase_slice(k, width * height);
         for y in r.y0 as usize..r.y1 as usize {
+            // The row's edge: its masked columns and its listed edge pixels, as the columns from the left and from the right that need it.
+            let g = &rows[y];
+            let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), rows[y + 1].first as usize) };
+            let row_px = &plan[g.first as usize..];
+            let edge_px = &row_px[row_px.iter().position(|e| e.1 == SHAPE_EDGE).unwrap_or(row_px.len())..];
+            let (mut el, mut er) = (g.mask_l as usize, g.mask_r as usize);
+            for e in edge_px {
+                let x = e.0 as usize;
+                if x < width / 2 { el = el.max(x + 1) } else { er = er.min(x) }
+            }
+            let (cl, cr) = if y < top { (console_span[y].0 as usize, console_span[y].1 as usize) } else { (0, 0) };
             let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
             let t_n = now();
             unsafe {
@@ -1525,7 +1541,20 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                 let src = back.as_ptr().add(y * width);
                 let mut x = x0;
                 while x < x1 {
-                    neon::sixteen_canvas(tabs, src.add(x), row.as_mut_ptr().add(x), thv);
+                    if x < el || x + 16 > er || (x + 16 > cl && x < cr) {
+                        let mut over = [0u64; 16];
+                        for j in 0..16 {
+                            let xx = x + j;
+                            let mut p = *(src.add(xx) as *const u64) & ((1 << 48) - 1);
+                            if xx >= cl && xx < cr {
+                                p = console_over(console_w[y * width + xx], p);
+                            }
+                            over[j] = edge_over(p, xx, g, edge_px, line);
+                        }
+                        neon::sixteen_app(tabs, over.as_ptr(), row.as_mut_ptr().add(x), neon::thresholds_at(thv, x));
+                    } else {
+                        neon::sixteen_canvas(tabs, src.add(x), row.as_mut_ptr().add(x), thv);
+                    }
                     x += 16;
                 }
             }
@@ -1711,6 +1740,13 @@ static mut CHROME_TOP: usize = 0;
 static mut CHROME_BOT: usize = 0;
 /// The minute the corners' clock last drew, so it redraws once a minute.
 static mut CHROME_KEY: i64 = -1;
+/// The console (owner, 2026-11-07): the circles at the top of the screen, the radios' switches and the system's indicators. It is the frontmost layer, over the home screen and every app alike, and lives in screen coordinates, so nothing transforms it. Drawn as fluor draws: front to back from empty, into fluor's 16-bit α + darkness (`G2T16`) over the `CHROME_TOP` rows, each circle's text and then its disc under it, by fluor's one `under`. Redrawn only when what it shows changes (`console_draw`).
+static mut CONSOLE: usize = 1;
+/// The console decoded once a redraw to working values with their transparency (`working`), so a publish folds the scene under it with no table walk; and each row's columns holding any of it, (from, to), so the rest of a row passes untouched.
+static mut CONSOLE_W: usize = 1;
+static mut CONSOLE_SPAN: usize = 1;
+/// What the console last drew (the minute, the radios, their measures, the switches), so it redraws when one changes.
+static mut CONSOLE_KEY: i64 = -1;
 
 /// Surface k's pixels.
 fn surface(k: usize, width: usize, height: usize) -> &'static mut [u64] {
@@ -1994,6 +2030,66 @@ fn owner_at(x: i64, y: i64, width: usize, height: usize) -> Option<usize> {
     None
 }
 
+/// The hairline's colour (owner, 2026-11-02). Release builds: standard-illuminant-E grey (equal VSF RGB codes) one stop darker than the theme's ring: the ring's photopic light (VSF RGB's weights, as vsf::colour::convert::vsf_rgb_to_photopic_f32 has them: R 0.2584, G 0.6346, B 0.1070, on gamma-2 codes) halved, back to a code. Development builds: bright orange in VSF RGB, full red, half-light green, no blue, so a dev image is told at a glance.
+fn hairline() -> u64 {
+    if option_env!("FERROS_PRODUCTION").is_some() {
+        let ring = draw::opaque(ferros_sys::theme::current().ring);
+        let lin = |sh: u32| { let c = (ring >> sh & 0xFFFF) as f32 * (1.0 / 16384.0); c * c };
+        let light = 0.2584 * lin(0) + 0.6346 * lin(16) + 0.1070 * lin(32);
+        let code = (libm::sqrtf(light * 0.5) * 16384.0) as u64;
+        1 << 63 | code | code << 16 | code << 32
+    } else {
+        let g = (libm::sqrtf(0.5) * 16384.0) as u64;
+        1 << 63 | 16384 | g << 16
+    }
+}
+
+/// Two working pixels mixed on their codes, `wb` (Q16, 65536 whole) of the second: how a hairline's weight is laid, as it was drawn and judged (owner, 2026-11-02). The second's no-dither bit is kept.
+#[inline]
+fn mix_code(a: u64, b: u64, wb: u64) -> u64 {
+    let ch = |sh: u32| (((a >> sh & 0xFFFF) * (65536 - wb) + (b >> sh & 0xFFFF) * wb) >> 16) << sh;
+    (b & 1 << 48) | ch(0) | ch(16) | ch(32)
+}
+
+/// Two working pixels mixed in light, `wb` (Q16) of the second: coverage is an area, so it weighs light, and a working value is a gamma-2 code, so the mix is on the squares and back to a code by the root. The second's no-dither bit is kept.
+#[inline]
+fn mix_light(a: u64, b: u64, wb: u64) -> u64 {
+    let ch = |sh: u32| {
+        let (la, lb) = ((a >> sh & 0xFFFF) * (a >> sh & 0xFFFF), (b >> sh & 0xFFFF) * (b >> sh & 0xFFFF));
+        (libm::sqrt(((la * (65536 - wb) + lb * wb) >> 16) as f64) as u64) << sh
+    };
+    (b & 1 << 48) | ch(0) | ch(16) | ch(32)
+}
+
+/// A plan weight as Q16 with 65536 whole (the plan keeps full as G#FFFF in its u16).
+#[inline]
+fn q16(v: u16) -> u64 {
+    if v == 0xFFFF { 65536 } else { v as u64 }
+}
+
+/// The glass's edge over one pixel of row `rows[y]` (the plan, `plan_glass`): outside the masked columns the mask colour, and the row's listed edge pixels (`SHAPE_EDGE`) their hairline at its alpha then the mask by their coverage's complement, both in light (owner, 2026-11-02: "as long as the edge renders gamma proper-ish and trims it to black on production"). The edge is in front of everything: the console, the windows, the home screen. The edge's hairline is the orange on development builds and on release builds the mask colour itself, as Photon's release build on Android draws its hairline black so the glass's corner is black to the curve.
+#[inline]
+fn edge_over(p: u64, x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], line: u64) -> u64 {
+    if x < g.mask_l as usize || x >= g.mask_r as usize {
+        return EDGE_MASK;
+    }
+    let edge_line = if DEV { line } else { EDGE_MASK };
+    match edge_px.iter().find(|e| e.0 as usize == x) {
+        Some(&(_, _, c, h)) => mix_light(EDGE_MASK, mix_light(p, edge_line, q16(h)), q16(c)),
+        None => p,
+    }
+}
+
+/// The console over a scene pixel `p` (a working value taken as opaque; its flag bits above 48 are not light): the console's decoded pixel `c` in front, the scene folded under it by fluor's under on working values (`fold`). Where the console is clear, the scene as it was.
+#[inline]
+fn console_over(c: u64, p: u64) -> u64 {
+    if c >> 63 != 0 {
+        return p;
+    }
+    let (acc, _) = fold(c, trans(c), p & ((1 << 48) - 1), 0);
+    acc & !(0x7FFF << 49)
+}
+
 /// The windows into phase `k` over `r` (screen coordinates): each row composed frontmost first (a pixel comes from the first window that covers it; nothing behind the windows but black), cut to the circle with its edge antialiased, the corners from the chrome; then each pixel's R, G, B (bits 0-15, 16-31, 32-47, working values: gamma 2, white = Q14) through the one table, E's gains and the dither, bit 48 set = no dither for that pixel.
 fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: usize) {
     let r = r.clip(width, height);
@@ -2006,17 +2102,8 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
     }
     let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
     let chrome = unsafe { core::slice::from_raw_parts(CHROME as *const u64, (top + bot) * width) };
-    // The hairline's colour (owner, 2026-11-02). Release builds: standard-illuminant-E grey (equal VSF RGB codes) one stop darker than the theme's ring: the ring's photopic light (VSF RGB's weights, as vsf::colour::convert::vsf_rgb_to_photopic_f32 has them: R 0.2584, G 0.6346, B 0.1070, on gamma-2 codes) halved, back to a code. Development builds: bright orange in VSF RGB, full red, half-light green, no blue, so a dev image is told at a glance.
-    let line = if option_env!("FERROS_PRODUCTION").is_some() {
-        let ring = draw::opaque(ferros_sys::theme::current().ring);
-        let lin = |sh: u32| { let c = (ring >> sh & 0xFFFF) as f32 * (1.0 / 16384.0); c * c };
-        let light = 0.2584 * lin(0) + 0.6346 * lin(16) + 0.1070 * lin(32);
-        let code = (libm::sqrtf(light * 0.5) * 16384.0) as u64;
-        1 << 63 | code | code << 16 | code << 32
-    } else {
-        let g = (libm::sqrtf(0.5) * 16384.0) as u64;
-        1 << 63 | 16384 | g << 16
-    };
+    let line = hairline();
+    let (console_w, console_span) = unsafe { (core::slice::from_raw_parts(CONSOLE_W as *const u64, top * width), core::slice::from_raw_parts(CONSOLE_SPAN as *const (u16, u16), top)) };
     let mut row = [3u32; 1344];
     let mut px = [0u64; 1344];
     let (xa, xb) = (r.x0 as usize, r.x1 as usize);
@@ -2083,20 +2170,6 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
             let (cl, cr, ml, mr) = (g.chrome_l as usize, g.chrome_r as usize, g.mask_l as usize, g.mask_r as usize);
             if cl > 0 || cr < width || ml > 0 || mr < width || first != next {
                 let crow = if y < top { &chrome[y * width..(y + 1) * width] } else if y >= height - bot { &chrome[(top + y - (height - bot)) * width..(top + y - (height - bot) + 1) * width] } else { &chrome[..0] };
-                let edge_line = if DEV { line } else { EDGE_MASK };
-                let mix = |a: u64, b: u64, wb: u64| {
-                    let ch = |sh: u32| (((a >> sh & 0xFFFF) * (65536 - wb) + (b >> sh & 0xFFFF) * wb) >> 16) << sh;
-                    (b & 1 << 48) | ch(0) | ch(16) | ch(32)
-                };
-                let q = |v: u16| if v == 0xFFFF { 65536 } else { v as u64 };
-                // Coverage is an area, so it weighs light, and a working value is a gamma-2 code: the covered mix is on the squares, back to a code by the root (what the circle did before the plan: the value by the root of its coverage, over black). The hairline's weight stays on the codes, as it was drawn and judged (owner, 2026-11-02).
-                let mixl = |a: u64, b: u64, wb: u64| {
-                    let ch = |sh: u32| {
-                        let (la, lb) = ((a >> sh & 0xFFFF) * (a >> sh & 0xFFFF), (b >> sh & 0xFFFF) * (b >> sh & 0xFFFF));
-                        (libm::sqrt(((la * (65536 - wb) + lb * wb) >> 16) as f64) as u64) << sh
-                    };
-                    (b & 1 << 48) | ch(0) | ch(16) | ch(32)
-                };
                 px[xa..xb.min(cl)].copy_from_slice(&crow[xa..xb.min(cl)]);
                 if xa.max(cr) < xb {
                     px[xa.max(cr)..xb].copy_from_slice(&crow[xa.max(cr)..xb]);
@@ -2112,7 +2185,14 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                     }
                     let p = px[x];
                     // The circle: coverage first (the content over the chrome, in light), the hairline over both sides after (on the codes, as before the plan: a pixel centred on the radius carries the whole line, a straddling pair its profile on each side).
-                    px[x] = mix(mixl(crow[x], p, q(c)), line, q(h));
+                    px[x] = mix_code(mix_light(crow[x], p, q16(c)), line, q16(h));
+                }
+                // The console in front of the windows, the circle and its hairline; only the glass's edge is in front of it.
+                if y < top {
+                    let (l, rr) = console_span[y];
+                    for x in (l as usize).max(xa)..(rr as usize).min(xb) {
+                        px[x] = console_over(console_w[y * width + x], px[x]);
+                    }
                 }
                 for x in xa..xb.min(ml) {
                     px[x] = EDGE_MASK;
@@ -2127,7 +2207,7 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                     }
                     let p = px[x];
                     // The edge: both mixes in light (owner, 2026-11-02: "as long as the edge renders gamma proper-ish and trims it to black on production"); on a production build the hairline is the mask's black, so the two pixels are one coverage ramp of the content toward black.
-                    px[x] = mixl(EDGE_MASK, mixl(p, edge_line, q(h)), q(c));
+                    px[x] = mix_light(EDGE_MASK, mix_light(p, if DEV { line } else { EDGE_MASK }, q16(h)), q16(c));
                 }
             }
         }
@@ -2473,7 +2553,7 @@ fn soft(d: f32) -> f32 {
 fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
     let t_all = now();
     let mut tb = [0u8; 32];
-    let (_, _, tn, key, _) = clock_state(&mut tb);
+    let (_, _, _, key, _) = clock_state(&mut tb);
     let facts = ferros_sys::facts().0;
     let radios = facts[32];
     // The battery's (facts 1-4) and the links' measures (facts 33-80) folded into the key too: the chrome redraws when one changes, at most every two seconds (the drivers' pace).
@@ -2503,17 +2583,15 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
             None
         }
     };
-    // Working values (gamma 2, white at Q14): the face, its ring when the thing is live and when it is not, the label.
+    // Working values (gamma 2, white at Q14): the face, and the ring of a thing that does not run.
     const FACE: f32 = 1800.0;
-    const RING_ON: f32 = 9000.0;
     const RING_OFF: f32 = 3200.0;
-    const INK: f32 = 11000.0;
-    let line = tb[..tn].split(|&c| c == b'\n').next().unwrap_or(&[]);
-    let mut colons = 0;
-    let end = line.iter().position(|&c| { colons += (c == b':') as u32; colons == 2 }).unwrap_or(line.len());
-    let time = core::str::from_utf8(&line[..end]).unwrap_or("");
     let (circles, n) = corner_layout(width, height);
     for &(x, y, r, what) in &circles[..n] {
+        // The top circles are the console's (`console_draw`); the chrome keeps the bottom corners.
+        if y < height as f32 * 0.5 {
+            continue;
+        }
         let live = match what {
             Corner::Clock | Corner::Home => true,
             Corner::Cellular => radios & 1 != 0,
@@ -2539,7 +2617,7 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
             _ => None,
         }
         .and_then(|ri: usize| facts[33 + 8 * ri..41 + 8 * ri].iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::STATE).map(|m| m.1));
-        let (ring_c, ink_c) = flavour(what);
+        let (ring_c, _) = flavour(what);
         let ring = if !live {
             (RING_OFF, RING_OFF, RING_OFF)
         } else if state == Some(1) {
@@ -2563,6 +2641,89 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
             }
         }
         unsafe { CHROME_US[0] += ferros_sys::us_since(t_disc) };
+    }
+    ALLOC.reset();
+    unsafe {
+        if CHROME_US[1] == 0 {
+            CHROME_US[1] = ferros_sys::us_since(t_all);
+        }
+    }
+    true
+}
+/// A C∞ step from 0 at t ≤ 0 to 1 at t ≥ 1: the bump exp(−1/t) against its mirror. Every derivative is zero at both ends, so a disc's edge has no kink and leaves nothing past itself (the bump is defined as 0 for t ≤ 0; the two tests are its definition, not a clamp).
+#[inline]
+fn bump_step(t: f32) -> f32 {
+    if t <= 0.0 {
+        return 0.0;
+    }
+    if t >= 1.0 {
+        return 1.0;
+    }
+    let (a, b) = (libm::expf(-1.0 / t), libm::expf(-1.0 / (1.0 - t)));
+    a / (a + b)
+}
+
+/// A colour in working values (gamma 2, white at Q14) as fluor's 16-bit darkness, straight (α is the caller's): each channel's `g2t` code is 2¹⁶ · tanh(v / 2¹⁴), the inverse of `G2T16_Q14`, and its darkness the complement. The console's colours are all under white, where tanh stays below 0.77, so the code never reaches 2¹⁶.
+fn g2t_colour(c: (f32, f32, f32)) -> u64 {
+    let dark = |v: f32| 65535 - (libm::tanhf(v * (1.0 / 16384.0)) * 65536.0) as u64;
+    dark(c.0) << 32 | dark(c.1) << 16 | dark(c.2)
+}
+
+/// The console (`CONSOLE`): when the minute, a radio's state, a measure or a switch changed (or `force`), every top circle drawn again, front to back from empty in fluor's α + darkness, each by fluor's `under` and nothing else: its text first, in front, then its disc under the text. A disc is solid, no stroke, no glow (owner, 2026-11-07): the radio's flavour while it is on and linked, one stop darker while up and searching, grey when it does not run, and grey and darker with no text once switched off by a tap (preference 15). The text is dark on a lit disc, light on a grey one. Then the layer is decoded once into `CONSOLE_W` and each row's columns into `CONSOLE_SPAN`. Returns whether it drew.
+fn console_draw(width: usize, height: usize, force: bool) -> bool {
+    use fluor::pixel::{Blend, BlendMode};
+    let mut tb = [0u8; 32];
+    let (_, _, tn, key, _) = clock_state(&mut tb);
+    let facts = ferros_sys::facts().0;
+    let radios = facts[32];
+    let off = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF);
+    // The battery's (facts 1-4) and the links' measures (facts 33-80) folded into the key, with the switches: the console redraws when one changes, at most every two seconds (the drivers' pace).
+    let mut mh = 0u64;
+    for &m in facts[1..5].iter().chain(&facts[33..81]) {
+        mh = (mh.rotate_left(7) ^ m).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    let k = (((key / 60) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64) ^ (off as i64) << 40;
+    if !force && k == unsafe { CONSOLE_KEY } {
+        return false;
+    }
+    unsafe { CONSOLE_KEY = k };
+    let rows = unsafe { CHROME_TOP };
+    let console = unsafe { core::slice::from_raw_parts_mut(CONSOLE as *mut u64, rows * width) };
+    console.fill(0);
+    // A screen pixel's place in the console. WHY the test: glyph and disc positions come from the layout's float geometry, and a disc's box or a glyph's edge can reach past the screen's sides or below the console's rows; an index from there would land in another row or past the buffer.
+    let at = |x: i64, y: i64| -> Option<usize> {
+        if x < 0 || x >= width as i64 || y < 0 || y >= rows as i64 {
+            return None;
+        }
+        Some(y as usize * width + x as usize)
+    };
+    // Working values (gamma 2, white at Q14): the grey of a lit indicator that is no radio, the grey of one that does not run, and the dark and light inks.
+    const LIT_GREY: f32 = 9000.0;
+    const OFF_GREY: f32 = 3200.0;
+    const DARK_INK: f32 = 1800.0;
+    const LIGHT_INK: f32 = 7000.0;
+    let line = tb[..tn].split(|&c| c == b'\n').next().unwrap_or(&[]);
+    let mut colons = 0;
+    let end = line.iter().position(|&c| { colons += (c == b':') as u32; colons == 2 }).unwrap_or(line.len());
+    let time = core::str::from_utf8(&line[..end]).unwrap_or("");
+    let (circles, n) = corner_layout(width, height);
+    for &(x, y, r, what) in &circles[..n] {
+        if y >= height as f32 * 0.5 {
+            continue;
+        }
+        let live = match what {
+            Corner::Clock => true,
+            Corner::Cellular => radios & 1 != 0,
+            Corner::Wifi => radios & 2 != 0,
+            Corner::Bluetooth => radios & 4 != 0,
+            Corner::Nfc => radios & 8 != 0,
+            Corner::Gnss => radios & 16 != 0,
+            // The usb driver's own word (its measure STATE): connected once the host configured it.
+            Corner::Usb => ferros_sys::measure_of(facts[33 + 8 * 5]) == Some((ferros_sys::measure::STATE, 2)),
+            // The gauge answered (facts 1-4, the kernel's two-second poll of the MAX77759 on hsi2c_11).
+            Corner::Battery => facts[1] != u64::MAX,
+            Corner::Home | Corner::Spare => false,
+        };
         // The radio's measures, as its driver published them (facts 33 + 8 · radio): every one shown as itself, in its unit, a line each; none folded into a level, no bars (owner, 2026-11-03).
         let radio = match what {
             Corner::Cellular => Some(0),
@@ -2573,100 +2734,141 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
             Corner::Usb => Some(5),
             _ => None,
         };
-        let mut lines = [Txt::new(); 9];
-        let mut nl = 1;
-        // The battery: its charge as the name, then the cell's voltage, the current (+ charging), their product and the temperature, as the gauge measures them (facts 1-4: per cent, hundredths of a degree, µV, µA).
-        let mut charge = Txt::new();
-        if what == Corner::Battery && facts[1] != u64::MAX {
-            charge.num(facts[1] as i64, 1, 0).s(" %");
-            let (cc, uv, ua) = (facts[2] as i64, facts[3] as i64, facts[4] as i64);
-            lines[nl].num(uv, 1_000_000, 3).s(" V");
-            nl += 1;
-            if ua >= 0 {
-                lines[nl].s("+");
+        // The radio's state as its driver says it (measure STATE): connected the flavour's full colour, up and searching one stop darker.
+        let state = radio.and_then(|ri: usize| facts[33 + 8 * ri..41 + 8 * ri].iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::STATE).map(|m| m.1));
+        // Switched off by a tap (preference 15, the radios' bits in facts 32's order; USB is no switch).
+        let switched_off = match radio {
+            Some(ri) if ri < 5 => off >> ri & 1 != 0,
+            _ => false,
+        };
+        let (flav, _) = flavour(what);
+        let stop = core::f32::consts::FRAC_1_SQRT_2;
+        let fill = if switched_off {
+            (OFF_GREY * stop, OFF_GREY * stop, OFF_GREY * stop)
+        } else if !live {
+            (OFF_GREY, OFF_GREY, OFF_GREY)
+        } else if radio.is_none() || what == Corner::Usb {
+            (LIT_GREY, LIT_GREY, LIT_GREY)
+        } else if state == Some(1) {
+            (flav.0 * stop, flav.1 * stop, flav.2 * stop)
+        } else {
+            flav
+        };
+        let ink = g2t_colour(if live && !switched_off { (DARK_INK, DARK_INK, DARK_INK) } else { (LIGHT_INK, LIGHT_INK, LIGHT_INK) });
+        // The text first: it is in front of its disc.
+        if !switched_off {
+            let mut lines = [Txt::new(); 9];
+            let mut nl = 1;
+            // The battery: its charge as the name, then the cell's voltage, the current (+ charging), their product and the temperature, as the gauge measures them (facts 1-4: per cent, hundredths of a degree, µV, µA).
+            let mut charge = Txt::new();
+            if what == Corner::Battery && facts[1] != u64::MAX {
+                charge.num(facts[1] as i64, 1, 0).s(" %");
+                let (cc, uv, ua) = (facts[2] as i64, facts[3] as i64, facts[4] as i64);
+                lines[nl].num(uv, 1_000_000, 3).s(" V");
+                nl += 1;
+                if ua >= 0 {
+                    lines[nl].s("+");
+                }
+                lines[nl].num(ua, 1000, 0).s(" mA");
+                nl += 1;
+                lines[nl].num(uv * ua / 1_000_000, 1_000_000, 2).s(" W");
+                nl += 1;
+                lines[nl].num(cc, 100, 1).s(" \u{B0}C");
+                nl += 1;
             }
-            lines[nl].num(ua, 1000, 0).s(" mA");
-            nl += 1;
-            lines[nl].num(uv * ua / 1_000_000, 1_000_000, 2).s(" W");
-            nl += 1;
-            lines[nl].num(cc, 100, 1).s(" \u{B0}C");
-            nl += 1;
-        }
-        let mut tech = None;
-        if let Some(ri) = radio {
-            for &m in &facts[33 + 8 * ri..41 + 8 * ri] {
-                let Some((kind, v)) = ferros_sys::measure_of(m) else { continue };
-                match kind {
-                    ferros_sys::measure::STATE => {}
-                    ferros_sys::measure::TECH => tech = Some(v),
-                    _ => {
-                        measure_text(&mut lines[nl], kind, v);
-                        nl += 1;
+            let mut tech = None;
+            if let Some(ri) = radio {
+                for &m in &facts[33 + 8 * ri..41 + 8 * ri] {
+                    let Some((kind, v)) = ferros_sys::measure_of(m) else { continue };
+                    match kind {
+                        ferros_sys::measure::STATE => {}
+                        ferros_sys::measure::TECH => tech = Some(v),
+                        _ => {
+                            measure_text(&mut lines[nl], kind, v);
+                            nl += 1;
+                        }
                     }
                 }
             }
-        }
-        let name: &str = match what {
-            Corner::Clock => time,
-            Corner::Cellular => match tech {
-                Some(14) => "LTE",
-                Some(20) => "NR",
-                _ => "cell",
-            },
-            Corner::Wifi => "wifi",
-            Corner::Bluetooth => "bt",
-            Corner::Nfc => "nfc",
-            Corner::Gnss => "gnss",
-            Corner::Usb => "usb",
-            Corner::Battery if charge.n > 0 => charge.str(),
-            Corner::Battery => "batt",
-            Corner::Home | Corner::Spare => "",
-        };
-        if name.is_empty() {
-            continue;
-        }
-        lines[0].s(name);
-        let eng = glyph_engine();
-        let dim = RING_OFF * 1.4;
-        // The name in the radio's flavour, its measures in plain ink; all dim when it does not run.
-        let ink_of = |j: usize| if !live { (dim, dim, dim) } else if j == 0 { ink_c } else { (INK, INK, INK) };
-        // The lines stacked about the centre, a pitch each; each line as large as fits its own chord (seven tenths of the circle's width at the line's far edge), the name half again as large as a measure.
-        let weight = |j: usize| if j == 0 && nl > 1 { 1.5 } else { 1.0 };
-        let total: f32 = (0..nl).map(weight).sum();
-        let pitch = if nl == 1 { r * 0.66 } else { r * 1.5 / total };
-        let mut top_y = y - pitch * total * 0.5;
-        for j in 0..nl {
-            let text = lines[j].str();
-            let lh = pitch * weight(j);
-            let far = libm::fabsf(top_y - y).max(libm::fabsf(top_y + lh - y));
-            // The lines span 1.5 r about the centre, so a line's far edge is at most 0.75 r out and the root's argument stays positive.
-            let chord = 2.0 * libm::sqrtf(r * r - far * far) * 0.7;
-            let mut px = lh * 0.9;
-            let tw0 = eng.width(text, px);
-            if tw0 > chord {
-                px *= chord / tw0;
-            }
-            let tw = eng.width(text, px);
-            let base = top_y + lh * 0.5 + px * 0.36;
-            let ink = ink_of(j);
-            eng.cover(text, x - tw * 0.5, base, px, (1.0, 0.0), |gx, gy, a| {
-                if let Some(i) = at(gx, gy) {
-                    let a = a as f32 / 255.0;
-                    let ch = |sh: u32, ink: f32| { let p = ((chrome[i] >> sh) & 0xFFFF) as f32; ((p + (ink - p) * a) as u64) << sh };
-                    chrome[i] = ch(0, ink.0) | ch(16, ink.1) | ch(32, ink.2);
+            let name: &str = match what {
+                Corner::Clock => time,
+                Corner::Cellular => match tech {
+                    Some(14) => "LTE",
+                    Some(20) => "NR",
+                    _ => "cell",
+                },
+                Corner::Wifi => "wifi",
+                Corner::Bluetooth => "bt",
+                Corner::Nfc => "nfc",
+                Corner::Gnss => "gnss",
+                Corner::Usb => "usb",
+                Corner::Battery if charge.n > 0 => charge.str(),
+                Corner::Battery => "batt",
+                Corner::Home | Corner::Spare => "",
+            };
+            if !name.is_empty() {
+                lines[0].s(name);
+                let eng = glyph_engine();
+                // The lines stacked about the centre, a pitch each; each line as large as fits its own chord (seven tenths of the circle's width at the line's far edge), the name half again as large as a measure.
+                let weight = |j: usize| if j == 0 && nl > 1 { 1.5 } else { 1.0 };
+                let total: f32 = (0..nl).map(weight).sum();
+                let pitch = if nl == 1 { r * 0.66 } else { r * 1.5 / total };
+                let mut top_y = y - pitch * total * 0.5;
+                for j in 0..nl {
+                    let text = lines[j].str();
+                    let lh = pitch * weight(j);
+                    let far = libm::fabsf(top_y - y).max(libm::fabsf(top_y + lh - y));
+                    // The lines span 1.5 r about the centre, so a line's far edge is at most 0.75 r out and the root's argument stays positive.
+                    let chord = 2.0 * libm::sqrtf(r * r - far * far) * 0.7;
+                    let mut px = lh * 0.9;
+                    let tw0 = eng.width(text, px);
+                    if tw0 > chord {
+                        px *= chord / tw0;
+                    }
+                    let tw = eng.width(text, px);
+                    let base = top_y + lh * 0.5 + px * 0.36;
+                    eng.cover(text, x - tw * 0.5, base, px, (1.0, 0.0), |gx, gy, a| {
+                        if let Some(i) = at(gx, gy) {
+                            // A glyph's coverage byte as a 16-bit α (× 257 takes 255 to 65535).
+                            console[i] = console[i].under(ink | (a as u64 * 257) << 48, BlendMode::Normal);
+                        }
+                    });
+                    top_y += lh;
                 }
-            });
-            top_y += lh;
+            }
+        }
+        // Then the disc, under its text: solid, its edge a C∞ step across one pixel centred on the radius.
+        let fill = g2t_colour(fill);
+        let (x0, x1, y0, y1) = ((x - r - 1.0) as i64, (x + r + 1.0) as i64, (y - r - 1.0) as i64, (y + r + 1.0) as i64);
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                let Some(i) = at(px, py) else { continue };
+                let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
+                let cov = bump_step(r + 0.5 - libm::sqrtf(dx * dx + dy * dy));
+                console[i] = console[i].under(fill | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
+            }
         }
     }
     ALLOC.reset();
-    unsafe {
-        if CHROME_US[1] == 0 {
-            CHROME_US[1] = ferros_sys::us_since(t_all);
+    // Decoded once for every publish, and each row's columns that hold any of it.
+    let (cw, span) = unsafe { (core::slice::from_raw_parts_mut(CONSOLE_W as *mut u64, rows * width), core::slice::from_raw_parts_mut(CONSOLE_SPAN as *mut (u16, u16), rows)) };
+    for yy in 0..rows {
+        let (mut l, mut rr) = (width, 0);
+        for xx in 0..width {
+            let i = yy * width + xx;
+            cw[i] = working(console[i], G2T16);
+            if console[i] >> 48 != 0 {
+                if l == width {
+                    l = xx;
+                }
+                rr = xx + 1;
+            }
         }
+        span[yy] = if l < rr { (l as u16, rr as u16) } else { (0, 0) };
     }
     true
 }
+
 /// The rectangle the last frame drew (cleared before the next one draws), and the one this frame is drawing.
 static mut PREV_DMG: draw::Rect = draw::Rect { x0: 0, y0: 0, x1: 4096, y1: 4096 };
 static mut CUR_DMG: draw::Rect = draw::Rect::EMPTY;
@@ -2831,6 +3033,27 @@ extern "C" fn receive(grants: u64) -> ! {
             let (x, y) = (u16::from_le_bytes([msg[9], msg[10]]) as i64, u16::from_le_bytes([msg[11], msg[12]]) as i64);
             let yes = mine.is_some() && owner_at(x, y, w as usize, h as usize) == mine;
             ferros_sys::reply(&tok, &[yes as u8]);
+            continue;
+        }
+        if op == 41 && n >= 5 {
+            // Which console circle is at this point: [x u16][y u16] → the radio's bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GNSS), or G#FF for none or a circle that is not a radio. The map asks it on a tap in the top rows, to switch that radio (preference 15).
+            let (w, h) = unsafe { SCREEN_WH };
+            let (x, y) = (u16::from_le_bytes([msg[1], msg[2]]) as f32 + 0.5, u16::from_le_bytes([msg[3], msg[4]]) as f32 + 0.5);
+            let (circles, cn) = corner_layout(w as usize, h as usize);
+            let mut hit = 0xFFu8;
+            for &(cx, cy, r, what) in &circles[..cn] {
+                if (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r * r {
+                    hit = match what {
+                        Corner::Cellular => 0,
+                        Corner::Wifi => 1,
+                        Corner::Bluetooth => 2,
+                        Corner::Nfc => 3,
+                        Corner::Gnss => 4,
+                        _ => 0xFF,
+                    };
+                }
+            }
+            ferros_sys::reply(&tok, &[hit]);
             continue;
         }
         if op == 24 {
@@ -3064,6 +3287,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         CHROME_BOT = bot;
         plan_glass(width, height);
         CHROME = alloc::vec![0u64; (top + bot) * width].leak().as_mut_ptr() as usize;
+        CONSOLE = alloc::vec![0u64; top * width].leak().as_mut_ptr() as usize;
+        CONSOLE_W = alloc::vec![CLEAR; top * width].leak().as_mut_ptr() as usize;
+        CONSOLE_SPAN = alloc::vec![(0u16, 0u16); top].leak().as_mut_ptr() as usize;
     }
     ALLOC.mark();
     log.s(b"display: present table (E peak ");
@@ -3742,7 +3968,29 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 Some(30) => {
                     let free = (0..SURFACES).find(|&k| unsafe { (*(&raw const WINS))[k] }.is_none());
                     let text: alloc::string::String = match (unsafe { APP }.is_some(), free) {
-                        (false, _) => "canvas\n".into(),
+                        // The home screen: each row as `publish_band` composes it for the glass (the edge, then the console, then the canvas), in working values, into the free surface.
+                        (false, Some(k)) => {
+                            let s = surface(k, width, height);
+                            let (top, line) = (unsafe { CHROME_TOP }, hairline());
+                            let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
+                            let (console_w, console_span) = unsafe { (core::slice::from_raw_parts(CONSOLE_W as *const u64, top * width), core::slice::from_raw_parts(CONSOLE_SPAN as *const (u16, u16), top)) };
+                            for y in 0..height {
+                                let g = &rows[y];
+                                let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), rows[y + 1].first as usize) };
+                                let row_px = &plan[g.first as usize..];
+                                let edge_px = &row_px[row_px.iter().position(|e| e.1 == SHAPE_EDGE).unwrap_or(row_px.len())..];
+                                let (cl, cr) = if y < top { (console_span[y].0 as usize, console_span[y].1 as usize) } else { (0, 0) };
+                                for x in 0..width {
+                                    let mut p = pixels[y * width + x] & ((1 << 48) - 1);
+                                    if x >= cl && x < cr {
+                                        p = console_over(console_w[y * width + x], p);
+                                    }
+                                    s[y * width + x] = edge_over(p, x, g, edge_px, line);
+                                }
+                            }
+                            alloc::format!("G#{:X}\n", s.as_ptr() as usize)
+                        }
+                        (false, None) => "canvas\n".into(),
                         (true, None) => "no free surface\n".into(),
                         (true, Some(k)) => {
                             let s = surface(k, width, height);
@@ -4022,13 +4270,20 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 // The idle fill republishes every phase within an eighth of a second of the last window op.
                 windows_changed(width, height);
             }
-            if { APP }.is_some() && chrome_draw(width, height, false) {
-                let top = draw::Rect { x0: 0, y0: 0, x1: width as i32, y1: CHROME_TOP as i32 };
+            // The console on every screen (it is in front of the home screen and of every app), the chrome's bottom corners while an app is up.
+            let chrome_new = { APP }.is_some() && chrome_draw(width, height, false);
+            let console_new = console_draw(width, height, false);
+            let top = draw::Rect { x0: 0, y0: 0, x1: width as i32, y1: CHROME_TOP as i32 };
+            if { APP }.is_some() && (chrome_new || console_new) {
                 let bottom = draw::Rect { x0: 0, y0: (height - CHROME_BOT) as i32, x1: width as i32, y1: height as i32 };
                 for k in 0..PHASES {
                     publish_app(top, &tabs, k, width, height);
                     publish_app(bottom, &tabs, k, width, height);
                 }
+            } else if console_new {
+                // The home screen: the canvas by its address (`pixels` is held by the request handler's closure here), its top rows into every phase with the console in front.
+                let canvas = core::slice::from_raw_parts(back as *const Px, width * height);
+                publish10x4(canvas, width, height, &tabs, (1 << PHASES) - 1, top);
             }
         }
         // Clients first: every request the receive thread has queued, oldest first. The slot is copied out and released before it is run, so the receive thread can refill it meanwhile.
