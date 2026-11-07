@@ -665,6 +665,8 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     v[32] = crate::process::named_alive_locked(&[b"modem", b"pcie1", b"bt", b"nfc", b"gnss", b"ip"]);
     // 83: whether a person is present (an identity unlocked: 2 yes, 1 no; kvault PERSON), so the radios' drivers can refuse what only a person may start while locked (AUTH.md "Radios while locked").
     v[83] = 1 + crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) as u64;
+    // 84: which board (ferros_kernel board.rs): 1 husky (Pixel 8 Pro), 2 akita (Pixel 8a). For the drivers whose part differs between them (the touch controller).
+    v[84] = 1 + crate::board::akita() as u64;
     // 82: whether this device allows Android from within ferros (ANDROID_ALLOWED: 2 yes, 1 no).
     v[82] = match ANDROID_ALLOWED.load(Relaxed) { 0 => crate::process::FACT_UNKNOWN, s => s };
     // 81: the panel's VCI (panel_power.rs): 2 on, 1 off, unknown until the service loop has read it.

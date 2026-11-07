@@ -82,11 +82,11 @@ impl Port {
     fn irq(&self) -> bool {
         mmio_read(cap(self.grants, S_GPIO), GPIO_DAT) as u32 & 1 == 0
     }
-    /// gpn0-0 as a level-low external interrupt, unmasked, pending cleared: the GIC line (S_IRQ) then fires while the controller holds INT low.
-    fn irq_setup(&self) {
+    /// gpn0-0 as an external interrupt, unmasked, pending cleared: level-low for the FTM5 (the GIC line fires while the controller holds INT low), a falling edge for akita's Goodix (it pulses INT low once a frame: the tree's `irq-flags = 2`; the edge latches in the bank's pending bit until `irq_done`).
+    fn irq_setup(&self, edge: bool) {
         let g = cap(self.grants, S_GPIO);
         mmio_write(g, GPIO_CON, (mmio_read(g, GPIO_CON) as u32 & !0xF) | 0xF);
-        mmio_write(g, EINT_CON, mmio_read(g, EINT_CON) as u32 & !0xF);
+        mmio_write(g, EINT_CON, (mmio_read(g, EINT_CON) as u32 & !0xF) | if edge { 2 } else { 0 });
         mmio_write(g, EINT_PEND, 1);
         mmio_write(g, EINT_MASK, mmio_read(g, EINT_MASK) as u32 & !1);
     }
@@ -226,6 +226,40 @@ fn decode(e: &[u8; EVT_SIZE], phase: u8) -> Contact {
     }
 }
 
+/// What is on the glass, and what has happened since the client last asked: the endpoint's state, whichever controller fills it.
+struct Table {
+    held: [Contact; SLOTS],
+    down: u16,
+    changes: [Contact; CHANGES],
+    head: usize,
+    count: usize,
+}
+
+impl Table {
+    /// One contact event: the held table updated, the event remembered (the oldest dropped once CHANGES are waiting).
+    fn push(&mut self, c: Contact) {
+        let id = c.id as usize;
+        if c.phase == 2 {
+            self.down &= !(1 << id);
+        } else {
+            self.held[id] = c;
+            self.down |= 1 << id;
+        }
+        self.changes[(self.head + self.count) % CHANGES] = c;
+        if self.count < CHANGES {
+            self.count += 1;
+        } else {
+            self.head = (self.head + 1) % CHANGES;
+        }
+    }
+    /// The contact `id` has left, where it was last seen.
+    fn leave(&mut self, id: usize) {
+        let mut c = self.held[id];
+        c.phase = 2;
+        self.push(c);
+    }
+}
+
 /// One line to the console, formatted without a heap.
 struct Line {
     b: [u8; 160],
@@ -241,11 +275,13 @@ impl core::fmt::Write for Line {
 }
 macro_rules! say {
     ($g:expr, $($t:tt)*) => {{
-        let mut l = Line { b: [0; 160], n: 0 };
+        let mut l = $crate::Line { b: [0; 160], n: 0 };
         let _ = core::fmt::Write::write_fmt(&mut l, format_args!($($t)*));
         console($g, &l.b[..l.n]);
     }};
 }
+
+mod goodix;
 
 /// Bring the controller up from cold, as the kernel's `touch::up` did until KERNEL-OUT.md move 1: the `touch` power switch (the port's clocks, reset low, DVDD, 1 ms, AVDD, 15 ms, reset high), then the probe's order from the oracle capture — the controller-ready event (up to 2 s), the GPIO6 fix-up (`FTS_GPIO6_UNUSED`: bit 7 of hardware register G#2000_00DE), the chip ID, and scan mode active with every sensing bit on (`A0 00 FF`, after the two-byte zero write to G#2000_0000 the controller needs before a mode change). Each step goes to the console; a step that fails is said and the rest still run, as the kernel's did.
 fn bring_up(p: &Port, grants: u64) -> bool {
@@ -294,9 +330,18 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The bring-up's console lines format through tables of absolute addresses: apply the payload's relocations first.
     unsafe { ferros_sys::relocate() };
     let p = Port { grants };
+    // akita carries a Goodix where husky has the FTM5 (fact 84; goodix.rs): the same port, reset and rails, its own protocol.
+    let akita = ferros_sys::facts().board() == Some(2);
+    let mut gdx = None;
     // Up to three tries, the controller switched fully off between them: after the jump from Android (the controller still in Android's session) the first bring-up found no controller-ready event, and a restart of this process brought it up (2026-11-01).
     for attempt in 0..3 {
-        if bring_up(&p, grants) {
+        let up = if akita {
+            gdx = goodix::bring_up(&p, grants, cap(grants, S_POWER));
+            gdx.is_some()
+        } else {
+            bring_up(&p, grants)
+        };
+        if up {
             break;
         }
         if attempt < 2 {
@@ -306,33 +351,34 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     console(grants, b"touch: serving the touch endpoint\n");
-    // What is on the glass, and what has happened since the client last asked.
-    let mut held = [Contact::default(); SLOTS];
-    let mut down = 0u16;
-    let mut changes = [Contact::default(); CHANGES];
-    let (mut head, mut count) = (0usize, 0usize);
+    let mut t = Table { held: [Contact::default(); SLOTS], down: 0, changes: [Contact::default(); CHANGES], head: 0, count: 0 };
     let mut msg = [0u8; 64];
     let mut out = [0u8; 1 + REC * SLOTS];
     let mut token = [0u8; 32];
     let tick = freq() / 128;
-    p.irq_setup();
+    p.irq_setup(akita);
     let mut screen_off = false;
+    // akita: the line fired since the last pass (an edge, gone by the time the pin could be read).
+    let mut fired = false;
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
-        // Screen off, sensing off (owner, 2026-10-25: lean power): the controller stops scanning while the screen is dark and starts again when it comes back, as the vendor driver's mode handler does on screen down/up — scan mode active with every sensing bit clear (`A0 00 00`) or set (`A0 00 FF`), each after the two-byte zero write to G#2000_0000 the controller needs before a mode change.
+        // Screen off, sensing off (owner, 2026-10-25: lean power): the controller stops scanning while the screen is dark and starts again when it comes back, as the vendor driver's mode handler does on screen down/up — scan mode active with every sensing bit clear (`A0 00 00`) or set (`A0 00 FF`), each after the two-byte zero write to G#2000_0000 the controller needs before a mode change. The FTM5's commands only: akita's Goodix sleeps by a command through its command address (`brl_suspend`), not written yet, and keeps scanning.
         let off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
-        if off != screen_off {
-            screen_off = off;
+        if off != screen_off && !akita {
             p.transact(&[0xFA, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00], &mut []);
             p.transact(&[0xA0, 0x00, if off { 0x00 } else { 0xFF }], &mut []);
         }
+        screen_off = off;
         // The controller first, so a client's call is answered from a table that is already current.
-        if p.irq() {
+        if let Some(g) = gdx.as_mut() {
+            if fired || p.irq() {
+                g.frame(&p, &mut t);
+            }
+        } else if p.irq() {
             let mut batch = [[0u8; EVT_SIZE]; 32];
             let n = p.drain(&mut batch);
             for e in batch[..n].iter() {
-                let id = ((e[1] >> 4) & 15) as usize;
                 let phase = match e[0] >> 4 {
                     EVT_ENTER => 0,
                     EVT_MOTION => 1,
@@ -340,19 +386,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     // Status, controller-ready and error events carry no contact.
                     _ => continue,
                 };
-                let c = decode(e, phase);
-                if phase == 2 {
-                    down &= !(1 << id);
-                } else {
-                    held[id] = c;
-                    down |= 1 << id;
-                }
-                changes[(head + count) % CHANGES] = c;
-                if count < CHANGES {
-                    count += 1;
-                } else {
-                    head = (head + 1) % CHANGES;
-                }
+                t.push(decode(e, phase));
             }
         }
         // Then any client waiting. `recv` polls, so the loop never blocks and the table keeps moving.
@@ -360,20 +394,20 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         if n != NOTHING && n != 0 {
             let len = match msg[0] {
                 0 => {
-                    let k = count.min(SLOTS);
+                    let k = t.count.min(SLOTS);
                     out[0] = k as u8;
                     for i in 0..k {
-                        changes[(head + i) % CHANGES].write(&mut out[1 + i * REC..1 + (i + 1) * REC]);
+                        t.changes[(t.head + i) % CHANGES].write(&mut out[1 + i * REC..1 + (i + 1) * REC]);
                     }
-                    head = (head + k) % CHANGES;
-                    count -= k;
+                    t.head = (t.head + k) % CHANGES;
+                    t.count -= k;
                     1 + k * REC
                 }
                 1 => {
                     let mut k = 0;
                     for id in 0..SLOTS {
-                        if down >> id & 1 == 1 {
-                            let mut c = held[id];
+                        if t.down >> id & 1 == 1 {
+                            let mut c = t.held[id];
                             c.phase = 1;
                             c.write(&mut out[1 + k * REC..1 + (k + 1) * REC]);
                             k += 1;
@@ -383,8 +417,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     1 + k * REC
                 }
                 2 => {
-                    out[0..2].copy_from_slice(&1343u16.to_le_bytes());
-                    out[2..4].copy_from_slice(&2991u16.to_le_bytes());
+                    // The panel's largest coordinates: husky's HK3 1344 × 2992, akita's AK3B 1080 × 2400 (its tree's panel-max-x/y).
+                    let (xm, ym): (u16, u16) = if akita { (1079, 2399) } else { (1343, 2991) };
+                    out[0..2].copy_from_slice(&xm.to_le_bytes());
+                    out[2..4].copy_from_slice(&ym.to_le_bytes());
                     out[4] = SLOTS as u8;
                     5
                 }
@@ -397,7 +433,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         // Until the controller raises its line, a client calls (the kernel ends the wait early for the endpoint's poller), or the tick — whichever first. The line is masked from firing to `irq_done`; the drain above has emptied the FIFO by then, so INT is high again.
         // A finger is the world: the watchdog's clock paused while waiting for one (ferros_sys::irq_wait_world).
-        ferros_sys::irq_wait_world(cap(grants, S_IRQ), now() + tick);
+        fired = ferros_sys::irq_wait_world(cap(grants, S_IRQ), now() + tick) == 0;
         p.irq_done();
     }
 }

@@ -205,6 +205,10 @@ impl Facts {
     fn get(&self, i: usize) -> Option<u64> {
         Some(self.0[i]).filter(|&v| v != u64::MAX)
     }
+    /// Which board (fact 84): 1 husky (Pixel 8 Pro), 2 akita (Pixel 8a). For a driver whose part differs between them.
+    pub fn board(&self) -> Option<u64> {
+        self.get(84)
+    }
     /// From the press at "Ready?" to the shell starting, microseconds.
     pub fn boot_us(&self) -> Option<u64> {
         self.get(0)
