@@ -14,7 +14,7 @@
 //! Colour: each pixel's orbit gives its smooth escape count n and its distance d to the set (the exterior distance estimate |z| ln|z| / |dz/dz₀|).
 //! d, measured in spans of the frame, draws the filaments and their halo, so their width is the same fraction of the frame on every display; log₂(1 + n), normalised to the survey's median and 99th percentile, shades the field and lights the hottest filaments white and the knots warm.
 //! The layers go front to back (AGENT.md "Compositing: Front to Back, `under` Only"): each a colour at a weight that is a C∞ function of d, n and the relief (a Cauchy bump, an algebraic sigmoid), taking its share of the light still uncovered; nothing is clamped. Behind the near set, the same set again zoomed out, turned and shifted, drawn as a soft dim glow, gives depth; a seeded lamp lights the set's relief (the potential's gradient), Lambert and a sheen, over a low ambient so the picture stays dark.
-//! Each colour is a VSF RGB colour, written as its working value (√light, white at Q14) and mixed as light.
+//! Each colour is a VSF RGB colour, held and mixed as its working code (√light, white at 1), as the display and fluor mix theirs: in light the mixes came out much lighter than they look they should (owner, 2026-11-07).
 //!
 //! Output: the display's working values, a u64 per pixel, R, G and B in bits 0-15, 16-31 and 32-47 as √light × 16384, α G#FFFF in bits 48-63.
 //! f32 and libm only: no fused multiply-add is ever formed (Rust never contracts), the square root is correctly rounded everywhere (aarch64's fsqrt, x86's sqrtss), and libm's logarithms are the same software on every target, so a row is the same wherever it is computed.
@@ -60,7 +60,7 @@ const INSIDE: f32 = 1. / (1u32 << 6) as f32;
 const NEAR_SPAN: f32 = 1. / (1u32 << 7) as f32;
 
 /// The palette, as working values (√light, white = 16384): the background's two ends, the field's shade, the halo, the filament, its white-hot core and the warm spark.
-const BG: [[u16; 3]; 2] = [[2437, 2437, 5591], [3297, 3441, 7025]];
+const BG: [[u16; 3]; 2] = [[1638, 1638, 3932], [2294, 2392, 4915]];
 const SHADE: [u16; 3] = [5243, 5079, 8520];
 const HALO: [u16; 3] = [4588, 5407, 11469];
 const FIL: [u16; 3] = [5898, 7209, 14090];
@@ -113,16 +113,16 @@ const HUE_STEP: [f32; 2] = [PI / 4., 2. * PI / 3.];
 /// How sharply the map's stops hold their colour between neighbours: each stop's weight is a Cauchy bump 1/(1 + ((t − t_k)·GM_K)²), the weights normalised: a C∞ partition of unity, so the map's colour has no kink anywhere.
 const GM_K: f32 = 8.;
 /// Where each layer reads the map: the field across its dark end (by the background's gradient and the slow-escape shade), the far layer and the flames in the middle, the halo above them (drifting with escape speed), the filament at the bright end.
-const FIELD_T: f32 = 3. / 8.;
+const FIELD_T: f32 = 1. / 4.;
 const FAR_T: [f32; 2] = [3. / 8., 5. / 8.];
 const RAYS_T: [f32; 2] = [1. / 4., 5. / 8.];
 const HALO_T: [f32; 2] = [5. / 8., 7. / 8.];
 
-/// The flames' tongues (owner, 2026-11-07: "more flames"): along the flame's real part, sin 2π·Re·FLAME_F made into tongues by an algebraic sigmoid of steepness FLAME_K, laid on by FLAME_A at most; their colour from the map by the imaginary part's own wave, between FLAME_T's ends.
-const FLAME_F: f32 = (1u32 << 3) as f32;
-const FLAME_K: f32 = 8.;
-const FLAME_A: f32 = 3. / 4.;
-const FLAME_T: [f32; 2] = [1. / 8., 3. / 4.];
+/// The soft flame (tapuwae's, owner 2026-11-07: "more flames"): two waves along the flame's contours at FLAME_F times its own scale, fading in away from the set as (d²/(d² + FLAME_FADE²)) in pixels, so they read in the open field and never crowd near the set: a hue wave from its real part, moving where the field reads the map by FLAME_T either way (the map's neighbouring stops are other hues), and a lightness wave from its imaginary part that only darkens, by FLAME_L at most (owner: "pretty dark").
+const FLAME_F: f32 = (1u32 << 2) as f32;
+const FLAME_FADE: f32 = (1u32 << 2) as f32;
+const FLAME_T: f32 = 3. / 16.;
+const FLAME_L: f32 = 3. / 8.;
 
 /// Saturation from the seed too (owner, 2026-11-07: "balanced around grey, saturation/hue dependent upon hash"): the palette's chroma times a seeded factor in this range, muted to rich, so over all people the colours average to grey.
 const SAT: [f32; 2] = [1. / 2., 1.];
@@ -140,7 +140,7 @@ pub struct Params {
     pub step: [f32; 2],
     /// The background gradient's direction, scaled so a span is 1 / GRAD_SPANS.
     pub grad: [f32; 2],
-    /// The density gradient map's colours in linear light, dark to light, each its own hue (`STOPS`); and the white-hot core's and the warm sparks'.
+    /// The density gradient map's colours as working codes (√light), dark to light, each its own hue (`STOPS`); and the white-hot core's and the warm sparks'.
     pub stops: [[f32; 3]; STOPS],
     pub hot: [f32; 3],
     pub warm: [f32; 3],
@@ -218,11 +218,11 @@ pub fn render_rows(p: &Params, rows: Range<usize>, out: &mut [u64]) {
     }
 }
 
-/// Packs linear light into a working value: √light × 16384, opaque.
-/// Every colour mixed is a convex combination of the palette's, whose channels are at most 1, so each channel's code is at most 16384 and fits its 16 bits.
+/// Packs a colour in working codes (√light, white at 1) into a working value: the code × 16384, opaque.
+/// Every colour mixed is a convex combination of the palette's codes, at most 1, times factors at most 1 (the lamp, the flame's darkening), so each channel is at most 16384 and fits its 16 bits.
 #[inline]
 pub fn pack(c: [f32; 3]) -> u64 {
-    let q = |v: f32| (libm::sqrtf(v) * 16384.) as u64;
+    let q = |v: f32| (v * 16384.) as u64;
     q(c[0]) | q(c[1]) << 16 | q(c[2]) << 32 | 0xFFFF << 48
 }
 
@@ -517,6 +517,8 @@ fn lerp(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 struct Frame<'a> {
     p: &'a Params,
     half: [f32; 2],
+    /// The frame's span in pixels (for the flame's fade, in pixels from the set).
+    span: f32,
     /// The near view and the far one: each its plane at the frame's centre, its step per pixel along x, and the factor from plane distance to spans of the frame.
     views: [([f32; 2], [f32; 2], f32); 2],
 }
@@ -528,7 +530,7 @@ const FAR_VIEW: usize = 1;
 impl<'a> Frame<'a> {
     fn new(p: &'a Params) -> Frame<'a> {
         let ds = |s: [f32; 2]| 1. / (libm::sqrtf(s[0] * s[0] + s[1] * s[1]) * span(p.width, p.height));
-        Frame { p, half: [p.width as f32 * 0.5, p.height as f32 * 0.5], views: [(p.centre, p.step, ds(p.step)), (p.far_centre, p.far_step, ds(p.far_step))] }
+        Frame { p, half: [p.width as f32 * 0.5, p.height as f32 * 0.5], span: span(p.width, p.height), views: [(p.centre, p.step, ds(p.step)), (p.far_centre, p.far_step, ds(p.far_step))] }
     }
 
     /// The plane under pixel (x, y) in view `v`.
@@ -613,16 +615,22 @@ impl<'a> Frame<'a> {
         let rays = sig((o.s - RAYS_MID) * RAYS_K);
         // The flame's glow is not lit: far from the set the potential's gradient spins round its critical points, and lit it drew small dark stars in the open field.
         put(map(RAYS_T[0] + (RAYS_T[1] - RAYS_T[0]) * rays), RAYS_A * rays / (1. + tg * tg));
-        // The flames' tongues, behind the glow and in front of the far layer.
-        let fr = libm::sinf(o.f[0] * FLAME_F * TAU);
-        let fi = libm::sinf(o.f[1] * FLAME_F * TAU);
-        put(map(FLAME_T[0] + (FLAME_T[1] - FLAME_T[0]) * (0.5 + 0.5 * fi)), FLAME_A * sig(fr * FLAME_K));
         put(map(FAR_T[0] + (FAR_T[1] - FAR_T[0]) * far), FAR_A * far);
         // The field, opaque, last: the map's dark end, by the background's seeded gradient and where escape is slow.
+        // The soft flame on the field: its hue wave moves where the field reads the map, its lightness wave darkens it, both fading in away from the set.
+        let px = ds * self.span;
+        let fade = px * px / (px * px + FLAME_FADE * FLAME_FADE);
+        let hue_wave = libm::sinf(o.f[0] * FLAME_F * TAU) * FLAME_T * fade;
+        let dark = 1. - FLAME_L * (0.5 + 0.5 * libm::sinf(o.f[1] * FLAME_F * TAU)) * fade;
         let pos = sig(fx * p.grad[0] + fy * p.grad[1]);
-        put(map(FIELD_T * (pos + SHADE_A * slow) * (1. / (1. + SHADE_A))), 1.);
+        put(lit(map(FIELD_T * (pos + SHADE_A * slow) * (1. / (1. + SHADE_A)) + hue_wave), dark), 1.);
         acc
     }
+}
+
+/// Light to working codes, √light a channel: the wallpaper mixes its layers in codes, as the display, fluor and tapuwae all do (owner, 2026-11-07: "we should be doing it in squared space, rather than linear to give it a dark appearance"); in light, a dark field half covered by a bright halo came out at half the bright light, much lighter than it looks it should.
+fn codes(c: [f32; 3]) -> [f32; 3] {
+    [libm::sqrtf(c[0]), libm::sqrtf(c[1]), libm::sqrtf(c[2])]
 }
 
 /// The density gradient map at `t` (0 the dark end, 1 the light): each stop weighted by a Cauchy bump about its place, the weights normalised, so the colour is a convex sum of the stops' and C∞ in t.
@@ -772,7 +780,7 @@ pub fn candidate(seed: &[u8; 32], attempt: u32, width: usize, height: usize) -> 
     let mut stops = [[0f32; 3]; STOPS];
     let mut h = hue;
     for k in 0..STOPS {
-        stops[k] = turn(STOP_CODES[k], h, sat);
+        stops[k] = codes(turn(STOP_CODES[k], h, sat));
         let s = hr.range(HUE_STEP);
         h += if hr.next() & 1 == 0 { s } else { -s };
     }
@@ -785,8 +793,8 @@ pub fn candidate(seed: &[u8; 32], attempt: u32, width: usize, height: usize) -> 
         step: [sc * libm::cosf(view_turn), sc * libm::sinf(view_turn)],
         grad: [g * libm::cosf(grad_turn), g * libm::sinf(grad_turn)],
         stops,
-        hot: turn(HOT, far_hue, sat),
-        warm: turn(WARM, warm_hue, sat),
+        hot: codes(turn(HOT, far_hue, sat)),
+        warm: codes(turn(WARM, warm_hue, sat)),
         far_centre: [zx * pull + shift * libm::cosf(shift_turn), zy * pull + shift * libm::sinf(shift_turn)],
         far_step: [far_sc * libm::cosf(far_turn), far_sc * libm::sinf(far_turn)],
         lamp: [libm::cosf(lamp_turn), libm::sinf(lamp_turn)],
