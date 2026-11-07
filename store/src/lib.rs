@@ -7,7 +7,9 @@
 //!
 //! Keys come from outside: each call carries the domain's two keys, as the kernel issues them for the kist whose request it is (VAULT-OUT.md, decision 1). Nothing here derives a key from a root.
 //!
-//! A rewrite takes a fresh id, so its pieces never overwrite the live value's: the head moves to the new id in the same engine commit as the last piece, and only then are the old pieces removed. An interrupted write leaves the old value whole; its own written pieces are unreachable until the orphan sweep (not built yet).
+//! A rewrite takes a fresh id, so its pieces never overwrite the live value's: the head moves to the new id in the same engine commit as the last piece, and only then are the old pieces removed. An interrupted write leaves the old value whole; a value large enough that its pieces reach the engine before its head is on the domain's pending list meanwhile, so `sweep` finds what such a write left behind.
+//!
+//! Each domain keeps its own books, as entries whose names begin with a zero byte: its list of names (`names`) and its pending list, each a VSF document with a repeated field.
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
@@ -110,8 +112,23 @@ impl Head {
     }
 }
 
+/// The vault's own entries in a domain: names beginning with a zero byte (a process's keys are printable ASCII, kete's address entries begin with a one byte, so none can be these). The domain's list of names, and the ids of values being written (`sweep`).
+const NAMES: &[u8] = b"\0names";
+const PENDING: &[u8] = b"\0pending";
+
+fn names_schema() -> SectionSchema {
+    SectionSchema::new("names").field("name", TypeConstraint::Wrapped(b'r'))
+}
+
+fn pending_schema() -> SectionSchema {
+    SectionSchema::new("pending").field("id", TypeConstraint::AnyHash)
+}
+
 /// A value being written a piece at a time (`Store::begin`, `write`, `finish`).
 pub struct Writer {
+    /// Whether this write keeps the domain's books (its name in the list, its id in the pending list): every write a caller makes; not the books' own.
+    books: bool,
+    name: Vec<u8>,
     head_addr: [u8; 32],
     id: [u8; 32],
     len: u64,
@@ -260,7 +277,11 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
 
     /// Start writing `name` afresh (its current value stays until `finish`).
     pub fn begin(&mut self, d: &Domain, name: &[u8]) -> Writer {
-        Writer { head_addr: Self::head_addr(d, name), id: self.fresh_id(), len: 0, piece: Vec::with_capacity(PIECE), sealed: Vec::new(), written: 0 }
+        self.writer(d, name, true)
+    }
+
+    fn writer(&mut self, d: &Domain, name: &[u8], books: bool) -> Writer {
+        Writer { head_addr: Self::head_addr(d, name), id: self.fresh_id(), len: 0, piece: Vec::with_capacity(PIECE), sealed: Vec::new(), written: 0, books, name: name.to_vec() }
     }
 
     /// The next bytes of the value being written.
@@ -273,7 +294,7 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
             if w.piece.len() == PIECE {
                 self.seal_piece(d, w)?;
                 if w.sealed.len() == BATCH {
-                    self.flush_pieces(w)?;
+                    self.flush_pieces(d, w)?;
                 }
             }
         }
@@ -289,7 +310,11 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         Ok(())
     }
 
-    fn flush_pieces(&mut self, w: &mut Writer) -> Result<()> {
+    /// Hand the sealed pieces to the engine ahead of the head. The first time a value does, its id goes on the domain's pending list, so pieces stranded by a write that never finishes can be found again (`sweep`); a value whose pieces all go with its head never needs it.
+    fn flush_pieces(&mut self, d: &Domain, w: &mut Writer) -> Result<()> {
+        if w.written == 0 && w.books {
+            self.edit_list(d, PENDING, pending_schema, "id", |l| l.push(VsfType::hb(w.id.to_vec())))?;
+        }
         let items: Vec<(&[u8; 32], &[u8])> = w.sealed.iter().map(|(a, s)| (a, s.as_slice())).collect();
         self.vault.put_batch(&items, (self.now)())?;
         w.written += w.sealed.len() as u64;
@@ -297,10 +322,11 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         Ok(())
     }
 
-    /// Finish the value: its last piece and its new head in one engine commit (the switch from the old value to the new is that commit), then the old value's pieces removed.
+    /// Finish the value: its last piece and its new head in one engine commit (the switch from the old value to the new is that commit), then the old value's pieces removed, and the books: a new name joins the domain's list, the id leaves the pending list.
     pub fn finish(&mut self, d: &Domain, mut w: Writer) -> Result<()> {
         self.forget();
         let old = self.vault.get(&w.head_addr)?.map(|s| Self::open(d, &w.head_addr, s).and_then(|p| Head::decode(&p))).transpose()?;
+        let pending = w.written > 0;
         // A value that fits one piece and was never split goes inline in its head: one engine entry.
         let head = if w.written == 0 && w.sealed.is_empty() {
             Head { len: w.len, id: w.id, inline: Some(core::mem::take(&mut w.piece)) }
@@ -315,8 +341,18 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         let mut items: Vec<(&[u8; 32], &[u8])> = w.sealed.iter().map(|(a, s)| (a, s.as_slice())).collect();
         items.push((&w.head_addr, &sealed_head));
         self.vault.put_batch(&items, (self.now)())?;
-        if let Some(old) = old {
-            self.drop_pieces(d, &old)?;
+        if let Some(old) = &old {
+            self.drop_pieces(d, old)?;
+        }
+        if w.books {
+            if old.is_none() {
+                let name = w.name.clone();
+                self.edit_list(d, NAMES, names_schema, "name", |l| l.push(VsfType::v(b'r', name)))?;
+            }
+            if pending {
+                let id = w.id.to_vec();
+                self.edit_list(d, PENDING, pending_schema, "id", |l| l.retain(|v| !matches!(v, VsfType::hb(b) if *b == id)))?;
+            }
         }
         Ok(())
     }
@@ -336,14 +372,69 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         Ok(())
     }
 
-    /// Remove the value: its head (so it is gone at once) and then its pieces. Returns whether it was there.
+    /// Remove the value: its head (so it is gone at once), then its pieces, then its name from the domain's list. Returns whether it was there.
     pub fn delete(&mut self, d: &Domain, name: &[u8]) -> Result<bool> {
         let Some((at, h)) = self.head(d, name)? else { return Ok(false) };
         self.vault.delete(&at, (self.now)())?;
         self.drop_pieces(d, &h)?;
         // After: looking the head up kept it.
         self.forget();
+        let name = name.to_vec();
+        self.edit_list(d, NAMES, names_schema, "name", |l| l.retain(|v| !matches!(v, VsfType::v(b'r', n) if *n == name)))?;
         Ok(true)
+    }
+
+    /// The domain's names, as callers wrote them (the vault's own entries are not among them).
+    pub fn names(&mut self, d: &Domain) -> Result<Vec<Vec<u8>>> {
+        Ok(self.list(d, NAMES, names_schema, "name")?.into_iter().filter_map(|v| if let VsfType::v(b'r', n) = v { Some(n) } else { None }).collect())
+    }
+
+    /// The pieces of every value whose write never finished in this domain, removed: each pending id's pieces from the first until one is not there (a value's pieces go to the engine in order). Run when the domain's keys are at hand (the vault process does it at a domain's first request after it starts). Returns how many pieces it removed.
+    pub fn sweep(&mut self, d: &Domain) -> Result<u64> {
+        let ids: Vec<[u8; 32]> = self.list(d, PENDING, pending_schema, "id")?.into_iter().filter_map(|v| if let VsfType::hb(b) = v { b.try_into().ok() } else { None }).collect();
+        let now = (self.now)();
+        let mut n = 0;
+        for id in &ids {
+            let mut k = 0;
+            while self.vault.delete(&Self::piece_addr(d, id, k), now)? {
+                k += 1;
+            }
+            n += k;
+        }
+        if !ids.is_empty() {
+            self.edit_list(d, PENDING, pending_schema, "id", |l| l.clear())?;
+        }
+        Ok(n)
+    }
+
+    /// One of the domain's own lists: the values of its repeated field `field`, none when it is absent.
+    fn list(&mut self, d: &Domain, which: &[u8], schema: fn() -> SectionSchema, field: &str) -> Result<Vec<VsfType>> {
+        let Some(doc) = self.get(d, which)? else { return Ok(Vec::new()) };
+        let s = SectionBuilder::parse_document(schema(), &doc, None).map_err(|_| Error::Format)?;
+        Ok(s.get_fields(field).iter().flat_map(|f| f.values.iter().cloned()).collect())
+    }
+
+    /// Change one of the domain's own lists and write it again (an empty list is removed). Its own write keeps no books.
+    fn edit_list(&mut self, d: &Domain, which: &[u8], schema: fn() -> SectionSchema, field: &str, f: impl FnOnce(&mut Vec<VsfType>)) -> Result<()> {
+        let mut l = self.list(d, which, schema, field)?;
+        f(&mut l);
+        if l.is_empty() {
+            if let Some((at, h)) = self.head(d, which)? {
+                self.vault.delete(&at, (self.now)())?;
+                self.drop_pieces(d, &h)?;
+                self.forget();
+            }
+            return Ok(());
+        }
+        let mut b = schema().build();
+        for v in l {
+            b = b.append_multi(field, alloc::vec![v]).map_err(|_| Error::Format)?;
+        }
+        let section = b.encode().map_err(|_| Error::Format)?;
+        let doc = vsf::VsfBuilder::new().creation_time_oscillations((self.now)()).provenance_only().add_unboxed(schema().name.clone(), section).build().map_err(|_| Error::Format)?;
+        let mut w = self.writer(d, which, false);
+        self.write(d, &mut w, &doc)?;
+        self.finish(d, w)
     }
 }
 
@@ -461,6 +552,40 @@ mod tests {
         wrong.addr = d.addr;
         assert!(matches!(s.read(&wrong, b"big", 0, &mut [0u8; 16]), Err(Error::Open)));
         assert!(matches!(s.read(&wrong, b"big", (3 * PIECE) as u64, &mut [0u8; 16]), Err(Error::Open)));
+    }
+
+    /// The domain's names follow its puts and deletes (a rewrite adds nothing), and never show the vault's own entries.
+    #[test]
+    fn names_follow() {
+        let mut s = store(1 << 14);
+        let d = domain(3);
+        s.put(&d, b"a", b"1").unwrap();
+        s.put(&d, b"b", &bytes(2 * PIECE, 1)).unwrap();
+        s.put(&d, b"a", b"2").unwrap();
+        let mut n = s.names(&d).unwrap();
+        n.sort();
+        assert_eq!(n, vec![b"a".to_vec(), b"b".to_vec()]);
+        s.delete(&d, b"a").unwrap();
+        assert_eq!(s.names(&d).unwrap(), vec![b"b".to_vec()]);
+        assert!(s.names(&domain(4)).unwrap().is_empty());
+    }
+
+    /// A large write abandoned before its head leaves pieces only `sweep` finds; it removes exactly those, and the old value under the name stays whole. A finished large write leaves nothing to sweep.
+    #[test]
+    fn sweep_strays() {
+        let mut s = store(1 << 15);
+        let d = domain(8);
+        let old = bytes(100, 2);
+        s.put(&d, b"w", &old).unwrap();
+        let before = s.engine().live_keys().unwrap().len();
+        let mut w = s.begin(&d, b"w");
+        s.write(&d, &mut w, &bytes(3 * BATCH * PIECE, 5)).unwrap();
+        drop(w);
+        assert_eq!(s.get(&d, b"w").unwrap().unwrap(), old);
+        assert_eq!(s.sweep(&d).unwrap(), (3 * BATCH) as u64);
+        assert_eq!(s.engine().live_keys().unwrap().len(), before);
+        s.put(&d, b"x", &bytes(2 * BATCH * PIECE + 5, 6)).unwrap();
+        assert_eq!(s.sweep(&d).unwrap(), 0);
     }
 
     /// A value written in uneven slices is the value written whole.
