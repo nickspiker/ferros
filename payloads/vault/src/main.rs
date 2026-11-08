@@ -1,6 +1,6 @@
 //! The vault process (docs/VAULT-OUT.md): the vault out of the kernel. It owns its disk (a window of blocks the kernel moves for it, `ferros_sys::block_read`/`block_write`), the layout (manifestus: the rotating ring, the tract, the HAMT, two mirrors), and the values of any size, sealed in pieces (`ferros_store`). The kernel moves blocks and issues each request's domain keys; it holds, parses and seals no value.
 //!
-//! The mirrors: A from block 0 of the window, B from half way (the window is 2 × 8 GiB, process.rs WINDOWS); each starts at MIRROR blocks (512 MiB) and grows into its half later (manifestus `grow`), because a blank vault is read whole before its first commit and 8 GiB would be four million reads.
+//! The mirrors: A from block 0 of the window, B from half way (the window is 2 × 8 GiB, process.rs WINDOWS). A blank region starts at MIRROR blocks (512 MiB), because a blank vault is read whole before its first commit and 8 GiB would be four million reads; once a vault is there each mirror opens bounded by its half and grows into it (manifestus `grow`, `Half::grow` zeroing from the committed extent).
 //!
 //! Requests come only from the kernel: each is a process's `SYS_STORE` call (process.rs `store_forward`) or the kernel's own call (`vault_call`: the bridge's store commands, and op 4, drop, at release), or a process's export (`SYS_UNLOCK` op 5, forwarded: op 5 here), stamped with the domain keys of its scope, one transfer at most. [op: 0 set, 1 get, 2 delete, 3 list][flags: bit 0 old entries wait in the kernel's vault][lock epoch u32 LE][domains][per domain: class (1 the person's), address key, sealing key][name length][name: within the scope, or 1 and a 32-byte address][rest]. Rest: set [offset u64][more u8][bytes]; get [offset u64][length u32]; list [offset u64][length u32][addresses u8]. The reply: [the syscall's value u64 LE][the bytes for the caller's buffer].
 //!
@@ -137,6 +137,28 @@ impl BlockDev for Half {
     fn flush(&mut self) -> manifestus::Result<()> {
         Ok(())
     }
+    /// A grow without the old extent: refused. This device is a window larger than the vault's extent, so only the engine knows where the old blocks end; manifestus's tract grows call `grow_from` with it.
+    fn grow(&mut self, new_blocks: u64) -> manifestus::Result<()> {
+        Err(manifestus::Error::Corrupt(alloc::format!("a grow to {new_blocks} blocks without the old extent: refused (the window zeroes only from a known extent)")))
+    }
+    /// The tract grown from `old_blocks` to `new_blocks` (the device's whole extent before and after, manifestus's space-first rule): exactly the new blocks zeroed, nothing below. 2026-11-08: this zeroed from a mark of its own that a grow during the vault's open found still unset, and wiped both mirrors from block 0 (the vault had filled at its first 512 MiB, where the default refused to grow).
+    fn grow_from(&mut self, old_blocks: u64, new_blocks: u64) -> manifestus::Result<()> {
+        // WHY: a half of the window is all one mirror has; past it the vault is full, and a write must fail rather than reach the other mirror.
+        if new_blocks > self.blocks {
+            return Err(manifestus::Error::Corrupt(alloc::format!("the vault's window is full: {new_blocks} blocks wanted, {} in a mirror", self.blocks)));
+        }
+        let zero = alloc::vec![0u8; RUN << 12];
+        let mut at = old_blocks;
+        while at < new_blocks {
+            // A run of up to RUN blocks a call, the last one shorter.
+            let n = (new_blocks - at).min(RUN as u64) as usize;
+            if ferros_sys::block_write(cap(grants(), S_BLOCKS), self.base + at, &zero[..n << 12]) != 0 {
+                return Err(manifestus::Error::Corrupt(alloc::format!("zeroing the grown tract failed at {at}")));
+            }
+            at += n as u64;
+        }
+        Ok(())
+    }
 }
 
 /// Nonces from the kernel's entropy (the session's wairua), drawn 4 KiB at a time.
@@ -211,7 +233,12 @@ type St = Store<Half, Half, Entropy>;
 
 extern "C" fn work(_: u64) -> ! {
     let t0 = now();
-    let mirror = Mirror::new(Half { base: 0, blocks: MIRROR }, Half { base: HALF, blocks: MIRROR });
+    // Each mirror bounded by its half of the window (8 GiB), so a grown tract opens again; what is in use is the committed extent, claimed below. A blank region (block 0, the first root slot, all zeros) opens at MIRROR instead: a blank vault is read whole before its first commit, and over 8 GiB that would be four million reads. The next open finds it and takes the half.
+    let mut probe = [0u8; 4096];
+    let blank = ferros_sys::block_read(cap(grants(), S_BLOCKS), 0, &mut probe) == 0 && probe.iter().all(|&b| b == 0);
+    let bound = if blank { MIRROR } else { HALF };
+    say!("vault: block 0 blank {}, opening bounded at {} blocks a mirror", blank, bound);
+    let mirror = Mirror::new(Half { base: 0, blocks: bound }, Half { base: HALF, blocks: bound });
     let vault = match Vault::open(mirror, RING_LOG2, seconds(), DeletePolicy::UnlinkOnly) {
         Ok(v) => v,
         Err(e) => {
@@ -219,6 +246,7 @@ extern "C" fn work(_: u64) -> ! {
             ferros_sys::exit(2);
         }
     };
+    say!("vault: tract {} blocks from {}, the window {} a mirror", vault.tract_blocks(), vault.tract_base(), HALF);
     let mut store = Store::new(vault, Entropy { pool: [0; 4096], at: 4096 }, seconds);
     say!("vault: open in {} ms, serving", (now() - t0) * 1000 / freq());
     // One transfer and its stamp each way, with room to spare.
@@ -383,14 +411,22 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
                     writers.push(Pending { domain: id, person, name: name.to_vec(), next: 0, w: store.begin(&d, name) });
                     writers.len() - 1
                 });
-                let ok = store.write(&d, &mut writers[i].w, bytes).is_ok();
+                // A refused write or finish says why on the console (2026-11-08: every write failed with "vault error" and no word of the cause).
+                let written = store.write(&d, &mut writers[i].w, bytes);
                 writers[i].next += bytes.len() as u64;
-                if !ok {
+                if let Err(e) = written {
+                    say!("vault: write refused at {}: {:?}", offset, e);
                     writers.swap_remove(i);
                     ERR
                 } else if !more {
                     let w = writers.swap_remove(i).w;
-                    if store.finish(&d, w).is_ok() { 0 } else { ERR }
+                    match store.finish(&d, w) {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            say!("vault: finish refused: {:?}", e);
+                            ERR
+                        }
+                    }
                 } else {
                     0
                 }
