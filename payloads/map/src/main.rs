@@ -1271,7 +1271,7 @@ impl Map {
         call(self.display, &m, &mut r);
     }
 
-    /// The camera that shows every circle with air around them, never closer than one world unit to a pixel: every circle inside the screen's width and the big circle (`active_circle`) together, so none lands past an edge or under the console in a top corner (owner, 2026-11-08: "the fit doesn't fit to screen extents anded with the big circle"). The turn is kept; the circles' bounds are taken as the screen will turn them, their middle put on the big circle's centre, and the zoom is the largest at which each circle passes both tests, seven eighths of the way.
+    /// The camera that shows every circle with air around them, never closer than one world unit to a pixel: every circle inside the screen's width and the big circle (`active_circle`) together, so none lands past an edge or under the console in a top corner (owner, 2026-11-08: "the fit doesn't fit to screen extents anded with the big circle"). The turn is kept; the circles' bounds are taken as the screen will turn them, their middle put on the big circle's centre, and the zoom is the largest at which each circle passes both tests, with no margin.
     fn home(&self) -> Cam {
         let (c, s, one) = (self.cam.c as f64, self.cam.s as f64, ONE as f64);
         // A world offset (×256) turned as `Cam::screen` turns it.
@@ -1291,7 +1291,8 @@ impl Map {
         let (_, ay, ar) = self.arrived();
         let (half_w, ar) = (self.w as f64 * 0.5, ar as f64);
         // The zoom (Q16 pixels a world unit; a world offset ×256 is (d / 256) · (z / 2¹⁶) pixels): each circle's farthest reach across, |du| + r, within the half width, and its farthest reach from the big circle's centre, √(du² + dv²) + r, within its radius.
-        let room = (7. / 8.) * (1u64 << 24) as f64;
+        // No margin (owner, 2026-11-08: "No margins."): the outermost circle touches the edge it meets.
+        let room = (1u64 << 24) as f64;
         let mut z = f64::MAX;
         for i in 0..self.n {
             let (u, v) = turn(self.xs[i] as f64, self.ys[i] as f64);
