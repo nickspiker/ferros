@@ -8,7 +8,8 @@
 //! `orb-tune --dump <out.vsf> [key=value ...]` writes the left side as a VSF visual (VSF RGB, gamma2tanh at 16 bits) instead of opening a window; `--nuclei` prints each bulb's nucleus.
 
 mod look;
-mod sky;
+
+use orb::sky;
 
 use look::{Look, Prep, RADIOS};
 

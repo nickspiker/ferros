@@ -1,13 +1,20 @@
-//! The GPS orb (owner, 2026-11-07): the sky seen from be        ([sat_l, knot_l, arc_l, sky_l].map(|l| l.map(|v| w * v / (w + v))), 0.75 * dome)ow, built from what the receiver knows.
+//! The GPS orb (owner, 2026-11-07): the sky seen from below, built from what the receiver knows.
 //! Zenith at the centre, the horizon inside the vessel's body, by Lambert's azimuthal equal-area projection: ρ = ρ_h·√2·sin(z/2), z the zenith angle.
 //! Equal-area, not stereographic: every patch of sky keeps its area on the dome, so a crowded sector looks crowded and the horizon is not swollen.
 //! Each tracked satellite is a light at its azimuth and elevation: its light its C/N0, its colour the frequency it is heard on, its shape the spectrum of its code.
 //! The fix is the knot where the used satellites' range arcs cross, its size the horizontal error estimate, its shape the geometry's error ellipse.
 //! GPS time is a faint ripple through the dome; the whole dome is turned by a secret angle and optionally mirrored, and no satellite IDs are drawn.
 //! In the tool the satellites are synthetic (the driver does not decode them yet): a seed places them, the knobs set how many, how strong, how many in the fix.
+//! On the device there are none yet: the dome alone while searching, and while fixed a round knot the size of the driver's error estimate.
 
+// The float maths without std (see `Fm`); unused where std is in the build.
+#[allow(unused_imports)]
+use crate::Fm;
 use crate::look::{Look, RING_LIGHT, mix, unit};
-use std::f32::consts::TAU;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::f32::consts::TAU;
 use vsf::colour::convert::apply_matrix_3x3_f32;
 use vsf::colour::spectral::constants::{LMS_2000_10DEG_1NM, LMS2VSF_RGB};
 
@@ -253,10 +260,15 @@ impl Sky {
         let herr_r = k.herr_m / DOME_M * rho_h;
         let sigma_r = herr_r / hdop2;
         let n_fit = used.len();
-        let fixed = fixed_state && q.is_some();
-        let knot = fixed.then(|| {
-            let s2 = (sigma_r * sigma_r) as f64;
-            Knot { cxx: (qxx * s2) as f32, cxy: (qxy * s2) as f32, cyy: (qyy * s2) as f32 }
+        // Fixed with no satellites to draw (the device, until the driver decodes them): the receiver's word for the fix, and no geometry to shape the knot, so a round one whose RMS radius is the error estimate (half its square on each axis).
+        let blind = sats.is_empty();
+        let fixed = fixed_state && (q.is_some() || blind);
+        let knot = fixed.then(|| match q {
+            Some(_) => {
+                let s2 = (sigma_r * sigma_r) as f64;
+                Knot { cxx: (qxx * s2) as f32, cxy: (qxy * s2) as f32, cyy: (qyy * s2) as f32 }
+            }
+            None => Knot { cxx: herr_r * herr_r * 0.5, cxy: 0., cyy: herr_r * herr_r * 0.5 },
         });
         let n_used = if fixed { n_fit } else { 0 };
         // This frame's lights.
@@ -280,7 +292,7 @@ impl Sky {
             s.arc_r = if fixed { rho } else { rho * (1. + 0.25 * (TAU * (frame * (1. + s.ph[0]) / (1 << 7) as f32 + s.ph[1])).sin()) };
         }
         let fl = k.flavour.map(|g| g * g);
-                Sky {
+        Sky {
             sats,
             rho_h,
             knot,

@@ -1,0 +1,13 @@
+[package]
+name = "orb"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "The console's radio circles: the vessel (Lumis's camera-button profile made radial), the Julia orb read as the link's I/Q plane, and the GPS sky dome, as fluor G2t16 layers composed front to back with under; no I/O"
+
+[dependencies]
+libm = "0.2"
+# The g2t encoder (tanh √L) and the cone tables the satellites' colours come from (no_std).
+vsf = { path = "../../vsf", default-features = false }
+# The one compositing kernel, `under`, at 16 bits (fluor's pixel module is no_std).
+fluor = { path = "../../fluor", default-features = false }

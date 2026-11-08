@@ -12,6 +12,8 @@ description = "The console's radio circles on the desktop: the vessel (Lumis's c
 fluor = { path = "../../../fluor", features = ["host-winit"] }
 # The g2t encoder (tanh √L) for every layer's colour, and the VSF visual that --dump writes.
 vsf = { path = "../../../vsf" }
+# The circles' maths, shared with the device (payloads/display's console).
+orb = { path = "../../orb" }
 rayon = "1"
 
 # fluor's own development profile, mirrored: profiles come from the binary's crate, not the dependency's, and fluor's paint code relies on wrapping arithmetic (its dev and release profiles both build with overflow checks off). The orb is per-pixel iteration, so the optimisation level matters too.
