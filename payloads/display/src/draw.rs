@@ -843,3 +843,162 @@ pub fn logo(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
     }
     Rect { x0: tx0 as i32, y0: y0 as i32, x1: tx1 as i32 + 1, y1: y1 as i32 + 1 }
 }
+
+/// The ferros mark while something moves (owner, 2026-11-07: "a simple distance squared check to determine the ring and then a segment based on angle instead of rendering and filling shapes"; no antialiasing in motion), as `logo` places it. Each row is cut at its breakpoints — where it crosses each piece's arcs (a root per arc a row, from the squared radii) and each piece's sides (lines through the centre: one division a side a row, no angle) — and each run between two breakpoints is one piece's colour throughout, found once at its middle by the squared distance and the sides' signs, and filled straight under what is there (the pieces are opaque). The mark at rest is `logo`'s, antialiased.
+pub fn logo_hard(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, c: i64, s: i64, lit: bool) -> Rect {
+    const N: usize = LOGO.len();
+    if r < 256 {
+        return Rect::EMPTY;
+    }
+    let (rf, cxf, cyf) = (r as f32 * (1.0 / 256.0), cx as f32 * (1.0 / 256.0), cy as f32 * (1.0 / 256.0));
+    let (cf, sf) = (c as f32 * (1.0 / 16384.0), s as f32 * (1.0 / 16384.0));
+    let turn = |nx: f32, ny: f32| (cf * nx - sf * ny, sf * nx + cf * ny);
+    // Each piece in screen pixels: its squared radii, its sides' inward normals turned onto the screen, whether it goes all the way round, whether its sides are a union (over half a turn), and its colour as an opaque pixel.
+    let mut pieces = [(0f32, 0f32, (0f32, 0f32), (0f32, 0f32), false, false, [0u64; 2]); N];
+    let mut bps_r = [0f32; 2 * N];
+    let mut nr = 0;
+    let mut sides = [(0f32, 0f32); 2 * N];
+    let mut ns = 0;
+    for (k, &(inner, outer, start, sweep, colour, grey)) in LOGO.iter().enumerate() {
+        let (a0, a1) = (start * core::f32::consts::TAU, (start + sweep) * core::f32::consts::TAU);
+        let n0 = turn(-libm::sinf(a0), libm::cosf(a0));
+        let n1 = turn(libm::sinf(a1), -libm::cosf(a1));
+        let col = if lit { colour } else { [grey; 3] };
+        let p = ALPHA | col[0] as u64 | (col[1] as u64) << 16 | (col[2] as u64) << 32;
+        let (rin, rout) = (inner * rf, outer * rf);
+        pieces[k] = (rin * rin, rout * rout, n0, n1, sweep >= 1.0, sweep > 0.5, [p, p]);
+        for rr in [rin, rout] {
+            if rr > 0.0 && !bps_r[..nr].iter().any(|&q| libm::fabsf(q - rr) < 1e-3) {
+                bps_r[nr] = rr;
+                nr += 1;
+            }
+        }
+        if sweep < 1.0 {
+            for n in [n0, n1] {
+                if !sides[..ns].iter().any(|&q| libm::fabsf(q.0 - n.0) + libm::fabsf(q.1 - n.1) < 1e-3 || libm::fabsf(q.0 + n.0) + libm::fabsf(q.1 + n.1) < 1e-3) {
+                    sides[ns] = n;
+                    ns += 1;
+                }
+            }
+        }
+    }
+    // The piece a point (offset from the centre) is in, by its squared distance and its sides' signs.
+    let at = |dx: f32, dy: f32| -> Option<[u64; 2]> {
+        let d2 = dx * dx + dy * dy;
+        for &(ri2, ro2, n0, n1, whole, union, p) in &pieces {
+            if d2 < ri2 || d2 >= ro2 {
+                continue;
+            }
+            if !whole {
+                let (s0, s1) = (n0.0 * dx + n0.1 * dy >= 0.0, n1.0 * dx + n1.1 * dy >= 0.0);
+                if !(if union { s0 || s1 } else { s0 && s1 }) {
+                    continue;
+                }
+            }
+            return Some(p);
+        }
+        None
+    };
+    // WHY the bounds: the disc follows the map's camera and is often partly off the screen (or the clip); its rows and columns are cut to them so no index lands outside the canvas.
+    let (bx0, by0, bx1, by1) = bounds(width, height);
+    let (y0, y1) = (((cyf - rf - 1.0) as i64).max(by0), ((cyf + rf + 1.0) as i64).min(by1 - 1));
+    let (mut tx0, mut tx1) = (i64::MAX, i64::MIN);
+    for y in y0..=y1 {
+        let dy = y as f32 + 0.5 - cyf;
+        if dy * dy >= rf * rf {
+            continue;
+        }
+        // The breakpoints on this row, as offsets from the centre: the arcs' crossings and the sides'.
+        let mut b = [0f32; 4 * N + 2];
+        let mut nb = 0;
+        for &rr in &bps_r[..nr] {
+            let q = rr * rr - dy * dy;
+            if q > 0.0 {
+                let h = libm::sqrtf(q);
+                b[nb] = -h;
+                b[nb + 1] = h;
+                nb += 2;
+            }
+        }
+        for &(nx, ny) in &sides[..ns] {
+            // The line nx·dx + ny·dy = 0 crosses the row at dx = −ny·dy / nx; one along the row (nx near 0) crosses it nowhere that matters.
+            if libm::fabsf(nx) > 1e-6 {
+                b[nb] = -ny * dy / nx;
+                nb += 1;
+            }
+        }
+        // In order: a short list, by insertion.
+        for i in 1..nb {
+            let v = b[i];
+            let mut j = i;
+            while j > 0 && b[j - 1] > v {
+                b[j] = b[j - 1];
+                j -= 1;
+            }
+            b[j] = v;
+        }
+        let row = y as usize * width;
+        // Never empty: the outermost arc is the disc's own, crossed by every row inside it.
+        for i in 1..nb {
+            let (lo, hi) = (b[i - 1], b[i]);
+            let Some(p) = at((lo + hi) * 0.5, dy) else { continue };
+            // The run's pixels: those whose centres fall in [lo, hi), cut to the bounds.
+            let (xa, xb) = ((libm::ceilf(cxf + lo - 0.5) as i64).max(bx0), (libm::ceilf(cxf + hi - 0.5) as i64).min(bx1));
+            if xa >= xb {
+                continue;
+            }
+            let run = &mut px[row + xa as usize..row + xb as usize];
+            let n2 = run.len() & !1;
+            let mut k = 0;
+            while k < n2 {
+                unsafe { crate::neon::under2(run.as_mut_ptr().add(k), p.as_ptr()) };
+                k += 2;
+            }
+            for q in &mut run[n2..] {
+                *q = under(*q, p[0]);
+            }
+            tx0 = tx0.min(xa);
+            tx1 = tx1.max(xb);
+        }
+    }
+    if tx0 > tx1 {
+        return Rect::EMPTY;
+    }
+    Rect { x0: tx0 as i32, y0: y0 as i32, x1: tx1 as i32, y1: y1 as i32 + 1 }
+}
+
+/// A disc while something moves (owner, 2026-11-07: no antialiasing in motion): every pixel whose centre is inside the radius, solid, under what is there, each row one run (its reach from one root); the disc at rest is `disc`'s, antialiased. Q8 pixels as `disc`.
+pub fn disc_hard(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32) -> Rect {
+    if r < 128 {
+        return Rect::EMPTY;
+    }
+    let (bx0, by0, bx1, by1) = bounds(width, height);
+    let p = [opaque(colour); 2];
+    let (rf, cxf, cyf) = (r as f32 * (1.0 / 256.0), cx as f32 * (1.0 / 256.0), cy as f32 * (1.0 / 256.0));
+    // WHY the bounds: the disc follows the camera and is often partly off the screen (or the clip); its rows and columns are cut to them.
+    let (y0, y1) = (((cyf - rf) as i64 - 1).max(by0), ((cyf + rf) as i64 + 1).min(by1 - 1));
+    for y in y0..=y1 {
+        let dy = y as f32 + 0.5 - cyf;
+        let q = rf * rf - dy * dy;
+        if q <= 0.0 {
+            continue;
+        }
+        let h = libm::sqrtf(q);
+        // The pixels whose centres fall in [cx − h, cx + h].
+        let (xa, xb) = ((libm::ceilf(cxf - h - 0.5) as i64).max(bx0), (libm::floorf(cxf + h - 0.5) as i64 + 1).min(bx1));
+        if xa >= xb {
+            continue;
+        }
+        let run = &mut px[y as usize * width + xa as usize..y as usize * width + xb as usize];
+        let n2 = run.len() & !1;
+        let mut k = 0;
+        while k < n2 {
+            unsafe { crate::neon::under2(run.as_mut_ptr().add(k), p.as_ptr()) };
+            k += 2;
+        }
+        for q in &mut run[n2..] {
+            *q = under(*q, p[0]);
+        }
+    }
+    Rect { x0: ((cx - r) >> 8) as i32 - 2, y0: ((cy - r) >> 8) as i32 - 2, x1: ((cx + r) >> 8) as i32 + 3, y1: ((cy + r) >> 8) as i32 + 3 }.clip(width, height)
+}

@@ -1992,6 +1992,8 @@ static mut PAN: Option<([u8; 18], u8, u32, (i64, i64))> = None;
 static mut CLEAR_PENDING: bool = false;
 /// Measuring pans: frames shifted, their µs summed (the shift, the strips), the worst.
 static mut PAN_US: [u64; 4] = [0; 4];
+/// Measuring frames drawn while something moves: count, the scene µs and the publish µs summed, the worst whole frame.
+static mut MOVE_US: [u64; 4] = [0; 4];
 
 /// The canvas moved by (dx, dy) whole pixels in place (a pixel at (x, y) goes to (x + dx, y + dy)); what nothing moves into is cleared. Rows in the order that never reads a row already written.
 fn canvas_shift(px: &mut [Px], width: usize, height: usize, dx: i64, dy: i64) {
@@ -5171,15 +5173,20 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                                 unsafe { SCENE_US[1] += ferros_sys::us_since(t_b) };
                             } else {
                                 if cir.icon == ICON_FERROS {
-                                    draw::logo(pixels, width, height, sx, sy, ri, tc, ts, true);
-                                    draw::disc(pixels, width, height, sx, sy, ri, 0);
+                                    // While something moves, by rings and segments without antialiasing (`draw::logo_hard`); at rest antialiased.
+                                    if moving {
+                                        draw::logo_hard(pixels, width, height, sx, sy, ri, tc, ts, true);
+                                    } else {
+                                        draw::logo(pixels, width, height, sx, sy, ri, tc, ts, true);
+                                    }
+                                    if moving { draw::disc_hard(pixels, width, height, sx, sy, ri, 0) } else { draw::disc(pixels, width, height, sx, sy, ri, 0) };
                                 } else if let Some(mp) = mp {
                                     draw::icon(pixels, width, height, sx, sy, ri, tc, ts, mp, lit);
                                 }
                                 let t_d = now();
                                 unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
                                 if mp.is_none() && cir.icon != ICON_FERROS {
-                                    draw::disc(pixels, width, height, sx, sy, ri, fill);
+                                    if moving { draw::disc_hard(pixels, width, height, sx, sy, ri, fill) } else { draw::disc(pixels, width, height, sx, sy, ri, fill) };
                                 }
                                 r = draw::Rect::EMPTY;
                                 unsafe { SCENE_US[1] += ferros_sys::us_since(t_d) };
@@ -5285,6 +5292,27 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             SEC_US[5] += SCENE_US[0];
                             SEC_US[6] += SCENE_US[1];
                             SEC_US[7] += CLEAR_US;
+                        }
+                        // Measuring frames drawn while something moves (the camera op's flag): every 64, the scene's draw (or the pan's shift and strips), the publish and the worst whole frame.
+                        if moving {
+                            unsafe {
+                                let whole = ferros_sys::us_since(t_pan);
+                                MOVE_US[0] += 1;
+                                MOVE_US[1] += PHASE_US[0];
+                                MOVE_US[2] += PHASE_US[2];
+                                MOVE_US[3] = MOVE_US[3].max(whole);
+                                if MOVE_US[0] == 64 {
+                                    log.s(b"display: moving, 64 frames: scene ");
+                                    log.dec(MOVE_US[1] / 64);
+                                    log.s(b" us, publish ");
+                                    log.dec(MOVE_US[2] / 64);
+                                    log.s(b" us a frame; worst whole frame ");
+                                    log.dec(MOVE_US[3]);
+                                    log.s(b" us\n");
+                                    log.flush();
+                                    MOVE_US = [0; 4];
+                                }
+                            }
                         }
                         // Measuring the region's frames (COMPOSITOR.md): every 128 of them, the average front layer's draw, wait for the last frame and publish, the worst whole frame, and the pixels damaged a frame.
                         if skip_scene {

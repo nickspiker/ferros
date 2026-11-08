@@ -2312,6 +2312,36 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         map.draw();
     }
+    // FERROS_MAP_START=zoom (development, measuring the scene while it grows): two seconds after start, 128 display frames (held four seconds at the largest, for a capture) of a pinch with a twist from the home view, the settings circle and its mark growing past the screen, each frame drawn moving and paced by the panel (op 24), then the view back home at rest; the frames the panel showed to the console.
+    if option_env!("FERROS_MAP_START") == Some("zoom") {
+        sleep_until(now() + 2 * freq());
+        let home = map.cam;
+        map.touching = true;
+        let mut fr = [0u8; 4];
+        call(display, &[24], &mut fr);
+        let (t0, f0) = (now(), u32::from_le_bytes(fr));
+        for k in 0..128i64 {
+            // At the largest, held four seconds (the frame drawn moving stays on the screen), for a capture.
+            if k == 64 {
+                sleep_until(now() + 4 * freq());
+            }
+            let grow = if k < 64 { 1016 } else { 1000_000 / 1016 };
+            map.cam.z = map.cam.z * grow / 1000;
+            let (c, sn) = (map.cam.c * 16380 / ONE - map.cam.s * 286 / ONE, map.cam.s * 16380 / ONE + map.cam.c * 286 / ONE);
+            map.cam.c = c;
+            map.cam.s = sn;
+            map.draw();
+            call(display, &[24], &mut fr);
+        }
+        let ms = ferros_sys::us_since(t0) / 1000;
+        let frames = u32::from_le_bytes(fr).wrapping_sub(f0);
+        let mut l = Line::new();
+        let _ = write!(l, "map: zoom 128 draws in {ms} ms, {frames} frames on the panel\n");
+        console(grants, l.as_str().as_bytes());
+        map.touching = false;
+        map.cam = home;
+        map.draw();
+    }
     console(grants, b"map: home drawn; a tap on a circle opens it\n");
     // FERROS_MAP_START=crowd: 200 more circles in the display's scene only (never the vault), for timing a busy home screen.
     if option_env!("FERROS_MAP_START") == Some("crowd") {
