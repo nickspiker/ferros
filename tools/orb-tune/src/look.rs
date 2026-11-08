@@ -1,11 +1,13 @@
 //! The look of one console circle: the vessel (Lumis's camera-button profile, made radial) and the orb inside it.
 //! Every layer is built in linear VSF RGB light, encoded to `g2t` codes (tanh √L) at 16 bits, and composed front to back with fluor's `under`: the rim's rings (glass, in front), the radio's name (only while it is off), the orb, the dark body, then black.
+//! GPS draws the sky dome (sky.rs) in the orb's place, and its map pin in the name's.
 //! Positions are in units of the circle's radius r, so the same look holds at every size; the rings are blurred analytically by the sample's footprint (a Gaussian under a box is near a wider Gaussian of the same area), so a ring under a pixel wide still antialiases.
 
 use fluor::pixel::{Blend, BlendMode, G2t16, Pixel};
 use rayon::prelude::*;
 use std::f64::consts::TAU;
 use vsf::colour::convert::delinearize_gamma2tanh_f32;
+use crate::sky::{self, Sky};
 
 /// A complex number, for the Julia set and the bulbs' Newton solves.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -90,6 +92,9 @@ const fn q14(r: f32, g: f32, b: f32) -> [f32; 3] {
 }
 
 /// The seven radios, keys 0 to 6.
+/// The GPS radio's index, whose orb is the sky dome.
+pub const GPS: usize = 5;
+
 pub const RADIOS: [Radio; 7] = [
     Radio { name: "WiFi", console_r: 81., flavour: q14(0., 10918., 7075.), turn: 0., conj: false, phase: 0.5, bands: ["2.4 GHz", "5 GHz", "6 GHz"], bw_mhz: 80., qam_bits: 8 },
     Radio { name: "LTE", console_r: 109., flavour: q14(13932., 6972., 0.), turn: 0.25, conj: false, phase: 0.25, bands: ["low", "mid", "high"], bw_mhz: 20., qam_bits: 6 },
@@ -141,6 +146,25 @@ pub struct Look {
     pub plane: f32,
     /// The soft knee's light, stops from white: the orb's light L becomes W·L/(W + L), so nothing reaches a ceiling.
     pub knee_stops: f32,
+    /// GPS: tracked satellites a system (GPS, Galileo, GLONASS, BeiDou, QZSS, NavIC), from the seed's sky.
+    pub sats: [u32; 6],
+    /// The seed that places the satellites (azimuth, elevation, C/N0 noise, GLONASS channel, L5).
+    pub seed: u32,
+    /// C/N0's spread about its elevation trend, dB.
+    pub cn0_spread: f32,
+    /// How many of the strongest are used in the fix.
+    pub used: u32,
+    /// The fraction of the satellites whose system has an L5 signal that carry one.
+    pub l5_frac: f32,
+    /// The horizontal error estimate, m (the driver's ACCURACY, in mm there).
+    pub herr_m: f32,
+    /// The open sky's sector, turns: 1 the whole sky, small an urban canyon (the satellites' azimuths squeezed into it, so the geometry, and HDOP, worsens).
+    pub sector: f32,
+    /// Privacy: the dome turned by this secret angle (turns), and mirrored.
+    pub secret_turn: f32,
+    pub mirror: bool,
+    /// The colour map's stretch about L1 (γ in `sky::carrier_nm`).
+    pub stretch: f32,
 }
 
 impl Look {
@@ -171,6 +195,16 @@ impl Look {
             orb_r: 0.75,
             plane: 1.5,
             knee_stops: -1.,
+            sats: [8, 6, 5, 6, 2, 0],
+            seed: 0,
+            cn0_spread: 6.,
+            used: 12,
+            l5_frac: 0.5,
+            herr_m: 4.,
+            sector: 1.,
+            secret_turn: 0.,
+            mirror: false,
+            stretch: 4.,
         }
     }
 }
@@ -277,7 +311,7 @@ const N_MAX: u32 = 1 << 10;
 const N_SUM: u32 = 1 << 5;
 
 /// The light of VSF grey at the console ring's working value 9000 (Q14): the flavours are at this photopic light (or their brightest channel full), so the orb takes it as its unit.
-const RING_LIGHT: f32 = (9000. / (1 << 14) as f32) * (9000. / (1 << 14) as f32);
+pub(crate) const RING_LIGHT: f32 = (9000. / (1 << 14) as f32) * (9000. / (1 << 14) as f32);
 
 /// e^{−κ}I₀(κ), the mean of e^{κ(cos θ − 1)} over a turn (von Mises), by I₀'s series: normalises a constellation point so a sharp one is bright and a smeared one a dim haze of the same symbols.
 fn vm_mean(kappa: f64) -> f64 {
@@ -343,10 +377,13 @@ pub struct Prep {
     knee: f32,
     sparks: Vec<Spark>,
     spark_s: f32,
+    /// GPS: the sky dome in place of the Julia orb while the radio is on, and the map pin while it is off.
+    sky: Option<Sky>,
+    pin: bool,
 }
 
 /// Stepping a hash: SplitMix64.
-fn mix(k: u64) -> u64 {
+pub(crate) fn mix(k: u64) -> u64 {
     let mut z = k.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -354,7 +391,7 @@ fn mix(k: u64) -> u64 {
 }
 
 /// A uniform in [0, 1) from a hash.
-fn unit(h: u64) -> f64 {
+pub(crate) fn unit(h: u64) -> f64 {
     (h >> 11) as f64 / (1u64 << 53) as f64
 }
 
@@ -469,6 +506,8 @@ impl Prep {
             knee: k.knee_stops.exp2(),
             sparks,
             spark_s,
+            sky: (k.radio == GPS && k.orb && k.state != 0).then(|| Sky::new(k)),
+            pin: k.radio == GPS && k.orb && k.state == 0,
         }
     }
 
@@ -511,7 +550,7 @@ fn tint_layer(l: [f32; 3], a: f32) -> G2t16 {
 const BLACK: G2t16 = u64::MAX;
 
 /// One sample at (x, y) in r units from the centre, `fs` the sample's footprint in r, `text` the name's layer (a composite) at this pixel: every layer front to back from empty.
-fn sample(p: &Prep, x: f32, y: f32, fs: f32, text: G2t16) -> G2t16 {
+fn sample(p: &Prep, x: f32, y: f32, fs: f32, px: f32, text: G2t16) -> G2t16 {
     let rho2 = x * x + y * y;
     let d = 1. - rho2.sqrt();
     // The rings, Lumis's shape made smooth: each channel peaks at its own depth, drops off a cliff on its outer side and fades e-fold every λ on its inner, exp(−s(e^{t/s} − 1 − t/s)) with t the depth above the peak in λ (C∞, its peak rounded where Lumis's is a point). The footprint widens λ by its box (variance fs²/12, the ring's light kept), and s so the cliff is never under a footprint.
@@ -528,7 +567,19 @@ fn sample(p: &Prep, x: f32, y: f32, fs: f32, text: G2t16) -> G2t16 {
     let mut acc: G2t16 = 0;
     acc = acc.under(light_layer(ring), BlendMode::Normal);
     acc = acc.under_premult(text, BlendMode::Normal);
-    if p.orb {
+    if p.pin {
+        // GPS off: the map pin in the ink, its coverage the display's C∞ step across two pixels of its signed distance.
+        let cov = sky::bump_step((1. - sky::pin_sd(x, y) / px) * 0.5);
+        acc = acc.under(tint_layer([sky::PIN_INK; 3], cov), BlendMode::Normal);
+    }
+    if let Some(sky) = &p.sky {
+        // GPS on: the dome's four layers front to back, the satellites, the knot, the range arcs, the sky; then the night, black at the dome's opacity, before the body.
+        let (lights, night) = sky.light(x, y, fs);
+        for l in lights {
+            acc = acc.under(light_layer(l), BlendMode::Normal);
+        }
+        acc = acc.under(tint_layer([0.; 3], night), BlendMode::Normal);
+    } else if p.orb {
         acc = acc.under(light_layer(orb(p, x, y, rho2, fs)), BlendMode::Normal);
     }
     // The body: its tint, opaque but for 2⁻⁴ of the background, rising by a logistic (C∞) under the green ring, so nothing is drawn outside.
@@ -655,7 +706,7 @@ pub fn render(p: &Prep, r: f32, ss: u32, text: &[G2t16]) -> (Vec<G2t16>, usize) 
                 for a in 0..ss {
                     let x = (i as f32 + (a as f32 + 0.5) / ss as f32 - mid) / r;
                     let y = (j as f32 + (b as f32 + 0.5) / ss as f32 - mid) / r;
-                    let s = sample(p, x, y, fs, t).channels();
+                    let s = sample(p, x, y, fs, 1. / r, t).channels();
                     for c in 0..3 {
                         sum[c] += s[c] as u64;
                     }
@@ -670,7 +721,8 @@ pub fn render(p: &Prep, r: f32, ss: u32, text: &[G2t16]) -> (Vec<G2t16>, usize) 
 /// The radio's name, when it is off: its flavour's colour a stop over the ring's, centred in a square of side `side`, as a composite layer.
 pub fn name_layer(text: &mut fluor::text::TextRenderer, k: &Look, r: f32, side: usize) -> Vec<G2t16> {
     let mut buf = vec![0u64; side * side];
-    if k.state != 0 || !k.orb {
+    // GPS shows its symbol, the pin (drawn in `sample`), not its name.
+    if k.state != 0 || !k.orb || k.radio == GPS {
         return buf;
     }
     let name = RADIOS[k.radio].name;

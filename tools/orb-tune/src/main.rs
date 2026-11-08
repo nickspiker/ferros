@@ -3,10 +3,12 @@
 //! Left: one console circle drawn large, and beside it the same circle at its true size on husky's 1344 × 2992 panel (the radius `corner_layout` solves for that radio's corner) and at twice that, so the look is judged at real size.
 //! Right: one slider row per knob, its value in its own unit, in the style of chirp's bell tune.
 //! The circle is the vessel (Lumis's camera-button profile made radial: three channel rings at their own depths, a dark tinted body) and, behind the O toggle, the orb inside it: a Julia set whose c every dimension of the radio's link picks.
+//! GPS (radio 5) has its own orb, the sky dome (sky.rs): its satellites, their fix and the privacy turn on the last fifteen sliders; switched off it shows its map pin.
 //! Keys: R rolls every dimension of the link, S prints every knob (paste-ready as --dump arguments), 0-6 pick the radio, O shows or hides the orb, Space makes it alive (one frame step a redraw, counted in frames, no clock).
 //! `orb-tune --dump <out.vsf> [key=value ...]` writes the left side as a VSF visual (VSF RGB, gamma2tanh at 16 bits) instead of opening a window; `--nuclei` prints each bulb's nucleus.
 
 mod look;
+mod sky;
 
 use look::{Look, Prep, RADIOS};
 
@@ -31,7 +33,7 @@ struct Knob {
     step: f32,
 }
 
-const KNOBS: [Knob; 25] = [
+const KNOBS: [Knob; 40] = [
     Knob { key: "radio", label: "radio", lo: 0., hi: 6., step: 1. },
     Knob { key: "depth", label: "rim depth", lo: 0., hi: 1. / (1 << 2) as f32, step: 0. },
     Knob { key: "width", label: "rim tail λ", lo: 1. / (1 << 9) as f32, hi: 1. / (1 << 4) as f32, step: 0. },
@@ -57,6 +59,22 @@ const KNOBS: [Knob; 25] = [
     Knob { key: "plane", label: "plane half-width", lo: 1. / (1 << 1) as f32, hi: 4., step: 0. },
     Knob { key: "knee", label: "soft knee", lo: -4., hi: 2., step: 0. },
     Knob { key: "sharp", label: "rim sharpness s", lo: 1. / (1 << 4) as f32, hi: 1., step: 0. },
+    // GPS (radio 5): the sky dome's synthetic sky, its fix, and the privacy turn.
+    Knob { key: "gps", label: "GPS satellites", lo: 0., hi: 16., step: 1. },
+    Knob { key: "gal", label: "Galileo satellites", lo: 0., hi: 16., step: 1. },
+    Knob { key: "glo", label: "GLONASS satellites", lo: 0., hi: 16., step: 1. },
+    Knob { key: "bds", label: "BeiDou satellites", lo: 0., hi: 16., step: 1. },
+    Knob { key: "qzss", label: "QZSS satellites", lo: 0., hi: 8., step: 1. },
+    Knob { key: "navic", label: "NavIC satellites", lo: 0., hi: 8., step: 1. },
+    Knob { key: "seed", label: "sky seed", lo: 0., hi: 1023., step: 1. },
+    Knob { key: "cn0", label: "C/N0 spread", lo: 0., hi: 16., step: 0. },
+    Knob { key: "used", label: "used in fix", lo: 0., hi: 32., step: 1. },
+    Knob { key: "l5", label: "L5-capable", lo: 0., hi: 1., step: 0. },
+    Knob { key: "herr", label: "horizontal error", lo: 1., hi: (1 << 7) as f32, step: 0. },
+    Knob { key: "sky", label: "open sky (DOP)", lo: 1. / (1 << 4) as f32, hi: 1., step: 0. },
+    Knob { key: "turn", label: "secret turn", lo: 0., hi: 1., step: 0. },
+    Knob { key: "mirror", label: "mirror", lo: 0., hi: 1., step: 1. },
+    Knob { key: "stretch", label: "L1 stretch γ", lo: 1., hi: (1 << 4) as f32, step: 0. },
 ];
 const N_KNOBS: usize = KNOBS.len();
 const K_RADIO: usize = 0;
@@ -86,7 +104,17 @@ fn get(k: &Look, i: usize) -> f32 {
         21 => k.orb_r,
         22 => k.plane,
         23 => k.knee_stops,
-        _ => k.sharp,
+        24 => k.sharp,
+        25..=30 => k.sats[i - 25] as f32,
+        31 => k.seed as f32,
+        32 => k.cn0_spread,
+        33 => k.used as f32,
+        34 => k.l5_frac,
+        35 => k.herr_m,
+        36 => k.sector,
+        37 => k.secret_turn,
+        38 => k.mirror as u32 as f32,
+        _ => k.stretch,
     }
 }
 
@@ -120,7 +148,17 @@ fn set(k: &mut Look, i: usize, v: f32) {
         21 => k.orb_r = v,
         22 => k.plane = v,
         23 => k.knee_stops = v,
-        _ => k.sharp = v,
+        24 => k.sharp = v,
+        25..=30 => k.sats[i - 25] = v as u32,
+        31 => k.seed = v as u32,
+        32 => k.cn0_spread = v,
+        33 => k.used = v as u32,
+        34 => k.l5_frac = v,
+        35 => k.herr_m = v,
+        36 => k.sector = v,
+        37 => k.secret_turn = v,
+        38 => k.mirror = v != 0.,
+        _ => k.stretch = v,
     }
 }
 
@@ -134,6 +172,7 @@ fn show(k: &Look, i: usize) -> String {
         5 => format!("{v:.2} stops under"),
         6..=8 => format!("{v:.3} √L"),
         9 => if k.orb { "on" } else { "off" }.to_string(),
+        10 if k.radio == look::GPS => ["off", "searching", "fixed"][k.state as usize].to_string(),
         10 => ["off", "searching", "connected"][k.state as usize].to_string(),
         11 => format!("period {}", k.period),
         12 => format!("{v:.1} dB"),
@@ -147,7 +186,20 @@ fn show(k: &Look, i: usize) -> String {
         21 => format!("{v:.3} r"),
         22 => format!("{v:.3}"),
         23 => format!("{v:+.2} stops"),
-        _ => format!("{v:.3}"),
+        24 => format!("{v:.3}"),
+        25..=30 => format!("{}", v as u32),
+        31 => format!("{}", k.seed),
+        32 => format!("±{v:.1} dB"),
+        33 => {
+            let s = sky::Sky::new(k);
+            format!("{} of {} tracked", s.n_used, s.n_tracked)
+        }
+        34 => format!("{:.0} %", v * 100.),
+        35 => format!("±{v:.1} m"),
+        36 => format!("{:.0}°, HDOP {:.2}", v * 360., sky::Sky::new(k).hdop),
+        37 => format!("{:.0}°", v * 360.),
+        38 => if k.mirror { "mirrored" } else { "as seen" }.to_string(),
+        _ => format!("γ {v:.2}"),
     }
 }
 
@@ -169,6 +221,9 @@ fn print_knobs(k: &Look) {
     println!("{}", args.join(" "));
     let c = Prep::new(k).c();
     println!("  c = {:+.6} {:+.6}i", c.re, c.im);
+    if k.radio == look::GPS {
+        println!("{}", sky::Sky::new(k).report());
+    }
 }
 
 /// A smooth (C∞) minimum, (a + b − √((a − b)² + δ²))/2 with δ = 2⁻⁵ of a + b: a hair under the smaller, with no corner where the two cross.
@@ -675,6 +730,9 @@ fn dump(out: &str, args: &[String]) {
     let v = Visual { title: "orb tune".into(), text: args_line.join(" "), planes: vec![plane], ..Default::default() };
     let bytes = v.write().unwrap_or_else(|e| fail(&format!("visual: {e}")));
     std::fs::write(out, &bytes).unwrap_or_else(|e| fail(&format!("{out}: {e}")));
+    if k.radio == look::GPS {
+        println!("{}", sky::Sky::new(&k).report());
+    }
     let c = Prep::new(&k).c();
     println!("{out}: {w}x{h}; big circle r {big} at (0, 0) side {s0}, 2x at ({}, 0) side {s1}, true size at ({}, {}) side {s2}; c = {:+.6} {:+.6}i", s0 + gap, places[2].0, places[2].1, c.re, c.im);
 }
