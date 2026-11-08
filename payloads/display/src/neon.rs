@@ -103,7 +103,7 @@ unsafe fn code16(o: &Odt, a: uint16x8_t, b: uint16x8_t) -> (uint16x8_t, uint16x8
 
 /// Three channels of 16 Q4 codes, dithered by `th` (one threshold per pixel, 0-63), packed B[31:22] G[21:12] R[11:2] A[1:0] (each code's two low bits zero, for the DQE's truncation) and stored as 16 words: the word's four bytes are four planes — (R << 4) | 3, (G << 6) | (R >> 4), G >> 2, B — written by one interleaving store.
 #[inline(always)]
-unsafe fn dither_pack(q: [uint16x8_t; 6], th: uint8x16_t, dst: *mut u32) {
+pub unsafe fn dither_pack(q: [uint16x8_t; 6], th: uint8x16_t, dst: *mut u32) {
     unsafe {
         let (t0, t1) = (vmovl_u8(vget_low_u8(th)), vmovl_high_u8(th));
         let code = |a: uint16x8_t, b: uint16x8_t| vqshrn_high_n_u16::<6>(vqshrn_n_u16::<6>(vqaddq_u16(a, t0)), vqaddq_u16(b, t1));
@@ -177,5 +177,45 @@ pub unsafe fn under2(dst: *mut u64, src: *const u64) {
         let hi = vmull_high_u16(s, room);
         let q = vrshrn_high_n_u32::<16>(vrshrn_n_u32::<16>(vsraq_n_u32::<16>(lo, lo)), vsraq_n_u32::<16>(hi, hi));
         vst1q_u16(dst as *mut u16, vqaddq_u16(d, q));
+    }
+}
+
+/// Two pixels as an opaque layer at opacity `a` (16-bit coverage, 65535 whole): each colour lane c · a / 65535 (rounded as `under2` divides), the alpha lane a. A flight's page image (COMPOSITOR.md "The flight, prerendered"), made opaque first by composing it over the wallpaper or black, at the flight's progress.
+#[inline(always)]
+pub unsafe fn opaque_at2(p: *mut u64, a: u16) {
+    unsafe {
+        const COLOUR: [u16; 8] = [0xFFFF, 0xFFFF, 0xFFFF, 0, 0xFFFF, 0xFFFF, 0xFFFF, 0];
+        let v = vld1q_u16(p as *const u16);
+        let av = vdupq_n_u16(a);
+        let lo = vmull_u16(vget_low_u16(v), vget_low_u16(av));
+        let hi = vmull_high_u16(v, av);
+        let q = vrshrn_high_n_u32::<16>(vrshrn_n_u32::<16>(vsraq_n_u32::<16>(lo, lo)), vsraq_n_u32::<16>(hi, hi));
+        vst1q_u16(p as *mut u16, vbslq_u16(vld1q_u16(COLOUR.as_ptr()), q, av));
+    }
+}
+
+/// Eight working pixels (the 16-bit canvas's) to their codes, red, green and blue: light, ODT and code once a pixel (a flight frame's half resolution, COMPOSITOR.md "The flight, prerendered"). The canvas is over black: alpha plays no part.
+#[inline(always)]
+pub unsafe fn codes8(o: &Odt, src: *const u64) -> [uint16x8_t; 3] {
+    unsafe {
+        let p = vld4q_u16(src as *const u16);
+        let (r, g, b) = matrix8(o, light16(o, p.0), light16(o, p.1), light16(o, p.2));
+        // code16 takes two lights' eights and gives each its own codes back in order: red and green in one, blue alone.
+        let (cr, cg) = code16(o, r, g);
+        let (cb, _) = code16(o, b, b);
+        [cr, cg, cb]
+    }
+}
+
+/// Eight half-resolution codes a channel spread over sixteen columns, linearly: each even column its own code, each odd one the rounded mean of its code and the next (`next`, the following block's first codes, or these again at a row's end), so the half resolution shows no blocks.
+#[inline(always)]
+pub unsafe fn spread16(c: [uint16x8_t; 3], next: [uint16x8_t; 3]) -> [uint16x8_t; 6] {
+    unsafe {
+        let s = |a: uint16x8_t, n: uint16x8_t| {
+            let odd = vrhaddq_u16(a, vextq_u16::<1>(a, n));
+            (vzip1q_u16(a, odd), vzip2q_u16(a, odd))
+        };
+        let (r, g, b) = (s(c[0], next[0]), s(c[1], next[1]), s(c[2], next[2]));
+        [r.0, r.1, g.0, g.1, b.0, b.1]
     }
 }

@@ -17,7 +17,7 @@
 //! - 9 `dcs [bytes…]`: one raw DCS write (dev). 10 `read [reg u8][len u8]` → the bytes (dev).
 //! - 11 `testcard`: the highlight shoulder on the glass (DISPLAY-CALIB.md, DISPLAY-DESIGN.md §6): a log ramp of scene light from −6 to +3.3 stops; the top half through the max-brightness curve (encoded gamma2tanh value as the gamma-2 signal: white at 57 % of peak, highlights rolled by tanh), the bottom half linear with a hard clip at the same white; ticks at 1×, 2×, 4×, 8× white; everything through the panel's measured 2.185. Replaces the frame; `begin` takes it back.
 //! - 12 `scene clear`: empty the map's retained scene (SHELL.md: the device is a map of your life).
-//! - 13 `scene add [count u8][count x circle]`: append circles, each 30 bytes — `x i32`, `y i32` (world units), `r u16`, `ring u8` (0 none, 1 thin, 2 heavy — importance), `lit u8` (1 = changed since last seen, the only colour on the map), `icon u8` (n = the n-th icon in the embedded bundle, 0 = none), `len u8`, `label [16]`.
+//! - 13 `scene add [count u8][count x circle]`: append circles, each 30 bytes — `x i32`, `y i32` (world units), `r u16`, `ring u8` (0 none, 1 thin, 2 heavy — importance), `lit u8` (1 = changed since last seen, the only colour on the map), `icon u8` (n = the n-th icon in the embedded bundle, 6 the ferros mark the display draws itself, 0 = none), `len u8`, `label [16]`.
 //! - 14 `camera [cx i32][cy i32][zoom u32, 16.16]`, the centre in world units ×256 (24.8, so a pan at high zoom moves by a pixel, not a world unit): draw the scene through the camera and present. Reply byte 1 = whether DECON advanced.
 //!   Optional flag byte 13, bit 0: keep the frame's overlay (see 15). Optional bytes 14-17: the turn, `[cos i16][sin i16]` in Q14 (world to screen is that rotation, then the zoom); absent = upright.
 //! - 15 `batch [len u16][op…]…`: several ops in one call, in order — a frame with an overlay is `begin`, its text and rects and discs, then `camera` with the keep flag, which draws the scene under them and presents. One call per frame rather than one per op: each call is a round trip through the scheduler. The reply is the last op's, its status the first failure's.
@@ -427,8 +427,8 @@ fn icon_decode() -> [u16; 256] {
 
 /// The apps' icons, bundled by tools/app-icons: b"ICN3" (gamma2tanh codes; ICN2: gamma 2), count u8, size u16 LE, then per icon size x size RGBA, already cut to a circle, followed by its size x size grey (photopic luminance), all VSF RGB gamma 2 codes. Empty when the build had no bundle.
 static ICONS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icons.bin"));
-/// The ferros icon's number (tools/app-icons' order, counted from one as the map's `icon` field counts them): drawn from logo.vsf's geometry (`draw::logo`), not from its raster in the bundle.
-const ICON_FERROS: u8 = 5;
+/// The ferros mark's number, one past the bundle's five (counted from one as the map's `icon` field counts them): drawn from logo.vsf's geometry (`draw::logo`); the bundle carries no raster of it.
+const ICON_FERROS: u8 = 6;
 
 /// The n-th icon (from 1): its RGBA, its grey, and its side, if the bundle has it.
 fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
@@ -1554,7 +1554,9 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
     // The finished wallpaper's base, 0 while there is none.
     let wall = unsafe { if WALL_ON { WALL_BUF } else { 0 } };
     // An open circle's front layer (its text, COMPOSITOR.md), 0 while no region is up: in front of the canvas, which then holds the clean window. A block's skip then asks the front alone, and its clean bit means "this phase holds the clean window here".
-    let text_layer = unsafe { if REGION_ON { ARENA } else { 0 } };
+    // A flight frame (COMPOSITOR.md "The flight, prerendered"): sampled from the flight's two images at half resolution (`flight_publish_row`); the canvas and the front layer are read only as the page image.
+    let flight = unsafe { *(&raw const FLIGHT_FRAME) };
+    let text_layer = unsafe { if REGION_ON && flight.is_none() { ARENA } else { 0 } };
     // Which phases hold only the background at each 16-pixel block (`CLEAN`): rows are this call's own, so no other publisher touches their bytes.
     let clean_w = unsafe { CLEAN_W };
     let clean = unsafe { core::slice::from_raw_parts_mut(CLEAN as *mut u8, clean_w * height) };
@@ -1573,6 +1575,14 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
             let ((cl, cr), bw) = bar_line(y, width, height);
             let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
             let t_n = now();
+            if let Some(f) = &flight {
+                unsafe {
+                    let thv = core::arch::aarch64::vld1q_u8(th.as_ptr());
+                    flight_publish_row(f, back.as_ptr(), width, height, tabs, k, y, x0, x1, wall, clean, clean_w, &mut row, dst, g, edge_px, (el, er, cl, cr), bw, thv);
+                    PUB_TICKS[0] += now() - t_n;
+                }
+                continue;
+            }
             unsafe {
                 let thv = core::arch::aarch64::vld1q_u8(th.as_ptr());
                 let src = back.as_ptr().add(y * width);
@@ -1583,7 +1593,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                 let mut run = x0;
                 while x < x1 {
                     // Compose once (COMPOSITOR.md step 2): sixteen canvas pixels all empty show only the background (the wallpaper, or black), and a phase whose block held just that at its last publish already holds it: nothing composed, nothing through the table, nothing written. The wallpaper lit every pixel, so a pan published the whole screen through the table every frame (25 frames/s, measured 2026-11-07).
-                    let glass = x < el || x + 16 > er || (x + 16 > cl && x < cr);
+                    let glass = x < el || x + 16 > er || bars_in(bw, cl, cr, x);
                     let mut any = 0u64;
                     for j in 0..16 {
                         any |= *ask.add(x + j);
@@ -1967,6 +1977,349 @@ fn region_off(width: usize, height: usize) {
         CLEAN_KEY = None;
         FRONT_OLD.k = 0;
         FRONT_OLD.n = 0;
+        PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
+        clean_reset();
+    }
+}
+
+// ---------------------------------------------------------------- the flight, prerendered
+//
+// COMPOSITOR.md "The flight, prerendered": opening or closing the open circle, two images made once — the page image (the clean window in the canvas and the text in the front layer, the region as landing shows it) and the plane image (a free app surface) — and each frame of the flight samples them through the camera, nearest, inside the publish. No scene is drawn while it flies.
+
+/// The flight's images: the surface holding the plane image, the camera op it was made at (None until made), the page image's camera op (the region's clean window must be current for it), and the theme and scene generation the plane image was made in.
+#[derive(Clone, Copy)]
+struct FlightImages {
+    surf: usize,
+    plane: Option<[u8; 18]>,
+    page: [u8; 18],
+    theme: u8,
+    scene: u32,
+}
+static mut FLIGHT: Option<FlightImages> = None;
+/// What the camera op inside an op 45 does: 0 nothing (not inside one), 1 the page image (the region path, no publish), 2 the plane image (the scene into the flight's surface), 3 nothing to make (both images current).
+static mut FLIGHT_PRE: u8 = 0;
+/// One image's map from a screen pixel to its own, 16.16: the pixel (0, 0)'s centre, and the steps a pixel right and a row down.
+#[derive(Clone, Copy)]
+struct FlightMap {
+    u0: i64,
+    ux: i64,
+    uy: i64,
+    v0: i64,
+    vx: i64,
+    vy: i64,
+}
+/// The flight frame on the screen: the page image's map and the plane image's, the page's opacity (16-bit coverage, 65535 whole) and the plane's surface base. Some while flight frames are what the phases hold; the publish then samples instead of reading the canvas.
+#[derive(Clone, Copy)]
+struct FlightFrame {
+    page: FlightMap,
+    plane: FlightMap,
+    alpha: u16,
+    plane_px: usize,
+    /// The page image's clean window is its ground alone (a disc of one colour): worked out per sample, not read — its centre and the square of its radius in the page image's pixels, and its colour as an opaque working pixel.
+    ground: (i64, i64, i64, u64),
+}
+static mut FLIGHT_FRAME: Option<FlightFrame> = None;
+/// The page image's text, by row: the columns [lo, hi) any of the front layer's ops may touch (lo | hi << 16), set each flight frame from the kept ops, so a sample reads the front layer only where text can be. In the heap, a word a row.
+static mut FLIGHT_TEXT: usize = 1;
+/// Measuring a flight: frames, the summed and worst op 46 (the sampled publish and the wait), and the prerender's µs.
+static mut FLIGHT_US: [u64; 4] = [0; 4];
+/// Measuring a flight: counter ticks spent sampling the images, summed over the publish threads.
+static FLIGHT_SAMPLE: AtomicU64 = AtomicU64::new(0);
+static FLIGHT_COPY: AtomicU64 = AtomicU64::new(0);
+
+/// A camera op's camera (op 14's bytes: x i32, y i32 in world units ×256, z u32 16.16, the turn Q14 at 14-17) as floats.
+fn cam_of(m: &[u8; 18]) -> (f64, f64, f64, f64, f64) {
+    let i32le = |i: usize| i32::from_le_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]) as f64;
+    let i16le = |i: usize| i16::from_le_bytes([m[i], m[i + 1]]) as f64;
+    (i32le(1), i32le(5), u32::from_le_bytes([m[9], m[10], m[11], m[12]]) as f64, i16le(14), i16le(16))
+}
+
+/// The map from the screen under camera `now` to the image made under camera `img`: world to screen is the turn then the zoom about the screen's centre, so screen to image is one similarity, P_img = C + k·R(θ_img − θ)·(P − C) + R_img·(cam − cam_img)·z_img / 2²⁴, with k = z_img / z. Worked out once a frame in floats; the pixels step through it in integers.
+fn flight_map(now: &[u8; 18], img: &[u8; 18], width: usize, height: usize) -> FlightMap {
+    let (x, y, z, c, s) = cam_of(now);
+    let (xi, yi, zi, ci, si) = cam_of(img);
+    let q28 = (1u64 << 28) as f64;
+    let k = zi / z;
+    let (cd, sd) = ((ci * c + si * s) / q28 * k, (si * c - ci * s) / q28 * k);
+    let (dx, dy) = (x - xi, y - yi);
+    let q38 = (1u64 << 38) as f64;
+    let (tx, ty) = ((ci * dx - si * dy) * zi / q38, (si * dx + ci * dy) * zi / q38);
+    let (cx, cy) = (width as f64 * 0.5, height as f64 * 0.5);
+    // Pixel (0, 0)'s centre, (0.5, 0.5).
+    let (px, py) = (0.5 - cx, 0.5 - cy);
+    let one = 65536.0;
+    let u0 = cx + cd * px - sd * py + tx;
+    let v0 = cy + sd * px + cd * py + ty;
+    FlightMap { u0: libm::round(u0 * one) as i64, ux: libm::round(cd * one) as i64, uy: libm::round(-sd * one) as i64, v0: libm::round(v0 * one) as i64, vx: libm::round(sd * one) as i64, vy: libm::round(cd * one) as i64 }
+}
+
+/// One row of an image's map: where pixel 0 of row `y` lands (16.16), the step a pixel, and the columns [lo, hi) that land inside the image.
+#[derive(Clone, Copy)]
+struct FlightSpan {
+    u: i64,
+    du: i64,
+    v: i64,
+    dv: i64,
+    lo: usize,
+    hi: usize,
+}
+
+/// The columns x of a row whose a + x·d (16.16) lands on a pixel 0 to lim − 1 (lim = the image's side ×65536), narrowed into [lo, hi).
+fn flight_keep(a: i64, d: i64, lim: i64, lo: &mut i64, hi: &mut i64) {
+    if d == 0 {
+        if a < 0 || a > lim - 1 {
+            *hi = *lo;
+        }
+        return;
+    }
+    // x·d in [p − a, q − a], made a positive step by turning the line round for a negative one.
+    let (a, d, p, q) = if d > 0 { (a, d, 0, lim - 1) } else { (-a, -d, 1 - lim, 0) };
+    let xl = (p - a + d - 1).div_euclid(d);
+    let xh = (q - a).div_euclid(d) + 1;
+    // WHY the narrowing: the image covers only part of the screen at this camera (a shrinking page, a plane magnified past its edge); outside the columns both bounds allow, the pixel lands off the image and its index would read past the buffer or another row.
+    *lo = (*lo).max(xl);
+    *hi = (*hi).min(xh);
+}
+
+fn flight_span(m: &FlightMap, y: usize, width: usize, height: usize) -> FlightSpan {
+    let (u, v) = (m.u0 + y as i64 * m.uy, m.v0 + y as i64 * m.vy);
+    let (mut lo, mut hi) = (0i64, width as i64);
+    flight_keep(u, m.ux, (width as i64) << 16, &mut lo, &mut hi);
+    flight_keep(v, m.vx, (height as i64) << 16, &mut lo, &mut hi);
+    // An empty span: the row misses the image.
+    if hi < lo {
+        hi = lo;
+    }
+    FlightSpan { u, du: m.ux, v, dv: m.vx, lo: lo as usize, hi: hi as usize }
+}
+
+/// A flight frame's sixteen columns from x on row y at half resolution (COMPOSITOR.md "The flight, prerendered"): eight samples, one each two columns, each pixel the image pixel its centre lands in (nearest), into `out`: the page image (the text in front of the clean window) over the wallpaper (or black), so opaque, at the flight's α, in front; the plane image over the wallpaper under it. Both opaque, that is α·page + (1 − α)·plane by `under` alone. Returns whether either image had anything there (none: only the wallpaper shows, which the phase may already hold).
+#[inline(never)]
+unsafe fn flight_half(f: &FlightFrame, ps: &FlightSpan, ls: &FlightSpan, _canvas: *const u64, x: usize, y: usize, width: usize, wall: usize, out: &mut [u64; 8]) -> u64 {
+    unsafe {
+        let mut pg = [0u64; 8];
+        let mut cw = [0u64; 8];
+        let mut pl = [0u64; 8];
+        let text = ARENA as *const u64;
+        let rows = FLIGHT_TEXT as *const u32;
+        let plane = f.plane_px as *const u64;
+        let (gx, gy, gr2, gc) = f.ground;
+        let mut any = 0u64;
+        for j in 0..8 {
+            let xx = x + 2 * j;
+            // WHY the tests: the columns outside an image's span land off it (`flight_span`); they hold nothing of it.
+            if f.alpha != 0 && xx >= ps.lo && xx < ps.hi {
+                let (iu, iv) = ((ps.u + xx as i64 * ps.du) >> 16, (ps.v + xx as i64 * ps.dv) >> 16);
+                // The text only where the row has any (a read of the front layer elsewhere is a cache miss for nothing), the ground by its circle, nearest: inside where the pixel's centre is.
+                let e = *rows.add(iv as usize) as i64;
+                if iu >= e & 0xFFFF && iu < e >> 16 {
+                    pg[j] = *text.add(iv as usize * width + iu as usize);
+                }
+                let (dx, dy) = (iu - gx, iv - gy);
+                if dx * dx + dy * dy <= gr2 {
+                    cw[j] = gc;
+                }
+                any |= pg[j] | cw[j];
+            }
+            if f.alpha != 0xFFFF && xx >= ls.lo && xx < ls.hi {
+                let (u, v) = (ls.u + xx as i64 * ls.du, ls.v + xx as i64 * ls.dv);
+                pl[j] = *plane.add((v >> 16) as usize * width + (u >> 16) as usize);
+                any |= pl[j];
+            }
+        }
+        if any == 0 {
+            return 0;
+        }
+        let mut wl = [0u64; 8];
+        if wall != 0 {
+            let w = (wall as *const u64).add(y * width + x);
+            for j in 0..8 {
+                wl[j] = *w.add(2 * j);
+            }
+        }
+        for j in (0..8).step_by(2) {
+            if f.alpha != 0 {
+                neon::under2(pg.as_mut_ptr().add(j), cw.as_ptr().add(j));
+                neon::under2(pg.as_mut_ptr().add(j), wl.as_ptr().add(j));
+                neon::opaque_at2(pg.as_mut_ptr().add(j), f.alpha);
+            }
+            neon::under2(pl.as_mut_ptr().add(j), wl.as_ptr().add(j));
+            neon::under2(pg.as_mut_ptr().add(j), pl.as_ptr().add(j));
+        }
+        *out = pg;
+        any
+    }
+}
+
+/// Each publishing thread's scratch for a flight frame: two half-resolution rows (the pair's top row and the next pair's, which the odd row between them is the mean of), each its pixels (672), its codes (`neon::codes8`, 6 words a block, 84 blocks), each block's kind and a tag (the frame and the row it holds). The workers' by their stacks, the render thread's last.
+const FLIGHT_SLOT: usize = 672 + 84 * 6 + 84 + 1;
+const FLIGHT_SCRATCH: usize = 2 * FLIGHT_SLOT;
+/// Counts flight frames, for the scratch rows' tags.
+static mut FLIGHT_SEQ: u64 = 0;
+/// Their base in the heap, set at start (statics are in the image, which the vault keeps under 3 MiB).
+static mut FLIGHT_ROWS: usize = 1;
+
+/// This thread's flight scratch: a worker is told by its stack pointer lying in its own stack (`PUB_STACKS`), anything else is the render thread.
+fn flight_row_buf() -> &'static mut [u64; FLIGHT_SCRATCH] {
+    let sp: usize;
+    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+    let base = &raw const PUB_STACKS as usize;
+    let i = sp.wrapping_sub(base) / 16384;
+    // WHY the test: a thread outside the workers' stacks (the render thread) lands past the last worker; it takes the extra row.
+    let k = if i < PUB_WORKERS { i } else { PUB_WORKERS };
+    unsafe { &mut *((FLIGHT_ROWS as *mut [u64; FLIGHT_SCRATCH]).add(k)) }
+}
+
+/// Sixteen zero pixels: a block of black, as the canvas path presents it.
+static ZERO16: [u64; 16] = [0; 16];
+
+/// One half-resolution row of a flight frame into a scratch slot (`FLIGHT_SLOT`): each block's eight samples composed (`flight_half`) and their codes (`neon::codes8`), and whether the block has anything of either image.
+unsafe fn flight_codes(f: &FlightFrame, canvas: *const u64, width: usize, height: usize, tabs: &neon::Odt, wall: usize, y: usize, x0: usize, x1: usize, slot: &mut [u64]) {
+    use core::arch::aarch64::vst1q_u16;
+    unsafe {
+        let t_s = now();
+        let (hrow, rest) = slot.split_at_mut(672);
+        let (codes, kinds) = rest.split_at_mut(84 * 6);
+        let (ps, ls) = (flight_span(&f.page, y, width, height), flight_span(&f.plane, y, width, height));
+        let mut x = x0;
+        while x < x1 {
+            let bi = x / 16;
+            let mut h = [0u64; 8];
+            let any = flight_half(f, &ps, &ls, canvas, x, y, width, wall, &mut h);
+            kinds[bi] = (any != 0) as u64;
+            if any != 0 {
+                hrow[x / 2..x / 2 + 8].copy_from_slice(&h);
+                let c = neon::codes8(tabs, h.as_ptr());
+                let at = codes.as_mut_ptr().add(bi * 6) as *mut u16;
+                for (i, v) in c.iter().enumerate() {
+                    vst1q_u16(at.add(i * 8), *v);
+                }
+            }
+            x += 16;
+        }
+        FLIGHT_SAMPLE.fetch_add(now() - t_s, Ordering::Relaxed);
+    }
+}
+
+/// One row of a flight frame into phase k (COMPOSITOR.md "The flight, prerendered"), at half resolution made smooth: the images are sampled and their light, ODT and code worked out once each two columns of each second row (`flight_codes`), and each row's codes are spread linearly between them (an odd column the mean of its neighbours, an odd row the mean of the rows above and below), so the half resolution shows no blocks; each row then only dithers and packs with its own thresholds. A block where neither image has anything shows only the wallpaper (or black), at full resolution: skipped where the phase already holds just that (its compose-once bit), else presented from the wallpaper itself. The glass's edge and the bars go in front per pixel, as on every home screen row. `edges` is the row's (el, er, cl, cr) as `publish_band` works them out.
+#[inline(never)]
+unsafe fn flight_publish_row(f: &FlightFrame, canvas: *const u64, width: usize, height: usize, tabs: &neon::Odt, k: usize, y: usize, x0: usize, x1: usize, wall: usize, clean: &mut [u8], clean_w: usize, row: &mut [u32; 1344], dst: &mut [u32], g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], edges: (usize, usize, usize, usize), bw: &[u64], thv: core::arch::aarch64::uint8x16_t) {
+    use core::arch::aarch64::{uint16x8_t, vdupq_laneq_u16, vld1q_u16, vrhaddq_u16};
+    unsafe {
+        let scratch = flight_row_buf();
+        let seq = FLIGHT_SEQ;
+        // The rows of the pair's top and of the next pair's (the last pair: its own again), each made once a frame into its slot.
+        let top = y & !1;
+        let next = if top + 2 < height { top + 2 } else { top };
+        let base = scratch.as_mut_ptr();
+        let mut slot_of = |ty: usize| -> *const u64 {
+            let s = core::slice::from_raw_parts_mut(base.add((ty >> 1 & 1) * FLIGHT_SLOT), FLIGHT_SLOT);
+            let tag = seq << 16 | ty as u64;
+            if s[FLIGHT_SLOT - 1] != tag {
+                flight_codes(f, canvas, width, height, tabs, wall, ty, x0, x1, s);
+                s[FLIGHT_SLOT - 1] = tag;
+            }
+            s.as_ptr()
+        };
+        let a = slot_of(top);
+        let b = if y & 1 == 1 { slot_of(next) } else { a };
+        let (codes_a, codes_b) = (a.add(672) as *const u16, b.add(672) as *const u16);
+        let (kinds_a, kinds_b) = (a.add(672 + 84 * 6), b.add(672 + 84 * 6));
+        // A block's codes on this row: the top row's, or on an odd row the mean of the two rows (either alone where the other has nothing).
+        let block = |bi: usize| -> Option<[uint16x8_t; 3]> {
+            let (ma, mb) = (*kinds_a.add(bi) != 0, *kinds_b.add(bi) != 0);
+            let ld = |c: *const u16| -> [uint16x8_t; 3] { core::array::from_fn(|i| vld1q_u16(c.add(bi * 24 + i * 8))) };
+            match (ma, mb) {
+                (true, true) => {
+                    let (p, q) = (ld(codes_a), ld(codes_b));
+                    Some(core::array::from_fn(|i| vrhaddq_u16(p[i], q[i])))
+                }
+                (true, false) => Some(ld(codes_a)),
+                (false, true) => Some(ld(codes_b)),
+                (false, false) => None,
+            }
+        };
+        let (el, er, cl, cr) = edges;
+        let bit = 1u8 << k;
+        let mut x = x0;
+        let mut run = x0;
+        let mut cur = block(x0 / 16);
+        while x < x1 {
+            let bi = x / 16;
+            let ci = y * clean_w + bi;
+            let glass = x < el || x + 16 > er || bars_in(bw, cl, cr, x);
+            let nxt = if x + 16 < x1 { block(bi + 1) } else { None };
+            if cur.is_none() && !glass && clean[ci] & bit != 0 {
+                if run < x {
+                    dst[y * width + run..y * width + x].copy_from_slice(&row[run..x]);
+                }
+                x += 16;
+                run = x;
+                cur = nxt;
+                continue;
+            }
+            if glass {
+                // In front per pixel: the glass's edge, the bars, then the flight's pixel (or the wallpaper alone).
+                let h = if *kinds_a.add(bi) != 0 { a } else { b };
+                let mut front = [0u64; 16];
+                for j in 0..16 {
+                    let xx = x + j;
+                    let c = if xx >= cl && xx < cr { bw[xx] } else { CLEAR };
+                    let p = if cur.is_some() { *h.add(xx / 2) } else if wall != 0 { *(wall as *const u64).add(y * width + xx) } else { 0 };
+                    front[j] = glass_front(xx, g, edge_px, c, p & ((1 << 48) - 1));
+                }
+                neon::sixteen_app(tabs, front.as_ptr(), row.as_mut_ptr().add(x), neon::thresholds_at(thv, x));
+                clean[ci] &= !bit;
+            } else if let Some(c) = cur {
+                // Spread toward the next block's first codes, or held at this block's last where it has none.
+                let n = nxt.unwrap_or([vdupq_laneq_u16::<7>(c[0]), vdupq_laneq_u16::<7>(c[1]), vdupq_laneq_u16::<7>(c[2])]);
+                neon::dither_pack(neon::spread16(c, n), thv, row.as_mut_ptr().add(x));
+                clean[ci] &= !bit;
+            } else {
+                // Only the wallpaper (or black) here, which this phase does not hold yet: presented at full resolution, and then it does.
+                let src = if wall != 0 { (wall as *const u64).add(y * width + x) } else { ZERO16.as_ptr() };
+                neon::sixteen_canvas(tabs, src, row.as_mut_ptr().add(x), thv);
+                clean[ci] |= bit;
+            }
+            x += 16;
+            cur = nxt;
+        }
+        if run < x1 {
+            let t_c = now();
+            dst[y * width + run..y * width + x1].copy_from_slice(&row[run..x1]);
+            FLIGHT_COPY.fetch_add(now() - t_c, Ordering::Relaxed);
+        }
+    }
+}
+
+
+/// The flight's surface still free: no window shows it and no process holds it (the kernel's generation byte 0), and no app is in front.
+fn flight_surface_free(k: usize) -> bool {
+    unsafe { (*(&raw const WINS))[k].is_none() && ferros_sys::pref(8 + k as u64) == 0 && (*(&raw const APP)).is_none() }
+}
+
+/// The flight ends (a frame that is not a flight frame): the images go, and every phase owes the whole screen once, its compose-once bits gone with what they knew.
+fn flight_end(width: usize, height: usize, log: &mut Log) {
+    unsafe {
+        if FLIGHT_US[0] > 0 {
+            log.s(b"display: flight: ");
+            log.dec(FLIGHT_US[0]);
+            log.s(b" frames, the sampled publish ");
+            log.dec(FLIGHT_US[1] / FLIGHT_US[0]);
+            log.s(b" us a frame, the worst whole frame ");
+            log.dec(FLIGHT_US[2]);
+            log.s(b" us; sampling ");
+            log.dec(FLIGHT_SAMPLE.swap(0, Ordering::Relaxed) * 1_000_000 / freq() / FLIGHT_US[0]);
+            log.s(b" us a frame over the threads, the copy out ");
+            log.dec(FLIGHT_COPY.swap(0, Ordering::Relaxed) * 1_000_000 / freq() / FLIGHT_US[0]);
+            log.s(b" us; prerender ");
+            log.dec(FLIGHT_US[3]);
+            log.s(b" us\n");
+            log.flush();
+        }
+        FLIGHT_US = [0; 4];
+        FLIGHT = None;
+        FLIGHT_FRAME = None;
         PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
         clean_reset();
     }
@@ -2388,6 +2741,13 @@ fn scale_q16(p: u64, q: u64) -> u64 {
 fn under_pm(acc: u64, t: u64, layer: u64, lt: u64) -> (u64, u64) {
     let ch = |sh: u32| ((acc >> sh & 0xFFFF) + ((layer >> sh & 0xFFFF) * t >> 14)) << sh;
     (ch(0) | ch(16) | ch(32), t * lt >> 14)
+}
+
+/// Whether the bars have anything in the sixteen columns from x (`bar_line`'s columns [cl, cr) and their pixels): a block they leave clear and the edge does not reach is the scene's alone, presented as any other (2026-11-07: every block of the bars' rows went through the per-pixel front, the bars' whole width though their circles cover a fraction of it).
+#[inline]
+fn bars_in(bw: &[u64], cl: usize, cr: usize, x: usize) -> bool {
+    // WHY the bounds: the row's bar pixels are only the bars' inside [cl, cr) (the glass front takes them only there); the block's columns are cut to that range.
+    x + 16 > cl && x < cr && (x.max(cl)..(x + 16).min(cr)).any(|i| bw[i] >> 63 == 0)
 }
 
 /// The columns of a row the glass's edge touches: everything left of `el` and from `er` on (its masked columns and its listed edge pixels).
@@ -3854,7 +4214,7 @@ static mut RECV_STACK: [u8; 32768] = [0; 32768];
 
 /// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved): the receive thread waits for them.
 fn op_is_sync(op: u8) -> bool {
-    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31)
+    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 45)
 }
 
 extern "C" fn receive(grants: u64) -> ! {
@@ -4161,6 +4521,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         CON_STACK_LO = (&raw const CON_STACK) as usize;
         CON_GLYPHS = glyphs::Glyphs::with_arena(FONT, 1 << 17);
     }
+    // Each publishing thread's flight scratch (`flight_row_buf`), kept with the rest.
+    unsafe {
+        FLIGHT_ROWS = alloc::vec![0u64; FLIGHT_SCRATCH * (PUB_WORKERS + 1)].leak().as_mut_ptr() as usize;
+        FLIGHT_TEXT = alloc::vec![0u32; height].leak().as_mut_ptr() as usize;
+    }
     ALLOC.mark();
     log.s(b"display: present table (E peak ");
     log.dec(peak0 as u64);
@@ -4432,6 +4797,27 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         gravity_poll();
                     }
                     let saved_dmg = unsafe { (PREV_DMG, CUR_DMG) };
+                    // Inside an op 45 (COMPOSITOR.md "The flight, prerendered"): 1 makes the page image (the region path, no publish), 2 the plane image (the scene into the flight's surface), 3 nothing (both current).
+                    let pre = unsafe { FLIGHT_PRE };
+                    if pre == 3 {
+                        unsafe { REGION_REQ = None };
+                        return len;
+                    }
+                    // Any other frame while a flight was up ends it: every phase owes the whole screen.
+                    let mut flight_ended = false;
+                    if pre == 0 && clip_k.is_none() && unsafe { (*(&raw const FLIGHT)).is_some() || (*(&raw const FLIGHT_FRAME)).is_some() } {
+                        flight_end(width, height, &mut log);
+                        flight_ended = true;
+                    }
+                    // The plane image is drawn into the flight's surface, from clear, not into the canvas (which holds the page image's clean window).
+                    let pixels: &mut [Px] = match unsafe { *(&raw const FLIGHT) } {
+                        Some(f) if pre == 2 => {
+                            let s = surface(f.surf, width, height);
+                            s.fill(0);
+                            s
+                        }
+                        _ => &mut *pixels,
+                    };
                     // The camera, in integers: the centre in world units ×256, the zoom 16.16, the turn (cos, sin) Q14.
                     let cx = i32::from_le_bytes([m[1], m[2], m[3], m[4]]) as i64;
                     let cy = i32::from_le_bytes([m[5], m[6], m[7], m[8]]) as i64;
@@ -4454,7 +4840,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             None
                         };
                     }
-                    if m.get(13).copied().unwrap_or(0) & 1 == 0 {
+                    if m.get(13).copied().unwrap_or(0) & 1 == 0 && pre != 2 {
                         let t_c = now();
                         unsafe {
                             draw::clear(pixels, width, if clip_k.is_some() { draw::CLIP.clip(width, height) } else { PREV_DMG.clip(width, height) });
@@ -4510,7 +4896,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             unsafe { CUR_DMG = CUR_DMG.union(r) };
                         }
                         (None, _) => {
-                            if clip_k.is_none() && unsafe { REGION_ON } {
+                            if clip_k.is_none() && pre == 0 && unsafe { REGION_ON } {
                                 region_off(width, height);
                                 log.s(b"display: region: ended\n");
                                 log.flush();
@@ -4735,6 +5121,18 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         unsafe { PREV_DMG = CUR_DMG };
                         c
                     };
+                    // A flight's image made (op 45): nothing published; the plane image leaves the canvas's own record of what it holds as it was.
+                    if pre != 0 {
+                        unsafe {
+                            if pre == 2 {
+                                (PREV_DMG, CUR_DMG) = saved_dmg;
+                            }
+                            CLOCK_SHOWN = false;
+                            SCOPE_SHOWN = false;
+                        }
+                        return len;
+                    }
+                    let changed = if flight_ended { draw::Rect::full(width, height) } else { changed };
                     // The finished frame out. Temporal: into the next phase, armed without waiting for it to go out (only for the previous frame to have started); the layer flips to it at the next TE.
                     if ten && unsafe { TEMPORAL } {
                         pipe.settle(&mut armed, true);
@@ -4798,6 +5196,119 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         FRAMES.store(frames, Ordering::Relaxed);
                         out[1] = moved as u8;
                         len = 2;
+                    }
+                }
+                // 45 `flight [way u8: 1 opening, 0 closing][the plane image's camera op, 18 bytes][the page image's camera op, 18 bytes]`, then the ops that make a missing image (COMPOSITOR.md "The flight, prerendered"): this header decides what they make (`FLIGHT_PRE`); the batch runner runs them after it. Status 3: no flight here (no free surface, an app in front, no front layer, no temporal phases, or the page image not on the screen to close from); the map flies the old way.
+                Some(45) if m.len() >= 38 => {
+                    let t45 = now();
+                    let (mut plane, mut page) = ([0u8; 18], [0u8; 18]);
+                    plane.copy_from_slice(&m[2..20]);
+                    page.copy_from_slice(&m[20..38]);
+                    let theme = ferros_sys::theme::index() as u8;
+                    let scene = unsafe { SCENE_GEN };
+                    // The surface: the flight's own while it is still free, else the last free one (the kernel gives surfaces out from the first, the capture takes the first free).
+                    let surf = match unsafe { *(&raw const FLIGHT) } {
+                        Some(f) if flight_surface_free(f.surf) => Some(f.surf),
+                        _ => (0..SURFACES).rev().find(|&k| flight_surface_free(k)),
+                    };
+                    let ok = surf.is_some() && front_layer(width, height).is_some() && ten && unsafe { TEMPORAL };
+                    unsafe { FLIGHT_PRE = 0 };
+                    match surf {
+                        Some(k) if ok => unsafe {
+                            let mut f = match *(&raw const FLIGHT) {
+                                Some(f) if f.surf == k && f.theme == theme && f.scene == scene => f,
+                                _ => FlightImages { surf: k, plane: None, page, theme, scene },
+                            };
+                            f.page = page;
+                            let page_up = REGION_ON && CLEAN_KEY.is_some_and(|c| c.1 == page);
+                            if m[1] == 1 {
+                                // Opening: the plane image is the canvas as the plane's last frame left it (not while a region holds the canvas); the page image is made by the ops that follow, unless it is already up.
+                                if f.plane != Some(plane) {
+                                    if REGION_ON {
+                                        out[0] = 3;
+                                    } else {
+                                        surface(k, width, height).copy_from_slice(&pixels[..width * height]);
+                                        f.plane = Some(plane);
+                                    }
+                                }
+                                FLIGHT_PRE = if page_up { 3 } else { 1 };
+                            } else if !page_up {
+                                // Closing from a page that is not on the screen as asked.
+                                out[0] = 3;
+                            } else if f.plane == Some(plane) {
+                                FLIGHT_PRE = 3;
+                            } else {
+                                f.plane = Some(plane);
+                                FLIGHT_PRE = 2;
+                            }
+                            if out[0] == 0 {
+                                FLIGHT = Some(f);
+                                CLOCK_SHOWN = false;
+                                SCOPE_SHOWN = false;
+                            } else {
+                                FLIGHT_PRE = 0;
+                            }
+                        },
+                        _ => out[0] = 3,
+                    }
+                    unsafe { FLIGHT_US[3] += ferros_sys::us_since(t45) };
+                }
+                // 46 `flight frame [camera op, 18 bytes][α u16]`: one frame of the flight, the camera now and the page image's opacity (65535 whole). Nothing is drawn: the publish samples the two images (`flight_publish_row`). Without both images it does nothing (status 3).
+                Some(46) if m.len() >= 21 => {
+                    client_owned = true;
+                    unsafe { CLIENT_DREW = true };
+                    last_interaction = now();
+                    let t46 = now();
+                    let mut cam = [0u8; 18];
+                    cam.copy_from_slice(&m[1..19]);
+                    let alpha = u16::from_le_bytes([m[19], m[20]]);
+                    match unsafe { *(&raw const FLIGHT) } {
+                        Some(FlightImages { surf, plane: Some(plane), page, .. }) if flight_surface_free(surf) && unsafe { REGION_ON && CLEAN_KEY.is_some_and(|c| c.1 == page) } => {
+                            unsafe {
+                                // The clean window's ground, from its region op (`[cx i16][cy i16][r u16][ground]`), and the text's rows from the front layer's kept ops.
+                                let q = (*(&raw const CLEAN_KEY)).map(|c| c.0).unwrap_or([0; 10]);
+                                let i16q = |i: usize| i16::from_le_bytes([q[i], q[i + 1]]) as i64;
+                                let gr = u16::from_le_bytes([q[4], q[5]]) as i64;
+                                let ground = (i16q(0), i16q(2), gr * gr, draw::opaque(u32::from_le_bytes([q[6], q[7], q[8], q[9]]) & 0x00FF_FFFF));
+                                let text_rows = core::slice::from_raw_parts_mut(FLIGHT_TEXT as *mut u32, height);
+                                text_rows.fill(0);
+                                let old = &*(&raw const FRONT_OLD);
+                                for i in 0..old.k {
+                                    let r = old.ops[i].2.clip(width, height);
+                                    if r.is_empty() {
+                                        continue;
+                                    }
+                                    for y in r.y0 as usize..r.y1 as usize {
+                                        let e = text_rows[y];
+                                        let (lo, hi) = if e == 0 { (r.x0 as u32, r.x1 as u32) } else { ((e & 0xFFFF).min(r.x0 as u32), (e >> 16).max(r.x1 as u32)) };
+                                        text_rows[y] = lo | hi << 16;
+                                    }
+                                }
+                                FLIGHT_SEQ += 1;
+                                FLIGHT_FRAME = Some(FlightFrame { page: flight_map(&cam, &page, width, height), plane: flight_map(&cam, &plane, width, height), alpha, plane_px: surface(surf, width, height).as_ptr() as usize, ground });
+                                CLOCK_SHOWN = false;
+                                SCOPE_SHOWN = false;
+                                PUB_TICKS = [0; 3];
+                                PUB_BLOCKS = [0; 3];
+                            }
+                            pipe.settle(&mut armed, true);
+                            let t_pub = now();
+                            publish_next(pixels, width, height, &tabs, draw::Rect::full(width, height));
+                            ferros_sys::dma_barrier();
+                            let pub_us = ferros_sys::us_since(t_pub);
+                            pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
+                            armed = Some(pipe.arm(win));
+                            frames += 1;
+                            FRAMES.store(frames, Ordering::Relaxed);
+                            unsafe {
+                                FLIGHT_US[0] += 1;
+                                FLIGHT_US[1] += pub_us;
+                                FLIGHT_US[2] = FLIGHT_US[2].max(ferros_sys::us_since(t46));
+                            }
+                            out[1] = 1;
+                            len = 2;
+                        }
+                        _ => out[0] = 3,
                     }
                 }
                 Some(21) => {
@@ -5035,7 +5546,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     }
                 }
                 Some(30) => {
-                    let free = (0..SURFACES).find(|&k| unsafe { (*(&raw const WINS))[k] }.is_none());
+                    // Not the flight's: it holds the plane image.
+                    let flight_surf = unsafe { *(&raw const FLIGHT) }.map(|f| f.surf);
+                    let free = (0..SURFACES).find(|&k| unsafe { (*(&raw const WINS))[k] }.is_none() && Some(k) != flight_surf);
+                    let flight = unsafe { *(&raw const FLIGHT_FRAME) };
+                    let wall_at = unsafe { if WALL_ON { WALL_BUF } else { 0 } };
                     let text: alloc::string::String = match (unsafe { APP }.is_some(), free) {
                         // The home screen: each row as `publish_band` composes it for the glass (the edge, then the console, then the canvas), in working values, into the free surface.
                         (false, Some(k)) => {
@@ -5047,6 +5562,21 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                                 let row_px = &plan[g.first as usize..];
                                 let edge_px = &row_px[row_px.iter().position(|e| e.1 == SHAPE_EDGE).unwrap_or(row_px.len())..];
                                 let ((cl, cr), bw) = bar_line(y, width, height);
+                                // A flight frame: sampled as the publish samples it, at half resolution from the pair's top row, the wallpaper in it (alone at full resolution where neither image has anything).
+                                if let Some(f) = flight {
+                                    let yt = y & !1;
+                                    let (ps, ls) = (flight_span(&f.page, yt, width, height), flight_span(&f.plane, yt, width, height));
+                                    for x in (0..width & !15).step_by(16) {
+                                        let mut fl = [0u64; 8];
+                                        let any = unsafe { flight_half(&f, &ps, &ls, pixels.as_ptr(), x, yt, width, wall_at, &mut fl) };
+                                        for j in 0..16 {
+                                            let c = if x + j >= cl && x + j < cr { bw[x + j] } else { CLEAR };
+                                            let p = if any != 0 { fl[j / 2] } else if wall_at != 0 { unsafe { *(wall_at as *const u64).add(y * width + x + j) } } else { 0 };
+                                            s[y * width + x + j] = glass_front(x + j, g, edge_px, c, p & ((1 << 48) - 1));
+                                        }
+                                    }
+                                    continue;
+                                }
                                 for x in 0..width {
                                     let c = if x >= cl && x < cr { bw[x] } else { CLEAR };
                                     // The canvas with the wallpaper under it, as publish_band puts it.
@@ -5398,7 +5928,27 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             if dsi_op {
                 dsi_lock();
             }
-            let len = if m.first() == Some(&15) {
+            let len = if m.first() == Some(&45) {
+                // A flight's start (op 45): its header decides what the ops after it make, and they run as a batch's do; refused, they do not run.
+                let mut len = handle(&m[..m.len().min(38)], &mut out);
+                if out[0] == 0 {
+                    let t_pre = now();
+                    let mut at = 38usize;
+                    while at + 2 <= m.len() {
+                        let l = u16::from_le_bytes([m[at], m[at + 1]]) as usize;
+                        if at + 2 + l > m.len() || matches!(m.get(at + 2), Some(&15) | Some(&45)) {
+                            out[0] = 1;
+                            break;
+                        }
+                        let mut o = [0u8; 16];
+                        len = handle(&m[at + 2..at + 2 + l], &mut o);
+                        at += 2 + l;
+                    }
+                    unsafe { FLIGHT_US[3] += ferros_sys::us_since(t_pre) };
+                }
+                unsafe { FLIGHT_PRE = 0 };
+                len
+            } else if m.first() == Some(&15) {
                 // A batch: [len u16][op…] after [len u16][op…], run in order; the reply is the last op's, with the first failure's status if any failed.
                 let (mut at, mut fail, mut len) = (1usize, 0u8, 1usize);
                 while at + 2 <= m.len() {

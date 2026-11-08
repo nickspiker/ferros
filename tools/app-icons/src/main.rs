@@ -23,13 +23,12 @@ const SIZE: usize = 256;
 const CODE: &str = "/mnt/Harbor/Code";
 
 /// The map's apps, in its order, and where each keeps its icon.
-const APPS: [(&str, &str); 6] = [
+const APPS: [(&str, &str); 5] = [
     ("Photon", "photon/assets/icon-1024.png"),
     ("Mahere", "mahere/installers/icon-1024.png"),
     ("Lumis", "lumis/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.webp"),
     ("Opsin", "opsin/assets/opsin_orb.vsf"),
-    // The device's own circle (SHELL.md): ferros's logo, the phase-diagram slices of iron.
-    ("ferros", "ferros/logo.svg"),
+    // The device's own circle (SHELL.md), ferros's mark, is not here: the display draws it from logo.vsf's geometry at any size (draw::logo), as the number one past the bundle, 6 (its 256-px raster was 327 KB of a display image the vault holds under 3 MiB).
     // The present stage's test screen (payloads/ramps): its bands, as an icon.
     ("Ramps", "ferros/assets/ramps-icon.png"),
 ];

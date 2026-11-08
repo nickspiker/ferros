@@ -50,7 +50,7 @@ struct Spec {
 }
 
 /// The one built-in circle: the system's own, the device's settings. It never lights (lit means a person sent you something).
-const CIRCLES: [Spec; 1] = [Spec { label: "settings", ring: 1, lit: 0, share: 250, icon: 5 }];
+const CIRCLES: [Spec; 1] = [Spec { label: "settings", ring: 1, lit: 0, share: 250, icon: 6 }];
 const N: usize = CIRCLES.len();
 
 /// The map's total circle area, as four circles of radius 110 world units: each circle gets its share of it, so area is time.
@@ -106,11 +106,12 @@ fn coast(v: f64) -> (f64, f64) {
     }
 }
 
-/// A camera flight in progress (`Map::fly`): where each part of the camera stood from the target when it began, in the space it looks even in — the centre's world offset (×256), the zoom's natural logarithm against the target's, the turn's angle from the target's in radians — each part's speed then (a display frame), and the frames since.
+/// A camera flight in progress (`Map::fly`): where each part of the camera stood from the target when it began, in the space it looks even in — the centre's world offset (×256), the zoom's natural logarithm against the target's, the turn's angle from the target's in radians, and the fade between the plane and the open page (COMPOSITOR.md "The flight, prerendered") against where it goes — each part's speed then (a display frame), the fade's end, and the frames since.
 #[derive(Clone, Copy)]
 struct Flight {
-    off: [f64; 4],
-    vel: [f64; 4],
+    off: [f64; 5],
+    vel: [f64; 5],
+    fade_to: f64,
     t: i32,
 }
 
@@ -702,6 +703,10 @@ struct Map {
     /// The view a circle was opened from, flown back to when it closes (owner, 2026-11-06: "it should revert to the last view when exiting").
     back: Option<Cam>,
     leaving: bool,
+    /// The fade from the plane (0) to the open page (1), on the flight's spring; and whether the display flies this flight from its two prerendered images (op 45 took it), and the page image's camera (the open circle landed).
+    fade: f64,
+    fast: bool,
+    page_cam: Option<Cam>,
     /// A pinch on the open page: the spread it began at (sixteenths of a pixel) and the scale then; and the scale it is at now, shown live and kept as the preference when the fingers lift (64ths of an octave).
     pinch: Option<(i64, f32)>,
     scale_live: Option<f32>,
@@ -1145,24 +1150,88 @@ impl Map {
 
     /// Go to `to`: the camera flies there a display frame at a time (`step_cam`), each part of it on the critically damped spring (`spring`) in the space it looks even in (owner, 2026-11-05: the tap's flight follows the settings' snap; 2026-11-06: eased, as the pages are). From rest it eases in; a new target mid-flight keeps the speed the camera has, so a second tap turns the flight without a jolt.
     fn fly(&mut self, to: Cam) {
-        let vel = match (self.target, self.flight) {
+        let mut vel: [f64; 5] = match (self.target, self.flight) {
             (Some(_), Some(f)) => core::array::from_fn(|i| spring(f.off[i], f.vel[i], f.t).1),
-            _ => [0.; 4],
+            _ => [0.; 5],
         };
         let (c, s) = (self.cam.c as f64, self.cam.s as f64);
         let (tc, ts) = (to.c as f64, to.s as f64);
-        let off = [(self.cam.x - to.x) as f64, (self.cam.y - to.y) as f64, libm::log(self.cam.z as f64 / to.z as f64), libm::atan2(tc * s - ts * c, tc * c + ts * s)];
-        self.flight = Some(Flight { off, vel, t: 0 });
+        // The fade's end: the open page when flying to it, the plane when leaving it; on the plane there is no page, the fade at rest at 0.
+        let fade_to = match (self.view, self.leaving) {
+            (View::Open(_), false) => 1.,
+            (View::Open(_), true) => 0.,
+            _ => {
+                self.fade = 0.;
+                vel[4] = 0.;
+                0.
+            }
+        };
+        let off = [(self.cam.x - to.x) as f64, (self.cam.y - to.y) as f64, libm::log(self.cam.z as f64 / to.z as f64), libm::atan2(tc * s - ts * c, tc * c + ts * s), self.fade - fade_to];
+        self.flight = Some(Flight { off, vel, fade_to, t: 0 });
         self.target = Some(to);
         self.settling = true;
         self.frame_seen = None;
+        self.prerender();
+    }
+
+    /// A flight to or from the open circle starts (COMPOSITOR.md "The flight, prerendered"): the display is asked to make what it lacks of the flight's two images (op 45), the plane at its camera and the page landed, and the flight then sends only the camera and the fade a frame (op 46). Refused (no free surface, an app in front), the flight draws every frame as before.
+    fn prerender(&mut self) {
+        let (View::Open(i), Some(to)) = (self.view, self.target) else {
+            self.fast = false;
+            return;
+        };
+        let opening = !self.leaving;
+        // Opening: the plane is where the camera is now, the page where it lands. Closing: the plane where it lands, the page as it was landed.
+        let (plane, page) = if opening { (self.cam, to) } else { (to, self.page_cam.unwrap_or_else(|| self.at(i))) };
+        let mut b = [0u8; 4096];
+        b[0] = 45;
+        b[1] = opening as u8;
+        b[2..20].copy_from_slice(&plane.op(true));
+        b[20..38].copy_from_slice(&page.op(true));
+        let mut n = 38;
+        let mut put = |b: &mut [u8; 4096], op: &[u8]| {
+            // WHY the test: a page of more than the message holds is cut, as `Batch::op` cuts one.
+            if n + 2 + op.len() <= b.len() {
+                b[n..n + 2].copy_from_slice(&(op.len() as u16).to_le_bytes());
+                b[n + 2..n + 2 + op.len()].copy_from_slice(op);
+                n += 2 + op.len();
+            }
+        };
+        if opening {
+            // The page as landing shows it: laid out with no flight (`page_frame` landed), its region op, its ops, the landed camera.
+            let target = self.target.take();
+            let mut pb = Batch::new();
+            let (cx, cy, r, _) = self.page_frame();
+            pb.region(cx, cy, r, fill());
+            self.settings(&mut pb, true);
+            self.nrows = 0;
+            self.target = target;
+            let mut at = 1usize;
+            while at + 2 <= pb.n {
+                let l = u16::from_le_bytes([pb.b[at], pb.b[at + 1]]) as usize;
+                put(&mut b, &pb.b[at + 2..at + 2 + l]);
+                at += 2 + l;
+            }
+            put(&mut b, &page.op(true));
+            self.page_cam = Some(page);
+        } else {
+            put(&mut b, &plane.op(true));
+        }
+        let mut r = [0u8; 4];
+        let got = call(self.display, &b[..n], &mut r);
+        self.fast = got >= 1 && got != ferros_sys::ERR && r[0] == 0;
+        let mut l = Line::new();
+        let _ = write!(l, "map: flight {}: {}\n", if opening { "in" } else { "out" }, if self.fast { "prerendered" } else { "drawn whole (the display has no room)" });
+        console(self.grants, l.as_str().as_bytes());
     }
 
     /// One display frame of the camera's flight to `target`: each part where its spring has it now — the centre at its world offset, the zoom at the target's times e to the logarithm's offset (a circle grows by smooth factors), the turn at the target's direction turned by the angle's. Landed, exactly on the target, once every part and its speed are under half a pixel on the screen; then, leaving, the view is the plane again. Returns whether it is still flying.
     fn step_cam(&mut self) -> bool {
         let (Some(t), Some(mut f)) = (self.target, self.flight) else { return false };
         f.t += 1;
-        let p: [(f64, f64); 4] = core::array::from_fn(|i| spring(f.off[i], f.vel[i], f.t));
+        let p: [(f64, f64); 5] = core::array::from_fn(|i| spring(f.off[i], f.vel[i], f.t));
+        // The fade: from rest the spring never passes its end, and a flight turned round starts it with a speed under ω times its offset (each step keeps that so), so it stays between the plane and the page.
+        self.fade = f.fade_to + p[4].0;
         let z = t.z as f64 * libm::exp(p[2].0);
         let (cs, sn) = (libm::cos(p[3].0), libm::sin(p[3].0));
         let (tc, ts) = (t.c as f64, t.s as f64);
@@ -1176,12 +1245,15 @@ impl Map {
         self.flight = Some(f);
         // On the screen, in pixels: the centre's offset at this zoom (world ×256 at 16.16 pixels a unit), the zoom's and the turn's across the screen's width; each part and its speed.
         let w = self.w as f64;
-        let px = |i: usize, v: f64| if i < 2 { v.abs() * z / (1u64 << 24) as f64 } else { v.abs() * w };
-        let still = (0..4).any(|i| px(i, p[i].0) >= 0.5 || px(i, p[i].1) >= 0.5);
+        // The fade in 1024ths: it lands within a thousandth of its end, so landing on the real page shows no step.
+        let px = |i: usize, v: f64| if i < 2 { v.abs() * z / (1u64 << 24) as f64 } else if i < 4 { v.abs() * w } else { v.abs() * (1 << 10) as f64 };
+        let still = (0..5).any(|i| px(i, p[i].0) >= 0.5 || px(i, p[i].1) >= 0.5);
         if !still {
             self.cam = t;
             self.target = None;
             self.flight = None;
+            self.fade = f.fade_to;
+            self.fast = false;
             if self.leaving {
                 self.leaving = false;
                 self.view = View::Map;
@@ -1194,9 +1266,22 @@ impl Map {
     /// Landed on an open circle, the frame is its region (COMPOSITOR.md "The open circle is an app's region"): the ground and the scene made once by the display, the page in front of them, only what changed drawn and published. Flying, or on the plane, every frame is drawn whole.
     fn draw(&mut self) {
         let mut b = Batch::new();
+        // Flying to or from the open circle on the display's prerendered images: the camera now and the fade, nothing drawn (op 46).
+        if self.fast && self.target.is_some() && matches!(self.view, View::Open(_)) {
+            self.nrows = 0;
+            let mut m = [0u8; 21];
+            m[0] = 46;
+            m[1..19].copy_from_slice(&self.cam.op(true));
+            // The fade as 16-bit coverage; it stays within 0 to 1 (`step_cam`), and the cast saturates.
+            m[19..21].copy_from_slice(&(libm::round(self.fade * 65535.) as u16).to_le_bytes());
+            b.op(&m);
+            b.send(self.display);
+            return;
+        }
         let region = matches!(self.view, View::Open(_)) && self.target.is_none();
         if region {
             let (cx, cy, r, _) = self.page_frame();
+            self.page_cam = Some(self.cam);
             b.region(cx, cy, r, fill());
         } else {
             b.op(&[1]);
@@ -1226,8 +1311,9 @@ impl Map {
         if !matches!(self.view, View::Open(_)) {
             self.back = Some(self.cam);
             let to = self.at(0);
-            self.fly(to);
             self.view = View::Open(0);
+            self.leaving = false;
+            self.fly(to);
         }
         self.settling = true;
         self.frame_seen = None;
@@ -1934,8 +2020,9 @@ impl Map {
                     let to = self.at(i);
                     // The view to come back to when it closes.
                     self.back = Some(self.cam);
-                    self.fly(to);
                     self.view = View::Open(i);
+                    self.leaving = false;
+                    self.fly(to);
                     self.draw();
                 }
             }
@@ -2133,6 +2220,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         flight: None,
         back: None,
         leaving: false,
+        fade: 0.,
+        fast: false,
+        page_cam: None,
         pinch: None,
         scale_live: None,
         nrows: 0,
@@ -2164,11 +2254,13 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             let i = (v[1] - b'0') as usize;
             map.cam = map.at(i);
             map.view = View::Open(i);
+            map.fade = 1.;
         }
         // FERROS_MAP_START=swipe: the settings open, and the synthetic finger (below) swipes across them, for timing the open circle's frames with no one at the panel.
         if v == b"swipe" {
             map.cam = map.at(0);
             map.view = View::Open(0);
+            map.fade = 1.;
         }
     }
     map.draw();
@@ -2265,6 +2357,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let map_start = now();
     // The display's frame-start count, from the last frame wait (op 24).
     let (mut frame_count, mut synth_f0) = (0u32, 0u32);
+    // FERROS_MAP_START=open: the flights tapped so far, and when the last was.
+    let (mut synth_open, mut synth_open_at) = (0u32, 0u64);
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
@@ -2318,6 +2412,18 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 map.draw();
             }
             // Still in front: the touches are its, but the corners are the system's (WINDOWS.md), so they are read on below for a corner gesture, and nothing else is done with them.
+        }
+        // FERROS_MAP_START=open (development, measuring the flight with no one at the panel): three seconds after start and every two seconds after, while nothing moves, a tap on the settings circle opens it and the next tap, low at the left outside the open circle, closes it; eight flights.
+        // FERROS_MAP_START=outhold: one flight in, then the flight out held at its eighth frame (the camera and the fade where they are, nothing stepped), for a capture of the screen mid-flight.
+        if (option_env!("FERROS_MAP_START") == Some("open") && synth_open < 8 || option_env!("FERROS_MAP_START") == Some("outhold") && synth_open < 2) && !map.settling && !down && now().wrapping_sub(map_start) > 3 * freq() && now().wrapping_sub(synth_open_at) > 2 * freq() {
+            synth_open += 1;
+            synth_open_at = now();
+            if map.view == View::Map {
+                let (sx, sy) = map.cam.screen(w, h, map.xs[0], map.ys[0]);
+                map.tap(1, sx, sy);
+            } else {
+                map.tap(1, 4, h - 4);
+            }
         }
         // The screen off (the power key): no touches reach the map.
         let t_loop = now();
@@ -2709,6 +2815,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
             }
             map.settling = moving;
+            if option_env!("FERROS_MAP_START") == Some("outhold") && map.leaving && map.flight.is_some_and(|f| f.t >= 8) {
+                map.settling = false;
+            }
             if steps > 0 {
                 map.draw();
             }
