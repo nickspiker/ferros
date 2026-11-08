@@ -19,6 +19,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use core::fmt::Write;
 use ferros_sys::{call, cap, console, freq, now, sleep_until};
 use tatau::Style;
@@ -29,6 +31,14 @@ const S_SETTINGS: u64 = 3;
 const S_STORE: u64 = 4;
 /// The identity service (payloads/fgtw): the Fleet page asks it the fleet's state and members, and starts this device's departure.
 const S_FGTW: u64 = 5;
+
+/// The heap a link's detail document is verified and read in (ferros_sys::detail): a few kilobytes while a link's page shows, freed after each frame.
+const HEAP_SIZE: usize = 1 << 16;
+#[repr(C, align(64))]
+struct Heap([u8; HEAP_SIZE]);
+static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
+#[global_allocator]
+static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
 
 /// One circle: its label, its weight of ring (0 none, 1 thin, 2 heavy — importance), whether it is lit (changed since last seen), its share of the map's area in thousandths, and its icon in the display server's bundle (tools/app-icons order).
 struct Spec {
@@ -426,10 +436,14 @@ enum Choice {
     Link(u8),
     /// A radio's page: its switch, as its console circle's tap (preference 15).
     Switch(u8),
+    /// A link's knob (docs/RADIO-CONTROLS.md): its link and slot in the control blocks (ferros_sys::control); a value knob goes round its choices, an action counts up.
+    Knob(u8, u8),
+    /// The clock's zone, a quarter hour west (-1) or east (1).
+    Zone(i8),
 }
 
-/// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one.
-const PAGES: [&str; 15] = ["appearance", "numbers", "keyboard", "security", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "about", "developer"];
+/// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The clock after the links (docs/RADIO-CONTROLS.md): its time, zone and sources.
+const PAGES: [&str; 16] = ["appearance", "numbers", "keyboard", "security", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "clock", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Taps in a row on About's version line that make Developer a page (owner, 2026-11-05: "twelve"), and the tap from which the hint shows and counts down ("don't show a toast hint until four taps"). No time window: any other tap starts the count again.
@@ -505,7 +519,126 @@ fn measure_words(l: &mut Line, f: tatau::Fmt, kind: u16, v: i64) -> &'static str
         m::SATS_USED => { num(l, v, ""); "satellites in the fix" }
         m::CN0 => { num(l, v / 1000, " dB-Hz"); "best carrier to noise" }
         m::ACCURACY => { num(l, v / 1000, " m"); "accuracy (±)" }
+        m::REGISTRATION => {
+            l.s(match v {
+                0 => "not registered",
+                1 => "home",
+                2 => "searching",
+                3 => "denied",
+                5 => "roaming",
+                20 => "emergency only",
+                _ => "unknown",
+            });
+            "registration"
+        }
+        m::MTU => { let _ = tatau::size_bits(l, f, v.unsigned_abs() * 8, 1); "largest packet" }
+        m::PACKETS_DOWN => { num(l, v, ""); "packets in" }
+        m::PACKETS_UP => { num(l, v, ""); "packets out" }
+        m::ERRORS_DOWN => { num(l, v, ""); "bad packets in" }
+        m::ERRORS_UP => { num(l, v, ""); "failed packets out" }
+        m::DROPPED_DOWN => { num(l, v, ""); "dropped in" }
+        m::DROPPED_UP => { num(l, v, ""); "refused out" }
+        m::SUSPENDS => { num(l, v, ""); "link naps" }
+        m::POWER_SAVE => {
+            l.s(match v {
+                0 => "off",
+                1 => "on",
+                2 => "fast",
+                _ => "-",
+            });
+            "power save"
+        }
+        m::LINK_POWER => {
+            l.s(match v {
+                0 => "working",
+                1 => "light sleep",
+                2 => "sleep",
+                3 => "suspended",
+                _ => "-",
+            });
+            "link power"
+        }
+        m::ALTITUDE => { num(l, v / 1000, " m"); "altitude" }
+        m::SPEED => { num(l, v / 1000, " m/s"); "speed" }
+        m::HEADING => { num(l, v / 1000, "°"); "heading" }
         _ => { num(l, v, ""); "measure" }
+    }
+}
+
+/// The groups a link's page shows its measures in (docs/RADIO-CONTROLS.md), in order: each kind's group.
+const GROUPS: [&str; 5] = ["signal", "channel", "link", "counters", "motion"];
+fn group_of(kind: u16) -> usize {
+    use ferros_sys::measure as m;
+    match kind {
+        m::FREQ | m::BANDWIDTH | m::CHANNEL => 1,
+        m::RATE_DOWN | m::RATE_UP | m::LATENCY | m::LOSS | m::MCS | m::STREAMS | m::MTU | m::POWER_SAVE | m::LINK_POWER | m::REGISTRATION | m::TECH => 2,
+        m::PACKETS_DOWN | m::PACKETS_UP | m::ERRORS_DOWN | m::ERRORS_UP | m::DROPPED_DOWN | m::DROPPED_UP | m::SUSPENDS => 3,
+        m::ALTITUDE | m::SPEED | m::HEADING => 4,
+        _ => 0,
+    }
+}
+
+/// A detail field's name for the page (ferros_sys::detail's schemas).
+fn detail_label(field: &str) -> &'static str {
+    match field {
+        "carrier" => "carrier",
+        "apn" => "data APN",
+        "attach_apn" => "attach APN",
+        "ipv4" => "address",
+        "ipv6" => "address (IPv6)",
+        "dns4" => "DNS",
+        "dns6" => "DNS (IPv6)",
+        "ssid" => "network",
+        "bssid" => "access point",
+        "mac" => "this device on it",
+        "router" => "router",
+        "dns" => "DNS",
+        "lease" => "lease",
+        _ => "detail",
+    }
+}
+
+/// A detail value written for the page: names as they are; addresses, being identifiers and not quantities, in hexadecimal grouped as their standards group them (no base's magnitude reading makes sense of them); a lease as a duration in the device's base.
+fn detail_words(l: &mut Line, f: tatau::Fmt, v: &ferros_sys::vsf::VsfType) {
+    use ferros_sys::vsf::VsfType;
+    let hex = |l: &mut Line, bytes: &[u8], group: usize, sep: &str| {
+        for (i, c) in bytes.chunks(group).enumerate() {
+            if i > 0 {
+                l.s(sep);
+            }
+            for b in c {
+                let _ = write!(l, "{b:02X}");
+            }
+        }
+    };
+    match v {
+        VsfType::a(s) => {
+            l.s(s);
+        }
+        VsfType::ni(a) => hex(l, a, 1, "."),
+        VsfType::nj(a) => hex(l, a, 2, ":"),
+        VsfType::nm(a) => hex(l, a, 1, ":"),
+        other => match other.as_u64() {
+            Some(s) => {
+                let _ = tatau::duration_ns(l, f, s * 1_000_000_000, 1);
+            }
+            None => {
+                l.s("-");
+            }
+        },
+    }
+}
+
+/// A satellite system's name (ferros_sys::Sat).
+fn system_name(s: u8) -> &'static str {
+    match s {
+        0 => "GPS",
+        1 => "GLONASS",
+        2 => "Galileo",
+        3 => "BeiDou",
+        4 => "QZSS",
+        5 => "NavIC",
+        _ => "other",
     }
 }
 
@@ -1387,20 +1520,160 @@ impl Map {
                 }
                 fact(b, &mut y, "state", link_state(k, state));
                 let f = ferros_sys::numbers(Style::Glyphs);
+                // Everything the driver publishes (docs/RADIO-CONTROLS.md): its eight slots, then its tracks, grouped (signal, channel, link, counters, motion); tracked satellites listed on their own; then its names and addresses (the detail, read with the Settings capability), then its knobs.
+                let mut words = [ferros_sys::MEASURE_NONE; 8 + ferros_sys::TRACKS_MAX];
+                words[..8].copy_from_slice(slots);
+                let nt = ferros_sys::tracks(k as u64, &mut words[8..]);
+                let all = &words[..8 + nt];
+                let header = |b: &mut Batch, y: &mut i64, t: &str| {
+                    *y += uu(1, 2);
+                    b.text(cx, *y, note as u16, dim(), 1, t);
+                    *y += uu(2, 1);
+                };
                 let mut any = false;
-                for &m in slots {
-                    let Some((kind, v)) = ferros_sys::measure_of(m) else { continue };
-                    if kind == ferros_sys::measure::STATE {
-                        continue;
+                for (g, gname) in GROUPS.iter().enumerate() {
+                    let mut first = true;
+                    for &w in all {
+                        let Some((kind, v)) = ferros_sys::measure_of(w) else { continue };
+                        if kind == ferros_sys::measure::STATE || kind == ferros_sys::measure::SAT || group_of(kind) != g {
+                            continue;
+                        }
+                        if first {
+                            header(b, &mut y, gname);
+                            first = false;
+                        }
+                        let mut l = Line::new();
+                        let what = measure_words(&mut l, f, kind, v);
+                        fact(b, &mut y, what, l.as_str());
+                        any = true;
                     }
-                    let mut l = Line::new();
-                    let what = measure_words(&mut l, f, kind, v);
-                    fact(b, &mut y, what, l.as_str());
-                    any = true;
                 }
-                if !any {
+                // Each tracked signal: its system, number and band, where it stands overhead, its carrier to noise, and whether the fix uses it.
+                let mut nsat = 0;
+                for &w in all {
+                    let Some(s) = ferros_sys::sat_of(w) else { continue };
+                    if nsat == 0 {
+                        header(b, &mut y, "satellites");
+                    }
+                    nsat += 1;
+                    let cnt = |l: &mut Line, n: i64| {
+                        if n < 0 {
+                            l.s("-");
+                        }
+                        if let Ok(tatau::Out::Nothing) = tatau::count(l, f, n.unsigned_abs(), 1) {
+                            l.s("0");
+                        }
+                    };
+                    let mut name = Line::new();
+                    name.s(system_name(s.system));
+                    name.s(" ");
+                    cnt(&mut name, s.number as i64);
+                    name.s(if s.band == 1 { " L5" } else { " L1" });
+                    let mut l = Line::new();
+                    cnt(&mut l, s.elevation as i64);
+                    l.s("° up, ");
+                    cnt(&mut l, s.azimuth as i64);
+                    l.s("° round, ");
+                    cnt(&mut l, s.cn0 as i64);
+                    l.s(if s.used { " dB-Hz, in the fix" } else { " dB-Hz" });
+                    fact(b, &mut y, name.as_str(), l.as_str());
+                }
+                if !any && nsat == 0 {
                     fact(b, &mut y, "measures", "none yet");
                 }
+                // The names and addresses: shown only here, to whoever holds the settings.
+                let mut doc = [0u8; 1 << 10];
+                if let Some(n) = ferros_sys::detail(cap(self.grants, S_SETTINGS), k as u64, &mut doc) {
+                    // WHY the bound: the kernel returns the document's whole length, which the call allows to exceed the buffer; a document this page cannot hold whole is not read.
+                    if n > 0 && n <= doc.len() {
+                        if let Some(fields) = ferros_sys::detail::parse(k as u64, &doc[..n]) {
+                            if !fields.is_empty() {
+                                header(b, &mut y, "names and addresses");
+                            }
+                            for (name, _, v) in fields.iter() {
+                                let mut l = Line::new();
+                                detail_words(&mut l, f, v);
+                                fact(b, &mut y, detail_label(name), l.as_str());
+                            }
+                        }
+                    }
+                }
+                // The knobs (ferros_sys::control): a value goes round its choices at each tap, an action happens at its tap.
+                header(b, &mut y, "settings");
+                let c = ferros_sys::controls(k as u64);
+                use ferros_sys::control as ctl;
+                match k as u64 {
+                    ctl::CELLULAR => {
+                        row(self, b, &mut y, small, grey(), "re-register now", Some(Choice::Knob(k as u8, ctl::CELL_REREGISTER as u8)));
+                        b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "the radio off and on: it registers afresh");
+                        y += uu(2, 1);
+                    }
+                    ctl::WIFI => {
+                        let ps = c[ctl::WIFI_POWER_SAVE as usize];
+                        let mut l = Line::new();
+                        l.s("power save: ");
+                        l.s(match ps {
+                            1 => "on",
+                            2 => "fast",
+                            _ => "off",
+                        });
+                        row(self, b, &mut y, small, grey(), l.as_str(), Some(Choice::Knob(k as u8, ctl::WIFI_POWER_SAVE as u8)));
+                        let band = c[ctl::WIFI_BAND as usize];
+                        let mut l = Line::new();
+                        l.s("band: ");
+                        l.s(match band {
+                            1 => "5 GHz only",
+                            2 => "2.4 GHz only",
+                            _ => "any (5 GHz first)",
+                        });
+                        row(self, b, &mut y, small, grey(), l.as_str(), Some(Choice::Knob(k as u8, ctl::WIFI_BAND as u8)));
+                        b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "the band takes at the next join:");
+                        b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "switch WiFi off and on");
+                        y += uu(3, 1);
+                    }
+                    _ => {
+                        b.text(cx, y, note as u16, dim(), 1, "nothing to set here yet");
+                        y += uu(2, 1);
+                    }
+                }
+            }
+            "clock" => {
+                // The clock (docs/RADIO-CONTROLS.md): the time here and at UTC in the device's base, the zone and its knob, and where the time comes from.
+                let f = ferros_sys::numbers(Style::Glyphs);
+                let zone = ferros_sys::zone();
+                match ferros_sys::local_time() {
+                    Some((secs, ticks)) => {
+                        let ns = (ticks * 1_000_000_000 / freq()) as u32;
+                        let eagle = ferros_sys::detail::eagle_now();
+                        let mut l = Line::new();
+                        let _ = tatau::date_time(&mut l, f, secs, ns, eagle);
+                        b.text(cx, y, (uu(3, 2)) as u16, white(), 1, l.as_str());
+                        y += uu(3, 1);
+                        let mut l = Line::new();
+                        let _ = tatau::date_time(&mut l, f, secs - zone, ns, eagle);
+                        fact(b, &mut y, "at UTC", l.as_str());
+                    }
+                    None => {
+                        fact(b, &mut y, "time", "not read yet");
+                    }
+                }
+                let mut l = Line::new();
+                l.s("UTC");
+                if zone != 0 {
+                    l.s(if zone < 0 { " - " } else { " + " });
+                    let _ = tatau::duration_ns(&mut l, f, zone.unsigned_abs() * 1_000_000_000, 1);
+                }
+                fact(b, &mut y, "zone", l.as_str());
+                row(self, b, &mut y, small, grey(), "a quarter hour east", Some(Choice::Zone(1)));
+                row(self, b, &mut y, small, grey(), "a quarter hour west", Some(Choice::Zone(-1)));
+                y += uu(1, 2);
+                b.text(cx, y, note as u16, dim(), 1, "sources");
+                y += uu(2, 1);
+                fact(b, &mut y, "from", "the PMIC's clock");
+                fact(b, &mut y, "read", "at start, then hourly");
+                fact(b, &mut y, "network time", "not decoded yet");
+                fact(b, &mut y, "GPS time", "not used yet");
+                fact(b, &mut y, "numbers", base_name(ferros_sys::device_base()));
             }
             "about" => {
                 let f = ferros_sys::numbers(Style::Glyphs);
@@ -1747,6 +2020,28 @@ impl Map {
                         let off = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) ^ (1 << k);
                         set(self, ferros_sys::PREF_RADIOS_OFF, off);
                     }
+                    // A link's knob (docs/RADIO-CONTROLS.md): an action counts up, a value goes round its three choices (unset reads as the first).
+                    Some(Choice::Knob(link, slot)) => {
+                        use ferros_sys::control as ctl;
+                        let cur = ferros_sys::controls(link as u64)[slot as usize];
+                        let next = match (link as u64, slot as u64) {
+                            // WHY the wrap: the driver acts on any change of the count, and from unset (all ones) it wraps to 0, which is a change too.
+                            (ctl::CELLULAR, ctl::CELL_REREGISTER) => cur.wrapping_add(1),
+                            _ => (if cur == ctl::UNSET { 0 } else { cur } + 1) % 3,
+                        };
+                        if !ferros_sys::control(cap(self.grants, S_SETTINGS), link as u64, slot as u64, next) {
+                            console(self.grants, b"map: the kernel did not take the knob\n");
+                        }
+                    }
+                    // The zone a quarter hour either way (zones are set in quarter hours).
+                    Some(Choice::Zone(d)) => {
+                        use ferros_sys::control as ctl;
+                        let z = ferros_sys::zone() + d as i64 * 900;
+                        // WHY the range: no zone lies west of UTC - 12 h or east of UTC + 14 h; a tap past either end does nothing.
+                        if (-12 * 3600..=14 * 3600).contains(&z) && !ferros_sys::control(cap(self.grants, S_SETTINGS), ctl::CLOCK, ctl::CLOCK_ZONE, z as u64) {
+                            console(self.grants, b"map: the kernel did not take the zone\n");
+                        }
+                    }
                     Some(Choice::Page(k)) => {
                         self.page = self.wrap(self.page as isize + k as isize);
                         self.page_dx += k as i64 * self.w;
@@ -1786,6 +2081,7 @@ fn dist16(a: (i64, i64), b: (i64, i64)) -> i64 {
 pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The circles' labels are `&'static str`, absolute addresses fixed at link time; linked position-independent, they are relocations this applies before anything reads them. Without it the first label read faulted at its link-time address, G#D9B (2026-10-21).
     unsafe { ferros_sys::relocate() };
+    unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
     let display = cap(grants, S_DISPLAY);
     let touch = cap(grants, S_TOUCH);
     let mut r = [0u8; 256];
@@ -1998,8 +2294,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.draw();
         }
 
-        // The open settings' live facts (About, Connections): drawn again once a second while they show (live data, not motion).
-        if matches!(map.view, View::Open(_)) && matches!(PAGES[map.page], "about" | "connections" | "fleet") && !map.settling && now().wrapping_sub(last_facts) > freq() {
+        // The open settings' live facts (About, Connections, each link's page, the clock): drawn again once a second while they show (live data, not motion).
+        if matches!(map.view, View::Open(_)) && matches!(PAGES[map.page], "about" | "connections" | "fleet" | "cellular" | "WiFi" | "Bluetooth" | "NFC" | "GPS" | "USB" | "clock") && !map.settling && now().wrapping_sub(last_facts) > freq() {
             last_facts = now();
             if PAGES[map.page] == "fleet" {
                 map.fleet.poll(cap(map.grants, S_FGTW));

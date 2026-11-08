@@ -324,6 +324,11 @@ pub fn pet() {
 pub struct Facts(pub [u64; 88]);
 
 /// Local wall time: (seconds since 1970 in local time — UTC plus the zone, `device.tz` — and the counter ticks into the current second), or None until the kernel has read the PMIC's clock. From the kernel's base (facts 8, 9) and this process's own counter.
+/// The time zone as the kernel last handed it (preferences bytes 24-31): seconds east of UTC.
+pub fn zone() -> i64 {
+    unsafe { core::ptr::read_volatile((arc_base() + PREFS + 24) as *const u64) as i64 }
+}
+
 pub fn local_time() -> Option<(i64, u64)> {
     // From the preferences block (bytes 16-31, the kernel's PREF_WALL): no syscall — the first version asked SYS_FACTS on every frame, and facts samples the battery gauge over I2C under the kernel lock (it hung the kernel, 2026-10-23).
     let at = arc_base() + PREFS + 16;
