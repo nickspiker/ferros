@@ -1181,11 +1181,23 @@ pub fn release_identity(cap: u64) -> bool {
     svc(nr::UNLOCK, cap, 4, 0, 0, 0) == 0
 }
 
-/// The unlocked identity's own entries on this device as one VSF document (section `identity_export`, an `entry` field per vault name: the name and its stored bytes), written into `buf`, for saving them to the fleet before a departure. The document's length, or None while locked or when it does not fit.
+/// The unlocked identity's own entries on this device as one VSF document (section `identity_export`, an `entry` field per vault name: the name and its stored bytes), written into `buf`, for saving them to the fleet before a departure. The document's length, or None while locked or when it does not fit. Read a transfer at a time from offsets (op 5's x4): the document is built at offset 0 and kept until read to its end, and each call answers one transfer (4096 bytes) at most.
 pub fn export_identity(cap: u64, buf: &mut [u8]) -> Option<usize> {
-    match svc(nr::UNLOCK, cap, 5, off(buf.as_ptr()), buf.len() as u64, 0) {
-        ERR => None,
-        n => Some(n as usize),
+    let mut at = 0;
+    loop {
+        // One transfer a call: what the kernel copies back, so `at` knows how far each call wrote.
+        let piece = (buf.len() - at).min(1 << 12);
+        let whole = match svc(nr::UNLOCK, cap, 5, off(buf[at..].as_ptr()), piece as u64, at as u64) {
+            ERR => return None,
+            n => n as usize,
+        };
+        if whole > buf.len() {
+            return None;
+        }
+        at += piece.min(whole - at);
+        if at >= whole {
+            return Some(whole);
+        }
     }
 }
 

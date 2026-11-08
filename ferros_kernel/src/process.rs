@@ -1163,6 +1163,8 @@ pub static mut STORE_KEYS: Option<fn() -> Result<Vec<alloc::string::String>, ()>
 pub static mut UNLOCK: Option<fn(u8, Option<&[u8; 32]>) -> Result<u64, ()>> = None;
 /// The identity's entries as one VSF document (service.rs `store_export`), for SYS_UNLOCK op 5.
 pub static mut EXPORT: Option<fn() -> Option<alloc::vec::Vec<u8>>> = None;
+/// The export being read (op 5 without a vault process), from its build at offset 0 until it is read to its end; the person's plaintext, wiped then. Under the kernel lock.
+static mut EXPORT_DOC: Option<alloc::vec::Vec<u8>> = None;
 /// An entry kept by 32-byte address rather than by name (SYS_STORE bit 5): kete on ferros keeps its vaults this way — the address is kete's, the kernel scopes it (kvault `addr_scoped`).
 pub enum AddrOp<'a> {
     Get,
@@ -1393,16 +1395,51 @@ pub const VOP_DELETE: u8 = 2;
 pub const VOP_LIST: u8 = 3;
 /// Every value of each stamped domain deleted (release: the person's domains, VAULT-OUT.md). Name and rest empty. The value: how many values went, or ERR.
 pub const VOP_DROP: u8 = 4;
+/// The person's own entries as one VSF document (`SYS_UNLOCK` op 5, the departure's "save first"): name empty; rest [offset u64][length u32][per domain, in the stamp's order: its scope's prefix length u8, the prefix]. The value: the document's whole length, or ERR; the bytes from the offset, at most the length.
+pub const VOP_EXPORT: u8 = 5;
+
+/// `SYS_UNLOCK` op 5 while the vault process serves, for a caller holding the Unlock right: its endpoint.
+fn export_route(p: &Process, f: &Frame) -> Option<usize> {
+    let ep = vault_ep()?;
+    let token = p.read(f.x[0], 32);
+    matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Unlock, r)) if r & RIGHT_SEND != 0).then_some(ep)
+}
+
+/// `SYS_UNLOCK` op 5 forwarded to the vault process as a call from the caller, who waits as for a store call: stamped with the person's domain in every scope that holds their names, less those the identity service keeps to itself (kvault `EXPORT_SKIP`, as the kernel's own export). The vault builds the document and hands it out from the offset (x4), one transfer at most (x3, the caller's length). ERR while the person is locked.
+fn export_forward(f: &mut Frame, cur: usize, ep: usize) -> u64 {
+    // WHY: the length is the caller's, and the vault answers one transfer at most (SYS_REPLY reads no more): a larger buffer takes its first transfer, the caller asks again from the next offset (ferros_sys `export_identity`).
+    let len = (f.x[3] as usize).min(STORE_MAX);
+    let scopes: Vec<&str> = STORES.iter().map(|s| s.prefix).filter(|p| crate::kvault::identity_within(p) && !crate::kvault::EXPORT_SKIP.contains(p)).collect();
+    let domains: Vec<(&str, bool)> = scopes.iter().map(|&p| (p, true)).collect();
+    let mut rest = Vec::with_capacity(12 + scopes.iter().map(|p| 1 + p.len()).sum::<usize>());
+    rest.extend_from_slice(&f.x[4].to_le_bytes());
+    rest.extend_from_slice(&(len as u32).to_le_bytes());
+    for p in &scopes {
+        rest.push(p.len() as u8);
+        rest.extend_from_slice(p.as_bytes());
+    }
+    let Some(msg) = stamp_domains(VOP_EXPORT, &domains, &[], &rest) else {
+        f.x[0] = ERR;
+        return 0;
+    };
+    call_endpoint(f, cur, ep, msg, f.x[2], len as u64 | STORE_REPLY)
+}
 
 /// A stamped request (`store_forward`'s message layout): `prefix`'s domain in each class of `classes`, then `name` and `rest`. A listing leaves out the person's domain while they are locked; anything else needing a locked class is None, as the kernel's vault refuses it.
 fn stamp(op: u8, prefix: &str, classes: &[bool], name: &[u8], rest: &[u8]) -> Option<Vec<u8>> {
-    let mut msg = Vec::with_capacity(8 + classes.len() * 65 + 1 + name.len() + rest.len());
+    let domains: Vec<(&str, bool)> = classes.iter().map(|&c| (prefix, c)).collect();
+    stamp_domains(op, &domains, name, rest)
+}
+
+/// A stamped request over domains of several scopes (an export: the person's domain in each scope that holds their names), each a (scope prefix, the person's?) pair; otherwise as `stamp`.
+fn stamp_domains(op: u8, domains: &[(&str, bool)], name: &[u8], rest: &[u8]) -> Option<Vec<u8>> {
+    let mut msg = Vec::with_capacity(8 + domains.len() * 65 + 1 + name.len() + rest.len());
     msg.push(op);
     msg.push(MIGRATE_PENDING.load(core::sync::atomic::Ordering::Acquire) as u8);
     msg.extend_from_slice(&LOCK_EPOCH.load(core::sync::atomic::Ordering::Acquire).to_le_bytes());
     let at_count = msg.len();
     msg.push(0);
-    for &identity in classes {
+    for &(prefix, identity) in domains {
         let Some(mut keys) = domain_keys(prefix, identity) else {
             if op == VOP_LIST && identity {
                 continue;
@@ -2052,6 +2089,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
+        // The person's export while the vault process serves: it builds the document (VAULT-OUT.md).
+        SYS_UNLOCK if f.x[1] == 5 && export_route(p, f).is_some() => {
+            let ep = export_route(p, f).unwrap();
+            export_forward(f, cur, ep)
+        }
         SYS_UNLOCK => {
             let token = p.read(f.x[0], 32);
             let op = f.x[1];
@@ -2066,14 +2108,29 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         r.unwrap_or(ERR)
                     }
                     2..=4 => unlock(op as u8, None).unwrap_or(ERR),
-                    // Op 5: the identity's own entries as one VSF document into the caller's buffer (x2, x3 its length), for saving them to the fleet before a departure; the document's length, or ERR while locked or when it does not fit.
-                    5 => match unsafe { EXPORT }.and_then(|e| e()) {
-                        Some(doc) if doc.len() as u64 <= f.x[3] => {
-                            p.write(f.x[2], &doc);
-                            doc.len() as u64
+                    // Op 5: the identity's own entries as one VSF document into the caller's buffer (x2, x3 its length) from offset x4, for saving them to the fleet before a departure; the document's whole length, or ERR while locked. With a vault process serving, it answers instead (`export_forward`).
+                    5 => {
+                        // Built at offset 0 and kept until read to its end, so the pieces of one read are one document (each build stamps its own time and provenance); one transfer a call, as the vault process answers.
+                        let kept = unsafe { &mut *(&raw mut EXPORT_DOC) };
+                        if f.x[4] == 0 {
+                            *kept = unsafe { EXPORT }.and_then(|e| e());
                         }
-                        _ => ERR,
-                    },
+                        match kept.as_mut() {
+                            Some(doc) => {
+                                // WHY: the offset and the length are the caller's; past the end there is nothing to copy (slicing past it would panic the kernel), and one transfer at most goes back.
+                                let from = (f.x[4] as usize).min(doc.len());
+                                let to = from + (f.x[3] as usize).min(STORE_MAX).min(doc.len() - from);
+                                p.write(f.x[2], &doc[from..to]);
+                                let whole = doc.len() as u64;
+                                if to == doc.len() {
+                                    doc.fill(0);
+                                    *kept = None;
+                                }
+                                whole
+                            }
+                            None => ERR,
+                        }
+                    }
                     _ => ERR,
                 },
                 _ => ERR,

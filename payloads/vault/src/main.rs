@@ -2,7 +2,7 @@
 //!
 //! The mirrors: A from block 0 of the window, B from half way (the window is 2 × 8 GiB, process.rs WINDOWS); each starts at MIRROR blocks (512 MiB) and grows into its half later (manifestus `grow`), because a blank vault is read whole before its first commit and 8 GiB would be four million reads.
 //!
-//! Requests come only from the kernel: each is a process's `SYS_STORE` call (process.rs `store_forward`) or the kernel's own call (`vault_call`: the bridge's store commands, and op 4, drop, at release), stamped with the domain keys of its scope, one transfer at most. [op: 0 set, 1 get, 2 delete, 3 list][flags: bit 0 old entries wait in the kernel's vault][lock epoch u32 LE][domains][per domain: class (1 the person's), address key, sealing key][name length][name: within the scope, or 1 and a 32-byte address][rest]. Rest: set [offset u64][more u8][bytes]; get [offset u64][length u32]; list [offset u64][length u32][addresses u8]. The reply: [the syscall's value u64 LE][the bytes for the caller's buffer].
+//! Requests come only from the kernel: each is a process's `SYS_STORE` call (process.rs `store_forward`) or the kernel's own call (`vault_call`: the bridge's store commands, and op 4, drop, at release), or a process's export (`SYS_UNLOCK` op 5, forwarded: op 5 here), stamped with the domain keys of its scope, one transfer at most. [op: 0 set, 1 get, 2 delete, 3 list][flags: bit 0 old entries wait in the kernel's vault][lock epoch u32 LE][domains][per domain: class (1 the person's), address key, sealing key][name length][name: within the scope, or 1 and a 32-byte address][rest]. Rest: set [offset u64][more u8][bytes]; get [offset u64][length u32]; list [offset u64][length u32][addresses u8]. The reply: [the syscall's value u64 LE][the bytes for the caller's buffer].
 //!
 //! Keys live for the request they came with: zeroed after it, and the store's cache knows a key only by its hash. When the lock epoch moves (the person locked), the cache's plaintext and any write of the person's in progress go.
 //!
@@ -57,8 +57,10 @@ const S_BLOCKS: u64 = 2;
 const S_ENTROPY: u64 = 3;
 const S_VAULT: u64 = 4;
 
-/// The kernel's own operations, past the four a `SYS_STORE` call makes (process.rs `VOP_*`): drop every value of each stamped domain (release).
+/// Past the four a `SYS_STORE` call makes (process.rs `VOP_*`): drop every value of each stamped domain (the kernel's own call, at release), and the export.
 const OP_DROP: u8 = 4;
+/// The person's export as one VSF document (a process's `SYS_UNLOCK` op 5, forwarded), a transfer at a time.
+const OP_EXPORT: u8 = 5;
 
 /// Each mirror's size to start with, in 4 KiB blocks (512 MiB), and where B starts in the window (its second half).
 const MIRROR: u64 = 1 << 17;
@@ -225,6 +227,8 @@ extern "C" fn work(_: u64) -> ! {
     let mut token = [0u8; 32];
     let mut writers: Vec<Pending> = Vec::new();
     let mut epoch: Option<u32> = None;
+    // The person's export being read (op 5): built at offset 0, kept until read to its end or the person locks.
+    let mut export: Option<Vec<u8>> = None;
     loop {
         let n = ferros_sys::recv(cap(grants(), S_SERVE), &mut msg, &mut token, false);
         if n == ERR {
@@ -236,13 +240,16 @@ extern "C" fn work(_: u64) -> ! {
             // The person locked (or unlocked) since the last request: what this process holds of theirs goes.
             store.forget();
             writers.retain(|p| !p.person);
+            if let Some(mut x) = export.take() {
+                x.fill(0);
+            }
         }
         epoch = Some(e);
         // Old entries wait in the kernel's vault: they move before this request is served, so it never finds a name between the two vaults (gone from the kernel's, not yet here).
         if m[1] & 1 != 0 {
             migrate(&mut store);
         }
-        let len = serve(&mut store, &mut writers, m, &mut out);
+        let len = serve(&mut store, &mut writers, &mut export, m, &mut out);
         m.fill(0);
         ferros_sys::reply(&token, &out[..len]);
     }
@@ -263,7 +270,7 @@ fn wipe(d: &mut Domain) {
 }
 
 /// One stamped request into `out` (the reply: the syscall's value, then the caller's bytes); returns the reply's length.
-fn serve(store: &mut St, writers: &mut Vec<Pending>, m: &[u8], out: &mut [u8]) -> usize {
+fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>>, m: &[u8], out: &mut [u8]) -> usize {
     const NOTHING: u64 = ferros_sys::NOTHING;
     let (op, count) = (m[0], m[6] as usize);
     let at_name = 7 + count * 65;
@@ -319,6 +326,40 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, m: &[u8], out: &mut [u8]) -
         }
         say!("vault: dropped {} domains ({} values){}", count, n, if ok { "" } else { ", some failed" });
         if ok { n } else { ERR }
+    } else if op == OP_EXPORT {
+        // The person's export (a process's SYS_UNLOCK op 5, forwarded): built at offset 0 from the stamped domains, each with its scope's prefix after the offset and length; handed out a transfer at a time; wiped once read to its end.
+        let (offset, len) = (u64_at(rest) as usize, u32::from_le_bytes(rest[8..12].try_into().unwrap()) as usize);
+        if offset == 0 {
+            if let Some(mut x) = export.take() {
+                x.fill(0);
+            }
+            let mut doms = Vec::with_capacity(count);
+            let mut at = 12;
+            for i in 0..count {
+                let p = &rest[at + 1..at + 1 + rest[at] as usize];
+                at += 1 + p.len();
+                doms.push((p, domain_at(m, 7 + i * 65).1));
+            }
+            *export = export_document(store, &doms);
+            for (_, d) in doms.iter_mut() {
+                wipe(d);
+            }
+        }
+        match export.as_mut() {
+            Some(doc) => {
+                // WHY: the offset is the caller's and may lie past the end (nothing to send then).
+                let from = offset.min(doc.len());
+                data = (doc.len() - from).min(len);
+                out[8..8 + data].copy_from_slice(&doc[from..from + data]);
+                let whole = doc.len() as u64;
+                if from + data == doc.len() {
+                    doc.fill(0);
+                    *export = None;
+                }
+                whole
+            }
+            None => ERR,
+        }
     } else {
         let (person, mut d) = domain_at(m, 7);
         let id = *blake3::hash(&d.addr).as_bytes();
@@ -383,6 +424,44 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, m: &[u8], out: &mut [u8]) -
         r
     };
     reply(out, ret, data)
+}
+
+/// The largest value an export carries, and the largest export: the document is built whole in this process's heap (HEAP_BYTES). A value past the first is left out and named on the console (the person's made wallpaper, `map.wallpaper.made`, is 24 MB and belongs to this device's screen alone); an export past the second is refused.
+const EXPORT_VALUE_MAX: u64 = 1 << 20;
+const EXPORT_MAX: u64 = 1 << 22;
+
+/// The person's export as the kernel's own export builds it (service.rs `store_export`): section `identity_export`, one `entry` field per name, its values the full name (`d`) and the stored bytes (`v'r'`). None when a domain cannot be read or it would pass EXPORT_MAX.
+fn export_document(store: &mut St, doms: &[(&[u8], Domain)]) -> Option<Vec<u8>> {
+    let parts: Vec<(&[u8], &Domain)> = doms.iter().map(|(p, d)| (*p, d)).collect();
+    let x = match store.export(&parts, EXPORT_VALUE_MAX, EXPORT_MAX) {
+        Ok(x) => x,
+        Err(e) => {
+            say!("vault: export refused: {:?}", e);
+            return None;
+        }
+    };
+    for (name, n) in &x.left_out {
+        say!("vault: export leaves out {} ({} bytes)", core::str::from_utf8(name).unwrap_or("?"), n);
+    }
+    let mut section = vsf::VsfSection::new("identity_export");
+    for (name, value) in &x.entries {
+        section.add_field_multi("entry", alloc::vec![vsf::VsfType::d(alloc::string::String::from_utf8_lossy(name).into_owned()), vsf::VsfType::v(b'r', value.clone())]);
+    }
+    say!("vault: export: {} entries", x.entries.len());
+    let doc = vsf::VsfBuilder::new().creation_time_oscillations(eagle()).provenance_only().add_section_direct(section).build().ok();
+    for (_, mut v) in x.entries {
+        v.fill(0);
+    }
+    doc
+}
+
+/// Eagle time now, in oscillations (the kernel's settings.rs `eagle_now`, from the wall clock the kernel publishes): 0 until the kernel has read the PMIC's clock.
+fn eagle() -> i64 {
+    // The Eagle epoch (1969-07-20 20:17:40 UTC) in the wall clock's seconds.
+    const EPOCH_UNIX: i128 = -14_182_940;
+    let Some((secs, ticks, hz)) = ferros_sys::utc_time() else { return 0 };
+    let ops = vsf::OSCILLATIONS_PER_SECOND as i128;
+    ((secs as i128 - EPOCH_UNIX) * ops + ticks as i128 * ops / hz as i128) as i64
 }
 
 fn reply(out: &mut [u8], ret: u64, data: usize) -> usize {

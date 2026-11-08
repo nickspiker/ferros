@@ -50,6 +50,14 @@ pub enum Error {
     Seal,
     /// A head opened but is not a value document, or a piece is missing.
     Format,
+    /// An export would pass its bound (`Store::export`).
+    TooLarge,
+}
+
+/// A person's export (`Store::export`): each value carried, under its full name, and each one left out for its size, with its length.
+pub struct Export {
+    pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+    pub left_out: Vec<(Vec<u8>, u64)>,
 }
 
 impl From<manifestus::Error> for Error {
@@ -395,6 +403,39 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         Ok(self.list(d, NAMES, names_schema, "name")?.into_iter().filter_map(|v| if let VsfType::v(b'r', n) = v { Some(n) } else { None }).collect())
     }
 
+    /// Every named value of each domain with its name made whole (the domain's scope prefix first), in the domains' order: what a person's export carries (`SYS_UNLOCK` op 5, VAULT-OUT.md). Address-named values (kete's raw addresses) are not names a person reads and are left out, as the kernel's export left them. The export is read whole into memory, so it is bounded: a value longer than `value_max` is left out and named in `Export::left_out` with its length, and when what remains passes `total_max` nothing is read and the export is `TooLarge`; the lengths are known from the heads before any value is read.
+    pub fn export(&mut self, parts: &[(&[u8], &Domain)], value_max: u64, total_max: u64) -> Result<Export> {
+        let mut take = Vec::new();
+        let mut left_out = Vec::new();
+        let mut total = 0u64;
+        for (k, (prefix, d)) in parts.iter().enumerate() {
+            for name in self.names(d)? {
+                if name.first() == Some(&1) {
+                    continue;
+                }
+                let Some(n) = self.len(d, &name)? else { continue };
+                let mut full = prefix.to_vec();
+                full.extend_from_slice(&name);
+                if n > value_max {
+                    left_out.push((full, n));
+                } else {
+                    total += n;
+                    take.push((k, name, full));
+                }
+            }
+        }
+        if total > total_max {
+            return Err(Error::TooLarge);
+        }
+        let mut entries = Vec::with_capacity(take.len());
+        for (k, name, full) in take {
+            if let Some(v) = self.get(parts[k].1, &name)? {
+                entries.push((full, v));
+            }
+        }
+        Ok(Export { entries, left_out })
+    }
+
     /// Every value of the domain deleted and the pieces of its unfinished writes swept, its books going with them (an empty list is removed): nothing of the domain is left on the disk. Release, when a person leaves the device (VAULT-OUT.md). Returns how many values went.
     pub fn drop_domain(&mut self, d: &Domain) -> Result<u64> {
         let mut n = 0;
@@ -627,6 +668,34 @@ mod tests {
         assert_eq!(s.engine().live_keys().unwrap().len(), before);
         assert_eq!(s.get(&kept, b"keep").unwrap().unwrap(), keep);
         assert_eq!(s.drop_domain(&gone).unwrap(), 0);
+    }
+
+    /// An export carries every named value of each domain given, whole and under its full name, and nothing of a domain not given or of another key.
+    #[test]
+    fn export_whole() {
+        let mut s = store(1 << 15);
+        let (map, wifi, other) = (domain(9), domain(10), domain(11));
+        let big = bytes(2 * PIECE + 9, 3);
+        s.put(&map, b"places", &big).unwrap();
+        s.put(&map, b"theme", b"dark").unwrap();
+        s.put(&wifi, b"cred", b"secret").unwrap();
+        s.put(&other, b"x", b"y").unwrap();
+        let mut addr = alloc::vec![1u8];
+        addr.extend_from_slice(&[7u8; 32]);
+        s.put(&map, &addr, b"kete").unwrap();
+        let parts: [(&[u8], &Domain); 2] = [(b"map.", &map), (b"wifi.", &wifi)];
+        let x = s.export(&parts, 1 << 20, 1 << 22).unwrap();
+        let mut e = x.entries;
+        e.sort();
+        assert_eq!(e, vec![(b"map.places".to_vec(), big.clone()), (b"map.theme".to_vec(), b"dark".to_vec()), (b"wifi.cred".to_vec(), b"secret".to_vec())]);
+        assert!(x.left_out.is_empty());
+        assert!(s.export(&[], 1, 1).unwrap().entries.is_empty());
+        // A value past the value bound is named, not carried; the rest still is.
+        let x = s.export(&parts, PIECE as u64, 1 << 22).unwrap();
+        assert_eq!(x.left_out, vec![(b"map.places".to_vec(), big.len() as u64)]);
+        assert_eq!(x.entries.len(), 2);
+        // Past the total bound, nothing is read.
+        assert!(matches!(s.export(&parts, 1 << 20, 8), Err(Error::TooLarge)));
     }
 
     /// A value written in uneven slices is the value written whole.

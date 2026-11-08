@@ -38,6 +38,8 @@ const IDENTITY: [&str; 5] = ["map.", "fgtw.", "ahau.", "wifi.cred", "gps.last"];
 pub fn identity_class(name: &str) -> bool {
     IDENTITY.iter().any(|p| name.starts_with(p))
 }
+/// The identity service's own scopes (its roots, its fleet chain, the attest screen's verifier), never in the person's export: it holds what the export is sealed into.
+pub const EXPORT_SKIP: [&str; 2] = ["fgtw.", "ahau."];
 /// Whether a scope (its prefix) holds any identity-class names: a listing of it covers the person's domain as well as the device's.
 pub fn identity_within(prefix: &str) -> bool {
     IDENTITY.iter().any(|p| p.starts_with(prefix) || prefix.starts_with(p))
@@ -506,7 +508,7 @@ impl KVault {
         }
         let mut out = Vec::new();
         for name in self.names_in(Class::Identity)? {
-            if name.starts_with("fgtw.") || name.starts_with("ahau.") {
+            if EXPORT_SKIP.iter().any(|p| name.starts_with(p)) {
                 continue;
             }
             if let Some(v) = self.get_by_key(&name)? {

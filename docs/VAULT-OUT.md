@@ -111,9 +111,13 @@ The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by t
   - The service loop sends the drops through the kernel's channel, a call a pass, before its restart. The vault process drops each domain whole (`ferros_store` `drop_domain`: every value, the pieces of unfinished writes, the books; host-tested to leave the disk as it was before the domain's first write).
   - A drop that fails, or no vault process to send it to, is logged and the restart goes ahead: the renewed device-only secret already makes those entries unopenable. Released while locked, nothing can be stamped, and the same holds.
   - `diag "identity release"` now takes the kernel lock (it wrote the vault outside it).
+- **The identity export through the vault process (2026-11-07, built, not yet on the device):**
+  - `SYS_UNLOCK` op 5, while the vault process serves, is forwarded to it as a call from the caller (`process.rs` `export_forward`), stamped with the person's domain in every scope that holds their names less the identity service's own (`kvault::EXPORT_SKIP`: `fgtw.`, `ahau.`, as the kernel's export skipped them) and each scope's prefix. The vault builds the same document the kernel did (section `identity_export`, an `entry` per name: the full name, the bytes) at offset 0 and hands it out a transfer at a time; it is wiped when read to its end or when the person locks.
+  - The op gains an offset (x4); `ferros_sys::export_identity` reads in transfers, with the same signature. Without a vault process the kernel keeps its own export between the reads in the same way (each build stamps its own time, so pieces of two builds would not be one document).
+  - Bounded, because the document is built whole in the vault's 8 MiB heap: a value over 1 MiB is left out and named on the console (the person's made wallpaper, `map.wallpaper.made`, 24 MB, is this screen's alone), and an export over 4 MiB is refused (`ferros_store` `export`, host-tested).
+  - Nothing calls op 5 yet (the Fleet page's "save first" is to come).
 - **Still to do:**
   - the person's entries moving at the first attest (built, not yet seen on the device);
-  - the identity export for a departure (`SYS_UNLOCK` op 5), which still reads the kernel's vault and so finds nothing that moved;
   - per-kist domains through the oracle and the common area's named grants (step 3's rest);
   - the vault's capsule in the kernel image;
   - the kernel's own names moved behind a channel of its own, then `kvault`, `vault_boot` and `ufs_device` retired (step 4).
