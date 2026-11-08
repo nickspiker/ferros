@@ -91,6 +91,51 @@ The replay carries gpsd's aiding from the capture night: the time (ferros rewrit
 - **Not checked:** the replays' `92 81` and `8e 81` messages are not decoded, so I can't rule out that they also carry a place. The capture's own files stay on Harbor.
 - **A first fix with no last position starts cold** (about 5-8 minutes, measured with a zeroed position). Every fix after it, in that person's session, starts from their own last fix.
 
+## The satellites (2026-11-07)
+
+The fix message also carries every signal the chip tracks, one 56-bit record each at its end.
+Decoded against gpsd's own output for all 213 fixes of the on-chip capture (lhd4.trace with logcat3.txt: `$GPGSV`/`$GLGSV`, `$GNGSA`, `$PGLOR,SAT`), with a scratch Rust decoder that includes the driver's own `payloads/gps/src/sky.rs`.
+
+Where the records are, bit numbers as in "The fix message" (little-endian 32-bit words, MSB first, from the class's first bit):
+- They start at bit 585, or 617 when bit 213 (the track flag) is set: the track brings a 32-bit block (the track s16 at 439 and 16 bits more), and everything after it moves.
+  Bit 213 is the only flag in bits 200-220 that varied in the capture (167 of 213 set).
+- The count is a u7 17 bits before the first record (bit 568 or 600).
+- The message ends 16 bits after its body, and the body is the records' end less one bit rounded up to a whole 32-bit word: `len × 8 = ⌈(start + 56 n − 1) / 32⌉ × 32 + 16`, true of all 213.
+  The driver checks it before reading a record; a message that fails is counted (`fix messages laid out otherwise` in its 32 s report) and gives no satellites.
+- There is no other per-satellite message in on-chip mode: besides the fix (G#16) the chip sends only a 14-byte `01 81` id 08, a 122-byte class 04 message, and 22-byte class 03 messages, none of which grows with the satellites.
+
+One record, its bits in order:
+
+| Bits | Field | Values seen |
+|---|---|---|
+| 0-5 | PRN u6 | GPS PRN; GLONASS the orbital slot (NMEA 64 + slot, `$PGLOR,SAT` `R` + slot) |
+| 6 | used | `$PGLOR,SAT` flag G#02 |
+| 7 | always 1 | |
+| 8 | unnamed flag | `$PGLOR,SAT` flag G#20; clear on the strongest satellites in the fix |
+| 9 | always 1 | |
+| 10-15 | system u6 | 0 GPS, 8 GLONASS |
+| 16-23 | elevation s8, degrees | 5 to 75 |
+| 24-39 | azimuth u16, degrees | 0 to 360 (360 is north as well) |
+| 40-47 | band u8 | 0 L1 (GLONASS G1), 2 L5 |
+| 48-55 | C/N0 u8 | gpsd's dB-Hz = ⌊(raw + 16) / 4⌋ |
+
+**Match:** 3032 records in the 213 messages, each one found as a row of gpsd's GSV (3032 rows): elevation, azimuth and C/N0 3032 of 3032; the count against gpsd's distinct satellites 213 of 213 fixes; C/N0 and both flags against `$PGLOR,SAT` 2857 of 2857 L1 records.
+The used bit against `$GNGSA` agrees on 2844 of 2857 L1 records: the 13 others are `$PGLOR,SAT` flag G#33, which gpsd leaves out of GSA (it lists G#3F, G#3B and G#1F), and nothing in the record tells G#33 from G#3F; the satellites-in-fix count then matches gpsd's on 203 of 213 fixes.
+L5 records carry no used bit of their own (always clear), and gpsd's GSV gives them no elevation or azimuth; the chip's are the same as the satellite's L1 record (166 of the 175 L5 records had one, all 166 the same).
+The C/N0 offset is fixed only to gpsd's integer: ⌊(raw + 16) / 4⌋, round((raw + 14) / 4) and ⌈(raw + 13) / 4⌉ are the same function, so the true value is (raw + 13 to 16) / 4; the driver keeps raw + 16 in quarter dB-Hz.
+Not seen in the capture, so not known: Galileo, BeiDou and QZSS system codes, L1C/E1/E5a/B1/B2a band codes, and a GLONASS frequency channel (it is not in the record).
+
+**No Doppler.**
+The record is fully accounted for above: no Doppler, range rate or pseudorange in it, and no other message carries them in on-chip mode (in host mode the chip streams measurements at ~18 KB/s, which would have them, but then the position is ours to compute).
+A satellite's line-of-sight velocity therefore needs its orbit (the ephemeris or LTO), not the chip's report; its motion across the sky comes from successive elevations and azimuths.
+Those are whole degrees, and satellites cross the sky at about half a degree a minute: in the capture's 2908 pairs of successive fixes the elevation changed 18 times and the azimuth 15, never by more than one degree.
+So the driver keeps both: the plain change since the previous fix that had the signal (mostly 0), and the rate between the first and the latest one-degree step seen on each axis, in millidegrees a second (the capture's 3.5 minutes gave 7 to 9 mdeg/s where two steps were seen, about 0.5° a minute).
+
+**In the driver** (`payloads/gps/src/sky.rs`): a fixed table of 64 signals, two of them swapped at each message, a signal found in the previous one by (system, band, PRN).
+Op 2 SATS on the `gps` endpoint serves the latest list (layout in main.rs's header: 25 bytes a signal), and the measure slots carry SATS_SEEN (a satellite on L1 and L5 counts once), SATS_USED and CN0 (the best, milli-dB-Hz) beside the state and the error estimate.
+`gpstest 02` prints the list.
+Satellites come only with fix messages: while the chip searches before its first fix there is no list.
+
 ## Next
 
 1. ~~Navigation~~ — done above.

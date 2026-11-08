@@ -10,11 +10,17 @@
 //! The `gps` endpoint, first byte the op:
 //! - `0` FIX: `valid u8`, `fixes u32`, `age ms u32` (since the latest), `lat i32`, `lon i32` (2⁻²³ degrees), `alt i32` (m), `err u32` (m), `speed i32`, `track i32` (1/64 m/s, 1/64 °) — little-endian, 33 bytes.
 //! - `1` STOP: the chip powered down, the last fix kept; the process exits after replying.
+//! - `2` SATS: the signals the chip tracked at the latest fix message (sky.rs, GPS.md "The satellites"): `n u8`, `msgs u32` (fix messages decoded so far), `age ms u32` (since the latest), then `n` records of 25 bytes — `system u8` (the chip's code: 0 GPS, 8 GLONASS), `band u8` (0 L1 or GLONASS G1, 2 L5), `prn u8` (GLONASS: the orbital slot), `flags u8` (bit 0 used in the fix, bit 1 the chip's unnamed flag), `el i8`, `az u16` (degrees), `d_el i16`, `d_az i16` (degrees since the previous fix that had the signal, the azimuth the short way round north), `cn0 u16` (quarter dB-Hz), `d_ms u32` (the chip's ms between the two fixes, 0 for a signal new in this one), `el_rate i32`, `az_rate i32` (millidegrees a second between the first and the latest one-degree step seen, `i32::MIN` until there are two) — little-endian, at most 64 records.
+//!
+//! Measures (ferros_sys::status, the corners' GPS circle): slot 0 the state, 1 the error estimate, 2 the satellites tracked, 3 those used in the fix, 4 the best C/N0.
 #![no_std]
 #![no_main]
 
 use core::fmt::Write;
 use ferros_sys::{cap, console, freq, mmio_read, mmio_write, now, recv, reply, store_get_at, store_set, store_set_at, NOTHING};
+
+mod sky;
+use sky::{Sky, REC, SATS};
 
 const S_GPS: u64 = 1;
 const S_SPI: u64 = 2;
@@ -243,10 +249,10 @@ fn sbits(b: &[u8], o: usize, n: usize) -> i32 {
     (bits(b, o, n) << (32 - n)) as i32 >> (32 - n)
 }
 
-/// A fix from a chip payload: the inner `c0 c1 … c0 c4` frame (G#C0 escaped as `c0 c0`), class `01 81`, id G#16, the position-valid, altitude and speed flags set (bits 210, 212, 215; GPS.md "The on-chip engine").
-fn parse_fix(p: &[u8]) -> Option<Fix> {
+/// The fix message in a chip payload, unescaped into `m` from the class on; its length.
+/// The inner `c0 c1 … c0 c4` frame (G#C0 escaped as `c0 c0`), class `01 81`, id G#16 (GPS.md "The on-chip engine").
+fn fix_msg(p: &[u8], m: &mut [u8; 512]) -> Option<usize> {
     let c = p.iter().take(8).zip(p.iter().skip(1)).position(|(&a, &b)| a == 0xC0 && b == 0xC1)?;
-    let mut m = [0u8; 512];
     let (mut j, mut n) = (c + 2, 0usize);
     while j < p.len() && n < m.len() {
         if p[j] == 0xC0 && j + 1 < p.len() {
@@ -259,10 +265,14 @@ fn parse_fix(p: &[u8]) -> Option<Fix> {
         n += 1;
         j += 1;
     }
-    let m = &m[..n];
-    if m.len() < 60 || m[0] != 0x01 || m[1] != 0x81 || m[9] != 0x16 {
+    if n < 60 || m[0] != 0x01 || m[1] != 0x81 || m[9] != 0x16 {
         return None;
     }
+    Some(n)
+}
+
+/// The position in a fix message (`fix_msg`), when the position-valid, altitude and speed flags are set (bits 210, 212, 215).
+fn parse_fix(m: &[u8]) -> Option<Fix> {
     if bits(m, 212, 1) == 0 || bits(m, 210, 1) == 0 || bits(m, 215, 1) == 0 {
         return None;
     }
@@ -271,7 +281,7 @@ fn parse_fix(p: &[u8]) -> Option<Fix> {
     (x.lat.unsigned_abs() <= 90 << 23 && x.lon.unsigned_abs() <= 180 << 23 && x.err < 1023 && (x.lat, x.lon) != (0, 0)).then_some(x)
 }
 
-/// The chip's side, deframed: acks by sequence, fixes, CRC failures.
+/// The chip's side, deframed: acks by sequence, fixes and the satellites that came with them, CRC failures.
 struct Deframer {
     acked: [bool; 256],
     frames: u32,
@@ -279,6 +289,8 @@ struct Deframer {
     fixes: u32,
     fix: Fix,
     fix_at: u64,
+    sky: Sky,
+    sky_at: u64,
 }
 
 impl Deframer {
@@ -325,7 +337,13 @@ impl Deframer {
             self.acked[f[3] as usize] = true;
             return;
         }
-        if let Some(x) = parse_fix(&f[k..f.len() - 1]) {
+        let mut m = [0u8; 512];
+        let Some(n) = fix_msg(&f[k..f.len() - 1], &mut m) else {
+            return;
+        };
+        self.sky.take(&m[..n]);
+        self.sky_at = now();
+        if let Some(x) = parse_fix(&m[..n]) {
             self.fixes += 1;
             self.fix = x;
             self.fix_at = now();
@@ -582,7 +600,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
 
     let t_all = now();
     let f = freq();
-    let mut d = Deframer { acked: [false; 256], frames: 0, crc_bad: 0, fixes: 0, fix: Fix::default(), fix_at: 0 };
+    let mut d = Deframer { acked: [false; 256], frames: 0, crc_bad: 0, fixes: 0, fix: Fix::default(), fix_at: 0, sky: Sky::new(), sky_at: 0 };
     let mut raw = Buf { b: [0; 8192], n: 0 };
     let (mut at, mut recs, mut late, mut errs) = (4usize, 0u32, 0u32, 0u32);
     let mut rec = [0u8; 4096];
@@ -650,6 +668,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let (mut asks, mut silent, mut bytes, mut said) = (0u32, 0u32, 0usize, now());
     // The corners' GPS circle (ferros_sys::measure): on and searching, then holding a fix with its error estimate; published when either changes.
     let mut published: Option<(u8, u32)> = None;
+    // The satellites' three (tracked, used, best C/N0), published with each fix message (the count of those decoded and refused, `u32::MAX` before the first pass empties the slots).
+    let mut published_sky = u32::MAX;
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
@@ -673,7 +693,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         mmio_write(far, EINT_PEND, 1 << 3);
         ferros_sys::irq_ack(cap(grants, S_IRQ));
         if now().wrapping_sub(said) > 32 * f {
-            say!(grants, "gps: the last 32 s: HOST_REQ {} times, MCU_RESP silent {}, {} bytes read; {} frames, {} fixes in all\n", asks, silent, bytes, d.frames, d.fixes);
+            let (seen, used, cn0) = d.sky.counts();
+            say!(grants, "gps: the last 32 s: HOST_REQ {} times, MCU_RESP silent {}, {} bytes read; {} frames, {} fixes in all; {} satellites tracked, {} in the fix, best C/N0 {} dB-Hz ({} fix messages laid out otherwise)\n", asks, silent, bytes, d.frames, d.fixes, seen, used, cn0 >> 2, d.sky.bad);
             (asks, silent, bytes, said) = (0, 0, 0, now());
         }
         if d.fixes > shown {
@@ -691,6 +712,16 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             status(0, w(k::STATE, now_shown.0 as i64));
             status(1, if d.fixes > 0 { w(k::ACCURACY, now_shown.1 as i64 * 1000) } else { MEASURE_NONE });
             published = Some(now_shown);
+        }
+        if published_sky != d.sky.msgs + d.sky.bad {
+            use ferros_sys::{measure as k, measure_word as w, status, MEASURE_NONE};
+            let (seen, used, cn0) = d.sky.counts();
+            let none = d.sky.msgs == 0;
+            status(2, if none { MEASURE_NONE } else { w(k::SATS_SEEN, seen as i64) });
+            status(3, if none { MEASURE_NONE } else { w(k::SATS_USED, used as i64) });
+            // Quarter dB-Hz to milli-dB-Hz.
+            status(4, if none || seen == 0 { MEASURE_NONE } else { w(k::CN0, cn0 as i64 * 250) });
+            published_sky = d.sky.msgs + d.sky.bad;
         }
         if d.fixes > 0 && now().wrapping_sub(kept_at) > 64 * f {
             keep_last(grants, &d);
@@ -716,6 +747,17 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     reply(&token, &[ok as u8]);
                     say!(grants, "gps: stopped after {} fixes\n", d.fixes);
                     ferros_sys::exit(0);
+                }
+                2 => {
+                    let mut r = [0u8; 9 + SATS * REC];
+                    let n = d.sky.sats().len();
+                    r[0] = n as u8;
+                    r[1..5].copy_from_slice(&d.sky.msgs.to_le_bytes());
+                    r[5..9].copy_from_slice(&((now().wrapping_sub(d.sky_at) * 1000 / f) as u32).to_le_bytes());
+                    for k in 0..n {
+                        d.sky.record(k, &mut r[9 + REC * k..9 + REC * (k + 1)]);
+                    }
+                    reply(&token, &r[..9 + REC * n]);
                 }
                 _ => {
                     reply(&token, &[]);
