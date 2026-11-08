@@ -74,8 +74,15 @@ Later, not now: a system picker that hands a kist just the file the person chose
 - **The installer, for development**:
   - `ferros-bridge capsule … --kist NAME --option HEX --want RIGHT REASON …` signs a declaration in, with the option as the capsule's `hp`, so an update keeps the kist's identity.
   - `ferros-bridge kist install <capsule>` checks the signature, stores the capsule in parts of 4 MiB (a `store` command's part form: offset and more, by address), and adds the kist to the attested person's list. `kist answer` and `kist list` are for testing.
-  - tools/mahere-kist.sh makes and installs Mahere.
+  - tools/mahere-kist.sh and tools/photon-kist.sh make and install Mahere and Photon.
 - **One shot dead**: the kernel's kill, exit and restart paths give a process nothing on its way out (audited 2026-11-08). Arcs are now wiped as they are freed, so the attest screen, Hive, Ramps and wintest no longer wipe or close their window before they exit (the display drops a dead process's window).
+- **Measured on the Pro** (2026-11-08): Mahere's 47 MB capsule stored in 12 s, Photon's 106 MB in 23 s (the vault process's heap raised to 24 MiB on the way: rewriting a capsule grows a manifestus buffer with the vault's entries). A launch reads the capsule from the vault in 3.8 to 3.9 s (Mahere) and 6.2 to 10.3 s (Photon), a transfer of 4 KiB a call through the kernel's channel. Launched from its circle (FERROS_MAP_START=kist, no one at the panel), with the question answered at the defaults (all off), Mahere started with its gps slot empty and opened its vault in its own domain; Photon with every want off started and ended at once, and with all seven granted ran. A relaunch killed the running Photon and started it again with the answers as they stood.
+- **Not yet**: the question and the pages seen by eye; a kist's own icon in the list; Mahere and Photon running at once (each takes a 256 MiB arc, the big pool is 320 MiB: the second is refused for room); reading a capsule in larger transfers than 4 KiB.
+- **Teardown still in processes** (found by the 2026-11-08 audit, left for the owner: each powers hardware or ends a session, and moving it is a decision):
+  - payloads/usb `give_up` switches the controller's power off before it exits; payloads/bt and payloads/sensors switch theirs off when bring-up fails; payloads/gpu's one-shot demo resets the GPU before it exits. A kernel rule (a power switch turned off when the last process holding it ends) would take all of these.
+  - payloads/gps op 1 STOP keeps the last fix, powers the chip down and exits; payloads/modem's rmnet op 5 DOWN powers the CP down and exits. The kernel's radio switch already kills without asking (and powers Bluetooth, NFC and GPS down itself); the last fix would then need keeping when it is taken.
+  - payloads/httptest puts ip's link mode back before it exits.
+  - Outside this repo: fluor's ferros host sends op 23 when an app closes (Photon, fluordemo), and Rust's std runs main's destructors and flushes stdout at its return (ferros_rt `rt_main`).
 
 ## Built before
 

@@ -122,7 +122,7 @@ The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by t
   - The stored copy goes once a slot b cold boot has started the vault from the image (decision 0's "boot path last").
 - **Still to do:**
   - the person's entries moving at the first attest (built, not yet seen on the device);
-  - per-kist domains through the oracle and the common area's named grants (step 3's rest);
+  - the common area's named grants (step 3's rest; per-kist domains exist since 2026-11-08: `Object::Domain`, KISTS.md "Built", keyed from the kist's ihi under the person's key);
   - the kernel's own names moved behind a channel of its own, then `kvault`, `vault_boot` and `ufs_device` retired (step 4).
 
 ## Found while mapping the kernel's vault (2026-11-07)
