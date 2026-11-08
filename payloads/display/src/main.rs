@@ -5567,6 +5567,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                                         text_rows[y] = lo | hi << 16;
                                     }
                                 }
+                                // The first flight frame: the compose-once bits said what the phases held before it (closing, "this phase holds the clean window here", the region's meaning), not the wallpaper alone the flight's skip asks; trusted, the blocks the shrinking page left kept the ground (the owner's "16x16 squares everywhere" zooming out, 2026-11-08). They start again.
+                                if (*(&raw const FLIGHT_FRAME)).is_none() {
+                                    clean_reset();
+                                }
                                 FLIGHT_SEQ += 1;
                                 FLIGHT_FRAME = Some(FlightFrame { page: flight_map(&cam, &page, width, height), plane: flight_map(&cam, &plane, width, height), alpha, plane_px: surface(surf, width, height).as_ptr() as usize, ground });
                                 CLOCK_SHOWN = false;
