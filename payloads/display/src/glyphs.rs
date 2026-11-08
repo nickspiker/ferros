@@ -37,8 +37,13 @@ pub struct Glyphs {
 impl Glyphs {
     /// From the typeface's bytes; the table and arena are allocated now (before the heap's mark) and kept for the process.
     pub fn new(ttf: &'static [u8]) -> Option<Glyphs> {
+        Self::with_arena(ttf, ARENA)
+    }
+
+    /// The same with a cache of `arena` samples (the console's worker keeps a small one: its text is a few sizes of a few words).
+    pub fn with_arena(ttf: &'static [u8], arena: usize) -> Option<Glyphs> {
         let font = FontRef::from_index(ttf, 0)?;
-        Some(Glyphs { font, table: alloc::vec![EMPTY; SLOTS].leak(), arena: alloc::vec![0u16; ARENA].leak(), used: 0, misses: 0 })
+        Some(Glyphs { font, table: alloc::vec![EMPTY; SLOTS].leak(), arena: alloc::vec![0u16; arena].leak(), used: 0, misses: 0 })
     }
 
     /// The width of `s` at `px` pixels, along its own baseline.
@@ -89,7 +94,7 @@ impl Glyphs {
                     });
                     match img {
                         Some((l, t, w, h, data)) => {
-                            if (w * h) as usize > ARENA / 4 {
+                            if (w * h) as usize > self.arena.len() / 4 {
                                 big = Some((l, t, w, h, data));
                                 EMPTY
                             } else {
@@ -139,7 +144,7 @@ impl Glyphs {
 
     fn insert(&mut self, key: u64, left: i32, top: i32, w: u32, h: u32, data: &[u16]) -> Entry {
         let n = (w * h) as usize;
-        if n > ARENA / 4 || data.len() < n {
+        if n > self.arena.len() / 4 || data.len() < n {
             return EMPTY;
         }
         // Full (the arena, or the probe run): everything goes; the cache refills from what is drawn next.
@@ -152,7 +157,7 @@ impl Glyphs {
             }
             i = (i + 1) % SLOTS;
         }
-        if self.used + n > ARENA || slot.is_none() {
+        if self.used + n > self.arena.len() || slot.is_none() {
             for e in self.table.iter_mut() {
                 *e = EMPTY;
             }

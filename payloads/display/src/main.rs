@@ -327,6 +327,26 @@ unsafe impl Sync for Bump {}
 
 unsafe impl GlobalAlloc for Bump {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        // The console's worker allocates from its own arena (COMPOSITOR.md, step 1: producers off the render thread), told by its stack pointer: this bump is not shared between threads, and the render thread resets it every frame. Swash allocates as it scales a glyph, so the worker cannot draw text without a heap of its own.
+        let sp: usize;
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+        if sp.wrapping_sub(CON_STACK_LO) < CON_STACK_LEN {
+            return CON_HEAP.bump(l);
+        }
+        self.bump(l)
+    }
+    unsafe fn dealloc(&self, _: *mut u8, _: Layout) {}
+}
+
+/// The console worker's stack (its allocations are told by it) and heap. Non-zero initialisers (see `ALLOC`): until `init` no stack pointer falls in the range.
+static mut CON_STACK_LO: usize = usize::MAX;
+static mut CON_STACK_LEN: usize = 1;
+static mut CON_STACK: [u8; 1 << 18] = [0; 1 << 18];
+static CON_HEAP: Bump = Bump { base: UnsafeCell::new(1), next: UnsafeCell::new(1), mark: UnsafeCell::new(1), end: UnsafeCell::new(1) };
+
+impl Bump {
+    /// The bump itself: the next aligned bytes of this arena, null when it is full or not yet set up.
+    unsafe fn bump(&self, l: Layout) -> *mut u8 {
         let base = *self.base.get();
         if base <= 1 {
             return core::ptr::null_mut();
@@ -338,16 +358,18 @@ unsafe impl GlobalAlloc for Bump {
         *self.next.get() = start + l.size();
         start as *mut u8
     }
-    unsafe fn dealloc(&self, _: *mut u8, _: Layout) {}
 }
 
 impl Bump {
     fn init(&self, base: usize) {
+        self.init_at(base, HEAP_REGION);
+    }
+    fn init_at(&self, base: usize, len: usize) {
         unsafe {
             *self.base.get() = base;
             *self.next.get() = base;
             *self.mark.get() = base;
-            *self.end.get() = base + HEAP_REGION;
+            *self.end.get() = base + len;
         }
     }
     fn mark(&self) {
@@ -1760,6 +1782,15 @@ static mut BAR: usize = 1;
 /// The bars decoded once a redraw to working values with their transparency (`working`), so a publish folds the scene under them with no table walk; and each row's columns holding any of them, (from, to), so the rest of a row passes untouched.
 static mut BAR_W: usize = 1;
 static mut BAR_SPAN: usize = 1;
+/// The bars as a mailbox (COMPOSITOR.md, step 1): the console's worker draws `BAR` and decodes the whole of it into these back buffers, then says so (`CON_READY`, with the rectangle that changed against the front, `CON_RECT`); the render thread swaps them with the front ones at a pass's top, where no publish is reading, and publishes that rectangle. The worker draws again only once the render thread has taken the last.
+static mut BAR_W_BACK: usize = 1;
+static mut BAR_SPAN_BACK: usize = 1;
+static CON_READY: AtomicU64 = AtomicU64::new(0);
+/// Bumped by the render thread every pass, to wake the worker to look at the console's key.
+static CON_NUDGE: AtomicU64 = AtomicU64::new(0);
+static mut CON_RECT: [draw::Rect; 2] = [draw::Rect::EMPTY; 2];
+/// The worker's own glyph engine: its cache is not shared with the render thread's.
+static mut CON_GLYPHS: Option<glyphs::Glyphs> = None;
 /// What the console last drew (the minute, the radios, their measures, the switches), so it redraws when one changes.
 static mut CONSOLE_KEY: i64 = -1;
 /// Measuring the console's redraws: the parts of its key at the last draw, how often each has moved, the draws' summed time and their count.
@@ -2826,7 +2857,6 @@ fn helm_draw(width: usize, height: usize) -> bool {
             }
         }
     }
-    bar_decode(top, bot, width);
     true
 }
 
@@ -2836,9 +2866,48 @@ fn px_out(y: i64, height: usize) -> bool {
     y < (height - unsafe { CHROME_BOT }) as i64 || y >= height as i64
 }
 
+/// The bars' producer (COMPOSITOR.md, step 1: producers never draw on the render thread). Woken on every render pass (`CON_NUDGE`), it looks at the console's key; when it changed, and the render thread has taken the last result, it draws the console (and the helm, the first time) into `BAR`, decodes the whole of the bars into the back buffers, finds what differs from the front (the top bar's and the bottom bar's rectangles), and says so (`CON_READY`), waking the render thread. On its own stack and heap (`CON_STACK`, `CON_HEAP`).
+extern "C" fn console_worker(arg: u64) -> ! {
+    let (width, height) = ((arg >> 32) as usize, (arg & 0xFFFF_FFFF) as usize);
+    let mut seen = 0u64;
+    loop {
+        let n = CON_NUDGE.load(Ordering::Acquire);
+        if n == seen {
+            ferros_sys::wait(&CON_NUDGE, n, 0);
+            continue;
+        }
+        seen = n;
+        // The last result not taken yet: its back buffers are still the render thread's to swap in.
+        if CON_READY.load(Ordering::Acquire) != 0 {
+            continue;
+        }
+        let console = console_draw(width, height, false);
+        let helm = helm_draw(width, height);
+        CON_HEAP.reset();
+        if !console && !helm {
+            continue;
+        }
+        let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
+        bar_decode(0, top + bot, width);
+        // What changed, row by row, back against front: the columns from the first differing pixel to the last.
+        let (front, back) = unsafe { (core::slice::from_raw_parts(BAR_W as *const u64, (top + bot) * width), core::slice::from_raw_parts(BAR_W_BACK as *const u64, (top + bot) * width)) };
+        let mut rects = [draw::Rect::EMPTY; 2];
+        for b in 0..top + bot {
+            let (f, k) = (&front[b * width..(b + 1) * width], &back[b * width..(b + 1) * width]);
+            let Some(x0) = (0..width).find(|&x| f[x] != k[x]) else { continue };
+            let x1 = (0..width).rev().find(|&x| f[x] != k[x]).map_or(x0, |x| x) + 1;
+            let (which, y) = if b < top { (0, b) } else { (1, height - bot + (b - top)) };
+            rects[which] = rects[which].union(draw::Rect { x0: x0 as i32, y0: y as i32, x1: x1 as i32, y1: y as i32 + 1 });
+        }
+        unsafe { CON_RECT = rects };
+        CON_READY.store(1, Ordering::Release);
+        ferros_sys::wake(&RING_TAIL, 1);
+    }
+}
+
 /// The bars' rows `b0..b0 + rows` decoded for publishing (`BAR_W`, by `working`), and each row's columns holding any of them (`BAR_SPAN`).
 fn bar_decode(b0: usize, rows: usize, width: usize) {
-    let (bar, cw, span) = unsafe { (core::slice::from_raw_parts((BAR as *const u64).add(b0 * width), rows * width), core::slice::from_raw_parts_mut((BAR_W as *mut u64).add(b0 * width), rows * width), core::slice::from_raw_parts_mut((BAR_SPAN as *mut (u16, u16)).add(b0), rows)) };
+    let (bar, cw, span) = unsafe { (core::slice::from_raw_parts((BAR as *const u64).add(b0 * width), rows * width), core::slice::from_raw_parts_mut((BAR_W_BACK as *mut u64).add(b0 * width), rows * width), core::slice::from_raw_parts_mut((BAR_SPAN_BACK as *mut (u16, u16)).add(b0), rows)) };
     for yy in 0..rows {
         let (mut l, mut rr) = (width, 0);
         for xx in 0..width {
@@ -3098,7 +3167,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 }
             } else if !name.is_empty() {
                 lines[0].s(name);
-                let eng = glyph_engine();
+                let eng = unsafe { (*(&raw mut CON_GLYPHS)).as_mut().expect("console glyphs") };
                 // The lines stacked about the centre, a pitch each; each line as large as fits its own chord (seven tenths of the circle's width at the line's far edge), the name half again as large as a measure.
                 let weight = |j: usize| if j == 0 && nl > 1 { 1.5 } else { 1.0 };
                 let total: f32 = (0..nl).map(weight).sum();
@@ -3168,9 +3237,8 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             }
         }
     }
-    ALLOC.reset();
-    // Decoded once for every publish, and each row's columns that hold any of it.
-    bar_decode(0, rows, width);
+    // The worker's own heap: this draw's tables and glyphs gone (`CON_HEAP`, the render thread's bump untouched).
+    CON_HEAP.reset();
     unsafe {
         CONSOLE_US[0] += ferros_sys::us_since(t_draw);
         CONSOLE_US[1] += 1;
@@ -3614,6 +3682,13 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         BAR = alloc::vec![0u64; (top + bot) * width].leak().as_mut_ptr() as usize;
         BAR_W = alloc::vec![CLEAR; (top + bot) * width].leak().as_mut_ptr() as usize;
         BAR_SPAN = alloc::vec![(0u16, 0u16); top + bot].leak().as_mut_ptr() as usize;
+        BAR_W_BACK = alloc::vec![CLEAR; (top + bot) * width].leak().as_mut_ptr() as usize;
+        BAR_SPAN_BACK = alloc::vec![(0u16, 0u16); top + bot].leak().as_mut_ptr() as usize;
+        // The console worker's heap (1 MiB: a draw's tables and the glyphs it rasterises, reset after each draw), its stack (its allocations are told by it), and its own glyph engine.
+        CON_HEAP.init_at(alloc::vec![0u8; 1 << 20].leak().as_mut_ptr() as usize, 1 << 20);
+        CON_STACK_LEN = (*(&raw const CON_STACK)).len();
+        CON_STACK_LO = (&raw const CON_STACK) as usize;
+        CON_GLYPHS = glyphs::Glyphs::with_arena(FONT, 1 << 17);
     }
     ALLOC.mark();
     log.s(b"display: present table (E peak ");
@@ -3738,6 +3813,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             log.s(b"display: no publish worker\n");
             log.flush();
         }
+    }
+    // The bars' producer (`console_worker`), on the workers with the rest.
+    if ferros_sys::thread_spawn(console_worker, unsafe { &mut *(&raw mut CON_STACK) }, (width as u64) << 32 | height as u64) != 0 {
+        log.s(b"display: no console worker\n");
+        log.flush();
     }
     // The render thread on the big core (KERNEL.md "Cores": pinning by latency class — this is the one real compute path; receive and vsync stay on the workers, where the map and the touch server run, so a call hands off on the caller's own core). After the other threads are spawned: they inherit the mask.
     ferros_sys::pin(ferros_sys::CORES_BIG);
@@ -4643,13 +4723,23 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             wall_step(grants, width, height);
             stage_us[1] = ferros_sys::us_since(t_w);
             let t_bars = now();
-            // The bars on every screen (in front of the home screen and of every app): each redrawn when what it shows changed, and its rows into every phase.
-            let console_new = console_draw(width, height, false);
-            let helm_new = helm_draw(width, height);
-            let top = draw::Rect { x0: 0, y0: 0, x1: width as i32, y1: CHROME_TOP as i32 };
-            let bottom = draw::Rect { x0: 0, y0: (height - CHROME_BOT) as i32, x1: width as i32, y1: height as i32 };
-            for (new, r) in [(console_new, top), (helm_new, bottom)] {
-                if !new {
+            // The bars on every screen (in front of the home screen and of every app), drawn by their worker, never here (COMPOSITOR.md, step 1): nudged on every pass to look at what they show; when it has drawn, their buffers swap here, at a pass's top where no publish is reading, and only the rectangles that changed go into every phase.
+            CON_NUDGE.fetch_add(1, Ordering::Release);
+            ferros_sys::wake(&CON_NUDGE, 1);
+            let changed = if CON_READY.load(Ordering::Acquire) != 0 {
+                let (w, s) = (BAR_W, BAR_SPAN);
+                BAR_W = BAR_W_BACK;
+                BAR_SPAN = BAR_SPAN_BACK;
+                BAR_W_BACK = w;
+                BAR_SPAN_BACK = s;
+                let r = CON_RECT;
+                CON_READY.store(0, Ordering::Release);
+                r
+            } else {
+                [draw::Rect::EMPTY; 2]
+            };
+            for r in changed {
+                if r.is_empty() {
                     continue;
                 }
                 if { APP }.is_some() {
