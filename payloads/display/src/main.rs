@@ -4153,8 +4153,8 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                         console[i] = console[i].under(ink | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
                     }
                 }
-            } else if matches!(what, Corner::Wifi | Corner::Cellular | Corner::Nfc) {
-                // The radio's own field, switched off, in the ink and posterised to near black and white (owner, 2026-11-07): WiFi a single emitter's waves; cellular a mesh of emitters at random places, their ripples interfering; NFC the magnetic dipole's field lines, the figure-eight, its light falling off with the log of the distance. Posterised by tanh (the bands near flat, their edges C∞); faded out before the rim by the C∞ bump exp(1 − 1/(1 − t²)).
+            } else if matches!(what, Corner::Wifi | Corner::Bluetooth | Corner::Cellular | Corner::Nfc) {
+                // The radio's own field, switched off, in the ink and posterised to near black and white (owner, 2026-11-07): WiFi a single emitter's waves; Bluetooth the same waves from two poles side by side, interfering (owner, 2026-11-08: "like the wifi icon but has two poles instead of one"); cellular a mesh of emitters at random places, their ripples interfering; NFC the magnetic dipole's field lines, the figure-eight, its light falling off with the log of the distance. Posterised by tanh (the bands near flat, their edges C∞); faded out before the rim by the C∞ bump exp(1 − 1/(1 − t²)).
                 let ri = r * (1.0 - 2.0 * VESSEL_DEPTH);
                 let post = |v: f32| 0.5 + 0.5 * libm::tanhf((1 << 2) as f32 * v);
                 let env = |q2: f32| {
@@ -4176,6 +4176,15 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                             let lam = ri * (1.0 / 3.0);
                             let d = libm::sqrtf(dx * dx + (dy - ri * 0.35) * (dy - ri * 0.35));
                             post(libm::sinf(tau * d / lam) / libm::sqrtf(1.0 + d / lam))
+                        }
+                        Corner::Bluetooth => {
+                            // WiFi's wave from two poles in phase, either side of WiFi's emitter at a third of a wavelength's spacing each way: their fringes fan out between and around them. The sum over √2 keeps one pole's amplitude.
+                            let lam = ri * (1.0 / 3.0);
+                            let (sx, sy) = (lam * (1.0 / 3.0), dy - ri * 0.35);
+                            let d0 = libm::sqrtf((dx - sx) * (dx - sx) + sy * sy);
+                            let d1 = libm::sqrtf((dx + sx) * (dx + sx) + sy * sy);
+                            let w = |d: f32| libm::sinf(tau * d / lam) / libm::sqrtf(1.0 + d / lam);
+                            post((w(d0) + w(d1)) * core::f32::consts::FRAC_1_SQRT_2)
                         }
                         Corner::Cellular => {
                             let lam = ri * (1.0 / (1 << 2) as f32);

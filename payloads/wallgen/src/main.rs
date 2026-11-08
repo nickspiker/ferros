@@ -4,7 +4,7 @@
 //! Otherwise it draws the `wallpaper` crate's picture on four threads, in three passes with a barrier between: the first pass, the edges marked, the marked pixels drawn again 4 × 4. The picture is the same one the display draws from the same seed.
 //! It packs the picture as a VSF visual (one plane, VSF RGB, gamma2tanh at 16 bits, as tools/wallpaper writes a person's own), stores it as `wallpaper.made` in pieces and then its key, and asks the display to show it (op 44).
 //!
-//! The heap is 96 MiB: the frame (working values, 32 MB), then the samples (24 MB), then the document: writing it holds about three copies of the samples (the packed tensor, the section the builder keeps, the bytes written); 60 MiB failed at the write, 2026-11-07.
+//! The heap is 120 MiB, inside the 128 MiB arc the kernel gives it either way (arcs are powers of two): the frame (working values, 32 MB), then the samples (24 MB), then the document: writing it holds four copies of the samples at its peak (the packed tensor, the section the builder keeps, the bytes written, and the provenance hash's zeroed copy). 60 MiB failed at the write, and 96 MiB on the Pro the night of 2026-11-07 (the builder's output grew by doubling, 48 MB at its last step; vsf now sizes it once).
 //!
 //! Grant slots: 0 console, 1 the vault scope `map.`, 2 use display. Input: the wallpaper seed.
 #![no_std]
@@ -17,7 +17,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use ferros_sys::{call, cap, console, freq, now, ERR};
 
-const HEAP_BYTES: usize = 96 << 20;
+const HEAP_BYTES: usize = 120 << 20;
 const STACK_BYTES: usize = 1 << 16;
 const WORKERS: usize = 3;
 /// Rows a thread takes at a time.
