@@ -208,6 +208,88 @@ pub fn disc(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
     Rect { x0: ((cx - r) >> 8) as i32 - 2, y0: ((cy - r) >> 8) as i32 - 2, x1: ((cx + r) >> 8) as i32 + 3, y1: ((cy + r) >> 8) as i32 + 3 }.clip(width, height)
 }
 
+/// A capsule of `colour` (opaque G#RRGGBB): every point within r of the segment from (ax, ay) to (bx, by), all in Q8 pixels, drawn under what is there and antialiased as `disc` is, by the first-order distance from the edge (½ − (d² − r²)/2r, no root). Its boundary is two half circles and the straight sides tangent to them, C¹ where they meet. The slider's track and the checkbox's tick (display ops 48 and 50).
+pub fn capsule(px: &mut [Px], width: usize, height: usize, ax: i64, ay: i64, bx: i64, by: i64, r: i64, colour: u32) {
+    if r < 128 {
+        return;
+    }
+    let (bx0, by0, bx1, by1) = bounds(width, height);
+    // In pixels from here, the segment's start the origin.
+    let q = 1.0 / 256.0;
+    let (dx, dy, rf) = ((bx - ax) as f32 * q, (by - ay) as f32 * q, r as f32 * q);
+    let len2 = dx * dx + dy * dy;
+    let (r2, inv2r) = (rf * rf, 0.5 / rf);
+    // A pixel wholly inside: its centre half a pixel or more inside the edge.
+    let ri2 = if rf > 0.5 { (rf - 0.5) * (rf - 0.5) } else { -1.0 };
+    let solid = opaque(colour);
+    let (lo_x, hi_x, lo_y, hi_y) = (ax.min(bx) - r, ax.max(bx) + r, ay.min(by) - r, ay.max(by) + r);
+    // WHY the bounds: the capsule is placed by the page and may run past the screen or the redraw's clip; outside them the index is another row or past the buffer.
+    for y in ((lo_y >> 8) - 1).max(by0)..=((hi_y >> 8) + 1).min(by1 - 1) {
+        let rowb = y as usize * width;
+        let qy = ((y << 8) + 128 - ay) as f32 * q;
+        for x in ((lo_x >> 8) - 1).max(bx0)..=((hi_x >> 8) + 1).min(bx1 - 1) {
+            let p = &mut px[rowb + x as usize];
+            if *p >> 48 == 0xFFFF {
+                continue;
+            }
+            let qx = ((x << 8) + 128 - ax) as f32 * q;
+            // The distance² to the segment: to its start before it, to its end past it, else across it (the capsule is the points within r of the segment, so the cases are its shape, not a guard).
+            let s = qx * dx + qy * dy;
+            let d2 = if s <= 0.0 {
+                qx * qx + qy * qy
+            } else if s >= len2 {
+                (qx - dx) * (qx - dx) + (qy - dy) * (qy - dy)
+            } else {
+                let c = qx * dy - qy * dx;
+                c * c / len2
+            };
+            if d2 <= ri2 {
+                *p = if *p == 0 { solid } else { under(*p, solid) };
+                continue;
+            }
+            let cov = 0.5 - (d2 - r2) * inv2r;
+            if cov <= 0.0 {
+                continue;
+            }
+            // A pixel is never more than covered: the cast to a byte's range is the coverage's own limit.
+            *p = under(*p, at_cover16(colour, (cov * 65535.0) as u16 as u32));
+        }
+    }
+}
+
+/// A ring of `colour` (opaque G#RRGGBB) centred at (cx, cy), radius r, its stroke `w` wide centred on the radius (all Q8 pixels), drawn under what is there: a pixel's coverage by the band, w/2 + ½ − |e| for its centre's distance e from the radius, first order (e = (d² − r²)/2r, no root). The radio button's ring (display op 49); at one pixel wide it weighs as the app circle's hairline.
+pub fn ring(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, w: i64, colour: u32) {
+    if r < 256 || w < 16 {
+        return;
+    }
+    let (bx0, by0, bx1, by1) = bounds(width, height);
+    let q = 1.0 / 256.0;
+    let (rf, hw) = (r as f32 * q, w as f32 * q * 0.5);
+    let (r2, inv2r) = (rf * rf, 0.5 / rf);
+    let reach = r + w / 2 + 256;
+    // WHY the bounds: the ring is placed by the page and may run past the screen or the redraw's clip; outside them the index is another row or past the buffer.
+    for y in (((cy - reach) >> 8) - 1).max(by0)..=(((cy + reach) >> 8) + 1).min(by1 - 1) {
+        let rowb = y as usize * width;
+        let qy = ((y << 8) + 128 - cy) as f32 * q;
+        for x in (((cx - reach) >> 8) - 1).max(bx0)..=(((cx + reach) >> 8) + 1).min(bx1 - 1) {
+            let p = &mut px[rowb + x as usize];
+            if *p >> 48 == 0xFFFF {
+                continue;
+            }
+            let qx = ((x << 8) + 128 - cx) as f32 * q;
+            let e = (qx * qx + qy * qy - r2) * inv2r;
+            // The band's coverage of the pixel by the distance's size either side of the radius (its definition, not a guard).
+            let cov = hw + 0.5 - if e < 0.0 { -e } else { e };
+            if cov <= 0.0 {
+                continue;
+            }
+            // A pixel is never more than covered: the cast to a byte's range is the coverage's own limit.
+            *p = under(*p, at_cover16(colour, (cov * 65535.0) as u16 as u32));
+        }
+    }
+}
+
+
 /// A glow around a disc of radius r centred at (cx, cy) (Q8 pixels): emitted light added behind whatever is already there (alpha stays as it is, so drawn after the circles it lands only where they leave room), falling off as 1/(distance from the edge) — `peak` one pixel out, half that two out, a quarter four out: a step down for every doubling of the distance (owner, 2026-10-23: "imgpx-FF0000-770000-330000"). No root anywhere, as in `disc`: with q = d² − r² = e·(2r + e) for an edge distance e, the brightness is peak · 2r · s / q — exactly peak·s/e near the edge, and a little faster far out, which bounds the reach. `scale_q8` is s, the distance at which the glow is still at peak, in Q8 pixels (256 = one pixel); `floor` the brightness (0-255) below which it stops. Gamma-space values, as the canvas holds them. Returns the rectangle it touched.
 /// log2 of q > 0 in Q16 octaves, without a divide or a table (Mitchell): the top bit's place is the integer part, the bits under it the fraction, plus m·(1 − m)·0.3466 (one multiply), which takes the straight-line fraction's kinks at each octave down to under a hundredth of an octave.
 #[inline(always)]

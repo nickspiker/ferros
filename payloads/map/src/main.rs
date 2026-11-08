@@ -78,6 +78,39 @@ fn fill() -> u32 {
     ferros_sys::theme::current().plane
 }
 
+/// The controls (owner, 2026-11-08: "add in the fluor elements like sliders (for brightness) and buttons", then "radio buttons and checkboxes ... very against the switch design"): fluor's button and slider, a radio's ring and a checkbox's squircle, drawn by the display (ops 47-50, COMPOSITOR.md "Controls").
+/// A button's colours by theme, G#RRGGBB VSF RGB codes at gamma 2 as every op's: its fill, its fill while held (or armed, the first tap of two), and its edge on the top-left and the bottom-right of the anti-diagonal, shadow then light so it stands raised (fluor's BUTTON_FILL, BUTTON_HELD, TEXTBOX_SHADOW_EDGE and TEXTBOX_LIGHT_EDGE on grey, whose dark codes are the same at gamma 2; the other themes' in their own hues).
+const BUTTON_LOOK: [[u32; 4]; 4] = [
+    [0x1A214C, 0x3C4CA8, 0x2A3336, 0x423F36],
+    [0x162238, 0x2E4C78, 0x1A2028, 0x48525E],
+    [0x3A2414, 0x6E4424, 0x241A12, 0x5A4A3A],
+    [0x380A06, 0x6A160C, 0x180404, 0x4A120C],
+];
+/// The radio's and the checkbox's look, one of three for the owner to pick from (2026-11-08): 0 the app circle's hairline (its weight, a pixel, and its colour: the ring's light halved on release, orange on development builds) for the stroke and the fill alike; 1 that hairline round a fill of the theme's text colour, the checkbox ticked in the ground's; 2 fluor's stroke (a 32nd of the label's size, plus a pixel) in the secondary text colour, filled with the theme's lit colour and ticked.
+const MARK_LOOK: u8 = 0;
+/// The circles' hairline colour, as the display draws the app circle's (display `hairline`): on release, grey (equal codes) at half the photopic light of the theme's ring (VSF RGB's weights on its codes, squared); on development builds, VSF RGB orange, full red and green at half its light.
+fn hairline() -> u32 {
+    if DEV {
+        return 0xFF_B4_00;
+    }
+    let ring = ferros_sys::theme::current().ring;
+    let lin = |sh: u32| {
+        let c = (ring >> sh & 0xFF) as f32 * (1. / 255.);
+        c * c
+    };
+    let light = 0.2584 * lin(16) + 0.6346 * lin(8) + 0.1070 * lin(0);
+    let code = (libm::sqrtf(light * 0.5) * 255.) as u32;
+    code << 16 | code << 8 | code
+}
+/// A mark's stroke width (Q8 pixels) and colours (stroke, fill, ink unused here, tick) and whether a checked box carries its tick, for the label size `px`, by `MARK_LOOK`.
+fn mark_look(px: i64) -> (i64, [u32; 4], bool) {
+    match MARK_LOOK {
+        0 => (256, [hairline(), hairline(), 0, fill()], false),
+        1 => (256, [hairline(), white(), 0, fill()], true),
+        _ => (((px >> 5) + 1) << 8, [grey(), ferros_sys::theme::current().lit, 0, fill()], true),
+    }
+}
+
 /// Movement under this many panel pixels is a finger resting, not a drag: a tap may wobble this much.
 const SLOP: i64 = 24;
 /// One, in the rotation's Q14.
@@ -440,6 +473,61 @@ impl Batch {
         m[7..11].copy_from_slice(&colour.to_le_bytes());
         self.op(&m);
     }
+    /// fluor's button (display op 47): its label at `px` in `ink` centred on (cx, cy), in front of a pill `w` wide (wider for a long label) and `h` high, filled `fill` inside its two-tone edge (`tl` on the top-left side of the anti-diagonal, `br` on the other).
+    #[allow(clippy::too_many_arguments)]
+    fn button(&mut self, cx: i64, cy: i64, w: i64, h: i64, px: i64, look: [u32; 4], t: &str) {
+        let mut m = [0u8; 140];
+        m[0] = 47;
+        // The clamps are the fields' own ranges, as for every op the display reads (a page sliding off an edge has its buttons past it).
+        m[1..3].copy_from_slice(&(cx.clamp(-32768, 32767) as i16).to_le_bytes());
+        m[3..5].copy_from_slice(&(cy.clamp(-32768, 32767) as i16).to_le_bytes());
+        m[5..7].copy_from_slice(&(w.clamp(0, 65535) as u16).to_le_bytes());
+        m[7..9].copy_from_slice(&(h.clamp(0, 65535) as u16).to_le_bytes());
+        m[9..11].copy_from_slice(&(px.clamp(0, 65535) as u16).to_le_bytes());
+        for (k, c) in look.iter().enumerate() {
+            m[11 + 4 * k..15 + 4 * k].copy_from_slice(&c.to_le_bytes());
+        }
+        let t = t.as_bytes();
+        let k = t.len().min(m.len() - 27);
+        m[27..27 + k].copy_from_slice(&t[..k]);
+        self.op(&m[..27 + k]);
+    }
+    /// fluor's slider (display op 48): the track from x0 to x1 at y, `tr` its half-thickness and `kr` the knob's radius (Q8 pixels), the knob at `t` of the way (0 to 1), `left` up to it, `right` past it.
+    #[allow(clippy::too_many_arguments)]
+    fn slider(&mut self, x0: i64, x1: i64, y: i64, tr: i64, kr: i64, t: f64, left: u32, right: u32, knob: u32) {
+        let mut m = [0u8; 25];
+        m[0] = 48;
+        for (k, &v) in [x0, x1, y].iter().enumerate() {
+            m[1 + 2 * k..3 + 2 * k].copy_from_slice(&(v.clamp(-32768, 32767) as i16).to_le_bytes());
+        }
+        m[7..9].copy_from_slice(&(tr.clamp(0, 65535) as u16).to_le_bytes());
+        m[9..11].copy_from_slice(&(kr.clamp(0, 65535) as u16).to_le_bytes());
+        // The knob's place in 65535ths; the slider keeps t within 0 to 1, and the cast saturates.
+        m[11..13].copy_from_slice(&(libm::round(t * 65535.) as u16).to_le_bytes());
+        for (k, c) in [left, right, knob].iter().enumerate() {
+            m[13 + 4 * k..17 + 4 * k].copy_from_slice(&c.to_le_bytes());
+        }
+        self.op(&m);
+    }
+    /// A radio button (display op 49) or a checkbox (op 50) and its label, centred together on (cx, cy): the mark `mark` pixels across, its stroke `sw` wide (Q8 pixels), `state` bit 0 chosen or checked (bit 1 with it: the checkbox's tick); colours stroke, fill, the label's ink, the tick.
+    #[allow(clippy::too_many_arguments)]
+    fn mark(&mut self, op: u8, cx: i64, cy: i64, px: i64, mark: i64, sw: i64, state: u8, colours: [u32; 4], t: &str) {
+        let mut m = [0u8; 140];
+        m[0] = op;
+        m[1..3].copy_from_slice(&(cx.clamp(-32768, 32767) as i16).to_le_bytes());
+        m[3..5].copy_from_slice(&(cy.clamp(-32768, 32767) as i16).to_le_bytes());
+        m[5..7].copy_from_slice(&(px.clamp(0, 65535) as u16).to_le_bytes());
+        m[7..9].copy_from_slice(&(mark.clamp(0, 65535) as u16).to_le_bytes());
+        m[9..11].copy_from_slice(&(sw.clamp(0, 65535) as u16).to_le_bytes());
+        m[11] = state;
+        for (k, c) in colours.iter().enumerate() {
+            m[12 + 4 * k..16 + 4 * k].copy_from_slice(&c.to_le_bytes());
+        }
+        let t = t.as_bytes();
+        let k = t.len().min(m.len() - 28);
+        m[28..28 + k].copy_from_slice(&t[..k]);
+        self.op(&m[..28 + k]);
+    }
     fn send(&self, display: u64) {
         let mut r = [0u8; 4];
         call(display, &self.b[..self.n], &mut r);
@@ -507,14 +595,18 @@ enum Choice {
     Dither,
     /// One of the theme swatches.
     Theme(u8),
-    /// The brightness dots: which one is decided by x.
+    /// The brightness slider, nine stops (preference 3): the stop is decided by x, dragged or tapped.
     Brightness,
+    /// The UI scale slider (preference 14), half to twice: the scale decided by x.
+    Scale,
+    /// A link's value knob set to one of its choices (its radio group): link, slot, value.
+    KnobSet(u8, u8, u8),
+    /// The light scope's channel (preference 7) set to one of its radio group, 0 off to 6.
+    ScopeSet(u8),
     /// The keyboard's layout (honeycomb::LAYOUTS: 0 Dvorak, 1 QWERTY).
     Layout(u8),
     UnlockAtBoot,
     ProxWake,
-    /// The light scope's channel, round 0 (off) to 6.
-    Scope,
     /// About's version line: twelve taps in a row and Developer is a page.
     Version,
     /// A neighbour page's title: one page that way.
@@ -825,6 +917,10 @@ struct Map {
     /// A pinch on the open page: the spread it began at (sixteenths of a pixel) and the scale then; and the scale it is at now, shown live and kept as the preference when the fingers lift (64ths of an octave).
     pinch: Option<(i64, f32)>,
     scale_live: Option<f32>,
+    /// The controls under a finger (COMPOSITOR.md "Controls"): the row a finger is down on, which a button shows held until the finger lifts or moves; a slider dragged and the knob's place on it now (0 to 1); and a slider's knob let go off its value's place (a brightness between stops, a scale between 64ths), on a spring to it: (the slider, the offset in pixels and the speed it started at, frames gone).
+    pressed: Option<Choice>,
+    slide: Option<(Choice, f64)>,
+    knob: Option<(Choice, f64, f64, i32)>,
     nrows: usize,
     /// Each circle's own turn (its icon), (cos, sin) in Q14; two fingers in a circle twist it.
     rc: [i64; MAX],
@@ -1710,9 +1806,9 @@ impl Map {
         for &j in &open {
             let w = &k.wants[j];
             let on = self.ask >> j & 1 == 1;
-            let mut l = Line::new();
-            let _ = write!(l, "{}: {}", ferros_kist::MEANS[w.right as usize], if on { "on" } else { "off" });
-            b.text(cx, y, uu(5, 4) as u16, if on { white() } else { grey() }, 1, l.as_str());
+            // Its checkbox (COMPOSITOR.md "Controls"), the label white when on.
+            let (sw, colours, tick) = mark_look(uu(5, 4));
+            b.mark(50, cx, y - uu(1, 2), uu(5, 4), uu(1, 1), sw, on as u8 | ((on && tick) as u8) << 1, [colours[0], colours[1], if on { white() } else { grey() }, colours[3]], ferros_kist::MEANS[w.right as usize]);
             b.text(cx, y + uu(3, 2), uu(7, 8) as u16, dim(), 1, &w.reason);
             if live {
                 self.push_row(cx - half, cx + half, y - uu(2, 1), y + uu(3, 2), Choice::AskWant(j as u8));
@@ -1720,7 +1816,9 @@ impl Map {
             y += pitch;
         }
         y += uu(1, 1);
-        b.text(cx, y, uu(3, 2) as u16, white(), 1, "start");
+        // The button that starts it: fluor's, held while a finger is on it.
+        let [bf, bh, tl, br] = BUTTON_LOOK[ferros_sys::theme::index()];
+        b.button(cx, y - uu(1, 2), uu(16, 1), uu(2, 1), uu(3, 2), [if self.pressed == Some(Choice::AskGo) { bh } else { bf }, tl, br, white()], "start");
         if live {
             self.push_row(cx - half, cx + half, y - uu(2, 1), y + uu(1, 1), Choice::AskGo);
         }
@@ -1792,6 +1890,51 @@ impl Map {
             }
             *y += uu(3, 1);
         };
+        // The controls (COMPOSITOR.md "Controls"), each in a row's place and pitch, tappable across the row as a row is. A button: fluor's pill, sixteen units wide (a longer label grows it), two high, centred on the text's middle, held while a finger is down on it, and in its held fill while `armed` (the first tap of two).
+        let button = |m: &mut Map, b: &mut Batch, y: &mut i64, t: &str, armed: bool, what: Option<Choice>| {
+            let [fill, held, tl, br] = BUTTON_LOOK[ferros_sys::theme::index()];
+            let down = armed || what.is_some() && m.pressed == what;
+            b.button(cx, *y - uu(1, 2), uu(16, 1), uu(2, 1), uu(5, 4), [if down { held } else { fill }, tl, br, white()], t);
+            if let (true, Some(c)) = (hit, what) {
+                m.push_row(cx - half, cx + half, *y - uu(2, 1), *y + uu(1, 1), c);
+            }
+            *y += uu(3, 1);
+        };
+        // A checkbox (op 50) or a radio button (op 49) with its label, the mark a unit across: filled when on (`MARK_LOOK`), the label white when on and grey when off.
+        let mark = |m: &mut Map, b: &mut Batch, y: &mut i64, op: u8, t: &str, on: bool, what: Option<Choice>| {
+            let (sw, colours, tick) = mark_look(uu(5, 4));
+            let state = on as u8 | ((on && tick) as u8) << 1;
+            b.mark(op, cx, *y - uu(1, 2), uu(5, 4), uu(1, 1), sw, state, [colours[0], colours[1], if on { white() } else { grey() }, colours[3]], t);
+            if let (true, Some(c)) = (hit, what) {
+                m.push_row(cx - half, cx + half, *y - uu(2, 1), *y + uu(1, 1), c);
+            }
+            *y += uu(3, 1);
+        };
+        // A radio group (op 49, state bit 2): one choice of several, its marks in one column, the group centred on the page by its widest label (the display measures it, op 28); `now` the one chosen, `what` each one's choice.
+        let radios = |m: &mut Map, b: &mut Batch, y: &mut i64, names: &[&str], now: usize, what: &dyn Fn(usize) -> Choice| {
+            let (px, mk) = (uu(5, 4), uu(1, 1));
+            let wide = names.iter().filter_map(|n| ferros_sys::window::width(m.display, px as u16, n.as_bytes())).max().unwrap_or(0) as i64 / 4;
+            let left = cx - (mk + mk / 2 + wide) / 2;
+            let (sw, colours, _) = mark_look(px);
+            for (v, n) in names.iter().enumerate() {
+                let on = v == now;
+                b.mark(49, left, *y - uu(1, 2), px, mk, sw, on as u8 | 4, [colours[0], colours[1], if on { white() } else { grey() }, colours[3]], n);
+                if hit {
+                    m.push_row(cx - half, cx + half, *y - uu(2, 1), *y + uu(1, 1), what(v));
+                }
+                *y += uu(3, 1);
+            }
+        };
+        // A slider (op 48): fluor's, the theme's text colour up to the knob and on it, black past it; its knob a unit across and its track a quarter of that thick (fluor's proportions); the row it is in reaches a unit and a half either side.
+        let slider = |m: &mut Map, b: &mut Batch, y: &mut i64, what: Choice| {
+            let (a, z) = m.track(cx);
+            let kr = uq >> 1;
+            b.slider(a, z, *y, kr >> 2, kr, m.slider_t(what, cx), white(), 0, white());
+            if hit {
+                m.push_row(cx - half, cx + half, *y - uu(3, 2), *y + uu(3, 2), what);
+            }
+            *y += uu(4, 1);
+        };
         // A fact: its name right of the centre's left, its value left of the centre's right.
         let fact = |b: &mut Batch, y: &mut i64, name: &str, value: &str| {
             b.text(cx - uu(1, 1), *y, (uu(5, 4)) as u16, grey(), 2, name);
@@ -1800,7 +1943,6 @@ impl Map {
         };
         let small = uu(5, 4);
         let note = uu(7, 8);
-        let on_off = |v: bool| if v { "on" } else { "off" };
         match PAGES[p] {
             "appearance" => {
                 // The themes as swatches: each its ground with its ring around it, the one in use with its lit colour at the centre, its name beneath.
@@ -1820,25 +1962,14 @@ impl Map {
                 y += uu(7, 1);
                 b.text(cx, y, small as u16, grey(), 1, "brightness");
                 y += uu(2, 1);
-                // Brightness: nine dots, a stop apart, dimmest on the left; the current one larger and white.
-                let now = 8 - ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS).min(8) as i64;
-                let (x0, step) = Map::dots(cx, uq);
-                for k in 0..9 {
-                    let x = x0 + k * step;
-                    if k == now {
-                        b.disc(x, y, uu(1, 2), white());
-                    } else {
-                        b.disc(x, y, uu(1, 4), dim());
-                    }
-                }
-                if hit {
-                    self.push_row(cx - half, cx + half, y - uu(3, 2), y + uu(3, 2), Choice::Brightness);
-                }
-                y += uu(4, 1);
+                // Brightness: a slider over its nine stops, dimmest on the left, dragged or tapped (owner, 2026-11-08: "sliders (for brightness)").
+                slider(self, b, &mut y, Choice::Brightness);
+                // The UI scale, half to twice, as a pinch on the page sets it.
+                b.text(cx, y, small as u16, grey(), 1, "scale");
+                y += uu(2, 1);
+                slider(self, b, &mut y, Choice::Scale);
                 let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
-                let mut l = Line::new();
-                let _ = write!(l, "names under circles: {}", on_off(labels));
-                row(self, b, &mut y, small, grey(), l.as_str(), Some(Choice::Labels));
+                mark(self, b, &mut y, 50, "names under circles", labels, Some(Choice::Labels));
             }
             "numbers" => {
                 // The number base is chosen by seeing: each row is two seconds and a mebibyte (2^23 bits, a whole number of doublings) written in that base, its name small beneath.
@@ -1852,9 +1983,9 @@ impl Map {
                     let current = code == now_base;
                     b.text(cx, y, (uu(3, 2)) as u16, if current { white() } else { grey() }, 1, v.as_str());
                     b.text(cx, y + uu(11, 8), note as u16, if current { grey() } else { dim() }, 1, base_name(code));
-                    if current {
-                        b.disc(cx - uu(14, 1), y - uu(1, 2), uu(1, 3), white());
-                    }
+                    // Its radio button left of it, chosen for the base in use (one of a group: a choice, not a switch).
+                    let (sw, colours, _) = mark_look(small);
+                    b.mark(49, cx - uu(14, 1), y - uu(1, 2), small, uu(1, 1), sw, current as u8, [colours[0], colours[1], 0, 0], "");
                     if hit {
                         self.push_row(cx - half, cx + half, y - uu(2, 1), y + uu(15, 8), Choice::Base(code));
                     }
@@ -1865,24 +1996,14 @@ impl Map {
                 b.text(cx, y, note as u16, dim(), 1, "layout");
                 y += uu(2, 1);
                 let now_l = ferros_sys::pref(ferros_sys::PREF_LAYOUT);
-                for (i, name) in ["Dvorak", "QWERTY"].iter().enumerate() {
-                    let current = now_l == i as u8;
-                    if current {
-                        b.disc(cx - uu(7, 1), y - uu(1, 2), uu(1, 3), white());
-                    }
-                    row(self, b, &mut y, uu(3, 2), if current { white() } else { grey() }, name, Some(Choice::Layout(i as u8)));
-                }
+                radios(self, b, &mut y, &["Dvorak", "QWERTY"], now_l as usize, &|i| Choice::Layout(i as u8));
             }
             "security" => {
                 // Unlock at boot: off by default. Turning it on takes two taps, the first arming it with the reason it is off (AUTH.md: a stolen device then holds the identity).
                 let on = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1;
-                let mut l = Line::new();
-                if self.armed {
-                    l.s("tap again: unlock at boot");
-                } else {
-                    let _ = write!(l, "unlock at boot: {}", on_off(on));
-                }
-                row(self, b, &mut y, small, if self.armed { white() } else { grey() }, l.as_str(), Some(Choice::UnlockAtBoot));
+                // A checkbox; armed, its label asks for the second tap.
+                let armed = self.armed;
+                mark(self, b, &mut y, 50, if armed { "tap again: unlock at boot" } else { "unlock at boot" }, on, Some(Choice::UnlockAtBoot));
                 b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "on, the device opens without your handle:");
                 b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "whoever holds it holds your identity");
                 y += uu(3, 1);
@@ -1961,7 +2082,12 @@ impl Map {
                             (true, true) => "home screen: the same on all your devices",
                             (false, true) => "home screen: this device's own",
                         };
-                        row(self, b, &mut y, small, if on { white() } else { grey() }, label, settled.then_some(Choice::HomeSync));
+                        // A checkbox once the fleet has answered: checked, the same on all your devices; unchecked, this device's own.
+                        if settled {
+                            mark(self, b, &mut y, 50, "home screen: the same on all your devices", on, Some(Choice::HomeSync));
+                        } else {
+                            row(self, b, &mut y, small, grey(), label, None);
+                        }
                     }
                     if let Some((intent, result)) = f.depart {
                         let mut l = Line::new();
@@ -1969,14 +2095,14 @@ impl Map {
                         l.s(if intent == 1 { " asks to leave, to a new owner" } else { " asks to leave the fleet" });
                         row(self, b, &mut y, small, white(), l.as_str(), None);
                         match result {
-                            0 => row(self, b, &mut y, small, grey(), "approve: type the words it shows", Some(Choice::FleetApprove)),
+                            0 => button(self, b, &mut y, "approve: type the words it shows", false, Some(Choice::FleetApprove)),
                             1 => row(self, b, &mut y, small, grey(), "approving", None),
                             2 => row(self, b, &mut y, small, grey(), "approved: it leaves the fleet", None),
-                            _ => row(self, b, &mut y, small, grey(), "the approval did not publish: type the words again", Some(Choice::FleetApprove)),
+                            _ => button(self, b, &mut y, "the approval did not publish: type the words again", false, Some(Choice::FleetApprove)),
                         }
                     }
                     if f.add == 0 {
-                        row(self, b, &mut y, small, grey(), "add a device", Some(Choice::FleetAdd));
+                        button(self, b, &mut y, "add a device", false, Some(Choice::FleetAdd));
                         if f.cands > 0 {
                             b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "a device on this network asks to join");
                             y += uu(2, 1);
@@ -2009,14 +2135,14 @@ impl Map {
                                 b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "open Photon's join screen on the device");
                                 y += uu(2, 1);
                             }
-                            row(self, b, &mut y, small, grey(), "type its words", Some(Choice::FleetWords));
+                            button(self, b, &mut y, "type its words", false, Some(Choice::FleetWords));
                             b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "or tap the two devices together");
                             y += uu(2, 1);
                         }
                         if f.add == 3 {
-                            row(self, b, &mut y, small, white(), "it left its words screen: finish", Some(Choice::FleetConfirm));
+                            button(self, b, &mut y, "it left its words screen: finish", false, Some(Choice::FleetConfirm));
                         }
-                        row(self, b, &mut y, small, grey(), if f.add >= 5 { "done" } else { "close" }, Some(Choice::FleetClose));
+                        button(self, b, &mut y, if f.add >= 5 { "done" } else { "close" }, false, Some(Choice::FleetClose));
                     }
                 }
                 if f.state == Some(8) {
@@ -2028,7 +2154,7 @@ impl Map {
                     b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "then this device wipes and restarts");
                     y += uu(2, 1);
                 } else if matches!(f.state, Some(2) | Some(3)) {
-                    row(self, b, &mut y, small, if f.confirm { white() } else { grey() }, if f.confirm { "tap again: remove this device" } else { "remove this device" }, Some(Choice::FleetRemove));
+                    button(self, b, &mut y, if f.confirm { "tap again: remove this device" } else { "remove this device" }, f.confirm, Some(Choice::FleetRemove));
                     if f.confirm {
                         b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "wipes from this device: the map's arrangement,");
                         b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "WiFi networks, the last location; not saved");
@@ -2047,9 +2173,7 @@ impl Map {
             }
             "power" => {
                 let on = ferros_sys::pref(ferros_sys::PREF_PROX_WAKE) == 1;
-                let mut l = Line::new();
-                let _ = write!(l, "proximity wake: {}", on_off(on));
-                row(self, b, &mut y, small, grey(), l.as_str(), Some(Choice::ProxWake));
+                mark(self, b, &mut y, 50, "proximity wake", on, Some(Choice::ProxWake));
                 b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "on, the power key lights the screen");
                 b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "only when nothing covers the sensor");
                 y += uu(3, 1);
@@ -2075,7 +2199,7 @@ impl Map {
                 let state = slots.iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::STATE).map(|m| m.1);
                 if k < 5 {
                     let off = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) >> k & 1 == 1;
-                    row(self, b, &mut y, small, white(), if off { "switched off: tap to switch on" } else { "on: tap to switch off" }, Some(Choice::Switch(k as u8)));
+                    mark(self, b, &mut y, 50, "on", !off, Some(Choice::Switch(k as u8)));
                 }
                 fact(b, &mut y, "state", link_state(k, state));
                 let f = ferros_sys::numbers(Style::Glyphs);
@@ -2163,29 +2287,18 @@ impl Map {
                 use ferros_sys::control as ctl;
                 match k as u64 {
                     ctl::CELLULAR => {
-                        row(self, b, &mut y, small, grey(), "re-register now", Some(Choice::Knob(k as u8, ctl::CELL_REREGISTER as u8)));
+                        button(self, b, &mut y, "re-register now", false, Some(Choice::Knob(k as u8, ctl::CELL_REREGISTER as u8)));
                         b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "the radio off and on: it registers afresh");
                         y += uu(2, 1);
                     }
                     ctl::WIFI => {
-                        let ps = c[ctl::WIFI_POWER_SAVE as usize];
-                        let mut l = Line::new();
-                        l.s("power save: ");
-                        l.s(match ps {
-                            1 => "on",
-                            2 => "fast",
-                            _ => "off",
-                        });
-                        row(self, b, &mut y, small, grey(), l.as_str(), Some(Choice::Knob(k as u8, ctl::WIFI_POWER_SAVE as u8)));
-                        let band = c[ctl::WIFI_BAND as usize];
-                        let mut l = Line::new();
-                        l.s("band: ");
-                        l.s(match band {
-                            1 => "5 GHz only",
-                            2 => "2.4 GHz only",
-                            _ => "any (5 GHz first)",
-                        });
-                        row(self, b, &mut y, small, grey(), l.as_str(), Some(Choice::Knob(k as u8, ctl::WIFI_BAND as u8)));
+                        // Each value knob a radio group, its choices in its own order (unset reads as the first).
+                        for (slot, title, names) in [(ctl::WIFI_POWER_SAVE, "power save", ["off", "on", "fast"]), (ctl::WIFI_BAND, "band", ["any (5 GHz first)", "5 GHz only", "2.4 GHz only"])] {
+                            let now = if c[slot as usize] == ctl::UNSET { 0 } else { c[slot as usize] };
+                            b.text(cx, y, note as u16, dim(), 1, title);
+                            y += uu(2, 1);
+                            radios(self, b, &mut y, &names, now as usize, &|v| Choice::KnobSet(k as u8, slot as u8, v as u8));
+                        }
                         b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "the band takes at the next join:");
                         b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "switch WiFi off and on");
                         y += uu(3, 1);
@@ -2223,8 +2336,8 @@ impl Map {
                     let _ = tatau::duration_ns(&mut l, f, zone.unsigned_abs() * 1_000_000_000, 1);
                 }
                 fact(b, &mut y, "zone", l.as_str());
-                row(self, b, &mut y, small, grey(), "a quarter hour east", Some(Choice::Zone(1)));
-                row(self, b, &mut y, small, grey(), "a quarter hour west", Some(Choice::Zone(-1)));
+                button(self, b, &mut y, "a quarter hour east", false, Some(Choice::Zone(1)));
+                button(self, b, &mut y, "a quarter hour west", false, Some(Choice::Zone(-1)));
                 y += uu(1, 2);
                 b.text(cx, y, note as u16, dim(), 1, "sources");
                 y += uu(2, 1);
@@ -2319,9 +2432,13 @@ impl Map {
                         row(self, b, &mut y, note, dim(), "asks for nothing", None);
                     }
                     for (j, w) in k.wants.iter().enumerate() {
+                        // A checkbox: on or off, a want never asked saying so.
                         let mut l = Line::new();
-                        let _ = write!(l, "{}: {}", ferros_kist::MEANS[w.right as usize], answer_words(w.answer));
-                        row(self, b, &mut y, small, if w.answer.is_some_and(|a| a.0) { white() } else { grey() }, l.as_str(), Some(Choice::Answer(ki as u8, j as u8)));
+                        l.s(ferros_kist::MEANS[w.right as usize]);
+                        if w.answer.is_none() {
+                            l.s(" (not asked yet)");
+                        }
+                        mark(self, b, &mut y, 50, l.as_str(), w.answer.is_some_and(|a| a.0), Some(Choice::Answer(ki as u8, j as u8)));
                         y -= uu(3, 4);
                         row(self, b, &mut y, note, dim(), &w.reason, None);
                     }
@@ -2333,14 +2450,16 @@ impl Map {
                 let ks = self.kists.kists.clone();
                 for r in 0..ferros_kist::RIGHTS.len() {
                     row(self, b, &mut y, uu(3, 2), white(), ferros_kist::MEANS[r], None);
-                    let mut l = Line::new();
-                    let _ = write!(l, "new kists start {}", on_off(self.kists.defaults >> r & 1 == 1));
-                    row(self, b, &mut y, small, grey(), l.as_str(), Some(Choice::Default(r as u8)));
+                    let on = self.kists.defaults >> r & 1 == 1;
+                    mark(self, b, &mut y, 50, "new kists start on", on, Some(Choice::Default(r as u8)));
                     for (ki, k) in ks.iter().enumerate() {
                         if let Some(j) = k.wants.iter().position(|w| w.right as usize == r) {
                             let mut l = Line::new();
-                            let _ = write!(l, "{}: {}", k.name, answer_words(k.wants[j].answer));
-                            row(self, b, &mut y, small, if k.wants[j].answer.is_some_and(|a| a.0) { white() } else { grey() }, l.as_str(), Some(Choice::Answer(ki as u8, j as u8)));
+                            l.s(&k.name);
+                            if k.wants[j].answer.is_none() {
+                                l.s(" (not asked yet)");
+                            }
+                            mark(self, b, &mut y, 50, l.as_str(), k.wants[j].answer.is_some_and(|a| a.0), Some(Choice::Answer(ki as u8, j as u8)));
                         }
                     }
                     y += uu(1, 1);
@@ -2349,24 +2468,84 @@ impl Map {
             _ => {
                 // Developer: the panel's and the sensors' knobs.
                 let spatial = ferros_sys::pref(ferros_sys::PREF_DITHER) == 1;
-                row(self, b, &mut y, small, grey(), if spatial { "dither: spatial (the panel rests)" } else { "dither: spatial and temporal" }, Some(Choice::Dither));
+                // The temporal dither a checkbox (unchecked, spatial alone: the panel rests); the light scope's channel a radio group.
+                mark(self, b, &mut y, 50, "temporal dither", !spatial, Some(Choice::Dither));
                 let sc = ferros_sys::pref(ferros_sys::PREF_SCOPE);
-                let mut l = Line::new();
-                if sc == 0 {
-                    l.s("light scope: off");
-                } else {
-                    let _ = write!(l, "light scope: channel {}", ["red", "visible", "blue", "green", "IR", "clear"][(sc as usize - 1) % 6]);
-                }
-                row(self, b, &mut y, small, grey(), l.as_str(), Some(Choice::Scope));
+                b.text(cx, y, note as u16, dim(), 1, "light scope");
+                y += uu(2, 1);
+                radios(self, b, &mut y, &["off", "red", "visible", "blue", "green", "IR", "clear"], sc as usize, &|v| Choice::ScopeSet(v as u8));
             }
         }
         self.page_h[p] = y - y0;
     }
 
-    /// The brightness dots' first x and spacing: nine dots four layout units apart (`uq`, the unit in 256ths of a pixel).
-    fn dots(cx: i64, uq: i64) -> (i64, i64) {
-        let step = 4 * uq >> 8;
-        (cx - 4 * step, step)
+    /// A slider's track on a page centred on x = `cx`: its ends. Three quarters of the screen's width at the circle's arrived size, growing and shrinking with it through a flight, and not with the UI scale: the scale's own slider keeps its ends under the finger while the page grows round it.
+    fn track(&self, cx: i64) -> (i64, i64) {
+        let (_, _, r, _) = self.page_frame();
+        let (_, _, ar) = self.arrived();
+        let half = self.w * r / ar * 3 >> 3;
+        (cx - half, cx + half)
+    }
+    /// Where a slider's value puts its knob (0 to 1): brightness's stops dimmest on the left (preference 3 counts stops below the brightest), the scale from a half on the left to twice on the right (the pinch's or the drag's while one goes on).
+    fn slider_rest(&self, what: Choice) -> f64 {
+        match what {
+            Choice::Brightness => (8 - ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS)) as f64 / 8.,
+            Choice::Scale => (self.scale_live.unwrap_or(ferros_sys::ui_scale() as f32) as f64 + 64.) / 128.,
+            _ => 0.,
+        }
+    }
+    /// Where a slider's knob is drawn now: under the finger dragging it, else at its value, off it by its spring's offset once let go between two values.
+    fn slider_t(&self, what: Choice, cx: i64) -> f64 {
+        if let Some((c, t)) = self.slide {
+            if c == what {
+                return t;
+            }
+        }
+        let rest = self.slider_rest(what);
+        match self.knob {
+            Some((c, x0, v0, n)) if c == what => {
+                let (a, b) = self.track(cx);
+                rest + spring(x0, v0, n).0 / (b - a) as f64
+            }
+            _ => rest,
+        }
+    }
+    /// A slider set from the finger at x (a drag across it, or a tap): the knob there, and the value written as it changes. Brightness takes the nearest of its nine stops through the Settings capability each time the stop changes; the scale follows the finger live (`scale_live`) and is kept when the finger lifts, as the pinch's is (every process lays itself out again on a scale change, so once, not every frame).
+    fn slide_to(&mut self, what: Choice, x: i64) {
+        let (a, b) = self.track(self.w / 2);
+        // WHY the bounds: the finger runs past either end of the track, and the knob stays at the end it passed.
+        let t = ((x - a) as f64 / (b - a) as f64).clamp(0., 1.);
+        self.slide = Some((what, t));
+        self.knob = None;
+        match what {
+            Choice::Brightness => {
+                let stop = 8 - libm::round(t * 8.) as u8;
+                if stop != ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS) {
+                    ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BRIGHTNESS, stop);
+                    let mut l = Line::new();
+                    let _ = write!(l, "map: brightness slider: {stop} stops below the brightest\n");
+                    console(self.grants, l.as_str().as_bytes());
+                }
+            }
+            Choice::Scale => self.scale_live = Some((t * 128. - 64.) as f32),
+            _ => {}
+        }
+    }
+    /// The finger left a slider: its knob goes from where the finger left it to its value's place on the spring, stepped in display frames.
+    fn slide_done(&mut self) {
+        let Some((what, t)) = self.slide.take() else { return };
+        let rest = match what {
+            // The scale is kept rounded to its 64ths (the lift writes it).
+            Choice::Scale => (libm::round(t * 128. - 64.) + 64.) / 128.,
+            _ => self.slider_rest(what),
+        };
+        let (a, b) = self.track(self.w / 2);
+        let off = (t - rest) * (b - a) as f64;
+        self.knob = if off.abs() >= 0.5 { Some((what, off, 0., 0)) } else { None };
+    }
+    /// The settings' row under a panel point, as the last frame laid them out.
+    fn row_at(&self, sx: i64, sy: i64) -> Option<Choice> {
+        self.rows[..self.nrows].iter().find(|r| sx >= r.0 && sx < r.1 && sy >= r.2 && sy < r.3).map(|r| r.4)
     }
 
     fn push_row(&mut self, x0: i64, x1: i64, top: i64, bottom: i64, what: Choice) {
@@ -2381,6 +2560,17 @@ impl Map {
         let (dx, dy) = (cur.1 - start.1, cur.2 - start.2);
         if self.swipe == 0 {
             self.swipe = if dx.abs() >= dy.abs() { 1 } else { 2 };
+            // Across, from a slider: the drag is the slider's (3), not the strip's; up and down still scrolls the page.
+            if self.swipe == 1 && matches!(self.row_at(start.1, start.2), Some(Choice::Brightness | Choice::Scale)) {
+                self.swipe = 3;
+            }
+        }
+        if self.swipe == 3 {
+            // The slider held since the lock (a scale change lays the page out again, and its row may move from under where the finger landed).
+            if let Some(what) = self.slide.map(|s| s.0).or(self.row_at(start.1, start.2)) {
+                self.slide_to(what, cur.1);
+            }
+            return;
         }
         if self.swipe == 1 {
             let moved = if prev.0 { cur.1 - prev.1 } else { 0 };
@@ -2448,13 +2638,21 @@ impl Map {
             let last = self.dys.iter().rev().find(|&&d| d != 0).copied().unwrap_or(0);
             self.fling = -(last.signum() * m) as f64;
         }
+        if self.swipe == 3 {
+            self.slide_done();
+        }
         self.swipe = 0;
-        self.settling = self.page_dx != 0 || self.fling != 0. || self.spring.is_some();
+        self.settling = self.page_dx != 0 || self.fling != 0. || self.spring.is_some() || self.knob.is_some();
     }
 
     /// One display frame of the motion after a finger lifted or a tap (owner, 2026-11-05: frame-counted): the camera's flight (`step_cam`), the settings' strip on its spring (`step_strip`), and the flings — a page's scroll and the plane's pan — carried by their speed under `coast`'s friction, whole pixels moved and the fraction kept for the next frame. Returns whether anything is still moving.
     fn step(&mut self) -> bool {
         self.step_strip();
+        // A slider's knob let go between two values: to its value's place on the same spring as the strip, at rest once both its offset and its speed are under half a pixel.
+        if let Some((c, x0, v0, t)) = self.knob {
+            let (x, v) = spring(x0, v0, t + 1);
+            self.knob = if x.abs() < 0.5 && v.abs() < 0.5 { None } else { Some((c, x0, v0, t + 1)) };
+        }
         if self.fling != 0. {
             let max = self.vscroll_max();
             let (d, v) = coast(self.fling);
@@ -2483,7 +2681,7 @@ impl Map {
             self.pan = if v == 0. { None } else { Some((ux, uy, v, rx - ix, ry - iy)) };
         }
         let flying = self.step_cam();
-        self.page_dx != 0 || self.fling != 0. || self.spring.is_some() || self.pan.is_some() || flying
+        self.page_dx != 0 || self.fling != 0. || self.spring.is_some() || self.pan.is_some() || self.knob.is_some() || flying
     }
 
     /// A tap: one finger or two, at a panel point. Logged with what it did, so a session can be followed from `diag console`.
@@ -2578,12 +2776,21 @@ impl Map {
                 };
                 match row {
                     Some(Choice::Base(code)) => set(self, ferros_sys::PREF_BASE, code),
-                    Some(Choice::Brightness) => {
-                        let (x0, step) = Map::dots(self.w / 2, self.unit());
-                        // WHY: the dots' row reaches past the first and last dot; a tap there means that end dot.
-                        let k = ((sx - x0 + step / 2) / step).clamp(0, 8);
-                        set(self, ferros_sys::PREF_BRIGHTNESS, (8 - k) as u8);
+                    // A slider tapped: its knob and its value there at once, as a drag would leave them; the scale is kept now (the lift that wrote a drag's has passed).
+                    Some(c @ (Choice::Brightness | Choice::Scale)) => {
+                        self.slide_to(c, sx);
+                        self.slide = None;
+                        if let Some(s) = self.scale_live.take() {
+                            set(self, ferros_sys::PREF_SCALE, libm::roundf(s) as i8 as u8);
+                        }
                     }
+                    // A link's value knob set to the choice tapped in its radio group.
+                    Some(Choice::KnobSet(link, slot, v)) => {
+                        if !ferros_sys::control(cap(self.grants, S_SETTINGS), link as u64, slot as u64, v as u64) {
+                            console(self.grants, b"map: the kernel did not take the knob\n");
+                        }
+                    }
+                    Some(Choice::ScopeSet(v)) => set(self, ferros_sys::PREF_SCOPE, v),
                     Some(Choice::Theme(i)) => set(self, ferros_sys::PREF_THEME, i),
                     Some(Choice::Dither) => set(self, ferros_sys::PREF_DITHER, (ferros_sys::pref(ferros_sys::PREF_DITHER) != 1) as u8),
                     Some(Choice::Labels) => {
@@ -2592,7 +2799,6 @@ impl Map {
                     }
                     Some(Choice::Layout(i)) => set(self, ferros_sys::PREF_LAYOUT, i),
                     Some(Choice::ProxWake) => set(self, ferros_sys::PREF_PROX_WAKE, (ferros_sys::pref(ferros_sys::PREF_PROX_WAKE) != 1) as u8),
-                    Some(Choice::Scope) => set(self, ferros_sys::PREF_SCOPE, (ferros_sys::pref(ferros_sys::PREF_SCOPE) + 1) % 7),
                     // Off in one tap; on in two, the first arming it with the warning.
                     Some(Choice::UnlockAtBoot) => {
                         if ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1 {
@@ -2746,15 +2952,6 @@ impl Map {
     }
 }
 
-/// A want's answer in words: on, off, or not asked yet (a want added by an update, or never launched).
-fn answer_words(a: Option<(bool, i64)>) -> &'static str {
-    match a {
-        Some((true, _)) => "on",
-        Some((false, _)) => "off",
-        None => "not asked yet",
-    }
-}
-
 /// "map: numbers in <base>", with two seconds written in it, in words (the console is a terminal surface).
 fn say_base(grants: u64, code: u8) {
     let mut out = Line::new();
@@ -2839,6 +3036,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         pick_scroll: 0,
         pinch: None,
         scale_live: None,
+        pressed: None,
+        slide: None,
+        knob: None,
         nrows: 0,
         rc: [ONE; MAX],
         rsn: [0; MAX],
@@ -3218,6 +3418,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 let _ = write!(l, "map: touch down at {},{}: corner {}\n", f.1, f.2, hit);
                 console(grants, l.as_str().as_bytes());
             }
+            // A finger on the open settings' controls: the row it is on, which a button shows held (no corner gesture, no app in front).
+            map.knob = None;
+            map.pressed = if corner == 0 && !map.app_front && matches!(map.view, View::Open(_)) { map.row_at(f.1, f.2) } else { None };
+            if map.pressed.is_some() {
+                map.draw();
+            }
         }
         if down {
             most = most.max(held);
@@ -3228,6 +3434,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 let (dx, dy) = (cur[id].1 - start[id].1, cur[id].2 - start[id].2);
                 if dx * dx + dy * dy > SLOP * SLOP {
                     moved = true;
+                    // A finger that moves is a drag, not a press: the button it was on is let go.
+                    map.pressed = None;
                 }
             }
             if corner != 0 && held >= 1 {
@@ -3296,10 +3504,14 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     map.frame_seen = Some(frame_count);
                 }
             }
-            // A pinch on the open page lifted: its scale is the device's from now (preference 14, kept in the vault by the kernel), once, not every frame of the pinch.
+            // A pinch on the open page lifted: its scale is the device's from now (preference 14, kept in the vault by the kernel), once, not every frame of the pinch. The scale slider's drag ends the same way.
+            map.pressed = None;
             map.pinch = None;
             if let Some(s) = map.scale_live.take() {
                 ferros_sys::set_pref(cap(grants, S_SETTINGS), ferros_sys::PREF_SCALE, libm::roundf(s) as i8 as u8);
+                let mut l = Line::new();
+                let _ = write!(l, "map: scale kept: {} 64ths of an octave\n", libm::roundf(s) as i8);
+                console(grants, l.as_str().as_bytes());
                 map.draw();
             }
             // A flight a touch paused goes on from this frame.

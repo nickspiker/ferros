@@ -25,6 +25,8 @@
 //! - 17 `scene move [index u8][x i32][y i32][r u16]` (optionally `[cos i16][sin i16]`, the circle's own turn in Q14): one circle of the scene moved, resized and turned in place (the owner arranging by hand).
 //! - 18 `region [cx i16][cy i16][r u16][ground]`: in place of `begin`, the open circle, landed, as an app's region (COMPOSITOR.md): the page's ops up to the camera op are its front layer, drawn only where they changed; the camera op makes the clean window (the ground, the scene under it) once and then draws no scene. A camera op with no region op before it ends the region.
 //! - 19 `text turned [cx i16][cy i16][px u16][colour][alpha u8][cos i16][sin i16][utf8…]`: text centred on (cx, cy), turned about it (Q14, positive sin clockwise), at opacity alpha (255 opaque): the settings' titles riding the circle.
+//! - 47 `button [cx i16][cy i16][w u16][h u16][px u16][fill][edge top-left][edge bottom-right][ink][utf8 label]` and 48 `slider [x0 i16][x1 i16][cy i16][track r u16 Q8][knob r u16 Q8][at u16 Q16][left][right][knob]`: fluor's button and slider as a page's elements (COMPOSITOR.md "Controls"), drawn like the page's text, in the front layer while a region is up.
+//! - 49 `radio` and 50 `check [cx i16][cy i16][px u16][mark u16][stroke u16 Q8][state u8][stroke colour][fill][ink][tick][utf8 label]`: a radio button or a checkbox with its label, centred together (COMPOSITOR.md "Controls").
 //! - 22 `app [x u16][y u16][w u16][h u16]`: the app in front's frame, its 16-bit pixels in the `app-surface` region (R, G, B in bits 0-15, 16-31, 32-47: working values, gamma 2, white = Q14; bit 48 = no dither), published at full precision; 23 `app done`: the screen is the map's again. Op 5's reply carries whether an app is in front (byte 12).
 //! - 21 `ramps [column u8]`: the present stage's test screen, or one column of it alone on black between two thin white lines (dithered bands: our 4×4 to 8 bits, 12 effective; undithered: the 8-bit truncation), straight from 16-bit working values (see `ramps`); status 3 when the pipe is not in 10 bits.
 //! - 24 `frame wait`: returns once the panel's next frame has started, or after a hundred-and-twentieth of a second when no frame is in flight (a command-mode panel starts a frame only when one is armed); the reply is the frame-start count, u32. A client that draws once per return is locked to the panel's refresh: it reads its input right after a frame starts and its update is ready for the next one (the map, while a finger is down).
@@ -1872,7 +1874,7 @@ fn front_layer(width: usize, height: usize) -> Option<&'static mut [Px]> {
     unsafe { if ARENA_WORDS >= width * height { Some(core::slice::from_raw_parts_mut(ARENA as *mut Px, width * height)) } else { None } }
 }
 
-/// A page's drawing op (2 text, 3 rect, 16 disc, 19 turned text): the rectangle it may touch, and, given pixels, the op drawn into them under what is there, inside `draw::CLIP`. None for an op that is not one of these or is malformed.
+/// A page's drawing op (2 text, 3 rect, 16 disc, 19 turned text, 47 button, 48 slider, 49 radio, 50 checkbox): the rectangle it may touch, and, given pixels, the op drawn into them under what is there, inside `draw::CLIP`. None for an op that is not one of these or is malformed.
 fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Option<draw::Rect> {
     let i16le = |i: usize| i16::from_le_bytes([m[i], m[i + 1]]) as i64;
     let u16le = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]) as i64;
@@ -1938,6 +1940,155 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
             // Every pixel of the turned text lies within its unturned box's reach from the centre: half its width across, an em up or down at most.
             let reach = sqrt(tw * tw * 0.25 + size * size) as i32 + 3;
             Some(draw::Rect { x0: cx as i32 - reach, y0: cy as i32 - reach, x1: cx as i32 + reach + 1, y1: cy as i32 + reach + 1 })
+        }
+        // 47 `button [cx i16][cy i16][w u16][h u16][px u16][fill][edge top-left][edge bottom-right][ink][utf8 label]`: fluor's button (widgets/button.rs) as a region element: its label centred in front, then the pill under it, a squircle rounded rect (`SHAPE_POWER`, the house's asymmetric corners: top-left and bottom-right at half the height, the other two at a quarter) filled `fill` inside a two-tone edge, one colour on each side of the box's anti-diagonal, the edge's width fluor's (a 32nd of the label's size, plus the pixel floor). The pill is `w` wide, or wider when the label and half the height each side would not fit.
+        Some(47) if m.len() >= 27 => {
+            let (cx, cy, h, size) = (i16le(1), i16le(3), u16le(7), u16le(9) as f32);
+            let t = core::str::from_utf8(&m[27..]).ok()?;
+            // WHY the tests: the op is the client's; a size the glyph engine does not draw, or a pill too short to hold its edge and its corners, is refused as malformed.
+            if !(4.0..=512.0).contains(&size) || h < 4 {
+                return None;
+            }
+            let tw = glyph_engine().width(t, size);
+            // WHY the max: the page asks one width for its buttons so a column of them lines up; a label too long for it grows its own pill rather than running past the edge.
+            let w = u16le(5).max(tw as i64 + h);
+            let (x0, y0) = (cx - w / 2, cy - h / 2);
+            let rect = draw::Rect { x0: x0 as i32, y0: y0 as i32, x1: (x0 + w) as i32, y1: (y0 + h) as i32 };
+            if let Some(px) = px {
+                let (bx0, by0, bx1, by1) = draw::bounds(width, height);
+                let seen = rect.intersect(draw::Rect { x0: bx0 as i32, y0: by0 as i32, x1: bx1 as i32, y1: by1 as i32 });
+                if !seen.is_empty() {
+                    // The label first, nearest the viewer: its ink's middle about 0.36 em over the baseline, as turned text centres.
+                    let mut d = Damage::new();
+                    let mut c = Canvas::new(px, width, height, &mut d);
+                    text(&mut c, &Font, t, cx as f32 - tw * 0.5, cy as f32 + size * 0.36, size, 0xFF00_0000 | colour(23));
+                    // Then the pill under it, drawn by fluor's own squircle kernels into a scratch the pill's size in fluor's 16-bit α + darkness, the colours as darkness of the display's gamma-2 codes (fluor's blends are linear, so the convention carries them), and each pixel brought over as premultiplied light (α − darkness, 65280 the code 255 at full α: white, Q14) under what is there.
+                    let (wu, hu) = (w as usize, h as usize);
+                    let mut buf = alloc::vec![0u64; wu * hu];
+                    {
+                        use fluor::paint::squircle as sq;
+                        let mut fd = fluor::canvas::Damage::new();
+                        let mut fc = fluor::canvas::Canvas::new(&mut buf[..], wu, hu, &mut fd);
+                        let dark = |c: u32| c ^ 0xFF_FFFF | 0xFF00_0000;
+                        let e = (size as i64 >> 5) + 1;
+                        let (wi, hi, ei) = (w as isize, h as isize, e as isize);
+                        // The fill first, in front, one edge's width inside; then the edge ring under it.
+                        if wi > 2 * ei && hi > 2 * ei {
+                            sq::draw_squircle_rrect(&mut fc, ei, ei, wi - 2 * ei, hi - 2 * ei, dark(colour(11)), sq::asymmetric_radii((h - 2 * e) as f32 * 0.5), sq::SHAPE_POWER);
+                        }
+                        sq::draw_squircle_rrect_two_tone(&mut fc, 0, 0, wi, hi, dark(colour(15)), dark(colour(19)), sq::asymmetric_radii(h as f32 * 0.5), sq::SHAPE_POWER, None, 0);
+                    }
+                    for y in seen.y0..seen.y1 {
+                        let (row, src) = (y as usize * width, (y as i64 - y0) as usize * wu);
+                        for x in seen.x0..seen.x1 {
+                            let p = buf[src + (x as i64 - x0) as usize];
+                            let a = p >> 48;
+                            if a == 0 {
+                                continue;
+                            }
+                            // Light from darkness, channel by channel (fluor's R is bits 32-47, the display's bits 0-15). Darkness never exceeds α here: the scratch is fluor's own drawing, and its `under` keeps darkness ≤ α.
+                            let l = |sh: u32| (a - (p >> sh & 0xFFFF)) * 16384 / 65280;
+                            let q = &mut px[row + x as usize];
+                            *q = draw::under(*q, a << 48 | l(32) | l(16) << 16 | l(0) << 32);
+                        }
+                    }
+                    drop(buf);
+                    ALLOC.reset();
+                }
+            }
+            Some(draw::Rect { x0: rect.x0 - 1, y0: rect.y0 - 1, x1: rect.x1 + 1, y1: rect.y1 + 1 })
+        }
+        // 48 `slider [x0 i16][x1 i16][cy i16][track r u16, Q8][knob r u16, Q8][at u16, Q16][left][right][knob]`: fluor's slider (widgets/slider.rs) as a region element: the knob, a disc at `at` of the way from x0 to x1 (sub-pixel, so it follows a finger smoothly), in front; under it the track, a stadium of half-thickness `track r` (its ends round, C¹ where they meet the straight sides), `left` from x0 to the knob and `right` from the knob to x1.
+        Some(48) if m.len() >= 25 => {
+            let (x0, x1, cy, tr, kr, t) = (i16le(1), i16le(3), i16le(5), u16le(7), u16le(9), u16le(11));
+            // WHY the test: the op is the client's; a track that runs backwards is malformed.
+            if x1 < x0 {
+                return None;
+            }
+            // Q8 pixels, a pixel's centre at its ·256 + 128.
+            let (a, b, yc) = ((x0 << 8) + 128, (x1 << 8) + 128, (cy << 8) + 128);
+            let k = a + (b - a) * t / 65535;
+            if let Some(px) = px {
+                draw::disc(px, width, height, k, yc, kr, colour(21));
+                draw::capsule(px, width, height, a, yc, k, yc, tr, colour(13));
+                draw::capsule(px, width, height, k, yc, b, yc, tr, colour(17));
+            }
+            let reach = (kr.max(tr) >> 8) + 3;
+            Some(draw::Rect { x0: (x0 - reach) as i32, y0: (cy - reach) as i32, x1: (x1 + reach + 1) as i32, y1: (cy + reach + 1) as i32 })
+        }
+        // 49 `radio` and 50 `check [cx i16][cy i16][px u16][mark u16][stroke u16, Q8][state u8][stroke colour][fill][ink][tick][utf8 label]`: a radio button or a checkbox with its label, the mark `mark` pixels across and the label (at `px`, in `ink`) half its size to the right, the two centred together on (cx, cy) (state bit 2: the mark's left edge at cx, a group's column). The radio is a ring `stroke` wide whose outer edge is the mark's, with a disc of `fill` half its width inside when chosen (state bit 0). The checkbox is fluor's squircle box (its asymmetric corners, `SHAPE_POWER`) edged `stroke` wide (whole pixels, a hairline at least), filled with `fill` when checked (bit 0), with a tick in `tick` over the fill when bit 1 is set too.
+        Some(op @ (49 | 50)) if m.len() >= 28 => {
+            let (cx, cy, size, mk, sw, state) = (i16le(1), i16le(3), u16le(5) as f32, u16le(7), u16le(9), m[11]);
+            let t = core::str::from_utf8(&m[28..]).ok()?;
+            // WHY the tests: the op is the client's; a size the glyph engine does not draw, or a mark too small to hold its stroke, is refused as malformed.
+            if !(4.0..=512.0).contains(&size) || mk < 4 || sw < 16 || sw >> 7 >= mk {
+                return None;
+            }
+            let tw = if t.is_empty() { 0 } else { glyph_engine().width(t, size) as i64 };
+            let gap = if t.is_empty() { 0 } else { mk / 2 };
+            // State bit 2: a radio group's column, the mark's left edge at cx (so the group's marks line up), else the mark and label centred together on it.
+            let left = if state & 4 != 0 { cx } else { cx - (mk + gap + tw) / 2 };
+            let (mx, reach) = (left + mk / 2, (mk / 2).max(size as i64) + 2);
+            let rect = draw::Rect { x0: left as i32 - 2, y0: (cy - reach) as i32, x1: (left + mk + gap + tw) as i32 + 3, y1: (cy + reach) as i32 + 1 };
+            if let Some(px) = px {
+                if !t.is_empty() {
+                    let mut d = Damage::new();
+                    let mut c = Canvas::new(px, width, height, &mut d);
+                    text(&mut c, &Font, t, (left + mk + gap) as f32, cy as f32 + size * 0.36, size, 0xFF00_0000 | colour(20));
+                    ALLOC.reset();
+                }
+                // The mark's centre in Q8, on a pixel's centre when the mark is an odd number across, between two when even.
+                let (qx, qy) = ((left << 8) + (mk << 7), (cy << 8) + 128 - (mk & 1 ^ 1) * 128);
+                if *op == 49 {
+                    if state & 1 != 0 {
+                        draw::disc(px, width, height, qx, qy, mk << 6, colour(16));
+                    }
+                    draw::ring(px, width, height, qx, qy, (mk << 7) - sw / 2, sw, colour(12));
+                } else {
+                    let (filled, tick) = (state & 1 != 0, state & 3 == 3);
+                    if tick {
+                        // Two strokes, short then long, a 16th of the box thick, inside its middle.
+                        let at = |fx: i64, fy: i64| (qx + (mk * fx >> 3), qy + (mk * fy >> 3));
+                        let ((ax, ay), (bx, by), (ex, ey)) = (at(-512, 0), at(-128, 384), at(576, -448));
+                        draw::capsule(px, width, height, ax, ay, bx, by, mk << 4, colour(24));
+                        draw::capsule(px, width, height, bx, by, ex, ey, mk << 4, colour(24));
+                    }
+                    // The box's two squircles by fluor's own kernel, each into a scratch the box's size: their coverages alone matter. The edge is the band between them (the outer's coverage less the inner's, exact for one shape inside the other), the fill the inner's.
+                    let (x0, y0, s) = (left, cy - mk / 2, mk as usize);
+                    // WHY the max: the edge is the band between two squircles a whole number of pixels apart; a stroke under a pixel is drawn as one, the hairline.
+                    let e = ((sw + 128) >> 8).max(1) as isize;
+                    let mut outer = alloc::vec![0u64; s * s];
+                    let mut inner = alloc::vec![0u64; s * s];
+                    {
+                        use fluor::paint::squircle as sq;
+                        let big = mk as f32 * 0.32;
+                        let mut fd = fluor::canvas::Damage::new();
+                        sq::draw_squircle_rrect(&mut fluor::canvas::Canvas::new(&mut outer[..], s, s, &mut fd), 0, 0, mk as isize, mk as isize, 0xFF00_0000, sq::asymmetric_radii(big), sq::SHAPE_POWER);
+                        if (mk as isize) > 2 * e {
+                            sq::draw_squircle_rrect(&mut fluor::canvas::Canvas::new(&mut inner[..], s, s, &mut fd), e, e, mk as isize - 2 * e, mk as isize - 2 * e, 0xFF00_0000, sq::asymmetric_radii(big - e as f32), sq::SHAPE_POWER);
+                        }
+                    }
+                    let (bx0, by0, bx1, by1) = draw::bounds(width, height);
+                    // WHY the bounds: the box is placed by the page and may run past the screen or the redraw's clip; outside them the index is another row or past the buffer.
+                    for y in y0.max(by0)..(y0 + mk).min(by1) {
+                        for x in x0.max(bx0)..(x0 + mk).min(bx1) {
+                            let i = (y - y0) as usize * s + (x - x0) as usize;
+                            let (ao, ai) = ((outer[i] >> 48) as u32, (inner[i] >> 48) as u32);
+                            let q = &mut px[y as usize * width + x as usize];
+                            if filled && ai != 0 {
+                                *q = draw::under(*q, draw::at_cover16(colour(16), ai));
+                            }
+                            // The inner squircle lies inside the outer, so its coverage never passes the outer's.
+                            if ao > ai {
+                                *q = draw::under(*q, draw::at_cover16(colour(12), ao - ai));
+                            }
+                        }
+                    }
+                    drop((outer, inner));
+                    ALLOC.reset();
+                }
+            }
+            Some(rect)
         }
         _ => None,
     }
@@ -5027,8 +5178,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         }
                     }
                 }
-                // The page's drawing ops (2 text, 3 rect, 16 disc, 19 turned text; `page_op`): after a region op, kept for the front layer and drawn at the camera op, only where they changed (`front_frame`); otherwise drawn into the canvas now.
-                Some(2 | 3 | 16 | 19) => {
+                // The page's drawing ops (2 text, 3 rect, 16 disc, 19 turned text, 47 button, 48 slider, 49 radio, 50 checkbox; `page_op`): after a region op, kept for the front layer and drawn at the camera op, only where they changed (`front_frame`); otherwise drawn into the canvas now.
+                Some(2 | 3 | 16 | 19 | 47 | 48 | 49 | 50) => {
                     let collect = unsafe { { REGION_REQ }.is_some() } && front_layer(width, height).is_some();
                     if collect {
                         let f = unsafe { &mut *(&raw mut FRONT_NEW) };
