@@ -769,7 +769,7 @@ impl Client {
         }
     }
 
-    /// Op 6, the Fleet page's list: `[count][count × (the device key's first 8 bytes, flags: bit 0 this device)]`. Bound with no list yet (the chain only in RAM since unlock-at-boot is off, and none adopted this session), the seed's copy is read first.
+    /// Op 6, the Fleet page's list: `[count][count × (the device key's first 8 bytes, flags: bit 0 this device)]`, then each row's name `[length][UTF-8]`. Bound with no list yet (the chain only in RAM since unlock-at-boot is off, and none adopted this session), the seed's copy is read first.
     fn members_reply(&mut self) -> Vec<u8> {
         if self.members.is_empty() && self.bound {
             if let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) {
@@ -791,11 +791,23 @@ impl Client {
         }
         // WHY the cap: the reply's count is one byte and the Fleet page lays out at most 16 rows.
         let n = self.members.len().min(16);
-        let mut r = Vec::with_capacity(1 + n * 9);
+        let mut r = Vec::with_capacity(1 + n * (9 + 1 + 36));
         r.push(n as u8);
         for k in &self.members[..n] {
             r.extend_from_slice(&k[..8]);
             r.push((*k == self.me) as u8);
+        }
+        // The names after the rows, one `[length][UTF-8]` per row in the same order: the two-word name every device of this fleet computes for a member (`fgtw::pair::device_name_default`, the one Photon's Fleet page and pairing screen show), length 0 when there is no identity seed to compute it with. A reader that knows only the rows stops before them.
+        for k in &self.members[..n] {
+            match self.identity_seed {
+                Some(seed) => {
+                    let name = fgtw::pair::device_name_default(k, &seed);
+                    // Two voca words: at most 36 bytes (the longest word is 18), so the length fits its byte.
+                    r.push(name.len() as u8);
+                    r.extend_from_slice(name.as_bytes());
+                }
+                None => r.push(0),
+            }
         }
         r
     }

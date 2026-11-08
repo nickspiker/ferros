@@ -165,6 +165,9 @@ fn place(rs: &[i64], xs: &mut [i64], ys: &mut [i64]) {
     }
 }
 
+/// The longest device name the Fleet page keeps: two voca words (fgtw::pair::device_name_default) are at most 36 bytes.
+const NAME_BYTES: usize = 1 << 6;
+
 /// The Fleet page's view of the identity service (payloads/fgtw ops 1 and 6), asked once a second while the page shows and after its taps.
 #[derive(Clone, Copy)]
 struct Fleet {
@@ -174,6 +177,9 @@ struct Fleet {
     words_n: usize,
     keys: [[u8; 8]; 16],
     me: [bool; 16],
+    /// Each member's two-word device name (fgtw op 6's names), `names_n` bytes of it; 0 when the service gave none, and the row shows the key prefix instead.
+    names: [[u8; NAME_BYTES]; 16],
+    names_n: [u8; 16],
     n: usize,
     /// The remove row's first tap: what goes with the device is shown, and the next tap on it starts the departure.
     confirm: bool,
@@ -183,7 +189,7 @@ struct Fleet {
 
 impl Fleet {
     const fn new() -> Self {
-        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], n: 0, confirm: false, leave_result: None }
+        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None }
     }
 
     /// The service's state and words (`[state][siblings heard][words]`), then its members (`[count][count × (8 key bytes, flags)]`). CALL_LIVE: a service that is not running answers at once instead of holding the page.
@@ -198,14 +204,30 @@ impl Fleet {
         let w = (n as usize - 2).min(self.words.len());
         self.words[..w].copy_from_slice(&r[2..2 + w]);
         self.words_n = w;
-        let mut m = [0u8; 1 + 16 * 9];
+        let mut m = [0u8; 1 + 16 * 9 + 16 * (1 + NAME_BYTES)];
         let k = ferros_sys::call_live(svc, &[6], &mut m);
         if k != ferros_sys::ERR && k >= 1 {
-            // WHY: the count is the service's word; the rows read are those that both fit the reply and the table.
-            let cnt = (m[0] as usize).min(16).min((k as usize - 1) / 9);
+            // WHY: the count is the service's word; the rows read are those that both fit the reply and the table. The length is the reply as the service sent it, counted only as far as the buffer took it.
+            let got = (k as usize).min(m.len());
+            let cnt = (m[0] as usize).min(16).min((got - 1) / 9);
             for i in 0..cnt {
                 self.keys[i].copy_from_slice(&m[1 + i * 9..9 + i * 9]);
                 self.me[i] = m[9 + i * 9] & 1 == 1;
+                self.names_n[i] = 0;
+            }
+            // The names after the rows (`[length][UTF-8]` each, in row order). WHY the checks: the lengths are another process's words; a name that would run past what the reply holds or what a slot keeps ends the reading, and the rows from there show their key prefix.
+            let mut at = 1 + cnt * 9;
+            for i in 0..cnt {
+                if at >= got {
+                    break;
+                }
+                let len = m[at] as usize;
+                if len > NAME_BYTES || at + 1 + len > got {
+                    break;
+                }
+                self.names[i][..len].copy_from_slice(&m[at + 1..at + 1 + len]);
+                self.names_n[i] = len as u8;
+                at += 1 + len;
             }
             self.n = cnt;
         }
@@ -511,7 +533,7 @@ struct Map {
     armed: bool,
     /// Developer made a page by the twelve taps (the vault, `map.dev`).
     dev: bool,
-    /// The Fleet page as the identity service last answered: its state (payloads/fgtw: 0 no identity, 1 joining, 2 bound waiting for the key, 3 a member with the key, 4-7 looking up, 8 leaving), the approval words while leaving, the members (key prefixes, which one is this device), and the remove row armed by its first tap.
+    /// The Fleet page as the identity service last answered: its state (payloads/fgtw: 0 no identity, 1 joining, 2 bound waiting for the key, 3 a member with the key, 4-7 looking up, 8 leaving), the approval words while leaving, the members (their device names, or key prefixes where there is none; which one is this device), and the remove row armed by its first tap.
     fleet: Fleet,
     /// Where the camera is flying (`fly`), and whether the flight leaves the open circle for the plane (the page drawn, shrinking with the circle, until it lands).
     target: Option<Cam>,
@@ -1248,9 +1270,17 @@ impl Map {
                 };
                 row(self, b, &mut y, small, white(), state, None);
                 for i in 0..f.n {
+                    // Each member by the two-word name its fleet knows it by (Photon's Fleet page shows the same one); the key's first four bytes only when the service gave no name.
                     let mut l = Line::new();
-                    for x in &f.keys[i][..4] {
-                        let _ = write!(l, "{x:02x}");
+                    match core::str::from_utf8(&f.names[i][..f.names_n[i] as usize]) {
+                        Ok(name) if !name.is_empty() => {
+                            l.s(name);
+                        }
+                        _ => {
+                            for x in &f.keys[i][..4] {
+                                let _ = write!(l, "{x:02x}");
+                            }
+                        }
                     }
                     if f.me[i] {
                         l.s("  this device");
