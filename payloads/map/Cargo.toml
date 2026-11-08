@@ -9,7 +9,9 @@ name = "map"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys", features = ["detail"] }
+ferros_sys = { path = "../../ferros_sys" }
+# A link's detail document (docs/RADIO-CONTROLS.md).
+ferros_detail = { path = "../../ferros_detail" }
 # The heap the links' detail documents are read in (ferros_sys::detail, docs/RADIO-CONTROLS.md).
 ferros_heap = { path = "../../ferros_heap" }
 ferros_ledger = { path = "../../ferros_ledger" }

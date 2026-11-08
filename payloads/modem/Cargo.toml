@@ -9,6 +9,8 @@ name = "modem"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys", features = ["detail"] }
+ferros_sys = { path = "../../ferros_sys" }
+# A link's detail document (docs/RADIO-CONTROLS.md).
+ferros_detail = { path = "../../ferros_detail" }
 # The kernel's free-list allocator: a driver that runs for the whole session allocates and frees per frame.
 ferros_heap = { path = "../../ferros_heap" }

@@ -1,0 +1,15 @@
+[package]
+name = "ferros_detail"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "A link's detail (docs/RADIO-CONTROLS.md): its names and identifiers as one VSF document, the schemas shared by the driver that writes and the settings page that reads. Needs a heap in the process; kept out of ferros_sys so a process without one never links alloc."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ferros_sys = { path = "../ferros_sys" }
+vsf = { path = "../../vsf", default-features = false }
+# vsf hashes with blake3; pure Rust, as the display has it: its C and assembly do not build for the bare target.
+blake3 = { version = "1", default-features = false, features = ["pure"] }

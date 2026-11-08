@@ -1,7 +1,11 @@
 //! A link's detail (docs/RADIO-CONTROLS.md): what a driver knows that is text or an identifier — a network's name, an access point's address, the line's IP addresses — never smuggled into a measure's number. One complete VSF document (header, Eagle time, provenance hash) with one section named for the link and a typed field each, kept by the kernel (`SYS_DETAIL`) and read only with the Settings capability.
 //!
 //! The schemas are here, once, for the driver that writes and the page that reads: the reader verifies the document and refuses a field its schema does not name.
+#![no_std]
+
 extern crate alloc;
+
+pub use vsf;
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -32,8 +36,8 @@ pub const WIFI: &[(&str, Kind)] = &[("ssid", Kind::Text), ("bssid", Kind::Mac), 
 /// A link's section name and fields (`control`'s link numbers), None for a link with no detail yet.
 pub fn fields(link: u64) -> Option<(&'static str, &'static [(&'static str, Kind)])> {
     match link {
-        crate::control::CELLULAR => Some(("cellular", CELLULAR)),
-        crate::control::WIFI => Some(("wifi", WIFI)),
+        ferros_sys::control::CELLULAR => Some(("cellular", CELLULAR)),
+        ferros_sys::control::WIFI => Some(("wifi", WIFI)),
         _ => None,
     }
 }
@@ -62,7 +66,7 @@ fn schema(link: u64) -> Option<SectionSchema> {
 pub fn eagle_now() -> i64 {
     // Unix seconds at the Eagle epoch (1969-07-20 20:17:40 UTC).
     const EPOCH_UNIX: i128 = -14_182_940;
-    let Some((secs, ticks, hz)) = crate::utc_time() else { return 0 };
+    let Some((secs, ticks, hz)) = ferros_sys::utc_time() else { return 0 };
     let ops = vsf::OSCILLATIONS_PER_SECOND as i128;
     ((secs as i128 - EPOCH_UNIX) * ops + ticks as i128 * ops / hz as i128) as i64
 }
@@ -81,12 +85,12 @@ pub fn build(link: u64, values: Vec<(&str, VsfType)>) -> Option<Vec<u8>> {
 /// Build and hand to the kernel as this driver's link's detail: true when it was taken.
 pub fn publish(link: u64, values: Vec<(&str, VsfType)>) -> bool {
     match build(link, values) {
-        Some(doc) => crate::detail_set(&doc),
+        Some(doc) => ferros_sys::detail_set(&doc),
         None => false,
     }
 }
 
-/// A document read back (`crate::detail`), verified and parsed: each field present, in the schema's order, with its kind and value. None for a document that does not verify, or does not match the link's schema.
+/// A document read back (`ferros_sys::detail`), verified and parsed: each field present, in the schema's order, with its kind and value. None for a document that does not verify, or does not match the link's schema.
 pub fn parse(link: u64, doc: &[u8]) -> Option<Vec<(&'static str, Kind, VsfType)>> {
     let (_, fs) = fields(link)?;
     let section = SectionBuilder::parse_document(schema(link)?, doc, None).ok()?;

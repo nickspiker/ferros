@@ -32,7 +32,7 @@ const S_STORE: u64 = 4;
 /// The identity service (payloads/fgtw): the Fleet page asks it the fleet's state and members, and starts this device's departure.
 const S_FGTW: u64 = 5;
 
-/// The heap a link's detail document is verified and read in (ferros_sys::detail): a few kilobytes while a link's page shows, freed after each frame.
+/// The heap a link's detail document is verified and read in (ferros_detail): a few kilobytes while a link's page shows, freed after each frame.
 const HEAP_SIZE: usize = 1 << 16;
 #[repr(C, align(64))]
 struct Heap([u8; HEAP_SIZE]);
@@ -578,7 +578,7 @@ fn group_of(kind: u16) -> usize {
     }
 }
 
-/// A detail field's name for the page (ferros_sys::detail's schemas).
+/// A detail field's name for the page (ferros_detail's schemas).
 fn detail_label(field: &str) -> &'static str {
     match field {
         "carrier" => "carrier",
@@ -599,8 +599,8 @@ fn detail_label(field: &str) -> &'static str {
 }
 
 /// A detail value written for the page: names as they are; addresses, being identifiers and not quantities, in hexadecimal grouped as their standards group them (no base's magnitude reading makes sense of them); a lease as a duration in the device's base.
-fn detail_words(l: &mut Line, f: tatau::Fmt, v: &ferros_sys::vsf::VsfType) {
-    use ferros_sys::vsf::VsfType;
+fn detail_words(l: &mut Line, f: tatau::Fmt, v: &ferros_detail::vsf::VsfType) {
+    use ferros_detail::vsf::VsfType;
     let hex = |l: &mut Line, bytes: &[u8], group: usize, sep: &str| {
         for (i, c) in bytes.chunks(group).enumerate() {
             if i > 0 {
@@ -1586,7 +1586,7 @@ impl Map {
                 if let Some(n) = ferros_sys::detail(cap(self.grants, S_SETTINGS), k as u64, &mut doc) {
                     // WHY the bound: the kernel returns the document's whole length, which the call allows to exceed the buffer; a document this page cannot hold whole is not read.
                     if n > 0 && n <= doc.len() {
-                        if let Some(fields) = ferros_sys::detail::parse(k as u64, &doc[..n]) {
+                        if let Some(fields) = ferros_detail::parse(k as u64, &doc[..n]) {
                             if !fields.is_empty() {
                                 header(b, &mut y, "names and addresses");
                             }
@@ -1644,7 +1644,7 @@ impl Map {
                 match ferros_sys::local_time() {
                     Some((secs, ticks)) => {
                         let ns = (ticks * 1_000_000_000 / freq()) as u32;
-                        let eagle = ferros_sys::detail::eagle_now();
+                        let eagle = ferros_detail::eagle_now();
                         let mut l = Line::new();
                         let _ = tatau::date_time(&mut l, f, secs, ns, eagle);
                         b.text(cx, y, (uu(3, 2)) as u16, white(), 1, l.as_str());

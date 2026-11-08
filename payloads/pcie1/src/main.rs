@@ -12,7 +12,7 @@ extern crate alloc;
 
 use ferros_sys::svc;
 
-/// The heap the link's detail document is built in (ferros_sys::detail): a few hundred bytes a build, rebuilt only when the link changes.
+/// The heap the link's detail document is built in (ferros_detail): a few hundred bytes a build, rebuilt only when the link changes.
 const HEAP_SIZE: usize = 1 << 16;
 #[repr(C, align(64))]
 struct Heap([u8; HEAP_SIZE]);
@@ -1612,10 +1612,10 @@ fn publish_measures(m: &mut Msgbuf, d: &mut Drv, pkts: &mut [u32; 4]) {
 /// The WiFi link's tracks this driver fills (`publish_measures`), emptied while there is no link.
 const WIFI_TRACKS: usize = 7;
 
-/// The link's detail for its settings page (ferros_sys::detail::WIFI): the network's name from the credential (ASCII only: a name that is not is left out rather than mangled), the access point joined, this device's address on it, and what DHCP gave when this driver ran it (in service the `ip` process runs DHCP, and its lease is not here).
+/// The link's detail for its settings page (ferros_detail::WIFI): the network's name from the credential (ASCII only: a name that is not is left out rather than mangled), the access point joined, this device's address on it, and what DHCP gave when this driver ran it (in service the `ip` process runs DHCP, and its lease is not here).
 fn publish_detail(m: &Msgbuf) {
-    use ferros_sys::detail::publish;
-    use ferros_sys::vsf::VsfType;
+    use ferros_detail::publish;
+    use ferros_detail::vsf::VsfType;
     let mut f = alloc::vec::Vec::new();
     let ssid = &m.want[..m.want_len];
     if !ssid.is_empty() && ssid.iter().all(|&c| (0x20..0x7F).contains(&c)) {
@@ -1737,7 +1737,7 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     // The corners' WiFi circle (SYS_STATUS): the link's own measures every two seconds, each in its unit, published only where the firmware answers (owner: many dimensions, never bars). Into the scan's request area: no scan runs while serving.
     let mut status_at = 0u64;
     let mut pkts = [0u32; 4];
-    // The link's names and addresses for its settings page (ferros_sys::detail, behind the Settings capability): they hold while this join does.
+    // The link's names and addresses for its settings page (ferros_detail, behind the Settings capability): they hold while this join does.
     publish_detail(m);
     // The control block (docs/RADIO-CONTROLS.md), looked at four times a second: a generation moved since the last look is a knob set. None: not looked at yet, so the first look applies what is kept.
     let mut control_at = 0u64;

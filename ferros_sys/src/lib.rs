@@ -229,7 +229,7 @@ pub fn controls(link: u64) -> [u64; control::WORDS] {
     b
 }
 
-/// This driver's detail document (`detail::build`), kept by the kernel as its link's (at most 1 KiB). True when taken.
+/// This driver's detail document (ferros_detail::build), kept by the kernel as its link's (at most 1 KiB). True when taken.
 pub fn detail_set(doc: &[u8]) -> bool {
     svc(nr::DETAIL, 0, off(doc.as_ptr()), doc.len() as u64, 0, 0) == 0
 }
@@ -240,11 +240,6 @@ pub fn detail(cap: u64, link: u64, buf: &mut [u8]) -> Option<usize> {
     (r != ERR).then_some(r as usize)
 }
 
-#[cfg(feature = "detail")]
-pub mod detail;
-/// The VSF crate the detail documents are made of, for a driver building one.
-#[cfg(feature = "detail")]
-pub use vsf;
 pub const MEASURE_NONE: u64 = u64::MAX;
 pub const TECH_NONE: u8 = 0;
 pub const TECH_WIFI4: u8 = 1;

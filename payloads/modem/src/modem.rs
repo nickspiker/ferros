@@ -2246,9 +2246,9 @@ impl Online {
         status_track(6, w(k::SUSPENDS, self.suspends as i64));
     }
 
-    /// The detail for the settings page (ferros_sys::detail::CELLULAR, behind the Settings capability): the carrier pack loaded (fixed today), the data and attach APNs, and while a call is up its addresses and DNS servers (the line's: never logged, shown only to the person).
+    /// The detail for the settings page (ferros_detail::CELLULAR, behind the Settings capability): the carrier pack loaded (fixed today), the data and attach APNs, and while a call is up its addresses and DNS servers (the line's: never logged, shown only to the person).
     fn publish_detail(&self) {
-        use ferros_sys::vsf::VsfType;
+        use ferros_detail::vsf::VsfType;
         let text = |b: &[u8]| VsfType::a(b.iter().map(|&c| c as char).collect());
         let mut f = alloc::vec![("carrier", VsfType::a(alloc::string::String::from("Verizon"))), ("apn", text(DATA_APN)), ("attach_apn", text(ATTACH_APN))];
         if let Some(c) = self.call {
@@ -2261,7 +2261,7 @@ impl Online {
                 f.push(("dns6", VsfType::nj(c.dns6)));
             }
         }
-        ferros_sys::detail::publish(ferros_sys::control::CELLULAR, f);
+        ferros_detail::publish(ferros_sys::control::CELLULAR, f);
     }
 
     fn new(t0: u64, probe: u8) -> Self {
