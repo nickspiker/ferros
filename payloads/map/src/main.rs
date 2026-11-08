@@ -31,9 +31,13 @@ const S_SETTINGS: u64 = 3;
 const S_STORE: u64 = 4;
 /// The identity service (payloads/fgtw): the Fleet page asks it the fleet's state and members, and starts this device's departure.
 const S_FGTW: u64 = 5;
+/// The vault scope `kists.`: the person's kists and their answers (ferros_kist), read for the kist circles and the settings, written with the person's answers.
+const S_KIST_LIST: u64 = 6;
+/// Init's `launch` endpoint: a kist circle tapped asks init to launch it (the map holds none of a kist's rights).
+const S_LAUNCH: u64 = 7;
 
 /// The heap a link's detail document is verified and read in (ferros_detail): a few kilobytes while a link's page shows, freed after each frame.
-const HEAP_SIZE: usize = 1 << 16;
+const HEAP_SIZE: usize = 1 << 18;
 #[repr(C, align(64))]
 struct Heap([u8; HEAP_SIZE]);
 static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
@@ -41,8 +45,8 @@ static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
 static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
 
 /// One circle: its label, its weight of ring (0 none, 1 thin, 2 heavy — importance), whether it is lit (changed since last seen), its share of the map's area in thousandths, and its icon in the display server's bundle (tools/app-icons order).
-struct Spec {
-    label: &'static str,
+struct Spec<'a> {
+    label: &'a str,
     ring: u8,
     lit: u8,
     share: u32,
@@ -50,8 +54,11 @@ struct Spec {
 }
 
 /// The one built-in circle: the system's own, the device's settings. It never lights (lit means a person sent you something).
-const CIRCLES: [Spec; 1] = [Spec { label: "settings", ring: 1, lit: 0, share: 250, icon: 6 }];
-const N: usize = CIRCLES.len();
+const CIRCLES: [Spec<'static>; 1] = [Spec { label: "settings", ring: 1, lit: 0, share: 250, icon: 6 }];
+/// The most circles the map holds: settings and the kists the person installed (KISTS.md), each a kist circle after it.
+const MAX: usize = 1 << 4;
+/// A kist circle's share of the map's area until it is sized by hand (thousandths, as `Spec::share`).
+const KIST_SHARE: u32 = 125;
 
 /// The map's total circle area, as four circles of radius 110 world units: each circle gets its share of it, so area is time.
 const BASE_RADIUS: i64 = 110;
@@ -188,6 +195,10 @@ struct Fleet {
     words_n: usize,
     keys: [[u8; 8]; 16],
     me: [bool; 16],
+    /// Each member heard on this network (fgtw op 6, flag bit 1).
+    heard: [bool; 16],
+    /// How this device reaches its fleet (fgtw op 7): the network up, seconds since fgtw.org last answered (None: never), fleet devices heard on this network. None until the service answered it.
+    reach: Option<(bool, Option<u32>, u8)>,
     /// Each member's two-word device name (fgtw op 6's names), `names_n` bytes of it; 0 when the service gave none, and the row shows the key prefix instead.
     names: [[u8; NAME_BYTES]; 16],
     names_n: [u8; 16],
@@ -200,7 +211,7 @@ struct Fleet {
 
 impl Fleet {
     const fn new() -> Self {
-        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None }
+        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], reach: None, names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None }
     }
 
     /// The service's state and words (`[state][siblings heard][words]`), then its members (`[count][count × (8 key bytes, flags)]`). CALL_LIVE: a service that is not running answers at once instead of holding the page.
@@ -215,6 +226,11 @@ impl Fleet {
         let w = (n as usize - 2).min(self.words.len());
         self.words[..w].copy_from_slice(&r[2..2 + w]);
         self.words_n = w;
+        let mut q = [0u8; 6];
+        self.reach = (ferros_sys::call_live(svc, &[7], &mut q) == 6).then(|| {
+            let age = u32::from_le_bytes([q[1], q[2], q[3], q[4]]);
+            (q[0] != 0, (age != u32::MAX).then_some(age), q[5])
+        });
         let mut m = [0u8; 1 + 16 * 9 + 16 * (1 + NAME_BYTES)];
         let k = ferros_sys::call_live(svc, &[6], &mut m);
         if k != ferros_sys::ERR && k >= 1 {
@@ -224,6 +240,7 @@ impl Fleet {
             for i in 0..cnt {
                 self.keys[i].copy_from_slice(&m[1 + i * 9..9 + i * 9]);
                 self.me[i] = m[9 + i * 9] & 1 == 1;
+                self.heard[i] = m[9 + i * 9] & 2 == 2;
                 self.names_n[i] = 0;
             }
             // The names after the rows (`[length][UTF-8]` each, in row order). WHY the checks: the lengths are another process's words; a name that would run past what the reply holds or what a slot keeps ends the reading, and the rows from there show their key prefix.
@@ -445,10 +462,18 @@ enum Choice {
     Picker,
     /// A page's title in the picker: that page.
     Pick(u8),
+    /// A kist's want on the Kists or Permissions page: (the kist in the person's list, the want), its answer turned over.
+    Answer(u8, u8),
+    /// A right's default for new kists (Permissions).
+    Default(u8),
+    /// The first-launch question: a want's switch (its index in the kist's wants).
+    AskWant(u8),
+    /// The first-launch question answered: the answers kept and the kist launched.
+    AskGo,
 }
 
 /// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The clock after the links (docs/RADIO-CONTROLS.md): its time, zone and sources.
-const PAGES: [&str; 16] = ["appearance", "numbers", "keyboard", "security", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "clock", "about", "developer"];
+const PAGES: [&str; 18] = ["appearance", "numbers", "keyboard", "security", "kists", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "clock", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Taps in a row on About's version line that make Developer a page (owner, 2026-11-05: "twelve"), and the tap from which the hint shows and counts down ("don't show a toast hint until four taps"). No time window: any other tap starts the count again.
@@ -665,13 +690,13 @@ struct Map {
     w: i64,
     h: i64,
     /// Circles in world units ×256, and radii in world units.
-    xs: [i64; N],
-    ys: [i64; N],
-    rs: [i64; N],
+    xs: [i64; MAX],
+    ys: [i64; MAX],
+    rs: [i64; MAX],
     cam: Cam,
     view: View,
     /// The settings' tappable places, as laid out by the last frame: (left, right, top, bottom, what).
-    rows: [(i64, i64, i64, i64, Choice); 32],
+    rows: [(i64, i64, i64, i64, Choice); 64],
     /// The settings page on show; the strip's offset from it in pixels (positive: dragged right, the page before it coming in), kept within half a screen by moving `page` as it passes; how far the page is scrolled up; and the fling still carrying it (pixels a frame, under `coast`'s friction), with the fraction of a pixel it has gone past its last whole one.
     page: usize,
     page_dx: i64,
@@ -721,15 +746,128 @@ struct Map {
     scale_live: Option<f32>,
     nrows: usize,
     /// Each circle's own turn (its icon), (cos, sin) in Q14; two fingers in a circle twist it.
-    rc: [i64; N],
-    rsn: [i64; N],
+    rc: [i64; MAX],
+    rsn: [i64; MAX],
     /// Circles moved or sized by hand since arranging began, to keep when it ends.
-    arranged: [bool; N],
+    arranged: [bool; MAX],
     /// An app is in front (one the map did not start: a bridge spawn), and it has the touches.
     app_front: bool,
+    /// How many circles there are: settings, then a kist circle for each kist in the person's list (at most `MAX`).
+    n: usize,
+    /// The person's kists and their answers (`kists.list`, ferros_kist), as last read: kist circle i is `kists.kists[i - 1]`.
+    kists: ferros_kist::Kists,
+    /// The first-launch question on an open kist circle: each unanswered want's switch as the person has it now, a bit per want (started from their defaults).
+    ask: u64,
 }
 
 impl Map {
+    /// Circle `i` as the scene draws it: settings first, then each installed kist, its name its label and its icon the display's bundled one for that app (tools/app-icons order), or none.
+    fn spec(&self, i: usize) -> Spec<'_> {
+        if i == 0 {
+            let c = &CIRCLES[0];
+            return Spec { label: c.label, ring: c.ring, lit: c.lit, share: c.share, icon: c.icon };
+        }
+        let name = self.kists.kists[i - 1].name.as_str();
+        // The display's bundle (tools/app-icons APPS, 1-based): the kist's icon by its app's name until a kist carries its own (KISTS.md: the list's `icon`).
+        const BUNDLED: [&str; 5] = ["Photon", "Mahere", "Lumis", "Opsin", "Ramps"];
+        let icon = BUNDLED.iter().position(|b| b.eq_ignore_ascii_case(name)).map_or(0, |k| k as u8 + 1);
+        Spec { label: name, ring: 1, lit: 0, share: KIST_SHARE, icon }
+    }
+
+    fn label(&self, i: usize) -> &str {
+        self.spec(i).label
+    }
+
+    /// The kist behind circle `i` (none for settings).
+    fn kist(&self, i: usize) -> Option<&ferros_kist::Kist> {
+        i.checked_sub(1).and_then(|k| self.kists.kists.get(k))
+    }
+
+    /// The person's list read again (another device of theirs may have answered, or an install added a kist); false when it could not be read (nobody present), the copy kept as it was.
+    fn reload_kists(&mut self) -> bool {
+        match ferros_kist::store::read(cap(self.grants, S_KIST_LIST)) {
+            Some(k) => {
+                self.kists = k;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The person's list read again, and the kist circles made to match it when a kist came or went (an install over the bridge, one on another of their devices): placed afresh by the seeded fit, each kept place winning, then the scene sent again.
+    fn refresh_circles(&mut self) {
+        if !self.reload_kists() {
+            return;
+        }
+        // WHY: the arrays hold MAX circles (as at start).
+        let n = (1 + self.kists.kists.len()).min(MAX);
+        if n == self.n {
+            return;
+        }
+        self.n = n;
+        for i in 1..MAX {
+            self.rs[i] = if i < n { radius_of(KIST_SHARE) } else { 0 };
+            self.rc[i] = ONE;
+            self.rsn[i] = 0;
+        }
+        let (mut xs, mut ys) = ([0i64; MAX], [0i64; MAX]);
+        place(&self.rs[..n], &mut xs[..n], &mut ys[..n]);
+        for i in 0..n {
+            self.xs[i] = xs[i] << 8;
+            self.ys[i] = ys[i] << 8;
+        }
+        self.load_places_near();
+        self.push_apart(MAX);
+        self.send_scene();
+    }
+
+    /// The places kept by hand (`load_places`), then every circle still at its seeded place moved with the settings circle: the seeded fit is about the settings circle at the origin, and a kist circle installed after the person moved settings would otherwise land far from it, off the view they keep.
+    fn load_places_near(&mut self) -> usize {
+        let seeded: [(i64, i64); MAX] = core::array::from_fn(|i| (self.xs[i], self.ys[i]));
+        let kept = self.load_places();
+        let (dx, dy) = (self.xs[0] - seeded[0].0, self.ys[0] - seeded[0].1);
+        for i in 1..self.n {
+            if (self.xs[i], self.ys[i]) == seeded[i] {
+                self.xs[i] += dx;
+                self.ys[i] += dy;
+            }
+        }
+        kept
+    }
+
+    /// The person's list written whole, after a change of theirs (an answer, a default); the console says when the vault did not take it.
+    fn save_kists(&self) -> bool {
+        let ok = ferros_kist::store::write(cap(self.grants, S_KIST_LIST), &self.kists, ferros_detail::eagle_now());
+        if !ok {
+            console(self.grants, b"map: the vault did not take the person's kists\n");
+        }
+        ok
+    }
+
+    /// Ask init to launch kist circle `i`'s kist (KISTS.md): the map holds none of its rights. Init's answer (ferros_kist::launch).
+    fn launch(&self, i: usize) -> u8 {
+        let Some(k) = self.kist(i) else { return ferros_kist::launch::NOT_INSTALLED };
+        let mut m = [0u8; 33];
+        m[0] = ferros_kist::launch::OP_LAUNCH;
+        m[1..].copy_from_slice(&k.capsule);
+        let mut r = [ferros_kist::launch::REFUSED; 1];
+        call(cap(self.grants, S_LAUNCH), &m, &mut r);
+        let mut l = Line::new();
+        let _ = write!(l, "map: launch {}: {}\n", k.name, match r[0] { 0 => "starting", 1 => "running", 2 => "asking first", 3 => "not installed", 5 => "the list is not readable", _ => "refused" });
+        console(self.grants, l.as_str().as_bytes());
+        r[0]
+    }
+
+    /// A running kist relaunched with its answers as they now stand (owner, 2026-11-08: a revoke is a kill and a respawn without that right, and the kill is one shot dead): init's `OP_RELAUNCH`; nothing happens to a kist not running.
+    fn relaunch(&self, k: usize) {
+        let Some(kist) = self.kists.kists.get(k) else { return };
+        let mut m = [0u8; 33];
+        m[0] = ferros_kist::launch::OP_RELAUNCH;
+        m[1..].copy_from_slice(&kist.capsule);
+        let mut r = [0u8; 1];
+        call(cap(self.grants, S_LAUNCH), &m, &mut r);
+    }
+
     /// Where an arrived circle stands on the panel, centre and radius: the circle an app lives in (ferros_sys::active_circle, the display's, its hairline), so every active app's page is inscribed in the same circle (owner, 2026-11-05). Until then fifteen thirty-seconds of the width across, at the panel's centre. The zoom keeps the map's own circle within the screen's width, so the page's fill, at this radius, is what shows.
     fn arrived(&self) -> (i64, i64, i64) {
         let (cx, cy, r) = ferros_sys::active_circle(self.w as usize, self.h as usize);
@@ -737,20 +875,23 @@ impl Map {
     }
 
     /// A circle's vault key, relative to the map's scope: `place.<label>`, so a circle keeps its place however the table grows.
-    fn place_key(i: usize, key: &mut [u8; 32]) -> usize {
-        let l = CIRCLES[i].label.as_bytes();
+    fn place_key(&self, i: usize, key: &mut [u8; 32]) -> usize {
+        let l = self.label(i).as_bytes();
         key[..6].copy_from_slice(b"place.");
+        // WHY: a vault name is at most 32 bytes here; a kist's name past 26 is cut, and a space (a vault name holds none) becomes an underscore.
         let n = l.len().min(26);
-        key[6..6 + n].copy_from_slice(&l[..n]);
+        for (d, &s) in key[6..6 + n].iter_mut().zip(l) {
+            *d = if s == b' ' { b'_' } else { s };
+        }
         6 + n
     }
 
     /// The arrangement made by hand, from the vault: each circle's place as EWE integers (CLAUDE.md: no fixed widths on storage) — x and y in world units ×256, zigzag-mapped (they can be negative), the radius, and then (since the circles turn) its turn as cos and sin in Q14, zigzag; a place kept before turns existed has three and stays upright.
     fn load_places(&mut self) -> usize {
         let mut loaded = 0;
-        for i in 0..N {
+        for i in 0..self.n {
             let mut key = [0u8; 32];
-            let kl = Map::place_key(i, &mut key);
+            let kl = self.place_key(i, &mut key);
             let mut v = [0u8; 64];
             let Some(n) = ferros_sys::store_get(cap(self.grants, S_STORE), &key[..kl], &mut v) else { continue };
             let v = &v[..n.min(64)];
@@ -789,7 +930,7 @@ impl Map {
     /// Keep circle i's place in the vault.
     fn save_place(&self, i: usize) -> bool {
         let mut key = [0u8; 32];
-        let kl = Map::place_key(i, &mut key);
+        let kl = self.place_key(i, &mut key);
         let zig = |v: i64| ((v << 1) ^ (v >> 63)) as u64;
         let mut b = [0u8; 32];
         let mut n = 0;
@@ -804,8 +945,8 @@ impl Map {
         const AIR: i64 = 4;
         for _ in 0..8 {
             let mut any = false;
-            for a in 0..N {
-                for b in a + 1..N {
+            for a in 0..self.n {
+                for b in a + 1..self.n {
                     let (dx, dy) = (self.xs[b] - self.xs[a], self.ys[b] - self.ys[a]);
                     let want = (self.rs[a] + self.rs[b] + AIR) << 8;
                     let d2 = dx * dx + dy * dy;
@@ -858,7 +999,7 @@ impl Map {
     fn zoom_limits(&self) -> (i64, i64) {
         let mut sum_r2 = 0i64;
         let mut r_min = i64::MAX;
-        for i in 0..N {
+        for i in 0..self.n {
             let r = self.rs[i].max(1);
             sum_r2 += r * r;
             r_min = r_min.min(r);
@@ -873,11 +1014,11 @@ impl Map {
     /// The radius circle `i` may take, given the others: within RADIUS_RATIO of the smallest and the largest of them.
     fn radius_limits(&self, i: usize) -> (i64, i64) {
         // Alone, a circle has nothing to be within a ratio of (the search below would leave lo at i64::MAX and lo × RADIUS_RATIO would overflow), so the screen bounds it instead, at the zoom it is held at: from a 64th of the screen's width across to the width itself (past three quarters of the width it is a place, and the fingers move the plane anyway). Two fingers on a kist circle size it, the only one too (owner, 2026-11-07: until then a lone circle kept its size and only turned).
-        if N == 1 {
+        if self.n == 1 {
             return (((self.w >> 7) << 16) / self.cam.z, ((self.w >> 1) << 16) / self.cam.z);
         }
         let (mut lo, mut hi) = (i64::MAX, 1i64);
-        for j in 0..N {
+        for j in 0..self.n {
             if j != i {
                 lo = lo.min(self.rs[j].max(1));
                 hi = hi.max(self.rs[j]);
@@ -889,7 +1030,7 @@ impl Map {
     /// The circles may not leave the screen entirely: their joint bounding box on the panel must still touch it (owner, 2026-10-23: "at least one edge has to be touching so we don't lose the circles"). Called after every camera change; the camera is pulled back by the overshoot.
     fn keep_on_screen(&mut self) {
         let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
-        for i in 0..N {
+        for i in 0..self.n {
             let (sx, sy) = self.cam.screen(self.w, self.h, self.xs[i], self.ys[i]);
             let sr = (self.rs[i] * self.cam.z >> 16).max(1);
             x0 = x0.min(sx - sr);
@@ -913,7 +1054,7 @@ impl Map {
         if z == Z_ONE {
             return;
         }
-        for i in 0..N {
+        for i in 0..self.n {
             self.xs[i] = self.xs[i] * z / Z_ONE;
             self.ys[i] = self.ys[i] * z / Z_ONE;
             self.rs[i] = (self.rs[i] * z / Z_ONE).max(1);
@@ -963,7 +1104,7 @@ impl Map {
     /// Whether, with circle `i` moved by (dx, dy), every circle still has a neighbour within one screen diagonal of it (edge to edge) at the zoom-out limit — distance, not a bounding box, so no orientation and no rectangles (owner, 2026-10-23: "so it never exceeds the screen diagonal; don't want weird rectangles floating around"). Zooming all the way out then always shows a connected set.
     fn fits_when_out(&self, i: usize, dx: i64, dy: i64) -> bool {
         // Alone, a circle is its own connected set: with no neighbour the nearest distance below stays i64::MAX and every move would be refused.
-        if N == 1 {
+        if self.n == 1 {
             return true;
         }
         let (z_out, _) = self.zoom_limits();
@@ -971,10 +1112,10 @@ impl Map {
         let diag = isqrt(self.w * self.w + self.h * self.h);
         let limit = ((diag << 16) / z_out.max(1)) << 8;
         let pos = |j: usize| if j == i { (self.xs[j] + dx, self.ys[j] + dy) } else { (self.xs[j], self.ys[j]) };
-        for a in 0..N {
+        for a in 0..self.n {
             let (ax, ay) = pos(a);
             let mut nearest = i64::MAX;
-            for b in 0..N {
+            for b in 0..self.n {
                 if b == a {
                     continue;
                 }
@@ -991,7 +1132,7 @@ impl Map {
 
     /// Keep every circle moved since the last time in the vault.
     fn save_arranged(&mut self) {
-        for i in 0..N {
+        for i in 0..self.n {
             if self.arranged[i] {
                 self.arranged[i] = false;
                 if !self.save_place(i) {
@@ -1005,7 +1146,7 @@ impl Map {
     fn hit(&self, sx: i64, sy: i64) -> Option<usize> {
         let (wx, wy) = self.cam.world(self.w, self.h, sx, sy);
         let mut best: Option<usize> = None;
-        for i in 0..N {
+        for i in 0..self.n {
             let (dx, dy) = ((wx - self.xs[i]) >> 8, (wy - self.ys[i]) >> 8);
             if dx * dx + dy * dy <= self.rs[i] * self.rs[i] && best.is_none_or(|b| self.rs[i] < self.rs[b]) {
                 best = Some(i);
@@ -1019,10 +1160,11 @@ impl Map {
         let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
         let mut r = [0u8; 4];
         call(self.display, &[12], &mut r);
-        let mut m = [0u8; 2 + 30 * N];
+        let mut m = [0u8; 2 + 30 * MAX];
         m[0] = 13;
-        m[1] = N as u8;
-        for (i, a) in CIRCLES.iter().enumerate() {
+        m[1] = self.n as u8;
+        for i in 0..self.n {
+            let a = self.spec(i);
             let at = 2 + i * 30;
             m[at..at + 4].copy_from_slice(&((self.xs[i] >> 8) as i32).to_le_bytes());
             m[at + 4..at + 8].copy_from_slice(&((self.ys[i] >> 8) as i32).to_le_bytes());
@@ -1038,7 +1180,7 @@ impl Map {
         call(self.display, &m, &mut r);
         self.send_crowd();
         // The circles' own turns ride on `scene move`: a fresh scene starts every circle upright.
-        for i in 0..N {
+        for i in 0..self.n {
             if self.rc[i] != ONE || self.rsn[i] != 0 {
                 self.send_move(i);
             }
@@ -1081,7 +1223,7 @@ impl Map {
         let mut ys = [0i64; 256];
         let mut rs = [0i64; 256];
         let mut k = 0;
-        for i in 0..N {
+        for i in 0..self.n {
             xs[k] = self.xs[i] >> 8;
             ys[k] = self.ys[i] >> 8;
             rs[k] = self.rs[i];
@@ -1132,7 +1274,7 @@ impl Map {
     /// The camera that shows every circle with air around them, never closer than one world unit to a pixel.
     fn home(&self) -> Cam {
         let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
-        for i in 0..N {
+        for i in 0..self.n {
             let r = self.rs[i] << 8;
             x0 = x0.min(self.xs[i] - r);
             y0 = y0.min(self.ys[i] - r);
@@ -1212,7 +1354,10 @@ impl Map {
             let mut pb = Batch::new();
             let (cx, cy, r, _) = self.page_frame();
             pb.region(cx, cy, r, fill());
-            self.settings(&mut pb, true);
+            match self.view {
+                View::Open(i) if i > 0 => self.ask_page(&mut pb, i, true),
+                _ => self.settings(&mut pb, true),
+            }
             self.nrows = 0;
             self.target = target;
             let mut at = 1usize;
@@ -1299,7 +1444,8 @@ impl Map {
         self.nrows = 0;
         match self.view {
             View::Map => {}
-            View::Open(_) => self.settings(&mut b, region),
+            View::Open(0) => self.settings(&mut b, region),
+            View::Open(i) => self.ask_page(&mut b, i, region),
         }
         // Flag bit 1: something moves (a finger is down, or a flight, fling or spring goes on): the display may pan by shifting what it drew (COMPOSITOR.md "Pans from the last frame"); a frame without it is drawn whole, at rest.
         let mut cam = self.cam.op(true);
@@ -1422,6 +1568,44 @@ impl Map {
             }
         }
         // The page out to the circle itself, which the display's hairline draws over; a region's ground is its region op's, made once.
+        if !region {
+            b.disc(cx, cy, r, fill());
+        }
+    }
+
+    /// The first-launch question (owner, 2026-11-08), inscribed in the kist's open circle: its name, then each want not yet answered, its switch as the person has it (`ask`, started from their defaults: out of the box every one off) and the developer's reason under it, then "start". Asked once for this person and this kist, on every device of theirs; a kist itself can never ask.
+    fn ask_page(&mut self, b: &mut Batch, i: usize, region: bool) {
+        let (cx, cy, r, uq) = self.page_frame();
+        let uu = |n: i64, d: i64| n * uq / (d << 8);
+        let half = self.w / 2;
+        let (title_y, top, bottom) = self.bands();
+        let Some(k) = self.kist(i).cloned() else { return };
+        b.text(cx, title_y, uu(2, 1) as u16, white(), 1, &k.name);
+        let open: alloc::vec::Vec<usize> = (0..k.wants.len()).filter(|&j| k.wants[j].answer.is_none()).collect();
+        // The rows' height, centred in the band: a line saying what this is, each want two lines, then start.
+        let pitch = uu(7, 2);
+        let h = uu(3, 1) + open.len() as i64 * pitch + uu(4, 1);
+        let mut y = (top + bottom - h) / 2 + uu(2, 1);
+        b.text(cx, y, uu(1, 1) as u16, grey(), 1, "asks for, once; change it later in settings");
+        y += uu(3, 1);
+        let live = self.target.is_none();
+        for &j in &open {
+            let w = &k.wants[j];
+            let on = self.ask >> j & 1 == 1;
+            let mut l = Line::new();
+            let _ = write!(l, "{}: {}", ferros_kist::MEANS[w.right as usize], if on { "on" } else { "off" });
+            b.text(cx, y, uu(5, 4) as u16, if on { white() } else { grey() }, 1, l.as_str());
+            b.text(cx, y + uu(3, 2), uu(7, 8) as u16, dim(), 1, &w.reason);
+            if live {
+                self.push_row(cx - half, cx + half, y - uu(2, 1), y + uu(3, 2), Choice::AskWant(j as u8));
+            }
+            y += pitch;
+        }
+        y += uu(1, 1);
+        b.text(cx, y, uu(3, 2) as u16, white(), 1, "start");
+        if live {
+            self.push_row(cx - half, cx + half, y - uu(2, 1), y + uu(1, 1), Choice::AskGo);
+        }
         if !region {
             b.disc(cx, cy, r, fill());
         }
@@ -1595,9 +1779,41 @@ impl Map {
                     Some(2) => "in the fleet, waiting for its key",
                     Some(3) => "in the fleet",
                     Some(8) => "leaving the fleet",
+                    // fgtw's verdicts while not yet bound (payloads/fgtw V_*), each its own words: until 2026-11-08 all four read "looking the identity up", forever when offline.
+                    Some(5) => "a new identity: no fleet holds it yet",
+                    Some(6) => "this handle has another identity's fleet",
+                    Some(7) => "no verdict: nothing answers",
                     Some(_) => "looking the identity up",
                 };
                 row(self, b, &mut y, small, white(), state, None);
+                // How this device reaches its fleet (fgtw op 7): the network, when fgtw.org last answered, and the fleet's devices heard on this network.
+                if let Some((up, seed, near)) = f.reach {
+                    let nf = ferros_sys::numbers(Style::Glyphs);
+                    let mut l = Line::new();
+                    if !up {
+                        l.s("offline: no network");
+                    } else {
+                        match seed {
+                            Some(s) => {
+                                l.s("fgtw.org answered ");
+                                let _ = tatau::duration_ns(&mut l, nf, s as u64 * 1_000_000_000, 0);
+                                l.s(" ago");
+                            }
+                            None => {
+                                l.s("network up, fgtw.org has not answered");
+                            }
+                        }
+                    }
+                    row(self, b, &mut y, small, grey(), l.as_str(), None);
+                    let mut l = Line::new();
+                    if near == 0 {
+                        l.s("none of your devices heard nearby");
+                    } else {
+                        let _ = tatau::count(&mut l, nf, near as u64, 0);
+                        l.s(" of your devices heard nearby");
+                    }
+                    row(self, b, &mut y, small, grey(), l.as_str(), None);
+                }
                 for i in 0..f.n {
                     // Each member by the two-word name its fleet knows it by (Photon's Fleet page shows the same one); the key's first four bytes only when the service gave no name.
                     let mut l = Line::new();
@@ -1613,6 +1829,8 @@ impl Map {
                     }
                     if f.me[i] {
                         l.s("  this device");
+                    } else if f.heard[i] {
+                        l.s("  nearby");
                     }
                     row(self, b, &mut y, small, if f.me[i] { white() } else { grey() }, l.as_str(), None);
                 }
@@ -1629,6 +1847,12 @@ impl Map {
                     if f.confirm {
                         b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "wipes from this device: the map's arrangement,");
                         b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "WiFi networks, the last location; not saved");
+                        y += uu(3, 1);
+                    }
+                    // A departure needs one of the fleet's devices to approve, by the network or nearby: with neither, say so before the tap, not after.
+                    if f.reach.is_some_and(|(up, _, near)| !up && near == 0) {
+                        b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "removing needs one of your devices to approve:");
+                        b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "a network, or one of them nearby");
                         y += uu(3, 1);
                     }
                     if f.leave_result.is_some_and(|r| r != 0) {
@@ -1898,6 +2122,45 @@ impl Map {
                 }
                 fact(b, &mut y, "chip", v.as_str());
             }
+            "kists" => {
+                // Each installed kist and what it asked for (owner, 2026-11-08: per kist, its rights, switches), the developer's reason under each; a tap changes the answer for every device of the person's (the list is theirs), and a kist running is killed and started again with the answers as they now stand.
+                let ks = self.kists.kists.clone();
+                if ks.is_empty() {
+                    row(self, b, &mut y, small, grey(), "no kists installed", None);
+                }
+                for (ki, k) in ks.iter().enumerate() {
+                    row(self, b, &mut y, uu(3, 2), white(), &k.name, None);
+                    if k.wants.is_empty() {
+                        row(self, b, &mut y, note, dim(), "asks for nothing", None);
+                    }
+                    for (j, w) in k.wants.iter().enumerate() {
+                        let mut l = Line::new();
+                        let _ = write!(l, "{}: {}", ferros_kist::MEANS[w.right as usize], answer_words(w.answer));
+                        row(self, b, &mut y, small, if w.answer.is_some_and(|a| a.0) { white() } else { grey() }, l.as_str(), Some(Choice::Answer(ki as u8, j as u8)));
+                        y -= uu(3, 4);
+                        row(self, b, &mut y, note, dim(), &w.reason, None);
+                    }
+                    y += uu(1, 1);
+                }
+            }
+            "permissions" => {
+                // Each right the other way round (owner, 2026-11-08: "who has GPS", "who has the network"), with the person's default for every new kist first: what its switch starts at in a first-launch question (out of the box, off).
+                let ks = self.kists.kists.clone();
+                for r in 0..ferros_kist::RIGHTS.len() {
+                    row(self, b, &mut y, uu(3, 2), white(), ferros_kist::MEANS[r], None);
+                    let mut l = Line::new();
+                    let _ = write!(l, "new kists start {}", on_off(self.kists.defaults >> r & 1 == 1));
+                    row(self, b, &mut y, small, grey(), l.as_str(), Some(Choice::Default(r as u8)));
+                    for (ki, k) in ks.iter().enumerate() {
+                        if let Some(j) = k.wants.iter().position(|w| w.right as usize == r) {
+                            let mut l = Line::new();
+                            let _ = write!(l, "{}: {}", k.name, answer_words(k.wants[j].answer));
+                            row(self, b, &mut y, small, if k.wants[j].answer.is_some_and(|a| a.0) { white() } else { grey() }, l.as_str(), Some(Choice::Answer(ki as u8, j as u8)));
+                        }
+                    }
+                    y += uu(1, 1);
+                }
+            }
             _ => {
                 // Developer: the panel's and the sensors' knobs.
                 let spatial = ferros_sys::pref(ferros_sys::PREF_DITHER) == 1;
@@ -2060,7 +2323,7 @@ impl Map {
         let mut l = Line::new();
         let name = |v: View| match v {
             View::Map => ("map", ""),
-            View::Open(i) => ("open: ", CIRCLES[i].label),
+            View::Open(i) => ("open: ", self.label(i)),
         };
         let (a, b) = name(self.view);
         let _ = write!(l, "map: {fingers}-finger tap at {sx},{sy} -> {a}{b}{}\n", if before == self.view { " (no change)" } else { "" });
@@ -2082,7 +2345,20 @@ impl Map {
         };
         match (fingers, self.view) {
             (1, View::Map) => {
+                // A kist installed or removed since: its circle comes or goes before the tap is placed.
+                self.refresh_circles();
                 if let Some(i) = self.hit(sx, sy) {
+                    // A kist circle: launched by init with the person's answers; a want never answered first opens the circle on the question (KISTS.md). The list read again first: another of the person's devices may have answered meanwhile.
+                    if i > 0 {
+                        self.reload_kists();
+                        let Some(k) = self.kist(i) else { return };
+                        if !k.unanswered() {
+                            self.launch(i);
+                            return;
+                        }
+                        // Each unanswered switch starts at the person's default for its right.
+                        self.ask = k.wants.iter().enumerate().fold(0u64, |a, (j, w)| a | ((self.kists.defaults >> w.right & 1) as u64) << j);
+                    }
                     let to = self.at(i);
                     // The view to come back to when it closes.
                     self.back = Some(self.cam);
@@ -2206,6 +2482,43 @@ impl Map {
                             self.pick_scroll = (self.page as i64 * pitch - (bottom - top - pitch) / 2).clamp(0, max);
                         }
                     }
+                    // An answer turned over on the Kists or Permissions page (never answered reads as off: one tap turns it on): kept in the person's list, and the kist, if running, killed and launched again with it.
+                    Some(Choice::Answer(ki, j)) => {
+                        self.reload_kists();
+                        if let Some(w) = self.kists.kists.get_mut(ki as usize).and_then(|k| k.wants.get_mut(j as usize)) {
+                            let on = !w.answer.is_some_and(|a| a.0);
+                            w.answer = Some((on, ferros_detail::eagle_now()));
+                            if self.save_kists() {
+                                self.relaunch(ki as usize);
+                            }
+                        }
+                    }
+                    Some(Choice::Default(r)) => {
+                        self.reload_kists();
+                        self.kists.defaults ^= 1 << r;
+                        self.save_kists();
+                    }
+                    Some(Choice::AskWant(j)) => self.ask ^= 1 << j,
+                    // The question answered: every want it showed gets the switch's answer, kept for the person (asked once, ever); then the circle closes and init launches the kist.
+                    Some(Choice::AskGo) => {
+                        if let View::Open(i) = self.view {
+                            let ask = self.ask;
+                            let now = ferros_detail::eagle_now();
+                            if let Some(k) = i.checked_sub(1).and_then(|k| self.kists.kists.get_mut(k)) {
+                                for (j, w) in k.wants.iter_mut().enumerate() {
+                                    if w.answer.is_none() {
+                                        w.answer = Some((ask >> j & 1 == 1, now));
+                                    }
+                                }
+                            }
+                            if self.save_kists() {
+                                let to = self.back.take().unwrap_or_else(|| self.home());
+                                self.leaving = true;
+                                self.fly(to);
+                                self.launch(i);
+                            }
+                        }
+                    }
                     Some(Choice::Pick(p)) => {
                         self.page = p as usize;
                         self.page_dx = 0;
@@ -2229,6 +2542,15 @@ impl Map {
             }
             _ => {}
         }
+    }
+}
+
+/// A want's answer in words: on, off, or not asked yet (a want added by an update, or never launched).
+fn answer_words(a: Option<(bool, i64)>) -> &'static str {
+    match a {
+        Some((true, _)) => "on",
+        Some((false, _)) => "off",
+        None => "not asked yet",
     }
 }
 
@@ -2265,11 +2587,14 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     let (w, h) = (u16::from_le_bytes([r[0], r[1]]) as i64, u16::from_le_bytes([r[2], r[3]]) as i64);
 
-    // The circles, sized by share and placed once.
-    let rs: [i64; N] = core::array::from_fn(|i| radius_of(CIRCLES[i].share));
-    let mut xs = [0i64; N];
-    let mut ys = [0i64; N];
-    place(&rs, &mut xs, &mut ys);
+    // The circles: settings, then a kist circle for each kist the person installed (their list, `kists.list`; none readable, none shown), sized by share and placed once.
+    let kists = ferros_kist::store::read(cap(grants, S_KIST_LIST)).unwrap_or_default();
+    // WHY: the scene and the arrays hold MAX circles; kists past it get no circle until there is room (the settings' Kists page still lists them).
+    let n = (1 + kists.kists.len()).min(MAX);
+    let rs: [i64; MAX] = core::array::from_fn(|i| if i == 0 { radius_of(CIRCLES[0].share) } else if i < n { radius_of(KIST_SHARE) } else { 0 });
+    let mut xs = [0i64; MAX];
+    let mut ys = [0i64; MAX];
+    place(&rs[..n], &mut xs[..n], &mut ys[..n]);
     let mut map = Map {
         grants,
         display,
@@ -2280,7 +2605,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         rs,
         cam: Cam { x: 0, y: 0, z: 1 << 16, c: ONE, s: 0 },
         view: View::Map,
-        rows: [(0, 0, 0, 0, Choice::Labels); 32],
+        rows: [(0, 0, 0, 0, Choice::Labels); 64],
         page: 0,
         page_dx: 0,
         scroll: 0,
@@ -2314,14 +2639,17 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         pinch: None,
         scale_live: None,
         nrows: 0,
-        rc: [ONE; N],
-        rsn: [0; N],
-        arranged: [false; N],
+        rc: [ONE; MAX],
+        rsn: [0; MAX],
+        arranged: [false; MAX],
         app_front: false,
+        n,
+        kists,
+        ask: 0,
     };
-    let kept = map.load_places();
+    let kept = map.load_places_near();
     // Whatever the vault held, no two circles start overlapping (places kept before circles pushed each other could).
-    map.push_apart(N);
+    map.push_apart(MAX);
     if kept > 0 {
         let mut l = Line::new();
         let _ = write!(l, "map: {kept} circle(s) where the owner put them\n");
@@ -2338,7 +2666,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut saved_view = map.cam;
     // A development build can start arrived at a circle, its page open, without a finger: FERROS_MAP_START=o<n> (circle n).
     if let Some(v) = option_env!("FERROS_MAP_START").map(str::as_bytes) {
-        if v.len() == 2 && (v[1] as usize).wrapping_sub(b'0' as usize) < N {
+        if v.len() == 2 && (v[1] as usize).wrapping_sub(b'0' as usize) < map.n {
             let i = (v[1] - b'0') as usize;
             map.cam = map.at(i);
             map.view = View::Open(i);
@@ -2539,6 +2867,17 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         // FERROS_MAP_START=open (development, measuring the flight with no one at the panel): three seconds after start and every two seconds after, while nothing moves, a tap on the settings circle opens it and the next tap, low at the left outside the open circle, closes it; eight flights.
         // FERROS_MAP_START=outhold: one flight in, then the flight out held at its eighth frame (the camera and the fade where they are, nothing stepped), for a capture of the screen mid-flight.
+        // FERROS_MAP_START=kist (development, the first launch with no one at the panel): three seconds after start a tap on the last kist circle (the newest installed); two seconds on, if the question is up, a tap on its "start".
+        if option_env!("FERROS_MAP_START") == Some("kist") && map.n > 1 && synth_open < 2 && !map.settling && !down && now().wrapping_sub(map_start) > 3 * freq() && now().wrapping_sub(synth_open_at) > 2 * freq() {
+            synth_open += 1;
+            synth_open_at = now();
+            if map.view == View::Map {
+                let (sx, sy) = map.cam.screen(w, h, map.xs[map.n - 1], map.ys[map.n - 1]);
+                map.tap(1, sx, sy);
+            } else if let Some(r) = map.rows[..map.nrows].iter().find(|r| r.4 == Choice::AskGo).copied() {
+                map.tap(1, (r.0 + r.1) / 2, (r.2 + r.3) / 2);
+            }
+        }
         if (option_env!("FERROS_MAP_START") == Some("open") && synth_open < 8 || option_env!("FERROS_MAP_START") == Some("outhold") && synth_open < 2) && !map.settling && !down && now().wrapping_sub(map_start) > 3 * freq() && now().wrapping_sub(synth_open_at) > 2 * freq() {
             synth_open += 1;
             synth_open_at = now();

@@ -17,3 +17,5 @@ ferros_heap = { path = "../../ferros_heap" }
 ferros_ledger = { path = "../../ferros_ledger" }
 libm = "0.2"
 tatau = { path = "../../../tatau" }
+# Kists (KISTS.md): the person's list for the kist circles, the first-launch question and the permission pages.
+ferros_kist = { path = "../../ferros_kist", features = ["process"] }
