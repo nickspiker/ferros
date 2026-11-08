@@ -3513,6 +3513,10 @@ extern "C" fn receive(grants: u64) -> ! {
                     };
                 }
             }
+            // The bottom corners whole, not only their rings (owner, 2026-11-07: the gesture was "finicky"; logged, the touches on the home ring landed below and right of it, at the glass's edge): anywhere in the lower half outside the app's circle is home on the right, back on the left. The corners are the system's (WINDOWS.md).
+            if hit == 0xFF && y > h as f32 * 0.5 && !in_circle(x as i64, y as i64, w as usize, h as usize) {
+                hit = if x > w as f32 * 0.5 { 8 } else { 9 };
+            }
             ferros_sys::reply(&tok, &[hit]);
             continue;
         }
