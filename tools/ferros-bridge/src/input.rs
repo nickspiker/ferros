@@ -93,9 +93,15 @@ fn line(f: u8, a: At, b: At, frames: u32, out: &mut Vec<Event>) {
 /// The panel's width and height from the display server (op 5 through payloads/capture), for the gestures that place two fingers by a radius: a fraction of the width across is that many pixels up and down too.
 fn panel(bridge: &Path) -> (f64, f64) {
     let bin = payload(bridge, "capture");
-    let out = Command::new(bridge).arg("spawn").arg(&bin).args(["05", "--use", "display"]).output().unwrap_or_else(|e| fail(&format!("spawn capture: {e}")));
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let hex: String = text.split("proc: ").nth(1).map(|s| s.chars().take_while(|c| c.is_ascii_hexdigit()).collect()).unwrap_or_default();
+    let answer = |l: &str| !l.is_empty() && l.chars().all(|c| c.is_ascii_hexdigit());
+    // Asked again when another reader took the answer off the console (`spawn`), up to three times.
+    let mut hex = String::new();
+    for _ in 0..3 {
+        if let Some(h) = spawn(bridge, &bin, "05", "panel", &["--use", "display"], 8, answer).into_iter().find(|l| answer(l)) {
+            hex = h;
+            break;
+        }
+    }
     // [w u16][h u16]… little-endian, as hex.
     let byte = |i: usize| hex.get(i * 2..i * 2 + 2).and_then(|h| u8::from_str_radix(h, 16).ok());
     match (byte(0), byte(1), byte(2), byte(3)) {
@@ -184,28 +190,16 @@ fn send(bridge: &Path, s: &Script, doc_as_is: Option<&[u8]>) -> bool {
                 };
                 let bin = inject.get_or_insert_with(|| payload(bridge, "inject")).clone();
                 let hex: String = doc.iter().map(|b| format!("{b:02X}")).collect();
-                let out = Command::new(bridge).arg("spawn").arg(&bin).arg(&hex).args(["--name", "inject", "--use", "touch", "--use", "display"]).output().unwrap_or_else(|e| fail(&format!("spawn: {e}")));
-                let mut said: Vec<String> = lines(&String::from_utf8_lossy(&out.stdout));
-                if !out.status.success() {
-                    eprintln!("{}", String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or(""));
-                    return false;
-                }
-                // The process waits on the display's frames, so the spawn can come back before it is done: its last line is read off the console then, polled until it comes (a frame budget's worth of seconds, plus the idle waits' longest).
+                // A frame budget's worth of seconds, plus the idle waits' longest (1024 frames, under 9 s).
                 let idles = t.events.iter().filter(|e| matches!(e.ev, Ev::Wait { idle: true })).count() as u64;
-                let polls = (t.frames() / 120 + 8 + idles * 9) * 4;
-                for _ in 0..polls {
-                    if said.iter().any(|l| l.starts_with("done") || l.starts_with("refused")) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                    if let Ok(o) = Command::new(bridge).args(["diag", "console"]).output() {
-                        said.extend(lines(&String::from_utf8_lossy(&o.stdout)));
-                    }
-                }
+                let secs = t.frames() / 120 + 8 + idles * 9;
+                let said = spawn(bridge, &bin, &hex, "inject", &["--use", "touch", "--use", "display"], secs, |l| l.starts_with("done") || l.starts_with("refused"));
                 for l in &said {
                     println!("inject: {l}");
                 }
-                if !said.iter().any(|l| l.starts_with("done")) {
+                if said.iter().any(|l| l == GONE) {
+                    println!("inject: whether every event was taken is not known");
+                } else if !said.iter().any(|l| l.starts_with("done")) {
                     if said.is_empty() {
                         println!("inject: no word from the process");
                     }
@@ -217,11 +211,48 @@ fn send(bridge: &Path, s: &Script, doc_as_is: Option<&[u8]>) -> bool {
     true
 }
 
-/// The inject process's own console lines, out of everything the console carried. Reading the console takes every process's lines off it, so the others go to stderr rather than nowhere.
-fn lines(text: &str) -> Vec<String> {
+/// Spawn `bin` named `name` with `input` (hex) and `grants`, and collect its console lines until one satisfies `last`. A process that waits on another (the display's frames, its answer) parks, and the spawn comes back before it is done: the rest is read off the console, a quarter second apart, for up to `secs` seconds.
+fn spawn(bridge: &Path, bin: &Path, input: &str, name: &str, grants: &[&str], secs: u64, last: impl Fn(&str) -> bool) -> Vec<String> {
+    let out = Command::new(bridge).arg("spawn").arg(bin).arg(input).args(["--name", name]).args(grants).output().unwrap_or_else(|e| fail(&format!("spawn: {e}")));
+    if !out.status.success() {
+        fail(&format!("spawn {name}: {}", String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("")));
+    }
+    let mut said = lines(&String::from_utf8_lossy(&out.stdout), name);
+    // The console is one queue for every reader: another session's `diag console` takes these lines off it as readily as this one (2026-11-08, three answers lost while the other agents polled). So the process itself is watched too: once it has ended, one more read, and a missing answer is said to be missing rather than waited on.
+    let tag = format!(" {name} (");
+    for k in 0..secs * 4 {
+        if said.iter().any(|l| last(l)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if let Ok(o) = Command::new(bridge).args(["diag", "console"]).output() {
+            said.extend(lines(&String::from_utf8_lossy(&o.stdout), name));
+        }
+        if k % 4 == 3 && !said.iter().any(|l| last(l)) {
+            let alive = Command::new(bridge).args(["diag", "threads"]).output().map(|o| String::from_utf8_lossy(&o.stdout).contains(&tag)).unwrap_or(true);
+            if !alive {
+                if let Ok(o) = Command::new(bridge).args(["diag", "console"]).output() {
+                    said.extend(lines(&String::from_utf8_lossy(&o.stdout), name));
+                }
+                if !said.iter().any(|l| last(l)) {
+                    said.push(String::from(GONE));
+                }
+                break;
+            }
+        }
+    }
+    said
+}
+
+/// What `spawn` reports for a process that ended with its answer read off the console by someone else.
+const GONE: &str = "ended; its report was taken off the console by another reader";
+
+/// One process's own console lines (the kernel prefixes each with its name), out of everything the console carried. Reading the console takes every process's lines off it, so the others go to stderr rather than nowhere.
+fn lines(text: &str, name: &str) -> Vec<String> {
     let mut own = Vec::new();
+    let tag = format!("{name}: ");
     for l in text.lines() {
-        match l.split("inject: ").nth(1) {
+        match l.split(tag.as_str()).nth(1) {
             Some(s) => own.push(String::from(s)),
             None if l.contains(": ") && !l.starts_with(' ') && !l.starts_with("ALIVE") => eprintln!("console: {l}"),
             None => {}
