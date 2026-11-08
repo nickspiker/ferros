@@ -121,10 +121,15 @@ const SPRING: f64 = core::f64::consts::LN_2;
 
 /// A critically damped spring to 0, `t` display frames after it started at offset `x0` with speed `v0` (a frame): its offset and speed then. x(t) = (x₀ + (v₀ + ωx₀)t)·e^(−ωt): it leaves at v₀ (from rest, easing in) and comes to 0 with every derivative going to 0, passing it at most once.
 fn spring(x0: f64, v0: f64, t: i32) -> (f64, f64) {
+    spring_at(x0, v0, t, SPRING)
+}
+
+/// The critically damped spring at rate `w`: x(t) = (x0 + (v0 + w·x0)·t)·e^(−w·t), and its speed.
+fn spring_at(x0: f64, v0: f64, t: i32, w: f64) -> (f64, f64) {
     let t = t as f64;
-    let e = libm::exp(-SPRING * t);
-    let a = v0 + SPRING * x0;
-    ((x0 + a * t) * e, (v0 - SPRING * a * t) * e)
+    let e = libm::exp(-w * t);
+    let a = v0 + w * x0;
+    ((x0 + a * t) * e, (v0 - w * a * t) * e)
 }
 
 /// The friction on a fling, the plane's pan and a page's scroll alike: true, the owner's pixel a frame per frame that fades out as the fling stops (f = −v/√(1 + v²): 1 at any real speed, so the same reach, v²/2, and easing to nothing at the stop, the algebraic sigmoid, so the stop has no kink); false, the pixel a frame per frame exactly (owner, 2026-11-05), which stops dead (owner, 2026-11-06: "let's try b, but I'ma think we'll go for a at the end"; tried, b was "too slippery" — its friction fades with the speed, so the last pixels creep on — "let's go with a").
@@ -888,7 +893,7 @@ struct Map {
     dys: [i64; 3],
     /// Across: the last three frames' movements, and the strip's spring to its page once the finger lifts: (offset at the start, speed at the start in pixels a frame in `page_dx`'s sense, frames gone); None at rest or under a finger.
     dxs: [i64; 3],
-    spring: Option<(f64, f64, i32)>,
+    spring: Option<(f64, f64, i32, f64)>,
     /// Moving after the finger lifted, and the display's frame count the motion last stepped to (None: the first step is one frame).
     settling: bool,
     frame_seen: Option<u32>,
@@ -2599,20 +2604,20 @@ impl Map {
 
     /// One frame of the strip on its way to its page (`page_dx` to 0; `release_settings` picked the page). The page is a detent and the strip a mass on a critically damped spring to it (`spring`; owner, 2026-11-06: "it's clunky ... just needs some ease"), from the offset and the speed it started with, t in display frames. One curve for every case and smooth in every derivative: it leaves at the finger's speed (from rest, easing in), slides into the page with every derivative going to 0, and momentum heading away coasts out and comes back on the same curve; a flick that would pass the page swings past it once, a little, as a detent does. ω is the halving's rate, ln 2 a frame. Computed from the closed form at each frame count, so a missed frame skips a sample, never the motion. A strip left off its page with no spring (a title tapped, a snap caught and let go) starts one from rest.
     fn step_strip(&mut self) {
-        let (x0, v0, t) = match self.spring {
+        let (x0, v0, t, w) = match self.spring {
             Some(s) => s,
-            None if self.page_dx != 0 => (self.page_dx as f64, 0., 0),
+            None if self.page_dx != 0 => (self.page_dx as f64, 0., 0, SPRING),
             None => return,
         };
         let t = t + 1;
-        let (x, v) = spring(x0, v0, t);
+        let (x, v) = spring_at(x0, v0, t, w);
         // At rest on the page once both the offset and the speed are under half a pixel: nothing more would show.
         if x.abs() < 0.5 && v.abs() < 0.5 {
             self.page_dx = 0;
             self.spring = None;
         } else {
             self.page_dx = libm::round(x) as i64;
-            self.spring = Some((x0, v0, t));
+            self.spring = Some((x0, v0, t, w));
         }
     }
 
@@ -2624,14 +2629,17 @@ impl Map {
             let last = self.dxs.iter().rev().find(|&&d| d != 0).copied().unwrap_or(0);
             let vx = last.signum() * m;
             let rest = self.page_dx + vx.signum() * m * (m + 1) / 2;
-            // The page nearest the resting point: k pages back (positive `page_dx` brings the page before in).
-            let k = (rest + rest.signum() * self.w / 2) / self.w;
+            // The page nearest the resting point, k pages back (positive `page_dx` brings the page before in), and never more than one: left, right or this one (owner, 2026-11-08: "clamp it to one page, no doubles, otherwise it starts to get weird"; a hard fling reached several).
+            let k = ((rest + rest.signum() * self.w / 2) / self.w).signum();
             if k != 0 {
                 self.page = self.wrap(self.page as isize - k as isize);
                 self.page_dx -= k * self.w;
                 self.scroll = 0;
             }
-            self.spring = if self.page_dx != 0 || vx != 0 { Some((self.page_dx as f64, vx as f64, 0)) } else { None };
+            // The spring's rate: the halving's, or, when the strip is already heading for its page faster than that rate would bring it (v0 toward the page above w·|x0|), the rate at which it arrives exactly at the finger's speed: x(t) = (x0 + (v0 + w·x0)·t)·e^(−w·t) crosses the page only where v0 + w·x0 has the opposite sign to x0, so w = −v0/x0 makes the approach a plain decay, never past the page, its speed at release the finger's (owner, 2026-11-08: "it could overshoot when you combine the two and settle").
+            let (x0, v0) = (self.page_dx as f64, vx as f64);
+            let w = if x0 * v0 < 0. { SPRING.max(-v0 / x0) } else { SPRING };
+            self.spring = if self.page_dx != 0 || vx != 0 { Some((x0, v0, 0, w)) } else { None };
         }
         if self.swipe == 2 {
             let m = self.dys.iter().map(|d| d.abs()).max().unwrap_or(0);
