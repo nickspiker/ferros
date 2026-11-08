@@ -640,7 +640,8 @@ fn orb(p: &Prep, x: f32, y: f32, rho2: f32, fs: f32) -> [f32; 3] {
         if n < N_SUM {
             iq = iq + z.scale(wk * (-r2 / 4.).exp());
             // Past |z| = 2 the lattice's extent term is under e⁻²⁵⁶: skipping it shapes nothing.
-            if r2 < 4. {
+            // With no constellation shown (a searching link, its gain 0) the sum is multiplied by 0 at the end, so it is not taken at all: it is the dearest part of an orbit, and the device draws within a budget.
+            if r2 < 4. && p.qam_gain != 0. {
                 qam += wk * p.qam(z);
             }
             wk *= decay;
@@ -744,4 +745,71 @@ pub fn render_row(p: &Prep, r: f32, ss: u32, j: usize, row: &mut [G2t16], text: 
 /// The side of the square `render_row` draws a circle of radius `r` pixels in: 2⌈r⌉ + 4.
 pub fn side(r: f32) -> usize {
     2 * r.ceil() as usize + 4
+}
+
+/// The orb at a lower resolution, for the device (payloads/display's console): its layers worked out on a square grid every `step` pixels (a power of two), each point the composite `orb_under` makes from empty, and read back a row of pixels at a time by `grid_read_row`.
+/// The grid's points sit `step` apart from −half to +half about the circle's centre in both axes, `grid_side` of them a side; half is a whole number of steps at least r + 2 + step, so every pixel within r + 2 of the centre (as far as the vessel draws) has the three points either way that `grid_read_row` takes.
+pub fn grid_half(r: f32, step: f32) -> f32 {
+    step * (((r + 2.) / step).ceil() + 1.)
+}
+
+/// The points a side of the grid for a circle of radius `r` pixels.
+pub fn grid_side(r: f32, step: f32) -> usize {
+    (2. * grid_half(r, step) / step) as usize + 1
+}
+
+/// Fills `out` (`grid_side`² composites, row by row) with the orb's layers for a circle of radius `r` pixels, each point sampled once with the grid's spacing as its footprint.
+/// A point further from the centre than r + 2 + 1.5·step·√2 is left empty and not worked out: no pixel `grid_read_row` serves (within r + 2) reaches it, so the disc's corners cost nothing.
+pub fn grid_fill(p: &Prep, r: f32, step: f32, out: &mut [G2t16]) {
+    let half = grid_half(r, step);
+    let gs = grid_side(r, step);
+    let reach = r + 2. + 1.5 * step * core::f32::consts::SQRT_2;
+    let (fs, px) = (step / r, 1. / r);
+    for gj in 0..gs {
+        for gi in 0..gs {
+            let (u, v) = (gi as f32 * step - half, gj as f32 * step - half);
+            out[gj * gs + gi] = if u * u + v * v > reach * reach { 0 } else { p.orb_under(0, u / r, v / r, fs, px) };
+        }
+    }
+}
+
+/// A row of the orb's composites, `out[i]` at (dx0 + i, dy) pixels from the circle's centre, every |dx| and |dy| at most r + 2, from the grid `grid_fill` made: the quadratic B-spline of the 3 × 3 points about each pixel, its weights (1 − t)²/2, ½ + t(1 − t), t²/2 a side.
+/// The B-spline is C¹ everywhere (a bilinear read would kink at every grid line), and its weights are non-negative and sum to 1, so each field is a convex mix of the points' fields: α stays within 0..=ONE and each premultiplied darkness within its α, which `under_premult` needs.
+/// In fixed point, as two passes: the row's three grid rows mixed down each column first (into `col`, `grid_side` long, the caller's scratch), then each pixel's three columns. A composite's four 16-bit fields ride two to a word in 32-bit lanes (R and B, then α and G); the vertical weights are in 256ths and the horizontal in 128ths, each set summing exactly to its whole, so a lane holds at most 65535 · 256 · 128 < 2³¹ and never carries into the next, and the same integer weights on every field keep darkness within α exactly.
+/// Outside |d| ≤ r + 2 an index runs past the grid and panics: a caller's bug, not a case.
+pub fn grid_read_row(grid: &[G2t16], r: f32, step: f32, dx0: f32, dy: f32, out: &mut [G2t16], col: &mut [[u64; 2]]) {
+    const LANES: u64 = 0x0000_FFFF_0000_FFFF;
+    let half = grid_half(r, step);
+    let gs = grid_side(r, step);
+    // The point at or below f + ½ and the three weights in `one`ths: the outer two rounded, the middle what is left, so they sum to `one` exactly ((1 − t)² + t² ≤ 1, so the middle is never negative).
+    let w = |f: f32, one: f32| {
+        let c = (f + 0.5) as usize;
+        let t = f + 0.5 - c as f32;
+        let w0 = ((1. - t) * (1. - t) * 0.5 * one + 0.5) as u64;
+        let w2 = (t * t * 0.5 * one + 0.5) as u64;
+        (c, [w0, one as u64 - w0 - w2, w2])
+    };
+    let (cy, wy) = w((dy + half) / step, (1 << 8) as f32);
+    let first = w((dx0 + half) / step, 1.).0 - 1;
+    let last = w((dx0 + (out.len() - 1) as f32 + half) / step, 1.).0 + 1;
+    for gi in first..=last {
+        let (mut a, mut b) = (0u64, 0u64);
+        for (j, &k) in wy.iter().enumerate() {
+            let g = grid[(cy + j - 1) * gs + gi];
+            a += (g & LANES) * k;
+            b += (g >> 16 & LANES) * k;
+        }
+        col[gi] = [a, b];
+    }
+    for (i, o) in out.iter_mut().enumerate() {
+        let (cx, wx) = w((dx0 + i as f32 + half) / step, (1 << 7) as f32);
+        let (mut a, mut b) = (0u64, 0u64);
+        for (k, &q) in wx.iter().enumerate() {
+            let [ca, cb] = col[cx + k - 1];
+            a += ca * q;
+            b += cb * q;
+        }
+        // Each lane's 2¹⁵ of weight shifted out; the high lane's dropped bits land in 17-31, which the mask clears.
+        *o = (b >> 15 & LANES) << 16 | (a >> 15 & LANES);
+    }
 }

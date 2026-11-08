@@ -2759,11 +2759,11 @@ impl vsf::container::ByteSource for VaultSource {
 }
 
 /// The person's own wallpaper (`map.wallpaper` in their space: a VSF visual, one plane of VSF RGB gamma2tanh codes at 16 bits, planar [3, height, width], as tools/wallpaper and tools/screencap write one) into `WALL_BUF`, if they set one; whether it did. vsf's container locates the plane over the vault (`VaultSource`) and reads it a band of rows a channel at a time, so nothing of its size passes through the heap; each code becomes a working value by the display's own g2t table (`G2T16_Q14`).
-fn wall_own(grants: u64, width: usize, height: usize) -> bool {
+fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> bool {
     let c = cap(grants, S_MAP_SCOPE);
-    let Some(len) = ferros_sys::store_get(c, b"wallpaper", &mut []) else { return false };
+    let Some(len) = ferros_sys::store_get(c, key, &mut []) else { return false };
     let mut l = Log { grants, buf: [0; 256], n: 0 };
-    let doc = match vsf::container::Document::open(VaultSource { cap: c, key: b"wallpaper", len: len as u64 }) {
+    let doc = match vsf::container::Document::open(VaultSource { cap: c, key, len: len as u64 }) {
         Ok(d) => d,
         Err(_) => {
             l.s(b"display: the person's own wallpaper is not a VSF document; theirs from the seed shows\n");
@@ -2969,8 +2969,147 @@ const VESSEL_LAMBDA: f32 = 0.0126;
 const VESSEL_SHARP: f32 = 1.0 / (1 << 2) as f32;
 const VESSEL_SEP: f32 = 0.018 * core::f32::consts::SQRT_2;
 
+/// The orbs' grid spacing, pixels: a radio's orb is worked out at every other pixel and read back smoothly a row at a time (`orb::look::grid_read_row`, a C¹ B-spline), a quarter of the work of every pixel. At one sample a pixel the six orbs took 40 ms on the desktop (2026-11-07), and the device's cores are slower.
+const ORB_STEP: f32 = (1 << 1) as f32;
+
+/// Each radio's orb grid, in the facts' radio order (cellular, WiFi, Bluetooth, NFC, GPS, USB): the key of the inputs it was made from (u64::MAX none yet), its base in the console worker's arena (1 none), and its points.
+/// Allocated at the worker's first draw and kept below the arena's mark, so a redraw for the clock or the battery reuses every orb, and a radio's orb is made again only when its own measures change. Non-zero initialisers (see `ALLOC`).
+static mut ORB_GRIDS: [(u64, usize, usize); 6] = [(u64::MAX, 1, 1); 6];
+/// The orbs made since the last report, and their time (µs).
+static mut ORB_MADE: [u64; 2] = [0; 2];
+/// The vessels' pixels drawn since the last report, their time (µs): the circles without an orb, and with one (rings, the orb read from its grid, body).
+static mut VESSEL_US: [u64; 2] = [1; 2];
+/// The worker's arena at its fullest since the last report, bytes.
+static mut CON_PEAK: usize = 1;
+
+/// A corner's radio, in the facts' order (facts 33 + 8 · radio): cellular, WiFi, Bluetooth, NFC, GPS, USB.
+fn radio_of(what: Corner) -> Option<usize> {
+    match what {
+        Corner::Cellular => Some(0),
+        Corner::Wifi => Some(1),
+        Corner::Bluetooth => Some(2),
+        Corner::Nfc => Some(3),
+        Corner::Gps => Some(4),
+        Corner::Usb => Some(5),
+        _ => None,
+    }
+}
+
+/// A live radio's orb (owner, 2026-11-07: the circles' orbs drawn from the radios' live measures, by tools/orb-tune's maths): the `orb` crate's knobs from the driver's measures (`ms`, its eight slots), as orb-tune's sliders read them.
+/// A measure the driver does not publish keeps orb-tune's own starting value (`orb::Look::new`: SNR 30 dB, signal −55 dBm, noise floor −92 dBm, the middle band, the radio's typical channel width and constellation, delay spread 32 ns, no loss), unless the radio's kind says better (below). Not animated: frame 0.
+/// The meaning of each knob: SNR the bulb's depth (how firmly orbits settle, and the constellation's sharpness); the signal the orb's light (a stop every 10 dB); the noise floor its turbulence and the grain in its hue; the band a small turn of its hue; the channel's width how far the I/Q phase swings the hue; the period (the bulb's arms) the spatial streams; loss the sparks; delay spread the multipath fringes.
+fn orb_look(ri: usize, ms: &[u64], state: i64) -> orb::Look {
+    use ferros_sys::measure as k;
+    let get = |kind: u16| ms.iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == kind).map(|m| m.1);
+    // A measure in thousandths (milli-dBm, milli-dB, kHz) in its whole unit (dBm, dB, MHz).
+    let milli = |kind: u16| get(kind).map(|v| v as f32 * (1.0 / 1000.0));
+    // orb-tune's radios: WiFi 0, LTE 1, NR 2, Bluetooth 3, NFC 4, GPS 5, USB 6; cellular is LTE unless the modem says NR.
+    let radio = match ri {
+        0 if get(k::TECH) == Some(ferros_sys::TECH_NR as i64) => 2,
+        0 => 1,
+        1 => 0,
+        2 => 3,
+        3 => 4,
+        4 => orb::GPS,
+        _ => 6,
+    };
+    let mut l = orb::Look::new(radio);
+    l.orb = true;
+    l.frame = 0;
+    // Connected (2) or up and searching (1); a live radio with no word yet is searching.
+    l.state = if state == 2 { 2 } else { 1 };
+    match ri {
+        0 => {
+            // Cellular: RSSI the light, or RSRP 32 dB up (a 20 MHz carrier's 1200 subcarriers, fully loaded, are 10·log₁₀ 1200 = 30.8 dB over one), else −90 dBm. SNR as it is, else 10 dB. RSRQ (−3 dB a clean cell, −20 a loaded or interfered one) is the roughness: the noise floor −100 dBm at −3 dB, 2 dB up for each dB worse, else RSRQ −10 dB. Streams by technology: LTE 2 × 2, NR 4 × 4 (husky's NR receive). The channel width and constellation orb-tune's typical ones (LTE 20 MHz 64-QAM, NR 100 MHz 256-QAM): the modem publishes neither. Delay spread 256 ns, an urban macro cell's.
+            l.rssi_dbm = milli(k::RSSI).or(milli(k::RSRP).map(|v| v + (1 << 5) as f32)).unwrap_or(-90.0);
+            l.snr_db = milli(k::SNR).unwrap_or(10.0);
+            l.noise_dbm = -100.0 + (1 << 1) as f32 * (-3.0 - milli(k::RSRQ).unwrap_or(-10.0));
+            l.period = if radio == 2 { 4 } else { 2 };
+            l.delay_ns = (1 << 8) as f32;
+        }
+        1 => {
+            // WiFi: RSSI and the noise floor as they are (else −60 and −92 dBm), SNR as published (else their difference). The band from the centre frequency: 2.4 GHz (under 3 GHz) 0, 5 GHz 1, 6 GHz (from 5925 MHz) 2. The width from BANDWIDTH (else 80 MHz). The streams from the rate's spectral efficiency: one stream carries at most about 8 bit/s/Hz (1024-QAM at 5/6), so one more arm for each 8 the rate shows over the width (else 2, husky's 2 × 2). Loss from LOSS (parts per million to per cent). Delay spread 32 ns, indoors.
+            let rssi = milli(k::RSSI).unwrap_or(-60.0);
+            let noise = milli(k::NOISE).unwrap_or(-92.0);
+            l.rssi_dbm = rssi;
+            l.noise_dbm = noise;
+            l.snr_db = milli(k::SNR).unwrap_or(rssi - noise);
+            l.band = match get(k::FREQ) {
+                Some(f) if f < 3_000_000 => 0,
+                Some(f) if f < 5_925_000 => 1,
+                Some(_) => 2,
+                None => 1,
+            };
+            let bw = milli(k::BANDWIDTH).unwrap_or(80.0);
+            l.bw_log2 = libm::log2f(bw);
+            // WHY the min: a period is a count of the bulb's arms, and the driver's rate is external input; past 8 (orb-tune's top) a bulb is under a pixel at the console's size, and a misread rate (a counter in the wrong unit) would ask for hundreds, each a Newton solve of 2⁶ · 2⁵ · p steps.
+            l.period = match get(k::RATE_DOWN) {
+                Some(rate) => (1 + (rate as f32 / (bw * 1_000_000.0) * (1.0 / (1 << 3) as f32)) as u32).min(8),
+                None => 2,
+            };
+            l.loss_pct = get(k::LOSS).map_or(0.0, |v| v as f32 * (1.0 / 10_000.0));
+            l.delay_ns = (1 << 5) as f32;
+        }
+        2 => {
+            // Bluetooth: the beacon's own transmit power is the only level the driver has, so the light is that 64 dB down (0 dBm out shows as a −64 dBm link); no beacon going out, −80 dBm, dim. One stream.
+            l.rssi_dbm = milli(k::TX_POWER).map_or(-80.0, |tx| tx - (1 << 6) as f32);
+            l.period = 1;
+        }
+        3 => {
+            // NFC: a card's field present (STATE 2) is the strongest link the device has, −44 dBm; polling (its 13.56 MHz carrier published) −60; up and idle −76. One stream, and no multipath in the near field.
+            l.rssi_dbm = if state == 2 { -44.0 } else if get(k::FREQ).is_some() { -60.0 } else { -76.0 };
+            l.period = 1;
+            l.delay_ns = 0.0;
+        }
+        4 => {
+            // GPS: the sky dome with no satellites (the driver does not decode them yet): searching the dome alone, fixed a round knot whose RMS radius is the error estimate (ACCURACY, mm; else 32 m).
+            l.sats = [0; 6];
+            l.used = 0;
+            l.herr_m = milli(k::ACCURACY).unwrap_or((1 << 5) as f32);
+        }
+        _ => {
+            // USB: a wire, so a strong clean link (−44 dBm, SNR 40 dB, noise floor −100 dBm, no multipath); the streams by the signalling rate, one arm up to USB 2's 480 Mb/s and one more each time it doubles from 5 Gb/s (USB 3 5 Gb/s two, 10 Gb/s three, 20 Gb/s four).
+            l.rssi_dbm = -44.0;
+            l.snr_db = 40.0;
+            l.noise_dbm = -100.0;
+            l.delay_ns = 0.0;
+            let mut p = 1;
+            let mut rate = get(k::RATE_DOWN).unwrap_or(0);
+            while rate >= 5_000_000_000 {
+                p += 1;
+                rate >>= 1;
+            }
+            l.period = p;
+        }
+    }
+    l
+}
+
+/// An orb's inputs and its circle's radius, hashed: its grid is made again only when this changes.
+fn orb_key(l: &orb::Look, r: f32) -> u64 {
+    let mut h = 0u64;
+    let words = [l.radio as u64, l.state as u64, l.period as u64, l.band as u64, l.qam_bits as u64, l.snr_db.to_bits() as u64, l.rssi_dbm.to_bits() as u64, l.noise_dbm.to_bits() as u64, l.bw_log2.to_bits() as u64, l.loss_pct.to_bits() as u64, l.delay_ns.to_bits() as u64, l.herr_m.to_bits() as u64, r.to_bits() as u64];
+    for w in words {
+        h = (h.rotate_left(7) ^ w).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    h
+}
+
 fn console_draw(width: usize, height: usize, force: bool) -> bool {
     use fluor::pixel::{Blend, BlendMode};
+    // The orbs' grids, once: at the worker's first draw, before anything of the draw is allocated (the arena was reset to its mark after the last), a grid for each radio circle of the console from the worker's arena, then the mark moved above them so the reset after every draw keeps them.
+    unsafe {
+        if ORB_GRIDS.map(|g| g.1).iter().all(|&b| b == 1) {
+            let (circles, n) = corner_layout(width, height);
+            for &(_, y, r, what) in &circles[..n] {
+                if let (Some(ri), true) = (radio_of(what), y < height as f32 * 0.5) {
+                    let gs = orb::look::grid_side(r, ORB_STEP);
+                    ORB_GRIDS[ri] = (u64::MAX, alloc::vec![0u64; gs * gs].leak().as_mut_ptr() as usize, gs * gs);
+                }
+            }
+            CON_HEAP.mark();
+        }
+    }
     let mut tb = [0u8; 32];
     let t_cs = ferros_sys::now();
     let (_, _, tn, _, _) = clock_state(&mut tb);
@@ -3066,15 +3205,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             Corner::Home | Corner::Back | Corner::Spare => false,
         };
         // The radio's measures, as its driver published them (facts 33 + 8 · radio): every one shown as itself, in its unit, a line each; none folded into a level, no bars (owner, 2026-11-03).
-        let radio = match what {
-            Corner::Cellular => Some(0),
-            Corner::Wifi => Some(1),
-            Corner::Bluetooth => Some(2),
-            Corner::Nfc => Some(3),
-            Corner::Gps => Some(4),
-            Corner::Usb => Some(5),
-            _ => None,
-        };
+        let radio = radio_of(what);
         // The radio's state as its driver says it (measure STATE): connected the flavour's full colour, up and searching one stop darker.
         let state = radio.and_then(|ri: usize| facts[33 + 8 * ri..41 + 8 * ri].iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::STATE).map(|m| m.1));
         // Switched off by a tap (preference 15, the radios' bits in facts 32's order; USB is no switch).
@@ -3148,32 +3279,16 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 Corner::Home | Corner::Back | Corner::Spare => "",
             };
             if what == Corner::Gps {
-                // GPS switched off shows its symbol, not its name (owner, 2026-11-07: "the classic teardrop with a hole punch"): a map pin, the convex hull of a round head and the tip below it (its sides the tangents from the tip), a hole through the head's centre, in the ink, its edge the C∞ step across two pixels. By its signed distance, so it is sharp at any size.
-                let (a, l, hole) = (r * 0.3, r * 0.6, r * 0.12);
+                // GPS switched off shows its symbol, not its name (owner, 2026-11-07: "the classic teardrop with a hole punch"): a map pin, the convex hull of a round head and the tip below it (its sides the tangents from the tip), a hole through the head's centre, in the ink, its edge the C∞ step across two pixels. By its signed distance (the orb crate's `pin_sd`, in the circle's radius, the one tools/orb-tune draws), so it is sharp at any size.
+                let (a, l) = (r * 0.3, r * 0.6);
                 // The head's centre, so the pin from the head's top to the tip sits centred in the circle.
                 let (cx, cy) = (x, y - (l - a) * 0.5);
-                // The tangent point on the head (right side; the pin is symmetric): the angle α from the downward axis with cos α = a / l.
-                let (ca, sa) = (a / l, libm::sqrtf(1.0 - (a / l) * (a / l)));
-                let (kx, ky) = (a * sa, a * ca);
-                let (tlen, dirx, diry) = { let (vx, vy) = (-kx, l - ky); let m = libm::sqrtf(vx * vx + vy * vy); (m, vx / m, vy / m) };
-                let pin = |qx: f32, qy: f32| -> f32 {
-                    let (qx, qy) = (libm::fabsf(qx), qy);
-                    let s = (qx - kx) * dirx + (qy - ky) * diry;
-                    let body = if s <= 0.0 {
-                        libm::sqrtf(qx * qx + qy * qy) - a
-                    } else if s >= tlen {
-                        libm::sqrtf(qx * qx + (qy - l) * (qy - l))
-                    } else {
-                        (qx - kx) * sa + (qy - ky) * ca
-                    };
-                    // The hole punched out of the head.
-                    body.max(hole - libm::sqrtf(qx * qx + qy * qy))
-                };
                 let (x0, x1, y0, y1) = ((cx - a - 2.0) as i64, (cx + a + 2.0) as i64, (cy - a - 2.0) as i64, (cy + l + 2.0) as i64);
                 for py in y0..=y1 {
                     for px in x0..=x1 {
                         let Some(i) = at(px, py) else { continue };
-                        let cov = draw::bump_step((1.0 - pin(px as f32 + 0.5 - cx, py as f32 + 0.5 - cy)) * 0.5);
+                        let sd = orb::sky::pin_sd((px as f32 + 0.5 - x) / r, (py as f32 + 0.5 - y) / r) * r;
+                        let cov = draw::bump_step((1.0 - sd) * 0.5);
                         console[i] = console[i].under(ink | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
                     }
                 }
@@ -3262,48 +3377,66 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 }
             }
         }
-        // Then the vessel, under its text (tools/orb-tune `sample`, its defaults; owner, 2026-11-07: Lumis's camera-picker button made round): each channel of the fill a ring of its own at its own depth from the edge (blue outermost, red innermost: a prism; a channel the fill does not have draws nothing), Lumis's shape made smooth (a cliff on its outer side, a tail e-folding every λ on its inner) widened by the pixel's footprint, cut by a logistic at the circle's edge so nothing is drawn outside; then under them the body, the fill four stops darker, opaque but for a sixteenth, rising by a logistic under the green ring. Between the edge and the body the scene shows through. Every term C∞.
+        // Then the vessel, under its text (the orb crate's `Vessel`, tools/orb-tune's defaults; owner, 2026-11-07: Lumis's camera-picker button made round): each channel of the fill a ring of its own at its own depth from the edge (blue outermost, red innermost: a prism; a channel the fill does not have draws nothing), Lumis's shape made smooth (a cliff on its outer side, a tail e-folding every λ on its inner) widened by the pixel's footprint, cut by a logistic at the circle's edge so nothing is drawn outside; then under them the body, the fill four stops darker, opaque but for a sixteenth, rising by a logistic under the green ring. Between the edge and the body the scene shows through. Every term C∞.
         let fl = [fill.0, fill.1, fill.2].map(|v| { let c = v * (1.0 / 16384.0); c * c });
-        let sep = VESSEL_SEP;
-        let ring_d = [VESSEL_DEPTH + sep * 0.5, VESSEL_DEPTH, VESSEL_DEPTH - sep];
+        let vessel = orb::Vessel::new(fl, VESSEL_DEPTH, VESSEL_LAMBDA, VESSEL_SHARP, VESSEL_SEP, 0.0, 4.0);
         let fs = 1.0 / r;
-        // The footprint's box (variance fs²/12) widens λ, the ring's light kept, and s, so the cliff is never under a pixel.
-        let le = libm::sqrtf(VESSEL_LAMBDA * VESSEL_LAMBDA + fs * fs * (1.0 / 12.0));
-        let s = libm::sqrtf(VESSEL_SHARP * VESSEL_SHARP + fs * fs / (le * le * 12.0));
-        let ew = libm::sqrtf(fs * fs + VESSEL_LAMBDA * VESSEL_LAMBDA * (1.0 / (1 << 6) as f32));
-        let body_l = fl.map(|v| v * (1.0 / (1 << 4) as f32));
-        let body = g2t_colour((libm::sqrtf(body_l[0]) * 16384.0, libm::sqrtf(body_l[1]) * 16384.0, libm::sqrtf(body_l[2]) * 16384.0));
         // The vessel depends on the distance from the centre alone, so its two layers (the rings, the body) are worked out once a draw for each sixteenth of a pixel of radius, and each pixel is then a root and a lookup. Worked out per pixel, the transcendentals cost 33 ms a console draw (2026-11-07, measured), a stutter at every battery reading.
         const SUB: f32 = (1 << 4) as f32;
         let n = ((r + 2.0) * SUB) as usize;
         let mut lut = alloc::vec![(0u64, 0u64); n];
         for (j, e) in lut.iter_mut().enumerate() {
-            let d = 1.0 - (j as f32 + 0.5) * (1.0 / SUB) * fs;
-            let edge = 1.0 / (1.0 + libm::expf(-d * 2.0 / ew));
-            let amp = VESSEL_LAMBDA / le * edge;
-            // Each ring's light as its g2t code (tanh √L), and the layer's α as t₀ + (1 − t₀)(t₁ + (1 − t₁)t₂) (every term non-negative: the product form cancels in f32 on a ring's faint tail and leaves α 0 beside light); each channel's colour t/α, darkness its complement. No light: α 0, t/α NaN, which the cast takes to 0.
-            let t = [0, 1, 2].map(|c| {
-                let t = (ring_d[c] - d) / le;
-                libm::tanhf(libm::sqrtf(fl[c] * amp * libm::expf(-s * (libm::expf(t / s) - 1.0 - t / s))))
-            });
-            let a = t[0] + (1.0 - t[0]) * (t[1] + (1.0 - t[1]) * t[2]);
-            let dark = |v: f32| 65535 - (v / a * 65535.0) as u64;
-            let ring = ((a * 65535.0) as u64) << 48 | dark(t[0]) << 32 | dark(t[1]) << 16 | dark(t[2]);
-            let body_a = (1.0 - 1.0 / (1 << 4) as f32) / (1.0 + libm::expf(-(d - VESSEL_DEPTH) * 2.0 / le));
-            *e = (ring, body | ((body_a * 65535.0) as u64) << 48);
+            *e = vessel.at(1.0 - (j as f32 + 0.5) * (1.0 / SUB) * fs, fs);
         }
+        // The orb, between the rings and the body as tools/orb-tune layers it (the rings are the glass, in front), on a live radio not switched off: its grid made again only when its measures changed (`ORB_GRIDS`), each pixel read from it. A circle with text (off, or no radio) has none, so the text and the orb never meet.
+        let orb_grid: Option<&[u64]> = match radio {
+            Some(ri) if live && !switched_off => unsafe {
+                let (key, base, len) = ORB_GRIDS[ri];
+                if base == 1 {
+                    None
+                } else {
+                    let look = orb_look(ri, &facts[33 + 8 * ri..41 + 8 * ri], state.unwrap_or(1));
+                    let grid = core::slice::from_raw_parts_mut(base as *mut u64, len);
+                    let k = orb_key(&look, r);
+                    if k != key {
+                        let t_orb = ferros_sys::now();
+                        orb::look::grid_fill(&orb::Prep::new(&look), r, ORB_STEP, grid);
+                        ORB_GRIDS[ri].0 = k;
+                        ORB_MADE[0] += ferros_sys::us_since(t_orb);
+                        ORB_MADE[1] += 1;
+                    }
+                    Some(&*grid)
+                }
+            },
+            _ => None,
+        };
+        let t_ves = ferros_sys::now();
         let (x0, x1, y0, y1) = ((x - r - 1.0) as i64, (x + r + 1.0) as i64, (y - r - 1.0) as i64, (y + r + 1.0) as i64);
+        // The orb's row (its composites across the box, read from the grid a row at a time) and the read's column scratch, from the worker's arena for this draw.
+        let mut orb_row = alloc::vec![0u64; if orb_grid.is_some() { (x1 - x0 + 1) as usize } else { 0 }];
+        let mut orb_col = alloc::vec![[0u64; 2]; if orb_grid.is_some() { orb::look::grid_side(r, ORB_STEP) } else { 0 }];
         for py in y0..=y1 {
+            let dy = py as f32 + 0.5 - y;
+            if let Some(g) = orb_grid {
+                // Every pixel of the box is within r + 1.5 of the centre in each axis, which is all `grid_read_row` asks.
+                orb::look::grid_read_row(g, r, ORB_STEP, x0 as f32 + 0.5 - x, dy, &mut orb_row, &mut orb_col);
+            }
             for px in x0..=x1 {
                 let Some(i) = at(px, py) else { continue };
-                let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
+                let dx = px as f32 + 0.5 - x;
                 // The box's corners lie past r + 2 (outside the circle, where the vessel is nothing): their entries are past the table's end.
                 let Some(&(ring, body)) = lut.get((libm::sqrtf(dx * dx + dy * dy) * SUB) as usize) else { continue };
-                console[i] = console[i].under(ring, BlendMode::Normal).under(body, BlendMode::Normal);
+                let mut c = console[i].under(ring, BlendMode::Normal);
+                if orb_grid.is_some() {
+                    c = c.under_premult(orb_row[(px - x0) as usize], BlendMode::Normal);
+                }
+                console[i] = c.under(body, BlendMode::Normal);
             }
         }
+        unsafe { VESSEL_US[orb_grid.is_some() as usize] += ferros_sys::us_since(t_ves) };
     }
-    // The worker's own heap: this draw's tables and glyphs gone (`CON_HEAP`, the render thread's bump untouched).
+    // The worker's own heap: this draw's tables and glyphs gone (`CON_HEAP`, the render thread's bump untouched). Measured first: the most it held (the orbs' grids below its mark included).
+    unsafe { CON_PEAK = CON_PEAK.max(CON_HEAP.used()) };
     CON_HEAP.reset();
     unsafe {
         CONSOLE_US[0] += ferros_sys::us_since(t_draw);
@@ -3317,10 +3450,24 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 l.s(name);
                 l.dec(CONSOLE_WHY[j] as u64);
             }
-            l.s(b"\n");
+            // The orbs made again (a radio's measures changed), their time, and the worker's arena at its fullest.
+            l.s(b"; orbs ");
+            l.dec(ORB_MADE[1]);
+            l.s(b" in ");
+            l.dec(ORB_MADE[0]);
+            l.s(b" us; vessels ");
+            l.dec(VESSEL_US[0] / 32);
+            l.s(b" + ");
+            l.dec(VESSEL_US[1] / 32);
+            l.s(b" us a draw; arena ");
+            l.dec(CON_PEAK as u64 >> 10);
+            l.s(b" KiB\n");
             l.flush();
             CONSOLE_US = [0; 2];
             CONSOLE_WHY = [0; 5];
+            ORB_MADE = [0; 2];
+            VESSEL_US = [0; 2];
+            CON_PEAK = 1;
         }
     }
     true
@@ -4485,13 +4632,25 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         let mut seed = [0u8; 32];
                         seed.copy_from_slice(&m[1..33]);
                         unsafe { WALL_ON = false };
-                        if wall_own(grants, width, height) {
+                        if wall_own(grants, width, height, b"wallpaper") {
                             console(grants, b"display: wallpaper: the person's own\n");
                             wall_ready(width, height);
+                        } else if wall_own(grants, width, height, b"wallpaper.made") {
+                            // Made once on this device from their seed and kept (payloads/wallgen; owner, 2026-11-07: not drawn again at every attest).
+                            console(grants, b"display: wallpaper: the person's, kept on this device\n");
+                            wall_ready(width, height);
                         } else {
+                            // Not made on this device yet: drawn here meanwhile, while wallgen makes and keeps it (it says when, op 44).
                             console(grants, b"display: wallpaper: made from the person's seed\n");
                             unsafe { WALL_PENDING = Some(seed) };
                         }
+                    }
+                }
+                // 44 `wallpaper kept`: wallgen has made the person's wallpaper and kept it on this device (`map.wallpaper.made`): shown from there, unless their own is set, or this display is still drawing the same picture itself (its threads write the buffer; it finishes with what wallgen made).
+                Some(44) => {
+                    if unsafe { WALL_BUF != 0 && !WALL_RUNNING } && !wall_own(grants, width, height, b"wallpaper") && wall_own(grants, width, height, b"wallpaper.made") {
+                        console(grants, b"display: wallpaper: the person's, kept on this device\n");
+                        wall_ready(width, height);
                     }
                 }
                 Some(30) => {
