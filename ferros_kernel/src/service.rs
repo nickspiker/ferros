@@ -1532,7 +1532,8 @@ pub fn run(mut b: Boot) -> ! {
         // A launch of Android the `android` switch accepted: the gate's Android path, as `diag android` takes it. The person is checked again here; the reset scrubs ferros's memory on its way (platform::before_reset).
         #[cfg(not(shim_handoff))]
         if ANDROID_REQ.swap(false, core::sync::atomic::Ordering::AcqRel) && unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).is_some_and(|s| s.unlocked()) {
-            let r = crate::slot::set_active(0);
+            // Under the kernel lock, as every UFS command (devinfo is written while processes still run).
+            let r = crate::process::with_lock(|| crate::slot::set_active(0));
             unsafe {
                 let p = 0xFD60_0FF8usize as *mut u64;
                 core::ptr::write_volatile(p, 0x414E_4452_4F49_4431);
@@ -1760,49 +1761,55 @@ pub fn run(mut b: Boot) -> ! {
                     // Hex dump of UFS blocks: `diag lun <lun> <first lba> <count>`, non-zero 16-byte rows only (LU3: devinfo LBA 6, pinfo 8, blenv 10; LU0 partitions at the LBAs `diag ufsdesc` prints) — for finding where the bootloader keeps the active slot besides devinfo (2026-10-17). devinfo carries the device's identity (serials, IMEIs, MACs): don't paste it anywhere.
                     let mut it = cmd.params[4..].split(|&c| c == b' ').filter_map(|t| core::str::from_utf8(t).ok()?.parse::<u32>().ok());
                     let (lun, first, count) = (it.next().unwrap_or(3).min(7) as u8, it.next().unwrap_or(6), it.next().unwrap_or(1).min(8));
-                    let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
-                    let hex = b"0123456789ABCDEF";
-                    for lba in first..first + count {
-                        let mut ok = false;
-                        for _ in 0..4 {
-                            if ufs.read_block_lun(lun, lba) == 0 && ufs.last_response_status() == 0 {
-                                ok = true;
-                                break;
-                            }
-                        }
-                        resp.extend_from_slice(alloc::format!("LBA {lba}{}\n", if ok { "" } else { " unreadable" }).as_bytes());
-                        if !ok {
-                            continue;
-                        }
-                        let b = ufs.data_buffer();
-                        for (i, row) in b.chunks(16).enumerate() {
-                            if row.iter().any(|&x| x != 0) {
-                                resp.extend_from_slice(alloc::format!("  {:04X}:", i * 16).as_bytes());
-                                for &x in row {
-                                    resp.push(b' ');
-                                    resp.push(hex[(x >> 4) as usize]);
-                                    resp.push(hex[(x & 15) as usize]);
+                    // Under the kernel lock, as every UFS command: processes on the other cores drive the flash too (the vault process's blocks, the partitions' readers).
+                    crate::process::with_lock(|| {
+                        let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                        let hex = b"0123456789ABCDEF";
+                        for lba in first..first + count {
+                            let mut ok = false;
+                            for _ in 0..4 {
+                                if ufs.read_block_lun(lun, lba) == 0 && ufs.last_response_status() == 0 {
+                                    ok = true;
+                                    break;
                                 }
-                                resp.push(b'\n');
+                            }
+                            resp.extend_from_slice(alloc::format!("LBA {lba}{}\n", if ok { "" } else { " unreadable" }).as_bytes());
+                            if !ok {
+                                continue;
+                            }
+                            let b = ufs.data_buffer();
+                            for (i, row) in b.chunks(16).enumerate() {
+                                if row.iter().any(|&x| x != 0) {
+                                    resp.extend_from_slice(alloc::format!("  {:04X}:", i * 16).as_bytes());
+                                    for &x in row {
+                                        resp.push(b' ');
+                                        resp.push(hex[(x >> 4) as usize]);
+                                        resp.push(hex[(x & 15) as usize]);
+                                    }
+                                    resp.push(b'\n');
+                                }
                             }
                         }
-                    }
+                    });
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
                 if cmd.params.starts_with(b"bootlun ") {
                     // `diag bootlun <1|2>`: write the UFS device's bBootLunEn attribute (1 = Boot LU A, 2 = Boot LU B) and read it back. The ROM boots the bootloader chain from that LU, and the bootloader's "boot slot" follows the LU's letter before devinfo is read (its log: "ufshc: bBootLunEn 0x2" then "boot slot: b"; devinfo's active flag gets re-synced to it). Only 1 or 2 are accepted: 0 disables boot.
-                    let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
-                    let before = ufs.read_attribute(0x00, 0);
-                    let want = cmd.params[8..].first().map(|&c| c.wrapping_sub(b'0') as u32);
-                    let line = match want {
-                        Some(v @ 1..=2) => {
-                            let ok = ufs.write_attribute(0x00, 0, v);
-                            alloc::format!("bBootLunEn before {before:?}, write {v}: {}, after {:?}\n", if ok { "accepted" } else { "REFUSED" }, ufs.read_attribute(0x00, 0))
-                        }
-                        _ => alloc::format!("bBootLunEn {before:?}; only 1 or 2 may be written\n"),
-                    };
-                    resp.extend_from_slice(line.as_bytes());
+                    // Under the kernel lock, as every UFS command: processes on the other cores drive the flash too (the vault process's blocks, the partitions' readers).
+                    crate::process::with_lock(|| {
+                        let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                        let before = ufs.read_attribute(0x00, 0);
+                        let want = cmd.params[8..].first().map(|&c| c.wrapping_sub(b'0') as u32);
+                        let line = match want {
+                            Some(v @ 1..=2) => {
+                                let ok = ufs.write_attribute(0x00, 0, v);
+                                alloc::format!("bBootLunEn before {before:?}, write {v}: {}, after {:?}\n", if ok { "accepted" } else { "REFUSED" }, ufs.read_attribute(0x00, 0))
+                            }
+                            _ => alloc::format!("bBootLunEn {before:?}; only 1 or 2 may be written\n"),
+                        };
+                        resp.extend_from_slice(line.as_bytes());
+                    });
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
@@ -1816,7 +1823,7 @@ pub fn run(mut b: Boot) -> ! {
                         continue;
                     }
                     // The gate's Android path from the host, for bisecting it: slot a active in devinfo, then the plain PSCI reset. The bootloader boots the active slot. `android here` leaves the slot as it is, so the gate of the slot that booted answers, as volume down there does (how Android from slot b is tested, 2026-10-28).
-                    let r = if cmd.params == b"android here" { crate::slot::MARKED } else { crate::slot::set_active(0) };
+                    let r = if cmd.params == b"android here" { crate::slot::MARKED } else { crate::process::with_lock(|| crate::slot::set_active(0)) };
                     // Tell slot a's boot gate (ferros_hv/src/gate.rs) to answer "Android" this once instead of auto-choosing ferros; cleaned to DRAM, since the gate reads it with the caches off.
                     unsafe {
                         let p = 0xFD60_0FF8usize as *mut u64;
@@ -1852,90 +1859,96 @@ pub fn run(mut b: Boot) -> ! {
                 }
                 if cmd.params == b"devinfo" {
                     // The bootloader's slot record as it stands (slot.rs): both words, retries byte and flags byte (b0 unbootable, b1 successful, b2 active, b3 fastboot-ok).
-                    let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
-                    let mut ok = false;
-                    for _ in 0..4 {
-                        if ufs.read_block_lun(3, 6) == 0 && ufs.last_response_status() == 0 {
-                            ok = true;
-                            break;
+                    // Under the kernel lock, as every UFS command: processes on the other cores drive the flash too (the vault process's blocks, the partitions' readers).
+                    crate::process::with_lock(|| {
+                        let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                        let mut ok = false;
+                        for _ in 0..4 {
+                            if ufs.read_block_lun(3, 6) == 0 && ufs.last_response_status() == 0 {
+                                ok = true;
+                                break;
+                            }
                         }
-                    }
-                    if ok {
-                        let b = ufs.data_buffer();
-                        let w = |s: usize| u32::from_le_bytes([b[0x30 + 4 * s], b[0x31 + 4 * s], b[0x32 + 4 * s], b[0x33 + 4 * s]]);
-                        resp.extend_from_slice(alloc::format!("DEVINFO magic {}{}{}{} major {}: slot a word G#{:08X} (retries {}, flags G#{:02X}), slot b word G#{:08X} (retries {}, flags G#{:02X})\n", b[0] as char, b[1] as char, b[2] as char, b[3] as char, u16::from_le_bytes([b[4], b[5]]), w(0), w(0) & 0xFF, (w(0) >> 8) & 0xFF, w(1), w(1) & 0xFF, (w(1) >> 8) & 0xFF).as_bytes());
-                    } else {
-                        resp.extend_from_slice(b"DEVINFO unreadable\n");
-                    }
+                        if ok {
+                            let b = ufs.data_buffer();
+                            let w = |s: usize| u32::from_le_bytes([b[0x30 + 4 * s], b[0x31 + 4 * s], b[0x32 + 4 * s], b[0x33 + 4 * s]]);
+                            resp.extend_from_slice(alloc::format!("DEVINFO magic {}{}{}{} major {}: slot a word G#{:08X} (retries {}, flags G#{:02X}), slot b word G#{:08X} (retries {}, flags G#{:02X})\n", b[0] as char, b[1] as char, b[2] as char, b[3] as char, u16::from_le_bytes([b[4], b[5]]), w(0), w(0) & 0xFF, (w(0) >> 8) & 0xFF, w(1), w(1) & 0xFF, (w(1) >> 8) & 0xFF).as_bytes());
+                        } else {
+                            resp.extend_from_slice(b"DEVINFO unreadable\n");
+                        }
+                    });
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
                 if cmd.params == b"ufsdesc" {
                     // The UFS device's provisioning, read from the device itself: the Device descriptor (LU count, feature bits), every Unit descriptor (enabled, boot LUN id, WRITE PROTECT TYPE: 0 none / 1 power-on / 2 permanent, block size, block count), and each enabled LU's GPT partition names — so the boot-chain write-protect question (BOOT.md, 2026-10-17) is answered by the flash, not by guessing.
-                    let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
-                    let (d, n, ocs) = ufs.read_descriptor(0x00, 0);
-                    resp.extend_from_slice(alloc::format!("DEVICE_DESC len {n} ocs {ocs}: numLU {} bootEnable {} descrAccessEn {} features G#{:02X}{:02X}\n", d.get(0x08).copied().unwrap_or(0), d.get(0x05).copied().unwrap_or(0), d.get(0x06).copied().unwrap_or(0), d.get(0x1F).copied().unwrap_or(0), d.get(0x1E).copied().unwrap_or(0)).as_bytes());
-                    // The provisioning lock and the write-protect flags (JEDEC UFS: attribute bConfigDescrLock G#1B is one-time — once 1 the LU layout is permanent; flags fPermanentWPEn G#02 and fPowerOnWPEn G#03; attribute bBootLunEn G#00).
-                    let fmt = |v: Option<u32>| match v { Some(x) => alloc::format!("{x}"), None => alloc::string::String::from("?") };
-                    let fmtb = |v: Option<bool>| match v { Some(x) => alloc::format!("{}", x as u8), None => alloc::string::String::from("?") };
-                    resp.extend_from_slice(alloc::format!("bConfigDescrLock {} bBootLunEn {} bCurrentPowerMode {} fPermanentWPEn {} fPowerOnWPEn {} fDeviceInit {}\n", fmt(ufs.read_attribute(0x1B, 0)), fmt(ufs.read_attribute(0x00, 0)), fmt(ufs.read_attribute(0x02, 0)), fmtb(ufs.read_flag(0x02)), fmtb(ufs.read_flag(0x03)), fmtb(ufs.read_flag(0x01))).as_bytes());
-                    let (c, cn, cocs) = ufs.read_descriptor(0x01, 0);
-                    resp.extend_from_slice(alloc::format!("CONFIG_DESC len {cn} ocs {cocs}: bootEnable {} descrAccessEn {} initPowerMode {} highPriorityLUN {}\n", c.get(0x03).copied().unwrap_or(0), c.get(0x04).copied().unwrap_or(0), c.get(0x05).copied().unwrap_or(0), c.get(0x06).copied().unwrap_or(0)).as_bytes());
-                    for lu in 0..8u8 {
-                        let (u, n, ocs) = ufs.read_descriptor(0x02, lu);
-                        if n < 0x13 || ocs != 0 {
-                            resp.extend_from_slice(alloc::format!("LU{lu}: no descriptor (len {n}, ocs {ocs})\n").as_bytes());
-                            continue;
-                        }
-                        let blocks = u64::from_be_bytes([u[0x0B], u[0x0C], u[0x0D], u[0x0E], u[0x0F], u[0x10], u[0x11], u[0x12]]);
-                        let bs = 1u64 << u[0x0A];
-                        let wp = match u[0x05] { 0 => "none", 1 => "POWER-ON", 2 => "PERMANENT", _ => "?" };
-                        resp.extend_from_slice(alloc::format!("LU{lu}: enable {} bootLunId {} writeProtect {} memType {} blockSize {bs} blocks {blocks} = {} MiB\n", u[0x03], u[0x04], wp, u[0x08], blocks * bs >> 20).as_bytes());
-                        if u[0x03] == 0 {
-                            continue;
-                        }
-                        // GPT: header at LBA 1, the entry array where it says (usually LBA 2), 128-byte entries, UTF-16LE names at +56.
-                        if ufs.read_block_lun(lu, 1) != 0 || ufs.last_response_status() != 0 {
-                            resp.extend_from_slice(b"    (LBA 1 unreadable)\n");
-                            continue;
-                        }
-                        let h = *ufs.data_buffer();
-                        if &h[0..8] != b"EFI PART" {
-                            resp.extend_from_slice(b"    (no GPT)\n");
-                            continue;
-                        }
-                        let entry_lba = u64::from_le_bytes(h[0x48..0x50].try_into().unwrap());
-                        let count = u32::from_le_bytes(h[0x50..0x54].try_into().unwrap()).min(256) as usize;
-                        let esize = u32::from_le_bytes(h[0x54..0x58].try_into().unwrap()) as usize;
-                        let per_block = if esize > 0 { 4096 / esize } else { 0 };
-                        let mut names = alloc::string::String::new();
-                        let mut i = 0usize;
-                        while i < count && per_block > 0 {
-                            if ufs.read_block_lun(lu, (entry_lba as usize + i / per_block) as u32) != 0 {
-                                break;
+                    // Under the kernel lock, as every UFS command: processes on the other cores drive the flash too (the vault process's blocks, the partitions' readers).
+                    crate::process::with_lock(|| {
+                        let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                        let (d, n, ocs) = ufs.read_descriptor(0x00, 0);
+                        resp.extend_from_slice(alloc::format!("DEVICE_DESC len {n} ocs {ocs}: numLU {} bootEnable {} descrAccessEn {} features G#{:02X}{:02X}\n", d.get(0x08).copied().unwrap_or(0), d.get(0x05).copied().unwrap_or(0), d.get(0x06).copied().unwrap_or(0), d.get(0x1F).copied().unwrap_or(0), d.get(0x1E).copied().unwrap_or(0)).as_bytes());
+                        // The provisioning lock and the write-protect flags (JEDEC UFS: attribute bConfigDescrLock G#1B is one-time — once 1 the LU layout is permanent; flags fPermanentWPEn G#02 and fPowerOnWPEn G#03; attribute bBootLunEn G#00).
+                        let fmt = |v: Option<u32>| match v { Some(x) => alloc::format!("{x}"), None => alloc::string::String::from("?") };
+                        let fmtb = |v: Option<bool>| match v { Some(x) => alloc::format!("{}", x as u8), None => alloc::string::String::from("?") };
+                        resp.extend_from_slice(alloc::format!("bConfigDescrLock {} bBootLunEn {} bCurrentPowerMode {} fPermanentWPEn {} fPowerOnWPEn {} fDeviceInit {}\n", fmt(ufs.read_attribute(0x1B, 0)), fmt(ufs.read_attribute(0x00, 0)), fmt(ufs.read_attribute(0x02, 0)), fmtb(ufs.read_flag(0x02)), fmtb(ufs.read_flag(0x03)), fmtb(ufs.read_flag(0x01))).as_bytes());
+                        let (c, cn, cocs) = ufs.read_descriptor(0x01, 0);
+                        resp.extend_from_slice(alloc::format!("CONFIG_DESC len {cn} ocs {cocs}: bootEnable {} descrAccessEn {} initPowerMode {} highPriorityLUN {}\n", c.get(0x03).copied().unwrap_or(0), c.get(0x04).copied().unwrap_or(0), c.get(0x05).copied().unwrap_or(0), c.get(0x06).copied().unwrap_or(0)).as_bytes());
+                        for lu in 0..8u8 {
+                            let (u, n, ocs) = ufs.read_descriptor(0x02, lu);
+                            if n < 0x13 || ocs != 0 {
+                                resp.extend_from_slice(alloc::format!("LU{lu}: no descriptor (len {n}, ocs {ocs})\n").as_bytes());
+                                continue;
                             }
-                            let blk = *ufs.data_buffer();
-                            for e in 0..per_block {
-                                if i >= count {
+                            let blocks = u64::from_be_bytes([u[0x0B], u[0x0C], u[0x0D], u[0x0E], u[0x0F], u[0x10], u[0x11], u[0x12]]);
+                            let bs = 1u64 << u[0x0A];
+                            let wp = match u[0x05] { 0 => "none", 1 => "POWER-ON", 2 => "PERMANENT", _ => "?" };
+                            resp.extend_from_slice(alloc::format!("LU{lu}: enable {} bootLunId {} writeProtect {} memType {} blockSize {bs} blocks {blocks} = {} MiB\n", u[0x03], u[0x04], wp, u[0x08], blocks * bs >> 20).as_bytes());
+                            if u[0x03] == 0 {
+                                continue;
+                            }
+                            // GPT: header at LBA 1, the entry array where it says (usually LBA 2), 128-byte entries, UTF-16LE names at +56.
+                            if ufs.read_block_lun(lu, 1) != 0 || ufs.last_response_status() != 0 {
+                                resp.extend_from_slice(b"    (LBA 1 unreadable)\n");
+                                continue;
+                            }
+                            let h = *ufs.data_buffer();
+                            if &h[0..8] != b"EFI PART" {
+                                resp.extend_from_slice(b"    (no GPT)\n");
+                                continue;
+                            }
+                            let entry_lba = u64::from_le_bytes(h[0x48..0x50].try_into().unwrap());
+                            let count = u32::from_le_bytes(h[0x50..0x54].try_into().unwrap()).min(256) as usize;
+                            let esize = u32::from_le_bytes(h[0x54..0x58].try_into().unwrap()) as usize;
+                            let per_block = if esize > 0 { 4096 / esize } else { 0 };
+                            let mut names = alloc::string::String::new();
+                            let mut i = 0usize;
+                            while i < count && per_block > 0 {
+                                if ufs.read_block_lun(lu, (entry_lba as usize + i / per_block) as u32) != 0 {
                                     break;
                                 }
-                                let ent = &blk[e * esize..(e + 1) * esize];
-                                if ent[..16].iter().any(|&b| b != 0) {
-                                    let name: alloc::string::String = ent[56..128].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).filter_map(|c| char::from_u32(c as u32)).collect();
-                                    let first = u64::from_le_bytes(ent[32..40].try_into().unwrap());
-                                    let last = u64::from_le_bytes(ent[40..48].try_into().unwrap());
-                                    let attr = u64::from_le_bytes(ent[48..56].try_into().unwrap());
-                                    names.push_str(&alloc::format!(" {name}@{first}({}K)", (last + 1 - first) * bs >> 10));
-                                    if attr != 0 {
-                                        // GPT attribute bits (Android's A/B HALs keep slot state in bits 48+ on some SoCs); printed only when set, to see whether husky's bootloader uses them.
-                                        names.push_str(&alloc::format!("[attr G#{attr:X}]"));
+                                let blk = *ufs.data_buffer();
+                                for e in 0..per_block {
+                                    if i >= count {
+                                        break;
                                     }
+                                    let ent = &blk[e * esize..(e + 1) * esize];
+                                    if ent[..16].iter().any(|&b| b != 0) {
+                                        let name: alloc::string::String = ent[56..128].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).filter_map(|c| char::from_u32(c as u32)).collect();
+                                        let first = u64::from_le_bytes(ent[32..40].try_into().unwrap());
+                                        let last = u64::from_le_bytes(ent[40..48].try_into().unwrap());
+                                        let attr = u64::from_le_bytes(ent[48..56].try_into().unwrap());
+                                        names.push_str(&alloc::format!(" {name}@{first}({}K)", (last + 1 - first) * bs >> 10));
+                                        if attr != 0 {
+                                            // GPT attribute bits (Android's A/B HALs keep slot state in bits 48+ on some SoCs); printed only when set, to see whether husky's bootloader uses them.
+                                            names.push_str(&alloc::format!("[attr G#{attr:X}]"));
+                                        }
+                                    }
+                                    i += 1;
                                 }
-                                i += 1;
                             }
+                            resp.extend_from_slice(alloc::format!("    GPT:{names}\n").as_bytes());
                         }
-                        resp.extend_from_slice(alloc::format!("    GPT:{names}\n").as_bytes());
-                    }
+                    });
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
@@ -2035,35 +2048,38 @@ pub fn run(mut b: Boot) -> ! {
                     if store.is_none() {
                         resp.extend_from_slice(b"no disk on this boot\n");
                     } else {
-                        let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
-                        // A LUN's first command after power-on can report UNIT ATTENTION; it succeeds on retry.
-                        let mut ocs = 0xFF;
-                        for _ in 0..4 {
-                            ocs = ufs.read_block_lun(3, 6);
-                            if ocs == 0 && ufs.last_response_status() == 0 {
-                                break;
+                        // Under the kernel lock, as every UFS command: processes on the other cores drive the flash too (the vault process's blocks, the partitions' readers).
+                        crate::process::with_lock(|| {
+                            let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                            // A LUN's first command after power-on can report UNIT ATTENTION; it succeeds on retry.
+                            let mut ocs = 0xFF;
+                            for _ in 0..4 {
+                                ocs = ufs.read_block_lun(3, 6);
+                                if ocs == 0 && ufs.last_response_status() == 0 {
+                                    break;
+                                }
                             }
-                        }
-                        append_hex(&mut resp, b"DEVINFO_OCS=", ocs as u32 | (ufs.last_response_status() as u32) << 8);
-                        let d = ufs.data_buffer();
-                        let hx = b"0123456789ABCDEF";
-                        for i in 0..32 {
-                            let w = u32::from_le_bytes([d[i * 4], d[i * 4 + 1], d[i * 4 + 2], d[i * 4 + 3]]);
-                            let key = [b'D', b'E', b'V', b'I', b'N', b'F', b'O', b'_', hx[i * 4 >> 4], hx[i * 4 & 15], b'='];
-                            append_hex(&mut resp, &key, w);
-                        }
-                        // Fingerprint of everything past the header (rest of LBA 6 + all of LBA 7): tells whether a slot change touched anything else (a checksum, a mirror) without sending the identity data itself.
-                        let mut h = blake3::Hasher::new();
-                        h.update(&d[0x80..]);
-                        let mut ocs7 = ufs.read_block_lun(3, 7);
-                        if ocs7 != 0 || ufs.last_response_status() != 0 {
-                            ocs7 = ufs.read_block_lun(3, 7);
-                        }
-                        h.update(ufs.data_buffer());
-                        let f = h.finalize();
-                        let fb = f.as_bytes();
-                        append_hex(&mut resp, b"DEVINFO_REST_OCS=", ocs7 as u32);
-                        append_hex(&mut resp, b"DEVINFO_REST_B3=", u32::from_be_bytes([fb[0], fb[1], fb[2], fb[3]]));
+                            append_hex(&mut resp, b"DEVINFO_OCS=", ocs as u32 | (ufs.last_response_status() as u32) << 8);
+                            let d = ufs.data_buffer();
+                            let hx = b"0123456789ABCDEF";
+                            for i in 0..32 {
+                                let w = u32::from_le_bytes([d[i * 4], d[i * 4 + 1], d[i * 4 + 2], d[i * 4 + 3]]);
+                                let key = [b'D', b'E', b'V', b'I', b'N', b'F', b'O', b'_', hx[i * 4 >> 4], hx[i * 4 & 15], b'='];
+                                append_hex(&mut resp, &key, w);
+                            }
+                            // Fingerprint of everything past the header (rest of LBA 6 + all of LBA 7): tells whether a slot change touched anything else (a checksum, a mirror) without sending the identity data itself.
+                            let mut h = blake3::Hasher::new();
+                            h.update(&d[0x80..]);
+                            let mut ocs7 = ufs.read_block_lun(3, 7);
+                            if ocs7 != 0 || ufs.last_response_status() != 0 {
+                                ocs7 = ufs.read_block_lun(3, 7);
+                            }
+                            h.update(ufs.data_buffer());
+                            let f = h.finalize();
+                            let fb = f.as_bytes();
+                            append_hex(&mut resp, b"DEVINFO_REST_OCS=", ocs7 as u32);
+                            append_hex(&mut resp, b"DEVINFO_REST_B3=", u32::from_be_bytes([fb[0], fb[1], fb[2], fb[3]]));
+                        });
                     }
                     resp.extend_from_slice(b"END\n");
                     queue_pt_response(&mut pt_out_data, &resp);
@@ -2277,11 +2293,11 @@ pub fn run(mut b: Boot) -> ! {
                         let r = it.next().and_then(|v| u8::from_str_radix(v, 16).ok());
                         let f = it.next().and_then(|v| u8::from_str_radix(v, 16).ok());
                         match (slot, r, f) {
-                            (Some(s), Some(r), Some(f)) => resp.extend_from_slice(alloc::format!("set_word: G#{:X}\n", crate::slot::set_word(s, r, f)).as_bytes()),
+                            (Some(s), Some(r), Some(f)) => resp.extend_from_slice(alloc::format!("set_word: G#{:X}\n", crate::process::with_lock(|| crate::slot::set_word(s, r, f))).as_bytes()),
                             _ => resp.extend_from_slice(b"slot word <a|b> <retries hex> <flags hex>\n"),
                         }
                     }
-                    match crate::slot::words() {
+                    match crate::process::with_lock(crate::slot::words) {
                         Some([a, b]) => resp.extend_from_slice(alloc::format!("slot a G#{a:04X}  slot b G#{b:04X}\n").as_bytes()),
                         None => resp.extend_from_slice(b"devinfo not readable\n"),
                     }
@@ -2360,7 +2376,7 @@ pub fn run(mut b: Boot) -> ! {
                         },
                         _ => false,
                     };
-                    let kept = ok && crate::settings::document(None).is_some_and(|d| store.as_mut().is_some_and(|s| s.set(crate::settings::KEY, &d).is_ok()));
+                    let kept = ok && crate::settings::document(None).is_some_and(|d| crate::process::with_lock(|| store.as_mut().is_some_and(|s| s.set(crate::settings::KEY, &d).is_ok())));
                     resp.extend_from_slice(alloc::format!("pref {name}: {}\n", if !ok { "refused" } else if kept { "set and kept" } else { "set, NOT kept" }).as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
@@ -2406,7 +2422,7 @@ pub fn run(mut b: Boot) -> ! {
                 }
                 if cmd.params.starts_with(b"cam pdma") {
                     // `diag cam pdma`: hand the front end's register program to the PDMA engine (camera.rs), the only path to the region the CPU cannot write.
-                    let mut b2 = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
+                    let mut b2 = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten()));
                     if b2.is_none() && cfg!(cam_frame_blob) {
                         b2 = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
                     }
@@ -2415,14 +2431,14 @@ pub fn run(mut b: Boot) -> ! {
                             let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
                             if 8 + n <= b.len() { Some(b[8..8 + n].to_vec()) } else { None }
                         }
-                        _ => store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten()),
+                        _ => crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten())),
                     };
                     let prog = match b2.as_deref() {
                         Some(b) if b.len() > 8 && &b[..4] == b"CFRM" => {
                             let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
                             if 8 + n <= b.len() { Some(b[8 + n..].to_vec()) } else { None }
                         }
-                        _ => store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten()),
+                        _ => crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten())),
                     };
                     let words: alloc::vec::Vec<&[u8]> = cmd.params.split(|&c| c == b' ').collect();
                     // `cam pdma uw ...`: the ultrawide's own init and CPU setup (FERROS_CAM_UW), `cam pdma front ...` the front camera's (FERROS_CAM_FRONT), instead of the main camera's bundle.
@@ -2434,7 +2450,7 @@ pub fn run(mut b: Boot) -> ! {
                 if cmd.params == b"cam frame" {
                     // `diag cam frame`: `cam stream` plus the front end's DMA program from the vault (cam.ispfe.prog, tools/camera-prog.py); reports which output buffers were written.
                     // Both tables can come as one value, `cam.frame` = 'CFRM' + init length (u32 LE) + init + program, because only one vault write per boot succeeds at the moment (2026-10-20).
-                    let mut bundle = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
+                    let mut bundle = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten()));
                     if bundle.is_none() && cfg!(cam_frame_blob) {
                         bundle = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
                     }
@@ -2443,7 +2459,7 @@ pub fn run(mut b: Boot) -> ! {
                             let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
                             if 8 + n <= b.len() { (Some(b[8..8 + n].to_vec()), Some(b[8 + n..].to_vec())) } else { (None, None) }
                         }
-                        _ => (store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten()), store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten())),
+                        _ => (crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten())), crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten()))),
                     };
                     crate::camera::frame_probe(&mut resp, init, prog);
                     queue_pt_response(&mut pt_out_data, &resp);
@@ -2452,9 +2468,9 @@ pub fn run(mut b: Boot) -> ! {
                 if cmd.params == b"cam stream" || cmd.params == b"cam raw" || cmd.params == b"cam lochs" {
                     // `diag cam stream`: replay the sensor init, configure CSI link 1, stream 300 ms, report what the link saw and dump its words.
                     // The init comes from the same places `cam frame` takes it from: the vault's own key, the bundled `cam.frame` value, or the image's built-in bundle. The vault lost these keys in the move to manifestus, and the dump is the whole point of the command, so it should not depend on which of the three is present.
-                    let mut init = store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten());
+                    let mut init = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten()));
                     if init.is_none() {
-                        let mut b = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
+                        let mut b = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten()));
                         if b.is_none() && cfg!(cam_frame_blob) {
                             b = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
                         }
@@ -2473,9 +2489,9 @@ pub fn run(mut b: Boot) -> ! {
                 }
                 if cmd.params == b"cam slit" || cmd.params == b"cam slitsweep" {
                     // `diag cam slit`: set our own window and frame rate through the sensor's CCS registers and measure the rate change (camera.rs).
-                    let mut t = store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten());
+                    let mut t = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten()));
                     if t.is_none() {
-                        let mut b = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
+                        let mut b = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten()));
                         if b.is_none() && cfg!(cam_frame_blob) {
                             b = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
                         }
