@@ -85,6 +85,33 @@ What blocks the rest of the list after the night of 2026-10-31. Each is a choice
 10. **`partfs` (found 2026-11-04).** It reads ext4 and f2fs files on Android's partitions for the modem driver (its image, NV, carrier configs) and the Bluetooth driver (its patch).
     - Moving it needs a way to give a process read access to one partition's blocks without the vault's LU (an `ufs` block grant, read only, per partition).
     - Proposed: build the block grant when a second consumer of Android's partitions appears; until then the kernel's reader is one module serving two drivers.
+## Ready without the owner (2026-11-07, night)
+
+What on this list and VAULT-OUT.md's "Still to do" needs no decision, in the order it is being built, most value for least risk first.
+Each is one commit, kernel and payload together, and none is on the cold boot's path unless said.
+
+0. **The kernel's own channel to the vault process, and the bridge's `store` commands through it.**
+   The kernel becomes a caller of the `vault` endpoint with no thread behind it: its reply lands in a mailbox the service loop reads, and the PT reply waits for it (the USB process already polls for a reply that is not ready).
+   Value: `store ls`, `get` and `rm` of a moved name find it again, and `put` writes straight into the vault process, past the old 3 MiB limit.
+   Risk: low; a development door, compiled out of a production build, and with no vault process the kernel's vault answers as before.
+   It is also the channel the next three need.
+1. **Release drops the person's domains in the vault process.**
+   At release (a completed departure) the kernel stamps a drop of each of the person's domains while their keys still exist, and the service loop sends them before its restart.
+   Value: a departed person's entries leave the disk, not only become unopenable.
+   Risk: low; runs only at release, and a failed drop still restarts (the renewed device-only secret already makes the entries unopenable).
+2. **The identity export through the vault process** (`SYS_UNLOCK` op 5).
+   Forwarded as a store call is, stamped with the person's domains; the vault builds the document and hands it out a transfer at a time (the op gains an offset).
+   Value: the departure's "save first" finds what moved. Nothing calls it yet, so the risk is nil.
+3. **The vault's capsule in the kernel image** (VAULT-OUT.md decision 0), optional at build time: with `FERROS_VAULT_CAPSULE` set the kernel embeds that capsule and starts the vault from it; without it, from its own vault as today.
+   Risk: on the boot path, so it waits for a slot b cold boot with the owner present before the stored copy goes.
+
+Not ready, and why:
+- **The kernel's own names behind its channel, then `kvault`'s storage path retired** (VAULT-OUT.md step 4): the kernel reads `init`, `sealed` and the capsules before any process runs, and the AoC firmware in the service loop's sensor steps. Moving them needs the vault started from the kernel image (3, verified from cold) and a synchronous read for the boot. After 3.
+- **`amp`** waits on decision 7, **`haptics`** on decision 8, the power group on 9, `partfs` on 10, the camera on 3.
+- **`spi.rs` as a shared crate** has value only once `amp` leaves (the kernel's last SPI user besides the power switches' pin setup); with decision 7 open, it waits.
+- **gps**: already a process (`payloads/gps`); the kernel keeps only its power switch. **fp**: deleted (decision 4).
+- **Policy in the service loop** (move 9): the AoC's start runs a step a pass in the kernel because it is ACPM, GSA and Trusty underneath (thin brokers); what is policy in it is the 4 s wait, too small to move alone.
+
 ## Record
 
 - 2026-10-31: USB steps 1-5 (partial) — USB.md.
