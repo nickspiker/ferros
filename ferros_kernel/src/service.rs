@@ -427,6 +427,8 @@ pub static ANDROID_ALLOWED: core::sync::atomic::AtomicU64 = core::sync::atomic::
 static ANDROID_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// A completed departure released the identity (SYS_UNLOCK op 4): the service loop restarts the device, which comes back at the attest screen (AUTH.md's "no way back to the attest screen" gap, closed the plain way).
 static RELEASE_RESET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The drops of the released person's domains in the vault process (process.rs `vault_stamp_drops`), each a stamp carrying that domain's keys, waiting for the service loop to send them before the restart. Under the kernel lock (filled in a syscall, taken by the loop).
+static mut RELEASE_DROPS: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
 
 /// The `android` switch (process.rs POWERS): accepted only on a device that allows Android and while a person is present (the vault's identity class unlocked: the kernel's own state, set by an attest through SYS_UNLOCK, never a process's word). Nothing in the base OS holds it (owner, 2026-11-04: nothing is built in but system settings): it is for an Android launcher a person installs, and this check is the lock whoever holds it. The service loop then does the gate's Android path: ANDROID_ONCE, slot a, the reset with its scrub (`diag android`'s sequence).
 pub fn android_request(on: bool) -> bool {
@@ -518,8 +520,19 @@ fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
             Ok(0)
         }
         (4, _) => {
-            let n = st.release().map_err(|_| ())?;
-            crate::flashlog::line(&alloc::format!("identity released: {n} entries deleted, the device-only secret renewed"));
+            // The person's domains in the vault process, stamped while their keys still exist (release locks them); the service loop sends the drops before its restart.
+            let mut drops = crate::process::vault_stamp_drops();
+            let n = match st.release() {
+                Ok(n) => n,
+                Err(_) => {
+                    for d in drops.iter_mut() {
+                        d.fill(0);
+                    }
+                    return Err(());
+                }
+            };
+            crate::flashlog::line(&alloc::format!("identity released: {n} entries deleted from the kernel's vault, the device-only secret renewed; {} of the person's domains to drop in the vault process", drops.len()));
+            unsafe { (*(&raw mut RELEASE_DROPS)).append(&mut drops) };
             RELEASE_RESET.store(true, core::sync::atomic::Ordering::Release);
             Ok(0)
         }
@@ -1350,6 +1363,8 @@ pub fn run(mut b: Boot) -> ! {
     let mut vault_job: Option<VaultJob> = None;
     #[cfg(not(ferros_production))]
     let mut vault_cmd: Option<crate::ptlink::Submitted> = None;
+    // A drop of the released person's domain sent to the vault process, its answer awaited (`RELEASE_DROPS`).
+    let mut release_drop_sent = false;
     // The sensors process's check (below): when it last looked.
     let mut sensors_check = 0u64;
 
@@ -1455,9 +1470,40 @@ pub fn run(mut b: Boot) -> ! {
             radios_applied = radios_off;
         }
         // Released (a completed departure): restart, so the device comes back at the attest screen with nothing of the identity left.
-        if RELEASE_RESET.swap(false, core::sync::atomic::Ordering::AcqRel) {
-            crate::flashlog::line("identity released: restarting at the attest screen");
-            platform::reboot();
+        // First the person's domains in the vault process are dropped, a call a pass through the kernel's channel (none while a bridge command holds it); a drop that fails, or no vault to send it to, is logged and the restart goes ahead: the renewed device-only secret already makes those entries unopenable.
+        #[cfg(not(ferros_production))]
+        let channel_free = vault_job.is_none();
+        #[cfg(ferros_production)]
+        let channel_free = true;
+        if channel_free && RELEASE_RESET.load(core::sync::atomic::Ordering::Acquire) {
+            if release_drop_sent {
+                match crate::process::vault_answer() {
+                    Some(Ok((n, _))) if n != crate::process::ERR => {
+                        crate::flashlog::line(&alloc::format!("identity released: a domain of the person's dropped in the vault process ({n} values)"));
+                        release_drop_sent = false;
+                    }
+                    Some(_) => {
+                        crate::flashlog::line("identity released: a drop in the vault process failed; its entries stay on the disk, unopenable");
+                        release_drop_sent = false;
+                    }
+                    None => {}
+                }
+            }
+            if !release_drop_sent {
+                match crate::process::with_lock(|| unsafe { (*(&raw mut RELEASE_DROPS)).pop() }) {
+                    Some(msg) => {
+                        release_drop_sent = crate::process::vault_call(msg);
+                        if !release_drop_sent {
+                            crate::flashlog::line("identity released: no vault process to drop the person's domain; its entries stay on the disk, unopenable");
+                        }
+                    }
+                    None => {
+                        RELEASE_RESET.store(false, core::sync::atomic::Ordering::Release);
+                        crate::flashlog::line("identity released: restarting at the attest screen");
+                        platform::reboot();
+                    }
+                }
+            }
         }
         // A launch of Android the `android` switch accepted: the gate's Android path, as `diag android` takes it. The person is checked again here; the reset scrubs ferros's memory on its way (platform::before_reset).
         #[cfg(not(shim_handoff))]
@@ -2676,8 +2722,9 @@ pub fn run(mut b: Boot) -> ! {
                 }
                 if cmd.params == b"identity" || cmd.params == b"identity release" {
                     // `diag identity`: the identity class's state (AUTH.md); `diag "identity release"`: every identity entry deleted, the binding and any kept seed gone, the device-only secret renewed — what a completed departure does, for a developer starting the device over.
-                    let s = if cmd.params == b"identity release" { store_unlock(4, None).map(|_| "released") } else { Ok("") };
-                    let st = store_unlock(0, None).unwrap_or(0);
+                    // Under the kernel lock, as every UFS command (release writes the vault; the state reads it).
+                    let s = if cmd.params == b"identity release" { crate::process::with_lock(|| store_unlock(4, None)).map(|_| "released") } else { Ok("") };
+                    let st = crate::process::with_lock(|| store_unlock(0, None)).unwrap_or(0);
                     resp.extend_from_slice(alloc::format!("identity: {} unlocked {}, bound {}\n", s.unwrap_or("release failed"), st & 1 == 1, st & 2 == 2).as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;

@@ -1391,6 +1391,8 @@ pub const VOP_SET: u8 = 0;
 pub const VOP_GET: u8 = 1;
 pub const VOP_DELETE: u8 = 2;
 pub const VOP_LIST: u8 = 3;
+/// Every value of each stamped domain deleted (release: the person's domains, VAULT-OUT.md). Name and rest empty. The value: how many values went, or ERR.
+pub const VOP_DROP: u8 = 4;
 
 /// A stamped request (`store_forward`'s message layout): `prefix`'s domain in each class of `classes`, then `name` and `rest`. A listing leaves out the person's domain while they are locked; anything else needing a locked class is None, as the kernel's vault refuses it.
 fn stamp(op: u8, prefix: &str, classes: &[bool], name: &[u8], rest: &[u8]) -> Option<Vec<u8>> {
@@ -1495,6 +1497,11 @@ pub fn vault_stamp_list(i: usize, offset: u64, len: u32) -> Option<(Vec<u8>, &'s
     rest.extend_from_slice(&len.to_le_bytes());
     rest.push(0);
     Some((with_lock_held_or(|| stamp(VOP_LIST, sc.prefix, classes, &[], &rest))?, sc.prefix))
+}
+
+/// Stamps dropping every one of the person's domains in the vault process (each scope that holds the person's names), for release: made while their keys still exist, sent by the service loop before its restart (service.rs). Empty while they are locked: nothing could be stamped, and what is on the disk is already unopenable once release renews the device-only secret.
+pub fn vault_stamp_drops() -> Vec<Vec<u8>> {
+    with_lock_held_or(|| STORES.iter().filter(|sc| crate::kvault::identity_within(sc.prefix)).filter_map(|sc| stamp(VOP_DROP, sc.prefix, &[true], &[], &[])).collect())
 }
 
 /// A server receiving on `ep` takes the head of its queue now; a polling server asleep between polls is woken (its sleep returns early, which a poll loop reads as "look again").

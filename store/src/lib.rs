@@ -395,6 +395,19 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         Ok(self.list(d, NAMES, names_schema, "name")?.into_iter().filter_map(|v| if let VsfType::v(b'r', n) = v { Some(n) } else { None }).collect())
     }
 
+    /// Every value of the domain deleted and the pieces of its unfinished writes swept, its books going with them (an empty list is removed): nothing of the domain is left on the disk. Release, when a person leaves the device (VAULT-OUT.md). Returns how many values went.
+    pub fn drop_domain(&mut self, d: &Domain) -> Result<u64> {
+        let mut n = 0;
+        for name in self.names(d)? {
+            if self.delete(d, &name)? {
+                n += 1;
+            }
+        }
+        self.sweep(d)?;
+        self.forget();
+        Ok(n)
+    }
+
     /// The pieces of every value whose write never finished in this domain, removed: each pending id's pieces from the first until one is not there (a value's pieces go to the engine in order). Run when the domain's keys are at hand (the vault process does it at a domain's first request after it starts). Returns how many pieces it removed.
     pub fn sweep(&mut self, d: &Domain) -> Result<u64> {
         let ids: Vec<[u8; 32]> = self.list(d, PENDING, pending_schema, "id")?.into_iter().filter_map(|v| if let VsfType::hb(b) = v { b.try_into().ok() } else { None }).collect();
@@ -592,6 +605,28 @@ mod tests {
         assert_eq!(s.engine().live_keys().unwrap().len(), before);
         s.put(&d, b"x", &bytes(2 * BATCH * PIECE + 5, 6)).unwrap();
         assert_eq!(s.sweep(&d).unwrap(), 0);
+    }
+
+    /// Dropping a domain leaves nothing of it on the disk (its values, an abandoned large write's pieces, its books) and touches no other domain.
+    #[test]
+    fn drop_leaves_nothing() {
+        let mut s = store(1 << 15);
+        let (gone, kept) = (domain(5), domain(6));
+        let keep = bytes(PIECE + 3, 4);
+        s.put(&kept, b"keep", &keep).unwrap();
+        let before = s.engine().live_keys().unwrap().len();
+        s.put(&gone, b"small", b"x").unwrap();
+        s.put(&gone, b"big", &bytes(3 * PIECE + 1, 7)).unwrap();
+        let mut w = s.begin(&gone, b"cut");
+        s.write(&gone, &mut w, &bytes(2 * BATCH * PIECE, 8)).unwrap();
+        drop(w);
+        assert!(s.engine().live_keys().unwrap().len() > before);
+        assert_eq!(s.drop_domain(&gone).unwrap(), 2);
+        assert!(s.names(&gone).unwrap().is_empty());
+        assert_eq!(s.get(&gone, b"big").unwrap(), None);
+        assert_eq!(s.engine().live_keys().unwrap().len(), before);
+        assert_eq!(s.get(&kept, b"keep").unwrap().unwrap(), keep);
+        assert_eq!(s.drop_domain(&gone).unwrap(), 0);
     }
 
     /// A value written in uneven slices is the value written whole.

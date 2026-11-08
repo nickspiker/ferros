@@ -106,10 +106,14 @@ The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by t
   - A bridge `store` command for a name the vault process holds (a scope's, not one the kernel keeps) becomes a job in the service loop (`service.rs` `VaultJob`): a get read a transfer at a time, a put written in pieces from the command (which stays with the job: ptlink takes no other command until its reply is taken), a remove; `ls` lists the kernel's vault, then every scope from the vault process, each name made whole with its prefix. The PT reply waits for the job's last call; the USB process already polls for a reply not ready.
   - A get or a remove the vault process does not find goes to the kernel's vault, where a name not yet moved still is. A put to the vault process takes up to the 6 MiB one command carries; a get is held to 3 MiB (the reply is built whole in the kernel's heap and copied once more on its way out). The person's names need them unlocked, as before.
   - With no vault process serving, every command is the kernel's vault's, as before.
+- **Release drops the person's domains in the vault process (2026-11-07, built, not yet on the device):**
+  - At release (`SYS_UNLOCK` op 4, a completed departure, or `diag "identity release"`) the kernel stamps a drop of each of the person's domains (each scope that holds the person's names: `map.`, `gps.`, `wifi.`, `fgtw.`, `ahau.`) while their keys still exist, then releases the kernel's vault as before (`process.rs` `vault_stamp_drops`).
+  - The service loop sends the drops through the kernel's channel, a call a pass, before its restart. The vault process drops each domain whole (`ferros_store` `drop_domain`: every value, the pieces of unfinished writes, the books; host-tested to leave the disk as it was before the domain's first write).
+  - A drop that fails, or no vault process to send it to, is logged and the restart goes ahead: the renewed device-only secret already makes those entries unopenable. Released while locked, nothing can be stamped, and the same holds.
+  - `diag "identity release"` now takes the kernel lock (it wrote the vault outside it).
 - **Still to do:**
   - the person's entries moving at the first attest (built, not yet seen on the device);
   - the identity export for a departure (`SYS_UNLOCK` op 5), which still reads the kernel's vault and so finds nothing that moved;
-  - release (a completed departure) deletes the person's entries only from the kernel's vault: those in the vault process stay on disk, unopenable once the device-only secret is renewed, until the kernel tells the vault to drop the person's domains;
   - per-kist domains through the oracle and the common area's named grants (step 3's rest);
   - the vault's capsule in the kernel image;
   - the kernel's own names moved behind a channel of its own, then `kvault`, `vault_boot` and `ufs_device` retired (step 4).

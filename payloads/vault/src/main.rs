@@ -2,7 +2,7 @@
 //!
 //! The mirrors: A from block 0 of the window, B from half way (the window is 2 × 8 GiB, process.rs WINDOWS); each starts at MIRROR blocks (512 MiB) and grows into its half later (manifestus `grow`), because a blank vault is read whole before its first commit and 8 GiB would be four million reads.
 //!
-//! Requests come only from the kernel (process.rs `store_forward`): each is a process's `SYS_STORE` call, stamped with the domain keys of its scope, one transfer at most. [op: 0 set, 1 get, 2 delete, 3 list][flags: bit 0 old entries wait in the kernel's vault][lock epoch u32 LE][domains][per domain: class (1 the person's), address key, sealing key][name length][name: within the scope, or 1 and a 32-byte address][rest]. Rest: set [offset u64][more u8][bytes]; get [offset u64][length u32]; list [offset u64][length u32][addresses u8]. The reply: [the syscall's value u64 LE][the bytes for the caller's buffer].
+//! Requests come only from the kernel: each is a process's `SYS_STORE` call (process.rs `store_forward`) or the kernel's own call (`vault_call`: the bridge's store commands, and op 4, drop, at release), stamped with the domain keys of its scope, one transfer at most. [op: 0 set, 1 get, 2 delete, 3 list][flags: bit 0 old entries wait in the kernel's vault][lock epoch u32 LE][domains][per domain: class (1 the person's), address key, sealing key][name length][name: within the scope, or 1 and a 32-byte address][rest]. Rest: set [offset u64][more u8][bytes]; get [offset u64][length u32]; list [offset u64][length u32][addresses u8]. The reply: [the syscall's value u64 LE][the bytes for the caller's buffer].
 //!
 //! Keys live for the request they came with: zeroed after it, and the store's cache knows a key only by its hash. When the lock epoch moves (the person locked), the cache's plaintext and any write of the person's in progress go.
 //!
@@ -56,6 +56,9 @@ const S_SERVE: u64 = 1;
 const S_BLOCKS: u64 = 2;
 const S_ENTROPY: u64 = 3;
 const S_VAULT: u64 = 4;
+
+/// The kernel's own operations, past the four a `SYS_STORE` call makes (process.rs `VOP_*`): drop every value of each stamped domain (release).
+const OP_DROP: u8 = 4;
 
 /// Each mirror's size to start with, in 4 KiB blocks (512 MiB), and where B starts in the window (its second half).
 const MIRROR: u64 = 1 << 17;
@@ -301,6 +304,21 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, m: &[u8], out: &mut [u8]) -
         } else {
             ERR
         }
+    } else if op == OP_DROP {
+        // Release (the kernel's own call): each stamped domain dropped whole (ferros_store `drop_domain`), any write of it in progress with it. How many values went.
+        let (mut n, mut ok) = (0u64, true);
+        for i in 0..count {
+            let (_, mut d) = domain_at(m, 7 + i * 65);
+            let id = *blake3::hash(&d.addr).as_bytes();
+            writers.retain(|p| p.domain != id);
+            match store.drop_domain(&d) {
+                Ok(k) => n += k,
+                Err(_) => ok = false,
+            }
+            wipe(&mut d);
+        }
+        say!("vault: dropped {} domains ({} values){}", count, n, if ok { "" } else { ", some failed" });
+        if ok { n } else { ERR }
     } else {
         let (person, mut d) = domain_at(m, 7);
         let id = *blake3::hash(&d.addr).as_bytes();
