@@ -1573,6 +1573,8 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                 let thv = core::arch::aarch64::vld1q_u8(th.as_ptr());
                 let src = back.as_ptr().add(y * width);
                 let mut x = x0;
+                // The run of blocks made since the last skip, copied to the phase in one wide copy when a skip or the row's end closes it (the phase is not cacheable: a copy a block cost more than the table saved, 77 ms a frame against 33, 2026-11-07).
+                let mut run = x0;
                 while x < x1 {
                     // Compose once (COMPOSITOR.md step 2): sixteen canvas pixels all empty show only the background (the wallpaper, or black), and a phase whose block held just that at its last publish already holds it: nothing composed, nothing through the table, nothing written. The wallpaper lit every pixel, so a pan published the whole screen through the table every frame (25 frames/s, measured 2026-11-07).
                     let glass = x < el || x + 16 > er || (x + 16 > cl && x < cr);
@@ -1583,9 +1585,16 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                     let ci = y * clean_w + x / 16;
                     let bit = 1u8 << k;
                     if !glass && any == 0 && clean[ci] & bit != 0 {
+                        if run < x {
+                            dst[y * width + run..y * width + x].copy_from_slice(&row[run..x]);
+                            PUB_TICKS[2] += (x - run) as u64;
+                        }
+                        PUB_BLOCKS[0] += 1;
                         x += 16;
+                        run = x;
                         continue;
                     }
+                    PUB_BLOCKS[if any == 0 { 1 } else { 2 }] += 1;
                     // The scene: the canvas, and the wallpaper under it where there is one (the canvas's pixels are premultiplied with their alpha, so the wallpaper shows in exactly the room each leaves: a circle's edge, a glow).
                     let mut scene = [0u64; 16];
                     let scene_at = if wall != 0 {
@@ -1615,10 +1624,11 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                             clean[ci] &= !bit;
                         }
                     }
-                    // Each block written as it is made: a skipped one leaves the phase as it is.
-                    dst[y * width + x..y * width + x + 16].copy_from_slice(&row[x..x + 16]);
-                    PUB_TICKS[2] += 16;
                     x += 16;
+                }
+                if run < x1 {
+                    dst[y * width + run..y * width + x1].copy_from_slice(&row[run..x1]);
+                    PUB_TICKS[2] += (x1 - run) as u64;
                 }
             }
             unsafe {
@@ -1634,6 +1644,8 @@ static mut SEC_US: [u64; 8] = [0; 8];
 static mut CLEAR_US: u64 = 0;
 /// The publish's own split, in counter ticks since the last camera op: the NEON loop, the copy out, and pixels.
 static mut PUB_TICKS: [u64; 3] = [1; 3];
+/// Measuring compose-once: 16-pixel blocks skipped, made with an empty canvas, made with something drawn, since the last report.
+static mut PUB_BLOCKS: [u64; 3] = [0; 3];
 
 /// Content changed inside `r`: every phase owes it; the one on the layer is paid now (with whatever it already owed).
 /// A frame into the ring: the next phase in turn, never the one on the layer (which the panel may still be reading), and it becomes the current one. Every frame goes this way — a camera op, an app's frame, the status line — so the frame after can be armed at once (the buffer it writes was on screen three frames before) and consecutive frames carry consecutive phases' thresholds: the temporal dither at whatever rate frames come, 120 Hz under a finger, 10 Hz at rest (the flip below, which publishes nothing once the ring holds the image).
@@ -4225,7 +4237,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         }
                     }
                     let mut t_phase = now();
-                    unsafe { SCENE_US = [0; 3]; PUB_TICKS = [0; 3] };
+                    unsafe { SCENE_US = [0; 3]; PUB_TICKS = [0; 3]; PUB_BLOCKS = [0; 3] };
                     let (wq, hq) = ((width as i64) << 7, (height as i64) << 7);
                     // The glows, collected as the circles go and drawn after all of them, so they land behind every circle (front to back: what is drawn later goes under). Each: centre, radius (Q8), colour, peak.
                     let mut glows = [(0i64, 0i64, 0i64, 0u32, 0u32); 256];
@@ -5156,6 +5168,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 tlog.dec(unsafe { PUB_TICKS[1] } * 1000 / freq());
                 tlog.s(b" ms, kpx ");
                 tlog.dec(unsafe { PUB_TICKS[2] } / 1000);
+                tlog.s(b", blocks skipped ");
+                tlog.dec(unsafe { PUB_BLOCKS[0] });
+                tlog.s(b" empty ");
+                tlog.dec(unsafe { PUB_BLOCKS[1] });
+                tlog.s(b" drawn ");
+                tlog.dec(unsafe { PUB_BLOCKS[2] });
                 tlog.s(b"; camera: scene ");
                 for (k, name) in [b" ms, - " as &[u8], b" ms, publish ", b" ms, waited for the last frame ", b" ms\n"].iter().enumerate() {
                     tlog.dec(unsafe { PHASE_US[k] } / 1000);

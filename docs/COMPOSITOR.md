@@ -52,6 +52,22 @@ Anything that draws on the render thread can stall the screen. The cure is struc
 - The DPU's hardware windows. They blend Porter-Duff over, so they serve only pure selection: an opaque full-screen app in a plane, nothing blended against it.
 - The GPU for `under`: the owner's decision, 2026-11-05. The GPU makes compute-dense layers; `under` and the present stay on NEON.
 
+## The open circle is an app's region (owner, 2026-11-07)
+
+The owner: "that's basically the internal region for the app, the rest should stay fixed aside from clock and signal updates on occasion with an atomic. Could also maintain a clean window and always just throw the text right on top. since that circle is ours we can do whatever we want with the inside."
+
+Measured that day:
+- With settings open, every frame redrew the whole scene. The settings circle fills the screen, and its mark was drawn again each frame (14 ms; too big for the sprite cache).
+- The whole screen was published: about 105,000 of 108,000 blocks had something drawn, so compose-once found nothing to skip.
+- That is 39 ms a frame, 25 frames a second, for a page where only text moved.
+
+The design:
+- **The clean window.** The open circle's ground and the ferros mark, made once for the circle's size and turn and kept, never redrawn while the page scrolls or turns.
+- **The text in front.** The page's text is its own layer, drawn first (nearest the viewer) and composed under onto the clean window, only in the rows that changed. No Porter-Duff over anywhere.
+- **The chrome stays fixed.** Outside the circle nothing moves but the console's own updates, which its worker publishes when they change (step 1).
+- **Titles turn in.** A page's title spins about its own centre into place as the page changes, instead of sliding and being clipped at the circle's edge. The glyph engine draws each glyph at any angle, so a title is a few glyphs a frame.
+- **Settings is the first app.** Its region uses the same machinery as an app window: surfaces, span chains, `publish_app`. What it learns, apps get.
+
 ## Build order
 
 0. **Measure the interactive path** (touch → map → display) to know where the 72 frames/s go.
