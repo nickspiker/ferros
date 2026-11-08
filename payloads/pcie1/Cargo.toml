@@ -9,6 +9,8 @@ name = "pcie1"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
+ferros_sys = { path = "../../ferros_sys", features = ["detail"] }
+# The heap the detail document is built in (ferros_sys::detail, docs/RADIO-CONTROLS.md).
+ferros_heap = { path = "../../ferros_heap" }
 # The per-network MAC (keyed BLAKE3 of the SSID under the ira-derived key), portable code only.
 blake3 = { version = "1", default-features = false, features = ["pure"] }

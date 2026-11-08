@@ -242,6 +242,9 @@ pub fn detail(cap: u64, link: u64, buf: &mut [u8]) -> Option<usize> {
 
 #[cfg(feature = "detail")]
 pub mod detail;
+/// The VSF crate the detail documents are made of, for a driver building one.
+#[cfg(feature = "detail")]
+pub use vsf;
 pub const MEASURE_NONE: u64 = u64::MAX;
 pub const TECH_NONE: u8 = 0;
 pub const TECH_WIFI4: u8 = 1;

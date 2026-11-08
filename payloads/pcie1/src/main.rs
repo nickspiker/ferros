@@ -8,7 +8,17 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use ferros_sys::svc;
+
+/// The heap the link's detail document is built in (ferros_sys::detail): a few hundred bytes a build, rebuilt only when the link changes.
+const HEAP_SIZE: usize = 1 << 16;
+#[repr(C, align(64))]
+struct Heap([u8; HEAP_SIZE]);
+static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
+#[global_allocator]
+static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
 
 const ELBI: u64 = 1;
 const SOC: u64 = 2;
@@ -226,6 +236,7 @@ _entry:
 
 extern "C" fn pcie1_main(grants: u64, input: u64, input_len: u64) -> ! {
     let (base, freq) = (ferros_sys::arc_base(), ferros_sys::freq());
+    unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
     // Spawned by init at boot there is no input (a spawn from the vault carries none): with the vault scope granted, the whole bring-up from the vault's files; from the bridge, the stage byte it was given.
     // The grant count at 0x200 of the grants page (the handle table fills the first 512 bytes since 2026-11-03; read at 0 it was 0, and the driver thought it had no vault scope).
     let has_store = unsafe { core::ptr::read_volatile((base + grants + 0x200) as *const u32) } as u64 > STORE;
@@ -935,7 +946,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let cons_before = d.tcm_rd(cons + 16);
     let t0 = d.now();
     let rx_off = d.tcm_rd(sh + 36);
-    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); 64], rxq_head: 0, rxq_len: 0 };
+    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); 64], rxq_head: 0, rxq_len: 0 };
     // Control submit ring: 8 ioctl response buffers and 8 event buffers first (the firmware DMAs ioctl results into a posted response buffer, named by its request id in the completion).
     for b in 0..8u32 {
         m.post(d, 0x0B, 1 + b, [8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
@@ -985,6 +996,8 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
             m.want[..ssid.len()].copy_from_slice(ssid);
             m.want_len = ssid.len();
         }
+        // The band knob as it stands now, after any wait for the credential: the join takes it (docs/RADIO-CONTROLS.md).
+        m.band = ferros_sys::controls(ferros_sys::control::WIFI)[ferros_sys::control::WIFI_BAND as usize];
         scan(d, &mut m, clm);
         if stage >= 12 {
             join(d, &mut m, cred);
@@ -1027,6 +1040,8 @@ struct Msgbuf {
     want: [u8; 32],
     want_len: usize,
     target: Option<Target>,
+    /// The band knob as it stood before the scan (ferros_sys::control::WIFI_BAND: 0 or unset any, 1 5 GHz only, 2 2.4 GHz only), for the join's choice.
+    band: u64,
     /// Join progress from events: link up (16), keyed (46 with status 6 or 10, reason 0), or a failure.
     linked: bool,
     keyed: bool,
@@ -1440,6 +1455,10 @@ impl Msgbuf {
         }
         let rssi = (dr32u(bi + 76) >> 16) as u16 as i16;
         let five = cs & 0xC000 == 0xC000;
+        // The band knob (ferros_sys::control::WIFI_BAND): 1 keeps only 5 GHz, 2 only 2.4 GHz; anything else (0, unset, a value this driver does not know) is any.
+        if (self.band == 1 && !five) || (self.band == 2 && five) {
+            return;
+        }
         // 5 GHz whenever the network has it, then signal; 2.4 GHz only where there is no 5 GHz. No 2.4 GHz join has held under ferros: each associated, then lost the link waiting for the first beacon (WLC_E_LINK reason 8, NO_FIRST_BCN_RX) — the first on 2026-10-15, three more on 2026-11-04 at −36 dBm, chosen over 5 GHz at −55 by the 15 dB preference this replaces. 2.4 GHz shares the antenna with Bluetooth, which nothing here coordinates with WiFi yet, and which was advertising the pairing beacon each time.
         if self.target.map(|t| (t.five, t.rssi) >= (five, rssi)).unwrap_or(false) {
             return;
@@ -1519,6 +1538,9 @@ fn publish_measures(m: &mut Msgbuf, d: &mut Drv, pkts: &mut [u32; 4]) {
         for s in 1..8 {
             status(s, MEASURE_NONE);
         }
+        for t in 0..WIFI_TRACKS {
+            ferros_sys::status_track(t, MEASURE_NONE);
+        }
         return;
     }
     let rssi = ask(m, d, 127, 12).map(|a| dr32u(a) as i32);
@@ -1570,6 +1592,59 @@ fn publish_measures(m: &mut Msgbuf, d: &mut Drv, pkts: &mut [u32; 4]) {
         }
         None => MEASURE_NONE,
     });
+    // The tracks (docs/RADIO-CONTROLS.md), what the eight slots have no room for: the channel, the transmit power (`qtxpower`: quarter dBm, bit 31 the override flag; brcmfmac's reading), the power-save mode the firmware holds (WLC_GET_PM 85), and the packet counters (WLC_GET_PKTCNTS, cumulative since the chip came up). A track the firmware did not answer is emptied.
+    let track = |t: usize, v: Option<u64>| {
+        ferros_sys::status_track(t, v.unwrap_or(MEASURE_NONE));
+    };
+    track(0, cs.map(|cs| w(k::CHANNEL, (cs & 0xFF) as i64)));
+    let q = match m.get_var(d, b"qtxpower", req) {
+        Some((0, b, _)) => Some((dr32u(m.resp(b)) & 0x7FFF_FFFF) as i64),
+        _ => None,
+    };
+    track(1, q.map(|q| w(k::TX_POWER, q * 250)));
+    track(2, ask(m, d, 85, 4).map(|a| w(k::POWER_SAVE, dr32u(a) as i64)));
+    track(3, now.map(|c| w(k::PACKETS_DOWN, c[0] as i64)));
+    track(4, now.map(|c| w(k::ERRORS_DOWN, c[1] as i64)));
+    track(5, now.map(|c| w(k::PACKETS_UP, c[2] as i64)));
+    track(6, now.map(|c| w(k::ERRORS_UP, c[3] as i64)));
+}
+
+/// The WiFi link's tracks this driver fills (`publish_measures`), emptied while there is no link.
+const WIFI_TRACKS: usize = 7;
+
+/// The link's detail for its settings page (ferros_sys::detail::WIFI): the network's name from the credential (ASCII only: a name that is not is left out rather than mangled), the access point joined, this device's address on it, and what DHCP gave when this driver ran it (in service the `ip` process runs DHCP, and its lease is not here).
+fn publish_detail(m: &Msgbuf) {
+    use ferros_sys::detail::publish;
+    use ferros_sys::vsf::VsfType;
+    let mut f = alloc::vec::Vec::new();
+    let ssid = &m.want[..m.want_len];
+    if !ssid.is_empty() && ssid.iter().all(|&c| (0x20..0x7F).contains(&c)) {
+        f.push(("ssid", VsfType::a(ssid.iter().map(|&c| c as char).collect())));
+    }
+    if let Some(t) = m.target {
+        f.push(("bssid", VsfType::nm(t.bssid)));
+    }
+    if m.mac != [0; 6] {
+        f.push(("mac", VsfType::nm(m.mac)));
+    }
+    if let (true, Some((ip, _))) = (m.acked, m.offer) {
+        f.push(("ipv4", VsfType::ni(ip)));
+        f.push(("router", VsfType::ni(m.lease[1])));
+        f.push(("dns", VsfType::ni(m.lease[2])));
+        f.push(("lease", VsfType::u(m.lease_s as usize, false)));
+    }
+    publish(ferros_sys::control::WIFI, f);
+}
+
+/// The knobs as the control block holds them (ferros_sys::control): power save applied at once (WLC_SET_PM 86: 0 off, 1 PM1, 2 PM2); unset is today's off, set at the join; a value past 2 is not this driver's and is left alone. The band is the join's (`consider`), read before the scan.
+fn apply_controls(m: &mut Msgbuf, d: &mut Drv, c: &[u64; ferros_sys::control::WORDS]) {
+    let pm = c[ferros_sys::control::WIFI_POWER_SAVE as usize];
+    if pm <= 2 {
+        let r = m.ioctl_int(d, 86, pm as u32);
+        d.kv(b"power save set", pm as u32);
+        d.kv(b"WLC_SET_PM", r);
+        d.flush();
+    }
 }
 
 fn be16(a: u32) -> u32 {
@@ -1662,9 +1737,22 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     // The corners' WiFi circle (SYS_STATUS): the link's own measures every two seconds, each in its unit, published only where the firmware answers (owner: many dimensions, never bars). Into the scan's request area: no scan runs while serving.
     let mut status_at = 0u64;
     let mut pkts = [0u32; 4];
+    // The link's names and addresses for its settings page (ferros_sys::detail, behind the Settings capability): they hold while this join does.
+    publish_detail(m);
+    // The control block (docs/RADIO-CONTROLS.md), looked at four times a second: a generation moved since the last look is a knob set. None: not looked at yet, so the first look applies what is kept.
+    let mut control_at = 0u64;
+    let mut control_gen: Option<u64> = None;
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
+        if d.now().wrapping_sub(control_at) >= d.freq / 4 {
+            control_at = d.now();
+            let c = ferros_sys::controls(ferros_sys::control::WIFI);
+            if control_gen != Some(c[0]) {
+                control_gen = Some(c[0]);
+                apply_controls(m, d, &c);
+            }
+        }
         if d.now().wrapping_sub(status_at) >= 2 * d.freq {
             status_at = d.now();
             publish_measures(m, d, &mut pkts);
