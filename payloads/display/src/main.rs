@@ -1776,6 +1776,8 @@ static mut RAISES: u32 = 0;
 const CLEAR: u64 = 1 << 63;
 /// The rows outside the app's circle at the top and at the bottom (`chrome_rows`): the bars' rows.
 static mut CHROME_TOP: usize = 0;
+/// Full screen (owner, 2026-11-07: slide from the home circle to the centre): the console, the helm and the app's circle hidden, only the glass's edge left (black, and orange on development builds). Toggled by op 43; the corners stay the system's, so the same gesture comes back.
+static mut FULL: bool = false;
 static mut CHROME_BOT: usize = 0;
 /// The bars (owner, 2026-11-07): the console, the circles at the top of the screen (the radios' switches and the system's indicators), over the `CHROME_TOP` rows, then the helm, home and back at the bottom, over the `CHROME_BOT` rows. They are the frontmost layer but the glass's edge, over the home screen and every app alike, in screen coordinates, so nothing transforms them. Drawn as fluor draws: front to back from empty, into fluor's 16-bit α + darkness (`G2T16`), by fluor's one `under`; redrawn only when what they show changes (`console_draw`, `helm_draw`).
 static mut BAR: usize = 1;
@@ -1809,6 +1811,10 @@ fn bar_row(y: usize, height: usize) -> Option<usize> {
 /// The bars at screen row `y`: the columns holding any of them (from, to) and the row's decoded pixels (`BAR_W`); an empty span and no pixels off their rows.
 #[inline]
 fn bar_line(y: usize, width: usize, height: usize) -> ((usize, usize), &'static [u64]) {
+    // Full screen: the bars hidden, every publish passes their rows untouched.
+    if unsafe { FULL } {
+        return ((0, 0), &[]);
+    }
     match bar_row(y, height) {
         Some(b) => unsafe {
             let s = *(BAR_SPAN as *const (u16, u16)).add(b);
@@ -2249,14 +2255,18 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
             let (first, next) = (g.first as usize, rows[y + 1].first as usize);
             let (cl, cr, ml, mr) = (g.chrome_l as usize, g.chrome_r as usize, g.mask_l as usize, g.mask_r as usize);
             if cl > 0 || cr < width || ml > 0 || mr < width || first != next {
-                px[xa..xb.min(cl)].fill(0);
-                if xa.max(cr) < xb {
-                    px[xa.max(cr)..xb].fill(0);
+                // Full screen (`FULL`): no circle, the app to the glass's edge.
+                let full = unsafe { FULL };
+                if !full {
+                    px[xa..xb.min(cl)].fill(0);
+                    if xa.max(cr) < xb {
+                        px[xa.max(cr)..xb].fill(0);
+                    }
                 }
                 let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), next) };
                 let row_px = &plan[first..next];
                 let split = row_px.iter().position(|e| e.1 == SHAPE_EDGE).unwrap_or(row_px.len());
-                for &(x, _, c, h) in &row_px[..split] {
+                for &(x, _, c, h) in &row_px[..if full { 0 } else { split }] {
                     let x = x as usize;
                     if x < xa || x >= xb {
                         continue;
@@ -3483,7 +3493,7 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         if op == 41 && n >= 5 {
-            // Which console circle is at this point: [x u16][y u16] → the radio's bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS), or G#FF for none or a circle that is not a radio. The map asks it on a tap in the top rows, to switch that radio (preference 15).
+            // Which corner circle is at this point: [x u16][y u16] → the radio's bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS), 8 home, 9 back, or G#FF for none or another circle. The map asks it on a tap in the top rows, to switch that radio (preference 15).
             let (w, h) = unsafe { SCREEN_WH };
             let (x, y) = (u16::from_le_bytes([msg[1], msg[2]]) as f32 + 0.5, u16::from_le_bytes([msg[3], msg[4]]) as f32 + 0.5);
             let (circles, cn) = corner_layout(w as usize, h as usize);
@@ -3496,6 +3506,9 @@ extern "C" fn receive(grants: u64) -> ! {
                         Corner::Bluetooth => 2,
                         Corner::Nfc => 3,
                         Corner::Gps => 4,
+                        // The helm's two (owner, 2026-11-07): home and back, for the map's corner gestures.
+                        Corner::Home => 8,
+                        Corner::Back => 9,
                         _ => 0xFF,
                     };
                 }
@@ -4425,6 +4438,15 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         },
                         None => out[0] = 3,
                     }
+                }
+                Some(43) => {
+                    // Full screen on or off (`FULL`; the map sends it when a touch from the home circle is let go at the screen's centre): every phase republished, the bars and the circle gone or back. Replies the new state.
+                    unsafe {
+                        FULL = !FULL;
+                        PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
+                        out[1] = FULL as u8;
+                    }
+                    last_interaction = 0;
                 }
                 Some(16) if m.len() >= 11 => {
                     let v = |i: usize| i16::from_le_bytes([m[i], m[i + 1]]) as isize;

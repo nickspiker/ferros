@@ -1740,6 +1740,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut down = false;
     let mut most = 0usize;
     let mut moved = false;
+    // A session that began on one of the helm's corner circles (the display's op 41: 8 home, 9 back; 0 none), and where its first finger is now: the system's gesture, never a pan (owner, 2026-11-07: from the home circle to the centre and let go, full screen on or off).
+    let mut corner = 0u8;
+    let mut corner_at = (0i64, 0i64);
     let mut start = [(false, 0i64, 0i64); 16];
     // The circle the fingers hold, decided again whenever the number of moving fingers changes (one finger: the circle it started on; two: the circle both are inside), and for how many fingers it was decided.
     let mut grab: Option<usize> = None;
@@ -1809,10 +1812,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             if map.app_done() {
                 map.app_front = false;
                 map.draw();
-            } else {
-                sleep_until(now() + freq() / 10);
-                continue;
             }
+            // Still in front: the touches are its, but the corners are the system's (WINDOWS.md), so they are read on below for a corner gesture, and nothing else is done with them.
         }
         // The screen off (the power key): no touches reach the map.
         let t_loop = now();
@@ -1899,6 +1900,13 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.panned = false;
             map.pan = None;
             map.settling = map.target.is_some();
+            // Where the first finger landed: on the home or back circle, the session is the corner's.
+            let f = cur[ids[0]];
+            let mut q = [0u8; 4];
+            let (xb, yb) = ((f.1 as u16).to_le_bytes(), (f.2 as u16).to_le_bytes());
+            let hit = if call(map.display, &[41, xb[0], xb[1], yb[0], yb[1]], &mut q) >= 1 { q[0] } else { 0xFF };
+            corner = if hit == 8 || hit == 9 { hit } else { 0 };
+            corner_at = (f.1, f.2);
         }
         if down {
             most = most.max(held);
@@ -1911,9 +1919,32 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     moved = true;
                 }
             }
+            if corner != 0 && held >= 1 {
+                corner_at = (cur[ids[0]].1, cur[ids[0]].2);
+            }
         }
         if held == 0 && down {
             down = false;
+            // A corner's session let go: from the home circle to the screen's centre (within a quarter of the narrower side), full screen on or off (the display's op 43). Back's slide waits for the owner's word on what it opens (WINDOWS.md: the map is already recents).
+            // A still tap on a corner circle is a tap as before (on the home circle it closes the open settings); only a slide is the corner's.
+            if corner != 0 && !moved {
+                corner = 0;
+            }
+            if corner != 0 {
+                let (dx, dy) = (corner_at.0 - w / 2, corner_at.1 - h / 2);
+                let reach = w.min(h) / 4;
+                if corner == 8 && dx * dx + dy * dy < reach * reach {
+                    let mut q = [0u8; 4];
+                    let n = call(map.display, &[43], &mut q);
+                    console(grants, if n >= 2 && q[1] == 1 { b"map: full screen\n" } else { b"map: full screen off\n" });
+                }
+                corner = 0;
+                continue;
+            }
+            // An app in front: its own touches, nothing for the map.
+            if map.app_front {
+                continue;
+            }
             // A drag on the open settings lifted: the strip snaps, the fling carries on, stepped from the last frame the drag saw.
             if matches!(map.view, View::Open(_)) && map.swipe != 0 {
                 map.release_settings();
@@ -1973,6 +2004,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
         }
 
+        // A corner's session moves nothing on the map; with an app in front the map does nothing else at all, reading touches only for the corners, a hundred and twenty-eighth of a second apart while one is held, a sixty-fourth between.
+        if corner != 0 || map.app_front {
+            prev = cur;
+            sleep_until(now() + freq() / if down { 1 << 7 } else { 1 << 6 });
+            continue;
+        }
         // Drags and pinches, once the fingers have moved past the slop: the contacts present both now and last frame are the ones that moved.
         // One finger on the open settings: across goes round the pages, up and down scrolls the page (owner, 2026-11-05); two fingers still leave for the plane.
         if moved && held == 1 && matches!(map.view, View::Open(_)) {
