@@ -21,6 +21,15 @@ libc = { path = "/mnt/Harbor/Code/ferros-libc" }
 panic = "abort"
 opt-level = 1
 
+# The dependencies at full optimisation (fluor's rasterizers and composes, cosmic-text and swash's shaping and glyphs: every pixel of a frame runs through them), Photon's own code at the development level above so its relink stays quick (2026-11-08: at opt-level 1 the frame's full-screen passes took 10 to 30 ms each on the A715s).
+[profile.dev.package."*"]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev.package.photon-messenger]
+opt-level = 1
+
 [profile.release]
 panic = "abort"
 
