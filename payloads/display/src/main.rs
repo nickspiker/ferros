@@ -2953,6 +2953,8 @@ fn battery_flavour(charge: u64) -> (f32, f32, f32) {
 
 /// The vessel's rim, in the circle's radius (tools/orb-tune's defaults, Lumis's proportions: its rings at 0.052h, 0.048h, 0.039h of a box h tall): the green ring's depth from the edge; each ring's inner tail λ (it fades e-fold every λ inward: Lumis's v = k³w⁹ moves e-fold every 0.0063h) and its outer sharpness s (the profile exp(−s(e^{t/s} − 1 − t/s)), at s = ¼ down to 0.5 % where Lumis's reaches zero); and the channels' separation (blue that much further out, red half of it further in; orb-tune's default at its band 1, 0.018 widened half a stop).
 const VESSEL_DEPTH: f32 = 0.096;
+/// NFC's symbol lit by the inverse square of the distance instead of its log (owner, 2026-11-07: to compare the two).
+const NFC_INV_SQ: bool = false;
 const VESSEL_LAMBDA: f32 = 0.0126;
 const VESSEL_SHARP: f32 = 1.0 / (1 << 2) as f32;
 const VESSEL_SEP: f32 = 0.018 * core::f32::consts::SQRT_2;
@@ -3163,6 +3165,60 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                         let Some(i) = at(px, py) else { continue };
                         let cov = draw::bump_step((1.0 - pin(px as f32 + 0.5 - cx, py as f32 + 0.5 - cy)) * 0.5);
                         console[i] = console[i].under(ink | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
+                    }
+                }
+            } else if matches!(what, Corner::Wifi | Corner::Cellular | Corner::Nfc) {
+                // The radio's own field, switched off, in the ink and posterised to near black and white (owner, 2026-11-07): WiFi a single emitter's waves; cellular a mesh of emitters at random places, their ripples interfering; NFC the magnetic dipole's field lines, the figure-eight, its light falling off with the log of the distance. Posterised by tanh (the bands near flat, their edges C∞); faded out before the rim by the C∞ bump exp(1 − 1/(1 − t²)).
+                let ri = r * (1.0 - 2.0 * VESSEL_DEPTH);
+                let post = |v: f32| 0.5 + 0.5 * libm::tanhf((1 << 2) as f32 * v);
+                let env = |q2: f32| {
+                    let t2 = q2 / (ri * ri);
+                    if t2 >= 1.0 { 0.0 } else { libm::expf(1.0 - 1.0 / (1.0 - t2)) }
+                };
+                let tau = core::f32::consts::TAU;
+                // Cellular's emitters: fixed places (a hash of their number) inside the inner disc, each with its own phase.
+                let emitters: [(f32, f32, f32); 6] = core::array::from_fn(|k| {
+                    let h = (k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    let u = |s: u32| ((h >> s) & 0xFFFF) as f32 * (1.0 / 65536.0);
+                    let (a, rr) = (tau * u(0), 0.7 * libm::sqrtf(u(16)));
+                    (rr * libm::cosf(a) * ri, rr * libm::sinf(a) * ri, tau * u(32))
+                });
+                let field = |dx: f32, dy: f32| -> f32 {
+                    match what {
+                        Corner::Wifi => {
+                            // The emitter a little below the centre, its wavelength a third of the field, the 2-D wave's amplitude falling as 1/√d.
+                            let lam = ri * (1.0 / 3.0);
+                            let d = libm::sqrtf(dx * dx + (dy - ri * 0.35) * (dy - ri * 0.35));
+                            post(libm::sinf(tau * d / lam) / libm::sqrtf(1.0 + d / lam))
+                        }
+                        Corner::Cellular => {
+                            let lam = ri * (1.0 / (1 << 2) as f32);
+                            let mut s = 0.0;
+                            for &(ex, ey, ph) in &emitters {
+                                let d = libm::sqrtf((dx - ex) * (dx - ex) + (dy - ey) * (dy - ey));
+                                s += libm::cosf(tau * d / lam + ph) / libm::sqrtf(1.0 + d / lam);
+                            }
+                            post(s * libm::sqrtf(1.0 / 6.0))
+                        }
+                        _ => {
+                            // The dipole upright at the centre: its field lines ρ = C sin²θ, banded by the stream function sin²θ/ρ; ρ softened by a small core so the centre is finite.
+                            let (ux, uy) = (dx / ri, dy / ri);
+                            let core2 = 1.0 / (1 << 6) as f32;
+                            let rho = libm::sqrtf(ux * ux + uy * uy + core2);
+                            let psi = (ux * ux / (rho * rho)) / rho;
+                            // The light by the distance: the log falloff (ln(1/ρ) over its range), or, NFC_INV_SQ, the inverse square.
+                            let light = if NFC_INV_SQ { core2 / (rho * rho) } else { libm::logf(1.0 / rho) / libm::logf(1.0 / libm::sqrtf(core2)) };
+                            post(libm::sinf(tau * (1 << 1) as f32 * psi)) * light
+                        }
+                    }
+                };
+                let (x0, x1, y0, y1) = ((x - ri) as i64, (x + ri) as i64 + 1, (y - ri) as i64, (y + ri) as i64 + 1);
+                for py in y0..=y1 {
+                    for px in x0..=x1 {
+                        let Some(i) = at(px, py) else { continue };
+                        let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
+                        let a = field(dx, dy) * env(dx * dx + dy * dy);
+                        console[i] = console[i].under(ink | ((a * 65535.0) as u64) << 48, BlendMode::Normal);
                     }
                 }
             } else if !name.is_empty() {
