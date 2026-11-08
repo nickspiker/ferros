@@ -2136,6 +2136,14 @@ struct Online {
     suspends: u32,
     /// UL packets still to log by shape (TRACE sets both).
     ul_log: u32,
+    /// The control block (docs/RADIO-CONTROLS.md): when it was last looked at (µs since online), its generation then (None: not yet), the re-register count last acted on (None: not yet seen, the first look only records it), and when the radio goes back on after a re-register's off.
+    ctl_at: u64,
+    ctl_gen: Option<u64>,
+    rereg_seen: Option<u64>,
+    rereg_on: Option<u64>,
+    /// The tracks last published (µs since online), and the call the detail was last published for (None: never; Some(None): no call).
+    tracks_at: u64,
+    detail_for: Option<Option<u8>>,
 }
 
 /// Bytes as hex, `n` of them from `at`.
@@ -2185,6 +2193,77 @@ impl Online {
         status(4, s.rsrq.map_or(MEASURE_NONE, |v| w(k::RSRQ, v * 1000)));
         status(5, s.snr.map_or(MEASURE_NONE, |v| w(k::SNR, v * 100)));
     }
+    /// The service's own part of a pass (docs/RADIO-CONTROLS.md): the tracks every two seconds, the detail when the call comes or goes, and the control block four times a second.
+    fn service_extras(&mut self, rep: &mut Vec<u8>) {
+        let t = since_us(self.t0);
+        if t.wrapping_sub(self.tracks_at) >= 2_000_000 {
+            self.tracks_at = t;
+            self.publish_tracks();
+        }
+        let call = self.call.map(|c| c.cid);
+        if self.detail_for != Some(call) {
+            self.detail_for = Some(call);
+            self.publish_detail();
+        }
+        if t.wrapping_sub(self.ctl_at) >= 250_000 {
+            self.ctl_at = t;
+            let c = ferros_sys::controls(ferros_sys::control::CELLULAR);
+            if self.ctl_gen != Some(c[0]) {
+                self.ctl_gen = Some(c[0]);
+                let n = c[ferros_sys::control::CELL_REREGISTER as usize];
+                // The first look only records the count: a count set before this service came up is not an order to this one.
+                if self.rereg_seen.is_some_and(|s| s != n) && self.rereg_on.is_none() {
+                    match sit_request(&mut self.link, CH_FMT0 + 1, SIT_SET_RADIO_POWER, &[1, 0, 0, 0, 0, 0]) {
+                        Ok(tok) => line(rep, alloc::format!("t={} ms: re-register asked: -> SIT_SET_RADIO_POWER off ch A#{} token A#{tok}\n", t / 1000, CH_FMT0 + 1)),
+                        Err(e) => line(rep, alloc::format!("t={} ms: re-register: SIT_SET_RADIO_POWER off not sent: {e}\n", t / 1000)),
+                    }
+                    // Back on half a second later, as the bring-up's own cycle (stage G#10).
+                    self.rereg_on = Some(t + 500_000);
+                }
+                self.rereg_seen = Some(n);
+            }
+        }
+        if self.rereg_on.is_some_and(|at| t > at) {
+            self.rereg_on = None;
+            match sit_request(&mut self.link, CH_FMT0 + 1, SIT_SET_RADIO_POWER, &[2, 0, 0, 0, 0, 0]) {
+                Ok(tok) => line(rep, alloc::format!("t={} ms: re-register: -> SIT_SET_RADIO_POWER on ch A#{} token A#{tok}\n", t / 1000, CH_FMT0 + 1)),
+                Err(e) => line(rep, alloc::format!("t={} ms: re-register: SIT_SET_RADIO_POWER on not sent: {e}\n", t / 1000)),
+            }
+            // The registration asked again in a second, not at the 64 s backstop.
+            self.next_reg = t + 1_000_000;
+        }
+    }
+
+    /// The tracks (ferros_sys::measure), beyond the eight slots: the data stack's registration state (the reply's first byte), the call's MTU, packets down and up, dropped down (the queue full, or malformed), refused up (the ring full), and the link's suspends. Each emptied where unknown.
+    fn publish_tracks(&self) {
+        use ferros_sys::{measure as k, measure_word as w, status_track, MEASURE_NONE};
+        status_track(0, self.reg_last[1].map_or(MEASURE_NONE, |s| w(k::REGISTRATION, s[0] as i64)));
+        status_track(1, self.call.map_or(MEASURE_NONE, |c| w(k::MTU, c.mtu as i64)));
+        status_track(2, w(k::PACKETS_DOWN, self.packets as i64));
+        status_track(3, w(k::PACKETS_UP, self.ul_sent as i64));
+        status_track(4, w(k::DROPPED_DOWN, (self.dl_dropped + self.dl_bad) as i64));
+        status_track(5, w(k::DROPPED_UP, self.ul_full as i64));
+        status_track(6, w(k::SUSPENDS, self.suspends as i64));
+    }
+
+    /// The detail for the settings page (ferros_sys::detail::CELLULAR, behind the Settings capability): the carrier pack loaded (fixed today), the data and attach APNs, and while a call is up its addresses and DNS servers (the line's: never logged, shown only to the person).
+    fn publish_detail(&self) {
+        use ferros_sys::vsf::VsfType;
+        let text = |b: &[u8]| VsfType::a(b.iter().map(|&c| c as char).collect());
+        let mut f = alloc::vec![("carrier", VsfType::a(alloc::string::String::from("Verizon"))), ("apn", text(DATA_APN)), ("attach_apn", text(ATTACH_APN))];
+        if let Some(c) = self.call {
+            if c.v4 != [0; 4] {
+                f.push(("ipv4", VsfType::ni(c.v4)));
+                f.push(("dns4", VsfType::ni(c.dns4)));
+            }
+            if c.v6 != [0; 16] {
+                f.push(("ipv6", VsfType::nj(c.v6)));
+                f.push(("dns6", VsfType::nj(c.dns6)));
+            }
+        }
+        ferros_sys::detail::publish(ferros_sys::control::CELLULAR, f);
+    }
+
     fn new(t0: u64, probe: u8) -> Self {
         Online {
             t0,
@@ -2229,6 +2308,12 @@ impl Online {
             idle_since: None,
             suspends: 0,
             ul_log: 0,
+            ctl_at: 0,
+            ctl_gen: None,
+            rereg_seen: None,
+            rereg_on: None,
+            tracks_at: 0,
+            detail_for: None,
         }
     }
 
@@ -2298,6 +2383,9 @@ impl Online {
             }
         }
         self.last = now_s;
+        if probe == SERVICE {
+            self.service_extras(rep);
+        }
         let link = &mut self.link;
         if probe >= 1 && !self.probed && since_us(t0) > 2_000_000 {
             self.probed = true;
