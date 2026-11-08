@@ -47,6 +47,12 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let (mut x, mut y): (i64, i64) = if a.len() >= 3 { (a[1].parse().unwrap(), a[2].parse().unwrap()) } else { (518, 48) };
     let mut points: Vec<(i64, i64)> = Vec::new();
+    // Every logged point also goes to a file as it is taken, so a terminal that loses its scrollback loses nothing (2026-11-08: a corner's scan vanished with a click).
+    let _ = std::fs::create_dir_all("/mnt/Harbor/tmp/cutout-scan");
+    // Named by the first number not yet taken (scan-0, scan-1, …): no clock in it.
+    let log_path = (0..).map(|n| format!("/mnt/Harbor/tmp/cutout-scan/scan-{n}.txt")).find(|p| !std::path::Path::new(p).exists()).unwrap();
+    let mut log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path).ok();
+    println!("points also go to {log_path}");
     let raw = Raw::on();
     let say = |s: String| {
         print!("\r\x1b[2K{s}");
@@ -71,6 +77,10 @@ fn main() {
             [b' '] => {
                 points.push((x, y));
                 print!("\r\x1b[2Klogged {x} {y}\r\n");
+                if let Some(f) = log.as_mut() {
+                    let _ = writeln!(f, "{x} {y}");
+                    let _ = f.flush();
+                }
                 say(format!("dot at ({x}, {y})  logged ({x}, {y}), points logged {}", points.len()));
                 continue;
             }
