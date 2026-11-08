@@ -624,8 +624,8 @@ fn bilerp(p00: Px, p10: Px, p01: Px, p11: Px, fu: u32, fv: u32) -> Px {
     (rb >> 8 & M) | (ga >> 8 & M) << 16
 }
 
-/// An icon inside the disc of radius `r` (Q8) at (cx, cy), turned by (c, s) Q14 — screen to icon is the inverse turn — under what is there. The mip level is the smallest at least as wide as the disc, so a texel never shrinks more than 2:1; between texels, bilinear. `lit`: the icon's own colours, else its grey (the map at rest). Returns the rectangle it touched.
-pub fn icon(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, c: i64, s: i64, m: &Mips, lit: bool) -> Rect {
+/// An icon inside the disc of radius `r` (Q8) at (cx, cy), turned by (c, s) Q14 — screen to icon is the inverse turn — under what is there, always in its own colours: a circle's graphic stays the same for recognisability, and its glow says its state (owner, 2026-11-08; until then a quiet circle drew its grey). The mip level is the smallest at least as wide as the disc, so a texel never shrinks more than 2:1; between texels, bilinear. Returns the rectangle it touched.
+pub fn icon(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, c: i64, s: i64, m: &Mips) -> Rect {
     if r < 256 {
         return Rect::EMPTY;
     }
@@ -637,7 +637,7 @@ pub fn icon(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
     }
     let size = (m.size >> l) as i64;
     let stride = size as usize + 2 * PAD;
-    let tex = &(if lit { m.rgba } else { m.grey })[m.offset[l]..m.offset[l] + stride * stride];
+    let tex = &m.rgba[m.offset[l]..m.offset[l] + stride * stride];
     // One texel in Q8 screen pixels at radius r, and the trim: the larger of 2 px and 2 texels.
     let texel = (2 * r) / size.max(1);
     let r_art = r + (2 * 256i64).max(2 * texel);

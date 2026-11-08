@@ -2092,8 +2092,8 @@ impl Item {
             Item::Disc(x, y, r, colour, hard) => {
                 if hard { draw::disc_hard(px, width, height, x, y, r, colour) } else { draw::disc(px, width, height, x, y, r, colour) };
             }
-            Item::Icon(x, y, r, c, s, mp, lit) => {
-                draw::icon(px, width, height, x, y, r, c, s, unsafe { &*(mp as *const draw::Mips) }, lit);
+            Item::Icon(x, y, r, c, s, mp, _) => {
+                draw::icon(px, width, height, x, y, r, c, s, unsafe { &*(mp as *const draw::Mips) });
             }
             Item::Glow(x, y, r, colour, peak) => {
                 if GLOW_LOG {
@@ -5412,7 +5412,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                                             draw::disc(px, d, d, c, c, ri, 0);
                                         }
                                         Some(mp) => {
-                                            draw::icon(px, d, d, c, c, ri, tc, ts, mp, lit);
+                                            draw::icon(px, d, d, c, c, ri, tc, ts, mp);
                                         }
                                         None => {
                                             draw::disc(px, d, d, c, c, ri, fill);

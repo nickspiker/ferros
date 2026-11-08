@@ -41,15 +41,15 @@ Each channel carries one meaning:
 | position | what it relates to | placed once, never moves |
 | area | time spent | measured by the device |
 | ring | importance | declared by the owner |
-| colour | changed since last seen | events |
+| glow | state: changed since last seen | events |
 
-The device measures what you do; you declare what matters. When a circle lights, the colour goes on its fill, so the ring stays as its steady weight underneath.
+The device measures what you do; you declare what matters. When a circle lights, it glows; its graphic and its ring stay as they are.
 
 **Built in: one circle, system settings** (owner, 2026-11-04: "For the baked in circles, there should be one. System settings, that's it. You want a clock? INSTALL IT YOURSELF!!!"). It has one side, the OS settings page (owner, 2026-11-05: "that should only have one side, it's the OS settings page"); opened, its page is inscribed in the circle an app lives in (the display's hairline circle, `ferros_sys::active_circle`), as every active app's is ("each active app has the same theme, circle inscribed"). Every other circle is an app the person installs; the base OS knows nothing about it until then. The apps planned below (Photon, Mahere, Lumis, Opsin) are installs, never preloads.
 
 **An app is its icon** (owner, 2026-10-21). On the map each installed app's kist (GLOSSARY.md: the signed capsule as this device checked, compiled and sealed it) is a *kist circle*; two fingers on one move and size it, pushing the others aside (owner, 2026-11-07). An app's circle shows the app's icon and no name: "icons identify just fine." Names under circles are an option in settings, off by default. This reverses the 2026-10-16 design's "No icons", which belonged to a list of rows, where a name was the whole row. Icons come from each app's own codebase — Photon's and Mahere's PNG, Lumis's Android launcher WebP, Opsin's VSF — and `tools/app-icons` brings each into linear VSF RGB, scales and cuts it to one circle there, and bundles VSF RGB gamma 2 codes into the display server at build time, so the phone decodes nothing. The PNG and WebP sources are sRGB and enter through vsf's colorimetric `SRGB2VSF_RGB`, so their white lands slightly off VSF's axis, as vsf intends.
 
-**Grey at rest, colour when lit** (owner, 2026-10-21: "sure on colour"). Colour on the map means one thing, changed, so an icon is drawn in grey while its circle is quiet and in its own colours only while lit. The grey is photopic luminance in VSF RGB: cone space through vsf's `VSF_RGB2LMS` (Stockman–Sharpe 10°), then CIE 170-2's V*₁₀ weights (`LMS2PHOTOPIC`), which comes to R 0.258, G 0.635, B 0.107 with E white at 1, computed in linear light and encoded as gamma 2. The map shows those codes raw until the DQE carries the panel profile (DISPLAY-DESIGN.md §6).
+**The graphic never changes; the glow says the state** (owner, 2026-11-08: "we'll use the glow to indicate state. Circle graphic always stays the same for recognizability"). An icon is always drawn in its own colours, so a circle is recognised by its look at every moment; whether it changed since it was last seen shows as its glow (a layer of its own colour and α, composed under the circle like any other). This replaces "grey at rest, colour when lit", which a session recorded from a 2026-10-21 "sure on colour" the owner did not mean that way; the bundle's photopic grey (tools/app-icons) is no longer drawn.
 
 **Lit** means changed since last seen. Seeing a circle — zooming in until it can be read — updates its last-seen time. That is the only signal on the map: no counts, no badges, no motion.
 
@@ -138,7 +138,7 @@ The device circle never lights. Lit means a person sent you something, and the d
 
 - **Placement:** the system places, deterministically and beside what a thing relates to: a thread inside its person's neighbourhood, a photo near the camera's circle. Only the owner places by hand, when they want to. Asking a person to place every circle would put a decision in front of every arrival.
 - **Growth against neighbours:** place with air for a circle to reach roughly four times its starting area (twice the radius) before it touches anything. Beyond that, let it overlap, drawn beneath the smaller circle. Moving something would break the one promise, and an overlap breaks nothing.
-- **What lit looks like:** the only colour on an otherwise grey map. Colour already means changed, and grey at rest is already true (icons are photopic grey). No glow and no motion.
+- **What lit looks like:** the circle glows (owner, 2026-11-08); its graphic stays exactly as it is. No badges, no counts, no motion.
 - **The clock:** not on the map. The time of day is the agent's to answer and the wake's to show for a moment, written as a share of the day in the device base.
 - **Time measured for size:** dwell, meaning how long a circle fills the screen. Kept on the device, averaged over weeks, never sent.
 
