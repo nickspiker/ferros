@@ -2016,7 +2016,7 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
             let reach = (kr.max(tr) >> 8) + 3;
             Some(draw::Rect { x0: (x0 - reach) as i32, y0: (cy - reach) as i32, x1: (x1 + reach + 1) as i32, y1: (cy + reach + 1) as i32 })
         }
-        // 49 `radio` and 50 `check [cx i16][cy i16][px u16][mark u16][stroke u16, Q8][state u8][stroke colour][fill][ink][tick][utf8 label]`: a radio button or a checkbox with its label, the mark `mark` pixels across and the label (at `px`, in `ink`) half its size to the right, the two centred together on (cx, cy) (state bit 2: the mark's left edge at cx, a group's column). The radio is a ring `stroke` wide whose outer edge is the mark's, with a disc of `fill` half its width inside when chosen (state bit 0). The checkbox is fluor's squircle box (its asymmetric corners, `SHAPE_POWER`) edged `stroke` wide (whole pixels, a hairline at least), filled with `fill` when checked (bit 0), with a tick in `tick` over the fill when bit 1 is set too.
+        // 49 `radio` and 50 `check [cx i16][cy i16][px u16][mark u16][stroke u16, Q8][state u8][stroke colour][fill][ink][tick][utf8 label]`: a radio button or a checkbox with its label, the mark `mark` pixels across and the label (at `px`, in `ink`) half its size to the right, the two centred together on (cx, cy) (state bit 2: the mark's left edge at cx, a group's column). The radio is a ring `stroke` wide whose outer edge is the mark's, black inside, with a disc of `fill` half its width in it when chosen (state bit 0). The checkbox is fluor's squircle box (its asymmetric corners, `SHAPE_POWER`) edged `stroke` wide (whole pixels, a hairline at least), black inside, filled with `fill` when checked (bit 0), with a tick in `tick` over the fill when bit 1 is set too.
         Some(op @ (49 | 50)) if m.len() >= 28 => {
             let (cx, cy, size, mk, sw, state) = (i16le(1), i16le(3), u16le(5) as f32, u16le(7), u16le(9), m[11]);
             let t = core::str::from_utf8(&m[28..]).ok()?;
@@ -2043,6 +2043,8 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
                     if state & 1 != 0 {
                         draw::disc(px, width, height, qx, qy, mk << 6, colour(16));
                     }
+                    // Black inside the ring, behind the dot (owner, 2026-11-08: "background for radio and checkbox should be black, not dk grey"), out to the ring's inner edge.
+                    draw::disc(px, width, height, qx, qy, (mk << 7) - sw, 0);
                     draw::ring(px, width, height, qx, qy, (mk << 7) - sw / 2, sw, colour(12));
                 } else {
                     let (filled, tick) = (state & 1 != 0, state & 3 == 3);
@@ -2075,8 +2077,9 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
                             let i = (y - y0) as usize * s + (x - x0) as usize;
                             let (ao, ai) = ((outer[i] >> 48) as u32, (inner[i] >> 48) as u32);
                             let q = &mut px[y as usize * width + x as usize];
-                            if filled && ai != 0 {
-                                *q = draw::under(*q, draw::at_cover16(colour(16), ai));
+                            // The inside: the fill when checked, else black (owner, 2026-11-08: "background for radio and checkbox should be black, not dk grey").
+                            if ai != 0 {
+                                *q = draw::under(*q, draw::at_cover16(if filled { colour(16) } else { 0 }, ai));
                             }
                             // The inner squircle lies inside the outer, so its coverage never passes the outer's.
                             if ao > ai {
