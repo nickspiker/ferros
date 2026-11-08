@@ -118,6 +118,8 @@ Its pages are Photon's split (photon docs/settings-panel.md), a ring a swipe goe
 
 The page's title is large at the top, its neighbours' small and dim either side; a swipe across goes round the ring, a tap on a neighbour's title goes there. Under a lifted finger the strip snaps to a page, its offset halving each frame (floored, so it lands), and a fling scrolls a page longer than its band by the largest of the last three frames' movements, losing a pixel a frame; both counted in the panel's frames, not in frames drawn (owner, 2026-11-05).
 
+The page picker (owner, 2026-11-08: "a vertical scrolling settings picker that comes up with just titles when you click on the title so you can easily scroll thru all the pages and pick one, rather than swiping left/right each page"): a tap on the title replaces the page with every page's title, one a row down the page's band, the open one white, scrolled so it stands in the middle; dragged up and down the list scrolls and flings as a page does (a pixel a frame lost, counted in the panel's frames); a tap on a title opens that page and puts the list away, a tap on the title again puts it away unchanged. Swiping across still goes round the ring.
+
 Developer is a page on development builds. On release builds twelve taps in a row on About's version line make it one (kept in the vault); a hint shows from the fourth tap and counts down, and any other tap starts the count again. No time window.
 
 That is the whole of settings: the device's own choices on the device's own circle, and each app's choices on the app's circle. Nothing is two levels deep.

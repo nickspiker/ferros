@@ -441,6 +441,10 @@ enum Choice {
     Knob(u8, u8),
     /// The clock's zone, a quarter hour west (-1) or east (1).
     Zone(i8),
+    /// The title: the page picker up or away.
+    Picker,
+    /// A page's title in the picker: that page.
+    Pick(u8),
 }
 
 /// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The clock after the links (docs/RADIO-CONTROLS.md): its time, zone and sources.
@@ -709,6 +713,9 @@ struct Map {
     page_cam: Option<Cam>,
     /// A finger is down (the touch session), for the camera op's moving flag.
     touching: bool,
+    /// The page picker is up (a tap on the title), and how far its list is scrolled, pixels.
+    picker: bool,
+    pick_scroll: i64,
     /// A pinch on the open page: the spread it began at (sixteenths of a pixel) and the scale then; and the scale it is at now, shown live and kept as the preference when the fingers lift (64ths of an octave).
     pinch: Option<(i64, f32)>,
     scale_live: Option<f32>,
@@ -1259,6 +1266,7 @@ impl Map {
             if self.leaving {
                 self.leaving = false;
                 self.view = View::Map;
+                self.picker = false;
             }
         }
         still
@@ -1393,23 +1401,74 @@ impl Map {
             let x = cx + k as i64 * span;
             self.push_row(x - span / 2, x + span / 2, title_y - uu(2, 1), title_y + uu(1, 1), Choice::Page(k));
         }
-        let cur = self.page;
-        // Each page's height at the unit it is drawn at, laid out first into a batch that is not sent (not live, so no rows): its centring needs it, and the unit changes every frame of a flight (a page never laid out was centred as empty, 2026-11-05).
-        for k in -1isize..=1 {
-            let p = self.wrap(cur as isize + k);
-            self.draw_page(&mut Batch::new(), p, cx, false);
-        }
-        self.draw_page(b, cur, cx + self.page_dx, true);
-        if self.page_dx > 0 {
-            let p = self.wrap(cur as isize - 1);
-            self.draw_page(b, p, cx + self.page_dx - self.w, false);
-        } else if self.page_dx < 0 {
-            let p = self.wrap(cur as isize + 1);
-            self.draw_page(b, p, cx + self.page_dx + self.w, false);
+        // The title itself: a tap brings up the page picker (owner, 2026-11-08: "a vertical scrolling settings picker that comes up with just titles when you click on the title"), a tap again puts it away.
+        self.push_row(cx - span / 2, cx + span / 2, title_y - uu(2, 1), title_y + uu(1, 1), Choice::Picker);
+        if self.picker {
+            self.draw_picker(b, cx);
+        } else {
+            let cur = self.page;
+            // Each page's height at the unit it is drawn at, laid out first into a batch that is not sent (not live, so no rows): its centring needs it, and the unit changes every frame of a flight (a page never laid out was centred as empty, 2026-11-05).
+            for k in -1isize..=1 {
+                let p = self.wrap(cur as isize + k);
+                self.draw_page(&mut Batch::new(), p, cx, false);
+            }
+            self.draw_page(b, cur, cx + self.page_dx, true);
+            if self.page_dx > 0 {
+                let p = self.wrap(cur as isize - 1);
+                self.draw_page(b, p, cx + self.page_dx - self.w, false);
+            } else if self.page_dx < 0 {
+                let p = self.wrap(cur as isize + 1);
+                self.draw_page(b, p, cx + self.page_dx + self.w, false);
+            }
         }
         // The page out to the circle itself, which the display's hairline draws over; a region's ground is its region op's, made once.
         if !region {
             b.disc(cx, cy, r, fill());
+        }
+    }
+
+    /// The page picker's rows: their pitch and the size of their titles, in the unit (`unit`), and how far the list scrolls (what of it does not fit the page's band).
+    fn picker_metrics(&self) -> (i64, i64, i64) {
+        let uq = self.unit();
+        let (_, top, bottom) = self.bands();
+        let pitch = 3 * uq >> 8;
+        let size = 7 * uq / (4 << 8);
+        // WHY the floor: a list shorter than the band does not scroll at all.
+        (pitch, size, (self.pages() as i64 * pitch - (bottom - top)).max(0))
+    }
+
+    /// The page picker (owner, 2026-11-08): every page's title, one a row down the page's band, the open page's white and the rest grey, the list scrolled by `pick_scroll`; a tap on a title opens that page. Only the rows inside the band are sent; the text moves, nothing is laid out again.
+    fn draw_picker(&mut self, b: &mut Batch, cx: i64) {
+        let (_, top, bottom) = self.bands();
+        let (pitch, size, _) = self.picker_metrics();
+        let half = self.w / 2;
+        for p in 0..self.pages() {
+            // The row's band and its baseline, about two thirds down it.
+            let row_top = top + p as i64 * pitch - self.pick_scroll;
+            let base = row_top + pitch * 2 / 3;
+            // Wholly inside the band only: a title cut by the band's edge would be clipped by nothing (the circle's edge is further out).
+            if row_top < top || row_top + pitch > bottom {
+                continue;
+            }
+            b.text(cx, base, size as u16, if p == self.page { white() } else { grey() }, 1, PAGES[p]);
+            if self.page_dx == 0 {
+                self.push_row(cx - half, cx + half, row_top, row_top + pitch, Choice::Pick(p as u8));
+            }
+        }
+    }
+
+    /// What a vertical drag and its fling move: the open page's scroll, or the page picker's while it is up; and how far it goes.
+    fn vscroll(&self) -> i64 {
+        if self.picker { self.pick_scroll } else { self.scroll }
+    }
+    fn vscroll_max(&self) -> i64 {
+        if self.picker { self.picker_metrics().2 } else { self.scroll_max(self.page) }
+    }
+    fn set_vscroll(&mut self, v: i64) {
+        if self.picker {
+            self.pick_scroll = v;
+        } else {
+            self.scroll = v;
         }
     }
 
@@ -1893,7 +1952,8 @@ impl Map {
             }
         } else {
             // WHY the bounds: a page scrolls only as far as it is longer than its band; past either end there is nothing to show.
-            self.scroll = (self.drag_base.1 - dy).clamp(0, self.scroll_max(self.page));
+            let v = (self.drag_base.1 - dy).clamp(0, self.vscroll_max());
+            self.set_vscroll(v);
             let moved = if prev.0 { cur.2 - prev.2 } else { 0 };
             self.dys = [self.dys[1], self.dys[2], moved];
         }
@@ -1948,18 +2008,19 @@ impl Map {
     fn step(&mut self) -> bool {
         self.step_strip();
         if self.fling != 0. {
-            let max = self.scroll_max(self.page);
+            let max = self.vscroll_max();
             let (d, v) = coast(self.fling);
             self.fling_res += d;
             let whole = libm::trunc(self.fling_res);
             self.fling_res -= whole;
-            self.scroll += whole as i64;
+            let mut s = self.vscroll() + whole as i64;
             self.fling = v;
-            // WHY: the page's ends stop the fling; past them there is nothing to show.
-            if self.scroll < 0 || self.scroll > max {
-                self.scroll = self.scroll.clamp(0, max);
+            // WHY: the page's (or the list's) ends stop the fling; past them there is nothing to show.
+            if s < 0 || s > max {
+                s = s.clamp(0, max);
                 self.fling = 0.;
             }
+            self.set_vscroll(s);
         }
         if let Some((ux, uy, v, rx, ry)) = self.pan {
             let (d, v) = coast(v);
@@ -2134,6 +2195,25 @@ impl Map {
                             console(self.grants, b"map: the kernel did not take the zone\n");
                         }
                     }
+                    Some(Choice::Picker) => {
+                        // Up: scrolled so the open page's title stands in the middle of the band, as near as the list's ends allow. Away: the page as it was.
+                        self.picker = !self.picker;
+                        self.fling = 0.;
+                        if self.picker {
+                            let (pitch, _, max) = self.picker_metrics();
+                            let (_, top, bottom) = self.bands();
+                            // WHY the bounds: the list scrolls only from its first title to its last; past them there is nothing to show.
+                            self.pick_scroll = (self.page as i64 * pitch - (bottom - top - pitch) / 2).clamp(0, max);
+                        }
+                    }
+                    Some(Choice::Pick(p)) => {
+                        self.page = p as usize;
+                        self.page_dx = 0;
+                        self.scroll = 0;
+                        self.fling = 0.;
+                        self.spring = None;
+                        self.picker = false;
+                    }
                     Some(Choice::Page(k)) => {
                         self.page = self.wrap(self.page as isize + k as isize);
                         self.page_dx += k as i64 * self.w;
@@ -2229,6 +2309,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         fast: false,
         page_cam: None,
         touching: false,
+        picker: false,
+        pick_scroll: 0,
         pinch: None,
         scale_live: None,
         nrows: 0,
@@ -2263,7 +2345,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.fade = 1.;
         }
         // FERROS_MAP_START=swipe: the settings open, and the synthetic finger (below) swipes across them, for timing the open circle's frames with no one at the panel.
-        if v == b"swipe" {
+        // FERROS_MAP_START=picker: the same with the page picker up, the synthetic finger scrolling its list.
+        if v == b"swipe" || v == b"picker" {
+            map.picker = v == b"picker";
             map.cam = map.at(0);
             map.view = View::Open(0);
             map.fade = 1.;
@@ -2468,7 +2552,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         // The screen off (the power key): no touches reach the map.
         let t_loop = now();
         let swipe = option_env!("FERROS_MAP_START") == Some("swipe");
-        let n = if matches!(option_env!("FERROS_MAP_START"), Some("drag") | Some("crowd") | Some("swipe")) && synth < 192 && now().wrapping_sub(map_start) > 2 * freq() {
+        let pick = option_env!("FERROS_MAP_START") == Some("picker");
+        let n = if matches!(option_env!("FERROS_MAP_START"), Some("drag") | Some("crowd") | Some("swipe") | Some("picker")) && synth < 192 && now().wrapping_sub(map_start) > 2 * freq() {
             synth += 1;
             if synth == 2 {
                 // From the second pass: the first frame wait's reply is in.
@@ -2485,6 +2570,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
                 synth_at.1 = y;
                 // Swiping the settings: from right of the centre, leftward.
+                if pick {
+                    synth_at = (w / 2, h / 2 + h / 4);
+                }
                 if swipe {
                     synth_at = (w / 2 + 360, h / 2);
                 }
@@ -2504,7 +2592,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 let k = synth as i64 - 1;
                 let off = if k < 90 { k * 6 } else { (180 - k) * 6 };
                 // Swiping, 8 pixels a pass across: 720 out, past half the screen, so the page turns over and back.
-                let (x, y) = if swipe { (synth_at.0 - off * 8 / 6, synth_at.1) } else { (synth_at.0, synth_at.1 - off) };
+                // The picker's list: up and down, 8 pixels a pass, up from below the middle and back.
+                let (x, y) = if swipe { (synth_at.0 - off * 8 / 6, synth_at.1) } else if pick { (synth_at.0, synth_at.1 - off * 8 / 6) } else { (synth_at.0, synth_at.1 - off) };
                 r[0] = 1;
                 r[1..13].fill(0);
                 r[3] = 1;
@@ -2548,7 +2637,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             grab_n = 0;
             // A finger on the open settings catches the strip and the page where they are: the motion stops under it.
             map.swipe = 0;
-            map.drag_base = (map.page_dx, map.scroll);
+            map.drag_base = (map.page_dx, map.vscroll());
             map.dys = [0; 3];
             map.dxs = [0; 3];
             map.spring = None;
