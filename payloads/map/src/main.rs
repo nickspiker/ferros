@@ -372,10 +372,14 @@ enum Choice {
     Page(i8),
     /// The Fleet page's "remove this device": the first tap shows what goes with it, the second starts the departure.
     FleetRemove,
+    /// A link on Connections: its own page (LINKS order).
+    Link(u8),
+    /// A radio's page: its switch, as its console circle's tap (preference 15).
+    Switch(u8),
 }
 
-/// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"). Developer is a page only on development builds, or once the twelve taps made it one.
-const PAGES: [&str; 9] = ["appearance", "numbers", "keyboard", "security", "fleet", "power", "connections", "about", "developer"];
+/// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one.
+const PAGES: [&str; 15] = ["appearance", "numbers", "keyboard", "security", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Taps in a row on About's version line that make Developer a page (owner, 2026-11-05: "twelve"), and the tap from which the hint shows and counts down ("don't show a toast hint until four taps"). No time window: any other tap starts the count again.
@@ -383,6 +387,77 @@ const DEV_TAPS: u8 = 12;
 const DEV_HINT: u8 = 4;
 /// The radios and USB in the kernel's facts order (facts 33 + 8 · link, ferros_sys::measure), as the Connections page names them.
 const LINKS: [&str; 6] = ["cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB"];
+
+/// A link's state in words: switched off by its circle (preference 15; USB, the sixth, has no switch) before anything its driver last said, which outlives it.
+fn link_state(k: usize, state: Option<i64>) -> &'static str {
+    if k < 5 && ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) >> k & 1 == 1 {
+        return "switched off";
+    }
+    match state {
+        Some(0) => "off",
+        Some(1) => "on, no link",
+        Some(2) => "connected",
+        _ => "-",
+    }
+}
+
+/// A measure (ferros_sys::measure) for a link's page: its name returned, its value written into `l` in its unit and the device's base (tatau). Milli units shown whole: a link's numbers to the unit are all a person reads.
+fn measure_words(l: &mut Line, f: tatau::Fmt, kind: u16, v: i64) -> &'static str {
+    use ferros_sys::measure as m;
+    let num = |l: &mut Line, n: i64, unit: &str| {
+        if n < 0 {
+            l.s("-");
+        }
+        if let Ok(tatau::Out::Nothing) = tatau::count(l, f, n.unsigned_abs(), 1) {
+            l.s("0");
+        }
+        l.s(unit);
+    };
+    match kind {
+        m::TECH => {
+            l.s(match v {
+                1 => "WiFi 4",
+                2 => "WiFi 5",
+                3 => "WiFi 6",
+                4 => "WiFi 7",
+                14 => "LTE",
+                20 => "NR",
+                32 => "Bluetooth",
+                33 => "NFC",
+                34 => "GPS",
+                35 => "USB",
+                _ => "-",
+            });
+            "technology"
+        }
+        m::RSSI => { num(l, v / 1000, " dBm"); "signal" }
+        m::NOISE => { num(l, v / 1000, " dBm"); "noise floor" }
+        m::SNR => { num(l, v / 1000, " dB"); "signal to noise" }
+        m::RSRP => { num(l, v / 1000, " dBm"); "reference power" }
+        m::RSRQ => { num(l, v / 1000, " dB"); "reference quality" }
+        m::SINR => { num(l, v / 1000, " dB"); "signal to interference" }
+        m::VSWR => { num(l, v / 1000, ":1"); "antenna match (VSWR)" }
+        m::TX_POWER => { num(l, v / 1000, " dBm"); "transmit power" }
+        m::FREQ if v >= 100_000 => { num(l, v / 1000, " MHz"); "frequency" }
+        m::FREQ => { num(l, v, " kHz"); "frequency" }
+        m::BANDWIDTH => { num(l, v / 1000, " MHz"); "channel width" }
+        m::CHANNEL => { num(l, v, ""); "channel" }
+        m::RATE_DOWN | m::RATE_UP => {
+            let _ = tatau::size_bits(l, f, v.unsigned_abs(), 1);
+            l.s("/s");
+            if kind == m::RATE_DOWN { "rate down" } else { "rate up" }
+        }
+        m::LATENCY => { let _ = tatau::duration_ns(l, f, v.unsigned_abs(), 1); "round trip" }
+        m::LOSS => { let _ = tatau::share(l, f, v.unsigned_abs(), 1_000_000, 2); "loss" }
+        m::MCS => { num(l, v, ""); "MCS" }
+        m::STREAMS => { num(l, v, ""); "streams" }
+        m::SATS_SEEN => { num(l, v, ""); "satellites seen" }
+        m::SATS_USED => { num(l, v, ""); "satellites in the fix" }
+        m::CN0 => { num(l, v / 1000, " dB-Hz"); "best carrier to noise" }
+        m::ACCURACY => { num(l, v / 1000, " m"); "accuracy (±)" }
+        _ => { num(l, v, ""); "measure" }
+    }
+}
 
 /// The four bases in the order the chooser shows them: the house base first.
 const BASES: [u8; 4] = [12, 0x8C, 10, 16];
@@ -420,7 +495,7 @@ struct Map {
     panned: bool,
     pan: Option<(f64, f64, f64, f64, f64)>,
     /// Each page's content height as last laid out, for how far it scrolls.
-    page_h: [i64; 9],
+    page_h: [i64; PAGES.len()],
     /// The drag on the settings: which way it is locked (0 not yet, 1 across, 2 up and down), where the strip and the scroll stood at the touch, and the last three frames' movements up and down.
     swipe: u8,
     drag_base: (i64, i64),
@@ -950,6 +1025,25 @@ impl Map {
         if DEV || self.dev { PAGES.len() } else { PAGES.len() - 1 }
     }
     /// Page `p`, round the ring either way.
+    /// Settings at the page named `name` (a link's page, from Connections or from its console circle dragged toward the centre): from the plane the settings circle flies open on it, as a tap on it does; already open, it is on that page at once.
+    fn show_page(&mut self, name: &str) {
+        let Some(p) = PAGES.iter().position(|q| *q == name) else { return };
+        self.page = p;
+        self.page_dx = 0;
+        self.scroll = 0;
+        self.fling = 0.;
+        self.spring = None;
+        if !matches!(self.view, View::Open(_)) {
+            self.back = Some(self.cam);
+            let to = self.at(0);
+            self.fly(to);
+            self.view = View::Open(0);
+        }
+        self.settling = true;
+        self.frame_seen = None;
+        self.draw();
+    }
+
     fn wrap(&self, p: isize) -> usize {
         p.rem_euclid(self.pages() as isize) as usize
     }
@@ -1193,21 +1287,43 @@ impl Map {
                 y += uu(3, 1);
             }
             "connections" => {
-                // Each link as its driver says it (measure STATE): read here, chosen elsewhere until the radios have choices of their own.
+                // Each link as its driver says it (measure STATE), each row its own page's door (owner, 2026-11-07).
                 let facts = ferros_sys::facts();
                 for (k, name) in LINKS.iter().enumerate() {
                     let state = facts.0[33 + 8 * k..41 + 8 * k].iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::STATE).map(|m| m.1);
+                    let y_row = y;
                     // Switched off by its status circle (preference 15; USB, the sixth, has no switch): the driver's last word outlives it, so the switch is read first.
-                    if k < 5 && ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) >> k & 1 == 1 {
-                        fact(b, &mut y, name, "switched off");
+                    fact(b, &mut y, name, link_state(k, state));
+                    if hit {
+                        self.push_row(cx - half, cx + half, y_row - uu(2, 1), y, Choice::Link(k as u8));
+                    }
+                }
+            }
+            name @ ("cellular" | "WiFi" | "Bluetooth" | "NFC" | "GPS" | "USB") => {
+                // A link's own page (owner, 2026-11-07: "the radio details that actually show numbers and config"; the console's circles carry none): its switch, its state, and every measure its driver publishes, each by name in its unit, in the device's base.
+                let k = LINKS.iter().position(|l| *l == name).unwrap_or(0);
+                let facts = ferros_sys::facts();
+                let slots = &facts.0[33 + 8 * k..41 + 8 * k];
+                let state = slots.iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::STATE).map(|m| m.1);
+                if k < 5 {
+                    let off = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) >> k & 1 == 1;
+                    row(self, b, &mut y, small, white(), if off { "switched off: tap to switch on" } else { "on: tap to switch off" }, Some(Choice::Switch(k as u8)));
+                }
+                fact(b, &mut y, "state", link_state(k, state));
+                let f = ferros_sys::numbers(Style::Glyphs);
+                let mut any = false;
+                for &m in slots {
+                    let Some((kind, v)) = ferros_sys::measure_of(m) else { continue };
+                    if kind == ferros_sys::measure::STATE {
                         continue;
                     }
-                    fact(b, &mut y, name, match state {
-                        Some(0) => "off",
-                        Some(1) => "on, no link",
-                        Some(2) => "connected",
-                        _ => "-",
-                    });
+                    let mut l = Line::new();
+                    let what = measure_words(&mut l, f, kind, v);
+                    fact(b, &mut y, what, l.as_str());
+                    any = true;
+                }
+                if !any {
+                    fact(b, &mut y, "measures", "none yet");
                 }
             }
             "about" => {
@@ -1547,6 +1663,14 @@ impl Map {
                         }
                     }
                     // A neighbour's title: that page, coming in from its side and settling as a swipe does.
+                    Some(Choice::Link(k)) => {
+                        // Connections' row: that link's own page, straight there.
+                        self.show_page(LINKS[k as usize]);
+                    }
+                    Some(Choice::Switch(k)) => {
+                        let off = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) ^ (1 << k);
+                        set(self, ferros_sys::PREF_RADIOS_OFF, off);
+                    }
                     Some(Choice::Page(k)) => {
                         self.page = self.wrap(self.page as isize + k as isize);
                         self.page_dx += k as i64 * self.w;
@@ -1621,7 +1745,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         pans: [(0, 0); 3],
         panned: false,
         pan: None,
-        page_h: [0; 9],
+        page_h: [0; PAGES.len()],
         swipe: 0,
         drag_base: (0, 0),
         dys: [0; 3],
@@ -1908,7 +2032,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             let mut q = [0u8; 4];
             let (xb, yb) = ((f.1 as u16).to_le_bytes(), (f.2 as u16).to_le_bytes());
             let hit = if call(map.display, &[41, xb[0], xb[1], yb[0], yb[1]], &mut q) >= 1 { q[0] } else { 0xFF };
-            corner = if hit == 8 || hit == 9 { hit } else { 0 };
+            // A radio's console circle too (0-4, as 16 + its bit): dragged toward the centre it opens that radio's page; tapped still, it switches as before.
+            corner = if hit == 8 || hit == 9 { hit } else if hit < 5 { 16 | hit } else { 0 };
             corner_at = (f.1, f.2);
             corner_from = (f.1, f.2);
             corner_done = false;
@@ -1938,7 +2063,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 let span = (2 * w * h) as f64 / (w + h) as f64;
                 if !corner_done && inward > span / 12. {
                     corner_done = true;
-                    if corner == 8 {
+                    if corner & 16 != 0 {
+                        // A radio's circle dragged in: its page in settings (with an app in front, the settings circle is not on the screen: nothing).
+                        if !map.app_front {
+                            map.show_page(LINKS[(corner & 15) as usize]);
+                        }
+                    } else if corner == 8 {
                         let mut q = [0u8; 4];
                         let n = call(map.display, &[43], &mut q);
                         console(grants, if n >= 2 && q[1] == 1 { b"map: full screen\n" } else { b"map: full screen off\n" });
