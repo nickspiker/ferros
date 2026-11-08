@@ -486,8 +486,9 @@ impl Client {
     fn store_get(&self, key: &[u8], buf: &mut [u8]) -> Option<usize> {
         ferros_sys::store_get(cap(self.log.grants, S_STORE), key, buf)
     }
+    /// Every write whole, whatever its size: one transfer takes at most 4096 bytes, and a fleet chain past that was refused and never kept (found 2026-11-07).
     fn store_set(&self, key: &[u8], value: &[u8]) -> bool {
-        ferros_sys::store_set(cap(self.log.grants, S_STORE), key, value)
+        self.store_set_whole(key, value)
     }
     /// Write a value of any size: in one transfer when it fits, else in pieces the kernel assembles and commits with the last one.
     fn store_set_whole(&self, key: &[u8], value: &[u8]) -> bool {
@@ -570,12 +571,10 @@ impl Client {
         // The chain we hold, if bound before: folded again against our roots, so a bad write never binds us.
         let mut held: Option<Vec<u8>> = None;
         if let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) {
-            // The chain's own size first (a get returns the value's whole length), then exactly that: a 128 KiB buffer asked of a 160 KiB heap that has been running a while need not find one free run.
-            let mut probe = [0u8; 1];
-            let size = self.store_get(b"chain", &mut probe).unwrap_or(0);
-            let mut chain = alloc::vec![0u8; size];
-            if let Some(n) = (size > 0).then(|| self.store_get(b"chain", &mut chain)).flatten() {
-                if n <= chain.len() {
+            // Read whole, piece by piece, exactly its own size (one transfer holds at most 4096 bytes, and a fleet chain grows past that; a 128 KiB buffer asked of a 160 KiB heap that has been running a while need not find one free run).
+            if let Some(mut chain) = self.store_get_whole(b"chain") {
+                let n = chain.len();
+                if n > 0 {
                     if let Ok((blob, bound)) = join::adopt_chain(&hp, &seed, &self.me, &chain[..n]) {
                         self.bound = bound;
                         self.note_members(&blob);
