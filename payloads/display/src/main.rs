@@ -1624,7 +1624,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
             let g = &rows[y];
             let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), rows[y + 1].first as usize) };
             let row_px = &plan[g.first as usize..];
-            let edge_px = &row_px[row_px.iter().position(|e| e.1 == SHAPE_EDGE).unwrap_or(row_px.len())..];
+            let edge_px = &row_px[front_split(row_px)..];
             let (el, er) = edge_cols(g, edge_px, width);
             let ((cl, cr), bw) = bar_line(y, width, height);
             let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
@@ -1647,7 +1647,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                 let mut run = x0;
                 while x < x1 {
                     // Compose once (COMPOSITOR.md step 2): sixteen canvas pixels all empty show only the background (the wallpaper, or black), and a phase whose block held just that at its last publish already holds it: nothing composed, nothing through the table, nothing written. The wallpaper lit every pixel, so a pan published the whole screen through the table every frame (25 frames/s, measured 2026-11-07).
-                    let glass = x < el || x + 16 > er || bars_in(bw, cl, cr, x);
+                    let glass = x < el || x + 16 > er || hole_in(g, x) || bars_in(bw, cl, cr, x);
                     let mut any = 0u64;
                     for j in 0..16 {
                         any |= *ask.add(x + j);
@@ -2607,7 +2607,7 @@ unsafe fn flight_publish_row(f: &FlightFrame, canvas: *const u64, width: usize, 
         while x < x1 {
             let bi = x / 16;
             let ci = y * clean_w + bi;
-            let glass = x < el || x + 16 > er || bars_in(bw, cl, cr, x);
+            let glass = x < el || x + 16 > er || hole_in(g, x) || bars_in(bw, cl, cr, x);
             let nxt = if x + 16 < x1 { block(bi + 1) } else { None };
             if cur.is_none() && !glass && clean[ci] & wbit != 0 {
                 if run < x {
@@ -2956,7 +2956,7 @@ const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 const EDGE_MASK: u64 = if DEV { 1 << 48 | 11585 | 8192 << 16 } else { 1 << 48 };
 
 /// The glass's shape, planned once per screen size (owner, 2026-11-02: "maintain a global compressed mask since most will be opaque for the OS in general"): the circle an app lives in (the corners outside it are the system's chrome) and the screen's own edge, as Photon draws its window on Android glass (fluor paint/edge.rs `glass_corner_params`, Nick 2026-09-17: a superellipse corner inside the glass's circular arc, cutting one and a half glass insets deeper at the diagonal, exponent 6 or the first lower one whose corners fit, nine tenths of the fitted size; the top-left and bottom-right corners twice the top-right and bottom-left, the 2:1 asymmetry).
-/// Per row: the columns of chrome from the left and from the right (the circle's outside), the columns masked from the left and from the right (the edge's outside, over the chrome), then the row's antialiased pixels in the order they apply (column, shape, coverage Q16, hairline alpha Q16): the circle's first, in column order, then the edge's. `GLASS_ROWS` has height + 1 entries; a row's pixels run from its `first` to the next row's. Everything else on a row is glass, untouched: the publish path does no geometry at all, it copies runs and blends the listed pixels.
+/// Per row: the columns of chrome from the left and from the right (the circle's outside), the columns masked from the left and from the right (the edge's outside, over the chrome), then the row's antialiased pixels in the order they apply (column, shape, coverage Q16, hairline alpha Q16): the circle's first, in column order, then the edge's, then the camera hole's knockout (every column of its range). `GLASS_ROWS` has height + 1 entries; a row's pixels run from its `first` to the next row's. Everything else on a row is glass, untouched: the publish path does no geometry at all, it copies runs and blends the listed pixels.
 /// The edge comes from fluor's walk of the corners' crossings (`walk_window_edges`, the one walk Photon's chrome draws with: a four-corner mirror and a single-pixel alias per axis), the circle from its distance field, both at plan time only.
 struct GlassRow {
     first: u32,
@@ -2964,10 +2964,27 @@ struct GlassRow {
     chrome_r: u16,
     mask_l: u16,
     mask_r: u16,
+    /// The camera hole's knockout on this row: columns hole_l..hole_r, every one of them listed (`SHAPE_HOLE`, the row's last pixels, in column order); empty (0, 0) on rows without it.
+    hole_l: u16,
+    hole_r: u16,
 }
 /// A listed pixel's shape: the circle (its base is the chrome under it, its hairline the ring's) or the edge (its base the mask colour, its hairline the edge's).
 const SHAPE_CIRCLE: u16 = 0;
 const SHAPE_EDGE: u16 = 1;
+/// The camera hole's knockout (owner, 2026-11-08: "an anti-aliased orange knockout that is as small as possible without touching the dead px", on "the same front/first layer mask with the asymmetric squircle edges"): its base the mask colour, no hairline; listed after the edge's pixels, every column of the row's hole range, so `glass_front` finds one by its column less `hole_l`.
+const SHAPE_HOLE: u16 = 2;
+/// husky's knockout stays off until its hole is measured on its glass (tools/cutout-scan, as akita's was): `ferros_sys::CUTOUT_HOLE` is Android's figure, and a knockout from it could cover live pixels or leave dead ones uncovered. Set true once the measured hole is in.
+const HOLE_HUSKY: bool = false;
+/// Where the row's pixels in front of the scene begin (the edge's, then the hole's): past the circle's.
+#[inline]
+fn front_split(row_px: &[(u16, u16, u16, u16)]) -> usize {
+    row_px.iter().position(|e| e.1 != SHAPE_CIRCLE).unwrap_or(row_px.len())
+}
+/// Whether the sixteen columns from x reach the row's hole knockout (an empty range never does).
+#[inline]
+fn hole_in(g: &GlassRow, x: usize) -> bool {
+    x < g.hole_r as usize && x + 16 > g.hole_l as usize
+}
 /// Non-zero initialisers (see `ALLOC`): `plan_glass` sets them.
 static mut GLASS_ROWS: usize = 1;
 static mut GLASS_PX: usize = 1;
@@ -3017,6 +3034,8 @@ fn plan_glass(width: usize, height: usize) {
     let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
     let mut rows: alloc::vec::Vec<GlassRow> = alloc::vec::Vec::with_capacity(height + 1);
     let mut px: alloc::vec::Vec<(u16, u16, u16, u16)> = alloc::vec::Vec::new();
+    // The camera hole, where its knockout is on (`HOLE_HUSKY`).
+    let hole = if ferros_sys::akita() || HOLE_HUSKY { Some(ferros_sys::cutout_hole()) } else { None };
     let mut mi = 0;
     for y in 0..height {
         let first = px.len() as u32;
@@ -3114,9 +3133,35 @@ fn plan_glass(width: usize, height: usize) {
                 mi += 1;
             }
         }
-        rows.push(GlassRow { first, chrome_l: cl as u16, chrome_r: cr as u16, mask_l: ml as u16, mask_r: mr as u16 });
+        // The camera hole's knockout: every column whose pixel the disc touches at all, contiguous on a row (a disc's chord), each with the glass's coverage left by it. The disc's coverage of a pixel is R + 0.5 − d with d its centre's distance to the hole's centre, 1 half a pixel or more inside the radius, 0 half a pixel or more outside, the ramp between (the same rule as the circle's: by the definition of coverage, not a guard), so the radius measured on the glass (`ferros_sys::cutout_hole`, the smallest covering every dead pixel whole) puts the ramp on live pixels only.
+        let (mut hl, mut hr) = (0usize, 0usize);
+        if let Some((hx, hy, hrad)) = hole {
+            let dy = y as f32 + 0.5 - hy;
+            let reach = hrad + 0.5;
+            if dy * dy < reach * reach {
+                let half = libm::sqrtf(reach * reach - dy * dy);
+                // The chord's columns, a column wider each side than the reach (the pixels there have coverage 0 and are dropped below): the hole lies inside the glass by the panel's facts, so these are on the row.
+                let (x0, x1) = ((hx - half) as usize - 1, (hx + half) as usize + 2);
+                let disc = |x: usize| -> u32 {
+                    let dx = x as f32 + 0.5 - hx;
+                    let cov = reach - libm::sqrtf(dx * dx + dy * dy);
+                    let cov = if cov > 1.0 { 1.0 } else if cov < 0.0 { 0.0 } else { cov };
+                    (cov * 65536.0) as u32
+                };
+                let l = (x0..x1).find(|&x| disc(x) > 0);
+                if let Some(l) = l {
+                    let r = (l..x1).rev().find(|&x| disc(x) > 0).unwrap() + 1;
+                    // A listed pixel has the disc's coverage 1 or more in Q16 (found so), so the glass's 65536 − it fits the u16.
+                    for x in l..r {
+                        px.push((x as u16, SHAPE_HOLE, (65536 - disc(x)) as u16, 0));
+                    }
+                    (hl, hr) = (l, r);
+                }
+            }
+        }
+        rows.push(GlassRow { first, chrome_l: cl as u16, chrome_r: cr as u16, mask_l: ml as u16, mask_r: mr as u16, hole_l: hl as u16, hole_r: hr as u16 });
     }
-    rows.push(GlassRow { first: px.len() as u32, chrome_l: 0, chrome_r: width as u16, mask_l: 0, mask_r: width as u16 });
+    rows.push(GlassRow { first: px.len() as u32, chrome_l: 0, chrome_r: width as u16, mask_l: 0, mask_r: width as u16, hole_l: 0, hole_r: 0 });
     unsafe {
         GLASS_ROWS = rows.leak().as_ptr() as usize;
         GLASS_PX = px.leak().as_ptr() as usize;
@@ -3198,23 +3243,34 @@ fn bars_in(bw: &[u64], cl: usize, cr: usize, x: usize) -> bool {
     x + 16 > cl && x < cr && (x.max(cl)..(x + 16).min(cr)).any(|i| bw[i] >> 63 == 0)
 }
 
-/// The columns of a row the glass's edge touches: everything left of `el` and from `er` on (its masked columns and its listed edge pixels).
+/// The columns of a row the glass's edge touches: everything left of `el` and from `er` on (its masked columns and its listed edge pixels; the hole's knockout, listed after them, is the row's own range, `hole_in`).
 fn edge_cols(g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], width: usize) -> (usize, usize) {
     let (mut el, mut er) = (g.mask_l as usize, g.mask_r as usize);
-    for e in edge_px {
+    for e in &edge_px[..edge_px.len() - (g.hole_r - g.hole_l) as usize] {
         let x = e.0 as usize;
         if x < width / 2 { el = el.max(x + 1) } else { er = er.min(x) }
     }
     (el, er)
 }
 
-/// What the glass shows at column `x` of a row (`g`, its listed edge pixels `edge_px`), front to back, each layer under the ones before (`under_pm`): the glass's edge first, then the console's decoded pixel `c` (`CLEAR` where it has none), then the scene `p` (working values, opaque) last. Outside the masked columns the mask is opaque, so nothing behind it is read. On a listed edge pixel the mask is in front by its coverage's complement, and the edge's hairline under it in the mask's own colour (as Photon's release build on Android draws its hairline black, so the glass's corner is black to the curve). On development builds too, since the mask itself turned orange: a full-light orange hairline there stood a stop brighter than the mask beside it, a bright jagged stroke along the curve (owner, 2026-11-07).
+/// What the glass shows at column `x` of a row (`g`, its listed edge pixels `edge_px`), front to back, each layer under the ones before (`under_pm`): the glass's edge and the camera hole's knockout first, then the console's decoded pixel `c` (`CLEAR` where it has none), then the scene `p` (working values, opaque) last. Outside the masked columns the mask is opaque, so nothing behind it is read. On a listed edge pixel the mask is in front by its coverage's complement, and the edge's hairline under it in the mask's own colour (as Photon's release build on Android draws its hairline black, so the glass's corner is black to the curve). On development builds too, since the mask itself turned orange: a full-light orange hairline there stood a stop brighter than the mask beside it, a bright jagged stroke along the curve (owner, 2026-11-07). The hole's knockout (`edge_px`'s last `hole_r − hole_l` pixels, one a column from `hole_l`) is the mask by its coverage the same way, with no hairline; where it covers the pixel whole it is the mask as outside the edge, undithered.
 #[inline]
 fn glass_front(x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], c: u64, p: u64) -> u64 {
     if x < g.mask_l as usize || x >= g.mask_r as usize {
         return EDGE_MASK;
     }
-    let edge = edge_px.iter().find(|e| e.0 as usize == x);
+    let (hl, hr) = (g.hole_l as usize, g.hole_r as usize);
+    let (edge_px, hole_px) = edge_px.split_at(edge_px.len() - (hr - hl));
+    // WHY the range test: it selects the knockout's columns (not a guard); inside them `x - hl` indexes the hole's pixels, one a column by `plan_glass`'s construction, and no edge pixel shares a column with them.
+    let edge = if x >= hl && x < hr {
+        let e = &hole_px[x - hl];
+        if e.2 == 0 {
+            return EDGE_MASK;
+        }
+        Some(e)
+    } else {
+        edge_px.iter().find(|e| e.0 as usize == x)
+    };
     // Nothing in front here: the pixel as it came, its flag bits (no dither) kept.
     if edge.is_none() && c >> 63 != 0 {
         return p;
@@ -3300,7 +3356,7 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                 }
             }
         }
-        // The glass's shape, from the plan (`plan_glass`), front to back: outside the app's circle is black (nothing of the windows shows there); on the circle's listed pixels its hairline is in front, then the windows by the circle's coverage, then that black; then over everything so made the glass's edge, the bars (the console and the helm), and that pixel last (`glass_front`), on the columns either touches. The circle's hairline is `line`.
+        // The glass's shape, from the plan (`plan_glass`), front to back: outside the app's circle is black (nothing of the windows shows there); on the circle's listed pixels its hairline is in front, then the windows by the circle's coverage, then that black; then over everything so made the glass's edge and the camera hole's knockout, the bars (the console and the helm), and that pixel last (`glass_front`), on the columns any of them touches. The circle's hairline is `line`.
         {
             let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
             let g = &rows[y];
@@ -3320,7 +3376,7 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                 }
                 let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), next) };
                 let row_px = &plan[first..next];
-                let split = row_px.iter().position(|e| e.1 == SHAPE_EDGE).unwrap_or(row_px.len());
+                let split = front_split(row_px);
                 for &(x, _, c, h) in &row_px[..if full { 0 } else { split }] {
                     let x = x as usize;
                     if x < xa || x >= xb {
@@ -3333,7 +3389,7 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                 let (el, er) = edge_cols(g, edge_px, width);
                 let ((bl, br), bw) = bar_line(y, width, height);
                 for x in xa..xb {
-                    if x < el || x >= er || (x >= bl && x < br) {
+                    if x < el || x >= er || (x >= bl && x < br) || (x >= g.hole_l as usize && x < g.hole_r as usize) {
                         let c = if x >= bl && x < br { bw[x] } else { CLEAR };
                         px[x] = glass_front(x, g, edge_px, c, px[x]);
                     }
@@ -5302,8 +5358,25 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     log.dec(ALLOC.used() as u64 >> 10);
     log.s(b" KiB\n");
     log.flush();
+    // The camera hole's knockout as planned: its rows and pixels (none while the board's hole is unmeasured, `HOLE_HUSKY`).
+    {
+        let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
+        let mut held = rows[..height].iter().enumerate().filter(|(_, g)| g.hole_r > g.hole_l);
+        let top = held.next();
+        let (n, last, px) = held.fold((top.is_some() as u64, top.map_or(0, |t| t.0), top.map_or(0, |t| (t.1.hole_r - t.1.hole_l) as u64)), |(n, _, p), (y, g)| (n + 1, y, p + (g.hole_r - g.hole_l) as u64));
+        log.s(b"display: the camera hole's knockout: ");
+        log.dec(n);
+        log.s(b" rows (");
+        log.dec(top.map_or(0, |t| t.0 as u64));
+        log.s(b" to ");
+        log.dec(last as u64);
+        log.s(b"), ");
+        log.dec(px);
+        log.s(b" pixels\n");
+        log.flush();
+    }
 
-    let pixels: &mut [Px] = unsafe { core::slice::from_raw_parts_mut(back as *mut Px, width * height) };
+    let pixels: &mut [Px]= unsafe { core::slice::from_raw_parts_mut(back as *mut Px, width * height) };
     let screen: &mut [u32] = unsafe { core::slice::from_raw_parts_mut(fb as *mut u32, width * height) };
 
     // The layer is left on the boot ring's surface until a client's first frame: every present points it here first, so the ring stays up until the attest screen replaces it, with no black between (owner, 2026-11-05). The back buffer starts black.
@@ -6501,7 +6574,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                                 let g = &rows[y];
                                 let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), rows[y + 1].first as usize) };
                                 let row_px = &plan[g.first as usize..];
-                                let edge_px = &row_px[row_px.iter().position(|e| e.1 == SHAPE_EDGE).unwrap_or(row_px.len())..];
+                                let edge_px = &row_px[front_split(row_px)..];
                                 let ((cl, cr), bw) = bar_line(y, width, height);
                                 // A flight frame: sampled as the publish samples it, at half resolution from the pair's top row, the wallpaper in it (alone at full resolution where neither image has anything).
                                 if let Some(f) = flight {

@@ -130,3 +130,24 @@ The owner on the glass, first look at the shell: the picture right, the corners 
 - **Brightness**: the AK3B is held at DBV 3175, the top of its normal mode (800 cd/m² by Google's capability; never its high brightness mode without the owner), and every step is in the pixels by the Pro's law (preference 3, 32nds of a stop; the brightest white half the panel's peak). ABL had left DBV 1437 under a table built for husky's peak. Set to preference 32 (white 160 cd/m²) for the owner; `diag "pref brightness <0-255>"` changes it, or the settings slider once the map runs.
 - **Corners** (`GLASS_RADIUS_AKITA`, payloads/display): 112.5, then 98 (the small corner's diagonal cut 8.1 px less), then 96 at the owner's "2px smaller". At 96 fluor's exponent goes from 4 to 5, so the corner is longer (the small one 303.7 px along each edge) and squarer, its diagonal cut 55.6 px. Live: `tools/akita-glass.sh corner <g>` shows grey inside and orange where the mask at g would cut (orange on the glass: g too big); `tools/akita-glass.sh off` returns to the shell. A chosen g goes into `GLASS_RADIUS_AKITA`.
 - **Cutout**: Google's overlay circle (centre 539.5, 68.71, radius 33.72, bottom row 102.43) is Android's approximation, not measured. `tools/akita-glass.sh cutout <cx> <cy> <r>` draws black with a white ring 16 px wide from radius r round (cx, cy) and a red crosshair beyond it. The ring's inner edge touching the hole all round, with no black between, is the hole's radius about that centre; black showing on one side means the hole sits off the other way; the ring cut into means the hole reaches past r there. The measured centre and radius (or a per-row map, if it is not a circle) replace `ferros_sys::CUTOUT_BOTTOM_AKITA` and Google's numbers.
+- **Cutout, measured** (2026-11-08, tools/cutout-scan): the owner marked every pixel the hole hides completely, row by row, then checked them white on black in a dark room (display op 52 mode 4: nothing lit once one stray mark was dropped). 3148 pixels on rows 37 to 100, every row centred on x 539.5, the top and bottom mirror images about y 69.0. The knockout over them is the smallest circle covering every one whole by the mask's coverage rule (R + 0.5 − d, d a pixel centre's distance): radius 32.30 about (539.5, 69.0), the farthest dead pixel's centre 31.80 out (`ferros_sys::CUTOUT_HOLE_AKITA`; its bottom 101.30 is `CUTOUT_BOTTOM_AKITA`, the app circle tangent to it). Its antialiased ramp lands on live pixels only: 36 live pixels covered whole, 194 on the ramp, rows 36 to 101. The display's glass plan draws it in the mask colour, in front with the edge (payloads/display `SHAPE_HOLE`). The map, each row's first and last hidden column:
+
+```
+row first last    row first last    row first last    row first last
+ 37   535  543     53   512  566     69   508  570     85   513  565
+ 38   530  548     54   512  566     70   508  570     86   513  565
+ 39   528  550     55   511  567     71   508  570     87   514  564
+ 40   525  553     56   511  567     72   508  570     88   515  563
+ 41   524  554     57   510  568     73   508  570     89   515  563
+ 42   522  556     58   510  568     74   509  569     90   516  562
+ 43   521  557     59   510  568     75   509  569     91   517  561
+ 44   519  559     60   509  569     76   509  569     92   518  560
+ 45   518  560     61   509  569     77   509  569     93   519  559
+ 46   517  561     62   509  569     78   510  568     94   521  557
+ 47   516  562     63   509  569     79   510  568     95   522  556
+ 48   515  563     64   508  570     80   510  568     96   524  554
+ 49   515  563     65   508  570     81   511  567     97   525  553
+ 50   514  564     66   508  570     82   511  567     98   528  550
+ 51   513  565     67   508  570     83   512  566     99   530  548
+ 52   513  565     68   508  570     84   512  566    100   535  543
+```
