@@ -24,13 +24,14 @@ use core::arch::global_asm;
 use ferros_sys::{call, cap, console, exit, freq, now, sleep_until, window};
 use honeycomb::{Event, Key, Keyboard, Touch, Touches};
 
-/// Typing at the blinkey: `c` into the handle bytes `t` (`n` of them, `chars` characters) at byte `at`, the bytes after it moved up. Nothing at MAX_CHARS. Returns where the blinkey goes: after `c`.
-fn insert_at(t: &mut [u8; 4 * MAX_CHARS], n: &mut usize, chars: &mut usize, at: usize, c: char) -> usize {
-    if *chars >= MAX_CHARS {
-        return at;
-    }
+/// Typing at the blinkey: `c` into the text bytes `t` (`n` of them, `chars` characters) at byte `at`, the bytes after it moved up. Nothing at `limit` characters (MAX_CHARS for a handle, WORD_CHARS for words), nor when the bytes would not fit the buffer. Returns where the blinkey goes: after `c`.
+fn insert_at(t: &mut [u8; TEXT_BYTES], n: &mut usize, chars: &mut usize, at: usize, c: char, limit: usize) -> usize {
     let mut b = [0u8; 4];
     let e = c.encode_utf8(&mut b).as_bytes();
+    // WHY the byte check: words allow WORD_CHARS characters and a character is up to four bytes, more than the buffer holds; past its end the copy below would panic. A handle (MAX_CHARS × 4 bytes) always fits.
+    if *chars >= limit || *n + e.len() > TEXT_BYTES {
+        return at;
+    }
     t.copy_within(at..*n, at + e.len());
     t[at..at + e.len()].copy_from_slice(e);
     *n += e.len();
@@ -39,7 +40,7 @@ fn insert_at(t: &mut [u8; 4 * MAX_CHARS], n: &mut usize, chars: &mut usize, at: 
 }
 
 /// Delete at the blinkey: the character before byte `at` out of the handle bytes, the bytes after it moved down and the freed tail wiped. Returns where the blinkey goes: where that character began.
-fn delete_before(t: &mut [u8; 4 * MAX_CHARS], n: &mut usize, chars: &mut usize, at: usize) -> usize {
+fn delete_before(t: &mut [u8; TEXT_BYTES], n: &mut usize, chars: &mut usize, at: usize) -> usize {
     if at == 0 {
         return 0;
     }
@@ -165,6 +166,10 @@ static mut LABELS: [(i64, i64, u16, u16, [u8; 32], usize); 256] = [(0, 0, 0, 0, 
 static mut NLABELS: usize = 0;
 /// The longest handle the screen takes, in characters.
 const MAX_CHARS: usize = 64;
+/// The entry's buffer, in bytes: a handle (MAX_CHARS characters of up to four bytes) or a newcomer's 23 pairing words (WORD_CHARS).
+const TEXT_BYTES: usize = 1 << 9;
+/// The most characters of words typed for the identity service (its pairing words: 23 voca words of at most 18 letters with spaces between).
+const WORD_CHARS: usize = (1 << 9) - (1 << 6);
 /// Grey working values: the mark, the prompt, the status line (gamma 2, white = Q14).
 const MARK: u64 = 9000;
 const TEXT: u16 = 16384;
@@ -407,6 +412,10 @@ enum Mode {
     Grey([u8; 32]),
     /// fgtw.org's chain for the handle is another identity's: enter starts over.
     Wrong,
+    /// After attest, the keyboard for words the identity service wants typed (the Fleet page, fgtw ops 15 and 16): 1 a newcomer's pairing words, 2 a leaver's approval words. Nothing of the handle is in it.
+    Words(u8),
+    /// After attest, waiting for words to be wanted, the window gone.
+    Hosting,
 }
 
 struct Ahau {
@@ -424,7 +433,7 @@ struct Ahau {
     session_proof: Option<[u8; 32]>,
     /// The roots are set but the client has not taken them yet (`send_roots`).
     roots_pending: bool,
-    handle: [u8; 4 * MAX_CHARS],
+    handle: [u8; TEXT_BYTES],
     len: usize,
     chars: usize,
     /// The blinkey's place in the handle, a byte offset on a character's boundary: typing inserts there, delete takes the character before it, a tap on the entry line moves it.
@@ -562,7 +571,7 @@ impl Ahau {
 
     /// Whether the screen takes a handle now: the first entry, and the mint's second. Elsewhere (looking, the words, no answer, wrong) there is no text box and keys type nothing.
     fn typing(&self) -> bool {
-        matches!(self.mode, Mode::Fresh | Mode::Mint(_))
+        matches!(self.mode, Mode::Fresh | Mode::Mint(_) | Mode::Words(_))
     }
 
     /// Whether a step back to the entry exists: from any step after a first entry (owner, 2026-10-28: "we need a way to go back to the previous screen").
@@ -602,7 +611,8 @@ impl Ahau {
             Mode::Fresh => Some(if self.bound { "unlock" } else { "bind" }),
             Mode::Mint(_) => Some("mint"),
             Mode::Wrong => Some("start over"),
-            Mode::Looking(_) | Mode::Join(_) | Mode::Grey(_) => None,
+            Mode::Words(_) => Some("cancel"),
+            Mode::Looking(_) | Mode::Join(_) | Mode::Grey(_) | Mode::Hosting => None,
         }
     }
 
@@ -765,7 +775,10 @@ impl Ahau {
 
     /// The entry: the handle as typed, a cursor, and a line under it.
     fn entry(&self) {
-        publish_fresh_text(&self.handle[..self.len], true);
+        // The mark is the handle's: words typed for the identity service draw none.
+        if !matches!(self.mode, Mode::Words(_)) {
+            publish_fresh_text(&self.handle[..self.len], true);
+        }
         // A keystroke restarts the blinkey: bright at the top, its next tick a fresh interval away (Photon: the caret stays solid through typing).
         self.wave_top.set(true);
         self.blink_next.set(self.next_blink());
@@ -824,8 +837,8 @@ impl Ahau {
     }
 
     /// The handle as the entry line shows it — a newline as ¶ (the typeface has no return arrow), so the handle stays on one line as typed — its length, and where the blinkey falls in it.
-    fn shown(&self) -> ([u8; 4 * MAX_CHARS + 4 * MAX_CHARS], usize, usize) {
-        let mut t = [0u8; 4 * MAX_CHARS + 4 * MAX_CHARS];
+    fn shown(&self) -> ([u8; 2 * TEXT_BYTES], usize, usize) {
+        let mut t = [0u8; 2 * TEXT_BYTES];
         let (mut n, mut at) = (0, 0);
         for (i, &c) in self.handle[..self.len].iter().enumerate() {
             if i == self.caret {
@@ -986,9 +999,11 @@ impl Ahau {
     fn all(&self) {
         self.surf().fill(0);
         Front::fill64(window::PORCH, (self.w * self.h) as u64, 0);
-        let (cx, cy, r) = self.mark_at();
-        draw_mark(self.surf(), self.w, cx, cy, r);
-        self.present(cy - r - 2, cy + r + 2);
+        if !matches!(self.mode, Mode::Words(_)) {
+            let (cx, cy, r) = self.mark_at();
+            draw_mark(self.surf(), self.w, cx, cy, r);
+            self.present(cy - r - 2, cy + r + 2);
+        }
         self.status(self.prompt());
         self.entry();
         self.button();
@@ -1140,6 +1155,9 @@ impl Ahau {
             Mode::Mint(_) => "This handle is unclaimed.\nMinting is permanent.\nType your handle again to mint your identity.",
             Mode::Grey(_) => "No answer yet. Still looking.",
             Mode::Wrong => "This handle's record doesn't match.\nStart over with another.",
+            Mode::Words(1) => "Type the words the new device shows.",
+            Mode::Words(_) => "Type the words the leaving device shows,\nthen enter.",
+            Mode::Hosting => "",
         }
     }
 
@@ -1172,6 +1190,11 @@ impl Ahau {
     /// The attest button (or a mint's second enter): a first entry derives the proof and hands the roots to the client; a mint confirms; wrong starts over. A join or no answer has no button: the screen closes only when the fleet binds the device.
     fn attest(&mut self) {
         match self.mode {
+            Mode::Words(_) => {
+                self.end_words(true);
+                return;
+            }
+            Mode::Hosting => return,
             Mode::Join(_) | Mode::Grey(_) => return,
             Mode::Wrong => {
                 self.mode = Mode::Fresh;
@@ -1321,21 +1344,199 @@ impl Ahau {
             self.roots_pending = !self.hand_roots();
         }
         console(self.grants, b"ahau: roots handed to fgtw\n");
-        exit(0)
+        self.host_words()
     }
 
     fn attested(&mut self) -> ! {
         if let Some(seed) = self.session_seed {
             self.wallpaper(&seed);
         }
-        // One shot dead (owner, 2026-11-08): no wipe and no window closed on the way out; the kernel wipes the arc as it reclaims it and the display drops the window of a process that ended.
         console(self.grants, b"ahau: attested\n");
-        exit(0)
+        self.host_words()
+    }
+
+    /// After attest this process stays, its window gone, as the keyboard for words the identity service wants typed (the Fleet page's add flow and departure approvals, fgtw ops 15 and 16, the sponsor's side of photon docs/pairing-v2.md): asked four times a second, and while words are wanted the screen shows its keyboard and an entry line, each stroke sent to the identity service and its answer on the status line, until they match, the person cancels, or the service no longer wants them. The handle was wiped at attest; nothing of it is here.
+    fn host_words(&mut self) -> ! {
+        self.wipe();
+        self.mode = Mode::Hosting;
+        window::done(self.display, self.base);
+        console(self.grants, b"ahau: staying as the keyboard for words the identity service asks for (the Fleet page)\n");
+        let touch = cap(self.grants, S_TOUCH);
+        let mut touches = Touches::new(self.w);
+        touches.trace_words = false;
+        let mut held = [(0u8, 0i64, 0i64); 16];
+        let mut r = [0u8; 256];
+        let mut pressed: Option<Key> = None;
+        loop {
+            ferros_sys::pet();
+            let kind = self.words_wanted();
+            if kind == 0 {
+                sleep_until(now() + freq() / 4);
+                continue;
+            }
+            self.mode = Mode::Words(kind);
+            self.wipe();
+            self.retint();
+            self.all();
+            self.show();
+            console(self.grants, if kind == 1 { b"ahau: words wanted: a new device's\n".as_slice() } else { b"ahau: words wanted: a leaving device's\n" });
+            let mut polls = 0u32;
+            while matches!(self.mode, Mode::Words(_)) {
+                ferros_sys::pet();
+                if self.blink() {
+                    self.show_entry();
+                }
+                let n = call(touch, &[1], &mut r) as usize;
+                let count = if n >= 1 && n != ferros_sys::ERR as usize { (r[0] as usize).min(16) } else { 0 };
+                let mut k = 0;
+                while k < count && 1 + (k + 1) * 12 <= n {
+                    let rec = &r[1 + k * 12..1 + (k + 1) * 12];
+                    held[k] = (rec[0], u16::from_le_bytes([rec[4], rec[5]]) as i64, u16::from_le_bytes([rec[6], rec[7]]) as i64);
+                    k += 1;
+                }
+                let mut outs = [Touch::Scrolled; 48];
+                let mut no = 0;
+                let (display, base) = (self.display, self.base);
+                touches.poll(&mut self.kb, &held[..k], &mut |x, y| window::mine(display, base, x as u16, y as u16), &mut |t| {
+                    outs[no] = t;
+                    no += 1;
+                });
+                for &t in &outs[..no] {
+                    if !matches!(self.mode, Mode::Words(_)) {
+                        break;
+                    }
+                    match t {
+                        // Typed at the press, as the handle is (COMMIT_AT_PRESS): the lift only lets the key go.
+                        Touch::Light(key) => {
+                            self.light(key, true);
+                            self.prepare(key);
+                            self.tap(key);
+                            if matches!(self.mode, Mode::Words(_)) {
+                                self.light(key, true);
+                            }
+                            pressed = Some(key);
+                        }
+                        Touch::Unlight(key) => {
+                            if pressed == Some(key) {
+                                pressed = None;
+                            }
+                            self.light(key, false);
+                        }
+                        Touch::Scrolled => self.show_board(),
+                        Touch::Tap(key) => {
+                            if pressed == Some(key) {
+                                pressed = None;
+                                self.light(key, false);
+                            } else {
+                                self.tap(key);
+                            }
+                        }
+                        Touch::TapAt(x, y) => self.tap_at(x, y),
+                        Touch::Drag(x0, y0, x, _) => {
+                            self.drag_text(x0, y0, x);
+                        }
+                        Touch::Trail(..) | Touch::Traced => {}
+                    }
+                }
+                // The identity service no longer wants them (matched on its side, the Fleet page closed the flow, the departure gone): the screen goes.
+                polls += 1;
+                if polls % 64 == 0 && matches!(self.mode, Mode::Words(_)) && self.words_wanted() != kind {
+                    self.end_words(false);
+                }
+                if matches!(self.mode, Mode::Words(_)) && (no > 0 || self.follow_layout()) {
+                    self.show();
+                }
+                sleep_until(now() + freq() / 240);
+            }
+        }
+    }
+
+    /// The words the identity service wants typed now (fgtw op 16): 0 none, 1 a newcomer's, 2 a leaver's.
+    fn words_wanted(&self) -> u8 {
+        let mut o = [0u8; 4];
+        let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[16], &mut o);
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] > 2 { 0 } else { o[0] }
+    }
+
+    /// The words as typed to the identity service: a newcomer's matched at every stroke (fgtw op 11, the live matcher), a leaver's checked when `enter` (op 14). The answer on the status line; a match ends the words.
+    fn send_words(&mut self, enter: bool) {
+        let Mode::Words(kind) = self.mode else { return };
+        let mut m = [0u8; 1 + TEXT_BYTES];
+        m[0] = if kind == 1 { 11 } else { 14 };
+        m[1..1 + self.len].copy_from_slice(&self.handle[..self.len]);
+        if kind == 2 && !enter {
+            return;
+        }
+        let mut o = [0u8; 128];
+        let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &m[..1 + self.len], &mut o);
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 {
+            self.status("The identity service is not answering.");
+            return;
+        }
+        // WHY the min: the reply's length is the service's word; what follows the kind is read only as far as this buffer took it.
+        let n = (n as usize).min(o.len());
+        let text = |from: usize| core::str::from_utf8(o.get(from..n).unwrap_or(&[])).unwrap_or("");
+        let mut l = Line::new();
+        if kind == 2 {
+            match o[0] {
+                0 => {
+                    self.end_words(false);
+                    return;
+                }
+                2 => self.status("These words don't match. Try again."),
+                _ => {
+                    self.end_words(false);
+                    return;
+                }
+            }
+            return;
+        }
+        match o[0] {
+            // Matched: the identity service adds it now; the Fleet page shows how it goes.
+            2 => {
+                self.end_words(false);
+                return;
+            }
+            0 if n > 2 => {
+                let _ = core::fmt::Write::write_fmt(&mut l, format_args!("\"{}\" is not one of the words.", text(2)));
+            }
+            0 => {
+                let _ = core::fmt::Write::write_str(&mut l, "Waiting for the new device to ask.");
+            }
+            1 => {
+                let _ = core::fmt::Write::write_str(&mut l, self.prompt());
+            }
+            3 => {
+                let _ = core::fmt::Write::write_fmt(&mut l, format_args!("No device asking has \"{}\".", text(2)));
+            }
+            4 => {
+                let _ = core::fmt::Write::write_fmt(&mut l, format_args!("Matches {}.", text(2)));
+            }
+            5 => {
+                let _ = core::fmt::Write::write_fmt(&mut l, format_args!("Matches {} devices.", o.get(1).copied().unwrap_or(0)));
+            }
+            _ => {
+                self.end_words(false);
+                return;
+            }
+        }
+        self.status(core::str::from_utf8(l.as_bytes()).unwrap_or(""));
+    }
+
+    /// The words done: the screen goes, the text wiped; `cancel` tells the identity service they are no longer wanted (op 15 [0]).
+    fn end_words(&mut self, cancel: bool) {
+        if cancel {
+            let mut o = [0u8; 4];
+            let _ = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[15, 0], &mut o);
+        }
+        self.wipe();
+        self.mode = Mode::Hosting;
+        window::done(self.display, self.base);
     }
 
     /// A finger is down on `key`: the handle as that key would make it goes to the mark's thread now, so its frame is ready by the lift; the text itself changes only at the lift (`tap`). The key's effect is found on a copy of the keyboard (its shift and page are the real one's), so nothing here changes until the tap.
     fn preview(&self, key: Key) {
-        if !self.typing() {
+        if !self.typing() || matches!(self.mode, Mode::Words(_)) {
             return;
         }
         let mut kb = self.kb.clone();
@@ -1343,10 +1544,10 @@ impl Ahau {
         let (mut t, mut n, mut ch) = (self.handle, self.len, self.chars);
         match kb.tap(key) {
             Some(Event::Char(c)) => {
-                insert_at(&mut t, &mut n, &mut ch, self.caret, c);
+                insert_at(&mut t, &mut n, &mut ch, self.caret, c, MAX_CHARS);
             }
             Some(Event::Enter) => {
-                insert_at(&mut t, &mut n, &mut ch, self.caret, '\n');
+                insert_at(&mut t, &mut n, &mut ch, self.caret, '\n', MAX_CHARS);
             }
             Some(Event::Back) => {
                 delete_before(&mut t, &mut n, &mut ch, self.caret);
@@ -1361,7 +1562,8 @@ impl Ahau {
     }
 
     fn type_char(&mut self, c: char) {
-        self.caret = insert_at(&mut self.handle, &mut self.len, &mut self.chars, self.caret, c);
+        let limit = if matches!(self.mode, Mode::Words(_)) { WORD_CHARS } else { MAX_CHARS };
+        self.caret = insert_at(&mut self.handle, &mut self.len, &mut self.chars, self.caret, c, limit);
         self.entry();
     }
 
@@ -1373,6 +1575,11 @@ impl Ahau {
             Some(Event::Back) => {
                 self.caret = delete_before(&mut self.handle, &mut self.len, &mut self.chars, self.caret);
                 self.entry();
+            }
+            // Words: enter sends them as typed (they hold no newline).
+            Some(Event::Enter) if matches!(self.mode, Mode::Words(_)) => {
+                self.send_words(true);
+                return;
             }
             // Enter is a character of the handle (owner, 2026-10-28: "enter is a valid char"); the button under the entry line attests.
             Some(Event::Enter) => self.type_char('\n'),
@@ -1387,6 +1594,13 @@ impl Ahau {
                 return;
             }
             None => return,
+        }
+        // Words: matched as they are typed (the newcomer's), the result on the status line.
+        if matches!(self.mode, Mode::Words(_)) {
+            self.send_words(false);
+            if !matches!(self.mode, Mode::Words(_)) {
+                return;
+            }
         }
         // Every stroke: the keys take the new handle's rainbow, laid on from the board in one pass; a letter that ended a one-letter shift brings the lower-case board, drawn at its press.
         let t = now();
@@ -1783,7 +1997,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, caret: 0, word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None) };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None) };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     start_fresh_mark(grants, w / 3);
     a.retint();

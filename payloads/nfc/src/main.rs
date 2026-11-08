@@ -11,6 +11,9 @@
 //! - `0` STATE: text (the chip's versions, discovery, counts).
 //! - `1` SERVE + S (32 bytes): a ceremony is live; GET DATA answers S until STOP. → [0].
 //! - `2` STOP: no ceremony; GET DATA answers 6A82. → [0].
+//! - `4` READER: the sponsor's side of the tap (photon PhotonNfc's reader): polling NFC-A alone, no listening; a tapped device answering ISO-DEP is asked for Photon's tag (SELECT the AID, GET DATA) and the secret it serves kept. → [0], or [1] refused (nobody has attested, or discovery would not start).
+//! - `5` READER STOP: listening and polling as before. → [0] or [1].
+//! - `6` READ SECRET: the secret read off a tapped device since the last ask (32 bytes, once), else nothing.
 //! - `3` READS: activations u32, S served u32, field-on events u32 (little-endian, 12 bytes): a ceremony's caller watches S served move to know the sponsor's phone read it.
 #![no_std]
 #![no_main]
@@ -117,6 +120,11 @@ struct Nfc {
     discovering: bool,
     /// A reader's field on us now (RF_FIELD_INFO_NTF's last word).
     field: bool,
+    /// Reader mode (op 4, the sponsor's side of the tap): discovery polls NFC-A only and does not listen, so this device is the reader when two devices touch; a device found answering ISO-DEP is asked for Photon's tag (SELECT, then GET DATA) and its secret kept for the identity service (op 6).
+    reading: bool,
+    /// Where the exchange with a tapped device stands: 0 none, 1 the SELECT sent, 2 the GET DATA sent.
+    rstage: u8,
+    read_secret: Option<[u8; 32]>,
 }
 
 impl Nfc {
@@ -323,7 +331,11 @@ impl Nfc {
                     let len = self.apdu_len;
                     a[..len].copy_from_slice(&self.apdu[..len]);
                     self.apdu_len = 0;
-                    self.apdu(&a[..len]);
+                    if self.rstage != 0 {
+                        self.tag_answer(&a[..len]);
+                    } else {
+                        self.apdu(&a[..len]);
+                    }
                 }
             }
             // CORE_RESET_NTF: the chip reset itself (a reason in byte 0: 1 = the host asked, A0 = into NFC mode).
@@ -349,6 +361,18 @@ impl Nfc {
             (3, 1, 5) => {
                 // Byte 3 is the technology and mode: below G#80 we polled and found a tag (or a device answering as one). Its technology parameters follow byte 6 (their length): for NFC-A the SENS_RES, then the UID's length and the UID. Logged, then the tag let go back to discovery (RF_DEACTIVATE, type 3).
                 let mode = pl.get(3).copied().unwrap_or(0);
+                // Reader mode and an ISO-DEP device (interface G#02): Photon's tag asked for, its SELECT the first APDU.
+                if mode < 0x80 && self.reading && pl.get(1) == Some(&0x02) {
+                    self.credits = pl.get(5).copied().unwrap_or(1) as u32;
+                    self.apdu_len = 0;
+                    self.rstage = 1;
+                    let mut c = [0u8; 5 + 8 + 1];
+                    c[..5].copy_from_slice(&[0x00, 0xA4, 0x04, 0x00, AID.len() as u8]);
+                    c[5..13].copy_from_slice(&AID);
+                    say!(self.grants, "nfc: a device answers as a tag: asking for Photon's\n");
+                    self.data(&c);
+                    return;
+                }
                 if mode < 0x80 {
                     self.tags += 1;
                     let tl = pl.get(6).copied().unwrap_or(0) as usize;
@@ -428,8 +452,11 @@ impl Nfc {
 
     /// Listening as a card on NFC-A and NFC-B, and between listens polling for tags on NFC-A, NFC-B and NFC-V (each entry a technology and mode, then 1: every discovery period), as Android interleaves them.
     fn discover(&mut self, p: &mut Packet) -> bool {
+        // Reader mode: NFC-A polling alone (Photon's reader takes NFC-A, FLAG_READER_NFC_A), no listening, so the other device of a tap is the card.
+        let both: &[u8] = &[0x21, 0x03, 0x0B, 0x05, 0x00, 0x01, 0x01, 0x01, 0x06, 0x01, 0x80, 0x01, 0x81, 0x01];
+        let reader: &[u8] = &[0x21, 0x03, 0x03, 0x01, 0x00, 0x01];
         // G#A0, discovery already started, is discovering too.
-        self.discovering = match self.cmd(&[0x21, 0x03, 0x0B, 0x05, 0x00, 0x01, 0x01, 0x01, 0x06, 0x01, 0x80, 0x01, 0x81, 0x01], p) {
+        self.discovering = match self.cmd(if self.reading { reader } else { both }, p) {
             Some(n) if n >= 4 && (p[3] == 0 || p[3] == 0xA0) => true,
             Some(n) => {
                 say!(self.grants, "nfc: discover refused: {}\n", Hex(&p[..n]));
@@ -489,6 +516,64 @@ impl Nfc {
         self.discover(p)
     }
 
+    /// One APDU to the tapped device on the static RF connection, as one data packet (every APDU here fits one).
+    fn data(&mut self, apdu: &[u8]) {
+        let mut r = [0u8; 3 + 32];
+        r[2] = apdu.len() as u8;
+        r[3..3 + apdu.len()].copy_from_slice(apdu);
+        // A packet sent with no credit breaks the controller's flow control (NCI 2.0 4.4.4): said, not hidden, and sent anyway.
+        if self.credits == 0 {
+            say!(self.grants, "nfc: sending without a credit\n");
+        } else {
+            self.credits -= 1;
+        }
+        if let Err(e) = self.send(&r[..3 + apdu.len()]) {
+            say!(self.grants, "nfc: send to the tag failed G#{e:X}\n");
+        }
+    }
+
+    /// The tapped device's answer (reader mode, PhotonNfc's reader): to the SELECT 9000, then GET DATA (80 CA 00 00 00); to that, S (32 bytes) and 9000, kept for the identity service. Anything else ends the exchange. The device is then let go back to discovery (RF_DEACTIVATE, type 3).
+    fn tag_answer(&mut self, a: &[u8]) {
+        let ok = a.len() >= 2 && a[a.len() - 2..] == [0x90, 0x00];
+        match self.rstage {
+            1 if ok => {
+                self.rstage = 2;
+                self.data(&[0x80, 0xCA, 0x00, 0x00, 0x00]);
+                return;
+            }
+            2 if ok && a.len() == 34 => {
+                let mut s = [0u8; 32];
+                s.copy_from_slice(&a[..32]);
+                self.read_secret = Some(s);
+                self.tags += 1;
+                say!(self.grants, "nfc: a pairing secret read from a tapped device\n");
+            }
+            1 => say!(self.grants, "nfc: the tapped device is not a Photon joiner ({})\n", Hex(&a[..a.len().min(4)])),
+            _ => say!(self.grants, "nfc: the tapped device's GET DATA answer has an unexpected shape ({} bytes)\n", a.len()),
+        }
+        self.rstage = 0;
+        if let Err(e) = self.send(&[0x21, 0x06, 0x01, 0x03]) {
+            say!(self.grants, "nfc: release failed G#{e:X}\n");
+        }
+    }
+
+    /// Reader mode on or off: discovery stopped (RF_DEACTIVATE to idle) and started again with the other set of technologies.
+    fn set_reading(&mut self, on: bool, p: &mut Packet) -> bool {
+        if self.reading == on {
+            return true;
+        }
+        self.reading = on;
+        self.rstage = 0;
+        if self.discovering {
+            // Its response, then the deactivation notification (type 0, idle), which `packet` reads as discovery stopped.
+            let _ = self.cmd(&[0x21, 0x06, 0x01, 0x00], p);
+            if let Some(n) = self.next(p, 64) {
+                self.packet(p, n);
+            }
+        }
+        self.discover(p)
+    }
+
     fn state(&self, out: &mut Line) {
         let _ = write!(out, "firmware {}, RF config {}; {}; S {}; activations {}, S served {}, fields {}, tags {}", Hex(&self.version), Hex(&self.config), if self.discovering { "listening (A, B), polling (A, B, V)" } else { "not listening" }, if self.secret.is_some() { "live" } else { "none" }, self.activations, self.served, self.fields, self.tags);
     }
@@ -498,7 +583,7 @@ impl Nfc {
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    let mut nfc = Nfc { grants, secret: None, credits: 0, apdu: [0; 512], apdu_len: 0, activations: 0, served: 0, fields: 0, tags: 0, version: [0; 4], config: [0; 2], discovering: false, field: false };
+    let mut nfc = Nfc { grants, secret: None, credits: 0, apdu: [0; 512], apdu_len: 0, activations: 0, served: 0, fields: 0, tags: 0, version: [0; 4], config: [0; 2], discovering: false, field: false, reading: false, rstage: 0, read_secret: None };
     let mut p: Packet = [0; 258];
     if !ferros_sys::power(cap(grants, S_POWER), true) {
         say!(grants, "nfc: power on failed (HSI1 off?)\n");
@@ -563,6 +648,22 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     r[4..8].copy_from_slice(&nfc.served.to_le_bytes());
                     r[8..].copy_from_slice(&nfc.fields.to_le_bytes());
                     reply(&token, &r);
+                }
+                // The sponsor's side of the tap (the identity service's add flow): reader mode on (gated like the tag: nothing before a person has attested), off, and the secret read off a tapped device, once.
+                4 if ferros_sys::facts().0[83] != 2 => {
+                    reply(&token, &[1]);
+                }
+                4 | 5 => {
+                    let on = msg[0] == 4;
+                    let ok = nfc.set_reading(on, &mut p);
+                    say!(grants, "nfc: reader mode {}\n", if !ok { "refused" } else if on { "on" } else { "off" });
+                    reply(&token, &[!ok as u8]);
+                }
+                6 => {
+                    match nfc.read_secret.take() {
+                        Some(s) => reply(&token, &s),
+                        None => reply(&token, &[]),
+                    };
                 }
                 _ => {
                     reply(&token, &[]);

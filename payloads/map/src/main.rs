@@ -207,11 +207,24 @@ struct Fleet {
     confirm: bool,
     /// What the last departure request answered (fgtw `leave`: 0 started, 1 not a member, 2 a bad intent, 3 the request did not build).
     leave_result: Option<u8>,
+    /// Adding a device (fgtw op 9): the flow's phase (payloads/fgtw ADD_*: 0 closed, 1 open, 2 adding, 3 waiting for the confirm, 4 handing over the key, 5 added, 6 failed), the devices asking to join (the key's first 8 bytes, flags: bit 0 its beacon heard, bit 1 its request heard on this network, bit 2 the one just bound; its name), and the service's note.
+    add: u8,
+    cand_key: [[u8; 8]; 8],
+    cand_flags: [u8; 8],
+    cand_name: [[u8; NAME_BYTES]; 8],
+    cand_name_n: [u8; 8],
+    cands: usize,
+    add_note: [u8; 64],
+    add_note_n: usize,
+    /// A sibling's departure waiting for approval here (fgtw op 13): its intent and how the approval stands (0 waiting, 1 approving, 2 approved, 3 failed), and its name.
+    depart: Option<(u8, u8)>,
+    depart_name: [u8; NAME_BYTES],
+    depart_name_n: usize,
 }
 
 impl Fleet {
     const fn new() -> Self {
-        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], reach: None, names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None }
+        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], reach: None, names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0 }
     }
 
     /// The service's state and words (`[state][siblings heard][words]`), then its members (`[count][count × (8 key bytes, flags)]`). CALL_LIVE: a service that is not running answers at once instead of holding the page.
@@ -259,6 +272,60 @@ impl Fleet {
             }
             self.n = cnt;
         }
+        self.poll_add(svc);
+    }
+
+    /// The add flow and a departure waiting (fgtw ops 9 and 13). WHY the checks: the counts and lengths are another process's words; a row or a name that would run past what the reply holds or a slot keeps ends the reading there.
+    fn poll_add(&mut self, svc: u64) {
+        let mut a = [0u8; 2 + 8 * (8 + 2 + NAME_BYTES) + 1 + 255];
+        let k = ferros_sys::call_live(svc, &[9], &mut a);
+        self.cands = 0;
+        self.add_note_n = 0;
+        if k != ferros_sys::ERR && k >= 2 {
+            let got = (k as usize).min(a.len());
+            self.add = a[0];
+            let mut at = 2;
+            for i in 0..(a[1] as usize).min(8) {
+                if at + 10 > got {
+                    break;
+                }
+                let len = a[at + 9] as usize;
+                if len > NAME_BYTES || at + 10 + len > got {
+                    break;
+                }
+                self.cand_key[i].copy_from_slice(&a[at..at + 8]);
+                self.cand_flags[i] = a[at + 8];
+                self.cand_name[i][..len].copy_from_slice(&a[at + 10..at + 10 + len]);
+                self.cand_name_n[i] = len as u8;
+                self.cands = i + 1;
+                at += 10 + len;
+            }
+            if at < got {
+                let len = (a[at] as usize).min(self.add_note.len());
+                if at + 1 + len <= got {
+                    self.add_note[..len].copy_from_slice(&a[at + 1..at + 1 + len]);
+                    self.add_note_n = len;
+                }
+            }
+        } else {
+            self.add = 0;
+        }
+        let mut d = [0u8; 4 + NAME_BYTES];
+        let k = ferros_sys::call_live(svc, &[13], &mut d);
+        self.depart = None;
+        if k != ferros_sys::ERR && k >= 4 && d[0] == 1 {
+            let len = (d[3] as usize).min(NAME_BYTES).min(k as usize - 4);
+            self.depart_name[..len].copy_from_slice(&d[4..4 + len]);
+            self.depart_name_n = len;
+            self.depart = Some((d[1], d[2]));
+        }
+    }
+
+    /// An add-flow op to the identity service (8 open or close, 10 pick, 12 confirm, 15 the keyboard for words), then the page's view again.
+    fn add_op(&mut self, svc: u64, msg: &[u8]) {
+        let mut r = [0u8; 8];
+        let _ = ferros_sys::call_live(svc, msg, &mut r);
+        self.poll(svc);
     }
 
     /// Start this device's departure (fgtw op 5, intent 1: to a new owner, so the approver also frees the device for another fleet).
@@ -450,6 +517,14 @@ enum Choice {
     Page(i8),
     /// The Fleet page's "remove this device": the first tap shows what goes with it, the second starts the departure.
     FleetRemove,
+    /// The Fleet page's add flow (fgtw::sponsor through payloads/fgtw ops 8-15): open it, pick a device heard nearby (its row), type the newcomer's words (on the attest screen's keyboard, ahau), confirm a nearby pick turned green, close it.
+    FleetAdd,
+    FleetPick(u8),
+    FleetWords,
+    FleetConfirm,
+    FleetClose,
+    /// A sibling's departure waiting here: type the words it shows (ahau's keyboard) to approve it.
+    FleetApprove,
     /// A link on Connections: its own page (LINKS order).
     Link(u8),
     /// A radio's page: its switch, as its console circle's tap (preference 15).
@@ -1853,6 +1928,64 @@ impl Map {
                     }
                     row(self, b, &mut y, small, if f.me[i] { white() } else { grey() }, l.as_str(), None);
                 }
+                // Adding a device, and approving a sibling's departure (fgtw::sponsor, through payloads/fgtw ops 8-15): a member of the fleet only.
+                if f.state == Some(3) {
+                    if let Some((intent, result)) = f.depart {
+                        let mut l = Line::new();
+                        l.s(core::str::from_utf8(&f.depart_name[..f.depart_name_n]).unwrap_or("a device"));
+                        l.s(if intent == 1 { " asks to leave, to a new owner" } else { " asks to leave the fleet" });
+                        row(self, b, &mut y, small, white(), l.as_str(), None);
+                        match result {
+                            0 => row(self, b, &mut y, small, grey(), "approve: type the words it shows", Some(Choice::FleetApprove)),
+                            1 => row(self, b, &mut y, small, grey(), "approving", None),
+                            2 => row(self, b, &mut y, small, grey(), "approved: it leaves the fleet", None),
+                            _ => row(self, b, &mut y, small, grey(), "the approval did not publish: type the words again", Some(Choice::FleetApprove)),
+                        }
+                    }
+                    if f.add == 0 {
+                        row(self, b, &mut y, small, grey(), "add a device", Some(Choice::FleetAdd));
+                        if f.cands > 0 {
+                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "a device on this network asks to join");
+                            y += uu(2, 1);
+                        }
+                    } else {
+                        let phase = match f.add {
+                            1 => "add a device: devices asking to join",
+                            2 => "adding it to the fleet",
+                            3 => "it is in the fleet",
+                            4 => "handing it the fleet's key",
+                            5 => "added",
+                            _ => "adding it failed",
+                        };
+                        row(self, b, &mut y, small, white(), phase, None);
+                        if f.add_note_n > 0 {
+                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, core::str::from_utf8(&f.add_note[..f.add_note_n]).unwrap_or(""));
+                            y += uu(2, 1);
+                        }
+                        for i in 0..f.cands {
+                            // A device heard nearby (its request on this network, or its beacon) is a tap to pick; one only the registry knows is matched by its words.
+                            let nearby = f.cand_flags[i] & 3 != 0;
+                            let mut l = Line::new();
+                            l.s(core::str::from_utf8(&f.cand_name[i][..f.cand_name_n[i] as usize]).unwrap_or("a device"));
+                            l.s(if f.cand_flags[i] & 4 != 0 { "  added" } else if nearby { "  nearby: tap to add" } else { "  not nearby: type its words" });
+                            let pick = nearby && f.add == 1;
+                            row(self, b, &mut y, small, if pick { white() } else { grey() }, l.as_str(), pick.then_some(Choice::FleetPick(i as u8)));
+                        }
+                        if f.add == 1 {
+                            if f.cands == 0 {
+                                b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "open Photon's join screen on the device");
+                                y += uu(2, 1);
+                            }
+                            row(self, b, &mut y, small, grey(), "type its words", Some(Choice::FleetWords));
+                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "or tap the two devices together");
+                            y += uu(2, 1);
+                        }
+                        if f.add == 3 {
+                            row(self, b, &mut y, small, white(), "it left its words screen: finish", Some(Choice::FleetConfirm));
+                        }
+                        row(self, b, &mut y, small, grey(), if f.add >= 5 { "done" } else { "close" }, Some(Choice::FleetClose));
+                    }
+                }
                 if f.state == Some(8) {
                     // The departure waits for a device of the fleet: its person types these words there (Photon: Devices).
                     b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "approve on one of your devices with:");
@@ -2439,6 +2572,18 @@ impl Map {
                         }
                     }
                     // Remove this device: the first tap shows what goes with it, the second starts the departure (the words then show here).
+                    // Adding a device (payloads/fgtw ops 8, 10, 12, 15): the flow opened and closed, a nearby device picked, a pick confirmed, the keyboard asked for the newcomer's words (1) or a leaver's (2), which the attest screen (ahau) hosts.
+                    Some(Choice::FleetAdd) => self.fleet.add_op(cap(self.grants, S_FGTW), &[8, 1]),
+                    Some(Choice::FleetClose) => self.fleet.add_op(cap(self.grants, S_FGTW), &[8, 0]),
+                    Some(Choice::FleetPick(i)) => {
+                        let mut m = [0u8; 9];
+                        m[0] = 10;
+                        m[1..].copy_from_slice(&self.fleet.cand_key[i as usize]);
+                        self.fleet.add_op(cap(self.grants, S_FGTW), &m);
+                    }
+                    Some(Choice::FleetConfirm) => self.fleet.add_op(cap(self.grants, S_FGTW), &[12]),
+                    Some(Choice::FleetWords) => self.fleet.add_op(cap(self.grants, S_FGTW), &[15, 1]),
+                    Some(Choice::FleetApprove) => self.fleet.add_op(cap(self.grants, S_FGTW), &[15, 2]),
                     Some(Choice::FleetRemove) => {
                         if self.fleet.confirm {
                             self.fleet.leave(cap(self.grants, S_FGTW));

@@ -436,6 +436,62 @@ struct Sponsor {
     online: bool,
 }
 
+/// The add flow's phases, as the Fleet page reads them (op 9).
+const ADD_CLOSED: u8 = 0;
+/// Open: candidates listed from the registry and the LAN, nothing picked.
+const ADD_OPEN: u8 = 1;
+/// A candidate picked (by its words, its tag, or nearby): the Add being signed and published.
+const ADD_BINDING: u8 = 2;
+/// Picked nearby and bound: the fleet key waits for the person's confirm that the newcomer left its words screen (two-phase: a wrong pick stays a keyless ledger entry).
+const ADD_BOUND: u8 = 3;
+/// The fan-out being grown to the newcomer.
+const ADD_GROWING: u8 = 4;
+/// Added: the newcomer is in the chain and holds the fleet key.
+const ADD_DONE: u8 = 5;
+/// The last step failed; `note` says why.
+const ADD_FAILED: u8 = 6;
+
+/// How long a binding request heard over the LAN, or a beacon over BLE, counts as "nearby" (Photon's LAN_HEARD_FRESH).
+const NEARBY_US: u64 = 30_000_000;
+
+/// The sponsor's side of adding a device to this fleet (fgtw::sponsor; photon docs/pairing-v2.md), while the Fleet page's add flow is open. The newcomer's binding request reaches this device from the seed's registry (listed every 8 s while open) and over the LAN (`bind_req`, kept whether or not the flow is open, as Photon keeps it); its BLE beacon and NFC tag are read by the radios' drivers.
+struct Adding {
+    phase: u8,
+    /// The registry's last list, and when it was asked.
+    registry: Vec<fgtw::fleet::BindRequest>,
+    listed_us: u64,
+    /// The candidate rows (fgtw::sponsor::candidates), rebuilt whenever a source changes.
+    cands: Vec<fgtw::sponsor::Candidate>,
+    /// The request picked, whether its key follows at once (words, tap) or waits for the confirm (nearby), and the device bound.
+    picked: Option<(fgtw::fleet::BindRequest, bool)>,
+    bound: Option<[u8; 32]>,
+    /// The person's confirm, waiting for the loop to grow the fan-out.
+    confirm: bool,
+    /// The words typed so far (op 11), matched live.
+    words: alloc::string::String,
+    /// What the Fleet page shows under the phase.
+    note: alloc::string::String,
+}
+
+impl Adding {
+    const fn new() -> Self {
+        Adding { phase: ADD_CLOSED, registry: Vec::new(), listed_us: 0, cands: Vec::new(), picked: None, bound: None, confirm: false, words: alloc::string::String::new(), note: alloc::string::String::new() }
+    }
+}
+
+/// A sibling's departure waiting for this device's person to approve it (`depart_req`, checked on receipt): the leaving device, its consent stamp and eggs, its intent, its words' commitment, and an approval asked for (the words matched; the loop countersigns).
+struct DepartAsk {
+    leaver: [u8; 32],
+    t: i64,
+    sig: Vec<u8>,
+    intent: u8,
+    commit: Option<[u8; 32]>,
+    approve: bool,
+    /// What happened to the approval (0 waiting, 1 approving, 2 approved, 3 failed).
+    result: u8,
+}
+
+
 struct Client {
     log: Log,
     udp: Udp,
@@ -482,6 +538,20 @@ struct Client {
     given_asked_t: i64,
     /// The departure stamp the named sponsor was handed last (0 = none yet).
     given_depart_t: i64,
+    /// The chains and fan-outs this device holds (fgtw::held, the rule Photon's held set follows): the seed's copy when it answers, this one when it does not.
+    held: core::cell::RefCell<fgtw::held::HeldChains>,
+    held_fan: core::cell::RefCell<fgtw::held::HeldFanouts>,
+    /// Sponsoring: the add flow, the binding requests handed over the LAN (checked, the newest per device) and where each came from and when, and the beacon ids the Bluetooth driver heard.
+    adding: Adding,
+    lan_reqs: Vec<fgtw::fleet::BindRequest>,
+    lan_from: Vec<([u8; 32], Addr, u64)>,
+    ble_heard: Vec<([u8; fgtw::pair::BEACON_UUID_LEN], u64)>,
+    /// Whether the radios are listening for newcomers (the BLE scan, the NFC reader) while the add flow is open (`sponsor_radios`).
+    listening: bool,
+    /// A sibling's departure waiting for approval here.
+    depart_ask: Option<DepartAsk>,
+    /// Words wanted from the person (op 15, the Fleet page): 0 none, 1 a newcomer's pairing words, 2 a leaver's approval words. The keyboard's host (the attest screen, ahau) asks for it (op 16), sends what is typed (ops 11, 14), and closes when the words match or the person cancels (op 15 [0]).
+    entry: u8,
 }
 
 impl Client {
@@ -773,6 +843,8 @@ impl Client {
     fn note_members(&mut self, blob: &fgtw::fleet::MembershipBlob) {
         if let Ok(m) = blob.fold() {
             self.members = m;
+            // The held copy too (fgtw::held): what a sponsor's Add extends when the seed does not answer.
+            fgtw::held::ChainHold::hold(&self.held, blob);
         }
     }
 
@@ -1320,6 +1392,9 @@ impl Client {
                     }
                 }
             }
+            // A newcomer asking this device to add it, and a sibling asking to leave: the sponsor's and the approver's frames (fgtw::sponsor).
+            Ok((Inbound::Other(name), _)) if name == "bind_req" => self.on_bind_req(from, bytes),
+            Ok((Inbound::Other(name), _)) if name == "depart_req" => self.on_depart_req(bytes),
             Ok((Inbound::Other(name), signer)) => {
                 self.log.put(b"fgtw: frame ");
                 self.log.put(name.as_bytes());
@@ -1395,11 +1470,42 @@ impl Client {
             let out = self.pt.tick(t, eagle());
             self.send_all(out);
             // The attest screen: the state, or its roots (op 4, 65 bytes).
-            let mut req = [0u8; 72];
+            // On the stack: a syscall's buffers must be in the arc. 512 bytes hold the longest words entry (23 voca words, at most 18 letters each, with spaces).
+            let mut req = [0u8; 512];
             let mut tok = [0u8; 32];
             let n = ferros_sys::recv(cap(self.log.grants, S_SERVE), &mut req, &mut tok, true);
             if n != ERR && n != ferros_sys::NOTHING {
                 busy = true;
+                // WHY the min: `n` is what the caller sent, which may be more than the buffer took.
+                let got = (n as usize).min(req.len());
+                // The sponsor's and the approver's ops (the Fleet page's add flow and approvals, fgtw::sponsor): each answers alone, nothing of the state after it. 8 [on] open or close the add flow → [0]; 9 → the add flow (`adding_reply`); 10 [key 8] pick a nearby candidate → [result]; 11 [words] the words typed so far → the match (`type_words`); 12 confirm a nearby pick → [result]; 13 → a departure waiting (`depart_ask_reply`); 14 [words] approve it → [result]; 15 [kind] words wanted from the person (0 none, 1 a newcomer's, 2 a leaver's) → [0]; 16 → the words wanted now [kind] (the keyboard's host asks).
+                if n >= 1 && (8..=16).contains(&req[0]) {
+                    let text = core::str::from_utf8(&req[1..got]).unwrap_or("");
+                    let r: Vec<u8> = match req[0] {
+                        8 if n >= 2 => {
+                            self.open_add(req[1] != 0);
+                            alloc::vec![0]
+                        }
+                        9 => self.adding_reply(),
+                        10 if n >= 9 => {
+                            let mut k = [0u8; 8];
+                            k.copy_from_slice(&req[1..9]);
+                            alloc::vec![self.pick_nearby(&k)]
+                        }
+                        11 => self.type_words(text),
+                        12 => alloc::vec![self.confirm_add()],
+                        13 => self.depart_ask_reply(),
+                        14 => alloc::vec![self.approve_words(text)],
+                        15 if n >= 2 && req[1] <= 2 => {
+                            self.entry = req[1];
+                            alloc::vec![0]
+                        }
+                        16 => alloc::vec![self.entry_wanted()],
+                        _ => alloc::vec![ERR as u8],
+                    };
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
                 let mut reply = Vec::with_capacity(400);
                 // Op 6: the fleet's members, for the Fleet page (`members_reply`): its own reply, nothing of the state after it.
                 // Op 7: how this device reaches its fleet, for the Fleet page: [the network up (IPv4) u8][seconds since fgtw.org last answered, u32 LE, all ones for never][fleet devices heard on this network u8].
@@ -1506,6 +1612,8 @@ impl Client {
                     }
                 }
             }
+            // Sponsoring and approving (fgtw::sponsor): the add flow's listing, binding and growing, the radios listening for newcomers, an approved departure.
+            self.sponsor_step(t);
             // The verdict: looked up once the network is up, and again every 30 s while GREY or while a fresh handle waits (someone else may mint it meanwhile).
             // The client serves from the start, network or not (the attest screen waits on it); the network coming up is a reason to look up at once, not 30 s later.
             let up = self.udp.flags().is_some_and(|f| f & 1 != 0);
@@ -1575,6 +1683,538 @@ impl Client {
     }
 }
 
+
+/// The sponsor's and the approver's side (fgtw::sponsor, the code Photon's Devices screen runs): adding another device to this fleet, and approving a sibling's departure. Everything that signs or reaches the seed runs in the loop (`sponsor_step`), never inside a call another process waits on; the Fleet page's ops only record what the person asked.
+impl Client {
+    /// The candidate rows again, from the registry's last list and the LAN's requests, each marked nearby when its request came over the LAN or its beacon was heard within `NEARBY_US`.
+    fn rebuild_candidates(&mut self) {
+        let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
+        fgtw::sponsor::retain_fresh(&mut self.lan_reqs, eagle());
+        let t = now_us();
+        // The clock only moves forward, so `t` is never behind a stamp taken earlier.
+        self.ble_heard.retain(|(_, at)| t - at < NEARBY_US);
+        let reqs = fgtw::sponsor::merge_requests(&self.adding.registry, &self.lan_reqs);
+        let ble: Vec<[u8; fgtw::pair::BEACON_UUID_LEN]> = self.ble_heard.iter().map(|(u, _)| *u).collect();
+        let lan: Vec<[u8; 32]> = self.lan_from.iter().filter(|(_, _, at)| t - at < NEARBY_US).map(|(k, _, _)| *k).collect();
+        self.adding.cands = fgtw::sponsor::candidates(reqs, &seed, &hp, &ble, &lan);
+    }
+
+    /// A newcomer's binding request handed to this device over the LAN (`bind_req`): taken only by a member of the fleet it names, checked exactly as a registry row is (fgtw::sponsor::check_lan_request), kept as the newest from its device, and its address remembered for the hand-over.
+    fn on_bind_req(&mut self, from: Addr, bytes: &[u8]) {
+        let Ok((hp, req, _)) = fgtw::protocol::parse_bind_req(bytes) else { return };
+        let (Some(our_hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
+        if hp != our_hp || !self.bound {
+            return;
+        }
+        let key = req.device_pubkey;
+        match fgtw::sponsor::check_lan_request(&req, &hp, &seed, eagle()) {
+            Ok(()) => {}
+            Err(why) => {
+                self.log.put(b"fgtw: a binding request from ");
+                self.log.fp(&key);
+                self.log.put(if why == fgtw::sponsor::LanRefusal::Stale { b" is stale: ignored".as_slice() } else { b" does not verify for our fleet: ignored" });
+                self.log.line();
+                return;
+            }
+        }
+        if fgtw::sponsor::offer_lan(&mut self.lan_reqs, req) == fgtw::sponsor::Offered::Unchanged {
+            return;
+        }
+        let t = now_us();
+        match self.lan_from.iter_mut().find(|(k, _, _)| *k == key) {
+            Some(e) => {
+                e.1 = from;
+                e.2 = t;
+            }
+            None => {
+                self.log.put(b"fgtw: ");
+                self.log.put(fgtw::pair::device_name_default(&key, &seed).as_bytes());
+                self.log.put(b" (");
+                self.log.fp(&key);
+                self.log.put(b") asks to join from ");
+                self.log.addr(&from);
+                self.log.line();
+                self.lan_from.push((key, from, t));
+            }
+        }
+        self.rebuild_candidates();
+    }
+
+    /// Op 8: the Fleet page's add flow opened (1) or closed (0). Opening lists the registry at once and starts the radios listening; closing stops them, and forgets a finished or failed add.
+    fn open_add(&mut self, on: bool) {
+        if on && self.adding.phase == ADD_CLOSED {
+            self.adding.phase = ADD_OPEN;
+            self.adding.listed_us = 0;
+            self.adding.words.clear();
+            self.adding.note.clear();
+            self.adding.picked = None;
+            self.adding.bound = None;
+            self.adding.confirm = false;
+            self.rebuild_candidates();
+            self.log.put(b"fgtw: the add flow is open: listing devices asking to join");
+            self.log.line();
+        } else if !on && self.adding.phase != ADD_CLOSED {
+            // A bind or a grow under way finishes in the loop; only the screen closes.
+            if matches!(self.adding.phase, ADD_OPEN | ADD_DONE | ADD_FAILED | ADD_BOUND) {
+                self.adding.phase = ADD_CLOSED;
+            }
+            self.adding.registry.clear();
+        }
+    }
+
+    /// Op 10: a candidate heard nearby picked by the first 8 bytes of its key. Its key waits for the person's confirm (two-phase). Returns 0 picked, 1 no such nearby candidate, 2 busy.
+    fn pick_nearby(&mut self, key8: &[u8]) -> u8 {
+        if self.adding.phase != ADD_OPEN {
+            return 2;
+        }
+        let Some(c) = self.adding.cands.iter().find(|c| c.nearby() && c.req.device_pubkey[..8] == *key8) else { return 1 };
+        self.adding.picked = Some((c.req.clone(), false));
+        self.adding.phase = ADD_BINDING;
+        0
+    }
+
+    /// Op 11: the words typed so far, matched live (fgtw::sponsor::match_words). A full match picks the candidate, and its key follows at once (the typed 256-bit match is the confirmation). Returns [kind][count], then the word to flag or the matched name: kind 0 no candidates yet, 1 nothing typed, 2 matched, 3 no device has this word, 4 one device still matches, 5 several do, 6 the add flow is not open for words.
+    fn type_words(&mut self, text: &str) -> Vec<u8> {
+        use fgtw::sponsor::WordMatch;
+        self.adding.words.clear();
+        self.adding.words.push_str(text);
+        let mut r = Vec::with_capacity(48);
+        if self.adding.phase != ADD_OPEN {
+            r.extend_from_slice(&[6, 0]);
+            return r;
+        }
+        match fgtw::sponsor::match_words(text, &self.adding.cands) {
+            WordMatch::NoCandidates { typo } => {
+                r.extend_from_slice(&[0, 0]);
+                if let Some(w) = typo {
+                    r.extend_from_slice(w.as_bytes());
+                }
+            }
+            // WHY the cap: a byte on the wire; past 255 devices asking the page has nothing different to say.
+            WordMatch::Nothing { asking } => r.extend_from_slice(&[1, asking.min(255) as u8]),
+            WordMatch::Full(i) => {
+                let c = &self.adding.cands[i];
+                r.extend_from_slice(&[2, 1]);
+                r.extend_from_slice(c.name.as_bytes());
+                self.adding.picked = Some((c.req.clone(), true));
+                self.adding.phase = ADD_BINDING;
+            }
+            WordMatch::NoMatch(w) => {
+                r.extend_from_slice(&[3, 0]);
+                r.extend_from_slice(w.as_bytes());
+            }
+            WordMatch::One(i) => {
+                r.extend_from_slice(&[4, 1]);
+                r.extend_from_slice(self.adding.cands[i].name.as_bytes());
+            }
+            // WHY the cap: as above.
+            WordMatch::Many(k) => r.extend_from_slice(&[5, k.min(255) as u8]),
+        }
+        r
+    }
+
+    /// Op 12: the person's confirm that the newcomer bound by a nearby pick left its words screen: its key follows. Returns 0 taken, 1 nothing waiting for a confirm.
+    fn confirm_add(&mut self) -> u8 {
+        if self.adding.phase != ADD_BOUND {
+            return 1;
+        }
+        self.adding.confirm = true;
+        self.adding.phase = ADD_GROWING;
+        0
+    }
+
+    /// Op 16: the words wanted from the person now, dropped once nothing is left to type them for (the add flow past picking, the departure approved or gone).
+    fn entry_wanted(&mut self) -> u8 {
+        if self.entry == 1 && self.adding.phase != ADD_OPEN {
+            self.entry = 0;
+        }
+        if self.entry == 2 && !self.depart_ask.as_ref().is_some_and(|d| d.result == 0 || d.result == 3) {
+            self.entry = 0;
+        }
+        self.entry
+    }
+
+    /// Op 9, the add flow for the Fleet page: [phase][rows], each row [the key's first 8 bytes][flags: bit 0 its beacon heard, bit 1 its request heard on the LAN, bit 2 the device just bound][name length][name], then [note length][note].
+    fn adding_reply(&self) -> Vec<u8> {
+        let mut r = Vec::with_capacity(256);
+        r.push(self.adding.phase);
+        // WHY the cap: the Fleet page lays out at most 8 candidates, and the count is one byte.
+        let n = self.adding.cands.len().min(8);
+        r.push(n as u8);
+        for c in &self.adding.cands[..n] {
+            r.extend_from_slice(&c.req.device_pubkey[..8]);
+            r.push(c.heard_ble as u8 | (c.heard_lan as u8) << 1 | ((self.adding.bound == Some(c.req.device_pubkey)) as u8) << 2);
+            r.push(c.name.len() as u8);
+            r.extend_from_slice(c.name.as_bytes());
+        }
+        // WHY the cap: a length byte; every note written here is a short sentence.
+        let note = &self.adding.note.as_bytes()[..self.adding.note.len().min(255)];
+        r.push(note.len() as u8);
+        r.extend_from_slice(note);
+        r
+    }
+
+    /// A frame to every fleet device heard in the last two minutes (as the pings go), and to `extra` (a newcomer's address) once.
+    fn push_to_fleet(&mut self, frame: Vec<u8>, extra: Option<Addr>) {
+        let t = now_us();
+        let mut to: Vec<Addr> = self.sponsors.iter().filter(|s| t - s.heard_us < 120_000_000).map(|s| s.addr).collect();
+        if let Some(a) = extra {
+            if !to.iter().any(|x| x.fam == a.fam && x.ip == a.ip && x.port == a.port) {
+                to.push(a);
+            }
+        }
+        for a in to {
+            let out = self.pt.send(a, frame.clone(), now_us(), eagle());
+            self.send_all(out);
+        }
+    }
+
+    /// The newcomer's address on this network, if its request came over the LAN.
+    fn newcomer_addr(&self, key: &[u8; 32]) -> Option<Addr> {
+        self.lan_from.iter().find(|(k, _, _)| k == key).map(|(_, a, _)| *a)
+    }
+
+    fn add_failed(&mut self, why: &str) {
+        self.log.put(b"fgtw: adding a device failed: ");
+        self.log.put(why.as_bytes());
+        self.log.line();
+        self.adding.note.clear();
+        self.adding.note.push_str(why);
+        self.adding.phase = ADD_FAILED;
+    }
+
+    /// The Add for the picked request (fgtw::sponsor::bind_device_held), signed here on the X3: appended to the chain held (refreshed from the seed when it answers), held, mirrored to the seed, kept, and handed to the fleet and the newcomer. A words or tap pick grows the fan-out next; a nearby pick waits for the confirm.
+    fn bind_picked(&mut self) {
+        let Some((req, auto)) = self.adding.picked.take() else { return };
+        let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
+        let key = req.device_pubkey;
+        if fgtw::sponsor::plate_locked(&self.held, &hp, &req) {
+            self.add_failed("this is a device you locked out");
+            return;
+        }
+        self.log.put(b"fgtw: adding ");
+        self.log.put(fgtw::pair::device_name_default(&key, &seed).as_bytes());
+        self.log.put(b" (");
+        self.log.fp(&key);
+        self.log.put(if auto { b") to the fleet: its words matched" } else { b") to the fleet: picked nearby, its key waits for the confirm" });
+        self.log.line();
+        let t0 = now();
+        ferros_sys::pin(ferros_sys::CORES_BIG);
+        ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000);
+        fgtw::set_clock(eagle());
+        let r = {
+            let s = self.seed();
+            let r = fgtw::sponsor::bind_device_held(&s, &self.held, &self.keys, &hp, &req);
+            self.seed_ip = s.ip.get();
+            r
+        };
+        ferros_sys::pin(0);
+        let blob = match r {
+            Ok(b) => b,
+            Err(e) => {
+                self.add_failed(&e);
+                return;
+            }
+        };
+        let Ok(bytes) = blob.to_vsf_bytes() else {
+            self.add_failed("the extended chain did not encode");
+            return;
+        };
+        self.log.put(b"fgtw: the Add is in the chain (");
+        self.log.dec(blob.ops.len() as u64);
+        self.log.put(b" ops) in ");
+        self.log.dec(ferros_sys::us_since(t0) / 1000);
+        self.log.put(b" ms: handing it to the fleet and the newcomer");
+        self.log.line();
+        self.note_members(&blob);
+        self.persist_set(b"chain", &bytes);
+        self.adding.bound = Some(key);
+        match fgtw::protocol::fleet_resp(&hp, &bytes, &self.keys, eagle()) {
+            Ok(frame) => {
+                let to = self.newcomer_addr(&key);
+                self.push_to_fleet(frame, to);
+            }
+            Err(e) => {
+                self.log.put(b"fgtw: the chain frame did not build: ");
+                self.log.put(e.as_bytes());
+                self.log.line();
+            }
+        }
+        self.adding.note.clear();
+        if auto {
+            self.adding.confirm = true;
+            self.adding.phase = ADD_GROWING;
+        } else {
+            self.adding.note.push_str("when it has left its words screen, confirm");
+            self.adding.phase = ADD_BOUND;
+        }
+    }
+
+    /// The newcomer's key: the fan-out grown to the chain's members under the SAME fleet key (fgtw::held::fanout_grow_held), held, mirrored to the seed, and handed to the newcomer and the fleet.
+    fn grow_for_newcomer(&mut self) {
+        self.adding.confirm = false;
+        let (Some(hp), Some(seed), Some(key)) = (self.hp, self.identity_seed, self.fleet_key) else {
+            self.add_failed("this device does not hold the fleet key");
+            return;
+        };
+        let members = self.members.clone();
+        ferros_sys::pin(ferros_sys::CORES_BIG);
+        ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000);
+        fgtw::set_clock(eagle());
+        let r = {
+            let s = self.seed();
+            let r = fgtw::held::fanout_grow_held(&s, &self.held_fan, &hp, &self.keys, &key, &members, &seed);
+            self.seed_ip = s.ip.get();
+            r
+        };
+        ferros_sys::pin(0);
+        let (revision, blob) = match r {
+            Ok(x) => x,
+            Err(e) => {
+                self.add_failed(&e);
+                return;
+            }
+        };
+        self.log.put(b"fgtw: the fan-out grown to revision ");
+        self.log.dec(revision);
+        self.log.put(b" for ");
+        self.log.dec(members.len() as u64);
+        self.log.put(b" devices: handing it to the newcomer and the fleet");
+        self.log.line();
+        match fgtw::protocol::fanout_resp(&hp, &blob, &self.keys, eagle()) {
+            Ok(frame) => {
+                let to = self.adding.bound.and_then(|k| self.newcomer_addr(&k));
+                self.push_to_fleet(frame, to);
+            }
+            Err(e) => {
+                self.log.put(b"fgtw: the fan-out frame did not build: ");
+                self.log.put(e.as_bytes());
+                self.log.line();
+            }
+        }
+        // The newcomer is a member now: its request is done with.
+        if let Some(k) = self.adding.bound {
+            self.lan_reqs.retain(|r| r.device_pubkey != k);
+            self.adding.registry.retain(|r| r.device_pubkey != k);
+            self.rebuild_candidates();
+        }
+        self.adding.note.clear();
+        self.adding.note.push_str("added");
+        self.adding.phase = ADD_DONE;
+    }
+
+    /// A sibling's departure request (`depart_req`): kept for this device's person to approve when the leaver is a current member other than this device and its consent's Ed25519 egg verifies (fgtw::sponsor::depart_receipt_valid). The countersign happens only on the person's approval with the leaver's words.
+    fn on_depart_req(&mut self, bytes: &[u8]) {
+        let Ok((req, leaver)) = fgtw::protocol::parse_depart_req(bytes) else { return };
+        let Some(hp) = self.hp else { return };
+        if !self.bound || leaver == self.me || !self.members.contains(&leaver) {
+            return;
+        }
+        if !fgtw::sponsor::depart_receipt_valid(&hp, &leaver, req.t, &req.consent_sig) {
+            self.log.put(b"fgtw: a departure request from ");
+            self.log.fp(&leaver);
+            self.log.put(b" carries an invalid signature: dropped");
+            self.log.line();
+            return;
+        }
+        if self.depart_ask.as_ref().is_some_and(|d| d.leaver == leaver && d.t == req.t) {
+            return;
+        }
+        self.log.put(b"fgtw: ");
+        if let Some(seed) = self.identity_seed {
+            self.log.put(fgtw::pair::device_name_default(&leaver, &seed).as_bytes());
+            self.log.put(b" (");
+            self.log.fp(&leaver);
+            self.log.put(b")");
+        }
+        self.log.put(b" asks to leave the fleet: approve on the Fleet page with the words it shows");
+        self.log.line();
+        self.depart_ask = Some(DepartAsk { leaver, t: req.t, sig: req.consent_sig, intent: req.intent, commit: req.words_commit, approve: false, result: 0 });
+    }
+
+    /// Op 13, a departure waiting here: [present][intent][result: 0 waiting, 1 approving, 2 approved, 3 failed][name length][name].
+    fn depart_ask_reply(&self) -> Vec<u8> {
+        let mut r = Vec::with_capacity(48);
+        match (&self.depart_ask, self.identity_seed) {
+            (Some(d), Some(seed)) => {
+                let name = fgtw::pair::device_name_default(&d.leaver, &seed);
+                r.extend_from_slice(&[1, d.intent, d.result, name.len() as u8]);
+                r.extend_from_slice(name.as_bytes());
+            }
+            _ => r.extend_from_slice(&[0, 0, 0, 0]),
+        }
+        r
+    }
+
+    /// Op 14: the leaver's words typed here. Returns 0 they match (the loop countersigns), 1 no departure waiting, 2 the words do not match, 3 the request carries no words to check.
+    fn approve_words(&mut self, text: &str) -> u8 {
+        let Some(d) = self.depart_ask.as_mut() else { return 1 };
+        let Some(commit) = d.commit else { return 3 };
+        if !fgtw::sponsor::depart_words_match(text, &commit) {
+            return 2;
+        }
+        d.approve = true;
+        d.result = 1;
+        0
+    }
+
+    /// The approved departure countersigned and published (fgtw::sponsor::approve_departure), the device's brand released when it leaves to a new owner; the chain is read again so the members drop the leaver.
+    fn approve_now(&mut self) {
+        let Some(hp) = self.hp else { return };
+        let Some(d) = self.depart_ask.as_mut() else { return };
+        d.approve = false;
+        let (leaver, t, sig, intent) = (d.leaver, d.t, d.sig.clone(), d.intent);
+        ferros_sys::pin(ferros_sys::CORES_BIG);
+        ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000);
+        fgtw::set_clock(eagle());
+        let r = {
+            let s = self.seed();
+            let r = fgtw::sponsor::approve_departure(&s, &self.keys, &hp, &leaver, t, &sig, intent);
+            self.seed_ip = s.ip.get();
+            r
+        };
+        ferros_sys::pin(0);
+        let ok = r.is_ok();
+        self.log.put(b"fgtw: the departure of ");
+        self.log.fp(&leaver);
+        match r {
+            Ok(fgtw::sponsor::Approved::BrandKept) => self.log.put(b" approved: the consented Remove is published"),
+            Ok(fgtw::sponsor::Approved::Released(Ok(()))) => self.log.put(b" approved: the consented Remove is published and the device released for its new owner"),
+            Ok(fgtw::sponsor::Approved::Released(Err(e))) => {
+                self.log.put(b" approved: the consented Remove is published; the release failed: ");
+                self.log.put(e.as_bytes());
+            }
+            Err(e) => {
+                self.log.put(b" was not published: ");
+                self.log.put(e.as_bytes());
+            }
+        }
+        self.log.line();
+        if let Some(d) = self.depart_ask.as_mut() {
+            d.result = if ok { 2 } else { 3 };
+        }
+        if ok {
+            // The members without the leaver: the chain as the seed (or the held copy) now has it.
+            fgtw::set_clock(eagle());
+            let fetched = {
+                let s = self.seed();
+                fgtw::held::fetch(&s, &self.held, &hp)
+            };
+            if let Ok(Some(b)) = fetched {
+                self.note_members(&b);
+                if let Ok(bytes) = b.to_vsf_bytes() {
+                    self.persist_set(b"chain", &bytes);
+                }
+            }
+        }
+    }
+
+    /// The radios listening for newcomers while the add flow is open: the Bluetooth driver scanning for pairing beacons (op 3 on, op 4 off) and the NFC driver reading a tapped device's tag (op 4 on, op 5 off). CALL_LIVE: a driver that is down fails at once.
+    fn sponsor_radios(&mut self, on: bool) {
+        let (nfc, bt) = (cap(unsafe { GRANTS }, S_NFC), cap(unsafe { GRANTS }, S_BT));
+        let (mut ra, mut rb) = ([0u8; 4], [0u8; 4]);
+        let a = ferros_sys::call_live(nfc, &[if on { 4 } else { 5 }], &mut ra);
+        let b = ferros_sys::call_live(bt, &[if on { 3 } else { 4 }], &mut rb);
+        self.listening = on;
+        let said = |n: u64, r: &[u8; 4]| -> &'static [u8] { if n == ERR { b"not running" } else if n >= 1 && r[0] != 0 { b"refused" } else { b"ok" } };
+        self.log.put(if on { b"fgtw: listening for newcomers: nfc reader ".as_slice() } else { b"fgtw: no longer listening for newcomers: nfc reader " });
+        self.log.put(said(a, &ra));
+        self.log.put(b", bt scan ");
+        self.log.put(said(b, &rb));
+        self.log.line();
+    }
+
+    /// What the radios heard: the Bluetooth driver's pairing beacons (op 5: [count][count × 16 bytes]) and the NFC driver's last tag read (op 6: [32 bytes] once, then nothing). A tag whose secret opens a candidate's commitment picks it, its key following at once (Photon's tap).
+    fn sponsor_hear(&mut self) {
+        let (nfc, bt) = (cap(unsafe { GRANTS }, S_NFC), cap(unsafe { GRANTS }, S_BT));
+        let mut r = [0u8; 1 + 16 * fgtw::pair::BEACON_UUID_LEN];
+        let n = ferros_sys::call_live(bt, &[5], &mut r);
+        let mut changed = false;
+        if n != ERR && n >= 1 {
+            // WHY: the count is the driver's word, and the reply's length may run past this buffer (it says what was sent): only the ids both hold are read.
+            let k = (r[0] as usize).min((n as usize - 1) / fgtw::pair::BEACON_UUID_LEN).min(16);
+            let t = now_us();
+            for i in 0..k {
+                let mut u = [0u8; fgtw::pair::BEACON_UUID_LEN];
+                u.copy_from_slice(&r[1 + i * fgtw::pair::BEACON_UUID_LEN..1 + (i + 1) * fgtw::pair::BEACON_UUID_LEN]);
+                match self.ble_heard.iter_mut().find(|(x, _)| *x == u) {
+                    Some(e) => e.1 = t,
+                    None => {
+                        self.ble_heard.push((u, t));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        let mut s = [0u8; 32];
+        if ferros_sys::call_live(nfc, &[6], &mut s) == 32 {
+            match fgtw::sponsor::nfc_match(&s, &self.adding.cands) {
+                Some(i) if self.adding.phase == ADD_OPEN => {
+                    self.log.put(b"fgtw: a tapped device's tag matches ");
+                    self.log.put(self.adding.cands[i].name.as_bytes());
+                    self.log.put(b": adding it");
+                    self.log.line();
+                    // Photon's tap binds and grows at once: the secret read off the tag is the proximity and the intent.
+                    self.adding.picked = Some((self.adding.cands[i].req.clone(), true));
+                    self.adding.phase = ADD_BINDING;
+                }
+                Some(_) => {}
+                None => {
+                    self.log.put(b"fgtw: a tapped tag's secret matches no device asking to join (a stale request, or not a newcomer's)");
+                    self.log.line();
+                }
+            }
+        }
+        if changed {
+            self.rebuild_candidates();
+        }
+    }
+
+    /// The sponsor's work, once a pass of the loop: the registry listed every 8 s while the add flow is open, the radios listening while it is, a pick bound, a confirm grown, an approval countersigned.
+    fn sponsor_step(&mut self, t: u64) {
+        let open = self.adding.phase != ADD_CLOSED && self.bound;
+        if open != self.listening {
+            self.sponsor_radios(open);
+        }
+        if open {
+            self.sponsor_hear();
+        }
+        if self.adding.phase == ADD_OPEN && self.net_up && t - self.adding.listed_us >= 8_000_000 {
+            self.adding.listed_us = t;
+            if let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) {
+                fgtw::set_clock(eagle());
+                let r = {
+                    let s = self.seed();
+                    let r = fgtw::client::bindreq_list(&s, &self.keys, &hp, &seed);
+                    self.seed_ip = s.ip.get();
+                    r
+                };
+                match r {
+                    Ok(reqs) => {
+                        self.seed_heard_us = now_us();
+                        self.adding.registry = reqs;
+                        self.rebuild_candidates();
+                    }
+                    Err(e) => {
+                        self.log.put(b"fgtw: the registry's list failed: ");
+                        self.log.put(e.as_bytes());
+                        self.log.line();
+                    }
+                }
+            }
+        }
+        if self.adding.phase == ADD_BINDING && self.adding.picked.is_some() {
+            self.bind_picked();
+        }
+        if self.adding.phase == ADD_GROWING && self.adding.confirm {
+            self.grow_for_newcomer();
+        }
+        if self.depart_ask.as_ref().is_some_and(|d| d.approve) {
+            self.approve_now();
+        }
+    }
+}
+
 static mut GRANTS: u64 = 0;
 
 extern "C" fn work(_: u64) -> ! {
@@ -1602,7 +2242,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: false, depart_ask: None, entry: 0 };
     c.run()
 }
 
