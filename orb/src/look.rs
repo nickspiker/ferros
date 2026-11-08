@@ -344,10 +344,14 @@ pub struct Vessel {
 
 impl Vessel {
     /// `fl` the flavour as linear light; the green ring's `depth` from the edge, each ring's inner tail λ (`width`) and outer sharpness `sharp`, the channels' separation `sep` (blue that much further out, red half of it further in), all in r; the rings' light `rim_stops` over the flavour's and the body's `body_stops` under it.
+    /// The rings keep their places relative to each other, but the whole set moves out so the outermost ring the flavour has peaks one λ inside the edge, its cliff ending at the circle's radius: the colour reaches the tangent, so touching circles touch in colour (owner, 2026-11-07: "the widest colour is not tangent to the other circles, there's spaces between"). A channel the flavour lacks draws nothing and does not count; with none at all the rings stay where `depth` puts them.
     pub fn new(fl: [f32; 3], depth: f32, width: f32, sharp: f32, sep: f32, rim_stops: f32, body_stops: f32) -> Vessel {
         let rim = rim_stops.exp2();
         let body = (-body_stops).exp2();
-        Vessel { ring_d: [depth + sep * 0.5, depth, depth - sep], lambda: width, sharp, ring_l: fl.map(|v| v * rim), body_l: fl.map(|v| v * body), body_edge: depth }
+        let raw = [depth + sep * 0.5, depth, depth - sep];
+        let outer = (0..3).filter(|&c| fl[c] > 0.).map(|c| raw[c]).fold(f32::MAX, f32::min);
+        let shift = if outer == f32::MAX { 0. } else { outer - width };
+        Vessel { ring_d: raw.map(|d| d - shift), lambda: width, sharp, ring_l: fl.map(|v| v * rim), body_l: fl.map(|v| v * body), body_edge: depth - shift }
     }
 
     /// The rings' layer and the body's layer at depth `d` = 1 − ρ from the edge (r), `fs` the sample's footprint (r).

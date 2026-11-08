@@ -767,6 +767,11 @@ const SYS_SENSORS: u64 = 26;
 /// status(slot, word): one of a radio driver's eight measure slots for the corners' circles (WINDOWS.md), SYS_FACTS 33-80, eight words a link: the link is the caller's own, by its name (modem, pcie1, bt, nfc, gps, usb), so no capability; anyone else, or a slot past 7, gets ERR. A word is a tagged measure (ferros_sys::measure: the kind in bits 48-63, the value in its unit below), all ones empty; the kernel keeps the words and reads none of them.
 const SYS_STATUS: u64 = 27;
 pub static STATUS: [[core::sync::atomic::AtomicU64; 8]; 6] = [const { [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 8] }; 6];
+/// A link's tracks (owner, 2026-11-07: "add as many as we need to show all"): beyond its eight measures, up to TRACKS words its driver sets as slots 8 and up of the same call, read with `tracks` (SYS_TRACKS), never through the facts, so the facts keep their size. The GPS driver's satellites first, a word each (ferros_sys::measure::SAT).
+pub const TRACKS: usize = 1 << 6;
+pub static TRACK: [[core::sync::atomic::AtomicU64; TRACKS]; 6] = [const { [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; TRACKS] }; 6];
+/// tracks(link, buf, words): link k's tracks (0 cellular … 5 USB, the facts' order) into `buf`, at most `words` and TRACKS. No capability, as the facts. → the words written, or ERR for no such link.
+const SYS_TRACKS: u64 = 31;
 /// pet(): the process is alive and going round its main loop (the process watchdog, measuring: the kernel records the longest stretch between two pets, `diag pets`). → 0.
 const SYS_PET: u64 = 28;
 /// block(cap, op, block, buf): 4 KiB blocks of a window on the ferros partition (`WINDOWS`), by number within it: op bit 0 write (else read), bits 8-15 the count (1 to BLOCK_MAX), `buf` the count × 4 KiB in the caller's arc. → 0, or ERR (no such window, out of it, or the UFS command failed).
@@ -2012,8 +2017,28 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     STATUS[i][f.x[0] as usize].store(f.x[1], core::sync::atomic::Ordering::Relaxed);
                     0
                 }
+                // Slots 8 and up: the link's tracks, bounded as the measures are.
+                Some(i) if f.x[0] < (8 + TRACKS) as u64 => {
+                    TRACK[i][f.x[0] as usize - 8].store(f.x[1], core::sync::atomic::Ordering::Relaxed);
+                    0
+                }
                 Some(_) => ERR,
                 None => ERR,
+            };
+            0
+        }
+        SYS_TRACKS => {
+            // WHY the bounds: the link and the count are the caller's; there are six links and TRACKS words each.
+            f.x[0] = if f.x[0] < 6 {
+                let n = (f.x[2] as usize).min(TRACKS);
+                let mut bytes = [0u8; TRACKS * 8];
+                for k in 0..n {
+                    bytes[k * 8..k * 8 + 8].copy_from_slice(&TRACK[f.x[0] as usize][k].load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
+                }
+                p.write(f.x[1], &bytes[..n * 8]);
+                n as u64
+            } else {
+                ERR
             };
             0
         }

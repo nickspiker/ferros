@@ -1427,6 +1427,17 @@ fn fps_dot(mask: u32, width: usize, height: usize) {
 
 /// What each phase frame has not yet been given of the current content, as one rectangle (empty = current): a present writes only the phase on the layer (all four took 71 ms a frame, 2026-10-22) and adds what it changed to the others' rectangles; the idle loop brings the others up to date one at a time; the flip only moves to a phase that is current.
 static mut PHASE_DIRTY: [draw::Rect; PHASES] = [draw::Rect { x0: 0, y0: 0, x1: 4096, y1: 4096 }; PHASES];
+/// Compose once (COMPOSITOR.md step 2): a byte per 16-pixel block of the screen, bit k set while phase k holds there only the background as it was published (the wallpaper, or black), so a publish over that block with the canvas still empty writes nothing (`publish_band`). Cleared whole whenever the background or the table changes (`clean_reset`): a new wallpaper, a brightness, windows, full screen.
+static mut CLEAN: usize = 1;
+static mut CLEAN_W: usize = 0;
+
+fn clean_reset() {
+    unsafe {
+        if CLEAN_W > 0 {
+            core::slice::from_raw_parts_mut(CLEAN as *mut u8, CLEAN_W * SCREEN_WH.1 as usize).fill(0);
+        }
+    }
+}
 
 /// The 8-bit canvas into the phase frames in `mask` (bit k = phase k), over `r` only (widened to 16-pixel steps): NEON, 16 pixels per step (neon.rs), a row at a time through a cached buffer, then wide copies out. The scalar `publish10` below is the reference.
 // ---------------------------------------------------------------- the publish workers
@@ -1540,6 +1551,9 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
     let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
     // The finished wallpaper's base, 0 while there is none.
     let wall = unsafe { if WALL_ON { WALL_BUF } else { 0 } };
+    // Which phases hold only the background at each 16-pixel block (`CLEAN`): rows are this call's own, so no other publisher touches their bytes.
+    let clean_w = unsafe { CLEAN_W };
+    let clean = unsafe { core::slice::from_raw_parts_mut(CLEAN as *mut u8, clean_w * height) };
     for k in 0..PHASES {
         if mask >> k & 1 == 0 {
             continue;
@@ -1560,6 +1574,18 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                 let src = back.as_ptr().add(y * width);
                 let mut x = x0;
                 while x < x1 {
+                    // Compose once (COMPOSITOR.md step 2): sixteen canvas pixels all empty show only the background (the wallpaper, or black), and a phase whose block held just that at its last publish already holds it: nothing composed, nothing through the table, nothing written. The wallpaper lit every pixel, so a pan published the whole screen through the table every frame (25 frames/s, measured 2026-11-07).
+                    let glass = x < el || x + 16 > er || (x + 16 > cl && x < cr);
+                    let mut any = 0u64;
+                    for j in 0..16 {
+                        any |= *src.add(x + j);
+                    }
+                    let ci = y * clean_w + x / 16;
+                    let bit = 1u8 << k;
+                    if !glass && any == 0 && clean[ci] & bit != 0 {
+                        x += 16;
+                        continue;
+                    }
                     // The scene: the canvas, and the wallpaper under it where there is one (the canvas's pixels are premultiplied with their alpha, so the wallpaper shows in exactly the room each leaves: a circle's edge, a glow).
                     let mut scene = [0u64; 16];
                     let scene_at = if wall != 0 {
@@ -1571,7 +1597,8 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                     } else {
                         src.add(x) as *const u64
                     };
-                    if x < el || x + 16 > er || (x + 16 > cl && x < cr) {
+                    if glass {
+                        clean[ci] &= !bit;
                         let mut front = [0u64; 16];
                         for j in 0..16 {
                             let xx = x + j;
@@ -1582,16 +1609,20 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                         neon::sixteen_app(tabs, front.as_ptr(), row.as_mut_ptr().add(x), neon::thresholds_at(thv, x));
                     } else {
                         neon::sixteen_canvas(tabs, scene_at as *const Px, row.as_mut_ptr().add(x), thv);
+                        if any == 0 {
+                            clean[ci] |= bit;
+                        } else {
+                            clean[ci] &= !bit;
+                        }
                     }
+                    // Each block written as it is made: a skipped one leaves the phase as it is.
+                    dst[y * width + x..y * width + x + 16].copy_from_slice(&row[x..x + 16]);
+                    PUB_TICKS[2] += 16;
                     x += 16;
                 }
             }
-            let t_c = now();
-            dst[y * width + x0..y * width + x1].copy_from_slice(&row[x0..x1]);
             unsafe {
-                PUB_TICKS[0] += t_c - t_n;
-                PUB_TICKS[1] += now() - t_c;
-                PUB_TICKS[2] += ((x1 - x0) as u64) << 0;
+                PUB_TICKS[0] += now() - t_n;
             }
         }
     }
@@ -2328,6 +2359,7 @@ fn windows_changed(width: usize, height: usize) {
     layout_build(width, height);
     unsafe {
         PHASE_DIRTY = [full; PHASES];
+        clean_reset();
         if (*(&raw const WINS)).iter().all(|w| w.is_none()) {
             APP = None;
             PREV_DMG = full;
@@ -2733,6 +2765,7 @@ fn wall_ready(width: usize, height: usize) {
     unsafe {
         WALL_ON = true;
         PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
+        clean_reset();
     }
 }
 
@@ -3905,6 +3938,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         BAR_W = alloc::vec![CLEAR; (top + bot) * width].leak().as_mut_ptr() as usize;
         BAR_SPAN = alloc::vec![(0u16, 0u16); top + bot].leak().as_mut_ptr() as usize;
         BAR_W_BACK = alloc::vec![CLEAR; (top + bot) * width].leak().as_mut_ptr() as usize;
+        // The compose-once bitmap (`CLEAN`), all clear: nothing is known to hold the background yet.
+        CLEAN_W = width / 16;
+        CLEAN = alloc::vec![0u8; (width / 16) * height].leak().as_mut_ptr() as usize;
         BAR_SPAN_BACK = alloc::vec![(0u16, 0u16); top + bot].leak().as_mut_ptr() as usize;
         // The console worker's heap (1 MiB: a draw's tables and the glyphs it rasterises, reset after each draw), its stack (its allocations are told by it), and its own glyph engine.
         CON_HEAP.init_at(alloc::vec![0u8; 1 << 20].leak().as_mut_ptr() as usize, 1 << 20);
@@ -4043,6 +4079,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     // The render thread on the big core (KERNEL.md "Cores": pinning by latency class — this is the one real compute path; receive and vsync stay on the workers, where the map and the touch server run, so a call hands off on the caller's own core). After the other threads are spawned: they inherit the mask.
     ferros_sys::pin(ferros_sys::CORES_BIG);
+    // A person already unlocked (a display restarted after attest): their wallpaper as their space keeps it, their own or the one made on this device, so a restart does not lose it until the next attest. Before attest their space is closed, nothing is read, and the attest screen hands the seed over as ever (op 42).
+    if unsafe { WALL_BUF } != 0 && (wall_own(grants, width, height, b"wallpaper") || wall_own(grants, width, height, b"wallpaper.made")) {
+        wall_ready(width, height);
+    }
     // What the ring's tail was when this pass last looked: the wait at the end of a pass returns as soon as it moves.
     let mut seen_tail = 0u64;
     let (mut frames_last_tick, mut starts_last_tick) = (0u64, 0u64);
@@ -4597,6 +4637,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     unsafe {
                         FULL = !FULL;
                         PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
+                        clean_reset();
                         out[1] = FULL as u8;
                     }
                     last_interaction = 0;
@@ -5055,7 +5096,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             // How long a call took, by its first op (a batch by its last), logged when slow and at most every two seconds: the frame budget is the thing to watch.
             let took = ferros_sys::us_since(t_call);
-            if took > 20_000 && now().wrapping_sub(last_slow_log) > 2 * freq() {
+            if took > 8_000 && now().wrapping_sub(last_slow_log) > 2 * freq() {
                 last_slow_log = now();
                 tlog.s(b"display: call op ");
                 tlog.dec(m.first().copied().unwrap_or(0) as u64);
@@ -5207,6 +5248,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             let full = draw::Rect::full(width, height);
             unsafe {
                 PHASE_DIRTY = [full; PHASES];
+                clean_reset();
             }
             let mut pub_us = 0u64;
             if unsafe { TEMPORAL } && client_owned {

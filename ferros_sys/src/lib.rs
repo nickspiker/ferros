@@ -49,6 +49,7 @@ pub mod nr {
     pub const PET: u64 = 28;
     pub const BLOCK: u64 = 29;
     pub const VAULT: u64 = 30;
+    pub const TRACKS: u64 = 31;
 }
 /// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
 pub const CORES_WORKERS: u64 = 0x00F0;
@@ -159,6 +160,8 @@ pub mod measure {
     pub const CN0: u16 = 21;
     /// GPS: the fix's horizontal error estimate, mm.
     pub const ACCURACY: u16 = 22;
+    /// GPS: one tracked signal (a track word, `tracks`): `sat_word` packs it, `sat_of` unpacks it.
+    pub const SAT: u16 = 23;
 }
 pub const MEASURE_NONE: u64 = u64::MAX;
 pub const TECH_NONE: u8 = 0;
@@ -180,7 +183,52 @@ pub fn measure_word(kind: u16, value: i64) -> u64 {
 pub fn measure_of(w: u64) -> Option<(u16, i64)> {
     if w == MEASURE_NONE { None } else { Some(((w >> 48) as u16, (w << 16) as i64 >> 16)) }
 }
-/// Set this driver's measure slot `slot` (0-7) to `word` (`measure_word`, or `MEASURE_NONE` to empty it). Only the modem, pcie1, bt, nfc, gps and usb drivers have slots; anyone else gets ERR.
+/// This driver's track `k` (0-63; `tracks`), as `status` sets a measure.
+pub fn status_track(k: usize, word: u64) -> u64 {
+    status(8 + k as u64, word)
+}
+
+/// Link `link`'s tracks (0 cellular … 5 USB, the facts' order) into `buf`, at most 64: the words written (each a tagged measure, all ones empty), or 0 for none.
+pub fn tracks(link: u64, buf: &mut [u64]) -> usize {
+    let r = svc(nr::TRACKS, link, off(buf.as_mut_ptr() as *const u8), buf.len() as u64, 0, 0);
+    if r == ERR { 0 } else { r as usize }
+}
+
+/// One GPS signal as a track word (measure::SAT), its 47 bits: system (0 GPS, 1 GLONASS, 2 Galileo, 3 BeiDou, 4 QZSS, 5 NavIC, 7 other) in 0-2, band (0 L1/E1/B1/G1, 1 L5/E5a/B2a) in 3, its number in 4-10, used in the fix in 11, elevation (signed degrees) in 12-19, azimuth (degrees) in 20-28, C/N0 (dB-Hz) in 29-34, then elevation's and azimuth's rates (in steps of two millidegrees a second, signed six bits each, -32 for not yet known) in 35-40 and 41-46.
+pub struct Sat {
+    pub system: u8,
+    pub band: u8,
+    pub number: u8,
+    pub used: bool,
+    pub elevation: i8,
+    pub azimuth: u16,
+    pub cn0: u8,
+    pub el_rate: i8,
+    pub az_rate: i8,
+}
+
+/// The rate a track word gives when it is not known yet.
+pub const SAT_NO_RATE: i8 = -32;
+/// The tracks a link has (the kernel's TRACKS).
+pub const TRACKS_MAX: usize = 1 << 6;
+
+pub fn sat_word(s: &Sat) -> u64 {
+    let six = |v: i8| (v as u64) & 63;
+    let v = (s.system as u64 & 7) | (s.band as u64 & 1) << 3 | (s.number as u64 & 127) << 4 | (s.used as u64) << 11 | ((s.elevation as u8) as u64) << 12 | (s.azimuth as u64 & 511) << 20 | (s.cn0 as u64 & 63) << 29 | six(s.el_rate) << 35 | six(s.az_rate) << 41;
+    measure_word(measure::SAT, v as i64)
+}
+
+pub fn sat_of(w: u64) -> Option<Sat> {
+    let (kind, v) = measure_of(w)?;
+    if kind != measure::SAT {
+        return None;
+    }
+    let v = v as u64;
+    let six = |x: u64| ((x as u8) << 2) as i8 >> 2;
+    Some(Sat { system: (v & 7) as u8, band: (v >> 3 & 1) as u8, number: (v >> 4 & 127) as u8, used: v >> 11 & 1 != 0, elevation: (v >> 12) as u8 as i8, azimuth: (v >> 20 & 511) as u16, cn0: (v >> 29 & 63) as u8, el_rate: six(v >> 35 & 63), az_rate: six(v >> 41 & 63) })
+}
+
+/// Set this driver's measure slot `slot` (0-7; 8 and up its tracks, `status_track`) to `word` (`measure_word`, or `MEASURE_NONE` to empty it). Only the modem, pcie1, bt, nfc, gps and usb drivers have slots; anyone else gets ERR.
 pub fn status(slot: u64, word: u64) -> u64 {
     svc(nr::STATUS, slot, word, 0, 0, 0)
 }

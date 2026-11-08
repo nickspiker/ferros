@@ -670,6 +670,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let mut published: Option<(u8, u32)> = None;
     // The satellites' three (tracked, used, best C/N0), published with each fix message (the count of those decoded and refused, `u32::MAX` before the first pass empties the slots).
     let mut published_sky = u32::MAX;
+    // The tracks the last publish filled, so the next empties only past its own.
+    let mut tracks_filled = 0usize;
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
@@ -721,6 +723,29 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             status(3, if none { MEASURE_NONE } else { w(k::SATS_USED, used as i64) });
             // Quarter dB-Hz to milli-dB-Hz.
             status(4, if none || seen == 0 { MEASURE_NONE } else { w(k::CN0, cn0 as i64 * 250) });
+            // Each signal as a track (owner, 2026-11-07: where they are overhead and how they move; ferros_sys::Sat): the console's GPS orb draws its sky from these. The slots past the last signal emptied, up to what the last publish filled.
+            let sats = d.sky.sats();
+            let n = sats.len().min(ferros_sys::TRACKS_MAX);
+            for (t, s) in sats[..n].iter().enumerate() {
+                // WHY the saturation: a rate field holds six bits in steps of two millidegrees a second (±62); a faster one (an azimuth near the zenith) shows as the fastest it can hold rather than wrapping to the other sign.
+                let rate = |r: i32| if r == sky::NO_RATE { ferros_sys::SAT_NO_RATE } else { (r / 2).clamp(-31, 31) as i8 };
+                let sat = ferros_sys::Sat {
+                    system: match s.sys { 0 => 0, 8 => 1, _ => 7 },
+                    band: (s.band == 2) as u8,
+                    number: s.prn,
+                    used: s.flags & 1 != 0,
+                    elevation: s.el,
+                    azimuth: s.az,
+                    cn0: (s.cn0 >> 2) as u8,
+                    el_rate: rate(s.el_steps.rate()),
+                    az_rate: rate(s.az_steps.rate()),
+                };
+                ferros_sys::status_track(t, ferros_sys::sat_word(&sat));
+            }
+            for t in n..tracks_filled {
+                ferros_sys::status_track(t, MEASURE_NONE);
+            }
+            tracks_filled = n;
             published_sky = d.sky.msgs + d.sky.bad;
         }
         if d.fixes > 0 && now().wrapping_sub(kept_at) > 64 * f {
