@@ -722,10 +722,23 @@ impl Process {
         match self.span(off, bytes.len()) {
             // In the arc (Normal write-back memory): one copy. A reply of a quarter MiB (a store transfer, STORE_MAX) went a volatile byte at a time.
             Some(a) if a >= self.arc.base && a + bytes.len() <= self.arc.base + self.arc.size => unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), a as *mut u8, bytes.len()) },
-            // In one of the process's DMA regions: a byte at a time, as ever (some are Device memory, where a wide unaligned store faults).
+            // In the display's heap, Normal write-back memory (cachemap DISPLAY_HEAP): one copy. The display's wallpaper loader reads 24 MB a quarter MiB at a time into it, and a byte at a time cost 590 ms of a 721 ms load (2026-11-08).
+            Some(a) if a >= crate::cachemap::DISPLAY_HEAP.0 && a + bytes.len() <= crate::cachemap::DISPLAY_HEAP.1 => unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), a as *mut u8, bytes.len()) },
+            // In one of the process's other DMA regions (some are Device memory, where a wide unaligned store faults): bytes up to an 8-byte boundary, aligned 8-byte stores (which Device memory takes), the tail in bytes.
             Some(a) => {
-                for (i, &b) in bytes.iter().enumerate() {
+                // WHY the min: a buffer shorter than the way to the next 8-byte boundary is all head.
+                let head = ((8 - (a & 7)) & 7).min(bytes.len());
+                for (i, &b) in bytes[..head].iter().enumerate() {
                     unsafe { core::ptr::write_volatile((a + i) as *mut u8, b) };
+                }
+                let words = (bytes.len() - head) / 8;
+                for w in 0..words {
+                    let at = head + w * 8;
+                    let v = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+                    unsafe { core::ptr::write_volatile((a + at) as *mut u64, v) };
+                }
+                for (i, &b) in bytes[head + words * 8..].iter().enumerate() {
+                    unsafe { core::ptr::write_volatile((a + head + words * 8 + i) as *mut u8, b) };
                 }
             }
             None => self.bad_buf(off, bytes.len(), true),
