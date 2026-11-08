@@ -11,3 +11,10 @@ path = "src/lib.rs"
 [dependencies]
 # Numbers in the device base (SETTINGS.md): `numbers()` hands an app a ready tatau formatter.
 tatau = { path = "../../tatau" }
+# A link's detail (docs/RADIO-CONTROLS.md): its names and identifiers as one VSF document, the schemas shared by the driver that writes and the settings page that reads (`detail`). Needs a heap in the process.
+vsf = { path = "../../vsf", default-features = false, optional = true }
+# vsf hashes with blake3; pure Rust, as the display has it: its C and assembly do not build for the bare target.
+blake3 = { version = "1", default-features = false, features = ["pure"], optional = true }
+
+[features]
+detail = ["dep:vsf", "dep:blake3"]

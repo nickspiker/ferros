@@ -283,6 +283,12 @@ fn store_pref(index: usize, value: u8) -> bool {
     unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(crate::settings::KEY, &doc).is_ok()).unwrap_or(false) }
 }
 
+/// The settings document as it stands (the radio knobs and the zone with it: SYS_CONTROL), into the vault.
+fn store_document() -> bool {
+    let Some(doc) = crate::settings::document(None) else { return false };
+    unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(crate::settings::KEY, &doc).is_ok()).unwrap_or(false) }
+}
+
 /// `SYS_STORE`'s vault: the kernel has already checked the capability and prefixed the key with its scope.
 fn store_scoped(key: &str, value: Option<&[u8]>) -> Result<Option<alloc::vec::Vec<u8>>, ()> {
     let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
@@ -1126,6 +1132,7 @@ pub fn run(mut b: Boot) -> ! {
         SPAWN_STORE = &raw mut store;
         crate::process::CAPSULES = Some(read_capsule);
         crate::process::PREF_STORE = Some(store_pref);
+        crate::process::CONTROL_STORE = Some(store_document);
         crate::process::FACTS = Some(facts);
         crate::process::STORE = Some(store_scoped);
         // The last boot's end, if the fault sink or the panic reporter recorded one, into the flash log: a reboot should never be silent.

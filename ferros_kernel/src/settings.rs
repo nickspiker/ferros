@@ -28,9 +28,15 @@ pub const FIELDS: [(&str, usize); 11] = [
 /// The time zone: seconds east of UTC.
 const TZ: &str = "tz";
 
+/// The radio knobs kept as device settings (docs/RADIO-CONTROLS.md): field name, link (the control blocks' order: 0 cellular, 1 WiFi, …), slot. Value knobs only: actions are counters and are never kept.
+pub const KNOBS: [(&str, usize, usize); 2] = [("wifi_power_save", 1, 1), ("wifi_band", 1, 2)];
+
 fn schema() -> SectionSchema {
     let mut s = SectionSchema::new(SECTION);
     for (name, _) in FIELDS {
+        s = s.field(name, TypeConstraint::AnyUnsigned);
+    }
+    for (name, _, _) in KNOBS {
         s = s.field(name, TypeConstraint::AnyUnsigned);
     }
     s.field(TZ, TypeConstraint::AnySigned)
@@ -63,6 +69,13 @@ pub fn document(change: Option<(usize, u8)>) -> Option<Vec<u8>> {
     }
     let tz = crate::rtc::TZ.load(core::sync::atomic::Ordering::Relaxed);
     b = b.set(TZ, VsfType::i(tz as isize)).ok()?;
+    // A knob still unset (all ones) is left out: absent means the driver's own default.
+    for (name, link, slot) in KNOBS {
+        let v = crate::process::CONTROL[link][slot].load(core::sync::atomic::Ordering::Relaxed);
+        if v != u64::MAX {
+            b = b.set(name, VsfType::u(v as usize, false)).ok()?;
+        }
+    }
     let section = b.encode().ok()?;
     vsf::VsfBuilder::new().creation_time_oscillations(eagle_now()).provenance_only().add_unboxed(SECTION, section).build().ok()
 }
@@ -80,6 +93,14 @@ pub fn apply(doc: &[u8], held: bool) -> Option<usize> {
             } else {
                 crate::process::set_pref(index, v as u8);
             }
+            n += 1;
+        }
+    }
+    // The knobs as kept; a driver ignores a value it cannot use, so none is range-checked here.
+    for (name, link, slot) in KNOBS {
+        if let Some(v) = first(name).and_then(|v| v.as_u64()) {
+            crate::process::CONTROL[link][slot].store(v, core::sync::atomic::Ordering::Relaxed);
+            crate::process::CONTROL_GEN[link].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             n += 1;
         }
     }

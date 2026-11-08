@@ -772,6 +772,30 @@ pub const TRACKS: usize = 1 << 6;
 pub static TRACK: [[core::sync::atomic::AtomicU64; TRACKS]; 6] = [const { [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; TRACKS] }; 6];
 /// tracks(link, buf, words): link k's tracks (0 cellular … 5 USB, the facts' order) into `buf`, at most `words` and TRACKS. No capability, as the facts. → the words written, or ERR for no such link.
 const SYS_TRACKS: u64 = 31;
+/// control(cap, link, slot, word): one of a link's knobs (docs/RADIO-CONTROLS.md), set by whoever holds Settings (the map). Links 0-5 the drivers in the facts' order, 6 the clock (the kernel's own: slot 1 the zone, seconds east, applied at once). Slots 1 to CONTROLS - 1; every set counts the link's generation up, which its driver watches. A kept knob (settings.rs KNOBS) and the zone write the settings document; a vault that refuses it puts the old value back and returns ERR. → 0 or ERR.
+const SYS_CONTROL: u64 = 32;
+/// controls(link, buf, words): a link's control block into `buf`, at most `words` and CONTROLS: the generation, then slots 1 to 15 (all ones: unset, the driver's own default). No capability: a driver reads its own block, the settings page shows the values. → the words written, or ERR for no such link.
+const SYS_CONTROLS: u64 = 33;
+/// detail(op, …): a link's text and identifiers as one VSF document (ferros_sys::detail). Op 0, a driver (by its name, as SYS_STATUS): x1/x2 the document and its length, at most DETAIL_MAX, kept as its link's → 0 or ERR. Op 1: x1 the Settings capability's token offset, x2 the link, x3/x4 a buffer and its length → the document's whole length (0 for none yet), its first bytes copied; ERR without the capability. The kernel reads none of it; the reader verifies it.
+const SYS_DETAIL: u64 = 34;
+/// Each link's control block: words 1 to CONTROLS - 1 (word 0 is the generation, `CONTROL_GEN`), all ones until set.
+pub const CONTROLS: usize = 1 << 4;
+/// The links with a control block: the six of the facts, and the clock.
+pub const CONTROL_LINKS: usize = 7;
+/// The clock's link, and its zone's slot.
+pub const CONTROL_CLOCK: usize = 6;
+pub const CONTROL_ZONE: usize = 1;
+pub static CONTROL: [[core::sync::atomic::AtomicU64; CONTROLS]; CONTROL_LINKS] = [const { [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; CONTROLS] }; CONTROL_LINKS];
+pub static CONTROL_GEN: [core::sync::atomic::AtomicU64; CONTROL_LINKS] = [const { core::sync::atomic::AtomicU64::new(0) }; CONTROL_LINKS];
+/// Keeps the settings document as it now stands (the knobs and the zone with it): → stored. Registered by whoever owns the vault (service.rs), as PREF_STORE.
+pub static mut CONTROL_STORE: Option<fn() -> bool> = None;
+/// The largest detail document a link keeps.
+pub const DETAIL_MAX: usize = 1 << 10;
+/// The detail documents and their lengths, touched only under the kernel lock (inside a syscall).
+static mut DETAIL: [[u8; DETAIL_MAX]; 6] = [[0; DETAIL_MAX]; 6];
+static mut DETAIL_LEN: [usize; 6] = [0; 6];
+/// The radio drivers by process name, in the facts' order: the link a SYS_STATUS or SYS_DETAIL caller speaks for.
+const LINK_NAMES: [&[u8]; 6] = [b"modem", b"pcie1", b"bt", b"nfc", b"gps", b"usb"];
 /// pet(): the process is alive and going round its main loop (the process watchdog, measuring: the kernel records the longest stretch between two pets, `diag pets`). → 0.
 const SYS_PET: u64 = 28;
 /// block(cap, op, block, buf): 4 KiB blocks of a window on the ferros partition (`WINDOWS`), by number within it: op bit 0 write (else read), bits 8-15 the count (1 to BLOCK_MAX), `buf` the count × 4 KiB in the caller's arc. → 0, or ERR (no such window, out of it, or the UFS command failed).
@@ -2039,6 +2063,101 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 n as u64
             } else {
                 ERR
+            };
+            0
+        }
+        SYS_CONTROL => {
+            let token = p.read(f.x[0], 32);
+            let held = matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0);
+            let (link, slot, word) = (f.x[1] as usize, f.x[2] as usize, f.x[3]);
+            use core::sync::atomic::Ordering::Relaxed;
+            // WHY the bounds: the link and the slot are the caller's, indexes into the blocks; slot 0 is the generation, never set from outside.
+            f.x[0] = if !held || link >= CONTROL_LINKS || slot == 0 || slot >= CONTROLS {
+                ERR
+            } else if link == CONTROL_CLOCK && slot == CONTROL_ZONE {
+                // The zone, seconds east: within a day of UTC, as the settings document takes it.
+                let z = word as i64;
+                let was = crate::rtc::TZ.load(Relaxed);
+                if z.unsigned_abs() >= 86_400 {
+                    ERR
+                } else {
+                    crate::rtc::set_tz_held(z);
+                    if unsafe { CONTROL_STORE }.map(|st| st()).unwrap_or(false) {
+                        CONTROL_GEN[link].fetch_add(1, Relaxed);
+                        0
+                    } else {
+                        crate::rtc::set_tz_held(was);
+                        ERR
+                    }
+                }
+            } else {
+                let was = CONTROL[link][slot].swap(word, Relaxed);
+                let kept = crate::settings::KNOBS.iter().any(|k| k.1 == link && k.2 == slot);
+                if kept && !unsafe { CONTROL_STORE }.map(|st| st()).unwrap_or(false) {
+                    CONTROL[link][slot].store(was, Relaxed);
+                    ERR
+                } else {
+                    CONTROL_GEN[link].fetch_add(1, Relaxed);
+                    0
+                }
+            };
+            0
+        }
+        SYS_CONTROLS => {
+            // WHY the bounds: the link and the count are the caller's; there are CONTROL_LINKS blocks of CONTROLS words.
+            f.x[0] = if (f.x[0] as usize) < CONTROL_LINKS {
+                let link = f.x[0] as usize;
+                let n = (f.x[2] as usize).min(CONTROLS);
+                let mut bytes = [0u8; CONTROLS * 8];
+                for k in 0..n {
+                    use core::sync::atomic::Ordering::Relaxed;
+                    let w = match k {
+                        0 => CONTROL_GEN[link].load(Relaxed),
+                        CONTROL_ZONE if link == CONTROL_CLOCK => crate::rtc::TZ.load(Relaxed) as u64,
+                        _ => CONTROL[link][k].load(Relaxed),
+                    };
+                    bytes[k * 8..k * 8 + 8].copy_from_slice(&w.to_le_bytes());
+                }
+                p.write(f.x[1], &bytes[..n * 8]);
+                n as u64
+            } else {
+                ERR
+            };
+            0
+        }
+        SYS_DETAIL => {
+            let own = LINK_NAMES.iter().position(|n| *n == p.name.as_slice());
+            f.x[0] = match f.x[0] {
+                // A driver's own document: its length bounded so it fits the link's buffer.
+                0 => match own {
+                    Some(i) if (f.x[2] as usize) <= DETAIL_MAX => {
+                        let n = f.x[2] as usize;
+                        let doc = p.read(f.x[1], n);
+                        unsafe {
+                            (&mut *(&raw mut DETAIL))[i][..n].copy_from_slice(&doc);
+                            (*(&raw mut DETAIL_LEN))[i] = n;
+                        }
+                        0
+                    }
+                    _ => ERR,
+                },
+                1 => {
+                    let token = p.read(f.x[1], 32);
+                    let held = matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0);
+                    // WHY the bound: the link is the caller's, an index into six documents.
+                    if held && (f.x[2] as usize) < LINK_NAMES.len() {
+                        let i = f.x[2] as usize;
+                        let n = unsafe { (*(&raw const DETAIL_LEN))[i] };
+                        // WHY the min: the buffer is the caller's and may be shorter than the document; its length says how much to copy, the return how much there is.
+                        let take = n.min(f.x[4] as usize);
+                        let doc = unsafe { &(&*(&raw const DETAIL))[i][..take] };
+                        p.write_from(f.x[3], doc);
+                        n as u64
+                    } else {
+                        ERR
+                    }
+                }
+                _ => ERR,
             };
             0
         }

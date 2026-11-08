@@ -50,6 +50,9 @@ pub mod nr {
     pub const BLOCK: u64 = 29;
     pub const VAULT: u64 = 30;
     pub const TRACKS: u64 = 31;
+    pub const CONTROL: u64 = 32;
+    pub const CONTROLS: u64 = 33;
+    pub const DETAIL: u64 = 34;
 }
 /// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
 pub const CORES_WORKERS: u64 = 0x00F0;
@@ -162,7 +165,83 @@ pub mod measure {
     pub const ACCURACY: u16 = 22;
     /// GPS: one tracked signal (a track word, `tracks`): `sat_word` packs it, `sat_of` unpacks it.
     pub const SAT: u16 = 23;
+    /// Cellular: the data stack's registration state as the CP reports it (0 not registered, 1 home, 2 searching, 3 denied, 4 unknown, 5 roaming; the CP's own 20 an emergency attach).
+    pub const REGISTRATION: u16 = 24;
+    /// The largest packet the link takes, bytes.
+    pub const MTU: u16 = 25;
+    /// Packets received and sent since the driver started (counts).
+    pub const PACKETS_DOWN: u16 = 26;
+    pub const PACKETS_UP: u16 = 27;
+    /// Packets received bad, and sent that failed, since the driver started (counts).
+    pub const ERRORS_DOWN: u16 = 28;
+    pub const ERRORS_UP: u16 = 29;
+    /// Packets received and dropped by the driver (its queue full, or malformed), and packets refused going up (the ring full) (counts).
+    pub const DROPPED_DOWN: u16 = 30;
+    pub const DROPPED_UP: u16 = 31;
+    /// The link's power-saving mode as the radio reports it (WiFi: 0 off, 1 on, 2 fast).
+    pub const POWER_SAVE: u16 = 32;
+    /// The link powered down to save power and back up, since the driver started (count; cellular: the PCIe link's suspends).
+    pub const SUSPENDS: u16 = 33;
+    /// GPS, with a fix: altitude (mm), ground speed (mm/s), heading (millidegrees from true north).
+    pub const ALTITUDE: u16 = 34;
+    pub const SPEED: u16 = 35;
+    pub const HEADING: u16 = 36;
+    /// USB: the link's power state (0 U0 working, 1 U1, 2 U2, 3 U3 suspended).
+    pub const LINK_POWER: u16 = 37;
 }
+
+/// The links' control blocks (docs/RADIO-CONTROLS.md): which link, and what each slot of it means. Slot 0 of every block is its generation (counted up by every set); 1-15 the knobs, all ones (`UNSET`) for the driver's own default. A value knob is kept in the settings document; an action is a counter the page counts up and the driver acts on once.
+pub mod control {
+    pub const CELLULAR: u64 = 0;
+    pub const WIFI: u64 = 1;
+    pub const BLUETOOTH: u64 = 2;
+    pub const NFC: u64 = 3;
+    pub const GPS: u64 = 4;
+    pub const USB: u64 = 5;
+    /// The clock: the kernel is its driver.
+    pub const CLOCK: u64 = 6;
+    /// A slot never set: the driver's own default.
+    pub const UNSET: u64 = u64::MAX;
+    /// Words in a block.
+    pub const WORDS: usize = 1 << 4;
+    /// Cellular, an action: the data stack's radio off and on again (it registers afresh; the call comes back once it is home).
+    pub const CELL_REREGISTER: u64 = 1;
+    /// WiFi, kept: power save, 0 off (the default), 1 on (PM1), 2 fast (PM2). Applied at once.
+    pub const WIFI_POWER_SAVE: u64 = 1;
+    /// WiFi, kept: the band to join on, 0 any (5 GHz whenever the network has it, the default), 1 5 GHz only, 2 2.4 GHz only. Applied at the next join.
+    pub const WIFI_BAND: u64 = 2;
+    /// The clock: the zone, seconds east of UTC (signed, within a day). Kept as the settings document's `tz`.
+    pub const CLOCK_ZONE: u64 = 1;
+}
+
+/// Set knob `slot` of link `link` (`control`) to `word`, given the Settings capability. Returns true when the kernel took it (and kept it, for a kept knob).
+pub fn control(cap: u64, link: u64, slot: u64, word: u64) -> bool {
+    svc(nr::CONTROL, cap, link, slot, word, 0) == 0
+}
+
+/// Link `link`'s control block now: the generation, then slots 1-15 (`control::UNSET` where unset). All zero for no such link.
+pub fn controls(link: u64) -> [u64; control::WORDS] {
+    let mut b = [0u64; control::WORDS];
+    let r = svc(nr::CONTROLS, link, off(b.as_mut_ptr() as *const u8), b.len() as u64, 0, 0);
+    if r == ERR {
+        return [0; control::WORDS];
+    }
+    b
+}
+
+/// This driver's detail document (`detail::build`), kept by the kernel as its link's (at most 1 KiB). True when taken.
+pub fn detail_set(doc: &[u8]) -> bool {
+    svc(nr::DETAIL, 0, off(doc.as_ptr()), doc.len() as u64, 0, 0) == 0
+}
+
+/// Link `link`'s detail document into `buf`, given the Settings capability: the document's whole length (0: none yet), or None without the capability.
+pub fn detail(cap: u64, link: u64, buf: &mut [u8]) -> Option<usize> {
+    let r = svc(nr::DETAIL, 1, cap, link, off(buf.as_mut_ptr()), buf.len() as u64);
+    (r != ERR).then_some(r as usize)
+}
+
+#[cfg(feature = "detail")]
+pub mod detail;
 pub const MEASURE_NONE: u64 = u64::MAX;
 pub const TECH_NONE: u8 = 0;
 pub const TECH_WIFI4: u8 = 1;
