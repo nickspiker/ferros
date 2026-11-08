@@ -711,10 +711,19 @@ fn vault_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![Serve(b"vault"), Blocks(b"vault"), Entropy, Vault]
 }
 
+/// The GPS driver's grants in its slot order (payloads/gps): 1 serve gps, 2 the SPI port, 3 gpio-far-alive, 4 gpio-gpp0, 5 gpio-hsi2, 6 the vault scope `gps.`, 7 the power switch, 8 HOST_REQ's interrupt. Its own list, as the vault's: init's page is full at 108, and the kernel starts this driver itself, only once a person has attested (radios at attest, GPS locked until then).
+fn gps_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
+    use crate::process::Grant::*;
+    alloc::vec![Serve(b"gps"), Hardware(b"usi3-spi"), Hardware(b"gpio-far-alive"), Hardware(b"gpio-gpp0"), Hardware(b"gpio-hsi2"), Store(b"gps"), Power(b"gps"), Irq(b"gps-host-req")]
+}
+
 /// Each shell process's capabilities, as init hands them out (payloads/init: the slots of `home_grants`, 1-based), for restarting one from the vault without a reboot.
 fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'static>>> {
     if name == b"vault" {
         return Some(vault_grants());
+    }
+    if name == b"gps" {
+        return Some(gps_grants());
     }
     let slots: &[usize] = match name {
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
@@ -767,6 +776,7 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
         let attached = person && crate::process::with_lock(|| store.as_mut().is_some_and(|s| s.bound().unwrap_or(false)));
         let refused: Option<&[u8]> = match name {
             b"fgtw" if !person => Some(b"not started, nobody has attested: "),
+            b"gps" if !person => Some(b"not started, GPS is locked until a person attests: "),
             b"map" if !attached => Some(b"not started, this device is not bound to an attested identity: "),
             _ => None,
         };
@@ -1437,6 +1447,7 @@ pub fn run(mut b: Boot) -> ! {
     let mut ipc_marked = false;
     // The radios switched off (preference 15) as the loop last applied them: init started only the ones left on.
     let mut radios_applied = crate::process::pref(crate::process::PREF_RADIOS_OFF) & 0x1F;
+    let mut gps_started = false;
     // The panel's VCI as ABL or Android left it (SYS_FACTS 81): the display server reads it to know a panel it must power up (state B).
     crate::panel_power::read_state();
     // The display engine fenced to its own regions when the DPU is up already (ABL's splash, or a jump from a lit Android); a DPU that is down is fenced by the `dpu` switch as it powers it (s2mpu::fence_dpu). Before init starts the display server, so it never runs unfenced.
@@ -1492,6 +1503,19 @@ pub fn run(mut b: Boot) -> ! {
                 }
             }
             radios_applied = radios_off;
+        }
+        // GPS switched on, a person attested, and no driver running: started once each time a person is in (no one in, the next attest may start it again). Nothing else started it: init's page has no room for its grants, and the switch above only acts on a change, so a GPS left on was never driven (2026-11-08).
+        let person = store.as_ref().is_some_and(|s| s.unlocked());
+        if !person {
+            gps_started = false;
+        } else if !gps_started && radios_off & 1 << 4 == 0 {
+            gps_started = true;
+            let running = crate::process::with_lock(|| crate::process::named_alive_locked(&[b"gps"])) != 0;
+            if !running {
+                let mut rep = alloc::vec::Vec::new();
+                restart(&mut store, b"gps", &mut rep);
+                crate::flashlog::line(&alloc::format!("gps after attest: {}", core::str::from_utf8(&rep).unwrap_or("").trim_end()));
+            }
         }
         // Released (a completed departure): restart, so the device comes back at the attest screen with nothing of the identity left.
         // First the person's domains in the vault process are dropped, a call a pass through the kernel's channel (none while a bridge command holds it); a drop that fails, or no vault to send it to, is logged and the restart goes ahead: the renewed device-only secret already makes those entries unopenable.
