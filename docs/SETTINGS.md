@@ -30,9 +30,11 @@ One spec VSF document in the vault under the key `device` (ferros_kernel `settin
 | `unlock_at_boot` | unsigned | 0 off (the handle is typed each boot, nothing of the identity on disk), 1 on (the seed is stored so the phone unlocks without typing) | 0 |
 | `radios_off` | unsigned | the radios switched off, a bit each: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS (a tap on a status circle; the kernel stops that driver while its bit is set) | 0 |
 | `tz` | signed | seconds east of UTC | 0 |
+| `wifi_power_save` | unsigned | WiFi power save: 0 off, 1 on (PM1), 2 fast (PM2); a radio knob (RADIO-CONTROLS.md), set on the WiFi page | unset: off |
+| `wifi_band` | unsigned | the band WiFi joins on: 0 any (5 GHz first), 1 5 GHz only, 2 2.4 GHz only; takes at the next join | unset: any |
 
 - **Loaded** by the kernel right after the vault opens: the defaults, then every valid field, into every process's preferences block.
-- **Written whole** on every change: a process holding Settings (`SYS_SET_PREF`), `ferros-bridge diag "pref <name> <value>"`, or a `device` document stored from the bridge (applied at once).
+- **Written whole** on every change: a process holding Settings (`SYS_SET_PREF`) or a radio knob or the zone (`SYS_CONTROL`, docs/RADIO-CONTROLS.md; the clock page sets the zone a quarter hour at a time), `ferros-bridge diag "pref <name> <value>"`, or a `device` document stored from the bridge (applied at once).
 - **The language** joins as its own VSF type (ISO 639-3 packed, with optional ISO 15924 script and ISO 3166-1 region, all numbers), asked of the VSF session on 2026-10-27. Like every field here it follows the last identity to attest. Until then the device is English.
 
 ## The number base (`device.base`)

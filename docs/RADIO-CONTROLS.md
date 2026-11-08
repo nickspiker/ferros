@@ -43,7 +43,7 @@ What each driver reports and what can be turned, as of 2026-11-07. "Next" is wha
 
 - **Measures:** state, RSSI, noise floor, SNR, centre frequency, channel width, rate, transmit loss over two seconds.
 - **Tracks:** the channel number, transmit power (`qtxpower`, quarter dBm), the power-save mode the firmware reports (WLC_GET_PM), packets received and sent, receive errors and transmit failures (WLC_GET_PKTCNTS, cumulative).
-- **Detail** (`wifi`): the network's name (from the person's credential), the access point's address (WLC_GET_BSSID), this device's address on that network (per network, keyed from the ira), the address DHCP gave, the router, the DNS server, the lease's length.
+- **Detail** (`wifi`): the network's name (from the person's credential), the access point's address (WLC_GET_BSSID), this device's address on that network (per network, keyed from the ira), and the lease (address, router, DNS server, length) when this driver ran DHCP itself; in service the `ip` process runs DHCP and its lease is not here yet (next: ip publishes it, or hands it to the driver).
 - **Knobs:**
   - *Power save* (kept): off (the default since bring-up), on (PM1, the radio sleeps between beacons), fast (PM2, sleeps after a quiet spell). Applied at once (WLC_SET_PM).
   - *Band* (kept): any (5 GHz whenever the network has it), 5 GHz only, 2.4 GHz only. Applied at the next join: switch WiFi off and on. No 2.4 GHz join has held under ferros yet (WIFI.md; the antenna is shared with Bluetooth and nothing coordinates them).
@@ -79,3 +79,11 @@ What each driver reports and what can be turned, as of 2026-11-07. "Next" is wha
 - `SYS_DETAIL` 34: x0 the op. Op 0 (a driver): x1/x2 the document and its length (at most 1 KiB), stored as its link's (by its process name, as `SYS_STATUS`). Op 1 (the settings): x1 the Settings capability's token offset, x2 the link, x3/x4 a buffer and its length → the document's whole length (0 when the driver has written none), its first bytes copied.
 
 The drivers find their link by their process name (modem, pcie1, bt, nfc, gps, usb), exactly as `SYS_STATUS` does, so no capability or grant slot is needed for a driver's own block.
+
+## The pages
+
+A link's page (payloads/map `draw_page`): its switch and state, every measure from its slots and tracks grouped (signal, channel, link, counters, motion) in the device's base, the satellites one a line, its names and addresses, its knobs as rows a tap turns. Addresses are identifiers, not quantities: they are written in hexadecimal grouped as their standards group them (IPv4 by byte with dots, IPv6 by sixteen bits with colons, hardware addresses by byte with colons), in every base. The link pages and the clock redraw once a second while they show.
+
+## State (2026-11-07)
+
+Built, committed, nothing flashed or deployed. The kernel calls need the kernel flashed; until then the drivers and the map degrade to today's behaviour (an unknown call returns ERR: the control blocks read as zeros, which mean power save off and any band; the detail is refused; a knob tap says on the console that the kernel did not take it). The driver capsules (modem, pcie1, gps, usb) and the map are to be stored and restarted with the flashed kernel.
