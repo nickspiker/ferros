@@ -71,6 +71,8 @@ const RING_LOG2: u8 = manifestus::HOST_RING_LOG2;
 const RUN: usize = 1 << 4;
 
 static mut GRANTS: u64 = 0;
+/// Spawned to start the region afresh (input bit 0, by hand).
+static mut FRESH: bool = false;
 
 fn grants() -> u64 {
     unsafe { GRANTS }
@@ -211,8 +213,10 @@ macro_rules! say {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn vault_main(g: u64, _input: u64, _input_len: u64) -> ! {
+pub extern "C" fn vault_main(g: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
+    // Input bit 0, by hand over the bridge only (the kernel spawns with no input): start the region afresh (`FRESH`).
+    unsafe { FRESH = input_len >= 1 && core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) & 1 == 1 };
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     unsafe { GRANTS = g };
     let stack = unsafe { &mut *STACK.0.get() };
@@ -234,6 +238,21 @@ type St = Store<Half, Half, Entropy>;
 extern "C" fn work(_: u64) -> ! {
     let t0 = now();
     // Each mirror bounded by its half of the window (8 GiB), so a grown tract opens again; what is in use is the committed extent, claimed below. A blank region (block 0, the first root slot, all zeros) opens at MIRROR instead: a blank vault is read whole before its first commit, and over 8 GiB that would be four million reads. The next open finds it and takes the half.
+    // Afresh: the first MIRROR blocks of each half zeroed, so the open below finds a blank region and formats it. Only by hand (input bit 0): it destroys whatever the region held (2026-11-08, the owner: "I do not care about literally any data on this device", after the wipe left orphaned blocks no spine reached).
+    if unsafe { FRESH } {
+        let zero = alloc::vec![0u8; RUN << 12];
+        for base in [0, HALF] {
+            let mut at = 0;
+            while at < MIRROR {
+                if ferros_sys::block_write(cap(grants(), S_BLOCKS), base + at, &zero) != 0 {
+                    say!("vault: zeroing for a fresh start failed at {}", base + at);
+                    ferros_sys::exit(2);
+                }
+                at += RUN as u64;
+            }
+        }
+        say!("vault: the region zeroed for a fresh start ({} blocks a mirror)", MIRROR);
+    }
     let mut probe = [0u8; 4096];
     let blank = ferros_sys::block_read(cap(grants(), S_BLOCKS), 0, &mut probe) == 0 && probe.iter().all(|&b| b == 0);
     let bound = if blank { MIRROR } else { HALF };
