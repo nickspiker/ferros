@@ -80,6 +80,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let jumped = ferros_sys::facts().0[31] == 6;
     // The GPU too: Android ran it, and whether the hv cuts it off at the jump is still the owner's open decision (KERNEL-OUT.md); the attest screen draws on the CPU without it.
     let after_jump = |n: &[u8]| jumped && matches!(n, b"pcie1" | b"nfc" | b"bt" | b"sensors" | b"modem" | b"gpu");
+    let akita = ferros_sys::facts().0[84] == 2;
+|n: &[u8]| jumped && matches!(n, b"pcie1" | b"nfc" | b"bt" | b"sensors" | b"modem" | b"gpu");
     for (name, key, slots) in SHELL.iter() {
         if switched_off(name) {
             console(grants, b"init: ");
@@ -93,10 +95,16 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             console(grants, b" not started: the jump from Android left its hardware in Android's state\n");
             continue;
         }
+        if akita && unfit(name) {
+            console(grants, b"init: ");
+            console(grants, name);
+            console(grants, b" not started: not brought up on akita (docs/BOARDS.md)\n");
+            continue;
+        }
         if *name == b"fgtw" {
             // Every driver the keepers watch is started by now.
             for (k, s) in stacks.0.iter_mut().enumerate() {
-                if !after_jump(KEPT[k].0) {
+                if !after_jump(KEPT[k].0) && !(akita && unfit(KEPT[k].0)) {
                     ferros_sys::thread_spawn(keeper, s, (grants << 2) | k as u64);
                 }
             }
@@ -207,6 +215,11 @@ extern "C" fn keeper(arg: u64) -> ! {
             }
         }
     }
+}
+
+/// The drivers left out on akita (Pixel 8a, SYS_FACTS 84 = 2) until each is brought up there (docs/BOARDS.md): its WiFi is a BCM4383, not the BCM4398 the WiFi driver's later stages load; Bluetooth is the same chip and waits for WiFi's REG_ON; the modem and the AoC's sensors have not been run on it.
+fn unfit(name: &[u8]) -> bool {
+    matches!(name, b"pcie1" | b"bt" | b"modem" | b"sensors")
 }
 
 /// Whether a radio's driver is switched off (preference 15, the status circles; owner 2026-11-07): the bit in the facts' order, cellular, WiFi, Bluetooth, NFC, GPS. Not a radio: never.

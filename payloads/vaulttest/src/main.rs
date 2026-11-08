@@ -1,4 +1,4 @@
-//! The vault process's proof on the device (VAULT-OUT.md): a process with the `test` store scope, using the store calls every process uses, which the kernel forwards to the vault process. It writes a small value and a 6 MiB one (past the kernel's old 3 MiB limit) in 4 KiB transfers, reads both back (the large one checked by its BLAKE3), lists the names, deletes one and finds it gone. With input 01 it only reads the large value back, for after the vault process is restarted.
+//! The vault process's proof on the device (VAULT-OUT.md): a process with the `test` store scope, using the store calls every process uses, which the kernel forwards to the vault process. It writes a small value and a 6 MiB one (past the kernel's old 3 MiB limit) in 4 KiB transfers, reads both back (the large one checked by its BLAKE3), lists the names, deletes one and finds it gone. With input 01 it only reads the large value back, for after the vault process is restarted. With input 02 it streams one 576 MiB value in and back, compared byte for byte, (the tract's grow past a blank vault's first 512 MiB) and deletes it.
 //!
 //! Grant slots: 0 console, 1 store test.
 #![no_std]
@@ -119,14 +119,20 @@ fn ms(t: u64) -> u64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn test_main(g: u64, input: u64, input_len: u64) -> ! {
+    // The mode byte first: `arc_base` reads x28, which this function's own code may take for itself further down (the grow mode never ran after a rebuild, 2026-11-08).
+    let mode = if input_len > 0 { unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } } else { 0 };
     unsafe { ferros_sys::relocate() };
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     unsafe { GRANTS = g };
+    // Input 02: the grow (manifestus grow_from, VAULT-OUT.md): one value larger than a blank vault's first 512 MiB a mirror, streamed in, read back and compared byte for byte (the pattern regenerated a transfer at a time; blake3's incremental Hasher faulted in this payload, 2026-11-08) and deleted, so the tract must grow into its half of the window.
+    if mode == 2 {
+        grow();
+    }
     // Past the kernel's old 3 MiB limit on a value (service.rs STORE_VALUE_MAX).
     let big: Vec<u8> = (0..BIG as u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
     let want = blake3::hash(&big);
     // Input 01: only look, after the vault process was restarted: the value the last run left is still there, whole.
-    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 1 {
+    if mode == 1 {
         let t = now();
         let back = get(b"big");
         let same = back.as_ref().is_some_and(|b| blake3::hash(b) == want);
@@ -154,6 +160,53 @@ pub extern "C" fn test_main(g: u64, input: u64, input_len: u64) -> ! {
     let all = small_ok && wrote && same && listed && deleted && again && after && absent;
     say!("vaulttest: {}", if all { "all passed" } else { "FAILED" });
     ferros_sys::exit(if all { 0 } else { 1 })
+}
+
+/// The grow mode's value: 576 MiB, past a blank vault's first 512 MiB a mirror (and its 9216 pieces' entries within the vault's 24 MiB heap as manifestus doubles its buffer of them).
+/// On akita (2026-11-08, a blank vault): the vault process ran out of its 24 MiB heap at 384 MiB written (an allocation of 10.7 MB failed: manifestus's buffer of the vault's entries, doubling), so today this mode stops there and the vault restarts; it passes once the vault bounds that buffer.
+const GROW: usize = 576 << 20;
+
+/// The grow mode's byte at `i`, the large value's pattern (generated a transfer at a time: the value does not fit the heap).
+fn grow_fill(off: usize, buf: &mut [u8]) {
+    for (k, b) in buf.iter_mut().enumerate() {
+        *b = (((off + k) as u32).wrapping_mul(2654435761) >> 13) as u8;
+    }
+}
+
+fn grow() -> ! {
+    let mut buf = alloc::vec![0u8; 4096];
+    let mut want = alloc::vec![0u8; 4096];
+    let t = now();
+    let mut off = 0;
+    let mut wrote = true;
+    while off < GROW {
+        grow_fill(off, &mut buf);
+        if !ferros_sys::store_set_at(store(), b"grow", off, &buf, off + buf.len() < GROW) {
+            wrote = false;
+            break;
+        }
+        off += buf.len();
+    }
+    say!("vaulttest: grow: {} MiB written {} in {} ms (stopped at {} MiB)", GROW >> 20, wrote, ms(t), off >> 20);
+    let t = now();
+    let mut off = 0;
+    let mut read = true;
+    let mut same = true;
+    while read && off < GROW {
+        match ferros_sys::store_get_at(store(), b"grow", off, &mut buf) {
+            Some(whole) if whole == GROW => {
+                grow_fill(off, &mut want);
+                same &= buf == want;
+                off += buf.len();
+            }
+            _ => read = false,
+        }
+    }
+    let same = read && same;
+    say!("vaulttest: grow: read back {} in {} ms, every byte as written: {}", read, ms(t), same);
+    let deleted = ferros_sys::store_delete(store(), b"grow") == Some(true);
+    say!("vaulttest: grow: deleted {}; {}", deleted, if wrote && same && deleted { "passed" } else { "FAILED" });
+    ferros_sys::exit(if wrote && same && deleted { 0 } else { 1 })
 }
 
 #[panic_handler]

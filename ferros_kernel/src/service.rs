@@ -974,10 +974,11 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
             crate::process::push_console(alloc::format!("rescue: the vault's {name} replaced by the kernel's known-good capsule ({})\n", if r.is_ok() { "ok" } else { "failed" }).as_bytes());
         }
     }
-    // akita (board.rs): storage-off, no vault and so no init; and every driver process init starts assumes husky's panel, touch and rails. The USB process alone, from the native capsule this kernel carries, so the bridge reaches the device.
-    if crate::board::akita() {
+    // akita (board.rs) without `init` in its vault (its first boots, or no vault): the USB process alone, from the native capsule this kernel carries, so the bridge reaches the device and can store the shell. With `init` stored, akita takes husky's path below (since 2026-11-08: its vault and ira since 2026-11-06; init leaves out the drivers whose hardware is not husky's there, payloads/init `unfit`).
+    let akita_bare = crate::board::akita() && crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("init").ok().flatten())).is_none();
+    if akita_bare {
         #[cfg(ferros_usb_capsule)]
-        // No ira on akita yet, so no oracle secret: the capsule is checked by its signature and runs without an ihi (spawn_capsule would refuse it: "no ira: no system secret, no ihi", the first akita boots, 2026-11-06).
+        // Without a vault there is no ira and so no oracle secret: the capsule is checked by its signature and runs without an ihi (spawn_capsule would refuse it: "no ira: no system secret, no ihi", the first akita boots, 2026-11-06).
         match shell_grants(b"usb").map(|g| crate::process::spawn_capsule_no_ihi(b"usb", include_bytes!("../../target/akita-usb.capsule.vsf"), b"", &g)) {
             Some(Ok(o)) => {
                 mark_ran(&o);
