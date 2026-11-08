@@ -304,6 +304,34 @@ impl Batch {
         m[12..12 + k].copy_from_slice(&t[..k]);
         self.op(&m[..12 + k]);
     }
+    /// Text centred on (x, y) and turned about that centre by (c, s) in Q14, at opacity `alpha` (255 opaque): op 19, the titles turning in.
+    fn turned(&mut self, x: i64, y: i64, px: u16, colour: u32, alpha: u8, c: i16, s: i16, t: &str) {
+        let mut m = [0u8; 140];
+        m[0] = 19;
+        // Signed, as the display reads them; the clamps are the fields' own ranges (a title riding off the screen can have its centre past the edge).
+        m[1..3].copy_from_slice(&(x.clamp(-32768, 32767) as i16).to_le_bytes());
+        m[3..5].copy_from_slice(&(y.clamp(-32768, 32767) as i16).to_le_bytes());
+        m[5..7].copy_from_slice(&px.to_le_bytes());
+        m[7..11].copy_from_slice(&colour.to_le_bytes());
+        m[11] = alpha;
+        m[12..14].copy_from_slice(&c.to_le_bytes());
+        m[14..16].copy_from_slice(&s.to_le_bytes());
+        let t = t.as_bytes();
+        let k = t.len().min(m.len() - 16);
+        m[16..16 + k].copy_from_slice(&t[..k]);
+        self.op(&m[..16 + k]);
+    }
+    /// The open circle, landed, as an app's region (display op 18, in place of `begin`): its centre, radius and ground; what follows is its page, in front of a clean window the display makes once.
+    fn region(&mut self, x: i64, y: i64, r: i64, ground: u32) {
+        let mut m = [0u8; 11];
+        m[0] = 18;
+        // The clamps are the fields' own ranges, as for every op the display reads (the circle is the screen's, well inside them).
+        m[1..3].copy_from_slice(&(x.clamp(-32768, 32767) as i16).to_le_bytes());
+        m[3..5].copy_from_slice(&(y.clamp(-32768, 32767) as i16).to_le_bytes());
+        m[5..7].copy_from_slice(&(r.clamp(0, 65535) as u16).to_le_bytes());
+        m[7..11].copy_from_slice(&ground.to_le_bytes());
+        self.op(&m);
+    }
     fn disc(&mut self, x: i64, y: i64, r: i64, colour: u32) {
         let mut m = [0u8; 11];
         m[0] = 16;
@@ -1030,13 +1058,20 @@ impl Map {
     }
 
     /// Draw the frame: the overlay for the view first (what is sent first is on top), then the scene under it through the camera. The one circle is the system's: the device's settings.
+    /// Landed on an open circle, the frame is its region (COMPOSITOR.md "The open circle is an app's region"): the ground and the scene made once by the display, the page in front of them, only what changed drawn and published. Flying, or on the plane, every frame is drawn whole.
     fn draw(&mut self) {
         let mut b = Batch::new();
-        b.op(&[1]);
+        let region = matches!(self.view, View::Open(_)) && self.target.is_none();
+        if region {
+            let (cx, cy, r, _) = self.page_frame();
+            b.region(cx, cy, r, fill());
+        } else {
+            b.op(&[1]);
+        }
         self.nrows = 0;
         match self.view {
             View::Map => {}
-            View::Open(_) => self.settings(&mut b),
+            View::Open(_) => self.settings(&mut b, region),
         }
         b.op(&self.cam.op(true));
         b.send(self.display);
@@ -1101,29 +1136,38 @@ impl Map {
     }
 
     /// The settings (owner, 2026-11-05): the pages a ring, the page on show inscribed in the circle an app lives in, its title large at the top with its neighbours' small and dim either side; a swipe across goes round the ring, up and down scrolls a page longer than its band. Laid out in 48ths of the width (`unit`).
-    fn settings(&mut self, b: &mut Batch) {
+    fn settings(&mut self, b: &mut Batch, region: bool) {
         let (cx, cy, r, uq) = self.page_frame();
         // Lengths in the unit, from its 256ths (uq): k units over d, rounded once, so the page scales smoothly through a flight or a pinch.
         let uu = |n: i64, d: i64| n * uq / (d << 8);
         let (title_y, _, _) = self.bands();
-        // The titles: a strip eighteen units apart (three eighths of the screen, landed), moving with the pages at that fraction of their speed; size and colour from the distance to the centre by span² / (span² + 8 d²), C∞, 1 on the centre and a ninth a neighbour away.
+        // The titles ride the circle (owner, 2026-11-07: "rotate around with the circle", not slid left and right and clipped, not spun about themselves, no vertical skew): each page's title stands on the arc about the circle's centre through the title's place, a page apart by the angle whose arc is the screen's width, so at the top a title moves with the finger. Turning from one page to the next the outgoing title rides the arc away and the incoming one rides in from the other side, each turned to its place on the arc (its baseline the arc's tangent), at one size. Each is drawn at α = cos²(π · its offset in pages), gone at half a page with α's slope 0 there, so the hand-over is C¹. The offset is the finger's or its spring's, counted in display frames: the motion has no clock of its own.
         let span = uu(18, 1);
-        let (big, small) = (uu(2, 1), uu(5, 4));
-        let (hi, lo) = (white(), dim());
-        for k in -2isize..=2 {
-            let p = self.wrap(self.page as isize + k);
-            let x = cx + k as i64 * span + self.page_dx * span / self.w;
-            let d = x - cx;
-            let (num, den) = (span * span, span * span + 8 * d * d);
-            let size = small + (big - small) * num / den;
-            let mix = |s: u32| {
-                let (a, b) = (((lo >> s) & 255) as i64, ((hi >> s) & 255) as i64);
-                ((a + (b - a) * num / den) as u32) << s
-            };
-            b.text(x, title_y, size as u16, mix(16) | mix(8) | mix(0), 1, PAGES[p]);
-            if k == -1 || k == 1 {
-                self.push_row(x - span / 2, x + span / 2, title_y - uu(2, 1), title_y + uu(1, 1), Choice::Page(k as i8));
+        let size = uu(2, 1);
+        // The ink's centre about 0.36 of an em over the baseline (as the display centres turned text), and its distance from the circle's centre: the arc's radius.
+        let (ink_y, cyf) = ((title_y - size * 23 / 64) as f64, cy as f64);
+        let arc = cyf - ink_y;
+        let per_page = self.w as f64 / arc;
+        let t = self.page_dx as f64 / self.w as f64;
+        for k in -1isize..=1 {
+            let d = k as f64 + t;
+            let v = libm::cos(core::f64::consts::PI * d);
+            let alpha = libm::round(v * v * 255.) as i64;
+            // Past half a page (or so near it that nothing would show) the title is gone.
+            if d.abs() >= 0.5 || alpha == 0 {
+                continue;
             }
+            // Its angle round the circle from straight up, clockwise as the strip moves right.
+            let phi = d * per_page;
+            let (c, s) = (libm::cos(phi), libm::sin(phi));
+            let (x, y) = (cx as f64 + arc * s, cyf - arc * c);
+            let p = self.wrap(self.page as isize + k);
+            b.turned(libm::round(x) as i64, libm::round(y) as i64, size as u16, white(), alpha as u8, libm::round(c * 16384.) as i16, libm::round(s * 16384.) as i16, PAGES[p]);
+        }
+        // The neighbours are still a tap away, either side of the title where their titles stood.
+        for k in [-1i8, 1] {
+            let x = cx + k as i64 * span;
+            self.push_row(x - span / 2, x + span / 2, title_y - uu(2, 1), title_y + uu(1, 1), Choice::Page(k));
         }
         let cur = self.page;
         // Each page's height at the unit it is drawn at, laid out first into a batch that is not sent (not live, so no rows): its centring needs it, and the unit changes every frame of a flight (a page never laid out was centred as empty, 2026-11-05).
@@ -1139,8 +1183,10 @@ impl Map {
             let p = self.wrap(cur as isize + 1);
             self.draw_page(b, p, cx + self.page_dx + self.w, false);
         }
-        // The page out to the circle itself, which the display's hairline draws over.
-        b.disc(cx, cy, r, fill());
+        // The page out to the circle itself, which the display's hairline draws over; a region's ground is its region op's, made once.
+        if !region {
+            b.disc(cx, cy, r, fill());
+        }
     }
 
     /// Page `p` centred on x = `cx`: centred in its band when it fits, else from the band's top less the scroll. `live`: the page on show, whose rows a tap reaches (only once the strip has settled on it).
@@ -1823,6 +1869,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.cam = map.at(i);
             map.view = View::Open(i);
         }
+        // FERROS_MAP_START=swipe: the settings open, and the synthetic finger (below) swipes across them, for timing the open circle's frames with no one at the panel.
+        if v == b"swipe" {
+            map.cam = map.at(0);
+            map.view = View::Open(0);
+        }
     }
     map.draw();
     // Nothing is in focus (display op 25, icon 0): a display that outlived an older map, one with widgets that took focus, would otherwise keep redrawing one at the panel's rate.
@@ -1974,7 +2025,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         // The screen off (the power key): no touches reach the map.
         let t_loop = now();
-        let n = if matches!(option_env!("FERROS_MAP_START"), Some("drag") | Some("crowd")) && synth < 192 && now().wrapping_sub(map_start) > 2 * freq() {
+        let swipe = option_env!("FERROS_MAP_START") == Some("swipe");
+        let n = if matches!(option_env!("FERROS_MAP_START"), Some("drag") | Some("crowd") | Some("swipe")) && synth < 192 && now().wrapping_sub(map_start) > 2 * freq() {
             synth += 1;
             if synth == 2 {
                 // From the second pass: the first frame wait's reply is in.
@@ -1990,6 +2042,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     y -= 40;
                 }
                 synth_at.1 = y;
+                // Swiping the settings: from right of the centre, leftward.
+                if swipe {
+                    synth_at = (w / 2 + 360, h / 2);
+                }
             }
             if synth == 181 {
                 let mut l = Line::new();
@@ -2005,7 +2061,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 // A pan through the air, 90 passes up and 90 back, so the plane ends where it was and the lift is no tap.
                 let k = synth as i64 - 1;
                 let off = if k < 90 { k * 6 } else { (180 - k) * 6 };
-                let (x, y) = (synth_at.0, synth_at.1 - off);
+                // Swiping, 8 pixels a pass across: 720 out, past half the screen, so the page turns over and back.
+                let (x, y) = if swipe { (synth_at.0 - off * 8 / 6, synth_at.1) } else { (synth_at.0, synth_at.1 - off) };
                 r[0] = 1;
                 r[1..13].fill(0);
                 r[3] = 1;
@@ -2201,6 +2258,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             let id = ids[0];
             map.drag_settings(start[id], prev[id], cur[id]);
             map.draw();
+            synth_draws += 1;
         } else if moved && held == 2 && matches!(map.view, View::Open(_)) {
             // Two fingers on the open page: the UI scale follows their spread, 64ths of an octave by log₂ of how far they have opened since they began (owner, 2026-11-05: "makes it so you can easily scale any app any time"), shown live and kept when they lift.
             let (a, b) = (ids[0], ids[1]);

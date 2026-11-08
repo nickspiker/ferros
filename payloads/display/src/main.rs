@@ -23,6 +23,8 @@
 //! - 15 `batch [len u16][op…]…`: several ops in one call, in order — a frame with an overlay is `begin`, its text and rects and discs, then `camera` with the keep flag, which draws the scene under them and presents. One call per frame rather than one per op: each call is a round trip through the scheduler. The reply is the last op's, its status the first failure's.
 //! - 16 `disc [x i16][y i16][r u16][colour]`: a filled circle in panel pixels (the shell's shapes are circles; a ring is a smaller disc of the ground colour sent first, since what is sent first is on top).
 //! - 17 `scene move [index u8][x i32][y i32][r u16]` (optionally `[cos i16][sin i16]`, the circle's own turn in Q14): one circle of the scene moved, resized and turned in place (the owner arranging by hand).
+//! - 18 `region [cx i16][cy i16][r u16][ground]`: in place of `begin`, the open circle, landed, as an app's region (COMPOSITOR.md): the page's ops up to the camera op are its front layer, drawn only where they changed; the camera op makes the clean window (the ground, the scene under it) once and then draws no scene. A camera op with no region op before it ends the region.
+//! - 19 `text turned [cx i16][cy i16][px u16][colour][alpha u8][cos i16][sin i16][utf8…]`: text centred on (cx, cy), turned about it (Q14, positive sin clockwise), at opacity alpha (255 opaque): the settings' titles riding the circle.
 //! - 22 `app [x u16][y u16][w u16][h u16]`: the app in front's frame, its 16-bit pixels in the `app-surface` region (R, G, B in bits 0-15, 16-31, 32-47: working values, gamma 2, white = Q14; bit 48 = no dither), published at full precision; 23 `app done`: the screen is the map's again. Op 5's reply carries whether an app is in front (byte 12).
 //! - 21 `ramps [column u8]`: the present stage's test screen, or one column of it alone on black between two thin white lines (dithered bands: our 4×4 to 8 bits, 12 effective; undithered: the 8-bit truncation), straight from 16-bit working values (see `ramps`); status 3 when the pipe is not in 10 bits.
 //! - 24 `frame wait`: returns once the panel's next frame has started, or after a hundred-and-twentieth of a second when no frame is in flight (a command-mode panel starts a frame only when one is armed); the reply is the frame-start count, u32. A client that draws once per return is locked to the panel's refresh: it reads its input right after a frame starts and its update is ready for the next one (the map, while a finger is down).
@@ -1551,6 +1553,8 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
     let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
     // The finished wallpaper's base, 0 while there is none.
     let wall = unsafe { if WALL_ON { WALL_BUF } else { 0 } };
+    // An open circle's front layer (its text, COMPOSITOR.md), 0 while no region is up: in front of the canvas, which then holds the clean window. A block's skip then asks the front alone, and its clean bit means "this phase holds the clean window here".
+    let text_layer = unsafe { if REGION_ON { ARENA } else { 0 } };
     // Which phases hold only the background at each 16-pixel block (`CLEAN`): rows are this call's own, so no other publisher touches their bytes.
     let clean_w = unsafe { CLEAN_W };
     let clean = unsafe { core::slice::from_raw_parts_mut(CLEAN as *mut u8, clean_w * height) };
@@ -1572,6 +1576,8 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
             unsafe {
                 let thv = core::arch::aarch64::vld1q_u8(th.as_ptr());
                 let src = back.as_ptr().add(y * width);
+                // What the block skip asks: the canvas, or with a region up its front layer.
+                let ask = if text_layer != 0 { (text_layer as *const Px).add(y * width) } else { src };
                 let mut x = x0;
                 // The run of blocks made since the last skip, copied to the phase in one wide copy when a skip or the row's end closes it (the phase is not cacheable: a copy a block cost more than the table saved, 77 ms a frame against 33, 2026-11-07).
                 let mut run = x0;
@@ -1580,7 +1586,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                     let glass = x < el || x + 16 > er || (x + 16 > cl && x < cr);
                     let mut any = 0u64;
                     for j in 0..16 {
-                        any |= *src.add(x + j);
+                        any |= *ask.add(x + j);
                     }
                     let ci = y * clean_w + x / 16;
                     let bit = 1u8 << k;
@@ -1597,7 +1603,19 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                     PUB_BLOCKS[if any == 0 { 1 } else { 2 }] += 1;
                     // The scene: the canvas, and the wallpaper under it where there is one (the canvas's pixels are premultiplied with their alpha, so the wallpaper shows in exactly the room each leaves: a circle's edge, a glow).
                     let mut scene = [0u64; 16];
-                    let scene_at = if wall != 0 {
+                    let scene_at = if text_layer != 0 && any != 0 {
+                        // A region's block with text in it: the text first, the clean window under it, the wallpaper under both.
+                        core::ptr::copy_nonoverlapping(ask.add(x) as *const u64, scene.as_mut_ptr(), 16);
+                        for j in (0..16).step_by(2) {
+                            neon::under2(scene.as_mut_ptr().add(j), src.add(x + j) as *const u64);
+                        }
+                        if wall != 0 {
+                            for j in (0..16).step_by(2) {
+                                neon::under2(scene.as_mut_ptr().add(j), (wall as *const u64).add(y * width + x + j));
+                            }
+                        }
+                        scene.as_ptr()
+                    } else if wall != 0 {
                         core::ptr::copy_nonoverlapping(src.add(x) as *const u64, scene.as_mut_ptr(), 16);
                         for j in (0..16).step_by(2) {
                             neon::under2(scene.as_mut_ptr().add(j), (wall as *const u64).add(y * width + x + j));
@@ -1768,6 +1786,189 @@ fn blit(px: &mut [Px], width: usize, height: usize, spr: &[Px], ext: &[Px], d: u
         for (p, &q) in row[n2..].iter_mut().zip(src[n2..].iter()) {
             *p = draw::under(*p, q);
         }
+    }
+}
+
+// ---------------------------------------------------------------- the open circle as an app's region
+//
+// COMPOSITOR.md "The open circle is an app's region", as built: the map's open circle, landed, is two layers. The front is the page's text, a full screen of working values in the sprite arena (no circle on the map is sprite-sized while a circle is open, so the arena is free; the sprites are dropped when a region opens). Behind it the clean window, in the canvas: the circle's ground, then the scene through the camera under it, made once for the circle, its ground, the camera, the theme and the scene, and kept. The wallpaper stays under both (`publish_band`).
+
+/// A region is up: the front layer is composed in front of the canvas, and the canvas holds the clean window.
+static mut REGION_ON: bool = false;
+/// Measuring the region's frames: count, front layer µs, wait µs, publish µs (summed), the worst whole frame µs, damaged pixels (summed).
+static mut REGION_US: [u64; 6] = [0; 6];
+/// The region op of the frame being received (op 18: its bytes after the op), taken by the frame's camera op; the page's drawing ops between the two are the front layer's.
+static mut REGION_REQ: Option<[u8; 10]> = None;
+/// What the clean window in the canvas was made for: the region op's bytes, the camera op's (padded), the theme and the scene's generation. None while the canvas holds anything else.
+static mut CLEAN_KEY: Option<([u8; 10], [u8; 18], u8, u32)> = None;
+/// Counts every change to the retained scene (ops 12, 13, 17): a clean window made before one is stale.
+static mut SCENE_GEN: u32 = 0;
+/// A frame's front ops, kept so the next frame draws only what changed: the ops' bytes back to back, and each op's offset, length and the rectangle it may touch.
+const FRONT_OPS: usize = 128;
+#[derive(Clone, Copy)]
+struct FrontOps {
+    buf: [u8; SLOT],
+    n: usize,
+    ops: [(u16, u16, draw::Rect); FRONT_OPS],
+    k: usize,
+}
+impl FrontOps {
+    const EMPTY: FrontOps = FrontOps { buf: [0; SLOT], n: 0, ops: [(0, 0, draw::Rect::EMPTY); FRONT_OPS], k: 0 };
+    fn op(&self, i: usize) -> &[u8] {
+        let (o, l, _) = self.ops[i];
+        &self.buf[o as usize..o as usize + l as usize]
+    }
+}
+/// Last frame's front ops (what the front layer holds) and this frame's (being received).
+static mut FRONT_OLD: FrontOps = FrontOps::EMPTY;
+static mut FRONT_NEW: FrontOps = FrontOps::EMPTY;
+
+/// The front layer: the sprite arena as a full screen, or None when the arena is too small for one (no `display-sprites` region: the old path draws the page into the canvas).
+fn front_layer(width: usize, height: usize) -> Option<&'static mut [Px]> {
+    // WHY the test: without the `display-sprites` region the arena is 6 MiB of the heap, less than a screen, and a screen's slice over it would run past the allocation.
+    unsafe { if ARENA_WORDS >= width * height { Some(core::slice::from_raw_parts_mut(ARENA as *mut Px, width * height)) } else { None } }
+}
+
+/// A page's drawing op (2 text, 3 rect, 16 disc, 19 turned text): the rectangle it may touch, and, given pixels, the op drawn into them under what is there, inside `draw::CLIP`. None for an op that is not one of these or is malformed.
+fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Option<draw::Rect> {
+    let i16le = |i: usize| i16::from_le_bytes([m[i], m[i + 1]]) as i64;
+    let u16le = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]) as i64;
+    let colour = |i: usize| u32::from_le_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]) & 0x00FF_FFFF;
+    match m.first() {
+        Some(2) if m.len() >= 12 => {
+            let (x, y, size) = (i16le(1) as f32, i16le(3) as f32, u16le(5) as f32);
+            let t = core::str::from_utf8(&m[12..]).ok()?;
+            if !(4.0..=512.0).contains(&size) {
+                return None;
+            }
+            let tw = glyph_engine().width(t, size);
+            let left = match m[11] { 1 => x - tw * 0.5, 2 => x - tw, _ => x };
+            if let Some(px) = px {
+                let mut d = Damage::new();
+                let mut c = Canvas::new(px, width, height, &mut d);
+                text(&mut c, &Font, t, left, y, size, 0xFF00_0000 | colour(7));
+                ALLOC.reset();
+            }
+            Some(draw::Rect { x0: left as i32 - 2, y0: (y - size) as i32 - 2, x1: (left + tw) as i32 + 3, y1: (y + size * 0.4) as i32 + 3 })
+        }
+        Some(3) if m.len() >= 13 => {
+            let (x, y, w, h) = (u16le(1) as isize, u16le(3) as isize, u16le(5) as isize, u16le(7) as isize);
+            if let Some(px) = px {
+                let mut d = Damage::new();
+                let mut c = Canvas::new(px, width, height, &mut d);
+                paint::fill_rect(&mut c, x, y, w, h, 0xFF00_0000 | colour(9), None, None);
+            }
+            Some(draw::Rect { x0: x as i32, y0: y as i32, x1: (x + w.max(1)) as i32, y1: (y + h.max(1)) as i32 })
+        }
+        Some(16) if m.len() >= 11 => {
+            let (x, y, r) = (i16le(1), i16le(3), u16le(5));
+            if let Some(px) = px {
+                draw::disc(px, width, height, (x << 8) + 128, (y << 8) + 128, r << 8, colour(7));
+            }
+            Some(draw::Rect { x0: (x - r - 2) as i32, y0: (y - r - 2) as i32, x1: (x + r + 3) as i32, y1: (y + r + 3) as i32 })
+        }
+        // 19 `text turned [cx i16][cy i16][px u16][colour][alpha u8, 255 opaque][cos i16][sin i16, Q14][utf8…]`: text centred on (cx, cy) and turned about that centre, at the opacity asked (the titles turning in, COMPOSITOR.md).
+        Some(19) if m.len() >= 16 => {
+            let (cx, cy, size) = (i16le(1) as f32, i16le(3) as f32, u16le(5) as f32);
+            let t = core::str::from_utf8(&m[16..]).ok()?;
+            if !(4.0..=512.0).contains(&size) {
+                return None;
+            }
+            let (alpha, tc, ts) = (m[11] as u32, i16le(12) as f32 / 16384.0, i16le(14) as f32 / 16384.0);
+            let g = glyph_engine();
+            let tw = g.width(t, size);
+            if let Some(px) = px {
+                // The baseline's start in the text's own frame, (−width/2, +0.36 em) from the centre, turned onto the screen (as `text_turned_centre`).
+                let (fx, fy) = (-tw * 0.5, size * 0.36);
+                let (bx0, by0, bx1, by1) = draw::bounds(width, height);
+                // The opacity as a Q16 factor on each glyph sample's coverage: 255 is 65536, the coverage itself.
+                let k = alpha * 257 + 1;
+                g.cover(t, cx + tc * fx - ts * fy, cy + ts * fx + tc * fy, size, (tc, ts), |sx, sy, a| {
+                    // WHY the test: a turned title's pixels come from its layout and can fall past the screen's or the clip's edge; outside them the index is another row or past the buffer.
+                    if sx >= bx0 && sy >= by0 && sx < bx1 && sy < by1 {
+                        let p = &mut px[sy as usize * width + sx as usize];
+                        *p = draw::under(*p, draw::at_cover16(colour(7), a * k >> 16));
+                    }
+                });
+                ALLOC.reset();
+            }
+            // Every pixel of the turned text lies within its unturned box's reach from the centre: half its width across, an em up or down at most.
+            let reach = sqrt(tw * tw * 0.25 + size * size) as i32 + 3;
+            Some(draw::Rect { x0: cx as i32 - reach, y0: cy as i32 - reach, x1: cx as i32 + reach + 1, y1: cy as i32 + reach + 1 })
+        }
+        _ => None,
+    }
+}
+
+/// The front layer brought to this frame's ops (`FRONT_NEW`) from last frame's (`FRONT_OLD`): an op sent again byte for byte stays as drawn; the rectangles of the ops that went and of the ops that came, merged until no two overlap, are cleared and every op touching one is drawn again inside it, in the frame's order (front first). Returns their union, the frame's damage; `FRONT_NEW` becomes `FRONT_OLD`.
+fn front_frame(front: &mut [Px], width: usize, height: usize) -> draw::Rect {
+    let (old, new) = unsafe { (&mut *(&raw mut FRONT_OLD), &*(&raw const FRONT_NEW)) };
+    let mut matched = [false; FRONT_OPS];
+    let mut dmg = [draw::Rect::EMPTY; 2 * FRONT_OPS];
+    let mut nd = 0usize;
+    for i in 0..new.k {
+        match (0..old.k).find(|&j| !matched[j] && old.op(j) == new.op(i)) {
+            Some(j) => matched[j] = true,
+            None => {
+                dmg[nd] = new.ops[i].2;
+                nd += 1;
+            }
+        }
+    }
+    for j in 0..old.k {
+        if !matched[j] {
+            dmg[nd] = old.ops[j].2;
+            nd += 1;
+        }
+    }
+    // Merged until disjoint: an op drawn into two overlapping rectangles in turn would lay its antialiased edge under itself twice where they overlap. Each merge takes one away, so this ends.
+    let mut merged = true;
+    while merged {
+        merged = false;
+        let mut a = 0;
+        while a < nd {
+            let mut b = a + 1;
+            while b < nd {
+                if !dmg[a].intersect(dmg[b]).is_empty() {
+                    dmg[a] = dmg[a].union(dmg[b]);
+                    dmg[b] = dmg[nd - 1];
+                    nd -= 1;
+                    merged = true;
+                } else {
+                    b += 1;
+                }
+            }
+            a += 1;
+        }
+    }
+    let mut all = draw::Rect::EMPTY;
+    for d in dmg[..nd].iter().map(|d| d.clip(width, height)).filter(|d| !d.is_empty()) {
+        draw::clear(front, width, d);
+        unsafe { draw::CLIP = d };
+        for i in 0..new.k {
+            if !new.ops[i].2.intersect(d).is_empty() {
+                page_op(new.op(i), Some(&mut *front), width, height);
+            }
+        }
+        all = all.union(d);
+    }
+    unsafe { draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX } };
+    old.buf[..new.n].copy_from_slice(&new.buf[..new.n]);
+    old.n = new.n;
+    old.ops = new.ops;
+    old.k = new.k;
+    all
+}
+
+/// The region ends (a camera op with no region op before it: the flight out, the plane): the canvas is the map's again and every phase owes the whole screen once.
+fn region_off(width: usize, height: usize) {
+    unsafe {
+        REGION_ON = false;
+        CLEAN_KEY = None;
+        FRONT_OLD.k = 0;
+        FRONT_OLD.n = 0;
+        PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
+        clean_reset();
     }
 }
 
@@ -4118,6 +4319,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 Some(1) => {
                     client_owned = true;
                     unsafe { CLIENT_DREW = true };
+                    // A plain frame: no region op is pending, and the clear below takes the clean window out of the canvas.
+                    unsafe {
+                        REGION_REQ = None;
+                        CLEAN_KEY = None;
+                    }
                     // Only what the last frame drew needs clearing; the rest of the back buffer is still empty. Between frames (the clock's redraw), only the clip.
                     unsafe {
                         if { CLIP_PHASE }.is_some() {
@@ -4128,32 +4334,48 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         }
                     }
                 }
-                Some(2) if m.len() >= 12 => {
-                    let x = i16::from_le_bytes([m[1], m[2]]) as f32;
-                    let y = i16::from_le_bytes([m[3], m[4]]) as f32;
-                    let px = u16::from_le_bytes([m[5], m[6]]) as f32;
-                    let colour = 0xFF00_0000 | u32::from_le_bytes([m[7], m[8], m[9], m[10]]) & 0x00FF_FFFF;
-                    let align = m[11];
-                    match core::str::from_utf8(&m[12..]) {
-                        Ok(t) if px >= 4.0 && px <= 512.0 => {
-                            let tw = text_width(&font, t, px);
-                            let left = match align { 1 => x - tw * 0.5, 2 => x - tw, _ => x };
-                            let mut c = Canvas::new(pixels, width, height, &mut damage);
-                            text(&mut c, &font, t, left, y, px, colour);
-                            ALLOC.reset();
-                            let r = draw::Rect { x0: left as i32 - 2, y0: (y - px) as i32 - 2, x1: (left + tw) as i32 + 3, y1: (y + px * 0.4) as i32 + 3 };
-                            unsafe { CUR_DMG = CUR_DMG.union(r.clip(width, height)) };
+                // The page's drawing ops (2 text, 3 rect, 16 disc, 19 turned text; `page_op`): after a region op, kept for the front layer and drawn at the camera op, only where they changed (`front_frame`); otherwise drawn into the canvas now.
+                Some(2 | 3 | 16 | 19) => {
+                    let collect = unsafe { { REGION_REQ }.is_some() } && front_layer(width, height).is_some();
+                    if collect {
+                        let f = unsafe { &mut *(&raw mut FRONT_NEW) };
+                        match page_op(m, None, width, height) {
+                            // WHY the bounds: the batch is the client's, and a page of more ops or bytes than the kept list holds would write past it; such an op is refused (status 2).
+                            Some(r) if f.k < FRONT_OPS && f.n + m.len() <= f.buf.len() => {
+                                f.buf[f.n..f.n + m.len()].copy_from_slice(m);
+                                f.ops[f.k] = (f.n as u16, m.len() as u16, r);
+                                f.n += m.len();
+                                f.k += 1;
+                            }
+                            Some(_) => out[0] = 2,
+                            None => out[0] = 1,
                         }
-                        _ => out[0] = 1,
+                    } else {
+                        match page_op(m, Some(&mut *pixels), width, height) {
+                            Some(r) => unsafe { CUR_DMG = CUR_DMG.union(r.clip(width, height)) },
+                            None => out[0] = 1,
+                        }
                     }
                 }
-                Some(3) if m.len() >= 13 => {
-                    let v = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]) as isize;
-                    let colour = 0xFF00_0000 | u32::from_le_bytes([m[9], m[10], m[11], m[12]]) & 0x00FF_FFFF;
-                    let mut c = Canvas::new(pixels, width, height, &mut damage);
-                    paint::fill_rect(&mut c, v(1), v(3), v(5), v(7), colour, None, None);
-                    let r = draw::Rect { x0: v(1) as i32, y0: v(3) as i32, x1: (v(1) + v(5).max(1)) as i32, y1: (v(3) + v(7).max(1)) as i32 };
-                    unsafe { CUR_DMG = CUR_DMG.union(r.clip(width, height)) };
+                // 18 `region [cx i16][cy i16][r u16][ground u32]`: the open circle, landed, as an app's region (COMPOSITOR.md): in place of `begin`. The page's ops that follow are the front layer; the camera op after them makes the clean window (this ground, the scene under it) if it is not current, and publishes only what the page changed.
+                Some(18) if m.len() >= 11 => {
+                    client_owned = true;
+                    unsafe { CLIENT_DREW = true };
+                    let mut q = [0u8; 10];
+                    q.copy_from_slice(&m[1..11]);
+                    unsafe {
+                        REGION_REQ = Some(q);
+                        FRONT_NEW.k = 0;
+                        FRONT_NEW.n = 0;
+                    }
+                    // No room for a front layer: the frame as before, the page into the canvas from a clear frame (the ground goes under it at the camera op).
+                    if front_layer(width, height).is_none() {
+                        unsafe {
+                            draw::clear(pixels, width, PREV_DMG.clip(width, height));
+                            CUR_DMG = draw::Rect::EMPTY;
+                            CLEAN_KEY = None;
+                        }
+                    }
                 }
                 Some(4) => {
                     // The finished frame to the framebuffer: reads from cache, writes combined.
@@ -4171,13 +4393,17 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     unsafe { LAST_FRAME.1 = 0 };
                     client_owned = true;
                     unsafe { CLIENT_DREW = true };
-                    unsafe { SCENE_N = 0 };
+                    unsafe {
+                        SCENE_N = 0;
+                        SCENE_GEN = SCENE_GEN.wrapping_add(1);
+                    }
                 }
                 Some(13) if m.len() >= 2 => {
                     // The scene changed: the last frame no longer matches it, so the clock is not redrawn from it until the client sends the frame that does (a pinch's renormalise rescaled the scene under the old camera, and the replay drew a clock and scenery at the wrong scale into the clock's square, 2026-10-24).
                     unsafe { LAST_FRAME.1 = 0 };
                     client_owned = true;
                     unsafe { CLIENT_DREW = true };
+                    unsafe { SCENE_GEN = SCENE_GEN.wrapping_add(1) };
                     let count = m[1] as usize;
                     let mut at = 2usize;
                     for _ in 0..count {
@@ -4236,6 +4462,62 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             CLEAR_US = ferros_sys::us_since(t_c);
                         }
                     }
+                    // The open circle as an app's region (a region op before this one, COMPOSITOR.md): the front layer brought up to this frame, and the clean window made if it is not current; while it is, no scene is drawn and only what the front changed is published. A full frame without a region op ends the region.
+                    let region = if clip_k.is_none() { unsafe { core::mem::take(&mut *(&raw mut REGION_REQ)) } } else { None };
+                    let (mut skip_scene, mut remade, mut front_dmg, mut front_us, t_frame) = (false, false, draw::Rect::EMPTY, 0u64, now());
+                    let ground = |q: &[u8; 10]| {
+                        let i16q = |i: usize| i16::from_le_bytes([q[i], q[i + 1]]) as i64;
+                        ((i16q(0) << 8) + 128, (i16q(2) << 8) + 128, (u16::from_le_bytes([q[4], q[5]]) as i64) << 8, u32::from_le_bytes([q[6], q[7], q[8], q[9]]) & 0x00FF_FFFF)
+                    };
+                    match (region, front_layer(width, height)) {
+                        (Some(q), Some(front)) => unsafe {
+                            if !REGION_ON {
+                                REGION_ON = true;
+                                // The arena is the front layer from now: every sprite is dropped (the scene draws none while a region is up) and the layer starts empty.
+                                for k in 0..256 {
+                                    SPRITES[k].valid = false;
+                                    SPRITES[k].cap = 0;
+                                }
+                                ARENA_NEXT = 0;
+                                front.fill(0);
+                                FRONT_OLD.k = 0;
+                                FRONT_OLD.n = 0;
+                                CLEAN_KEY = None;
+                            }
+                            let mut cam = [0u8; 18];
+                            // WHY the bound: a camera op is 13 to 18 bytes (its turn optional); the key holds 18.
+                            let n = m.len().min(18);
+                            cam[..n].copy_from_slice(&m[..n]);
+                            let key = (q, cam, ferros_sys::theme::index() as u8, SCENE_GEN);
+                            if CLEAN_KEY == Some(key) {
+                                skip_scene = true;
+                            } else {
+                                // The clean window: the canvas cleared, the circle's ground, and the scene under it (below), once.
+                                draw::clear(pixels, width, PREV_DMG.clip(width, height));
+                                let (gx, gy, gr, gc) = ground(&q);
+                                CUR_DMG = draw::disc(pixels, width, height, gx, gy, gr, gc);
+                                CLEAN_KEY = Some(key);
+                                remade = true;
+                            }
+                            let t_front = now();
+                            front_dmg = front_frame(front, width, height);
+                            front_us = ferros_sys::us_since(t_front);
+                        },
+                        (Some(q), None) => {
+                            // No room for a front layer: the page went into the canvas (op 18 cleared it first), the ground under it now, the scene under both as ever.
+                            let (gx, gy, gr, gc) = ground(&q);
+                            let r = draw::disc(pixels, width, height, gx, gy, gr, gc);
+                            unsafe { CUR_DMG = CUR_DMG.union(r) };
+                        }
+                        (None, _) => {
+                            if clip_k.is_none() && unsafe { REGION_ON } {
+                                region_off(width, height);
+                                log.s(b"display: region: ended\n");
+                                log.flush();
+                            }
+                        }
+                    }
+                    let scene_n = if skip_scene { 0 } else { unsafe { SCENE_N } };
                     let mut t_phase = now();
                     unsafe { SCENE_US = [0; 3]; PUB_TICKS = [0; 3]; PUB_BLOCKS = [0; 3] };
                     let (wq, hq) = ((width as i64) << 7, (height as i64) << 7);
@@ -4244,7 +4526,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     let mut nglow = 0usize;
                     // The theme (ferros_sys::theme, device preference 5): every colour the scene chooses.
                     let th = ferros_sys::theme::current();
-                    for i in 0..unsafe { SCENE_N } {
+                    for i in 0..scene_n {
                         let cir = unsafe { SCENE[i] };
                         // World to screen, Q8 pixels: offset, turn, zoom, centre.
                         let (dx, dy) = (((cir.x as i64) << 8) - cx, ((cir.y as i64) << 8) - cy);
@@ -4365,7 +4647,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         let mut r = draw::Rect::EMPTY;
                         let still = unsafe { LAST_KEY[i] == [sr, stroke, tc, ts, lit as i64, cir.icon as i64] };
                         unsafe { LAST_KEY[i] = [sr, stroke, tc, ts, lit as i64, cir.icon as i64] };
-                        if d <= SPRITE_MAX && still {
+                        if d <= SPRITE_MAX && still && !unsafe { REGION_ON } {
                             // Cached: drawn at the sprite's centre pixel, then blitted.
                             let key = [sr, stroke, tc, ts, lit as i64, cir.icon as i64];
                             let (spr, ext) = sprite(i, key, d, |px, d| {
@@ -4431,8 +4713,27 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         ferros_sys::dma_barrier();
                         return len;
                     }
-                    let changed = unsafe { if CLOCK_ONLY { CLOCK_RECT.clip(width, height) } else { PREV_DMG.union(CUR_DMG).clip(width, height) } };
-                    unsafe { PREV_DMG = CUR_DMG };
+                    // A region: its clean window current, only what the front changed; just made, every phase owes the whole screen once (the background its blocks were known to hold is gone). The widgets under the region stay as the clean window caught them: nothing redraws them between frames while it is up.
+                    let changed = if skip_scene {
+                        front_dmg
+                    } else if remade {
+                        log.s(b"display: region: clean window made in ");
+                        log.dec(ferros_sys::us_since(t_frame) / 1000);
+                        log.s(b" ms\n");
+                        log.flush();
+                        unsafe {
+                            CLOCK_SHOWN = false;
+                            SCOPE_SHOWN = false;
+                            PREV_DMG = CUR_DMG;
+                            PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
+                            clean_reset();
+                        }
+                        draw::Rect::full(width, height)
+                    } else {
+                        let c = unsafe { if CLOCK_ONLY { CLOCK_RECT.clip(width, height) } else { PREV_DMG.union(CUR_DMG).clip(width, height) } };
+                        unsafe { PREV_DMG = CUR_DMG };
+                        c
+                    };
                     // The finished frame out. Temporal: into the next phase, armed without waiting for it to go out (only for the previous frame to have started); the layer flips to it at the next TE.
                     if ten && unsafe { TEMPORAL } {
                         pipe.settle(&mut armed, true);
@@ -4454,6 +4755,33 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             SEC_US[5] += SCENE_US[0];
                             SEC_US[6] += SCENE_US[1];
                             SEC_US[7] += CLEAR_US;
+                        }
+                        // Measuring the region's frames (COMPOSITOR.md): every 128 of them, the average front layer's draw, wait for the last frame and publish, the worst whole frame, and the pixels damaged a frame.
+                        if skip_scene {
+                            unsafe {
+                                let whole = ferros_sys::us_since(t_frame);
+                                REGION_US[0] += 1;
+                                REGION_US[1] += front_us;
+                                REGION_US[2] += PHASE_US[3];
+                                REGION_US[3] += PHASE_US[2];
+                                REGION_US[4] = REGION_US[4].max(whole);
+                                REGION_US[5] += if changed.is_empty() { 0 } else { ((changed.x1 - changed.x0) as u64) * ((changed.y1 - changed.y0) as u64) };
+                                if REGION_US[0] == 128 {
+                                    log.s(b"display: region, 128 frames: front ");
+                                    log.dec(REGION_US[1] / 128);
+                                    log.s(b" us, wait ");
+                                    log.dec(REGION_US[2] / 128);
+                                    log.s(b" us, publish ");
+                                    log.dec(REGION_US[3] / 128);
+                                    log.s(b" us a frame; worst frame ");
+                                    log.dec(REGION_US[4]);
+                                    log.s(b" us; damage ");
+                                    log.dec(REGION_US[5] / 128 / 1000);
+                                    log.s(b" kpx a frame\n");
+                                    log.flush();
+                                    REGION_US = [0; 6];
+                                }
+                            }
                         }
                         out[1] = 1;
                         len = 2;
@@ -4654,15 +4982,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     }
                     last_interaction = 0;
                 }
-                Some(16) if m.len() >= 11 => {
-                    let v = |i: usize| i16::from_le_bytes([m[i], m[i + 1]]) as isize;
-                    let r = u16::from_le_bytes([m[5], m[6]]) as isize;
-                    let colour = 0xFF00_0000 | u32::from_le_bytes([m[7], m[8], m[9], m[10]]) & 0x00FF_FFFF;
-                    let r = draw::disc(pixels, width, height, ((v(1) as i64) << 8) + 128, ((v(3) as i64) << 8) + 128, (r as i64) << 8, colour & 0x00FF_FFFF);
-                    unsafe { CUR_DMG = CUR_DMG.union(r) };
-                }
                 Some(17) if m.len() >= 12 => {
-                    unsafe { LAST_FRAME.1 = 0 };
+                    unsafe {
+                        LAST_FRAME.1 = 0;
+                        SCENE_GEN = SCENE_GEN.wrapping_add(1);
+                    }
                     let i = m[1] as usize;
                     if i < unsafe { SCENE_N } {
                         let i32le = |k: usize| i32::from_le_bytes([m[k], m[k + 1], m[k + 2], m[k + 3]]);
@@ -4725,7 +5049,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                                 for x in 0..width {
                                     let c = if x >= cl && x < cr { bw[x] } else { CLEAR };
                                     // The canvas with the wallpaper under it, as publish_band puts it.
-                                    let scene = if unsafe { WALL_ON } { draw::under(pixels[y * width + x], unsafe { *(WALL_BUF as *const u64).add(y * width + x) }) } else { pixels[y * width + x] };
+                                    let canvas = if unsafe { REGION_ON } { draw::under(unsafe { *(ARENA as *const u64).add(y * width + x) }, pixels[y * width + x]) } else { pixels[y * width + x] };
+                                    let scene = if unsafe { WALL_ON } { draw::under(canvas, unsafe { *(WALL_BUF as *const u64).add(y * width + x) }) } else { canvas };
                                     s[y * width + x] = glass_front(x, g, edge_px, c, scene & ((1 << 48) - 1));
                                 }
                             }
