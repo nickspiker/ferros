@@ -1271,22 +1271,40 @@ impl Map {
         call(self.display, &m, &mut r);
     }
 
-    /// The camera that shows every circle with air around them, never closer than one world unit to a pixel.
+    /// The camera that shows every circle with air around them, never closer than one world unit to a pixel: every circle inside the screen's width and the big circle (`active_circle`) together, so none lands past an edge or under the console in a top corner (owner, 2026-11-08: "the fit doesn't fit to screen extents anded with the big circle"). The turn is kept; the circles' bounds are taken as the screen will turn them, their middle put on the big circle's centre, and the zoom is the largest at which each circle passes both tests, seven eighths of the way.
     fn home(&self) -> Cam {
-        let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+        let (c, s, one) = (self.cam.c as f64, self.cam.s as f64, ONE as f64);
+        // A world offset (×256) turned as `Cam::screen` turns it.
+        let turn = |x: f64, y: f64| ((c * x - s * y) / one, (s * x + c * y) / one);
+        let (mut u0, mut v0, mut u1, mut v1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for i in 0..self.n {
-            let r = self.rs[i] << 8;
-            x0 = x0.min(self.xs[i] - r);
-            y0 = y0.min(self.ys[i] - r);
-            x1 = x1.max(self.xs[i] + r);
-            y1 = y1.max(self.ys[i] + r);
+            let (u, v) = turn(self.xs[i] as f64, self.ys[i] as f64);
+            let r = (self.rs[i] << 8) as f64;
+            u0 = u0.min(u - r);
+            v0 = v0.min(v - r);
+            u1 = u1.max(u + r);
+            v1 = v1.max(v + r);
         }
-        // Zoom so the bounds take seven eighths of the panel either way.
-        let (bw, bh) = (((x1 - x0) >> 8).max(1), ((y1 - y0) >> 8).max(1));
-        let z = ((self.w * 7 / 8) << 16) / bw;
+        let (um, vm) = ((u0 + u1) * 0.5, (v0 + v1) * 0.5);
+        // The middle back into the world: the turn undone (its transpose).
+        let (wx, wy) = ((c * um + s * vm) / one, (c * vm - s * um) / one);
+        let (_, ay, ar) = self.arrived();
+        let (half_w, ar) = (self.w as f64 * 0.5, ar as f64);
+        // The zoom (Q16 pixels a world unit; a world offset ×256 is (d / 256) · (z / 2¹⁶) pixels): each circle's farthest reach across, |du| + r, within the half width, and its farthest reach from the big circle's centre, √(du² + dv²) + r, within its radius.
+        let room = (7. / 8.) * (1u64 << 24) as f64;
+        let mut z = f64::MAX;
+        for i in 0..self.n {
+            let (u, v) = turn(self.xs[i] as f64, self.ys[i] as f64);
+            let (du, dv, r) = (u - um, v - vm, (self.rs[i] << 8) as f64);
+            z = z.min(room * half_w / (du.abs() + r)).min(room * ar / (libm::sqrt(du * du + dv * dv) + r));
+        }
         let (lo, hi) = self.zoom_limits();
-        let z = z.min(((self.h * 7 / 8) << 16) / bh).clamp(lo, hi);
-        Cam { x: (x0 + x1) / 2, y: (y0 + y1) / 2, z, c: self.cam.c, s: self.cam.s }
+        let mut cam = Cam { x: wx as i64, y: wy as i64, z: (z as i64).clamp(lo, hi), c: self.cam.c, s: self.cam.s };
+        // The camera's centre is the panel's: it stands off the fit's middle by the big circle's offset from the panel's centre, as `at` does.
+        let (dx, dy) = cam.delta(0, self.h / 2 - ay);
+        cam.x += dx;
+        cam.y += dy;
+        cam
     }
 
     /// The camera that has arrived at circle i: the circle on the active circle (`arrived`), the circle an app lives in, however much larger than the screen that is (no zoom limit here: arriving, the map's own circle becomes the app's). The camera's centre is the panel's, so it stands off the circle's centre by the active circle's offset from the panel's centre, in world units at the arrived zoom.
