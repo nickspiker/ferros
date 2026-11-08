@@ -4465,8 +4465,6 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     // The open circle as an app's region (a region op before this one, COMPOSITOR.md): the front layer brought up to this frame, and the clean window made if it is not current; while it is, no scene is drawn and only what the front changed is published. A full frame without a region op ends the region.
                     let region = if clip_k.is_none() { unsafe { core::mem::take(&mut *(&raw mut REGION_REQ)) } } else { None };
                     let (mut skip_scene, mut remade, mut front_dmg, mut front_us, t_frame) = (false, false, draw::Rect::EMPTY, 0u64, now());
-                    // The open circle's ground while the clean window is made: a circle it hides whole is not drawn at all (below).
-                    let mut cover: Option<(i64, i64, i64)> = None;
                     let ground = |q: &[u8; 10]| {
                         let i16q = |i: usize| i16::from_le_bytes([q[i], q[i + 1]]) as i64;
                         ((i16q(0) << 8) + 128, (i16q(2) << 8) + 128, (u16::from_le_bytes([q[4], q[5]]) as i64) << 8, u32::from_le_bytes([q[6], q[7], q[8], q[9]]) & 0x00FF_FFFF)
@@ -4494,10 +4492,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             if CLEAN_KEY == Some(key) {
                                 skip_scene = true;
                             } else {
-                                // The clean window: the canvas cleared, the circle's ground, and the scene under it (below), once.
+                                // The clean window: the canvas cleared and the circle's ground, once.
                                 draw::clear(pixels, width, PREV_DMG.clip(width, height));
                                 let (gx, gy, gr, gc) = ground(&q);
-                                cover = Some((gx, gy, gr));
                                 CUR_DMG = draw::disc(pixels, width, height, gx, gy, gr, gc);
                                 CLEAN_KEY = Some(key);
                                 remade = true;
@@ -4520,7 +4517,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             }
                         }
                     }
-                    let scene_n = if skip_scene { 0 } else { unsafe { SCENE_N } };
+                    // The clean window is the open circle's ground alone (owner, 2026-11-07: "can we not draw any other circles other than the nav and console?"): no circle of the map, not the open one's own mark, no glow; the bars are their own layer.
+                    let scene_n = if skip_scene || remade { 0 } else { unsafe { SCENE_N } };
                     let mut t_phase = now();
                     unsafe { SCENE_US = [0; 3]; PUB_TICKS = [0; 3]; PUB_BLOCKS = [0; 3] };
                     let (wq, hq) = ((width as i64) << 7, (height as i64) << 7);
@@ -4553,13 +4551,6 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         }
                         if sr < 256 || sx + sr < 0 || sx - sr > (width as i64) << 8 || sy + sr < 0 || sy - sr > (height as i64) << 8 {
                             continue;
-                        }
-                        // Hidden whole behind the open circle's opaque ground, the clean window's front: opaque in front stops the walk, for a whole shape as for a pixel (owner, 2026-11-07: the mark is not to be touched at all once opened). Its glow, which reaches past the ground's rim, went in above.
-                        if let Some((gx, gy, gr)) = cover {
-                            let (dx, dy) = (sx - gx, sy - gy);
-                            if gr >= sr && dx * dx + dy * dy <= (gr - sr) * (gr - sr) {
-                                continue;
-                            }
                         }
                         // Importance is the ring's weight, in screen pixels so it stays legible at every zoom: thin 4 % (at least a pixel), heavy 12 % (at least two).
                         // No stroke: the circle's image reaches its radius, so circles touch; importance is the glow, drawn after every circle (below).
