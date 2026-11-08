@@ -499,11 +499,12 @@ pub fn wallgen_after_unlock(seed: [u8; 32]) {
 
 /// wallgen (payloads/wallgen) with the person's wallpaper seed as its input, from its capsule in the kernel's vault: it makes their wallpaper once on this device and keeps it in their space, or ends at once if it already has. 1 the vault scope `map.`, 2 use display. Started from the service loop, after an unlock (an unlock is a syscall, under the kernel's lock: no spawn there).
 fn spawn_wallgen(store: &mut Option<ShimStore>, seed: &[u8; 32]) {
-    let Some(capsule) = store.as_mut().and_then(|s| s.get_by_key("wallgen").ok().flatten()) else {
+    // Under the kernel lock, as every UFS command must be: the vault process drives the same controller from the workers (SYS_BLOCK), and a read outside the lock collided with its moves at an attest and wedged the link (2026-11-07).
+    let Some(capsule) = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("wallgen").ok().flatten())) else {
         crate::process::push_console(b"home: no wallgen capsule in the vault; the display draws the wallpaper at every attest\n");
         return;
     };
-    let sealed = store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten()).unwrap_or_default();
+    let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
     use crate::process::Grant::*;
     match crate::process::spawn_capsule(b"wallgen", &capsule, seed, &[Store(b"map"), Use(b"display")], &sealed) {
         Ok(o) => {
@@ -663,9 +664,9 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
         crate::process::push_console(b"home: no init capsule in the vault\n");
         return true;
     };
-    let sealed = store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten()).unwrap_or_default();
+    let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
     // The vault process first (VAULT-OUT.md, decision 0), so it is serving when the processes init starts ask for what they keep; until it is, the kernel's vault answers them. Its capsule rides in the kernel's vault for now (`vault`, kept by the kernel: never forwarded, never moved); the kernel image carries it once the kernel keeps no disk of its own. None stored: every store call is the kernel's vault's, as before.
-    if let Some(vc) = store.as_mut().and_then(|s| s.get_by_key("vault").ok().flatten()) {
+    if let Some(vc) = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("vault").ok().flatten())) {
         match crate::process::spawn_capsule(b"vault", &vc, b"", &vault_grants(), &sealed) {
             Ok(o) => {
                 mark_ran(&o);
