@@ -1743,6 +1743,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // A session that began on one of the helm's corner circles (the display's op 41: 8 home, 9 back; 0 none), and where its first finger is now: the system's gesture, never a pan (owner, 2026-11-07: from the home circle to the centre and let go, full screen on or off).
     let mut corner = 0u8;
     let mut corner_at = (0i64, 0i64);
+    // Where that finger landed, and whether the corner has acted this touch.
+    let mut corner_from = (0i64, 0i64);
+    let mut corner_done = false;
     let mut start = [(false, 0i64, 0i64); 16];
     // The circle the fingers hold, decided again whenever the number of moving fingers changes (one finger: the circle it started on; two: the circle both are inside), and for how many fingers it was decided.
     let mut grab: Option<usize> = None;
@@ -1907,6 +1910,14 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             let hit = if call(map.display, &[41, xb[0], xb[1], yb[0], yb[1]], &mut q) >= 1 { q[0] } else { 0xFF };
             corner = if hit == 8 || hit == 9 { hit } else { 0 };
             corner_at = (f.1, f.2);
+            corner_from = (f.1, f.2);
+            corner_done = false;
+            // Measuring (the first cut did not fire for the owner): a touch in the bottom sixth, what the display said is under it.
+            if f.2 > h - h / 6 {
+                let mut l = Line::new();
+                let _ = write!(l, "map: touch down at {},{}: corner {}\n", f.1, f.2, hit);
+                console(grants, l.as_str().as_bytes());
+            }
         }
         if down {
             most = most.max(held);
@@ -1921,23 +1932,37 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             if corner != 0 && held >= 1 {
                 corner_at = (cur[ids[0]].1, cur[ids[0]].2);
+                // The swipe inward: the finger's travel along the line from where it landed toward the screen's centre. Past a twelfth of the screen's harmonic span (2wh/(w+h); owner, 2026-11-07), the corner acts, once a touch: home, full screen on or off (op 43); back, the map zoomed out to every circle (`home`), the map being recents (WINDOWS.md).
+                let (ux, uy) = ((w / 2 - corner_from.0) as f64, (h / 2 - corner_from.1) as f64);
+                let inward = ((corner_at.0 - corner_from.0) as f64 * ux + (corner_at.1 - corner_from.1) as f64 * uy) / libm::sqrt(ux * ux + uy * uy);
+                let span = (2 * w * h) as f64 / (w + h) as f64;
+                if !corner_done && inward > span / 12. {
+                    corner_done = true;
+                    if corner == 8 {
+                        let mut q = [0u8; 4];
+                        let n = call(map.display, &[43], &mut q);
+                        console(grants, if n >= 2 && q[1] == 1 { b"map: full screen\n" } else { b"map: full screen off\n" });
+                    } else {
+                        // An open circle closes on the way, as a tap outside it does: the view is the plane once the camera lands (`step_cam`).
+                        if matches!(map.view, View::Open(_)) {
+                            map.back = None;
+                            map.leaving = true;
+                        }
+                        let to = map.home();
+                        map.fly(to);
+                        map.draw();
+                        console(grants, b"map: back: zoomed out to every circle\n");
+                    }
+                }
             }
         }
         if held == 0 && down {
             down = false;
-            // A corner's session let go: from the home circle to the screen's centre (within a quarter of the narrower side), full screen on or off (the display's op 43). Back's slide waits for the owner's word on what it opens (WINDOWS.md: the map is already recents).
-            // A still tap on a corner circle is a tap as before (on the home circle it closes the open settings); only a slide is the corner's.
+            // A corner's session let go: it acted while moving (above), if it went far enough inward. A still tap on a corner circle is a tap as before (on the home circle it closes the open settings).
             if corner != 0 && !moved {
                 corner = 0;
             }
             if corner != 0 {
-                let (dx, dy) = (corner_at.0 - w / 2, corner_at.1 - h / 2);
-                let reach = w.min(h) / 4;
-                if corner == 8 && dx * dx + dy * dy < reach * reach {
-                    let mut q = [0u8; 4];
-                    let n = call(map.display, &[43], &mut q);
-                    console(grants, if n >= 2 && q[1] == 1 { b"map: full screen\n" } else { b"map: full screen off\n" });
-                }
                 corner = 0;
                 continue;
             }
