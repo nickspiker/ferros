@@ -490,6 +490,30 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     ]
 }
 
+/// The person's wallpaper seed from their last unlock (kvault `unlock`), waiting for the service loop to start wallgen with it.
+static mut WALLGEN_SEED: Option<[u8; 32]> = None;
+
+pub fn wallgen_after_unlock(seed: [u8; 32]) {
+    unsafe { WALLGEN_SEED = Some(seed) };
+}
+
+/// wallgen (payloads/wallgen) with the person's wallpaper seed as its input, from its capsule in the kernel's vault: it makes their wallpaper once on this device and keeps it in their space, or ends at once if it already has. 1 the vault scope `map.`, 2 use display. Started from the service loop, after an unlock (an unlock is a syscall, under the kernel's lock: no spawn there).
+fn spawn_wallgen(store: &mut Option<ShimStore>, seed: &[u8; 32]) {
+    let Some(capsule) = store.as_mut().and_then(|s| s.get_by_key("wallgen").ok().flatten()) else {
+        crate::process::push_console(b"home: no wallgen capsule in the vault; the display draws the wallpaper at every attest\n");
+        return;
+    };
+    let sealed = store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten()).unwrap_or_default();
+    use crate::process::Grant::*;
+    match crate::process::spawn_capsule(b"wallgen", &capsule, seed, &[Store(b"map"), Use(b"display")], &sealed) {
+        Ok(o) => {
+            mark_ran(&o);
+            crate::process::push_console(&o.console);
+        }
+        Err(e) => crate::process::push_console(alloc::format!("home: wallgen refused: {e}\n").as_bytes()),
+    }
+}
+
 /// The vault process's capabilities (payloads/vault: 1 serve `vault`, 2 the `vault` block window, 3 entropy, 4 the vault right). Not init's to hand out: the kernel starts it before init (VAULT-OUT.md, decision 0), and init's grants page is full.
 fn vault_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     use crate::process::Grant::*;
@@ -1225,6 +1249,10 @@ pub fn run(mut b: Boot) -> ! {
     platform::mark(0x3A);
     loop {
         platform::pet_watchdogs();
+        // A person unlocked: wallgen, once (`spawn_wallgen`).
+        if let Some(seed) = unsafe { (*(&raw mut WALLGEN_SEED)).take() } {
+            spawn_wallgen(&mut store, &seed);
+        }
         // A status circle tapped (preference 15, owner 2026-11-07): a radio switched off has its driver stopped and, where the kernel holds its power switch (Bluetooth, NFC, GPS), its chip powered down; switched on, its driver starts again from its capsule. Cellular and WiFi have no kernel switch: their drivers stop, the modem staying as it was until a power-down of its own exists.
         let radios_off = crate::process::pref(crate::process::PREF_RADIOS_OFF) & 0x1F;
         if radios_off != radios_applied {

@@ -417,6 +417,8 @@ impl KVault {
         if keep {
             self.raw_put(ID_UNLOCK, seed)?;
         }
+        // The person's wallpaper seed for wallgen (payloads/wallgen), which makes their wallpaper once on this device and keeps it: derived one way, as the attest screen derives it (ahau_core::wallpaper_seed, the same context), so nothing of the identity seed leaves here.
+        crate::service::wallgen_after_unlock(blake3::derive_key("ferros 2026-11-07 wallpaper seed", seed));
         Ok(())
     }
 
