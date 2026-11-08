@@ -2199,6 +2199,21 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params.starts_with(b"key ") {
+                    // `diag key power` (docs/INPUT-INJECT.md, `ferros-bridge input key`): a press of the power key put where its interrupt puts one (`__power_pressed`, main.rs `.Lirq_power`), so the screen toggle below and the proximity wake rule take it as they take a finger's. Refused while a volume key is physically down: the press would make a chord with it (power + volume up is the hv's jump under Android, both volume keys the kill), and no chord is ever injected. The volume keys themselves have nothing to inject into: the killswitch and the gate read their pins' levels, and nothing queues their presses.
+                    if cmd.params == b"key power" {
+                        if crate::killswitch::volume_key_down() {
+                            resp.extend_from_slice(b"key power refused: a volume key is held, and a press now would be a chord\n");
+                        } else {
+                            unsafe { core::ptr::write_volatile(&raw mut crate::__power_pressed, 1) };
+                            resp.extend_from_slice(b"key power pressed\n");
+                        }
+                    } else {
+                        resp.extend_from_slice(b"key: only `key power`; the volume keys are read as levels (the killswitch, the gate) and nothing queues their presses\n");
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params == b"console" {
                     // What processes have sent their consoles since the last read (background slices included), and how many are alive.
                     append_hex(&mut resp, b"ALIVE=", crate::process::alive() as u32);
