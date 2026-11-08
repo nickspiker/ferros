@@ -67,9 +67,9 @@ pub fn grants() -> u64 {
     GRANTS.load(Ordering::Relaxed)
 }
 
-/// How many grants the process holds (the page's first word).
+/// How many grants the process holds: the u32 at 0x200, after the handle table (SANDBOX.md, "Handles"; the kernel's process.rs TOKENS). Read at +0 since the table moved in (2026-11-03) this was the console's handle base, zero, so no grant was ever probed: the entropy grant went unfound and std fell back to its mixer.
 pub fn grant_count() -> u64 {
-    unsafe { ((sys::arc_base() + grants()) as *const u32).read_volatile() as u64 }
+    unsafe { ((sys::arc_base() + grants() + 0x200) as *const u32).read_volatile() as u64 }
 }
 
 /// The arc offset of grant `slot`'s 32-byte token (slot 0 is the console).
