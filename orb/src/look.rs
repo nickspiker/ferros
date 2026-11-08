@@ -344,31 +344,37 @@ pub struct Vessel {
 
 impl Vessel {
     /// `fl` the flavour as linear light; the green ring's `depth` from the edge, each ring's inner tail λ (`width`) and outer sharpness `sharp`, the channels' separation `sep` (blue that much further out, red half of it further in), all in r; the rings' light `rim_stops` over the flavour's and the body's `body_stops` under it.
-    /// The rings keep their places relative to each other, but the whole set moves out so the outermost ring the flavour has peaks one λ inside the edge, its cliff ending at the circle's radius: the colour reaches the tangent, so touching circles touch in colour (owner, 2026-11-07: "the widest colour is not tangent to the other circles, there's spaces between"). A channel the flavour lacks draws nothing and does not count; with none at all the rings stay where `depth` puts them.
+    /// The rings keep their places relative to each other, but the whole set moves out so the outermost ring the flavour has falls off its cliff to half its peak exactly at the circle's radius (`at` places it for the footprint): the colour's sharp outer edge is the circle, so tangent circles meet rim to rim at the tangent point, each at half its light there, with no background between and neither ring over the other (owner, 2026-11-07: "the widest colour is not tangent to the other circles, there's spaces between"; 2026-11-08: "the battery and GPS circles in the console overlap a smidge and some have 2-3px gaps"). A channel the flavour lacks draws nothing and does not count; with none at all the rings stay where `depth` puts them.
     pub fn new(fl: [f32; 3], depth: f32, width: f32, sharp: f32, sep: f32, rim_stops: f32, body_stops: f32) -> Vessel {
         let rim = rim_stops.exp2();
         let body = (-body_stops).exp2();
         let raw = [depth + sep * 0.5, depth, depth - sep];
         let outer = (0..3).filter(|&c| fl[c] > 0.).map(|c| raw[c]).fold(f32::MAX, f32::min);
-        let shift = if outer == f32::MAX { 0. } else { outer - width };
+        let shift = if outer == f32::MAX { 0. } else { outer };
         Vessel { ring_d: raw.map(|d| d - shift), lambda: width, sharp, ring_l: fl.map(|v| v * rim), body_l: fl.map(|v| v * body), body_edge: depth - shift }
     }
 
     /// The rings' layer and the body's layer at depth `d` = 1 − ρ from the edge (r), `fs` the sample's footprint (r).
     /// The rings, Lumis's shape made smooth: each channel peaks at its own depth, drops off a cliff on its outer side and fades e-fold every λ on its inner, exp(−s(e^{t/s} − 1 − t/s)) with t the depth above the peak in λ (C∞, its peak rounded where Lumis's is a point). The footprint widens λ by its box (variance fs²/12, the ring's light kept), and s so the cliff is never under a footprint.
-    /// The circle's own edge: a logistic (C∞) about a footprint wide at d = 0 (plus an eighth of λ, so it never becomes a step), so a ring pushed out by a wide separation is cut there and nothing is drawn outside.
-    /// The body: its tint, opaque but for 2⁻⁴ of the background, rising by a logistic (C∞) under the green ring, so nothing is drawn outside.
+    /// The circle's own edge is the outermost ring's cliff: every ring sits h deeper than `new` put it, h the distance outside its peak where the cliff is at half (h = x·s·λ' with λ' the widened λ and e^x − 1 − x = ln 2 / s), so the outermost ring is at half its light at d = 0 for any footprint. Past the edge the cliff falls faster than any exponential (under 2⁻²⁰ of the peak one λ out), so nothing is drawn outside and no second cut is needed: a cut there (the logistic this had) halved the light again at the radius and moved the visible edge inside it by a footprint.
+    /// The body: its tint, opaque but for 2⁻⁴ of the background, rising by a logistic (C∞) under the green ring, moved with the rings, so nothing is drawn outside.
     pub fn at(&self, d: f32, fs: f32) -> (G2t16, G2t16) {
         let le = (self.lambda * self.lambda + fs * fs / 12.).sqrt();
         let s = (self.sharp * self.sharp + fs * fs / (le * le * 12.)).sqrt();
-        let ew = (fs * fs + self.lambda * self.lambda / (1 << 6) as f32).sqrt();
-        let edge = 1. / (1. + (-d * 2. / ew).exp());
-        let amp = self.lambda / le * edge;
+        // h/s solves e^x − 1 − x = ln 2 / s by Newton from √(2 ln 2 / s), which is at or above the root (e^x − 1 − x ≥ x²/2): on a convex rising function the steps fall monotonically onto it, 2⁻²⁰ close by the fourth.
+        let c = core::f32::consts::LN_2 / s;
+        let mut x = (2. * c).sqrt();
+        for _ in 0..1 << 2 {
+            let ex = x.exp();
+            x -= (ex - 1. - x - c) / (ex - 1.);
+        }
+        let h = x * s * le;
+        let amp = self.lambda / le;
         let ring = [0, 1, 2].map(|c| {
-            let t = (self.ring_d[c] - d) / le;
+            let t = (self.ring_d[c] + h - d) / le;
             self.ring_l[c] * amp * (-s * ((t / s).exp() - 1. - t / s)).exp()
         });
-        let body_a = (1. - 1. / (1 << 4) as f32) / (1. + (-(d - self.body_edge) * 2. / le).exp());
+        let body_a = (1. - 1. / (1 << 4) as f32) / (1. + (-(d - self.body_edge - h) * 2. / le).exp());
         (light_layer(ring), tint_layer(self.body_l, body_a))
     }
 }
