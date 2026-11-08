@@ -211,7 +211,7 @@ fn send(bridge: &Path, s: &Script, doc_as_is: Option<&[u8]>) -> bool {
     true
 }
 
-/// Spawn `bin` named `name` with `input` (hex) and `grants`, and collect its console lines until one satisfies `last`. A process that waits on another (the display's frames, its answer) parks, and the spawn comes back before it is done: the rest is read off the console, a quarter second apart, for up to `secs` seconds.
+/// Spawn `bin` named `name` with `input` (hex) and `grants`, and collect its console lines until one satisfies `last`. A process that waits on another (the display's frames, its answer) parks, and the spawn comes back before it is done: the rest is read off the console, an eighth of a second apart (the first reader takes a line, so this one asks often), for up to `secs` seconds.
 fn spawn(bridge: &Path, bin: &Path, input: &str, name: &str, grants: &[&str], secs: u64, last: impl Fn(&str) -> bool) -> Vec<String> {
     let out = Command::new(bridge).arg("spawn").arg(bin).arg(input).args(["--name", name]).args(grants).output().unwrap_or_else(|e| fail(&format!("spawn: {e}")));
     if !out.status.success() {
@@ -220,15 +220,15 @@ fn spawn(bridge: &Path, bin: &Path, input: &str, name: &str, grants: &[&str], se
     let mut said = lines(&String::from_utf8_lossy(&out.stdout), name);
     // The console is one queue for every reader: another session's `diag console` takes these lines off it as readily as this one (2026-11-08, three answers lost while the other agents polled). So the process itself is watched too: once it has ended, one more read, and a missing answer is said to be missing rather than waited on.
     let tag = format!(" {name} (");
-    for k in 0..secs * 4 {
+    for k in 0..secs * 8 {
         if said.iter().any(|l| last(l)) {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::thread::sleep(std::time::Duration::from_millis(125));
         if let Ok(o) = Command::new(bridge).args(["diag", "console"]).output() {
             said.extend(lines(&String::from_utf8_lossy(&o.stdout), name));
         }
-        if k % 4 == 3 && !said.iter().any(|l| last(l)) {
+        if k % 8 == 7 && !said.iter().any(|l| last(l)) {
             let alive = Command::new(bridge).args(["diag", "threads"]).output().map(|o| String::from_utf8_lossy(&o.stdout).contains(&tag)).unwrap_or(true);
             if !alive {
                 if let Ok(o) = Command::new(bridge).args(["diag", "console"]).output() {

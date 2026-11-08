@@ -36,6 +36,8 @@ Every command prints the script it sends, one line per event with the frame it l
 
 Pinch and rotate ask the display for the panel's size, so the two fingers' path is round on the glass and not stretched by its aspect.
 
+**The report comes off the console, which every reader shares.** The inject process waits on the display's frames, so the spawn returns before the process is done, and its report has to be read from `diag console`. That console is one queue: whoever reads first takes a line. To get its line first, the bridge reads every eighth of a second. It also watches `diag threads`, and when the process has ended and someone else took its line, it says so (`its report was taken off the console by another reader`) instead of waiting.
+
 Why the defaults:
 - **The tap's 8 frames:** the map reads touch a thirtieth of a second apart at rest (four frames at 120 Hz). A shorter press can come and go between two reads.
 - **The 8 frames still before a swipe moves:** a finger already moving when it is first seen is first seen somewhere else. On 2026-11-08 the home corner's swipe was read inside the app's circle.
