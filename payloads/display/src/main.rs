@@ -1429,11 +1429,27 @@ fn fps_dot(mask: u32, width: usize, height: usize) {
 
 /// What each phase frame has not yet been given of the current content, as one rectangle (empty = current): a present writes only the phase on the layer (all four took 71 ms a frame, 2026-10-22) and adds what it changed to the others' rectangles; the idle loop brings the others up to date one at a time; the flip only moves to a phase that is current.
 static mut PHASE_DIRTY: [draw::Rect; PHASES] = [draw::Rect { x0: 0, y0: 0, x1: 4096, y1: 4096 }; PHASES];
-/// Compose once (COMPOSITOR.md step 2): a byte per 16-pixel block of the screen, bit k set while phase k holds there only the background as it was published (the wallpaper, or black), so a publish over that block with the canvas still empty writes nothing (`publish_band`). Cleared whole whenever the background or the table changes (`clean_reset`): a new wallpaper, a brightness, windows, full screen.
+/// Compose once (COMPOSITOR.md step 2): a byte per 16-pixel block of the screen. Bits 4-7, one a phase (`WALL_BIT`): phase k holds there only the background as it was published (the wallpaper, or black), whatever the screen is doing, so a block with nothing in front of the background is not written again. Bits 0-3: phase k holds there what the mode's own skip asks (an open circle's region: its clean window with no text in front), cleared at every change of mode (`clean_reset`). Both cleared whenever the background itself or the table changes (`clean_reset_all`): a new wallpaper, a brightness, windows, full screen. (Until 2026-11-08 one bit served both, and every open, close and flight forgot the wallpaper the phases held: the next four frames presented the whole screen again, 24 ms each.)
 static mut CLEAN: usize = 1;
 static mut CLEAN_W: usize = 0;
 
+/// Phase k's background bit in a `CLEAN` byte.
+#[inline(always)]
+fn wall_bit(k: usize) -> u8 {
+    1 << (4 + k)
+}
+
+/// A change of mode (a region opened or closed, a flight begun or ended): the mode's bits forgotten, the background's kept.
 fn clean_reset() {
+    unsafe {
+        if CLEAN_W > 0 {
+            core::slice::from_raw_parts_mut(CLEAN as *mut u8, CLEAN_W * SCREEN_WH.1 as usize).iter_mut().for_each(|b| *b &= 0xF0);
+        }
+    }
+}
+
+/// The background or the table changed: everything forgotten.
+fn clean_reset_all() {
     unsafe {
         if CLEAN_W > 0 {
             core::slice::from_raw_parts_mut(CLEAN as *mut u8, CLEAN_W * SCREEN_WH.1 as usize).fill(0);
@@ -1607,8 +1623,11 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                         any |= *ask.add(x + j);
                     }
                     let ci = y * clean_w + x / 16;
-                    let bit = 1u8 << k;
-                    if !glass && any == 0 && clean[ci] & bit != 0 {
+                    let (bit, wbit) = (1u8 << k, wall_bit(k));
+                    // Nothing in front of the background here: the canvas empty, and with a region up its text too (the clean window is the canvas then).
+                    let bare = any == 0 && (text_layer == 0 || (0..16).all(|j| *src.add(x + j) == 0));
+                    // Skipped where this phase holds just the background (its bit kept across every change of mode), or, a region's, where it holds the clean window with no text in front.
+                    if !glass && ((bare && clean[ci] & wbit != 0) || (text_layer != 0 && any == 0 && clean[ci] & bit != 0)) {
                         if run < x {
                             dst[y * width + run..y * width + x].copy_from_slice(&row[run..x]);
                             PUB_TICKS[2] += (x - run) as u64;
@@ -1643,7 +1662,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                         src.add(x) as *const u64
                     };
                     if glass {
-                        clean[ci] &= !bit;
+                        clean[ci] &= !(bit | wbit);
                         let mut front = [0u64; 16];
                         for j in 0..16 {
                             let xx = x + j;
@@ -1654,11 +1673,9 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                         neon::sixteen_app(tabs, front.as_ptr(), row.as_mut_ptr().add(x), neon::thresholds_at(thv, x));
                     } else {
                         neon::sixteen_canvas(tabs, scene_at as *const Px, row.as_mut_ptr().add(x), thv);
-                        if any == 0 {
-                            clean[ci] |= bit;
-                        } else {
-                            clean[ci] &= !bit;
-                        }
+                        // The background alone, or not; and a region's clean window with no text, or not (off the region, the mode's bit says nothing).
+                        let b = if bare { wbit } else { 0 } | if text_layer != 0 && any == 0 { bit } else { 0 };
+                        clean[ci] = clean[ci] & !(bit | wbit) | b;
                     }
                     x += 16;
                 }
@@ -2399,7 +2416,8 @@ unsafe fn flight_publish_row(f: &FlightFrame, canvas: *const u64, width: usize, 
             }
         };
         let (el, er, cl, cr) = edges;
-        let bit = 1u8 << k;
+        // The flight asks only the background's bit (`wall_bit`): the mode's own is cleared where it writes.
+        let (bit, wbit) = (1u8 << k, wall_bit(k));
         let mut x = x0;
         let mut run = x0;
         let mut cur = block(x0 / 16);
@@ -2408,7 +2426,7 @@ unsafe fn flight_publish_row(f: &FlightFrame, canvas: *const u64, width: usize, 
             let ci = y * clean_w + bi;
             let glass = x < el || x + 16 > er || bars_in(bw, cl, cr, x);
             let nxt = if x + 16 < x1 { block(bi + 1) } else { None };
-            if cur.is_none() && !glass && clean[ci] & bit != 0 {
+            if cur.is_none() && !glass && clean[ci] & wbit != 0 {
                 if run < x {
                     dst[y * width + run..y * width + x].copy_from_slice(&row[run..x]);
                 }
@@ -2428,17 +2446,17 @@ unsafe fn flight_publish_row(f: &FlightFrame, canvas: *const u64, width: usize, 
                     front[j] = glass_front(xx, g, edge_px, c, p & ((1 << 48) - 1));
                 }
                 neon::sixteen_app(tabs, front.as_ptr(), row.as_mut_ptr().add(x), neon::thresholds_at(thv, x));
-                clean[ci] &= !bit;
+                clean[ci] &= !(bit | wbit);
             } else if let Some(c) = cur {
                 // Spread toward the next block's first codes, or held at this block's last where it has none.
                 let n = nxt.unwrap_or([vdupq_laneq_u16::<7>(c[0]), vdupq_laneq_u16::<7>(c[1]), vdupq_laneq_u16::<7>(c[2])]);
                 neon::dither_pack(neon::spread16(c, n), thv, row.as_mut_ptr().add(x));
-                clean[ci] &= !bit;
+                clean[ci] &= !(bit | wbit);
             } else {
                 // Only the wallpaper (or black) here, which this phase does not hold yet: presented at full resolution, and then it does.
                 let src = if wall != 0 { (wall as *const u64).add(y * width + x) } else { ZERO16.as_ptr() };
                 neon::sixteen_canvas(tabs, src, row.as_mut_ptr().add(x), thv);
-                clean[ci] |= bit;
+                clean[ci] = clean[ci] & !bit | wbit;
             }
             x += 16;
             cur = nxt;
@@ -3095,7 +3113,7 @@ fn windows_changed(width: usize, height: usize) {
     layout_build(width, height);
     unsafe {
         PHASE_DIRTY = [full; PHASES];
-        clean_reset();
+        clean_reset_all();
         if (*(&raw const WINS)).iter().all(|w| w.is_none()) {
             APP = None;
             PREV_DMG = full;
@@ -3466,6 +3484,7 @@ fn wall_step(grants: u64, width: usize, height: usize) {
                 WALL_MASK = alloc::vec![0u8; wallpaper::mask_stride(width) * height].leak().as_mut_ptr() as usize;
             }
             WALL_ON = false;
+            clean_reset_all();
             WALL_P = Some(wallpaper::params(&seed, width, height));
             WALL_BASE = (WALL_PASSES.load(Ordering::Acquire), now());
             WALL_RUNNING = true;
@@ -3501,7 +3520,7 @@ fn wall_ready(width: usize, height: usize) {
     unsafe {
         WALL_ON = true;
         PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
-        clean_reset();
+        clean_reset_all();
     }
 }
 
@@ -5685,6 +5704,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             // Every phase now holds the ramps; the next frame of the map starts from a clear screen (its first publish covers everything).
                             unsafe {
                                 PHASE_DIRTY = [draw::Rect::EMPTY; PHASES];
+                                clean_reset_all();
                                 PREV_DMG = draw::Rect::full(width, height);
                             }
                         } else {
@@ -5851,7 +5871,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     unsafe {
                         FULL = !FULL;
                         PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
-                        clean_reset();
+                        clean_reset_all();
                         out[1] = FULL as u8;
                     }
                     last_interaction = 0;
@@ -5886,6 +5906,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         let mut seed = [0u8; 32];
                         seed.copy_from_slice(&m[1..33]);
                         unsafe { WALL_ON = false };
+                        clean_reset_all();
                         if wall_own(grants, width, height, b"wallpaper") {
                             console(grants, b"display: wallpaper: the person's own\n");
                             wall_ready(width, height);
@@ -6504,7 +6525,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             let full = draw::Rect::full(width, height);
             unsafe {
                 PHASE_DIRTY = [full; PHASES];
-                clean_reset();
+                clean_reset_all();
             }
             let mut pub_us = 0u64;
             if unsafe { TEMPORAL } && client_owned {
