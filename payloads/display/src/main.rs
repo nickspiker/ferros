@@ -2866,8 +2866,8 @@ fn fold(acc: u64, t: u64, p: u64, mode: u8) -> (u64, u64) {
 
 /// The glass's own corner radius, in panel pixels: a fact of this panel to be tuned on the device (owner, 2026-11-02: "we'll fine tune the radius on this device to squeeze as much out of it"). Android reports 68 at its 1008-wide frame, 91 at the full raster.
 const GLASS_RADIUS: f32 = 80.0;
-/// akita's AK3B (1080 × 2400): Android reports 128 (its device overlay's rounded_corner_radius, device/google/akita) where it reports husky's 91. First taken in husky's tuned proportion (80 of 91), 112.5; on the glass the small corners then had about 8 px to spare (owner, 2026-11-08), and 98 cut the small corner's diagonal 8.1 px less (64.8 to 56.7 px along it, exponent 4); then the owner, on the glass: "Let's try 2px smaller radius", 96 (fluor's exponent goes to 5 there: the small corner 303.7 px long and squarer, its diagonal cut 55.6 px). Tuned further with op 52 (tools/akita-glass.sh corner).
-const GLASS_RADIUS_AKITA: f32 = 96.0;
+/// akita's AK3B (1080 × 2400): Android reports 128 (its device overlay's rounded_corner_radius, device/google/akita) where it reports husky's 91. First taken in husky's tuned proportion (80 of 91), 112.5; on the glass the small corners then had about 8 px to spare (owner, 2026-11-08), and 98 cut the small corner's diagonal 8.1 px less (64.8 to 56.7 px along it, exponent 4); then the owner, on the glass: "Let's try 2px smaller radius", 96 (fluor's exponent goes to 5 there: the small corner 303.7 px long and squarer, its diagonal cut 55.6 px). Then "1 more px smaller and then I think we got it": 95, the owner's value. Tuned with op 52 (tools/akita-glass.sh corner).
+const GLASS_RADIUS_AKITA: f32 = 95.0;
 
 /// 1 while a development drawing (op 52) holds every phase: nothing else is published until it is released.
 static RAW_HOLD: AtomicU64 = AtomicU64::new(0);
