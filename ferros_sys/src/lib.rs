@@ -102,8 +102,11 @@ pub fn device_base() -> u8 {
 
 /// The bottom of the camera cutout, in panel rows: a fact of this panel, not a knob. husky's hole is centred at (672, 75) with radius 43.25 at 1344 x 2992 (Android's DisplayCutout for the physical raster), so its bottom edge is row 118.25.
 pub const CUTOUT_BOTTOM: f32 = 118.25;
-/// akita's (Pixel 8a, AK3B at 1080 x 2400): centred at (539.5, 68.71) with radius 33.72 (its device overlay's config_mainBuiltInDisplayCutout, device/google/akita), so its bottom edge is row 102.43.
-pub const CUTOUT_BOTTOM_AKITA: f32 = 102.43;
+/// akita's (Pixel 8a, AK3B at 1080 x 2400), measured on the glass (owner, 2026-11-08, tools/cutout-scan: the 3148 pixels the hole hides completely, marked one by one, then checked white on black in a dark room, nothing lit): rows 37 to 100, every row centred on x 539.5, top and bottom mirror images about y 69.0. The knockout (the glass mask over the hole) is the smallest circle that covers every one of those pixels whole: radius 32.30 about (539.5, 69.0), the farthest dead pixel's centre 31.80 out plus half a pixel, so its antialiased ramp lands only on live pixels. Its bottom edge, row 101.30, is what the app circle is tangent to. Google's overlay (config_mainBuiltInDisplayCutout) says (539.5, 68.71) radius 33.72.
+pub const CUTOUT_BOTTOM_AKITA: f32 = 101.30;
+/// The camera hole's knockout, the glass mask's circle over it: centre and radius in panel pixels (pixel edges: column x spans x..x + 1). husky's is Android's figure until measured on its glass (tools/cutout-scan); akita's measured (`CUTOUT_BOTTOM_AKITA`).
+pub const CUTOUT_HOLE: (f32, f32, f32) = (672.0, 75.0, 43.25);
+pub const CUTOUT_HOLE_AKITA: (f32, f32, f32) = (539.5, 69.0, 32.3002);
 
 /// The board fact (SYS_FACTS 84: 1 husky, 2 akita) as first read, 0 until then: it does not change while a process runs.
 static BOARD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -121,6 +124,11 @@ pub fn akita() -> bool {
 /// This panel's cutout bottom (`CUTOUT_BOTTOM`, `CUTOUT_BOTTOM_AKITA`).
 pub fn cutout_bottom() -> f32 {
     if akita() { CUTOUT_BOTTOM_AKITA } else { CUTOUT_BOTTOM }
+}
+
+/// This panel's camera hole (`CUTOUT_HOLE`, `CUTOUT_HOLE_AKITA`): centre x, centre y, radius.
+pub fn cutout_hole() -> (f32, f32, f32) {
+    if akita() { CUTOUT_HOLE_AKITA } else { CUTOUT_HOLE }
 }
 
 /// The circle an app lives in, on a `w` × `h` screen: centre and radius in pixels. Tangent to the bottom of the camera cutout and to the bottom of the screen, centred, so the corners outside it belong to the system (owner, 2026-11-02); the display draws its hairline, and every active app's page is inscribed in it (owner, 2026-11-05: the settings page fills it, the attest mark keeps its own smaller circle).
