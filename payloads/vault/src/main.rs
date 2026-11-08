@@ -16,7 +16,9 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use ferros_store::{Domain, Nonces, Store, Writer};
+use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use core::sync::atomic::{AtomicU64, AtomicUsize};
+use ferros_store::{Domain, Nonces, Opener, Sealed, Store, Writer};
 use ferros_sys::{cap, console, freq, now, ERR};
 use manifestus::{Block, BlockDev, DeletePolicy, Mirror, Vault};
 
@@ -99,7 +101,7 @@ impl BlockDev for Half {
     }
     fn read(&mut self, lba: u64, buf: &mut Block) -> manifestus::Result<()> {
         self.io(lba, 1)?;
-        if ferros_sys::block_read(cap(grants(), S_BLOCKS), self.base + lba, buf) != 0 {
+        if !blocks_read(self.base + lba, buf) {
             return Err(manifestus::Error::Corrupt(alloc::format!("block read failed at {lba}")));
         }
         Ok(())
@@ -111,25 +113,23 @@ impl BlockDev for Half {
         }
         Ok(())
     }
-    /// Up to RUN blocks a kernel call.
+    /// Up to `RUN_NOW` blocks a kernel call (one UFS command each on a kernel from 2026-11-08 on).
     fn read_run(&mut self, lba: u64, out: &mut [Block]) -> manifestus::Result<()> {
         self.io(lba, out.len() as u64)?;
-        for (k, chunk) in out.chunks_mut(RUN).enumerate() {
-            let bytes = unsafe { core::slice::from_raw_parts_mut(chunk.as_mut_ptr() as *mut u8, chunk.len() << 12) };
-            if ferros_sys::block_read(cap(grants(), S_BLOCKS), self.base + lba + (k * RUN) as u64, bytes) != 0 {
-                return Err(manifestus::Error::Corrupt(alloc::format!("block read failed at {lba}")));
-            }
+        let bytes = unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() << 12) };
+        if !blocks_read(self.base + lba, bytes) {
+            return Err(manifestus::Error::Corrupt(alloc::format!("block read failed at {lba}")));
         }
         Ok(())
     }
     fn write_run(&mut self, lba: u64, blocks: &[&Block]) -> manifestus::Result<()> {
         self.io(lba, blocks.len() as u64)?;
-        let mut buf = alloc::vec![0u8; RUN << 12];
-        for (k, chunk) in blocks.chunks(RUN).enumerate() {
+        let mut buf = alloc::vec![0u8; RUN_MAX << 12];
+        for (k, chunk) in blocks.chunks(RUN_MAX).enumerate() {
             for (j, b) in chunk.iter().enumerate() {
                 buf[j << 12..(j + 1) << 12].copy_from_slice(&b[..]);
             }
-            if ferros_sys::block_write(cap(grants(), S_BLOCKS), self.base + lba + (k * RUN) as u64, &buf[..chunk.len() << 12]) != 0 {
+            if !blocks_write(self.base + lba + (k * RUN_MAX) as u64, &buf[..chunk.len() << 12]) {
                 return Err(manifestus::Error::Corrupt(alloc::format!("block write failed at {lba}")));
             }
         }
@@ -233,6 +233,190 @@ struct Pending {
     w: Writer,
 }
 
+/// The most blocks one kernel call moves on a kernel from 2026-11-08 on (process.rs BLOCK_MAX: one UFS command, 128 KiB, so a 64 KiB piece's 17 blocks are one call), and on one from before (16, each block its own command): the first refusal of a larger run drops to the smaller for good.
+const RUN_MAX: usize = 1 << 5;
+static RUN_NOW: AtomicUsize = AtomicUsize::new(RUN_MAX);
+
+/// Block reads, measured for the read report (`Meter`): calls' time in timer ticks, and blocks.
+static IO_TICKS: AtomicU64 = AtomicU64::new(0);
+static IO_BLOCKS: AtomicU64 = AtomicU64::new(0);
+
+/// `buf.len() / 4096` blocks of the window from `at` into `buf`, `RUN_NOW` blocks a call.
+fn blocks_read(at: u64, buf: &mut [u8]) -> bool {
+    let t = now();
+    let n = buf.len() >> 12;
+    let mut k = 0;
+    while k < n {
+        let m = (n - k).min(RUN_NOW.load(Relaxed));
+        if ferros_sys::block_read(cap(grants(), S_BLOCKS), at + k as u64, &mut buf[k << 12..(k + m) << 12]) != 0 {
+            // A kernel from before 2026-11-08 refuses more than RUN blocks a call: once, then the smaller run.
+            if m > RUN {
+                RUN_NOW.store(RUN, Relaxed);
+                continue;
+            }
+            return false;
+        }
+        k += m;
+    }
+    IO_TICKS.fetch_add(now() - t, Relaxed);
+    IO_BLOCKS.fetch_add(n as u64, Relaxed);
+    true
+}
+
+/// `blocks_read`'s other half.
+fn blocks_write(at: u64, buf: &[u8]) -> bool {
+    let n = buf.len() >> 12;
+    let mut k = 0;
+    while k < n {
+        let m = (n - k).min(RUN_NOW.load(Relaxed));
+        if ferros_sys::block_write(cap(grants(), S_BLOCKS), at + k as u64, &buf[k << 12..(k + m) << 12]) != 0 {
+            if m > RUN {
+                RUN_NOW.store(RUN, Relaxed);
+                continue;
+            }
+            return false;
+        }
+        k += m;
+    }
+    true
+}
+
+/// The helpers that open a read's pieces beside the serving thread (owner, 2026-11-08: "24MB from the vault should be imperceptibly fast"): a 256 KiB transfer (ferros_sys::STORE_MAX) is four 64 KiB pieces, one a core. They hold nothing between requests: the sealing key is on the board only while a request's pieces open, and wiped after.
+const HELPERS: usize = 3;
+const HELPER_STACK: usize = 1 << 16;
+static HELPER_STACKS: [Region<HELPER_STACK>; HELPERS] = [const { Region(UnsafeCell::new([0; HELPER_STACK])) }; HELPERS];
+
+/// The board: the batch (bits 32-63, moved for each), its piece count (bits 16-31) and the next piece to claim (bits 0-15). A claim is a compare-and-swap within one batch, so a helper late to a batch claims nothing of the next: a claim it wins is of a batch whose server still waits, whose pieces and key are still on the board.
+static BOARD_NEXT: AtomicU64 = AtomicU64::new(0);
+/// Pieces of the batch opened.
+static BOARD_DONE: AtomicU64 = AtomicU64::new(0);
+/// The batch's pieces (their address) and the sealing key.
+static mut BOARD: (usize, [u8; 32]) = (0, [0; 32]);
+
+/// Claim and open the board's pieces until none is left to claim.
+fn work_board() {
+    loop {
+        let c = BOARD_NEXT.load(Acquire);
+        let (n, next) = ((c >> 16) & 0xFFFF, c & 0xFFFF);
+        if next >= n {
+            return;
+        }
+        if BOARD_NEXT.compare_exchange(c, c + 1, AcqRel, Relaxed).is_err() {
+            continue;
+        }
+        let (at, key) = unsafe { (BOARD.0, &*(&raw const BOARD.1)) };
+        // SAFETY: piece `next` < n of the batch this claim is of: its server waits for every claimed piece (BOARD_DONE) before the slice or the key leave the board, and no other thread claims the same index.
+        ferros_store::open_piece(key, unsafe { &mut *(at as *mut Sealed).add(next as usize) });
+        if BOARD_DONE.fetch_add(1, AcqRel) + 1 == n {
+            ferros_sys::wake(&BOARD_DONE, 1);
+        }
+    }
+}
+
+extern "C" fn helper(_: u64) -> ! {
+    loop {
+        let c = BOARD_NEXT.load(Acquire);
+        work_board();
+        ferros_sys::wait(&BOARD_NEXT, c, 0);
+    }
+}
+
+/// The serving thread's opener: a lone piece here, more on the board with the helpers (the server opens its share too), waited for, the key wiped.
+struct Helpers;
+
+impl Opener for Helpers {
+    fn open_all(&mut self, seal: &[u8; 32], pieces: &mut [Sealed]) {
+        let t = now();
+        let n = pieces.len() as u64;
+        if n == 1 {
+            ferros_store::open_piece(seal, &mut pieces[0]);
+        } else {
+            unsafe { BOARD = (pieces.as_mut_ptr() as usize, *seal) };
+            BOARD_DONE.store(0, Release);
+            let batch = (BOARD_NEXT.load(Acquire) >> 32) + 1;
+            BOARD_NEXT.store(batch << 32 | n << 16, Release);
+            ferros_sys::wake(&BOARD_NEXT, HELPERS as u64);
+            work_board();
+            loop {
+                let d = BOARD_DONE.load(Acquire);
+                if d >= n {
+                    break;
+                }
+                ferros_sys::wait(&BOARD_DONE, d, 0);
+            }
+            unsafe {
+                (*(&raw mut BOARD.1)).fill(0);
+                BOARD.0 = 0;
+            }
+        }
+        OPEN_TICKS.fetch_add(now() - t, Relaxed);
+        OPEN_BYTES.fetch_add(pieces.iter().map(|p| p.bytes.len() as u64).sum(), Relaxed);
+    }
+}
+
+/// Opening, measured for the read report: the wall time of each request's opening, and the sealed bytes opened.
+static OPEN_TICKS: AtomicU64 = AtomicU64::new(0);
+static OPEN_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// A large value read from its first byte to its last, measured stage by stage (owner, 2026-11-08: "Report MB/s per stage"): the block reads (the kernel's UFS commands and copies), the opening (XChaCha20-Poly1305, on the helpers), and the rest of serving (manifestus's index walk and each block's BLAKE3 guard and decode, the copies); from the first request to the last, the requests' own time and the time between them (the kernel's hand-offs and the reader's own work).
+struct Meter {
+    on: bool,
+    t0: u64,
+    requests: u64,
+    serving: u64,
+    io: (u64, u64),
+    open: (u64, u64),
+}
+
+/// Values at least this large get a read report.
+const METER_MIN: u64 = 1 << 20;
+
+impl Meter {
+    /// A read of `len` bytes from `offset` of a value `whole` bytes long, served in `ticks`: starts at offset 0, said when it reaches the end.
+    fn note(&mut self, offset: u64, data: u64, whole: u64, ticks: u64, t_start: u64) {
+        if offset == 0 && whole >= METER_MIN {
+            *self = Meter { on: true, t0: t_start, requests: 0, serving: 0, io: (IO_TICKS.load(Relaxed), IO_BLOCKS.load(Relaxed)), open: (OPEN_TICKS.load(Relaxed), OPEN_BYTES.load(Relaxed)) };
+        }
+        if !self.on {
+            return;
+        }
+        self.requests += 1;
+        self.serving += ticks;
+        if offset + data < whole {
+            return;
+        }
+        self.on = false;
+        let f = freq();
+        let us = |t: u64| t * 1_000_000 / f;
+        // WHY the max: a stage that took no time (every piece already open, no block read) would divide by zero, and the report is not worth the process.
+        let rate = |bytes: u64, t: u64| bytes / us(t).max(1);
+        let (io_t, io_b) = (IO_TICKS.load(Relaxed) - self.io.0, (IO_BLOCKS.load(Relaxed) - self.io.1) << 12);
+        let (op_t, op_b) = (OPEN_TICKS.load(Relaxed) - self.open.0, OPEN_BYTES.load(Relaxed) - self.open.1);
+        let wall = now() - self.t0;
+        // Signed: block reads made by a migration in the same requests count in `io` too.
+        let rest = us(self.serving) as i64 - us(io_t) as i64 - us(op_t) as i64;
+        say!(
+            "vault: read {} B in {} requests, {} ms first to last ({} MB/s): serving {} ms; blocks {} B in {} ms ({} MB/s); opening {} B in {} ms ({} MB/s, {} cores); index, block guards and copies {} ms; between requests {} ms",
+            whole,
+            self.requests,
+            us(wall) / 1000,
+            rate(whole, wall),
+            us(self.serving) / 1000,
+            io_b,
+            us(io_t) / 1000,
+            rate(io_b, io_t),
+            op_b,
+            us(op_t) / 1000,
+            rate(op_b, op_t),
+            HELPERS + 1,
+            rest / 1000,
+            us(wall - self.serving) / 1000
+        );
+    }
+}
+
+static mut METER: Meter = Meter { on: false, t0: 0, requests: 0, serving: 0, io: (0, 0), open: (0, 0) };
+
 type St = Store<Half, Half, Entropy>;
 
 extern "C" fn work(_: u64) -> ! {
@@ -268,9 +452,15 @@ extern "C" fn work(_: u64) -> ! {
     say!("vault: tract {} blocks from {}, the window {} a mirror", vault.tract_blocks(), vault.tract_base(), HALF);
     let mut store = Store::new(vault, Entropy { pool: [0; 4096], at: 4096 }, seconds);
     say!("vault: open in {} ms, serving", (now() - t0) * 1000 / freq());
-    // One transfer and its stamp each way, with room to spare.
-    let mut msg = alloc::vec![0u8; 8 << 10];
-    let mut out = alloc::vec![0u8; 8 << 10];
+    // The pieces' helpers, idle until a read hands them a batch (`Helpers`).
+    for s in HELPER_STACKS.iter() {
+        if ferros_sys::thread_spawn(helper, unsafe { &mut *s.0.get() }, 0) == ERR {
+            say!("vault: a helper did not start; reads open their pieces on fewer cores");
+        }
+    }
+    // One transfer (ferros_sys::STORE_MAX, 256 KiB) and its stamp each way, with room to spare.
+    let mut msg = alloc::vec![0u8; ferros_sys::STORE_MAX + (1 << 12)];
+    let mut out = alloc::vec![0u8; ferros_sys::STORE_MAX + (1 << 12)];
     let mut token = [0u8; 32];
     let mut writers: Vec<Pending> = Vec::new();
     let mut epoch: Option<u32> = None;
@@ -452,10 +642,13 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
             }
             1 => {
                 let (offset, len) = (u64_at(rest), u32::from_le_bytes(rest[8..12].try_into().unwrap()) as usize);
-                match store.read(&d, name, offset, &mut out[8..8 + len]) {
+                let t = now();
+                // The pieces opened on the helpers as well as here (`Helpers`).
+                match store.read_with(&d, name, offset, &mut out[8..8 + len], &mut Helpers) {
                     Ok(Some(whole)) => {
                         // WHY: the offset is the caller's and may lie past the end (nothing to send then: the subtraction stops at 0).
                         data = (whole.saturating_sub(offset) as usize).min(len);
+                        unsafe { (*(&raw mut METER)).note(offset, data as u64, whole, now() - t, t) };
                         whole
                     }
                     Ok(None) => NOTHING,

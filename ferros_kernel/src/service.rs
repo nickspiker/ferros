@@ -2949,6 +2949,27 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params.starts_with(b"ufs runs") {
+                    // `diag "ufs runs [on|off|reset]"`: SYS_BLOCK's multi-block commands (a run a command, ferros_hal `read_run_lun`) and what the vault process's block calls cost: calls, blocks, time inside them, MB/s, reads and writes. `off` sends every run a block a command again, to measure both on one boot; `reset` zeroes the counts.
+                    use core::sync::atomic::Ordering::Relaxed;
+                    match &cmd.params[..] {
+                        b"ufs runs on" | b"ufs runs off" => ferros_hal::ufs::RUNS_ON.store(cmd.params == b"ufs runs on", Relaxed),
+                        b"ufs runs reset" => crate::process::BLOCK_STATS.iter().for_each(|s| s.store(0, Relaxed)),
+                        _ => {}
+                    }
+                    let s = |i: usize| crate::process::BLOCK_STATS[i].load(Relaxed);
+                    let f = cntfrq();
+                    let line = |what: &str, k: usize| {
+                        let (calls, blocks, ticks) = (s(k), s(k + 1), s(k + 2));
+                        let us = ticks * 1_000_000 / f;
+                        alloc::format!("  {what}: A#{calls} calls, A#{blocks} blocks, A#{} ms inside, A#{} us a call, A#{} MB/s\n", us / 1000, us / calls.max(1), (blocks << 12) / us.max(1))
+                    };
+                    resp.extend_from_slice(alloc::format!("ufs runs {}, PRDT stride A#{} (0 not probed yet, 1 refused: a block a command)\n", if ferros_hal::ufs::RUNS_ON.load(Relaxed) { "on" } else { "off" }, ferros_hal::ufs::PRDT_STRIDE.load(Relaxed)).as_bytes());
+                    resp.extend_from_slice(line("reads", 0).as_bytes());
+                    resp.extend_from_slice(line("writes", 3).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params == b"smp dark on" || cmd.params == b"smp dark off" {
                     DARK_WORKERS_OFF.store(cmd.params == b"smp dark on", core::sync::atomic::Ordering::Relaxed);
                     resp.extend_from_slice(alloc::format!("workers off while dark: {}\n", cmd.params == b"smp dark on").as_bytes());

@@ -54,6 +54,44 @@ pub enum Error {
     TooLarge,
 }
 
+/// A piece of a read (`Store::read_with`): its address (the associated data it was sealed under) and its sealed bytes, [nonce][ciphertext][tag], opened where they lie; `ok` once they opened.
+pub struct Sealed {
+    pub addr: [u8; 32],
+    pub bytes: Vec<u8>,
+    pub ok: bool,
+}
+
+/// Opens a read's pieces under the request's sealing key, perhaps several at once on other threads (the vault process's helpers). Each piece is opened by `open_piece`.
+pub trait Opener {
+    fn open_all(&mut self, seal: &[u8; 32], pieces: &mut [Sealed]);
+}
+
+/// Every piece here, one after another.
+pub struct Serial;
+
+impl Opener for Serial {
+    fn open_all(&mut self, seal: &[u8; 32], pieces: &mut [Sealed]) {
+        for p in pieces.iter_mut() {
+            open_piece(seal, p);
+        }
+    }
+}
+
+/// One sealed piece opened in place: its plaintext then lies at `bytes[NONCE..len - TAG]`; sets and returns `ok`. Touches nothing else and allocates nothing, so any thread may run it on its own piece.
+pub fn open_piece(seal: &[u8; 32], p: &mut Sealed) -> bool {
+    let n = p.bytes.len();
+    // WHY: the sealed bytes are the disk's; shorter than a nonce and a tag they cannot be a piece, and the split below would panic.
+    if n < NONCE + TAG {
+        p.ok = false;
+        return false;
+    }
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(seal));
+    let (nonce, rest) = p.bytes.split_at_mut(NONCE);
+    let (body, tag) = rest.split_at_mut(n - NONCE - TAG);
+    p.ok = cipher.decrypt_in_place_detached(XNonce::from_slice(nonce), &p.addr, body, chacha20poly1305::Tag::from_slice(tag)).is_ok();
+    p.ok
+}
+
 /// A person's export (`Store::export`): each value carried, under its full name, and each one left out for its size, with its length.
 pub struct Export {
     pub entries: Vec<(Vec<u8>, Vec<u8>)>,
@@ -221,17 +259,6 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         Ok(Some((at, h)))
     }
 
-    /// Piece `k` of value `id`, opened (the last one opened is kept).
-    fn piece(&mut self, d: &Domain, id: &[u8; 32], k: u64) -> Result<&[u8]> {
-        let addr = Self::piece_addr(d, id, k);
-        let id_k = Self::key_id(d);
-        if !matches!(&self.last_piece, Some((a, k, _)) if *a == addr && *k == id_k) {
-            let sealed = self.vault.get(&addr)?.ok_or(Error::Format)?;
-            self.last_piece = Some((addr, id_k, Self::open(d, &addr, sealed)?));
-        }
-        Ok(&self.last_piece.as_ref().ok_or(Error::Format)?.2)
-    }
-
     /// What the cache knows a sealing key by.
     fn key_id(d: &Domain) -> [u8; 32] {
         *blake3::hash(&d.seal).as_bytes()
@@ -253,8 +280,13 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         Ok(self.head(d, name)?.map(|(_, h)| h.len))
     }
 
-    /// Bytes of the value from `offset` into `out` (as many as fit and the value holds). Returns the value's whole length, or None if it is absent; only the pieces the range touches are read and opened.
+    /// Bytes of the value from `offset` into `out` (as many as fit and the value holds). Returns the value's whole length, or None if it is absent; only the pieces the range touches are read and opened, one after another.
     pub fn read(&mut self, d: &Domain, name: &[u8], offset: u64, out: &mut [u8]) -> Result<Option<u64>> {
+        self.read_with(d, name, offset, out, &mut Serial)
+    }
+
+    /// `read`, the pieces the range touches fetched sealed first and then opened together by `opener` (the vault process opens them on several cores at once: a 256 KiB transfer is four pieces). The keys are the request's: `opener` holds the sealing key only while it opens. The last piece opened is kept, as `read` keeps it.
+    pub fn read_with(&mut self, d: &Domain, name: &[u8], offset: u64, out: &mut [u8], opener: &mut dyn Opener) -> Result<Option<u64>> {
         let Some((_, h)) = self.head(d, name)? else { return Ok(None) };
         if offset >= h.len || out.is_empty() {
             return Ok(Some(h.len));
@@ -264,10 +296,35 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
             out[..(end - offset) as usize].copy_from_slice(&data[offset as usize..end as usize]);
             return Ok(Some(h.len));
         }
+        let (k0, k1) = (offset >> PIECE_LOG2, (end - 1) >> PIECE_LOG2);
+        let id_k = Self::key_id(d);
+        let cached = |s: &Self, addr: &[u8; 32]| matches!(&s.last_piece, Some((a, k, _)) if a == addr && *k == id_k);
+        // The pieces the kept one does not cover, sealed, in order.
+        let mut sealed: Vec<Sealed> = Vec::new();
+        for k in k0..=k1 {
+            let addr = Self::piece_addr(d, &h.id, k);
+            if !cached(self, &addr) {
+                let bytes = self.vault.get(&addr)?.ok_or(Error::Format)?;
+                sealed.push(Sealed { addr, bytes, ok: false });
+            }
+        }
+        if !sealed.is_empty() {
+            opener.open_all(&d.seal, &mut sealed);
+            if sealed.iter().any(|p| !p.ok) {
+                return Err(Error::Open);
+            }
+        }
+        let mut next = 0;
         let mut at = offset;
-        while at < end {
-            let k = at >> PIECE_LOG2;
-            let piece = self.piece(d, &h.id, k)?;
+        for k in k0..=k1 {
+            let addr = Self::piece_addr(d, &h.id, k);
+            let piece: &[u8] = if cached(self, &addr) {
+                &self.last_piece.as_ref().ok_or(Error::Format)?.2
+            } else {
+                let p = &sealed[next];
+                next += 1;
+                &p.bytes[NONCE..p.bytes.len() - TAG]
+            };
             let p0 = k << PIECE_LOG2;
             let (from, to) = ((at - p0) as usize, ((end - p0) as usize).min(piece.len()));
             if from >= to {
@@ -277,6 +334,15 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
             let dst = (at - offset) as usize;
             out[dst..dst + to - from].copy_from_slice(&piece[from..to]);
             at = p0 + to as u64;
+        }
+        // The last piece opened is kept: a reader a few KiB at a time comes back for it next.
+        if let Some(mut p) = sealed.pop() {
+            p.bytes.truncate(p.bytes.len() - TAG);
+            p.bytes.drain(..NONCE);
+            self.last_piece = Some((p.addr, id_k, p.bytes));
+        }
+        for p in sealed.iter_mut() {
+            p.bytes.fill(0);
         }
         Ok(Some(h.len))
     }
@@ -631,6 +697,48 @@ mod tests {
         wrong.addr = d.addr;
         assert!(matches!(s.read(&wrong, b"big", 0, &mut [0u8; 16]), Err(Error::Open)));
         assert!(matches!(s.read(&wrong, b"big", (3 * PIECE) as u64, &mut [0u8; 16]), Err(Error::Open)));
+    }
+
+    /// Opens the pieces last first, as threads finishing in any order would.
+    struct Backwards(usize);
+    impl Opener for Backwards {
+        fn open_all(&mut self, seal: &[u8; 32], pieces: &mut [Sealed]) {
+            self.0 += pieces.len();
+            for p in pieces.iter_mut().rev() {
+                open_piece(seal, p);
+            }
+        }
+    }
+
+    /// A large value read in 256 KiB transfers through an opener (the vault process's, on several cores) comes back whole, from aligned and unaligned offsets, each piece opened once when the reads walk it in order; one transfer's pieces opened in any order land in their places; a piece the opener could not open fails the read.
+    #[test]
+    fn read_with_opener() {
+        let mut s = store(1 << 14);
+        let d = domain(7);
+        let v = bytes(3_000_000 + 17, 8);
+        s.put(&d, b"made", &v).unwrap();
+        let t = 1 << 18;
+        for start in [0usize, 5, PIECE - 3] {
+            s.forget();
+            let mut o = Backwards(0);
+            let mut back = vec![0u8; v.len() - start];
+            for off in (start..v.len()).step_by(t) {
+                let end = (off + t).min(v.len());
+                assert_eq!(s.read_with(&d, b"made", off as u64, &mut back[off - start..end - start], &mut o).unwrap(), Some(v.len() as u64));
+            }
+            assert_eq!(back, v[start..], "from {start}");
+            // Each piece opened once: the kept piece covers the next transfer's first.
+            assert_eq!(o.0, v.len().div_ceil(PIECE) - start / PIECE, "from {start}");
+        }
+        let mut wrong = domain(9);
+        wrong.addr = d.addr;
+        assert!(matches!(s.read_with(&wrong, b"made", (2 * PIECE) as u64, &mut vec![0u8; t], &mut Backwards(0)), Err(Error::Open)));
+        struct Refuses;
+        impl Opener for Refuses {
+            fn open_all(&mut self, _: &[u8; 32], _: &mut [Sealed]) {}
+        }
+        s.forget();
+        assert!(matches!(s.read_with(&d, b"made", 0, &mut [0u8; 16], &mut Refuses), Err(Error::Open)));
     }
 
     /// The domain's names follow its puts and deletes (a rewrite adds nothing), and never show the vault's own entries.

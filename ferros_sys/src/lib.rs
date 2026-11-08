@@ -119,6 +119,11 @@ pub fn set_pref(cap: u64, index: u64, value: u8) -> u64 {
     svc(nr::SET_PREF, cap, index, value as u64, 0, 0)
 }
 
+/// `set_pref` applied to every process's preferences at once but not kept in the vault: a slider while the finger is down (owner, 2026-11-08: the brightness slider wrote the settings into the vault at every step and the settings ran at 20 fps). `set_pref` at the lift keeps it.
+pub fn set_pref_live(cap: u64, index: u64, value: u8) -> u64 {
+    svc(nr::SET_PREF, cap, index | 1 << 8, value as u64, 0, 0)
+}
+
 /// A radio's link, as its driver measures it, for the corners' circles (kernel SYS_STATUS, facts 33-80): up to eight measures a link (the five radios, then USB), each a tagged word, the kind in bits 48-63 and its value, signed, in bits 0-47, in the kind's own unit. A link is many measures, never one number and never bars (owner, 2026-11-03: "frequency, bandwidth, speed, latency, flavor, packet loss ... RSSI, VSWR"): a driver publishes what it measures and nothing else, and a new measure is a new kind, not a new layout. `MEASURE_NONE` (all ones) is an empty slot.
 pub mod measure {
     /// 0 off, 1 on (up, no link), 2 connected.
@@ -416,13 +421,16 @@ impl Facts {
     }
 }
 
+/// The largest transfer one `SYS_STORE` call moves either way (the kernel's process.rs STORE_MAX): 256 KiB since 2026-11-08, four of the vault's 64 KiB pieces, which the vault process opens on four cores at once. 4 KiB before, and a kernel from before refuses a larger buffer (ERR).
+pub const STORE_MAX: usize = 1 << 18;
+
 /// Read `key` from the vault scope a Store capability names (the key is relative to the scope): Some(the value's whole length, of which at most `buf.len()` bytes were copied), or None if it is absent or the call was refused.
 pub fn store_get(cap: u64, key: &[u8], buf: &mut [u8]) -> Option<usize> {
     let r = svc(nr::STORE, cap, (buf.len() as u64) << 8, off(key.as_ptr()), key.len() as u64, off(buf.as_mut_ptr()));
     if r == ERR || r == NOTHING { None } else { Some(r as usize) }
 }
 
-/// Blocks of a window on the ferros partition (a Blocks capability; the vault process's disk, VAULT-OUT.md): `buf.len() / 4096` blocks (1 to 16) from block `at` of the window, read into `buf`. Returns 0, or ERR (not a window this process holds, out of it, or the UFS command failed).
+/// Blocks of a window on the ferros partition (a Blocks capability; the vault process's disk, VAULT-OUT.md): `buf.len() / 4096` blocks (1 to 32: one UFS command, 128 KiB; 16 on a kernel from before 2026-11-08, which refuses more) from block `at` of the window, read into `buf`. Returns 0, or ERR (not a window this process holds, out of it, or the UFS command failed).
 pub fn block_read(cap: u64, at: u64, buf: &mut [u8]) -> u64 {
     svc(nr::BLOCK, cap, ((buf.len() as u64 >> 12) & 0xFF) << 8, at, off(buf.as_mut_ptr()), 0)
 }
@@ -446,7 +454,7 @@ pub fn vault_read(cap: u64, name: &[u8], offset: u64, buf: &mut [u8]) -> u64 {
 pub fn vault_done(cap: u64, name: &[u8]) -> u64 {
     svc(nr::VAULT, cap, 2, off(name.as_ptr()), name.len() as u64, 0)
 }
-/// Read part of a value larger than one transfer: `buf.len()` bytes (at most 4096) from `offset` of the value under `key`. Returns the value's whole length (the kernel keeps the value between such reads, so walking a large one costs one vault read).
+/// Read part of a value larger than one transfer: `buf.len()` bytes (at most `STORE_MAX`) from `offset` of the value under `key`. Returns the value's whole length (the kernel keeps the value between such reads, so walking a large one costs one vault read).
 pub fn store_get_at(cap: u64, key: &[u8], offset: usize, buf: &mut [u8]) -> Option<usize> {
     let r = svc(nr::STORE, cap, 2 | (buf.len() as u64) << 8 | (offset as u64) << 32, off(key.as_ptr()), key.len() as u64, off(buf.as_mut_ptr()));
     if r == ERR || r == NOTHING { None } else { Some(r as usize) }

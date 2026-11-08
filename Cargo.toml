@@ -78,6 +78,7 @@ members = [
     "payloads/vaulttest",
     "payloads/wallgen",
     "payloads/pqprobe",
+    "payloads/vaultbench",
     "payloads/wxtest",
     "payloads/beamtest",
     "payloads/wdtfire",

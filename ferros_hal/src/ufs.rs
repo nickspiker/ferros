@@ -164,13 +164,23 @@ struct Utrd {
     dw: [u32; 8],
 }
 
-/// UTP Command Descriptor — Command UPIU + Response UPIU + PRDT. Must be 128-byte aligned. Fixed layout: [0x000..0x200) Command UPIU (512 bytes) [0x200..0x400) Response UPIU (512 bytes) [0x400..0x410) PRDT entry 0 (16 bytes)
+/// UTP Command Descriptor — Command UPIU + Response UPIU + PRDT. Must be 128-byte aligned. Fixed layout: [0x000..0x200) Command UPIU (512 bytes) [0x200..0x400) Response UPIU (512 bytes) [0x400..0x1400) the PRDT: room for RUN_MAX entries at the 128-byte stride the controller takes when the inline-encryption descriptor type is set (`PRDT_STRIDE`), which holds them at the standard 16 too.
 #[repr(C, align(128))]
 struct Ucd {
     cmd_upiu: [u8; 512],
     rsp_upiu: [u8; 512],
-    prdt: [PrdtEntry; 1],
+    prdt: [PrdtEntry; PRDT_SLOTS],
 }
+
+/// The most blocks one command moves (`read_run_lun`, `write_run_lun`): 128 KiB, the kernel's run buffer.
+pub const RUN_MAX: usize = 1 << 5;
+/// PRDT slots of 16 bytes: RUN_MAX entries at the larger stride (128 bytes, eight slots each).
+const PRDT_SLOTS: usize = RUN_MAX << 3;
+
+/// The controller's PRDT entry stride, learned once (`probe_prdt_stride`): 0 not yet known, 16 the standard entry, 128 the inline-encryption entry (FMPSECURITY0.DESCTYPE 3, set through EL3 by Linux's pixel-ufs-crypto: a jump from Android leaves it so; ABL's cold path is not known to), 1 multi-entry commands refused (the probe failed: runs go a block a command, as before). A single-entry command reads its one entry at offset 0 either way, which is why the block-at-a-time path never had to know.
+pub static PRDT_STRIDE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Runs off by hand (`diag "ufs runs off"`): every run a block a command, to measure the difference on the same boot.
+pub static RUNS_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
 /// Physical Region Description Table entry (16 bytes).
 #[repr(C)]
@@ -212,7 +222,7 @@ static mut UFS_BUF: UfsBuffers = UfsBuffers {
             base_addr_hi: 0,
             reserved: 0,
             size: 0,
-        }; 1],
+        }; PRDT_SLOTS],
     },
     data: [0; 4096],
 };
@@ -245,6 +255,17 @@ pub struct UfsProbe {
     pub unit0_block_size_exp: u8,         // block = 2^exp * 512
     pub unit0_block_count: u64,
     pub unit0_erase_block_size: u32,      // in allocation units
+}
+
+/// A SCSI READ(10) or WRITE(10) of `n` blocks at `lba`.
+fn rw10(op: u8, lba: u32, n: u16) -> [u8; 10] {
+    [op, 0, (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8, 0, (n >> 8) as u8, n as u8, 0]
+}
+
+/// A PRDT entry for one 4 KiB block at `addr`, written `off` bytes into the table at `p`.
+unsafe fn prdt_at(p: *mut u8, off: usize, addr: usize) {
+    let a = addr as u64;
+    unsafe { core::ptr::write(p.add(off) as *mut PrdtEntry, PrdtEntry { base_addr_lo: a as u32, base_addr_hi: (a >> 32) as u32, reserved: 0, size: 4095 }) };
 }
 
 pub struct UfsController {
@@ -674,13 +695,19 @@ impl UfsController {
     }
 
     fn send_command(&self, cmd_type: u32, direction: u32, prdt_count: u16) -> u8 {
+        let data = unsafe { &raw const UFS_BUF.data as usize };
+        self.send_command_on(cmd_type, direction, prdt_count, 16 * prdt_count as usize, (data, 4096))
+    }
+
+    /// `send_command` with the PRDT's bytes in use and the data's range (address, length) named: what the caches are cleaned and invalidated over.
+    fn send_command_on(&self, cmd_type: u32, direction: u32, prdt_count: u16, prdt_bytes: usize, data: (usize, usize)) -> u8 {
         self.h8_wake();
-        let r = self.send_command_awake(cmd_type, direction, prdt_count);
+        let r = self.send_command_awake(cmd_type, direction, prdt_count, prdt_bytes, data);
         H8_LAST_USE.store(ticks(), core::sync::atomic::Ordering::Relaxed);
         r
     }
 
-    fn send_command_awake(&self, cmd_type: u32, direction: u32, prdt_count: u16) -> u8 {
+    fn send_command_awake(&self, cmd_type: u32, direction: u32, prdt_count: u16, prdt_bytes: usize, data: (usize, usize)) -> u8 {
         unsafe {
             let buf = &raw mut UFS_BUF;
             let ucd_addr = &raw const (*buf).ucd as usize as u64;
@@ -697,13 +724,13 @@ impl UfsController {
             (*buf).utrd.dw[6] = (0x0080 << 16) | 0x0080; // response: offset=0x80 DW, len=0x80 DW
             (*buf).utrd.dw[7] = (0x0100 << 16) | (prdt_count as u32); // prdt: offset=0x100 DW
 
-            // Cache clean UTRD + UCD + data buffer
+            // Cache clean UTRD + UCD (its two UPIUs and the PRDT in use) + the data
             let utrd_phys = &raw const (*buf).utrd as usize;
             let ucd_phys = &raw const (*buf).ucd as usize;
-            let data_phys = &raw const (*buf).data as usize;
+            let ucd_len = 1024 + prdt_bytes;
             crate::mmio::cache_clean(utrd_phys, 32);
-            crate::mmio::cache_clean(ucd_phys, 1040); // 1024 + 16 for PRDT
-            crate::mmio::cache_clean(data_phys, 4096);
+            crate::mmio::cache_clean(ucd_phys, ucd_len);
+            crate::mmio::cache_clean(data.0, data.1);
             core::arch::asm!("dsb sy");
 
             // Ring doorbell
@@ -715,8 +742,8 @@ impl UfsController {
 
             // Invalidate caches to see DMA results
             crate::mmio::cache_invalidate(utrd_phys, 32);
-            crate::mmio::cache_invalidate(ucd_phys, 1040);
-            crate::mmio::cache_invalidate(data_phys, 4096);
+            crate::mmio::cache_invalidate(ucd_phys, ucd_len);
+            crate::mmio::cache_invalidate(data.0, data.1);
 
             ((*buf).utrd.dw[2] & 0xFF) as u8
         }
@@ -816,6 +843,92 @@ impl UfsController {
 
         // direction=1 (host→device), cmd_type=0 (SCSI), 1 PRDT entry
         self.send_command(0, 1, 1)
+    }
+
+    /// `n` consecutive blocks (1 to RUN_MAX) of `lun` from `lba` into `dst`, n × 4 KiB of device-DMA memory (the UFS's own pages, which its S2MPU lets it reach), identity-mapped: one READ(10) of n blocks once the PRDT stride is known (`PRDT_STRIDE`), else a block a command through the one-block buffer. Whether every command completed with OCS 0 and SCSI status 0.
+    pub fn read_run_lun(&self, lun: u8, lba: u32, n: usize, dst: usize) -> bool {
+        self.run(lun, lba, n, dst, false)
+    }
+
+    /// `read_run_lun`'s other half: `n` blocks from `src` written at `lba`.
+    pub fn write_run_lun(&self, lun: u8, lba: u32, n: usize, src: usize) -> bool {
+        self.run(lun, lba, n, src, true)
+    }
+
+    fn run(&self, lun: u8, lba: u32, n: usize, buf: usize, write: bool) -> bool {
+        use core::sync::atomic::Ordering::Relaxed;
+        let stride = PRDT_STRIDE.load(Relaxed) as usize;
+        if n > 1 && RUNS_ON.load(Relaxed) && (stride == 16 || stride == 128) {
+            let cdb = rw10(if write { scsi::WRITE_10 } else { scsi::READ_10 }, lba, n as u16);
+            self.build_scsi_upiu(lun, 0, if write { upiu::FLAG_WRITE } else { upiu::FLAG_READ }, (n << 12) as u32, &cdb);
+            unsafe {
+                let p = &raw mut UFS_BUF.ucd.prdt as *mut u8;
+                // Every byte of the entries in use zero first: at the larger stride an entry's inline-encryption fields (des3's crypto bit, the IV, the nonce) stay off.
+                core::ptr::write_bytes(p, 0, n * stride);
+                for i in 0..n {
+                    prdt_at(p, i * stride, buf + (i << 12));
+                }
+            }
+            return self.send_command_on(0, if write { 1 } else { 2 }, n as u16, n * stride, (buf, n << 12)) == 0 && self.last_response_status() == 0;
+        }
+        for k in 0..n {
+            let at = buf + (k << 12);
+            let ocs = if write {
+                unsafe { core::ptr::copy_nonoverlapping(at as *const u8, (&raw mut UFS_BUF.data) as *mut u8, 4096) };
+                self.write_block_lun(lun, lba + k as u32)
+            } else {
+                self.read_block_lun(lun, lba + k as u32)
+            };
+            if ocs != 0 || self.last_response_status() != 0 {
+                return false;
+            }
+            if !write {
+                unsafe { core::ptr::copy_nonoverlapping((&raw const UFS_BUF.data) as *const u8, at as *mut u8, 4096) };
+            }
+        }
+        true
+    }
+
+    /// Learn the PRDT entry stride (`PRDT_STRIDE`) from blocks `lba` and `lba + 1` of `lun`, with `scratch` as six blocks of device-DMA memory: the two blocks are read a command each for reference, then together by one READ(10) whose second entry is written both at the standard offset (16) and at the inline-encryption one (128), each to its own block of `scratch` filled with a pattern; whichever receives the second block is the stride. Under either reading of the table every entry the controller takes points into `scratch`. The second block equal to the pattern: nothing learned (0), the next run asks again; the run command failing or landing anywhere else: multi-entry commands refused (1). Returns the stride as it now stands.
+    pub fn probe_prdt_stride(&self, lun: u8, lba: u32, scratch: usize) -> u32 {
+        use core::sync::atomic::Ordering::Relaxed;
+        const PATTERN: u8 = 0xA5;
+        let blk = |k: usize| unsafe { core::slice::from_raw_parts_mut((scratch + (k << 12)) as *mut u8, 4096) };
+        // The references, a block a command: blocks 3 and 4 of the scratch.
+        for (k, l) in [(3usize, lba), (4, lba + 1)] {
+            if self.read_block_lun(lun, l) != 0 || self.last_response_status() != 0 {
+                return PRDT_STRIDE.load(Relaxed);
+            }
+            blk(k).copy_from_slice(self.data_buffer());
+        }
+        if blk(4).iter().all(|&b| b == PATTERN) {
+            return PRDT_STRIDE.load(Relaxed);
+        }
+        for k in 0..3 {
+            blk(k).fill(PATTERN);
+        }
+        let cdb = rw10(scsi::READ_10, lba, 2);
+        self.build_scsi_upiu(lun, 0, upiu::FLAG_READ, 2 << 12, &cdb);
+        unsafe {
+            let p = &raw mut UFS_BUF.ucd.prdt as *mut u8;
+            core::ptr::write_bytes(p, 0, 2 * 128);
+            prdt_at(p, 0, scratch);
+            prdt_at(p, 16, scratch + (1 << 12));
+            prdt_at(p, 128, scratch + (2 << 12));
+        }
+        let ok = self.send_command_on(0, 2, 2, 2 * 128, (scratch, 3 << 12)) == 0 && self.last_response_status() == 0;
+        let pattern = |k: usize| blk(k).iter().all(|&b| b == PATTERN);
+        let stride = if !ok || blk(0) != blk(3) {
+            1
+        } else if blk(1) == blk(4) && pattern(2) {
+            16
+        } else if blk(2) == blk(4) && pattern(1) {
+            128
+        } else {
+            1
+        };
+        PRDT_STRIDE.store(stride, Relaxed);
+        stride
     }
 
     /// Get a reference to the data buffer (for reading results after read_block).

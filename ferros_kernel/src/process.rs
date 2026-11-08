@@ -720,6 +720,9 @@ impl Process {
             return;
         }
         match self.span(off, bytes.len()) {
+            // In the arc (Normal write-back memory): one copy. A reply of a quarter MiB (a store transfer, STORE_MAX) went a volatile byte at a time.
+            Some(a) if a >= self.arc.base && a + bytes.len() <= self.arc.base + self.arc.size => unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), a as *mut u8, bytes.len()) },
+            // In one of the process's DMA regions: a byte at a time, as ever (some are Device memory, where a wide unaligned store faults).
             Some(a) => {
                 for (i, &b) in bytes.iter().enumerate() {
                     unsafe { core::ptr::write_volatile((a + i) as *mut u8, b) };
@@ -784,6 +787,8 @@ const SYS_SLEEP: u64 = 9;
 const SYS_SPAWN: u64 = 10;
 /// Change a device preference: x0 the Settings capability's token offset, x1 which preference, x2 its new value. The kernel checks the value, keeps it in the vault through `PREF_STORE`, and rewrites it in every live process's preferences block at once. Returns 0 or ERR.
 const SYS_SET_PREF: u64 = 11;
+/// SYS_SET_PREF x1 bit 8: the value applied to every process's block but not kept in the vault (a slider while the finger is down).
+const PREF_LIVE: u64 = 1 << 8;
 /// The device's plain facts for its dashboard (SHELL.md: the device circle's front): x0/x1 a buffer in the caller's arc and its length; up to FACT_COUNT u64 words, little-endian, `FACT_UNKNOWN` where a fact is not known. No capability: these are what the device shows whoever holds it, and none is a key, a handle or a serial. Returns the bytes written.
 const SYS_FACTS: u64 = 12;
 pub const FACT_COUNT: usize = 88;
@@ -852,10 +857,17 @@ static mut DETAIL_LEN: [usize; 6] = [0; 6];
 const LINK_NAMES: [&[u8]; 6] = [b"modem", b"pcie1", b"bt", b"nfc", b"gps", b"usb"];
 /// pet(): the process is alive and going round its main loop (the process watchdog, measuring: the kernel records the longest stretch between two pets, `diag pets`). → 0.
 const SYS_PET: u64 = 28;
-/// block(cap, op, block, buf): 4 KiB blocks of a window on the ferros partition (`WINDOWS`), by number within it: op bit 0 write (else read), bits 8-15 the count (1 to BLOCK_MAX), `buf` the count × 4 KiB in the caller's arc. → 0, or ERR (no such window, out of it, or the UFS command failed).
+/// block(cap, op, block, buf): 4 KiB blocks of a window on the ferros partition (`WINDOWS`), by number within it: op bit 0 write (else read), bits 8-15 the count (1 to BLOCK_MAX), `buf` the count × 4 KiB in the caller's arc. → 0, or ERR (no such window, out of it, or the UFS command failed). The count moves as one UFS command (a run, ferros_hal `read_run_lun`) once the controller's PRDT stride is known.
 const SYS_BLOCK: u64 = 29;
-/// The most blocks one `SYS_BLOCK` moves.
-const BLOCK_MAX: u64 = 1 << 4;
+/// The most blocks one `SYS_BLOCK` moves: one UFS command's worth (128 KiB, ferros_hal RUN_MAX), so a 64 KiB piece the vault seals (17 blocks with its nonce, tag and furrow headers) is one call and one command. 16 until 2026-11-08, each block its own command.
+const BLOCK_MAX: u64 = ferros_hal::ufs::RUN_MAX as u64;
+/// The run's bounce: UFS DMAs only into its own pages (the HSI2 S2MPU allows `.bss.dma.ufs` and nothing else of the kernel's), uncached by the static cache map, so a run lands here and is copied to the caller.
+#[repr(C, align(4096))]
+struct RunBuf([u8; ferros_hal::ufs::RUN_MAX << 12]);
+#[unsafe(link_section = ".bss.dma.ufs")]
+static mut UFS_RUN: RunBuf = RunBuf([0; ferros_hal::ufs::RUN_MAX << 12]);
+/// SYS_BLOCK's measure (`diag "ufs runs"`, owner 2026-11-08: "24MB from the vault should be imperceptibly fast"): calls, blocks and timer ticks inside the call (the command or commands and the copy), reads then writes.
+pub static BLOCK_STATS: [core::sync::atomic::AtomicU64; 6] = [const { core::sync::atomic::AtomicU64::new(0) }; 6];
 /// vault(cap, op, x2, x3, buf): the vault process's own call (`Object::Vault`), moving the kernel's vault's old entries into its domains (VAULT-OUT.md, migration); x1 bits 0-7 the op, 8-31 the buffer's length, 32-63 an offset. Op 0: the x2-th entry still to move (a skip past ones that would not move) into `buf` as [class: 1 the person's][the domain's address and sealing keys][the scope prefix's length][the full name] → its length, NOTHING when none is left. Op 1: the value of the entry named at x2/x3, from the offset → its whole length. Op 2: that entry moved, removed from the kernel's vault → 0, NOTHING if it was not there. ERR otherwise.
 const SYS_VAULT: u64 = 30;
 const SYS_LAST: u64 = 22;
@@ -1242,8 +1254,8 @@ pub static mut STORE_ADDR: Option<fn(&str, &[u8; 32], AddrOp) -> Result<Option<V
 static mut STORE_STAGE: Option<(Vec<u8>, Vec<u8>)> = None;
 /// The last value read piecewise (key, value), so a large value is fetched from the vault once.
 static mut STORE_CACHE: Option<(Vec<u8>, Vec<u8>)> = None;
-/// The largest value `SYS_STORE` moves either way.
-pub const STORE_MAX: usize = 4096;
+/// The largest transfer `SYS_STORE` moves either way: 256 KiB, four of the vault process's 64 KiB pieces (ferros_store PIECE), which it opens on four cores at once (payloads/vault `Openers`). 4 KiB until 2026-11-08, when the person's 24 MB wallpaper took about 5900 round trips and 2.9 s (owner: "24MB from the vault should be imperceptibly fast").
+pub const STORE_MAX: usize = 1 << 18;
 
 /// The vault process's endpoint (VAULT-OUT.md, step 3). While a process receives on it, every `SYS_STORE` call is forwarded there (`store_forward`), stamped by the kernel with the domain keys of the caller's scope; while none does, the kernel's own vault answers as before. Nothing may call it directly (a message on it is the kernel's), and only a spawn holding the vault right (`Grant::Vault`) may serve it.
 const VAULT_EP: &[u8] = b"vault";
@@ -2127,25 +2139,31 @@ fn el0_trap(f: &mut Frame) -> u64 {
             f.x[0] = match (window, crate::ufs_device::part()) {
                 // WHY the bounds: the block number and count are the process's; a window is all it may touch, and the partition must hold the window (the same refusal the kernel's own vault makes).
                 (Some(w), Some((first, blocks))) if (1..=BLOCK_MAX).contains(&count) && at < w.blocks && count <= w.blocks - at && w.offset + w.blocks <= blocks as u64 => {
+                    use core::sync::atomic::Ordering::Relaxed;
                     let u = ferros_hal::ufs::UfsController::new(0x1320_0000);
-                    let base = first as u64 + w.offset + at;
-                    let mut ok = true;
-                    for k in 0..count {
-                        let off = buf + (k << 12);
-                        let lba = (base + k) as u32;
-                        if write {
-                            p.read_into(off, u.data_buffer_mut());
-                            ok = u.write_block_lun(0, lba) == 0 && u.last_response_status() == 0;
-                        } else {
-                            ok = u.read_block_lun(0, lba) == 0 && u.last_response_status() == 0;
-                            if ok {
-                                p.write_from(off, u.data_buffer());
-                            }
-                        }
-                        if !ok {
-                            break;
-                        }
+                    let base = (first as u64 + w.offset + at) as u32;
+                    let n = count as usize;
+                    let run = (&raw mut UFS_RUN) as usize;
+                    let bytes = unsafe { core::slice::from_raw_parts_mut(run as *mut u8, n << 12) };
+                    let t0 = crate::platform::cntpct();
+                    // The PRDT's stride, learned at the first access of more than one block (`probe_prdt_stride`, the run buffer its scratch): until it is known a run goes a block a command.
+                    if n > 1 && ferros_hal::ufs::PRDT_STRIDE.load(Relaxed) == 0 {
+                        u.probe_prdt_stride(0, base, run);
                     }
+                    let ok = if write {
+                        p.read_into(buf, bytes);
+                        u.write_run_lun(0, base, n, run)
+                    } else {
+                        let ok = u.read_run_lun(0, base, n, run);
+                        if ok {
+                            p.write_from(buf, bytes);
+                        }
+                        ok
+                    };
+                    let s = if write { 3 } else { 0 };
+                    BLOCK_STATS[s].fetch_add(1, Relaxed);
+                    BLOCK_STATS[s + 1].fetch_add(count, Relaxed);
+                    BLOCK_STATS[s + 2].fetch_add(crate::platform::cntpct() - t0, Relaxed);
                     if ok { 0 } else { ERR }
                 }
                 _ => ERR,
@@ -2632,8 +2650,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
         SYS_SET_PREF => {
             let token = p.read(f.x[0], 32);
             let held = matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0);
-            let (index, value) = (f.x[1] as usize, f.x[2] as u8);
-            f.x[0] = if held && pref_valid(index, value) && unsafe { PREF_STORE }.map(|st| st(index, value)).unwrap_or(false) {
+            // x1 bit 8 (`PREF_LIVE`): applied, not kept — a slider under a finger (owner, 2026-11-08: the brightness slider wrote the settings document into the kernel's vault at every 32nd of a stop, a UFS commit under the kernel lock each, and the settings ran at 20 fps); the value is kept by the call without it, at the lift.
+            let (index, value, live) = ((f.x[1] & 0xFF) as usize, f.x[2] as u8, f.x[1] & PREF_LIVE != 0);
+            f.x[0] = if held && f.x[1] >> 9 == 0 && pref_valid(index, value) && (live || unsafe { PREF_STORE }.map(|st| st(index, value)).unwrap_or(false)) {
                 set_pref_locked(index, value);
                 0
             } else {
