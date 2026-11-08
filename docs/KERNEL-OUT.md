@@ -105,6 +105,8 @@ Each is one commit, kernel and payload together, and none is on the cold boot's 
 3. **The vault's capsule in the kernel image** (VAULT-OUT.md decision 0), optional at build time: with `FERROS_VAULT_CAPSULE` set the kernel embeds that capsule and starts the vault from it; without it, from its own vault as today.
    Risk: on the boot path, so it waits for a slot b cold boot with the owner present before the stored copy goes.
 
+Where they stand (end of the night): all four built and pushed, one commit each, plus a fifth found on the way: the service loop's remaining UFS commands (the `diag` tools that drive the controller, the slot record's writes, `diag pref`, the camera tools' vault reads) now take the kernel lock. Nothing is flashed: the kernel needs the main session's flash, and the vault's new operations (drop, export) need its new capsule stored first (`tools/husky-shell.sh vault`, safe with today's kernel: the old operations are unchanged). VAULT-OUT.md "Built so far" has each, and how to check it.
+
 Not ready, and why:
 - **The kernel's own names behind its channel, then `kvault`'s storage path retired** (VAULT-OUT.md step 4): the kernel reads `init`, `sealed` and the capsules before any process runs, and the AoC firmware in the service loop's sensor steps. Moving them needs the vault started from the kernel image (3, verified from cold) and a synchronous read for the boot. After 3.
 - **`amp`** waits on decision 7, **`haptics`** on decision 8, the power group on 9, `partfs` on 10, the camera on 3.
