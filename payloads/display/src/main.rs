@@ -3493,29 +3493,28 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         if op == 41 && n >= 5 {
-            // Which corner circle is at this point: [x u16][y u16] → the radio's bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS), 8 home, 9 back, or G#FF for none or another circle. The map asks it on a tap in the top rows, to switch that radio (preference 15).
+            // What the system has at this point, outside the app's circle: [x u16][y u16] → in the lower half, a region (owner, 2026-11-07): 9 back on the left, 8 home on the right, whole (the arrow and the ring are only drawn there, nothing to aim at); in the upper half, the console's radio circle under it, by its bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS). G#FF for nothing: inside the circle, or on no radio.
             let (w, h) = unsafe { SCREEN_WH };
             let (x, y) = (u16::from_le_bytes([msg[1], msg[2]]) as f32 + 0.5, u16::from_le_bytes([msg[3], msg[4]]) as f32 + 0.5);
-            let (circles, cn) = corner_layout(w as usize, h as usize);
             let mut hit = 0xFFu8;
-            for &(cx, cy, r, what) in &circles[..cn] {
-                if (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r * r {
-                    hit = match what {
-                        Corner::Cellular => 0,
-                        Corner::Wifi => 1,
-                        Corner::Bluetooth => 2,
-                        Corner::Nfc => 3,
-                        Corner::Gps => 4,
-                        // The helm's two (owner, 2026-11-07): home and back, for the map's corner gestures.
-                        Corner::Home => 8,
-                        Corner::Back => 9,
-                        _ => 0xFF,
-                    };
-                }
-            }
-            // The bottom corners whole, not only their rings (owner, 2026-11-07: the gesture was "finicky"; logged, the touches on the home ring landed below and right of it, at the glass's edge): anywhere in the lower half outside the app's circle is home on the right, back on the left. The corners are the system's (WINDOWS.md).
-            if hit == 0xFF && y > h as f32 * 0.5 && !in_circle(x as i64, y as i64, w as usize, h as usize) {
+            if in_circle(x as i64, y as i64, w as usize, h as usize) {
+                // The app's (or the map's): nothing of the system's.
+            } else if y > h as f32 * 0.5 {
                 hit = if x > w as f32 * 0.5 { 8 } else { 9 };
+            } else {
+                let (circles, cn) = corner_layout(w as usize, h as usize);
+                for &(cx, cy, r, what) in &circles[..cn] {
+                    if (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r * r {
+                        hit = match what {
+                            Corner::Cellular => 0,
+                            Corner::Wifi => 1,
+                            Corner::Bluetooth => 2,
+                            Corner::Nfc => 3,
+                            Corner::Gps => 4,
+                            _ => 0xFF,
+                        };
+                    }
+                }
             }
             ferros_sys::reply(&tok, &[hit]);
             continue;
