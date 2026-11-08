@@ -2,7 +2,7 @@
 //!
 //! The fleet over the LAN (photon docs/pairing-v2.md "The ceremony over the mesh"; STATUS.md "Enrollment / pairing"): an EL0 process on the `ip` process's UDP, it beacons as the stock app does (`pt_disc` to the app's multicast groups on 4384), hears the owner's other devices beaconing under the same handle, hands the nearest sponsor its binding request as a `bind_req` over Photon Transport, takes the chain (`fleet_resp`) and the fan-out (`fanout_resp`) the sponsor pushes back, folds the chain against its own roots and opens the fan-out with its own ira, and from then on answers pings as a fleet member. Everything it speaks is photon_core (pt, join, wire), pinned byte for byte against the app by tools/photon-interop.
 //!
-//! Identity: the device key is rooted in the kernel's ira (`ira_key("fgtw device")` → `join::DeviceKeys::derive`; "photon device" until 2026-11-04, changed when no fleet held this device), the same after a factory reset; the identity roots (`identity_seed`, `handle_proof`) come from the attest screen (op 4, in RAM) or are pushed into the vault scope `fgtw.` by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the device. Once bound, the chain (`fgtw.chain`) and the fleet key (`fgtw.fleet_key`) live in the same scope. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
+//! Identity: the device key is rooted in the kernel's ira (`ira_key("fgtw device")` → `join::DeviceKeys::derive`; "photon device" until 2026-11-04, changed when no fleet held this device), the same after a factory reset; the identity roots (`identity_seed`, `handle_proof`) come from the attest screen (op 4, in RAM) or are pushed into the vault scope `fgtw.` by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the device. Once bound, the chain (`fgtw.chain`) and the fleet key (`fgtw.fleet_key`) live in the same scope. A departure under way is kept there too (`fgtw.depart`, whatever unlock-at-boot says: it holds no root) until it completes, so a restart resumes it. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
 //!
 //! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the request to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same 19 bytes for the boot-started service] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving) and the words the 23 pairing words while joining or the 3 approval words while leaving; op 1 the state alone, op 2 mint (a result byte first), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk). Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
 
@@ -352,6 +352,7 @@ impl Udp {
 }
 
 /// A departure from the fleet in progress (pairing-v2 "Chain changes": removal is bilateral, the leaver's consent countersigned by a surviving member).
+/// Kept in the vault as `fgtw.depart` (`DEPART_KEY`) from the moment it starts until it completes, so a reboot resumes it rather than dropping it (`keep_depart`, `resume_depart`).
 struct Depart {
     t: i64,
     words: alloc::string::String,
@@ -368,6 +369,12 @@ const V_WRONG: u8 = 6;
 const V_UNREACHABLE: u8 = 7;
 /// Leaving: a departure request is out (op 5) and its approval words are shown until a surviving device of the fleet approves and the chain no longer holds this device.
 const V_LEAVING: u8 = 8;
+
+/// The kept departure's name in the `fgtw.` scope: one VSF document, section `depart`, with `rq` the signed `depart_req` frame as a binary blob (its stamp and consent inside it) and `wd` the three approval words.
+/// Nothing of the identity is in it: the frame is this device's signature over its consent, and which identity it leaves is proven again at resume by checking the consent's Ed25519 egg against the roots then in hand (`resume_depart`).
+const DEPART_KEY: &[u8] = b"depart";
+/// One transfer of the vault (the kernel's STORE_MAX): larger values go in pieces.
+const STORE_PIECE: usize = 4096;
 
 /// The seed (photon docs/peers-are-fgtw.md: peers first, the seed last). Plain HTTP on port 80, which fgtw.org serves (checked 2026-10-28; Claude memories/fgtw_plain_http_for_ferros.md): every call is one POST of a signed VSF document, and every answer is verified and folded here, so the transport carries no trust.
 const SEED_HOST: &[u8] = b"fgtw.org";
@@ -480,6 +487,37 @@ impl Client {
     fn store_set(&self, key: &[u8], value: &[u8]) -> bool {
         ferros_sys::store_set(cap(self.log.grants, S_STORE), key, value)
     }
+    /// Write a value of any size: in one transfer when it fits, else in pieces the kernel assembles and commits with the last one.
+    fn store_set_whole(&self, key: &[u8], value: &[u8]) -> bool {
+        let c = cap(self.log.grants, S_STORE);
+        if value.len() <= STORE_PIECE {
+            return ferros_sys::store_set(c, key, value);
+        }
+        let mut ok = true;
+        for (k, piece) in value.chunks(STORE_PIECE).enumerate() {
+            let at = k * STORE_PIECE;
+            ok &= ferros_sys::store_set_at(c, key, at, piece, at + piece.len() < value.len());
+        }
+        ok
+    }
+    /// Read a value of any size, piece by piece; None when it is absent.
+    fn store_get_whole(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let c = cap(self.log.grants, S_STORE);
+        let mut piece = alloc::vec![0u8; STORE_PIECE];
+        let total = ferros_sys::store_get_at(c, key, 0, &mut piece)?;
+        let mut v = Vec::with_capacity(total);
+        let mut at = 0;
+        while at < total {
+            // WHY the min: the last piece is shorter than a transfer, and only what the value holds is read into the copy.
+            let n = (total - at).min(STORE_PIECE);
+            if at > 0 {
+                ferros_sys::store_get_at(c, key, at, &mut piece[..n])?;
+            }
+            v.extend_from_slice(&piece[..n]);
+            at += n;
+        }
+        Some(v)
+    }
 
     /// Read the unlock-at-boot preference (this process's own grants page).
     fn read_persist(&mut self) {
@@ -528,6 +566,7 @@ impl Client {
             self.fleet_key = Some(b);
         }
         // The chain we hold, if bound before: folded again against our roots, so a bad write never binds us.
+        let mut held: Option<Vec<u8>> = None;
         if let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) {
             // The chain's own size first (a get returns the value's whole length), then exactly that: a 128 KiB buffer asked of a 160 KiB heap that has been running a while need not find one free run.
             let mut probe = [0u8; 1];
@@ -542,9 +581,16 @@ impl Client {
                         self.log.dec(blob.ops.len() as u64);
                         self.log.put(if bound { b" op(s), this device is a member" } else { b" op(s), this device is not in it" });
                         self.log.line();
+                        chain.truncate(n);
+                        held = Some(chain);
                     }
                 }
             }
+        }
+        // A departure that was under way when the device last stopped: resumed, and finished at once if the chain held here already lacks this device.
+        self.resume_depart();
+        if let Some(c) = held {
+            self.depart_check(&c);
         }
         if !say && self.hp.is_none() {
             return;
@@ -562,6 +608,10 @@ impl Client {
 
     fn show_words(&mut self) {
         let (Some(seed), false) = (self.identity_seed, self.bound) else { return };
+        // Leaving (a departure resumed before the chain is adopted again): the approval words are what this device shows, never the pairing words.
+        if self.depart.is_some() {
+            return;
+        }
         let words = join::pair_words(&self.me, &seed);
         self.log.put(b"fgtw: pairing words - ");
         self.log.put(words.as_bytes());
@@ -773,10 +823,61 @@ impl Client {
         self.log.put(words.as_bytes());
         self.log.line();
         self.depart = Some(Depart { t, words, frame, checked_us: 0 });
+        self.keep_depart();
         for i in 0..self.sponsors.len() {
             self.depart_hand(i);
         }
         0
+    }
+
+    /// The departure under way into the vault (`DEPART_KEY`), so a reboot before a device of the fleet approves resumes it with the same request and the same words.
+    /// Kept whether or not unlock-at-boot is on: it holds no root, and without it a reboot would leave the approver's words pointing at a request this device had forgotten.
+    fn keep_depart(&mut self) {
+        let Some(d) = &self.depart else { return };
+        let mut section = vsf::VsfSection::new("depart");
+        section.add_field("rq", vsf::VsfType::v(b'b', d.frame.clone()));
+        section.add_field("wd", vsf::VsfType::x(d.words.clone()));
+        let kept = match vsf::VsfBuilder::new().creation_time_oscillations(eagle()).add_section_direct(section).build() {
+            Ok(doc) => self.store_set_whole(DEPART_KEY, &doc),
+            Err(_) => false,
+        };
+        if !kept {
+            self.log.put(b"fgtw: the departure was not kept in the vault: a reboot before it is approved drops it");
+            self.log.line();
+        }
+    }
+
+    /// A departure kept in the vault (`keep_depart`), taken up again once the roots are in hand: its request and words as they were, handed to siblings as they are heard and checked against the chain as `leave` leaves them.
+    /// Taken up only for the identity it leaves: the request must be this device's, and its consent's Ed25519 egg must verify over these roots' departure bytes (`fleet::departreq_signing_bytes`); a departure from another identity stays in the vault untouched.
+    fn resume_depart(&mut self) {
+        let Some(hp) = self.hp else { return };
+        if self.depart.is_some() || self.identity_seed.is_none() {
+            return;
+        }
+        let Some(doc) = self.store_get_whole(DEPART_KEY) else { return };
+        let Ok((header, end)) = vsf::verification::read_verified(&doc, None) else {
+            self.log.put(b"fgtw: a kept departure does not verify: left as it is");
+            self.log.line();
+            return;
+        };
+        let Ok(section) = header.primary_section(&doc, end) else { return };
+        let frame = section.get_field("rq").and_then(|f| f.values.first()).and_then(|v| v.as_bytes()).map(|b| b.to_vec());
+        let words = section.get_field("wd").and_then(|f| f.values.first()).and_then(|v| v.as_string()).map(alloc::string::String::from);
+        let (Some(frame), Some(words)) = (frame, words) else { return };
+        let Ok((req, leaver)) = fgtw::protocol::parse_depart_req(&frame) else { return };
+        let msg = fgtw::fleet::departreq_signing_bytes(&hp, &self.me, req.t);
+        let ours = leaver == self.me
+            && fgtw::pq::eggs_from_bytes(&req.consent_sig).is_ok_and(|eggs| eggs.iter().any(|e| e.scheme == fgtw::fleet::scheme::ED25519 && fgtw::pq::verify_egg(e.scheme, &self.me, &msg, &e.sig)));
+        if !ours {
+            return;
+        }
+        self.log.put(b"fgtw: resuming the departure kept from before the restart; approve on a device of the fleet with the words: ");
+        self.log.put(words.as_bytes());
+        self.log.line();
+        self.depart = Some(Depart { t: req.t, words, frame, checked_us: 0 });
+        for i in 0..self.sponsors.len() {
+            self.depart_hand(i);
+        }
     }
 
     /// Hand the departure request to sibling `i`, once per request.
@@ -804,6 +905,7 @@ impl Client {
             self.log.put(b"fgtw: the fleet's chain no longer holds this device: departed; the identity is forgotten here");
             self.log.line();
             self.depart = None;
+            let _ = ferros_sys::store_delete(cap(self.log.grants, S_STORE), DEPART_KEY);
             self.forget_disk();
             self.forget_identity();
             if !ferros_sys::release_identity(cap(unsafe { GRANTS }, S_UNLOCK)) {
@@ -1292,6 +1394,8 @@ impl Client {
                     self.last_lookup_us = 0;
                     self.log.put(if self.persist { b"fgtw: roots set in RAM and kept on disk (unlock at boot on)" } else { b"fgtw: roots set in RAM only (nothing of the identity on disk)" });
                     self.log.line();
+                    // A departure kept from before a restart: these roots are the first chance to take it up (with unlock-at-boot off, nothing of the identity is on disk at `load`).
+                    self.resume_depart();
                 }
                 // Op 5: leave the fleet, `[5][intent]` (1 to a new owner, 2 to the desk) → [result: 0 started, else why not], then the state (8 leaving, with the approval words).
                 if n >= 2 && req[0] == 5 {
@@ -1307,15 +1411,16 @@ impl Client {
                 let state = if self.depart.is_some() { V_LEAVING } else { state };
                 reply.push(state);
                 reply.push(self.sponsors.len().min(255) as u8);
-                if let (Some(seed), false, V_JOIN) = (self.identity_seed, self.bound, self.verdict) {
-                    reply.extend_from_slice(join::pair_words(&self.me, &seed).as_bytes());
-                } else if let Some(d) = &self.depart {
+                // The approval words first: a departure resumed after a restart can be under way before the chain is adopted again (not yet bound), and its words, not the pairing words, are what the state 8 shows.
+                if let Some(d) = &self.depart {
                     reply.extend_from_slice(d.words.as_bytes());
+                } else if let (Some(seed), false, V_JOIN) = (self.identity_seed, self.bound, self.verdict) {
+                    reply.extend_from_slice(join::pair_words(&self.me, &seed).as_bytes());
                 }
                 svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, reply.as_ptr() as u64 - self.udp.base, reply.len() as u64, 0, 0);
             }
             // Joining: the seed's copy of the chain every 16 s, for the sponsor's Add. A sponsor hands the chain and the fan-out to a newcomer at the address its request came from on the LAN; one it knows only from the registry or the tap has no address, and the newcomer has to look (2026-11-04: Brittany's phone bound this device by the tap and the words stayed up). The clock only moves forward, so `t` is never behind the last check.
-            if !self.bound && self.verdict == V_JOIN && t - self.join_checked_us >= 16_000_000 {
+            if !self.bound && self.depart.is_none() && self.verdict == V_JOIN && t - self.join_checked_us >= 16_000_000 {
                 self.join_checked_us = t;
                 self.join_check();
             }
@@ -1365,7 +1470,7 @@ impl Client {
                 }
             }
             // The binding request only once there is a fleet to ask (the verdict says joining): minting it signs in three families, SLH-DSA-128s among them, which takes seconds; it is done here in the loop, never inside a call another process waits on.
-            if !self.bound && self.hp.is_some() && self.verdict == V_JOIN && self.request_frame.is_empty() {
+            if !self.bound && self.depart.is_none() && self.hp.is_some() && self.verdict == V_JOIN && self.request_frame.is_empty() {
                 self.mint_request();
             }
             // Bound: nothing left to prove proximity for.
