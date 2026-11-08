@@ -2919,6 +2919,20 @@ fn raw_cutout(width: usize, height: usize, cx: f32, cy: f32, r: f32) {
         }
     }
 }
+/// The cutout's row-by-row map (op 52 mode 3; owner, 2026-11-08: "right arrow until it disappears then go to the next line and repeat", the glass's pixels being on or off): black, one white pixel at (x, y), and dim red guides along its row and column from 8 to 64 pixels away, so the eye finds the place without a guide pixel near the hole's edge.
+fn raw_dot(width: usize, height: usize, x0: usize, y0: usize) {
+    let (white, red, black) = (pack10(1020, 1020, 1020), pack10(255, 0, 0), pack10(0, 0, 0));
+    for k in 0..PHASES {
+        let dst = phase_slice(k, width * height);
+        for y in 0..height {
+            for x in 0..width {
+                let (dx, dy) = ((x as i64 - x0 as i64).abs(), (y as i64 - y0 as i64).abs());
+                let guide = (dy == 0 && (8..=64).contains(&dx)) || (dx == 0 && (8..=64).contains(&dy));
+                dst[y * width + x] = if dx == 0 && dy == 0 { white } else if guide { red } else { black };
+            }
+        }
+    }
+}
 fn glass_radius() -> f32 {
     if ferros_sys::akita() { GLASS_RADIUS_AKITA } else { GLASS_RADIUS }
 }
@@ -6230,9 +6244,16 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             }
                             log.s(b"display: op 52 released: the shell again\n");
                         }
-                        1 | 2 => {
+                        1 | 2 | 3 => {
                             RAW_HOLD.store(1, Ordering::Release);
-                            if m[1] == 1 {
+                            if m[1] == 3 {
+                                // WHY the bounds: the dot's place is the host's; one off the panel draws nothing rather than writing past the frame.
+                                let (x, y) = (v(2) as usize, v(4) as usize);
+                                if x < width && y < height {
+                                    raw_dot(width, height, x, y);
+                                }
+                                log.s(alloc::format!("display: op 52 dot at ({x}, {y})\n").as_bytes());
+                            } else if m[1] == 1 {
                                 let g = v(2);
                                 let (rs, rb, n) = raw_corners(width, height, g);
                                 log.s(alloc::format!("display: op 52 corners at glass radius {g}: small {rs:.1}, big {rb:.1}, exponent {n}; the small corner's diagonal cut {:.1} px\n", rs * (1. - libm::exp2f(-1. / n as f32)) * core::f32::consts::SQRT_2).as_bytes());
