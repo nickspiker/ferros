@@ -1,6 +1,6 @@
-//! The camera cutout mapped row by row on the glass (owner, 2026-11-08: "right arrow until it disappears then go to the next line and repeat"; the glass's pixels are on or off). The display draws one white pixel on black (op 52 mode 3, through the capture payload, about 40 ms a step); the keys move it, and the person marks where it disappears and where it comes back on each row.
+//! The camera cutout mapped on the glass (owner, 2026-11-08: the glass's pixels are on or off; he marks a solid area that is completely obscured). The display draws one white pixel on black (op 52 mode 3, through the capture payload, about 40 ms a step); the keys move it and space logs where it is.
 //!
-//! Keys: ← → one pixel, [ ] five; ↑ ↓ a row; space marks (first the first hidden pixel, then the first visible one after it); enter keeps the row and goes down one, starting a few pixels left of the last left edge; u forgets the row's marks; q prints the map and leaves (the display released).
+//! Keys: ← → ↑ ↓ one pixel, [ ] five across; space logs the dot's (x, y) (owner, 2026-11-08: "Strictly log the xy when I press space"); q prints every logged point and leaves (the display released).
 //!
 //! Usage: tools/cutout-scan/target/release/cutout-scan [x y]   (the start, panel pixels; default above akita's cutout)
 use std::io::{Read, Write};
@@ -46,16 +46,14 @@ impl Drop for Raw {
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let (mut x, mut y): (i64, i64) = if a.len() >= 3 { (a[1].parse().unwrap(), a[2].parse().unwrap()) } else { (518, 48) };
-    // Rows kept: (row, first hidden column, last hidden column).
-    let mut rows: Vec<(i64, i64, i64)> = Vec::new();
-    let mut marks: Vec<i64> = Vec::new();
+    let mut points: Vec<(i64, i64)> = Vec::new();
     let raw = Raw::on();
     let say = |s: String| {
         print!("\r\x1b[2K{s}");
         let _ = std::io::stdout().flush();
     };
     dot(x, y);
-    say(format!("dot at ({x}, {y})  marks {marks:?}  rows kept {}", rows.len()));
+    say(format!("dot at ({x}, {y})  points logged 0"));
     let mut stdin = std::io::stdin();
     let mut b = [0u8; 3];
     loop {
@@ -71,30 +69,21 @@ fn main() {
             [b']'] => x += 5,
             [b'['] => x -= 5,
             [b' '] => {
-                if marks.len() < 2 {
-                    marks.push(x);
-                }
-            }
-            [b'u'] => marks.clear(),
-            [b'\r'] | [b'\n'] => {
-                if marks.len() == 2 {
-                    rows.push((y, marks[0], marks[1] - 1));
-                }
-                let restart = marks.first().copied().unwrap_or(x) - 4;
-                marks.clear();
-                y += 1;
-                x = restart;
+                points.push((x, y));
+                print!("\r\x1b[2Klogged {x} {y}\r\n");
+                say(format!("dot at ({x}, {y})  logged ({x}, {y}), points logged {}", points.len()));
+                continue;
             }
             [b'q'] | [3] => break,
             _ => continue,
         }
         dot(x, y);
-        say(format!("dot at ({x}, {y})  marks {marks:?}  rows kept {}", rows.len()));
+        say(format!("dot at ({x}, {y})  points logged {}", points.len()));
     }
     drop(raw);
     send("3400");
-    println!("\nThe cutout, row by row (row: first hidden column ..= last hidden column):");
-    for (r, l, rr) in &rows {
-        println!("{r}: {l}..={rr}");
+    println!("\nPoints logged (x, y):");
+    for (x, y) in &points {
+        println!("{x} {y}");
     }
 }
