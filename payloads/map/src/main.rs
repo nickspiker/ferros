@@ -86,7 +86,7 @@ const BUTTON_LOOK: [[u32; 4]; 4] = [
     [0x3A2414, 0x6E4424, 0x241A12, 0x5A4A3A],
     [0x380A06, 0x6A160C, 0x180404, 0x4A120C],
 ];
-/// The radio's and the checkbox's look, one of three for the owner to pick from (2026-11-08): 0 the app circle's hairline (its weight, a pixel, and its colour: the ring's light halved on release, orange on development builds) for the stroke and the fill alike; 1 that hairline round a fill of the theme's text colour, the checkbox ticked in the ground's; 2 fluor's stroke (a 32nd of the label's size, plus a pixel) in the secondary text colour, filled with the theme's lit colour and ticked.
+/// The radio's and the checkbox's look, one of three for the owner to pick from (2026-11-08): 0 a pixel's stroke and the fill alike in the theme's mark colour (white in the default theme, owner 2026-11-08: "no amber"); 1 that hairline round a fill of the theme's text colour, the checkbox ticked in the ground's; 2 fluor's stroke (a 32nd of the label's size, plus a pixel) in the secondary text colour, filled with the theme's lit colour and ticked.
 const MARK_LOOK: u8 = 0;
 /// The circles' hairline colour, as the display draws the app circle's (display `hairline`): on release, grey (equal codes) at half the photopic light of the theme's ring (VSF RGB's weights on its codes, squared); on development builds, VSF RGB orange, full red and green at half its light.
 fn hairline() -> u32 {
@@ -105,7 +105,10 @@ fn hairline() -> u32 {
 /// A mark's stroke width (Q8 pixels) and colours (stroke, fill, ink unused here, tick) and whether a checked box carries its tick, for the label size `px`, by `MARK_LOOK`.
 fn mark_look(px: i64) -> (i64, [u32; 4], bool) {
     match MARK_LOOK {
-        0 => (256, [hairline(), hairline(), 0, fill()], false),
+        0 => {
+            let m = ferros_sys::theme::current().mark;
+            (256, [m, m, 0, fill()], false)
+        }
         1 => (256, [hairline(), white(), 0, fill()], true),
         _ => (((px >> 5) + 1) << 8, [grey(), ferros_sys::theme::current().lit, 0, fill()], true),
     }
@@ -600,7 +603,7 @@ enum Choice {
     Dither,
     /// One of the theme swatches.
     Theme(u8),
-    /// The brightness slider, nine stops (preference 3): the stop is decided by x, dragged or tapped.
+    /// The brightness slider, continuous (preference 3, 32nds of a stop): the value is decided by x, dragged or tapped.
     Brightness,
     /// The UI scale slider (preference 14), half to twice: the scale decided by x.
     Scale,
@@ -1950,12 +1953,13 @@ impl Map {
         let note = uu(7, 8);
         match PAGES[p] {
             "appearance" => {
-                // The themes as swatches: each its ground with its ring around it, the one in use with its lit colour at the centre, its name beneath.
+                // The themes as swatches: each its ground with its ring around it, the one in use with its mark colour at the centre, its name beneath.
                 let now_t = ferros_sys::theme::index();
                 for (i, t) in ferros_sys::theme::THEMES.iter().enumerate() {
                     let x = cx + (2 * i as i64 - 3) * uu(3, 1);
                     if i == now_t {
-                        b.disc(x, y, uu(1, 2), t.lit);
+                        // The chosen one's dot in its theme's mark colour, as a radio's (white in the default theme; owner, 2026-11-08: "no amber").
+                        b.disc(x, y, uu(1, 2), t.mark);
                     }
                     b.disc(x, y, uu(2, 1) - uu(1, 4), t.plane);
                     b.disc(x, y, uu(2, 1), t.ring);
@@ -1967,7 +1971,7 @@ impl Map {
                 y += uu(7, 1);
                 b.text(cx, y, small as u16, grey(), 1, "brightness");
                 y += uu(2, 1);
-                // Brightness: a slider over its nine stops, dimmest on the left, dragged or tapped (owner, 2026-11-08: "sliders (for brightness)").
+                // Brightness: a continuous slider, dimmest on the left, dragged or tapped (owner, 2026-11-08: "sliders (for brightness)", "why's brightness not continuous?").
                 slider(self, b, &mut y, Choice::Brightness);
                 // The UI scale, half to twice, as a pinch on the page sets it.
                 b.text(cx, y, small as u16, grey(), 1, "scale");
@@ -2494,7 +2498,7 @@ impl Map {
     /// Where a slider's value puts its knob (0 to 1): brightness's stops dimmest on the left (preference 3 counts stops below the brightest), the scale from a half on the left to twice on the right (the pinch's or the drag's while one goes on).
     fn slider_rest(&self, what: Choice) -> f64 {
         match what {
-            Choice::Brightness => (8 - ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS)) as f64 / 8.,
+            Choice::Brightness => (255 - ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS)) as f64 / 255.,
             Choice::Scale => (self.scale_live.unwrap_or(ferros_sys::ui_scale() as f32) as f64 + 64.) / 128.,
             _ => 0.,
         }
@@ -2515,7 +2519,7 @@ impl Map {
             _ => rest,
         }
     }
-    /// A slider set from the finger at x (a drag across it, or a tap): the knob there, and the value written as it changes. Brightness takes the nearest of its nine stops through the Settings capability each time the stop changes; the scale follows the finger live (`scale_live`) and is kept when the finger lifts, as the pinch's is (every process lays itself out again on a scale change, so once, not every frame).
+    /// A slider set from the finger at x (a drag across it, or a tap): the knob there, and the value written as it changes. Brightness writes its 32nds of a stop through the Settings capability each time the value changes; the scale follows the finger live (`scale_live`) and is kept when the finger lifts, as the pinch's is (every process lays itself out again on a scale change, so once, not every frame).
     fn slide_to(&mut self, what: Choice, x: i64) {
         let (a, b) = self.track(self.w / 2);
         // WHY the bounds: the finger runs past either end of the track, and the knob stays at the end it passed.
@@ -2524,12 +2528,10 @@ impl Map {
         self.knob = None;
         match what {
             Choice::Brightness => {
-                let stop = 8 - libm::round(t * 8.) as u8;
-                if stop != ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS) {
-                    ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BRIGHTNESS, stop);
-                    let mut l = Line::new();
-                    let _ = write!(l, "map: brightness slider: {stop} stops below the brightest\n");
-                    console(self.grants, l.as_str().as_bytes());
+                // Continuous (owner, 2026-11-08): 32nds of a stop, the knob's place across the track's 255 of them.
+                let v = 255 - libm::round(t * 255.) as u8;
+                if v != ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS) {
+                    ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BRIGHTNESS, v);
                 }
             }
             Choice::Scale => self.scale_live = Some((t * 128. - 64.) as f32),

@@ -1375,10 +1375,10 @@ fn panel_for(nits: f32) -> (bool, u16, f32) {
     (false, 3307, DBV_NITS[6].1)
 }
 
-/// Brightness step (stops below the brightest white) to (white, the E peak the table lands on, the panel setting): the brightest white is half the E peak at the panel's top (owner: max white one stop under max); each step halves it; the panel's own brightness comes down once its peak would be more than 16× white (the working format's headroom), so the codes are never wasted on light no value can reach.
-fn brightness(step: u8) -> (f32, f32, bool, u16) {
+/// Brightness (32nds of a stop below the brightest white, preference 3) to (white, the E peak the table lands on, the panel setting): the brightest white is half the E peak at the panel's top (owner: max white one stop under max); every 32 halve it, continuously between (owner, 2026-11-08: a continuous slider); the panel's own brightness comes down once its peak would be more than 16× white (the working format's headroom), so the codes are never wasted on light no value can reach.
+fn brightness(v: u8) -> (f32, f32, bool, u16) {
     let top_e = HBM_NITS * E_LIGHT;
-    let white = top_e * 0.5 / (1u32 << step.min(8)) as f32;
+    let white = top_e * 0.5 * libm::exp2f(-(v as f32) * (1. / (1 << 5) as f32));
     // The panel never below the normal-mode top (owner, 2026-11-03): below about DBV 1400 the DDIC dims by lengthening each frame's dark window (95 % emission duty at DBV 1490 and above, about 85 % at 1236, under half at 983, measured by eye in Android), so every step under it is the pixel values' (the table and the 12-bit dither), the light's duty staying at the panel's 95 %. High brightness mode only for the steps that need more than DBV 3307 gives.
     let want = (white * 16.0).min(top_e) / E_LIGHT;
     let (hbm, dbv, native) = if want > DBV_NITS[6].1 { panel_for(want) } else { (false, DBV_NITS[6].0 as u16, DBV_NITS[6].1) };
@@ -2063,7 +2063,8 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
                     let mut inner = alloc::vec![0u64; s * s];
                     {
                         use fluor::paint::squircle as sq;
-                        let big = mk as f32 * 0.32;
+                        // The big corners' radius: 0.64 of the box (owner, 2026-11-08: "2x bigger radius for the checkboxes", from 0.32). Each side carries a big and a small corner (fluor's asymmetric radii, big and half), 1.5 × 0.64 = 0.96 of the side, so the corners still meet within it.
+                        let big = mk as f32 * 0.64;
                         let mut fd = fluor::canvas::Damage::new();
                         sq::draw_squircle_rrect(&mut fluor::canvas::Canvas::new(&mut outer[..], s, s, &mut fd), 0, 0, mk as isize, mk as isize, 0xFF00_0000, sq::asymmetric_radii(big), sq::SHAPE_POWER);
                         if (mk as isize) > 2 * e {
@@ -3721,6 +3722,7 @@ impl vsf::container::ByteSource for VaultSource {
 fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> bool {
     let c = cap(grants, S_MAP_SCOPE);
     let Some(len) = ferros_sys::store_get(c, key, &mut []) else { return false };
+    let t0 = now();
     let mut l = Log { grants, buf: [0; 256], n: 0 };
     let doc = match vsf::container::Document::open(VaultSource { cap: c, key, len: len as u64 }) {
         Ok(d) => d,
@@ -3769,6 +3771,13 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
         }
         y0 = y1;
     }
+    // Measuring (owner, 2026-11-08: "the unlock process took way too long"): the whole load, over the vault.
+    l.s(b"display: the person's ");
+    l.s(key);
+    l.s(b" loaded in ");
+    l.dec(ferros_sys::us_since(t0) / 1000);
+    l.s(b" ms\n");
+    l.flush();
     true
 }
 
