@@ -116,10 +116,13 @@ The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by t
   - The op gains an offset (x4); `ferros_sys::export_identity` reads in transfers, with the same signature. Without a vault process the kernel keeps its own export between the reads in the same way (each build stamps its own time, so pieces of two builds would not be one document).
   - Bounded, because the document is built whole in the vault's 8 MiB heap: a value over 1 MiB is left out and named on the console (the person's made wallpaper, `map.wallpaper.made`, 24 MB, is this screen's alone), and an export over 4 MiB is refused (`ferros_store` `export`, host-tested).
   - Nothing calls op 5 yet (the Fleet page's "save first" is to come).
+- **The vault's capsule in the kernel image (2026-11-07, built, optional, not yet on the device):**
+  - `FERROS_VAULT_CAPSULE=<signed capsule>` at the kernel's build embeds it (`build.rs`, `service.rs` `VAULT_CARRIED`). At home the kernel starts the vault from it, through the signature gate as any capsule; refused or absent, from the `vault` entry of its own vault as before. `diag restart vault` takes the stored capsule first (the development loop pushes one), the carried one when none is stored.
+  - Unset, the kernel is as before. Set, the image grows by the capsule (about 450 KB: 1.74 to 2.20 MB).
+  - The stored copy goes once a slot b cold boot has started the vault from the image (decision 0's "boot path last").
 - **Still to do:**
   - the person's entries moving at the first attest (built, not yet seen on the device);
   - per-kist domains through the oracle and the common area's named grants (step 3's rest);
-  - the vault's capsule in the kernel image;
   - the kernel's own names moved behind a channel of its own, then `kvault`, `vault_boot` and `ufs_device` retired (step 4).
 
 ## Found while mapping the kernel's vault (2026-11-07)

@@ -699,6 +699,12 @@ fn spawn_wallgen(store: &mut Option<ShimStore>, seed: &[u8; 32]) {
     }
 }
 
+/// The vault process's capsule the kernel image carries (FERROS_VAULT_CAPSULE at build; VAULT-OUT.md decision 0), empty when the build carried none. The boot starts the vault from it first; a restart from the stored one first (the development loop pushes one).
+#[cfg(ferros_vault_capsule)]
+static VAULT_CARRIED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vault.capsule.vsf"));
+#[cfg(not(ferros_vault_capsule))]
+static VAULT_CARRIED: &[u8] = &[];
+
 /// The vault process's capabilities (payloads/vault: 1 serve `vault`, 2 the `vault` block window, 3 entropy, 4 the vault right). Not init's to hand out: the kernel starts it before init (VAULT-OUT.md, decision 0), and init's grants page is full.
 fn vault_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     use crate::process::Grant::*;
@@ -757,7 +763,8 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
         };
         // What reads the person's space starts only when init's `wait_person` would start it (owner, 2026-11-04: "Attest should ONLY load attest", and "if it's not attached to an identity, not usable"): fgtw once a person has attested, the map once the device is also bound to that identity. A restart does not get around either. A vault that cannot say whether it is bound counts as not bound.
         let person = store.as_mut().is_some_and(|s| s.unlocked());
-        let attached = person && store.as_mut().is_some_and(|s| s.bound().unwrap_or(false));
+        // Under the kernel lock: `bound` reads the vault (a UFS command), and processes run on the other cores.
+        let attached = person && crate::process::with_lock(|| store.as_mut().is_some_and(|s| s.bound().unwrap_or(false)));
         let refused: Option<&[u8]> = match name {
             b"fgtw" if !person => Some(b"not started, nobody has attested: "),
             b"map" if !attached => Some(b"not started, this device is not bound to an attested identity: "),
@@ -776,7 +783,9 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
         let killed = crate::process::kill(name);
         crate::flashlog::line(&alloc::format!("restart {nm}: {} ; reading the capsule", if killed { "killed" } else { "was not running" }));
         platform::crumb(0x52);
-        let Some(capsule) = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key(core::str::from_utf8(name).unwrap_or("")).ok().flatten())) else {
+        // The vault restarts from the stored capsule (the development loop pushes one), else from the one the kernel image carries.
+        let stored = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key(core::str::from_utf8(name).unwrap_or("")).ok().flatten()));
+        let Some(capsule) = stored.or_else(|| (name == b"vault" && !VAULT_CARRIED.is_empty()).then(|| VAULT_CARRIED.to_vec())) else {
             rep.extend_from_slice(b"no capsule in the vault for ");
             rep.extend_from_slice(name);
             rep.push(b'\n');
@@ -840,23 +849,38 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
         return true;
     }
     // `home.off` in the vault (any value): no shell this boot, so the panel is the bridge's alone — a measurement session (tools/display-profile.sh) must not have the map redraw because an instrument rests on the glass. Removed with `store rm home.off`.
-    if store.as_mut().and_then(|s| s.get_by_key("home.off").ok().flatten()).is_some() {
+    // Under the kernel lock, as every UFS command (nothing else runs yet, but the rule has no exceptions).
+    if crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("home.off").ok().flatten())).is_some() {
         crate::process::push_console(b"home: off (vault home.off): no shell this boot\n");
         return false;
     }
-    let Some(capsule) = store.as_mut().and_then(|s| s.get_by_key("init").ok().flatten()) else {
+    let Some(capsule) = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("init").ok().flatten())) else {
         crate::process::push_console(b"home: no init capsule in the vault\n");
         return true;
     };
     let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
-    // The vault process first (VAULT-OUT.md, decision 0), so it is serving when the processes init starts ask for what they keep; until it is, the kernel's vault answers them. Its capsule rides in the kernel's vault for now (`vault`, kept by the kernel: never forwarded, never moved); the kernel image carries it once the kernel keeps no disk of its own. None stored: every store call is the kernel's vault's, as before.
-    if let Some(vc) = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("vault").ok().flatten())) {
-        match crate::process::spawn_capsule(b"vault", &vc, b"", &vault_grants(), &sealed) {
+    // The vault process first (VAULT-OUT.md, decision 0), so it is serving when the processes init starts ask for what they keep; until it is, the kernel's vault answers them. From the capsule the kernel image carries (FERROS_VAULT_CAPSULE at build), else the `vault` entry of the kernel's own vault (kept by the kernel: never forwarded, never moved). Neither: every store call is the kernel's vault's, as before.
+    let mut vault_up = false;
+    if !VAULT_CARRIED.is_empty() {
+        match crate::process::spawn_capsule(b"vault", VAULT_CARRIED, b"", &vault_grants(), &sealed) {
             Ok(o) => {
                 mark_ran(&o);
                 crate::process::push_console(&o.console);
+                crate::process::push_console(b"home: vault from the kernel image\n");
+                vault_up = true;
             }
-            Err(e) => crate::process::push_console(alloc::format!("home: vault refused: {e}\n").as_bytes()),
+            Err(e) => crate::process::push_console(alloc::format!("home: the kernel image's vault refused: {e}; the stored one next\n").as_bytes()),
+        }
+    }
+    if !vault_up {
+        if let Some(vc) = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("vault").ok().flatten())) {
+            match crate::process::spawn_capsule(b"vault", &vc, b"", &vault_grants(), &sealed) {
+                Ok(o) => {
+                    mark_ran(&o);
+                    crate::process::push_console(&o.console);
+                }
+                Err(e) => crate::process::push_console(alloc::format!("home: vault refused: {e}\n").as_bytes()),
+            }
         }
     }
     // The pipe stays at ABL's 8 bpc here: the display server takes it to the 10 bpc blend at its start (payloads/display modeset.rs; KERNEL-OUT.md decision 6, 2026-11-01).

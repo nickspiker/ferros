@@ -32,6 +32,18 @@ fn main() {
         }
         Err(_) => std::fs::write(&pout, b"").unwrap(),
     }
+    // FERROS_VAULT_CAPSULE=<file>: the vault process's signed capsule rides in the kernel image (VAULT-OUT.md decision 0: whatever verifies the kernel verifies it, and kernel and vault ship and roll back together). The kernel starts the vault from it at home, before init, and from the `vault` entry of its own vault only when this is absent or refused. Unset: as before, from that entry alone.
+    println!("cargo:rustc-check-cfg=cfg(ferros_vault_capsule)");
+    println!("cargo:rerun-if-env-changed=FERROS_VAULT_CAPSULE");
+    let vout = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("vault.capsule.vsf");
+    match std::env::var("FERROS_VAULT_CAPSULE") {
+        Ok(path) => {
+            println!("cargo:rerun-if-changed={path}");
+            std::fs::copy(&path, &vout).unwrap_or_else(|e| panic!("FERROS_VAULT_CAPSULE {path}: {e}"));
+            println!("cargo:rustc-cfg=ferros_vault_capsule");
+        }
+        Err(_) => std::fs::write(&vout, b"").unwrap(),
+    }
     // FERROS_CAM_UW=<prefix> (the ultrawide, `diag cam pdma uw`) and FERROS_CAM_FRONT=<prefix> (the front camera, `diag cam pdma front`): each camera's <prefix>.init (tools/camera-init.py), <prefix>.cpr2 (tools/camera-cpu.py) and <prefix>.pdma (tools/camera-pdma-image.py). Dev only and local, like the main camera's: the init carries the sensor vendor's settings.
     let od = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     for (env, tag) in [("FERROS_CAM_UW", "uw"), ("FERROS_CAM_FRONT", "front")] {
