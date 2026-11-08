@@ -2551,6 +2551,10 @@ static mut CON_RECT: [draw::Rect; 2] = [draw::Rect::EMPTY; 2];
 static mut CON_GLYPHS: Option<glyphs::Glyphs> = None;
 /// What the console last drew (the minute, the radios, their measures, the switches), so it redraws when one changes.
 static mut CONSOLE_KEY: i64 = -1;
+/// Each console circle's look at its last draw (`console_draw`; 0 not drawn), whether the console was ever drawn whole, and the rows the last draw changed, [lo, hi) of the bars' rows.
+static mut CON_CIRCLE_KEYS: [u64; 16] = [0; 16];
+static mut CON_DRAWN: bool = false;
+static mut CON_ROWS: (usize, usize) = (0, 0);
 /// Measuring the console's redraws: the parts of its key at the last draw, how often each has moved, the draws' summed time and their count.
 static mut CONSOLE_PARTS: [u64; 5] = [0; 5];
 static mut CONSOLE_WHY: [u32; 5] = [0; 5];
@@ -3648,6 +3652,9 @@ fn px_out(y: i64, height: usize) -> bool {
 extern "C" fn console_worker(arg: u64) -> ! {
     let (width, height) = ((arg >> 32) as usize, (arg & 0xFFFF_FFFF) as usize);
     let mut seen = 0u64;
+    // The rows the last draw changed, and whether the helm drew then (the first console draw is whole, and the helm counts as drawn before it, so every row of the bars is decoded first).
+    let mut prev_rows = (0usize, 0usize);
+    let mut helm_prev = true;
     loop {
         let n = CON_NUDGE.load(Ordering::Acquire);
         if n == seen {
@@ -3666,11 +3673,29 @@ extern "C" fn console_worker(arg: u64) -> ! {
             continue;
         }
         let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
-        bar_decode(0, top + bot, width);
+        // The rows to decode: the console's drawn this time and the last (the back buffer is the front of two draws ago), and the helm's whole when it drew. Decoding every row of the bars each draw was a few ms of the worker's for one circle's change.
+        let now_rows = if console { unsafe { CON_ROWS } } else { (0, 0) };
+        let (mut lo, mut hi) = (now_rows.0.min(prev_rows.0), now_rows.1.max(prev_rows.1));
+        if now_rows.0 >= now_rows.1 {
+            (lo, hi) = prev_rows;
+        } else if prev_rows.0 >= prev_rows.1 {
+            (lo, hi) = now_rows;
+        }
+        prev_rows = now_rows;
+        if helm || helm_prev {
+            hi = top + bot;
+            if lo >= hi {
+                lo = top;
+            }
+        }
+        helm_prev = helm;
+        if lo < hi {
+            bar_decode(lo, hi - lo, width);
+        }
         // What changed, row by row, back against front: the columns from the first differing pixel to the last.
         let (front, back) = unsafe { (core::slice::from_raw_parts(BAR_W as *const u64, (top + bot) * width), core::slice::from_raw_parts(BAR_W_BACK as *const u64, (top + bot) * width)) };
         let mut rects = [draw::Rect::EMPTY; 2];
-        for b in 0..top + bot {
+        for b in lo..hi {
             let (f, k) = (&front[b * width..(b + 1) * width], &back[b * width..(b + 1) * width]);
             let Some(x0) = (0..width).find(|&x| f[x] != k[x]) else { continue };
             let x1 = (0..width).rev().find(|&x| f[x] != k[x]).map_or(x0, |x| x) + 1;
@@ -3941,7 +3966,17 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
     let t_draw = ferros_sys::now();
     let rows = unsafe { CHROME_TOP };
     let console = unsafe { core::slice::from_raw_parts_mut(BAR as *mut u64, rows * width) };
-    console.fill(0);
+    // Only the circles whose own look changed are drawn again (2026-11-08: the battery's live readings every two seconds redrew every circle, the off radios' fields with them, 61 ms a draw); the first draw, or a forced one, starts from empty.
+    let whole = force || !unsafe { CON_DRAWN };
+    if whole {
+        console.fill(0);
+        unsafe {
+            CON_CIRCLE_KEYS = [0; 16];
+            CON_DRAWN = true;
+        }
+    }
+    // The console's rows drawn this time, [lo, hi).
+    let (mut dirty_lo, mut dirty_hi) = (rows, 0usize);
     // A screen pixel's place in the console. WHY the test: glyph and disc positions come from the layout's float geometry, and a disc's box or a glyph's edge can reach past the screen's sides or below the console's rows; an index from there would land in another row or past the buffer.
     let at = |x: i64, y: i64| -> Option<usize> {
         if x < 0 || x >= width as i64 || y < 0 || y >= rows as i64 {
@@ -3955,7 +3990,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
     const LIVE_INK: f32 = 11000.0;
     const LIGHT_INK: f32 = 7000.0;
     let (circles, n) = corner_layout(width, height);
-    for &(x, y, r, what) in &circles[..n] {
+    for (ci, &(x, y, r, what)) in circles[..n].iter().enumerate() {
         if y >= height as f32 * 0.5 {
             continue;
         }
@@ -3998,6 +4033,45 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         };
         // Light ink on the vessel's dark body: brighter while the circle is live.
         let ink = g2t_colour(if live && !switched_off { (LIVE_INK, LIVE_INK, LIVE_INK) } else { (LIGHT_INK, LIGHT_INK, LIGHT_INK) });
+        // This circle's look, as one key: what it is, whether it runs and is switched off, its colours, and what it shows (the clock its time, the battery its readings, a radio its measures, which its orb and its words come from). Unchanged since its last draw, its pixels stay as they are.
+        let mut key = 0x9E37_79B9_7F4A_7C15u64 ^ ci as u64;
+        let mut mix = |v: u64| key = (key.rotate_left(7) ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        mix(live as u64 | (switched_off as u64) << 1);
+        mix(fill.0.to_bits() as u64 | (fill.1.to_bits() as u64) << 32);
+        mix(fill.2.to_bits() as u64);
+        mix(ink);
+        match what {
+            Corner::Clock => mix(time_h),
+            Corner::Battery => facts[1..5].iter().for_each(|&f| mix(f)),
+            _ => {}
+        }
+        if let Some(ri) = radio {
+            facts[33 + 8 * ri..41 + 8 * ri].iter().for_each(|&f| mix(f));
+        }
+        // Never 0, which is "not drawn yet".
+        let key = key | 1;
+        if !whole && unsafe { CON_CIRCLE_KEYS[ci] } == key {
+            continue;
+        }
+        unsafe { CON_CIRCLE_KEYS[ci] = key };
+        // Its disc emptied (everything it draws lies within two pixels of its edge; the circles never reach each other), and its rows owed a decode.
+        let reach = r + 2.5;
+        let (by0, by1) = (((y - reach) as i64).max(0), ((y + reach) as i64 + 1).min(rows as i64));
+        for py in by0..by1 {
+            for px in (x - reach) as i64..=(x + reach) as i64 {
+                let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
+                if dx * dx + dy * dy <= reach * reach {
+                    if let Some(i) = at(px, py) {
+                        console[i] = 0;
+                    }
+                }
+            }
+        }
+        // WHY the bounds: a circle near the console's foot reaches below its rows; only its rows are the console's.
+        if by0 < by1 {
+            dirty_lo = dirty_lo.min(by0 as usize);
+            dirty_hi = dirty_hi.max(by1 as usize);
+        }
         // The text first: it is in front of its vessel. A radio's circle carries words only while it is off, its name alone (owner, 2026-11-07: "it will only show text when off"); on, its orb speaks for it, and its numbers are on its detail page. The clock and the battery keep theirs.
         if radio.is_none() || switched_off || !live {
             let mut lines = [Txt::new(); 9];
@@ -4237,6 +4311,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             VESSEL_US = [0; 2];
             CON_PEAK = 1;
         }
+        CON_ROWS = if whole { (0, rows) } else { (dirty_lo, dirty_hi) };
     }
     true
 }
