@@ -14,7 +14,7 @@
 //!
 //! Positions are deterministic until the person arranges by hand; then each moved circle is kept in the vault (`map.place.<name>`) and wins over the seeded place from then on.
 //!
-//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page).
+//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page, and the identity space: the arrangement and kists written from the person's fleet are read again when its generation moves, docs/IDENTITY-SPACE.md).
 
 #![no_std]
 #![no_main]
@@ -191,6 +191,8 @@ const NAME_BYTES: usize = 1 << 6;
 struct Fleet {
     /// None until the service answered at all (it starts only once a person has attested).
     state: Option<u8>,
+    /// The person's identity space (fgtw op 17): this device's home-screen sync, and whether the first pull from their fleet is done. None until the service answered it.
+    home: Option<(bool, bool)>,
     words: [u8; 64],
     words_n: usize,
     keys: [[u8; 8]; 16],
@@ -224,7 +226,7 @@ struct Fleet {
 
 impl Fleet {
     const fn new() -> Self {
-        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], reach: None, names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0 }
+        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], reach: None, names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0, home: None }
     }
 
     /// The service's state and words (`[state][siblings heard][words]`), then its members (`[count][count × (8 key bytes, flags)]`). CALL_LIVE: a service that is not running answers at once instead of holding the page.
@@ -244,6 +246,8 @@ impl Fleet {
             let age = u32::from_le_bytes([q[1], q[2], q[3], q[4]]);
             (q[0] != 0, (age != u32::MAX).then_some(age), q[5])
         });
+        let mut s = [0u8; 8];
+        self.home = (ferros_sys::call_live(svc, &[17], &mut s) == 8).then(|| (s[4] == 1, s[5] == 1));
         let mut m = [0u8; 1 + 16 * 9 + 16 * (1 + NAME_BYTES)];
         let k = ferros_sys::call_live(svc, &[6], &mut m);
         if k != ferros_sys::ERR && k >= 1 {
@@ -525,6 +529,8 @@ enum Choice {
     FleetClose,
     /// A sibling's departure waiting here: type the words it shows (ahau's keyboard) to approve it.
     FleetApprove,
+    /// The Fleet page's "this device's home screen": follows the person's fleet, or keeps its own (payloads/fgtw op 18; docs/IDENTITY-SPACE.md).
+    HomeSync,
     /// A link on Connections: its own page (LINKS order).
     Link(u8),
     /// A radio's page: its switch, as its console circle's tap (preference 15).
@@ -879,6 +885,24 @@ impl Map {
         if n == self.n {
             return;
         }
+        self.place_circles(n);
+    }
+
+    /// The person's kists and arrangement read again after the identity service wrote them from their fleet (payloads/fgtw space.rs: a reset device getting its home screen back, a move made on another of their devices): every circle placed afresh, each kept place winning, the view as kept, then the scene sent again.
+    fn reload_arrangement(&mut self) {
+        if !self.reload_kists() {
+            return;
+        }
+        // WHY: the arrays hold MAX circles (as at start).
+        let n = (1 + self.kists.kists.len()).min(MAX);
+        self.place_circles(n);
+        if self.load_view() {
+            self.send_scene();
+        }
+    }
+
+    /// `n` circles placed by the seeded fit, each kept place winning (`load_places_near`), pushed apart, and the scene sent.
+    fn place_circles(&mut self, n: usize) {
         self.n = n;
         for i in 1..MAX {
             self.rs[i] = if i < n { radius_of(KIST_SHARE) } else { 0 };
@@ -1930,6 +1954,15 @@ impl Map {
                 }
                 // Adding a device, and approving a sibling's departure (fgtw::sponsor, through payloads/fgtw ops 8-15): a member of the fleet only.
                 if f.state == Some(3) {
+                    // The home screen across the person's devices (owner, 2026-11-08: "on all my ferros devices the homescreen layout should sync, unless of course I go into settings and uncheck that"): its kists and answers always follow them; its arrangement does unless switched off here.
+                    if let Some((on, settled)) = f.home {
+                        let label = match (on, settled) {
+                            (_, false) => "home screen: fetching yours from your fleet",
+                            (true, true) => "home screen: the same on all your devices",
+                            (false, true) => "home screen: this device's own",
+                        };
+                        row(self, b, &mut y, small, if on { white() } else { grey() }, label, settled.then_some(Choice::HomeSync));
+                    }
                     if let Some((intent, result)) = f.depart {
                         let mut l = Line::new();
                         l.s(core::str::from_utf8(&f.depart_name[..f.depart_name_n]).unwrap_or("a device"));
@@ -2584,6 +2617,10 @@ impl Map {
                     Some(Choice::FleetConfirm) => self.fleet.add_op(cap(self.grants, S_FGTW), &[12]),
                     Some(Choice::FleetWords) => self.fleet.add_op(cap(self.grants, S_FGTW), &[15, 1]),
                     Some(Choice::FleetApprove) => self.fleet.add_op(cap(self.grants, S_FGTW), &[15, 2]),
+                    Some(Choice::HomeSync) => {
+                        let on = self.fleet.home.is_some_and(|h| h.0);
+                        self.fleet.add_op(cap(self.grants, S_FGTW), &[18, !on as u8]);
+                    }
                     Some(Choice::FleetRemove) => {
                         if self.fleet.confirm {
                             self.fleet.leave(cap(self.grants, S_FGTW));
@@ -2961,6 +2998,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut grab_n = 0usize;
     let mut last_app_check = 0u64;
     let mut last_facts = 0u64;
+    // The identity space's generation last read (payloads/fgtw op 17), and when it was asked.
+    let mut space_seen = 0u32;
+    let mut last_space = 0u64;
     let mut last_pass = now();
     let mut draw_us = 0u64;
     let mut move_us = 0u64;
@@ -3002,6 +3042,19 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         if sc != scale_seen {
             scale_seen = sc;
             map.draw();
+        }
+
+        // The person's identity space (payloads/fgtw op 17): once a second, on the plane with nothing held, its generation asked; a new one means the identity service wrote this device's kists or home screen from the person's fleet (a reset device getting its arrangement back, a move made on another of their devices), and the circles are read again. Generation 0 is nothing written yet; a map started after a write reads it once more, which changes nothing.
+        if map.view == View::Map && !down && !map.settling && now().wrapping_sub(last_space) > freq() {
+            last_space = now();
+            let mut s = [0u8; 8];
+            if ferros_sys::call_live(cap(map.grants, S_FGTW), &[17], &mut s) == 8 {
+                let g = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+                if g != space_seen {
+                    space_seen = g;
+                    map.reload_arrangement();
+                }
+            }
         }
 
         // The open settings' live facts (About, Connections, each link's page, the clock): drawn again once a second while they show (live data, not motion).

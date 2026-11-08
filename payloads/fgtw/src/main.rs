@@ -4,7 +4,7 @@
 //!
 //! Identity: the device key is rooted in the kernel's ira (`ira_key("fgtw device")` → `join::DeviceKeys::derive`; "photon device" until 2026-11-04, changed when no fleet held this device), the same after a factory reset; the identity roots (`identity_seed`, `handle_proof`) come from the attest screen (op 4, in RAM) or are pushed into the vault scope `fgtw.` by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the device. Once bound, the chain (`fgtw.chain`) and the fleet key (`fgtw.fleet_key`) live in the same scope. A departure under way is kept there too (`fgtw.depart`, whatever unlock-at-boot says: it holds no root) until it completes, so a restart resumes it. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
 //!
-//! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the binding request (and a departure request) to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same 19 bytes for the boot-started service] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving) and the words the 23 pairing words while joining or the 3 approval words while leaving; op 1 the state alone, op 2 mint (a result byte first), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk). Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
+//! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the binding request (and a departure request) to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same 19 bytes for the boot-started service] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock --store map --store kists. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving) and the words the 23 pairing words while joining or the 3 approval words while leaving; op 1 the state alone, op 2 mint (a result byte first), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk). Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes), 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space: their home screen and their kists, joined to their fleet's, space.rs): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
 
 #![no_std]
 #![no_main]
@@ -18,6 +18,8 @@ use fgtw::pq::FleetSigner;
 use photon_core::join::{self, DeviceKeys, Inbound};
 use photon_core::pt::{self, Addr, Event, Pt};
 use photon_core::wire::{self, Frame};
+
+mod space;
 
 /// The heap and the work thread's stack, in .bss: the entry's header (`ferrosRT`, ferros_rt's) tells the kernel how much zeroed memory follows the code, so the arc holds them (payload.ld). Was 160 KiB in .data to fit a 1 MiB arc: a re-minted binding request (an SLH-DSA signature, 7856 B) then found no free run once the client had run a while, and the client panicked (2026-10-28).
 const HEAP_BYTES: usize = 2 << 20;
@@ -548,10 +550,17 @@ struct Client {
     ble_heard: Vec<([u8; fgtw::pair::BEACON_UUID_LEN], u64)>,
     /// Whether the radios are listening for newcomers (the BLE scan, the NFC reader) while the add flow is open (`sponsor_radios`).
     listening: bool,
+    /// Loop passes since the radios were last told to listen: told again every 64 while the add flow is open, so a driver restarted meanwhile listens again (both answer a repeat with nothing changed). And what they last answered, so only a change is said.
+    listen_pass: u32,
+    listen_said: (u8, u8),
+    /// The beacon ids heard and the candidates heard by Bluetooth at the last look, so only a change is said.
+    ble_said: (usize, usize),
     /// A sibling's departure waiting for approval here.
     depart_ask: Option<DepartAsk>,
     /// Words wanted from the person (op 15, the Fleet page): 0 none, 1 a newcomer's pairing words, 2 a leaver's approval words. The keyboard's host (the attest screen, ahau) asks for it (op 16), sends what is typed (ops 11, 14), and closes when the words match or the person cancels (op 15 [0]).
     entry: u8,
+    /// The person's identity space (space.rs, docs/IDENTITY-SPACE.md): their kists, answers and home screen, kept here and synced with their fleet.
+    space: space::SpaceSync,
 }
 
 impl Client {
@@ -1079,6 +1088,7 @@ impl Client {
         self.request_t = 0;
         self.request_frame.clear();
         self.verdict = V_NONE;
+        self.space = space::SpaceSync::new();
     }
 
     /// fgtw's transport for this call, starting from the address resolved last.
@@ -1395,6 +1405,9 @@ impl Client {
             // A newcomer asking this device to add it, and a sibling asking to leave: the sponsor's and the approver's frames (fgtw::sponsor).
             Ok((Inbound::Other(name), _)) if name == "bind_req" => self.on_bind_req(from, bytes),
             Ok((Inbound::Other(name), _)) if name == "depart_req" => self.on_depart_req(bytes),
+            // The person's identity space from a sibling (space.rs).
+            Ok((Inbound::Other(name), _)) if name == "space_push" => self.on_space_push(from, bytes),
+            Ok((Inbound::Other(name), _)) if name == "space_want" => self.on_space_want(from, bytes),
             Ok((Inbound::Other(name), signer)) => {
                 self.log.put(b"fgtw: frame ");
                 self.log.put(name.as_bytes());
@@ -1479,6 +1492,17 @@ impl Client {
                 // WHY the min: `n` is what the caller sent, which may be more than the buffer took.
                 let got = (n as usize).min(req.len());
                 // The sponsor's and the approver's ops (the Fleet page's add flow and approvals, fgtw::sponsor): each answers alone, nothing of the state after it. 8 [on] open or close the add flow → [0]; 9 → the add flow (`adding_reply`); 10 [key 8] pick a nearby candidate → [result]; 11 [words] the words typed so far → the match (`type_words`); 12 confirm a nearby pick → [result]; 13 → a departure waiting (`depart_ask_reply`); 14 [words] approve it → [result]; 15 [kind] words wanted from the person (0 none, 1 a newcomer's, 2 a leaver's) → [0]; 16 → the words wanted now [kind] (the keyboard's host asks).
+                // The identity space (space.rs): 17 → its state for the map (`space_reply`: the generation the map reloads its circles on, this device's home-screen sync, the first pull done, the facts); 18 [on] this device's home screen follows the fleet's or keeps its own → [0 done, 1 not yet: before the first pull].
+                if n >= 1 && req[0] == 17 {
+                    let r = self.space_reply();
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
+                if n >= 2 && req[0] == 18 {
+                    let r = [self.space_switch(req[1] != 0)];
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
                 if n >= 1 && (8..=16).contains(&req[0]) {
                     let text = core::str::from_utf8(&req[1..got]).unwrap_or("");
                     let r: Vec<u8> = match req[0] {
@@ -1614,6 +1638,8 @@ impl Client {
             }
             // Sponsoring and approving (fgtw::sponsor): the add flow's listing, binding and growing, the radios listening for newcomers, an approved departure.
             self.sponsor_step(t);
+            // The person's identity space: the first pull, then this device's copy joined to it and handed on (space.rs).
+            self.space_step(t);
             // The verdict: looked up once the network is up, and again every 30 s while GREY or while a fresh handle waits (someone else may mint it meanwhile).
             // The client serves from the start, network or not (the attest screen waits on it); the network coming up is a reason to look up at once, not 30 s later.
             let up = self.udp.flags().is_some_and(|f| f & 1 != 0);
@@ -1697,6 +1723,26 @@ impl Client {
         let ble: Vec<[u8; fgtw::pair::BEACON_UUID_LEN]> = self.ble_heard.iter().map(|(u, _)| *u).collect();
         let lan: Vec<[u8; 32]> = self.lan_from.iter().filter(|(_, _, at)| t - at < NEARBY_US).map(|(k, _, _)| *k).collect();
         self.adding.cands = fgtw::sponsor::candidates(reqs, &seed, &hp, &ble, &lan);
+        // Measuring the nearby path: how many beacon ids Bluetooth hears, and how many devices asking match one (fgtw::pair::beacon_matches), said when either changes.
+        let matched = self.adding.cands.iter().filter(|c| c.heard_ble).count();
+        if (ble.len(), matched) != self.ble_said {
+            self.ble_said = (ble.len(), matched);
+            self.log.put(b"fgtw: Bluetooth hears ");
+            self.log.dec(ble.len() as u64);
+            self.log.put(b" service id(s); ");
+            self.log.dec(matched as u64);
+            self.log.put(b" of the ");
+            self.log.dec(self.adding.cands.len() as u64);
+            self.log.put(b" device(s) asking to join match one");
+            self.log.line();
+        }
+        // A device asking is known only from fgtw.org's registry or a request on this network: a beacon alone names no request to match. With neither, the page says so.
+        if self.adding.phase == ADD_OPEN {
+            self.adding.note.clear();
+            if self.adding.cands.is_empty() {
+                self.adding.note.push_str(if self.net_up { "waiting for a device to ask (fgtw.org, this network)" } else { "no network: a device asking is found through fgtw.org (cellular or WiFi)" });
+            }
+        }
     }
 
     /// A newcomer's binding request handed to this device over the LAN (`bind_req`): taken only by a member of the fleet it names, checked exactly as a registry row is (fgtw::sponsor::check_lan_request), kept as the newest from its device, and its address remembered for the hand-over.
@@ -2115,7 +2161,15 @@ impl Client {
         let (mut ra, mut rb) = ([0u8; 4], [0u8; 4]);
         let a = ferros_sys::call_live(nfc, &[if on { 4 } else { 5 }], &mut ra);
         let b = ferros_sys::call_live(bt, &[if on { 3 } else { 4 }], &mut rb);
+        let changed = on != self.listening;
         self.listening = on;
+        self.listen_pass = 0;
+        let code = |n: u64, r: &[u8; 4]| -> u8 { if n == ERR { 2 } else if n >= 1 && r[0] != 0 { 1 } else { 0 } };
+        let now_said = (code(a, &ra), code(b, &rb));
+        if !changed && now_said == self.listen_said {
+            return;
+        }
+        self.listen_said = now_said;
         let said = |n: u64, r: &[u8; 4]| -> &'static [u8] { if n == ERR { b"not running" } else if n >= 1 && r[0] != 0 { b"refused" } else { b"ok" } };
         self.log.put(if on { b"fgtw: listening for newcomers: nfc reader ".as_slice() } else { b"fgtw: no longer listening for newcomers: nfc reader " });
         self.log.put(said(a, &ra));
@@ -2173,7 +2227,8 @@ impl Client {
     /// The sponsor's work, once a pass of the loop: the registry listed every 8 s while the add flow is open, the radios listening while it is, a pick bound, a confirm grown, an approval countersigned.
     fn sponsor_step(&mut self, t: u64) {
         let open = self.adding.phase != ADD_CLOSED && self.bound;
-        if open != self.listening {
+        self.listen_pass += 1;
+        if open != self.listening || (open && self.listen_pass >= 64) {
             self.sponsor_radios(open);
         }
         if open {
@@ -2192,6 +2247,12 @@ impl Client {
                 match r {
                     Ok(reqs) => {
                         self.seed_heard_us = now_us();
+                        if reqs.len() != self.adding.registry.len() {
+                            self.log.put(b"fgtw: fgtw.org's registry lists ");
+                            self.log.dec(reqs.len() as u64);
+                            self.log.put(b" device(s) asking to join");
+                            self.log.line();
+                        }
                         self.adding.registry = reqs;
                         self.rebuild_candidates();
                     }
@@ -2242,7 +2303,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: false, depart_ask: None, entry: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: false, listen_pass: 0, listen_said: (255, 255), ble_said: (0, 0), depart_ask: None, entry: 0, space: space::SpaceSync::new() };
     c.run()
 }
 

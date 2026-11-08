@@ -15,3 +15,5 @@ photon_core = { path = "../../photon_core" }
 fgtw = { path = "../../../fgtw", default-features = false, features = ["fanout", "protocol"] }
 ed25519-dalek = { version = "2", default-features = false }
 vsf = { path = "../../../vsf", default-features = false }
+# The person's identity space (space.rs): ferros's vocabulary for fgtw::space and the sync with this device's copy.
+ferros_space = { path = "../../ferros_space" }

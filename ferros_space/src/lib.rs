@@ -611,3 +611,67 @@ mod tests {
         assert_eq!(decode_view(&encode_view(&v)), Some(v));
     }
 }
+
+/// The end test on the host with a real device's data: `FERROS_SPACE_DUMP=<dir> cargo test -p ferros_space -- --ignored --nocapture`, the directory holding what `ferros-bridge store get` read off the device (`kists.list`, `map.place.<label>` for settings and each kist, `map.view`). The device's copy goes into a space, sealed and opened as it crosses the fleet, and an empty vault (a reset device) is brought back from it; the two copies must match byte for byte. Reads the device's files only; writes nothing to it.
+#[cfg(test)]
+mod device_dump {
+    extern crate std;
+    use super::*;
+    use std::collections::BTreeMap;
+
+    struct Files(BTreeMap<(u8, Vec<u8>), Vec<u8>>);
+
+    impl Store for Files {
+        fn get(&mut self, s: Scope, key: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+            Ok(self.0.get(&(s as u8, key.to_vec())).cloned())
+        }
+        fn set(&mut self, s: Scope, key: &[u8], value: &[u8]) -> bool {
+            self.0.insert((s as u8, key.to_vec()), value.to_vec());
+            true
+        }
+        fn remove(&mut self, s: Scope, key: &[u8]) -> bool {
+            self.0.remove(&(s as u8, key.to_vec()));
+            true
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn a_devices_own_copy_comes_back_from_its_space() {
+        let Ok(dir) = std::env::var("FERROS_SPACE_DUMP") else { return };
+        let mut device = Files(BTreeMap::new());
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let e = e.unwrap();
+            let name = e.file_name().into_string().unwrap();
+            let bytes = std::fs::read(e.path()).unwrap();
+            let (scope, key) = match name.split_once('.') {
+                Some(("kists", k)) => (Scope::Kists, k),
+                Some(("map", k)) => (Scope::Map, k),
+                _ => continue,
+            };
+            device.set(scope, key.as_bytes(), &bytes);
+        }
+        let me = [0x11; 32];
+        let (mut space, mut base) = (Space::new(), Baseline::default());
+        let o = sync(&mut space, &mut base, &mut device, &me, 1 << 40).unwrap();
+        let list = read_list(&mut device).unwrap();
+        std::println!("the device's copy: {} kist(s) ({}), {} fact(s) in its space, {} place(s) and the view", list.kists.len(), list.kists.iter().map(|k| k.name.as_str()).collect::<Vec<_>>().join(", "), space.entries().len(), device.0.keys().filter(|k| k.1.starts_with(b"place.")).count());
+        assert!(o.space_changed && o.wrote == 0);
+        let (hp, key) = ([0x77; 32], [0x88; 32]);
+        let doc = space.to_doc(1 << 40).unwrap();
+        let sealed = fgtw::space::seal(&doc, &hp, &key).unwrap();
+        std::println!("sealed: {} bytes of document, {} sealed", doc.len(), sealed.wrap.len());
+        let mut fresh = Files(BTreeMap::new());
+        let (mut sf, mut bf) = (Space::from_doc(&fgtw::space::open(&sealed, &hp, &key).unwrap()).unwrap(), Baseline::default());
+        let o = sync(&mut sf, &mut bf, &mut fresh, &[0x22; 32], (1 << 40) + 1).unwrap();
+        std::println!("the reset device: {} write(s)", o.wrote);
+        assert_eq!(read_list(&mut fresh).unwrap(), list, "the same kists, answers and defaults");
+        for (k, v) in device.0.iter().filter(|(k, _)| k.0 == Scope::Map as u8) {
+            let label = std::string::String::from_utf8_lossy(&k.1);
+            match fresh.0.get(k) {
+                Some(w) if decode_place(w).is_some() && decode_place(w) == decode_place(v) || k.1 == b"view" && decode_view(w) == decode_view(v) => std::println!("  {label}: the same"),
+                other => panic!("{label}: {:?} on the device, {:?} restored", v, other),
+            }
+        }
+    }
+}

@@ -62,8 +62,8 @@ const SHELL: [(&[u8], &[u8], &[u64]); 12] = [
     (b"bt", b"bt", &[81, 82, 76, 83, 41]),
     // The cellular modem's driver (payloads/modem): it powers the CP, registers and serves the data call on rmnet; ip takes it as its second link.
     (b"modem", b"modem", &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 40, 69, 70, 71, 72, 73, 74, 75, 76]),
-    // What reads the person's space (the identity class), each when it may (`wait_person`). fgtw, the identity service, once an identity is unlocked: it is part of attest, looking the identity up and joining its fleet (its chain and key; not the Photon app, which a person installs): 1 use udp, 2 the vault scope `fgtw.`, 3 the ira key, 4 serve fgtw, 5 entropy (the fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right (payloads/fgtw). The map only once the device is also bound to that identity (owner, 2026-11-04: "if it's not attached to an identity, not usable"): its arrangement, 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page).
-    (b"fgtw", b"fgtw", &[50, 48, 49, 46, 41, 80, 84, 85]),
+    // What reads the person's space (the identity class), each when it may (`wait_person`). fgtw, the identity service, once an identity is unlocked: it is part of attest, looking the identity up and joining its fleet (its chain and key; not the Photon app, which a person installs): 1 use udp, 2 the vault scope `fgtw.`, 3 the ira key, 4 serve fgtw, 5 entropy (the fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right, 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space, joined to their fleet's: payloads/fgtw space.rs). The map only once the device is also bound to that identity (owner, 2026-11-04: "if it's not attached to an identity, not usable"): its arrangement, 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page).
+    (b"fgtw", b"fgtw", &[50, 48, 49, 46, 41, 80, 84, 85, 20, 107]),
     (b"map", b"map", &[17, 18, 19, 20, 47, 107, 106]),
 ];
 
