@@ -1241,23 +1241,7 @@ fn call_endpoint(f: &mut Frame, cur: usize, ep: usize, msg: Vec<u8>, roff: u64, 
     t.frame = *f;
     tr(TR_CALL, cur, ep as u64);
     kk.endpoints[ep].queue.push_back((cur, msg));
-    // A server thread already waiting on this endpoint takes it now.
-    if let Some(server) = kk.threads.iter().position(|q| matches!(q, Some(q) if matches!(q.state, State::Receiving(e, ..) if e == ep))) {
-        deliver(server, ep);
-    } else if let Some(s) = kk.endpoints[ep].poller {
-        // A polling server asleep between polls: wake it now (its sleep returns early, which a poll loop reads as "look again").
-        if let Some(q) = th(s) {
-            // Asleep, or in a timed interrupt wait (a driver that serves an endpoint and waits for its device in one loop): back with 2, as at its deadline.
-            if matches!(q.state, State::Sleeping(_)) || matches!(q.state, State::Waiting(a, _) if a < 1024) {
-                if matches!(q.state, State::Waiting(..)) {
-                    q.frame.x[0] = 2;
-                }
-                q.state = State::Runnable;
-                enqueue_back(s);
-                tr(TR_WAKE_POLL, s, ep as u64);
-            }
-        }
-    }
+    wake_server(ep);
     if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
 }
 
@@ -1381,20 +1365,48 @@ fn store_forward(f: &mut Frame, cur: usize, ep: usize, sc: &StoreScope) -> u64 {
     }
     // The classes the request covers: a listing both where the scope holds the person's names (the device's always), anything else its own name's.
     let classes: &[bool] = if list && crate::kvault::identity_within(sc.prefix) { &[false, true] } else if crate::kvault::identity_class(&full) { &[true] } else { &[false] };
-    let mut msg = Vec::with_capacity(8 + 2 * 65 + 34 + 13 + len);
-    msg.push(if list { 3 } else if del { 2 } else if set { 0 } else { 1 });
+    let mut rest = Vec::with_capacity(13 + len);
+    if set {
+        rest.extend_from_slice(&offset.to_le_bytes());
+        rest.push(more as u8);
+        rest.extend_from_slice(&p.read(f.x[4], len));
+    } else if !del {
+        rest.extend_from_slice(&offset.to_le_bytes());
+        rest.extend_from_slice(&(len as u32).to_le_bytes());
+        if list {
+            rest.push(raw as u8);
+        }
+    }
+    let op = if list { VOP_LIST } else if del { VOP_DELETE } else if set { VOP_SET } else { VOP_GET };
+    let Some(msg) = stamp(op, sc.prefix, classes, &name, &rest) else {
+        f.x[0] = ERR;
+        return 0;
+    };
+    let rcap = if set || del { 0 } else { len as u64 };
+    call_endpoint(f, cur, ep, msg, f.x[4], rcap | STORE_REPLY)
+}
+
+/// The vault process's operations (payloads/vault): the four a `SYS_STORE` call makes, then the kernel's own.
+pub const VOP_SET: u8 = 0;
+pub const VOP_GET: u8 = 1;
+pub const VOP_DELETE: u8 = 2;
+pub const VOP_LIST: u8 = 3;
+
+/// A stamped request (`store_forward`'s message layout): `prefix`'s domain in each class of `classes`, then `name` and `rest`. A listing leaves out the person's domain while they are locked; anything else needing a locked class is None, as the kernel's vault refuses it.
+fn stamp(op: u8, prefix: &str, classes: &[bool], name: &[u8], rest: &[u8]) -> Option<Vec<u8>> {
+    let mut msg = Vec::with_capacity(8 + classes.len() * 65 + 1 + name.len() + rest.len());
+    msg.push(op);
     msg.push(MIGRATE_PENDING.load(core::sync::atomic::Ordering::Acquire) as u8);
     msg.extend_from_slice(&LOCK_EPOCH.load(core::sync::atomic::Ordering::Acquire).to_le_bytes());
     let at_count = msg.len();
     msg.push(0);
     for &identity in classes {
-        // A listing leaves out the person's domain while they are locked; anything else is refused, as the kernel's vault refuses it.
-        let Some(mut keys) = domain_keys(sc.prefix, identity) else {
-            if list && identity {
+        let Some(mut keys) = domain_keys(prefix, identity) else {
+            if op == VOP_LIST && identity {
                 continue;
             }
-            f.x[0] = ERR;
-            return 0;
+            msg.fill(0);
+            return None;
         };
         msg.push(identity as u8);
         msg.extend_from_slice(&keys);
@@ -1402,20 +1414,107 @@ fn store_forward(f: &mut Frame, cur: usize, ep: usize, sc: &StoreScope) -> u64 {
         msg[at_count] += 1;
     }
     msg.push(name.len() as u8);
-    msg.extend_from_slice(&name);
-    if set {
-        msg.extend_from_slice(&offset.to_le_bytes());
-        msg.push(more as u8);
-        msg.extend_from_slice(&p.read(f.x[4], len));
-    } else if !del {
-        msg.extend_from_slice(&offset.to_le_bytes());
-        msg.extend_from_slice(&(len as u32).to_le_bytes());
-        if list {
-            msg.push(raw as u8);
+    msg.extend_from_slice(name);
+    msg.extend_from_slice(rest);
+    Some(msg)
+}
+
+/// The caller the kernel is on the vault endpoint (VAULT-OUT.md interface 5, the kernel's own channel): no thread behind it. Its call is queued and delivered as any other; the vault's reply lands in `KERNEL_CALL` for the service loop (the bridge's `store` commands, release).
+const KERNEL_CALLER: usize = usize::MAX;
+/// The kernel's call: in flight (queued, or delivered and not yet answered), and its answer once it came, Ok(the vault's reply: [the value u64 LE][the bytes]) or Err (the vault ended without answering). One at a time.
+static mut KERNEL_CALL: (bool, Option<Result<Vec<u8>, ()>>) = (false, None);
+
+fn kernel_call() -> &'static mut (bool, Option<Result<Vec<u8>, ()>>) {
+    // SAFETY: only under the kernel lock (the syscalls that answer it, and `vault_call`/`vault_answer`, which take it).
+    unsafe { &mut *(&raw mut KERNEL_CALL) }
+}
+
+/// The vault answered the kernel's call, or ended without answering: kept for the service loop, woken by the event in case it sleeps.
+fn kernel_answered(r: Result<Vec<u8>, ()>) {
+    let c = kernel_call();
+    if c.0 {
+        c.1 = Some(r);
+    }
+    unsafe { core::arch::asm!("sev") };
+}
+
+/// The kernel's own call to the vault process: `msg`, a stamp (`vault_stamp`, `vault_stamp_list`). False when no vault process serves or a call is already in flight; the message is wiped then.
+pub fn vault_call(mut msg: Vec<u8>) -> bool {
+    with_lock(|| {
+        let c = kernel_call();
+        let Some(ep) = vault_ep().filter(|_| !c.0) else {
+            msg.fill(0);
+            return false;
+        };
+        *c = (true, None);
+        tr(TR_CALL, KERNEL_CALLER, ep as u64);
+        k().endpoints[ep].queue.push_back((KERNEL_CALLER, msg));
+        wake_server(ep);
+        true
+    })
+}
+
+/// The kernel's call's answer once it came: Ok((the value, the bytes)) or Err (the vault ended without answering, or answered short). None while it waits, or when none was made.
+pub fn vault_answer() -> Option<Result<(u64, Vec<u8>), ()>> {
+    with_lock(|| {
+        let c = kernel_call();
+        let r = c.1.take()?;
+        c.0 = false;
+        Some(r.and_then(|m| match m.get(..8) {
+            Some(v) => Ok((u64::from_le_bytes(v.try_into().unwrap()), m[8..].to_vec())),
+            None => Err(()),
+        }))
+    })
+}
+
+/// Whether a vault process serves the `vault` endpoint (alive, opening or receiving): the kernel's own channel goes there, not to the kernel's vault.
+pub fn vault_serving() -> bool {
+    with_lock(|| vault_ep().is_some())
+}
+
+/// The scope a full name belongs to in the vault process, and the name within it, if it is one the vault takes (a scope's, not one the kernel keeps, a name of printable ASCII up to 96 bytes, as `store_forward` refuses the rest).
+pub fn vault_name(full: &str) -> Option<(&'static StoreScope, &[u8])> {
+    let sc = scope_of(full)?;
+    let rel = &full.as_bytes()[sc.prefix.len()..];
+    (!rel.is_empty() && rel.len() <= 96 && rel.iter().all(|&b| (0x21..0x7F).contains(&b))).then_some((sc, rel))
+}
+
+/// A stamp for the kernel's own get, set or delete of the full name `full` (`vault_name`): its scope's domain in the name's class. None when the vault does not take the name, or the class is locked.
+pub fn vault_stamp(op: u8, full: &str, rest: &[u8]) -> Option<Vec<u8>> {
+    let (sc, rel) = vault_name(full)?;
+    // Under the kernel lock: the person's keys come from the vault's unlock state, which an unlock or a lock on another core changes.
+    with_lock_held_or(|| stamp(op, sc.prefix, &[crate::kvault::identity_class(full)], rel, rest))
+}
+
+/// A stamp for the kernel's own listing of scope `i` of `STORES` from `offset`, at most `len` bytes (names one per line): every class the scope holds, the person's left out while locked. With its prefix, to make the names whole.
+pub fn vault_stamp_list(i: usize, offset: u64, len: u32) -> Option<(Vec<u8>, &'static str)> {
+    let sc = STORES.get(i)?;
+    let classes: &[bool] = if crate::kvault::identity_within(sc.prefix) { &[false, true] } else { &[false] };
+    let mut rest = Vec::with_capacity(13);
+    rest.extend_from_slice(&offset.to_le_bytes());
+    rest.extend_from_slice(&len.to_le_bytes());
+    rest.push(0);
+    Some((with_lock_held_or(|| stamp(VOP_LIST, sc.prefix, classes, &[], &rest))?, sc.prefix))
+}
+
+/// A server receiving on `ep` takes the head of its queue now; a polling server asleep between polls is woken (its sleep returns early, which a poll loop reads as "look again").
+fn wake_server(ep: usize) {
+    let kk = k();
+    if let Some(server) = kk.threads.iter().position(|q| matches!(q, Some(q) if matches!(q.state, State::Receiving(e, ..) if e == ep))) {
+        deliver(server, ep);
+    } else if let Some(s) = kk.endpoints[ep].poller {
+        if let Some(q) = th(s) {
+            // Asleep, or in a timed interrupt wait (a driver that serves an endpoint and waits for its device in one loop): back with 2, as at its deadline.
+            if matches!(q.state, State::Sleeping(_)) || matches!(q.state, State::Waiting(a, _) if a < 1024) {
+                if matches!(q.state, State::Waiting(..)) {
+                    q.frame.x[0] = 2;
+                }
+                q.state = State::Runnable;
+                enqueue_back(s);
+                tr(TR_WAKE_POLL, s, ep as u64);
+            }
         }
     }
-    let rcap = if set || del { 0 } else { len as u64 };
-    call_endpoint(f, cur, ep, msg, f.x[4], rcap | STORE_REPLY)
 }
 
 const ENTROPY_CONTEXT: &str = "ferros husky 2026-10-15 entropy syscall v1";
@@ -1498,7 +1597,7 @@ pub struct PowerSwitch {
     pub set: fn(bool) -> bool,
 }
 pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gps", set: crate::gps::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }];
-const ERR: u64 = u64::MAX;
+pub const ERR: u64 = u64::MAX;
 /// What a polling `recv` returns when no message is waiting.
 pub const NOTHING: u64 = u64::MAX - 1;
 /// What `spawn` reports for a process still running when its slice ended (it continues in later slices).
@@ -2457,7 +2556,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     // One transfer, and a forwarded store reply's 8-byte value ahead of it (`store_forward`); a plain caller still gets at most what it asked for.
                     let msg = p.read(f.x[1], (f.x[2] as usize).min(STORE_MAX + 8));
                     let mut handed = false;
-                    if let (Some(ct), Some(cp)) = (th(caller), proc_of(caller)) {
+                    if caller == KERNEL_CALLER {
+                        // The kernel's own call (`vault_call`): kept for the service loop; the server runs on.
+                        kernel_answered(Ok(msg));
+                    } else if let (Some(ct), Some(cp)) = (th(caller), proc_of(caller)) {
                         if let State::Calling(roff, rcap) = ct.state {
                             if rcap & STORE_REPLY != 0 {
                                 // A forwarded store call (`store_forward`): the vault's reply is the syscall's value, then the bytes for the caller's buffer, as many as it asked for. WHY the checks: the reply is the vault process's, its length its own.
@@ -2525,7 +2627,9 @@ fn add_thread(t: Thread) -> usize {
 fn fail_callers(cspace: &[CapEntry]) {
     for c in cspace {
         if let Object::Reply(caller) = c.object {
-            if let Some(ct) = th(caller) {
+            if caller == KERNEL_CALLER {
+                kernel_answered(Err(()));
+            } else if let Some(ct) = th(caller) {
                 if matches!(ct.state, State::Calling(..)) {
                     ct.frame.x[0] = ERR;
                     ct.state = State::Runnable;
@@ -2560,7 +2664,14 @@ fn fail_orphaned_calls() {
         }
         let queued: Vec<usize> = kk.endpoints[ep].queue.iter().map(|q| q.0).collect();
         for caller in queued {
-            if let Some(ct) = th(caller) {
+            if caller == KERNEL_CALLER {
+                // The kernel's own call, queued for a vault that ended: its stamp (domain keys) wiped, the service loop told.
+                for q in k().endpoints[ep].queue.iter_mut().filter(|q| q.0 == KERNEL_CALLER) {
+                    q.1.fill(0);
+                }
+                k().endpoints[ep].queue.retain(|q| q.0 != KERNEL_CALLER);
+                kernel_answered(Err(()));
+            } else if let Some(ct) = th(caller) {
                 // A forwarded store call waits as CALL_LIVE does: its frame's x4 is the caller's buffer, so the mark is in the state.
                 if matches!(ct.state, State::Calling(..)) && ct.frame.x[4] & CALL_LIVE != 0 || matches!(ct.state, State::Calling(_, c) if c & STORE_REPLY != 0) {
                     ct.frame.x[0] = ERR;

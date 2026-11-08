@@ -219,6 +219,171 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
     }
 }
 
+/// A bridge `store` command the vault process answers (VAULT-OUT.md: the names it holds), through the kernel's own channel (process.rs `vault_call`), a transfer a call. Its PT reply waits until the last call is answered: the USB process polls for a reply that is not ready yet (ptlink.rs).
+#[cfg(not(ferros_production))]
+enum VaultJob {
+    /// A value read whole: its full name, what has come so far.
+    Get { full: alloc::string::String, got: alloc::vec::Vec<u8> },
+    /// A value written in pieces from the command's parameters (the command kept beside the job: `vault_cmd` in `run`): its full name, where the value starts in them, the next offset into it.
+    Put { full: alloc::string::String, from: usize, at: usize },
+    Remove { full: alloc::string::String },
+    /// Every name: the kernel's own vault's first (already in `out`, after its status byte), then each scope's from the vault process in turn, `scope` the one being read, `at` into its listing, `part` its listing so far.
+    List { out: alloc::vec::Vec<u8>, scope: usize, at: u64, part: alloc::vec::Vec<u8> },
+}
+
+/// One transfer of the kernel's channel (process.rs STORE_MAX, the vault process's one-transfer bound).
+#[cfg(not(ferros_production))]
+const VAULT_PIECE: usize = crate::process::STORE_MAX;
+
+/// A bridge `store` command for the vault process: Some(Ok(the job, its first call made)) when the vault process serves and the name is one it holds (a scope's, not one the kernel keeps), or the listing; Some(Err(the PT reply)) when the call could not be made; None: the kernel's vault answers, as before.
+#[cfg(not(ferros_production))]
+fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u8]) -> Option<Result<VaultJob, alloc::vec::Vec<u8>>> {
+    if !crate::process::vault_serving() {
+        return None;
+    }
+    let name = |b: &[u8]| core::str::from_utf8(b).ok().filter(|k| crate::process::vault_name(k).is_some()).map(alloc::string::String::from);
+    let job = match op {
+        ferros_pt::Op::Write => {
+            let klen = u16::from_be_bytes([*params.first()?, *params.get(1)?]) as usize;
+            VaultJob::Put { full: name(params.get(2..2 + klen)?)?, from: 2 + klen, at: 0 }
+        }
+        ferros_pt::Op::Read if params.is_empty() => {
+            let mut out = alloc::vec![0u8];
+            match crate::process::with_lock(|| store.as_mut().map(|s| s.keys())) {
+                Some(Ok(keys)) => {
+                    for k in keys {
+                        out.extend_from_slice(k.as_bytes());
+                        out.push(b'\n');
+                    }
+                }
+                Some(Err(_)) => return Some(Err(alloc::vec![2])),
+                None => {}
+            }
+            VaultJob::List { out, scope: 0, at: 0, part: alloc::vec::Vec::new() }
+        }
+        ferros_pt::Op::Read => VaultJob::Get { full: name(params)?, got: alloc::vec::Vec::new() },
+        ferros_pt::Op::Exec => VaultJob::Remove { full: name(params)? },
+    };
+    Some(vault_job_call(&job, params).map(|_| job))
+}
+
+/// The job's next call to the vault process; Err(the PT reply) when it cannot be made.
+#[cfg(not(ferros_production))]
+fn vault_job_call(job: &VaultJob, params: &[u8]) -> Result<(), alloc::vec::Vec<u8>> {
+    use crate::process::{vault_stamp, VOP_DELETE, VOP_GET, VOP_SET};
+    let mut rest = alloc::vec::Vec::with_capacity(16 + VAULT_PIECE);
+    let msg = match job {
+        VaultJob::Get { full, got } => {
+            rest.extend_from_slice(&(got.len() as u64).to_le_bytes());
+            rest.extend_from_slice(&(VAULT_PIECE as u32).to_le_bytes());
+            vault_stamp(VOP_GET, full, &rest)
+        }
+        VaultJob::Put { full, from, at } => {
+            let value = &params[*from..];
+            let end = (at + VAULT_PIECE).min(value.len());
+            rest.extend_from_slice(&(*at as u64).to_le_bytes());
+            rest.push((end < value.len()) as u8);
+            rest.extend_from_slice(&value[*at..end]);
+            vault_stamp(VOP_SET, full, &rest)
+        }
+        VaultJob::Remove { full } => vault_stamp(VOP_DELETE, full, &[]),
+        VaultJob::List { scope, at, .. } => crate::process::vault_stamp_list(*scope, *at, VAULT_PIECE as u32).map(|(m, _)| m),
+    };
+    rest.fill(0);
+    let Some(msg) = msg else {
+        let mut r = alloc::vec![2u8];
+        r.extend_from_slice(b"locked: the person's entries open only while they are present");
+        return Err(r);
+    };
+    if crate::process::vault_call(msg) {
+        Ok(())
+    } else {
+        let mut r = alloc::vec![4u8];
+        r.extend_from_slice(b"the vault process is gone, or the kernel's channel to it is busy");
+        Err(r)
+    }
+}
+
+/// One step of a job: the answer to its last call, if it has come, then its next call. Some(the PT reply) when it is done. A get or a remove the vault process does not find goes to the kernel's vault, where a name not yet moved still is.
+#[cfg(not(ferros_production))]
+fn vault_job_step(job: &mut VaultJob, params: &[u8], store: &mut Option<ShimStore>) -> Option<alloc::vec::Vec<u8>> {
+    use crate::process::{ERR, NOTHING};
+    let (value, bytes) = match crate::process::vault_answer()? {
+        Ok(a) => a,
+        Err(()) => return Some(alloc::vec![4]),
+    };
+    match job {
+        VaultJob::Get { full, got } => match value {
+            NOTHING => return Some(crate::process::with_lock(|| store_command(store.as_mut(), ferros_pt::Op::Read, full.as_bytes()))),
+            ERR => return Some(alloc::vec![2]),
+            // The reply is built whole in the kernel's heap, and copied once more as it goes out: held to the limit the kernel's vault keeps for the same reason (STORE_VALUE_MAX).
+            whole if whole as usize > STORE_VALUE_MAX => return Some(alloc::vec![5]),
+            whole => {
+                if got.is_empty() {
+                    got.reserve_exact(whole as usize);
+                }
+                // A piece that brings nothing while the value is not whole would ask for the same piece for ever: the vault's error.
+                if bytes.is_empty() && (got.len() as u64) < whole {
+                    return Some(alloc::vec![2]);
+                }
+                got.extend_from_slice(&bytes);
+                if got.len() as u64 >= whole {
+                    let mut r = alloc::vec::Vec::with_capacity(1 + got.len());
+                    r.push(0);
+                    r.extend_from_slice(got);
+                    got.fill(0);
+                    return Some(r);
+                }
+            }
+        },
+        VaultJob::Put { from, at, .. } => {
+            if value != 0 {
+                return Some(alloc::vec![2]);
+            }
+            let len = params.len() - *from;
+            *at = (*at + VAULT_PIECE).min(len);
+            if *at >= len {
+                return Some(alloc::vec![0]);
+            }
+        }
+        VaultJob::Remove { full } => {
+            return Some(match value {
+                0 => alloc::vec![0],
+                NOTHING => crate::process::with_lock(|| store_command(store.as_mut(), ferros_pt::Op::Exec, full.as_bytes())),
+                _ => alloc::vec![2],
+            });
+        }
+        VaultJob::List { out, scope, at, part } => {
+            if value == ERR {
+                let mut r = alloc::vec![2u8];
+                r.extend_from_slice(alloc::format!("listing scope {} failed", crate::process::STORES[*scope].name).as_bytes());
+                return Some(r);
+            }
+            if bytes.is_empty() && (part.len() as u64) < value {
+                return Some(alloc::vec![2]);
+            }
+            part.extend_from_slice(&bytes);
+            *at = part.len() as u64;
+            if *at >= value {
+                // The scope's listing whole: each name made whole with its scope's prefix.
+                let prefix = crate::process::STORES[*scope].prefix;
+                for line in part.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+                    out.extend_from_slice(prefix.as_bytes());
+                    out.extend_from_slice(line);
+                    out.push(b'\n');
+                }
+                part.clear();
+                *at = 0;
+                *scope += 1;
+                if *scope == crate::process::STORES.len() {
+                    return Some(core::mem::take(out));
+                }
+            }
+        }
+    };
+    vault_job_call(job, params).err()
+}
+
 /// The boot screen: boot path, generation, vault state + root, and how to get out.
 fn status_text(kind: BootKind, generation: u64, probe: Option<&VaultProbe>) -> alloc::vec::Vec<u8> {
     let mut t = alloc::vec::Vec::new();
@@ -1180,6 +1345,11 @@ pub fn run(mut b: Boot) -> ! {
     let mut pt_out_data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let mut proc_restore: Option<alloc::vec::Vec<u8>> = None;
     let mut proc_act = false;
+    // A bridge `store` command the vault process is answering (`VaultJob`), and the command it came in, kept for a put's value (ptlink takes no other until its reply is taken).
+    #[cfg(not(ferros_production))]
+    let mut vault_job: Option<VaultJob> = None;
+    #[cfg(not(ferros_production))]
+    let mut vault_cmd: Option<crate::ptlink::Submitted> = None;
     // The sensors process's check (below): when it last looked.
     let mut sensors_check = 0u64;
 
@@ -1304,8 +1474,27 @@ pub fn run(mut b: Boot) -> ! {
                 platform::reboot();
             }
         }
+        // A bridge `store` command the vault process is answering: its next step; its reply goes out below once the last call is answered.
+        #[cfg(not(ferros_production))]
+        let vault_waits = match vault_job.as_mut() {
+            Some(job) => {
+                let params = vault_cmd.as_ref().and_then(|c| ferros_pt::command::parse(c.payload.bytes())).map(|c| c.params).unwrap_or(&[]);
+                match vault_job_step(job, params, &mut store) {
+                    Some(resp) => {
+                        queue_pt_response(&mut pt_out_data, &resp);
+                        vault_job = None;
+                        vault_cmd = None;
+                        false
+                    }
+                    None => true,
+                }
+            }
+            None => false,
+        };
+        #[cfg(ferros_production)]
+        let vault_waits = false;
         // The USB process's command handled last pass: its raw reply to the process, the kernel's own outbound reply back in place.
-        if let Some(saved) = proc_restore.take() {
+        if let Some(saved) = if vault_waits { None } else { proc_restore.take() } {
             platform::RAW_REPLY.store(false, core::sync::atomic::Ordering::Relaxed);
             let reply = core::mem::replace(&mut pt_out_data, saved);
             let act = core::mem::take(&mut proc_act);
@@ -2751,9 +2940,16 @@ pub fn run(mut b: Boot) -> ! {
                 // A development door: compiled out of a production build (its `open` check refuses it there anyway).
                 #[cfg(not(ferros_production))]
                 {
-                // Under the kernel lock: syscalls on the worker cores reach the vault holding it (the map's places, a setting), so this core takes it too — one owner at a time.
-                let resp = crate::process::with_lock(|| store_command(store.as_mut(), cmd.op, cmd.params));
-                queue_pt_response(&mut pt_out_data, &resp);
+                // A name the vault process holds (and the listing, while it serves): its job, the reply when its last call is answered (`vault_job_step`, at the top of a later pass).
+                match vault_job_start(&mut store, cmd.op, cmd.params) {
+                    Some(Ok(job)) => vault_job = Some(job),
+                    Some(Err(resp)) => queue_pt_response(&mut pt_out_data, &resp),
+                    // Under the kernel lock: syscalls on the worker cores reach the vault holding it (the map's places, a setting), so this core takes it too — one owner at a time.
+                    None => {
+                        let resp = crate::process::with_lock(|| store_command(store.as_mut(), cmd.op, cmd.params));
+                        queue_pt_response(&mut pt_out_data, &resp);
+                    }
+                }
                 }
             } else if cmd.cap == cap_display && cmd.op == ferros_pt::Op::Write {
                 // A development door: compiled out of a production build (its `open` check refuses it there anyway).
@@ -3255,6 +3451,11 @@ pub fn run(mut b: Boot) -> ! {
                 }
                 leave(&b, EXIT_REBOOT, &st);
             }
+        }
+        // A put the vault process takes over later passes reads its value from the command: it stays with the job.
+        #[cfg(not(ferros_production))]
+        if matches!(vault_job, Some(VaultJob::Put { .. })) && vault_cmd.is_none() {
+            vault_cmd = Some(proc_cmd);
         }
     }
 }

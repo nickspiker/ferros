@@ -980,9 +980,9 @@ async fn cmd_store(args: &[String]) {
                 None => args[2].as_bytes().to_vec(),
             };
             let key = args[1].as_bytes();
-            // The vault takes values up to 3 MiB (the kernel's STORE_VALUE_MAX: the seal and the read-back each need about twice the value in one piece of its heap); larger ones it refuses with status 5.
-            if value.len() > 3 << 20 {
-                eprintln!("{} bytes is over the vault's 3 MiB value limit", value.len());
+            // One PT command carries at most 6 MiB (the kernel's ptlink BIG region). A name the vault process holds (a scope's: map., wifi., gpu., …) takes a value up to that; the kernel's own vault refuses one over 3 MiB with status 5 (its STORE_VALUE_MAX: the seal and the read-back each need about twice the value in one piece of its heap).
+            if ferros_pt::command::CMD_MIN_SIZE + 2 + key.len() + value.len() > 6 << 20 {
+                eprintln!("{} bytes is over the 6 MiB one command carries", value.len());
                 std::process::exit(1);
             }
             let mut p = Vec::with_capacity(2 + key.len() + value.len());
@@ -1016,7 +1016,7 @@ async fn cmd_store(args: &[String]) {
             std::process::exit(1);
         }
         Some(s) => {
-            eprintln!("{}", match s { 2 => "vault error", 3 => "bad request", 4 => "no vault open on the device", 5 => "refused: over the vault's 3 MiB value limit", _ => "unknown status" });
+            eprintln!("{}", match s { 2 => "vault error", 3 => "bad request", 4 => "no vault open on the device", 5 => "refused: over 3 MiB (a put to the kernel's own vault, or a get, which the kernel answers whole)", _ => "unknown status" });
             // Newer kernels follow status 2 with the vault's own error text.
             if r.len() > 1 {
                 eprintln!("  {}", String::from_utf8_lossy(&r[1..]));
@@ -1030,6 +1030,8 @@ async fn cmd_store(args: &[String]) {
     }
     let body = &r[1..];
     match args[0].as_str() {
+        // The vault process answers a put with no object hash (its values are a head and pieces, not one object).
+        "put" if body.is_empty() => println!("stored (the vault process)"),
         "put" => println!("stored, object {}", body.iter().map(|b| format!("{b:02x}")).collect::<String>()),
         "get" => match args.get(2) {
             Some(out) => {

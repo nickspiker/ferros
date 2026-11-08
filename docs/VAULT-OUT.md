@@ -101,11 +101,15 @@ The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by t
     - a 6 MiB value (past the old 3 MiB limit) written in 843 ms and read back in 648 ms, the same by BLAKE3;
     - names, delete and absent all hold.
   - **After a reboot.** The vault opens in 139 ms; the GPU boots from `gpu.fw` and the sensors process loads its 15 scripts, both from the vault.
+- **The kernel's own channel, and the bridge's `store` commands through it (2026-11-07, built, not yet on the device):**
+  - The kernel calls the `vault` endpoint as a caller with no thread behind it (`process.rs` `vault_call`): queued and delivered as any call, stamped as `store_forward` stamps (the shared `stamp`), one call at a time. The vault's reply, or an error should the vault end first (`fail_callers`, `fail_orphaned_calls`), lands in a mailbox the service loop reads (`vault_answer`), with an event to wake it.
+  - A bridge `store` command for a name the vault process holds (a scope's, not one the kernel keeps) becomes a job in the service loop (`service.rs` `VaultJob`): a get read a transfer at a time, a put written in pieces from the command (which stays with the job: ptlink takes no other command until its reply is taken), a remove; `ls` lists the kernel's vault, then every scope from the vault process, each name made whole with its prefix. The PT reply waits for the job's last call; the USB process already polls for a reply not ready.
+  - A get or a remove the vault process does not find goes to the kernel's vault, where a name not yet moved still is. A put to the vault process takes up to the 6 MiB one command carries; a get is held to 3 MiB (the reply is built whole in the kernel's heap and copied once more on its way out). The person's names need them unlocked, as before.
+  - With no vault process serving, every command is the kernel's vault's, as before.
 - **Still to do:**
   - the person's entries moving at the first attest (built, not yet seen on the device);
   - the identity export for a departure (`SYS_UNLOCK` op 5), which still reads the kernel's vault and so finds nothing that moved;
   - release (a completed departure) deletes the person's entries only from the kernel's vault: those in the vault process stay on disk, unopenable once the device-only secret is renewed, until the kernel tells the vault to drop the person's domains;
-  - the bridge's `store` commands, which still read and write the kernel's vault (a `put` moves at the next request; `ls` and `get` of a moved name find nothing);
   - per-kist domains through the oracle and the common area's named grants (step 3's rest);
   - the vault's capsule in the kernel image;
   - the kernel's own names moved behind a channel of its own, then `kvault`, `vault_boot` and `ufs_device` retired (step 4).
