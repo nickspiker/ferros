@@ -1340,10 +1340,10 @@ fn build_lut(lut: &mut [u16], white: f32, peak_e: f32) {
 }
 
 /// The panel's brightness: high brightness mode with DBV G#FFF, or normal mode at `dbv`. TE2 with it.
-/// HK3's commands: on akita's AK3B none are sent (its DBV range, WRCTRLD bits and TE2 are its own, and its B9 is the TE select HK3's TE2 writes would change; docs/AK3B.md, the brightness policy is the owner's to decide after measuring): the panel keeps ABL's brightness.
+/// On akita's AK3B only the DBV, as Google's `ak3b_set_brightness` sends it (`51`, big-endian, no test key): WRCTRLD stays ABL's G#20 (BCTRL, no dimming, no HBM, read back 2026-11-08), and HK3's TE2 is not sent (AK3B's B9 is its TE select).
 fn set_panel(dsi: &ferros_dsi::Dsim<DsiGrant>, hbm: bool, dbv: u16) -> bool {
     if ferros_sys::akita() {
-        return false;
+        return !hbm && dsi.dcs(&[0x51, (dbv >> 8) as u8, dbv as u8]).is_ok();
     }
     let r = dsi.dcs(&[0xF0, 0x5A, 0x5A]).and_then(|_| dsi.dcs(&[0x53, if hbm { 0xE0 } else { 0x20 }])).and_then(|_| dsi.dcs(&[0x51, (dbv >> 8) as u8, dbv as u8])).and_then(|_| dsi.dcs(&[0xF0, 0xA5, 0xA5]));
     te2(dsi);
@@ -1368,6 +1368,9 @@ fn te2(dsi: &ferros_dsi::Dsim<DsiGrant>) {
 /// The panel's brightness (DBV) against its light, measured in the 1 cm window (DISPLAY-CALIB.md, 2026-10-22): normal mode to DBV 3307; above that, high brightness mode at its full 1472 cd/m² (native white).
 const DBV_NITS: [(f32, f32); 7] = [(196.0, 1.9), (400.0, 9.2), (853.0, 49.9), (1353.0, 136.2), (2000.0, 324.6), (2600.0, 588.5), (3307.0, 984.2)];
 const HBM_NITS: f32 = 1471.9;
+/// akita's AK3B, from Google's `ak3b_brightness_capability` (not measured on this unit): normal mode DBV 209-3175 for 2-800 cd/m², high brightness mode 3176-4095 for 800-1400. ABL leaves it at DBV 1437 (read back 2026-11-08). E's share of native white (E_LIGHT) is HK3's measured one until AK3B's spectra are measured.
+const AK3B_DBV_TOP: u16 = 3175;
+const AK3B_TOP_NITS: f32 = 800.0;
 
 /// The panel setting that gives a native peak as close to `nits` as it has: (high brightness mode, DBV, the native peak it gives). Between measured points, log-linear.
 fn panel_for(nits: f32) -> (bool, u16, f32) {
@@ -1389,6 +1392,11 @@ fn panel_for(nits: f32) -> (bool, u16, f32) {
 
 /// Brightness (32nds of a stop below the brightest white, preference 3) to (white, the E peak the table lands on, the panel setting): the brightest white is half the E peak at the panel's top (owner: max white one stop under max); every 32 halve it, continuously between (owner, 2026-11-08: a continuous slider); the panel's own brightness comes down once its peak would be more than 16× white (the working format's headroom), so the codes are never wasted on light no value can reach.
 fn brightness(v: u8) -> (f32, f32, bool, u16) {
+    // akita's AK3B: the panel held at the top of its normal mode and every step in the pixels, as husky's below DBV 3307, by the same law (the brightest setting puts white at half the panel's peak). Never its high brightness mode (DBV above 3175, 800-1400 cd/m²): not without the owner's word.
+    if ferros_sys::akita() {
+        let top_e = AK3B_TOP_NITS * E_LIGHT;
+        return (top_e * 0.5 * libm::exp2f(-(v as f32) * (1. / (1 << 5) as f32)), top_e, false, AK3B_DBV_TOP);
+    }
     let top_e = HBM_NITS * E_LIGHT;
     let white = top_e * 0.5 * libm::exp2f(-(v as f32) * (1. / (1 << 5) as f32));
     // The panel never below the normal-mode top (owner, 2026-11-03): below about DBV 1400 the DDIC dims by lengthening each frame's dark window (95 % emission duty at DBV 1490 and above, about 85 % at 1236, under half at 983, measured by eye in Android), so every step under it is the pixel values' (the table and the 12-bit dither), the light's duty staying at the panel's 95 %. High brightness mode only for the steps that need more than DBV 3307 gives.
@@ -1440,7 +1448,7 @@ const FPS_DOT_WORDS: [u32; PHASES] = [0x3FF << 2 | 3, 0x3FF << 12 | 3, 0x3FF << 
 /// The dev dot into the phases in `mask` (bit k = phase k), when built in.
 #[inline(always)]
 fn fps_dot(mask: u32, width: usize, height: usize) {
-    if FPS_DOT {
+    if FPS_DOT && RAW_HOLD.load(Ordering::Acquire) == 0 {
         for k in 0..PHASES {
             if mask >> k & 1 == 1 {
                 phase_slice(k, width * height)[height / 2 * width + width / 2] = FPS_DOT_WORDS[k];
@@ -1591,7 +1599,7 @@ fn publish10x4(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask:
 
 /// The home screen's rows into the phases `mask` names, each pixel front to back (`glass_front`): the glass's edge, then the console (its rows only), then the canvas. A 16-pixel step that touches neither is the canvas straight through the NEON present; one that does is composed first and goes through the app's present, which leaves the mask's own pixels undithered.
 fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask: u32, r: draw::Rect) {
-    if r.is_empty() {
+    if r.is_empty() || RAW_HOLD.load(Ordering::Acquire) == 1 {
         return;
     }
     let (x0, x1) = ((r.x0 as usize) & !15, ((r.x1 as usize + 15) & !15).min(width & !15));
@@ -2858,8 +2866,59 @@ fn fold(acc: u64, t: u64, p: u64, mode: u8) -> (u64, u64) {
 
 /// The glass's own corner radius, in panel pixels: a fact of this panel to be tuned on the device (owner, 2026-11-02: "we'll fine tune the radius on this device to squeeze as much out of it"). Android reports 68 at its 1008-wide frame, 91 at the full raster.
 const GLASS_RADIUS: f32 = 80.0;
-/// akita's AK3B (1080 × 2400): Android reports 128 (its device overlay's rounded_corner_radius, device/google/akita) where it reports husky's 91; taken in husky's tuned proportion (80 of 91) until the owner tunes it on the device.
-const GLASS_RADIUS_AKITA: f32 = 112.5;
+/// akita's AK3B (1080 × 2400): Android reports 128 (its device overlay's rounded_corner_radius, device/google/akita) where it reports husky's 91. First taken in husky's tuned proportion (80 of 91), 112.5; on the glass the small corners then had about 8 px to spare (owner, 2026-11-08), and 98 cut the small corner's diagonal 8.1 px less (64.8 to 56.7 px along it, exponent 4); then the owner, on the glass: "Let's try 2px smaller radius", 96 (fluor's exponent goes to 5 there: the small corner 303.7 px long and squarer, its diagonal cut 55.6 px). Tuned further with op 52 (tools/akita-glass.sh corner).
+const GLASS_RADIUS_AKITA: f32 = 96.0;
+
+/// 1 while a development drawing (op 52) holds every phase: nothing else is published until it is released.
+static RAW_HOLD: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a pixel centre lies outside the glass's corners at glass radius `g`, as `plan_glass` shapes them (fluor `glass_corner_params`: the superellipse ((R−x)/R)^n + ((R−y)/R)^n = 1 from each corner, the top-left and bottom-right corners twice the others).
+fn outside_corners(x: usize, y: usize, w: f32, h: f32, rs: f32, rb: f32, n: i32) -> bool {
+    let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+    let (left, top) = (fx < w * 0.5, fy < h * 0.5);
+    let r = if left == top { rb } else { rs };
+    let (dx, dy) = (if left { fx } else { w - fx }, if top { fy } else { h - fy });
+    if dx >= r || dy >= r {
+        return false;
+    }
+    let (u, v) = ((r - dx) / r, (r - dy) / r);
+    libm::powf(u, n as f32) + libm::powf(v, n as f32) > 1.0
+}
+
+/// Op 52's corners: every phase grey inside the glass's corners at glass radius `g` and the development orange outside them, no mask, no antialiasing (each pixel by its centre). Where orange shows on the glass, the mask at `g` cuts glass; where the grey's corner meets the glass's own edge with no orange, it does not. Returns the corners' (small, big, exponent).
+fn raw_corners(width: usize, height: usize, g: f32) -> (f32, f32, i32) {
+    let (rs, rb, n) = fluor::paint::edge::glass_corner_params(g, width as f32, height as f32);
+    let (inside, outside) = (pack10(800, 800, 800), pack10(1020, 512, 0));
+    for k in 0..PHASES {
+        let dst = phase_slice(k, width * height);
+        for y in 0..height {
+            for x in 0..width {
+                dst[y * width + x] = if outside_corners(x, y, width as f32, height as f32, rs, rb, n) { outside } else { inside };
+            }
+        }
+    }
+    (rs, rb, n)
+}
+
+/// Op 52's cutout: every phase black but a white ring 16 px wide from radius `r` out, round (`cx`, `cy`), and a red crosshair through the centre beyond the ring (16 to 64 px past it), no antialiasing. Where the ring's inner edge meets the camera hole with no black between, all round, the hole's edge is `r` about that centre; black showing on one side means the hole sits off that way, the ring cut into on a side means the hole reaches past `r` there.
+fn raw_cutout(width: usize, height: usize, cx: f32, cy: f32, r: f32) {
+    let (white, red, black) = (pack10(1020, 1020, 1020), pack10(1020, 0, 0), pack10(0, 0, 0));
+    let (r0, r1) = (r * r, (r + 16.) * (r + 16.));
+    let (c0, c1) = (r + 16., r + 64.);
+    for k in 0..PHASES {
+        let dst = phase_slice(k, width * height);
+        for y in 0..height {
+            let dy = y as f32 + 0.5 - cy;
+            for x in 0..width {
+                let dx = x as f32 + 0.5 - cx;
+                let d2 = dx * dx + dy * dy;
+                // The crosshair: the pixel row and column holding the centre, beyond the ring.
+                let on_axis = (libm::fabsf(dy) < 0.5 && libm::fabsf(dx) >= c0 && libm::fabsf(dx) <= c1) || (libm::fabsf(dx) < 0.5 && libm::fabsf(dy) >= c0 && libm::fabsf(dy) <= c1);
+                dst[y * width + x] = if d2 >= r0 && d2 < r1 { white } else if on_axis { red } else { black };
+            }
+        }
+    }
+}
 fn glass_radius() -> f32 {
     if ferros_sys::akita() { GLASS_RADIUS_AKITA } else { GLASS_RADIUS }
 }
@@ -3146,7 +3205,7 @@ fn glass_front(x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], c: u64,
 /// The windows into phase `k` over `r` (screen coordinates): each row composed frontmost first (a pixel comes from the first window that covers it; nothing behind the windows but black), cut to the circle with its edge antialiased, the corners from the chrome; then each pixel's R, G, B (bits 0-15, 16-31, 32-47, working values: gamma 2, white = Q14) through the one table, E's gains and the dither, bit 48 set = no dither for that pixel.
 fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: usize) {
     let r = r.clip(width, height);
-    if r.is_empty() {
+    if r.is_empty() || RAW_HOLD.load(Ordering::Acquire) == 1 {
         return;
     }
     let dst = phase_slice(k, width * height);
@@ -5252,7 +5311,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         log.at(b"panel brightness");
         let r = set_panel(&dsi, hbm0, dbv0);
         log.at(b"panel brightness done");
-        log.s(if akita { b"display: 10 bits, panel brightness left at ABL's (AK3B's policy is the owner's, docs/AK3B.md)\n".as_slice() } else if r { b"display: 10 bits, panel brightness set for the white and its headroom\n" } else { b"display: 10 bits, but the brightness command stuck\n" });
+        log.s(if akita && r { b"display: 10 bits, the AK3B at DBV 3175 (its normal top, 800 cd/m2), white in the pixels\n".as_slice() } else if akita { b"display: 10 bits, but the AK3B's DBV write stuck\n" } else if r { b"display: 10 bits, panel brightness set for the white and its headroom\n" } else { b"display: 10 bits, but the brightness command stuck\n" });
     } else {
         log.s(b"display: 8 bits (DECON not in the 10 bpc blend)\n");
     }
@@ -6155,6 +6214,40 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     } else {
                         out[0] = 3;
                     }
+                }
+                // 52 (development, tools/akita-glass.sh): the glass's own measures drawn raw into every phase, and nothing else published until released: `[52, 1, g u16]` the corners at glass radius g (16ths of a pixel, `raw_corners`); `[52, 2, cx u16, cy u16, r u16]` the cutout's ring (16ths, `raw_cutout`); `[52, 0]` back to the shell, every phase owed whole. Replies 0; the console says what was drawn.
+                Some(52) if m.len() >= 2 && option_env!("FERROS_PRODUCTION").is_none() && ten && unsafe { TEMPORAL } => {
+                    // WHY `get`: the message is the client's, of any length; a value it did not send reads 0 rather than past its bytes.
+                    let v = |i: usize| m.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as f32 * (1. / (1 << 4) as f32)).unwrap_or(0.);
+                    let full = draw::Rect::full(width, height);
+                    match m[1] {
+                        0 => {
+                            RAW_HOLD.store(0, Ordering::Release);
+                            unsafe {
+                                PHASE_DIRTY = [full; PHASES];
+                                clean_reset_all();
+                                PREV_DMG = full;
+                            }
+                            log.s(b"display: op 52 released: the shell again\n");
+                        }
+                        1 | 2 => {
+                            RAW_HOLD.store(1, Ordering::Release);
+                            if m[1] == 1 {
+                                let g = v(2);
+                                let (rs, rb, n) = raw_corners(width, height, g);
+                                log.s(alloc::format!("display: op 52 corners at glass radius {g}: small {rs:.1}, big {rb:.1}, exponent {n}; the small corner's diagonal cut {:.1} px\n", rs * (1. - libm::exp2f(-1. / n as f32)) * core::f32::consts::SQRT_2).as_bytes());
+                            } else {
+                                let (cx, cy, r) = (v(2), v(4), v(6));
+                                raw_cutout(width, height, cx, cy, r);
+                                log.s(alloc::format!("display: op 52 cutout ring from radius {r} round ({cx}, {cy})\n").as_bytes());
+                            }
+                            ferros_sys::dma_barrier();
+                            pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
+                            let _ = pipe.present(win);
+                        }
+                        _ => out[0] = 1,
+                    }
+                    log.flush();
                 }
                 Some(22) if m.len() >= 18 => {
                     // A window shown or redrawn (WINDOWS.md): [x u16][y u16][w u16][h u16] the part of the screen it covers, [base u64] its surface (the client's own `dma` of it), [level u8] 0 an app, 1 input, 2 the system, and optionally [format u8] its pixels (`Win::format`: 0, the default, the display's working values; 1 fluor's 16-bit g2t). It goes in front of its level; every phase owes the whole screen; the next one is published now, the others while idle.
