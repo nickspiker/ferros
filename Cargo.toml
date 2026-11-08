@@ -62,6 +62,7 @@ members = [
     "payloads/pcie1",
     "ferros_sys",
     "ferros_kist",
+    "ferros_space",
     "ferros_inject",
     "valhall",
     "ferros_sandbox",

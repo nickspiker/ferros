@@ -1,0 +1,19 @@
+[package]
+name = "ferros_space"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The person's identity space on ferros (docs/IDENTITY-SPACE.md): what of theirs follows them to every device of their fleet (the kists they installed and their answers, their permission defaults, the arrangement of their home screen and the view, each device's home-screen sync switch), as fgtw::space facts, and the sync that joins a device's own copy (kists.list, map.place.*, map.view) to them. no_std; the identity service (payloads/fgtw) runs it."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+fgtw = { path = "../../fgtw", default-features = false }
+vsf = { path = "../../vsf", default-features = false }
+ferros_kist = { path = "../ferros_kist" }
+ferros_ledger = { path = "../ferros_ledger" }
+
+[dev-dependencies]
+# The host test seals and opens the space between two vaults as the devices do (the seal is fgtw's `fanout`, its nonce the OS's with `std`).
+fgtw = { path = "../../fgtw", default-features = false, features = ["std", "fanout"] }
