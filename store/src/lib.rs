@@ -550,6 +550,25 @@ mod tests {
         (0..n).map(|i| (i as u32).wrapping_mul(2654435761).wrapping_add(seed as u32).to_le_bytes()[1]).collect()
     }
 
+    /// A large value written the way a process writes it, one transfer at a time (4 KiB, as wallgen's 24 MB wallpaper, 2026-11-08), reads back from its first byte and across pieces.
+    #[test]
+    fn large_in_transfers() {
+        let mut s = store(1 << 14);
+        let d = domain(6);
+        let v = bytes(24_128_145, 3);
+        let mut w = s.begin(&d, b"wallpaper.made");
+        for chunk in v.chunks(1 << 12) {
+            s.write(&d, &mut w, chunk).unwrap();
+        }
+        s.finish(&d, w).unwrap();
+        for off in [0usize, 1, PIECE - 7, PIECE, 5 * PIECE + 3, v.len() - 9] {
+            let mut out = [0u8; 64];
+            let n = (v.len() - off).min(64);
+            assert_eq!(s.read(&d, b"wallpaper.made", off as u64, &mut out[..n]).unwrap(), Some(v.len() as u64));
+            assert_eq!(&out[..n], &v[off..off + n], "at {off}");
+        }
+    }
+
     /// Values of every awkward size round-trip whole, and in ranges across piece boundaries.
     #[test]
     fn sizes_and_ranges() {

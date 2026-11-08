@@ -383,6 +383,14 @@ impl Bump {
     fn used(&self) -> usize {
         unsafe { *self.next.get() - *self.base.get() }
     }
+    /// Where the next allocation goes: a point to come back to (`back_to`).
+    fn now(&self) -> usize {
+        unsafe { *self.next.get() }
+    }
+    /// Everything allocated since `now` gave `at` forgotten: the caller holds none of it any more. For a loop whose every pass allocates and drops its own (the wallpaper's bands read over the vault: 24 MB through a 32 MiB heap that is otherwise only reset once a frame).
+    fn back_to(&self, at: usize) {
+        unsafe { *self.next.get() = at };
+    }
 }
 
 /// Non-zero initialisers keep these in `.data`: the flat image carries no `.bss`, and whatever the kernel copies after the code (the input) would otherwise share their bytes. `init` sets the real values.
@@ -3536,13 +3544,16 @@ impl vsf::container::ByteSource for VaultSource {
         self.len
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), vsf::container::SourceError> {
+        // Through a buffer on the stack: vsf's buffers are on the heap, and the heap is a DMA region outside the arc (S_HEAP). The kernel writes a syscall's reply at the caller's offset masked into its arc, so a heap pointer's reply landed elsewhere in the arc: the reads came back zeros, the made wallpaper "not a VSF document", and each read overwrote up to 4 KiB of the display's own memory (2026-11-08). The stack is in the arc.
+        let mut bounce = [0u8; 1 << 12];
         let mut at = 0;
         while at < buf.len() {
             // The kernel hands over at most 4 KiB a read (ferros_sys::store_get_at).
-            let n = (buf.len() - at).min(1 << 12);
-            if ferros_sys::store_get_at(self.cap, self.key, offset as usize + at, &mut buf[at..at + n]).is_none() {
+            let n = (buf.len() - at).min(bounce.len());
+            if ferros_sys::store_get_at(self.cap, self.key, offset as usize + at, &mut bounce[..n]).is_none() {
                 return Err(vsf::container::SourceError::Io("the vault refused a read".into()));
             }
+            buf[at..at + n].copy_from_slice(&bounce[..n]);
             at += n;
         }
         Ok(())
@@ -3556,8 +3567,16 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
     let mut l = Log { grants, buf: [0; 256], n: 0 };
     let doc = match vsf::container::Document::open(VaultSource { cap: c, key, len: len as u64 }) {
         Ok(d) => d,
-        Err(_) => {
-            l.s(b"display: the person's own wallpaper is not a VSF document; theirs from the seed shows\n");
+        Err(e) => {
+            // What vsf refused, and where: until 2026-11-08 the error was dropped, and the made wallpaper (24 MB, written whole by wallgen) was refused with no word why.
+            l.s(b"display: the person's ");
+            l.s(key);
+            l.s(b" (");
+            l.dec(len as u64);
+            l.s(b" B) is not a VSF document the display can open: ");
+            let why = alloc::format!("{e}");
+            l.s(&why.as_bytes()[..why.len().min(160)]);
+            l.s(b"; theirs from the seed shows\n");
             l.flush();
             return false;
         }
@@ -3570,6 +3589,8 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
     };
     let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, width * height) };
     let table = unsafe { core::slice::from_raw_parts(G2T16_Q14, 1 << 16) };
+    // Each channel's read (its bytes and its samples) is dropped before the next: the heap comes back to here after each, or 24 MB of reads would pass through the 32 MiB bump.
+    let keep = ALLOC.now();
     let mut y0 = 0;
     while y0 < height {
         // The last band stops at the screen's bottom.
@@ -3586,6 +3607,8 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
             for (p, &code) in band.iter_mut().zip(&s) {
                 *p |= (table[code as usize] as u64) << (16 * ch);
             }
+            drop(s);
+            ALLOC.back_to(keep);
         }
         y0 = y1;
     }
