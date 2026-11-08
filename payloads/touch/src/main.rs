@@ -11,6 +11,9 @@
 //! - `0` CHANGES: every contact event seen since the last CHANGES call — a count byte, then that many records, oldest first. This is what an event loop wants.
 //! - `1` HELD: the contacts on the glass *now* — a count byte, then that many records, phase always move. This is what "how hard is this control being pressed" wants, and it exists because the controller reports a contact entering, then only when something about it changes, then leaving: **a finger held perfectly still produces no events at all**. A delta-only endpoint would make every client rebuild this table, and get it wrong the same way the decay screen did before the owner caught it.
 //! - `2` INFO: `x_max u16 LE`, `y_max u16 LE`, `slots u8` — the panel's largest coordinates and how many contacts the table holds.
+//! - `3` INJECT, development builds only (docs/INPUT-INJECT.md, payloads/inject): `count u8`, then that many records as above with the id a finger number (below `ferros_inject::FINGERS`) → `status u8` (0 taken, 1 refused), `injected u16 LE`. The records go into the table in order exactly as the controller's events do, so CHANGES and HELD serve them to every consumer alike; finger f takes the slot 15 − f. A batch is taken whole or not at all: refused when a finger enters while its slot is held (by a real finger or itself) or moves or leaves while it is not an injected contact. A real contact landing on an injected slot takes it over, and the injector's next record for it is refused.
+//! - `4` INJECTED, development builds only: `injected u16 LE` (bit s: the contact in slot s is injected), `taken u32 LE` (injected records taken since this process started): the one place an injected contact differs from a real one, for diagnostics.
+//! A production build (FERROS_PRODUCTION set at build time, as the kernel's and the display's) has neither op: they answer as unknown ops do.
 
 #![no_std]
 #![no_main]
@@ -66,6 +69,10 @@ const SLOTS: usize = 16;
 /// How many events are remembered between two CHANGES calls. A client polling every frame sees far fewer; a client that stops asking loses the oldest.
 const CHANGES: usize = 64;
 const REC: usize = 12;
+/// A development build (FERROS_PRODUCTION unset): the injection ops exist (payloads/display's `DEV`).
+const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
+/// Fingers an injector may hold (ferros_inject::FINGERS): finger f is slot 15 − f.
+const INJECT_FINGERS: usize = 1 << 3;
 
 struct Port {
     grants: u64,
@@ -233,11 +240,52 @@ struct Table {
     changes: [Contact; CHANGES],
     head: usize,
     count: usize,
+    /// Bit s: the contact in slot s came from an injector (op 3), not the controller. Diagnostics only (op 4): nothing served to a consumer carries it.
+    injected: u16,
+    /// Injected records taken since the process started.
+    taken: u32,
 }
 
 impl Table {
-    /// One contact event: the held table updated, the event remembered (the oldest dropped once CHANGES are waiting).
+    /// One contact event from the controller. A real finger in a slot an injector held takes the slot over.
     fn push(&mut self, c: Contact) {
+        self.injected &= !(1 << c.id);
+        self.record(c);
+    }
+    /// Op 3: an injector's batch, `count` records at `recs` with finger numbers for ids, taken whole or refused whole (see the module's op list). Returns whether it was taken.
+    fn inject(&mut self, recs: &[u8], count: usize) -> bool {
+        // The order first, on copies: nothing is applied unless every record is in order.
+        let (mut down, mut injected) = (self.down, self.injected);
+        for r in recs.chunks_exact(REC).take(count) {
+            // WHY: the finger number is the caller's; a finger past INJECT_FINGERS has no slot (15 − f would leave the table's top half, and underflow past 15).
+            if r[0] as usize >= INJECT_FINGERS {
+                return false;
+            }
+            let bit = 1u16 << (SLOTS - 1 - r[0] as usize);
+            match r[1] {
+                0 if down & bit == 0 => {
+                    down |= bit;
+                    injected |= bit;
+                }
+                1 if injected & bit != 0 => {}
+                2 if injected & bit != 0 => {
+                    down &= !bit;
+                    injected &= !bit;
+                }
+                _ => return false,
+            }
+        }
+        for r in recs.chunks_exact(REC).take(count) {
+            let w = |at: usize| u16::from_le_bytes([r[at], r[at + 1]]);
+            let c = Contact { id: (SLOTS - 1 - r[0] as usize) as u8, phase: r[1], kind: r[2], pressure: r[3], x: w(4), y: w(6), major: w(8), minor: w(10) };
+            self.record(c);
+            self.taken = self.taken.wrapping_add(1);
+        }
+        self.injected = injected;
+        true
+    }
+    /// One contact event, whoever made it: the held table updated, the event remembered (the oldest dropped once CHANGES are waiting).
+    fn record(&mut self, c: Contact) {
         let id = c.id as usize;
         if c.phase == 2 {
             self.down &= !(1 << id);
@@ -351,8 +399,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     console(grants, b"touch: serving the touch endpoint\n");
-    let mut t = Table { held: [Contact::default(); SLOTS], down: 0, changes: [Contact::default(); CHANGES], head: 0, count: 0 };
-    let mut msg = [0u8; 64];
+    let mut t = Table { held: [Contact::default(); SLOTS], down: 0, changes: [Contact::default(); CHANGES], head: 0, count: 0, injected: 0, taken: 0 };
+    // Room for an injection batch: the op, the count and a record per finger an injector may hold.
+    let mut msg = [0u8; 2 + REC * INJECT_FINGERS];
     let mut out = [0u8; 1 + REC * SLOTS];
     let mut token = [0u8; 32];
     let tick = freq() / 128;
@@ -423,6 +472,19 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     out[2..4].copy_from_slice(&ym.to_le_bytes());
                     out[4] = SLOTS as u8;
                     5
+                }
+                3 if DEV => {
+                    let count = msg[1] as usize;
+                    // WHY: the count is the caller's; records it names past the bytes it sent were never sent (the kernel cuts a message to this buffer, so a count past INJECT_FINGERS lands here too).
+                    let taken = 2 + count * REC <= n as usize && t.inject(&msg[2..2 + count * REC], count);
+                    out[0] = if taken { 0 } else { 1 };
+                    out[1..3].copy_from_slice(&t.injected.to_le_bytes());
+                    3
+                }
+                4 if DEV => {
+                    out[0..2].copy_from_slice(&t.injected.to_le_bytes());
+                    out[2..6].copy_from_slice(&t.taken.to_le_bytes());
+                    6
                 }
                 _ => {
                     out[0] = 0;

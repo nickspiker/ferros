@@ -6,6 +6,7 @@
 //
 // usb.rs ── nusb USB link (VID G#1209, PID G#4665) struct UsbLink { interface, ep_out, ep_in } ::open() → Result<Self> ::send(data) — pads to 512 bytes (DWC3 short packet workaround) ::recv() → Vec<u8> ::recv_timeout(duration) → Result<Vec<u8>>
 
+mod input;
 mod usb;
 
 use ferros_pt::StreamId;
@@ -61,6 +62,7 @@ fn usage() {
     eprintln!("  run <payload.bin> [hex]  Hot-load a payload blob, call it, print its output");
     eprintln!("  store put <key> <text|@file> | get <key> [out] | ls | rm <key>   Vault by logical key (shim)");
     eprintln!("  display [--hold] [text]  Render text on the panel (shim after a --live handoff; '\\n' = newline; --hold keeps it up until a REBOOT; both volume keys = killswitch power-off)");
+    eprintln!("  input <tap|hold|swipe|drag|pinch|rotate|key|idle|shot|script> …  Fingers and keys in shown frames, as a VSF script (development builds; `input` alone for the list)");
 }
 
 #[tokio::main]
@@ -97,6 +99,8 @@ async fn main() {
             cmd_poke(&args[2], &args[3]).await;
         }
         "store" => cmd_store(&args[2..]).await,
+        // input tap|hold|swipe|drag|pinch|rotate|key|idle|shot|script …: fingers and keys in shown frames (input.rs, docs/INPUT-INJECT.md).
+        "input" => input::cmd(&args[2..]).await,
         // kist install <capsule.vsf>: keep a signed kist capsule in the vault and add it to the attested person's list (KISTS.md).
         "kist" if args.get(2).map(String::as_str) == Some("install") && args.len() >= 4 => cmd_kist_install(&args[3]).await,
         // kist answer <name> <right> on|off: one answer of the attested person's (development); kist list: their list.

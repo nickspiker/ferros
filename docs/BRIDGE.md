@@ -32,6 +32,7 @@ See [PIPE.md](PIPE.md) and the Photon Transport stack docs for the layering rati
 | `terminal` | `adb shell` | Interactive bidirectional PT session |
 | `echo` / `send` / `ping` | `adb shell ping` (loosely) | Link/PT test harness (no real adb/fastboot equivalent) |
 | `dbg` / `dbg2` | *(no analog)* | Live kernel counters / raw DWC3 event ring over EP0 — work even when the bulk path is wedged |
+| `input <gesture> …` | `adb shell input` | Fingers and keys in shown frames, as a VSF script: tap, hold, swipe, drag, pinch, rotate, key, idle, shot, script (development builds; docs/INPUT-INJECT.md) |
 
 The difference that matters: adb and fastboot are two separate stacks with two separate transports and two separate device modes.
 ferros-bridge is one tool, one transport (PT), one device that never has to drop into a special "bootloader mode" to accept a new kernel — `reload` works against the running kernel.

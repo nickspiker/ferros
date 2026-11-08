@@ -20,3 +20,5 @@ vsf = { path = "../../../vsf", features = ["crypto"] }
 ed25519-dalek = "2"
 # kists (KISTS.md): a capsule's declaration when it is signed, the person's list when one is installed
 ferros_kist = { path = "../../ferros_kist" }
+# input injection scripts (docs/INPUT-INJECT.md): built here, played on the device by payloads/inject
+ferros_inject = { path = "../../ferros_inject" }
