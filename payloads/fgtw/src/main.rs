@@ -471,6 +471,8 @@ struct Client {
     /// Where this device stands with the identity (V_*), and when the seed was last asked.
     verdict: u8,
     last_lookup_us: u64,
+    /// When fgtw.org last answered a fetch (`now_us`), 0 never: the Fleet page says how long ago (2026-11-08: offline it said nothing).
+    seed_heard_us: u64,
     /// When the seed's chain was last read for this device's Add while joining (`join_check`).
     join_checked_us: u64,
     /// The seed's address, once resolved.
@@ -717,6 +719,9 @@ impl Client {
             (r, t2.ip.get())
         };
         self.seed_ip = ip;
+        if recovered.is_some() {
+            self.seed_heard_us = now_us();
+        }
         if let Some(k) = recovered {
             self.fleet_key = Some(k);
             self.persist_set(b"fleet_key", &k);
@@ -735,6 +740,9 @@ impl Client {
             (r, s.ip.get())
         };
         self.seed_ip = ip;
+        if fetched.is_ok() {
+            self.seed_heard_us = now_us();
+        }
         let Ok(Some(b)) = fetched else { return };
         let Ok(bytes) = b.to_vsf_bytes() else { return };
         if !self.hold_chain(&bytes) {
@@ -770,7 +778,8 @@ impl Client {
 
     /// Op 6, the Fleet page's list: `[count][count × (the device key's first 8 bytes, flags: bit 0 this device)]`, then each row's name `[length][UTF-8]`. Bound with no list yet (the chain only in RAM since unlock-at-boot is off, and none adopted this session), the seed's copy is read first.
     fn members_reply(&mut self) -> Vec<u8> {
-        if self.members.is_empty() && self.bound {
+        // Only with a network: offline the fetch only waited out its timeout, and the Fleet page with it, every time it asked (2026-11-08).
+        if self.members.is_empty() && self.bound && self.net_up {
             if let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) {
                 fgtw::set_clock(eagle());
                 let (fetched, ip) = {
@@ -779,6 +788,9 @@ impl Client {
                     (r, s.ip.get())
                 };
                 self.seed_ip = ip;
+                if fetched.is_ok() {
+                    self.seed_heard_us = now_us();
+                }
                 if let Ok(Some(b)) = fetched {
                     if let Ok(bytes) = b.to_vsf_bytes() {
                         if let Ok((blob, _)) = join::adopt_chain(&hp, &seed, &self.me, &bytes) {
@@ -794,7 +806,9 @@ impl Client {
         r.push(n as u8);
         for k in &self.members[..n] {
             r.extend_from_slice(&k[..8]);
-            r.push((*k == self.me) as u8);
+            // Bit 0 this device; bit 1 heard on this network (a fleet device beaconing, `sponsors`, online).
+            let heard = self.sponsors.iter().any(|s| s.online && s.key == *k);
+            r.push((*k == self.me) as u8 | (heard as u8) << 1);
         }
         // The names after the rows, one `[length][UTF-8]` per row in the same order: the two-word name every device of this fleet computes for a member (`fgtw::pair::device_name_default`, the one Photon's Fleet page and pairing screen show), length 0 when there is no identity seed to compute it with. A reader that knows only the rows stops before them.
         for k in &self.members[..n] {
@@ -1015,6 +1029,9 @@ impl Client {
         let fetched = fgtw::client::fetch(&t, &hp);
         let ip = t.ip.get();
         self.seed_ip = ip;
+        if fetched.is_ok() {
+            self.seed_heard_us = now_us();
+        }
         self.log.put(b"fgtw: lookup: fgtw.org answered in ");
         self.log.dec(ferros_sys::us_since(t0) / 1000);
         self.log.put(match &fetched {
@@ -1385,6 +1402,17 @@ impl Client {
                 busy = true;
                 let mut reply = Vec::with_capacity(400);
                 // Op 6: the fleet's members, for the Fleet page (`members_reply`): its own reply, nothing of the state after it.
+                // Op 7: how this device reaches its fleet, for the Fleet page: [the network up (IPv4) u8][seconds since fgtw.org last answered, u32 LE, all ones for never][fleet devices heard on this network u8].
+                if n >= 1 && req[0] == 7 {
+                    let mut r = [0u8; 6];
+                    r[0] = self.net_up as u8;
+                    let age = if self.seed_heard_us == 0 { u32::MAX } else { ((now_us() - self.seed_heard_us) / 1_000_000) as u32 };
+                    r[1..5].copy_from_slice(&age.to_le_bytes());
+                    // WHY the cap: a byte on the wire; past 255 devices heard the page has nothing different to say.
+                    r[5] = self.sponsors.iter().filter(|s| s.online).count().min(255) as u8;
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
                 if n >= 1 && req[0] == 6 {
                     let r = self.members_reply();
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
@@ -1468,6 +1496,9 @@ impl Client {
                         (r, s.ip.get())
                     };
                     self.seed_ip = ip;
+                    if fetched.is_ok() {
+                        self.seed_heard_us = now_us();
+                    }
                     if let Ok(Some(b)) = fetched {
                         if let Ok(bytes) = b.to_vsf_bytes() {
                             self.depart_check(&bytes);
@@ -1571,7 +1602,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0 };
     c.run()
 }
 
