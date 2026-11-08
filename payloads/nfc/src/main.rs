@@ -11,8 +11,8 @@
 //! - `0` STATE: text (the chip's versions, discovery, counts).
 //! - `1` SERVE + S (32 bytes): a ceremony is live; GET DATA answers S until STOP. → [0].
 //! - `2` STOP: no ceremony; GET DATA answers 6A82. → [0].
-//! - `4` READER: the sponsor's side of the tap (photon PhotonNfc's reader): polling NFC-A alone, no listening; a tapped device answering ISO-DEP is asked for Photon's tag (SELECT the AID, GET DATA) and the secret it serves kept. → [0], or [1] refused (nobody has attested, or discovery would not start).
-//! - `5` READER STOP: listening and polling as before. → [0] or [1].
+//! - `4` READER: the sponsor's side of the tap (photon PhotonNfc's reader): a device found answering ISO-DEP while discovery polls is asked for Photon's tag (SELECT the AID, GET DATA) and the secret it serves kept. Discovery itself is unchanged. → [0], or [1] refused (nobody has attested). Asked again while on: nothing changes.
+//! - `5` READER STOP. → [0].
 //! - `6` READ SECRET: the secret read off a tapped device since the last ask (32 bytes, once), else nothing.
 //! - `3` READS: activations u32, S served u32, field-on events u32 (little-endian, 12 bytes): a ceremony's caller watches S served move to know the sponsor's phone read it.
 #![no_std]
@@ -125,6 +125,11 @@ struct Nfc {
     /// Where the exchange with a tapped device stands: 0 none, 1 the SELECT sent, 2 the GET DATA sent.
     rstage: u8,
     read_secret: Option<[u8; 32]>,
+    /// Discovery's starts that failed in a row: the first is said, the rest are quiet (`quiet` while one is tried) and spaced twice as far apart each time (`retry_wait`).
+    discover_failures: u32,
+    quiet: bool,
+    /// A CORE_RESET_NTF seen since this was cleared (`init`).
+    reset_seen: bool,
 }
 
 impl Nfc {
@@ -302,7 +307,9 @@ impl Nfc {
             }
             self.packet(p, n);
         }
-        say!(self.grants, "nfc: no response to {}\n", Hex(c));
+        if !self.quiet {
+            say!(self.grants, "nfc: no response to {}\n", Hex(c));
+        }
         None
     }
 
@@ -340,6 +347,7 @@ impl Nfc {
             }
             // CORE_RESET_NTF: the chip reset itself (a reason in byte 0: 1 = the host asked, A0 = into NFC mode).
             (3, 0, 0) => {
+                self.reset_seen = true;
                 if pl.len() >= 2 {
                     say!(self.grants, "nfc: reset notification, reason G#{:02X}, config {}\n", pl[0], if pl[1] == 1 { "kept" } else { "reset" });
                 }
@@ -452,18 +460,31 @@ impl Nfc {
 
     /// Listening as a card on NFC-A and NFC-B, and between listens polling for tags on NFC-A, NFC-B and NFC-V (each entry a technology and mode, then 1: every discovery period), as Android interleaves them.
     fn discover(&mut self, p: &mut Packet) -> bool {
-        // Reader mode: NFC-A polling alone (Photon's reader takes NFC-A, FLAG_READER_NFC_A), no listening, so the other device of a tap is the card.
         let both: &[u8] = &[0x21, 0x03, 0x0B, 0x05, 0x00, 0x01, 0x01, 0x01, 0x06, 0x01, 0x80, 0x01, 0x81, 0x01];
-        let reader: &[u8] = &[0x21, 0x03, 0x03, 0x01, 0x00, 0x01];
+        self.quiet = self.discover_failures > 0;
         // G#A0, discovery already started, is discovering too.
-        self.discovering = match self.cmd(if self.reading { reader } else { both }, p) {
+        self.discovering = match self.cmd(both, p) {
             Some(n) if n >= 4 && (p[3] == 0 || p[3] == 0xA0) => true,
             Some(n) => {
-                say!(self.grants, "nfc: discover refused: {}\n", Hex(&p[..n]));
+                if !self.quiet {
+                    say!(self.grants, "nfc: discover refused: {}\n", Hex(&p[..n]));
+                }
                 false
             }
             None => false,
         };
+        self.quiet = false;
+        if self.discovering {
+            if self.discover_failures > 0 {
+                say!(self.grants, "nfc: discovery started again after {} failed tries\n", self.discover_failures);
+            }
+            self.discover_failures = 0;
+        } else {
+            if self.discover_failures == 0 {
+                say!(self.grants, "nfc: discovery did not start; trying again, each time twice as long after\n");
+            }
+            self.discover_failures += 1;
+        }
         self.discovering
     }
 
@@ -481,7 +502,13 @@ impl Nfc {
             &[0x20, 0x01, 0x02, 0x00, 0x00],
         ];
         for (k, c) in steps.iter().enumerate() {
+            self.reset_seen = false;
             if self.ok(c, p).is_none() {
+                // CORE_RESET whose response never came but whose notification did (reason 1, the host asked): the reset happened. Seen after a restart of this driver (2026-11-08): the notification arrived, the response did not, and every later command was refused as uninitialised.
+                if k == 0 && self.reset_seen {
+                    say!(self.grants, "nfc: CORE_RESET answered by its notification alone; going on\n");
+                    continue;
+                }
                 return false;
             }
             if k == 2 {
@@ -557,21 +584,18 @@ impl Nfc {
         }
     }
 
-    /// Reader mode on or off: discovery stopped (RF_DEACTIVATE to idle) and started again with the other set of technologies.
-    fn set_reading(&mut self, on: bool, p: &mut Packet) -> bool {
-        if self.reading == on {
-            return true;
+    /// Reader mode on or off. Discovery stays as it is (listening and polling, interleaved): a tapped device found while this one polls is asked for Photon's tag. A poll-only discovery (NFC-A alone, `21 03 03 01 00 01`) went unanswered by this controller every time (2026-11-08), so the tap rides the polling discovery already does.
+    fn set_reading(&mut self, on: bool) -> bool {
+        if self.reading != on {
+            self.reading = on;
+            self.rstage = 0;
         }
-        self.reading = on;
-        self.rstage = 0;
-        if self.discovering {
-            // Its response, then the deactivation notification (type 0, idle), which `packet` reads as discovery stopped.
-            let _ = self.cmd(&[0x21, 0x06, 0x01, 0x00], p);
-            if let Some(n) = self.next(p, 64) {
-                self.packet(p, n);
-            }
-        }
-        self.discover(p)
+        true
+    }
+
+    /// How long to wait before starting discovery again after `discover_failures` failures in a row: a second, doubling to at most 64. WHY the cap: a controller that recovers is found again within a minute, and the doubling has nothing left to save past that.
+    fn retry_wait(&self) -> u64 {
+        freq() << self.discover_failures.min(6)
     }
 
     fn state(&self, out: &mut Line) {
@@ -583,13 +607,15 @@ impl Nfc {
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    let mut nfc = Nfc { grants, secret: None, credits: 0, apdu: [0; 512], apdu_len: 0, activations: 0, served: 0, fields: 0, tags: 0, version: [0; 4], config: [0; 2], discovering: false, field: false, reading: false, rstage: 0, read_secret: None };
+    let mut nfc = Nfc { grants, secret: None, credits: 0, apdu: [0; 512], apdu_len: 0, activations: 0, served: 0, fields: 0, tags: 0, version: [0; 4], config: [0; 2], discovering: false, field: false, reading: false, rstage: 0, read_secret: None, discover_failures: 0, quiet: false, reset_seen: false };
     let mut p: Packet = [0; 258];
     if !ferros_sys::power(cap(grants, S_POWER), true) {
         say!(grants, "nfc: power on failed (HSI1 off?)\n");
         ferros_sys::exit(1);
     }
     let up = nfc.init(&mut p);
+    // A bring-up that failed is tried again whole (from CORE_RESET) where discovery would be: a controller that never finished its initialisation refuses discovery (status G#06) forever.
+    let mut needs_init = !up;
     let mut l = Line { b: [0; 512], n: 0 };
     nfc.state(&mut l);
     say!(grants, "nfc: {}: {}\n", if up { "up" } else { "bring-up failed" }, core::str::from_utf8(&l.b[..l.n]).unwrap_or(""));
@@ -615,10 +641,22 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             continue;
         }
-        // Discovery stopped (a deactivation to idle, or a bring-up that failed at the end): started again, at most once a second.
+        // Discovery stopped (a deactivation to idle, or a bring-up that failed at the end): started again, a second later, then twice as long after each failure (`retry_wait`).
         if !nfc.discovering && now() > retry_at {
-            retry_at = now() + freq();
-            nfc.discover(&mut p);
+            if needs_init {
+                nfc.quiet = nfc.discover_failures > 0;
+                needs_init = !nfc.init(&mut p);
+                nfc.quiet = false;
+                if needs_init {
+                    nfc.discover_failures += 1;
+                } else {
+                    say!(grants, "nfc: up after {} tries\n", nfc.discover_failures + 1);
+                    nfc.discover_failures = 0;
+                }
+            } else {
+                nfc.discover(&mut p);
+            }
+            retry_at = now() + nfc.retry_wait();
         }
         let n = recv(cap(grants, S_NFC), &mut msg, &mut token, true);
         if n != NOTHING && n != ferros_sys::ERR && n > 0 {
@@ -655,7 +693,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
                 4 | 5 => {
                     let on = msg[0] == 4;
-                    let ok = nfc.set_reading(on, &mut p);
+                    let was = nfc.reading;
+                    let ok = nfc.set_reading(on);
+                    if was == on {
+                        reply(&token, &[0]);
+                        continue;
+                    }
                     say!(grants, "nfc: reader mode {}\n", if !ok { "refused" } else if on { "on" } else { "off" });
                     reply(&token, &[!ok as u8]);
                 }

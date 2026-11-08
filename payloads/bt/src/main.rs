@@ -114,6 +114,9 @@ struct Bt {
     dropped: u32,
     /// Scanning for pairing beacons (the identity service's add flow, op 3), and the 128-bit service UUIDs heard, each with when (`heard_uuid`): the newest `HEARD` kept, the oldest replaced.
     scanning: bool,
+    /// What the scan has heard since the driver started (measuring the sponsor's nearby path): advertising reports, and those carrying a 128-bit service UUID. Said on the console at each power of two.
+    reports: u32,
+    uuid_reports: u32,
     heard: [([u8; 16], u64); HEARD],
 }
 
@@ -443,6 +446,10 @@ impl Bt {
         if e.len() < 4 || e[0] != 0x3E || e[2] != 0x02 {
             return false;
         }
+        self.reports += 1;
+        if self.reports.is_power_of_two() {
+            say!(self.grants, "bt: scan: {} advertising reports heard, {} with a 128-bit service UUID\n", self.reports, self.uuid_reports);
+        }
         // One report per event is what this chip sends for legacy scanning; several are laid out field by field (all types, then all addresses, ...), which is not read here.
         if e[3] != 1 || e.len() < 4 + 9 {
             return true;
@@ -457,6 +464,7 @@ impl Bt {
             }
             let (kind, body) = (data[at + 1], &data[at + 2..at + 1 + l]);
             if kind == 0x06 || kind == 0x07 {
+                self.uuid_reports += 1;
                 for u in body.chunks_exact(16) {
                     let mut id = [0u8; 16];
                     for k in 0..16 {
@@ -484,8 +492,23 @@ impl Bt {
     /// Scanning for pairing beacons on (passive: nothing goes on the air; the own address a fresh non-resolvable private one, as the beacon's) or off.
     fn scan(&mut self, on: bool) -> bool {
         if !on {
+            if !self.scanning {
+                return true;
+            }
             self.scanning = false;
             return self.ok(0x200C, &[0, 0], 256);
+        }
+        // Asked again while scanning (the identity service re-asserts it): nothing to change.
+        if self.scanning {
+            return true;
+        }
+        // The LE Meta event (bit 61) is outside the controller's default event mask (bits 0-44, Core 5.x Vol 4 Part E 7.3.1): without it no advertising report ever reaches the host (2026-11-08: the scan heard nothing). The default mask with bit 61, and the LE event mask's default (advertising reports among them).
+        let mask: u64 = (1 << 45) - 1 | 1 << 61;
+        if !self.ok(0x0C01, &mask.to_le_bytes(), 256) {
+            return false;
+        }
+        if !self.ok(0x2001, &0x1Fu64.to_le_bytes(), 256) {
+            return false;
         }
         let mut a = [0u8; 6];
         if self.beacon.is_none() {
@@ -547,7 +570,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             *v = unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + k as u64) as *const u8) };
         }
     }
-    let mut bt = Bt { grants, rx: [0; 1024], rx_len: 0, name: [0; 64], name_len: 0, beacon: None, events_in_download: 0, dropped: 0, scanning: false, heard: [([0; 16], 0); HEARD] };
+    let mut bt = Bt { grants, rx: [0; 1024], rx_len: 0, name: [0; 64], name_len: 0, beacon: None, events_in_download: 0, dropped: 0, scanning: false, heard: [([0; 16], 0); HEARD], reports: 0, uuid_reports: 0 };
     // At boot WiFi's driver may not have raised its REG_ON yet (the kernel refuses Bluetooth alone): tried again every 4 s, saying so once. Any other failure ends the driver, the chip powered down.
     // Started beside WiFi's driver at boot: its REG_ON cycle and bring-up first (it turns this core off before the cycle anyway).
     sleep_ms(16 << 10);
