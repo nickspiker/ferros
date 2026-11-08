@@ -49,10 +49,26 @@ impl Rect {
 /// The rectangle every primitive here draws inside: the whole surface, except while a widget's region alone is redrawn (the clock between frames) — then only that region is cleared and drawn, so what lies outside it is left exactly as the last full frame made it.
 pub static mut CLIP: Rect = Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX };
 
-/// `CLIP` on this surface: (x0, y0, x1, y1), half-open.
+/// The scene drawn by rows across the publish threads (main.rs `scene_split`, COMPOSITOR.md): while `BANDED`, each thread draws inside its own clip, told by its stack (the workers' stacks lie from `WORKER_STACKS.0`, `WORKER_STACKS.1` bytes each, `WORKER_STACKS.2` of them; any other thread is the render thread, the last clip).
+pub static mut BANDED: bool = false;
+pub static mut WORKER_STACKS: (usize, usize, usize) = (0, 1, 0);
+pub static mut BAND_CLIP: [Rect; 8] = [Rect::EMPTY; 8];
+
+/// This thread's place among the publish threads: a worker by its stack, else the render thread (the one past the workers).
+#[inline(always)]
+pub fn thread_slot() -> usize {
+    let sp: usize;
+    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+    let (base, size, n) = unsafe { WORKER_STACKS };
+    let i = sp.wrapping_sub(base) / size;
+    // WHY the test: a thread outside the workers' stacks lands past the last of them; it is the render thread.
+    if i < n { i } else { n }
+}
+
+/// `CLIP` on this surface: (x0, y0, x1, y1), half-open; while the scene is drawn by rows, this thread's own band of it.
 #[inline(always)]
 pub fn bounds(width: usize, height: usize) -> (i64, i64, i64, i64) {
-    let c = unsafe { CLIP }.clip(width, height);
+    let c = unsafe { if BANDED { BAND_CLIP[thread_slot()] } else { CLIP } }.clip(width, height);
     (c.x0 as i64, c.y0 as i64, c.x1 as i64, c.y1 as i64)
 }
 

@@ -2313,7 +2313,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         map.draw();
     }
     // FERROS_MAP_START=zoom (development, measuring the scene while it grows): two seconds after start, 128 display frames (held four seconds at the largest, for a capture) of a pinch with a twist from the home view, the settings circle and its mark growing past the screen, each frame drawn moving and paced by the panel (op 24), then the view back home at rest; the frames the panel showed to the console.
-    if option_env!("FERROS_MAP_START") == Some("zoom") {
+    if matches!(option_env!("FERROS_MAP_START"), Some("zoom") | Some("zoomcrowd")) {
+        // zoomcrowd: with the crowd's 200 circles too (a busy screen drawn whole every frame).
+        if option_env!("FERROS_MAP_START") == Some("zoomcrowd") {
+            map.crowd(200);
+        }
         sleep_until(now() + 2 * freq());
         let home = map.cam;
         map.touching = true;

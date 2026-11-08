@@ -1459,7 +1459,9 @@ static PUB_FINISHED: AtomicU64 = AtomicU64::new(0);
 /// The job: canvas base, width, height, phase mask, the rect, the stripe count.
 static mut PUB_PARAMS: (usize, usize, usize, u32, draw::Rect, usize) = (0, 0, 0, 0, draw::Rect::EMPTY, 1);
 static mut PUB_TABS: neon::Odt = unsafe { core::mem::zeroed() };
-static mut PUB_STACKS: [[u8; 16384]; PUB_WORKERS] = [[0; 16384]; PUB_WORKERS];
+/// A publish worker's stack, bytes.
+const PUB_STACK: usize = 16384;
+static mut PUB_STACKS: [[u8; PUB_STACK]; PUB_WORKERS] = [[0; PUB_STACK]; PUB_WORKERS];
 
 /// Take stripes of job `job` until none are left; each one finished is counted. Returns when the job has no stripe left to take (others may still be finishing theirs).
 fn pub_take(job: u64) {
@@ -1478,8 +1480,14 @@ fn pub_take(job: u64) {
         }
         let y0 = r.y0 + i as i32 * PUB_STRIPE;
         let stripe = draw::Rect { x0: r.x0, y0, x1: r.x1, y1: (y0 + PUB_STRIPE).min(r.y1) };
-        let back = unsafe { core::slice::from_raw_parts(base as *const Px, w * h) };
-        publish_band(back, w, h, unsafe { &*(&raw const PUB_TABS) }, mask, stripe);
+        if unsafe { PUB_KIND } == 1 {
+            // The scene's list (`scene_split`): this stripe's rows drawn into the canvas, which no other stripe touches.
+            let px = unsafe { core::slice::from_raw_parts_mut(base as *mut Px, w * h) };
+            scene_stripe(px, w, h, stripe);
+        } else {
+            let back = unsafe { core::slice::from_raw_parts(base as *const Px, w * h) };
+            publish_band(back, w, h, unsafe { &*(&raw const PUB_TABS) }, mask, stripe);
+        }
         PUB_FINISHED.fetch_add(1, Ordering::AcqRel);
         ferros_sys::wake(&PUB_FINISHED, 1);
     }
@@ -2016,6 +2024,129 @@ fn canvas_shift(px: &mut [Px], width: usize, height: usize, dx: i64, dy: i64) {
     }
 }
 
+// ---------------------------------------------------------------- the scene by rows across the cores
+//
+// COMPOSITOR.md "The scene by rows" (owner, 2026-11-07: "split across cores"): the scene loop works out each circle's place and makes its sprite on the render thread, and lists what it draws (`Item`); the list is then drawn in stripes of rows taken by the publish workers and the render thread, each inside its own clip (`draw::BAND_CLIP`), in the list's order, so each pixel sees the same layers in the same order as one thread would give it.
+
+/// One thing the scene draws, with what it needs: a sprite blitted (its pixels, its row extents, its side, its top left), the ferros mark (centre, radius, turn, hard), a disc (centre, radius, colour, hard), a bundle icon (centre, radius, turn, its mips, lit), a glow (centre, radius, colour, peak). Q8 pixels as the draw functions take them.
+#[derive(Clone, Copy)]
+enum Item {
+    Blit(usize, usize, usize, i64, i64),
+    Logo(i64, i64, i64, i64, i64, bool),
+    Disc(i64, i64, i64, u32, bool),
+    Icon(i64, i64, i64, i64, i64, usize, bool),
+    Glow(i64, i64, i64, u32, u32),
+}
+const ITEMS: usize = 1024;
+static mut SCENE_ITEMS: [Item; ITEMS] = [Item::Disc(0, 0, 0, 0, false); ITEMS];
+static mut SCENE_NI: usize = 0;
+/// The publish workers' job: 0 a publish, 1 the scene's list (`scene_stripe`).
+static mut PUB_KIND: u8 = 0;
+
+impl Item {
+    /// The rows it may touch, [y0, y1).
+    fn rows(&self) -> (i64, i64) {
+        match *self {
+            Item::Blit(_, _, d, _, oy) => (oy, oy + d as i64),
+            Item::Logo(_, y, r, _, _, _) | Item::Disc(_, y, r, _, _) | Item::Icon(_, y, r, _, _, _, _) => ((y - r) >> 8, ((y + r) >> 8) + 3),
+            Item::Glow(_, y, r, _, _) => {
+                let reach = r + r / GLOW_FRACTION + 256;
+                ((y - reach) >> 8, ((y + reach) >> 8) + 3)
+            }
+        }
+    }
+    fn draw(&self, px: &mut [Px], width: usize, height: usize) {
+        match *self {
+            Item::Blit(spr, ext, d, ox, oy) => {
+                let (spr, ext) = unsafe { (core::slice::from_raw_parts(spr as *const Px, d * d), core::slice::from_raw_parts(ext as *const Px, d)) };
+                blit(px, width, height, spr, ext, d, ox, oy);
+            }
+            Item::Logo(x, y, r, c, s, hard) => {
+                if hard { draw::logo_hard(px, width, height, x, y, r, c, s, true) } else { draw::logo(px, width, height, x, y, r, c, s, true) };
+            }
+            Item::Disc(x, y, r, colour, hard) => {
+                if hard { draw::disc_hard(px, width, height, x, y, r, colour) } else { draw::disc(px, width, height, x, y, r, colour) };
+            }
+            Item::Icon(x, y, r, c, s, mp, lit) => {
+                draw::icon(px, width, height, x, y, r, c, s, unsafe { &*(mp as *const draw::Mips) }, lit);
+            }
+            Item::Glow(x, y, r, colour, peak) => {
+                if GLOW_LOG {
+                    draw::glow_log(px, width, height, x, y, r, colour, peak, GLOW_FRACTION, GLOW_OCT_LOG2);
+                } else {
+                    draw::glow(px, width, height, x, y, r, colour, peak, GLOW_SCALE_Q8, GLOW_FLOOR);
+                }
+            }
+        }
+    }
+}
+
+/// One more thing on the scene's list; drawn at once on this thread if the list is full.
+fn scene_push(it: Item, px: &mut [Px], width: usize, height: usize) {
+    unsafe {
+        // WHY the test: a scene of more things than the list holds (256 circles, each at most two things, and their glows, fit) would write past it; the rest are drawn here, in order after what the list holds only where they overlap it.
+        if SCENE_NI < ITEMS {
+            SCENE_ITEMS[SCENE_NI] = it;
+            SCENE_NI += 1;
+        } else {
+            it.draw(px, width, height);
+        }
+    }
+}
+
+/// One stripe of rows of the scene's list, drawn inside this thread's clip: the stripe within the frame's own clip.
+fn scene_stripe(px: &mut [Px], width: usize, height: usize, stripe: draw::Rect) {
+    unsafe {
+        let band = stripe.intersect(draw::CLIP);
+        draw::BAND_CLIP[draw::thread_slot()] = band;
+        if band.is_empty() {
+            return;
+        }
+        let items = &(&*(&raw const SCENE_ITEMS))[..SCENE_NI];
+        for it in items {
+            let (y0, y1) = it.rows();
+            if y1 > band.y0 as i64 && y0 < band.y1 as i64 {
+                it.draw(px, width, height);
+            }
+        }
+    }
+}
+
+/// The scene's list drawn by rows across the publish workers and this thread (as `publish10x4` splits a publish), then emptied.
+fn scene_split(px: &mut [Px], width: usize, height: usize) {
+    unsafe {
+        if SCENE_NI == 0 {
+            return;
+        }
+        let full = draw::Rect::full(width, height);
+        let workers = PUB_UP.load(Ordering::Acquire) as usize;
+        draw::BANDED = true;
+        if workers == 0 {
+            scene_stripe(px, width, height, full);
+        } else {
+            let n = ((height as i32 + PUB_STRIPE - 1) / PUB_STRIPE) as usize;
+            let job = PUB_JOB.load(Ordering::Acquire) + 1;
+            PUB_KIND = 1;
+            PUB_PARAMS = (px.as_mut_ptr() as usize, width, height, 0, full, n);
+            PUB_FINISHED.store((job & 0xFFFF_FFFF) << 32, Ordering::Release);
+            PUB_CLAIM.store((job & 0xFFFF_FFFF) << 32, Ordering::Release);
+            PUB_JOB.store(job, Ordering::Release);
+            ferros_sys::wake(&PUB_JOB, PUB_WORKERS as u64);
+            pub_take(job);
+            loop {
+                let f = PUB_FINISHED.load(Ordering::Acquire);
+                if (f & 0xFFFF_FFFF) as usize >= n {
+                    break;
+                }
+                ferros_sys::wait(&PUB_FINISHED, f, now() + freq() / 1000);
+            }
+            PUB_KIND = 0;
+        }
+        draw::BANDED = false;
+        SCENE_NI = 0;
+    }
+}
+
 // ---------------------------------------------------------------- the flight, prerendered
 //
 // COMPOSITOR.md "The flight, prerendered": opening or closing the open circle, two images made once — the page image (the clean window in the canvas and the text in the front layer, the region as landing shows it) and the plane image (a free app surface) — and each frame of the flight samples them through the camera, nearest, inside the publish. No scene is drawn while it flies.
@@ -2193,15 +2324,9 @@ static mut FLIGHT_SEQ: u64 = 0;
 /// Their base in the heap, set at start (statics are in the image, which the vault keeps under 3 MiB).
 static mut FLIGHT_ROWS: usize = 1;
 
-/// This thread's flight scratch: a worker is told by its stack pointer lying in its own stack (`PUB_STACKS`), anything else is the render thread.
+/// This thread's flight scratch, by its place among the publish threads (`draw::thread_slot`: a worker by its stack, else the render thread, the last).
 fn flight_row_buf() -> &'static mut [u64; FLIGHT_SCRATCH] {
-    let sp: usize;
-    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
-    let base = &raw const PUB_STACKS as usize;
-    let i = sp.wrapping_sub(base) / 16384;
-    // WHY the test: a thread outside the workers' stacks (the render thread) lands past the last worker; it takes the extra row.
-    let k = if i < PUB_WORKERS { i } else { PUB_WORKERS };
-    unsafe { &mut *((FLIGHT_ROWS as *mut [u64; FLIGHT_SCRATCH]).add(k)) }
+    unsafe { &mut *((FLIGHT_ROWS as *mut [u64; FLIGHT_SCRATCH]).add(draw::thread_slot())) }
 }
 
 /// Sixteen zero pixels: a block of black, as the canvas path presents it.
@@ -4560,6 +4685,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         FLIGHT_ROWS = alloc::vec![0u64; FLIGHT_SCRATCH * (PUB_WORKERS + 1)].leak().as_mut_ptr() as usize;
         FLIGHT_TEXT = alloc::vec![0u32; height].leak().as_mut_ptr() as usize;
     }
+    // The publish workers' stacks, so the draw functions tell a worker's band of the scene by the stack it runs on (`draw::thread_slot`).
+    unsafe { draw::WORKER_STACKS = (&raw const PUB_STACKS as usize, PUB_STACK, PUB_WORKERS) };
     ALLOC.mark();
     log.s(b"display: present table (E peak ");
     log.dec(peak0 as u64);
@@ -5169,24 +5296,20 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                                 });
                                 unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
                                 let t_b = now();
-                                blit(pixels, width, height, spr, ext, d, (sx >> 8) - d as i64 / 2, (sy >> 8) - d as i64 / 2);
+                                scene_push(Item::Blit(spr.as_ptr() as usize, ext.as_ptr() as usize, d, (sx >> 8) - d as i64 / 2, (sy >> 8) - d as i64 / 2), pixels, width, height);
                                 unsafe { SCENE_US[1] += ferros_sys::us_since(t_b) };
                             } else {
                                 if cir.icon == ICON_FERROS {
                                     // While something moves, by rings and segments without antialiasing (`draw::logo_hard`); at rest antialiased.
-                                    if moving {
-                                        draw::logo_hard(pixels, width, height, sx, sy, ri, tc, ts, true);
-                                    } else {
-                                        draw::logo(pixels, width, height, sx, sy, ri, tc, ts, true);
-                                    }
-                                    if moving { draw::disc_hard(pixels, width, height, sx, sy, ri, 0) } else { draw::disc(pixels, width, height, sx, sy, ri, 0) };
+                                    scene_push(Item::Logo(sx, sy, ri, tc, ts, moving), pixels, width, height);
+                                    scene_push(Item::Disc(sx, sy, ri, 0, moving), pixels, width, height);
                                 } else if let Some(mp) = mp {
-                                    draw::icon(pixels, width, height, sx, sy, ri, tc, ts, mp, lit);
+                                    scene_push(Item::Icon(sx, sy, ri, tc, ts, mp as *const draw::Mips as usize, lit), pixels, width, height);
                                 }
                                 let t_d = now();
                                 unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
                                 if mp.is_none() && cir.icon != ICON_FERROS {
-                                    if moving { draw::disc_hard(pixels, width, height, sx, sy, ri, fill) } else { draw::disc(pixels, width, height, sx, sy, ri, fill) };
+                                    scene_push(Item::Disc(sx, sy, ri, fill, moving), pixels, width, height);
                                 }
                                 r = draw::Rect::EMPTY;
                                 unsafe { SCENE_US[1] += ferros_sys::us_since(t_d) };
@@ -5196,13 +5319,14 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         }
                         let t_g = now();
                         for &(gx, gy, gr, colour, peak) in &glows[..nglow] {
-                            let gr_rect = if GLOW_LOG {
-                                draw::glow_log(pixels, width, height, gx, gy, gr, colour, peak, GLOW_FRACTION, GLOW_OCT_LOG2)
-                            } else {
-                                draw::glow(pixels, width, height, gx, gy, gr, colour, peak, GLOW_SCALE_Q8, GLOW_FLOOR)
-                            };
+                            scene_push(Item::Glow(gx, gy, gr, colour, peak), pixels, width, height);
+                            // Its reach, as `draw::glow_log` gives it back.
+                            let reach = gr + gr / GLOW_FRACTION + 256;
+                            let gr_rect = draw::Rect { x0: ((gx - reach) >> 8) as i32 - 1, y0: ((gy - reach) >> 8) as i32 - 1, x1: ((gx + reach) >> 8) as i32 + 2, y1: ((gy + reach) >> 8) as i32 + 2 }.clip(width, height);
                             unsafe { CUR_DMG = CUR_DMG.union(gr_rect) };
                         }
+                        // The list drawn by rows across the cores.
+                        scene_split(pixels, width, height);
                         unsafe { SCENE_US[2] = ferros_sys::us_since(t_g) };
                     }
                     if shift.is_some() {

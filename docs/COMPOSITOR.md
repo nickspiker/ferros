@@ -101,6 +101,12 @@ A pan moves every circle by the same amount, so the frame before already holds t
 - **Measured** on the Pro (`FERROS_MAP_START=zoom`: 128 frames of a pinch with a twist, the settings circle growing to three times the screen's width): the scene 2.4-2.7 ms a frame against 7.2 with the antialiased mark (spans, each edge pixel worked out by bump steps), 129 frames/s; the publish 2.2-2.4 ms.
 - **Measured** on the Pro (`FERROS_MAP_START=crowd`, 200 circles, the synthetic drag): the shift and its strips 2.6 ms a frame against about 14 ms drawing the scene; 78 frames/s on the panel against 66. The publish is now most of a pan frame.
 
+## The scene by rows (owner, 2026-11-07: "split across cores")
+
+The scene loop stays on the render thread for what must be one thread's: each circle's place on the screen, its sprite made when it is cached, the widgets and labels (the glyph cache and the bump allocator are the render thread's). What it would draw it lists instead (`Item`: a sprite's blit, the mark, a disc, an icon, a glow), in its order. The list is then drawn in stripes of 32 rows taken by the publish workers and the render thread, as a publish is: each thread draws every item that reaches its stripe, inside its own clip (`draw::BAND_CLIP`, told by the stack it runs on, `draw::thread_slot`), so each pixel sees the same layers in the same order as on one thread. A pan's strips go the same way, a strip at a time.
+
+Measured on the Pro (`FERROS_MAP_START=zoomcrowd`: the crowd's 200 circles and the settings circle, a pinch with a twist, every frame drawn whole): the scene 3.2 ms a frame against 14.7 on the render thread alone; the zoom of the settings circle alone 2.1 against 2.4-2.7.
+
 ## Build order
 
 0. **Measure the interactive path** (touch → map → display) to know where the 72 frames/s go.
