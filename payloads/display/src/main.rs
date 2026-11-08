@@ -2258,7 +2258,10 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                 // Full screen (`FULL`): no circle, the app to the glass's edge.
                 let full = unsafe { FULL };
                 if !full {
-                    px[xa..xb.min(cl)].fill(0);
+                    // WHY the test: a publish covers columns xa..xb, which since the bars' worker publishes only what changed (COMPOSITOR.md step 1) need not start at the row's left; the left chrome ends at cl, which may be left of xa, and the range would then start past its end (the display panicked here after a boot, 2026-11-07).
+                    if xa < xb.min(cl) {
+                        px[xa..xb.min(cl)].fill(0);
+                    }
                     if xa.max(cr) < xb {
                         px[xa.max(cr)..xb].fill(0);
                     }
