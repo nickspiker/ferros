@@ -707,6 +707,8 @@ struct Map {
     fade: f64,
     fast: bool,
     page_cam: Option<Cam>,
+    /// A finger is down (the touch session), for the camera op's moving flag.
+    touching: bool,
     /// A pinch on the open page: the spread it began at (sixteenths of a pixel) and the scale then; and the scale it is at now, shown live and kept as the preference when the fingers lift (64ths of an octave).
     pinch: Option<(i64, f32)>,
     scale_live: Option<f32>,
@@ -1291,7 +1293,10 @@ impl Map {
             View::Map => {}
             View::Open(_) => self.settings(&mut b, region),
         }
-        b.op(&self.cam.op(true));
+        // Flag bit 1: something moves (a finger is down, or a flight, fling or spring goes on): the display may pan by shifting what it drew (COMPOSITOR.md "Pans from the last frame"); a frame without it is drawn whole, at rest.
+        let mut cam = self.cam.op(true);
+        cam[13] |= ((self.touching || self.settling) as u8) << 1;
+        b.op(&cam);
         b.send(self.display);
     }
 
@@ -2223,6 +2228,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         fade: 0.,
         fast: false,
         page_cam: None,
+        touching: false,
         pinch: None,
         scale_live: None,
         nrows: 0,
@@ -2500,6 +2506,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         // The session: when it began, how many fingers it ever held, where each landed, and whether any went further than a resting finger does.
         if held > 0 && !down {
             down = true;
+            map.touching = true;
             most = 0;
             moved = false;
             start = [(false, 0, 0); 16];
@@ -2577,6 +2584,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         if held == 0 && down {
             down = false;
+            map.touching = false;
             // A corner's session let go: it acted while moving (above), if it went far enough inward. A still tap on a corner circle is a tap as before (on the home circle it closes the open settings).
             if corner != 0 && !moved {
                 corner = 0;

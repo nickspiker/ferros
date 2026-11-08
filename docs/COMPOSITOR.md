@@ -90,6 +90,15 @@ The shape, top down:
   - **The ends.** Any frame that is not a flight frame ends the flight: every phase owes the whole screen once. Closing lands on the plane's own path.
 - **What it does not do yet.** The other phases' debt is still one rectangle a phase (`PHASE_DIRTY`); a scroll moves every row, so its damage is the page's band either way. The front layer is not a `Win`/surface: the window table holds the kernel's per-app surfaces and the region needs none; when apps draw into a region of their own circle, the region becomes a window of the map's.
 
+## Pans from the last frame (owner, 2026-11-07: "keeping pre-renders for pans")
+
+A pan moves every circle by the same amount, so the frame before already holds this one, shifted.
+- **The flag.** The map's camera op carries bit 1 of its flag byte while something moves: a finger is down, or a flight, fling or spring goes on. A frame without it is drawn whole: at rest everything is drawn once more for real, antialiased.
+- **The shift.** A plain plane frame (a `begin`, nothing drawn over the scene, no region, no flight, no widget on the map) with the flag, at the zoom, turn, theme and scene the canvas was last drawn whole at (the anchor), is the canvas moved in place by whole pixels; only the strips the move uncovers (a band of rows, then the columns beside it, never a corner twice) are drawn, clipped to them. The `begin`'s clear waits for the camera op to know which kind of frame it is.
+- **Exact, not approximate.** Shifted, the scene is drawn at the anchor's camera with every centre moved by the whole shift, so a circle's whole-pixel centre in a strip is where the moved part of it already stands: no seam. The real camera is under half a pixel from it, and the frame at rest puts everything exactly where the camera says.
+- **Past half the screen** the frame is drawn whole and becomes the new anchor.
+- **Measured** on the Pro (`FERROS_MAP_START=crowd`, 200 circles, the synthetic drag): the shift and its strips 2.6 ms a frame against about 14 ms drawing the scene; 78 frames/s on the panel against 66. The publish is now most of a pan frame.
+
 ## Build order
 
 0. **Measure the interactive path** (touch → map → display) to know where the 72 frames/s go.

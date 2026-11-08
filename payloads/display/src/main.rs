@@ -1982,6 +1982,38 @@ fn region_off(width: usize, height: usize) {
     }
 }
 
+// ---------------------------------------------------------------- pans from the last frame
+//
+// COMPOSITOR.md "Pans from the last frame": while the plane moves by a pan alone (the zoom and the turn as they were, nothing over the scene, the map's moving flag on), the canvas is the last whole frame shifted by whole pixels and only the strips the shift uncovers are drawn; at rest the frame is drawn whole again.
+
+/// The camera op the canvas was last drawn whole at (its flags cleared), the theme and scene generation it was drawn in, and the whole-pixel shift the canvas holds from it now.
+static mut PAN: Option<([u8; 18], u8, u32, (i64, i64))> = None;
+/// A `begin` whose clear waits for the camera op: a pan keeps the canvas, a whole frame clears what the last one drew.
+static mut CLEAR_PENDING: bool = false;
+/// Measuring pans: frames shifted, their µs summed (the shift, the strips), the worst.
+static mut PAN_US: [u64; 4] = [0; 4];
+
+/// The canvas moved by (dx, dy) whole pixels in place (a pixel at (x, y) goes to (x + dx, y + dy)); what nothing moves into is cleared. Rows in the order that never reads a row already written.
+fn canvas_shift(px: &mut [Px], width: usize, height: usize, dx: i64, dy: i64) {
+    let (w, h) = (width as i64, height as i64);
+    // The columns that receive a pixel: [x0, x1), from x0 − dx on.
+    let (x0, x1) = (dx.max(0), (w + dx).min(w));
+    for k in 0..h {
+        let y = if dy > 0 { h - 1 - k } else { k };
+        let row = y as usize * width;
+        let sy = y - dy;
+        // WHY the tests: a row with no source row (uncovered by the shift) and a shift wider than the screen have nothing to move; their pixels are cleared.
+        if sy < 0 || sy >= h || x0 >= x1 {
+            px[row..row + width].fill(0);
+            continue;
+        }
+        let src = sy as usize * width + (x0 - dx) as usize;
+        unsafe { core::ptr::copy(px.as_ptr().add(src), px.as_mut_ptr().add(row + x0 as usize), (x1 - x0) as usize) };
+        px[row..row + x0 as usize].fill(0);
+        px[row + x1 as usize..row + width].fill(0);
+    }
+}
+
 // ---------------------------------------------------------------- the flight, prerendered
 //
 // COMPOSITOR.md "The flight, prerendered": opening or closing the open circle, two images made once — the page image (the clean window in the canvas and the text in the front layer, the region as landing shows it) and the plane image (a free app surface) — and each frame of the flight samples them through the camera, nearest, inside the publish. No scene is drawn while it flies.
@@ -4694,7 +4726,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         if { CLIP_PHASE }.is_some() {
                             draw::clear(pixels, width, draw::CLIP.clip(width, height));
                         } else {
-                            draw::clear(pixels, width, PREV_DMG.clip(width, height));
+                            // Held until the frame shows whether it is a pan from the last (`PAN`, the camera op) or whole: a pan keeps what the canvas holds.
+                            CLEAR_PENDING = true;
                             CUR_DMG = draw::Rect::EMPTY;
                         }
                     }
@@ -4716,6 +4749,13 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             None => out[0] = 1,
                         }
                     } else {
+                        // The frame's held clear first: something is drawn into the canvas, so the frame is whole.
+                        unsafe {
+                            if CLEAR_PENDING {
+                                draw::clear(pixels, width, PREV_DMG.clip(width, height));
+                                CLEAR_PENDING = false;
+                            }
+                        }
                         match page_op(m, Some(&mut *pixels), width, height) {
                             Some(r) => unsafe { CUR_DMG = CUR_DMG.union(r.clip(width, height)) },
                             None => out[0] = 1,
@@ -4743,6 +4783,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     }
                 }
                 Some(4) => {
+                    unsafe {
+                        if CLEAR_PENDING {
+                            draw::clear(pixels, width, PREV_DMG.clip(width, height));
+                            CLEAR_PENDING = false;
+                        }
+                    }
                     // The finished frame to the framebuffer: reads from cache, writes combined.
                     if ten && unsafe { TEMPORAL } { publish_next(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &tabs) } else { publish(pixels, screen) }
                     ferros_sys::dma_barrier();
@@ -4823,6 +4869,65 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     let cy = i32::from_le_bytes([m[5], m[6], m[7], m[8]]) as i64;
                     let z = u32::from_le_bytes([m[9], m[10], m[11], m[12]]) as i64;
                     let (rc, rs) = if m.len() >= 18 { (i16::from_le_bytes([m[14], m[15]]) as i64, i16::from_le_bytes([m[16], m[17]]) as i64) } else { (16384, 0) };
+                    // Pans from the last frame (COMPOSITOR.md): a plain plane frame (a `begin`, nothing drawn over the scene, no region, no flight, no widget on the map) with the moving flag (bit 1), at the zoom, turn, theme and scene the canvas was last drawn whole at, is that frame shifted by whole pixels; only the strips the shift uncovers are drawn. Shifted, the scene is drawn at the anchor's camera moved by the whole shift, so every circle's whole-pixel centre is where a whole frame at that camera would put it.
+                    let t_pan = now();
+                    let mut cam_key = [0u8; 18];
+                    cam_key[..m.len().min(18)].copy_from_slice(&m[..m.len().min(18)]);
+                    cam_key[13] = 0;
+                    let theme_now = ferros_sys::theme::index() as u8;
+                    let plain = clip_k.is_none() && pre == 0 && unsafe { CLEAR_PENDING && { CUR_DMG }.is_empty() && (*(&raw const REGION_REQ)).is_none() && !REGION_ON && (*(&raw const FLIGHT_FRAME)).is_none() } && m.get(13).copied().unwrap_or(0) & 1 == 1 && unsafe { (&*(&raw const SCENE))[..SCENE_N].iter().all(|c| c.icon != WIDGET_CLOCK && c.icon != WIDGET_SCOPE) };
+                    let moving = m.get(13).copied().unwrap_or(0) & 2 != 0;
+                    let shift = match unsafe { *(&raw const PAN) } {
+                        Some((a, at, ag, prev)) if plain && moving && at == theme_now && ag == unsafe { SCENE_GEN } && a[9..13] == cam_key[9..13] && a[14..18] == cam_key[14..18] => {
+                            let (ax, ay) = (i32::from_le_bytes([a[1], a[2], a[3], a[4]]) as i64, i32::from_le_bytes([a[5], a[6], a[7], a[8]]) as i64);
+                            // The screen moves by −R·(camera − anchor)·z: world ×256 at 16.16 pixels a unit with the turn in Q14, 2³⁸ in all.
+                            let (ddx, ddy) = ((cx - ax) as f64, (cy - ay) as f64);
+                            let q38 = (1u64 << 38) as f64;
+                            let (fx, fy) = (-(rc as f64 * ddx - rs as f64 * ddy) * z as f64 / q38, -(rs as f64 * ddx + rc as f64 * ddy) * z as f64 / q38);
+                            let d = (libm::round(fx) as i64, libm::round(fy) as i64);
+                            // WHY the bound: a shift of half the screen or more uncovers more than it keeps; the frame is drawn whole.
+                            if d.0.abs() < (width as i64) / 2 && d.1.abs() < (height as i64) / 2 { Some((a, ax, ay, d, prev)) } else { None }
+                        }
+                        _ => None,
+                    };
+                    // The strips the shift uncovers, as clips (rows, then columns).
+                    let mut strips = [draw::Rect::EMPTY; 2];
+                    let mut nstrips = 1usize;
+                    if let Some((a, _, _, d, prev)) = shift {
+                        let (dx, dy) = (d.0 - prev.0, d.1 - prev.1);
+                        canvas_shift(pixels, width, height, dx, dy);
+                        let (w, h) = (width as i32, height as i32);
+                        let (dx, dy) = (dx as i32, dy as i32);
+                        let rows = if dy > 0 { draw::Rect { x0: 0, y0: 0, x1: w, y1: dy } } else { draw::Rect { x0: 0, y0: h + dy, x1: w, y1: h } };
+                        // The columns only on the rows the row strip leaves: drawn twice, a corner would take its edges and glows under themselves twice.
+                        let (ry0, ry1) = if dy > 0 { (dy, h) } else { (0, h + dy) };
+                        let cols = if dx > 0 { draw::Rect { x0: 0, y0: ry0, x1: dx, y1: ry1 } } else { draw::Rect { x0: w + dx, y0: ry0, x1: w, y1: ry1 } };
+                        nstrips = 0;
+                        for r in [rows, cols] {
+                            if !r.is_empty() {
+                                strips[nstrips] = r;
+                                nstrips += 1;
+                            }
+                        }
+                        unsafe {
+                            CLEAR_PENDING = false;
+                            PAN = Some((a, theme_now, SCENE_GEN, d));
+                        }
+                    } else {
+                        unsafe {
+                            if CLEAR_PENDING {
+                                draw::clear(pixels, width, PREV_DMG.clip(width, height));
+                                CLEAR_PENDING = false;
+                            }
+                            // Drawn whole: the anchor of the pans to come, if it is a plain plane frame.
+                            PAN = if plain { Some((cam_key, theme_now, SCENE_GEN, (0, 0))) } else { None };
+                        }
+                    }
+                    // Shifted: the scene at the anchor's camera, every centre moved by the whole shift (Q8).
+                    let (cx, cy, (ox, oy)) = match shift {
+                        Some((_, ax, ay, d, _)) => (ax, ay, (d.0 << 8, d.1 << 8)),
+                        None => (cx, cy, (0, 0)),
+                    };
                     // Flag bit 0: keep what the frame already holds (a `begin` and the client's overlay, sent first in the same batch), so the scene goes under it; without it the frame starts from the last frame's rectangle cleared.
                     unsafe {
                         // A full frame says afresh which widgets are on the glass; a redraw between frames (a clip) draws only what reaches its clip and must not forget the others (the clock's clip turned the scope's redraws off, and the scope's the clock's, 2026-10-25).
@@ -4908,185 +5013,211 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     let mut t_phase = now();
                     unsafe { SCENE_US = [0; 3]; PUB_TICKS = [0; 3]; PUB_BLOCKS = [0; 3] };
                     let (wq, hq) = ((width as i64) << 7, (height as i64) << 7);
-                    // The glows, collected as the circles go and drawn after all of them, so they land behind every circle (front to back: what is drawn later goes under). Each: centre, radius (Q8), colour, peak.
-                    let mut glows = [(0i64, 0i64, 0i64, 0u32, 0u32); 256];
-                    let mut nglow = 0usize;
-                    // The theme (ferros_sys::theme, device preference 5): every colour the scene chooses.
-                    let th = ferros_sys::theme::current();
-                    for i in 0..scene_n {
-                        let cir = unsafe { SCENE[i] };
-                        // World to screen, Q8 pixels: offset, turn, zoom, centre.
-                        let (dx, dy) = (((cir.x as i64) << 8) - cx, ((cir.y as i64) << 8) - cy);
-                        // Centres on whole pixels, so a cached sprite and a fresh drawing always line up.
-                        let sx = (((rc * dx - rs * dy) >> 14) * z / 65536 + wq) & !255 | 128;
-                        let sy = (((rs * dx + rc * dy) >> 14) * z / 65536 + hq) & !255 | 128;
-                        let sr = cir.r as i64 * z >> 8;
-                        // Between frames, only what reaches the clip (the circle and its glow, 1/12 of the radius out) is drawn.
-                        if clip_k.is_some() {
-                            let reach = sr + sr / GLOW_FRACTION + 512;
-                            let c = unsafe { draw::CLIP };
-                            if (sx + reach) >> 8 < c.x0 as i64 || (sx - reach) >> 8 >= c.x1 as i64 || (sy + reach) >> 8 < c.y0 as i64 || (sy - reach) >> 8 >= c.y1 as i64 {
+                    // Shifted (a pan from the last frame), once for each strip the shift uncovered, clipped to it; else once, whole.
+                    for si in 0..nstrips {
+                        if shift.is_some() {
+                            unsafe { draw::CLIP = strips[si] };
+                        }
+                        // The glows, collected as the circles go and drawn after all of them, so they land behind every circle (front to back: what is drawn later goes under). Each: centre, radius (Q8), colour, peak.
+                        let mut glows = [(0i64, 0i64, 0i64, 0u32, 0u32); 256];
+                        let mut nglow = 0usize;
+                        // The theme (ferros_sys::theme, device preference 5): every colour the scene chooses.
+                        let th = ferros_sys::theme::current();
+                        for i in 0..scene_n {
+                            let cir = unsafe { SCENE[i] };
+                            // World to screen, Q8 pixels: offset, turn, zoom, centre.
+                            let (dx, dy) = (((cir.x as i64) << 8) - cx, ((cir.y as i64) << 8) - cy);
+                            // Centres on whole pixels, so a cached sprite and a fresh drawing always line up.
+                            let sx = ((((rc * dx - rs * dy) >> 14) * z / 65536 + wq) & !255 | 128) + ox;
+                            let sy = ((((rs * dx + rc * dy) >> 14) * z / 65536 + hq) & !255 | 128) + oy;
+                            let sr = cir.r as i64 * z >> 8;
+                            // Between frames, only what reaches the clip (the circle and its glow, 1/12 of the radius out) is drawn.
+                            if clip_k.is_some() || shift.is_some() {
+                                let reach = sr + sr / GLOW_FRACTION + 512;
+                                let c = unsafe { draw::CLIP };
+                                if (sx + reach) >> 8 < c.x0 as i64 || (sx - reach) >> 8 >= c.x1 as i64 || (sy + reach) >> 8 < c.y0 as i64 || (sy - reach) >> 8 >= c.y1 as i64 {
+                                    continue;
+                                }
+                            }
+                            // Its glow, before the visibility cut: a circle just off the screen still lights its edge.
+                            if sr >= 256 && cir.ring > 0 && nglow < glows.len() {
+                                let colour = if cir.lit != 0 { th.lit & 0x00FF_FFFF } else { th.ring & 0x00FF_FFFF };
+                                glows[nglow] = (sx, sy, sr, colour, th.glow_peak[(cir.ring as usize).min(2)]);
+                                nglow += 1;
+                            }
+                            if sr < 256 || sx + sr < 0 || sx - sr > (width as i64) << 8 || sy + sr < 0 || sy - sr > (height as i64) << 8 {
                                 continue;
                             }
-                        }
-                        // Its glow, before the visibility cut: a circle just off the screen still lights its edge.
-                        if sr >= 256 && cir.ring > 0 && nglow < glows.len() {
-                            let colour = if cir.lit != 0 { th.lit & 0x00FF_FFFF } else { th.ring & 0x00FF_FFFF };
-                            glows[nglow] = (sx, sy, sr, colour, th.glow_peak[(cir.ring as usize).min(2)]);
-                            nglow += 1;
-                        }
-                        if sr < 256 || sx + sr < 0 || sx - sr > (width as i64) << 8 || sy + sr < 0 || sy - sr > (height as i64) << 8 {
-                            continue;
-                        }
-                        // Importance is the ring's weight, in screen pixels so it stays legible at every zoom: thin 4 % (at least a pixel), heavy 12 % (at least two).
-                        // No stroke: the circle's image reaches its radius, so circles touch; importance is the glow, drawn after every circle (below).
-                        // No stroke any more; the slot in the sprite's key holds the theme, which colours a plain circle's fill.
-                        let stroke = ferros_sys::theme::index() as i64;
-                        let lit = cir.lit != 0;
-                        let ri = sr;
-                        // A widget the display draws itself (not a bundle icon): the clock — its time in the centre first, then the face under it; never cached, it changes every second.
-                        if cir.icon == WIDGET_SCOPE {
-                            // Turned as an icon is: the camera's turn, then the circle's own.
-                            let (cc, cs) = (cir.c as i64, cir.s as i64);
-                            let turn = (((rc * cc - rs * cs) >> 14) as f32 / 16384.0, ((rs * cc + rc * cs) >> 14) as f32 / 16384.0);
-                            let r = scope_widget(pixels, width, height, sx, sy, sr, turn, th, &font);
-                            ALLOC.reset();
-                            unsafe {
-                                CUR_DMG = CUR_DMG.union(r);
-                                SCOPE_SHOWN = true;
-                                SCOPE_RECT = SCOPE_RECT.union(r);
+                            // Importance is the ring's weight, in screen pixels so it stays legible at every zoom: thin 4 % (at least a pixel), heavy 12 % (at least two).
+                            // No stroke: the circle's image reaches its radius, so circles touch; importance is the glow, drawn after every circle (below).
+                            // No stroke any more; the slot in the sprite's key holds the theme, which colours a plain circle's fill.
+                            let stroke = ferros_sys::theme::index() as i64;
+                            let lit = cir.lit != 0;
+                            let ri = sr;
+                            // A widget the display draws itself (not a bundle icon): the clock — its time in the centre first, then the face under it; never cached, it changes every second.
+                            if cir.icon == WIDGET_SCOPE {
+                                // Turned as an icon is: the camera's turn, then the circle's own.
+                                let (cc, cs) = (cir.c as i64, cir.s as i64);
+                                let turn = (((rc * cc - rs * cs) >> 14) as f32 / 16384.0, ((rs * cc + rc * cs) >> 14) as f32 / 16384.0);
+                                let r = scope_widget(pixels, width, height, sx, sy, sr, turn, th, &font);
+                                ALLOC.reset();
+                                unsafe {
+                                    CUR_DMG = CUR_DMG.union(r);
+                                    SCOPE_SHOWN = true;
+                                    SCOPE_RECT = SCOPE_RECT.union(r);
+                                }
+                                continue;
                             }
-                            continue;
-                        }
-                        if cir.icon == WIDGET_CLOCK {
-                            let mut tb = [0u8; 32];
-                            let (rings, nrings, tn, key, pm) = clock_state(&mut tb);
-                            unsafe { CLOCK_KEY = key };
-                            if let Ok(t) = core::str::from_utf8(&tb[..tn]) {
-                                // The centre's width (124/256 of the radius, both sides), less a margin, at the text's natural width.
-                                let room = (sr >> 8) as f32 * 2.0 * 124.0 / 256.0 * 0.82;
-                                // Sized by the widest the time can be (12:00:00, four dozenal places, or a row of three in focus), so the digits keep one size as the time's own width changes.
-                                let widest = match nrings {
-                                    6 => "\u{10}:\u{10}:\u{10}",
-                                    4 => "\u{10}:\u{10}:\u{10}:\u{10}",
-                                    _ => "00:00:00",
-                                };
-                                let unit = text_width(&font, widest, 100.0).max(1.0);
-                                // As big as the face makes room for, at every zoom (owner, 2026-10-24: no cap — at 256 px the digits stopped growing with the clock).
-                                let px = room / unit * 100.0;
-                                // The digits turn with the face: upright by gravity once the AoC reports it, else with the map's and the circle's own turn.
+                            if cir.icon == WIDGET_CLOCK {
+                                let mut tb = [0u8; 32];
+                                let (rings, nrings, tn, key, pm) = clock_state(&mut tb);
+                                unsafe { CLOCK_KEY = key };
+                                if let Ok(t) = core::str::from_utf8(&tb[..tn]) {
+                                    // The centre's width (124/256 of the radius, both sides), less a margin, at the text's natural width.
+                                    let room = (sr >> 8) as f32 * 2.0 * 124.0 / 256.0 * 0.82;
+                                    // Sized by the widest the time can be (12:00:00, four dozenal places, or a row of three in focus), so the digits keep one size as the time's own width changes.
+                                    let widest = match nrings {
+                                        6 => "\u{10}:\u{10}:\u{10}",
+                                        4 => "\u{10}:\u{10}:\u{10}:\u{10}",
+                                        _ => "00:00:00",
+                                    };
+                                    let unit = text_width(&font, widest, 100.0).max(1.0);
+                                    // As big as the face makes room for, at every zoom (owner, 2026-10-24: no cap — at 256 px the digits stopped growing with the clock).
+                                    let px = room / unit * 100.0;
+                                    // The digits turn with the face: upright by gravity once the AoC reports it, else with the map's and the circle's own turn.
+                                    let (cc, cs) = (cir.c as i64, cir.s as i64);
+                                    let (fc, fs) = unsafe { GRAV_TURN }.unwrap_or(((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14));
+                                    let (tcf, tsf) = (fc as f32 / 16384.0, fs as f32 / 16384.0);
+                                    let (cxf, cyf) = ((sx >> 8) as f32 + 0.5, (sy >> 8) as f32 + 0.5);
+                                    let t_digits = now();
+                                    // Two rows in focus (the upper three places over the lower three), one otherwise; rows stack along the face's own down.
+                                    let rows = t.split('\n').count() as f32;
+                                    for (k, line) in t.split('\n').enumerate() {
+                                        let d = (k as f32 - (rows - 1.0) * 0.5) * px * 1.15;
+                                        text_turned_centre(pixels, width, height, line, cxf - tsf * d, cyf + tcf * d, px, (tcf, tsf), 0xFF00_0000 | th.text);
+                                        ALLOC.reset();
+                                    }
+                                    // am / pm under the digits, half their size, turned with the face.
+                                    if let Some(pm) = pm {
+                                        let d = px * 0.8;
+                                        text_turned_centre(pixels, width, height, if pm { "pm" } else { "am" }, cxf - tsf * d, cyf + tcf * d, px * 0.45, (tcf, tsf), 0xFF00_0000 | th.text2);
+                                        ALLOC.reset();
+                                    }
+                                    unsafe { CLOCK_PART_US[0] += ferros_sys::us_since(t_digits) };
+                                }
+                                let t_face = now();
+                                // The face's turn: gravity's when known, else the camera's and the circle's own, as the icons get it.
                                 let (cc, cs) = (cir.c as i64, cir.s as i64);
                                 let (fc, fs) = unsafe { GRAV_TURN }.unwrap_or(((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14));
-                                let (tcf, tsf) = (fc as f32 / 16384.0, fs as f32 / 16384.0);
-                                let (cxf, cyf) = ((sx >> 8) as f32 + 0.5, (sy >> 8) as f32 + 0.5);
-                                let t_digits = now();
-                                // Two rows in focus (the upper three places over the lower three), one otherwise; rows stack along the face's own down.
-                                let rows = t.split('\n').count() as f32;
-                                for (k, line) in t.split('\n').enumerate() {
-                                    let d = (k as f32 - (rows - 1.0) * 0.5) * px * 1.15;
-                                    text_turned_centre(pixels, width, height, line, cxf - tsf * d, cyf + tcf * d, px, (tcf, tsf), 0xFF00_0000 | th.text);
-                                    ALLOC.reset();
+                                let r = draw::clock(pixels, width, height, sx, sy, sr, &rings[..nrings], unsafe { &*(&raw const CLOCK_DIRS) }, fc, fs);
+                                unsafe { CLOCK_PART_US[1] += ferros_sys::us_since(t_face) };
+                                unsafe {
+                                    CLOCK_GEOM = (sx, sy, sr, fc, fs, nrings);
+                                    BACK_CLOCK = ClockShown { frac: core::array::from_fn(|k| rings[k].frac_q16), lighter: core::array::from_fn(|k| rings[k].lighter), key, turn: GRAV_TURN.unwrap_or((0, 0)) };
                                 }
-                                // am / pm under the digits, half their size, turned with the face.
-                                if let Some(pm) = pm {
-                                    let d = px * 0.8;
-                                    text_turned_centre(pixels, width, height, if pm { "pm" } else { "am" }, cxf - tsf * d, cyf + tcf * d, px * 0.45, (tcf, tsf), 0xFF00_0000 | th.text2);
-                                    ALLOC.reset();
+                                unsafe {
+                                    CUR_DMG = CUR_DMG.union(r);
+                                    CLOCK_SHOWN = true;
+                                    CLOCK_RECT = CLOCK_RECT.union(r);
                                 }
-                                unsafe { CLOCK_PART_US[0] += ferros_sys::us_since(t_digits) };
+                                continue;
                             }
-                            let t_face = now();
-                            // The face's turn: gravity's when known, else the camera's and the circle's own, as the icons get it.
+                            // Front to back: the label, the icon, the fill, the ring's larger disc beneath them all.
+                            // Zoom is semantic: a name appears only once the circle is big enough to read it.
+                            if sr >= 36 << 8 && cir.len > 0 {
+                                if let Ok(t) = core::str::from_utf8(&cir.label[..cir.len as usize]) {
+                                    // A third of the radius, at every zoom (no cap: it stopped at 72 px; the 36-px threshold above is when a name appears at all).
+                                    let px = (sr >> 8) as f32 * 0.32;
+                                    let tw = text_width(&font, t, px);
+                                    let (fx, fy) = ((sx >> 8) as f32, (sy >> 8) as f32);
+                                    let mut c = Canvas::new(pixels, width, height, &mut damage);
+                                    text(&mut c, &font, t, fx - tw * 0.5, fy + px * 0.35, px, if lit { BLACK } else { 0xFF00_0000 | th.text });
+                                    ALLOC.reset();
+                                }
+                            }
+                            let t_i = now();
                             let (cc, cs) = (cir.c as i64, cir.s as i64);
-                            let (fc, fs) = unsafe { GRAV_TURN }.unwrap_or(((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14));
-                            let r = draw::clock(pixels, width, height, sx, sy, sr, &rings[..nrings], unsafe { &*(&raw const CLOCK_DIRS) }, fc, fs);
-                            unsafe { CLOCK_PART_US[1] += ferros_sys::us_since(t_face) };
-                            unsafe {
-                                CLOCK_GEOM = (sx, sy, sr, fc, fs, nrings);
-                                BACK_CLOCK = ClockShown { frac: core::array::from_fn(|k| rings[k].frac_q16), lighter: core::array::from_fn(|k| rings[k].lighter), key, turn: GRAV_TURN.unwrap_or((0, 0)) };
-                            }
-                            unsafe {
-                                CUR_DMG = CUR_DMG.union(r);
-                                CLOCK_SHOWN = true;
-                                CLOCK_RECT = CLOCK_RECT.union(r);
-                            }
-                            continue;
-                        }
-                        // Front to back: the label, the icon, the fill, the ring's larger disc beneath them all.
-                        // Zoom is semantic: a name appears only once the circle is big enough to read it.
-                        if sr >= 36 << 8 && cir.len > 0 {
-                            if let Ok(t) = core::str::from_utf8(&cir.label[..cir.len as usize]) {
-                                // A third of the radius, at every zoom (no cap: it stopped at 72 px; the 36-px threshold above is when a name appears at all).
-                                let px = (sr >> 8) as f32 * 0.32;
-                                let tw = text_width(&font, t, px);
-                                let (fx, fy) = ((sx >> 8) as f32, (sy >> 8) as f32);
-                                let mut c = Canvas::new(pixels, width, height, &mut damage);
-                                text(&mut c, &font, t, fx - tw * 0.5, fy + px * 0.35, px, if lit { BLACK } else { 0xFF00_0000 | th.text });
-                                ALLOC.reset();
-                            }
-                        }
-                        let t_i = now();
-                        let (cc, cs) = (cir.c as i64, cir.s as i64);
-                        let (tc, ts) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
-                        let fill = if lit { th.lit & 0x00FF_FFFF } else { th.plane & 0x00FF_FFFF };
-                        let mp = mips.get((cir.icon as usize).wrapping_sub(1));
-                        let d = (2 * ((sr >> 8) + 3)) as usize;
-                        let mut r = draw::Rect::EMPTY;
-                        let still = unsafe { LAST_KEY[i] == [sr, stroke, tc, ts, lit as i64, cir.icon as i64] };
-                        unsafe { LAST_KEY[i] = [sr, stroke, tc, ts, lit as i64, cir.icon as i64] };
-                        if d <= SPRITE_MAX && still && !unsafe { REGION_ON } {
-                            // Cached: drawn at the sprite's centre pixel, then blitted.
-                            let key = [sr, stroke, tc, ts, lit as i64, cir.icon as i64];
-                            let (spr, ext) = sprite(i, key, d, |px, d| {
-                                let c = ((d as i64 / 2) << 8) | 128;
-                                // The fill only where there is no art: under an icon it showed as a dark rim along the edge.
-                                match mp {
-                                    // The ferros mark in its own colours, on black (owner, 2026-11-07): the mark first, the black disc under it.
-                                    _ if cir.icon == ICON_FERROS => {
-                                        draw::logo(px, d, d, c, c, ri, tc, ts, true);
-                                        draw::disc(px, d, d, c, c, ri, 0);
+                            let (tc, ts) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
+                            let fill = if lit { th.lit & 0x00FF_FFFF } else { th.plane & 0x00FF_FFFF };
+                            let mp = mips.get((cir.icon as usize).wrapping_sub(1));
+                            let d = (2 * ((sr >> 8) + 3)) as usize;
+                            let mut r = draw::Rect::EMPTY;
+                            let still = unsafe { LAST_KEY[i] == [sr, stroke, tc, ts, lit as i64, cir.icon as i64] };
+                            unsafe { LAST_KEY[i] = [sr, stroke, tc, ts, lit as i64, cir.icon as i64] };
+                            if d <= SPRITE_MAX && still && !unsafe { REGION_ON } {
+                                // Cached: drawn at the sprite's centre pixel, then blitted.
+                                let key = [sr, stroke, tc, ts, lit as i64, cir.icon as i64];
+                                let (spr, ext) = sprite(i, key, d, |px, d| {
+                                    let c = ((d as i64 / 2) << 8) | 128;
+                                    // The fill only where there is no art: under an icon it showed as a dark rim along the edge.
+                                    match mp {
+                                        // The ferros mark in its own colours, on black (owner, 2026-11-07): the mark first, the black disc under it.
+                                        _ if cir.icon == ICON_FERROS => {
+                                            draw::logo(px, d, d, c, c, ri, tc, ts, true);
+                                            draw::disc(px, d, d, c, c, ri, 0);
+                                        }
+                                        Some(mp) => {
+                                            draw::icon(px, d, d, c, c, ri, tc, ts, mp, lit);
+                                        }
+                                        None => {
+                                            draw::disc(px, d, d, c, c, ri, fill);
+                                        }
                                     }
-                                    Some(mp) => {
-                                        draw::icon(px, d, d, c, c, ri, tc, ts, mp, lit);
-                                    }
-                                    None => {
-                                        draw::disc(px, d, d, c, c, ri, fill);
-                                    }
+    
+                                });
+                                unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
+                                let t_b = now();
+                                blit(pixels, width, height, spr, ext, d, (sx >> 8) - d as i64 / 2, (sy >> 8) - d as i64 / 2);
+                                unsafe { SCENE_US[1] += ferros_sys::us_since(t_b) };
+                            } else {
+                                if cir.icon == ICON_FERROS {
+                                    draw::logo(pixels, width, height, sx, sy, ri, tc, ts, true);
+                                    draw::disc(pixels, width, height, sx, sy, ri, 0);
+                                } else if let Some(mp) = mp {
+                                    draw::icon(pixels, width, height, sx, sy, ri, tc, ts, mp, lit);
                                 }
-
-                            });
-                            unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
-                            let t_b = now();
-                            blit(pixels, width, height, spr, ext, d, (sx >> 8) - d as i64 / 2, (sy >> 8) - d as i64 / 2);
-                            unsafe { SCENE_US[1] += ferros_sys::us_since(t_b) };
-                        } else {
-                            if cir.icon == ICON_FERROS {
-                                draw::logo(pixels, width, height, sx, sy, ri, tc, ts, true);
-                                draw::disc(pixels, width, height, sx, sy, ri, 0);
-                            } else if let Some(mp) = mp {
-                                draw::icon(pixels, width, height, sx, sy, ri, tc, ts, mp, lit);
+                                let t_d = now();
+                                unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
+                                if mp.is_none() && cir.icon != ICON_FERROS {
+                                    draw::disc(pixels, width, height, sx, sy, ri, fill);
+                                }
+                                r = draw::Rect::EMPTY;
+                                unsafe { SCENE_US[1] += ferros_sys::us_since(t_d) };
                             }
-                            let t_d = now();
-                            unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
-                            if mp.is_none() && cir.icon != ICON_FERROS {
-                                draw::disc(pixels, width, height, sx, sy, ri, fill);
-                            }
-                            r = draw::Rect::EMPTY;
-                            unsafe { SCENE_US[1] += ferros_sys::us_since(t_d) };
+                            let whole = draw::Rect { x0: ((sx - sr) >> 8) as i32 - 3, y0: ((sy - sr) >> 8) as i32 - 3, x1: ((sx + sr) >> 8) as i32 + 4, y1: ((sy + sr) >> 8) as i32 + 4 }.clip(width, height);
+                            unsafe { CUR_DMG = CUR_DMG.union(whole).union(r) };
                         }
-                        let whole = draw::Rect { x0: ((sx - sr) >> 8) as i32 - 3, y0: ((sy - sr) >> 8) as i32 - 3, x1: ((sx + sr) >> 8) as i32 + 4, y1: ((sy + sr) >> 8) as i32 + 4 }.clip(width, height);
-                        unsafe { CUR_DMG = CUR_DMG.union(whole).union(r) };
+                        let t_g = now();
+                        for &(gx, gy, gr, colour, peak) in &glows[..nglow] {
+                            let gr_rect = if GLOW_LOG {
+                                draw::glow_log(pixels, width, height, gx, gy, gr, colour, peak, GLOW_FRACTION, GLOW_OCT_LOG2)
+                            } else {
+                                draw::glow(pixels, width, height, gx, gy, gr, colour, peak, GLOW_SCALE_Q8, GLOW_FLOOR)
+                            };
+                            unsafe { CUR_DMG = CUR_DMG.union(gr_rect) };
+                        }
+                        unsafe { SCENE_US[2] = ferros_sys::us_since(t_g) };
                     }
-                    let t_g = now();
-                    for &(gx, gy, gr, colour, peak) in &glows[..nglow] {
-                        let gr_rect = if GLOW_LOG {
-                            draw::glow_log(pixels, width, height, gx, gy, gr, colour, peak, GLOW_FRACTION, GLOW_OCT_LOG2)
-                        } else {
-                            draw::glow(pixels, width, height, gx, gy, gr, colour, peak, GLOW_SCALE_Q8, GLOW_FLOOR)
-                        };
-                        unsafe { CUR_DMG = CUR_DMG.union(gr_rect) };
+                    if shift.is_some() {
+                        unsafe {
+                            draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX };
+                            // Everything moved: the whole screen is this frame's, and the canvas may hold something anywhere.
+                            CUR_DMG = draw::Rect::full(width, height);
+                            let us = ferros_sys::us_since(t_pan);
+                            PAN_US[0] += 1;
+                            PAN_US[1] += us;
+                            PAN_US[2] = PAN_US[2].max(us);
+                            if PAN_US[0] == 64 {
+                                log.s(b"display: pans, 64 frames shifted: the shift and its strips ");
+                                log.dec(PAN_US[1] / 64);
+                                log.s(b" us a frame, worst ");
+                                log.dec(PAN_US[2]);
+                                log.s(b" us\n");
+                                log.flush();
+                                PAN_US = [0; 4];
+                            }
+                        }
                     }
-                    unsafe { SCENE_US[2] = ferros_sys::us_since(t_g) };
                     unsafe { PHASE_US[0] = ferros_sys::us_since(t_phase) };
                     t_phase = now();
                     unsafe { PHASE_US[1] = 0 };
