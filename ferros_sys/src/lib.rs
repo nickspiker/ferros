@@ -452,6 +452,11 @@ pub fn store_get_at(cap: u64, key: &[u8], offset: usize, buf: &mut [u8]) -> Opti
     if r == ERR || r == NOTHING { None } else { Some(r as usize) }
 }
 
+/// `store_get_at` with the kernel's answer as it is: the value's whole length, NOTHING (absent) or ERR (refused: nobody present for a person's name, or no such grant), for a caller that must tell absent from refused (a list it would otherwise write over).
+pub fn store_read_at(cap: u64, key: &[u8], offset: usize, buf: &mut [u8]) -> u64 {
+    svc(nr::STORE, cap, 2 | (buf.len() as u64) << 8 | (offset as u64) << 32, off(key.as_ptr()), key.len() as u64, off(buf.as_mut_ptr()))
+}
+
 /// Write a value larger than one transfer in pieces: `piece` at `offset` of the value under `key`, `more` while pieces follow; the piece without `more` commits the whole (the kernel assembles it). True while the kernel takes them.
 pub fn store_set_at(cap: u64, key: &[u8], offset: usize, piece: &[u8], more: bool) -> bool {
     svc(nr::STORE, cap, 1 | 2 | if more { 4 } else { 0 } | (piece.len() as u64) << 8 | (offset as u64) << 32, off(key.as_ptr()), key.len() as u64, off(piece.as_ptr())) == 0
@@ -769,6 +774,27 @@ fn spawn_with(grants: u64, name: &[u8], key: &[u8], slots: &[u64], flags: u64) -
         at += 32;
     }
     svc(nr::SPAWN, off(req.as_ptr()), at as u64, flags, 0, 0)
+}
+
+/// Launch a kist (KISTS.md; `SYS_SPAWN` kist mode): the capsule stored in the vault under its 32-byte address `capsule` (the `capsules.` scope) as a process called `name`, with one slot per want the capsule declares, in its order: the right's code (ferros_kist::RIGHTS) where the person granted it, G#FF (an empty slot) where they did not. The kernel makes every right's object itself from the Kists capability at grant `kists`, and refuses any right the capsule does not declare in that slot once it has read it. 0 queued (the kernel streams the capsule from the vault and starts it; the outcome goes to the console), NOTHING already running or starting, ERR refused (the reason on the console). At most 64 slots. `replace`: a live process of that name is killed first (one shot dead) and the kist launched again; with none alive, NOTHING and nothing launched.
+pub fn spawn_kist(grants: u64, kists: u64, name: &[u8], capsule: &[u8; 32], codes: &[u8], replace: bool) -> u64 {
+    let mut req = [0u8; 1 + 64 + 32 + 32 + 1 + 64];
+    assert!(name.len() <= 64 && codes.len() <= 64, "spawn_kist: a name or a list of slots longer than a request holds");
+    let mut at = 0;
+    req[at] = name.len() as u8;
+    req[at + 1..at + 1 + name.len()].copy_from_slice(name);
+    at += 1 + name.len();
+    req[at..at + 32].copy_from_slice(capsule);
+    at += 32;
+    let tok = (arc_base() + cap(grants, kists)) as *const u8;
+    for i in 0..32 {
+        req[at + i] = unsafe { core::ptr::read_volatile(tok.add(i)) };
+    }
+    at += 32;
+    req[at] = codes.len() as u8;
+    req[at + 1..at + 1 + codes.len()].copy_from_slice(codes);
+    at += 1 + codes.len();
+    svc(nr::SPAWN, off(req.as_ptr()), at as u64, 2 | (replace as u64) << 2, 0, 0)
 }
 
 /// End this process; its arc and capabilities cease to exist.

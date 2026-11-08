@@ -18,3 +18,5 @@ nunc-time = "0.0.0"
 # signed capsules for `spawn` (the kernel gate verifies them with vsf crypto-verify)
 vsf = { path = "../../../vsf", features = ["crypto"] }
 ed25519-dalek = "2"
+# kists (KISTS.md): a capsule's declaration when it is signed, the person's list when one is installed
+ferros_kist = { path = "../../ferros_kist" }

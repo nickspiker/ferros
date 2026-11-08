@@ -731,3 +731,79 @@ mod tests {
         assert_eq!(s.get(&d, b"stream").unwrap().unwrap(), v);
     }
 }
+
+/// The largest single allocation while a large value is written over itself (2026-11-08: the vault process, an 8 MiB heap, died on a 1,343,496-byte allocation rewriting a 47 MB kist capsule at its own address). `cargo test -p ferros_store rewrite_peak -- --ignored --nocapture`.
+#[cfg(test)]
+mod peak {
+    extern crate std;
+    use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use manifestus::{Block, DeletePolicy, Mirror};
+
+    struct Track;
+    static BIGGEST: AtomicUsize = AtomicUsize::new(0);
+    unsafe impl core::alloc::GlobalAlloc for Track {
+        unsafe fn alloc(&self, l: core::alloc::Layout) -> *mut u8 {
+            BIGGEST.fetch_max(l.size(), Ordering::Relaxed);
+            unsafe { std::alloc::System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: core::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(p, l) }
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: core::alloc::Layout, n: usize) -> *mut u8 {
+            BIGGEST.fetch_max(n, Ordering::Relaxed);
+            unsafe { std::alloc::System.realloc(p, l, n) }
+        }
+    }
+    #[global_allocator]
+    static A: Track = Track;
+
+    struct Mem(Vec<Block>);
+    impl BlockDev for Mem {
+        fn block_count(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read(&mut self, lba: u64, buf: &mut Block) -> manifestus::Result<()> {
+            *buf = self.0[lba as usize];
+            Ok(())
+        }
+        fn write(&mut self, lba: u64, buf: &Block) -> manifestus::Result<()> {
+            self.0[lba as usize] = *buf;
+            Ok(())
+        }
+        fn flush(&mut self) -> manifestus::Result<()> {
+            Ok(())
+        }
+    }
+    struct Counter(u64);
+    impl Nonces for Counter {
+        fn nonce(&mut self) -> [u8; NONCE] {
+            self.0 += 1;
+            let mut n = [0u8; NONCE];
+            n[..8].copy_from_slice(&self.0.to_le_bytes());
+            n
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn rewrite_peak() {
+        let m = Mirror::new(Mem(alloc::vec![[0u8; 4096]; 1 << 15]), Mem(alloc::vec![[0u8; 4096]; 1 << 15]));
+        let v = Vault::open(m, 8, 1, DeletePolicy::UnlinkOnly).expect("vault");
+        let mut s = Store::new(v, Counter(0), || 1);
+        let d = Domain { addr: [3; 32], seal: [4; 32] };
+        let mut name = alloc::vec![1u8];
+        name.extend_from_slice(&[9u8; 32]);
+        let value: Vec<u8> = (0..47_438_062usize).map(|i| (i * 31 >> 3) as u8).collect();
+        for round in 0..2 {
+            BIGGEST.store(0, Ordering::Relaxed);
+            let mut w = s.begin(&d, &name);
+            for c in value.chunks(4096) {
+                s.write(&d, &mut w, c).unwrap();
+            }
+            let before = BIGGEST.load(Ordering::Relaxed);
+            s.finish(&d, w).unwrap();
+            std::println!("round {round}: biggest allocation writing {before}, finishing {}", BIGGEST.load(Ordering::Relaxed));
+        }
+    }
+}

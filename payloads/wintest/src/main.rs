@@ -89,7 +89,7 @@ extern "C" fn wintest_main(grants: u64, input: u64, input_len: u64) -> ! {
     while now() < end {
         sleep_until(now() + freq());
     }
-    window::done(display, base);
+    // One shot dead (owner, 2026-11-08): the display drops the window of a process that ended.
     exit(0)
 }
 

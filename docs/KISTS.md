@@ -1,6 +1,6 @@
 # Kists on the map
 
-Status: a design, 2026-11-07, nothing of it built but the pieces named under "Built". The owner: "should be nice round circles on the home screen for each kist." A kist is an installed app as this device runs it (GLOSSARY.md: the developer's signed capsule after the device checked, compiled and sealed it); its circle on the map is its kist circle (SHELL.md). The base OS bakes in one circle, settings (no_baked_apps): every other circle is a kist the person installed, and the map knows nothing of it until then.
+Status: designed 2026-11-07; permissions decided and the first cut built 2026-11-08 ("Permissions" and "Built" below). The owner: "should be nice round circles on the home screen for each kist." A kist is an installed app as this device runs it (GLOSSARY.md: the developer's signed capsule after the device checked, compiled and sealed it); its circle on the map is its kist circle (SHELL.md). The base OS bakes in one circle, settings (no_baked_apps): every other circle is a kist the person installed, and the map knows nothing of it until then.
 
 ## What exists to build on
 
@@ -40,7 +40,44 @@ At attest the map reads `kists` (it already holds the person's arrangement) and 
 4. **map:** kist circles from `kists`, and the tap's `launch` call (another session owns payloads/map and payloads/display today; nothing here touches them).
 5. **Installer:** the install flow above.
 
-## Built
+## Permissions (owner, 2026-11-08)
+
+0. **A grant is the permission.** A kist can do only what it is handed at spawn: no permission-check calls, no ambient authority.
+1. **Wants are declared in the signed capsule**, each a named right with one line of the developer's reason. Nothing undeclared can be granted: the kernel reads the declaration from the capsule it launches and refuses any right not declared in that slot.
+2. **Asked once, ever, per person, per kist, per permission.** The kist is its gate identity (developer key and option), not its name; the answers are the person's (identity class), so every device of theirs knows them.
+3. **Default off** for every want. An update that adds a want asks that want (off until answered); the other answers stand.
+4. **The person's defaults**: a default per right (the Permissions page) sets where the first-launch question's switch starts. Out of the box every one is off.
+5. **No lying**: a right said no to is an empty slot, never a fake, and a kist runs without it (Mahere without GPS; Lumis without the camera has no cameras to pick).
+6. **Kists can never ask.** No call makes a prompt. The system asks once, at first launch: every unanswered want on one screen, each a switch.
+7. **Revoke = kill and respawn** without the right. Every kill and every end, of any process, is one shot dead: no end hooks, no signals, no graceful shutdown, no teardown code; the kernel reclaims by dropping (and wipes the arc as it does).
+8. **Settings pages**: per kist (Kists), per right (Permissions: who has the GPS, who has the network), and the defaults, in the system settings circle.
+9. **Kist circles** on the map, round, one per kist; a tap asks init to launch it (init holds every grant; the map holds none of the kist's), the first launch showing the question first.
+
+Later, not now: a system picker that hands a kist just the file the person chose (no permission needed: the choice is the grant); the console showing live use of a right.
+
+## Built (2026-11-08)
+
+- **The vocabulary and the documents** (`ferros_kist`, host-tested):
+  - The rights by code (`RIGHTS`: display, touch, surface, ira, domain, entropy, gps, udp), with a person's words for each (`MEANS`).
+  - The capsule's declaration: a section `kist` (`name`) and a section `wants`, a field per want named by its right, its value the reason (`a`, ASCII text: vsf encodes `x` only with std). The fields' order is the slot order. Both sit before the code, so they are read from the capsule's first bytes.
+  - The person's list, `kists.list` (scope `kists.`, identity class; it stands in for the common area's `kists`): a section `defaults` (a field per right, 1 or 0) and a section `kist` per kist (`capsule` hb, `developer` ke, `option` hp, `name`, and a field per want: the reason, then once answered the answer `u` and when `e`).
+- **The kernel** (process.rs, service.rs):
+  - `Object::Domain`, a kist's own vault domain: its keys derived under the person's key from a one-way name of the process's ihi (the oracle over its developer key and option), through the vault process only, open only while the person is present.
+  - `Object::Kists`, init's right to launch. `SYS_SPAWN` kist mode (x2 bit 1) names the capsule by its address in `capsules.` and gives a right code or an empty slot (`Object::Empty`: a zero token nothing finds) per want; the kernel makes each right's object itself. The service loop streams the capsule from the vault process a transfer a call (`KistJob`) into its arc, checks its blake3 against the address, runs the gate over it in place, checks every slot against the capsule's own declaration, then builds the process. Bit 2 is a relaunch: the running process killed (one shot dead), then launched again.
+  - Scopes `capsules.` (the device's, by content address) and `kists.` (the person's).
+  - init's grants page was full at 108: the GPU service has its own list now (`gpu_grants`) and the kernel starts it at home, before init. Its five slots went to the Kists right, serve and use `launch`, and `kists.`.
+- **init** serves `launch`: [0 launch, or 1 relaunch][the capsule's address] → an answer (`ferros_kist::launch`). It reads the person's list itself, never the map's word, and launches nothing while a want is unanswered.
+- **The map**:
+  - A kist circle per kist in the list after the settings circle (up to 15), its icon the display's bundled one for that app until a kist carries its own, refreshed at a tap on the plane.
+  - A tap launches through init. If any want is unanswered, the circle first opens on the question: each unanswered want a switch set from the person's default, its reason under it, then "start", which keeps the answers and launches.
+  - Settings pages Kists (each kist, each want a switch) and Permissions (each right: the default for new kists, then every kist that wants it). A changed answer is written to the list, and a running kist is relaunched.
+- **The installer, for development**:
+  - `ferros-bridge capsule … --kist NAME --option HEX --want RIGHT REASON …` signs a declaration in, with the option as the capsule's `hp`, so an update keeps the kist's identity.
+  - `ferros-bridge kist install <capsule>` checks the signature, stores the capsule in parts of 4 MiB (a `store` command's part form: offset and more, by address), and adds the kist to the attested person's list. `kist answer` and `kist list` are for testing.
+  - tools/mahere-kist.sh makes and installs Mahere.
+- **One shot dead**: the kernel's kill, exit and restart paths give a process nothing on its way out (audited 2026-11-08). Arcs are now wiped as they are freed, so the attest screen, Hive, Ramps and wintest no longer wipe or close their window before they exit (the display drops a dead process's window).
+
+## Built before
 
 - Mahere as a kist: mahere's `mahere-device` (the touch-device app, shared with Android) and `mahere-ferros` (its ferros shell), tools/mahere-build.sh; spawned over the bridge it starts, opens its vault from its ira key, and draws its first frame through fluor's ferros host (2026-11-07). Its development spawn uses the `test` vault scope until kists have domains.
 - fluor's ferros host takes an input hook (`run_app_with`), so an app with gestures of its own (Mahere's two fingers) reads every contact.

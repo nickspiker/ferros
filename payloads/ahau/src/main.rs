@@ -1328,9 +1328,8 @@ impl Ahau {
         if let Some(seed) = self.session_seed {
             self.wallpaper(&seed);
         }
-        self.wipe();
+        // One shot dead (owner, 2026-11-08): no wipe and no window closed on the way out; the kernel wipes the arc as it reclaims it and the display drops the window of a process that ended.
         console(self.grants, b"ahau: attested\n");
-        window::done(self.display, self.base);
         exit(0)
     }
 

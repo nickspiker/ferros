@@ -259,8 +259,8 @@ impl Hive {
                 console(grants, &m[..head.len() + self.len + 1]);
                 self.len = 0;
             }
+            // One shot dead (owner, 2026-11-08): the display drops the window of a process that ended.
             Some(Event::Leave) => {
-                window::done(self.display, self.base);
                 console(grants, b"hive: back to the map\n");
                 exit(0);
             }

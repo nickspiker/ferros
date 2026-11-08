@@ -250,7 +250,10 @@ pub fn arc_alloc(bytes: usize, masked: bool) -> Option<Arc> {
 
 /// Return an arc to its pool, merging buddies; a masked arc's guard goes back with it.
 pub fn arc_free(arc: Arc) {
+    // Whatever the process held is gone with it: the kernel wipes the arc as it reclaims it, so no process wipes its own secrets on its way out (owner, 2026-11-08: every end is one shot dead, no cleanup; the arc was zeroed only when handed out again until then).
+    // After the reset: the grants page and the code are read-only until it returns the arc to writable data.
     crate::cachemap::arc_reset(arc.base, arc.block);
+    unsafe { core::ptr::write_bytes(arc.base as *mut u8, 0, arc.size) };
     if arc.guard != 0 {
         crate::cachemap::guard_pages(arc.base + arc.size, arc.guard, false);
         buddy_give(arc.base + arc.size, arc.guard);
@@ -318,6 +321,12 @@ pub enum Object {
     Blocks(usize),
     /// Served by the kernel: the vault process's own call (`SYS_VAULT`): the old entries of the kernel's vault, to move into its domains (VAULT-OUT.md, migration). With it, and only with it, a spawn may serve the `vault` endpoint.
     Vault,
+    /// Served by the kernel, through the vault process: the holder's own vault domain (VAULT-OUT.md, "Kist, per person"), keyed by the kernel from the holder's ihi (the oracle over its developer key and option) under the person's key, so no kist opens another's data and none opens its own while no one is present. A process passes it on only as the same right: the child's is the child's own domain (`SYS_STORE` resolves it against the caller).
+    Domain,
+    /// Served by the kernel: the right to launch a kist (KISTS.md): `SYS_SPAWN` in kist mode, naming a capsule by its vault address and handing each declared want its right or an empty slot. The kernel makes each right's object itself (`kist_object`), so the holder needs no other grant to hand out; it holds every right a kist may be handed, and is init's alone.
+    Kists,
+    /// A slot left empty: a want the person said no to (owner, 2026-11-08: "a denied right is an empty slot, never a fake"). Its token is zeros and nothing looks it up.
+    Empty,
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -361,6 +370,9 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Sensors => (16, 0),
         Object::Blocks(i) => (17, i as u64),
         Object::Vault => (18, 0),
+        Object::Domain => (19, 0),
+        Object::Kists => (20, 0),
+        Object::Empty => (21, 0),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -458,6 +470,8 @@ struct Process {
     pet_thread: usize,
     paused_at: u64,
     paused: u64,
+    /// Its own vault domain's name (`Object::Domain`): a one-way derivation of its ihi, so the kernel keeps no copy of the ihi itself; None for a process spawned without one.
+    domain: Option<[u8; 32]>,
 }
 
 struct Endpoint {
@@ -693,7 +707,8 @@ impl Process {
             for (a, b) in e.token.iter().zip(token.iter()) {
                 diff |= a ^ b;
             }
-            if diff == 0 && token.len() == 32 {
+            // An empty slot (a want said no to) holds the zero token and is never a capability: presenting zeros finds nothing.
+            if diff == 0 && token.len() == 32 && e.object != Object::Empty {
                 hit = Some(i);
             }
         }
@@ -1153,7 +1168,15 @@ pub static STORES: &[StoreScope] = &[
     StoreScope { name: "gpu", prefix: "gpu." },
     // The vault process's proof (payloads/vaulttest): scratch, nothing kept.
     StoreScope { name: "test", prefix: "test." },
+    // Installed kists' signed capsules (KISTS.md), the device's: each under its own content address (the blake3 of the capsule, a 32-byte address name), so two people on one device who installed the same app share one copy. The kernel reads them to launch a kist; the installer writes them.
+    StoreScope { name: "capsules", prefix: "capsules." },
+    // The person's list of installed kists and their answers (`kists.list`, ferros_kist; identity class, kvault IDENTITY): init reads it to launch a kist, the map shows it and writes the person's answers. Stands for the common area's `kists` until the common area's named grants exist (VAULT-OUT.md).
+    StoreScope { name: "kists", prefix: "kists." },
 ];
+/// The context deriving a process's own domain name (`Process::domain`) from its ihi.
+const KIST_DOMAIN_CONTEXT: &str = "ferros 2026-11-08 kist domain";
+/// The scope prefix every kist domain's keys are derived under, followed by the domain's name (`domain_keys`): no `STORES` prefix can collide with it (none holds a zero byte).
+const KIST_DOMAIN_PREFIX: &[u8] = b"kist\0";
 /// The vault behind `SYS_STORE`, registered by whoever owns it (service.rs): (full key, None = get / Some(value) = set) -> Ok(the value for a get, None if absent) or Err.
 pub static mut STORE: Option<fn(&str, Option<&[u8]>) -> Result<Option<Vec<u8>>, ()>> = None;
 /// Delete a key (true when it was there) and list every key of the vault (full names): what a std process's vault needs beyond get and set (kete on ferros, STD-TARGET.md).
@@ -1214,14 +1237,14 @@ fn scope_of(name: &str) -> Option<&'static StoreScope> {
     STORES.iter().find(|s| name.starts_with(s.prefix))
 }
 
-/// A scope's domain keys in one class (the kernel derives every key; the vault process seals with them, VAULT-OUT.md): the address key, then the sealing key. None while the class is locked.
-fn domain_keys(prefix: &str, identity: bool) -> Option<[u8; 64]> {
+/// A scope's domain keys in one class (the kernel derives every key; the vault process seals with them, VAULT-OUT.md): the address key, then the sealing key. None while the class is locked. A kist's own domain is a "scope" of `KIST_DOMAIN_PREFIX` and its name, in the person's class.
+fn domain_keys(prefix: &[u8], identity: bool) -> Option<[u8; 64]> {
     let mut base = unsafe { DOMAIN_BASE }?(identity)?;
     let mut out = [0u8; 64];
     for (i, ctx) in [DOMAIN_ADDR_CONTEXT, DOMAIN_SEAL_CONTEXT].iter().enumerate() {
         let mut h = blake3::Hasher::new_derive_key(ctx);
         h.update(&base);
-        h.update(prefix.as_bytes());
+        h.update(prefix);
         out[i << 5..(i + 1) << 5].copy_from_slice(h.finalize().as_bytes());
     }
     base.fill(0);
@@ -1254,7 +1277,7 @@ fn migrate_next(p: &Process, skip: usize, buf: u64, len: usize) -> u64 {
     for name in names {
         let Some(sc) = scope_of(&name) else { continue };
         let identity = crate::kvault::identity_class(&name);
-        let Some(mut keys) = domain_keys(sc.prefix, identity) else { continue };
+        let Some(mut keys) = domain_keys(sc.prefix.as_bytes(), identity) else { continue };
         if seen < skip {
             seen += 1;
             keys.fill(0);
@@ -1318,12 +1341,19 @@ pub fn note_old_put(name: &str) {
     }
 }
 
-/// Where a `SYS_STORE` goes: to the vault process (its endpoint and the caller's scope) while it serves and the name is not one the kernel keeps; None, the kernel's own vault.
-fn store_route(p: &Process, f: &Frame) -> Option<(usize, &'static StoreScope)> {
+/// Where a forwarded `SYS_STORE` lands: a scope of `STORES`, or the caller's own kist domain (`Object::Domain`, by its name).
+enum Where {
+    Scope(&'static StoreScope),
+    Domain([u8; 32]),
+}
+
+/// Where a `SYS_STORE` goes: to the vault process (its endpoint, and the caller's scope or its own domain) while it serves and the name is not one the kernel keeps; None, the kernel's own vault (which holds no kist domain: a domain call with no vault process is refused there).
+fn store_route(p: &Process, f: &Frame) -> Option<(usize, Where)> {
     let ep = vault_ep()?;
     let token = p.read(f.x[0], 32);
     let sc = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
         Some((Object::Store(i), r)) if r & RIGHT_SEND != 0 => STORES.get(i)?,
+        Some((Object::Domain, r)) if r & RIGHT_SEND != 0 => return p.domain.map(|d| (ep, Where::Domain(d))),
         _ => return None,
     };
     if f.x[1] & 32 == 0 {
@@ -1333,13 +1363,13 @@ fn store_route(p: &Process, f: &Frame) -> Option<(usize, &'static StoreScope)> {
             return None;
         }
     }
-    Some((ep, sc))
+    Some((ep, Where::Scope(sc)))
 }
 
 /// `SYS_STORE` while the vault process serves (VAULT-OUT.md, step 3): the request, stamped with the domain keys of the caller's scope, goes to the vault as a call from the caller, who waits for the reply as for any call. The kernel copies one transfer each way and keeps nothing; keys for the person's domain only while they are unlocked.
 ///
 /// The stamped message: [op: 0 set, 1 get, 2 delete, 3 list][flags: bit 0 old entries pending][lock epoch u32 LE][domains][per domain: class (1 the person's) and the address and sealing keys, 65 bytes][name length][name: the name within the scope, or 1 and the 32-byte address][rest]. Rest: set [offset u64][more u8][bytes]; get [offset u64][length u32]; list [offset u64][length u32][addresses u8]; delete nothing.
-fn store_forward(f: &mut Frame, cur: usize, ep: usize, sc: &StoreScope) -> u64 {
+fn store_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
     let Some(p) = proc_of(cur) else {
         f.x[0] = ERR;
         return 0;
@@ -1361,12 +1391,18 @@ fn store_forward(f: &mut Frame, cur: usize, ep: usize, sc: &StoreScope) -> u64 {
     if !list {
         name.extend_from_slice(&rel);
     }
-    let mut full = alloc::string::String::from(sc.prefix);
-    if !raw {
-        full.extend(rel.iter().map(|&b| b as char));
-    }
-    // The classes the request covers: a listing both where the scope holds the person's names (the device's always), anything else its own name's.
-    let classes: &[bool] = if list && crate::kvault::identity_within(sc.prefix) { &[false, true] } else if crate::kvault::identity_class(&full) { &[true] } else { &[false] };
+    // The domain's keys are derived under its prefix: a scope's, or a kist's own (`KIST_DOMAIN_PREFIX` and its name, the person's class always: a kist's data is the person's, open only while they are present).
+    let (prefix, classes): (Vec<u8>, &[bool]) = match wh {
+        Where::Scope(sc) => {
+            let mut full = alloc::string::String::from(sc.prefix);
+            if !raw {
+                full.extend(rel.iter().map(|&b| b as char));
+            }
+            // The classes the request covers: a listing both where the scope holds the person's names (the device's always), anything else its own name's.
+            (sc.prefix.as_bytes().to_vec(), if list && crate::kvault::identity_within(sc.prefix) { &[false, true] } else if crate::kvault::identity_class(&full) { &[true] } else { &[false] })
+        }
+        Where::Domain(d) => ([KIST_DOMAIN_PREFIX, &d[..]].concat(), &[true]),
+    };
     let mut rest = Vec::with_capacity(13 + len);
     if set {
         rest.extend_from_slice(&offset.to_le_bytes());
@@ -1380,7 +1416,7 @@ fn store_forward(f: &mut Frame, cur: usize, ep: usize, sc: &StoreScope) -> u64 {
         }
     }
     let op = if list { VOP_LIST } else if del { VOP_DELETE } else if set { VOP_SET } else { VOP_GET };
-    let Some(msg) = stamp(op, sc.prefix, classes, &name, &rest) else {
+    let Some(msg) = stamp(op, &prefix, classes, &name, &rest) else {
         f.x[0] = ERR;
         return 0;
     };
@@ -1410,7 +1446,7 @@ fn export_forward(f: &mut Frame, cur: usize, ep: usize) -> u64 {
     // WHY: the length is the caller's, and the vault answers one transfer at most (SYS_REPLY reads no more): a larger buffer takes its first transfer, the caller asks again from the next offset (ferros_sys `export_identity`).
     let len = (f.x[3] as usize).min(STORE_MAX);
     let scopes: Vec<&str> = STORES.iter().map(|s| s.prefix).filter(|p| crate::kvault::identity_within(p) && !crate::kvault::EXPORT_SKIP.contains(p)).collect();
-    let domains: Vec<(&str, bool)> = scopes.iter().map(|&p| (p, true)).collect();
+    let domains: Vec<(&[u8], bool)> = scopes.iter().map(|&p| (p.as_bytes(), true)).collect();
     let mut rest = Vec::with_capacity(12 + scopes.iter().map(|p| 1 + p.len()).sum::<usize>());
     rest.extend_from_slice(&f.x[4].to_le_bytes());
     rest.extend_from_slice(&(len as u32).to_le_bytes());
@@ -1426,13 +1462,13 @@ fn export_forward(f: &mut Frame, cur: usize, ep: usize) -> u64 {
 }
 
 /// A stamped request (`store_forward`'s message layout): `prefix`'s domain in each class of `classes`, then `name` and `rest`. A listing leaves out the person's domain while they are locked; anything else needing a locked class is None, as the kernel's vault refuses it.
-fn stamp(op: u8, prefix: &str, classes: &[bool], name: &[u8], rest: &[u8]) -> Option<Vec<u8>> {
-    let domains: Vec<(&str, bool)> = classes.iter().map(|&c| (prefix, c)).collect();
+fn stamp(op: u8, prefix: &[u8], classes: &[bool], name: &[u8], rest: &[u8]) -> Option<Vec<u8>> {
+    let domains: Vec<(&[u8], bool)> = classes.iter().map(|&c| (prefix, c)).collect();
     stamp_domains(op, &domains, name, rest)
 }
 
 /// A stamped request over domains of several scopes (an export: the person's domain in each scope that holds their names), each a (scope prefix, the person's?) pair; otherwise as `stamp`.
-fn stamp_domains(op: u8, domains: &[(&str, bool)], name: &[u8], rest: &[u8]) -> Option<Vec<u8>> {
+fn stamp_domains(op: u8, domains: &[(&[u8], bool)], name: &[u8], rest: &[u8]) -> Option<Vec<u8>> {
     let mut msg = Vec::with_capacity(8 + domains.len() * 65 + 1 + name.len() + rest.len());
     msg.push(op);
     msg.push(MIGRATE_PENDING.load(core::sync::atomic::Ordering::Acquire) as u8);
@@ -1522,7 +1558,16 @@ pub fn vault_name(full: &str) -> Option<(&'static StoreScope, &[u8])> {
 pub fn vault_stamp(op: u8, full: &str, rest: &[u8]) -> Option<Vec<u8>> {
     let (sc, rel) = vault_name(full)?;
     // Under the kernel lock: the person's keys come from the vault's unlock state, which an unlock or a lock on another core changes.
-    with_lock_held_or(|| stamp(op, sc.prefix, &[crate::kvault::identity_class(full)], rel, rest))
+    with_lock_held_or(|| stamp(op, sc.prefix.as_bytes(), &[crate::kvault::identity_class(full)], rel, rest))
+}
+
+/// A stamp for the kernel's own call on an entry of the scope named `scope` that is named by a 32-byte address (an installed kist's capsule, by its blake3): the scope's domain in its class. None for no such scope, or a locked class.
+pub fn vault_stamp_addr(op: u8, scope: &str, addr: &[u8; 32], rest: &[u8]) -> Option<Vec<u8>> {
+    let sc = STORES.iter().find(|s| s.name == scope)?;
+    let mut name = Vec::with_capacity(33);
+    name.push(1);
+    name.extend_from_slice(addr);
+    with_lock_held_or(|| stamp(op, sc.prefix.as_bytes(), &[crate::kvault::identity_class(sc.prefix)], &name, rest))
 }
 
 /// A stamp for the kernel's own listing of scope `i` of `STORES` from `offset`, at most `len` bytes (names one per line): every class the scope holds, the person's left out while locked. With its prefix, to make the names whole.
@@ -1533,12 +1578,12 @@ pub fn vault_stamp_list(i: usize, offset: u64, len: u32) -> Option<(Vec<u8>, &'s
     rest.extend_from_slice(&offset.to_le_bytes());
     rest.extend_from_slice(&len.to_le_bytes());
     rest.push(0);
-    Some((with_lock_held_or(|| stamp(VOP_LIST, sc.prefix, classes, &[], &rest))?, sc.prefix))
+    Some((with_lock_held_or(|| stamp(VOP_LIST, sc.prefix.as_bytes(), classes, &[], &rest))?, sc.prefix))
 }
 
 /// Stamps dropping every one of the person's domains in the vault process (each scope that holds the person's names), for release: made while their keys still exist, sent by the service loop before its restart (service.rs). Empty while they are locked: nothing could be stamped, and what is on the disk is already unopenable once release renews the device-only secret.
 pub fn vault_stamp_drops() -> Vec<Vec<u8>> {
-    with_lock_held_or(|| STORES.iter().filter(|sc| crate::kvault::identity_within(sc.prefix)).filter_map(|sc| stamp(VOP_DROP, sc.prefix, &[true], &[], &[])).collect())
+    with_lock_held_or(|| STORES.iter().filter(|sc| crate::kvault::identity_within(sc.prefix)).filter_map(|sc| stamp(VOP_DROP, sc.prefix.as_bytes(), &[true], &[], &[])).collect())
 }
 
 /// A server receiving on `ep` takes the head of its queue now; a polling server asleep between polls is woken (its sleep returns early, which a poll loop reads as "look again").
@@ -2397,6 +2442,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
+        SYS_SPAWN if f.x[2] & 2 != 0 => {
+            f.x[0] = kist_request(p, &p.read(f.x[0], (f.x[1] as usize).min(4096)), f.x[2] & 4 != 0);
+            0
+        }
         SYS_SPAWN => {
             // Parse [name len][name][key len][key][n][n tokens] from the caller's arc and resolve each token in the caller's own table: a child gets only what its parent holds, at the same rights, and never a reply.
             let req = p.read(f.x[0], (f.x[1] as usize).min(4096));
@@ -3125,6 +3174,10 @@ pub enum Grant<'a> {
     Blocks(&'a [u8]),
     /// The vault process's right (syscall 30), and with it the right to serve `vault`.
     Vault,
+    /// The holder's own vault domain (`Object::Domain`).
+    Domain,
+    /// The right to launch kists (`Object::Kists`): init's.
+    Kists,
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -3215,6 +3268,186 @@ pub fn spawn_capsule_staged(name: &[u8], arc: Arc, capsule_len: usize, code_offs
     launch(built, input.len())
 }
 
+// ---------------------------------------------------------------- kists (KISTS.md)
+
+/// A kist launch init asked for (`SYS_SPAWN` kist mode), waiting for the service loop to stream its capsule from the vault process (service.rs `KistJob`): its process name, its capsule's vault address, and a right code or `ferros_kist::EMPTY` per slot.
+pub struct KistLaunch {
+    pub name: Vec<u8>,
+    pub capsule: [u8; 32],
+    pub codes: Vec<u8>,
+}
+/// One launch at a time: the service loop streams one capsule through the kernel's channel at once. Under the kernel lock.
+static mut KIST_LAUNCH: Option<KistLaunch> = None;
+/// A launch being streamed by the service loop, by name: a second ask for it is "already starting" (NOTHING), as for a live one.
+static mut KIST_STARTING: Vec<u8> = Vec::new();
+
+/// The object right `code` (ferros_kist::RIGHTS) is handed as, made by the kernel itself: the holder of `Kists` needs no grant of its own for any of them. None for a code outside the vocabulary.
+fn kist_object(code: u8) -> Option<(Object, u32)> {
+    if code == ferros_kist::EMPTY {
+        return Some((Object::Empty, 0));
+    }
+    Some(match *ferros_kist::RIGHTS.get(code as usize)? {
+        "display" => (Object::Endpoint(endpoint(b"display")), RIGHT_SEND),
+        "touch" => (Object::Endpoint(endpoint(b"touch")), RIGHT_SEND),
+        "surface" => (Object::NewSurface, RIGHT_SEND | RIGHT_RECV),
+        "ira" => (Object::Ira, RIGHT_SEND),
+        "domain" => (Object::Domain, RIGHT_SEND),
+        "entropy" => (Object::Entropy, RIGHT_SEND),
+        "gps" => (Object::Endpoint(endpoint(b"gps")), RIGHT_SEND),
+        "udp" => (Object::Endpoint(endpoint(b"udp")), RIGHT_SEND),
+        _ => return None,
+    })
+}
+
+/// `SYS_SPAWN` in kist mode (x2 bit 1; bit 2, a relaunch: a live process of that name killed first, NOTHING with none alive): [name length][name][the capsule's 32-byte vault address][the caller's Kists token, 32 bytes][n][n right codes, `EMPTY` for a slot said no to]. Queued for the service loop, which streams the capsule from the vault and checks every slot against the capsule's own declaration before anything runs (`spawn_kist`). 0 queued, NOTHING already running or starting, ERR refused (the reason on the console): no Kists right, a code outside the vocabulary, nobody present (a kist's data and rights are the person's), or another launch still streaming.
+fn kist_request(p: &Process, req: &[u8], replace: bool) -> u64 {
+    let mut at = 0usize;
+    let mut take = |n: usize| -> Vec<u8> { let s = req[at.min(req.len())..(at + n).min(req.len())].to_vec(); at += n; s };
+    let nl = take(1).first().copied().unwrap_or(0) as usize;
+    let name = take(nl);
+    let capsule = take(32);
+    let token = take(32);
+    let n = take(1).first().copied().unwrap_or(0) as usize;
+    let codes = take(n);
+    let refuse = |why: &str| {
+        let kk = k();
+        kk.console.extend_from_slice(b"kist launch refused: ");
+        kk.console.extend_from_slice(why.as_bytes());
+        kk.console.push(b'\n');
+        ERR
+    };
+    if !matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Kists, r)) if r & RIGHT_SEND != 0) {
+        return refuse("the caller holds no Kists right");
+    }
+    if name.is_empty() || capsule.len() != 32 || codes.len() != n || codes.iter().any(|&c| kist_object(c).is_none()) {
+        return refuse("a malformed request, or a right outside the vocabulary");
+    }
+    let kk = k();
+    if unsafe { DOMAIN_BASE }.and_then(|b| b(true)).is_none() {
+        return refuse("nobody is present: a kist runs only for an attested person");
+    }
+    let slot = unsafe { &mut *(&raw mut KIST_LAUNCH) };
+    if slot.is_some() {
+        return refuse("another kist is still starting");
+    }
+    let alive = kk.procs.iter().flatten().any(|q| q.name == name && !q.dying);
+    // A relaunch (the person changed an answer): the running kist killed, one shot dead, before it is launched again with the answers as they stand. Not running: nothing to relaunch.
+    if replace {
+        if !alive {
+            return NOTHING;
+        }
+        kill_locked(&name);
+    } else if alive || unsafe { &*(&raw const KIST_STARTING) }.as_slice() == name.as_slice() {
+        return NOTHING;
+    }
+    *slot = Some(KistLaunch { name, capsule: capsule[..].try_into().unwrap(), codes });
+    unsafe { core::arch::asm!("sev") };
+    0
+}
+
+/// Whether a process is ending but not yet gone (a thread of it still on a core: its arc returns at that thread's next trap).
+pub fn any_dying() -> bool {
+    with_lock(|| k().procs.iter().flatten().any(|p| p.dying))
+}
+
+/// The service loop takes the waiting launch, marking its name as starting until `kist_done`.
+pub fn kist_take() -> Option<KistLaunch> {
+    with_lock(|| {
+        let l = unsafe { (*(&raw mut KIST_LAUNCH)).take() }?;
+        unsafe { *(&raw mut KIST_STARTING) = l.name.clone() };
+        Some(l)
+    })
+}
+
+/// The launch the service loop was streaming has ended, started or not.
+pub fn kist_done() {
+    with_lock(|| unsafe { (*(&raw mut KIST_STARTING)).clear() });
+}
+
+/// Where a native capsule's code lies inside it, from its `aarch64` section's table entry: the byte vector's offset and length, which must end within the capsule's `whole` length (the gate checks the framing again over the signed bytes). Needs only the header and the section's first bytes.
+pub fn locate_code(capsule: &[u8], whole: usize) -> Result<(usize, usize), &'static str> {
+    let (header, _) = vsf::file_format::VsfHeader::decode(capsule).map_err(|_| "kist: the capsule's header does not decode")?;
+    let entry = header.fields.iter().find(|f| f.name == "aarch64").ok_or("kist: no native code section (a masked kist is not launched from the vault yet)")?;
+    let from = entry.offset_bytes;
+    // WHY the window: the code's `vb` marker sits within the section's first bytes (its bracket, the field's name and colon); the bound keeps a capsule whose table points past its end from reading past it.
+    for p in from..(from + 64).min(capsule.len().saturating_sub(2)) {
+        if capsule[p] == b'v' && capsule[p + 1] == b'b' {
+            let mut q = p + 2;
+            if let Ok(bits) = vsf::ewe::read_uint::<u64>(capsule, &mut q) {
+                let len = (bits >> 3) as usize;
+                if bits & 7 == 0 && len > 0 && q + len <= whole {
+                    return Ok((q, len));
+                }
+            }
+        }
+    }
+    Err("kist: the code's byte vector is not where its section begins")
+}
+
+/// The arc a kist's capsule needs, from its first bytes (`head`: the header, the declaration and the start of its code) and its whole length: the capsule staged at the code offset, or the code with its zeroed tail (`image_tail`), whichever is more, the entry stack and the room a streamed spawn leaves (the bridge's 64 KiB).
+pub fn kist_need(head: &[u8], total: usize) -> Result<usize, &'static str> {
+    let (co, cl) = locate_code(head, total)?;
+    if co + 56 > head.len() {
+        return Err("kist: the code's header is past the first bytes read");
+    }
+    let tail = image_tail(&head[co..co + 56]);
+    Ok(CODE + total.max(cl + tail) + STACK + (1 << 16))
+}
+
+/// A kist whose capsule the service loop streamed from the vault into `arc` at the code offset (`total` bytes): it must be the capsule named (its blake3 is its vault address), pass the gate where it lies, and declare every right handed to it in the slot it is handed in (`ferros_kist::want_codes`: nothing undeclared can be granted). Then the code moves down, the rest is zeroed, and the process is built with exactly the launch's objects, queued to run. On any refusal the arc goes back to the pool.
+pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize) -> Result<(), &'static str> {
+    let r = (|| {
+        if cfg!(ferros_production) {
+            return Err("gate: production refuses unmasked native code");
+        }
+        if CODE + total + STACK > arc.size {
+            return Err("kist: the capsule does not fit its arc");
+        }
+        let capsule = unsafe { core::slice::from_raw_parts_mut((arc.base + CODE) as *mut u8, total) };
+        if blake3::hash(capsule).as_bytes() != &l.capsule {
+            return Err("kist: the vault's capsule is not the one named (its blake3)");
+        }
+        let wants = ferros_kist::want_codes(capsule)?;
+        if wants.len() != l.codes.len() || wants.iter().zip(&l.codes).any(|(&w, &c)| c != ferros_kist::EMPTY && c != w) {
+            return Err("kist: a right the capsule does not declare in that slot");
+        }
+        let (co, cl) = locate_code(capsule, total)?;
+        let g = crate::oracle::gate_located(capsule, co, cl)?;
+        let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
+        unsafe {
+            core::ptr::copy((arc.base + CODE + co) as *const u8, (arc.base + CODE) as *mut u8, cl);
+            core::ptr::write_bytes((arc.base + CODE + cl) as *mut u8, 0, total - cl);
+        }
+        Ok((ihi, cl))
+    })();
+    let (ihi, cl) = match r {
+        Ok(x) => x,
+        Err(e) => {
+            with_lock(|| arc_free(arc));
+            return Err(e);
+        }
+    };
+    with_lock(|| {
+        let kk = k();
+        if kk.procs.iter().flatten().any(|q| q.name == l.name && !q.dying) {
+            arc_free(arc);
+            return Err("kist: a process of that name started meanwhile");
+        }
+        // Every slot's object made here (`kist_object`), the codes checked at the request.
+        let objects: Vec<(Object, u32)> = l.codes.iter().filter_map(|&c| kist_object(c)).collect();
+        match build_from(&l.name, arc, cl, b"", &objects, Some(ihi), false, cl, false) {
+            Ok((me, _, _)) => {
+                enqueue_back(me);
+                Ok(())
+            }
+            Err(e) => {
+                arc_free(arc);
+                Err(e)
+            }
+        }
+    })
+}
+
 /// The second half of a spawn, entered with the lock held: the built process runs its first slice on this core and the outcome comes back.
 fn launch(built: Result<(usize, Arc, usize), &'static str>, input_len: usize) -> Result<Outcome, &'static str> {
     let (me, arc, in_off) = match built {
@@ -3259,6 +3492,8 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
             Grant::Serve(n) => (Object::Endpoint(endpoint(n)), RIGHT_RECV),
             Grant::Use(n) => (Object::Endpoint(endpoint(n)), RIGHT_SEND),
             Grant::Vault => (Object::Vault, RIGHT_SEND),
+            Grant::Domain => (Object::Domain, RIGHT_SEND),
+            Grant::Kists => (Object::Kists, RIGHT_SEND),
             Grant::Hardware(n) => match HARDWARE.iter().position(|h| h.name.as_bytes() == *n) {
                 Some(i) => (Object::Hardware(i), RIGHT_SEND | RIGHT_RECV),
                 None => return Err("no such hardware block"),
@@ -3350,7 +3585,12 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
         return Err("spawn: more grants than the grants page holds (108 slots and the console)");
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0 };
+    // An empty slot's token is zeros: a want said no to reads as no grant at all.
+    for c in cspace.iter_mut().filter(|c| c.object == Object::Empty) {
+        c.token = [0; 32];
+    }
+    let domain = ihi.map(|i| blake3::derive_key(KIST_DOMAIN_CONTEXT, &i));
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain };
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.
     p.write(TOKENS as u64, &(p.cspace.len() as u32).to_le_bytes());

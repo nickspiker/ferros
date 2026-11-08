@@ -10,3 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
+# Kists (KISTS.md): the person's list read to launch one with exactly its granted rights; a heap to read it in.
+ferros_kist = { path = "../../ferros_kist", features = ["process"] }
+ferros_heap = { path = "../../ferros_heap" }

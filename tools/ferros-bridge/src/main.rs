@@ -97,6 +97,10 @@ async fn main() {
             cmd_poke(&args[2], &args[3]).await;
         }
         "store" => cmd_store(&args[2..]).await,
+        // kist install <capsule.vsf>: keep a signed kist capsule in the vault and add it to the attested person's list (KISTS.md).
+        "kist" if args.get(2).map(String::as_str) == Some("install") && args.len() >= 4 => cmd_kist_install(&args[3]).await,
+        // kist answer <name> <right> on|off: one answer of the attested person's (development); kist list: their list.
+        "kist" if matches!(args.get(2).map(String::as_str), Some("answer") | Some("list")) => cmd_kist_answer(&args[3..]).await,
         "display" if args.get(2).map(String::as_str) == Some("power") => {
             // display power [samples = 1] [interval in 1/16 s = 8] [battery] — battery voltage and current from the MAX77759 gauge over hsi2c_11 (PMIC.md), for display power profiling against a `display fill` scene. `battery`: the charger's buck is off for the run so the reading is the system's draw, not the charger's leftovers.
             let n: u8 = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(1);
@@ -300,6 +304,9 @@ async fn main() {
                     "--fixed" => { i += 2; }
                     "--bti" => { i += 1; }
                     "--exact" => { i += 1; }
+                    // --domain: its own vault domain (syscall 13 on its own data, KISTS.md); --kists: the right to launch kists (init's).
+                    "--domain" => { grants.push((16, String::new())); i += 1; }
+                    "--kists" => { grants.push((17, String::new())); i += 1; }
                     // --input-file F: append F's bytes to the process input (repeatable; each framed as u32 LE length + bytes after the hex input).
                     "--input-file" => { files.push(args.get(i + 1).cloned().unwrap_or_default()); i += 2; }
                     other => { hex = Some(other.to_string()); i += 1; }
@@ -574,6 +581,54 @@ fn fixed_arg() -> Option<u32> {
     args.iter().position(|a| a == "--fixed").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok())
 }
 
+/// A kist's declaration from the command line (KISTS.md): `--kist NAME` and each `--want RIGHT REASON` in slot order; None without `--kist`. A right outside the vocabulary, or a reason or name that is not printable ASCII (the list keeps them as `a`), stops here.
+fn kist_arg() -> Option<ferros_kist::Decl> {
+    let args: Vec<String> = std::env::args().collect();
+    let name = args.iter().position(|a| a == "--kist").and_then(|i| args.get(i + 1)).cloned()?;
+    let ascii = |s: &str| !s.is_empty() && s.bytes().all(|b| (0x20..0x7F).contains(&b));
+    let mut wants = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--want" {
+            let (Some(r), Some(why)) = (args.get(i + 1), args.get(i + 2)) else {
+                eprintln!("--want takes a right and its reason");
+                std::process::exit(1);
+            };
+            let Some(c) = ferros_kist::code(r) else {
+                eprintln!("{r} is not a right ({})", ferros_kist::RIGHTS.join(", "));
+                std::process::exit(1);
+            };
+            if !ascii(why) || wants.iter().any(|w: &(u8, String)| w.0 == c) {
+                eprintln!("--want {r}: a reason of printable ASCII, each right once");
+                std::process::exit(1);
+            }
+            wants.push((c, why.clone()));
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    if !ascii(&name) {
+        eprintln!("--kist: a name of printable ASCII");
+        std::process::exit(1);
+    }
+    Some(ferros_kist::Decl { name, wants })
+}
+
+/// `--option HEX`: the kist's option, 32 bytes (64 hex digits), written as the capsule's provenance hash: the identity that stays the same across versions (ORACLE.md §5, "the developer mints it once, keeps it stable"), so the person's answers and the kist's domain carry over an update. Without it the hash is computed from the content, and every build is a new kist.
+fn option_arg() -> Option<[u8; 32]> {
+    let args: Vec<String> = std::env::args().collect();
+    let h = args.iter().position(|a| a == "--option").and_then(|i| args.get(i + 1))?;
+    let b: Vec<u8> = (0..h.len() / 2).filter_map(|i| u8::from_str_radix(h.get(i * 2..i * 2 + 2)?, 16).ok()).collect();
+    match <[u8; 32]>::try_from(b) {
+        Ok(o) if h.len() == 64 => Some(o),
+        _ => {
+            eprintln!("--option takes 64 hex digits");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8> {
     use ed25519_dalek::SigningKey;
     use vsf::types::VsfType;
@@ -604,7 +659,16 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
     if masked && std::env::args().any(|a| a == "--exact") {
         section.add_field("exact", VsfType::u(1, false));
     }
-    let unsigned = vsf::VsfBuilder::new()
+    // A kist's declaration goes before its code, so the kernel and the installer read it from the capsule's first bytes.
+    let mut builder = vsf::VsfBuilder::new();
+    if let Some(d) = kist_arg() {
+        let (k, w) = ferros_kist::declaration_sections(&d);
+        builder = builder.add_section_direct(k).add_section_direct(w);
+    }
+    if let Some(o) = option_arg() {
+        builder = builder.provenance_hash(o);
+    }
+    let unsigned = builder
         .add_section_direct(section)
         .signature_ed25519(pubkey, [0u8; 64])
         .build()
@@ -1049,6 +1113,143 @@ async fn cmd_store(args: &[String]) {
         "ls" => print!("{}", String::from_utf8_lossy(body)),
         _ => println!("removed"),
     }
+}
+
+/// One STORE command and its reply: the status byte's meaning on failure, the rest on success.
+async fn store_call(link: &usb::UsbLink, op: ferros_pt::Op, params: &[u8]) -> Result<Vec<u8>, String> {
+    let cmd = build_cmd(ferros_pt::command::caps::STORE, op, params);
+    pt_send(link, &cmd).await?;
+    let r = pt_recv(link).await?;
+    match r.first().copied() {
+        Some(0) => Ok(r[1..].to_vec()),
+        Some(1) => Err("not found".into()),
+        Some(s) => Err(format!("status {s}: {}", String::from_utf8_lossy(&r[1..]))),
+        None => Err("empty response".into()),
+    }
+}
+
+/// `kist install <capsule.vsf>` (KISTS.md, development's installer: the capsule arrives over PT): the capsule's signature checked here as the gate will check it, its bytes kept in the vault under their blake3 (`capsules.`, the device's, in parts of 4 MiB, each a command, so a capsule of any size goes in), then the person's list (`kists.list`, theirs: they must be attested) read, the kist added or updated (an update keeps every answer for a right it still wants; a new want is unanswered, asked at the next launch) and written back. The device asks each new want at the kist's first launch, never here.
+async fn cmd_kist_install(path: &str) {
+    let capsule = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("Failed to read {path}: {e}");
+        std::process::exit(1);
+    });
+    if !matches!(vsf::verification::verify_file_signature(&capsule), Ok(true)) {
+        eprintln!("{path}: not a signed capsule, or its signature does not verify");
+        std::process::exit(1);
+    }
+    let (decl, (developer, option)) = match (ferros_kist::declaration(&capsule), ferros_kist::identity(&capsule)) {
+        (Ok(d), Ok(i)) => (d, i),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("{path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let addr = *blake3::hash(&capsule).as_bytes();
+    let link = usb::UsbLink::open().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let mut key = b"capsules.".to_vec();
+    key.extend_from_slice(&addr);
+    let t0 = std::time::Instant::now();
+    const PART: usize = 4 << 20;
+    for (k, part) in capsule.chunks(PART).enumerate() {
+        let off = k * PART;
+        let more = off + part.len() < capsule.len();
+        let mut p = Vec::with_capacity(2 + key.len() + 9 + part.len());
+        p.extend_from_slice(&((key.len() as u16) | 1 << 15 | 1 << 14).to_be_bytes());
+        p.extend_from_slice(&key);
+        p.extend_from_slice(&(off as u64).to_le_bytes());
+        p.push(more as u8);
+        p.extend_from_slice(part);
+        if let Err(e) = store_call(&link, ferros_pt::Op::Write, &p).await {
+            eprintln!("\nthe capsule's part at {off} was not stored: {e}");
+            std::process::exit(1);
+        }
+        eprint!("\r  {} of {} bytes stored, {} ms", off + part.len(), capsule.len(), t0.elapsed().as_millis());
+    }
+    eprintln!();
+    let mut list = match store_call(&link, ferros_pt::Op::Read, b"kists.list").await {
+        Ok(doc) => ferros_kist::Kists::parse(&doc).unwrap_or_else(|e| {
+            eprintln!("the person's list does not parse ({e}); not overwriting it");
+            std::process::exit(1);
+        }),
+        Err(e) if e == "not found" => ferros_kist::Kists::default(),
+        Err(e) => {
+            eprintln!("the person's list could not be read ({e}): is someone attested?");
+            std::process::exit(1);
+        }
+    };
+    let i = list.install(addr, developer, option, &decl);
+    let doc = list.build(vsf::eagle_time_oscillations()).unwrap_or_else(|e| {
+        eprintln!("the list does not build: {e}");
+        std::process::exit(1);
+    });
+    let mut p = Vec::with_capacity(2 + 10 + doc.len());
+    p.extend_from_slice(&(10u16).to_be_bytes());
+    p.extend_from_slice(b"kists.list");
+    p.extend_from_slice(&doc);
+    if let Err(e) = store_call(&link, ferros_pt::Op::Write, &p).await {
+        eprintln!("the person's list was not written: {e}");
+        std::process::exit(1);
+    }
+    let k = &list.kists[i];
+    println!("installed {} ({} bytes, capsule {}), {} kist(s) in the person's list", k.name, capsule.len(), addr.iter().map(|b| format!("{b:02X}")).collect::<String>(), list.kists.len());
+    for w in &k.wants {
+        let a = match w.answer {
+            None => "unanswered (asked at its first launch)",
+            Some((true, _)) => "granted",
+            Some((false, _)) => "not granted",
+        };
+        println!("  {}: {a} -- {}", ferros_kist::RIGHTS[w.right as usize], w.reason);
+    }
+}
+
+/// `kist answer <name> <right> on|off|unset` (development; unset puts the want back to never asked): the attested person's answer for one want of an installed kist, written into their list as the first-launch question or the settings' Kists page would write it. `kist list`: the list as it stands.
+async fn cmd_kist_answer(args: &[String]) {
+    let link = usb::UsbLink::open().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let mut list = match store_call(&link, ferros_pt::Op::Read, b"kists.list").await {
+        Ok(doc) => ferros_kist::Kists::parse(&doc).unwrap_or_else(|e| {
+            eprintln!("the person's list does not parse: {e}");
+            std::process::exit(1);
+        }),
+        Err(e) => {
+            eprintln!("the person's list could not be read: {e}");
+            std::process::exit(1);
+        }
+    };
+    if args.len() >= 3 {
+        let (name, right, on) = (&args[0], &args[1], args[2] == "on");
+        let Some(code) = ferros_kist::code(right) else {
+            eprintln!("{right} is not a right ({})", ferros_kist::RIGHTS.join(", "));
+            std::process::exit(1);
+        };
+        let Some(w) = list.kists.iter_mut().find(|k| k.name.eq_ignore_ascii_case(name)).and_then(|k| k.wants.iter_mut().find(|w| w.right == code)) else {
+            eprintln!("no kist {name} that wants {right}");
+            std::process::exit(1);
+        };
+        w.answer = if args[2] == "unset" { None } else { Some((on, vsf::eagle_time_oscillations())) };
+        let doc = list.build(vsf::eagle_time_oscillations()).expect("the list builds");
+        let mut p = Vec::with_capacity(12 + doc.len());
+        p.extend_from_slice(&(10u16).to_be_bytes());
+        p.extend_from_slice(b"kists.list");
+        p.extend_from_slice(&doc);
+        if let Err(e) = store_call(&link, ferros_pt::Op::Write, &p).await {
+            eprintln!("the person's list was not written: {e}");
+            std::process::exit(1);
+        }
+    }
+    for k in &list.kists {
+        println!("{} (capsule {})", k.name, k.capsule.iter().map(|b| format!("{b:02X}")).collect::<String>());
+        for w in &k.wants {
+            println!("  {}: {}", ferros_kist::RIGHTS[w.right as usize], match w.answer { None => "unanswered", Some((true, _)) => "granted", Some((false, _)) => "not granted" });
+        }
+    }
+    println!("defaults: {}", ferros_kist::RIGHTS.iter().enumerate().filter(|(c, _)| list.defaults >> c & 1 == 1).map(|(_, r)| *r).collect::<Vec<_>>().join(", "));
 }
 
 /// Send raw DISPLAY params and print the reply.

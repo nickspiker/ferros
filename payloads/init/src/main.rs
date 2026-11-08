@@ -11,10 +11,31 @@
 //!   46 serve fgtw, 47 use fgtw, 48 the vault scope `fgtw.`, 49 the ira key, 50 use udp (payloads/fgtw, the identity service).
 //!   51 the vault scope `ahau.`, 52 use rmnet (the cellular link, the IP process's second), 53 serve rmnet, 54-68 the modem's hardware, 69-71 its shared memory, 72-76 its partitions (payloads/modem).
 //!   77-79 the NFC driver's, 80 use nfc, 81-83 the Bluetooth driver's, 84 use bt, 85 the identity unlock right, 86-90 the USB driver's (registers, DMA, interrupt, PT commands, power). 91 the touch controller's power. 92-96 the sensors process's (the AoC's IPC block and mailboxes, the vault scope `aoc.`, the Sensors right, its switch).
+//!   104 the Kists right (launching a kist with exactly its granted rights, KISTS.md), 105 serve launch, 106 use launch (the map's), 107 the vault scope `kists.` (the person's list); 104-108 were the GPU service's, which the kernel starts itself since 2026-11-08.
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use ferros_sys::{call_live, cap, console, freq, now, sleep_until, spawn, ERR};
+
+/// Grant slot 104: the Kists right (KISTS.md); 105: serve launch; 107: the vault scope `kists.`.
+const S_KISTS: u64 = 104;
+const S_LAUNCH: u64 = 105;
+const S_KIST_LIST: u64 = 107;
+
+/// The heap the person's list of kists is read in (ferros_kist), a launch at a time.
+const HEAP_SIZE: usize = 1 << 18;
+#[repr(C, align(64))]
+struct Heap([u8; HEAP_SIZE]);
+static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
+#[global_allocator]
+static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+/// The launcher's stack (`launcher`): a list parsed through vsf wants more than a keeper's.
+const LAUNCH_STACK: usize = 1 << 16;
+#[repr(C, align(16))]
+struct LaunchStack([u8; LAUNCH_STACK]);
+static mut LSTACK: LaunchStack = LaunchStack([0; LAUNCH_STACK]);
 
 /// Grant slot 17: use display (the header's list).
 const S_USE_DISPLAY: u64 = 17;
@@ -22,12 +43,10 @@ const S_USE_DISPLAY: u64 = 17;
 const S_UNLOCK: u64 = 85;
 
 /// Each process: its name, its vault key, and which of init's slots it receives, in the order its own grant slots expect them (payloads/display, payloads/touch, payloads/map headers).
-const SHELL: [(&[u8], &[u8], &[u64]); 13] = [
+const SHELL: [(&[u8], &[u8], &[u64]); 12] = [
     // What runs before a person is present (AUTH.md, the device class): the screen, touch and the attest screen, then the network and the radios.
     (b"display", b"display", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103, 20]),
     (b"touch", b"touch", &[14, 15, 16, 23, 91]),
-    // The GPU service (payloads/gpu, GPU.md "Layers"): it boots the GPU once and serves `gpu`, kernels for the clients' layers in the shared arena. Started ahead of the attest screen, its first client. 1 registers, 2 memory, 3 the vault scope (gpu.fw), 4 the job interrupt, 5 the layer arena, 6 serve gpu.
-    (b"gpu", b"gpu", &[105, 106, 107, 108, 68, 104]),
     // The attest screen, before anything else draws: 1 use display, 2 use touch, 3 a surface (init's `surfaces` passes as one of its own), 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings (its layout switch writes the device's layout), 8 use fgtw (the identity service's verdict on the identity, and the mint), 9 the identity unlock right, 10 a second surface (the keyboard's back buffer; `surfaces` again) (payloads/ahau).
     (b"ahau", b"ahau", &[17, 18, 22, 51, 48, 49, 19, 47, 85, 22, 24, 68]),
     // The USB driver (payloads/usb, USB.md): it runs the controller and serves Photon Transport to the bridge, handing each command to the kernel. 1 the controller's registers, 2 its DMA memory, 3 its interrupt, 4 the kernel's PT commands, 5 the `usb` power switch. The kernel has no USB of its own: should the driver end, the keeper below starts it again.
@@ -45,7 +64,7 @@ const SHELL: [(&[u8], &[u8], &[u64]); 13] = [
     (b"modem", b"modem", &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 40, 69, 70, 71, 72, 73, 74, 75, 76]),
     // What reads the person's space (the identity class), each when it may (`wait_person`). fgtw, the identity service, once an identity is unlocked: it is part of attest, looking the identity up and joining its fleet (its chain and key; not the Photon app, which a person installs): 1 use udp, 2 the vault scope `fgtw.`, 3 the ira key, 4 serve fgtw, 5 entropy (the fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right (payloads/fgtw). The map only once the device is also bound to that identity (owner, 2026-11-04: "if it's not attached to an identity, not usable"): its arrangement, 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page).
     (b"fgtw", b"fgtw", &[50, 48, 49, 46, 41, 80, 84, 85]),
-    (b"map", b"map", &[17, 18, 19, 20, 47]),
+    (b"map", b"map", &[17, 18, 19, 20, 47, 107, 106]),
 ];
 
 #[unsafe(no_mangle)]
@@ -53,6 +72,7 @@ const SHELL: [(&[u8], &[u8], &[u64]); 13] = [
 pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The table's names and slot lists are `&'static` slices, absolute addresses fixed at link time: apply the payload's relocations before reading them (the first run faulted at address 0 without this, 2026-10-22, as the map once did).
     unsafe { ferros_sys::relocate() };
+    unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
     let mut failed = 0u64;
     // The keepers' stacks: in this frame, which never returns.
     let mut stacks = Stacks([[0u8; KEEPER_STACK]; KEPT.len()]);
@@ -97,10 +117,50 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     if failed == 0 {
         console(grants, b"init: shell, network, radios and the person's space started (display, touch, ahau, usb, pcie1, ip, sensors, nfc, bt, modem, fgtw, map)\n");
     }
-    // init stays: its keepers run in this process. The main thread only waits.
+    // Kists launch from here on (the map's kist circles): the person is present and the device bound by now (`wait_person` before the map).
+    ferros_sys::thread_spawn(launcher, unsafe { &mut (*(&raw mut LSTACK)).0 }, grants);
+    // init stays: its keepers and its launcher run in this process. The main thread only waits.
     let _ = failed;
     loop {
         sleep_until(now() + freq() * 1024);
+    }
+}
+
+/// The `launch` endpoint (KISTS.md, owner 2026-11-08): the map asks for a kist by its capsule's address and init launches it with exactly the rights the person granted, read from the person's own list, never the map's word; the map holds none of a kist's rights. A want never answered launches nothing: the map asks first (init never asks, and no kist can). One process per kist: a second tap finds it running.
+extern "C" fn launcher(grants: u64) -> ! {
+    use ferros_kist::launch::*;
+    let mut msg = [0u8; 64];
+    let mut token = [0u8; 32];
+    loop {
+        let n = ferros_sys::recv(cap(grants, S_LAUNCH), &mut msg, &mut token, false);
+        if n == ERR {
+            continue;
+        }
+        let answer = if n >= 33 && (msg[0] == OP_LAUNCH || msg[0] == OP_RELAUNCH) { launch(grants, msg[1..33].try_into().unwrap(), msg[0] == OP_RELAUNCH) } else { REFUSED };
+        ferros_sys::reply(&token, &[answer]);
+    }
+}
+
+/// One launch (or, `relaunch`, a running kist killed and launched again after the person changed an answer): the kist found in the person's list by its capsule, its slots from their answers (a right granted, or an empty slot), handed to the kernel, which checks them against the capsule itself.
+fn launch(grants: u64, capsule: [u8; 32], relaunch: bool) -> u8 {
+    use ferros_kist::launch::*;
+    let Some(list) = ferros_kist::store::read(cap(grants, S_KIST_LIST)) else { return UNREADABLE };
+    let Some(k) = list.by_capsule(&capsule) else { return NOT_INSTALLED };
+    let Some(codes) = k.launch_codes() else { return ASK };
+    // WHY: the name is the installer's ASCII; a process name and a request hold 64 bytes, a slot list 64 slots (a longer one is a capsule no request can launch).
+    let name = &k.name.as_bytes()[..k.name.len().min(64)];
+    if codes.len() > 64 {
+        return REFUSED;
+    }
+    match ferros_sys::spawn_kist(grants, S_KISTS, name, &capsule, &codes, relaunch) {
+        0 => {
+            console(grants, if relaunch { b"init: relaunching ".as_slice() } else { b"init: launching " });
+            console(grants, name);
+            console(grants, b"\n");
+            STARTED
+        }
+        ferros_sys::NOTHING => RUNNING,
+        _ => REFUSED,
     }
 }
 

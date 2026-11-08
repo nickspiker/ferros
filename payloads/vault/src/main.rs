@@ -20,8 +20,8 @@ use ferros_store::{Domain, Nonces, Store, Writer};
 use ferros_sys::{cap, console, freq, now, ERR};
 use manifestus::{Block, BlockDev, DeletePolicy, Mirror, Vault};
 
-/// The heap: manifestus's working set (its index walks, the reap's windows) and a piece being opened or sealed.
-const HEAP_BYTES: usize = 8 << 20;
+/// The heap: manifestus's working set (its index walks, the reap's windows) and a piece being opened or sealed. 24 MiB since 2026-11-08: a write grows a buffer of manifestus's with the vault's entries (about 926 bytes an entry, doubling: 671,760 bytes writing a 47 MB kist capsule into an empty store, 1,343,504 writing it again, measured on the host, ferros_store `rewrite_peak`), and at 8 MiB the vault process died rewriting Mahere's capsule. The growth itself is manifestus's to bound.
+const HEAP_BYTES: usize = 24 << 20;
 const STACK_BYTES: usize = 1 << 18;
 
 #[repr(C, align(16))]

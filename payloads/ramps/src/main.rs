@@ -162,7 +162,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         if held == 0 && down {
             down = false;
             if !moved && most == 2 {
-                window::done(display, unsafe { SURF });
+                // One shot dead (owner, 2026-11-08): the display drops the window of a process that ended.
                 console(grants, b"ramps: back to the map\n");
                 exit(0);
             }

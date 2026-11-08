@@ -224,8 +224,8 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
 enum VaultJob {
     /// A value read whole: its full name, what has come so far.
     Get { full: alloc::string::String, got: alloc::vec::Vec<u8> },
-    /// A value written in pieces from the command's parameters (the command kept beside the job: `vault_cmd` in `run`): its full name, where the value starts in them, the next offset into it.
-    Put { full: alloc::string::String, from: usize, at: usize },
+    /// A value written in pieces from the command's parameters (the command kept beside the job: `vault_cmd` in `run`): its full name (its scope's name, when `addr` names it by a 32-byte address), where the value starts in them, the next offset into it; and for a value larger than one command carries (an installed kist's capsule), where this command's part starts in the value and whether more commands follow.
+    Put { full: alloc::string::String, addr: Option<[u8; 32]>, from: usize, at: usize, base: u64, more: bool },
     Remove { full: alloc::string::String },
     /// Every name: the kernel's own vault's first (already in `out`, after its status byte), then each scope's from the vault process in turn, `scope` the one being read, `at` into its listing, `part` its listing so far.
     List { out: alloc::vec::Vec<u8>, scope: usize, at: u64, part: alloc::vec::Vec<u8> },
@@ -244,8 +244,24 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
     let name = |b: &[u8]| core::str::from_utf8(b).ok().filter(|k| crate::process::vault_name(k).is_some()).map(alloc::string::String::from);
     let job = match op {
         ferros_pt::Op::Write => {
-            let klen = u16::from_be_bytes([*params.first()?, *params.get(1)?]) as usize;
-            VaultJob::Put { full: name(params.get(2..2 + klen)?)?, from: 2 + klen, at: 0 }
+            // [key length u16 BE][key][value]. Bit 15 of the length: a part of a larger value, [offset u64 LE][more u8] after the key. Bit 14: the key is a scope's prefix and a 32-byte address (an installed kist's capsule, by its blake3).
+            let k = u16::from_be_bytes([*params.first()?, *params.get(1)?]);
+            let (part, raw, klen) = (k & 1 << 15 != 0, k & 1 << 14 != 0, (k & 0x3FFF) as usize);
+            let key = params.get(2..2 + klen)?;
+            let (full, addr) = if raw {
+                let (prefix, a) = key.split_at(klen.checked_sub(32)?);
+                let sc = crate::process::STORES.iter().find(|s| s.prefix.as_bytes() == prefix)?;
+                (alloc::string::String::from(sc.name), Some(<[u8; 32]>::try_from(a).ok()?))
+            } else {
+                (name(key)?, None)
+            };
+            let (base, more, from) = if part {
+                let o = 2 + klen;
+                (u64::from_le_bytes(params.get(o..o + 8)?.try_into().ok()?), *params.get(o + 8)? != 0, o + 9)
+            } else {
+                (0, false, 2 + klen)
+            };
+            VaultJob::Put { full, addr, from, at: 0, base, more }
         }
         ferros_pt::Op::Read if params.is_empty() => {
             let mut out = alloc::vec![0u8];
@@ -278,13 +294,16 @@ fn vault_job_call(job: &VaultJob, params: &[u8]) -> Result<(), alloc::vec::Vec<u
             rest.extend_from_slice(&(VAULT_PIECE as u32).to_le_bytes());
             vault_stamp(VOP_GET, full, &rest)
         }
-        VaultJob::Put { full, from, at } => {
+        VaultJob::Put { full, addr, from, at, base, more } => {
             let value = &params[*from..];
             let end = (at + VAULT_PIECE).min(value.len());
-            rest.extend_from_slice(&(*at as u64).to_le_bytes());
-            rest.push((end < value.len()) as u8);
+            rest.extend_from_slice(&(base + *at as u64).to_le_bytes());
+            rest.push((end < value.len() || *more) as u8);
             rest.extend_from_slice(&value[*at..end]);
-            vault_stamp(VOP_SET, full, &rest)
+            match addr {
+                Some(a) => crate::process::vault_stamp_addr(VOP_SET, full, a, &rest),
+                None => vault_stamp(VOP_SET, full, &rest),
+            }
         }
         VaultJob::Remove { full } => vault_stamp(VOP_DELETE, full, &[]),
         VaultJob::List { scope, at, .. } => crate::process::vault_stamp_list(*scope, *at, VAULT_PIECE as u32).map(|(m, _)| m),
@@ -382,6 +401,121 @@ fn vault_job_step(job: &mut VaultJob, params: &[u8], store: &mut Option<ShimStor
         }
     };
     vault_job_call(job, params).err()
+}
+
+/// A kist launch init asked for (process.rs `kist_request`), its capsule streamed from the vault process through the kernel's channel a transfer a call: the first transfers into `head` until the code's header is in (`kist_need` sizes the arc from it), then straight into the arc at the code offset, as the bridge's streamed spawn lands its pieces. Done, `spawn_kist` checks it and builds the process.
+struct KistJob {
+    l: crate::process::KistLaunch,
+    total: usize,
+    head: alloc::vec::Vec<u8>,
+    arc: Option<crate::process::Arc>,
+    got: usize,
+    t0: u64,
+    /// Its first bytes are in and its arc waits for one that is coming back (`kist_arc`).
+    waiting: bool,
+}
+
+/// The kist job's next read (from `got`); false when the channel would not take it.
+fn kist_call(job: &KistJob) -> bool {
+    let mut rest = [0u8; 12];
+    rest[..8].copy_from_slice(&(job.got as u64).to_le_bytes());
+    rest[8..].copy_from_slice(&(crate::process::STORE_MAX as u32).to_le_bytes());
+    match crate::process::vault_stamp_addr(crate::process::VOP_GET, "capsules", &job.l.capsule, &rest) {
+        Some(msg) => crate::process::vault_call(msg),
+        None => false,
+    }
+}
+
+/// The kist's arc, sized from its first bytes (`kist_need`), with those bytes copied in. Ok(false): the pool has no room yet while a process ends (a relaunch's own predecessor still leaving a core, its arc coming back at its next trap), so the job waits for that, not for a time; Err when there is no room and nothing is coming back.
+fn kist_arc(job: &mut KistJob) -> Result<bool, &'static str> {
+    let need = crate::process::kist_need(&job.head, job.total)?;
+    let Some(arc) = crate::process::with_lock(|| crate::process::arc_alloc(need, false)) else {
+        return if crate::process::any_dying() { Ok(false) } else { Err("the arc pool has no room for the kist") };
+    };
+    if crate::process::CODE + job.total > arc.size {
+        crate::process::with_lock(|| crate::process::arc_free(arc));
+        return Err("the kist's arc is smaller than its capsule");
+    }
+    unsafe { core::ptr::copy_nonoverlapping(job.head.as_ptr(), (arc.base + crate::process::CODE) as *mut u8, job.head.len()) };
+    job.arc = Some(arc);
+    job.head = alloc::vec::Vec::new();
+    Ok(true)
+}
+
+/// The kist job after its last bytes or its arc: the process built once the capsule is whole, else the next read.
+fn kist_next(job: &mut KistJob) -> Option<Result<(), &'static str>> {
+    if job.got >= job.total {
+        return Some(match job.arc.take() {
+            Some(arc) => crate::process::spawn_kist(&job.l, arc, job.total),
+            None => Err("the capsule ended before its code"),
+        });
+    }
+    if !kist_call(job) {
+        return Some(Err("the kernel's channel to the vault process would not take the next read"));
+    }
+    None
+}
+
+/// One step of the kist job: waiting for its arc, or the answer to its last read if it has come, then its next read. Some(the outcome) once it is done; the arc is the process's or back in the pool by then.
+fn kist_step(job: &mut KistJob) -> Option<Result<(), &'static str>> {
+    use crate::process::{ERR, NOTHING};
+    let r = (|| {
+        if job.waiting {
+            return match kist_arc(job) {
+                Ok(true) => {
+                    job.waiting = false;
+                    kist_next(job)
+                }
+                Ok(false) => None,
+                Err(e) => Some(Err(e)),
+            };
+        }
+        let (value, bytes) = match crate::process::vault_answer()? {
+            Ok(a) => a,
+            Err(()) => return Some(Err("the vault process ended while the capsule was read")),
+        };
+        match value {
+            NOTHING => return Some(Err("no such capsule in the vault (install it first)")),
+            ERR => return Some(Err("the vault process could not read the capsule")),
+            _ => {}
+        }
+        // WHY the bounds: the length is the vault's word; a capsule of nothing, or past the gigabyte the arc pool can hold, is refused before any arc is asked for.
+        if value == 0 || value > 1 << 30 || (job.total != 0 && value as usize != job.total) {
+            return Some(Err("the capsule's length is not one an arc can hold, or it changed while it was read"));
+        }
+        job.total = value as usize;
+        // WHY: the piece is the vault's; past the capsule's length it would land past the staging the arc was sized for, and nothing at all while the capsule is not whole would ask for the same piece for ever.
+        if job.got + bytes.len() > job.total || (bytes.is_empty() && job.got < job.total) {
+            return Some(Err("the vault process answered past the capsule's end, or nothing"));
+        }
+        match job.arc {
+            None => {
+                job.head.extend_from_slice(&bytes);
+                job.got += bytes.len();
+                if job.head.len() >= job.total.min(1 << 16) {
+                    match kist_arc(job) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            job.waiting = true;
+                            return None;
+                        }
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+            }
+            Some(arc) => {
+                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), (arc.base + crate::process::CODE + job.got) as *mut u8, bytes.len()) };
+                job.got += bytes.len();
+            }
+        }
+        kist_next(job)
+    })();
+    if r.as_ref().is_some_and(|x| x.is_err()) {
+        if let Some(arc) = job.arc.take() {
+            crate::process::with_lock(|| crate::process::arc_free(arc));
+        }
+    }
+    r
 }
 
 /// The boot screen: boot path, generation, vault state + root, and how to get out.
@@ -668,8 +802,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Power(b"dpu"),
         // 102 the `panel` switch (panel_power.rs: VCI and the reset pulse), 103 `panel-vddd` (VDDD after the init set): the panel from off (§8, state B).
         Power(b"panel"), Power(b"panel-vddd"),
-        // The GPU service (payloads/gpu, GPU.md "Layers"): 104 serve gpu, 105 its registers, 106 its memory, 107 the vault scope `gpu.` (its firmware), 108 its job interrupt; the layer arena is 68 and `use gpu` 24. The page is full at 108.
-        Serve(b"gpu"), Dma(b"gpu-regs"), Dma(b"gpu-mem"), Store(b"gpu"), Irq(b"gpu-job"),
+        // Kists (KISTS.md, 2026-11-08): 104 the right to launch them (each right a kist is granted is made by the kernel from it: init holds no other grant for them), 105 serve `launch` (the map asks init to launch one), 106 use `launch` (the map's), 107 the vault scope `kists.` (the person's list and answers: init reads it, the map shows it and writes the answers). These were the GPU service's until it got its own list (`gpu_grants`), started by the kernel as the vault and GPS are: the page holds 108 slots.
+        Kists, Serve(b"launch"), Use(b"launch"), Store(b"kists"),
         // The `android` switch (android_request) is in no one's list: the base OS has no Android launcher (owner, 2026-11-04: nothing built in but system settings). It goes to a launcher a person installs, once installing exists.
     ]
 }
@@ -717,6 +851,12 @@ fn gps_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![Serve(b"gps"), Hardware(b"usi3-spi"), Hardware(b"gpio-far-alive"), Hardware(b"gpio-gpp0"), Hardware(b"gpio-hsi2"), Store(b"gps"), Power(b"gps"), Irq(b"gps-host-req")]
 }
 
+/// The GPU service's grants in its slot order (payloads/gpu): 1 its registers, 2 its memory, 3 the vault scope `gpu.` (its firmware), 4 its job interrupt, 5 the layer arena, 6 serve gpu. Its own list since 2026-11-08, as the vault's and the GPS driver's: init's page gave its five slots to kists, and the kernel starts the GPU service at home, before init (so before the attest screen, its first client).
+fn gpu_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
+    use crate::process::Grant::*;
+    alloc::vec![Dma(b"gpu-regs"), Dma(b"gpu-mem"), Store(b"gpu"), Irq(b"gpu-job"), Dma(b"layers"), Serve(b"gpu")]
+}
+
 /// Each shell process's capabilities, as init hands them out (payloads/init: the slots of `home_grants`, 1-based), for restarting one from the vault without a reboot.
 fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'static>>> {
     if name == b"vault" {
@@ -725,13 +865,15 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
     if name == b"gps" {
         return Some(gps_grants());
     }
+    if name == b"gpu" {
+        return Some(gpu_grants());
+    }
     let slots: &[usize] = match name {
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
         b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103, 20],
         b"touch" => &[14, 15, 16, 23, 91],
-        // The GPU service in its own slot order: 1 registers, 2 memory, 3 the vault scope, 4 the job interrupt, 5 the layer arena, 6 serve gpu.
-        b"gpu" => &[105, 106, 107, 108, 68, 104],
-        b"map" => &[17, 18, 19, 20],
+        // 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page), 6 the vault scope `kists.` (the person's kists and answers), 7 use launch (payloads/map).
+        b"map" => &[17, 18, 19, 20, 47, 107, 106],
         b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83],
         b"ip" => &[44, 45, 41, 52],
         // The modem driver: serve rmnet, its hardware, windows and partitions (payloads/modem's slot order).
@@ -891,6 +1033,19 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
                 }
                 Err(e) => crate::process::push_console(alloc::format!("home: vault refused: {e}\n").as_bytes()),
             }
+        }
+    }
+    // The GPU service, from its capsule in the vault, with its own grants (`gpu_grants`): before init, so it serves before the attest screen asks it. Not after a jump from Android: Android ran the GPU, and the attest screen draws on the CPU without it (init skipped it there too).
+    if !platform::jumped() {
+        match crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("gpu").ok().flatten())) {
+            Some(gc) => match crate::process::spawn_capsule(b"gpu", &gc, b"", &gpu_grants(), &sealed) {
+                Ok(o) => {
+                    mark_ran(&o);
+                    crate::process::push_console(&o.console);
+                }
+                Err(e) => crate::process::push_console(alloc::format!("home: gpu refused: {e}\n").as_bytes()),
+            },
+            None => crate::process::push_console(b"home: no gpu capsule in the vault\n"),
         }
     }
     // The pipe stays at ABL's 8 bpc here: the display server takes it to the 10 bpc blend at its start (payloads/display modeset.rs; KERNEL-OUT.md decision 6, 2026-11-01).
@@ -1399,6 +1554,8 @@ pub fn run(mut b: Boot) -> ! {
     let mut vault_cmd: Option<crate::ptlink::Submitted> = None;
     // A drop of the released person's domain sent to the vault process, its answer awaited (`RELEASE_DROPS`).
     let mut release_drop_sent = false;
+    // A kist's capsule being read from the vault process for its launch (`KistJob`).
+    let mut kist_job: Option<KistJob> = None;
     // The sensors process's check (below): when it last looked.
     let mut sensors_check = 0u64;
 
@@ -1520,9 +1677,9 @@ pub fn run(mut b: Boot) -> ! {
         // Released (a completed departure): restart, so the device comes back at the attest screen with nothing of the identity left.
         // First the person's domains in the vault process are dropped, a call a pass through the kernel's channel (none while a bridge command holds it); a drop that fails, or no vault to send it to, is logged and the restart goes ahead: the renewed device-only secret already makes those entries unopenable.
         #[cfg(not(ferros_production))]
-        let channel_free = vault_job.is_none();
+        let channel_free = vault_job.is_none() && kist_job.is_none();
         #[cfg(ferros_production)]
-        let channel_free = true;
+        let channel_free = kist_job.is_none();
         if channel_free && RELEASE_RESET.load(core::sync::atomic::Ordering::Acquire) {
             if release_drop_sent {
                 match crate::process::vault_answer() {
@@ -1588,6 +1745,36 @@ pub fn run(mut b: Boot) -> ! {
         };
         #[cfg(ferros_production)]
         let vault_waits = false;
+        // A kist launch init asked for (KISTS.md): started once the kernel's channel is free (no bridge store command, no release under way), then a read a pass until the capsule is in its arc (`kist_step`).
+        #[cfg(not(ferros_production))]
+        let bridge_holds_channel = vault_job.is_some();
+        #[cfg(ferros_production)]
+        let bridge_holds_channel = false;
+        if kist_job.is_none() && !bridge_holds_channel && !RELEASE_RESET.load(core::sync::atomic::Ordering::Acquire) {
+            if let Some(l) = crate::process::kist_take() {
+                let job = KistJob { l, total: 0, head: alloc::vec::Vec::new(), arc: None, got: 0, t0: cntpct(), waiting: false };
+                if kist_call(&job) {
+                    kist_job = Some(job);
+                } else {
+                    crate::process::push_console(alloc::format!("kist {}: not started: no vault process, or the kernel's channel to it is busy\n", core::str::from_utf8(&job.l.name).unwrap_or("?")).as_bytes());
+                    crate::process::kist_done();
+                }
+            }
+        }
+        if let Some(job) = kist_job.as_mut() {
+            if let Some(r) = kist_step(job) {
+                let nm = core::str::from_utf8(&job.l.name).unwrap_or("?");
+                let ms = (cntpct() - job.t0) * 1000 / cntfrq();
+                let line = match r {
+                    Ok(()) => alloc::format!("kist {nm}: started from the vault ({} bytes read in {ms} ms)\n", job.total),
+                    Err(e) => alloc::format!("kist {nm}: not started: {e}\n"),
+                };
+                crate::flashlog::line(line.trim_end());
+                crate::process::push_console(line.as_bytes());
+                crate::process::kist_done();
+                kist_job = None;
+            }
+        }
         // The USB process's command handled last pass: its raw reply to the process, the kernel's own outbound reply back in place.
         if let Some(saved) = if vault_waits { None } else { proc_restore.take() } {
             platform::RAW_REPLY.store(false, core::sync::atomic::Ordering::Relaxed);
@@ -3457,6 +3644,8 @@ pub fn run(mut b: Boot) -> ! {
                             13 => crate::process::Grant::Sensors,
                             14 => crate::process::Grant::Blocks(g),
                             15 => crate::process::Grant::Vault,
+                            16 => crate::process::Grant::Domain,
+                            17 => crate::process::Grant::Kists,
                             _ => crate::process::Grant::Use(g),
                         });
                     }

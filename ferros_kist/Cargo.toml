@@ -1,0 +1,19 @@
+[package]
+name = "ferros_kist"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Kists (docs/KISTS.md): the rights a kist may want, its signed declaration in the capsule, and the person's list of installed kists with their answers, as VSF. Needs a heap; the kernel reads only the rights' names."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+vsf = { path = "../../vsf", default-features = false }
+# vsf hashes with blake3; pure Rust, as the display has it: its C and assembly do not build for the bare target.
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+# The list read and written through a process's `kists.` grant (init, the map): only where ferros_sys's calls exist.
+ferros_sys = { path = "../ferros_sys", optional = true }
+
+[features]
+process = ["dep:ferros_sys"]
