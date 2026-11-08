@@ -1325,7 +1325,10 @@ impl Ahau {
     /// The person's wallpaper (owner, 2026-11-07: handle entry unlocks it): their wallpaper seed to the display (op 42), which makes their wallpaper from it unless they set their own. The seed is one-way from their identity seed (BLAKE3's key derivation under a context of its own), so it shows nothing of the handle, and it is the same on every device of theirs and theirs alone. It is kept in their space (`ahau.wallpaper`) for a boot that unlocks without the handle being typed (`send_wallpaper`).
     fn wallpaper(&self, seed: &[u8; 32]) {
         let ws = ahau_core::wallpaper_seed(seed);
-        if !self.put(S_AHAU, b"wallpaper", &ws) {
+        // Kept only when it is not already (every attest of a device's person but the first): a write is a vault commit, and this is on the way to the home screen (owner, 2026-11-08: "should be milliseconds").
+        let mut kept = [0u8; 32];
+        let same = ferros_sys::store_get(cap(self.grants, S_AHAU), b"wallpaper", &mut kept) == Some(32) && kept == ws;
+        if !same && !self.put(S_AHAU, b"wallpaper", &ws) {
             console(self.grants, b"ahau: the wallpaper seed was not kept\n");
         }
         send_wallpaper(self.display, &ws);
@@ -1333,10 +1336,11 @@ impl Ahau {
 
     /// A person this device knows: the screen closes now, then the handle proof is made behind it and the roots go to the identity service (fgtw) (made again until it takes them: it starts once the space is open), then this process ends.
     fn unlocked_known(&mut self, seed: [u8; 32]) -> ! {
-        self.wallpaper(&seed);
         self.wipe();
         console(self.grants, b"ahau: unlocked (this device knows the identity); the screen goes, the proof follows\n");
+        // The screen first, then the wallpaper's seed (the display loads it on a thread of its own and answers at once): the home screen waits for neither (owner, 2026-11-08: "4 seconds from attest to showing homescreen ... should be milliseconds").
         window::done(self.display, self.base);
+        self.wallpaper(&seed);
         let proof = self.proof_for(&seed, false);
         self.send_roots(&seed, &proof);
         while self.roots_pending {

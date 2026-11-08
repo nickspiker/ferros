@@ -337,6 +337,10 @@ unsafe impl GlobalAlloc for Bump {
         if sp.wrapping_sub(CON_STACK_LO) < CON_STACK_LEN {
             return CON_HEAP.bump(l);
         }
+        // The wallpaper's loader likewise (`wall_loader`, `LOAD_HEAP`).
+        if sp.wrapping_sub(LOAD_STACK_LO) < LOAD_STACK_LEN {
+            return LOAD_HEAP.bump(l);
+        }
         self.bump(l)
     }
     unsafe fn dealloc(&self, _: *mut u8, _: Layout) {}
@@ -384,14 +388,6 @@ impl Bump {
     }
     fn used(&self) -> usize {
         unsafe { *self.next.get() - *self.base.get() }
-    }
-    /// Where the next allocation goes: a point to come back to (`back_to`).
-    fn now(&self) -> usize {
-        unsafe { *self.next.get() }
-    }
-    /// Everything allocated since `now` gave `at` forgotten: the caller holds none of it any more. For a loop whose every pass allocates and drops its own (the wallpaper's bands read over the vault: 24 MB through a 32 MiB heap that is otherwise only reset once a frame).
-    fn back_to(&self, at: usize) {
-        unsafe { *self.next.get() = at };
     }
 }
 
@@ -1325,6 +1321,9 @@ const E_CODE_Q15: [u32; 3] = [32768, 28548, 29883];
 const E_LIGHT: f32 = 0.801;
 
 /// The present stage's one table: a 16-bit working value (gamma 2, white = 1.0 = Q14 16384, up to 4.0 = 16× white in light) to a 10-bit panel code with 4 fraction bits (Q4, 0..16368), before the white point. One entry folds the whole display transform: the roll-off, Y/peak = tanh²(a·v), always on, with infinity on the panel's peak and `a` solved so white lands exactly on its share of it, tanh²(a) = white ÷ peak, a = atanh(√(white/peak)) (owner, 2026-10-22: at the brightest setting white is half the peak); then the panel's 1/2.19. Shared by the three channels (their curves agree within the instrument's noise); E's per-channel gains come after it. Built once, here, with f32; everything per pixel is integer.
+/// The brightness (preference 3) the one table was last built for: a brightness change builds only the present stage's tables (`odt_tables`), and the ramps (op 21), the table's one reader, build it again when it is stale (owner, 2026-11-08: 65536 tanh and pow at every 32nd of a stop of the slider, for nothing).
+static mut LUT_FOR: u8 = 0;
+
 fn build_lut(lut: &mut [u16], white: f32, peak_e: f32) {
     let k = libm::atanhf(sqrt((white / peak_e).min(0.999)));
     for (i, e) in lut.iter_mut().enumerate() {
@@ -3576,9 +3575,6 @@ fn measure_text(t: &mut Txt, kind: u16, v: i64) {
     };
 }
 
-/// Rows read a band when the person's own wallpaper is read from the vault (`wall_own`).
-const WALL_ROWS: usize = 1 << 6;
-
 /// The wallpaper's threads (owner, 2026-11-07: twelve seconds on the render thread alone was too long). Besides the render loop, which never waits on them, they take bands of rows of the job's three passes: drawing (one sample a pixel), marking (the pixels whose colour differs from a neighbour's, `wallpaper::mark_rows`), and refining (those again at 4 × 4 samples, `wallpaper::refine_rows`). A band is claimed by a compare-and-swap on (pass, next band), so the cores' different rates even out, and whoever finishes a pass's last band moves the job to the next pass and wakes the others. Marking reads the finished first pass and writes only its own rows' bits; refining writes only its own rows; no band ever writes what another reads, and the picture is the same however the bands fall.
 const WALL_THREADS: usize = 4;
 /// Rows a band.
@@ -3644,6 +3640,46 @@ fn wall_band(p: &wallpaper::Params, pass: u64, band: usize) {
 /// The render loop's side of the wallpaper job, each pass of the loop: a waiting seed starts a job when none runs; the first pass done shows the wallpaper, the refining done shows it again. Each with its time to the console.
 fn wall_step(grants: u64, width: usize, height: usize) {
     unsafe {
+        // A load (`wall_loader`): its result shown the pass it arrives, or the seed's job wanted when nothing was kept.
+        if LOADING {
+            let d = LOAD_DONE.load(Ordering::Acquire);
+            let r = LOAD_REQ.load(Ordering::Acquire);
+            if d >> 8 != r >> 8 {
+                return;
+            }
+            LOADING = false;
+            // A newer load wanted meanwhile (another attest): this result is not shown; that load starts next pass.
+            if LOAD_WANTED != 0 {
+                return;
+            }
+            match d & 0xFF {
+                FOUND_OWN => {
+                    console(grants, b"display: wallpaper: the person's own\n");
+                    wall_ready(width, height);
+                }
+                FOUND_MADE => {
+                    console(grants, b"display: wallpaper: the person's, kept on this device\n");
+                    wall_ready(width, height);
+                }
+                _ if r & LOAD_SEED != 0 => {
+                    console(grants, b"display: wallpaper: made from the person's seed\n");
+                    WALL_PENDING = Some(LOAD_SEED_BYTES);
+                }
+                _ => {}
+            }
+            return;
+        }
+        if !WALL_RUNNING && LOAD_WANTED != 0 {
+            // Started only between jobs: the loader and the job's threads both write `WALL_BUF`. A seed waiting for its job gives way: the load falls back to it if nothing is kept.
+            WALL_PENDING = None;
+            LOADING = true;
+            WALL_ON = false;
+            let seq = (LOAD_REQ.load(Ordering::Acquire) >> 8) + 1;
+            LOAD_REQ.store(seq << 8 | LOAD_WANTED, Ordering::Release);
+            LOAD_WANTED = 0;
+            ferros_sys::wake(&LOAD_REQ, 1);
+            return;
+        }
         if !WALL_RUNNING {
             let Some(seed) = (*(&raw mut WALL_PENDING)).take() else { return };
             if WALL_MASK == 0 {
@@ -3690,11 +3726,31 @@ fn wall_ready(width: usize, height: usize) {
     }
 }
 
-/// The vault as a byte source for vsf's container (`Document`): the value under `key` in a store scope, read in the kernel's pieces of at most 4 KiB (it keeps the value between such reads, so walking a large one costs one vault read). vsf reads only what it needs: the header, then the rows asked for.
+/// The vault as a byte source for vsf's container (`Document`): the value under `key` in a store scope, read straight into the caller's buffer (the display's heap is a DMA region outside its arc, which the kernel resolves as it does the arc since 2026-11-08) a transfer at a time (`TRANSFER`). vsf reads only what it needs: the header and the plane's place.
 struct VaultSource {
     cap: u64,
     key: &'static [u8],
     len: u64,
+}
+
+/// The transfer a vault read moves: ferros_sys::STORE_MAX (256 KiB) on a kernel from 2026-11-08 on; a kernel from before refuses more than 4 KiB, and the first refusal drops to that for good.
+static TRANSFER: AtomicU64 = AtomicU64::new(ferros_sys::STORE_MAX as u64);
+
+/// `buf.len()` bytes of the value under `key` from `offset`, a transfer a call; whether the vault gave them.
+fn vault_read(cap: u64, key: &[u8], offset: u64, buf: &mut [u8]) -> bool {
+    let mut at = 0;
+    while at < buf.len() {
+        let n = (buf.len() - at).min(TRANSFER.load(Ordering::Relaxed) as usize);
+        if ferros_sys::store_get_at(cap, key, offset as usize + at, &mut buf[at..at + n]).is_none() {
+            if n > 1 << 12 {
+                TRANSFER.store(1 << 12, Ordering::Relaxed);
+                continue;
+            }
+            return false;
+        }
+        at += n;
+    }
+    true
 }
 
 impl vsf::container::ByteSource for VaultSource {
@@ -3702,23 +3758,71 @@ impl vsf::container::ByteSource for VaultSource {
         self.len
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), vsf::container::SourceError> {
-        // Through a buffer on the stack: vsf's buffers are on the heap, and the heap is a DMA region outside the arc (S_HEAP). The kernel writes a syscall's reply at the caller's offset masked into its arc, so a heap pointer's reply landed elsewhere in the arc: the reads came back zeros, the made wallpaper "not a VSF document", and each read overwrote up to 4 KiB of the display's own memory (2026-11-08). The stack is in the arc.
-        let mut bounce = [0u8; 1 << 12];
-        let mut at = 0;
-        while at < buf.len() {
-            // The kernel hands over at most 4 KiB a read (ferros_sys::store_get_at).
-            let n = (buf.len() - at).min(bounce.len());
-            if ferros_sys::store_get_at(self.cap, self.key, offset as usize + at, &mut bounce[..n]).is_none() {
-                return Err(vsf::container::SourceError::Io("the vault refused a read".into()));
-            }
-            buf[at..at + n].copy_from_slice(&bounce[..n]);
-            at += n;
-        }
-        Ok(())
+        if vault_read(self.cap, self.key, offset, buf) { Ok(()) } else { Err(vsf::container::SourceError::Io("the vault refused a read".into())) }
     }
 }
 
-/// The person's own wallpaper (`map.wallpaper` in their space: a VSF visual, one plane of VSF RGB gamma2tanh codes at 16 bits, planar [3, height, width], as tools/wallpaper and tools/screencap write one) into `WALL_BUF`, if they set one; whether it did. vsf's container locates the plane over the vault (`VaultSource`) and reads it a band of rows a channel at a time, so nothing of its size passes through the heap; each code becomes a working value by the display's own g2t table (`G2T16_Q14`).
+/// The wallpaper's loader (owner, 2026-11-08: "4 seconds from attest to showing homescreen. that's real bad... should be milliseconds"): the person's wallpaper read from the vault on a thread of its own, so the home screen is drawn at once and the wallpaper appears under it in the first frame after it is whole (no fade). Until then the 24 MB read held the render thread for 2.9 s, and the attest screen's call (op 42) with it. The render loop starts a load (`LOAD_REQ`: a sequence number, then what to try in the low byte) only while no wallpaper job runs, and takes its result (`LOAD_DONE`: the same number, then what was found) in `wall_step`; meanwhile nothing publishes `WALL_BUF` (`WALL_ON` is false).
+static LOAD_REQ: AtomicU64 = AtomicU64::new(0);
+static LOAD_DONE: AtomicU64 = AtomicU64::new(0);
+/// What a load tries (`LOAD_REQ`'s low byte): their own, then the one made on this device; and then (`LOAD_SEED`) the seed, drawn here, when neither is kept.
+const LOAD_KEPT: u64 = 1;
+const LOAD_SEED: u64 = 2;
+/// What a load found (`LOAD_DONE`'s low byte).
+const FOUND_OWN: u64 = 1;
+const FOUND_MADE: u64 = 2;
+const FOUND_NONE: u64 = 3;
+/// The screen's size, for the loader.
+static mut LOAD_SIZE: (usize, usize) = (0, 0);
+/// The seed a load falls back to (op 42's), and a load wanted but not started (a job was running): its low byte as `LOAD_REQ`'s.
+static mut LOAD_SEED_BYTES: [u8; 32] = [0; 32];
+static mut LOAD_WANTED: u64 = 0;
+/// A load running (from its start in `wall_step` to its result taken there).
+static mut LOADING: bool = false;
+/// The loader's stack (its allocations are told by it, as the console worker's are) and heap: vsf's header parse and the transfer buffer, dropped after each load. Non-zero initialisers (see `ALLOC`).
+static mut LOAD_STACK: [u8; 1 << 18] = [0; 1 << 18];
+static mut LOAD_STACK_LO: usize = usize::MAX;
+static mut LOAD_STACK_LEN: usize = 1;
+static LOAD_HEAP: Bump = Bump { base: UnsafeCell::new(1), next: UnsafeCell::new(1), mark: UnsafeCell::new(1), end: UnsafeCell::new(1) };
+const LOAD_HEAP_BYTES: usize = 2 << 20;
+
+extern "C" fn wall_loader(grants: u64) -> ! {
+    let mut seen = 0;
+    loop {
+        let r = LOAD_REQ.load(Ordering::Acquire);
+        if r == seen {
+            ferros_sys::wait(&LOAD_REQ, r, 0);
+            continue;
+        }
+        seen = r;
+        let (width, height) = unsafe { LOAD_SIZE };
+        let found = if wall_own(grants, width, height, b"wallpaper") {
+            FOUND_OWN
+        } else if wall_own(grants, width, height, b"wallpaper.made") {
+            FOUND_MADE
+        } else {
+            FOUND_NONE
+        };
+        LOAD_HEAP.reset();
+        LOAD_DONE.store(r & !0xFF | found, Ordering::Release);
+        // The render thread waits on the ring's tail between passes.
+        ferros_sys::wake(&RING_TAIL, 1);
+    }
+}
+
+/// A load wanted (`what`: `LOAD_KEPT`, or with `LOAD_SEED` falling back to the seed): started by `wall_step` as soon as no job runs. The wallpaper on the glass goes now: the load writes the buffer it is published from.
+fn wall_load(what: u64, seed: Option<[u8; 32]>) {
+    unsafe {
+        if let Some(s) = seed {
+            LOAD_SEED_BYTES = s;
+        }
+        LOAD_WANTED = what;
+        WALL_ON = false;
+    }
+    clean_reset_all();
+}
+
+/// The person's own wallpaper (`map.wallpaper` in their space: a VSF visual, one plane of VSF RGB gamma2tanh codes at 16 bits, planar [3, height, width], as tools/wallpaper and tools/screencap write one), or the one made on this device (`map.wallpaper.made`), into `WALL_BUF`; whether it did. On the loader's thread (`wall_loader`). vsf's container locates the plane over the vault (`VaultSource`); then the plane is read from its first byte to its last, a transfer at a time at the transfer's own boundaries in the value (so the vault opens each of its pieces once, four at a time), and each code becomes a working value by the display's own g2t table (`G2T16_Q14`) as it arrives: the three planes one after another, red setting each pixel opaque, green and blue joining it.
 fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> bool {
     let c = cap(grants, S_MAP_SCOPE);
     let Some(len) = ferros_sys::store_get(c, key, &mut []) else { return false };
@@ -3741,44 +3845,87 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
         }
     };
     let span = doc.entries().iter().find(|e| e.name.starts_with("plane.")).and_then(|e| doc.packed(e, "samples").ok().flatten());
-    let Some(span) = span.filter(|s| s.bit_depth == 16 && s.shape[..] == [3, height, width]) else {
+    let n = width * height;
+    // The plane's bytes: two a sample, big-endian (vsf's bit packing), three planes of the screen. WHY the length too: the document is the vault's, and with exactly 6 × n bytes every sample lands in one of the three planes, inside `WALL_BUF`.
+    let Some(span) = span.filter(|s| s.bit_depth == 16 && s.shape[..] == [3, height, width] && s.data_len == (6 * n) as u64) else {
         l.s(b"display: the person's own wallpaper is not one 16-bit plane of this screen's size; theirs from the seed shows\n");
         l.flush();
         return false;
     };
-    let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, width * height) };
+    let t_open = ferros_sys::us_since(t0);
+    let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, n) };
     let table = unsafe { core::slice::from_raw_parts(G2T16_Q14, 1 << 16) };
-    // Each channel's read (its bytes and its samples) is dropped before the next: the heap comes back to here after each, or 24 MB of reads would pass through the 32 MiB bump.
-    let keep = ALLOC.now();
-    let mut y0 = 0;
-    while y0 < height {
-        // The last band stops at the screen's bottom.
-        let y1 = (y0 + WALL_ROWS).min(height);
-        let band = &mut buf[y0 * width..y1 * width];
-        // Opaque, its channels filled one plane at a time.
-        band.fill(0xFFFF << 48);
-        for ch in 0..3 {
-            let Ok(s) = doc.packed_range_u16(&span, ch * height * width + y0 * width, (y1 - y0) * width) else {
-                l.s(b"display: the person's own wallpaper could not be read whole; theirs from the seed shows\n");
-                l.flush();
-                return false;
-            };
-            for (p, &code) in band.iter_mut().zip(&s) {
-                *p |= (table[code as usize] as u64) << (16 * ch);
-            }
-            drop(s);
-            ALLOC.back_to(keep);
+    let transfer = ferros_sys::STORE_MAX;
+    let mut chunk = alloc::vec![0u8; transfer];
+    let (first, end) = (span.data_offset, span.data_offset + span.data_len);
+    // The sample being filled (all three planes in a row), and a byte carried over a transfer's edge (a plane starting at an odd offset of the value).
+    let (mut s, mut carry): (usize, Option<u8>) = (0, None);
+    let mut at = first;
+    let (mut t_read, mut t_conv) = (0u64, 0u64);
+    while at < end {
+        // To the next transfer boundary of the value, or the plane's end.
+        let to = ((at / transfer as u64 + 1) * transfer as u64).min(end);
+        let bytes = &mut chunk[..(to - at) as usize];
+        let t = now();
+        if !vault_read(c, key, at, bytes) {
+            l.s(b"display: the person's own wallpaper could not be read whole; theirs from the seed shows\n");
+            l.flush();
+            return false;
         }
-        y0 = y1;
+        t_read += now() - t;
+        let t = now();
+        let mut i = 0;
+        if let Some(hi) = carry.take() {
+            wall_sample(buf, table, n, s, u16::from_be_bytes([hi, bytes[0]]));
+            s += 1;
+            i = 1;
+        }
+        // The pairs whole in this transfer, run by run within one plane.
+        while i + 1 < bytes.len() {
+            let (plane, p0) = (s / n, s % n);
+            let run = ((bytes.len() - i) >> 1).min(n - p0);
+            let codes = bytes[i..i + 2 * run].chunks_exact(2).map(|b| table[u16::from_be_bytes([b[0], b[1]]) as usize] as u64);
+            let px = &mut buf[p0..p0 + run];
+            match plane {
+                0 => px.iter_mut().zip(codes).for_each(|(p, v)| *p = 0xFFFF << 48 | v),
+                _ => px.iter_mut().zip(codes).for_each(|(p, v)| *p |= v << (16 * plane)),
+            }
+            s += run;
+            i += 2 * run;
+        }
+        if i < bytes.len() {
+            carry = Some(bytes[i]);
+        }
+        t_conv += now() - t;
+        at = to;
     }
-    // Measuring (owner, 2026-11-08: "the unlock process took way too long"): the whole load, over the vault.
+    drop(chunk);
+    // Measuring (owner, 2026-11-08: "the unlock process took way too long"): the whole load over the vault, and where it went.
+    let ms = |t: u64| t * 1000 / freq();
+    let total = ferros_sys::us_since(t0);
     l.s(b"display: the person's ");
     l.s(key);
     l.s(b" loaded in ");
-    l.dec(ferros_sys::us_since(t0) / 1000);
+    l.dec(total / 1000);
+    l.s(b" ms (");
+    l.dec(len as u64 / total);
+    l.s(b" MB/s): opening the document ");
+    l.dec(t_open / 1000);
+    l.s(b" ms, the vault's reads ");
+    l.dec(ms(t_read));
+    l.s(b" ms, the codes to working values ");
+    l.dec(ms(t_conv));
     l.s(b" ms\n");
     l.flush();
     true
+}
+
+/// Sample `s` of the three planes (each `n` pixels) into its pixel: the first plane sets it opaque with its red, the others add theirs.
+#[inline(always)]
+fn wall_sample(buf: &mut [u64], table: &[u16], n: usize, s: usize, code: u16) {
+    let (plane, p) = (s / n, s % n);
+    let v = table[code as usize] as u64;
+    buf[p] = if plane == 0 { 0xFFFF << 48 | v } else { buf[p] | v << (16 * plane) };
 }
 
 /// Whether the helm has been drawn (it shows nothing that changes; drawn once, at the first pass).
@@ -4965,6 +5112,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut bright = ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS);
     let (white0, peak0, hbm0, dbv0) = brightness(bright);
     build_lut(lut, white0, peak0);
+    unsafe { LUT_FOR = bright };
     // The ODT's tables for this white (neon.rs `Odt`): every pixel's path.
     let mut tabs = odt_tables(white0, peak0);
     let lut_ms = ferros_sys::us_since(t_lut) / 1000;
@@ -5008,6 +5156,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         CON_STACK_LEN = (*(&raw const CON_STACK)).len();
         CON_STACK_LO = (&raw const CON_STACK) as usize;
         CON_GLYPHS = glyphs::Glyphs::with_arena(FONT, 1 << 17);
+        // The wallpaper loader's heap and stack (`wall_loader`).
+        LOAD_HEAP.init_at(alloc::vec![0u8; LOAD_HEAP_BYTES].leak().as_mut_ptr() as usize, LOAD_HEAP_BYTES);
+        LOAD_STACK_LEN = (*(&raw const LOAD_STACK)).len();
+        LOAD_STACK_LO = (&raw const LOAD_STACK) as usize;
+        LOAD_SIZE = (width, height);
     }
     // Each publishing thread's flight scratch (`flight_row_buf`), kept with the rest.
     unsafe {
@@ -5134,6 +5287,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             log.flush();
         }
     }
+    // The wallpaper's loader (`wall_loader`), idle until a load.
+    if ferros_sys::thread_spawn(wall_loader, unsafe { &mut *(&raw mut LOAD_STACK) }, grants) != 0 {
+        log.s(b"display: no wallpaper loader\n");
+        log.flush();
+    }
     for i in 0..PUB_WORKERS {
         if ferros_sys::thread_spawn(pub_worker, unsafe { &mut (*(&raw mut PUB_STACKS))[i] }, i as u64) != 0 {
             log.s(b"display: no publish worker\n");
@@ -5147,9 +5305,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     // The render thread on the big core (KERNEL.md "Cores": pinning by latency class — this is the one real compute path; receive and vsync stay on the workers, where the map and the touch server run, so a call hands off on the caller's own core). After the other threads are spawned: they inherit the mask.
     ferros_sys::pin(ferros_sys::CORES_BIG);
-    // A person already unlocked (a display restarted after attest): their wallpaper as their space keeps it, their own or the one made on this device, so a restart does not lose it until the next attest. Before attest their space is closed, nothing is read, and the attest screen hands the seed over as ever (op 42).
-    if unsafe { WALL_BUF } != 0 && (wall_own(grants, width, height, b"wallpaper") || wall_own(grants, width, height, b"wallpaper.made")) {
-        wall_ready(width, height);
+    // A person already unlocked (a display restarted after attest): their wallpaper as their space keeps it, their own or the one made on this device, so a restart does not lose it until the next attest; read by the loader while the screen is drawn. Before attest their space is closed, nothing is read, and the attest screen hands the seed over as ever (op 42).
+    if unsafe { WALL_BUF } != 0 {
+        wall_load(LOAD_KEPT, None);
     }
     // What the ring's tail was when this pass last looked: the wait at the end of a pass returns as soon as it moves.
     let mut seen_tail = 0u64;
@@ -5932,6 +6090,13 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     unsafe { CLIENT_DREW = true };
                     // `[column u8]`: that column alone (0-8); absent or past 8: all of them.
                     let only = m.get(1).map(|&c| c as usize).filter(|&c| c < 9);
+                    // The ramps' table, for the brightness as it is now (built only here: nothing else reads it).
+                    let b = ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS);
+                    if unsafe { LUT_FOR } != b {
+                        let (white, peak_e, _, _) = brightness(b);
+                        build_lut(lut, white, peak_e);
+                        unsafe { LUT_FOR = b };
+                    }
                     if ten {
                         if unsafe { TEMPORAL } {
                             let (a, b, c, d) = (phase_slice(0, width * height), phase_slice(1, width * height), phase_slice(2, width * height), phase_slice(3, width * height));
@@ -6140,27 +6305,15 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     } else {
                         let mut seed = [0u8; 32];
                         seed.copy_from_slice(&m[1..33]);
-                        unsafe { WALL_ON = false };
-                        clean_reset_all();
-                        if wall_own(grants, width, height, b"wallpaper") {
-                            console(grants, b"display: wallpaper: the person's own\n");
-                            wall_ready(width, height);
-                        } else if wall_own(grants, width, height, b"wallpaper.made") {
-                            // Made once on this device from their seed and kept (payloads/wallgen; owner, 2026-11-07: not drawn again at every attest).
-                            console(grants, b"display: wallpaper: the person's, kept on this device\n");
-                            wall_ready(width, height);
-                        } else {
-                            // Not made on this device yet: drawn here meanwhile, while wallgen makes and keeps it (it says when, op 44).
-                            console(grants, b"display: wallpaper: made from the person's seed\n");
-                            unsafe { WALL_PENDING = Some(seed) };
-                        }
+                        // Read by the loader (`wall_loader`) and answered now: their own, else the one made on this device from their seed and kept (payloads/wallgen; owner, 2026-11-07: not drawn again at every attest), else drawn here from the seed meanwhile, while wallgen makes and keeps it (it says when, op 44). The home screen does not wait for it (owner, 2026-11-08).
+                        wall_load(LOAD_KEPT | LOAD_SEED, Some(seed));
                     }
                 }
                 // 44 `wallpaper kept`: wallgen has made the person's wallpaper and kept it on this device (`map.wallpaper.made`): shown from there, unless their own is set, or this display is still drawing the same picture itself (its threads write the buffer; it finishes with what wallgen made).
+                // Read by the loader, and only when no wallpaper is up: one this display drew from the same seed is the same picture, and loading it again would take it off the glass while it is read.
                 Some(44) => {
-                    if unsafe { WALL_BUF != 0 && !WALL_RUNNING } && !wall_own(grants, width, height, b"wallpaper") && wall_own(grants, width, height, b"wallpaper.made") {
-                        console(grants, b"display: wallpaper: the person's, kept on this device\n");
-                        wall_ready(width, height);
+                    if unsafe { WALL_BUF != 0 && !WALL_RUNNING && !WALL_ON && !LOADING } {
+                        wall_load(LOAD_KEPT, None);
                     }
                 }
                 Some(30) => {
@@ -6751,7 +6904,6 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         if b != bright && ten {
             bright = b;
             let (white, peak_e, hbm, dbv) = brightness(b);
-            build_lut(lut, white, peak_e);
             tabs = odt_tables(white, peak_e);
             // The panel's own setting, by the panel thread.
             PANEL_BRIGHT.store((hbm as u64) << 16 | dbv as u64, Ordering::Release);

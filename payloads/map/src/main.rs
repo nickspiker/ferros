@@ -2530,7 +2530,8 @@ impl Map {
             Choice::Brightness => {
                 // Continuous (owner, 2026-11-08): 32nds of a stop, the knob's place across the track's 255 of them.
                 let v = 255 - libm::round(t * 255.) as u8;
-                if v != ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS) {
+                // Applied live, kept at the lift (`brightness_kept`; owner, 2026-11-08: written into the vault at every 32nd of a stop, a commit under the kernel lock each, the settings ran at 20 fps). A kernel from before refuses the live call: then kept at once, as before.
+                if v != ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS) && ferros_sys::set_pref_live(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BRIGHTNESS, v) == ferros_sys::ERR {
                     ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BRIGHTNESS, v);
                 }
             }
@@ -2541,6 +2542,9 @@ impl Map {
     /// The finger left a slider: its knob goes from where the finger left it to its value's place on the spring, stepped in display frames.
     fn slide_done(&mut self) {
         let Some((what, t)) = self.slide.take() else { return };
+        if what == Choice::Brightness {
+            self.brightness_kept();
+        }
         let rest = match what {
             // The scale is kept rounded to its 64ths (the lift writes it).
             Choice::Scale => (libm::round(t * 128. - 64.) + 64.) / 128.,
@@ -2549,6 +2553,10 @@ impl Map {
         let (a, b) = self.track(self.w / 2);
         let off = (t - rest) * (b - a) as f64;
         self.knob = if off.abs() >= 0.5 { Some((what, off, 0., 0)) } else { None };
+    }
+    /// The brightness as the slider left it, kept in the vault (the drag applied it live, `set_pref_live`).
+    fn brightness_kept(&self) {
+        ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BRIGHTNESS, ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS));
     }
     /// The settings' row under a panel point, as the last frame laid them out.
     fn row_at(&self, sx: i64, sy: i64) -> Option<Choice> {
@@ -2790,6 +2798,9 @@ impl Map {
                     Some(c @ (Choice::Brightness | Choice::Scale)) => {
                         self.slide_to(c, sx);
                         self.slide = None;
+                        if c == Choice::Brightness {
+                            self.brightness_kept();
+                        }
                         if let Some(s) = self.scale_live.take() {
                             set(self, ferros_sys::PREF_SCALE, libm::roundf(s) as i8 as u8);
                         }
