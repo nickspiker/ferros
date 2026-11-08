@@ -933,6 +933,8 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
         crate::flashlog::line(&alloc::format!("restart {nm}: killing"));
         platform::crumb(0x51);
         let killed = crate::process::kill(name);
+        // What it left switched on goes off before its successor starts, so the new process finds it off rather than switched off under it.
+        crate::process::power_offs_apply();
         crate::flashlog::line(&alloc::format!("restart {nm}: {} ; reading the capsule", if killed { "killed" } else { "was not running" }));
         platform::crumb(0x52);
         // The vault restarts from the stored capsule (the development loop pushes one), else from the one the kernel image carries.
@@ -1634,6 +1636,8 @@ pub fn run(mut b: Boot) -> ! {
     platform::mark(0x3A);
     loop {
         platform::pet_watchdogs();
+        // The power switches a process left on when it ended (one shot dead, no cleanup of its own): turned off here, on the kernel's core.
+        crate::process::power_offs_apply();
         // A person unlocked: wallgen, once (`spawn_wallgen`).
         if let Some(seed) = unsafe { (*(&raw mut WALLGEN_SEED)).take() } {
             spawn_wallgen(&mut store, &seed);

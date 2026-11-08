@@ -77,7 +77,6 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let block: &[u64] = unsafe { &(*(&raw const BLOCK)).0 };
     if !ferros_sys::sensors_publish(cap(grants, S_SENSORS), block) {
         say("sensors: the kernel refused the block\n");
-        ferros_sys::power(cap(grants, S_POWER), false);
         ferros_sys::exit(1);
     }
     let f = freq();
@@ -96,8 +95,8 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     say(&out);
     out.clear();
     if !ok {
+        // One shot (owner, 2026-11-08): the switch it turned on goes off with it, the kernel's doing.
         say("sensors: USF did not open; this process ends, init's keeper starts another\n");
-        ferros_sys::power(cap(grants, S_POWER), false);
         ferros_sys::exit(2);
     }
     // The sensors appear once the AoC has probed its buses with the registry.

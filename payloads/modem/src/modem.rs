@@ -2968,12 +2968,8 @@ pub fn rmnet_call(req: &[u8]) -> Vec<u8> {
             state(&mut r);
             r
         }
-        Some(5) => {
-            let mut r = Vec::new();
-            down(&mut r);
-            crate::hw::say(&r);
-            ferros_sys::exit(0)
-        }
+        // DOWN: one shot (owner, 2026-11-08): this process ends with no teardown of its own; the CP stays as it was (the modem has no kernel power switch yet; the `off` mode powers it down on purpose).
+        Some(5) => ferros_sys::exit(0),
         Some(7) => {
             RESTART.store(true, core::sync::atomic::Ordering::Relaxed);
             alloc::vec![0]

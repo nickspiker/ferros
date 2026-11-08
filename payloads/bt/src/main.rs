@@ -455,8 +455,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 sleep_ms(4096);
             }
             Err(e) => {
+                // One shot: the kernel switches the chip off as this process ends (it switched it on).
                 say!(grants, "bt: bring-up failed: {e}\n");
-                ferros_sys::power(cap(grants, S_POWER), false);
                 ferros_sys::exit(1);
             }
         }

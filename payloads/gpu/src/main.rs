@@ -968,17 +968,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         while now() < end {
             ferros_sys::sleep_until(now() + g.f);
         }
-        window::done(display, surf as u64);
     }
-    // Left quiet until a resident service keeps it: a soft reset stops the MCU and its jobs and powers the L2 down (the shader cores are the MCU's, off with it), so an ended driver leaves nothing running.
-    g.wr(GPU_IRQ_MASK, RESET_COMPLETED);
-    g.wr(GPU_COMMAND, 0x101);
-    let quiet = g.wait(500, |g| g.rd(GPU_IRQ_RAWSTAT) & RESET_COMPLETED != 0);
-    g.wr(GPU_IRQ_CLEAR, IRQ_ALL);
-    g.wr(GPU_IRQ_MASK, 0);
-    g.wr(JOB_IRQ_MASK, 0);
-    g.wr(MMU_IRQ_MASK, 0);
-    say!(grants, "gpu: left quiet: reset {}, MCU_STATUS G#{:X}, L2_READY G#{:X}, SHADER_READY G#{:X}\n", if quiet { "done" } else { "never completed" }, g.rd(MCU_STATUS), g.rd64(L2_READY), g.rd64(0x140));
+    // One shot (owner, 2026-11-08): no reset and no window closed on the way out; the display drops a dead process's window, and the GPU is left as the demo left it until the next driver resets it at its start.
     exit(if ok { 0 } else { 1 });
 }
 

@@ -49,6 +49,7 @@ members = [
     "payloads/hive",
     "payloads/ahau",
     "payloads/epcall",
+    "payloads/buftrap",
     "payloads/keytest",
     "honeycomb",
     "wallpaper",

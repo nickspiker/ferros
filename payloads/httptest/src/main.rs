@@ -65,12 +65,8 @@ impl App {
     fn udp(&self, req: &[u8], out: &mut [u8]) -> u64 {
         svc(CALL, self.grants + 0x204 + 32, self.off(req.as_ptr()), req.len() as u64, self.off(out.as_mut_ptr()), out.len() as u64)
     }
-    /// The line, then exit; a `!` run gives ip its default link mode back first.
+    /// The line, then exit, one shot (owner, 2026-11-08): a `!` run leaves ip's link mode as it set it (ip's own to put back).
     fn done(&mut self, msg: &[u8]) -> ! {
-        if CELL_ONLY.load(core::sync::atomic::Ordering::Relaxed) {
-            let mut r = [0u8; 16];
-            let _ = self.udp(&[9, 0], &mut r);
-        }
         self.put(msg);
         self.put(b"\n");
         self.flush();

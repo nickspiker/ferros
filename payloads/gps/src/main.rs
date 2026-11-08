@@ -2,14 +2,14 @@
 //!
 //! The kernel keeps only what a process cannot do: the chip's three rails (ACPM), the SPI port's clocks and USI mode, and the lines' pin modes, behind the `gps` power capability (`SYS_POWER`, kernel gps.rs `power`). Everything else is here, through MMIO grants: the port's registers, and the data bits of the four lines (HOST_REQ gpa5-3, MCU_REQ gpp4-3, MCU_RESP gph3-2, nSTANDBY gph3-3).
 //!
-//! The session: the vault's `gps.replay` (or `gps.replay.sky`, the same without the LTO orbits) is gpsd's on-chip session cut from a capture — the patch download, the second firmware stage, the configuration, the aiding — played record by record, each reliable packet waiting for the chip's ack. Before it goes out, the aiding is ferros's own: the time from the RTC, the position from the last fix (`gps.last`). Then the chip navigates alone and sends a fix a second; the latest is kept, and written back to `gps.last` with the first fix and every 64 s.
+//! The session: the vault's `gps.replay` (or `gps.replay.sky`, the same without the LTO orbits) is gpsd's on-chip session cut from a capture — the patch download, the second firmware stage, the configuration, the aiding — played record by record, each reliable packet waiting for the chip's ack. Before it goes out, the aiding is ferros's own: the time from the RTC, the position from the last fix (`gps.last`). Then the chip navigates alone and sends a fix a second; the latest is kept, and written back to `gps.last` whenever it moves (every change hits disk; nothing is written on the way out).
 //!
 //! Spawn: ferros-bridge spawn gps.bin <flags> --name gps --serve gps --hw usi3-spi --hw gpio-far-alive --hw gpio-gpp0 --hw gpio-hsi2 --store gps --power gps --irq gps-host-req
 //! Grant slots, in that order: 0 console, 1 the `gps` endpoint (serve), 2 the SPI port, 3 gpio-far-alive, 4 gpio-gpp0 (PERIC0), 5 gpio-hsi2, 6 the vault scope `gps.`, 7 the power switch, 8 HOST_REQ's interrupt. Input byte 0: bit 0 = the sky replay.
 //!
 //! The `gps` endpoint, first byte the op:
 //! - `0` FIX: `valid u8`, `fixes u32`, `age ms u32` (since the latest), `lat i32`, `lon i32` (2⁻²³ degrees), `alt i32` (m), `err u32` (m), `speed i32`, `track i32` (1/64 m/s, 1/64 °) — little-endian, 33 bytes.
-//! - `1` STOP: the chip powered down, the last fix kept; the process exits after replying.
+//! - `1` STOP: the process exits after replying; the kernel powers the chip down as it ends (the last fix is kept whenever it changes).
 //! - `2` SATS: the signals the chip tracked at the latest fix message (sky.rs, GPS.md "The satellites"): `n u8`, `msgs u32` (fix messages decoded so far), `age ms u32` (since the latest), then `n` records of 25 bytes — `system u8` (the chip's code: 0 GPS, 8 GLONASS), `band u8` (0 L1 or GLONASS G1, 2 L5), `prn u8` (GLONASS: the orbital slot), `flags u8` (bit 0 used in the fix, bit 1 the chip's unnamed flag), `el i8`, `az u16` (degrees), `d_el i16`, `d_az i16` (degrees since the previous fix that had the signal, the azimuth the short way round north), `cn0 u16` (quarter dB-Hz), `d_ms u32` (the chip's ms between the two fixes, 0 for a signal new in this one), `el_rate i32`, `az_rate i32` (millidegrees a second between the first and the latest one-degree step seen, `i32::MIN` until there are two) — little-endian, at most 64 records.
 //!
 //! Measures (ferros_sys::status, the corners' GPS circle): slot 0 the state, 1 the error estimate, 2 the satellites tracked, 3 those used in the fix, 4 the best C/N0.
@@ -666,7 +666,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let mut msg = [0u8; 16];
     let mut token = [0u8; 32];
     let mut shown = 0u32;
-    let mut kept_at = 0u64;
+    // The last fix as kept in the vault (`keep_last`), kept again only when it moves.
+    let mut kept = (0i32, 0i32);
     // (HOST_REQ seen, MCU_RESP not answering, bytes read), and when they were last reported.
     let (mut asks, mut silent, mut bytes, mut said) = (0u32, 0u32, 0usize, now());
     // The corners' GPS circle (ferros_sys::measure): on and searching, then holding a fix with its error estimate; published when either changes.
@@ -708,8 +709,6 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             if shown == 0 {
                 // Coarse on the console on purpose: the precise fix is for the endpoint, not the log.
                 say!(grants, "gps: first fix {} ms after power-up, ±{} m (lat {}.{} lon {}.{})\n", d.fix_at.wrapping_sub(t_all) * 1000 / f, d.fix.err, d.fix.lat >> 23, ((d.fix.lat.unsigned_abs() & 0x7F_FFFF) * 10) >> 23, d.fix.lon >> 23, ((d.fix.lon.unsigned_abs() & 0x7F_FFFF) * 10) >> 23);
-                keep_last(grants, &d);
-                kept_at = now();
             }
             shown = d.fixes;
         }
@@ -724,6 +723,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         if d.fixes != published_fix {
             use ferros_sys::{measure as k, measure_word as w, status, MEASURE_NONE};
             published_fix = d.fixes;
+            // The last fix kept as it changes (every change hits disk; owner, 2026-11-08: nothing is kept on the way out, an end is one shot dead).
+            if d.fixes > 0 && (d.fix.lat, d.fix.lon) != kept {
+                keep_last(grants, &d);
+                kept = (d.fix.lat, d.fix.lon);
+            }
             let fx = d.fix;
             status(5, if d.fixes > 0 { w(k::ALTITUDE, fx.alt as i64 * 1000) } else { MEASURE_NONE });
             status(6, if d.fixes > 0 { w(k::SPEED, fx.speed as i64 * 1000 >> 6) } else { MEASURE_NONE });
@@ -762,10 +766,6 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             tracks_filled = n;
             published_sky = d.sky.msgs + d.sky.bad;
         }
-        if d.fixes > 0 && now().wrapping_sub(kept_at) > 64 * f {
-            keep_last(grants, &d);
-            kept_at = now();
-        }
         let n = recv(cap(grants, S_GPS), &mut msg, &mut token, true);
         if n != NOTHING && n != ferros_sys::ERR && n > 0 {
             match msg[0] {
@@ -779,11 +779,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     }
                     reply(&token, &r);
                 }
+                // STOP: one shot (owner, 2026-11-08): the reply, then gone; the kernel powers the chip down as this process ends (it switched it on), and the last fix was kept when it came.
                 1 => {
-                    keep_last(grants, &d);
-                    chip.set(NSTANDBY, false);
-                    let ok = ferros_sys::power(cap(grants, S_POWER), false);
-                    reply(&token, &[ok as u8]);
+                    reply(&token, &[1]);
                     say!(grants, "gps: stopped after {} fixes\n", d.fixes);
                     ferros_sys::exit(0);
                 }

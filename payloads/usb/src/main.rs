@@ -65,10 +65,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     if let Some(&m @ (b'h' | b'k')) = input.first() {
         let on = ferros_sys::power(cap(grants, S_POWER), true);
         say!(grants, "usb: controller taken: {on}\n");
+        // `h`: held two seconds, then this process ends; the kernel switches the controller off as it does (one shot, no switch-off of its own).
         if m == b'h' {
             ferros_sys::sleep_until(ferros_sys::now() + 2 * ferros_sys::freq());
-            let off = ferros_sys::power(cap(grants, S_POWER), false);
-            say!(grants, "usb: controller given back: {off}\n");
         }
         ferros_sys::exit(0);
     }
@@ -469,10 +468,9 @@ fn serve(grants: u64) -> ! {
     }
 }
 
-/// Give up: the reason on the console and this process gone. init's keeper starts the driver again (payloads/init), its `power usb on` readying the link afresh; the kernel has no USB of its own to fall back to since 2026-11-01.
-fn give_up(grants: u64, power: u64, why: &str) -> ! {
+/// Give up: the reason on the console and this process gone, one shot (owner, 2026-11-08): the kernel switches the controller off as this process ends (it switched it on), and init's keeper starts the driver again (payloads/init), its `power usb on` readying the link afresh; the kernel has no USB of its own to fall back to since 2026-11-01.
+fn give_up(grants: u64, _power: u64, why: &str) -> ! {
     say!(grants, "usb: {why}; this driver ends, init's keeper starts another\n");
-    ferros_sys::power(power, false);
     ferros_sys::exit(2)
 }
 

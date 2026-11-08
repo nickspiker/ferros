@@ -472,6 +472,8 @@ struct Process {
     paused: u64,
     /// Its own vault domain's name (`Object::Domain`): a one-way derivation of its ihi, so the kernel keeps no copy of the ihi itself; None for a process spawned without one.
     domain: Option<[u8; 32]>,
+    /// Launched as a kist (`spawn_kist`): its ira-derived keys are its own (`SYS_IRA`), never a system service's.
+    kist: bool,
 }
 
 struct Endpoint {
@@ -657,9 +659,38 @@ fn thread_name(t: usize) -> Vec<u8> {
 }
 
 impl Process {
+    /// Where `len` bytes a syscall names at arc offset `off` lie (owner, 2026-11-08: a syscall buffer resolves or traps): in the arc, used as they are; else inside one of this process's own DMA regions (a heap or a surface outside the arc, named by the pointer the process holds, which `ferros_sys::off` turns into an offset past the arc), used directly, which gives it nothing it did not hold. None anywhere else: the caller traps (`BUF_FAULT`), where until then the offset was masked into the arc and the bytes landed in the process's own memory elsewhere (the display's wallpaper reads, 2026-11-08).
+    fn span(&self, off: u64, len: usize) -> Option<usize> {
+        let size = self.arc.size as u64;
+        // WHY: the offset and length are the process's; the subtraction is taken only once the offset is inside the arc, so it cannot wrap.
+        if off < size && len as u64 <= size - off {
+            return Some(self.arc.base + off as usize);
+        }
+        self.dma_span((self.arc.base as u64).wrapping_add(off) & !DMA_ADDR, len)
+    }
+    /// A buffer the kernel will touch later (a receive buffer, a reply buffer): resolved now, at the syscall that names it, so a bad one traps there and not inside another process's call.
+    fn check(&self, off: u64, len: usize) {
+        if len != 0 && self.span(off, len).is_none() {
+            self.bad_buf(off, len, true);
+        }
+    }
+    /// The buffer could not be resolved: kept for the trap at the syscall's end (the first such buffer of the syscall).
+    fn bad_buf(&self, off: u64, len: usize, write: bool) {
+        let b = unsafe { &mut *(&raw mut BUF_FAULT) };
+        if b.is_none() {
+            *b = Some(BufFault { epoch: self.epoch, off, len, write });
+        }
+    }
     fn read(&self, off: u64, len: usize) -> Vec<u8> {
-        let m = self.arc.mask();
-        (0..len).map(|i| unsafe { core::ptr::read_volatile((self.arc.base + ((off as usize + i) & m)) as *const u8) }).collect()
+        if len == 0 {
+            return Vec::new();
+        }
+        let mut v = alloc::vec![0u8; len];
+        match self.span(off, len) {
+            Some(a) => unsafe { core::ptr::copy_nonoverlapping(a as *const u8, v.as_mut_ptr(), len) },
+            None => self.bad_buf(off, len, false),
+        }
+        v
     }
     /// A buffer a syscall names by address inside a DMA region this process holds (`DMA_ADDR | address`, as the USB driver names its 6 MiB command area): the address, when all `len` bytes lie inside one such region.
     fn dma_span(&self, addr: u64, len: usize) -> Option<usize> {
@@ -671,32 +702,40 @@ impl Process {
             _ => None,
         })
     }
-    /// `read` into a slice the caller owns: no heap copy, for a command of megabytes (SYS_PT). One copy when the range does not wrap the arc's mask, as a well-formed caller's never does.
+    /// `read` into a slice the caller owns: no heap copy, for a command of megabytes (SYS_PT).
     fn read_into(&self, off: u64, dst: &mut [u8]) {
-        let m = self.arc.mask();
-        let start = off as usize & m;
-        if start + dst.len() <= m + 1 {
-            unsafe { core::ptr::copy_nonoverlapping((self.arc.base + start) as *const u8, dst.as_mut_ptr(), dst.len()) };
-        } else {
-            for (i, b) in dst.iter_mut().enumerate() {
-                *b = unsafe { core::ptr::read_volatile((self.arc.base + ((off as usize + i) & m)) as *const u8) };
+        if dst.is_empty() {
+            return;
+        }
+        match self.span(off, dst.len()) {
+            Some(a) => unsafe { core::ptr::copy_nonoverlapping(a as *const u8, dst.as_mut_ptr(), dst.len()) },
+            None => {
+                dst.fill(0);
+                self.bad_buf(off, dst.len(), false);
             }
         }
     }
     fn write(&self, off: u64, bytes: &[u8]) {
-        let m = self.arc.mask();
-        for (i, &b) in bytes.iter().enumerate() {
-            unsafe { core::ptr::write_volatile((self.arc.base + ((off as usize + i) & m)) as *mut u8, b) };
+        if bytes.is_empty() {
+            return;
+        }
+        match self.span(off, bytes.len()) {
+            Some(a) => {
+                for (i, &b) in bytes.iter().enumerate() {
+                    unsafe { core::ptr::write_volatile((a + i) as *mut u8, b) };
+                }
+            }
+            None => self.bad_buf(off, bytes.len(), true),
         }
     }
-    /// `write` in one copy when the range does not wrap the arc's mask, as a well-formed caller's never does: a block read hands back 4 KiB at a time (SYS_BLOCK).
+    /// `write` in one copy: a block read hands back 4 KiB at a time (SYS_BLOCK).
     fn write_from(&self, off: u64, src: &[u8]) {
-        let m = self.arc.mask();
-        let start = off as usize & m;
-        if start + src.len() <= m + 1 {
-            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), (self.arc.base + start) as *mut u8, src.len()) };
-        } else {
-            self.write(off, src);
+        if src.is_empty() {
+            return;
+        }
+        match self.span(off, src.len()) {
+            Some(a) => unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), a as *mut u8, src.len()) },
+            None => self.bad_buf(off, src.len(), true),
         }
     }
     /// Find the capability for a presented token: compare against every entry without an early exit, so the time taken says nothing about which (if any) matched. Returns the entry index.
@@ -1175,6 +1214,8 @@ pub static STORES: &[StoreScope] = &[
 ];
 /// The context deriving a process's own domain name (`Process::domain`) from its ihi.
 const KIST_DOMAIN_CONTEXT: &str = "ferros 2026-11-08 kist domain";
+/// The context binding a kist's ira-derived key to its gate identity (`SYS_IRA`).
+const KIST_IRA_CONTEXT: &str = "ferros 2026-11-08 kist ira";
 /// The scope prefix every kist domain's keys are derived under, followed by the domain's name (`domain_keys`): no `STORES` prefix can collide with it (none holds a zero byte).
 const KIST_DOMAIN_PREFIX: &[u8] = b"kist\0";
 /// The vault behind `SYS_STORE`, registered by whoever owns it (service.rs): (full key, None = get / Some(value) = set) -> Ok(the value for a get, None if absent) or Err.
@@ -1258,6 +1299,7 @@ fn call_endpoint(f: &mut Frame, cur: usize, ep: usize, msg: Vec<u8>, roff: u64, 
         f.x[0] = ERR;
         return 0;
     };
+    p.check(roff, (rcap & !(CALL_LIVE | STORE_REPLY)) as usize);
     // Blocked on another process: the watchdog's clock paused for the thread that pets (that process answers for its own hang).
     if cur == p.pet_thread {
         p.paused_at = crate::platform::cntpct();
@@ -1686,6 +1728,142 @@ pub struct PowerSwitch {
     pub set: fn(bool) -> bool,
 }
 pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gps", set: crate::gps::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }];
+/// A syscall buffer that resolved nowhere (`Process::span`): whose (the process's epoch), the offset as given, its length, and whether the kernel was to write it. The syscall that touched it traps at its end (`buf_trap`). Under the kernel lock: one syscall at a time.
+#[derive(Clone, Copy)]
+struct BufFault {
+    epoch: u64,
+    off: u64,
+    len: usize,
+    write: bool,
+}
+static mut BUF_FAULT: Option<BufFault> = None;
+/// The exit value of a process killed for a syscall buffer (production): FAULT with the exception class G#3F, which no hardware fault uses, and the syscall's number.
+const BAD_BUFFER: u64 = FAULT | 0x3F << 40;
+
+/// Where an absolute address lies, in words, against the caller's arc and every DMA region: inside one (held or not), or how far before or past the nearest.
+fn nearest_region(p: &Process, addr: usize) -> alloc::string::String {
+    let mut best: Option<(usize, alloc::string::String)> = None;
+    let mut consider = |start: usize, size: usize, name: &str, held: bool| {
+        let (d, s) = if addr >= start && addr < start + size {
+            (0, alloc::format!("inside {name}{}", if held { "" } else { " (not held)" }))
+        } else if addr >= start + size {
+            (addr - (start + size), alloc::format!("G#{:X} bytes past {name}", addr - (start + size)))
+        } else {
+            (start - addr, alloc::format!("G#{:X} bytes before {name}", start - addr))
+        };
+        if best.as_ref().is_none_or(|b| d < b.0) {
+            best = Some((d, s));
+        }
+    };
+    consider(p.arc.base, p.arc.size, "its arc", true);
+    for (i, r) in DMA.iter().enumerate() {
+        if r.size > 0 {
+            consider(r.base, r.size, r.name, p.cspace.iter().any(|c| c.object == Object::Dma(i)));
+        }
+    }
+    best.map(|b| b.1).unwrap_or_default()
+}
+
+/// A syscall named a buffer that resolved nowhere (owner, 2026-11-08: "run it in debug/trap mode"): the report (process and thread, syscall and op, the offset, address and length, the nearest region, PC and LR at the svc) to the console and the flash log; then a development build parks the calling thread for good with its memory intact (to read over the bridge; `diag kill` ends it), and a production build ends the process, one shot. Returns the trap's value as the dispatch does.
+#[allow(clippy::too_many_arguments)]
+fn buf_trap(f: &mut Frame, cur: usize, pi: usize, r: u64, b: BufFault, nr: u64, op: u64, pc: u64, lr: u64) -> u64 {
+    let kk = k();
+    let Some(p) = kk.procs.get(pi).and_then(|q| q.as_ref()) else { return r };
+    let base = p.arc.base as u64;
+    let line = alloc::format!(
+        "{}: TRAP syscall {} op G#{:X}: a buffer it {} that is neither in its arc nor in a region it holds: offset G#{:X} (address G#{:X}) length A#{}, {}; pc +G#{:X} lr +G#{:X} (thread {}){}\n",
+        core::str::from_utf8(&thread_name(cur)).unwrap_or("?"),
+        nr,
+        op,
+        if b.write { "was to be written into" } else { "named to be read" },
+        b.off,
+        base.wrapping_add(b.off),
+        b.len,
+        nearest_region(p, base.wrapping_add(b.off) as usize),
+        pc.wrapping_sub(base),
+        lr.wrapping_sub(base),
+        cur,
+        if cfg!(ferros_production) { "; killed" } else { "; parked, memory intact (diag kill ends it)" },
+    );
+    kk.console.extend_from_slice(line.as_bytes());
+    crate::platform::pstore(line.as_bytes());
+    crate::flashlog::line(line.trim_end());
+    let still_current = cur_get() == Some(cur);
+    if cfg!(ferros_production) {
+        end_process(pi, cur, BAD_BUFFER | (nr & 0xFF) << 16);
+        if still_current {
+            return if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 };
+        }
+        return r;
+    }
+    // Parked for good: out of every queue, asleep with no deadline, nothing to wake it.
+    kk.runnable.retain(|&q| q != cur);
+    runnable_sync();
+    for ep in kk.endpoints.iter_mut() {
+        ep.queue.retain(|(caller, _)| *caller != cur);
+        if ep.poller == Some(cur) {
+            ep.poller = None;
+        }
+    }
+    if let Some(t) = th(cur) {
+        if still_current {
+            t.frame = *f;
+        }
+        t.state = State::Sleeping(u64::MAX);
+    }
+    if still_current {
+        return if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 };
+    }
+    r
+}
+
+/// Who switched each power switch on (a process's epoch; 0 none), and the switches whose owner ended with them on, waiting for the kernel's core (`power_offs_apply`). The owner's rule (2026-11-08): a process's end is one shot dead with no cleanup of its own, and the kernel turns off what it left on. A switch switched on again by another process before that is its, and stays on. Under the kernel lock.
+static mut POWER_OWNER: [u64; 16] = [0; 16];
+static mut POWER_OFF_PENDING: u32 = 0;
+
+/// Switch `i` set by a process: on, owned by its epoch; off, owned by no one. Not the `android` switch: a launch request, not a power.
+fn power_owned(i: usize, epoch: u64) {
+    if POWERS[i].name == "android" {
+        return;
+    }
+    unsafe {
+        POWER_OWNER[i] = epoch;
+        POWER_OFF_PENDING &= !(1 << i);
+    }
+}
+
+/// A process ended (exit, fault, kill): every switch it left on is to be turned off on the kernel's core.
+fn power_orphaned(epoch: u64) {
+    unsafe {
+        for i in 0..POWERS.len() {
+            if POWER_OWNER[i] == epoch && epoch != 0 {
+                POWER_OWNER[i] = 0;
+                POWER_OFF_PENDING |= 1 << i;
+            }
+        }
+    }
+}
+
+/// The switches whose owners ended, turned off now. On the kernel's core only (every switch is set there, as `SYS_POWER` requires): the service loop each pass, and `diag restart` between its kill and its spawn, so the new process finds the switch off rather than turned off under it.
+pub fn power_offs_apply() {
+    if 1u16 << core() != kernel_mask() {
+        return;
+    }
+    for i in 0..POWERS.len() {
+        // Taken and switched under one hold of the lock: a process switching it on again meanwhile owns it, and it stays on.
+        let done = with_lock(|| unsafe {
+            if POWER_OFF_PENDING >> i & 1 == 0 {
+                return None;
+            }
+            POWER_OFF_PENDING &= !(1 << i);
+            Some((POWERS[i].set)(false))
+        });
+        if let Some(ok) = done {
+            crate::flashlog::line(&alloc::format!("power {}: off, its process ended ({})", POWERS[i].name, if ok { "done" } else { "the switch refused" }));
+        }
+    }
+}
+
 pub const ERR: u64 = u64::MAX;
 /// What a polling `recv` returns when no message is waiting.
 pub const NOTHING: u64 = u64::MAX - 1;
@@ -1812,6 +1990,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
     // Crumbs round every syscall (G#90 + number entering, G#70 + number leaving), so a watchdog reset inside one is readable from PREV_EXIT.
     let nr = f.x[8];
     crate::platform::crumb(0x90 + nr.min(SYS_LAST));
+    // What the trap report names, as the svc found them (a dispatch may switch the frame to another thread).
+    let (at_op, at_pc, at_lr, at_epoch) = (f.x[1], f.elr, f.x[30], p.epoch);
+    unsafe { *(&raw mut BUF_FAULT) = None };
     let r = match f.x[8] {
         SYS_EXIT => end(f, f.x[0]),
         SYS_THREAD_SPAWN => {
@@ -2118,7 +2299,13 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let found = p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights));
             f.x[0] = match found {
                 Some((Object::Power(i), r)) if r & RIGHT_SEND != 0 && 1u16 << core() == kernel_mask() => {
-                    if (POWERS[i].set)(f.x[1] == 1) { 0 } else { ERR }
+                    let on = f.x[1] == 1;
+                    if (POWERS[i].set)(on) {
+                        power_owned(i, if on { p.epoch } else { 0 });
+                        0
+                    } else {
+                        ERR
+                    }
                 }
                 _ => {
                     // A refusal at the door says which check (2026-11-04: the display's `panel-vddd` was refused after jumps with no word from the switch itself).
@@ -2388,11 +2575,23 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let len = f.x[2] as usize;
             f.x[0] = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                 Some((Object::Ira, r)) if r & RIGHT_SEND != 0 && (1..=64).contains(&len) => {
+                    // A kist's keys are its own (owner, 2026-11-08): derived under a context no system process's name reaches, then bound to the kist's gate identity (its domain name, one way from its ihi: the oracle over its developer key and option), so no kist can ask for a system service's key, nor another kist's. A system process's keys are derived as they always were, byte for byte.
                     let mut context = alloc::vec::Vec::with_capacity(32 + len);
-                    context.extend_from_slice(b"ferros process ira v1 ");
+                    context.extend_from_slice(if p.kist { b"ferros kist ira v1 ".as_slice() } else { b"ferros process ira v1 " });
                     context.extend_from_slice(&p.read(f.x[1], len));
                     // Derived where the ira is held (keys.rs): the ira itself never leaves the registers.
-                    match core::str::from_utf8(&context).ok().and_then(crate::ira::derive) {
+                    let key = core::str::from_utf8(&context).ok().and_then(crate::ira::derive).and_then(|k| match (p.kist, p.domain) {
+                        (false, _) => Some(k),
+                        (true, Some(d)) => {
+                            let mut h = blake3::Hasher::new_derive_key(KIST_IRA_CONTEXT);
+                            h.update(&d);
+                            h.update(&k);
+                            Some(*h.finalize().as_bytes())
+                        }
+                        // A kist without a gate identity has no key of its own to have.
+                        (true, None) => None,
+                    });
+                    match key {
                         Some(key) => {
                             p.write(f.x[3], &key);
                             32
@@ -2564,6 +2763,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
         }
         SYS_RECV => {
             let token = p.read(f.x[0], 32);
+            p.check(f.x[1], f.x[2] as usize);
+            p.check(f.x[3], 32);
             if let Some((Object::Endpoint(ep), r)) = p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                 if r & RIGHT_RECV != 0 {
                     kk.endpoints[ep].server = p.epoch;
@@ -2714,6 +2915,15 @@ fn el0_trap(f: &mut Frame) -> u64 {
             0
         }
     };
+    // A buffer of this syscall that resolved nowhere: the caller traps (`buf_trap`). One of another process's (none should be: a server's receive buffer and a caller's reply buffer are its own syscall's) was simply not touched.
+    let r = match unsafe { (*(&raw mut BUF_FAULT)).take() } {
+        Some(b) if b.epoch == at_epoch => buf_trap(f, cur, pi, r, b, nr, at_op, at_pc, at_lr),
+        Some(b) => {
+            crate::flashlog::line(&alloc::format!("syscall {nr}: a buffer of another process (epoch {}) at G#{:X} not touched", b.epoch, b.off));
+            r
+        }
+        None => r,
+    };
     // Leaving: the number, the process the trap entered from (bits 8-15), the process it returns into or FF when it leaves EL0 (bits 16-23).
     crate::platform::crumb(0x70 + nr.min(SYS_LAST) | (cur as u64) << 8 | cur_get().map(|c| c as u64).unwrap_or(0xFF) << 16);
     deadlines_sync();
@@ -2832,6 +3042,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         let name = p.name.clone();
         surfaces_free(p.epoch);
         crate::sensorlink::ended(p.epoch);
+        power_orphaned(p.epoch);
         fail_callers(&p.cspace);
         p.cspace.retain(|c| !matches!(c.object, Object::Reply(_)));
         let at = kk.console.len();
@@ -3036,6 +3247,7 @@ fn kill_locked(name: &[u8]) -> bool {
     let Some(i) = kk.procs.iter().position(|p| matches!(p, Some(p) if p.name == name)) else { return false };
     surfaces_free(kk.procs[i].as_ref().unwrap().epoch);
     crate::sensorlink::ended(kk.procs[i].as_ref().unwrap().epoch);
+    power_orphaned(kk.procs[i].as_ref().unwrap().epoch);
     {
         let p = kk.procs[i].as_mut().unwrap();
         fail_callers(&p.cspace);
@@ -3437,6 +3649,9 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize) -> Result<(), &'static
         let objects: Vec<(Object, u32)> = l.codes.iter().filter_map(|&c| kist_object(c)).collect();
         match build_from(&l.name, arc, cl, b"", &objects, Some(ihi), false, cl, false) {
             Ok((me, _, _)) => {
+                if let Some(q) = th(me).map(|t| t.proc).and_then(|pi| kk.procs.get_mut(pi)).and_then(|q| q.as_mut()) {
+                    q.kist = true;
+                }
                 enqueue_back(me);
                 Ok(())
             }
@@ -3590,7 +3805,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
         c.token = [0; 32];
     }
     let domain = ihi.map(|i| blake3::derive_key(KIST_DOMAIN_CONTEXT, &i));
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain };
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false };
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.
     p.write(TOKENS as u64, &(p.cspace.len() as u32).to_le_bytes());
