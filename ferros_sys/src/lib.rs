@@ -102,11 +102,32 @@ pub fn device_base() -> u8 {
 
 /// The bottom of the camera cutout, in panel rows: a fact of this panel, not a knob. husky's hole is centred at (672, 75) with radius 43.25 at 1344 x 2992 (Android's DisplayCutout for the physical raster), so its bottom edge is row 118.25.
 pub const CUTOUT_BOTTOM: f32 = 118.25;
+/// akita's (Pixel 8a, AK3B at 1080 x 2400): centred at (539.5, 68.71) with radius 33.72 (its device overlay's config_mainBuiltInDisplayCutout, device/google/akita), so its bottom edge is row 102.43.
+pub const CUTOUT_BOTTOM_AKITA: f32 = 102.43;
+
+/// The board fact (SYS_FACTS 84: 1 husky, 2 akita) as first read, 0 until then: it does not change while a process runs.
+static BOARD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Whether this device is akita (the Pixel 8a), for what differs from husky's panel and parts.
+pub fn akita() -> bool {
+    let mut b = BOARD.load(Ordering::Relaxed);
+    if b == 0 {
+        b = facts().0[84];
+        BOARD.store(b, Ordering::Relaxed);
+    }
+    b == 2
+}
+
+/// This panel's cutout bottom (`CUTOUT_BOTTOM`, `CUTOUT_BOTTOM_AKITA`).
+pub fn cutout_bottom() -> f32 {
+    if akita() { CUTOUT_BOTTOM_AKITA } else { CUTOUT_BOTTOM }
+}
 
 /// The circle an app lives in, on a `w` × `h` screen: centre and radius in pixels. Tangent to the bottom of the camera cutout and to the bottom of the screen, centred, so the corners outside it belong to the system (owner, 2026-11-02); the display draws its hairline, and every active app's page is inscribed in it (owner, 2026-11-05: the settings page fills it, the attest mark keeps its own smaller circle).
 pub fn active_circle(w: usize, h: usize) -> (f32, f32, f32) {
-    let r = (h as f32 - CUTOUT_BOTTOM) * 0.5;
-    (w as f32 * 0.5, CUTOUT_BOTTOM + r, r)
+    let c = cutout_bottom();
+    let r = (h as f32 - c) * 0.5;
+    (w as f32 * 0.5, c + r, r)
 }
 
 /// A number formatter in the device base, right now: `tatau::count(&mut out, ferros_sys::numbers(Style::Glyphs), n, 1)`. Glyphs where the app draws with the Oxanium +glyphs face, words elsewhere.

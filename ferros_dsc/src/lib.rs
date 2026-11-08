@@ -171,3 +171,39 @@ mod tests {
         assert!(p[88..].iter().all(|&b| b == 0));
     }
 }
+
+/// akita's AK3B: 1080×2400, two 540×48 slices per line, 8 bpc at 8 bpp (Google's `panel-google-ak3b.c` `pps_config`, kernel/devices/google/akita android-gs-akita-android16; its rc_buf_thresh are the PPS's units, × 64 here). The modeset checks its PPS against the words ABL's encoders hold before using it (payloads/display modeset.rs).
+pub const AKITA: Config = Config {
+    bits_per_component: 8,
+    line_buf_depth: 9,
+    block_pred_enable: true,
+    convert_rgb: true,
+    simple_422: false,
+    vbr_enable: false,
+    bits_per_pixel: 128,
+    pic_height: 2400,
+    pic_width: 1080,
+    slice_height: 48,
+    slice_width: 540,
+    slice_chunk_size: 540,
+    initial_xmit_delay: 512,
+    initial_dec_delay: 526,
+    initial_scale_value: 32,
+    scale_increment_interval: 1190,
+    scale_decrement_interval: 7,
+    first_line_bpg_offset: 12,
+    nfl_bpg_offset: 523,
+    slice_bpg_offset: 543,
+    initial_offset: 6144,
+    final_offset: 4336,
+    flatness_min_qp: 3,
+    flatness_max_qp: 12,
+    rc_model_size: 8192,
+    rc_edge_factor: 6,
+    rc_quant_incr_limit0: 11,
+    rc_quant_incr_limit1: 11,
+    rc_tgt_offset_high: 3,
+    rc_tgt_offset_low: 3,
+    rc_buf_thresh: [896, 1792, 2688, 3584, 4480, 5376, 6272, 6720, 7168, 7616, 7744, 7872, 8000, 8064],
+    rc_range_params: [(0, 4, 2), (0, 4, 0), (1, 5, 0), (1, 6, 62), (3, 7, 60), (3, 7, 58), (3, 7, 56), (3, 8, 56), (3, 9, 56), (3, 10, 54), (5, 11, 54), (5, 12, 52), (5, 13, 52), (7, 13, 52), (13, 15, 52)],
+};

@@ -132,6 +132,12 @@ fn frame_no() -> u32 {
 }
 /// A frame armed (`arm`, `present`): the frame-start thread masks the trigger again when it starts.
 static ONE_FRAME: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// 1 while the panel holds a frame it was sent (husky's HK3), so the trigger is masked once each armed frame starts; 0 on akita, whose AK3B as ABL leaves it shows a single frame for about 18 of 60 refreshes (docs/AK3B.md): there DECON stays triggered on every TE once armed, as the kernel's gate does, until that is understood.
+static PANEL_HOLDS: AtomicU64 = AtomicU64::new(1);
+/// TRIG_CON with the TE trigger masked, where the panel holds a frame; as it is, where it does not.
+fn trigger_masked(t: u32) -> u32 {
+    if PANEL_HOLDS.load(Ordering::Acquire) == 1 { (t & !HW_TRIG_EN) | HW_TRIG_MASK } else { t }
+}
 static mut VSYNC_STACK: [u8; 16384] = [0; 16384];
 
 /// The frame-start thread: each start of a frame at DECON clears its pending bit, counts it and wakes whoever waits for it.
@@ -163,7 +169,7 @@ extern "C" fn vsync(grants: u64) -> ! {
             // An armed frame has started: the TE trigger masked again at once, so the panel gets that one frame. Left to `settle` on the main loop's next pass (up to a sixteenth of a second later), the 120 Hz TE re-sent it meanwhile: about 7 frame starts per 10 Hz dither flip, 70 a second at rest, which held the kernel's clock policy in its active profile (it counts 24 a second as animating) and the device warm (2026-11-01).
             if ONE_FRAME.swap(false, Ordering::AcqRel) {
                 let t = ferros_sys::mmio_read(decon, TRIG_CON) as u32;
-                ferros_sys::mmio_write(decon, TRIG_CON, (t & !HW_TRIG_EN) | HW_TRIG_MASK);
+                ferros_sys::mmio_write(decon, TRIG_CON, trigger_masked(t));
             }
             FRAME_STARTS.fetch_add(1, Ordering::Release);
             ferros_sys::wake(&FRAME_STARTS, 4);
@@ -1170,7 +1176,7 @@ impl Pipe {
             frame_wait();
         }
         let t = self.rd(S_DECON, TRIG_CON);
-        self.wr(S_DECON, TRIG_CON, (t & !HW_TRIG_EN) | HW_TRIG_MASK);
+        self.wr(S_DECON, TRIG_CON, trigger_masked(t));
         let irq = self.rd(S_DMA0, RDMA_IRQ);
         self.wr(S_DMA0, RDMA_IRQ, irq & IDMA_IRQ_CLEAR);
         (moved, irq)
@@ -1206,7 +1212,7 @@ impl Pipe {
             }
         }
         let t = self.rd(S_DECON, TRIG_CON);
-        self.wr(S_DECON, TRIG_CON, (t & !HW_TRIG_EN) | HW_TRIG_MASK);
+        self.wr(S_DECON, TRIG_CON, trigger_masked(t));
         *armed = None;
     }
     /// The first enabled window on channel 0 (the base layer ABL draws on; 5 on a cold boot).
@@ -1334,7 +1340,11 @@ fn build_lut(lut: &mut [u16], white: f32, peak_e: f32) {
 }
 
 /// The panel's brightness: high brightness mode with DBV G#FFF, or normal mode at `dbv`. TE2 with it.
+/// HK3's commands: on akita's AK3B none are sent (its DBV range, WRCTRLD bits and TE2 are its own, and its B9 is the TE select HK3's TE2 writes would change; docs/AK3B.md, the brightness policy is the owner's to decide after measuring): the panel keeps ABL's brightness.
 fn set_panel(dsi: &ferros_dsi::Dsim<DsiGrant>, hbm: bool, dbv: u16) -> bool {
+    if ferros_sys::akita() {
+        return false;
+    }
     let r = dsi.dcs(&[0xF0, 0x5A, 0x5A]).and_then(|_| dsi.dcs(&[0x53, if hbm { 0xE0 } else { 0x20 }])).and_then(|_| dsi.dcs(&[0x51, (dbv >> 8) as u8, dbv as u8])).and_then(|_| dsi.dcs(&[0xF0, 0xA5, 0xA5]));
     te2(dsi);
     r.is_ok()
@@ -1342,6 +1352,9 @@ fn set_panel(dsi: &ferros_dsi::Dsim<DsiGrant>, hbm: bool, dbv: u16) -> bool {
 
 /// The panel's TE2 output, the beat the under-display light and proximity sensor (TMD3719) times its bursts to: on, changeable, rising edge G#10 and falling G#30 lines into the frame (panel-google-hk3.c `hk3_update_te2_internal`; ABL leaves it off, and without it the sensor never measured, 2026-10-24). Sent with the brightness and after every display on.
 fn te2(dsi: &ferros_dsi::Dsim<DsiGrant>) {
+    if ferros_sys::akita() {
+        return;
+    }
     let _ = dsi.dcs(&[0xF0, 0x5A, 0x5A]);
     let _ = dsi.dcs(&[0xB0, 0x00, 0x42, 0xF2]);
     let _ = dsi.dcs(&[0xF2, 0x0D]);
@@ -2845,6 +2858,11 @@ fn fold(acc: u64, t: u64, p: u64, mode: u8) -> (u64, u64) {
 
 /// The glass's own corner radius, in panel pixels: a fact of this panel to be tuned on the device (owner, 2026-11-02: "we'll fine tune the radius on this device to squeeze as much out of it"). Android reports 68 at its 1008-wide frame, 91 at the full raster.
 const GLASS_RADIUS: f32 = 80.0;
+/// akita's AK3B (1080 × 2400): Android reports 128 (its device overlay's rounded_corner_radius, device/google/akita) where it reports husky's 91; taken in husky's tuned proportion (80 of 91) until the owner tunes it on the device.
+const GLASS_RADIUS_AKITA: f32 = 112.5;
+fn glass_radius() -> f32 {
+    if ferros_sys::akita() { GLASS_RADIUS_AKITA } else { GLASS_RADIUS }
+}
 /// Whether this is a development build (the orange outside the edge).
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Outside the screen's edge: black on release; on development builds an orange (full red over the root of two, green at half: VSF RGB codes, half the light of full orange at gamma 2), so a dev image is told at a glance and the mask is still a mask. The edge's hairline is drawn in it too (`glass_front`).
@@ -2868,7 +2886,7 @@ static mut GLASS_ROWS: usize = 1;
 static mut GLASS_PX: usize = 1;
 fn plan_glass(width: usize, height: usize) {
     use fluor::paint::edge::{compute_squircle_crossings, glass_corner_params, walk_window_edges};
-    let (rs, rb, n) = glass_corner_params(GLASS_RADIUS, width as f32, height as f32);
+    let (rs, rb, n) = glass_corner_params(glass_radius(), width as f32, height as f32);
     let (ss, cs) = compute_squircle_crossings(rs, n);
     let (sb, cb) = compute_squircle_crossings(rb, n);
     // The rows the edge's corners reach, at the top and at the bottom: the big cap and the inner pixel past it. Those rows are kept whole while the walk runs, in the sprite arena (empty at init, 64 MiB; the walk's writes land in any order and a pixel can be written more than once, so the rows are compacted afterwards, not as they come); the rows between get only the straight edges' pixels, which arrive one per row per edge.
@@ -4980,6 +4998,17 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // On the X3 for the power switches and the modeset: the kernel takes SYS_POWER only from its own core, and a thread nobody pinned runs on the workers. Unpinned, this thread started on the X3 (where init spawned it), took the `dpu` and `panel` switches there, and was on a worker by the modeset's `panel-vddd`, refused without the switch ever running: the panel came up without VDDD after two jumps, ran a few frames and stopped (2026-11-04). Unpinned again before any thread is spawned: they inherit the mask.
     ferros_sys::pin(ferros_sys::CORES_BIG);
     ferros_sys::sleep_until(now() + freq() / 1000);
+    // akita's AK3B (docs/AK3B.md): the server takes ABL's lit pipe — its 8 bpc link at 60 Hz, ABL's raster, PPS and brightness — and sends the panel nothing of HK3's (no idle floor or TE mode, no brightness or TE2). The modeset takes DECON to the 10 bpc blend on that same link and raster only after checking ABL's every raster word against AK3B's (modeset.rs `akita_check`), and sends the panel nothing. 120 Hz and the brightness policy wait on the owner's design (AK3B.md "For the owner"). A DPU or panel left off, or a jump from Android, needs AK3B's own power-up and init, not written: refused.
+    let akita = ferros_sys::akita();
+    if akita {
+        let f = ferros_sys::facts().0;
+        if f[30] == 1 || f[81] == 1 || f[31] == 6 {
+            log.s(b"display: akita's panel is not as ABL lit it (DPU or panel off, or a jump): AK3B's power-up is not written (docs/AK3B.md)\n");
+            log.flush();
+            ferros_sys::exit(3);
+        }
+        PANEL_HOLDS.store(0, Ordering::Release);
+    }
     let from_off = ferros_sys::facts().0[30] == 1;
     if from_off {
         if !ferros_sys::power(cap(grants, S_DPU_POWER), true) || ferros_sys::facts().0[30] != 2 {
@@ -5203,7 +5232,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     log.s(b" Mbps\n");
     log.flush();
     // Nothing moves between presents, so the panel may rest: the 10 Hz auto-rate floor (its own engine drops the refresh when frames stop and comes back for the next one; DISPLAY-POWER.md: 150–190 mW under 120 Hz) — with the TE kept fixed at 120 Hz, as Android runs it: DECON triggers on TE, so a changeable TE at the floor would make every present wait for the next 100 ms tick (measured 10 Hz on the pin, 2026-10-16 night). Fixed, the panel inserts the frame at once and the saving stays. A client can change the floor (op 8).
-    if dsi.alive() {
+    if dsi.alive() && !akita {
         log.at(b"panel idle + TE commands");
         let (_, f1) = dsi.sequence(ferros_dsi::hk3::IDLE_10);
         let (_, f2) = dsi.sequence(ferros_dsi::hk3::TE_FIXED);
@@ -5213,11 +5242,17 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
 
     // 10 bits when the kernel has put DECON in the 10 bpc blend (GLOBAL_CON bit 20, set by the modeset before the shell starts): the layer becomes 10-bit and every frame goes through the present stage, with the panel at its peak (HBM) so the table's headroom is real. Otherwise the 8-bit copy, as before.
     let ten = pipe.rd(S_DECON, 0x0020) & (1 << 20) != 0;
+    // akita reaches 10 bits only through the modeset with ABL's own raster (modeset.rs `akita_check`); the 8-bit copy no longer feeds the compositor's phases (publish_band writes them unconditionally), so without the blend there is nothing to draw with.
+    if akita && !ten {
+        log.s(b"display: akita: the pipe is not in the 10 bpc blend; the 8-bit path cannot draw the shell\n");
+        log.flush();
+        ferros_sys::exit(3);
+    }
     if ten && dsi.alive() {
         log.at(b"panel brightness");
         let r = set_panel(&dsi, hbm0, dbv0);
         log.at(b"panel brightness done");
-        log.s(if r { b"display: 10 bits, panel brightness set for the white and its headroom\n" } else { b"display: 10 bits, but the brightness command stuck\n" });
+        log.s(if akita { b"display: 10 bits, panel brightness left at ABL's (AK3B's policy is the owner's, docs/AK3B.md)\n".as_slice() } else if r { b"display: 10 bits, panel brightness set for the white and its headroom\n" } else { b"display: 10 bits, but the brightness command stuck\n" });
     } else {
         log.s(b"display: 8 bits (DECON not in the 10 bpc blend)\n");
     }
@@ -6374,7 +6409,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     len = n;
                 }
                 // 31 `panel off` (development: the bench for state B, DISPLAY-DESIGN.md §8): display off, sleep in, the 100 ms the panel needs, then its rails and reset through the `panel` switch; the screen stays dark until a display server starts and powers it up again (`diag "restart display"`). Replies 0, or 1 if the switch refused.
-                Some(31) if option_env!("FERROS_PRODUCTION").is_none() => {
+                Some(31) if option_env!("FERROS_PRODUCTION").is_none() && !akita => {
                     dsi_lock();
                     let _ = dsi.dcs(&[0x28]);
                     let _ = dsi.dcs(&[0x10]);
@@ -6397,7 +6432,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     let r = dsi.dcs(&[0xF0, 0x5A, 0x5A]).and_then(|_| dsi.dcs(&[0x51, (dbv >> 8) as u8, dbv as u8])).and_then(|_| dsi.dcs(&[0xF0, 0xA5, 0xA5]));
                     out[0] = r.is_err() as u8 * 3;
                 }
-                Some(7) if m.len() >= 2 => {
+                // 7 and 8 are HK3's scripts: refused on akita (`_`).
+                Some(7) if m.len() >= 2 && !akita => {
                     let (script, fps) = match m[1] {
                         60 => (ferros_dsi::hk3::REFRESH_60, 60),
                         120 => (ferros_dsi::hk3::REFRESH_120, 120),
@@ -6411,7 +6447,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         out[0] = fail.is_some() as u8 * 3;
                     }
                 }
-                Some(8) if m.len() >= 2 => {
+                Some(8) if m.len() >= 2 && !akita => {
                     let script = match m[1] {
                         30 => Some(ferros_dsi::hk3::IDLE_30),
                         10 => Some(ferros_dsi::hk3::IDLE_10),

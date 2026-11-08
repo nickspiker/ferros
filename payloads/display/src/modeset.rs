@@ -130,7 +130,8 @@ struct Raster {
 
 /// WQHD on the 8 bpc link.
 fn raster() -> Raster {
-    let cfg = ferros_dsc::HUSKY_WQHD;
+    // akita's AK3B at ABL's raster (its underrun word is ABL's: `akita_check`).
+    let cfg = if ferros_sys::akita() { ferros_dsc::AKITA } else { ferros_dsc::HUSKY_WQHD };
     let sw = cfg.slice_width as u32;
     let comp = sw / 3;
     let threshold = (sw.div_ceil(3) + 3) / 4 * 4 * 2;
@@ -356,6 +357,10 @@ impl M<'_> {
         for (dsc, snap) in [(0, sub0), (DSC1, sub1)] {
             self.restore(S_DECON_SUB, dsc, snap, &[]);
             self.wr(S_DECON_SUB, dsc + DSC_CONTROL3, 3 << 12 | r.comp);
+            // akita: each encoder keeps ABL's own PPS words (restored above): they describe its half of the picture (pic_width 540, initial_dec_delay 436), not the panel's PPS (1080, 526), as read on akita 2026-11-08.
+            if ferros_sys::akita() {
+                continue;
+            }
             for i in 0..22 {
                 self.wr(S_DECON_SUB, dsc + DSC_PPS + 4 * i as u64, u32::from_be_bytes([pps[4 * i], pps[4 * i + 1], pps[4 * i + 2], pps[4 * i + 3]]));
             }
@@ -470,6 +475,19 @@ pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool, j
             }
         };
         let hs = ferros_dsi::pll_hs_clk(|off| c.phy[off as usize / 4]);
+        // akita: the same raster ABL runs, so every raster word this sequence writes must already be ABL's; any that is not stops the modeset before a register is touched (the pipe stays at 8 bpc).
+        let akita = ferros_sys::akita();
+        let mut r = r;
+        if akita {
+            let bad = akita_check(&r, &c);
+            if !bad.is_empty() {
+                m.say(b"modeset: akita's AK3B raster does not match ABL's pipe, left at 8 bpc:");
+                m.say(&bad);
+                m.say(b"\n");
+                return m.rep;
+            }
+            r.underrun = c.link[(DSIM_UNDERRUN_CTRL / 4) as usize];
+        }
         if jumped {
             m.say(alloc::format!("modeset: after a jump, from the cold boot's tables (the running PHY's PLL said {} Mbps)\n", ferros_dsi::pll_hs_clk(|off| m.rd(S_DPHY, DPHY + off as u64))).as_bytes());
         }
@@ -477,25 +495,34 @@ pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool, j
         m.decon_stop();
         m.dsim_stop();
         m.dsim_init(&r, &c.link, &c.bias, &c.phy, hs, jumped);
+        // akita: the TE protect and timeout as ABL set them for its 60 Hz (dsim_init figures them for husky's 120).
+        if akita {
+            m.wr(S_DSIM, DSIM_CMD_TE_CTRL0, c.link[(DSIM_CMD_TE_CTRL0 / 4) as usize]);
+            m.wr(S_DSIM, DSIM_CMD_TE_CTRL1, c.link[(DSIM_CMD_TE_CTRL1 / 4) as usize]);
+        }
         m.decon_init(&r, &c.main, &c.sub0, &c.sub1, &c.win, c.wincon);
-        if let Some(vddd) = panel_cold {
+        if akita {
+            // Nothing to the panel: its link, PPS, raster and rate are ABL's and unchanged (the 10 bpc blend is DECON's, dithered onto the same 8 bpc link).
+        } else if let Some(vddd) = panel_cold {
             m.panel_on(dsi, &r, vddd);
         } else if let Some((reset, vddd)) = awake {
             m.wake_panel(dsi, &r, reset, vddd);
         }
 
-        // The panel, just after a TE: DSC on, the PPS, the raster, the full feature block for 120 Hz, control display, FFC on.
-        m.after_te();
-        let pps = ferros_dsc::pps(&r.cfg);
-        if dsi.send(ferros_dsi::DCS_SHORT_WRITE_1, &[0x9D, 0x01]).is_err() || dsi.send(ferros_dsi::PPS_LONG_WRITE, &pps).is_err() {
-            m.say(b"panel: PPS stuck\n");
-        }
-        let (_, f1) = dsi.sequence(ferros_dsi::hk3::RES_WQHD);
-        let (_, f2) = dsi.sequence(ferros_dsi::hk3::REFRESH_120);
-        let f3 = dsi.dcs(&[0x53, 0x20]).err();
-        let (_, f4) = dsi.sequence(ferros_dsi::hk3::FFC_ON);
-        if f1.is_some() || f2.is_some() || f3.is_some() || f4.is_some() {
-            m.say(b"panel: a command set stuck\n");
+        // The panel, just after a TE: DSC on, the PPS, the raster, the full feature block for 120 Hz, control display, FFC on. HK3's; none on akita.
+        if !akita {
+            m.after_te();
+            let pps = ferros_dsc::pps(&r.cfg);
+            if dsi.send(ferros_dsi::DCS_SHORT_WRITE_1, &[0x9D, 0x01]).is_err() || dsi.send(ferros_dsi::PPS_LONG_WRITE, &pps).is_err() {
+                m.say(b"panel: PPS stuck\n");
+            }
+            let (_, f1) = dsi.sequence(ferros_dsi::hk3::RES_WQHD);
+            let (_, f2) = dsi.sequence(ferros_dsi::hk3::REFRESH_120);
+            let f3 = dsi.dcs(&[0x53, 0x20]).err();
+            let (_, f4) = dsi.sequence(ferros_dsi::hk3::FFC_ON);
+            if f1.is_some() || f2.is_some() || f3.is_some() || f4.is_some() {
+                m.say(b"panel: a command set stuck\n");
+            }
         }
 
         // Start: every window's shadow, DECON on, running, and the painter's masked trigger.
@@ -523,6 +550,35 @@ fn words(b: &[u8]) -> Vec<u32> {
 }
 
 /// A running cold boot's pipe as ABL leaves it (oracle/display/husky-hk3/cold-pipe): DECON's main, DSC 0 and DSC 1 and window 5 blocks, the window's control word, DSIM's link, the D-PHY's bias and the PHY. `from_off` builds from it, and `ten_bpc` after a jump.
+/// akita: each raster word the modeset writes, against the word ABL's running pipe holds (the snapshot), named where they differ; empty when AK3B's raster (ferros_dsc::AKITA) is exactly ABL's. The link's CONFIG may read back without its compression bit (19), as on husky. The first run on akita (2026-11-08) matched every word but the encoders' PPS, which hold half the picture each and are kept as ABL wrote them.
+fn akita_check(r: &Raster, c: &ColdPipe) -> Vec<u8> {
+    let mut bad = Vec::new();
+    let mut want = |name: &str, have: u32, want: u32| {
+        if have != want {
+            bad.extend_from_slice(alloc::format!(" {name} G#{have:X} not G#{want:X};").as_bytes());
+        }
+    };
+    let link = |o: u64| c.link[(o / 4) as usize];
+    let main = |o: u64| c.main[(o / 4) as usize];
+    want("DSIM_THRESHOLD", link(DSIM_THRESHOLD), r.threshold);
+    want("DSIM_RESOL", link(DSIM_RESOL), r.h << 16 | r.threshold);
+    want("DSIM_NUM_OF_TRANSFER", link(DSIM_NUM_OF_TRANSFER), r.h);
+    want("DSIM_CONFIG", link(DSIM_CONFIG) | 1 << 19, CONFIG_RUNNING);
+    want("DSIM_CPRS_CTRL", link(DSIM_CPRS_CTRL), 0xA);
+    let sw = r.cfg.slice_width as u32;
+    want("DSIM_SLICE01", link(DSIM_SLICE01), sw << 16 | sw);
+    want("BLD_BG_IMG_SIZE_PRI", main(BLD_BG_IMG_SIZE_PRI), r.h << 16 | r.w);
+    want("OF_SIZE_0", main(OF_SIZE_0), r.h << 16 | r.comp);
+    want("OF_SIZE_1", main(OF_SIZE_1), r.comp);
+    want("OF_SIZE_2", main(OF_SIZE_2), (r.cfg.slice_height as u32) << 16 | r.comp);
+    want("WIN_END", c.win[(0x0010 / 4) as usize], (r.h - 1) << 16 | (r.w - 1));
+    // The encoders' PPS words are not compared: on akita each holds its half of the picture (decon_init keeps them as ABL wrote them).
+    for (name, snap) in [("DSC0", &c.sub0), ("DSC1", &c.sub1)] {
+        want(name, snap[(DSC_CONTROL3 / 4) as usize] & 0xFFFF, 3 << 12 | r.comp);
+    }
+    bad
+}
+
 struct ColdPipe {
     main: Vec<u32>,
     sub0: Vec<u32>,

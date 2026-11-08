@@ -217,9 +217,9 @@ extern "C" fn keeper(arg: u64) -> ! {
     }
 }
 
-/// The drivers left out on akita (Pixel 8a, SYS_FACTS 84 = 2) until each is brought up there (docs/BOARDS.md): its WiFi is a BCM4383, not the BCM4398 the WiFi driver's later stages load; Bluetooth is the same chip and waits for WiFi's REG_ON; the modem and the AoC's sensors have not been run on it.
+/// The drivers left out on akita (Pixel 8a, SYS_FACTS 84 = 2) until each is brought up there (docs/BOARDS.md): its WiFi is a BCM4383, not the BCM4398 the WiFi driver's later stages load; Bluetooth is the same chip and waits for WiFi's REG_ON; the modem and the AoC's sensors have not been run on it; and with neither WiFi nor the modem, `ip` has no link to serve.
 fn unfit(name: &[u8]) -> bool {
-    matches!(name, b"pcie1" | b"bt" | b"modem" | b"sensors")
+    matches!(name, b"pcie1" | b"bt" | b"modem" | b"sensors" | b"ip")
 }
 
 /// Whether a radio's driver is switched off (preference 15, the status circles; owner 2026-11-07): the bit in the facts' order, cellular, WiFi, Bluetooth, NFC, GPS. Not a radio: never.
