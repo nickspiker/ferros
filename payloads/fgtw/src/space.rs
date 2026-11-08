@@ -38,11 +38,13 @@ pub struct SpaceSync {
     /// Said once: no clock, no slot at fgtw.org.
     said_clock: bool,
     said_slot: bool,
+    /// The last join failed and said why: said again only once one has succeeded (a vault that refuses every 4 s would otherwise fill the console).
+    said_join: bool,
 }
 
 impl SpaceSync {
     pub fn new() -> SpaceSync {
-        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false }
+        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false }
     }
 }
 
@@ -353,6 +355,7 @@ impl Client {
         let me = self.me;
         match ferros_space::sync(&mut self.space.space, &mut self.space.base, &mut copy, &me, eagle()) {
             Ok(o) => {
+                self.space.said_join = false;
                 if o.wrote > 0 {
                     self.space.generation = self.space.generation.wrapping_add(1);
                     self.log.put(b"fgtw: space: ");
@@ -371,9 +374,12 @@ impl Client {
                 }
             }
             Err(why) => {
-                self.log.put(b"fgtw: space: not joined: ");
-                self.log.put(why.as_bytes());
-                self.log.line();
+                if !self.space.said_join {
+                    self.space.said_join = true;
+                    self.log.put(b"fgtw: space: not joined: ");
+                    self.log.put(why.as_bytes());
+                    self.log.line();
+                }
             }
         }
     }
