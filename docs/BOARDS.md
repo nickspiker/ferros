@@ -36,6 +36,8 @@ The phone itself, 2026-11-05: bootloader akita-17.0-15199481, baseband g5300o-26
 
 ## How akita boots for now
 
+(The state of 2026-11-06 morning; since 2026-11-08 akita boots the shell from its vault, below, "The shell on akita".)
+
 Storage-off until 2026-11-06, when its per-unit partitions were backed up (below); since then the UFS link comes up for the flash log in `klog`, and the rest stays off:
 - the UFS link, the flash log in `klog` and (since 2026-11-06) the vault in its ferros partition, but no write protect and no slot mark; the gate's Android choice (volume down) makes slot b active and resets into its Android (since 2026-11-06, devinfo checked to have husky's layout), and fastboot is the way back;
 - no ira (its sources include a devinfo read);
@@ -97,3 +99,26 @@ From akita's device tree (the factory image's overlays, `__fixups__` resolved): 
 Checked under the hv, without hands: the motor answers husky's `diag haptic up` (CS40L26A, revision A1, its ROM in standby; no waveform played yet, it buzzes). NFC comes up with husky's process unchanged (firmware 02092700, RF config A911, listening A and B, polling A, B and V), three runs of four; Android's own sequence on akita, traced from its i2c events, is the one the process sends. The fourth, on a boot that had come through fastboot and the touch and motor bring-ups, got the chip's reset notification and then no response to CORE_RESET; not seen again.
 
 WiFi: husky's staged driver (payloads/pcie1, stages 00 and 03) brings PCIe channel 1 up on akita unchanged — PHY locked, the link trained to L0 in A#122 µs — and the chip is not husky's: endpoint G#14E4:4449, chipcommon G#10224383, a **BCM4383** revision 2 where husky has the BCM4398. Stages 04 and on (the enumeration ROM, the firmware download through the CA7 path) are written for the BCM4398 and were not run; the BCM4383's firmware, NVRAM and CLM come from akita's own vendor partition. Android picks the `a3` variant for revision 2 (`fw_bcmdhd.bin_4383_a3`, `bcmdhd_clm.blob_4383_a3`; the board's calibration is a `bcmdhd.cal_*`); the whole set, with the Bluetooth patches (`brcm/BCM.hcd` and two others), is copied to /mnt/Harbor/tmp/akita-wifi-fw-2026-11-06/ with its hashes, local only. Google's driver for it is `google-modules/wlan/bcm4383`. Bluetooth (the same combo chip) waits for WiFi's REG_ON, as on husky, so it follows WiFi.
+
+## The shell on akita (2026-11-08)
+
+akita runs the shell from its own vault, as husky does, through the hv's gate on slot b (`SKIP_PKVM_CHECK=1 tools/akita-hv.sh --flash`). Checked over two cold reboots, without hands:
+
+- **Kernel** (service.rs `start_home`): with `init` in akita's vault, husky's path (the vault process first, then init); without it, the usb capsule the kernel carries, as before (a fresh akita).
+- **Stored** in akita's kernel vault: `init`, `vault`, `usb`, `touch`, `nfc`, `display`, `ahau`, `map` (built and signed as `tools/husky-shell.sh` does; `ferros-bridge store put <name> @target/akita-<name>.capsule.vsf`).
+- **init** (payloads/init `unfit`) leaves out on akita what is not husky's there or not run on it yet: `pcie1` (a BCM4383), `bt` (the same chip), `modem`, `sensors`, and `ip` (no link without them), each said on the console. `fgtw` waits for a person, the map for a bound identity, as on husky.
+- **The vault process**: a blank region 4 GiB into akita's ferros partition (2 × 8 GiB, well inside its 77.7 GiB) opened in 13.5 s at 512 MiB a mirror; reopened bounded by its 8 GiB half in 1.1 to 1.3 s. vaulttest: 6 MiB written in 598 ms, read in 301 ms, the same by BLAKE3; names, delete and sweep. One value cannot pass 384 MiB yet: the vault process ran out of its 24 MiB heap there (a 10.7 MB allocation: manifestus's entries buffer doubling) and exited, so the tract's grow past its first 512 MiB is not yet exercised (vaulttest input 02 reproduces it).
+- **The display server** (docs/AK3B.md "On akita, 2026-11-08"): ABL's 8 bpc link and raster, taken to the 10 bpc blend by the modeset only after every raster word it writes is checked against ABL's running pipe; nothing sent to the panel; DECON triggered on every TE (the AK3B does not hold one frame); the glass radius and cutout akita's (below). 1080 × 2400, temporal dither, 60 frame starts a second.
+- **touch**: the Goodix GT9895 serving the touch endpoint at boot (confirm, firmware 9895 G#1F010011, 16 × 34 lines). Contacts under a finger are the owner's to try (the attest screen's keyboard).
+- **ahau**, the attest screen: up at boot, "no identity in hand; type the handle", the mark drawn in about 0.5 s on the workers (no GPU service on akita). Nobody has attested: whose identity goes on akita is the owner's to say, and the map (home screen) starts only after that.
+- **usb** and **NFC**: as before, from init now.
+
+akita's geometry, from its device overlay (device/google/akita, cloned to `/mnt/Harbor/ferros-ref/akita`): the camera hole centred at (539.5, 68.71), radius 33.72, its bottom row 102.43 (`ferros_sys::CUTOUT_BOTTOM_AKITA`, through `ferros_sys::cutout_bottom`, which the app's circle uses); Android's corner radius 128 px (husky's 91), so the display's glass radius is 112.5, husky's tuned 80/91 of it, for the owner to tune on the glass.
+
+Radios and GPS:
+- **NFC**: up at every boot from init (husky's process unchanged).
+- **Haptics**: the CS40L26A answers (2026-11-06); no waveform is played until the owner is there.
+- **WiFi / Bluetooth**: the BCM4383 rev 2 trains its PCIe link under husky's stages 00 and 03; its firmware set (`fw_bcmdhd.bin_4383_a3`, `bcmdhd_clm.blob_4383_a3`, `bcmdhd.cal_*`, the BT patches) is in /mnt/Harbor/tmp/akita-wifi-fw-2026-11-06/. What it needs: the BCM4383's own download (Google's `google-modules/wlan/bcm4383`, not in the reference tree yet) in place of the BCM4398's stages 04 and on, then the same msgbuf/flowring path; Bluetooth follows WiFi's REG_ON as on husky.
+- **GPS**: a Samsung GPS chip Google's tree names "KEPLER" (`samsung,exynos-gnss`, the MP board's `gnssif`; Google's identifiers keep their word), not husky's BCM4776. Its data runs over SPI 21 (`samsung,gnss-spi`, 50 MHz, PDMA1) with two handshake lines, AP to GNSS on gpp4-3 and GNSS to AP (its interrupt) on gpa5-3; its rails are the sub-PMIC's LDO9S (core), LDO10S (RF) and LDO11S (aux); and its firmware and boot go through the modem (`gnss_boot` and `gnss_dump` io devices on the CP link, a 4 MiB `GNSS_FW` region at 8 MiB into the CP's shared memory). Google's driver is `soc-gs/drivers/soc/google/gnssif_spi` (gnss_main, gnss_spi, gnss_keplerctl_device). So it comes after the modem process runs on akita: no bring-up yet.
+
+Still to do on akita: contacts under a finger and the screen-off path (with hands), whose identity (the owner), AK3B's 120 Hz and brightness policy (AK3B.md, the owner's design), the modem, WiFi and the GPS above, the GPU service, and the sensors (the AoC).

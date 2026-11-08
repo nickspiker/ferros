@@ -47,6 +47,17 @@ What AK3B does not offer that HK3 does: free VRR and idle floors below 30 Hz, an
 - ABL leaves AK3B at 60 Hz with its splash at G#FAC0_0000 (outside the DPU fence; ferros draws into its own framebuffer on akita).
 - The panel does not hold one sent frame: at the gate, one triggered frame showed for about 18 of 60 frames, and DECON triggering on TE for the whole gate fixed it (ready.rs). That is unexpected for a command-mode panel with GRAM, and could be the pulse/GPO settings ABL leaves or the TE mode. It should be measured before the display server relies on single-frame presents on akita.
 
+## On akita, 2026-11-08: the display server at ABL's mode
+
+Plan step 0's part that needs no AK3B command is built (payloads/display; docs/BOARDS.md "The shell on akita"):
+- ABL's link, raster, DSC and 60 Hz are kept, and nothing is sent to the panel: no HK3 command (refresh, idle floor, TE mode, brightness, WRCTRLD, TE2, panel off). The brightness is ABL's.
+- The modeset takes DECON to the 10 bpc blend (the DQE's dither onto the same 8 bpc link, as on husky), with akita's raster (`ferros_dsc::AKITA`, from Google's `pps_config`), only after checking every raster word it writes against ABL's running pipe; any mismatch leaves the pipe untouched. The first run found one: each of the two DSC encoders holds the PPS of its own half (pic_width 540, initial_dec_delay 436), not the panel's (1080, 526), so on akita the encoders keep ABL's PPS words. Every other word matched.
+- DECON stays triggered on every TE (the single-frame question above is still open): 60 frame starts a second while the shell is up, a frame every refresh. The kernel's clock policy counts that as animating, so akita stays in the active profile while the display runs: a cost until the question is answered.
+- A DPU or panel left off, or a jump from Android, is refused: AK3B's power-up (rails VDDI, VCI, VDDD, reset, its init set) is not written.
+- The glass radius (112.5) and the cutout (bottom row 102.43) are akita's (BOARDS.md).
+
+Still the owner's: the three questions below, and a look at the glass (the picture under the 10 bpc blend has been seen only by the logs).
+
 ## Proposed plan
 
 0. **The display server on akita**:
