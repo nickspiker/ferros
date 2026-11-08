@@ -234,6 +234,8 @@ struct Fix {
     err: u32,
     speed: i32,
     track: i32,
+    /// The message carried a track (its flag, bit 213): without it `track` is 0, not north.
+    has_track: bool,
 }
 
 /// `n` bits at bit `o` of a stream of little-endian 32-bit words, MSB first (gpsd's reader).
@@ -276,8 +278,9 @@ fn parse_fix(m: &[u8]) -> Option<Fix> {
     if bits(m, 212, 1) == 0 || bits(m, 210, 1) == 0 || bits(m, 215, 1) == 0 {
         return None;
     }
-    let track = if bits(m, 213, 1) == 1 { sbits(m, 439, 16) } else { 0 };
-    let x = Fix { err: bits(m, 221, 10), lms: bits(m, 231, 32), lat: sbits(m, 311, 32), lon: sbits(m, 343, 32), alt: sbits(m, 375, 16), speed: sbits(m, 407, 16), track };
+    let has_track = bits(m, 213, 1) == 1;
+    let track = if has_track { sbits(m, 439, 16) } else { 0 };
+    let x = Fix { err: bits(m, 221, 10), lms: bits(m, 231, 32), lat: sbits(m, 311, 32), lon: sbits(m, 343, 32), alt: sbits(m, 375, 16), speed: sbits(m, 407, 16), track, has_track };
     (x.lat.unsigned_abs() <= 90 << 23 && x.lon.unsigned_abs() <= 180 << 23 && x.err < 1023 && (x.lat, x.lon) != (0, 0)).then_some(x)
 }
 
@@ -672,6 +675,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let mut published_sky = u32::MAX;
     // The tracks the last publish filled, so the next empties only past its own.
     let mut tracks_filled = 0usize;
+    // The fix count the altitude, speed and heading were last published for (u32::MAX: never, so the first pass empties their slots).
+    let mut published_fix = u32::MAX;
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
@@ -714,6 +719,15 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             status(0, w(k::STATE, now_shown.0 as i64));
             status(1, if d.fixes > 0 { w(k::ACCURACY, now_shown.1 as i64 * 1000) } else { MEASURE_NONE });
             published = Some(now_shown);
+        }
+        // With each new fix, how it moves (docs/RADIO-CONTROLS.md): altitude (metres to mm), ground speed (64ths of a m/s to mm/s) and heading (64ths of a degree to millidegrees; only when the message carried a track). Not the position: that is the person's, served on the `gps` endpoint, never in a measure anyone can read.
+        if d.fixes != published_fix {
+            use ferros_sys::{measure as k, measure_word as w, status, MEASURE_NONE};
+            published_fix = d.fixes;
+            let fx = d.fix;
+            status(5, if d.fixes > 0 { w(k::ALTITUDE, fx.alt as i64 * 1000) } else { MEASURE_NONE });
+            status(6, if d.fixes > 0 { w(k::SPEED, fx.speed as i64 * 1000 >> 6) } else { MEASURE_NONE });
+            status(7, if d.fixes > 0 && fx.has_track { w(k::HEADING, fx.track as i64 * 1000 >> 6) } else { MEASURE_NONE });
         }
         if published_sky != d.sky.msgs + d.sky.bad {
             use ferros_sys::{measure as k, measure_word as w, status, MEASURE_NONE};
