@@ -11,6 +11,9 @@
 //! - `0` STATE: text (the firmware, the beacon).
 //! - `1` BEACON + 16 bytes: advertise them (replacing any beacon going out). → [0], or [1] if the chip refused.
 //! - `2` STOP: no beacon. → [0] or [1].
+//! - `3` SCAN: listen for pairing beacons (passive: nothing goes on the air), the sponsor's side of the ceremony (the identity service's add flow). → [0], or [1] if refused (nobody has attested, or the chip said no).
+//! - `4` SCAN STOP. → [0] or [1].
+//! - `5` HEARD: the 128-bit service UUIDs heard in the last 30 s, newest first, at most 16: [count][count × 16 bytes], byte 0 the most significant (as op 1 takes them). The identity service matches them against its candidates (fgtw::pair::beacon_matches); a UUID that matches nothing is any other device's.
 #![no_std]
 #![no_main]
 
@@ -50,6 +53,13 @@ const FIFO: u32 = 256;
 const CLK: u32 = 200_000_000;
 const SLOW: u32 = 115_200;
 const FAST: u32 = 4_000_000;
+
+/// How many service UUIDs heard are kept: a sponsor matches a newcomer's beacon among them, and a busy room advertises others; the newcomer's, advertised every 100 ms, is always among the newest.
+const HEARD: usize = 32;
+/// How long a UUID heard counts (op 5): Photon's nearby window.
+const HEARD_FRESH_S: u64 = 30;
+/// The scan's interval and window, equal (scanning all the time while the add flow is open): 96 × 0.625 ms = 60 ms.
+const SCAN: u16 = 96;
 
 /// The advertising interval: 160 × 0.625 ms = 100 ms, Android's ADVERTISE_MODE_LOW_LATENCY.
 const INTERVAL: u16 = 160;
@@ -102,6 +112,9 @@ struct Bt {
     beacon: Option<[u8; 16]>,
     events_in_download: u32,
     dropped: u32,
+    /// Scanning for pairing beacons (the identity service's add flow, op 3), and the 128-bit service UUIDs heard, each with when (`heard_uuid`): the newest `HEARD` kept, the oldest replaced.
+    scanning: bool,
+    heard: [([u8; 16], u64); HEARD],
 }
 
 impl Bt {
@@ -225,6 +238,9 @@ impl Bt {
                 if e[0] == 0x0F && n >= 6 && u16::from_le_bytes([e[4], e[5]]) == op {
                     e[0] = e[2];
                     return Some(1);
+                }
+                if self.adv_report(&e[..n]) {
+                    continue;
                 }
                 say!(self.grants, "bt: event {}\n", Hex(&e[..n.min(32)]));
             }
@@ -422,6 +438,98 @@ impl Bt {
         true
     }
 
+    /// An LE Advertising Report (LE Meta, code G#3E, subevent G#02) while scanning: each 128-bit service UUID it carries (AD types G#06 and G#07, little-endian on air, so byte 0, the most significant, last) kept as heard now. Returns whether the event was one (reports are taken here, never printed: a room full of advertisers would flood the console). The report is the chip's, relaying any device in range: every length in it is checked before it is read.
+    fn adv_report(&mut self, e: &[u8]) -> bool {
+        if e.len() < 4 || e[0] != 0x3E || e[2] != 0x02 {
+            return false;
+        }
+        // One report per event is what this chip sends for legacy scanning; several are laid out field by field (all types, then all addresses, ...), which is not read here.
+        if e[3] != 1 || e.len() < 4 + 9 {
+            return true;
+        }
+        let len = e[12] as usize;
+        let Some(data) = e.get(13..13 + len) else { return true };
+        let mut at = 0;
+        while at + 1 < data.len() {
+            let l = data[at] as usize;
+            if l == 0 || at + 1 + l > data.len() {
+                break;
+            }
+            let (kind, body) = (data[at + 1], &data[at + 2..at + 1 + l]);
+            if kind == 0x06 || kind == 0x07 {
+                for u in body.chunks_exact(16) {
+                    let mut id = [0u8; 16];
+                    for k in 0..16 {
+                        id[k] = u[15 - k];
+                    }
+                    self.heard_uuid(id);
+                }
+            }
+            at += 1 + l;
+        }
+        true
+    }
+
+    /// `id` heard now: its entry refreshed, or the oldest replaced.
+    fn heard_uuid(&mut self, id: [u8; 16]) {
+        let t = now();
+        let slot = match self.heard.iter().position(|(u, at)| *at != 0 && *u == id) {
+            Some(i) => i,
+            // HEARD is a nonzero constant, so the range is never empty.
+            None => (0..HEARD).min_by_key(|&i| self.heard[i].1).unwrap(),
+        };
+        self.heard[slot] = (id, t);
+    }
+
+    /// Scanning for pairing beacons on (passive: nothing goes on the air; the own address a fresh non-resolvable private one, as the beacon's) or off.
+    fn scan(&mut self, on: bool) -> bool {
+        if !on {
+            self.scanning = false;
+            return self.ok(0x200C, &[0, 0], 256);
+        }
+        let mut a = [0u8; 6];
+        if self.beacon.is_none() {
+            if ferros_sys::entropy(cap(self.grants, S_ENTROPY), &mut a) != 6 {
+                say!(self.grants, "bt: no entropy for the address\n");
+                return false;
+            }
+            a[5] &= 0x3F;
+            if !self.ok(0x2005, &a, 256) {
+                return false;
+            }
+        }
+        let s = SCAN.to_le_bytes();
+        if !self.ok(0x200B, &[0, s[0], s[1], s[0], s[1], 0x01, 0x00], 256) {
+            return false;
+        }
+        // No duplicate filtering: a beacon heard again keeps its time fresh.
+        if !self.ok(0x200C, &[1, 0], 256) {
+            return false;
+        }
+        self.scanning = true;
+        true
+    }
+
+    /// The UUIDs heard within `HEARD_FRESH_S`, newest first, at most 16: [count][count × 16 bytes].
+    fn heard_reply(&self, out: &mut [u8; 1 + 16 * 16]) -> usize {
+        let t = now();
+        let fresh = freq() * HEARD_FRESH_S;
+        let mut order: [usize; HEARD] = core::array::from_fn(|i| i);
+        order.sort_unstable_by_key(|&i| core::cmp::Reverse(self.heard[i].1));
+        let mut k = 0;
+        for &i in &order {
+            let (u, at) = self.heard[i];
+            // `k == 16`: the reply holds sixteen (the identity service reads that many); the table keeps more so a noisy room does not push a newcomer out between reads.
+            if at == 0 || t - at > fresh || k == 16 {
+                break;
+            }
+            out[1 + k * 16..1 + (k + 1) * 16].copy_from_slice(&u);
+            k += 1;
+        }
+        out[0] = k as u8;
+        1 + k * 16
+    }
+
     fn state(&self, out: &mut Line) {
         let _ = write!(out, "{}; beacon {}", core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("?"), if self.beacon.is_some() { "advertising" } else { "off" });
     }
@@ -439,7 +547,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             *v = unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + k as u64) as *const u8) };
         }
     }
-    let mut bt = Bt { grants, rx: [0; 1024], rx_len: 0, name: [0; 64], name_len: 0, beacon: None, events_in_download: 0, dropped: 0 };
+    let mut bt = Bt { grants, rx: [0; 1024], rx_len: 0, name: [0; 64], name_len: 0, beacon: None, events_in_download: 0, dropped: 0, scanning: false, heard: [([0; 16], 0); HEARD] };
     // At boot WiFi's driver may not have raised its REG_ON yet (the kernel refuses Bluetooth alone): tried again every 4 s, saying so once. Any other failure ends the driver, the chip powered down.
     // Started beside WiFi's driver at boot: its REG_ON cycle and bring-up first (it turns this core off before the cycle anyway).
     sleep_ms(16 << 10);
@@ -503,12 +611,19 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     let ok = bt.advertise(&b);
                     say!(grants, "bt: beacon {}\n", if ok { "restored" } else { "refused" });
                 }
+                if bt.scanning {
+                    let ok = bt.scan(true);
+                    say!(grants, "bt: scanning {}\n", if ok { "restored" } else { "refused" });
+                }
                 bt.measures();
                 checked = now();
             }
         }
         if bt.pull() > 0 {
             while let Some(n) = bt.event(&mut e) {
+                if bt.adv_report(&e[..n]) {
+                    continue;
+                }
                 say!(grants, "bt: event {}\n", Hex(&e[..n.min(32)]));
             }
         }
@@ -537,6 +652,25 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     bt.beacon = None;
                     reply(&token, &[!ok as u8]);
                     bt.measures();
+                }
+                // The sponsor's side (the identity service's add flow): scan for newcomers' pairing beacons, stop, and the beacons heard. Gated like the beacon: nothing is listened for before a person has attested.
+                3 if ferros_sys::facts().0[83] != 2 => {
+                    reply(&token, &[1]);
+                }
+                3 => {
+                    let ok = bt.scan(true);
+                    say!(grants, "bt: scanning for pairing beacons: {}\n", if ok { "on" } else { "refused" });
+                    reply(&token, &[!ok as u8]);
+                }
+                4 => {
+                    let ok = bt.scan(false);
+                    say!(grants, "bt: scanning stopped\n");
+                    reply(&token, &[!ok as u8]);
+                }
+                5 => {
+                    let mut out = [0u8; 1 + 16 * 16];
+                    let k = bt.heard_reply(&mut out);
+                    reply(&token, &out[..k]);
                 }
                 _ => {
                     reply(&token, &[]);
