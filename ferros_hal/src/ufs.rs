@@ -379,12 +379,8 @@ impl UfsController {
             crate::mmio::cache_clean(ucd_addr_phys, 1024);
             core::arch::asm!("dsb sy");
 
-            // Ring doorbell (slot 0)
-            self.nexus(false); // device-management UPIU: nexus bit clear
-            self.write_reg(regs::UTRLDBR, 1);
-
-            // Completion, time-bounded (wait_transfer).
-            let _ = self.wait_transfer(1000);
+            // Ring doorbell (slot 0), the link awake first.
+            self.ring_management();
 
             // Read results
             crate::mmio::cache_invalidate(utrd_addr_phys, 32);
@@ -449,9 +445,7 @@ impl UfsController {
             crate::mmio::cache_clean(ucd_phys, 1024);
             core::arch::asm!("dsb sy");
 
-            self.nexus(false); // device-management UPIU: nexus bit clear
-            self.write_reg(regs::UTRLDBR, 1);
-            let _ = self.wait_transfer(1000);
+            self.ring_management();
 
             // Read results
             crate::mmio::cache_invalidate(utrd_phys, 32);
@@ -510,9 +504,7 @@ impl UfsController {
             crate::mmio::cache_clean(utrd_phys, 32);
             crate::mmio::cache_clean(ucd_phys, 1024);
             core::arch::asm!("dsb sy");
-            self.nexus(false);
-            self.write_reg(regs::UTRLDBR, 1);
-            let _ = self.wait_transfer(1000);
+            self.ring_management();
             crate::mmio::cache_invalidate(utrd_phys, 32);
             crate::mmio::cache_invalidate(ucd_phys, 1024);
             let ocs = ((*buf).utrd.dw[2] & 0xFF) as u8;
@@ -670,6 +662,15 @@ impl UfsController {
         H8_ON.store(true, Relaxed);
         H8_COUNTS[0].fetch_add(1, Relaxed);
         true
+    }
+
+    /// Ring slot 0 for a device-management UPIU (NOP OUT, QUERY) and wait for it, the link brought out of hibernate first as for every command. The queries rang the doorbell on a hibernated link (clocks stopped) whenever nothing had touched the flash for 16 ms: the command never completed, came back OCS G#F, and stayed in the doorbell (`diag ufsdesc` empty, 2026-11-07).
+    fn ring_management(&self) {
+        self.h8_wake();
+        self.nexus(false); // device-management UPIU: nexus bit clear
+        self.write_reg(regs::UTRLDBR, 1);
+        let _ = self.wait_transfer(1000);
+        H8_LAST_USE.store(ticks(), core::sync::atomic::Ordering::Relaxed);
     }
 
     fn send_command(&self, cmd_type: u32, direction: u32, prdt_count: u16) -> u8 {
