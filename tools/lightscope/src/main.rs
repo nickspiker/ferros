@@ -2,7 +2,7 @@
 //!
 //! The input is AC-coupled (line in or mic in), so the light's DC level is gone: everything is read from the waveform's shape. The threshold sits between the window's lowest and highest sample (the trigger slider moves it); above it is "on". Rising crossings, with a sixteenth of the swing as hysteresis, give the frequency; the time above and below the threshold, the duty; the shortest on and off stretches, the notch's width. A sample at full scale marks the readout CLIPPING: lower the load resistor or the light.
 //!
-//! Keys: space freezes and thaws; `l` prints the readout to the terminal.
+//! Keys: space freezes and thaws; `n` (or the normalize button) fits the window's own swing to the plot, off showing the scale slider's fixed height (full scale at its right end); `l` prints the readout to the terminal.
 //! Usage: tools/lightscope/target/release/lightscope [part of the input device's name]   (default: the system's default input; every input is listed at start)
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -18,7 +18,7 @@ use fluor::host::chrome_widget::DefaultChrome;
 use fluor::host::widget::{self as widget, Container, Widget};
 use fluor::paint::pack_argb;
 use fluor::text::TextStyle;
-use fluor::widgets::Slider;
+use fluor::widgets::{Button, Slider};
 
 /// The codec's own top rate: a sound server offers more by resampling, which adds no timing.
 const NATIVE: u32 = 192_000;
@@ -29,6 +29,8 @@ const SPAN_LO: f64 = -14.;
 const SPAN_OCTAVES: f64 = 11.;
 /// The analysis window: at least this many samples, and at least four screens.
 const ANALYSIS_MIN: usize = 1 << 14;
+/// The scale slider's range: full scale at its right end, 2^-12 (about −72 dBFS) near its left.
+const SCALE_OCTAVES: f32 = 12.;
 
 struct Ring {
     buf: Vec<f32>,
@@ -54,6 +56,11 @@ struct Scope {
     chrome: DefaultChrome,
     timebase: Slider,
     trigger: Slider,
+    /// The vertical scale while not normalized: the plot's height is ± 2^-(SCALE_OCTAVES × (1 − v)) of full scale, so a quiet input looks quiet.
+    scale: Slider,
+    /// Normalize: the window's own swing fills the plot (owner, 2026-11-08: "can we add a normalize feature? like a button to turn that on/off"); off, the scale slider's fixed height.
+    normalize: bool,
+    norm_button: Button,
     hit_counter: HitId,
     dragging: Option<usize>,
     ring: Arc<Mutex<Ring>>,
@@ -197,10 +204,12 @@ impl Scope {
         let chrome = DefaultChrome::new(Viewport::new(1200, 700), "lightscope".to_string(), None, Some("".to_string()), &mut hit_counter);
         let timebase = Slider::new(&mut hit_counter, 0., 0., 1., 1., ((-8. - SPAN_LO) / SPAN_OCTAVES) as f32);
         let trigger = Slider::new(&mut hit_counter, 0., 0., 1., 1., 0.5);
+        let scale = Slider::new(&mut hit_counter, 0., 0., 1., 1., 1.);
+        let norm_button = Button::new(&mut hit_counter, 0., 0., 1., 1., 14., "normalize");
         let ring = Arc::new(Mutex::new(Ring { buf: vec![0.; RING], written: 0 }));
         let want = std::env::args().nth(1);
         let (stream, rate, device) = open_input(want.as_deref(), ring.clone());
-        Scope { title: "lightscope".into(), chrome, timebase, trigger, hit_counter, dragging: None, ring, rate, device, _stream: stream, frozen: None, reading: Reading::default(), plot: (0, 0, 1, 1) }
+        Scope { title: "lightscope".into(), chrome, timebase, trigger, scale, normalize: false, norm_button, hit_counter, dragging: None, ring, rate, device, _stream: stream, frozen: None, reading: Reading::default(), plot: (0, 0, 1, 1) }
     }
 
     fn span_s(&self) -> f64 {
@@ -214,9 +223,12 @@ impl Scope {
         let top = h * 0.16;
         let bottom = h * 0.80;
         self.plot = (margin as usize, top as usize, (w - margin * 2.) as usize, (bottom - top) as usize);
-        let sw = w * 0.36;
-        self.timebase.set_rect(margin + w * 0.12 + sw * 0.5, h * 0.88, sw, bw);
-        self.trigger.set_rect(w * 0.58 + sw * 0.5, h * 0.88, sw, bw);
+        let sw = w * 0.22;
+        self.timebase.set_rect(margin + w * 0.09 + sw * 0.5, h * 0.88, sw, bw);
+        self.trigger.set_rect(w * 0.41 + sw * 0.5, h * 0.88, sw, bw);
+        self.scale.set_rect(w * 0.73 + sw * 0.5, h * 0.88, sw, bw);
+        self.norm_button.set_rect(w - margin - bw * 3.5, h * 0.955, bw * 7., bw * 1.6);
+        self.norm_button.set_font_size(bw * 0.8);
     }
 
     /// The samples to look at: the frozen copy, or the newest window of the ring.
@@ -259,7 +271,7 @@ impl Scope {
         let swing = if hi > lo { hi - lo } else { 1. };
         // A sixteenth of the plot's height above and below the swing.
         let pad = swing * (1. / (1 << 4) as f32);
-        let (vlo, vrange) = (lo - pad, swing + pad * 2.);
+        let (vlo, vrange) = match self.fixed_half() { Some(half) => (-half, half * 2.), None => (lo - pad, swing + pad * 2.) };
         let row = |v: f32| -> isize { py as isize + ((1. - (v - vlo) / vrange) * (ph - 1) as f32) as isize };
         // The trigger: the latest rising crossing with a whole screen after it.
         let mut start = x.len().saturating_sub(screen);
@@ -307,6 +319,8 @@ impl Container for Scope {
     fn visit(&mut self, f: &mut dyn FnMut(&mut dyn Widget)) {
         f(&mut self.timebase);
         f(&mut self.trigger);
+        f(&mut self.scale);
+        f(&mut self.norm_button);
         self.chrome.visit(f);
     }
 }
@@ -343,8 +357,8 @@ impl FluorApp for Scope {
             Event::CursorMoved { .. } => {
                 let (x, y) = (ctx.cursor_x, ctx.cursor_y);
                 if let Some(i) = self.dragging {
-                    if i == 0 { self.timebase.set_value_from_x(x) } else { self.trigger.set_value_from_x(x) }
-                    let _ = self.timebase.take_change() | self.trigger.take_change();
+                    match i { 0 => self.timebase.set_value_from_x(x), 1 => self.trigger.set_value_from_x(x), _ => self.scale.set_value_from_x(x) }
+                    let _ = self.timebase.take_change() | self.trigger.take_change() | self.scale.take_change();
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
@@ -358,8 +372,11 @@ impl FluorApp for Scope {
                 let hit = self.chrome.hit_at(x, y);
                 if hit != HIT_NONE {
                     let response = widget::dispatch_click(self as &mut dyn Container, hit, x, y, Default::default());
-                    self.dragging = if hit == self.timebase.hit_id() { Some(0) } else if hit == self.trigger.hit_id() { Some(1) } else { None };
-                    let _ = self.timebase.take_change() | self.trigger.take_change();
+                    if self.norm_button.take_click() {
+                        self.normalize = !self.normalize;
+                    }
+                    self.dragging = if hit == self.timebase.hit_id() { Some(0) } else if hit == self.trigger.hit_id() { Some(1) } else if hit == self.scale.hit_id() { Some(2) } else { None };
+                    let _ = self.timebase.take_change() | self.trigger.take_change() | self.scale.take_change();
                     ctx.window.request_redraw();
                     return response;
                 }
@@ -381,6 +398,7 @@ impl FluorApp for Scope {
                         self.frozen = if self.frozen.is_some() { None } else { Some(self.window(self.analysis_len())) };
                     }
                     Key::Character(c) if c.eq_ignore_ascii_case("l") => println!("{}", self.readout()),
+                    Key::Character(c) if c.eq_ignore_ascii_case("n") => self.normalize = !self.normalize,
                     _ => return EventResponse::Pass,
                 }
                 ctx.window.request_redraw();
@@ -425,18 +443,23 @@ impl FluorApp for Scope {
         let (px, py, _, ph) = self.plot;
         let lines = [
             (self.readout(), py as Coord * 0.62, font),
-            (format!("{} per screen, {} per line{}", fmt_time(self.span_s()), fmt_time(self.span_s() / 8.), if self.frozen.is_some() { "   FROZEN (space)" } else { "" }), (py + ph) as Coord + font * 1.2, font * 0.85),
+            (format!("{} per screen, {} per line, height {}{}", fmt_time(self.span_s()), fmt_time(self.span_s() / 8.), match self.fixed_half() { Some(h) => format!("±{:.0} dBFS", level_db(h)), None => "normalized".into() }, if self.frozen.is_some() { "   FROZEN (space)" } else { "" }), (py + ph) as Coord + font * 1.2, font * 0.85),
         ];
         for (t, y, f) in lines {
             let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
             ctx.text.draw_text_left(&mut canvas, &t, px as Coord, y, &TextStyle::new(f, label), None, None);
         }
-        for (t, s) in [("timebase", &self.timebase), ("trigger", &self.trigger)] {
+        for (t, s) in [("timebase", &self.timebase), ("trigger", &self.trigger), ("scale", &self.scale)] {
             let b = s.bbox();
             let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
             ctx.text.draw_text_left(&mut canvas, t, b.x - font * 4.5, b.y + b.h * 0.5, &TextStyle::new(font * 0.85, label), None, None);
         }
-        for s in [&mut self.timebase, &mut self.trigger] {
+        {
+            let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
+            let id = self.norm_button.hit_id();
+            self.norm_button.render_content_into(&mut canvas, 0., 0., ctx.text, None, Some(&mut self.chrome.hit_test_map), id);
+        }
+        for s in [&mut self.timebase, &mut self.trigger, &mut self.scale] {
             let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
             let id = s.hit_id();
             s.render_content_into(&mut canvas, Some(&mut self.chrome.hit_test_map), id);
@@ -449,7 +472,7 @@ impl FluorApp for Scope {
 
     fn cursor_for(&self, x: Coord, y: Coord, ctx: &Context) -> CursorIcon {
         let hit = self.chrome.hit_at(x, y);
-        if self.chrome.owns_hit(hit) || hit == self.timebase.hit_id() || hit == self.trigger.hit_id() {
+        if self.chrome.owns_hit(hit) || hit == self.timebase.hit_id() || hit == self.trigger.hit_id() || hit == self.scale.hit_id() || hit == self.norm_button.hit_id() {
             return CursorIcon::Pointer;
         }
         match chrome::get_resize_edge(ctx.viewport, x, y) {
@@ -463,6 +486,12 @@ impl FluorApp for Scope {
 }
 
 impl Scope {
+    /// The fixed half-height in full-scale units, or None when normalized.
+    fn fixed_half(&self) -> Option<f32> {
+        let v = self.scale.value();
+        if self.normalize { None } else { Some((-(SCALE_OCTAVES * (1. - v))).exp2()) }
+    }
+
     /// Four screens, at least `ANALYSIS_MIN` samples, at most the ring.
     fn analysis_len(&self) -> usize {
         ((self.span_s() * self.rate as f64) as usize * 4).max(ANALYSIS_MIN).min(RING)
