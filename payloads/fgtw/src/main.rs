@@ -1498,6 +1498,12 @@ impl Client {
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
                     continue;
                 }
+                // 19: this device's two-word name in the identity's fleet (`device_name_default` of its key under the identity seed), the one the approving device shows for its request; empty before the roots are in (owner, 2026-11-09: "would be nice to know what I'm adding").
+                if n >= 1 && req[0] == 19 {
+                    let r = self.identity_seed.map(|seed| fgtw::pair::device_name_default(&self.me, &seed).into_bytes()).unwrap_or_default();
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
                 if n >= 2 && req[0] == 18 {
                     let r = [self.space_switch(req[1] != 0)];
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);

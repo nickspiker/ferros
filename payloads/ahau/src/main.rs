@@ -474,6 +474,17 @@ struct Ahau {
     joining: bool,
     /// The network page's element under a finger, lit while it is held (0 the button, 1 `back`, 16 + k the list's row k): it acts when the finger lifts still on it (`net_release`), however it moved meanwhile, so a tap that wandered is not taken for a drag.
     pressed: core::cell::Cell<Option<u8>>,
+    /// The status's line count as last drawn (`status`), the join step's band below it (`words_band`): whether it holds the words, its scroll in pixels, the drag that moves it (landing row, scroll then), its last three frames' movements, the fling, its fraction of a pixel, the scroll's end, the panel frame last stepped; and this device's name in the fleet (fgtw op 19).
+    status_lines: core::cell::Cell<usize>,
+    words_shown: core::cell::Cell<bool>,
+    words_scroll: core::cell::Cell<i64>,
+    words_grab: core::cell::Cell<Option<(i64, i64)>>,
+    words_dys: core::cell::Cell<[i64; 3]>,
+    words_fling: core::cell::Cell<f64>,
+    words_fling_res: core::cell::Cell<f64>,
+    words_max: core::cell::Cell<i64>,
+    words_frame: core::cell::Cell<Option<u32>>,
+    dev_name: ([u8; 48], usize),
 }
 
 impl Ahau {
@@ -609,20 +620,10 @@ impl Ahau {
     /// The button under the entry line: its rectangle (x0, y0, x1, y1). With a step back, it moves right and `back` takes the left.
     fn button_at(&self) -> (usize, usize, usize, usize) {
         let y0 = self.button_top();
-        // The height and the label follow the scale; a lone button's width too, about the centre (at twice, w/8 to 7w/8); beside `back` the two keep their halves of the row.
+        // The height, the label and the width follow the scale, about the centre (at twice, w/8 to 7w/8). There is no `back` button: the bottom-left corner is back (owner, 2026-11-09: "Never show a back button").
         let hgt = self.k(self.w / 10);
-        if self.can_go_back() {
-            (self.w * 9 / 16, y0, self.w * 7 / 8, y0 + hgt)
-        } else {
-            let half = self.k(self.w * 3 / 16);
-            (self.w / 2 - half, y0, self.w / 2 + half, y0 + hgt)
-        }
-    }
-
-    /// The `back` button, left of the main one.
-    fn back_at(&self) -> (usize, usize, usize, usize) {
-        let (_, y0, _, y1) = self.button_at();
-        (self.w / 8, y0, self.w * 7 / 16, y1)
+        let half = self.k(self.w * 3 / 16);
+        (self.w / 2 - half, y0, self.w / 2 + half, y0 + hgt)
     }
 
     /// Back to the entry: the pending roots stay (the client keeps at them); the same handle resumes, another replaces them.
@@ -663,22 +664,12 @@ impl Ahau {
         for y in ry0..ry1 {
             s[y * self.w..(y + 1) * self.w].fill(0);
         }
-        if self.can_go_back() {
-            let (bx0, by0, bx1, by1) = self.back_at();
-            pill(s, self.w, bx0, by0, bx1, by1, if self.pressed.get() == Some(1) { PRESSED } else { 1800 }, self.k(self.w / 24));
-        }
         let (x0, y0, x1, y1) = self.button_at();
         if self.button_label().is_some() {
             pill(s, self.w, x0, y0, x1, y1, if self.pressed.get() == Some(0) { PRESSED } else if self.joining { 1800 } else { 2600 }, self.k(self.w / 24));
         }
         // The labels in front of the pills, the row composed whole before it shows (`compose`).
         self.compose(ry0, ry1, || {
-        if self.can_go_back() {
-            let (bx0, by0, bx1, by1) = self.back_at();
-            let px = self.k(self.w / 24);
-            let x = self.centre_x((bx0 + bx1) as i64 / 2, px, b"back");
-            window::text(self.display, self.text_to.get(), x as i16, ((by0 + by1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, b"back");
-        }
         if let Some(t) = self.button_label() {
             let px = self.k(self.w / 24);
             let x = self.centre_x((x0 + x1) as i64 / 2, px, t.as_bytes());
@@ -702,60 +693,204 @@ impl Ahau {
         self.kb.top - self.w * 3 / 20 - self.k(self.w / 10)
     }
 
-    /// The status: a line, or two split at a newline.
+    /// `t` broken into lines no wider than `width` pixels at `px`: at each newline, and between words where the next would not fit (a word wider than the whole width keeps a line to itself). The lines as byte ranges into `out`; their count.
+    fn wrap(&self, px: usize, t: &[u8], width: i64, out: &mut [(usize, usize)]) -> usize {
+        let mut n = 0;
+        let mut para = 0;
+        while para <= t.len() {
+            let pend = t[para..].iter().position(|&c| c == b'\n').map_or(t.len(), |k| para + k);
+            let mut start = para;
+            loop {
+                // The longest run of whole words from `start` that fits; the first word always goes in.
+                let (mut end, mut j) = (start, start);
+                while j < pend {
+                    let next = t[j..pend].iter().position(|&c| c == b' ').map_or(pend, |k| j + k);
+                    if end > start && self.measure(px, &t[start..next]) / 4 > width {
+                        break;
+                    }
+                    end = next;
+                    j = next + 1;
+                }
+                // WHY the test: `out` is a fixed array the caller sizes for its text; lines past it are not drawn rather than written past its end.
+                if n < out.len() {
+                    out[n] = (start, end);
+                    n += 1;
+                }
+                if end >= pend {
+                    break;
+                }
+                start = end + 1;
+            }
+            para = pend + 1;
+        }
+        n
+    }
+
+    /// The status: its lines (a newline breaks one) wrapped to the screen's width, centred (owner, 2026-11-09: "it should word wrap ... not get a nasty black band and disappear"). The rows the last status took are cleared too, so a shorter one leaves nothing of a longer.
     fn status(&self, t: &str) {
         let mut keep = ([0u8; 256], t.len().min(256));
         keep.0[..keep.1].copy_from_slice(&t.as_bytes()[..keep.1]);
         self.status_text.set(keep);
         let (b, px) = self.status_at();
-        // Cleared for the longest status, three lines (the mint's: baselines at b, b + 1.3 px, b + 2.6 px, and its descenders): cleared for two, the mint's third line stayed under a one-line status after it (owner, 2026-11-04).
-        let (y0, y1) = (b - px * 3 / 2, b + 2 * px * 13 / 10 + px / 2);
+        let mut lines = [(0usize, 0usize); 32];
+        let n = self.wrap(px, t.as_bytes(), (self.w * 13 / 16) as i64, &mut lines);
+        let rows = n.max(self.status_lines.get()).max(1);
+        self.status_lines.set(n);
+        let (y0, y1) = (b - px * 3 / 2, b + (rows - 1) * px * 13 / 10 + px / 2);
         self.surf()[y0 * self.w..y1 * self.w].fill(0);
         self.compose(y0, y1, || {
-            for (k, line) in t.split('\n').enumerate() {
-                self.centred(b + k * px * 13 / 10, px, QUIET, line);
+            for (k, &(s, e)) in lines[..n].iter().enumerate() {
+                self.centred(b + k * px * 13 / 10, px, QUIET, core::str::from_utf8(&t.as_bytes()[s..e]).unwrap_or(""));
             }
         });
     }
 
-    /// The pairing words while joining, six to a row under the status line, split at the capitals they come camelCased with; cleared otherwise.
+    /// The join step's band: from under the status's last line down to the button row (the entry line, hidden while joining, is inside it).
+    fn words_band(&self) -> (usize, usize) {
+        let (b, px) = self.status_at();
+        let y0 = b + self.status_lines.get().max(1).saturating_sub(1) * px * 13 / 10 + px / 2 + self.w / 32;
+        // Down to the button row when there is a button, else to the keyboard (the join step has none).
+        let y1 = if self.button_label().is_some() { self.button_top() } else { self.kb.top } - self.w / 64;
+        // WHY: at a large scale the status can reach the buttons; the band is then empty, not inverted.
+        (y0, y1.max(y0))
+    }
+
+    /// While joining: this device's name (the one the approving device shows for its request), then the pairing words, split at the capitals they come camelCased with, wrapped to the width. The band scrolls by the pixel with the finger and flings on as the settings pages do (`scroll_words`, `release_words`, `step_words`); its top and bottom edges fade out the text cut there, the fade's depth growing smoothly with what is cut. Otherwise the band is cleared once, when it held them.
     fn words(&self) {
         let px = self.k(self.w / 30);
-        let top = self.status_at().0 + self.w / 8;
-        let (y0, y1) = (top, top + px * 9);
-        self.surf()[y0 * self.w..y1 * self.w].fill(0);
+        let (y0, y1) = self.words_band();
         if !matches!(self.mode, Mode::Join(_)) {
-            self.present(y0, y1);
+            if self.words_shown.replace(false) {
+                self.surf()[y0 * self.w..y1 * self.w].fill(0);
+                self.present(y0, y1);
+            }
             return;
         }
-        self.compose(y0, y1, || {
-            let w = &self.word_buf[..self.word_len];
-            let mut row = [0u8; 160];
-            let (mut n, mut count, mut line) = (0usize, 0usize, 0usize);
-            let flush = |row: &[u8], line: usize| {
-                if let Ok(t) = core::str::from_utf8(row) {
-                    self.centred(top + px * 3 / 2 + line * px * 3 / 2, px, TEXT, t);
-                }
-            };
-            for (i, &c) in w.iter().enumerate() {
-                if c.is_ascii_uppercase() && i > 0 {
-                    count += 1;
-                    if count % 6 == 0 {
-                        flush(&row[..n], line);
-                        line += 1;
-                        n = 0;
-                    } else if n < row.len() {
-                        row[n] = b' ';
-                        n += 1;
-                    }
-                }
-                if n < row.len() {
-                    row[n] = c;
-                    n += 1;
+        self.words_shown.set(true);
+        self.surf()[y0 * self.w..y1 * self.w].fill(0);
+        let mut t = [0u8; 640];
+        let mut n = 0;
+        let mut push = |b: &[u8], n: &mut usize| {
+            for &c in b {
+                // WHY: `t` holds the name (48) and the words (512) with their spaces; anything past it is dropped, not written past its end.
+                if *n < t.len() {
+                    t[*n] = c;
+                    *n += 1;
                 }
             }
-            flush(&row[..n], line);
-        });
+        };
+        if self.dev_name.1 > 0 {
+            push(b"This device: ", &mut n);
+            // The name comes camelCased (two voca words, as the words do): a space before each capital after the first.
+            for (i, &c) in self.dev_name.0[..self.dev_name.1].iter().enumerate() {
+                if c.is_ascii_uppercase() && i > 0 {
+                    push(b" ", &mut n);
+                }
+                push(&[c], &mut n);
+            }
+            push(b"\n", &mut n);
+        }
+        let head = n;
+        for (i, &c) in self.word_buf[..self.word_len].iter().enumerate() {
+            if c.is_ascii_uppercase() && i > 0 {
+                push(b" ", &mut n);
+            }
+            push(&[c], &mut n);
+        }
+        let mut lines = [(0usize, 0usize); 64];
+        let nl = self.wrap(px, &t[..n], (self.w * 13 / 16) as i64, &mut lines);
+        let pitch = px * 3 / 2;
+        // WHY the bounds: the scroll reaches from the first line to where the last sits at the band's foot; past either end the band would show nothing, and text shorter than the band does not scroll.
+        let max = ((nl * pitch + px / 2) as i64 - (y1 - y0) as i64).max(0);
+        self.words_max.set(max);
+        let scroll = self.words_scroll.get().min(max).max(0);
+        self.words_scroll.set(scroll);
+        // As `compose`, with the edges faded between the text and the glass.
+        let tb = if self.back != 0 { self.back } else { self.base };
+        self.put_rows(tb, y0, y1);
+        for (k, &(s, e)) in lines[..nl].iter().enumerate() {
+            let base = (y0 + px * 5 / 4 + k * pitch) as i64 - scroll;
+            if base + (px / 2) as i64 <= y0 as i64 || base - (px * 3 / 2) as i64 >= y1 as i64 {
+                continue;
+            }
+            let v = if s < head { QUIET } else { TEXT };
+            let x = self.centre_x(self.w as i64 / 2, px, &t[s..e]);
+            window::text(self.display, tb, x as i16, base as i16, px as u16, v, &t[s..e]);
+        }
+        self.get_rows(tb, y0, y1);
+        // Each edge fades over up to an em: its depth em·tanh(cut/em), where `cut` is the text out of sight past that edge (0 at rest at the top: no fade there), so the fade comes and goes with every derivative continuous. Across it, the entry line's C∞ step, exp(−1/u) against its mirror.
+        let fade = |u: f32| {
+            let e = |u: f32| if u > 0. { libm::expf(-1. / u) } else { 0. };
+            e(u) / (e(u) + e(1. - u))
+        };
+        let em = px as f32;
+        let depth = |cut: i64| em * libm::tanhf(cut as f32 / em);
+        let s = self.surf();
+        for (d, top) in [(depth(scroll), true), (depth(max - scroll), false)] {
+            if d < 1. {
+                continue;
+            }
+            for r in 0..(d as usize).min(y1 - y0) {
+                let y = if top { y0 + r } else { y1 - 1 - r };
+                let k = (libm::sqrtf(fade((r as f32 + 0.5) / d)) * (1u32 << 14) as f32) as u64;
+                for p in &mut s[y * self.w..(y + 1) * self.w] {
+                    let ch = |v: u64| (v & 0xFFFF) * k >> 14;
+                    *p = ch(*p) | ch(*p >> 16) << 16 | ch(*p >> 32) << 32;
+                }
+            }
+        }
+        self.present(y0, y1);
+    }
+
+    /// A drag on the join step's band: the text follows the finger by the pixel (the scroll at the drag's landing plus how far the finger has come up since), each frame's movement kept for the fling.
+    fn scroll_words(&self, y0: i64, y: i64) {
+        let start = match self.words_grab.get() {
+            Some((g, s)) if g == y0 => s,
+            _ => {
+                let s = self.words_scroll.get();
+                self.words_grab.set(Some((y0, s)));
+                self.words_dys.set([0; 3]);
+                self.words_fling.set(0.);
+                s
+            }
+        };
+        let before = self.words_scroll.get();
+        self.words_scroll.set(start + (y0 - y));
+        self.words();
+        let d = self.words_scroll.get() - before;
+        let dys = self.words_dys.get();
+        self.words_dys.set([dys[1], dys[2], d]);
+    }
+
+    /// The finger lifted from the band: it goes on the way it last went at the largest of its last three frames' movements (the settings pages' `release_settings`).
+    fn release_words(&self) {
+        if self.words_grab.take().is_none() {
+            return;
+        }
+        let dys = self.words_dys.get();
+        let m = dys.iter().map(|d| d.abs()).max().unwrap_or(0);
+        let last = dys.iter().rev().find(|&&d| d != 0).copied().unwrap_or(0);
+        self.words_fling.set((last.signum() * m) as f64);
+        self.words_frame.set(None);
+    }
+
+    /// One display frame of the fling: the settings pages' friction (`coast`: a pixel a frame per frame, at rest under one), stopped by the band's ends. Whether it still moves.
+    fn step_words(&self) -> bool {
+        let v = self.words_fling.get();
+        if v == 0. {
+            return false;
+        }
+        let (d, v) = (v, if v.abs() <= 1. { 0. } else { v - v.signum() });
+        let res = self.words_fling_res.get() + d;
+        let whole = libm::trunc(res);
+        self.words_fling_res.set(res - whole);
+        let s = self.words_scroll.get() + whole as i64;
+        let max = self.words_max.get();
+        // WHY: the band's ends stop the fling; past them there is nothing to show.
+        self.words_fling.set(if s < 0 || s > max { 0. } else { v });
+        self.words_scroll.set(s);
+        self.words();
+        self.words_fling.get() != 0.
     }
 
     /// The identity service's state (op 1): its state byte, with the pairing words kept while it joins.
@@ -807,6 +942,14 @@ impl Ahau {
         }
         let changed = next != self.mode;
         self.mode = next;
+        // This device's name in the fleet, once, for the join step (fgtw op 19: empty until the roots are in).
+        if matches!(next, Mode::Join(_)) && self.dev_name.1 == 0 {
+            let mut r = [0u8; 48];
+            let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[19], &mut r);
+            if n != ferros_sys::ERR && (1..=48).contains(&(n as usize)) {
+                self.dev_name = (r, n as usize);
+            }
+        }
         if changed {
             self.status(self.prompt());
             self.entry_line(false);
@@ -1009,8 +1152,11 @@ impl Ahau {
         let (r0, r1) = ((b - px * 3 / 2) * self.w, (b + px / 2) * self.w);
         // No entry while nothing is typed: the words screen and the others between entries have no text box (owner, 2026-11-04).
         if !self.typing() {
-            self.surf()[r0..r1].fill(0);
-            self.present(r0 / self.w, r1 / self.w);
+            // While joining, these rows belong to the words' band (`words`): cleared here they cut a black band through the words (owner, 2026-11-09).
+            if !matches!(self.mode, Mode::Join(_)) {
+                self.surf()[r0..r1].fill(0);
+                self.present(r0 / self.w, r1 / self.w);
+            }
             return;
         }
         // Built whole in the back surface's rows and copied in, so a frame the display composes meanwhile never catches them cleared: drawn in place, the line flickered black at the blinkey's ticks (2026-11-01). Without a back surface, in place. The keyboard's boards use the back surface's rows below these.
@@ -1256,9 +1402,6 @@ impl Ahau {
         if self.button_label().is_some() && inside(self.button_at()) {
             return Some(0);
         }
-        if self.can_go_back() && inside(self.back_at()) {
-            return Some(1);
-        }
         if self.mode == Mode::Networks && !self.joining {
             return self.net_row_at(y).map(|k| 16 + k as u8);
         }
@@ -1310,7 +1453,6 @@ impl Ahau {
                 self.button();
                 self.words();
             }
-            1 if self.can_go_back() => self.go_back(),
             k if k >= 16 => self.net_pick((k - 16) as usize),
             _ => {}
         }
@@ -2578,7 +2720,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None) };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0) };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     start_fresh_mark(grants, w / 3);
     a.retint();
@@ -2752,6 +2894,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             orb = None;
             orb_asked = false;
             pulled = false;
+            a.release_words();
         }
         if k == 0 {
             if pinch.take().is_some() {
@@ -2831,6 +2974,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     } else if !pulled && a.mode == Mode::Networks && y0 < a.kb.top as i64 && y0 - y > reach {
                         pulled = true;
                         a.net_close();
+                    } else if matches!(a.mode, Mode::Join(_)) && { let (b0, b1) = a.words_band(); (b0 as i64..b1 as i64).contains(&y0) } {
+                        a.scroll_words(y0, y);
                     } else {
                         a.drag_text(x0, y0, x);
                     }
@@ -2855,6 +3000,21 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         if a.follow_layout() || no > 0 || followed {
             a.show();
+        }
+        // The words flinging after a lift: stepped once per frame the panel started since the last step (display op 24 waits for the next and gives its count), as the settings pages are.
+        if a.words_fling.get() != 0. {
+            let mut fr = [0u8; 4];
+            call(display, &[24], &mut fr);
+            let f = u32::from_le_bytes(fr);
+            let steps = a.words_frame.get().map_or(1, |p| f.wrapping_sub(p));
+            a.words_frame.set(Some(f));
+            for _ in 0..steps {
+                if !a.step_words() {
+                    break;
+                }
+            }
+            a.show();
+            continue;
         }
         sleep_until(now() + freq() / 240);
     }
