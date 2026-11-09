@@ -451,6 +451,8 @@ struct Ahau {
     scale: core::cell::Cell<f32>,
     /// The last status line, drawn again at a new scale.
     status_text: core::cell::Cell<([u8; 256], usize)>,
+    /// The surface text goes into: the shown one, or the back one while a band is composed there (`compose`).
+    text_to: core::cell::Cell<u64>,
 }
 
 impl Ahau {
@@ -509,12 +511,23 @@ impl Ahau {
     /// Text centred across the screen on `baseline`, by the keyboard's estimate of the typeface's advance (0.56 em).
     fn centred(&self, baseline: usize, px: usize, value: u16, t: &str) {
         let x = self.centre_x(self.w as i64 / 2, px, t.as_bytes());
-        window::text(self.display, self.base, x as i16, baseline as i16, px as u16, value, t.as_bytes());
+        window::text(self.display, self.text_to.get(), x as i16, baseline as i16, px as u16, value, t.as_bytes());
     }
 
     /// Where text starts so it is centred on `cx`: its width as the display's typeface sets it (op 28, `measure`, in quarter pixels). A width guessed from the character count (0.56 em each) put proportional lines off centre (owner, 2026-11-04).
     fn centre_x(&self, cx: i64, px: usize, t: &[u8]) -> i64 {
         cx - self.measure(px, t) / 8
+    }
+
+    /// Rows y0..y1 composed whole before they show (owner, 2026-11-09: "Flickers to black a lot"): the buffer's rows (cleared or with their shapes) put on the back surface, `text` draws there (the display lays each glyph in front, what is under by the room left), the rows taken back and presented once. Drawn in place, a frame caught them cleared or a button bare.
+    fn compose(&self, y0: usize, y1: usize, text: impl FnOnce()) {
+        let tb = if self.back != 0 { self.back } else { self.base };
+        self.put_rows(tb, y0, y1);
+        self.text_to.set(tb);
+        text();
+        self.text_to.set(self.base);
+        self.get_rows(tb, y0, y1);
+        self.present(y0, y1);
     }
 
     fn clear_rows(&self, y0: usize, y1: usize) {
@@ -638,19 +651,20 @@ impl Ahau {
         if self.button_label().is_some() {
             pill(s, self.w, x0, y0, x1, y1, 2600, self.k(self.w / 24));
         }
-        // The row presented before the display writes its words on it.
-        self.present(ry0, ry1);
+        // The labels in front of the pills, the row composed whole before it shows (`compose`).
+        self.compose(ry0, ry1, || {
         if self.can_go_back() {
             let (bx0, by0, bx1, by1) = self.back_at();
             let px = self.k(self.w / 24);
             let x = self.centre_x((bx0 + bx1) as i64 / 2, px, b"back");
-            window::text(self.display, self.base, x as i16, ((by0 + by1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, b"back");
+            window::text(self.display, self.text_to.get(), x as i16, ((by0 + by1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, b"back");
         }
         if let Some(t) = self.button_label() {
             let px = self.k(self.w / 24);
             let x = self.centre_x((x0 + x1) as i64 / 2, px, t.as_bytes());
-            window::text(self.display, self.base, x as i16, ((y0 + y1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, t.as_bytes());
+            window::text(self.display, self.text_to.get(), x as i16, ((y0 + y1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, t.as_bytes());
         }
+        });
     }
 
     fn entry_at(&self) -> (usize, usize) {
@@ -664,46 +678,53 @@ impl Ahau {
         self.status_text.set(keep);
         let (b, px) = self.status_at();
         // Cleared for the longest status, three lines (the mint's: baselines at b, b + 1.3 px, b + 2.6 px, and its descenders): cleared for two, the mint's third line stayed under a one-line status after it (owner, 2026-11-04).
-        self.clear_rows(b - px * 3 / 2, b + 2 * px * 13 / 10 + px / 2);
-        for (k, line) in t.split('\n').enumerate() {
-            self.centred(b + k * px * 13 / 10, px, QUIET, line);
-        }
+        let (y0, y1) = (b - px * 3 / 2, b + 2 * px * 13 / 10 + px / 2);
+        self.surf()[y0 * self.w..y1 * self.w].fill(0);
+        self.compose(y0, y1, || {
+            for (k, line) in t.split('\n').enumerate() {
+                self.centred(b + k * px * 13 / 10, px, QUIET, line);
+            }
+        });
     }
 
     /// The pairing words while joining, six to a row under the status line, split at the capitals they come camelCased with; cleared otherwise.
     fn words(&self) {
         let px = self.k(self.w / 30);
         let top = self.status_at().0 + self.w / 8;
-        self.clear_rows(top, top + px * 9);
+        let (y0, y1) = (top, top + px * 9);
+        self.surf()[y0 * self.w..y1 * self.w].fill(0);
         if !matches!(self.mode, Mode::Join(_)) {
+            self.present(y0, y1);
             return;
         }
-        let w = &self.word_buf[..self.word_len];
-        let mut row = [0u8; 160];
-        let (mut n, mut count, mut line) = (0usize, 0usize, 0usize);
-        let flush = |row: &[u8], line: usize| {
-            if let Ok(t) = core::str::from_utf8(row) {
-                self.centred(top + px * 3 / 2 + line * px * 3 / 2, px, TEXT, t);
-            }
-        };
-        for (i, &c) in w.iter().enumerate() {
-            if c.is_ascii_uppercase() && i > 0 {
-                count += 1;
-                if count % 6 == 0 {
-                    flush(&row[..n], line);
-                    line += 1;
-                    n = 0;
-                } else if n < row.len() {
-                    row[n] = b' ';
+        self.compose(y0, y1, || {
+            let w = &self.word_buf[..self.word_len];
+            let mut row = [0u8; 160];
+            let (mut n, mut count, mut line) = (0usize, 0usize, 0usize);
+            let flush = |row: &[u8], line: usize| {
+                if let Ok(t) = core::str::from_utf8(row) {
+                    self.centred(top + px * 3 / 2 + line * px * 3 / 2, px, TEXT, t);
+                }
+            };
+            for (i, &c) in w.iter().enumerate() {
+                if c.is_ascii_uppercase() && i > 0 {
+                    count += 1;
+                    if count % 6 == 0 {
+                        flush(&row[..n], line);
+                        line += 1;
+                        n = 0;
+                    } else if n < row.len() {
+                        row[n] = b' ';
+                        n += 1;
+                    }
+                }
+                if n < row.len() {
+                    row[n] = c;
                     n += 1;
                 }
             }
-            if n < row.len() {
-                row[n] = c;
-                n += 1;
-            }
-        }
-        flush(&row[..n], line);
+            flush(&row[..n], line);
+        });
     }
 
     /// The identity service's state (op 1): its state byte, with the pairing words kept while it joins.
@@ -1007,13 +1028,14 @@ impl Ahau {
     fn rescale(&self) {
         let (_, cy, r) = self.mark_at();
         let (y0, y1) = (cy + r + 2, self.kb.top);
-        self.clear_rows(y0, y1);
+        // Cleared in the buffer only: each piece composes its own band and shows it whole, then the region is shown once more from the buffer, which now holds their text too, so what a smaller size no longer covers goes black with no frame of it blank in between.
+        self.surf()[y0 * self.w..y1 * self.w].fill(0);
         let (t, n) = self.status_text.get();
         self.status(core::str::from_utf8(&t[..n]).unwrap_or(""));
         self.words();
         self.entry_line(true);
         self.button();
-        // Each piece presented its own rows; presenting the region again from the buffer would wipe the labels the display drew into the shown surface (the button's "bind" vanished at the first pinch, 2026-11-09).
+        self.present(y0, y1);
         self.show();
     }
 
@@ -2026,7 +2048,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None) };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None) };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     start_fresh_mark(grants, w / 3);
     a.retint();
