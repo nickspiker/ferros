@@ -1371,6 +1371,10 @@ const HBM_NITS: f32 = 1471.9;
 /// akita's AK3B, from Google's `ak3b_brightness_capability` (not measured on this unit): normal mode DBV 209-3175 for 2-800 cd/m², high brightness mode 3176-4095 for 800-1400. ABL leaves it at DBV 1437 (read back 2026-11-08). E's share of native white (E_LIGHT) is HK3's measured one until AK3B's spectra are measured.
 const AK3B_DBV_TOP: u16 = 3175;
 const AK3B_TOP_NITS: f32 = 800.0;
+/// akita's high brightness mode peak (Google's capability, 1400 cd/m² at DBV 4095; never entered by ferros without the owner): the floor's reference, as husky's is its measured peak.
+const AK3B_HBM_NITS: f32 = 1400.0;
+/// akita's light against DBV in normal mode, a power law through Google's two ends (2 cd/m² at DBV 209, 800 at 3175: 2.2 fits both to a percent; husky's measured table follows 2.2 too). Not measured on this unit.
+const AK3B_GAMMA: f32 = 2.2;
 
 /// The panel setting that gives a native peak as close to `nits` as it has: (high brightness mode, DBV, the native peak it gives). Between measured points, log-linear.
 fn panel_for(nits: f32) -> (bool, u16, f32) {
@@ -1395,7 +1399,13 @@ fn brightness(v: u8) -> (f32, f32, bool, u16) {
     // akita's AK3B: the panel held at the top of its normal mode and every step in the pixels, as husky's below DBV 3307, by the same law (the brightest setting puts white at half the panel's peak). Never its high brightness mode (DBV above 3175, 800-1400 cd/m²): not without the owner's word.
     if ferros_sys::akita() {
         let top_e = AK3B_TOP_NITS * E_LIGHT;
-        return (top_e * 0.5 * libm::exp2f(-(v as f32) * (1. / (1 << 5) as f32)), top_e, false, AK3B_DBV_TOP);
+        let white = top_e * 0.5 * libm::exp2f(-(v as f32) * (1. / (1 << 5) as f32));
+        // WHY the floor (owner, 2026-11-08: "guess it goes the same for both"): never under an eighth of the panel's peak light (AK3B_HBM_NITS / 8, 175 cd/m², about DBV 1590), as husky; the emission duty drops below about DBV 1280 (photodiode, about 108 cd/m², where husky's drops too). An eighth of the normal top (100 cd/m², DBV 1234) would be under it.
+        let want = (white * 16.0).min(top_e) / E_LIGHT;
+        let floor = AK3B_HBM_NITS * (1. / (1 << 3) as f32);
+        let nits = if want > floor { want } else { floor };
+        let dbv = (AK3B_DBV_TOP as f32 * libm::powf(nits / AK3B_TOP_NITS, 1. / AK3B_GAMMA)) as u16;
+        return (white, nits * E_LIGHT, false, dbv);
     }
     let top_e = HBM_NITS * E_LIGHT;
     let white = top_e * 0.5 * libm::exp2f(-(v as f32) * (1. / (1 << 5) as f32));
@@ -5489,7 +5499,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         log.at(b"panel brightness");
         let r = set_panel(&dsi, hbm0, dbv0);
         log.at(b"panel brightness done");
-        log.s(if akita && r { b"display: 10 bits, the AK3B at DBV 3175 (its normal top, 800 cd/m2), white in the pixels\n".as_slice() } else if akita { b"display: 10 bits, but the AK3B's DBV write stuck\n" } else if r { b"display: 10 bits, panel brightness set for the white and its headroom\n" } else { b"display: 10 bits, but the brightness command stuck\n" });
+        log.s(if akita && r { alloc::format!("display: 10 bits, the AK3B at DBV {dbv0}, white in the pixels\n").into_bytes().leak() as &[u8] } else if akita { b"display: 10 bits, but the AK3B's DBV write stuck\n" } else if r { b"display: 10 bits, panel brightness set for the white and its headroom\n" } else { b"display: 10 bits, but the brightness command stuck\n" });
     } else {
         log.s(b"display: 8 bits (DECON not in the 10 bpc blend)\n");
     }
@@ -5505,7 +5515,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             TEMPORAL = true;
         }
-        log.s(b"display: temporal dither on: four frames, flipped every 100 ms\n");
+        log.s(if akita { b"display: temporal dither on: four frames, flipped every frame\n".as_slice() } else { b"display: temporal dither on: four frames, flipped every 100 ms\n" });
     } else {
         log.s(b"display: no temporal dither (spatial only)\n");
     }
@@ -7337,7 +7347,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         // The flip this pass decided at its top, when the clock was drawn into the phase it shows: re-reading the time here flipped, now and then, to a phase whose clock had not been drawn (its edge 400 ms behind, 2026-10-24).
         if unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean && flip_due {
             // The focused widget at the panel's rate, everything else on the 10 Hz flips. In focus the timer is half a frame and `settle` (which holds a flip until the last one has started) does the pacing: a full frame's timer started after each flip's own work slipped a refresh now and then (100 a second, 2026-10-25).
-            next_flip = now() + if unsafe { FOCUS } != 0 { freq() / 240 } else { freq() / 10 };
+            // akita at the panel's rate too (owner, 2026-11-08: "since we have to feed this thing at 60hz minimum, I guess we roll in the dither"): its panel does not hold a frame, so DECON sends one every TE whatever changes, and a phase a frame costs the link nothing more.
+            next_flip = now() + if unsafe { FOCUS } != 0 || akita { freq() / 240 } else { freq() / 10 };
             pipe.settle(&mut armed, true);
             unsafe { CUR_PHASE = (CUR_PHASE + 1) % PHASES };
             pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
