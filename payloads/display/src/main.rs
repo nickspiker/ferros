@@ -3478,6 +3478,8 @@ enum Corner {
 
 /// The glass's own outline, exact (owner, 2026-11-08: "make sure the console circles are all dimensioned properly in regards to the new screen curves and center big circle"): fluor's corners as `plan_glass` draws them, superellipses ((R − a)/R)^n + ((R − b)/R)^n = 1 with a and b the distances in from the corner's two edges, R the big radius at the top-left and bottom-right and the small at the other two (`glass_corner_params`), each a polyline of `GLASS_SEGS` segments (chord error under a thousandth of a pixel at these radii), joined by the screen's straight edges. Until 2026-11-08 the solver measured to each row's whole masked columns at the row's centre, which misses the edge between rows where the curve runs nearly flat: circles reached into the mask in one corner and stopped short of it in another.
 const GLASS_SEGS: usize = 1 << 9;
+/// The edge's hairline, in pixels: one, the outermost pixel of the glass (fluor's walk_window_edges, opaque along the straight edges and on the curve's outer pixel).
+const EDGE_HAIRLINE: f32 = 1.;
 
 struct GlassOutline {
     w: f32,
@@ -3562,7 +3564,8 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
     let (cx, cy, rr) = circle(width, height);
     let (w, h) = (width as f32, height as f32);
     let app = |x: f32, y: f32| libm::sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy)) - rr;
-    let glass = |x: f32, y: f32| outline.dist(x, y);
+    // The glass the eye sees ends a pixel inside its outline: the edge's hairline is the outermost glass pixel, drawn in the mask's colour (black on release; 2026-11-08, on the Pro the circles' rims lay a pixel into it, row 0 black over WiFi's top). So the circles are tangent to the hairline's inner side.
+    let glass = |x: f32, y: f32| outline.dist(x, y) - EDGE_HAIRLINE;
     let clear = |x: f32, y: f32| { let (a, g) = (app(x, y), glass(x, y)); if a < g { a } else { g } };
     let mut out = [(0.0f32, 0.0f32, 0.0f32, Corner::Spare); 16];
     let mut n = 0;
