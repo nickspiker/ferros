@@ -290,6 +290,8 @@ _entry:
 );
 
 extern "C" fn pcie1_main(grants: u64, input: u64, input_len: u64) -> ! {
+    // First: the image's own relocations (payload.ld, build.rs: linked -pie).
+    unsafe { ferros_sys::relocate() };
     let (base, freq) = (ferros_sys::arc_base(), ferros_sys::freq());
     unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
     // Spawned by init at boot there is no input (a spawn from the vault carries none): with the vault scope granted, the whole bring-up from the vault's files; from the bridge, the stage byte it was given.

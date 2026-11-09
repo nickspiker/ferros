@@ -119,6 +119,8 @@ WiFi: husky's staged driver (payloads/pcie1, stages 00 and 03) brings PCIe chann
 
 **Every pcie1 run had been resetting the 8a (found 2026-11-09):** its console call put the reply at arc offset G#A00, in the grants page, which the kernel maps read-only for everyone since the sandbox work; the kernel's write of the reply faulted under its lock and the watchdog reset the device. The reply now goes to the driver's own memory.
 
+**akita's WiFi up (2026-11-09):** pcie1 takes the BCM4383 the whole way: the CR4 halted and released through its wrapper, the firmware (`fw_bcmdhd.bin_4383_a3`, `RTE (PCIE-MSGBUF) 20.25.929.104.5`) booting in 762 ms, rings at IPC 7, the CLM loaded (`country` #n → US) and the txcap after it, a scan, and a WPA2-PSK join (keyed on 5 GHz channel 149 in 371 ms; `join_ver` unsupported, `wlc_ver` 14.4 → join v1). The driver is linked `-pie` now and relocates at entry (a static's pointer had kept its link address). init starts pcie1 and ip on akita at boot from the vault (`wifi.fw`, `wifi.nvram`, `wifi.clm`, `wifi.txcap`, the 8a's own files): the firmware comes up and the driver waits for `wifi.cred`, the person's, locked until attest; a credential before attest is the attest screen's network page's to provide.
+
 ## The shell on akita (2026-11-08)
 
 akita runs the shell from its own vault, as husky does, through the hv's gate on slot b (`SKIP_PKVM_CHECK=1 tools/akita-hv.sh --flash`). Checked over two cold reboots, without hands:
