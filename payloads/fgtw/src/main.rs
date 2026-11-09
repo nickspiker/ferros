@@ -934,6 +934,8 @@ impl Client {
         self.log.line();
         self.depart = Some(Depart { t, words, frame, checked_us: 0 });
         self.keep_depart();
+        let request = self.depart.as_ref().map(|d| d.frame.clone()).unwrap_or_default();
+        self.space_put_depart(&request);
         for i in 0..self.sponsors.len() {
             self.depart_hand(i);
         }
@@ -986,6 +988,8 @@ impl Client {
         self.log.put(words.as_bytes());
         self.log.line();
         self.depart = Some(Depart { t: req.t, words, frame, checked_us: 0 });
+        let request = self.depart.as_ref().map(|d| d.frame.clone()).unwrap_or_default();
+        self.space_put_depart(&request);
         for i in 0..self.sponsors.len() {
             self.depart_hand(i);
         }
@@ -2056,7 +2060,7 @@ impl Client {
     }
 
     /// A sibling's departure request (`depart_req`): kept for this device's person to approve when the leaver is a current member other than this device and its consent's Ed25519 egg verifies (fgtw::sponsor::depart_receipt_valid). The countersign happens only on the person's approval with the leaver's words.
-    fn on_depart_req(&mut self, bytes: &[u8]) {
+    pub fn on_depart_req(&mut self, bytes: &[u8]) {
         let Ok((req, leaver)) = fgtw::protocol::parse_depart_req(bytes) else { return };
         let Some(hp) = self.hp else { return };
         if !self.bound || leaver == self.me || !self.members.contains(&leaver) {
@@ -2146,6 +2150,7 @@ impl Client {
             d.result = if ok { 2 } else { 3 };
         }
         if ok {
+            self.space_drop_depart(&leaver);
             // The members without the leaver: the chain as the seed (or the held copy) now has it.
             fgtw::set_clock(eagle());
             let fetched = {

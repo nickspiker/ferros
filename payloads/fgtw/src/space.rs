@@ -384,6 +384,46 @@ impl Client {
         }
     }
 
+    /// This device's departure request into the space and out to the fleet and fgtw.org at once, so a member approves it wherever it is, on any network (owner, 2026-11-09: "broadcast to the devices like a regular message"); the local hand-over (`depart_hand`) stays the fast path.
+    pub fn space_put_depart(&mut self, request: &[u8]) {
+        if self.space_ready().is_none() {
+            return;
+        }
+        if ferros_space::put_depart(&mut self.space.space, &self.me, request, eagle()) {
+            self.log.put(b"fgtw: space: our departure request, to the fleet");
+            self.log.line();
+            self.space_keep();
+            self.space_to_fleet();
+            self.space_seed(true);
+        }
+    }
+
+    /// A departure published (or its device gone from the fleet): marked gone in the space, so no member asks for it again.
+    pub fn space_drop_depart(&mut self, leaver: &[u8; 32]) {
+        if self.space_ready().is_none() {
+            return;
+        }
+        if ferros_space::drop_depart(&mut self.space.space, leaver, &self.me, eagle()) {
+            self.space_keep();
+            self.space_to_fleet();
+            self.space_seed(true);
+        }
+    }
+
+    /// The departures the space carries: another member's goes to the intake a local hand-over takes (`on_depart_req`, which checks its signature and keeps it for the Fleet page); one whose device is no longer a member is marked gone.
+    fn space_departures(&mut self) {
+        for (leaver, request) in ferros_space::departures(&self.space.space) {
+            if leaver == self.me {
+                continue;
+            }
+            if self.bound && !self.members.is_empty() && !self.members.contains(&leaver) {
+                self.space_drop_depart(&leaver);
+                continue;
+            }
+            self.on_depart_req(&request);
+        }
+    }
+
     /// The loop's step: the first pull, then the join every 4 s and fgtw.org every 64 s. The clock only moves forward, so `t` is never behind a time taken from it.
     pub fn space_step(&mut self, t: u64) {
         if self.space_ready().is_none() {
@@ -407,6 +447,7 @@ impl Client {
         if t - self.space.last_local_us >= LOCAL_US {
             self.space.last_local_us = t;
             self.space_join();
+            self.space_departures();
         }
         if t - self.space.last_seed_us >= SEED_US {
             self.space.last_seed_us = t;

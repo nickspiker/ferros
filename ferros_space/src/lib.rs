@@ -10,6 +10,7 @@
 //! | `PLACE` | scope `ke`, then `d` "settings" or developer, option | x, y `i` (world ×256), radius `i`, turn cos, sin `i` (Q14) | `map.place.<label>` (EWE, the map's) |
 //! | `VIEW` | scope `ke` | x, y, cos, sin `i` | `map.view` |
 //! | `HOME_SYNC` | a device `ke` | on `u` | none: the space's own, set from settings |
+//! | `DEPART` | the leaving device `ke` | its signed departure request `v` | none: the identity service's own (payloads/fgtw), so a member approves it wherever it is |
 //!
 //! The scope of a place and the view is the fleet's (`FLEET`, 32 zero bytes) on every device whose home-screen sync is on (the default), and the device's own key on one where the person switched it off, so that device keeps an arrangement of its own, which follows it through a reset all the same.
 //!
@@ -36,6 +37,8 @@ pub mod kind {
     pub const PLACE: u8 = 3;
     pub const VIEW: u8 = 4;
     pub const HOME_SYNC: u8 = 5;
+    /// A member leaving the fleet: its signed departure request, carried by the space to every member wherever it is (owner, 2026-11-09: "broadcast to the devices like a regular message"), approved on any of them with the words the leaver shows; gone once the Remove is published or the device is no longer a member.
+    pub const DEPART: u8 = 6;
 }
 
 /// The scope of the fleet's shared arrangement.
@@ -104,6 +107,36 @@ pub fn view_id(scope: &[u8; 32]) -> Vec<VsfType> {
 
 pub fn home_sync_id(device: &[u8; 32]) -> Vec<VsfType> {
     vec![VsfType::ke(device.to_vec())]
+}
+
+/// A departure's id: the leaving device's key.
+pub fn depart_id(device: &[u8; 32]) -> Vec<VsfType> {
+    vec![VsfType::ke(device.to_vec())]
+}
+
+/// `device`'s departure request into the space (written by that device). Whether the space changed.
+pub fn put_depart(space: &mut Space, device: &[u8; 32], request: &[u8], now: i64) -> bool {
+    let value = vec![VsfType::v(b'b', request.to_vec())];
+    if space.get(kind::DEPART, &depart_id(device)).is_some_and(|e| !e.gone && e.value == value) {
+        return false;
+    }
+    let updated = space.get(kind::DEPART, &depart_id(device)).map_or(now, |e| now.max(e.updated + 1));
+    space.put(Entry { kind: kind::DEPART, id: depart_id(device), value, updated, by: *device, gone: false })
+}
+
+/// The departures in the space: each leaving device and its request's bytes.
+pub fn departures(space: &Space) -> Vec<([u8; 32], Vec<u8>)> {
+    space.live(kind::DEPART).filter_map(|e| Some((e.id.first().and_then(k32)?, e.value.first()?.as_bytes()?.to_vec()))).collect()
+}
+
+/// `device`'s departure marked gone (by `by`): published, or no longer a member. Whether the space changed.
+pub fn drop_depart(space: &mut Space, device: &[u8; 32], by: &[u8; 32], now: i64) -> bool {
+    let Some(e) = space.get(kind::DEPART, &depart_id(device)) else { return false };
+    if e.gone {
+        return false;
+    }
+    let updated = now.max(e.updated + 1);
+    space.put(Entry { kind: kind::DEPART, id: depart_id(device), value: Vec::new(), updated, by: *by, gone: true })
 }
 
 /// A place's id read back: (scope, circle).
