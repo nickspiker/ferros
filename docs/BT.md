@@ -11,7 +11,7 @@ The BCM4398's Bluetooth core is on the APM's USI1 UART: serial_18, G#155D_0000, 
     - DEV_WAKE gpn9-0, held high: no low-power protocol yet;
     - HOST_WAKE gpn6-0, an input;
     - BLE_DBO gpp24-3, a flip-flop clock pulsed at every REG_ON change.
-  - It refuses while WiFi's WL_REG_ON (gph3-4, gpio-hsi2) is low. The coordinator powers WiFi first.
+  - It powers Bluetooth whatever WiFi's WL_REG_ON (gph3-4, gpio-hsi2) is. Until 2026-11-09 it refused while WL_REG_ON was low (Android's order, WiFi first, made a rule, never measured): a switched-off WiFi silently took Bluetooth with it. Measured on the Pro that day with WL_REG_ON low: the chip id, the patch (3104 records, 2.9 s) and the firmware up. The rule that stands is the cycle rule below.
 - **Process** (`payloads/bt`, endpoint `bt`):
   - the UART through its grant;
   - the patch from vendor_a `/firmware/brcm/BCM.hcd` (Android's file for this module, G5SN V17);

@@ -9,9 +9,6 @@ const GPN8: usize = 0x1506_0100;
 const GPN9: usize = 0x1506_0120;
 const GPP24: usize = 0x10C4_0060;
 const DBO_PIN: u32 = 3;
-/// WL_REG_ON: gph3-4 (gpio-hsi2, the bank at G#1304_0000), WiFi's power line, read only here.
-const GPH3: usize = 0x1304_0000;
-
 fn rd(a: usize) -> u32 {
     unsafe { core::ptr::read_volatile(a as *const u32) }
 }
@@ -40,12 +37,9 @@ fn dbo_pulse() {
     dat(GPP24, DBO_PIN, false);
 }
 
-/// On: the UART's USI in UART mode, the lines' modes (DBO first driven high, as nitrous's first rfkill call does), then REG_ON low with a DBO pulse, 30 ms, REG_ON high with a DBO pulse, DEV_WAKE high (the chip awake: ferros does not run its low-power protocol yet), and 20 ms for the chip's ROM. Off: DEV_WAKE low, REG_ON low with a DBO pulse, 20 ms. False if WiFi's REG_ON is low (the chip's Bluetooth core is not to be powered alone).
+/// On: the UART's USI in UART mode, the lines' modes (DBO first driven high, as nitrous's first rfkill call does), then REG_ON low with a DBO pulse, 30 ms, REG_ON high with a DBO pulse, DEV_WAKE high (the chip awake: ferros does not run its low-power protocol yet), and 20 ms for the chip's ROM. Off: DEV_WAKE low, REG_ON low with a DBO pulse, 20 ms. Powered whatever WiFi's REG_ON is: the measured rule (2026-10-31) is only that WL_REG_ON is never cycled under a powered Bluetooth core, which pcie1 keeps by turning Bluetooth off around its cycle; refusing Bluetooth while WiFi was off was Android's power-up order made a rule, never measured, and it took Bluetooth down silently with a switched-off WiFi (owner, 2026-11-09: "why is bluetooth not to be on whilst wifi is off?"). Tested on the Pro with WL_REG_ON low.
 pub fn power(on: bool) -> bool {
     let ms = |n: u64| us(n * 1000);
-    if on && rd(GPH3 + 4) & 1 << 4 == 0 {
-        return false;
-    }
     if on {
         wr(USI_MODE, (rd(USI_MODE) & !7) | 1);
         dat(GPP24, DBO_PIN, true);

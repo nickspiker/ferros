@@ -17,7 +17,7 @@ Bring-up facts:
   - a tag read (UID 04 6D F0 EA D2 5B 80);
   - the beacon heard by the dev box's BlueZ.
 
-**The REG_ON rule:** cycling WiFi's WL_REG_ON while the BT core is powered wedged the combo chip, and through PCIe the whole phone. That caused two watchdog resets, each within a minute of the WiFi keeper restarting pcie1.
+**The REG_ON rule:** cycling WiFi's WL_REG_ON while the BT core is powered wedged the combo chip, and through PCIe the whole phone. That caused two watchdog resets, each within a minute of the WiFi keeper restarting pcie1. Bluetooth itself runs with WL_REG_ON low (measured on the Pro 2026-11-09; the kernel no longer refuses it): the rule is only about cycling WL_REG_ON under a powered Bluetooth core.
 - **Fix:** pcie1 holds the `bt` power switch (its slot 18) and turns BT off first.
 - **Recovery:** `bt` health-checks every 8 s and comes back 16 s later.
 
