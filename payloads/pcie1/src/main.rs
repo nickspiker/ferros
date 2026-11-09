@@ -51,6 +51,8 @@ struct Drv {
     base: u64,
     freq: u64,
     log: [u8; 3000],
+    /// The console call's 16-byte reply.
+    reply: [u8; 16],
     n: usize,
     failed: bool,
     /// The backplane window BAR1 shows now (cfg G#84), so a run of accesses in one window costs one config write.
@@ -204,7 +206,9 @@ impl Drv {
     }
     fn flush(&mut self) {
         if self.n > 0 {
-            svc(1, self.grants + 0x204, self.log.as_ptr() as u64 - self.base, self.n as u64, 0xA00, 16);
+            // The reply into the driver's own memory: G#A00 was in the grants page, read-only since the sandbox work, and the kernel's write of the reply there faulted under its lock and reset the 8a at every run (2026-11-09).
+            let r = core::ptr::addr_of_mut!(self.reply) as u64 - self.base;
+            svc(1, self.grants + 0x204, self.log.as_ptr() as u64 - self.base, self.n as u64, r, 16);
             self.n = 0;
         }
     }
@@ -241,7 +245,7 @@ extern "C" fn pcie1_main(grants: u64, input: u64, input_len: u64) -> ! {
     // The grant count at 0x200 of the grants page (the handle table fills the first 512 bytes since 2026-11-03; read at 0 it was 0, and the driver thought it had no vault scope).
     let has_store = unsafe { core::ptr::read_volatile((base + grants + 0x200) as *const u32) } as u64 > STORE;
     let stage = if input_len > 0 { unsafe { core::ptr::read_volatile((base + input) as *const u8) } } else if has_store { 14 } else { 0 };
-    let mut d = Drv { grants, base, freq, log: [0; 3000], n: 0, failed: false, win: u32::MAX };
+    let mut d = Drv { grants, base, freq, log: [0; 3000], reply: [0; 16], n: 0, failed: false, win: u32::MAX };
     let rest: &mut [u8] = if input_len > 1 { unsafe { core::slice::from_raw_parts_mut((base + input + 1) as *mut u8, input_len as usize - 1) } } else { &mut [] };
     run(&mut d, stage, rest);
     d.flush();
@@ -506,6 +510,32 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     // ---- stage 4: dump the NCI enumeration ROM (read-only) — the chip describes its own cores there (nciutils.c nci_init: ChipCommon EromPtrOffset G#FC → EROM2 base; EROM1/OOBR sit below it). The host parses the dump before any core reset is attempted. ----
     let erom2 = d.rd(MEM, 0xFC);
     d.kv(b"cc.eromptr", erom2);
+    // The backplane by the chip id's top nibble (siutils.c si_doattach): 6 NCI (the BCM4398, its EROM and OOBR below the pointer), 1 AI (the BCM4383 on akita, 2026-11-09). On an AI chip the region the NCI arithmetic derives is not decoded: reading it stalled the bus and reset the 8a. There the ROM is at the pointer itself (aiutils.c ai_scan; in the OOBR, NCI-format, when its low three bits are set, aiutils.c ai_erom_in_oobr), dumped only as stage G#41, its whole G#E00 bytes; stage 4 stops at the pointer.
+    if chip >> 28 == 1 {
+        d.kv(b"backplane_ai", 1);
+        d.kv(b"erom_in_oobr", (erom2 & 7 != 0) as u32);
+        d.flush();
+        if stage == 0x41 && erom2 & 7 == 0 {
+            d.wr(CFG, 0x80, erom2 & !0xFFF);
+            let off = (erom2 & 0xFFF) as u64;
+            for i in 0..(0xE00u64 / 4) {
+                if i % 8 == 0 {
+                    d.flush();
+                    d.hex((i * 4) as u32);
+                    d.put(b":");
+                }
+                let v = d.rd(MEM, off + i * 4);
+                d.put(b" ");
+                d.hex(v);
+                if i % 8 == 7 {
+                    d.put(b"\n");
+                }
+            }
+            d.flush();
+            d.wr(CFG, 0x80, 0x1800_0000);
+        }
+        return;
+    }
     let erom1 = erom2 & !0xFFF;
     let oobr = erom2 & !0x1FFF;
     d.kv(b"erom1_base", erom1);
