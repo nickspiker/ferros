@@ -10,8 +10,10 @@ pub fn pow(x: f32, p: f32) -> f32 {
     libm::exp2f(p * libm::log2f(x))
 }
 
-/// The panel's measured power law (γ 2.19 in 8- and 10-bit codes, to 10-bit code 8; DISPLAY-CALIB.md).
-pub const PANEL_GAMMA: f32 = 2.19;
+/// The panel's measured power law, in 8- and 10-bit codes: husky's HK3 2.19 (to 10-bit code 8; DISPLAY-CALIB.md), akita's AK3B 2.23 (grey 2.220-2.236 from code 32 to 224 at DBV 3175, the i1 Pro, 2026-11-08; docs/AK3B.md).
+pub fn panel_gamma() -> f32 {
+    if ferros_sys::akita() { 2.23 } else { 2.19 }
+}
 
 /// The ODT, VSF RGB → panel linear RGB (`tools/panel-white-e.py`, the DBV 3307 readings): the panel's three primaries from the profile's spectra under VSF's observer, the matrix they make inverted; rows are panel R, G, B, columns VSF R, G, B. Absolute (E in is E on the glass), so its row sums are E's gains. Model tier, from one unit (pixel 8 pro calibration data/README.md). Applied to every pixel by `neon::Odt` (neon.rs), with no clamp: out-of-gamut channels land at 0 or at the panel's top through the output tables (owner, 2026-10-24); every sRGB colour lands inside, so only colour beyond sRGB ever meets them.
 pub const ODT: [[f32; 3]; 3] = [[1.359550, -0.372458, 0.012909], [-0.098444, 0.863965, -0.026116], [0.001826, -0.001101, 0.816481]];
@@ -34,7 +36,7 @@ pub fn odt_tables(white: f32, peak_e: f32) -> neon::Odt {
     use core::arch::aarch64::*;
     let k = libm::atanh(libm::sqrt((white / peak_e).min(0.999) as f64));
     let h = |x: f64| f32_to_f16(x as f32);
-    let gm = 1.0 / PANEL_GAMMA;
+    let gm = 1.0 / panel_gamma();
     let nudge = |i: usize| (pow(1.0 + i as f32 / 64.0, gm) * 32768.0 + 0.5) as u32;
     let (mut nudge_hi, mut nudge_lo, mut slope) = ([0u8; 64], [0u8; 64], [0u8; 64]);
     for i in 0..64 {

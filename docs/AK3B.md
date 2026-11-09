@@ -77,6 +77,37 @@ Whole-device draw from the fuel gauge (`diag power`, 16 s windows, charger cut, 
 - Part of it is the link: akita's panel does not hold a sent frame, so DECON sends the whole frame every TE, 120 frames a second over DSI at 120 even when nothing changes. If the panel can be made to refresh from its own memory (the single-frame question above), 120 at rest would cost the panel's scanning only.
 - Measured on a dark screen. A bright one may move the gap (the emission's duty and pulses per frame per mode are unmeasured).
 
+## Profiled with the i1 Pro (2026-11-08 night)
+
+`tools/akita-profile.sh run`, unattended (the owner calibrated the i1 on its tile and seated it on the 1 cm disc): 234 spectral readings, raw in `oracle/display/akita-ak3b/profile-0/` (readings.csv, spotread.log with every spectrum). Patches are the display server's op 52 mode 8 (raw 10-bit codes past the present table, 8 bits on the link), centred, radius 84 px (1 cm at 430 ppi).
+
+**Emission duty:** full down to about DBV 1280 by the owner's photodiode (BPW34 on line in), degrading below. On the measured curve DBV 1280 is **99.7 cd/m²**: the knee is 100 nits of white. husky's (DBV 1219-1246) is about 108-114 on its coarser table. Both Samsung driver chips appear to switch at a luminance, not a register value.
+
+**Luminance per DBV, full white in the disc:**
+
+| DBV | cd/m² | | DBV | cd/m² |
+|---|---|---|---|---|
+| 209 | 1.86 | | 1500 | 141.8 |
+| 400 | 8.12 | | 2000 | 273.7 |
+| 853 | 42.9 | | 2600 | 501.0 |
+| 1000 | 60.9 | | 3175 | 802.1 (normal mode's top) |
+| 1200 | 89.2 | | 3176 HBM | 797.7 |
+| 1280 | 99.7 | | 3600 HBM | 1072 |
+| 1353 | 112.2 | | 4095 HBM | 1417 |
+
+- Normal mode is a power law, exponent 2.23 end to end (Google's 2 at 209 and 800 at 3175 both hold); the middle runs a few percent under the line (2000: 274 against 290).
+- High brightness mode is linear: 0.674 cd/m² a DBV step from 798 at 3176 to 1417 at 4095 (Google: 1400).
+
+**Tone curve at DBV 3175** (code 32 to 224, 8-bit codes): grey 2.220-2.236, flat; green 2.21-2.25; red 2.19 falling to 2.13 at the top; blue 2.20 to 2.16. The present stage now uses 2.23 on akita (`odt::panel_gamma`), 2.19 on husky.
+
+**Near black** (HBM, 1417 white): grey 1 0.030 cd/m², 2 0.05, 3 0.10, 4 0.16, 8 0.706 (the power law says 0.65), 16 3.13. Black (grey 0 at 3175) reads 0.003, the instrument's floor.
+
+**Colours** (xy, the 1931 observer as spotread reports; the spectra are kept for VSF's): red (0.6803, 0.3194), green (0.2401, 0.7128), blue (0.1396, 0.0448); white (0.3073, 0.3257) at 3175, (0.3089, 0.3258) in HBM; grey 128 (0.3071, 0.3228). R + G + B is 8-9 % more light than white at both brightnesses (877 against 807; 1533 against 1421): white is limited. E's white for akita (its own row sums, as husky's E_CODE_Q15) is still husky's: solving it from these spectra under Stockman-Sharpe 10° is the next step.
+
+**Window against field:** at 3175 the disc 806, a 2 cm disc 808, 4 cm 809, the whole panel 795 (−1.4 %); in HBM 1418, 1423, 1424, the whole panel 1374 (−3.1 %), the whole field's white also bluer-green shifted (y 0.320 against 0.326).
+
+**Lost:** the 8a dropped off USB right after the full-field white in HBM (the most current the panel draws) and kept showing it; every later section (APL, sustain, the closing drift) read that full field, not its patch, and is void. USB did not come back with a host port reset. Unknown yet whether it is the charger path, the USB switch or the kernel; to look at with the device in hand (the kill chord or a long power press clears the screen).
+
 ## Proposed plan
 
 0. **The display server on akita**:

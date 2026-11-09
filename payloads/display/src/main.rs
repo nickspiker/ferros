@@ -45,7 +45,7 @@ mod glyphs;
 mod modeset;
 mod neon;
 mod odt;
-use odt::{odt_tables, pow, PANEL_GAMMA};
+use odt::{odt_tables, panel_gamma, pow};
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -1332,9 +1332,10 @@ static mut LUT_FOR: u8 = 0;
 
 fn build_lut(lut: &mut [u16], white: f32, peak_e: f32) {
     let k = libm::atanhf(sqrt((white / peak_e).min(0.999)));
+    let g = 2.0 / panel_gamma();
     for (i, e) in lut.iter_mut().enumerate() {
         let y = tanh(i as f32 / 16384.0 * k);
-        let q = pow(y, 2.0 / PANEL_GAMMA) * 1023.0 * 16.0 + 0.5;
+        let q = pow(y, g) * 1023.0 * 16.0 + 0.5;
         *e = if q.is_nan() || q < 0.0 { 0 } else if q > 16368.0 { 16368 } else { q as u16 };
     }
 }
