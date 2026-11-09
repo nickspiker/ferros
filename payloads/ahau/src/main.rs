@@ -174,11 +174,6 @@ const WORD_CHARS: usize = (1 << 9) - (1 << 6);
 const MARK: u64 = 9000;
 const TEXT: u16 = 16384;
 const QUIET: u16 = 7000;
-/// The entry's line: a quarter of white in gamma 2 (Q14).
-const LINE: u64 = 1 << 12;
-/// The button: Photon's attest button in grey (fluor's Button: the squircle of power 3, corners h/2 and h/4 by turns, a two-tone hairline of a 32nd of the label's size plus a pixel, shadow above the anti-diagonal and light below, so it reads raised). The fill as the back and attest buttons always were; the edges fluor's textbox edges as greys.
-const PILL_SHADOW: u64 = 3100;
-const PILL_LIGHT: u64 = 4096;
 
 global_asm!(
     r#"
@@ -452,9 +447,18 @@ struct Ahau {
     /// The entry line's pan in pixels (TEXT.md: 0 while the handle fits), and the drag that moves it: where its finger landed and the pan then.
     pan: core::cell::Cell<i64>,
     grab: core::cell::Cell<Option<(i64, i64, i64)>>,
+    /// The UI scale the text and the buttons follow, 64ths of an octave (preference 14, as the map's pages; owner, 2026-11-09: "make it so the two finger zoom changes the button and text size like Photon"): set live by a pinch above the keyboard, kept as the device's at the lift.
+    scale: core::cell::Cell<f32>,
+    /// The last status line, drawn again at a new scale.
+    status_text: core::cell::Cell<([u8; 256], usize)>,
 }
 
 impl Ahau {
+    /// The scale's factor on a size: 2^(s/64).
+    fn k(&self, v: usize) -> usize {
+        (v as f32 * libm::exp2f(self.scale.get() * (1. / (1 << 6) as f32))) as usize
+    }
+
     fn surf(&self) -> &'static mut [u64] {
         unsafe { core::slice::from_raw_parts_mut(&raw mut BUF as *mut u64, self.w * self.h) }
     }
@@ -527,7 +531,7 @@ impl Ahau {
     }
     fn status_at(&self) -> (usize, usize) {
         let (_, cy, r) = self.mark_at();
-        (cy + r + self.w / 16, self.w / 34)
+        (cy + r + self.w / 16, self.k(self.w / 34))
     }
 
 
@@ -583,10 +587,13 @@ impl Ahau {
     fn button_at(&self) -> (usize, usize, usize, usize) {
         let (b, px) = self.entry_at();
         let y0 = b + px;
+        // The height and the label follow the scale; a lone button's width too, about the centre (at twice, w/8 to 7w/8); beside `back` the two keep their halves of the row.
+        let hgt = self.k(self.w / 10);
         if self.can_go_back() {
-            (self.w * 9 / 16, y0, self.w * 7 / 8, y0 + self.w / 10)
+            (self.w * 9 / 16, y0, self.w * 7 / 8, y0 + hgt)
         } else {
-            (self.w * 5 / 16, y0, self.w * 11 / 16, y0 + self.w / 10)
+            let half = self.k(self.w * 3 / 16);
+            (self.w / 2 - half, y0, self.w / 2 + half, y0 + hgt)
         }
     }
 
@@ -625,33 +632,36 @@ impl Ahau {
         }
         if self.can_go_back() {
             let (bx0, by0, bx1, by1) = self.back_at();
-            pill(s, self.w, bx0, by0, bx1, by1, 1800, self.w / 24);
+            pill(s, self.w, bx0, by0, bx1, by1, 1800, self.k(self.w / 24));
         }
         let (x0, y0, x1, y1) = self.button_at();
         if self.button_label().is_some() {
-            pill(s, self.w, x0, y0, x1, y1, 2600, self.w / 24);
+            pill(s, self.w, x0, y0, x1, y1, 2600, self.k(self.w / 24));
         }
         // The row presented before the display writes its words on it.
         self.present(ry0, ry1);
         if self.can_go_back() {
             let (bx0, by0, bx1, by1) = self.back_at();
-            let px = self.w / 24;
+            let px = self.k(self.w / 24);
             let x = self.centre_x((bx0 + bx1) as i64 / 2, px, b"back");
             window::text(self.display, self.base, x as i16, ((by0 + by1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, b"back");
         }
         if let Some(t) = self.button_label() {
-            let px = self.w / 24;
+            let px = self.k(self.w / 24);
             let x = self.centre_x((x0 + x1) as i64 / 2, px, t.as_bytes());
             window::text(self.display, self.base, x as i16, ((y0 + y1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, t.as_bytes());
         }
     }
 
     fn entry_at(&self) -> (usize, usize) {
-        (self.kb.top - self.w * 5 / 16, self.w / 16)
+        (self.kb.top - self.w * 5 / 16, self.k(self.w / 16))
     }
 
     /// The status: a line, or two split at a newline.
     fn status(&self, t: &str) {
+        let mut keep = ([0u8; 256], t.len().min(256));
+        keep.0[..keep.1].copy_from_slice(&t.as_bytes()[..keep.1]);
+        self.status_text.set(keep);
         let (b, px) = self.status_at();
         // Cleared for the longest status, three lines (the mint's: baselines at b, b + 1.3 px, b + 2.6 px, and its descenders): cleared for two, the mint's third line stayed under a one-line status after it (owner, 2026-11-04).
         self.clear_rows(b - px * 3 / 2, b + 2 * px * 13 / 10 + px / 2);
@@ -662,7 +672,7 @@ impl Ahau {
 
     /// The pairing words while joining, six to a row under the status line, split at the capitals they come camelCased with; cleared otherwise.
     fn words(&self) {
-        let px = self.w / 30;
+        let px = self.k(self.w / 30);
         let top = self.status_at().0 + self.w / 8;
         self.clear_rows(top, top + px * 9);
         if !matches!(self.mode, Mode::Join(_)) {
@@ -773,7 +783,7 @@ impl Ahau {
         n != ferros_sys::ERR && n != ferros_sys::NOTHING && n >= 1 && out[0] != 0
     }
 
-    /// The entry: the handle as typed, a cursor, and a line under it.
+    /// The entry: the handle as typed and a cursor.
     fn entry(&self) {
         // The mark is the handle's: words typed for the identity service draw none.
         if !matches!(self.mode, Mode::Words(_)) {
@@ -986,14 +996,25 @@ impl Ahau {
                 *p = ch(*p) | ch(*p >> 16) << 16 | ch(*p >> 32) << 32;
             }
         }
-        // The line: three quarters of the width, a single pixel, grey at a quarter in gamma 2 (owner, 2026-10-29).
-        let (x0, x1, y) = (self.w / 8, self.w * 7 / 8, b + px / 4);
-        s[y * self.w + x0..y * self.w + x1].fill(grey(LINE));
-        // The blinkey where the caret is, while it is in the window: a drag can carry it out (typing brings it back, `chase`). In front of the letters and the line, both already in the rows it composes over.
+        // The blinkey where the caret is, while it is in the window: a drag can carry it out (typing brings it back, `chase`). In front of the letters, already in the rows it composes over. (No line under the handle: the owner, 2026-11-09, "nix the underline for the handle".)
         if (w0..w1).contains(&(x + caret_px)) {
             self.blinkey(s, (x + caret_px) as usize, b - px * 7 / 8, px * 17 / 16, px);
         }
         self.present(r0 / self.w, r1 / self.w);
+    }
+
+    /// Everything between the mark and the keyboard drawn again at the scale now (the status, the pairing words, the entry, the buttons), the rows cleared first so a smaller size leaves nothing of the larger.
+    fn rescale(&self) {
+        let (_, cy, r) = self.mark_at();
+        let (y0, y1) = (cy + r + 2, self.kb.top);
+        self.clear_rows(y0, y1);
+        let (t, n) = self.status_text.get();
+        self.status(core::str::from_utf8(&t[..n]).unwrap_or(""));
+        self.words();
+        self.entry_line(true);
+        self.button();
+        // Each piece presented its own rows; presenting the region again from the buffer would wipe the labels the display drew into the shown surface (the button's "bind" vanished at the first pinch, 2026-11-09).
+        self.show();
     }
 
     fn all(&self) {
@@ -1657,6 +1678,9 @@ fn pill(s: &mut [u64], w: usize, x0: usize, y0: usize, x1: usize, y1: usize, fil
     let (bw, bh) = ((x1 - x0) as f32, (y1 - y0) as f32);
     let stroke = (label_px / (1 << 5) + 1) as f32;
     let big = bh * 0.5;
+    // The edge greys from the fill as the honeycomb's keys have theirs: light √(fill² + BEVEL²) on the top left, shadow fill² / light on the bottom right.
+    let light = (fill * fill + honeycomb::BEVEL * honeycomb::BEVEL).isqrt();
+    let shadow = fill * fill / light;
     // Coverage of the rounded rectangle inset by `inset` at (fx, fy) from the box's corner: inside its straight edges whole; in a corner square, the superellipse |u/r|³ + |v/r|³ = 1, by the distance across it along the ray from the corner's centre (its own length scaled by f^(−1/3), f the superellipse's value there), half a pixel either side.
     let cover = |fx: f32, fy: f32, inset: f32| -> f32 {
         let (x, y, w, h) = (fx - inset, fy - inset, bw - 2. * inset, bh - 2. * inset);
@@ -1687,8 +1711,8 @@ fn pill(s: &mut [u64], w: usize, x0: usize, y0: usize, x1: usize, y1: usize, fil
                 continue;
             }
             let inner = cover(fx, fy, stroke);
-            // The hairline's tone by the box's anti-diagonal: shadow above it, light below (fluor's raised bevel).
-            let edge = if fx / bw + fy / bh <= 1. { PILL_SHADOW } else { PILL_LIGHT };
+            // The hairline's tone by the box's anti-diagonal: light above it, shadow below, lit from the top left as the keys are (owner, 2026-11-09: "TL should be brightish like the keymap and the bottom right should be darker"): the honeycomb's rule on this fill.
+            let edge = if fx / bw + fy / bh <= 1. { light } else { shadow };
             let v = fill as f32 * inner + edge as f32 * outer * (1. - inner);
             s[y * w + x] = grey(v as u64);
         }
@@ -2002,7 +2026,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None) };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None) };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     start_fresh_mark(grants, w / 3);
     a.retint();
@@ -2020,6 +2044,9 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // Every key exact: a rolling finger still types where it landed.
     touches.trace_words = false;
     let mut held = [(0u8, 0i64, 0i64); 16];
+    // The pinch above the keyboard: (spread at its start, the scale then), and whether the touch now down is one (`rescale`).
+    let mut pinch: Option<(f32, f32)> = None;
+    let mut pinched = false;
     // The key typed at its press (COMMIT_AT_PRESS), whose tap at the lift is then only its letting go.
     let mut pressed: Option<Key> = None;
     // The last frame of the mark put on the glass (FRESH_DONE's count).
@@ -2048,9 +2075,37 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             held[k] = (rec[0], u16::from_le_bytes([rec[4], rec[5]]) as i64, u16::from_le_bytes([rec[6], rec[7]]) as i64);
             k += 1;
         }
+        // Two fingers above the keyboard: a pinch, the scale following their spread, 64ths of an octave by log₂ of how far they opened since they began (as the map's pages), kept as the device's when they lift. Until every finger lifts, the touches above the keyboard are the pinch's, not taps or drags.
+        if k == 2 && held[0].2 < a.kb.top as i64 && held[1].2 < a.kb.top as i64 {
+            let (dx, dy) = (held[0].1 - held[1].1, held[0].2 - held[1].2);
+            // WHY the floor of 1: two fingers on one spot have no spread, and log₂ of a ratio over 0 is infinite.
+            let d = (((dx * dx + dy * dy) as u64).isqrt() as f32).max(1.);
+            let (d0, s0) = *pinch.get_or_insert((d, a.scale.get()));
+            // WHY the bounds: the preference's own range, half to twice (the kernel refuses anything past it).
+            let s = (s0 + 64. * libm::log2f(d / d0)).clamp(-64., 64.);
+            if (s - a.scale.get()).abs() >= 1. {
+                a.scale.set(s);
+                a.rescale();
+            }
+            pinched = true;
+        }
+        if k == 0 {
+            if pinch.take().is_some() {
+                ferros_sys::set_pref(cap(grants, S_SETTINGS), ferros_sys::PREF_SCALE, libm::roundf(a.scale.get()) as i8 as u8);
+            }
+            pinched = false;
+        }
+        let mut keys = [(0u8, 0i64, 0i64); 16];
+        let mut nk = 0;
+        for &f in &held[..k] {
+            if !pinched || f.2 >= a.kb.top as i64 {
+                keys[nk] = f;
+                nk += 1;
+            }
+        }
         let mut outs = [Touch::Scrolled; 48];
         let mut no = 0;
-        touches.poll(&mut a.kb, &held[..k], &mut |x, y| window::mine(display, base, x as u16, y as u16), &mut |t| {
+        touches.poll(&mut a.kb, &keys[..nk], &mut |x, y| window::mine(display, base, x as u16, y as u16), &mut |t| {
             outs[no] = t;
             no += 1;
         });
@@ -2100,11 +2155,13 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     console(a.grants, l.as_bytes());
                     slid = None;
                 }
-                Touch::TapAt(x, y) => a.tap_at(x, y),
+                Touch::TapAt(x, y) if !pinched => a.tap_at(x, y),
+                Touch::TapAt(..) => {}
                 // A drag on the entry line pans it (TEXT.md); elsewhere nothing yet.
-                Touch::Drag(x0, y0, x, _) => {
+                Touch::Drag(x0, y0, x, _) if !pinched => {
                     a.drag_text(x0, y0, x);
                 }
+                Touch::Drag(..) => {}
                 // A handle is exact bytes, typed key by key: no shape writing here.
                 Touch::Trail(..) | Touch::Traced => {}
             }
