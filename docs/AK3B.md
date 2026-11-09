@@ -56,6 +56,8 @@ Plan step 0's part that needs no AK3B command is built (payloads/display; docs/B
 - A DPU or panel left off, or a jump from Android, is refused: AK3B's power-up (rails VDDI, VCI, VDDD, reset, its init set) is not written.
 - The glass radius (112.5) and the cutout (bottom row 102.43) are akita's (BOARDS.md).
 
+- **A display restart on akita breaks the picture** (2026-11-08, unmeasured): after `diag "restart display"` (three in a row, each re-running the modeset on its own running pipe and re-sending DBV 3175) the frame was right in a capture, but the glass showed it under a gradient, bright at the top and black at the bottom (the space key unreadable), with a thin-duty 60 Hz flicker; a reboot cleared it. Until the restart path is measured (the panel's power mode and DBV read back, the TE trigger, the pulse settings), deploy a new display to akita by `store put` and a reboot, never a restart.
+
 Still the owner's: the three questions below, and a look at the glass (the picture under the 10 bpc blend has been seen only by the logs).
 
 ## Proposed plan
