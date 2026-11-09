@@ -7,6 +7,9 @@ extern crate alloc;
 
 pub use vsf;
 
+/// A WiFi network's credential (the vault's `wifi.cred` and `wifi.net`).
+pub mod network;
+
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;

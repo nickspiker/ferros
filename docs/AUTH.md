@@ -13,6 +13,7 @@ The vault holds two classes of entry.
 | Drivers and firmware | the capsules (`display`, `touch`, `pcie1`, `ip`, `modem`, `nfc`, `bt`, …), `wifi.fw`, `wifi.nvram`, `wifi.clm`, `gps.*` |
 | The attest front end | the `display`, `touch`, `ahau` capsules |
 | Hardware-owned settings | `device` (SETTINGS.md): language, number base, time zone, keyboard layout, brightness, dither, theme, proximity wake, unlock at boot |
+| A network joined before anyone attests | `wifi.net` (ATTEST-UI.md "WiFi connect": joined under a random MAC; moved into the person's on attest, still to build) |
 | The device's own bookkeeping | `sealed`, the kernel's reserved names (`\0…`): the name list, the device-only secret, the binding flag, the identity class's address list |
 
 **The identity class** is the person's. It is sealed under a key bound to this device and to the person, and opens only while that person is present:
@@ -61,7 +62,7 @@ The network owns the assignment: a device belongs to the identity whose fleet bo
 - **At attest.** ahau derives the seed and unlocks (op 1). On a bound device the screen closes at once; the proof follows behind it, then the roots go to fgtw (the identity service). On an unbound device the look-up and join run as before.
 - **The boot order** (init):
   1. Display, touch, the attest screen.
-  2. WiFi (the chip comes up; it joins once `wifi.cred` can be read), IP, NFC, Bluetooth, the modem.
+  2. WiFi (the chip comes up; it joins once `wifi.cred` can be read, or the device's `wifi.net` from boot, or a network the page hands in), IP, NFC, Bluetooth, the modem.
   3. A wait for a person (op 0, unlocked), then fgtw, the identity service: part of attest, it looks the identity up and joins its fleet.
   4. A wait for the device to be bound to that identity (op 0, bound), then the map. Both read the identity class.
 - **Unlock at boot** (`device.unlock_at_boot`, opt-in, warned): while it is on, the kernel keeps the seed in the device class and unlocks at boot, before init starts. Off, the kept seed is deleted at boot.
@@ -141,13 +142,13 @@ Every radio is up at the attest screen: the modem, the WiFi chip, Bluetooth and 
    - The modem (HSI1) is held to its carve-outs, the WiFi chip (HSI2) to its windows, and BLK_MISC's masters are denied everything (2026-11-04).
    - The modem's fence matters most: any base station reaches the modem before anyone attests.
 2. **No stable identifier goes on the air while locked.**
-   - Measured 2026-11-04: the WiFi driver neither scans nor joins until `wifi.cred` opens (`wait_cred`), so the chip is up but sends nothing. Bluetooth advertises only when asked, under a fresh non-resolvable random address each time, and refuses to while locked. A locate beacon would rotate its keys.
+   - Measured 2026-11-04: the WiFi driver neither scans nor joins until `wifi.cred` opens (`wait_cred`), so the chip is up but sends nothing. Since 2026-11-09 it scans when the network page asks, and joins a network handed in before attest (or kept from one, `wifi.net`) under a fresh random MAC each time; with no credential and no page asking it still sends nothing. Bluetooth advertises only when asked, under a fresh non-resolvable random address each time, and refuses to while locked. A locate beacon would rotate its keys.
    - Radio addresses that last belong to the identity (worn by the person, not the device).
 3. **Nothing acts on radio input while locked unless it carries the fleet's signature.**
    - No Bluetooth pairing, no NFC action, no listening socket, no clock set from the network.
    - fgtw, the only thing that acts on what the radios bring, waits for a person. And since 2026-11-04 the drivers refuse it themselves, from SYS_FACTS 83 (a person present): `ip` answers applications nothing but its addresses, `bt` refuses the beacon, `nfc` refuses the tap secret.
 
-Only the cellular link carries data while locked: the WiFi join needs the person's `wifi.cred`. After a jump from Android no radio starts at all, locked or not (their drivers meet Android's hardware state).
+Data while locked: the cellular link, and a WiFi network joined before attest (`wifi.net`, the owner's call of 2026-11-09: binding needs a network). The person's own networks (`wifi.cred`) wait for them. After a jump from Android no radio starts at all, locked or not (their drivers meet Android's hardware state).
 
 ## Locate (plan, 2026-11-04)
 

@@ -18,6 +18,10 @@ NVRAM=${NVRAM:-$FWDIR/bcmdhd.cal_USI_G5SN_9957_V17}
 CLM=${CLM:-$FWDIR/bcmdhd_clm.blob_4398_d0}
 # The WiFi credential (never committed, never printed): SSID on the first line, passphrase on the second.
 CRED=${CRED:-/mnt/Harbor/Code/keys/wifi.txt}
+# pcie1 reads the credential as a VSF document (ferros_detail network.rs), made here from the text file and removed on exit.
+CREDDOC=$(mktemp)
+trap 'rm -f "$CREDDOC"' EXIT
+[ -f "$CRED" ] && "$B" wifi-cred "$CRED" "$CREDDOC" >/dev/null
 ( cd "$REPO" && cargo el0 -q -p ferros-payload-pcie1 && aarch64-linux-gnu-objcopy -O binary "$R/pcie1" "$R/pcie1.bin" ) || exit 1
 HW="--hw pcie1-elbi --hw pcie1-soc --hw pcie1-pcs --hw pcie1-udbg --hw pcie1-phy --hw pcie1-dbi --hw pcie1-cfg --hw pcie1-mem --hw gpio-hsi2 --hw gpio-far-alive --hw cmu-hsi2 --hw pmu"
 for s in 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14; do
@@ -25,8 +29,8 @@ for s in 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14; do
     echo "=== stage $s"
     EXTRA=()
     [[ "$s" > 06 ]] && EXTRA=(--entropy --dma pcie1-dma --input-file "$FW" --input-file "$NVRAM" --input-file "$CLM")
-    [[ "$s" > 11 ]] && [ -f "$CRED" ] && EXTRA+=(--input-file "$CRED")
-    [ "$s" = 14 ] && EXTRA=(--entropy --dma pcie1-dma --serve wlan --store wifi --ira --input-file "$FW" --input-file "$NVRAM" --input-file "$CLM" --input-file "$CRED")
+    [[ "$s" > 11 ]] && [ -f "$CRED" ] && EXTRA+=(--input-file "$CREDDOC")
+    [ "$s" = 14 ] && EXTRA=(--entropy --dma pcie1-dma --serve wlan --store wifi --ira --input-file "$FW" --input-file "$NVRAM" --input-file "$CLM" --input-file "$CREDDOC")
     timeout 120 "$B" spawn "$R/pcie1.bin" "$s" --name pcie1 $HW "${EXTRA[@]}" 2>&1 | grep -vE "DATA|SPEC|recv\[|recv:|send|Staging|Staged|COMPLETE|Connected|Signed"
     # Long waits (WL_REG_ON's 200 ms) span many time slices: the spawn returns after the first one and the driver finishes in the background. Drain its console until it exits.
     for _ in $(seq 60); do

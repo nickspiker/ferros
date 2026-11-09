@@ -6,7 +6,11 @@
 //
 // usb.rs ── nusb USB link (VID G#1209, PID G#4665) struct UsbLink { interface, ep_out, ep_in } ::open() → Result<Self> ::send(data) — pads to 512 bytes (DWC3 short packet workaround) ::recv() → Vec<u8> ::recv_timeout(duration) → Result<Vec<u8>>
 
+extern crate alloc;
 mod input;
+/// A WiFi credential document, the schema pcie1 reads (shared by path: it uses only vsf and alloc).
+#[path = "../../../ferros_detail/src/network.rs"]
+mod network;
 mod usb;
 
 use ferros_pt::StreamId;
@@ -236,6 +240,28 @@ async fn main() {
                 std::process::exit(1);
             }
             cmd_run(&args[2], args.get(3).map(|s| s.as_str()), ferros_pt::command::caps::RUN, Vec::new()).await;
+        }
+        "wifi-cred" => {
+            // wifi-cred <in.txt> <out.vsf>: the network credential document pcie1 reads (ferros_detail network.rs: section `network`, name and passphrase), from a host file holding the name on its first line and the passphrase on its second (keys/wifi.txt). For a staged run's input file or a `store put wifi.cred`; never printed.
+            if args.len() < 4 {
+                eprintln!("Usage: ferros-bridge wifi-cred <in.txt> <out.vsf>");
+                std::process::exit(1);
+            }
+            let text = std::fs::read_to_string(&args[2]).unwrap_or_else(|e| {
+                eprintln!("{}: {e}", args[2]);
+                std::process::exit(1);
+            });
+            let mut lines = text.lines().map(|l| l.trim_end());
+            let (name, pass) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
+            let Some(doc) = network::build(name.as_bytes(), pass.as_bytes(), vsf::eagle_time_oscillations()) else {
+                eprintln!("{}: not a usable credential (a name of 1 to 32 bytes, a passphrase of 8 to 63)", args[2]);
+                std::process::exit(1);
+            };
+            std::fs::write(&args[3], &doc).unwrap_or_else(|e| {
+                eprintln!("{}: {e}", args[3]);
+                std::process::exit(1);
+            });
+            println!("credential document: {} bytes", doc.len());
         }
         "capsule" => {
             // capsule <code.bin> <out.vsf>: write a signed capsule (e.g. for `store put init @out.vsf`, which the cold boot spawns as its first process).

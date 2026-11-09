@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
 use ferros_sys::svc;
 
 /// The heap the link's detail document is built in (ferros_detail): a few hundred bytes a build, rebuilt only when the link changes.
@@ -1103,7 +1104,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let cons_before = d.tcm_rd(cons + 16);
     let t0 = d.now();
     let rx_off = d.tcm_rd(sh + 36);
-    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); 64], rxq_head: 0, rxq_len: 0 };
+    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); 64], rxq_head: 0, rxq_len: 0, nets: [Net { name: [0; 32], len: 0, rssi: 0, flags: 0, seen_in: 0 }; 32], nnets: 0, scan_gen: 0, scan_ver: 1, quiet: false, outcome: 0, rx_up: false, personal: true };
     // Control submit ring: 8 ioctl response buffers and 8 event buffers first (the firmware DMAs ioctl results into a posted response buffer, named by its request id in the completion).
     for b in 0..8u32 {
         m.post(d, 0x0B, 1 + b, [8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
@@ -1148,16 +1149,27 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
         d.kv(b"sh.flags (G#400 = trapped)", f);
     }
     if stage >= 11 {
-        let cred: &[u8] = if cred.is_empty() && from_store { wait_cred(d) } else { cred };
-        if let Some((ssid, _)) = credential(cred) {
-            m.want[..ssid.len()].copy_from_slice(ssid);
-            m.want_len = ssid.len();
-        }
-        // The band knob as it stands now, after any wait for the credential: the join takes it (docs/RADIO-CONTROLS.md).
-        m.band = ferros_sys::controls(ferros_sys::control::WIFI)[ferros_sys::control::WIFI_BAND as usize];
-        scan(d, &mut m, clm);
-        if stage >= 12 {
-            join(d, &mut m, cred);
+        if from_store && stage >= 12 {
+            // The boot path: the vault's credential, or one the network page hands in, joined (`connect`); the page served meanwhile.
+            connect(d, &mut m, clm);
+        } else {
+            // A staged run: the credential document given as an input file (`ferros-bridge wifi-cred`), if any.
+            let c = credential(cred);
+            if let Some((ssid, _)) = &c {
+                m.set_want(ssid);
+            }
+            // The band knob as it stands now: the join takes it (docs/RADIO-CONTROLS.md).
+            m.band = ferros_sys::controls(ferros_sys::control::WIFI)[ferros_sys::control::WIFI_BAND as usize];
+            scan(d, &mut m, clm);
+            if stage >= 12 {
+                match &c {
+                    Some((ssid, pass)) => join(d, &mut m, ssid, pass),
+                    None => {
+                        d.put(b"stage 12 wants a credential document as its fourth input file (ferros-bridge wifi-cred)\n");
+                        d.flush();
+                    }
+                }
+            }
         }
         if stage == 13 && m.keyed {
             dhcp(d, &mut m);
@@ -1229,6 +1241,32 @@ struct Msgbuf {
     rxq: [(u8, u16, u16); 64],
     rxq_head: usize,
     rxq_len: usize,
+    /// The networks the last scan found, one entry per name (its strongest BSS), for the network page (SCAN, `serve_unjoined`).
+    nets: [Net; 32],
+    nnets: usize,
+    /// Counts scans: an entry not seen in the latest is dropped when it ends (`end_scan`), so the page keeps the last list while a new scan runs.
+    scan_gen: u8,
+    /// The escan request layout (`scan_ver`), read once the radio is up.
+    scan_ver: u32,
+    /// After the first scan, BSSes are not printed again.
+    quiet: bool,
+    /// The last join's outcome for STATUS: 0 none yet, 1 no WPA2-PSK BSS of that name in range, 2 refused (a wrong passphrase among the reasons), 3 timed out, 4 joined.
+    outcome: u8,
+    /// The 64 receive buffers posted (the first join).
+    rx_up: bool,
+    /// The credential is the person's (`wifi.cred`; a staged run's input file counts as one): the MAC is this network's, from the ira. A device's (`wifi.net`, joined before anyone attested) joins under a random one each time: no stable identifier on the air while locked (AUTH.md, rule 2).
+    personal: bool,
+}
+
+/// A network as the page shows it: its name, the strongest signal seen (dBm), and flags: bit 0 joinable here (WPA2-PSK outside 6 GHz), bit 1 open, bit 2 other security (WEP, WPA, SAE only, enterprise), bit 3 seen on 5 GHz.
+#[derive(Clone, Copy)]
+struct Net {
+    name: [u8; 32],
+    len: u8,
+    rssi: i16,
+    flags: u8,
+    /// The scan it was last seen in (`scan_gen`).
+    seen_in: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -1524,6 +1562,16 @@ impl Msgbuf {
         // WLC_E_ESCAN_RESULT: status 8 = a partial result carrying one BSS, 0 = the scan finished, anything else = it ended otherwise.
         if status != 8 {
             self.scan_done = true;
+            // Networks the scan just ended did not see are gone.
+            let g = self.scan_gen;
+            let mut k = 0;
+            for j in 0..self.nnets {
+                if self.nets[j].seen_in == g {
+                    self.nets[k] = self.nets[j];
+                    k += 1;
+                }
+            }
+            self.nnets = k;
             d.kv(b"escan finished, status", status);
             return;
         }
@@ -1555,17 +1603,23 @@ impl Msgbuf {
         let rssi = (dr32u(bi + 78 - 2) >> 16) as u16 as i16;
         let (ie_off, ie_len) = (dr32u(bi + 116) & 0xFFFF, dr32u(bi + 120));
         let mut sec: &[u8] = if dr32u(bi + 16) & 0x10 != 0 { b"WEP" } else { b"open" };
+        let mut psk = false;
         let mut q = bi + ie_off;
         let end = q + ie_len.min(2048);
         while q + 2 <= end {
             let (id, l) = (dbr(q), dbr(q + 1) as u32);
             if id == 48 {
                 sec = b"RSN";
+                psk = rsn_psk(q + 2, l).is_some();
                 self.consider(bi, q + 2, l, cs);
             } else if id == 221 && l >= 4 && sec != b"RSN" && dbr(q + 2) == 0x00 && dbr(q + 3) == 0x50 && dbr(q + 4) == 0xF2 && dbr(q + 5) == 1 {
                 sec = b"WPA";
             }
             q += 2 + l;
+        }
+        self.note_net(bi, cs, rssi, if psk && band != b"6G" { 1 } else if sec == b"open" { 2 } else { 4 });
+        if self.quiet {
+            return;
         }
         d.put(band);
         d.put(b" ch ");
@@ -1596,21 +1650,7 @@ impl Msgbuf {
             return;
         }
         let group: [u8; 4] = core::array::from_fn(|k| dbr(rsn + 2 + k as u32));
-        let np = (dbr(rsn + 6) as u32) | (dbr(rsn + 7) as u32) << 8;
-        let a = rsn + 8 + 4 * np;
-        if a + 2 > rsn + l {
-            return;
-        }
-        let na = (dbr(a) as u32) | (dbr(a + 1) as u32) << 8;
-        let psk = (0..na).any(|k| {
-            let s = a + 2 + 4 * k;
-            dbr(s) == 0x00 && dbr(s + 1) == 0x0F && dbr(s + 2) == 0xAC && dbr(s + 3) == 2
-        });
-        let caps = a + 2 + 4 * na;
-        let mfpc = caps + 1 < rsn + l && dbr(caps) & 0x80 != 0;
-        if !psk {
-            return;
-        }
+        let Some(mfpc) = rsn_psk(rsn, l) else { return };
         let rssi = (dr32u(bi + 76) >> 16) as u16 as i16;
         let five = cs & 0xC000 == 0xC000;
         // The band knob (ferros_sys::control::WIFI_BAND): 1 keeps only 5 GHz, 2 only 2.4 GHz; anything else (0, unset, a value this driver does not know) is any.
@@ -1623,6 +1663,66 @@ impl Msgbuf {
         }
         let bssid: [u8; 6] = core::array::from_fn(|k| dbr(bi + 8 + k as u32));
         self.target = Some(Target { bssid, chanspec: cs, rssi, group, mfpc, ctl: dbr(bi + 88), five });
+    }
+    /// The network to join: its name, which the scan matches (`consider`) and the MAC is keyed on (`set_mac`).
+    fn set_want(&mut self, name: &[u8]) {
+        self.want = [0; 32];
+        self.want[..name.len()].copy_from_slice(name);
+        self.want_len = name.len();
+    }
+    /// SCAN's reply: [scanning 0/1, count, then per network strongest first: name length, name, signal (dBm, signed byte), flags (`Net`, bit 4: the network being joined or kept)].
+    fn scan_reply(&self, scanning: bool, out: &mut [u8]) -> usize {
+        let mut order = [0u8; 32];
+        for (k, o) in order.iter_mut().enumerate() {
+            *o = k as u8;
+        }
+        let order = &mut order[..self.nnets];
+        order.sort_unstable_by(|a, b| self.nets[*b as usize].rssi.cmp(&self.nets[*a as usize].rssi));
+        out[0] = scanning as u8;
+        out[1] = self.nnets as u8;
+        let mut at = 2;
+        for &k in order.iter() {
+            let e = &self.nets[k as usize];
+            let name = &e.name[..e.len as usize];
+            let known = if self.want_len > 0 && name == &self.want[..self.want_len] { 1 << 4 } else { 0 };
+            out[at] = e.len;
+            out[at + 1..at + 1 + name.len()].copy_from_slice(name);
+            at += 1 + name.len();
+            out[at] = e.rssi as i8 as u8;
+            out[at + 1] = e.flags | known;
+            at += 2;
+        }
+        at
+    }
+    /// STATUS's reply: [state: 0 waiting for a network, 1 scanning, 2 joined; the last join's outcome (`outcome`); the name length; the name being joined or kept].
+    fn status_reply(&self, state: u8, out: &mut [u8]) -> usize {
+        out[0] = state;
+        out[1] = self.outcome;
+        out[2] = self.want_len as u8;
+        out[3..3 + self.want_len].copy_from_slice(&self.want[..self.want_len]);
+        3 + self.want_len
+    }
+    /// One BSS into the network list: a name seen before keeps its strongest signal and gathers the flags; a hidden network (no name) is not listed.
+    fn note_net(&mut self, bi: u32, cs: u32, rssi: i16, flags: u8) {
+        // The SSID length is the firmware's byte from the air (0..=255 as a field); the name buffer is 32 bytes (802.11's limit), so a longer one would index past it: bounded, as `bss` bounds its print.
+        let n = (dbr(bi + 18) as usize).min(32);
+        if n == 0 {
+            return;
+        }
+        let name: [u8; 32] = core::array::from_fn(|k| if k < n { dbr(bi + 19 + k as u32) } else { 0 });
+        let five = if cs & 0xC000 == 0xC000 { 8 } else { 0 };
+        let g = self.scan_gen;
+        if let Some(e) = self.nets[..self.nnets].iter_mut().find(|e| e.len as usize == n && e.name == name) {
+            // First sight in this scan: the entry starts over; then the strongest BSS of the name.
+            if e.seen_in != g {
+                (e.rssi, e.flags, e.seen_in) = (rssi, 0, g);
+            }
+            e.rssi = e.rssi.max(rssi);
+            e.flags |= flags | five;
+        } else if self.nnets < self.nets.len() {
+            self.nets[self.nnets] = Net { name, len: n as u8, rssi, flags: flags | five, seen_in: g };
+            self.nnets += 1;
+        }
     }
     /// One ioctl: `in_len` bytes at the request buffer go to the firmware, up to `out_len` come back in a posted response buffer. Waits for the completion (3 s), handling events meanwhile.
     fn ioctl(&mut self, d: &mut Drv, cmd: u32, req_buf: u32, in_len: u32, out_len: u32) -> Option<(u32, u32, u32)> {
@@ -1952,6 +2052,13 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
                 out[6] = m.linked as u8;
                 7
             }
+            // The network page while joined: the list from before the join (no scan runs while serving), JOIN refused with 3 (joined already; another network is a later change), and the status.
+            Some(4) => m.scan_reply(false, &mut out),
+            Some(5) => {
+                out[0] = 3;
+                1
+            }
+            Some(6) => m.status_reply(2, &mut out),
             Some(1) => {
                 out[0] = 1;
                 1
@@ -2171,8 +2278,8 @@ fn from_vault(d: &Drv) -> Option<(Fw<'static>, &'static mut [u8], &'static [u8],
     let fw_len = store_get_at(d, b"fw", 0, &mut head)?;
     let nv = vault_file(d, b"nvram", 0x10_0000)?;
     let clm = vault_file(d, b"clm", 0x11_0000).map(|b| &*b).unwrap_or(&[]);
-    let cred = vault_file(d, b"cred", 0x12_0000).map(|b| &*b).unwrap_or(&[]);
-    Some((Fw::Vault(fw_len), nv, clm, cred))
+    // The credential is read by `connect` (`stored_cred`): the person's or the device's, as a document.
+    Some((Fw::Vault(fw_len), nv, clm, &[]))
 }
 
 /// One small file of the vault scope `wifi.`, read whole into scratch `at` bytes into the DMA region (64 KiB at most). None when it is absent, too large, or locked (the credential is the person's, AUTH.md).
@@ -2197,44 +2304,207 @@ fn vault_file(d: &Drv, key: &[u8], at: u64) -> Option<&'static mut [u8]> {
     Some(buf)
 }
 
-/// The network credential when it was not there at the start: networks travel with the person (AUTH.md), so `wifi.cred` is locked until someone attests. Asked again four times a second, the chip up and its firmware running meanwhile; said once.
-fn wait_cred(d: &mut Drv) -> &'static [u8] {
-    d.put(b"no network credential yet (the person's, locked until attest): waiting for it\n");
-    d.flush();
-    // The corners' WiFi circle: up, no link, while it waits.
-    ferros_sys::status(0, ferros_sys::measure_word(ferros_sys::measure::STATE, 1));
-    loop {
-        if let Some(c) = vault_file(d, b"cred", 0x12_0000) {
-            d.put(b"network credential readable: joining\n");
-            d.flush();
-            return c;
+/// The network credential (ferros_detail::network, a VSF document): its name and passphrase, or None if it is not one. Never printed.
+fn credential(c: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    ferros_detail::network::parse(c)
+}
+
+/// The credential the vault keeps: the person's (`wifi.cred`, readable once someone attests, AUTH.md) before the device's (`wifi.net`, a network joined before anyone attested). A value that is not a credential document (the two-line text file it replaced, 2026-11-09) is dropped, never parsed.
+fn stored_cred(d: &mut Drv) -> Option<(Vec<u8>, Vec<u8>, &'static [u8])> {
+    for key in [&b"cred"[..], b"net"] {
+        let Some(doc) = vault_file(d, key, 0x12_0000) else { continue };
+        match credential(doc) {
+            Some((n, p)) => return Some((n, p, key)),
+            None => {
+                let gone = ferros_sys::store_delete(d.cap(STORE), key);
+                d.put(b"wifi.");
+                d.put(key);
+                d.put(if gone == Some(true) { b" dropped: not a credential document\n" } else { b" is not a credential document and could not be dropped\n" });
+                d.flush();
+            }
         }
-        ferros_sys::sleep_until(ferros_sys::now() + d.freq / 4);
+    }
+    None
+}
+
+/// Eagle time now, in oscillations (the vault process's `eagle`): 0 until the kernel has read the PMIC's clock.
+fn eagle() -> i64 {
+    // The Eagle epoch (1969-07-20 20:17:40 UTC) in the wall clock's seconds.
+    const EPOCH_UNIX: i128 = -14_182_940;
+    let Some((secs, ticks, hz)) = ferros_sys::utc_time() else { return 0 };
+    let ops = ferros_detail::vsf::OSCILLATIONS_PER_SECOND as i128;
+    ((secs as i128 - EPOCH_UNIX) * ops + ticks as i128 * ops / hz as i128) as i64
+}
+
+/// The boot path's join (init's pcie1): the radio up, then a credential — the vault's (`stored_cred`), or one the network page hands in (JOIN, `serve_unjoined`) — scanned for and joined. A join that fails goes back to serving the page; a credential handed in that failed is deleted again (a mistyped passphrase is not kept), and the vault's own is retried when a scan sees its network.
+fn connect(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
+    let mut next = stored_cred(d).map(|(n, p, k)| (n, p, k, false));
+    if let Some((n, _, k, _)) = &next {
+        m.set_want(n);
+        m.personal = *k == b"cred";
+    }
+    m.band = ferros_sys::controls(ferros_sys::control::WIFI)[ferros_sys::control::WIFI_BAND as usize];
+    radio_up(d, m, clm);
+    // radio_up set this credential's MAC; any other needs the radio brought down first (`rejoin_as`).
+    let mut fresh = true;
+    let mut skip: Option<(Vec<u8>, Vec<u8>, &'static [u8])> = None;
+    loop {
+        let (name, pass, key, handed) = match next.take() {
+            Some(c) => c,
+            None => {
+                fresh = false;
+                serve_unjoined(d, m, &skip)
+            }
+        };
+        if fresh {
+            m.target = None;
+            escan_start(d, m);
+            escan_wait(d, m);
+        } else {
+            rejoin_as(d, m, &name, key == b"cred");
+        }
+        fresh = false;
+        join(d, m, &name, &pass);
+        if m.keyed {
+            return;
+        }
+        // Not joined: the firmware let go of any half-made association (WLC_DISASSOC 52), and the join's state cleared for the next.
+        let req = m.dma + 0x1_3000;
+        for k in 0..12 {
+            db(req + k, 0);
+        }
+        let _ = m.ioctl(d, 52, req, 12, 12);
+        m.linked = false;
+        m.join_failed = false;
+        skip = if handed {
+            let _ = ferros_sys::store_delete(d.cap(STORE), key);
+            d.put(b"the credential handed in did not join: deleted\n");
+            d.flush();
+            None
+        } else {
+            Some((name, pass, key))
+        };
     }
 }
 
-/// The WiFi credential file (keys/wifi.txt): the SSID on the first line, the passphrase on the second. Never printed.
-fn credential(c: &[u8]) -> Option<(&[u8], &[u8])> {
-    let trim = |s: &[u8]| -> usize { s.iter().rposition(|&b| b != b'\r' && b != b' ').map(|i| i + 1).unwrap_or(0) };
-    let nl = c.iter().position(|&b| b == b'\n')?;
-    let ssid = &c[..trim(&c[..nl])];
-    let rest = &c[nl + 1..];
-    let end = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
-    let pass = &rest[..trim(&rest[..end])];
-    if ssid.is_empty() || ssid.len() > 32 || pass.len() < 8 || pass.len() > 63 {
-        return None;
+/// Before any join (`connect`), the network page's requests on `wlan`, beside the vault looked at four times a second: 3 the MAC (not linked), 4 SCAN ([4, 1] starts a scan unless one runs, [4] reads the list; the reply is the list so far, the last scan's until this one ends, `scan_reply`), 5 JOIN ([5, name length, name, passphrase]: kept in the vault, then joined), 6 STATUS (`status_reply`). The radio sends nothing until asked: no scan runs unless the page asks for one or a kept credential is waiting for its network. Returns a credential to join and, for one handed in, the vault key it was kept under. `skip`: the vault's credential that last failed; it is tried again once a scan sees its network.
+fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, skip: &Option<(Vec<u8>, Vec<u8>, &'static [u8])>) -> (Vec<u8>, Vec<u8>, &'static [u8], bool) {
+    d.put(b"no network to join: serving the network page\n");
+    d.flush();
+    // The corners' WiFi circle: up, no link.
+    ferros_sys::status(0, ferros_sys::measure_word(ferros_sys::measure::STATE, 1));
+    let mut msg = [0u8; 256];
+    let mut out = [0u8; 2048];
+    let mut tok = [0u8; 32];
+    let mut vault_at = 0u64;
+    let mut scanning = false;
+    // A kept credential out of range is looked for again every 64 s.
+    let mut retry_at = d.now() + (1 << 6) * d.freq;
+    loop {
+        ferros_sys::pet();
+        let _ = m.pump(d);
+        if scanning && m.scan_done {
+            scanning = false;
+            if let Some((name, pass, key)) = skip {
+                if m.nets[..m.nnets].iter().any(|e| e.flags & 1 != 0 && &e.name[..e.len as usize] == &name[..]) {
+                    return (name.clone(), pass.clone(), key, false);
+                }
+            }
+        }
+        if skip.is_some() && !scanning && d.now() >= retry_at {
+            retry_at = d.now() + (1 << 6) * d.freq;
+            escan_start(d, m);
+            scanning = true;
+        }
+        if d.now().wrapping_sub(vault_at) >= d.freq / 4 {
+            vault_at = d.now();
+            if let Some(c) = stored_cred(d) {
+                if skip.as_ref() != Some(&c) {
+                    d.put(b"network credential readable: joining\n");
+                    d.flush();
+                    return (c.0, c.1, c.2, false);
+                }
+            }
+        }
+        let n = svc(2, d.cap(WLAN), msg.as_mut_ptr() as u64 - d.base, msg.len() as u64, tok.as_mut_ptr() as u64 - d.base, 1);
+        if n == u64::MAX - 1 || n == ERR {
+            ferros_sys::sleep_until(ferros_sys::now() + d.freq / 1000);
+            continue;
+        }
+        let msg = unsafe { core::ptr::read_volatile(&msg) };
+        let n = n as usize;
+        let mut handed = None;
+        let len = match msg.first() {
+            Some(3) => {
+                out[..6].copy_from_slice(&m.mac);
+                out[6] = 0;
+                7
+            }
+            // [4, 1] starts a scan (unless one runs), [4] or [4, 0] only reads the list: the page asks for one scan and polls.
+            Some(4) => {
+                if n >= 2 && msg[1] == 1 && !scanning {
+                    escan_start(d, m);
+                    scanning = true;
+                }
+                m.scan_reply(scanning, &mut out)
+            }
+            Some(5) if n >= 2 && 2 + msg[1] as usize <= n => {
+                let (name, pass) = (&msg[2..2 + msg[1] as usize], &msg[2 + msg[1] as usize..n]);
+                // Kept before it is tried, so the join survives a restart; deleted again if it does not join (`connect`). The person's when someone has attested, else the device's.
+                match ferros_detail::network::build(name, pass, eagle()) {
+                    None => {
+                        out[0] = 1;
+                    }
+                    Some(doc) => {
+                        let cap = d.cap(STORE);
+                        let key: Option<&'static [u8]> = [&b"cred"[..], b"net"].into_iter().find(|k| ferros_sys::store_set_at(cap, k, 0, &doc, false));
+                        match key {
+                            Some(k) => {
+                                out[0] = 0;
+                                out[1] = (k == b"net") as u8;
+                                handed = Some((name.to_vec(), pass.to_vec(), k));
+                            }
+                            None => out[0] = 2,
+                        }
+                    }
+                }
+                if handed.is_some() { 2 } else { 1 }
+            }
+            Some(6) => m.status_reply(if scanning { 1 } else { 0 }, &mut out),
+            _ => 0,
+        };
+        svc(3, tok.as_ptr() as u64 - d.base, out.as_ptr() as u64 - d.base, len as u64, 0, 0);
+        if let Some((name, pass, key)) = handed {
+            d.put(b"a network handed in by the page: joining\n");
+            d.flush();
+            return (name, pass, key, true);
+        }
     }
-    Some((ssid, pass))
+}
+
+/// The radio brought down and up again as this network's MAC (`set_mac` needs it down: WLC_DOWN 3, then WLC_UP 2), then a scan for its BSSes.
+fn rejoin_as(d: &mut Drv, m: &mut Msgbuf, name: &[u8], personal: bool) {
+    m.set_want(name);
+    m.personal = personal;
+    m.target = None;
+    m.band = ferros_sys::controls(ferros_sys::control::WIFI)[ferros_sys::control::WIFI_BAND as usize];
+    let req = m.dma + 0x1_3000;
+    for k in 0..4 {
+        db(req + k, 0);
+    }
+    let r = m.ioctl(d, 3, req, 4, 4).map(|r| r.0).unwrap_or(u32::MAX);
+    d.kv(b"WLC_DOWN", r);
+    set_mac(d, m);
+    let r = m.ioctl(d, 2, req, 4, 4).map(|r| r.0).unwrap_or(u32::MAX);
+    d.kv(b"WLC_UP", r);
+    escan_start(d, m);
+    escan_wait(d, m);
 }
 
 /// Stage 12: join the best scanned BSS of the credential's network with WPA2-PSK, the firmware doing the 4-way handshake (dhd's wl_cfg80211_connect order: sup_wpa, STA defaults, infra, security cleared, wpa_auth provisional → auth → wsec → mfp → wpa_auth final, the passphrase as WLC_SET_WSEC_PMK, our RSN IE as "wpaie", then "join" with the BSSID and chanspec). Done when the firmware's supplicant reports keyed.
-fn join(d: &mut Drv, m: &mut Msgbuf, cred: &[u8]) {
-    let Some((ssid, pass)) = credential(cred) else {
-        d.put(b"stage 12 wants --input-file keys/wifi.txt (SSID line, passphrase line, 8..63 chars)\n");
-        d.flush();
-        return;
-    };
+fn join(d: &mut Drv, m: &mut Msgbuf, ssid: &[u8], pass: &[u8]) {
     let Some(t) = m.target else {
+        m.outcome = 1;
         d.put(b"no WPA2-PSK BSS of that SSID in the scan (outside 6 GHz)\n");
         d.flush();
         return;
@@ -2244,11 +2514,14 @@ fn join(d: &mut Drv, m: &mut Msgbuf, cred: &[u8]) {
     d.put(b" rssi -");
     d.dec((-(t.rssi as i32)).max(0) as u32);
     d.put(if t.mfpc { b" (AP can do MFP)\n" } else { b"\n" });
-    // Receive buffers first: the firmware runs split RX (SPLITRX_MODE 4), so data frames — the AP's EAPOL handshake messages among them — land in host buffers from the rxpost ring; with none posted the handshake never starts (seen: associated, no PSK_SUP, beacon loss after 15 s).
-    for i in 0..64 {
-        m.post_rx(i);
+    // Receive buffers first: the firmware runs split RX (SPLITRX_MODE 4), so data frames — the AP's EAPOL handshake messages among them — land in host buffers from the rxpost ring; with none posted the handshake never starts (seen: associated, no PSK_SUP, beacon loss after 15 s). Posted once: a later join (another network, `connect`) finds them there.
+    if !m.rx_up {
+        for i in 0..64 {
+            m.post_rx(i);
+        }
+        m.ring_rx(d);
+        m.rx_up = true;
     }
-    m.ring_rx(d);
     let r = m.set_int(d, b"sup_wpa", 1);
     d.kv(b"sup_wpa", r);
     let r = m.set_int(d, b"roam_off", 1);
@@ -2347,6 +2620,7 @@ fn join(d: &mut Drv, m: &mut Msgbuf, cred: &[u8]) {
     }
     d.kv(b"join_ms", ((d.now().wrapping_sub(ts) * 1000) / d.freq) as u32);
     d.kv(b"rx frames", m.rx_frames);
+    m.outcome = if m.keyed { 4 } else if m.join_failed { 2 } else { 3 };
     if m.keyed {
         d.put(b"ASSOCIATED AND KEYED (WPA2-PSK, firmware supplicant)\n");
         // scb_val_t: i32 val, u8 ea[6], pad — WLC_GET_RSSI (127).
@@ -2392,6 +2666,13 @@ fn dload(d: &mut Drv, m: &mut Msgbuf, iovar: &[u8], blob: &[u8]) -> u32 {
 
 /// Stage 11: a scan, the way dhd's up path and wl_run_escan do it. The regulatory blob first, loaded whatever `country` reads (`dload`), then the txcap blob, the escan-result event (69) enabled in `event_msgs_ext`, WLC_UP (2), `scan_ver` to pick the request layout, then `escan` over every channel; results arrive as events, one BSS each, until a final status.
 fn scan(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
+    radio_up(d, m, clm);
+    escan_start(d, m);
+    escan_wait(d, m);
+}
+
+/// The radio up for scanning and joining (stage 11's first half, `scan`): the regulatory and transmit-power blobs, the events, this network's MAC (`set_mac`), `bus:host_access`, WLC_UP, and the escan layout.
+fn radio_up(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
     let req = m.dma + 0x1_3000;
     // The regulatory blob, whatever `country` reads (dhd_common.c dhd_apply_default_clm loads it every time: a firmware with its own table, as akita's BCM4383 a3, would otherwise run its built-in table, not the SKU's), then the transmit-power caps after it (dhd_apply_default_txcap, the same chunks with `txcapload`; dhd only logs its failure). The txcap blob from the vault's `wifi.txcap`, when there is one.
     let country = |d: &mut Drv, m: &mut Msgbuf, when: &[u8]| {
@@ -2434,9 +2715,24 @@ fn scan(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
     for (k, v) in 0u32.to_le_bytes().iter().enumerate() {
         db(req + k as u32, *v);
     }
+    set_mac(d, m);
+    // `bus:host_access` = 1 just before WLC_UP, as both Google drivers send it (dhd_cfg80211.c, WLAN_ACCEL_BOOT, built into the BCM4398's and the BCM4383's): the host may reach the dongle's memory. Its status logged; a firmware without it answers an error and nothing else changes.
+    let r = m.set_var(d, b"bus:host_access", &1u32.to_le_bytes());
+    d.kv(b"bus:host_access", r);
+    let r = m.ioctl(d, 2, req, 4, 4).map(|r| r.0).unwrap_or(u32::MAX);
+    d.kv(b"WLC_UP", r);
+    m.scan_ver = match m.get_var(d, b"scan_ver", req) {
+        Some((0, b, _)) => dr32u(m.resp(b) + 4) & 0xFFFF,
+        _ => 1,
+    };
+    d.kv(b"scan_ver", m.scan_ver);
+}
+
+/// The MAC to join with, set while the radio is down (`radio_up`, before WLC_UP; `rejoin_as` brings the radio down for another network).
+fn set_mac(d: &mut Drv, m: &mut Msgbuf) {
     // The MAC to join with, set while the radio is still down: one address per network (owner, 2026-10-31) — the first six bytes of BLAKE3 keyed by this device's ira-derived key over the network's SSID, made a locally administered unicast address (bit 1 of the first byte set, bit 0 clear). The same on a network every time, different on every other, and not linkable between them without the ira. Keyed on the SSID, not the access point's MAC: the SSID is known before the radio comes up, which is when the address must be set, and one network answers from a different MAC on each band and each mesh node. Without the ira right, or with no SSID to join, a random address from the entropy right. Never the chip's own: the calibration file's Broadcom placeholder (00:90:4c:50:10:01, the same on every unit), which pangolin refused from the evening of 2026-10-29 on.
     let mut mac = [0u8; 6];
-    let ssid = &m.want[..m.want_len];
+    let ssid = if m.personal { &m.want[..m.want_len] } else { &[][..] };
     let keyed = match ferros_sys::ira_key(d.cap(IRA), "wifi mac per network v1") {
         Some(key) if !ssid.is_empty() => {
             mac.copy_from_slice(&blake3::keyed_hash(&key, ssid).as_bytes()[..6]);
@@ -2447,7 +2743,7 @@ fn scan(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
     if keyed || svc(6, d.cap(ENTROPY), mac.as_mut_ptr() as u64 - d.base, 6, 0, 0) == 6 {
         mac[0] = (mac[0] & 0xFC) | 2;
         let r = m.set_var(d, b"cur_etheraddr", &mac);
-        d.kv(if keyed { b"cur_etheraddr set (this network's, from the ira)" } else { b"cur_etheraddr set (random: no ira right or no SSID)" }, r);
+        d.kv(if keyed { b"cur_etheraddr set (this network's, from the ira)" } else { b"cur_etheraddr set (random: no ira right, no network yet, or a network joined before anyone attested)" }, r);
         let h = b"0123456789abcdef";
         d.put(b"joining as MAC ");
         for (k, v) in mac.iter().enumerate() {
@@ -2458,16 +2754,13 @@ fn scan(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
         }
         d.put(b"\n");
     }
-    // `bus:host_access` = 1 just before WLC_UP, as both Google drivers send it (dhd_cfg80211.c, WLAN_ACCEL_BOOT, built into the BCM4398's and the BCM4383's): the host may reach the dongle's memory. Its status logged; a firmware without it answers an error and nothing else changes.
-    let r = m.set_var(d, b"bus:host_access", &1u32.to_le_bytes());
-    d.kv(b"bus:host_access", r);
-    let r = m.ioctl(d, 2, req, 4, 4).map(|r| r.0).unwrap_or(u32::MAX);
-    d.kv(b"WLC_UP", r);
-    let ver = match m.get_var(d, b"scan_ver", req) {
-        Some((0, b, _)) => dr32u(m.resp(b) + 4) & 0xFFFF,
-        _ => 1,
-    };
-    d.kv(b"scan_ver", ver);
+}
+
+/// A scan started (`escan`), its results arriving as events (`event`, `bss`): the network list starts over.
+fn escan_start(d: &mut Drv, m: &mut Msgbuf) {
+    let ver = m.scan_ver;
+    m.nseen = 0;
+    m.scan_gen = m.scan_gen.wrapping_add(1);
     // escan: u32 version, u16 action 1 (start), u16 sync id, then the scan params — v1 without the version/length prefix; v2/v3 72 bytes, v4 76 (scan_type_ext). Broadcast SSID, BSSID ff…ff, any BSS type, active, firmware-default times, every channel.
     let mut p = [0u8; 84];
     let (hdr_ver, plen): (u32, usize) = match ver {
@@ -2494,6 +2787,10 @@ fn scan(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
     let r = m.set_var(d, b"escan", &p[..8 + plen]);
     d.kv(b"escan", r);
     d.flush();
+}
+
+/// The scan waited out (12 s at most), events handled meanwhile; BSSes are printed for the first scan only.
+fn escan_wait(d: &mut Drv, m: &mut Msgbuf) {
     let ts = d.now();
     while !m.scan_done && d.now().wrapping_sub(ts) < 12 * d.freq {
         let _ = m.pump(d);
@@ -2502,6 +2799,26 @@ fn scan(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
     d.kv(b"BSSes", m.nseen as u32);
     d.kv(b"scan_ms", ((d.now().wrapping_sub(ts) * 1000) / d.freq) as u32);
     d.flush();
+    m.quiet = true;
+}
+
+/// An RSN IE's body at `rsn`, `l` bytes (version 2, group 4, pairwise count + list, AKM count + list, capabilities): Some(whether the AP can do management frame protection) when it offers PSK (00-0F-AC:2), None otherwise.
+fn rsn_psk(rsn: u32, l: u32) -> Option<bool> {
+    if l < 8 {
+        return None;
+    }
+    let np = (dbr(rsn + 6) as u32) | (dbr(rsn + 7) as u32) << 8;
+    let a = rsn + 8 + 4 * np;
+    if a + 2 > rsn + l {
+        return None;
+    }
+    let na = (dbr(a) as u32) | (dbr(a + 1) as u32) << 8;
+    let psk = (0..na).any(|k| {
+        let s = a + 2 + 4 * k;
+        dbr(s) == 0x00 && dbr(s + 1) == 0x0F && dbr(s + 2) == 0xAC && dbr(s + 3) == 2
+    });
+    let caps = a + 2 + 4 * na;
+    psk.then_some(caps + 1 < rsn + l && dbr(caps) & 0x80 != 0)
 }
 
 /// bcmutils.c process_nvram_vars, in place: drop '\r', '#' comments to end of line and empty lines; each line ends in a NUL. Returns the length used (the rest is zeroed).

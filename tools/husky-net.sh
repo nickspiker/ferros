@@ -15,6 +15,10 @@ FW=${FW:-$FWDIR/fw_bcmdhd.bin_4398_d0}
 NVRAM=${NVRAM:-$FWDIR/bcmdhd.cal_USI_G5SN_9957_V17}
 CLM=${CLM:-$FWDIR/bcmdhd_clm.blob_4398_d0}
 CRED=${CRED:-/mnt/Harbor/Code/keys/wifi.txt}
+# pcie1 reads the credential as a VSF document (ferros_detail network.rs), made here from the text file and removed on exit.
+CREDDOC=$(mktemp)
+trap 'rm -f "$CREDDOC"' EXIT
+[ -f "$CRED" ] && "$B" wifi-cred "$CRED" "$CREDDOC" >/dev/null
 ( cd "$REPO" && cargo el0 -q -p ferros-payload-pcie1 -p ferros-payload-ip -p ferros-payload-nettest ) || exit 1
 for b in pcie1 ip nettest; do aarch64-linux-gnu-objcopy -O binary "$R/$b" "$R/$b.bin" || exit 1; done
 # MASKED=1: run ip and nettest as sandboxed images (tools/ferros-masked-build.sh; the checker accepted every instruction).
@@ -29,7 +33,7 @@ fi
 drain() { "$B" diag console 2>/dev/null | grep -v '^ALIVE=' | grep -v '^$' | tee -a "$LOG"; }
 HW="--hw pcie1-elbi --hw pcie1-soc --hw pcie1-pcs --hw pcie1-udbg --hw pcie1-phy --hw pcie1-dbi --hw pcie1-cfg --hw pcie1-mem --hw gpio-hsi2 --hw gpio-far-alive --hw cmu-hsi2 --hw pmu"
 echo "=== wifi driver (stage 14: firmware, join, serve wlan)"
-timeout 120 "$B" spawn "$R/pcie1.bin" 14 --name pcie1 $HW --entropy --dma pcie1-dma --serve wlan --store wifi --ira --input-file "$FW" --input-file "$NVRAM" --input-file "$CLM" --input-file "$CRED" >/dev/null 2>&1
+timeout 120 "$B" spawn "$R/pcie1.bin" 14 --name pcie1 $HW --entropy --dma pcie1-dma --serve wlan --store wifi --ira --input-file "$FW" --input-file "$NVRAM" --input-file "$CLM" --input-file "$CREDDOC" >/dev/null 2>&1
 for _ in $(seq 90); do
     drain >/dev/null
     grep -q "serving wlan" "$LOG" && break
