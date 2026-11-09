@@ -191,10 +191,63 @@ pub fn pet_watchdogs() {
     }
 }
 
+/// The stall catcher's record (the Pro's watchdog reset of 2026-11-08: the X3 held the kernel lock past the watchdog's second in the middle of a cutout scan, and nothing said where). When the watchdog has gone half its window unpetted, a worker asks the core that holds the kernel lock (with the lock free, the kernel's own core) where it is (SGI 2, main.rs `.Lirq_dump`) and keeps the answer here, cleaned to DRAM, so the reset that follows leaves the stalled core's place for the next boot. Six words at +G#260: the head (bits 0-7 the stalled core + 1, 8-15 the core that caught it, 16-39 milliseconds since the last pet, 40-47 the kernel lock's holder + 1 or 0, 48-63 stalls caught this boot), ELR (0: the core did not take the SGI within a millisecond, its interrupts masked), x30, SPSR, the kernel lock's note at the catch (slot 0: holder and call site), the counter at the catch. The previous boot's six at +G#290 (`notes_rotate`); DIAG STALL_* and PREV_STALL_*, and the decoded lines `diag` prints. Addresses decode against the kernel ELF (`aarch64-linux-gnu-addr2line -e target/aarch64-unknown-none/release/ferros_kernel`).
+pub const STALL: usize = RAMOOPS_RESULT + 0x260;
+pub const STALL_WORDS: usize = 6;
+/// The last pet the caught stall followed: one catch per stall, however many cores look.
+static STALL_FOR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static STALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// From the workers (their idle loop, and their spin on a held kernel lock): catch a stall of the kernel's core or of the lock's holder while the watchdog still runs. Costs two loads and a compare when nothing is stalled.
+pub fn stall_check() {
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed};
+    let last = LAST_PET.load(Relaxed);
+    if last == 0 || RESET_ORDERED.load(Relaxed) || PET_HOLD.load(Relaxed) {
+        return;
+    }
+    let (f, now) = (cntfrq(), cntpct());
+    if now.wrapping_sub(last) < f >> 1 || STALL_FOR.swap(last, AcqRel) == last {
+        return;
+    }
+    let holder = crate::process::holder();
+    let me = crate::process::core();
+    let target = if holder != 0 { holder - 1 } else { crate::process::kernel_mask().trailing_zeros() as usize };
+    // A core never spins on a lock it holds, and the idle loop holds none: only the kernel's own core finding itself silent (no lock held) lands here, with nobody else to ask.
+    if target == me {
+        return;
+    }
+    let d = unsafe {
+        core::ptr::write_volatile(&raw mut crate::__core_dump[target], [0; 16]);
+        // SGI 2 (ICC_SGI1R_EL1: INTID bits 24-27, Aff1 bits 16-23, target list bit 0 = Aff0 0), as `diag core` sends it.
+        core::arch::asm!("dsb sy", "msr S3_0_C12_C11_5, {v}", "isb", v = in(reg) ((target as u64) << 16) | (2u64 << 24) | 1);
+        let t = cntpct();
+        while core::ptr::read_volatile(&raw const crate::__core_dump[target][0]) == 0 && cntpct().wrapping_sub(t) < f >> 10 {
+            core::hint::spin_loop();
+        }
+        core::ptr::read_volatile(&raw const crate::__core_dump[target])
+    };
+    let n = STALLS.fetch_add(1, Relaxed) + 1;
+    let ms = now.wrapping_sub(last) * 1000 / f;
+    let head = (target as u64 + 1) | (me as u64) << 8 | ms << 16 | (holder as u64) << 40 | n << 48;
+    let words = [head, d[0], d[9], d[1], note_read(0), now];
+    unsafe {
+        for (i, &w) in words.iter().enumerate() {
+            write_volatile((STALL + i * 8) as *mut u64, w);
+        }
+        core::arch::asm!("dc civac, {a}", "dc civac, {b}", "dsb sy", a = in(reg) STALL as u64, b = in(reg) (STALL + (STALL_WORDS - 1) * 8) as u64);
+    }
+}
+
+/// The stall record: this boot's (`prev` false) or the previous boot's.
+pub fn stall_read(prev: bool) -> [u64; STALL_WORDS] {
+    let base = if prev { STALL + STALL_WORDS * 8 } else { STALL };
+    core::array::from_fn(|i| unsafe { read_volatile((base + i * 8) as *const u64) })
+}
+
 /// Breadcrumb at G#18 (kernel prints it as `mbr_sig`): bumped per step so a stall leaves the last marker; the completed report writes low byte 0 (or an exit reason).
 /// Where the post-mortem notes live: the ramoops result page, beside the crumb (+G#18) that has survived every kind of reset — slots 0-7 at +G#100, the previous boot's at +G#140. Every other home tried got overwritten by something at boot (2026-10-23: the gate, a log, the 17 MB gate image, the modem firmware, and G#B000_0000 read back as noise).
 pub const NOTES: usize = RAMOOPS_RESULT + 0x100;
-/// Slot 0: the kernel lock's holder (core + 1, 0 = free; process.rs). Slots 1-5: cores 4-8's last crumb, the core in the top byte. Slot 6: the service loop's last crumb.
+/// Slot 0: the kernel lock's holder and where it took the lock (process.rs `lock`): bits 0-7 the core + 1 (0 = free), 8-31 the call site's line, 32-63 the first four bytes of its file's name (`serv` for service.rs, `proc` for process.rs). Slots 1-5: cores 4-8's last crumb, the core in the top byte. Slot 6: the clock policy's state (top byte: 1 rest, 2 active, 3 dark) and CNTHCTL_EL2 at the last switch (service.rs `clock_profile`; G#F7 is the event stream at bit 15 with the counters open). Slot 7: the switch count (bits 40-63) and the counter at the last switch, shifted right 16.
 pub fn note(slot: usize, v: u64) {
     unsafe {
         let a = NOTES + (slot & 7) * 8;
@@ -274,6 +327,12 @@ pub fn notes_rotate() {
             write_volatile((MMIO_NOTES + 0x48 + i * 8) as *mut u64, v);
             write_volatile((MMIO_NOTES + i * 8) as *mut u64, 0);
             core::arch::asm!("dc civac, {a}", "dc civac, {b}", a = in(reg) (MMIO_NOTES + i * 8) as u64, b = in(reg) (MMIO_NOTES + 0x48 + i * 8) as u64);
+        }
+        for i in 0..STALL_WORDS {
+            let v = read_volatile((STALL + i * 8) as *const u64);
+            write_volatile((STALL + (STALL_WORDS + i) * 8) as *mut u64, v);
+            write_volatile((STALL + i * 8) as *mut u64, 0);
+            core::arch::asm!("dc civac, {a}", "dc civac, {b}", a = in(reg) (STALL + i * 8) as u64, b = in(reg) (STALL + (STALL_WORDS + i) * 8) as u64);
         }
         core::arch::asm!("dsb sy");
     }

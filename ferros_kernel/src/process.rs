@@ -46,21 +46,59 @@ static LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::ne
 pub static LOCK_SPINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The core holding the kernel lock, plus one (0: free): lets code that runs both inside syscalls and from the service loop take the lock only when it does not already hold it (`with_lock_held_or`).
 static HOLDER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Where the holder took the lock (`site_word`) and when (the counter); the longest hold since boot and its site (DIAG LOCK_HOLD_*): the measure of what keeps the other cores waiting, and of what comes near the watchdog's second.
+static LOCK_SITE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LOCK_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LOCK_HOLD_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LOCK_HOLD_SITE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The core holding the kernel lock plus one, 0 when free (platform::stall_check: whom to ask where it is).
+pub fn holder() -> usize {
+    HOLDER.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// A lock call site as one word: bits 0-23 the line, bits 24-55 the first four bytes of the file's name (`serv` for service.rs, `proc` for process.rs, `ptli`, `flas`, `part`, `sens`: unique among the kernel's files that take the lock). A line fits 24 bits (no source file is sixteen million lines).
+fn site_word(l: &core::panic::Location) -> u64 {
+    let f = l.file().as_bytes();
+    let base = f.iter().rposition(|&c| c == b'/').map_or(0, |i| i + 1);
+    let mut tag = [0u8; 4];
+    for (t, &c) in tag.iter_mut().zip(&f[base..]) {
+        *t = c;
+    }
+    l.line() as u64 | (u32::from_le_bytes(tag) as u64) << 24
+}
+
+/// Take the kernel lock. `#[track_caller]` (here and in `with_lock`) makes the call site the one that names the hold: the post-mortem note and the longest-hold measure say which `with_lock` or syscall path held it (the 2026-11-08 reset left only "core 8").
+#[track_caller]
 fn lock() {
     use core::sync::atomic::Ordering;
     if LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
         LOCK_SPINS.fetch_add(1, Ordering::Relaxed);
+        let mut spins = 0u32;
         while LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
+            // Every 4096th turn: is the holder stalled past half the watchdog's window? (platform::stall_check: one SGI to it, its place kept for the post-mortem.) WHY wrapping: a spin past 2^32 turns (minutes, a hang the watchdog ended long before) only feeds this every-4096th test, where a wrap changes nothing.
+            spins = spins.wrapping_add(1);
+            if (spins & 0xFFF) == 0 {
+                crate::platform::stall_check();
+            }
         }
     }
+    let site = site_word(core::panic::Location::caller());
     HOLDER.store(core() + 1, Ordering::Relaxed);
-    // Who holds it, for the post-mortem (a hang with the lock held names its core).
-    crate::platform::note(0, core() as u64 + 1);
+    LOCK_SITE.store(site, Ordering::Relaxed);
+    LOCK_AT.store(crate::platform::cntpct(), Ordering::Relaxed);
+    // Who holds it and from where, for the post-mortem (a hang with the lock held names its core and its call site).
+    crate::platform::note(0, core() as u64 + 1 | site << 8);
 }
 fn unlock() {
-    HOLDER.store(0, core::sync::atomic::Ordering::Relaxed);
+    use core::sync::atomic::Ordering::Relaxed;
+    let held = crate::platform::cntpct().wrapping_sub(LOCK_AT.load(Relaxed));
+    if held > LOCK_HOLD_MAX.load(Relaxed) {
+        LOCK_HOLD_MAX.store(held, Relaxed);
+        LOCK_HOLD_SITE.store(LOCK_SITE.load(Relaxed), Relaxed);
+    }
+    HOLDER.store(0, Relaxed);
     crate::platform::note(0, 0);
     LOCK.store(false, core::sync::atomic::Ordering::Release);
 }
@@ -1035,6 +1073,7 @@ fn write_pref_all(index: usize, value: u8) {
 }
 
 /// Run `f` with the kernel lock held — the service loop's way into the vault, which is part of the kernel's locked state (syscalls reach it with the lock held; KERNEL.md "Cores"). Inside `f`, only the `_held` variants of lock-taking functions.
+#[track_caller]
 pub fn with_lock<R>(f: impl FnOnce() -> R) -> R {
     lock();
     let r = f();
@@ -1043,6 +1082,7 @@ pub fn with_lock<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// `f` under the kernel lock, whether or not this core already holds it (a syscall does; the service loop does not): for code both reach, such as the flash log.
+#[track_caller]
 pub fn with_lock_held_or<R>(f: impl FnOnce() -> R) -> R {
     if HOLDER.load(core::sync::atomic::Ordering::Relaxed) == core() + 1 {
         f()
@@ -3495,7 +3535,8 @@ pub fn spawn_capsule_staged(name: &[u8], arc: Arc, capsule_len: usize, code_offs
     let ihi = match r {
         Ok(i) => i,
         Err(e) => {
-            arc_free(arc);
+            // The pools are the kernel's shared state: under the lock, as every arc taken or given back (a worker frees a process's arc at its end meanwhile).
+            with_lock(|| arc_free(arc));
             return Err(e);
         }
     };

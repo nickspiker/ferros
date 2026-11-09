@@ -721,6 +721,33 @@ fn read_capsule(key: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 }
 
 /// The boot checklist's process rows, from what a spawned process did in its first slice (the host's spawn over USB, or init at boot — which marked nothing until 2026-10-29, so a boot without a host left them red): an arc and a spawn, EL0 reached unless it faulted at entry (exit G#FA…), a syscall and its capabilities once it said something, IPC once a call came back; and the first process itself.
+/// A kernel lock call site (process.rs `site_word`) as `serv* line A#1234`: the four bytes of the file's name it keeps, then the line.
+fn site_text(w: u64) -> alloc::string::String {
+    let tag: alloc::string::String = ((w >> 24) as u32).to_le_bytes().iter().map(|&c| if c.is_ascii_graphic() { c as char } else { '?' }).collect();
+    alloc::format!("{tag}* line A#{}", w & 0xFF_FFFF)
+}
+
+/// DIAG's decoded lines for the lock and the stall catcher: the longest hold since boot and its site, the previous boot's last holder (note slot 0), and the stall records (platform::stall_check), this boot's and the previous boot's. Addresses are the kernel's own (`aarch64-linux-gnu-addr2line -e target/aarch64-unknown-none/release/ferros_kernel`) or, at EL0 (SPSR mode 0), the process's.
+fn stall_lines(freq: u64) -> alloc::string::String {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut s = alloc::format!("lock: held longest A#{} us, taken at {}\n", crate::process::LOCK_HOLD_MAX.load(Relaxed) * 1_000_000 / freq, site_text(crate::process::LOCK_HOLD_SITE.load(Relaxed)));
+    let prev_lock = platform::note_read(8);
+    if prev_lock & 0xFF != 0 {
+        s.push_str(&alloc::format!("lock at the previous boot's end: held by core A#{}, taken at {}\n", (prev_lock & 0xFF) - 1, site_text(prev_lock >> 8)));
+    }
+    for (prev, what) in [(false, "this boot"), (true, "the previous boot")] {
+        let w = platform::stall_read(prev);
+        if w[0] & 0xFF == 0 {
+            continue;
+        }
+        let holder = (w[0] >> 40) & 0xFF;
+        let lock = if holder == 0 { alloc::string::String::from("the lock free") } else { alloc::format!("the lock held by core A#{} from {}", holder - 1, site_text(w[4] >> 8)) };
+        let at = if w[1] == 0 { alloc::string::String::from("it did not answer (interrupts masked)") } else { alloc::format!("ELR G#{:X} LR G#{:X} SPSR G#{:X}", w[1], w[2], w[3]) };
+        s.push_str(&alloc::format!("stall ({what}, A#{} caught): core A#{} silent A#{} ms after the last pet, caught by core A#{}, {lock}; {at}\n", w[0] >> 48, (w[0] & 0xFF) - 1, (w[0] >> 16) & 0xFF_FFFF, (w[0] >> 8) & 0xFF));
+    }
+    s
+}
+
 fn mark_ran(o: &crate::process::Outcome) {
     use crate::checklist::{mark, Item};
     mark(Item::Arcs);
@@ -1637,6 +1664,8 @@ pub fn run(mut b: Boot) -> ! {
     platform::mark(0x3A);
     loop {
         platform::pet_watchdogs();
+        // The service loop's pass crumbs (2026-11-08: the reset left G#B4, woken from the idle `wfe`, as the X3's last word, and nothing after it said where the pass went): G#D3 the pass's top, G#D4 a command taken from the USB process, G#D5 with its capability and op (bits 8-39 and 40-47), G#D6 the polls, G#D7 the clock policy, G#D8 past the UFS hibernate and the thermal poll; then G#D1 a slice, G#D2 back, G#B3 into the idle `wfe`, G#B4 out of it.
+        platform::crumb(0xD3);
         // The power switches a process left on when it ended (one shot dead, no cleanup of its own): turned off here, on the kernel's core.
         crate::process::power_offs_apply();
         // A person unlocked: wallgen, once (`spawn_wallgen`).
@@ -1812,6 +1841,7 @@ pub fn run(mut b: Boot) -> ! {
         let inbox_full = crate::ptlink::INBOX_FULL.load(core::sync::atomic::Ordering::Relaxed);
         // Home: start init (and with it the shell and the USB process) on the service loop's first pass, the moment the boot path is done. Until 2026-11-05 it waited for a second after the press (the boot ring's budget, 2026-10-22), which made every boot take at least a second whatever the work took (owner: "I CANNOT PUT BOOTS IN UNDER A SECOND IF WHEN I PRESS POWER IT TAKES EXACTLY 1S"). init's first spawn derives the wairua, which waits for KOHI's words from worker 3: that, not a timer, is what home waits on.
         // The wall clock, re-read hourly (rtc.rs), and the battery gauge every two seconds: both on this core, never inside a syscall.
+        platform::crumb(0xD6);
         crate::rtc::poll();
         gauge_poll();
         power_poll();
@@ -1823,12 +1853,14 @@ pub fn run(mut b: Boot) -> ! {
         crate::odpm::poll();
         // The SoC's unused power domains off, once, as the clock policy starts (pd.rs). After a jump at once, on the first pass: the jump is a killswitch, and a domain Android left on may hold a bus master still running Android's work (the GPU, a codec, the camera's chain, the TPU); its power cut stops it dead, through EL3 as every domain switch goes, where its S2MPU could not be touched safely (owner, 2026-11-04: "kill the rails").
         crate::pd::gate_at_boot(now.wrapping_sub(t_boot), if platform::jumped() { 0 } else { 16 * cntfrq() });
+        platform::crumb(0xD7);
         clock_policy(false, now.wrapping_sub(t_boot));
         // The UFS link into hibernate once it has been idle 16 ms (ferros_hal ufs `h8_enter_if_idle`), under the kernel lock as every command is; every command brings it back.
         if ferros_hal::ufs::H8_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
             crate::process::with_lock(|| ferros_hal::ufs::UfsController::new(0x1320_0000).h8_enter_if_idle(cntfrq() / 64));
         }
         thermal_poll();
+        platform::crumb(0xD8);
         // Diagnostic: DECON's frames and trigger through the boot (checklist.rs frame_trace, until its 64 lines are full).
         crate::checklist::frame_trace();
         if !home_started {
@@ -1945,6 +1977,7 @@ pub fn run(mut b: Boot) -> ! {
         }
         // A command the USB process handed over (ptlink.rs, USB.md): the one dispatch below. Its handlers end with `continue`, so what follows — the raw reply handed back — runs at the top of the next pass (`proc_restore`).
         let Some(proc_cmd) = crate::process::with_lock(crate::ptlink::take_inbox) else { continue };
+        platform::crumb(0xD4);
         // Every command comes from the process now (the kernel's own USB went 2026-11-01); the name stays for the handlers that answer first and act later.
         let from_proc = true;
         // The process's second submission of a command that answered first (reload, reboot, `diag android`): now act.
@@ -1956,6 +1989,7 @@ pub fn run(mut b: Boot) -> ! {
         platform::RAW_REPLIED.store(false, core::sync::atomic::Ordering::Relaxed);
         if let Some(cmd) = ferros_pt::command::parse(payload) {
             st.last_cmd = u32::from_le_bytes([cmd.cap[0], cmd.cap[1], cmd.cap[2], cmd.cap[3]]) as u64 | (cmd.op as u64) << 56;
+            platform::crumb(0xD5 | (st.last_cmd & 0xFFFF_FFFF) << 8 | (cmd.op as u64) << 40);
             // Production builds (FERROS_PRODUCTION=1) close the development doors over USB, for the locked bootloader (BOOT.md): a cable must not be able to reload the kernel, run code, read or write memory or the vault, read the screen, spawn, or drive a diagnostic, since ABL checks only what it boots. Open: a reboot, and DIAG with no parameters (status, no secrets). The portal will grant the rest to the owner's identity (STATUS.md 7); until then they are closed outright.
             let open = !cfg!(ferros_production) || (cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec) || (cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read && cmd.params.is_empty());
             if !open {
@@ -2395,13 +2429,13 @@ pub fn run(mut b: Boot) -> ! {
                     let k = core::str::from_utf8(k).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(99);
                     if k < 16 {
                         unsafe {
-                            core::ptr::write_volatile(&raw mut crate::__core_dump[k as usize], [0; 8]);
+                            core::ptr::write_volatile(&raw mut crate::__core_dump[k as usize], [0; 16]);
                             core::arch::asm!("msr S3_0_C12_C11_5, {v}", "isb", v = in(reg) (k << 16) | (2u64 << 24) | 1);
                         }
                         let t = cntpct();
                         while cntpct().wrapping_sub(t) < cntfrq() / 100 {}
                         let d = unsafe { core::ptr::read_volatile(&raw const crate::__core_dump[k as usize]) };
-                        resp.extend_from_slice(alloc::format!("core A#{k}: ELR G#{:X} SPSR G#{:X} SP G#{:X} SP_EL0 G#{:X} x0 G#{:X} x1 G#{:X} x2 G#{:X} x3 G#{:X}\n", d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]).as_bytes());
+                        resp.extend_from_slice(alloc::format!("core A#{k}: ELR G#{:X} LR G#{:X} FP G#{:X} SPSR G#{:X} SP G#{:X} SP_EL0 G#{:X} x0 G#{:X} x1 G#{:X} x2 G#{:X} x3 G#{:X}\n", d[0], d[9], d[8], d[1], d[2], d[3], d[4], d[5], d[6], d[7]).as_bytes());
                         if d[0] == 0 {
                             resp.extend_from_slice(b"(no dump: the core did not take the SGI within 10 ms)\n");
                         }
@@ -3116,6 +3150,9 @@ pub fn run(mut b: Boot) -> ! {
                 append_hex(&mut resp, b"WDT_PETS=", crate::platform::PETS.load(core::sync::atomic::Ordering::Relaxed) as u32);
                 append_hex(&mut resp, b"WDT_HANDOVER_US=", crate::platform::HANDOVER_GAP_US.load(core::sync::atomic::Ordering::Relaxed) as u32);
                 append_hex(&mut resp, b"WDT_HANDOVER_KIND=", crate::platform::HANDOVER_KIND.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                // The kernel lock's longest hold since boot (process.rs `lock`): what keeps the other cores waiting, and how near anything comes to the watchdog's second. Decoded with the stall records in `stall_lines` below.
+                append_hex(&mut resp, b"LOCK_HOLD_MAX_US=", (crate::process::LOCK_HOLD_MAX.load(core::sync::atomic::Ordering::Relaxed) * 1_000_000 / freq) as u32);
+                resp.extend_from_slice(stall_lines(freq).as_bytes());
                 append_hex(&mut resp, b"EXC=", crate::exception_count().wrapping_sub(exc_start) as u32);
                 append_hex(&mut resp, b"UFS_LOST=", ferros_hal::ufs::UFS_LOST.load(core::sync::atomic::Ordering::Relaxed));
                 // The commands the USB process has handed over (ptlink.rs).
@@ -3634,10 +3671,11 @@ pub fn run(mut b: Boot) -> ! {
                     let (total, need, co, cl, off) = (w(0), w(1), w(2), w(3), w(4));
                     let piece = &pr[40..];
                     if off == 0 {
+                        // The arc pools under the kernel lock, as every arc taken or given back: a worker ending a process frees its arc into the same lists meanwhile (this path took and gave back unlocked until 2026-11-08).
                         if let Some((a, ..)) = spawn_stage.take() {
-                            crate::process::arc_free(a);
+                            crate::process::with_lock(|| crate::process::arc_free(a));
                         }
-                        if let Some(arc) = crate::process::arc_alloc(need, false) {
+                        if let Some(arc) = crate::process::with_lock(|| crate::process::arc_alloc(need, false)) {
                             spawn_stage = Some((arc, total, 0, co, cl));
                         }
                     }
@@ -3697,7 +3735,7 @@ pub fn run(mut b: Boot) -> ! {
                     let spawned = match staged {
                         Some((arc, total, received, co, cl)) if received == total => crate::process::spawn_capsule_staged(nm, arc, total, co, cl, input, &grants),
                         Some((arc, ..)) => {
-                            crate::process::arc_free(arc);
+                            crate::process::with_lock(|| crate::process::arc_free(arc));
                             Err("spawn: the streamed capsule is incomplete")
                         }
                         None => crate::process::spawn_capsule(nm, code, input, &grants, &sealed),

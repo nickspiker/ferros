@@ -656,7 +656,7 @@ _m1_entry:
     add     x1, x1, :lo12:__core_dump
     mrs     x2, mpidr_el1
     ubfx    x2, x2, #8, #4
-    add     x1, x1, x2, lsl #6
+    add     x1, x1, x2, lsl #7
     mrs     x2, elr_el2
     str     x2, [x1, #0]
     mrs     x2, spsr_el2
@@ -669,6 +669,8 @@ _m1_entry:
     stp     x2, x3, [x1, #32]
     ldp     x2, x3, [sp, #16]
     stp     x2, x3, [x1, #48]
+    // The frame pointer and the link register as the interrupted code left them (nothing before this in the handler touches them): with ELR, the caller of the place the core is stuck in (platform::stall_check).
+    stp     x29, x30, [x1, #64]
     dsb     sy
     b       .Lirq_eoi
 .Lirq_key:
@@ -1115,9 +1117,9 @@ pub static mut __irq_count: u64 = 0;
 /// Per core (MPIDR Aff1), where its IRQ handler last was: 1 entered, 2 past the chord check, 3 the dead loop (both volume keys read pressed and SYSTEM_OFF returned), 4 a device line masked and marked pending, 5 after EOI, 6 leaving for the preempt path, 7 returned to the interrupted code. DIAG IRQ_STAGE_Ck; a core stuck in the handler shows where (2026-10-23).
 #[unsafe(no_mangle)]
 pub static mut __irq_stage: [u64; 16] = [0; 16];
-/// Per core, what SGI 2 (`diag core <k>`) found when it interrupted it: ELR, SPSR, SP (the handler's), SP_EL0, then x0-x3 as they were — a stuck core's exact position (2026-10-23).
+/// Per core, what SGI 2 (`diag core <k>`, platform::stall_check) found when it interrupted it: ELR, SPSR, SP (the handler's), SP_EL0, x0-x3 as they were, then x29 and x30 — a stuck core's exact position and its caller (2026-10-23; x29/x30 2026-11-08). Sixteen words a core (`.Lirq_dump` steps by 128 bytes), the last six unused.
 #[unsafe(no_mangle)]
-pub static mut __core_dump: [[u64; 8]; 16] = [[0; 8]; 16];
+pub static mut __core_dump: [[u64; 16]; 16] = [[0; 16]; 16];
 #[unsafe(no_mangle)]
 static mut __boot_el: u64 = 0;
 /// Fault sink for the sync exception handler: 0 = skip-and-count (cold/m1 boots); nonzero = physical address of a ramoops result block that the FIRST fault is recorded into before a PSCI warm reset (shim path, see `.Lexc_recover`).

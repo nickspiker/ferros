@@ -243,6 +243,8 @@ extern "C" fn ferros_core_main(block: usize) -> ! {
         crate::platform::worker_step(9);
         crate::keys::serve();
         crate::platform::worker_step(10);
+        // The kernel's core (or the lock's holder) silent past half the watchdog's window: where it is, kept for the post-mortem (platform::stall_check). An idle worker wakes for its own deadlines and kicks at least, so a stall that keeps every worker idle is still seen.
+        crate::platform::stall_check();
         if STOP.load(Ordering::Acquire) != 0 {
             UP.fetch_and(!(1 << k), Ordering::AcqRel);
             OFF.fetch_add(1, Ordering::AcqRel);
