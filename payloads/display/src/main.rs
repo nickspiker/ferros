@@ -1343,7 +1343,8 @@ fn build_lut(lut: &mut [u16], white: f32, peak_e: f32) {
 /// On akita's AK3B only the DBV, as Google's `ak3b_set_brightness` sends it (`51`, big-endian, no test key): WRCTRLD stays ABL's G#20 (BCTRL, no dimming, no HBM, read back 2026-11-08), and HK3's TE2 is not sent (AK3B's B9 is its TE select).
 fn set_panel(dsi: &ferros_dsi::Dsim<DsiGrant>, hbm: bool, dbv: u16) -> bool {
     if ferros_sys::akita() {
-        return !hbm && dsi.dcs(&[0x51, (dbv >> 8) as u8, dbv as u8]).is_ok();
+        // WRCTRLD as Google's ak3b_update_wrctrld: BCTRL always, HBM G#C0 with it.
+        return dsi.dcs(&[0x53, if hbm { 0xE0 } else { 0x20 }]).and_then(|_| dsi.dcs(&[0x51, (dbv >> 8) as u8, dbv as u8])).is_ok();
     }
     let r = dsi.dcs(&[0xF0, 0x5A, 0x5A]).and_then(|_| dsi.dcs(&[0x53, if hbm { 0xE0 } else { 0x20 }])).and_then(|_| dsi.dcs(&[0x51, (dbv >> 8) as u8, dbv as u8])).and_then(|_| dsi.dcs(&[0xF0, 0xA5, 0xA5]));
     te2(dsi);
@@ -1371,7 +1372,7 @@ const HBM_NITS: f32 = 1471.9;
 /// akita's AK3B, from Google's `ak3b_brightness_capability` (not measured on this unit): normal mode DBV 209-3175 for 2-800 cd/m², high brightness mode 3176-4095 for 800-1400. ABL leaves it at DBV 1437 (read back 2026-11-08). E's share of native white (E_LIGHT) is HK3's measured one until AK3B's spectra are measured.
 const AK3B_DBV_TOP: u16 = 3175;
 const AK3B_TOP_NITS: f32 = 800.0;
-/// akita's high brightness mode peak (Google's capability, 1400 cd/m² at DBV 4095; never entered by ferros without the owner): the floor's reference, as husky's is its measured peak.
+/// akita's high brightness mode peak (Google's capability, 1400 cd/m² at DBV 4095; not measured on this unit): its brightest, and the floor's reference, as husky's measured peak is.
 const AK3B_HBM_NITS: f32 = 1400.0;
 /// akita's light against DBV in normal mode, a power law through Google's two ends (2 cd/m² at DBV 209, 800 at 3175: 2.2 fits both to a percent; husky's measured table follows 2.2 too). Not measured on this unit.
 const AK3B_GAMMA: f32 = 2.2;
@@ -1396,16 +1397,22 @@ fn panel_for(nits: f32) -> (bool, u16, f32) {
 
 /// Brightness (32nds of a stop below the brightest white, preference 3) to (white, the E peak the table lands on, the panel setting): the brightest white is half the E peak at the panel's top (owner: max white one stop under max); every 32 halve it, continuously between (owner, 2026-11-08: a continuous slider); the panel's own brightness comes down once its peak would be more than 16× white (the working format's headroom), so the codes are never wasted on light no value can reach.
 fn brightness(v: u8) -> (f32, f32, bool, u16) {
-    // akita's AK3B: the panel held at the top of its normal mode and every step in the pixels, as husky's below DBV 3307, by the same law (the brightest setting puts white at half the panel's peak). Never its high brightness mode (DBV above 3175, 800-1400 cd/m²): not without the owner's word.
+    // akita's AK3B by husky's law (owner, 2026-11-08: "Why are we restricting full power mode?"): the brightest white half the panel's peak (its high brightness mode, 1400 cd/m²), the panel following the brightness down to its floor, every finer step in the pixels.
     if ferros_sys::akita() {
-        let top_e = AK3B_TOP_NITS * E_LIGHT;
+        let top_e = AK3B_HBM_NITS * E_LIGHT;
         let white = top_e * 0.5 * libm::exp2f(-(v as f32) * (1. / (1 << 5) as f32));
         // WHY the floor (owner, 2026-11-08: "guess it goes the same for both"): never under an eighth of the panel's peak light (AK3B_HBM_NITS / 8, 175 cd/m², about DBV 1590), as husky; the emission duty drops below about DBV 1280 (photodiode, about 108 cd/m², where husky's drops too). An eighth of the normal top (100 cd/m², DBV 1234) would be under it.
         let want = (white * 16.0).min(top_e) / E_LIGHT;
         let floor = AK3B_HBM_NITS * (1. / (1 << 3) as f32);
         let nits = if want > floor { want } else { floor };
-        let dbv = (AK3B_DBV_TOP as f32 * libm::powf(nits / AK3B_TOP_NITS, 1. / AK3B_GAMMA)) as u16;
-        return (white, nits * E_LIGHT, false, dbv);
+        // Google's curves (panel-google-ak3b.c): normal mode a 2.2 power law to 800 cd/m² at DBV 3175; high brightness mode linear from 800 at DBV 3176 to 1400 at 4095.
+        let hbm = nits > AK3B_TOP_NITS;
+        let dbv = if hbm {
+            (AK3B_DBV_TOP as f32 + 1. + (nits - AK3B_TOP_NITS) * ((4095 - AK3B_DBV_TOP - 1) as f32 / (AK3B_HBM_NITS - AK3B_TOP_NITS))) as u16
+        } else {
+            (AK3B_DBV_TOP as f32 * libm::powf(nits / AK3B_TOP_NITS, 1. / AK3B_GAMMA)) as u16
+        };
+        return (white, nits * E_LIGHT, hbm, dbv);
     }
     let top_e = HBM_NITS * E_LIGHT;
     let white = top_e * 0.5 * libm::exp2f(-(v as f32) * (1. / (1 << 5) as f32));
@@ -2947,6 +2954,33 @@ fn raw_green(width: usize, height: usize, spans: &[(usize, usize, usize)], white
         }
     }
 }
+/// A measurement patch (op 52 mode 8; the panel profiled with the i1 Pro, docs/DISPLAY-CALIB.md, owner 2026-11-08): a disc of radius `r` pixels at the panel's centre in 10-bit codes `fg` on `bg`, whole pixels (a pixel is the disc's when its centre is inside), or the whole panel in `fg` when `r` is 0. Raw codes, past the present table: the panel's own response is what is measured.
+fn raw_patch(width: usize, height: usize, fg: (u32, u32, u32), bg: (u32, u32, u32), r: usize) {
+    let (f, b) = (pack10(fg.0, fg.1, fg.2), pack10(bg.0, bg.1, bg.2));
+    let (cx, cy) = (width as i64, height as i64);
+    let rr = (r * r * 4) as i64;
+    for k in 0..PHASES {
+        let dst = phase_slice(k, width * height);
+        if r == 0 {
+            dst.fill(f);
+            continue;
+        }
+        dst.fill(b);
+        // In half pixels: a pixel's centre (2x + 1, 2y + 1) against the panel's centre (w, h), within 2r.
+        for y in 0..height {
+            let dy = (2 * y as i64 + 1) - cy;
+            if dy * dy > rr {
+                continue;
+            }
+            for x in 0..width {
+                let dx = (2 * x as i64 + 1) - cx;
+                if dx * dx + dy * dy <= rr {
+                    dst[y * width + x] = f;
+                }
+            }
+        }
+    }
+}
 fn raw_spans(width: usize, height: usize, spans: &[(usize, usize, usize)]) {
     let (white, black) = (pack10(1020, 1020, 1020), pack10(0, 0, 0));
     for k in 0..PHASES {
@@ -3332,7 +3366,15 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
         // The row's spans (`layout_build`): each one's chain, frontmost first, into the row.
         let bands = unsafe { core::slice::from_raw_parts(&raw const BANDS as *const Band, NBANDS) };
         let order = unsafe { core::slice::from_raw_parts(&raw const ORDER as *const (u8, u8, u8), SURFACES) };
-        let band = bands.iter().find(|b| (y as u16) >= b.y0 && (y as u16) < b.y1).unwrap();
+        let Some(band) = bands.iter().find(|b| (y as u16) >= b.y0 && (y as u16) < b.y1) else {
+            // Every row is in a band by construction (fluor::layout covers 0..height); a row outside them all is a bug, said whole before the panic (2026-11-08 on akita, at start).
+            let mut s = alloc::format!("display: no band for row {y} (phase {k}, rect {},{} to {},{}); {} bands:", r.x0, r.y0, r.x1, r.y1, bands.len());
+            for b in bands { s += &alloc::format!(" {}..{}", b.y0, b.y1); }
+            s += "; windows:";
+            for w in unsafe { (*(&raw const WINS)).iter() }.flatten() { s += &alloc::format!(" ({},{} to {},{})", w.rect.x0, w.rect.y0, w.rect.x1, w.rect.y1); }
+            ferros_sys::console(unsafe { PANIC_GRANTS }, s.as_bytes());
+            panic!("no band for row {y}");
+        };
         for sp in band.spans() {
             let (a, b) = ((sp.x0 as usize).max(xa), (sp.x1 as usize).min(xb));
             if a >= b {
@@ -5208,6 +5250,22 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // First: the image's own relocations (fontdue's `dyn OutlineBuilder` vtable is an absolute address in .rodata).
     unsafe { ferros_sys::relocate() };
     unsafe { PANIC_GRANTS = grants };
+    // The server runs on its own stack (`MAIN_STACK`), not the kernel's 64 KiB at the arc's top: that one sits right on the image's last statics, and the server outgrew it (2026-11-08 on akita, three starts, three different crashes, each in the statics at the top of .bss: the band table, then both glyph caches; the modeset's and a publish's row buffers are 16 KiB a frame). This thread parks for good.
+    if ferros_sys::thread_spawn(server, unsafe { &mut *(&raw mut MAIN_STACK) }, grants) != 0 {
+        ferros_sys::console(grants, b"display: no thread for the server\n");
+        ferros_sys::exit(9);
+    }
+    loop {
+        ferros_sys::wait(&PARKED, 0, ferros_sys::now() + ferros_sys::freq() * (1 << 10));
+    }
+}
+
+/// The server's stack (`_entry`): 512 KiB, as the kernel's own.
+static mut MAIN_STACK: [u8; 1 << 19] = [0; 1 << 19];
+/// The first thread's word to wait on, never changed.
+static PARKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+extern "C" fn server(grants: u64) -> ! {
     let mut log = Log { grants, buf: [0; 256], n: 0 };
     let pipe = Pipe { grants };
     let fb = ferros_sys::dma(cap(grants, S_FB)) as usize;
@@ -5515,7 +5573,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             TEMPORAL = true;
         }
-        log.s(if akita { b"display: temporal dither on: four frames, flipped every frame\n".as_slice() } else { b"display: temporal dither on: four frames, flipped every 100 ms\n" });
+        log.s(b"display: temporal dither on: four frames, flipped every 100 ms\n");
     } else {
         log.s(b"display: no temporal dither (spatial only)\n");
     }
@@ -6418,9 +6476,14 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             }
                             log.s(b"display: op 52 released: the shell again\n");
                         }
-                        1 | 2 | 3 | 4 | 5 | 6 | 7 => {
+                        1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 => {
                             RAW_HOLD.store(1, Ordering::Release);
-                            if m[1] == 7 {
+                            if m[1] == 8 {
+                                // [8][fg r, g, b u16][bg r, g, b u16][radius u16]: 10-bit codes, the radius in pixels (0 the whole panel).
+                                let w = |i: usize| m.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as u32).unwrap_or(0);
+                                raw_patch(width, height, (w(2), w(4), w(6)), (w(8), w(10), w(12)), w(14) as usize);
+                                log.s(alloc::format!("display: op 52 patch {} {} {} on {} {} {}, radius {}\n", w(2), w(4), w(6), w(8), w(10), w(12), w(14)).as_bytes());
+                            } else if m[1] == 7 {
                                 // [7][x u16][y u16]: a white crosshair one pixel wide on black, column x and row y the whole panel (owner, 2026-11-08: "gimme a 1px white crosshair on black so I can look for duty cycle").
                                 let w = |i: usize| m.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize).unwrap_or(0);
                                 let (x, y) = (w(2), w(4));
@@ -6742,6 +6805,19 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     ferros_sys::sleep_until(now() + freq() / 10);
                     out[0] = !ferros_sys::power(cap(grants, S_PANEL_POWER), false) as u8;
                     len = 1;
+                }
+                // 49 `[49, row u16]`: the glass's own columns on that row, first and last visible (the mask's columns, the edge's hairline inside them), u16 each; for a client that lays itself out on the glass the eye sees (honeycomb's bar, owner 2026-11-08: "go off center intersect of squircle for divisions").
+                Some(49) if m.len() >= 3 => {
+                    let y = u16::from_le_bytes([m[1], m[2]]) as usize;
+                    // WHY the bounds: the row is the client's.
+                    if y < height {
+                        let row = unsafe { &*(GLASS_ROWS as *const GlassRow).add(y) };
+                        out[0..2].copy_from_slice(&row.mask_l.to_le_bytes());
+                        out[2..4].copy_from_slice(&row.mask_r.to_le_bytes());
+                        len = 4;
+                    } else {
+                        out[0] = 1;
+                    }
                 }
                 Some(5) => {
                     out[0..2].copy_from_slice(&(width as u16).to_le_bytes());
@@ -7347,8 +7423,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         // The flip this pass decided at its top, when the clock was drawn into the phase it shows: re-reading the time here flipped, now and then, to a phase whose clock had not been drawn (its edge 400 ms behind, 2026-10-24).
         if unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean && flip_due {
             // The focused widget at the panel's rate, everything else on the 10 Hz flips. In focus the timer is half a frame and `settle` (which holds a flip until the last one has started) does the pacing: a full frame's timer started after each flip's own work slipped a refresh now and then (100 a second, 2026-10-25).
-            // akita at the panel's rate too (owner, 2026-11-08: "since we have to feed this thing at 60hz minimum, I guess we roll in the dither"): its panel does not hold a frame, so DECON sends one every TE whatever changes, and a phase a frame costs the link nothing more.
-            next_flip = now() + if unsafe { FOCUS } != 0 || akita { freq() / 240 } else { freq() / 10 };
+            // (akita's flips at the panel's rate, tried 2026-11-08, showed phases before their insides were published: every column the circle's top row repeated down the screen, orange in a dev build. Back at 10 Hz until the phases are published in step with the flips: the owner's "proper rotating synchronous dither buffer".)
+            next_flip = now() + if unsafe { FOCUS } != 0 { freq() / 240 } else { freq() / 10 };
             pipe.settle(&mut armed, true);
             unsafe { CUR_PHASE = (CUR_PHASE + 1) % PHASES };
             pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);

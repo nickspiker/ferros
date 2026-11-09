@@ -290,6 +290,7 @@ extern "C" fn hive_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         exit(2);
     }
     let mut kb = Keyboard::new(w, ferros_sys::active_circle(w, h));
+    fit_bar(display, &mut kb);
     // The device's layout (SETTINGS.md); a value from a newer build falls back to the default.
     let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
     kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };
@@ -402,4 +403,18 @@ impl core::fmt::Write for Line {
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
+}
+/// The keyboard's bar divided over the glass the eye sees (display op 49: the glass's columns on a row), averaged over the bar's top and foot rows (owner, 2026-11-08: "go off center intersect of squircle for divisions"). A display without the op leaves the screen's width.
+fn fit_bar(display: u64, kb: &mut honeycomb::Keyboard) {
+    let (top, foot) = kb.bar_rows();
+    let mut span = [0f32; 2];
+    for y in [top, foot] {
+        let mut r = [0u8; 8];
+        if ferros_sys::call(display, &[49, y as u8, (y >> 8) as u8], &mut r) < 4 {
+            return;
+        }
+        span[0] += u16::from_le_bytes([r[0], r[1]]) as f32 * 0.5;
+        span[1] += u16::from_le_bytes([r[2], r[3]]) as f32 * 0.5;
+    }
+    kb.fit_bar(span[0], span[1]);
 }

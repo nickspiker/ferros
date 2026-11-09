@@ -119,6 +119,9 @@ pub struct Keyboard {
     ccx: i64,
     rr: i64,
     edge: i64,
+    /// The bar's span, Q8: where the glass the eye sees begins and ends at the bar's height (the screen's width until `fit_bar`). The keys divide it, not the screen: the bottom corners differ (the big one at the right), so dividing the screen put enter's visible part off its label (owner, 2026-11-08: "go off center intersect of squircle for divisions").
+    bar_l: i64,
+    bar_r: i64,
     /// The keyboard's top edge, in pixels: everything from here down is the keyboard's (the top row at the screen's edges, where nothing is moved down).
     pub top: usize,
     /// The row after the keyboard's lowest, in pixels: the circle's bottom, where the bar's foot sags to at the circle's centre column.
@@ -151,7 +154,7 @@ impl Keyboard {
         let cy0 = cy3 - (VIS as i64 - 1) * py;
         let a = px / 2 - gap / 2;
         let bottom = ((ccy + cr - 1) >> 8) as usize + 1;
-        Keyboard { w, px, py, cy0, a, r: a * TWO_OVER_SQRT3 >> 16, gap, bar0, bar1, ccx, rr, edge, top: ((cy0 - cell_r) >> 8) as usize, bottom, view: 0, shift: Shift::Off, layout: 0, left: BAR_KEYS[B_MAP], tint: None }
+        Keyboard { w, px, py, cy0, a, r: a * TWO_OVER_SQRT3 >> 16, gap, bar0, bar1, ccx, rr, edge, bar_l: 0, bar_r: (w as i64) << 8, top: ((cy0 - cell_r) >> 8) as usize, bottom, view: 0, shift: Shift::Off, layout: 0, left: BAR_KEYS[B_MAP], tint: None }
     }
 
     /// How far column `fx` (Q8) is moved down: the circle's bottom there less its bottom at the screen's edge. 0 at the edges, the circle's bottom less the bar's foot at its centre column, smooth between (a circle's arc). One root a column, never one a pixel.
@@ -207,10 +210,27 @@ impl Keyboard {
         if self.shift != Shift::Off { c.to_uppercase().next().unwrap_or(c) } else { c }
     }
 
-    /// Bar key `b`'s left and right edges, drawn (inset by half the gap).
+    /// The bar's rows at the screen's edges, its top and its foot (pixels): where a host asks the glass's columns for `fit_bar`.
+    pub fn bar_rows(&self) -> (usize, usize) {
+        ((self.bar0 >> 8) as usize, ((self.bar1 - 1) >> 8) as usize)
+    }
+
+    /// The bar's keys divided over the glass the eye sees, from `left` to `right` (pixels, the glass's first and last columns at the bar, averaged over its top and foot) rather than over the screen. The end keys still reach the screen's edges, under the mask.
+    pub fn fit_bar(&mut self, left: f32, right: f32) {
+        self.bar_l = (left * (1 << 8) as f32) as i64;
+        self.bar_r = (right * (1 << 8) as f32) as i64;
+    }
+
+    /// Where the bar's division `e` (half columns, 0 to 20) falls, Q8.
+    fn bar_at(&self, e: i64) -> i64 {
+        self.bar_l + e * (self.bar_r - self.bar_l) / BAR_EDGE[BAR_KEYS.len() - 1]
+    }
+
+    /// Bar key `b`'s left and right edges, drawn (inset by half the gap); the end keys out to the screen's edges.
     fn bar_x(&self, b: usize) -> (i64, i64) {
-        let left = if b == 0 { 0 } else { BAR_EDGE[b - 1] * self.px / 2 };
-        (left + self.gap / 2, BAR_EDGE[b] * self.px / 2 - self.gap / 2)
+        let left = if b == 0 { 0 } else { self.bar_at(BAR_EDGE[b - 1]) };
+        let right = if b == BAR_KEYS.len() - 1 { (self.w as i64) << 8 } else { self.bar_at(BAR_EDGE[b]) };
+        (left + self.gap / 2, right - self.gap / 2)
     }
 
     /// The key under a finger at pixel (x, y).
@@ -222,8 +242,7 @@ impl Keyboard {
             return Key::None;
         }
         if fy >= self.bar0 {
-            let half = fx * 2 / self.px;
-            return Key::Bar(BAR_EDGE.iter().position(|&e| half < e).unwrap_or(BAR_KEYS.len() - 1));
+            return Key::Bar(BAR_EDGE.iter().position(|&e| fx < self.bar_at(e)).unwrap_or(BAR_KEYS.len() - 1));
         }
         if fy < ((self.top as i64) << 8) + 128 {
             return Key::None;
@@ -364,7 +383,8 @@ impl Keyboard {
                     let d = self.sag(fx);
                     (y0 + d, y1 + d)
                 });
-                let cx = (x0 + x1) / 2;
+                // The label on the key's visible part: its division of the glass, not the end keys' reach under the mask.
+                let cx = (self.bar_at(if b == 0 { 0 } else { BAR_EDGE[b - 1] }) + self.bar_at(BAR_EDGE[b])) / 2;
                 let cy = (self.bar0 + self.bar1) / 2 + self.sag(cx);
                 if b == B_SHIFT {
                     // ▲ (owner, 2026-11-01): the label's grey off, white once, black in caps lock (on the lit key all three).
