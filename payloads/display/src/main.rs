@@ -3521,31 +3521,40 @@ impl GlassOutline {
         GlassOutline { w, h, r, n: nf, pts: [mk(0), mk(1), mk(2), mk(3)] }
     }
 
-    /// The signed distance from a point to the outline: positive inside the glass, negative outside.
+    /// The signed distance from a point to the outline: positive inside the glass, negative outside. Every corner is looked at, not only the one on the point's side of the screen: a big corner's box reaches past the screen's middle (akita's top-left to column 602.7 of 1080: 2026-11-08, a point at column 602.7 on row 0 was in neither the top edge's run nor the right-hand corner's box, read as roomy, and the top-right's circles were solved onto row 0).
     fn dist(&self, x: f32, y: f32) -> f32 {
         let (w, h) = (self.w, self.h);
-        // Which corner's box the point is in, if any: (index, a, b).
-        let k = if x < w * 0.5 { if y < h * 0.5 { 0 } else { 2 } } else if y < h * 0.5 { 1 } else { 3 };
-        let (a, b) = (if k & 1 == 0 { x } else { w - x }, if k < 2 { y } else { h - y });
-        let rk = self.r[k];
-        let outside = a < 0. || b < 0. || (a < rk && b < rk && libm::powf((rk - a) / rk, self.n) + libm::powf((rk - b) / rk, self.n) > 1.);
-        // The straight edges where they run (between the corners' boxes), then the nearest corner's curve.
+        let mut outside = x < 0. || y < 0. || x > w || y > h;
+        // The straight edges where they run (between the corners' boxes).
         let mut d = f32::MAX;
         if x >= self.r[0] && x <= w - self.r[1] { d = d.min(y.abs()); }
         if x >= self.r[2] && x <= w - self.r[3] { d = d.min((h - y).abs()); }
         if y >= self.r[0] && y <= h - self.r[2] { d = d.min(x.abs()); }
         if y >= self.r[1] && y <= h - self.r[3] { d = d.min((w - x).abs()); }
-        let p = &self.pts[k];
-        for i in 0..GLASS_SEGS {
-            let (x0, y0) = p[i];
-            let (x1, y1) = p[i + 1];
-            let (dx, dy) = (x1 - x0, y1 - y0);
-            let l2 = dx * dx + dy * dy;
-            // WHY the guard: two points of the polyline can coincide where the curve meets its edge; the segment is then a point.
-            let t = if l2 > 0. { ((x - x0) * dx + (y - y0) * dy) / l2 } else { 0. };
-            let t = if t < 0. { 0. } else if t > 1. { 1. } else { t };
-            let (ex, ey) = (x0 + t * dx - x, y0 + t * dy - y);
-            d = d.min(libm::sqrtf(ex * ex + ey * ey));
+        for k in 0..4 {
+            let rk = self.r[k];
+            // The point in from the corner's two edges; inside its box, the superellipse says which side of the curve it is on.
+            let (a, b) = (if k & 1 == 0 { x } else { w - x }, if k < 2 { y } else { h - y });
+            if a >= 0. && b >= 0. && a < rk && b < rk && libm::powf((rk - a) / rk, self.n) + libm::powf((rk - b) / rk, self.n) > 1. {
+                outside = true;
+            }
+            // The corner's curve lies in its box: a box farther than the nearest found cannot hold anything nearer.
+            let (da, db) = (if a > rk { a - rk } else if a < 0. { -a } else { 0. }, if b > rk { b - rk } else if b < 0. { -b } else { 0. });
+            if da * da + db * db >= d * d {
+                continue;
+            }
+            let p = &self.pts[k];
+            for i in 0..GLASS_SEGS {
+                let (x0, y0) = p[i];
+                let (x1, y1) = p[i + 1];
+                let (dx, dy) = (x1 - x0, y1 - y0);
+                let l2 = dx * dx + dy * dy;
+                // WHY the guard: two points of the polyline can coincide where the curve meets its edge; the segment is then a point.
+                let t = if l2 > 0. { ((x - x0) * dx + (y - y0) * dy) / l2 } else { 0. };
+                let t = if t < 0. { 0. } else if t > 1. { 1. } else { t };
+                let (ex, ey) = (x0 + t * dx - x, y0 + t * dy - y);
+                d = d.min(libm::sqrtf(ex * ex + ey * ey));
+            }
         }
         if outside { -d } else { d }
     }
