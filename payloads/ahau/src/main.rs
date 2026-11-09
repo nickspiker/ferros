@@ -1208,9 +1208,6 @@ impl Ahau {
                 if b + px / 2 > foot {
                     break;
                 }
-                let shown = printable(name);
-                let v = if flags & 1 != 0 { TEXT } else { QUIET };
-                window::text(self.display, self.text_to.get(), (self.w / 8) as i16, b as i16, px as u16, v, &shown.0[..shown.1]);
                 let mut l = Line::new();
                 if flags & (1 << 4) != 0 {
                     let _ = core::fmt::Write::write_str(&mut l, "kept");
@@ -1219,6 +1216,21 @@ impl Ahau {
                 }
                 let x = (self.w * 7 / 8) as i64 - self.measure(px, l.as_bytes()) / 4;
                 window::text(self.display, self.text_to.get(), x as i16, b as i16, px as u16, QUIET, l.as_bytes());
+                // The name up to half an em short of the signal: one too long for that (at a large scale) loses its end to "...".
+                let (mut shown, mut n) = printable(name);
+                let room = x - (self.w / 8) as i64 - (px / 2) as i64;
+                if self.measure(px, &shown[..n]) / 4 > room {
+                    while n > 0 {
+                        n -= 1;
+                        shown[n..n + 3].copy_from_slice(b"...");
+                        if self.measure(px, &shown[..n + 3]) / 4 <= room {
+                            break;
+                        }
+                    }
+                    n += 3;
+                }
+                let v = if flags & 1 != 0 { TEXT } else { QUIET };
+                window::text(self.display, self.text_to.get(), (self.w / 8) as i16, b as i16, px as u16, v, &shown[..n]);
                 k += 1;
             }
         });
@@ -2393,6 +2405,9 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut pinched = false;
     // A pull (the network page down, or up again) acts once per touch: set when it acts, cleared when every finger lifts.
     let mut pulled = false;
+    // A finger on the WiFi circle: where it landed and where it is now; whether this touch's landing was asked about yet.
+    let mut orb: Option<(i64, i64, i64, i64)> = None;
+    let mut orb_asked = false;
     // The key typed at its press (COMMIT_AT_PRESS), whose tap at the lift is then only its letting go.
     let mut pressed: Option<Key> = None;
     // The last frame of the mark put on the glass (FRESH_DONE's count).
@@ -2450,7 +2465,34 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             pinched = true;
         }
+        // The WiFi circle's slide (owner, 2026-11-07: tap a circle, slide toward the centre, release = its detail page): a lone finger that lands on it (display op 41: 1 is WiFi) and lets go an eighth of the width nearer the screen's centre opens the network page. The circles are the display's, so the finger never reaches this screen's own touches.
+        if k == 1 {
+            let (x, y) = (held[0].1, held[0].2);
+            match orb {
+                None if !orb_asked => {
+                    orb_asked = true;
+                    let mut m = [41u8, 0, 0, 0, 0];
+                    m[1..3].copy_from_slice(&(x as u16).to_le_bytes());
+                    m[3..5].copy_from_slice(&(y as u16).to_le_bytes());
+                    let mut h = [0xFFu8; 1];
+                    if call(display, &m, &mut h) == 1 && h[0] == 1 {
+                        orb = Some((x, y, x, y));
+                    }
+                }
+                Some((x0, y0, _, _)) => orb = Some((x0, y0, x, y)),
+                None => {}
+            }
+        }
         if k == 0 {
+            if let Some((x0, y0, x1, y1)) = orb.take() {
+                let (cx, cy) = (a.w as i64 / 2, a.h as i64 / 2);
+                let d = |x: i64, y: i64| (((x - cx) * (x - cx) + (y - cy) * (y - cy)) as u64).isqrt() as i64;
+                if d(x0, y0) - d(x1, y1) > (a.w / 8) as i64 && !a.net_open() {
+                    a.net_pull();
+                    a.show();
+                }
+            }
+            orb_asked = false;
             pulled = false;
         }
         if k == 0 {
@@ -2613,8 +2655,9 @@ fn fit_bar(display: u64, kb: &mut honeycomb::Keyboard) {
 }
 
 /// A network's name as the page shows it: printable ASCII kept, anything else a `?` (the driver joins ASCII names only; the bytes of others are not trusted to be text).
-fn printable(name: &[u8]) -> ([u8; 32], usize) {
-    let mut t = [0u8; 32];
+fn printable(name: &[u8]) -> ([u8; 35], usize) {
+    // Three bytes past the longest name: room for the "..." of one cut short (`net_draw`).
+    let mut t = [0u8; 35];
     for (o, &c) in t.iter_mut().zip(name) {
         *o = if (0x20..0x7F).contains(&c) { c } else { b'?' };
     }
