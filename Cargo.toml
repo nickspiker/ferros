@@ -24,6 +24,7 @@ members = [
     "tools/install",
     "tools/flash",
     "payloads/hello",
+    "payloads/stackprobe",
     "payloads/display",
     "payloads/shelltest",
     "payloads/fptest",

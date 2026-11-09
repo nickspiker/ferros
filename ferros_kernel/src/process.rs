@@ -3703,6 +3703,9 @@ pub fn kist_need(head: &[u8], total: usize) -> Result<usize, &'static str> {
     if co + 56 > head.len() {
         return Err("kist: the code's header is past the first bytes read");
     }
+    if !has_image_header(&head[co..co + 56]) {
+        return Err("kist: the image has no header (ferros_sys::entry!), so its .bss is unknown");
+    }
     let tail = image_tail(&head[co..co + 56]);
     Ok(CODE + total.max(cl + tail) + STACK + (1 << 16))
 }
@@ -3852,6 +3855,14 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
 }
 
 /// The zeroed memory a std image asks for after its code — its `.bss` and its heap — from the header `ferros_rt` puts at offset 8: the eight bytes `ferrosRT`, then the byte count (STD-TARGET.md). The flat image cannot carry `.bss` (the input used to land right after the code), so the image says how much the arc must grow and the input moves past it. A native payload has no header: 0.
+/// Whether the image carries ferros_rt's header ("ferrosRT" at offset 8): its zeroed tail is known.
+fn has_image_header(code: &[u8]) -> bool {
+    code.len() >= 56 && &code[8..16] == b"ferrosRT"
+}
+
+/// The page under the first thread's stack, kernel-only (owner, 2026-11-09): a stack run past its 64 KiB, or statics grown up into it, faults there with the process named, not into memory it does not own.
+const STACK_GUARD: usize = 1 << 12;
+
 fn image_tail(code: &[u8]) -> usize {
     if code.len() >= 56 && &code[8..16] == b"ferrosRT" {
         // Two words, summed here: .bss plus 16 (the linker script's own arithmetic) and the heap (a --defsym the script only forwards; summing them in the script took the default heap once, 2026-10-27).
@@ -3866,10 +3877,14 @@ fn image_tail(code: &[u8]) -> usize {
 fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize, fixed: u32) -> Result<(usize, Arc, usize), &'static str> {
     cap_key().ok_or("no wairua: refusing to mint capabilities")?;
     let inline = input.len(); // bridge: full inline (pcie1 still reads input from its arc); sandboxed apps carry no input, so their arcs stay small either way. INLINE_INPUT becomes the cap once pcie1 streams firmware via SYS_INPUT (option 1).
+    // No header, no spawn (owner, 2026-11-09): without it the .bss is unknown, and the arc sized from the file alone put the stack on the process's own statics (the display and bt, 2026-11-08). Every payload carries it (ferros_sys::entry!, tools/payload-check.sh).
+    if !has_image_header(code) {
+        return Err("spawn: the image has no header (ferros_sys::entry!), so its .bss is unknown");
+    }
     let tail = image_tail(code);
     // `fixed` carries the mode word: bits 0-7 fixed mode's K (0: not fixed), bit 8 BTI (guarded code pages), bit 9 exact mode.
     let (fixed, bti, exact) = (fixed & 0xFF, fixed >> 8 & 1 == 1, fixed >> 9 & 1 == 1);
-    let need = CODE + code.len() + tail + inline + STACK;
+    let need = CODE + code.len() + tail + inline + STACK_GUARD + STACK;
     // Fixed mode (SANDBOX.md, "Modes"): the arc is exactly the sealed 2^K, the size every `bfi` in the code assumes.
     if fixed != 0 && need > 1 << fixed {
         return Err("spawn: the image does not fit its fixed arc");
@@ -3886,7 +3901,15 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
 /// The process in an arc that already holds its code at the code offset (`build` copied it; a streamed spawn staged it there): the capability table, the grants page, the ihi, the preferences, the input past the code's zeroed tail, W^X, and the first thread.
 fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize, bti: bool) -> Result<(usize, Arc, usize), &'static str> {
     cap_key().ok_or("no wairua: refusing to mint capabilities")?;
+    if !has_image_header(unsafe { core::slice::from_raw_parts((arc.base + CODE) as *const u8, code_len.min(56)) }) {
+        return Err("spawn: the image has no header (ferros_sys::entry!), so its .bss is unknown");
+    }
     let tail = image_tail(unsafe { core::slice::from_raw_parts((arc.base + CODE) as *const u8, code_len) });
+    // Room for the stack's guard page between the image (its tail and the input after it) and the stack; an arc too small is refused before anything is made (a staged arc is sized by `kist_need`, with room).
+    let floor = arc.top() - STACK - STACK_GUARD;
+    if floor < arc.base + CODE + code_len + tail + input.len() {
+        return Err("spawn: no room for the stack's guard page above the image");
+    }
     let epoch = EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     let mut cspace = alloc::vec![CapEntry { token: mint(Object::Console, RIGHT_SEND, epoch), object: Object::Console, rights: RIGHT_SEND }];
     for &(object, rights) in objects {
@@ -3930,6 +3953,8 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     crate::cachemap::set_arc_wx(arc.base, arc.block, arc.base + CODE, arc.base + CODE + exec_len, !masked, bti);
     // The grants page read-only (the handle table, the tokens, the preferences, the ihi): nothing in it is the process's to write.
     crate::cachemap::grants_page(arc.base, false);
+    // The stack's guard: the page under it (`floor`, checked above to lie past the image, its tail and the input).
+    crate::cachemap::guard_pages(floor, STACK_GUARD, true);
     // The frame a queued start resumes into: exactly what `ferros_el0_enter` sets up (entry, stack at the arc's top, the arc's base and mask in x28/x27 for masked code, grants/input/length in x0-x2, EL0t with interrupts open).
     let mut frame = zero;
     frame.elr = (arc.base + CODE) as u64;
