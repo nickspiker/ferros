@@ -238,7 +238,8 @@ impl Keyboard {
         // The column's sag undone first: the rest is the unbent keyboard's map.
         let fx = (x << 8) + 128;
         let fy = (y << 8) + 128 - self.sag(fx);
-        if fy >= self.bar1 {
+        // Past the foot's own pixel row (its antialiased edge, on the circle since the foot lost its gap, 2026-11-09): nothing of the keyboard.
+        if fy >= self.bar1 + 256 {
             return Key::None;
         }
         if fy >= self.bar0 {
@@ -348,11 +349,12 @@ impl Keyboard {
             Key::Bar(b) => {
                 let (x0, x1) = self.bar_x(b);
                 let (lo, hi) = self.sags(x0, x1);
-                (self.bar0 + self.gap / 2 + lo, self.bar1 - self.gap / 2 + hi)
+                (self.bar0 + self.gap / 2 + lo, self.bar1 + hi)
             }
             Key::None => return (0, 0),
         };
-        (((y0 >> 8) - 1) as usize, ((y1 >> 8) + 2) as usize)
+        // WHY the min: the bar's foot reaches the circle's bottom, the screen's last row at the centre column; the two rows of slack after it would be past the surface.
+        (((y0 >> 8) - 1) as usize, (((y1 >> 8) + 2) as usize).min(self.bottom))
     }
 
     /// One key, lit or at rest, with its label.
@@ -377,7 +379,8 @@ impl Keyboard {
             Key::Bar(b) => {
                 let on = lit || (b == B_SHIFT && self.shift != Shift::Off);
                 let (x0, x1) = self.bar_x(b);
-                let (y0, y1) = (self.bar0 + self.gap / 2, self.bar1 - self.gap / 2);
+                // The foot on the circle itself, no gap under it (owner, 2026-11-09: "the spacebar should touch the bottom of the screen rather than leave a few px gap for the circle hairline"): the circle meets the screen's bottom at its centre column. The keys still keep half a gap from the row above.
+                let (y0, y1) = (self.bar0 + self.gap / 2, self.bar1);
                 let face = self.colour(key, if on { LIT } else { BAR_KEY });
                 shape(s, self.w, x0, x1, face, |fx| {
                     let d = self.sag(fx);

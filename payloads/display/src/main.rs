@@ -3120,9 +3120,8 @@ fn plan_glass(width: usize, height: usize) {
                     let d = libm::sqrtf(d2);
                     let cov = rad + 0.5 - d;
                     let cov = if cov > 1.0 { 1.0 } else if cov < 0.0 { 0.0 } else { cov };
-                    let t = d - rad;
-                    let hl = if t * t < 1.0 { let u = 1.0 - t * t; u * u } else { 0.0 };
-                    ((cov * 65536.0) as u32, (hl * 65536.0) as u32)
+                    // No hairline (owner, 2026-11-09: "We can remove the big circle from the draw stack, it was just a visual guide ... Circle idea and alignment stays, just needs to be invisible"): the circle still clips the windows and lays out the corners and the keyboard, with nothing drawn on its edge.
+                    ((cov * 65536.0) as u32, 0)
                 } else {
                     (65536, 0)
                 }
@@ -3540,6 +3539,8 @@ enum Corner {
 const GLASS_SEGS: usize = 1 << 9;
 /// The edge's hairline, in pixels: one, the outermost pixel of the glass (fluor's walk_window_edges, opaque along the straight edges and on the curve's outer pixel).
 const EDGE_HAIRLINE: f32 = 1.;
+/// A console circle's rim past its radius, its antialiasing (`corner_layout`).
+const CIRCLE_RIM: f32 = 1.;
 
 struct GlassOutline {
     w: f32,
@@ -3634,7 +3635,8 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
     let (w, h) = (width as f32, height as f32);
     let app = |x: f32, y: f32| libm::sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy)) - rr;
     // The glass the eye sees ends a pixel inside its outline: the edge's hairline is the outermost glass pixel, drawn in the mask's colour (black on release; 2026-11-08, on the Pro the circles' rims lay a pixel into it, row 0 black over WiFi's top). So the circles are tangent to the hairline's inner side.
-    let glass = |x: f32, y: f32| outline.dist(x, y) - EDGE_HAIRLINE;
+    // And one pixel more for the circle's own antialiased rim, which reaches past its radius: tangent at the hairline, the rim fell under the edge mask in front and the bottom-right home circle came out darkened and trimmed (owner, 2026-11-09).
+    let glass = |x: f32, y: f32| outline.dist(x, y) - EDGE_HAIRLINE - CIRCLE_RIM;
     let clear = |x: f32, y: f32| { let (a, g) = (app(x, y), glass(x, y)); if a < g { a } else { g } };
     let mut out = [(0.0f32, 0.0f32, 0.0f32, Corner::Spare); 16];
     let mut n = 0;
