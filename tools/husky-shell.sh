@@ -13,6 +13,8 @@ pkgs=(); for n in "$@"; do pkgs+=(-p "ferros-payload-$n"); done
 [[ " $* " == *" display "* ]] && (cd tools/app-icons && cargo run -q --release -- "$REPO/target/icons" >/dev/null)
 # A failed build stops here: under pipefail the old `cargo | grep && exit 1 || true` carried on and stored the last good binary (2026-10-29: init kept its old table for an evening).
 out=$(cargo el0 -q "${pkgs[@]}" "${PROFILE_FLAGS[@]}" 2>&1) || { echo "$out" | grep -E "^error" -A10; exit 1; }
+# Every image must declare its whole memory to the kernel (tools/payload-check.sh) before it reaches the vault.
+"$REPO/tools/payload-check.sh" "$@" || exit 1
 restart=()
 for n in "$@"; do
     aarch64-linux-gnu-objcopy -O binary "$R/$n" "$R/$n.bin"
