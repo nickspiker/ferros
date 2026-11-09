@@ -1066,8 +1066,12 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     d.kv(b"ri.max_flowrings|max_subq", v);
     let v = d.tcm_rd(ri + 56);
     d.kv(b"ri.max_cplrings|max_vdevs", v);
-    // host_cap: IPC 9, HOSTRDY, deep sleep off (NO_OOB_DW without INBAND_DW), no trap on a PCIe Unsupported Request.
-    d.tcm_wr(sh + 84, 0x0080_1409);
+    // host_cap: the IPC revision both speak (the lower of the host's 9 and the firmware's, flags[7:0]: the BCM4398 reports 9, akita's BCM4383 7; dhd_msgbuf.c dhd_set_host_cap), HOSTRDY only if the firmware supports it (flags bit 28, PCIE_SHARED_HOSTRDY_SUPPORT), deep sleep off (NO_OOB_DW without INBAND_DW), no trap on a PCIe Unsupported Request.
+    let fl = d.tcm_rd(sh);
+    let ipc = (fl & 0xFF).min(9);
+    let hostrdy = if fl & (1 << 28) != 0 { 0x400 } else { 0 };
+    d.kv(b"host_cap.ipc", ipc);
+    d.tcm_wr(sh + 84, 0x0080_1000 | hostrdy | ipc);
     d.tcm_wr(sh + 112, 0);
     for (i, &(off, items, len)) in RINGS.iter().enumerate() {
         let m = ringmem + 16 * i as u32;
@@ -1507,7 +1511,8 @@ impl Msgbuf {
             match ty {
                 16 => self.linked = flags & 1 != 0,
                 46 if (status == 6 || status == 10) && reason == 0 => self.keyed = true,
-                46 if status < 10 && reason != 0 && reason != 21 => self.join_failed = true,
+                // WLC_E_PSK_SUP (46): a failed handshake unless the reason is 0, 21 (PTK update) or 23 (GTK update: the BCM4383's driver ignores it too, wl_cfg80211.c).
+                46 if status < 10 && reason != 0 && reason != 21 && reason != 23 => self.join_failed = true,
                 0 | 3 | 7 if status != 0 => self.join_failed = true,
                 5 | 6 | 11 | 12 => self.join_failed = true,
                 _ => {}
@@ -2284,17 +2289,35 @@ fn join(d: &mut Drv, m: &mut Msgbuf, cred: &[u8]) {
     let r = m.set_var(d, b"wpaie", &ie);
     d.kv(b"wpaie", r);
     // join: v0 (wl_extjoin_params_t) unless join_ver says otherwise; ssid (u32 len + 32), scan params (scan_type u8, pad, nprobes, active, passive, home = -1), then the assoc params: BSSID, bssid_cnt 0, one chanspec.
+    // A firmware without `join_ver` (akita's BCM4383, 2026-11-09: the query failed and v0 was refused) has its layout told by its `wlc_ver` (wl_cfg80211.c wl_get_join_iovar_ver: v1 from wlc_ver_major 17, or 16.1 and later, or 14.2 and 14.4; v0 before).
     let jv = match m.get_var(d, b"join_ver", req) {
         Some((0, b, _)) => dr32u(m.resp(b) + 4) & 0xFFFF,
-        _ => 0,
+        other => {
+            d.kv(b"join_ver status", other.map(|o| o.0).unwrap_or(u32::MAX));
+            match m.get_var(d, b"wlc_ver", req) {
+                Some((0, b, _)) => {
+                    let (maj, min) = (dr32u(m.resp(b) + 12) & 0xFFFF, dr32u(m.resp(b) + 12) >> 16);
+                    d.kv(b"wlc_ver major", maj);
+                    d.kv(b"wlc_ver minor", min);
+                    (maj >= 17 || (maj == 16 && min >= 1) || (maj == 14 && (min == 2 || min == 4))) as u32
+                }
+                _ => 0,
+            }
+        }
     };
     d.kv(b"join_ver", jv);
-    let mut j = [0u8; 84];
+    let mut j = [0u8; 88];
+    // v3 (akita's BCM4383, wlioctl.h wl_extjoin_params_v3_t): the assoc params gain an MLD address and pad after the BSSID count, so chanspec_num moves to 80 and the list to 84; dhd writes the version into the header (0) and into the assoc params (60) for it (wl_cfg80211.c, WL_JOIN_VERSION_MAJOR_3).
     let (o_ssid, o_scan, o_bssid, o_cnt, o_num, o_list) = match jv {
         0 => (0usize, 36usize, 56usize, 62usize, 64usize, 68usize),
         1 => (4, 40, 64, 70, 72, 76),
-        _ => (4, 40, 64, 70, 76, 80),
+        2 => (4, 40, 64, 70, 76, 80),
+        _ => (4, 40, 64, 70, 80, 84),
     };
+    if jv >= 3 {
+        j[0..2].copy_from_slice(&(jv as u16).to_le_bytes());
+        j[60..62].copy_from_slice(&(jv as u16).to_le_bytes());
+    }
     j[o_ssid..o_ssid + 4].copy_from_slice(&(ssid.len() as u32).to_le_bytes());
     j[o_ssid + 4..o_ssid + 4 + ssid.len()].copy_from_slice(ssid);
     for k in 0..4 {
@@ -2340,48 +2363,56 @@ fn join(d: &mut Drv, m: &mut Msgbuf, cred: &[u8]) {
     d.flush();
 }
 
-/// Stage 11: a scan, the way dhd's up path and wl_run_escan do it. The regulatory table first (`country` reads "#n" when the firmware has no CLM: then the CLM blob goes in through `clmload` in 1408-byte chunks), the escan-result event (69) enabled in `event_msgs_ext`, WLC_UP (2), `scan_ver` to pick the request layout, then `escan` over every channel; results arrive as events, one BSS each, until a final status.
+/// A blob into the firmware through `clmload` or `txcapload` (dhd_common.c _dhd_apply_default_clm / dhd_download_blob): wl_dload_data_t per 1408-byte chunk, u16 flag (handler version 1 << 12 | DL_BEGIN 2 on the first | DL_END 4 on the last), u16 type 2 (DL_TYPE_CLM, for both), u32 len, u32 crc 0, the data, the chunk padded to 8. The first failing status, or 0.
+fn dload(d: &mut Drv, m: &mut Msgbuf, iovar: &[u8], blob: &[u8]) -> u32 {
+    let mut off = 0;
+    let mut status = 0;
+    while off < blob.len() && status == 0 {
+        let n = (blob.len() - off).min(1408);
+        let mut flag = 1u16 << 12;
+        if off == 0 {
+            flag |= 2;
+        }
+        if off + n == blob.len() {
+            flag |= 4;
+        }
+        let mut chunk = [0u8; 1424];
+        chunk[0..2].copy_from_slice(&flag.to_le_bytes());
+        chunk[2..4].copy_from_slice(&2u16.to_le_bytes());
+        chunk[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+        chunk[12..12 + n].copy_from_slice(&blob[off..off + n]);
+        let total = (12 + n).div_ceil(8) * 8;
+        status = m.set_var(d, iovar, &chunk[..total]);
+        off += n;
+    }
+    status
+}
+
+/// Stage 11: a scan, the way dhd's up path and wl_run_escan do it. The regulatory blob first, loaded whatever `country` reads (`dload`), then the txcap blob, the escan-result event (69) enabled in `event_msgs_ext`, WLC_UP (2), `scan_ver` to pick the request layout, then `escan` over every channel; results arrive as events, one BSS each, until a final status.
 fn scan(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
     let req = m.dma + 0x1_3000;
-    if let Some((0, b, _)) = m.get_var(d, b"country", req) {
-        let cc: [u8; 4] = core::array::from_fn(|k| dbr(m.resp(b) + k as u32));
-        d.put(b"country before CLM: ");
-        d.put(&cc[..2]);
-        d.put(b"\n");
-        if &cc[..2] == b"#n" {
-            if clm.is_empty() {
-                d.put(b"no CLM in firmware and none given (--input-file clm_blob)\n");
-                return;
-            }
-            // wl_dload_data_t per chunk: u16 flag (handler version 1 << 12 | DL_BEGIN 2 on the first | DL_END 4 on the last), u16 type 2 (CLM), u32 len, u32 crc 0, data; the chunk padded to 8.
-            let mut off = 0;
-            let mut status = 0;
-            while off < clm.len() && status == 0 {
-                let n = (clm.len() - off).min(1408);
-                let mut flag = 1u16 << 12;
-                if off == 0 {
-                    flag |= 2;
-                }
-                if off + n == clm.len() {
-                    flag |= 4;
-                }
-                let mut chunk = [0u8; 1424];
-                chunk[0..2].copy_from_slice(&flag.to_le_bytes());
-                chunk[2..4].copy_from_slice(&2u16.to_le_bytes());
-                chunk[4..8].copy_from_slice(&(n as u32).to_le_bytes());
-                chunk[12..12 + n].copy_from_slice(&clm[off..off + n]);
-                let total = (12 + n).div_ceil(8) * 8;
-                status = m.set_var(d, b"clmload", &chunk[..total]);
-                off += n;
-            }
-            d.kv(b"clmload status", status);
-            if let Some((0, b, _)) = m.get_var(d, b"country", req) {
-                let cc: [u8; 4] = core::array::from_fn(|k| dbr(m.resp(b) + k as u32));
-                d.put(b"country after CLM: ");
-                d.put(&cc[..2]);
-                d.put(b"\n");
-            }
+    // The regulatory blob, whatever `country` reads (dhd_common.c dhd_apply_default_clm loads it every time: a firmware with its own table, as akita's BCM4383 a3, would otherwise run its built-in table, not the SKU's), then the transmit-power caps after it (dhd_apply_default_txcap, the same chunks with `txcapload`; dhd only logs its failure). The txcap blob from the vault's `wifi.txcap`, when there is one.
+    let country = |d: &mut Drv, m: &mut Msgbuf, when: &[u8]| {
+        if let Some((0, b, _)) = m.get_var(d, b"country", req) {
+            let cc: [u8; 4] = core::array::from_fn(|k| dbr(m.resp(b) + k as u32));
+            d.put(b"country ");
+            d.put(when);
+            d.put(b": ");
+            d.put(&cc[..2]);
+            d.put(b"\n");
         }
+    };
+    country(d, m, b"before CLM");
+    if clm.is_empty() {
+        d.put(b"no CLM blob given (--input-file clm_blob or the vault's wifi.clm): the firmware's own table stands\n");
+    } else {
+        let status = dload(d, m, b"clmload", clm);
+        d.kv(b"clmload status", status);
+        country(d, m, b"after CLM");
+    }
+    if let Some(txcap) = vault_file(d, b"txcap", 0x13_0000) {
+        let status = dload(d, m, b"txcapload", txcap);
+        d.kv(b"txcapload status", status);
     }
     // event_msgs_ext: GET the mask (ver 1, command 0, len 27, maxgetsize 27), set bit 69, SET it back (command 3).
     let mut mask = [0u8; 27];
@@ -2425,6 +2456,9 @@ fn scan(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
         }
         d.put(b"\n");
     }
+    // `bus:host_access` = 1 just before WLC_UP, as both Google drivers send it (dhd_cfg80211.c, WLAN_ACCEL_BOOT, built into the BCM4398's and the BCM4383's): the host may reach the dongle's memory. Its status logged; a firmware without it answers an error and nothing else changes.
+    let r = m.set_var(d, b"bus:host_access", &1u32.to_le_bytes());
+    d.kv(b"bus:host_access", r);
     let r = m.ioctl(d, 2, req, 4, 4).map(|r| r.0).unwrap_or(u32::MAX);
     d.kv(b"WLC_UP", r);
     let ver = match m.get_var(d, b"scan_ver", req) {
@@ -2506,4 +2540,4 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 }
 
 /// The vault files (nvram, clm, cred), 64 KiB each, in the arc (`vault_file`).
-static mut FILES: [[u8; 0x1_0000]; 3] = [[0; 0x1_0000]; 3];
+static mut FILES: [[u8; 0x1_0000]; 4] = [[0; 0x1_0000]; 4];
