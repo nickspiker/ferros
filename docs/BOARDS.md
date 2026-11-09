@@ -33,6 +33,8 @@ Nothing is copied from another model or taken from a vendor's figures once it ca
 6. **Touch.** The axes and edges under a finger, contacts against the glass's own map.
 7. **Sensors and radios.** Each brought up under ferros or listed as not yet, against the first model's.
 
+**Why the glass is measured, not taken (owner on the Pro, 2026-11-08, production edges in black):** Android shows red and blue fringe pixels at its corners and around the camera hole; ferros, masked by the white-rule map, shows none ("Android = red/blue, ferros = flawless"). Android draws a vendor circle per model (husky: corners radius 91, hole (672, 75) radius 43.25; akita: corners 128, hole (539.5, 68.71) radius 33.72) with standard path antialiasing, never fitted to which pixels the glass actually hides or partly hides on the unit.
+
 ## Side keys (calibration)
 
 Where each side key sits, in panel rows, top and bottom edge inclusive (`board::keys`). The gate draws its marks from them: the power triangle centred on the power key and as tall as it, the volume-down chevron with its tip on the rocker's bottom edge and a quarter of the rocker tall (ready.rs `marks`). Anything else that points at a key (a hint, a press echo) takes them from there too.
