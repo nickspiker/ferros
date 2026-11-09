@@ -12,3 +12,5 @@ The owner (who sees flicker to well above 1 kHz) sees the HK3 at ~94-97 % emissi
 **How to apply:** treat 100 % duty as unavailable on husky's panel; dimming stays in the present stage (table + dither) as designed. If the question comes up again, point at the write-up rather than re-testing. A G#BD table experiment is safe to send whole (the panel took it) and `bd 21 01 83 03 03 … bd 00 00 00 02 00 06 00 16 00 2e 00 ee / f7 0f` restores the normal one.
 
 **2026-11-03:** the "every brightness" claim was wrong below the knee. Sweep in Android (owner by eye, backlight sysfs): 3307/2000/1490 ~95 %, 1236 ~85 %, 983 <50 %; panel idle made no difference. ferros now floors DBV at 3307 and dims every step in pixels (owner: "keep them all max"; payloads/display brightness()). DISPLAY-CALIB.md "Emission duty".
+
+**2026-11-08, measured:** a BPW34 on line in (tools/lightscope) over a 1 cm square (tools/dbv-slider): full duty down to DBV 1246, degrading below; no difference between 120/60 Hz or HBM on/off. Matches the by-eye 1236 (~85 %) / 1490 (~95 %). Floor still 3307 in payloads/display brightness(); moving it to 1246 is the owner's call.
