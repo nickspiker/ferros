@@ -503,5 +503,32 @@ fn fmt_time(s: f64) -> String {
 }
 
 fn main() {
+    source_check();
     fluor::host::app::run_app(Scope::new()).expect("event loop");
+}
+
+/// What the sound server listens to and how loud (owner, 2026-11-08: five plugs tried on the light-blue jack while PipeWire listened to the rear microphone with +60 dB of boost): the default source's active port and the codec's boosts, said at start, with a warning when the port is a microphone or a boost is on.
+fn source_check() {
+    let run = |cmd: &str, args: &[&str]| std::process::Command::new(cmd).args(args).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let src = run("pactl", &["get-default-source"]).trim().to_string();
+    let list = run("pactl", &["list", "sources"]);
+    let mut port = String::new();
+    let mut ours = false;
+    for l in list.lines() {
+        if let Some(n) = l.trim().strip_prefix("Name: ") { ours = n == src; }
+        if ours { if let Some(p) = l.trim().strip_prefix("Active Port: ") { port = p.to_string(); } }
+    }
+    eprintln!("lightscope: the sound server's source {src}, port {}", if port.is_empty() { "?" } else { &port });
+    if port.contains("mic") {
+        eprintln!("lightscope: WARNING the port is a microphone (bias, boost): `pactl set-source-port {src} analog-input-linein` for line in");
+    }
+    for c in ["Line Boost", "Front Mic Boost", "Rear Mic Boost", "Mic Boost"] {
+        let a = run("amixer", &["sget", c]);
+        if let Some(db) = a.lines().find(|l| l.contains("Front Left:")).and_then(|l| l.split('[').find(|s| s.ends_with("dB]") || s.contains("dB"))) {
+            let db = db.trim_end_matches(']');
+            if !db.starts_with("0.00") {
+                eprintln!("lightscope: WARNING {c} at {db}: `amixer sset \"{c}\" 0`");
+            }
+        }
+    }
 }
