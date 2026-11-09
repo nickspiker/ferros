@@ -85,8 +85,10 @@ struct Board {
     base: [u16; BOARD_PIXELS],
     weight: [u16; BOARD_PIXELS],
     index: [u8; BOARD_PIXELS],
+    /// Each pixel's see-through part, 0 opaque to 255 clear (the display's working transparency, Q14, in eighths of a byte): the keys' edges and the gaps between them, through which the words under the keyboard show (`words`).
+    clear: [u8; BOARD_PIXELS],
 }
-const NO_BOARD: Board = Board { base: [0; BOARD_PIXELS], weight: [0; BOARD_PIXELS], index: [0; BOARD_PIXELS] };
+const NO_BOARD: Board = Board { base: [0; BOARD_PIXELS], weight: [0; BOARD_PIXELS], index: [0; BOARD_PIXELS], clear: [0; BOARD_PIXELS] };
 /// Two boards kept (owner, 2026-11-01: copy and tint): the one on show and the one a held key will leave, or the other case, so a shift, a letter or a lift is one tint pass and a copy, with no label drawn. A board missing is drawn once into the slot not on show (`Ahau::board`); `Ahau::boards` says which board each slot holds.
 static mut BOARDS: [Board; 2] = [NO_BOARD; 2];
 /// What a board's untinted pixels follow: its layout, its view, upper case or not, the bar's left key's label. The shift key's own look (off, once, lock) is drawn over it at every paint.
@@ -658,6 +660,10 @@ impl Ahau {
     }
 
     fn button(&self) {
+        // While joining there is no button, and its row is the words' band's (`words`): cleared here it cut a black band through them.
+        if matches!(self.mode, Mode::Join(_)) {
+            return;
+        }
         // The whole row first, so a button that moved or went leaves nothing behind.
         let (_, ry0, _, ry1) = self.button_at();
         let s = self.surf();
@@ -749,8 +755,15 @@ impl Ahau {
     fn words_band(&self) -> (usize, usize) {
         let (b, px) = self.status_at();
         let y0 = b + self.status_lines.get().max(1).saturating_sub(1) * px * 13 / 10 + px / 2 + self.w / 32;
-        // Down to the button row when there is a button, else to the keyboard (the join step has none).
-        let y1 = if self.button_label().is_some() { self.button_top() } else { self.kb.top } - self.w / 64;
+        // Down to the button row when there is a button; the join step has none, and its words run on under the keyboard to its foot (owner, 2026-11-09: "literally let you scroll it under the keyboard"), when its board is kept (`show_board`: one too big is drawn straight onto the glass, with no transparency kept to put them under).
+        let (top, bottom) = self.kb_rows();
+        let y1 = if self.button_label().is_some() {
+            self.button_top() - self.w / 64
+        } else if (bottom - top) * self.w <= BOARD_PIXELS {
+            bottom
+        } else {
+            top - self.w / 64
+        };
         // WHY: at a large scale the status can reach the buttons; the band is then empty, not inverted.
         (y0, y1.max(y0))
     }
@@ -763,6 +776,8 @@ impl Ahau {
             if self.words_shown.replace(false) {
                 self.surf()[y0 * self.w..y1 * self.w].fill(0);
                 self.present(y0, y1);
+                // The words ran under the keyboard: it is laid again without them.
+                self.show_board();
             }
             return;
         }
@@ -801,7 +816,9 @@ impl Ahau {
         let nl = self.wrap(px, &t[..n], (self.w * 13 / 16) as i64, &mut lines);
         let pitch = px * 3 / 2;
         // WHY the bounds: the scroll reaches from the first line to where the last sits at the band's foot; past either end the band would show nothing, and text shorter than the band does not scroll.
-        let max = ((nl * pitch + px / 2) as i64 - (y1 - y0) as i64).max(0);
+        // What can be read is above the keyboard: the scroll ends where the last line clears its top.
+        let seen = if y1 > self.kb.top { self.kb.top } else { y1 };
+        let max = ((nl * pitch + px / 2) as i64 - (seen - y0) as i64).max(0);
         self.words_max.set(max);
         let scroll = self.words_scroll.get().min(max).max(0);
         self.words_scroll.set(scroll);
@@ -818,6 +835,26 @@ impl Ahau {
             window::text(self.display, tb, x as i16, base as i16, px as u16, v, &t[s..e]);
         }
         self.get_rows(tb, y0, y1);
+        // The keyboard's rows front to back: each key pixel first, the words under it by what it leaves see-through (the display's `under_pm`: the words' channels by that transparency added), so a key's inside hides them, its edge lets part through, a gap shows them whole. The result is opaque.
+        if y1 > self.kb.top {
+            let (top, w) = (self.kb.top, self.w);
+            let b = unsafe { &(*(&raw const BOARDS))[self.shown_board.get()] };
+            let tint = self.kb.tint.unwrap_or([[1 << 14; 3]; 64]);
+            let s = self.surf();
+            for i in 0..(y1 - top) * w {
+                let k = board_px(b, &tint, i);
+                let tr = b.clear[i] as u64;
+                let p = &mut s[top * w + i];
+                *p = if tr == 0 {
+                    k
+                } else {
+                    let ch = |sh: u32| ((k >> sh & 0xFFFF) + ((*p >> sh & 0xFFFF) * tr >> 8)) << sh;
+                    ch(0) | ch(16) | ch(32)
+                };
+            }
+            // The shift key as it stands (off, once, lock), as `lay_board` draws it.
+            self.kb.draw_key(s, Key::Bar(honeycomb::B_SHIFT), false, &mut |_, _, _, _, _| {});
+        }
         // Each edge fades over up to an em: its depth em·tanh(cut/em), where `cut` is the text out of sight past that edge (0 at rest at the top: no fade there), so the fade comes and goes with every derivative continuous. Across it, the entry line's C∞ step, exp(−1/u) against its mirror.
         let fade = |u: f32| {
             let e = |u: f32| if u > 0. { libm::expf(-1. / u) } else { 0. };
@@ -826,7 +863,8 @@ impl Ahau {
         let em = px as f32;
         let depth = |cut: i64| em * libm::tanhf(cut as f32 / em);
         let s = self.surf();
-        for (d, top) in [(depth(scroll), true), (depth(max - scroll), false)] {
+        // Only the top: below, the words go under the keyboard.
+        for (d, top) in [(depth(scroll), true)] {
             if d < 1. {
                 continue;
             }
@@ -1709,6 +1747,10 @@ impl Ahau {
         self.get_rows(tb, y0, y1);
         self.present(y0, y1);
         self.show();
+        if self.words_shown.get() {
+            self.words();
+            self.show();
+        }
     }
 
     /// Where a board is drawn and painted before it shows: the back surface (its base and pixels), or, without one, the screen itself.
@@ -1747,6 +1789,8 @@ impl Ahau {
                 let i = (y - top) * w + x;
                 let p = t[y * w + x] & 0xFFFF;
                 b.base[i] = p as u16;
+                let tr = if t[y * w + x] >> 63 != 0 { 16384 } else { t[y * w + x] >> 49 & 0x3FFF };
+                b.clear[i] = (tr * 255 >> 14) as u8;
                 let k = if same {
                     b.index[i] as usize
                 } else {
@@ -1786,6 +1830,10 @@ impl Ahau {
         self.present(top, bottom);
         let t3 = now();
         self.shown_board.set(slot);
+        // While joining, the words go under the board just laid (`words` composes the keyboard's rows with them).
+        if self.words_shown.get() {
+            self.words();
+        }
         // The lift's stages, for its console line (`Touch::Tap`): the board (drawn or kept), the tint pass, the present.
         let us = |a: u64, b: u64| b.wrapping_sub(a) * 1_000_000 / freq();
         unsafe { LIFT_US[1..4].copy_from_slice(&[us(t0, t1), us(t1, t2), us(t2, t3)]) };
@@ -1796,12 +1844,9 @@ impl Ahau {
         let (top, w) = (self.kb_rows().0, self.w);
         let b = unsafe { &(*(&raw const BOARDS))[slot] };
         let t = self.surf();
-        let one = 1i64 << 14;
         let tint = self.kb.tint.unwrap_or([[1 << 14; 3]; 64]);
         for i in (y0 - top) * w..(y1 - top) * w {
-            let (p, wt, c) = (b.base[i] as i64, b.weight[i] as i64, &tint[b.index[i] as usize]);
-            let ch = |c: u16| (p * (one + (wt * (c as i64 - one) >> 14)) >> 14) as u64;
-            t[top * w + i] = ch(c[0]) | ch(c[1]) << 16 | ch(c[2]) << 32;
+            t[top * w + i] = board_px(b, &tint, i) | clear_bits(b.clear[i]);
         }
         self.kb.draw_key(t, Key::Bar(honeycomb::B_SHIFT), false, &mut |_, _, _, _, _| {});
     }
@@ -3086,4 +3131,17 @@ fn printable(name: &[u8]) -> ([u8; 35], usize) {
         *o = if (0x20..0x7F).contains(&c) { c } else { b'?' };
     }
     (t, name.len())
+}
+
+/// Board pixel `i` in the handle's tints: its grey, each channel moved toward the key's tint by the pixel's weight (a label keeps its own grey), as working values, premultiplied (the key's edge already holds only its share).
+fn board_px(b: &Board, tint: &[[u16; 3]; 64], i: usize) -> u64 {
+    let one = 1i64 << 14;
+    let (p, wt, c) = (b.base[i] as i64, b.weight[i] as i64, &tint[b.index[i] as usize]);
+    let ch = |c: u16| (p * (one + (wt * (c as i64 - one) >> 14)) >> 14) as u64;
+    ch(c[0]) | ch(c[1]) << 16 | ch(c[2]) << 32
+}
+
+/// A board pixel's see-through part (`Board::clear`, 0 to 255) as the display's working transparency: Q14 in bits 49-62, or bit 63 when clear through.
+fn clear_bits(c: u8) -> u64 {
+    if c == 255 { 1 << 63 } else { ((c as u64) << 6) << 49 }
 }

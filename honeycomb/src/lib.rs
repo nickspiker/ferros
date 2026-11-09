@@ -311,7 +311,8 @@ impl Keyboard {
 
     /// The whole keyboard: its area cleared to black (the surface's rows from `top` to `bottom`), every key, every label through `label(x, baseline, size px, value, text)`, x the label's centre: the host centres it by its ink (ferros_sys window::text_centred).
     pub fn draw(&self, s: &mut [u64], label: &mut dyn FnMut(i64, i64, u16, u16, &str)) {
-        s[self.top * self.w..self.bottom * self.w].fill(0);
+        // See-through between the keys (bit 63, the display's clear working pixel): what lies under the keyboard shows in its gaps (owner, 2026-11-09: "we need to sort out the keyboard transparency").
+        s[self.top * self.w..self.bottom * self.w].fill(CLEAR);
         for k in 0..self.hexes() {
             self.draw_key(s, Key::Hex(k), false, label);
         }
@@ -581,6 +582,14 @@ fn grey(v: u64) -> u64 {
     v | v << 16 | v << 32
 }
 
+/// A working pixel's see-through part (the display's transparency, Q14 in bits 49-62, 0 opaque) for the key's share `area` of it (Q16: its column's cover by its row's, each Q8): what the key leaves uncovered, through which what is under the keyboard shows. A whole pixel is 2¹⁶, so the share never exceeds it.
+fn see_through(area: u64) -> u64 {
+    (16384 - (area >> 2)) << 49
+}
+
+/// The display's clear working pixel: see-through whatever its channels hold.
+pub const CLEAR: u64 = 1 << 63;
+
 /// The shift key's ▲: an equilateral triangle pointing up, centred at (`cx`, `cy`) and `h` high (Q8), in grey `g`, composed front to back with the key's face `key` behind it: the ▲ first into an empty accumulator at α = its coverage (4 × 4 samples, in sixteenths), then the face under it through what the ▲ leaves, in linear light. The ▲ stands well inside the face's flat span (3/8 of its height, centred), so the face behind it is `key` and the surface is not read: each pixel is written whole, after `shape` has drawn the face. Not text: the host's labels can only brighten what is under them, and the caps-lock ▲ is black.
 fn up_triangle(s: &mut [u64], w: usize, cx: i64, cy: i64, h: i64, g: u64, key: [u64; 3]) {
     // Half the base: h/√3 (37/64).
@@ -631,7 +640,7 @@ fn hex(s: &mut [u64], w: usize, cx: i64, cy: i64, a: i64, r: i64, key: [u64; 3],
             // The two lines lie a whole side apart (the vertical sides are r long, many pixels), so they never share a pixel's area.
             let rest = face - above - below;
             let c = |i: usize| ((cov_x * (above * up[i] + below * down[i]) + rest * (lx * h2[i] + rx * d2[i] + (cov_x - lx - rx) * k2[i])) >> 16).isqrt();
-            s[y as usize * w + x as usize] = c(0) | c(1) << 16 | c(2) << 32;
+            s[y as usize * w + x as usize] = c(0) | c(1) << 16 | c(2) << 32 | see_through(cov_x * face);
         }
     }
 }
@@ -657,7 +666,7 @@ fn bar_shape(s: &mut [u64], w: usize, left: i64, right: i64, key: [u64; 3], lit:
             // The two lines lie the key's height apart (many pixels), so they never share a pixel's area.
             let rest = face - above - below;
             let c = |i: usize| ((cov_x * (above * up[i] + below * down[i]) + rest * (lx * h2[i] + rx * d2[i] + (cov_x - lx - rx) * k2[i])) >> 16).isqrt();
-            s[y as usize * w + x as usize] = c(0) | c(1) << 16 | c(2) << 32;
+            s[y as usize * w + x as usize] = c(0) | c(1) << 16 | c(2) << 32 | see_through(cov_x * face);
         }
     }
 }
