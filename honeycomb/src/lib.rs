@@ -381,8 +381,12 @@ impl Keyboard {
                 let (x0, x1) = self.bar_x(b);
                 // The foot on the circle itself, no gap under it (owner, 2026-11-09: "the spacebar should touch the bottom of the screen rather than leave a few px gap for the circle hairline"): the circle meets the screen's bottom at its centre column. The keys still keep half a gap from the row above.
                 let (y0, y1) = (self.bar0 + self.gap / 2, self.bar1);
-                let face = self.colour(key, if on { LIT } else { BAR_KEY });
-                shape(s, self.w, x0, x1, face, |fx| {
+                let g = if on { LIT } else { BAR_KEY };
+                let face = self.colour(key, g);
+                // Lit as the hexes are: the same lights and their mirrored shadows (`draw_key`'s hex arm).
+                let (tl, half) = ((g * g + BEVEL * BEVEL).isqrt(), (g * g + BEVEL * BEVEL / 2).isqrt());
+                let lit = [tl, half, g * g / half, g * g / tl].map(|v| self.colour(key, v));
+                bar_shape(s, self.w, x0, x1, face, lit, |fx| {
                     let d = self.sag(fx);
                     (y0 + d, y1 + d)
                 });
@@ -577,20 +581,6 @@ fn grey(v: u64) -> u64 {
     v | v << 16 | v << 32
 }
 
-/// One column of a shape: pixel column `x`, covered from `top` to `bot` (Q8), `cov_x` of its width (0 to 256). The ends get the value times √coverage; the span between them the column's value flat.
-fn column(s: &mut [u64], w: usize, x: usize, top: i64, bot: i64, cov_x: u32, v: [u64; 3]) {
-    let (yt, yb) = ((top >> 8) as usize, ((bot - 1) >> 8) as usize);
-    let (ct, cb) = (256 - (top & 255) as u32, ((bot - 1) & 255) as u32 + 1);
-    let rgb = |cov: u64| v[0] * cov >> 8 | (v[1] * cov >> 8) << 16 | (v[2] * cov >> 8) << 32;
-    let shade = |c: u32| rgb((c * cov_x).isqrt() as u64);
-    let flat = rgb((cov_x << 8).isqrt() as u64);
-    s[yt * w + x] = shade(ct);
-    for y in yt + 1..yb {
-        s[y * w + x] = flat;
-    }
-    s[yb * w + x] = shade(cb);
-}
-
 /// The shift key's ▲: an equilateral triangle pointing up, centred at (`cx`, `cy`) and `h` high (Q8), in grey `g`, composed front to back with the key's face `key` behind it: the ▲ first into an empty accumulator at α = its coverage (4 × 4 samples, in sixteenths), then the face under it through what the ▲ leaves, in linear light. The ▲ stands well inside the face's flat span (3/8 of its height, centred), so the face behind it is `key` and the surface is not read: each pixel is written whole, after `shape` has drawn the face. Not text: the host's labels can only brighten what is under them, and the caps-lock ▲ is black.
 fn up_triangle(s: &mut [u64], w: usize, cx: i64, cy: i64, h: i64, g: u64, key: [u64; 3]) {
     // Half the base: h/√3 (37/64).
@@ -646,19 +636,29 @@ fn hex(s: &mut [u64], w: usize, cx: i64, cy: i64, a: i64, r: i64, key: [u64; 3],
     }
 }
 
-/// A shape `left` to `right` (Q8) wide, each pixel column's top and bottom from `span` at the column's centre.
-fn shape(s: &mut [u64], w: usize, left: i64, right: i64, v: [u64; 3], span: impl Fn(i64) -> (i64, i64)) {
-    let (xl, xr) = ((left >> 8) as usize, ((right - 1) >> 8) as usize);
-    for x in xl..=xr {
-        let cov_x = if x == xl {
-            256 - (left & 255) as u32
-        } else if x == xr {
-            ((right - 1) & 255) as u32 + 1
-        } else {
-            256
-        };
-        let (top, bot) = span(((x as i64) << 8) + 128);
-        column(s, w, x, top, bot, cov_x, v);
+/// A bar key `left` to `right` (Q8) wide, each pixel column's top and bottom from `span` at its centre, in colour `key`, with the hexes' bevel (owner, 2026-11-09: "key accents on the TL and BR of our bottom round keys too, ... match the bright/dark edges of the letters"): a line a pixel thick inside each side, `lit` = [top-left, left and top-right, right and bottom-left, bottom-right] as `hex` takes them. The top's left half takes the top-left light and its right half the half light, the bottom's left half the half shadow and its right half the full shadow, the left side the half light and the right side the half shadow, as a hex's sides are lit.
+fn bar_shape(s: &mut [u64], w: usize, left: i64, right: i64, key: [u64; 3], lit: [[u64; 3]; 4], span: impl Fn(i64) -> (i64, i64)) {
+    let sq = |v: [u64; 3]| v.map(|c| c * c);
+    let (k2, [tl2, h2, d2, br2]) = (sq(key), lit.map(sq));
+    let ov = |a0: i64, a1: i64, b0: i64, b1: i64| (a1.min(b1) - a0.max(b0)).max(0) as u64;
+    let mid = (left + right) / 2;
+    for x in (left >> 8)..=((right - 1) >> 8) {
+        let (x0, x1) = (x << 8, (x + 1) << 8);
+        let cov_x = ov(x0, x1, left, right);
+        // The side lines: the first pixel's width in from each side (the key is many pixels wide, so together never more than cov_x).
+        let (lx, rx) = (ov(x0, x1, left, left + 256), ov(x0, x1, right - 256, right));
+        let fx = x0 + 128;
+        let (top, bot) = span(fx);
+        let (up, down) = if fx < mid { (tl2, d2) } else { (h2, br2) };
+        for y in (top >> 8)..=((bot - 1) >> 8) {
+            let (y0, y1) = (y << 8, (y + 1) << 8);
+            let face = ov(y0, y1, top, bot);
+            let (above, below) = (ov(y0, y1, top, top + 256), ov(y0, y1, bot - 256, bot));
+            // The two lines lie the key's height apart (many pixels), so they never share a pixel's area.
+            let rest = face - above - below;
+            let c = |i: usize| ((cov_x * (above * up[i] + below * down[i]) + rest * (lx * h2[i] + rx * d2[i] + (cov_x - lx - rx) * k2[i])) >> 16).isqrt();
+            s[y as usize * w + x as usize] = c(0) | c(1) << 16 | c(2) << 32;
+        }
     }
 }
 
