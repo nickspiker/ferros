@@ -1380,8 +1380,8 @@ const AK3B_DBV_TOP: u16 = 3175;
 const AK3B_TOP_NITS: f32 = 800.0;
 /// akita's high brightness mode peak (Google's capability, 1400 cd/m² at DBV 4095; not measured on this unit): its brightest, and the floor's reference, as husky's measured peak is.
 const AK3B_HBM_NITS: f32 = 1400.0;
-/// akita's light against DBV in normal mode, a power law through Google's two ends (2 cd/m² at DBV 209, 800 at 3175: 2.2 fits both to a percent; husky's measured table follows 2.2 too). Not measured on this unit.
-const AK3B_GAMMA: f32 = 2.2;
+/// akita's light against DBV in normal mode, a power law: 2.23 end to end on this unit (the i1 Pro, 1.86 cd/m² at DBV 209, 802 at 3175; docs/AK3B.md), Google's two ends both held.
+const AK3B_GAMMA: f32 = 2.23;
 
 /// The panel setting that gives a native peak as close to `nits` as it has: (high brightness mode, DBV, the native peak it gives). Between measured points, log-linear.
 fn panel_for(nits: f32) -> (bool, u16, f32) {
