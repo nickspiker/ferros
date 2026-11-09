@@ -82,10 +82,14 @@ fn logical_extents_locked(name: &str) -> Result<Vec<Part>, String> {
     };
     let u32at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
     let u64at = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-    if u32at(&block(1)?, 0) != 0x616C_4467 {
+    let geo = block(1)?;
+    if u32at(&geo, 0) != 0x616C_4467 {
         return Err(String::from("super: no LP geometry"));
     }
-    let hdr = block(3)?;
+    // The metadata copy of the name's slot (liblp: slot s at 12 KiB + s × metadata_max_size, geometry +40): a `_b` name is in slot 1's, where its extents are listed (akita runs Android from slot b; its vendor_b was "not in super's metadata" read from slot 0's, 2026-11-09).
+    let slot = name.ends_with("_b") as u64;
+    let first = 3 + slot * (u32at(&geo, 40) as u64 / 4096);
+    let hdr = block(first)?;
     if u32at(&hdr, 0) != 0x414C_5030 {
         return Err(String::from("super: no LP metadata header"));
     }
@@ -96,7 +100,7 @@ fn logical_extents_locked(name: &str) -> Result<Vec<Part>, String> {
     }
     let mut meta = Vec::with_capacity(hsize + tsize + 4096);
     for k in 0..(hsize + tsize).div_ceil(4096) as u64 {
-        meta.extend_from_slice(&block(3 + k)?);
+        meta.extend_from_slice(&block(first + k)?);
     }
     let table = |d: usize| (hsize + u32at(&meta, d) as usize, u32at(&meta, d + 4) as usize, u32at(&meta, d + 8) as usize);
     let (poff, pcount, psize) = table(80);
@@ -175,6 +179,16 @@ fn vermagic_locked(rep: &mut Vec<u8>, name: &str) {
 }
 
 /// An ext4 mount of a partition already found (a logical one from `find_logical`, say).
+/// An ext4 filesystem over a logical partition's extents, in order (`logical_extents`).
+pub fn mount_extents(name: &str, parts: Vec<Part>) -> Result<Mount, String> {
+    let mut scratch = vec![0u8; 4096];
+    let fs = ferros_ext4::Fs::mount(PartDisk::extents(parts), &mut scratch).map_err(|e| alloc::format!("{name}: {e:?}"))?;
+    if fs.block_size != 4096 {
+        return Err(alloc::format!("{name}: block size {} (only 4 KiB handled)", fs.block_size));
+    }
+    Ok(Mount { fs, scratch, block: vec![0u8; 4096] })
+}
+
 pub fn mount_part(name: &str, part: Part) -> Result<Mount, String> {
     let mut scratch = vec![0u8; 4096];
     let fs = ferros_ext4::Fs::mount(PartDisk::new(part), &mut scratch).map_err(|e| alloc::format!("{name}: {e:?}"))?;
@@ -184,28 +198,39 @@ pub fn mount_part(name: &str, part: Part) -> Result<Mount, String> {
     Ok(Mount { fs, scratch, block: vec![0u8; 4096] })
 }
 
-/// A partition as an ext4 disk: filesystem block n is LBA first + n (both 4 KiB).
+/// A partition as a disk: filesystem block n is the n-th 4 KiB block across its extents, in order (one for a GPT partition; a logical partition in super may have several: akita's vendor_b has nine, 2026-11-09).
 pub struct PartDisk {
     ufs: UfsController,
-    part: Part,
+    parts: Vec<Part>,
 }
 
 impl PartDisk {
     pub fn new(part: Part) -> Self {
-        PartDisk { ufs: UfsController::new(UFS_BASE), part }
+        PartDisk { ufs: UfsController::new(UFS_BASE), parts: vec![part] }
+    }
+    pub fn extents(parts: Vec<Part>) -> Self {
+        PartDisk { ufs: UfsController::new(UFS_BASE), parts }
+    }
+    /// Block n's LU and LBA, or None past the last extent (the filesystem's numbers are read from the disk itself: past the end is corrupt metadata).
+    fn lba(&self, mut n: u64) -> Option<(u8, u64)> {
+        for p in &self.parts {
+            let len = p.last - p.first + 1;
+            if n < len {
+                return Some((p.lun, p.first + n)).filter(|x| x.1 <= u32::MAX as u64);
+            }
+            n -= len;
+        }
+        None
     }
 }
 
 impl ferros_ext4::Disk for PartDisk {
     fn read_blocks(&mut self, block: u64, buf: &mut [u8]) -> Result<(), ferros_ext4::Error> {
         for (i, chunk) in buf.chunks_mut(4096).enumerate() {
-            let lba = self.part.first + block + i as u64;
-            if lba > self.part.last || lba > u32::MAX as u64 {
-                return Err(ferros_ext4::Error::Corrupt);
-            }
+            let Some((lun, lba)) = self.lba(block + i as u64) else { return Err(ferros_ext4::Error::Corrupt) };
             // One UFS command under the kernel lock, as the vault's are (a syscall holds it): the modem service reads files here while processes use the vault.
             let ufs = &mut self.ufs;
-            let (lun, n) = (self.part.lun, chunk.len());
+            let n = chunk.len();
             let ok = crate::process::with_lock_held_or(|| {
                 let ok = ufs.read_block_lun(lun, lba as u32) == 0 && ufs.last_response_status() == 0;
                 if ok {
@@ -223,13 +248,10 @@ impl ferros_ext4::Disk for PartDisk {
 
 impl ferros_f2fs::Disk for PartDisk {
     fn read_block(&mut self, block: u64, buf: &mut [u8; ferros_f2fs::BLOCK]) -> Result<(), ferros_f2fs::Error> {
-        let lba = self.part.first + block;
-        if lba > self.part.last || lba > u32::MAX as u64 {
-            return Err(ferros_f2fs::Error::Corrupt);
-        }
+        let Some((lun, lba)) = self.lba(block) else { return Err(ferros_f2fs::Error::Corrupt) };
         // One UFS command under the kernel lock, as in the ext4 reader above.
         let ufs = &mut self.ufs;
-        let lun = self.part.lun;
+
         let ok = crate::process::with_lock_held_or(|| {
             let ok = ufs.read_block_lun(lun, lba as u32) == 0 && ufs.last_response_status() == 0;
             if ok {
@@ -367,12 +389,17 @@ pub fn part_call(part: &'static str, req: &[u8], cap: usize) -> Vec<u8> {
         let Ok(name) = core::str::from_utf8(path) else { return Vec::new() };
         let opened = match part {
             "efs" | "persist" | "modem_userdata" => read_f2fs(part, name).map(Open::F2fs),
-            "vendor_a" => find_logical(part).and_then(|p| mount_part(part, p)).and_then(|mut m| m.open(name).map(|i| Open::Ext4(m, i))),
+            // vendor_b too: akita runs Android from slot b, and its vendor partition (the Bluetooth patch, 2026-11-09) is there.
+            "vendor_a" | "vendor_b" => logical_extents(part).and_then(|x| mount_extents(part, x)).and_then(|mut m| m.open(name).map(|i| Open::Ext4(m, i))),
             _ => mount(part).and_then(|mut m| m.open(name).map(|i| Open::Ext4(m, i))),
         };
         match opened {
             Ok(o) => unsafe { *(&raw mut PART_OPEN) = Some((part, path.to_vec(), o)) },
-            Err(_) => return Vec::new(),
+            // Said in the flash log (`diag log`): a driver sees only an empty answer (2026-11-09: akita's Bluetooth patch, "not on vendor_a" with no reason).
+            Err(e) => {
+                crate::flashlog::line(&alloc::format!("partfs: {part} {name}: {e:?}"));
+                return Vec::new();
+            }
         }
     }
     let Some((_, _, open)) = (unsafe { (*(&raw mut PART_OPEN)).as_mut() }) else { return Vec::new() };

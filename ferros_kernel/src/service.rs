@@ -810,7 +810,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         // 68: was the PMU a second time (the modem takes slot 40's, the same grant, since 2026-11-05); now the layer arena (GPU.md "Layers"), for the GPU service and its clients. The grants page holds 108 slots (process.rs PREFS at G#FC0), so slots are reused, never appended past 108.
         Dma(b"layers"),
         Dma(b"modem-pktproc"), Dma(b"modem-ipc"), Dma(b"modem-msi"),
-        Part(b"modem_a"), Part(b"efs"), Part(b"persist"), Part(b"modem_userdata"), Part(b"vendor_a"),
+        // 76 the vendor partition of the slot Android runs from: akita's is slot b (its Bluetooth patch read from there, 2026-11-09), husky's slot a.
+        Part(b"modem_a"), Part(b"efs"), Part(b"persist"), Part(b"modem_userdata"), Part(if crate::board::akita() { b"vendor_b" } else { b"vendor_a" }),
         // The NFC driver (payloads/nfc, docs/NFC.md): 77 serve nfc, 78 hsi2c_0, 79 its power; its interrupt line is read in gpio-alive (67). 80 use nfc (Photon's, the tap's secret).
         Serve(b"nfc"), Hardware(b"hsi2c0"), Power(b"nfc"), Use(b"nfc"),
         // The Bluetooth driver (payloads/bt, docs/BT.md): 81 serve bt, 82 the APM UART, 83 its power; the patch from vendor_a (76), entropy (41). 84 use bt (Photon's, the beacon).
