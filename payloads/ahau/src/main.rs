@@ -143,6 +143,8 @@ const S_BACK: u64 = 10;
 /// Slots 11 and 12: the GPU service (`use gpu`) and the layer arena, where the mark's quick pass is drawn on the GPU (GPU.md, "The resident service, and the attest mark's path"). Without them (after a jump, no GPU service) the quick pass stays on the CPU.
 const S_GPU: u64 = 11;
 const S_LAYERS: u64 = 12;
+/// The WiFi driver's `wlan` (init's slot 44): the network page's SCAN, JOIN and STATUS (pcie1, ATTEST-UI.md "WiFi connect").
+const S_WLAN: u64 = 13;
 /// The GPU's view of the layer arena (payloads/gpu ARENA_VA), and ahau's own region of it: the kernel's words at 32 MiB, the quick pass's pixels from 33 MiB (gputest uses the first 32).
 const ARENA_VA: u64 = 0x8000_0000;
 const GPU_CODE: usize = 32 << 20;
@@ -411,6 +413,10 @@ enum Mode {
     Words(u8),
     /// After attest, waiting for words to be wanted, the window gone.
     Hosting,
+    /// The network page over the attest screen (ATTEST-UI.md "First use", 2: pulled down from the mark): the networks the WiFi chip sees; the mode under it waits in `under`.
+    Networks,
+    /// The network page: the passphrase for the network picked, typed on the keyboard (it never feeds the mark or the keys' rainbow).
+    Pass,
 }
 
 struct Ahau {
@@ -453,6 +459,13 @@ struct Ahau {
     status_text: core::cell::Cell<([u8; 256], usize)>,
     /// The surface text goes into: the shown one, or the back one while a band is composed there (`compose`).
     text_to: core::cell::Cell<u64>,
+    /// The network page: the mode under it, the handle as it stood (put back when the page closes), the last SCAN reply, the network picked (name, length), and a JOIN sent whose link has not come.
+    under: Mode,
+    stash: ([u8; TEXT_BYTES], usize, usize, usize),
+    nets: [u8; 1 << 11],
+    nets_len: usize,
+    pick: ([u8; 32], usize),
+    joining: bool,
 }
 
 impl Ahau {
@@ -563,7 +576,22 @@ impl Ahau {
                 return;
             }
         }
+        // The network page: a row picks its network, the button scans or joins.
+        if self.mode == Mode::Networks && !self.joining {
+            if let Some(k) = self.net_row_at(y) {
+                self.net_pick(k);
+                return;
+            }
+        }
         let (x0, y0, x1, y1) = self.button_at();
+        if (x0 as i64..x1 as i64).contains(&x) && (y0 as i64..y1 as i64).contains(&y) && matches!(self.mode, Mode::Networks | Mode::Pass) {
+            match self.mode {
+                Mode::Pass => self.net_join(),
+                _ if !self.joining => self.net_scan(),
+                _ => {}
+            }
+            return;
+        }
         if (x0 as i64..x1 as i64).contains(&x) && (y0 as i64..y1 as i64).contains(&y) {
             if self.button_label().is_some() {
                 self.attest();
@@ -588,12 +616,12 @@ impl Ahau {
 
     /// Whether the screen takes a handle now: the first entry, and the mint's second. Elsewhere (looking, the words, no answer, wrong) there is no text box and keys type nothing.
     fn typing(&self) -> bool {
-        matches!(self.mode, Mode::Fresh | Mode::Mint(_) | Mode::Words(_))
+        matches!(self.mode, Mode::Fresh | Mode::Mint(_) | Mode::Words(_) | Mode::Pass)
     }
 
     /// Whether a step back to the entry exists: from any step after a first entry (owner, 2026-10-28: "we need a way to go back to the previous screen").
     fn can_go_back(&self) -> bool {
-        matches!(self.mode, Mode::Looking(_) | Mode::Join(_) | Mode::Mint(_) | Mode::Grey(_) | Mode::Wrong)
+        matches!(self.mode, Mode::Looking(_) | Mode::Join(_) | Mode::Mint(_) | Mode::Grey(_) | Mode::Wrong | Mode::Networks | Mode::Pass)
     }
 
     /// The button under the entry line: its rectangle (x0, y0, x1, y1). With a step back, it moves right and `back` takes the left.
@@ -617,6 +645,12 @@ impl Ahau {
 
     /// Back to the entry: the pending roots stay (the client keeps at them); the same handle resumes, another replaces them.
     fn go_back(&mut self) {
+        // On the network page: from the passphrase back to the list, from the list back to the screen under it.
+        match self.mode {
+            Mode::Pass => return self.net_list(),
+            Mode::Networks => return self.net_close(),
+            _ => {}
+        }
         self.mode = Mode::Fresh;
         self.status(self.prompt());
         self.words();
@@ -631,7 +665,9 @@ impl Ahau {
             Mode::Mint(_) => Some("mint"),
             Mode::Wrong => Some("start over"),
             Mode::Words(_) => Some("cancel"),
-            Mode::Looking(_) | Mode::Join(_) | Mode::Grey(_) | Mode::Hosting => None,
+            Mode::Networks if !self.joining => Some("scan"),
+            Mode::Pass => Some("join"),
+            Mode::Looking(_) | Mode::Join(_) | Mode::Grey(_) | Mode::Hosting | Mode::Networks => None,
         }
     }
 
@@ -812,8 +848,8 @@ impl Ahau {
 
     /// The entry: the handle as typed and a cursor.
     fn entry(&self) {
-        // The mark is the handle's: words typed for the identity service draw none.
-        if !matches!(self.mode, Mode::Words(_)) {
+        // The mark is the handle's: words typed for the identity service draw none, nor does a passphrase.
+        if !matches!(self.mode, Mode::Words(_) | Mode::Networks | Mode::Pass) {
             publish_fresh_text(&self.handle[..self.len], true);
         }
         // A keystroke restarts the blinkey: bright at the top, its next tick a fresh interval away (Photon: the caret stays solid through typing).
@@ -1034,6 +1070,10 @@ impl Ahau {
     fn rescale(&self) {
         let (_, cy, r) = self.mark_at();
         let (y0, y1) = (cy + r + 2, self.kb.top);
+        // The network page's list is sized by the scale too.
+        if self.net_open() {
+            self.net_draw();
+        }
         // Cleared in the buffer only: each piece composes its own band and shows it whole, then the region is shown once more from the buffer, which now holds their text too, so what a smaller size no longer covers goes black with no frame of it blank in between.
         self.surf()[y0 * self.w..y1 * self.w].fill(0);
         let (t, n) = self.status_text.get();
@@ -1048,15 +1088,268 @@ impl Ahau {
     fn all(&self) {
         self.surf().fill(0);
         Front::fill64(window::PORCH, (self.w * self.h) as u64, 0);
-        if !matches!(self.mode, Mode::Words(_)) {
-            let (cx, cy, r) = self.mark_at();
-            draw_mark(self.surf(), self.w, cx, cy, r);
-            self.present(cy - r - 2, cy + r + 2);
+        if self.net_open() {
+            // The network page: its list where the mark was, its own status line.
+            self.net_draw();
+            self.net_status();
+        } else {
+            if !matches!(self.mode, Mode::Words(_)) {
+                let (cx, cy, r) = self.mark_at();
+                draw_mark(self.surf(), self.w, cx, cy, r);
+                self.present(cy - r - 2, cy + r + 2);
+            }
+            self.status(self.prompt());
         }
-        self.status(self.prompt());
         self.entry();
         self.button();
         self.show_board();
+    }
+
+    /// Whether the network page is up.
+    fn net_open(&self) -> bool {
+        matches!(self.mode, Mode::Networks | Mode::Pass)
+    }
+
+    /// The network page pulled down over the screen: the mode under it and the handle as typed are kept for its closing; one scan is asked for.
+    fn net_pull(&mut self) {
+        if self.net_open() || matches!(self.mode, Mode::Words(_) | Mode::Hosting) {
+            return;
+        }
+        self.under = self.mode;
+        self.stash = (self.handle, self.len, self.chars, self.caret);
+        self.zero_text();
+        self.mode = Mode::Networks;
+        self.joining = false;
+        self.nets_len = 0;
+        self.net_scan();
+        self.all();
+    }
+
+    /// The network page closed: the screen under it back as it was, the handle as typed.
+    fn net_close(&mut self) {
+        self.zero_text();
+        (self.handle, self.len, self.chars, self.caret) = self.stash;
+        for b in self.stash.0.iter_mut() {
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        self.mode = self.under;
+        self.joining = false;
+        self.all();
+    }
+
+    /// From the passphrase back to the list.
+    fn net_list(&mut self) {
+        self.zero_text();
+        self.mode = Mode::Networks;
+        self.entry();
+        self.button();
+        self.net_status();
+    }
+
+    /// The text box emptied, its bytes overwritten (a passphrase never lingers in memory).
+    fn zero_text(&mut self) {
+        for b in self.handle.iter_mut() {
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        self.len = 0;
+        self.chars = 0;
+        self.caret = 0;
+        self.pan.set(0);
+    }
+
+    /// The list's `k`th network from the last SCAN reply (pcie1: [scanning, count], then name length, name, dBm, flags): its name, signal and flags.
+    fn net_entry(&self, k: usize) -> Option<(&[u8], i8, u8)> {
+        // WHY `get`: the reply is another process's bytes (the driver's), its lengths unchecked here; a short or malformed one ends the list rather than indexing past the reply.
+        let b = &self.nets[..self.nets_len];
+        if b.len() < 2 || k >= b[1] as usize {
+            return None;
+        }
+        let mut at = 2;
+        for j in 0..=k {
+            let n = *b.get(at)? as usize;
+            let e = b.get(at + 1..at + 3 + n)?;
+            if j == k {
+                return Some((&e[..n], e[n] as i8, e[n + 1]));
+            }
+            at += 3 + n;
+        }
+        None
+    }
+
+    /// The list's rows: their size, pitch, the first row's baseline and the list's foot, inside the mark's square below its top three eighths (the console's circles run along the top of the glass, over the mark's top).
+    fn net_rows(&self) -> (usize, usize, usize, usize) {
+        let (_, cy, r) = self.mark_at();
+        let px = self.k(self.w / 24);
+        let pitch = px * 2;
+        (px, pitch, cy - r * 5 / 8 + pitch, cy + r)
+    }
+
+    /// The row under `y`, if a network is listed there.
+    fn net_row_at(&self, y: i64) -> Option<usize> {
+        let (px, pitch, first, foot) = self.net_rows();
+        let top = first as i64 - pitch as i64 + (px / 2) as i64;
+        if y < top || y >= foot as i64 {
+            return None;
+        }
+        let k = ((y - top) / pitch as i64) as usize;
+        self.net_entry(k).map(|_| k)
+    }
+
+    /// The list drawn where the mark was: each network's name (bright when this device can join it, quiet otherwise) and, at the right, its signal in dBm, or `kept` for the one the device keeps.
+    fn net_draw(&self) {
+        let (_, cy, r) = self.mark_at();
+        let (y0, y1) = (cy - r - 2, cy + r + 2);
+        self.surf()[y0 * self.w..y1 * self.w].fill(0);
+        self.compose(y0, y1, || {
+            let (px, pitch, first, foot) = self.net_rows();
+            let mut k = 0;
+            while let Some((name, dbm, flags)) = self.net_entry(k) {
+                let b = first + k * pitch;
+                if b + px / 2 > foot {
+                    break;
+                }
+                let shown = printable(name);
+                let v = if flags & 1 != 0 { TEXT } else { QUIET };
+                window::text(self.display, self.text_to.get(), (self.w / 8) as i16, b as i16, px as u16, v, &shown.0[..shown.1]);
+                let mut l = Line::new();
+                if flags & (1 << 4) != 0 {
+                    let _ = core::fmt::Write::write_str(&mut l, "kept");
+                } else {
+                    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("{dbm} dBm"));
+                }
+                let x = (self.w * 7 / 8) as i64 - self.measure(px, l.as_bytes()) / 4;
+                window::text(self.display, self.text_to.get(), x as i16, b as i16, px as u16, QUIET, l.as_bytes());
+                k += 1;
+            }
+        });
+    }
+
+    /// The page's status line: what it is doing, or what to do.
+    fn net_status(&self) {
+        let name = printable(&self.pick.0[..self.pick.1]);
+        let name = core::str::from_utf8(&name.0[..name.1]).unwrap_or("");
+        let mut l = Line::new();
+        let scanning = self.nets_len >= 1 && self.nets[0] == 1;
+        let count = if self.nets_len >= 2 { self.nets[1] } else { 0 };
+        let _ = match self.mode {
+            _ if self.joining => core::fmt::Write::write_fmt(&mut l, format_args!("Joining {name}.")),
+            Mode::Pass => core::fmt::Write::write_fmt(&mut l, format_args!("The passphrase for {name}.")),
+            _ if count == 0 && (scanning || self.nets_len == 0) => core::fmt::Write::write_str(&mut l, "Looking for networks."),
+            _ if count == 0 => core::fmt::Write::write_str(&mut l, "No networks found."),
+            _ => core::fmt::Write::write_str(&mut l, "Tap a network to join it."),
+        };
+        self.status(core::str::from_utf8(l.as_bytes()).unwrap_or(""));
+    }
+
+    /// A scan asked of the WiFi driver ([4, 1]), and the list as it stands.
+    fn net_scan(&mut self) {
+        self.net_ask(&[4, 1]);
+    }
+
+    /// SCAN asked (`q`): the reply kept and drawn when it changed. A driver not answering yet (starting, or busy joining) leaves the list as it was.
+    fn net_ask(&mut self, q: &[u8]) -> bool {
+        let mut out = [0u8; 1 << 11];
+        let n = ferros_sys::call_live(cap(self.grants, S_WLAN), q, &mut out);
+        if n == ferros_sys::ERR || n < 2 {
+            return false;
+        }
+        let n = n as usize;
+        if n == self.nets_len && out[..n] == self.nets[..n] {
+            return false;
+        }
+        self.nets[..n].copy_from_slice(&out[..n]);
+        self.nets_len = n;
+        self.net_draw();
+        self.net_status();
+        true
+    }
+
+    /// A network picked: its passphrase is typed next.
+    fn net_pick(&mut self, k: usize) {
+        let Some((name, _, flags)) = self.net_entry(k) else { return };
+        let n = name.len();
+        let mut pick = [0u8; 32];
+        pick[..n].copy_from_slice(name);
+        self.pick = (pick, n);
+        if flags & 1 == 0 {
+            // Not WPA2-PSK outside 6 GHz: open, WPA3 only, enterprise, WEP. The driver joins none of those yet.
+            let shown = printable(&pick[..n]);
+            let mut l = Line::new();
+            let _ = core::fmt::Write::write_fmt(&mut l, format_args!("{} needs a kind of security this device cannot join yet.", core::str::from_utf8(&shown.0[..shown.1]).unwrap_or("")));
+            self.status(core::str::from_utf8(l.as_bytes()).unwrap_or(""));
+            return;
+        }
+        self.zero_text();
+        self.mode = Mode::Pass;
+        self.net_status();
+        self.entry();
+        self.button();
+    }
+
+    /// JOIN: the network picked and the passphrase typed, handed to the WiFi driver, which keeps them and joins (the page then waits for the link: `net_poll`). The request's bytes and the text box overwritten after.
+    fn net_join(&mut self) {
+        let (name, n) = self.pick;
+        let pass = &self.handle[..self.len];
+        if !(8..=63).contains(&pass.len()) || !pass.is_ascii() {
+            self.status("A passphrase is 8 to 63 plain characters.");
+            return;
+        }
+        let mut q = [0u8; 2 + 32 + 63];
+        q[0] = 5;
+        q[1] = n as u8;
+        q[2..2 + n].copy_from_slice(&name[..n]);
+        q[2 + n..2 + n + pass.len()].copy_from_slice(pass);
+        let len = 2 + n + pass.len();
+        let mut out = [0u8; 8];
+        let r = ferros_sys::call_live(cap(self.grants, S_WLAN), &q[..len], &mut out);
+        for b in q.iter_mut() {
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        match (r, out[0]) {
+            (r, _) if r == ferros_sys::ERR || r == 0 => self.status("The WiFi is not answering yet. Try again."),
+            (_, 0) => {
+                self.zero_text();
+                self.joining = true;
+                self.mode = Mode::Networks;
+                self.entry();
+                self.button();
+                self.net_status();
+            }
+            (_, 1) => self.status("A passphrase is 8 to 63 plain characters."),
+            (_, 3) => self.status("This device is on a network already."),
+            _ => self.status("The device could not keep this network."),
+        }
+    }
+
+    /// The page's poll (about four times a second): while a join runs, its outcome (the data link up closes the page; the driver answering STATUS again with no link means it failed); otherwise the list, while a scan fills it.
+    fn net_poll(&mut self) -> bool {
+        if !self.joining {
+            return self.nets_len >= 1 && self.nets[0] == 1 && self.net_ask(&[4]);
+        }
+        if ferros_sys::data_link_up(&ferros_sys::facts()) {
+            self.net_close();
+            return true;
+        }
+        let mut out = [0u8; 64];
+        let r = ferros_sys::call_live(cap(self.grants, S_WLAN), &[6], &mut out);
+        // Not answering: still joining. Joined (state 2): the link comes with its address.
+        if r == ferros_sys::ERR || r < 2 || out[0] != 0 {
+            return false;
+        }
+        self.joining = false;
+        self.mode = Mode::Pass;
+        let shown = printable(&self.pick.0[..self.pick.1]);
+        let name = core::str::from_utf8(&shown.0[..shown.1]).unwrap_or("");
+        let mut l = Line::new();
+        let _ = match out[1] {
+            1 => core::fmt::Write::write_fmt(&mut l, format_args!("{name} is out of reach.")),
+            3 => core::fmt::Write::write_fmt(&mut l, format_args!("{name} did not answer. Try again.")),
+            _ => core::fmt::Write::write_fmt(&mut l, format_args!("{name} refused the passphrase.")),
+        };
+        self.status(core::str::from_utf8(l.as_bytes()).unwrap_or(""));
+        self.entry();
+        self.button();
+        true
     }
 
     /// The keyboard's rows: from its top to the bar's foot at its lowest (on the app's circle, its bottom).
@@ -1210,6 +1503,8 @@ impl Ahau {
             Mode::Words(1) => "Type the words the new device shows.",
             Mode::Words(_) => "Type the words the leaving device shows,\nthen enter.",
             Mode::Hosting => "",
+            // The network page writes its own lines (`net_status`).
+            Mode::Networks | Mode::Pass => "",
         }
     }
 
@@ -1592,7 +1887,7 @@ impl Ahau {
 
     /// A finger is down on `key`: the handle as that key would make it goes to the mark's thread now, so its frame is ready by the lift; the text itself changes only at the lift (`tap`). The key's effect is found on a copy of the keyboard (its shift and page are the real one's), so nothing here changes until the tap.
     fn preview(&self, key: Key) {
-        if !self.typing() || matches!(self.mode, Mode::Words(_)) {
+        if !self.typing() || matches!(self.mode, Mode::Words(_) | Mode::Pass) {
             return;
         }
         let mut kb = self.kb.clone();
@@ -1618,7 +1913,12 @@ impl Ahau {
     }
 
     fn type_char(&mut self, c: char) {
-        let limit = if matches!(self.mode, Mode::Words(_)) { WORD_CHARS } else { MAX_CHARS };
+        let limit = match self.mode {
+            Mode::Words(_) => WORD_CHARS,
+            // WPA2's longest passphrase.
+            Mode::Pass => 63,
+            _ => MAX_CHARS,
+        };
         self.caret = insert_at(&mut self.handle, &mut self.len, &mut self.chars, self.caret, c, limit);
         self.entry();
     }
@@ -1630,6 +1930,15 @@ impl Ahau {
             Some(Event::Char(c)) => self.type_char(c),
             Some(Event::Back) => {
                 self.caret = delete_before(&mut self.handle, &mut self.len, &mut self.chars, self.caret);
+                self.entry();
+            }
+            // The passphrase: enter joins, clear empties it (the mark is not the passphrase's, so nothing is published).
+            Some(Event::Enter) if self.mode == Mode::Pass => {
+                self.net_join();
+                return;
+            }
+            Some(Event::Leave) if self.mode == Mode::Pass => {
+                self.zero_text();
                 self.entry();
             }
             // Words: enter sends them as typed (they hold no newline).
@@ -1658,9 +1967,11 @@ impl Ahau {
                 return;
             }
         }
-        // Every stroke: the keys take the new handle's rainbow, laid on from the board in one pass; a letter that ended a one-letter shift brings the lower-case board, drawn at its press.
+        // Every stroke: the keys take the new handle's rainbow, laid on from the board in one pass; a letter that ended a one-letter shift brings the lower-case board, drawn at its press. A passphrase leaves the handle's rainbow as it was: the keys would otherwise show a hash of it.
         let t = now();
-        self.retint();
+        if self.mode != Mode::Pass {
+            self.retint();
+        }
         unsafe { LIFT_US[0] = now().wrapping_sub(t) * 1_000_000 / freq() };
         self.show_board();
     }
@@ -2057,7 +2368,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None) };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), joining: false };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     start_fresh_mark(grants, w / 3);
     a.retint();
@@ -2080,6 +2391,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The data link's state last drawn into the status while looking (None outside it).
     let mut link_up: Option<bool> = None;
     let mut pinched = false;
+    // A pull (the network page down, or up again) acts once per touch: set when it acts, cleared when every finger lifts.
+    let mut pulled = false;
     // The key typed at its press (COMMIT_AT_PRESS), whose tap at the lift is then only its letting go.
     let mut pressed: Option<Key> = None;
     // The last frame of the mark put on the glass (FRESH_DONE's count).
@@ -2089,7 +2402,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         ferros_sys::pet();
         let done = FRESH_DONE.load(core::sync::atomic::Ordering::Acquire);
         let typed = FRESH_DONE_GEN.load(core::sync::atomic::Ordering::Acquire) == SHOW_GEN.load(core::sync::atomic::Ordering::Acquire);
-        if done != mark_shown && typed {
+        // Not while the network page covers the mark: it is drawn whole when the page closes.
+        if done != mark_shown && typed && !a.net_open() {
             let (cx, cy, r) = a.mark_at();
             draw_mark(a.surf(), a.w, cx, cy, r);
             a.present(cy - r - 2, cy + r + 2);
@@ -2135,6 +2449,9 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 a.rescale();
             }
             pinched = true;
+        }
+        if k == 0 {
+            pulled = false;
         }
         if k == 0 {
             if pinch.take().is_some() {
@@ -2204,9 +2521,19 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
                 Touch::TapAt(x, y) if !pinched => a.tap_at(x, y),
                 Touch::TapAt(..) => {}
-                // A drag on the entry line pans it (TEXT.md); elsewhere nothing yet.
-                Touch::Drag(x0, y0, x, _) if !pinched => {
-                    a.drag_text(x0, y0, x);
+                // A pull down from the mark's upper half opens the network page, a pull up on the page closes it (an eighth of the width, once per touch); a drag on the entry line pans it (TEXT.md).
+                Touch::Drag(x0, y0, x, y) if !pinched => {
+                    let (_, cy, _) = a.mark_at();
+                    let reach = (a.w / 8) as i64;
+                    if !pulled && !a.net_open() && y0 < cy as i64 && y - y0 > reach {
+                        pulled = true;
+                        a.net_pull();
+                    } else if !pulled && a.mode == Mode::Networks && y0 < a.kb.top as i64 && y0 - y > reach {
+                        pulled = true;
+                        a.net_close();
+                    } else {
+                        a.drag_text(x0, y0, x);
+                    }
                 }
                 Touch::Drag(..) => {}
                 // A handle is exact bytes, typed key by key: no shape writing here.
@@ -2222,7 +2549,10 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         // Following the identity service's verdict while the identity is looked up or joined: about four times a second.
         polls += 1;
-        let followed = polls % 64 == 0 && a.follow_client();
+        let followed = polls % 64 == 0 && !a.net_open() && a.follow_client();
+        if polls % 64 == 0 && a.net_open() && a.net_poll() {
+            a.show();
+        }
         if a.follow_layout() || no > 0 || followed {
             a.show();
         }
@@ -2280,4 +2610,13 @@ fn fit_bar(display: u64, kb: &mut honeycomb::Keyboard) {
         span[1] += u16::from_le_bytes([r[2], r[3]]) as f32 * 0.5;
     }
     kb.fit_bar(span[0], span[1]);
+}
+
+/// A network's name as the page shows it: printable ASCII kept, anything else a `?` (the driver joins ASCII names only; the bytes of others are not trusted to be text).
+fn printable(name: &[u8]) -> ([u8; 32], usize) {
+    let mut t = [0u8; 32];
+    for (o, &c) in t.iter_mut().zip(name) {
+        *o = if (0x20..0x7F).contains(&c) { c } else { b'?' };
+    }
+    (t, name.len())
 }

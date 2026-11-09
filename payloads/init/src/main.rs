@@ -48,7 +48,7 @@ const SHELL: [(&[u8], &[u8], &[u64]); 12] = [
     (b"display", b"display", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103, 20]),
     (b"touch", b"touch", &[14, 15, 16, 23, 91]),
     // The attest screen, before anything else draws: 1 use display, 2 use touch, 3 a surface (init's `surfaces` passes as one of its own), 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings (its layout switch writes the device's layout), 8 use fgtw (the identity service's verdict on the identity, and the mint), 9 the identity unlock right, 10 a second surface (the keyboard's back buffer; `surfaces` again) (payloads/ahau).
-    (b"ahau", b"ahau", &[17, 18, 22, 51, 48, 49, 19, 47, 85, 22, 24, 68]),
+    (b"ahau", b"ahau", &[17, 18, 22, 51, 48, 49, 19, 47, 85, 22, 24, 68, 44]),
     // The USB driver (payloads/usb, USB.md): it runs the controller and serves Photon Transport to the bridge, handing each command to the kernel. 1 the controller's registers, 2 its DMA memory, 3 its interrupt, 4 the kernel's PT commands, 5 the `usb` power switch. The kernel has no USB of its own: should the driver end, the keeper below starts it again.
     (b"usb", b"usb", &[86, 87, 88, 89, 90]),
     // The WiFi driver's slots in its own order: 1-12 hardware, 13 entropy, 14 DMA, 15 serve wlan, 16 the vault scope, 17 the ira key (its per-network MAC), 18 Bluetooth's power (off before WL_REG_ON is cycled) (payloads/pcie1 header). It brings the chip up now and joins once the identity's network credential can be read.
