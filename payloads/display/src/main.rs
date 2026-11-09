@@ -4076,8 +4076,7 @@ static mut LOAD_WANTED: u64 = 0;
 /// A load running (from its start in `wall_step` to its result taken there).
 static mut LOADING: bool = false;
 /// The loader's stack (its allocations are told by it, as the console worker's are) and heap: vsf's header parse and the transfer buffer, dropped after each load. Non-zero initialisers (see `ALLOC`).
-// 128 KiB (was 256): the image's .bss must end a 64 KiB stack below the arc's top, which the kernel sizes without it (`_entry`'s check).
-static mut LOAD_STACK: [u8; 1 << 17] = [0; 1 << 17];
+static mut LOAD_STACK: [u8; 1 << 18] = [0; 1 << 18];
 static mut LOAD_STACK_LO: usize = usize::MAX;
 static mut LOAD_STACK_LEN: usize = 1;
 static LOAD_HEAP: Bump = Bump { base: UnsafeCell::new(1), next: UnsafeCell::new(1), mark: UnsafeCell::new(1), end: UnsafeCell::new(1) };
@@ -5253,13 +5252,12 @@ extern "C" fn receive(grants: u64) -> ! {
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
+pub extern "C" fn display_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // First: the image's own relocations (fontdue's `dyn OutlineBuilder` vtable is an absolute address in .rodata).
     unsafe { ferros_sys::relocate() };
     unsafe { PANIC_GRANTS = grants };
     // The stack is the kernel's, above the image now that the image carries its .bss (payload.ld): it had been landing on the last statics (2026-11-08). A server thread on its own static stack was tried that night and broke the capture op (op 30 faulted in its NEON compose); back to the one thread.
-    // The gap between the image's end and this stack: the kernel sized the arc without .bss (payload.ld), so a .bss grown into the stack's 64 KiB is caught here, loud, not met later as corrupt statics.
+    // The gap between the image's end and this stack: the entry's header gives the kernel the .bss (payload.ld `__ferros_tail`), so the arc holds both; should that ever fail, the overlap is caught here, loud, not met later as corrupt statics.
     {
         unsafe extern "C" {
             static __image_end: u8;
@@ -7518,3 +7516,23 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 }
 /// The console grant for the panic handler (set first thing in `_entry`; `.data`, see ALLOC).
 static mut PANIC_GRANTS: u64 = 1;
+
+// The entry with ferros_rt's image header (as ahau's): "ferrosRT" at offset 8, then .bss + 16 (payload.ld's `__ferros_tail`), so the kernel counts the zeroed tail in the arc (process.rs `image_tail`). Without it the arc was sized from the flat image alone and the stack at its top sat on the last statics (2026-11-08: the display's crashes on the 8a; bt's stack 26 KiB inside its .bss).
+core::arch::global_asm!(
+    r#"
+    .section .text.entry, "ax"
+    .globl _entry
+    .type _entry, %function
+_entry:
+    b {main}
+    .4byte 0
+    .ascii "ferrosRT"
+    .quad __ferros_tail
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad 0
+    .size _entry, . - _entry
+"#,
+    main = sym display_main
+);

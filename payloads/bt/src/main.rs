@@ -559,8 +559,7 @@ impl Bt {
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
+pub extern "C" fn bt_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     // Input: 16 bytes to advertise from the start (a test without a caller). Taken first: a native payload's input lands right after its code, where `.bss` (the firmware chunk) is.
     let mut first = [0u8; 16];
@@ -709,3 +708,23 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
 }
+
+// The entry with ferros_rt's image header (as ahau's): "ferrosRT" at offset 8, then .bss + 16 (payload.ld's `__ferros_tail`), so the kernel counts the zeroed tail in the arc (process.rs `image_tail`). Without it the arc was sized from the flat image alone and the stack at its top sat on the last statics (2026-11-08: the display's crashes on the 8a; bt's stack 26 KiB inside its .bss).
+core::arch::global_asm!(
+    r#"
+    .section .text.entry, "ax"
+    .globl _entry
+    .type _entry, %function
+_entry:
+    b {main}
+    .4byte 0
+    .ascii "ferrosRT"
+    .quad __ferros_tail
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad 0
+    .size _entry, . - _entry
+"#,
+    main = sym bt_main
+);
