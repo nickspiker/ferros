@@ -1399,9 +1399,11 @@ fn brightness(v: u8) -> (f32, f32, bool, u16) {
     }
     let top_e = HBM_NITS * E_LIGHT;
     let white = top_e * 0.5 * libm::exp2f(-(v as f32) * (1. / (1 << 5) as f32));
-    // The panel never below the normal-mode top (owner, 2026-11-03): below about DBV 1400 the DDIC dims by lengthening each frame's dark window (95 % emission duty at DBV 1490 and above, about 85 % at 1236, under half at 983, measured by eye in Android), so every step under it is the pixel values' (the table and the 12-bit dither), the light's duty staying at the panel's 95 %. High brightness mode only for the steps that need more than DBV 3307 gives.
+    // (Until 2026-11-08 the panel never went below the normal-mode top, owner 2026-11-03; now never below an eighth of its peak, below.) Below about DBV 1246 the DDIC dims by lengthening each frame's dark window (95 % emission duty at DBV 1490 and above, about 85 % at 1236, under half at 983, measured by eye in Android), so every step under it is the pixel values' (the table and the 12-bit dither), the light's duty staying at the panel's 95 %. High brightness mode only for the steps that need more than DBV 3307 gives.
     let want = (white * 16.0).min(top_e) / E_LIGHT;
-    let (hbm, dbv, native) = if want > DBV_NITS[6].1 { panel_for(want) } else { (false, DBV_NITS[6].0 as u16, DBV_NITS[6].1) };
+    // WHY the floor (the owner's, 2026-11-08: "let's be conservative ... 12.5% we cap the dim"): the panel never under an eighth of its peak light (HBM_NITS / 8, 184 cd/m², about DBV 1549), three stops under the top; below DBV 1219-1246 (108-114 cd/m²) the HK3 cuts its emission duty (measured with a photodiode, DISPLAY-CALIB.md), so every dimmer step stays in the pixels at full duty. Was DBV 3307 (984 cd/m²).
+    let floor = HBM_NITS * (1. / (1 << 3) as f32);
+    let (hbm, dbv, native) = panel_for(if want > floor { want } else { floor });
     (white, native * E_LIGHT, hbm, dbv)
 }
 
