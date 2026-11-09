@@ -1,0 +1,10 @@
+[package]
+name = "lightscope"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+fluor = { path = "../../../fluor", features = ["host-winit"] }
+cpal = "0.18.1"
+
+[workspace]
