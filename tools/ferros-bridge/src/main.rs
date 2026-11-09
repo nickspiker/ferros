@@ -869,6 +869,8 @@ async fn cmd_run_with_tail(path: &str, hex_input: Option<&str>, exec_cap: &[u8],
                         }
                     }
                 }
+                // Out now: a spawn goes on streaming the device log until it is stopped, and a piped stdout held back is lost with it.
+                let _ = std::io::Write::flush(&mut std::io::stdout());
             } else if resp.starts_with(b"ERR") {
                 eprintln!("Device error: {}", String::from_utf8_lossy(&resp));
                 std::process::exit(1);

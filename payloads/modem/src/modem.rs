@@ -1,6 +1,6 @@
 //! The cellular modem (Shannon S5300 over PCIe channel 0): what the cold boot needs, step by step (docs/oracle/MODEM-BOOT-RECON.md).
 //!
-//! Step 1 here: the images. `modem.bin` in `modem_a` begins with a TOC of 32-byte entries {name[12], file offset, CP load address, size, CRC, id}; BOOT is the ROM stage, MAIN/VSS/APM go over the boot channel, and the three NV sections come from per-unit files (efs nv_normal.bin / nv_protected.bin, modem_userdata replay_region.bin).
+//! Step 1 here: the images. `modem.bin` in the modem partition (modem_a on husky, modem_b on akita) begins with a TOC of 32-byte entries {name[12], file offset, CP load address, size, CRC, id}; BOOT is the ROM stage, MAIN/VSS/APM go over the boot channel, and the three NV sections come from per-unit files (efs nv_normal.bin / nv_protected.bin, modem_userdata replay_region.bin).
 //! Nothing here prints NV contents: they are per-unit.
 
 use alloc::vec::Vec;
@@ -24,7 +24,7 @@ impl Section {
     }
 }
 
-pub const MODEM_PART: &str = "modem_a";
+pub const MODEM_PART: &str = "modem";
 pub const MODEM_BIN: &str = "/images/default/modem.bin";
 
 /// Parse the TOC from the first block of modem.bin.
@@ -626,7 +626,14 @@ pub fn stages(rep: &mut Vec<u8>, n: u8) {
         return;
     }
     rom_boot(rep);
-    if n < 6 || rd(BOOT_STAGE) != 0x3FFF || !link_cycle(rep) || n < 7 {
+    if n < 6 {
+        return;
+    }
+    let stage = rd(BOOT_STAGE);
+    if stage != 0x3FFF {
+        return line(rep, alloc::format!("boot_stage G#{stage:X} before the link cycle, not the ROM's G#3FFF: stopping\n"));
+    }
+    if !link_cycle(rep) || n < 7 {
         return;
     }
     let mut seq = None;
@@ -1933,10 +1940,10 @@ fn rfs_data(link: &mut SitLink, p: &RfsXfer, file: &[u8]) -> Result<(), alloc::s
     ring_send(link, true, CH_RFS, &m)
 }
 
-/// A carrier-config file from vendor_a, or why not. Paths are the CP's: only plain names under the root, no "..", are looked up.
+/// A carrier-config file from the vendor partition, or why not. Paths are the CP's: only plain names under the root, no "..", are looked up.
 fn rfs_vendor_file(path: &str) -> Result<Vec<u8>, alloc::string::String> {
     let rel = path.strip_prefix(CARRIER_CONFIG_ROOT).filter(|r| r.starts_with('/') && !r.contains("..") && r.bytes().all(|c| c.is_ascii_graphic())).ok_or_else(|| alloc::string::String::from("outside the carrier-config root"))?;
-    let mut m = crate::partfs::mount("vendor_a")?;
+    let mut m = crate::partfs::mount("vendor")?;
     let ino = m.open(&alloc::format!("/firmware/carrierconfig{rel}"))?;
     // A file over 4 MiB is not a carrier-config file; the CP's sizes are u32 anyway.
     if !ino.is_file() || ino.size > 1 << 22 {
@@ -1948,7 +1955,7 @@ fn rfs_vendor_file(path: &str) -> Result<Vec<u8>, alloc::string::String> {
     Ok(v)
 }
 
-/// One remote-file message from the CP: answered as rfsd answers it, writes pulled and dropped, carrier-config files read from vendor_a.
+/// One remote-file message from the CP: answered as rfsd answers it, writes pulled and dropped, carrier-config files read from the vendor partition.
 fn rfs(rep: &mut Vec<u8>, t_ms: u64, b: &[u8], link: &mut SitLink, st: &mut Rfs) {
     // The CP's bytes: every word read is checked to lie inside the message.
     let w = |i: usize| if b.len() >= i + 4 { Some(u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])) } else { None };

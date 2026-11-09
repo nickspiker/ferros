@@ -5,7 +5,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 /// The partition grants in slot order from `S_PART` (main.rs).
-const PARTS: [&str; 5] = ["modem_a", "efs", "persist", "modem_userdata", "vendor_a"];
+/// By role: the modem and vendor partitions are the slot Android runs from (husky's modem_a and vendor_a, akita's modem_b and vendor_b), granted by the kernel in these slots.
+const PARTS: [&str; 5] = ["modem", "efs", "persist", "modem_userdata", "vendor"];
 
 /// A partition by its grant.
 pub struct Mount {
