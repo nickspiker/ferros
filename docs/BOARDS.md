@@ -20,6 +20,19 @@ ferros runs on two Tensor G3 (zuma) phones. The kernel tells them apart at entry
 akita's repeater tune, from its MP board overlay (`repeater_tune1..5`): G#50 = G#0A, G#70 = G#5F, G#71 = G#2E, G#73 = G#80, G#79 = G#40 (ferros_hal `AKITA_REPEATER_TUNE`).
 
 
+## Every new model, profiled on the unit before release (owner, 2026-11-08)
+
+Nothing is copied from another model or taken from a vendor's figures once it can be measured on the device in hand. Each step's result goes where the code reads it (the board's constants, its table, this file), and each is checked on the glass, not only computed.
+
+0. **Glass.** Every dead pixel of each corner and the camera hole, marked row by row with tools/cutout-scan under the white rule (a pixel is dead unless it shows pure white; the subpixels' fringe counts dead). Corners checked in a pitch-black room with the dead pixels' green subpixels alone lit (display op 52 mode 5): nothing seen. The hole checked by lighting the ring just outside its map white (op 52 mode 6): every pixel pure white. Then the glass radius and the knockout circle fitted to cover every dead pixel whole.
+1. **Side keys.** Each key's top and bottom row with `ferros-bridge display ruler` (board::keys).
+2. **Refresh.** Every rate the panel offers (and any its frequency select takes beyond the vendor's), each counted in frame starts a second, the switch between them watched for a visible step.
+3. **Light's timing.** Emission duty and pulses per frame against DBV at each rate, with a photodiode (line in or a scope), not by eye: the knee where the duty drops, and high brightness mode's.
+4. **Light's amount and colour.** The DISPLAY-CALIB.md sweep with the i1 Pro: luminance per DBV, the transfer near black and at the top, each primary's and white's full spectrum (built under VSF's observer, never 1931 xy), additivity, full field against a window, held white's drift.
+5. **Power.** Whole-device draw (`diag power`) at rest and moving, per rate and per brightness, black and white, so the policy (rate at rest, DBV floor, high brightness mode) is chosen from numbers.
+6. **Touch.** The axes and edges under a finger, contacts against the glass's own map.
+7. **Sensors and radios.** Each brought up under ferros or listed as not yet, against the first model's.
+
 ## Side keys (calibration)
 
 Where each side key sits, in panel rows, top and bottom edge inclusive (`board::keys`). The gate draws its marks from them: the power triangle centred on the power key and as tall as it, the volume-down chevron with its tip on the rocker's bottom edge and a quarter of the rocker tall (ready.rs `marks`). Anything else that points at a key (a hint, a press echo) takes them from there too.
