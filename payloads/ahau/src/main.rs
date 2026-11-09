@@ -598,8 +598,7 @@ impl Ahau {
 
     /// The button under the entry line: its rectangle (x0, y0, x1, y1). With a step back, it moves right and `back` takes the left.
     fn button_at(&self) -> (usize, usize, usize, usize) {
-        let (b, px) = self.entry_at();
-        let y0 = b + px;
+        let y0 = self.button_top();
         // The height and the label follow the scale; a lone button's width too, about the centre (at twice, w/8 to 7w/8); beside `back` the two keep their halves of the row.
         let hgt = self.k(self.w / 10);
         if self.can_go_back() {
@@ -667,8 +666,15 @@ impl Ahau {
         });
     }
 
+    /// The entry's baseline and size: above the button, an entry size over its top, so a larger scale grows them upward, never into the keyboard (2026-11-09: grown downward, a scaled-up button's foot ran into the keyboard's rows and stayed there as a line).
     fn entry_at(&self) -> (usize, usize) {
-        (self.kb.top - self.w * 5 / 16, self.k(self.w / 16))
+        let px = self.k(self.w / 16);
+        (self.button_top() - px, px)
+    }
+
+    /// The button row's top: its foot a fixed 0.15 of the width above the keyboard (where it stood at scale one), its height the scale's.
+    fn button_top(&self) -> usize {
+        self.kb.top - self.w * 3 / 20 - self.k(self.w / 10)
     }
 
     /// The status: a line, or two split at a newline.
@@ -1193,9 +1199,12 @@ impl Ahau {
             // The screen's words (owner, 2026-10-31: simple and direct; AUTH.md "What the attest screen says").
             Mode::Fresh if self.bound => "Type your handle.",
             Mode::Fresh => "This device is unbound.\nType your handle to bind.",
+            // No data link, nothing can be found: said so rather than looking (owner, 2026-11-09). The loop redraws it when a link comes or goes.
+            Mode::Looking(_) if !ferros_sys::data_link_up(&ferros_sys::facts()) => "Waiting for connectivity.",
             Mode::Looking(_) => "Finding this identity.",
             Mode::Join(_) => "Use an existing device to bind this device to your fleet.",
             Mode::Mint(_) => "This handle is unclaimed.\nMinting is permanent.\nType your handle again to mint your identity.",
+            Mode::Grey(_) if !ferros_sys::data_link_up(&ferros_sys::facts()) => "Waiting for connectivity.",
             Mode::Grey(_) => "No answer yet. Still looking.",
             Mode::Wrong => "This handle's record doesn't match.\nStart over with another.",
             Mode::Words(1) => "Type the words the new device shows.",
@@ -2068,6 +2077,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut held = [(0u8, 0i64, 0i64); 16];
     // The pinch above the keyboard: (spread at its start, the scale then), and whether the touch now down is one (`rescale`).
     let mut pinch: Option<(f32, f32)> = None;
+    // The data link's state last drawn into the status while looking (None outside it).
+    let mut link_up: Option<bool> = None;
     let mut pinched = false;
     // The key typed at its press (COMMIT_AT_PRESS), whose tap at the lift is then only its letting go.
     let mut pressed: Option<Key> = None;
@@ -2089,6 +2100,19 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if a.blink() {
             a.show_entry();
         }
+        // While it looks for the identity, the status follows the network: "Waiting for connectivity." with no data link, the looking words once one is up (and back), redrawn only when that changes.
+        if matches!(a.mode, Mode::Looking(_) | Mode::Grey(_)) {
+            let up = ferros_sys::data_link_up(&ferros_sys::facts());
+            if link_up != Some(up) {
+                if link_up.is_some() {
+                    a.status(a.prompt());
+                    a.show();
+                }
+                link_up = Some(up);
+            }
+        } else {
+            link_up = None;
+        }
         let n = call(touch, &[1], &mut r) as usize;
         let count = if n >= 1 && n != ferros_sys::ERR as usize { (r[0] as usize).min(16) } else { 0 };
         let mut k = 0;
@@ -2098,7 +2122,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             k += 1;
         }
         // Two fingers above the keyboard: a pinch, the scale following their spread, 64ths of an octave by log₂ of how far they opened since they began (as the map's pages), kept as the device's when they lift. Until every finger lifts, the touches above the keyboard are the pinch's, not taps or drags.
-        if k == 2 && held[0].2 < a.kb.top as i64 && held[1].2 < a.kb.top as i64 {
+        // It starts with both above the keyboard and holds wherever they wander after (owner, 2026-11-09: "the two finger zoom gets cancelled when you touch the keyboard"); one finger lifted, the other is still the pinch's, until both are up.
+        if k == 2 && (pinch.is_some() || (held[0].2 < a.kb.top as i64 && held[1].2 < a.kb.top as i64)) {
             let (dx, dy) = (held[0].1 - held[1].1, held[0].2 - held[1].2);
             // WHY the floor of 1: two fingers on one spot have no spread, and log₂ of a ratio over 0 is infinite.
             let d = (((dx * dx + dy * dy) as u64).isqrt() as f32).max(1.);
@@ -2120,7 +2145,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         let mut keys = [(0u8, 0i64, 0i64); 16];
         let mut nk = 0;
         for &f in &held[..k] {
-            if !pinched || f.2 >= a.kb.top as i64 {
+            if !pinched {
                 keys[nk] = f;
                 nk += 1;
             }

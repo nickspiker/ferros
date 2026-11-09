@@ -1379,3 +1379,8 @@ _entry:
         );
     };
 }
+
+/// Whether a data link is up: cellular or WiFi in state 2, connected (facts 33-48, `measure::STATE`; links 0 cellular, 1 WiFi). For a screen that waits on the network to say so (ahau, owner 2026-11-09: "should say something like 'waiting for connectivity'").
+pub fn data_link_up(f: &Facts) -> bool {
+    (0..2).any(|k| f.0[33 + 8 * k..41 + 8 * k].iter().filter_map(|&m| measure_of(m)).any(|m| m.0 == measure::STATE && m.1 == 2))
+}
