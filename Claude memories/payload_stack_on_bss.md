@@ -1,14 +1,16 @@
 ---
 name: payload-stack-on-bss
-description: a process's first thread gets the kernel's 64 KiB STACK at its arc's top, directly on the image's last .bss statics; a deep payload overflows silently into them (display, akita, 2026-11-08: three starts, three different crashes); deep servers run on their own static stack
+description: the kernel sizes a no_std payload's arc from its flat image without .bss (image_tail reads only a ferros_rt header), so the 64 KiB stack at the arc's top can sit on the last statics; display crashed three ways on the 8a (2026-11-08); fixed by keeping .bss clear plus a start-up gap check; real fix is a kernel change
 metadata:
   type: project
 ---
 
-The kernel (process.rs `STACK`, 64 KiB) puts a process's first thread at the arc's top, and the arc is sized `CODE + code + tail + inline + STACK`: the stack's floor is the end of .bss, with no guard. A payload whose main thread goes deeper than 64 KiB writes over its own last statics without a fault.
+`process.rs build`: `need = CODE + code.len() + tail + inline + STACK`, `tail = image_tail(code)`, which is non-zero only for images carrying the `ferrosRT` header (std processes). A no_std payload's flat binary (`objcopy -O binary`) has no .bss, so the arc (next power of two) can end inside .bss, and the first thread's stack (64 KiB at the arc's top) overwrites the last statics silently.
 
-**Found 2026-11-08 on the 8a:** the display server crashed at start three different ways (a layout band missing, then the glyph caches' tables "len 4") and showed every column as the circle's top row (orange in a dev build) after a few KB of new code; the statics at the top of .bss (`nm -n -S`: SLOW, CLOCK_DIRS, BANDS, …, GLYPHS, CON_GLYPHS) were exactly the ones hit, the faulting sp 8 KiB above them. Fixed in 7b6e455: `_entry` spawns the server on `MAIN_STACK` (512 KiB static) and parks.
+**Found 2026-11-08 on the 8a:** the display's .bss ended 23 KB inside its stack (4 MiB arc). Crashes moved with every build (band table, glyph caches, an orange screen of repeated rows), each in the top-of-.bss statics. Dead ends that night: a separate 512 KiB static stack (pushed .bss past 4 MiB, masked addresses wrapped: worse); folding .bss into the image (the capsule went over the kernel vault's 3 MiB put limit and never stored, so every later test ran the old build: check for "stored" after every store put).
 
-**Why:** the symptoms look like logic bugs and move with the binary's layout, so bisecting by feature misleads (a change "fixes" it by shrinking or growing the image).
+**Fix in place:** LOAD_STACK 256 → 128 KiB (image end 172 KB under the stack's top), `__image_end` in payload.ld, and `_entry` refuses to start, loudly, if the gap is under 64 KiB.
 
-**How to apply:** random crashes in a payload's top-of-.bss statics, or ones that come and go as code is added: check the main thread's depth first (sp against the end of .bss). Any payload with deep frames or big stack buffers runs its work on its own static stack via `ferros_sys::thread_spawn`. A kernel guard page under STACK would make it fault loud instead.
+**Why:** the symptoms look like logic bugs and move with layout, so feature bisects mislead.
+
+**How to apply:** random crashes in a payload's top-of-.bss statics: compare `__image_end` (or `nm -n` last symbol) + CODE + 64 KiB with the arc's power of two. Proper fix (kernel flash, owner's OK): the kernel learns each payload's memsz (capsule field from the ELF, or a header like ferros_rt's) and a guard page under STACK.

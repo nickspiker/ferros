@@ -4076,7 +4076,8 @@ static mut LOAD_WANTED: u64 = 0;
 /// A load running (from its start in `wall_step` to its result taken there).
 static mut LOADING: bool = false;
 /// The loader's stack (its allocations are told by it, as the console worker's are) and heap: vsf's header parse and the transfer buffer, dropped after each load. Non-zero initialisers (see `ALLOC`).
-static mut LOAD_STACK: [u8; 1 << 18] = [0; 1 << 18];
+// 128 KiB (was 256): the image's .bss must end a 64 KiB stack below the arc's top, which the kernel sizes without it (`_entry`'s check).
+static mut LOAD_STACK: [u8; 1 << 17] = [0; 1 << 17];
 static mut LOAD_STACK_LO: usize = usize::MAX;
 static mut LOAD_STACK_LEN: usize = 1;
 static LOAD_HEAP: Bump = Bump { base: UnsafeCell::new(1), next: UnsafeCell::new(1), mark: UnsafeCell::new(1), end: UnsafeCell::new(1) };
@@ -5144,9 +5145,9 @@ static FRAMES: AtomicU64 = AtomicU64::new(0);
 static mut SCREEN_WH: (u16, u16) = (0, 0);
 static mut RECV_STACK: [u8; 32768] = [0; 32768];
 
-/// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved): the receive thread waits for them.
+/// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved, full screen's new state, the glass's columns): the receive thread waits for them. An op left out is answered 0 at once and its reply dropped (2026-11-08: op 43's state and op 53's columns never reached the map and the keyboard).
 fn op_is_sync(op: u8) -> bool {
-    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 45)
+    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 43 | 45 | 53)
 }
 
 extern "C" fn receive(grants: u64) -> ! {
@@ -5257,22 +5258,25 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // First: the image's own relocations (fontdue's `dyn OutlineBuilder` vtable is an absolute address in .rodata).
     unsafe { ferros_sys::relocate() };
     unsafe { PANIC_GRANTS = grants };
-    // The server runs on its own stack (`MAIN_STACK`), not the kernel's 64 KiB at the arc's top: that one sits right on the image's last statics, and the server outgrew it (2026-11-08 on akita, three starts, three different crashes, each in the statics at the top of .bss: the band table, then both glyph caches; the modeset's and a publish's row buffers are 16 KiB a frame). This thread parks for good.
-    if ferros_sys::thread_spawn(server, unsafe { &mut *(&raw mut MAIN_STACK) }, grants) != 0 {
-        ferros_sys::console(grants, b"display: no thread for the server\n");
-        ferros_sys::exit(9);
+    // The stack is the kernel's, above the image now that the image carries its .bss (payload.ld): it had been landing on the last statics (2026-11-08). A server thread on its own static stack was tried that night and broke the capture op (op 30 faulted in its NEON compose); back to the one thread.
+    // The gap between the image's end and this stack: the kernel sized the arc without .bss (payload.ld), so a .bss grown into the stack's 64 KiB is caught here, loud, not met later as corrupt statics.
+    {
+        unsafe extern "C" {
+            static __image_end: u8;
+        }
+        let sp: usize;
+        unsafe { core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+        let end = unsafe { &raw const __image_end } as usize;
+        let gap = sp.wrapping_sub(end);
+        if gap < 1 << 16 {
+            ferros_sys::console(grants, alloc::format!("display: the image ends G#{:X} under the stack's top, less than its 64 KiB: the statics would be overwritten; refusing to start\n", gap).as_bytes());
+            ferros_sys::exit(4);
+        }
     }
-    loop {
-        ferros_sys::wait(&PARKED, 0, ferros_sys::now() + ferros_sys::freq() * (1 << 10));
-    }
+    server(grants)
 }
 
-/// The server's stack (`_entry`): 512 KiB, as the kernel's own.
-static mut MAIN_STACK: [u8; 1 << 19] = [0; 1 << 19];
-/// The first thread's word to wait on, never changed.
-static PARKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-extern "C" fn server(grants: u64) -> ! {
+fn server(grants: u64) -> ! {
     let mut log = Log { grants, buf: [0; 256], n: 0 };
     let pipe = Pipe { grants };
     let fb = ferros_sys::dma(cap(grants, S_FB)) as usize;
@@ -6813,8 +6817,8 @@ extern "C" fn server(grants: u64) -> ! {
                     out[0] = !ferros_sys::power(cap(grants, S_PANEL_POWER), false) as u8;
                     len = 1;
                 }
-                // 49 `[49, row u16]`: the glass's own columns on that row, first and last visible (the mask's columns, the edge's hairline inside them), u16 each; for a client that lays itself out on the glass the eye sees (honeycomb's bar, owner 2026-11-08: "go off center intersect of squircle for divisions").
-                Some(49) if m.len() >= 3 => {
+                // 53 `[53, row u16]` (49, first chosen, is the radio op: 2026-11-08 the bar never moved): the glass's own columns on that row, first and last visible (the mask's columns, the edge's hairline inside them), u16 each; for a client that lays itself out on the glass the eye sees (honeycomb's bar, owner 2026-11-08: "go off center intersect of squircle for divisions").
+                Some(53) if m.len() >= 3 => {
                     let y = u16::from_le_bytes([m[1], m[2]]) as usize;
                     // WHY the bounds: the row is the client's.
                     if y < height {

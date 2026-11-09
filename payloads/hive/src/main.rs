@@ -404,13 +404,13 @@ impl core::fmt::Write for Line {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
 }
-/// The keyboard's bar divided over the glass the eye sees (display op 49: the glass's columns on a row), averaged over the bar's top and foot rows (owner, 2026-11-08: "go off center intersect of squircle for divisions"). A display without the op leaves the screen's width.
+/// The keyboard's bar divided over the glass the eye sees (display op 53: the glass's columns on a row), averaged over the bar's top and foot rows (owner, 2026-11-08: "go off center intersect of squircle for divisions"). A display without the op leaves the screen's width.
 fn fit_bar(display: u64, kb: &mut honeycomb::Keyboard) {
     let (top, foot) = kb.bar_rows();
     let mut span = [0f32; 2];
     for y in [top, foot] {
         let mut r = [0u8; 8];
-        if ferros_sys::call(display, &[49, y as u8, (y >> 8) as u8], &mut r) < 4 {
+        if ferros_sys::call(display, &[53, y as u8, (y >> 8) as u8], &mut r) < 4 {
             return;
         }
         span[0] += u16::from_le_bytes([r[0], r[1]]) as f32 * 0.5;

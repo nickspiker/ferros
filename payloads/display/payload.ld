@@ -16,5 +16,7 @@ SECTIONS {
     .data : { *(.data*) *(.got*) *(.got.plt*) }
     .dynamic : { *(.dynamic) }
     .bss : { *(.bss*) }
+    /* The image's end, .bss included: the kernel sizes the arc from the flat image alone (process.rs `build`: no tail without a ferros_rt header), so .bss lies past what it counted and its stack (STACK, 64 KiB at the arc's top) can land on it; `_entry` checks the gap at start (2026-11-08). */
+    __image_end = .;
     /DISCARD/ : { *(.comment) *(.eh_frame*) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash) *(.interp) }
 }
