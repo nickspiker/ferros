@@ -6560,6 +6560,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         clean_reset_all();
                         out[1] = FULL as u8;
                     }
+                    // The state is the reply's second byte (2026-11-08: replied with one, the map logged "full screen off" for every toggle).
+                    len = 2;
                     last_interaction = 0;
                 }
                 Some(17) if m.len() >= 12 => {
