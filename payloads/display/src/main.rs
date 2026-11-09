@@ -2921,8 +2921,9 @@ fn raw_cutout(width: usize, height: usize, cx: f32, cy: f32, r: f32) {
 }
 /// The cutout's marked map checked on the glass (op 52 mode 4; owner, 2026-11-08: "Draw just the white and black pixels with no anti-aliasing or anything to double check ... I want to make sure it's black"): every pixel black but the rows' spans, white, whole pixels: where the map is right the hole hides every white pixel and the device shows nothing (in a dark room it cannot be found); a lit pixel is the map reaching past the hole. (Drawn the other way round first, white with the spans black: blinding, and a black pixel under a bright screen is the wrong test.) `spans` is (row, first column, last column) each.
 /// The dead corners checked in green alone (op 52 mode 5; owner, 2026-11-08: "show just green and no red or blue ... since only red and blue are out of bounds ... if we did it right I shouldn't see a thing in a pitch black room"): every pixel black but the spans, their green subpixels only, whole pixels. `spans` is (row, first column, last column) each, any number a row.
-fn raw_green(width: usize, height: usize, spans: &[(usize, usize, usize)]) {
-    let (green, black) = (pack10(0, 1020, 0), pack10(0, 0, 0));
+/// Mode 6 draws the same spans white: the camera hole's ring check (owner, 2026-11-08: at the hole the marked pixels show cyan, magenta and the rest, so a dark test proves nothing there): the ring of pixels just outside the hole's map, each of which must show pure white if the map is whole.
+fn raw_green(width: usize, height: usize, spans: &[(usize, usize, usize)], white: bool) {
+    let (green, black) = (if white { pack10(1020, 1020, 1020) } else { pack10(0, 1020, 0) }, pack10(0, 0, 0));
     for k in 0..PHASES {
         let dst = phase_slice(k, width * height);
         dst.fill(black);
@@ -6345,13 +6346,13 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             }
                             log.s(b"display: op 52 released: the shell again\n");
                         }
-                        1 | 2 | 3 | 4 | 5 => {
+                        1 | 2 | 3 | 4 | 5 | 6 => {
                             RAW_HOLD.store(1, Ordering::Release);
-                            if m[1] == 5 {
+                            if m[1] == 5 || m[1] == 6 {
                                 // [5] then per span [row u16][first column u16][last column u16], whole pixels.
                                 let w = |i: usize| m.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize).unwrap_or(0);
                                 let spans: alloc::vec::Vec<(usize, usize, usize)> = (0..(m.len() - 2) / 6).map(|k| (w(2 + 6 * k), w(4 + 6 * k), w(6 + 6 * k))).collect();
-                                raw_green(width, height, &spans);
+                                raw_green(width, height, &spans, m[1] == 6);
                                 log.s(alloc::format!("display: op 52 green spans: {}\n", spans.len()).as_bytes());
                             } else if m[1] == 4 {
                                 // [4][first row u16][count u16] then per row [first column u16][last column u16], whole pixels.
