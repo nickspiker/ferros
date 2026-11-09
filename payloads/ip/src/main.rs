@@ -257,12 +257,13 @@ impl Ip {
         svc(CALL, self.cap(S_RMNET), self.off(f.as_ptr()), 1 + pkt.len() as u64, self.off(r.as_mut_ptr()), 16 | CALL_LIVE);
     }
 
-    /// Ask the WiFi driver for its MAC (CALL_LIVE: an error at once when no driver serves `wlan`); answered, WiFi is up and DHCP and a router solicitation start.
+    /// Ask the WiFi driver for its MAC and whether it is linked ([3] → MAC, linked; CALL_LIVE: an error at once when no driver serves `wlan`); linked, WiFi is up and DHCP and a router solicitation start. The driver answers before any join too (the network page, since 2026-11-09), unlinked and under its scanning MAC, which a join replaces: taken as up then, DHCP went out under an address the access point never associated and never bound, and the attest screen waited on a network that never came (owner, 2026-11-09: "No answer yet. Still looking").
     fn wifi_up(&mut self) {
         self.wifi_t = now();
         let mut info = [0u8; 16];
         let q = [3u8];
-        if svc(CALL, self.cap(S_WLAN), self.off(q.as_ptr()), 1, self.off(info.as_mut_ptr()), 16 | CALL_LIVE) == ERR {
+        let n = svc(CALL, self.cap(S_WLAN), self.off(q.as_ptr()), 1, self.off(info.as_mut_ptr()), 16 | CALL_LIVE);
+        if n == ERR || n < 7 || info[6] == 0 {
             return;
         }
         self.mac.copy_from_slice(&info[..6]);
