@@ -132,3 +132,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: Photon is the full app](feedback_photon_is_the_full_app.md) — one Photon on every platform (std/photon); no photon_core/stripped copy; FGTW = attest, identity, OS sync (2026-11-05)
 - [Pixel 8a (akita)](akita_pixel8a.md) — second ferros device (unlocked, pKVM off, "could be anyone's"); per-unit partitions backed up 2026-11-06; Magisk root on slot b; board split + probes in docs/BOARDS.md; hv runs on slot b (flash with an AVB footer: ferros-mkimg avb-footer)
 - [Pro flash paths](husky_flash_paths.md) — fastboot 64 MiB send fails on the Pro (2026-11-06); prefix flash with unchanged footer, or Android dd when the hv has no UFS firewall
+- [Payload stack sits on .bss](payload_stack_on_bss.md) — first thread's 64 KiB STACK has no guard over the last statics; overflow corrupts silently; deep servers use their own static stack
