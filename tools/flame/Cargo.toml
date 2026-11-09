@@ -1,0 +1,10 @@
+[package]
+name = "flame"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+vsf = { path = "../../../vsf" }
+rustc-demangle = "0.1"

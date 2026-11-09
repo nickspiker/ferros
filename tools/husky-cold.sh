@@ -1,3 +1,4 @@
+. /mnt/Harbor/Code/ferros/tools/lib/profile.sh
 #!/usr/bin/env bash
 # Boot ferros straight from the bootloader on slot b (pure cold boot, no Linux) and drive it over USB.
 #
@@ -86,7 +87,7 @@ esac
 if [ -n "${1:-}" ]; then
     IMG=$1
 else
-    ( cd "$REPO" && cargo build -p ferros_kernel --target aarch64-unknown-none --release && cargo build -q -p ferros-bridge )
+    ( cd "$REPO" && cargo build -p ferros_kernel --target aarch64-unknown-none --release "${PROFILE_FLAGS[@]}" && cargo build -q -p ferros-bridge )
     ( cd "$REPO" && cargo run -q -p ferros-mkimg -- boot "$ELF" --pad 16 -o "$IMG" )
 fi
 echo "== image: $IMG ($(stat -c%s "$IMG") bytes)"

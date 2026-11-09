@@ -114,7 +114,32 @@ fn cur_get() -> Option<usize> {
     unsafe { (*(&raw const CURRENT))[core()] }
 }
 fn cur_set(t: Option<usize>) {
-    unsafe { (*(&raw mut CURRENT))[core()] = t };
+    let c = core();
+    unsafe { (*(&raw mut CURRENT))[c] = t };
+    prof_note(c, t);
+}
+/// The profiler's view of what this core runs (prof.rs): the thread, its process's epoch, its image base and its arc, which the tick reads without the lock; and, while a run is on, the thread's names, kept once for the host.
+fn prof_note(c: usize, t: Option<usize>) {
+    let ctx = t.and_then(|t| proc_of(t).map(|p| crate::prof::Ctx { thread: t, epoch: p.epoch, base: p.arc.base + CODE, lo: p.arc.base, hi: p.arc.base + p.arc.size }));
+    crate::prof::running(c, ctx);
+    if let Some(x) = ctx {
+        if crate::prof::on() && crate::prof::unseen(x.thread, x.epoch) {
+            prof_keep(x.thread);
+        }
+    }
+}
+fn prof_keep(t: usize) {
+    if let Some(p) = proc_of(t) {
+        crate::prof::seen(t, p.epoch, p.arc.base + CODE, &p.name, thread_name(t));
+    }
+}
+/// A profiler run starts (prof.rs, lock held): every thread alive now, named.
+pub fn prof_seed() {
+    for t in 0..k().threads.len() {
+        if k().threads[t].is_some() {
+            prof_keep(t);
+        }
+    }
 }
 /// Whether thread `t` is at EL0 on some core right now — the test for "running elsewhere" when a process ends: a thread's `Running` state alone is not it (a stale `Running` with no core kept a dead display process's thread forever and its arc with it, 2026-10-23).
 fn on_a_core(t: usize) -> bool {
@@ -1993,9 +2018,12 @@ fn pick_runnable() -> Option<usize> {
 /// Called from `.Lel0_sync` for every synchronous exception taken from EL0, with the running process's live frame. Returns 0 to eret through `f` (which may now be another process's frame), 1 to leave EL0 (value in f.x[0]).
 #[unsafe(no_mangle)]
 pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
+    // The profiler's note of this trap (prof.rs): who called, from where, and the call (x8 for an `svc`, ESR class G#15; G#FFFF for anything else).
+    crate::prof::enter(if f.esr >> 26 == 0x15 { f.x[8] } else { 0xFFFF }, f.elr, f.x[29], f.x[30]);
     lock();
     let r = el0_trap(f);
     unlock();
+    crate::prof::leave();
     if r == 0 {
         // Back to EL0 with a slice timer still running: a tick that fired during this syscall was taken at EL2 (.Lirq_tick clears the timer and returns), and without this the thread would run on untimed until its next syscall (2026-10-23).
         let ctl: u64;

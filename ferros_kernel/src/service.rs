@@ -2608,6 +2608,12 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params == b"prof" || cmd.params.starts_with(b"prof ") {
+                    // `diag "prof [start [hz] | stop | pull | free]"`: the whole-system sampling profiler (prof.rs); tools/flame drives it and reads the rings.
+                    crate::prof::diag(core::str::from_utf8(&cmd.params[4..]).unwrap_or(""), &mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params == b"x3" {
                     // `diag x3`: start the big core on a timing probe and report (x3.rs).
                     let f = cntfrq();
@@ -3628,6 +3634,8 @@ pub fn run(mut b: Boot) -> ! {
                     // The workers off first: the copy below rewrites the kernel under them (smp.rs).
                     ferros_hal::ufs::H8_ENABLED.store(false, core::sync::atomic::Ordering::Relaxed);
                     crate::process::with_lock(|| ferros_hal::ufs::UfsController::new(0x1320_0000).h8_wake_now());
+                    // A profiler run stopped, its timer off on this core (the workers' go with them): the next kernel meets no tick.
+                    crate::prof::shutdown();
                     crate::smp::stop_all();
                     unsafe {
                         // The copy overwrites the vector table: no interrupt may land mid-copy. The new image re-arms the killswitch first thing.

@@ -1,3 +1,4 @@
+. /mnt/Harbor/Code/ferros/tools/lib/profile.sh
 #!/usr/bin/env bash
 # ferros hv on husky (HV.md): build the EL2 layer, pack it in front of the slot-a Linux Image as one boot.img v4 kernel, and (with --flash) put it on boot_a and boot it.
 # Blob = [hv flat binary padded to G#18_0000][Linux Image], LZ4-legacy compressed as ABL expects; ABL loads it at G#8008_0000, so the Image lands 2 MiB aligned at G#8020_0000.
@@ -26,7 +27,7 @@ HV=$(stat -c %s $W/hv.bin); PAD=$((0x180000))
 FERROS_BIN=""
 if [ $FERROS = 1 ]; then
   # The cold ferros image (link base G#8008_0000), the same one slot b boots.
-  cargo build -q -p ferros_kernel --target aarch64-unknown-none --release
+  cargo build -q -p ferros_kernel --target aarch64-unknown-none --release "${PROFILE_FLAGS[@]}"
   aarch64-linux-gnu-objcopy -O binary target/aarch64-unknown-none/release/ferros_kernel $W/ferros.bin
   FERROS_BIN=$W/ferros.bin
 fi

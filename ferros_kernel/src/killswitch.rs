@@ -210,6 +210,18 @@ pub fn enable_ppi(intid: u32) {
     wr(sgi + 0x100, 1 << intid);
 }
 
+/// Enable one private interrupt (a PPI: INTID 16..32, a constant at every caller) on the calling core's own redistributor: group 1, middle priority. For a line every core takes for itself (prof.rs: each core's EL2 virtual timer); `enable_ppi` above serves the kernel's core only.
+pub fn enable_ppi_here(intid: u32) {
+    let Some(gicr) = my_gicr() else { return };
+    let sgi = gicr + GICR_SGI;
+    let n = intid as usize;
+    wr(sgi + 0x80, rd(sgi + 0x80) | 1 << n);
+    let pr = sgi + 0x400 + (n & !3);
+    let sh = (n & 3) * 8;
+    wr(pr, (rd(pr) & !(0xFF << sh)) | (0x80 << sh));
+    wr(sgi + 0x100, 1 << n);
+}
+
 /// Arm the killswitch. Safe to call again (RELOAD re-runs it).
 pub fn arm() -> Armed {
     // Held at boot: die before anything else runs.

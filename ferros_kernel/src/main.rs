@@ -118,6 +118,9 @@ mod kohi;
 // The performance monitors, open to EL0 on every core (pmu.rs).
 #[cfg(feature = "pixel8")]
 mod pmu;
+// The whole-system sampling profiler (`diag prof`, tools/flame).
+#[cfg(feature = "pixel8")]
+mod prof;
 // Where the ira and wairua could live off DRAM: a probe of the unused CPU registers (keyreg.rs, KEY_REGISTERS.md).
 #[cfg(feature = "pixel8")]
 mod keyreg;
@@ -574,6 +577,8 @@ _m1_entry:
     b.eq    .Lirq_dump
     cmp     x0, #26
     b.eq    .Lirq_tick
+    cmp     x0, #28
+    b.eq    .Lirq_prof
     cmp     x0, #60
     b.eq    .Lirq_power
     cmp     x0, #61
@@ -650,6 +655,72 @@ _m1_entry:
     ldp     x2, x3, [sp, #16]
     ldp     x0, x1, [sp], #32
     b       .Lel0_preempt
+// The profiler's tick (prof.rs): this core's EL2 virtual timer, PPI 28. The record is written in Rust, which may use any caller-saved register, the vector registers among them (the kernel's memcpy does): x4-x18, x29, x30 and v0-v31 with FPCR/FPSR are saved over the x0-x3 the entry saved (x0, the INTID, kept with x30 for the EOI). It gets the interrupted ELR, SPSR, x29 and x30, re-arms or stops the timer itself (the line drops before the EOI), and never takes the kernel lock. Then EOI and the common return: it parks nothing, whichever level it interrupted.
+.Lirq_prof:
+    sub     sp, sp, #672
+    stp     x4, x5, [sp, #0]
+    stp     x6, x7, [sp, #16]
+    stp     x8, x9, [sp, #32]
+    stp     x10, x11, [sp, #48]
+    stp     x12, x13, [sp, #64]
+    stp     x14, x15, [sp, #80]
+    stp     x16, x17, [sp, #96]
+    stp     x18, x29, [sp, #112]
+    stp     x30, x0, [sp, #128]
+    stp     q0, q1, [sp, #160]
+    stp     q2, q3, [sp, #192]
+    stp     q4, q5, [sp, #224]
+    stp     q6, q7, [sp, #256]
+    stp     q8, q9, [sp, #288]
+    stp     q10, q11, [sp, #320]
+    stp     q12, q13, [sp, #352]
+    stp     q14, q15, [sp, #384]
+    stp     q16, q17, [sp, #416]
+    stp     q18, q19, [sp, #448]
+    stp     q20, q21, [sp, #480]
+    stp     q22, q23, [sp, #512]
+    stp     q24, q25, [sp, #544]
+    stp     q26, q27, [sp, #576]
+    stp     q28, q29, [sp, #608]
+    stp     q30, q31, [sp, #640]
+    mrs     x9, fpcr
+    mrs     x10, fpsr
+    stp     x9, x10, [sp, #144]
+    mrs     x0, elr_el2
+    mrs     x1, spsr_el2
+    mov     x2, x29
+    mov     x3, x30
+    bl      ferros_prof_tick
+    ldp     x9, x10, [sp, #144]
+    msr     fpcr, x9
+    msr     fpsr, x10
+    ldp     q0, q1, [sp, #160]
+    ldp     q2, q3, [sp, #192]
+    ldp     q4, q5, [sp, #224]
+    ldp     q6, q7, [sp, #256]
+    ldp     q8, q9, [sp, #288]
+    ldp     q10, q11, [sp, #320]
+    ldp     q12, q13, [sp, #352]
+    ldp     q14, q15, [sp, #384]
+    ldp     q16, q17, [sp, #416]
+    ldp     q18, q19, [sp, #448]
+    ldp     q20, q21, [sp, #480]
+    ldp     q22, q23, [sp, #512]
+    ldp     q24, q25, [sp, #544]
+    ldp     q26, q27, [sp, #576]
+    ldp     q28, q29, [sp, #608]
+    ldp     q30, q31, [sp, #640]
+    ldp     x30, x0, [sp, #128]
+    ldp     x18, x29, [sp, #112]
+    ldp     x16, x17, [sp, #96]
+    ldp     x14, x15, [sp, #80]
+    ldp     x12, x13, [sp, #64]
+    ldp     x10, x11, [sp, #48]
+    ldp     x8, x9, [sp, #32]
+    ldp     x6, x7, [sp, #16]
+    ldp     x4, x5, [sp, #0]
+    add     sp, sp, #672
+    b       .Lirq_eoi
 // SGI 2: dump where this core is (process.rs `diag core`): the interrupted ELR/SPSR, both stack pointers, and x0-x3 as saved at entry.
 .Lirq_dump:
     adrp    x1, __core_dump
@@ -1098,6 +1169,12 @@ pub extern "C" fn ferros_el0_trap(_frame: *mut u64) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn ferros_el0_preempt(_frame: *mut u64) -> u64 {
     1
+}
+/// M1 has no profiler; `.Lirq_prof` still names the tick handler, and a tick (never armed here) would only need the timer stopped.
+#[cfg(not(feature = "pixel8"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn ferros_prof_tick(_elr: u64, _spsr: u64, _fp: u64, _lr: u64) {
+    unsafe { core::arch::asm!("msr S3_4_C14_C3_1, xzr", "isb") };
 }
 
 /// Set by `.Lirq_power` when the power key is pressed.

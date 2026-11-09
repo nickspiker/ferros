@@ -237,6 +237,8 @@ extern "C" fn ferros_core_main(block: usize) -> ! {
             steps += 1;
             crate::platform::worker_step(3 + steps as u64);
         }
+        // A profiler run on: this core's timer started (prof.rs).
+        crate::prof::poll();
         // `diag keyreg` asks worker 0 to probe its own registers (keyreg.rs).
         crate::keyreg::serve(k);
         // The ira and wairua into this core's registers when a sealed copy is meant for it (keys.rs): before any slice runs here.
