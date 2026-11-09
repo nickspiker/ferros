@@ -319,6 +319,18 @@ impl Keyboard {
         for b in 0..BAR_KEYS.len() {
             self.draw_key(s, Key::Bar(b), false, label);
         }
+        // One slab under its top edge (owner, 2026-11-09: "whatever relevant top mask to obscure once it goes past the top edge"): in each column, from the first pixel a key reaches down, nothing is see-through, the gaps black and the keys' edges on black, so what lies under the keyboard shows only above its outline. The first pixel keeps its share, the outline's antialiasing.
+        for x in 0..self.w {
+            let mut inside = false;
+            for y in self.top..self.bottom {
+                let p = &mut s[y * self.w + x];
+                if inside {
+                    *p &= (1 << 48) - 1;
+                } else if *p >> 63 == 0 {
+                    inside = true;
+                }
+            }
+        }
     }
 
     /// A key's slot in `tint`: the hexes by index, the bar's keys from 48.
