@@ -1104,7 +1104,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let cons_before = d.tcm_rd(cons + 16);
     let t0 = d.now();
     let rx_off = d.tcm_rd(sh + 36);
-    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); 64], rxq_head: 0, rxq_len: 0, nets: [Net { name: [0; 32], len: 0, rssi: 0, flags: 0, seen_in: 0 }; 32], nnets: 0, scan_gen: 0, scan_ver: 1, quiet: false, outcome: 0, rx_up: false, personal: true, retry_s: 1 << 6 };
+    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); RX_BUFS as usize], rxq_head: 0, rxq_len: 0, nets: [Net { name: [0; 32], len: 0, rssi: 0, flags: 0, seen_in: 0 }; 32], nnets: 0, scan_gen: 0, scan_ver: 1, quiet: false, outcome: 0, rx_up: false, personal: true, retry_s: 1 << 6 };
     // Control submit ring: 8 ioctl response buffers and 8 event buffers first (the firmware DMAs ioctl results into a posted response buffer, named by its request id in the completion).
     for b in 0..8u32 {
         m.post(d, 0x0B, 1 + b, [8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
@@ -1238,7 +1238,7 @@ struct Msgbuf {
     lease_s: u32,
     /// Server mode (stage 14): received frames wait in their rx buffers until a client takes one (buffer index, frame offset, length); the buffer is re-posted only then — backpressure without a copy.
     serving: bool,
-    rxq: [(u8, u16, u16); 64],
+    rxq: [(u8, u16, u16); RX_BUFS as usize],
     rxq_head: usize,
     rxq_len: usize,
     /// The networks the last scan found, one entry per name (its strongest BSS), for the network page (SCAN, `serve_unjoined`).
@@ -1303,11 +1303,11 @@ impl Msgbuf {
         d.tcm_wr(self.h2d_w, self.w % 64);
         d.wr(MEM, 0x2140, 0xFF00_0000 | (self.w % 64));
     }
-    /// Post receive buffer `i` (2 KiB at +G#4_0000 + i × G#800) on the rxpost ring: host_rxbuf_post_t — header (type G#11, request id = G#1000 + i), u16 metadata length 0, u16 data length, rsvd, metadata address 0, data address.
+    /// Post receive buffer `i` (2 KiB at RX_BASE + i × G#800) on the rxpost ring: host_rxbuf_post_t — header (type G#11, request id = G#1000 + i), u16 metadata length 0, u16 data length, rsvd, metadata address 0, data address.
     fn post_rx(&mut self, i: u32) {
         let phase = if (self.rxp_w / 512) % 2 == 0 { 0x80 } else { 0 };
         let a = self.dma + 0x1000 + 32 * (self.rxp_w % 512);
-        let buf = self.dma + 0x4_0000 + 0x800 * i;
+        let buf = self.dma + RX_BASE + 0x800 * i;
         let words = [0x11 | phase << 16 | (self.rxp_seq % 253) << 24, 0x1000 + i, 2048 << 16, 0, 0, 0, buf, 0];
         for (k, v) in words.iter().enumerate() {
             dw(a + 4 * k as u32, *v);
@@ -1338,8 +1338,8 @@ impl Msgbuf {
             // dhd: the frame starts at data_offset if non-zero, otherwise at pcie_shared dma_rxoffset (8 here), measured from the posted buffer; it is a plain Ethernet frame.
             let off = if words[4] & 0xFFFF != 0 { words[4] & 0xFFFF } else { self.rx_off };
             self.rx_frames += 1;
-            if i < 64 {
-                let p = self.dma + 0x4_0000 + 0x800 * i + off;
+            if i < RX_BUFS {
+                let p = self.dma + RX_BASE + 0x800 * i + off;
                 if self.serving {
                     // Hold the buffer for a client (re-posted when taken). The completion flags don't separate Ethernet from 802.11 frames here (an EAPOL frame came flagged G#02 too), so everything goes to the client, which ignores what it can't parse. data_len counts the frame from the offset on: subtracting the offset clipped 8 bytes off every frame (DHCP options and router advertisement prefixes lost).
                     if self.rxq_len < self.rxq.len() && len > 0 {
@@ -1367,7 +1367,7 @@ impl Msgbuf {
                         d.hex(v);
                     }
                     d.put(b"\n  buf:");
-                    let b0 = self.dma + 0x4_0000 + 0x800 * i;
+                    let b0 = self.dma + RX_BASE + 0x800 * i;
                     for k in 0..8 {
                         d.put(b" ");
                         d.hex(dr(b0 + 4 * k));
@@ -1980,6 +1980,9 @@ fn find_cap(d: &mut Drv, id: u32) -> Option<u64> {
 /// A#192.168.1.1 — one base prefix for the dotted quad.
 /// The `wlan` endpoint (grant slot after the DMA region): Ethernet frames for other processes. Requests (first byte): 1 SEND frame → [0] sent / [1] too short; 2 RECV → the oldest received frame, or nothing (length 0); 3 INFO → our MAC (6 bytes) + link up (1). Between requests the driver keeps its rings moving; `recv` polls (flag 1) so it never blocks.
 const WLAN: u64 = 15;
+/// Receive buffers posted to the chip, 2 KiB each from RX_BASE in the DMA region (whose upper 1.5 MiB nothing else uses). 64 served the BCM4398; with 64 posted akita's BCM4383 delivered a third of its unicast and no ARP at all, so nothing on the LAN could be resolved and DNS never left (2026-11-09: Android's dhd posts 2040). With 256: every echo answered, ARP resolved, fgtw.org reached. A power of two under the rxpost ring's 512 slots; the rx queue's index fits a byte.
+const RX_BUFS: u32 = 1 << 8;
+const RX_BASE: u32 = 0x8_0000;
 
 fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     if !flowring(d, m) {
@@ -2045,7 +2048,7 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
                 let (i, off, l) = m.rxq[m.rxq_head];
                 m.rxq_head = (m.rxq_head + 1) % m.rxq.len();
                 m.rxq_len -= 1;
-                let p = m.dma + 0x4_0000 + 0x800 * i as u32 + off as u32;
+                let p = m.dma + RX_BASE + 0x800 * i as u32 + off as u32;
                 let l = (l as usize).min(out.len());
                 for (k, o) in out[..l].iter_mut().enumerate() {
                     *o = dbr(p + k as u32);
@@ -2534,7 +2537,7 @@ fn join(d: &mut Drv, m: &mut Msgbuf, ssid: &[u8], pass: &[u8]) {
     d.put(if t.mfpc { b" (AP can do MFP)\n" } else { b"\n" });
     // Receive buffers first: the firmware runs split RX (SPLITRX_MODE 4), so data frames — the AP's EAPOL handshake messages among them — land in host buffers from the rxpost ring; with none posted the handshake never starts (seen: associated, no PSK_SUP, beacon loss after 15 s). Posted once: a later join (another network, `connect`) finds them there.
     if !m.rx_up {
-        for i in 0..64 {
+        for i in 0..RX_BUFS {
             m.post_rx(i);
         }
         m.ring_rx(d);

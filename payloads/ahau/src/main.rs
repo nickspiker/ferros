@@ -1387,7 +1387,7 @@ impl Ahau {
         let b = first + k * pitch;
         let mut l = Line::new();
         if flags & (1 << 4) != 0 {
-            let _ = core::fmt::Write::write_str(&mut l, "kept");
+            let _ = core::fmt::Write::write_str(&mut l, if wifi_joined() { "connected" } else { "kept" });
         } else if let Some(d) = dbm {
             let _ = core::fmt::Write::write_fmt(&mut l, format_args!("{d} dBm"));
         }
@@ -2913,6 +2913,12 @@ fn fit_bar(display: u64, kb: &mut honeycomb::Keyboard) {
 }
 
 /// A network's name as the page shows it: printable ASCII kept, anything else a `?` (the driver joins ASCII names only; the bytes of others are not trusted to be text).
+/// Whether WiFi is joined: its link's STATE measure 2 (the driver's, facts 41-48), so the page says the network kept is connected, not merely kept (owner, 2026-11-09: "it just says pangolin kept, nothing about connected").
+fn wifi_joined() -> bool {
+    let f = ferros_sys::facts();
+    f.0[33 + 8..41 + 8].iter().filter_map(|&m| ferros_sys::measure_of(m)).any(|m| m.0 == ferros_sys::measure::STATE && m.1 == 2)
+}
+
 fn printable(name: &[u8]) -> ([u8; 35], usize) {
     // Three bytes past the longest name: room for the "..." of one cut short (`net_draw`).
     let mut t = [0u8; 35];

@@ -231,6 +231,8 @@ impl Ip {
         f[13..15].copy_from_slice(&ty.to_be_bytes());
         f[15..n].copy_from_slice(payload);
         let mut r = [0u8; 16];
+        // WHY the floor: an Ethernet frame is 60 bytes at least (IEEE 802.3, without its FCS); a shorter one (an ARP, 42) is padded with zeros, as every host pads it.
+        let n = n.max(1 + 60);
         svc(CALL, self.cap(S_WLAN), self.off(f.as_ptr()), n as u64, self.off(r.as_mut_ptr()), 16 | CALL_LIVE);
     }
 
