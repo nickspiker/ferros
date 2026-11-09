@@ -3476,31 +3476,75 @@ enum Corner {
     Spare,
 }
 
-/// The glass boundary's distance from a point: the masked columns of each row near it (left and right), and the screen's top and bottom edges.
-fn glass_dist(rows: &[GlassRow], width: usize, height: usize, x: f32, y: f32, reach: f32) -> f32 {
-    // Outside the glass on its own row (in a masked corner, or off the screen): no clearance at all. Unsigned, a point beyond the corner's curve read as roomy and the bottom-right circle was solved out in the mask (2026-11-03).
-    if y < 0.0 || y >= height as f32 || x < 0.0 || x >= width as f32 {
-        return -1.0;
+/// The glass's own outline, exact (owner, 2026-11-08: "make sure the console circles are all dimensioned properly in regards to the new screen curves and center big circle"): fluor's corners as `plan_glass` draws them, superellipses ((R − a)/R)^n + ((R − b)/R)^n = 1 with a and b the distances in from the corner's two edges, R the big radius at the top-left and bottom-right and the small at the other two (`glass_corner_params`), each a polyline of `GLASS_SEGS` segments (chord error under a thousandth of a pixel at these radii), joined by the screen's straight edges. Until 2026-11-08 the solver measured to each row's whole masked columns at the row's centre, which misses the edge between rows where the curve runs nearly flat: circles reached into the mask in one corner and stopped short of it in another.
+const GLASS_SEGS: usize = 1 << 9;
+
+struct GlassOutline {
+    w: f32,
+    h: f32,
+    /// Radii: top-left, top-right, bottom-left, bottom-right.
+    r: [f32; 4],
+    n: f32,
+    /// Each corner's curve in screen pixels (pixel edges), GLASS_SEGS + 1 points from the vertical edge to the horizontal one.
+    pts: [alloc::vec::Vec<(f32, f32)>; 4],
+}
+
+impl GlassOutline {
+    fn new(width: usize, height: usize) -> GlassOutline {
+        let (rs, rb, n) = fluor::paint::edge::glass_corner_params(glass_radius(), width as f32, height as f32);
+        let (w, h) = (width as f32, height as f32);
+        let r = [rb, rs, rs, rb];
+        let nf = n as f32;
+        let mk = |k: usize| -> alloc::vec::Vec<(f32, f32)> {
+            let rr = r[k];
+            (0..=GLASS_SEGS)
+                .map(|i| {
+                    // The cosine as the sine of the mirrored step, so both ends are exact: cosf(π/2) in f32 is −4.4e-8, and its fractional power a NaN that dropped the curve's last segment, where it meets the edge (2026-11-08: the WiFi circle, solved there, sat 1.9 px off the cellular one).
+                    let step = core::f32::consts::FRAC_PI_2 / GLASS_SEGS as f32;
+                    let (s, c) = (libm::sinf(i as f32 * step), libm::sinf((GLASS_SEGS - i) as f32 * step));
+                    // a, b: in from the vertical and the horizontal edge.
+                    let a = rr * (1. - libm::powf(c, 2. / nf));
+                    let b = rr * (1. - libm::powf(s, 2. / nf));
+                    match k {
+                        0 => (a, b),
+                        1 => (w - a, b),
+                        2 => (a, h - b),
+                        _ => (w - a, h - b),
+                    }
+                })
+                .collect()
+        };
+        GlassOutline { w, h, r, n: nf, pts: [mk(0), mk(1), mk(2), mk(3)] }
     }
-    let own = &rows[y as usize];
-    if x < own.mask_l as f32 || x > own.mask_r as f32 {
-        return -1.0;
+
+    /// The signed distance from a point to the outline: positive inside the glass, negative outside.
+    fn dist(&self, x: f32, y: f32) -> f32 {
+        let (w, h) = (self.w, self.h);
+        // Which corner's box the point is in, if any: (index, a, b).
+        let k = if x < w * 0.5 { if y < h * 0.5 { 0 } else { 2 } } else if y < h * 0.5 { 1 } else { 3 };
+        let (a, b) = (if k & 1 == 0 { x } else { w - x }, if k < 2 { y } else { h - y });
+        let rk = self.r[k];
+        let outside = a < 0. || b < 0. || (a < rk && b < rk && libm::powf((rk - a) / rk, self.n) + libm::powf((rk - b) / rk, self.n) > 1.);
+        // The straight edges where they run (between the corners' boxes), then the nearest corner's curve.
+        let mut d = f32::MAX;
+        if x >= self.r[0] && x <= w - self.r[1] { d = d.min(y.abs()); }
+        if x >= self.r[2] && x <= w - self.r[3] { d = d.min((h - y).abs()); }
+        if y >= self.r[0] && y <= h - self.r[2] { d = d.min(x.abs()); }
+        if y >= self.r[1] && y <= h - self.r[3] { d = d.min((w - x).abs()); }
+        let p = &self.pts[k];
+        for i in 0..GLASS_SEGS {
+            let (x0, y0) = p[i];
+            let (x1, y1) = p[i + 1];
+            let (dx, dy) = (x1 - x0, y1 - y0);
+            let l2 = dx * dx + dy * dy;
+            // WHY the guard: two points of the polyline can coincide where the curve meets its edge; the segment is then a point.
+            let t = if l2 > 0. { ((x - x0) * dx + (y - y0) * dy) / l2 } else { 0. };
+            let t = if t < 0. { 0. } else if t > 1. { 1. } else { t };
+            let (ex, ey) = (x0 + t * dx - x, y0 + t * dy - y);
+            d = d.min(libm::sqrtf(ex * ex + ey * ey));
+        }
+        if outside { -d } else { d }
     }
-    let mut d = y.min(height as f32 - y).min(x).min(width as f32 - x);
-    let y0 = (y - reach).max(0.0) as usize;
-    let y1 = ((y + reach) as usize).min(height - 1);
-    for yy in y0..=y1 {
-        let dy = y - (yy as f32 + 0.5);
-        // The row's glass runs from column mask_l to column mask_r (both from the left; mask_r is the width where the row has no right mask).
-        let (l, r) = (rows[yy].mask_l as f32, rows[yy].mask_r as f32);
-        let dl = x - l;
-        let dr = r - x;
-        let dl2 = libm::sqrtf(dl * dl + dy * dy);
-        let dr2 = libm::sqrtf(dr * dr + dy * dy);
-        if dl2 < d { d = dl2; }
-        if dr2 < d { d = dr2; }
-    }
-    d
 }
 
 /// The screen's corner circles: (x, y, radius, what), up to sixteen.
@@ -3514,12 +3558,11 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
             return (CORNERS, CORNERS_N);
         }
     }
-    let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
+    let outline = GlassOutline::new(width, height);
     let (cx, cy, rr) = circle(width, height);
     let (w, h) = (width as f32, height as f32);
-    let reach = h / 8.0;
     let app = |x: f32, y: f32| libm::sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy)) - rr;
-    let glass = |x: f32, y: f32| glass_dist(rows, width, height, x, y, reach);
+    let glass = |x: f32, y: f32| outline.dist(x, y);
     let clear = |x: f32, y: f32| { let (a, g) = (app(x, y), glass(x, y)); if a < g { a } else { g } };
     let mut out = [(0.0f32, 0.0f32, 0.0f32, Corner::Spare); 16];
     let mut n = 0;
@@ -3548,13 +3591,18 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
             }
             y += step;
         }
-        let (cx0, cy0) = (bx, by);
-        for j in 0..33 {
-            for i in 0..33 {
-                let (x, y) = (cx0 + (i as f32 - 16.0) * 0.25, cy0 + (j as f32 - 16.0) * 0.25);
-                let c = clear(x, y);
-                if c > br { (bx, by, br) = (x, y, c); }
+        // Then a shrinking search around the best: a 5 × 5 pattern at each step, the step halved down to a sixty-fourth of a pixel.
+        let mut st = 2.0f32;
+        while st >= 1. / (1 << 6) as f32 {
+            let (cx0, cy0) = (bx, by);
+            for j in -2..=2 {
+                for i in -2..=2 {
+                    let (x, y) = (cx0 + i as f32 * st, cy0 + j as f32 * st);
+                    let c = clear(x, y);
+                    if c > br { (bx, by, br) = (x, y, c); }
+                }
             }
+            st *= 0.5;
         }
         out[n] = (bx, by, br, mid_what);
         n += 1;
