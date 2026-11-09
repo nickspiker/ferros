@@ -1,0 +1,9 @@
+[package]
+name = "panel-white"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+vsf = { path = "../../../vsf" }
+
+[workspace]

@@ -16,8 +16,18 @@ pub fn panel_gamma() -> f32 {
 }
 
 /// The ODT, VSF RGB → panel linear RGB (`tools/panel-white-e.py`, the DBV 3307 readings): the panel's three primaries from the profile's spectra under VSF's observer, the matrix they make inverted; rows are panel R, G, B, columns VSF R, G, B. Absolute (E in is E on the glass), so its row sums are E's gains. Model tier, from one unit (pixel 8 pro calibration data/README.md). Applied to every pixel by `neon::Odt` (neon.rs), with no clamp: out-of-gamut channels land at 0 or at the panel's top through the output tables (owner, 2026-10-24); every sRGB colour lands inside, so only colour beyond sRGB ever meets them.
-pub const ODT: [[f32; 3]; 3] = [[1.359550, -0.372458, 0.012909], [-0.098444, 0.863965, -0.026116], [0.001826, -0.001101, 0.816481]];
-pub const E_GAIN: [f32; 3] = [ODT[0][0] + ODT[0][1] + ODT[0][2], ODT[1][0] + ODT[1][1] + ODT[1][2], ODT[2][0] + ODT[2][1] + ODT[2][2]];
+pub const ODT_HUSKY: [[f32; 3]; 3] = [[1.359550, -0.372458, 0.012909], [-0.098444, 0.863965, -0.026116], [0.001826, -0.001101, 0.816481]];
+/// akita's AK3B, the same way from its own profile (tools/panel-white, `oracle/display/akita-ak3b/profile-0` at DBV 3175, 2026-11-08): its E white needs G 0.7532 and B 0.7965 of R, against husky's 0.7394 and 0.8172.
+pub const ODT_AKITA: [[f32; 3]; 3] = [[1.3065, -0.3222, 0.0157], [-0.0987, 0.8829, -0.0309], [0.0018, -0.0024, 0.7971]];
+/// This panel's ODT.
+pub fn odt() -> [[f32; 3]; 3] {
+    if ferros_sys::akita() { ODT_AKITA } else { ODT_HUSKY }
+}
+/// Its row sums: E's gains.
+pub fn e_gain() -> [f32; 3] {
+    let o = odt();
+    core::array::from_fn(|r| o[r][0] + o[r][1] + o[r][2])
+}
 
 /// The ODT's light scale: the E peak at 2^14 in f16, so 2^-28 of the peak is f16's smallest normal.
 pub const F16_SCALE: f64 = 16384.0;
@@ -51,8 +61,9 @@ pub fn odt_tables(white: f32, peak_e: f32) -> neon::Odt {
         scale_hi[e] = (s >> 8) as u8;
         scale_lo[e] = s as u8;
     }
-    let kk = |r: usize, c: usize| (ODT[r][c] - if r == c { E_GAIN[r] } else { 0.0 }) as f64;
-    let c0 = [E_GAIN[0] as f64, E_GAIN[1] as f64, E_GAIN[2] as f64, kk(0, 0), kk(0, 2), kk(1, 0), kk(1, 2), kk(2, 0)].map(h);
+    let (o, eg) = (odt(), e_gain());
+    let kk = |r: usize, c: usize| (o[r][c] - if r == c { eg[r] } else { 0.0 }) as f64;
+    let c0 = [eg[0] as f64, eg[1] as f64, eg[2] as f64, kk(0, 0), kk(0, 2), kk(1, 0), kk(1, 2), kk(2, 0)].map(h);
     let c1 = [kk(2, 2), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0].map(h);
     let kf = [(k / 16384.0) as f32, F16_SCALE as f32, 0.0, 0.0];
     unsafe {

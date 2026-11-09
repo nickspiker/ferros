@@ -1323,8 +1323,13 @@ fn testcard(pixels: &mut [Px], width: usize, height: usize) {
 const PEAK_NITS: f32 = 1467.0;
 const WHITE_NITS: f32 = 133.0;
 /// White is equal-energy E (owner): solved from the panel's measured spectra under VSF's observer (Stockman & Sharpe 10°, `tools/panel-white-e.py`, the DBV 3307 readings), E needs R 1.0, G 0.7394, B 0.8172 of each channel's light — the ODT's row sums below; E keeps 80.1 % of native white's light, which is the peak the roll-off lands on. On the code they are g^(1/2.19), Q15: the ramps (op 21) apply them to the one table directly.
-const E_CODE_Q15: [u32; 3] = [32768, 28548, 29883];
-const E_LIGHT: f32 = 0.801;
+fn e_code_q15() -> [u32; 3] {
+    // akita's from its own profile (tools/panel-white at DBV 3175, γ 2.23, 2026-11-08): E white keeps 81.1 % of its native white's light.
+    if ferros_sys::akita() { [32768, 28858, 29589] } else { [32768, 28548, 29883] }
+}
+fn e_light() -> f32 {
+    if ferros_sys::akita() { 0.811 } else { 0.801 }
+}
 
 /// The present stage's one table: a 16-bit working value (gamma 2, white = 1.0 = Q14 16384, up to 4.0 = 16× white in light) to a 10-bit panel code with 4 fraction bits (Q4, 0..16368), before the white point. One entry folds the whole display transform: the roll-off, Y/peak = tanh²(a·v), always on, with infinity on the panel's peak and `a` solved so white lands exactly on its share of it, tanh²(a) = white ÷ peak, a = atanh(√(white/peak)) (owner, 2026-10-22: at the brightest setting white is half the peak); then the panel's 1/2.19. Shared by the three channels (their curves agree within the instrument's noise); E's per-channel gains come after it. Built once, here, with f32; everything per pixel is integer.
 /// The brightness (preference 3) the one table was last built for: a brightness change builds only the present stage's tables (`odt_tables`), and the ramps (op 21), the table's one reader, build it again when it is stale (owner, 2026-11-08: 65536 tanh and pow at every 32nd of a stop of the slider, for nothing).
@@ -1400,10 +1405,10 @@ fn panel_for(nits: f32) -> (bool, u16, f32) {
 fn brightness(v: u8) -> (f32, f32, bool, u16) {
     // akita's AK3B by husky's law (owner, 2026-11-08: "Why are we restricting full power mode?"): the brightest white half the panel's peak (its high brightness mode, 1400 cd/m²), the panel following the brightness down to its floor, every finer step in the pixels.
     if ferros_sys::akita() {
-        let top_e = AK3B_HBM_NITS * E_LIGHT;
+        let top_e = AK3B_HBM_NITS * e_light();
         let white = top_e * 0.5 * libm::exp2f(-(v as f32) * (1. / (1 << 5) as f32));
         // WHY the floor (owner, 2026-11-08: "guess it goes the same for both"): never under an eighth of the panel's peak light (AK3B_HBM_NITS / 8, 175 cd/m², about DBV 1590), as husky; the emission duty drops below about DBV 1280 (photodiode, about 108 cd/m², where husky's drops too). An eighth of the normal top (100 cd/m², DBV 1234) would be under it.
-        let want = (white * 16.0).min(top_e) / E_LIGHT;
+        let want = (white * 16.0).min(top_e) / e_light();
         let floor = AK3B_HBM_NITS * (1. / (1 << 3) as f32);
         let nits = if want > floor { want } else { floor };
         // Google's curves (panel-google-ak3b.c): normal mode a 2.2 power law to 800 cd/m² at DBV 3175; high brightness mode linear from 800 at DBV 3176 to 1400 at 4095.
@@ -1413,16 +1418,16 @@ fn brightness(v: u8) -> (f32, f32, bool, u16) {
         } else {
             (AK3B_DBV_TOP as f32 * libm::powf(nits / AK3B_TOP_NITS, 1. / AK3B_GAMMA)) as u16
         };
-        return (white, nits * E_LIGHT, hbm, dbv);
+        return (white, nits * e_light(), hbm, dbv);
     }
-    let top_e = HBM_NITS * E_LIGHT;
+    let top_e = HBM_NITS * e_light();
     let white = top_e * 0.5 * libm::exp2f(-(v as f32) * (1. / (1 << 5) as f32));
     // (Until 2026-11-08 the panel never went below the normal-mode top, owner 2026-11-03; now never below an eighth of its peak, below.) Below about DBV 1246 the DDIC dims by lengthening each frame's dark window (95 % emission duty at DBV 1490 and above, about 85 % at 1236, under half at 983, measured by eye in Android), so every step under it is the pixel values' (the table and the 12-bit dither), the light's duty staying at the panel's 95 %. High brightness mode only for the steps that need more than DBV 3307 gives.
-    let want = (white * 16.0).min(top_e) / E_LIGHT;
+    let want = (white * 16.0).min(top_e) / e_light();
     // WHY the floor (the owner's, 2026-11-08: "let's be conservative ... 12.5% we cap the dim"): the panel never under an eighth of its peak light (HBM_NITS / 8, 184 cd/m², about DBV 1549), three stops under the top; below DBV 1219-1246 (108-114 cd/m²) the HK3 cuts its emission duty (measured with a photodiode, DISPLAY-CALIB.md), so every dimmer step stays in the pixels at full duty. Was DBV 3307 (984 cd/m²).
     let floor = HBM_NITS * (1. / (1 << 3) as f32);
     let (hbm, dbv, native) = panel_for(if want > floor { want } else { floor });
-    (white, native * E_LIGHT, hbm, dbv)
+    (white, native * e_light(), hbm, dbv)
 }
 
 /// The ordered 4×4 dither (Bayer), in sixteenths. The table's Q4 10-bit code is a Q6 8-bit code; the threshold (×4, in 64ths) is added before the six fraction bits are dropped, so each 4×4 cell (0.2 mm at 489 ppi) carries four bits below the 8-bit code the link takes: 12 bits effective. The DQE's own dither is in shift mode (kernel `start_home`), passing these 8 bits through untouched — two ordered dithers stacked partly cancelled into visible steps (owner's eyes, 2026-10-22).
@@ -5079,7 +5084,8 @@ fn ramps(outs: &mut [&mut [u32]], width: usize, height: usize, lut: &[u16], only
                 (v, dither, match k { 6 => 0, 7 => 1, 8 => 2, _ => 3 })
             };
             let base = lut[v.min(65535) as usize] as u32;
-            let q4 = [base * E_CODE_Q15[0] >> 15, base * E_CODE_Q15[1] >> 15, base * E_CODE_Q15[2] >> 15];
+            let e = e_code_q15();
+            let q4 = [base * e[0] >> 15, base * e[1] >> 15, base * e[2] >> 15];
             for (p, row) in rows.iter_mut().enumerate().take(n) {
                 let th = if !dither { 0 } else if n == PHASES { threshold(x, y, p) } else { BAYER[y & 3][x & 3] as u32 * 4 };
                 let c = |ch: usize| dither8(q4[ch], th);
