@@ -1765,7 +1765,7 @@ pub struct Hw {
 }
 
 /// The partitions a process may read files from (`Grant::Part`), read only (partfs.rs `part_call`): the modem driver's firmware image, its per-unit NV (efs, modem_userdata), the handover signature (persist) and the carrier configs (vendor_a, inside super). The owner's rule (2026-10-29): ferros reads Android's partitions, never writes them.
-pub static PARTS: &[&str] = &["modem_a", "efs", "persist", "modem_userdata", "vendor_a", "vendor_b"];
+pub static PARTS: &[&str] = &["modem_a", "efs", "persist", "modem_userdata", "vendor_a", "vendor_b", "modem_b"];
 
 /// The dev hardware registry: blocks a process may be granted by name (WIFI.md §0: PCIe ch1 sits in HSI2).
 pub static HARDWARE: &[Hw] = &[
