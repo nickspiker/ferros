@@ -176,6 +176,8 @@ const WORD_CHARS: usize = (1 << 9) - (1 << 6);
 const MARK: u64 = 9000;
 const TEXT: u16 = 16384;
 const QUIET: u16 = 7000;
+/// A pill under a finger (the network page's rows and buttons): about twice the brightest pill at rest.
+const PRESSED: u64 = 1 << 13;
 
 global_asm!(
     r#"
@@ -466,6 +468,8 @@ struct Ahau {
     nets_len: usize,
     pick: ([u8; 32], usize),
     joining: bool,
+    /// The network page's element under a finger, lit while it is held (0 the button, 1 `back`, 16 + k the list's row k): it acts when the finger lifts still on it (`net_release`), however it moved meanwhile, so a tap that wandered is not taken for a drag.
+    pressed: core::cell::Cell<Option<u8>>,
 }
 
 impl Ahau {
@@ -561,7 +565,7 @@ impl Ahau {
     }
 
 
-    /// A tap on no key: the button under the entry line acts (or `back` beside it).
+    /// A tap on no key: on the entry line, the blinkey moves there. (The buttons act from their own press, `net_press`.)
     fn tap_at(&mut self, x: i64, y: i64) {
         // On the entry line: the blinkey to the nearest character boundary.
         let (b, px) = self.entry_at();
@@ -569,38 +573,7 @@ impl Ahau {
             self.place_caret(x);
             return;
         }
-        if self.can_go_back() {
-            let (bx0, by0, bx1, by1) = self.back_at();
-            if (bx0 as i64..bx1 as i64).contains(&x) && (by0 as i64..by1 as i64).contains(&y) {
-                self.go_back();
-                return;
-            }
-        }
-        // The network page: a row picks its network, the button scans or joins.
-        if self.mode == Mode::Networks && !self.joining {
-            if let Some(k) = self.net_row_at(y) {
-                self.net_pick(k);
-                return;
-            }
-        }
-        let (x0, y0, x1, y1) = self.button_at();
-        if (x0 as i64..x1 as i64).contains(&x) && (y0 as i64..y1 as i64).contains(&y) && matches!(self.mode, Mode::Networks | Mode::Pass) {
-            match self.mode {
-                Mode::Pass => self.net_join(),
-                _ if !self.joining => self.net_scan(),
-                _ => {}
-            }
-            return;
-        }
-        if (x0 as i64..x1 as i64).contains(&x) && (y0 as i64..y1 as i64).contains(&y) {
-            if self.button_label().is_some() {
-                self.attest();
-                self.entry();
-                self.button();
-                self.words();
-            }
-            return;
-        }
+        // The buttons and the network page's rows act from their own press (`net_press`, `net_release`), not from a tap.
     }
 
     /// The device's layout changed (from anywhere: the identity's settings, `diag pref`): the keyboard follows.
@@ -666,6 +639,7 @@ impl Ahau {
             Mode::Wrong => Some("start over"),
             Mode::Words(_) => Some("cancel"),
             Mode::Networks if !self.joining => Some("scan"),
+            Mode::Networks if self.joining => Some("joining"),
             Mode::Pass => Some("join"),
             Mode::Looking(_) | Mode::Join(_) | Mode::Grey(_) | Mode::Hosting | Mode::Networks => None,
         }
@@ -680,11 +654,11 @@ impl Ahau {
         }
         if self.can_go_back() {
             let (bx0, by0, bx1, by1) = self.back_at();
-            pill(s, self.w, bx0, by0, bx1, by1, 1800, self.k(self.w / 24));
+            pill(s, self.w, bx0, by0, bx1, by1, if self.pressed.get() == Some(1) { PRESSED } else { 1800 }, self.k(self.w / 24));
         }
         let (x0, y0, x1, y1) = self.button_at();
         if self.button_label().is_some() {
-            pill(s, self.w, x0, y0, x1, y1, 2600, self.k(self.w / 24));
+            pill(s, self.w, x0, y0, x1, y1, if self.pressed.get() == Some(0) { PRESSED } else if self.joining { 1800 } else { 2600 }, self.k(self.w / 24));
         }
         // The labels in front of the pills, the row composed whole before it shows (`compose`).
         self.compose(ry0, ry1, || {
@@ -1184,15 +1158,96 @@ impl Ahau {
         (px, pitch, cy - r * 5 / 8 + pitch, cy + r)
     }
 
-    /// The row under `y`, if a network is listed there.
+    /// Row `k`'s pill (x0, y0, x1, y1): three quarters of the pitch tall, centred on its text's middle (a third of an em above the baseline), across all but a sixteenth of the width each side.
+    fn net_row_rect(&self, k: usize) -> (usize, usize, usize, usize) {
+        let (px, pitch, first, _) = self.net_rows();
+        let mid = first + k * pitch - px / 3;
+        (self.w / 16, mid - pitch * 3 / 8, self.w * 15 / 16, mid + pitch * 3 / 8)
+    }
+
+    /// Whether row `k` is the network picked.
+    fn net_picked(&self, k: usize) -> bool {
+        self.net_entry(k).is_some_and(|(name, _, _)| name == &self.pick.0[..self.pick.1])
+    }
+
+    /// The row whose pill holds `y`, if a network is listed there and its row is shown.
     fn net_row_at(&self, y: i64) -> Option<usize> {
         let (px, pitch, first, foot) = self.net_rows();
-        let top = first as i64 - pitch as i64 + (px / 2) as i64;
-        if y < top || y >= foot as i64 {
-            return None;
+        let mut k = 0;
+        while self.net_entry(k).is_some() && first + k * pitch + px / 2 <= foot {
+            let (_, y0, _, y1) = self.net_row_rect(k);
+            if (y0 as i64..y1 as i64).contains(&y) {
+                return Some(k);
+            }
+            k += 1;
         }
-        let k = ((y - top) / pitch as i64) as usize;
-        self.net_entry(k).map(|_| k)
+        None
+    }
+
+    /// The screen's element under (x, y), as `pressed` names them: the button, `back`, or on the network page a row (rows only while no join runs).
+    fn net_hit(&self, x: i64, y: i64) -> Option<u8> {
+        let inside = |(x0, y0, x1, y1): (usize, usize, usize, usize)| (x0 as i64..x1 as i64).contains(&x) && (y0 as i64..y1 as i64).contains(&y);
+        if self.button_label().is_some() && inside(self.button_at()) {
+            return Some(0);
+        }
+        if self.can_go_back() && inside(self.back_at()) {
+            return Some(1);
+        }
+        if self.mode == Mode::Networks && !self.joining {
+            return self.net_row_at(y).map(|k| 16 + k as u8);
+        }
+        None
+    }
+
+    /// The pressed element drawn again (lit, or at rest once `pressed` is cleared).
+    fn net_redraw(&self, what: u8) {
+        if what >= 16 {
+            self.net_draw();
+        } else {
+            self.button();
+        }
+    }
+
+    /// A finger down on the page: the element under it lit at once.
+    fn net_press(&self, x: i64, y: i64) -> bool {
+        let Some(e) = self.net_hit(x, y) else { return false };
+        self.pressed.set(Some(e));
+        self.net_redraw(e);
+        true
+    }
+
+    /// The finger moved: off its element, the element goes back to rest and will not act.
+    fn net_follow(&self, x: i64, y: i64) {
+        if let Some(e) = self.pressed.get() {
+            if self.net_hit(x, y) != Some(e) {
+                self.pressed.set(None);
+                self.net_redraw(e);
+            }
+        }
+    }
+
+    /// The finger lifted: the element it was still on acts (the button scans or joins, `back` steps back, a row is picked).
+    fn net_release(&mut self) {
+        let Some(e) = self.pressed.take() else { return };
+        self.net_redraw(e);
+        match e {
+            0 if self.mode == Mode::Pass => self.net_join(),
+            0 if self.mode == Mode::Networks => {
+                if !self.joining {
+                    self.net_scan();
+                }
+            }
+            // The attest screen's own button (bind, unlock, mint, start over, cancel).
+            0 => {
+                self.attest();
+                self.entry();
+                self.button();
+                self.words();
+            }
+            1 if self.can_go_back() => self.go_back(),
+            k if k >= 16 => self.net_pick((k - 16) as usize),
+            _ => {}
+        }
     }
 
     /// The list drawn where the mark was: each network's name (bright when this device can join it, quiet otherwise) and, at the right, its signal in dBm, or `kept` for the one the device keeps.
@@ -1200,8 +1255,17 @@ impl Ahau {
         let (_, cy, r) = self.mark_at();
         let (y0, y1) = (cy - r - 2, cy + r + 2);
         self.surf()[y0 * self.w..y1 * self.w].fill(0);
+        // Each row a pill behind its text: quiet, brighter for the network picked (its passphrase being typed, or joining), brightest under a finger (`pressed`).
+        let (px, pitch, first, foot) = self.net_rows();
+        let mut k = 0;
+        while self.net_entry(k).is_some() && first + k * pitch + px / 2 <= foot {
+            let (_, ry0, _, ry1) = self.net_row_rect(k);
+            let picked = self.net_picked(k) && (self.mode == Mode::Pass || self.joining);
+            let fill = if self.pressed.get() == Some(16 + k as u8) { PRESSED } else if picked { 3600 } else { 1000 };
+            pill(self.surf(), self.w, self.w / 16, ry0, self.w * 15 / 16, ry1, fill, px);
+            k += 1;
+        }
         self.compose(y0, y1, || {
-            let (px, pitch, first, foot) = self.net_rows();
             let mut k = 0;
             while let Some((name, dbm, flags)) = self.net_entry(k) {
                 let b = first + k * pitch;
@@ -2380,7 +2444,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), joining: false };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), joining: false, pressed: core::cell::Cell::new(None) };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     start_fresh_mark(grants, w / 3);
     a.retint();
@@ -2408,6 +2472,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // A finger on one of the system's places (op 41): which (bit 7 once it moved: no longer a tap), where it landed, whether it acted; whether this touch's landing was asked about yet.
     let mut orb: Option<(u8, i64, i64, bool)> = None;
     let mut orb_asked = false;
+    // Whether this touch's landing was looked at for the network page's rows and buttons.
+    let mut press_asked = false;
     // The key typed at its press (COMMIT_AT_PRESS), whose tap at the lift is then only its letting go.
     let mut pressed: Option<Key> = None;
     // The last frame of the mark put on the glass (FRESH_DONE's count).
@@ -2465,17 +2531,48 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             pinched = true;
         }
-        // The system's places around the glass, which are the display's, so a finger on one never reaches this screen's own touches: asked of the display where a lone finger lands (op 41), as the map does. The WiFi circle (1) swiped toward the centre opens the network page (owner, 2026-11-07: tap a circle, slide toward the centre = its page); the back corner (9) swiped inward, or tapped, steps back. Inward is the finger's travel along the line from where it landed to the screen's centre, past a twelfth of the span (the map's measure, 2wh/(w+h)).
+        // The buttons (and the network page's rows) under a lone finger: lit at its landing, back at rest if it leaves them, acting at the lift while still on them (`net_release`; owner, 2026-11-09: "any movement just ... cancels"). A second finger (a pinch) lets the element go.
+        {
+            if k == 1 {
+                let (x, y) = (held[0].1, held[0].2);
+                if !press_asked {
+                    press_asked = true;
+                    if y < a.kb.top as i64 && a.net_press(x, y) {
+                        a.show();
+                    }
+                } else if a.pressed.get().is_some() {
+                    a.net_follow(x, y);
+                    if a.pressed.get().is_none() {
+                        a.show();
+                    }
+                }
+            } else if k >= 2 {
+                if let Some(e) = a.pressed.take() {
+                    a.net_redraw(e);
+                    a.show();
+                }
+            }
+        }
+        if k == 0 {
+            if a.pressed.get().is_some() {
+                a.net_release();
+                a.show();
+            }
+            press_asked = false;
+        }
+        // The system's places around the glass, which are the display's, so a finger on one never reaches this screen's own touches: asked of the display where a lone finger lands (op 41), as the map does. A radio's circle (0-4) tapped still switches that radio; the WiFi circle (1) swiped toward the centre opens the network page (owner, 2026-11-07: tap a circle, slide toward the centre = its page); the back corner (9) swiped inward, or tapped, steps back. Inward is the finger's travel along the line from where it landed to the screen's centre, past a twelfth of the span (the map's measure, 2wh/(w+h)).
         if k == 1 {
             let (x, y) = (held[0].1, held[0].2);
             match orb {
+                // Only where the glass is not this screen's own (`window::mine`) and no button took the press: op 41 calls the whole lower half outside the app's circle the back region, which takes in this screen's buttons and keys, and a press on them is theirs.
+                None if !orb_asked && (a.pressed.get().is_some() || window::mine(display, base, x as u16, y as u16)) => orb_asked = true,
                 None if !orb_asked => {
                     orb_asked = true;
                     let mut m = [41u8, 0, 0, 0, 0];
                     m[1..3].copy_from_slice(&(x as u16).to_le_bytes());
                     m[3..5].copy_from_slice(&(y as u16).to_le_bytes());
                     let mut q = [0xFFu8; 1];
-                    if call(display, &m, &mut q) == 1 && (q[0] == 1 || q[0] == 9) {
+                    if call(display, &m, &mut q) == 1 && (q[0] < 5 || q[0] == 9) {
                         orb = Some((q[0], x, y, false));
                     }
                 }
@@ -2484,11 +2581,13 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     let inward = ((x - x0) as f32 * ux + (y - y0) as f32 * uy) / libm::sqrtf(ux * ux + uy * uy);
                     let span = (2 * a.w * a.h) as f32 / (a.w + a.h) as f32;
                     if inward > span * (1. / 12.) {
-                        orb = Some((what, x0, y0, true));
-                        if what & 0x7F == 1 {
-                            a.net_pull();
-                        } else if a.can_go_back() {
-                            a.go_back();
+                        // Acted: the lift is not a tap as well (a swipe first seen already far from its landing never set the moved bit).
+                        orb = Some((what | 0x80, x0, y0, true));
+                        match what & 0x7F {
+                            1 => a.net_pull(),
+                            9 if a.can_go_back() => a.go_back(),
+                            // The other radios have no page before attest.
+                            _ => {}
                         }
                         a.show();
                     } else if (x - x0).abs() + (y - y0).abs() > (a.w / 64) as i64 {
@@ -2500,12 +2599,21 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
         }
         if k == 0 {
-            // The back corner tapped still: back.
-            if let Some((9, ..)) = orb {
-                if a.can_go_back() {
+            match orb {
+                // The back corner tapped still: back.
+                Some((9, _, _, false)) if a.can_go_back() => {
                     a.go_back();
                     a.show();
                 }
+                // A radio's circle tapped still: that radio off or on (preference 15, as the map does after attest; owner, 2026-11-09: the radios switch on the attest screen too). The display redraws the circle from the preference.
+                Some((r, _, _, false)) if r < 5 => {
+                    let off = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) ^ (1 << r);
+                    ferros_sys::set_pref(cap(grants, S_SETTINGS), ferros_sys::PREF_RADIOS_OFF, off);
+                    let mut l = Line::new();
+                    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: status circle {r} tapped: radios off G#{off:02X}\n"));
+                    console(grants, l.as_bytes());
+                }
+                _ => {}
             }
             orb = None;
             orb_asked = false;
