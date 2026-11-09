@@ -45,6 +45,10 @@ const ERR: u64 = u64::MAX;
 /// BAR1's offset inside the pcie1-mem window (stage 6 places it above BAR0's 64 KiB), and its size: the 4 MiB slice of the dongle backplane that cfg G#84 selects.
 const BAR1: u64 = 0x40_0000;
 const BAR1_SIZE: u32 = 0x40_0000;
+/// akita's BCM4383 (an AI backplane): its Cortex-R4 core and wrapper, and its RAM base, as its enumeration ROM gave them (docs/BOARDS.md, 2026-11-09; dhd_pcie.c CR4_4383_RAM_BASE G#6E_0000).
+const CR4_CORE: u32 = 0x1803_0000;
+const CR4_WRAP: u32 = 0x1813_0000;
+const RAM_BASE_4383: u32 = 0x6E_0000;
 
 struct Drv {
     grants: u64,
@@ -155,6 +159,53 @@ impl Drv {
         self.kv(k, v);
     }
     /// One word of dongle memory (backplane address) through BAR1, moving the window first (dhdpcie_bus_membytes with bar1 switching).
+    /// The backplane power request of a multi-backplane chip (the BCM4383, siutils.c si_srpwr_request over PCIe: the PCIe core's power control at BAR0 + G#2000 + G#1E8, the ARM/backplane domain's request bit 9 and its ready bit 17, up to 15 ms, PMU_MAX_TRANSITION_DLY). dhd holds it around every TCM access; this driver holds it from the halt on. Some(µs to ready) or None.
+    fn srpwr(&mut self, on: bool) -> Option<u64> {
+        let v = self.rd(MEM, 0x21E8);
+        self.wr(MEM, 0x21E8, if on { v | 1 << 9 } else { v & !(1 << 9) });
+        if on { self.poll(MEM, 0x21E8, 1 << 17, 1 << 17, 15_000) } else { Some(0) }
+    }
+    /// The Cortex-R4's reset through its AI wrapper (aiutils.c _ai_core_reset, the CR4 path of dhd_pcie.c __dhdpcie_bus_download_state): `halt` leaves it reset-released with CPUHALT set (ioctrl G#21), else running (ioctrl G#01). The wrapper (the EROM read on akita: master wrapper G#1813_0000, its only one) through BAR0's second window, its registers at +G#1000: ioctrl +G#408, resetstatus +G#804, resetctrl +G#800. False if a reset status never settled.
+    fn cr4_reset(&mut self, halt: bool) -> bool {
+        const IOCTRL: u64 = 0x1408;
+        const RESETCTRL: u64 = 0x1800;
+        const RESETSTATUS: u64 = 0x1804;
+        let bits = if halt { 0x20 } else { 0 };
+        self.wr(CFG, 0x70, CR4_WRAP);
+        let mut ok = self.poll(MEM, RESETSTATUS, 0xFFFF_FFFF, 0, 300).is_some();
+        self.wr(MEM, RESETCTRL, 1);
+        self.us(10);
+        ok &= self.poll(MEM, RESETSTATUS, 0xFFFF_FFFF, 0, 300).is_some();
+        // Clock on and forced (FGC) with the core's bits, then out of reset, then the force off.
+        self.wr(MEM, IOCTRL, bits | 0x3);
+        let _ = self.rd(MEM, IOCTRL);
+        ok &= self.poll(MEM, RESETSTATUS, 0xFFFF_FFFF, 0, 300).is_some();
+        for _ in 0..10 {
+            if self.rd(MEM, RESETCTRL) == 0 {
+                break;
+            }
+            self.wr(MEM, RESETCTRL, 0);
+            ok &= self.poll(MEM, RESETSTATUS, 0xFFFF_FFFF, 0, 300).is_some();
+        }
+        self.wr(MEM, IOCTRL, bits | 0x1);
+        let _ = self.rd(MEM, IOCTRL);
+        self.us(1);
+        ok
+    }
+    /// The CR4's RAM in bytes (siutils_host.c si_tcm_size): corecap at core + 4, its banks [3:0] + [7:4]; each bank's info by writing its index to core + G#40 and reading core + G#44, size (bits 7:0 + 1) × (1 KiB with bit 9, else 8 KiB). The core must be up (halted is fine).
+    fn cr4_ramsize(&mut self) -> u32 {
+        self.wr(CFG, 0x80, CR4_CORE);
+        let cap = self.rd(MEM, 0x4);
+        let banks = (cap & 0xF) + ((cap >> 4) & 0xF);
+        let mut size = 0u32;
+        for i in 0..banks {
+            self.wr(MEM, 0x40, i);
+            let bi = self.rd(MEM, 0x44);
+            size += ((bi & 0xFF) + 1) * if bi & (1 << 9) != 0 { 1024 } else { 8192 };
+        }
+        self.wr(CFG, 0x80, 0x1800_0000);
+        size
+    }
     fn window(&mut self, addr: u32) {
         let w = addr & !(BAR1_SIZE - 1);
         if w != self.win {
@@ -510,8 +561,9 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     // ---- stage 4: dump the NCI enumeration ROM (read-only) — the chip describes its own cores there (nciutils.c nci_init: ChipCommon EromPtrOffset G#FC → EROM2 base; EROM1/OOBR sit below it). The host parses the dump before any core reset is attempted. ----
     let erom2 = d.rd(MEM, 0xFC);
     d.kv(b"cc.eromptr", erom2);
+    let ai = chip >> 28 == 1;
     // The backplane by the chip id's top nibble (siutils.c si_doattach): 6 NCI (the BCM4398, its EROM and OOBR below the pointer), 1 AI (the BCM4383 on akita, 2026-11-09). On an AI chip the region the NCI arithmetic derives is not decoded: reading it stalled the bus and reset the 8a. There the ROM is at the pointer itself (aiutils.c ai_scan; in the OOBR, NCI-format, when its low three bits are set, aiutils.c ai_erom_in_oobr), dumped only as stage G#41, its whole G#E00 bytes; stage 4 stops at the pointer.
-    if chip >> 28 == 1 {
+    if ai {
         d.kv(b"backplane_ai", 1);
         d.kv(b"erom_in_oobr", (erom2 & 7 != 0) as u32);
         d.flush();
@@ -534,14 +586,17 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
             d.flush();
             d.wr(CFG, 0x80, 0x1800_0000);
         }
-        return;
+        if stage < 5 || stage == 0x41 {
+            return;
+        }
     }
     let erom1 = erom2 & !0xFFF;
     let oobr = erom2 & !0x1FFF;
     d.kv(b"erom1_base", erom1);
     d.kv(b"oobr_base", oobr);
     d.flush();
-    for &(name, base) in &[(&b"oobr"[..], oobr), (b"erom", erom1)] {
+    let nci_roms = [(&b"oobr"[..], oobr), (&b"erom"[..], erom1)];
+    for &(name, base) in if ai { &nci_roms[..0] } else { &nci_roms[..] } {
         d.wr(CFG, 0x80, base);
         d.put(b"dump ");
         d.put(name);
@@ -592,6 +647,19 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     d.show(b"cfg.bar0win2", CFG, 0x70);
     d.wr(CFG, 0x80, 0x1800_1000);
     d.show(b"pcie.dar_security_status", MEM, 0xA74);
+    if ai {
+        // The CR4's state through its wrapper, read before anything changes it (WL_REG_ON has just released the chip): ioctrl (G#21 = halted, clocked), resetctrl (0 = out of reset); then the backplane power request, which the CR4 and the TCM need on a multi-backplane chip, and how long it took to come ready.
+        d.wr(CFG, 0x70, CR4_WRAP);
+        d.show(b"cr4.ioctrl", MEM, 0x1408);
+        d.show(b"cr4.resetctrl", MEM, 0x1800);
+        d.show(b"cr4.resetstatus", MEM, 0x1804);
+        d.show(b"pcie.pwr_ctl", MEM, 0x21E8);
+        d.flush();
+        let r = d.srpwr(true);
+        d.kv(b"srpwr.ready_us", r.map(|u| u as u32).unwrap_or(u32::MAX));
+        d.show(b"pcie.pwr_ctl", MEM, 0x21E8);
+        d.flush();
+    } else {
     d.wr(CFG, 0x80, oobr);
     d.show(b"ca7.coreinfo", MEM, 0x240);
     d.show(b"ca7.dmpctrl", MEM, 0x248);
@@ -625,30 +693,51 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
         d.put(b"\n");
     }
     d.wr(CFG, 0x80, 0x1800_0000);
+    }
     d.flush();
     if stage < 6 {
         return;
     }
 
     // ---- stage 6: the dongle's RAM through BAR1, ARM still halted. RAM size the way si_sysmem_size counts it (sysmem rev 14 ≥ 12: coreinfo ROM banks [31:24], SRAM banks [23:16]; per bank, bankidx G#10 ← index, bankinfo G#40 size = 8 KiB × ([6:0] + 1)); the RAM base is the sysmem's second slave port (G#2A_0000, dhd_pcie.c NCI default). BAR1 (4 MiB) sits above BAR0 (64 KiB) at G#6040_0000; cfg G#84 picks which 4 MiB of the backplane it shows (dhdpcie_setbar1win). Then a pattern round trip in both windows, and the shared-area word at the top of RAM zeroed (dhdpcie_init_shared_addr). ----
-    d.wr(CFG, 0x80, 0x1808_8000);
-    let ci = d.rd(MEM, 0x0);
-    d.kv(b"sysmem.coreinfo", ci);
-    let (nrb, nb) = ((ci >> 24) & 0xFF, (ci >> 16) & 0xFF);
-    let mut ramsize = 0u32;
-    for i in nrb..nrb + nb {
-        d.wr(MEM, 0x10, i);
-        let bi = d.rd(MEM, 0x40);
-        ramsize += 8192 * ((bi & 0x7F) + 1);
-    }
-    d.wr(CFG, 0x80, 0x1800_0000);
+    // An AI chip (akita's BCM4383): its CR4 halted through the wrapper (dhd resets it into halt whatever its state, the CR4 path of __dhdpcie_bus_download_state), the power request held from stage 5, and the RAM sized from the CR4's banks (si_tcm_size); its RAM based at G#6E_0000.
+    let ramsize = if ai {
+        let ok = d.cr4_reset(true);
+        d.kv(b"cr4.halt_ok", ok as u32);
+        d.wr(CFG, 0x70, CR4_WRAP);
+        d.show(b"cr4.ioctrl", MEM, 0x1408);
+        d.show(b"cr4.resetctrl", MEM, 0x1800);
+        d.flush();
+        if !ok {
+            d.failed = true;
+            return;
+        }
+        let s = d.cr4_ramsize();
+        d.wr(CFG, 0x80, CR4_CORE);
+        d.show(b"cr4.corecap", MEM, 0x4);
+        d.wr(CFG, 0x80, 0x1800_0000);
+        s
+    } else {
+        d.wr(CFG, 0x80, 0x1808_8000);
+        let ci = d.rd(MEM, 0x0);
+        d.kv(b"sysmem.coreinfo", ci);
+        let (nrb, nb) = ((ci >> 24) & 0xFF, (ci >> 16) & 0xFF);
+        let mut ramsize = 0u32;
+        for i in nrb..nrb + nb {
+            d.wr(MEM, 0x10, i);
+            let bi = d.rd(MEM, 0x40);
+            ramsize += 8192 * ((bi & 0x7F) + 1);
+        }
+        d.wr(CFG, 0x80, 0x1800_0000);
+        ramsize
+    };
     d.kv(b"ramsize", ramsize);
-    const RAM_BASE: u32 = 0x2A_0000;
+    let ram_base: u32 = if ai { RAM_BASE_4383 } else { 0x2A_0000 };
     d.wr(CFG, 0x18, 0x6040_0000);
     d.wr(CFG, 0x1C, 0);
     d.flush();
     let t0 = d.now();
-    let w0 = d.tcm_rd(RAM_BASE);
+    let w0 = d.tcm_rd(ram_base);
     d.kv(b"bar1.first_read_us", (d.now().wrapping_sub(t0) * 1_000_000 / d.freq) as u32);
     d.kv(b"ram[base]", w0);
     d.flush();
@@ -656,10 +745,10 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
         d.put(b"BAR1 does not decode\n");
         return;
     }
-    let top = RAM_BASE + ramsize - 4;
+    let top = ram_base + ramsize - 4;
     let v = d.tcm_rd(top);
     d.kv(b"ram[top]", v);
-    for (addr, pat) in [(RAM_BASE, 0xA5C3_3C5Au32), (top - 4, 0x5A3C_C3A5)] {
+    for (addr, pat) in [(ram_base, 0xA5C3_3C5Au32), (top - 4, 0x5A3C_C3A5)] {
         d.tcm_wr(addr, pat);
         let back = d.tcm_rd(addr);
         d.put(if back == pat { b"roundtrip ok " } else { b"roundtrip BAD " });
@@ -730,22 +819,28 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     }
     d.flush();
     // Enter: the CA7 must be out of reset and halted (stage 5 found it so after WL_REG_ON; dhd resets it into that state only when it isn't, which this driver doesn't do yet).
-    d.wr(CFG, 0x80, oobr);
-    let dmp = d.rd(MEM, 0x248);
-    d.wr(CFG, 0x80, 0x1800_0000);
-    d.wr(CFG, 0x70, 0x1850_4000);
-    let in_reset = d.rd(MEM, 0x1140) & 1;
+    // An AI chip: its CR4 halted in stage 6, the wrapper reading ioctrl G#21 (halted, clocked) and resetctrl 0.
+    let (dmp, in_reset) = if ai {
+        d.wr(CFG, 0x70, CR4_WRAP);
+        (d.rd(MEM, 0x1408), d.rd(MEM, 0x1800) & 1)
+    } else {
+        d.wr(CFG, 0x80, oobr);
+        let dmp = d.rd(MEM, 0x248);
+        d.wr(CFG, 0x80, 0x1800_0000);
+        d.wr(CFG, 0x70, 0x1850_4000);
+        (dmp, d.rd(MEM, 0x1140) & 1)
+    };
     if dmp & 0x20 == 0 || in_reset != 0 {
         d.kv(b"ca7 not halted+up, dmpctrl", dmp);
         d.failed = true;
         return;
     }
-    let ramtop = RAM_BASE + ramsize;
+    let ramtop = ram_base + ramsize;
     d.tcm_wr(ramtop - 4, 0);
     // The image at the RAM base; its first word is the reset instruction, written to address 0 last.
     let t0 = d.now();
     let (resetinstr, bad) = match fw {
-        Fw::Mem(fw) => (u32::from_le_bytes([fw[0], fw[1], fw[2], fw[3]]), d.tcm_write_verify(RAM_BASE, fw)),
+        Fw::Mem(fw) => (u32::from_le_bytes([fw[0], fw[1], fw[2], fw[3]]), d.tcm_write_verify(ram_base, fw)),
         Fw::Vault(len) => {
             let mut chunk = [0u8; 4096];
             let (mut off, mut bad, mut first) = (0usize, 0u32, 0u32);
@@ -758,7 +853,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
                 if off == 0 {
                     first = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 }
-                bad += d.tcm_write_verify(RAM_BASE + off as u32, &chunk[..n]);
+                bad += d.tcm_write_verify(ram_base + off as u32, &chunk[..n]);
                 off += n;
             }
             (first, bad)
@@ -807,12 +902,28 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let v = d.tcm_rd(0);
     d.kv(b"ram[0]", v);
     d.flush();
-    d.wr(CFG, 0x80, oobr);
-    let v = d.rd(MEM, 0x248) & !0x20;
-    d.wr(MEM, 0x248, v);
-    let rel = d.poll(MEM, 0x248, 0xFFFF_FFFF, v, 5000);
-    d.kv(b"ca7.released_us", rel.map(|u| u as u32).unwrap_or(u32::MAX));
-    d.wr(CFG, 0x80, 0x1800_0000);
+    if ai {
+        // The CR4 (dhd_pcie.c __dhdpcie_bus_download_state, its CR4 branch): the reset instruction must read back from address 0, the DAR power control's bit 9 set (buscorerev 77 ≥ 68: the ARM cold-boot workaround, BAR0 + G#2A0C), then a full wrapper reset with no CPUHALT, not a halt-bit clear.
+        if v != resetinstr {
+            d.put(b"the reset instruction did not read back from address 0\n");
+            d.failed = true;
+            d.flush();
+            return;
+        }
+        let p = d.rd(MEM, 0x2A0C);
+        d.wr(MEM, 0x2A0C, p | 1 << 9);
+        let ok = d.cr4_reset(false);
+        d.kv(b"cr4.release_ok", ok as u32);
+        d.wr(CFG, 0x70, CR4_WRAP);
+        d.show(b"cr4.ioctrl", MEM, 0x1408);
+    } else {
+        d.wr(CFG, 0x80, oobr);
+        let v = d.rd(MEM, 0x248) & !0x20;
+        d.wr(MEM, 0x248, v);
+        let rel = d.poll(MEM, 0x248, 0xFFFF_FFFF, v, 5000);
+        d.kv(b"ca7.released_us", rel.map(|u| u as u32).unwrap_or(u32::MAX));
+        d.wr(CFG, 0x80, 0x1800_0000);
+    }
     d.flush();
     // The firmware boots and replaces the length token in the last RAM word with the address of its shared area (dhdpcie_readshared). Watch it for up to 4 s.
     let t0 = d.now();
@@ -824,7 +935,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
             d.kv(b"  at_ms", ((d.now().wrapping_sub(t0) * 1000) / d.freq) as u32);
             last = v;
         }
-        if v != token && v != 0 && v >= RAM_BASE && v < ramtop {
+        if v != token && v != 0 && v >= ram_base && v < ramtop {
             break Some(v);
         }
         if d.now().wrapping_sub(t0) > 4 * d.freq {
@@ -835,9 +946,14 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     d.flush();
     let Some(sh) = shared else {
         d.kv(b"no shared area; ramtop word", last);
-        d.wr(CFG, 0x80, oobr);
-        d.show(b"ca7.dmpctrl", MEM, 0x248);
-        d.wr(CFG, 0x80, 0x1800_0000);
+        if ai {
+            d.wr(CFG, 0x70, CR4_WRAP);
+            d.show(b"cr4.ioctrl", MEM, 0x1408);
+        } else {
+            d.wr(CFG, 0x80, oobr);
+            d.show(b"ca7.dmpctrl", MEM, 0x248);
+            d.wr(CFG, 0x80, 0x1800_0000);
+        }
         d.flush();
         return;
     };
@@ -861,9 +977,14 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let mut prev = [u32::MAX; 4];
     while d.now().wrapping_sub(t0) < 3 * d.freq {
         let mut cur = [d.tcm_rd(sh), d.tcm_rd(sh + 0x14), d.tcm_rd(ramtop - 4), 0];
-        d.wr(CFG, 0x80, oobr);
-        cur[3] = d.rd(MEM, 0x248);
-        d.wr(CFG, 0x80, 0x1800_0000);
+        if ai {
+            d.wr(CFG, 0x70, CR4_WRAP);
+            cur[3] = d.rd(MEM, 0x1408);
+        } else {
+            d.wr(CFG, 0x80, oobr);
+            cur[3] = d.rd(MEM, 0x248);
+            d.wr(CFG, 0x80, 0x1800_0000);
+        }
         if cur != prev {
             d.hex(((d.now().wrapping_sub(t0) * 1_000_000) / d.freq) as u32);
             d.put(b"us flags/console/ramtop/dmp:");
@@ -883,12 +1004,12 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let sh = d.tcm_rd(ramtop - 4);
     d.kv(b"shared (settled)", sh);
     d.show(b"rc.msi_status", DBI, 0x830);
-    if sh >= RAM_BASE && sh < ramtop {
+    if sh >= ram_base && sh < ramtop {
         // bcmpcie.h: PCIE_SHARED_ASSERT G#200, PCIE_SHARED_TRAP G#400.
         let f = d.tcm_rd(sh);
         d.put(if f & 0x600 != 0 { b"FIRMWARE TRAPPED/ASSERTED\n" } else { b"firmware running, no trap\n" });
     }
-    if sh < RAM_BASE || sh >= ramtop {
+    if sh < ram_base || sh >= ramtop {
         d.flush();
         return;
     }
@@ -898,7 +1019,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     }
     d.flush();
     let cons = d.tcm_rd(sh + 0x14);
-    if cons < RAM_BASE || cons >= ramtop {
+    if cons < ram_base || cons >= ramtop {
         return;
     }
     let (buf, size, idx) = (d.tcm_rd(cons + 8), d.tcm_rd(cons + 12), d.tcm_rd(cons + 16));
@@ -906,7 +1027,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     d.kv(b"cons.size", size);
     d.kv(b"cons.idx", idx);
     d.flush();
-    if buf < RAM_BASE || size == 0 || size > 0x1_0000 || buf + size > ramtop || idx > size {
+    if buf < ram_base || size == 0 || size > 0x1_0000 || buf + size > ramtop || idx > size {
         return;
     }
     // Unwrapped start (idx is where the next byte goes): oldest first when the ring has wrapped, i.e. the byte after idx is non-zero.
