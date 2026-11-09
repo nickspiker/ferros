@@ -1104,7 +1104,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let cons_before = d.tcm_rd(cons + 16);
     let t0 = d.now();
     let rx_off = d.tcm_rd(sh + 36);
-    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); 64], rxq_head: 0, rxq_len: 0, nets: [Net { name: [0; 32], len: 0, rssi: 0, flags: 0, seen_in: 0 }; 32], nnets: 0, scan_gen: 0, scan_ver: 1, quiet: false, outcome: 0, rx_up: false, personal: true };
+    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); 64], rxq_head: 0, rxq_len: 0, nets: [Net { name: [0; 32], len: 0, rssi: 0, flags: 0, seen_in: 0 }; 32], nnets: 0, scan_gen: 0, scan_ver: 1, quiet: false, outcome: 0, rx_up: false, personal: true, retry_s: 1 << 6 };
     // Control submit ring: 8 ioctl response buffers and 8 event buffers first (the firmware DMAs ioctl results into a posted response buffer, named by its request id in the completion).
     for b in 0..8u32 {
         m.post(d, 0x0B, 1 + b, [8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
@@ -1256,6 +1256,8 @@ struct Msgbuf {
     rx_up: bool,
     /// The credential is the person's (`wifi.cred`; a staged run's input file counts as one): the MAC is this network's, from the ira. A device's (`wifi.net`, joined before anyone attested) joins under a random one each time: no stable identifier on the air while locked (AUTH.md, rule 2).
     personal: bool,
+    /// Seconds before a kept credential that did not join is tried again (`serve_unjoined`): 64, doubling to 1024, back to 64 on a join.
+    retry_s: u64,
 }
 
 /// A network as the page shows it: its name, the strongest signal seen (dBm), and flags: bit 0 joinable here (WPA2-PSK outside 6 GHz), bit 1 open, bit 2 other security (WEP, WPA, SAE only, enterprise), bits 3, 5 and 6 seen on 5, 2.4 and 6 GHz.
@@ -2371,6 +2373,7 @@ fn connect(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
         fresh = false;
         join(d, m, &name, &pass);
         if m.keyed {
+            m.retry_s = 1 << 6;
             return;
         }
         // Not joined: the firmware let go of any half-made association (WLC_DISASSOC 52), and the join's state cleared for the next.
@@ -2405,8 +2408,8 @@ fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, skip: &Option<(Vec<u8>, Vec<u8>, 
     let mut tok = [0u8; 32];
     let mut vault_at = 0u64;
     let mut scanning = false;
-    // A kept credential out of range is looked for again every 64 s.
-    let mut retry_at = d.now() + (1 << 6) * d.freq;
+    // A kept credential that did not join is looked for again after `m.retry_s`, which doubles at each try that finds its network (`connect`).
+    let mut retry_at = d.now() + m.retry_s * d.freq;
     loop {
         ferros_sys::pet();
         let _ = m.pump(d);
@@ -2414,12 +2417,16 @@ fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, skip: &Option<(Vec<u8>, Vec<u8>, 
             scanning = false;
             if let Some((name, pass, key)) = skip {
                 if m.nets[..m.nnets].iter().any(|e| e.flags & 1 != 0 && &e.name[..e.len as usize] == &name[..]) {
+                    // The next wait twice this one, up to 1024 s (the modem's policy): this router throttles repeated joins (2026-10-15: association succeeds, the WPA2 handshake fails, for about ten minutes), and a try every 64 s kept the throttle on.
+                    if m.retry_s < 1 << 10 {
+                        m.retry_s <<= 1;
+                    }
                     return (name.clone(), pass.clone(), key, false);
                 }
             }
         }
         if skip.is_some() && !scanning && d.now() >= retry_at {
-            retry_at = d.now() + (1 << 6) * d.freq;
+            retry_at = d.now() + m.retry_s * d.freq;
             escan_start(d, m);
             scanning = true;
         }
@@ -2741,10 +2748,11 @@ fn radio_up(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
 
 /// The MAC to join with, set while the radio is down (`radio_up`, before WLC_UP; `rejoin_as` brings the radio down for another network).
 fn set_mac(d: &mut Drv, m: &mut Msgbuf) {
+    // Since 2026-11-09 the address is the person's and this device's together (owner: "We mix the ira in with our identity. can't have same address devices on network"): the key is the kernel's person-bound ira key (`ira_person_key`), which exists only while the person's identity is unlocked, so two people on one device, or one person on two devices, never share an address. Before:
     // The MAC to join with, set while the radio is still down: one address per network (owner, 2026-10-31) — the first six bytes of BLAKE3 keyed by this device's ira-derived key over the network's SSID, made a locally administered unicast address (bit 1 of the first byte set, bit 0 clear). The same on a network every time, different on every other, and not linkable between them without the ira. Keyed on the SSID, not the access point's MAC: the SSID is known before the radio comes up, which is when the address must be set, and one network answers from a different MAC on each band and each mesh node. Without the ira right, or with no SSID to join, a random address from the entropy right. Never the chip's own: the calibration file's Broadcom placeholder (00:90:4c:50:10:01, the same on every unit), which pangolin refused from the evening of 2026-10-29 on.
     let mut mac = [0u8; 6];
     let ssid = if m.personal { &m.want[..m.want_len] } else { &[][..] };
-    let keyed = match ferros_sys::ira_key(d.cap(IRA), "wifi mac per network v1") {
+    let keyed = match ferros_sys::ira_person_key(d.cap(IRA), "wifi mac per network v2") {
         Some(key) if !ssid.is_empty() => {
             mac.copy_from_slice(&blake3::keyed_hash(&key, ssid).as_bytes()[..6]);
             true
@@ -2754,7 +2762,7 @@ fn set_mac(d: &mut Drv, m: &mut Msgbuf) {
     if keyed || svc(6, d.cap(ENTROPY), mac.as_mut_ptr() as u64 - d.base, 6, 0, 0) == 6 {
         mac[0] = (mac[0] & 0xFC) | 2;
         let r = m.set_var(d, b"cur_etheraddr", &mac);
-        d.kv(if keyed { b"cur_etheraddr set (this network's, from the ira)" } else { b"cur_etheraddr set (random: no ira right, no network yet, or a network joined before anyone attested)" }, r);
+        d.kv(if keyed { b"cur_etheraddr set (this network's, the person's and this device's)" } else { b"cur_etheraddr set (random: no network yet, a network joined before anyone attested, or nobody's identity unlocked)" }, r);
         let h = b"0123456789abcdef";
         d.put(b"joining as MAC ");
         for (k, v) in mac.iter().enumerate() {

@@ -605,7 +605,7 @@ fn store_scoped(key: &str, value: Option<&[u8]>) -> Result<Option<alloc::vec::Ve
 }
 
 /// The base of a class's vault domains (process.rs `domain_keys`, VAULT-OUT.md): the device's from the ira, derived once; the person's from their unlock, None while locked.
-fn domain_base(identity: bool) -> Option<[u8; 32]> {
+pub(crate) fn domain_base(identity: bool) -> Option<[u8; 32]> {
     if identity {
         return unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut())?.identity_domain();
     }

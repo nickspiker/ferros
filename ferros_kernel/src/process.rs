@@ -1321,6 +1321,8 @@ pub static STORES: &[StoreScope] = &[
 const KIST_DOMAIN_CONTEXT: &str = "ferros 2026-11-08 kist domain";
 /// The context binding a kist's ira-derived key to its gate identity (`SYS_IRA`).
 const KIST_IRA_CONTEXT: &str = "ferros 2026-11-08 kist ira";
+/// A process's ira key bound to the person present (SYS_IRA x4 bit 0): the WiFi address a person wears on a network, theirs and this device's together.
+const PERSON_IRA_CONTEXT: &str = "ferros 2026-11-09 person ira";
 /// The scope prefix every kist domain's keys are derived under, followed by the domain's name (`domain_keys`): no `STORES` prefix can collide with it (none holds a zero byte).
 const KIST_DOMAIN_PREFIX: &[u8] = b"kist\0";
 /// The vault behind `SYS_STORE`, registered by whoever owns it (service.rs): (full key, None = get / Some(value) = set) -> Ok(the value for a get, None if absent) or Err.
@@ -2695,8 +2697,18 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     context.extend_from_slice(if p.kist { b"ferros kist ira v1 ".as_slice() } else { b"ferros process ira v1 " });
                     context.extend_from_slice(&p.read(f.x[1], len));
                     // Derived where the ira is held (keys.rs): the ira itself never leaves the registers.
+                    // Bit 0 of x4: the key worn by the person as well as the device (owner, 2026-11-09: "We mix the ira in with our identity. can't have same address devices on network"): bound to the unlocked identity's domain key, so it differs for every person on every device and exists only while someone is present (none while locked).
+                    let person = f.x[4] & 1 != 0;
                     let key = core::str::from_utf8(&context).ok().and_then(crate::ira::derive).and_then(|k| match (p.kist, p.domain) {
+                        (false, _) if person => crate::service::domain_base(true).map(|id| {
+                            let mut h = blake3::Hasher::new_derive_key(PERSON_IRA_CONTEXT);
+                            h.update(&id);
+                            h.update(&k);
+                            *h.finalize().as_bytes()
+                        }),
                         (false, _) => Some(k),
+                        // A kist asks for its own keys only.
+                        (true, _) if person => None,
                         (true, Some(d)) => {
                             let mut h = blake3::Hasher::new_derive_key(KIST_IRA_CONTEXT);
                             h.update(&d);

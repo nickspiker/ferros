@@ -645,6 +645,13 @@ pub fn ira_key(cap: u64, domain: &str) -> Option<[u8; 32]> {
     (r == 32).then_some(out)
 }
 
+/// `ira_key` bound to the person present as well as this device (the kernel mixes the unlocked identity's domain key in): None while nobody's identity is unlocked. A kernel from before 2026-11-09 ignores the flag and gives the device's key alone.
+pub fn ira_person_key(cap: u64, domain: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    let r = svc(nr::IRA, cap, off(domain.as_ptr()), domain.len() as u64, off(out.as_mut_ptr()), 1);
+    (r == 32).then_some(out)
+}
+
 /// UTC wall time: (seconds since 1970, the counter ticks into the current second, the counter's rate), or None until the kernel has read the PMIC's clock. `local_time` with the zone taken back out — for stamps that cross the network (Photon's eagle time).
 pub fn utc_time() -> Option<(i64, u64, u64)> {
     let at = arc_base() + PREFS + 16;

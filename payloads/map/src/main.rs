@@ -104,13 +104,15 @@ fn hairline() -> u32 {
 }
 /// A mark's stroke width (Q8 pixels) and colours (stroke, fill, ink unused here, tick) and whether a checked box carries its tick, for the label size `px`, by `MARK_LOOK`.
 fn mark_look(px: i64) -> (i64, [u32; 4], bool) {
+    // The stroke the buttons carry (an em over 32, plus a pixel: fluor's widgets), never under 2 pixels (owner, 2026-11-09: "2px ... min, follow the same button stroke so if they get big we want to have more than 2px"; a pixel's stroke was too thin and its anti-aliasing jittered).
+    let sw = (((px >> 5) + 1).max(2)) << 8;
     match MARK_LOOK {
         0 => {
             let m = ferros_sys::theme::current().mark;
-            (256, [m, m, 0, fill()], false)
+            (sw, [m, m, 0, fill()], false)
         }
-        1 => (256, [hairline(), white(), 0, fill()], true),
-        _ => (((px >> 5) + 1) << 8, [grey(), ferros_sys::theme::current().lit, 0, fill()], true),
+        1 => (sw, [hairline(), white(), 0, fill()], true),
+        _ => (sw, [grey(), ferros_sys::theme::current().lit, 0, fill()], true),
     }
 }
 
