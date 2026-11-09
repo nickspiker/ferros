@@ -721,7 +721,17 @@ fn thread_name(t: usize) -> Vec<u8> {
     n
 }
 
+/// Whether `len` bytes at arc offset `off` touch the grants page ([0, CODE)): the kernel's, read-only to the process and to the kernel alike but while the kernel opens it for its own write.
+fn in_grants(off: u64, len: usize) -> bool {
+    len != 0 && off < CODE as u64
+}
+
 impl Process {
+    /// The kernel's own writes into the grants page (the tokens, the handle table, the ihi, the preferences): at build, before the page is closed, and through `write_pref_all`, which opens it around the write.
+    fn write_grants(&self, off: u64, bytes: &[u8]) {
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), (self.arc.base + off as usize) as *mut u8, bytes.len()) };
+    }
+
     /// Where `len` bytes a syscall names at arc offset `off` lie (owner, 2026-11-08: a syscall buffer resolves or traps): in the arc, used as they are; else inside one of this process's own DMA regions (a heap or a surface outside the arc, named by the pointer the process holds, which `ferros_sys::off` turns into an offset past the arc), used directly, which gives it nothing it did not hold. None anywhere else: the caller traps (`BUF_FAULT`), where until then the offset was masked into the arc and the bytes landed in the process's own memory elsewhere (the display's wallpaper reads, 2026-11-08).
     fn span(&self, off: u64, len: usize) -> Option<usize> {
         let size = self.arc.size as u64;
@@ -733,7 +743,7 @@ impl Process {
     }
     /// A buffer the kernel will touch later (a receive buffer, a reply buffer): resolved now, at the syscall that names it, so a bad one traps there and not inside another process's call.
     fn check(&self, off: u64, len: usize) {
-        if len != 0 && self.span(off, len).is_none() {
+        if len != 0 && (self.span(off, len).is_none() || in_grants(off, len)) {
             self.bad_buf(off, len, true);
         }
     }
@@ -780,6 +790,11 @@ impl Process {
     }
     fn write(&self, off: u64, bytes: &[u8]) {
         if bytes.is_empty() {
+            return;
+        }
+        // Never into the grants page (owner rule: a syscall buffer resolves or traps, 2026-11-08): it is read-only at every level, the kernel's write there faulted under its lock and reset the device (pcie1's console reply at G#A00, the 8a, 2026-11-09). The kernel's own writes there go by `write_grants`.
+        if in_grants(off, bytes.len()) {
+            self.bad_buf(off, bytes.len(), true);
             return;
         }
         match self.span(off, bytes.len()) {
@@ -1083,7 +1098,7 @@ fn write_pref_all(index: usize, value: u8) {
     for p in kk.procs.iter().flatten() {
         // The grants page is read-only at every level: opened for the write, closed after.
         crate::cachemap::grants_page(p.arc.base, true);
-        p.write((PREFS + index) as u64, &[value]);
+        p.write_grants((PREFS + index) as u64, &[value]);
         crate::cachemap::grants_page(p.arc.base, false);
     }
     for i in 0..kk.threads.len() {
@@ -1861,11 +1876,12 @@ fn buf_trap(f: &mut Frame, cur: usize, pi: usize, r: u64, b: BufFault, nr: u64, 
     let Some(p) = kk.procs.get(pi).and_then(|q| q.as_ref()) else { return r };
     let base = p.arc.base as u64;
     let line = alloc::format!(
-        "{}: TRAP syscall {} op G#{:X}: a buffer it {} that is neither in its arc nor in a region it holds: offset G#{:X} (address G#{:X}) length A#{}, {}; pc +G#{:X} lr +G#{:X} (thread {}){}\n",
+        "{}: TRAP syscall {} op G#{:X}: a buffer it {} {}: offset G#{:X} (address G#{:X}) length A#{}, {}; pc +G#{:X} lr +G#{:X} (thread {}){}\n",
         core::str::from_utf8(&thread_name(cur)).unwrap_or("?"),
         nr,
         op,
         if b.write { "was to be written into" } else { "named to be read" },
+        if b.write && in_grants(b.off, b.len) { "in its grants page, read-only (the kernel's: tokens, preferences)" } else { "that is neither in its arc nor in a region it holds" },
         b.off,
         base.wrapping_add(b.off),
         b.len,
@@ -3932,20 +3948,20 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false };
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.
-    p.write(TOKENS as u64, &(p.cspace.len() as u32).to_le_bytes());
+    p.write_grants(TOKENS as u64, &(p.cspace.len() as u32).to_le_bytes());
     for (i, c) in p.cspace.iter().enumerate() {
-        p.write((TOKENS + 4 + 32 * i) as u64, &c.token);
+        p.write_grants((TOKENS + 4 + 32 * i) as u64, &c.token);
         // The table holds the first 32 slots, the pair load's reach (init holds a hundred grants and uses no handle; its tokens begin where the table ends).
         if i < 32 {
             let (base, mask) = handle_of(c.object);
-            p.write((HANDLES + 16 * i) as u64, &base.to_le_bytes());
-            p.write((HANDLES + 16 * i + 8) as u64, &mask.to_le_bytes());
+            p.write_grants((HANDLES + 16 * i) as u64, &base.to_le_bytes());
+            p.write_grants((HANDLES + 16 * i + 8) as u64, &mask.to_le_bytes());
         }
     }
     if let Some(i) = ihi {
-        p.write(IHI as u64, &i);
+        p.write_grants(IHI as u64, &i);
     }
-    p.write(PREFS as u64, unsafe { &*(&raw const PREFS_NOW) });
+    p.write_grants(PREFS as u64, unsafe { &*(&raw const PREFS_NOW) });
     let in_off = CODE + code_len + tail;
     p.write(in_off as u64, input);
     crate::cachemap::sync_code(arc.base + CODE, code_len);
