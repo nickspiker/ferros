@@ -2405,8 +2405,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut pinched = false;
     // A pull (the network page down, or up again) acts once per touch: set when it acts, cleared when every finger lifts.
     let mut pulled = false;
-    // A finger on the WiFi circle: where it landed and where it is now; whether this touch's landing was asked about yet.
-    let mut orb: Option<(i64, i64, i64, i64)> = None;
+    // A finger on one of the system's places (op 41): which (bit 7 once it moved: no longer a tap), where it landed, whether it acted; whether this touch's landing was asked about yet.
+    let mut orb: Option<(u8, i64, i64, bool)> = None;
     let mut orb_asked = false;
     // The key typed at its press (COMMIT_AT_PRESS), whose tap at the lift is then only its letting go.
     let mut pressed: Option<Key> = None;
@@ -2465,7 +2465,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             pinched = true;
         }
-        // The WiFi circle's slide (owner, 2026-11-07: tap a circle, slide toward the centre, release = its detail page): a lone finger that lands on it (display op 41: 1 is WiFi) and lets go an eighth of the width nearer the screen's centre opens the network page. The circles are the display's, so the finger never reaches this screen's own touches.
+        // The system's places around the glass, which are the display's, so a finger on one never reaches this screen's own touches: asked of the display where a lone finger lands (op 41), as the map does. The WiFi circle (1) swiped toward the centre opens the network page (owner, 2026-11-07: tap a circle, slide toward the centre = its page); the back corner (9) swiped inward, or tapped, steps back. Inward is the finger's travel along the line from where it landed to the screen's centre, past a twelfth of the span (the map's measure, 2wh/(w+h)).
         if k == 1 {
             let (x, y) = (held[0].1, held[0].2);
             match orb {
@@ -2474,24 +2474,40 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     let mut m = [41u8, 0, 0, 0, 0];
                     m[1..3].copy_from_slice(&(x as u16).to_le_bytes());
                     m[3..5].copy_from_slice(&(y as u16).to_le_bytes());
-                    let mut h = [0xFFu8; 1];
-                    if call(display, &m, &mut h) == 1 && h[0] == 1 {
-                        orb = Some((x, y, x, y));
+                    let mut q = [0xFFu8; 1];
+                    if call(display, &m, &mut q) == 1 && (q[0] == 1 || q[0] == 9) {
+                        orb = Some((q[0], x, y, false));
                     }
                 }
-                Some((x0, y0, _, _)) => orb = Some((x0, y0, x, y)),
-                None => {}
+                Some((what, x0, y0, false)) => {
+                    let (ux, uy) = ((a.w as i64 / 2 - x0) as f32, (a.h as i64 / 2 - y0) as f32);
+                    let inward = ((x - x0) as f32 * ux + (y - y0) as f32 * uy) / libm::sqrtf(ux * ux + uy * uy);
+                    let span = (2 * a.w * a.h) as f32 / (a.w + a.h) as f32;
+                    if inward > span * (1. / 12.) {
+                        orb = Some((what, x0, y0, true));
+                        if what & 0x7F == 1 {
+                            a.net_pull();
+                        } else if a.can_go_back() {
+                            a.go_back();
+                        }
+                        a.show();
+                    } else if (x - x0).abs() + (y - y0).abs() > (a.w / 64) as i64 {
+                        // Moved, not yet far: no longer a tap.
+                        orb = Some((what | 0x80, x0, y0, false));
+                    }
+                }
+                _ => {}
             }
         }
         if k == 0 {
-            if let Some((x0, y0, x1, y1)) = orb.take() {
-                let (cx, cy) = (a.w as i64 / 2, a.h as i64 / 2);
-                let d = |x: i64, y: i64| (((x - cx) * (x - cx) + (y - cy) * (y - cy)) as u64).isqrt() as i64;
-                if d(x0, y0) - d(x1, y1) > (a.w / 8) as i64 && !a.net_open() {
-                    a.net_pull();
+            // The back corner tapped still: back.
+            if let Some((9, ..)) = orb {
+                if a.can_go_back() {
+                    a.go_back();
                     a.show();
                 }
             }
+            orb = None;
             orb_asked = false;
             pulled = false;
         }
