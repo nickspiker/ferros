@@ -130,27 +130,31 @@ The owner on the glass, first look at the shell: the picture right, the corners 
 - **Brightness**: the AK3B is held at DBV 3175, the top of its normal mode (800 cd/m² by Google's capability; never its high brightness mode without the owner), and every step is in the pixels by the Pro's law (preference 3, 32nds of a stop; the brightest white half the panel's peak). ABL had left DBV 1437 under a table built for husky's peak. Set to preference 32 (white 160 cd/m²) for the owner; `diag "pref brightness <0-255>"` changes it, or the settings slider once the map runs.
 - **Corners** (`GLASS_RADIUS_AKITA`, payloads/display): 112.5, then 98 (the small corner's diagonal cut 8.1 px less), then 96 at the owner's "2px smaller". At 96 fluor's exponent goes from 4 to 5, so the corner is longer (the small one 303.7 px along each edge) and squarer, its diagonal cut 55.6 px. Live: `tools/akita-glass.sh corner <g>` shows grey inside and orange where the mask at g would cut (orange on the glass: g too big); `tools/akita-glass.sh off` returns to the shell. A chosen g goes into `GLASS_RADIUS_AKITA`.
 - **Cutout**: Google's overlay circle (centre 539.5, 68.71, radius 33.72, bottom row 102.43) is Android's approximation, not measured. `tools/akita-glass.sh cutout <cx> <cy> <r>` draws black with a white ring 16 px wide from radius r round (cx, cy) and a red crosshair beyond it. The ring's inner edge touching the hole all round, with no black between, is the hole's radius about that centre; black showing on one side means the hole sits off the other way; the ring cut into means the hole reaches past r there. The measured centre and radius (or a per-row map, if it is not a circle) replace `ferros_sys::CUTOUT_BOTTOM_AKITA` and Google's numbers.
-- **Cutout, measured** (2026-11-08, tools/cutout-scan): the owner marked every pixel the hole hides completely, row by row, then checked them white on black in a dark room (display op 52 mode 4: nothing lit once one stray mark was dropped). 3148 pixels on rows 37 to 100, every row centred on x 539.5, the top and bottom mirror images about y 69.0. The knockout over them is the smallest circle covering every one whole by the mask's coverage rule (R + 0.5 − d, d a pixel centre's distance): radius 32.30 about (539.5, 69.0), the farthest dead pixel's centre 31.80 out (`ferros_sys::CUTOUT_HOLE_AKITA`; its bottom 101.30 is `CUTOUT_BOTTOM_AKITA`, the app circle tangent to it). Its antialiased ramp lands on live pixels only: 36 live pixels covered whole, 194 on the ramp, rows 36 to 101. The display's glass plan draws it in the mask colour, in front with the edge (payloads/display `SHAPE_HOLE`). The map, each row's first and last hidden column:
+- **Cutout, measured** (2026-11-08, tools/cutout-scan) under the white rule: a pixel is dead unless it shows pure white, so the edge's fringe pixels (cyan, magenta, red, blue) count dead. The owner marked the dead pixels both sides row by row and checked them by lighting the ring of pixels just outside the map white on black (display op 52 mode 6): every one pure white. 3276 pixels on rows 37 to 100, every row centred on x 539.5, the top and bottom mirror images about y 69.0. The knockout over them is the smallest circle covering every one whole by the mask's coverage rule (R + 0.5 − d, d a pixel centre's distance): radius 32.83 about (539.5, 69.0), the farthest dead centres 32.33 out at rows 48 and 89, columns 514 and 564 (`ferros_sys::CUTOUT_HOLE_AKITA`; its bottom 101.83 is `CUTOUT_BOTTOM_AKITA`, the app circle tangent to it). Its antialiased ramp lands on live pixels only: 12 covered whole, 202 on the ramp. The display's glass plan draws it in the mask colour, in front with the edge (payloads/display `SHAPE_HOLE`). The first map (the pixels hidden completely, fringe counted live, checked dark white on black) had 3148 pixels and radius 32.30. The map, each row's first and last dead column:
 
 ```
 row first last    row first last    row first last    row first last
- 37   535  543     53   512  566     69   508  570     85   513  565
- 38   530  548     54   512  566     70   508  570     86   513  565
- 39   528  550     55   511  567     71   508  570     87   514  564
- 40   525  553     56   511  567     72   508  570     88   515  563
- 41   524  554     57   510  568     73   508  570     89   515  563
- 42   522  556     58   510  568     74   509  569     90   516  562
- 43   521  557     59   510  568     75   509  569     91   517  561
- 44   519  559     60   509  569     76   509  569     92   518  560
- 45   518  560     61   509  569     77   509  569     93   519  559
- 46   517  561     62   509  569     78   510  568     94   521  557
- 47   516  562     63   509  569     79   510  568     95   522  556
- 48   515  563     64   508  570     80   510  568     96   524  554
- 49   515  563     65   508  570     81   511  567     97   525  553
- 50   514  564     66   508  570     82   511  567     98   528  550
- 51   513  565     67   508  570     83   512  566     99   530  548
- 52   513  565     68   508  570     84   512  566    100   535  543
+ 37   534  544     53   511  567     69   507  571     85   512  566
+ 38   529  549     54   511  567     70   507  571     86   512  566
+ 39   527  551     55   510  568     71   507  571     87   513  565
+ 40   524  554     56   510  568     72   507  571     88   514  564
+ 41   523  555     57   509  569     73   507  571     89   514  564
+ 42   521  557     58   509  569     74   508  570     90   515  563
+ 43   520  558     59   509  569     75   508  570     91   516  562
+ 44   518  560     60   508  570     76   508  570     92   517  561
+ 45   517  561     61   508  570     77   508  570     93   518  560
+ 46   516  562     62   508  570     78   509  569     94   520  558
+ 47   515  563     63   508  570     79   509  569     95   521  557
+ 48   514  564     64   507  571     80   509  569     96   523  555
+ 49   514  564     65   507  571     81   510  568     97   524  554
+ 50   513  565     66   507  571     82   510  568     98   527  551
+ 51   512  566     67   507  571     83   511  567     99   529  549
+ 52   512  566     68   507  571     84   511  567    100   534  544
 ```
+
+- **Corners, measured under the white rule** (2026-11-08): the top-left and bottom-left marked row by row, the bottom the top mirrored to the pixel (row y ↔ 2399 − y), the right corners taken as the left mirrored; checked in a pitch-black room with every dead pixel's green subpixel alone lit (display op 52 mode 5, all four corners): nothing seen. The smallest glass radius whose mask covers every dead pixel whole at the small corners: 95.25 (`GLASS_RADIUS_AKITA`; 93.5 from the first map, 95 by eye before it). Rows from the top, each row's last dead column (columns 0 through it are dead; row 134 on, none):
+
+0: 133; 1: 122; 2: 114; 3: 108; 4: 103; 5: 99; 6: 95; 7: 91; 8: 88; 9: 85; 10: 82; 11: 80; 12: 77; 13: 75; 14: 73; 15: 71; 16: 69; 17: 67; 18: 65; 19: 63; 20: 61; 21: 60; 22: 58; 23: 57; 24: 55; 25: 54; 26: 52; 27: 51; 28: 50; 29: 48; 30: 47; 31: 46; 32: 45; 33: 43; 34: 42; 35: 41; 36: 40; 37: 39; 38: 38; 39: 37; 40: 36; 41: 35; 42: 34; 43: 33; 44: 32; 45: 32; 46: 31; 47: 30; 48: 29; 49: 28; 50: 28; 51: 27; 52: 26; 53: 25; 54: 25; 55: 24; 56: 23; 57: 23; 58: 22; 59: 21; 60: 21; 61: 20; 62: 19; 63: 19; 64: 18; 65: 18; 66: 17; 67: 17; 68: 16; 69: 16; 70: 15; 71: 15; 72: 14; 73: 14; 74: 13; 75: 13; 76: 12; 77: 12; 78: 11; 79: 11; 80: 11; 81: 10; 82: 10; 83: 9; 84: 9; 85: 9; 86: 8; 87: 8; 88: 8; 89: 7; 90: 7; 91: 7; 92: 6; 93: 6; 94: 6; 95: 6; 96: 5; 97: 5; 98: 5; 99: 5; 100: 4; 101: 4; 102: 4; 103: 4; 104: 3; 105: 3; 106: 3; 107: 3; 108: 3; 109: 2; 110: 2; 111: 2; 112: 2; 113: 2; 114: 2; 115: 1; 116: 1; 117: 1; 118: 1; 119: 1; 120: 1; 121: 1; 122: 1; 123: 0; 124: 0; 125: 0; 126: 0; 127: 0; 128: 0; 129: 0; 130: 0; 131: 0; 132: 0; 133: 0
 
 ## husky's cutout, measured (2026-11-08)
 
