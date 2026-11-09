@@ -2973,8 +2973,8 @@ const SHAPE_CIRCLE: u16 = 0;
 const SHAPE_EDGE: u16 = 1;
 /// The camera hole's knockout (owner, 2026-11-08: "an anti-aliased orange knockout that is as small as possible without touching the dead px", on "the same front/first layer mask with the asymmetric squircle edges"): its base the mask colour, no hairline; listed after the edge's pixels, every column of the row's hole range, so `glass_front` finds one by its column less `hole_l`.
 const SHAPE_HOLE: u16 = 2;
-/// husky's knockout stays off until its hole is measured on its glass (tools/cutout-scan, as akita's was): `ferros_sys::CUTOUT_HOLE` is Android's figure, and a knockout from it could cover live pixels or leave dead ones uncovered. Set true once the measured hole is in.
-const HOLE_HUSKY: bool = false;
+/// husky's knockout: on since its hole was measured on its glass (owner, 2026-11-08, tools/cutout-scan, as akita's was; `ferros_sys::CUTOUT_HOLE`).
+const HOLE_HUSKY: bool = true;
 /// Where the row's pixels in front of the scene begin (the edge's, then the hole's): past the circle's.
 #[inline]
 fn front_split(row_px: &[(u16, u16, u16, u16)]) -> usize {

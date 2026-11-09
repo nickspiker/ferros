@@ -100,12 +100,12 @@ pub fn device_base() -> u8 {
     unsafe { core::ptr::read_volatile((arc_base() + PREFS + PREF_BASE) as *const u8) }
 }
 
-/// The bottom of the camera cutout, in panel rows: a fact of this panel, not a knob. husky's hole is centred at (672, 75) with radius 43.25 at 1344 x 2992 (Android's DisplayCutout for the physical raster), so its bottom edge is row 118.25.
-pub const CUTOUT_BOTTOM: f32 = 118.25;
+/// The bottom of the camera cutout, in panel rows: a fact of this panel, not a knob. husky's (Pixel 8 Pro, 1344 x 2992), measured on the glass (owner, 2026-11-08, tools/cutout-scan: the 5604 pixels the hole hides completely, both sides marked row by row, then checked white on black in a dark room, nothing lit): rows 33 to 116, every row centred on x 671.5 (half a pixel left of the panel's middle), top and bottom mirrored about y 75.0. The knockout is the smallest circle covering every one of them whole, radius 42.96 about (671.5, 75.0) (no centre within half a pixel does better); its bottom edge, row 117.96, is what the app circle is tangent to. Android's DisplayCutout said (672, 75) radius 43.25, bottom 118.25.
+pub const CUTOUT_BOTTOM: f32 = 117.9647;
 /// akita's (Pixel 8a, AK3B at 1080 x 2400), measured on the glass (owner, 2026-11-08, tools/cutout-scan: the 3148 pixels the hole hides completely, marked one by one, then checked white on black in a dark room, nothing lit): rows 37 to 100, every row centred on x 539.5, top and bottom mirror images about y 69.0. The knockout (the glass mask over the hole) is the smallest circle that covers every one of those pixels whole: radius 32.30 about (539.5, 69.0), the farthest dead pixel's centre 31.80 out plus half a pixel, so its antialiased ramp lands only on live pixels. Its bottom edge, row 101.30, is what the app circle is tangent to. Google's overlay (config_mainBuiltInDisplayCutout) says (539.5, 68.71) radius 33.72.
 pub const CUTOUT_BOTTOM_AKITA: f32 = 101.30;
-/// The camera hole's knockout, the glass mask's circle over it: centre and radius in panel pixels (pixel edges: column x spans x..x + 1). husky's is Android's figure until measured on its glass (tools/cutout-scan); akita's measured (`CUTOUT_BOTTOM_AKITA`).
-pub const CUTOUT_HOLE: (f32, f32, f32) = (672.0, 75.0, 43.25);
+/// The camera hole's knockout, the glass mask's circle over it: centre and radius in panel pixels (pixel edges: column x spans x..x + 1). both measured on their glass (`CUTOUT_BOTTOM`, `CUTOUT_BOTTOM_AKITA`).
+pub const CUTOUT_HOLE: (f32, f32, f32) = (671.5, 75.0, 42.9647);
 pub const CUTOUT_HOLE_AKITA: (f32, f32, f32) = (539.5, 69.0, 32.3002);
 
 /// The board fact (SYS_FACTS 84: 1 husky, 2 akita) as first read, 0 until then: it does not change while a process runs.
