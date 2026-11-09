@@ -6346,9 +6346,17 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             }
                             log.s(b"display: op 52 released: the shell again\n");
                         }
-                        1 | 2 | 3 | 4 | 5 | 6 => {
+                        1 | 2 | 3 | 4 | 5 | 6 | 7 => {
                             RAW_HOLD.store(1, Ordering::Release);
-                            if m[1] == 5 || m[1] == 6 {
+                            if m[1] == 7 {
+                                // [7][x u16][y u16]: a white crosshair one pixel wide on black, column x and row y the whole panel (owner, 2026-11-08: "gimme a 1px white crosshair on black so I can look for duty cycle").
+                                let w = |i: usize| m.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize).unwrap_or(0);
+                                let (x, y) = (w(2), w(4));
+                                let mut spans: alloc::vec::Vec<(usize, usize, usize)> = (0..height).map(|r| (r, x, x)).collect();
+                                spans.push((y, 0, width - 1));
+                                raw_green(width, height, &spans, true);
+                                log.s(alloc::format!("display: op 52 crosshair at ({x}, {y})\n").as_bytes());
+                            } else if m[1] == 5 || m[1] == 6 {
                                 // [5] then per span [row u16][first column u16][last column u16], whole pixels.
                                 let w = |i: usize| m.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize).unwrap_or(0);
                                 let spans: alloc::vec::Vec<(usize, usize, usize)> = (0..(m.len() - 2) / 6).map(|k| (w(2 + 6 * k), w(4 + 6 * k), w(6 + 6 * k))).collect();
