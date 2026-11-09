@@ -178,6 +178,8 @@ const TEXT: u16 = 16384;
 const QUIET: u16 = 7000;
 /// A pill under a finger (the network page's rows and buttons): about twice the brightest pill at rest.
 const PRESSED: u64 = 1 << 13;
+/// The flat dark grey behind the network picked on the network page.
+const SELECTED: u64 = 1 << 11;
 
 global_asm!(
     r#"
@@ -467,6 +469,8 @@ struct Ahau {
     nets: [u8; 1 << 11],
     nets_len: usize,
     pick: ([u8; 32], usize),
+    /// The filter as typed when a network was picked (bytes, length, characters), back in the text box on `back`.
+    filter: ([u8; 128], usize, usize),
     joining: bool,
     /// The network page's element under a finger, lit while it is held (0 the button, 1 `back`, 16 + k the list's row k): it acts when the finger lifts still on it (`net_release`), however it moved meanwhile, so a tap that wandered is not taken for a drag.
     pressed: core::cell::Cell<Option<u8>>,
@@ -560,6 +564,11 @@ impl Ahau {
         (self.w / 2, top + r, r)
     }
     fn status_at(&self) -> (usize, usize) {
+        // On the network page the status sits just over the buttons (its three lines' rows and a sixty-fourth of the width above them), and the list runs down to it.
+        if self.net_open() {
+            let px = self.k(self.w / 34);
+            return (self.button_top() - px * 31 / 10 - self.w / 64, px);
+        }
         let (_, cy, r) = self.mark_at();
         (cy + r + self.w / 16, self.k(self.w / 34))
     }
@@ -589,7 +598,7 @@ impl Ahau {
 
     /// Whether the screen takes a handle now: the first entry, and the mint's second. Elsewhere (looking, the words, no answer, wrong) there is no text box and keys type nothing.
     fn typing(&self) -> bool {
-        matches!(self.mode, Mode::Fresh | Mode::Mint(_) | Mode::Words(_) | Mode::Pass)
+        matches!(self.mode, Mode::Fresh | Mode::Mint(_) | Mode::Words(_) | Mode::Networks | Mode::Pass)
     }
 
     /// Whether a step back to the entry exists: from any step after a first entry (owner, 2026-10-28: "we need a way to go back to the previous screen").
@@ -640,7 +649,9 @@ impl Ahau {
             Mode::Words(_) => Some("cancel"),
             Mode::Networks if !self.joining => Some("scan"),
             Mode::Networks if self.joining => Some("joining"),
-            Mode::Pass => Some("join"),
+            // Only a network this device can join (WPA2-PSK outside 6 GHz) gets a join.
+            Mode::Pass if self.net_found().is_some_and(|f| f.1 & 1 != 0) => Some("join"),
+            Mode::Pass => None,
             Mode::Looking(_) | Mode::Join(_) | Mode::Grey(_) | Mode::Hosting | Mode::Networks => None,
         }
     }
@@ -679,6 +690,10 @@ impl Ahau {
     /// The entry's baseline and size: above the button, an entry size over its top, so a larger scale grows them upward, never into the keyboard (2026-11-09: grown downward, a scaled-up button's foot ran into the keyboard's rows and stayed there as a line).
     fn entry_at(&self) -> (usize, usize) {
         let px = self.k(self.w / 16);
+        // On the network page the text box is at the top: the filter, then the passphrase (owner, 2026-11-09).
+        if self.net_open() {
+            return (self.net_top() + px * 3 / 2, px);
+        }
         (self.button_top() - px, px)
     }
 
@@ -1044,9 +1059,11 @@ impl Ahau {
     fn rescale(&self) {
         let (_, cy, r) = self.mark_at();
         let (y0, y1) = (cy + r + 2, self.kb.top);
-        // The network page's list is sized by the scale too.
+        // The network page is laid out from top to buttons by the scale: drawn whole again.
         if self.net_open() {
-            self.net_draw();
+            self.all();
+            self.show();
+            return;
         }
         // Cleared in the buffer only: each piece composes its own band and shows it whole, then the region is shown once more from the buffer, which now holds their text too, so what a smaller size no longer covers goes black with no frame of it blank in between.
         self.surf()[y0 * self.w..y1 * self.w].fill(0);
@@ -1114,10 +1131,12 @@ impl Ahau {
     /// From the passphrase back to the list.
     fn net_list(&mut self) {
         self.zero_text();
+        // The filter as it was when the network was picked.
+        let (f, n, chars) = self.filter;
+        self.handle[..n].copy_from_slice(&f[..n]);
+        (self.len, self.chars, self.caret) = (n, chars, n);
         self.mode = Mode::Networks;
-        self.entry();
-        self.button();
-        self.net_status();
+        self.all();
     }
 
     /// The text box emptied, its bytes overwritten (a passphrase never lingers in memory).
@@ -1150,12 +1169,25 @@ impl Ahau {
         None
     }
 
-    /// The list's rows: their size, pitch, the first row's baseline and the list's foot, inside the mark's square below its top three eighths (the console's circles run along the top of the glass, over the mark's top).
-    fn net_rows(&self) -> (usize, usize, usize, usize) {
+    /// The page's top: below the console's circles, which run along the top of the glass over the mark's top three eighths. The text box sits here (`entry_at`), the list or the network picked under it (owner, 2026-11-09: "textbox needs to go up top to filter the networks").
+    fn net_top(&self) -> usize {
         let (_, cy, r) = self.mark_at();
+        cy - r * 5 / 8
+    }
+
+    /// The list's rows: their size, pitch, the first row's baseline and the list's foot (the band's), under the text box.
+    fn net_rows(&self) -> (usize, usize, usize, usize) {
+        let (b, epx) = self.entry_at();
         let px = self.k(self.w / 24);
         let pitch = px * 2;
-        (px, pitch, cy - r * 5 / 8 + pitch, cy + r)
+        (px, pitch, b + epx / 2 + px * 11 / 8, self.net_band().1)
+    }
+
+    /// The rows' band: from under the text box down to the status line's rows.
+    fn net_band(&self) -> (usize, usize) {
+        let (b, epx) = self.entry_at();
+        let (sb, spx) = self.status_at();
+        (b + epx / 2, sb - spx * 3 / 2)
     }
 
     /// Row `k`'s pill (x0, y0, x1, y1): three quarters of the pitch tall, centred on its text's middle (a third of an em above the baseline), across all but a sixteenth of the width each side.
@@ -1165,23 +1197,57 @@ impl Ahau {
         (self.w / 16, mid - pitch * 3 / 8, self.w * 15 / 16, mid + pitch * 3 / 8)
     }
 
-    /// Whether row `k` is the network picked.
-    fn net_picked(&self, k: usize) -> bool {
-        self.net_entry(k).is_some_and(|(name, _, _)| name == &self.pick.0[..self.pick.1])
+    /// Whether `name` holds the filter as typed, letters matched either case (an empty filter holds every name).
+    fn net_matches(&self, name: &[u8]) -> bool {
+        let f = &self.handle[..self.len];
+        f.is_empty() || name.windows(f.len()).any(|w| w.eq_ignore_ascii_case(f))
     }
 
-    /// The row whose pill holds `y`, if a network is listed there and its row is shown.
-    fn net_row_at(&self, y: i64) -> Option<usize> {
-        let (px, pitch, first, foot) = self.net_rows();
-        let mut k = 0;
-        while self.net_entry(k).is_some() && first + k * pitch + px / 2 <= foot {
-            let (_, y0, _, y1) = self.net_row_rect(k);
-            if (y0 as i64..y1 as i64).contains(&y) {
-                return Some(k);
+    /// The `k`th network the filter lets through, as `net_entry` gives it.
+    fn net_visible(&self, k: usize) -> Option<(&[u8], i8, u8)> {
+        let mut seen = 0;
+        let mut j = 0;
+        while let Some(e) = self.net_entry(j) {
+            if self.net_matches(e.0) {
+                if seen == k {
+                    return Some(e);
+                }
+                seen += 1;
             }
-            k += 1;
+            j += 1;
         }
         None
+    }
+
+    /// The network picked, as the last scan has it (signal and flags), if it was seen.
+    fn net_found(&self) -> Option<(i8, u8)> {
+        let pick = &self.pick.0[..self.pick.1];
+        let mut j = 0;
+        while let Some((name, dbm, flags)) = self.net_entry(j) {
+            if name == pick {
+                return Some((dbm, flags));
+            }
+            j += 1;
+        }
+        None
+    }
+
+    /// How many rows are shown: the networks the filter lets through, as many as fit above the list's foot.
+    fn net_shown(&self) -> usize {
+        let (px, pitch, first, foot) = self.net_rows();
+        let mut k = 0;
+        while self.net_visible(k).is_some() && first + k * pitch + px / 2 <= foot {
+            k += 1;
+        }
+        k
+    }
+
+    /// The row whose pill holds `y`, among the rows shown.
+    fn net_row_at(&self, y: i64) -> Option<usize> {
+        (0..self.net_shown()).find(|&k| {
+            let (_, y0, _, y1) = self.net_row_rect(k);
+            (y0 as i64..y1 as i64).contains(&y)
+        })
     }
 
     /// The screen's element under (x, y), as `pressed` names them: the button, `back`, or on the network page a row (rows only while no join runs).
@@ -1208,7 +1274,7 @@ impl Ahau {
         }
     }
 
-    /// A finger down on the page: the element under it lit at once.
+    /// A finger down: the element under it lit at once.
     fn net_press(&self, x: i64, y: i64) -> bool {
         let Some(e) = self.net_hit(x, y) else { return false };
         self.pressed.set(Some(e));
@@ -1226,7 +1292,7 @@ impl Ahau {
         }
     }
 
-    /// The finger lifted: the element it was still on acts (the button scans or joins, `back` steps back, a row is picked).
+    /// The finger lifted: the element it was still on acts (the button scans, joins or attests, `back` steps back, a row is picked).
     fn net_release(&mut self) {
         let Some(e) = self.pressed.take() else { return };
         self.net_redraw(e);
@@ -1250,54 +1316,101 @@ impl Ahau {
         }
     }
 
-    /// The list drawn where the mark was: each network's name (bright when this device can join it, quiet otherwise) and, at the right, its signal in dBm, or `kept` for the one the device keeps.
+    /// Under the text box: the networks the filter lets through (each a pill: its name, bright when this device can join it, quiet otherwise, and at the right its signal in dBm, or `kept` for the one the device keeps), or, once one is picked, that network alone, lit, with what the scan knows of it.
     fn net_draw(&self) {
-        let (_, cy, r) = self.mark_at();
-        let (y0, y1) = (cy - r - 2, cy + r + 2);
+        let (y0, y1) = self.net_band();
         self.surf()[y0 * self.w..y1 * self.w].fill(0);
-        // Each row a pill behind its text: quiet, brighter for the network picked (its passphrase being typed, or joining), brightest under a finger (`pressed`).
         let (px, pitch, first, foot) = self.net_rows();
-        let mut k = 0;
-        while self.net_entry(k).is_some() && first + k * pitch + px / 2 <= foot {
-            let (_, ry0, _, ry1) = self.net_row_rect(k);
-            let picked = self.net_picked(k) && (self.mode == Mode::Pass || self.joining);
-            let fill = if self.pressed.get() == Some(16 + k as u8) { PRESSED } else if picked { 3600 } else { 1000 };
-            pill(self.surf(), self.w, self.w / 16, ry0, self.w * 15 / 16, ry1, fill, px);
-            k += 1;
+        let picked = self.mode == Mode::Pass || self.joining;
+        // The rows are text, not buttons (owner, 2026-11-09: "No buttons for the network, just a solid dark grey fill behind selected with bold text"): one flat dark grey behind the network picked, or behind the row under a finger while it is held.
+        let lit = if picked { Some(0) } else { self.pressed.get().filter(|&e| e >= 16).map(|e| (e - 16) as usize) };
+        if let Some(k) = lit {
+            let (x0, ry0, x1, ry1) = self.net_row_rect(k);
+            for y in ry0..ry1 {
+                self.surf()[y * self.w + x0..y * self.w + x1].fill(grey(SELECTED));
+            }
         }
         self.compose(y0, y1, || {
-            let mut k = 0;
-            while let Some((name, dbm, flags)) = self.net_entry(k) {
-                let b = first + k * pitch;
-                if b + px / 2 > foot {
-                    break;
-                }
-                let mut l = Line::new();
-                if flags & (1 << 4) != 0 {
-                    let _ = core::fmt::Write::write_str(&mut l, "kept");
-                } else {
-                    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("{dbm} dBm"));
-                }
-                let x = (self.w * 7 / 8) as i64 - self.measure(px, l.as_bytes()) / 4;
-                window::text(self.display, self.text_to.get(), x as i16, b as i16, px as u16, QUIET, l.as_bytes());
-                // The name up to half an em short of the signal: one too long for that (at a large scale) loses its end to "...".
-                let (mut shown, mut n) = printable(name);
-                let room = x - (self.w / 8) as i64 - (px / 2) as i64;
-                if self.measure(px, &shown[..n]) / 4 > room {
-                    while n > 0 {
-                        n -= 1;
-                        shown[n..n + 3].copy_from_slice(b"...");
-                        if self.measure(px, &shown[..n + 3]) / 4 <= room {
-                            break;
+            if picked {
+                let found = self.net_found();
+                self.net_row_text(0, &self.pick.0[..self.pick.1], found.map(|f| f.0), found.map_or(0, |f| f.1), true);
+                // What the scan knows of it, a line each under its pill.
+                let mut lines: [Line; 4] = core::array::from_fn(|_| Line::new());
+                let mut n = 0;
+                match found {
+                    None => {
+                        let _ = core::fmt::Write::write_str(&mut lines[0], "Not seen in the last scan.");
+                        n = 1;
+                    }
+                    Some((dbm, flags)) => {
+                        let _ = core::fmt::Write::write_fmt(&mut lines[n], format_args!("Signal {dbm} dBm"));
+                        n += 1;
+                        let bands = [(5, "2.4 GHz"), (3, "5 GHz"), (6, "6 GHz")];
+                        let mut first_band = true;
+                        for (bit, name) in bands {
+                            if flags >> bit & 1 != 0 {
+                                let _ = core::fmt::Write::write_str(&mut lines[n], if first_band { "" } else { ", " });
+                                let _ = core::fmt::Write::write_str(&mut lines[n], name);
+                                first_band = false;
+                            }
+                        }
+                        if !first_band {
+                            n += 1;
+                        }
+                        let _ = core::fmt::Write::write_str(&mut lines[n], if flags & 1 != 0 { "WPA2 personal" } else if flags & 2 != 0 { "Open: not joined by this device yet" } else { "WPA3, enterprise or WEP: not joined by this device yet" });
+                        n += 1;
+                        if flags & (1 << 4) != 0 {
+                            let _ = core::fmt::Write::write_str(&mut lines[n], "Kept on this device");
+                            n += 1;
                         }
                     }
-                    n += 3;
                 }
-                let v = if flags & 1 != 0 { TEXT } else { QUIET };
-                window::text(self.display, self.text_to.get(), (self.w / 8) as i16, b as i16, px as u16, v, &shown[..n]);
-                k += 1;
+                for (j, l) in lines[..n].iter().enumerate() {
+                    let b = first + pitch + j * px * 3 / 2;
+                    if b + px / 2 > foot {
+                        break;
+                    }
+                    window::text(self.display, self.text_to.get(), (self.w / 8) as i16, b as i16, px as u16, QUIET, l.as_bytes());
+                }
+            } else {
+                for k in 0..self.net_shown() {
+                    let Some((name, dbm, flags)) = self.net_visible(k) else { break };
+                    self.net_row_text(k, name, Some(dbm), flags, lit == Some(k));
+                }
             }
         });
+    }
+
+    /// Row `k`'s text: the name at the left (bright when joinable or picked), the signal (or `kept`) at the right; a name too long for the row at the scale ends in "..." short of the signal.
+    fn net_row_text(&self, k: usize, name: &[u8], dbm: Option<i8>, flags: u8, lit: bool) {
+        let (px, pitch, first, _) = self.net_rows();
+        let b = first + k * pitch;
+        let mut l = Line::new();
+        if flags & (1 << 4) != 0 {
+            let _ = core::fmt::Write::write_str(&mut l, "kept");
+        } else if let Some(d) = dbm {
+            let _ = core::fmt::Write::write_fmt(&mut l, format_args!("{d} dBm"));
+        }
+        let x = (self.w * 7 / 8) as i64 - self.measure(px, l.as_bytes()) / 4;
+        window::text(self.display, self.text_to.get(), x as i16, b as i16, px as u16, QUIET, l.as_bytes());
+        let (mut shown, mut n) = printable(name);
+        let room = x - (self.w / 8) as i64 - (px / 2) as i64;
+        if self.measure(px, &shown[..n]) / 4 > room {
+            while n > 0 {
+                n -= 1;
+                shown[n..n + 3].copy_from_slice(b"...");
+                if self.measure(px, &shown[..n + 3]) / 4 <= room {
+                    break;
+                }
+            }
+            n += 3;
+        }
+        let v = if lit || flags & 1 != 0 { TEXT } else { QUIET };
+        window::text(self.display, self.text_to.get(), (self.w / 8) as i16, b as i16, px as u16, v, &shown[..n]);
+        // Bold, as the typeface has no heavier weight: the name drawn again a twenty-fourth of an em to the right.
+        if lit {
+            window::text(self.display, self.text_to.get(), (self.w / 8 + px.div_ceil(24)) as i16, b as i16, px as u16, v, &shown[..n]);
+        }
     }
 
     /// The page's status line: what it is doing, or what to do.
@@ -1309,10 +1422,14 @@ impl Ahau {
         let count = if self.nets_len >= 2 { self.nets[1] } else { 0 };
         let _ = match self.mode {
             _ if self.joining => core::fmt::Write::write_fmt(&mut l, format_args!("Joining {name}.")),
-            Mode::Pass => core::fmt::Write::write_fmt(&mut l, format_args!("The passphrase for {name}.")),
-            _ if count == 0 && (scanning || self.nets_len == 0) => core::fmt::Write::write_str(&mut l, "Looking for networks."),
+            Mode::Pass if self.button_label().is_some() => core::fmt::Write::write_fmt(&mut l, format_args!("The passphrase for {name}.")),
+            Mode::Pass if self.net_found().is_none() => core::fmt::Write::write_fmt(&mut l, format_args!("{name} is out of reach.")),
+            Mode::Pass => core::fmt::Write::write_fmt(&mut l, format_args!("{name} needs a kind of security this device cannot join yet.")),
+            _ if self.nets_len == 0 => core::fmt::Write::write_str(&mut l, "The WiFi is starting."),
+            _ if count == 0 && scanning => core::fmt::Write::write_str(&mut l, "Looking for networks."),
             _ if count == 0 => core::fmt::Write::write_str(&mut l, "No networks found."),
-            _ => core::fmt::Write::write_str(&mut l, "Tap a network to join it."),
+            _ if self.net_visible(0).is_none() => core::fmt::Write::write_str(&mut l, "No network matches."),
+            _ => core::fmt::Write::write_str(&mut l, "Type to narrow the list, tap a network to join it."),
         };
         self.status(core::str::from_utf8(l.as_bytes()).unwrap_or(""));
     }
@@ -1342,24 +1459,19 @@ impl Ahau {
 
     /// A network picked: its passphrase is typed next.
     fn net_pick(&mut self, k: usize) {
-        let Some((name, _, flags)) = self.net_entry(k) else { return };
+        let Some((name, _, _)) = self.net_visible(k) else { return };
         let n = name.len();
         let mut pick = [0u8; 32];
         pick[..n].copy_from_slice(name);
         self.pick = (pick, n);
-        if flags & 1 == 0 {
-            // Not WPA2-PSK outside 6 GHz: open, WPA3 only, enterprise, WEP. The driver joins none of those yet.
-            let shown = printable(&pick[..n]);
-            let mut l = Line::new();
-            let _ = core::fmt::Write::write_fmt(&mut l, format_args!("{} needs a kind of security this device cannot join yet.", core::str::from_utf8(&shown.0[..shown.1]).unwrap_or("")));
-            self.status(core::str::from_utf8(l.as_bytes()).unwrap_or(""));
-            return;
-        }
+        // The filter kept for `back`; the text box takes the passphrase.
+        // 32 characters of up to four bytes each (`type_char`'s limit for the filter).
+        let mut f = [0u8; 128];
+        f[..self.len].copy_from_slice(&self.handle[..self.len]);
+        self.filter = (f, self.len, self.chars);
         self.zero_text();
         self.mode = Mode::Pass;
-        self.net_status();
-        self.entry();
-        self.button();
+        self.all();
     }
 
     /// JOIN: the network picked and the passphrase typed, handed to the WiFi driver, which keeps them and joins (the page then waits for the link: `net_poll`). The request's bytes and the text box overwritten after.
@@ -1400,24 +1512,29 @@ impl Ahau {
     /// The page's poll (about four times a second): while a join runs, its outcome (the data link up closes the page; the driver answering STATUS again with no link means it failed); otherwise the list, while a scan fills it.
     fn net_poll(&mut self) -> bool {
         if !self.joining {
-            return self.nets_len >= 1 && self.nets[0] == 1 && self.net_ask(&[4]);
+            // No answer yet (owner, 2026-11-09: "I waited there for a minute, then I pressed scan and it immediately populated"): the driver was not serving `wlan` yet when the page asked (it serves once its chip is up and any kept network joined), so the scan is asked for again each poll until it answers; then the list is read while its scan runs.
+            if self.nets_len == 0 {
+                return self.net_ask(&[4, 1]);
+            }
+            return self.nets[0] == 1 && self.net_ask(&[4]);
         }
-        if ferros_sys::data_link_up(&ferros_sys::facts()) {
+        // While it joins, the driver answers nothing (a call would hold this screen until the join ended): its WiFi link's measures in the facts say how it goes. STATE 2: joined (the page closes; the address follows). JOIN 1-3: it failed, and why.
+        let f = ferros_sys::facts();
+        let wifi = |kind: u16| f.0[33 + 8..41 + 8].iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == kind).map(|m| m.1);
+        if wifi(ferros_sys::measure::STATE) == Some(2) {
             self.net_close();
             return true;
         }
-        let mut out = [0u8; 64];
-        let r = ferros_sys::call_live(cap(self.grants, S_WLAN), &[6], &mut out);
-        // Not answering: still joining. Joined (state 2): the link comes with its address.
-        if r == ferros_sys::ERR || r < 2 || out[0] != 0 {
-            return false;
-        }
+        let outcome = match wifi(ferros_sys::measure::JOIN) {
+            Some(o @ 1..=3) => o,
+            _ => return false,
+        };
         self.joining = false;
         self.mode = Mode::Pass;
         let shown = printable(&self.pick.0[..self.pick.1]);
         let name = core::str::from_utf8(&shown.0[..shown.1]).unwrap_or("");
         let mut l = Line::new();
-        let _ = match out[1] {
+        let _ = match outcome {
             1 => core::fmt::Write::write_fmt(&mut l, format_args!("{name} is out of reach.")),
             3 => core::fmt::Write::write_fmt(&mut l, format_args!("{name} did not answer. Try again.")),
             _ => core::fmt::Write::write_fmt(&mut l, format_args!("{name} refused the passphrase.")),
@@ -1963,7 +2080,7 @@ impl Ahau {
 
     /// A finger is down on `key`: the handle as that key would make it goes to the mark's thread now, so its frame is ready by the lift; the text itself changes only at the lift (`tap`). The key's effect is found on a copy of the keyboard (its shift and page are the real one's), so nothing here changes until the tap.
     fn preview(&self, key: Key) {
-        if !self.typing() || matches!(self.mode, Mode::Words(_) | Mode::Pass) {
+        if !self.typing() || matches!(self.mode, Mode::Words(_) | Mode::Networks | Mode::Pass) {
             return;
         }
         let mut kb = self.kb.clone();
@@ -1993,6 +2110,8 @@ impl Ahau {
             Mode::Words(_) => WORD_CHARS,
             // WPA2's longest passphrase.
             Mode::Pass => 63,
+            // A filter on names, which are 32 bytes at most.
+            Mode::Networks => 32,
             _ => MAX_CHARS,
         };
         self.caret = insert_at(&mut self.handle, &mut self.len, &mut self.chars, self.caret, c, limit);
@@ -2014,6 +2133,17 @@ impl Ahau {
                 return;
             }
             Some(Event::Leave) if self.mode == Mode::Pass => {
+                self.zero_text();
+                self.entry();
+            }
+            // The filter: enter picks the one network it leaves, clear empties it.
+            Some(Event::Enter) if self.mode == Mode::Networks => {
+                if self.net_visible(0).is_some() && self.net_visible(1).is_none() {
+                    self.net_pick(0);
+                }
+                return;
+            }
+            Some(Event::Leave) if self.mode == Mode::Networks => {
                 self.zero_text();
                 self.entry();
             }
@@ -2045,8 +2175,12 @@ impl Ahau {
         }
         // Every stroke: the keys take the new handle's rainbow, laid on from the board in one pass; a letter that ended a one-letter shift brings the lower-case board, drawn at its press. A passphrase leaves the handle's rainbow as it was: the keys would otherwise show a hash of it.
         let t = now();
-        if self.mode != Mode::Pass {
+        if !self.net_open() {
             self.retint();
+        } else if self.mode == Mode::Networks {
+            // The filter changed: the list follows.
+            self.net_draw();
+            self.net_status();
         }
         unsafe { LIFT_US[0] = now().wrapping_sub(t) * 1_000_000 / freq() };
         self.show_board();
@@ -2444,7 +2578,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), joining: false, pressed: core::cell::Cell::new(None) };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None) };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     start_fresh_mark(grants, w / 3);
     a.retint();

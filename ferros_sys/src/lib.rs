@@ -222,6 +222,8 @@ pub mod measure {
     pub const HEADING: u16 = 36;
     /// USB: the link's power state (0 U0 working, 1 U1, 2 U2, 3 U3 suspended).
     pub const LINK_POWER: u16 = 37;
+    /// WiFi: a join the network page handed in (pcie1 JOIN): 0 running, then its outcome if it failed: 1 no WPA2-PSK network of that name in range, 2 refused (a wrong passphrase among the reasons), 3 timed out. A join that succeeds shows as STATE 2 instead. The page reads it from the facts, so it never calls a driver that is busy joining.
+    pub const JOIN: u16 = 38;
 }
 
 /// The links' control blocks (docs/RADIO-CONTROLS.md): which link, and what each slot of it means. Slot 0 of every block is its generation (counted up by every set); 1-15 the knobs, all ones (`UNSET`) for the driver's own default. A value knob is kept in the settings document; an action is a counter the page counts up and the driver acts on once.

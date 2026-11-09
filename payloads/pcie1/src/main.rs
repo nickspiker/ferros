@@ -1258,7 +1258,7 @@ struct Msgbuf {
     personal: bool,
 }
 
-/// A network as the page shows it: its name, the strongest signal seen (dBm), and flags: bit 0 joinable here (WPA2-PSK outside 6 GHz), bit 1 open, bit 2 other security (WEP, WPA, SAE only, enterprise), bit 3 seen on 5 GHz.
+/// A network as the page shows it: its name, the strongest signal seen (dBm), and flags: bit 0 joinable here (WPA2-PSK outside 6 GHz), bit 1 open, bit 2 other security (WEP, WPA, SAE only, enterprise), bits 3, 5 and 6 seen on 5, 2.4 and 6 GHz.
 #[derive(Clone, Copy)]
 struct Net {
     name: [u8; 32],
@@ -1710,7 +1710,12 @@ impl Msgbuf {
             return;
         }
         let name: [u8; 32] = core::array::from_fn(|k| if k < n { dbr(bi + 19 + k as u32) } else { 0 });
-        let five = if cs & 0xC000 == 0xC000 { 8 } else { 0 };
+        // The band it was seen on (chanspec bits 14-15: 0 2.4 GHz, 1 6 GHz, 3 5 GHz): bit 5, bit 6 and bit 3 of the flags.
+        let five = match cs & 0xC000 {
+            0 => 1 << 5,
+            0x4000 => 1 << 6,
+            _ => 1 << 3,
+        };
         let g = self.scan_gen;
         if let Some(e) = self.nets[..self.nnets].iter_mut().find(|e| e.len as usize == n && e.name == name) {
             // First sight in this scan: the entry starts over; then the strongest BSS of the name.
@@ -2393,6 +2398,8 @@ fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, skip: &Option<(Vec<u8>, Vec<u8>, 
     d.flush();
     // The corners' WiFi circle: up, no link.
     ferros_sys::status(0, ferros_sys::measure_word(ferros_sys::measure::STATE, 1));
+    // The last join's outcome for the network page (measure JOIN), when one failed; nothing before any.
+    ferros_sys::status(1, if (1..=3).contains(&m.outcome) { ferros_sys::measure_word(ferros_sys::measure::JOIN, m.outcome as i64) } else { ferros_sys::MEASURE_NONE });
     let mut msg = [0u8; 256];
     let mut out = [0u8; 2048];
     let mut tok = [0u8; 32];
@@ -2473,6 +2480,10 @@ fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, skip: &Option<(Vec<u8>, Vec<u8>, 
             Some(6) => m.status_reply(if scanning { 1 } else { 0 }, &mut out),
             _ => 0,
         };
+        // The join under way, for the page (measure JOIN 0), published before the reply: the page reads the facts, not this driver, until the join ends, and must never see an older outcome as this one's.
+        if handed.is_some() {
+            ferros_sys::status(1, ferros_sys::measure_word(ferros_sys::measure::JOIN, 0));
+        }
         svc(3, tok.as_ptr() as u64 - d.base, out.as_ptr() as u64 - d.base, len as u64, 0, 0);
         if let Some((name, pass, key)) = handed {
             d.put(b"a network handed in by the page: joining\n");
