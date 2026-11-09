@@ -60,6 +60,23 @@ Plan step 0's part that needs no AK3B command is built (payloads/display; docs/B
 
 Still the owner's: the three questions below, and a look at the glass (the picture under the 10 bpc blend has been seen only by the logs).
 
+## Refresh rate and power, measured (2026-11-08)
+
+Display op 7 on akita (`[7, fps, rate byte]`) sends Google's ak3b_change_frequency sequence with any rate byte and sets DSIM's TE timers for fps. HS120 (`60 00 00`, `B9 31`) runs: the server logs 120 frame starts a second (DECON still triggered on every TE). HS60 (`60 08 00`) and NS60 (`60 18 00`) both come back to 60. A reboot returns to ABL's 60.
+
+Whole-device draw from the fuel gauge (`diag power`, 16 s windows, charger cut, the bind screen at rest, mostly black, DBV 3175, clocks as the policy left them); the PMIC rail meters do not work on akita (every rail resets under the read):
+
+| rate | windows | mean |
+|---|---|---|
+| HS60 | 1600, 1641, 1586, 1694 mW | 1630 mW |
+| HS120 | 1842, 1789, 1814, 1771, 1837 mW | 1811 mW |
+| NS60 | 1608 mW | |
+| ABL's 60 at boot | 1640, 1790 mW | |
+
+- **120 Hz at rest costs about 180 mW over 60** (the paired windows 143-185 mW apart; about 11 % of the device at rest). Window-to-window noise is about ±50 mW, so NS60 against HS60 is not resolved.
+- Part of it is the link: akita's panel does not hold a sent frame, so DECON sends the whole frame every TE, 120 frames a second over DSI at 120 even when nothing changes. If the panel can be made to refresh from its own memory (the single-frame question above), 120 at rest would cost the panel's scanning only.
+- Measured on a dark screen. A bright one may move the gap (the emission's duty and pulses per frame per mode are unmeasured).
+
 ## Proposed plan
 
 0. **The display server on akita**:

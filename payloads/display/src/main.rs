@@ -6675,6 +6675,19 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     let r = dsi.dcs(&[0xF0, 0x5A, 0x5A]).and_then(|_| dsi.dcs(&[0x51, (dbv >> 8) as u8, dbv as u8])).and_then(|_| dsi.dcs(&[0xF0, 0xA5, 0xA5]));
                     out[0] = r.is_err() as u8 * 3;
                 }
+                // akita's refresh (owner, 2026-11-08: "Let's do some power checks and bringup checks"): `[7, fps, rate byte]`, AK3B's frequency select as Google's ak3b_change_frequency sends it (test key on, `60 <byte> 00`, TE select `B9 31` at 120 else `B9 30`, `F7 0F` frequency update, test key off), then DSIM's TE timers for fps. The byte is the panel's: G#00 HS120, G#08 HS60, G#18 NS60; any other is a probe (docs/AK3B.md), read back by the frame starts a second the server logs.
+                Some(7) if m.len() >= 3 && akita => {
+                    let fps = m[1] as u32;
+                    let te = if fps == 120 { 0x31 } else { 0x30 };
+                    let script = [0x39, 3, 0xF0, 0x5A, 0x5A, 0, 0x39, 3, 0x60, m[2], 0x00, 0, 0x15, 2, 0xB9, te, 0, 0x15, 2, 0xF7, 0x0F, 0, 0x39, 3, 0xF0, 0xA5, 0xA5, 0];
+                    let (_, fail) = dsi.sequence(&script);
+                    // WHY the guard: fps is the host's; the TE timers divide by it.
+                    if fps != 0 {
+                        dsi.set_cmd_te(fps, hs_mbps, width as u32);
+                    }
+                    log.s(alloc::format!("display: akita refresh: 60 {:02X} 00, TE select {:02X}, DSIM timers for {} Hz{}\n", m[2], te, fps, if fail.is_some() { ", a packet failed" } else { "" }).as_bytes());
+                    out[0] = fail.is_some() as u8 * 3;
+                }
                 // 7 and 8 are HK3's scripts: refused on akita (`_`).
                 Some(7) if m.len() >= 2 && !akita => {
                     let (script, fps) = match m[1] {
