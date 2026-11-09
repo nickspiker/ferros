@@ -6346,6 +6346,20 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                                 if x < width && y < height {
                                     raw_dot(width, height, x, y);
                                 }
+                                // Then the points the person has logged, white too, whole pixels [x u16][y u16] each after the dot (owner, 2026-11-08: "wherever we log, can we leave it white? would be nice to see where I marked").
+                                let w = |i: usize| m.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize).unwrap_or(usize::MAX);
+                                let white = pack10(1020, 1020, 1020);
+                                let mut i = 6;
+                                while i + 4 <= m.len() {
+                                    let (px, py) = (w(i), w(i + 2));
+                                    // WHY the bounds: the points are the host's; one off the panel is skipped.
+                                    if px < width && py < height {
+                                        for k in 0..PHASES {
+                                            phase_slice(k, width * height)[py * width + px] = white;
+                                        }
+                                    }
+                                    i += 4;
+                                }
                                 log.s(alloc::format!("display: op 52 dot at ({x}, {y})\n").as_bytes());
                             } else if m[1] == 1 {
                                 let g = v(2);

@@ -19,8 +19,14 @@ fn u16hex(v: i64) -> String {
     format!("{:02X}{:02X}", n & 0xFF, n >> 8)
 }
 
-fn dot(x: i64, y: i64) {
-    send(&format!("3403{}{}", u16hex(x), u16hex(y)));
+/// The dot, then every logged point (whole pixels), white on the glass so the person sees where they marked. The display takes a message of 4 KiB: the last thousand points at most.
+fn dot(x: i64, y: i64, points: &[(i64, i64)]) {
+    let mut m = format!("3403{}{}", u16hex(x), u16hex(y));
+    let from = points.len().saturating_sub(1000);
+    for &(px, py) in &points[from..] {
+        m.push_str(&format!("{:02X}{:02X}{:02X}{:02X}", px & 0xFF, (px >> 8) & 0xFF, py & 0xFF, (py >> 8) & 0xFF));
+    }
+    send(&m);
 }
 
 /// The terminal in raw mode for the keys, put back on the way out.
@@ -58,7 +64,7 @@ fn main() {
         print!("\r\x1b[2K{s}");
         let _ = std::io::stdout().flush();
     };
-    dot(x, y);
+    dot(x, y, &points);
     say(format!("dot at ({x}, {y})  points logged 0"));
     let mut stdin = std::io::stdin();
     let mut b = [0u8; 3];
@@ -82,12 +88,13 @@ fn main() {
                     let _ = f.flush();
                 }
                 say(format!("dot at ({x}, {y})  logged ({x}, {y}), points logged {}", points.len()));
+                dot(x, y, &points);
                 continue;
             }
             [b'q'] | [3] => break,
             _ => continue,
         }
-        dot(x, y);
+        dot(x, y, &points);
         say(format!("dot at ({x}, {y})  points logged {}", points.len()));
     }
     drop(raw);
