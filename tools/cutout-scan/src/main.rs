@@ -1,6 +1,6 @@
 //! The camera cutout mapped on the glass (owner, 2026-11-08: the glass's pixels are on or off; he marks a solid area that is completely obscured). The display draws one white pixel on black (op 52 mode 3, through the capture payload, about 40 ms a step); the keys move it and space logs where it is.
 //!
-//! Keys: ← → ↑ ↓ one pixel, [ ] five across; space logs the dot's (x, y) (owner, 2026-11-08: "Strictly log the xy when I press space"); q prints every logged point and leaves (the display released).
+//! Keys: ← → ↑ ↓ one pixel, [ ] five across; space logs the dot's (x, y) (owner, 2026-11-08: "Strictly log the xy when I press space"), kept white on the glass; h turns that hold off and on (--no-hold starts with it off); q prints every logged point and leaves (the display released).
 //!
 //! Usage: tools/cutout-scan/target/release/cutout-scan [x y]   (the start, panel pixels; default above akita's cutout)
 use std::io::{Read, Write};
@@ -20,7 +20,8 @@ fn u16hex(v: i64) -> String {
 }
 
 /// The dot, then every logged point (whole pixels), white on the glass so the person sees where they marked. The display takes a message of 4 KiB: the last thousand points at most.
-fn dot(x: i64, y: i64, points: &[(i64, i64)]) {
+fn dot(x: i64, y: i64, points: &[(i64, i64)], hold: bool) {
+    let points = if hold { points } else { &points[..0] };
     let mut m = format!("3403{}{}", u16hex(x), u16hex(y));
     let from = points.len().saturating_sub(1000);
     for &(px, py) in &points[from..] {
@@ -51,8 +52,11 @@ impl Drop for Raw {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let (mut x, mut y): (i64, i64) = if a.len() >= 3 { (a[1].parse().unwrap(), a[2].parse().unwrap()) } else { (518, 48) };
+    let nums: Vec<i64> = a.iter().skip(1).filter_map(|s| s.parse().ok()).collect();
+    let (mut x, mut y): (i64, i64) = if nums.len() >= 2 { (nums[0], nums[1]) } else { (518, 48) };
     let mut points: Vec<(i64, i64)> = Vec::new();
+    // The logged points kept white on the glass (`h` turns it off and on; `--no-hold` starts with it off: at the camera hole the marked pixels show the panel's fringe colours and confuse the eye, owner 2026-11-08).
+    let mut hold = !std::env::args().any(|a| a == "--no-hold");
     // Every logged point also goes to a file as it is taken, so a terminal that loses its scrollback loses nothing (2026-11-08: a corner's scan vanished with a click).
     let _ = std::fs::create_dir_all("/mnt/Harbor/tmp/cutout-scan");
     // Named by the first number not yet taken (scan-0, scan-1, …): no clock in it.
@@ -64,7 +68,7 @@ fn main() {
         print!("\r\x1b[2K{s}");
         let _ = std::io::stdout().flush();
     };
-    dot(x, y, &points);
+    dot(x, y, &points, hold);
     say(format!("dot at ({x}, {y})  points logged 0"));
     let mut stdin = std::io::stdin();
     let mut b = [0u8; 3];
@@ -88,13 +92,14 @@ fn main() {
                     let _ = f.flush();
                 }
                 say(format!("dot at ({x}, {y})  logged ({x}, {y}), points logged {}", points.len()));
-                dot(x, y, &points);
+                dot(x, y, &points, hold);
                 continue;
             }
+            [b'h'] => hold = !hold,
             [b'q'] | [3] => break,
             _ => continue,
         }
-        dot(x, y, &points);
+        dot(x, y, &points, hold);
         say(format!("dot at ({x}, {y})  points logged {}", points.len()));
     }
     drop(raw);
