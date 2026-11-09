@@ -51,8 +51,7 @@ macro_rules! say {
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     let input = unsafe { core::slice::from_raw_parts((ferros_sys::arc_base() + input) as *const u8, input_len as usize) };
     if input.first() == Some(&b'd') {
@@ -496,3 +495,6 @@ fn copy_packet(dst: *mut u8, src: *const u8) {
         )
     };
 }
+
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
+ferros_sys::entry!(payload_main);

@@ -35,8 +35,7 @@ fn rd(a: usize) -> u32 { unsafe { core::ptr::read_volatile(a as *const u32) } }
 fn wr(a: usize, v: u32) { unsafe { core::ptr::write_volatile(a as *mut u32, v); core::arch::asm!("dsb sy"); } }
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(_i: *const u8, _il: usize, out: *mut u8, cap: usize) -> u64 {
+pub extern "C" fn payload_main(_i: *const u8, _il: usize, out: *mut u8, cap: usize) -> u64 {
     unsafe extern "C" { static mut __bss_start: u8; static mut __bss_end: u8; }
     unsafe { let mut p = &raw mut __bss_start as *mut u8; let e = &raw mut __bss_end as *mut u8; while p < e { core::ptr::write_volatile(p, 0); p = p.add(1); } }
     let mut o = Out { ptr: out, cap, n: 0 };
@@ -90,3 +89,23 @@ pub extern "C" fn _entry(_i: *const u8, _il: usize, out: *mut u8, cap: usize) ->
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+
+// The entry and its image header (as ferros_sys::entry!, which this payload does not link): "ferrosRT" at offset 8, then .bss + 16, so the kernel sizes the arc from the image and its .bss.
+core::arch::global_asm!(
+    r#"
+    .section .text.entry, "ax"
+    .globl _entry
+    .type _entry, %function
+_entry:
+    b {main}
+    .4byte 0
+    .ascii "ferrosRT"
+    .quad __ferros_tail
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad 0
+    .size _entry, . - _entry
+"#,
+    main = sym payload_main
+);

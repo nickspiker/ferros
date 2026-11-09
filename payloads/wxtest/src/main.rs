@@ -10,8 +10,7 @@
 use ferros_sys::{arc_base, console, input};
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, _in: u64, _inlen: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, _in: u64, _inlen: u64) -> ! {
     let base = arc_base();
     let mut sel = [0u8; 1];
     input(0, &mut sel);
@@ -37,3 +36,6 @@ pub extern "C" fn _entry(grants: u64, _in: u64, _inlen: u64) -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
 }
+
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
+ferros_sys::entry!(payload_main);

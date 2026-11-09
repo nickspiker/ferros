@@ -25,8 +25,7 @@ const CALL: u64 = 1;
 const REPLY_BUF: u64 = 0x8000;
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let base = arc_base();
     let console = grants + 0x204;
     let endpoint = grants + 0x204 + 32;
@@ -49,3 +48,23 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
+
+// The entry and its image header (as ferros_sys::entry!, which this payload does not link): "ferrosRT" at offset 8, then .bss + 16, so the kernel sizes the arc from the image and its .bss.
+core::arch::global_asm!(
+    r#"
+    .section .text.entry, "ax"
+    .globl _entry
+    .type _entry, %function
+_entry:
+    b {main}
+    .4byte 0
+    .ascii "ferrosRT"
+    .quad __ferros_tail
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad 0
+    .size _entry, . - _entry
+"#,
+    main = sym payload_main
+);

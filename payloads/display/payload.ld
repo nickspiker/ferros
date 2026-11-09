@@ -15,10 +15,12 @@ SECTIONS {
     }
     .data : { *(.data*) *(.got*) *(.got.plt*) }
     .dynamic : { *(.dynamic) }
+    __file_end = .;
     . = ALIGN(64);
     .bss : { *(.bss*) *(COMMON) }
     /* The image's end, .bss included: the kernel sizes the arc from the flat image alone (process.rs `build`: no tail without a ferros_rt header), so .bss lies past what it counted and its stack (STACK, 64 KiB at the arc's top) can land on it; `_entry` checks the gap at start (2026-11-08). */
     __image_end = .;
     /DISCARD/ : { *(.comment) *(.eh_frame*) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash) *(.interp) }
 }
-__ferros_tail = SIZEOF(.bss) + 16;
+/* The zeroed tail from the file's end (alignment padding included) to .bss's end, plus 16. */
+__ferros_tail = ADDR(.bss) + SIZEOF(.bss) - __file_end + 16;

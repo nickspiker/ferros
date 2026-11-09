@@ -133,8 +133,7 @@ fn card(f: u32, y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, _in: u64, _inlen: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, _in: u64, _inlen: u64) -> ! {
     let _ = arc_base();
     unsafe { GRANTS = grants };
     let mut cfg = [0u8; 9];
@@ -246,3 +245,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     console(unsafe { GRANTS }, &m[..n]);
     ferros_sys::panic_exit()
 }
+
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
+ferros_sys::entry!(payload_main);

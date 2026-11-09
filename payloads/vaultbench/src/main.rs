@@ -172,8 +172,7 @@ extern "C" fn work(_: u64) -> ! {
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     unsafe { GRANTS = grants };
     let stack = unsafe { &mut (*(&raw mut STACK)).0 };
@@ -185,3 +184,6 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::exit(9)
 }
+
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
+ferros_sys::entry!(payload_main);

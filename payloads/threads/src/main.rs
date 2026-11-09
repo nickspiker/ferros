@@ -39,8 +39,7 @@ impl Write for Line {
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // PIE: the `dyn Write` vtable below is an absolute address in .rodata, zero until relocated (a call through it is a jump to 0 — the first run of this test, 2026-10-23).
     unsafe { ferros_sys::relocate() };
     let t0 = now();
@@ -70,3 +69,6 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
 }
+
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
+ferros_sys::entry!(payload_main);

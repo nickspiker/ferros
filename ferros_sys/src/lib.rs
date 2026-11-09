@@ -1354,3 +1354,28 @@ impl<const SLOT: u64> Handle<SLOT> {
         }
     }
 }
+
+/// A payload's entry with ferros_rt's image header (process.rs `image_tail`): `b main`, a pad word, "ferrosRT" at offset 8, the zeroed tail (.bss + 16, payload.ld's `__ferros_tail`), three unused words and a heap of 0. The kernel sizes the process's arc from the flat image plus that tail and refuses an image without the header (2026-11-09: the display's and bt's stacks sat on their own statics because the kernel never counted their .bss). `main` is `extern "C" fn(grants: u64, input: u64, input_len: u64) -> !`.
+#[macro_export]
+macro_rules! entry {
+    ($main:path) => {
+        core::arch::global_asm!(
+            r#"
+    .section .text.entry, "ax"
+    .globl _entry
+    .type _entry, %function
+_entry:
+    b {main}
+    .4byte 0
+    .ascii "ferrosRT"
+    .quad __ferros_tail
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad 0
+    .size _entry, . - _entry
+"#,
+            main = sym $main
+        );
+    };
+}

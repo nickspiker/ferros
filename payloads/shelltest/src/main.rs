@@ -84,8 +84,7 @@ fn uptime(buf: &mut [u8; 8], secs: u32) -> &str {
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, _input: u64, input_len: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, _input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     let mut sel = [0u8; 1];
     let sel = if input_len > 0 && ferros_sys::input(0, &mut sel) == 1 { sel[0] } else { 0 };
@@ -171,3 +170,6 @@ pub extern "C" fn _entry(grants: u64, _input: u64, input_len: u64) -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
 }
+
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
+ferros_sys::entry!(payload_main);

@@ -14,8 +14,7 @@ fn svc(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let base: u64;
     unsafe { asm!("mov {}, x28", out(reg) base) };
     let console = grants + 0x204;
@@ -40,3 +39,23 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
+
+// The entry and its image header (as ferros_sys::entry!, which this payload does not link): "ferrosRT" at offset 8, then .bss + 16, so the kernel sizes the arc from the image and its .bss.
+core::arch::global_asm!(
+    r#"
+    .section .text.entry, "ax"
+    .globl _entry
+    .type _entry, %function
+_entry:
+    b {main}
+    .4byte 0
+    .ascii "ferrosRT"
+    .quad __ferros_tail
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad 0
+    .size _entry, . - _entry
+"#,
+    main = sym payload_main
+);

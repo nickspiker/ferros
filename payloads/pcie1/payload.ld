@@ -8,8 +8,10 @@ SECTIONS {
     }
     .rodata : { *(.rodata*) }
     .data : { *(.data*) }
+    __file_end = .;
     . = ALIGN(64);
     .bss : { *(.bss*) *(COMMON) }
     /DISCARD/ : { *(.comment) *(.eh_frame*) }
 }
-__ferros_tail = SIZEOF(.bss) + 16;
+/* The zeroed tail from the file's end (alignment padding included) to .bss's end, plus 16. */
+__ferros_tail = ADDR(.bss) + SIZEOF(.bss) - __file_end + 16;

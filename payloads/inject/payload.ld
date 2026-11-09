@@ -17,3 +17,5 @@ SECTIONS {
     .dynamic : { *(.dynamic) }
     /DISCARD/ : { *(.comment) *(.eh_frame*) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash) *(.interp) }
 }
+/* .bss is carried in .data (the image holds its zeros): the tail is only the 16 every image declares. */
+__ferros_tail = 16;

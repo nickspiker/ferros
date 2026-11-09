@@ -15,6 +15,10 @@ SECTIONS {
     }
     .data : { *(.data*) *(.got*) *(.got.plt*) }
     .dynamic : { *(.dynamic) }
-    .bss : { *(.bss*) }
+    __file_end = .;
+    . = ALIGN(64);
+    .bss : { *(.bss*) *(COMMON) }
     /DISCARD/ : { *(.comment) *(.eh_frame*) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash) *(.interp) }
 }
+/* The zeroed tail from the file's end (alignment padding included) to .bss's end, plus 16. */
+__ferros_tail = ADDR(.bss) + SIZEOF(.bss) - __file_end + 16;

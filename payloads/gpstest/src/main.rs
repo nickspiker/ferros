@@ -22,8 +22,7 @@ impl Write for Line {
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     let mut r = [0u8; 33];
     // Input byte 0: the op (0 FIX, 1 STOP, 2 SATS).
@@ -79,3 +78,6 @@ fn sats(grants: u64) -> ! {
     }
     ferros_sys::exit(0);
 }
+
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
+ferros_sys::entry!(payload_main);

@@ -7517,22 +7517,5 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 /// The console grant for the panic handler (set first thing in `_entry`; `.data`, see ALLOC).
 static mut PANIC_GRANTS: u64 = 1;
 
-// The entry with ferros_rt's image header (as ahau's): "ferrosRT" at offset 8, then .bss + 16 (payload.ld's `__ferros_tail`), so the kernel counts the zeroed tail in the arc (process.rs `image_tail`). Without it the arc was sized from the flat image alone and the stack at its top sat on the last statics (2026-11-08: the display's crashes on the 8a; bt's stack 26 KiB inside its .bss).
-core::arch::global_asm!(
-    r#"
-    .section .text.entry, "ax"
-    .globl _entry
-    .type _entry, %function
-_entry:
-    b {main}
-    .4byte 0
-    .ascii "ferrosRT"
-    .quad __ferros_tail
-    .quad 0
-    .quad 0
-    .quad 0
-    .quad 0
-    .size _entry, . - _entry
-"#,
-    main = sym display_main
-);
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
+ferros_sys::entry!(display_main);

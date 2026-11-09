@@ -160,8 +160,7 @@ fn resolve(a: &App, fam: u8, dns: [u8; 16], host: &[u8], qtype: u16) -> Option<[
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let base = ferros_sys::arc_base();
     let mut a = App { grants, base, log: [0; 512], n: 0 };
     let mut spec = [0u8; 256];
@@ -350,3 +349,6 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
 }
+
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
+ferros_sys::entry!(payload_main);

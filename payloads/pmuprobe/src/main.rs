@@ -45,8 +45,7 @@ fn rd(addr: usize) -> u32 {
 
 /// Entry — pinned at blob offset 0 by payload.ld.
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(_inp: *const u8, _in_len: usize, out: *mut u8, out_cap: usize) -> u64 {
+pub extern "C" fn payload_main(_inp: *const u8, _in_len: usize, out: *mut u8, out_cap: usize) -> u64 {
     let mut o = Out { ptr: out, cap: out_cap, n: 0 };
 
     // Window around the DT reboot-cmd-offset (G#810): 16 words each side, 4-byte stride.
@@ -64,3 +63,23 @@ pub extern "C" fn _entry(_inp: *const u8, _in_len: usize, out: *mut u8, out_cap:
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
+
+// The entry and its image header (as ferros_sys::entry!, which this payload does not link): "ferrosRT" at offset 8, then .bss + 16, so the kernel sizes the arc from the image and its .bss.
+core::arch::global_asm!(
+    r#"
+    .section .text.entry, "ax"
+    .globl _entry
+    .type _entry, %function
+_entry:
+    b {main}
+    .4byte 0
+    .ascii "ferrosRT"
+    .quad __ferros_tail
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad 0
+    .size _entry, . - _entry
+"#,
+    main = sym payload_main
+);

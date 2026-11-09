@@ -8,8 +8,7 @@ use ferros_sys::{call, cap, console, exit};
 const S_DISPLAY: u64 = 1;
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     // Room for a text reply (the nfc driver's STATE runs to a few hundred bytes), printed in hex.
     let mut r = [0u8; 512];
@@ -45,3 +44,6 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
 }
+
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
+ferros_sys::entry!(payload_main);

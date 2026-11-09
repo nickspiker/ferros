@@ -68,8 +68,7 @@ const SHELL: [(&[u8], &[u8], &[u64]); 12] = [
 ];
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The table's names and slot lists are `&'static` slices, absolute addresses fixed at link time: apply the payload's relocations before reading them (the first run faulted at address 0 without this, 2026-10-22, as the map once did).
     unsafe { ferros_sys::relocate() };
     unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
@@ -266,3 +265,6 @@ fn wait_front(grants: u64) {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
 }
+
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
+ferros_sys::entry!(payload_main);

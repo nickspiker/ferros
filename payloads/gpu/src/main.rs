@@ -220,8 +220,7 @@ impl Shared {
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     let regs = ferros_sys::dma(cap(grants, S_REGS)) as usize;
     let base = ferros_sys::dma(cap(grants, S_MEM)) as usize;
@@ -1105,3 +1104,6 @@ fn alloc_free_fmt(g: u32, a: u32, b: u32) -> Tail {
     let _ = write!(t, "; first at gid {g}: GPU {a}, CPU {b}");
     t
 }
+
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
+ferros_sys::entry!(payload_main);

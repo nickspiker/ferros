@@ -5,8 +5,7 @@
 use ferros_sys::{cap, console, exit};
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     let on = input_len == 0 || unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 1;
     // SYS_FACTS 82 first: whether the device allows Android (2 yes, 1 no), the android switch's other rule.
@@ -26,3 +25,6 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
 }
+
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
+ferros_sys::entry!(payload_main);

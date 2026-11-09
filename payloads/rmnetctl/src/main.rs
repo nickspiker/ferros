@@ -9,8 +9,7 @@
 use ferros_sys::{cap, console, exit, CALL_LIVE, ERR};
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let base = ferros_sys::arc_base();
     // The request is the input (up to 16 bytes: TRACE takes a count after its byte); none is STATE.
     let mut q = [4u8; 16];
@@ -53,3 +52,6 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
 }
+
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
+ferros_sys::entry!(payload_main);
