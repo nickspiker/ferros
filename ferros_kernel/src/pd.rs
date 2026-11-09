@@ -134,7 +134,12 @@ pub fn gate_at_boot(booted_for: u64, after: u64) {
     unsafe { GATED = true };
     let mut out = alloc::vec::Vec::new();
     // The GPU stays as ABL leaves it, powered and clocked, since ferros drives it (GPU.md, 2026-11-04): this file has its off sequence but no on, which needs its PLLs back through ACPM's DVFS. Gating it saved about 50 mW (its rail 66 to 15 mW, 2026-10-25); the GPU driver will gate it itself once it has a power switch with both directions.
-    for &(name, cmu, pmu_off) in DOMAINS.iter().filter(|d| d.0 != "g3d") {
+    for (i, &(name, cmu, pmu_off)) in DOMAINS.iter().enumerate().filter(|(_, d)| d.0 != "g3d") {
+        // Said before each domain is gated, crumb and line both (the crumb G#E0 + its index, the core's note), so a hang inside one names it: twice a jump froze the kernel's core in this pass with nothing logged after the display's fence (2026-11-09).
+        crate::platform::crumb(0xE0 + i as u64);
+        if crate::platform::jumped() {
+            crate::flashlog::line(&alloc::format!("pd: gating {name} after the jump"));
+        }
         off(name, cmu, pmu_off, &mut out);
     }
     for l in out.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
