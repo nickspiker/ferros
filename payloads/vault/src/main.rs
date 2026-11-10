@@ -354,6 +354,9 @@ impl Opener for Helpers {
     }
 }
 
+/// Whether the serving thread is on the X3 for a large value's bulk read (the get request).
+static mut ON_BIG: bool = false;
+
 /// Opening, measured for the read report: the wall time of each request's opening, and the sealed bytes opened.
 static OPEN_TICKS: AtomicU64 = AtomicU64::new(0);
 static OPEN_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -466,6 +469,7 @@ extern "C" fn work(_: u64) -> ! {
     let mut epoch: Option<u32> = None;
     // The person's export being read (op 5): built at offset 0, kept until read to its end or the person locks.
     let mut export: Option<Vec<u8>> = None;
+
     loop {
         let n = ferros_sys::recv(cap(grants(), S_SERVE), &mut msg, &mut token, false);
         if n == ERR {
@@ -643,8 +647,19 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
             1 => {
                 let (offset, len) = (u64_at(rest), u32::from_le_bytes(rest[8..12].try_into().unwrap()) as usize);
                 let t = now();
-                // The pieces opened on the helpers as well as here (`Helpers`).
-                match store.read_with(&d, name, offset, &mut out[8..8 + len], &mut Helpers) {
+                // A large value read in bulk transfers is served on the X3 (owner, 2026-11-09: "why the wallpaper still takes about 1s to show"): the index walk, the blocks' guards and the copies ran three times as fast there as on a worker, and a 24 MB value's read went from 1256 to 637 ms of serving. Pinned at its first bulk transfer and back on the workers when it reaches its end or a request that is not one comes (a move a transfer cost most of the gain: 1026 ms), so the render thread's core is only lent while someone reads a large value.
+                let bulk = len >= 1 << 16;
+                if bulk && unsafe { !ON_BIG } {
+                    ferros_sys::pin(ferros_sys::CORES_BIG);
+                    unsafe { ON_BIG = true };
+                }
+                let r = store.read_with(&d, name, offset, &mut out[8..8 + len], &mut Helpers);
+                let done = !matches!(r, Ok(Some(whole)) if bulk && offset + (len as u64) < whole);
+                if done && unsafe { ON_BIG } {
+                    ferros_sys::pin(0);
+                    unsafe { ON_BIG = false };
+                }
+                match r {
                     Ok(Some(whole)) => {
                         // WHY: the offset is the caller's and may lie past the end (nothing to send then: the subtraction stops at 0).
                         data = (whole.saturating_sub(offset) as usize).min(len);

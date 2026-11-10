@@ -128,6 +128,10 @@ pub extern "C" fn test_main(g: u64, input: u64, input_len: u64) -> ! {
     if mode == 2 {
         grow();
     }
+    // Input 03: the wallpaper's read, timed (owner, 2026-11-09: "why the wallpaper still takes about 1s to show"): a value the wallpaper's size written and read back in the display's transfers.
+    if mode == 3 || mode == 4 {
+        wall(mode == 4);
+    }
     // Past the kernel's old 3 MiB limit on a value (service.rs STORE_VALUE_MAX).
     let big: Vec<u8> = (0..BIG as u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
     let want = blake3::hash(&big);
@@ -207,6 +211,54 @@ fn grow() -> ! {
     let deleted = ferros_sys::store_delete(store(), b"grow") == Some(true);
     say!("vaulttest: grow: deleted {}; {}", deleted, if wrote && same && deleted { "passed" } else { "FAILED" });
     ferros_sys::exit(if wrote && same && deleted { 0 } else { 1 })
+}
+
+/// The wallpaper read's size: the Pro's screen, three planes of 16-bit samples (24,127,488 bytes; the made wallpaper's document is 24,128,145).
+const WALL: usize = 6 * 1344 * 2992;
+
+/// The value the size of a wallpaper written in the display's transfers (ferros_sys::STORE_MAX), then read back the way the display reads it twice, timed: the first read after the write and a second, so what a cache holds shows. The vault process says each read's stages (its read report).
+/// Input 04 reads the value input 03 left (and deletes it), so the reads' own block calls can be counted apart from the write's.
+fn wall(read_only: bool) -> ! {
+    let mut buf = alloc::vec![0u8; ferros_sys::STORE_MAX];
+    let mut want = alloc::vec![0u8; ferros_sys::STORE_MAX];
+    let t = now();
+    let mut off = if read_only { WALL } else { 0 };
+    let mut wrote = true;
+    while off < WALL {
+        let n = (WALL - off).min(buf.len());
+        grow_fill(off, &mut buf[..n]);
+        if !ferros_sys::store_set_at(store(), b"wall", off, &buf[..n], off + n < WALL) {
+            wrote = false;
+            break;
+        }
+        off += n;
+    }
+    say!("vaulttest: wall: {} B written {} in {} ms", WALL, wrote, ms(t));
+    let mut same = wrote;
+    for pass in 0..2 {
+        let t = now();
+        let mut off = 0;
+        while same && off < WALL {
+            let n = (WALL - off).min(buf.len());
+            match ferros_sys::store_get_at(store(), b"wall", off, &mut buf[..n]) {
+                Some(whole) if whole == WALL => {
+                    grow_fill(off, &mut want[..n]);
+                    same &= buf[..n] == want[..n];
+                    off += n;
+                }
+                _ => same = false,
+            }
+        }
+        let us = (now() - t) * 1_000_000 / freq();
+        say!("vaulttest: wall: read {} in {} ms ({} MB/s), pass {}, as written: {}", WALL, us / 1000, WALL as u64 / us, pass, same);
+    }
+    if !read_only {
+        say!("vaulttest: wall: kept for input 04");
+        ferros_sys::exit(if same { 0 } else { 1 })
+    }
+    let deleted = ferros_sys::store_delete(store(), b"wall") == Some(true);
+    say!("vaulttest: wall: deleted {}; {}", deleted, if same && deleted { "passed" } else { "FAILED" });
+    ferros_sys::exit(if same && deleted { 0 } else { 1 })
 }
 
 #[panic_handler]

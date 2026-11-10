@@ -3551,7 +3551,12 @@ struct GlassOutline {
     n: f32,
     /// Each corner's curve in screen pixels (pixel edges), GLASS_SEGS + 1 points from the vertical edge to the horizontal one.
     pts: [alloc::vec::Vec<(f32, f32)>; 4],
+    /// Each corner's segments in runs of GLASS_RUN, each run's bounding box (x0, y0, x1, y1): a run whose box is no nearer than the nearest found holds nothing nearer, so `dist` skips it whole (2026-11-09: the console's first layout took 1.48 s on an A715, every point walking all 512 segments).
+    boxes: [alloc::vec::Vec<(f32, f32, f32, f32)>; 4],
 }
+
+/// Segments a run of `GlassOutline::boxes`.
+const GLASS_RUN: usize = 1 << 4;
 
 impl GlassOutline {
     fn new(width: usize, height: usize) -> GlassOutline {
@@ -3578,7 +3583,18 @@ impl GlassOutline {
                 })
                 .collect()
         };
-        GlassOutline { w, h, r, n: nf, pts: [mk(0), mk(1), mk(2), mk(3)] }
+        let pts = [mk(0), mk(1), mk(2), mk(3)];
+        let boxes = core::array::from_fn(|k| {
+            let p: &alloc::vec::Vec<(f32, f32)> = &pts[k];
+            (0..GLASS_SEGS / GLASS_RUN)
+                .map(|j| {
+                    // Points j·RUN ..= (j + 1)·RUN: the run's segments and both their ends.
+                    let run = &p[j * GLASS_RUN..=(j + 1) * GLASS_RUN];
+                    run.iter().fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |(x0, y0, x1, y1), &(x, y)| (x0.min(x), y0.min(y), x1.max(x), y1.max(y)))
+                })
+                .collect()
+        });
+        GlassOutline { w, h, r, n: nf, pts, boxes }
     }
 
     /// The signed distance from a point to the outline: positive inside the glass, negative outside. Every corner is looked at, not only the one on the point's side of the screen: a big corner's box reaches past the screen's middle (akita's top-left to column 602.7 of 1080: 2026-11-08, a point at column 602.7 on row 0 was in neither the top edge's run nor the right-hand corner's box, read as roomy, and the top-right's circles were solved onto row 0).
@@ -3604,7 +3620,13 @@ impl GlassOutline {
                 continue;
             }
             let p = &self.pts[k];
-            for i in 0..GLASS_SEGS {
+            for (j, &(bx0, by0, bx1, by1)) in self.boxes[k].iter().enumerate() {
+                // The run's box no nearer than the nearest found: nothing in it is nearer.
+                let (ex, ey) = (if x < bx0 { bx0 - x } else if x > bx1 { x - bx1 } else { 0. }, if y < by0 { by0 - y } else if y > by1 { y - by1 } else { 0. });
+                if ex * ex + ey * ey >= d * d {
+                    continue;
+                }
+            for i in j * GLASS_RUN..(j + 1) * GLASS_RUN {
                 let (x0, y0) = p[i];
                 let (x1, y1) = p[i + 1];
                 let (dx, dy) = (x1 - x0, y1 - y0);
@@ -3614,6 +3636,7 @@ impl GlassOutline {
                 let t = if t < 0. { 0. } else if t > 1. { 1. } else { t };
                 let (ex, ey) = (x0 + t * dx - x, y0 + t * dy - y);
                 d = d.min(libm::sqrtf(ex * ex + ey * ey));
+            }
             }
         }
         if outside { -d } else { d }
@@ -3662,8 +3685,11 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
         while y < yb {
             let mut x = xa + step * 0.5;
             while x < xb {
-                let c = clear(x, y);
-                if c > br { (bx, by, br) = (x, y, c); }
+                // The clearance is the nearer of the app's circle and the glass: where the app's alone is no better than the best, the glass (the costly half) cannot make it better, and is not asked.
+                if app(x, y) > br {
+                    let c = clear(x, y);
+                    if c > br { (bx, by, br) = (x, y, c); }
+                }
                 x += step;
             }
             y += step;
@@ -3702,21 +3728,22 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
                 let c = glass(x, y);
                 libm::sqrtf((x - prev.0) * (x - prev.0) + (y - prev.1) * (y - prev.1)) - prev.2 - c
             };
+            // Bracketed four pixels at a time (each `gap` is a 40-step bisection, and a pixel at a time cost the first layout most of a second on an A715), then bisected to the same precision.
             let (mut a, mut found) = (s0, false);
-            let mut s = s0 + dir;
-            for _ in 0..2048 {
+            let mut s = s0 + 4.0 * dir;
+            for _ in 0..512 {
                 if gap(s) >= 0.0 {
                     found = true;
                     break;
                 }
                 a = s;
-                s += dir;
+                s += 4.0 * dir;
             }
             if !found {
                 return None;
             }
             let (mut lo, mut hi) = (a, s);
-            for _ in 0..30 {
+            for _ in 0..32 {
                 let mid = (lo + hi) * 0.5;
                 if gap(mid) >= 0.0 { hi = mid } else { lo = mid }
             }
@@ -3941,6 +3968,26 @@ fn wall_band(p: &wallpaper::Params, pass: u64, band: usize) {
     }
 }
 
+/// Measuring an attest (owner, 2026-11-09: "why the wallpaper still takes about 1s to show and the console 2s after attest"): when op 42 came (timer ticks, 0 never), and which of its marks have been said (bits).
+static mut ATTEST_T: (u64, u32) = (0, 0);
+
+/// Said once an attest: `what` and the milliseconds since op 42.
+fn attest_mark(grants: u64, bit: u32, what: &[u8]) {
+    unsafe {
+        if ATTEST_T.0 == 0 || ATTEST_T.1 & bit != 0 {
+            return;
+        }
+        ATTEST_T.1 |= bit;
+        let mut l = Log { grants, buf: [0; 256], n: 0 };
+        l.s(b"display: attest +");
+        l.dec((now() - ATTEST_T.0) * 1000 / freq());
+        l.s(b" ms: ");
+        l.s(what);
+        l.s(b"\n");
+        l.flush();
+    }
+}
+
 /// The render loop's side of the wallpaper job, each pass of the loop: a waiting seed starts a job when none runs; the first pass done shows the wallpaper, the refining done shows it again. Each with its time to the console.
 fn wall_step(grants: u64, width: usize, height: usize) {
     unsafe {
@@ -3952,6 +3999,8 @@ fn wall_step(grants: u64, width: usize, height: usize) {
                 return;
             }
             LOADING = false;
+            let seed_late = LOAD_SEED_LATE;
+            LOAD_SEED_LATE = false;
             // A newer load wanted meanwhile (another attest): this result is not shown; that load starts next pass.
             if LOAD_WANTED != 0 {
                 return;
@@ -3960,12 +4009,14 @@ fn wall_step(grants: u64, width: usize, height: usize) {
                 FOUND_OWN => {
                     console(grants, b"display: wallpaper: the person's own\n");
                     wall_ready(width, height);
+                    attest_mark(grants, 2, b"wallpaper shown");
                 }
                 FOUND_MADE => {
                     console(grants, b"display: wallpaper: the person's, kept on this device\n");
                     wall_ready(width, height);
+                    attest_mark(grants, 2, b"wallpaper shown");
                 }
-                _ if r & LOAD_SEED != 0 => {
+                _ if r & LOAD_SEED != 0 || seed_late => {
                     console(grants, b"display: wallpaper: made from the person's seed\n");
                     WALL_PENDING = Some(LOAD_SEED_BYTES);
                 }
@@ -3978,6 +4029,7 @@ fn wall_step(grants: u64, width: usize, height: usize) {
             WALL_PENDING = None;
             LOADING = true;
             WALL_ON = false;
+            attest_mark(grants, 1, b"wallpaper load started");
             let seq = (LOAD_REQ.load(Ordering::Acquire) >> 8) + 1;
             LOAD_REQ.store(seq << 8 | LOAD_WANTED, Ordering::Release);
             LOAD_WANTED = 0;
@@ -4081,6 +4133,8 @@ static mut LOAD_SIZE: (usize, usize) = (0, 0);
 /// The seed a load falls back to (op 42's), and a load wanted but not started (a job was running): its low byte as `LOAD_REQ`'s.
 static mut LOAD_SEED_BYTES: [u8; 32] = [0; 32];
 static mut LOAD_WANTED: u64 = 0;
+/// A seed to fall back to that came while a load of the kept wallpaper was already running (`wall_load`): that load's result stands, and when nothing was kept the seed's wallpaper is made.
+static mut LOAD_SEED_LATE: bool = false;
 /// A load running (from its start in `wall_step` to its result taken there).
 static mut LOADING: bool = false;
 /// The loader's stack (its allocations are told by it, as the console worker's are) and heap: vsf's header parse and the transfer buffer, dropped after each load. Non-zero initialisers (see `ALLOC`).
@@ -4119,6 +4173,11 @@ fn wall_load(what: u64, seed: Option<[u8; 32]>) {
     unsafe {
         if let Some(s) = seed {
             LOAD_SEED_BYTES = s;
+        }
+        // The kept wallpaper's read already under way (a display started after the person unlocked reads it at once, and the attest's op 42 follows): the same read, so it is kept and the seed made its fallback. Until 2026-11-09 the second request threw the first read away and read the 24 MB again: shown at +1716 ms where one read takes about 420.
+        if LOADING && what & LOAD_KEPT != 0 && LOAD_REQ.load(Ordering::Acquire) & LOAD_KEPT != 0 {
+            LOAD_SEED_LATE |= what & LOAD_SEED != 0;
+            return;
         }
         LOAD_WANTED = what;
         WALL_ON = false;
@@ -4348,6 +4407,10 @@ fn px_out(y: i64, height: usize) -> bool {
 }
 
 /// The bars' producer (COMPOSITOR.md, step 1: producers never draw on the render thread). Woken on every render pass (`CON_NUDGE`), it looks at the console's key; when it changed, and the render thread has taken the last result, it draws the console (and the helm, the first time) into `BAR`, decodes the whole of the bars into the back buffers, finds what differs from the front (the top bar's and the bottom bar's rectangles), and says so (`CON_READY`), waking the render thread. On its own stack and heap (`CON_STACK`, `CON_HEAP`).
+/// The console's draws said so far (the first few are logged).
+static mut CON_DRAWS: u64 = 0;
+
+
 extern "C" fn console_worker(arg: u64) -> ! {
     let (width, height) = ((arg >> 32) as usize, (arg & 0xFFFF_FFFF) as usize);
     let mut seen = 0u64;
@@ -4365,9 +4428,11 @@ extern "C" fn console_worker(arg: u64) -> ! {
         if CON_READY.load(Ordering::Acquire) != 0 {
             continue;
         }
+        let t_draw = now();
         let console = console_draw(width, height, false);
         let helm = helm_draw(width, height);
         CON_HEAP.reset();
+        let draw_us = ferros_sys::us_since(t_draw);
         if !console && !helm {
             continue;
         }
@@ -4388,8 +4453,27 @@ extern "C" fn console_worker(arg: u64) -> ! {
             }
         }
         helm_prev = helm;
+        let t_dec = now();
         if lo < hi {
             bar_decode(lo, hi - lo, width);
+        }
+        // Measuring (owner, 2026-11-09: "the console 2s after attest"): the first draws, when (ms since boot) and what each took.
+        unsafe {
+            if CON_DRAWS < 2 && (console || helm) {
+                CON_DRAWS += 1;
+                let mut l = Log { grants: PANIC_GRANTS, buf: [0; 256], n: 0 };
+                l.s(b"display: console draw ");
+                l.dec(CON_DRAWS);
+                l.s(b" at ");
+                l.dec(now() * 1000 / freq());
+                l.s(b" ms: draw ");
+                l.dec(draw_us);
+                l.s(b" us, decode ");
+                l.dec(ferros_sys::us_since(t_dec));
+                l.s(b" us\n");
+                l.flush();
+
+            }
         }
         // What changed, row by row, back against front: the columns from the first differing pixel to the last.
         let (front, back) = unsafe { (core::slice::from_raw_parts(BAR_W as *const u64, (top + bot) * width), core::slice::from_raw_parts(BAR_W_BACK as *const u64, (top + bot) * width)) };
@@ -6817,6 +6901,7 @@ fn server(grants: u64) -> ! {
                     } else {
                         let mut seed = [0u8; 32];
                         seed.copy_from_slice(&m[1..33]);
+                        unsafe { ATTEST_T = (now(), 0) };
                         // Read by the loader (`wall_loader`) and answered now: their own, else the one made on this device from their seed and kept (payloads/wallgen; owner, 2026-11-07: not drawn again at every attest), else drawn here from the seed meanwhile, while wallgen makes and keeps it (it says when, op 44). The home screen does not wait for it (owner, 2026-11-08).
                         wall_load(LOAD_KEPT | LOAD_SEED, Some(seed));
                     }
@@ -7196,6 +7281,7 @@ fn server(grants: u64) -> ! {
                 BAR_SPAN_BACK = s;
                 let r = CON_RECT;
                 CON_READY.store(0, Ordering::Release);
+                attest_mark(grants, 4, b"console frame taken");
                 r
             } else {
                 [draw::Rect::EMPTY; 2]
