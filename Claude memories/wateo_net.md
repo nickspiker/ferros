@@ -1,0 +1,17 @@
+---
+name: wateo-net
+description: Wāteo (wateo.net): the data-only member-run carrier; site in /mnt/Chiton/MEGA/wateo on Pages project `wateo`; no dollars, crypto only; DUNA forming (100, then 500, launch ~1k, invite only)
+metadata:
+  type: project
+---
+
+**Wāteo** (wah-TAY-oh), wateo.net, bought 2026-11-09: data-only service at cost, run by its members, tied to the handle not the SIM, sponsor carriers the person picks. See [[mvno-data-only]] and [[fgtw-duna-runanga]].
+
+- **Site:** static HTML + one style.css in `/mnt/Chiton/MEGA/wateo` (beside passless, not in git), deploy with `./deploy.sh` (Pages project `wateo`, branch main). Seven pages: Home, How it works, Principles, Books, Join, Limits, Contact. No scripts. `_headers` sends `Cache-Control: no-transform` on every page, which stops Cloudflare injecting its email decoder, beacons or Rocket Loader with no dashboard toggle (verified 2026-11-09: the email obfuscation was injecting into Contact until the header went in). NEL/Report-To still come from the zone (passless strips them in a Function; wateo has none).
+- **DNS:** zone in the owner's Cloudflare account (registrar Cloudflare); wateo.net CNAME → wateo.pages.dev proxied; mail is a Proton custom domain (MX, SPF, 3 DKIM CNAMEs DNS-only, DMARC quarantine); kaitiaki@wateo.net is the contact. Wrangler's OAuth can't edit DNS or zone settings; the owner does those in the dashboard. Only .net: no wateo.org/.com.
+- **No dollars** (owner, 2026-11-09): dollars can't be governed in a decentralized way. Payment is crypto; fiat holders swap thru an onboarding provider such as Coinbase. Never write prices or flows in dollars.
+- **The association is forming, not formed** (owner, 2026-11-09): 100 people to form the DUNA, at least 400 more to launch, likely no launch before ~1,000, invite only for now. Site footer says "(forming)".
+- Principles text does not exist yet; the site says so rather than inventing it.
+- **Logo** (owner, 2026-11-09): `logo.svg` in the site folder: a solid disc in VSF RGB green brought to the sRGB gamut edge along the line from 523 nm to Illuminant E (VSF linear (0.406, 1, 0.406) = #00FF93; never the clipped #00FF00), "wāteo" in Comfortaa Bold outlined in black, the ā's macron and a bar under the word in E white #FFE5E1 (brightest Illuminant E in sRGB, never D65 #FFFFFF), text #000000. `favicon.svg` = disc + bar only. Built with inkscape (text-to-path, path-split for the macron).
+- **Site theme "bands"** (owner, 2026-11-09): dark only, never dark text on a light page. Background the logo green at 1/64 linear (#00220F), nav band and doors at 1/32 (#003118), lines 1/16 (#004725), headings E white #FFE5E1, body half E half green (#90BC93), accent #00FF93, warn = vsf Orange to the gamut edge (#FF8B00). Nav is a full-width band, its Home link the favicon mark; Home shows logo.svg. No animations, no transitions, no pixel units, no breakpoint media queries: sizes in --ru only (the one aspect-ratio query defines --ru, as on ferros.org/passless.org).
+- **Carrier access, Hologram** (owner, 2026-11-10): a Hologram IoT account with the organization "FGTW wateo"; its dashboard can test and add eSIM profiles on Verizon, AT&T and T-Mobile. The first step toward network switching. The eSIM SGP.22 client is the one place web encodings are allowed ferros-side ([[feedback-no-web-encodings]]); nothing of the account (logins, ICCIDs, IMEIs) goes in the repo.
