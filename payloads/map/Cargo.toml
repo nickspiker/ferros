@@ -19,3 +19,5 @@ libm = "0.2"
 tatau = { path = "../../../tatau" }
 # Kists (KISTS.md): the person's list for the kist circles, the first-launch question and the permission pages.
 ferros_kist = { path = "../../ferros_kist", features = ["process"] }
+# The words on the settings pages in the person's language (Photon's sixteen; the fleet's words are fgtw's, thru it).
+ferros_lang = { path = "../../ferros_lang", features = ["process"] }

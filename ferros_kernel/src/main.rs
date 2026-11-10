@@ -63,6 +63,7 @@ mod x3;
 mod smp;
 mod rtc;
 mod zone;
+mod lang;
 mod aoc;
 mod haptics;
 mod gps;

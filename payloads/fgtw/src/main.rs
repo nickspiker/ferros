@@ -1783,6 +1783,12 @@ impl Client {
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
                     continue;
                 }
+                // 23 [the ISO 639-3 code]: the person's language chosen on this device's language page while it follows them (space.rs `space_lang`) → [0 done, 1 before the first pull, 2 not a code]. The kernel holds what the page shows (the preferences block).
+                if n >= 1 && req[0] == 23 {
+                    let r = [self.space_lang(&req[1..got])];
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
                 if n >= 1 && (8..=16).contains(&req[0]) {
                     let text = core::str::from_utf8(&req[1..got]).unwrap_or("");
                     let r: Vec<u8> = match req[0] {

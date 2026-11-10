@@ -24,7 +24,37 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use ferros_sys::{call, cap, console, freq, now, sleep_until};
+use ferros_lang::{Fleet as FleetMsg, Lang, Msg, Say};
 use tatau::Style;
+
+/// A message in the person's language (ferros_lang), read at draw time like every preference.
+fn tr(m: Msg) -> &'static str {
+    ferros_lang::t(m)
+}
+
+/// A message with holes in the person's language, its numbers in their base, as a line.
+fn say(m: Say) -> Line {
+    let mut l = Line::new();
+    let _ = ferros_lang::s(m, &mut l);
+    l
+}
+
+/// A fleet or identity message (fgtw's, shared with Photon) in the person's language, as a line.
+fn fleet(m: FleetMsg) -> Line {
+    let mut l = Line::new();
+    let _ = ferros_lang::fleet(m, &mut l);
+    l
+}
+
+/// `t` cut to at most `n` bytes at a character's edge: the display reads every text as UTF-8 and drops one cut inside a character (a translation is two bytes a letter in places).
+fn fit(t: &str, n: usize) -> &str {
+    let mut k = t.len().min(n);
+    // WHY: an op's field is fixed and `t` is a translation or a name of any length; cutting inside a character makes the whole text invalid UTF-8, which the display drops. PROOF: index 0 is always a boundary, so the loop ends.
+    while !t.is_char_boundary(k) {
+        k -= 1;
+    }
+    &t[..k]
+}
 
 const S_DISPLAY: u64 = 1;
 const S_TOUCH: u64 = 2;
@@ -449,12 +479,12 @@ impl Fleet {
 
 /// A line of text being written, for tatau's formatters.
 struct Line {
-    b: [u8; 120],
+    b: [u8; 1 << 8],
     n: usize,
 }
 impl Line {
     fn new() -> Line {
-        Line { b: [0; 120], n: 0 }
+        Line { b: [0; 1 << 8], n: 0 }
     }
     fn s(&mut self, t: &str) -> &mut Line {
         let _ = self.write_str(t);
@@ -466,10 +496,10 @@ impl Line {
 }
 impl Write for Line {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let b = s.as_bytes();
-        let n = b.len().min(self.b.len() - self.n);
-        self.b[self.n..self.n + n].copy_from_slice(&b[..n]);
-        self.n += n;
+        // Cut at a character's edge (`fit`): a line cut inside one would read back as nothing at all.
+        let b = fit(s, self.b.len() - self.n).as_bytes();
+        self.b[self.n..self.n + b.len()].copy_from_slice(b);
+        self.n += b.len();
         Ok(())
     }
 }
@@ -495,7 +525,7 @@ impl Batch {
     }
     /// Text with its baseline at y; align 0 left, 1 centred on x, 2 right edge at x.
     fn text(&mut self, x: i64, y: i64, px: u16, colour: u32, align: u8, t: &str) {
-        let mut m = [0u8; 140];
+        let mut m = [0u8; 1 << 8];
         m[0] = 2;
         // Signed, as the display reads them (a page sliding off the left edge has its text at negative x); the clamp is the field's own range.
         m[1..3].copy_from_slice(&(x.clamp(-32768, 32767) as i16).to_le_bytes());
@@ -503,14 +533,14 @@ impl Batch {
         m[5..7].copy_from_slice(&px.to_le_bytes());
         m[7..11].copy_from_slice(&colour.to_le_bytes());
         m[11] = align;
-        let t = t.as_bytes();
-        let k = t.len().min(m.len() - 12);
+        let t = fit(t, m.len() - 12).as_bytes();
+        let k = t.len();
         m[12..12 + k].copy_from_slice(&t[..k]);
         self.op(&m[..12 + k]);
     }
     /// Text centred on (x, y) and turned about that centre by (c, s) in Q14, at opacity `alpha` (255 opaque): op 19, the titles turning in.
     fn turned(&mut self, x: i64, y: i64, px: u16, colour: u32, alpha: u8, c: i16, s: i16, t: &str) {
-        let mut m = [0u8; 140];
+        let mut m = [0u8; 1 << 8];
         m[0] = 19;
         // Signed, as the display reads them; the clamps are the fields' own ranges (a title riding off the screen can have its centre past the edge).
         m[1..3].copy_from_slice(&(x.clamp(-32768, 32767) as i16).to_le_bytes());
@@ -520,8 +550,8 @@ impl Batch {
         m[11] = alpha;
         m[12..14].copy_from_slice(&c.to_le_bytes());
         m[14..16].copy_from_slice(&s.to_le_bytes());
-        let t = t.as_bytes();
-        let k = t.len().min(m.len() - 16);
+        let t = fit(t, m.len() - 16).as_bytes();
+        let k = t.len();
         m[16..16 + k].copy_from_slice(&t[..k]);
         self.op(&m[..16 + k]);
     }
@@ -548,7 +578,7 @@ impl Batch {
     /// fluor's button (display op 47): its label at `px` in `ink` centred on (cx, cy), in front of a pill `w` wide (wider for a long label) and `h` high, filled `fill` inside its two-tone edge (`tl` on the top-left side of the anti-diagonal, `br` on the other).
     #[allow(clippy::too_many_arguments)]
     fn button(&mut self, cx: i64, cy: i64, w: i64, h: i64, px: i64, look: [u32; 4], t: &str) {
-        let mut m = [0u8; 140];
+        let mut m = [0u8; 1 << 8];
         m[0] = 47;
         // The clamps are the fields' own ranges, as for every op the display reads (a page sliding off an edge has its buttons past it).
         m[1..3].copy_from_slice(&(cx.clamp(-32768, 32767) as i16).to_le_bytes());
@@ -559,8 +589,8 @@ impl Batch {
         for (k, c) in look.iter().enumerate() {
             m[11 + 4 * k..15 + 4 * k].copy_from_slice(&c.to_le_bytes());
         }
-        let t = t.as_bytes();
-        let k = t.len().min(m.len() - 27);
+        let t = fit(t, m.len() - 27).as_bytes();
+        let k = t.len();
         m[27..27 + k].copy_from_slice(&t[..k]);
         self.op(&m[..27 + k]);
     }
@@ -584,7 +614,7 @@ impl Batch {
     /// A radio button (display op 49) or a checkbox (op 50) and its label, centred together on (cx, cy): the mark `mark` pixels across, its stroke `sw` wide (Q8 pixels), `state` bit 0 chosen or checked (bit 1 with it: the checkbox's tick); colours stroke, fill, the label's ink, the tick.
     #[allow(clippy::too_many_arguments)]
     fn mark(&mut self, op: u8, cx: i64, cy: i64, px: i64, mark: i64, sw: i64, state: u8, colours: [u32; 4], t: &str) {
-        let mut m = [0u8; 140];
+        let mut m = [0u8; 1 << 8];
         m[0] = op;
         m[1..3].copy_from_slice(&(cx.clamp(-32768, 32767) as i16).to_le_bytes());
         m[3..5].copy_from_slice(&(cy.clamp(-32768, 32767) as i16).to_le_bytes());
@@ -595,8 +625,8 @@ impl Batch {
         for (k, c) in colours.iter().enumerate() {
             m[12 + 4 * k..16 + 4 * k].copy_from_slice(&c.to_le_bytes());
         }
-        let t = t.as_bytes();
-        let k = t.len().min(m.len() - 28);
+        let t = fit(t, m.len() - 28).as_bytes();
+        let k = t.len();
         m[28..28 + k].copy_from_slice(&t[..k]);
         self.op(&m[..28 + k]);
     }
@@ -712,6 +742,9 @@ enum Choice {
     ZoneRegion(u16),
     ZoneCity(u16),
     ZoneNone,
+    /// The language page (SETTINGS.md): "follow my identity" turned over; a language picked, by its index (fgtw::text::Lang::index).
+    LangFollow,
+    Lang(u8),
     /// The title: the page picker up or away.
     Picker,
     /// A page's title in the picker: that page.
@@ -726,8 +759,8 @@ enum Choice {
     AskGo,
 }
 
-/// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The clock after the links (docs/RADIO-CONTROLS.md): its time, zone and sources.
-const PAGES: [&str; 18] = ["appearance", "units", "keyboard", "security", "kists", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "clock", "about", "developer"];
+/// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The clock after the links (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
+const PAGES: [&str; 19] = ["appearance", "units", "keyboard", "security", "kists", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "clock", "language", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Whether it looks like one (the orange hairlines, as the display's): FERROS_RELEASE_LOOK set gives a development build the release look for screen captures (owner, 2026-11-10), its tools kept.
@@ -738,17 +771,55 @@ const DEV_HINT: u8 = 4;
 /// The radios and USB in the kernel's facts order (facts 33 + 8 · link, ferros_sys::measure), as the Connections page names them.
 const LINKS: [&str; 6] = ["cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB"];
 
+/// A page's title in the person's language, by its key in `PAGES` (a link's own name is a name, and stays; cellular is a word, and is translated).
+fn page_title(key: &'static str) -> &'static str {
+    tr(match key {
+        "appearance" => Msg::PageAppearance,
+        "units" => Msg::PageUnits,
+        "keyboard" => Msg::PageKeyboard,
+        "security" => Msg::PageSecurity,
+        "kists" => Msg::PageKists,
+        "permissions" => Msg::PagePermissions,
+        "fleet" => Msg::PageFleet,
+        "power" => Msg::PagePower,
+        "connections" => Msg::PageConnections,
+        "cellular" => Msg::PageCellular,
+        "clock" => Msg::PageClock,
+        "language" => Msg::PageLanguage,
+        "about" => Msg::PageAbout,
+        "developer" => Msg::PageDeveloper,
+        _ => return key,
+    })
+}
+
 /// A link's state in words: switched off by its circle (preference 15; USB, the sixth, has no switch) before anything its driver last said, which outlives it.
 fn link_state(k: usize, state: Option<i64>) -> &'static str {
     if k < 5 && ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) >> k & 1 == 1 {
-        return "switched off";
+        return tr(Msg::SwitchedOff);
     }
     match state {
-        Some(0) => "off",
-        Some(1) => "on, no link",
-        Some(2) => "connected",
+        Some(0) => tr(Msg::Off),
+        Some(1) => tr(Msg::OnNoLink),
+        Some(2) => tr(Msg::Connected),
         _ => "-",
     }
+}
+
+/// What a right is, in the person's words and language, by its place in ferros_kist::RIGHTS (whose MEANS are the English).
+fn right_name(r: usize) -> &'static str {
+    const NAMES: [Msg; ferros_kist::RIGHTS.len()] = [Msg::RightDisplay, Msg::RightTouch, Msg::RightSurface, Msg::RightIra, Msg::RightDomain, Msg::RightEntropy, Msg::RightGps, Msg::RightUdp];
+    tr(NAMES[r])
+}
+
+/// A theme's name in the person's language, by its place in ferros_sys::theme::THEMES (whose `name`s are the English).
+fn theme_name(i: usize) -> &'static str {
+    const NAMES: [Msg; ferros_sys::theme::THEMES.len()] = [Msg::ThemeGrey, Msg::ThemeSlate, Msg::ThemeEmber, Msg::ThemeNight];
+    tr(NAMES[i])
+}
+
+/// The languages the language page offers, in Photon's picker order: those the display's face can draw (ferros_lang::renders; the others wait for a face).
+fn languages() -> impl Iterator<Item = Lang> {
+    Lang::ALL.into_iter().filter(|&l| ferros_lang::renders(l))
 }
 
 /// A measure (ferros_sys::measure) for a link's page: its name returned, its value written into `l` in its unit and the device's base (tatau). Milli units shown whole: a link's numbers to the unit are all a person reads.
@@ -778,81 +849,81 @@ fn measure_words(l: &mut Line, f: tatau::Fmt, kind: u16, v: i64) -> &'static str
                 35 => "USB",
                 _ => "-",
             });
-            "technology"
+            tr(Msg::Technology)
         }
-        m::RSSI => { num(l, v / 1000, " dBm"); "signal" }
-        m::NOISE => { num(l, v / 1000, " dBm"); "noise floor" }
-        m::SNR => { num(l, v / 1000, " dB"); "signal to noise" }
-        m::RSRP => { num(l, v / 1000, " dBm"); "reference power" }
-        m::RSRQ => { num(l, v / 1000, " dB"); "reference quality" }
-        m::SINR => { num(l, v / 1000, " dB"); "signal to interference" }
-        m::VSWR => { num(l, v / 1000, ":1"); "antenna match (VSWR)" }
-        m::TX_POWER => { num(l, v / 1000, " dBm"); "transmit power" }
-        m::FREQ if v >= 100_000 => { num(l, v / 1000, " MHz"); "frequency" }
-        m::FREQ => { num(l, v, " kHz"); "frequency" }
-        m::BANDWIDTH => { num(l, v / 1000, " MHz"); "channel width" }
-        m::CHANNEL => { num(l, v, ""); "channel" }
+        m::RSSI => { num(l, v / 1000, " dBm"); tr(Msg::Signal) }
+        m::NOISE => { num(l, v / 1000, " dBm"); tr(Msg::NoiseFloor) }
+        m::SNR => { num(l, v / 1000, " dB"); tr(Msg::SignalToNoise) }
+        m::RSRP => { num(l, v / 1000, " dBm"); tr(Msg::ReferencePower) }
+        m::RSRQ => { num(l, v / 1000, " dB"); tr(Msg::ReferenceQuality) }
+        m::SINR => { num(l, v / 1000, " dB"); tr(Msg::SignalToInterference) }
+        m::VSWR => { num(l, v / 1000, ":1"); tr(Msg::AntennaMatch) }
+        m::TX_POWER => { num(l, v / 1000, " dBm"); tr(Msg::TransmitPower) }
+        m::FREQ if v >= 100_000 => { num(l, v / 1000, " MHz"); tr(Msg::Frequency) }
+        m::FREQ => { num(l, v, " kHz"); tr(Msg::Frequency) }
+        m::BANDWIDTH => { num(l, v / 1000, " MHz"); tr(Msg::ChannelWidth) }
+        m::CHANNEL => { num(l, v, ""); tr(Msg::Channel) }
         m::RATE_DOWN | m::RATE_UP => {
             let _ = tatau::size_bits(l, f, v.unsigned_abs(), 1);
             l.s("/s");
-            if kind == m::RATE_DOWN { "rate down" } else { "rate up" }
+            if kind == m::RATE_DOWN { tr(Msg::RateDown) } else { tr(Msg::RateUp) }
         }
-        m::LATENCY => { let _ = tatau::duration_ns(l, f, v.unsigned_abs(), 1); "round trip" }
-        m::LOSS => { let _ = tatau::share(l, f, v.unsigned_abs(), 1_000_000, 2); "loss" }
+        m::LATENCY => { let _ = tatau::duration_ns(l, f, v.unsigned_abs(), 1); tr(Msg::RoundTrip) }
+        m::LOSS => { let _ = tatau::share(l, f, v.unsigned_abs(), 1_000_000, 2); tr(Msg::Loss) }
         m::MCS => { num(l, v, ""); "MCS" }
-        m::STREAMS => { num(l, v, ""); "streams" }
-        m::SATS_SEEN => { num(l, v, ""); "satellites seen" }
-        m::SATS_USED => { num(l, v, ""); "satellites in the fix" }
-        m::CN0 => { num(l, v / 1000, " dB-Hz"); "best carrier to noise" }
-        m::ACCURACY => { num(l, v / 1000, " m"); "accuracy (±)" }
+        m::STREAMS => { num(l, v, ""); tr(Msg::Streams) }
+        m::SATS_SEEN => { num(l, v, ""); tr(Msg::SatellitesSeen) }
+        m::SATS_USED => { num(l, v, ""); tr(Msg::SatellitesInFix) }
+        m::CN0 => { num(l, v / 1000, " dB-Hz"); tr(Msg::BestCarrierToNoise) }
+        m::ACCURACY => { num(l, v / 1000, " m"); tr(Msg::Accuracy) }
         m::REGISTRATION => {
-            l.s(match v {
-                0 => "not registered",
-                1 => "home",
-                2 => "searching",
-                3 => "denied",
-                5 => "roaming",
-                20 => "emergency only",
-                _ => "unknown",
-            });
-            "registration"
+            l.s(tr(match v {
+                0 => Msg::NotRegistered,
+                1 => Msg::RegHome,
+                2 => Msg::Searching,
+                3 => Msg::Denied,
+                5 => Msg::Roaming,
+                20 => Msg::EmergencyOnly,
+                _ => Msg::Unknown,
+            }));
+            tr(Msg::Registration)
         }
-        m::MTU => { let _ = tatau::size_bits(l, f, v.unsigned_abs() * 8, 1); "largest packet" }
-        m::PACKETS_DOWN => { num(l, v, ""); "packets in" }
-        m::PACKETS_UP => { num(l, v, ""); "packets out" }
-        m::ERRORS_DOWN => { num(l, v, ""); "bad packets in" }
-        m::ERRORS_UP => { num(l, v, ""); "failed packets out" }
-        m::DROPPED_DOWN => { num(l, v, ""); "dropped in" }
-        m::DROPPED_UP => { num(l, v, ""); "refused out" }
-        m::SUSPENDS => { num(l, v, ""); "link naps" }
+        m::MTU => { let _ = tatau::size_bits(l, f, v.unsigned_abs() * 8, 1); tr(Msg::LargestPacket) }
+        m::PACKETS_DOWN => { num(l, v, ""); tr(Msg::PacketsIn) }
+        m::PACKETS_UP => { num(l, v, ""); tr(Msg::PacketsOut) }
+        m::ERRORS_DOWN => { num(l, v, ""); tr(Msg::BadPacketsIn) }
+        m::ERRORS_UP => { num(l, v, ""); tr(Msg::FailedPacketsOut) }
+        m::DROPPED_DOWN => { num(l, v, ""); tr(Msg::DroppedIn) }
+        m::DROPPED_UP => { num(l, v, ""); tr(Msg::RefusedOut) }
+        m::SUSPENDS => { num(l, v, ""); tr(Msg::LinkNaps) }
         m::POWER_SAVE => {
             l.s(match v {
-                0 => "off",
-                1 => "on",
-                2 => "fast",
+                0 => tr(Msg::Off),
+                1 => tr(Msg::On),
+                2 => tr(Msg::Fast),
                 _ => "-",
             });
-            "power save"
+            tr(Msg::PowerSave)
         }
         m::LINK_POWER => {
             l.s(match v {
-                0 => "working",
-                1 => "light sleep",
-                2 => "sleep",
-                3 => "suspended",
+                0 => tr(Msg::Working),
+                1 => tr(Msg::LightSleep),
+                2 => tr(Msg::Sleep),
+                3 => tr(Msg::Suspended),
                 _ => "-",
             });
-            "link power"
+            tr(Msg::LinkPower)
         }
-        m::ALTITUDE => { num(l, v / 1000, " m"); "altitude" }
-        m::SPEED => { num(l, v / 1000, " m/s"); "speed" }
-        m::HEADING => { num(l, v / 1000, "°"); "heading" }
-        _ => { num(l, v, ""); "measure" }
+        m::ALTITUDE => { num(l, v / 1000, " m"); tr(Msg::Altitude) }
+        m::SPEED => { num(l, v / 1000, " m/s"); tr(Msg::Speed) }
+        m::HEADING => { num(l, v / 1000, "°"); tr(Msg::Heading) }
+        _ => { num(l, v, ""); tr(Msg::Measure) }
     }
 }
 
 /// The groups a link's page shows its measures in (docs/RADIO-CONTROLS.md), in order: each kind's group.
-const GROUPS: [&str; 5] = ["signal", "channel", "link", "counters", "motion"];
+const GROUPS: [Msg; 5] = [Msg::Signal, Msg::Channel, Msg::GroupLink, Msg::GroupCounters, Msg::GroupMotion];
 fn group_of(kind: u16) -> usize {
     use ferros_sys::measure as m;
     match kind {
@@ -948,22 +1019,21 @@ fn fleet_take(seen: u32) -> Option<(u32, Fleet)> {
 
 /// A detail field's name for the page (ferros_detail's schemas).
 fn detail_label(field: &str) -> &'static str {
-    match field {
-        "carrier" => "carrier",
-        "apn" => "data APN",
-        "attach_apn" => "attach APN",
-        "ipv4" => "address",
-        "ipv6" => "address (IPv6)",
-        "dns4" => "DNS",
-        "dns6" => "DNS (IPv6)",
-        "ssid" => "network",
-        "bssid" => "access point",
-        "mac" => "this device on it",
-        "router" => "router",
-        "dns" => "DNS",
-        "lease" => "lease",
-        _ => "detail",
-    }
+    tr(match field {
+        "carrier" => Msg::Carrier,
+        "apn" => Msg::DataApn,
+        "attach_apn" => Msg::AttachApn,
+        "ipv4" => Msg::Address,
+        "ipv6" => Msg::AddressIpv6,
+        "dns4" | "dns" => return "DNS",
+        "dns6" => Msg::DnsIpv6,
+        "ssid" => Msg::Network,
+        "bssid" => Msg::AccessPoint,
+        "mac" => Msg::ThisDeviceOnIt,
+        "router" => Msg::Router,
+        "lease" => Msg::Lease,
+        _ => Msg::Detail,
+    })
 }
 
 /// A detail value written for the page: names as they are; addresses, being identifiers and not quantities, in hexadecimal grouped as their standards group them (no base's magnitude reading makes sense of them); a lease as a duration in the device's base.
@@ -1021,7 +1091,7 @@ fn system_name(s: u8) -> &'static str {
         3 => "BeiDou",
         4 => "QZSS",
         5 => "NavIC",
-        _ => "other",
+        _ => tr(Msg::OtherSystem),
     }
 }
 
@@ -1029,12 +1099,12 @@ fn system_name(s: u8) -> &'static str {
 const BASES: [u8; 4] = [12, 0x8C, 10, 16];
 
 fn base_name(code: u8) -> &'static str {
-    match code {
-        10 => "arabic",
-        16 => "hexadecimal",
-        0x8C => "dozenal linear (DLS)",
-        _ => "dozenal magnitude (DMS)",
-    }
+    tr(match code {
+        10 => Msg::BaseArabic,
+        16 => Msg::BaseHex,
+        0x8C => Msg::BaseDls,
+        _ => Msg::BaseDms,
+    })
 }
 
 struct Map {
@@ -1115,9 +1185,9 @@ struct Map {
     kists: ferros_kist::Kists,
     /// The first-launch question on an open kist circle: each unanswered want's switch as the person has it now, a bit per want (started from their defaults).
     ask: u64,
-    /// The clock page's zone picker while it is open (`ZonePick`), and the last word on a choice that did not take, shown until the next tap on the page.
+    /// The clock page's zone picker while it is open (`ZonePick`), and the last word on a choice that did not take (the clock's or the language's), shown until the next tap on the page, in the language in effect when it draws.
     zone_pick: Option<ZonePick>,
-    zone_note: Option<&'static str>,
+    zone_note: Option<Msg>,
 }
 
 /// The clock page's zone picker (owner, 2026-11-10: "auto/manual zone, picker, all that"): every zone's id as the kernel lists them (SYS_ZONE op 6, the zones document's order), browsed by region (the IANA id's first part: America, Europe, …) then by place. No typing: the map has no keyboard of its own (the attest screen hosts the one there is), so a list it is.
@@ -1647,8 +1717,9 @@ impl Map {
             m[at + 10] = a.ring;
             m[at + 11] = a.lit;
             m[at + 12] = a.icon;
-            let label = a.label.as_bytes();
-            let len = if labels || a.icon == 0 { label.len().min(16) } else { 0 };
+            // The settings circle's name in the person's language (its `label` stays the English key its place is kept under); a kist's is its own. The op's field holds 16 bytes, cut at a character's edge (`fit`).
+            let label = fit(if i == 0 { tr(Msg::Settings) } else { a.label }, 16).as_bytes();
+            let len = if labels || a.icon == 0 { label.len() } else { 0 };
             m[at + 13] = len as u8;
             m[at + 14..at + 14 + len].copy_from_slice(&label[..len]);
         }
@@ -2034,7 +2105,7 @@ impl Map {
             let (c, s) = (libm::cos(phi), libm::sin(phi));
             let (x, y) = (cx as f64 + arc * s, cyf - arc * c);
             let p = self.wrap(self.page as isize + k);
-            b.turned(libm::round(x) as i64, libm::round(y) as i64, size as u16, white(), alpha as u8, libm::round(c * 16384.) as i16, libm::round(s * 16384.) as i16, PAGES[p]);
+            b.turned(libm::round(x) as i64, libm::round(y) as i64, size as u16, white(), alpha as u8, libm::round(c * 16384.) as i16, libm::round(s * 16384.) as i16, page_title(PAGES[p]));
         }
         // The neighbours are still a tap away, either side of the title where their titles stood.
         for k in [-1i8, 1] {
@@ -2080,7 +2151,7 @@ impl Map {
         let pitch = uu(7, 2);
         let h = uu(3, 1) + open.len() as i64 * pitch + uu(4, 1);
         let mut y = (top + bottom - h) / 2 + uu(2, 1);
-        b.text(cx, y, uu(1, 1) as u16, grey(), 1, "asks for, once; change it later in settings");
+        b.text(cx, y, uu(1, 1) as u16, grey(), 1, tr(Msg::AsksForOnce));
         y += uu(3, 1);
         let live = self.target.is_none();
         for &j in &open {
@@ -2088,7 +2159,7 @@ impl Map {
             let on = self.ask >> j & 1 == 1;
             // Its checkbox (COMPOSITOR.md "Controls"), the label white when on.
             let (sw, colours, tick) = mark_look(uu(5, 4));
-            b.mark(50, cx, y - uu(1, 2), uu(5, 4), uu(1, 1), sw, on as u8 | ((on && tick) as u8) << 1, [colours[0], colours[1], if on { white() } else { grey() }, colours[3]], ferros_kist::MEANS[w.right as usize]);
+            b.mark(50, cx, y - uu(1, 2), uu(5, 4), uu(1, 1), sw, on as u8 | ((on && tick) as u8) << 1, [colours[0], colours[1], if on { white() } else { grey() }, colours[3]], right_name(w.right as usize));
             b.text(cx, y + uu(3, 2), uu(7, 8) as u16, dim(), 1, &w.reason);
             if live {
                 self.push_row(cx - half, cx + half, y - uu(2, 1), y + uu(3, 2), Choice::AskWant(j as u8));
@@ -2098,7 +2169,7 @@ impl Map {
         y += uu(1, 1);
         // The button that starts it: fluor's, held while a finger is on it.
         let [bf, bh, tl, br] = BUTTON_LOOK[ferros_sys::theme::index()];
-        b.button(cx, y - uu(1, 2), uu(16, 1), uu(2, 1), uu(3, 2), [if self.pressed == Some(Choice::AskGo) { bh } else { bf }, tl, br, white()], "start");
+        b.button(cx, y - uu(1, 2), uu(16, 1), uu(2, 1), uu(3, 2), [if self.pressed == Some(Choice::AskGo) { bh } else { bf }, tl, br, white()], tr(Msg::Start));
         if live {
             self.push_row(cx - half, cx + half, y - uu(2, 1), y + uu(1, 1), Choice::AskGo);
         }
@@ -2130,7 +2201,7 @@ impl Map {
             if row_top < top || row_top + pitch > bottom {
                 continue;
             }
-            b.text(cx, base, size as u16, if p == self.page { white() } else { grey() }, 1, PAGES[p]);
+            b.text(cx, base, size as u16, if p == self.page { white() } else { grey() }, 1, page_title(PAGES[p]));
             if self.page_dx == 0 {
                 self.push_row(cx - half, cx + half, row_top, row_top + pitch, Choice::Pick(p as u8));
             }
@@ -2277,6 +2348,21 @@ impl Map {
         };
         let small = uu(5, 4);
         let note = uu(7, 8);
+        // A note under the control above it, small and dim: a message's lines ('\n' between them), the first a unit over `y` and each next a unit and a half lower, `y` then past them all (where the two-line notes always left it).
+        let notes = |b: &mut Batch, y: &mut i64, t: &str| {
+            let mut n = 0;
+            for (k, line) in t.split('\n').enumerate() {
+                b.text(cx, *y - uu(1, 1) + k as i64 * uu(3, 2), note as u16, dim(), 1, line);
+                n = k as i64 + 1;
+            }
+            *y += n * uu(3, 2);
+        };
+        // Rows for a message of several lines ('\n' a forced break; each line still wrapped at its spaces by `row`).
+        let rows = |m: &mut Map, b: &mut Batch, y: &mut i64, px: i64, colour: u32, t: &str| {
+            for line in t.split('\n') {
+                row(m, b, y, px, colour, line, None);
+            }
+        };
         match PAGES[p] {
             "appearance" => {
                 // The themes as swatches: each its ground with its ring around it, the one in use with its mark colour at the centre, its name beneath.
@@ -2289,22 +2375,22 @@ impl Map {
                     }
                     b.disc(x, y, uu(2, 1) - uu(1, 4), t.plane);
                     b.disc(x, y, uu(2, 1), t.ring);
-                    b.text(x, y + uu(3, 1) + uu(1, 2), note as u16, if i == now_t { white() } else { grey() }, 1, t.name);
+                    b.text(x, y + uu(3, 1) + uu(1, 2), note as u16, if i == now_t { white() } else { grey() }, 1, theme_name(i));
                     if hit {
                         self.push_row(x - uu(3, 1), x + uu(3, 1), y - uu(2, 1) - uu(1, 2), y + uu(4, 1), Choice::Theme(i as u8));
                     }
                 }
                 y += uu(7, 1);
-                b.text(cx, y, small as u16, grey(), 1, "brightness");
+                b.text(cx, y, small as u16, grey(), 1, tr(Msg::Brightness));
                 y += uu(2, 1);
                 // Brightness: a continuous slider, dimmest on the left, dragged or tapped (owner, 2026-11-08: "sliders (for brightness)", "why's brightness not continuous?").
                 slider(self, b, &mut y, Choice::Brightness);
                 // The UI scale, half to twice, as a pinch on the page sets it.
-                b.text(cx, y, small as u16, grey(), 1, "scale");
+                b.text(cx, y, small as u16, grey(), 1, tr(Msg::Scale));
                 y += uu(2, 1);
                 slider(self, b, &mut y, Choice::Scale);
                 let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
-                mark(self, b, &mut y, 50, "names under circles", labels, Some(Choice::Labels));
+                mark(self, b, &mut y, 50, tr(Msg::NamesUnderCircles), labels, Some(Choice::Labels));
             }
             "units" => {
                 // The number base is chosen by seeing: each row is two seconds and a mebibyte (2^23 bits, a whole number of doublings) written in that base, its name small beneath.
@@ -2328,7 +2414,7 @@ impl Map {
                 }
             }
             "keyboard" => {
-                b.text(cx, y, note as u16, dim(), 1, "layout");
+                b.text(cx, y, note as u16, dim(), 1, tr(Msg::Layout));
                 y += uu(2, 1);
                 let now_l = ferros_sys::pref(ferros_sys::PREF_LAYOUT);
                 radios(self, b, &mut y, &["Dvorak", "QWERTY"], now_l as usize, &|i| Choice::Layout(i as u8));
@@ -2339,32 +2425,38 @@ impl Map {
                 // A checkbox; armed, its label asks for the second tap.
                 let armed = self.armed;
                 // Its words say attest, as the attest screen does (owner, 2026-11-10: "always attest").
-                mark(self, b, &mut y, 50, if armed { "tap again: attest at boot" } else { "attest at boot" }, on, Some(Choice::UnlockAtBoot));
-                b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "on, the device opens without your handle:");
-                b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "whoever holds it holds your identity");
-                y += uu(3, 1);
+                mark(self, b, &mut y, 50, tr(if armed { Msg::AttestAtBootArmed } else { Msg::AttestAtBoot }), on, Some(Choice::UnlockAtBoot));
+                notes(b, &mut y, tr(Msg::AttestAtBootNote));
             }
             "fleet" => {
-                // The fleet this identity's devices make (payloads/fgtw): where this device stands, the members, and removing this device. Removing wipes the identity's things from it (AUTH.md: the identity class) and it restarts at the attest screen once a device of the fleet approves.
+                // The fleet this identity's devices make (payloads/fgtw): where this device stands, the members, and removing this device. Removing wipes the identity's things from it (AUTH.md: the identity class) and it restarts at the attest screen once a device of the fleet approves. Its words are fgtw's (fgtw::text), the same Photon shows, but for the home screen's and what removing wipes here.
                 let f = self.fleet;
+                let named = |b: &[u8], n: usize, or: FleetMsg<'static>| -> Line {
+                    match core::str::from_utf8(&b[..n]) {
+                        Ok(s) if !s.is_empty() => {
+                            let mut l = Line::new();
+                            l.s(s);
+                            l
+                        }
+                        _ => fleet(or),
+                    }
+                };
                 'fleet: {
                 // A sibling asking to leave: the request alone, nothing else on the page until it is answered (owner, 2026-11-10: "curious why there's so many buttons on that screen", and "it's a bit vague").
-                if let (Some(3), Some((_, result))) = (f.state, f.depart) {
-                    let name = core::str::from_utf8(&f.depart_name[..f.depart_name_n]).unwrap_or("");
-                    b.text(cx, y, (uu(3, 2)) as u16, white(), 1, if name.is_empty() { "one of your devices" } else { name });
-                    y += uu(2, 1);
-                    row(self, b, &mut y, small, white(), "is asking your fleet for its release", None);
+                if let (Some(3), Some((intent, result))) = (f.state, f.depart) {
+                    let name = named(&f.depart_name, f.depart_name_n, FleetMsg::OneOfYourDevices);
+                    rows(self, b, &mut y, small, white(), fleet(FleetMsg::DepartRequestLine(name.as_str())).as_str());
                     match result {
                         0 | 3 => {
-                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "approving wipes it and frees its hardware to join any fleet");
-                            b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "denying keeps it in your fleet");
-                            y += uu(3, 1);
-                            button(self, b, &mut y, if result == 3 { "approve again: the last one did not go out" } else { "approve" }, false, Some(Choice::FleetApprove));
-                            button(self, b, &mut y, "deny", false, Some(Choice::FleetDeny));
+                            // What approving does (it asked to have its hardware freed for a new owner, intent 1, or to keep it with this fleet), a sentence wrapped to the page, and what denying does.
+                            rows(self, b, &mut y, note, dim(), fleet(if intent == 1 { FleetMsg::DepartFreesHardware } else { FleetMsg::DepartKeepsHardware }).as_str());
+                            notes(b, &mut y, fleet(FleetMsg::DepartDenyKeeps).as_str());
+                            button(self, b, &mut y, fleet(if result == 3 { FleetMsg::DepartApproveAgainPill } else { FleetMsg::DepartApprovePill }).as_str(), false, Some(Choice::FleetApprove));
+                            button(self, b, &mut y, fleet(FleetMsg::DepartDenyPill).as_str(), false, Some(Choice::FleetDeny));
                         }
-                        1 => row(self, b, &mut y, small, grey(), "approving", None),
-                        2 => row(self, b, &mut y, small, grey(), "approved: it is leaving your fleet", None),
-                        _ => row(self, b, &mut y, small, grey(), "denied: it stays in your fleet", None),
+                        1 => row(self, b, &mut y, small, grey(), fleet(FleetMsg::DepartApproving).as_str(), None),
+                        2 => row(self, b, &mut y, small, grey(), fleet(FleetMsg::DepartApproved).as_str(), None),
+                        _ => rows(self, b, &mut y, small, grey(), fleet(FleetMsg::DepartDeniedHere(name.as_str())).as_str()),
                     }
                     break 'fleet;
                 }
@@ -2375,95 +2467,88 @@ impl Map {
                         b.text(cx, y, (uu(3, 2)) as u16, white(), 1, me);
                         y += uu(2, 1);
                     }
-                    row(self, b, &mut y, small, white(), if f.state == Some(8) { "this device is asking your fleet for its release" } else { "sending the request to your devices" }, None);
-                    b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "approve or deny on any of your other devices,");
-                    b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "or tap one of them to this one");
-                    y += uu(3, 1);
-                    b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "once approved, your things are wiped from it");
-                    b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "and it restarts; back gives up leaving");
-                    y += uu(3, 1);
+                    row(self, b, &mut y, small, white(), fleet(if f.state == Some(8) { FleetMsg::DepartAsking } else { FleetMsg::DepartSending }).as_str(), None);
+                    notes(b, &mut y, fleet(FleetMsg::DepartTapHint).as_str());
+                    notes(b, &mut y, fleet(FleetMsg::DepartThen).as_str());
                     break 'fleet;
                 }
                 // A departure approved here has gone through: said once, above the page.
                 if f.left_n > 0 {
-                    let mut l = Line::new();
-                    l.s(core::str::from_utf8(&f.left[..f.left_n]).unwrap_or("a device"));
-                    l.s(" left your fleet");
-                    row(self, b, &mut y, small, white(), l.as_str(), None);
+                    let name = named(&f.left, f.left_n, FleetMsg::ADevice);
+                    rows(self, b, &mut y, small, white(), fleet(FleetMsg::FleetSignedOut(name.as_str())).as_str());
                 }
                 let state = match f.state {
-                    None => "the identity service is not running",
-                    Some(0) => "no identity here",
-                    Some(1) => "joining: confirm on one of your devices",
-                    Some(2) => "in the fleet, waiting for its key",
-                    Some(3) => "in the fleet",
-                    Some(8) => "leaving the fleet",
+                    None => {
+                        let mut l = Line::new();
+                        l.s(tr(Msg::FleetServiceNotRunning));
+                        l
+                    }
+                    Some(0) => fleet(FleetMsg::NoIdentityHere),
+                    Some(1) => fleet(FleetMsg::JoiningConfirm),
+                    Some(2) => fleet(FleetMsg::InFleetWaitingKey),
+                    Some(3) => fleet(FleetMsg::InFleet),
+                    Some(8) => fleet(FleetMsg::LeavingFleet),
                     // fgtw's verdicts while not yet bound (payloads/fgtw V_*), each its own words: until 2026-11-08 all four read "looking the identity up", forever when offline.
-                    Some(5) => "a new identity: no fleet holds it yet",
-                    Some(6) => "this handle has another identity's fleet",
-                    Some(7) => "no verdict: nothing answers",
-                    Some(_) => "looking the identity up",
+                    Some(5) => fleet(FleetMsg::NewIdentityNoFleet),
+                    Some(6) => fleet(FleetMsg::HandleHasOtherFleet),
+                    Some(7) => fleet(FleetMsg::NoVerdict),
+                    Some(_) => fleet(FleetMsg::LookingUp),
                 };
-                row(self, b, &mut y, small, white(), state, None);
+                row(self, b, &mut y, small, white(), state.as_str(), None);
                 for i in 0..f.n {
                     // Each member by the two-word name its fleet knows it by (Photon's Fleet page shows the same one); the key's first four bytes only when the service gave no name.
-                    let mut l = Line::new();
+                    let mut name = Line::new();
                     match core::str::from_utf8(&f.names[i][..f.names_n[i] as usize]) {
-                        Ok(name) if !name.is_empty() => {
-                            l.s(name);
+                        Ok(s) if !s.is_empty() => {
+                            name.s(s);
                         }
                         _ => {
                             for x in &f.keys[i][..4] {
-                                let _ = write!(l, "{x:02x}");
+                                let _ = write!(name, "{x:02x}");
                             }
                         }
                     }
-                    if f.me[i] {
-                        l.s("  this device");
+                    let l = if f.me[i] {
+                        fleet(FleetMsg::MemberThisDevice(name.as_str()))
                     } else if f.heard[i] {
-                        l.s("  nearby");
-                    }
+                        fleet(FleetMsg::MemberNearby(name.as_str()))
+                    } else {
+                        name
+                    };
                     row(self, b, &mut y, small, if f.me[i] { white() } else { grey() }, l.as_str(), None);
                 }
                 // Adding a device, and approving a sibling's departure (fgtw::sponsor, through payloads/fgtw ops 8-15): a member of the fleet only.
                 if f.state == Some(3) {
                     // The home screen across the person's devices (owner, 2026-11-08: "on all my ferros devices the homescreen layout should sync, unless of course I go into settings and uncheck that"): its kists and answers always follow them; its arrangement does unless switched off here.
                     if let Some((on, settled)) = f.home {
-                        let label = match (on, settled) {
-                            (_, false) => "home screen: fetching yours from your fleet",
-                            (true, true) => "home screen: the same on all your devices",
-                            (false, true) => "home screen: this device's own",
-                        };
                         // A checkbox once the fleet has answered: checked, the same on all your devices; unchecked, this device's own.
                         if settled {
-                            mark(self, b, &mut y, 50, "home screen: the same on all your devices", on, Some(Choice::HomeSync));
+                            mark(self, b, &mut y, 50, tr(Msg::HomeSame), on, Some(Choice::HomeSync));
                         } else {
-                            row(self, b, &mut y, small, grey(), label, None);
+                            row(self, b, &mut y, small, grey(), tr(Msg::HomeFetching), None);
                         }
                     }
                     if f.denied_by_n > 0 {
-                        let mut l = Line::new();
-                        l.s("leaving was denied on ");
-                        l.s(core::str::from_utf8(&f.denied_by[..f.denied_by_n]).unwrap_or("one of your devices"));
-                        row(self, b, &mut y, small, white(), l.as_str(), None);
+                        let name = named(&f.denied_by, f.denied_by_n, FleetMsg::OneOfYourDevices);
+                        rows(self, b, &mut y, small, white(), fleet(FleetMsg::DepartDeniedOn(name.as_str())).as_str());
                     }
                     if f.add == 0 {
-                        button(self, b, &mut y, "add a device", false, Some(Choice::FleetAdd));
+                        button(self, b, &mut y, fleet(FleetMsg::AddDevicePill).as_str(), false, Some(Choice::FleetAdd));
                         // Only a device heard here (its beacon or its request on this network, flags bits 0 and 1): one known only from fgtw.org's registry is no one nearby, and a join asked from anywhere on the internet is said nowhere (owner, 2026-11-10: "LAN, fine. WAN, nope").
                         if f.cand_flags[..f.cands].iter().any(|&fl| fl & 3 != 0) {
-                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "a device on this network is asking to join");
-                            y += uu(2, 1);
+                            notes(b, &mut y, fleet(FleetMsg::DeviceAsksToJoin).as_str());
                         }
                     } else {
                         let phase = match f.add {
-                            1 => "add a device: devices asking to join",
-                            2 => "adding it to the fleet",
-                            3 => "add a device: selected",
-                            4 => "handing it the fleet's key",
-                            5 => "added",
-                            _ => "adding it failed",
+                            1 => FleetMsg::AddAsking,
+                            2 => FleetMsg::AddingToFleet,
+                            3 => FleetMsg::AddSelected,
+                            4 => FleetMsg::HandingKey,
+                            5 => FleetMsg::Added,
+                            _ => FleetMsg::AddingFailed,
                         };
-                        row(self, b, &mut y, small, white(), phase, None);
+                        row(self, b, &mut y, small, white(), fleet(phase).as_str(), None);
+                        // The identity service's own note on the flow, in its words (payloads/fgtw `adding_reply`).
                         if f.add_note_n > 0 {
                             b.text(cx, y - uu(1, 1), note as u16, dim(), 1, core::str::from_utf8(&f.add_note[..f.add_note_n]).unwrap_or(""));
                             y += uu(2, 1);
@@ -2471,28 +2556,28 @@ impl Map {
                         for i in 0..f.cands {
                             // A device heard nearby (its request on this network, or its beacon) is a tap to pick; one only the registry knows is matched by its words.
                             let nearby = f.cand_flags[i] & 3 != 0;
-                            let mut l = Line::new();
-                            l.s(core::str::from_utf8(&f.cand_name[i][..f.cand_name_n[i] as usize]).unwrap_or("a device"));
-                            l.s(if f.cand_flags[i] & 4 != 0 { "  added" } else if nearby { "  nearby: tap to select" } else { "  not nearby: type its words" });
+                            let name = named(&f.cand_name[i], f.cand_name_n[i] as usize, FleetMsg::ADevice);
+                            let l = fleet(if f.cand_flags[i] & 4 != 0 {
+                                FleetMsg::CandAdded(name.as_str())
+                            } else if nearby {
+                                FleetMsg::CandNearby(name.as_str())
+                            } else {
+                                FleetMsg::CandNotNearby(name.as_str())
+                            });
                             let pick = nearby && f.add == 1;
                             row(self, b, &mut y, small, if pick { white() } else { grey() }, l.as_str(), pick.then_some(Choice::FleetPick(i as u8)));
                         }
                         if f.add == 1 {
                             if f.cands == 0 {
-                                b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "open Photon's join screen on the device");
-                                y += uu(2, 1);
+                                notes(b, &mut y, fleet(FleetMsg::OpenPhotonJoin).as_str());
                             }
-                            button(self, b, &mut y, "type its words", false, Some(Choice::FleetWords));
-                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "or hold the two devices together: it joins at once");
-                            y += uu(2, 1);
+                            button(self, b, &mut y, fleet(FleetMsg::TypeItsWordsPill).as_str(), false, Some(Choice::FleetWords));
+                            notes(b, &mut y, fleet(FleetMsg::HoldTogether).as_str());
                         }
                         // Selected (fgtw ADD_SELECTED, owner 2026-11-10: "I need a distinct green add, and note to press back otherwise"): the device and its words, the same it shows, Add in VSF RGB primary green, and Back with nothing to undo.
                         if f.add == 3 {
-                            let name = core::str::from_utf8(&f.sel_name[..f.sel_name_n]).unwrap_or("the device");
-                            let mut l = Line::new();
-                            l.s("Selected: ");
-                            l.s(name);
-                            row(self, b, &mut y, small, white(), l.as_str(), None);
+                            let name = named(&f.sel_name, f.sel_name_n, FleetMsg::TheDevice);
+                            row(self, b, &mut y, small, white(), fleet(FleetMsg::SelectedDevice(name.as_str())).as_str(), None);
                             // The words four to a line, as the device shows them.
                             let words = core::str::from_utf8(&f.sel_words[..f.sel_words_n]).unwrap_or("");
                             let mut line = Line::new();
@@ -2515,41 +2600,37 @@ impl Map {
                                 y += uu(2, 1);
                             }
                             // The question and its two answers side by side (owner, 2026-11-10: "Is your new device bright green? and that should have a yes and no, no does the same as back"): Yes in VSF RGB green adds it; No goes back to the list, nothing to undo.
-                            row(self, b, &mut y, small, white(), "Is your new device bright green?", None);
+                            rows(self, b, &mut y, small, white(), fleet(FleetMsg::IsNewDeviceGreen).as_str());
                             let (bw, off) = (uu(7, 1), uu(4, 1));
                             let yes_down = self.pressed == Some(Choice::FleetConfirm);
-                            b.button(cx - off, y - uu(1, 2), bw, uu(2, 1), uu(5, 4), [if yes_down { GREEN_HELD } else { GREEN }, GREEN_EDGE, GREEN_EDGE, 0x000000], "Yes");
+                            b.button(cx - off, y - uu(1, 2), bw, uu(2, 1), uu(5, 4), [if yes_down { GREEN_HELD } else { GREEN }, GREEN_EDGE, GREEN_EDGE, 0x000000], fleet(FleetMsg::YesPill).as_str());
                             let [fill, held, tl, br] = BUTTON_LOOK[ferros_sys::theme::index()];
                             let no_down = self.pressed == Some(Choice::FleetAdd);
-                            b.button(cx + off, y - uu(1, 2), bw, uu(2, 1), uu(5, 4), [if no_down { held } else { fill }, tl, br, white()], "No");
+                            b.button(cx + off, y - uu(1, 2), bw, uu(2, 1), uu(5, 4), [if no_down { held } else { fill }, tl, br, white()], fleet(FleetMsg::NoPill).as_str());
                             if hit {
                                 self.push_row(cx - half, cx, y - uu(2, 1), y + uu(1, 1), Choice::FleetConfirm);
                                 self.push_row(cx, cx + half, y - uu(2, 1), y + uu(1, 1), Choice::FleetAdd);
                             }
                             y += uu(3, 1);
                         }
-                        button(self, b, &mut y, if f.add >= 5 { "done" } else { "close" }, false, Some(Choice::FleetClose));
+                        button(self, b, &mut y, fleet(if f.add >= 5 { FleetMsg::DonePill } else { FleetMsg::ClosePill }).as_str(), false, Some(Choice::FleetClose));
                     }
                 }
                 if matches!(f.state, Some(2) | Some(3)) {
-                    button(self, b, &mut y, if f.confirm { "tap again: remove this device" } else { "remove this device" }, f.confirm, Some(Choice::FleetRemove));
+                    button(self, b, &mut y, fleet(FleetMsg::RemovePill { armed: f.confirm }).as_str(), f.confirm, Some(Choice::FleetRemove));
                     if f.confirm {
-                        b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "wipes from this device: the map's arrangement,");
-                        b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "WiFi networks, the last location; not saved");
-                        y += uu(3, 1);
+                        notes(b, &mut y, tr(Msg::RemoveNote));
                     }
                     if f.leave_result.is_some_and(|r| r != 0) {
-                        row(self, b, &mut y, small, white(), "the departure did not start", None);
+                        row(self, b, &mut y, small, white(), fleet(FleetMsg::DepartNotStarted).as_str(), None);
                     }
                 }
                 }
             }
             "power" => {
                 let on = ferros_sys::pref(ferros_sys::PREF_PROX_WAKE) == 1;
-                mark(self, b, &mut y, 50, "proximity wake", on, Some(Choice::ProxWake));
-                b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "on, the power key lights the screen");
-                b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "only when nothing covers the sensor");
-                y += uu(3, 1);
+                mark(self, b, &mut y, 50, tr(Msg::ProximityWake), on, Some(Choice::ProxWake));
+                notes(b, &mut y, tr(Msg::ProximityWakeNote));
             }
             "connections" => {
                 // Each link as its driver says it (measure STATE), each row its own page's door (owner, 2026-11-07).
@@ -2558,7 +2639,7 @@ impl Map {
                     let state = facts.0[33 + 8 * k..41 + 8 * k].iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::STATE).map(|m| m.1);
                     let y_row = y;
                     // Switched off by its status circle (preference 15; USB, the sixth, has no switch): the driver's last word outlives it, so the switch is read first.
-                    fact(b, &mut y, name, link_state(k, state));
+                    fact(b, &mut y, page_title(name), link_state(k, state));
                     if hit {
                         self.push_row(cx - half, cx + half, y_row - uu(2, 1), y, Choice::Link(k as u8));
                     }
@@ -2572,9 +2653,9 @@ impl Map {
                 let state = slots.iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::STATE).map(|m| m.1);
                 if k < 5 {
                     let off = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) >> k & 1 == 1;
-                    mark(self, b, &mut y, 50, "on", !off, Some(Choice::Switch(k as u8)));
+                    mark(self, b, &mut y, 50, tr(Msg::On), !off, Some(Choice::Switch(k as u8)));
                 }
-                fact(b, &mut y, "state", link_state(k, state));
+                fact(b, &mut y, tr(Msg::State), link_state(k, state));
                 let f = ferros_sys::numbers(Style::Glyphs);
                 // Everything the driver publishes (docs/RADIO-CONTROLS.md): its eight slots, then its tracks, grouped (signal, channel, link, counters, motion); tracked satellites listed on their own; then its names and addresses (the detail, read with the Settings capability), then its knobs.
                 let mut words = [ferros_sys::MEASURE_NONE; 8 + ferros_sys::TRACKS_MAX];
@@ -2595,7 +2676,7 @@ impl Map {
                             continue;
                         }
                         if first {
-                            header(b, &mut y, gname);
+                            header(b, &mut y, tr(*gname));
                             first = false;
                         }
                         let mut l = Line::new();
@@ -2609,7 +2690,7 @@ impl Map {
                 for &w in all {
                     let Some(s) = ferros_sys::sat_of(w) else { continue };
                     if nsat == 0 {
-                        header(b, &mut y, "satellites");
+                        header(b, &mut y, tr(Msg::Satellites));
                     }
                     nsat += 1;
                     let cnt = |l: &mut Line, n: i64| {
@@ -2625,17 +2706,16 @@ impl Map {
                     name.s(" ");
                     cnt(&mut name, s.number as i64);
                     name.s(if s.band == 1 { " L5" } else { " L1" });
-                    let mut l = Line::new();
-                    cnt(&mut l, s.elevation as i64);
-                    l.s("° up, ");
-                    cnt(&mut l, s.azimuth as i64);
-                    l.s("° round, ");
-                    cnt(&mut l, s.cn0 as i64);
-                    l.s(if s.used { " dB-Hz, in the fix" } else { " dB-Hz" });
+                    // Where it stands and how strong, its numbers written in the device's base and handed to the person's language whole.
+                    let (mut up, mut round, mut cn0) = (Line::new(), Line::new(), Line::new());
+                    cnt(&mut up, s.elevation as i64);
+                    cnt(&mut round, s.azimuth as i64);
+                    cnt(&mut cn0, s.cn0 as i64);
+                    let l = say(Say::SatPlace { up: up.as_str(), round: round.as_str(), cn0: cn0.as_str(), used: s.used });
                     fact(b, &mut y, name.as_str(), l.as_str());
                 }
                 if !any && nsat == 0 {
-                    fact(b, &mut y, "measures", "none yet");
+                    fact(b, &mut y, tr(Msg::Measures), tr(Msg::NoneYet));
                 }
                 // The names and addresses: shown only here, to whoever holds the settings.
                 let mut doc = [0u8; 1 << 10];
@@ -2644,7 +2724,7 @@ impl Map {
                     if n > 0 && n <= doc.len() {
                         if let Some(fields) = ferros_detail::parse(k as u64, &doc[..n]) {
                             if !fields.is_empty() {
-                                header(b, &mut y, "names and addresses");
+                                header(b, &mut y, tr(Msg::NamesAndAddresses));
                             }
                             for (name, _, v) in fields.iter() {
                                 let mut l = Line::new();
@@ -2655,29 +2735,29 @@ impl Map {
                     }
                 }
                 // The knobs (ferros_sys::control): a value goes round its choices at each tap, an action happens at its tap.
-                header(b, &mut y, "settings");
+                header(b, &mut y, tr(Msg::Settings));
                 let c = ferros_sys::controls(k as u64);
                 use ferros_sys::control as ctl;
                 match k as u64 {
                     ctl::CELLULAR => {
-                        button(self, b, &mut y, "re-register now", false, Some(Choice::Knob(k as u8, ctl::CELL_REREGISTER as u8)));
-                        b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "the radio off and on: it registers afresh");
+                        button(self, b, &mut y, tr(Msg::ReRegisterNow), false, Some(Choice::Knob(k as u8, ctl::CELL_REREGISTER as u8)));
+                        b.text(cx, y - uu(1, 1), note as u16, dim(), 1, tr(Msg::ReRegisterNote));
                         y += uu(2, 1);
                     }
                     ctl::WIFI => {
                         // Each value knob a radio group, its choices in its own order (unset reads as `unset`'s: power save follows the screen, the band is any).
-                        for (slot, title, names, unset) in [(ctl::WIFI_POWER_SAVE, "power save", &["off", "on", "fast", "with the screen"][..], 3), (ctl::WIFI_BAND, "band", &["any (5 GHz first)", "5 GHz only", "2.4 GHz only"][..], 0)] {
+                        let save = [tr(Msg::Off), tr(Msg::On), tr(Msg::Fast), tr(Msg::WithTheScreen)];
+                        let band = [tr(Msg::BandAny), tr(Msg::Band5Only), tr(Msg::Band24Only)];
+                        for (slot, title, names, unset) in [(ctl::WIFI_POWER_SAVE, tr(Msg::PowerSave), &save[..], 3), (ctl::WIFI_BAND, tr(Msg::Band), &band[..], 0)] {
                             let now = if c[slot as usize] == ctl::UNSET { unset } else { c[slot as usize] };
                             b.text(cx, y, note as u16, dim(), 1, title);
                             y += uu(2, 1);
-                            radios(self, b, &mut y, &names, now as usize, &|v| Choice::KnobSet(k as u8, slot as u8, v as u8));
+                            radios(self, b, &mut y, names, now as usize, &|v| Choice::KnobSet(k as u8, slot as u8, v as u8));
                         }
-                        b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "the band takes at the next join:");
-                        b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "switch WiFi off and on");
-                        y += uu(3, 1);
+                        notes(b, &mut y, tr(Msg::BandNote));
                     }
                     _ => {
-                        b.text(cx, y, note as u16, dim(), 1, "nothing to set here yet");
+                        b.text(cx, y, note as u16, dim(), 1, tr(Msg::NothingToSetYet));
                         y += uu(2, 1);
                     }
                 }
@@ -2696,10 +2776,10 @@ impl Map {
                         y += uu(3, 1);
                         let mut l = Line::new();
                         let _ = tatau::date_time(&mut l, f, secs - zone, ns, eagle);
-                        fact(b, &mut y, "at UTC", l.as_str());
+                        fact(b, &mut y, tr(Msg::AtUtc), l.as_str());
                     }
                     None => {
-                        fact(b, &mut y, "time", "not read yet");
+                        fact(b, &mut y, tr(Msg::Time), tr(Msg::NotReadYet));
                     }
                 }
                 // An offset as the page writes it: UTC, then how far east (+) or west (-), in the device's base.
@@ -2711,14 +2791,14 @@ impl Map {
                     }
                 };
                 let st = ferros_sys::zone::state();
-                // The zone picker while it is open (Choice::ZonePicker): it alone under the time, the regions then a region's places. Taken out of the map while the page is laid out, put back after.
+                // The zone picker while it is open (Choice::ZonePicker): it alone under the time, the regions then a region's places (tzdata's names, which stay). Taken out of the map while the page is laid out, put back after.
                 if let Some(pk) = self.zone_pick.take() {
                     let ruling = st.map(|s| s.ruling().1);
                     row(self, b, &mut y, small, white(), match pk.region {
-                        None => "choose a zone",
+                        None => tr(Msg::ChooseAZone),
                         Some(r) => pk.region(r),
                     }, None);
-                    button(self, b, &mut y, "back", false, Some(Choice::ZoneBack));
+                    button(self, b, &mut y, tr(Msg::Back), false, Some(Choice::ZoneBack));
                     // A row of the list: drawn and tappable only on the page's band (a region holds over a hundred places, past the batch's room and the page's 64 tappable rows), its place on the page kept either way.
                     let item = |m: &mut Map, b: &mut Batch, y: &mut i64, t: &str, on: bool, what: Choice| {
                         if *y + uu(2, 1) > top && *y - uu(2, 1) < bottom {
@@ -2731,7 +2811,7 @@ impl Map {
                     };
                     match pk.region {
                         None => {
-                            item(self, b, &mut y, "none: a fixed offset", ruling.is_some_and(|r| r.is_none()), Choice::ZoneNone);
+                            item(self, b, &mut y, tr(Msg::NoneFixedOffset), ruling.is_some_and(|r| r.is_none()), Choice::ZoneNone);
                             for r in 0..pk.regions.len() {
                                 let on = ruling.is_some_and(|z| z.as_str().split('/').next() == Some(pk.region(r)));
                                 item(self, b, &mut y, pk.region(r), on, Choice::ZoneRegion(r as u16));
@@ -2749,7 +2829,7 @@ impl Map {
                 } else {
                     let (standard, legal) = ferros_sys::zone_offsets();
                     match st {
-                        None => fact(b, &mut y, "zone", "this kernel names no zones"),
+                        None => fact(b, &mut y, tr(Msg::Zone), tr(Msg::NoZonesInKernel)),
                         Some(st) => {
                             // The zone in effect, its two offsets (arabic shows the legal one, dozenal and hex the standard one all year), and where it comes from.
                             let mut l = Line::new();
@@ -2758,85 +2838,104 @@ impl Map {
                             } else {
                                 zone_words(&mut l, st.effective.as_str(), true);
                             }
-                            fact(b, &mut y, "zone", l.as_str());
+                            fact(b, &mut y, tr(Msg::Zone), l.as_str());
                             if !st.effective.is_none() {
                                 let mut l = Line::new();
                                 utc(&mut l, standard);
-                                fact(b, &mut y, "standard", l.as_str());
+                                fact(b, &mut y, tr(Msg::Standard), l.as_str());
                                 let mut l = Line::new();
                                 utc(&mut l, legal);
-                                l.s(if legal != standard { ", daylight time" } else { "" });
-                                fact(b, &mut y, "legal", l.as_str());
+                                let l = if legal != standard { say(Say::DaylightTime(l.as_str())) } else { l };
+                                fact(b, &mut y, tr(Msg::Legal), l.as_str());
                             }
-                            fact(b, &mut y, "from", match st.from {
-                                ferros_sys::zone::FROM_NETWORK => "the cellular network",
-                                ferros_sys::zone::FROM_POSITION => "GPS, the nearest place",
-                                ferros_sys::zone::FROM_HAND => "set by hand",
-                                _ => "a fixed offset",
-                            });
+                            fact(b, &mut y, tr(Msg::From), tr(match st.from {
+                                ferros_sys::zone::FROM_NETWORK => Msg::FromNetwork,
+                                ferros_sys::zone::FROM_POSITION => Msg::FromPosition,
+                                ferros_sys::zone::FROM_HAND => Msg::FromHand,
+                                _ => Msg::FromOffset,
+                            }));
                             if st.from == ferros_sys::zone::FROM_POSITION {
-                                b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "the zone whose principal place is nearest,");
-                                b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "until ferros has the zones' borders");
-                                y += uu(3, 1);
+                                notes(b, &mut y, tr(Msg::NearestPlaceNote));
                             }
                             y += uu(1, 2);
                             // Whose choice rules (owner, 2026-11-10: "it's per identity, you can uncheck and set per device tho"): the identity's, the same on all the person's devices that follow it, or this device's own.
-                            mark(self, b, &mut y, 50, "follow my identity", st.follow, Some(Choice::ZoneFollow));
+                            mark(self, b, &mut y, 50, tr(Msg::FollowMyIdentity), st.follow, Some(Choice::ZoneFollow));
                             let says = match (st.follow, st.identity) {
-                                (false, _) => "off: this device keeps a zone of its own",
-                                (true, ferros_sys::zone::IDENTITY_NONE) => "your identity has no zone yet: set here, it becomes it",
-                                (true, _) => "set here, it changes on all your devices that follow it",
+                                (false, _) => Msg::ZoneOwn,
+                                (true, ferros_sys::zone::IDENTITY_NONE) => Msg::ZoneIdentityNone,
+                                (true, _) => Msg::SetHereAllFollow,
                             };
-                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, says);
+                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, tr(says));
                             y += uu(2, 1);
                             let (auto, id) = st.ruling();
-                            radios(self, b, &mut y, &["automatic", "by hand"], if auto { 0 } else { 1 }, &|v| Choice::ZoneAuto(v == 0));
+                            radios(self, b, &mut y, &[tr(Msg::Automatic), tr(Msg::ByHand)], if auto { 0 } else { 1 }, &|v| Choice::ZoneAuto(v == 0));
                             if auto {
-                                b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "from the cellular network, then GPS;");
-                                b.text(cx, y + uu(1, 2), note as u16, dim(), 1, if matches!(st.from, ferros_sys::zone::FROM_HAND | ferros_sys::zone::FROM_OFFSET) { "nothing found yet: the zone below stands in" } else { "the zone below stands in until one is found" });
-                                y += uu(3, 1);
+                                notes(b, &mut y, tr(if matches!(st.from, ferros_sys::zone::FROM_HAND | ferros_sys::zone::FROM_OFFSET) { Msg::ZoneAutoNothingFound } else { Msg::ZoneAutoStandsIn }));
                             }
                             let mut l = Line::new();
                             if id.is_none() {
-                                l.s("none: a fixed offset");
+                                l.s(tr(Msg::NoneFixedOffset));
                             } else {
                                 zone_words(&mut l, id.as_str(), true);
                             }
                             row(self, b, &mut y, small, white(), l.as_str(), None);
-                            button(self, b, &mut y, "choose a zone", false, Some(Choice::ZonePicker));
+                            button(self, b, &mut y, tr(Msg::ChooseAZone), false, Some(Choice::ZonePicker));
                             if id.is_none() {
-                                button(self, b, &mut y, "a quarter hour east", false, Some(Choice::Zone(1)));
-                                button(self, b, &mut y, "a quarter hour west", false, Some(Choice::Zone(-1)));
+                                button(self, b, &mut y, tr(Msg::QuarterHourEast), false, Some(Choice::Zone(1)));
+                                button(self, b, &mut y, tr(Msg::QuarterHourWest), false, Some(Choice::Zone(-1)));
                             }
                         }
                     }
                     if let Some(t) = self.zone_note {
-                        row(self, b, &mut y, note, white(), t, None);
+                        row(self, b, &mut y, note, white(), tr(t), None);
                     }
                     y += uu(1, 2);
-                    b.text(cx, y, note as u16, dim(), 1, "sources");
+                    b.text(cx, y, note as u16, dim(), 1, tr(Msg::Sources));
                     y += uu(2, 1);
-                    fact(b, &mut y, "from", "the PMIC's clock");
-                    fact(b, &mut y, "read", "at start, then hourly");
+                    fact(b, &mut y, tr(Msg::From), tr(Msg::ThePmicClock));
+                    fact(b, &mut y, tr(Msg::Read), tr(Msg::AtStartThenHourly));
                     // The network's word on the zone (NITZ and its country), as the kernel heard it; its time is not used yet.
-                    let mut l = Line::new();
-                    match st.filter(|s| s.mcc != 0) {
+                    let l = match st.filter(|s| s.mcc != 0) {
                         Some(s) => {
-                            l.s("heard: MCC ");
-                            let _ = tatau::count(&mut l, f, s.mcc as u64, 1);
-                            if let Some(c) = s.country {
-                                l.s(", ");
-                                l.s(core::str::from_utf8(&c).unwrap_or("?"));
+                            let mut mcc = Line::new();
+                            let _ = tatau::count(&mut mcc, f, s.mcc as u64, 1);
+                            match s.country {
+                                Some(c) => say(Say::HeardMccIn { mcc: mcc.as_str(), country: core::str::from_utf8(&c).unwrap_or("?") }),
+                                None => say(Say::HeardMcc(mcc.as_str())),
                             }
                         }
                         None => {
-                            l.s("not heard yet");
+                            let mut l = Line::new();
+                            l.s(tr(Msg::NotHeardYet));
+                            l
                         }
-                    }
-                    fact(b, &mut y, "network zone", l.as_str());
-                    fact(b, &mut y, "network time", "not used yet");
-                    fact(b, &mut y, "GPS time", "not used yet");
-                    fact(b, &mut y, "units", base_name(ferros_sys::device_base()));
+                    };
+                    fact(b, &mut y, tr(Msg::NetworkZone), l.as_str());
+                    fact(b, &mut y, tr(Msg::NetworkTime), tr(Msg::NotUsedYet));
+                    fact(b, &mut y, tr(Msg::GpsTime), tr(Msg::NotUsedYet));
+                    fact(b, &mut y, tr(Msg::PageUnits), base_name(ferros_sys::device_base()));
+                }
+            }
+            "language" => {
+                // The language (SETTINGS.md), as the zone: whose choice rules (the identity's, the same on all the person's devices that follow it, or this device's own), then every language the display can draw, each named in itself (Photon's picker: autonyms, in its order), the one in effect chosen. A pick is the identity's while following it (payloads/fgtw op 23), else this device's (SYS_LANG op 0).
+                let follows = ferros_sys::lang::follows();
+                mark(self, b, &mut y, 50, tr(Msg::FollowMyIdentity), follows, Some(Choice::LangFollow));
+                let says = match (follows, ferros_sys::lang::identity()) {
+                    (false, _) => Msg::LangOwn,
+                    (true, None) => Msg::LangIdentityNone,
+                    (true, Some(_)) => Msg::SetHereAllFollow,
+                };
+                b.text(cx, y - uu(1, 1), note as u16, dim(), 1, tr(says));
+                y += uu(2, 1);
+                // The one shown chosen is the language in effect (English while none is, or one the display cannot draw is).
+                let now = ferros_lang::current();
+                let langs: Vec<Lang> = languages().collect();
+                let names: Vec<&str> = langs.iter().map(|l| l.autonym()).collect();
+                let at = langs.iter().position(|&l| l == now).unwrap_or(usize::MAX);
+                radios(self, b, &mut y, &names, at, &|v| Choice::Lang(langs[v].index()));
+                notes(b, &mut y, tr(Msg::MoreLanguagesNeedFace));
+                if let Some(t) = self.zone_note {
+                    row(self, b, &mut y, note, white(), tr(t), None);
                 }
             }
             "about" => {
@@ -2844,33 +2943,37 @@ impl Map {
                 let facts = ferros_sys::facts();
                 b.text(cx, y, (uu(2, 1)) as u16, white(), 1, "ferros");
                 y += uu(3, 1);
-                row(self, b, &mut y, small, grey(), if DEV { "version Zil, development build" } else { "version Zil" }, Some(Choice::Version));
+                row(self, b, &mut y, small, grey(), tr(if DEV { Msg::VersionDev } else { Msg::Version }), Some(Choice::Version));
                 // The hint from the fourth tap on, counting down to Developer; it stays until the next tap changes it (no timers).
                 if self.taps >= DEV_HINT {
-                    let mut l = Line::new();
-                    if DEV || self.dev {
-                        l.s("Developer is a page already");
+                    let l = if DEV || self.dev {
+                        let mut l = Line::new();
+                        l.s(tr(Msg::DeveloperAlready));
+                        l
                     } else {
-                        let _ = tatau::count(&mut l, f, (DEV_TAPS - self.taps) as u64, 1);
-                        l.s(" taps to Developer");
-                    }
+                        say(Say::TapsToDeveloper((DEV_TAPS - self.taps) as u64))
+                    };
                     b.text(cx, y - uu(1, 1), note as u16, white(), 1, l.as_str());
                     y += uu(2, 1);
                 }
                 y += uu(1, 1);
-                let mut v = Line::new();
-                match facts.battery_pct() {
+                let v = match facts.battery_pct() {
                     Some(p) => {
-                        let _ = tatau::share(&mut v, f, p, 100, 2);
-                        if let Some(ua) = facts.battery_ua() {
-                            v.s(if ua > 0 { "  charging" } else { "  on battery" });
+                        let mut pct = Line::new();
+                        let _ = tatau::share(&mut pct, f, p, 100, 2);
+                        match facts.battery_ua() {
+                            Some(ua) if ua > 0 => say(Say::Charging(pct.as_str())),
+                            Some(_) => say(Say::OnBattery(pct.as_str())),
+                            None => pct,
                         }
                     }
                     None => {
-                        v.s("not read");
+                        let mut v = Line::new();
+                        v.s(tr(Msg::NotRead));
+                        v
                     }
-                }
-                fact(b, &mut y, "battery", v.as_str());
+                };
+                fact(b, &mut y, tr(Msg::Battery), v.as_str());
                 let mut v = Line::new();
                 match facts.boot_us() {
                     Some(us) => {
@@ -2880,22 +2983,22 @@ impl Map {
                         v.s("-");
                     }
                 }
-                fact(b, &mut y, "press to ready", v.as_str());
+                fact(b, &mut y, tr(Msg::PressToReady), v.as_str());
                 let mut v = Line::new();
                 // The counter runs from the SoC's reset: power on, near enough (the bootloader's seconds included).
                 let (t, hz) = (now(), freq());
                 let _ = tatau::duration_ns(&mut v, f, t / hz * 1_000_000_000 + t % hz * 1_000_000_000 / hz, 1);
-                fact(b, &mut y, "since power on", v.as_str());
+                fact(b, &mut y, tr(Msg::SincePowerOn), v.as_str());
                 let mut v = Line::new();
                 if let Some(n) = facts.processes() {
                     let _ = tatau::count(&mut v, f, n, 1);
                 }
-                fact(b, &mut y, "processes", v.as_str());
+                fact(b, &mut y, tr(Msg::Processes), v.as_str());
                 let mut v = Line::new();
                 if let Some(n) = facts.vault_keys() {
                     let _ = tatau::count(&mut v, f, n, 1);
                 }
-                fact(b, &mut y, "in the vault", v.as_str());
+                fact(b, &mut y, tr(Msg::InTheVault), v.as_str());
                 // The hottest part of the SoC as the kernel last read it, and whether the kernel has the big core's clock down for it.
                 let mut v = Line::new();
                 match facts.soc_temp_c() {
@@ -2903,33 +3006,36 @@ impl Map {
                         let _ = tatau::count(&mut v, f, c, 1);
                         v.s(" °C");
                         if facts.throttled() == Some(true) {
-                            v.s("  throttled");
+                            v = say(Say::Throttled(v.as_str()));
                         }
                     }
                     None => {
                         v.s("-");
                     }
                 }
-                fact(b, &mut y, "chip", v.as_str());
+                fact(b, &mut y, tr(Msg::Chip), v.as_str());
             }
             "kists" => {
-                // Each installed kist and what it asked for (owner, 2026-11-08: per kist, its rights, switches), the developer's reason under each; a tap changes the answer for every device of the person's (the list is theirs), and a kist running is killed and started again with the answers as they now stand.
+                // Each installed kist and what it asked for (owner, 2026-11-08: per kist, its rights, switches), the developer's reason under each (the developer's words, as written); a tap changes the answer for every device of the person's (the list is theirs), and a kist running is killed and started again with the answers as they now stand.
                 let ks = self.kists.kists.clone();
                 if ks.is_empty() {
-                    row(self, b, &mut y, small, grey(), "no kists installed", None);
+                    row(self, b, &mut y, small, grey(), tr(Msg::NoKistsInstalled), None);
                 }
                 for (ki, k) in ks.iter().enumerate() {
                     row(self, b, &mut y, uu(3, 2), white(), &k.name, None);
                     if k.wants.is_empty() {
-                        row(self, b, &mut y, note, dim(), "asks for nothing", None);
+                        row(self, b, &mut y, note, dim(), tr(Msg::AsksForNothing), None);
                     }
                     for (j, w) in k.wants.iter().enumerate() {
                         // A checkbox: on or off, a want never asked saying so.
-                        let mut l = Line::new();
-                        l.s(ferros_kist::MEANS[w.right as usize]);
-                        if w.answer.is_none() {
-                            l.s(" (not asked yet)");
-                        }
+                        let right = right_name(w.right as usize);
+                        let l = if w.answer.is_none() {
+                            say(Say::NotAskedYet(right))
+                        } else {
+                            let mut l = Line::new();
+                            l.s(right);
+                            l
+                        };
                         mark(self, b, &mut y, 50, l.as_str(), w.answer.is_some_and(|a| a.0), Some(Choice::Answer(ki as u8, j as u8)));
                         y -= uu(3, 4);
                         row(self, b, &mut y, note, dim(), &w.reason, None);
@@ -2941,16 +3047,18 @@ impl Map {
                 // Each right the other way round (owner, 2026-11-08: "who has GPS", "who has the network"), with the person's default for every new kist first: what its switch starts at in a first-launch question (out of the box, off).
                 let ks = self.kists.kists.clone();
                 for r in 0..ferros_kist::RIGHTS.len() {
-                    row(self, b, &mut y, uu(3, 2), white(), ferros_kist::MEANS[r], None);
+                    row(self, b, &mut y, uu(3, 2), white(), right_name(r), None);
                     let on = self.kists.defaults >> r & 1 == 1;
-                    mark(self, b, &mut y, 50, "new kists start on", on, Some(Choice::Default(r as u8)));
+                    mark(self, b, &mut y, 50, tr(Msg::NewKistsStartOn), on, Some(Choice::Default(r as u8)));
                     for (ki, k) in ks.iter().enumerate() {
                         if let Some(j) = k.wants.iter().position(|w| w.right as usize == r) {
-                            let mut l = Line::new();
-                            l.s(&k.name);
-                            if k.wants[j].answer.is_none() {
-                                l.s(" (not asked yet)");
-                            }
+                            let l = if k.wants[j].answer.is_none() {
+                                say(Say::NotAskedYet(&k.name))
+                            } else {
+                                let mut l = Line::new();
+                                l.s(&k.name);
+                                l
+                            };
                             mark(self, b, &mut y, 50, l.as_str(), k.wants[j].answer.is_some_and(|a| a.0), Some(Choice::Answer(ki as u8, j as u8)));
                         }
                     }
@@ -2961,11 +3069,11 @@ impl Map {
                 // Developer: the panel's and the sensors' knobs.
                 let spatial = ferros_sys::pref(ferros_sys::PREF_DITHER) == 1;
                 // The temporal dither a checkbox (unchecked, spatial alone: the panel rests); the light scope's channel a radio group.
-                mark(self, b, &mut y, 50, "temporal dither", !spatial, Some(Choice::Dither));
+                mark(self, b, &mut y, 50, tr(Msg::TemporalDither), !spatial, Some(Choice::Dither));
                 let sc = ferros_sys::pref(ferros_sys::PREF_SCOPE);
-                b.text(cx, y, note as u16, dim(), 1, "light scope");
+                b.text(cx, y, note as u16, dim(), 1, tr(Msg::LightScope));
                 y += uu(2, 1);
-                radios(self, b, &mut y, &["off", "red", "visible", "blue", "green", "IR", "clear"], sc as usize, &|v| Choice::ScopeSet(v as u8));
+                radios(self, b, &mut y, &[tr(Msg::Off), tr(Msg::ScopeRed), tr(Msg::ScopeVisible), tr(Msg::ScopeBlue), tr(Msg::ScopeGreen), "IR", tr(Msg::ScopeClear)], sc as usize, &|v| Choice::ScopeSet(v as u8));
             }
         }
         self.page_h[p] = y - y0;
@@ -3048,13 +3156,31 @@ impl Map {
             let mut r = [0u8; 8];
             let n = ferros_sys::call_live(cap(self.grants, S_FGTW), &m, &mut r);
             self.zone_note = match (n, r[0]) {
-                (ferros_sys::ERR | ferros_sys::NOTHING | 0, _) => Some("the identity service did not answer"),
+                (ferros_sys::ERR | ferros_sys::NOTHING | 0, _) => Some(Msg::ServiceDidNotAnswer),
                 (_, 0) => None,
-                (_, 1) => Some("your fleet has not answered yet: try again once it has"),
-                _ => Some("not a zone"),
+                (_, 1) => Some(Msg::FleetNotAnsweredYet),
+                _ => Some(Msg::NotAZone),
             };
         } else if !ferros_sys::zone::set_device(cap(self.grants, S_SETTINGS), auto, id) {
-            self.zone_note = Some("the kernel did not take it");
+            self.zone_note = Some(Msg::KernelDidNotTake);
+        }
+    }
+
+    /// A language chosen on the language page: the identity's while this device follows it, thru its identity service (payloads/fgtw op 23: into the person's space, then to every device that follows it, this one first); else this device's own, straight to the kernel (SYS_LANG op 0). What did not take is said on the page, as the zone's is.
+    fn lang_choose(&mut self, l: Lang) {
+        if ferros_sys::lang::follows() {
+            let iso = l.iso();
+            let m = [23, iso[0], iso[1], iso[2]];
+            let mut r = [0u8; 8];
+            let n = ferros_sys::call_live(cap(self.grants, S_FGTW), &m, &mut r);
+            self.zone_note = match (n, r[0]) {
+                (ferros_sys::ERR | ferros_sys::NOTHING | 0, _) => Some(Msg::ServiceDidNotAnswer),
+                (_, 0) => None,
+                (_, 1) => Some(Msg::FleetNotAnsweredYet),
+                _ => Some(Msg::NotALanguage),
+            };
+        } else if !ferros_sys::lang::set_device(cap(self.grants, S_SETTINGS), Some(l.iso())) {
+            self.zone_note = Some(Msg::KernelDidNotTake);
         }
     }
 
@@ -3353,7 +3479,7 @@ impl Map {
                 if row != Some(Choice::FleetRemove) {
                     self.fleet.confirm = false;
                 }
-                // The clock's word on a zone choice that did not take stays until the next tap.
+                // The clock's (or the language's) word on a choice that did not take stays until the next tap.
                 self.zone_note = None;
                 let set = |m: &Map, pref: u64, v: u8| {
                     ferros_sys::set_pref(cap(m.grants, S_SETTINGS), pref, v);
@@ -3485,10 +3611,17 @@ impl Map {
                     Some(Choice::ZoneFollow) => {
                         if let Some(st) = ferros_sys::zone::state() {
                             if !ferros_sys::zone::set_follow(cap(self.grants, S_SETTINGS), !st.follow) {
-                                self.zone_note = Some("the kernel did not take it");
+                                self.zone_note = Some(Msg::KernelDidNotTake);
                             }
                         }
                     }
+                    // The language (SETTINGS.md): whose choice rules, and a language picked (the identity's while following it, else this device's).
+                    Some(Choice::LangFollow) => {
+                        if !ferros_sys::lang::set_follow(cap(self.grants, S_SETTINGS), !ferros_sys::lang::follows()) {
+                            self.zone_note = Some(Msg::KernelDidNotTake);
+                        }
+                    }
+                    Some(Choice::Lang(i)) => self.lang_choose(Lang::from_index(i)),
                     Some(Choice::ZoneAuto(auto)) => {
                         if let Some(st) = ferros_sys::zone::state() {
                             let id = st.ruling().1;
@@ -3498,7 +3631,7 @@ impl Map {
                     Some(Choice::ZonePicker) => {
                         self.zone_pick = ZonePick::load();
                         if self.zone_pick.is_none() {
-                            self.zone_note = Some("no zones on this device yet (the zones document, tools/tzvsf)");
+                            self.zone_note = Some(Msg::NoZonesYet);
                         }
                         self.scroll = 0;
                     }

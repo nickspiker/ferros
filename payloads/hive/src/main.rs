@@ -217,7 +217,7 @@ impl Hive {
         self.present(self.row0(), self.h);
         self.replay_labels();
         let size = (self.w / 37) as u16;
-        window::text(self.display, self.base, (self.w / 28) as i16, (self.h / 8) as i16, size, 5000, b"hive: the honeycomb keyboard (two fingers: scroll; page on the symbol row)");
+        window::text(self.display, self.base, (self.w / 28) as i16, (self.h / 8) as i16, size, 5000, ferros_lang::t(ferros_lang::Msg::HiveHint).as_bytes());
         self.line();
     }
 
@@ -290,6 +290,7 @@ extern "C" fn hive_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         exit(2);
     }
     let mut kb = Keyboard::new(w, ferros_sys::active_circle(w, h));
+    words(&mut kb);
     fit_bar(display, &mut kb);
     // The device's layout (SETTINGS.md); a value from a newer build falls back to the default.
     let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
@@ -404,6 +405,25 @@ impl core::fmt::Write for Line {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
 }
+/// Nothing in the hive allocates; its words come thru ferros_lang from fgtw, which links the alloc crate, and a linked alloc wants an allocator. This one refuses every request: an allocation here is a bug, and it fails loud (alloc's error handler, then the panic handler), with no heap carried for it.
+struct NoHeap;
+unsafe impl core::alloc::GlobalAlloc for NoHeap {
+    unsafe fn alloc(&self, _: core::alloc::Layout) -> *mut u8 {
+        core::ptr::null_mut()
+    }
+    unsafe fn dealloc(&self, _: *mut u8, _: core::alloc::Layout) {}
+}
+#[global_allocator]
+static ALLOC: NoHeap = NoHeap;
+
+/// The bar's keys and the symbols' page key in the person's language (ferros_lang).
+fn words(kb: &mut honeycomb::Keyboard) {
+    use ferros_lang::{t, Msg};
+    kb.left = t(Msg::KeyMap);
+    kb.bar = [t(Msg::KeyMap), t(Msg::KeyShift), t(Msg::KeySpace), t(Msg::KeyDel), t(Msg::KeyEnter)];
+    kb.page = t(Msg::KeyPage);
+}
+
 /// The keyboard's bar divided over the glass the eye sees (display op 53: the glass's columns on a row), averaged over the bar's top and foot rows (owner, 2026-11-08: "go off center intersect of squircle for divisions"). A display without the op leaves the screen's width.
 fn fit_bar(display: u64, kb: &mut honeycomb::Keyboard) {
     let (top, foot) = kb.bar_rows();

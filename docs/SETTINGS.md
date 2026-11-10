@@ -37,10 +37,23 @@ One spec VSF document in the vault under the key `device` (ferros_kernel `settin
 | `zone_found`, `zone_found_by` | ASCII, unsigned | the zone last found here, and by what: 1 the network, 2 a position | none |
 | `wifi_power_save` | unsigned | WiFi power save: 0 off, 1 on (PM1), 2 fast (PM2); a radio knob (RADIO-CONTROLS.md), set on the WiFi page | unset: off |
 | `wifi_band` | unsigned | the band WiFi joins on: 0 any (5 GHz first), 1 5 GHz only, 2 2.4 GHz only; takes at the next join | unset: any |
+| `language` | language (`wl`) | this device's own language, its ISO 639-3 code (no script or region) | none: English |
+| `language_follow` | unsigned | 1 the device follows the identity's language, 0 it keeps its own | 1 |
+| `language_identity` | language (`wl`) | the identity's language as its identity service last wrote it; never read back into the identity | none |
 
 - **Loaded** by the kernel right after the vault opens: the defaults, then every valid field, into every process's preferences block.
 - **Written whole** on every change: a process holding Settings (`SYS_SET_PREF`) or a radio knob or the zone (`SYS_CONTROL`, docs/RADIO-CONTROLS.md; the clock page sets the zone a quarter hour at a time), `ferros-bridge diag "pref <name> <value>"`, or a `device` document stored from the bridge (applied at once).
-- **The language** joins as its own VSF type (ISO 639-3 packed, with optional ISO 15924 script and ISO 3166-1 region, all numbers), asked of the VSF session on 2026-10-27. Like every field here it follows the last identity to attest. Until then the device is English.
+- **The language** is kept as a language (vsf `wl`), as the zone is kept (2026-11-10, below).
+
+## The language (`device.language`)
+
+The shell speaks Photon's sixteen languages (English, Español, Māori, Português, Français, Bahasa Indonesia, Deutsch, Kiswahili, Tiếng Việt, Türkçe, Русский, हिन्दी, Українська, Italiano, Polski, Filipino), from one list shared with Photon (fgtw::text `Lang`, Photon's storage order and autonyms).
+
+- **Two choices, as the zone.** The identity's (the person's space, ferros_space `LANG`, written to each device by its identity service, payloads/fgtw) and this device's own. The device follows the identity's while "follow my identity" is on (the default) and the identity has one; else its own. The kernel works out the one in effect (lang.rs) and knows no list: a language is its ISO 639-3 code packed as `wl` packs it, so a language the shell cannot show is kept and reads as English.
+- **Set** on the settings' language page (payloads/map): while following, a pick is the identity's (fgtw op 23: into the space, to every device that follows it); else this device's (SYS_LANG op 0). `ferros-bridge diag "pref language <code>"` (`eng`, `mri`, … or `none`) and `"pref language_follow 0"` on the bench.
+- **Read** by every process from its second preferences block (preferences 32-38 at G#FB0: in effect, this device's, the identity's, the follow switch), at draw time (ferros_lang `current`).
+- **The words** are ferros_lang's (the settings pages, the attest screen, the keyboard) and fgtw::text's (the fleet's and identity's, shared with Photon, in Photon's wording where Photon has the message): whole messages with holes, every number in the person's base.
+- **What the display draws.** One face, Oxanium +glyphs, by its character map with no shaping (measured with fc-query, 2026-11-10): Latin-1 and most of Latin Extended-A. Twelve languages draw whole. Russian and Ukrainian (no Cyrillic), Hindi (no Devanagari, and it needs shaping) and Vietnamese (no ơ ư, no precomposed tone letters, and no combining hook above, dot below or horn) do not: they are carried in full, are not offered on the page, and read as English while they are the setting. They need a face that covers them (and, for Hindi, shaping); a font is the owner's decision.
 
 ## The number base (`device.base`)
 

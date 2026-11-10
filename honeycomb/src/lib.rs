@@ -133,6 +133,9 @@ pub struct Keyboard {
     pub layout: usize,
     /// The bar's left key's label (the host decides what it does: `Event::Leave`).
     pub left: &'static str,
+    /// The bar's other keys' labels in `BAR_KEYS` order (the left one is `left`), and the symbols' page key's: the English until the host gives its words (the person's language, ferros_lang). The host's words are drawn as given; keep them short, they sit on keys.
+    pub bar: [&'static str; 5],
+    pub page: &'static str,
     /// Per-key tints (owner, 2026-10-29: the attest screen's keys each their own colour, a rainbow that changes with every stroke): a multiplier per channel (Q14, 2¹⁴ = as drawn) on a key's grey, at rest and lit alike, indexed by `tint_index`; None draws every key grey.
     pub tint: Option<[[u16; 3]; 64]>,
 }
@@ -154,7 +157,7 @@ impl Keyboard {
         let cy0 = cy3 - (VIS as i64 - 1) * py;
         let a = px / 2 - gap / 2;
         let bottom = ((ccy + cr - 1) >> 8) as usize + 1;
-        Keyboard { w, px, py, cy0, a, r: a * TWO_OVER_SQRT3 >> 16, gap, bar0, bar1, ccx, rr, edge, bar_l: 0, bar_r: (w as i64) << 8, top: ((cy0 - cell_r) >> 8) as usize, bottom, view: 0, shift: Shift::Off, layout: 0, left: BAR_KEYS[B_MAP], tint: None }
+        Keyboard { w, px, py, cy0, a, r: a * TWO_OVER_SQRT3 >> 16, gap, bar0, bar1, ccx, rr, edge, bar_l: 0, bar_r: (w as i64) << 8, top: ((cy0 - cell_r) >> 8) as usize, bottom, view: 0, shift: Shift::Off, layout: 0, left: BAR_KEYS[B_MAP], bar: BAR_KEYS, page: "page", tint: None }
     }
 
     /// How far column `fx` (Q8) is moved down: the circle's bottom there less its bottom at the screen's edge. 0 at the edges, the circle's bottom less the bar's foot at its centre column, smooth between (a circle's arc). One root a column, never one a pixel.
@@ -385,7 +388,7 @@ impl Keyboard {
                 hex(s, self.w, cx, cy, a, r, self.colour(key, g), lit, &|fx| self.sag(fx));
                 let c = self.cell(k);
                 let mut b = [0u8; 4];
-                let (t, size) = if c == PAGE { ("page", size * 5 / 8) } else { (&*c.encode_utf8(&mut b), size) };
+                let (t, size) = if c == PAGE { (self.page, size * 5 / 8) } else { (&*c.encode_utf8(&mut b), size) };
                 // The label unbent, moved down by its key's centre column's sag.
                 centred(cx, cy + self.sag(cx), size, t, label);
             }
@@ -415,7 +418,7 @@ impl Keyboard {
                     };
                     up_triangle(s, self.w, cx, cy, (y1 - y0) * 3 >> 3, g, face);
                 } else {
-                    centred(cx, cy, size * 5 / 7, if b == B_MAP { self.left } else { BAR_KEYS[b] }, label);
+                    centred(cx, cy, size * 5 / 7, if b == B_MAP { self.left } else { self.bar[b] }, label);
                 }
             }
             Key::None => {}

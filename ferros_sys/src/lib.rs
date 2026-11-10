@@ -54,6 +54,7 @@ pub mod nr {
     pub const CONTROLS: u64 = 33;
     pub const DETAIL: u64 = 34;
     pub const ZONE: u64 = 35;
+    pub const LANG: u64 = 36;
 }
 
 /// The clock's zone (kernel zone.rs, SYS_ZONE; docs/TIME.md; owner, 2026-11-10): the identity's choice and this device's own, each automatic (the zone found from the cellular network, then GPS) or by hand (an IANA id), and the switch that says which rules.
@@ -213,9 +214,74 @@ pub fn ui_scale() -> i8 {
     pref(PREF_SCALE) as i8
 }
 
+/// The second preferences block, 16 bytes under the first (kernel process.rs PREFS_HI): preference 32 + k at byte k. A kernel older than it leaves them zero, each one's default.
+pub const PREFS_HI: u64 = 0xFB0;
+/// Preferences 32-38, the language (`lang`): 32-33 the language in effect, 34-35 this device's own, 36-37 the identity's, each a packed ISO 639-3 code (0 none); 38 whether the device keeps its own (1) or follows the identity's (0).
+pub const PREF_LANG: u64 = 32;
+pub const PREF_LANG_DEVICE: u64 = 34;
+pub const PREF_LANG_IDENTITY: u64 = 36;
+pub const PREF_LANG_OWN: u64 = 38;
+
 /// A preference byte as this process's copy holds it now.
 pub fn pref(index: u64) -> u8 {
-    unsafe { core::ptr::read_volatile((arc_base() + PREFS + index.min(31)) as *const u8) }
+    // The two blocks: 0-31 at PREFS, 32-47 at PREFS_HI. WHY the min and the mask: the index is the caller's; one past 31 stays inside the first block (as it always has) and one past 47 inside the second, never the tokens or the ihi.
+    let at = if index < 32 { PREFS + index } else { PREFS_HI + (index & 15) };
+    unsafe { core::ptr::read_volatile((arc_base() + at) as *const u8) }
+}
+
+/// The language the shell speaks (kernel lang.rs, SYS_LANG; SETTINGS.md): this device's own and the identity's, each a language by its ISO 639-3 code, and the switch that says which rules. The state is read from the preferences block; the calls change it.
+pub mod lang {
+    use super::{nr, pref, svc, PREF_LANG, PREF_LANG_DEVICE, PREF_LANG_IDENTITY, PREF_LANG_OWN};
+
+    /// A code as the kernel keeps it: the three letters base 26 (vsf `wl`'s packing); 0 none.
+    pub fn pack(code: [u8; 3]) -> u16 {
+        code.iter().fold(0u16, |p, &c| p * 26 + (c - b'a') as u16)
+    }
+
+    /// The letters of a packed code; None for none.
+    pub fn unpack(p: u16) -> Option<[u8; 3]> {
+        // WHY the bound: the kernel keeps only codes below 26³ (lang::valid), so this holds for any kernel that has the call; a zeroed block is none.
+        (p != 0 && p < 26 * 26 * 26).then(|| [b'a' + (p / 676) as u8, b'a' + (p / 26 % 26) as u8, b'a' + (p % 26) as u8])
+    }
+
+    fn read(at: u64) -> u16 {
+        u16::from_le_bytes([pref(at), pref(at + 1)])
+    }
+
+    /// The language in effect (the identity's while the device follows it and it has one, else this device's); None for none.
+    pub fn effective() -> Option<[u8; 3]> {
+        unpack(read(PREF_LANG))
+    }
+
+    /// This device's own language; None for none.
+    pub fn device() -> Option<[u8; 3]> {
+        unpack(read(PREF_LANG_DEVICE))
+    }
+
+    /// The identity's, as its service last wrote it; None for none.
+    pub fn identity() -> Option<[u8; 3]> {
+        unpack(read(PREF_LANG_IDENTITY))
+    }
+
+    /// Whether this device follows the identity's language (the default).
+    pub fn follows() -> bool {
+        pref(PREF_LANG_OWN) == 0
+    }
+
+    /// This device's own language, given the Settings capability (None: none). True when taken and kept.
+    pub fn set_device(cap: u64, code: Option<[u8; 3]>) -> bool {
+        svc(nr::LANG, 0, cap, code.map_or(0, pack) as u64, 0, 0) == 0
+    }
+
+    /// Whether this device follows the identity's language, given the Settings capability.
+    pub fn set_follow(cap: u64, on: bool) -> bool {
+        svc(nr::LANG, 1, cap, !on as u64, 0, 0) == 0
+    }
+
+    /// The identity's language written to this device (the identity service only, payloads/fgtw): None, it has none.
+    pub fn set_identity(code: Option<[u8; 3]>) -> bool {
+        svc(nr::LANG, 2, code.map_or(0, pack) as u64, 0, 0, 0) == 0
+    }
 }
 
 /// The device's number base right now (tatau's code: 10 arabic, 12 DMS, 16 hex, G#8C DLS). Read it at draw time, not once: the person can change it while the app runs.
