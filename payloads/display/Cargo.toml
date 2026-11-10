@@ -9,6 +9,7 @@ name = "display"
 path = "src/main.rs"
 
 [dependencies]
+tatau = { path = "../../../tatau" }
 ferros_sys = { path = "../../ferros_sys" }
 # The person's default wallpaper, a Julia set from their wallpaper seed (op 42).
 wallpaper = { path = "../../wallpaper" }

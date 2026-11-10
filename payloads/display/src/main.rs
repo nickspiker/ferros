@@ -3818,15 +3818,21 @@ fn flavour(what: Corner) -> ((f32, f32, f32), (f32, f32, f32)) {
     }
 }
 
-/// A line of a corner's text, on the stack (the chrome draws without the heap's growth). 32 bytes hold the longest line `measure_text` makes ("kind 65535: " and a 48-bit value's 15 digits with its sign, 28 bytes), so a write past it is a bug there and panics.
+/// A line of a corner's text, on the stack (the chrome draws without the heap's growth). 64 bytes hold the longest line `measure_text` makes in any base (a DLS value is an arrow, up to a dozen digits, the point and the unit), so a write past it is a bug there and panics.
 #[derive(Clone, Copy)]
 struct Txt {
-    b: [u8; 32],
+    b: [u8; 64],
     n: usize,
+}
+impl core::fmt::Write for Txt {
+    fn write_str(&mut self, t: &str) -> core::fmt::Result {
+        self.s(t);
+        Ok(())
+    }
 }
 impl Txt {
     const fn new() -> Txt {
-        Txt { b: [0; 32], n: 0 }
+        Txt { b: [0; 64], n: 0 }
     }
     fn s(&mut self, t: &str) -> &mut Txt {
         for &c in t.as_bytes() {
@@ -3835,8 +3841,34 @@ impl Txt {
         }
         self
     }
-    /// `v / unit` with `places` digits after the point, rounded half away from zero.
+    /// `v / unit` in the device's base (tatau, owner 2026-11-10: "the console seems to not respect my base choice"): Arabic with `places` digits after the point, rounded half away from zero; hex the whole value; DLS the exact value at the base's significant digits; DMS its doublings, signed. Zero in DMS has no doublings and is written 0.
     fn num(&mut self, v: i64, unit: i64, places: u32) -> &mut Txt {
+        use core::fmt::Write as _;
+        let f = ferros_sys::numbers(tatau::Style::Glyphs);
+        let whole = (v.unsigned_abs() + unit.unsigned_abs() / 2) / unit.unsigned_abs();
+        match f.base {
+            tatau::Base::Arabic => {}
+            tatau::Base::Hex => {
+                if v < 0 && whole != 0 {
+                    self.s("-");
+                }
+                let _ = write!(self, "{whole:X}");
+                return self;
+            }
+            tatau::Base::Dls => {
+                let _ = tatau::dls_value(self, f.style, v < 0, v.unsigned_abs() as u128, unit.unsigned_abs() as u128, f.sig);
+                return self;
+            }
+            tatau::Base::Dms => {
+                if v < 0 && whole != 0 {
+                    self.s("-");
+                }
+                if let Ok(tatau::Out::Nothing) = tatau::count(self, f, whole, 1) {
+                    self.s("0");
+                }
+                return self;
+            }
+        }
         let p = 10i64.pow(places);
         let scaled = (v.unsigned_abs() as i128 * p as i128 * 2 + unit as i128) / (unit as i128 * 2);
         if v < 0 && scaled != 0 {
@@ -4876,7 +4908,8 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             // The battery: its charge as the name, then the cell's voltage, the current (+ charging), their product and the temperature, as the gauge measures them (facts 1-4: per cent, hundredths of a degree, µV, µA).
             let mut charge = Txt::new();
             if what == Corner::Battery && facts[1] != u64::MAX {
-                charge.num(facts[1] as i64, 1, 0).s(" %");
+                // A share of the whole charge in the device's base (tatau: Arabic a percentage, hex its fraction digits, dozenal after the point).
+                let _ = tatau::share(&mut charge, ferros_sys::numbers(tatau::Style::Glyphs), facts[1], 100, 2);
                 let (cc, uv, ua) = (facts[2] as i64, facts[3] as i64, facts[4] as i64);
                 lines[nl].num(uv, 1_000_000, 3).s(" V");
                 nl += 1;

@@ -661,7 +661,7 @@ enum Choice {
 }
 
 /// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The clock after the links (docs/RADIO-CONTROLS.md): its time, zone and sources.
-const PAGES: [&str; 18] = ["appearance", "numbers", "keyboard", "security", "kists", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "clock", "about", "developer"];
+const PAGES: [&str; 18] = ["appearance", "units", "keyboard", "security", "kists", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "clock", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Whether it looks like one (the orange hairlines, as the display's): FERROS_RELEASE_LOOK set gives a development build the release look for screen captures (owner, 2026-11-10), its tools kept.
@@ -2040,7 +2040,7 @@ impl Map {
                 let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
                 mark(self, b, &mut y, 50, "names under circles", labels, Some(Choice::Labels));
             }
-            "numbers" => {
+            "units" => {
                 // The number base is chosen by seeing: each row is two seconds and a mebibyte (2^23 bits, a whole number of doublings) written in that base, its name small beneath.
                 let now_base = ferros_sys::device_base();
                 for code in BASES {
@@ -2391,7 +2391,7 @@ impl Map {
                 fact(b, &mut y, "read", "at start, then hourly");
                 fact(b, &mut y, "network time", "not decoded yet");
                 fact(b, &mut y, "GPS time", "not used yet");
-                fact(b, &mut y, "numbers", base_name(ferros_sys::device_base()));
+                fact(b, &mut y, "units", base_name(ferros_sys::device_base()));
             }
             "about" => {
                 let f = ferros_sys::numbers(Style::Glyphs);
