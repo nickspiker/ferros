@@ -90,7 +90,7 @@ const BUTTON_LOOK: [[u32; 4]; 4] = [
 const MARK_LOOK: u8 = 0;
 /// The circles' hairline colour, as the display draws the app circle's (display `hairline`): on release, grey (equal codes) at half the photopic light of the theme's ring (VSF RGB's weights on its codes, squared); on development builds, VSF RGB orange, full red and green at half its light.
 fn hairline() -> u32 {
-    if DEV {
+    if DEV_LOOK {
         return 0xFF_B4_00;
     }
     let ring = ferros_sys::theme::current().ring;
@@ -664,6 +664,8 @@ enum Choice {
 const PAGES: [&str; 18] = ["appearance", "numbers", "keyboard", "security", "kists", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "clock", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
+/// Whether it looks like one (the orange hairlines, as the display's): FERROS_RELEASE_LOOK set gives a development build the release look for screen captures (owner, 2026-11-10), its tools kept.
+const DEV_LOOK: bool = DEV && option_env!("FERROS_RELEASE_LOOK").is_none();
 /// Taps in a row on About's version line that make Developer a page (owner, 2026-11-05: "twelve"), and the tap from which the hint shows and counts down ("don't show a toast hint until four taps"). No time window: any other tap starts the count again.
 const DEV_TAPS: u8 = 12;
 const DEV_HINT: u8 = 4;
@@ -1971,6 +1973,31 @@ impl Map {
             b.text(cx + uu(1, 1), *y, (uu(5, 4)) as u16, white(), 0, value);
             *y += uu(2, 1) + uu(1, 4);
         };
+        // A fact whose value can run past the page's edge (an IPv6 address; owner, 2026-11-10: "should wrap when it hits the edge of the screen"): broken after its own separators (a colon, a space, a dot) onto further lines under it, each as long as fits. The map has no font metrics (the display has them): a character is taken as five eighths of the size, wider than the face's digits, so a line errs short. Half the page wide less a unit either side is always tens of characters, so a line is never empty.
+        let fact_wrap = |b: &mut Batch, y: &mut i64, name: &str, value: &str| {
+            let px = uu(5, 4);
+            let fits = ((half - uu(2, 1)) * 8 / (px * 5)) as usize;
+            b.text(cx - uu(1, 1), *y, px as u16, grey(), 2, name);
+            let mut rest = value;
+            loop {
+                let cut = if rest.len() <= fits {
+                    rest.len()
+                } else {
+                    let mut f = fits;
+                    while !rest.is_char_boundary(f) {
+                        f -= 1;
+                    }
+                    rest[..f].rfind([':', ' ', '.']).map_or(f, |k| k + 1)
+                };
+                b.text(cx + uu(1, 1), *y, px as u16, white(), 0, &rest[..cut]);
+                rest = &rest[cut..];
+                if rest.is_empty() {
+                    break;
+                }
+                *y += uu(3, 2);
+            }
+            *y += uu(2, 1) + uu(1, 4);
+        };
         let small = uu(5, 4);
         let note = uu(7, 8);
         match PAGES[p] {
@@ -2284,7 +2311,7 @@ impl Map {
                             for (name, _, v) in fields.iter() {
                                 let mut l = Line::new();
                                 detail_words(&mut l, f, v);
-                                fact(b, &mut y, detail_label(name), l.as_str());
+                                fact_wrap(b, &mut y, detail_label(name), l.as_str());
                             }
                         }
                     }

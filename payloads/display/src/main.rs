@@ -3017,11 +3017,13 @@ fn raw_dot(width: usize, height: usize, x0: usize, y0: usize) {
 fn glass_radius() -> f32 {
     if ferros_sys::akita() { GLASS_RADIUS_AKITA } else { GLASS_RADIUS }
 }
-/// Whether this is a development build (the orange outside the edge).
+/// Whether this is a development build.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
+/// Whether it looks like one (the orange outside the edge and on the hairlines): a development build built with FERROS_RELEASE_LOOK set looks as a release does, for screen captures to show (owner, 2026-11-10: "so I don't get orange in my screencaps"), and keeps every development tool.
+const DEV_LOOK: bool = DEV && option_env!("FERROS_RELEASE_LOOK").is_none();
 /// Outside the screen's edge: black on release; on development builds an orange (full red over the root of two, green at half: VSF RGB codes, half the light of full orange at gamma 2), so a dev image is told at a glance and the mask is still a mask. The edge's hairline is drawn in it too (`glass_front`).
 /// Two stops darker since 2026-11-09 (owner: "a bit bright and makes it hard to compose"): a quarter of the light, half the working value (gamma 2), red full over 2√2 and green a quarter.
-const EDGE_MASK: u64 = if DEV { 1 << 48 | 11585 >> 1 | (8192 >> 1) << 16 } else { 1 << 48 };
+const EDGE_MASK: u64 = if DEV_LOOK { 1 << 48 | 11585 >> 1 | (8192 >> 1) << 16 } else { 1 << 48 };
 
 /// The glass's shape, planned once per screen size (owner, 2026-11-02: "maintain a global compressed mask since most will be opaque for the OS in general"): the circle an app lives in (the corners outside it are the system's chrome) and the screen's own edge, as Photon draws its window on Android glass (fluor paint/edge.rs `glass_corner_params`, Nick 2026-09-17: a superellipse corner inside the glass's circular arc, cutting one and a half glass insets deeper at the diagonal, exponent 6 or the first lower one whose corners fit, nine tenths of the fitted size; the top-left and bottom-right corners twice the top-right and bottom-left, the 2:1 asymmetry).
 /// Per row: the columns of chrome from the left and from the right (the circle's outside), the columns masked from the left and from the right (the edge's outside, over the chrome), then the row's antialiased pixels in the order they apply (column, shape, coverage Q16, hairline alpha Q16): the circle's first, in column order, then the edge's, then the camera hole's knockout (every column of its range). `GLASS_ROWS` has height + 1 entries; a row's pixels run from its `first` to the next row's. Everything else on a row is glass, untouched: the publish path does no geometry at all, it copies runs and blends the listed pixels.
@@ -3271,7 +3273,7 @@ fn owner_at(x: i64, y: i64, width: usize, height: usize) -> Option<usize> {
 
 /// The hairline's colour (owner, 2026-11-02). Release builds: standard-illuminant-E grey (equal VSF RGB codes) one stop darker than the theme's ring: the ring's photopic light (VSF RGB's weights, as vsf::colour::convert::vsf_rgb_to_photopic_f32 has them: R 0.2584, G 0.6346, B 0.1070, on gamma-2 codes) halved, back to a code. Development builds: bright orange in VSF RGB, full red, half-light green, no blue, so a dev image is told at a glance.
 fn hairline() -> u64 {
-    if option_env!("FERROS_PRODUCTION").is_some() {
+    if !DEV_LOOK {
         let ring = draw::opaque(ferros_sys::theme::current().ring);
         let lin = |sh: u32| { let c = (ring >> sh & 0xFFFF) as f32 * (1.0 / 16384.0); c * c };
         let light = 0.2584 * lin(0) + 0.6346 * lin(16) + 0.1070 * lin(32);
