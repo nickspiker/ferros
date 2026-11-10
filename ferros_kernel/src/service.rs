@@ -670,6 +670,8 @@ fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
                 }
             };
             crate::flashlog::line(&alloc::format!("identity released: {n} entries deleted from the kernel's vault, the device-only secret renewed; {} of the person's domains to drop in the vault process", drops.len()));
+            // The person's zone goes with them (zone.rs): this device's own choice rules again.
+            let _ = crate::zone::set_identity(None, || crate::settings::document(None).is_some_and(|d| st.set(crate::settings::KEY, &d).is_ok()));
             unsafe { (*(&raw mut RELEASE_DROPS)).append(&mut drops) };
             RELEASE_RESET.store(true, core::sync::atomic::Ordering::Release);
             Ok(0)

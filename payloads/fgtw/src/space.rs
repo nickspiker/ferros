@@ -5,6 +5,7 @@
 //! - **Then every 4 s** the device's copy (kists.list, map.place.*, map.view) is joined to the space (ferros_space::sync): the person's changes here go into the space, the space's into the copy. A change goes to every fleet device heard (`space_push`) and to fgtw.org (pulled, merged, put back, so a sibling's copy there is never written over).
 //! - **Every 64 s** fgtw.org is asked again, for a sibling's change made where this device could not hear it.
 //! - **The map** reads the generation (op 17), bumped whenever the device's copy was written from the space, and reloads its circles; the Fleet page's switch "sync this device's home screen" is op 18.
+//! - **The person's zone** (ferros_space `ZONE`; owner, 2026-11-10: "it's per identity, you can uncheck and set per device tho"): chosen on the clock page of a device that follows it (op 22), and written to the kernel (SYS_ZONE op 4) at every join where it changed, never read back from the kernel (settings flow identity to device only). Whether this device follows it is the device's own switch, kept by the kernel.
 
 use super::*;
 use ferros_space::space::{Baseline, Sealed, Space};
@@ -40,11 +41,14 @@ pub struct SpaceSync {
     said_slot: bool,
     /// The last join failed and said why: said again only once one has succeeded (a vault that refuses every 4 s would otherwise fill the console).
     said_join: bool,
+    /// The person's zone as last written to the kernel (SYS_ZONE op 4): None not yet, Some(None) the person has chosen none.
+    zone_told: Option<Option<(bool, alloc::string::String)>>,
+    said_zone: bool,
 }
 
 impl SpaceSync {
     pub fn new() -> SpaceSync {
-        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false }
+        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, zone_told: None, said_zone: false }
     }
 }
 
@@ -357,6 +361,8 @@ impl Client {
         }
         let mut copy = self.copy();
         let me = self.me;
+        // The person's zone, which no copy on this device mirrors: to the kernel as it changes (from a sibling, fgtw.org, or a choice made here).
+        self.space_zone_to_kernel();
         match ferros_space::sync(&mut self.space.space, &mut self.space.base, &mut copy, &me, eagle()) {
             Ok(o) => {
                 self.space.said_join = false;
@@ -497,6 +503,49 @@ impl Client {
         // WHY the cap: two bytes on the wire; a space past 65535 facts is not one this page lists.
         r[6..8].copy_from_slice(&(self.space.space.entries().len().min(u16::MAX as usize) as u16).to_le_bytes());
         r
+    }
+
+    /// The person's zone written to the kernel when it differs from what was last written (settings flow identity to device only: the kernel never hands one back). The kernel keeps it in the device settings, and the device follows it unless its settings say otherwise (kernel zone.rs).
+    fn space_zone_to_kernel(&mut self) {
+        let z = ferros_space::zone(&self.space.space);
+        if self.space.zone_told.as_ref() == Some(&z) {
+            return;
+        }
+        if ferros_sys::zone::set_identity(z.as_ref().map(|(auto, id)| (*auto, id.as_bytes()))) {
+            self.log.put(b"fgtw: space: the person's zone to this device: ");
+            match &z {
+                None => self.log.put(b"none chosen"),
+                Some((true, _)) => self.log.put(b"automatic"),
+                Some((false, id)) if id.is_empty() => self.log.put(b"a fixed offset"),
+                Some((false, id)) => self.log.put(id.as_bytes()),
+            }
+            self.log.line();
+            self.space.zone_told = Some(z);
+        } else if !self.space.said_zone {
+            // Said once: an older kernel without the zone call, or the vault refused it; tried again at the next join.
+            self.space.said_zone = true;
+            self.log.put(b"fgtw: space: the kernel did not take the person's zone");
+            self.log.line();
+        }
+    }
+
+    /// Op 22 [automatic u8][the IANA id by hand]: the person chose their zone on this device (the clock page, following them): into the space, out to the fleet and fgtw.org, and to the kernel. → [0 done, 1 not yet: before the first pull, as op 18; 2 not an id].
+    pub fn space_zone(&mut self, auto: bool, id: &[u8]) -> u8 {
+        if self.space_ready().is_none() || !self.space.settled {
+            return 1;
+        }
+        // WHY the bounds: the id is the map's, and goes into the space as ASCII; tzdata's longest is 30 bytes, the kernel holds 64.
+        let Some(id) = core::str::from_utf8(id).ok().filter(|s| s.len() <= 1 << 6 && s.bytes().all(|c| c.is_ascii_graphic())) else { return 2 };
+        let me = self.me;
+        if ferros_space::set_zone(&mut self.space.space, &me, auto, id, eagle()) {
+            self.log.put(b"fgtw: space: the person's zone chosen here, to the fleet");
+            self.log.line();
+            self.space_keep();
+            self.space_to_fleet();
+            self.space_seed(true);
+        }
+        self.space_zone_to_kernel();
+        0
     }
 
     /// Op 18 [on]: this device's home screen follows the fleet's (1) or keeps its own (0). Refused (1) before the first pull: the switch is a fact of the person's space, and a fresh device's copy of it is not yet theirs.
