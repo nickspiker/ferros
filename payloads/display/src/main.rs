@@ -4665,6 +4665,15 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         };
         // The radio's measures, as its driver published them (facts 33 + 8 · radio): every one shown as itself, in its unit, a line each; none folded into a level, no bars (owner, 2026-11-03).
         let radio = radio_of(what);
+        // GPS's satellites as its driver tracks them (the kernel's TRACKS for its link): each one's azimuth and elevation in degrees and its weight in the rings (`gps_rings`): its carrier to noise over 48 dB-Hz, a satellite in the fix at full and one only tracked at half.
+        let sats: alloc::vec::Vec<(f32, f32, f32)> = if what == Corner::Gps {
+            let mut b = [0u64; ferros_sys::TRACKS_MAX];
+            // WHY the min: the count is the kernel's answer; only the words the buffer holds are read.
+            let n = ferros_sys::tracks(ferros_sys::control::GPS, &mut b).min(b.len());
+            b[..n].iter().filter_map(|&w| ferros_sys::sat_of(w)).filter(|s| s.cn0 > 0).map(|s| (s.azimuth as f32, s.elevation as f32, s.cn0 as f32 * (1.0 / 48.0) * if s.used { 1.0 } else { 0.5 })).collect()
+        } else {
+            alloc::vec::Vec::new()
+        };
         // The radio's state as its driver says it (measure STATE): connected the flavour's full colour, up and searching one stop darker.
         let state = radio.and_then(|ri: usize| facts[33 + 8 * ri..41 + 8 * ri].iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::STATE).map(|m| m.1));
         // Switched off by a tap (preference 15, the radios' bits in facts 32's order; USB is no switch).
@@ -4704,6 +4713,10 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         if let Some(ri) = radio {
             facts[33 + 8 * ri..41 + 8 * ri].iter().for_each(|&f| mix(f));
         }
+        for &(az, el, wt) in &sats {
+            mix(az.to_bits() as u64 | (el.to_bits() as u64) << 32);
+            mix(wt.to_bits() as u64);
+        }
         // Never 0, which is "not drawn yet".
         let key = key | 1;
         if pass == 0 {
@@ -4725,8 +4738,8 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         };
         // A box of pixels (x0, x1, y0, y1) cut to the region's: only the work, as `at` alone keeps the drawing inside the region.
         let cut = |b: (i64, i64, i64, i64)| (b.0.max(rbox.0), b.1.min(rbox.1), b.2.max(rbox.2), b.3.min(rbox.3));
-        // The text first: it is in front of its vessel. A radio's circle carries words only while it is off, its name alone (owner, 2026-11-07: "it will only show text when off"); on, its orb speaks for it, and its numbers are on its detail page. The clock and the battery keep theirs.
-        if radio.is_none() || switched_off || !live {
+        // The text first: it is in front of its vessel. Since 2026-11-09 (owner: "switch to the most useful stats, similar to the battery for all the radios except for GPS") a radio on carries its name and its measures, a line each, as the battery its readings; GPS on draws its satellites' rings (`gps_rings`); a radio switched off its field, GPS off its pin. Before: a radio carried words only while off (2026-11-07), its orb speaking for it on (`ORBS`). for it, and its numbers are on its detail page. The clock and the battery keep theirs.
+        {
             let mut lines = [Txt::new(); 9];
             let mut nl = 1;
             // The battery: its charge as the name, then the cell's voltage, the current (+ charging), their product and the temperature, as the gauge measures them (facts 1-4: per cent, hundredths of a degree, µV, µA).
@@ -4757,6 +4770,12 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                     }
                 }
             }
+            // A radio on: its most useful measures (`radio_lines`).
+            if live && !switched_off {
+                if let Some(ri) = radio {
+                    nl = radio_lines(what, &facts[33 + 8 * ri..41 + 8 * ri], state, &mut lines, nl);
+                }
+            }
             let name: &str = match what {
                 Corner::Clock => time,
                 Corner::Cellular => match tech {
@@ -4773,7 +4792,9 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 Corner::Battery => "batt",
                 Corner::Home | Corner::Back | Corner::Spare => "",
             };
-            if what == Corner::Gps {
+            if what == Corner::Gps && live && !switched_off && !sats.is_empty() {
+                gps_rings(&sats, x, y, r * (1.0 - 2.0 * VESSEL_DEPTH), flav, &mut |px, py| at(px, py), console, cut);
+            } else if what == Corner::Gps && !(live && !switched_off) {
                 // GPS switched off shows its symbol, not its name (owner, 2026-11-07: "the classic teardrop with a hole punch"): a map pin, the convex hull of a round head and the tip below it (its sides the tangents from the tip), a hole through the head's centre, in the ink, its edge the C∞ step across two pixels. By its signed distance (the orb crate's `pin_sd`, in the circle's radius, the one tools/orb-tune draws), so it is sharp at any size.
                 let (a, l) = (r * 0.3, r * 0.6);
                 // The head's centre, so the pin from the head's top to the tip sits centred in the circle.
@@ -4787,7 +4808,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                         console[i] = console[i].under(ink | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
                     }
                 }
-            } else if matches!(what, Corner::Wifi | Corner::Bluetooth | Corner::Cellular | Corner::Nfc) {
+            } else if matches!(what, Corner::Wifi | Corner::Bluetooth | Corner::Cellular | Corner::Nfc) && !(live && !switched_off) {
                 // The radio's own field, switched off, in the ink and posterised to near black and white (owner, 2026-11-07): WiFi a single emitter's waves; Bluetooth the same waves from two poles side by side, interfering (owner, 2026-11-08: "like the wifi icon but has two poles instead of one"); cellular a mesh of emitters at random places, their ripples interfering; NFC the magnetic dipole's field lines, the figure-eight, its light falling off with the log of the distance. Posterised by tanh (the bands near flat, their edges C∞); faded out before the rim by the C∞ bump exp(1 − 1/(1 − t²)).
                 let ri = r * (1.0 - 2.0 * VESSEL_DEPTH);
                 let post = |v: f32| 0.5 + 0.5 * libm::tanhf((1 << 2) as f32 * v);
@@ -4894,7 +4915,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         }
         // The orb, between the rings and the body as tools/orb-tune layers it (the rings are the glass, in front), on a live radio not switched off: its grid made again only when its measures changed (`ORB_GRIDS`), each pixel read from it. A circle with text (off, or no radio) has none, so the text and the orb never meet.
         let orb_grid: Option<&[u64]> = match radio {
-            Some(ri) if live && !switched_off => unsafe {
+            Some(ri) if ORBS && live && !switched_off => unsafe {
                 let (key, base, len) = ORB_GRIDS[ri];
                 if base == 1 {
                     None
@@ -7522,3 +7543,85 @@ static mut PANIC_GRANTS: u64 = 1;
 
 // The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
 ferros_sys::entry!(display_main);
+
+/// The radios' orbs (`orb_look`, the console's orb grids): off since 2026-11-09 (owner: "I haven't thought thru what I want it to look like and get used to the numbers so switch to the most useful stats"), kept for when the look is decided.
+const ORBS: bool = false;
+
+/// A radio's most useful measures for its circle, a line each after its name, as the battery shows its readings (owner, 2026-11-09): WiFi its signal, signal over noise, rate down and transmit power; cellular its reference signal's power, signal over interference (or noise), quality and signal; Bluetooth its transmit power; NFC its carrier; GPS (with no satellite to draw) the satellites in its fix and tracked, the best carrier to noise and its accuracy. WiFi not joined or cellular not registered says so first. Each measure only where its driver publishes it. Returns the line count.
+fn radio_lines(what: Corner, ms: &[u64], state: Option<i64>, lines: &mut [Txt; 9], mut nl: usize) -> usize {
+    use ferros_sys::measure as m;
+    let order: &[u16] = match what {
+        Corner::Wifi => &[m::RSSI, m::SNR, m::RATE_DOWN, m::TX_POWER],
+        Corner::Cellular => &[m::RSRP, m::SINR, m::SNR, m::RSRQ, m::RSSI],
+        Corner::Bluetooth => &[m::TX_POWER],
+        Corner::Nfc => &[m::FREQ],
+        Corner::Gps => &[m::SATS_USED, m::SATS_SEEN, m::CN0, m::ACCURACY],
+        _ => &[],
+    };
+    // Not linked yet: WiFi not joined (its STATE 1), cellular not registered (no technology yet; its STATE says only whether the data call is up).
+    let searching = match what {
+        Corner::Wifi => state == Some(1),
+        Corner::Cellular => !ms.iter().filter_map(|&w| ferros_sys::measure_of(w)).any(|x| x.0 == m::TECH),
+        _ => false,
+    };
+    if searching {
+        lines[nl].s("searching");
+        nl += 1;
+    }
+    for &k in order {
+        // Four lines under the name at most, as the battery has: the circle's chord holds no more at a readable size.
+        if nl >= 5 {
+            break;
+        }
+        let Some(v) = ms.iter().filter_map(|&w| ferros_sys::measure_of(w)).find(|x| x.0 == k).map(|x| x.1) else { continue };
+        let l = &mut lines[nl];
+        match k {
+            m::RSSI | m::NOISE | m::RSRP | m::TX_POWER => l.num(v, 1000, 0).s(" dBm"),
+            m::SNR | m::RSRQ | m::SINR => l.num(v, 1000, 0).s(" dB"),
+            m::RATE_DOWN | m::RATE_UP => l.num(v, 1_000_000, 0).s(" Mb/s"),
+            m::FREQ => l.num(v, 1000, 2).s(" MHz"),
+            m::SATS_USED => l.num(v, 1, 0).s(" in fix"),
+            m::SATS_SEEN => l.num(v, 1, 0).s(" seen"),
+            m::CN0 => l.num(v, 1000, 0).s(" dB-Hz"),
+            m::ACCURACY => l.num(v, 1000, 1).s(" m"),
+            _ => continue,
+        };
+        nl += 1;
+    }
+    nl
+}
+
+/// GPS's satellites as rings that all meet over the person (owner, 2026-11-09: "arcs like the edge of a bubble ... imagine refractive index of a smooth sphere, fresnel ... those should intersect over me and if I get more ... the point gets brighter"). Each satellite (azimuth, elevation in degrees, weight) is a circle through the disc's centre: its centre toward the satellite's azimuth (north up), its radius from a quarter of the disc's radius `ri` at the zenith to half at the horizon. Its light is a bubble's limb, dense at its edge and faint inside: w / √(s² + w²) with s = 1 − (d/ρ)² across the circle, w its width (an eighth of a 16th of the disc, in s), C∞ everywhere and 1 on the edge. The satellites' light adds as depth, its opacity 1 − e^(−depth), so where every ring meets (the centre) the light grows with each one; the disc's own edge fades it by exp(1 − 1/(1 − t²)), as the radios' fields fade.
+fn gps_rings(sats: &[(f32, f32, f32)], x: f32, y: f32, ri: f32, flav: (f32, f32, f32), at: &mut dyn FnMut(i64, i64) -> Option<usize>, console: &mut [u64], cut: impl Fn((i64, i64, i64, i64)) -> (i64, i64, i64, i64)) {
+    use fluor::pixel::{Blend, BlendMode};
+    let colour = g2t_colour(flav);
+    let band = ri * (1.0 / (1 << 5) as f32);
+    let rings: alloc::vec::Vec<(f32, f32, f32, f32)> = sats
+        .iter()
+        .map(|&(az, el, wt)| {
+            let (a, e) = (az.to_radians(), el.to_radians());
+            let rho = ri * (1.0 + libm::cosf(e)) * 0.25;
+            (libm::sinf(a) * rho, -libm::cosf(a) * rho, rho, wt)
+        })
+        .collect();
+    let (x0, x1, y0, y1) = cut(((x - ri) as i64, (x + ri) as i64 + 1, (y - ri) as i64, (y + ri) as i64 + 1));
+    for py in y0..=y1 {
+        for px in x0..=x1 {
+            let Some(i) = at(px, py) else { continue };
+            let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
+            let t2 = (dx * dx + dy * dy) / (ri * ri);
+            if t2 >= 1.0 {
+                continue;
+            }
+            let env = libm::expf(1.0 - 1.0 / (1.0 - t2));
+            let mut depth = 0.0;
+            for &(cx, cy, rho, wt) in &rings {
+                let s = 1.0 - ((dx - cx) * (dx - cx) + (dy - cy) * (dy - cy)) / (rho * rho);
+                let w = 2.0 * band / rho;
+                depth += wt * w / libm::sqrtf(s * s + w * w);
+            }
+            let a = (1.0 - libm::expf(-depth)) * env;
+            console[i] = console[i].under(colour | ((a * 65535.0) as u64) << 48, BlendMode::Normal);
+        }
+    }
+}
