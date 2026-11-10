@@ -911,8 +911,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"ip" => &[44, 45, 41, 52],
         // The modem driver: serve rmnet, its hardware, windows and partitions (payloads/modem's slot order).
         b"modem" => &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 40, 69, 70, 71, 72, 73, 74, 75, 76],
-        // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve fgtw, 5 entropy (the fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right (payloads/fgtw).
-        b"fgtw" => &[50, 48, 49, 46, 41, 80, 84, 85],
+        // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve fgtw, 5 entropy (the fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right, 9 the vault scope `map.`, 10 the vault scope `kists.` (payloads/fgtw; as init gives them: without 9 and 10 a restarted fgtw could not join the identity space, "the person's list is not readable", 2026-11-10).
+        b"fgtw" => &[50, 48, 49, 46, 41, 80, 84, 85, 20, 107],
         // 1 serve nfc, 2 hsi2c_0, 3 gpio-alive, 4 its power (payloads/nfc).
         b"nfc" => &[77, 78, 67, 79],
         // 1 serve bt, 2 the APM UART, 3 vendor_a, 4 its power, 5 entropy (payloads/bt).

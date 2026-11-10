@@ -105,6 +105,21 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if *name == b"map" {
             wait_person(grants, true);
         }
+        // fgtw again until it starts (2026-11-10, the Pro after a release: the attest screen holds one of the big pool's two arcs and wallgen, remaking a wiped person's wallpaper, the other for about 20 s; fgtw's one try found the pool full and the device sat with no identity service, so nothing of the fleet came back). Each try a second apart, said once.
+        if *name == b"fgtw" {
+            let mut said = false;
+            while spawn(grants, name, key, slots) != 0 {
+                if !said {
+                    said = true;
+                    console(grants, b"init: fgtw could not start yet (no arc free); trying again each second\n");
+                }
+                sleep_until(now() + freq());
+            }
+            if said {
+                console(grants, b"init: fgtw started\n");
+            }
+            continue;
+        }
         if spawn(grants, name, key, slots) != 0 {
             console(grants, b"init: could not start ");
             console(grants, name);
