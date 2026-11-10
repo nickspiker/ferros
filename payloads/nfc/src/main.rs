@@ -594,6 +594,19 @@ impl Nfc {
     }
 
     /// How long to wait before starting discovery again after `discover_failures` failures in a row: a second, doubling to at most 64. WHY the cap: a controller that recovers is found again within a minute, and the doubling has nothing left to save past that.
+    /// The screen off: discovery stopped (RF_DEACTIVATE to idle) and the controller told (CORE_SET_POWER_SUB_STATE 1, screen off), so neither the field nor the listen runs in the dark; a tap is consent only on a device whose screen is on (AUTH.md), so nothing is lost. On: sub-state 0 (on, unlocked, as the bring-up sets it), and the loop starts discovery again at once. 2026-11-10: NFC drew ~20 mW with the screen off and woke its driver ~115 times a second.
+    fn screen(&mut self, dark: bool, p: &mut Packet) {
+        if dark {
+            if self.discovering {
+                self.ok(&[0x21, 0x06, 0x01, 0x00], p);
+                self.discovering = false;
+            }
+            self.ok(&[0x20, 0x09, 0x01, 0x01], p);
+        } else {
+            self.ok(&[0x20, 0x09, 0x01, 0x00], p);
+        }
+    }
+
     fn retry_wait(&self) -> u64 {
         freq() << self.discover_failures.min(6)
     }
@@ -623,9 +636,21 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut retry_at = 0u64;
     // The corners' NFC circle (ferros_sys::measure), at each change: up; listening, with the carrier it listens on (NFC's 13.56 MHz); a reader's field on us (connected, while it lasts).
     let mut shown = None;
+    // The screen's state, read four times a second (`Nfc::screen`).
+    let (mut dark, mut dark_at) = (false, 0u64);
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
+        if now().wrapping_sub(dark_at) >= freq() / 4 {
+            dark_at = now();
+            let off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
+            if off != dark && !needs_init {
+                dark = off;
+                nfc.screen(dark, &mut p);
+                retry_at = 0;
+                say!(grants, "nfc: screen {}: {}\n", if dark { "off" } else { "on" }, if dark { "discovery stopped" } else { "discovery again" });
+            }
+        }
         if shown != Some((nfc.discovering, nfc.field)) {
             shown = Some((nfc.discovering, nfc.field));
             use ferros_sys::{measure as k, measure_word as w, status, MEASURE_NONE};
@@ -641,7 +666,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             continue;
         }
         // Discovery stopped (a deactivation to idle, or a bring-up that failed at the end): started again, a second later, then twice as long after each failure (`retry_wait`).
-        if !nfc.discovering && now() > retry_at {
+        if !nfc.discovering && !dark && now() > retry_at {
             if needs_init {
                 nfc.quiet = nfc.discover_failures > 0;
                 needs_init = !nfc.init(&mut p);
@@ -713,7 +738,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             continue;
         }
-        sleep_ms(1);
+        // A pass a millisecond while discovery runs; while the screen is off nothing comes from the air, and a request (the state, a secret) waits at most this long.
+        sleep_ms(if dark { 1 << 4 } else { 1 });
     }
 }
 
