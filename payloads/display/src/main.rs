@@ -3831,6 +3831,47 @@ fn flavour(what: Corner) -> ((f32, f32, f32), (f32, f32, f32)) {
     }
 }
 
+/// The calendar clock's rings (owner, 2026-11-10), as fractions of the circle's inner radius, outer and inner edge each: the months, the week, the day; the text inside the innermost (`CAL_TEXT`). The swept part's light and the rest's, as the ink's opacity.
+const CAL_RINGS: [(f32, f32); 3] = [(0.97, 0.83), (0.79, 0.67), (0.63, 0.51)];
+const CAL_TEXT: f32 = 0.5;
+const CAL_SWEPT: f32 = 0.6;
+const CAL_REST: f32 = 0.18;
+
+/// The clock corner's calendar now: the date line and each ring's (sweep, divisions).
+struct Cal {
+    date: Txt,
+    rings: [(f32, u32); 3],
+}
+
+/// The local date and time as the clock corner shows them (owner, 2026-11-10: "the outer ring being the month Zil-Stelor (or Jan-Dec if they pick arabic) and the middle ring being the week, Mon-Sun for all, then the inner ring being the first time digit in dozenal (one spinney), or the hour hand (two spinneys) in arabic. Should read top row month day, Stela Tue, Nov Tue"): the month a dozenal digit (months counted from Zil) in a dozenal base, else its three letters; the weekday's three letters in every base. The rings: the year by months (the month and how far thru it), the week from Monday, and the day (dozenal) or the twelve hours.
+fn calendar() -> Cal {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let (secs, sub) = ferros_sys::local_time().unwrap_or((0, 0));
+    let dayf = (secs.rem_euclid(86400) as f32 + sub as f32 / freq() as f32) * (1.0 / 86400.0);
+    let (year, m, d, wd) = tatau::civil_from_days(secs.div_euclid(86400));
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    // Months counted from 0: February 1, April 3, June 5, September 8, November 10.
+    let dim = match m {
+        1 => if leap { 29 } else { 28 },
+        3 | 5 | 8 | 10 => 30,
+        _ => 31,
+    };
+    let dozenal = ferros_sys::pref(ferros_sys::PREF_BASE) & 0x7F == 12;
+    let mut date = Txt::new();
+    if dozenal {
+        let mut b = [0u8; 4];
+        date.s(char::from_u32(0x10 + m).unwrap_or('?').encode_utf8(&mut b));
+    } else {
+        date.s(MONTHS[m as usize]);
+    }
+    date.s(" ").s(DAYS[wd as usize]);
+    let monthf = (m as f32 + ((d - 1) as f32 + dayf) / dim as f32) * (1.0 / 12.0);
+    let weekf = (wd as f32 + dayf) * (1.0 / 7.0);
+    let hours = if dozenal { dayf } else { dayf * 2.0 - libm::floorf(dayf * 2.0) };
+    Cal { date, rings: [(monthf, 12), (weekf, 7), (hours, 12)] }
+}
+
 /// A line of a corner's text, on the stack (the chrome draws without the heap's growth). 64 bytes hold the longest line `measure_text` makes in any base (a DLS value is an arrow, up to a dozen digits, the point and the unit), so a write past it is a bug there and panics.
 #[derive(Clone, Copy)]
 struct Txt {
@@ -4745,6 +4786,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         end -= 2;
     }
     let time = core::str::from_utf8(&line[..end]).unwrap_or("");
+    let cal = calendar();
     let t_f = ferros_sys::now();
     let facts = ferros_sys::facts().0;
     let f_us = ferros_sys::us_since(t_f);
@@ -4773,7 +4815,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
     }
     // The time by what it shows, not by the clock's count: the count is seconds only for decimal (a dozenal count is in 50/12 s, and its sixtieths never lined up with the twelfth the circle shows, which turned over up to four minutes late).
     let mut time_h = 0u64;
-    for &c in time.as_bytes() {
+    for &c in time.as_bytes().iter().chain(cal.date.str().as_bytes()) {
         time_h = (time_h.rotate_left(7) ^ c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
     let k = (((time_h >> 9) as i64) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64 ^ (off as i64) << 40;
@@ -5049,10 +5091,19 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                     }
                 }
             } else if !name.is_empty() {
-                lines[0].s(name);
+                // The clock: the date over the time, inside the calendar's rings (`CAL_TEXT` of the circle), the two lines alike.
+                let clock = what == Corner::Clock;
+                if clock {
+                    lines[0].s(cal.date.str());
+                    lines[1].s(name);
+                    nl = 2;
+                } else {
+                    lines[0].s(name);
+                }
+                let r = if clock { r * CAL_TEXT } else { r };
                 let eng = unsafe { (*(&raw mut CON_GLYPHS)).as_mut().expect("console glyphs") };
                 // The lines stacked about the centre, a pitch each; each line as large as fits its own chord (seven tenths of the circle's width at the line's far edge), the name half again as large as a measure.
-                let weight = |j: usize| if j == 0 && nl > 1 { 1.5 } else { 1.0 };
+                let weight = |j: usize| if j == 0 && nl > 1 && !clock { 1.5 } else { 1.0 };
                 let total: f32 = (0..nl).map(weight).sum();
                 let pitch = if nl == 1 { r * 0.66 } else { r * 1.5 / total };
                 let mut top_y = y - pitch * total * 0.5;
@@ -5076,6 +5127,37 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                         }
                     });
                     top_y += lh;
+                }
+            }
+            // The calendar's rings, behind the clock's text (front to back): outermost the year's months, then the week, then the day (dozenal, the time's first place, one turn a day) or the twelve hours (the hour hand, two turns a day). Each a sweep from twelve o'clock to where it stands, lighter than the rest of its ring, with a tick at each of its divisions in front; every edge the C∞ step across a pixel's width.
+            if what == Corner::Clock && live {
+                let ri = r * (1.0 - 2.0 * VESSEL_DEPTH);
+                let tau = core::f32::consts::TAU;
+                let (x0, x1, y0, y1) = cut(((x - ri) as i64, (x + ri) as i64 + 1, (y - ri) as i64, (y + ri) as i64 + 1));
+                for py in y0..=y1 {
+                    for px in x0..=x1 {
+                        let Some(i) = at(px, py) else { continue };
+                        let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
+                        let d = libm::sqrtf(dx * dx + dy * dy);
+                        // The turn's fraction clockwise from twelve o'clock, 0 to 1.
+                        let a = libm::atan2f(dx, -dy);
+                        let f = if a < 0.0 { a + tau } else { a } * (1.0 / tau);
+                        for (k, &(frac, ticks)) in cal.rings.iter().enumerate() {
+                            let (r1, r0) = (ri * CAL_RINGS[k].0, ri * CAL_RINGS[k].1);
+                            let band = draw::bump_step(r1 - d + 0.5) * draw::bump_step(d - r0 + 0.5);
+                            if band <= 0.0 {
+                                continue;
+                            }
+                            // Arc lengths in pixels at this radius: past the start of the sweep (twelve o'clock) and short of its end.
+                            let swept = draw::bump_step(f * tau * d + 0.5) * draw::bump_step((frac - f) * tau * d + 0.5);
+                            let g = f * ticks as f32;
+                            let off = libm::fabsf(g - libm::roundf(g)) * (tau / ticks as f32) * d;
+                            let tick = draw::bump_step(1.0 - off);
+                            let level = CAL_SWEPT * swept + CAL_REST * (1.0 - swept);
+                            console[i] = console[i].under(ink | ((band * tick * 65535.0) as u64) << 48, BlendMode::Normal);
+                            console[i] = console[i].under(ink | ((band * level * 65535.0) as u64) << 48, BlendMode::Normal);
+                        }
+                    }
                 }
             }
         }
