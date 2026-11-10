@@ -92,10 +92,11 @@ const NO_BOARD: Board = Board { base: [0; BOARD_PIXELS], weight: [0; BOARD_PIXEL
 /// Two boards kept (owner, 2026-11-01: copy and tint): the one on show and the one a held key will leave, or the other case, so a shift, a letter or a lift is one tint pass and a copy, with no label drawn. A board missing is drawn once into the slot not on show (`Ahau::board`); `Ahau::boards` says which board each slot holds.
 static mut BOARDS: [Board; 2] = [NO_BOARD; 2];
 /// What a board's untinted pixels follow: its layout, its view, upper case or not, the bar's left key's label. The shift key's own look (off, once, lock) is drawn over it at every paint.
-type BoardKey = (usize, usize, bool, &'static str);
+type BoardKey = (usize, usize, bool, &'static str, &'static str);
 
+/// The page key's word stands for all the bar's words: they change together, with the language.
 fn board_key(kb: &Keyboard) -> BoardKey {
-    (kb.layout, kb.view, kb.shift != honeycomb::Shift::Off, kb.left)
+    (kb.layout, kb.view, kb.shift != honeycomb::Shift::Off, kb.left, kb.page)
 }
 
 /// The mark thread's work: the grants (for its console line), the radius and the salt, set before it starts; and its stack.
@@ -850,7 +851,7 @@ impl Ahau {
             _ => {}
         }
         self.mode = Mode::Fresh;
-        self.status(self.prompt());
+        self.status(self.prompt().as_str());
         self.words();
         self.entry();
         self.button();
@@ -858,15 +859,16 @@ impl Ahau {
 
     /// What the button does now, or nothing while the client is asked.
     fn button_label(&self) -> Option<&'static str> {
+        use ferros_lang::{t, Msg};
         match self.mode {
             // Always "attest", bound or not (owner, 2026-11-10: "needs to say attest, not unlock. always attest"): the prompt above says whether the handle also binds this device.
-            Mode::Fresh => Some("attest"),
-            Mode::Mint(_) => Some("mint"),
-            Mode::Wrong | Mode::Owned => Some("start over"),
-            Mode::Words(_) => Some("cancel"),
-            Mode::Networks if self.joining => Some("joining"),
+            Mode::Fresh => Some(t(Msg::Attest)),
+            Mode::Mint(_) => Some(t(Msg::Mint)),
+            Mode::Wrong | Mode::Owned => Some(t(Msg::StartOver)),
+            Mode::Words(_) => Some(t(Msg::Cancel)),
+            Mode::Networks if self.joining => Some(t(Msg::JoiningButton)),
             // Only a network this device can join (WPA2-PSK outside 6 GHz) gets a join.
-            Mode::Pass if self.net_found().is_some_and(|f| f.1 & 1 != 0) => Some("join"),
+            Mode::Pass if self.net_found().is_some_and(|f| f.1 & 1 != 0) => Some(t(Msg::Join)),
             Mode::Pass => None,
             Mode::Looking(_) | Mode::Join(_) | Mode::Bound(_) | Mode::Grey(_) | Mode::Hosting | Mode::Networks => None,
         }
@@ -1210,7 +1212,7 @@ impl Ahau {
             return true;
         }
         if changed {
-            self.status(self.prompt());
+            self.status(self.prompt().as_str());
             self.entry_line(false);
             self.button();
         }
@@ -1482,10 +1484,17 @@ impl Ahau {
         // The bound screen: green, its one line, nothing to type or press.
         if matches!(self.mode, Mode::Bound(_)) {
             // Selected: the selecting device's name came in the copy's words (fgtw op 1); bound: none.
-            let mut l = Line::new();
             let name = core::str::from_utf8(&self.word_buf[..self.word_len]).unwrap_or("");
-            let _ = if name.is_empty() { core::fmt::Write::write_str(&mut l, self.prompt()) } else { core::fmt::Write::write_fmt(&mut l, format_args!("Selected by {name}.\nWaiting for the fleet's keys.")) };
-            self.status(core::str::from_utf8(l.as_bytes()).unwrap_or(""));
+            // Selected: who selected it (Photon's line), then that the keys follow, a line each.
+            let l = if name.is_empty() {
+                self.prompt()
+            } else {
+                let mut l = fl(ferros_lang::Fleet::SelectedBy(name));
+                let _ = core::fmt::Write::write_str(&mut l, "\n");
+                let _ = ferros_lang::fleet(ferros_lang::Fleet::WaitingFleetKeys, &mut l);
+                l
+            };
+            self.status(l.as_str());
             self.show();
             return;
         }
@@ -1499,7 +1508,7 @@ impl Ahau {
                 draw_mark(self.surf(), self.w, cx, cy, r);
                 self.present(cy - r - 2, cy + r + 2);
             }
-            self.status(self.prompt());
+            self.status(self.prompt().as_str());
         }
         self.entry();
         self.button();
@@ -1745,11 +1754,11 @@ impl Ahau {
                 let mut n = 0;
                 match found {
                     None => {
-                        let _ = core::fmt::Write::write_str(&mut lines[0], "Not seen in the last scan.");
+                        lines[0] = tx(ferros_lang::Msg::NotSeenLastScan);
                         n = 1;
                     }
                     Some((dbm, flags)) => {
-                        let _ = core::fmt::Write::write_fmt(&mut lines[n], format_args!("Signal {dbm} dBm"));
+                        lines[n] = sx(ferros_lang::Say::Signal(signed(dbm as i64).as_str()));
                         n += 1;
                         let bands = [(5, "2.4 GHz"), (3, "5 GHz"), (6, "6 GHz")];
                         let mut first_band = true;
@@ -1763,10 +1772,10 @@ impl Ahau {
                         if !first_band {
                             n += 1;
                         }
-                        let _ = core::fmt::Write::write_str(&mut lines[n], if flags & 1 != 0 { "WPA2 personal" } else if flags & 2 != 0 { "Open: not joined by this device yet" } else { "WPA3, enterprise or WEP: not joined by this device yet" });
+                        lines[n] = tx(if flags & 1 != 0 { ferros_lang::Msg::Wpa2Personal } else if flags & 2 != 0 { ferros_lang::Msg::OpenNotJoined } else { ferros_lang::Msg::Wpa3NotJoined });
                         n += 1;
                         if flags & (1 << 4) != 0 {
-                            let _ = core::fmt::Write::write_str(&mut lines[n], "Kept on this device");
+                            lines[n] = tx(ferros_lang::Msg::KeptOnDevice);
                             n += 1;
                         }
                     }
@@ -1793,9 +1802,11 @@ impl Ahau {
         let b = first + k * pitch;
         let mut l = Line::new();
         if flags & (1 << 4) != 0 {
-            let _ = core::fmt::Write::write_str(&mut l, if wifi_joined() { "connected" } else { "kept" });
+            l = tx(if wifi_joined() { ferros_lang::Msg::Connected } else { ferros_lang::Msg::KeptTag });
         } else if let Some(d) = dbm {
-            let _ = core::fmt::Write::write_fmt(&mut l, format_args!("{d} dBm"));
+            // The signal in the person's base (dBm, a unit symbol, stays).
+            l = signed(d as i64);
+            let _ = core::fmt::Write::write_str(&mut l, " dBm");
         }
         let x = (self.w * 7 / 8) as i64 - self.measure(px, l.as_bytes()) / 4;
         window::text(self.display, self.text_to.get(), x as i16, b as i16, px as u16, QUIET, l.as_bytes());
@@ -1823,21 +1834,21 @@ impl Ahau {
     fn net_status(&self) {
         let name = printable(&self.pick.0[..self.pick.1]);
         let name = core::str::from_utf8(&name.0[..name.1]).unwrap_or("");
-        let mut l = Line::new();
         let scanning = self.nets_len >= 1 && self.nets[0] == 1;
         let count = if self.nets_len >= 2 { self.nets[1] } else { 0 };
-        let _ = match self.mode {
-            _ if self.joining => core::fmt::Write::write_fmt(&mut l, format_args!("Joining {name}.")),
-            Mode::Pass if self.button_label().is_some() => core::fmt::Write::write_fmt(&mut l, format_args!("The passphrase for {name}.")),
-            Mode::Pass if self.net_found().is_none() => core::fmt::Write::write_fmt(&mut l, format_args!("{name} is out of reach.")),
-            Mode::Pass => core::fmt::Write::write_fmt(&mut l, format_args!("{name} needs a kind of security this device cannot join yet.")),
-            _ if self.nets_len == 0 => core::fmt::Write::write_str(&mut l, "The WiFi is starting."),
-            _ if count == 0 && scanning => core::fmt::Write::write_str(&mut l, "Looking for networks."),
-            _ if count == 0 => core::fmt::Write::write_str(&mut l, "No networks found."),
-            _ if self.net_visible(0).is_none() => core::fmt::Write::write_str(&mut l, "No network matches."),
-            _ => core::fmt::Write::write_str(&mut l, "Type to narrow the list, tap a network to join it."),
+        use ferros_lang::{Msg, Say};
+        let l = match self.mode {
+            _ if self.joining => sx(Say::JoiningNet(name)),
+            Mode::Pass if self.button_label().is_some() => sx(Say::PassphraseFor(name)),
+            Mode::Pass if self.net_found().is_none() => sx(Say::OutOfReach(name)),
+            Mode::Pass => sx(Say::SecurityUnsupported(name)),
+            _ if self.nets_len == 0 => tx(Msg::WifiStarting),
+            _ if count == 0 && scanning => tx(Msg::LookingForNetworks),
+            _ if count == 0 => tx(Msg::NoNetworksFound),
+            _ if self.net_visible(0).is_none() => tx(Msg::NoNetworkMatches),
+            _ => tx(Msg::TypeToNarrow),
         };
-        self.status(core::str::from_utf8(l.as_bytes()).unwrap_or(""));
+        self.status(l.as_str());
     }
 
     /// The list as `wlan_thread` last published it, kept and drawn when it changed (no call here). Until the driver first answers, the page stays as it was ("The WiFi is starting.").
@@ -1879,7 +1890,7 @@ impl Ahau {
         let (name, n) = self.pick;
         let pass = &self.handle[..self.len];
         if !(8..=63).contains(&pass.len()) || !pass.is_ascii() {
-            self.status("A passphrase is 8 to 63 plain characters.");
+            self.status(sx(ferros_lang::Say::PassphraseLength { min: 8, max: 63 }).as_str());
             return;
         }
         let mut q = [0u8; 2 + 32 + 63];
@@ -1894,7 +1905,7 @@ impl Ahau {
             unsafe { core::ptr::write_volatile(b, 0) };
         }
         match (r, out[0]) {
-            (r, _) if r == ferros_sys::ERR || r == 0 => self.status("The WiFi is not answering yet. Try again."),
+            (r, _) if r == ferros_sys::ERR || r == 0 => self.status(tx(ferros_lang::Msg::WifiNotAnswering).as_str()),
             (_, 0) => {
                 self.zero_text();
                 self.joining = true;
@@ -1903,9 +1914,9 @@ impl Ahau {
                 self.button();
                 self.net_status();
             }
-            (_, 1) => self.status("A passphrase is 8 to 63 plain characters."),
-            (_, 3) => self.status("This device is on a network already."),
-            _ => self.status("The device could not keep this network."),
+            (_, 1) => self.status(sx(ferros_lang::Say::PassphraseLength { min: 8, max: 63 }).as_str()),
+            (_, 3) => self.status(tx(ferros_lang::Msg::AlreadyOnNetwork).as_str()),
+            _ => self.status(tx(ferros_lang::Msg::CouldNotKeepNetwork).as_str()),
         }
     }
 
@@ -1930,13 +1941,12 @@ impl Ahau {
         self.mode = Mode::Pass;
         let shown = printable(&self.pick.0[..self.pick.1]);
         let name = core::str::from_utf8(&shown.0[..shown.1]).unwrap_or("");
-        let mut l = Line::new();
-        let _ = match outcome {
-            1 => core::fmt::Write::write_fmt(&mut l, format_args!("{name} is out of reach.")),
-            3 => core::fmt::Write::write_fmt(&mut l, format_args!("{name} did not answer. Try again.")),
-            _ => core::fmt::Write::write_fmt(&mut l, format_args!("{name} refused the passphrase.")),
-        };
-        self.status(core::str::from_utf8(l.as_bytes()).unwrap_or(""));
+        let l = sx(match outcome {
+            1 => ferros_lang::Say::OutOfReach(name),
+            3 => ferros_lang::Say::DidNotAnswer(name),
+            _ => ferros_lang::Say::RefusedPassphrase(name),
+        });
+        self.status(l.as_str());
         self.entry();
         self.button();
         true
@@ -2084,25 +2094,26 @@ impl Ahau {
         }
     }
 
-    fn prompt(&self) -> &'static str {
+    fn prompt(&self) -> Line {
+        use ferros_lang::{Fleet, Msg};
         match self.mode {
-            // The screen's words (owner, 2026-10-31: simple and direct; AUTH.md "What the attest screen says").
-            Mode::Fresh if self.bound => "Type your handle.",
-            Mode::Fresh => "This device is unbound.\nType your handle to bind.",
+            // The screen's words (owner, 2026-10-31: simple and direct; AUTH.md "What the attest screen says"), in the person's language; the fleet's and identity's are fgtw's, the same Photon shows.
+            Mode::Fresh if self.bound => tx(Msg::TypeYourHandle),
+            Mode::Fresh => tx(Msg::UnboundTypeToBind),
             // No data link, nothing can be found: said so rather than looking (owner, 2026-11-09). The loop redraws it when a link comes or goes.
-            Mode::Looking(_) if !ferros_sys::data_link_up(&ferros_sys::facts()) => "Waiting for connectivity.",
-            Mode::Looking(_) => "Finding this identity.",
-            Mode::Join(_) => "Use an existing device to bind this device to your fleet.",
-            Mode::Bound(_) => "Bound to your fleet.\nWaiting for its keys.",
-            Mode::Mint(_) => "This handle is unclaimed.\nMinting is permanent.\nType your handle again to mint your identity.",
-            Mode::Grey(_) if !ferros_sys::data_link_up(&ferros_sys::facts()) => "Waiting for connectivity.",
-            Mode::Grey(_) => "No answer yet. Still looking.",
-            Mode::Wrong => "This handle's record doesn't match.\nStart over with another.",
-            Mode::Owned => "This device belongs to another identity.\nOnly its fleet can let it go.",
-            Mode::Words(_) => "Type the words the new device shows.",
-            Mode::Hosting => "",
+            Mode::Looking(_) if !ferros_sys::data_link_up(&ferros_sys::facts()) => tx(Msg::WaitingConnectivity),
+            Mode::Looking(_) => tx(Msg::FindingIdentity),
+            Mode::Join(_) => fl(Fleet::UseExistingDevice),
+            Mode::Bound(_) => fl(Fleet::BoundWaitingKeys),
+            Mode::Mint(_) => tx(Msg::MintPrompt),
+            Mode::Grey(_) if !ferros_sys::data_link_up(&ferros_sys::facts()) => tx(Msg::WaitingConnectivity),
+            Mode::Grey(_) => tx(Msg::NoAnswerYet),
+            Mode::Wrong => tx(Msg::RecordMismatch),
+            Mode::Owned => fl(Fleet::OwnedByOther),
+            Mode::Words(_) => fl(Fleet::TypeWords),
+            Mode::Hosting => Line::new(),
             // The network page writes its own lines (`net_status`).
-            Mode::Networks | Mode::Pass => "",
+            Mode::Networks | Mode::Pass => Line::new(),
         }
     }
 
@@ -2143,7 +2154,7 @@ impl Ahau {
             Mode::Join(_) | Mode::Grey(_) => return,
             Mode::Wrong | Mode::Owned => {
                 self.mode = Mode::Fresh;
-                self.status(self.prompt());
+                self.status(self.prompt().as_str());
                 self.words();
                 return;
             }
@@ -2170,7 +2181,7 @@ impl Ahau {
                 ferros_sys::Unlock::Belongs => {
                     console(self.grants, b"ahau: refused: this device belongs to another identity\n");
                     self.wipe();
-                    self.status("Denied. This device is bound to another identity.");
+                    self.status(fl(ferros_lang::Fleet::DeniedBoundOther).as_str());
                     self.entry();
                     return;
                 }
@@ -2186,14 +2197,14 @@ impl Ahau {
                 console(self.grants, b"ahau: roots set; their thread hands them to fgtw\n");
                 self.wipe();
                 self.mode = Mode::Looking(seed);
-                self.status(self.prompt());
+                self.status(self.prompt().as_str());
             }
             Mode::Mint(first) => {
                 if !ahau_core::same(&first, &seed) {
-                    self.status("They don't match. Try again.");
+                    self.status(fl(ferros_lang::Fleet::HandlesDontMatch).as_str());
                     return;
                 }
-                self.status("Minting.");
+                self.status(tx(ferros_lang::Msg::Minting).as_str());
                 self.entry();
                 self.show();
                 let mut out = [0u8; 600];
@@ -2208,7 +2219,7 @@ impl Ahau {
                     4 => {
                         // Another device's genesis won the handle first: it has a fleet now.
                         self.mode = Mode::Join(seed);
-                        self.status(self.prompt());
+                        self.status(self.prompt().as_str());
                         // Its words come with `client_thread`'s next copy (the mint rang the doorbell).
                         self.words();
                     }
@@ -2216,7 +2227,7 @@ impl Ahau {
                         let mut l = Line::new();
                         let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: mint refused, client says {r}\n"));
                         console(self.grants, l.as_bytes());
-                        self.status("Minting failed. Enter to retry.");
+                        self.status(tx(ferros_lang::Msg::MintingFailed).as_str());
                     }
                 }
             }
@@ -2242,7 +2253,7 @@ impl Ahau {
             return p;
         }
         if say {
-            self.status("Computing identity keys.");
+            self.status(tx(ferros_lang::Msg::ComputingKeys).as_str());
             self.entry();
             self.show();
             // Let the display put the status up before the proof holds the core.
@@ -2422,43 +2433,35 @@ impl Ahau {
         let mut o = [0u8; 128];
         let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &m[..1 + self.len], &mut o);
         if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 {
-            self.status("The identity service is not answering.");
+            self.status(tx(ferros_lang::Msg::IdentityServiceNotAnswering).as_str());
             return;
         }
         // WHY the min: the reply's length is the service's word; what follows the kind is read only as far as this buffer took it.
         let n = (n as usize).min(o.len());
         let text = |from: usize| core::str::from_utf8(o.get(from..n).unwrap_or(&[])).unwrap_or("");
-        let mut l = Line::new();
-        match o[0] {
+        // The service's verdict in the person's words (fgtw's, the same Photon shows); the word typed and the device's name as they are.
+        let l = match o[0] {
             // Matched: the identity service adds it now; the Fleet page shows how it goes.
             2 => {
                 self.end_words(false);
                 return;
             }
-            0 if n > 2 => {
-                let _ = core::fmt::Write::write_fmt(&mut l, format_args!("\"{}\" is not one of the words.", text(2)));
-            }
-            0 => {
-                let _ = core::fmt::Write::write_str(&mut l, "Waiting for the new device to ask.");
-            }
-            1 => {
-                let _ = core::fmt::Write::write_str(&mut l, self.prompt());
-            }
-            3 => {
-                let _ = core::fmt::Write::write_fmt(&mut l, format_args!("No device asking has \"{}\".", text(2)));
-            }
-            4 => {
-                let _ = core::fmt::Write::write_fmt(&mut l, format_args!("Matches {}.", text(2)));
-            }
+            0 if n > 2 => fl(ferros_lang::Fleet::InvalidWord(text(2))),
+            0 => fl(ferros_lang::Fleet::WaitingForDevice),
+            1 => self.prompt(),
+            3 => fl(ferros_lang::Fleet::NoMatchingDevice(text(2))),
+            4 => fl(ferros_lang::Fleet::MatchingDevice(text(2))),
             5 => {
-                let _ = core::fmt::Write::write_fmt(&mut l, format_args!("Matches {} devices.", o.get(1).copied().unwrap_or(0)));
+                // The count in the person's base, and as a value for the languages whose words agree with it.
+                let count = o.get(1).copied().unwrap_or(0) as u64;
+                fl(ferros_lang::Fleet::MatchingMultiple { count, shown: signed(count as i64).as_str() })
             }
             _ => {
                 self.end_words(false);
                 return;
             }
-        }
-        self.status(core::str::from_utf8(l.as_bytes()).unwrap_or(""));
+        };
+        self.status(l.as_str());
     }
 
     /// The words done: the screen goes, the text wiped; `cancel` tells the identity service they are no longer wanted (op 15 [0]).
@@ -2961,7 +2964,13 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mode = Mode::Fresh;
     let mut kb = Keyboard::new(w, ferros_sys::active_circle(w, h));
     fit_bar(cap(grants, S_DISPLAY), &mut kb);
-    kb.left = "clear";
+    // The bar's words in the person's language (the left key clears what is typed); the board cache follows them (`board_key`).
+    {
+        use ferros_lang::{t, Msg};
+        kb.left = t(Msg::KeyClear);
+        kb.bar = [t(Msg::KeyClear), t(Msg::KeyShift), t(Msg::KeySpace), t(Msg::KeyDel), t(Msg::KeyEnter)];
+        kb.page = t(Msg::KeyPage);
+    }
     // The device's layout; a value from a newer build than this one falls back to the default.
     let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
     kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };
@@ -3033,7 +3042,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             let up = ferros_sys::data_link_up(&ferros_sys::facts());
             if link_up != Some(up) {
                 if link_up.is_some() {
-                    a.status(a.prompt());
+                    a.status(a.prompt().as_str());
                     a.show();
                 }
                 link_up = Some(up);
@@ -3306,15 +3315,55 @@ impl Line {
     fn as_bytes(&self) -> &[u8] {
         &self.b[..self.n]
     }
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(self.as_bytes()).unwrap_or("")
+    }
 }
 
 impl core::fmt::Write for Line {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let k = s.len().min(self.b.len() - self.n);
+        let mut k = s.len().min(self.b.len() - self.n);
+        // WHY: the line is fixed and `s` a translation of any length; a cut inside a character makes the whole line invalid UTF-8, which reads as nothing. PROOF: 0 is always a boundary, so the loop ends.
+        while !s.is_char_boundary(k) {
+            k -= 1;
+        }
         self.b[self.n..self.n + k].copy_from_slice(&s.as_bytes()[..k]);
         self.n += k;
         Ok(())
     }
+}
+
+/// A message of the attest screen in the person's language (ferros_lang), as a line.
+fn tx(m: ferros_lang::Msg) -> Line {
+    let mut l = Line::new();
+    let _ = core::fmt::Write::write_str(&mut l, ferros_lang::t(m));
+    l
+}
+
+/// A message with holes in the person's language, its counts in their base.
+fn sx(m: ferros_lang::Say) -> Line {
+    let mut l = Line::new();
+    let _ = ferros_lang::s(m, &mut l);
+    l
+}
+
+/// A fleet or identity message (fgtw's, shared with Photon) in the person's language.
+fn fl(m: ferros_lang::Fleet) -> Line {
+    let mut l = Line::new();
+    let _ = ferros_lang::fleet(m, &mut l);
+    l
+}
+
+/// A signed number in the person's base (a network's signal in dBm).
+fn signed(n: i64) -> Line {
+    let mut l = Line::new();
+    if n < 0 {
+        let _ = core::fmt::Write::write_str(&mut l, "-");
+    }
+    if let Ok(tatau::Out::Nothing) = tatau::count(&mut l, ferros_sys::numbers(tatau::Style::Glyphs), n.unsigned_abs(), 1) {
+        let _ = core::fmt::Write::write_str(&mut l, "0");
+    }
+    l
 }
 
 #[panic_handler]
