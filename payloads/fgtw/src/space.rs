@@ -6,6 +6,7 @@
 //! - **Every 64 s** fgtw.org is asked again, for a sibling's change made where this device could not hear it.
 //! - **The map** reads the generation (op 17), bumped whenever the device's copy was written from the space, and reloads its circles; the Fleet page's switch "sync this device's home screen" is op 18.
 //! - **The person's zone** (ferros_space `ZONE`; owner, 2026-11-10: "it's per identity, you can uncheck and set per device tho"): chosen on the clock page of a device that follows it (op 22), and written to the kernel (SYS_ZONE op 4) at every join where it changed, never read back from the kernel (settings flow identity to device only). Whether this device follows it is the device's own switch, kept by the kernel.
+//! - **The person's language** (ferros_space `LANG`), as the zone: chosen on the language page of a device that follows it (op 23), written to the kernel (SYS_LANG op 2) at every join where it changed, never read back.
 
 use super::*;
 use ferros_space::space::{Baseline, Sealed, Space};
@@ -44,11 +45,14 @@ pub struct SpaceSync {
     /// The person's zone as last written to the kernel (SYS_ZONE op 4): None not yet, Some(None) the person has chosen none.
     zone_told: Option<Option<(bool, alloc::string::String)>>,
     said_zone: bool,
+    /// The person's language as last written to the kernel (SYS_LANG op 2): None not yet, Some(None) the person has none.
+    lang_told: Option<Option<[u8; 3]>>,
+    said_lang: bool,
 }
 
 impl SpaceSync {
     pub fn new() -> SpaceSync {
-        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, zone_told: None, said_zone: false }
+        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, zone_told: None, said_zone: false, lang_told: None, said_lang: false }
     }
 }
 
@@ -361,8 +365,9 @@ impl Client {
         }
         let mut copy = self.copy();
         let me = self.me;
-        // The person's zone, which no copy on this device mirrors: to the kernel as it changes (from a sibling, fgtw.org, or a choice made here).
+        // The person's zone and language, which no copy on this device mirrors: to the kernel as they change (from a sibling, fgtw.org, or a choice made here).
         self.space_zone_to_kernel();
+        self.space_lang_to_kernel();
         match ferros_space::sync(&mut self.space.space, &mut self.space.base, &mut copy, &me, eagle()) {
             Ok(o) => {
                 self.space.said_join = false;
@@ -545,6 +550,47 @@ impl Client {
             self.space_seed(true);
         }
         self.space_zone_to_kernel();
+        0
+    }
+
+    /// The person's language written to the kernel when it differs from what was last written (settings flow identity to device only: the kernel never hands one back). The kernel keeps it in the device settings, and the device follows it unless its settings say otherwise (kernel lang.rs).
+    fn space_lang_to_kernel(&mut self) {
+        let l = ferros_space::language(&self.space.space);
+        if self.space.lang_told == Some(l) {
+            return;
+        }
+        if ferros_sys::lang::set_identity(l) {
+            self.log.put(b"fgtw: space: the person's language to this device: ");
+            self.log.put(l.as_ref().map_or(b"none chosen".as_slice(), |c| c.as_slice()));
+            self.log.line();
+            self.space.lang_told = Some(l);
+        } else if !self.space.said_lang {
+            // Said once: an older kernel without the language call, or the vault refused it; tried again at the next join.
+            self.space.said_lang = true;
+            self.log.put(b"fgtw: space: the kernel did not take the person's language");
+            self.log.line();
+        }
+    }
+
+    /// Op 23 [the ISO 639-3 code, three letters]: the person chose their language on this device (the language page, following them): into the space, out to the fleet and fgtw.org, and to the kernel. → [0 done, 1 not yet: before the first pull, as op 18; 2 not a code].
+    pub fn space_lang(&mut self, code: &[u8]) -> u8 {
+        if self.space_ready().is_none() || !self.space.settled {
+            return 1;
+        }
+        // WHY: the code is the map's, and goes into the space as a vsf `wl`, which takes three lowercase letters and nothing else.
+        let Ok(code) = <[u8; 3]>::try_from(code) else { return 2 };
+        if !code.iter().all(u8::is_ascii_lowercase) {
+            return 2;
+        }
+        let me = self.me;
+        if ferros_space::set_language(&mut self.space.space, &me, code, eagle()) {
+            self.log.put(b"fgtw: space: the person's language chosen here, to the fleet");
+            self.log.line();
+            self.space_keep();
+            self.space_to_fleet();
+            self.space_seed(true);
+        }
+        self.space_lang_to_kernel();
         0
     }
 

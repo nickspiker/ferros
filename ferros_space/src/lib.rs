@@ -12,6 +12,7 @@
 //! | `HOME_SYNC` | a device `ke` | on `u` | none: the space's own, set from settings |
 //! | `DEPART` | the leaving device `ke` | its signed departure request `v`, or once denied the signed deny | none: the identity service's own (payloads/fgtw), so a member answers it wherever it is |
 //! | `ZONE` | the fleet's scope `ke` | automatic `u` (1 or 0), then the IANA id by hand `a` when there is one | none: the identity service writes it to the kernel (SYS_ZONE op 4) on each device, which follows it unless its settings say otherwise |
+//! | `LANG` | the fleet's scope `ke` | the language `wl` (its ISO 639-3 code) | none: the identity service writes it to the kernel (SYS_LANG op 2) on each device, which follows it unless its settings say otherwise |
 //!
 //! The scope of a place and the view is the fleet's (`FLEET`, 32 zero bytes) on every device whose home-screen sync is on (the default), and the device's own key on one where the person switched it off, so that device keeps an arrangement of its own, which follows it through a reset all the same.
 //!
@@ -42,6 +43,8 @@ pub mod kind {
     pub const DEPART: u8 = 6;
     /// The person's time zone (owner, 2026-11-10: "it's per identity, you can uncheck and set per device tho"): automatic (each device finds its own from its network, then GPS) or a zone by hand; written to each device that follows it, never read back from one (settings flow identity to device only).
     pub const ZONE: u8 = 7;
+    /// The person's language (SETTINGS.md, as the zone: "per identity, you can uncheck and set per device"): chosen on the language page of a device that follows it, written to each device that follows it, never read back from one.
+    pub const LANG: u8 = 8;
 }
 
 /// The scope of the fleet's shared arrangement.
@@ -204,6 +207,30 @@ pub fn set_zone(space: &mut Space, by: &[u8; 32], auto: bool, id: &str, now: i64
     }
     let updated = space.get(kind::ZONE, &zone_id()).map_or(now, |e| now.max(e.updated + 1));
     space.put(Entry { kind: kind::ZONE, id: zone_id(), value, updated, by: *by, gone: false })
+}
+
+/// The language's id: the fleet's scope, one choice for the person.
+pub fn language_id() -> Vec<VsfType> {
+    vec![VsfType::ke(FLEET.to_vec())]
+}
+
+/// The person's language, its ISO 639-3 code; None until they have chosen one.
+pub fn language(space: &Space) -> Option<[u8; 3]> {
+    let e = space.get(kind::LANG, &language_id()).filter(|e| !e.gone)?;
+    e.value.iter().find_map(|v| match v {
+        VsfType::wl(l) => Some(l.code()),
+        _ => None,
+    })
+}
+
+/// The person chose their language on one of their devices (its settings, following them): written straight into the space as a vsf `wl`, stamped past its last write so it wins the merge whatever the clocks say. `code` is three lowercase letters (an ISO 639-3 code: fgtw::text::Lang::iso); anything else is refused (false). True when the space changed.
+pub fn set_language(space: &mut Space, by: &[u8; 32], code: [u8; 3], now: i64) -> bool {
+    // WHY: vsf::Language::new panics on anything but a-z, and the code reaches here from a process's request.
+    if !code.iter().all(u8::is_ascii_lowercase) || language(space) == Some(code) {
+        return false;
+    }
+    let updated = space.get(kind::LANG, &language_id()).map_or(now, |e| now.max(e.updated + 1));
+    space.put(Entry { kind: kind::LANG, id: language_id(), value: vec![VsfType::wl(vsf::Language::new(code))], updated, by: *by, gone: false })
 }
 
 // ── The map's own forms (payloads/map: `place_key`, `save_place`, `save_view`) ──
@@ -386,7 +413,7 @@ pub struct Outcome {
     /// Writes made to the device's copy from the space: the map reads its places again.
     pub wrote: usize,
     /// The kinds written (bit k: kind k), for the identity service's line: a sync that writes on every pass names what does not stay (2026-11-10: four writes every cycle on the Pro, its copy unchanged).
-    pub kinds: u8,
+    pub kinds: u16,
 }
 
 /// One write from the space applied to the device's copy (the list in hand; places and the view straight to the vault). False when the vault refused.
@@ -482,7 +509,7 @@ pub fn read_list(store: &mut impl Store) -> Result<Kists, ()> {
 pub fn sync(space: &mut Space, base: &mut Baseline, store: &mut impl Store, me: &[u8; 32], now: i64) -> Result<Outcome, &'static str> {
     let start = space.digest();
     let mut wrote = 0;
-    let mut kinds = 0u8;
+    let mut kinds = 0u16;
     for _ in 0..4 {
         let mut list = read_list(store).map_err(|_| "the person's list is not readable")?;
         let scope = if home_sync(space, me) { FLEET } else { *me };
@@ -496,7 +523,7 @@ pub fn sync(space: &mut Space, base: &mut Baseline, store: &mut impl Store, me: 
         // Kists before answers and places: an answer or a place names a kist the list must already hold.
         let (first, rest): (Vec<Write>, Vec<Write>) = writes.into_iter().partition(|w| matches!(w, Write::Set { kind: kind::KIST, .. } | Write::Remove { kind: kind::KIST, .. }));
         for w in first.into_iter().chain(rest) {
-            // Kinds are 0 to 6 (`kind`): a bit each in a u8.
+            // Kinds are 0 to 8 (`kind`): a bit each in a u16.
             kinds |= 1 << match &w { Write::Set { kind, .. } | Write::Remove { kind, .. } => *kind };
             if !apply(w, &mut list, &mut list_changed, store) {
                 *base = before;
@@ -708,6 +735,26 @@ mod tests {
         let o = sync(&mut sa, &mut b, &mut v, &PRO, 3000).unwrap();
         assert_eq!(o.kinds >> kind::ZONE & 1, 0);
         assert_eq!(zone(&sa), Some((true, String::new())));
+    }
+
+    /// The person's language, as the zone: none until chosen; chosen on one device, it crosses the fleet sealed as a vsf `wl`; the later choice wins even from a device whose clock runs behind; a code that is not three letters is refused; the device's own copy is never touched by the sync.
+    #[test]
+    fn the_persons_language_follows_them() {
+        let mut sa = Space::new();
+        assert_eq!(language(&sa), None);
+        assert!(set_language(&mut sa, &PRO, *b"mri", 2000));
+        assert!(!set_language(&mut sa, &PRO, *b"mri", 2001), "the same choice changes nothing");
+        assert!(!set_language(&mut sa, &PRO, *b"MRI", 2002), "not a code");
+        let mut sb = hand_over(&sa);
+        assert_eq!(language(&sb), Some(*b"mri"));
+        assert!(set_language(&mut sb, &OTHER, *b"spa", 1500));
+        sa.merge(hand_over(&sb));
+        assert_eq!(language(&sa), Some(*b"spa"));
+        let mut v = arranged_pro();
+        let mut b = Baseline::default();
+        let o = sync(&mut sa, &mut b, &mut v, &PRO, 3000).unwrap();
+        assert_eq!(o.kinds >> kind::LANG & 1, 0);
+        assert_eq!(language(&sa), Some(*b"spa"));
     }
 }
 

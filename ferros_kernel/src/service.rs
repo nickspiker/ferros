@@ -2707,6 +2707,17 @@ pub fn run(mut b: Boot) -> ! {
                             c.is_some_and(|c| crate::process::with_lock(|| crate::zone::set_device(c, || true)))
                         }
                         ("zone_follow", Some(v @ (0 | 1))) => crate::process::with_lock(|| crate::zone::set_follow(v == 1, || true)),
+                        // `diag "pref language <ISO 639-3>"` (eng, spa, mri, …; `none` for none): this device's own language (lang.rs). `pref language_follow 0` and `1`: this device's own, or the identity's. Three lowercase letters or nothing: anything else is refused.
+                        ("language", _) => {
+                            let w = word.as_bytes();
+                            let code = match w {
+                                b"none" => Some(0),
+                                [a, b, c] if w.iter().all(u8::is_ascii_lowercase) => Some((*a - b'a') as u16 * 676 + (*b - b'a') as u16 * 26 + (*c - b'a') as u16),
+                                _ => None,
+                            };
+                            code.is_some_and(|c| crate::process::with_lock(|| crate::lang::set_device(c, || true)))
+                        }
+                        ("language_follow", Some(v @ (0 | 1))) => crate::process::with_lock(|| crate::lang::set_own(v == 0, || true)),
                         ("tz", Some(z)) if z.abs() < 86_400 => {
                             crate::rtc::set_tz(z);
                             true

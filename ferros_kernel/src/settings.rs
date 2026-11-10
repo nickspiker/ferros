@@ -1,6 +1,6 @@
 //! The device's settings (SETTINGS.md) as one spec VSF document in the vault, under the key `device`: a section `device` with a typed field per setting, stamped with its Eagle time and a provenance hash. It replaced the raw one-byte `device.*` keys on 2026-10-27 (owner: "All device settings should be proper spec VSF for aid in vault storage").
 //!
-//! The kernel loads the document right after the vault opens and puts each value into every process's preferences block; a change (SYS_SET_PREF from a process holding Settings, `diag pref`, or a `device` document stored from the bridge) writes the whole document again. A field that is absent, or out of range, keeps its default. The language joins as its own VSF type once vsf has one (asked of the VSF session, 2026-10-27); it will follow the last attested identity, as every setting here does (SETTINGS.md).
+//! The kernel loads the document right after the vault opens and puts each value into every process's preferences block; a change (SYS_SET_PREF from a process holding Settings, `diag pref`, or a `device` document stored from the bridge) writes the whole document again. A field that is absent, or out of range, keeps its default. The language is kept as a language (vsf `wl`, its ISO 639-3 code), this device's and the identity's, with the switch that says which rules (lang.rs), as the zone is.
 use alloc::vec::Vec;
 use vsf::schema::{SectionBuilder, SectionSchema, TypeConstraint};
 use vsf::VsfType;
@@ -35,6 +35,20 @@ const ZONE_IDENTITY: &str = "zone_identity";
 const ZONE_IDENTITY_AUTO: &str = "zone_identity_auto";
 const ZONE_FOUND: &str = "zone_found";
 const ZONE_FOUND_BY: &str = "zone_found_by";
+/// The language (lang.rs): this device's own (`language`, a vsf `wl`: its ISO 639-3 code, no script or region; absent, none: English), whether the device follows the identity's (`language_follow`, 1 the default), and the identity's as its service last wrote it (`language_identity`; absent, none).
+const LANGUAGE: &str = "language";
+const LANGUAGE_FOLLOW: &str = "language_follow";
+const LANGUAGE_IDENTITY: &str = "language_identity";
+
+/// A packed code (lang.rs) as the document keeps it, or none for 0.
+fn language_of(code: u16) -> Option<vsf::Language> {
+    if code == 0 {
+        return None;
+    }
+    // The letters base 26, as vsf packs them (lang.rs keeps only codes below 26³, so each is a letter).
+    let l = [b'a' + (code / 676) as u8, b'a' + (code / 26 % 26) as u8, b'a' + (code % 26) as u8];
+    Some(vsf::Language::new(l))
+}
 
 /// The radio knobs kept as device settings (docs/RADIO-CONTROLS.md): field name, link (the control blocks' order: 0 cellular, 1 WiFi, …), slot. Value knobs only: actions are counters and are never kept.
 pub const KNOBS: [(&str, usize, usize); 2] = [("wifi_power_save", 1, 1), ("wifi_band", 1, 2)];
@@ -54,7 +68,7 @@ fn schema() -> SectionSchema {
     for name in [ZONE_AUTO, ZONE_FOLLOW, ZONE_IDENTITY_AUTO, ZONE_FOUND_BY] {
         s = s.field(name, TypeConstraint::AnyUnsigned);
     }
-    s
+    s.field(LANGUAGE, TypeConstraint::Language).field(LANGUAGE_IDENTITY, TypeConstraint::Language).field(LANGUAGE_FOLLOW, TypeConstraint::AnyUnsigned)
 }
 
 /// Eagle time now, in oscillations, from the RTC's base (0 until the RTC has been read: the document then says it was made at the epoch).
@@ -98,6 +112,12 @@ pub fn document(change: Option<(usize, u8)>) -> Option<Vec<u8>> {
     if !z.found.is_none() {
         b = b.set(ZONE_FOUND_BY, unsigned(z.found_by)).ok()?;
     }
+    for (name, code) in [(LANGUAGE, crate::lang::device()), (LANGUAGE_IDENTITY, crate::lang::identity())] {
+        if let Some(l) = language_of(code) {
+            b = b.set(name, VsfType::wl(l)).ok()?;
+        }
+    }
+    b = b.set(LANGUAGE_FOLLOW, unsigned(!crate::lang::own() as u8)).ok()?;
     // A knob still unset (all ones) is left out: absent means the driver's own default.
     for (name, link, slot) in KNOBS {
         let v = crate::process::CONTROL[link][slot].load(core::sync::atomic::Ordering::Relaxed);
@@ -144,6 +164,14 @@ pub fn apply(doc: &[u8], held: bool) -> Option<usize> {
     // WHY the filter: the document can be stored from the bridge; a finder past 2 (the position) is none zone.rs knows, read as none.
     let found_by = first(ZONE_FOUND_BY).and_then(|v| v.as_u64()).filter(|&b| b <= 2).unwrap_or(0) as u8;
     crate::zone::load(device, identity, flag(ZONE_FOLLOW).unwrap_or(true), id(ZONE_FOUND), found_by);
+    n += 1;
+    // The language's choices, each absent one at its default (none, following the identity, nothing from it yet); a field that is not a language is none.
+    // WHY `valid`: the document can be stored from the bridge, and a packed code past three letters would be handed to every process as one; read as none.
+    let language = |name: &str| match first(name) {
+        Some(VsfType::wl(l)) if crate::lang::valid(l.packed() as u64) => l.packed(),
+        _ => 0,
+    };
+    crate::lang::load(language(LANGUAGE), language(LANGUAGE_IDENTITY), flag(LANGUAGE_FOLLOW) == Some(false), held);
     n += 1;
     if let Some(z) = first(TZ).and_then(|v| v.as_i64()) {
         // A zone is within a day of UTC; anything else is not a zone.

@@ -930,6 +930,8 @@ const SYS_CONTROLS: u64 = 33;
 const SYS_DETAIL: u64 = 34;
 /// zone(op, …): the clock's zone (zone.rs, docs/TIME.md). Op 0, the modem (by its name, a narrow right of its own as SYS_STATUS, never Settings): the network's word, x1 its MCC (0 none), x2 NITZ's legal offset in seconds east, x3 flags (bit 0 the offset given, bit 1 the daylight flag given, bit 2 daylight time on). Op 1, the GPS driver (by its name): a new position, x1 latitude and x2 longitude in 2^-23 degrees. Op 2, Settings at x1: this device's choice, x2 1 automatic, x3/x4 its id by hand (length 0: none, the fixed offset). Op 3, Settings at x1: x2 1 follow the identity's choice, 0 this device's own. Op 4, the identity service (by its name, fgtw): the identity's choice, x1 0 by hand, 1 automatic, 2 none (forgotten), x2/x3 its id. Op 5: the state into x1/x2 (zone::STATE_LEN bytes; no capability: the zone is what the clock shows whoever holds the device). Op 6: every zone's id into x1/x2, each its length then its bytes → the list's whole length. Ops 2-4 keep the settings document, put back as it was when the vault refuses. → 0 or ERR, op 5 the bytes written, op 6 the length.
 const SYS_ZONE: u64 = 35;
+/// lang(op, …): the language the shell speaks (lang.rs, SETTINGS.md), a packed ISO 639-3 code (vsf `wl`'s letters; 0 none, English). Op 0, Settings at x1: this device's own language, x2 the code. Op 1, Settings at x1: x2 1 this device keeps its own, 0 it follows the identity's. Op 2, the identity service (by its name, fgtw, as SYS_ZONE op 4): the identity's language, x1 the code (0: it has none). Each keeps the settings document, put back as it was when the vault refuses. The state is read from the preferences block (PREF_LANG…), not here. → 0 or ERR.
+const SYS_LANG: u64 = 36;
 /// Each link's control block: words 1 to CONTROLS - 1 (word 0 is the generation, `CONTROL_GEN`), all ones until set.
 pub const CONTROLS: usize = 1 << 4;
 /// The links with a control block: the six of the facts, and the clock.
@@ -1054,7 +1056,7 @@ pub const PREF_THEME: usize = 5;
 pub const PREF_PROX_WAKE: usize = 6;
 /// Preference 7: the light scope, 0 off or 1–6 the VD6282 channel its 16 kHz trace follows (in the sensor's register order, VD6283 datasheet: 1 red, 2 visible, 3 blue, 4 green, 5 IR, 6 clear — provisional for the VD6282) (usf.rs, the display's scope widget).
 pub const PREF_SCOPE: usize = 7;
-/// Preference 12: the keyboard layout on the honeycomb (honeycomb::Layout), 0 Dvorak (the default, owner 2026-10-27) or 1 QWERTY with Q on the bottom row. Bytes 8-11 are the surfaces' generations, 16-31 the wall clock; the language will take two bytes once vsf has a language type.
+/// Preference 12: the keyboard layout on the honeycomb (honeycomb::Layout), 0 Dvorak (the default, owner 2026-10-27) or 1 QWERTY with Q on the bottom row. Bytes 8-11 are the surfaces' generations, 16-31 the wall clock; the language is in the second block (PREF_LANG).
 pub const PREF_LAYOUT: usize = 12;
 /// How many layouts the honeycomb carries: the valid range of PREF_LAYOUT.
 pub const LAYOUTS: u8 = 2;
@@ -1068,19 +1070,33 @@ pub const PREF_RADIOS_OFF: usize = 15;
 pub const SCALE_REACH: i8 = 64;
 /// How many themes ferros_sys carries (ferros_sys::theme::THEMES): the valid range of PREF_THEME.
 pub const THEMES: u8 = 4;
+/// The second preferences block in the grants page: preferences 32-47 at G#FB0, the 16 bytes under the first block that no token reaches (the tokens, 32 bytes each from G#204, end at G#FA4 with the 109th, the most the page has ever held), so the page holds as many grants as before. The first block is full (bytes 8-11 the surfaces, 16-31 the wall clock). A kernel older than it leaves these bytes zero, which reads as each one's default.
+pub const PREFS_HI: usize = 0xFB0;
+/// Preferences 32-38, the language (lang.rs; written by the kernel only, never thru SYS_SET_PREF): 32-33 the language in effect, 34-35 this device's own, 36-37 the identity's as its service last wrote it, each a packed ISO 639-3 code (vsf `wl`'s letters, little-endian; 0 none, English); 38 whether the device keeps its own (1) or follows the identity's (0, the default).
+pub const PREF_LANG: usize = 32;
+pub const PREF_LANG_DEVICE: usize = 34;
+pub const PREF_LANG_IDENTITY: usize = 36;
+pub const PREF_LANG_OWN: usize = 38;
+/// How many preferences there are: the first block's 32 and the second's 16.
+const PREF_COUNT: usize = 48;
+
+/// Where preference `index` (below PREF_COUNT) is in a grants page.
+fn pref_at(index: usize) -> usize {
+    if index < 32 { PREFS + index } else { PREFS_HI + index - 32 }
+}
 
 /// A preference as the kernel holds it now.
 pub fn pref(index: usize) -> u8 {
-    if index < 32 { unsafe { PREFS_NOW[index] } } else { 0 }
+    if index < PREF_COUNT { unsafe { PREFS_NOW[index] } } else { 0 }
 }
-static mut PREFS_NOW: [u8; 32] = [0; 32];
+static mut PREFS_NOW: [u8; PREF_COUNT] = [0; PREF_COUNT];
 
 /// Keeps a changed preference in the vault: (preference, value) -> stored. Registered by whoever owns the vault (service.rs).
 pub static mut PREF_STORE: Option<fn(usize, u8) -> bool> = None;
 
 /// Set a preference in kernel memory and in every live process (no persistence: the caller has done that, or the value came from the vault).
 pub fn set_pref(index: usize, value: u8) {
-    if index >= 32 {
+    if index >= PREF_COUNT {
         return;
     }
     unsafe { (*(&raw mut PREFS_NOW))[index] = value };
@@ -1100,7 +1116,7 @@ fn write_pref_all(index: usize, value: u8) {
     for p in kk.procs.iter().flatten() {
         // The grants page is read-only at every level: opened for the write, closed after.
         crate::cachemap::grants_page(p.arc.base, true);
-        p.write_grants((PREFS + index) as u64, &[value]);
+        p.write_grants(pref_at(index) as u64, &[value]);
         crate::cachemap::grants_page(p.arc.base, false);
     }
     for i in 0..kk.threads.len() {
@@ -1151,7 +1167,7 @@ pub fn set_wall_held(base: u64, tz: i64) {
 
 /// `set_pref` for the syscall path, where the lock is held.
 fn set_pref_locked(index: usize, value: u8) {
-    if index >= 32 {
+    if index >= PREF_COUNT {
         return;
     }
     unsafe { (*(&raw mut PREFS_NOW))[index] = value };
@@ -2704,6 +2720,27 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
+        SYS_LANG => {
+            let settings = |at: u64| {
+                let token = p.read(at, 32);
+                matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0)
+            };
+            let keep = || unsafe { CONTROL_STORE }.map(|st| st()).unwrap_or(false);
+            // WHY `valid`: the code is the caller's, and is kept in the vault and handed to every process as two bytes; one that is no packed three letters is refused, not cut.
+            f.x[0] = match f.x[0] {
+                0 if settings(f.x[1]) && crate::lang::valid(f.x[2]) => {
+                    if crate::lang::set_device(f.x[2] as u16, keep) { 0 } else { ERR }
+                }
+                1 if settings(f.x[1]) => {
+                    if crate::lang::set_own(f.x[2] == 1, keep) { 0 } else { ERR }
+                }
+                2 if p.name.as_slice() == b"fgtw" && crate::lang::valid(f.x[1]) => {
+                    if crate::lang::set_identity(f.x[1] as u16, keep) { 0 } else { ERR }
+                }
+                _ => ERR,
+            };
+            0
+        }
         SYS_DETAIL => {
             let own = LINK_NAMES.iter().position(|n| *n == p.name.as_slice());
             f.x[0] = match f.x[0] {
@@ -4014,8 +4051,8 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
         };
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }
-    // The tokens end at PREFS (G#FC0, the preferences block, then the ihi at G#FE0): a 109th slot's token was written there and overwritten by the next preferences write, so init's spawn of the GPU service was refused for a token it held (2026-11-05). Refused here, with the reason, rather than corrupted.
-    if TOKENS + 4 + 32 * cspace.len() > PREFS {
+    // The tokens end at PREFS_HI (G#FB0, the second preferences block, then the first at G#FC0 and the ihi at G#FE0): a 109th slot's token was once written over the preferences and overwritten by the next preferences write, so init's spawn of the GPU service was refused for a token it held (2026-11-05). Refused here, with the reason, rather than corrupted.
+    if TOKENS + 4 + 32 * cspace.len() > PREFS_HI {
         return Err("spawn: more grants than the grants page holds (108 slots and the console)");
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };
@@ -4040,7 +4077,9 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     if let Some(i) = ihi {
         p.write_grants(IHI as u64, &i);
     }
-    p.write_grants(PREFS as u64, unsafe { &*(&raw const PREFS_NOW) });
+    let prefs = unsafe { &*(&raw const PREFS_NOW) };
+    p.write_grants(PREFS as u64, &prefs[..32]);
+    p.write_grants(PREFS_HI as u64, &prefs[32..]);
     let in_off = CODE + code_len + tail;
     p.write(in_off as u64, input);
     crate::cachemap::sync_code(arc.base + CODE, code_len);
