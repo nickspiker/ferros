@@ -1,0 +1,20 @@
+[package]
+name = "ferros_lang"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "ferros's own words in every language, done as Photon does its text (photon docs/languages.md): the settings pages, the attest screen, the keyboard, each a typed message, every language one exhaustive match over them. The language list and the fleet's and identity's words are fgtw's (fgtw::text), shared with Photon."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The one language list (Photon's sixteen) and the fleet's and identity's words, written once for every TOKEN app.
+fgtw = { path = "../../fgtw", default-features = false, features = ["text"] }
+# Numbers inside a message are written in the person's base (SETTINGS.md), by tatau.
+tatau = { path = "../../tatau" }
+# The language in effect, read from the process's own preferences block: only where ferros_sys's calls exist.
+ferros_sys = { path = "../ferros_sys", optional = true }
+
+[features]
+process = ["dep:ferros_sys"]
