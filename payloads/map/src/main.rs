@@ -2405,18 +2405,19 @@ impl Map {
                                 b.text(cx, y - uu(1, 1), note as u16, grey(), 1, line.as_str());
                                 y += uu(2, 1);
                             }
-                            let mut l = Line::new();
-                            l.s("Add ");
-                            l.s(name);
-                            let down = self.pressed == Some(Choice::FleetConfirm);
-                            b.button(cx, y - uu(1, 2), uu(16, 1), uu(2, 1), uu(5, 4), [if down { GREEN_HELD } else { GREEN }, GREEN_EDGE, GREEN_EDGE, 0x000000], l.as_str());
+                            // The question and its two answers side by side (owner, 2026-11-10: "Is your new device bright green? and that should have a yes and no, no does the same as back"): Yes in VSF RGB green adds it; No goes back to the list, nothing to undo.
+                            row(self, b, &mut y, small, white(), "Is your new device bright green?", None);
+                            let (bw, off) = (uu(7, 1), uu(4, 1));
+                            let yes_down = self.pressed == Some(Choice::FleetConfirm);
+                            b.button(cx - off, y - uu(1, 2), bw, uu(2, 1), uu(5, 4), [if yes_down { GREEN_HELD } else { GREEN }, GREEN_EDGE, GREEN_EDGE, 0x000000], "Yes");
+                            let [fill, held, tl, br] = BUTTON_LOOK[ferros_sys::theme::index()];
+                            let no_down = self.pressed == Some(Choice::FleetAdd);
+                            b.button(cx + off, y - uu(1, 2), bw, uu(2, 1), uu(5, 4), [if no_down { held } else { fill }, tl, br, white()], "No");
                             if hit {
-                                self.push_row(cx - half, cx + half, y - uu(2, 1), y + uu(1, 1), Choice::FleetConfirm);
+                                self.push_row(cx - half, cx, y - uu(2, 1), y + uu(1, 1), Choice::FleetConfirm);
+                                self.push_row(cx, cx + half, y - uu(2, 1), y + uu(1, 1), Choice::FleetAdd);
                             }
                             y += uu(3, 1);
-                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "Didn't turn green? Press Back.");
-                            y += uu(2, 1);
-                            button(self, b, &mut y, "back", false, Some(Choice::FleetAdd));
                         }
                         button(self, b, &mut y, if f.add >= 5 { "done" } else { "close" }, false, Some(Choice::FleetClose));
                     }
