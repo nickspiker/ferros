@@ -17,10 +17,12 @@ pub struct UsbLink {
 
 impl UsbLink {
     /// Find and open the ferros device. Returns None if not found.
+    /// With two ferros devices on the host (the Pro and the 8a, 2026-11-10) the first found was taken, whichever it was: `FERROS_BUS=<bus number>` (lsusb's) picks one.
     pub fn open() -> Result<Self, String> {
+        let bus: Option<u8> = std::env::var("FERROS_BUS").ok().and_then(|v| v.parse().ok());
         let device = nusb::list_devices()
             .map_err(|e| format!("USB enumeration failed: {e}"))?
-            .find(|d| d.vendor_id() == FERROS_VID && d.product_id() == FERROS_PID)
+            .find(|d| d.vendor_id() == FERROS_VID && d.product_id() == FERROS_PID && bus.is_none_or(|b| d.bus_number() == b))
             .ok_or_else(|| {
                 format!("No device found with VID={FERROS_VID:04x} PID={FERROS_PID:04x}")
             })?;
