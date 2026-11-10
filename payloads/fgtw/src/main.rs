@@ -577,6 +577,8 @@ struct Client {
     watchers: Vec<[u8; 32]>,
     watch_gen: u32,
     watch_seen: Vec<u8>,
+    /// When this lookup asked FGTW (the person's devices on this network and the fleet peers known) before fgtw.org (`ask_fgtw`); 0 not yet. The owner, 2026-11-10: "are we consulting the FGTW first or fgtw.org?"
+    fgtw_asked_us: u64,
 }
 
 impl Client {
@@ -752,9 +754,71 @@ impl Client {
         self.depart_hand_given();
     }
 
+    /// The lookup's question to FGTW: a signed `fleet_req` for this handle proof to this network (the beacon groups and the subnet broadcast, where beacons go) and to each fleet peer known by address. Answered by a member with its beacon, or its chain for a device it knows (`on_fleet_req`).
+    fn ask_fgtw(&mut self, hp: &[u8; 32]) {
+        // Signed with the Ed25519 key alone, as the app's fleet_req is (Photon `build_fleet_req_vsf`, `envelope_signer`): one datagram on a broadcast, where every scheme's signature (about 10 KB) would not fit.
+        let frame = match fgtw::protocol::fleet_req(hp, self.keys.keypair(), eagle()) {
+            Ok(f) => f,
+            Err(e) => {
+                self.log.put(b"fgtw: lookup: the question to FGTW did not build: ");
+                self.log.put(e.as_bytes());
+                self.log.line();
+                return;
+            }
+        };
+        self.log.put(b"fgtw: lookup: asking FGTW first (this network");
+        let mut v4 = [0u8; 16];
+        v4[..4].copy_from_slice(&join::BEACON_V4);
+        self.udp.send(&Addr { fam: 4, ip: v4, port: join::BEACON_PORT }, join::BEACON_PORT, &frame);
+        self.udp.send(&Addr { fam: 6, ip: join::BEACON_V6, port: join::BEACON_PORT }, join::BEACON_PORT, &frame);
+        if let Some(b) = self.udp.subnet_broadcast() {
+            let mut ip = [0u8; 16];
+            ip[..4].copy_from_slice(&b);
+            self.udp.send(&Addr { fam: 4, ip, port: join::BEACON_PORT }, join::BEACON_PORT, &frame);
+        }
+        let peers: Vec<Addr> = self.sponsors.iter().map(|s| s.addr).collect();
+        for a in &peers {
+            self.udp.send(&Addr { port: join::BEACON_PORT, ..*a }, join::BEACON_PORT, &frame);
+        }
+        self.log.put(b" and ");
+        self.log.dec(peers.len() as u64);
+        self.log.put(b" fleet peer(s) known)");
+        self.log.line();
+    }
+
+    /// A device asking FGTW who holds a handle proof (`fleet_req` on 4384). Ours, and this device a member: a device the fleet holds gets the chain (`fleet_resp`), any other our beacon, unicast (a few bytes, what listening to beacons would tell it, so no amplification); a device asking for another handle, or this one not a member, gets nothing.
+    fn on_fleet_req(&mut self, from: Addr, hp: [u8; 32], asker: [u8; 32]) {
+        if Some(hp) != self.hp || asker == self.me || !self.bound {
+            return;
+        }
+        let chain = self.held.borrow().get(&hp).and_then(|b| b.to_vsf_bytes().ok());
+        if let (true, Some(chain)) = (self.members.contains(&asker), chain) {
+            if let Ok(frame) = fgtw::protocol::fleet_resp(&hp, &chain, &self.keys, eagle()) {
+                let out = self.pt.send(Addr { port: join::PORT, ..from }, frame, now_us(), eagle());
+                self.send_all(out);
+                self.log.put(b"fgtw: FGTW: our chain to ");
+                self.log.fp(&asker);
+                self.log.line();
+            }
+            return;
+        }
+        let frame = join::beacon(hp, join::PORT, self.me, eagle());
+        self.udp.send(&Addr { port: join::BEACON_PORT, ..from }, join::BEACON_PORT, &frame);
+        self.log.put(b"fgtw: FGTW: our beacon to ");
+        self.log.fp(&asker);
+        self.log.put(b", which asked who holds this identity");
+        self.log.line();
+    }
+
     /// A beacon on 4384: a device of our fleet on this network is a sponsor - remembered, and handed our binding request while we are unbound.
     fn on_beacon(&mut self, from: Addr, bytes: &[u8]) {
-        let Some((hp, port, Some(key))) = join::parse_beacon(bytes) else { return };
+        let Some((hp, port, Some(key))) = join::parse_beacon(bytes) else {
+            // Not a beacon: a device's question to FGTW, perhaps.
+            if let Ok((hp, asker)) = fgtw::protocol::parse_fleet_req(bytes) {
+                self.on_fleet_req(from, hp, asker);
+            }
+            return;
+        };
         if Some(hp) != self.hp || key == self.me {
             return;
         }
@@ -1183,8 +1247,18 @@ impl Client {
         if self.bound {
             return;
         }
+        // FGTW first: the person's devices are asked (a signed fleet_req to this network and to the fleet peers known), and one that answers settles it (its beacon makes the verdict join, its chain is adopted, `on_beacon`, `on_frame`). fgtw.org, the bootstrap, only once a quarter second has passed with no answer: a device on the same network answers in milliseconds, and silence is the only "no" a broadcast gets, so this one wait is the deadline that makes the question finite.
+        if self.fgtw_asked_us == 0 {
+            self.ask_fgtw(&hp);
+            self.fgtw_asked_us = now_us();
+            return;
+        }
+        if now_us().wrapping_sub(self.fgtw_asked_us) < 1 << 18 {
+            return;
+        }
+        self.fgtw_asked_us = 0;
         let heard = !self.sponsors.is_empty();
-        self.log.put(b"fgtw: lookup: asking fgtw.org");
+        self.log.put(b"fgtw: lookup: no device of this identity answered on FGTW; asking fgtw.org, the bootstrap");
         self.log.line();
         let t0 = now();
         fgtw::set_clock(eagle());
@@ -1476,6 +1550,11 @@ impl Client {
                         if bound && !self.bound {
                             self.became_bound();
                         }
+                        // A chain for our handle from a device of FGTW: the identity has a fleet, whatever fgtw.org would say.
+                        if !bound && matches!(self.verdict, V_LOOKING | V_FRESH | V_UNREACHABLE) {
+                            self.hold_chain(&chain);
+                            self.verdict = V_JOIN;
+                        }
                         self.depart_check(&chain);
                     }
                     Err(e) => {
@@ -1702,6 +1781,7 @@ impl Client {
                     if self.hp.is_some() {
                         self.verdict = V_LOOKING;
                         self.last_lookup_us = 0;
+                        self.fgtw_asked_us = 0;
                     }
                 }
                 // Op 4: the attest screen hands the roots in RAM (`[4][seed 32][proof 32]`), the default — nothing of the identity written unless unlock-at-boot is on. Forget the old, take these, persist or wipe per the setting, look up.
@@ -1722,6 +1802,7 @@ impl Client {
                     self.hp = Some(hp);
                     self.verdict = V_LOOKING;
                     self.last_lookup_us = 0;
+                    self.fgtw_asked_us = 0;
                     self.log.put(if self.persist { b"fgtw: roots set in RAM and kept on disk (unlock at boot on)" } else { b"fgtw: roots set in RAM only (nothing of the identity on disk)" });
                     self.log.line();
                     // A departure kept from before a restart: these roots are the first chance to take it up (with unlock-at-boot off, nothing of the identity is on disk at `load`).
@@ -1785,10 +1866,13 @@ impl Client {
             if up && !self.net_up {
                 self.net_up = true;
                 self.last_lookup_us = 0;
+                self.fgtw_asked_us = 0;
                 self.log.put(b"fgtw: the network is up (IPv4)");
                 self.log.line();
             }
-            if self.hp.is_some() && !self.bound && matches!(self.verdict, V_LOOKING | V_UNREACHABLE | V_FRESH) && t.saturating_sub(self.last_lookup_us) >= if self.verdict == V_LOOKING { 2_000_000 } else { 30_000_000 } {
+            // Also the moment FGTW's answer window closes (`lookup`), so fgtw.org follows a silent network a quarter second later, not at the next 2 s.
+            let window_closed = self.fgtw_asked_us != 0 && t.wrapping_sub(self.fgtw_asked_us) >= 1 << 18;
+            if self.hp.is_some() && !self.bound && matches!(self.verdict, V_LOOKING | V_UNREACHABLE | V_FRESH) && (window_closed || t.saturating_sub(self.last_lookup_us) >= if self.verdict == V_LOOKING { 2_000_000 } else { 30_000_000 }) {
                 self.last_lookup_us = t;
                 if up {
                     self.offline_looks = 0;
@@ -2581,7 +2665,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: false, listen_pass: 0, listen_said: (255, 255), ble_said: (0, 0), depart_ask: None, denied: Vec::new(), depart_denied: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new() };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: false, listen_pass: 0, listen_said: (255, 255), ble_said: (0, 0), depart_ask: None, denied: Vec::new(), depart_denied: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0 };
     c.run()
 }
 
