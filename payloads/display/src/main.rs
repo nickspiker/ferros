@@ -4273,10 +4273,9 @@ fn helm_draw(width: usize, height: usize) -> bool {
             Corner::Back => true,
             _ => continue,
         };
-        // Lit: the stroke brightens toward white and a soft light fills the circle behind it, a layer of its own under the stroke (front to back, the glow a coloured layer), both by the corner's level.
+        // Lit: the stroke brightens toward white by the button's level (its wedge's light, below).
         let lvl = unsafe { HELM_LEVEL[back as usize] };
         let lit_ink = g2t_colour((9000.0 + 7000.0 * lvl, 9000.0 + 7000.0 * lvl, 9000.0 + 7000.0 * lvl));
-        let glow = g2t_colour((6000.0, 6000.0, 6000.0));
         // The distance from a point to the mark's centre line.
         let dist = |px: f32, py: f32| -> f32 {
             if !back {
@@ -4312,12 +4311,24 @@ fn helm_draw(width: usize, height: usize) -> bool {
                 if cov > 0.0 {
                     bar[i] = bar[i].under(if lvl > 0.0 { lit_ink } else { ink } | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
                 }
-                if lvl > 0.0 {
-                    // The fill's coverage: the circle's, its edge a pixel wide.
-                    let fill = draw::bump_step((r - libm::sqrtf((fx - x) * (fx - x) + (fy - y) * (fy - y))) * 0.5 + 0.5);
-                    if fill > 0.0 {
-                        bar[i] = bar[i].under(glow | ((fill * lvl * 0.5 * 65535.0) as u64) << 48, BlendMode::Normal);
-                    }
+            }
+        }
+    }
+    // Each button's whole wedge (owner, 2026-11-09: "everything in that wedge should light up", "1/8 opacity black when the helm is showing, that turns white at same said opacity when tapped"): the bars' rows outside the app's circle, the left half back's and the right half home's (op 41's regions), a layer behind the marks (front to back) at an eighth of opacity, its colour black at rest and white by the button's level; its edge along the circle a pixel wide.
+    let lv = unsafe { HELM_LEVEL };
+    {
+        let shade = |l: f32| g2t_colour((16384.0 * l, 16384.0 * l, 16384.0 * l));
+        let wedge = [shade(lv[0]), shade(lv[1])];
+        let (ccx, ccy, cr) = circle(width, height);
+        for row in 0..bot {
+            let fy = (height - bot + row) as f32 + 0.5;
+            for px in 0..width {
+                let fx = px as f32 + 0.5;
+                let side = (fx < width as f32 * 0.5) as usize;
+                let out = draw::bump_step((libm::sqrtf((fx - ccx) * (fx - ccx) + (fy - ccy) * (fy - ccy)) - cr) * 0.5 + 0.5);
+                if out > 0.0 {
+                    let i = row * width + px;
+                    bar[i] = bar[i].under(wedge[side] | ((out * (1.0 / (1 << 3) as f32) * 65535.0) as u64) << 48, BlendMode::Normal);
                 }
             }
         }
