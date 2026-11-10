@@ -3642,13 +3642,14 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
     let mut out = [(0.0f32, 0.0f32, 0.0f32, Corner::Spare); 16];
     let mut n = 0;
     // Each corner: (left?, top?, middle, along the horizontal edge, along the vertical edge, the next along the horizontal edge). The indicators up top, navigation at the bottom (owner, 2026-11-03); IP is no radio, its measures are the links'. Bluetooth has more to show than NFC, so it takes the larger place, the next along the top (owner, 2026-11-04).
-    let jobs = [
-        (true, true, Corner::Clock, Corner::Battery, Corner::Usb, Some(Corner::Gps)),
-        (false, true, Corner::Cellular, Corner::Wifi, Corner::Nfc, Some(Corner::Bluetooth)),
-        (true, false, Corner::Back, Corner::Spare, Corner::Spare, None),
-        (false, false, Corner::Home, Corner::Spare, Corner::Spare, None),
+    // The right corner since 2026-11-09 (owner: "I'd put NFC to the left of BT"): cellular, WiFi, Bluetooth, NFC along the top, nothing down the side.
+    let jobs: [(bool, bool, Corner, Corner, Option<Corner>, &[Corner]); 4] = [
+        (true, true, Corner::Clock, Corner::Battery, Some(Corner::Usb), &[Corner::Gps]),
+        (false, true, Corner::Cellular, Corner::Wifi, None, &[Corner::Bluetooth, Corner::Nfc]),
+        (true, false, Corner::Back, Corner::Spare, Some(Corner::Spare), &[]),
+        (false, false, Corner::Home, Corner::Spare, Some(Corner::Spare), &[]),
     ];
-    for &(left, top, mid_what, hor_what, ver_what, next_what) in &jobs {
+    for &(left, top, mid_what, hor_what, ver_what, next_whats) in &jobs {
         // The corner's quarter of the screen, as far as the app's circle leaves room: the strip above (below) the circle's chord at the screen's edge.
         let strip = if top { cy - libm::sqrtf(rr * rr - cx * cx) } else { h - (cy + libm::sqrtf(rr * rr - cx * cx)) };
         let (xa, xb) = if left { (0.0, w * 0.5) } else { (w * 0.5, w) };
@@ -3727,13 +3728,16 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
             out[n] = (c.0, c.1, c.2, hor_what);
             n += 1;
         }
-        if let Some(c) = side(false, mid, by) {
-            out[n] = (c.0, c.1, c.2, ver_what);
+        if let (Some(what), Some(c)) = (ver_what, side(false, mid, by)) {
+            out[n] = (c.0, c.1, c.2, what);
             n += 1;
         }
-        // The next along the top: tangent to the glass, the app's circle and the side circle before it.
-        if let (Some(what), Some(c)) = (next_what, hor) {
-            if let Some(d) = side(true, c, c.0) {
+        // The next ones along the top, in turn: each tangent to the glass, the app's circle and the circle before it.
+        let mut prev = hor;
+        for &what in next_whats {
+            let Some(c) = prev else { break };
+            prev = side(true, c, c.0);
+            if let Some(d) = prev {
                 out[n] = (d.0, d.1, d.2, what);
                 n += 1;
             }
@@ -7619,6 +7623,7 @@ fn radio_lines(what: Corner, ms: &[u64], state: Option<i64>, lines: &mut [Txt; 9
         lines[nl].s("searching");
         nl += 1;
     }
+    let first = nl;
     for &k in order {
         // Four lines under the name at most, as the battery has: the circle's chord holds no more at a readable size.
         if nl >= 5 {
@@ -7638,6 +7643,19 @@ fn radio_lines(what: Corner, ms: &[u64], state: Option<i64>, lines: &mut [Txt; 9
             _ => continue,
         };
         nl += 1;
+    }
+    // On but nothing measured yet: what it is doing, so the circle never stands with a bare name (owner, 2026-11-09: the circles with names alone looked broken).
+    if nl == first && !searching {
+        let doing = match what {
+            Corner::Gps => "no satellites",
+            Corner::Cellular => "registered",
+            Corner::Bluetooth | Corner::Nfc | Corner::Wifi => "on",
+            _ => "",
+        };
+        if !doing.is_empty() {
+            lines[nl].s(doing);
+            nl += 1;
+        }
     }
     nl
 }
