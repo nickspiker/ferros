@@ -1,0 +1,13 @@
+[package]
+name = "vsf2web"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+vsf = { path = "../../../vsf" }
+# AV1 (rav1e) in an AVIF file: the house image codec, the one image format every current browser shows (owner, 2026-11-10: the website's screenshots, "8 bit web").
+ravif = "0.11"
+rgb = "0.8"
+imgref = "1"

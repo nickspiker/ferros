@@ -11,7 +11,7 @@
    <meta charset="utf-8">
    <meta name="viewport" content="width=device-width, initial-scale=1">
    <title>ferros</title>
-   <meta name="description" content="ferros: a mobile operating system distilled to what an operating system is. Rust, no C, no passwords, no phone numbers. Boots in under a second. Runs today on a Pixel 8 Pro.">
+   <meta name="description" content="ferros: a mobile operating system distilled to what an operating system is. Rust, no C, no passwords, no phone numbers. Boots in under a second. Runs today on a Pixel 8 Pro and a Pixel 8a.">
    <style>
       :root {
          --ru: 1vw;
@@ -263,6 +263,33 @@
       .tiers td + td {
          text-align: right;
       }
+
+      /* The screens, captured on the device (16-bit VSF RGB) and shown here as 8-bit sRGB: two to a row on a narrow screen, three on a wide one, each its panel's own shape. */
+      .shots {
+         display: grid;
+         grid-template-columns: repeat(auto-fill, minmax(calc(26 * var(--ru)), 1fr));
+         gap: calc(2 * var(--ru));
+         margin: calc(2 * var(--ru)) 0;
+      }
+
+      .shots figure {
+         margin: 0;
+      }
+
+      .shots img {
+         display: block;
+         width: 100%;
+         height: auto;
+         aspect-ratio: 1344 / 2992;
+         border-radius: calc(2.4 * var(--ru));
+         background: #000;
+      }
+
+      .shots figcaption {
+         margin-top: calc(0.8 * var(--ru));
+         font-size: calc(1.7 * var(--ru));
+         color: var(--dim);
+      }
    </style>
 </head>
 <body>
@@ -303,7 +330,7 @@
       <p><strong>Under one second</strong> from the bootloader to the home screen, from cold, every time.</p>
 
       <h2>What runs today</h2>
-      <p>On a Pixel 8 Pro, from a cold boot, with no Linux underneath:</p>
+      <p>On a Pixel 8 Pro, from a cold boot, with no Linux underneath (and on a Pixel 8a too, all of it but the cameras and satellite positioning, so far):</p>
       <ul>
          <li>Its own kernel, in Rust from the first instruction after four short hand-written entry stubs (the image headers the bootloader parses and the first jumps, with the MMU off and no stack). All drivers run outside the kernel with capabilities.</li>
          <li>A store of its own on the flash. No file system was ported; every write is a commit.</li>
@@ -319,6 +346,35 @@
          A storage firewall under Android stops it writing the boot chain or ferros's store, whatever it has been told to update.<br>
          Running it is your choice, never the default: opt in after you attest, the firewall and the gate on whenever it is installed, and ferros zeroes its own memory before handing over. Apps come to ferros as APKs compiled on the device; Android stays for whoever wants it, unsupported and unforbidden.
       </p>
+
+      <h2>What it looks like</h2>
+      <p>Captured on a Pixel 8 Pro, straight from the display's 16-bit canvas, shown here in 8-bit sRGB.</p>
+      <div class="shots">
+         <figure>
+            <img src="shots/unbound-half.avif" srcset="shots/unbound-half.avif 672w, shots/unbound.avif 1344w" sizes="(min-aspect-ratio: 1/1) 30vh, 46vw" alt="The attest screen on a device nobody has attested on: the ferros mark, the words This device is unbound, type your handle to bind, an empty entry, an attest button and the honeycomb keyboard." loading="lazy">
+            <figcaption>Nobody here yet. Nothing of anyone's is on it until a handle is typed.</figcaption>
+         </figure>
+         <figure>
+            <img src="shots/attest-half.avif" srcset="shots/attest-half.avif 672w, shots/attest.avif 1344w" sizes="(min-aspect-ratio: 1/1) 30vh, 46vw" alt="The attest screen with a handle typed, lightkeeper, an r lit on the honeycomb keyboard as it is pressed, and the attest button." loading="lazy">
+            <figcaption>Attest: your handle, typed on the honeycomb. (An example handle.)</figcaption>
+         </figure>
+         <figure>
+            <img src="shots/home-half.avif" srcset="shots/home-half.avif 672w, shots/home.avif 1344w" sizes="(min-aspect-ratio: 1/1) 30vh, 46vw" alt="The home screen: circles on a fractal wallpaper, a map's circle, a clock drawn as rings, the system's own circle, and the radios' circles along the top edge." loading="lazy">
+            <figcaption>Home: a circle for each app you installed, where you put it. The clock is drawn live by the display.</figcaption>
+         </figure>
+         <figure>
+            <img src="shots/appearance-half.avif" srcset="shots/appearance-half.avif 672w, shots/appearance.avif 1344w" sizes="(min-aspect-ratio: 1/1) 30vh, 46vw" alt="Settings, appearance: four themes as swatches, a brightness slider, a scale slider and a switch for names under circles." loading="lazy">
+            <figcaption>Appearance: themes, brightness, scale.</figcaption>
+         </figure>
+         <figure>
+            <img src="shots/units-half.avif" srcset="shots/units-half.avif 672w, shots/units.avif 1344w" sizes="(min-aspect-ratio: 1/1) 30vh, 46vw" alt="Settings, units: two seconds and a mebibyte written in each of four number bases, dozenal magnitude, dozenal linear, arabic and hexadecimal." loading="lazy">
+            <figcaption>Units: every number in the base you choose.</figcaption>
+         </figure>
+         <figure>
+            <img src="shots/cellular-half.avif" srcset="shots/cellular-half.avif 672w, shots/cellular.avif 1344w" sizes="(min-aspect-ratio: 1/1) 30vh, 46vw" alt="Settings, cellular: connected on LTE, the signal's measures, the link's counters, and the carrier's names and addresses." loading="lazy">
+            <figcaption>Cellular: the link's own numbers, no bars.</figcaption>
+         </figure>
+      </div>
 
       <h2>What it will never be</h2>
       <p class="warn">
@@ -397,21 +453,21 @@
       <h2>Status</h2>
       <dl>
          <dt>Working today</dt>
-         <dd>Everything under "What runs today", on one device, the Pixel 8 Pro, since the autumn of 2026: display, touch, all cores, cameras, data-only cellular. Both boot slots carry the same signed image.</dd>
+         <dd>Everything under "What runs today" on the Pixel 8 Pro, since the autumn of 2026: display, touch, all cores, the GPU, cameras, data-only cellular. Both boot slots carry the same signed image. On a Pixel 8a since November: the same, but for its cameras and satellite positioning.</dd>
          <dt>Being worked on</dt>
          <dd>The radios after a jump from a running Android (the jump itself lands). The last gaps in the storage firewall. The drivers still in the kernel. The window stack: bands, spans and blend modes are in, the corners' controls are decided on paper.</dd>
          <dt>Public release</dt>
-         <dd>Expected by 2027-01-01. Until then: development builds on the Pixel 8 Pro, from the repository.</dd>
+         <dd>Expected by 2027-01-01. Until then: development builds on the Pixel 8 Pro and the Pixel 8a, from the repository.</dd>
          <dt>Not started</dt>
-         <dd>The GPU. Carrier voice, by design, never. Glyph's hardware (years nine to twelve of the plan). A second device.</dd>
+         <dd>Carrier voice, by design, never. Glyph's hardware (years nine to twelve of the plan).</dd>
          <dt>Last updated</dt>
-         <dd>2026-11-03</dd>
+         <dd>2026-11-10</dd>
       </dl>
 
       <h2>Questions</h2>
       <dl>
          <dt>Can I run it on my device?</dt>
-         <dd>Yes, today, if it is a Pixel 8 Pro: development builds, flashed from the repository (<code>tools/husky-cold.sh</code>), with a stock Android kept alongside. A public release is expected by 2027-01-01. Other devices come after; bringing one up is months of work each.</dd>
+         <dd>Yes, today, if it is a Pixel 8 Pro or a Pixel 8a: development builds, flashed from the repository (<code>tools/husky-cold.sh</code> on the Pro, <code>tools/akita-hv.sh</code> on the 8a), with a stock Android kept alongside. A public release is expected by 2027-01-01. Other devices come after; bringing one up is months of work each.</dd>
          <dt>No passwords?</dt>
          <dd>One handle, yours. You give it to people so they can find you; you never give it to a machine that keeps it, and no server holds anything to compare it against. The things you carry today are the easy ones to steal: a social security number, a card number, an address, a password. Each is a copy, and whoever holds the copy is you, from anywhere, for as long as nobody notices. The handle is not a copy. Knowing it gets you nothing; it derives you only on a device of yours, and a device of yours is something you can see, hold and cut off. A stolen password fails quietly, everywhere, for months. A stolen device fails loudly, once, and you cut it off.</dd>
          <dt>What if I lose my device?</dt>
