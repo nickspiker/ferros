@@ -373,6 +373,8 @@ const WORD_CHARS: usize = (1 << 9) - (1 << 6);
 const MARK: u64 = 9000;
 const TEXT: u16 = 16384;
 const QUIET: u16 = 7000;
+/// VSF RGB's primary green (0, 1, 0) as a working pixel (gamma 2, white Q14, green in bits 16-31): the bound screen's background (owner, 2026-11-10: "background should change from black to VSF primary green at (0.,1.,0.)").
+const GREEN: u64 = 16384 << 16;
 /// A pill under a finger (the network page's rows and buttons): about twice the brightest pill at rest.
 const PRESSED: u64 = 1 << 13;
 /// The flat dark grey behind the network picked on the network page.
@@ -604,6 +606,8 @@ enum Mode {
     Looking([u8; 32]),
     /// The identity has a fleet: one of its devices adds this one with the words shown (or the tap); the screen closes when the fleet binds it.
     Join([u8; 32]),
+    /// The fleet bound this device (identity service state 2) and its key has not come yet: a device that picked this one from its nearby list (no words typed, no tap) waits for its person to confirm that this screen turned green (fgtw ADD_BOUND). The whole screen VSF RGB primary green, one line of text, nothing to type.
+    Bound([u8; 32]),
     /// No fleet holds the handle: the permanence warning, and the handle again to mint.
     Mint([u8; 32]),
     /// No fleet device and no fgtw.org answer: nothing decided, the client keeps looking.
@@ -766,8 +770,13 @@ impl Ahau {
         self.present(y0, y1);
     }
 
+    /// The screen's background: green while bound and waiting for the fleet key, else black.
+    fn bg(&self) -> u64 {
+        if matches!(self.mode, Mode::Bound(_)) { GREEN } else { 0 }
+    }
+
     fn clear_rows(&self, y0: usize, y1: usize) {
-        self.surf()[y0 * self.w..y1 * self.w].fill(0);
+        self.surf()[y0 * self.w..y1 * self.w].fill(self.bg());
         self.present(y0, y1);
     }
 
@@ -857,7 +866,7 @@ impl Ahau {
             // Only a network this device can join (WPA2-PSK outside 6 GHz) gets a join.
             Mode::Pass if self.net_found().is_some_and(|f| f.1 & 1 != 0) => Some("join"),
             Mode::Pass => None,
-            Mode::Looking(_) | Mode::Join(_) | Mode::Grey(_) | Mode::Hosting | Mode::Networks => None,
+            Mode::Looking(_) | Mode::Join(_) | Mode::Bound(_) | Mode::Grey(_) | Mode::Hosting | Mode::Networks => None,
         }
     }
 
@@ -870,7 +879,7 @@ impl Ahau {
         let (_, ry0, _, ry1) = self.button_at();
         let s = self.surf();
         for y in ry0..ry1 {
-            s[y * self.w..(y + 1) * self.w].fill(0);
+            s[y * self.w..(y + 1) * self.w].fill(self.bg());
         }
         let (x0, y0, x1, y1) = self.button_at();
         if self.button_label().is_some() {
@@ -945,7 +954,7 @@ impl Ahau {
         let rows = n.max(self.status_lines.get()).max(1);
         self.status_lines.set(n);
         let (y0, y1) = (b - px * 3 / 2, b + (rows - 1) * px * 13 / 10 + px / 2);
-        self.surf()[y0 * self.w..y1 * self.w].fill(0);
+        self.surf()[y0 * self.w..y1 * self.w].fill(self.bg());
         self.compose(y0, y1, || {
             for (k, &(s, e)) in lines[..n].iter().enumerate() {
                 self.centred(b + k * px * 13 / 10, px, QUIET, core::str::from_utf8(&t.as_bytes()[s..e]).unwrap_or(""));
@@ -976,7 +985,7 @@ impl Ahau {
         let (y0, y1) = self.words_band();
         if !matches!(self.mode, Mode::Join(_)) {
             if self.words_shown.replace(false) {
-                self.surf()[y0 * self.w..y1 * self.w].fill(0);
+                self.surf()[y0 * self.w..y1 * self.w].fill(self.bg());
                 self.present(y0, y1);
                 // The words ran under the keyboard: it is laid again without them.
                 self.show_board();
@@ -984,7 +993,7 @@ impl Ahau {
             return;
         }
         self.words_shown.set(true);
-        self.surf()[y0 * self.w..y1 * self.w].fill(0);
+        self.surf()[y0 * self.w..y1 * self.w].fill(self.bg());
         let mut t = [0u8; 640];
         let mut n = 0;
         let mut push = |b: &[u8], n: &mut usize| {
@@ -1136,7 +1145,7 @@ impl Ahau {
     /// While the identity is being looked up or joined: follow the client, from `client_thread`'s copy (nothing here calls fgtw). Returns whether the screen changed.
     fn follow_client(&mut self) -> bool {
         let seed = match self.mode {
-            Mode::Looking(s) | Mode::Join(s) | Mode::Grey(s) => s,
+            Mode::Looking(s) | Mode::Join(s) | Mode::Grey(s) | Mode::Bound(s) => s,
             _ => return false,
         };
         if self.roots_pending {
@@ -1158,9 +1167,19 @@ impl Ahau {
         self.word_len = c.words_len;
         let next = match c.state {
             1 => Mode::Join(seed),
-            2 | 3 => {
+            // Bound, the fleet key not here yet: green until it comes (until 2026-11-10 this was taken as attested, and a device picked from the nearby list went on without the key, past the person's confirm).
+            2 => {
+                if !matches!(self.mode, Mode::Bound(_)) {
+                    console(self.grants, b"ahau: bound to the identity's fleet; waiting for its key (green)\n");
+                    self.mark_member();
+                }
+                Mode::Bound(seed)
+            }
+            3 => {
                 console(self.grants, b"ahau: this device is a member of the identity's fleet\n");
-                self.mark_member();
+                if !matches!(self.mode, Mode::Bound(_)) {
+                    self.mark_member();
+                }
                 self.attested();
             }
             5 => Mode::Mint(seed),
@@ -1173,10 +1192,16 @@ impl Ahau {
             return false;
         }
         let changed = next != self.mode;
+        let was_bound = matches!(self.mode, Mode::Bound(_));
         self.mode = next;
         // This device's name in the fleet, for the join step (fgtw op 19: empty until the roots are in).
         if matches!(next, Mode::Join(_)) && self.dev_name.1 == 0 && c.name_len > 0 {
             self.dev_name = (c.name, c.name_len);
+        }
+        // Into the bound screen, or out of it: the whole screen again on its new background.
+        if changed && (matches!(next, Mode::Bound(_)) || was_bound) {
+            self.all();
+            return true;
         }
         if changed {
             self.status(self.prompt());
@@ -1377,7 +1402,7 @@ impl Ahau {
         if !self.typing() {
             // While joining, these rows belong to the words' band (`words`): cleared here they cut a black band through the words (owner, 2026-11-09).
             if !matches!(self.mode, Mode::Join(_)) {
-                self.surf()[r0..r1].fill(0);
+                self.surf()[r0..r1].fill(self.bg());
                 self.present(r0 / self.w, r1 / self.w);
             }
             return;
@@ -1385,7 +1410,7 @@ impl Ahau {
         // Built whole in the back surface's rows and copied in, so a frame the display composes meanwhile never catches them cleared: drawn in place, the line flickered black at the blinkey's ticks (2026-11-01). Without a back surface, in place. The keyboard's boards use the back surface's rows below these.
         let tb = if self.back != 0 { self.back } else { self.base };
         let s = self.surf();
-        s[r0..r1].fill(0);
+        s[r0..r1].fill(self.bg());
         let (t, n, at) = self.shown();
         let shown = core::str::from_utf8(&t[..n]).unwrap_or("");
         // Measured by the typeface's own advances (display op 28), the blinkey where the text before it ends.
@@ -1435,7 +1460,7 @@ impl Ahau {
             return;
         }
         // Cleared in the buffer only: each piece composes its own band and shows it whole, then the region is shown once more from the buffer, which now holds their text too, so what a smaller size no longer covers goes black with no frame of it blank in between.
-        self.surf()[y0 * self.w..y1 * self.w].fill(0);
+        self.surf()[y0 * self.w..y1 * self.w].fill(self.bg());
         let (t, n) = self.status_text.get();
         self.status(core::str::from_utf8(&t[..n]).unwrap_or(""));
         self.words();
@@ -1446,8 +1471,14 @@ impl Ahau {
     }
 
     fn all(&self) {
-        self.surf().fill(0);
-        Front::fill64(window::PORCH, (self.w * self.h) as u64, 0);
+        self.surf().fill(self.bg());
+        Front::fill64(window::PORCH, (self.w * self.h) as u64, self.bg());
+        // The bound screen: green, its one line, nothing to type or press.
+        if matches!(self.mode, Mode::Bound(_)) {
+            self.status(self.prompt());
+            self.show();
+            return;
+        }
         if self.net_open() {
             // The network page: its list where the mark was, its own status line.
             self.net_draw();
@@ -1684,7 +1715,7 @@ impl Ahau {
     /// Under the text box: the networks the filter lets through (each a pill: its name, bright when this device can join it, quiet otherwise, and at the right its signal in dBm, or `kept` for the one the device keeps), or, once one is picked, that network alone, lit, with what the scan knows of it.
     fn net_draw(&self) {
         let (y0, y1) = self.net_band();
-        self.surf()[y0 * self.w..y1 * self.w].fill(0);
+        self.surf()[y0 * self.w..y1 * self.w].fill(self.bg());
         let (px, pitch, first, foot) = self.net_rows();
         let picked = self.mode == Mode::Pass || self.joining;
         // The rows are text, not buttons (owner, 2026-11-09: "No buttons for the network, just a solid dark grey fill behind selected with bold text"): one flat dark grey behind the network picked, or behind the row under a finger while it is held.
@@ -2052,6 +2083,7 @@ impl Ahau {
             Mode::Looking(_) if !ferros_sys::data_link_up(&ferros_sys::facts()) => "Waiting for connectivity.",
             Mode::Looking(_) => "Finding this identity.",
             Mode::Join(_) => "Use an existing device to bind this device to your fleet.",
+            Mode::Bound(_) => "Bound to your fleet.\nConfirm on the device adding this one.",
             Mode::Mint(_) => "This handle is unclaimed.\nMinting is permanent.\nType your handle again to mint your identity.",
             Mode::Grey(_) if !ferros_sys::data_link_up(&ferros_sys::facts()) => "Waiting for connectivity.",
             Mode::Grey(_) => "No answer yet. Still looking.",
