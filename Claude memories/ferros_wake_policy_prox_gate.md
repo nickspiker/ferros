@@ -1,6 +1,6 @@
 ---
 name: ferros_wake_policy_prox_gate
-description: "ferros display-wake requirement — power button lights the panel ONLY if raw proximity is far; native policy, no reactive undo"
+description: "ferros display-wake requirement: power press lights the panel ONLY if raw proximity is far AND nothing touches the glass; power is the only way off, no timeout"
 metadata: 
   node_type: memory
   type: project
@@ -14,3 +14,5 @@ Owner's wake spec (stated 2026-08-21): the screen turns on ONLY when the power b
 Explicitly reject Google's on-ear fusion: the FUSED `com.google.sensor.prox_voice_call` (`0x0101002a`, vendor type 131092) releases screen-off when orientation exits the ~0.87 rad ear cone, which is exactly the "flat on table → screen wakes" failure. ferros uses the raw sensor only, near==off period.
 
 **Husky/Android stopgap RETIRED (2026-09-09):** PocketGuard (Magisk priv-app that undid covered wakes via `su -c "input keyevent 223"`) was removed from the phone at the owner's request — the raw-vs-fused proximity fight was too glitchy in practice, and there is no clean layer on Android to win it (the wake decision is in PhoneWindowManager, the on-ear fusion is in AoC). Conclusion: don't retry this on Android; it only gets solved when ferros owns the whole stack. Source is kept for reference at ferros `tools/pocketguard/`. Related: [[pixel8_dedicated_dev_device]].
+
+**Restated 2026-11-10 (owner):** the screen turns on only with all three: a power press, the proximity sensor not covered (its tuning later), and nothing touching the glass (finger, edge, palm: any contact blocks it). The power button is the only thing that turns it off; nothing turns it off by itself (no timeout).
