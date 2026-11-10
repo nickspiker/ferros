@@ -6967,7 +6967,9 @@ fn server(grants: u64) -> ! {
                     let free = (0..SURFACES).find(|&k| unsafe { (*(&raw const WINS))[k] }.is_none() && Some(k) != flight_surf);
                     let flight = unsafe { *(&raw const FLIGHT_FRAME) };
                     let wall_at = unsafe { if WALL_ON { WALL_BUF } else { 0 } };
-                    let text: alloc::string::String = match (unsafe { APP }.is_some(), free) {
+                    // `[30, 1]`: the glass's mask alone (owner, 2026-11-10, the website's screens: "pull that screen mask for the edges/cam, de premultiply it, apply alpha"): every pixel through `glass_front` with nothing in front but the mask and only white behind it, so with the release look's black mask each pixel's working value is white times the share of the glass that shows there (the edge's and the camera hole's antialiasing exact, as the panel gets them). Whatever is on the screen, an app included.
+                    let mask = m.get(1) == Some(&1);
+                    let text: alloc::string::String = match (unsafe { APP }.is_some() && !mask, free) {
                         // The home screen: each row as `publish_band` composes it for the glass (the edge, then the console, then the canvas), in working values, into the free surface.
                         (false, Some(k)) => {
                             let s = surface(k, width, height);
@@ -6977,6 +6979,14 @@ fn server(grants: u64) -> ! {
                                 let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), rows[y + 1].first as usize) };
                                 let row_px = &plan[g.first as usize..];
                                 let edge_px = &row_px[front_split(row_px)..];
+                                if mask {
+                                    // White at Q14 in each of R, G and B.
+                                    const WHITE: u64 = 16384 | 16384 << 16 | 16384 << 32;
+                                    for x in 0..width {
+                                        s[y * width + x] = glass_front(x, g, edge_px, CLEAR, WHITE);
+                                    }
+                                    continue;
+                                }
                                 let ((cl, cr), bw) = bar_line(y, width, height);
                                 // A flight frame: sampled as the publish samples it, at half resolution from the pair's top row, the wallpaper in it (alone at full resolution where neither image has anything).
                                 if let Some(f) = flight {

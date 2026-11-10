@@ -3,6 +3,7 @@
 //! The kernel's memory read hands back up to 4 MiB of DRAM a call (service.rs), so a WQHD canvas is 8 reads; the tool advances by what each read returns, so an older kernel (64 KiB) still works, slowly.
 //! Usage: screencap [out.vsf] [width height]   (default target/screen/<time>.vsf, 1344 2992; a jump from Android's scaled mode runs 1008 2244)
 //!        screencap --enter [width height]      (a capture each time Enter is pressed, into the folder it was started from as <Eagle time in hex>.vsf; `q` then Enter ends it; tools/snap.sh runs it from anywhere)
+//!        screencap --mask [out.vsf] [width height]   (the glass's mask alone, white where the glass shows and black where the mask covers, its edges antialiased as the panel gets them; default mask.vsf here: tools/vsf2web's --mask)
 
 use std::process::Command;
 use vsf::colour::convert::delinearize_gamma2tanh_bits_f32;
@@ -22,8 +23,14 @@ fn build_capture() -> std::path::PathBuf {
     bin
 }
 
-fn source(bridge: &std::path::Path, bin: &std::path::Path) -> usize {
-    let out = Command::new(bridge).arg("spawn").arg(bin).args(["--use", "display"]).output().expect("ferros-bridge");
+fn source(bridge: &std::path::Path, bin: &std::path::Path, mask: bool) -> usize {
+    // The capture process's input `m` asks for the mask alone (display op 30 with 1).
+    let mut cmd = Command::new(bridge);
+    cmd.arg("spawn").arg(bin);
+    if mask {
+        cmd.arg("6d");
+    }
+    let out = cmd.args(["--use", "display"]).output().expect("ferros-bridge");
     // The capture's reply, `proc: G#…`, anywhere in a line: other processes' console lines run into it when they have no newline of their own yet (2026-11-03: four captures read the canvas while the modem's log was streaming).
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     // The capture waits on the display server, so the spawn can come back before its answer does (2026-11-07: parked, its `proc:` line on the console a moment later): then the console is asked, a few times a second apart, and its last answer taken.
@@ -51,6 +58,14 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let bridge = repo.join("target/debug/ferros-bridge");
+    if a.get(1).map(String::as_str) == Some("--mask") {
+        let out = a.get(2).cloned().unwrap_or_else(|| "mask.vsf".into());
+        let w: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(1344);
+        let h: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(2992);
+        let bin = build_capture();
+        capture(&bridge, &bin, &out, w, h, true);
+        return;
+    }
     if a.get(1).map(String::as_str) == Some("--enter") {
         let w: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(1344);
         let h: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(2992);
@@ -65,7 +80,7 @@ fn main() {
             }
             // Named by Eagle Time, in hex.
             let out = here.join(format!("{:x}.vsf", vsf::eagle_time_oscillations()));
-            capture(&bridge, &bin, &out.to_string_lossy(), w, h);
+            capture(&bridge, &bin, &out.to_string_lossy(), w, h, false);
         }
         return;
     }
@@ -79,15 +94,15 @@ fn main() {
     let w: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(1344);
     let h: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(2992);
     let bin = build_capture();
-    capture(&bridge, &bin, &out, w, h);
+    capture(&bridge, &bin, &out, w, h, false);
 }
 
 /// One capture: the finished frame's address from the capture process, the frame read over the bridge, written to `out` as a VSF visual.
-fn capture(bridge: &std::path::Path, bin: &std::path::Path, out: &str, w: usize, h: usize) {
+fn capture(bridge: &std::path::Path, bin: &std::path::Path, out: &str, w: usize, h: usize, mask: bool) {
     let bytes = w * h * 8;
     let tmp = std::env::temp_dir().join("screencap.part");
     let t0 = std::time::Instant::now();
-    let base = source(bridge, bin);
+    let base = source(bridge, bin, mask);
     eprintln!("reading G#{base:X}{}", if base == CANVAS { " (the canvas: the capture named no surface)" } else { "" });
     let mut raw = Vec::with_capacity(bytes);
     let mut reads = 0;

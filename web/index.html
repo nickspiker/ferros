@@ -285,13 +285,12 @@
          margin: 0;
       }
 
+      /* Each shot carries the glass's own edge and camera hole as its alpha (the device's mask, antialiased as the panel gets it), so the page rounds nothing. */
       .shots img {
          display: block;
          width: 100%;
          height: auto;
          aspect-ratio: 1344 / 2992;
-         border-radius: calc(2.4 * var(--ru));
-         background: #000;
       }
 
       .shots figcaption {
