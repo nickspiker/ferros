@@ -298,6 +298,43 @@
          font-size: calc(1.7 * var(--ru));
          color: var(--dim);
       }
+
+      /* The kist list (tools/kistcat): name, developer, version, what it is. The same rules as kists.fgtw.org's page. */
+      .kists {
+         width: 100%;
+         border-collapse: collapse;
+         margin: calc(2 * var(--ru)) 0;
+         font-size: calc(1.9 * var(--ru));
+         text-align: left;
+      }
+
+      .kists th {
+         font-family: var(--mono);
+         font-weight: 400;
+         font-size: calc(1.6 * var(--ru));
+         letter-spacing: 0.1em;
+         text-transform: uppercase;
+         color: var(--faint);
+         padding: calc(0.7 * var(--ru)) calc(1 * var(--ru)) calc(0.7 * var(--ru)) 0;
+         border-bottom: calc(0.1 * var(--ru)) solid var(--line);
+      }
+
+      .kists td {
+         padding: calc(0.9 * var(--ru)) calc(1 * var(--ru)) calc(0.9 * var(--ru)) 0;
+         border-bottom: calc(0.1 * var(--ru)) solid var(--line);
+         color: var(--dim);
+         vertical-align: top;
+      }
+
+      .kists td:first-child {
+         color: var(--ink);
+      }
+
+      .kists .mono {
+         font-family: var(--mono);
+         font-size: calc(1.7 * var(--ru));
+         white-space: nowrap;
+      }
    </style>
 </head>
 <body>
@@ -450,6 +487,12 @@
          <li>Every remaining driver out of the kernel, until what is left is a kernel and nothing else.</li>
          <li><strong>Glyph</strong>, the device ferros is for: hermetic, no ports, no openings, a sapphire slab for a face, one physical control (the killswitch), nothing in it replaceable, built for a twelve-year life. Designed for the parts of 2032, not 2026.</li>
       </ul>
+
+      <h2>Kists</h2>
+      <p>A kist is an app for ferros: one file, signed by its developer and checked by your device when it installs it. Anyone may list one and nobody needs an account to install one. The list vouches for nothing; your device checks every kist itself. No fees, no ads, no stars. The whole list, searchable: <a href="http://kists.fgtw.org/">kists.fgtw.org</a>.</p>
+      <!-- kists: begin (tools/kistcat writes the list from tools/kistcat/kists.sh; change it there, not here) -->
+<p class="audit-note">None listed yet (2026-11-10).</p>
+<!-- kists: end -->
 
       <h2>Doors</h2>
       <ul class="doors">
