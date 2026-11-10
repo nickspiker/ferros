@@ -376,10 +376,14 @@ impl Ip {
         true
     }
 
-    /// The MAC for an IPv4 destination: broadcast, a cached neighbour (on-link) or the router's; None after sending an ARP request (the caller retries).
+    /// The MAC for an IPv4 destination: broadcast (limited or this subnet's), a multicast group's (01:00:5e and the group's low 23 bits, as the IGMP report already sends), a cached neighbour (on-link) or the router's; None after sending an ARP request (the caller retries).
+    /// Until 2026-11-10 only 255.255.255.255 counted as broadcast and multicast went to the router: the Pro ARPed for 192.168.1.255 at every beacon and never sent one, and its group beacons reached the router alone, so desktop Photon never heard it (seen in a capture on the desktop's WiFi).
     fn next_hop4(&mut self, dst: [u8; 4]) -> Option<[u8; 6]> {
-        if dst == [255; 4] {
+        if dst == [255; 4] || (self.bound && (0..4).all(|k| dst[k] == self.v4[k] | !self.mask[k])) {
             return Some([0xFF; 6]);
+        }
+        if dst[0] & 0xF0 == 0xE0 {
+            return Some([0x01, 0x00, 0x5E, dst[1] & 0x7F, dst[2], dst[3]]);
         }
         let on_link = (0..4).all(|k| dst[k] & self.mask[k] == self.v4[k] & self.mask[k]);
         let hop = if on_link { dst } else { self.router };
