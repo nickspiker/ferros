@@ -828,7 +828,15 @@ fn detail_words(l: &mut Line, f: tatau::Fmt, v: &ferros_detail::vsf::VsfType) {
         VsfType::a(s) => {
             l.s(s);
         }
-        VsfType::ni(a) => hex(l, a, 1, "."),
+        // IPv4 in the standard dotted decimal (owner, 2026-11-09: "Standard convention for units is fine for now"); IPv6 and hardware addresses keep their standard hex.
+        VsfType::ni(a) => {
+            for (k, b) in a.iter().enumerate() {
+                if k > 0 {
+                    l.s(".");
+                }
+                let _ = write!(l, "{b}");
+            }
+        }
         VsfType::nj(a) => hex(l, a, 2, ":"),
         VsfType::nm(a) => hex(l, a, 1, ":"),
         other => match other.as_u64() {
