@@ -57,6 +57,18 @@ The network owns the assignment: a device belongs to the identity whose fleet bo
 
   `diag "identity release"` does the same for a developer starting the device over.
 
+## Joining and leaving a fleet: devices first, words last (owner, 2026-11-10)
+
+The fleet is the person's devices, and they ask each other: fgtw.org (the bootstrap) only helps them find one another and holds a request for a device that cannot be reached (owner: "should be contacting the actual FGTW first (my other devices and friends) since my devices are the ones that should be notifying and asking").
+
+- **Transports, in order:** an NFC tap; a BLE broadcast; the LAN; directly over the FGTW peer network (traversal, relay) to each fleet device wherever it is; fgtw.org's slot last, for a device offline. Each carries the same signed request.
+- **Every fleet device that receives a request notifies the person** and asks there (one press to approve); the first approval settles it and the others clear. Nothing waits on the person opening a page.
+- **An NFC tap is consent, both ways.** Joining: the tap with a fleet member binds the newcomer (as built). Leaving: the reverse of add, so a tap between the leaving device (its leave screen up: its own consent, which fgtw.org requires on every Remove) and an attested fleet device with its screen on approves the departure; the staying device says what happened and asks nothing more. A lost or stolen device still cannot be removed, only locked or shrunk.
+- **Words are the last resort** (owner: "it's very clear that's a last effort if NFC fails and BLE fails ... it shouldn't be showing those unless we really need to"; "there's no typing of words"). They came from Photon's pairing-v2, where they were the first transport in 2026-07. They are not shown while a tap, BLE or a fleet device's notification can carry the request, and then only when the person asks for them. Leaving needs no words at all: the request is signed by a current member, so it cannot be a stranger's.
+- **No reachability internals on these screens:** not whether fgtw.org answered, not which devices are nearby. The leaving screen says it is asking the person's devices, and what to do (tap, or approve on any of them).
+
+Not built yet (2026-11-10): ferros's fgtw reaches siblings on the LAN and fgtw.org only, nothing notifies, and the join and leave screens still lead with words.
+
 ## Unlocking and locking
 
 - **At attest.** ahau derives the seed and unlocks (op 1). On a bound device the screen closes at once; the proof follows behind it, then the roots go to fgtw (the identity service). On an unbound device the look-up and join run as before.
