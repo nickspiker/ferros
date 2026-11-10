@@ -138,6 +138,130 @@ static FRESH_DONE_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 static SHOW_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// fgtw's endpoint (payloads/fgtw, the identity service): op 1 its state and, while joining, its pairing words; op 2 mint.
 const S_FGTW_EP: u64 = 8;
+
+/// The identity service is asked from two threads of its own, never from the screen's (owner, 2026-11-10: "a blinking attest button and a frozen cursor when I hit attest"): a call waits as long as fgtw's pass does, and a pass took 3 s while it minted binding requests, so the screen froze with it. The map had the same fault the same day (its `fgtw_poller`).
+/// The session's roots for op 4 (seed, proof), written by the screen before it moves ROOTS_GEN on; `roots_thread` hands each generation over and sets ROOTS_TAKEN to it once fgtw took it.
+static mut ROOTS: [u8; 64] = [0; 64];
+static ROOTS_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ROOTS_TAKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static mut ROOTS_STACK: [u8; 1 << 15] = [0; 1 << 15];
+static mut CLIENT_STACK: [u8; 1 << 15] = [0; 1 << 15];
+
+/// The identity service as `client_thread` last read it: its state byte (op 1), its pairing words while joining, this device's name in the fleet (op 19, while joining), and the roots generation fgtw held when it was read (a copy read before the latest roots says nothing about them).
+#[derive(Clone, Copy)]
+struct ClientCopy {
+    roots: u64,
+    state: u8,
+    words: [u8; 512],
+    words_len: usize,
+    name: [u8; 48],
+    name_len: usize,
+}
+/// The copy under a sequence count (odd while it is written; it moves only when the service rang).
+static CLIENT_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static mut CLIENT_COPY: ClientCopy = ClientCopy { roots: 0, state: 0, words: [0; 512], words_len: 0, name: [0; 48], name_len: 0 };
+
+/// Waits for fgtw to answer: it starts once the space is open and may restart, and no doorbell exists for a server coming up, so a refused call is made again after a wait that doubles from a sixty-fourth of a second to a second (the one timer on these threads, and why).
+fn absent_wait(absent: &mut u64) {
+    sleep_until(now() + *absent);
+    if *absent < freq() {
+        *absent <<= 1;
+    }
+}
+
+/// Hands each new generation of the session's roots to fgtw (op 4), sleeping on ROOTS_GEN between, so the screen never waits on the hand-over.
+extern "C" fn roots_thread(grants: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    let svc = cap(grants, S_FGTW_EP);
+    let mut absent = freq() >> 6;
+    loop {
+        let g = ROOTS_GEN.load(Ordering::Acquire);
+        if g == ROOTS_TAKEN.load(Ordering::Acquire) {
+            ferros_sys::wait_world(&ROOTS_GEN, g, 0);
+            continue;
+        }
+        let mut m = [0u8; 65];
+        m[0] = 4;
+        m[1..].copy_from_slice(unsafe { &*(&raw const ROOTS) });
+        // Written again while copied: the newer roots are the ones to hand.
+        if ROOTS_GEN.load(Ordering::Acquire) != g {
+            continue;
+        }
+        let mut out = [0u8; 16];
+        let n = ferros_sys::call_live(svc, &m, &mut out);
+        // Taken when the reply says so (its state byte first, 0 while it holds no identity). Any reply at all is not enough: from 2026-10-28 to 2026-11-04 fgtw ignored the message (it wanted 69 bytes), still replied, and the roots were counted as handed.
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || out[0] == 0 {
+            absent_wait(&mut absent);
+            continue;
+        }
+        absent = freq() >> 6;
+        ROOTS_TAKEN.store(g, Ordering::Release);
+        ferros_sys::wake(&ROOTS_TAKEN, 1);
+    }
+}
+
+/// fgtw's doorbell (op 21), held from the first roots on: answered when what it watches changes (its state, the fleet, the space), and only then is op 1 (and op 19 while joining) read and the copy published. Nothing on a timer but `absent_wait`.
+extern "C" fn client_thread(grants: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    let svc = cap(grants, S_FGTW_EP);
+    // Nothing to follow before a person typed a handle.
+    while ROOTS_GEN.load(Ordering::Acquire) == 0 {
+        ferros_sys::wait_world(&ROOTS_GEN, 0, 0);
+    }
+    let mut c = ClientCopy { roots: 0, state: 0, words: [0; 512], words_len: 0, name: [0; 48], name_len: 0 };
+    // u32::MAX is never a count fgtw has given, so the first call is answered at once.
+    let mut count = u32::MAX;
+    let mut absent = freq() >> 6;
+    loop {
+        let mut m = [21u8, 0, 0, 0, 0];
+        m[1..].copy_from_slice(&count.to_le_bytes());
+        let mut r = [0u8; 4];
+        // An fgtw without the doorbell answers op 21 as its state (a byte or two), never four bytes: treated as absent.
+        if ferros_sys::call_live(svc, &m, &mut r) != 4 {
+            absent_wait(&mut absent);
+            continue;
+        }
+        absent = freq() >> 6;
+        count = u32::from_le_bytes(r);
+        c.roots = ROOTS_TAKEN.load(Ordering::Acquire);
+        let mut out = [0u8; 600];
+        let n = ferros_sys::call_live(svc, &[1], &mut out);
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 2 {
+            continue;
+        }
+        // WHY the mins: the reply's length is the service's word; the words are kept only as far as both buffers reach.
+        let n = (n as usize).min(out.len());
+        let k = (n - 2).min(c.words.len());
+        c.state = out[0];
+        c.words[..k].copy_from_slice(&out[2..2 + k]);
+        c.words_len = k;
+        c.name_len = 0;
+        if c.state == 1 {
+            let n = ferros_sys::call_live(svc, &[19], &mut c.name);
+            if n != ferros_sys::ERR && (1..=48).contains(&(n as usize)) {
+                c.name_len = n as usize;
+            }
+        }
+        CLIENT_SEQ.fetch_add(1, Ordering::AcqRel);
+        unsafe { *(&raw mut CLIENT_COPY) = c };
+        CLIENT_SEQ.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// The copy `client_thread` last published and its sequence count, read whole (again if it was being written); None when it has not moved from `seen`.
+fn client_take(seen: u32) -> Option<(u32, ClientCopy)> {
+    use core::sync::atomic::Ordering;
+    loop {
+        let s0 = CLIENT_SEQ.load(Ordering::Acquire);
+        if s0 == seen {
+            return None;
+        }
+        let v = unsafe { *(&raw const CLIENT_COPY) };
+        if s0 & 1 == 0 && CLIENT_SEQ.load(Ordering::Acquire) == s0 {
+            return Some((s0, v));
+        }
+    }
+}
 /// Grant slot 9: the identity unlock right (SYS_UNLOCK, AUTH.md): the person's space opens from the seed, before the proof.
 const S_UNLOCK: u64 = 9;
 /// Slot 10: a second surface, the keyboard's back buffer: a board that a key's tap will redraw (shift, a page, a layout) is drawn there whole while the finger is down and copied in at the lift (`prepare`), as the mark's frame is rendered ahead by its thread. Without it the lift redrew the board in place, 59 ms (2026-11-01: draw 14, the key map 37, the tint 8), and the shift showed a few frames late.
@@ -440,8 +564,11 @@ struct Ahau {
     /// This session's last derived seed and proof (RAM only), so typing the same handle again (after `back`) skips the proof.
     session_seed: Option<[u8; 32]>,
     session_proof: Option<[u8; 32]>,
-    /// The roots are set but the client has not taken them yet (`send_roots`).
+    /// The roots are set but the client has not taken them yet (`send_roots`): the generation published to `roots_thread` (ROOTS_GEN), which ROOTS_TAKEN reaches once fgtw took them.
     roots_pending: bool,
+    roots_gen: u64,
+    /// `client_thread`'s copy last taken (its sequence count).
+    client_seen: u32,
     handle: [u8; TEXT_BYTES],
     len: usize,
     chars: usize,
@@ -934,39 +1061,30 @@ impl Ahau {
         self.words_fling.get() != 0.
     }
 
-    /// The identity service's state (op 1): its state byte, with the pairing words kept while it joins.
-    fn client_state(&mut self) -> Option<u8> {
-        let mut out = [0u8; 600];
-        // CALL_LIVE: a client that is not answering yet (starting, or between passes of its loop) is a None this poll, never a frozen screen.
-        let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[1], &mut out);
-        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 2 {
-            return None;
-        }
-        let n = (n as usize).min(out.len());
-        let k = (n - 2).min(self.word_buf.len());
-        self.word_buf[..k].copy_from_slice(&out[2..2 + k]);
-        self.word_len = k;
-        Some(out[0])
-    }
-
-    /// While the identity is being looked up or joined: follow the client. Returns whether the screen changed.
+    /// While the identity is being looked up or joined: follow the client, from `client_thread`'s copy (nothing here calls fgtw). Returns whether the screen changed.
     fn follow_client(&mut self) -> bool {
         let seed = match self.mode {
             Mode::Looking(s) | Mode::Join(s) | Mode::Grey(s) => s,
             _ => return false,
         };
         if self.roots_pending {
-            self.roots_pending = !self.hand_roots();
-            if self.roots_pending {
+            if ROOTS_TAKEN.load(core::sync::atomic::Ordering::Acquire) != self.roots_gen {
                 return false;
             }
+            self.roots_pending = false;
             console(self.grants, b"ahau: roots handed to fgtw; it looks the identity up\n");
         }
-        // The words as last drawn, to redraw them only when the identity service has new ones (a fresh binding request): redrawn every poll, the words screen flickered four times a second (owner, 2026-11-04).
-        let (len0, words0) = (self.word_len, self.word_buf);
-        let Some(state) = self.client_state() else { return false };
-        let same_words = self.word_buf[..self.word_len] == words0[..len0];
-        let next = match state {
+        let Some((seq, c)) = client_take(self.client_seen) else { return false };
+        self.client_seen = seq;
+        // A copy read before fgtw took these roots is about the last ones.
+        if c.roots != self.roots_gen {
+            return false;
+        }
+        // The words redrawn only when the identity service has new ones (a fresh binding request): redrawn every poll, the words screen flickered four times a second (owner, 2026-11-04).
+        let same_words = self.word_buf[..self.word_len] == c.words[..c.words_len];
+        self.word_buf = c.words;
+        self.word_len = c.words_len;
+        let next = match c.state {
             1 => Mode::Join(seed),
             2 | 3 => {
                 console(self.grants, b"ahau: this device is a member of the identity's fleet\n");
@@ -984,13 +1102,9 @@ impl Ahau {
         }
         let changed = next != self.mode;
         self.mode = next;
-        // This device's name in the fleet, once, for the join step (fgtw op 19: empty until the roots are in).
-        if matches!(next, Mode::Join(_)) && self.dev_name.1 == 0 {
-            let mut r = [0u8; 48];
-            let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[19], &mut r);
-            if n != ferros_sys::ERR && (1..=48).contains(&(n as usize)) {
-                self.dev_name = (r, n as usize);
-            }
+        // This device's name in the fleet, for the join step (fgtw op 19: empty until the roots are in).
+        if matches!(next, Mode::Join(_)) && self.dev_name.1 == 0 && c.name_len > 0 {
+            self.dev_name = (c.name, c.name_len);
         }
         if changed {
             self.status(self.prompt());
@@ -1001,23 +1115,18 @@ impl Ahau {
         true
     }
 
-    /// Hand the roots to the identity service (fgtw) in RAM (op 4): it takes them, keeps them on disk only if unlock-at-boot is on, and looks the identity up. Nothing is written here. The call does not wait for a client that is not answering yet (CALL_LIVE): the hand-over is then marked pending and made again at the next poll (`follow_client`), so the screen never freezes on it.
+    /// Hand the roots to the identity service (fgtw) in RAM (op 4): it takes them, keeps them on disk only if unlock-at-boot is on, and looks the identity up. Nothing is written here. The hand-over is `roots_thread`'s, which waits for fgtw however long it takes; here the roots are only published to it, so the screen never freezes on it.
     fn send_roots(&mut self, seed: &[u8; 32], proof: &[u8; 32]) {
+        use core::sync::atomic::Ordering;
         self.session_seed = Some(*seed);
         self.session_proof = Some(*proof);
-        self.roots_pending = !self.hand_roots();
-    }
-
-    /// One attempt at the op-4 hand-over of the session's roots: true when fgtw took them, which its reply says (its state byte first, 0 while it holds no identity). Any reply at all is not enough: from 2026-10-28 to 2026-11-04 fgtw ignored the message (it wanted 69 bytes), still replied, and the roots were counted as handed.
-    fn hand_roots(&self) -> bool {
-        let (Some(seed), Some(proof)) = (self.session_seed, self.session_proof) else { return false };
-        let mut m = [0u8; 65];
-        m[0] = 4;
-        m[1..33].copy_from_slice(&seed);
-        m[33..65].copy_from_slice(&proof);
-        let mut out = [0u8; 16];
-        let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &m, &mut out);
-        n != ferros_sys::ERR && n != ferros_sys::NOTHING && n >= 1 && out[0] != 0
+        let roots = unsafe { &mut *(&raw mut ROOTS) };
+        roots[..32].copy_from_slice(seed);
+        roots[32..].copy_from_slice(proof);
+        self.roots_gen = ROOTS_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+        self.roots_pending = true;
+        // Both threads: the roots' to hand them, the client's to start following.
+        ferros_sys::wake(&ROOTS_GEN, 2);
     }
 
     /// The entry: the handle as typed and a cursor.
@@ -1969,7 +2078,7 @@ impl Ahau {
                 let proof = if self.session_seed == Some(seed) { self.session_proof.unwrap() } else { self.proof_for(&seed, true) };
                 // The roots to the client in RAM; it keeps them on disk only if unlock-at-boot is on.
                 self.send_roots(&seed, &proof);
-                console(self.grants, if self.roots_pending { b"ahau: fgtw is not taking the roots yet (it starts once the space is open); handing them on as it answers\n" } else { b"ahau: roots handed to fgtw; it looks the identity up\n" });
+                console(self.grants, b"ahau: roots set; their thread hands them to fgtw\n");
                 self.wipe();
                 self.mode = Mode::Looking(seed);
                 self.status(self.prompt());
@@ -1995,7 +2104,7 @@ impl Ahau {
                         // Another device's genesis won the handle first: it has a fleet now.
                         self.mode = Mode::Join(seed);
                         self.status(self.prompt());
-                        let _ = self.client_state();
+                        // Its words come with `client_thread`'s next copy (the mint rang the doorbell).
                         self.words();
                     }
                     _ => {
@@ -2074,10 +2183,15 @@ impl Ahau {
         self.wallpaper(&seed);
         let proof = self.proof_for(&seed, false);
         self.send_roots(&seed, &proof);
-        while self.roots_pending {
-            sleep_until(now() + freq() / 16);
-            self.roots_pending = !self.hand_roots();
+        // `roots_thread` hands them over; this waits on its word, no timer.
+        loop {
+            let t = ROOTS_TAKEN.load(core::sync::atomic::Ordering::Acquire);
+            if t == self.roots_gen {
+                break;
+            }
+            ferros_sys::wait_world(&ROOTS_TAKEN, t, 0);
         }
+        self.roots_pending = false;
         console(self.grants, b"ahau: roots handed to fgtw\n");
         self.host_words()
     }
@@ -2753,8 +2867,11 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0) };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, roots_gen: 0, client_seen: 0, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0) };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
+    // The identity service's two threads (`roots_thread`, `client_thread`): both sleep until a handle is typed.
+    ferros_sys::thread_spawn(roots_thread, unsafe { &mut *(&raw mut ROOTS_STACK) }, grants);
+    ferros_sys::thread_spawn(client_thread, unsafe { &mut *(&raw mut CLIENT_STACK) }, grants);
     start_fresh_mark(grants, w / 3);
     a.retint();
     a.all();
@@ -3040,9 +3157,9 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             a.light(key, false);
             publish_fresh_text(&a.handle[..a.len], true);
         }
-        // Following the identity service's verdict while the identity is looked up or joined: about four times a second.
+        // Following the identity service's verdict while the identity is looked up or joined: `client_thread`'s copy, read when it moved (no call here).
         polls += 1;
-        let followed = polls % 64 == 0 && !a.net_open() && a.follow_client();
+        let followed = !a.net_open() && a.follow_client();
         if polls % 64 == 0 && a.net_open() && a.net_poll() {
             a.show();
         }
