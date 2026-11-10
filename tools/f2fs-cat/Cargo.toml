@@ -1,0 +1,10 @@
+[package]
+name = "f2fs-cat"
+version = "0.1.0"
+edition = "2024"
+description = "Host side: list and copy files out of an f2fs image through ferros_f2fs (the reader the kernel uses), for a phone's persist backup"
+
+[workspace]
+
+[dependencies]
+ferros_f2fs = { path = "../../ferros_f2fs" }
