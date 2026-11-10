@@ -33,6 +33,8 @@ ihi = { path = "../../ihi", default-features = false }
 vsf = { path = "../../vsf", default-features = false, features = ["crypto-verify"] }
 # A kist's declared wants (KISTS.md), checked at every launch from the vault.
 ferros_kist = { path = "../ferros_kist" }
+# The zone's rule: standard and legal offsets and the next change (owner, 2026-11-10)
+ferros_tz = { path = "../ferros_tz" }
 
 [build-dependencies]
 # Rasterises the "Ready?" gate text at build time (no font engine in the kernel).

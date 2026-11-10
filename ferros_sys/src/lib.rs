@@ -355,19 +355,25 @@ pub fn pet() {
 pub struct Facts(pub [u64; 88]);
 
 /// Local wall time: (seconds since 1970 in local time — UTC plus the zone, `device.tz` — and the counter ticks into the current second), or None until the kernel has read the PMIC's clock. From the kernel's base (facts 8, 9) and this process's own counter.
-/// The time zone as the kernel last handed it (preferences bytes 24-31): seconds east of UTC.
+/// The zone's two offsets as the kernel last handed them (preferences bytes 24-31, kernel rtc.rs `packed`): (standard, legal), seconds east of UTC. Legal is daylight time while it is in effect; without a zone's rule (a manual offset) the two are the same.
+pub fn zone_offsets() -> (i64, i64) {
+    let v = unsafe { core::ptr::read_volatile((arc_base() + PREFS + 24) as *const u64) };
+    (v as u32 as i32 as i64, (v >> 32) as u32 as i32 as i64)
+}
+
+/// The offset the device's base shows (owner, 2026-11-10): arabic the legal one, matching the wall clocks, daylight time and all; dozenal and hex the zone's standard offset all year, never daylight time, so their date can differ from arabic's for an hour of the day in daylight season.
 pub fn zone() -> i64 {
-    unsafe { core::ptr::read_volatile((arc_base() + PREFS + 24) as *const u64) as i64 }
+    let (standard, legal) = zone_offsets();
+    if device_base() == 10 { legal } else { standard }
 }
 
 pub fn local_time() -> Option<(i64, u64)> {
     // From the preferences block (bytes 16-31, the kernel's PREF_WALL): no syscall — the first version asked SYS_FACTS on every frame, and facts samples the battery gauge over I2C under the kernel lock (it hung the kernel, 2026-10-23).
-    let at = arc_base() + PREFS + 16;
-    let rd = |o: u64| unsafe { core::ptr::read_volatile((at + o) as *const u64) };
-    let (base, tz) = (rd(0), rd(8) as i64);
+    let base = unsafe { core::ptr::read_volatile((arc_base() + PREFS + 16) as *const u64) };
     if base == 0 {
         return None;
     }
+    let tz = zone();
     let hz = freq();
     let t = base.wrapping_add(now());
     Some(((t / hz) as i64 + tz, t % hz))

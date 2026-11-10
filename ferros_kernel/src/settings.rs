@@ -27,6 +27,8 @@ pub const FIELDS: [(&str, usize); 11] = [
 ];
 /// The time zone: seconds east of UTC.
 const TZ: &str = "tz";
+/// The zone by its IANA id (owner, 2026-11-10: "Proper zone too"); its rule comes from the `zones` document (rtc.rs `resolve_zone`). With none, `tz` is the offset.
+const ZONE: &str = "zone";
 
 /// The radio knobs kept as device settings (docs/RADIO-CONTROLS.md): field name, link (the control blocks' order: 0 cellular, 1 WiFi, …), slot. Value knobs only: actions are counters and are never kept.
 pub const KNOBS: [(&str, usize, usize); 2] = [("wifi_power_save", 1, 1), ("wifi_band", 1, 2)];
@@ -39,7 +41,7 @@ fn schema() -> SectionSchema {
     for (name, _, _) in KNOBS {
         s = s.field(name, TypeConstraint::AnyUnsigned);
     }
-    s.field(TZ, TypeConstraint::AnySigned)
+    s.field(TZ, TypeConstraint::AnySigned).field(ZONE, TypeConstraint::AsciiText)
 }
 
 /// Eagle time now, in oscillations, from the RTC's base (0 until the RTC has been read: the document then says it was made at the epoch).
@@ -69,6 +71,10 @@ pub fn document(change: Option<(usize, u8)>) -> Option<Vec<u8>> {
     }
     let tz = crate::rtc::TZ.load(core::sync::atomic::Ordering::Relaxed);
     b = b.set(TZ, VsfType::i(tz as isize)).ok()?;
+    let zone = crate::rtc::zone_id();
+    if !zone.is_empty() {
+        b = b.set(ZONE, VsfType::a(vsf::Ascii::from_bytes(zone)?)).ok()?;
+    }
     // A knob still unset (all ones) is left out: absent means the driver's own default.
     for (name, link, slot) in KNOBS {
         let v = crate::process::CONTROL[link][slot].load(core::sync::atomic::Ordering::Relaxed);
@@ -101,6 +107,11 @@ pub fn apply(doc: &[u8], held: bool) -> Option<usize> {
         if let Some(v) = first(name).and_then(|v| v.as_u64()) {
             crate::process::CONTROL[link][slot].store(v, core::sync::atomic::Ordering::Relaxed);
             crate::process::CONTROL_GEN[link].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            n += 1;
+        }
+    }
+    if let Some(VsfType::a(z)) = first(ZONE) {
+        if crate::rtc::set_zone(z.as_bytes()) {
             n += 1;
         }
     }

@@ -1867,6 +1867,7 @@ pub fn run(mut b: Boot) -> ! {
         // The wall clock, re-read hourly (rtc.rs), and the battery gauge every two seconds: both on this core, never inside a syscall.
         platform::crumb(0xD6);
         crate::rtc::poll();
+        crate::rtc::resolve_zone(&mut store);
         gauge_poll();
         power_poll();
         // The heap's second region, 2 s in (main.rs heap2_join: its line invalidation kept off the boot path).
@@ -2652,7 +2653,9 @@ pub fn run(mut b: Boot) -> ! {
                     let text = core::str::from_utf8(rest).unwrap_or("");
                     let mut it = text.split_whitespace();
                     let (name, val) = (it.next().unwrap_or(""), it.next().and_then(|v| v.parse::<i64>().ok()));
+                    // `diag "pref zone <IANA id>"`: the zone by its id (its rule from the vault's `zones` document at the next pass).
                     let ok = match (name, val) {
+                        ("zone", _) => it.clone().count() == 0 && crate::rtc::set_zone(text.split_whitespace().nth(1).unwrap_or("").as_bytes()),
                         ("tz", Some(z)) if z.abs() < 86_400 => {
                             crate::rtc::set_tz(z);
                             true

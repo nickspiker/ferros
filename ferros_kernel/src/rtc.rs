@@ -15,15 +15,105 @@ pub static READ_AT: AtomicU64 = AtomicU64::new(0);
 /// The local time zone, seconds east of UTC (the settings document's `tz`, settings.rs; absent = 0).
 pub static TZ: AtomicI64 = AtomicI64::new(0);
 
-/// A new zone: kept and handed to every process with the base.
+/// A new manual offset (used when no zone is set, or its rule is not found): kept and handed to every process with the base.
 pub fn set_tz(secs: i64) {
     TZ.store(secs, Ordering::Relaxed);
-    crate::process::set_wall(BASE.load(Ordering::Relaxed), secs);
+    crate::process::set_wall(BASE.load(Ordering::Relaxed), packed());
 }
 /// The same with the kernel lock held (the store command runs under it).
 pub fn set_tz_held(secs: i64) {
     TZ.store(secs, Ordering::Relaxed);
-    crate::process::set_wall_held(BASE.load(Ordering::Relaxed), secs);
+    crate::process::set_wall_held(BASE.load(Ordering::Relaxed), packed());
+}
+
+/// The zone (owner, 2026-11-10: "arabic needs to match wall clock with DST legal, dozenal stays"; "Proper zone too"): its IANA id as the settings name it (`zone`), its rule once read from the `zones` document in the vault (tools/tzvsf), and whether that read is still to do (`resolve_zone`, from the service loop, which holds the store).
+static mut ZONE_ID: ([u8; 64], usize) = ([0; 64], 0);
+static mut RULE: Option<ferros_tz::Rule> = None;
+static ZONE_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The next instant (Unix seconds) the legal offset changes, 0 for none: the deadline `poll` acts on.
+static NEXT: AtomicI64 = AtomicI64::new(0);
+
+/// The zone's id as set, empty for none.
+pub fn zone_id() -> &'static [u8] {
+    unsafe {
+        let z = &*(&raw const ZONE_ID);
+        &z.0[..z.1]
+    }
+}
+
+/// A zone set by its id: kept, and its rule read at the service loop's next pass. An id longer than the slot is not a zone tzdata has (the longest is 30 bytes).
+pub fn set_zone(id: &[u8]) -> bool {
+    if id.len() > 64 || !id.iter().all(|&b| b.is_ascii_graphic()) {
+        return false;
+    }
+    unsafe {
+        let z = &mut *(&raw mut ZONE_ID);
+        z.0[..id.len()].copy_from_slice(id);
+        z.1 = id.len();
+        RULE = None;
+    }
+    ZONE_PENDING.store(true, Ordering::Release);
+    true
+}
+
+/// Unix seconds now, from the base; None until the RTC has been read.
+fn utc_now() -> Option<i64> {
+    let base = BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return None;
+    }
+    let (f, now) = (crate::platform::cntfrq(), crate::platform::cntpct());
+    Some((base.wrapping_add(now) / f) as i64)
+}
+
+/// The two offsets in the processes' one wall slot (preferences bytes 24-31; the page has no room for another: the ihi follows at 32): the standard offset in the low 32 bits, the legal one (daylight time while in effect) in the high 32, each seconds east of UTC. With no zone's rule, both are the manual offset. Sets `NEXT` to the legal offset's next change.
+fn packed() -> i64 {
+    let (s, l) = match (unsafe { RULE }, utc_now()) {
+        (Some(r), Some(t)) => {
+            let n = r.at(t);
+            NEXT.store(n.next.unwrap_or(0), Ordering::Relaxed);
+            (n.standard, n.legal)
+        }
+        _ => {
+            NEXT.store(0, Ordering::Relaxed);
+            let z = TZ.load(Ordering::Relaxed) as i32;
+            (z, z)
+        }
+    };
+    (s as u32 as u64 | (l as u32 as u64) << 32) as i64
+}
+
+/// From the service loop, with the store: a zone set and not yet read gets its rule from the `zones` document (one `zone` section per zone: `id`, `rule`), and every process its offsets.
+pub fn resolve_zone(store: &mut Option<crate::vault_boot::ShimStore>) {
+    if !ZONE_PENDING.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let id = zone_id();
+    let doc = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("zones").ok().flatten()));
+    let rule = doc.as_deref().and_then(|d| zone_rule(d, id));
+    unsafe { RULE = rule };
+    crate::flashlog::line(&alloc::format!("zone {}: {}", core::str::from_utf8(id).unwrap_or("?"), match (doc.is_some(), rule.is_some()) {
+        (_, true) => "its rule read",
+        (true, false) => "not in the zones document; the manual offset stands",
+        (false, false) => "no zones document in the vault; the manual offset stands",
+    }));
+    crate::process::set_wall(BASE.load(Ordering::Relaxed), packed());
+}
+
+/// The rule of zone `id` in a `zones` document.
+fn zone_rule(doc: &[u8], id: &[u8]) -> Option<ferros_tz::Rule> {
+    use vsf::types::VsfType;
+    let (header, end) = vsf::file_format::VsfHeader::decode(doc).ok()?;
+    for s in header.sections(doc, end).ok()? {
+        let text = |name: &str| s.get_field(name).and_then(|f| f.values.first()).and_then(|v| match v {
+            VsfType::a(a) => Some(a.as_bytes().to_vec()),
+            _ => None,
+        });
+        if s.name == "zone" && text("id").as_deref() == Some(id) {
+            return ferros_tz::Rule::parse(core::str::from_utf8(&text("rule")?).ok()?);
+        }
+    }
+    None
 }
 
 /// The RTC's fields: (year, month 1-12, day 1-31, hour, minute, second).
@@ -72,13 +162,17 @@ pub fn sync() -> Result<u64, u32> {
     let base = (unix * f).wrapping_sub(now);
     BASE.store(base, Ordering::Release);
     READ_AT.store(now, Ordering::Relaxed);
-    crate::process::set_wall(base, TZ.load(Ordering::Relaxed));
+    crate::process::set_wall(base, packed());
     Ok(unix)
 }
 
-/// From the service loop: the first read, then one an hour.
+/// From the service loop: the first read, then one an hour; and at the zone's next change (a known instant, not a poll of anything), the offsets again.
 pub fn poll() {
     let (f, now) = (crate::platform::cntfrq(), crate::platform::cntpct());
+    let next = NEXT.load(Ordering::Relaxed);
+    if next != 0 && utc_now().is_some_and(|t| t >= next) {
+        crate::process::set_wall(BASE.load(Ordering::Relaxed), packed());
+    }
     if BASE.load(Ordering::Relaxed) == 0 || now.wrapping_sub(READ_AT.load(Ordering::Relaxed)) > 3600 * f {
         if sync().is_err() {
             // Try again in a minute rather than on every pass.
