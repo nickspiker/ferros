@@ -2343,15 +2343,15 @@ impl Map {
                 let f = self.fleet;
                 'fleet: {
                 // A sibling asking to leave: the request alone, nothing else on the page until it is answered (owner, 2026-11-10: "curious why there's so many buttons on that screen", and "it's a bit vague").
-                if let (Some(3), Some((intent, result))) = (f.state, f.depart) {
+                if let (Some(3), Some((_, result))) = (f.state, f.depart) {
                     let name = core::str::from_utf8(&f.depart_name[..f.depart_name_n]).unwrap_or("");
                     b.text(cx, y, (uu(3, 2)) as u16, white(), 1, if name.is_empty() { "one of your devices" } else { name });
                     y += uu(2, 1);
-                    row(self, b, &mut y, small, white(), if intent == 1 { "is asking your fleet for its release, to a new owner" } else { "is asking your fleet for its release" }, None);
+                    row(self, b, &mut y, small, white(), "is asking your fleet for its release", None);
                     match result {
                         0 | 3 => {
-                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "approve: your things are wiped from it and it restarts");
-                            b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "deny: it stays in your fleet");
+                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "approving wipes it and frees its hardware to join any fleet");
+                            b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "denying keeps it in your fleet");
                             y += uu(3, 1);
                             button(self, b, &mut y, if result == 3 { "approve again: the last one did not go out" } else { "approve" }, false, Some(Choice::FleetApprove));
                             button(self, b, &mut y, "deny", false, Some(Choice::FleetDeny));

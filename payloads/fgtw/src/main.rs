@@ -1514,7 +1514,8 @@ impl Client {
                 return;
             }
             Some(Frame::Pong { key, .. }) => {
-                if let Some(s) = self.sponsors.iter_mut().find(|s| s.key == key) {
+                if let Some(i) = self.sponsors.iter().position(|s| s.key == key) {
+                    let s = &mut self.sponsors[i];
                     s.heard_us = t;
                     if !s.online {
                         s.online = true;
@@ -1523,6 +1524,8 @@ impl Client {
                         self.log.put(b" answers our pings");
                         self.log.line();
                     }
+                    // A departure it has not taken yet (its hand-off given up on, or never made): handed now that it answers.
+                    self.depart_hand(i);
                 }
                 return;
             }
@@ -1713,6 +1716,10 @@ impl Client {
                                 self.log.addr(&to);
                                 self.log.put(b" was given up on");
                                 self.log.line();
+                                // A departure to that device is handed again at its next answer (`Pong`): the desktop restarted 14 s before one arrived, and with no retry it never saw it (2026-11-10).
+                                for s in self.sponsors.iter_mut().filter(|s| s.addr.fam == to.fam && s.addr.ip == to.ip && s.addr.port == to.port) {
+                                    s.depart_t = 0;
+                                }
                             }
                         }
                     }
