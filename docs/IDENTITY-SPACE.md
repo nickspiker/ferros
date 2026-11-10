@@ -17,12 +17,13 @@ One set of typed facts per person (fgtw::space, ferros's vocabulary in ferros_sp
 | VIEW | scope | x, y, turn | `map.view` |
 | HOME_SYNC | a device key | on or off | none: set from the Fleet page |
 | ZONE | the fleet | automatic, and the zone by hand (an IANA id) | none: the identity service writes it to the kernel of each device that follows it (docs/TIME.md); chosen on the clock page |
+| LANG | the fleet | the language (`wl`, its ISO 639-3 code) | none: the identity service writes it to the kernel of each device that follows it (SETTINGS.md); chosen on the language page |
 
 The scope of a place and the view is the fleet's on every device whose home-screen sync is on (the default) and the device's own key on one switched off, so that device keeps its own arrangement, and gets it back after its own reset too. Kists, answers and defaults always follow the person.
 
 Not in it: device firmware (below), the wallpaper (made per device, VAULT-OUT.md "First use"), the identity's roots (identity_not_on_disk_default), anything of a kist's own domain (its data syncs, if ever, as the kist's own business).
 
-Next to add when they exist: the language, the WiFi networks (`wifi.cred`; a credential carried by the space reaches a device only once it is online some other way: cellular, or a sibling over Bluetooth).
+Next to add when they exist: the WiFi networks (`wifi.cred`; a credential carried by the space reaches a device only once it is online some other way: cellular, or a sibling over Bluetooth).
 
 ## Conflicts
 
