@@ -2164,6 +2164,8 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
             }
             // The network page while joined: the list from before the join (no scan runs while serving), JOIN refused with 3 (joined already; another network is a later change), and the status.
             Some(4) => m.scan_reply(false, &mut out),
+            // WATCH while joined: the list from before the join, and the last (no scan runs while serving).
+            Some(7) => watch_reply(m, false, false, &mut out),
             Some(5) => {
                 out[0] = 3;
                 1
@@ -2498,7 +2500,36 @@ fn connect(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
     }
 }
 
-/// Before any join (`connect`), the network page's requests on `wlan`, beside the vault looked at four times a second: 3 the MAC (not linked), 4 SCAN ([4, 1] starts a scan unless one runs, [4] reads the list; the reply is the list so far, the last scan's until this one ends, `scan_reply`), 5 JOIN ([5, name length, name, passphrase]: kept in the vault, then joined), 6 STATUS (`status_reply`). The radio sends nothing until asked: no scan runs unless the page asks for one or a kept credential is waiting for its network. Returns a credential to join and, for one handed in, the vault key it was kept under. `skip`: the vault's credential that last failed; it is tried again once a scan sees its network.
+
+/// The network page's list as last answered to a WATCH (op 7), counted: moved on each time the list or its scanning flag changes, kept across a join that failed so a page waiting from before it is answered at once after.
+static PAGE_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// WATCH's reply: [count u32 LE][1 more will come, 0 this is the last (joined: no scan runs while serving)][SCAN's reply (`scan_reply`)].
+fn watch_reply(m: &Msgbuf, scanning: bool, live: bool, out: &mut [u8]) -> usize {
+    out[..4].copy_from_slice(&PAGE_GEN.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
+    out[4] = live as u8;
+    5 + m.scan_reply(scanning, &mut out[5..])
+}
+
+/// The list's count moved on when it differs from the one last answered (`last`).
+fn watch_count(m: &Msgbuf, scanning: bool, last: &mut Vec<u8>) {
+    let mut b = [0u8; 2048];
+    let n = m.scan_reply(scanning, &mut b);
+    if b[..n] != last[..] {
+        *last = b[..n].to_vec();
+        PAGE_GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Every held WATCH answered with the list as it stands: when it changed, and before the page loop leaves for a join (a held call nobody answers keeps its caller waiting for good; it calls again, and that call waits in the endpoint while the join runs).
+fn watch_answer(d: &Drv, m: &Msgbuf, scanning: bool, held: &mut Vec<[u8; 32]>) {
+    let mut out = [0u8; 2048];
+    let len = watch_reply(m, scanning, true, &mut out);
+    for tok in core::mem::take(held) {
+        svc(3, tok.as_ptr() as u64 - d.base, out.as_ptr() as u64 - d.base, len as u64, 0, 0);
+    }
+}
+/// Before any join (`connect`), the network page's requests on `wlan`, beside the vault looked at four times a second: 3 the MAC (not linked), 4 SCAN ([4, 1] starts a scan unless one runs, [4] reads the list; the reply is the list so far, the last scan's until this one ends, `scan_reply`), 5 JOIN ([5, name length, name, passphrase]: kept in the vault, then joined), 6 STATUS (`status_reply`), 7 WATCH (the page's held call: the list when it changes, `watch_reply`). The radio sends nothing until asked: no scan runs unless a page watches (one after another while it does) or a kept credential is waiting for its network. Returns a credential to join and, for one handed in, the vault key it was kept under. `skip`: the vault's credential that last failed; it is tried again once a scan sees its network.
 fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, skip: &Option<(Vec<u8>, Vec<u8>, &'static [u8])>) -> (Vec<u8>, Vec<u8>, &'static [u8], bool) {
     d.put(b"no network to join: serving the network page\n");
     d.flush();
@@ -2511,6 +2542,10 @@ fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, skip: &Option<(Vec<u8>, Vec<u8>, 
     let mut tok = [0u8; 32];
     let mut vault_at = 0u64;
     let mut scanning = false;
+    // WATCH calls held until the list changes, and the list as last answered.
+    let mut held: Vec<[u8; 32]> = Vec::new();
+    let mut held_gen = 0u32;
+    let mut last: Vec<u8> = Vec::new();
     // A kept credential that did not join is looked for again after `m.retry_s`, which doubles at each try that finds its network (`connect`).
     let mut retry_at = d.now() + m.retry_s * d.freq;
     loop {
@@ -2524,6 +2559,7 @@ fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, skip: &Option<(Vec<u8>, Vec<u8>, 
                     if m.retry_s < 1 << 10 {
                         m.retry_s <<= 1;
                     }
+                    watch_answer(d, m, scanning, &mut held);
                     return (name.clone(), pass.clone(), key, false);
                 }
             }
@@ -2533,12 +2569,20 @@ fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, skip: &Option<(Vec<u8>, Vec<u8>, 
             escan_start(d, m);
             scanning = true;
         }
+        // The page's held WATCH calls answered once the list moved (a network found, a scan begun or ended).
+        if !held.is_empty() {
+            watch_count(m, scanning, &mut last);
+            if PAGE_GEN.load(core::sync::atomic::Ordering::Relaxed) != held_gen {
+                watch_answer(d, m, scanning, &mut held);
+            }
+        }
         if d.now().wrapping_sub(vault_at) >= d.freq / 4 {
             vault_at = d.now();
             if let Some(c) = stored_cred(d) {
                 if skip.as_ref() != Some(&c) {
                     d.put(b"network credential readable: joining\n");
                     d.flush();
+                    watch_answer(d, m, scanning, &mut held);
                     return (c.0, c.1, c.2, false);
                 }
             }
@@ -2551,13 +2595,32 @@ fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, skip: &Option<(Vec<u8>, Vec<u8>, 
         let msg = unsafe { core::ptr::read_volatile(&msg) };
         let n = n as usize;
         let mut handed = None;
+        // 7 WATCH [count u32 LE]: the page's held call (owner, 2026-11-10: no scan button, the list filling as networks are found). Answered at once when the list differs from the caller's count (u32::MAX at the page's opening, never a count given), else held until it changes; a WATCH with nothing new to say starts the next scan, so scans run back to back while a page waits and stop when it closes (it calls no more).
+        if msg.first() == Some(&7) && n >= 5 {
+            let theirs = u32::from_le_bytes([msg[1], msg[2], msg[3], msg[4]]);
+            watch_count(m, scanning, &mut last);
+            let now_gen = PAGE_GEN.load(core::sync::atomic::Ordering::Relaxed);
+            // WHY the cap: callers are other processes, each held call keeps 32 bytes until the list moves; the page holds one, and past 4 a caller is answered at once with what there is.
+            if theirs != now_gen || held.len() >= 4 {
+                let len = watch_reply(m, scanning, true, &mut out);
+                svc(3, tok.as_ptr() as u64 - d.base, out.as_ptr() as u64 - d.base, len as u64, 0, 0);
+            } else {
+                if !scanning {
+                    escan_start(d, m);
+                    scanning = true;
+                }
+                held.push(tok);
+                held_gen = now_gen;
+            }
+            continue;
+        }
         let len = match msg.first() {
             Some(3) => {
                 out[..6].copy_from_slice(&m.mac);
                 out[6] = 0;
                 7
             }
-            // [4, 1] starts a scan (unless one runs), [4] or [4, 0] only reads the list: the page asks for one scan and polls.
+            // [4, 1] starts a scan (unless one runs), [4] or [4, 0] only reads the list (the page watches instead, op 7).
             Some(4) => {
                 if n >= 2 && msg[1] == 1 && !scanning {
                     escan_start(d, m);
@@ -2598,6 +2661,7 @@ fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, skip: &Option<(Vec<u8>, Vec<u8>, 
         if let Some((name, pass, key)) = handed {
             d.put(b"a network handed in by the page: joining\n");
             d.flush();
+            watch_answer(d, m, scanning, &mut held);
             return (name, pass, key, true);
         }
     }

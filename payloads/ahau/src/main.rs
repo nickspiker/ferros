@@ -262,6 +262,77 @@ fn client_take(seen: u32) -> Option<(u32, ClientCopy)> {
         }
     }
 }
+
+/// The network page's list comes from a thread of its own (`wlan_thread`), never a call from the screen (owner, 2026-11-10: no scan button, the list filling as networks are found). NET_WANT: 0 while the page is closed, else which opening of it this is (NET_OPENS counts them), so a list from an earlier opening is never shown.
+static NET_WANT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static NET_OPENS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The list as the WiFi driver last answered (SCAN's reply: [scanning, count, networks...]) and its length, under a sequence count (odd while it is written).
+static NETS_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static mut NETS_COPY: ([u8; 1 << 11], usize) = ([0; 1 << 11], 0);
+static mut WLAN_STACK: [u8; 1 << 15] = [0; 1 << 15];
+
+/// The WiFi driver's WATCH (payloads/pcie1 op 7), held while the network page is open: answered when the list changes (a network found, a scan begun or ended), and a WATCH with nothing new starts the driver's next scan, so it scans only while this page waits. The driver answering "the last" (joined: it scans no more) ends the watch for this opening.
+extern "C" fn wlan_thread(grants: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    let svc = cap(grants, S_WLAN);
+    let mut count = u32::MAX;
+    let (mut opened, mut done) = (0u64, 0u64);
+    let mut absent = freq() >> 6;
+    loop {
+        let w = NET_WANT.load(Ordering::Acquire);
+        if w == 0 || w == done {
+            ferros_sys::wait_world(&NET_WANT, w, 0);
+            continue;
+        }
+        // A new opening: u32::MAX is never a count the driver has given, so its first WATCH is answered at once with the list as it stands.
+        if w != opened {
+            opened = w;
+            count = u32::MAX;
+        }
+        let mut m = [7u8, 0, 0, 0, 0];
+        m[1..].copy_from_slice(&count.to_le_bytes());
+        let mut out = [0u8; 1 << 11];
+        let n = ferros_sys::call_live(svc, &m, &mut out);
+        // The driver not serving the page yet (its chip coming up, or a join running) or one without WATCH (a reply of no bytes).
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 7 {
+            absent_wait(&mut absent);
+            continue;
+        }
+        absent = freq() >> 6;
+        count = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+        if out[4] == 0 {
+            done = w;
+        }
+        // The page closed (or opened again) while the call was held: this list is not that page's.
+        if NET_WANT.load(Ordering::Acquire) != w {
+            continue;
+        }
+        // WHY the min: the reply's length is the driver's word; the list is kept only as far as the buffer took it.
+        let k = (n as usize).min(out.len()) - 5;
+        NETS_SEQ.fetch_add(1, Ordering::AcqRel);
+        unsafe {
+            let c = &mut *(&raw mut NETS_COPY);
+            c.0[..k].copy_from_slice(&out[5..5 + k]);
+            c.1 = k;
+        }
+        NETS_SEQ.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// The list `wlan_thread` last published and its sequence count, read whole (again if it was being written); None when it has not moved from `seen`.
+fn nets_take(seen: u32) -> Option<(u32, ([u8; 1 << 11], usize))> {
+    use core::sync::atomic::Ordering;
+    loop {
+        let s0 = NETS_SEQ.load(Ordering::Acquire);
+        if s0 == seen {
+            return None;
+        }
+        let v = unsafe { *(&raw const NETS_COPY) };
+        if s0 & 1 == 0 && NETS_SEQ.load(Ordering::Acquire) == s0 {
+            return Some((s0, v));
+        }
+    }
+}
 /// Grant slot 9: the identity unlock right (SYS_UNLOCK, AUTH.md): the person's space opens from the seed, before the proof.
 const S_UNLOCK: u64 = 9;
 /// Slot 10: a second surface, the keyboard's back buffer: a board that a key's tap will redraw (shift, a page, a layout) is drawn there whole while the finger is down and copied in at the lift (`prepare`), as the mark's frame is rendered ahead by its thread. Without it the lift redrew the board in place, 59 ms (2026-11-01: draw 14, the key map 37, the tint 8), and the shift showed a few frames late.
@@ -577,6 +648,8 @@ struct Ahau {
     /// The identity service's pairing words while this device joins its identity's fleet.
     word_buf: [u8; 512],
     word_len: usize,
+    /// `wlan_thread`'s list last taken (its sequence count).
+    nets_seen: u32,
     /// The back surface's base (0: none granted, the board is drawn in place), where boards are drawn and tinted before they show; which board each slot of BOARDS holds, and the slot on show.
     back: u64,
     boards: core::cell::Cell<[Option<BoardKey>; 2]>,
@@ -780,7 +853,6 @@ impl Ahau {
             Mode::Mint(_) => Some("mint"),
             Mode::Wrong | Mode::Owned => Some("start over"),
             Mode::Words(_) => Some("cancel"),
-            Mode::Networks if !self.joining => Some("scan"),
             Mode::Networks if self.joining => Some("joining"),
             // Only a network this device can join (WPA2-PSK outside 6 GHz) gets a join.
             Mode::Pass if self.net_found().is_some_and(|f| f.1 & 1 != 0) => Some("join"),
@@ -1398,7 +1470,7 @@ impl Ahau {
         matches!(self.mode, Mode::Networks | Mode::Pass)
     }
 
-    /// The network page pulled down over the screen: the mode under it and the handle as typed are kept for its closing; one scan is asked for.
+    /// The network page pulled down over the screen: the mode under it and the handle as typed are kept for its closing; `wlan_thread` watches the driver's list from now until it closes.
     fn net_pull(&mut self) {
         if self.net_open() || matches!(self.mode, Mode::Words(_) | Mode::Hosting) {
             return;
@@ -1409,12 +1481,15 @@ impl Ahau {
         self.mode = Mode::Networks;
         self.joining = false;
         self.nets_len = 0;
-        self.net_scan();
+        NET_WANT.store(NET_OPENS.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1, core::sync::atomic::Ordering::Release);
+        ferros_sys::wake(&NET_WANT, 1);
         self.all();
     }
 
     /// The network page closed: the screen under it back as it was, the handle as typed.
     fn net_close(&mut self) {
+        // The watch ends: `wlan_thread` calls no more, so the driver scans no more.
+        NET_WANT.store(0, core::sync::atomic::Ordering::Release);
         self.zero_text();
         (self.handle, self.len, self.chars, self.caret) = self.stash;
         for b in self.stash.0.iter_mut() {
@@ -1592,11 +1667,8 @@ impl Ahau {
         self.net_redraw(e);
         match e {
             0 if self.mode == Mode::Pass => self.net_join(),
-            0 if self.mode == Mode::Networks => {
-                if !self.joining {
-                    self.net_scan();
-                }
-            }
+            // The list fills by itself (`wlan_thread`); while a join runs the button says so and does nothing.
+            0 if self.mode == Mode::Networks => {}
             // The attest screen's own button (bind, unlock, mint, start over, cancel).
             0 => {
                 self.attest();
@@ -1727,19 +1799,13 @@ impl Ahau {
         self.status(core::str::from_utf8(l.as_bytes()).unwrap_or(""));
     }
 
-    /// A scan asked of the WiFi driver ([4, 1]), and the list as it stands.
-    fn net_scan(&mut self) {
-        self.net_ask(&[4, 1]);
-    }
-
-    /// SCAN asked (`q`): the reply kept and drawn when it changed. A driver not answering yet (starting, or busy joining) leaves the list as it was.
-    fn net_ask(&mut self, q: &[u8]) -> bool {
-        let mut out = [0u8; 1 << 11];
-        let n = ferros_sys::call_live(cap(self.grants, S_WLAN), q, &mut out);
-        if n == ferros_sys::ERR || n < 2 {
+    /// The list as `wlan_thread` last published it, kept and drawn when it changed (no call here). Until the driver first answers, the page stays as it was ("The WiFi is starting.").
+    fn net_take(&mut self) -> bool {
+        let Some((seq, (out, n))) = nets_take(self.nets_seen) else { return false };
+        self.nets_seen = seq;
+        if n < 2 {
             return false;
         }
-        let n = n as usize;
         if n == self.nets_len && out[..n] == self.nets[..n] {
             return false;
         }
@@ -1802,14 +1868,11 @@ impl Ahau {
         }
     }
 
-    /// The page's poll (about four times a second): while a join runs, its outcome (the data link up closes the page; the driver answering STATUS again with no link means it failed); otherwise the list, while a scan fills it.
+    /// The page's turn of the main loop: while a join runs, its outcome (the data link up closes the page; the driver answering STATUS again with no link means it failed); otherwise the list as `wlan_thread` last had it.
     fn net_poll(&mut self) -> bool {
         if !self.joining {
-            // No answer yet (owner, 2026-11-09: "I waited there for a minute, then I pressed scan and it immediately populated"): the driver was not serving `wlan` yet when the page asked (it serves once its chip is up and any kept network joined), so the scan is asked for again each poll until it answers; then the list is read while its scan runs.
-            if self.nets_len == 0 {
-                return self.net_ask(&[4, 1]);
-            }
-            return self.nets[0] == 1 && self.net_ask(&[4]);
+            // The driver's list as `wlan_thread` has it: a page opened before the driver serves fills the moment it does (owner, 2026-11-09: "I waited there for a minute, then I pressed scan and it immediately populated").
+            return self.net_take();
         }
         // While it joins, the driver answers nothing (a call would hold this screen until the join ended): its WiFi link's measures in the facts say how it goes. STATE 2: joined (the page closes; the address follows). JOIN 1-3: it failed, and why.
         let f = ferros_sys::facts();
@@ -2867,11 +2930,13 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, roots_gen: 0, client_seen: 0, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0) };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, roots_gen: 0, client_seen: 0, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, nets_seen: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0) };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     // The identity service's two threads (`roots_thread`, `client_thread`): both sleep until a handle is typed.
     ferros_sys::thread_spawn(roots_thread, unsafe { &mut *(&raw mut ROOTS_STACK) }, grants);
     ferros_sys::thread_spawn(client_thread, unsafe { &mut *(&raw mut CLIENT_STACK) }, grants);
+    // The network page's list (`wlan_thread`): it sleeps until the page opens.
+    ferros_sys::thread_spawn(wlan_thread, unsafe { &mut *(&raw mut WLAN_STACK) }, grants);
     start_fresh_mark(grants, w / 3);
     a.retint();
     a.all();
@@ -3160,7 +3225,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         // Following the identity service's verdict while the identity is looked up or joined: `client_thread`'s copy, read when it moved (no call here).
         polls += 1;
         let followed = !a.net_open() && a.follow_client();
-        if polls % 64 == 0 && a.net_open() && a.net_poll() {
+        // The network page: the list each pass (a copy, no call); a join's outcome from the facts about four times a second.
+        if a.net_open() && (!a.joining || polls % 64 == 0) && a.net_poll() {
             a.show();
         }
         if a.follow_layout() || no > 0 || followed {
