@@ -21,6 +21,7 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
 use core::fmt::Write;
 use ferros_sys::{call, cap, console, freq, now, sleep_until};
 use tatau::Style;
@@ -701,8 +702,16 @@ enum Choice {
     Switch(u8),
     /// A link's knob (docs/RADIO-CONTROLS.md): its link and slot in the control blocks (ferros_sys::control); a value knob goes round its choices, an action counts up.
     Knob(u8, u8),
-    /// The clock's zone, a quarter hour west (-1) or east (1).
+    /// The clock's fixed offset (no zone), a quarter hour west (-1) or east (1).
     Zone(i8),
+    /// The clock's zone (kernel zone.rs, docs/TIME.md): "follow my identity" turned over; the ruling choice automatic (true) or by hand; the picker opened, or one level back; a region in it (its index in the picker's regions); a zone (its index in the zones list); no zone, a fixed offset.
+    ZoneFollow,
+    ZoneAuto(bool),
+    ZonePicker,
+    ZoneBack,
+    ZoneRegion(u16),
+    ZoneCity(u16),
+    ZoneNone,
     /// The title: the page picker up or away.
     Picker,
     /// A page's title in the picker: that page.
@@ -1106,6 +1115,100 @@ struct Map {
     kists: ferros_kist::Kists,
     /// The first-launch question on an open kist circle: each unanswered want's switch as the person has it now, a bit per want (started from their defaults).
     ask: u64,
+    /// The clock page's zone picker while it is open (`ZonePick`), and the last word on a choice that did not take, shown until the next tap on the page.
+    zone_pick: Option<ZonePick>,
+    zone_note: Option<&'static str>,
+}
+
+/// The clock page's zone picker (owner, 2026-11-10: "auto/manual zone, picker, all that"): every zone's id as the kernel lists them (SYS_ZONE op 6, the zones document's order), browsed by region (the IANA id's first part: America, Europe, …) then by place. No typing: the map has no keyboard of its own (the attest screen hosts the one there is), so a list it is.
+struct ZonePick {
+    /// The list as the kernel gave it: each id its length, a byte, then its bytes.
+    raw: Vec<u8>,
+    /// Each id's place in `raw`: (start, length), in the list's order.
+    ids: Vec<(usize, usize)>,
+    /// The regions, in alphabetical order, each once.
+    regions: Vec<(usize, usize)>,
+    /// The region open, an index into `regions`; None: the regions are shown.
+    region: Option<usize>,
+}
+
+impl ZonePick {
+    /// The picker from the kernel's list; None when there is none (the zones document not on this device, or not read yet).
+    fn load() -> Option<ZonePick> {
+        let mut raw = alloc::vec![0u8; 1 << 13];
+        let mut n = ferros_sys::zone::list(&mut raw);
+        if n > raw.len() {
+            raw = alloc::vec![0u8; n];
+            n = ferros_sys::zone::list(&mut raw);
+        }
+        // WHY the second bound: the kernel answers the list's whole length, which can pass the buffer; read whole or not at all (a list cut short would end inside an id).
+        if n == 0 || n > raw.len() {
+            return None;
+        }
+        raw.truncate(n);
+        let mut ids = Vec::new();
+        let mut at = 0;
+        while at < raw.len() {
+            let len = raw[at] as usize;
+            ids.push((at + 1, len));
+            at += 1 + len;
+        }
+        let mut p = ZonePick { raw, ids, regions: Vec::new(), region: None };
+        let mut regions: Vec<(usize, usize)> = Vec::new();
+        for k in 0..p.ids.len() {
+            let r = p.region_of(k);
+            if !regions.iter().any(|&(s, l)| &p.raw[s..s + l] == r.as_bytes()) {
+                let (s, _) = p.ids[k];
+                regions.push((s, r.len()));
+            }
+        }
+        regions.sort_by(|a, b| p.raw[a.0..a.0 + a.1].cmp(&p.raw[b.0..b.0 + b.1]));
+        p.regions = regions;
+        Some(p)
+    }
+
+    fn id(&self, k: usize) -> &str {
+        let (s, l) = self.ids[k];
+        core::str::from_utf8(&self.raw[s..s + l]).unwrap_or("")
+    }
+
+    /// An id's region: its part before the first `/` (the whole id when it has none).
+    fn region_of(&self, k: usize) -> &str {
+        let id = self.id(k);
+        id.split('/').next().unwrap_or(id)
+    }
+
+    fn region(&self, r: usize) -> &str {
+        let (s, l) = self.regions[r];
+        core::str::from_utf8(&self.raw[s..s + l]).unwrap_or("")
+    }
+
+    /// The zones of region `r`, in alphabetical order of their places.
+    fn places(&self, r: usize) -> Vec<usize> {
+        let name = self.region(r);
+        let mut v: Vec<usize> = (0..self.ids.len()).filter(|&k| self.region_of(k) == name).collect();
+        v.sort_by(|&a, &b| self.id(a).cmp(self.id(b)));
+        v
+    }
+}
+
+/// A zone's id as a person reads it: the place without its region, its parts joined by commas and its underscores spaces ("America/Argentina/Buenos_Aires" → "Argentina, Buenos Aires"). The page's lines are short: written into a Line.
+fn zone_words(l: &mut Line, id: &str, with_region: bool) {
+    let mut parts = id.split('/');
+    if !with_region && id.contains('/') {
+        parts.next();
+    }
+    for (k, part) in parts.enumerate() {
+        if k > 0 {
+            l.s(", ");
+        }
+        for (j, piece) in part.split('_').enumerate() {
+            if j > 0 {
+                l.s(" ");
+            }
+            l.s(piece);
+        }
+    }
 }
 
 impl Map {
@@ -2569,23 +2672,142 @@ impl Map {
                         fact(b, &mut y, "time", "not read yet");
                     }
                 }
-                let mut l = Line::new();
-                l.s("UTC");
-                if zone != 0 {
-                    l.s(if zone < 0 { " - " } else { " + " });
-                    let _ = tatau::duration_ns(&mut l, f, zone.unsigned_abs() * 1_000_000_000, 1);
+                // An offset as the page writes it: UTC, then how far east (+) or west (-), in the device's base.
+                let utc = |l: &mut Line, s: i64| {
+                    l.s("UTC");
+                    if s != 0 {
+                        l.s(if s < 0 { " - " } else { " + " });
+                        let _ = tatau::duration_ns(l, f, s.unsigned_abs() * 1_000_000_000, 1);
+                    }
+                };
+                let st = ferros_sys::zone::state();
+                // The zone picker while it is open (Choice::ZonePicker): it alone under the time, the regions then a region's places. Taken out of the map while the page is laid out, put back after.
+                if let Some(pk) = self.zone_pick.take() {
+                    let ruling = st.map(|s| s.ruling().1);
+                    row(self, b, &mut y, small, white(), match pk.region {
+                        None => "choose a zone",
+                        Some(r) => pk.region(r),
+                    }, None);
+                    button(self, b, &mut y, "back", false, Some(Choice::ZoneBack));
+                    // A row of the list: drawn and tappable only on the page's band (a region holds over a hundred places, past the batch's room and the page's 64 tappable rows), its place on the page kept either way.
+                    let item = |m: &mut Map, b: &mut Batch, y: &mut i64, t: &str, on: bool, what: Choice| {
+                        if *y + uu(2, 1) > top && *y - uu(2, 1) < bottom {
+                            b.text(cx, *y, small as u16, if on { white() } else { grey() }, 1, t);
+                            if hit {
+                                m.push_row(cx - half, cx + half, *y - uu(2, 1), *y + uu(1, 1), what);
+                            }
+                        }
+                        *y += uu(3, 1);
+                    };
+                    match pk.region {
+                        None => {
+                            item(self, b, &mut y, "none: a fixed offset", ruling.is_some_and(|r| r.is_none()), Choice::ZoneNone);
+                            for r in 0..pk.regions.len() {
+                                let on = ruling.is_some_and(|z| z.as_str().split('/').next() == Some(pk.region(r)));
+                                item(self, b, &mut y, pk.region(r), on, Choice::ZoneRegion(r as u16));
+                            }
+                        }
+                        Some(r) => {
+                            for k in pk.places(r) {
+                                let mut l = Line::new();
+                                zone_words(&mut l, pk.id(k), false);
+                                item(self, b, &mut y, l.as_str(), ruling.is_some_and(|z| z.as_str() == pk.id(k)), Choice::ZoneCity(k as u16));
+                            }
+                        }
+                    }
+                    self.zone_pick = Some(pk);
+                } else {
+                    let (standard, legal) = ferros_sys::zone_offsets();
+                    match st {
+                        None => fact(b, &mut y, "zone", "this kernel names no zones"),
+                        Some(st) => {
+                            // The zone in effect, its two offsets (arabic shows the legal one, dozenal and hex the standard one all year), and where it comes from.
+                            let mut l = Line::new();
+                            if st.effective.is_none() {
+                                utc(&mut l, standard);
+                            } else {
+                                zone_words(&mut l, st.effective.as_str(), true);
+                            }
+                            fact(b, &mut y, "zone", l.as_str());
+                            if !st.effective.is_none() {
+                                let mut l = Line::new();
+                                utc(&mut l, standard);
+                                fact(b, &mut y, "standard", l.as_str());
+                                let mut l = Line::new();
+                                utc(&mut l, legal);
+                                l.s(if legal != standard { ", daylight time" } else { "" });
+                                fact(b, &mut y, "legal", l.as_str());
+                            }
+                            fact(b, &mut y, "from", match st.from {
+                                ferros_sys::zone::FROM_NETWORK => "the cellular network",
+                                ferros_sys::zone::FROM_POSITION => "GPS, the nearest place",
+                                ferros_sys::zone::FROM_HAND => "set by hand",
+                                _ => "a fixed offset",
+                            });
+                            if st.from == ferros_sys::zone::FROM_POSITION {
+                                b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "the zone whose principal place is nearest,");
+                                b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "until ferros has the zones' borders");
+                                y += uu(3, 1);
+                            }
+                            y += uu(1, 2);
+                            // Whose choice rules (owner, 2026-11-10: "it's per identity, you can uncheck and set per device tho"): the identity's, the same on all the person's devices that follow it, or this device's own.
+                            mark(self, b, &mut y, 50, "follow my identity", st.follow, Some(Choice::ZoneFollow));
+                            let says = match (st.follow, st.identity) {
+                                (false, _) => "off: this device keeps a zone of its own",
+                                (true, ferros_sys::zone::IDENTITY_NONE) => "your identity has no zone yet: set here, it becomes it",
+                                (true, _) => "set here, it changes on all your devices that follow it",
+                            };
+                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, says);
+                            y += uu(2, 1);
+                            let (auto, id) = st.ruling();
+                            radios(self, b, &mut y, &["automatic", "by hand"], if auto { 0 } else { 1 }, &|v| Choice::ZoneAuto(v == 0));
+                            if auto {
+                                b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "from the cellular network, then GPS;");
+                                b.text(cx, y + uu(1, 2), note as u16, dim(), 1, if matches!(st.from, ferros_sys::zone::FROM_HAND | ferros_sys::zone::FROM_OFFSET) { "nothing found yet: the zone below stands in" } else { "the zone below stands in until one is found" });
+                                y += uu(3, 1);
+                            }
+                            let mut l = Line::new();
+                            if id.is_none() {
+                                l.s("none: a fixed offset");
+                            } else {
+                                zone_words(&mut l, id.as_str(), true);
+                            }
+                            row(self, b, &mut y, small, white(), l.as_str(), None);
+                            button(self, b, &mut y, "choose a zone", false, Some(Choice::ZonePicker));
+                            if id.is_none() {
+                                button(self, b, &mut y, "a quarter hour east", false, Some(Choice::Zone(1)));
+                                button(self, b, &mut y, "a quarter hour west", false, Some(Choice::Zone(-1)));
+                            }
+                        }
+                    }
+                    if let Some(t) = self.zone_note {
+                        row(self, b, &mut y, note, white(), t, None);
+                    }
+                    y += uu(1, 2);
+                    b.text(cx, y, note as u16, dim(), 1, "sources");
+                    y += uu(2, 1);
+                    fact(b, &mut y, "from", "the PMIC's clock");
+                    fact(b, &mut y, "read", "at start, then hourly");
+                    // The network's word on the zone (NITZ and its country), as the kernel heard it; its time is not used yet.
+                    let mut l = Line::new();
+                    match st.filter(|s| s.mcc != 0) {
+                        Some(s) => {
+                            l.s("heard: MCC ");
+                            let _ = tatau::count(&mut l, f, s.mcc as u64, 1);
+                            if let Some(c) = s.country {
+                                l.s(", ");
+                                l.s(core::str::from_utf8(&c).unwrap_or("?"));
+                            }
+                        }
+                        None => {
+                            l.s("not heard yet");
+                        }
+                    }
+                    fact(b, &mut y, "network zone", l.as_str());
+                    fact(b, &mut y, "network time", "not used yet");
+                    fact(b, &mut y, "GPS time", "not used yet");
+                    fact(b, &mut y, "units", base_name(ferros_sys::device_base()));
                 }
-                fact(b, &mut y, "zone", l.as_str());
-                button(self, b, &mut y, "a quarter hour east", false, Some(Choice::Zone(1)));
-                button(self, b, &mut y, "a quarter hour west", false, Some(Choice::Zone(-1)));
-                y += uu(1, 2);
-                b.text(cx, y, note as u16, dim(), 1, "sources");
-                y += uu(2, 1);
-                fact(b, &mut y, "from", "the PMIC's clock");
-                fact(b, &mut y, "read", "at start, then hourly");
-                fact(b, &mut y, "network time", "not decoded yet");
-                fact(b, &mut y, "GPS time", "not used yet");
-                fact(b, &mut y, "units", base_name(ferros_sys::device_base()));
             }
             "about" => {
                 let f = ferros_sys::numbers(Style::Glyphs);
@@ -2785,6 +3007,27 @@ impl Map {
         let off = (t - rest) * (b - a) as f64;
         self.knob = if off.abs() >= 0.5 { Some((what, off, 0., 0)) } else { None };
     }
+    /// A zone choice made on the clock page (automatic, and the id by hand; empty: none, a fixed offset): the identity's while this device follows it, through its identity service (payloads/fgtw op 22: into the person's space, then to every device that follows it, this one first); else this device's own, straight to the kernel. What did not take is said on the page.
+    fn zone_choose(&mut self, auto: bool, id: &[u8]) {
+        let Some(st) = ferros_sys::zone::state() else { return };
+        if st.follow {
+            let mut m = Vec::with_capacity(2 + id.len());
+            m.push(22);
+            m.push(auto as u8);
+            m.extend_from_slice(id);
+            let mut r = [0u8; 8];
+            let n = ferros_sys::call_live(cap(self.grants, S_FGTW), &m, &mut r);
+            self.zone_note = match (n, r[0]) {
+                (ferros_sys::ERR | ferros_sys::NOTHING | 0, _) => Some("the identity service did not answer"),
+                (_, 0) => None,
+                (_, 1) => Some("your fleet has not answered yet: try again once it has"),
+                _ => Some("not a zone"),
+            };
+        } else if !ferros_sys::zone::set_device(cap(self.grants, S_SETTINGS), auto, id) {
+            self.zone_note = Some("the kernel did not take it");
+        }
+    }
+
     /// The brightness as the slider left it, kept in the vault (the drag applied it live, `set_pref_live`).
     fn brightness_kept(&self) {
         ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BRIGHTNESS, ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS));
@@ -3080,6 +3323,8 @@ impl Map {
                 if row != Some(Choice::FleetRemove) {
                     self.fleet.confirm = false;
                 }
+                // The clock's word on a zone choice that did not take stays until the next tap.
+                self.zone_note = None;
                 let set = |m: &Map, pref: u64, v: u8| {
                     ferros_sys::set_pref(cap(m.grants, S_SETTINGS), pref, v);
                 };
@@ -3205,6 +3450,51 @@ impl Map {
                         if (-12 * 3600..=14 * 3600).contains(&z) && !ferros_sys::control(cap(self.grants, S_SETTINGS), ctl::CLOCK, ctl::CLOCK_ZONE, z as u64) {
                             console(self.grants, b"map: the kernel did not take the zone\n");
                         }
+                    }
+                    // The zone (docs/TIME.md): who rules, automatic or by hand, and the picker's levels; a zone picked or none closes it.
+                    Some(Choice::ZoneFollow) => {
+                        if let Some(st) = ferros_sys::zone::state() {
+                            if !ferros_sys::zone::set_follow(cap(self.grants, S_SETTINGS), !st.follow) {
+                                self.zone_note = Some("the kernel did not take it");
+                            }
+                        }
+                    }
+                    Some(Choice::ZoneAuto(auto)) => {
+                        if let Some(st) = ferros_sys::zone::state() {
+                            let id = st.ruling().1;
+                            self.zone_choose(auto, id.as_bytes());
+                        }
+                    }
+                    Some(Choice::ZonePicker) => {
+                        self.zone_pick = ZonePick::load();
+                        if self.zone_pick.is_none() {
+                            self.zone_note = Some("no zones on this device yet (the zones document, tools/tzvsf)");
+                        }
+                        self.scroll = 0;
+                    }
+                    Some(Choice::ZoneBack) => {
+                        match self.zone_pick.as_mut() {
+                            Some(p) if p.region.is_some() => p.region = None,
+                            _ => self.zone_pick = None,
+                        }
+                        self.scroll = 0;
+                    }
+                    Some(Choice::ZoneRegion(r)) => {
+                        if let Some(p) = self.zone_pick.as_mut() {
+                            p.region = Some(r as usize);
+                        }
+                        self.scroll = 0;
+                    }
+                    Some(c @ (Choice::ZoneCity(_) | Choice::ZoneNone)) => {
+                        let id: Vec<u8> = match (c, self.zone_pick.as_ref()) {
+                            (Choice::ZoneCity(k), Some(p)) => p.id(k as usize).as_bytes().to_vec(),
+                            _ => Vec::new(),
+                        };
+                        // Picked by hand: the choice keeps whether it is automatic (the zone picked then stands in until one is found).
+                        let auto = ferros_sys::zone::state().is_some_and(|s| s.ruling().0);
+                        self.zone_choose(auto, &id);
+                        self.zone_pick = None;
+                        self.scroll = 0;
                     }
                     Some(Choice::Picker) => {
                         // Up: scrolled so the open page's title stands in the middle of the band, as near as the list's ends allow. Away: the page as it was.
@@ -3374,6 +3664,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         n,
         kists,
         ask: 0,
+        zone_pick: None,
+        zone_note: None,
     };
     let kept = map.load_places_near();
     // Whatever the vault held, no two circles start overlapping (places kept before circles pushed each other could).
