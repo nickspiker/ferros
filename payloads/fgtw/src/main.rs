@@ -573,6 +573,10 @@ struct Client {
     entry: u8,
     /// The person's identity space (space.rs, docs/IDENTITY-SPACE.md): their kists, answers and home screen, kept here and synced with their fleet.
     space: space::SpaceSync,
+    /// The doorbell (op 21; owner, 2026-11-10: "No polling! ... It should be push or doorbell"): callers waiting for a change (their reply tokens), the change count they are answered with, and what they watch (`watch_state`) when it was last counted.
+    watchers: Vec<[u8; 32]>,
+    watch_gen: u32,
+    watch_seen: Vec<u8>,
 }
 
 impl Client {
@@ -1611,6 +1615,18 @@ impl Client {
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
                     continue;
                 }
+                // 21 [count u32 LE]: the doorbell. Answered [count u32 LE] at once when what the Fleet page and the map read (`watch_digest`) has changed since the caller's count, else held and answered the moment it does (`watch_ring`), so no client asks on a timer. At most 8 held: a ninth caller is answered at once with the count it has.
+                if n >= 5 && req[0] == 21 {
+                    self.watch_count();
+                    let theirs = u32::from_le_bytes([req[1], req[2], req[3], req[4]]);
+                    if theirs != self.watch_gen || self.watchers.len() >= 8 {
+                        let r = self.watch_gen.to_le_bytes();
+                        svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    } else {
+                        self.watchers.push(tok);
+                    }
+                    continue;
+                }
                 // 19: this device's two-word name in the identity's fleet (`device_name_default` of its key under the identity seed), the one the approving device shows for its request; empty before the roots are in (owner, 2026-11-09: "would be nice to know what I'm adding").
                 // 20: this device's departure given up (the Fleet page's back, owner 2026-11-09: "pressing back ... should stop me trying to leave"): forgotten here, in the vault and in the space, so no member is asked to approve it. [0] given up, [1] none under way. A member that countersigned it already has published the Remove; nothing here undoes that.
                 if n >= 1 && req[0] == 20 {
@@ -1823,11 +1839,48 @@ impl Client {
                     }
                 }
             }
+            // The doorbell: whoever waits is told of a change made by this pass.
+            if !self.watchers.is_empty() {
+                self.watch_ring();
+            }
             if !busy && !self.pt.busy() {
                 ferros_sys::sleep_until(now() + ferros_sys::freq() / 50);
             } else {
                 ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000);
             }
+        }
+    }
+
+    /// What the Fleet page and the map read, in one piece: the state (op 1's), the members (op 6), a departure waiting (op 13), the add flow (op 9), this device's own departure denied, and the space (op 17).
+    fn watch_state(&mut self) -> Vec<u8> {
+        let mut v = alloc::vec![self.hp.is_some() as u8, self.bound as u8, self.fleet_key.is_some() as u8, self.depart.is_some() as u8, self.verdict, self.sponsors.len() as u8];
+        v.extend_from_slice(&self.members_reply());
+        v.extend_from_slice(&self.depart_ask_reply());
+        v.extend_from_slice(&self.adding_reply());
+        v.extend_from_slice(self.depart_denied.as_ref().map_or(&[0u8; 32][..], |d| &d[..]));
+        v.extend_from_slice(&self.space_reply());
+        v
+    }
+
+    /// The change count moved on when what is watched differs from what was last counted.
+    fn watch_count(&mut self) {
+        let d = self.watch_state();
+        if d != self.watch_seen {
+            self.watch_seen = d;
+            self.watch_gen = self.watch_gen.wrapping_add(1);
+        }
+    }
+
+    /// Every held doorbell answered with the new count, once there is a change.
+    fn watch_ring(&mut self) {
+        let was = self.watch_gen;
+        self.watch_count();
+        if self.watch_gen == was {
+            return;
+        }
+        let r = self.watch_gen.to_le_bytes();
+        for tok in core::mem::take(&mut self.watchers) {
+            svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
         }
     }
 }
@@ -2528,7 +2581,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: false, listen_pass: 0, listen_said: (255, 255), ble_said: (0, 0), depart_ask: None, denied: Vec::new(), depart_denied: None, entry: 0, space: space::SpaceSync::new() };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: false, listen_pass: 0, listen_said: (255, 255), ble_said: (0, 0), depart_ask: None, denied: Vec::new(), depart_denied: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new() };
     c.run()
 }
 
