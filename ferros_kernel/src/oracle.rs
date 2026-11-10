@@ -53,9 +53,16 @@ pub fn gate_located(capsule: &mut [u8], code_offset: usize, code_len: usize) -> 
     use vsf::types::VsfType;
     // The signature, verified over the file with its own 64 bytes zeroed — done in place (zero, hash, verify, put them back) where vsf's verifier would copy the file first; a 100 MB copy is more than the kernel heap holds (the first Photon spawn died there, 2026-10-27).
     let (header, header_end) = VsfHeader::decode(capsule).map_err(|_| "gate: bad header")?;
-    let sig: [u8; 64] = match &header.signature {
-        Some(VsfType::ge(s)) if s.len() == 64 => s[..].try_into().unwrap(),
-        Some(_) => return Err("gate: only an Ed25519-signed capsule streams; a multi-scheme one takes the staging slot"),
+    // The signature slot as it sits in the header: a plain Ed25519 `ge`, or a list of eggs (`gm`, a kist signed with every scheme of its developer's bundle, 2026-11-10), whose Ed25519 egg is checked here at every spawn; the others were checked at install, before the capsule reached the vault (owner, 2026-11-10). Either way the signature covers the file with the whole slot zeroed.
+    let (slot, sig): (alloc::vec::Vec<u8>, [u8; 64]) = match &header.signature {
+        Some(VsfType::ge(s)) if s.len() == 64 => (s.clone(), s[..].try_into().unwrap()),
+        Some(VsfType::gm(b)) => {
+            let eggs = vsf::eggs::eggs_from_bytes(b).map_err(|_| "gate: the signature slot is not an egg list")?;
+            let anchor = eggs.iter().find(|e| e.scheme == vsf::eggs::SCHEME_ED25519).ok_or("gate: no Ed25519 egg")?;
+            let sig: [u8; 64] = anchor.sig.as_slice().try_into().map_err(|_| "gate: the Ed25519 egg is not 64 bytes")?;
+            (b.clone(), sig)
+        }
+        Some(_) => return Err("gate: a signature the gate does not read"),
         None => return Err("gate: not a signed capsule"),
     };
     if sig.iter().all(|&b| b == 0) {
@@ -66,12 +73,17 @@ pub fn gate_located(capsule: &mut [u8], code_offset: usize, code_len: usize) -> 
         _ => return Err("gate: no Ed25519 developer key"),
     };
     let hdr_len = header_end.min(capsule.len());
-    let at = (0..=hdr_len.saturating_sub(64)).find(|&i| capsule[i..i + 64] == sig).ok_or("gate: the signature is not in the header")?;
-    capsule[at..at + 64].fill(0);
+    let n = slot.len();
+    // WHY the bound: the slot's bytes are found within the header the decode just read; a slot longer than the header cannot be in it.
+    if n == 0 || n > hdr_len {
+        return Err("gate: the signature is not in the header");
+    }
+    let at = (0..=hdr_len - n).find(|&i| capsule[i..i + n] == slot[..]).ok_or("gate: the signature is not in the header")?;
+    capsule[at..at + n].fill(0);
     let hash = blake3::hash(capsule);
-    capsule[at..at + 64].copy_from_slice(&sig);
+    capsule[at..at + n].copy_from_slice(&slot);
     let key = VerifyingKey::from_bytes(&pubkey).map_err(|_| "gate: bad developer key")?;
-    if key.verify(hash.as_bytes(), &Signature::from_bytes(&sig)).is_err() {
+    if key.verify_strict(hash.as_bytes(), &Signature::from_bytes(&sig)).is_err() {
         // The flash log gets what was hashed: the bridge prints the same for the file it sent, so a mismatch names the piece of memory, not the code.
         crate::flashlog::line(&alloc::format!("gate: signature does not verify over {} bytes, signature at {}, hash {}", capsule.len(), at, hash.to_hex()));
         return Err("gate: signature does not verify");
@@ -90,11 +102,18 @@ pub fn gate_located(capsule: &mut [u8], code_offset: usize, code_len: usize) -> 
     if !framed {
         return Err("gate: the named code is not a byte-vector value of that length");
     }
-    let hp: [u8; 32] = match &header.provenance_hash {
-        VsfType::hp(h) if h.len() == 32 => h[..].try_into().unwrap(),
-        _ => return Err("gate: no provenance hash"),
-    };
-    Ok(Located { developer_pubkey: pubkey, hp })
+    Ok(Located { developer_pubkey: pubkey, hp: identity_hash(capsule, &header.provenance_hash)? })
+}
+
+/// What the oracle keys a capsule's ihi on (ORACLE.md §5): a kist's option (its `kist` section's `option`, the same across its versions, so its sealed data survives an update), else the header's provenance hash (the shell's own capsules, and anything not a kist).
+fn identity_hash(capsule: &[u8], hp: &vsf::types::VsfType) -> Result<[u8; 32], &'static str> {
+    if let Some(o) = ferros_kist::option_of(capsule).map_err(|_| "gate: the kist section does not read")? {
+        return Ok(o);
+    }
+    match hp {
+        vsf::types::VsfType::hp(h) if h.len() == 32 => Ok(h[..].try_into().unwrap()),
+        _ => Err("gate: no provenance hash"),
+    }
 }
 
 /// The gate. Ok only if the capsule's Ed25519 signature verifies over this exact file.
@@ -111,10 +130,7 @@ pub fn gate(capsule: &[u8]) -> Result<Gated, &'static str> {
         Some(VsfType::ke(k)) if k.len() == 32 => k[..].try_into().unwrap(),
         _ => return Err("gate: no Ed25519 developer key"),
     };
-    let hp: [u8; 32] = match &header.provenance_hash {
-        VsfType::hp(h) if h.len() == 32 => h[..].try_into().unwrap(),
-        _ => return Err("gate: no provenance hash"),
-    };
+    let hp = identity_hash(capsule, &header.provenance_hash)?;
     let sections = header.sections(capsule, header_end).map_err(|_| "gate: bad sections")?;
     let find = |name: &str| {
         sections

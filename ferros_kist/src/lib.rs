@@ -2,7 +2,7 @@
 //!
 //! - **A right** is one thing a kist can be handed at spawn: a grant (owner, 2026-11-08: "a grant is the permission"). The vocabulary is fixed here, a right named and numbered by its place in `RIGHTS`; the kernel hands each one out as its own object (process.rs `kist_object`).
 //! - **The declaration** is in the signed capsule: a section `kist` (`name`, the app's own name, text) and a section `wants`, one field per right the kist asks for, named by the right, its value one line of the developer's reason (text, a human's words). The fields' order is the kist's grant slot order: slot 1 is the first want, and a right the person said no to is an empty slot, never a fake. Nothing undeclared can be granted: the kernel checks every launch against the capsule it runs.
-//! - **The list** is the person's (`kists.list`, identity class, so it follows them to every device of their fleet): one VSF document, a section `defaults` (a field per right, 1 on or 0 off: what the first-launch question starts each switch at; out of the box every one is off) and a section `kist` per installed kist: `capsule` (hb, the blake3 of the signed capsule, its vault address), `developer` (ke) and `option` (hp), together the kist's identity as the gate sees it, `name` (text), and a field per want named by its right: the reason (ASCII text, `a`: vsf encodes UTF-8 text, `x`, only with std, and the map and init are no_std), and once the person answered, the answer (unsigned, 1 granted or 0 not) and when (Eagle time). A want never answered has no answer and is asked at the next launch, once (owner, 2026-11-08: "asked once, ever, per person, per kist, per permission").
+//! - **The list** is the person's (`kists.list`, identity class, so it follows them to every device of their fleet): one VSF document, a section `defaults` (a field per right, 1 on or 0 off: what the first-launch question starts each switch at; out of the box every one is off) and a section `kist` per installed kist: `capsule` (hb, the blake3 of the signed capsule, its vault address), `developer` (ke) and `option` (hp; in the capsule it is the `kist` section's `option`, hR), together the kist's identity as the gate sees it, `name` (text), and a field per want named by its right: the reason (ASCII text, `a`: vsf encodes UTF-8 text, `x`, only with std, and the map and init are no_std), and once the person answered, the answer (unsigned, 1 granted or 0 not) and when (Eagle time). A want never answered has no answer and is asked at the next launch, once (owner, 2026-11-08: "asked once, ever, per person, per kist, per permission").
 #![no_std]
 
 extern crate alloc;
@@ -121,24 +121,33 @@ pub fn want_codes(capsule: &[u8]) -> Result<Vec<u8>, &'static str> {
     Ok(declaration(capsule)?.wants.into_iter().map(|w| w.0).collect())
 }
 
-/// The developer's key and the option (`hp`) of a capsule's header: the kist's identity as the gate sees it.
+/// The developer's key (the header's `ke`) and the option (the `kist` section's `option`, `hR`): the kist's identity across its versions. Until 2026-11-10 the option rode in the header's provenance hash, which every VSF reader then called tampered (it is the content's BLAKE3 by definition); a capsule that carries it there is not read.
 pub fn identity(capsule: &[u8]) -> Result<([u8; 32], [u8; 32]), &'static str> {
     let (h, _) = VsfHeader::decode(capsule).map_err(|_| "not a VSF file")?;
     let developer = match &h.signer_pubkey {
         Some(VsfType::ke(k)) if k.len() == 32 => k[..].try_into().unwrap(),
         _ => return Err("no Ed25519 developer key"),
     };
-    let option = match &h.provenance_hash {
-        VsfType::hp(p) if p.len() == 32 => p[..].try_into().unwrap(),
-        _ => return Err("no provenance hash"),
-    };
+    let option = option_of(capsule)?.ok_or("no kist option")?;
     Ok((developer, option))
 }
 
+/// The `kist` section's `option` (`hR`, 32 bytes), or None for a capsule with no kist section or no option in it.
+pub fn option_of(capsule: &[u8]) -> Result<Option<[u8; 32]>, &'static str> {
+    Ok(section(capsule, "kist")?.and_then(|s| s.get_field("option").and_then(|f| f.values.first()).and_then(|v| match v {
+        VsfType::hR(o) if o.len() == 32 => Some(o[..].try_into().unwrap()),
+        _ => None,
+    })))
+}
+
 /// The sections a capsule's declaration adds, for the signer (ferros-bridge `capsule --kist`): `kist` with the name, `wants` with a field per want, or no `wants` at all for a kist that wants nothing (2026-11-10: an empty section was written and did not parse back, so the clock's capsule could not be installed; a capsule without one already reads as wanting nothing).
-pub fn declaration_sections(d: &Decl) -> (VsfSection, Option<VsfSection>) {
+pub fn declaration_sections(d: &Decl, option: Option<[u8; 32]>) -> (VsfSection, Option<VsfSection>) {
     let mut k = VsfSection::new("kist");
     k.add_field("name", VsfType::a(vsf::Ascii::checked("name", d.name.clone())));
+    // The kist's identity across versions (ORACLE.md §5: minted once by the developer, kept), as its own field: the header's `hp` stays the content's provenance.
+    if let Some(o) = option {
+        k.add_field("option", VsfType::hR(o.to_vec()));
+    }
     if d.wants.is_empty() {
         return (k, None);
     }
@@ -303,13 +312,17 @@ mod tests {
 
     #[test]
     fn declaration_reads_from_a_capsule_without_its_code() {
-        let (kist, wants) = declaration_sections(&decl());
+        let (kist, wants) = declaration_sections(&decl(), Some([5; 32]));
         let mut code = VsfSection::new("aarch64");
         code.add_field("code", VsfType::v(b'b', alloc::vec![7u8; 1 << 12]));
-        let file = vsf::VsfBuilder::new().provenance_hash([5; 32]).add_section_direct(kist).add_section_direct(wants.unwrap()).add_section_direct(code).build().unwrap();
+        let file = vsf::VsfBuilder::new().provenance_only().add_section_direct(kist).add_section_direct(wants.unwrap()).add_section_direct(code).build().unwrap();
         let d = declaration(&file).unwrap();
         assert_eq!(d, decl());
         assert_eq!(want_codes(&file).unwrap(), alloc::vec![0, 6]);
+        // The option is the kist section's, and the header's provenance hash is the content's own.
+        assert_eq!(option_of(&file).unwrap(), Some([5; 32]));
+        let (h, _) = VsfHeader::decode(&file).unwrap();
+        assert!(matches!(&h.provenance_hash, VsfType::hp(p) if p[..] != [5u8; 32]));
         // A capsule with no declaration wants nothing.
         let mut c = VsfSection::new("aarch64");
         c.add_field("code", VsfType::v(b'b', alloc::vec![1u8; 16]));

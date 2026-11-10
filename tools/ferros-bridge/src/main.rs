@@ -689,17 +689,38 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
     if masked && std::env::args().any(|a| a == "--exact") {
         section.add_field("exact", VsfType::u(1, false));
     }
-    // A kist's declaration goes before its code, so the kernel and the installer read it from the capsule's first bytes.
+    // A kist's declaration goes before its code, so the kernel and the installer read it from the capsule's first bytes; its option rides in it (`kist`'s `option`), and the header's `hp` is the content's provenance hash, as every VSF reader expects.
     let mut builder = vsf::VsfBuilder::new();
-    if let Some(d) = kist_arg() {
-        let (k, w) = ferros_kist::declaration_sections(&d);
+    let kist = kist_arg();
+    if let Some(d) = &kist {
+        let Some(option) = option_arg() else {
+            eprintln!("a kist needs its --option (its identity across versions, minted once)");
+            std::process::exit(1);
+        };
+        let (k, w) = ferros_kist::declaration_sections(d, Some(option));
         builder = builder.add_section_direct(k);
         if let Some(w) = w {
             builder = builder.add_section_direct(w);
         }
     }
-    if let Some(o) = option_arg() {
-        builder = builder.provenance_hash(o);
+    // A kist is signed with every scheme of its developer's bundle (owner, 2026-11-10: "no single eggs"): Photon's release key with the release bundle's three eggs (fgtw::release). A developer of their own needs fgtw's developer bundle, not there yet, so their kist is refused rather than signed with one egg. Every other capsule (the shell's processes, under ferros's key) keeps its one Ed25519 signature.
+    if kist.is_some() {
+        if pubkey != fgtw::release::RELEASE_ED25519 {
+            eprintln!("this kist's key is not Photon's release key, and a developer's own three-egg bundle is not built yet (fgtw SigningBundle::developer): not signed with a single egg");
+            std::process::exit(1);
+        }
+        let unsigned = builder
+            .add_section_direct(section)
+            .signed_only_eggs(VsfType::ke(pubkey.to_vec()), &fgtw::release::release_slots())
+            .build()
+            .unwrap_or_else(|e| {
+                eprintln!("Capsule build failed: {e}");
+                std::process::exit(1);
+            });
+        return fgtw::release::sign_release(unsigned, &fgtw::pq::SigningBundle::release(&seed)).unwrap_or_else(|e| {
+            eprintln!("Capsule signing failed: {e}");
+            std::process::exit(1);
+        });
     }
     let unsigned = builder
         .add_section_direct(section)
@@ -1180,6 +1201,15 @@ async fn cmd_kist_install(path: &str) {
             std::process::exit(1);
         }
     };
+    // Every egg, here, before the capsule reaches the vault (owner, 2026-11-10: all three at install, the Ed25519 egg again at every spawn, by the kernel's gate): Photon's against its release bundle. A developer's own bundle is not built yet (fgtw SigningBundle::developer), so any other developer's kist is refused.
+    if developer != fgtw::release::RELEASE_ED25519 {
+        eprintln!("{path}: its developer is not Photon's release key, and checking another developer's three eggs is not built yet: not installed");
+        std::process::exit(1);
+    }
+    if let Err(e) = fgtw::release::verify_release(&capsule) {
+        eprintln!("{path}: {e}: not installed");
+        std::process::exit(1);
+    }
     let addr = *blake3::hash(&capsule).as_bytes();
     let link = usb::UsbLink::open().unwrap_or_else(|e| {
         eprintln!("{e}");
