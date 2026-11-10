@@ -726,7 +726,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
             if d.fixes > 0 && (d.fix.lat, d.fix.lon) != kept {
                 keep_last(grants, &d);
                 kept = (d.fix.lat, d.fix.lon);
-                // The zone (kernel zone.rs; owner, 2026-11-10: "cellular, then GPS"): each new position to the kernel through the clock's narrow right, never a measure anyone reads; it finds the zone again once the device has moved some 30 km.
+                // The zone (kernel zone.rs; owner, 2026-11-10: "cellular, then GPS"): each new position to the kernel thru the clock's narrow right, never a measure anyone reads; it finds the zone again once the device has moved some 30 km.
                 ferros_sys::zone::position(d.fix.lat, d.fix.lon);
             }
             let fx = d.fix;

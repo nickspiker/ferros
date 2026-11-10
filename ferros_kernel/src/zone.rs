@@ -2,7 +2,7 @@
 //!
 //! - **Two choices.** The identity's (written here by its identity service, payloads/fgtw, from the person's space: settings flow identity to device only) and this device's own. Each is automatic (the zone found here) or by hand (an IANA id; none, the fixed offset `tz`). The device follows the identity's while "follow my identity" is on (the default) and the identity has said something; else its own.
 //! - **Found here**, when the choice is automatic: the cellular network's word first (NITZ's offset and daylight flag, its MCC's country), then a GPS position; ferros_tz::find names the zone, from the `zones` document (tools/tzvsf). Until something is found, the zone by hand stands in.
-//! - **Pushed, never polled.** The modem hands each NITZ and each MCC in (SYS_ZONE op 0) and the GPS driver each new position (op 1), each through a narrow right of its own (the caller's name, as SYS_STATUS), never the settings right; the service loop's next pass finds the zone (`step`).
+//! - **Pushed, never polled.** The modem hands each NITZ and each MCC in (SYS_ZONE op 0) and the GPS driver each new position (op 1), each thru a narrow right of its own (the caller's name, as SYS_STATUS), never the settings right; the service loop's next pass finds the zone (`step`).
 //! - **Kept** in the device settings document (settings.rs): the device's choice, the follow switch, the identity's choice as last written, and the zone last found, so a boot has its zone before any network.
 
 use alloc::vec::Vec;

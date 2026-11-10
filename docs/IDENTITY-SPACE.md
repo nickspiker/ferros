@@ -16,6 +16,7 @@ One set of typed facts per person (fgtw::space, ferros's vocabulary in ferros_sp
 | PLACE | scope, circle (settings, or a kist by developer and option) | x, y, radius, turn | `map.place.<label>` |
 | VIEW | scope | x, y, turn | `map.view` |
 | HOME_SYNC | a device key | on or off | none: set from the Fleet page |
+| ZONE | the fleet | automatic, and the zone by hand (an IANA id) | none: the identity service writes it to the kernel of each device that follows it (docs/TIME.md); chosen on the clock page |
 
 The scope of a place and the view is the fleet's on every device whose home-screen sync is on (the default) and the device's own key on one switched off, so that device keeps its own arrangement, and gets it back after its own reset too. Kists, answers and defaults always follow the person.
 

@@ -3007,7 +3007,7 @@ impl Map {
         let off = (t - rest) * (b - a) as f64;
         self.knob = if off.abs() >= 0.5 { Some((what, off, 0., 0)) } else { None };
     }
-    /// A zone choice made on the clock page (automatic, and the id by hand; empty: none, a fixed offset): the identity's while this device follows it, through its identity service (payloads/fgtw op 22: into the person's space, then to every device that follows it, this one first); else this device's own, straight to the kernel. What did not take is said on the page.
+    /// A zone choice made on the clock page (automatic, and the id by hand; empty: none, a fixed offset): the identity's while this device follows it, thru its identity service (payloads/fgtw op 22: into the person's space, then to every device that follows it, this one first); else this device's own, straight to the kernel. What did not take is said on the page.
     fn zone_choose(&mut self, auto: bool, id: &[u8]) {
         let Some(st) = ferros_sys::zone::state() else { return };
         if st.follow {
