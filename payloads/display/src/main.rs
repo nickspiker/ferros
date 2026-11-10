@@ -683,6 +683,19 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 6], usize, usize, i64, Opti
             put(char::from_u32(0x10 + *v as u32).unwrap_or('?'), &mut n);
         }
         (rings, 4, n, u, None)
+    } else if ferros_sys::pref(ferros_sys::PREF_BASE) == 16 {
+        // Hex (owner, 2026-11-10: the clock follows the base): tatau's hex time of day, the seconds since midnight, linear, in the centre; four rings, the count's own hex places, sixteen ticks each: outermost a turn every G#10 seconds, then G#100, G#1000 and G#1_0000 (about 18 hours, so the inner ring sweeps most of the day).
+        let rings = [ring(frac(16 * hz), false, 16), ring(frac(256 * hz), false, 16), ring(frac(4096 * hz), false, 16), ring(frac(65536 * hz), false, 16), ring(0, false, 0), ring(0, false, 0)];
+        let sod = t / hz;
+        let mut started = false;
+        for k in (0..5).rev() {
+            let v = (sod >> (4 * k)) & 0xF;
+            if v != 0 || started || k == 0 {
+                started = true;
+                put(char::from_digit(v as u32, 16).unwrap_or('?').to_ascii_uppercase(), &mut n);
+            }
+        }
+        (rings, 4, n, sod, None)
     } else {
         let sod = t / hz;
         let (h, m, sec) = (sod / 3600, (sod / 60) % 60, sod % 60);

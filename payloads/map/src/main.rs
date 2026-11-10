@@ -2072,7 +2072,8 @@ impl Map {
                 let on = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1;
                 // A checkbox; armed, its label asks for the second tap.
                 let armed = self.armed;
-                mark(self, b, &mut y, 50, if armed { "tap again: unlock at boot" } else { "unlock at boot" }, on, Some(Choice::UnlockAtBoot));
+                // Its words say attest, as the attest screen does (owner, 2026-11-10: "always attest").
+                mark(self, b, &mut y, 50, if armed { "tap again: attest at boot" } else { "attest at boot" }, on, Some(Choice::UnlockAtBoot));
                 b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "on, the device opens without your handle:");
                 b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "whoever holds it holds your identity");
                 y += uu(3, 1);

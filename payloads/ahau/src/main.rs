@@ -648,7 +648,8 @@ impl Ahau {
     /// What the button does now, or nothing while the client is asked.
     fn button_label(&self) -> Option<&'static str> {
         match self.mode {
-            Mode::Fresh => Some(if self.bound { "unlock" } else { "bind" }),
+            // Always "attest", bound or not (owner, 2026-11-10: "needs to say attest, not unlock. always attest"): the prompt above says whether the handle also binds this device.
+            Mode::Fresh => Some("attest"),
             Mode::Mint(_) => Some("mint"),
             Mode::Wrong | Mode::Owned => Some("start over"),
             Mode::Words(_) => Some("cancel"),
