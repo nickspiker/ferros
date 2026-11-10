@@ -252,10 +252,14 @@ impl Client {
         }
         if put && self.space.seed_digest != self.space.space.digest() {
             let Some(sealed) = self.space_sealed() else { return };
+            // Signed with everything this device holds (Falcon and SLH-DSA beside Ed25519), as every other write to fgtw.org is: a fleet whose members declared them refuses a bare Ed25519 egg (`below_floor`), and until 2026-11-10 every push from here was refused so, the departure request with it. On the X3, as the binding request signs: SLH-DSA-128s takes seconds on a worker.
+            ferros_sys::pin(ferros_sys::CORES_BIG);
+            ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000);
             let r = {
                 let s = self.seed();
-                fgtw::client::push_space(&s, &hp, self.keys.keypair(), &sealed)
+                fgtw::client::push_space(&s, &hp, &self.keys, &sealed)
             };
+            ferros_sys::pin(0);
             match r {
                 Ok(()) => {
                     self.space.seed_digest = self.space.space.digest();
