@@ -3773,7 +3773,7 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
     (out, n)
 }
 
-/// Each radio's flavour (owner, 2026-11-07): WiFi 497 nm, cellular 598 nm, Bluetooth VSF blue, NFC VSF RGB 7F00FF (gamma-2 codes), GPS VSF green, USB VSF red. A wavelength is its cone response (vsf LMS_2000_10DEG_1NM) in VSF RGB, moved toward white (E, equal codes) just far enough that no channel is negative: the same hue at the most saturation the primaries reach, its third channel black. Each scaled to the light of the grey it replaces by VSF's photopic weights (R 0.2584, G 0.6346, B 0.1070): the ring at RING_ON's light (0.3017 linear), the name at INK's (0.4507), or as far as the colour goes with its brightest channel full (blue 0.107, NFC 0.171, red 0.258; cellular's name stops at its red). As working values, gamma 2, white at Q14. The rest grey, equal codes.
+/// Each radio's flavour (owner, 2026-11-07): WiFi 497 nm, cellular 598 nm, Bluetooth VSF blue, NFC VSF RGB 7F00FF (gamma-2 codes), GPS 550 nm (owner, 2026-11-09; VSF green before), USB VSF red. A wavelength is its cone response (vsf LMS_2000_10DEG_1NM) in VSF RGB, moved toward white (E, equal codes) just far enough that no channel is negative: the same hue at the most saturation the primaries reach, its third channel black. Each scaled to the light of the grey it replaces by VSF's photopic weights (R 0.2584, G 0.6346, B 0.1070): the ring at RING_ON's light (0.3017 linear), the name at INK's (0.4507), or as far as the colour goes with its brightest channel full (blue 0.107, NFC 0.171, red 0.258; cellular's name stops at its red). As working values, gamma 2, white at Q14. The rest grey, equal codes.
 fn flavour(what: Corner) -> ((f32, f32, f32), (f32, f32, f32)) {
     const RING_ON: f32 = 9000.0;
     const INK: f32 = 11000.0;
@@ -3782,7 +3782,7 @@ fn flavour(what: Corner) -> ((f32, f32, f32), (f32, f32, f32)) {
         Corner::Wifi => ((0.0, 10918.0, 7075.0), (0.0, 13344.0, 8647.0)),
         Corner::Bluetooth => ((0.0, 0.0, 16384.0), (0.0, 0.0, 16384.0)),
         Corner::Nfc => ((8160.0, 0.0, 16384.0), (8160.0, 0.0, 16384.0)),
-        Corner::Gps => ((0.0, 11298.0, 0.0), (0.0, 13808.0, 0.0)),
+        Corner::Gps => ((6938.0, 10393.0, 0.0), (8479.0, 12703.0, 0.0)),
         Corner::Usb => ((16384.0, 0.0, 0.0), (16384.0, 0.0, 0.0)),
         _ => ((RING_ON, RING_ON, RING_ON), (INK, INK, INK)),
     }
