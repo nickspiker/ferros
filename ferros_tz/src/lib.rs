@@ -243,6 +243,106 @@ pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (yoe as i64 + era * 400 + (m <= 2) as i64, m, d)
 }
 
+/// A zone as the choice sees it (one `zone` section of the zones document, tools/tzvsf): its rule, its countries (ISO 3166 alpha-2; the first is the country of its principal place, as zone1970.tab lists them) and its principal place (latitude, longitude in arc-seconds).
+#[derive(Clone, Copy, Debug)]
+pub struct Zone<'a> {
+    pub rule: Rule,
+    pub countries: &'a [[u8; 2]],
+    pub at: (i32, i32),
+}
+
+/// What is known of where the device is (owner, 2026-11-10: "cellular, then GPS"): the country of the network it is on (from its MCC), the offset the network says is legal there now and, when it said, whether daylight time is in it (NITZ), and a position (arc-seconds).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Clue {
+    pub country: Option<[u8; 2]>,
+    pub offset: Option<(i32, Option<bool>)>,
+    pub at: Option<(i32, i32)>,
+}
+
+/// What named the zone: the network (its country, its offset, a position only choosing among the zones those leave), or a position alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Network,
+    Position,
+}
+
+/// The zone a clue names at `t` (Unix seconds, UTC), as Android picks one from NITZ and the MCC, then the position: the index into `zones`, and what named it.
+///
+/// - The pool: the zones of the network's country whose rule gives the network's offset now, and its daylight flag too when it gave one; failing that the offset alone; failing that (an offset none of the country's zones keeps) the country alone. With no country, every zone.
+/// - With a position: the pool's zone whose principal place is nearest. Until zone regions exist (timezone-boundary-builder's licence is the owner's call) this is the fallback: a place near a border can be nearer another zone's principal place than its own.
+/// - Without one: the pool's first zone whose country is listed first (zone1970.tab puts the most populous first), else its first; but only when the network gave an offset or every zone in the pool keeps the same rule. A country of several zones and no offset names none, and an offset with no country names nothing.
+pub fn find(zones: &[Zone], clue: &Clue, t: i64) -> Option<(usize, Source)> {
+    let in_country = |z: &Zone| clue.country.is_none_or(|c| z.countries.contains(&c));
+    let fits = |z: &Zone, strict: bool| match clue.offset {
+        None => true,
+        Some((o, dst)) => {
+            let n = z.rule.at(t);
+            n.legal == o && (!strict || dst.is_none_or(|d| (n.legal != n.standard) == d))
+        }
+    };
+    let level = [Some(true), Some(false), None].into_iter().find(|&s| zones.iter().any(|z| in_country(z) && s.is_none_or(|s| fits(z, s))))?;
+    let pool = |z: &Zone| in_country(z) && level.is_none_or(|s| fits(z, s));
+    if let Some(p) = clue.at {
+        let i = nearest(zones, p, pool)?;
+        return Some((i, if clue.country.is_some() { Source::Network } else { Source::Position }));
+    }
+    let country = clue.country?;
+    let first = zones.iter().position(|z| pool(z) && z.countries.first() == Some(&country)).or_else(|| zones.iter().position(pool))?;
+    let offset_used = clue.offset.is_some() && level.is_some();
+    if !offset_used && zones.iter().any(|z| pool(z) && z.rule != zones[first].rule) {
+        return None;
+    }
+    Some((first, Source::Network))
+}
+
+/// The zone among those `keep` passes whose principal place is nearest `at` (arc-seconds) along the earth's surface: the largest cosine of the angle between the two places, so no square root and no arc cosine.
+pub fn nearest(zones: &[Zone], at: (i32, i32), keep: impl Fn(&Zone) -> bool) -> Option<usize> {
+    let (s0, c0) = (sin_q30(at.0 as i64), cos_q30(at.0 as i64));
+    let mut best: Option<(usize, i128)> = None;
+    for (i, z) in zones.iter().enumerate().filter(|(_, z)| keep(z)) {
+        // The longitudes' difference brought within half a turn: two places either side of the antimeridian are close, not a whole turn apart.
+        let mut d = z.at.1 as i64 - at.1 as i64;
+        if d > HALF_TURN {
+            d -= 2 * HALF_TURN;
+        } else if d < -HALF_TURN {
+            d += 2 * HALF_TURN;
+        }
+        let (s, c) = (sin_q30(z.at.0 as i64), cos_q30(z.at.0 as i64));
+        // cos(angle) = sin φ0 sin φ1 + cos φ0 cos φ1 cos Δλ, in Q60.
+        let dot = s0 as i128 * s as i128 + (c0 as i128 * c as i128 >> 30) * cos_q30(d) as i128;
+        if best.is_none_or(|b| dot > b.1) {
+            best = Some((i, dot));
+        }
+    }
+    best.map(|b| b.0)
+}
+
+/// Half a turn in arc-seconds.
+const HALF_TURN: i64 = 648_000;
+const Q30: i128 = 1 << 30;
+/// π in Q30.
+const PI_Q30: i128 = 3_373_259_426;
+
+/// The cosine of an angle in arc-seconds within half a turn either way, in Q30: integer, as the rest of this crate (the kernel uses it).
+pub fn cos_q30(a: i64) -> i64 {
+    let a = a.abs();
+    // Past a right angle cos(a) = -cos(180° - a), so the series is taken at most a quarter turn out, where its first eight terms are good to 2^-33.
+    let (a, sign) = if a > HALF_TURN / 2 { (HALF_TURN - a, -1) } else { (a, 1) };
+    let x = a as i128 * PI_Q30 / HALF_TURN as i128;
+    let x2 = x * x >> 30;
+    // Taylor's series by Horner: 1 - x²/(1·2) (1 - x²/(3·4) (1 - …)), to x¹⁴/14!.
+    let mut c = Q30;
+    for k in [182, 132, 90, 56, 30, 12, 2] {
+        c = Q30 - (x2 * c >> 30) / k;
+    }
+    sign * c as i64
+}
+
+/// The sine of a latitude in arc-seconds (a quarter turn either way), in Q30: the cosine of its distance from the pole.
+pub fn sin_q30(lat: i64) -> i64 {
+    cos_q30(HALF_TURN / 2 - lat)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +397,79 @@ mod tests {
         assert!(Rule::parse("PST8PDT").is_none());
         assert!(Rule::parse("XX5").is_none());
         assert!(Rule::parse("EST5EDT,M13.1.0,M11.1.0").is_none());
+    }
+
+    #[test]
+    fn cosine_in_q30() {
+        let q = 1i64 << 30;
+        assert_eq!(cos_q30(0), q);
+        assert!((cos_q30(60 * 3600) - q / 2).abs() < 4);
+        assert!(cos_q30(90 * 3600).abs() < 4);
+        assert!((cos_q30(180 * 3600) + q).abs() < 4);
+        assert!((sin_q30(30 * 3600) - q / 2).abs() < 4);
+        assert!((sin_q30(-90 * 3600) + q).abs() < 4);
+    }
+
+    /// Arc-seconds from degrees and minutes.
+    fn dm(d: i32, m: i32) -> i32 {
+        d * 3600 + d.signum() * m * 60
+    }
+
+    /// A few of zone1970.tab's rows, Phoenix after Denver as there, Zurich before Berlin (it is not: to show the first-listed country wins over the order).
+    const TABLE: [(&str, &str, &[[u8; 2]], (i32, i32)); 9] = [
+        ("America/Edmonton", "MST7MDT,M3.2.0,M11.1.0", &[[b'C', b'A']], (53 * 3600 + 33 * 60, -113 * 3600 - 28 * 60)),
+        ("Europe/Zurich", "CET-1CEST,M3.5.0,M10.5.0/3", &[[b'C', b'H'], [b'D', b'E'], [b'L', b'I']], (47 * 3600 + 23 * 60, 8 * 3600 + 32 * 60)),
+        ("Europe/Berlin", "CET-1CEST,M3.5.0,M10.5.0/3", &[[b'D', b'E'], [b'D', b'K'], [b'N', b'O'], [b'S', b'E'], [b'S', b'J']], (52 * 3600 + 30 * 60, 13 * 3600 + 22 * 60)),
+        ("Pacific/Fiji", "<+12>-12", &[[b'F', b'J']], (-18 * 3600 - 8 * 60, 178 * 3600 + 25 * 60)),
+        ("America/New_York", "EST5EDT,M3.2.0,M11.1.0", &[[b'U', b'S']], (40 * 3600 + 43 * 60, -74 * 3600)),
+        ("America/Denver", "MST7MDT,M3.2.0,M11.1.0", &[[b'U', b'S']], (39 * 3600 + 44 * 60, -104 * 3600 - 59 * 60)),
+        ("America/Phoenix", "MST7", &[[b'U', b'S'], [b'C', b'A']], (33 * 3600 + 27 * 60, -112 * 3600 - 4 * 60)),
+        ("America/Los_Angeles", "PST8PDT,M3.2.0,M11.1.0", &[[b'U', b'S']], (34 * 3600 + 3 * 60, -118 * 3600 - 14 * 60)),
+        ("Pacific/Honolulu", "HST10", &[[b'U', b'S']], (21 * 3600 + 18 * 60, -157 * 3600 - 51 * 60)),
+    ];
+
+    fn pick(clue: Clue, t: i64) -> Option<(&'static str, Source)> {
+        let zones: [Zone; 9] = core::array::from_fn(|i| Zone { rule: Rule::parse(TABLE[i].1).unwrap(), countries: TABLE[i].2, at: TABLE[i].3 });
+        find(&zones, &clue, t).map(|(i, s)| (TABLE[i].0, s))
+    }
+
+    #[test]
+    fn network_country_and_offset() {
+        let (winter, summer) = (utc(2026, 11, 10, 20), utc(2026, 7, 1, 20));
+        let us = Some(*b"US");
+        let net = |o: i32, dst: Option<bool>| Clue { country: us, offset: Some((o * H, dst)), at: None };
+        assert_eq!(pick(net(-8, Some(false)), winter), Some(("America/Los_Angeles", Source::Network)));
+        // UTC - 7 in summer: Pacific daylight time, or Arizona's standard time all year, told apart by the daylight flag.
+        assert_eq!(pick(net(-7, Some(true)), summer).unwrap().0, "America/Los_Angeles");
+        assert_eq!(pick(net(-7, Some(false)), summer).unwrap().0, "America/Phoenix");
+        // Without the flag, the first of the two in the table.
+        assert_eq!(pick(net(-7, None), summer).unwrap().0, "America/Phoenix");
+        // UTC - 7 in winter: Denver and Phoenix both keep it; the first in the table, as Android takes its country's default.
+        assert_eq!(pick(net(-7, Some(false)), winter).unwrap().0, "America/Denver");
+        // An offset none of the country's zones keeps: the country alone, which for the United States names none.
+        assert_eq!(pick(net(5, None), winter), None);
+        // Germany: Berlin, its own, over Zurich (Büsingen), listed first in the table but Switzerland's.
+        assert_eq!(pick(Clue { country: Some(*b"DE"), offset: Some((H, Some(false))), at: None }, winter).unwrap().0, "Europe/Berlin");
+        // The country alone: one rule across its zones names it; several do not.
+        assert_eq!(pick(Clue { country: Some(*b"DE"), offset: None, at: None }, winter).unwrap().0, "Europe/Berlin");
+        assert_eq!(pick(Clue { country: us, offset: None, at: None }, winter), None);
+        // An offset with no country names nothing.
+        assert_eq!(pick(Clue { country: None, offset: Some((-8 * H, Some(false))), at: None }, winter), None);
+    }
+
+    #[test]
+    fn position_chooses() {
+        let winter = utc(2026, 11, 10, 20);
+        // Tucson, in winter at UTC - 7 on a US network: Denver and Phoenix both fit; the nearer principal place is Phoenix.
+        let tucson = (dm(32, 13), dm(-110, 58));
+        assert_eq!(pick(Clue { country: Some(*b"US"), offset: Some((-7 * H, Some(false))), at: Some(tucson) }, winter), Some(("America/Phoenix", Source::Network)));
+        // The position alone: the nearest principal place anywhere.
+        assert_eq!(pick(Clue { at: Some(tucson), ..Clue::default() }, winter), Some(("America/Phoenix", Source::Position)));
+        // Across the antimeridian: Taveuni at 179° 58' W is Fiji's, not Honolulu's.
+        assert_eq!(pick(Clue { at: Some((dm(-16, 50), dm(-179, 58))), ..Clue::default() }, winter).unwrap().0, "Pacific/Fiji");
+        // A US network and a place in Canada (Calgary): the nearest of the US zones, never Edmonton.
+        assert_eq!(pick(Clue { country: Some(*b"US"), offset: None, at: Some((dm(51, 3), dm(-114, 4))) }, winter).unwrap().0, "America/Denver");
+        // Nothing known: nothing named.
+        assert_eq!(pick(Clue::default(), winter), None);
     }
 }
