@@ -2704,8 +2704,61 @@ impl Map {
         self.page_dx != 0 || self.fling != 0. || self.spring.is_some() || self.pan.is_some() || self.knob.is_some() || flying
     }
 
+    /// The back corner, one level at a time (owner, 2026-11-09: "pressing back ... should stop me trying to leave and go to the regular fleet page, then back again goes to the list of all the categories, then back again should go to the home screen"): on the Fleet page a departure under way is given up (fgtw op 20), the remove row's armed confirm disarmed, an add flow closed; then a settings page goes to the page picker; then the picker, or a kist's page, closes to every circle. What it did, for the console.
+    fn back_step(&mut self) -> &'static str {
+        if self.view == View::Open(0) && PAGES[self.page] == "fleet" {
+            let svc = cap(self.grants, S_FGTW);
+            if self.fleet.state == Some(8) {
+                let mut r = [0u8; 4];
+                let _ = ferros_sys::call_live(svc, &[20], &mut r);
+                self.fleet.confirm = false;
+                self.fleet.leave_result = None;
+                self.fleet.poll(svc);
+                self.draw();
+                return "map: back: the departure given up";
+            }
+            if self.fleet.confirm {
+                self.fleet.confirm = false;
+                self.draw();
+                return "map: back: the remove row disarmed";
+            }
+            if self.fleet.add != 0 {
+                self.fleet.add_op(svc, &[8, 0]);
+                self.draw();
+                return "map: back: the add flow closed";
+            }
+        }
+        if self.view == View::Open(0) && !self.picker {
+            self.picker = true;
+            self.draw();
+            return "map: back: the page picker";
+        }
+        // An open circle closes on the way, as a tap outside it does: the view is the plane once the camera lands (`step_cam`).
+        if matches!(self.view, View::Open(_)) {
+            self.back = None;
+            self.leaving = true;
+        }
+        let to = self.home();
+        self.fly(to);
+        self.draw();
+        "map: back: zoomed out to every circle"
+    }
+
     /// A tap: one finger or two, at a panel point. Logged with what it did, so a session can be followed from `diag console`.
     fn tap(&mut self, fingers: usize, sx: i64, sy: i64) {
+        // The back corner (display op 41: 9), lower left, tapped still: a level back (`back_step`), never a tap on what lies under it.
+        if fingers == 1 && sx >= 0 && sy > self.h / 2 {
+            let mut m = [41u8, 0, 0, 0, 0];
+            m[1..3].copy_from_slice(&(sx as u16).to_le_bytes());
+            m[3..5].copy_from_slice(&(sy as u16).to_le_bytes());
+            let mut r = [0xFFu8; 1];
+            if call(self.display, &m, &mut r) == 1 && r[0] == 9 {
+                let said = self.back_step();
+                console(self.grants, said.as_bytes());
+                console(self.grants, b"\n");
+                return;
+            }
+        }
         let before = self.view;
         // A status circle first (owner, 2026-11-07): they sit over everything at the top, so a one-finger tap on a radio's switches that radio (preference 15) and goes no further. The display knows where they are (op 41).
         if fingers == 1 && sx >= 0 && sy >= 0 && sy < self.h / 4 {
@@ -3478,15 +3531,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                         let n = call(map.display, &[43], &mut q);
                         console(grants, if n >= 2 && q[1] == 1 { b"map: full screen\n" } else { b"map: full screen off\n" });
                     } else {
-                        // An open circle closes on the way, as a tap outside it does: the view is the plane once the camera lands (`step_cam`).
-                        if matches!(map.view, View::Open(_)) {
-                            map.back = None;
-                            map.leaving = true;
-                        }
-                        let to = map.home();
-                        map.fly(to);
-                        map.draw();
-                        console(grants, b"map: back: zoomed out to every circle\n");
+                        let said = map.back_step();
+                        console(grants, said.as_bytes());
+                        console(grants, b"\n");
                     }
                 }
             }

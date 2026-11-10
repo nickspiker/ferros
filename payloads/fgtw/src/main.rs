@@ -943,6 +943,19 @@ impl Client {
         0
     }
 
+    /// Op 20: the departure under way given up: 0, or 1 when there is none.
+    fn give_up_depart(&mut self) -> u8 {
+        if self.depart.take().is_none() {
+            return 1;
+        }
+        let _ = ferros_sys::store_delete(cap(self.log.grants, S_STORE), DEPART_KEY);
+        let me = self.me;
+        self.space_drop_depart(&me);
+        self.log.put(b"fgtw: the departure given up: this device stays in the fleet");
+        self.log.line();
+        0
+    }
+
     /// The departure under way into the vault (`DEPART_KEY`), so a reboot before a device of the fleet approves resumes it with the same request and the same words.
     /// Kept whether or not unlock-at-boot is on: it holds no root, and without it a reboot would leave the approver's words pointing at a request this device had forgotten.
     fn keep_depart(&mut self) {
@@ -1503,6 +1516,12 @@ impl Client {
                     continue;
                 }
                 // 19: this device's two-word name in the identity's fleet (`device_name_default` of its key under the identity seed), the one the approving device shows for its request; empty before the roots are in (owner, 2026-11-09: "would be nice to know what I'm adding").
+                // 20: this device's departure given up (the Fleet page's back, owner 2026-11-09: "pressing back ... should stop me trying to leave"): forgotten here, in the vault and in the space, so no member is asked to approve it. [0] given up, [1] none under way. A member that countersigned it already has published the Remove; nothing here undoes that.
+                if n >= 1 && req[0] == 20 {
+                    let r = [self.give_up_depart()];
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
                 if n >= 1 && req[0] == 19 {
                     let r = self.identity_seed.map(|seed| fgtw::pair::device_name_default(&self.me, &seed).into_bytes()).unwrap_or_default();
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
