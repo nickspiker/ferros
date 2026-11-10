@@ -17,3 +17,7 @@ ferros_sys = { path = "../ferros_sys", optional = true }
 
 [features]
 process = ["dep:ferros_sys"]
+
+[dev-dependencies]
+# The fetch's test signs a capsule with every egg of a test release bundle and checks the streamed hashes against fgtw's own verifier (host only: the kernel builds this crate without it).
+fgtw = { path = "../../fgtw", default-features = false, features = ["std", "sign"] }
