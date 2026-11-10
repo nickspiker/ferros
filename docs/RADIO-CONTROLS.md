@@ -45,7 +45,7 @@ What each driver reports and what can be turned, as of 2026-11-07. "Next" is wha
 - **Tracks:** the channel number, transmit power (`qtxpower`, quarter dBm), the power-save mode the firmware reports (WLC_GET_PM), packets received and sent, receive errors and transmit failures (WLC_GET_PKTCNTS, cumulative).
 - **Detail** (`wifi`): the network's name (from the person's credential), the access point's address (WLC_GET_BSSID), this device's address on that network (per network, keyed from the ira), and the lease (address, router, DNS server, length) when this driver ran DHCP itself; in service the `ip` process runs DHCP and its lease is not here yet (next: ip publishes it, or hands it to the driver).
 - **Knobs:**
-  - *Power save* (kept): off (the default since bring-up), on (PM1, the radio sleeps between beacons), fast (PM2, sleeps after a quiet spell). Applied at once (WLC_SET_PM).
+  - *Power save* (kept): off, on (PM1, the radio sleeps between beacons), fast (PM2, sleeps after a quiet spell), with the screen (the default since 2026-11-10: PM2 while the screen is off, off while it is on; 150 mW less with the screen off, POWER.md). Applied at once (WLC_SET_PM), and again at every screen change.
   - *Band* (kept): any (5 GHz whenever the network has it), 5 GHz only, 2.4 GHz only. Applied at the next join: switch WiFi off and on. No 2.4 GHz join has held under ferros yet (WIFI.md; the antenna is shared with Bluetooth and nothing coordinates them).
 - **Next:** a scan on demand with its results (names in the detail, signals in tracks), forget the network (the credential is the identity's, `wifi.cred`), roaming (the driver joins with `roam_off`), join a chosen access point, the MCS and spatial streams (`rate_info` layout unchecked).
 

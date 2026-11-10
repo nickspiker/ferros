@@ -1903,9 +1903,12 @@ fn publish_detail(m: &Msgbuf) {
     publish(ferros_sys::control::WIFI, f);
 }
 
-/// The knobs as the control block holds them (ferros_sys::control): power save applied at once (WLC_SET_PM 86: 0 off, 1 PM1, 2 PM2); unset is today's off, set at the join; a value past 2 is not this driver's and is left alone. The band is the join's (`consider`), read before the scan.
-fn apply_controls(m: &mut Msgbuf, d: &mut Drv, c: &[u64; ferros_sys::control::WORDS]) {
-    let pm = c[ferros_sys::control::WIFI_POWER_SAVE as usize];
+/// The knobs as the control block holds them (ferros_sys::control): power save applied at once (WLC_SET_PM 86: 0 off, 1 PM1, 2 PM2); 3 or unset follows the screen, PM2 while it is off (the radio sleeps after a quiet spell, as Android runs it) and off while it is on, set at the join and at every screen change (2026-11-10: the screen-off draw had grown to 1.07 W from 0.58, the WiFi link the largest part left); a value past 3 is not this driver's and is left alone. The band is the join's (`consider`), read before the scan.
+fn apply_controls(m: &mut Msgbuf, d: &mut Drv, c: &[u64; ferros_sys::control::WORDS], dark: bool) {
+    let pm = match c[ferros_sys::control::WIFI_POWER_SAVE as usize] {
+        ferros_sys::control::UNSET | 3 => if dark { 2 } else { 0 },
+        v => v,
+    };
     if pm <= 2 {
         let r = m.ioctl_int(d, 86, pm as u32);
         d.kv(b"power save set", pm as u32);
@@ -2012,18 +2015,21 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     // The link this join made, watched while serving (`pump` reads the firmware's events): a join's own failures are behind it.
     let was_linked = m.linked;
     m.join_failed = false;
-    // The control block (docs/RADIO-CONTROLS.md), looked at four times a second: a generation moved since the last look is a knob set. None: not looked at yet, so the first look applies what is kept.
+    // The control block (docs/RADIO-CONTROLS.md), looked at four times a second with the screen's state: a generation moved since the last look is a knob set, a screen change moves an unset power save. None: not looked at yet, so the first look applies what is kept.
     let mut control_at = 0u64;
     let mut control_gen: Option<u64> = None;
+    let mut dark_was = false;
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
         if d.now().wrapping_sub(control_at) >= d.freq / 4 {
             control_at = d.now();
             let c = ferros_sys::controls(ferros_sys::control::WIFI);
-            if control_gen != Some(c[0]) {
+            let dark = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
+            if control_gen != Some(c[0]) || dark != dark_was {
                 control_gen = Some(c[0]);
-                apply_controls(m, d, &c);
+                dark_was = dark;
+                apply_controls(m, d, &c, dark);
             }
         }
         if d.now().wrapping_sub(status_at) >= 2 * d.freq {

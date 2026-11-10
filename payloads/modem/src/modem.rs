@@ -2116,9 +2116,11 @@ struct Online {
     sig_len: u32,
     /// The counter when the indication was last logged (0: never): once a 16 s at most (it changes every second or so and drowned the console).
     sig_logged: u64,
-    /// When the signal is next asked for (µs since online): every 2 s while the data stack is registered, since on NR the CP sends no G#0906 of its own.
+    /// When the signal is next asked for (µs since online): every 2 s while the data stack is registered and the screen is on, since on NR the CP sends no G#0906 of its own. Not while the screen is off: nobody reads it, and each ask brings the link back up and wakes the CP (2026-11-10: the modem's supplies drew ~540 mW with the screen off, against Android's ~40).
     sig_ask: u64,
-    screen_set: bool,
+    /// The screen state last told the CP (0 not yet, 1 on, 2 off) and when the screen preference is next read (µs since online).
+    screen_sent: u8,
+    screen_check: u64,
     camp_seen: [u8; 2],
     call_sent: bool,
     /// Not before this (µs since online): the next setup after a refusal or a lost call.
@@ -2301,7 +2303,8 @@ impl Online {
             sig_len: 0,
             sig_logged: 0,
             sig_ask: 0,
-            screen_set: false,
+            screen_sent: 0,
+            screen_check: 0,
             camp_seen: [0; 2],
             call_sent: false,
             call_retry: 0,
@@ -2534,16 +2537,21 @@ impl Online {
                 }
             }
         }
-        // The screen on, once the radio is: Android's RIL says so at each screen change, and the CP may hold its signal reports while it takes the screen for off. Then the signal asked for on the data stack's channel every 2 s while it is registered.
-        if probe >= 3 && self.powered && !self.screen_set && since_us(t0) > 4_000_000 {
-            self.screen_set = true;
-            for ch in [CH_FMT0, CH_FMT0 + 1] {
-                if let Err(e) = sit_request(link, ch, SIT_SET_SCREEN_STATE, &[1, 0, 0, 0]) {
-                    line(rep, alloc::format!("t={} ms: SIT_SET_SCREEN_STATE not sent on ch A#{ch}: {e}\n", since_us(t0) / 1000));
+        // The screen's state, once the radio is on and at every change after (read every quarter second): Android's RIL says so at each screen change, and the CP holds its signal reports and stretches its own wakeups while it takes the screen for off. Then the signal asked for on the data stack's channel every 2 s while it is registered and the screen is on.
+        if probe >= 3 && self.powered && since_us(t0) > 4_000_000 && since_us(t0) > self.screen_check {
+            self.screen_check = since_us(t0) + 250_000;
+            let want = if ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1 { 2 } else { 1 };
+            if want != self.screen_sent {
+                self.screen_sent = want;
+                for ch in [CH_FMT0, CH_FMT0 + 1] {
+                    if let Err(e) = sit_request(link, ch, SIT_SET_SCREEN_STATE, &[(want == 1) as u8, 0, 0, 0]) {
+                        line(rep, alloc::format!("t={} ms: SIT_SET_SCREEN_STATE not sent on ch A#{ch}: {e}\n", since_us(t0) / 1000));
+                    }
                 }
+                line(rep, alloc::format!("t={} ms: screen {} told to the CP; link suspends so far A#{}, acknowledgements A#{}\n", since_us(t0) / 1000, if want == 1 { "on" } else { "off" }, self.suspends, self.link_acks));
             }
         }
-        if probe >= 3 && matches!(self.reg_last[1], Some([1 | 5, ..])) && since_us(t0) > self.sig_ask {
+        if probe >= 3 && self.screen_sent == 1 && matches!(self.reg_last[1], Some([1 | 5, ..])) && since_us(t0) > self.sig_ask {
             self.sig_ask = since_us(t0) + 2_000_000;
             if let Err(e) = sit_request(link, CH_FMT0 + 1, SIT_GET_SIGNAL_STRENGTH, &[]) {
                 line(rep, alloc::format!("t={} ms: SIT_GET_SIGNAL_STRENGTH not sent: {e}\n", since_us(t0) / 1000));

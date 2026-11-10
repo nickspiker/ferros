@@ -2300,9 +2300,9 @@ impl Map {
                         y += uu(2, 1);
                     }
                     ctl::WIFI => {
-                        // Each value knob a radio group, its choices in its own order (unset reads as the first).
-                        for (slot, title, names) in [(ctl::WIFI_POWER_SAVE, "power save", ["off", "on", "fast"]), (ctl::WIFI_BAND, "band", ["any (5 GHz first)", "5 GHz only", "2.4 GHz only"])] {
-                            let now = if c[slot as usize] == ctl::UNSET { 0 } else { c[slot as usize] };
+                        // Each value knob a radio group, its choices in its own order (unset reads as `unset`'s: power save follows the screen, the band is any).
+                        for (slot, title, names, unset) in [(ctl::WIFI_POWER_SAVE, "power save", &["off", "on", "fast", "with the screen"][..], 3), (ctl::WIFI_BAND, "band", &["any (5 GHz first)", "5 GHz only", "2.4 GHz only"][..], 0)] {
+                            let now = if c[slot as usize] == ctl::UNSET { unset } else { c[slot as usize] };
                             b.text(cx, y, note as u16, dim(), 1, title);
                             y += uu(2, 1);
                             radios(self, b, &mut y, &names, now as usize, &|v| Choice::KnobSet(k as u8, slot as u8, v as u8));

@@ -242,7 +242,7 @@ pub mod control {
     pub const WORDS: usize = 1 << 4;
     /// Cellular, an action: the data stack's radio off and on again (it registers afresh; the call comes back once it is home).
     pub const CELL_REREGISTER: u64 = 1;
-    /// WiFi, kept: power save, 0 off (the default), 1 on (PM1), 2 fast (PM2). Applied at once.
+    /// WiFi, kept: power save, 0 off, 1 on (PM1), 2 fast (PM2), 3 with the screen (PM2 while it is off, off while it is on; the default, as unset). Applied at once.
     pub const WIFI_POWER_SAVE: u64 = 1;
     /// WiFi, kept: the band to join on, 0 any (5 GHz whenever the network has it, the default), 1 5 GHz only, 2 2.4 GHz only. Applied at the next join.
     pub const WIFI_BAND: u64 = 2;
