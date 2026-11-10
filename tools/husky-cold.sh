@@ -124,7 +124,8 @@ wait_boot() {
     local t0 limit=$1
     t0=$(date +%s)
     while :; do
-        if lsusb -d 1209:4665 >/dev/null 2>&1; then
+        # With FERROS_BUS set (two ferros devices on the host) only that bus counts: the other device answered at once and the slot b check ran against a Pro still booting (2026-11-10).
+        if lsusb -d 1209:4665 2>/dev/null | grep -q "^Bus 0*${FERROS_BUS:-[0-9]*} "; then
             echo "== ferros on USB after $(( $(date +%s) - t0 ))s"
             return 0
         fi
