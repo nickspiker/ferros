@@ -894,6 +894,34 @@ extern "C" fn fgtw_poller(grants: u64) -> ! {
     }
 }
 
+
+/// Whether the Fleet page is on screen, as the main loop last saw it (bit 0), counted in the bits above so each change is a new word: `fleet_page_thread` opens fgtw's add flow while it shows and closes it when it goes (owner, 2026-11-10: adding a device, by a touch on its row or by NFC, needs "the fleet page open").
+static FLEET_PAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The add flow following the Fleet page (fgtw op 8 [1] or [0]), on a thread of its own: a call waits as long as fgtw's pass, and the main loop never waits on fgtw (`fgtw_poller`). Asleep on FLEET_PAGE between changes; a refused call (fgtw not serving yet) is made again after the doubling wait `fgtw_poller` uses.
+extern "C" fn fleet_page_thread(grants: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    let svc = cap(grants, S_FGTW);
+    let mut done = 0u64;
+    let mut absent = freq() >> 6;
+    loop {
+        let v = FLEET_PAGE.load(Ordering::Acquire);
+        if v == done {
+            ferros_sys::wait_world(&FLEET_PAGE, v, 0);
+            continue;
+        }
+        let mut r = [0u8; 4];
+        if ferros_sys::call_live(svc, &[8, (v & 1) as u8], &mut r) == ferros_sys::ERR {
+            sleep_until(now() + absent);
+            if absent < freq() {
+                absent <<= 1;
+            }
+            continue;
+        }
+        absent = freq() >> 6;
+        done = v;
+    }
+}
 /// The copy `fgtw_poller` last published and its sequence count, read whole (again if it was being written); None when it has not moved from `seen`.
 fn fleet_take(seen: u32) -> Option<(u32, Fleet)> {
     use core::sync::atomic::Ordering;
@@ -2323,7 +2351,7 @@ impl Map {
                                 y += uu(2, 1);
                             }
                             button(self, b, &mut y, "type its words", false, Some(Choice::FleetWords));
-                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "or tap the two devices together");
+                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "or hold the two devices together: it joins at once");
                             y += uu(2, 1);
                         }
                         // Selected (fgtw ADD_SELECTED, owner 2026-11-10: "I need a distinct green add, and note to press back otherwise"): the device and its words, the same it shows, Add in VSF RGB primary green, and Back with nothing to undo.
@@ -3503,6 +3531,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut ask_seen: Option<(u8, [u8; NAME_BYTES], usize)> = None;
     // The copy of the identity service last taken (`fgtw_poller`'s sequence count).
     let mut fleet_seen = 0u32;
+    // Whether the Fleet page showed at the last pass (`FLEET_PAGE`).
+    let mut fleet_shown = false;
     let mut last_pass = now();
     let mut draw_us = 0u64;
     let mut move_us = 0u64;
@@ -3511,6 +3541,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The identity service's answers come from a thread of their own (`fgtw_poller`): the main loop never waits on fgtw.
     static mut POLL_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(fgtw_poller, unsafe { &mut *(&raw mut POLL_STACK) }, grants);
+    // The add flow following the Fleet page (`fleet_page_thread`).
+    static mut PAGE_STACK: [u8; 1 << 14] = [0; 1 << 14];
+    ferros_sys::thread_spawn(fleet_page_thread, unsafe { &mut *(&raw mut PAGE_STACK) }, grants);
     // FERROS_MAP_START=drag: a synthetic finger instead of the touch server for the first 192 passes — two seconds after start (past the display's first full frame), a pan through the air and back, so the frame pacing can be measured with no one at the panel (it logs passes, draws and the rate).
     let mut synth = 0u32;
     // FERROS_MAP_START=drag: the drag's own rate, for measuring the frame pacing with no one at the panel.
@@ -3556,6 +3589,14 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             if matches!(map.view, View::Open(_)) && PAGES[map.page] == "fleet" && !map.settling {
                 map.draw();
             }
+        }
+        // The Fleet page shown or gone: the add flow follows it (`fleet_page_thread`), so a device can be added by a touch on its row or by NFC whenever the page is open.
+        let shown = matches!(map.view, View::Open(_)) && PAGES[map.page] == "fleet";
+        if shown != fleet_shown {
+            fleet_shown = shown;
+            let v = FLEET_PAGE.load(core::sync::atomic::Ordering::Acquire);
+            FLEET_PAGE.store(((v >> 1) + 1) << 1 | shown as u64, core::sync::atomic::Ordering::Release);
+            ferros_sys::wake(&FLEET_PAGE, 1);
         }
         // A fleet device's departure waiting on this person: a new one opens the Fleet page on it, Approve or Deny ready (owner, 2026-11-10: "go right to the fleet page and have the unbind request 'Approve' or 'Deny' screen ready to go"). Not over an app in front, and not while a finger is down or the map is settling: a request waiting opens the page once the fingers lift.
         if !map.app_front && !down && !map.settling {

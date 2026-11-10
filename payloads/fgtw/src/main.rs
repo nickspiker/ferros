@@ -451,7 +451,7 @@ const ADD_CLOSED: u8 = 0;
 const ADD_OPEN: u8 = 1;
 /// A candidate picked (by its words, its tag, or nearby): the Add being signed and published.
 const ADD_BINDING: u8 = 2;
-/// Selected (a nearby row or an NFC tap): nothing bound; the device was told (`bind_select`) and should be green, and Add binds and grows it as one act. Back returns to the list with nothing to undo (owner, 2026-11-10, after a pick 50 ft away stayed bound when Back was pressed).
+/// Selected (a nearby row touched on the screen): nothing bound; the device was told (`bind_select`) and should be green, and Add binds and grows it as one act. Back returns to the list with nothing to undo (owner, 2026-11-10, after a pick 50 ft away stayed bound when Back was pressed).
 const ADD_SELECTED: u8 = 3;
 /// The fan-out being grown to the newcomer.
 const ADD_GROWING: u8 = 4;
@@ -471,8 +471,8 @@ struct Adding {
     listed_us: u64,
     /// The candidate rows (fgtw::sponsor::candidates), rebuilt whenever a source changes.
     cands: Vec<fgtw::sponsor::Candidate>,
-    /// The request picked and how (true: its words matched; false: Add on a selected device), and the device bound. Either way the key follows at once.
-    picked: Option<(fgtw::fleet::BindRequest, bool)>,
+    /// The request picked and how (its words matched, Add pressed on a selected device, or an NFC tap), and the device bound. Either way the key follows at once.
+    picked: Option<(fgtw::fleet::BindRequest, &'static str)>,
     bound: Option<[u8; 32]>,
     /// The device selected and told so, waiting for the person's Add (`select`).
     selected: Option<fgtw::fleet::BindRequest>,
@@ -2163,7 +2163,7 @@ impl Client {
                 let c = &self.adding.cands[i];
                 r.extend_from_slice(&[2, 1]);
                 r.extend_from_slice(c.name.as_bytes());
-                self.adding.picked = Some((c.req.clone(), true));
+                self.adding.picked = Some((c.req.clone(), "its words matched"));
                 self.adding.phase = ADD_BINDING;
             }
             WordMatch::NoMatch(w) => {
@@ -2186,7 +2186,7 @@ impl Client {
             return 1;
         }
         let Some(req) = self.adding.selected.take() else { return 1 };
-        self.adding.picked = Some((req, false));
+        self.adding.picked = Some((req, "Add pressed on the selected device"));
         self.adding.phase = ADD_BINDING;
         0
     }
@@ -2265,7 +2265,7 @@ impl Client {
 
     /// The Add for the picked request (fgtw::sponsor::bind_device_held), signed here on the X3: appended to the chain held (refreshed from the seed when it answers), held, mirrored to the seed, kept, and handed to the fleet and the newcomer. A words or tap pick grows the fan-out next; a nearby pick waits for the confirm.
     fn bind_picked(&mut self) {
-        let Some((req, auto)) = self.adding.picked.take() else { return };
+        let Some((req, how)) = self.adding.picked.take() else { return };
         let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
         let key = req.device_pubkey;
         if fgtw::sponsor::plate_locked(&self.held, &hp, &req) {
@@ -2276,7 +2276,8 @@ impl Client {
         self.log.put(fgtw::pair::device_name_default(&key, &seed).as_bytes());
         self.log.put(b" (");
         self.log.fp(&key);
-        self.log.put(if auto { b") to the fleet: its words matched" } else { b") to the fleet: Add pressed on the selected device" });
+        self.log.put(b") to the fleet: ");
+        self.log.put(how.as_bytes());
         self.log.line();
         let t0 = now();
         ferros_sys::pin(ferros_sys::CORES_BIG);
@@ -2326,7 +2327,7 @@ impl Client {
         self.adding.phase = ADD_GROWING;
     }
 
-    /// A device selected (the Fleet page's button on a nearby row, or an NFC tap whose secret opens its commitment): nothing is written to the chain. The fleet's chain and a `bind_select` go to it over this network (it turns green on the select, checking our key against the chain), and the page shows Add, which binds and grows as one act. With no address for it on this network it is told nothing (ferros has no relay): it stays dark, and the person presses Back and types its words.
+    /// A device selected (the Fleet page's button on a nearby row; an NFC tap adds at once instead): nothing is written to the chain. The fleet's chain and a `bind_select` go to it over this network (it turns green on the select, checking our key against the chain), and the page shows Add, which binds and grows as one act. With no address for it on this network it is told nothing (ferros has no relay): it stays dark, and the person presses Back and types its words.
     fn select(&mut self, req: fgtw::fleet::BindRequest, by: &str) {
         let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
         let key = req.device_pubkey;
@@ -2670,13 +2671,15 @@ impl Client {
         let mut s = [0u8; 32];
         if ferros_sys::call_live(nfc, &[6], &mut s) == 32 {
             match fgtw::sponsor::nfc_match(&s, &self.adding.cands) {
-                Some(i) if self.adding.phase == ADD_OPEN => {
+                // NFC adds at once (owner, 2026-11-10: "Touch on screen ... required for BLE OR no touch on screen, just physical proximity (NFC). Both of which need the fleet page open"): the device held within a few centimetres, its tag's secret opening its request's commitment, the Fleet page open here and the newcomer attested is the whole consent. Bound and grown as one act, as Add does. A device picked on the screen still selects, turns green, and waits for Add.
+                Some(i) if matches!(self.adding.phase, ADD_OPEN | ADD_SELECTED) => {
                     self.log.put(b"fgtw: a tapped device's tag matches ");
                     self.log.put(self.adding.cands[i].name.as_bytes());
+                    self.log.put(b": adding it");
                     self.log.line();
-                    // A tap selects, as the button does (owner, 2026-11-10: "so tap, literally the button or NFC tap"): the person presses Add once the device turns green.
-                    let req = self.adding.cands[i].req.clone();
-                    self.select(req, "an NFC tap");
+                    self.adding.selected = None;
+                    self.adding.picked = Some((self.adding.cands[i].req.clone(), "an NFC tap"));
+                    self.adding.phase = ADD_BINDING;
                 }
                 Some(_) => {}
                 None => {
