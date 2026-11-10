@@ -150,3 +150,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: FGTW is devices first](feedback_fgtw_devices_first.md) - fleet requests go device to device and notify there; fgtw.org is only the bootstrap; no reachability internals on user screens
 - [Kist keys follow ownership](kist_keys_follow_ownership.md) - Photon and ferros are commons (project keys); Lumis and Mahere are the owner's (his developer key); key custody hand-off not built
 - [Feedback: no polling](feedback_no_polling.md) - no polling, no timers unless proven necessary: push or doorbell (held call answered on change, interrupt, wake); never ask every N ms
+- [Time zones decided](time_zones_decided.md) - arabic legal DST wall time; dozenal and hex standard offset, never DST (dates may differ); zone from cellular then GPS regions; identity's setting, per-device override
