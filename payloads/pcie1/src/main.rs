@@ -1968,18 +1968,78 @@ fn console_dump(d: &mut Drv, buf: u32, size: u32, start: u32, len: u32) {
 
 /// Walk the endpoint's capability list (cfg G#34) for `id`; returns the capability's config offset.
 fn find_cap(d: &mut Drv, id: u32) -> Option<u64> {
-    let mut p = (d.rd(CFG, 0x34) & 0xFC) as u64;
+    find_cap_in(d, CFG, id)
+}
+
+/// The same walk in `space`: CFG the endpoint's configuration, DBI the root complex's own.
+fn find_cap_in(d: &mut Drv, space: u64, id: u32) -> Option<u64> {
+    let mut p = (d.rd(space, 0x34) & 0xFC) as u64;
     for _ in 0..48 {
         if p == 0 {
             return None;
         }
-        let h = d.rd(CFG, p);
+        let h = d.rd(space, p);
         if h & 0xFF == id {
             return Some(p);
         }
         p = ((h >> 8) & 0xFC) as u64;
     }
     None
+}
+
+/// The extended capability `id` in `space` (from G#100: id in bits 15:0, the next one's offset in bits 31:20), or None.
+fn find_ext_cap(d: &mut Drv, space: u64, id: u32) -> Option<u64> {
+    let mut p = 0x100u64;
+    for _ in 0..48 {
+        let h = d.rd(space, p);
+        if h & 0xFFFF == id {
+            return Some(p);
+        }
+        p = (h >> 20) as u64 & 0xFFC;
+        if p < 0x100 {
+            return None;
+        }
+    }
+    None
+}
+
+/// ASPM L1 with its substates on the WiFi link, as Linux's exynos_pcie_rc_set_l1ss does for EP_BCM_WIFI (pcie-exynos-rc.c 4423-4503; dhd enables it once in dhd_bus_start, after the firmware is up and the first ioctl answered: earlier gave link-down): PCI-PM on the root complex then the endpoint (T_POWER_ON 200 us, LTR on, the LTR L1.2 threshold 160 x 1024 ns, common-mode restore, the four enables), the endpoint's LTR maxima (about 3 ms, snoop and no-snoop), then ASPM L1 with common clock on the root complex and the endpoint (CLKREQ enabled on the endpoint only). The link's idle state while the screen is off was the largest SoC-side item left (2026-11-10: L24S_HSI and L3S_PCIE1 ~75 mW over the 2026-10-25 figure). Returns false when a capability is missing (nothing then written).
+fn enable_l1ss(d: &mut Drv) -> bool {
+    let (Some(rc_pcie), Some(ep_pcie)) = (find_cap_in(d, DBI, 0x10), find_cap_in(d, CFG, 0x10)) else {
+        d.put(b"l1ss: no PCIe capability\n");
+        return false;
+    };
+    let (Some(rc_l1ss), Some(ep_l1ss), Some(ep_ltr)) = (find_ext_cap(d, DBI, 0x1E), find_ext_cap(d, CFG, 0x1E), find_ext_cap(d, CFG, 0x18)) else {
+        d.put(b"l1ss: no L1 substates or LTR capability\n");
+        return false;
+    };
+    d.kv(b"l1ss rc pcie", rc_pcie as u32);
+    d.kv(b"l1ss rc l1ss", rc_l1ss as u32);
+    d.kv(b"l1ss ep pcie", ep_pcie as u32);
+    d.kv(b"l1ss ep l1ss", ep_l1ss as u32);
+    d.kv(b"l1ss ep ltr", ep_ltr as u32);
+    // PCI-PM, the root complex.
+    d.wr(DBI, rc_l1ss + 0xC, 0xA1);
+    d.wr(DBI, 0xB44, 0xEA);
+    d.set(DBI, rc_pcie + 0x28, 0x400);
+    d.wr(DBI, rc_l1ss + 0x8, 0x40A0_2A0F);
+    // PCI-PM, the endpoint.
+    d.wr(CFG, ep_l1ss + 0xC, 0xA1);
+    d.wr(CFG, ep_ltr + 0x4, 0x1003_1003);
+    d.set(CFG, ep_pcie + 0x28, 0x400);
+    d.wr(CFG, ep_l1ss + 0x8, 0x40A0_0A0F);
+    // ASPM L1: the root complex, then the endpoint.
+    let v = d.rd(DBI, rc_pcie + 0x10);
+    d.wr(DBI, rc_pcie + 0x10, (v & !0x3) | 0x40 | 0x2);
+    let v = d.rd(CFG, ep_pcie + 0x10);
+    d.wr(CFG, ep_pcie + 0x10, (v & !0x3) | 0x100 | 0x40 | 0x2);
+    let back = [d.rd(DBI, rc_l1ss + 0x8), d.rd(CFG, ep_l1ss + 0x8), d.rd(DBI, rc_pcie + 0x10), d.rd(CFG, ep_pcie + 0x10)];
+    d.kv(b"l1ss rc ctl1", back[0]);
+    d.kv(b"l1ss ep ctl1", back[1]);
+    d.kv(b"l1ss rc linkctl", back[2]);
+    d.kv(b"l1ss ep linkctl", back[3]);
+    d.flush();
+    true
 }
 
 /// A#192.168.1.1 — one base prefix for the dotted quad.
@@ -2004,6 +2064,10 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     m.verbose = false;
     d.put(b"serving wlan\n");
     d.flush();
+    enable_l1ss(d);
+    // The link's power state as the PHY reports it (PCS G#188 bits 2:0: 0 L0, 2 L1, 5 L1.1, 6 L1.2; read without waking the link), sampled each pass and said every 32 s.
+    let mut lstates = [0u32; 8];
+    let mut lstates_at = d.now();
     let mut msg = [0u8; 2048];
     let mut out = [0u8; 2048];
     let mut tok = [0u8; 32];
@@ -2035,6 +2099,23 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
         if d.now().wrapping_sub(status_at) >= 2 * d.freq {
             status_at = d.now();
             publish_measures(m, d, &mut pkts);
+        }
+        let ls = d.rd(PCS, 0x188) & 7;
+        lstates[ls as usize] += 1;
+        if d.now().wrapping_sub(lstates_at) >= 32 * d.freq {
+            lstates_at = d.now();
+            d.put(b"link states, last 32 s (PCS G#188 2:0 = 0 L0, 2 L1, 5 L1.1, 6 L1.2):");
+            for (k, n) in lstates.iter().enumerate() {
+                if *n > 0 {
+                    d.put(b" ");
+                    d.put(&[b'0' + k as u8]);
+                    d.put(b"=");
+                    d.hex(*n);
+                }
+            }
+            d.put(b"\n");
+            d.flush();
+            lstates = [0; 8];
         }
         let _ = m.pump(d);
         // The link lost while serving (the firmware's LINK down, or a deauthentication or disassociation from the access point): until 2026-11-10 the loop served on unlinked, the IP stack heard "not linked" every 4 s and the device was off the network until someone restarted this driver (the 8a, overnight). Now it ends, saying why, and init's keeper starts it again (at most every 64 s), which brings the radio up and joins afresh: the path every boot takes.
