@@ -2109,6 +2109,13 @@ impl Client {
             self.adding.phase = ADD_OPEN;
             return;
         }
+        // Only a member holding the fleet key adds (owner, 2026-11-10: "Fleet key check, yes"): a bound device without it would write the Add into the chain and then fail to hand the key over, leaving a keyless member (tonight's baf3dec7). Said on the page, and nothing listens.
+        if on && self.adding.phase == ADD_CLOSED && (!self.bound || self.fleet_key.is_none()) {
+            self.adding.note.clear();
+            self.adding.note.push_str("this device does not hold the fleet key, so it cannot add devices");
+            self.adding.phase = ADD_FAILED;
+            return;
+        }
         if on && self.adding.phase == ADD_CLOSED {
             self.adding.phase = ADD_OPEN;
             self.adding.listed_us = 0;
@@ -2267,6 +2274,11 @@ impl Client {
     fn bind_picked(&mut self) {
         let Some((req, how)) = self.adding.picked.take() else { return };
         let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
+        // Nothing is written without the key to hand over after it (`open_add` refuses the flow; this holds for any path into a bind).
+        if self.fleet_key.is_none() {
+            self.add_failed("this device does not hold the fleet key, so it cannot add devices");
+            return;
+        }
         let key = req.device_pubkey;
         if fgtw::sponsor::plate_locked(&self.held, &hp, &req) {
             self.add_failed("this is a device you locked out");
@@ -2695,7 +2707,8 @@ impl Client {
 
     /// The sponsor's work, once a pass of the loop: the registry listed every 8 s while the add flow is open, the radios listening while it is, a pick bound, a confirm grown, an approval countersigned.
     fn sponsor_step(&mut self, t: u64) {
-        let open = self.adding.phase != ADD_CLOSED && self.bound;
+        // Listening (NFC reader, BLE scan, the registry's list) only while the add flow is open for a member holding the fleet key: never on a failed or finished flow.
+        let open = matches!(self.adding.phase, ADD_OPEN | ADD_SELECTED | ADD_BINDING | ADD_GROWING) && self.bound && self.fleet_key.is_some();
         self.listen_pass += 1;
         if open != self.listening || (open && self.listen_pass >= 64) {
             self.sponsor_radios(open);

@@ -2221,7 +2221,7 @@ impl Map {
                     let name = core::str::from_utf8(&f.depart_name[..f.depart_name_n]).unwrap_or("");
                     b.text(cx, y, (uu(3, 2)) as u16, white(), 1, if name.is_empty() { "one of your devices" } else { name });
                     y += uu(2, 1);
-                    row(self, b, &mut y, small, white(), if intent == 1 { "asks to leave your fleet, for a new owner" } else { "asks to leave your fleet" }, None);
+                    row(self, b, &mut y, small, white(), if intent == 1 { "is asking your fleet for its release, to a new owner" } else { "is asking your fleet for its release" }, None);
                     match result {
                         0 | 3 => {
                             b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "approve: your things are wiped from it and it restarts");
@@ -2243,7 +2243,7 @@ impl Map {
                         b.text(cx, y, (uu(3, 2)) as u16, white(), 1, me);
                         y += uu(2, 1);
                     }
-                    row(self, b, &mut y, small, white(), if f.state == Some(8) { "this device asks to leave your fleet" } else { "sending the request to your devices" }, None);
+                    row(self, b, &mut y, small, white(), if f.state == Some(8) { "this device is asking your fleet for its release" } else { "sending the request to your devices" }, None);
                     b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "approve or deny on any of your other devices,");
                     b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "or tap one of them to this one");
                     y += uu(3, 1);
@@ -2319,7 +2319,7 @@ impl Map {
                         button(self, b, &mut y, "add a device", false, Some(Choice::FleetAdd));
                         // Only a device heard here (its beacon or its request on this network, flags bits 0 and 1): one known only from fgtw.org's registry is no one nearby, and a join asked from anywhere on the internet is said nowhere (owner, 2026-11-10: "LAN, fine. WAN, nope").
                         if f.cand_flags[..f.cands].iter().any(|&fl| fl & 3 != 0) {
-                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "a device on this network asks to join");
+                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "a device on this network is asking to join");
                             y += uu(2, 1);
                         }
                     } else {
