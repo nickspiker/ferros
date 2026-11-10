@@ -264,6 +264,15 @@
          text-align: right;
       }
 
+      /* The mark, half the column wide, centred over the title (owner, 2026-11-10). */
+      .logo {
+         display: block;
+         width: 50%;
+         height: auto;
+         aspect-ratio: 1 / 1;
+         margin: calc(2 * var(--ru)) auto calc(1 * var(--ru));
+      }
+
       /* The screens, captured on the device (16-bit VSF RGB) and shown here as 8-bit sRGB: two to a row on a narrow screen, three on a wide one, each its panel's own shape. */
       .shots {
          display: grid;
@@ -298,6 +307,7 @@
          <a href="https://passless.org/">passless.org</a> · <a href="https://passless.org/photon/">photon</a> · <a href="https://github.com/nickspiker/ferros">source</a>
       </nav>
 
+      <img class="logo" src="logo.svg" alt="The ferros mark">
       <h1>ferros<span>.org</span></h1>
 
       <p class="thesis">
