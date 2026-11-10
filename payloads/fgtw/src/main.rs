@@ -362,7 +362,7 @@ struct Depart {
     checked_us: u64,
 }
 
-/// Where this device stands with the identity whose roots it holds (the `fgtw` endpoint's op 1 state byte; pairing-v2's lamp). 0 no roots, 1 joining (the identity has a fleet, this device is not in it yet: RED, words shown), 2 bound waiting for the fleet key, 3 a member with the key, 4 looking the identity up, 5 fresh (fgtw.org holds no chain and no fleet device is heard: it may be minted), 6 wrong fleet (the seed's chain for this handle has another identity's genesis), 7 unreachable (no peer heard and no seed answer: GREY, never a verdict), 8 leaving (a departure request out, its approval words shown).
+/// Where this device stands with the identity whose roots it holds (the `fgtw` endpoint's op 1 state byte; pairing-v2's lamp). 0 no roots, 1 joining (the identity has a fleet, this device is not in it yet: RED, words shown), 2 bound waiting for the fleet key, 3 a member with the key, 4 looking the identity up, 5 fresh (fgtw.org holds no chain and no fleet device is heard: it may be minted), 6 wrong fleet (the seed's chain for this handle has another identity's genesis), 7 unreachable (no peer heard and no seed answer: GREY, never a verdict), 8 leaving (a departure request out, its approval words shown), 9 owned elsewhere (fgtw.org says this device is in another identity's fleet: no words).
 const V_NONE: u8 = 0;
 const V_JOIN: u8 = 1;
 const V_LOOKING: u8 = 4;
@@ -371,6 +371,8 @@ const V_WRONG: u8 = 6;
 const V_UNREACHABLE: u8 = 7;
 /// Leaving: a departure request is out (op 5) and its approval words are shown until a surviving device of the fleet approves and the chain no longer holds this device.
 const V_LEAVING: u8 = 8;
+/// Owned elsewhere: fgtw.org refused this device's binding request because the device is in another identity's fleet (`device_owned`). No words; only that fleet can let it go.
+const V_OWNED: u8 = 9;
 
 /// The kept departure's name in the `fgtw.` scope: one VSF document, section `depart`, with `rq` the signed `depart_req` frame as a binary blob (its stamp and consent inside it) and `wd` the three approval words.
 /// Nothing of the identity is in it: the frame is this device's signature over its consent, and which identity it leaves is proven again at resume by checking the consent's Ed25519 egg against the roots then in hand (`resume_depart`).
@@ -505,6 +507,8 @@ struct Client {
     fleet_key: Option<[u8; 32]>,
     /// The fleet's members as the last chain this client adopted folds them (the Fleet page's list, op 6): device keys, this one among them.
     members: Vec<[u8; 32]>,
+    /// The chain's ops said on the console so far (`note_members`): its whole history the first time this run adopts one, then each op added after.
+    chain_seen: usize,
     pt: Pt,
     sponsors: Vec<Sponsor>,
     /// This device's current binding request and its stamp (re-minted every 210 s while unbound, as the app re-posts).
@@ -852,8 +856,55 @@ impl Client {
     fn note_members(&mut self, blob: &fgtw::fleet::MembershipBlob) {
         if let Ok(m) = blob.fold() {
             self.members = m;
+            self.say_chain(blob);
             // The held copy too (fgtw::held): what a sponsor's Add extends when the seed does not answer.
             fgtw::held::ChainHold::hold(&self.held, blob);
+        }
+    }
+
+    /// The fleet's history on the console (owner, 2026-11-09, after a device joined with nobody remembering how: "do we have logs of the event?"): each op of the chain this run has not said yet, what it did to which device, signed by which, and when. The chain itself is the record, signed op by op and held by fgtw.org and every member; this is it read out.
+    fn say_chain(&mut self, blob: &fgtw::fleet::MembershipBlob) {
+        if blob.ops.len() <= self.chain_seen {
+            return;
+        }
+        let seed = self.identity_seed;
+        for (i, op) in blob.ops.iter().enumerate().skip(self.chain_seen) {
+            use fgtw::fleet::OpKind as K;
+            self.log.put(b"fgtw: fleet op ");
+            self.log.dec(i as u64);
+            self.log.put(match op.kind {
+                K::Genesis => b": founded by ".as_slice(),
+                K::Add => b": added ",
+                K::Remove => b": removed ",
+                K::Checkpoint => b": checkpoint by ",
+                K::Declare => b": keys declared by ",
+                K::Lock => b": locked out ",
+                K::Unlock => b": unlocked ",
+            });
+            self.say_device(&op.device_pubkey, seed);
+            if op.signer_pubkey != op.device_pubkey {
+                self.log.put(b", signed by ");
+                self.say_device(&op.signer_pubkey, seed);
+            }
+            self.log.put(b", at Eagle second ");
+            self.log.dec((op.eagle_time / vsf::OSCILLATIONS_PER_SECOND as i64) as u64);
+            self.log.line();
+        }
+        self.chain_seen = blob.ops.len();
+    }
+
+    /// A device as the Fleet page names it (its two words, when the identity is in hand) and its key's fingerprint.
+    fn say_device(&mut self, key: &[u8; 32], seed: Option<[u8; 32]>) {
+        if let Some(s) = seed {
+            let name = fgtw::pair::device_name_default(key, &s);
+            self.log.put(name.as_bytes());
+            self.log.put(b" ");
+        }
+        self.log.put(b"(");
+        self.log.fp(key);
+        self.log.put(b")");
+        if *key == self.me {
+            self.log.put(b" this device");
         }
     }
 
@@ -1150,7 +1201,9 @@ impl Client {
             Err(_) => fgtw::attest::SeedAnswer::Unreachable,
         };
         use fgtw::attest::AttestVerdict as A;
-        let v = match fgtw::attest::attest_verdict(&hp, &self.me, None, &[], answer) {
+        let a = fgtw::attest::attest_verdict(&hp, &self.me, None, &[], answer);
+        let member = matches!(a, A::Member);
+        let v = match a {
             A::Member => {
                 if let Ok(Some(b)) = &fetched {
                     if let Ok(bytes) = b.to_vsf_bytes() {
@@ -1165,12 +1218,31 @@ impl Client {
             A::Fresh => if heard { V_JOIN } else { V_FRESH },
             A::Unreachable | A::Unverifiable(_) => if heard { V_JOIN } else { V_UNREACHABLE },
         };
+        // A device that is no member here: is it another identity's? fgtw.org's registry answers (`device_owner_get`, never whose) before the screen offers to mint or shows join words. Unanswered, the verdict stands: the genesis and the binding request meet the same gate at the seed.
+        let owned = if !member && matches!(v, V_FRESH | V_JOIN) {
+            let t2 = self.seed();
+            let r = fgtw::client::device_owned_elsewhere(&t2, &self.me, &hp);
+            self.log.put(match &r {
+                Ok(true) => b"fgtw: owner: fgtw.org says another identity holds this device".as_slice(),
+                Ok(false) => b"fgtw: owner: fgtw.org says no other identity holds this device",
+                Err(_) => b"fgtw: owner: no answer: ",
+            });
+            if let Err(e) = &r {
+                self.log.put(e.as_bytes());
+            }
+            self.log.line();
+            r == Ok(true)
+        } else {
+            false
+        };
+        let v = if owned { V_OWNED } else { v };
         if v != self.verdict {
             self.log.put(match v {
                 V_JOIN if self.bound => b"fgtw: this device is a member of the identity's fleet".as_slice(),
                 V_JOIN => b"fgtw: this identity has a fleet: waiting to be added from one of its devices",
                 V_FRESH => b"fgtw: fgtw.org holds no chain for this handle and no fleet device is heard: it may be minted",
                 V_WRONG => b"fgtw: fgtw.org's chain for this handle claims another slot",
+                V_OWNED => b"fgtw: fgtw.org says this device belongs to another identity's fleet: no mint, no words",
                 _ => b"fgtw: neither a fleet device nor fgtw.org answers: no verdict (GREY)",
             });
             self.log.line();
@@ -1222,6 +1294,12 @@ impl Client {
                 self.verdict = V_JOIN;
                 4
             }
+            Err(e) if e.contains("another identity's fleet") => {
+                self.log.put(b"fgtw: the genesis was refused: this device belongs to another identity's fleet");
+                self.log.line();
+                self.verdict = V_OWNED;
+                5
+            }
             Err(e) => {
                 self.log.put(b"fgtw: the genesis did not land: ");
                 self.log.put(e.as_bytes());
@@ -1265,6 +1343,14 @@ impl Client {
                 // The same request to fgtw.org's registry, as the app posts it: a sponsor lists its candidates from the registry and from requests handed to it on the LAN, and matches the typed words and the heard BLE beacon only against those. Handed over the LAN alone, a request never reached a sponsor this device could not hear (a WiFi that passes no multicast between its clients), and the sponsor had nothing to match (2026-11-04, owner: "does not register").
                 match self.post_request(&req, &hp) {
                     Ok(()) => self.log.put(b"fgtw: binding request posted to fgtw.org"),
+                    // fgtw.org's registry has this device's key in another identity's fleet (its device → owner index): a final answer, not a failed post (owner, 2026-11-09, "Ira is bound": a released 8a showed join words for a second handle). The request is dropped, so no words, no LAN copy and no tap; the device stays its owner's until that fleet lets it go (a departure to a new owner releases the claim).
+                    Err(e) if e.starts_with("device_owned") => {
+                        self.log.put(b"fgtw: binding request refused by fgtw.org: this device belongs to another identity's fleet");
+                        self.request_frame.clear();
+                        self.request_t = 0;
+                        self.radios(None);
+                        self.verdict = V_OWNED;
+                    }
                     Err(e) => {
                         self.log.put(b"fgtw: binding request not posted to fgtw.org: ");
                         self.log.put(e.as_bytes());
@@ -2308,6 +2394,16 @@ impl Client {
 
 static mut GRANTS: u64 = 0;
 
+/// The fgtw crate's own account of what it did (a seed mirror that failed, a refused add), on the console as this process's lines are.
+fn crate_log(s: &str) {
+    let mut b = Vec::with_capacity(s.len() + 14);
+    b.extend_from_slice(b"fgtw: crate: ");
+    b.extend_from_slice(s.as_bytes());
+    b.push(b'\n');
+    let mut r = [0u8; 16];
+    ferros_sys::call(cap(unsafe { GRANTS }, 0), &b, &mut r);
+}
+
 extern "C" fn work(_: u64) -> ! {
     let grants = unsafe { GRANTS };
     let base = ferros_sys::arc_base();
@@ -2333,7 +2429,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: false, listen_pass: 0, listen_said: (255, 255), ble_said: (0, 0), depart_ask: None, entry: 0, space: space::SpaceSync::new() };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: false, listen_pass: 0, listen_said: (255, 255), ble_said: (0, 0), depart_ask: None, entry: 0, space: space::SpaceSync::new() };
     c.run()
 }
 
@@ -2345,6 +2441,7 @@ pub extern "C" fn fgtw_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     unsafe { GRANTS = grants };
     fgtw::set_entropy(kernel_entropy);
+    fgtw::set_log(crate_log);
     if input_len >= 19 {
         let mut b = [0u8; 19];
         for (k, x) in b.iter_mut().enumerate() {

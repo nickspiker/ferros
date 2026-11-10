@@ -415,6 +415,8 @@ enum Mode {
     Grey([u8; 32]),
     /// fgtw.org's chain for the handle is another identity's: enter starts over.
     Wrong,
+    /// fgtw.org refused the binding request: this device is in another identity's fleet (fgtw verdict 9). Enter starts over.
+    Owned,
     /// After attest, the keyboard for words the identity service wants typed (the Fleet page, fgtw ops 15 and 16): 1 a newcomer's pairing words, 2 a leaver's approval words. Nothing of the handle is in it.
     Words(u8),
     /// After attest, waiting for words to be wanted, the window gone.
@@ -616,7 +618,7 @@ impl Ahau {
 
     /// Whether a step back to the entry exists: from any step after a first entry (owner, 2026-10-28: "we need a way to go back to the previous screen").
     fn can_go_back(&self) -> bool {
-        matches!(self.mode, Mode::Looking(_) | Mode::Join(_) | Mode::Mint(_) | Mode::Grey(_) | Mode::Wrong | Mode::Networks | Mode::Pass)
+        matches!(self.mode, Mode::Looking(_) | Mode::Join(_) | Mode::Mint(_) | Mode::Grey(_) | Mode::Wrong | Mode::Owned | Mode::Networks | Mode::Pass)
     }
 
     /// The button under the entry line: its rectangle (x0, y0, x1, y1). With a step back, it moves right and `back` takes the left.
@@ -648,7 +650,7 @@ impl Ahau {
         match self.mode {
             Mode::Fresh => Some(if self.bound { "unlock" } else { "bind" }),
             Mode::Mint(_) => Some("mint"),
-            Mode::Wrong => Some("start over"),
+            Mode::Wrong | Mode::Owned => Some("start over"),
             Mode::Words(_) => Some("cancel"),
             Mode::Networks if !self.joining => Some("scan"),
             Mode::Networks if self.joining => Some("joining"),
@@ -973,6 +975,7 @@ impl Ahau {
             5 => Mode::Mint(seed),
             6 => Mode::Wrong,
             7 => Mode::Grey(seed),
+            9 => Mode::Owned,
             _ => return false,
         };
         if next == self.mode && (same_words || !matches!(next, Mode::Join(_))) {
@@ -1880,6 +1883,7 @@ impl Ahau {
             Mode::Grey(_) if !ferros_sys::data_link_up(&ferros_sys::facts()) => "Waiting for connectivity.",
             Mode::Grey(_) => "No answer yet. Still looking.",
             Mode::Wrong => "This handle's record doesn't match.\nStart over with another.",
+            Mode::Owned => "This device belongs to another identity.\nOnly its fleet can let it go.",
             Mode::Words(1) => "Type the words the new device shows.",
             Mode::Words(_) => "Type the words the leaving device shows,\nthen enter.",
             Mode::Hosting => "",
@@ -1923,7 +1927,7 @@ impl Ahau {
             }
             Mode::Hosting => return,
             Mode::Join(_) | Mode::Grey(_) => return,
-            Mode::Wrong => {
+            Mode::Wrong | Mode::Owned => {
                 self.mode = Mode::Fresh;
                 self.status(self.prompt());
                 self.words();

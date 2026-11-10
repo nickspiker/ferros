@@ -415,6 +415,8 @@ impl KVault {
                 return Err(KvError::Belongs);
             }
             self.wipe_identity()?;
+            // The (empty) name list written at once: it is what recognises this identity here after a bind, and one that stores nothing in the kernel's vault (everything in the vault process since 2026-11) would otherwise have none and be refused as another's at its next unlock (the 8a, 2026-11-09: bound in boot 117, its own handle refused in 118).
+            self.put_names(Class::Identity, &[])?;
         }
         if keep {
             self.raw_put(ID_UNLOCK, seed)?;
@@ -455,6 +457,10 @@ impl KVault {
     pub fn bind(&mut self) -> Result<(), KvError> {
         if self.id.is_none() {
             return Err(KvError::Locked);
+        }
+        // The identity's name list before the mark, for an identity unlocked by a kernel from before `unlock` wrote it: without it the bound identity's next unlock is refused.
+        if self.raw_get_in(Class::Identity, ID_NAMES)?.is_none() {
+            self.put_names(Class::Identity, &[])?;
         }
         self.raw_put(ID_BOUND, &[1])?;
         Ok(())
