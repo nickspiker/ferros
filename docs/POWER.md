@@ -169,3 +169,29 @@ Today's dark profile keeps the X3 and the service loop running, so the pets go o
 - **Entry:** stop the watchdogs as the very last step before the cores go down, so everything up to that point stays covered.
 - **Resume:** arm them as the very first step, as `arm_safety` does at boot, so a hang while waking resets within 1 s.
 - **Optional, only if the sleep state itself is ever distrusted:** keep them running through the sleep with a long window and a wake timer that pets them.
+
+## 2026-11-10: the screen-off draw had doubled
+
+Owner: the Pro, screen off overnight, lost 70 % in 8 h unplugged. Measured with the cable in, screen off: **1.07-1.13 W**, against 0.58 W on 2026-10-25; unplugged 0.89 W. Since then the modem registers, WiFi, Bluetooth, NFC, GPS and the sensors run from boot, and the GPU is no longer gated.
+
+**Killing a process measures nothing**: its hardware stays as it was. Display, NFC, sensors, pcie1 and modem killed one at a time moved the draw by under 20 mW each (NFC and the sensors power their chips down on kill; the rest do not). What did measure:
+
+| what | screen-off draw |
+|---|---|
+| the CP powered off (`husky-modem.sh off`) | 55 mW less |
+| GPS powered off (`diag gps off`) | 17 mW less |
+| Bluetooth off | nothing measurable |
+| WiFi power save PM2 (it ran PM0, awake every beacon) | **150 mW less** (1069 → 920) |
+| NFC discovery stopped | ~20 mW less |
+
+- The rail meters' count is 20 bits and stops at G#F_FFFF after 2.3 h at 125 Hz: a meter enabled long ago reads every batch as reset (`85 rails unknown`). Clearing METER_EN by hand (`diag acpm u <0|1> A 8 0 1` then `... 8 1 1`) made them read; `odpm start` now does it (kernel, built 2026-11-10, not yet flashed).
+- **VSYS_PWR_IFPMIC overreads like BB_HLDO**: it read 410 mW with the CP up and 94 with it off, while the battery saw 55 mW between the two. Trust the battery for the modem.
+- What the rails still show above 2026-10-25 with the screen off: the WiFi PCIe link held in L0 (L24S_HSI 31 → 67 mW, L3S_PCIE1 41 new), the GPU's rails at its top clock (~40 mW, 8 when it was gated), the X3 holding the kernel (41 mW; Android's big core sleeps power-collapsed at 2).
+
+Changes:
+- pcie1: power save follows the screen when the knob is unset or "with the screen" (the new default): PM2 while it is off, off while it is on (RADIO-CONTROLS.md).
+- modem: SET_SCREEN_STATE at every screen change (it was sent once, on), and the signal asked for only while the screen is on.
+- nfc: no discovery and controller sub-state "screen off" while the screen is off, a pass every 16 ms instead of every millisecond.
+- kernel (not yet flashed): the GPU's clock to its floor with the dark profile; the power window says how many samples were taken at each clock state; `odpm start` clears the meters.
+
+Screen off, every radio up, cable in: **0.93-1.01 W** after the three process changes. Left, by size: the WiFi PCIe link's L1 substates (Linux runs `use-l1ss` on pcie_1), real sleep (cores power-collapsed, then the SoC's own sleep with wake sources: the power key, the modem, WiFi, the RTC), GPS while dark (17 mW, the owner's call: a slower first fix after each wake), the USB re-init churn with the cable out.

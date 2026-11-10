@@ -1302,6 +1302,8 @@ struct PowerWin {
     min_ua: i32,
     max_ua: i32,
     secs: u64,
+    /// The clock policy's state at each sample (CLOCK_STATE: 0 not applied, 1 rest, 2 active, 3 dark), so a reading says what it measured.
+    states: [u32; 4],
 }
 static mut POWER_WIN: Option<PowerWin> = None;
 static mut POWER_RESULT: Option<alloc::string::String> = None;
@@ -1325,7 +1327,7 @@ fn power_start(secs: u64, gap16: u64, input: bool, delay: u64) -> alloc::string:
     let settle = now + f / 2 + delay.min(120) * f;
     unsafe {
         POWER_RESULT = None;
-        POWER_WIN = Some(PowerWin { settle, end: settle + secs * f, next: settle, gap: (gap16.clamp(1, 64) * f / 16).max(1), charger_prev, input_prev, sum_ua: 0, sum_uv: 0, n: 0, min_ua: i32::MAX, max_ua: i32::MIN, secs });
+        POWER_WIN = Some(PowerWin { settle, end: settle + secs * f, next: settle, gap: (gap16.clamp(1, 64) * f / 16).max(1), charger_prev, input_prev, sum_ua: 0, sum_uv: 0, n: 0, min_ua: i32::MAX, max_ua: i32::MIN, secs, states: [0; 4] });
     }
     msg += &alloc::format!("power window: {secs} s from half a second after the charger cut{}; read it with `diag power`\n", if input_prev.is_some() { ", CHGIN deselected" } else { "" });
     msg
@@ -1343,6 +1345,8 @@ fn power_poll() {
             w.n += 1;
             w.min_ua = w.min_ua.min(g.current_ua);
             w.max_ua = w.max_ua.max(g.current_ua);
+            // CLOCK_STATE is only ever 0 to 3 (clock_profile's `want`): indexed as is.
+            w.states[unsafe { CLOCK_STATE } as usize] += 1;
         }
     }
     if now >= w.end {
@@ -1360,7 +1364,7 @@ fn power_poll() {
         if w.n > 0 {
             let ma = w.sum_ua / w.n as i64 / 1000;
             let mv = w.sum_uv / w.n as u64 / 1000;
-            r += &alloc::format!("{} s, {} samples: {ma} mA (min {}, max {}) at {mv} mV = {} mW (negative = discharging)\n", w.secs, w.n, w.min_ua / 1000, w.max_ua / 1000, ma * mv as i64 / 1000);
+            r += &alloc::format!("{} s, {} samples: {ma} mA (min {}, max {}) at {mv} mV = {} mW (negative = discharging); clocks dark {}, rest {}, active {}, unset {} of the samples\n", w.secs, w.n, w.min_ua / 1000, w.max_ua / 1000, ma * mv as i64 / 1000, w.states[3], w.states[1], w.states[2], w.states[0]);
         } else {
             r += "no gauge samples\n";
         }
@@ -1437,8 +1441,22 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
         if want == 3 && workers_dark {
             crate::smp::stop_all();
         }
+        // The GPU's clock with the dark profile, while a gpu process keeps it up.
+        if unsafe { GPU_CLOCKED } && (want == 3) != (was == 3) {
+            gpu_rate(want != 3);
+        }
     }
 }
+/// The GPU's clock at its top (G3D 890, G3DL2 900 MHz) or its floor (150 / 160 MHz), the L2 first going up and last going down (GPU.md "The GPU's clock"). At the top while a `gpu` process lives and the screen is lit; at the floor otherwise, the dark profile included (2026-11-10: the GPU's rails held ~40 mW with the screen off at its top, idle).
+fn gpu_rate(top: bool) {
+    let r = if top {
+        (crate::acpm::dvfs_set(8, 900_000), crate::acpm::dvfs_set(7, 890_000))
+    } else {
+        (crate::acpm::dvfs_set(7, 150_000), crate::acpm::dvfs_set(8, 160_000))
+    };
+    crate::process::push_console(alloc::format!("gpu clock: {} ({:?})\n", if top { "G3D 890, G3DL2 900 MHz" } else { "the floor, 150 / 160 MHz" }, r).as_bytes());
+}
+
 /// `diag smp dark on|off`: whether the workers go off with the dark profile (on by default).
 pub static DARK_WORKERS_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
@@ -1898,12 +1916,7 @@ pub fn run(mut b: Boot) -> ! {
             let live = crate::process::running(b"gpu");
             if live != unsafe { GPU_CLOCKED } {
                 unsafe { GPU_CLOCKED = live };
-                let r = if live {
-                    (crate::acpm::dvfs_set(8, 900_000), crate::acpm::dvfs_set(7, 890_000))
-                } else {
-                    (crate::acpm::dvfs_set(7, 150_000), crate::acpm::dvfs_set(8, 160_000))
-                };
-                crate::process::push_console(alloc::format!("gpu clock: {} ({:?})\n", if live { "G3D 890, G3DL2 900 MHz" } else { "the floor, 150 / 160 MHz" }, r).as_bytes());
+                gpu_rate(live && unsafe { CLOCK_STATE } != 3);
             }
         }
         // No sensors process running, whatever path ended it (its end is caught in end_process and kill as well): its block is forgotten, so the kernel never reads memory that may be another process's now. init's keeper starts it again.

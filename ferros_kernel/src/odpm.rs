@@ -143,7 +143,9 @@ fn wr(pmic: u32, reg: u32, v: u8) {
 fn enable(pmic: u32) {
     // CTRL1: METER_EN (bit 0), INT_SAMP_RATE (bits 4:2) = 4, 125 Hz.
     // CTRL1: EXT_METER_EN (bit 1) as well, for the external shunt channels; CTRL2: all three external channels enabled (bits 5:3), their sampling at 31.25 Hz (bits 2:0 = 2, Google's rate).
+    // METER_EN off first, which clears the accumulators and the sample count: the count is 20 bits and stops at G#F_FFFF after 2^20 samples (2.3 h at 125 Hz), and a meter left on since an earlier sweep then reads every batch as reset under it (2026-11-10: 85 rails unknown until it was cleared by hand).
     let c1 = rd(pmic, CTRL1);
+    wr(pmic, CTRL1, c1 & !1);
     wr(pmic, CTRL1, (c1 & !0x1C) | 4 << 2 | 1 << 1 | 1);
     let c2 = rd(pmic, CTRL2);
     wr(pmic, CTRL2, (c2 & !0x3F) | 0x7 << 3 | 2);
