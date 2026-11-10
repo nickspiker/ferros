@@ -374,6 +374,8 @@ const V_UNREACHABLE: u8 = 7;
 const V_LEAVING: u8 = 8;
 /// Owned elsewhere: fgtw.org refused this device's binding request because the device is in another identity's fleet (`device_owned`). No words; only that fleet can let it go.
 const V_OWNED: u8 = 9;
+/// Selected: a member picked this joining device (the Fleet page's button or an NFC tap) and said so (`bind_select`, owner 2026-11-10: "if you tap, it shouldn't become part of the fleet, it should just get notified it was selected"). Nothing is bound: the attest screen turns green with the selecting device's name (op 1's words), and the join completes when the new chain folds this device in and a fan-out wrap opens, as before. Op 1 only; never a verdict.
+const V_SELECTED: u8 = 10;
 
 /// The kept departure's name in the `fgtw.` scope: one VSF document, section `depart`, with `rq` the signed `depart_req` frame as a binary blob (its stamp, consent and salt inside it).
 /// Nothing of the identity is in it: the frame is this device's signature over its consent, and which identity it leaves is proven again at resume by checking the consent's Ed25519 egg against the roots then in hand (`resume_depart`).
@@ -569,6 +571,12 @@ struct Client {
     denied: Vec<([u8; 32], [u8; 32], i64)>,
     /// This device's own departure denied: the device that denied it, shown on the Fleet page until the person asks again.
     depart_denied: Option<[u8; 32]>,
+    /// The members of the latest chain for our handle handed to this device before it was bound (a sponsor pushes it ahead of its `bind_select`): what a select's sender is checked against.
+    offered: Vec<[u8; 32]>,
+    /// A `bind_select` for this device that came before any chain its sender is in (the frames crossed): its sender, checked again when a chain arrives.
+    select_waiting: Option<[u8; 32]>,
+    /// The member that selected this device, once its select checked out: the green screen until the join completes.
+    selected_by: Option<[u8; 32]>,
     /// Words wanted from the person (op 15, the Fleet page): 0 none, 1 a newcomer's pairing words (the last resort when a tap and BLE fail; a departure takes no words since 2026-11-10). The keyboard's host (the attest screen, ahau) asks for it (op 16), sends what is typed (ops 11, 14), and closes when the words match or the person cancels (op 15 [0]).
     entry: u8,
     /// The person's identity space (space.rs, docs/IDENTITY-SPACE.md): their kists, answers and home screen, kept here and synced with their fleet.
@@ -1229,6 +1237,9 @@ impl Client {
         self.bound = false;
         self.fleet_key = None;
         self.members.clear();
+        self.offered.clear();
+        self.select_waiting = None;
+        self.selected_by = None;
         self.sponsors.clear();
         self.request_t = 0;
         self.request_frame.clear();
@@ -1550,6 +1561,15 @@ impl Client {
                         if bound && !self.bound {
                             self.became_bound();
                         }
+                        // Not bound yet: the members a sponsor's select is checked against, and a select that came first checked now.
+                        if !bound {
+                            if let Ok(m) = blob.fold() {
+                                self.offered = m;
+                            }
+                            if let Some(s) = self.select_waiting.take() {
+                                self.select_from(s);
+                            }
+                        }
                         // A chain for our handle from a device of FGTW: the identity has a fleet, whatever fgtw.org would say.
                         if !bound && matches!(self.verdict, V_LOOKING | V_FRESH | V_UNREACHABLE) {
                             self.hold_chain(&chain);
@@ -1597,6 +1617,13 @@ impl Client {
                     }
                 }
             }
+            // A member picked this device (its Fleet page's button or an NFC tap): green, nothing bound. Only for the handle this device is joining and for its own key; anything else is dropped without a word.
+            Ok((Inbound::BindSelect { hp, joiner }, signer)) => {
+                if self.bound || self.hp != Some(hp) || joiner != self.me {
+                    return;
+                }
+                self.select_from(signer);
+            }
             // A newcomer asking this device to add it, and a sibling asking to leave: the sponsor's and the approver's frames (fgtw::sponsor).
             Ok((Inbound::Other(name), _)) if name == "bind_req" => self.on_bind_req(from, bytes),
             Ok((Inbound::Other(name), _)) if name == "depart_req" => self.on_depart_req(bytes),
@@ -1613,6 +1640,24 @@ impl Client {
                 self.log.line();
             }
             Err(_) => {}
+        }
+    }
+
+    /// A select's sender checked: a current member of the chain offered for our handle (its genesis this identity's, folded, so a device locked out or removed is not in it), or of the chain this device holds. Until a chain naming it arrives the select waits (the sponsor pushes the chain first, but the frames may cross).
+    fn select_from(&mut self, sender: [u8; 32]) {
+        if self.bound {
+            return;
+        }
+        if !self.offered.contains(&sender) && !self.members.contains(&sender) {
+            self.select_waiting = Some(sender);
+            return;
+        }
+        if self.selected_by != Some(sender) {
+            self.selected_by = Some(sender);
+            self.log.put(b"fgtw: selected by ");
+            self.log.fp(&sender);
+            self.log.put(b": green, waiting for the new chain and the fleet key");
+            self.log.line();
         }
     }
 
@@ -1820,10 +1865,15 @@ impl Client {
                     (true, true, true) => 3,
                 };
                 let state = if self.depart.is_some() { V_LEAVING } else { state };
+                // Selected by a member and not bound yet: the green screen, the selecting device's name after the state.
+                let state = if !self.bound && self.depart.is_none() && self.selected_by.is_some() { V_SELECTED } else { state };
                 reply.push(state);
                 reply.push(self.sponsors.len().min(255) as u8);
+                if let (Some(seed), V_SELECTED, Some(by)) = (self.identity_seed, state, self.selected_by) {
+                    reply.extend_from_slice(fgtw::pair::device_name_default(&by, &seed).as_bytes());
+                }
                 // Joining's pairing words follow the state, the last resort when a tap and BLE fail; a departure shows none (owner, 2026-11-10), even one resumed before the chain is adopted again.
-                if let (Some(seed), false, V_JOIN, None) = (self.identity_seed, self.bound, self.verdict, &self.depart) {
+                if let (Some(seed), false, V_JOIN, None, None) = (self.identity_seed, self.bound, self.verdict, &self.depart, self.selected_by) {
                     reply.extend_from_slice(join::pair_words(&self.me, &seed).as_bytes());
                 }
                 svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, reply.as_ptr() as u64 - self.udp.base, reply.len() as u64, 0, 0);
@@ -1938,6 +1988,8 @@ impl Client {
     /// What the Fleet page and the map read, in one piece: the state (op 1's), the members (op 6), a departure waiting (op 13), the add flow (op 9), this device's own departure denied, and the space (op 17).
     fn watch_state(&mut self) -> Vec<u8> {
         let mut v = alloc::vec![self.hp.is_some() as u8, self.bound as u8, self.fleet_key.is_some() as u8, self.depart.is_some() as u8, self.verdict, self.sponsors.len() as u8];
+        // The select too: the attest screen turns green on it.
+        v.extend_from_slice(self.selected_by.as_ref().map_or(&[0u8; 32][..], |s| &s[..]));
         v.extend_from_slice(&self.members_reply());
         v.extend_from_slice(&self.depart_ask_reply());
         v.extend_from_slice(&self.adding_reply());
@@ -2665,7 +2717,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: false, listen_pass: 0, listen_said: (255, 255), ble_said: (0, 0), depart_ask: None, denied: Vec::new(), depart_denied: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: false, listen_pass: 0, listen_said: (255, 255), ble_said: (0, 0), depart_ask: None, denied: Vec::new(), depart_denied: None, offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0 };
     c.run()
 }
 

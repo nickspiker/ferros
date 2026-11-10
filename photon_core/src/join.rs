@@ -101,6 +101,8 @@ pub enum Inbound {
     FleetResp { hp: [u8; 32], chain: Vec<u8> },
     /// A fan-out blob for handle `hp` (`fanout_to_bytes` inside).
     FanoutResp { hp: [u8; 32], blob: Vec<u8> },
+    /// A member picked this joining device (`fgtw::protocol::bind_select`): the fleet's handle proof and the selected device's key. Binds nothing; the sender is the selecting member.
+    BindSelect { hp: [u8; 32], joiner: [u8; 32] },
     /// Some other envelope frame, by section name (a sibling's control traffic the device does not handle yet).
     Other(String),
 }
@@ -112,6 +114,13 @@ pub fn parse_frame(bytes: &[u8]) -> Result<(Inbound, [u8; 32]), String> {
     let frame = match section.name.as_str() {
         "fleet_resp" => Inbound::FleetResp { hp: field_handle_proof(&section, "hp").ok_or("fleet_resp missing hp")?, chain: field_ge(&section, "ch").ok_or("fleet_resp missing ch")? },
         "fanout_resp" => Inbound::FanoutResp { hp: field_handle_proof(&section, "hp").ok_or("fanout_resp missing hp")?, blob: field_ge(&section, "bl").ok_or("fanout_resp missing bl")? },
+        "bind_select" => Inbound::BindSelect {
+            hp: field_handle_proof(&section, "hp").ok_or("bind_select missing hp")?,
+            joiner: match section.get_field("dev").and_then(|f| f.values.first()) {
+                Some(vsf::VsfType::ke(b)) if b.len() == 32 => b.as_slice().try_into().map_err(|_| "bind_select dev")?,
+                _ => return Err("bind_select missing dev".into()),
+            },
+        },
         other => Inbound::Other(other.to_string()),
     };
     Ok((frame, signer))

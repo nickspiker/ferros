@@ -606,7 +606,7 @@ enum Mode {
     Looking([u8; 32]),
     /// The identity has a fleet: one of its devices adds this one with the words shown (or the tap); the screen closes when the fleet binds it.
     Join([u8; 32]),
-    /// The fleet bound this device (identity service state 2) and its key has not come yet: a device that picked this one from its nearby list (no words typed, no tap) waits for its person to confirm that this screen turned green (fgtw ADD_BOUND). The whole screen VSF RGB primary green, one line of text, nothing to type.
+    /// A member selected this device (identity service state 10: its Fleet page's button or an NFC tap, `bind_select`), or the fleet bound it (state 2), and the fleet key has not come yet: the whole screen VSF RGB primary green, the selecting device's name when it is a select, nothing to type. The member's person presses Add once they see it green.
     Bound([u8; 32]),
     /// No fleet holds the handle: the permanence warning, and the handle again to mint.
     Mint([u8; 32]),
@@ -644,6 +644,8 @@ struct Ahau {
     roots_gen: u64,
     /// `client_thread`'s copy last taken (its sequence count).
     client_seen: u32,
+    /// This device bound to the identity in the vault (`mark_member`), once: at the fleet's bind, never at a select.
+    marked: bool,
     handle: [u8; TEXT_BYTES],
     len: usize,
     chars: usize,
@@ -1169,19 +1171,23 @@ impl Ahau {
             1 => Mode::Join(seed),
             // Bound, the fleet key not here yet: green until it comes (until 2026-11-10 this was taken as attested, and a device picked from the nearby list went on without the key, past the person's confirm).
             2 => {
-                if !matches!(self.mode, Mode::Bound(_)) {
+                if !self.marked {
                     console(self.grants, b"ahau: bound to the identity's fleet; waiting for its key (green)\n");
                     self.mark_member();
+                    self.marked = true;
                 }
                 Mode::Bound(seed)
             }
             3 => {
                 console(self.grants, b"ahau: this device is a member of the identity's fleet\n");
-                if !matches!(self.mode, Mode::Bound(_)) {
+                if !self.marked {
                     self.mark_member();
+                    self.marked = true;
                 }
                 self.attested();
             }
+            // Selected by a member (fgtw V_SELECTED, owner 2026-11-10): green with its name (the copy's words), nothing bound here; the join completes when the chain and the key come.
+            10 => Mode::Bound(seed),
             5 => Mode::Mint(seed),
             6 => Mode::Wrong,
             7 => Mode::Grey(seed),
@@ -1475,7 +1481,11 @@ impl Ahau {
         Front::fill64(window::PORCH, (self.w * self.h) as u64, self.bg());
         // The bound screen: green, its one line, nothing to type or press.
         if matches!(self.mode, Mode::Bound(_)) {
-            self.status(self.prompt());
+            // Selected: the selecting device's name came in the copy's words (fgtw op 1); bound: none.
+            let mut l = Line::new();
+            let name = core::str::from_utf8(&self.word_buf[..self.word_len]).unwrap_or("");
+            let _ = if name.is_empty() { core::fmt::Write::write_str(&mut l, self.prompt()) } else { core::fmt::Write::write_fmt(&mut l, format_args!("Selected by {name}.\nWaiting for the fleet's keys.")) };
+            self.status(core::str::from_utf8(l.as_bytes()).unwrap_or(""));
             self.show();
             return;
         }
@@ -2083,7 +2093,7 @@ impl Ahau {
             Mode::Looking(_) if !ferros_sys::data_link_up(&ferros_sys::facts()) => "Waiting for connectivity.",
             Mode::Looking(_) => "Finding this identity.",
             Mode::Join(_) => "Use an existing device to bind this device to your fleet.",
-            Mode::Bound(_) => "Bound to your fleet.\nConfirm on the device adding this one.",
+            Mode::Bound(_) => "Bound to your fleet.\nWaiting for its keys.",
             Mode::Mint(_) => "This handle is unclaimed.\nMinting is permanent.\nType your handle again to mint your identity.",
             Mode::Grey(_) if !ferros_sys::data_link_up(&ferros_sys::facts()) => "Waiting for connectivity.",
             Mode::Grey(_) => "No answer yet. Still looking.",
@@ -2962,7 +2972,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, roots_gen: 0, client_seen: 0, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, nets_seen: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0) };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, roots_gen: 0, client_seen: 0, marked: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, nets_seen: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0) };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     // The identity service's two threads (`roots_thread`, `client_thread`): both sleep until a handle is typed.
     ferros_sys::thread_spawn(roots_thread, unsafe { &mut *(&raw mut ROOTS_STACK) }, grants);
