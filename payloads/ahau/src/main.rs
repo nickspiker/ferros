@@ -2895,15 +2895,26 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     let mut q = [0xFFu8; 1];
                     if call(display, &m, &mut q) == 1 && (q[0] < 5 || q[0] == 9) {
                         orb = Some((q[0], x, y, false));
+                        // The back button of the helm lit at once (display op 54).
+                        if q[0] == 9 {
+                            helm_light(display, 9, 0.5);
+                        }
                     }
                 }
                 Some((what, x0, y0, false)) => {
                     let (ux, uy) = ((a.w as i64 / 2 - x0) as f32, (a.h as i64 / 2 - y0) as f32);
                     let inward = ((x - x0) as f32 * ux + (y - y0) as f32 * uy) / libm::sqrtf(ux * ux + uy * uy);
                     let span = (2 * a.w * a.h) as f32 / (a.w + a.h) as f32;
+                    // The helm's back button follows the swipe, as the map's does: ½(1 + tanh(inward / threshold)).
+                    if what & 0x7F == 9 {
+                        helm_light(display, 9, 0.5 * (1.0 + libm::tanhf(inward / (span * (1. / 12.)))));
+                    }
                     if inward > span * (1. / 12.) {
                         // Acted: the lift is not a tap as well (a swipe first seen already far from its landing never set the moved bit).
                         orb = Some((what | 0x80, x0, y0, true));
+                        if what & 0x7F == 9 {
+                            helm_light(display, 9, 1.0);
+                        }
                         match what & 0x7F {
                             1 => a.net_pull(),
                             9 if a.can_go_back() => a.go_back(),
@@ -2918,6 +2929,10 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
                 _ => {}
             }
+        }
+        // The helm's back button let go: its light out (the display fades it).
+        if k == 0 && orb.is_some_and(|o| o.0 & 0x7F == 9) {
+            helm_light(display, 9, 0.0);
         }
         if k == 0 {
             match orb {
@@ -3144,4 +3159,11 @@ fn board_px(b: &Board, tint: &[[u16; 3]; 64], i: usize) -> u64 {
 /// A board pixel's see-through part (`Board::clear`, 0 to 255) as the display's working transparency: Q14 in bits 49-62, or bit 63 when clear through.
 fn clear_bits(c: u8) -> u64 {
     if c == 255 { 1 << 63 } else { ((c as u64) << 6) << 49 }
+}
+
+/// A helm button's light (display op 54): `corner` 8 home or 9 back, `level` 0 to 1.
+fn helm_light(display: u64, corner: u8, level: f32) {
+    let q = ((level * 65535.0) as u16).to_le_bytes();
+    let mut r = [0u8; 4];
+    let _ = call(display, &[54, corner, q[0], q[1]], &mut r);
 }

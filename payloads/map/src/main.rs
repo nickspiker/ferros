@@ -2704,6 +2704,13 @@ impl Map {
         self.page_dx != 0 || self.fling != 0. || self.spring.is_some() || self.pan.is_some() || self.knob.is_some() || flying
     }
 
+    /// A helm button's light (display op 54): `corner` 8 home or 9 back, `level` 0 to 1.
+    fn helm_light(&self, corner: u8, level: f32) {
+        let q = ((level * 65535.0) as u16).to_le_bytes();
+        let mut r = [0u8; 4];
+        let _ = call(self.display, &[54, corner, q[0], q[1]], &mut r);
+    }
+
     /// The back corner, one level at a time (owner, 2026-11-09: "pressing back ... should stop me trying to leave and go to the regular fleet page, then back again goes to the list of all the categories, then back again should go to the home screen"): on the Fleet page a departure under way is given up (fgtw op 20), the remove row's armed confirm disarmed, an add flow closed; then a settings page goes to the page picker; then the picker, or a kist's page, closes to every circle. What it did, for the console.
     fn back_step(&mut self) -> &'static str {
         if self.view == View::Open(0) && PAGES[self.page] == "fleet" {
@@ -3484,6 +3491,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             let hit = if call(map.display, &[41, xb[0], xb[1], yb[0], yb[1]], &mut q) >= 1 { q[0] } else { 0xFF };
             // A radio's console circle too (0-4, as 16 + its bit): dragged toward the centre it opens that radio's page; tapped still, it switches as before.
             corner = if hit == 8 || hit == 9 { hit } else if hit < 5 { 16 | hit } else { 0 };
+            // A helm button under the finger: lit at once (display op 54).
+            if corner == 8 || corner == 9 {
+                map.helm_light(corner, 0.5);
+            }
             corner_at = (f.1, f.2);
             corner_from = (f.1, f.2);
             corner_done = false;
@@ -3519,6 +3530,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 let (ux, uy) = ((w / 2 - corner_from.0) as f64, (h / 2 - corner_from.1) as f64);
                 let inward = ((corner_at.0 - corner_from.0) as f64 * ux + (corner_at.1 - corner_from.1) as f64 * uy) / libm::sqrt(ux * ux + uy * uy);
                 let span = (2 * w * h) as f64 / (w + h) as f64;
+                // The helm button's light follows the swipe: half at the landing, toward full as the finger comes in (½(1 + tanh(inward / threshold)), C∞, lower again if it pulls away), full once it acted.
+                if corner == 8 || corner == 9 {
+                    let lvl = if corner_done { 1.0 } else { 0.5 * (1.0 + libm::tanh(inward / (span / 12.))) };
+                    map.helm_light(corner, lvl as f32);
+                }
                 if !corner_done && inward > span / 12. {
                     corner_done = true;
                     if corner & 16 != 0 {
@@ -3541,6 +3557,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if held == 0 && down {
             down = false;
             map.touching = false;
+            // The helm button let go: its light out (the display fades it).
+            if corner == 8 || corner == 9 {
+                map.helm_light(corner, 0.0);
+            }
             // A corner's session let go: it acted while moving (above), if it went far enough inward. A still tap on a corner circle is a tap as before (on the home circle it closes the open settings).
             if corner != 0 && !moved {
                 corner = 0;

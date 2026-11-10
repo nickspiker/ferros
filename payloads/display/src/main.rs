@@ -49,7 +49,7 @@ use odt::{odt_tables, panel_gamma, pow};
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use ferros_sys::{cap, console, freq, mmio_read, mmio_write, now};
 use draw::Px;
 
@@ -4229,10 +4229,27 @@ fn wall_sample(buf: &mut [u64], table: &[u16], n: usize, s: usize, code: u16) {
 
 /// Whether the helm has been drawn (it shows nothing that changes; drawn once, at the first pass).
 static mut HELM_DRAWN: bool = false;
+/// The helm's light (the bottom corners' two buttons; owner, 2026-11-09: light them up), home [0] and back [1]: the level a client last reported (op 54, Q16: a finger landed, how far its swipe has come, acted), and the level drawn, which follows a rise at once and halves what is left of a fall each render pass, so a release fades out by frames and never by a timer.
+static HELM_TARGET: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+static mut HELM_LEVEL: [f32; 2] = [0.0; 2];
 
 /// The helm (owner, 2026-11-07): the bottom corners' marks into the bars' bottom rows, front to back from empty in fluor's α + darkness, then decoded. Home, at the bottom right: a 2-pixel stroked circle tangent to the glass's edge and the app's circle (the corner's middle circle, which `corner_layout` solved tangent to both), the stroke inside it. Back, at the bottom left: a left arrow, 2-pixel strokes, on that corner's middle circle. A stroke's coverage is the C∞ step across two pixels on each side (`bump_step`, slope 1 at its edge as area coverage), from the distance to its centre line. Returns whether it drew.
 fn helm_draw(width: usize, height: usize) -> bool {
     use fluor::pixel::{Blend, BlendMode};
+    // The corners' light a pass on: a change redraws the helm.
+    for k in 0..2 {
+        let target = HELM_TARGET[k].load(Ordering::Acquire) as f32 * (1.0 / 65535.0);
+        let cur = unsafe { HELM_LEVEL[k] };
+        let mut next = if target >= cur { target } else { target + (cur - target) * 0.5 };
+        // At rest once under a 256th of the way: nothing more would show.
+        if libm::fabsf(next - target) < 1.0 / 256.0 {
+            next = target;
+        }
+        if next != cur {
+            unsafe { HELM_LEVEL[k] = next };
+            unsafe { HELM_DRAWN = false };
+        }
+    }
     if unsafe { HELM_DRAWN } {
         return false;
     }
@@ -4256,6 +4273,10 @@ fn helm_draw(width: usize, height: usize) -> bool {
             Corner::Back => true,
             _ => continue,
         };
+        // Lit: the stroke brightens toward white and a soft light fills the circle behind it, a layer of its own under the stroke (front to back, the glow a coloured layer), both by the corner's level.
+        let lvl = unsafe { HELM_LEVEL[back as usize] };
+        let lit_ink = g2t_colour((9000.0 + 7000.0 * lvl, 9000.0 + 7000.0 * lvl, 9000.0 + 7000.0 * lvl));
+        let glow = g2t_colour((6000.0, 6000.0, 6000.0));
         // The distance from a point to the mark's centre line.
         let dist = |px: f32, py: f32| -> f32 {
             if !back {
@@ -4285,10 +4306,18 @@ fn helm_draw(width: usize, height: usize) -> bool {
                 if px < 0 || px >= width as i64 {
                     continue;
                 }
-                let cov = stroke(dist(px as f32 + 0.5, py as f32 + 0.5));
+                let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
+                let cov = stroke(dist(fx, fy));
+                let i = row * width + px as usize;
                 if cov > 0.0 {
-                    let i = row * width + px as usize;
-                    bar[i] = bar[i].under(ink | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
+                    bar[i] = bar[i].under(if lvl > 0.0 { lit_ink } else { ink } | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
+                }
+                if lvl > 0.0 {
+                    // The fill's coverage: the circle's, its edge a pixel wide.
+                    let fill = draw::bump_step((r - libm::sqrtf((fx - x) * (fx - x) + (fy - y) * (fy - y))) * 0.5 + 0.5);
+                    if fill > 0.0 {
+                        bar[i] = bar[i].under(glow | ((fill * lvl * 0.5 * 65535.0) as u64) << 48, BlendMode::Normal);
+                    }
                 }
             }
         }
@@ -5202,6 +5231,17 @@ extern "C" fn receive(grants: u64) -> ! {
             let (x, y) = (u16::from_le_bytes([msg[9], msg[10]]) as i64, u16::from_le_bytes([msg[11], msg[12]]) as i64);
             let yes = mine.is_some() && owner_at(x, y, w as usize, h as usize) == mine;
             ferros_sys::reply(&tok, &[yes as u8]);
+            continue;
+        }
+        // 54 `corner light [corner u8: 8 home, 9 back][level u16 Q16]`: a client's finger on a bottom corner (owner, 2026-11-09: light up corners), the helm drawing it (`helm_draw`). → [0].
+        if op == 54 && n >= 4 {
+            let level = u16::from_le_bytes([msg[2], msg[3]]) as u32;
+            match msg[1] {
+                8 => HELM_TARGET[0].store(level, Ordering::Release),
+                9 => HELM_TARGET[1].store(level, Ordering::Release),
+                _ => {}
+            }
+            ferros_sys::reply(&tok, &[0]);
             continue;
         }
         if op == 41 && n >= 5 {
