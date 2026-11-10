@@ -101,6 +101,9 @@ struct Ip {
     /// Whether a person is present (SYS_FACTS 83), and when it was last asked (once a second): while nobody is, applications get nothing but the addresses (op 3), AUTH.md "Radios while locked".
     person: bool,
     person_t: u64,
+    /// The screen off (read with `person`, once a second): idle passes back off from 1 to 8 ms, `backoff` the shift of the next idle sleep (0 to 3).
+    dark: bool,
+    backoff: u32,
     /// LINK mode (request 9): 0 both, WiFi preferred; 1 cellular only; 2 WiFi only.
     mode: u8,
 }
@@ -1392,6 +1395,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         cell_t: 0,
         person: false,
         person_t: 0,
+        dark: false,
+        backoff: 0,
         mode: 0,
     };
     // Randomness: the DHCP transaction id and the IPv6 interface identifier (random per session).
@@ -1473,6 +1478,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if t.wrapping_sub(ip.person_t) > ip.freq {
             ip.person_t = t;
             ip.person = ferros_sys::facts().0[83] == 2;
+            ip.dark = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
         }
         // Applications: a polling recv on `udp`.
         let n = svc(RECV, ip.cap(S_UDP), ip.off(msg.as_mut_ptr()), msg.len() as u64, ip.off(tok.as_mut_ptr()), 1);
@@ -1501,9 +1507,16 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             ip.router_solicit();
         }
         ip.flush();
-        // Nothing came in either way: a millisecond's sleep, not a spinning core (it spun from boot once init started it, 2026-10-26).
-        if !busy {
-            ferros_sys::sleep_until(now() + ip.freq / 1000);
+        // Nothing came in either way: a millisecond's sleep, not a spinning core (it spun from boot once init started it, 2026-10-26). With the screen off, each idle pass in a row doubles it up to 8 ms, and anything that comes in brings it back to 1 (2026-11-10: the WiFi and cellular drivers were each asked a thousand times a second in the dark, every one a wakeup of the kernel's core).
+        if busy {
+            ip.backoff = 0;
+        } else {
+            ferros_sys::sleep_until(now() + (ip.freq / 1000 << ip.backoff));
+            ip.backoff = match (ip.dark, ip.backoff) {
+                (false, _) => 0,
+                (true, 3) => 3,
+                (true, b) => b + 1,
+            };
         }
     }
 }

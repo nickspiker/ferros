@@ -3797,6 +3797,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         push_us = 0;
         prev = cur;
         // Locked to the panel while a finger is down: each pass starts when the display's next frame has started (op 24, `frame wait`), so the touch is read fresh right after a refresh begins and the update is ready for the next one — one update a refresh while it fits, every other refresh (steady, no beat) when it does not. Was a fixed 1/120 s after the work: a period of work + 8.3 ms, about 60 a second (2026-10-24); the display replies to a frame before drawing it, so the frame call itself paces nothing. A thirtieth at rest.
+        // The screen off: no frame starts, so a settle waiting on them never steps and `frame wait` came back each refresh period with nothing done, 120 passes a second in the dark, the X3 near full (2026-11-10). Dark, the map rests an eighth of a second a pass and a settle carries on when the frames do.
+        let dark = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
+        if dark {
+            sleep_until(now() + freq() / (1 << 3));
+            continue;
+        }
         if held == 0 && !map.settling {
             sleep_until(now() + freq() / 30);
         } else {
