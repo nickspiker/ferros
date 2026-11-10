@@ -3642,10 +3642,11 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
     let mut out = [(0.0f32, 0.0f32, 0.0f32, Corner::Spare); 16];
     let mut n = 0;
     // Each corner: (left?, top?, middle, along the horizontal edge, along the vertical edge, the next along the horizontal edge). The indicators up top, navigation at the bottom (owner, 2026-11-03); IP is no radio, its measures are the links'. Bluetooth has more to show than NFC, so it takes the larger place, the next along the top (owner, 2026-11-04).
-    // The right corner since 2026-11-09 (owner: "I'd put NFC to the left of BT"): cellular, WiFi, Bluetooth, NFC along the top, nothing down the side.
+    // The right corner since 2026-11-09 (owner: "I'd put NFC to the left of BT"): cellular, WiFi, Bluetooth, NFC along the top, nothing down the side. Not on akita, whose fatter glass corners leave no room for the fourth along the top (owner, 2026-11-09: "8a specifically since the corners have a fatter radius we'll have to move nfc back to where it was"): there NFC goes back down the side.
+    let right: (Option<Corner>, &[Corner]) = if ferros_sys::akita() { (Some(Corner::Nfc), &[Corner::Bluetooth]) } else { (None, &[Corner::Bluetooth, Corner::Nfc]) };
     let jobs: [(bool, bool, Corner, Corner, Option<Corner>, &[Corner]); 4] = [
         (true, true, Corner::Clock, Corner::Battery, Some(Corner::Usb), &[Corner::Gps]),
-        (false, true, Corner::Cellular, Corner::Wifi, None, &[Corner::Bluetooth, Corner::Nfc]),
+        (false, true, Corner::Cellular, Corner::Wifi, right.0, right.1),
         (true, false, Corner::Back, Corner::Spare, Some(Corner::Spare), &[]),
         (false, false, Corner::Home, Corner::Spare, Some(Corner::Spare), &[]),
     ];
