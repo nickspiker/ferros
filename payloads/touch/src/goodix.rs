@@ -173,7 +173,7 @@ impl Goodix {
                     seen[id] = Contact {
                         id: id as u8,
                         phase: 1,
-                        kind: r[0] & 0x0F,
+                        kind: kind(r[0] & 0x0F),
                         pressure: if wide { r[8] } else { 0 },
                         x: le16(r, 2),
                         y: le16(r, 4),
@@ -200,5 +200,14 @@ impl Goodix {
             }
         }
         self.down = now;
+    }
+}
+
+/// A Goodix point's type (the low nibble of its first byte) in the touch endpoint's words, which are the FTM5's (1 finger, 3 stylus, 0 hover; the map takes 1 to 3 as a finger, main.rs). Goodix's Berlin parts say 1 for a stylus hovering and 3 for a stylus touching, and Google's driver takes every other value for a finger (goodix_brl_hw.c `POINT_TYPE_STYLUS_HOVER`, `POINT_TYPE_STYLUS`, `goodix_parse_finger`). Passed through as they came, a finger whose nibble was 0 or past 3 was dropped as "not a finger" and a hovering stylus counted as one (owner on the 8a, 2026-11-10: "the gestures don't work all the time").
+fn kind(t: u8) -> u8 {
+    match t {
+        0x01 => 0,
+        0x03 => 3,
+        _ => 1,
     }
 }
