@@ -53,6 +53,129 @@ pub mod nr {
     pub const CONTROL: u64 = 32;
     pub const CONTROLS: u64 = 33;
     pub const DETAIL: u64 = 34;
+    pub const ZONE: u64 = 35;
+}
+
+/// The clock's zone (kernel zone.rs, SYS_ZONE; docs/TIME.md; owner, 2026-11-10): the identity's choice and this device's own, each automatic (the zone found from the cellular network, then GPS) or by hand (an IANA id), and the switch that says which rules.
+pub mod zone {
+    use super::{nr, off, svc, ERR};
+
+    /// The longest id the kernel holds, and the state's length (kernel zone::ID_MAX, STATE_LEN).
+    pub const ID_MAX: usize = 1 << 6;
+    pub const STATE_LEN: usize = 12 + 4 * (1 + ID_MAX);
+    /// Where the zone in effect comes from (`State::from`).
+    pub const FROM_OFFSET: u8 = 0;
+    pub const FROM_HAND: u8 = 1;
+    pub const FROM_NETWORK: u8 = 2;
+    pub const FROM_POSITION: u8 = 3;
+    /// The identity's choice as written to this device (`State::identity`).
+    pub const IDENTITY_NONE: u8 = 0;
+    pub const IDENTITY_HAND: u8 = 1;
+    pub const IDENTITY_AUTO: u8 = 2;
+
+    /// An IANA id as the kernel holds it; empty for none.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub struct Id {
+        pub b: [u8; ID_MAX],
+        pub n: u8,
+    }
+
+    impl Id {
+        pub fn as_bytes(&self) -> &[u8] {
+            &self.b[..self.n as usize]
+        }
+        pub fn as_str(&self) -> &str {
+            core::str::from_utf8(self.as_bytes()).unwrap_or("")
+        }
+        pub fn is_none(&self) -> bool {
+            self.n == 0
+        }
+    }
+
+    /// The zone's state (SYS_ZONE op 5).
+    #[derive(Clone, Copy)]
+    pub struct State {
+        /// This device follows the identity's choice.
+        pub follow: bool,
+        /// This device's own choice is automatic.
+        pub device_auto: bool,
+        /// The identity's choice as last written here: IDENTITY_NONE, _HAND or _AUTO.
+        pub identity: u8,
+        /// Where the zone in effect comes from (FROM_*).
+        pub from: u8,
+        /// The zones document has been read (no list, and no zone by id, before).
+        pub table: bool,
+        /// The cellular network's country (ISO 3166 alpha-2) and MCC, when heard.
+        pub country: Option<[u8; 2]>,
+        pub mcc: u16,
+        /// The zone in effect, this device's by hand, the identity's, and the one found here.
+        pub effective: Id,
+        pub device: Id,
+        pub identity_id: Id,
+        pub found: Id,
+    }
+
+    impl State {
+        /// The choice that rules this device: (automatic, its id by hand), the identity's while following it and it has one, else this device's.
+        pub fn ruling(&self) -> (bool, Id) {
+            if self.follow && self.identity != IDENTITY_NONE { (self.identity == IDENTITY_AUTO, self.identity_id) } else { (self.device_auto, self.device) }
+        }
+    }
+
+    /// The zone's state now; None when the kernel has no zone call (an older kernel).
+    pub fn state() -> Option<State> {
+        let mut b = [0u8; STATE_LEN];
+        if svc(nr::ZONE, 5, off(b.as_mut_ptr() as *const u8), b.len() as u64, 0, 0) != STATE_LEN as u64 {
+            return None;
+        }
+        let id = |k: usize| {
+            let at = 12 + k * (1 + ID_MAX);
+            // The length byte is the kernel's, never past ID_MAX (zone::Id): a kernel that wrote more is broken, and the copy panics.
+            let mut z = Id { b: [0; ID_MAX], n: b[at] };
+            z.b[..z.n as usize].copy_from_slice(&b[at + 1..at + 1 + z.n as usize]);
+            z
+        };
+        Some(State { follow: b[0] == 1, device_auto: b[1] == 1, identity: b[2], from: b[3], table: b[5] == 1, country: (b[6] != 0).then_some([b[6], b[7]]), mcc: u16::from_le_bytes([b[8], b[9]]), effective: id(0), device: id(1), identity_id: id(2), found: id(3) })
+    }
+
+    /// Every zone's id into `buf` (each its length, a byte, then its bytes; zone1970.tab's order): the list's whole length (0 before the zones document is read).
+    pub fn list(buf: &mut [u8]) -> usize {
+        let r = svc(nr::ZONE, 6, off(buf.as_mut_ptr()), buf.len() as u64, 0, 0);
+        if r == ERR { 0 } else { r as usize }
+    }
+
+    /// This device's own choice, given the Settings capability: automatic, and its zone by hand (empty: none, the fixed offset). True when taken and kept.
+    pub fn set_device(cap: u64, auto: bool, id: &[u8]) -> bool {
+        svc(nr::ZONE, 2, cap, auto as u64, off(id.as_ptr()), id.len() as u64) == 0
+    }
+
+    /// Whether this device follows the identity's choice, given the Settings capability.
+    pub fn set_follow(cap: u64, on: bool) -> bool {
+        svc(nr::ZONE, 3, cap, on as u64, 0, 0) == 0
+    }
+
+    /// The identity's choice written to this device (the identity service only, payloads/fgtw): None forgets it, else (automatic, its id by hand).
+    pub fn set_identity(choice: Option<(bool, &[u8])>) -> bool {
+        match choice {
+            None => svc(nr::ZONE, 4, 2, 0, 0, 0) == 0,
+            Some((auto, id)) => svc(nr::ZONE, 4, auto as u64, off(id.as_ptr()), id.len() as u64, 0) == 0,
+        }
+    }
+
+    /// The cellular network's word (the modem only): its MCC (0 none), and NITZ's legal offset (seconds east) with whether daylight time is in it, when it gave them.
+    pub fn network(mcc: u16, offset: Option<(i32, Option<bool>)>) -> bool {
+        let (o, flags) = match offset {
+            None => (0, 0),
+            Some((o, None)) => (o, 1),
+            Some((o, Some(d))) => (o, 1 | 2 | (d as u64) << 2),
+        };
+        svc(nr::ZONE, 0, mcc as u64, o as i64 as u64, flags, 0) == 0
+    }
+
+    /// A new position (the GPS driver only), in 2^-23 degrees: the kernel finds the zone again once it has moved some 30 km.
+    pub fn position(lat: i32, lon: i32) -> bool {
+        svc(nr::ZONE, 1, lat as i64 as u64, lon as i64 as u64, 0, 0) == 0
+    }
 }
 /// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
 pub const CORES_WORKERS: u64 = 0x00F0;

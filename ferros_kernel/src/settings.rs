@@ -27,8 +27,14 @@ pub const FIELDS: [(&str, usize); 11] = [
 ];
 /// The time zone: seconds east of UTC.
 const TZ: &str = "tz";
-/// The zone by its IANA id (owner, 2026-11-10: "Proper zone too"); its rule comes from the `zones` document (rtc.rs `resolve_zone`). With none, `tz` is the offset.
+/// The zone (owner, 2026-11-10: "Proper zone too"; zone.rs): this device's own choice, its IANA id by hand (`zone`; none: `tz` is the offset) and whether it is automatic (`zone_auto`, 1 the default); whether the device follows the identity's (`zone_follow`, 1 the default); the identity's as its service last wrote it (`zone_identity_auto` present once it has, `zone_identity` its id); the zone last found here and what found it (`zone_found`, `zone_found_by`: 1 the network, 2 a position).
 const ZONE: &str = "zone";
+const ZONE_AUTO: &str = "zone_auto";
+const ZONE_FOLLOW: &str = "zone_follow";
+const ZONE_IDENTITY: &str = "zone_identity";
+const ZONE_IDENTITY_AUTO: &str = "zone_identity_auto";
+const ZONE_FOUND: &str = "zone_found";
+const ZONE_FOUND_BY: &str = "zone_found_by";
 
 /// The radio knobs kept as device settings (docs/RADIO-CONTROLS.md): field name, link (the control blocks' order: 0 cellular, 1 WiFi, …), slot. Value knobs only: actions are counters and are never kept.
 pub const KNOBS: [(&str, usize, usize); 2] = [("wifi_power_save", 1, 1), ("wifi_band", 1, 2)];
@@ -41,7 +47,14 @@ fn schema() -> SectionSchema {
     for (name, _, _) in KNOBS {
         s = s.field(name, TypeConstraint::AnyUnsigned);
     }
-    s.field(TZ, TypeConstraint::AnySigned).field(ZONE, TypeConstraint::AsciiText)
+    s = s.field(TZ, TypeConstraint::AnySigned);
+    for name in [ZONE, ZONE_IDENTITY, ZONE_FOUND] {
+        s = s.field(name, TypeConstraint::AsciiText);
+    }
+    for name in [ZONE_AUTO, ZONE_FOLLOW, ZONE_IDENTITY_AUTO, ZONE_FOUND_BY] {
+        s = s.field(name, TypeConstraint::AnyUnsigned);
+    }
+    s
 }
 
 /// Eagle time now, in oscillations, from the RTC's base (0 until the RTC has been read: the document then says it was made at the epoch).
@@ -71,9 +84,19 @@ pub fn document(change: Option<(usize, u8)>) -> Option<Vec<u8>> {
     }
     let tz = crate::rtc::TZ.load(core::sync::atomic::Ordering::Relaxed);
     b = b.set(TZ, VsfType::i(tz as isize)).ok()?;
-    let zone = crate::rtc::zone_id();
-    if !zone.is_empty() {
-        b = b.set(ZONE, VsfType::a(vsf::Ascii::from_bytes(zone)?)).ok()?;
+    let z = crate::zone::state();
+    let unsigned = |v: u8| VsfType::u(v as usize, false);
+    for (name, id) in [(ZONE, z.device.id), (ZONE_IDENTITY, z.identity.map_or(crate::zone::Id::NONE, |c| c.id)), (ZONE_FOUND, z.found)] {
+        if !id.is_none() {
+            b = b.set(name, VsfType::a(vsf::Ascii::from_bytes(id.as_bytes())?)).ok()?;
+        }
+    }
+    b = b.set(ZONE_AUTO, unsigned(z.device.auto as u8)).ok()?.set(ZONE_FOLLOW, unsigned(z.follow as u8)).ok()?;
+    if let Some(c) = z.identity {
+        b = b.set(ZONE_IDENTITY_AUTO, unsigned(c.auto as u8)).ok()?;
+    }
+    if !z.found.is_none() {
+        b = b.set(ZONE_FOUND_BY, unsigned(z.found_by)).ok()?;
     }
     // A knob still unset (all ones) is left out: absent means the driver's own default.
     for (name, link, slot) in KNOBS {
@@ -110,11 +133,18 @@ pub fn apply(doc: &[u8], held: bool) -> Option<usize> {
             n += 1;
         }
     }
-    if let Some(VsfType::a(z)) = first(ZONE) {
-        if crate::rtc::set_zone(z.as_bytes()) {
-            n += 1;
-        }
-    }
+    // The zone's choices, each absent one at its default (automatic, following the identity, nothing from the identity or found yet); an id that is not one is none.
+    let id = |name: &str| match first(name) {
+        Some(VsfType::a(z)) => crate::zone::Id::new(z.as_bytes()).unwrap_or(crate::zone::Id::NONE),
+        _ => crate::zone::Id::NONE,
+    };
+    let flag = |name: &str| first(name).and_then(|v| v.as_u64()).map(|v| v == 1);
+    let device = crate::zone::Choice { auto: flag(ZONE_AUTO).unwrap_or(true), id: id(ZONE) };
+    let identity = flag(ZONE_IDENTITY_AUTO).map(|auto| crate::zone::Choice { auto, id: id(ZONE_IDENTITY) });
+    // WHY the filter: the document can be stored from the bridge; a finder past 2 (the position) is none zone.rs knows, read as none.
+    let found_by = first(ZONE_FOUND_BY).and_then(|v| v.as_u64()).filter(|&b| b <= 2).unwrap_or(0) as u8;
+    crate::zone::load(device, identity, flag(ZONE_FOLLOW).unwrap_or(true), id(ZONE_FOUND), found_by);
+    n += 1;
     if let Some(z) = first(TZ).and_then(|v| v.as_i64()) {
         // A zone is within a day of UTC; anything else is not a zone.
         if z.abs() < 86_400 {

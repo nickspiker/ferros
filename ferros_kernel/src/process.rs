@@ -928,6 +928,8 @@ const SYS_CONTROL: u64 = 32;
 const SYS_CONTROLS: u64 = 33;
 /// detail(op, …): a link's text and identifiers as one VSF document (ferros_sys::detail). Op 0, a driver (by its name, as SYS_STATUS): x1/x2 the document and its length, at most DETAIL_MAX, kept as its link's → 0 or ERR. Op 1: x1 the Settings capability's token offset, x2 the link, x3/x4 a buffer and its length → the document's whole length (0 for none yet), its first bytes copied; ERR without the capability. The kernel reads none of it; the reader verifies it.
 const SYS_DETAIL: u64 = 34;
+/// zone(op, …): the clock's zone (zone.rs, docs/TIME.md). Op 0, the modem (by its name, a narrow right of its own as SYS_STATUS, never Settings): the network's word, x1 its MCC (0 none), x2 NITZ's legal offset in seconds east, x3 flags (bit 0 the offset given, bit 1 the daylight flag given, bit 2 daylight time on). Op 1, the GPS driver (by its name): a new position, x1 latitude and x2 longitude in 2^-23 degrees. Op 2, Settings at x1: this device's choice, x2 1 automatic, x3/x4 its id by hand (length 0: none, the fixed offset). Op 3, Settings at x1: x2 1 follow the identity's choice, 0 this device's own. Op 4, the identity service (by its name, fgtw): the identity's choice, x1 0 by hand, 1 automatic, 2 none (forgotten), x2/x3 its id. Op 5: the state into x1/x2 (zone::STATE_LEN bytes; no capability: the zone is what the clock shows whoever holds the device). Op 6: every zone's id into x1/x2, each its length then its bytes → the list's whole length. Ops 2-4 keep the settings document, put back as it was when the vault refuses. → 0 or ERR, op 5 the bytes written, op 6 the length.
+const SYS_ZONE: u64 = 35;
 /// Each link's control block: words 1 to CONTROLS - 1 (word 0 is the generation, `CONTROL_GEN`), all ones until set.
 pub const CONTROLS: usize = 1 << 4;
 /// The links with a control block: the six of the facts, and the clock.
@@ -2634,6 +2636,71 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 n as u64
             } else {
                 ERR
+            };
+            0
+        }
+        SYS_ZONE => {
+            let named = |n: &[u8]| p.name.as_slice() == n;
+            let settings = |at: u64| {
+                let token = p.read(at, 32);
+                matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0)
+            };
+            let keep = || unsafe { CONTROL_STORE }.map(|st| st()).unwrap_or(false);
+            // An id named by the caller: WHY the bound, the length is the caller's and an id is at most zone::ID_MAX bytes; a longer one is refused, not cut.
+            let id = |at: u64, len: u64| if len as usize <= crate::zone::ID_MAX { crate::zone::Id::new(&p.read(at, len as usize)) } else { None };
+            f.x[0] = match f.x[0] {
+                0 if named(b"modem") => {
+                    let flags = f.x[3];
+                    let dst = (flags & 2 != 0).then_some(flags & 4 != 0);
+                    // WHY the bound: the offset is the modem's reading of the network; a legal offset lies within a day of UTC, anything else is not one and is dropped (the MCC still counts).
+                    let offset = (flags & 1 != 0 && (f.x[2] as i64).unsigned_abs() < 86_400).then_some((f.x[2] as i64 as i32, dst));
+                    // WHY the bound: an MCC is three decimal digits (ITU E.212); anything else names no country.
+                    crate::zone::network(if f.x[1] < 1000 { f.x[1] as u16 } else { 0 }, offset);
+                    0
+                }
+                1 if named(b"gps") => {
+                    let (lat, lon) = (f.x[1] as i64, f.x[2] as i64);
+                    // WHY the bounds: the driver's fix in 2^-23 degrees; a latitude past a quarter turn or a longitude past a half is no place, and the arithmetic after assumes them.
+                    if lat.unsigned_abs() <= 90 << 23 && lon.unsigned_abs() <= 180 << 23 {
+                        crate::zone::position(lat, lon);
+                        0
+                    } else {
+                        ERR
+                    }
+                }
+                2 if settings(f.x[1]) => match id(f.x[3], f.x[4]) {
+                    Some(z) if crate::zone::set_device(crate::zone::Choice { auto: f.x[2] == 1, id: z }, keep) => 0,
+                    _ => ERR,
+                },
+                3 if settings(f.x[1]) => {
+                    if crate::zone::set_follow(f.x[2] == 1, keep) { 0 } else { ERR }
+                }
+                4 if named(b"fgtw") => {
+                    let c = match (f.x[1], id(f.x[2], f.x[3])) {
+                        (2, _) => Some(None),
+                        (k @ (0 | 1), Some(z)) => Some(Some(crate::zone::Choice { auto: k == 1, id: z })),
+                        _ => None,
+                    };
+                    match c {
+                        Some(c) if crate::zone::set_identity(c, keep) => 0,
+                        _ => ERR,
+                    }
+                }
+                5 => {
+                    let b = crate::zone::state_bytes();
+                    // WHY the min: the buffer is the caller's and may be shorter than the state.
+                    let n = b.len().min(f.x[2] as usize);
+                    p.write(f.x[1], &b[..n]);
+                    n as u64
+                }
+                6 => {
+                    let v = crate::zone::list();
+                    // WHY the min: the buffer is the caller's; the return says how long the whole list is.
+                    let n = v.len().min(f.x[2] as usize);
+                    p.write(f.x[1], &v[..n]);
+                    v.len() as u64
+                }
+                _ => ERR,
             };
             0
         }

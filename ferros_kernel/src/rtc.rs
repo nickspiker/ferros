@@ -26,7 +26,7 @@ pub fn set_tz_held(secs: i64) {
     crate::process::set_wall_held(BASE.load(Ordering::Relaxed), packed());
 }
 
-/// The zone (owner, 2026-11-10: "arabic needs to match wall clock with DST legal, dozenal stays"; "Proper zone too"): its IANA id as the settings name it (`zone`), its rule once read from the `zones` document in the vault (tools/tzvsf), and whether that read is still to do (`resolve_zone`, from the service loop, which holds the store).
+/// The zone in effect (owner, 2026-11-10: "arabic needs to match wall clock with DST legal, dozenal stays"; "Proper zone too"): its IANA id as zone.rs chose it, its rule once read from zone.rs's table (the `zones` document, tools/tzvsf), and whether that read is still to do (`resolve_zone`, from the service loop).
 static mut ZONE_ID: ([u8; 64], usize) = ([0; 64], 0);
 static mut RULE: Option<ferros_tz::Rule> = None;
 static ZONE_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -41,8 +41,9 @@ pub fn zone_id() -> &'static [u8] {
     }
 }
 
-/// A zone set by its id: kept, and its rule read at the service loop's next pass. An id longer than the slot is not a zone tzdata has (the longest is 30 bytes).
+/// The zone in effect set by its id (zone.rs `apply`; empty: none, the fixed offset): kept, and its rule read at the service loop's next pass. An id longer than the slot is not a zone tzdata has (the longest is 30 bytes).
 pub fn set_zone(id: &[u8]) -> bool {
+    // WHY the bounds: the slot holds 64 bytes, and the id reaches here from the settings document and the processes (zone.rs checks it the same way first).
     if id.len() > 64 || !id.iter().all(|&b| b.is_ascii_graphic()) {
         return false;
     }
@@ -57,7 +58,7 @@ pub fn set_zone(id: &[u8]) -> bool {
 }
 
 /// Unix seconds now, from the base; None until the RTC has been read.
-fn utc_now() -> Option<i64> {
+pub fn utc_now() -> Option<i64> {
     let base = BASE.load(Ordering::Relaxed);
     if base == 0 {
         return None;
@@ -83,37 +84,27 @@ fn packed() -> i64 {
     (s as u32 as u64 | (l as u32 as u64) << 32) as i64
 }
 
-/// From the service loop, with the store: a zone set and not yet read gets its rule from the `zones` document (one `zone` section per zone: `id`, `rule`), and every process its offsets.
-pub fn resolve_zone(store: &mut Option<crate::vault_boot::ShimStore>) {
+/// The zone's rule read again at the next pass (zone.rs read the `zones` document anew).
+pub fn zone_again() {
+    ZONE_PENDING.store(true, Ordering::Release);
+}
+
+/// From the service loop, after zone.rs's step: a zone set and not yet read gets its rule from the zones table (zone.rs, the vault's `zones` document), and every process its offsets. No zone: the fixed offset.
+pub fn resolve_zone() {
     if !ZONE_PENDING.swap(false, Ordering::AcqRel) {
         return;
     }
     let id = zone_id();
-    let doc = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("zones").ok().flatten()));
-    let rule = doc.as_deref().and_then(|d| zone_rule(d, id));
+    let rule = crate::zone::rule_of(id);
     unsafe { RULE = rule };
-    crate::flashlog::line(&alloc::format!("zone {}: {}", core::str::from_utf8(id).unwrap_or("?"), match (doc.is_some(), rule.is_some()) {
-        (_, true) => "its rule read",
-        (true, false) => "not in the zones document; the manual offset stands",
-        (false, false) => "no zones document in the vault; the manual offset stands",
-    }));
-    crate::process::set_wall(BASE.load(Ordering::Relaxed), packed());
-}
-
-/// The rule of zone `id` in a `zones` document.
-fn zone_rule(doc: &[u8], id: &[u8]) -> Option<ferros_tz::Rule> {
-    use vsf::types::VsfType;
-    let (header, end) = vsf::file_format::VsfHeader::decode(doc).ok()?;
-    for s in header.sections(doc, end).ok()? {
-        let text = |name: &str| s.get_field(name).and_then(|f| f.values.first()).and_then(|v| match v {
-            VsfType::a(a) => Some(a.as_bytes().to_vec()),
-            _ => None,
-        });
-        if s.name == "zone" && text("id").as_deref() == Some(id) {
-            return ferros_tz::Rule::parse(core::str::from_utf8(&text("rule")?).ok()?);
-        }
+    if !id.is_empty() {
+        crate::flashlog::line(&alloc::format!("zone {}: {}", core::str::from_utf8(id).unwrap_or("?"), match (crate::zone::table_read(), rule.is_some()) {
+            (_, true) => "its rule read",
+            (true, false) => "not in the zones document; the fixed offset stands",
+            (false, false) => "no zones document read; the fixed offset stands",
+        }));
     }
-    None
+    crate::process::set_wall(BASE.load(Ordering::Relaxed), packed());
 }
 
 /// The RTC's fields: (year, month 1-12, day 1-31, hour, minute, second).

@@ -62,6 +62,7 @@ mod camera_snap;
 mod x3;
 mod smp;
 mod rtc;
+mod zone;
 mod aoc;
 mod haptics;
 mod gps;

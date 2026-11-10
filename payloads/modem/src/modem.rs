@@ -1525,6 +1525,14 @@ fn setup_data_call_params(apn: &[u8], types: u32, cid: u8) -> Vec<u8> {
 }
 const SIT_SET_PREFERRED_DATA_MODEM: u16 = 0x0740;
 
+/// A mobile country code from its three ASCII digits; 0 (none) for anything that is not three digits.
+fn mcc_of(d: [u8; 3]) -> u16 {
+    if !d.iter().all(|c| c.is_ascii_digit()) {
+        return 0;
+    }
+    d.iter().fold(0u16, |m, &c| m * 10 + (c - b'0') as u16)
+}
+
 /// Names for the ids the data path meets (rcmMsgToString); others print as their number.
 fn sit_name(id: u16) -> &'static str {
     match id {
@@ -2122,6 +2130,8 @@ struct Online {
     screen_sent: u8,
     screen_check: u64,
     camp_seen: [u8; 2],
+    /// The last MCC handed to the clock from IND_MCC, so the same country is said once.
+    mcc_said: u16,
     call_sent: bool,
     /// Not before this (µs since online): the next setup after a refusal or a lost call.
     call_retry: u64,
@@ -2306,6 +2316,7 @@ impl Online {
             screen_sent: 0,
             screen_check: 0,
             camp_seen: [0; 2],
+            mcc_said: 0,
             call_sent: false,
             call_retry: 0,
             call: None,
@@ -2745,6 +2756,28 @@ impl Online {
                         let _ = core::fmt::Write::write_fmt(&mut l, format_args!("{:02X}", at(i)));
                     }
                     line(rep, alloc::format!("t={} ms: NITZ ({flen} bytes) {l}\n", since_us(t0) / 1000));
+                    // The zone (kernel zone.rs; owner, 2026-11-10: "cellular, then GPS"), handed to the kernel on every NITZ. The parameters after the 8-byte indication header, as the vendor's ProtocolNitzData reads them (vendor.radio.protocol.sit.stream.so, its accessors need 17 bytes): 0 the daylight flag valid, 1-6 the time (UTC), 7 the zone in signed quarter hours (the whole legal offset, daylight time in it), 8 the daylight adjustment in hours, 9 the weekday, 10 MM info, 11-16 the network (MCC then MNC, ASCII).
+                    if flen >= 20 + 17 {
+                        let p = |i: u32| at(20 + i);
+                        let offset = p(7) as i8 as i32 * 900;
+                        let dst = (p(0) != 0).then_some(p(8) != 0);
+                        let mcc = mcc_of([p(11), p(12), p(13)]);
+                        let ok = ferros_sys::zone::network(mcc, Some((offset, dst)));
+                        line(rep, alloc::format!("t={} ms: NITZ: MCC A#{mcc}, UTC {}{} min{}, to the clock{}\n", since_us(t0) / 1000, if offset < 0 { "-" } else { "+" }, offset.unsigned_abs() / 60, match dst {
+                            Some(true) => ", daylight time",
+                            Some(false) => ", standard time",
+                            None => "",
+                        }, if ok { "" } else { ": REFUSED" }));
+                    }
+                }
+                // The network's country alone (SIT IND_MCC, G#072D): its MCC as three ASCII digits after the header's first parameter byte (the vendor's ProtocolNetMccAdapter copies them from there), for the zone when NITZ has not come.
+                if id == 0x072D && flen >= 20 + 4 {
+                    let mcc = mcc_of([at(21), at(22), at(23)]);
+                    if mcc != 0 && mcc != self.mcc_said {
+                        self.mcc_said = mcc;
+                        let ok = ferros_sys::zone::network(mcc, None);
+                        line(rep, alloc::format!("t={} ms: the network's MCC A#{mcc}, to the clock{}\n", since_us(t0) / 1000, if ok { "" } else { ": REFUSED" }));
+                    }
                 }
             }
             if quiet {
