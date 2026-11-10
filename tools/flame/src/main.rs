@@ -790,7 +790,7 @@ mod tests {
             b = b.add_unboxed("core", s);
         }
         for (t, n) in [(5u64, "display"), (9, "display.3")] {
-            let s = thread_schema().build().set("thread", u(t)).unwrap().set("epoch", u(0x1_0000_0007)).unwrap().set("base", u(0x8301_1000)).unwrap().set("process", vsf::VsfType::a("display".into())).unwrap().set("name", vsf::VsfType::a(n.into())).unwrap().encode().unwrap();
+            let s = thread_schema().build().set("thread", u(t)).unwrap().set("epoch", u(0x1_0000_0007)).unwrap().set("base", u(0x8301_1000)).unwrap().set("process", vsf::VsfType::a(vsf::Ascii::lit("display"))).unwrap().set("name", vsf::VsfType::a(vsf::Ascii::lit(n))).unwrap().encode().unwrap();
             b = b.add_unboxed("thread", s);
         }
         let doc = b.build().unwrap();

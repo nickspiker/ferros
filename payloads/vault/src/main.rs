@@ -692,11 +692,19 @@ fn export_document(store: &mut St, doms: &[(&[u8], Domain)]) -> Option<Vec<u8>> 
         say!("vault: export leaves out {} ({} bytes)", core::str::from_utf8(name).unwrap_or("?"), n);
     }
     let mut section = vsf::VsfSection::new("identity_export");
+    // A name is a `d`, ASCII: one that is not cannot be carried, and the export fails whole rather than leaving it behind unsaid.
+    let mut unnamed = 0usize;
     for (name, value) in &x.entries {
-        section.add_field_multi("entry", alloc::vec![vsf::VsfType::d(alloc::string::String::from_utf8_lossy(name).into_owned()), vsf::VsfType::v(b'r', value.clone())]);
+        match vsf::Ascii::from_bytes(name) {
+            Some(n) => section.add_field_multi("entry", alloc::vec![vsf::VsfType::d(n), vsf::VsfType::v(b'r', value.clone())]),
+            None => {
+                say!("vault: export: a name that is not ASCII ({} bytes) cannot be carried", name.len());
+                unnamed += 1;
+            }
+        }
     }
     say!("vault: export: {} entries", x.entries.len());
-    let doc = vsf::VsfBuilder::new().creation_time_oscillations(eagle()).provenance_only().add_section_direct(section).build().ok();
+    let doc = if unnamed == 0 { vsf::VsfBuilder::new().creation_time_oscillations(eagle()).provenance_only().add_section_direct(section).build().ok() } else { None };
     for (_, mut v) in x.entries {
         v.fill(0);
     }

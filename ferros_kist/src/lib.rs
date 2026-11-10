@@ -138,10 +138,10 @@ pub fn identity(capsule: &[u8]) -> Result<([u8; 32], [u8; 32]), &'static str> {
 /// The sections a capsule's declaration adds, for the signer (ferros-bridge `capsule --kist`): `kist` with the name, `wants` with a field per want.
 pub fn declaration_sections(d: &Decl) -> (VsfSection, VsfSection) {
     let mut k = VsfSection::new("kist");
-    k.add_field("name", VsfType::a(d.name.clone()));
+    k.add_field("name", VsfType::a(vsf::Ascii::checked("name", d.name.clone())));
     let mut w = VsfSection::new("wants");
     for (c, reason) in &d.wants {
-        w.add_field(RIGHTS[*c as usize], VsfType::a(reason.clone()));
+        w.add_field(RIGHTS[*c as usize], VsfType::a(vsf::Ascii::checked("reason", reason.clone())));
     }
     (k, w)
 }
@@ -205,9 +205,9 @@ impl Kists {
             s.add_field("capsule", VsfType::hb(k.capsule.to_vec()));
             s.add_field("developer", VsfType::ke(k.developer.to_vec()));
             s.add_field("option", VsfType::hp(k.option.to_vec()));
-            s.add_field("name", VsfType::a(k.name.clone()));
+            s.add_field("name", VsfType::a(vsf::Ascii::checked("name", k.name.clone())));
             for w in &k.wants {
-                let mut values = alloc::vec![VsfType::a(w.reason.clone())];
+                let mut values = alloc::vec![VsfType::a(vsf::Ascii::checked("reason", w.reason.clone()))];
                 if let Some((granted, when)) = w.answer {
                     values.push(VsfType::u(granted as usize, false));
                     values.push(VsfType::e(EtType::e6(when)));
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn a_want_outside_the_vocabulary_refuses_the_declaration() {
         let mut w = VsfSection::new("wants");
-        w.add_field("camera", VsfType::a(String::from("photos")));
+        w.add_field("camera", VsfType::a(vsf::Ascii::lit("photos")));
         let file = vsf::VsfBuilder::new().add_section_direct(w).build().unwrap();
         assert!(declaration(&file).is_err());
     }

@@ -681,7 +681,12 @@ fn store_export() -> Option<alloc::vec::Vec<u8>> {
     let entries = st.identity_export().ok()?;
     let mut section = vsf::VsfSection::new("identity_export");
     for (name, value) in &entries {
-        section.add_field_multi("entry", alloc::vec![vsf::VsfType::d(name.clone()), vsf::VsfType::v(b'r', value.clone())]);
+        // A name is a `d`, ASCII: one that is not cannot be carried, and the export fails whole rather than leaving it behind unsaid.
+        let Ok(n) = vsf::Ascii::new(name.clone()) else {
+            crate::flashlog::line(&alloc::format!("identity export refused: a name that is not ASCII ({} bytes)", name.len()));
+            return None;
+        };
+        section.add_field_multi("entry", alloc::vec![vsf::VsfType::d(n), vsf::VsfType::v(b'r', value.clone())]);
     }
     crate::flashlog::line(&alloc::format!("identity export: {} entries", entries.len()));
     vsf::VsfBuilder::new().creation_time_oscillations(crate::settings::eagle_now()).provenance_only().add_section_direct(section).build().ok()

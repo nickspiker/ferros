@@ -486,7 +486,7 @@ fn u(v: u64) -> vsf::VsfType {
     vsf::VsfType::u(v as usize, false)
 }
 fn ascii(b: &[u8]) -> vsf::VsfType {
-    vsf::VsfType::a(b.iter().map(|&c| if c.is_ascii_graphic() { c as char } else { '_' }).collect())
+    vsf::VsfType::a(vsf::Ascii::checked("name", b.iter().map(|&c| if c.is_ascii_graphic() { c as char } else { '_' }).collect::<alloc::string::String>()))
 }
 
 /// Build the index document and point the anchor at it.

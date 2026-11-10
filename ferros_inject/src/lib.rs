@@ -164,7 +164,7 @@ impl Script {
         let mut input = VsfSection::new("input");
         input.add_field("events", VsfType::u(self.events.len(), false));
         if !self.text.is_empty() {
-            input.add_field("text", VsfType::a(self.text.clone()));
+            input.add_field("text", VsfType::a(vsf::Ascii::new(self.text.clone()).map_err(|e| format!("text: {e}"))?));
         }
         let mut b = vsf::VsfBuilder::new().creation_time_oscillations(now).provenance_only().add_section_direct(input);
         for e in &self.events {

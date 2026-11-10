@@ -95,7 +95,7 @@ pub fn default_id(right: u8) -> Vec<VsfType> {
 pub fn place_id(scope: &[u8; 32], c: &Circle) -> Vec<VsfType> {
     let mut id = vec![VsfType::ke(scope.to_vec())];
     match c {
-        Circle::Settings => id.push(VsfType::d(String::from("settings"))),
+        Circle::Settings => id.push(VsfType::d(vsf::Ascii::lit("settings"))),
         Circle::Kist(d, o) => id.extend(kist_id(d, o)),
     }
     id
@@ -257,10 +257,10 @@ fn ints_of<const N: usize>(v: &[VsfType]) -> Option<[i64; N]> {
 
 /// A kist's fact value: its capsule, name, and wants in slot order (each right and the developer's reason).
 fn kist_value(k: &Kist) -> Vec<VsfType> {
-    let mut v = vec![VsfType::hb(k.capsule.to_vec()), VsfType::a(k.name.clone())];
+    let mut v = vec![VsfType::hb(k.capsule.to_vec()), VsfType::a(vsf::Ascii::checked("name", k.name.clone()))];
     for w in &k.wants {
         v.push(VsfType::u(w.right as usize, false));
-        v.push(VsfType::a(w.reason.clone()));
+        v.push(VsfType::a(vsf::Ascii::checked("reason", w.reason.clone())));
     }
     v
 }

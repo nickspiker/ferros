@@ -4,7 +4,6 @@
 //!
 //! This file is shared by path with the host's bridge (`ferros-bridge wifi-cred`), so it uses only `vsf` and `alloc`.
 
-use alloc::string::String;
 use alloc::vec::Vec;
 use vsf::schema::{SectionBuilder, SectionSchema, TypeConstraint};
 use vsf::VsfType;
@@ -22,11 +21,11 @@ pub fn usable(name: &[u8], pass: &[u8]) -> bool {
 
 /// The document for a credential, made at `eagle` (oscillations): None if the name or passphrase is not ASCII, or not usable.
 pub fn build(name: &[u8], pass: &[u8], eagle: i64) -> Option<Vec<u8>> {
-    if !usable(name, pass) || !name.is_ascii() || !pass.is_ascii() {
+    if !usable(name, pass) {
         return None;
     }
-    let name = String::from_utf8(name.to_vec()).ok()?;
-    let pass = String::from_utf8(pass.to_vec()).ok()?;
+    let name = vsf::Ascii::from_bytes(name)?;
+    let pass = vsf::Ascii::from_bytes(pass)?;
     let section = schema().build().set("name", VsfType::a(name)).ok()?.set("passphrase", VsfType::a(pass)).ok()?.encode().ok()?;
     vsf::VsfBuilder::new().creation_time_oscillations(eagle).provenance_only().add_unboxed(SECTION, section).build().ok()
 }

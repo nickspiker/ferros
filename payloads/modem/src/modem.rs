@@ -2264,8 +2264,9 @@ impl Online {
     /// The detail for the settings page (ferros_detail::CELLULAR, behind the Settings capability): the carrier pack loaded (fixed today), the data and attach APNs, and while a call is up its addresses and DNS servers (the line's: never logged, shown only to the person).
     fn publish_detail(&self) {
         use ferros_detail::vsf::VsfType;
-        let text = |b: &[u8]| VsfType::a(b.iter().map(|&c| c as char).collect());
-        let mut f = alloc::vec![("carrier", VsfType::a(alloc::string::String::from("Verizon"))), ("apn", text(DATA_APN)), ("attach_apn", text(ATTACH_APN))];
+        // The APNs are this driver's own ASCII constants.
+        let text = |b: &[u8]| VsfType::a(ferros_detail::vsf::Ascii::checked("apn", b.iter().map(|&c| c as char).collect::<alloc::string::String>()));
+        let mut f = alloc::vec![("carrier", VsfType::a(ferros_detail::vsf::Ascii::lit("Verizon"))), ("apn", text(DATA_APN)), ("attach_apn", text(ATTACH_APN))];
         if let Some(c) = self.call {
             if c.v4 != [0; 4] {
                 f.push(("ipv4", VsfType::ni(c.v4)));

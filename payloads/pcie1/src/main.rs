@@ -1884,7 +1884,7 @@ fn publish_detail(m: &Msgbuf) {
     let mut f = alloc::vec::Vec::new();
     let ssid = &m.want[..m.want_len];
     if !ssid.is_empty() && ssid.iter().all(|&c| (0x20..0x7F).contains(&c)) {
-        f.push(("ssid", VsfType::a(ssid.iter().map(|&c| c as char).collect())));
+        f.push(("ssid", VsfType::a(ferros_detail::vsf::Ascii::checked("ssid", ssid.iter().map(|&c| c as char).collect::<alloc::string::String>()))));
     }
     if let Some(t) = m.target {
         f.push(("bssid", VsfType::nm(t.bssid)));
