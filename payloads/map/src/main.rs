@@ -2167,26 +2167,32 @@ impl Map {
         let row = |m: &mut Map, b: &mut Batch, y: &mut i64, px: i64, colour: u32, t: &str, what: Option<Choice>| {
             let fits = ((2 * half - uu(2, 1)) * 8 / (px * 5)) as usize;
             let y0 = *y;
-            let mut rest = t;
-            loop {
-                let cut = if rest.len() <= fits {
-                    rest.len()
-                } else {
-                    let mut f = fits;
-                    while !rest.is_char_boundary(f) {
-                        f -= 1;
-                    }
-                    // A word longer than the line is cut where the line ends.
-                    rest[..f].rfind(' ').map_or(f, |k| k + 1)
-                };
-                // WHY: a line that takes nothing (fewer than one character fits: a page narrower than a glyph, or a first character wider in bytes than the line) would leave `rest` as it was and never end the loop. PROOF: every other case cuts at least one byte (rfind's k + 1, or f past a boundary). A line takes at least its first character.
-                let cut = if cut == 0 { rest.chars().next().map_or(rest.len(), char::len_utf8) } else { cut };
-                b.text(cx, *y, px as u16, colour, 1, rest[..cut].trim_end());
-                rest = rest[cut..].trim_start();
-                if rest.is_empty() {
-                    break;
+            // A `\n` is a forced line break (the shared fleet text's contract, fgtw text.rs); each line between is wrapped at spaces.
+            for (k, para) in t.split('\n').enumerate() {
+                if k > 0 {
+                    *y += uu(3, 2);
                 }
-                *y += uu(3, 2);
+                let mut rest = para;
+                loop {
+                    let cut = if rest.len() <= fits {
+                        rest.len()
+                    } else {
+                        let mut f = fits;
+                        while !rest.is_char_boundary(f) {
+                            f -= 1;
+                        }
+                        // A word longer than the line is cut where the line ends.
+                        rest[..f].rfind(' ').map_or(f, |k| k + 1)
+                    };
+                    // WHY: a line that takes nothing (fewer than one character fits: a page narrower than a glyph, or a first character wider in bytes than the line) would leave `rest` as it was and never end the loop. PROOF: every other case cuts at least one byte (rfind's k + 1, or f past a boundary). A line takes at least its first character.
+                    let cut = if cut == 0 { rest.chars().next().map_or(rest.len(), char::len_utf8) } else { cut };
+                    b.text(cx, *y, px as u16, colour, 1, rest[..cut].trim_end());
+                    rest = rest[cut..].trim_start();
+                    if rest.is_empty() {
+                        break;
+                    }
+                    *y += uu(3, 2);
+                }
             }
             if let (true, Some(c)) = (hit, what) {
                 m.push_row(cx - half, cx + half, y0 - uu(2, 1), *y + uu(1, 1), c);
