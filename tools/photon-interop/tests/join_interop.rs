@@ -109,21 +109,20 @@ fn eagle_time_from_utc_matches_vsf() {
     assert!((ours - theirs).abs() < vsf::OSCILLATIONS_PER_SECOND as i64 / 10, "ours {ours} theirs {theirs}");
 }
 
-/// The device's departure request, as the app's approver reads it: the fields come back, the frame's signer is the device, and the consent eggs verify against the device's own bundle over the departure bytes (what the fold checks on the consented Remove). The approval words' commitment is the app's (blake3 of the lowercased words).
+/// The device's departure request, as the app's approver reads it: the fields come back (the salt naming the request among them), the frame's signer is the device, and the consent eggs verify against the device's own bundle over the departure bytes (what the fold checks on the consented Remove). No words since 2026-11-10: the request is a member's signature, and a Deny answers it with a `depart_deny` naming its salt, which the app reads back the same.
 #[test]
 fn depart_req_is_what_the_app_approves() {
     let dev = DeviceKeys::derive(FP);
     let t = T + 5_000;
     let consent = join::depart_consent(&dev, &hp(), t);
-    let words = join::depart_words(0x1234_5678);
-    assert_eq!(fgtw::pair::pair_word_tokens(&words), 3, "three approval words");
-    let commit = join::depart_words_commit(&words);
-    assert_eq!(commit, *blake3::hash(words.to_lowercase().as_bytes()).as_bytes());
-    let req = join::DepartReq { t, consent_sig: consent.clone(), intent: join::DEPART_DESK, words_commit: Some(commit) };
+    let salt: [u8; 32] = blake3::hash(b"interop departure salt").into();
+    let req = join::DepartReq { t, consent_sig: consent.clone(), intent: join::DEPART_DESK, salt };
     let frame = join::depart_req(&req, &dev, T).unwrap();
-    let (ct, cs, leaver, intent, wc) = pproto::parse_depart_req_vsf(&frame).expect("the app parses + verifies our depart_req");
-    assert_eq!((ct, leaver, intent, wc), (t, dev.device_pubkey(), join::DEPART_DESK, Some(commit)));
+    let (ct, cs, leaver, intent, sl) = pproto::parse_depart_req_vsf(&frame).expect("the app parses + verifies our depart_req");
+    assert_eq!((ct, leaver, intent, sl), (t, dev.device_pubkey(), join::DEPART_DESK, salt));
     let eggs = fgtw::pq::eggs_from_bytes(&cs).unwrap();
     let msg = fgtw::fleet::departreq_signing_bytes(&hp(), &dev.device_pubkey(), t);
     assert!(fgtw::pq::verify_eggs(&eggs, &dev.public(), &msg, dev.public().mask()), "the consent verifies under every scheme the device holds");
+    let deny = join::depart_deny(&hp(), &dev.device_pubkey(), &salt, t, &dev, T + 1).unwrap();
+    assert_eq!(pproto::parse_depart_deny_vsf(&deny).expect("the app parses + verifies our depart_deny"), (hp(), dev.device_pubkey(), salt, t, dev.device_pubkey()));
 }
