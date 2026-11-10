@@ -11,6 +11,7 @@
 //! | `VIEW` | scope `ke` | x, y, cos, sin `i` | `map.view` |
 //! | `HOME_SYNC` | a device `ke` | on `u` | none: the space's own, set from settings |
 //! | `DEPART` | the leaving device `ke` | its signed departure request `v`, or once denied the signed deny | none: the identity service's own (payloads/fgtw), so a member answers it wherever it is |
+//! | `ZONE` | the fleet's scope `ke` | automatic `u` (1 or 0), then the IANA id by hand `a` when there is one | none: the identity service writes it to the kernel (SYS_ZONE op 4) on each device, which follows it unless its settings say otherwise |
 //!
 //! The scope of a place and the view is the fleet's (`FLEET`, 32 zero bytes) on every device whose home-screen sync is on (the default), and the device's own key on one where the person switched it off, so that device keeps an arrangement of its own, which follows it through a reset all the same.
 //!
@@ -39,6 +40,8 @@ pub mod kind {
     pub const HOME_SYNC: u8 = 5;
     /// A member leaving the fleet: its signed departure request, carried by the space to every member wherever it is (owner, 2026-11-09: "broadcast to the devices like a regular message"), approved or denied on any of them, no words (owner, 2026-11-10); once denied, the signed deny in its place; gone once the Remove is published or the device is no longer a member.
     pub const DEPART: u8 = 6;
+    /// The person's time zone (owner, 2026-11-10: "it's per identity, you can uncheck and set per device tho"): automatic (each device finds its own from its network, then GPS) or a zone by hand; written to each device that follows it, never read back from one (settings flow identity to device only).
+    pub const ZONE: u8 = 7;
 }
 
 /// The scope of the fleet's shared arrangement.
@@ -175,6 +178,32 @@ pub fn set_home_sync(space: &mut Space, device: &[u8; 32], on: bool, now: i64) -
     // Past the switch's last write, so this one wins the merge whatever the clocks say (a Lamport step: see fgtw::space::reconcile).
     let updated = space.get(kind::HOME_SYNC, &home_sync_id(device)).map_or(now, |e| now.max(e.updated + 1));
     space.put(Entry { kind: kind::HOME_SYNC, id: home_sync_id(device), value: vec![VsfType::u(on as usize, false)], updated, by: *device, gone: false })
+}
+
+/// The zone's id: the fleet's scope, one choice for the person.
+pub fn zone_id() -> Vec<VsfType> {
+    vec![VsfType::ke(FLEET.to_vec())]
+}
+
+/// The person's zone choice: (automatic, the IANA id by hand, empty for none); None until they have made one.
+pub fn zone(space: &Space) -> Option<(bool, String)> {
+    let e = space.get(kind::ZONE, &zone_id()).filter(|e| !e.gone)?;
+    let auto = e.value.iter().find_map(|v| v.as_u64())? == 1;
+    let id = e.value.iter().find_map(|v| v.as_string()).map(String::from).unwrap_or_default();
+    Some((auto, id))
+}
+
+/// The person chose their zone on one of their devices (its settings, following them): written straight into the space, stamped past its last write so it wins the merge whatever the clocks say. True when the space changed.
+pub fn set_zone(space: &mut Space, by: &[u8; 32], auto: bool, id: &str, now: i64) -> bool {
+    if zone(space).is_some_and(|z| z.0 == auto && z.1 == id) {
+        return false;
+    }
+    let mut value = vec![VsfType::u(auto as usize, false)];
+    if !id.is_empty() {
+        value.push(VsfType::a(vsf::Ascii::checked("zone", String::from(id))));
+    }
+    let updated = space.get(kind::ZONE, &zone_id()).map_or(now, |e| now.max(e.updated + 1));
+    space.put(Entry { kind: kind::ZONE, id: zone_id(), value, updated, by: *by, gone: false })
 }
 
 // ── The map's own forms (payloads/map: `place_key`, `save_place`, `save_view`) ──
@@ -658,6 +687,27 @@ mod tests {
         assert_eq!(place_key("a very long kist name that goes on"), b"place.a_very_long_kist_name_that".to_vec());
         let v = [1, -2, 3, -4];
         assert_eq!(decode_view(&encode_view(&v)), Some(v));
+    }
+
+    /// The person's zone: none until chosen; chosen on one device, it crosses the fleet sealed; the later choice wins even from a device whose clock runs behind; the device's own copy is never touched by the sync (identity to device only, by the identity service).
+    #[test]
+    fn the_persons_zone_follows_them() {
+        let mut sa = Space::new();
+        assert_eq!(zone(&sa), None);
+        assert!(set_zone(&mut sa, &PRO, false, "Pacific/Auckland", 2000));
+        assert!(!set_zone(&mut sa, &PRO, false, "Pacific/Auckland", 2001), "the same choice changes nothing");
+        let mut sb = hand_over(&sa);
+        assert_eq!(zone(&sb), Some((false, String::from("Pacific/Auckland"))));
+        // The other device's clock is behind: its choice is stamped past the last write all the same.
+        assert!(set_zone(&mut sb, &OTHER, true, "", 1500));
+        sa.merge(hand_over(&sb));
+        assert_eq!(zone(&sa), Some((true, String::new())));
+        // A sync of the device's copy neither reads nor writes the zone.
+        let mut v = arranged_pro();
+        let mut b = Baseline::default();
+        let o = sync(&mut sa, &mut b, &mut v, &PRO, 3000).unwrap();
+        assert_eq!(o.kinds >> kind::ZONE & 1, 0);
+        assert_eq!(zone(&sa), Some((true, String::new())));
     }
 }
 

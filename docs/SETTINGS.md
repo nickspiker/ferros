@@ -29,7 +29,12 @@ One spec VSF document in the vault under the key `device` (ferros_kernel `settin
 | `layout` | unsigned | 0 Dvorak, 1 QWERTY with Q on the bottom row (honeycomb) | 0 |
 | `unlock_at_boot` | unsigned | 0 off (the handle is typed each boot, nothing of the identity on disk), 1 on (the seed is stored so the phone unlocks without typing) | 0 |
 | `radios_off` | unsigned | the radios switched off, a bit each: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS (a tap on a status circle; the kernel stops that driver while its bit is set) | 0 |
-| `tz` | signed | seconds east of UTC | 0 |
+| `tz` | signed | the fixed offset, seconds east of UTC: used when no zone is in effect | 0 |
+| `zone` | ASCII | this device's zone by hand, an IANA id (docs/TIME.md) | none |
+| `zone_auto` | unsigned | this device's choice: 1 automatic (the zone found from the cellular network, then GPS; `zone` stands in until one is), 0 by hand | 1 |
+| `zone_follow` | unsigned | 1 the device follows the identity's zone choice, 0 it keeps its own | 1 |
+| `zone_identity_auto`, `zone_identity` | unsigned, ASCII | the identity's zone choice as its identity service last wrote it (present once it has); never read back into the identity | none |
+| `zone_found`, `zone_found_by` | ASCII, unsigned | the zone last found here, and by what: 1 the network, 2 a position | none |
 | `wifi_power_save` | unsigned | WiFi power save: 0 off, 1 on (PM1), 2 fast (PM2); a radio knob (RADIO-CONTROLS.md), set on the WiFi page | unset: off |
 | `wifi_band` | unsigned | the band WiFi joins on: 0 any (5 GHz first), 1 5 GHz only, 2 2.4 GHz only; takes at the next join | unset: any |
 

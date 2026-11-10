@@ -35,8 +35,8 @@ What each driver reports and what can be turned, as of 2026-11-07. "Next" is wha
   - *Technology* (LTE only, NR only, both): SIT_SET_ALLOW_NETWORK takes a u32 bitmap in the CP's own numbering (the boot mask G#4_03FE is the CP's report, not Android's RadioAccessFamily); which bit is which needs Android's SET_ALLOWED_NETWORK_TYPES_BITMAP captured for each choice.
   - *Band and frequency lock*: no SIT message for it is known; Android sets it through an OEM path to capture.
   - *Cell identity, band, EARFCN, PCI, neighbours*: IND_CELL_INFO_LIST (G#070F) and IND_PHYSICAL_CHANNEL_CONFIG (G#0742) arrive and are not decoded; the registration reply's area and cell ids sit after its first 4 bytes, layout unchecked. Location-bearing: they go in the detail, not tracks.
-  - *Operator name, MCC-MNC*: IND_MCC (G#072D) and the network's name, not decoded.
-  - *Network time*: NITZ (G#0905) is logged whole, its layout not decoded.
+  - *Operator name, MNC*: the network's name, not decoded. Its MCC is (IND_MCC, G#072D, and NITZ's network field), for the zone only (docs/TIME.md).
+  - *Network time*: NITZ (G#0905) is decoded for the zone (its offset, daylight flag and MCC go to the kernel, docs/TIME.md); its time is logged, not used.
   - *APN choice, roaming on/off, data on/off*: the profiles are Verizon's table today.
 
 ### WiFi (payloads/pcie1, BCM4398 msgbuf)
@@ -68,8 +68,8 @@ What each driver reports and what can be turned, as of 2026-11-07. "Next" is wha
 
 ### Clock (the kernel's rtc.rs; link 6 of the controls)
 
-- **Shown:** the local time and UTC in the device's base, the zone, where the time comes from (the PMIC's clock, read at boot and every hour after), and how long since that read.
-- **Knobs:** *zone*, a quarter hour either way per tap (kept as the settings document's `tz`). The number base is the Numbers page's.
+- **Shown:** the local time and UTC in the device's base, the zone by name with its standard and legal offsets and where it came from (the cellular network, GPS, by hand, a fixed offset), where the time comes from (the PMIC's clock, read at boot and every hour after), and the network's zone as heard.
+- **Knobs:** the zone (docs/TIME.md, `SYS_ZONE`): "follow my identity", automatic or by hand, a picker by region then place; a fixed offset a quarter hour either way per tap (kept as the settings document's `tz`), only with no zone. The number base is the Numbers page's.
 - **Next:** network time (NITZ, above) and GPS time as sources, and setting the PMIC's clock from them.
 
 ## Kernel calls

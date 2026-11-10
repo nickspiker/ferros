@@ -157,6 +157,10 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                     if key == crate::settings::KEY {
                         let _ = crate::settings::apply(&params[2 + klen..], true);
                     }
+                    // A new zones document (tools/tzvsf): read again at the service loop's next pass.
+                    if key == "zones" {
+                        crate::zone::table_stale();
+                    }
                     crate::flashlog::line(&alloc::format!("store set {key:?} ok: {}", store.describe()));
                     let mut r = alloc::vec![0u8];
                     r.extend_from_slice(&h);
@@ -666,6 +670,8 @@ fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
                 }
             };
             crate::flashlog::line(&alloc::format!("identity released: {n} entries deleted from the kernel's vault, the device-only secret renewed; {} of the person's domains to drop in the vault process", drops.len()));
+            // The person's zone goes with them (zone.rs): this device's own choice rules again.
+            let _ = crate::zone::set_identity(None, || crate::settings::document(None).is_some_and(|d| st.set(crate::settings::KEY, &d).is_ok()));
             unsafe { (*(&raw mut RELEASE_DROPS)).append(&mut drops) };
             RELEASE_RESET.store(true, core::sync::atomic::Ordering::Release);
             Ok(0)
@@ -1878,7 +1884,9 @@ pub fn run(mut b: Boot) -> ! {
         // The wall clock, re-read hourly (rtc.rs), and the battery gauge every two seconds: both on this core, never inside a syscall.
         platform::crumb(0xD6);
         crate::rtc::poll();
-        crate::rtc::resolve_zone(&mut store);
+        // The zone (zone.rs): its table read, and found again from what the radios said; then its rule.
+        crate::zone::step(&mut store);
+        crate::rtc::resolve_zone();
         gauge_poll();
         power_poll();
         // The heap's second region, 2 s in (main.rs heap2_join: its line invalidation kept off the boot path).
@@ -2486,6 +2494,28 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params == b"zone" || cmd.params.starts_with(b"zone ") {
+                    // `diag zone`: the zone in effect, both choices, what was found and what the radios said (zone.rs). `diag "zone net <mcc> [<offset s east> [<dst 0|1>]]"` and `diag "zone at <lat arc-s> <lon arc-s>"` hand in a clue as the modem and the GPS driver do, for a bench without either.
+                    let words: alloc::vec::Vec<&str> = core::str::from_utf8(&cmd.params[4..]).unwrap_or("").split_whitespace().collect();
+                    let num = |k: usize| words.get(k).and_then(|w| w.parse::<i64>().ok());
+                    // WHY the bounds: the numbers are typed at the bridge; an MCC is three digits, an offset within a day, a place on the earth, as SYS_ZONE holds the radios to.
+                    match (words.first().copied(), num(1), num(2)) {
+                        (Some("net"), Some(mcc), off) if (0..1000).contains(&mcc) => {
+                            let dst = num(3).map(|d| d == 1);
+                            crate::process::with_lock(|| crate::zone::network(mcc as u16, off.filter(|o| o.unsigned_abs() < 86_400).map(|o| (o as i32, dst))));
+                            resp.extend_from_slice(b"zone: the network's word handed in; found at the next pass\n");
+                        }
+                        (Some("at"), Some(lat), Some(lon)) if lat.unsigned_abs() <= 90 * 3600 && lon.unsigned_abs() <= 180 * 3600 => {
+                            crate::process::with_lock(|| crate::zone::position((lat << 23) / 3600, (lon << 23) / 3600));
+                            resp.extend_from_slice(b"zone: a position handed in; found at the next pass\n");
+                        }
+                        (None, _, _) => {}
+                        _ => resp.extend_from_slice(b"zone: net <mcc> [<offset s east> [<dst 0|1>]], or at <lat arc-s> <lon arc-s>\n"),
+                    }
+                    resp.extend_from_slice(crate::zone::describe().as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if let Some(c) = cmd.params.strip_prefix(b"thermal at ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<u8>().ok()) {
                     THROTTLE_AT.store(c.max(20), core::sync::atomic::Ordering::Relaxed);
                     resp.extend_from_slice(alloc::format!("throttle at A#{} C, release below A#{} C (takes effect within a second)\n", c.max(20), c.max(20) - 10).as_bytes());
@@ -2664,9 +2694,19 @@ pub fn run(mut b: Boot) -> ! {
                     let text = core::str::from_utf8(rest).unwrap_or("");
                     let mut it = text.split_whitespace();
                     let (name, val) = (it.next().unwrap_or(""), it.next().and_then(|v| v.parse::<i64>().ok()));
-                    // `diag "pref zone <IANA id>"`: the zone by its id (its rule from the vault's `zones` document at the next pass).
+                    // `diag "pref zone <IANA id>"`: this device's zone by hand (its rule from the vault's `zones` document at the next pass); `pref zone auto`, automatic (the zone found here, the id by hand standing in); `pref zone none`, by hand with no zone (the fixed offset `tz`). `pref zone_follow 0` and `1`: this device's own choice, or the identity's (zone.rs).
+                    let word = text.split_whitespace().nth(1).unwrap_or("");
                     let ok = match (name, val) {
-                        ("zone", _) => it.clone().count() == 0 && crate::rtc::set_zone(text.split_whitespace().nth(1).unwrap_or("").as_bytes()),
+                        ("zone", _) if it.clone().count() == 0 => {
+                            let was = crate::zone::state().device;
+                            let c = match word {
+                                "auto" => Some(crate::zone::Choice { auto: true, id: was.id }),
+                                "none" => Some(crate::zone::Choice { auto: false, id: crate::zone::Id::NONE }),
+                                w => crate::zone::Id::new(w.as_bytes()).filter(|z| !z.is_none()).map(|id| crate::zone::Choice { auto: false, id }),
+                            };
+                            c.is_some_and(|c| crate::process::with_lock(|| crate::zone::set_device(c, || true)))
+                        }
+                        ("zone_follow", Some(v @ (0 | 1))) => crate::process::with_lock(|| crate::zone::set_follow(v == 1, || true)),
                         ("tz", Some(z)) if z.abs() < 86_400 => {
                             crate::rtc::set_tz(z);
                             true

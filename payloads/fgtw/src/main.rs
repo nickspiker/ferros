@@ -1770,6 +1770,12 @@ impl Client {
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
                     continue;
                 }
+                // 22 [automatic][the IANA id by hand]: the person's zone chosen on this device's clock page while it follows them (space.rs `space_zone`) → [0 done, 1 before the first pull, 2 not an id]. The kernel holds what the page shows (SYS_ZONE op 5).
+                if n >= 2 && req[0] == 22 {
+                    let r = [self.space_zone(req[1] != 0, &req[2..got])];
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
                 if n >= 1 && (8..=16).contains(&req[0]) {
                     let text = core::str::from_utf8(&req[1..got]).unwrap_or("");
                     let r: Vec<u8> = match req[0] {
