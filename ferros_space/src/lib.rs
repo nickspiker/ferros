@@ -37,7 +37,7 @@ pub mod kind {
     pub const PLACE: u8 = 3;
     pub const VIEW: u8 = 4;
     pub const HOME_SYNC: u8 = 5;
-    /// A member leaving the fleet: its signed departure request, carried by the space to every member wherever it is (owner, 2026-11-09: "broadcast to the devices like a regular message"), approved on any of them with the words the leaver shows; gone once the Remove is published or the device is no longer a member.
+    /// A member leaving the fleet: its signed departure request, carried by the space to every member wherever it is (owner, 2026-11-09: "broadcast to the devices like a regular message"), approved or denied on any of them, no words (owner, 2026-11-10); once denied, the signed deny in its place; gone once the Remove is published or the device is no longer a member.
     pub const DEPART: u8 = 6;
 }
 
@@ -356,6 +356,8 @@ pub struct Outcome {
     pub space_changed: bool,
     /// Writes made to the device's copy from the space: the map reads its places again.
     pub wrote: usize,
+    /// The kinds written (bit k: kind k), for the identity service's line: a sync that writes on every pass names what does not stay (2026-11-10: four writes every cycle on the Pro, its copy unchanged).
+    pub kinds: u8,
 }
 
 /// One write from the space applied to the device's copy (the list in hand; places and the view straight to the vault). False when the vault refused.
@@ -451,6 +453,7 @@ pub fn read_list(store: &mut impl Store) -> Result<Kists, ()> {
 pub fn sync(space: &mut Space, base: &mut Baseline, store: &mut impl Store, me: &[u8; 32], now: i64) -> Result<Outcome, &'static str> {
     let start = space.digest();
     let mut wrote = 0;
+    let mut kinds = 0u8;
     for _ in 0..4 {
         let mut list = read_list(store).map_err(|_| "the person's list is not readable")?;
         let scope = if home_sync(space, me) { FLEET } else { *me };
@@ -464,6 +467,8 @@ pub fn sync(space: &mut Space, base: &mut Baseline, store: &mut impl Store, me: 
         // Kists before answers and places: an answer or a place names a kist the list must already hold.
         let (first, rest): (Vec<Write>, Vec<Write>) = writes.into_iter().partition(|w| matches!(w, Write::Set { kind: kind::KIST, .. } | Write::Remove { kind: kind::KIST, .. }));
         for w in first.into_iter().chain(rest) {
+            // Kinds are 0 to 6 (`kind`): a bit each in a u8.
+            kinds |= 1 << match &w { Write::Set { kind, .. } | Write::Remove { kind, .. } => *kind };
             if !apply(w, &mut list, &mut list_changed, store) {
                 *base = before;
                 return Err("the vault did not take a write");
@@ -478,7 +483,7 @@ pub fn sync(space: &mut Space, base: &mut Baseline, store: &mut impl Store, me: 
             }
         }
     }
-    Ok(Outcome { space_changed: space.digest() != start, wrote })
+    Ok(Outcome { space_changed: space.digest() != start, wrote, kinds })
 }
 
 /// The capsules the person's list names that this device lacks (`has` asks the device's `capsules.`), in list order: what the fetch must bring (docs/IDENTITY-SPACE.md "Capsules").

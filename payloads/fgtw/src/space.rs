@@ -364,7 +364,13 @@ impl Client {
                     self.space.generation = self.space.generation.wrapping_add(1);
                     self.log.put(b"fgtw: space: ");
                     self.log.dec(o.wrote as u64);
-                    self.log.put(b" write(s) to this device's kists and home screen from the fleet's");
+                    self.log.put(b" write(s) to this device's kists and home screen from the fleet's:");
+                    for (k, name) in [b"kist".as_slice(), b"answer", b"default", b"place", b"view", b"home sync", b"departure"].iter().enumerate() {
+                        if o.kinds >> k & 1 == 1 {
+                            self.log.put(b" ");
+                            self.log.put(name);
+                        }
+                    }
                     self.log.line();
                 }
                 if o.wrote > 0 || o.space_changed {
