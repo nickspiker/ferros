@@ -46,3 +46,14 @@ On Android, whether Photon keeps double and triple tap or moves to these gesture
 1. The attest line's window, fade, caret chase and pan, on its current bespoke line (the drag needs a `Drag` contact event from honeycomb's `Touches`, which today reports a moving off-key finger as nothing).
 2. The contacts-to-pointer adapter, and `Textbox` on ferros with the measuring question (Open 0) settled.
 3. The glass selection gestures in `Textbox` as a mode, Photon on ferros first; the attest line moves onto `Textbox` with selection off.
+
+## People's words on the wire: `x`, and its subsets (2026-11-09)
+
+A person's words travel as vsf's `x` (Unicode text, Huffman coded from one frozen codebook), never as `a`. Since vsf f90e7eb `a` and `d` hold `vsf::Ascii`, which cannot hold a byte past 127: `a` is for identifiers, the program's own words. A WiFi network's name is neither: it is `nw`, the SSID's octets bit for bit (vsf 025e540).
+
+The full codebook is one entry per Unicode scalar, 1,112,064 of them, 8.9 MB as stored. Measured: 712 characters have codes of 3 to 20 bits (Latin-1, Cyrillic, Arabic, Devanagari, Thai, kana, the commonest CJK and Hangul, a few emoji); every other character has 23 or 24. The tree is an ordinary Huffman tree, not canonical, so it is not rebuilt from code lengths, and it is frozen: the identity seed is BLAKE3 over a handle's `x` bytes, so a changed codebook names everyone else.
+
+- **std processes** (Photon, Mahere, any app built for the std target) build vsf with `text` (or `text-encode`) and carry the whole table. fluor draws what they decode.
+- **no_std processes** carry an exact subset: the codes of a chosen set of characters, pulled from `huffman_codes.bin` at build time, bit for bit the full table's. ahau_core does this today for the honeycomb keyboard's characters (its build.rs). A character outside the set is refused when encoding, never guessed; a code outside it reads as not in this table, never as another character (the code is prefix-free, so a longer code than any in the set cannot be misread as one in it).
+- **Sets are chosen by what they must hold, not cut by code length.** A prefix by frequency fails at once: Spanish's ¿ and ¡, Māori's macrons (ā ē ī ō ū), the curly quotes, the dashes, the ellipsis and € all have 23 or 24-bit codes. The keyboard's set is its keys; a language's set is that language's letters and punctuation (Spanish adds about a hundred entries to Latin-1, under a kilobyte at 8 bytes an entry).
+- **Not built yet.** No no_std process carries a person's words today (settings and anything showing them belong to std apps as they come). The first one that does gets a vsf no_std `x` codec over a subset table and the set it needs, generated as ahau_core's is; ahau_core's table moves onto it.
