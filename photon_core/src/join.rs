@@ -92,7 +92,7 @@ impl FleetSigner for DeviceKeys {
 }
 
 // The frames between fleet devices are fgtw's (`fgtw::protocol`, fgtw MIGRATION.md step 5, 2026-10-31): the beacon, the binding request and its `bind_req` envelope, the departure request, `fleet_req` / `fleet_resp` / `fanout_resp` — one codec with the app and every other fleet client, not a copy pinned against it. Builders take this device's keys (`DeviceKeys` is a `FleetSigner`) and the caller's eagle time.
-pub use fgtw::protocol::{beacon, bind_req, bind_request, depart_consent, depart_req, depart_words, depart_words_commit, parse_beacon, DepartReq, BEACON_PORT, BEACON_V4, BEACON_V6, DEPART_DESK, DEPART_NEW_OWNER, PORT};
+pub use fgtw::protocol::{beacon, bind_req, bind_request, depart_consent, depart_deny, depart_req, parse_depart_deny, parse_beacon, DepartReq, BEACON_PORT, BEACON_V4, BEACON_V6, DEPART_DESK, DEPART_NEW_OWNER, PORT};
 
 /// A device-signed frame from a peer, by its section.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -357,7 +357,8 @@ impl Udp {
 /// Kept in the vault as `fgtw.depart` (`DEPART_KEY`) from the moment it starts until it completes, so a reboot resumes it rather than dropping it (`keep_depart`, `resume_depart`).
 struct Depart {
     t: i64,
-    words: alloc::string::String,
+    /// The request's salt (fgtw::protocol::DepartReq): a denied request is never asked again, so a new one takes a new salt.
+    salt: [u8; 32],
     frame: Vec<u8>,
     checked_us: u64,
 }
@@ -369,14 +370,16 @@ const V_LOOKING: u8 = 4;
 const V_FRESH: u8 = 5;
 const V_WRONG: u8 = 6;
 const V_UNREACHABLE: u8 = 7;
-/// Leaving: a departure request is out (op 5) and its approval words are shown until a surviving device of the fleet approves and the chain no longer holds this device.
+/// Leaving: a departure request is out (op 5) to the fleet's devices, each of which asks its person, Approve or Deny, until one approves and the chain no longer holds this device.
 const V_LEAVING: u8 = 8;
 /// Owned elsewhere: fgtw.org refused this device's binding request because the device is in another identity's fleet (`device_owned`). No words; only that fleet can let it go.
 const V_OWNED: u8 = 9;
 
-/// The kept departure's name in the `fgtw.` scope: one VSF document, section `depart`, with `rq` the signed `depart_req` frame as a binary blob (its stamp and consent inside it) and `wd` the three approval words.
+/// The kept departure's name in the `fgtw.` scope: one VSF document, section `depart`, with `rq` the signed `depart_req` frame as a binary blob (its stamp, consent and salt inside it).
 /// Nothing of the identity is in it: the frame is this device's signature over its consent, and which identity it leaves is proven again at resume by checking the consent's Ed25519 egg against the roots then in hand (`resume_depart`).
 const DEPART_KEY: &[u8] = b"depart";
+/// The departure requests denied (`Client::denied`): one VSF document, section `denied`, a `request` field each (the leaving device `ke`, the salt `hb`, the consent stamp `e`).
+const DENIED_KEY: &[u8] = b"denied";
 /// One transfer of the vault (the kernel's STORE_MAX): larger values go in pieces.
 const STORE_PIECE: usize = 4096;
 
@@ -489,7 +492,8 @@ struct DepartAsk {
     t: i64,
     sig: Vec<u8>,
     intent: u8,
-    commit: Option<[u8; 32]>,
+    /// The request's salt, which a Deny names.
+    salt: [u8; 32],
     approve: bool,
     /// What happened to the approval (0 waiting, 1 approving, 2 approved, 3 failed).
     result: u8,
@@ -561,7 +565,11 @@ struct Client {
     ble_said: (usize, usize),
     /// A sibling's departure waiting for approval here.
     depart_ask: Option<DepartAsk>,
-    /// Words wanted from the person (op 15, the Fleet page): 0 none, 1 a newcomer's pairing words, 2 a leaver's approval words. The keyboard's host (the attest screen, ahau) asks for it (op 16), sends what is typed (ops 11, 14), and closes when the words match or the person cancels (op 15 [0]).
+    /// Departure requests denied here or by another fleet device: (the leaving device, the request's salt, its consent stamp), kept in the vault (`DENIED_KEY`), so the same request is never asked or approved again; the newest 32.
+    denied: Vec<([u8; 32], [u8; 32], i64)>,
+    /// This device's own departure denied: the device that denied it, shown on the Fleet page until the person asks again.
+    depart_denied: Option<[u8; 32]>,
+    /// Words wanted from the person (op 15, the Fleet page): 0 none, 1 a newcomer's pairing words (the last resort when a tap and BLE fail; a departure takes no words since 2026-11-10). The keyboard's host (the attest screen, ahau) asks for it (op 16), sends what is typed (ops 11, 14), and closes when the words match or the person cancels (op 15 [0]).
     entry: u8,
     /// The person's identity space (space.rs, docs/IDENTITY-SPACE.md): their kists, answers and home screen, kept here and synced with their fleet.
     space: space::SpaceSync,
@@ -673,7 +681,8 @@ impl Client {
                 }
             }
         }
-        // A departure that was under way when the device last stopped: resumed, and finished at once if the chain held here already lacks this device.
+        // A departure that was under way when the device last stopped: resumed, and finished at once if the chain held here already lacks this device. The requests denied before, so none is asked again.
+        self.load_denied();
         self.resume_depart();
         if let Some(c) = held {
             self.depart_check(&c);
@@ -967,10 +976,10 @@ impl Client {
         }
         let t = eagle();
         let consent = join::depart_consent(&self.keys, &hp, t);
-        let mut n = [0u8; 8];
-        kernel_entropy(&mut n);
-        let words = join::depart_words(u64::from_le_bytes(n));
-        let req = join::DepartReq { t, consent_sig: consent, intent, words_commit: Some(join::depart_words_commit(&words)) };
+        // A fresh salt names this request (owner, 2026-11-10: "upon deny another request will have to use a new salt").
+        let mut salt = [0u8; 32];
+        kernel_entropy(&mut salt);
+        let req = join::DepartReq { t, consent_sig: consent, intent, salt };
         let frame = match join::depart_req(&req, &self.keys, t) {
             Ok(f) => f,
             Err(e) => {
@@ -980,10 +989,10 @@ impl Client {
                 return 3;
             }
         };
-        self.log.put(if intent == join::DEPART_NEW_OWNER { b"fgtw: leaving the fleet (to a new owner); approve on a device of the fleet with the words: ".as_slice() } else { b"fgtw: leaving the fleet (to the desk); approve on a device of the fleet with the words: " });
-        self.log.put(words.as_bytes());
+        self.log.put(if intent == join::DEPART_NEW_OWNER { b"fgtw: leaving the fleet (to a new owner): asking this identity's devices, Approve or Deny on any of them".as_slice() } else { b"fgtw: leaving the fleet: asking this identity's devices, Approve or Deny on any of them" });
         self.log.line();
-        self.depart = Some(Depart { t, words, frame, checked_us: 0 });
+        self.depart_denied = None;
+        self.depart = Some(Depart { t, salt, frame, checked_us: 0 });
         self.keep_depart();
         let request = self.depart.as_ref().map(|d| d.frame.clone()).unwrap_or_default();
         self.space_put_depart(&request);
@@ -1007,13 +1016,12 @@ impl Client {
         0
     }
 
-    /// The departure under way into the vault (`DEPART_KEY`), so a reboot before a device of the fleet approves resumes it with the same request and the same words.
-    /// Kept whether or not unlock-at-boot is on: it holds no root, and without it a reboot would leave the approver's words pointing at a request this device had forgotten.
+    /// The departure under way into the vault (`DEPART_KEY`), so a reboot before a device of the fleet approves resumes it with the same request (the same salt).
+    /// Kept whether or not unlock-at-boot is on: it holds no root, and without it a reboot would leave the fleet's devices asking about a request this device had forgotten.
     fn keep_depart(&mut self) {
         let Some(d) = &self.depart else { return };
         let mut section = vsf::VsfSection::new("depart");
         section.add_field("rq", vsf::VsfType::v(b'b', d.frame.clone()));
-        section.add_field("wd", vsf::VsfType::x(d.words.clone()));
         let kept = match vsf::VsfBuilder::new().creation_time_oscillations(eagle()).add_section_direct(section).build() {
             Ok(doc) => self.store_set_whole(DEPART_KEY, &doc),
             Err(_) => false,
@@ -1038,20 +1046,21 @@ impl Client {
             return;
         };
         let Ok(section) = header.primary_section(&doc, end) else { return };
-        let frame = section.get_field("rq").and_then(|f| f.values.first()).and_then(|v| v.as_bytes()).map(|b| b.to_vec());
-        let words = section.get_field("wd").and_then(|f| f.values.first()).and_then(|v| v.as_string()).map(alloc::string::String::from);
-        let (Some(frame), Some(words)) = (frame, words) else { return };
-        let Ok((req, leaver)) = fgtw::protocol::parse_depart_req(&frame) else { return };
+        let Some(frame) = section.get_field("rq").and_then(|f| f.values.first()).and_then(|v| v.as_bytes()).map(|b| b.to_vec()) else { return };
+        // A request kept by a build from before 2026-11-10 (words, no salt) does not parse: dropped, and the person asks again.
+        let Ok((req, leaver)) = fgtw::protocol::parse_depart_req(&frame) else {
+            let _ = ferros_sys::store_delete(cap(self.log.grants, S_STORE), DEPART_KEY);
+            return;
+        };
         let msg = fgtw::fleet::departreq_signing_bytes(&hp, &self.me, req.t);
         let ours = leaver == self.me
             && fgtw::pq::eggs_from_bytes(&req.consent_sig).is_ok_and(|eggs| eggs.iter().any(|e| e.scheme == fgtw::fleet::scheme::ED25519 && fgtw::pq::verify_egg(e.scheme, &self.me, &msg, &e.sig)));
         if !ours {
             return;
         }
-        self.log.put(b"fgtw: resuming the departure kept from before the restart; approve on a device of the fleet with the words: ");
-        self.log.put(words.as_bytes());
+        self.log.put(b"fgtw: resuming the departure kept from before the restart: asking this identity's devices again");
         self.log.line();
-        self.depart = Some(Depart { t: req.t, words, frame, checked_us: 0 });
+        self.depart = Some(Depart { t: req.t, salt: req.salt, frame, checked_us: 0 });
         let request = self.depart.as_ref().map(|d| d.frame.clone()).unwrap_or_default();
         self.space_put_depart(&request);
         for i in 0..self.sponsors.len() {
@@ -1508,6 +1517,7 @@ impl Client {
             // A newcomer asking this device to add it, and a sibling asking to leave: the sponsor's and the approver's frames (fgtw::sponsor).
             Ok((Inbound::Other(name), _)) if name == "bind_req" => self.on_bind_req(from, bytes),
             Ok((Inbound::Other(name), _)) if name == "depart_req" => self.on_depart_req(bytes),
+            Ok((Inbound::Other(name), _)) if name == "depart_deny" => self.on_depart_deny(bytes),
             // The person's identity space from a sibling (space.rs).
             Ok((Inbound::Other(name), _)) if name == "space_push" => self.on_space_push(from, bytes),
             Ok((Inbound::Other(name), _)) if name == "space_want" => self.on_space_want(from, bytes),
@@ -1634,8 +1644,8 @@ impl Client {
                         11 => self.type_words(text),
                         12 => alloc::vec![self.confirm_add()],
                         13 => self.depart_ask_reply(),
-                        14 => alloc::vec![self.approve_words(text)],
-                        15 if n >= 2 && req[1] <= 2 => {
+                        14 if n >= 2 => alloc::vec![self.answer_depart(req[1] != 0)],
+                        15 if n >= 2 && req[1] <= 1 => {
                             self.entry = req[1];
                             alloc::vec![0]
                         }
@@ -1715,10 +1725,8 @@ impl Client {
                 let state = if self.depart.is_some() { V_LEAVING } else { state };
                 reply.push(state);
                 reply.push(self.sponsors.len().min(255) as u8);
-                // The approval words first: a departure resumed after a restart can be under way before the chain is adopted again (not yet bound), and its words, not the pairing words, are what the state 8 shows.
-                if let Some(d) = &self.depart {
-                    reply.extend_from_slice(d.words.as_bytes());
-                } else if let (Some(seed), false, V_JOIN) = (self.identity_seed, self.bound, self.verdict) {
+                // Joining's pairing words follow the state, the last resort when a tap and BLE fail; a departure shows none (owner, 2026-11-10), even one resumed before the chain is adopted again.
+                if let (Some(seed), false, V_JOIN, None) = (self.identity_seed, self.bound, self.verdict, &self.depart) {
                     reply.extend_from_slice(join::pair_words(&self.me, &seed).as_bytes());
                 }
                 svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, reply.as_ptr() as u64 - self.udp.base, reply.len() as u64, 0, 0);
@@ -2181,6 +2189,10 @@ impl Client {
         if self.depart_ask.as_ref().is_some_and(|d| d.leaver == leaver && d.t == req.t) {
             return;
         }
+        // A request denied once is never asked again, by its salt or by its consent stamp (the same consent under a new salt is the same request).
+        if self.denied.iter().any(|&(l, s, t)| l == leaver && (s == req.salt || t == req.t)) {
+            return;
+        }
         self.log.put(b"fgtw: ");
         if let Some(seed) = self.identity_seed {
             self.log.put(fgtw::pair::device_name_default(&leaver, &seed).as_bytes());
@@ -2188,18 +2200,23 @@ impl Client {
             self.log.fp(&leaver);
             self.log.put(b")");
         }
-        self.log.put(b" asks to leave the fleet: approve on the Fleet page with the words it shows");
+        self.log.put(b" asks to leave the fleet: Approve or Deny on the Fleet page");
         self.log.line();
-        self.depart_ask = Some(DepartAsk { leaver, t: req.t, sig: req.consent_sig, intent: req.intent, commit: req.words_commit, approve: false, result: 0 });
+        self.depart_ask = Some(DepartAsk { leaver, t: req.t, sig: req.consent_sig, intent: req.intent, salt: req.salt, approve: false, result: 0 });
     }
 
-    /// Op 13, a departure waiting here: [present][intent][result: 0 waiting, 1 approving, 2 approved, 3 failed][name length][name].
+    /// Op 13, a departure waiting here: [1][intent][result: 0 waiting, 1 approving, 2 approved, 3 failed][name length][name]; or this device's own departure denied: [2][0][0][name length][the name of the device that denied it]; else [0][0][0][0].
     fn depart_ask_reply(&self) -> Vec<u8> {
         let mut r = Vec::with_capacity(48);
-        match (&self.depart_ask, self.identity_seed) {
-            (Some(d), Some(seed)) => {
+        match (&self.depart_ask, self.depart_denied, self.identity_seed) {
+            (Some(d), _, Some(seed)) => {
                 let name = fgtw::pair::device_name_default(&d.leaver, &seed);
                 r.extend_from_slice(&[1, d.intent, d.result, name.len() as u8]);
+                r.extend_from_slice(name.as_bytes());
+            }
+            (None, Some(by), Some(seed)) => {
+                let name = fgtw::pair::device_name_default(&by, &seed);
+                r.extend_from_slice(&[2, 0, 0, name.len() as u8]);
                 r.extend_from_slice(name.as_bytes());
             }
             _ => r.extend_from_slice(&[0, 0, 0, 0]),
@@ -2207,16 +2224,98 @@ impl Client {
         r
     }
 
-    /// Op 14: the leaver's words typed here. Returns 0 they match (the loop countersigns), 1 no departure waiting, 2 the words do not match, 3 the request carries no words to check.
-    fn approve_words(&mut self, text: &str) -> u8 {
+    /// Op 14, the person's answer to the departure waiting here (owner, 2026-11-10: a yes or no question): `[14][1]` Approve (the loop countersigns), `[14][0]` Deny. Returns 0 done, 1 no departure waiting.
+    fn answer_depart(&mut self, approve: bool) -> u8 {
         let Some(d) = self.depart_ask.as_mut() else { return 1 };
-        let Some(commit) = d.commit else { return 3 };
-        if !fgtw::sponsor::depart_words_match(text, &commit) {
-            return 2;
+        if approve {
+            d.approve = true;
+            d.result = 1;
+            return 0;
         }
-        d.approve = true;
-        d.result = 1;
+        let (leaver, salt, t) = (d.leaver, d.salt, d.t);
+        self.depart_ask = None;
+        self.note_denied(leaver, salt, t);
+        let Some(hp) = self.hp else { return 0 };
+        self.log.put(b"fgtw: the departure of ");
+        self.log.fp(&leaver);
+        self.log.put(b" denied here: the fleet's devices are told, and that request is never asked again");
+        self.log.line();
+        // To every fleet device heard (the leaving one among them), and into the space for the rest (the entry's value becomes the deny: fgtw.org carries it to a device away from here).
+        if let Ok(frame) = fgtw::protocol::depart_deny(&hp, &leaver, &salt, t, self.keys.keypair(), eagle()) {
+            for i in 0..self.sponsors.len() {
+                let to = self.sponsors[i].addr;
+                let out = self.pt.send(to, frame.clone(), now_us(), eagle());
+                self.send_all(out);
+            }
+            self.space_deny_depart(&leaver, &frame);
+        }
         0
+    }
+
+    /// A departure denied, remembered so it is never asked again (`denied`, kept in the vault as `DENIED_KEY`).
+    fn note_denied(&mut self, leaver: [u8; 32], salt: [u8; 32], t: i64) {
+        if self.denied.iter().any(|&(l, s, _)| l == leaver && s == salt) {
+            return;
+        }
+        self.denied.push((leaver, salt, t));
+        // WHY the cap: a list kept whole in the vault; the newest 32 cover every request a person could have pending.
+        if self.denied.len() > 32 {
+            self.denied.remove(0);
+        }
+        let mut section = vsf::VsfSection::new("denied");
+        for &(l, s, t) in &self.denied {
+            section.add_field_multi("request", alloc::vec![vsf::VsfType::ke(l.to_vec()), vsf::VsfType::hb(s.to_vec()), vsf::VsfType::e(vsf::types::EtType::e6(t))]);
+        }
+        if let Ok(doc) = vsf::VsfBuilder::new().creation_time_oscillations(eagle()).add_section_direct(section).build() {
+            if !self.store_set_whole(DENIED_KEY, &doc) {
+                self.log.put(b"fgtw: the denied request was not kept in the vault");
+                self.log.line();
+            }
+        }
+    }
+
+    /// The denied requests kept in the vault (`note_denied`), read once the roots are in hand.
+    fn load_denied(&mut self) {
+        let Some(doc) = self.store_get_whole(DENIED_KEY) else { return };
+        let Ok((header, end)) = vsf::verification::read_verified(&doc, None) else { return };
+        let Ok(section) = header.primary_section(&doc, end) else { return };
+        self.denied.clear();
+        for f in section.get_fields("request") {
+            let v = &f.values;
+            if let (Some(vsf::VsfType::ke(l)), Some(vsf::VsfType::hb(s)), Some(t)) = (v.first(), v.get(1), v.get(2).and_then(|x| x.as_eagle())) {
+                if let (Ok(l), Ok(s)) = (<[u8; 32]>::try_from(l.as_slice()), <[u8; 32]>::try_from(s.as_slice())) {
+                    self.denied.push((l, s, t));
+                }
+            }
+        }
+    }
+
+    /// A `depart_deny` from a fleet device (on the LAN, or the space's departure entry): the request it names cleared here and never asked again; this device's own request denied ends its departure (the person may ask again: a new request, a new salt).
+    pub fn on_depart_deny(&mut self, bytes: &[u8]) {
+        let Ok((hp, leaver, salt, t, denier)) = fgtw::protocol::parse_depart_deny(bytes) else { return };
+        if self.hp != Some(hp) || !self.bound || !self.members.contains(&denier) || denier == leaver {
+            return;
+        }
+        let known = self.denied.iter().any(|&(l, s, _)| l == leaver && s == salt);
+        self.note_denied(leaver, salt, t);
+        if self.depart_ask.as_ref().is_some_and(|d| d.leaver == leaver && (d.salt == salt || d.t == t)) {
+            self.depart_ask = None;
+        }
+        if leaver == self.me && self.depart.as_ref().is_some_and(|d| d.salt == salt) {
+            self.depart = None;
+            let _ = ferros_sys::store_delete(cap(self.log.grants, S_STORE), DEPART_KEY);
+            self.depart_denied = Some(denier);
+            self.log.put(b"fgtw: our departure was denied by ");
+            self.log.fp(&denier);
+            self.log.put(b": this device stays in the fleet");
+            self.log.line();
+        } else if !known {
+            self.log.put(b"fgtw: the departure of ");
+            self.log.fp(&leaver);
+            self.log.put(b" was denied by ");
+            self.log.fp(&denier);
+            self.log.line();
+        }
     }
 
     /// The approved departure countersigned and published (fgtw::sponsor::approve_departure), the device's brand released when it leaves to a new owner; the chain is read again so the members drop the leaver.
@@ -2429,7 +2528,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: false, listen_pass: 0, listen_said: (255, 255), ble_said: (0, 0), depart_ask: None, entry: 0, space: space::SpaceSync::new() };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: false, listen_pass: 0, listen_said: (255, 255), ble_said: (0, 0), depart_ask: None, denied: Vec::new(), depart_denied: None, entry: 0, space: space::SpaceSync::new() };
     c.run()
 }
 

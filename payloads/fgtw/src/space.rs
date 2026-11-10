@@ -402,6 +402,18 @@ impl Client {
         }
     }
 
+    /// A departure denied here: the space's entry for it becomes the signed deny (ferros_space::deny_depart), so the fleet's devices away from here clear it and the leaving device learns of it.
+    pub fn space_deny_depart(&mut self, leaver: &[u8; 32], deny: &[u8]) {
+        if self.space_ready().is_none() {
+            return;
+        }
+        if ferros_space::deny_depart(&mut self.space.space, leaver, &self.me, deny, eagle()) {
+            self.space_keep();
+            self.space_to_fleet();
+            self.space_seed(true);
+        }
+    }
+
     /// A departure published (or its device gone from the fleet): marked gone in the space, so no member asks for it again.
     pub fn space_drop_depart(&mut self, leaver: &[u8; 32]) {
         if self.space_ready().is_none() {
@@ -416,15 +428,25 @@ impl Client {
 
     /// The departures the space carries: another member's goes to the intake a local hand-over takes (`on_depart_req`, which checks its signature and keeps it for the Fleet page); one whose device is no longer a member is marked gone.
     fn space_departures(&mut self) {
-        for (leaver, request) in ferros_space::departures(&self.space.space) {
-            if leaver == self.me {
+        let live = ferros_space::departures(&self.space.space);
+        for (leaver, bytes) in &live {
+            // A deny, wherever it was made: this device's own request among them.
+            if fgtw::protocol::parse_depart_deny(bytes).is_ok() {
+                self.on_depart_deny(bytes);
                 continue;
             }
-            if self.bound && !self.members.is_empty() && !self.members.contains(&leaver) {
-                self.space_drop_depart(&leaver);
+            if *leaver == self.me {
                 continue;
             }
-            self.on_depart_req(&request);
+            if self.bound && !self.members.is_empty() && !self.members.contains(leaver) {
+                self.space_drop_depart(leaver);
+                continue;
+            }
+            self.on_depart_req(bytes);
+        }
+        // A request waiting here whose entry is gone (approved on another device, or given up): cleared, unless this device is countersigning it now.
+        if self.depart_ask.as_ref().is_some_and(|d| !d.approve && d.result == 0 && !live.iter().any(|(l, _)| *l == d.leaver)) {
+            self.depart_ask = None;
         }
     }
 

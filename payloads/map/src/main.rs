@@ -242,8 +242,6 @@ struct Fleet {
     me: [bool; 16],
     /// Each member heard on this network (fgtw op 6, flag bit 1).
     heard: [bool; 16],
-    /// How this device reaches its fleet (fgtw op 7): the network up, seconds since fgtw.org last answered (None: never), fleet devices heard on this network. None until the service answered it.
-    reach: Option<(bool, Option<u32>, u8)>,
     /// Each member's two-word device name (fgtw op 6's names), `names_n` bytes of it; 0 when the service gave none, and the row shows the key prefix instead.
     names: [[u8; NAME_BYTES]; 16],
     names_n: [u8; 16],
@@ -265,11 +263,14 @@ struct Fleet {
     depart: Option<(u8, u8)>,
     depart_name: [u8; NAME_BYTES],
     depart_name_n: usize,
+    /// This device's own departure denied (fgtw op 13 [2]): the name of the device that denied it.
+    denied_by: [u8; NAME_BYTES],
+    denied_by_n: usize,
 }
 
 impl Fleet {
     const fn new() -> Self {
-        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], reach: None, names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0, home: None }
+        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0, denied_by: [0; NAME_BYTES], denied_by_n: 0, home: None }
     }
 
     /// The service's state and words (`[state][siblings heard][words]`), then its members (`[count][count × (8 key bytes, flags)]`). CALL_LIVE: a service that is not running answers at once instead of holding the page.
@@ -284,11 +285,7 @@ impl Fleet {
         let w = (n as usize - 2).min(self.words.len());
         self.words[..w].copy_from_slice(&r[2..2 + w]);
         self.words_n = w;
-        let mut q = [0u8; 6];
-        self.reach = (ferros_sys::call_live(svc, &[7], &mut q) == 6).then(|| {
-            let age = u32::from_le_bytes([q[1], q[2], q[3], q[4]]);
-            (q[0] != 0, (age != u32::MAX).then_some(age), q[5])
-        });
+
         let mut s = [0u8; 8];
         self.home = (ferros_sys::call_live(svc, &[17], &mut s) == 8).then(|| (s[4] == 1, s[5] == 1));
         let mut m = [0u8; 1 + 16 * 9 + 16 * (1 + NAME_BYTES)];
@@ -360,11 +357,18 @@ impl Fleet {
         let mut d = [0u8; 4 + NAME_BYTES];
         let k = ferros_sys::call_live(svc, &[13], &mut d);
         self.depart = None;
-        if k != ferros_sys::ERR && k >= 4 && d[0] == 1 {
+        self.denied_by_n = 0;
+        // WHY the mins: the name's length is the service's word; what is copied is what both the reply and the field hold.
+        if k != ferros_sys::ERR && k >= 4 && (d[0] == 1 || d[0] == 2) {
             let len = (d[3] as usize).min(NAME_BYTES).min(k as usize - 4);
-            self.depart_name[..len].copy_from_slice(&d[4..4 + len]);
-            self.depart_name_n = len;
-            self.depart = Some((d[1], d[2]));
+            if d[0] == 1 {
+                self.depart_name[..len].copy_from_slice(&d[4..4 + len]);
+                self.depart_name_n = len;
+                self.depart = Some((d[1], d[2]));
+            } else {
+                self.denied_by[..len].copy_from_slice(&d[4..4 + len]);
+                self.denied_by_n = len;
+            }
         }
     }
 
@@ -629,8 +633,9 @@ enum Choice {
     FleetWords,
     FleetConfirm,
     FleetClose,
-    /// A sibling's departure waiting here: type the words it shows (ahau's keyboard) to approve it.
+    /// A sibling's departure waiting here: Approve (fgtw op 14 [1]) or Deny ([0]).
     FleetApprove,
+    FleetDeny,
     /// The Fleet page's "this device's home screen": follows the person's fleet, or keeps its own (payloads/fgtw op 18; docs/IDENTITY-SPACE.md).
     HomeSync,
     /// A link on Connections: its own page (LINKS order).
@@ -2051,34 +2056,6 @@ impl Map {
                     Some(_) => "looking the identity up",
                 };
                 row(self, b, &mut y, small, white(), state, None);
-                // How this device reaches its fleet (fgtw op 7): the network, when fgtw.org last answered, and the fleet's devices heard on this network.
-                if let Some((up, seed, near)) = f.reach {
-                    let nf = ferros_sys::numbers(Style::Glyphs);
-                    let mut l = Line::new();
-                    if !up {
-                        l.s("offline: no network");
-                    } else {
-                        match seed {
-                            Some(s) => {
-                                l.s("fgtw.org answered ");
-                                let _ = tatau::duration_ns(&mut l, nf, s as u64 * 1_000_000_000, 0);
-                                l.s(" ago");
-                            }
-                            None => {
-                                l.s("network up, fgtw.org has not answered");
-                            }
-                        }
-                    }
-                    row(self, b, &mut y, small, grey(), l.as_str(), None);
-                    let mut l = Line::new();
-                    if near == 0 {
-                        l.s("none of your devices heard nearby");
-                    } else {
-                        let _ = tatau::count(&mut l, nf, near as u64, 0);
-                        l.s(" of your devices heard nearby");
-                    }
-                    row(self, b, &mut y, small, grey(), l.as_str(), None);
-                }
                 for i in 0..f.n {
                     // Each member by the two-word name its fleet knows it by (Photon's Fleet page shows the same one); the key's first four bytes only when the service gave no name.
                     let mut l = Line::new();
@@ -2120,12 +2097,25 @@ impl Map {
                         l.s(core::str::from_utf8(&f.depart_name[..f.depart_name_n]).unwrap_or("a device"));
                         l.s(if intent == 1 { " asks to leave, to a new owner" } else { " asks to leave the fleet" });
                         row(self, b, &mut y, small, white(), l.as_str(), None);
+                        // A yes or no question (owner, 2026-11-10): Approve or Deny, nothing typed.
                         match result {
-                            0 => button(self, b, &mut y, "approve: type the words it shows", false, Some(Choice::FleetApprove)),
+                            0 => {
+                                button(self, b, &mut y, "approve", false, Some(Choice::FleetApprove));
+                                button(self, b, &mut y, "deny", false, Some(Choice::FleetDeny));
+                            }
                             1 => row(self, b, &mut y, small, grey(), "approving", None),
                             2 => row(self, b, &mut y, small, grey(), "approved: it leaves the fleet", None),
-                            _ => button(self, b, &mut y, "the approval did not publish: type the words again", false, Some(Choice::FleetApprove)),
+                            _ => {
+                                button(self, b, &mut y, "the approval did not publish: approve again", false, Some(Choice::FleetApprove));
+                                button(self, b, &mut y, "deny", false, Some(Choice::FleetDeny));
+                            }
                         }
+                    }
+                    if f.denied_by_n > 0 {
+                        let mut l = Line::new();
+                        l.s("leaving was denied on ");
+                        l.s(core::str::from_utf8(&f.denied_by[..f.denied_by_n]).unwrap_or("one of your devices"));
+                        row(self, b, &mut y, small, white(), l.as_str(), None);
                     }
                     if f.add == 0 {
                         button(self, b, &mut y, "add a device", false, Some(Choice::FleetAdd));
@@ -2172,24 +2162,16 @@ impl Map {
                     }
                 }
                 if f.state == Some(8) {
-                    // The departure waits for a device of the fleet: its person types these words there (Photon: Devices).
-                    b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "approve on one of your devices with:");
-                    y += uu(1, 1);
-                    let words = core::str::from_utf8(&f.words[..f.words_n]).unwrap_or("");
-                    row(self, b, &mut y, uu(3, 2), white(), words, None);
-                    b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "then this device wipes and restarts");
-                    y += uu(2, 1);
+                    // The departure waits on the person's devices, each asking Approve or Deny (owner, 2026-11-10: no words).
+                    row(self, b, &mut y, small, white(), "asking your devices to let this one go", None);
+                    b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "approve on any of them, or tap one to this one");
+                    b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "then this device wipes and restarts");
+                    y += uu(3, 1);
                 } else if matches!(f.state, Some(2) | Some(3)) {
                     button(self, b, &mut y, if f.confirm { "tap again: remove this device" } else { "remove this device" }, f.confirm, Some(Choice::FleetRemove));
                     if f.confirm {
                         b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "wipes from this device: the map's arrangement,");
                         b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "WiFi networks, the last location; not saved");
-                        y += uu(3, 1);
-                    }
-                    // A departure needs one of the fleet's devices to approve, by the network or nearby: with neither, say so before the tap, not after.
-                    if f.reach.is_some_and(|(up, _, near)| !up && near == 0) {
-                        b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "removing needs one of your devices to approve:");
-                        b.text(cx, y + uu(1, 2), note as u16, dim(), 1, "a network, or one of them nearby");
                         y += uu(3, 1);
                     }
                     if f.leave_result.is_some_and(|r| r != 0) {
@@ -2920,7 +2902,8 @@ impl Map {
                     }
                     Some(Choice::FleetConfirm) => self.fleet.add_op(cap(self.grants, S_FGTW), &[12]),
                     Some(Choice::FleetWords) => self.fleet.add_op(cap(self.grants, S_FGTW), &[15, 1]),
-                    Some(Choice::FleetApprove) => self.fleet.add_op(cap(self.grants, S_FGTW), &[15, 2]),
+                    Some(Choice::FleetApprove) => self.fleet.add_op(cap(self.grants, S_FGTW), &[14, 1]),
+                    Some(Choice::FleetDeny) => self.fleet.add_op(cap(self.grants, S_FGTW), &[14, 0]),
                     Some(Choice::HomeSync) => {
                         let on = self.fleet.home.is_some_and(|h| h.0);
                         self.fleet.add_op(cap(self.grants, S_FGTW), &[18, !on as u8]);
@@ -3298,6 +3281,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The identity space's generation last read (payloads/fgtw op 17), and when it was asked.
     let mut space_seen = 0u32;
     let mut last_space = 0u64;
+    // The departure waiting here last seen (op 13's reply), so the Fleet page opens once for each: a request answered clears it, so the same device asking again opens the page again.
+    let mut last_ask = 0u64;
+    let mut ask_seen = [0u8; 4 + NAME_BYTES];
     let mut last_pass = now();
     let mut draw_us = 0u64;
     let mut move_us = 0u64;
@@ -3339,6 +3325,21 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if sc != scale_seen {
             scale_seen = sc;
             map.draw();
+        }
+
+        // A fleet device's departure waiting on this person (fgtw op 13): once a second, wherever the map is; a new one opens the Fleet page on it, Approve or Deny ready (owner, 2026-11-10: "go right to the fleet page and have the unbind request 'Approve' or 'Deny' screen ready to go"). Not over an app in front.
+        if !map.app_front && now().wrapping_sub(last_ask) > freq() {
+            last_ask = now();
+            let mut d = [0u8; 4 + NAME_BYTES];
+            let k = ferros_sys::call_live(cap(map.grants, S_FGTW), &[13], &mut d);
+            let asking = k != ferros_sys::ERR && k >= 4 && d[0] == 1 && d[2] == 0;
+            let key = if asking { d } else { [0u8; 4 + NAME_BYTES] };
+            if asking && key != ask_seen {
+                map.show_page("fleet");
+                map.fleet.poll(cap(map.grants, S_FGTW));
+                map.draw();
+            }
+            ask_seen = key;
         }
 
         // The person's identity space (payloads/fgtw op 17): once a second, on the plane with nothing held, its generation asked; a new one means the identity service wrote this device's kists or home screen from the person's fleet (a reset device getting its arrangement back, a move made on another of their devices), and the circles are read again. Generation 0 is nothing written yet; a map started after a write reads it once more, which changes nothing.

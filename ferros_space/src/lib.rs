@@ -10,7 +10,7 @@
 //! | `PLACE` | scope `ke`, then `d` "settings" or developer, option | x, y `i` (world ×256), radius `i`, turn cos, sin `i` (Q14) | `map.place.<label>` (EWE, the map's) |
 //! | `VIEW` | scope `ke` | x, y, cos, sin `i` | `map.view` |
 //! | `HOME_SYNC` | a device `ke` | on `u` | none: the space's own, set from settings |
-//! | `DEPART` | the leaving device `ke` | its signed departure request `v` | none: the identity service's own (payloads/fgtw), so a member approves it wherever it is |
+//! | `DEPART` | the leaving device `ke` | its signed departure request `v`, or once denied the signed deny | none: the identity service's own (payloads/fgtw), so a member answers it wherever it is |
 //!
 //! The scope of a place and the view is the fleet's (`FLEET`, 32 zero bytes) on every device whose home-screen sync is on (the default), and the device's own key on one where the person switched it off, so that device keeps an arrangement of its own, which follows it through a reset all the same.
 //!
@@ -124,9 +124,20 @@ pub fn put_depart(space: &mut Space, device: &[u8; 32], request: &[u8], now: i64
     space.put(Entry { kind: kind::DEPART, id: depart_id(device), value, updated, by: *device, gone: false })
 }
 
-/// The departures in the space: each leaving device and its request's bytes.
+/// The departures in the space: each leaving device and its entry's bytes, its signed request or, once denied, the signed deny (the reader tells them apart by the frame's section name).
 pub fn departures(space: &Space) -> Vec<([u8; 32], Vec<u8>)> {
     space.live(kind::DEPART).filter_map(|e| Some((e.id.first().and_then(k32)?, e.value.first()?.as_bytes()?.to_vec()))).collect()
+}
+
+/// `device`'s departure denied by `by` (owner, 2026-11-10): the entry's value becomes the signed `depart_deny` frame, so every fleet device that joins the space clears the request and the leaving device learns of it, wherever each is. A new request from the leaving device (a new salt) replaces it, as the newer write. Whether the space changed.
+pub fn deny_depart(space: &mut Space, device: &[u8; 32], by: &[u8; 32], deny: &[u8], now: i64) -> bool {
+    let value = vec![VsfType::v(b'b', deny.to_vec())];
+    let Some(e) = space.get(kind::DEPART, &depart_id(device)) else { return false };
+    if e.gone || e.value == value {
+        return false;
+    }
+    let updated = now.max(e.updated + 1);
+    space.put(Entry { kind: kind::DEPART, id: depart_id(device), value, updated, by: *by, gone: false })
 }
 
 /// `device`'s departure marked gone (by `by`): published, or no longer a member. Whether the space changed.

@@ -1884,8 +1884,7 @@ impl Ahau {
             Mode::Grey(_) => "No answer yet. Still looking.",
             Mode::Wrong => "This handle's record doesn't match.\nStart over with another.",
             Mode::Owned => "This device belongs to another identity.\nOnly its fleet can let it go.",
-            Mode::Words(1) => "Type the words the new device shows.",
-            Mode::Words(_) => "Type the words the leaving device shows,\nthen enter.",
+            Mode::Words(_) => "Type the words the new device shows.",
             Mode::Hosting => "",
             // The network page writes its own lines (`net_status`).
             Mode::Networks | Mode::Pass => "",
@@ -2114,7 +2113,7 @@ impl Ahau {
             self.retint();
             self.all();
             self.show();
-            console(self.grants, if kind == 1 { b"ahau: words wanted: a new device's\n".as_slice() } else { b"ahau: words wanted: a leaving device's\n" });
+            console(self.grants, b"ahau: words wanted: a new device's\n");
             let mut polls = 0u32;
             while matches!(self.mode, Mode::Words(_)) {
                 ferros_sys::pet();
@@ -2190,18 +2189,16 @@ impl Ahau {
     fn words_wanted(&self) -> u8 {
         let mut o = [0u8; 4];
         let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[16], &mut o);
-        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] > 2 { 0 } else { o[0] }
+        // Only a newcomer's words (1): a departure takes no words since 2026-11-10 (owner: Approve or Deny).
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] > 1 { 0 } else { o[0] }
     }
 
-    /// The words as typed to the identity service: a newcomer's matched at every stroke (fgtw op 11, the live matcher), a leaver's checked when `enter` (op 14). The answer on the status line; a match ends the words.
-    fn send_words(&mut self, enter: bool) {
-        let Mode::Words(kind) = self.mode else { return };
+    /// The words as typed to the identity service: a newcomer's, matched at every stroke (fgtw op 11, the live matcher). The answer on the status line; a match ends the words.
+    fn send_words(&mut self) {
+        let Mode::Words(_) = self.mode else { return };
         let mut m = [0u8; 1 + TEXT_BYTES];
-        m[0] = if kind == 1 { 11 } else { 14 };
+        m[0] = 11;
         m[1..1 + self.len].copy_from_slice(&self.handle[..self.len]);
-        if kind == 2 && !enter {
-            return;
-        }
         let mut o = [0u8; 128];
         let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &m[..1 + self.len], &mut o);
         if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 {
@@ -2212,20 +2209,6 @@ impl Ahau {
         let n = (n as usize).min(o.len());
         let text = |from: usize| core::str::from_utf8(o.get(from..n).unwrap_or(&[])).unwrap_or("");
         let mut l = Line::new();
-        if kind == 2 {
-            match o[0] {
-                0 => {
-                    self.end_words(false);
-                    return;
-                }
-                2 => self.status("These words don't match. Try again."),
-                _ => {
-                    self.end_words(false);
-                    return;
-                }
-            }
-            return;
-        }
         match o[0] {
             // Matched: the identity service adds it now; the Fleet page shows how it goes.
             2 => {
@@ -2340,7 +2323,7 @@ impl Ahau {
             }
             // Words: enter sends them as typed (they hold no newline).
             Some(Event::Enter) if matches!(self.mode, Mode::Words(_)) => {
-                self.send_words(true);
+                self.send_words();
                 return;
             }
             // Enter is a character of the handle (owner, 2026-10-28: "enter is a valid char"); the button under the entry line attests.
@@ -2359,7 +2342,7 @@ impl Ahau {
         }
         // Words: matched as they are typed (the newcomer's), the result on the status line.
         if matches!(self.mode, Mode::Words(_)) {
-            self.send_words(false);
+            self.send_words();
             if !matches!(self.mode, Mode::Words(_)) {
                 return;
             }
