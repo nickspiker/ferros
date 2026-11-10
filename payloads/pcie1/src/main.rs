@@ -1877,14 +1877,14 @@ fn publish_measures(m: &mut Msgbuf, d: &mut Drv, pkts: &mut [u32; 4]) {
 /// The WiFi link's tracks this driver fills (`publish_measures`), emptied while there is no link.
 const WIFI_TRACKS: usize = 7;
 
-/// The link's detail for its settings page (ferros_detail::WIFI): the network's name from the credential (ASCII only: a name that is not is left out rather than mangled), the access point joined, this device's address on it, and what DHCP gave when this driver ran it (in service the `ip` process runs DHCP, and its lease is not here).
+/// The link's detail for its settings page (ferros_detail::WIFI): the network's name from the credential (its SSID octets as `nw`, any language), the access point joined, this device's address on it, and what DHCP gave when this driver ran it (in service the `ip` process runs DHCP, and its lease is not here).
 fn publish_detail(m: &Msgbuf) {
     use ferros_detail::publish;
     use ferros_detail::vsf::VsfType;
     let mut f = alloc::vec::Vec::new();
     let ssid = &m.want[..m.want_len];
-    if !ssid.is_empty() && ssid.iter().all(|&c| (0x20..0x7F).contains(&c)) {
-        f.push(("ssid", VsfType::a(ferros_detail::vsf::Ascii::checked("ssid", ssid.iter().map(|&c| c as char).collect::<alloc::string::String>()))));
+    if let Some(s) = ferros_detail::vsf::Ssid::new(ssid).filter(|s| !s.is_empty()) {
+        f.push(("ssid", VsfType::nw(s)));
     }
     if let Some(t) = m.target {
         f.push(("bssid", VsfType::nm(t.bssid)));

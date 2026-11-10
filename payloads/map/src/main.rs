@@ -828,6 +828,13 @@ fn detail_words(l: &mut Line, f: tatau::Fmt, v: &ferros_detail::vsf::VsfType) {
         VsfType::a(s) => {
             l.s(s);
         }
+        // A network's name: its octets as UTF-8 text when they are, else as hex (an SSID is octets, and the hex is the honest form of one that is not text).
+        VsfType::nw(s) => match core::str::from_utf8(s.as_bytes()) {
+            Ok(t) if !t.chars().any(char::is_control) => {
+                l.s(t);
+            }
+            _ => hex(l, s.as_bytes(), 1, ""),
+        },
         // IPv4 in the standard dotted decimal (owner, 2026-11-09: "Standard convention for units is fine for now"); IPv6 and hardware addresses keep their standard hex.
         VsfType::ni(a) => {
             for (k, b) in a.iter().enumerate() {
