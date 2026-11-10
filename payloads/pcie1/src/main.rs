@@ -1798,8 +1798,10 @@ fn publish_measures(m: &mut Msgbuf, d: &mut Drv, pkts: &mut [u32; 4]) {
             _ => None,
         }
     };
-    status(0, w(k::STATE, if m.keyed { 2 } else { 1 }));
-    if !m.keyed {
+    // Connected only while the join holds: `keyed` is set once by the handshake and cleared only by the next join, so on its own it said connected after the access point let the device go, and the firmware answered the measures with its last values (the 8a, 2026-11-10: "why did it say the wifi was connected").
+    let up = m.keyed && m.linked;
+    status(0, w(k::STATE, if up { 2 } else { 1 }));
+    if !up {
         for s in 1..8 {
             status(s, MEASURE_NONE);
         }
