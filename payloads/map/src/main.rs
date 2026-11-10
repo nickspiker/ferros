@@ -2261,7 +2261,8 @@ impl Map {
                     }
                     if f.add == 0 {
                         button(self, b, &mut y, "add a device", false, Some(Choice::FleetAdd));
-                        if f.cands > 0 {
+                        // Only a device heard here (its beacon or its request on this network, flags bits 0 and 1): one known only from fgtw.org's registry is no one nearby, and a join asked from anywhere on the internet is said nowhere (owner, 2026-11-10: "LAN, fine. WAN, nope").
+                        if f.cand_flags[..f.cands].iter().any(|&fl| fl & 3 != 0) {
                             b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "a device on this network asks to join");
                             y += uu(2, 1);
                         }

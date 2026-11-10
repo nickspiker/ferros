@@ -1,0 +1,10 @@
+[package]
+name = "tzvsf"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+vsf = { path = "../../../vsf" }
+ferros_tz = { path = "../../ferros_tz" }
