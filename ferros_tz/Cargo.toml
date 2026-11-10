@@ -1,0 +1,9 @@
+[package]
+name = "ferros_tz"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Time zones (owner, 2026-11-10): a zone's rule as a POSIX TZ string (tzdata's footer), its standard and legal (DST) offsets at an instant, and the next change. no_std, no heap."
+
+[lib]
+path = "src/lib.rs"
