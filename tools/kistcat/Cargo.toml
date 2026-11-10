@@ -1,0 +1,20 @@
+[package]
+name = "kistcat"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "The kist directory (docs/KISTS.md \"The directory\"): reads signed capsules and developers' signed manifests, writes kists.vsf signed by the project key, the page for kists.fgtw.org and the list on ferros.org."
+
+# Its own workspace, as the other host tools under tools/ have: its HTTP client and the signing halves stay out of the device workspace's lock.
+[workspace]
+
+[dependencies]
+# The directory's schema, builder, parser and verifier: the same code the device's installer runs.
+ferros_kist = { path = "../../ferros_kist", features = ["directory"] }
+# text-encode: Photon's manifest writes `platform` and `arch` as `x` (Huffman text), which vsf decodes only with its tables.
+vsf = { path = "../../../vsf", features = ["crypto", "text-encode"] }
+# The project key's every-scheme bundle, and the release key's pinned bundle for Photon's manifest (the bridge's signing machinery for a kist).
+fgtw = { path = "../../../fgtw", default-features = false, features = ["std", "sign"] }
+blake3 = "1"
+# Plain HTTP only (no TLS feature): a developer's manifest is fetched as the device fetches it, and an https-only one fails here as it would there.
+ureq = { version = "3", default-features = false }

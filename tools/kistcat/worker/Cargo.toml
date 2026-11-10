@@ -1,0 +1,22 @@
+[package]
+name = "kists-worker"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "kists.fgtw.org's bare address: serves index.html from the R2 bucket kists (tools/kistcat writes it). Every other path is R2's own."
+
+# Its own workspace: a wasm32 crate, built by worker-build as fgtw's worker is.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+worker = "0.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

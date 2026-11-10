@@ -34,3 +34,6 @@ texput.log
 pixel 8 pro calibration data/*average.vsf
 __pycache__/
 web/.wrangler/
+# The kists Worker's worker-build output and wrangler's state.
+tools/kistcat/worker/build/
+tools/kistcat/worker/.wrangler/
