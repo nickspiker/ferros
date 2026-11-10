@@ -803,6 +803,41 @@ fn widget(name: &str) -> Option<u8> {
     name.eq_ignore_ascii_case("Clock").then_some(0x80)
 }
 
+/// What the identity service last said, kept by `fgtw_poller`: the space's generation (op 17; u64::MAX until it has answered) and the departure waiting here (op 13's reply when it asks, else zeros), the latter under a sequence count (odd while it is written).
+static FGTW_SPACE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+static FGTW_ASK_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static mut FGTW_ASK: [u8; 4 + NAME_BYTES] = [0; 4 + NAME_BYTES];
+
+/// The identity service asked once a second on a thread of its own (owner, 2026-11-10: "the two finger is bad on both devices", "two finger navigation that doesn't do anything"): fgtw answers between its own work, a call took 2.1 to 2.6 s, and the map's pass held for it saw a two-finger gesture made meanwhile as a tap. The main loop reads what this keeps, never waiting.
+extern "C" fn fgtw_poller(grants: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    loop {
+        let mut d = [0u8; 4 + NAME_BYTES];
+        let k = ferros_sys::call_live(cap(grants, S_FGTW), &[13], &mut d);
+        let asking = k != ferros_sys::ERR && k >= 4 && d[0] == 1 && d[2] == 0;
+        FGTW_ASK_SEQ.fetch_add(1, Ordering::AcqRel);
+        unsafe { *(&raw mut FGTW_ASK) = if asking { d } else { [0u8; 4 + NAME_BYTES] } };
+        FGTW_ASK_SEQ.fetch_add(1, Ordering::AcqRel);
+        let mut s = [0u8; 8];
+        if ferros_sys::call_live(cap(grants, S_FGTW), &[17], &mut s) == 8 {
+            FGTW_SPACE.store(u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as u64, Ordering::Release);
+        }
+        sleep_until(now() + freq());
+    }
+}
+
+/// The departure `fgtw_poller` last heard, read whole: again if it was being written.
+fn fgtw_ask() -> [u8; 4 + NAME_BYTES] {
+    use core::sync::atomic::Ordering;
+    loop {
+        let s0 = FGTW_ASK_SEQ.load(Ordering::Acquire);
+        let v = unsafe { *(&raw const FGTW_ASK) };
+        if s0 & 1 == 0 && FGTW_ASK_SEQ.load(Ordering::Acquire) == s0 {
+            return v;
+        }
+    }
+}
+
 /// A detail field's name for the page (ferros_detail's schemas).
 fn detail_label(field: &str) -> &'static str {
     match field {
@@ -3317,17 +3352,18 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut grab_n = 0usize;
     let mut last_app_check = 0u64;
     let mut last_facts = 0u64;
-    // The identity space's generation last read (payloads/fgtw op 17), and when it was asked.
+    // The identity space's generation last read (payloads/fgtw op 17, through `fgtw_poller`).
     let mut space_seen = 0u32;
-    let mut last_space = 0u64;
-    // The departure waiting here last seen (op 13's reply), so the Fleet page opens once for each: a request answered clears it, so the same device asking again opens the page again.
-    let mut last_ask = 0u64;
+    // The departure waiting here last seen (op 13's reply, through `fgtw_poller`), so the Fleet page opens once for each: a request answered clears it, so the same device asking again opens the page again.
     let mut ask_seen = [0u8; 4 + NAME_BYTES];
     let mut last_pass = now();
     let mut draw_us = 0u64;
     let mut move_us = 0u64;
     let mut last_ignored = 0u16;
     let mut push_us = 0u64;
+    // The identity service's answers come from a thread of their own (`fgtw_poller`): the main loop never waits on fgtw.
+    static mut POLL_STACK: [u8; 1 << 14] = [0; 1 << 14];
+    ferros_sys::thread_spawn(fgtw_poller, unsafe { &mut *(&raw mut POLL_STACK) }, grants);
     // FERROS_MAP_START=drag: a synthetic finger instead of the touch server for the first 192 passes — two seconds after start (past the display's first full frame), a pan through the air and back, so the frame pacing can be measured with no one at the panel (it logs passes, draws and the rate).
     let mut synth = 0u32;
     // FERROS_MAP_START=drag: the drag's own rate, for measuring the frame pacing with no one at the panel.
@@ -3366,13 +3402,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.draw();
         }
 
-        // A fleet device's departure waiting on this person (fgtw op 13): once a second, wherever the map is; a new one opens the Fleet page on it, Approve or Deny ready (owner, 2026-11-10: "go right to the fleet page and have the unbind request 'Approve' or 'Deny' screen ready to go"). Not over an app in front.
-        if !map.app_front && now().wrapping_sub(last_ask) > freq() {
-            last_ask = now();
-            let mut d = [0u8; 4 + NAME_BYTES];
-            let k = ferros_sys::call_live(cap(map.grants, S_FGTW), &[13], &mut d);
-            let asking = k != ferros_sys::ERR && k >= 4 && d[0] == 1 && d[2] == 0;
-            let key = if asking { d } else { [0u8; 4 + NAME_BYTES] };
+        // A fleet device's departure waiting on this person (fgtw op 13, as `fgtw_poller` last heard it): a new one opens the Fleet page on it, Approve or Deny ready (owner, 2026-11-10: "go right to the fleet page and have the unbind request 'Approve' or 'Deny' screen ready to go"). Not over an app in front, and not while a finger is down or the map is settling: a request waiting opens the page once the fingers lift.
+        if !map.app_front && !down && !map.settling {
+            let key = fgtw_ask();
+            let asking = key != [0u8; 4 + NAME_BYTES];
             if asking && key != ask_seen {
                 map.show_page("fleet");
                 map.fleet.poll(cap(map.grants, S_FGTW));
@@ -3381,16 +3414,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             ask_seen = key;
         }
 
-        // The person's identity space (payloads/fgtw op 17): once a second, on the plane with nothing held, its generation asked; a new one means the identity service wrote this device's kists or home screen from the person's fleet (a reset device getting its arrangement back, a move made on another of their devices), and the circles are read again. Generation 0 is nothing written yet; a map started after a write reads it once more, which changes nothing.
-        if map.view == View::Map && !down && !map.settling && now().wrapping_sub(last_space) > freq() {
-            last_space = now();
-            let mut s = [0u8; 8];
-            if ferros_sys::call_live(cap(map.grants, S_FGTW), &[17], &mut s) == 8 {
-                let g = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-                if g != space_seen {
-                    space_seen = g;
-                    map.reload_arrangement();
-                }
+        // The person's identity space (payloads/fgtw op 17, as `fgtw_poller` last heard it), on the plane with nothing held: a new generation means the identity service wrote this device's kists or home screen from the person's fleet (a reset device getting its arrangement back, a move made on another of their devices), and the circles are read again. Generation 0 is nothing written yet; a map started after a write reads it once more, which changes nothing.
+        if map.view == View::Map && !down && !map.settling {
+            let g = FGTW_SPACE.load(Ordering::Acquire);
+            if g != u64::MAX && g as u32 != space_seen {
+                space_seen = g as u32;
+                map.reload_arrangement();
             }
         }
 
