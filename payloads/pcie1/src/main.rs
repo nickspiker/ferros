@@ -2007,6 +2007,9 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     let mut pkts = [0u32; 4];
     // The link's names and addresses for its settings page (ferros_detail, behind the Settings capability): they hold while this join does.
     publish_detail(m);
+    // The link this join made, watched while serving (`pump` reads the firmware's events): a join's own failures are behind it.
+    let was_linked = m.linked;
+    m.join_failed = false;
     // The control block (docs/RADIO-CONTROLS.md), looked at four times a second: a generation moved since the last look is a knob set. None: not looked at yet, so the first look applies what is kept.
     let mut control_at = 0u64;
     let mut control_gen: Option<u64> = None;
@@ -2026,6 +2029,14 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
             publish_measures(m, d, &mut pkts);
         }
         let _ = m.pump(d);
+        // The link lost while serving (the firmware's LINK down, or a deauthentication or disassociation from the access point): until 2026-11-10 the loop served on unlinked, the IP stack heard "not linked" every 4 s and the device was off the network until someone restarted this driver (the 8a, overnight). Now it ends, saying why, and init's keeper starts it again (at most every 64 s), which brings the radio up and joins afresh: the path every boot takes.
+        if was_linked && (!m.linked || m.join_failed) {
+            d.put(if m.linked { b"the access point dropped this device while serving: ending; init's keeper starts this driver again\n".as_slice() } else { b"the link went down while serving: ending; init's keeper starts this driver again\n" });
+            d.flush();
+            m.serving = false;
+            d.failed = true;
+            return;
+        }
         m.pump_rx(d);
         m.pump_tx(d);
         let n = svc(2, d.cap(WLAN), msg.as_mut_ptr() as u64 - d.base, msg.len() as u64, tok.as_mut_ptr() as u64 - d.base, 1);
