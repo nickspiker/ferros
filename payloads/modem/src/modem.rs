@@ -1413,6 +1413,9 @@ const SIT_GET_SIM_STATUS: u16 = 0x0200;
 const SIT_SET_PS_SERVICE: u16 = 0x0710;
 const SIT_SET_INITIAL_ATTACH_APN: u16 = 0x0603;
 const SIT_SET_DATA_PROFILE: u16 = 0x0613;
+/// The signal now (ProtocolMiscBuilder::GetSignalStrength: no parameters) and the screen's state (SetScreenState: one u32, 1 on), the ids read from rcmMsgToString's table on 2026-11-09.
+const SIT_GET_SIGNAL_STRENGTH: u16 = 0x0900;
+const SIT_SET_SCREEN_STATE: u16 = 0x0902;
 
 /// One data profile (SIT_SET_DATA_PROFILE, 246 bytes with the header: ProtocolPsBuilder::BuildSetDataProfile): G#C profile id (-1 for profiles the framework does not number), G#10 the APN [101], G#75 PDP type, G#76 roaming PDP type (1 IP, 2 IPV6, 3 IPV4V6), G#77 auth, G#78 user [50], G#AA password [50], G#DD max-connection time, G#E1 max connections, G#E5 wait time, G#E9 enabled, G#EA the APN types (1 default, 2 MMS, 4 SUPL, 8 DUN, G#10 HIPRI, G#20 FOTA, G#40 IMS, G#80 CBS, G#100 IA, G#200 emergency), G#EE the network types bitmap.
 struct DataProfile {
@@ -1564,6 +1567,8 @@ fn sit_name(id: u16) -> &'static str {
         0x4601 => "OEM_IND_4601",
         0x4602 => "OEM_IND_4602",
         0x0905 => "IND_NITZ_TIME_RECEIVED",
+        0x0900 => "GET_SIGNAL_STRENGTH",
+        0x0902 => "SET_SCREEN_STATE",
         0x0906 => "IND_SIGNAL_STRENGTH",
         0x0D05 => "IND_AIMS_REGISTRATION",
         _ => "",
@@ -1573,7 +1578,7 @@ fn sit_name(id: u16) -> &'static str {
 /// Whether a message's parameters may be shown: radio power and state, registration and coverage, signal, SIM card state and data-call state carry no identity. Anything else — SIM files, IMSI, ICCID, IMEI, numbers, SMS, calls, cell ids, location, time — is shown by its header alone.
 fn sit_shown(id: u16) -> bool {
     // Network state (G#70E) is left out: after the PLMN it carries the tracking-area code. G#4602 (the carrier-config manifest indication) starts with the SIM's ICCID.
-    matches!(id, 0x0210 | 0x0249 | 0x024A | 0x0603 | 0x0604 | 0x0609 | 0x0710 | 0x0717 | 0x072C | 0x0740 | 0x074A | 0x0767 | 0x0800..=0x0805 | 0x0703 | 0x070B | 0x0711 | 0x074F | 0x0750 | 0x0810 | 0x0906 | 0x4600 | 0x4601)
+    matches!(id, 0x0210 | 0x0249 | 0x024A | 0x0603 | 0x0604 | 0x0609 | 0x0710 | 0x0717 | 0x072C | 0x0740 | 0x074A | 0x0767 | 0x0800..=0x0805 | 0x0703 | 0x070B | 0x0711 | 0x074F | 0x0750 | 0x0810 | 0x0900 | 0x0902 | 0x0906 |0x4600 | 0x4601)
 }
 
 /// The AP's side of the SIT link: each io-device (one per channel here) keeps its own frame counter, its own channel counter, both starting at 1 (`exynos_build_header`), and its own 6-bit multi-frame packet index (`exynos_build_fr_config`); the RCM token counts RIL requests.
@@ -2111,6 +2116,9 @@ struct Online {
     sig_len: u32,
     /// The counter when the indication was last logged (0: never): once a 16 s at most (it changes every second or so and drowned the console).
     sig_logged: u64,
+    /// When the signal is next asked for (µs since online): every 2 s while the data stack is registered, since on NR the CP sends no G#0906 of its own.
+    sig_ask: u64,
+    screen_set: bool,
     camp_seen: [u8; 2],
     call_sent: bool,
     /// Not before this (µs since online): the next setup after a refusal or a lost call.
@@ -2291,6 +2299,8 @@ impl Online {
             sig_last: [0; 256],
             sig_len: 0,
             sig_logged: 0,
+            sig_ask: 0,
+            screen_set: false,
             camp_seen: [0; 2],
             call_sent: false,
             call_retry: 0,
@@ -2523,6 +2533,21 @@ impl Online {
                 }
             }
         }
+        // The screen on, once the radio is: Android's RIL says so at each screen change, and the CP may hold its signal reports while it takes the screen for off. Then the signal asked for on the data stack's channel every 2 s while it is registered.
+        if probe >= 3 && self.powered && !self.screen_set && since_us(t0) > 4_000_000 {
+            self.screen_set = true;
+            for ch in [CH_FMT0, CH_FMT0 + 1] {
+                if let Err(e) = sit_request(link, ch, SIT_SET_SCREEN_STATE, &[1, 0, 0, 0]) {
+                    line(rep, alloc::format!("t={} ms: SIT_SET_SCREEN_STATE not sent on ch A#{ch}: {e}\n", since_us(t0) / 1000));
+                }
+            }
+        }
+        if probe >= 3 && matches!(self.reg_last[1], Some([1 | 5, ..])) && since_us(t0) > self.sig_ask {
+            self.sig_ask = since_us(t0) + 2_000_000;
+            if let Err(e) = sit_request(link, CH_FMT0 + 1, SIT_GET_SIGNAL_STRENGTH, &[]) {
+                line(rep, alloc::format!("t={} ms: SIT_GET_SIGNAL_STRENGTH not sent: {e}\n", since_us(t0) / 1000));
+            }
+        }
         if probe >= 2 && !self.powered && since_us(t0) > 3_000_000 {
             self.powered = true;
             // state 2 = on; the two option bytes are Android's forEmergencyCall and preferredForEmergencyCall (NetworkService::DoRadioPower → ProtocolNetworkBuilder::BuildRadioPower): both 0, a plain power-on for data. Each stack has its own RIL channel (245 the first SIM slot, 246 the second) and is powered on its own, as each Android RIL instance does.
@@ -2636,12 +2661,17 @@ impl Online {
                     self.publish_status();
                 }
             }
-            // The signal indication, whole (up to 256 bytes), past the cap too: kept at each change, logged at a change of length or once a 16 s.
-            if ril && at(12) == 2 && (at(14) as u16 | (at(15) as u16) << 8) == 0x0906 && flen >= 12 + 8 {
-                let n = (flen - 12 - 8).min(256);
+            // The signal, whole (up to 256 bytes), past the cap too: the indication (G#0906, parameters after its 8-byte header) or the reply to SIT_GET_SIGNAL_STRENGTH (G#0900, after its 12, error 0), the same parameters (ProtocolSignalStrengthAdapter reads the reply's from G#C as the indication's). Kept at each change, logged at a change of length or once a 16 s.
+            let sig_at = match (at(12), at(14) as u16 | (at(15) as u16) << 8) {
+                (2, 0x0906) => 12 + 8,
+                (1, SIT_GET_SIGNAL_STRENGTH) if at(22) == 0 => 12 + 12,
+                _ => 0,
+            };
+            if ril && sig_at != 0 && flen >= sig_at {
+                let n = (flen - sig_at).min(256);
                 let mut s = [0u8; 256];
                 for i in 0..n {
-                    s[i as usize] = at(20 + i);
+                    s[i as usize] = at(sig_at + i);
                 }
                 if n != self.sig_len || s != self.sig_last {
                     let log = n != self.sig_len || self.sig_logged == 0 || since_us(self.sig_logged) > 16_000_000;
