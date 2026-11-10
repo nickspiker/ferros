@@ -34,7 +34,7 @@ fn session_state() -> &'static (bool, [crate::kohi::Health; 3]) {
             // Into the registers; `keys::set` wipes this copy.
             let held = w.as_mut().is_some_and(|w| crate::keys::set(crate::keys::WAIRUA, w));
             // The jump's TRNG pool (kohi::trng_words) has served its last word: the gather took its share and `keys::set` the masks for the wairua's own setting, after which the wairua's stream serves every mask. The rest wiped here, not at the end of the gather (2026-11-03: wiped there, the wairua's set found the pool closed, "keys: TRNG refused", weak masks).
-            if crate::platform::jumped() {
+            if crate::platform::from_android() {
                 crate::kohi::wipe_jump_pool();
             }
             *s = Some((held, health));

@@ -109,6 +109,9 @@ mod slot;
 // Cold boot: the HSI2 S2MPU fence (what UFS and the WiFi chip may DMA into). Compiled into the handoff build too: the service and the drivers it shares with the cold boot call it (2026-11-06: the shim build had stopped compiling).
 #[cfg(feature = "pixel8")]
 mod s2mpu;
+// Power + volume up inside ferros: kill everything and start again from the image the hv kept, no bootloader (restart.rs).
+#[cfg(all(feature = "pixel8", not(shim_handoff)))]
+mod restart;
 // The static cache map: one identity table at boot so ferros's own memory is cacheable (KERNEL.md, Execution Model).
 #[cfg(feature = "pixel8")]
 mod cachemap;

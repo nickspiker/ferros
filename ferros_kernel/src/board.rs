@@ -138,3 +138,21 @@ pub fn probe_starve(n: u32) {
         crate::platform::starve_watchdogs();
     }
 }
+
+/// What the hv keeps for ferros's restart (ferros_hv hvcore `keep`, on both its paths): the packed image, ABL's device tree with its initrd range pointed at `LOW_BOOTCONFIG`, the bootconfig, and the record that says they are whole ([magic "FERROSKP", the image's length, the bootconfig's length]).
+pub fn hv_kept_image() -> usize {
+    hv_base() + 0x300_0000
+}
+pub fn hv_kept_dtb() -> usize {
+    hv_base() + 0x3C0_0000
+}
+pub fn hv_kept_bootconfig() -> usize {
+    hv_base() + 0x3D0_0000
+}
+pub fn hv_kept_record() -> usize {
+    hv_base() + 0x3D8_0000
+}
+pub const HV_KEPT_MAGIC: u64 = 0x504B_534F_5252_4546;
+/// The image's room in the hv's reservation (ferros_hv JUMP_IMAGE_MAX), and where the jump puts the bootconfig for ferros (ferros_hv LOW_BOOTCONFIG).
+pub const HV_KEPT_IMAGE_MAX: usize = 0xC0_0000;
+pub const LOW_BOOTCONFIG: usize = 0x8004_0000;

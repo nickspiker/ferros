@@ -89,8 +89,8 @@ core::arch::global_asm!(
 );
 
 unsafe extern "C" {
-    static ferros_reload_stub: u8;
-    static ferros_reload_stub_end: u8;
+    pub(crate) static ferros_reload_stub: u8;
+    pub(crate) static ferros_reload_stub_end: u8;
 }
 
 /// Report the vault and the session, then reset. The kernel dumps the whole 256-byte block as r[00..31]; this session's words: r[22] the commands the USB process handed over, r[23] what `reboot_to_bootloader` returned, r[24] the last command (cap bytes 0..3 | op << 56), r[27] the processes alive.
@@ -1655,6 +1655,8 @@ pub fn run(mut b: Boot) -> ! {
     crate::keys::serve();
     let keys_settle = cntpct() + cntfrq() / 4;
     let mut keys_settled = false;
+    // The restart chord arms once power and volume up are not both down: the chord that jumped here from Android (or started this restart) may still be held as this loop starts, and must not restart ferros again.
+    let mut chord_armed = false;
     let mut ipc_marked = false;
     // The radios switched off (preference 15) as the loop last applied them: init started only the ones left on.
     let mut radios_applied = crate::process::pref(crate::process::PREF_RADIOS_OFF) & 0x1F;
@@ -1848,6 +1850,15 @@ pub fn run(mut b: Boot) -> ! {
         }
         // The killswitch needs IRQs unmasked whenever the kernel isn't deliberately masking them (only the RELOAD handover does): re-assert it every pass, so no path back from a process or a fault can leave it disarmed.
         unsafe { core::arch::asm!("msr daifclr, #2") };
+        // Power + volume up: ferros restarts, as the chord leaves Android, with no bootloader (owner, 2026-11-10: "Kill everything and reboot but jump style"; restart.rs). Read from the keys' pins on each pass: either key's edge is an interrupt, which wakes this loop.
+        #[cfg(not(shim_handoff))]
+        {
+            let chord = crate::killswitch::power_held() && crate::killswitch::vol_up_held();
+            if chord && chord_armed {
+                crate::restart::restart(b.stub);
+            }
+            chord_armed |= !chord;
+        }
         // The power key turns the screen off and on (owner, 2026-10-22): a preference every process sees at once (process.rs PREF_SCREEN_OFF); the display server darkens the panel. The wake policy (proximity) comes later.
         if unsafe { core::ptr::read_volatile(&raw const crate::__power_pressed) } != 0 {
             unsafe { core::ptr::write_volatile(&raw mut crate::__power_pressed, 0) };
@@ -1935,7 +1946,7 @@ pub fn run(mut b: Boot) -> ! {
         // The AoC's start, when the `sensors` switch has asked for it and the boot's first seconds are past (the home screen first).
         if matches!(sensor_boot, SensorBoot::Done) && now.wrapping_sub(t_boot) > SENSORS_AFTER_S * freq && crate::sensorlink::START.swap(false, core::sync::atomic::Ordering::Relaxed) {
             // After the jump from a running Android (gate answer 6) the AoC, GSA and Trusty are still in Android's session, and this start knows only the cold path: the fourth jump's service loop stopped feeding the watchdog once sensors asked (APC watchdog, 2026-11-01). Left alone until a restart path exists; the sensors process gives up after its wait.
-            if crate::ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed) & 0xFF == 6 {
+            if crate::platform::jumped() {
                 crate::process::push_console(b"sensors: started by the jump from Android; the AoC is Android's, left alone (no restart path yet)\n");
             } else {
                 sensor_boot = SensorBoot::Wait;
@@ -1971,7 +1982,7 @@ pub fn run(mut b: Boot) -> ! {
         }
         // Development, while the jump from Android is brought up: a jumped session that the host has not reached in 60 s (no command from the USB process) leaves a note and resets warm, so the next boot reads its whole log from the pstore ring (tools/husky-pstore.sh). The killswitch, the only other way out of such a session, powers off and the log decays with the RAM (the twenty-seventh jump, 2026-11-02: ferros up, its killswitch armed, no USB, the screen still Android's).
         #[cfg(not(ferros_production))]
-        if platform::jumped() && st.proc_cmds == 0 && cntpct().wrapping_sub(t_boot) > 60 * cntfrq() {
+        if platform::from_android() && st.proc_cmds == 0 && cntpct().wrapping_sub(t_boot) > 60 * cntfrq() {
             platform::pstore(b"ferros: the jump's session: no host in 60 s, resetting warm to keep this log\n");
             // Every thread and where it waits, so the log says what the session was stuck on (the twenty-ninth jump: the display server and the attest screen ran, init, touch and USB printed nothing).
             let mut threads = alloc::vec::Vec::new();

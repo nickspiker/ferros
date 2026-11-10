@@ -1060,6 +1060,10 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
     if gate::ask(dtb as usize) == gate::Choice::Ferros {
         trail(0xBF);
         pstore::log(&[b"\nferros hv: gate -- ferros\n"]);
+        // Kept for ferros's own restart (power + volume up inside ferros), as the Android path keeps them for the jump.
+        if cfg!(hv_core) {
+            hvcore::keep_for_restart(dtb as usize);
+        }
         gate::start_ferros(dtb);
     }
     // Android, from either slot: it lives on slot a, so the slot suffix ABL wrote into bootconfig becomes _a (gate.rs).
@@ -2323,6 +2327,21 @@ mod hvcore {
             super::susp(i, 0, false);
         }
         super::susp(0, super::SUSP_MAGIC, false);
+        keep(dtb);
+    }
+
+    /// The ferros restart's record (ferros_kernel restart.rs, owner 2026-11-10: power + volume up inside ferros restarts it "jump style", no bootloader): in the bootconfig's MiB past the 64 KiB it uses, [magic "FERROSKP", the image's length, the bootconfig's length], written last, once all three are in place.
+    const KEPT: usize = JUMP_BOOTCONFIG + 0x8_0000;
+    const KEPT_MAGIC: u64 = 0x504B_534F_5252_4546;
+
+    /// On ferros's own path, before the gate starts it: the same three kept as for the jump, so a restart from ferros finds them, the counters left for ferros to read as before.
+    pub fn keep_for_restart(dtb: usize) {
+        keep(dtb);
+    }
+
+    /// The packed image, ABL's device tree (its initrd range pointed at the low bootconfig copy) and the bootconfig kept in the hv's reservation, then the record.
+    fn keep(dtb: usize) {
+        unsafe { write_volatile(KEPT as *mut u64, 0) };
         let Some((src, len)) = super::gate::ferros_image() else { return };
         let be = |a: usize| u32::from_be(unsafe { read_volatile(a as *const u32) }) as usize;
         let size = be(dtb + 4);
@@ -2331,6 +2350,7 @@ mod hvcore {
         }
         copy64(src, JUMP_IMAGE, len);
         copy64(dtb, JUMP_DTB, size);
+        let mut kept_bc = 0u64;
         if let (Some((s_at, s_len)), Some((e_at, e_len))) = (super::fdt::chosen_prop(JUMP_DTB, b"linux,initrd-start"), super::fdt::chosen_prop(JUMP_DTB, b"linux,initrd-end")) {
             let (s, e) = (super::fdt::cells(s_at, s_len), super::fdt::cells(e_at, e_len));
             if e > s {
@@ -2341,10 +2361,18 @@ mod hvcore {
                 super::fdt::set_cells(s_at, s_len, LOW_BOOTCONFIG as u64);
                 super::fdt::set_cells(e_at, e_len, LOW_BOOTCONFIG as u64 + n);
                 set(22, n);
+                kept_bc = n;
             }
         }
         unsafe { write_volatile(&raw mut IMAGE_LEN, len) };
         set(21, len as u64);
+        unsafe {
+            write_volatile((KEPT + 8) as *mut u64, len as u64);
+            write_volatile((KEPT + 16) as *mut u64, kept_bc);
+            asm!("dsb sy");
+            write_volatile(KEPT as *mut u64, KEPT_MAGIC);
+            asm!("dsb sy");
+        }
     }
 
     pub fn freezing() -> bool {

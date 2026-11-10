@@ -556,6 +556,12 @@ pub fn leave(want: u32) {
     unlock();
 }
 
+/// Before ferros's restart (restart.rs), with every other core already off: this core's registers cleared and nothing published, so no secret outlives the restart (the person attests again).
+pub fn wipe_for_restart() {
+    sealed(|| unsafe { keyreg_clear() });
+    HELD[me()].store(0, Ordering::Release);
+}
+
 /// The cores the blob still waits for, for the X3 to give up on ones that never came up (a worker whose CPU_ON failed would keep the blob in DRAM for good).
 pub fn forget_missing() {
     lock();

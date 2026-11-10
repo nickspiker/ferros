@@ -139,7 +139,7 @@ pub fn wipe_jump_pool() {
 }
 
 pub(crate) fn trng_words(out: &mut [u64]) -> bool {
-    if crate::platform::jumped() {
+    if crate::platform::from_android() {
         return jump_pool_take(out);
     }
     let mut i = 0;
@@ -261,7 +261,7 @@ fn trng_early() {
 /// Start gathering the firmware TRNG's words on another core, as early in the boot as the page tables allow.
 pub fn start_early() {
     // After the jump from Android the worker is a parked Android core started through the hv's mailbox, and the early core's own switch-off (PSCI CPU_OFF) would hand it back to the firmware path the jump avoids: KOHI gathers on the boot path instead (take_early finds nothing).
-    if crate::platform::jumped() {
+    if crate::platform::from_android() {
         return;
     }
     EARLY_STATE.store(1, core::sync::atomic::Ordering::Release);

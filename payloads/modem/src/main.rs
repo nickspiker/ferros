@@ -64,7 +64,8 @@ pub extern "C" fn modem_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
     hw::init(grants);
     // After the jump from a running Android (fact 31 = 6) the CP is still in Android's session, and this driver has no way yet to reset it: the first jump that let it run hung the bus on one of its register reads (core 7 in SYS_MMIO_READ for this thread, the APM watchdog reset the device, 2026-11-01). Stand down until the CP reset exists.
-    if ferros_sys::facts().0[31] == 6 {
+    // Fact 31 = 7, ferros's own restart, leaves the CP in the last session's state: the same.
+    if matches!(ferros_sys::facts().0[31], 6 | 7) {
         hw::say(b"modem: started by the jump from Android; the CP is Android's, left alone (no CP reset yet)\n");
         ferros_sys::exit(0)
     }

@@ -395,10 +395,18 @@ static JUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::
 pub fn detect_jump() {
     let g = crate::board::hv_gate_mark();
     let (mark, tel) = unsafe { (read_volatile(g as *const u64), read_volatile((g + 8) as *const u64)) };
-    JUMPED.store(mark == 0x4741_5445_464F_5252 && tel & 0xFF == 6, core::sync::atomic::Ordering::Relaxed);
+    let hv = mark == 0x4741_5445_464F_5252;
+    JUMPED.store(hv && matches!(tel & 0xFF, 6 | 7), core::sync::atomic::Ordering::Relaxed);
+    FROM_ANDROID.store(hv && tel & 0xFF == 6, core::sync::atomic::Ordering::Relaxed);
 }
+/// This boot met hardware a running system left (the jump from Android, answer 6, or ferros's own restart, answer 7, restart.rs): every driver that cannot yet bring its block up from any state stands down, and the display runs its whole modeset.
 pub fn jumped() -> bool {
     JUMPED.load(core::sync::atomic::Ordering::Relaxed)
+}
+/// The jump from a running Android only (answer 6): what is Android's alone, its TRNG session (the hv's pool instead) and its parked cores (the boot core is the hv's core 3, and the X3 still to be launched). A restart boots on the X3 that ran ferros, with the firmware TRNG ferros's own.
+static FROM_ANDROID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub fn from_android() -> bool {
+    FROM_ANDROID.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Start core `aff1` (MPIDR Aff1; `mpidr` its whole affinity) at `entry` with x0 = `ctx`: PSCI CPU_ON, or after the jump the hv's mailbox. The jump leaves Android's cores parked and powered, because powering them back on through the secure firmware hung on one jump in two (2026-11-01/02); the context is written before the entry, which the parked core polls. A core that is not parked there (Android had it off) gets PSCI CPU_ON.
