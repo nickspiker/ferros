@@ -451,8 +451,8 @@ const ADD_CLOSED: u8 = 0;
 const ADD_OPEN: u8 = 1;
 /// A candidate picked (by its words, its tag, or nearby): the Add being signed and published.
 const ADD_BINDING: u8 = 2;
-/// Picked nearby and bound: the fleet key waits for the person's confirm that the newcomer left its words screen (two-phase: a wrong pick stays a keyless ledger entry).
-const ADD_BOUND: u8 = 3;
+/// Selected (a nearby row or an NFC tap): nothing bound; the device was told (`bind_select`) and should be green, and Add binds and grows it as one act. Back returns to the list with nothing to undo (owner, 2026-11-10, after a pick 50 ft away stayed bound when Back was pressed).
+const ADD_SELECTED: u8 = 3;
 /// The fan-out being grown to the newcomer.
 const ADD_GROWING: u8 = 4;
 /// Added: the newcomer is in the chain and holds the fleet key.
@@ -471,9 +471,11 @@ struct Adding {
     listed_us: u64,
     /// The candidate rows (fgtw::sponsor::candidates), rebuilt whenever a source changes.
     cands: Vec<fgtw::sponsor::Candidate>,
-    /// The request picked, whether its key follows at once (words, tap) or waits for the confirm (nearby), and the device bound.
+    /// The request picked and how (true: its words matched; false: Add on a selected device), and the device bound. Either way the key follows at once.
     picked: Option<(fgtw::fleet::BindRequest, bool)>,
     bound: Option<[u8; 32]>,
+    /// The device selected and told so, waiting for the person's Add (`select`).
+    selected: Option<fgtw::fleet::BindRequest>,
     /// The person's confirm, waiting for the loop to grow the fan-out.
     confirm: bool,
     /// The words typed so far (op 11), matched live.
@@ -484,7 +486,7 @@ struct Adding {
 
 impl Adding {
     const fn new() -> Self {
-        Adding { phase: ADD_CLOSED, registry: Vec::new(), listed_us: 0, cands: Vec::new(), picked: None, bound: None, confirm: false, words: alloc::string::String::new(), note: alloc::string::String::new() }
+        Adding { phase: ADD_CLOSED, registry: Vec::new(), listed_us: 0, cands: Vec::new(), picked: None, bound: None, selected: None, confirm: false, words: alloc::string::String::new(), note: alloc::string::String::new() }
     }
 }
 
@@ -2100,6 +2102,13 @@ impl Client {
 
     /// Op 8: the Fleet page's add flow opened (1) or closed (0). Opening lists the registry at once and starts the radios listening; closing stops them, and forgets a finished or failed add.
     fn open_add(&mut self, on: bool) {
+        // Back from a selected device: the list again, nothing to undo (nothing was bound).
+        if on && self.adding.phase == ADD_SELECTED {
+            self.adding.selected = None;
+            self.adding.note.clear();
+            self.adding.phase = ADD_OPEN;
+            return;
+        }
         if on && self.adding.phase == ADD_CLOSED {
             self.adding.phase = ADD_OPEN;
             self.adding.listed_us = 0;
@@ -2113,21 +2122,21 @@ impl Client {
             self.log.line();
         } else if !on && self.adding.phase != ADD_CLOSED {
             // A bind or a grow under way finishes in the loop; only the screen closes.
-            if matches!(self.adding.phase, ADD_OPEN | ADD_DONE | ADD_FAILED | ADD_BOUND) {
+            if matches!(self.adding.phase, ADD_OPEN | ADD_DONE | ADD_FAILED | ADD_SELECTED) {
                 self.adding.phase = ADD_CLOSED;
             }
             self.adding.registry.clear();
         }
     }
 
-    /// Op 10: a candidate heard nearby picked by the first 8 bytes of its key. Its key waits for the person's confirm (two-phase). Returns 0 picked, 1 no such nearby candidate, 2 busy.
+    /// Op 10: a candidate heard nearby, picked by the first 8 bytes of its key: selected, nothing bound (`select`); Add (op 12) binds it. Returns 0 selected, 1 no such nearby candidate, 2 busy.
     fn pick_nearby(&mut self, key8: &[u8]) -> u8 {
         if self.adding.phase != ADD_OPEN {
             return 2;
         }
         let Some(c) = self.adding.cands.iter().find(|c| c.nearby() && c.req.device_pubkey[..8] == *key8) else { return 1 };
-        self.adding.picked = Some((c.req.clone(), false));
-        self.adding.phase = ADD_BINDING;
+        let req = c.req.clone();
+        self.select(req, "its row on the Fleet page");
         0
     }
 
@@ -2171,13 +2180,14 @@ impl Client {
         r
     }
 
-    /// Op 12: the person's confirm that the newcomer bound by a nearby pick left its words screen: its key follows. Returns 0 taken, 1 nothing waiting for a confirm.
+    /// Op 12: Add, on a selected device the person saw turn green: the bind and the fan-out grow as one act (`bind_picked`, then `grow_for_newcomer`), the chain and the fan-out pushed to it. Returns 0 taken, 1 nothing selected.
     fn confirm_add(&mut self) -> u8 {
-        if self.adding.phase != ADD_BOUND {
+        if self.adding.phase != ADD_SELECTED {
             return 1;
         }
-        self.adding.confirm = true;
-        self.adding.phase = ADD_GROWING;
+        let Some(req) = self.adding.selected.take() else { return 1 };
+        self.adding.picked = Some((req, false));
+        self.adding.phase = ADD_BINDING;
         0
     }
 
@@ -2209,6 +2219,18 @@ impl Client {
         let note = &self.adding.note.as_bytes()[..self.adding.note.len().min(255)];
         r.push(note.len() as u8);
         r.extend_from_slice(note);
+        // The selected device (phase ADD_SELECTED): [its name, length first][its masked words, the same the device shows, length u16 LE], both empty otherwise.
+        let (name, words) = match (&self.adding.selected, self.identity_seed) {
+            (Some(req), Some(seed)) => (fgtw::pair::device_name_default(&req.device_pubkey, &seed), fgtw::pair::masked_device_words(&req.device_pubkey, &seed)),
+            _ => (alloc::string::String::new(), alloc::string::String::new()),
+        };
+        // WHY the caps: a length byte, and two for the words; a device name is two words and the masked words a few hundred bytes.
+        let name = &name.as_bytes()[..name.len().min(255)];
+        r.push(name.len() as u8);
+        r.extend_from_slice(name);
+        let words = &words.as_bytes()[..words.len().min(0xFFFF)];
+        r.extend_from_slice(&(words.len() as u16).to_le_bytes());
+        r.extend_from_slice(words);
         r
     }
 
@@ -2254,7 +2276,7 @@ impl Client {
         self.log.put(fgtw::pair::device_name_default(&key, &seed).as_bytes());
         self.log.put(b" (");
         self.log.fp(&key);
-        self.log.put(if auto { b") to the fleet: its words matched" } else { b") to the fleet: picked nearby, its key waits for the confirm" });
+        self.log.put(if auto { b") to the fleet: its words matched" } else { b") to the fleet: Add pressed on the selected device" });
         self.log.line();
         let t0 = now();
         ferros_sys::pin(ferros_sys::CORES_BIG);
@@ -2298,13 +2320,54 @@ impl Client {
                 self.log.line();
             }
         }
+        // The key follows at once: the words matched, or the person pressed Add on a selected device (one act since 2026-11-10; a pick no longer binds).
         self.adding.note.clear();
-        if auto {
-            self.adding.confirm = true;
-            self.adding.phase = ADD_GROWING;
-        } else {
-            self.adding.note.push_str("when it has left its words screen, confirm");
-            self.adding.phase = ADD_BOUND;
+        self.adding.confirm = true;
+        self.adding.phase = ADD_GROWING;
+    }
+
+    /// A device selected (the Fleet page's button on a nearby row, or an NFC tap whose secret opens its commitment): nothing is written to the chain. The fleet's chain and a `bind_select` go to it over this network (it turns green on the select, checking our key against the chain), and the page shows Add, which binds and grows as one act. With no address for it on this network it is told nothing (ferros has no relay): it stays dark, and the person presses Back and types its words.
+    fn select(&mut self, req: fgtw::fleet::BindRequest, by: &str) {
+        let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
+        let key = req.device_pubkey;
+        if fgtw::sponsor::plate_locked(&self.held, &hp, &req) {
+            self.add_failed("this is a device you locked out");
+            return;
+        }
+        self.log.put(b"fgtw: selected ");
+        self.log.put(fgtw::pair::device_name_default(&key, &seed).as_bytes());
+        self.log.put(b" (");
+        self.log.fp(&key);
+        self.log.put(b") by ");
+        self.log.put(by.as_bytes());
+        self.log.put(b": nothing bound, Add binds it");
+        self.log.line();
+        self.adding.selected = Some(req);
+        self.adding.note.clear();
+        self.adding.phase = ADD_SELECTED;
+        let Some(to) = self.newcomer_addr(&key) else {
+            self.log.put(b"fgtw: the selected device has no address on this network: it is not told (no relay here)");
+            self.log.line();
+            return;
+        };
+        let t = eagle();
+        // The chain first, so the select's sender is a member of a chain the newcomer already has (it holds a select that comes first until a chain arrives).
+        if let Some(chain) = self.store_get_whole(b"chain") {
+            if let Ok(frame) = fgtw::protocol::fleet_resp(&hp, &chain, &self.keys, t) {
+                let out = self.pt.send(to, frame, now_us(), t);
+                self.send_all(out);
+            }
+        }
+        match fgtw::protocol::bind_select(&hp, &key, &self.keys, t) {
+            Ok(frame) => {
+                let out = self.pt.send(to, frame, now_us(), t);
+                self.send_all(out);
+            }
+            Err(e) => {
+                self.log.put(b"fgtw: the select did not build: ");
+                self.log.put(e.as_bytes());
+                self.log.line();
+            }
         }
     }
 
@@ -2610,11 +2673,10 @@ impl Client {
                 Some(i) if self.adding.phase == ADD_OPEN => {
                     self.log.put(b"fgtw: a tapped device's tag matches ");
                     self.log.put(self.adding.cands[i].name.as_bytes());
-                    self.log.put(b": adding it");
                     self.log.line();
-                    // Photon's tap binds and grows at once: the secret read off the tag is the proximity and the intent.
-                    self.adding.picked = Some((self.adding.cands[i].req.clone(), true));
-                    self.adding.phase = ADD_BINDING;
+                    // A tap selects, as the button does (owner, 2026-11-10: "so tap, literally the button or NFC tap"): the person presses Add once the device turns green.
+                    let req = self.adding.cands[i].req.clone();
+                    self.select(req, "an NFC tap");
                 }
                 Some(_) => {}
                 None => {

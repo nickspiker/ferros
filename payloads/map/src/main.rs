@@ -80,6 +80,10 @@ fn fill() -> u32 {
 
 /// The controls (owner, 2026-11-08: "add in the fluor elements like sliders (for brightness) and buttons", then "radio buttons and checkboxes ... very against the switch design"): fluor's button and slider, a radio's ring and a checkbox's squircle, drawn by the display (ops 47-50, COMPOSITOR.md "Controls").
 /// A button's colours by theme, G#RRGGBB VSF RGB codes at gamma 2 as every op's: its fill, its fill while held (or armed, the first tap of two), and its edge on the top-left and the bottom-right of the anti-diagonal, light then shadow, lit from the top left as the keys are (owner, 2026-11-09; until then shadow then light, fluor's old raised bevel, which read sunken) (fluor's BUTTON_FILL, BUTTON_HELD, TEXTBOX_SHADOW_EDGE and TEXTBOX_LIGHT_EDGE on grey, whose dark codes are the same at gamma 2; the other themes' in their own hues).
+/// The Fleet page's Add on a selected device: VSF RGB primary green (0, 1, 0), its held fill and its edge darker greens, the label black (owner, 2026-11-10: "a distinct green add").
+const GREEN: u32 = 0x00FF00;
+const GREEN_HELD: u32 = 0x00A000;
+const GREEN_EDGE: u32 = 0x006000;
 const BUTTON_LOOK: [[u32; 4]; 4] = [
     [0x1A214C, 0x3C4CA8, 0x423F36, 0x2A3336],
     [0x162238, 0x2E4C78, 0x48525E, 0x1A2028],
@@ -257,7 +261,7 @@ struct Fleet {
     confirm: bool,
     /// What the last departure request answered (fgtw `leave`: 0 started, 1 not a member, 2 a bad intent, 3 the request did not build).
     leave_result: Option<u8>,
-    /// Adding a device (fgtw op 9): the flow's phase (payloads/fgtw ADD_*: 0 closed, 1 open, 2 adding, 3 waiting for the confirm, 4 handing over the key, 5 added, 6 failed), the devices asking to join (the key's first 8 bytes, flags: bit 0 its beacon heard, bit 1 its request heard on this network, bit 2 the one just bound; its name), and the service's note.
+    /// Adding a device (fgtw op 9): the flow's phase (payloads/fgtw ADD_*: 0 closed, 1 open, 2 adding, 3 a device selected and Add waiting, 4 handing over the key, 5 added, 6 failed), the devices asking to join (the key's first 8 bytes, flags: bit 0 its beacon heard, bit 1 its request heard on this network, bit 2 the one just bound; its name), and the service's note.
     add: u8,
     cand_key: [[u8; 8]; 8],
     cand_flags: [u8; 8],
@@ -266,6 +270,11 @@ struct Fleet {
     cands: usize,
     add_note: [u8; 64],
     add_note_n: usize,
+    /// The device selected (phase 3, fgtw ADD_SELECTED): its name and its masked words, the same it shows.
+    sel_name: [u8; NAME_BYTES],
+    sel_name_n: usize,
+    sel_words: [u8; 512],
+    sel_words_n: usize,
     /// A sibling's departure waiting for approval here (fgtw op 13): its intent and how the approval stands (0 waiting, 1 approving, 2 approved, 3 failed), and its name.
     depart: Option<(u8, u8)>,
     depart_name: [u8; NAME_BYTES],
@@ -277,7 +286,7 @@ struct Fleet {
 
 impl Fleet {
     const fn new() -> Self {
-        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0, denied_by: [0; NAME_BYTES], denied_by_n: 0, home: None, space_gen: None, sent: false, left: [0; NAME_BYTES], left_n: 0 }
+        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, sel_name: [0; NAME_BYTES], sel_name_n: 0, sel_words: [0; 512], sel_words_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0, denied_by: [0; NAME_BYTES], denied_by_n: 0, home: None, space_gen: None, sent: false, left: [0; NAME_BYTES], left_n: 0 }
     }
 
     /// A fresh copy from `fgtw_poller` taken in, the page's own state kept: the remove row's arming, the last request's answer, a departure sent and not yet under way, and a departure approved here that has now gone (said as left).
@@ -351,7 +360,7 @@ impl Fleet {
 
     /// The add flow and a departure waiting (fgtw ops 9 and 13). WHY the checks: the counts and lengths are another process's words; a row or a name that would run past what the reply holds or a slot keeps ends the reading there.
     fn poll_add(&mut self, svc: u64) {
-        let mut a = [0u8; 2 + 8 * (8 + 2 + NAME_BYTES) + 1 + 255];
+        let mut a = [0u8; 2 + 8 * (8 + 2 + NAME_BYTES) + 1 + 255 + 1 + NAME_BYTES + 2 + 512];
         let k = ferros_sys::call_live(svc, &[9], &mut a);
         self.cands = 0;
         self.add_note_n = 0;
@@ -379,6 +388,25 @@ impl Fleet {
                 if at + 1 + len <= got {
                     self.add_note[..len].copy_from_slice(&a[at + 1..at + 1 + len]);
                     self.add_note_n = len;
+                }
+                at += 1 + a[at] as usize;
+            }
+            // The selected device's name and words (fgtw `adding_reply`), as far as the reply and the fields hold them.
+            self.sel_name_n = 0;
+            self.sel_words_n = 0;
+            if at < got {
+                let len = a[at] as usize;
+                if at + 1 + len <= got && len <= NAME_BYTES {
+                    self.sel_name[..len].copy_from_slice(&a[at + 1..at + 1 + len]);
+                    self.sel_name_n = len;
+                }
+                at += 1 + len;
+            }
+            if at + 2 <= got {
+                let len = u16::from_le_bytes([a[at], a[at + 1]]) as usize;
+                if at + 2 + len <= got && len <= self.sel_words.len() {
+                    self.sel_words[..len].copy_from_slice(&a[at + 2..at + 2 + len]);
+                    self.sel_words_n = len;
                 }
             }
         } else {
@@ -2270,7 +2298,7 @@ impl Map {
                         let phase = match f.add {
                             1 => "add a device: devices asking to join",
                             2 => "adding it to the fleet",
-                            3 => "it is in the fleet",
+                            3 => "add a device: selected",
                             4 => "handing it the fleet's key",
                             5 => "added",
                             _ => "adding it failed",
@@ -2285,7 +2313,7 @@ impl Map {
                             let nearby = f.cand_flags[i] & 3 != 0;
                             let mut l = Line::new();
                             l.s(core::str::from_utf8(&f.cand_name[i][..f.cand_name_n[i] as usize]).unwrap_or("a device"));
-                            l.s(if f.cand_flags[i] & 4 != 0 { "  added" } else if nearby { "  nearby: tap to add" } else { "  not nearby: type its words" });
+                            l.s(if f.cand_flags[i] & 4 != 0 { "  added" } else if nearby { "  nearby: tap to select" } else { "  not nearby: type its words" });
                             let pick = nearby && f.add == 1;
                             row(self, b, &mut y, small, if pick { white() } else { grey() }, l.as_str(), pick.then_some(Choice::FleetPick(i as u8)));
                         }
@@ -2298,8 +2326,46 @@ impl Map {
                             b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "or tap the two devices together");
                             y += uu(2, 1);
                         }
+                        // Selected (fgtw ADD_SELECTED, owner 2026-11-10: "I need a distinct green add, and note to press back otherwise"): the device and its words, the same it shows, Add in VSF RGB primary green, and Back with nothing to undo.
                         if f.add == 3 {
-                            button(self, b, &mut y, "it left its words screen: finish", false, Some(Choice::FleetConfirm));
+                            let name = core::str::from_utf8(&f.sel_name[..f.sel_name_n]).unwrap_or("the device");
+                            let mut l = Line::new();
+                            l.s("Selected: ");
+                            l.s(name);
+                            row(self, b, &mut y, small, white(), l.as_str(), None);
+                            // The words four to a line, as the device shows them.
+                            let words = core::str::from_utf8(&f.sel_words[..f.sel_words_n]).unwrap_or("");
+                            let mut line = Line::new();
+                            let mut k = 0;
+                            for w in words.split(' ').filter(|w| !w.is_empty()) {
+                                if k == 4 {
+                                    b.text(cx, y - uu(1, 1), note as u16, grey(), 1, line.as_str());
+                                    y += uu(3, 2);
+                                    line = Line::new();
+                                    k = 0;
+                                }
+                                if k > 0 {
+                                    line.s(" ");
+                                }
+                                line.s(w);
+                                k += 1;
+                            }
+                            if k > 0 {
+                                b.text(cx, y - uu(1, 1), note as u16, grey(), 1, line.as_str());
+                                y += uu(2, 1);
+                            }
+                            let mut l = Line::new();
+                            l.s("Add ");
+                            l.s(name);
+                            let down = self.pressed == Some(Choice::FleetConfirm);
+                            b.button(cx, y - uu(1, 2), uu(16, 1), uu(2, 1), uu(5, 4), [if down { GREEN_HELD } else { GREEN }, GREEN_EDGE, GREEN_EDGE, 0x000000], l.as_str());
+                            if hit {
+                                self.push_row(cx - half, cx + half, y - uu(2, 1), y + uu(1, 1), Choice::FleetConfirm);
+                            }
+                            y += uu(3, 1);
+                            b.text(cx, y - uu(1, 1), note as u16, dim(), 1, "Didn't turn green? Press Back.");
+                            y += uu(2, 1);
+                            button(self, b, &mut y, "back", false, Some(Choice::FleetAdd));
                         }
                         button(self, b, &mut y, if f.add >= 5 { "done" } else { "close" }, false, Some(Choice::FleetClose));
                     }
