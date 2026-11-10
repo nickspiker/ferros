@@ -60,15 +60,15 @@ The attest screen no longer decides anything about an identity. A first entry de
 
 Removal is bilateral (photon docs/pairing-v2.md "Chain changes"), the same as in the app's sign-out. The frames are fgtw's (`fgtw::protocol`), shared with the app.
 
+**Revised 2026-11-10 (owner), for ferros and the Photon app alike; not built yet.** The design below replaces the words of the 2026-10-31 version (three approval words typed on a surviving device). Words carried no key material and selected nothing a signature did not already settle; the request is signed by a current member's key, checked against the chain. The transports and their order are AUTH.md's "Joining and leaving a fleet".
+
 1. Op 5 `[5][intent]` on the `photon` endpoint starts the departure. Intent is 1 (to a new owner: the approver also releases the device, so another fleet can bind it) or 2 (to the desk).
-2. The client builds three things:
-   - this device's consent eggs over `fleet::departreq_signing_bytes`;
-   - three fresh approval words;
-   - the signed `depart_req`, carrying the words' commitment.
-3. The `depart_req` goes to every sibling heard beaconing, now and later.
-4. The state reads 8 (leaving), and the map shows the words.
-5. A surviving device's user types the words and publishes the consented Remove.
-6. The client checks the seed's chain every 16 s, and any chain a sibling pushes. Once the chain folds without this device, the identity's roots, chain and key are forgotten here.
+2. The client builds this device's consent eggs over `fleet::departreq_signing_bytes` with a fresh salt in what they sign, and the signed `depart_req` carrying it. The salt names this request: one denied is never accepted again, so asking again means a new request with a new salt.
+3. The `depart_req` goes to every fleet device: an NFC tap, a BLE broadcast, the LAN, directly over the FGTW peer network wherever each device is, and fgtw.org's slot last for a device offline.
+4. The state reads 8 (leaving). The leaving screen says it is asking the person's devices: tap one, or approve on any of them. No words, no reachability lines.
+5. Every fleet device that receives it notifies the person (ferros and the Photon app), and the notification opens the Fleet page with the request on it: which device, and **Approve** or **Deny**, ready. An NFC tap from an attested fleet device with its screen on is Approve.
+6. Approve publishes the consented Remove. Deny records the request's salt as denied and tells the fleet, so every device clears the request and refuses that salt; the leaving device hears it, says so, and a new request takes a new salt.
+7. The leaving device checks the seed's chain every 16 s, and any chain a sibling pushes. Once the chain folds without this device, the identity's roots, chain and key are forgotten here.
 
 Verified on the host: photon-interop shows the app parsing the device's `depart_req` and its consent verifying under every scheme the device holds. Not yet run against a live approver.
 
