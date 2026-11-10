@@ -3832,8 +3832,8 @@ fn flavour(what: Corner) -> ((f32, f32, f32), (f32, f32, f32)) {
 }
 
 /// The calendar clock's rings (owner, 2026-11-10), as fractions of the circle's inner radius, outer and inner edge each: the months, the week, the day; the text inside the innermost (`CAL_TEXT`). The swept part's light and the rest's, as the ink's opacity.
-const CAL_RINGS: [(f32, f32); 3] = [(0.97, 0.83), (0.79, 0.67), (0.63, 0.51)];
-const CAL_TEXT: f32 = 0.5;
+const CAL_RINGS: [(f32, f32); 3] = [(0.97, 0.88), (0.85, 0.77), (0.74, 0.66)];
+const CAL_TEXT: f32 = 0.62;
 const CAL_SWEPT: f32 = 0.6;
 const CAL_REST: f32 = 0.18;
 
@@ -5105,7 +5105,9 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 // The lines stacked about the centre, a pitch each; each line as large as fits its own chord (seven tenths of the circle's width at the line's far edge), the name half again as large as a measure.
                 let weight = |j: usize| if j == 0 && nl > 1 && !clock { 1.5 } else { 1.0 };
                 let total: f32 = (0..nl).map(weight).sum();
-                let pitch = if nl == 1 { r * 0.66 } else { r * 1.5 / total };
+                // The clock's two lines close together (owner, 2026-11-10: "bigger text and put the text spacing much closer together"): a pitch of half its text radius each, the glyphs a fifth larger than the pitch.
+                let pitch = if clock { r * 0.5 } else if nl == 1 { r * 0.66 } else { r * 1.5 / total };
+                let size = if clock { 1.2 } else { 0.9 };
                 let mut top_y = y - pitch * total * 0.5;
                 for j in 0..nl {
                     let text = lines[j].str();
@@ -5113,7 +5115,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                     let far = libm::fabsf(top_y - y).max(libm::fabsf(top_y + lh - y));
                     // The lines span 1.5 r about the centre, so a line's far edge is at most 0.75 r out and the root's argument stays positive.
                     let chord = 2.0 * libm::sqrtf(r * r - far * far) * 0.7;
-                    let mut px = lh * 0.9;
+                    let mut px = lh * size;
                     let tw0 = eng.width(text, px);
                     if tw0 > chord {
                         px *= chord / tw0;
