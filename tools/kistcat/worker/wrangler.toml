@@ -1,0 +1,19 @@
+# kists.fgtw.org's bare address: the Worker `kists` serves index.html from the R2 bucket `kists` (tools/kistcat). Deploy from this directory: `npx wrangler deploy`. Not deployed by any script.
+name = "kists"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-11-15"
+# Only its route reaches it: no workers.dev address.
+workers_dev = false
+
+[build]
+command = "cargo install -q worker-build@0.1.0 && worker-build --release"
+
+# The bucket the custom domain kists.fgtw.org serves (plain HTTP, no redirect).
+[[r2_buckets]]
+binding = "KISTS"
+bucket_name = "kists"
+
+# The bare address only (a pattern without `*` matches that path alone). /kists.vsf, /capsules/… and every other path stay R2's, never routed here.
+[[routes]]
+pattern = "kists.fgtw.org/"
+zone_name = "fgtw.org"

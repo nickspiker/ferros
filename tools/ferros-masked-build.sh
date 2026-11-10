@@ -17,7 +17,7 @@ mkdir -p "$OUT/s"
 # The codegen rules come from the target itself (targets/aarch64-ferros.json): the process ABI's reserved registers and the CPU's measured features are properties of the target, so core, alloc and compiler_builtins inherit them by being built for it.
 # They used to be scraped out of .cargo/config.toml with sed. That worked, but a change to the shape of that line would have silently produced a different feature set — and a core built without x27/x28 reserved breaks the masking invariant (KERNEL.md: the arc base and mask must hold at *every* instruction, which callee-saved does not give).
 TARGET=$REPO/targets/aarch64-ferros.json
-( cd "$REPO" && RUSTFLAGS="-C codegen-units=1 --emit=asm,link${BTI:+ -Z branch-protection=bti}" cargo +nightly build -q -p "$CRATE" --target "$TARGET" --release -Z json-target-spec -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem --target-dir "$TD" )
+( cd "$REPO" && RUSTFLAGS="-C codegen-units=1 -C llvm-args=-aarch64-enable-compress-jump-tables=false --emit=asm,link${BTI:+ -Z branch-protection=bti}" cargo +nightly build -q -p "$CRATE" --target "$TARGET" --release -Z json-target-spec -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem --target-dir "$TD" )
 DEPS=$TD/aarch64-ferros/release/deps
 # The payload's own (post-LTO) module holds everything it uses; compiler_builtins is never part of LTO.
 SRCS=$(ls -t "$DEPS"/${BIN}-*.s | head -1; ls -t "$DEPS"/compiler_builtins-*.s | head -1)

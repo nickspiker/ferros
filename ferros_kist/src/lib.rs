@@ -157,6 +157,14 @@ pub fn option_of(capsule: &[u8]) -> Result<Option<[u8; 32]>, &'static str> {
     })))
 }
 
+/// The developer's name, when the capsule's `kist` section carries one (`developer`, `a`): what the kist directory shows beside the key (tools/kistcat). No signer writes one yet; a capsule without it is named by its key alone.
+pub fn developer_name_of(capsule: &[u8]) -> Result<Option<String>, &'static str> {
+    Ok(section(capsule, "kist")?.and_then(|s| s.get_field("developer").and_then(|f| f.values.iter().find_map(|v| match v {
+        VsfType::a(t) => Some(String::from(t.as_str())),
+        _ => None,
+    }))))
+}
+
 /// The sections a capsule's declaration adds, for the signer (ferros-bridge `capsule --kist`): `kist` with the name, `wants` with a field per want, or no `wants` at all for a kist that wants nothing (2026-11-10: an empty section was written and did not parse back, so the clock's capsule could not be installed; a capsule without one already reads as wanting nothing).
 pub fn declaration_sections(d: &Decl, option: Option<[u8; 32]>) -> (VsfSection, Option<VsfSection>) {
     let mut k = VsfSection::new("kist");
@@ -536,5 +544,304 @@ mod capsule_on_disk {
         let at = (e.offset_bytes..e.offset_bytes + 64).find(|&p| c[p] == b'v' && c[p + 1] == b'b').unwrap();
         std::println!("header ends {end}, code section at {}, vb at {at}", e.offset_bytes);
         assert!(at < 1 << 16);
+    }
+}
+
+/// The kist directory (docs/KISTS.md "The directory"; owner, 2026-11-10): the public list of kists anyone may install, at `kists.fgtw.org/kists.vsf` over plain HTTP, built by tools/kistcat and read by the device's installer.
+///
+/// - **It vouches for nothing.** Anyone may list a kist and no account installs one. The device checks the capsule's blake3 against its entry and the capsule's developer signature at install; the directory's own signature (every egg of the ferros project key) only keeps a mirror, or anything on the path between, from editing the list.
+/// - **One VSF document**, signed with every scheme ([`fgtw::release::release_slots`], the slots the bridge reserves for a kist) and stamped with its Eagle time: a section `kist` per entry and a section `metrics` per entry, each field named and typed and read by its type marker, never by position.
+/// - **Text is ASCII** (`a`): the device's installer is no_std, and vsf decodes UTF-8 text (`x`, Huffman coded) only with std, as the person's list and the capsule's declaration already have it.
+#[cfg(feature = "directory")]
+pub mod directory {
+    use super::*;
+    use vsf::types::Ascii;
+
+    /// The host the device fetches from (plain HTTP: the device has no TLS), and the directory's exact path on it.
+    pub const HOST: &str = "kists.fgtw.org";
+    pub const PATH: &str = "/kists.vsf";
+
+    /// A capsule's version, as Photon's manifest gives its own (`major`, `minor`, `patch`, each `z`).
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+    pub struct Version {
+        pub major: u64,
+        pub minor: u64,
+        pub patch: u64,
+    }
+
+    /// Where the device gets the capsule.
+    #[derive(Clone, PartialEq, Debug)]
+    pub enum Source {
+        /// `path` (`a`): an exact path on [`HOST`], `/capsules/<blake3>.vsf`, the capsule's bytes kept by their own hash.
+        Path(String),
+        /// `manifest` (`nu`, a plain-http URL), `platform` and `arch` (`a`): the developer's own signed manifest (Photon's `manifest-release.vsf`). The device fetches it, checks that the entry's developer signed it with every egg, and takes the artefact section whose `platform` and `arch` are these; that artefact's blake3 must be the entry's `capsule`, or the manifest has moved past the directory and nothing is installed until the directory is rebuilt.
+        Manifest { url: String, platform: String, arch: String },
+    }
+
+    /// The kist's measures: many dimensions, never one score (owner, 2026-11-10: "not a single dimensional star system"). None is defined yet; the section is there, keyed by the kist's identity so its measures carry across versions, and a field per dimension comes later.
+    #[derive(Clone, PartialEq, Debug, Default)]
+    pub struct Metrics {}
+
+    /// One listed kist.
+    #[derive(Clone, PartialEq, Debug)]
+    pub struct Entry {
+        /// `name` (`a`): the app's own name, as its capsule's declaration gives it.
+        pub name: String,
+        /// `developer` (`ke`): the Ed25519 key the capsule is signed with; with `option`, the kist's identity across versions.
+        pub developer: [u8; 32],
+        /// `developer_name` (`a`), when the capsule's declaration names its developer.
+        pub developer_name: Option<String>,
+        /// `option` (`hR`): the kist's identity across versions, minted once by its developer.
+        pub option: [u8; 32],
+        /// `major`, `minor`, `patch` (`z`).
+        pub version: Version,
+        pub source: Source,
+        /// `capsule` (`hb`): the blake3 of the signed capsule, as the person's list and the vault name it.
+        pub capsule: [u8; 32],
+        /// `size` (`u`): the capsule's length in bytes.
+        pub size: u64,
+        /// `about` (`a`): one line of what the kist is.
+        pub about: String,
+        /// `icon` (`a`): a path on [`HOST`] to its icon (a VSF image, as tools/app-icons makes them), when it has one.
+        pub icon: Option<String>,
+        /// Its `metrics` section.
+        pub metrics: Metrics,
+    }
+
+    /// The directory: when it was made (Eagle oscillations), the key that signed it, and its kists in listed order.
+    #[derive(Clone, PartialEq, Debug)]
+    pub struct Directory {
+        pub made: i64,
+        pub signer: [u8; 32],
+        pub kists: Vec<Entry>,
+    }
+
+    fn text(what: &str, s: &str) -> Result<VsfType, String> {
+        Ascii::new(s).map(VsfType::a).map_err(|e| alloc::format!("{what} {s:?}: {e} (the directory's text is ASCII, read by a no_std installer)"))
+    }
+
+    /// The `kist` section of one entry.
+    fn entry_section(e: &Entry) -> Result<VsfSection, String> {
+        let mut s = VsfSection::new("kist");
+        s.add_field("name", text("name", &e.name)?);
+        s.add_field("developer", VsfType::ke(e.developer.to_vec()));
+        if let Some(n) = &e.developer_name {
+            s.add_field("developer_name", text("developer_name", n)?);
+        }
+        s.add_field("option", VsfType::hR(e.option.to_vec()));
+        s.add_field("major", VsfType::z(e.version.major as usize));
+        s.add_field("minor", VsfType::z(e.version.minor as usize));
+        s.add_field("patch", VsfType::z(e.version.patch as usize));
+        match &e.source {
+            Source::Path(p) => s.add_field("path", text("path", p)?),
+            Source::Manifest { url, platform, arch } => {
+                s.add_field("manifest", VsfType::nu(url.clone()));
+                s.add_field("platform", text("platform", platform)?);
+                s.add_field("arch", text("arch", arch)?);
+            }
+        }
+        s.add_field("capsule", VsfType::hb(e.capsule.to_vec()));
+        s.add_field("size", VsfType::u(e.size as usize, false));
+        s.add_field("about", text("about", &e.about)?);
+        if let Some(i) = &e.icon {
+            s.add_field("icon", text("icon", i)?);
+        }
+        Ok(s)
+    }
+
+    /// The `metrics` section of one entry: the kist's identity, and no dimension yet.
+    fn metrics_section(e: &Entry) -> VsfSection {
+        let mut s = VsfSection::new("metrics");
+        s.add_field("developer", VsfType::ke(e.developer.to_vec()));
+        s.add_field("option", VsfType::hR(e.option.to_vec()));
+        s
+    }
+
+    /// The directory as a complete VSF document stamped `made` (Eagle oscillations), its header naming `signer` (the project key's Ed25519 half) with an empty egg slot per scheme for the signer to fill (`fgtw::release::sign_release`, as the bridge signs a kist).
+    pub fn build_unsigned(kists: &[Entry], made: i64, signer: [u8; 32]) -> Result<Vec<u8>, String> {
+        let mut b = vsf::VsfBuilder::new().creation_time_oscillations(made).signed_only_eggs(VsfType::ke(signer.to_vec()), &fgtw::release::release_slots());
+        for e in kists {
+            b = b.add_section_direct(entry_section(e)?).add_section_direct(metrics_section(e));
+        }
+        b.build()
+    }
+
+    /// A field's first value of the wanted type (AGENT.md: the type marker says what a value is).
+    fn value<'a, T>(s: &'a VsfSection, name: &str, f: impl Fn(&'a VsfType) -> Option<T>) -> Option<T> {
+        s.get_field(name)?.values.iter().find_map(f)
+    }
+
+    fn ascii(s: &VsfSection, name: &str) -> Option<String> {
+        value(s, name, |v| match v {
+            VsfType::a(t) => Some(String::from(t.as_str())),
+            _ => None,
+        })
+    }
+
+    fn key(s: &VsfSection, name: &str) -> Option<[u8; 32]> {
+        // WHY: the length is the document's; `try_into` refuses a value of any other length rather than reading past it.
+        value(s, name, |v| match v {
+            VsfType::ke(k) => k[..].try_into().ok(),
+            _ => None,
+        })
+    }
+
+    fn option(s: &VsfSection) -> Option<[u8; 32]> {
+        // WHY: as `key`.
+        value(s, "option", |v| match v {
+            VsfType::hR(o) => o[..].try_into().ok(),
+            _ => None,
+        })
+    }
+
+    fn version_part(s: &VsfSection, name: &str) -> Option<u64> {
+        value(s, name, |v| match v {
+            VsfType::z(n) => Some(*n as u64),
+            _ => None,
+        })
+    }
+
+    fn entry_of(s: &VsfSection) -> Result<Entry, &'static str> {
+        let manifest = value(s, "manifest", |v| match v {
+            VsfType::nu(u) => Some(u.clone()),
+            _ => None,
+        });
+        let source = match (ascii(s, "path"), manifest) {
+            (Some(p), None) => Source::Path(p),
+            (None, Some(url)) => Source::Manifest {
+                url,
+                platform: ascii(s, "platform").ok_or("a manifest entry without its platform")?,
+                arch: ascii(s, "arch").ok_or("a manifest entry without its arch")?,
+            },
+            (Some(_), Some(_)) => return Err("an entry with both a path and a manifest"),
+            (None, None) => return Err("an entry with neither a path nor a manifest"),
+        };
+        Ok(Entry {
+            name: ascii(s, "name").ok_or("an entry without its name")?,
+            developer: key(s, "developer").ok_or("an entry without its developer key")?,
+            developer_name: ascii(s, "developer_name"),
+            option: option(s).ok_or("an entry without its option")?,
+            version: Version {
+                major: version_part(s, "major").ok_or("an entry without its version")?,
+                minor: version_part(s, "minor").ok_or("an entry without its version")?,
+                patch: version_part(s, "patch").ok_or("an entry without its version")?,
+            },
+            source,
+            // WHY: as `key`.
+            capsule: value(s, "capsule", |v| match v {
+                VsfType::hb(h) => h[..].try_into().ok(),
+                _ => None,
+            })
+            .ok_or("an entry without its capsule's blake3")?,
+            size: value(s, "size", |v| v.as_u64()).ok_or("an entry without its size")?,
+            about: ascii(s, "about").ok_or("an entry without its description")?,
+            icon: ascii(s, "icon"),
+            metrics: Metrics::default(),
+        })
+    }
+
+    /// The directory's entries, read and checked for shape only: who signed it is [`verify_directory`]'s. A section of another name is skipped (a later directory may carry more); a kist listed twice (one developer and option), an entry missing a field, or measures for a kist not listed refuse the whole document.
+    pub fn parse_directory(doc: &[u8]) -> Result<Directory, &'static str> {
+        let (header, end) = VsfHeader::decode(doc).map_err(|_| "not a VSF file")?;
+        let signer = match &header.signer_pubkey {
+            // WHY: the key's length is the document's; anything but 32 bytes is no Ed25519 key.
+            Some(VsfType::ke(k)) => k[..].try_into().map_err(|_| "a signer key that is not Ed25519")?,
+            _ => return Err("no signer"),
+        };
+        let made = header.creation_time.as_ref().and_then(|t| t.as_eagle()).ok_or("no creation time")?;
+        let sections = header.sections(doc, end).map_err(|_| "sections that do not parse")?;
+        let mut kists: Vec<Entry> = Vec::new();
+        for s in sections.iter().filter(|s| s.name == "kist") {
+            let e = entry_of(s)?;
+            if kists.iter().any(|k| k.developer == e.developer && k.option == e.option) {
+                return Err("a kist listed twice");
+            }
+            kists.push(e);
+        }
+        for s in sections.iter().filter(|s| s.name == "metrics") {
+            let (Some(developer), Some(option)) = (key(s, "developer"), option(s)) else { return Err("measures without their kist's identity") };
+            // No dimension is defined yet: the section only has to name a listed kist.
+            if !kists.iter().any(|k| k.developer == developer && k.option == option) {
+                return Err("measures for a kist that is not listed");
+            }
+        }
+        Ok(Directory { made, signer, kists })
+    }
+
+    /// The directory, if every egg of `project` (the ferros project key's public bundle, pinned by the reader) verifies over it and its header names that key: the bridge's rule for a kist (`fgtw::release::verify_signed_by`, owner 2026-11-10: "no single eggs"), then [`parse_directory`].
+    pub fn verify_directory(doc: &[u8], project: &fgtw::pq::KeyBundle) -> Result<Directory, String> {
+        fgtw::release::verify_signed_by(doc, &project.ed25519(), project)?;
+        parse_directory(doc).map_err(String::from)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        extern crate std;
+        use fgtw::pq::SigningBundle;
+
+        fn entry(n: u8, source: Source) -> Entry {
+            Entry {
+                name: String::from("Clock"),
+                developer: [n; 32],
+                developer_name: None,
+                option: [n ^ 1; 32],
+                version: Version { major: 0, minor: 1, patch: 0 },
+                source,
+                capsule: [n ^ 2; 32],
+                size: 700,
+                about: String::from("the time, drawn as rings"),
+                icon: None,
+                metrics: Metrics::default(),
+            }
+        }
+
+        fn signed(kists: &[Entry], key: &SigningBundle) -> Vec<u8> {
+            use fgtw::pq::FleetSigner;
+            let unsigned = build_unsigned(kists, 5, key.keypair().public.to_bytes()).unwrap();
+            fgtw::release::sign_release(unsigned, key).unwrap()
+        }
+
+        #[test]
+        fn build_verify_round_trip() {
+            let key = SigningBundle::developer(&[3; 32], "TEST_PROJECT");
+            let kists = alloc::vec![
+                entry(1, Source::Path(String::from("/capsules/ab.vsf"))),
+                entry(4, Source::Manifest { url: String::from("http://example.org/manifest.vsf"), platform: String::from("ferros"), arch: String::from("arm64") }),
+            ];
+            let doc = signed(&kists, &key);
+            let d = verify_directory(&doc, &key.public()).unwrap();
+            assert_eq!(d.kists, kists);
+            assert_eq!(d.made, 5);
+            // Signed by another key, or with one byte changed anywhere, it is refused.
+            let other = SigningBundle::developer(&[4; 32], "TEST_PROJECT");
+            assert!(verify_directory(&doc, &other.public()).is_err());
+            for at in [doc.len() >> 1, doc.len() - 1] {
+                let mut t = doc.clone();
+                t[at] ^= 1;
+                assert!(verify_directory(&t, &key.public()).is_err(), "a byte changed at {at}");
+            }
+        }
+
+        #[test]
+        fn an_empty_directory_round_trips() {
+            let key = SigningBundle::developer(&[3; 32], "TEST_PROJECT");
+            let d = verify_directory(&signed(&[], &key), &key.public()).unwrap();
+            assert!(d.kists.is_empty());
+        }
+
+        #[test]
+        fn a_kist_listed_twice_is_refused() {
+            let key = SigningBundle::developer(&[3; 32], "TEST_PROJECT");
+            let e = entry(1, Source::Path(String::from("/a.vsf")));
+            assert_eq!(parse_directory(&signed(&[e.clone(), e], &key)), Err("a kist listed twice"));
+        }
+
+        #[test]
+        fn text_that_is_not_ascii_is_refused_when_built() {
+            let mut e = entry(1, Source::Path(String::from("/a.vsf")));
+            e.about = String::from("the time \u{2192} drawn");
+            assert!(build_unsigned(&[e], 5, [0; 32]).is_err());
+        }
     }
 }

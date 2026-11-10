@@ -14,10 +14,14 @@ vsf = { path = "../../vsf", default-features = false }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 # The list read and written through a process's `kists.` grant (init, the map): only where ferros_sys's calls exist.
 ferros_sys = { path = "../ferros_sys", optional = true }
+# The kist directory (`directory`): its egg slots, and every egg checked against the project's pinned bundle, by fgtw's verify-only base (no_std + alloc, as payloads/fgtw builds it). Off for the kernel, init and the map, which read only the rights' names and the person's list.
+fgtw = { path = "../../fgtw", default-features = false, optional = true }
+
+[dev-dependencies]
+# The directory's tests sign with a test key, as kistcat signs with the project's; the fetch's test signs a capsule with every egg of a test release bundle and checks the streamed hashes against fgtw's own verifier.
+fgtw = { path = "../../fgtw", default-features = false, features = ["sign"] }
 
 [features]
 process = ["dep:ferros_sys"]
-
-[dev-dependencies]
-# The fetch's test signs a capsule with every egg of a test release bundle and checks the streamed hashes against fgtw's own verifier (host only: the kernel builds this crate without it).
-fgtw = { path = "../../fgtw", default-features = false, features = ["std", "sign"] }
+# The kist directory (kists.fgtw.org/kists.vsf): its schema, built by tools/kistcat and read by the device's installer.
+directory = ["dep:fgtw"]
