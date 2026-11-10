@@ -693,7 +693,10 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
     let mut builder = vsf::VsfBuilder::new();
     if let Some(d) = kist_arg() {
         let (k, w) = ferros_kist::declaration_sections(&d);
-        builder = builder.add_section_direct(k).add_section_direct(w);
+        builder = builder.add_section_direct(k);
+        if let Some(w) = w {
+            builder = builder.add_section_direct(w);
+        }
     }
     if let Some(o) = option_arg() {
         builder = builder.provenance_hash(o);

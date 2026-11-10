@@ -135,15 +135,18 @@ pub fn identity(capsule: &[u8]) -> Result<([u8; 32], [u8; 32]), &'static str> {
     Ok((developer, option))
 }
 
-/// The sections a capsule's declaration adds, for the signer (ferros-bridge `capsule --kist`): `kist` with the name, `wants` with a field per want.
-pub fn declaration_sections(d: &Decl) -> (VsfSection, VsfSection) {
+/// The sections a capsule's declaration adds, for the signer (ferros-bridge `capsule --kist`): `kist` with the name, `wants` with a field per want, or no `wants` at all for a kist that wants nothing (2026-11-10: an empty section was written and did not parse back, so the clock's capsule could not be installed; a capsule without one already reads as wanting nothing).
+pub fn declaration_sections(d: &Decl) -> (VsfSection, Option<VsfSection>) {
     let mut k = VsfSection::new("kist");
     k.add_field("name", VsfType::a(vsf::Ascii::checked("name", d.name.clone())));
+    if d.wants.is_empty() {
+        return (k, None);
+    }
     let mut w = VsfSection::new("wants");
     for (c, reason) in &d.wants {
         w.add_field(RIGHTS[*c as usize], VsfType::a(vsf::Ascii::checked("reason", reason.clone())));
     }
-    (k, w)
+    (k, Some(w))
 }
 
 impl Kists {
@@ -303,7 +306,7 @@ mod tests {
         let (kist, wants) = declaration_sections(&decl());
         let mut code = VsfSection::new("aarch64");
         code.add_field("code", VsfType::v(b'b', alloc::vec![7u8; 1 << 12]));
-        let file = vsf::VsfBuilder::new().provenance_hash([5; 32]).add_section_direct(kist).add_section_direct(wants).add_section_direct(code).build().unwrap();
+        let file = vsf::VsfBuilder::new().provenance_hash([5; 32]).add_section_direct(kist).add_section_direct(wants.unwrap()).add_section_direct(code).build().unwrap();
         let d = declaration(&file).unwrap();
         assert_eq!(d, decl());
         assert_eq!(want_codes(&file).unwrap(), alloc::vec![0, 6]);

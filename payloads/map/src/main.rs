@@ -798,6 +798,11 @@ fn group_of(kind: u16) -> usize {
     }
 }
 
+/// A kist the display draws itself in its circle (a widget: its scene icon at G#80 and up, display WIDGET_*), by the kist's name: the clock (owner, 2026-11-10: "my clock widget kist on the homescreen again"). Installed like any app (payloads/clock, tools/clock-kist.sh), never launched.
+fn widget(name: &str) -> Option<u8> {
+    name.eq_ignore_ascii_case("Clock").then_some(0x80)
+}
+
 /// A detail field's name for the page (ferros_detail's schemas).
 fn detail_label(field: &str) -> &'static str {
     match field {
@@ -979,7 +984,10 @@ impl Map {
         let name = self.kists.kists[i - 1].name.as_str();
         // The display's bundle (tools/app-icons APPS, 1-based): the kist's icon by its app's name until a kist carries its own (KISTS.md: the list's `icon`).
         const BUNDLED: [&str; 5] = ["Photon", "Mahere", "Lumis", "Opsin", "Ramps"];
-        let icon = BUNDLED.iter().position(|b| b.eq_ignore_ascii_case(name)).map_or(0, |k| k as u8 + 1);
+        let icon = match widget(name) {
+            Some(w) => w,
+            None => BUNDLED.iter().position(|b| b.eq_ignore_ascii_case(name)).map_or(0, |k| k as u8 + 1),
+        };
         Spec { label: name, ring: 1, lit: 0, share: KIST_SHARE, icon }
     }
 
@@ -1071,9 +1079,12 @@ impl Map {
         ok
     }
 
-    /// Ask init to launch kist circle `i`'s kist (KISTS.md): the map holds none of its rights. Init's answer (ferros_kist::launch).
+    /// Ask init to launch kist circle `i`'s kist (KISTS.md): the map holds none of its rights. Init's answer (ferros_kist::launch). A widget's kist is not launched: the display draws it, in its circle, from the scene (`widget`).
     fn launch(&self, i: usize) -> u8 {
         let Some(k) = self.kist(i) else { return ferros_kist::launch::NOT_INSTALLED };
+        if widget(&k.name).is_some() {
+            return ferros_kist::launch::RUNNING;
+        }
         let mut m = [0u8; 33];
         m[0] = ferros_kist::launch::OP_LAUNCH;
         m[1..].copy_from_slice(&k.capsule);

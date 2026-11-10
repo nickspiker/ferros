@@ -37,6 +37,7 @@ members = [
     "payloads/usb",
     "payloads/gpstest",
     "payloads/focustest",
+    "payloads/clock",
     "payloads/touchtest",
     "payloads/map",
     "payloads/init",
