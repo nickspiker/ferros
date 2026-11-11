@@ -13,6 +13,9 @@ GPU.md is the driver as built; this is what it grows into.
 - **Look, not bits** (2026-11-05): "bit identical-ish is totally fine".
 - **Mahere** (2026-11-11): "completely triangle raster all the way down. Except for place labels"; "no tilting or 3Dness"; "2-8 triangles per pixel, and each triangle of course has several layers but is one colour"; "The triangle shader shit is more for textures on things, to which we don't have rectangles, no?"; on exact coverage, "and then it'd be a 1:1 per px too, rather than our oversample now, I think 9x or so?"
 - **The order** (2026-11-11): "a proper study, design, plan and then if it looks good, we can build the GPU!"
+- **f16** (2026-11-11): "f16 is likely worth it, we get 2x and most of the mahere composite work can either be done in integer or f16." Valhall's paired half-precision ops run at twice the rate; light, colour, coverage weights and lookups are f16, coordinates stay integer (Mahere's Q30.16 texel addressing: f16's 11 bits cannot hold them).
+- **What a capsule carries** (2026-11-11): "ideally WGSL text becomes VSF compiled by the dev that gets checked and optimized by ferros." The developer's tools compile the source into a typed intermediate form stored as VSF in the capsule; the device validates it (types, buffer bounds, loop limits), optimises it, lowers it to Valhall at install and seals the result; the device never parses shader text (open question 0 closed).
+- **Source language, proposed** (owner: "Not sure on the source language, thoughts?"): the VSF form is the contract and any front end that emits it is welcome, all on the developer's machine: WGSL first (Mahere's compose is WGSL, naga parses it), Rust next (rust-gpu to SPIR-V, naga reads SPIR-V into the same form), ferros's own kernels from the `valhall` crate's recorded Rust into the same form, and a Spirix type in the form once Spirix replaces IEEE.
 
 ## 0. Study
 
