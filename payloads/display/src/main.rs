@@ -3136,6 +3136,12 @@ static mut CON_GLYPHS: Option<glyphs::Glyphs> = None;
 static mut CONSOLE_KEY: i64 = -1;
 /// Each console circle's look at its last draw (`console_draw`; 0 not drawn), whether the console was ever drawn whole, and the rows the last draw changed, [lo, hi) of the bars' rows.
 static mut CON_CIRCLE_KEYS: [u64; CON_CIRCLES] = [0; CON_CIRCLES];
+/// Each console circle's body key at its last body draw (`console_draw`; 0 not drawn), the bodies drawn and the blits' time since the last report (the 32-draw line).
+static mut CON_BODY_KEYS: [u64; CON_CIRCLES] = [0; CON_CIRCLES];
+static mut CON_BODIES: u64 = 0;
+static mut CON_BLIT_US: u64 = 0;
+/// The console's bodies (2026-11-11, owner: "they get drawn once into a buffer and then that circle RGBA just gets blit px for px right to the screen"): each circle's vessel and switched-off art, fluor's α + darkness, over the chrome rows at the top (`console_draw`).
+static mut BODY: usize = 1;
 /// Each console circle where it was last drawn (x, y, r): a circle that moved empties where it was as well as where it is (none moves today: the quick row moved until 2026-11-11, and slides in its own sprite now).
 static mut CON_CIRCLE_AT: [(f32, f32, f32); CON_CIRCLES] = [(0., 0., 0.); CON_CIRCLES];
 /// The console's circles: the corners' (at most 16).
@@ -5366,6 +5372,16 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
     let mut region = [(0.0f32, 0.0f32, 0.0f32); 2 * CON_CIRCLES];
     let mut nreg = 0;
     let mut rbox = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
+    // The bodies (owner, 2026-11-11: "like once you attest, they get drawn once into a buffer and then that circle RGBA just gets blit px for px right to the screen"): each circle's vessel and its switched-off art drawn once into the body layer (`BODY`, the chrome rows' size) and again only when that body's own key moves (its fill, its art, its size); the console's region is then its words and numbers drawn from empty, and the bodies blit under them (after the loop). `bregion` the discs of the circles whose body changed, `body_touched` the circles that reach into them.
+    let body = unsafe { core::slice::from_raw_parts_mut(BODY as *mut u64, rows * width) };
+    if whole {
+        body.fill(0);
+        unsafe { CON_BODY_KEYS = [0; CON_CIRCLES] };
+    }
+    let mut body_changed = [false; CON_CIRCLES];
+    let mut body_touched = [false; CON_CIRCLES];
+    let mut bregion = [(0.0f32, 0.0f32, 0.0f32); CON_CIRCLES];
+    let mut nbreg = 0;
     for pass in 0..2 {
     for (ci, &(x, y, r, what)) in circles[..n].iter().enumerate() {
         if y >= height as f32 * 0.5 || pass == 1 && !touched[ci] {
@@ -5443,11 +5459,27 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         }
         // Never 0, which is "not drawn yet".
         let key = key | 1;
+        // The body's own key (`BODY`): what is drawn once and blit after (the vessel by its fill and size, and the art a radio shows switched off, or GPS's pin), never the words or numbers over it. With the orbs on, the measures they come from too.
+        let art = !(live && !switched_off) && matches!(what, Corner::Wifi | Corner::Bluetooth | Corner::Cellular | Corner::Nfc | Corner::Gps);
+        let mut bkey = 0x9E37_79B9_7F4A_7C15u64 ^ ci as u64;
+        let mut bmix = |v: u64| bkey = (bkey.rotate_left(7) ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        bmix(fill.0.to_bits() as u64 | (fill.1.to_bits() as u64) << 32);
+        bmix(fill.2.to_bits() as u64 | (r.to_bits() as u64) << 32);
+        bmix(ink ^ (art as u64) << 63);
+        if let (true, Some(ri)) = (ORBS, radio) {
+            facts[33 + 8 * ri..41 + 8 * ri].iter().for_each(|&f| bmix(f));
+        }
+        let bkey = bkey | 1;
         if pass == 0 {
             changed[ci] = whole || unsafe { CON_CIRCLE_KEYS[ci] } != key;
             unsafe { CON_CIRCLE_KEYS[ci] = key };
+            body_changed[ci] = whole || unsafe { CON_BODY_KEYS[ci] } != bkey;
+            unsafe { CON_BODY_KEYS[ci] = bkey };
+            // A body that changed changes the circle's look: its region is drawn again whole.
+            changed[ci] |= body_changed[ci];
             continue;
         }
+        let drawing_body = body_touched[ci];
         // A screen pixel's place in the console, inside the region. WHY the bounds test: glyph and disc positions come from the layout's float geometry, and a disc's box or a glyph's edge can reach past the screen's sides or below the console's rows; an index from there would land in another row or past the buffer. WHY the region test: outside it the console holds every circle's last draw, composed already; drawing there again would lay this circle under itself.
         // Only the region's discs this circle reaches are asked at each pixel (2026-11-11: every pixel asked every disc of the region).
         let mut near = [(0f32, 0f32, 0f32); 2 * CON_CIRCLES];
@@ -5472,6 +5504,28 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         };
         // A box of pixels (x0, x1, y0, y1) cut to the region's: only the work, as `at` alone keeps the drawing inside the region.
         let cut = |b: (i64, i64, i64, i64)| (b.0.max(rbox.0), b.1.min(rbox.1), b.2.max(rbox.2), b.3.min(rbox.3));
+        // The same for the body layer: its region is the discs of the circles whose body changed (`bregion`), a part of the region; none at all while this circle's body is not drawn (an empty box).
+        let mut bnear = [(0f32, 0f32, 0f32); CON_CIRCLES];
+        let mut bn = 0;
+        for &(cx, cy, re) in &bregion[..nbreg] {
+            let s = r + REACH + re;
+            if (x - cx) * (x - cx) + (y - cy) * (y - cy) < s * s {
+                bnear[bn] = (cx, cy, re);
+                bn += 1;
+            }
+        }
+        let at_b = |px: i64, py: i64| -> Option<usize> {
+            if px < 0 || px >= width as i64 || py < 0 || py >= rows as i64 {
+                return None;
+            }
+            let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
+            if whole || bnear[..bn].iter().any(|&(cx, cy, re)| (fx - cx) * (fx - cx) + (fy - cy) * (fy - cy) <= re * re) {
+                Some(py as usize * width + px as usize)
+            } else {
+                None
+            }
+        };
+        let cut_b = |b: (i64, i64, i64, i64)| if drawing_body { cut(b) } else { (0, -1, 0, -1) };
         // The text first: it is in front of its vessel. Since 2026-11-09 (owner: "switch to the most useful stats, similar to the battery for all the radios except for GPS") a radio on carries its name and its measures, a line each, as the battery its readings; GPS on draws its satellites' rings (`gps_rings`); a radio switched off its field, GPS off its pin. Before: a radio carried words only while off (2026-11-07), its orb speaking for it on (`ORBS`). for it, and its numbers are on its detail page. The clock and the battery keep theirs.
         {
             let mut lines = [Txt::new(); 9];
@@ -5534,13 +5588,13 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 let (a, l) = (r * 0.3, r * 0.6);
                 // The head's centre, so the pin from the head's top to the tip sits centred in the circle.
                 let (cx, cy) = (x, y - (l - a) * 0.5);
-                let (x0, x1, y0, y1) = cut(((cx - a - 2.0) as i64, (cx + a + 2.0) as i64, (cy - a - 2.0) as i64, (cy + l + 2.0) as i64));
+                let (x0, x1, y0, y1) = cut_b(((cx - a - 2.0) as i64, (cx + a + 2.0) as i64, (cy - a - 2.0) as i64, (cy + l + 2.0) as i64));
                 for py in y0..=y1 {
                     for px in x0..=x1 {
-                        let Some(i) = at(px, py) else { continue };
+                        let Some(i) = at_b(px, py) else { continue };
                         let sd = orb::sky::pin_sd((px as f32 + 0.5 - x) / r, (py as f32 + 0.5 - y) / r) * r;
                         let cov = draw::bump_step((1.0 - sd) * 0.5);
-                        console[i] = console[i].under(ink | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
+                        body[i] = body[i].under(ink | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
                     }
                 }
             } else if matches!(what, Corner::Wifi | Corner::Bluetooth | Corner::Cellular | Corner::Nfc) && !(live && !switched_off) {
@@ -5597,13 +5651,13 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                         }
                     }
                 };
-                let (x0, x1, y0, y1) = cut(((x - ri) as i64, (x + ri) as i64 + 1, (y - ri) as i64, (y + ri) as i64 + 1));
+                let (x0, x1, y0, y1) = cut_b(((x - ri) as i64, (x + ri) as i64 + 1, (y - ri) as i64, (y + ri) as i64 + 1));
                 for py in y0..=y1 {
                     for px in x0..=x1 {
-                        let Some(i) = at(px, py) else { continue };
+                        let Some(i) = at_b(px, py) else { continue };
                         let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
                         let a = field(dx, dy) * env(dx * dx + dy * dy);
-                        console[i] = console[i].under(ink | ((a * 65535.0) as u64) << 48, BlendMode::Normal);
+                        body[i] = body[i].under(ink | ((a * 65535.0) as u64) << 48, BlendMode::Normal);
                     }
                 }
             } else if !name.is_empty() {
@@ -5680,6 +5734,11 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             }
         }
         // Then the vessel, under its text (the orb crate's `Vessel`, the defaults of tools/tune's orbs page; owner, 2026-11-07: Lumis's camera-picker button made round): each channel of the fill a ring of its own at its own depth from the edge (blue outermost, red innermost: a prism; a channel the fill does not have draws nothing), Lumis's shape made smooth (a cliff on its outer side, a tail e-folding every λ on its inner) widened by the pixel's footprint, the outermost ring the fill has at half its light exactly at the circle's radius (its cliff is the circle's edge, so tangent circles meet rim to rim at the tangent point) and nothing drawn outside; then under them the body, the fill four stops darker, opaque but for a sixteenth, rising by a logistic under the green ring. Between the edge and the body the scene shows through. Every term C∞.
+        // Only when this circle's body is drawn again (its fill, its art or its size changed; owner, 2026-11-11: "they get drawn once into a buffer and then that circle RGBA just gets blit"), into the body layer (`BODY`); a redraw of its words alone takes the body as it is (the blit after the loop).
+        if !drawing_body {
+            continue;
+        }
+        unsafe { CON_BODIES += 1 };
         let fl = [fill.0, fill.1, fill.2].map(|v| { let c = v * (1.0 / 16384.0); c * c });
         let vessel = orb::Vessel::new(fl, VESSEL_DEPTH, VESSEL_LAMBDA, VESSEL_SHARP, VESSEL_SEP, 0.0, 4.0);
         let fs = 1.0 / r;
@@ -5713,7 +5772,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             _ => None,
         };
         let t_ves = ferros_sys::now();
-        let (x0, x1, y0, y1) = cut(((x - r - 1.0) as i64, (x + r + 1.0) as i64, (y - r - 1.0) as i64, (y + r + 1.0) as i64));
+        let (x0, x1, y0, y1) = cut_b(((x - r - 1.0) as i64, (x + r + 1.0) as i64, (y - r - 1.0) as i64, (y + r + 1.0) as i64));
         // A circle whose reach meets the region only past its box (its last pixel and a half, where the vessel is nothing) has nothing to draw there.
         if x0 > x1 || y0 > y1 {
             continue;
@@ -5728,15 +5787,15 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 orb::look::grid_read_row(g, r, ORB_STEP, x0 as f32 + 0.5 - x, dy, &mut orb_row, &mut orb_col);
             }
             for px in x0..=x1 {
-                let Some(i) = at(px, py) else { continue };
+                let Some(i) = at_b(px, py) else { continue };
                 let dx = px as f32 + 0.5 - x;
                 // The box's corners lie past r + 2 (outside the circle, where the vessel is nothing): their entries are past the table's end.
-                let Some(&(ring, body)) = lut.get((libm::sqrtf(dx * dx + dy * dy) * SUB) as usize) else { continue };
-                let mut c = console[i].under(ring, BlendMode::Normal);
+                let Some(&(ring, inner)) = lut.get((libm::sqrtf(dx * dx + dy * dy) * SUB) as usize) else { continue };
+                let mut c = body[i].under(ring, BlendMode::Normal);
                 if orb_grid.is_some() {
                     c = c.under_premult(orb_row[(px - x0) as usize], BlendMode::Normal);
                 }
-                console[i] = c.under(body, BlendMode::Normal);
+                body[i] = c.under(inner, BlendMode::Normal);
             }
         }
         unsafe { VESSEL_US[orb_grid.is_some() as usize] += ferros_sys::us_since(t_ves) };
@@ -5781,8 +5840,48 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 (xj - x) * (xj - x) + (yj - y) * (yj - y) < s * s
             });
         }
+        // The bodies' region: every circle whose body changed, its disc out to its reach, emptied in the body layer; and the circles whose bodies reach into it, drawn there again.
+        for (ci, &(x, y, r, _)) in circles[..n].iter().enumerate() {
+            if !body_changed[ci] || y >= height as f32 * 0.5 {
+                continue;
+            }
+            let re = r + REACH;
+            bregion[nbreg] = (x, y, re);
+            nbreg += 1;
+            // WHY the bounds: as the console's, only the layer's own pixels are emptied.
+            for py in ((y - re) as i64).max(0)..=((y + re) as i64).min(rows as i64 - 1) {
+                for px in ((x - re) as i64).max(0)..=((x + re) as i64).min(width as i64 - 1) {
+                    let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
+                    if dx * dx + dy * dy <= re * re {
+                        body[py as usize * width + px as usize] = 0;
+                    }
+                }
+            }
+        }
+        for (cj, &(xj, yj, rj, _)) in circles[..n].iter().enumerate() {
+            body_touched[cj] = bregion[..nbreg].iter().any(|&(x, y, re)| {
+                let s = rj + REACH + re;
+                (xj - x) * (xj - x) + (yj - y) * (yj - y) < s * s
+            });
+        }
     }
     }
+    // The bodies blit under the words and numbers, pixel for pixel, over the region (front to back: what the circles show, then their bodies under it).
+    let t_blit = ferros_sys::now();
+    if nreg > 0 {
+        // WHY the bounds: the region's discs reach past the screen's sides and below the console's rows; only its own pixels are composed.
+        for py in rbox.2.max(0)..=rbox.3.min(rows as i64 - 1) {
+            let fy = py as f32 + 0.5;
+            for px in rbox.0.max(0)..=rbox.1.min(width as i64 - 1) {
+                let fx = px as f32 + 0.5;
+                if whole || region[..nreg].iter().any(|&(cx, cy, re)| (fx - cx) * (fx - cx) + (fy - cy) * (fy - cy) <= re * re) {
+                    let i = py as usize * width + px as usize;
+                    console[i] = console[i].under(body[i], BlendMode::Normal);
+                }
+            }
+        }
+    }
+    unsafe { CON_BLIT_US += ferros_sys::us_since(t_blit) };
     // The worker's own heap: this draw's tables and glyphs gone (`CON_HEAP`, the render thread's bump untouched). Measured first: the most it held (the orbs' grids below its mark included).
     unsafe { CON_PEAK = CON_PEAK.max(CON_HEAP.used()) };
     CON_HEAP.reset();
@@ -5809,12 +5908,18 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             l.dec(VESSEL_US[1] / 32);
             l.s(b" us a draw; arena ");
             l.dec(CON_PEAK as u64 >> 10);
-            l.s(b" KiB\n");
+            l.s(b" KiB; bodies drawn ");
+            l.dec(CON_BODIES);
+            l.s(b", their blit ");
+            l.dec(CON_BLIT_US / 32);
+            l.s(b" us a draw\n");
             l.flush();
             CONSOLE_US = [0; 2];
             CONSOLE_WHY = [0; 5];
             ORB_MADE = [0; 2];
             VESSEL_US = [0; 2];
+            CON_BODIES = 0;
+            CON_BLIT_US = 0;
             CON_PEAK = 1;
         }
         CON_ROWS = if whole { (0, rows) } else { (dirty_lo, dirty_hi) };
@@ -6298,6 +6403,13 @@ fn server(grants: u64) -> ! {
         plan_glass(width, height);
         // The console's circles are drawn in `BAR` over the chrome rows alone; the bars' decoded rows (`BAR_W`, its spans, its back buffers) reach the quick row's floor (quick.rs `rows`), where the row's sprites are composed (`bar_decode`). The sprites, kept for the process (quick.rs `init`).
         BAR = alloc::vec![0u64; (top + bot) * width].leak().as_mut_ptr() as usize;
+        // The console's bodies (`BODY`), the chrome rows at the top: on husky 288 × 1344 × 8 bytes, 3.0 MiB; akita 239 × 1080, 2.0 MiB.
+        let body_at = ALLOC.used();
+        BODY = alloc::vec![0u64; top * width].leak().as_mut_ptr() as usize;
+        log.s(b"display: console bodies ");
+        log.dec((ALLOC.used() - body_at) as u64 >> 10);
+        log.s(b" KiB\n");
+        log.flush();
         let top = quick::rows(width, height, top);
         BAR_TOP = top;
         quick::init(width, height);
