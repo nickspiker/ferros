@@ -3669,7 +3669,8 @@ fn arc_answer(pi: usize, op: u64, n: u64, r: Result<(u64, u64), u64>, f: &mut Fr
     let name = core::str::from_utf8(&p.name).unwrap_or("?");
     match r {
         Ok((top, was)) => {
-            if top != was {
+            // A grow or a shrink that changed the arc; ARC_SIZE answers (top, ceiling) and is no change at all (it was logged as a shrink from the ceiling until 2026-11-11: "Mahere: arc shrank G#2B400000 to G#3800000" on the Pro, ferros_rt asking the size before its first grow).
+            if (op == ARC_GROW || op == ARC_SHRINK) && top != was {
                 if op == ARC_GROW { p.grows += 1 } else { p.shrinks += 1 }
                 let line = alloc::format!("{name}: arc {} G#{was:X} to G#{top:X} ({} frames free)\n", if op == ARC_GROW { "grew" } else { "shrank" }, crate::frames::free());
                 kk.console.extend_from_slice(line.as_bytes());

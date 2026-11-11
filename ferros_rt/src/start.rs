@@ -104,16 +104,12 @@ unsafe extern "C" fn __ferros_start(grants: u64, input: u64, input_len: u64) -> 
     INPUT_OFF.store(input, Ordering::Relaxed);
     INPUT_LEN.store(input_len, Ordering::Relaxed);
     let base = sys::arc_base() as usize;
-    // The heap: the zeroed tail after .bss, up to the input (the kernel put the input at the tail's end), then the arc's slack past the input, up to the entry stack.
-    let a0 = (&raw const __bss_end) as usize;
-    let a1 = base + input as usize;
-    if a1 > a0 {
-        unsafe { crate::alloc::add_region(a0, a1 - a0) };
-    }
-    let b0 = base + (input + input_len) as usize;
-    let b1 = base + sys::arc_mask() as usize + 1 - crate::thread::ENTRY_STACK;
-    if b1 > b0 {
-        unsafe { crate::alloc::add_region(b0, b1 - b0) };
+    // The heap: the zeroed tail after .bss, up to the input (the kernel put the input at the tail's end), then the arc's slack past the input, up to the entry stack's guard page (layout.rs).
+    let top = base + sys::arc_mask() as usize + 1;
+    for (s, e) in crate::layout::heap_regions((&raw const __bss_end) as usize, base + input as usize, base + (input + input_len) as usize, top) {
+        if e > s {
+            unsafe { crate::alloc::add_region(s, e - s) };
+        }
     }
     crate::random::detect(grant_count());
     let Some((tls, _)) = crate::thread::tls::new_block() else { exit(0xDEAD) };

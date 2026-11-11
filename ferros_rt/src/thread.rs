@@ -14,8 +14,8 @@ const EXITED: u64 = 1;
 const DETACHED: u64 = 2;
 const DEAD: u64 = 3;
 
-/// The 64 KiB stack the kernel gives the entry thread at the arc's top (process.rs STACK); the heap stops below it.
-pub const ENTRY_STACK: usize = 64 * 1024;
+/// The 64 KiB stack the kernel gives the entry thread at the arc's top (process.rs STACK); the heap stops below it and the guard page under it (layout.rs).
+pub const ENTRY_STACK: usize = crate::layout::ENTRY_STACK;
 
 pub struct Block {
     state: AtomicU64,
