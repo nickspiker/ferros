@@ -159,6 +159,10 @@ pub fn rows(width: usize, height: usize, chrome_top: usize) -> usize {
 pub static OFFSET: AtomicU64 = AtomicU64::new(0);
 /// The slide's length (`slide`), for op 56's reply: the map's travel.
 pub static SLIDE: AtomicU64 = AtomicU64::new(0);
+/// The moves op 56 has made (offsets that changed), the last one's time (counter ticks) and the frame-start count then (main.rs `FRAME_STARTS`): the slide line's steps sent, and how many frames after its move each step reached the glass (main.rs `slide_shown`).
+pub static MOVES: AtomicU64 = AtomicU64::new(0);
+pub static MOVE_T: AtomicU64 = AtomicU64::new(0);
+pub static MOVE_FS: AtomicU64 = AtomicU64::new(0);
 
 /// The row as the map last set it (op 56), in two words the receive thread stores and the console's worker reads without a lock (a pass that reads one new and the other old is put right by the next):
 /// - `STATE_A`: flags in bits 32-39 (bit 0 the torch answers, bit 1 a screencap once the row is hidden); the torch's level in 40-47; the quick circle a finger holds in 48-55 (G#FF none); bits 56-63 unused (the radio press ring, drawn until 2026-11-11, when the long press went).
@@ -204,6 +208,12 @@ pub fn set(m: &[u8]) -> [u8; 3] {
     // WHY the bounds: the offset is the map's, and the bars hold the row's rows only between hidden and open (the row's band and the bars' rows end at its floor); past either end there is nothing to compose.
     let slide = SLIDE.load(Ordering::Acquire) as i32;
     let off = if off < 0 { 0 } else if off > slide { slide } else { off };
+    // A move of the slide, counted and stamped for the slide line (main.rs `slide_shown`): when it came and which frame had started then (the map moves the row as a frame starts, op 24, so the frame after is the one it is owed). Stamped before the offset is stored, so a worker that reads the new offset reads its stamp (only this thread stores either).
+    if OFFSET.load(Ordering::Acquire) != off as u64 {
+        MOVE_T.store(ferros_sys::now(), Ordering::Release);
+        MOVE_FS.store(FRAME_STARTS.load(Ordering::Acquire), Ordering::Release);
+        MOVES.fetch_add(1, Ordering::Release);
+    }
     OFFSET.store(off as u64, Ordering::Release);
     STATE_A.store((m[5] as u64) << 32 | (m[6] as u64) << 40 | (m[7] as u64) << 48 | (m[8] as u64) << 56, Ordering::Release);
     STATE_B.store(w16(9) | w16(11) << 16, Ordering::Release);
@@ -236,6 +246,10 @@ static mut SPRITES: [Option<Sprite>; N] = [const { None }; N];
 static mut BAND: (i64, i64) = (0, 0);
 /// The offset the bars were last composed at.
 static mut COMPOSED: i64 = -1;
+/// The offset the bars were last composed at (`COMPOSED`), for the console's worker: a pass whose `update` changed it is a step of the slide.
+pub fn composed() -> i64 {
+    unsafe { COMPOSED }
+}
 
 /// A circle's drawing reaches past its radius: the vessel's table runs to r + 2, its rim antialiased half a pixel more (the console's REACH), and a pixel of slack.
 const SPRITE_REACH: f32 = 3.;
@@ -323,7 +337,7 @@ fn look(k: usize, s: &Now) -> (f32, bool, Option<f32>, u64) {
 }
 
 /// Circle k drawn into its sprite at its size, front to back from empty: its ring, its word, then its vessel under them (the console's vessel, `orb::Vessel`, by a table over the radius); then decoded in place to working values.
-/// The sprites drawn since the slide's last measurement line (main.rs `SLIDE_US`).
+/// The sprites drawn since the slide's last measurement line (main.rs `slide_shown`).
 pub static RENDERS: AtomicU64 = AtomicU64::new(0);
 
 fn render(k: usize, grey: f32, on: bool, ring_share: Option<f32>, width: usize, height: usize) {

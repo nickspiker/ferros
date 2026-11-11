@@ -123,6 +123,19 @@ pub unsafe fn dither_pack(q: [uint16x8_t; 6], th: uint8x16_t, dst: *mut u32) {
 /// 16 of an app's pixels (u64 each: R, G, B working values in bits 0-15, 16-31, 32-47; bit 48 = no dither) through the ODT, dithered by `th` except where bit 48 asks not, into 16 words.
 #[inline(always)]
 pub unsafe fn sixteen_app(o: &Odt, src: *const u64, dst: *mut u32, th: uint8x16_t) {
+    unsafe { dither_codes(&codes_app(o, src), th, dst) }
+}
+
+/// 16 pixels' Q4 codes before the dither, red, green, blue (two halves each), and the lanes bit 48 keeps undithered: what every phase shares of a pixel (the dither is the only per-phase step), so a publish into several phases works the light, ODT and code out once (`codes_app`) and only dithers and packs per phase (`dither_codes`).
+#[derive(Clone, Copy)]
+pub struct Codes16 {
+    q: [uint16x8_t; 6],
+    nd: uint8x16_t,
+}
+
+/// 16 of an app's pixels (as `sixteen_app` takes them) to their codes, light, ODT and code, once.
+#[inline(always)]
+pub unsafe fn codes_app(o: &Odt, src: *const u64) -> Codes16 {
     unsafe {
         let p0 = vld4q_u16(src as *const u16);
         let p1 = vld4q_u16((src as *const u16).add(32));
@@ -131,8 +144,14 @@ pub unsafe fn sixteen_app(o: &Odt, src: *const u64, dst: *mut u32, th: uint8x16_
         let (cr, cg, cb) = (code16(o, r0, r1), code16(o, g0, g1), code16(o, b0, b1));
         let one = vdupq_n_u16(1);
         let nd = vcombine_u8(vmovn_u16(vtstq_u16(p0.3, one)), vmovn_u16(vtstq_u16(p1.3, one)));
-        dither_pack([cr.0, cr.1, cg.0, cg.1, cb.0, cb.1], vbicq_u8(th, nd), dst);
+        Codes16 { q: [cr.0, cr.1, cg.0, cg.1, cb.0, cb.1], nd }
     }
+}
+
+/// 16 codes (`codes_app`) dithered by one phase's thresholds `th` (but where they keep undithered) and packed into 16 words.
+#[inline(always)]
+pub unsafe fn dither_codes(c: &Codes16, th: uint8x16_t, dst: *mut u32) {
+    unsafe { dither_pack(c.q, vbicq_u8(th, c.nd), dst) }
 }
 
 /// The 16 thresholds of row `y`, phase `k`, for 16 pixels starting at any `x` (the pattern repeats every 16 pixels; `base` = `thresholds(y, k, ..)` at x = 0).
