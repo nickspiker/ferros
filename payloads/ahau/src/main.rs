@@ -672,6 +672,8 @@ struct Ahau {
     scale: core::cell::Cell<f32>,
     /// The last status line, drawn again at a new scale.
     status_text: core::cell::Cell<([u8; 256], usize)>,
+    /// A denial is on the status line (this device belongs to another identity): the next press puts the screen's own words back (owner, 2026-11-10: "The moment you press anything after the denied message on the attest screen it should go back to the regular message").
+    denied: core::cell::Cell<bool>,
     /// The surface text goes into: the shown one, or the back one while a band is composed there (`compose`).
     text_to: core::cell::Cell<u64>,
     /// The network page: the mode under it, the handle as it stood (put back when the page closes), the last SCAN reply, the network picked (name, length), and a JOIN sent whose link has not come.
@@ -2182,6 +2184,7 @@ impl Ahau {
                     console(self.grants, b"ahau: refused: this device belongs to another identity\n");
                     self.wipe();
                     self.status(fl(ferros_lang::Fleet::DeniedBoundOther).as_str());
+                    self.denied.set(true);
                     self.entry();
                     return;
                 }
@@ -2981,7 +2984,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, roots_gen: 0, client_seen: 0, marked: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), word_buf: [0; 512], word_len: 0, nets_seen: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0) };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, roots_gen: 0, client_seen: 0, marked: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), denied: core::cell::Cell::new(false), word_buf: [0; 512], word_len: 0, nets_seen: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0) };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     // The identity service's two threads (`roots_thread`, `client_thread`): both sleep until a handle is typed.
     ferros_sys::thread_spawn(roots_thread, unsafe { &mut *(&raw mut ROOTS_STACK) }, grants);
@@ -3079,6 +3082,11 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 let (x, y) = (held[0].1, held[0].2);
                 if !press_asked {
                     press_asked = true;
+                    // Any press after a denial: the screen's own words again, before the press does anything else.
+                    if a.denied.take() {
+                        a.status(a.prompt().as_str());
+                        a.show();
+                    }
                     if y < a.kb.top as i64 && a.net_press(x, y) {
                         a.show();
                     }
