@@ -5002,11 +5002,11 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                     Some(20) => "NR",
                     _ => "cell",
                 },
-                Corner::Wifi => "wifi",
-                Corner::Bluetooth => "bt",
-                Corner::Nfc => "nfc",
-                Corner::Gps => "gps",
-                Corner::Usb => "usb",
+                Corner::Wifi => "WiFi",
+                Corner::Bluetooth => "BT",
+                Corner::Nfc => "NFC",
+                Corner::Gps => "GPS",
+                Corner::Usb => "USB",
                 Corner::Battery if charge.n > 0 => charge.str(),
                 Corner::Battery => "batt",
                 Corner::Home | Corner::Back | Corner::Spare => "",
@@ -7841,6 +7841,8 @@ fn radio_lines(what: Corner, ms: &[u64], state: Option<i64>, lines: &mut [Txt; 9
         Corner::Bluetooth => &[m::TX_POWER],
         Corner::Nfc => &[m::FREQ],
         Corner::Gps => &[m::SATS_USED, m::SATS_SEEN, m::CN0, m::ACCURACY],
+        // USB: the link's signalling rate and its power state, as the USB process publishes them (owner, 2026-11-10: "why do I not get any stats on that? it just says usb").
+        Corner::Usb => &[m::RATE_DOWN, m::LINK_POWER],
         _ => &[],
     };
     // Not linked yet: WiFi not joined (its STATE 1), cellular not registered (no technology yet; its STATE says only whether the data call is up).
@@ -7870,6 +7872,8 @@ fn radio_lines(what: Corner, ms: &[u64], state: Option<i64>, lines: &mut [Txt; 9
             m::SATS_SEEN => l.num(v, 1, 0).s(" seen"),
             m::CN0 => l.num(v, 1000, 0).s(" dB-Hz"),
             m::ACCURACY => l.num(v, 1000, 1).s(" m"),
+            // DSTS.USBLNKST as the USB process gives it: 0 U0 (or on), 1 U1, 2 U2 (or L1), 3 U3 (or L2).
+            m::LINK_POWER => l.s(match v { 0 => "active", 1 => "standby", 2 => "asleep", 3 => "suspended", _ => continue }),
             _ => continue,
         };
         nl += 1;
