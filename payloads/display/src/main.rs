@@ -4193,7 +4193,8 @@ fn wall_step(grants: u64, width: usize, height: usize) {
                     console(grants, b"display: wallpaper: made from the person's seed\n");
                     WALL_PENDING = Some(LOAD_SEED_BYTES);
                 }
-                _ => {}
+                // Said, not silent (the Pro, 2026-11-10: the home screen without its wallpaper mid-boot, nothing in the log to say why): the load took the wallpaper off the glass and has nothing to put back.
+                _ => console(grants, b"display: wallpaper: nothing kept and no seed with the load; none shown\n"),
             }
             return;
         }
@@ -7130,6 +7131,17 @@ fn server(grants: u64) -> ! {
                     if unsafe { WALL_BUF != 0 && !WALL_RUNNING && !WALL_ON && !LOADING } {
                         wall_load(LOAD_KEPT, None);
                     }
+                }
+                // 32 `wallpaper state` (2026-11-10, the Pro's wallpaper gone with no line to say why): out[1] bits, 0 a buffer, 1 shown, 2 a load under way, 3 a drawing job running, 4 a seed waiting, 5 a load wanted; logged the same.
+                Some(32) => {
+                    let s = unsafe { (WALL_BUF != 0) as u8 | (WALL_ON as u8) << 1 | (LOADING as u8) << 2 | (WALL_RUNNING as u8) << 3 | ((*(&raw const WALL_PENDING)).is_some() as u8) << 4 | ((LOAD_WANTED != 0) as u8) << 5 };
+                    out[1] = s;
+                    len = 2;
+                    let mut l = Log { grants, buf: [0; 256], n: 0 };
+                    l.s(b"display: wallpaper state ");
+                    l.hex(s as u32);
+                    l.s(b"\n");
+                    l.flush();
                 }
                 Some(30) => {
                     // Not the flight's: it holds the plane image.
