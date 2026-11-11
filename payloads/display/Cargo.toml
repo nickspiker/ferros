@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 tatau = { path = "../../../tatau" }
 ferros_sys = { path = "../../ferros_sys" }
+# The quick row's words in the person's language (QUICK.md), read at draw time as the map reads its pages' words.
+ferros_lang = { path = "../../ferros_lang", features = ["process"] }
 # The person's default wallpaper, a Julia set from their wallpaper seed (op 42).
 wallpaper = { path = "../../wallpaper" }
 # The radio circles' orbs, the maths tools/tune's orbs page tunes (console_draw).
