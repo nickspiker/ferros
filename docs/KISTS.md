@@ -1,6 +1,6 @@
 # Kists on the map
 
-Status: designed 2026-11-07; permissions decided and the first cut built 2026-11-08 ("Permissions" and "Built" below). The owner: "should be nice round circles on the home screen for each kist." A kist is an installed app as this device runs it (GLOSSARY.md: the developer's signed capsule after the device checked, compiled and sealed it); its circle on the map is its kist circle (SHELL.md). The base OS bakes in one circle, settings (no_baked_apps): every other circle is a kist the person installed, and the map knows nothing of it until then.
+Status: designed 2026-11-07; permissions decided and the first cut built 2026-11-08 ("Permissions" and "Built" below). The owner: "should be nice round circles on the home screen for each kist." A kist is an installed app as this device runs it (GLOSSARY.md: the developer's signed capsule after the device checked, compiled and sealed it); its circle on the map is its kist circle (SHELL.md). The base OS bakes in one circle, settings (no_baked_apps): every other circle is a kist the person installed, and the map knows nothing of it until then. Kists that live on the map as live circles and are never opened (the clock, tides) are pucks, proposed in PUCKS.md (2026-11-11).
 
 ## What exists to build on
 
