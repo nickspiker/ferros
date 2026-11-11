@@ -1365,6 +1365,8 @@ static GPS_PAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 /// What `gps_watch` last read from the driver (`Map::gps_fix`'s meaning), under a sequence count (odd while it is written; it moves only when the driver's doorbell rang).
 static GPS_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static mut GPS_SNAP: Option<Option<GpsFix>> = None;
+/// What the chip has sent, as `gps_watch` last read it with the fix (payloads/gps FIX bytes 33-37): its frames << 8 | their kinds; 0 before a driver answered, or from one that does not say. Written before the sequence moves, read as the page draws.
+static GPS_HEARD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// GPS's claims as the kernel writes them here at every change (SYS_CLAIM op 4, ferros_sys::claim::doorbell; fact 85's word): the permissions and GPS pages draw "using now" again when it moves, nothing asked on a timer.
 static CLAIMS_WORD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The kists' bell as the kernel writes it here (SYS_NOT_STARTED op 1, ferros_sys::not_started::doorbell): its count moves when a kist launch init answered "started" did not start after all, or a kist that had not starts; the main loop then looks for the launch it asked (`kists_rang`), nothing asked on a timer.
@@ -1396,9 +1398,11 @@ extern "C" fn gps_watch(grants: u64) -> ! {
         match ferros_sys::claim::gps_watch(settings, count) {
             Some(c) => {
                 count = c;
-                let mut r = [0u8; 33];
+                // The fix, then the chip's frames and their kinds (38 bytes; a driver older than 2026-11-11 sends the 33 of the fix alone).
+                let mut r = [0u8; 38];
                 let n = ferros_sys::claim::gps_ask(settings, 0, &mut r);
                 let at = |k: usize| i32::from_le_bytes([r[k], r[k + 1], r[k + 2], r[k + 3]]);
+                GPS_HEARD.store(if n != ferros_sys::ERR && n >= 38 { (at(33) as u32 as u64) << 8 | r[37] as u64 } else { 0 }, Ordering::Release);
                 gps_publish(if n == ferros_sys::ERR || n < 33 {
                     None
                 } else if r[0] == 0 {
@@ -3005,7 +3009,15 @@ impl Map {
                             fact_wrap(b, &mut y, tr(Msg::DegMinSec), l.as_str());
                         }
                         // Under its heading alone, "where you are" said once (owner, 2026-11-10: it showed as the heading and again as the row's name); "using it now" the same.
-                        Some(None) => row(self, b, &mut y, small, white(), tr(Msg::NoFixYet), None),
+                        // No fix yet, and what the chip is doing meanwhile (owner, 2026-11-11: "there's zero satellites showing on this page is the thing ... I'd like to see what's actually going on in this thing"): its frames so far and their kinds, moving as it talks (the driver's doorbell moves every 64 frames). Its satellites come only with a fix message (GPS.md "What the chip sends before a fix").
+                        Some(None) => {
+                            row(self, b, &mut y, small, white(), tr(Msg::NoFixYet), None);
+                            let h = GPS_HEARD.load(core::sync::atomic::Ordering::Acquire);
+                            if h != 0 {
+                                let l = say(Say::ChipHeard { messages: h >> 8, kinds: h & 0xFF });
+                                row(self, b, &mut y, small, white(), l.as_str(), None);
+                            }
+                        }
                         None if self.gps_claimed => row(self, b, &mut y, small, white(), tr(Msg::StartingUp), None),
                         None => row(self, b, &mut y, small, white(), tr(Msg::SwitchedOff), None),
                     }

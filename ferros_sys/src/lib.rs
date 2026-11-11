@@ -236,6 +236,12 @@ pub mod zone {
     pub fn position(lat: i32, lon: i32) -> bool {
         svc(nr::ZONE, 1, lat as i64 as u64, lon as i64 as u64, 0, 0) == 0
     }
+
+    /// The zone in effect's principal place (the GPS driver only; the zones document's city, never anyone's place): latitude and longitude in arc-seconds. None with no zone in effect (a fixed offset), no zones document, or an older kernel.
+    pub fn place() -> Option<(i32, i32)> {
+        let mut b = [0u8; 8];
+        (svc(nr::ZONE, 7, off(b.as_mut_ptr()), 0, 0, 0) == 8).then(|| (i32::from_le_bytes([b[0], b[1], b[2], b[3]]), i32::from_le_bytes([b[4], b[5], b[6], b[7]])))
+    }
 }
 /// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
 pub const CORES_WORKERS: u64 = 0x00F0;

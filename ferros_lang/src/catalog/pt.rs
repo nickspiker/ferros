@@ -272,6 +272,13 @@ pub fn text(m: Msg) -> &'static str {
 pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
     match m {
         Say::SatPlace { up, round, cn0, used } => write!(o, "{up}° de elevação, {round}° de azimute, {cn0} dB-Hz{}", if used { ", em uso" } else { "" }),
+        Say::ChipHeard { messages, kinds } => {
+            o.write_str("mensagens do chip: ")?;
+            num(o, f, messages)?;
+            o.write_str(", tipos: ")?;
+            num(o, f, kinds)?;
+            o.write_str("; os satélites chegam com a primeira posição")
+        }
         Say::DaylightTime(utc) => write!(o, "{utc}, horário de verão"),
         Say::HeardMcc(mcc) => write!(o, "recebido: MCC {mcc}"),
         Say::HeardMccIn { mcc, country } => write!(o, "recebido: MCC {mcc}, {country}"),

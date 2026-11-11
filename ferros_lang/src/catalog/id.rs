@@ -272,6 +272,13 @@ pub fn text(m: Msg) -> &'static str {
 pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
     match m {
         Say::SatPlace { up, round, cn0, used } => write!(o, "{up}° tinggi, {round}° arah, {cn0} dB-Hz{}", if used { ", dipakai untuk posisi" } else { "" }),
+        Say::ChipHeard { messages, kinds } => {
+            o.write_str("pesan dari cip: ")?;
+            num(o, f, messages)?;
+            o.write_str(", jenis: ")?;
+            num(o, f, kinds)?;
+            o.write_str("; satelit muncul bersama posisi pertamanya")
+        }
         Say::DaylightTime(utc) => write!(o, "{utc}, waktu musim panas"),
         Say::HeardMcc(mcc) => write!(o, "terdengar: MCC {mcc}"),
         Say::HeardMccIn { mcc, country } => write!(o, "terdengar: MCC {mcc}, {country}"),

@@ -89,6 +89,7 @@ There is no typing: the map has no keyboard of its own (the attest screen hosts 
 - Op 4, the identity service (fgtw): x1 0 by hand, 1 automatic, 2 forget; x2/x3 its id.
 - Op 5: the state into x1/x2 (ferros_sys `zone::State`). No capability: the zone is what the clock shows whoever holds the device.
 - Op 6: every zone's id into x1/x2, each its length then its bytes; returns the list's whole length.
+- Op 7, the GPS driver (2026-11-11): the zone in effect's principal place (its `at`) into x1, 8 bytes, latitude and longitude as i32 arc-seconds; returns 8, or ERR with no zone in effect or no zones document. The driver's first aid when the person has no last fix (GPS.md "A rough start from the zone").
 
 Ops 2-4 keep the settings document and put the choice back when the vault refuses.
 

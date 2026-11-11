@@ -283,6 +283,13 @@ fn pick<'s>(n: u64, one: &'s str, few: &'s str, many: &'s str) -> &'s str {
 pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
     match m {
         Say::SatPlace { up, round, cn0, used } => write!(o, "wysokość {up}°, azymut {round}°, {cn0} dB-Hz{}", if used { ", użyty do pozycji" } else { "" }),
+        Say::ChipHeard { messages, kinds } => {
+            o.write_str("wiadomości z układu: ")?;
+            num(o, f, messages)?;
+            o.write_str(", rodzaje: ")?;
+            num(o, f, kinds)?;
+            o.write_str("; satelity pojawią się z pierwszą pozycją")
+        }
         Say::DaylightTime(utc) => write!(o, "{utc}, czas letni"),
         Say::HeardMcc(mcc) => write!(o, "odebrano: MCC {mcc}"),
         Say::HeardMccIn { mcc, country } => write!(o, "odebrano: MCC {mcc}, {country}"),

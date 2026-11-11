@@ -273,6 +273,13 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
     match m {
         // As in Photon's tr.rs, no suffix is glued to an inserted name (its last vowel is unknown when this is compiled): each sentence keeps the name bare.
         Say::SatPlace { up, round, cn0, used } => write!(o, "{up}° yükseklik, {round}° azimut, {cn0} dB-Hz{}", if used { ", konumda" } else { "" }),
+        Say::ChipHeard { messages, kinds } => {
+            o.write_str("çipten gelen mesajlar: ")?;
+            num(o, f, messages)?;
+            o.write_str(", tür: ")?;
+            num(o, f, kinds)?;
+            o.write_str("; uydular ilk konumla gelir")
+        }
         Say::DaylightTime(utc) => write!(o, "{utc}, yaz saati"),
         Say::HeardMcc(mcc) => write!(o, "duyulan: MCC {mcc}"),
         Say::HeardMccIn { mcc, country } => write!(o, "duyulan: MCC {mcc}, {country}"),
