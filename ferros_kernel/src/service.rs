@@ -2757,12 +2757,6 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                if cmd.params == b"gps off" {
-                    // `diag gps off`: the chip powered down, for a GPS driver that died with it on (gps.rs). Everything else about the chip is the driver's (payloads/gps, tools/husky-gps.sh): the kernel's bring-up tools left with the move (KERNEL-OUT.md decision 4).
-                    crate::gps::off(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
                 if cmd.params == b"aoc" {
                     // `diag aoc`: the AoC block from the AP (aoc.rs `report`). Its bring-up tools (on, off, peek, boot, log, mmu, fault, services, svc, usf, pins, gpio; gsa, ffa, trusty) went on 2026-11-01: the `sensors` switch starts it.
                     crate::aoc::report(&mut resp);
