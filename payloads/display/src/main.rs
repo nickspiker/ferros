@@ -1736,7 +1736,15 @@ static mut CUR_PHASE: usize = 0;
 
 /// The buffer the layer should show: the current phase when the temporal dither is on, else the one framebuffer.
 fn layer_fb(fb: usize) -> usize {
-    unsafe { if TEMPORAL { PHASE_BASE[CUR_PHASE] } else { fb } }
+    unsafe {
+        if TEMPORAL {
+            // The hit map's development view: its phase painted whole as it comes round (hit.rs `on_layer`), before the layer reads it.
+            hit::on_layer(CUR_PHASE);
+            PHASE_BASE[CUR_PHASE]
+        } else {
+            fb
+        }
+    }
 }
 
 fn phase_slice(k: usize, n: usize) -> &'static mut [u32] {
@@ -1836,6 +1844,9 @@ fn pub_take(job: u64) {
         } else if unsafe { PUB_KIND } == 2 {
             // The hit map written again (`hit::refresh`): this stripe's rows of it.
             hit::stripe(w, h, stripe);
+        } else if unsafe { PUB_KIND } == 3 {
+            // The hit map's development view painted into its phase (`hit::on_layer`): this stripe's rows.
+            hit::paint_stripe(w, stripe);
         } else {
             let back = unsafe { core::slice::from_raw_parts(base as *const Px, w * h) };
             publish_band(back, w, h, unsafe { &*(&raw const PUB_TABS) }, mask, stripe);
@@ -1865,8 +1876,6 @@ fn publish10x4(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask:
     if r.is_empty() {
         return;
     }
-    // The hit map is written again over `r` by this publish: a new palette for the development view (hit.rs).
-    hit::fresh();
     // A publish that is not the clock's own may carry an older clock (the back buffer's, whenever it was drawn): its next redraw is whole.
     if unsafe { CLIP_PHASE }.is_none() {
         for k in 0..PHASES {
@@ -1922,7 +1931,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
     // Which phases hold only the background at each 16-pixel block (`CLEAN`): rows are this call's own, so no other publisher touches their bytes.
     let clean_w = unsafe { CLEAN_W };
     let clean = unsafe { core::slice::from_raw_parts_mut(CLEAN as *mut u8, clean_w * height) };
-    // The hit map (hit.rs): written with the first phase this publish composes, over its columns; shown in its phase in development.
+    // The hit map (hit.rs): written with the first phase this publish composes, over its columns. In development its view's phase is painted whole from it as that phase comes round (`hit::on_layer`), never here.
     let hk = mask.trailing_zeros() as usize;
     let (hx0, hx1) = (r.x0 as usize, r.x1 as usize);
     let view = hit::view();
@@ -1936,8 +1945,6 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                 hit::row(y, hx0, hx1, width, height, false);
             }
             if view && k == hit::PHASE {
-                hit::paint(y, hx0, hx1, width, &mut row);
-                dst[y * width + hx0..y * width + hx1].copy_from_slice(&row[hx0..hx1]);
                 // The phase holds the map here, not the background: its blocks are composed afresh once the view is off.
                 for ci in y * clean_w + x0 / 16..y * clean_w + x1 / 16 {
                     clean[ci] &= !(1u8 << k | wall_bit(k));
@@ -2643,14 +2650,15 @@ fn scene_split(px: &mut [Px], width: usize, height: usize) {
     }
 }
 
-/// A job of `kind` (`PUB_KIND`: 1 the scene's list, 2 the hit map) over `r`, by stripes of rows taken by the publish workers and this thread, as `publish10x4` splits a publish; returns when every stripe is done. With no workers up, this thread does it all.
+/// A job of `kind` (`PUB_KIND`: 1 the scene's list, 2 the hit map, 3 the hit map's development view) over `r`, by stripes of rows taken by the publish workers and this thread, as `publish10x4` splits a publish; returns when every stripe is done. With no workers up, this thread does it all.
 fn stripes(kind: u8, base: usize, width: usize, height: usize, r: draw::Rect) {
     unsafe {
         let workers = PUB_UP.load(Ordering::Acquire) as usize;
         if workers == 0 {
             match kind {
                 1 => scene_stripe(core::slice::from_raw_parts_mut(base as *mut Px, width * height), width, height, r),
-                _ => hit::stripe(width, height, r),
+                2 => hit::stripe(width, height, r),
+                _ => hit::paint_stripe(width, r),
             }
             return;
         }
@@ -3697,9 +3705,7 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
     if r.is_empty() || RAW_HOLD.load(Ordering::Acquire) == 1 {
         return;
     }
-    if hits {
-        hit::fresh();
-    }
+    // The development view's phase is painted whole from the hit map as it comes round (`hit::on_layer`), never here.
     let view = hit::view() && k == hit::PHASE && unsafe { CAPTURE } == 0;
     let dst = phase_slice(k, width * height);
     unsafe {
@@ -3715,8 +3721,6 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
             hit::row(y, xa, xb, width, height, true);
         }
         if view {
-            hit::paint(y, xa, xb, width, &mut row);
-            dst[y * width + xa..y * width + xb].copy_from_slice(&row[xa..xb]);
             continue;
         }
         // The row's spans (`layout_build`): each one's chain, frontmost first, into the row.
@@ -4920,13 +4924,17 @@ extern "C" fn console_worker(arg: u64) -> ! {
             }
         }
         let t_diff = now();
-        // What changed, row by row, back against front: the columns from the first differing pixel to the last.
+        // What changed, row by row, back against front: the columns from the first differing pixel to the last, and those whose owner changed in the hit map's bars' ids (`hit::bars_changed`: an owner can change where no pixel does, the quick row's circles counting as open only on its last step), so the map is written there all the same.
         let (front, back) = unsafe { (core::slice::from_raw_parts(BAR_W as *const u64, (top + bot) * width), core::slice::from_raw_parts(BAR_W_BACK as *const u64, (top + bot) * width)) };
         let mut rects = [draw::Rect::EMPTY; 2];
         for b in lo..hi {
             let (f, k) = (&front[b * width..(b + 1) * width], &back[b * width..(b + 1) * width]);
-            let Some(x0) = (0..width).find(|&x| f[x] != k[x]) else { continue };
-            let x1 = (0..width).rev().find(|&x| f[x] != k[x]).map_or(x0, |x| x) + 1;
+            let px = (0..width).find(|&x| f[x] != k[x]).map(|x0| (x0, (0..width).rev().find(|&x| f[x] != k[x]).map_or(x0, |x| x) + 1));
+            let (x0, x1) = match (px, hit::bars_changed(b, width)) {
+                (Some(p), Some(i)) => (p.0.min(i.0), p.1.max(i.1)),
+                (Some(p), None) | (None, Some(p)) => p,
+                (None, None) => continue,
+            };
             let (which, y) = if b < top { (0, b) } else { (1, height - bot + (b - top)) };
             rects[which] = rects[which].union(draw::Rect { x0: x0 as i32, y0: y as i32, x1: x1 as i32, y1: y as i32 + 1 });
         }
@@ -8234,7 +8242,17 @@ fn server(grants: u64) -> ! {
                 tlog.dec(hit::TICKS.swap(0, Ordering::Relaxed) * 1_000_000 / freq());
                 tlog.s(b" us in ");
                 tlog.dec(hit::ROWS.swap(0, Ordering::Relaxed));
-                tlog.s(b" rows\n");
+                tlog.s(b" rows");
+                // Its development view: the frames painted whole, and their time on the render thread (the workers sharing it).
+                let paints = hit::PAINTS.swap(0, Ordering::Relaxed);
+                if paints > 0 {
+                    tlog.s(b"; its view painted ");
+                    tlog.dec(paints);
+                    tlog.s(b" times, ");
+                    tlog.dec(hit::PAINT_US.swap(0, Ordering::Relaxed) / paints);
+                    tlog.s(b" us each");
+                }
+                tlog.s(b"\n");
                 tlog.flush();
             }
             unsafe { SEC_US = [0; 8] };

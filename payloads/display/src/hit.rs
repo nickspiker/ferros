@@ -7,7 +7,7 @@
 //!   - with an app in front, its windows by the layer stack (`WINDOW` + surface): a window owns every pixel where it is not see-through, as fluor tags a widget by its shape; where no window is, nobody's;
 //!   - on the home screen: the open circle's page (`REGION`), the map's circles front first (`CIRCLE` + their index in the scene, the dummy kists included), each its disc; the plane under them all (`PLANE`).
 //! - **Read by one lookup.** Op 27 ("is this point my window's") and op 41 ("what of the system's is here") read the pixel (`at`); the geometry they kept of their own (the windows' rectangles and clear bits, the console's circles, the quick row's, the doorway, the helm's halves) went with them; it lives on only where it also draws.
-//! - **Seen in development** (owner: "a debug/devel checkbox for toggling on/off the hitmap on the fourth frame so we get three frames normal and fourth is always hitmap"): the fourth temporal phase (`PHASE`) shows the map, a flat colour per owner, instead of the image, and every redraw of the map picks a new palette (owner: "on that fourth frame, any redraw to the map should trigger a new colour palette"), so a change of ownership shows as a change of colour. Toggled by op 58 (the Developer page's checkbox, and two fingers swiped up from back and home together); never in a release build.
+//! - **Seen in development** (owner: "a debug/devel checkbox for toggling on/off the hitmap on the fourth frame so we get three frames normal and fourth is always hitmap"; then on the Pro: "make sure that fourth frame gets updated completely so I can see the whole map proper with fresh colours per rotate"): the fourth temporal phase (`PHASE`) shows the map, a flat colour per owner, instead of the image, painted whole from the map each time it comes round to the layer, in a palette new to that showing (`on_layer`), so every owner is one flat colour across the glass and a change of ownership shows from one rotation to the next. The publishes never paint into it. Toggled by op 58 (the Developer page's checkbox, and two fingers swiped up from back and home together); never in a release build.
 
 use super::*;
 use core::sync::atomic::AtomicU32;
@@ -346,11 +346,7 @@ pub fn refresh(width: usize, height: usize, r: draw::Rect) {
     if r.is_empty() {
         return;
     }
-    fresh();
     stripes(2, 0, width, height, r);
-    if VIEW.load(Ordering::Acquire) {
-        unsafe { PHASE_DIRTY[PHASE] = PHASE_DIRTY[PHASE].union(r) };
-    }
 }
 
 /// One stripe of a refresh (`pub_take`, kind 2).
@@ -361,9 +357,45 @@ pub fn stripe(width: usize, height: usize, s: draw::Rect) {
     }
 }
 
-/// A redraw of the map begins: its palette is new.
-pub fn fresh() {
+/// The phase the layer showed last (`on_layer`): the view's frame is painted as its phase comes round, once a showing.
+static mut LAST_ON_LAYER: usize = usize::MAX;
+
+/// The layer is about to show phase `k` (`layer_fb`, every present and flip). The view's phase coming round, from another phase, is painted whole from the map in a new palette (owner, 2026-11-11, on the Pro: "Can we draw the map with the same ID and make sure that fourth frame gets updated completely so I can see the whole map proper with fresh colours per rotate?"). Until then each publish painted only its own rectangle, each in a palette of its own, so the same owner showed in a different colour inside every rectangle a publish had touched: the clock's, the console's, the helm's (the "blocky areas around updates" and the bottom-left rectangle the owner saw).
+pub fn on_layer(k: usize) {
+    let was = unsafe { core::mem::replace(&mut *(&raw mut LAST_ON_LAYER), k) };
+    if k != PHASE || was == PHASE || !view() {
+        return;
+    }
+    let t0 = now();
     SEED.fetch_add(1, Ordering::Relaxed);
+    let (w, h) = unsafe { SCREEN_WH };
+    stripes(3, 0, w as usize, h as usize, draw::Rect::full(w as usize, h as usize));
+    PAINT_US.fetch_add(ferros_sys::us_since(t0), Ordering::Relaxed);
+    PAINTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The view's frames painted since the last stats line, and their µs.
+pub static PAINTS: AtomicU64 = AtomicU64::new(0);
+pub static PAINT_US: AtomicU64 = AtomicU64::new(0);
+
+/// One stripe of the view's frame (`pub_take`, kind 3): each row from the map, a colour worked out once a run of one owner, then one wide copy into the phase (non-cacheable: written, never read).
+pub fn paint_stripe(width: usize, s: draw::Rect) {
+    let seed = SEED.load(Ordering::Relaxed);
+    let dst = phase_slice(PHASE, width * unsafe { SCREEN_WH.1 } as usize);
+    // The glass's widest row (husky's 1344) fits; the publish's own rows are the same size.
+    let mut row = [0u32; 1344];
+    for y in s.y0 as usize..s.y1 as usize {
+        let ids = unsafe { core::slice::from_raw_parts((MAP as *const u16).add(y * width), width) };
+        let (mut last, mut c) = (ids[0], colour(ids[0], seed));
+        for x in 0..width {
+            if ids[x] != last {
+                last = ids[x];
+                c = colour(last, seed);
+            }
+            row[x] = c;
+        }
+        dst[y * width..(y + 1) * width].copy_from_slice(&row[..width]);
+    }
 }
 
 /// Whether the development view is on: never in a release build.
@@ -391,7 +423,7 @@ pub fn view_op(what: u8) -> [u8; 2] {
     [0, now as u8]
 }
 
-/// At a pass's top: the view switched since the last pass, so its phase owes the whole screen (on: the map in it; off: the image back), and every block's compose-once bit is forgotten (the phase's blocks held the map, not the background).
+/// At a pass's top: the view switched since the last pass, so its phase owes the whole screen (on: a publish into it writes every row of the map afresh before the view first comes round, `on_layer` painting it; off: the image back), and every block's compose-once bit is forgotten (the phase's blocks held the map, not the background).
 pub fn view_step(width: usize, height: usize) {
     let g = VIEW_GEN.load(Ordering::Acquire);
     unsafe {
@@ -406,13 +438,12 @@ pub fn view_step(width: usize, height: usize) {
     }
 }
 
-/// Row `y` of the map as the development view shows it, columns [xa, xb) into `row` (10-bit pixels for the phase): each owner a flat colour of this redraw's palette.
-pub fn paint(y: usize, xa: usize, xb: usize, width: usize, row: &mut [u32]) {
-    let ids = unsafe { core::slice::from_raw_parts((MAP as *const u16).add(y * width), width) };
-    let seed = SEED.load(Ordering::Relaxed);
-    for x in xa..xb {
-        row[x] = colour(ids[x], seed);
-    }
+/// The bars' ids that row `b` changes, front (on the glass) against back (just decoded): the columns from the first differing id to the last, for the worker's changed rectangles (`CON_RECT`), so an owner that changes with no pixel changing is published, and so written into the map, all the same.
+pub fn bars_changed(b: usize, width: usize) -> Option<(usize, usize)> {
+    let (f, k) = unsafe { (core::slice::from_raw_parts((BARS as *const u16).add(b * width), width), core::slice::from_raw_parts((BARS_BACK as *const u16).add(b * width), width)) };
+    let x0 = (0..width).find(|&x| f[x] != k[x])?;
+    let x1 = (0..width).rev().find(|&x| f[x] != k[x]).map_or(x0, |x| x) + 1;
+    Some((x0, x1))
 }
 
 /// An owner's colour in a palette: a hash of the id and the seed, one channel full so no owner reads as black, the others anywhere (10-bit codes, straight to the panel: a development view, not light).
