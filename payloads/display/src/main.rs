@@ -2858,10 +2858,12 @@ static mut RAISES: u32 = 0;
 const CLEAR: u64 = 1 << 63;
 /// The rows outside the app's circle at the top and at the bottom (`chrome_rows`): the bars' rows.
 static mut CHROME_TOP: usize = 0;
+/// The console's rows, the bars' top band: `CHROME_TOP`, or down to the quick row's floor where that is lower (quick.rs `rows`; since 2026-11-11 the row reaches past the chrome rows to touch the glass's sides).
+static mut BAR_TOP: usize = 0;
 /// Full screen (owner, 2026-11-07: slide from the home circle to the centre): the console, the helm and the app's circle hidden, only the glass's edge left (black, and orange on development builds). Toggled by op 43; the corners stay the system's, so the same gesture comes back.
 static mut FULL: bool = false;
 static mut CHROME_BOT: usize = 0;
-/// The bars (owner, 2026-11-07): the console, the circles at the top of the screen (the radios' switches and the system's indicators), over the `CHROME_TOP` rows, then the helm, home and back at the bottom, over the `CHROME_BOT` rows. They are the frontmost layer but the glass's edge, over the home screen and every app alike, in screen coordinates, so nothing transforms them. Drawn as fluor draws: front to back from empty, into fluor's 16-bit α + darkness (`G2T16`), by fluor's one `under`; redrawn only when what they show changes (`console_draw`, `helm_draw`).
+/// The bars (owner, 2026-11-07): the console, the circles at the top of the screen (the radios' switches and the system's indicators), over the `BAR_TOP` rows (the quick row with them), then the helm, home and back at the bottom, over the `CHROME_BOT` rows. They are the frontmost layer but the glass's edge, over the home screen and every app alike, in screen coordinates, so nothing transforms them. Drawn as fluor draws: front to back from empty, into fluor's 16-bit α + darkness (`G2T16`), by fluor's one `under`; redrawn only when what they show changes (`console_draw`, `helm_draw`).
 static mut BAR: usize = 1;
 /// The bars decoded once a redraw to working values with their transparency (`working`), so a publish folds the scene under them with no table walk; and each row's columns holding any of them, (from, to), so the rest of a row passes untouched.
 static mut BAR_W: usize = 1;
@@ -2891,10 +2893,10 @@ static mut CONSOLE_WHY: [u32; 5] = [0; 5];
 static mut CONSOLE_US: [u64; 2] = [0; 2];
 static mut CONSOLE_SLOW: [u64; 3] = [0; 3];
 
-/// A screen row's row in the bars (`BAR`): the console's `CHROME_TOP` rows first, then the helm's `CHROME_BOT`; none for the rows between.
+/// A screen row's row in the bars (`BAR`): the console's `BAR_TOP` rows first, then the helm's `CHROME_BOT`; none for the rows between.
 #[inline]
 fn bar_row(y: usize, height: usize) -> Option<usize> {
-    let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
+    let (top, bot) = unsafe { (BAR_TOP, CHROME_BOT) };
     if y < top { Some(y) } else if y >= height - bot { Some(top + y - (height - bot)) } else { None }
 }
 
@@ -4499,7 +4501,7 @@ fn helm_draw(width: usize, height: usize) -> bool {
         return false;
     }
     unsafe { HELM_DRAWN = true };
-    let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
+    let (top, bot) = unsafe { (BAR_TOP, CHROME_BOT) };
     let bar = unsafe { core::slice::from_raw_parts_mut((BAR as *mut u64).add(top * width), bot * width) };
     bar.fill(0);
     // The strokes' grey: the console's lit grey (working values, white at Q14).
@@ -4617,7 +4619,7 @@ extern "C" fn console_worker(arg: u64) -> ! {
         if !console && !helm {
             continue;
         }
-        let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
+        let (top, bot) = unsafe { (BAR_TOP, CHROME_BOT) };
         // The rows to decode: the console's drawn this time and the last (the back buffer is the front of two draws ago), and the helm's whole when it drew. Decoding every row of the bars each draw was a few ms of the worker's for one circle's change.
         let now_rows = if console { unsafe { CON_ROWS } } else { (0, 0) };
         let (mut lo, mut hi) = (now_rows.0.min(prev_rows.0), now_rows.1.max(prev_rows.1));
@@ -4933,7 +4935,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         CONSOLE_PARTS = parts;
     }
     let t_draw = ferros_sys::now();
-    let rows = unsafe { CHROME_TOP };
+    let rows = unsafe { BAR_TOP };
     let console = unsafe { core::slice::from_raw_parts_mut(BAR as *mut u64, rows * width) };
     // Only the circles whose own look changed are drawn again (2026-11-08: the battery's live readings every two seconds redrew every circle, the off radios' fields with them, 61 ms a draw); the first draw, or a forced one, starts from empty.
     let whole = force || !unsafe { CON_DRAWN };
@@ -5972,6 +5974,9 @@ fn server(grants: u64) -> ! {
         CHROME_TOP = top;
         CHROME_BOT = bot;
         plan_glass(width, height);
+        // The console's band reaches the quick row's floor (quick.rs `rows`): every buffer of the bars' top band below is that many rows.
+        let top = quick::rows(width, height, top);
+        BAR_TOP = top;
         BAR = alloc::vec![0u64; (top + bot) * width].leak().as_mut_ptr() as usize;
         BAR_W = alloc::vec![CLEAR; (top + bot) * width].leak().as_mut_ptr() as usize;
         BAR_SPAN = alloc::vec![(0u16, 0u16); top + bot].leak().as_mut_ptr() as usize;
