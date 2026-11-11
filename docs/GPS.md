@@ -81,6 +81,14 @@ The replay carries gpsd's aiding from the capture night: the time (ferros rewrit
 ## Location is the person's (owner, 2026-11-04)
 
 - **No GPS while nobody has attested.** The one exception is locate (AUTH.md "Locate", a plan).
+- **On demand (owner, 2026-11-10: "Wire it so GPS stays green but no visuals for satellites since we're not rx'ing and all that until something like mahere calls it or I open the GPS screen (which should turn it on whilist GPS screen is open) or Photon a friend pings for my location").** The switch on means GPS is allowed, not that the chip receives. The driver runs only while a process holds a claim (`SYS_CLAIM` 37, kernel process.rs `CLAIMS`, ferros_sys `claim`):
+  - Op 0 claims a right (only `gps` today), proved by Settings (the map's GPS page, while it shows with the screen on) or by the `gps` endpoint's send right (a kist the person granted GPS). Refused while nobody is present or GPS is switched off. Op 1 releases it. A process's end, any way, drops its claims (`end_process` and `kill_locked`).
+  - The service loop starts the driver as the claims go from none to one and kills it (chip powered down) as they go back to none, woken by the change (`sev`), never a timer. A driver that ends by itself while claimed is not started again until the claims go to none and back. Switching GPS off, or nobody present, drops every claim.
+  - Op 2 lists who claims a right (a kist by its capsule address, a system process with zeros), for Settings: the GPS and permissions pages say "using now". Fact 85 carries the count and a change count.
+  - Op 3 asks the driver FIX or SATS for a Settings holder that holds a claim, as its own CALL_LIVE call (the map has no slot left on init's grants page for a `use gps` of its own). The position passes thru; the kernel keeps none of it.
+  - A kist claims, then calls its `gps` slot with `call_live` (ERR while the driver is still replaying its session), and releases or simply ends.
+  - The console's GPS circle is lit while GPS is allowed and a person is present; its satellite rings and numbers only while the driver runs. A driver's measures and tracks are emptied as it ends, so a stopped driver's satellites are not drawn.
+  - The GPS page shows the seven Dymaxion words (vsf WorldCoord), decimal degrees and degrees, minutes and seconds once there is a fix, on the screen only.
 - **The last fix is the person's.** `gps.last` is identity class (kvault.rs `IDENTITY`): while locked the driver can neither read nor write it.
   - The old device-class entry was deleted the same night.
 - **The replays keep no place.** They held the capture's position (three `d0 81` messages each, the place they were captured), and they are device class.

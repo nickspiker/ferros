@@ -544,6 +544,8 @@ struct Process {
     domain: Option<[u8; 32]>,
     /// Launched as a kist (`spawn_kist`): its ira-derived keys are its own (`SYS_IRA`), never a system service's.
     kist: bool,
+    /// A kist's capsule address (its vault address, the blake3 of the signed capsule), as launched: what names it in the person's list, for the rights it is using (`CLAIMS`). None for a system process.
+    capsule: Option<[u8; 32]>,
 }
 
 struct Endpoint {
@@ -939,6 +941,10 @@ const SYS_DETAIL: u64 = 34;
 const SYS_ZONE: u64 = 35;
 /// lang(op, …): the language the shell speaks (lang.rs, SETTINGS.md), a packed ISO 639-3 code (vsf `wl`'s letters; 0 none, English). Op 0, Settings at x1: this device's own language, x2 the code. Op 1, Settings at x1: x2 1 this device keeps its own, 0 it follows the identity's. Op 2, the identity service (by its name, fgtw, as SYS_ZONE op 4): the identity's language, x1 the code (0: it has none). Each keeps the settings document, put back as it was when the vault refuses. The state is read from the preferences block (PREF_LANG…), not here. → 0 or ERR.
 const SYS_LANG: u64 = 36;
+/// claim(op, …): the rights in use (`CLAIMS`; owner, 2026-11-10: GPS "stays green but no visuals for satellites since we're not rx'ing ... until something like mahere calls it or I open the GPS screen ... or Photon a friend pings for my location", and "we need to be able to see what kists are using each permission"). A right by its code (ferros_kist::RIGHTS); only GPS is claimed today. Op 0: claim x1 the right, x2 the token offset of what proves the caller may use it (for GPS: Settings, the settings page's, or the `gps` endpoint's send right, a kist's granted want) → 0 (also when it held one already), ERR refused (no such right or proof, nobody present, GPS switched off). Op 1: release x1 the right → 0. Op 2: who claims x1 the right, x2 the Settings token, x3/x4 a buffer and its length → how many claims (all of them; records past the buffer are not written), each `CLAIM_REC` bytes: 0 a system process or 1 a kist, then the kist's capsule address (32 bytes, zeros for a system process); ERR without Settings. Op 3: the GPS driver asked thru the kernel for a Settings holder that holds a GPS claim (the map's page: init's grants page has no slot left for its own `use gps`): x1 the driver's op (0 FIX, 2 SATS, payloads/gps), x2 the Settings token, x3/x4 the reply's buffer and its length with CALL_LIVE set, the call the caller's own as SYS_CALL makes it → the reply's length, ERR at once when no driver is receiving yet. The position passes thru, never kept.
+const SYS_CLAIM: u64 = 37;
+/// A record of SYS_CLAIM op 2: the kind, then a capsule address.
+pub const CLAIM_REC: usize = 33;
 /// Each link's control block: words 1 to CONTROLS - 1 (word 0 is the generation, `CONTROL_GEN`), all ones until set.
 pub const CONTROLS: usize = 1 << 4;
 /// The links with a control block: the six of the facts, and the clock.
@@ -2571,7 +2577,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
             0
         }
         SYS_STATUS => {
-            let slot = [b"modem" as &[u8], b"pcie1", b"bt", b"nfc", b"gps", b"usb"].iter().position(|n| *n == p.name.as_slice());
+            // A kist never speaks for a link, whatever its name, here, in SYS_DETAIL, SYS_ZONE or SYS_LANG (2026-11-10): its name is its developer's, and with GPS started only on a claim a kist named `gps` could launch while the driver is down and speak as it.
+            let slot = [b"modem" as &[u8], b"pcie1", b"bt", b"nfc", b"gps", b"usb"].iter().position(|n| !p.kist && *n == p.name.as_slice());
             f.x[0] = match slot {
                 // The slot comes from the process: bounded so a bad one is refused, not a write past the radio's eight.
                 Some(i) if f.x[0] < 8 => {
@@ -2663,7 +2670,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
             0
         }
         SYS_ZONE => {
-            let named = |n: &[u8]| p.name.as_slice() == n;
+            let named = |n: &[u8]| !p.kist && p.name.as_slice() == n;
             let settings = |at: u64| {
                 let token = p.read(at, 32);
                 matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0)
@@ -2727,6 +2734,73 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
+        // The GPS driver asked for a Settings holder that holds a GPS claim (the map's GPS page): forwarded as the caller's own call, CALL_LIVE (the caller passes it in x4, so its registers come back as it set them), so a driver still replaying its session answers ERR at once instead of holding the page.
+        SYS_CLAIM if f.x[0] == 3 => {
+            let token = p.read(f.x[2], 32);
+            let settings = matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0);
+            let claimed = unsafe { (*(&raw const CLAIMS)).iter().any(|c| c.epoch == p.epoch && right_is_gps(c.right)) };
+            let ep = endpoint(b"gps");
+            // Only the driver's two reading ops pass: FIX and SATS. STOP (1) is the kernel's to give, by the claims.
+            if settings && claimed && matches!(f.x[1], 0 | 2) && f.x[4] & CALL_LIVE != 0 && has_receiver(ep) {
+                call_endpoint(f, cur, ep, alloc::vec![f.x[1] as u8], f.x[3], f.x[4] & !CALL_LIVE)
+            } else {
+                f.x[0] = ERR;
+                0
+            }
+        }
+        SYS_CLAIM => {
+            // WHY the bound: the right is the caller's, a code into ferros_kist::RIGHTS (`right_is_gps` reads it with `get`); past a byte it names nothing.
+            let gps = f.x[1] < 1 << 8 && right_is_gps(f.x[1] as u8);
+            let held = |at: u64| {
+                let token = p.read(at, 32);
+                p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)).filter(|o| o.1 & RIGHT_SEND != 0).map(|o| o.0)
+            };
+            let claims = unsafe { &mut *(&raw mut CLAIMS) };
+            f.x[0] = match f.x[0] {
+                0 if gps => {
+                    // The proof: Settings (the settings page), or the `gps` endpoint's send right (a kist the person granted GPS; its slot is empty, never this, when they said no).
+                    let proved = match held(f.x[2]) {
+                        Some(Object::Settings) => true,
+                        Some(Object::Endpoint(e)) => kk.endpoints[e].name == b"gps",
+                        _ => false,
+                    };
+                    // GPS is locked until a person attests (radios at attest), and a GPS switched off refuses every claim (preference 15, bit 4).
+                    let person = crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire);
+                    let allowed = pref(PREF_RADIOS_OFF) >> 4 & 1 == 0;
+                    if !(proved && person && allowed) {
+                        ERR
+                    } else {
+                        if !claims.iter().any(|c| c.epoch == p.epoch && c.right == f.x[1] as u8) {
+                            claims.push(Claim { epoch: p.epoch, right: f.x[1] as u8, capsule: p.capsule });
+                            claims_publish();
+                        }
+                        0
+                    }
+                }
+                1 => {
+                    let before = claims.len();
+                    claims.retain(|c| !(c.epoch == p.epoch && c.right as u64 == f.x[1]));
+                    if claims.len() != before {
+                        claims_publish();
+                    }
+                    0
+                }
+                2 if matches!(held(f.x[2]), Some(Object::Settings)) => {
+                    let mine: Vec<&Claim> = claims.iter().filter(|c| c.right as u64 == f.x[1]).collect();
+                    // WHY the bound: the buffer is the caller's; whole records only, as many as fit, and the count says how many there are.
+                    let fit = (f.x[4] as usize / CLAIM_REC).min(mine.len());
+                    let mut out = Vec::with_capacity(fit * CLAIM_REC);
+                    for c in &mine[..fit] {
+                        out.push(c.capsule.is_some() as u8);
+                        out.extend_from_slice(&c.capsule.unwrap_or([0; 32]));
+                    }
+                    p.write(f.x[3], &out);
+                    mine.len() as u64
+                }
+                _ => ERR,
+            };
+            0
+        }
         SYS_LANG => {
             let settings = |at: u64| {
                 let token = p.read(at, 32);
@@ -2741,7 +2815,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 1 if settings(f.x[1]) => {
                     if crate::lang::set_own(f.x[2] == 1, keep) { 0 } else { ERR }
                 }
-                2 if p.name.as_slice() == b"fgtw" && crate::lang::valid(f.x[1]) => {
+                2 if !p.kist && p.name.as_slice() == b"fgtw" && crate::lang::valid(f.x[1]) => {
                     if crate::lang::set_identity(f.x[1] as u16, keep) { 0 } else { ERR }
                 }
                 _ => ERR,
@@ -2749,7 +2823,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
             0
         }
         SYS_DETAIL => {
-            let own = LINK_NAMES.iter().position(|n| *n == p.name.as_slice());
+            let own = LINK_NAMES.iter().position(|n| !p.kist && *n == p.name.as_slice());
             f.x[0] = match f.x[0] {
                 // A driver's own document: its length bounded so it fits the link's buffer.
                 0 => match own {
@@ -3251,6 +3325,69 @@ fn fail_orphaned_calls() {
     }
 }
 
+/// One right in use: the process holding it, by its epoch (the kernel's own name for it, never one the process chose), and for a kist the capsule it was launched from (the person's list names a kist by it, so the permissions page can say which is using what).
+struct Claim {
+    epoch: u64,
+    right: u8,
+    capsule: Option<[u8; 32]>,
+}
+/// The claims held now (`SYS_CLAIM`). A claim lasts until its process releases it or ends: both end paths drop it (`claims_orphaned`), so a kist that dies, is killed or is relaunched without the right holds nothing. Per right, so another right can say "using now" the same way once something marks its use; only GPS is claimed today. Under the kernel lock.
+static mut CLAIMS: Vec<Claim> = Vec::new();
+/// GPS's claims as the service loop and the pages see them (SYS_FACTS 85): bits 0-15 how many, bits 16 and up a count of every change, so a reader knows the set moved without asking for it.
+pub static GPS_CLAIMS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Whether right `r` (ferros_kist::RIGHTS) is GPS.
+fn right_is_gps(r: u8) -> bool {
+    ferros_kist::RIGHTS.get(r as usize) == Some(&"gps")
+}
+
+/// The claims changed: GPS's count published with its change counted, and the service loop woken (`sev`) to start or stop the driver, never on a timer.
+fn claims_publish() {
+    let n = unsafe { (*(&raw const CLAIMS)).iter().filter(|c| right_is_gps(c.right)).count() } as u64;
+    let g = GPS_CLAIMS.load(core::sync::atomic::Ordering::Relaxed) >> 16;
+    GPS_CLAIMS.store((g + 1) << 16 | n, core::sync::atomic::Ordering::Release);
+    unsafe { core::arch::asm!("sev") };
+}
+
+/// A process ended (exit, fault, kill): its claims go with it.
+fn claims_orphaned(epoch: u64) {
+    let c = unsafe { &mut *(&raw mut CLAIMS) };
+    let before = c.len();
+    c.retain(|x| x.epoch != epoch);
+    if c.len() != before {
+        claims_publish();
+    }
+}
+
+/// Every GPS claim dropped (the switch turned off, or nobody present: the service loop, under the lock). → how many there were.
+pub fn gps_claims_drop() -> usize {
+    let c = unsafe { &mut *(&raw mut CLAIMS) };
+    let before = c.len();
+    c.retain(|x| !right_is_gps(x.right));
+    let n = before - c.len();
+    if n != 0 {
+        claims_publish();
+    }
+    n
+}
+
+/// GPS's claims now (`GPS_CLAIMS`' count).
+pub fn gps_claims() -> u64 {
+    GPS_CLAIMS.load(core::sync::atomic::Ordering::Acquire) & 0xFFFF
+}
+
+/// A link's measures, tracks and detail emptied as its driver ends (one shot dead, it empties nothing itself): until 2026-11-10 a stopped driver's last words stayed in the facts, and the console drew a stopped GPS's satellites as if it still heard them. Under the kernel lock.
+fn link_emptied(name: &[u8]) {
+    let Some(i) = LINK_NAMES.iter().position(|n| *n == name) else { return };
+    for w in &STATUS[i] {
+        w.store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+    }
+    for w in &TRACK[i] {
+        w.store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+    }
+    unsafe { (*(&raw mut DETAIL_LEN))[i] = 0 };
+}
+
 /// Bumped whenever a process is made, ends or is killed: what the service loop watches to act on the process table changing (the GPU's clock, service.rs), with no poll.
 pub static PROCS_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 fn end_process(pi: usize, cur: usize, value: u64) {
@@ -3287,6 +3424,8 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         surfaces_free(p.epoch);
         crate::sensorlink::ended(p.epoch);
         power_orphaned(p.epoch);
+        claims_orphaned(p.epoch);
+        link_emptied(&name);
         fail_callers(&p.cspace);
         p.cspace.retain(|c| !matches!(c.object, Object::Reply(_)));
         let at = kk.console.len();
@@ -3492,6 +3631,8 @@ fn kill_locked(name: &[u8]) -> bool {
     surfaces_free(kk.procs[i].as_ref().unwrap().epoch);
     crate::sensorlink::ended(kk.procs[i].as_ref().unwrap().epoch);
     power_orphaned(kk.procs[i].as_ref().unwrap().epoch);
+    claims_orphaned(kk.procs[i].as_ref().unwrap().epoch);
+    link_emptied(name);
     {
         let p = kk.procs[i].as_mut().unwrap();
         fail_callers(&p.cspace);
@@ -3940,6 +4081,7 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Resu
             Ok((me, _, _)) => {
                 if let Some(q) = th(me).map(|t| t.proc).and_then(|pi| kk.procs.get_mut(pi)).and_then(|q| q.as_mut()) {
                     q.kist = true;
+                    q.capsule = Some(l.capsule);
                 }
                 enqueue_back(me);
                 Ok(())
@@ -4235,7 +4377,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
         c.token = [0; 32];
     }
     let domain = ihi.map(|i| blake3::derive_key(KIST_DOMAIN_CONTEXT, &i));
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false };
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, capsule: None };
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.
     p.write_grants(TOKENS as u64, &(p.cspace.len() as u32).to_le_bytes());

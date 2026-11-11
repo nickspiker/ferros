@@ -4904,7 +4904,8 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
     for &c in time.as_bytes().iter().chain(cal.date.str().as_bytes()) {
         time_h = (time_h.rotate_left(7) ^ c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
-    let k = (((time_h >> 9) as i64) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64 ^ (off as i64) << 40;
+    // A person present or not (fact 83) too: GPS on is lit by it, its driver running or not.
+    let k = (((time_h >> 9) as i64) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64 ^ (off as i64) << 40 ^ ((facts[83] & 3) as i64) << 48;
     if !force && k == unsafe { CONSOLE_KEY } {
         return false;
     }
@@ -4960,7 +4961,8 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             Corner::Wifi => radios & 2 != 0,
             Corner::Bluetooth => radios & 4 != 0,
             Corner::Nfc => radios & 8 != 0,
-            Corner::Gps => radios & 16 != 0,
+            // GPS on demand (owner, 2026-11-10: "GPS stays green but no visuals for satellites since we're not rx'ing"): lit while it is allowed (its switch on) and a person has attested (fact 83), its driver running or not; the driver runs only while something claims it (kernel CLAIMS), and only then are its satellites drawn (`receiving` below).
+            Corner::Gps => radios & 16 != 0 || off >> 4 & 1 == 0 && facts[83] == 2,
             // The usb driver's own word (its measure STATE): connected once the host configured it.
             Corner::Usb => ferros_sys::measure_of(facts[33 + 8 * 5]) == Some((ferros_sys::measure::STATE, 2)),
             // The gauge answered (facts 1-4, the kernel's two-second poll of the MAX77759 on hsi2c_11).
@@ -4970,7 +4972,9 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         // The radio's measures, as its driver published them (facts 33 + 8 · radio): every one shown as itself, in its unit, a line each; none folded into a level, no bars (owner, 2026-11-03).
         let radio = radio_of(what);
         // GPS's satellites as its driver tracks them (the kernel's TRACKS for its link): each one's azimuth and elevation in degrees and its weight in the rings (`gps_rings`): its carrier to noise over 48 dB-Hz, a satellite in the fix at full and one only tracked at half.
-        let sats: alloc::vec::Vec<(f32, f32, f32)> = if what == Corner::Gps {
+        // Whether the GPS driver runs (fact 32 bit 4): on but unclaimed, the circle is the plain lit one, no rings and no numbers.
+        let receiving = what == Corner::Gps && radios & 16 != 0;
+        let sats: alloc::vec::Vec<(f32, f32, f32)> = if receiving {
             let mut b = [0u64; ferros_sys::TRACKS_MAX];
             // WHY the min: the count is the kernel's answer; only the words the buffer holds are read.
             let n = ferros_sys::tracks(ferros_sys::control::GPS, &mut b).min(b.len());
@@ -5005,7 +5009,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         // This circle's look, as one key: what it is, whether it runs and is switched off, its colours, and what it shows (the clock its time, the battery its readings, a radio its measures, which its orb and its words come from). Unchanged since its last draw, its pixels stay as they are.
         let mut key = 0x9E37_79B9_7F4A_7C15u64 ^ ci as u64;
         let mut mix = |v: u64| key = (key.rotate_left(7) ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        mix(live as u64 | (switched_off as u64) << 1);
+        mix(live as u64 | (switched_off as u64) << 1 | (receiving as u64) << 2);
         mix(fill.0.to_bits() as u64 | (fill.1.to_bits() as u64) << 32);
         mix(fill.2.to_bits() as u64);
         mix(ink);
@@ -5076,7 +5080,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 }
             }
             // A radio on: its most useful measures (`radio_lines`).
-            if live && !switched_off {
+            if live && !switched_off && (what != Corner::Gps || receiving) {
                 if let Some(ri) = radio {
                     nl = radio_lines(what, &facts[33 + 8 * ri..41 + 8 * ri], state, &mut lines, nl);
                 }

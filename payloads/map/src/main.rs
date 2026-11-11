@@ -1212,6 +1212,92 @@ struct Map {
     installer: installer::Installer,
     /// The Kists page's uninstall armed on a kist (the first tap of two, as "remove this device").
     uninstall_armed: Option<u8>,
+    /// The GPS page's claim (owner, 2026-11-10: "open the GPS screen (which should turn it on whilist GPS screen is open)"; ferros_sys::claim): held while the page shows, the screen is on and GPS is switched on.
+    gps_claimed: bool,
+    /// The driver as last asked thru the kernel while the page holds its claim (`gps_read`): None not answering yet (starting, its session replaying), Some(None) no fix yet, Some(Some(fix)) the fix. On the page only, never logged, dropped as the page goes.
+    gps_fix: Option<Option<GpsFix>>,
+}
+
+/// A fix as the GPS driver gives it (payloads/gps op 0 FIX): latitude and longitude in 2^-23 degrees. Its error estimate is the page's accuracy measure already (the driver's slot 1).
+#[derive(Clone, Copy)]
+struct GpsFix {
+    lat: i32,
+    lon: i32,
+}
+
+/// One of a fix's coordinates in decimal degrees, as other maps take it (owner, 2026-11-10: "the dymaxion words, lat/lon decimal and dms all for display"): arabic digits whatever the device's base, a standard written form to be read out or copied, six places (a tenth of a metre; the fix is in 2^-23 degrees, about a centimetre).
+fn degrees_decimal(l: &mut Line, v: i32) {
+    let a = v.unsigned_abs() as u64;
+    // Millionths of a degree, rounded at the half: 2^-23 degrees times 10^6, plus half of 2^23, over 2^23.
+    let micro = (a * 1_000_000 + (1 << 22)) >> 23;
+    let _ = write!(l, "{}{}.{:06}", if v < 0 { "-" } else { "" }, micro / 1_000_000, micro % 1_000_000);
+}
+
+/// One of a fix's coordinates in degrees, minutes and seconds with its hemisphere (N S for a latitude, E W for a longitude), seconds to a tenth (three metres or less), arabic digits as `degrees_decimal`.
+fn degrees_dms(l: &mut Line, v: i32, pos: char, neg: char) {
+    let a = v.unsigned_abs() as u64;
+    // Tenths of an arcsecond, rounded: 2^-23 degrees times 36000, plus half of 2^23, over 2^23.
+    let t = (a * 36_000 + (1 << 22)) >> 23;
+    let _ = write!(l, "{}\u{b0} {:02}\u{2032} {:02}.{}\u{2033} {}", t / 36_000, t / 600 % 60, t / 10 % 60, t % 10, if v < 0 { neg } else { pos });
+}
+
+impl Map {
+    /// Who is using right `right` now (ferros_sys::claim::users; owner, 2026-11-10: "we need to be able to see what kists are using each permission"): each claim's kist capsule, None for a system process (this page's own). At most sixteen: more than the page lists. Read at each draw of the pages that show it, one call; the kernel keeps nothing for the map to ask about later.
+    fn users(&self, right: u64) -> Vec<Option<[u8; 32]>> {
+        use ferros_sys::claim::REC;
+        let mut buf = [0u8; REC << 4];
+        let n = ferros_sys::claim::users(cap(self.grants, S_SETTINGS), right, &mut buf).unwrap_or(0);
+        // WHY the min: the count is every claim, the buffer holds sixteen records.
+        buf.chunks_exact(REC).take(n.min(1 << 4)).map(|r| (r[0] == 1).then(|| r[1..REC].try_into().unwrap())).collect()
+    }
+
+    /// A claimant as a person reads it: a kist by its name in their list, a system process as "settings" (the only one that claims today), a kist the list no longer names (a capsule updated while it ran) by its address's first bytes.
+    fn user_name(&self, u: &Option<[u8; 32]>, l: &mut Line) {
+        match u {
+            None => {
+                l.s(tr(Msg::Settings));
+            }
+            Some(c) => match self.kists.kists.iter().find(|k| &k.capsule == c) {
+                Some(k) => {
+                    l.s(&k.name);
+                }
+                None => {
+                    let _ = write!(l, "G#{:02X}{:02X}{:02X}{:02X}", c[0], c[1], c[2], c[3]);
+                }
+            },
+        }
+    }
+
+    /// A kist's want as its switch's label on the permissions and GPS pages: its name, "not asked yet" while unanswered, "using now" while it holds a claim on the right (`users`).
+    fn want_label(&self, k: &ferros_kist::Kist, j: usize, using: &[Option<[u8; 32]>]) -> Line {
+        if k.wants[j].answer.is_none() {
+            say(Say::NotAskedYet(&k.name))
+        } else if using.iter().any(|u| u.as_ref() == Some(&k.capsule)) {
+            say(Say::UsingNow(&k.name))
+        } else {
+            let mut l = Line::new();
+            l.s(&k.name);
+            l
+        }
+    }
+
+    /// The GPS driver's fix asked thru the kernel (ferros_sys::claim::gps_ask) for the page holding its claim: `gps_fix` as above.
+    fn gps_read(&mut self) {
+        if !self.gps_claimed {
+            self.gps_fix = None;
+            return;
+        }
+        let mut r = [0u8; 33];
+        let n = ferros_sys::claim::gps_ask(cap(self.grants, S_SETTINGS), 0, &mut r);
+        let at = |k: usize| i32::from_le_bytes([r[k], r[k + 1], r[k + 2], r[k + 3]]);
+        self.gps_fix = if n == ferros_sys::ERR || n < 33 {
+            None
+        } else if r[0] == 0 {
+            Some(None)
+        } else {
+            Some(Some(GpsFix { lat: at(9), lon: at(13) }))
+        };
+    }
 }
 
 /// The clock page's zone picker (owner, 2026-11-10: "auto/manual zone, picker, all that"): every zone's id as the kernel lists them (SYS_ZONE op 6, the zones document's order), browsed by region (the IANA id's first part: America, Europe, …) then by place. No typing: the map has no keyboard of its own (the attest screen hosts the one there is), so a list it is.
@@ -2699,6 +2785,53 @@ impl Map {
                     b.text(cx, *y, note as u16, dim(), 1, t);
                     *y += uu(2, 1);
                 };
+                // GPS: where you are, once the driver this page started (its claim) has a fix (owner, 2026-11-10: "bring up GPS and have the dymaxion words, lat/lon decimal and dms all for display"); then who is using GPS now, this page among them. On the screen only: none of it is logged or kept.
+                if k == 4 {
+                    header(b, &mut y, tr(Msg::RightGps));
+                    match self.gps_fix {
+                        Some(Some(fx)) => {
+                            let deg = |v: i32| v as f64 / (1u64 << 23) as f64;
+                            // The seven Dymaxion words (vsf WorldCoord): the point to a few millimetres, as words to say aloud.
+                            let words = ferros_kist::vsf::types::WorldCoord::from_lat_lon(deg(fx.lat), deg(fx.lon)).to_words();
+                            fact_wrap(b, &mut y, tr(Msg::PositionWords), &words);
+                            let mut l = Line::new();
+                            degrees_decimal(&mut l, fx.lat);
+                            l.s(", ");
+                            degrees_decimal(&mut l, fx.lon);
+                            fact_wrap(b, &mut y, tr(Msg::LatLon), l.as_str());
+                            let mut l = Line::new();
+                            degrees_dms(&mut l, fx.lat, 'N', 'S');
+                            l.s(", ");
+                            degrees_dms(&mut l, fx.lon, 'E', 'W');
+                            fact_wrap(b, &mut y, tr(Msg::DegMinSec), l.as_str());
+                        }
+                        Some(None) => fact(b, &mut y, tr(Msg::RightGps), tr(Msg::NoFixYet)),
+                        None if self.gps_claimed => fact(b, &mut y, tr(Msg::RightGps), tr(Msg::StartingUp)),
+                        None => fact(b, &mut y, tr(Msg::RightGps), tr(Msg::SwitchedOff)),
+                    }
+                    header(b, &mut y, tr(Msg::UsingNow));
+                    let users = self.users(ferros_sys::claim::GPS);
+                    if users.is_empty() {
+                        fact(b, &mut y, tr(Msg::UsingNow), tr(Msg::NoneYet));
+                    }
+                    for u in &users {
+                        let mut l = Line::new();
+                        self.user_name(u, &mut l);
+                        row(self, b, &mut y, small, white(), l.as_str(), None);
+                    }
+                    // Who may use it (owner, 2026-11-08: "who has GPS"): each kist that wants GPS, its switch the person's answer as on the permissions page, "using now" by its name while it holds a claim.
+                    let ks = self.kists.kists.clone();
+                    let gps = ferros_sys::claim::GPS as u8;
+                    if ks.iter().any(|kk| kk.wants.iter().any(|w| w.right == gps)) {
+                        header(b, &mut y, tr(Msg::PagePermissions));
+                    }
+                    for (ki, kk) in ks.iter().enumerate() {
+                        if let Some(j) = kk.wants.iter().position(|w| w.right == gps) {
+                            let l = self.want_label(kk, j, &users);
+                            mark(self, b, &mut y, 50, l.as_str(), kk.wants[j].answer.is_some_and(|a| a.0), Some(Choice::Answer(ki as u8, j as u8)));
+                        }
+                    }
+                }
                 let mut any = false;
                 for (g, gname) in GROUPS.iter().enumerate() {
                     let mut first = true;
@@ -3148,19 +3281,15 @@ impl Map {
             "permissions" => {
                 // Each right the other way round (owner, 2026-11-08: "who has GPS", "who has the network"), with the person's default for every new kist first: what its switch starts at in a first-launch question (out of the box, off).
                 let ks = self.kists.kists.clone();
+                // And who is using each right now (owner, 2026-11-10: "we need to be able to see what kists are using each permission"): a kist holding a claim on it says so by its name (`users`). Only GPS is claimed today; a right nothing marks the use of lists no one as using it.
                 for r in 0..ferros_kist::RIGHTS.len() {
                     row(self, b, &mut y, uu(3, 2), white(), right_name(r), None);
                     let on = self.kists.defaults >> r & 1 == 1;
                     mark(self, b, &mut y, 50, tr(Msg::NewKistsStartOn), on, Some(Choice::Default(r as u8)));
+                    let using = if r as u64 == ferros_sys::claim::GPS { self.users(r as u64) } else { Vec::new() };
                     for (ki, k) in ks.iter().enumerate() {
                         if let Some(j) = k.wants.iter().position(|w| w.right as usize == r) {
-                            let l = if k.wants[j].answer.is_none() {
-                                say(Say::NotAskedYet(&k.name))
-                            } else {
-                                let mut l = Line::new();
-                                l.s(&k.name);
-                                l
-                            };
+                            let l = self.want_label(k, j, &using);
                             mark(self, b, &mut y, 50, l.as_str(), k.wants[j].answer.is_some_and(|a| a.0), Some(Choice::Answer(ki as u8, j as u8)));
                         }
                     }
@@ -3963,6 +4092,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         zone_pick: None,
         zone_note: None,
         installer: installer::Installer::default(),
+        gps_claimed: false,
+        gps_fix: None,
         uninstall_armed: None,
     };
     let kept = map.load_places_near();
@@ -4125,6 +4256,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut fleet_shown = false;
     // The installer's copy last taken, the finished jobs in it (a kist installed or uninstalled: the circles follow), and whether the Kists page showed at the last pass (opening it reads the directory again).
     let (mut installer_seen, mut installer_done, mut kists_shown) = (0u32, 0u64, false);
+    // GPS's claims as the permissions page was last drawn with them (fact 85, its change count): a change draws it again.
+    let mut claims_seen = 0u64;
+    // Whether the GPS page showed (with GPS on and the screen on) at the last pass: its claim follows it.
+    let mut gps_shown = false;
     let mut last_pass = now();
     let mut draw_us = 0u64;
     let mut move_us = 0u64;
@@ -4214,6 +4349,25 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 let _ = installer::ask(grants, &[1]);
             }
         }
+        // The GPS page holds a GPS claim while it shows (owner, 2026-11-10: "open the GPS screen (which should turn it on whilist GPS screen is open)"), GPS switched on and the screen on: the kernel starts the driver for the first claim and stops it after the last (SYS_CLAIM). Claimed as the page comes, released as it goes; the switch turned off drops the claim in the kernel, and turned on again the page claims anew.
+        let shown = matches!(map.view, View::Open(_)) && PAGES[map.page] == "GPS" && ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) >> 4 & 1 == 0 && ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) != 1;
+        if shown != gps_shown {
+            gps_shown = shown;
+            if shown {
+                map.gps_claimed = ferros_sys::claim::claim(ferros_sys::claim::GPS, cap(grants, S_SETTINGS));
+                // Refused (no person present, which the map never runs without): not asked again until the page shows again.
+                if !map.gps_claimed {
+                    console(grants, b"map: the GPS page's claim was refused\n");
+                }
+            } else {
+                ferros_sys::claim::release(ferros_sys::claim::GPS);
+                map.gps_claimed = false;
+            }
+            map.gps_read();
+            if !map.settling {
+                map.draw();
+            }
+        }
         // A fleet device's departure waiting on this person: a new one opens the Fleet page on it, Approve or Deny ready (owner, 2026-11-10: "go right to the fleet page and have the unbind request 'Approve' or 'Deny' screen ready to go"). Not over an app in front, and not while a finger is down or the map is settling: a request waiting opens the page once the fingers lift.
         if !map.app_front && !down && !map.settling {
             let ask = map.fleet.depart.filter(|d| d.1 == 0).map(|d| (d.0, map.fleet.depart_name, map.fleet.depart_name_n));
@@ -4235,7 +4389,20 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         // The open settings' live facts (About, Connections, each link's page, the clock): drawn again once a second while they show (live data, not motion).
         if matches!(map.view, View::Open(_)) && matches!(PAGES[map.page], "about" | "connections" | "cellular" | "WiFi" | "Bluetooth" | "NFC" | "GPS" | "USB" | "clock") && !map.settling && now().wrapping_sub(last_facts) > freq() {
             last_facts = now();
+            // The GPS page: the driver's fix asked with the facts, drawn with them.
+            if PAGES[map.page] == "GPS" {
+                map.gps_read();
+            }
             map.draw();
+        }
+        // The permissions page: drawn again when the GPS claims change (fact 85's change count), looked at with the other pages' facts, once a second while it shows.
+        if matches!(map.view, View::Open(_)) && PAGES[map.page] == "permissions" && !map.settling && now().wrapping_sub(last_facts) > freq() {
+            last_facts = now();
+            let c = ferros_sys::facts().0[ferros_sys::claim::FACT] >> 16;
+            if c != claims_seen {
+                claims_seen = c;
+                map.draw();
+            }
         }
 
         // An app in front (a bridge spawn: Hive, for one), asked of the display eight times a second.

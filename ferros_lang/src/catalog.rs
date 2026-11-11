@@ -180,6 +180,18 @@ messages! {
     /// Two lines.
     BandNote,
     NothingToSetYet,
+    // The GPS page (owner, 2026-11-10): where the device is (under `RightGps`, "where you are"), and who is using GPS now.
+    /// The seven Dymaxion words (vsf WorldCoord) that name the place.
+    PositionWords,
+    /// "latitude, longitude", in decimal degrees.
+    LatLon,
+    /// "degrees, minutes, seconds".
+    DegMinSec,
+    NoFixYet,
+    /// The GPS driver started for the page and not answering yet.
+    StartingUp,
+    /// The heading over who is using GPS now.
+    UsingNow,
 
     // ---- the number bases (Units, the clock's "units" fact) ----
     BaseArabic,
@@ -414,6 +426,8 @@ pub enum Say<'a> {
     // ---- Kists, Permissions ----
     /// A right (or a kist's name) whose question was never asked: "the screen (not asked yet)".
     NotAskedYet(&'a str),
+    /// A kist using a right now (it holds a claim on it, ferros_sys::claim): "Mahere (using now)".
+    UsingNow(&'a str),
     // ---- the attest screen ----
     /// A network's signal, its dBm written already in the person's base.
     Signal(&'a str),
