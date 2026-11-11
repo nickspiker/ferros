@@ -16,7 +16,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use core::sync::atomic::{AtomicU64, AtomicUsize};
 use ferros_store::{Domain, Nonces, Opener, Sealed, Store, Writer};
 use ferros_sys::{cap, console, freq, now, ERR};
@@ -365,8 +365,12 @@ static BOARD_NEXT: AtomicU64 = AtomicU64::new(0);
 static BOARD_DONE: AtomicU64 = AtomicU64::new(0);
 /// The batch's pieces (their address) and the sealing key.
 static mut BOARD: (usize, [u8; 32]) = (0, [0; 32]);
+/// The batch's piece count, all of which its server will hand over (`Opener::ready`); bits 16-31 of BOARD_NEXT count those handed over so far.
+static BOARD_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Helpers waiting on BOARD_NEXT: a piece handed over wakes one only when one waits (each wake is a syscall under the kernel lock).
+static BOARD_WAITING: AtomicU64 = AtomicU64::new(0);
 
-/// Claim and open the board's pieces until none is left to claim.
+/// Claim and open the board's pieces until none handed over is left to claim.
 fn work_board() {
     loop {
         let c = BOARD_NEXT.load(Acquire);
@@ -378,9 +382,9 @@ fn work_board() {
             continue;
         }
         let (at, key) = unsafe { (BOARD.0, &*(&raw const BOARD.1)) };
-        // SAFETY: piece `next` < n of the batch this claim is of: its server waits for every claimed piece (BOARD_DONE) before the slice or the key leave the board, and no other thread claims the same index.
+        // SAFETY: piece `next` < n was handed over in the batch this claim is of (the claim compares the batch too): its server waits for every piece of the batch (BOARD_DONE) before the slots or the key leave the board, it no longer touches a slot once handed over, and no other thread claims the same index.
         ferros_store::open_piece(key, unsafe { &mut *(at as *mut Sealed).add(next as usize) });
-        if BOARD_DONE.fetch_add(1, AcqRel) + 1 == n {
+        if BOARD_DONE.fetch_add(1, AcqRel) + 1 == BOARD_TOTAL.load(Acquire) {
             ferros_sys::wake(&BOARD_DONE, 1);
         }
     }
@@ -390,29 +394,66 @@ extern "C" fn helper(_: u64) -> ! {
     loop {
         let c = BOARD_NEXT.load(Acquire);
         work_board();
-        ferros_sys::wait(&BOARD_NEXT, c, 0);
+        // Counted as waiting before the word is looked at again (sequentially consistent, against the server's hand-over then its look at the count): either the server sees this helper waiting and wakes it, or this helper sees the piece and does not sleep.
+        BOARD_WAITING.fetch_add(1, SeqCst);
+        if BOARD_NEXT.load(SeqCst) == c {
+            ferros_sys::wait(&BOARD_NEXT, c, 0);
+        }
+        BOARD_WAITING.fetch_sub(1, SeqCst);
     }
 }
 
-/// The serving thread's opener: a lone piece here, more on the board with the helpers (the server opens its share too), waited for, the key wiped.
-struct Helpers;
+/// The serving thread's opener (streamed, `ferros_store::Opener`): each piece goes on the board as it is fetched, and the helpers open it while the serving thread fetches the next (the fetch, with every block's BLAKE3 guard, is the engine's and runs on this thread alone; before 2026-11-11 the helpers sat idle through it and the fetch through the opening); at the end this thread opens what is still unclaimed, waits for the rest and wipes the key. A batch of one piece is opened here at `finish`: the board's hand-offs would cost more than the piece.
+#[derive(Default)]
+struct Helpers {
+    /// The batch is one piece, kept off the board.
+    solo: bool,
+    /// When the batch began, for the opening's measure.
+    t0: u64,
+}
 
 impl Opener for Helpers {
     fn open_all(&mut self, seal: &[u8; 32], pieces: &mut [Sealed]) {
+        let n = pieces.len();
+        let at = pieces.as_mut_ptr();
+        // SAFETY: the slice stays borrowed here until `finish` returns, and nothing else touches it.
+        unsafe { self.start(seal, at, n) };
+        for i in 0..n {
+            self.ready(i);
+        }
+        unsafe { self.finish(seal, at, n) };
+    }
+    unsafe fn start(&mut self, seal: &[u8; 32], pieces: *mut Sealed, n: usize) {
+        self.t0 = now();
+        self.solo = n == 1;
+        if self.solo {
+            return;
+        }
+        unsafe { BOARD = (pieces as usize, *seal) };
+        BOARD_DONE.store(0, Release);
+        BOARD_TOTAL.store(n as u64, Release);
+        let batch = (BOARD_NEXT.load(Acquire) >> 32) + 1;
+        BOARD_NEXT.store(batch << 32, SeqCst);
+    }
+    fn ready(&mut self, _i: usize) {
+        if self.solo {
+            return;
+        }
+        // Handed over in order: slot i is the (i + 1)-th.
+        BOARD_NEXT.fetch_add(1 << 16, SeqCst);
+        if BOARD_WAITING.load(SeqCst) != 0 {
+            ferros_sys::wake(&BOARD_NEXT, 1);
+        }
+    }
+    unsafe fn finish(&mut self, seal: &[u8; 32], pieces: *mut Sealed, n: usize) {
         let t = now();
-        let n = pieces.len() as u64;
-        if n == 1 {
-            ferros_store::open_piece(seal, &mut pieces[0]);
+        if self.solo {
+            ferros_store::open_piece(seal, unsafe { &mut *pieces });
         } else {
-            unsafe { BOARD = (pieces.as_mut_ptr() as usize, *seal) };
-            BOARD_DONE.store(0, Release);
-            let batch = (BOARD_NEXT.load(Acquire) >> 32) + 1;
-            BOARD_NEXT.store(batch << 32 | n << 16, Release);
-            ferros_sys::wake(&BOARD_NEXT, HELPERS as u64);
             work_board();
             loop {
                 let d = BOARD_DONE.load(Acquire);
-                if d >= n {
+                if d >= n as u64 {
                     break;
                 }
                 ferros_sys::wait(&BOARD_DONE, d, 0);
@@ -422,8 +463,10 @@ impl Opener for Helpers {
                 BOARD.0 = 0;
             }
         }
+        let opened: u64 = (0..n).map(|i| unsafe { (*pieces.add(i)).bytes.len() as u64 }).sum();
         OPEN_TICKS.fetch_add(now() - t, Relaxed);
-        OPEN_BYTES.fetch_add(pieces.iter().map(|p| p.bytes.len() as u64).sum(), Relaxed);
+        OPEN_SPAN.fetch_add(now() - self.t0, Relaxed);
+        OPEN_BYTES.fetch_add(opened, Relaxed);
     }
 }
 
@@ -433,6 +476,8 @@ static mut ON_BIG: bool = false;
 /// Opening, measured for the read report: the wall time of each request's opening, and the sealed bytes opened.
 static OPEN_TICKS: AtomicU64 = AtomicU64::new(0);
 static OPEN_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Opening streamed beside the fetch (2026-11-11): `OPEN_TICKS` is the part after the fetch (the serving thread opening what is left and waiting for the helpers), this the whole span from the batch's first piece to its last opened.
+static OPEN_SPAN: AtomicU64 = AtomicU64::new(0);
 
 /// The counters a read report takes the difference of: block reads (their calls' time, blocks, calls; the kernel's own split of the calls, in the UFS commands and copying into this process), blocks the read-ahead gave, opening (time, sealed bytes), and the store's fetch and copy (`ferros_store::ReadTicks`).
 #[derive(Clone, Copy)]
@@ -444,25 +489,26 @@ struct Counts {
     kcopy: u64,
     hits: u64,
     open: u64,
+    span: u64,
     opened: u64,
     fetch: u64,
     copy: u64,
 }
 
 impl Counts {
-    const ZERO: Counts = Counts { io: 0, blocks: 0, calls: 0, cmd: 0, kcopy: 0, hits: 0, open: 0, opened: 0, fetch: 0, copy: 0 };
+    const ZERO: Counts = Counts { io: 0, blocks: 0, calls: 0, cmd: 0, kcopy: 0, hits: 0, open: 0, span: 0, opened: 0, fetch: 0, copy: 0 };
     fn now(st: ferros_store::ReadTicks) -> Counts {
         let l = |a: &AtomicU64| a.load(Relaxed);
-        Counts { io: l(&IO_TICKS), blocks: l(&IO_BLOCKS), calls: l(&IO_CALLS), cmd: l(&IO_CMD), kcopy: l(&IO_COPY), hits: l(&AHEAD_HITS), open: l(&OPEN_TICKS), opened: l(&OPEN_BYTES), fetch: st.fetch, copy: st.copy }
+        Counts { io: l(&IO_TICKS), blocks: l(&IO_BLOCKS), calls: l(&IO_CALLS), cmd: l(&IO_CMD), kcopy: l(&IO_COPY), hits: l(&AHEAD_HITS), open: l(&OPEN_TICKS), span: l(&OPEN_SPAN), opened: l(&OPEN_BYTES), fetch: st.fetch, copy: st.copy }
     }
     /// What happened between `self` and `then`, counter by counter (each only grows).
     fn since(&self, then: &Counts) -> Counts {
-        Counts { io: self.io - then.io, blocks: self.blocks - then.blocks, calls: self.calls - then.calls, cmd: self.cmd - then.cmd, kcopy: self.kcopy - then.kcopy, hits: self.hits - then.hits, open: self.open - then.open, opened: self.opened - then.opened, fetch: self.fetch - then.fetch, copy: self.copy - then.copy }
+        Counts { io: self.io - then.io, blocks: self.blocks - then.blocks, calls: self.calls - then.calls, cmd: self.cmd - then.cmd, kcopy: self.kcopy - then.kcopy, hits: self.hits - then.hits, open: self.open - then.open, span: self.span - then.span, opened: self.opened - then.opened, fetch: self.fetch - then.fetch, copy: self.copy - then.copy }
     }
 }
 
 /// A large value read from its first byte to its last, measured stage by stage (owner, 2026-11-08: "Report MB/s per stage"; 2026-11-11: "2.9s for a 24MB read is embarassing", so one device run says where every millisecond goes). Two console lines when the read reaches the value's end:
-/// - `vault: read …`: the value, the requests, first to last; serving split into the fetch (manifestus's index walk to each piece, each block's BLAKE3 guard and decode, the furrows joined: `ReadTicks::fetch` less the block reads inside it), the block reads, the opening (XChaCha20-Poly1305 on this thread and the helpers), the copy out (into the reply, the opened pieces wiped) and the rest (the head, the bookkeeping); and the time between requests (the kernel's stamp and hand-offs both ways, the reply's copy into the reader, the reader's own work).
+/// - `vault: read …`: the value, the requests, first to last; serving split into the fetch (manifestus's index walk to each piece, each block's BLAKE3 guard and decode, the furrows joined, the pieces handed to the helpers: `ReadTicks::fetch` less the block reads inside it), the block reads, the opening left after them (XChaCha20-Poly1305 on this thread and the helpers; the helpers open beside the fetch, and "all" is each batch from its first piece handed over to its last opened), the copy out (into the reply, the opened pieces wiped) and the rest (the head, the bookkeeping); and the time between requests (the kernel's stamp and hand-offs both ways, the reply's copy into the reader, the reader's own work).
 /// - `vault: read blocks …`: the block reads' bytes and kernel calls, the kernel's split of those calls (in the UFS commands, copying into this process, the rest of the syscalls), and the blocks the read-ahead gave without a call.
 struct Meter {
     on: bool,
@@ -501,7 +547,7 @@ impl Meter {
         let fetch = ms(c.fetch) as i64 - ms(c.io) as i64;
         let rest = ms(self.serving) as i64 - ms(c.fetch) as i64 - ms(c.open) as i64 - ms(c.copy) as i64;
         say!(
-            "vault: read {} B in {} requests, {} ms first to last ({} MB/s): serving {} ms = fetch {} + block reads {} + opening {} ({} MB/s, {} cores) + copy out {} + rest {}; between requests {} ms",
+            "vault: read {} B in {} requests, {} ms first to last ({} MB/s): serving {} ms = fetch {} + block reads {} + opening after them {} (all {} ms, {} MB/s, {} cores) + copy out {} + rest {}; between requests {} ms",
             whole,
             self.requests,
             ms(wall),
@@ -510,7 +556,8 @@ impl Meter {
             fetch,
             ms(c.io),
             ms(c.open),
-            rate(c.opened, c.open),
+            ms(c.span),
+            rate(c.opened, c.span),
             HELPERS + 1,
             ms(c.copy),
             rest,
@@ -770,7 +817,7 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
                 }
                 let before = Counts::now(store.read_ticks());
                 unsafe { AHEAD_ON = bulk };
-                let r = store.read_with(&d, name, offset, &mut out[8..8 + len], &mut Helpers);
+                let r = store.read_with(&d, name, offset, &mut out[8..8 + len], &mut Helpers::default());
                 unsafe { AHEAD_ON = false };
                 let done = !matches!(r, Ok(Some(whole)) if bulk && offset + (len as u64) < whole);
                 if done && unsafe { ON_BIG } {
