@@ -4168,7 +4168,14 @@ impl Map {
         "map: back: zoomed out to every circle"
     }
 
-    /// Home's swipe, after the app in front went behind: the plane flies out to every circle at the turn that fits them largest (`home_turned`), an open circle closing on the way as a tap outside it does.
+    /// Home's swipe with an app in front (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls"): the app in front full screen or not (display op 43, as the quick row's middle circle switches it), the kist staying in front. Full screen hides ferros's controls (the console, the helm, the app's circle); the corners outside the circle stay the system's on the hit map (hit.rs `bars_row`, written whatever `FULL` is), undrawn, so this same swipe brings them back. The new state, or None with no app in front (the display's refusal, status 3: its word on what is in front, not the map's).
+    fn full_switch(&mut self) -> Option<bool> {
+        let mut r = [0u8; 4];
+        let n = call(self.display, &[43], &mut r);
+        (n >= 2 && n != ferros_sys::ERR && r[0] == 0).then_some(r[1] == 1)
+    }
+
+    /// Home's swipe on the home screen (owner, 2026-11-11: "on the home screen it auto-fits"): the plane flies out to every circle at the turn that fits them largest (`home_turned`), an open circle closing on the way as a tap outside it does.
     fn home_fly(&mut self) {
         if matches!(self.view, View::Open(_)) {
             self.back = None;
@@ -5381,7 +5388,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             if (corner == 8 || corner == 9) && held >= 1 && pair != 1 {
                 corner_at = (cur[ids[0]].1, cur[ids[0]].2);
-                // The swipe inward: the finger's travel along the line from where it landed toward the screen's centre. Past a twelfth of the screen's harmonic span (2wh/(w+h); owner, 2026-11-07), the corner acts, once a touch (WINDOWS.md "The helm"): home, behind and out to every circle turned to fit; back, the kist before.
+                // The swipe inward: the finger's travel along the line from where it landed toward the screen's centre. Past a twelfth of the screen's harmonic span (2wh/(w+h); owner, 2026-11-07), the corner acts, once a touch (WINDOWS.md "The helm"): home, the app in front full screen or not, or with none out to every circle turned to fit; back, the kist before.
                 let (ux, uy) = ((w / 2 - corner_from.0) as f64, (h / 2 - corner_from.1) as f64);
                 let inward = ((corner_at.0 - corner_from.0) as f64 * ux + (corner_at.1 - corner_from.1) as f64 * uy) / libm::sqrt(ux * ux + uy * uy);
                 let span = (2 * w * h) as f64 / (w + h) as f64;
@@ -5390,11 +5397,16 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 map.helm_light(corner, lvl as f32);
                 if !corner_done && inward > span / 12. {
                     corner_done = true;
-                    // The helm's swipes (owner, 2026-11-11): home's, the app in front behind as home's tap does, then the plane flies out to every circle at the turn that fits them largest ("so it spins into place"); back's, a flip to the kist before (this one behind). Full screen, which home's swipe switched until then, is the quick row's middle circle.
+                    // The helm's swipes (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls. on the home screen it auto-fits"; "Can't hide controls on home screen"). Home's: with an app in front, its full screen on or off (`full_switch`; the kist stays in front, where until then this swipe sent it behind first); with none, the plane flies out to every circle at the turn that fits them largest ("so it spins into place"), the controls always shown there. The display's answer decides which, not `app_front`. Back's: a flip to the kist before (this one behind). The quick row's middle circle switches full screen too.
                     let said = if corner == 8 {
-                        map.send_behind(false);
-                        map.home_fly();
-                        "map: home: every circle in view, turned to fit them largest"
+                        match map.full_switch() {
+                            Some(true) => "map: home: full screen, the controls hidden",
+                            Some(false) => "map: home: full screen off, the controls shown",
+                            None => {
+                                map.home_fly();
+                                "map: home: every circle in view, turned to fit them largest"
+                            }
+                        }
                     } else {
                         map.flip()
                     };
