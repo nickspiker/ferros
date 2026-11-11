@@ -668,6 +668,11 @@ pub fn store_set_addr(cap: u64, addr: &[u8; 32], value: &[u8]) -> bool {
     })
 }
 
+/// Write a value under an address in pieces, as `store_set_at` does by name: `piece` at `offset`, `more` while pieces follow; the piece without `more` commits the whole (the vault process writes each piece as it comes, so a value of any size passes through a buffer of one transfer). A piece is at most `STORE_MAX`. True while the vault takes them.
+pub fn store_set_addr_at(cap: u64, addr: &[u8; 32], offset: usize, piece: &[u8], more: bool) -> bool {
+    svc(nr::STORE, cap, 32 | 1 | 2 | if more { 4 } else { 0 } | (piece.len() as u64) << 8 | (offset as u64) << 32, off(addr.as_ptr()), 32, off(piece.as_ptr())) == 0
+}
+
 /// Delete the entry under an address: Some(whether it was there), None if refused.
 pub fn store_delete_addr(cap: u64, addr: &[u8; 32]) -> Option<bool> {
     match svc(nr::STORE, cap, 32 | 8, off(addr.as_ptr()), 32, 0) {
@@ -970,6 +975,46 @@ pub fn spawn_kist(grants: u64, kists: u64, name: &[u8], capsule: &[u8; 32], code
     req[at + 1..at + 1 + codes.len()].copy_from_slice(codes);
     at += 1 + codes.len();
     svc(nr::SPAWN, off(req.as_ptr()), at as u64, 2 | (replace as u64) << 2, 0, 0)
+}
+
+/// An install's stages as the kernel tells them on the caller's word (process.rs `install_tell`): the stage in bits 56-63, below it the bytes read so far, or the reason it was refused.
+pub mod install {
+    /// The kernel reading the stored capsule from the vault.
+    pub const READING: u64 = 0;
+    /// The sandbox checker over its masked code.
+    pub const CHECKING: u64 = 1;
+    /// Its seal, keyed to this device.
+    pub const SEALING: u64 = 2;
+    /// Checked and sealed, the seal kept.
+    pub const DONE: u64 = 3;
+    /// Refused; the low byte says why (`WHY_*`).
+    pub const REFUSED: u64 = 4;
+    pub const WHY_NOT_NAMED: u64 = 1;
+    pub const WHY_SECTIONS: u64 = 2;
+    pub const WHY_NATIVE: u64 = 3;
+    pub const WHY_SIGNATURE: u64 = 4;
+    pub const WHY_MODES: u64 = 5;
+    pub const WHY_CHECKER: u64 = 6;
+    pub const WHY_SECRET: u64 = 7;
+    pub const WHY_KEPT: u64 = 8;
+    pub const WHY_READ: u64 = 9;
+    pub const WHY_ROOM: u64 = 10;
+    /// A word's stage and its value.
+    pub fn split(word: u64) -> (u64, u64) {
+        (word >> 56, word & ((1 << 56) - 1))
+    }
+}
+
+/// Ask the kernel to install a kist this process stored in `capsules.` under `capsule` (SANDBOX.md "Lifecycle": read from the vault, gated, its masked code checked once, sealed to this device): `install` the slot of the Install right, `word` where each stage is told (`install::*`; wait on it with `wait_world`, never ask on a timer). 0 queued, ERR refused (the reason on the console; one install at a time).
+pub fn install_kist(grants: u64, install: u64, capsule: &[u8; 32], word: &core::sync::atomic::AtomicU64) -> u64 {
+    let mut req = [0u8; 72];
+    req[..32].copy_from_slice(capsule);
+    let tok = (arc_base() + cap(grants, install)) as *const u8;
+    for i in 0..32 {
+        req[32 + i] = unsafe { core::ptr::read_volatile(tok.add(i)) };
+    }
+    req[64..].copy_from_slice(&off(word as *const _ as *const u8).to_le_bytes());
+    svc(nr::SPAWN, off(req.as_ptr()), req.len() as u64, 8, 0, 0)
 }
 
 /// End this process; its arc and capabilities cease to exist.

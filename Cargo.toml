@@ -77,6 +77,7 @@ members = [
     "payloads/nettest",
     "payloads/httptest",
     "payloads/fgtw",
+    "payloads/kists",
     "payloads/vault",
     "payloads/vaulttest",
     "payloads/wallgen",

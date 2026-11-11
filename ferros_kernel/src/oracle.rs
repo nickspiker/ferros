@@ -46,7 +46,7 @@ pub struct Located {
     pub hp: [u8; 32],
 }
 
-/// The gate over a capsule already in an arc, too large to copy (a std process: Photon is 100 MB of image): the signature verifies over the whole file as always; the code is the byte-vector value the caller names by offset and length, checked to be framed exactly so (`v` `b` and the EWE bit length right before it). Native capsules only — a masked one takes `gate`, whose checker needs the code on its own — and the signature covers every byte, so a wrong location runs the developer's own bytes, nothing else.
+/// The gate over a capsule already in an arc, too large to copy (a std process: Photon is 100 MB of image): the signature verifies over the whole file as always; the code is the byte-vector value the caller names by offset and length, checked to be framed exactly so (`v` `b` and the EWE bit length right before it). The signature covers every byte, so a wrong location runs the developer's own bytes, nothing else. A masked kist (installed or launched from the vault) is gated here too, its modes read in place (`masked_modes`) and its checker run over the code where it lies (`process::install_kist`).
 pub fn gate_located(capsule: &mut [u8], code_offset: usize, code_len: usize) -> Result<Located, &'static str> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     use vsf::file_format::VsfHeader;
@@ -203,24 +203,82 @@ pub fn seal_key() -> Option<[u8; 32]> {
 
 /// The seal of a gated capsule: keyed BLAKE3 over who signed it, its provenance, whether it is masked, its instruction span and the exact image.
 pub fn seal(g: &Gated) -> Option<[u8; 32]> {
+    seal_parts(&g.developer_pubkey, &g.hp, g.masked, &Modes { text_len: g.text_len, fixed: g.fixed, bti: g.bti, exact: g.exact }, &g.code)
+}
+
+/// The seal over its parts, for a capsule gated where it lies (a kist installed from the vault, `process::install_kist`, and checked at its launch): the same bytes hashed in the same order as `seal`, so a seal is the same whichever way the capsule was gated.
+pub fn seal_parts(developer: &[u8; 32], hp: &[u8; 32], masked: bool, m: &Modes, code: &[u8]) -> Option<[u8; 32]> {
     let mut h = blake3::Hasher::new_keyed(&seal_key()?);
-    h.update(&g.developer_pubkey);
-    h.update(&g.hp);
-    h.update(&[g.masked as u8]);
+    h.update(developer);
+    h.update(hp);
+    h.update(&[masked as u8]);
     // Fixed mode's size is part of what was checked, so it is part of the seal (absent for ring, so ring seals are unchanged).
-    if g.fixed != 0 {
+    if m.fixed != 0 {
         h.update(b"fixed");
-        h.update(&[g.fixed as u8]);
+        h.update(&[m.fixed as u8]);
     }
-    if g.bti {
+    if m.bti {
         h.update(b"bti");
     }
-    if g.exact {
+    if m.exact {
         h.update(b"exact");
     }
-    h.update(&(g.text_len as u64).to_le_bytes());
-    h.update(&g.code);
+    h.update(&(m.text_len as u64).to_le_bytes());
+    h.update(code);
     Some(*h.finalize().as_bytes())
+}
+
+/// A masked image's span and modes, as its `masked` section gives them (`gate` reads the same fields from a copy).
+pub struct Modes {
+    pub text_len: usize,
+    pub fixed: u32,
+    pub bti: bool,
+    pub exact: bool,
+}
+
+/// The `masked` section's other fields read where the capsule lies, its code (`code_offset`, `code_len`, found by `process::locate_code`) never copied: a kist's image is tens of megabytes and the kernel heap holds 22 MiB. The code is the section's first field (its byte vector sits in the section's first bytes, where `locate_code` finds it), so the rest follow its closing bracket: `text` (the instruction span), `fixed`, `bti` and `exact`, refused as `gate` refuses them.
+pub fn masked_modes(capsule: &[u8], code_offset: usize, code_len: usize) -> Result<Modes, &'static str> {
+    use vsf::types::VsfType;
+    let mut p = code_offset + code_len;
+    if capsule.get(p) != Some(&b')') {
+        return Err("gate: the masked code is not the section's first field");
+    }
+    p += 1;
+    let (mut text, mut fixed, mut bti, mut exact) = (None, 0u32, false, false);
+    let n = |v: &VsfType| match v {
+        VsfType::u(n, _) => Some(*n),
+        VsfType::u3(n) => Some(*n as usize),
+        VsfType::u4(n) => Some(*n as usize),
+        VsfType::u5(n) => Some(*n as usize),
+        VsfType::u6(n) => Some(*n as usize),
+        _ => None,
+    };
+    // The fields up to the section's end; the bound is the capsule's own length (a section that never closes ends there).
+    while p < capsule.len() && capsule[p] != b']' {
+        if capsule[p] != b'(' {
+            p += 1;
+            continue;
+        }
+        let f = vsf::file_format::VsfField::parse(capsule, &mut p).map_err(|_| "gate: a masked field that does not parse")?;
+        match f.name.as_str() {
+            "text" => text = Some(f.values.first().and_then(n).ok_or("gate: masked code without a text length")?),
+            "fixed" => fixed = f.values.first().and_then(n).ok_or("gate: fixed mode without a size")? as u32,
+            "bti" => bti = true,
+            "exact" => exact = true,
+            _ => {}
+        }
+    }
+    let text_len = text.ok_or("gate: masked code without a text length")?;
+    if text_len == 0 || text_len > code_len || text_len % 4 != 0 {
+        return Err("gate: bad text length");
+    }
+    if fixed != 0 && !(16..=40).contains(&fixed) {
+        return Err("gate: fixed mode size out of range");
+    }
+    if exact && (fixed != 0 || !bti) {
+        return Err("gate: exact mode needs BTI and is not fixed");
+    }
+    Ok(Modes { text_len, fixed, bti, exact })
 }
 
 /// The oracle. None until the system persistent secret exists (no ira, no ihi).
