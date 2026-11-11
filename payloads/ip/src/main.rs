@@ -7,11 +7,13 @@
 //!
 //! `udp` requests (first byte):
 //! - 1 SEND: family (4 or 6), address (16 bytes; IPv4 in the first 4), destination port (u16 BE), source port (u16 BE), payload → [0] sent, [1] resolving the next hop (retry), [2] no address yet, [3] bad request.
-//! - 2 RECV: port (u16 BE) → family, address (16), source port, destination port, payload — or nothing (length 0). A RECV on a port, or a SEND from it, opens it: datagrams are kept only for the last eight ports asked for (a broadcast to a port nobody reads once filled the queue for good), the oldest giving way when the queue is full. IPv4 multicast and IPv6 link-scope multicast (ff02::; Photon's LAN beacons go to 239.104.199.144 and ff02::68c7:9014, port 4384) are delivered like unicast.
-//! - 3 INFO: → MAC (6), IPv4 address, mask, router (4 each), IPv6 link-local (16), IPv6 global (16), flags (bit 0 IPv4 bound, bit 1 IPv6 global, bit 2 the cellular call is up), the DNS server (4), then the cellular call's IPv6 DNS server (16) — 71 bytes. The addresses and DNS are the ones traffic of each family leaves with: WiFi's when it has them, else the call's.
+//! - 2 RECV: port (u16 BE) → family, address (16), source port, destination port, payload, or nothing (length 0). A RECV on a port, or a SEND from it, opens it: datagrams are kept only for the last eight ports asked for (a broadcast to a port nobody reads once filled the queue for good), the oldest giving way when the queue is full. IPv4 multicast and IPv6 link-scope multicast (ff02::; Photon's LAN beacons go to 239.104.199.144 and ff02::68c7:9014, port 4384) are delivered like unicast. A fourth byte, a wait in seconds (1 to 255), holds the call while the port has nothing: answered as a datagram for it lands, else with nothing when the wait runs out (a doorbell for a blocking reader, never a poll: owner, 2026-11-10, "No polling!"; 2026-11-11, Mahere fetching its map cells, "we have tcp and http so let's get the full meal deal wired up with mahere"). Without it, or 0, the answer is at once, as before.
+//! - 3 INFO: → MAC (6), IPv4 address, mask, router (4 each), IPv6 link-local (16), IPv6 global (16), flags (bit 0 IPv4 bound, bit 1 IPv6 global, bit 2 the cellular call is up), the DNS server (4), then the cellular call's IPv6 DNS server (16), then what this ip does beyond that (bit 0: the held receives, the wait byte of ops 2 and 6): 72 bytes, where an ip from before answers 71. The addresses and DNS are the ones traffic of each family leaves with: WiFi's when it has them, else the call's.
 //! - 4 TCP CONNECT: family, address (16), port (u16 BE) → [0, handle] connecting, [2] no address yet, [4] no free connection.
 //! - 5 TCP SEND: handle, data → [0, accepted u16 BE] (what the send buffer took; send the rest later), [5] not a connection.
-//! - 6 TCP RECV: handle → [state, data…]: state 1 connecting, 2 open, 3 the peer closed (no more data once this is empty), 4 failed (reset or timed out), 5 not a connection.
+//! - 6 TCP RECV: handle → [state, data…]: state 1 connecting, 2 open, 3 the peer closed (no more data once this is empty), 4 failed (reset or timed out), 5 not a connection. A third byte, a wait in seconds (1 to 255), holds the call while the connection is connecting or open with nothing taken in: answered as data lands, the peer closes, the connection fails, or when the wait runs out (then state 1 or 2 and no data). A held receive is its app asking (no idle reaping while it waits); a second held receive on the same connection answers the first as things stand. The reply carries up to 2047 bytes of data: a caller's buffer under 2 KiB loses the rest (the kernel cuts a reply at the caller's length).
+//!
+//! Held receives: up to eight at once (`HELDN`), the oldest answered as things stand when a ninth comes. While nobody is present each is answered with nothing, as any request would be.
 //! - 7 TCP CLOSE: handle → [0]: a FIN after the data already sent; the connection is freed once both sides have closed (or 16 s on). A connection its app has not asked about (send, receive, close) for 32 s is reset and freed: an app that dies leaves no slot behind.
 //! - 8 JOIN: family, group address (16) → [0]: join a multicast group — an IGMPv2 membership report (IPv4) or an MLDv1 listener report (IPv6) now and every 60 s, so a snooping access point forwards the group to us (2026-10-26: the desktop's Photon beacons to 239.104.199.144 never reached the device until it reported itself a member; broadcast did). The firmware already passes all multicast; the switch was the filter. Up to eight groups.
 //! - 9 LINK: mode → [0]: 0 both links, WiFi preferred (the default); 1 cellular only; 2 WiFi only. A test can take the cellular path with WiFi up; existing connections keep their link.
@@ -106,7 +108,29 @@ struct Ip {
     backoff: u32,
     /// LINK mode (request 9): 0 both, WiFi preferred; 1 cellular only; 2 WiFi only.
     mode: u8,
+    /// Receives held until something comes (ops 2 and 6 with a wait), answered by `answer_held`.
+    held: [Held; HELDN],
+    /// Stamps the holds in arrival order: the oldest gives way when all are taken.
+    held_seq: u32,
 }
+
+/// Held receives at once: eight, as many as the ports kept for UDP readers; a connection's reader takes one too.
+const HELDN: usize = 1 << 3;
+/// INFO's last byte: bit 0, this ip holds receives (the wait byte of ops 2 and 6).
+const DOES_HOLD: u8 = 1;
+
+/// One held receive: its reply token, when its wait runs out, and what it waits on (a UDP port, or a TCP connection's handle when `tcp`).
+#[derive(Clone, Copy)]
+struct Held {
+    used: bool,
+    tcp: bool,
+    port: u16,
+    handle: u8,
+    seq: u32,
+    until: u64,
+    tok: [u8; 32],
+}
+const HELD_FREE: Held = Held { used: false, tcp: false, port: 0, handle: 0, seq: 0, until: 0, tok: [0; 32] };
 
 /// The cellular data call, as `rmnet` INFO gives it (modem.rs `rmnet_call`): flags (bit 0 up, bit 1 IPv4, bit 2 IPv6), MTU, addresses, the first DNS server of each family. The addresses are the line's: never printed.
 #[derive(Clone, Copy)]
@@ -1148,12 +1172,147 @@ impl Ip {
         }
     }
 
-    /// One `udp` request; returns the reply length written to `out`.
-    fn serve(&mut self, m: &[u8], out: &mut [u8]) -> usize {
+    /// The port's oldest datagram into `out` (family, address, source port, destination port, payload); 0 when it has none.
+    fn udp_take(&mut self, port: u16, out: &mut [u8]) -> usize {
+        let Some(i) = (0..QN).filter(|&i| self.q[i].used && self.q[i].dport == port).min_by_key(|&i| self.q[i].seq) else { return 0 };
+        let d = &mut self.q[i];
+        d.used = false;
+        out[0] = d.fam;
+        out[1..17].copy_from_slice(&d.addr);
+        out[17..19].copy_from_slice(&d.sport.to_be_bytes());
+        out[19..21].copy_from_slice(&d.dport.to_be_bytes());
+        let n = d.len.min(out.len() - 21);
+        out[21..21 + n].copy_from_slice(&d.data[..n]);
+        21 + n
+    }
+
+    /// Connection `i`'s state and what it has taken in, into `out` (op 6's answer); the window reopened when it had shrunk below half.
+    fn tcp_take(&mut self, i: usize, out: &mut [u8]) -> usize {
+        let was_low = RXW - self.tcp[i].rx_len < RXW / 2;
+        let c = &mut self.tcp[i];
+        out[0] = match c.state {
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            _ => 4,
+        };
+        let n = c.rx_len.min(out.len() - 1);
+        for k in 0..n {
+            out[1 + k] = c.rx[(c.rx_head + k) % RXW];
+        }
+        c.rx_head = (c.rx_head + n) % RXW;
+        c.rx_len -= n;
+        // A window that had shrunk below half has grown: say so (a window update), or a sender avoiding silly windows waits for its persist timer.
+        if was_low && n > 0 && c.state >= 2 {
+            let s = c.snd_nxt;
+            self.tcp_out(i, 16, s, &[]);
+        }
+        1 + n
+    }
+
+    /// Hold a receive (`tok` its reply token) for `wait` seconds: on UDP `port`, or on connection `handle` when `tcp`. A held receive on the same connection is answered first as things stand (one reader a connection), and with every slot taken the oldest is.
+    fn hold(&mut self, tcp: bool, port: u16, handle: u8, wait: u8, tok: &[u8; 32], out: &mut [u8]) {
+        let same = if tcp { (0..HELDN).find(|&k| self.held[k].used && self.held[k].tcp && self.held[k].handle == handle) } else { None };
+        let k = match same.or_else(|| (0..HELDN).find(|&k| !self.held[k].used)) {
+            Some(k) => k,
+            None => (0..HELDN).min_by_key(|&k| self.held[k].seq).unwrap(),
+        };
+        if self.held[k].used {
+            self.answer(k, out);
+        }
+        self.held_seq = self.held_seq.wrapping_add(1);
+        self.held[k] = Held { used: true, tcp, port, handle, seq: self.held_seq, until: now() + wait as u64 * self.freq, tok: *tok };
+    }
+
+    /// Answer hold `k` as things stand (a connection's state and data, or the port's next datagram or nothing), and free it.
+    fn answer(&mut self, k: usize, out: &mut [u8]) {
+        let h = self.held[k];
+        self.held[k] = HELD_FREE;
+        let l = if !self.person {
+            0
+        } else if h.tcp {
+            let i = h.handle as usize;
+            if self.tcp[i].state == 0 {
+                out[0] = 5;
+                1
+            } else {
+                self.tcp[i].touched = now();
+                self.tcp_take(i, out)
+            }
+        } else {
+            self.udp_take(h.port, out)
+        };
+        svc(REPLY, self.off(h.tok.as_ptr()), self.off(out.as_ptr()), l as u64, 0, 0);
+    }
+
+    /// Each pass: every held receive that has something now (a datagram for its port; data, a close or a failure on its connection, or the connection gone), or whose wait ran out, or all of them while nobody is present, answered. A connection waited on counts as asked about. Returns whether any was.
+    fn answer_held(&mut self, out: &mut [u8]) -> bool {
+        let t = now();
+        let mut any = false;
+        for k in 0..HELDN {
+            let h = self.held[k];
+            if !h.used {
+                continue;
+            }
+            let ready = !self.person
+                || t > h.until
+                || if h.tcp {
+                    let c = &self.tcp[h.handle as usize];
+                    c.state == 0 || c.state >= 3 || c.rx_len > 0
+                } else {
+                    (0..QN).any(|i| self.q[i].used && self.q[i].dport == h.port)
+                };
+            if ready {
+                self.answer(k, out);
+                any = true;
+            } else if h.tcp {
+                self.tcp[h.handle as usize].touched = t;
+            }
+        }
+        any
+    }
+
+    /// One `udp` request (`tok` its reply token); returns the reply length written to `out`, or None when the request is held (answered later by `answer_held`).
+    fn serve(&mut self, m: &[u8], tok: &[u8; 32], out: &mut [u8]) -> Option<usize> {
         // While nobody has attested no application sends, receives, connects or joins: nothing may act on what the radios bring until a person is present (the addresses, op 3, stay readable). The locate responder will be the one exception (AUTH.md "Locate").
         if !self.person && m.first() != Some(&3) {
-            return 0;
+            return Some(0);
         }
+        // The receives that may be held (the wait byte); every other request is answered at once.
+        match m.first() {
+            Some(2) if m.len() >= 3 => {
+                let port = u16::from_be_bytes([m[1], m[2]]);
+                self.open_port(port);
+                let n = self.udp_take(port, out);
+                if n == 0 && m.len() >= 4 && m[3] > 0 {
+                    self.hold(false, port, 0, m[3], tok, out);
+                    return None;
+                }
+                return Some(n);
+            }
+            Some(6) if m.len() >= 2 => {
+                let i = m[1] as usize;
+                if i < TCPN {
+                    self.tcp[i].touched = now();
+                }
+                if i >= TCPN || self.tcp[i].state == 0 {
+                    out[0] = 5;
+                    return Some(1);
+                }
+                let c = &self.tcp[i];
+                if c.rx_len == 0 && (c.state == 1 || c.state == 2) && m.len() >= 3 && m[2] > 0 {
+                    self.hold(true, 0, i as u8, m[2], tok, out);
+                    return None;
+                }
+                return Some(self.tcp_take(i, out));
+            }
+            _ => {}
+        }
+        Some(self.serve_now(m, out))
+    }
+
+    /// A request answered at once; the reply length written to `out`.
+    fn serve_now(&mut self, m: &[u8], out: &mut [u8]) -> usize {
         match m.first() {
             Some(1) if m.len() >= 22 => {
                 let addr: [u8; 16] = m[2..18].try_into().unwrap();
@@ -1162,21 +1321,6 @@ impl Ip {
                 self.open_port(sport);
                 out[0] = self.udp_send(m[1], addr, dport, sport, &m[22..]);
                 1
-            }
-            Some(2) if m.len() >= 3 => {
-                let port = u16::from_be_bytes([m[1], m[2]]);
-                self.open_port(port);
-                // The port's oldest datagram.
-                let Some(i) = (0..QN).filter(|&i| self.q[i].used && self.q[i].dport == port).min_by_key(|&i| self.q[i].seq) else { return 0 };
-                let d = &mut self.q[i];
-                d.used = false;
-                out[0] = d.fam;
-                out[1..17].copy_from_slice(&d.addr);
-                out[17..19].copy_from_slice(&d.sport.to_be_bytes());
-                out[19..21].copy_from_slice(&d.dport.to_be_bytes());
-                let n = d.len.min(out.len() - 21);
-                out[21..21 + n].copy_from_slice(&d.data[..n]);
-                21 + n
             }
             Some(3) => {
                 // The addresses traffic leaves with (`pick4`, `pick6` for a global destination), and the DNS server of the link IPv4 leaves on.
@@ -1191,7 +1335,8 @@ impl Ip {
                 out[50] = a4.is_some() as u8 | (a6.is_some() as u8) << 1 | (self.cell.flags & 1) << 2;
                 out[51..55].copy_from_slice(if matches!(a4, Some((true, _))) { &self.cell.dns4 } else { &self.dns });
                 out[55..71].copy_from_slice(&self.cell.dns6);
-                71
+                out[71] = DOES_HOLD;
+                72
             }
             Some(9) if m.len() >= 2 && m[1] <= 2 => {
                 self.mode = m[1];
@@ -1221,36 +1366,6 @@ impl Ip {
                 out[1..3].copy_from_slice(&(n as u16).to_be_bytes());
                 self.tcp_tick();
                 3
-            }
-            Some(6) if m.len() >= 2 => {
-                let i = m[1] as usize;
-                if i < TCPN {
-                    self.tcp[i].touched = now();
-                }
-                if i >= TCPN || self.tcp[i].state == 0 {
-                    out[0] = 5;
-                    return 1;
-                }
-                let was_low = RXW - self.tcp[i].rx_len < RXW / 2;
-                let c = &mut self.tcp[i];
-                out[0] = match c.state {
-                    1 => 1,
-                    2 => 2,
-                    3 => 3,
-                    _ => 4,
-                };
-                let n = c.rx_len.min(out.len() - 1);
-                for k in 0..n {
-                    out[1 + k] = c.rx[(c.rx_head + k) % RXW];
-                }
-                c.rx_head = (c.rx_head + n) % RXW;
-                c.rx_len -= n;
-                // A window that had shrunk below half has grown: say so (a window update), or a sender avoiding silly windows waits for its persist timer.
-                if was_low && n > 0 && c.state >= 2 {
-                    let s = c.snd_nxt;
-                    self.tcp_out(i, 16, s, &[]);
-                }
-                1 + n
             }
             Some(8) if m.len() >= 18 && (m[1] == 4 || m[1] == 6) => {
                 let g: [u8; 16] = m[2..18].try_into().unwrap();
@@ -1402,6 +1517,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         dark: false,
         backoff: 0,
         mode: 0,
+        held: [HELD_FREE; HELDN],
+        held_seq: 0,
     };
     // Randomness: the DHCP transaction id and the IPv6 interface identifier (random per session).
     let mut r = [0u8; 16];
@@ -1488,11 +1605,16 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         let n = svc(RECV, ip.cap(S_UDP), ip.off(msg.as_mut_ptr()), msg.len() as u64, ip.off(tok.as_mut_ptr()), 1);
         if n != NOTHING && n != ERR {
             let m = &msg;
-            let l = ip.serve(&m[..(n as usize).min(m.len())], &mut out);
-            svc(REPLY, ip.off(tok.as_ptr()), ip.off(out.as_ptr()), l as u64, 0, 0);
+            if let Some(l) = ip.serve(&m[..(n as usize).min(m.len())], &tok, &mut out) {
+                svc(REPLY, ip.off(tok.as_ptr()), ip.off(out.as_ptr()), l as u64, 0, 0);
+            }
             busy = true;
         }
         ip.tcp_tick();
+        // The held receives that have their answer now (after what came in and what the connections did this pass).
+        if ip.answer_held(&mut out) {
+            busy = true;
+        }
         // Membership refreshed every 60 s (a querier's interval is 125 s; an unsolicited report keeps the snooper's entry alive without one).
         if ip.groups_n > 0 && now().wrapping_sub(ip.groups_t) > 60 * ip.freq {
             ip.groups_t = now();
