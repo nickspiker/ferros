@@ -2757,25 +2757,6 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                if cmd.params == b"gps off" {
-                    // `diag gps off`: the chip powered down, for a GPS driver that died with it on (gps.rs). Everything else about the chip is the driver's (payloads/gps, tools/husky-gps.sh): the kernel's bring-up tools left with the move (KERNEL-OUT.md decision 4).
-                    crate::gps::off(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"haptic" || cmd.params.starts_with(b"haptic ") {
-                    // `diag haptic` (state, read only), `diag haptic up` (bus, reset, IDs), `diag haptic play <n>` (ROM waveform n): the vibration motor's CS40L26 (haptics.rs).
-                    let a = core::str::from_utf8(&cmd.params[6..]).unwrap_or("").trim();
-                    if a == "up" {
-                        crate::haptics::up(&mut resp);
-                    } else if let Some(n) = a.strip_prefix("play").and_then(|t| t.trim().parse::<u32>().ok()) {
-                        crate::haptics::play(n, &mut resp);
-                    } else {
-                        crate::haptics::state(&mut resp);
-                    }
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
                 if cmd.params == b"aoc" {
                     // `diag aoc`: the AoC block from the AP (aoc.rs `report`). Its bring-up tools (on, off, peek, boot, log, mmu, fault, services, svc, usf, pins, gpio; gsa, ffa, trusty) went on 2026-11-01: the `sensors` switch starts it.
                     crate::aoc::report(&mut resp);
@@ -3396,18 +3377,6 @@ pub fn run(mut b: Boot) -> ! {
                 if cmd.params == b"modem hwcfg" {
                     // `diag modem hwcfg`: the handover block's inputs (modem.rs hwcfg): ABL's board fields, hardware_config.json, persist's cpsha size; the IMEIs never shown.
                     crate::modem::hwcfg(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"amp state" {
-                    // `diag amp state`: the speaker amplifiers' SPI clock path, pins and supply, read only (amp.rs).
-                    crate::amp::state(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"amp up" {
-                    // `diag amp up`: SPI up, supply, each amplifier's reset, boot-done and chip IDs.
-                    crate::amp::up(&mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }

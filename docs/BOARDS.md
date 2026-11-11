@@ -140,7 +140,7 @@ akita's geometry, from its device overlay (device/google/akita, cloned to `/mnt/
 
 Radios and GPS:
 - **NFC**: up at every boot from init (husky's process unchanged).
-- **Haptics**: the CS40L26A answers (2026-11-06); no waveform is played until the owner is there.
+- **Haptics**: the CS40L26A answers (2026-11-06, the kernel's `diag haptic up`, gone since 2026-11-10: the NFC process's op 7 reads the same); no waveform is played until the owner is there.
 - **WiFi / Bluetooth**: the BCM4383 rev 2 trains its PCIe link under husky's stages 00 and 03; its firmware set (`fw_bcmdhd.bin_4383_a3`, `bcmdhd_clm.blob_4383_a3`, `bcmdhd.cal_*`, the BT patches) is in /mnt/Harbor/tmp/akita-wifi-fw-2026-11-06/. What it needs: the BCM4383's own download (Google's `google-modules/wlan/bcm4383`, not in the reference tree yet) in place of the BCM4398's stages 04 and on, then the same msgbuf/flowring path; Bluetooth follows WiFi's REG_ON as on husky.
 - **GPS**: a Samsung GPS chip Google's tree names "KEPLER" (`samsung,exynos-gnss`, the MP board's `gnssif`; Google's identifiers keep their word), not husky's BCM4776. Its data runs over SPI 21 (`samsung,gnss-spi`, 50 MHz, PDMA1) with two handshake lines, AP to GNSS on gpp4-3 and GNSS to AP (its interrupt) on gpa5-3; its rails are the sub-PMIC's LDO9S (core), LDO10S (RF) and LDO11S (aux); and its firmware and boot go through the modem (`gnss_boot` and `gnss_dump` io devices on the CP link, a 4 MiB `GNSS_FW` region at 8 MiB into the CP's shared memory). Google's driver is `soc-gs/drivers/soc/google/gnssif_spi` (gnss_main, gnss_spi, gnss_keplerctl_device). So it comes after the modem process runs on akita: no bring-up yet.
 

@@ -179,7 +179,7 @@ Owner: the Pro, screen off overnight, lost 70 % in 8 h unplugged. Measured with 
 | what | screen-off draw |
 |---|---|
 | the CP powered off (`husky-modem.sh off`) | 55 mW less |
-| GPS powered off (`diag gps off`) | 17 mW less |
+| GPS powered off (`diag gps off` then; since 2026-11-10 its driver ended, by `diag "kill gps"` or the last claim gone: the `gps` switch goes off with it) | 17 mW less |
 | Bluetooth off | nothing measurable |
 | WiFi power save PM2 (it ran PM0, awake every beacon) | **150 mW less** (1069 → 920) |
 | NFC discovery stopped | ~20 mW less |

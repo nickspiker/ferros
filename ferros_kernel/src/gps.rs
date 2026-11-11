@@ -15,8 +15,8 @@ const MCU_REQ: (usize, u32) = (GPP4, 3);
 const MCU_RESP: (usize, u32) = (GPH3, 2);
 const NSTANDBY: (usize, u32) = (GPH3, 3);
 
-/// The rails: (name, sub-PMIC control register, its voltage as (base mV, step µV)).
-const RAILS: [(&str, u32, u32, u32); 4] = [("L9S GNSS core", 0x37, 725, 12_500), ("L10S GNSS RF", 0x38, 700, 25_000), ("L11S GNSS aux", 0x39, 700, 25_000), ("BUCK6S (core feed on this board?)", 0x18, 0, 0)];
+/// The three rails' sub-PMIC control registers: L9S_GNSS_CORE, L10S_GNSS_RF, L11S_GNSS_AUX (their voltages ABL's; the bring-up's readback of them and of BUCK6S left with `diag gps off`, 2026-11-10).
+const RAILS: [u32; 3] = [0x37, 0x38, 0x39];
 
 
 fn wr(a: usize, v: u32) {
@@ -47,20 +47,12 @@ pub fn power(on: bool) -> bool {
         set_con(HOST_REQ, 0);
     }
     let mut ok = true;
-    for (_, reg, _, step) in RAILS {
-        if step != 0 {
-            ok &= crate::acpm::update(crate::acpm::SUB, crate::acpm::T_PMIC, reg, if on { 0x80 } else { 0 }, 0x80).is_ok();
-        }
+    for reg in RAILS {
+        ok &= crate::acpm::update(crate::acpm::SUB, crate::acpm::T_PMIC, reg, if on { 0x80 } else { 0 }, 0x80).is_ok();
     }
     if on {
         ms(5);
         crate::spi::GPS.up();
     }
     ok
-}
-
-/// `diag gps off`: the chip powered down (the driver's own STOP does the same; this is for a driver that died with the chip on).
-pub fn off(out: &mut alloc::vec::Vec<u8>) {
-    let ok = power(false);
-    out.extend_from_slice(alloc::format!("GPS rails off: {ok}\n").as_bytes());
 }

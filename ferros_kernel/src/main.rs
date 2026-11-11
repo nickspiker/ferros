@@ -65,7 +65,6 @@ mod rtc;
 mod zone;
 mod lang;
 mod aoc;
-mod haptics;
 mod gps;
 mod nfc;
 mod bt;

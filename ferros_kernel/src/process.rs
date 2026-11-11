@@ -1856,7 +1856,9 @@ pub static HARDWARE: &[Hw] = &[
     Hw { name: "gpio-gpn0", base: 0x1506_0000, size: 0x1000, via_el3: false },
     // The GPS chip (GPS.md): HSI0 USI3's SPI port (spi_21). Its lines are in banks already above: HOST_REQ in gpio-far-alive (gpa5), MCU_REQ in gpio-gpp0 (gpp4, +G#80), MCU_RESP and nSTANDBY in gpio-hsi2 (gph3). Rails, clocks and pin modes are the kernel's (`POWERS`).
     Hw { name: "usi3-spi", base: 0x111E_0000, size: 0x1000, via_el3: false },
-    // The NFC controller (docs/NFC.md): hsi2c_0, the bus it shares with the vibration motor (whose driver is the kernel's diag, never running beside the `nfc` process). Its interrupt line gpa7-6 is read in gpio-alive, above. Pin modes, the reset and the clock pad are the kernel's (`POWERS`).
+    // The speaker amplifiers (AUDIO.md, payloads/amp): HSI0 USI1's SPI port (spi_19). The right's select (gpn1-0) is in gpio-gpn0 and the left's reset (gpp1-1) in gpio-gpp0, above. Clocks, buck A, pin modes and the right's reset are the kernel's (`POWERS`).
+    Hw { name: "usi1-spi", base: 0x111C_0000, size: 0x1000, via_el3: false },
+    // The NFC controller (docs/NFC.md): hsi2c_0, the bus it shares with the vibration motor, both run by the `nfc` process (KERNEL-OUT.md decision 8: the bus has one owner). Its interrupt line gpa7-6 is read in gpio-alive, above. Pin modes, both chips' resets and the clock pad are the kernel's (`POWERS`).
     Hw { name: "hsi2c0", base: 0x10C8_0000, size: 0x1000, via_el3: false },
     // Bluetooth (docs/BT.md): the APM's USI1 UART (serial_18). The USI mode word and the chip's power lines are the kernel's (`POWERS`).
     Hw { name: "apm-usi1-uart", base: 0x155D_0000, size: 0x1000, via_el3: false },
@@ -1867,7 +1869,7 @@ pub struct PowerSwitch {
     pub name: &'static str,
     pub set: fn(bool) -> bool,
 }
-pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gps", set: crate::gps::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }];
+pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gps", set: crate::gps::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }, PowerSwitch { name: "amp", set: crate::amp::power }];
 /// A syscall buffer that resolved nowhere (`Process::span`): whose (the process's epoch), the offset as given, its length, and whether the kernel was to write it. The syscall that touched it traps at its end (`buf_trap`). Under the kernel lock: one syscall at a time.
 #[derive(Clone, Copy)]
 struct BufFault {
