@@ -991,6 +991,10 @@ mod tests {
         }
     }
 
+    /// `knobs_default_is_today`'s expected values, computed from the code as it stood before the knobs (0a1304b), in release and debug alike.
+    const TODAY_PIXELS: &[(u32, u64)] = &[(9, 0xD6DD_8707_739F_8411), (9, 0x00C0_A2F4_FF7C_F056), (1, 0x21F0_B904_F9F4_C950), (1, 0x955C_065C_7E18_AB18), (3, 0x67FD_6934_1246_D3DE), (3, 0xDEAA_4EBF_F48B_D6AC), (0, 0x4AB5_094A_3D54_2807), (0, 0xCDB2_CE60_39BA_795B), (0, 0xE6AC_2E3A_1891_9771), (0, 0x095E_871E_2541_FF0C), (1, 0x6E01_4FC4_4970_BF4D), (1, 0xF5B3_4544_5F68_725B)];
+    const TODAY_FULL: &[u64] = &[0x5648_F637_BCCA_ABA1, 0x4C49_405C_7FF2_70D0, 0x8E6E_3810_54A7_52BE, 0xC799_382D_F3AC_159A, 0x8B04_B6E0_B832_FF4F, 0x56B4_8C6E_562E_848D, 0xB11B_A6C5_A78E_8284, 0x7A30_F7E4_C3A1_A4AD];
+
     fn hash(px: &[u64]) -> u64 {
         px.iter().fold(0xCBF2_9CE4_8422_2325u64, |h, &p| mix(h ^ p))
     }
@@ -1045,6 +1049,29 @@ mod tests {
             }
         }
         println!("refined {} of {} pixels ({:.1} %)", marked, w * h, 100. * marked as f64 / (w * h) as f64);
+    }
+
+    /// The pixels and choices of fixed seeds before the knobs became data (2026-11-10, computed from the constants' code at 0a1304b), and after: bit for bit the same.
+    /// Each case: the seed, the frame, the attempt kept, and the hash of the rendered frame's working values; then the choices alone at husky's full size (c, the view and the attempt), where the survey runs at the size the device runs it.
+    #[test]
+    fn knobs_default_is_today() {
+        let seeds: [[u8; 32]; 6] = [seed_of(0), seed_of(1), seed_of(2), seed_of(3), seed_of(41), core::array::from_fn(|k| (k as u8).wrapping_mul(37) ^ 0xA5)];
+        let frames = [(168, 374), (135, 300)];
+        let mut got = Vec::new();
+        for s in &seeds {
+            for &(w, h) in &frames {
+                let p = params(s, w, h);
+                let mut px = vec![0u64; w * h];
+                render_rows(&p, 0..h, &mut px);
+                got.push((p.attempt, hash(&px)));
+            }
+        }
+        let choice = |p: &Params| [p.c[0], p.c[1], p.centre[0], p.centre[1], p.step[0], p.step[1], p.far_centre[0], p.far_centre[1], p.far_step[0], p.far_step[1], p.l_lo, p.l_inv].iter().fold(p.attempt as u64, |h, v| mix(h ^ v.to_bits() as u64));
+        let full: Vec<u64> = (0..8).map(|n| choice(&params(&seed_of(n), 1344, 2992))).collect();
+        println!("pixels {got:X?}");
+        println!("full {full:X?}");
+        assert_eq!(got, TODAY_PIXELS);
+        assert_eq!(full, TODAY_FULL);
     }
 
     /// The device's composition, for a handful of seeds: each passes the survey (the example `validate` runs many more, built for speed).
