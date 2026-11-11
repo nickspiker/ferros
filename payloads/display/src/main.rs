@@ -1912,7 +1912,24 @@ fn publish10x4(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask:
     fps_dot(mask, width, height);
 }
 
+/// Blocks of 16 a row the codes scratch holds (`codes_row`): a power of two past the widest glass's (husky's 1344 columns, 84 blocks).
+const CODES_BLOCKS: usize = 1 << 7;
+/// Each publishing thread's codes for one row's blocks (`codes_row`), set at start; non-zero initialiser (see `ALLOC`).
+static mut CODES_ROWS: usize = 1;
+
+/// This thread's codes scratch (`neon::Codes16`, a block of 16 each), by its place among the publish threads (`draw::thread_slot`: a worker by its stack, else the render thread, the last): a row's composed blocks worked out to their codes once, by the first phase a publish writes, and only dithered by the rest (`publish_band`, `publish_app_mask`).
+fn codes_row() -> &'static mut [neon::Codes16; CODES_BLOCKS] {
+    unsafe { &mut *((CODES_ROWS as *mut [neon::Codes16; CODES_BLOCKS]).add(draw::thread_slot())) }
+}
+
+/// The bars over the scene where the glass's edge and the camera hole's knockout are not (`glass_front` with no edge pixel): the bars' pixel `c` in front by `under_pm`, the scene `p` under it, or `p` as it came where the bars have nothing. A column of `[el, er)` (`edge_cols`) outside the hole's range has no edge pixel by `edge_cols`'s construction (every left edge pixel is left of `el`, every right one at `er` or past it), so this is exactly `glass_front` there, without its walk of the row's edge pixels (a pixel's walk, every pixel of the bars' blocks, in every phase: on the corner rows the walk is long).
+#[inline(always)]
+fn bars_over(c: u64, p: u64) -> u64 {
+    if c >> 63 != 0 { p } else { under_pm(c & ((1 << 48) - 1), trans(c), p & ((1 << 48) - 1), 0).0 }
+}
+
 /// The home screen's rows into the phases `mask` names, each pixel front to back (`glass_front`): the glass's edge, then the console (its rows only), then the canvas. A 16-pixel step that touches neither is the canvas straight through the NEON present; one that does is composed first and goes through the app's present, which leaves the mask's own pixels undithered.
+/// Row by row, each row into every phase `mask` names (2026-11-11, owner on the Pro: "no reason we can't hit 120fps with a sliding console row"): a block of the glass or the bars is composed and worked out to its codes by the first phase that writes the row, and the others only dither those codes with their own thresholds (`codes_row`). Until then each phase composed and coded every such block again, four times over for the bars, whose changes go into all four.
 fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask: u32, r: draw::Rect) {
     if r.is_empty() || RAW_HOLD.load(Ordering::Acquire) == 1 {
         return;
@@ -1933,12 +1950,23 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
     let hk = mask.trailing_zeros() as usize;
     let (hx0, hx1) = (r.x0 as usize, r.x1 as usize);
     let view = hit::view();
-    for k in 0..PHASES {
-        if mask >> k & 1 == 0 {
-            continue;
-        }
-        let dst = phase_slice(k, width * height);
-        for y in r.y0 as usize..r.y1 as usize {
+    let codes = codes_row();
+    for y in r.y0 as usize..r.y1 as usize {
+        // The row's edge: its masked columns and its listed edge pixels, as the columns from the left and from the right that need it.
+        let g = &rows[y];
+        let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), rows[y + 1].first as usize) };
+        let row_px = &plan[g.first as usize..];
+        let edge_px = &row_px[front_split(row_px)..];
+        let (el, er) = edge_cols(g, edge_px, width);
+        let (hl, hr) = (g.hole_l as usize, g.hole_r as usize);
+        let ((cl, cr), bw) = bar_line(y, width, height);
+        // Whether this row's glass blocks have their codes in `codes` (a phase before this one wrote the row).
+        let mut have = false;
+        for k in 0..PHASES {
+            if mask >> k & 1 == 0 {
+                continue;
+            }
+            let dst = phase_slice(k, width * height);
             if k == hk {
                 hit::row(y, hx0, hx1, width, height, false);
             }
@@ -1949,13 +1977,6 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                 }
                 continue;
             }
-            // The row's edge: its masked columns and its listed edge pixels, as the columns from the left and from the right that need it.
-            let g = &rows[y];
-            let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), rows[y + 1].first as usize) };
-            let row_px = &plan[g.first as usize..];
-            let edge_px = &row_px[front_split(row_px)..];
-            let (el, er) = edge_cols(g, edge_px, width);
-            let ((cl, cr), bw) = bar_line(y, width, height);
             let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
             let t_n = now();
             if let Some(f) = &flight {
@@ -1997,6 +2018,13 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                         continue;
                     }
                     PUB_BLOCKS[if any == 0 { 1 } else { 2 }] += 1;
+                    // A glass block an earlier phase of this row composed: its codes, dithered with this phase's thresholds.
+                    if glass && have {
+                        clean[ci] &= !(bit | wbit);
+                        neon::dither_codes(&codes[x / 16], neon::thresholds_at(thv, x), row.as_mut_ptr().add(x));
+                        x += 16;
+                        continue;
+                    }
                     // The scene: the canvas, and the wallpaper under it where there is one (the canvas's pixels are premultiplied with their alpha, so the wallpaper shows in exactly the room each leaves: a circle's edge, a glow).
                     let mut scene = [0u64; 16];
                     let scene_at = if text_layer != 0 && any != 0 {
@@ -2027,9 +2055,12 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                             let xx = x + j;
                             let c = if xx >= cl && xx < cr { bw[xx] } else { CLEAR };
                             // The canvas word's fourth lane is its alpha, not flags: off, so its pixels keep their dither.
-                            front[j] = glass_front(xx, g, edge_px, c, *scene_at.add(j) & ((1 << 48) - 1));
+                            let p = *scene_at.add(j) & ((1 << 48) - 1);
+                            front[j] = if xx >= el && xx < er && !(xx >= hl && xx < hr) { bars_over(c, p) } else { glass_front(xx, g, edge_px, c, p) };
                         }
-                        neon::sixteen_app(tabs, front.as_ptr(), row.as_mut_ptr().add(x), neon::thresholds_at(thv, x));
+                        let c = &mut codes[x / 16];
+                        *c = neon::codes_app(tabs, front.as_ptr());
+                        neon::dither_codes(c, neon::thresholds_at(thv, x), row.as_mut_ptr().add(x));
                     } else {
                         neon::sixteen_canvas(tabs, scene_at as *const Px, row.as_mut_ptr().add(x), thv);
                         // The background alone, or not; and a region's clean window with no text, or not (off the region, the mode's bit says nothing).
@@ -2043,6 +2074,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                     PUB_TICKS[2] += (x1 - run) as u64;
                 }
             }
+            have = true;
             unsafe {
                 PUB_TICKS[0] += now() - t_n;
             }
@@ -3100,7 +3132,7 @@ fn app_live() -> bool {
     })
 }
 
-/// The windows' owners' doorbell: asleep on the bell word until the kernel rings it (a surface freed as its process ends, or given out), then the render thread woken off the ring's tail for a pass, whose top drops every window whose owner is gone. No timer: a process's end is the only thing that wakes it.
+/// The windows' owners' doorbell: asleep on the bell word until the kernel rings it (a surface freed as its process ends, or given out), then the render thread woken by its doorbell (`ring_bell`) for a pass, whose top drops every window whose owner is gone. No timer: a process's end is the only thing that wakes it.
 extern "C" fn reaper(_: u64) -> ! {
     let mut seen = SURF_LIVE.load(Ordering::Acquire);
     loop {
@@ -3108,13 +3140,10 @@ extern "C" fn reaper(_: u64) -> ! {
         let v = SURF_LIVE.load(Ordering::Acquire);
         if v != seen {
             seen = v;
-            REAPS.fetch_add(1, Ordering::Release);
-            ferros_sys::wake(&RING_TAIL, 1);
+            ring_bell();
         }
     }
 }
-/// Rings `reaper` has passed on, so the render thread does not sleep thru one that came while it was busy (it compares before it waits).
-static REAPS: AtomicU64 = AtomicU64::new(0);
 /// Bit 63 of a surface pixel: see-through.
 const CLEAR: u64 = 1 << 63;
 /// The rows outside the app's circle at the top and at the bottom (`chrome_rows`): the bars' rows.
@@ -3448,7 +3477,7 @@ fn channels_op(what: u8) -> [u8; 2] {
     if what & 0x80 == 0 && what as u32 & 7 != was {
         CHANNELS.store(what as u32 & 7, Ordering::Release);
         DEV_GEN.fetch_add(1, Ordering::AcqRel);
-        ferros_sys::wake(&RING_TAIL, 1);
+        ring_bell();
     }
     [0, CHANNELS.load(Ordering::Acquire) as u8]
 }
@@ -3460,7 +3489,7 @@ fn look_op(what: u8) -> [u8; 2] {
     }
     if what == 1 && LOOK.swap(false, Ordering::AcqRel) {
         DEV_GEN.fetch_add(1, Ordering::AcqRel);
-        ferros_sys::wake(&RING_TAIL, 1);
+        ring_bell();
     }
     [0, !dev_look() as u8]
 }
@@ -3777,15 +3806,21 @@ fn glass_front(x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], c: u64,
 /// The windows into phase `k` over `r` (screen coordinates): each row composed frontmost first (a pixel comes from the first window that covers it; nothing behind the windows but black), cut to the circle with its edge antialiased, the corners from the chrome; then each pixel's R, G, B (bits 0-15, 16-31, 32-47, working values: gamma 2, white = Q14) through the one table, E's gains and the dither, bit 48 set = no dither for that pixel.
 /// `hits`: this call writes the hit map's rows too (hit.rs; the first of several phases published together, never a capture), and in development shows the map instead of the image when `k` is its phase.
 fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: usize, hits: bool) {
+    publish_app_mask(r, tabs, 1 << k, width, height, hits);
+}
+
+/// `publish_app` into every phase `mask` names at once (2026-11-11, owner on the Pro: "no reason we can't hit 120fps with a sliding console row"): each row composed once, its light, ODT and code worked out once (`codes_row`), and only the dither and the pack done per phase. The bars' changes go into all four phases, and until then each phase composed the windows, the glass and the bars, and coded every pixel, again.
+fn publish_app_mask(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, height: usize, hits: bool) {
     let r = r.clip(width, height);
     if r.is_empty() || RAW_HOLD.load(Ordering::Acquire) == 1 {
         return;
     }
-    // The development view's phase is painted whole from the hit map as it comes round (`hit::on_layer`), never here.
-    let view = hit::view() && k == hit::PHASE && unsafe { CAPTURE } == 0;
-    let dst = phase_slice(k, width * height);
-    unsafe {
-        PHASE_CLOCK[k] = None;
+    // The development view's phase is painted whole from the hit map as it comes round (`hit::on_layer`), never here: the phases written are the others.
+    let write = if hit::view() && unsafe { CAPTURE } == 0 { mask & !(1 << hit::PHASE) } else { mask };
+    for k in 0..PHASES {
+        if mask >> k & 1 == 1 {
+            unsafe { PHASE_CLOCK[k] = None };
+        }
     }
     // The app circle's ring hairline (the edge's is the mask's own colour, `glass_front`).
     let line = hairline();
@@ -3796,7 +3831,7 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
         if hits {
             hit::row(y, xa, xb, width, height, true);
         }
-        if view {
+        if write == 0 {
             continue;
         }
         // The row's spans (`layout_build`): each one's chain, frontmost first, into the row.
@@ -3804,7 +3839,7 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
         let order = unsafe { core::slice::from_raw_parts(&raw const ORDER as *const (u8, u8, u8), SURFACES) };
         let Some(band) = bands.iter().find(|b| (y as u16) >= b.y0 && (y as u16) < b.y1) else {
             // Every row is in a band by construction (fluor::layout covers 0..height); a row outside them all is a bug, said whole before the panic (2026-11-08 on akita, at start).
-            let mut s = alloc::format!("display: no band for row {y} (phase {k}, rect {},{} to {},{}); {} bands:", r.x0, r.y0, r.x1, r.y1, bands.len());
+            let mut s = alloc::format!("display: no band for row {y} (phases G#{mask:X}, rect {},{} to {},{}); {} bands:", r.x0, r.y0, r.x1, r.y1, bands.len());
             for b in bands { s += &alloc::format!(" {}..{}", b.y0, b.y1); }
             s += "; windows:";
             for w in unsafe { (*(&raw const WINS)).iter() }.flatten() { s += &alloc::format!(" ({},{} to {},{})", w.rect.x0, w.rect.y0, w.rect.x1, w.rect.y1); }
@@ -3896,7 +3931,8 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                 for x in xa..xb {
                     if x < el || x >= er || (x >= bl && x < br) || (x >= g.hole_l as usize && x < g.hole_r as usize) {
                         let c = if x >= bl && x < br { bw[x] } else { CLEAR };
-                        px[x] = glass_front(x, g, edge_px, c, px[x]);
+                        // Between the edge's columns and off the hole, no edge pixel: the bars over the pixel without the walk (`bars_over`).
+                        px[x] = if x >= el && x < er && !(x >= g.hole_l as usize && x < g.hole_r as usize) { bars_over(c, px[x]) } else { glass_front(x, g, edge_px, c, px[x]) };
                     }
                 }
             }
@@ -3907,29 +3943,50 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
             cap[y * width + xa..y * width + xb].copy_from_slice(&px[xa..xb]);
             continue;
         }
-        let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
+        // The row's codes, once: sixteen pixels a block from xa, the last block's tail (under 16) padded.
+        let codes = codes_row();
+        let tail = (xb - xa) & 15;
         unsafe {
-            let base = core::arch::aarch64::vld1q_u8(th.as_ptr());
-            let mut x = xa;
+            let (mut x, mut j) = (xa, 0usize);
             while x + 16 <= xb {
-                neon::sixteen_app(tabs, px.as_ptr().add(x), row.as_mut_ptr().add(x), neon::thresholds_at(base, x));
+                codes[j] = neon::codes_app(tabs, px.as_ptr().add(x));
                 x += 16;
+                j += 1;
             }
-            if x < xb {
-                let n = xb - x;
+            if tail != 0 {
                 let mut pin = [0u64; 16];
-                let mut pout = [0u32; 16];
-                pin[..n].copy_from_slice(&px[x..xb]);
-                neon::sixteen_app(tabs, pin.as_ptr(), pout.as_mut_ptr(), neon::thresholds_at(base, x));
-                row[x..xb].copy_from_slice(&pout[..n]);
+                pin[..tail].copy_from_slice(&px[x..xb]);
+                codes[j] = neon::codes_app(tabs, pin.as_ptr());
             }
         }
-        dst[y * width + xa..y * width + xb].copy_from_slice(&row[xa..xb]);
+        // Then each phase: its dither on those codes, and the row's words out.
+        for k in 0..PHASES {
+            if write >> k & 1 == 0 {
+                continue;
+            }
+            let dst = phase_slice(k, width * height);
+            let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
+            unsafe {
+                let base = core::arch::aarch64::vld1q_u8(th.as_ptr());
+                let (mut x, mut j) = (xa, 0usize);
+                while x + 16 <= xb {
+                    neon::dither_codes(&codes[j], neon::thresholds_at(base, x), row.as_mut_ptr().add(x));
+                    x += 16;
+                    j += 1;
+                }
+                if tail != 0 {
+                    let mut pout = [0u32; 16];
+                    neon::dither_codes(&codes[j], neon::thresholds_at(base, x), pout.as_mut_ptr());
+                    row[x..xb].copy_from_slice(&pout[..tail]);
+                }
+            }
+            dst[y * width + xa..y * width + xb].copy_from_slice(&row[xa..xb]);
+        }
     }
     if unsafe { CAPTURE } != 0 {
         return;
     }
-    fps_dot(1 << k, width, height);
+    fps_dot(mask, width, height);
 }
 
 /// Where op 30 has the finished frame written instead of a phase (a free surface's pixels), 0 when not capturing.
@@ -4777,8 +4834,8 @@ extern "C" fn wall_loader(grants: u64) -> ! {
         };
         LOAD_HEAP.reset();
         LOAD_DONE.store(r & !0xFF | found, Ordering::Release);
-        // The render thread waits on the ring's tail between passes.
-        ferros_sys::wake(&RING_TAIL, 1);
+        // The render thread waits on its doorbell between passes (`BELL`).
+        ring_bell();
     }
 }
 
@@ -5057,19 +5114,88 @@ fn px_out(y: i64, height: usize) -> bool {
 }
 
 /// The bars' producer (COMPOSITOR.md, step 1: producers never draw on the render thread). Woken on every render pass (`CON_NUDGE`), it looks at the console's key; when it changed, and the render thread has taken the last result, it draws the console (and the helm, the first time) into `BAR`, decodes the whole of the bars into the back buffers, finds what differs from the front (the top bar's and the bottom bar's rectangles), and says so (`CON_READY`), waking the render thread. On its own stack and heap (`CON_STACK`, `CON_HEAP`).
-/// The slide's measurement (`console_worker`): passes, per part the sum and the worst (circles, sprites, compose, diff, pass, rows, publish), and the frame count when it began.
-struct SlideUs {
-    n: u64,
-    sum: [u64; 7],
-    max: [u64; 7],
-    frames0: u64,
+/// A quick row step as the console's worker made it, for the render thread's slide line (`SLIDE`): the offset, when op 56 moved the row to it (counter ticks) and the frame-start count then (quick.rs `MOVE_T`, `MOVE_FS`), the worker's parts in µs (the console's circles looked at, the row's sprites, the rows copied and composed, the changed rectangle, the whole pass), and the rows composed and the rows published. Set before `CON_READY`, taken by the render thread at the swap.
+#[derive(Clone, Copy)]
+struct Step {
+    off: i64,
+    t: u64,
+    fs: u64,
+    us: [u64; 5],
+    rows: [u64; 2],
 }
-impl SlideUs {
-    const ZERO: SlideUs = SlideUs { n: 0, sum: [0; 7], max: [0; 7], frames0: 0 };
+static mut CON_STEP: Option<Step> = None;
+
+/// The slide's measurement (owner, 2026-11-11, on the Pro: "it's still ridiculously slow. no reason we can't hit 120fps with a sliding console row"), the render thread's, said once a slide lands (open or hidden, `slide_shown`): the steps shown, the moves op 56 had made when the last slide landed (so the steps the map sent), the frame-start counts at the first step's move and at the frame that shows the last, how many steps were shown on the frame after their move, one late, and later, and per part the sum and the worst (the worker's five, the bars' publish, the move to the arm, the rows composed and published).
+struct Slide {
+    shown: u64,
+    moves: u64,
+    fs0: u64,
+    fs1: u64,
+    late: [u64; 3],
+    sum: [u64; 9],
+    max: [u64; 9],
 }
-static mut SLIDE_US: SlideUs = SlideUs::ZERO;
-/// The bars' publish on the render thread at its last swap, µs (stage 2 of its pass).
-static CON_PUB_US: AtomicU64 = AtomicU64::new(0);
+static mut SLIDE: Slide = Slide { shown: 0, moves: 0, fs0: 0, fs1: 0, late: [0; 3], sum: [0; 9], max: [0; 9] };
+
+/// A step the render thread armed (`step`, as the worker sent it, and the bars' publish in µs): counted into `SLIDE`, `shows` the frame-start count of the frame that shows it (the next to start after the arm, which waits for the last armed one to have started). The line said when the step lands the row open or hidden.
+fn slide_shown(step: Step, publish_us: u64, shows: u64, grants: u64) {
+    unsafe {
+        let s = &mut *(&raw mut SLIDE);
+        if s.shown == 0 {
+            s.fs0 = step.fs;
+        }
+        s.shown += 1;
+        s.fs1 = shows;
+        // How many frames after its move it shows: 1, the next (the map moved it as a frame started, and it is on the glass at the one after).
+        let late = shows.wrapping_sub(step.fs);
+        s.late[if late <= 1 { 0 } else if late == 2 { 1 } else { 2 }] += 1;
+        let parts = [step.us[0], step.us[1], step.us[2], step.us[3], step.us[4], publish_us, ferros_sys::us_since(step.t), step.rows[0], step.rows[1]];
+        for j in 0..parts.len() {
+            s.sum[j] += parts[j];
+            s.max[j] = s.max[j].max(parts[j]);
+        }
+        let slide = quick::SLIDE.load(Ordering::Acquire) as i64;
+        if step.off != 0 && step.off != slide {
+            return;
+        }
+        let moves = quick::MOVES.load(Ordering::Acquire);
+        let mut l = Log { grants, buf: [0; 256], n: 0 };
+        l.s(if step.off == 0 { b"display: slide: hidden: " } else { b"display: slide: open: " });
+        l.dec(moves.wrapping_sub(s.moves));
+        l.s(b" steps sent, ");
+        l.dec(s.shown);
+        l.s(b" shown in ");
+        l.dec(s.fs1.wrapping_sub(s.fs0));
+        l.s(b" frame starts; on the next frame ");
+        l.dec(s.late[0]);
+        l.s(b", one late ");
+        l.dec(s.late[1]);
+        l.s(b", later ");
+        l.dec(s.late[2]);
+        l.s(b"\n");
+        l.flush();
+        // The parts, a step's mean and the worst, in two lines (a console line holds 256 bytes).
+        for (line, parts) in [(b"display: slide: worker us mean/worst: circles " as &[u8], 0..5), (b"display: slide: publish us mean/worst ", 5..9)] {
+            let last = parts.end == 9;
+            let mut l = Log { grants, buf: [0; 256], n: 0 };
+            l.s(line);
+            for j in parts {
+                l.s([b"" as &[u8], b", sprites ", b", compose ", b", rect ", b", pass ", b"", b", move to arm ", b"; rows composed ", b", published "][j]);
+                l.dec(s.sum[j] / s.shown);
+                l.s(b"/");
+                l.dec(s.max[j]);
+            }
+            if last {
+                // The row's sprites drawn meanwhile (a look that changed: a tap, the torch answering): a slide alone draws none.
+                l.s(b"; sprites drawn ");
+                l.dec(quick::RENDERS.swap(0, Ordering::Relaxed));
+            }
+            l.s(b"\n");
+            l.flush();
+        }
+        *s = Slide { shown: 0, moves, fs0: 0, fs1: 0, late: [0; 3], sum: [0; 9], max: [0; 9] };
+    }
+}
 /// The console's draws said so far (the first few are logged).
 static mut CON_DRAWS: u64 = 0;
 
@@ -5093,9 +5219,17 @@ extern "C" fn console_worker(arg: u64) -> ! {
         }
         let t_draw = now();
         let console = console_draw(width, height, false);
+        // The console's changed rows decoded once, here, into its own decoded layer (`CON_DEC`): a quick row step copies them from there rather than decoding the console again (2026-11-11: decoding the console's rows was most of a step's 2.8 ms compose on the Pro, for a console that had not changed).
+        if console {
+            let (a, b) = unsafe { CON_ROWS };
+            con_decode(a, b, width);
+        }
         let t_q = now();
-        // The quick row: a circle drawn into its sprite only when its look changed, and the rows its slide owes (quick.rs `update`).
+        // The quick row: a circle drawn into its sprite only when its look changed, and the rows its slide owes (quick.rs `update`); whether the row moved (a step of the slide).
+        let was = quick::composed();
         let quick = quick::update(width, height);
+        // The first compose at start (from none, −1) is not a step.
+        let moved = quick::composed() != was && was >= 0;
         let q_us = ferros_sys::us_since(t_q);
         let helm = helm_draw(width, height);
         CON_HEAP.reset();
@@ -5104,6 +5238,8 @@ extern "C" fn console_worker(arg: u64) -> ! {
             continue;
         }
         let (top, bot) = unsafe { (BAR_TOP, CHROME_BOT) };
+        // Only the quick row changed: what differs from the front is known without looking (below).
+        let quick_only = !console && !helm && !helm_prev;
         // The rows to decode: the console's drawn this time and the last (the back buffer is the front of two draws ago), the quick row's owed, and the helm's whole when it drew. Decoding every row of the bars each draw was a few ms of the worker's for one circle's change.
         let mut now_rows = if console { unsafe { CON_ROWS } } else { (0, 0) };
         if let Some((a, b)) = quick {
@@ -5148,56 +5284,80 @@ extern "C" fn console_worker(arg: u64) -> ! {
             }
         }
         let t_diff = now();
-        // What changed, row by row, back against front: the columns from the first differing pixel to the last, and those whose owner changed in the hit map's bars' ids (`hit::bars_changed`: an owner can change where no pixel does, the quick row's circles counting as open only on its last step), so the map is written there all the same.
-        let (front, back) = unsafe { (core::slice::from_raw_parts(BAR_W as *const u64, (top + bot) * width), core::slice::from_raw_parts(BAR_W_BACK as *const u64, (top + bot) * width)) };
         let mut rects = [draw::Rect::EMPTY; 2];
-        for b in lo..hi {
-            let (f, k) = (&front[b * width..(b + 1) * width], &back[b * width..(b + 1) * width]);
-            let px = (0..width).find(|&x| f[x] != k[x]).map(|x0| (x0, (0..width).rev().find(|&x| f[x] != k[x]).map_or(x0, |x| x) + 1));
-            let (x0, x1) = match (px, hit::bars_changed(b, width)) {
-                (Some(p), Some(i)) => (p.0.min(i.0), p.1.max(i.1)),
-                (Some(p), None) | (None, Some(p)) => p,
-                (None, None) => continue,
-            };
-            let (which, y) = if b < top { (0, b) } else { (1, height - bot + (b - top)) };
-            rects[which] = rects[which].union(draw::Rect { x0: x0 as i32, y0: y as i32, x1: x1 as i32, y1: y as i32 + 1 });
-        }
-        // Measuring the slide (owner, 2026-11-11: "the top console pulldown is stupidly slow and jerky"): each pass that composed the quick row, by part (the console's circles drawn, the row's sprites drawn, the rows decoded and composed, the diff against the front), the whole pass, the rows, and the bars' publish on the render thread (`CON_PUB_US`, the pass before); summed and their worst, with the frames the panel showed meanwhile, said every 32 such passes.
-        if quick.is_some() {
-            let parts = [con_us, q_us, dec_us, ferros_sys::us_since(t_diff), ferros_sys::us_since(t_draw), (hi - lo) as u64, CON_PUB_US.load(Ordering::Relaxed)];
-            unsafe {
-                let s = &mut *(&raw mut SLIDE_US);
-                if s.n == 0 {
-                    s.frames0 = FRAME_STARTS.load(Ordering::Relaxed);
-                }
-                s.n += 1;
-                for j in 0..parts.len() {
-                    s.sum[j] += parts[j];
-                    s.max[j] = s.max[j].max(parts[j]);
-                }
-                if s.n == 1 << 5 {
-                    let mut l = Log { grants: PANIC_GRANTS, buf: [0; 256], n: 0 };
-                    l.s(b"display: slide: 32 passes in ");
-                    l.dec(FRAME_STARTS.load(Ordering::Relaxed).wrapping_sub(s.frames0));
-                    l.s(b" frames; us mean/worst: circles ");
-                    for (j, name) in [b"" as &[u8], b", sprites ", b", compose ", b", diff ", b", pass ", b"; rows ", b"; publish "].iter().enumerate() {
-                        l.s(name);
-                        l.dec(s.sum[j] >> 5);
-                        l.s(b"/");
-                        l.dec(s.max[j]);
+        let (front, back) = unsafe { (core::slice::from_raw_parts(BAR_W as *const u64, (top + bot) * width), core::slice::from_raw_parts(BAR_W_BACK as *const u64, (top + bot) * width)) };
+        if quick_only {
+            // Only the quick row moved or changed its look (owner, 2026-11-11: "no reason we can't hit 120fps with a sliding console row"): the rows that differ are the row's band where the front has it and where the back has it now (quick.rs `update`; the console's rows re-decoded from `CON_DEC` are the front's again), and within a row only the columns where either holds anything of the bars, each row's span (`BAR_SPAN`, front and back; outside its span a decoded row is clear), with any whose owner changed in the hit map's bars' ids (`hit::bars_changed`). No pixel compared: the diff that did it was 1.4 ms of a step on the Pro.
+            let (fs, ks) = unsafe { (core::slice::from_raw_parts(BAR_SPAN as *const (u16, u16), top + bot), core::slice::from_raw_parts(BAR_SPAN_BACK as *const (u16, u16), top + bot)) };
+            if let Some((a, b)) = quick {
+                for row in a..b {
+                    let (mut x0, mut x1) = (width, 0usize);
+                    for s in [fs[row], ks[row], hit::bars_changed(row, width).map_or((0, 0), |(p, q)| (p as u16, q as u16))] {
+                        if s.0 < s.1 {
+                            x0 = x0.min(s.0 as usize);
+                            x1 = x1.max(s.1 as usize);
+                        }
                     }
-                    // How many of the row's sprites were drawn in those passes (a look that changed: a tap, the torch answering): a slide alone draws none.
-                    l.s(b"; sprites drawn ");
-                    l.dec(quick::RENDERS.swap(0, Ordering::Relaxed));
-                    l.s(b"\n");
-                    l.flush();
-                    *s = SlideUs::ZERO;
+                    if x0 < x1 {
+                        rects[0] = rects[0].union(draw::Rect { x0: x0 as i32, y0: row as i32, x1: x1 as i32, y1: row as i32 + 1 });
+                    }
                 }
             }
+        } else {
+            // What changed, row by row, back against front: the columns from the first differing pixel to the last, and those whose owner changed in the hit map's bars' ids (`hit::bars_changed`: an owner can change where no pixel does, the quick row's circles counting as open only on its last step), so the map is written there all the same.
+            for b in lo..hi {
+                let (f, k) = (&front[b * width..(b + 1) * width], &back[b * width..(b + 1) * width]);
+                let px = (0..width).find(|&x| f[x] != k[x]).map(|x0| (x0, (0..width).rev().find(|&x| f[x] != k[x]).map_or(x0, |x| x) + 1));
+                let (x0, x1) = match (px, hit::bars_changed(b, width)) {
+                    (Some(p), Some(i)) => (p.0.min(i.0), p.1.max(i.1)),
+                    (Some(p), None) | (None, Some(p)) => p,
+                    (None, None) => continue,
+                };
+                let (which, y) = if b < top { (0, b) } else { (1, height - bot + (b - top)) };
+                rects[which] = rects[which].union(draw::Rect { x0: x0 as i32, y0: y as i32, x1: x1 as i32, y1: y as i32 + 1 });
+            }
+        }
+        // A step of the slide, for the render thread's slide line (`slide_shown`): the move it shows (quick.rs `MOVE_T`, `MOVE_FS`: the latest, which is the one composed) and this pass's parts.
+        unsafe {
+            CON_STEP = moved.then(|| Step {
+                off: quick::composed(),
+                t: quick::MOVE_T.load(Ordering::Acquire),
+                fs: quick::MOVE_FS.load(Ordering::Acquire),
+                us: [con_us, q_us, dec_us, ferros_sys::us_since(t_diff), ferros_sys::us_since(t_draw)],
+                rows: [(hi - lo) as u64, if rects[0].is_empty() { 0 } else { (rects[0].y1 - rects[0].y0) as u64 }],
+            });
         }
         unsafe { CON_RECT = rects };
         CON_READY.store(1, Ordering::Release);
-        ferros_sys::wake(&RING_TAIL, 1);
+        ring_bell();
+    }
+}
+
+/// One drawn row of the bars (`BAR`, fluor's α + darkness) decoded to working values (`working`) into `out`; returns the columns holding anything, (from, to), (width, 0) for none.
+fn decode_row(bar: &[u64], out: &mut [u64]) -> (usize, usize) {
+    let width = out.len();
+    let (mut l, mut rr) = (width, 0);
+    for xx in 0..width {
+        out[xx] = working(bar[xx], G2T16);
+        if bar[xx] >> 48 != 0 {
+            if l == width {
+                l = xx;
+            }
+            rr = xx + 1;
+        }
+    }
+    (l, rr)
+}
+
+/// The console's decoded layer (owner, 2026-11-11, on the Pro: "no reason we can't hit 120fps with a sliding console row"): the console's drawn rows (`BAR`'s first `CHROME_TOP`) decoded once each draw that changed them (`con_decode`), and each row's columns holding any of it (from, to), (width, 0) for none. `bar_decode` copies a row from here, so a step of the quick row's slide decodes nothing of a console that did not change. On husky 288 rows, 3.0 MiB.
+static mut CON_DEC: usize = 1;
+static mut CON_DEC_SPAN: usize = 1;
+
+/// The console's rows `lo..hi` (`CON_ROWS`, inside its chrome rows by `console_draw`'s construction) decoded into `CON_DEC`.
+fn con_decode(lo: usize, hi: usize, width: usize) {
+    for b in lo..hi {
+        let (bar, out, span) = unsafe { (core::slice::from_raw_parts((BAR as *const u64).add(b * width), width), core::slice::from_raw_parts_mut((CON_DEC as *mut u64).add(b * width), width), &mut *(CON_DEC_SPAN as *mut (usize, usize)).add(b)) };
+        *span = decode_row(bar, out);
     }
 }
 
@@ -5208,24 +5368,16 @@ fn bar_decode(b0: usize, rows: usize, width: usize, height: usize) {
     for yy in 0..rows {
         let b = b0 + yy;
         let out = &mut cw[yy * width..(yy + 1) * width];
-        let (mut l, mut rr) = (width, 0);
-        // The drawn row this decoded row comes from: the same in the chrome rows, none below them in the top band, and the helm's after the gap.
-        let src = if b < ct { Some(b) } else if b < bt { None } else { Some(b - (bt - ct)) };
-        match src {
-            Some(s) => {
-                let bar = unsafe { core::slice::from_raw_parts((BAR as *const u64).add(s * width), width) };
-                for xx in 0..width {
-                    out[xx] = working(bar[xx], G2T16);
-                    if bar[xx] >> 48 != 0 {
-                        if l == width {
-                            l = xx;
-                        }
-                        rr = xx + 1;
-                    }
-                }
-            }
-            None => out.fill(CLEAR),
-        }
+        // Where this decoded row comes from: the console's decoded layer in the chrome rows (`CON_DEC`, a copy), nothing below them in the top band, and the helm's drawn row after the gap.
+        let (mut l, mut rr) = if b < ct {
+            out.copy_from_slice(unsafe { core::slice::from_raw_parts((CON_DEC as *const u64).add(b * width), width) });
+            unsafe { *(CON_DEC_SPAN as *const (usize, usize)).add(b) }
+        } else if b < bt {
+            out.fill(CLEAR);
+            (width, 0)
+        } else {
+            decode_row(unsafe { core::slice::from_raw_parts((BAR as *const u64).add((b - (bt - ct)) * width), width) }, out)
+        };
         if b < bt {
             let (ql, qr) = quick::compose(b, out, width, height);
             if ql < qr {
@@ -6195,6 +6347,13 @@ static mut RING_RLEN: [u8; RING] = [0; RING];
 /// Slots consumed (the render thread advances it) and filled (the receive thread advances it); the difference is the queue.
 static RING_HEAD: AtomicU64 = AtomicU64::new(0);
 static RING_TAIL: AtomicU64 = AtomicU64::new(0);
+/// The render thread's doorbell: every thread with work for it (a request in the ring, the console's worker's bars, a window's end, the wallpaper, a dev switch) counts it up and wakes it (`ring_bell`), and the render thread sleeps on it between passes, from the count it read at the pass's top. Until 2026-11-11 it slept on the ring's tail, which only the receive thread moves: the console's worker woke it without changing the word, so bars made while a pass ran (the 10 Hz flip's present holds a pass up to a frame) were not seen until the pass after the next deadline, the flip a tenth of a second later, and a sliding quick row stood still until then (owner, 2026-11-11, on the Pro: "It looks WAY less than that. is it a 10-120hz flip issue?").
+static BELL: AtomicU64 = AtomicU64::new(0);
+#[inline]
+fn ring_bell() {
+    BELL.fetch_add(1, Ordering::Release);
+    ferros_sys::wake(&BELL, 1);
+}
 /// Per slot, how many requests the render thread has completed in it: a waiting receive thread sees it move.
 static RING_DONE: [AtomicU64; RING] = [const { AtomicU64::new(0) }; RING];
 static FRAMES: AtomicU64 = AtomicU64::new(0);
@@ -6325,7 +6484,7 @@ extern "C" fn receive(grants: u64) -> ! {
             tail += 1;
             RING_TAIL.store(tail, Ordering::Release);
         }
-        ferros_sys::wake(&RING_TAIL, 1);
+        ring_bell();
         if op_is_sync(op) {
             while RING_DONE[slot].load(Ordering::Acquire) == done {
                 ferros_sys::wait(&RING_DONE[slot], done, 0);
@@ -6570,6 +6729,9 @@ fn server(grants: u64) -> ! {
         log.dec((ALLOC.used() - body_at) as u64 >> 10);
         log.s(b" KiB\n");
         log.flush();
+        // The console's decoded layer (`CON_DEC`), its chrome rows: clear until its first draw, which is whole.
+        CON_DEC = alloc::vec![CLEAR; top * width].leak().as_mut_ptr() as usize;
+        CON_DEC_SPAN = alloc::vec![(width, 0usize); top].leak().as_mut_ptr() as usize;
         let top = quick::rows(width, height, top);
         BAR_TOP = top;
         quick::init(width, height);
@@ -6597,6 +6759,8 @@ fn server(grants: u64) -> ! {
     // Each publishing thread's flight scratch (`flight_row_buf`), kept with the rest.
     unsafe {
         FLIGHT_ROWS = alloc::vec![0u64; FLIGHT_SCRATCH * (PUB_WORKERS + 1)].leak().as_mut_ptr() as usize;
+        // Each publishing thread's row of codes (`codes_row`): 14 KiB a thread.
+        CODES_ROWS = alloc::vec![core::mem::zeroed::<neon::Codes16>(); CODES_BLOCKS * (PUB_WORKERS + 1)].leak().as_mut_ptr() as usize;
         FLIGHT_TEXT = alloc::vec![0u32; height].leak().as_mut_ptr() as usize;
     }
     heap_at[4] = ALLOC.used();
@@ -6713,6 +6877,8 @@ fn server(grants: u64) -> ! {
     let mut armed: Option<u32> = Some(pipe.arm(win));
     // Whether this pass swapped in bars that changed: armed for the next frame at the pass's end (the flip's place).
     let mut bars_present = false;
+    // The quick row's step those bars carry, with their publish in µs: counted into the slide line when armed (`slide_shown`).
+    let mut bars_step: Option<(Step, u64)> = None;
 
     let mut frames = 0u64;
     // A client owns the surface from its first `begin` on; until then this process paints its own screen and clock.
@@ -6783,8 +6949,6 @@ fn server(grants: u64) -> ! {
     if unsafe { WALL_BUF } != 0 {
         wall_load(false);
     }
-    // What the ring's tail was when this pass last looked: the wait at the end of a pass returns as soon as it moves.
-    let mut seen_tail = 0u64;
     let (mut frames_last_tick, mut starts_last_tick) = (0u64, 0u64);
     let mut clock_due = false;
     // The clock face's 60 directions, once.
@@ -6795,6 +6959,8 @@ fn server(grants: u64) -> ! {
         }
     }
     loop {
+        // The doorbell as this pass starts (`BELL`): the wait at its end sleeps only while nobody has rung since.
+        let bell = BELL.load(Ordering::Acquire);
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
         // One op, as the endpoint's header lists them: the reply's first byte is the status, the return the reply's length.
@@ -8389,7 +8555,6 @@ fn server(grants: u64) -> ! {
         // The hit map's development view switched (op 58): its phase owes the whole screen.
         hit::view_step(width, height);
         // Windows whose process ended (the kernel cleared or renewed its surface's generation, `live_gen`; `reaper` wakes this pass when it does): gone, and what was behind them shows; the last one gone, the map has the glass again. Then the corners' clock, once a minute while windows are up, into every phase over its corner.
-        let reaps_seen = REAPS.load(Ordering::Acquire);
         unsafe {
             let mut gone = false;
             for sk in 0..SURFACES {
@@ -8416,8 +8581,6 @@ fn server(grants: u64) -> ! {
             stage_us[1] = ferros_sys::us_since(t_w);
             let t_bars = now();
             // The bars on every screen (in front of the home screen and of every app), drawn by their worker, never here (COMPOSITOR.md, step 1): nudged on every pass to look at what they show; when it has drawn, their buffers swap here, at a pass's top where no publish is reading, and only the rectangles that changed go into every phase.
-            CON_NUDGE.fetch_add(1, Ordering::Release);
-            ferros_sys::wake(&CON_NUDGE, 1);
             let changed = if CON_READY.load(Ordering::Acquire) != 0 {
                 let (w, s) = (BAR_W, BAR_SPAN);
                 BAR_W = BAR_W_BACK;
@@ -8434,20 +8597,24 @@ fn server(grants: u64) -> ! {
                 }
                 // The hit map's share of the bars with them; the whole map again when the row came or went (everything inside the app's circle changed hands).
                 hit::bars_swap(width, height);
+                // A step of the quick row's slide, for its line at the arm (`slide_shown`).
+                bars_step = (*(&raw mut CON_STEP)).take().map(|s| (s, 0));
                 CON_READY.store(0, Ordering::Release);
                 attest_mark(grants, 4, b"console frame taken");
                 r
             } else {
                 [draw::Rect::EMPTY; 2]
             };
+            // The nudge after the swap, so the worker's look comes with its back buffers free: a step op 56 sent while the last result waited here was dropped by the worker (it only draws once the last is taken) and shown a step late, two halvings at once (2026-11-11). Now it makes the next step while this pass publishes the last.
+            CON_NUDGE.fetch_add(1, Ordering::Release);
+            ferros_sys::wake(&CON_NUDGE, 1);
             for r in changed {
                 if r.is_empty() {
                     continue;
                 }
                 if { APP }.is_some() {
-                    for k in 0..PHASES {
-                        publish_app(r, &tabs, k, width, height, k == 0);
-                    }
+                    // Every phase in one pass of the rows: composed and coded once, dithered four times (`publish_app_mask`).
+                    publish_app_mask(r, &tabs, (1 << PHASES) - 1, width, height, true);
                 } else {
                     // The home screen: the canvas by its address (`pixels` is held by the request handler's closure here).
                     let canvas = core::slice::from_raw_parts(back as *const Px, width * height);
@@ -8458,8 +8625,9 @@ fn server(grants: u64) -> ! {
             // Armed at the pass's end (`bars_present`), where the flip arms.
             bars_present = !changed[0].is_empty() || !changed[1].is_empty();
             stage_us[2] = ferros_sys::us_since(t_bars);
-            // For the console worker's slide measurement: the bars' publish this pass (quick.rs, QUICK.md).
-            CON_PUB_US.store(stage_us[2], Ordering::Relaxed);
+            if let Some((_, us)) = bars_step.as_mut() {
+                *us = stage_us[2];
+            }
         }
         // The quick row's screencap (QUICK.md; op 56 flag bit 1): taken as op 30 takes one, the pass the bars on the screen hold none of the row, so the row that asked for it is not in it. Until the clipboard exists (owner, 2026-11-07: "when we get the clipboard running that's where the screencap will live") the frame stays in the free surface op 30 wrote it to, its address on the console for tools/screencap's reader.
         if quick::CAPTURE.load(Ordering::Acquire) && unsafe { quick::EMPTY_FRONT } {
@@ -8787,6 +8955,10 @@ fn server(grants: u64) -> ! {
             pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
             let _ = pipe.present(win);
         }
+        // The quick row moving is the person's hand on the glass, as a camera op is (owner, 2026-11-11, on the Pro: "I thought finger down triggered the 120..."): the stale phases wait for it to stop. The fill below publishes a whole phase in a pass before this pass's arm, and ran between the steps of a slide, since op 56 never counted as an interaction.
+        if bars_step.is_some() {
+            last_interaction = now();
+        }
         // A stale phase first, from the back buffer, one per pass so a call waiting on the endpoint is never held up by more than one.
         let t_idle = now();
         // Only once the frames have stopped coming (an eighth of a second without a camera op): while a finger moves, the phases wait and the frames go out spatial only, rather than every frame also paying for a stale phase.
@@ -8806,7 +8978,9 @@ fn server(grants: u64) -> ! {
         // Spatial only (preference 4): no flips, so the panel can rest at its idle floor; the phase on the layer already carries a complete spatial dither.
         let temporal_on = ferros_sys::pref(ferros_sys::PREF_DITHER) == 0;
         // The flip this pass decided at its top, when the clock was drawn into the phase it shows: re-reading the time here flipped, now and then, to a phase whose clock had not been drawn (its edge 400 ms behind, 2026-10-24).
-        if unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean && flip_due {
+        // Bars that changed this pass go out armed, not on a flip (below): a flip's present holds this thread until its frame starts, and the next step of a slide with it.
+        let bars_arm = bars_present && !screen_off && RAW_HOLD.load(Ordering::Acquire) == 0;
+        if unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean && flip_due && !bars_arm {
             // The focused widget at the panel's rate, everything else on the 10 Hz flips. In focus the timer is half a frame and `settle` (which holds a flip until the last one has started) does the pacing: a full frame's timer started after each flip's own work slipped a refresh now and then (100 a second, 2026-10-25).
             // (akita's flips at the panel's rate, tried 2026-11-08, showed phases before their insides were published: every column the circle's top row repeated down the screen, orange in a dev build. Back at 10 Hz until the phases are published in step with the flips: the owner's "proper rotating synchronous dither buffer".)
             next_flip = now() + if unsafe { FOCUS } != 0 { freq() / 240 } else { freq() / 10 };
@@ -8816,16 +8990,26 @@ fn server(grants: u64) -> ! {
             let _ = pipe.present(win);
             frames += 1;
                         FRAMES.store(frames, Ordering::Relaxed);
-        } else if bars_present && !screen_off && RAW_HOLD.load(Ordering::Acquire) == 0 {
+        } else if bars_arm {
             // The bars changed this pass (`bars_present`): the phase on the layer, which holds the change (published into all four), armed again for the next frame, as a camera op's frame is (owner, 2026-11-11: "the fps is stupidly bad, especially the console second row slide up/down": the slide showed at the 10 Hz flips). The map steps the slide by these shown frames (op 24), so it runs at the rate they go out.
             pipe.settle(&mut armed, true);
+            // The frame starts so far, the last armed one's among them: this one is the next.
+            let starts = FRAME_STARTS.load(Ordering::Acquire);
             ferros_sys::dma_barrier();
             pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
             armed = Some(pipe.arm(win));
             frames += 1;
             FRAMES.store(frames, Ordering::Relaxed);
+            // The 10 Hz flip waits a tenth of a second after the last bars armed, so none falls between the steps of a slide (a flip's present holds this thread until its frame starts: the next step's publish waited behind it, 2026-11-11). Once the bars stop changing the flips come back; a widget in focus keeps its own rate.
+            if unsafe { FOCUS } == 0 {
+                next_flip = now() + freq() / 10;
+            }
+            if let Some((s, us)) = bars_step.take() {
+                slide_shown(s, us, starts + 1, grants);
+            }
         }
         bars_present = false;
+        bars_step = None;
         let flip_us = ferros_sys::us_since(t_flip);
         let pass_us = ferros_sys::us_since(t_pass);
         if pass_us > 30_000 {
@@ -8848,7 +9032,7 @@ fn server(grants: u64) -> ! {
             tlog.s(b" ms\n");
             tlog.flush();
         }
-        // Until a request arrives (the receive thread moves the ring's tail) or the next deadline: the second's tick; the flip, only while a flip can happen (while a finger moves the next phase stays dirty and `next_flip` falls into the past — a wake set from it made the old sleep return at once and this loop spin its slice, 2026-10-23); and a stale phase to refill once the frames have stopped coming.
+        // Until the doorbell rings (`BELL`: a request, the bars, a window's end) or the next deadline: the second's tick; the flip, only while a flip can happen (while a finger moves the next phase stays dirty and `next_flip` falls into the past — a wake set from it made the old sleep return at once and this loop spin its slice, 2026-10-23); and a stale phase to refill once the frames have stopped coming.
         let flip_possible = unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean;
         let mut wake = next_tick;
         if flip_possible {
@@ -8869,12 +9053,8 @@ fn server(grants: u64) -> ! {
                 }
             }
         }
-        let tail = RING_TAIL.load(Ordering::Acquire);
-        // A ring that came after this pass's top (`reaper`'s wake found this thread busy, not waiting): straight on to the next pass, which drops the window.
-        if tail == seen_tail && REAPS.load(Ordering::Acquire) == reaps_seen {
-            ferros_sys::wait(&RING_TAIL, tail, wake);
-        }
-        seen_tail = RING_TAIL.load(Ordering::Acquire);
+        // Anything rung since this pass's top (`ring_bell`: a request, the bars, a window's end) found this thread busy, not waiting: the word moved, so the wait returns at once and the next pass takes it.
+        ferros_sys::wait(&BELL, bell, wake);
     }
 }
 
