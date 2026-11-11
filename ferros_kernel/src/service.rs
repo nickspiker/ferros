@@ -3319,7 +3319,10 @@ pub fn run(mut b: Boot) -> ! {
                     use core::sync::atomic::Ordering::Relaxed;
                     match &cmd.params[..] {
                         b"ufs runs on" | b"ufs runs off" => ferros_hal::ufs::RUNS_ON.store(cmd.params == b"ufs runs on", Relaxed),
-                        b"ufs runs reset" => crate::process::BLOCK_STATS.iter().for_each(|s| s.store(0, Relaxed)),
+                        b"ufs runs reset" => {
+                            crate::process::BLOCK_STATS.iter().for_each(|s| s.store(0, Relaxed));
+                            ferros_hal::ufs::CMD_TICKS.iter().for_each(|s| s.store(0, Relaxed));
+                        }
                         _ => {}
                     }
                     let s = |i: usize| crate::process::BLOCK_STATS[i].load(Relaxed);
@@ -3331,6 +3334,13 @@ pub fn run(mut b: Boot) -> ! {
                     };
                     resp.extend_from_slice(alloc::format!("ufs runs {}, PRDT stride A#{} (0 not probed yet, 1 refused: a block a command)\n", if ferros_hal::ufs::RUNS_ON.load(Relaxed) { "on" } else { "off" }, ferros_hal::ufs::PRDT_STRIDE.load(Relaxed)).as_bytes());
                     resp.extend_from_slice(line("reads", 0).as_bytes());
+                    // The reads' time split (2026-11-11): the UFS commands alone (the link's wake, the cache upkeep, the doorbell to completion) and the rest (the copy to the caller), and how many were a large value's read-ahead (MOVING_BLOCKS or more).
+                    // The command's ticks are a part of the call's (both from the same start, added under the kernel lock), so the subtraction holds. WHY the max: no reads yet is no time, and the rate would divide by zero.
+                    let (calls, blocks, inside, cmd) = (s(0), s(1), s(2) * 1_000_000 / f, s(6) * 1_000_000 / f);
+                    resp.extend_from_slice(alloc::format!("    in the commands A#{} ms (A#{} MB/s), copying out A#{} ms; A#{} of A#{} calls a read-ahead\n", cmd / 1000, (blocks << 12) / cmd.max(1), (inside - cmd) / 1000, s(7), calls).as_bytes());
+                    // Every UFS command's split (the kernel's own vault and flash log included): the cache upkeep around it, and the doorbell to completion.
+                    let h = |i: usize| ferros_hal::ufs::CMD_TICKS[i].load(Relaxed) * 1_000_000 / f / 1000;
+                    resp.extend_from_slice(alloc::format!("  every command: cache upkeep A#{} ms, doorbell to completion A#{} ms\n", h(0), h(1)).as_bytes());
                     resp.extend_from_slice(line("writes", 3).as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;

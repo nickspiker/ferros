@@ -216,16 +216,17 @@ fn grow() -> ! {
 /// The wallpaper read's size: the Pro's screen, three planes of 16-bit samples (24,127,488 bytes; the made wallpaper's document is 24,128,145).
 const WALL: usize = 6 * 1344 * 2992;
 
-/// The value the size of a wallpaper written in the display's transfers (ferros_sys::STORE_MAX), then read back the way the display reads it twice, timed: the first read after the write and a second, so what a cache holds shows. The vault process says each read's stages (its read report).
+/// The value the size of a wallpaper written in one-transfer pieces (ferros_sys::STORE_MAX), then read back twice in a get's largest (ferros_sys::STORE_GET_MAX since 2026-11-11, STORE_MAX from the first refusal: a kernel or vault process from before), timed: the first read after the write and a second, so what a cache holds shows. The vault process says each read's stages (its read report, two lines).
 /// Input 04 reads the value input 03 left (and deletes it), so the reads' own block calls can be counted apart from the write's.
 fn wall(read_only: bool) -> ! {
-    let mut buf = alloc::vec![0u8; ferros_sys::STORE_MAX];
-    let mut want = alloc::vec![0u8; ferros_sys::STORE_MAX];
+    let mut buf = alloc::vec![0u8; ferros_sys::STORE_GET_MAX];
+    let mut want = alloc::vec![0u8; ferros_sys::STORE_GET_MAX];
+    let mut get = ferros_sys::STORE_GET_MAX;
     let t = now();
     let mut off = if read_only { WALL } else { 0 };
     let mut wrote = true;
     while off < WALL {
-        let n = (WALL - off).min(buf.len());
+        let n = (WALL - off).min(ferros_sys::STORE_MAX);
         grow_fill(off, &mut buf[..n]);
         if !ferros_sys::store_set_at(store(), b"wall", off, &buf[..n], off + n < WALL) {
             wrote = false;
@@ -238,19 +239,22 @@ fn wall(read_only: bool) -> ! {
     for pass in 0..2 {
         let t = now();
         let mut off = 0;
+        let mut calls = 0;
         while same && off < WALL {
-            let n = (WALL - off).min(buf.len());
+            let n = (WALL - off).min(get);
+            calls += 1;
             match ferros_sys::store_get_at(store(), b"wall", off, &mut buf[..n]) {
                 Some(whole) if whole == WALL => {
                     grow_fill(off, &mut want[..n]);
                     same &= buf[..n] == want[..n];
                     off += n;
                 }
+                None if n > ferros_sys::STORE_MAX => get = ferros_sys::STORE_MAX,
                 _ => same = false,
             }
         }
         let us = (now() - t) * 1_000_000 / freq();
-        say!("vaulttest: wall: read {} in {} ms ({} MB/s), pass {}, as written: {}", WALL, us / 1000, WALL as u64 / us, pass, same);
+        say!("vaulttest: wall: read {} in {} ms ({} MB/s, {} gets of up to {} KiB, each checked here), pass {}, as written: {}", WALL, us / 1000, WALL as u64 / us, calls, get >> 10, pass, same);
     }
     if !read_only {
         say!("vaulttest: wall: kept for input 04");

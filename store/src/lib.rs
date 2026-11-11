@@ -62,8 +62,24 @@ pub struct Sealed {
 }
 
 /// Opens a read's pieces under the request's sealing key, perhaps several at once on other threads (the vault process's helpers). Each piece is opened by `open_piece`.
+///
+/// Streamed (2026-11-11, owner: "2.9s for a 24MB read is embarassing"): `read_with` hands the pieces over one at a time as it fetches them, so other threads open piece i while it fetches piece i + 1 (the fetch, with each block's BLAKE3 guard, is the engine's and runs on the calling thread alone): `start` with the batch's slots, `ready(i)` once slot i holds its piece, `finish` with them all, which returns only when every piece has been opened. By default nothing happens until `finish`, which opens them all (`open_all`).
 pub trait Opener {
     fn open_all(&mut self, seal: &[u8; 32], pieces: &mut [Sealed]);
+    /// A streamed batch of `n` slots at `pieces` begins under `seal`.
+    ///
+    /// # Safety
+    /// The `n` slots stay where they are, and the key stays valid, until `finish` returns. The caller writes slot i only before `ready(i)` and touches no slot from `ready(i)` until `finish`; an opener touches slot i only from `ready(i)` until `finish` returns.
+    unsafe fn start(&mut self, _seal: &[u8; 32], _pieces: *mut Sealed, _n: usize) {}
+    /// Slot `i` of the batch holds its sealed piece.
+    fn ready(&mut self, _i: usize) {}
+    /// Every slot of the batch `start` began is ready: return once all are opened.
+    ///
+    /// # Safety
+    /// As `start`: the same `n` slots at `pieces`, every one ready.
+    unsafe fn finish(&mut self, seal: &[u8; 32], pieces: *mut Sealed, n: usize) {
+        self.open_all(seal, unsafe { core::slice::from_raw_parts_mut(pieces, n) });
+    }
 }
 
 /// Every piece here, one after another.
@@ -195,11 +211,35 @@ pub struct Store<A: BlockDev, B: BlockDev, N: Nonces> {
     /// The last head and the last piece opened, by address and a hash of the sealing key that opened them (the address alone is not enough: a caller with the right address key and the wrong sealing key must not be served what it could not open, which the tests caught; a hash, so no key outlives the request it came with, VAULT-OUT.md): a large value is read a few KiB at a time (the kernel hands a process 4 KiB a call), and without these every read opened its head again and a 64 KiB piece sixteen times over. Dropped whenever a value is written or removed.
     last_head: Option<([u8; 32], [u8; 32], Head)>,
     last_piece: Option<([u8; 32], [u8; 32], Vec<u8>)>,
+    /// A counter for `read_with`'s stages (`set_clock`), and what it has counted (`ReadTicks`); none until set.
+    clock: Option<fn() -> u64>,
+    ticks: ReadTicks,
+}
+
+/// Where `read_with`'s own time goes, in the clock's ticks (`Store::set_clock`), summed over reads (owner, 2026-11-11: the 24 MB read measured before it is fixed): fetching the sealed pieces (the engine's index walk to each piece, its furrows' reads, each block's BLAKE3 guard and decode, the furrows joined), and copying the opened pieces into the caller's buffer with the wipe of what was opened. The opening is the opener's to time.
+#[derive(Clone, Copy, Default)]
+pub struct ReadTicks {
+    pub fetch: u64,
+    pub copy: u64,
 }
 
 impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
     pub fn new(vault: Vault<A, B>, nonces: N, now: fn() -> i64) -> Self {
-        Store { vault, nonces, now, last_head: None, last_piece: None }
+        Store { vault, nonces, now, last_head: None, last_piece: None, clock: None, ticks: ReadTicks::default() }
+    }
+
+    /// Time `read_with`'s stages with `clock` (any monotonic counter: the vault process gives the generic timer).
+    pub fn set_clock(&mut self, clock: fn() -> u64) {
+        self.clock = Some(clock);
+    }
+
+    /// The stages' time so far (`ReadTicks`): a reader takes the difference across a read.
+    pub fn read_ticks(&self) -> ReadTicks {
+        self.ticks
+    }
+
+    fn tick(&self) -> u64 {
+        self.clock.map(|c| c()).unwrap_or(0)
     }
 
     /// The engine underneath (its stats, its commit).
@@ -299,21 +339,42 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         let (k0, k1) = (offset >> PIECE_LOG2, (end - 1) >> PIECE_LOG2);
         let id_k = Self::key_id(d);
         let cached = |s: &Self, addr: &[u8; 32]| matches!(&s.last_piece, Some((a, k, _)) if a == addr && *k == id_k);
-        // The pieces the kept one does not cover, sealed, in order.
-        let mut sealed: Vec<Sealed> = Vec::new();
-        for k in k0..=k1 {
-            let addr = Self::piece_addr(d, &h.id, k);
-            if !cached(self, &addr) {
-                let bytes = self.vault.get(&addr)?.ok_or(Error::Format)?;
-                sealed.push(Sealed { addr, bytes, ok: false });
+        // The pieces the kept one does not cover, in order: fetched sealed one after another, each handed to the opener as it arrives (streamed: opened elsewhere while the next is fetched), all opened when `finish` returns.
+        let t = self.tick();
+        let want: Vec<[u8; 32]> = (k0..=k1).map(|k| Self::piece_addr(d, &h.id, k)).filter(|a| !cached(self, a)).collect();
+        let n = want.len();
+        let mut sealed: Vec<Sealed> = (0..n).map(|_| Sealed { addr: [0; 32], bytes: Vec::new(), ok: false }).collect();
+        let base = sealed.as_mut_ptr();
+        let mut fetched: Result<()> = Ok(());
+        if n > 0 {
+            // SAFETY: `sealed` is neither moved nor resized, and `d` outlives the batch, until `finish` returns below; each slot is written thru `base` before its `ready` and not touched from it until then.
+            unsafe { opener.start(&d.seal, base, n) };
+            for (i, addr) in want.iter().enumerate() {
+                // After a failed fetch the rest stay empty (they fail to open, at once) and are handed over all the same, so `finish` still waits for whatever was already being opened.
+                if fetched.is_ok() {
+                    match self.vault.get(addr) {
+                        Ok(Some(bytes)) => unsafe { *base.add(i) = Sealed { addr: *addr, bytes, ok: false } },
+                        Ok(None) => fetched = Err(Error::Format),
+                        Err(e) => fetched = Err(e.into()),
+                    }
+                }
+                opener.ready(i);
             }
         }
-        if !sealed.is_empty() {
-            opener.open_all(&d.seal, &mut sealed);
-            if sealed.iter().any(|p| !p.ok) {
+        self.ticks.fetch += self.tick() - t;
+        if n > 0 {
+            // SAFETY: as `start`: every slot is ready; once this returns no other thread touches them.
+            unsafe { opener.finish(&d.seal, base, n) };
+            if fetched.is_err() || sealed.iter().any(|p| !p.ok) {
+                // Whatever did open goes, as it does after a good read.
+                for p in sealed.iter_mut() {
+                    p.bytes.fill(0);
+                }
+                fetched?;
                 return Err(Error::Open);
             }
         }
+        let t = self.tick();
         let mut next = 0;
         let mut at = offset;
         for k in k0..=k1 {
@@ -344,6 +405,7 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         for p in sealed.iter_mut() {
             p.bytes.fill(0);
         }
+        self.ticks.copy += self.tick() - t;
         Ok(Some(h.len))
     }
 
@@ -739,6 +801,95 @@ mod tests {
         }
         s.forget();
         assert!(matches!(s.read_with(&d, b"made", 0, &mut [0u8; 16], &mut Refuses), Err(Error::Open)));
+    }
+
+    /// A streamed opener (the vault process's helpers): a second thread opens each piece from its `ready` while the reader fetches the next, `finish` joins it.
+    struct Streamed {
+        tx: Option<std::sync::mpsc::Sender<usize>>,
+        worker: Option<std::thread::JoinHandle<usize>>,
+        readies: usize,
+        finishes: usize,
+    }
+    /// The batch's slots and key, handed to the worker thread. SAFETY (the `Send`): `Opener::start`'s contract keeps them valid and the slot touched by one side at a time until `finish` joins the worker.
+    struct Slots(*mut Sealed, [u8; 32]);
+    unsafe impl Send for Slots {}
+    impl Opener for Streamed {
+        fn open_all(&mut self, seal: &[u8; 32], pieces: &mut [Sealed]) {
+            Serial.open_all(seal, pieces);
+        }
+        unsafe fn start(&mut self, seal: &[u8; 32], pieces: *mut Sealed, _n: usize) {
+            let (tx, rx) = std::sync::mpsc::channel::<usize>();
+            let slots = Slots(pieces, *seal);
+            self.tx = Some(tx);
+            self.worker = Some(std::thread::spawn(move || {
+                let s = slots;
+                let mut opened = 0;
+                for i in rx {
+                    open_piece(&s.1, unsafe { &mut *s.0.add(i) });
+                    opened += 1;
+                }
+                opened
+            }));
+        }
+        fn ready(&mut self, i: usize) {
+            self.readies += 1;
+            self.tx.as_ref().unwrap().send(i).unwrap();
+        }
+        unsafe fn finish(&mut self, _: &[u8; 32], _: *mut Sealed, n: usize) {
+            self.finishes += 1;
+            self.tx = None;
+            assert_eq!(self.worker.take().unwrap().join().unwrap(), n);
+        }
+    }
+
+    /// Streamed reads: 1 MiB transfers of a 3 MB value come back whole from aligned and unaligned offsets, each piece handed over once and opened on the other thread; a wrong sealing key still fails the read, after the batch is joined.
+    #[test]
+    fn read_streamed() {
+        let mut s = store(1 << 14);
+        let d = domain(7);
+        let v = bytes(3_000_000 + 17, 8);
+        s.put(&d, b"made", &v).unwrap();
+        let t = 1 << 20;
+        for start in [0usize, 5, PIECE - 3] {
+            s.forget();
+            let mut o = Streamed { tx: None, worker: None, readies: 0, finishes: 0 };
+            let mut back = vec![0u8; v.len() - start];
+            for off in (start..v.len()).step_by(t) {
+                let end = (off + t).min(v.len());
+                assert_eq!(s.read_with(&d, b"made", off as u64, &mut back[off - start..end - start], &mut o).unwrap(), Some(v.len() as u64));
+            }
+            assert_eq!(back, v[start..], "from {start}");
+            assert_eq!(o.readies, v.len().div_ceil(PIECE) - start / PIECE, "from {start}");
+            assert_eq!(o.finishes, (v.len() - start).div_ceil(t), "from {start}");
+        }
+        let mut wrong = domain(9);
+        wrong.addr = d.addr;
+        s.forget();
+        let mut o = Streamed { tx: None, worker: None, readies: 0, finishes: 0 };
+        assert!(matches!(s.read_with(&wrong, b"made", 0, &mut vec![0u8; t], &mut o), Err(Error::Open)));
+        // The head refuses the wrong key first: no batch begins.
+        assert_eq!(o.finishes, 0);
+        // A piece that will not open (its bytes tampered on the way) fails the read after the batch is joined.
+        struct Tamper(Streamed);
+        impl Opener for Tamper {
+            fn open_all(&mut self, seal: &[u8; 32], pieces: &mut [Sealed]) {
+                self.0.open_all(seal, pieces);
+            }
+            unsafe fn start(&mut self, seal: &[u8; 32], pieces: *mut Sealed, n: usize) {
+                unsafe { self.0.start(seal, pieces, n) };
+            }
+            fn ready(&mut self, i: usize) {
+                self.0.ready(i);
+            }
+            unsafe fn finish(&mut self, seal: &[u8; 32], pieces: *mut Sealed, n: usize) {
+                unsafe { self.0.finish(seal, pieces, n) };
+                unsafe { (*pieces.add(n - 1)).ok = false };
+            }
+        }
+        s.forget();
+        let mut o = Tamper(Streamed { tx: None, worker: None, readies: 0, finishes: 0 });
+        assert!(matches!(s.read_with(&d, b"made", 0, &mut vec![0u8; t], &mut o), Err(Error::Open)));
+        assert_eq!(o.0.finishes, 1);
     }
 
     /// The domain's names follow its puts and deletes (a rewrite adds nothing), and never show the vault's own entries.

@@ -4401,24 +4401,33 @@ fn wall_ready(width: usize, height: usize) {
     }
 }
 
-/// The vault as a byte source for vsf's container (`Document`): the value under `key` in a store scope, read straight into the caller's buffer (the display's heap is a DMA region outside its arc, which the kernel resolves as it does the arc since 2026-11-08) a transfer at a time (`TRANSFER`). vsf reads only what it needs: the header and the plane's place.
+/// The vault as a byte source for vsf's container (`Document`): the value under `key` in a store scope, read straight into the caller's buffer (the display's heap is a DMA region outside its arc, which the kernel resolves as it does the arc since 2026-11-08) a transfer at a time (`TRANSFER`). vsf reads only what it needs: the trailer, the header and the plane's place, in small reads (64 bytes, the header, the section a step at a time), each of which was a round trip to the vault: they come from `win` instead, one of the vault's pieces (`WIN`) read whole the first time one of them falls inside it (2026-11-11: the document's opening took 25 to 52 ms of the load).
 struct VaultSource {
     cap: u64,
     key: &'static [u8],
     len: u64,
+    /// The piece-aligned stretch of the value small reads come from: its offset, its length, the bytes.
+    win: core::cell::RefCell<(u64, usize, alloc::vec::Vec<u8>)>,
 }
 
-/// The transfer a vault read moves: ferros_sys::STORE_MAX (256 KiB) on a kernel from 2026-11-08 on; a kernel from before refuses more than 4 KiB, and the first refusal drops to that for good.
-static TRANSFER: AtomicU64 = AtomicU64::new(ferros_sys::STORE_MAX as u64);
+/// A small read's window (`VaultSource::win`): one of the vault's pieces (ferros_store PIECE, 64 KiB), so a fill opens one piece; a read this large or larger goes straight to the vault.
+const WIN: usize = 1 << 16;
+
+/// The transfer a vault read moves: ferros_sys::STORE_GET_MAX (1 MiB) on a kernel from 2026-11-11 on, STORE_MAX (256 KiB) on one from 2026-11-08, 4 KiB before; each refusal drops to the next for good.
+static TRANSFER: AtomicU64 = AtomicU64::new(ferros_sys::STORE_GET_MAX as u64);
+/// The vault calls a load made (`vault_read`), for its console line.
+static VAULT_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// `buf.len()` bytes of the value under `key` from `offset`, a transfer a call; whether the vault gave them.
 fn vault_read(cap: u64, key: &[u8], offset: u64, buf: &mut [u8]) -> bool {
     let mut at = 0;
     while at < buf.len() {
         let n = (buf.len() - at).min(TRANSFER.load(Ordering::Relaxed) as usize);
+        VAULT_CALLS.fetch_add(1, Ordering::Relaxed);
         if ferros_sys::store_get_at(cap, key, offset as usize + at, &mut buf[at..at + n]).is_none() {
-            if n > 1 << 12 {
-                TRANSFER.store(1 << 12, Ordering::Relaxed);
+            let smaller = if n > ferros_sys::STORE_MAX { ferros_sys::STORE_MAX } else { 1 << 12 };
+            if n > smaller {
+                TRANSFER.store(smaller as u64, Ordering::Relaxed);
                 continue;
             }
             return false;
@@ -4433,7 +4442,32 @@ impl vsf::container::ByteSource for VaultSource {
         self.len
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), vsf::container::SourceError> {
-        if vault_read(self.cap, self.key, offset, buf) { Ok(()) } else { Err(vsf::container::SourceError::Io("the vault refused a read".into())) }
+        let refused = || vsf::container::SourceError::Io("the vault refused a read".into());
+        // WHY: the range is vsf's, read from the document's own bytes; past the value's end there is nothing to read, and the window's arithmetic below assumes the range inside it.
+        if offset.checked_add(buf.len() as u64).is_none_or(|end| end > self.len) {
+            return Err(vsf::container::SourceError::OutOfRange { offset, len: buf.len() as u64, size: self.len });
+        }
+        let start = offset & !(WIN as u64 - 1);
+        // A large read, or one across a piece's edge: straight to the vault.
+        if buf.len() >= WIN || offset + buf.len() as u64 > start + WIN as u64 {
+            return if vault_read(self.cap, self.key, offset, buf) { Ok(()) } else { Err(refused()) };
+        }
+        let mut w = self.win.borrow_mut();
+        if !(offset >= w.0 && offset + buf.len() as u64 <= w.0 + w.1 as u64) {
+            // The value's last piece is shorter: the window ends with it.
+            let n = (self.len - start).min(WIN as u64) as usize;
+            if w.2.len() < WIN {
+                w.2.resize(WIN, 0);
+            }
+            if !vault_read(self.cap, self.key, start, &mut w.2[..n]) {
+                w.1 = 0;
+                return Err(refused());
+            }
+            (w.0, w.1) = (start, n);
+        }
+        let from = (offset - w.0) as usize;
+        buf.copy_from_slice(&w.2[from..from + buf.len()]);
+        Ok(())
     }
 }
 
@@ -4460,6 +4494,63 @@ static mut LOAD_STACK_LO: usize = usize::MAX;
 static mut LOAD_STACK_LEN: usize = 1;
 static LOAD_HEAP: Bump = BUMP_NONE;
 const LOAD_HEAP_BYTES: usize = 2 << 20;
+
+/// The loader's reader (2026-11-11, owner: "2.9s for a 24MB read is embarassing"): the vault's next stretch of the plane is read on this thread while the loader turns the last into working values, so the conversion (28 ms of a 24 MB load, 2026-11-09) no longer waits between the vault's reads. A job: `READ_JOB` (the capability, the key, the offset, the length, the buffer), then `READ_REQ` a fresh sequence number; done: `READ_DONE`, the number shifted up one with whether the vault gave every byte in bit 0. It allocates nothing (`vault_read` makes only store calls), so it needs no heap of its own.
+static READ_REQ: AtomicU64 = AtomicU64::new(0);
+static READ_DONE: AtomicU64 = AtomicU64::new(0);
+static mut READ_JOB: (u64, &'static [u8], u64, usize, usize) = (0, b"", 0, 0, 0);
+static mut READ_STACK: [u8; 1 << 15] = [0; 1 << 15];
+/// The reader thread started; without it a job is read on the loader's own thread, at once.
+static READER_UP: AtomicBool = AtomicBool::new(false);
+/// The plane's stretches: half of the 1 MiB the loader read at once before (one 1 MiB arena for the two), each a batch of eight of the vault's pieces.
+const STRETCH: usize = 1 << 19;
+
+extern "C" fn wall_reader(_: u64) -> ! {
+    let mut seen = 0;
+    loop {
+        let r = READ_REQ.load(Ordering::Acquire);
+        if r == seen {
+            ferros_sys::wait(&READ_REQ, r, 0);
+            continue;
+        }
+        seen = r;
+        let ok = read_job();
+        READ_DONE.store(r << 1 | ok as u64, Ordering::Release);
+        ferros_sys::wake(&READ_DONE, 1);
+    }
+}
+
+/// The posted job read now: whether the vault gave every byte.
+fn read_job() -> bool {
+    let (cap, key, at, buf, len) = unsafe { READ_JOB };
+    // SAFETY: the loader posted `len` bytes at `buf` of a buffer it keeps, and touches none of them until the job's done word says so (`read_wait`).
+    vault_read(cap, key, at, unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) })
+}
+
+/// Post the read of `len` bytes of `key` from `at` into `buf` (on the reader thread, or here when it is not up): its sequence number.
+fn read_post(cap: u64, key: &'static [u8], at: u64, buf: *mut u8, len: usize) -> u64 {
+    let seq = READ_REQ.load(Ordering::Relaxed) + 1;
+    unsafe { READ_JOB = (cap, key, at, buf as usize, len) };
+    if READER_UP.load(Ordering::Relaxed) {
+        READ_REQ.store(seq, Ordering::Release);
+        ferros_sys::wake(&READ_REQ, 1);
+    } else {
+        READ_REQ.store(seq, Ordering::Relaxed);
+        READ_DONE.store(seq << 1 | read_job() as u64, Ordering::Release);
+    }
+    seq
+}
+
+/// Wait for job `seq`: whether the vault gave every byte.
+fn read_wait(seq: u64) -> bool {
+    loop {
+        let d = READ_DONE.load(Ordering::Acquire);
+        if d >> 1 == seq {
+            return d & 1 != 0;
+        }
+        ferros_sys::wait(&READ_DONE, d, 0);
+    }
+}
 
 extern "C" fn wall_loader(grants: u64) -> ! {
     let mut seen = 0;
@@ -4497,13 +4588,14 @@ fn wall_load(again: bool) {
     clean_reset_all();
 }
 
-/// The person's own wallpaper (`map.wallpaper` in their space: a VSF visual, one plane of VSF RGB gamma2tanh codes at 16 bits, planar [3, height, width], as tools/wallpaper and tools/screencap write one), or the one made on this device (`map.wallpaper.made`), into `WALL_BUF`; whether it did. On the loader's thread (`wall_loader`). vsf's container locates the plane over the vault (`VaultSource`); then the plane is read from its first byte to its last, a transfer at a time at the transfer's own boundaries in the value (so the vault opens each of its pieces once, four at a time), and each code becomes a working value by the display's own g2t table (`G2T16_Q14`) as it arrives: the three planes one after another, red setting each pixel opaque, green and blue joining it.
+/// The person's own wallpaper (`map.wallpaper` in their space: a VSF visual, one plane of VSF RGB gamma2tanh codes at 16 bits, planar [3, height, width], as tools/wallpaper and tools/screencap write one), or the one made on this device (`map.wallpaper.made`), into `WALL_BUF`; whether it did. On the loader's thread (`wall_loader`). vsf's container locates the plane over the vault (`VaultSource`); then the plane is read from its first byte to its last, a transfer at a time at the transfer's own boundaries in the value (so the vault opens each of its pieces once, sixteen at a time on a kernel from 2026-11-11), and each code becomes a working value by the display's own g2t table (`G2T16_Q14`) as it arrives: the three planes one after another, red setting each pixel opaque, green and blue joining it.
 fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> bool {
     let c = cap(grants, S_MAP_SCOPE);
     let Some(len) = ferros_sys::store_get(c, key, &mut []) else { return false };
     let t0 = now();
+    let calls0 = VAULT_CALLS.load(Ordering::Relaxed);
     let mut l = Log { grants, buf: [0; 256], n: 0 };
-    let doc = match vsf::container::Document::open(VaultSource { cap: c, key, len: len as u64 }) {
+    let doc = match vsf::container::Document::open(VaultSource { cap: c, key, len: len as u64, win: core::cell::RefCell::new((0, 0, alloc::vec::Vec::new())) }) {
         Ok(d) => d,
         Err(e) => {
             // What vsf refused, and where: until 2026-11-08 the error was dropped, and the made wallpaper (24 MB, written whole by wallgen) was refused with no word why.
@@ -4530,24 +4622,34 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
     let t_open = ferros_sys::us_since(t0);
     let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, n) };
     let table = unsafe { core::slice::from_raw_parts(G2T16_Q14, 1 << 16) };
-    let transfer = ferros_sys::STORE_MAX;
-    let mut chunk = alloc::vec![0u8; transfer];
+    // Stretches of half a MiB at their own boundaries in the value (eight of the vault's pieces, opened as one batch; on an older kernel `vault_read` moves one in its own smaller calls, still at piece boundaries), two buffers: the reader thread fills one (`read_post`) while this thread converts the other.
+    let mut bufs = [alloc::vec![0u8; STRETCH], alloc::vec![0u8; STRETCH]];
+    let ptrs = [bufs[0].as_mut_ptr(), bufs[1].as_mut_ptr()];
     let (first, end) = (span.data_offset, span.data_offset + span.data_len);
-    // The sample being filled (all three planes in a row), and a byte carried over a transfer's edge (a plane starting at an odd offset of the value).
+    // To the next stretch boundary of the value, or the plane's end.
+    let next_to = |at: u64| ((at / STRETCH as u64 + 1) * STRETCH as u64).min(end);
+    // The sample being filled (all three planes in a row), and a byte carried over a stretch's edge (a plane starting at an odd offset of the value).
     let (mut s, mut carry): (usize, Option<u8>) = (0, None);
     let mut at = first;
-    let (mut t_read, mut t_conv) = (0u64, 0u64);
+    let (mut t_wait, mut t_conv) = (0u64, 0u64);
+    let t_reads = now();
+    let mut seq = read_post(c, key, at, ptrs[0], (next_to(at) - at) as usize);
+    let mut k = 0;
     while at < end {
-        // To the next transfer boundary of the value, or the plane's end.
-        let to = ((at / transfer as u64 + 1) * transfer as u64).min(end);
-        let bytes = &mut chunk[..(to - at) as usize];
+        let to = next_to(at);
         let t = now();
-        if !vault_read(c, key, at, bytes) {
+        if !read_wait(seq) {
             l.s(b"display: the person's own wallpaper could not be read whole; theirs from the seed shows\n");
             l.flush();
             return false;
         }
-        t_read += now() - t;
+        t_wait += now() - t;
+        // The next stretch into the other buffer while this one becomes working values.
+        if to < end {
+            seq = read_post(c, key, to, ptrs[(k + 1) & 1], (next_to(to) - to) as usize);
+        }
+        // SAFETY: the job just waited for filled these `to - at` bytes and is done; the job posted after it writes only the other buffer, and this one is not posted again until it has been converted.
+        let bytes = unsafe { core::slice::from_raw_parts(ptrs[k & 1] as *const u8, (to - at) as usize) };
         let t = now();
         let mut i = 0;
         if let Some(hi) = carry.take() {
@@ -4573,8 +4675,10 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
         }
         t_conv += now() - t;
         at = to;
+        k += 1;
     }
-    drop(chunk);
+    let t_plane = now() - t_reads;
+    drop(bufs);
     // Measuring (owner, 2026-11-08: "the unlock process took way too long"): the whole load over the vault, and where it went.
     let ms = |t: u64| t * 1000 / freq();
     let total = ferros_sys::us_since(t0);
@@ -4586,11 +4690,17 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
     l.dec(len as u64 / total);
     l.s(b" MB/s): opening the document ");
     l.dec(t_open / 1000);
-    l.s(b" ms, the vault's reads ");
-    l.dec(ms(t_read));
+    l.s(b" ms, the plane ");
+    l.dec(ms(t_plane));
+    l.s(b" ms (waiting on the vault ");
+    l.dec(ms(t_wait));
     l.s(b" ms, the codes to working values ");
     l.dec(ms(t_conv));
-    l.s(b" ms\n");
+    l.s(b" ms beside its reads); ");
+    l.dec(VAULT_CALLS.load(Ordering::Relaxed) - calls0);
+    l.s(b" vault calls of up to ");
+    l.dec(TRANSFER.load(Ordering::Relaxed) >> 10);
+    l.s(b" KiB\n");
     l.flush();
     true
 }
@@ -6272,6 +6382,13 @@ fn server(grants: u64) -> ! {
     }
     if ferros_sys::thread_spawn(panel, unsafe { &mut *(&raw mut PANEL_STACK) }, grants) != 0 {
         log.s(b"display: no panel thread\n");
+        log.flush();
+    }
+    // The loader's reader (`wall_reader`), before the loader, idle until a stretch is posted; without it the loader reads on its own thread.
+    if ferros_sys::thread_spawn(wall_reader, unsafe { &mut *(&raw mut READ_STACK) }, 0) == 0 {
+        READER_UP.store(true, Ordering::Relaxed);
+    } else {
+        log.s(b"display: no wallpaper reader; the loader reads and converts in turn\n");
         log.flush();
     }
     // The wallpaper's loader (`wall_loader`), idle until a load.

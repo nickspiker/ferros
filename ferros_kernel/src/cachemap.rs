@@ -5,7 +5,7 @@
 //! Layout (4 KiB granule, 39-bit VA, walk starts at level 1):
 //! - Every 1 GiB block is Device-nGnRnE, exactly what the MMU-off world was, so nothing outside the window changes and nothing there is ever speculatively touched (secure carveouts stay safe).
 //! - The GiB holding the window gets a level-2 table: the window's 2 MiB blocks are Normal write-back; the rest stay Device.
-//! - The 2 MiB blocks holding the device DMA buffers (`.bss.dma`) get level-3 tables: those 4 KiB pages are Normal non-cacheable, so DMA never needs cache maintenance.
+//! - The 2 MiB blocks holding the device DMA buffers (`.bss.dma`) get level-3 tables: those 4 KiB pages are Normal non-cacheable, so DMA never needs cache maintenance. The one exception is UFS's 1 MiB run bounce (process.rs `UFS_RUN`, 2026-11-11): Normal write-back, kept right by the cache upkeep every UFS command already does around its data.
 //! - DMA_POOL (cold only): 2 MiB of Normal non-cacheable memory a driver process reaches directly (EL0 read/write, never executable at any level) — the memory its device DMAs into (rings, buffers). It is granted like hardware (process.rs `DMA`), and the device's IOMMU/S2MPU window is meant to cover exactly it, so the device reaches nothing else.
 //!
 //! The window is ferros's image, stack, heap, staging slot and the heap's second region: 64 MiB from DRAM base to the display framebuffer on a cold boot, or the whole 12 MiB handoff carveout (0x9240_0000..0x9300_0000, tpu_fw_reserved after it).
@@ -296,9 +296,11 @@ pub fn enable() -> bool {
                 dma_pool(vhe, a, BLOCK)
             } else if a + MIB2 > d0 && a < d1 {
                 let t = &mut l3[next_l3];
+                // The UFS run bounce alone of the DMA pages is cacheable (process.rs `UFS_RUN`: each command keeps its cache upkeep, and the copy out of it runs at cache speed).
+                let (r0, r1) = crate::process::ufs_run_range();
                 for (k, p) in t.0.iter_mut().enumerate() {
                     let pa = a + k * PAGE;
-                    *p = if pa >= d0 && pa < d1 { uncached(vhe, pa, TABLE_OR_PAGE) } else { normal(vhe, pa, TABLE_OR_PAGE) };
+                    *p = if pa >= d0 && pa < d1 && !(pa >= r0 && pa < r1) { uncached(vhe, pa, TABLE_OR_PAGE) } else { normal(vhe, pa, TABLE_OR_PAGE) };
                 }
                 let d = &raw const t.0 as u64 | TABLE_OR_PAGE;
                 next_l3 += 1;

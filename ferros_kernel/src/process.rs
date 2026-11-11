@@ -815,6 +815,20 @@ impl Process {
         }
         self.dma_span((self.arc.base as u64).wrapping_add(off) & !DMA_ADDR, len)
     }
+    /// `len` bytes at `off` where they lie, for a copy straight into another process (a forwarded store reply of up to STORE_GET_MAX, `SYS_REPLY`): no heap copy, no zeroed buffer first. None when they resolve nowhere (kept for the trap at the syscall's end, as `read` does).
+    fn view(&self, off: u64, len: usize) -> Option<&[u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        match self.span(off, len) {
+            // SAFETY: `span` resolved all `len` bytes inside this process's arc or one of its DMA regions, identity-mapped and the kernel's to read; the slice lives only for the copy that follows, under the kernel lock.
+            Some(a) => Some(unsafe { core::slice::from_raw_parts(a as *const u8, len) }),
+            None => {
+                self.bad_buf(off, len, false);
+                None
+            }
+        }
+    }
     /// Whether `len` bytes at arc offset `off` touch a range the process gave back (`holes`).
     fn in_hole(&self, off: usize, len: usize) -> bool {
         self.holes.iter().any(|&(lo, hi)| off < hi && off + len > lo)
@@ -1094,17 +1108,24 @@ static mut DETAIL_LEN: [usize; 6] = [0; 6];
 const LINK_NAMES: [&[u8]; 6] = [b"modem", b"pcie1", b"bt", b"nfc", b"gps", b"usb"];
 /// pet(): the process is alive and going round its main loop (the process watchdog, measuring: the kernel records the longest stretch between two pets, `diag pets`). → 0.
 const SYS_PET: u64 = 28;
-/// block(cap, op, block, buf): 4 KiB blocks of a window on the ferros partition (`WINDOWS`), by number within it: op bit 0 write (else read), bits 8-15 the count (1 to BLOCK_MAX), `buf` the count × 4 KiB in the caller's arc. → 0, or ERR (no such window, out of it, or the UFS command failed). The count moves as one UFS command (a run, ferros_hal `read_run_lun`) once the controller's PRDT stride is known.
+/// block(cap, op, block, buf): 4 KiB blocks of a window on the ferros partition (`WINDOWS`), by number within it: op bit 0 write (else read), bit 1 timed, bits 8-23 the count (1 to BLOCK_MAX; bits 8-15 until 2026-11-11, which a count under 256 still fits), `buf` the count × 4 KiB in the caller's arc. → 0, or ERR (no such window, out of it, or the UFS command failed). Timed (bit 1, ferros_sys `block_read_timed`): x1 returns the timer ticks of the UFS command (the link's wake, the cache upkeep, the doorbell to completion; a write's copy in counts with it) and x2 those of a read's copy to the caller, so the vault process's read report can split the two (owner, 2026-11-11: the 24 MB read measured before it is fixed); x1 and x2 are left as they were otherwise. The count moves as one UFS command (a run, ferros_hal `read_run_lun`) once the controller's PRDT stride is known.
 const SYS_BLOCK: u64 = 29;
-/// The most blocks one `SYS_BLOCK` moves: one UFS command's worth (128 KiB, ferros_hal RUN_MAX), so a 64 KiB piece the vault seals (17 blocks with its nonce, tag and furrow headers) is one call and one command. 16 until 2026-11-08, each block its own command.
+/// The most blocks one `SYS_BLOCK` moves: one UFS command's worth (1 MiB since 2026-11-11, ferros_hal RUN_MAX), so the vault's read-ahead of a large value takes 256 blocks (about fifteen of its 64 KiB pieces) a command. 32 (128 KiB) from 2026-11-08, one piece a command; 16 before, each block its own command.
 const BLOCK_MAX: u64 = ferros_hal::ufs::RUN_MAX as u64;
-/// The run's bounce: UFS DMAs only into its own pages (the HSI2 S2MPU allows `.bss.dma.ufs` and nothing else of the kernel's), uncached by the static cache map, so a run lands here and is copied to the caller.
+/// A read of at least this many blocks is a large value moving (the vault's read-ahead): the clock policy's activity, as a PT transfer is (ptlink.rs MOVING_AT; a 24 MB read at the rest clocks has the workers that open its pieces at their 402 MHz floor). A piece's own run (17 blocks) and the index walk's single blocks are not.
+const MOVING_BLOCKS: u64 = 1 << 7;
+/// The run's bounce: UFS DMAs only into its own pages (the HSI2 S2MPU allows `.bss.dma.ufs` and nothing else of the kernel's), so a run lands here and is copied to the caller. Normal write-back since 2026-11-11 (cachemap.rs `ufs_run_range`), the only `.bss.dma` pages that are: the run's commands clean it to the point of coherency before the doorbell and clean and invalidate it after (ferros_hal `send_command_awake`), and nothing writes it between the two, so no line can be written back over what the device put there and the copy out reads what the device wrote. Before, every block of a read was copied out of non-cacheable memory a word at a time, each load its own trip to DRAM with no prefetch.
 #[repr(C, align(4096))]
 struct RunBuf([u8; ferros_hal::ufs::RUN_MAX << 12]);
 #[unsafe(link_section = ".bss.dma.ufs")]
 static mut UFS_RUN: RunBuf = RunBuf([0; ferros_hal::ufs::RUN_MAX << 12]);
-/// SYS_BLOCK's measure (`diag "ufs runs"`, owner 2026-11-08: "24MB from the vault should be imperceptibly fast"): calls, blocks and timer ticks inside the call (the command or commands and the copy), reads then writes.
-pub static BLOCK_STATS: [core::sync::atomic::AtomicU64; 6] = [const { core::sync::atomic::AtomicU64::new(0) }; 6];
+/// The run bounce's address range, for the cache map (cacheable, the rest of `.bss.dma` not).
+pub fn ufs_run_range() -> (usize, usize) {
+    let a = (&raw const UFS_RUN) as usize;
+    (a, a + (ferros_hal::ufs::RUN_MAX << 12))
+}
+/// SYS_BLOCK's measure (`diag "ufs runs"`, owner 2026-11-08: "24MB from the vault should be imperceptibly fast"): calls, blocks and timer ticks inside the call (the command or commands and the copy), reads then writes; then the reads' ticks in the UFS command alone, and the reads' commands of at least MOVING_BLOCKS blocks.
+pub static BLOCK_STATS: [core::sync::atomic::AtomicU64; 8] = [const { core::sync::atomic::AtomicU64::new(0) }; 8];
 /// vault(cap, op, x2, x3, buf): the vault process's own call (`Object::Vault`), moving the kernel's vault's old entries into its domains (VAULT-OUT.md, migration); x1 bits 0-7 the op, 8-31 the buffer's length, 32-63 an offset. Op 0: the x2-th entry still to move (a skip past ones that would not move) into `buf` as [class: 1 the person's][the domain's address and sealing keys][the scope prefix's length][the full name] → its length, NOTHING when none is left. Op 1: the value of the entry named at x2/x3, from the offset → its whole length. Op 2: that entry moved, removed from the kernel's vault → 0, NOTHING if it was not there. ERR otherwise.
 const SYS_VAULT: u64 = 30;
 const SYS_LAST: u64 = 22;
@@ -1552,6 +1573,8 @@ static mut STORE_STAGE: Option<(Vec<u8>, Vec<u8>)> = None;
 static mut STORE_CACHE: Option<(Vec<u8>, Vec<u8>)> = None;
 /// The largest transfer `SYS_STORE` moves either way: 256 KiB, four of the vault process's 64 KiB pieces (ferros_store PIECE), which it opens on four cores at once (payloads/vault `Openers`). 4 KiB until 2026-11-08, when the person's 24 MB wallpaper took about 5900 round trips and 2.9 s (owner: "24MB from the vault should be imperceptibly fast").
 pub const STORE_MAX: usize = 1 << 18;
+/// The largest a get (`SYS_STORE` op get, forwarded to the vault process) reads in one call: 1 MiB since 2026-11-11, sixteen pieces the vault process fetches and opens as one batch on its four cores, and a quarter of the round trips of a large value read at STORE_MAX (93 for the 24 MB wallpaper, each with its stamp, its hand-offs and the reader's turn between them). The reply goes from the vault process's buffer straight into the caller's (`SYS_REPLY`), never thru the kernel's heap. Only while the vault process serving has said it answers that much (`SYS_VAULT` op 3, `VAULT_GET`): one from before has a reply buffer of one STORE_MAX transfer. Sets, lists and the kernel's own vault stay at STORE_MAX; a larger get is refused (as a kernel from before refuses it), and a reader drops to STORE_MAX (ferros_sys STORE_GET_MAX).
+pub const STORE_GET_MAX: usize = 1 << 20;
 
 /// The vault process's endpoint (VAULT-OUT.md, step 3). While a process receives on it, every `SYS_STORE` call is forwarded there (`store_forward`), stamped by the kernel with the domain keys of the caller's scope; while none does, the kernel's own vault answers as before. Nothing may call it directly (a message on it is the kernel's), and only a spawn holding the vault right (`Grant::Vault`) may serve it.
 const VAULT_EP: &[u8] = b"vault";
@@ -1576,6 +1599,17 @@ fn vault_ep() -> Option<usize> {
     let ep = kk.endpoints.iter().position(|e| e.name == VAULT_EP)?;
     let serving = kk.procs.iter().flatten().any(|p| !p.dying && p.cspace.iter().any(|c| matches!(c.object, Object::Endpoint(e) if e == ep) && c.rights & RIGHT_RECV != 0));
     serving.then_some(ep)
+}
+
+/// The largest get the vault process serving now has said it answers (`SYS_VAULT` op 3: its epoch, the length), else STORE_MAX: a vault process from before 2026-11-11 has a reply buffer of one STORE_MAX transfer, and a larger get would index past it. Under the kernel lock.
+static mut VAULT_GET: (u64, usize) = (u64::MAX, STORE_MAX);
+
+/// The get bound for the vault process serving `ep` (`VAULT_GET` when that process said it, STORE_MAX otherwise).
+fn vault_get_max(ep: usize) -> usize {
+    let kk = k();
+    let (epoch, max) = unsafe { VAULT_GET };
+    let said = kk.procs.iter().flatten().any(|p| !p.dying && p.epoch == epoch && p.cspace.iter().any(|c| matches!(c.object, Object::Endpoint(e) if e == ep) && c.rights & RIGHT_RECV != 0));
+    if said { max } else { STORE_MAX }
 }
 
 /// The scope a full name belongs to, if it may live in the vault process (not reserved, not kept by the kernel).
@@ -1728,9 +1762,10 @@ fn store_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
     let offset = if f.x[1] & 2 != 0 { f.x[1] >> 32 } else { 0 };
     let len = ((f.x[1] >> 8) & 0xFF_FFFF) as usize;
     let rel = p.read(f.x[2], (f.x[3] as usize).min(97));
-    // WHY: the name and the length are the caller's; the same refusals as the kernel's own path (a name of printable ASCII up to 96 bytes or a 32-byte address; one transfer at most).
+    // WHY: the name and the length are the caller's; the same refusals as the kernel's own path (a name of printable ASCII up to 96 bytes or a 32-byte address; one transfer at most: a get's own, larger, STORE_GET_MAX).
     let rel_ok = if raw { rel.len() == 32 || list } else { rel.len() <= 96 && rel.iter().all(|&b| (0x21..0x7F).contains(&b)) && (!rel.is_empty() || list) };
-    if !rel_ok || len > STORE_MAX {
+    let most = if set || del || list { STORE_MAX } else { vault_get_max(ep) };
+    if !rel_ok || len > most {
         f.x[0] = ERR;
         return 0;
     }
@@ -2459,7 +2494,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 Some((Object::Blocks(i), r)) if r & RIGHT_SEND != 0 => WINDOWS.get(i),
                 _ => None,
             };
-            let (write, count, at, buf) = (f.x[1] & 1 != 0, (f.x[1] >> 8) & 0xFF, f.x[2], f.x[3]);
+            let (write, timed, count, at, buf) = (f.x[1] & 1 != 0, f.x[1] & 2 != 0, (f.x[1] >> 8) & 0xFFFF, f.x[2], f.x[3]);
             f.x[0] = match (window, crate::ufs_device::part()) {
                 // WHY the bounds: the block number and count are the process's; a window is all it may touch, and the partition must hold the window (the same refusal the kernel's own vault makes).
                 (Some(w), Some((first, blocks))) if (1..=BLOCK_MAX).contains(&count) && at < w.blocks && count <= w.blocks - at && w.offset + w.blocks <= blocks as u64 => {
@@ -2474,20 +2509,31 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     if n > 1 && ferros_hal::ufs::PRDT_STRIDE.load(Relaxed) == 0 {
                         u.probe_prdt_stride(0, base, run);
                     }
-                    let ok = if write {
+                    let (ok, t_cmd) = if write {
                         p.read_into(buf, bytes);
-                        u.write_run_lun(0, base, n, run)
+                        (u.write_run_lun(0, base, n, run), crate::platform::cntpct())
                     } else {
+                        if count >= MOVING_BLOCKS {
+                            crate::ptlink::MOVING_AT.store(t0, Relaxed);
+                            BLOCK_STATS[7].fetch_add(1, Relaxed);
+                        }
                         let ok = u.read_run_lun(0, base, n, run);
+                        let t = crate::platform::cntpct();
                         if ok {
                             p.write_from(buf, bytes);
                         }
-                        ok
+                        BLOCK_STATS[6].fetch_add(t - t0, Relaxed);
+                        (ok, t)
                     };
+                    let t1 = crate::platform::cntpct();
                     let s = if write { 3 } else { 0 };
                     BLOCK_STATS[s].fetch_add(1, Relaxed);
                     BLOCK_STATS[s + 1].fetch_add(count, Relaxed);
-                    BLOCK_STATS[s + 2].fetch_add(crate::platform::cntpct() - t0, Relaxed);
+                    BLOCK_STATS[s + 2].fetch_add(t1 - t0, Relaxed);
+                    if timed {
+                        f.x[1] = t_cmd - t0;
+                        f.x[2] = t1 - t_cmd;
+                    }
                     if ok { 0 } else { ERR }
                 }
                 _ => ERR,
@@ -2501,7 +2547,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let (op, len, offset) = (f.x[1] & 0xFF, ((f.x[1] >> 8) & 0xFF_FFFF) as usize, (f.x[1] >> 32) as usize);
             // WHY: the length and the name are the vault process's: one transfer at most, a name as long as a scope's prefix and the longest name the kernel's path accepts.
             let name = || alloc::string::String::from_utf8(p.read(f.x[2], (f.x[3] as usize).min(1 << 7))).unwrap_or_default();
-            f.x[0] = if !ok || len > STORE_MAX {
+            f.x[0] = if ok && op == 3 {
+                // Op 3: this vault process answers gets of up to `len` bytes (its reply buffer), held to the kernel's own bound (WHY the min: the length is the vault process's, and SYS_REPLY copies at most STORE_GET_MAX). Forgotten when another process serves.
+                unsafe { VAULT_GET = (p.epoch, len.min(STORE_GET_MAX)) };
+                0
+            } else if !ok || len > STORE_MAX {
                 ERR
             } else {
                 match op {
@@ -3459,21 +3509,27 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     let Object::Reply(caller) = p.cspace[i].object else { unreachable!() };
                     // Single use: the token leaves the cspace before anything else happens.
                     p.cspace.swap_remove(i);
-                    // One transfer, and a forwarded store reply's 8-byte value ahead of it (`store_forward`); a plain caller still gets at most what it asked for.
-                    let msg = p.read(f.x[1], (f.x[2] as usize).min(STORE_MAX + 8));
+                    // One transfer, and a forwarded store reply's 8-byte value ahead of it (`store_forward`); a plain caller still gets at most what it asked for. WHY the min: the length is the server's own.
+                    let len = (f.x[2] as usize).min(STORE_MAX + 8);
                     let mut handed = false;
                     if caller == KERNEL_CALLER {
                         // The kernel's own call (`vault_call`): kept for the service loop; the server runs on.
-                        kernel_answered(Ok(msg));
+                        kernel_answered(Ok(p.read(f.x[1], len)));
                     } else if let (Some(ct), Some(cp)) = (th(caller), proc_of(caller)) {
                         if let State::Calling(roff, rcap) = ct.state {
                             if rcap & STORE_REPLY != 0 {
-                                // A forwarded store call (`store_forward`): the vault's reply is the syscall's value, then the bytes for the caller's buffer, as many as it asked for. WHY the checks: the reply is the vault process's, its length its own.
-                                let data = msg.get(8..).unwrap_or(&[]);
-                                let n = data.len().min((rcap & !STORE_REPLY) as usize);
-                                cp.write(roff, &data[..n]);
-                                ct.frame.x[0] = msg.get(..8).map(|v| u64::from_le_bytes(v.try_into().unwrap())).unwrap_or(ERR);
+                                // A forwarded store call (`store_forward`): the vault's reply is the syscall's value, then the bytes for the caller's buffer, as many as it asked for (a get up to STORE_GET_MAX), copied from the vault process's buffer straight into the caller's: until 2026-11-11 each quarter MiB went thru a zeroed heap vector first, three passes over every byte of a 24 MB read under the kernel lock. WHY the checks: the reply is the vault process's, its length its own; shorter than the value it carries nothing, and the caller is refused.
+                                let len = (f.x[2] as usize).min(STORE_GET_MAX + 8);
+                                match p.view(f.x[1], len) {
+                                    Some(msg) if msg.len() >= 8 => {
+                                        let n = (msg.len() - 8).min((rcap & !STORE_REPLY) as usize);
+                                        cp.write(roff, &msg[8..8 + n]);
+                                        ct.frame.x[0] = u64::from_le_bytes(msg[..8].try_into().unwrap());
+                                    }
+                                    _ => ct.frame.x[0] = ERR,
+                                }
                             } else {
+                                let msg = p.read(f.x[1], len);
                                 let n = msg.len().min(rcap as usize);
                                 cp.write(roff, &msg[..n]);
                                 ct.frame.x[0] = n as u64;

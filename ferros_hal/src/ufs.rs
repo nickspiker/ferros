@@ -164,7 +164,7 @@ struct Utrd {
     dw: [u32; 8],
 }
 
-/// UTP Command Descriptor — Command UPIU + Response UPIU + PRDT. Must be 128-byte aligned. Fixed layout: [0x000..0x200) Command UPIU (512 bytes) [0x200..0x400) Response UPIU (512 bytes) [0x400..0x1400) the PRDT: room for RUN_MAX entries at the 128-byte stride the controller takes when the inline-encryption descriptor type is set (`PRDT_STRIDE`), which holds them at the standard 16 too.
+/// UTP Command Descriptor — Command UPIU + Response UPIU + PRDT. Must be 128-byte aligned. Fixed layout: [0x000..0x200) Command UPIU (512 bytes) [0x200..0x400) Response UPIU (512 bytes) [0x400..0x8400) the PRDT: room for RUN_MAX entries at the 128-byte stride the controller takes when the inline-encryption descriptor type is set (`PRDT_STRIDE`), which holds them at the standard 16 too.
 #[repr(C, align(128))]
 struct Ucd {
     cmd_upiu: [u8; 512],
@@ -172,13 +172,15 @@ struct Ucd {
     prdt: [PrdtEntry; PRDT_SLOTS],
 }
 
-/// The most blocks one command moves (`read_run_lun`, `write_run_lun`): 128 KiB, the kernel's run buffer.
-pub const RUN_MAX: usize = 1 << 5;
+/// The most blocks one command moves (`read_run_lun`, `write_run_lun`): 1 MiB, the kernel's run buffer, a PRDT entry of 4 KiB each (Linux's ufs-exynos holds every segment to 4096 bytes, `max_segment_size`, and its block layer sends up to 1 MiB a command: the shape this controller already takes from Android). 128 KiB until 2026-11-11, when a 24 MB value's 6,200 blocks went in some 370 commands at 175 MB/s, each command's own latency paid at queue depth one (owner, 2026-11-11: "2.9s for a 24MB read is embarassing").
+pub const RUN_MAX: usize = 1 << 8;
 /// PRDT slots of 16 bytes: RUN_MAX entries at the larger stride (128 bytes, eight slots each).
 const PRDT_SLOTS: usize = RUN_MAX << 3;
 
 /// The controller's PRDT entry stride, learned once (`probe_prdt_stride`): 0 not yet known, 16 the standard entry, 128 the inline-encryption entry (FMPSECURITY0.DESCTYPE 3, set through EL3 by Linux's pixel-ufs-crypto: a jump from Android leaves it so; ABL's cold path is not known to), 1 multi-entry commands refused (the probe failed: runs go a block a command, as before). A single-entry command reads its one entry at offset 0 either way, which is why the block-at-a-time path never had to know.
 pub static PRDT_STRIDE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Every command's time split (2026-11-11, measuring the vault's 24 MB read before fixing it), in counter ticks: [0] the cache upkeep around it (the descriptors' and the data's clean before the doorbell and clean-and-invalidate after: ferros runs UFS non-coherent, kernel cold_ufs.rs, so the upkeep is per line of every byte moved), [1] the doorbell to completion (the link and the device). Read by the kernel's `diag "ufs runs"`, zeroed by its reset.
+pub static CMD_TICKS: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
 /// Runs off by hand (`diag "ufs runs off"`): every run a block a command, to measure the difference on the same boot.
 pub static RUNS_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
@@ -725,6 +727,7 @@ impl UfsController {
             (*buf).utrd.dw[7] = (0x0100 << 16) | (prdt_count as u32); // prdt: offset=0x100 DW
 
             // Cache clean UTRD + UCD (its two UPIUs and the PRDT in use) + the data
+            let t0 = ticks();
             let utrd_phys = &raw const (*buf).utrd as usize;
             let ucd_phys = &raw const (*buf).ucd as usize;
             let ucd_len = 1024 + prdt_bytes;
@@ -734,6 +737,7 @@ impl UfsController {
             core::arch::asm!("dsb sy");
 
             // Ring doorbell
+            let t1 = ticks();
             self.nexus(cmd_type == 0); // SCSI (cmd_type 0) sets the nexus bit, native UFS (query) clears it
             self.write_reg(regs::UTRLDBR, 1);
 
@@ -741,9 +745,13 @@ impl UfsController {
             let _ = self.wait_transfer(4000);
 
             // Invalidate caches to see DMA results
+            let t2 = ticks();
             crate::mmio::cache_invalidate(utrd_phys, 32);
             crate::mmio::cache_invalidate(ucd_phys, ucd_len);
             crate::mmio::cache_invalidate(data.0, data.1);
+            use core::sync::atomic::Ordering::Relaxed;
+            CMD_TICKS[0].fetch_add(t1 - t0 + ticks() - t2, Relaxed);
+            CMD_TICKS[1].fetch_add(t2 - t1, Relaxed);
 
             ((*buf).utrd.dw[2] & 0xFF) as u8
         }
