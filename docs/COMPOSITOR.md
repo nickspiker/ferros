@@ -124,6 +124,51 @@ The scene loop stays on the render thread for what must be one thread's: each ci
 
 Measured on the Pro (`FERROS_MAP_START=zoomcrowd`: the crowd's 200 circles and the settings circle, a pinch with a twist, every frame drawn whole): the scene 3.2 ms a frame against 14.7 on the render thread alone; the zoom of the settings circle alone 2.1 against 2.4-2.7.
 
+## Memory (2026-11-11)
+
+The display panicked at start on the Pro that night, "memory allocation of 2097152 bytes failed": its heap was a fixed 32 MiB region the kernel granted (cachemap `DISPLAY_HEAP`, `display-heap`), a bump allocator that frees nothing, and the quick row's band (QUICK.md "Memory") with the night's other additions had taken the start to about 30.4 MiB of it, with the wallpaper loader's 2 MiB still to come.
+
+Since then the heap is the display's own arc (docs/ARCS.md), grown on demand:
+- **The header.** `ferros_sys::entry!(display_main, grows HEAP_CEILING)`: the image's heap grows (bit 0 of the pad word), its ceiling 128 MiB (offset 48). The kernel maps 4 MiB of it right after .bss at spawn and sizes the arc's window for the whole ceiling; frames are mapped only as the display asks.
+- **The arenas.** The console worker's 1 MiB and the wallpaper loader's 2 MiB live in those first 4 MiB (`heap_init`), fixed as before.
+- **The render thread's heap** (`ALLOC`) starts empty at the arc's top, above the first stack, and asks for more (`ferros_sys::arc::grow`, SYS_ARC 40) when it runs out: at least 8 MiB, or a quarter of what it holds, or only what is short when that much would pass the ceiling. Each grow is a console line from the kernel (`display: arc grew G#… to G#…`). The new frames lie right above the old top, so the bump's run goes on unbroken.
+- **Nothing in the heap is DMA.** The back buffer is the canvas region (`display-canvas`), the framebuffers, phases, sprites and app surfaces are their own granted regions, so the heap may lie in any frames of the pool, and move (ARCS.md step 3). What a device scans stays granted.
+- **A kernel from before ARCS** (no SYS_ARC) maps the whole declared heap at spawn; the display then uses it as a fixed heap. On such a kernel the arc needs 128 MiB more than before: a display with this header wants the ARCS kernel.
+- **Slot 9**, the old `display-heap` grant, is still passed by init and no longer read, so every later slot keeps its number.
+
+The budget on husky (1344 × 2992), what lives for the process (before the heap's mark):
+
+| What | Size | Where it is made |
+|---|---|---|
+| The typeface's glyph cache (2 Mi samples of u16) and its table | 4.1 MiB | `glyphs::Glyphs::new` |
+| The present table, the g2t table | 0.25 MiB | `server` |
+| The icons' mip chains | about 4.4 MiB | `draw::Mips::build` |
+| The bars: `BAR` (the chrome rows), `BAR_W` and its back buffer (to the quick row's floor, 8 bytes a pixel) | about 15 MiB | `server`, QUICK.md "Memory" |
+| The quick row's six sprites | 2.1 MiB | `quick::init` |
+| The hit map (a u16 a pixel) and the bars' ids (two) | 7.7 + about 2.8 MiB | `hit::alloc`, "The hit map" below |
+| The compose-once bitmap, the wallpaper's refining mask, the flight's scratch, the glass's plan | about 1 MiB | `server`, `plan_glass` |
+| Outside the bump: the console's arena and the loader's | 3 MiB | the 4 MiB after .bss |
+
+About 27.4 MiB kept in the bump before the hit map (the 30.4 of QUICK.md less the two arenas now outside it), about 38 MiB with it, then each frame's scratch on top (glyph bitmaps, a draw's tables), reset every frame. The measured figures are the display's own lines:
+- `display: heap at start N KiB kept (typeface and glyph cache …, tables and icons …, bars and quick row …, hit map …, the rest …), N KiB mapped for it; console arena …, loader …; arc top G#… at the start, ceiling G#…`, once, at the mark;
+- `display: heap high water N KiB (kept …, mapped … of 131072), console arena N of 1024, loader N of 2048 KiB`, from the render loop's pass top each time one of the three passes a new MiB: the frame's scratch at its fullest, the console's arena as the console and the quick row come up, the loader's as a wallpaper is read.
+
+## The hit map (2026-11-11)
+
+The owner, on touch routing (op 27 walked the windows front to back reading their pixels' clear bit; op 41 recomputed the system's geometry): "I mean, I already built it in fluor so sure?" (fluor: `HitId = u16`, one per pixel, written by each widget as it paints). Then: "the hitmap is never even touched if the pixel is opaque. early out!"
+
+- **What it is.** A u16 a pixel, the glass's size (husky 1344 × 2992: 7.7 MiB), the owner of what the glass shows there (payloads/display hit.rs). Ids: 0 nobody (black inside the circle with no window there), 1 the map's plane, 2 the open circle's page, G#100 + op 41's code the system's places, G#200 + surface an app's window, G#1000 + scene index a circle of the map's plane (the dummy kists included; a glow is light, not a shape, and owns nothing).
+- **Written by the compose, front to back, once a pixel.** Each publish writes the rows it composes, with the first phase of a publish that carries several (`publish_band`, `publish_app`). A row starts as one free run of columns; each layer, frontmost first, claims the runs it owns, writes its id over what is still free and takes that out (`Free`), so nothing behind is looked at where a layer in front owns the pixel; the ground takes what is left. No pixel is written twice (checked on the host against a brute force over 20000 random rows).
+- **The layers, front to back.**
+  - The system's places, written by the console's worker at its own compose step (`bars_row`, from `bar_decode`) into the bars' ids, a u16 a pixel of the bars' rows, front and back, swapped with the bars' decoded rows at a pass's top: outside the app's circle every pixel (the radios' console circles 0-4, the doorway by the camera 10, the top's other ground 11, back 9 left of the middle and home 8 right of it at the bottom), and inside it the quick row's circles while it stands open as composed (32 + k).
+  - Behind the quick row (12): everything inside the app's circle while any of the row shows on the glass. When that changes the whole map is written again without composing anything (`refresh`, by stripes across the publish workers), since everything inside the circle changed hands.
+  - With an app in front, the windows by the layer stack's spans: a pixel is the first window's in its chain that is not see-through there (a G2T16 pixel with any α, a working pixel without bit 63), as fluor tags a widget by its shape, not its α; a translucent window's pixel is still its own. Nobody's where no window is.
+  - On the home screen: the open circle's ground while a region is up (2), then the map's circles, front first, each its disc as the camera op draws it this frame (the same transform, a shifted pan's circles at the anchor's camera moved by the shift), then the plane (1). A flight's frame is the plane throughout.
+- **Read by one lookup.** Op 27 is `map(x, y) == G#200 + the caller's surface`; op 41 is `map(x, y) − G#100` when that is one of the system's, else G#FF, with a quick circle's centre and radius from the row's layout (where it draws). Gone with them: `owner_at` (the windows' rectangles and clear bits walked per call), the console's circles and the doorway tested per call, `quick::hit`, `quick::showing`. What changed: while any of the quick row shows, a point inside the app's circle is the row's "behind" (12) and no longer also the app's (op 27 used to say yes there, so a tap that shut the row also reached the app).
+- **Memory:** the map 7.7 MiB and the bars' ids 2 × (`BAR_TOP` + `CHROME_BOT`) rows × 2 bytes (about 2.8 MiB on husky), in the heap before its mark; `display: hit map N KiB …, the bars' ids N KiB` at start.
+- **Cost a frame:** the rows each publish already composes, a few runs a row and one u16 write a pixel; a host stand-in (x86, one core, husky's size, the home screen's layers) writes the whole screen in 0.3 ms with 16 circles, 0.9 ms with 64 and 1.8 ms with 200, before the four publishing threads share it. The stats line every ten seconds says what it cost on the device: `…; hit map N us in N rows` (summed over the publishing threads).
+- **The development view** (owner: "a debug/devel checkbox for toggling on/off the hitmap on the fourth frame so we get three frames normal and fourth is always hitmap so we can see both. Quick shortcut in dev only is swipe up from both back and home to toggle on/off"; "on that fourth frame, any redraw to the map should trigger a new colour palette"): the fourth temporal phase shows the map, a flat colour per owner (one channel full so none reads black), instead of the image, so three frames of four are the image and the fourth the map, at whatever rate frames come. Every redraw of the map (every publish that writes it) takes a new palette, so whatever changed hands shows in new colours against the rest. Op 58 `[0 off, 1 on, 2 toggle, 3 ask]` → `[0][on]`, answered by the receive thread; the map's Developer page has its checkbox ("hit map"), and two fingers landing on back and home together and swiped up past a twelfth of the screen's span toggle it (the corner's own swipe does nothing while they are a pair). Development builds only: a release build answers status 1 and the map shows neither.
+
 ## Build order
 
 0. **Measure the interactive path** (touch → map → display) to know where the 72 frames/s go.

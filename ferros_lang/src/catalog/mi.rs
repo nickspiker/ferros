@@ -235,6 +235,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ScopeBlue => "kahurangi",
         Msg::ScopeGreen => "kākāriki",
         Msg::ScopeClear => "mārama",
+        Msg::HitMap => "mahere pāwhiri",
         // ---- the attest screen ----
         Msg::Attest => "whakaū",
         Msg::Mint => "whakawhānau",

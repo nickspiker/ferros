@@ -235,6 +235,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ScopeBlue => "синій",
         Msg::ScopeGreen => "зелений",
         Msg::ScopeClear => "без фільтра",
+        Msg::HitMap => "карта дотиків",
         // ---- the attest screen ----
         Msg::Attest => "засвідчити",
         Msg::Mint => "викарбувати",
