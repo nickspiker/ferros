@@ -44,6 +44,10 @@ enum Op {
     FCmp(Cond, u32, u32),
     Sel(u32, u32, u32),
     IMul(u32, u32),
+    /// Wrapping integer add.
+    IAdd(u32, u32),
+    /// A 32-bit word of one of the caller's uniform slots (`reserve`), as a value.
+    Uniform(u8, u8),
     And(u32, u32),
     Or(u32, u32),
     Xor(u32, u32),
@@ -78,13 +82,13 @@ impl Op {
     fn sources(&self, mut f: impl FnMut(u32)) {
         use Op::*;
         match *self {
-            Const(_) | Gid | LoopHead => {}
+            Const(_) | Gid | LoopHead | Uniform(..) => {}
             FNeg(a) | FRcp(a) | FRsq(a) | FFloor(a) | F2U(a) | F2I(a) | U2F(a) | S2F(a) | FrexpE(a, _, _) | FLogd(a) | Phi(a) | LoopEnd(a) | LoopBreak(a) => f(a),
             FAddLscale(a, b) | FExp(a, b) => {
                 f(a);
                 f(b)
             }
-            FAdd(a, b) | FMul(a, b) | FMin(a, b) | FMax(a, b) | FCmp(_, a, b) | IMul(a, b) | And(a, b) | Or(a, b) | Xor(a, b) | Shl(a, b) | Shr(a, b) => {
+            FAdd(a, b) | FMul(a, b) | FMin(a, b) | FMax(a, b) | FCmp(_, a, b) | IMul(a, b) | IAdd(a, b) | And(a, b) | Or(a, b) | Xor(a, b) | Shl(a, b) | Shr(a, b) => {
                 f(a);
                 f(b)
             }
@@ -118,6 +122,8 @@ impl Op {
             FCmp(..) => "fcmp",
             Sel(..) => "sel",
             IMul(..) => "imul",
+            IAdd(..) => "iadd",
+            Uniform(..) => "uniform",
             And(..) => "and",
             Or(..) => "or",
             Xor(..) => "xor",
@@ -198,6 +204,7 @@ fn push(op: Op) -> u32 {
         Op::Or(a, b) => both(a, b).map(|(x, y)| Ok(x | y)),
         Op::Xor(a, b) => both(a, b).map(|(x, y)| Ok(x ^ y)),
         Op::IMul(a, b) => both(a, b).map(|(x, y)| Ok(x.wrapping_mul(y))),
+        Op::IAdd(a, b) => both(a, b).map(|(x, y)| Ok(x.wrapping_add(y))),
         Op::Shl(a, s) => both(a, s).filter(|(_, y)| *y < 32).map(|(x, y)| Ok(x << y)),
         Op::Shr(a, s) => both(a, s).filter(|(_, y)| *y < 32).map(|(x, y)| Ok(x >> y)),
         Op::U2F(a) => c(a).map(|x| Ok((x as f32).to_bits())),
@@ -248,6 +255,13 @@ pub fn store_at(slot: u8, index: U, shift: u8, offset: i16, value: U) {
 /// 32 bits from the address in uniform `slot` plus `index << shift` plus `offset` bytes (the same address as `store_at`).
 pub fn load(slot: u8, index: U, shift: u8, offset: i16) -> U {
     U(push(Op::Load { slot, shift, offset, index: index.0 }))
+}
+
+/// Word `word` (0 low, 1 high) of the caller's uniform slot `slot`, as a value: what a run passes besides addresses (where a band of a grid starts, so one kernel serves every band).
+pub fn uniform(slot: u8, word: u8) -> U {
+    // WHY: slots from `reserved` up hold the kernel's own constants; reading one as the caller's would take a constant for the caller's value. A word past 1 has no 32 bits to name.
+    assert!(slot < rec().reserved && word < 2, "valhall::ssa: uniform({slot}, {word}) outside the caller's slots");
+    U(push(Op::Uniform(slot, word)))
 }
 
 /// Record the exact forms (see `Rec::exact`) from here, for a test against the CPU's pixels bit for bit. Fast by default.
@@ -500,6 +514,12 @@ impl U {
     /// Per invocation, `a` where the mask is set and `b` elsewhere, for masks.
     pub fn select_mask(m: M, a: M, b: M) -> M {
         M(push(Op::Sel(m.0, a.0, b.0)))
+    }
+}
+impl Add for U {
+    type Output = U;
+    fn add(self, o: U) -> U {
+        U(push(Op::IAdd(self.0, o.0)))
     }
 }
 impl BitAnd for U {
@@ -1013,6 +1033,12 @@ pub fn compile() -> Compiled {
             }
             Op::IMul(a, b) => {
                 k.imul_i32(d, rr(a), rr(b));
+            }
+            Op::IAdd(a, b) => {
+                k.iadd_u32(d, rr(a), rr(b));
+            }
+            Op::Uniform(slot, word) => {
+                k.mov_i32(d, if word == 0 { u(slot).w0() } else { u(slot).w1() });
             }
             Op::And(a, b) => {
                 k.lshift_and_i32(d, rr(a), Lut::ZERO, Byte::B0, rr(b));

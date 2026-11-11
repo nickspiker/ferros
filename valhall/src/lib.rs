@@ -36,6 +36,8 @@
 extern crate alloc;
 #[cfg(feature = "ssa")]
 pub mod ssa;
+#[cfg(feature = "sim")]
+pub mod sim;
 
 // ---------------------------------------------------------------------------
 // Operands
@@ -586,10 +588,10 @@ impl Ins {
 // The builder
 // ---------------------------------------------------------------------------
 
-/// Branch targets one kernel may declare.
-const LABELS: usize = 1 << 5;
-/// Branches one kernel may emit.
-const BRANCHES: usize = 1 << 6;
+/// Branch targets one kernel may declare: the SSA compiler takes two a loop, and the wallpaper's refine kernel has seventeen loops (one orbit for the far layer, one for each of its 4 × 4 samples).
+const LABELS: usize = 1 << 6;
+/// Branches one kernel may emit (two a loop).
+const BRANCHES: usize = 1 << 7;
 
 /// A kernel under construction, holding at most `N` instruction words with no allocator.
 /// Running past `N` words, [`LABELS`] labels or [`BRANCHES`] branches panics on the array index: a kernel that does not fit is a bug in the caller's sizing.

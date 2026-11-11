@@ -10,3 +10,5 @@ description = "Typed instruction builder for the Mali-G715's Valhall ISA (v11): 
 [features]
 # The SSA recorder and compiler (ssa.rs): needs an allocator in whatever links it.
 ssa = []
+# The host emulator of Valhall words (sim.rs): host tests only, it needs std.
+sim = []
