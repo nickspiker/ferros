@@ -59,9 +59,17 @@ pub fn hv_trng_pool() -> usize {
     hv_base() + 0x3E0_0000
 }
 
+/// A RELOAD's tag (x0 = generation << 1 | 1) with this bit set: the kernel that reloaded ran on akita. Bit 63, far above any generation.
+pub const RELOAD_AKITA: u64 = 1 << 63;
+
 /// The board from the device tree at `dtb` (ABL's x0): akita when the root `model` says AKITA. A RELOAD's tag (an odd x0) or no tree keeps what is set.
 /// MMU off, the tree in Device memory: aligned 32-bit and single-byte volatile loads only (an ordinary slice compare can become a wide unaligned load, and that faults on Device memory), and only the root node's own properties are looked at, which come before its first child.
 pub fn detect(dtb: u64) {
+    // A RELOAD from akita says so in its tag (service.rs builds it): the reloaded kernel has no tree, and husky's frame map names DRAM akita does not have (frames.rs).
+    if dtb & 1 == 1 && dtb & RELOAD_AKITA != 0 {
+        BOARD.store(Board::Akita as u8, Ordering::Relaxed);
+        return;
+    }
     if dtb == 0 || dtb & 3 != 0 {
         return;
     }

@@ -25,10 +25,16 @@ static mut L2_HI: Table = Table([0; 512]);
 /// Level 2 for the first GiB (the MMIO below the window): Device blocks, EL2-only, except the USB controller's block, which EL0 may reach (`USB_REGS`).
 static mut L2_LO: Table = Table([0; 512]);
 static mut L3: [Table; 2] = [Table([0; 512]), Table([0; 512])];
-/// 4 KiB pages for the arc pool (POOL), so a process's pages carry per-arc W^X (SANDBOX.md): the cold pool is 16 MiB = 8 blocks, the shim pool 2 MiB = 1.
-static mut POOL_L3: [Table; 8] = [Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512])];
-/// 4 KiB pages for the big arc pool too (POOL_BIG, 512 MiB = 256 blocks), since 2026-11-03: a masked process whose arc holds a frame-sized buffer (the attest screen, the keyboard: SANDBOX.md, "Handles") lives there and needs per-arc W^X and its handle table's read-only page like any other.
-static mut POOL_BIG_L3: [Table; 256] = [const { Table([0; 512]) }; 256];
+
+/// The arcs' virtual windows (ARCS.md, 2026-11-11): every process's arc is a window of addresses here, its 2 MiB slots mapped to frames of the pool wherever they lie (frames.rs), so an arc grows by mapping more and moves by remapping, and no process ever sees an address change. 64 GiB from G#40_0000_0000: above every address the SoC decodes on either board (DRAM ends at G#B_0000_0000), inside the 39-bit space TTBR0 walks. Until 2026-11-11 arcs were the physical pools themselves, identity-mapped (POOL's and POOL_BIG's own level-3 tables, which this replaces).
+/// Why windows and not a base register for every mode (ARCS.md proposed fixed and ring move by x28 alone): masked code keeps only the low bits of a data pointer, but its code pointers are whole addresses (return addresses on its stack, the vtables its relocations filled, function pointers), and a branch is not masked, so after a copy to a new base the first `ret` would jump into the old frames.
+pub const ARC_VA: (usize, usize) = (0x40_0000_0000, 0x50_0000_0000);
+/// Level 2 for each GiB of the windows: an entry per 2 MiB slot, pointing at the level-3 table of the frame mapped there (frames.rs `table`), or invalid.
+static mut L2_ARCS: [Table; 64] = [const { Table([0; 512]) }; 64];
+/// Level 2 for the GiBs from G#8_0000_0000 (husky's high bank) that hold frames: the frames Normal and the kernel's alone (it zeroes, copies and scrubs them by their own addresses), every other 2 MiB block Device, as the 1 GiB block was.
+static mut L2_DRAM: [Table; 16] = [const { Table([0; 512]) }; 16];
+/// The first GiB `L2_DRAM` covers.
+const DRAM_GIB0: usize = 32;
 
 unsafe extern "C" {
     static __dma_start: u8;
@@ -56,13 +62,13 @@ pub fn heap2_prepare() {
 pub const HEAP2: (usize, usize) = (0x8260_0000, 0x8300_0000);
 #[cfg(shim_handoff)]
 const WINDOW: (usize, usize) = (0x9240_0000, 0x9300_0000);
-/// The arc pool: EL0-accessible, a power of two aligned to its size, clear of the kernel image/stack/heap and the staging slot. Cold: 16 MiB at G#8300_0000, the top of the window, taken from the heap's second region (2026-10-26: the 8 MiB at G#8100_0000 held four guarded 1 MiB arcs — display, map, WiFi, IP — and refused the fifth process; G#8100_0000-G#8180_0000 is free now). Was: 8 MiB at G#8100_0000 (heap ends below it; staging slot G#8208_0000) — big enough for a driver process carrying multi-MiB firmware. Handoff (oracle only): 2 MiB at G#92C0_0000 (slot G#92A0_0000, stub G#92E8_0000).
+/// The first range of the frame pool (frames.rs; until 2026-11-11 the page pool of arcs, EL0-accessible): kernel-only Normal memory now, reached by processes only through their windows (ARC_VA). A power of two aligned to its size, clear of the kernel image/stack/heap and the staging slot. Cold: 16 MiB at G#8300_0000, the top of the window, taken from the heap's second region (2026-10-26: the 8 MiB at G#8100_0000 held four guarded 1 MiB arcs — display, map, WiFi, IP — and refused the fifth process; G#8100_0000-G#8180_0000 is free now). Was: 8 MiB at G#8100_0000 (heap ends below it; staging slot G#8208_0000) — big enough for a driver process carrying multi-MiB firmware. Handoff (oracle only): 2 MiB at G#92C0_0000 (slot G#92A0_0000, stub G#92E8_0000).
 #[cfg(not(shim_handoff))]
 pub const POOL: (usize, usize) = (0x8300_0000, 0x8400_0000);
 #[cfg(shim_handoff)]
 pub const POOL: (usize, usize) = (0x92C0_0000, 0x92E0_0000);
 
-/// The big arc pool (cold only): 320 MiB of Normal write-back, EL0 read/write/execute DRAM at G#A000_0000, in 2 MiB blocks of the window's GiB table — arcs of 16 MiB and up (a std process: Photon's heap, a fluor frame's scratch), where the 16 MiB page pool holds the small ones and the masked ones. Nothing in the device tree reserves G#9800_0000-G#C000_0000 (the TPU, GSA and modem carveouts sit below G#9740_0000 and from G#C000_0000; ferros-ref soc-gs dts, 2026-10-27); W^X is not kept per page here — native processes only, and the whole arc is theirs to execute.
+/// The second range of the frame pool (frames.rs; until 2026-11-11 the big arc pool, cold only): 320 MiB of Normal write-back DRAM at G#A000_0000, kernel-only 2 MiB blocks of the window's GiB table, processes reaching its frames through their windows (ARC_VA). Until then it held arcs of 16 MiB and up (a std process: Photon's heap, a fluor frame's scratch), where the 16 MiB page pool holds the small ones and the masked ones. Nothing in the device tree reserves G#9800_0000-G#C000_0000 (the TPU, GSA and modem carveouts sit below G#9740_0000 and from G#C000_0000; ferros-ref soc-gs dts, 2026-10-27); W^X lives in each frame's own level-3 table now.
 #[cfg(not(shim_handoff))]
 pub const POOL_BIG: (usize, usize) = (0xA000_0000, 0xB400_0000);
 
@@ -208,6 +214,20 @@ fn pool_page(vhe: bool, addr: usize, writable: bool, exec: bool) -> u64 {
 fn uncached(vhe: bool, addr: usize, kind: u64) -> u64 {
     addr as u64 | kind | ATTR_NC | SH_INNER | AF | if vhe { UXN | PXN } else { AP_EL2 | XN }
 }
+/// A frame of the pool at its own address (frames.rs): Normal write-back, the kernel's alone (no EL0 access), never executable.
+fn frame_block(vhe: bool, addr: usize) -> u64 {
+    addr as u64 | BLOCK | ATTR_NORMAL | SH_INNER | AF | if vhe { UXN | PXN } else { AP_EL2 | XN }
+}
+/// Whether the 2 MiB block at `a` is a frame of the pool.
+fn in_frames(a: usize) -> bool {
+    crate::frames::map().iter().any(|&(lo, hi)| a >= lo && a + MIB2 <= hi)
+}
+/// A page the kernel may read and write and no process may touch: an arc's guard, the page under its first stack, the slack of its last frame past its size.
+fn kernel_page(addr: usize) -> u64 {
+    addr as u64 | TABLE_OR_PAGE | ATTR_NORMAL | SH_INNER | AF | PXN | UXN
+}
+/// The output address bits of a descriptor (47:12).
+const OA: u64 = 0x0000_FFFF_FFFF_F000;
 
 /// Whether the cores implement VHE (ID_AA64MMFR1_EL1.VH, bits 11:8).
 fn has_vhe() -> bool {
@@ -234,7 +254,6 @@ pub fn enable() -> bool {
     let (f0, f1) = DISPLAY_FB;
     let (h0, h1) = DISPLAY_HEAP;
     let (t0, t1) = DISPLAY_PHASES;
-    let (b0, b1) = POOL_BIG;
     let dma_ok = q0 == q1 || (q0 % MIB2 == 0 && q1 % MIB2 == 0 && q0 >= w0 && q1 <= w1 && (q1 <= p0 || q0 >= p1) && (q1 <= d0 || q0 >= d1));
     // The framebuffers and the display heap sit outside the window but in its GiB (so the level-2 table covers them), 2 MiB aligned, apart from each other.
     let outside = |a: usize, b: usize| a == b || (a % MIB2 == 0 && b % MIB2 == 0 && a / GIB == w0 / GIB && (b - 1) / GIB == w0 / GIB && (b <= w0 || a >= w1));
@@ -247,7 +266,6 @@ pub fn enable() -> bool {
         let l1 = &mut *(&raw mut L1);
         let l2 = &mut *(&raw mut L2);
         let l3 = &mut *(&raw mut L3);
-        let pool_l3 = &mut *(&raw mut POOL_L3);
         for (i, e) in l1.0.iter_mut().enumerate() {
             *e = device(vhe, i * GIB, BLOCK);
         }
@@ -269,22 +287,11 @@ pub fn enable() -> bool {
                 device_el0(vhe, a, BLOCK)
             } else if (h0 != h1 && a >= h0 && a + MIB2 <= h1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 + USB_DMA_NC && a + MIB2 <= USB_DMA.1) || (GPU_MEM.0 != GPU_MEM.1 && a == GPU_SNOOP) || (LAYERS.0 != LAYERS.1 && a >= LAYERS.0 && a + MIB2 <= LAYERS.1) {
                 pool(vhe, a, BLOCK) | UXN
-            } else if b0 != b1 && a >= b0 && a + MIB2 <= b1 {
-                // The big pool at 4 KiB granularity as well: fresh pages are data.
-                let t = &mut (*(&raw mut POOL_BIG_L3))[(a - b0) / MIB2];
-                for (k, pg) in t.0.iter_mut().enumerate() {
-                    *pg = pool_page(vhe, a + k * PAGE, true, false);
-                }
-                &raw const t.0 as u64 | TABLE_OR_PAGE
+            } else if in_frames(a) {
+                // A frame of the pool (the page pool's and the big pool's ranges until 2026-11-11): the kernel's, by its own address; a process reaches it only through its window.
+                frame_block(vhe, a)
             } else if a + MIB2 <= w0 || a >= w1 {
                 device(vhe, a, BLOCK)
-            } else if a >= p0 && a + MIB2 <= p1 {
-                // The pool at 4 KiB granularity (per-arc W^X). A fresh/freed page is data: writable, non-executable; spawn flips a process's code pages to read-only + executable.
-                let t = &mut pool_l3[(a - p0) / MIB2];
-                for (k, pg) in t.0.iter_mut().enumerate() {
-                    *pg = pool_page(vhe, a + k * PAGE, true, false);
-                }
-                &raw const t.0 as u64 | TABLE_OR_PAGE
             } else if a >= q0 && a + MIB2 <= q1 {
                 dma_pool(vhe, a, BLOCK)
             } else if a + MIB2 > d0 && a < d1 {
@@ -314,6 +321,23 @@ pub fn enable() -> bool {
                 *e = if normal_here { pool(vhe, a, BLOCK) | UXN } else if modem_here { device_el0(vhe, a, BLOCK) } else { device(vhe, a, BLOCK) };
             }
             l1.0[s0 / GIB] = &raw const L2_HI as u64 | TABLE_OR_PAGE;
+        }
+        // The high bank's GiBs that hold frames (frames.rs: husky's 9 GiB from G#8_8000_0000): the frames Normal and the kernel's, every other block Device as the GiB was.
+        let l2d = &mut *(&raw mut L2_DRAM);
+        for (g, t) in l2d.iter_mut().enumerate() {
+            let base = (DRAM_GIB0 + g) * GIB;
+            if !crate::frames::map().iter().any(|&(lo, hi)| lo < base + GIB && hi > base) {
+                continue;
+            }
+            for (j, e) in t.0.iter_mut().enumerate() {
+                let a = base + j * MIB2;
+                *e = if in_frames(a) { frame_block(vhe, a) } else { device(vhe, a, BLOCK) };
+            }
+            l1.0[DRAM_GIB0 + g] = &raw const t.0 as u64 | TABLE_OR_PAGE;
+        }
+        // The arcs' windows: every GiB's level-2 table in place, every slot invalid until an arc maps a frame there.
+        for (g, t) in (*(&raw const L2_ARCS)).iter().enumerate() {
+            l1.0[ARC_VA.0 / GIB + g] = &raw const t.0 as u64 | TABLE_OR_PAGE;
         }
         // The tables went to DRAM with the MMU off. Discard any stale lines over the window (left by the loader; ours bypassed the cache) before the window becomes cacheable — including the table walker's view of the tables. Not the heap's second region (cold): it is discarded later, off the boot path, before the heap takes it (`heap2_prepare`; its 26 MiB of lines cost the boot ~235 ms here, 2026-10-26).
         asm!("dsb sy");
@@ -428,8 +452,7 @@ pub fn off_for_handover() {
     }
 }
 
-/// Make freshly written code at [addr, addr + len) executable: clean it to the point of unification, then invalidate the I-cache.
-/// Set the W^X attributes of an arc's pool pages (SANDBOX.md), then invalidate the TLB for them. A masked process marks `[exec_start, exec_end)` read-only + executable (its checked `.text`) and leaves every other page writable + non-executable (grants, read-only data, input, stack). A native dev process (`native`) gets the whole arc RWX. Call after writing the code, before entering; `arc_reset` returns every page to data on free.
+/// Set the W^X attributes of an arc's pages (SANDBOX.md), then invalidate the TLB for them. A masked process marks `[exec_start, exec_end)` read-only + executable (its checked `.text`) and leaves every other page writable + non-executable (grants, read-only data, input, stack). A native dev process (`native`) gets the whole arc RWX. Call after writing the code, before entering. Each page keeps the frame it maps; a freed arc's frames go back with fresh tables (frames.rs `give`), so nothing resets them here.
 pub fn set_arc_wx(base: usize, size: usize, exec_start: usize, exec_end: usize, native: bool, guarded: bool) {
     if !vhe() {
         return;
@@ -442,8 +465,9 @@ pub fn set_arc_wx(base: usize, size: usize, exec_start: usize, exec_end: usize, 
         while a < base + size {
             let exec = native || (a >= exec_start && a < exec_end);
             let writable = native || !exec;
+            let e = page_entry(a).unwrap();
             // A BTI capsule's code on guarded pages (GP, bit 50): every indirect branch into them must land on a `bti` instruction (SCTLR_EL2.BT0, set at boot), so no jump enters a multi-instruction check midway.
-            *page_entry(a).unwrap() = pool_page(true, a, writable, exec) | if guarded && exec && !native { 1 << 50 } else { 0 };
+            *e = pool_page(true, (*e & OA) as usize, writable, exec) | if guarded && exec && !native { 1 << 50 } else { 0 };
             a += PAGE;
         }
         asm!("dsb ish");
@@ -457,11 +481,7 @@ pub fn set_arc_wx(base: usize, size: usize, exec_start: usize, exec_end: usize, 
     }
 }
 
-/// Return an arc's pages to the default (writable data, non-executable) when it is freed.
-pub fn arc_reset(base: usize, size: usize) {
-    set_arc_wx(base, size, 0, 0, false, false);
-}
-
+/// Make freshly written code at [addr, addr + len) executable: clean it to the point of unification, then invalidate the I-cache.
 pub fn sync_code(addr: usize, len: usize) {
     unsafe {
         let mut a = addr & !63;
@@ -481,15 +501,15 @@ pub fn grants_page(base: usize, writable: bool) {
     let a = base;
     let Some(e) = page_entry(a) else { return };
     unsafe {
-        *e = pool_page(true, a, writable, false);
+        *e = pool_page(true, (*e & OA) as usize, writable, false);
         asm!("dsb ish");
         asm!("tlbi vae1is, {x}", x = in(reg) (a as u64) >> 12);
         asm!("dsb ish", "isb");
     }
 }
 
-/// A masked arc's guard (SANDBOX.md): `len` bytes from `base` mapped kernel-only (`on`), so no process reads or writes them, or back to ordinary pool pages (writable data) when the arc is freed. The kernel keeps its own access (the scrub zeroes the pools whole).
-pub fn guard_pages(base: usize, len: usize, on: bool) {
+/// `len` bytes of an arc from `base` made kernel-only: the page under its first thread's stack (process.rs STACK_GUARD), so a stack run past its end faults with the process named. The kernel keeps its own access: a syscall buffer may name it, and the kernel's write there must not fault.
+pub fn guard_pages(base: usize, len: usize) {
     if !vhe() {
         return;
     }
@@ -497,7 +517,7 @@ pub fn guard_pages(base: usize, len: usize, on: bool) {
         let mut a = base;
         while a < base + len {
             if let Some(e) = page_entry(a) {
-                *e = if on { a as u64 | TABLE_OR_PAGE | ATTR_NORMAL | SH_INNER | AF | PXN | UXN } else { pool_page(true, a, true, false) };
+                *e = kernel_page((*e & OA) as usize);
             }
             a += PAGE;
         }
@@ -511,34 +531,108 @@ pub fn guard_pages(base: usize, len: usize, on: bool) {
     }
 }
 
-/// Every page of both pools back to kernel-only writable data, for the scrub before a reset (platform::scrub_memory): a grants page and a masked process's code are read-only at every level, the kernel's too, and the scrub's first `dc zva` into one took a permission fault, so the fault's plain reset replaced the ordered one and `bridge reboot fastboot` booted ferros again (akita, 2026-11-06: FAR G#8300_0000, the first arc's grants page). Only after the workers are stopped: no process runs again before the reset.
-pub fn pools_to_kernel() {
+/// `len` bytes of an arc from `va` handed to the process as data (`open`: writable, never executable) or taken back to kernel-only, each page keeping its frame: the pages of a masked arc's last frame between its old size and its new one (process.rs `arc_resize`).
+pub fn pages_open(va: usize, len: usize, open: bool) {
     if !vhe() {
         return;
     }
-    for (lo, hi) in [POOL, POOL_BIG] {
-        let mut a = lo;
-        while a < hi {
-            *page_entry(a).unwrap() = a as u64 | TABLE_OR_PAGE | ATTR_NORMAL | SH_INNER | AF | PXN | UXN;
+    let mut a = va;
+    while a < va + len {
+        if let Some(e) = page_entry(a) {
+            let pa = (*e & OA) as usize;
+            *e = if open { pool_page(true, pa, true, false) } else { kernel_page(pa) };
+        }
+        a += PAGE;
+    }
+    unmapped(va, len);
+}
+
+/// Map frame `pa` at the window slot `va` (2 MiB aligned, inside ARC_VA) through the frame's own level-3 table at `table` (frames.rs): its first `usable` bytes as the process's data (writable, never executable; `set_arc_wx` makes code of them), the rest kernel-only (the slack of an arc smaller than its frames, which is a masked arc's guard). The slot must be unmapped. Call `mapped` once the arc's slots are in.
+pub fn map_slot(va: usize, pa: usize, table: usize, usable: usize) {
+    let t = unsafe { &mut *(table as *mut [u64; 512]) };
+    for (k, e) in t.iter_mut().enumerate() {
+        let a = pa + k * PAGE;
+        *e = if k * PAGE < usable { pool_page(true, a, true, false) } else { kernel_page(a) };
+    }
+    *slot_entry(va) = table as u64 | TABLE_OR_PAGE;
+}
+
+/// A moved frame's level-3 table (process.rs `arc_move`): every entry of the old table at `from`, its permissions kept (W^X, read-only, BTI's guarded bit, kernel-only), its output address the same page of the frame at `pa`. Written before the slot points at it.
+pub fn retable(from: usize, to: usize, pa: usize) {
+    let (a, b) = unsafe { (&*(from as *const [u64; 512]), &mut *(to as *mut [u64; 512])) };
+    for (k, (e, n)) in a.iter().zip(b.iter_mut()).enumerate() {
+        *n = if *e & 1 == 0 { 0 } else { (*e & !OA) | ((pa + k * PAGE) as u64 & OA) };
+    }
+}
+
+/// After an arc's frames were copied (a move): the instruction side made to see the code's new copies. Each page EL0 may execute (UXN clear) is cleaned to the point of unification unless the data cache is coherent there already (CTR_EL0.IDC), then the instruction cache invalidated unless it snoops (CTR_EL0.DIC). A native arc is executable whole; a masked one only its code pages.
+pub fn sync_exec(va: usize, len: usize) {
+    let ctr: u64;
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr) };
+    if ctr & (1 << 28) == 0 {
+        let mut a = va;
+        while a < va + len {
+            if page_entry(a).is_some_and(|e| *e & UXN == 0) {
+                let mut l = a;
+                while l < a + PAGE {
+                    unsafe { asm!("dc cvau, {}", in(reg) l) };
+                    l += 64;
+                }
+            }
             a += PAGE;
         }
     }
-    unsafe { asm!("dsb ish", "tlbi vmalle1is", "dsb ish", "isb") };
+    unsafe { asm!("dsb ish") };
+    if ctr & (1 << 29) == 0 {
+        unsafe { asm!("ic ialluis") };
+    }
+    unsafe { asm!("dsb ish", "isb") };
 }
 
-/// The level-3 entry of the pool page at `a`, in either pool; None outside both.
-fn page_entry(a: usize) -> Option<&'static mut u64> {
-    let (p0, p1) = POOL;
-    let (b0, b1) = POOL_BIG;
+/// The level-2 entry of window slot `va`. An address outside the windows is a bug in the caller: the index panics.
+fn slot_entry(va: usize) -> &'static mut u64 {
+    let g = (va - ARC_VA.0) / GIB;
+    unsafe { &mut (*(&raw mut L2_ARCS))[g].0[(va / MIB2) % 512] }
+}
+
+/// The level-3 table mapped at window slot `va`, None while the slot is unmapped.
+pub fn slot_table(va: usize) -> Option<usize> {
+    let e = *slot_entry(va);
+    (e & 3 == 3).then_some((e & OA) as usize)
+}
+
+/// Point window slot `va` at another level-3 table (a frame's, frames.rs `table`), or unmap it (0). Call `unmapped` for the slot before its old frame is used again.
+pub fn set_slot(va: usize, table: usize) {
+    *slot_entry(va) = if table == 0 { 0 } else { table as u64 | TABLE_OR_PAGE };
+}
+
+/// After mapping slots that were unmapped: the tables written before any core walks them. A slot going from invalid to valid needs no invalidation (no TLB holds an invalid entry).
+pub fn mapped() {
+    unsafe { asm!("dsb ish", "isb") };
+}
+
+/// After unmapping or remapping the window `[va, va + len)`: every core's TLB forgets it before its old frames are zeroed or handed on. Page by page up to 8 MiB; past that the whole TLB at once (one instruction, where a 200 MB arc would take 51,200).
+pub fn unmapped(va: usize, len: usize) {
     unsafe {
-        if a >= p0 && a < p1 {
-            let idx = (a - p0) / PAGE;
-            Some(&mut (*(&raw mut POOL_L3))[idx / 512].0[idx % 512])
-        } else if b0 != b1 && a >= b0 && a < b1 {
-            let idx = (a - b0) / PAGE;
-            Some(&mut (*(&raw mut POOL_BIG_L3))[idx / 512].0[idx % 512])
+        asm!("dsb ish");
+        if len > 8 << 20 {
+            asm!("tlbi vmalle1is");
         } else {
-            None
+            let mut a = va;
+            while a < va + len {
+                asm!("tlbi vae1is, {x}", x = in(reg) (a as u64) >> 12);
+                a += PAGE;
+            }
         }
+        asm!("dsb ish", "isb");
     }
+}
+
+/// The level-3 entry of the page at `a` in an arc's window; None outside the windows or in an unmapped slot.
+fn page_entry(a: usize) -> Option<&'static mut u64> {
+    if a < ARC_VA.0 || a >= ARC_VA.1 {
+        return None;
+    }
+    let t = slot_table(a)?;
+    Some(unsafe { &mut (*(t as *mut [u64; 512]))[(a / PAGE) % 512] })
 }
