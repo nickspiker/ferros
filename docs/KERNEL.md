@@ -556,6 +556,8 @@ Vault objects additionally carry cryptographic access control:
 
 ## Module 3: Ring Memory
 
+**Built so far, and the way there (2026-11-11):** one arc per process, sized at spawn and physically contiguous, from two pools carved at boot (16 MB and 320 MB); no growth, no second arc, no rotation yet. [ARCS.md](ARCS.md) is the plan from that to this module: one frame pool of all free DRAM, arcs that grow in place or move, DMA pinned.
+
 ### Principle
 
 No NULL. No MAX. No boundaries to overflow. The address space wraps by construction using two's complement arithmetic. Other process memory **does not exist** — not protected, not mapped, not addressable.

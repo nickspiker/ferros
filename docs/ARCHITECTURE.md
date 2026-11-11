@@ -221,6 +221,7 @@ Everything else is userspace:
 ARCHITECTURE.md     this document — why these decisions
 SECURITY_CHAIN.md   boot trust model, signature chain, owner sovereignty
 RING.md             ring mechanics, binary search, mirror protocol
+ARCS.md             process memory: arcs that grow in place or move (proposal)
 VAULT.md            persistent object store: tract, plow, HAMT, spine
 HAMT.md             hash array mapped trie, COW versioning, object formats
 LEDGER.md           append-only event chain, VSF format
