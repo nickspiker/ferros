@@ -126,6 +126,14 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ThemeSlate => "arduvaz",
         Msg::ThemeEmber => "kor",
         Msg::ThemeNight => "gece",
+        // ---- the quick row ----
+        Msg::Torch => "fener",
+        Msg::RadiosOff => "telsizler kapalı",
+        Msg::SoundOn => "ses",
+        Msg::Vibrate => "titreşim",
+        Msg::Silent => "sessiz",
+        Msg::DoNotDisturb => "rahatsız etmeyin",
+        Msg::Screencap => "ekran görüntüsü",
         // ---- Keyboard ----
         Msg::Layout => "düzen",
         // ---- Security ----

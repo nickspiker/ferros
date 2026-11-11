@@ -126,6 +126,14 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ThemeSlate => "स्लेटी",
         Msg::ThemeEmber => "अंगारा",
         Msg::ThemeNight => "रात",
+        // ---- the quick row ----
+        Msg::Torch => "टॉर्च",
+        Msg::RadiosOff => "रेडियो बंद",
+        Msg::SoundOn => "ध्वनि",
+        Msg::Vibrate => "कंपन",
+        Msg::Silent => "मौन",
+        Msg::DoNotDisturb => "परेशान न करें",
+        Msg::Screencap => "स्क्रीनशॉट",
         // ---- Keyboard ----
         Msg::Layout => "लेआउट",
         // ---- Security ----

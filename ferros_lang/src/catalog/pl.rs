@@ -126,6 +126,14 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ThemeSlate => "łupek",
         Msg::ThemeEmber => "żar",
         Msg::ThemeNight => "noc",
+        // ---- the quick row ----
+        Msg::Torch => "latarka",
+        Msg::RadiosOff => "radia wyłączone",
+        Msg::SoundOn => "dźwięk",
+        Msg::Vibrate => "wibracje",
+        Msg::Silent => "cisza",
+        Msg::DoNotDisturb => "nie przeszkadzać",
+        Msg::Screencap => "zrzut ekranu",
         // ---- Keyboard ----
         Msg::Layout => "układ",
         // ---- Security ----

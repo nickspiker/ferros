@@ -214,6 +214,20 @@ messages! {
     ThemeEmber,
     ThemeNight,
 
+    // ---- the quick row (payloads/display, QUICK.md): each circle's word; brightness is `Brightness` ----
+    /// The torch (the camera's flash held on).
+    Torch,
+    /// Every radio switched off at once (a tap puts back the ones that were on).
+    RadiosOff,
+    /// The sound mode's three: sounds play, the device buzzes instead, neither.
+    SoundOn,
+    Vibrate,
+    Silent,
+    /// The person's do not disturb (follows them across their devices).
+    DoNotDisturb,
+    /// A capture of the screen.
+    Screencap,
+
     // ---- Keyboard ----
     /// The keyboard layout's heading (Dvorak, QWERTY stay).
     Layout,

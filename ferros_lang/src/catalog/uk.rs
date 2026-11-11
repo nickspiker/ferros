@@ -126,6 +126,14 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ThemeSlate => "графіт",
         Msg::ThemeEmber => "жар",
         Msg::ThemeNight => "ніч",
+        // ---- the quick row ----
+        Msg::Torch => "ліхтарик",
+        Msg::RadiosOff => "радіо вимкнені",
+        Msg::SoundOn => "звук",
+        Msg::Vibrate => "вібрація",
+        Msg::Silent => "без звуку",
+        Msg::DoNotDisturb => "не турбувати",
+        Msg::Screencap => "знімок екрана",
         // ---- Keyboard ----
         Msg::Layout => "розкладка",
         // ---- Security ----
