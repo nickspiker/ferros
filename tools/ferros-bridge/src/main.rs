@@ -599,7 +599,7 @@ fn build_cmd(cap_name: &[u8], op: ferros_pt::Op, params: &[u8]) -> Vec<u8> {
 // Commands
 // ---------------------------------------------------------------------------
 
-/// Wrap position-independent native code in a signed capsule (toka's capsule format: a VSF file, section `aarch64` field `code`, signed with Ed25519 over the whole file). The developer key is the 64-byte keypair at $FERROS_DEV_KEY (default: the ferros key in the keys dir); only its 32-byte seed is used, and it never leaves this process.
+/// Wrap position-independent native code in a signed capsule (toka's capsule format: a VSF file, section `aarch64` field `code`, signed with Ed25519 over the whole file). The developer key is the 64-byte keypair at $FERROS_DEV_KEY (default: the ferros key in the keys dir); only its 32-byte seed is used, and it never leaves this process. A kist (`--kist NAME --option HEX [--want RIGHT REASON]... [--developer NAME]`) is built by ferros_kist::capsule, as tools/kistcat `kist` builds one: its developer's whole public bundle in it (`kb`) and an egg per scheme, so $FERROS_DEV_KEY is then a developer key (VSF, kistcat `devkey new`) or Photon's release seed.
 /// `--text-len N`: for a masked capsule, how many bytes of the image are instructions (the rest is read-only data).
 fn text_len_arg(args: &[String]) -> Option<usize> {
     args.iter().position(|a| a == "--text-len").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok())
@@ -659,9 +659,29 @@ fn option_arg() -> Option<[u8; 32]> {
     }
 }
 
+/// The kist signer's bundle from the key file: a developer's key (VSF, section `developer_key` { label a, seed kge }: tools/kistcat `devkey new`), its post-quantum halves derived under its label; or a raw seed that is Photon's release key (its bundle fgtw's). Any other raw seed is refused: a kist is never signed with one egg.
+fn kist_signer(key: &[u8], key_path: &str) -> fgtw::pq::SigningBundle {
+    use fgtw::pq::FleetSigner;
+    if key.starts_with("RÅ<".as_bytes()) {
+        let (label, mut seed) = ferros_kist::capsule::developer_key(key).unwrap_or_else(|e| {
+            eprintln!("{key_path}: {e}");
+            std::process::exit(1);
+        });
+        let b = fgtw::pq::SigningBundle::developer(&seed, &label);
+        seed.fill(0);
+        return b;
+    }
+    let seed: [u8; 32] = key[..32].try_into().unwrap();
+    let b = fgtw::pq::SigningBundle::release(&seed);
+    if b.keypair().public.to_bytes() != fgtw::release::RELEASE_ED25519 {
+        eprintln!("{key_path}: a kist is signed with every scheme of its developer's bundle: give a developer key (kistcat devkey new) or Photon's release key, not a bare seed");
+        std::process::exit(1);
+    }
+    b
+}
+
 fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8> {
     use ed25519_dalek::SigningKey;
-    use vsf::types::VsfType;
     let key_path = std::env::var("FERROS_DEV_KEY").unwrap_or_else(|_| "/mnt/Harbor/Code/keys/ferros.secret".to_string());
     let key = std::fs::read(&key_path).unwrap_or_else(|e| {
         eprintln!("No developer key at {key_path}: {e}");
@@ -671,59 +691,30 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
         eprintln!("Developer key at {key_path} is too short");
         std::process::exit(1);
     }
-    let seed: [u8; 32] = key[..32].try_into().unwrap();
-    let pubkey = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
-    let mut section = vsf::file_format::VsfSection::new(if masked { "masked" } else { "aarch64" });
-    section.add_field("code", VsfType::v(b'b', code.to_vec()));
-    if let Some(t) = text_len {
-        section.add_field("text", VsfType::u(t, false));
-    }
-    if let Some(k) = fixed_arg().filter(|_| masked) {
-        section.add_field("fixed", VsfType::u(k as usize, false));
-    }
-    // `--bti`: the image carries BTI landing pads; the kernel maps its code on guarded pages (SANDBOX.md, "BTI").
-    if masked && std::env::args().any(|a| a == "--bti") {
-        section.add_field("bti", VsfType::u(1, false));
-    }
-    // `--exact`: exact mode, the subtract and unsigned compare (SANDBOX.md, "Modes"); needs `--bti`.
-    if masked && std::env::args().any(|a| a == "--exact") {
-        section.add_field("exact", VsfType::u(1, false));
-    }
-    // A kist's declaration goes before its code, so the kernel and the installer read it from the capsule's first bytes; its option rides in it (`kist`'s `option`), and the header's `hp` is the content's provenance hash, as every VSF reader expects.
-    let mut builder = vsf::VsfBuilder::new();
-    let kist = kist_arg();
-    if let Some(d) = &kist {
+    // The code's section, as kistcat writes it (ferros_kist::capsule): `--bti` (the image carries BTI landing pads; the kernel maps its code on guarded pages, SANDBOX.md "BTI") and `--exact` (exact mode, the subtract and unsigned compare; needs `--bti`).
+    let c = ferros_kist::capsule::Code { image: code, masked, text: text_len, fixed: fixed_arg(), bti: std::env::args().any(|a| a == "--bti"), exact: std::env::args().any(|a| a == "--exact") };
+    // A kist: its declaration before its code (the kernel and the installer read it from the capsule's first bytes), its option in it (`kist`'s `option`), its developer's whole public bundle in it (`kb`), and an egg per scheme (owner, 2026-11-10: "no single eggs"; trust on first install), built by the one builder kistcat's `kist` uses.
+    if let Some(d) = kist_arg() {
         let Some(option) = option_arg() else {
             eprintln!("a kist needs its --option (its identity across versions, minted once)");
             std::process::exit(1);
         };
-        let (k, w) = ferros_kist::declaration_sections(d, Some(option));
-        builder = builder.add_section_direct(k);
-        if let Some(w) = w {
-            builder = builder.add_section_direct(w);
-        }
-    }
-    // A kist is signed with every scheme of its developer's bundle (owner, 2026-11-10: "no single eggs"): Photon's release key with the release bundle's three eggs (fgtw::release). A developer of their own needs fgtw's developer bundle, not there yet, so their kist is refused rather than signed with one egg. Every other capsule (the shell's processes, under ferros's key) keeps its one Ed25519 signature.
-    if kist.is_some() {
-        if pubkey != fgtw::release::RELEASE_ED25519 {
-            eprintln!("this kist's key is not Photon's release key, and a developer's own three-egg bundle is not built yet (fgtw SigningBundle::developer): not signed with a single egg");
+        let signer = kist_signer(&key, &key_path);
+        let developer = std::env::args().collect::<Vec<_>>().windows(2).find(|w| w[0] == "--developer").map(|w| w[1].clone());
+        let unsigned = ferros_kist::capsule::unsigned(&d, option, developer.as_deref(), &signer.public(), &c, vsf::eagle_time_oscillations()).unwrap_or_else(|e| {
+            eprintln!("Capsule build failed: {e}");
             std::process::exit(1);
-        }
-        let unsigned = builder
-            .add_section_direct(section)
-            .signed_only_eggs(VsfType::ke(pubkey.to_vec()), &fgtw::release::release_slots())
-            .build()
-            .unwrap_or_else(|e| {
-                eprintln!("Capsule build failed: {e}");
-                std::process::exit(1);
-            });
-        return fgtw::release::sign_release(unsigned, &fgtw::pq::SigningBundle::release(&seed)).unwrap_or_else(|e| {
+        });
+        return fgtw::release::sign_release(unsigned, &signer).unwrap_or_else(|e| {
             eprintln!("Capsule signing failed: {e}");
             std::process::exit(1);
         });
     }
-    let unsigned = builder
-        .add_section_direct(section)
+    // Every other capsule (the shell's processes, under ferros's key) keeps its one Ed25519 signature.
+    let seed: [u8; 32] = key[..32].try_into().unwrap();
+    let pubkey = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    let unsigned = vsf::VsfBuilder::new()
+        .add_section_direct(ferros_kist::capsule::code_section(&c))
         .signature_ed25519(pubkey, [0u8; 64])
         .build()
         .unwrap_or_else(|e| {
@@ -1201,18 +1192,29 @@ async fn cmd_kist_install(path: &str) {
             std::process::exit(1);
         }
     };
-    // Every egg, here, before the capsule reaches the vault (owner, 2026-11-10: all three at install, the Ed25519 egg again at every spawn, by the kernel's gate): Photon's against its release bundle. A developer's own bundle is not built yet (fgtw SigningBundle::developer), so any other developer's kist is refused.
-    if developer != fgtw::release::RELEASE_ED25519 {
-        eprintln!("{path}: its developer is not Photon's release key, and checking another developer's three eggs is not built yet: not installed");
-        std::process::exit(1);
-    }
-    if let Err(e) = fgtw::release::verify_release(&capsule) {
+    let (signer, eggs, file_hash) = vsf::verification::header_eggs(&capsule).unwrap_or_else(|e| {
         eprintln!("{path}: {e}: not installed");
         std::process::exit(1);
-    }
+    });
     let addr = *blake3::hash(&capsule).as_bytes();
     let link = usb::UsbLink::open().unwrap_or_else(|e| {
         eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let mut list = match store_call(&link, ferros_pt::Op::Read, b"kists.list").await {
+        Ok(doc) => ferros_kist::Kists::parse(&doc).unwrap_or_else(|e| {
+            eprintln!("the person's list does not parse ({e}); not overwriting it");
+            std::process::exit(1);
+        }),
+        Err(e) if e == "not found" => ferros_kist::Kists::default(),
+        Err(e) => {
+            eprintln!("the person's list could not be read ({e}): is someone attested?");
+            std::process::exit(1);
+        }
+    };
+    // Every egg, here, before the capsule reaches the vault (owner, 2026-11-10: all three at install, the Ed25519 egg again at every spawn, by the kernel's gate), against the bundle the capsule carries (`kb`, its Ed25519 key the developer's), and that bundle the one the person pinned for this developer at their first kist (trust on first install): the network installer's rule, ferros_kist `capsule::admit`. A capsule from before `kb` installs only under Photon's release key, against the bundle fgtw pins, as before.
+    let admitted = ferros_kist::capsule::admit(&capsule, &signer, &eggs, &file_hash, &list).unwrap_or_else(|r| {
+        eprintln!("{path}: {}: not installed", ferros_kist::capsule::refusal_words(&r));
         std::process::exit(1);
     });
     let mut key = b"capsules.".to_vec();
@@ -1235,17 +1237,12 @@ async fn cmd_kist_install(path: &str) {
         eprint!("\r  {} of {} bytes stored, {} ms", off + part.len(), capsule.len(), t0.elapsed().as_millis());
     }
     eprintln!();
-    let mut list = match store_call(&link, ferros_pt::Op::Read, b"kists.list").await {
-        Ok(doc) => ferros_kist::Kists::parse(&doc).unwrap_or_else(|e| {
-            eprintln!("the person's list does not parse ({e}); not overwriting it");
-            std::process::exit(1);
-        }),
-        Err(e) if e == "not found" => ferros_kist::Kists::default(),
-        Err(e) => {
-            eprintln!("the person's list could not be read ({e}): is someone attested?");
-            std::process::exit(1);
+    // The developer's bundle pinned with the kist when it is their first here (the list read above, before the capsule was stored).
+    if let Some(b) = admitted.bundle {
+        if list.trust(&developer, &b, admitted.name.as_deref(), vsf::eagle_time_oscillations()) == ferros_kist::Trust::First {
+            println!("first kist by this developer here: their key bundle is pinned in the person's list");
         }
-    };
+    }
     let i = list.install(addr, developer, option, &decl);
     // When it was installed: its fact's stamp in the person's space, so an install after an uninstall wins over the uninstall (ferros_space). Its source stays as it was: a capsule from the bridge has no URL to fetch again.
     list.kists[i].installed = vsf::eagle_time_oscillations();

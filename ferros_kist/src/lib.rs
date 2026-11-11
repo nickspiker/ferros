@@ -2,7 +2,7 @@
 //!
 //! - **A right** is one thing a kist can be handed at spawn: a grant (owner, 2026-11-08: "a grant is the permission"). The vocabulary is fixed here, a right named and numbered by its place in `RIGHTS`; the kernel hands each one out as its own object (process.rs `kist_object`).
 //! - **The declaration** is in the signed capsule: a section `kist` (`name`, the app's own name, text) and a section `wants`, one field per right the kist asks for, named by the right, its value one line of the developer's reason (text, a human's words). The fields' order is the kist's grant slot order: slot 1 is the first want, and a right the person said no to is an empty slot, never a fake. Nothing undeclared can be granted: the kernel checks every launch against the capsule it runs.
-//! - **The list** is the person's (`kists.list`, identity class, so it follows them to every device of their fleet): one VSF document, a section `defaults` (a field per right, 1 on or 0 off: what the first-launch question starts each switch at; out of the box every one is off) and a section `kist` per installed kist: `capsule` (hb, the blake3 of the signed capsule, its vault address), `developer` (ke) and `option` (hp; in the capsule it is the `kist` section's `option`, hR), together the kist's identity as the gate sees it, `name` (text), and a field per want named by its right: the reason (ASCII text, `a`: vsf encodes UTF-8 text, `x`, only with std, and the map and init are no_std), and once the person answered, the answer (unsigned, 1 granted or 0 not) and when (Eagle time). A want never answered has no answer and is asked at the next launch, once (owner, 2026-11-08: "asked once, ever, per person, per kist, per permission"). Since 2026-11-10 a kist may carry `source` (`nu`, the URL its capsule was fetched from, for a restore) and `installed` (Eagle time), and a section `kept` per uninstalled kist holds its answers (`developer`, `option`, a field per right: the answer and when) for the day it is installed again; readers from before skip all three.
+//! - **The list** is the person's (`kists.list`, identity class, so it follows them to every device of their fleet): one VSF document, a section `defaults` (a field per right, 1 on or 0 off: what the first-launch question starts each switch at; out of the box every one is off) and a section `kist` per installed kist: `capsule` (hb, the blake3 of the signed capsule, its vault address), `developer` (ke) and `option` (hp; in the capsule it is the `kist` section's `option`, hR), together the kist's identity as the gate sees it, `name` (text), and a field per want named by its right: the reason (ASCII text, `a`: vsf encodes UTF-8 text, `x`, only with std, and the map and init are no_std), and once the person answered, the answer (unsigned, 1 granted or 0 not) and when (Eagle time). A want never answered has no answer and is asked at the next launch, once (owner, 2026-11-08: "asked once, ever, per person, per kist, per permission"). Since 2026-11-10 a kist may carry `source` (`nu`, the URL its capsule was fetched from, for a restore) and `installed` (Eagle time), and a section `kept` per uninstalled kist holds its answers (`developer`, `option`, a field per right: the answer and when) for the day it is installed again; readers from before skip all three. Since 2026-11-10 (trust on first install) a section `pin` per developer holds the commitment of the key bundle their first kist carried (`Pin`, `Kists::trust`); readers from before skip it.
 //! - **Fetching** a capsule (the installer, payloads/kists) is `fetch`: a plain HTTP GET's response decoded as it arrives, and the capsule hashed and its header read as it streams into the vault, never held whole.
 #![no_std]
 
@@ -89,12 +89,37 @@ pub struct Kept {
     pub answers: Vec<(u8, bool, i64)>,
 }
 
-/// The person's list: their defaults (bit k: right k starts on at the first-launch question), their kists, and the answers of the kists they uninstalled.
+/// A developer the person trusted on first install (owner, 2026-11-10): the commitment of the key bundle (`fgtw::pq::KeyBundle::commit`, every scheme) that developer's first kist carried, kept in their list (a section `pin`: `developer` ke, `bundle` hp, `name` a when the kist named its developer, `pinned` e), so it follows them to every device of theirs. Every later kist or update from that developer key must carry a bundle with the same commitment. An uninstall keeps it, as it keeps answers.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Pin {
+    /// The developer's Ed25519 key, as the capsule's header and the kist's identity name it.
+    pub developer: [u8; 32],
+    /// The commitment of the bundle first seen for it.
+    pub bundle: [u8; 32],
+    /// The developer's name as their first kist gave it (its declaration's `developer`), for the person's words; None when it gave none.
+    pub name: Option<String>,
+    /// When it was pinned (Eagle oscillations): its fact's stamp in the person's space.
+    pub pinned: i64,
+}
+
+/// The person's list: their defaults (bit k: right k starts on at the first-launch question), their kists, the answers of the kists they uninstalled, and the developers they trusted on first install.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Kists {
     pub defaults: u32,
     pub kists: Vec<Kist>,
     pub kept: Vec<Kept>,
+    pub pins: Vec<Pin>,
+}
+
+/// What [`Kists::trust`] found for a developer's bundle.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Trust {
+    /// No pin yet: this is the developer's first kist here, and the bundle is now pinned (the list must be written for it to hold).
+    First,
+    /// The pin's own bundle.
+    Same,
+    /// Another bundle is pinned for this developer key: the kist is refused. The pin as it stands, for its words.
+    Other(Pin),
 }
 
 /// A section of a VSF file by its table of contents, parsed alone: a capsule's code (tens of megabytes) is never read to find its declaration.
@@ -157,7 +182,7 @@ pub fn option_of(capsule: &[u8]) -> Result<Option<[u8; 32]>, &'static str> {
     })))
 }
 
-/// The developer's name, when the capsule's `kist` section carries one (`developer`, `a`): what the kist directory shows beside the key (tools/kistcat). No signer writes one yet; a capsule without it is named by its key alone.
+/// The developer's name, when the capsule's `kist` section carries one (`developer`, `a`): what the kist directory shows beside the key (tools/kistcat), and the name a pin keeps for the person's words. `capsule::unsigned` writes it when the signer gives one; a capsule without it is named by its key alone.
 pub fn developer_name_of(capsule: &[u8]) -> Result<Option<String>, &'static str> {
     Ok(section(capsule, "kist")?.and_then(|s| s.get_field("developer").and_then(|f| f.values.iter().find_map(|v| match v {
         VsfType::a(t) => Some(String::from(t.as_str())),
@@ -251,6 +276,27 @@ impl Kists {
                     }
                     out.kept.push(Kept { developer, option, answers });
                 }
+                "pin" => {
+                    // Each by its type marker: the developer's key `ke`, the bundle's commitment `hp`. WHY `try_from`: the lengths are the document's; it refuses any but 32 bytes rather than reading past them.
+                    let developer = s.get_field("developer").and_then(|f| f.values.iter().find_map(|v| match v {
+                        VsfType::ke(k) => <[u8; 32]>::try_from(k.as_slice()).ok(),
+                        _ => None,
+                    }));
+                    let bundle = s.get_field("bundle").and_then(|f| f.values.iter().find_map(|v| match v {
+                        VsfType::hp(h) => <[u8; 32]>::try_from(h.as_slice()).ok(),
+                        _ => None,
+                    }));
+                    let (Some(developer), Some(bundle)) = (developer, bundle) else { return Err("a pin without its developer or bundle") };
+                    let name = s.get_field("name").and_then(|f| f.values.iter().find_map(|v| match v {
+                        VsfType::a(t) => Some(String::from(t.as_str())),
+                        _ => None,
+                    }));
+                    let pinned = s.get_field("pinned").and_then(|f| f.values.first()).and_then(|v| v.as_eagle()).unwrap_or(0);
+                    if out.pins.iter().any(|p| p.developer == developer) {
+                        return Err("a developer pinned twice");
+                    }
+                    out.pins.push(Pin { developer, bundle, name, pinned });
+                }
                 _ => {}
             }
         }
@@ -295,7 +341,45 @@ impl Kists {
             }
             b = b.add_section_direct(s);
         }
+        for p in &self.pins {
+            let mut s = VsfSection::new("pin");
+            s.add_field("developer", VsfType::ke(p.developer.to_vec()));
+            s.add_field("bundle", VsfType::hp(p.bundle.to_vec()));
+            if let Some(n) = &p.name {
+                s.add_field("name", VsfType::a(vsf::Ascii::checked("name", n.clone())));
+            }
+            if p.pinned != 0 {
+                s.add_field("pinned", VsfType::e(EtType::e6(p.pinned)));
+            }
+            b = b.add_section_direct(s);
+        }
         b.build()
+    }
+
+    /// The pin for this developer key, if the person trusted one.
+    pub fn pin_of(&self, developer: &[u8; 32]) -> Option<&Pin> {
+        self.pins.iter().find(|p| p.developer == *developer)
+    }
+
+    /// Trust on first install (owner, 2026-11-10): the bundle a kist carries (its commitment, `fgtw::pq::KeyBundle::commit`) set against the pin for its developer key. With no pin it is pinned now, named `name` and stamped `now` (the caller writes the list); the pinned bundle passes; any other is refused, the pin left as it was. The caller has already checked every egg against that bundle and that its Ed25519 key is the developer.
+    pub fn trust(&mut self, developer: &[u8; 32], bundle: &[u8; 32], name: Option<&str>, now: i64) -> Trust {
+        match self.pin_of(developer) {
+            Some(p) if p.bundle == *bundle => Trust::Same,
+            Some(p) => Trust::Other(p.clone()),
+            None => {
+                self.pins.push(Pin { developer: *developer, bundle: *bundle, name: name.map(String::from), pinned: now });
+                Trust::First
+            }
+        }
+    }
+
+    /// The pin as [`trust`](Self::trust) would judge it, changing nothing: a check before anything is kept.
+    pub fn judge(&self, developer: &[u8; 32], bundle: &[u8; 32]) -> Trust {
+        match self.pin_of(developer) {
+            Some(p) if p.bundle == *bundle => Trust::Same,
+            Some(p) => Trust::Other(p.clone()),
+            None => Trust::First,
+        }
     }
 
     /// The kist whose capsule has this address.
@@ -547,6 +631,381 @@ mod capsule_on_disk {
     }
 }
 
+/// A kist's capsule as its developer signs it (docs/KISTS.md "The capsule"; owner, 2026-11-10: "trust on first install"): the declaration, the developer's whole public bundle, the code, and an egg per scheme.
+///
+/// - **The bundle** rides in the `kist` section as one field `kb`, a value per scheme, each by its own key type: `ke` (Ed25519), `kvf` (Falcon-512), `kvs` (SPHINCS+). Read back by type marker, never by position, it is rebuilt into an `fgtw::pq::KeyBundle` whose commitment (`KeyBundle::commit`) is what the person's list pins for that developer. It is part of the file every egg signs.
+/// - **One builder** ([`unsigned`]): the bridge (`capsule --kist`) and tools/kistcat (`kist`) both build a kist thru it, then sign it with `fgtw::release::sign_release`, so the two write the same capsule.
+/// - A capsule from before 2026-11-10 carries no `kb`: it still reads (`bundle_of` gives None) and the bridge's development path still installs it as before; the network installer refuses it, as it has no bundle to check.
+#[cfg(feature = "bundle")]
+pub mod capsule {
+    use super::*;
+    use fgtw::fleet::scheme;
+    use fgtw::pq::KeyBundle;
+
+    /// The `kist` section's field that carries the developer's public bundle.
+    pub const BUNDLE: &str = "kb";
+
+    /// The code a capsule carries and how the kernel is to treat it (the bridge's `capsule` options; SANDBOX.md "Modes").
+    #[derive(Clone, Copy, Debug)]
+    pub struct Code<'a> {
+        /// The flat image (`objcopy -O binary`).
+        pub image: &'a [u8],
+        /// A sandboxed image (tools/ferros-masked-build.sh): section `masked`; else native code, section `aarch64`.
+        pub masked: bool,
+        /// How many bytes of the image are instructions (the checker covers exactly those).
+        pub text: Option<usize>,
+        /// Fixed mode at arc size 2^K (masked only).
+        pub fixed: Option<u32>,
+        /// BTI landing pads (masked only).
+        pub bti: bool,
+        /// Exact mode (masked only; needs `bti`).
+        pub exact: bool,
+    }
+
+    /// The code's section: `masked` or `aarch64`, the image as `code` (`v` b), then the masked modes the kernel reads.
+    pub fn code_section(c: &Code) -> VsfSection {
+        let mut s = VsfSection::new(if c.masked { "masked" } else { "aarch64" });
+        s.add_field("code", VsfType::v(b'b', c.image.to_vec()));
+        if let Some(t) = c.text {
+            s.add_field("text", VsfType::u(t, false));
+        }
+        if let Some(k) = c.fixed.filter(|_| c.masked) {
+            s.add_field("fixed", VsfType::u(k as usize, false));
+        }
+        if c.masked && c.bti {
+            s.add_field("bti", VsfType::u(1, false));
+        }
+        if c.masked && c.exact {
+            s.add_field("exact", VsfType::u(1, false));
+        }
+        s
+    }
+
+    /// A bundle's keys as the `kb` field's values, each by its own type: Err for a scheme VSF has no key type for here.
+    pub fn bundle_values(b: &KeyBundle) -> Result<Vec<VsfType>, &'static str> {
+        let mut v = Vec::with_capacity(3);
+        for s in [scheme::ED25519, scheme::FALCON512, scheme::SPHINCS_PLUS] {
+            let Some(k) = b.pubkey(s) else { continue };
+            v.push(match s {
+                scheme::ED25519 => VsfType::ke(k.to_vec()),
+                scheme::FALCON512 => VsfType::kvf(k.to_vec()),
+                _ => VsfType::kvs(k.to_vec()),
+            });
+        }
+        if v.len() as u32 != b.mask().count_ones() {
+            return Err("a bundle with a scheme a kist cannot carry");
+        }
+        Ok(v)
+    }
+
+    /// The `kb` field's values back into a bundle, each key by its type marker. Anything else in the field, a scheme twice, a key of the wrong length or a bundle without every scheme refuses it (owner, 2026-11-10: a kist carries its developer's whole bundle, all three schemes).
+    pub fn bundle_from_values(values: &[VsfType]) -> Result<KeyBundle, &'static str> {
+        let mut keys = Vec::with_capacity(values.len());
+        for v in values {
+            keys.push(match v {
+                VsfType::ke(k) => (scheme::ED25519, k.clone()),
+                VsfType::kvf(k) => (scheme::FALCON512, k.clone()),
+                VsfType::kvs(k) => (scheme::SPHINCS_PLUS, k.clone()),
+                _ => return Err("a value in the bundle that is no signing key"),
+            });
+        }
+        let b = KeyBundle::new(keys)?;
+        if b.mask() != fgtw::release::RELEASE_MASK {
+            return Err("a bundle without every scheme");
+        }
+        Ok(b)
+    }
+
+    /// The developer's bundle a capsule carries (`kist`'s `kb`), read from its first bytes; None for a capsule without one (before 2026-11-10). That the bundle's Ed25519 key is the capsule's developer, and that every egg verifies against it, is the caller's check ([`carried`] does the first).
+    pub fn bundle_of(capsule: &[u8]) -> Result<Option<KeyBundle>, &'static str> {
+        let Some(s) = section(capsule, "kist")? else { return Ok(None) };
+        match s.get_field(BUNDLE) {
+            Some(f) => bundle_from_values(&f.values).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The bundle a capsule carries, if it is its developer's: present, every scheme, and its Ed25519 key the header's (the kist's `developer`).
+    pub fn carried(capsule: &[u8]) -> Result<KeyBundle, &'static str> {
+        let b = bundle_of(capsule)?.ok_or("no developer bundle (kb)")?;
+        let (developer, _) = identity(capsule)?;
+        if b.ed25519() != developer {
+            return Err("its bundle is not its developer's key");
+        }
+        Ok(b)
+    }
+
+    /// A kist's capsule, unsigned: stamped `made` (Eagle oscillations), its header naming the bundle's Ed25519 key with an empty egg slot per scheme (`fgtw::release::release_slots`); then the `kist` section (name, option, the developer's name when given, `kb`), the `wants` section, and the code. Sign it with `fgtw::release::sign_release` and the developer's `SigningBundle`.
+    pub fn unsigned(d: &Decl, option: [u8; 32], developer_name: Option<&str>, bundle: &KeyBundle, code: &Code, made: i64) -> Result<Vec<u8>, String> {
+        let (mut k, w) = declaration_sections(d, Some(option));
+        if let Some(n) = developer_name {
+            k.add_field("developer", VsfType::a(vsf::Ascii::new(n).map_err(|e| alloc::format!("the developer's name {n:?}: {e} (a kist's text is ASCII, read by a no_std installer)"))?));
+        }
+        k.add_field_multi(BUNDLE, bundle_values(bundle).map_err(String::from)?);
+        let mut b = vsf::VsfBuilder::new().creation_time_oscillations(made).signed_only_eggs(VsfType::ke(bundle.ed25519().to_vec()), &fgtw::release::release_slots()).add_section_direct(k);
+        if let Some(w) = w {
+            b = b.add_section_direct(w);
+        }
+        b.add_section_direct(code_section(code)).build()
+    }
+
+    /// Why [`admit`] refused a capsule.
+    #[derive(Clone, PartialEq, Debug)]
+    pub enum Refused {
+        /// It carries no bundle of its developer (`kb`), or one that does not read: nothing to check its eggs against.
+        NoBundle,
+        /// The bundle it carries is not its developer's: its Ed25519 key is not the header's, or (for Photon's release key) it is not the bundle fgtw pins.
+        NotItsKey,
+        /// An egg is missing or does not verify against the bundle.
+        Eggs,
+        /// The person trusted another bundle for this developer key on its first install: the pin, for its words ("this kist is signed by a different key than <name>'s other kists").
+        OtherKey(Pin),
+    }
+
+    /// A capsule admitted: the commitment to pin for its developer (None for Photon's release key, which fgtw pins for everyone) and the developer's name as the capsule gives it.
+    #[derive(Clone, PartialEq, Debug)]
+    pub struct Admitted {
+        pub bundle: Option<[u8; 32]>,
+        pub name: Option<String>,
+    }
+
+    /// The install-time check of a kist's signature, the one rule for the network installer (payloads/kists) and the bridge's development path (owner, 2026-11-10: trust on first install). From the capsule's first bytes (`first`, its header and declaration), its header's signer and eggs, and the hash the eggs sign (`file_hash`):
+    /// 0. the bundle is the one the capsule carries (`kb`, every scheme), its Ed25519 key the kist's developer; for Photon's release key, the bundle fgtw pins (a carried one must be that one);
+    /// 1. every egg verifies against it (`fgtw::pq::verify_eggs`, the release mask: no single eggs);
+    /// 2. its commitment is the one the person's list pins for that developer, or none is pinned yet (then the caller pins it with [`Kists::trust`] when it writes the list).
+    ///
+    /// A capsule without `kb` (before 2026-11-10) is [`Refused::NoBundle`] unless its developer is the release key.
+    pub fn admit(first: &[u8], signer: &[u8; 32], eggs: &[vsf::eggs::Egg], file_hash: &[u8; 32], list: &Kists) -> Result<Admitted, Refused> {
+        let (developer, _) = identity(first).map_err(|_| Refused::NoBundle)?;
+        if *signer != developer {
+            return Err(Refused::NotItsKey);
+        }
+        let carried = bundle_of(first).map_err(|_| Refused::NoBundle)?;
+        let name = developer_name_of(first).ok().flatten();
+        let release = developer == fgtw::release::RELEASE_ED25519;
+        let bundle = match (release, carried) {
+            (true, None) => fgtw::release::release_bundle(),
+            (true, Some(b)) if b == fgtw::release::release_bundle() => b,
+            (true, Some(_)) => return Err(Refused::NotItsKey),
+            (false, None) => return Err(Refused::NoBundle),
+            (false, Some(b)) if b.ed25519() == developer => b,
+            (false, Some(_)) => return Err(Refused::NotItsKey),
+        };
+        if !fgtw::pq::verify_eggs(eggs, &bundle, file_hash, fgtw::release::RELEASE_MASK) {
+            return Err(Refused::Eggs);
+        }
+        if release {
+            return Ok(Admitted { bundle: None, name });
+        }
+        let commit = bundle.commit();
+        match list.judge(&developer, &commit) {
+            Trust::Other(p) => Err(Refused::OtherKey(p)),
+            _ => Ok(Admitted { bundle: Some(commit), name }),
+        }
+    }
+
+    /// The person's words for a refusal, with the pinned developer's name when there is one (else their key's first bytes, G# hex).
+    pub fn refusal_words(r: &Refused) -> String {
+        match r {
+            Refused::NoBundle => String::from("it does not carry its developer's keys"),
+            Refused::NotItsKey => String::from("the keys it carries are not its developer's"),
+            Refused::Eggs => String::from("its signature does not check out"),
+            Refused::OtherKey(p) => alloc::format!("this kist is signed by a different key than {}'s other kists", pin_name(p)),
+        }
+    }
+
+    /// A pin's developer as the person reads it: the name their first kist gave, or their key's first four bytes.
+    pub fn pin_name(p: &Pin) -> String {
+        match &p.name {
+            Some(n) => n.clone(),
+            None => alloc::format!("G#{:02X}{:02X}_{:02X}{:02X}", p.developer[0], p.developer[1], p.developer[2], p.developer[3]),
+        }
+    }
+
+    /// A developer key's secret (tools/kistcat `devkey new`: section `developer_key` { label a, seed kge }) read: its label and its 32-byte seed. The caller derives the bundle (`fgtw::pq::SigningBundle::developer(&seed, &label)`) and wipes the seed.
+    pub fn developer_key(doc: &[u8]) -> Result<(String, [u8; 32]), &'static str> {
+        let (header, end) = VsfHeader::decode(doc).map_err(|_| "not a VSF file")?;
+        let s = header.sections(doc, end).map_err(|_| "sections that do not parse")?.into_iter().find(|s| s.name == "developer_key").ok_or("no developer_key section")?;
+        let label = s.get_field("label").and_then(|f| f.values.iter().find_map(|v| if let VsfType::a(t) = v { Some(String::from(t.as_str())) } else { None })).ok_or("no label")?;
+        // WHY: the length is the file's; `try_into` refuses a seed of any other length.
+        let seed = s.get_field("seed").and_then(|f| f.values.iter().find_map(|v| if let VsfType::kge(k) = v { <[u8; 32]>::try_from(k.as_slice()).ok() } else { None })).ok_or("no 32-byte kge seed")?;
+        Ok((label, seed))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        extern crate std;
+        use fgtw::pq::{FleetSigner, SigningBundle};
+
+        fn decl() -> Decl {
+            Decl { name: String::from("Clock"), wants: alloc::vec![(0, String::from("to draw the rings"))] }
+        }
+
+        fn signed(key: &SigningBundle, name: Option<&str>) -> Vec<u8> {
+            let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
+            fgtw::release::sign_release(unsigned(&decl(), [5; 32], name, &key.public(), &code, 9).unwrap(), key).unwrap()
+        }
+
+        #[test]
+        fn the_carried_bundle_round_trips_and_verifies() {
+            let key = SigningBundle::developer(&[3; 32], "TEST_DEVELOPER");
+            let c = signed(&key, Some("Test Developer"));
+            let b = carried(&c).unwrap();
+            assert_eq!(b, key.public());
+            assert_eq!(b.to_bytes(), key.public().to_bytes());
+            assert_eq!(b.commit(), key.public().commit());
+            // Every egg against the carried bundle, as the installer checks it.
+            fgtw::release::verify_signed_by(&c, &b.ed25519(), &b).unwrap();
+            assert_eq!(declaration(&c).unwrap(), decl());
+            assert_eq!(identity(&c).unwrap(), (key.keypair().public.to_bytes(), [5; 32]));
+            assert_eq!(developer_name_of(&c).unwrap().as_deref(), Some("Test Developer"));
+            assert_eq!(want_codes(&c).unwrap(), alloc::vec![0]);
+        }
+
+        #[test]
+        fn a_tampered_bundle_fails() {
+            let key = SigningBundle::developer(&[3; 32], "TEST_DEVELOPER");
+            let c = signed(&key, None);
+            // A byte of the Falcon key in `kb` changed: the eggs no longer verify over the file, and against the changed bundle they never could.
+            let falcon = key.public().pubkey(scheme::FALCON512).unwrap().to_vec();
+            let at = (0..c.len() - falcon.len()).find(|&i| c[i..i + falcon.len()] == falcon[..]).unwrap() + (falcon.len() >> 1);
+            let mut t = c.clone();
+            t[at] ^= 1;
+            let b = carried(&t).unwrap();
+            assert_ne!(b.commit(), key.public().commit());
+            assert!(fgtw::release::verify_signed_by(&t, &b.ed25519(), &b).is_err());
+            assert!(fgtw::release::verify_signed_by(&t, &key.public().ed25519(), &key.public()).is_err());
+            // Another developer's bundle put in whole (signed by them): its Ed25519 key is not the header's.
+            let other = SigningBundle::developer(&[4; 32], "TEST_DEVELOPER");
+            let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
+            let mut u = unsigned(&decl(), [5; 32], None, &other.public(), &code, 9).unwrap();
+            // The header names this key, the bundle another: built by hand, as an attacker would.
+            let ed_other = other.public().ed25519();
+            let ed_mine = key.public().ed25519();
+            let h = (0..u.len() - 32).find(|&i| u[i..i + 32] == ed_other[..]).unwrap();
+            u[h..h + 32].copy_from_slice(&ed_mine);
+            let forged = fgtw::release::sign_release(u, &key).unwrap();
+            assert_eq!(carried(&forged), Err("its bundle is not its developer's key"));
+        }
+
+        #[test]
+        fn an_old_capsule_without_a_bundle_still_reads() {
+            let (k, w) = declaration_sections(&decl(), Some([5; 32]));
+            let code = Code { image: &[1u8; 16], masked: false, text: None, fixed: None, bti: false, exact: false };
+            let key = SigningBundle::release(&[6; 32]);
+            let u = vsf::VsfBuilder::new().signed_only_eggs(VsfType::ke(key.keypair().public.to_bytes().to_vec()), &fgtw::release::release_slots()).add_section_direct(k).add_section_direct(w.unwrap()).add_section_direct(code_section(&code)).build().unwrap();
+            let c = fgtw::release::sign_release(u, &key).unwrap();
+            assert_eq!(bundle_of(&c), Ok(None));
+            assert!(carried(&c).is_err());
+            assert_eq!(declaration(&c).unwrap(), decl());
+        }
+
+        /// The installer's steps for one capsule: admit, then (as its store stage does) pin and keep the kist in the list.
+        fn install(list: &mut Kists, c: &[u8]) -> Result<Trust, Refused> {
+            // vsf's reader checks the Ed25519 egg as it reads the header: a capsule changed anywhere fails here already.
+            let Ok((signer, eggs, file_hash)) = vsf::verification::header_eggs(c) else { return Err(Refused::Eggs) };
+            let a = admit(c, &signer, &eggs, &file_hash, list)?;
+            let (developer, option) = identity(c).unwrap();
+            let t = match a.bundle {
+                Some(b) => list.trust(&developer, &b, a.name.as_deref(), 7),
+                None => Trust::Same,
+            };
+            list.install(*blake3::hash(c).as_bytes(), developer, option, &declaration(c).unwrap());
+            Ok(t)
+        }
+
+        #[test]
+        fn trust_on_first_install() {
+            let key = SigningBundle::developer(&[3; 32], "TEST_DEVELOPER");
+            let mut list = Kists::default();
+            // The first kist by this developer pins its bundle, under the name it gives.
+            let first = signed(&key, Some("Test Developer"));
+            assert_eq!(install(&mut list, &first), Ok(Trust::First));
+            assert_eq!(list.pins, alloc::vec![Pin { developer: key.public().ed25519(), bundle: key.public().commit(), name: Some(String::from("Test Developer")), pinned: 7 }]);
+            // The pin round trips thru the list's document, and a list from before (no pin section) reads as none pinned.
+            let back = Kists::parse(&list.build(8).unwrap()).unwrap();
+            assert_eq!(back, list);
+            // A second kist (an update) with the same bundle installs.
+            let update = signed(&key, Some("Someone Else"));
+            assert_eq!(install(&mut list, &update), Ok(Trust::Same));
+            assert_eq!(list.pins.len(), 1);
+            assert_eq!(list.pins[0].name.as_deref(), Some("Test Developer"), "the first kist's name stands");
+            // The same Ed25519 key with other post-quantum halves (another label: another bundle, every egg its own and valid) is refused, named by the pin.
+            let other = SigningBundle::developer(&[3; 32], "ANOTHER_LABEL");
+            assert_eq!(other.public().ed25519(), key.public().ed25519());
+            assert_ne!(other.public().commit(), key.public().commit());
+            let c = signed(&other, Some("Test Developer"));
+            let r = install(&mut list, &c).unwrap_err();
+            assert_eq!(refusal_words(&r), "this kist is signed by a different key than Test Developer's other kists");
+            assert_eq!(list.pins[0].bundle, key.public().commit(), "the pin stands");
+            // An uninstall keeps the pin, as it keeps answers: the other bundle is still refused.
+            let (d, o) = identity(&first).unwrap();
+            list.remove(&d, &o);
+            assert!(list.kists.is_empty());
+            assert!(matches!(install(&mut list, &c), Err(Refused::OtherKey(_))));
+            // Without the bundle the eggs cannot be checked: a capsule with no kb is not admitted (not the release key's).
+            let (k, w) = declaration_sections(&decl(), Some([5; 32]));
+            let code = Code { image: &[1u8; 16], masked: true, text: Some(16), fixed: None, bti: false, exact: false };
+            let u = vsf::VsfBuilder::new().signed_only_eggs(VsfType::ke(key.public().ed25519().to_vec()), &fgtw::release::release_slots()).add_section_direct(k).add_section_direct(w.unwrap()).add_section_direct(code_section(&code)).build().unwrap();
+            let bare = fgtw::release::sign_release(u, &key).unwrap();
+            assert_eq!(install(&mut Kists::default(), &bare), Err(Refused::NoBundle));
+            // A capsule whose eggs do not verify against the bundle it carries.
+            let mut t = first.clone();
+            let n = t.len();
+            t[n - 1] ^= 1;
+            assert_eq!(install(&mut Kists::default(), &t), Err(Refused::Eggs));
+            // The installer's own path (eggs from the streamed head, the hash it computed): eggs over another hash do not verify.
+            let (signer, eggs, mut file_hash) = vsf::verification::header_eggs(&first).unwrap();
+            file_hash[0] ^= 1;
+            assert_eq!(admit(&first, &signer, &eggs, &file_hash, &Kists::default()), Err(Refused::Eggs));
+            // Eggs of another bundle over the right hash: the post-quantum eggs do not verify against the carried bundle.
+            let (_, other_eggs, other_hash) = vsf::verification::header_eggs(&c).unwrap();
+            let (_, _, first_hash) = vsf::verification::header_eggs(&first).unwrap();
+            assert_ne!(other_hash, first_hash);
+            let mixed: Vec<vsf::eggs::Egg> = eggs.iter().filter(|e| e.scheme == scheme::ED25519).cloned().chain(other_eggs.into_iter().filter(|e| e.scheme != scheme::ED25519)).collect();
+            assert_eq!(admit(&first, &signer, &mixed, &first_hash, &Kists::default()), Err(Refused::Eggs));
+        }
+
+        #[test]
+        fn a_bundle_short_of_a_scheme_is_refused() {
+            let key = SigningBundle::developer(&[3; 32], "TEST_DEVELOPER");
+            let v = bundle_values(&key.public()).unwrap();
+            assert_eq!(v.len(), 3);
+            assert!(bundle_from_values(&v[..2]).is_err());
+            assert!(bundle_from_values(&[v[0].clone(), v[0].clone(), v[1].clone(), v[2].clone()]).is_err());
+            assert!(bundle_from_values(&[v[0].clone(), v[1].clone(), VsfType::hb(alloc::vec![0; 32])]).is_err());
+        }
+
+        /// The Clock's capsule as tools/clock-kist.sh writes it (target/kists/clock.capsule.vsf), streamed thru the installer's intake in pieces and admitted as the installer admits it: `cargo test -p ferros_kist --features bundle -- --ignored`.
+        #[test]
+        #[ignore]
+        fn the_clock_capsule_admits_as_the_installer_streams_it() {
+            let Ok(c) = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/kists/clock.capsule.vsf")) else { return };
+            let mut intake = crate::fetch::Intake::new();
+            for piece in c.chunks(1 << 12) {
+                intake.update(piece).unwrap();
+            }
+            let t = intake.finish().unwrap();
+            assert_eq!(t.address, *blake3::hash(&c).as_bytes());
+            let mut list = Kists::default();
+            let a = admit(&t.first, &t.head.signer, &t.head.eggs, &t.file_hash, &list).unwrap();
+            let (developer, option) = identity(&t.first).unwrap();
+            assert_eq!(list.trust(&developer, &a.bundle.unwrap(), a.name.as_deref(), 1), Trust::First);
+            std::println!("{} by {:?}: developer {:02X?}, option {:02X?}, wants {:?}, bundle {:02X?}", declaration(&t.first).unwrap().name, a.name, &developer[..4], &option[..4], want_codes(&t.first).unwrap(), &a.bundle.unwrap()[..4]);
+        }
+
+        #[test]
+        fn a_developer_key_secret_reads() {
+            let mut s = VsfSection::new("developer_key");
+            s.add_field("label", VsfType::a(vsf::Ascii::lit("TEST_DEVELOPER")));
+            s.add_field("seed", VsfType::kge(alloc::vec![3; 32]));
+            let doc = vsf::VsfBuilder::new().creation_time_oscillations(1).provenance_only().add_section_direct(s).build().unwrap();
+            assert_eq!(developer_key(&doc).unwrap(), (String::from("TEST_DEVELOPER"), [3; 32]));
+        }
+    }
+}
+
 /// The kist directory (docs/KISTS.md "The directory"; owner, 2026-11-10): the public list of kists anyone may install, at `kists.fgtw.org/kists.vsf` over plain HTTP, built by tools/kistcat and read by the device's installer.
 ///
 /// - **It vouches for nothing.** Anyone may list a kist and no account installs one. The device checks the capsule's blake3 against its entry and the capsule's developer signature at install; the directory's own signature (every egg of the ferros project key) only keeps a mirror, or anything on the path between, from editing the list.
@@ -608,11 +1067,11 @@ pub mod directory {
         pub metrics: Metrics,
     }
 
-    /// The directory: when it was made (Eagle oscillations), the key that signed it, and its kists in listed order.
+    /// The directory: when it was made (Eagle oscillations), the key that signed it (None for a directory made unsigned, `build_open`, while the project key is not chosen), and its kists in listed order.
     #[derive(Clone, PartialEq, Debug)]
     pub struct Directory {
         pub made: i64,
-        pub signer: [u8; 32],
+        pub signer: Option<[u8; 32]>,
         pub kists: Vec<Entry>,
     }
 
@@ -660,6 +1119,15 @@ pub mod directory {
     /// The directory as a complete VSF document stamped `made` (Eagle oscillations), its header naming `signer` (the project key's Ed25519 half) with an empty egg slot per scheme for the signer to fill (`fgtw::release::sign_release`, as the bridge signs a kist).
     pub fn build_unsigned(kists: &[Entry], made: i64, signer: [u8; 32]) -> Result<Vec<u8>, String> {
         let mut b = vsf::VsfBuilder::new().creation_time_oscillations(made).signed_only_eggs(VsfType::ke(signer.to_vec()), &fgtw::release::release_slots());
+        for e in kists {
+            b = b.add_section_direct(entry_section(e)?).add_section_direct(metrics_section(e));
+        }
+        b.build()
+    }
+
+    /// The directory UNSIGNED: a complete VSF document stamped `made` with its provenance hash and no signer at all, for the time before the project key is chosen (owner, 2026-11-10: the FGTW kaitiakitanga decides it). The device reads it unchecked (`parse_directory`, `signer` None) and its page says so; [`verify_directory`] refuses it. A directory vouches for nothing either way: every capsule is checked against its own developer's bundle at install.
+    pub fn build_open(kists: &[Entry], made: i64) -> Result<Vec<u8>, String> {
+        let mut b = vsf::VsfBuilder::new().creation_time_oscillations(made).provenance_only();
         for e in kists {
             b = b.add_section_direct(entry_section(e)?).add_section_direct(metrics_section(e));
         }
@@ -745,8 +1213,10 @@ pub mod directory {
         let (header, end) = VsfHeader::decode(doc).map_err(|_| "not a VSF file")?;
         let signer = match &header.signer_pubkey {
             // WHY: the key's length is the document's; anything but 32 bytes is no Ed25519 key.
-            Some(VsfType::ke(k)) => k[..].try_into().map_err(|_| "a signer key that is not Ed25519")?,
-            _ => return Err("no signer"),
+            Some(VsfType::ke(k)) => Some(k[..].try_into().map_err(|_| "a signer key that is not Ed25519")?),
+            Some(_) => return Err("a signer key that is not Ed25519"),
+            // Unsigned (`build_open`): read unchecked, as the device reads every directory until the project key is pinned.
+            None => None,
         };
         let made = header.creation_time.as_ref().and_then(|t| t.as_eagle()).ok_or("no creation time")?;
         let sections = header.sections(doc, end).map_err(|_| "sections that do not parse")?;
@@ -821,6 +1291,18 @@ pub mod directory {
                 t[at] ^= 1;
                 assert!(verify_directory(&t, &key.public()).is_err(), "a byte changed at {at}");
             }
+        }
+
+        #[test]
+        fn an_unsigned_directory_reads_unchecked_and_never_verifies() {
+            let key = SigningBundle::developer(&[3; 32], "TEST_PROJECT");
+            let kists = alloc::vec![entry(1, Source::Path(String::from("/capsules/ab.vsf")))];
+            let doc = build_open(&kists, 5).unwrap();
+            let d = parse_directory(&doc).unwrap();
+            assert_eq!((d.signer, d.made, d.kists), (None, 5, kists));
+            assert!(verify_directory(&doc, &key.public()).is_err());
+            // A signed one names its signer.
+            assert_eq!(parse_directory(&signed(&[], &key)).unwrap().signer, Some(key.public().ed25519()));
         }
 
         #[test]

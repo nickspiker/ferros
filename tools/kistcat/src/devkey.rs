@@ -46,10 +46,11 @@ pub fn new_secret(secret: &Path, label: &str, made: i64) -> Result<SigningBundle
 
 /// The key from its VSF secret: the seed and the label it was made under, the bundle derived from them.
 pub fn read_secret(secret: &Path) -> Result<(String, SigningBundle), String> {
-    let doc = std::fs::read(secret).map_err(|e| format!("{}: {e}", secret.display()))?;
-    let s = section(&doc, "developer_key").map_err(|e| format!("{}: {e}", secret.display()))?;
-    let label = s.get_field("label").and_then(|f| f.values.iter().find_map(|v| if let VsfType::a(t) = v { Some(String::from(t.as_str())) } else { None })).ok_or("no label")?;
-    let mut seed: [u8; 32] = s.get_field("seed").and_then(|f| f.values.iter().find_map(|v| if let VsfType::kge(k) = v { k[..].try_into().ok() } else { None })).ok_or("no 32-byte kge seed")?;
+    let mut doc = std::fs::read(secret).map_err(|e| format!("{}: {e}", secret.display()))?;
+    // The one reader of the secret's form, shared with the bridge (ferros_kist::capsule::developer_key).
+    let read = ferros_kist::capsule::developer_key(&doc).map_err(|e| format!("{}: {e}", secret.display()));
+    doc.fill(0);
+    let (label, mut seed) = read?;
     let bundle = SigningBundle::developer(&seed, &label);
     seed.fill(0);
     Ok((label, bundle))

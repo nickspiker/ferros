@@ -31,6 +31,8 @@ pub struct Job {
     pub got: u64,
     pub total: u64,
     pub name: String,
+    /// For a kist refused as signed by another key than its developer's other kists (why 17): that developer, as the person's pin names them.
+    pub who: String,
 }
 
 /// One kist the directory lists.
@@ -121,8 +123,18 @@ fn read_status(b: &[u8], into: &mut Installer) -> bool {
         if p + 52 + nl > b.len() {
             return false;
         }
-        into.jobs.push(Job { kind: r[0], stage: r[1], why: r[2], capsule: r[3..35].try_into().unwrap(), got: u64_at(r, 35), total: u64_at(r, 43), name: String::from(core::str::from_utf8(&r[52..52 + nl]).unwrap_or("")) });
+        into.jobs.push(Job { kind: r[0], stage: r[1], why: r[2], capsule: r[3..35].try_into().unwrap(), got: u64_at(r, 35), total: u64_at(r, 43), name: String::from(core::str::from_utf8(&r[52..52 + nl]).unwrap_or("")), who: String::new() });
         p += 52 + nl;
+    }
+    // Then per job its `who` (an installer from before sends none: the names stay empty).
+    for j in into.jobs.iter_mut() {
+        // WHY: the bytes are the installer's; a record cut short ends the names.
+        if p >= b.len() || p + 1 + b[p] as usize > b.len() {
+            break;
+        }
+        let n = b[p] as usize;
+        j.who = String::from(core::str::from_utf8(&b[p + 1..p + 1 + n]).unwrap_or(""));
+        p += 1 + n;
     }
     true
 }
@@ -217,7 +229,7 @@ fn why(w: u8) -> &'static str {
         3 => "its size is not the one listed",
         4 => "it is not the capsule listed",
         5 => "its signature does not check out",
-        6 => "its developer's keys are not on this device",
+        6 => "it does not carry its developer's keys",
         7 => "this kist is a development build and can't be installed from the network",
         8 => "its code failed the check",
         9 => "it could not be sealed to this device",
@@ -228,6 +240,9 @@ fn why(w: u8) -> &'static str {
         14 => "nobody is attested",
         15 => "there is no room to check it now",
         16 => "it is not a kist",
+        // 17 names the developer (`words`).
+        17 => "this kist is signed by a different key than its developer's other kists",
+        18 => "the keys it carries are not its developer's",
         _ => "something went wrong",
     }
 }
@@ -270,11 +285,16 @@ pub fn words(j: &Job, f: tatau::Fmt) -> Line {
             });
         }
         _ => {
-            let _ = write!(l, "{}: {}", match j.kind {
+            let not = match j.kind {
                 KIND_INSTALL => "Not installed",
                 KIND_UNINSTALL => "Not uninstalled",
                 _ => "Not restored",
-            }, why(j.why));
+            };
+            let _ = if j.why == 17 && !j.who.is_empty() {
+                write!(l, "{not}: this kist is signed by a different key than {}'s other kists", j.who)
+            } else {
+                write!(l, "{not}: {}", why(j.why))
+            };
         }
     }
     l

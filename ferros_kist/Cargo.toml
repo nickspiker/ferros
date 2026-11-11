@@ -14,7 +14,7 @@ vsf = { path = "../../vsf", default-features = false }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 # The list read and written through a process's `kists.` grant (init, the map): only where ferros_sys's calls exist.
 ferros_sys = { path = "../ferros_sys", optional = true }
-# The kist directory (`directory`): its egg slots, and every egg checked against the project's pinned bundle, by fgtw's verify-only base (no_std + alloc, as payloads/fgtw builds it). Off for the kernel, init and the map, which read only the rights' names and the person's list.
+# A capsule's developer bundle (`bundle`) and the kist directory (`directory`): its egg slots, and every egg checked against the project's pinned bundle, by fgtw's verify-only base (no_std + alloc, as payloads/fgtw builds it). Off for the kernel, init and the map, which read only the rights' names and the person's list.
 fgtw = { path = "../../fgtw", default-features = false, optional = true }
 
 [dev-dependencies]
@@ -23,5 +23,7 @@ fgtw = { path = "../../fgtw", default-features = false, features = ["sign"] }
 
 [features]
 process = ["dep:ferros_sys"]
+# A capsule's developer bundle (`kb`, every scheme's public key) read and written, and a capsule built the one way the bridge and kistcat both build it (`capsule`): fgtw's KeyBundle and egg slots.
+bundle = ["dep:fgtw"]
 # The kist directory (kists.fgtw.org/kists.vsf): its schema, built by tools/kistcat and read by the device's installer.
-directory = ["dep:fgtw"]
+directory = ["bundle"]

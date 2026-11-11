@@ -2,10 +2,10 @@
 //!
 //! An install is SANDBOX.md's lifecycle with nothing skipped, each stage told to the page:
 //! 0. **fetching**: the capsule over plain HTTP (net.rs), straight into the vault in pieces of one transfer (`capsules.<blake3>`, the device's), hashed as it passes (ferros_kist::fetch::Intake), never held whole; the last piece is held back, so nothing is kept before its signature is checked;
-//! 1. **checking its signature**: its blake3 and size the directory's, its developer and option the entry's, and every egg (Ed25519, Falcon-512, SPHINCS+) against its developer's pinned key bundle (fgtw::pq; owner 2026-11-10: "no single eggs"); then the last piece commits it;
+//! 1. **checking its signature**: its blake3 and size the directory's, its developer and option the entry's, and every egg (Ed25519, Falcon-512, SPHINCS+) against the developer bundle the capsule carries (`kb`), its Ed25519 key the kist's developer (fgtw::pq; owner 2026-11-10: "no single eggs"); that bundle's commitment the one the person's list pins for that developer, or none pinned yet (trust on first install: ferros_kist `capsule::admit`); then the last piece commits it;
 //! 2. **checking its code**: the kernel reads it back from the vault, gates it where it lies and runs the sandbox checker over its masked code, once (`ferros_sys::install_kist`); native code is a development build and is refused ("this kist is a development build and can't be installed from the network");
 //! 3. **sealing it to this device**: the kernel's keyed seal, kept in the vault's `sealed` list, the only thing a launch checks;
-//! 4. **storing**: the kist in the person's list (`kists.list`), with where it came from (`source`) and when (`installed`), the answers it had (or kept from an uninstall) standing;
+//! 4. **storing**: the kist in the person's list (`kists.list`), with where it came from (`source`) and when (`installed`), the answers it had (or kept from an uninstall) standing, and its developer's bundle pinned there at their first kist (`Kists::trust`; an uninstall keeps the pin);
 //! 5. **done**, or the failure and why (the capsule's bytes dropped from the vault on any failure).
 //!
 //! An uninstall takes the kist out of the person's list, its answers kept (ferros_kist `Kists::remove`: asked once, ever), and drops its capsule; the identity service carries the removal to the person's other devices. A restore (the person's list came back from their fleet after a reset, payloads/fgtw space.rs) fetches each capsule the list names that this device lacks, from its recorded source then the directory, through the same stages; the fleet's own devices first is the owner's order, and a seam (`fleet_fetch`) until that protocol exists.
@@ -15,7 +15,7 @@
 //! Started by the kernel once a person has attested, with its own grants (service.rs `kists_grants`; init's page is full): 0 console, 1 use udp, 2 the vault scope `capsules.`, 3 the vault scope `kists.`, 4 serve `kists`, 5 use fgtw, 6 the Install right.
 //!
 //! `kists` ops (the map's, first byte):
-//! - 0 [count u32 LE]: the doorbell. Answered at once with the status when its count is not the caller's, else held until it changes: [count u32 LE][directory: 0 not read, 1 fetching, 2 read, 3 not reachable][1 the directory's signature checked, 0 not (the project key not pinned yet)][jobs n][per job: kind (0 install, 1 uninstall, 2 restore), stage (`STAGE_*`), why (`WHY_*`), the capsule 32, bytes so far u64 LE, bytes in all u64 LE, name length, name].
+//! - 0 [count u32 LE]: the doorbell. Answered at once with the status when its count is not the caller's, else held until it changes: [count u32 LE][directory: 0 not read, 1 fetching, 2 read, 3 not reachable][1 the directory's signature checked, 0 not (the project key not pinned yet)][jobs n][per job: kind (0 install, 1 uninstall, 2 restore), stage (`STAGE_*`), why (`WHY_*`), the capsule 32, bytes so far u64 LE, bytes in all u64 LE, name length, name], then per job again: [who length, who] (the developer whose other kists a refused key differs from, `WHY_OTHER_KEY`; empty for any other job).
 //! - 1: fetch the directory again and look for missing capsules again (the page opened) → [0].
 //! - 2 [from]: the directory's entries from `from` → [entries in all][n][per entry: capsule 32, developer 32, option 32, size u64 LE, major, minor, patch u16 LE each, name length, name, about length, about], as many as fit one reply.
 //! - 3 [capsule 32]: install (or update to) the directory's entry with that capsule → [0 queued, 1 not in the directory, 2 already under way, 3 too many under way].
@@ -64,10 +64,9 @@ static PIECE_BUF: Region<PIECE> = Region(UnsafeCell::new([0; PIECE]));
 #[global_allocator]
 static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
 
-/// The ferros project key's public bundle (`KeyBundle::to_bytes`), every scheme, that signs the directory (ferros_kist::directory::verify_directory). Not pinned yet (owner, 2026-11-10: "the project public bundle ... isn't pinned yet"): until it is, the directory is read unchecked and the page says so. A directory vouches for nothing either way: every capsule's own eggs are checked against its developer's pinned bundle below, so an unchecked directory can list nothing that installs.
+/// The ferros project key's public bundle (`KeyBundle::to_bytes`), every scheme, that signs the directory (ferros_kist::directory::verify_directory). Not pinned yet (owner, 2026-11-10: "the project public bundle ... isn't pinned yet"): until it is, the directory is read unchecked and the page says so. A directory vouches for nothing either way: every capsule's own eggs are checked against the developer bundle it carries and the person's pin for that developer (below), so an unchecked directory can list nothing that installs unchecked. tools/kistcat publishes it UNSIGNED (`build --unsigned`) until the project key is chosen.
 const PROJECT_BUNDLE: &[u8] = &[];
-/// The developers whose kists this device installs: each one's public bundle (`KeyBundle::to_bytes`, every scheme), pinned as fgtw pins Photon's release key (which is always trusted: `fgtw::release`). The owner's developer key (Clock, Mahere, Lumis) goes here once it exists (owner decision: pinned in the OS, or carried in the directory under the project key's signature).
-const DEVELOPERS: &[&[u8]] = &[];
+// No list of developers is built into the OS (owner, 2026-11-10: trust on first install): a kist carries its developer's whole public bundle (`kb`), its eggs are checked against that, and the person's list pins the bundle's commitment for that developer at their first kist (ferros_kist `capsule::admit`, `Kists::trust`). Photon's release key stays trusted as fgtw pins it.
 
 /// The kinds of job.
 const KIND_INSTALL: u8 = 0;
@@ -90,7 +89,8 @@ const WHY_MISSING: u8 = 2;
 const WHY_SIZE: u8 = 3;
 const WHY_NOT_NAMED: u8 = 4;
 const WHY_EGGS: u8 = 5;
-const WHY_UNKNOWN_DEVELOPER: u8 = 6;
+/// It carries no bundle of its developer's keys (a capsule from before 2026-11-10).
+const WHY_NO_BUNDLE: u8 = 6;
 const WHY_NATIVE: u8 = 7;
 const WHY_CHECKER: u8 = 8;
 const WHY_SEAL: u8 = 9;
@@ -101,6 +101,10 @@ const WHY_NOT_LISTED: u8 = 13;
 const WHY_NOBODY: u8 = 14;
 const WHY_ROOM: u8 = 15;
 const WHY_NOT_KIST: u8 = 16;
+/// The person trusted another bundle for this developer key at its first kist (the job's `who` names the developer).
+const WHY_OTHER_KEY: u8 = 17;
+/// The bundle it carries is not its developer's (its Ed25519 key is not the kist's).
+const WHY_NOT_ITS_KEYS: u8 = 18;
 
 /// The most jobs the page lists (finished ones give way first): one reply holds them, and the map holds sixteen circles.
 const JOBS_MAX: usize = 1 << 4;
@@ -118,6 +122,8 @@ struct Job {
     why: u8,
     got: u64,
     total: u64,
+    /// For `WHY_OTHER_KEY`: the developer the person trusted, as their pin names them (ferros_kist `capsule::pin_name`); empty otherwise.
+    who: String,
 }
 
 struct State {
@@ -184,6 +190,13 @@ fn status(s: &State) -> Vec<u8> {
         r.push(n.len() as u8);
         r.extend_from_slice(n);
     }
+    // After the jobs (a page from before reads to the last job and stops): per job, whose other kists a refused one's key differs from (`WHY_OTHER_KEY`), its length then its bytes, empty for any other.
+    for j in &s.jobs {
+        // WHY: a developer's name is at most 32 bytes here (the page's line), a length byte.
+        let w = &j.who.as_bytes()[..j.who.len().min(32)];
+        r.push(w.len() as u8);
+        r.extend_from_slice(w);
+    }
     r
 }
 
@@ -222,6 +235,34 @@ fn fail(job: usize, why: u8) {
         }
     });
     ring();
+}
+
+/// The job's `who`: the developer a refused kist's key differs from.
+fn set_who(job: usize, who: String) {
+    with(|s| {
+        if let Some(j) = s.jobs.get_mut(job) {
+            j.who = who;
+        }
+    });
+}
+
+/// A refusal of `ferros_kist::capsule::admit` as the page's reason (and the developer's name for a key other than the pinned one), said on the console in full.
+fn refused(job: usize, r: &ferros_kist::capsule::Refused) -> u8 {
+    use ferros_kist::capsule::Refused;
+    let mut l = Vec::new();
+    l.extend_from_slice(b"kists: refused: ");
+    l.extend_from_slice(ferros_kist::capsule::refusal_words(r).as_bytes());
+    l.push(b'\n');
+    say(&l);
+    match r {
+        Refused::NoBundle => WHY_NO_BUNDLE,
+        Refused::NotItsKey => WHY_NOT_ITS_KEYS,
+        Refused::Eggs => WHY_EGGS,
+        Refused::OtherKey(p) => {
+            set_who(job, ferros_kist::capsule::pin_name(p));
+            WHY_OTHER_KEY
+        }
+    }
 }
 
 /// Room for one more job: the oldest finished one gives way. False when every slot is under way.
@@ -301,7 +342,7 @@ fn serve(grants: u64) -> ! {
                     if !make_room(s) {
                         return 3;
                     }
-                    s.jobs.push(Job { kind: KIND_INSTALL, capsule, developer: e.developer, option: e.option, name: e.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: e.size });
+                    s.jobs.push(Job { kind: KIND_INSTALL, capsule, developer: e.developer, option: e.option, name: e.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: e.size, who: String::new() });
                     0
                 });
                 reply(&tok, &[r]);
@@ -320,7 +361,7 @@ fn serve(grants: u64) -> ! {
                         if !make_room(s) {
                             return 3;
                         }
-                        s.jobs.push(Job { kind: KIND_UNINSTALL, capsule: k.capsule, developer, option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0 });
+                        s.jobs.push(Job { kind: KIND_UNINSTALL, capsule: k.capsule, developer, option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new() });
                         0
                     }),
                 };
@@ -495,12 +536,14 @@ fn run(grants: u64, i: usize) {
     }
 }
 
-/// The developer's public bundle, every scheme, if this device trusts that developer: Photon's release key always (fgtw pins it), else one pinned in `DEVELOPERS`.
-fn bundle_for(developer: &[u8; 32]) -> Option<fgtw::pq::KeyBundle> {
-    if *developer == fgtw::release::RELEASE_ED25519 {
-        return Some(fgtw::release::release_bundle());
+/// Trust on first install, kept: the developer's bundle pinned in the person's list when none was (`Kists::trust`); a pin that differs now (the space brought one in since the check) refuses. Ok(true) when the list changed and must be written.
+fn pin(i: usize, list: &mut ferros_kist::Kists, developer: &[u8; 32], a: &ferros_kist::capsule::Admitted, now: i64) -> Result<bool, u8> {
+    let Some(b) = a.bundle else { return Ok(false) };
+    match list.trust(developer, &b, a.name.as_deref(), now) {
+        ferros_kist::Trust::First => Ok(true),
+        ferros_kist::Trust::Same => Ok(false),
+        ferros_kist::Trust::Other(p) => Err(refused(i, &ferros_kist::capsule::Refused::OtherKey(p))),
     }
-    DEVELOPERS.iter().filter_map(|b| fgtw::pq::KeyBundle::from_bytes(b).ok()).find(|k| k.ed25519() == *developer)
 }
 
 /// Where an entry's capsule is fetched from: a path on the directory's host. A manifest entry (the developer's own signed manifest, Photon's) is not read on the device yet.
@@ -515,7 +558,7 @@ fn entry_url(e: &Entry) -> Result<String, u8> {
 fn install(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
     let e = with(|s| s.dir.as_ref().and_then(|d| d.kists.iter().find(|e| e.capsule == job.capsule)).cloned()).ok_or(WHY_NOT_LISTED)?;
     let url = entry_url(&e)?;
-    let taken = bring(grants, i, &url, &e.capsule, Some(e.size), &e.developer, &e.option)?;
+    let (taken, admitted) = bring(grants, i, &url, &e.capsule, Some(e.size), &e.developer, &e.option)?;
     stage(i, STAGE_STORING, e.size, e.size);
     let decl = ferros_kist::declaration(&taken.first).map_err(|_| WHY_NOT_KIST)?;
     let list_cap = cap(grants, S_KISTS);
@@ -523,10 +566,15 @@ fn install(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
         drop_capsule(grants, &e.capsule);
         return Err(WHY_NOBODY);
     };
+    let at = ferros_detail::eagle_now();
+    // The developer's bundle pinned with the kist, in one write of the list: the first kist by a developer trusts it, every later one was checked against it.
+    if let Err(why) = pin(i, &mut list, &e.developer, &admitted, at) {
+        drop_capsule(grants, &e.capsule);
+        return Err(why);
+    }
     let old = list.by_identity(&e.developer, &e.option).map(|k| k.capsule);
     let k = list.install(e.capsule, e.developer, e.option, &decl);
     list.kists[k].source = Some(url);
-    let at = ferros_detail::eagle_now();
     list.kists[k].installed = at;
     if !ferros_kist::store::write(list_cap, &list, at) {
         drop_capsule(grants, &e.capsule);
@@ -581,7 +629,7 @@ fn restore_pass(grants: u64) {
             if !make_room(s) {
                 break;
             }
-            s.jobs.push(Job { kind: KIND_RESTORE, capsule: *c, developer: k.developer, option: k.option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0 });
+            s.jobs.push(Job { kind: KIND_RESTORE, capsule: *c, developer: k.developer, option: k.option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new() });
             added = true;
         }
     });
@@ -639,7 +687,20 @@ fn restore(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
     let mut why = WHY_NOT_LISTED;
     for u in &sources {
         match bring(grants, i, u, &job.capsule, size, &k.developer, &k.option) {
-            Ok(_) => {
+            Ok((_, admitted)) => {
+                // A list from before pins (or one whose pin has not arrived from the space yet): the restored kist's bundle pinned now, as at a first install.
+                let list_cap = cap(grants, S_KISTS);
+                if let Some(mut list) = ferros_kist::store::read(list_cap) {
+                    let at = ferros_detail::eagle_now();
+                    match pin(i, &mut list, &k.developer, &admitted, at) {
+                        Ok(true) if !ferros_kist::store::write(list_cap, &list, at) => return Err(WHY_VAULT),
+                        Ok(_) => {}
+                        Err(w) => {
+                            drop_capsule(grants, &job.capsule);
+                            return Err(w);
+                        }
+                    }
+                }
                 let mut l = Vec::new();
                 l.extend_from_slice(b"kists: restored ");
                 l.extend_from_slice(k.name.as_bytes());
@@ -665,9 +726,8 @@ fn drop_capsule(grants: u64, capsule: &[u8; 32]) {
     let _ = ferros_sys::store_delete_addr(cap(grants, S_CAPSULES), capsule);
 }
 
-/// Stages 0 to 3 for one capsule from one URL: fetched into the vault as it streams, its signature checked (every egg against its developer's bundle, its blake3, its size, its identity), committed, then checked and sealed by the kernel. On any failure its bytes are dropped. Returns what was taken in (its first bytes carry its declaration).
-fn bring(grants: u64, i: usize, url: &str, expect: &[u8; 32], size: Option<u64>, developer: &[u8; 32], option: &[u8; 32]) -> Result<Taken, u8> {
-    let bundle = bundle_for(developer).ok_or(WHY_UNKNOWN_DEVELOPER)?;
+/// Stages 0 to 3 for one capsule from one URL: fetched into the vault as it streams, its signature checked (its blake3, its size, its identity, every egg against the developer bundle it carries, and that bundle the one the person pinned for its developer), committed, then checked and sealed by the kernel. On any failure its bytes are dropped. Returns what was taken in (its first bytes carry its declaration) and what to pin.
+fn bring(grants: u64, i: usize, url: &str, expect: &[u8; 32], size: Option<u64>, developer: &[u8; 32], option: &[u8; 32]) -> Result<(Taken, ferros_kist::capsule::Admitted), u8> {
     let total = size.unwrap_or(0);
     stage(i, STAGE_FETCHING, 0, total);
     let capsules = cap(grants, S_CAPSULES);
@@ -744,9 +804,12 @@ fn bring(grants: u64, i: usize, url: &str, expect: &[u8; 32], size: Option<u64>,
         Ok((d, o)) if d == *developer && o == *option => {}
         _ => return failed(WHY_NOT_KIST),
     }
-    if taken.head.signer != *developer || bundle.ed25519() != *developer || !fgtw::pq::verify_eggs(&taken.head.eggs, &bundle, &taken.file_hash, fgtw::release::RELEASE_MASK) {
-        return failed(WHY_EGGS);
-    }
+    // Every egg against the bundle the capsule carries, its Ed25519 key the kist's developer, and that bundle the one the person pinned for this developer if they pinned one (trust on first install; Photon's release key against fgtw's pinned bundle).
+    let Some(list) = ferros_kist::store::read(cap(grants, S_KISTS)) else { return failed(WHY_NOBODY) };
+    let admitted = match ferros_kist::capsule::admit(&taken.first, &taken.head.signer, &taken.head.eggs, &taken.file_hash, &list) {
+        Ok(a) => a,
+        Err(r) => return failed(refused(i, &r)),
+    };
     if fill == 0 || !ferros_sys::store_set_addr_at(capsules, expect, written, &piece[..fill], false) {
         return failed(WHY_VAULT);
     }
@@ -755,7 +818,7 @@ fn bring(grants: u64, i: usize, url: &str, expect: &[u8; 32], size: Option<u64>,
     if let Err(why) = kernel_check(grants, i, expect, len) {
         return failed(why);
     }
-    Ok(taken)
+    Ok((taken, admitted))
 }
 
 /// The kernel's check and seal of a stored capsule, each stage it tells shown: its reading of the capsule is the code stage's bar, then the checker, then the seal.
