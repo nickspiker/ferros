@@ -1321,6 +1321,13 @@ name = "ferros_tcp"
 version = "0.1.0"
 
 [[package]]
+name = "ferros_tide"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
+
+[[package]]
 name = "ferros_vault"
 version = "0.1.0"
 dependencies = [
