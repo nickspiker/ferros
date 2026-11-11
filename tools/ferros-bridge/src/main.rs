@@ -599,7 +599,7 @@ fn build_cmd(cap_name: &[u8], op: ferros_pt::Op, params: &[u8]) -> Vec<u8> {
 // Commands
 // ---------------------------------------------------------------------------
 
-/// Wrap position-independent native code in a signed capsule (toka's capsule format: a VSF file, section `aarch64` field `code`, signed with Ed25519 over the whole file). The developer key is the 64-byte keypair at $FERROS_DEV_KEY (default: the ferros key in the keys dir); only its 32-byte seed is used, and it never leaves this process. A kist (`--kist NAME --option HEX [--want RIGHT REASON]... [--developer NAME]`) is built by ferros_kist::capsule, as tools/kistcat `kist` builds one: its developer's whole public bundle in it (`kb`) and an egg per scheme, so $FERROS_DEV_KEY is then a developer key (VSF, kistcat `devkey new`) or Photon's release seed.
+/// Wrap position-independent native code in a signed capsule (toka's capsule format: a VSF file, section `aarch64` field `code`, signed with Ed25519 over the whole file). The developer key is the 64-byte keypair at $FERROS_DEV_KEY (default: the ferros key in the keys dir); only its 32-byte seed is used, and it never leaves this process. A kist (`--kist NAME --option HEX [--want RIGHT REASON]... [--developer NAME] [--version 0.1.0]`) is built by ferros_kist::capsule, as tools/kistcat `kist` builds one: its developer's whole public bundle in it (`kb`) and an egg per scheme, so $FERROS_DEV_KEY is then a developer key (VSF, kistcat `devkey new`) or Photon's release seed.
 /// `--text-len N`: for a masked capsule, how many bytes of the image are instructions (the rest is read-only data).
 fn text_len_arg(args: &[String]) -> Option<usize> {
     args.iter().position(|a| a == "--text-len").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok())
@@ -701,7 +701,14 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
         };
         let signer = kist_signer(&key, &key_path);
         let developer = std::env::args().collect::<Vec<_>>().windows(2).find(|w| w[0] == "--developer").map(|w| w[1].clone());
-        let unsigned = ferros_kist::capsule::unsigned(&d, option, developer.as_deref(), &signer.public(), &c, vsf::eagle_time_oscillations()).unwrap_or_else(|e| {
+        // `--version 0.1.0` (any number of parts): the kist's version, in its signed declaration.
+        let version = std::env::args().collect::<Vec<_>>().windows(2).find(|w| w[0] == "--version").map(|w| {
+            ferros_kist::Version::parse(&w[1]).unwrap_or_else(|| {
+                eprintln!("--version {}: parts of decimal digits, separated by dots (0.1.0)", w[1]);
+                std::process::exit(1);
+            })
+        });
+        let unsigned = ferros_kist::capsule::unsigned(&d, option, version.as_ref(), developer.as_deref(), &signer.public(), &c, vsf::eagle_time_oscillations()).unwrap_or_else(|e| {
             eprintln!("Capsule build failed: {e}");
             std::process::exit(1);
         });

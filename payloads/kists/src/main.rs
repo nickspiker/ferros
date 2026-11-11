@@ -15,9 +15,9 @@
 //! Started by the kernel once a person has attested, with its own grants (service.rs `kists_grants`; init's page is full): 0 console, 1 use udp, 2 the vault scope `capsules.`, 3 the vault scope `kists.`, 4 serve `kists`, 5 use fgtw, 6 the Install right.
 //!
 //! `kists` ops (the map's, first byte):
-//! - 0 [count u32 LE]: the doorbell. Answered at once with the status when its count is not the caller's, else held until it changes: [count u32 LE][directory: 0 not read, 1 fetching, 2 read, 3 not reachable][1 the directory's signature checked, 0 not (the project key not pinned yet)][jobs n][per job: kind (0 install, 1 uninstall, 2 restore), stage (`STAGE_*`), why (`WHY_*`), the capsule 32, bytes so far u64 LE, bytes in all u64 LE, name length, name], then per job again: [who length, who] (the developer whose other kists a refused key differs from, `WHY_OTHER_KEY`; empty for any other job).
+//! - 0 [count u32 LE]: the doorbell. Answered at once with the status when its count is not the caller's, else held until it changes: [count u32 LE][directory: 0 not read, 1 fetching, 2 read, 3 not reachable][1 the directory's signature checked, 0 not (the project key not pinned yet)][jobs n][per job: kind (0 install, 1 uninstall, 2 restore), stage (`STAGE_*`), why (`WHY_*`), the capsule 32, bytes so far u64 LE, bytes in all u64 LE, name length, name], then per job again: [who length, who] (the developer whose other kists a refused key differs from, `WHY_OTHER_KEY`; empty for any other job), then the directory's generation u32 LE (moved each time a directory is read: the page reads the rows again).
 //! - 1: fetch the directory again and look for missing capsules again (the page opened) → [0].
-//! - 2 [from]: the directory's entries from `from` → [entries in all][n][per entry: capsule 32, developer 32, option 32, size u64 LE, major, minor, patch u16 LE each, name length, name, about length, about], as many as fit one reply.
+//! - 2 [from]: the directory's entries from `from` → [entries in all][n][per entry: capsule 32, developer 32, option 32, size u64 LE, the version's part count u8 then each part u64 LE (as its capsule's signed declaration writes it, leading zeros and all; at most 255 parts), name length, name, about length, about], as many as fit one reply (4000 bytes: an entry is at most A#2275, so one always fits). Until 2026-11-10 the version was three u16 (major, minor, patch).
 //! - 3 [capsule 32]: install (or update to) the directory's entry with that capsule → [0 queued, 1 not in the directory, 2 already under way, 3 too many under way].
 //! - 4 [developer 32][option 32]: uninstall that kist → [0 queued, 1 not installed, 3 too many under way].
 
@@ -134,6 +134,8 @@ struct State {
     dir_state: u8,
     dir_checked: bool,
     dir: Option<Directory>,
+    /// Moved on each time a directory is read: the page reads the rows again when it moves (a read that went 2 → 1 → 2 between two of its doorbells no longer leaves it the rows it had).
+    dir_gen: u32,
     dir_wanted: bool,
     restore_wanted: bool,
     jobs: Vec<Job>,
@@ -197,6 +199,8 @@ fn status(s: &State) -> Vec<u8> {
         r.push(w.len() as u8);
         r.extend_from_slice(w);
     }
+    // Last, the directory's generation (u32 LE): the page reads the rows again whenever it moves.
+    r.extend_from_slice(&s.dir_gen.to_le_bytes());
     r
 }
 
@@ -285,7 +289,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_SIZE) };
     GRANTS.store(grants, Ordering::Relaxed);
-    unsafe { *STATE.0.get() = Some(State { count: 0, watchers: Vec::new(), dir_state: 0, dir_checked: false, dir: None, dir_wanted: false, restore_wanted: true, jobs: Vec::new() }) };
+    unsafe { *STATE.0.get() = Some(State { count: 0, watchers: Vec::new(), dir_state: 0, dir_checked: false, dir: None, dir_gen: 0, dir_wanted: false, restore_wanted: true, jobs: Vec::new() }) };
     ferros_sys::thread_spawn(worker, unsafe { &mut *WORKER_STACK.0.get() }, grants);
     ferros_sys::thread_spawn(space_watch, unsafe { &mut *WATCHER_STACK.0.get() }, grants);
     say(b"kists: serving the installer (kists); a restore follows the identity service\n");
@@ -387,7 +391,9 @@ fn directory_reply(s: &State, from: u8) -> Vec<u8> {
         // WHY: the page's rows; longer text is cut, never sent past one reply (4 KiB).
         let name = &e.name.as_bytes()[..e.name.len().min(32)];
         let about = &e.about.as_bytes()[..e.about.len().min(96)];
-        let need = 32 * 3 + 8 + 6 + 2 + name.len() + about.len();
+        // WHY: the part count is one byte. The version is sent as written (the page drops its leading zero parts itself, ferros_kist::significant); one past 255 parts is sent to its first 255, and an entry is then at most 32 * 3 + 8 + 1 + 255 * 8 + 2 + 32 + 96 = A#2275 bytes, so the first always fits the reply.
+        let parts = &e.version.0[..e.version.0.len().min(255)];
+        let need = 32 * 3 + 8 + 1 + (parts.len() << 3) + 2 + name.len() + about.len();
         if r.len() + need > 4000 {
             break;
         }
@@ -395,9 +401,9 @@ fn directory_reply(s: &State, from: u8) -> Vec<u8> {
         r.extend_from_slice(&e.developer);
         r.extend_from_slice(&e.option);
         r.extend_from_slice(&e.size.to_le_bytes());
-        for v in [e.version.major, e.version.minor, e.version.patch] {
-            // WHY: a version part past 65535 is shown at its low bits; none is.
-            r.extend_from_slice(&(v as u16).to_le_bytes());
+        r.push(parts.len() as u8);
+        for p in parts {
+            r.extend_from_slice(&p.to_le_bytes());
         }
         r.push(name.len() as u8);
         r.extend_from_slice(name);
@@ -501,10 +507,21 @@ fn fetch_directory(grants: u64) {
             if !checked {
                 say(b"kists: the directory's signature is not checked: the project key's bundle is not pinned yet\n");
             }
+            // Each entry's version as this process parsed it, parts as written (2026-11-10: the page showed "Clock 0.0.0" for an entry the host parses as 0.1.0; the next run says which side read zeros).
+            for e in &d.kists {
+                let mut l = alloc::format!("kists: listed {} version", e.name);
+                for (i, p) in e.version.0.iter().enumerate() {
+                    l.push_str(&alloc::format!("{}A#{p}", if i == 0 { " " } else { "." }));
+                }
+                l.push('\n');
+                say(l.as_bytes());
+            }
             with(|s| {
                 s.dir = Some(d);
                 s.dir_state = 2;
                 s.dir_checked = checked;
+                // WHY wrapping: the page only asks whether it moved; past 2^32 reads it starts again, which a plain add would panic on in a debug build.
+                s.dir_gen = s.dir_gen.wrapping_add(1);
             });
         }
         Err(()) => {
@@ -561,6 +578,8 @@ fn install(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
     let (taken, admitted) = bring(grants, i, &url, &e.capsule, Some(e.size), &e.developer, &e.option)?;
     stage(i, STAGE_STORING, e.size, e.size);
     let decl = ferros_kist::declaration(&taken.first).map_err(|_| WHY_NOT_KIST)?;
+    // Its version as its signed declaration gives it (what the page compares a listed one against); a capsule without one (a manifest's artefact) takes the entry's, which its developer's signed manifest gave. A version field that does not read is no kist's.
+    let version = ferros_kist::version_of(&taken.first).map_err(|_| WHY_NOT_KIST)?.unwrap_or_else(|| e.version.clone());
     let list_cap = cap(grants, S_KISTS);
     let Some(mut list) = ferros_kist::store::read(list_cap) else {
         drop_capsule(grants, &e.capsule);
@@ -576,6 +595,7 @@ fn install(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
     let k = list.install(e.capsule, e.developer, e.option, &decl);
     list.kists[k].source = Some(url);
     list.kists[k].installed = at;
+    list.kists[k].version = Some(version);
     if !ferros_kist::store::write(list_cap, &list, at) {
         drop_capsule(grants, &e.capsule);
         return Err(WHY_VAULT);
