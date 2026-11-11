@@ -134,6 +134,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Silent => "मौन",
         Msg::DoNotDisturb => "परेशान न करें",
         Msg::Screencap => "स्क्रीनशॉट",
+        Msg::FullScreen => "पूर्ण स्क्रीन",
         // ---- the battery's page ----
         Msg::Charge => "चार्ज",
         Msg::Voltage => "वोल्टेज",

@@ -44,6 +44,7 @@
 extern crate alloc;
 
 mod draw;
+mod events;
 mod glyphs;
 mod hit;
 mod modeset;
@@ -3036,6 +3037,10 @@ struct Win {
     format: u8,
     /// Its mode byte (`MODE_MASK`, `OPAQUE`).
     mode: u8,
+    /// Behind (op 60; owner, 2026-11-11: "Home backgrounds the kist so depending on how it was designed, like Photon, it doesn't die but it stops rendering everything"): kept in the table with its surface and its process, never composed, never an owner in the hit map, its shows taken (place and format) but published nowhere, until op 59 brings it to the front.
+    back: bool,
+    /// Full screen for this window (op 43, the quick row's circle): no circle and no bars while it is the app in front (`FULL` follows the front app window's).
+    full: bool,
 }
 /// A surface of fluor's 16-bit pixels (fluor `pixel::G2t16`): α in bits 48-63, then each channel's darkness (the top code less the channel's VSF `g2t` code, scaled by α) in bits 32-47 (R), 16-31 (G) and 0-15 (B); α 0 is see-through.
 const G2T16: u8 = 1;
@@ -3075,11 +3080,11 @@ fn live_gen(k: usize) -> u8 {
     if SURF_BELL.load(Ordering::Acquire) && (SURF_LIVE.load(Ordering::Acquire) >> (8 * k)) as u8 != g { 0 } else { g }
 }
 
-/// `WINS` as `WIN_GENS`, after every change to it.
+/// `WINS` as `WIN_GENS`, after every change to it: the windows on the glass (one behind is not in front, so op 5 does not count it and the map has the glass).
 fn wins_mirror() {
     let mut v = 0u64;
     for k in 0..SURFACES {
-        if let Some(w) = unsafe { WINS[k] } {
+        if let Some(w) = unsafe { WINS[k] }.filter(|w| !w.back) {
             v |= (w.generation as u64) << (8 * k);
         }
     }
@@ -3116,7 +3121,7 @@ const CLEAR: u64 = 1 << 63;
 static mut CHROME_TOP: usize = 0;
 /// The console's rows, the bars' top band: `CHROME_TOP`, or down to the quick row's floor where that is lower (quick.rs `rows`; since 2026-11-11 the row reaches past the chrome rows to touch the glass's sides).
 static mut BAR_TOP: usize = 0;
-/// Full screen (owner, 2026-11-07: slide from the home circle to the centre): the console, the helm and the app's circle hidden, only the glass's edge left (black, and orange on development builds). Toggled by op 43; the corners stay the system's, so the same gesture comes back.
+/// Full screen (owner, 2026-11-07, then the home swipe; since 2026-11-11 the quick row's middle circle): the console, the helm and the app's circle hidden, only the glass's edge left (black, and orange on development builds). The app window in front's own flag (`Win::full`, switched by op 43), followed by `full_follow` whenever the windows change; off with no app in front. The corners stay the system's, and the console's rows show while the quick row is out (`bar_line`), so its circle switches it back.
 static mut FULL: bool = false;
 static mut CHROME_BOT: usize = 0;
 /// The bars (owner, 2026-11-07): the console, the circles at the top of the screen (the radios' switches and the system's indicators), over the `BAR_TOP` rows (the quick row with them), then the helm, home and back at the bottom, over the `CHROME_BOT` rows. They are the frontmost layer but the glass's edge, over the home screen and every app alike, in screen coordinates, so nothing transforms them. Drawn as fluor draws: front to back from empty, into fluor's 16-bit α + darkness (`G2T16`), by fluor's one `under`; redrawn only when what they show changes (`console_draw`, `helm_draw`).
@@ -3165,8 +3170,8 @@ fn bar_row(y: usize, height: usize) -> Option<usize> {
 /// The bars at screen row `y`: the columns holding any of them (from, to) and the row's decoded pixels (`BAR_W`); an empty span and no pixels off their rows.
 #[inline]
 fn bar_line(y: usize, width: usize, height: usize) -> ((usize, usize), &'static [u64]) {
-    // Full screen: the bars hidden, every publish passes their rows untouched.
-    if unsafe { FULL } {
+    // Full screen: the bars hidden, every publish passes their rows untouched; but the console's rows show while the bars on the glass hold any of the quick row (pulled from the doorway, which stays the system's), so its full screen circle can be reached and the row is never drawn over nothing.
+    if unsafe { FULL && (quick::EMPTY_FRONT || y >= BAR_TOP) } {
         return ((0, 0), &[]);
     }
     match bar_row(y, height) {
@@ -3191,10 +3196,11 @@ fn surface_of(base: u64) -> Option<usize> {
 
 /// The windows up, frontmost first: (surface, window), at most four.
 fn front_order() -> ([(usize, Win); SURFACES], usize) {
-    let mut v = [(0usize, Win { generation: 0, level: 0, order: 0, rect: draw::Rect::EMPTY, format: 0, mode: 0 }); SURFACES];
+    let mut v = [(0usize, Win { generation: 0, level: 0, order: 0, rect: draw::Rect::EMPTY, format: 0, mode: 0, back: false, full: false }); SURFACES];
     let mut n = 0;
     for k in 0..SURFACES {
-        if let Some(w) = unsafe { WINS[k] } {
+        // A window behind is in no stack: nothing of it is composed or owns a pixel.
+        if let Some(w) = unsafe { WINS[k] }.filter(|w| !w.back) {
             // Insertion by (level, order), highest first.
             let mut at = n;
             while at > 0 && (v[at - 1].1.level, v[at - 1].1.order) < (w.level, w.order) {
@@ -3389,7 +3395,7 @@ fn glass_radius() -> f32 {
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Whether it starts looking like one (the orange outside the edge and on the hairlines): a development build built with FERROS_RELEASE_LOOK set starts in the release look, for screen captures to show (owner, 2026-11-10: "so I don't get orange in my screencaps"), and keeps every development tool.
 const DEV_LOOK: bool = DEV && option_env!("FERROS_RELEASE_LOOK").is_none();
-/// The development look as it stands (owner, 2026-11-11: "a good spot for the release look, we can have it always be off and show orange, upon tap in UI it goes black and stays until a reboot"): on from `DEV_LOOK`, off for good by op 60 (the Developer page's "release look"), never on again until the display starts again; never stored. A release build has it off from the start and can never turn it on.
+/// The development look as it stands (owner, 2026-11-11: "a good spot for the release look, we can have it always be off and show orange, upon tap in UI it goes black and stays until a reboot"): on from `DEV_LOOK`, off for good by op 64 (the Developer page's "release look"), never on again until the display starts again; never stored. A release build has it off from the start and can never turn it on.
 static LOOK: AtomicBool = AtomicBool::new(DEV_LOOK);
 /// Whether the glass looks like a development build's now (`LOOK`); a constant false on release builds and on FERROS_RELEASE_LOOK builds, so their paths fold the orange away.
 #[inline(always)]
@@ -3934,13 +3940,33 @@ fn windows_changed(width: usize, height: usize) {
     let full = draw::Rect::full(width, height);
     layout_build(width, height);
     wins_mirror();
+    full_follow();
     unsafe {
         PHASE_DIRTY = [full; PHASES];
         clean_reset_all();
-        if (*(&raw const WINS)).iter().all(|w| w.is_none()) {
+        // None on the glass (all gone, or all behind): the map's again. One brought to the front: the glass is the windows'.
+        if (*(&raw const WINS)).iter().flatten().all(|w| w.back) {
             APP = None;
             PREV_DMG = full;
+        } else {
+            APP = Some(full);
         }
+    }
+}
+
+/// The app window in front (WINDOWS.md "The helm"): the last shown of level 0 (an app) that is not behind. What home sends behind (op 60), what back's Escape goes to (op 61), whose full screen op 43 switches.
+fn front_app() -> Option<usize> {
+    let wins = unsafe { &*(&raw const WINS) };
+    (0..SURFACES).filter(|&k| wins[k].is_some_and(|w| w.level == 0 && !w.back)).max_by_key(|&k| wins[k].map_or(0, |w| w.order))
+}
+
+/// `FULL` as the app window in front has it (none in front: off, so the home screen always has its bars). True when that changed.
+fn full_follow() -> bool {
+    let f = front_app().is_some_and(|k| unsafe { (*(&raw const WINS))[k] }.is_some_and(|w| w.full));
+    unsafe {
+        let was = FULL;
+        FULL = f;
+        was != f
     }
 }
 
@@ -6040,7 +6066,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
 static mut PREV_DMG: draw::Rect = draw::Rect { x0: 0, y0: 0, x1: 4096, y1: 4096 };
 static mut CUR_DMG: draw::Rect = draw::Rect::EMPTY;
 
-/// A 10-bit pixel as the hardware takes it once DMA, DPP and HDR-common agree (kernel `Panel::set_10bit`): B[31:22] G[21:12] R[11:2] A[1:0]; the panel's channels that are off (`CHANNELS`, op 59) at code 0.
+/// A 10-bit pixel as the hardware takes it once DMA, DPP and HDR-common agree (kernel `Panel::set_10bit`): B[31:22] G[21:12] R[11:2] A[1:0]; the panel's channels that are off (`CHANNELS`, op 63) at code 0.
 #[inline(always)]
 fn pack10(r: u32, g: u32, b: u32) -> u32 {
     (b << 22 | g << 12 | r << 2 | 3) & word_mask()
@@ -6134,7 +6160,7 @@ fn publish(back: &[Px], screen: &mut [u32]) {
     let (w, h) = unsafe { SCREEN_WH };
     hit::refresh(w as usize, h as usize, draw::Rect::full(w as usize, h as usize));
     let c8 = |v: u64| ((v & 0xFFFF) * 255 / 16384).min(255) as u32;
-    // The panel's channels that are off (`CHANNELS`, op 59) at 0, in this path's XRGB bytes.
+    // The panel's channels that are off (`CHANNELS`, op 63) at 0, in this path's XRGB bytes.
     let m = CHANNELS.load(Ordering::Relaxed);
     let keep = 0xFF00_0000 | (m & 1) * 0xFF << 16 | (m >> 1 & 1) * 0xFF << 8 | (m >> 2 & 1) * 0xFF;
     for (d, &p) in screen.iter_mut().zip(back.iter()) {
@@ -6177,7 +6203,7 @@ static mut RECV_STACK: [u8; 32768] = [0; 32768];
 
 /// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved, full screen's new state, the glass's columns): the receive thread waits for them. An op left out is answered 0 at once and its reply dropped (2026-11-08: op 43's state and op 53's columns never reached the map and the keyboard).
 fn op_is_sync(op: u8) -> bool {
-    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 43 | 45 | 53)
+    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 43 | 45 | 53 | 59 | 60 | 61)
 }
 
 extern "C" fn receive(grants: u64) -> ! {
@@ -6245,18 +6271,28 @@ extern "C" fn receive(grants: u64) -> ! {
             ferros_sys::reply(&tok, &[code]);
             continue;
         }
+        // 62 `events [base u64][seen u32]`: the caller's window's events after `seen`, held until there is one (events.rs; a doorbell, never a poll). Answered here or later by whoever posts the event; a base that names no surface, [3] at once.
+        if op == 62 && n >= 13 {
+            match surface_of(u64::from_le_bytes(msg[1..9].try_into().unwrap())) {
+                Some(k) => events::watch(k, live_gen(k), u32::from_le_bytes(msg[9..13].try_into().unwrap()), &tok),
+                None => {
+                    ferros_sys::reply(&tok, &[3]);
+                }
+            }
+            continue;
+        }
         // 58 `hit view [what u8: 0 off, 1 on, 2 toggle, 3 ask]` → [0][on u8]: the hit map in the fourth temporal phase (hit.rs; development builds only, status 1 on a release build). Answered here, at once.
         if op == 58 && n >= 2 {
             ferros_sys::reply(&tok, &hit::view_op(msg[1]));
             continue;
         }
-        // 59 `channels [what u8: bits 0-2 red, green, blue on; G#80 ask]` → [0][mask u8]: the panel's channels (`channels_op`; development builds only, status 1 on a release build). Answered here, at once.
-        if op == 59 && n >= 2 {
+        // 63 `channels [what u8: bits 0-2 red, green, blue on; G#80 ask]` → [0][mask u8]: the panel's channels (`channels_op`; development builds only, status 1 on a release build). Answered here, at once.
+        if op == 63 && n >= 2 {
             ferros_sys::reply(&tok, &channels_op(msg[1]));
             continue;
         }
-        // 60 `look [what u8: 0 ask, 1 release]` → [0][release u8]: the release look until the display starts again (`look_op`; development builds only, status 1 on a release build). Answered here, at once.
-        if op == 60 && n >= 2 {
+        // 64 `look [what u8: 0 ask, 1 release]` → [0][release u8]: the release look until the display starts again (`look_op`; development builds only, status 1 on a release build). Answered here, at once.
+        if op == 64 && n >= 2 {
             ferros_sys::reply(&tok, &look_op(msg[1]));
             continue;
         }
@@ -7704,6 +7740,15 @@ fn server(grants: u64) -> ! {
                     let base = u64::from_le_bytes(m[9..17].try_into().unwrap());
                     // The surface's live generation read once: read twice (once to refuse a dead surface, once to keep), a process ending between the two reads left a window kept under generation 0, which no later byte ever differed from, so it stayed in front for good. 0, its owner gone (a show queued before it ended): refused.
                     match surface_of(base).map(|sk| (sk, live_gen(sk))) {
+                        // A window behind (op 60): its place and format kept for when it comes to the front, nothing published (the glass is another's), not raised by its own show.
+                        Some((sk, generation)) if generation != 0 && unsafe { WINS[sk] }.is_some_and(|w| w.back && w.generation == generation) => unsafe {
+                            if let Some(w) = (*(&raw mut WINS))[sk].as_mut() {
+                                w.rect = rect;
+                                w.level = m[17];
+                                w.format = if m.len() > 18 { m[18] } else { 0 };
+                                w.mode = if m.len() > 27 { m[27] } else { 0 };
+                            }
+                        },
                         Some((sk, generation)) if ten && unsafe { TEMPORAL } && generation != 0 => {
                             let full = draw::Rect::full(width, height);
                             // What changed (ferros_sys `show_changed`: [x u16][y u16][w u16][h u16] after the format byte): only that part is published and owed by the other phases — when the window is already up as it was (same generation, place and level) and the screen composed. Otherwise, and for a plain show, the whole screen.
@@ -7715,9 +7760,15 @@ fn server(grants: u64) -> ! {
                             unsafe {
                                 if !same || m.len() < 27 {
                                     RAISES += 1;
-                                    WINS[sk] = Some(Win { generation, level: m[17], order: RAISES, rect, format: if m.len() > 18 { m[18] } else { 0 }, mode });
+                                    // Its full screen kept across shows (op 43), a new owner's window starting without.
+                                    let full_was = WINS[sk].is_some_and(|w| w.generation == generation && w.full);
+                                    WINS[sk] = Some(Win { generation, level: m[17], order: RAISES, rect, format: if m.len() > 18 { m[18] } else { 0 }, mode, back: false, full: full_was });
                                     layout_build(width, height);
                                     wins_mirror();
+                                    // A new window in front may be full screen, or the one it covers was: the circle and the bars follow, every phase owing the whole screen (`changed` is already all of it).
+                                    if full_follow() {
+                                        clean_reset_all();
+                                    }
                                 }
                                 if OP22_US[4] == 0 {
                                     OP22_US[0] = t_chrome - t22;
@@ -7841,16 +7892,86 @@ fn server(grants: u64) -> ! {
                     }
                 }
                 Some(43) => {
-                    // Full screen on or off (`FULL`; the map sends it when a touch from the home circle is let go at the screen's centre): every phase republished, the bars and the circle gone or back. Replies the new state.
-                    unsafe {
-                        FULL = !FULL;
-                        PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
-                        clean_reset_all();
-                        out[1] = FULL as u8;
+                    // Full screen on or off for the app window in front (`Win::full`, `FULL`; the quick row's circle since 2026-11-11, owner: full screen "moves to a quick-row circle", where the home swipe toggled it for the whole screen until then): every phase republished, the bars and the circle gone or back. Replies the new state; status 3 and the state unchanged with no app in front (the home screen always has its bars).
+                    match front_app() {
+                        Some(k) => unsafe {
+                            if let Some(w) = (*(&raw mut WINS))[k].as_mut() {
+                                w.full = !w.full;
+                            }
+                            full_follow();
+                            PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
+                            clean_reset_all();
+                        },
+                        None => out[0] = 3,
                     }
                     // The state is the reply's second byte (2026-11-08: replied with one, the map logged "full screen off" for every toggle).
+                    out[1] = unsafe { FULL } as u8;
                     len = 2;
                     last_interaction = 0;
+                }
+                Some(59) if m.len() >= 3 => {
+                    // Front (WINDOWS.md "The helm"): [surface u8][generation u8] → [0], or [3] with no such window: the window shown on that surface under that generation to the front of its level, out from behind if it was (a running kist's circle tapped, back's swipe flipping to it), and told so (`EV_FRONT`). Every phase owes the whole screen; the next is published now, as a show's.
+                    let sk = m[1] as usize;
+                    let found = sk < SURFACES && unsafe { WINS[sk] }.is_some_and(|w| w.generation == m[2] && live_gen(sk) == m[2]);
+                    if found {
+                        unsafe {
+                            RAISES += 1;
+                            if let Some(w) = (*(&raw mut WINS))[sk].as_mut() {
+                                w.back = false;
+                                w.order = RAISES;
+                            }
+                        }
+                        windows_changed(width, height);
+                        events::post(sk, m[2], (ferros_sys::window::EV_FRONT as u16) << 8);
+                        last_interaction = now();
+                        if ten && unsafe { TEMPORAL } {
+                            pipe.settle(&mut armed, true);
+                            let k = unsafe { (CUR_PHASE + 1) % PHASES };
+                            publish_app(unsafe { PHASE_DIRTY[k] }, &tabs, k, width, height, true);
+                            unsafe {
+                                PHASE_DIRTY[k] = draw::Rect::EMPTY;
+                                CUR_PHASE = k;
+                            }
+                            ferros_sys::dma_barrier();
+                            pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
+                            armed = Some(pipe.arm(win));
+                            frames += 1;
+                            FRAMES.store(frames, Ordering::Relaxed);
+                        }
+                    } else {
+                        out[0] = 3;
+                    }
+                }
+                Some(60) => {
+                    // Behind (WINDOWS.md "The helm"; owner, 2026-11-11: "Home backgrounds the kist ... it doesn't die but it stops rendering everything and stops playing anything except for notifications"): the app window in front leaves the glass and stays in the table, its process alive, told so (`EV_BEHIND`). → [0][surface][generation], or [3] with no app window in front. With none left on the glass the map has it again: its next frame repaints everything (`windows_changed`).
+                    match front_app() {
+                        Some(sk) => {
+                            let g = unsafe { (*(&raw mut WINS))[sk].as_mut() }.map_or(0, |w| {
+                                w.back = true;
+                                w.generation
+                            });
+                            windows_changed(width, height);
+                            events::post(sk, g, (ferros_sys::window::EV_BEHIND as u16) << 8);
+                            out[1] = sk as u8;
+                            out[2] = g;
+                            len = 3;
+                            last_interaction = now();
+                        }
+                        None => out[0] = 3,
+                    }
+                }
+                Some(61) if m.len() >= 2 => {
+                    // A key (WINDOWS.md "The helm"; owner, 2026-11-11: "back should signal escape to the app and go up one page"): [usage u8], by its USB HID usage, to the app window in front (`EV_KEY`). → [0][surface][generation], or [3] with no app window in front.
+                    match front_app() {
+                        Some(sk) => {
+                            let g = unsafe { WINS[sk] }.map_or(0, |w| w.generation);
+                            events::post(sk, g, (ferros_sys::window::EV_KEY as u16) << 8 | m[1] as u16);
+                            out[1] = sk as u8;
+                            out[2] = g;
+                            len = 3;
+                        }
+                        None => out[0] = 3,
+                    }
                 }
                 Some(17) if m.len() >= 12 => {
                     unsafe {
@@ -8303,9 +8424,14 @@ fn server(grants: u64) -> ! {
                 BAR_SPAN = BAR_SPAN_BACK;
                 BAR_W_BACK = w;
                 BAR_SPAN_BACK = s;
-                let r = CON_RECT;
+                let mut r = CON_RECT;
                 // Whether the bars now on the screen hold any of the quick row (a screencap it asked for waits until they hold none).
+                let was_empty = quick::EMPTY_FRONT;
                 quick::EMPTY_FRONT = quick::EMPTY_BACK.load(Ordering::Acquire);
+                // Full screen: the console's rows come and go with the row (`bar_line`), so all of them are published as it does.
+                if FULL && was_empty != quick::EMPTY_FRONT {
+                    r[0] = r[0].union(draw::Rect { x0: 0, y0: 0, x1: width as i32, y1: BAR_TOP as i32 });
+                }
                 // The hit map's share of the bars with them; the whole map again when the row came or went (everything inside the app's circle changed hands).
                 hit::bars_swap(width, height);
                 CON_READY.store(0, Ordering::Release);

@@ -227,6 +227,8 @@ messages! {
     DoNotDisturb,
     /// A capture of the screen.
     Screencap,
+    /// The app in front to the glass's edge, no circle and no bars (the quick row's middle circle).
+    FullScreen,
 
     // ---- the battery's page (the console's battery circle; its title is `Battery`) ----
     /// The state of charge.

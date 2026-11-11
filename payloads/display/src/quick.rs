@@ -1,6 +1,6 @@
 //! The quick row (docs/QUICK.md; owner, 2026-11-11: "gesture ideas, would be nice to have the torch, brightness and maybe a few other things", and on the proposal "Works"; then "any tap in that area or drag down should bring up said second row of consoleness, however we want to do that, some circle fitting goodness I suspect").
 //!
-//! - **Where.** Six circles inside the app's circle, under the camera, below the top row of console circles that sit outside it: each tangent to the app's circle from inside, to a horizontal floor from above and to its neighbours, the outer pair to the glass's left and right edges, the floor as low as that takes (owner, 2026-11-11, on the Pro: "Let's make the circles always touch the left/right sides so move the bottom horizontal guide down until they scale up and touch"). The fit `corner_layout` makes in the corners, turned inside out (`layout`). Until then the floor was the console's last row and the row stopped short of the sides.
+//! - **Where.** Seven circles inside the app's circle (six until 2026-11-11, when full screen came in from the home swipe as the middle one), under the camera, below the top row of console circles that sit outside it: each tangent to the app's circle from inside, to a horizontal floor from above and to its neighbours, the outer pair to the glass's left and right edges, the floor as low as that takes (owner, 2026-11-11, on the Pro: "Let's make the circles always touch the left/right sides so move the bottom horizontal guide down until they scale up and touch"). The fit `corner_layout` makes in the corners, turned inside out (`layout`). Until then the floor was the console's last row and the row stopped short of the sides.
 //! - **Collisions, by construction.** The console's corner circles are outside the app's circle and these inside it, both tangent to it, so they never overlap (their drawn rims, two and a half pixels, can meet, and the console's region redraw composes both). The camera hole is above the app's circle; the middle pair clear it by 56 pixels on husky, 41 on akita.
 //! - **How it opens: a slide** (owner, 2026-11-11: "track the finger down from top tho and slide it in so it doesn't need a re-render, just a move and composite, then do the iterate/2 each frame, like we do for the settings page until it snaps in or out of place"). The map owns the finger and the stepping and sends the row's offset (op 56): 0 hidden, `SLIDE` open, whole pixels. The row is drawn once at its size into its own sprites; a frame of the slide is the sprites composed under the console's circles at the offset, clipped to the app's circle so the row comes out from behind its top. The grow-and-fan animation of the first cut (C∞ in the pull) is gone: the owner waived it ("Simply appearing and disappearing is fine too. no need for a scale in/out animation").
 //! - **What draws it.** The console's worker: each circle into its sprite only when its look changes (`update`, `render`), and the composite into the bars' decoded rows (`compose`, from `bar_decode`).
@@ -9,18 +9,21 @@
 use super::*;
 use core::sync::atomic::AtomicBool;
 
-/// The row's circles, left to right: the outer pair the smallest (the room under the arc thins toward the sides), the middle pair the two rings (owner: "brightness as a ring you turn around a circle", "torch (tap on/off, ring for intensity)").
+/// The row's circles, left to right: the outer pair the smallest (the room under the arc thins toward the sides), the two rings either side of the middle (owner: "brightness as a ring you turn around a circle", "torch (tap on/off, ring for intensity)"), and full screen the middle one, the largest (owner, 2026-11-11: full screen moves from the home swipe "to a quick-row circle"; it switches the app in front, dimmed when there is none).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Item {
     RadiosOff,
     Sound,
     Brightness,
+    FullScreen,
     Torch,
     Dnd,
     Screencap,
 }
-pub const N: usize = 6;
-pub const ITEMS: [Item; N] = [Item::RadiosOff, Item::Sound, Item::Brightness, Item::Torch, Item::Dnd, Item::Screencap];
+pub const N: usize = 7;
+pub const ITEMS: [Item; N] = [Item::RadiosOff, Item::Sound, Item::Brightness, Item::FullScreen, Item::Torch, Item::Dnd, Item::Screencap];
+/// Each side's chain, out from the middle circle.
+const SIDE: usize = N / 2;
 
 /// The row at rest, open: (x, y, r) a circle, left to right, solved once per screen size.
 static mut LAYOUT: [(f32, f32, f32); N] = [(0., 0., 0.); N];
@@ -31,8 +34,16 @@ const STEPS: u32 = 1 << 4;
 /// The chain's own roots (`chain`) bisect brackets of at most half the width, to under a millionth of a pixel.
 const FINE: u32 = 1 << 5;
 
-/// One side's chain under a floor (owner, 2026-11-11: "move the bottom horizontal guide down until they scale up and touch"): three circles from the split line x = `m` outward (`dir` +1 right, −1 left), each tangent to the app's circle from inside (`inner`, its rim taken off as the corners take it) and to the floor `floor` from above, the first also to the split line (its twin on the other side touches it there), each next to the one before. A circle's centre is on the lens's middle line, where the arc's room and the floor's are equal (`medial`), and the chain steps out along it.
-fn chain(app: (f32, f32, f32), floor: f32, m: f32, dir: f32, reach: f32) -> [(f32, f32, f32); N / 2] {
+/// The middle circle under a floor, centred on the split line x = `m`: tangent to the app's circle from inside (its rim taken off) and to the floor from above, on the lens's middle line as every circle of the row (`chain`).
+fn middle(app: (f32, f32, f32), floor: f32, m: f32) -> (f32, f32, f32) {
+    let (cx, cy, rr) = app;
+    let (dx, cyd, k) = ((m - cx) as f64, cy as f64, (rr - CIRCLE_RIM - floor) as f64);
+    let y = ((dx * dx + cyd * cyd - k * k) / (2. * (cyd + k))) as f32;
+    (m, y, floor - y)
+}
+
+/// One side's chain under a floor (owner, 2026-11-11: "move the bottom horizontal guide down until they scale up and touch"): three circles out from the middle circle `mid` (`dir` +1 right, −1 left), each tangent to the app's circle from inside (`inner`, its rim taken off as the corners take it) and to the floor `floor` from above, the first also to the middle circle (its twin on the other side touches it too), each next to the one before. A circle's centre is on the lens's middle line, where the arc's room and the floor's are equal (`medial`), and the chain steps out along it. Until the seventh circle (2026-11-11) the first touched the split line itself.
+fn chain(app: (f32, f32, f32), floor: f32, mid: (f32, f32, f32), dir: f32) -> [(f32, f32, f32); SIDE] {
     let (cx, cy, rr) = app;
     let inner = |x: f32, y: f32| rr - CIRCLE_RIM - libm::sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy));
     let clear = |x: f32, y: f32| {
@@ -44,15 +55,13 @@ fn chain(app: (f32, f32, f32), floor: f32, m: f32, dir: f32, reach: f32) -> [(f3
         let (dx, cy, k) = ((s - cx) as f64, cy as f64, (rr - CIRCLE_RIM - floor) as f64);
         (s, ((dx * dx + cy * cy - k * k) / (2. * (cy + k))) as f32)
     };
-    let mut out = [(0f32, 0f32, 0f32); N / 2];
-    let u = root(&|u: f32| { let (x, y) = medial(m + dir * u); u - clear(x, y) }, 0., reach, FINE);
-    let (x, y) = medial(m + dir * u);
-    out[0] = (x, y, clear(x, y));
-    for k in 1..N / 2 {
-        let p = out[k - 1];
+    let mut out = [(0f32, 0f32, 0f32); SIDE];
+    let mut p = mid;
+    for c in out.iter_mut() {
         let u = root(&|u: f32| { let (x, y) = medial(p.0 + dir * u); libm::sqrtf((x - p.0) * (x - p.0) + (y - p.1) * (y - p.1)) - p.2 - clear(x, y) }, 0., (1 << 2) as f32 * p.2, FINE);
         let (x, y) = medial(p.0 + dir * u);
-        out[k] = (x, y, clear(x, y));
+        *c = (x, y, clear(x, y));
+        p = *c;
     }
     out
 }
@@ -67,9 +76,9 @@ fn root(g: &dyn Fn(f32) -> f32, mut lo: f32, mut hi: f32, steps: u32) -> f32 {
 }
 
 /// The row's circles at rest, open (`LAYOUT`), solved (owner, 2026-11-11, on the Pro: "Let's make the circles always touch the left/right sides so move the bottom horizontal guide down until they scale up and touch"):
-/// - Each side is a chain under the floor (`chain`): tangent to the app's arc from inside, to the floor, to its neighbour.
+/// - The middle circle (full screen) is centred on the split, tangent to the arc and the floor (`middle`); each side is a chain out from it under the floor (`chain`): tangent to the app's arc from inside, to the floor, to its neighbour. Centred under the camera, the middle circle's top meets the app circle's top, where the camera hole touches the circle from outside; the compose clips the row to the app's circle (`compose`), so none of its rim reaches the hole.
 /// - The outer pair are tangent to the glass's own left and right edges, exactly as `corner_layout` measures the glass (`GlassOutline`, its hairline and the circle's rim taken off): the corners are rounded and not alike (the big one top left), so the walls are not mirror images.
-/// - Two unknowns, two equations, solved by bisection, never stepped on a timer: for a floor, the split between the middle pair moves until both outer circles are as near their walls (moving it right brings the right wall nearer and takes the left away); then the floor moves down until that nearness is nought (a lower floor grows every circle, so the chain reaches further out). On husky the split lands a pixel right of centre, on akita six (its fat corner is rounder).
+/// - Two unknowns, two equations, solved by bisection, never stepped on a timer: for a floor, the split (the middle circle's centre) moves until both outer circles are as near their walls (moving it right brings the right wall nearer and takes the left away); then the floor moves down until that nearness is nought (a lower floor grows every circle, so the chain reaches further out). On husky the split lands a pixel right of centre, on akita six (its fat corner is rounder).
 /// - Lower floor, bigger circles: on husky the middle pair reach row 413, past the console's old last row (288): the console's rows reach the row's floor since 2026-11-11 (`rows`).
 pub fn layout(width: usize, height: usize) -> [(f32, f32, f32); N] {
     unsafe {
@@ -84,7 +93,10 @@ pub fn layout(width: usize, height: usize) -> [(f32, f32, f32); N] {
     // A circle's room to the glass, as the corners have it (`corner_layout`'s `glass`).
     let wall = |c: (f32, f32, f32)| outline.dist(c.0, c.1) - EDGE_HAIRLINE - CIRCLE_RIM - c.2;
     let reach = w * 0.5;
-    let ends = |floor: f32, m: f32| (wall(chain(app, floor, m, -1., reach)[N / 2 - 1]), wall(chain(app, floor, m, 1., reach)[N / 2 - 1]));
+    let ends = |floor: f32, m: f32| {
+        let mid = middle(app, floor, m);
+        (wall(chain(app, floor, mid, -1.)[SIDE - 1]), wall(chain(app, floor, mid, 1.)[SIDE - 1]))
+    };
     // For a floor: the split where both outer circles are as near their walls, and how near.
     let split = |floor: f32| -> (f32, f32) {
         let m = root(&|m: f32| { let (l, r) = ends(floor, m); l - r }, cx - w * 0.125, cx + w * 0.125, STEPS);
@@ -94,11 +106,13 @@ pub fn layout(width: usize, height: usize) -> [(f32, f32, f32); N] {
     let top = app.1 - app.2;
     let floor = root(&|f: f32| -split(f).1, top + w * (1. / (1 << 5) as f32), top + reach, STEPS);
     let m = split(floor).0;
-    let (left, right) = (chain(app, floor, m, -1., reach), chain(app, floor, m, 1., reach));
+    let mid = middle(app, floor, m);
+    let (left, right) = (chain(app, floor, mid, -1.), chain(app, floor, mid, 1.));
     let mut out = [(0f32, 0f32, 0f32); N];
-    for k in 0..N / 2 {
-        out[N / 2 + k] = right[k];
-        out[N / 2 - 1 - k] = left[k];
+    out[SIDE] = mid;
+    for k in 0..SIDE {
+        out[SIDE + 1 + k] = right[k];
+        out[SIDE - 1 - k] = left[k];
     }
     // The solved row, once per size, to the console: (x, y, r) in pixels, the floor, and the time the solve took.
     let mut l = Log { grants: unsafe { PANIC_GRANTS }, buf: [0; 256], n: 0 };
@@ -218,7 +232,7 @@ struct Sprite {
 }
 
 static mut SPRITES: [Option<Sprite>; N] = [const { None }; N];
-/// The rows the six sprites cover at rest, open, [top, bottom): the band the slide moves.
+/// The rows the seven sprites cover at rest, open, [top, bottom): the band the slide moves.
 static mut BAND: (i64, i64) = (0, 0);
 /// The offset the bars were last composed at.
 static mut COMPOSED: i64 = -1;
@@ -268,7 +282,7 @@ const OFF_GREY: f32 = 3200.;
 const LIVE_INK: f32 = 11000.;
 const LIGHT_INK: f32 = 7000.;
 
-/// A quick circle's look now: its grey (lit while what it switches is on; a stop darker for vibrate; the off grey; a stop under that for a torch that does not answer; the live ink's light under a finger), whether it is on (its ink), its ring's lit share (brightness by preference 3, 0 the brightest; the torch by its level; while a finger turns one, the share the map sent), and as one key with its word's language and the sound mode.
+/// A quick circle's look now: its grey (lit while what it switches is on; a stop darker for vibrate; the off grey; a stop under that for a torch that does not answer, and for full screen with no app in front; the live ink's light under a finger), whether it is on (its ink), its ring's lit share (brightness by preference 3, 0 the brightest; the torch by its level; while a finger turns one, the share the map sent), and as one key with its word's language and the sound mode.
 fn look(k: usize, s: &Now) -> (f32, bool, Option<f32>, u64) {
     let stop = core::f32::consts::FRAC_1_SQRT_2;
     let off = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF);
@@ -288,6 +302,12 @@ fn look(k: usize, s: &Now) -> (f32, bool, Option<f32>, u64) {
         },
         Item::Dnd => if ferros_sys::dnd::on() { (true, LIT_GREY) } else { (false, OFF_GREY) },
         Item::Screencap => (false, OFF_GREY),
+        // Lit while the app in front is full screen (`FULL`); dimmed with no app in front, where it switches nothing.
+        Item::FullScreen => match (app_live(), unsafe { FULL }) {
+            (false, _) => (false, OFF_GREY * stop),
+            (true, true) => (true, LIT_GREY),
+            (true, false) => (false, OFF_GREY),
+        },
     };
     let grey = if s.held == Some(k) { LIVE_INK } else { grey };
     let ring = match ITEMS[k] {
@@ -497,6 +517,7 @@ pub fn word(k: usize, x: f32, y: f32, r: f32, ink: u64, console: &mut [u64], at:
         },
         Item::Dnd => Msg::DoNotDisturb,
         Item::Screencap => Msg::Screencap,
+        Item::FullScreen => Msg::FullScreen,
     };
     let text = ferros_lang::t(m);
     // At most four lines: every language's words for these are three words or fewer.

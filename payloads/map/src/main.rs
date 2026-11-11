@@ -678,6 +678,9 @@ struct Cam {
 }
 /// The zoom's one fixed point: on release the world is rescaled so the camera's zoom is exactly this (one world unit = one pixel) and every position and radius absorbs the factor — the integers never walk toward an extreme (owner, 2026-10-23: "rescale upon release so we never accidentally hit infinities"). The limits are all relative (`Map::zoom_limits`, `Map::radius_limits`).
 const Z_ONE: i64 = 1 << 16;
+/// The home swipe's turn search (`Map::home_turned`): turns sampled across a half turn, then golden-section steps between the best one's neighbours (each step keeps 0.618 of the bracket: 2⁵ steps take the two samples either side of the best, under six degrees, to about a millionth of one).
+const TURN_SAMPLES: usize = 1 << 6;
+const TURN_REFINE: usize = 1 << 5;
 /// The circles together may not shrink below this fraction of the screen's area (1/256), nor the smallest circle grow past the screen; the largest and smallest circle may not differ by more than this in area (256×: 16× in radius).
 const AREA_FRACTION: i64 = 256;
 const RADIUS_RATIO: i64 = 16;
@@ -725,9 +728,9 @@ enum Choice {
     Dither,
     /// The display's hit map in every fourth frame (Developer; display op 58).
     HitMap,
-    /// One of the panel's channels on or off (Developer; display op 59): 0 red, 1 green, 2 blue.
+    /// One of the panel's channels on or off (Developer; display op 63): 0 red, 1 green, 2 blue.
     Channel(u8),
-    /// The release look until a reboot (Developer; display op 60).
+    /// The release look until a reboot (Developer; display op 64).
     ReleaseLook,
     /// One of the theme swatches.
     Theme(u8),
@@ -802,7 +805,7 @@ const PAGES: [&str; 20] = ["appearance", "units", "keyboard", "security", "kists
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Whether it starts looking like one (the orange hairlines, as the display's): FERROS_RELEASE_LOOK set gives a development build the release look for screen captures (owner, 2026-11-10), its tools kept.
 const DEV_LOOK: bool = DEV && option_env!("FERROS_RELEASE_LOOK").is_none();
-/// The development look as it stands, the display's (its op 60): off for good once the Developer page's "release look" is tapped, until a reboot (owner, 2026-11-11: "upon tap in UI it goes black and stays until a reboot"); a map started again asks the display.
+/// The development look as it stands, the display's (its op 64): off for good once the Developer page's "release look" is tapped, until a reboot (owner, 2026-11-11: "upon tap in UI it goes black and stays until a reboot"); a map started again asks the display.
 static LOOK: AtomicBool = AtomicBool::new(DEV_LOOK);
 /// Taps in a row on About's version line that make Developer a page (owner, 2026-11-05: "twelve"), and the tap from which the hint shows and counts down ("don't show a toast hint until four taps"). No time window: any other tap starts the count again.
 const DEV_TAPS: u8 = 12;
@@ -1202,7 +1205,7 @@ struct Map {
     dev: bool,
     /// Whether the display shows its hit map in every fourth frame (display op 58; development builds): the Developer page's checkbox and the two-finger swipe up from back and home together switch it, and the display's answer is kept here.
     hit_view: bool,
-    /// The panel's channels as the display has them (display op 59; development builds): bit 0 red, 1 green, 2 blue, set = on; the Developer page's three checkboxes.
+    /// The panel's channels as the display has them (display op 63; development builds): bit 0 red, 1 green, 2 blue, set = on; the Developer page's three checkboxes.
     channels: u8,
     /// The Fleet page as the identity service last answered: its state (payloads/fgtw: 0 no identity, 1 joining, 2 bound waiting for the key, 3 a member with the key, 4-7 looking up, 8 leaving), the approval words while leaving, the members (their device names, or key prefixes where there is none; which one is this device), and the remove row armed by its first tap.
     fleet: Fleet,
@@ -1234,8 +1237,12 @@ struct Map {
     rsn: [i64; MAX],
     /// Circles moved or sized by hand since arranging began, to keep when it ends.
     arranged: [bool; MAX],
-    /// An app is in front (one the map did not start: a bridge spawn), and it has the touches.
+    /// An app is in front (a kist, or one the map did not start: a bridge spawn), and it has the touches.
     app_front: bool,
+    /// The kists brought to the front, most recent first, by capsule (owner, 2026-11-11: back's swipe "flip to the previous kist"): a kist launched or raised goes to the head; each once.
+    recent: alloc::vec::Vec<[u8; 32]>,
+    /// The kist this map brought to the front last, while it is still in front (None once the map has the glass again).
+    front_kist: Option<[u8; 32]>,
     /// How many circles there are: settings, then a kist circle for each kist in the person's list (at most `MAX`).
     n: usize,
     /// The person's kists and their answers (`kists.list`, ferros_kist), as last read: kist circle i is `kists.kists[i - 1]`.
@@ -1678,18 +1685,74 @@ impl Map {
         let mut m = [0u8; 33];
         m[0] = ferros_kist::launch::OP_LAUNCH;
         m[1..].copy_from_slice(&k.capsule);
-        let mut r = [ferros_kist::launch::REFUSED; 1];
+        let mut r = [ferros_kist::launch::REFUSED, 0, 0, 0];
         // The bell as it stands before the ask: the kernel's job may fail before init's answer is back here.
         let bell = KISTS_WORD.load(core::sync::atomic::Ordering::Acquire);
-        call(cap(self.grants, S_LAUNCH), &m, &mut r);
+        let n = call(cap(self.grants, S_LAUNCH), &m, &mut r);
+        // Running on a surface (init's RUNNING with the surface and its generation): its window to the front instead of a second copy (owner, 2026-11-11: a running kist's circle tapped "brings it to the front").
+        let raised = r[0] == ferros_kist::launch::RUNNING && n == 3 && ferros_sys::window::front(self.display, r[1], r[2]);
         let mut l = Line::new();
-        let _ = write!(l, "map: launch {}: {}\n", k.name, match r[0] { 0 => "starting", 1 => "running", 2 => "asking first", 3 => "not installed", 5 => "the list is not readable", _ => "refused" });
+        let _ = write!(l, "map: launch {}: {}\n", k.name, match r[0] { 0 => "starting", 1 if raised => "running, brought to the front", 1 => "running", 2 => "asking first", 3 => "not installed", 5 => "the list is not readable", _ => "refused" });
         console(self.grants, l.as_str().as_bytes());
+        let capsule = k.capsule;
         if r[0] == ferros_kist::launch::STARTED {
-            self.asked = Some((k.capsule, bell));
+            self.asked = Some((capsule, bell));
             self.fault = None;
         }
+        // Started or running, it is the kist in front (or about to be, once its window shows): the head of the recent kists.
+        if r[0] == ferros_kist::launch::STARTED || r[0] == ferros_kist::launch::RUNNING {
+            self.recent.retain(|c| *c != capsule);
+            self.recent.insert(0, capsule);
+            self.front_kist = Some(capsule);
+        }
+        if raised {
+            self.app_front = true;
+        }
         r[0]
+    }
+
+    /// The kist circle holding `capsule`, if it is still installed.
+    fn circle_of(&self, capsule: &[u8; 32]) -> Option<usize> {
+        (1..self.n).find(|&i| self.kist(i).is_some_and(|k| k.capsule == *capsule))
+    }
+
+    /// Home (WINDOWS.md "The helm"; owner, 2026-11-11: "Home backgrounds the kist so depending on how it was designed, like Photon, it doesn't die but it stops rendering everything and stops playing anything except for notifications"): the app in front behind (display op 60, the app told so); the map is on the glass as it was left once it draws (`draw`, or the caller's own frame). Whether an app went behind.
+    fn send_behind(&mut self, draw: bool) -> bool {
+        let Some((k, g)) = ferros_sys::window::behind(self.display) else { return false };
+        let mut l = Line::new();
+        let _ = write!(l, "map: home: the window on surface {k} (generation {g}) behind\n");
+        console(self.grants, l.as_str().as_bytes());
+        self.app_front = false;
+        self.front_kist = None;
+        if draw {
+            self.draw();
+        }
+        true
+    }
+
+    /// Back's swipe (owner, 2026-11-11: "flip to the previous kist (this one to the background)"): the kist before the one in front, or with the map on the glass the last kist in front, launched as a tap on its circle would (init's RUNNING brings its window to the front; one that ended since starts again). The one in front goes behind first. A kist uninstalled since is passed over.
+    fn flip(&mut self) -> &'static str {
+        let skip = if self.app_front { self.front_kist } else { None };
+        loop {
+            let Some(c) = self.recent.iter().copied().find(|c| Some(*c) != skip) else { return "map: back: no other kist to flip to" };
+            let Some(i) = self.circle_of(&c) else {
+                self.recent.retain(|x| *x != c);
+                continue;
+            };
+            // The one in front behind first, the map not drawn: the next window is raised in the same breath, so the glass goes from one kist to the other. Not raised (starting again, or refused), the map draws until the kist's window shows.
+            if self.app_front {
+                self.send_behind(false);
+            }
+            let said = match self.launch(i) {
+                ferros_kist::launch::RUNNING => "map: back: flipped to the kist before",
+                ferros_kist::launch::STARTED => "map: back: the kist before starting again",
+                _ => "map: back: the kist before could not come to the front",
+            };
+            if !self.app_front {
+                self.draw();
+            }
+            return said;
+        }
     }
 
     /// The kists' bell rang (KISTS_WORD): the records the kernel keeps (ferros_sys::not_started) read, each one newer than the last taken (`kists_read`) taken once. The launch asked last (`asked`), rung after the ask, whether it did not start or started and then stopped: kept for its circle (`fault`) and shown once the plane is at rest (`show_fault`), the person having just tapped it or being in it. Any other kist that stopped abnormally (a fault, a panic, a kill from outside): said as its circle is next tapped, once (`stopped`). A start that failed for a launch this map did not ask (a relaunch) says nothing here. A stop the kernel no longer keeps (that kist started again since) is dropped unsaid.
@@ -2202,7 +2265,57 @@ impl Map {
 
     /// The camera that shows every circle with air around them, never closer than one world unit to a pixel: every circle inside the screen's width and the big circle (`active_circle`) together, so none lands past an edge or under the console in a top corner (owner, 2026-11-08: "the fit doesn't fit to screen extents anded with the big circle"). The turn is kept; the circles' bounds are taken as the screen will turn them, their middle put on the big circle's centre, and the zoom is the largest at which each circle passes both tests, with no margin.
     fn home(&self) -> Cam {
-        let (c, s, one) = (self.cam.c as f64, self.cam.s as f64, ONE as f64);
+        self.home_at(self.cam.c, self.cam.s).0
+    }
+
+    /// The home swipe's camera (owner, 2026-11-11: home's swipe flies out "to fit every circle" and "let's rotate it to find the most zoom we can too so it spins into place"): every circle in view as `home` fits them, at the turn that lets them be largest. The fit's zoom is a function of the turn with period a half turn (turning by π mirrors the circles through the fit's middle, which fits alike), continuous and piecewise smooth (the fit is the least of each circle's two room ratios). A bounded search, no timer: `TURN_SAMPLES` turns across the half turn centred on the camera's own (so the answer is the nearer of each pair a half turn apart, and the flight spins the short way), then golden-section steps inside the best sample's neighbours. Where the zoom limit caps every turn alike (a few small circles), the camera keeps its own turn: nothing to gain by spinning.
+    fn home_turned(&self) -> Cam {
+        let a0 = libm::atan2(self.cam.s as f64, self.cam.c as f64);
+        let half = core::f64::consts::PI;
+        let turn = |a: f64| (libm::round(libm::cos(a) * ONE as f64) as i64, libm::round(libm::sin(a) * ONE as f64) as i64);
+        let fit = |a: f64| { let (c, s) = turn(a); self.home_at(c, s).1 };
+        let step = half / TURN_SAMPLES as f64;
+        let (mut best, mut best_z) = (a0, fit(a0));
+        for j in 0..TURN_SAMPLES {
+            let a = a0 - half * 0.5 + step * (j as f64 + 0.5);
+            let z = fit(a);
+            if z > best_z {
+                (best, best_z) = (a, z);
+            }
+        }
+        // Golden-section search on [best − step, best + step]: the fit is unimodal at that scale (each sample is a 64th of a half turn, under three degrees).
+        let g = (libm::sqrt(5.) - 1.) * 0.5;
+        let (mut lo, mut hi) = (best - step, best + step);
+        let (mut p, mut q) = (hi - g * (hi - lo), lo + g * (hi - lo));
+        let (mut zp, mut zq) = (fit(p), fit(q));
+        for _ in 0..TURN_REFINE {
+            if zp < zq {
+                lo = p;
+                p = q;
+                zp = zq;
+                q = lo + g * (hi - lo);
+                zq = fit(q);
+            } else {
+                hi = q;
+                q = p;
+                zq = zp;
+                p = hi - g * (hi - lo);
+                zp = fit(p);
+            }
+        }
+        let (a, z) = if zp > zq { (p, zp) } else { (q, zq) };
+        let (best, best_z) = if z > best_z { (a, z) } else { (best, best_z) };
+        // The zoom limit: a turn that only gains past what the camera may reach gains nothing.
+        let (_, hi_z) = self.zoom_limits();
+        let here = fit(a0);
+        let (c, s) = if here >= hi_z as f64 || best_z <= here { (self.cam.c, self.cam.s) } else { turn(best) };
+        self.home_at(c, s).0
+    }
+
+    /// `home` at the turn (c, s), Q14: the camera, and the fit's own zoom before the zoom limits hold it (what the turn is chosen by).
+    fn home_at(&self, c: i64, s: i64) -> (Cam, f64) {
+        let (cc, ss) = (c, s);
+        let (c, s, one) = (c as f64, s as f64, ONE as f64);
         // A world offset (×256) turned as `Cam::screen` turns it.
         let turn = |x: f64, y: f64| ((c * x - s * y) / one, (s * x + c * y) / one);
         let (mut u0, mut v0, mut u1, mut v1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
@@ -2229,12 +2342,12 @@ impl Map {
             z = z.min(room * half_w / (du.abs() + r)).min(room * ar / (libm::sqrt(du * du + dv * dv) + r));
         }
         let (lo, hi) = self.zoom_limits();
-        let mut cam = Cam { x: wx as i64, y: wy as i64, z: (z as i64).clamp(lo, hi), c: self.cam.c, s: self.cam.s };
+        let mut cam = Cam { x: wx as i64, y: wy as i64, z: (z as i64).clamp(lo, hi), c: cc, s: ss };
         // The camera's centre is the panel's: it stands off the fit's middle by the big circle's offset from the panel's centre, as `at` does.
         let (dx, dy) = cam.delta(0, self.h / 2 - ay);
         cam.x += dx;
         cam.y += dy;
-        cam
+        (cam, z)
     }
 
     /// The camera that has arrived at circle i: the circle on the active circle (`arrived`), the circle an app lives in, however much larger than the screen that is (no zoom limit here: arriving, the map's own circle becomes the app's). The camera's centre is the panel's, so it stands off the circle's centre by the active circle's offset from the panel's centre, in world units at the arrived zoom.
@@ -3658,14 +3771,14 @@ impl Map {
                 if DEV {
                     let on = self.hit_view;
                     mark(self, b, &mut y, 50, tr(Msg::HitMap), on, Some(Choice::HitMap));
-                    // The panel's channels (owner, 2026-11-11: "a channel picker in debug that enables/disables red/green/blue of the panel output so I can look at channels"): a checkbox each, all on until a reboot unless changed here; an off channel is code 0 on every pixel the panel gets (display op 59).
+                    // The panel's channels (owner, 2026-11-11: "a channel picker in debug that enables/disables red/green/blue of the panel output so I can look at channels"): a checkbox each, all on until a reboot unless changed here; an off channel is code 0 on every pixel the panel gets (display op 63).
                     b.text(cx, y, note as u16, dim(), 1, tr(Msg::PanelChannels));
                     y += uu(2, 1);
                     for (c, name) in [Msg::ScopeRed, Msg::ScopeGreen, Msg::ScopeBlue].into_iter().enumerate() {
                         let on = self.channels >> c & 1 == 1;
                         mark(self, b, &mut y, 50, tr(name), on, Some(Choice::Channel(c as u8)));
                     }
-                    // The release look (owner, same day: "a good spot for the release look, we can have it always be off and show orange, upon tap in UI it goes black and stays until a reboot"): off in the development look, its box and its label in the development orange; one tap and the display (and this map's hairlines) take the release look until a reboot (display op 60), the box checked from then on and taking no more taps. Never stored.
+                    // The release look (owner, same day: "a good spot for the release look, we can have it always be off and show orange, upon tap in UI it goes black and stays until a reboot"): off in the development look, its box and its label in the development orange; one tap and the display (and this map's hairlines) take the release look until a reboot (display op 64), the box checked from then on and taking no more taps. Never stored.
                     if DEV_LOOK && LOOK.load(Ordering::Relaxed) {
                         let (sw, colours, _) = mark_look(uu(5, 4));
                         b.mark(50, cx, y - uu(1, 2), uu(5, 4), uu(1, 1), sw, 0, [DEV_ORANGE, colours[1], DEV_ORANGE, colours[3]], tr(Msg::ReleaseLook));
@@ -3949,18 +4062,18 @@ impl Map {
         }
     }
 
-    /// One of the panel's channels switched (display op 59; development builds), from the Developer page's checkboxes: `c` 0 red, 1 green, 2 blue; the display's answer kept for the checkboxes.
+    /// One of the panel's channels switched (display op 63; development builds), from the Developer page's checkboxes: `c` 0 red, 1 green, 2 blue; the display's answer kept for the checkboxes.
     fn channel_toggle(&mut self, c: u8) {
         let mut r = [0u8; 4];
-        if call(self.display, &[59, self.channels ^ 1 << c], &mut r) >= 2 && r[0] == 0 {
+        if call(self.display, &[63, self.channels ^ 1 << c], &mut r) >= 2 && r[0] == 0 {
             self.channels = r[1];
         }
     }
 
-    /// The release look until a reboot (display op 60; development builds), from the Developer page's row: one way, so the row stays checked and takes no more taps.
+    /// The release look until a reboot (display op 64; development builds), from the Developer page's row: one way, so the row stays checked and takes no more taps.
     fn release_look(&mut self) {
         let mut r = [0u8; 4];
-        if call(self.display, &[60, 1], &mut r) >= 2 && r[0] == 0 && r[1] == 1 {
+        if call(self.display, &[64, 1], &mut r) >= 2 && r[0] == 0 && r[1] == 1 {
             LOOK.store(false, Ordering::Relaxed);
             console(self.grants, b"map: the release look until a reboot\n");
         }
@@ -4013,21 +4126,45 @@ impl Map {
         "map: back: zoomed out to every circle"
     }
 
+    /// Home's swipe, after the app in front went behind: the plane flies out to every circle at the turn that fits them largest (`home_turned`), an open circle closing on the way as a tap outside it does.
+    fn home_fly(&mut self) {
+        if matches!(self.view, View::Open(_)) {
+            self.back = None;
+            self.leaving = true;
+        }
+        let to = self.home_turned();
+        self.fly(to);
+        self.draw();
+    }
+
+    /// A still tap on the helm (WINDOWS.md "The helm"; owner, 2026-11-11). Home (8): the app in front behind, the map as it was left; with the map on the glass, an open circle closes. Back (9): Escape to the app in front ("back should signal escape to the app and go up one page"; at its main page it does nothing more, never leaving the kist); with the map on the glass, a level back (`back_step`). Never a tap on what lies under the corner.
+    fn helm_tap(&mut self, corner: u8) -> &'static str {
+        if corner == 8 {
+            if self.send_behind(true) {
+                return "map: home: the app in front behind";
+            }
+            if matches!(self.view, View::Open(_)) {
+                let to = self.back.take().unwrap_or_else(|| self.home());
+                self.leaving = true;
+                self.fly(to);
+                self.draw();
+                return "map: home: the open circle closed";
+            }
+            return "map: home: the map already";
+        }
+        if self.app_front {
+            if ferros_sys::window::key(self.display, ferros_sys::window::KEY_ESCAPE).is_some() {
+                return "map: back: Escape to the app in front";
+            }
+            // The app ended since the map last looked: the map has the glass.
+            self.app_front = false;
+            self.front_kist = None;
+        }
+        self.back_step()
+    }
+
     /// A tap: one finger or two, at a panel point. Logged with what it did, so a session can be followed from `diag console`.
     fn tap(&mut self, fingers: usize, sx: i64, sy: i64) {
-        // The back corner (display op 41: 9), lower left, tapped still: a level back (`back_step`), never a tap on what lies under it.
-        if fingers == 1 && sx >= 0 && sy > self.h / 2 {
-            let mut m = [41u8, 0, 0, 0, 0];
-            m[1..3].copy_from_slice(&(sx as u16).to_le_bytes());
-            m[3..5].copy_from_slice(&(sy as u16).to_le_bytes());
-            let mut r = [0xFFu8; 1];
-            if call(self.display, &m, &mut r) == 1 && r[0] == 9 {
-                let said = self.back_step();
-                console(self.grants, said.as_bytes());
-                console(self.grants, b"\n");
-                return;
-            }
-        }
         let before = self.view;
         // A status circle first (owner, 2026-11-07): they sit over everything at the top, so a one-finger tap on a radio's switches that radio (preference 15) and goes no further. The display knows where they are (op 41).
         if fingers == 1 && sx >= 0 && sy >= 0 && sy < self.h / 4 {
@@ -4502,6 +4639,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         rsn: [0; MAX],
         arranged: [false; MAX],
         app_front: false,
+        recent: alloc::vec::Vec::new(),
+        front_kist: None,
         n,
         kists,
         ask: 0,
@@ -4521,10 +4660,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         let mut r = [0u8; 4];
         map.hit_view = call(map.display, &[58, 3], &mut r) >= 2 && r[0] == 0 && r[1] == 1;
         // The panel's channels and the look as the display has them (ops 59 and 60, ask): a map started again finds them as they were left.
-        if call(map.display, &[59, 0x80], &mut r) >= 2 && r[0] == 0 {
+        if call(map.display, &[63, 0x80], &mut r) >= 2 && r[0] == 0 {
             map.channels = r[1];
         }
-        if call(map.display, &[60, 0], &mut r) >= 2 && r[0] == 0 && r[1] == 1 {
+        if call(map.display, &[64, 0], &mut r) >= 2 && r[0] == 0 && r[1] == 1 {
             LOOK.store(false, Ordering::Relaxed);
         }
     }
@@ -4946,6 +5085,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if map.app_front {
             if map.app_done() {
                 map.app_front = false;
+                map.front_kist = None;
                 map.draw();
             }
             // Still in front: the touches are its, but the corners are the system's (WINDOWS.md), so they are read on below for a corner gesture, and nothing else is done with them.
@@ -5083,7 +5223,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 10 => quick::PULL,
                 11 => quick::NOTHING,
                 12 => quick::BEHIND,
-                32..=37 => quick::ITEM | (hit - 32),
+                c if (32..32 + quick::N).contains(&c) => quick::ITEM | (c - 32),
                 _ => 0,
             };
             quick_door = hit == 10;
@@ -5192,7 +5332,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             if (corner == 8 || corner == 9) && held >= 1 && pair != 1 {
                 corner_at = (cur[ids[0]].1, cur[ids[0]].2);
-                // The swipe inward: the finger's travel along the line from where it landed toward the screen's centre. Past a twelfth of the screen's harmonic span (2wh/(w+h); owner, 2026-11-07), the corner acts, once a touch: home, full screen on or off (op 43); back, the map zoomed out to every circle (`home`), the map being recents (WINDOWS.md).
+                // The swipe inward: the finger's travel along the line from where it landed toward the screen's centre. Past a twelfth of the screen's harmonic span (2wh/(w+h); owner, 2026-11-07), the corner acts, once a touch (WINDOWS.md "The helm"): home, behind and out to every circle turned to fit; back, the kist before.
                 let (ux, uy) = ((w / 2 - corner_from.0) as f64, (h / 2 - corner_from.1) as f64);
                 let inward = ((corner_at.0 - corner_from.0) as f64 * ux + (corner_at.1 - corner_from.1) as f64 * uy) / libm::sqrt(ux * ux + uy * uy);
                 let span = (2 * w * h) as f64 / (w + h) as f64;
@@ -5201,15 +5341,16 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 map.helm_light(corner, lvl as f32);
                 if !corner_done && inward > span / 12. {
                     corner_done = true;
-                    if corner == 8 {
-                        let mut q = [0u8; 4];
-                        let n = call(map.display, &[43], &mut q);
-                        console(grants, if n >= 2 && q[1] == 1 { b"map: full screen\n" } else { b"map: full screen off\n" });
+                    // The helm's swipes (owner, 2026-11-11): home's, the app in front behind as home's tap does, then the plane flies out to every circle at the turn that fits them largest ("so it spins into place"); back's, a flip to the kist before (this one behind). Full screen, which home's swipe switched until then, is the quick row's middle circle.
+                    let said = if corner == 8 {
+                        map.send_behind(false);
+                        map.home_fly();
+                        "map: home: every circle in view, turned to fit them largest"
                     } else {
-                        let said = map.back_step();
-                        console(grants, said.as_bytes());
-                        console(grants, b"\n");
-                    }
+                        map.flip()
+                    };
+                    console(grants, said.as_bytes());
+                    console(grants, b"\n");
                 }
             }
         }
@@ -5220,7 +5361,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             if corner == 8 || corner == 9 {
                 map.helm_light(corner, 0.0);
             }
-            // A corner's session let go: it acted while moving (above), if it went far enough inward. A still tap on a corner circle is a tap as before (on the home circle it closes the open settings; on a radio's, it switches it).
+            // A corner's session let go: it acted while moving (above), if it went far enough inward. A still tap is each place's own (below): the helm's home and back, a console circle's, the quick row's.
             let mut tap_thru = !moved;
             // The quick row's sessions end here (QUICK.md): a still tap in the doorway opens or shuts the row, any other pull settles by halving; a quick circle acts (or its turn is kept); behind the row the touch already shut it and goes no further. A console circle tapped still: a radio switches (preference 15), any other opens its page; dragged in it already opened its page; dragged elsewhere nothing.
             match corner {
@@ -5252,6 +5393,15 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     }
                 }
                 quick::NOTHING => tap_thru = false,
+                // The helm tapped still: home or back (`helm_tap`), with an app in front as on the map. Two fingers on back and home together are the hit map's pair (development builds), never a tap.
+                8 | 9 => {
+                    tap_thru = false;
+                    if !moved && pair != 1 {
+                        let said = map.helm_tap(corner);
+                        console(grants, said.as_bytes());
+                        console(grants, b"\n");
+                    }
+                }
                 _ => {}
             }
             if corner != 0 && tap_thru {

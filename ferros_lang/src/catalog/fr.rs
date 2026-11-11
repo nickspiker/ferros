@@ -134,6 +134,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Silent => "silence",
         Msg::DoNotDisturb => "ne pas déranger",
         Msg::Screencap => "capture",
+        Msg::FullScreen => "plein écran",
         // ---- the battery's page ----
         Msg::Charge => "charge",
         Msg::Voltage => "tension",

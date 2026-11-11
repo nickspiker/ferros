@@ -19,9 +19,13 @@ pub const ITEM: u8 = 0x80;
 pub const RADIOS_OFF: usize = 0;
 pub const SOUND: usize = 1;
 pub const BRIGHTNESS: usize = 2;
-pub const TORCH: usize = 3;
-pub const DND: usize = 4;
-pub const SCREENCAP: usize = 5;
+/// The middle one (owner, 2026-11-11: full screen moves from the home swipe to "a quick-row circle"): the app in front full screen or not (display op 43); nothing with no app in front, where the display draws it dimmed.
+pub const FULL_SCREEN: usize = 3;
+pub const TORCH: usize = 4;
+pub const DND: usize = 5;
+pub const SCREENCAP: usize = 6;
+/// How many circles the row has, and the hit map's id of the first (op 41: 32 + k).
+pub const N: u8 = 7;
 
 /// Half the width of `ease`'s ends (a ring's share eased at both ends).
 const EASE_HALF: f32 = 1. / (1 << 3) as f32;
@@ -252,6 +256,16 @@ impl Quick {
                 let _ = write!(l, "map: quick: sound mode {next}\n");
             }
             BRIGHTNESS => {}
+            FULL_SCREEN => {
+                // The display switches the app in front's full screen and says how it stands; with no app in front it refuses (status 3) and nothing changes.
+                let mut r = [0u8; 4];
+                let n = call(self.display, &[43], &mut r);
+                let _ = write!(l, "map: quick: {}\n", match (n >= 2 && n != ferros_sys::ERR, r[0], r[1]) {
+                    (true, 0, 1) => "full screen",
+                    (true, 0, _) => "full screen off",
+                    _ => "full screen: no app in front",
+                });
+            }
             TORCH => match torch_now() {
                 Some(0) => {
                     self.torch_sent = self.torch_lit;

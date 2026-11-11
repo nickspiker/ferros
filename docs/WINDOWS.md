@@ -125,6 +125,28 @@ Geometric ones only and nothing timed (the standing rule: no long press, no doub
 
 **Build order, once decided:** the bottom-right tap (one corner hit test and a done op), then the pinch, then the other three corners as their pages exist (ATTEST-UI.md's indicators give the top right and bottom left their faces first).
 
+## The helm: home and back (2026-11-11)
+
+Owner: "Home backgrounds the kist so depending on how it was designed, like Photon, it doesn't die but it stops rendering everything and stops playing anything except for notifications. and yes, both [taps and swipes]. back should signal escape to the app and go up one page. I'd say tapping on back bottoms out on the kist main page, so Photon that would be the contacts screen. if the user wants to go home, they can tap on the bottom right to go home." Home's swipe: "let's rotate it to find the most zoom we can too so it spins into place".
+
+| | tap (still) | swipe inward (past a twelfth of the screen's harmonic span) |
+|---|---|---|
+| back (bottom left, hit id 9) | Escape to the app in front: up one page; at its main page nothing more (it never leaves the kist). With the map on the glass, a level back (`back_step`). | Flip to the kist before (this one behind). With the map on the glass, the last kist in front. |
+| home (bottom right, hit id 8) | Home: the app in front behind, the map as it was left. With the map on the glass, an open circle closes. | Home, then the plane flies out to every circle at the turn that fits them largest, spinning into place. |
+
+Full screen, which home's swipe switched until then, is the quick row's middle circle (QUICK.md). A running kist's circle tapped brings its window to the front instead of starting another copy.
+
+- **Behind.** A window behind stays in the display's table with its surface and its process, but is in no stack: nothing of it is composed, it owns no pixel of the hit map, op 5 does not count it (the map has the glass), and its shows keep their place and format and publish nothing. Op 59 brings it back: to the front of its level, every phase owed the whole screen, the next published at once as a show's.
+- **Ops** (all synchronous, answered by the render thread but 62):
+  - **59 `front [surface u8][generation u8]`** → [0], or [3] for no such window: the window on that surface under that generation to the front, out from behind (`ferros_sys::window::front`).
+  - **60 `behind`** → [0][surface][generation], or [3] with no app window in front: the app window in front (level 0, the last shown not behind) behind (`window::behind`).
+  - **61 `key [usage u8]`** → [0][surface][generation], or [3]: a key by its USB HID usage to the app window in front (`window::key`; back's tap sends Escape, G#29).
+  - **62 `events [base u64][seen u32]`** → [0][count u32][state u8: bit 0 behind][k u8][k events u16]: the caller's window's events after `seen`, held by the receive thread until there is one (a doorbell, never a poll; display events.rs). An event is its kind in the high byte (1 behind, 2 front, 3 key) and a key's usage in the low one; the last sixteen are kept, and the state byte says where the window stands whatever was missed. A surface's events belong to the generation it was given under: a new owner starts from nothing.
+  - **43 `full screen`** now switches the app window in front's own flag (`Win::full`, kept while it is behind), [3] with none; `FULL` follows the app in front, so the home screen always has its bars. Full screen keeps the console's rows hidden only while the bars on the glass hold none of the quick row: pulled from the doorway, the console and the row show over the app, so its circle can switch full screen off again.
+- **Which kist is which window.** The kernel answers a kist launch for a kist already running with `RUNNING_ON` | surface << 8 | generation (process.rs `kist_request`); init passes it on as RUNNING with the two bytes (ferros_kist::launch::RUNNING); the map raises that window (op 59). The map keeps the kists it brought to the front, most recent first, by capsule, for back's flip; a kist that ended since is launched again by the flip.
+- **The app's side** (fluor's ferros host): a thread holds op 62; behind, the frame loop draws nothing and reads no touches, asleep until the display or the app's own threads ring, taking in its user events and its tick as they come; the app hears `Focused(false)` and `on_focus_changed(false)`. In front again: focus back, `on_window_shown`, the touches queued meanwhile dropped (they were made on other windows), and the next frame drawn whole. Escape arrives as a key press and release, `NamedKey::Escape`.
+- **Home's turn** (map `home_turned`): the fit's zoom as a function of the turn has period a half turn; sampled 64 times across the half turn centred on the camera's own, then golden-section steps between the best sample's neighbours, and the flight's spring turns the short way. Where the zoom limit caps every turn alike, the camera keeps its turn.
+
 ## Order of work
 
 1. Done: map frames kept off the glass under an app; text at op 26; the map stands aside for any app in front.
