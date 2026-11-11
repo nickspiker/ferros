@@ -2946,6 +2946,15 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                // `diag move <name>…`: each named process's arc moved to other frames (ARCS.md step 3), at once or as its last thread leaves a core; the console line says how long the copy and the whole pause took (`diag console`).
+                if let Some(names) = cmd.params.strip_prefix(b"move ") {
+                    for name in names.split(|&b| b == b' ').filter(|n| !n.is_empty()) {
+                        resp.extend_from_slice(name);
+                        resp.extend_from_slice(if crate::process::move_named(name) { b": held for its move (the console says when it moved)\n" } else { b": no such process\n" });
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 // `diag frames`: the frame pool's memory map on this board (frames.rs, BOARDS.md "Memory map").
                 if cmd.params == b"frames" {
                     resp.extend_from_slice(crate::frames::map_report().as_bytes());

@@ -582,6 +582,8 @@ _m1_entry:
     b.hs    .Lirq_ret
     cmp     x0, #2
     b.eq    .Lirq_dump
+    cmp     x0, #3
+    b.eq    .Lirq_hold
     cmp     x0, #26
     b.eq    .Lirq_tick
     cmp     x0, #28
@@ -654,6 +656,16 @@ _m1_entry:
 // The EL2 timer (PPI 26): a process's time slice is up. Stop the timer and EOI; from EL2 there is nothing to preempt, from EL0 park the process (.Lel0_preempt) and give the CPU back to the kernel.
 .Lirq_tick:
     msr     cnthp_ctl_el2, xzr
+    msr     S3_0_C12_C12_1, x0     // ICC_EOIR1_EL1
+    isb
+    mrs     x1, spsr_el2
+    and     x1, x1, #0xF
+    cbnz    x1, .Lirq_ret
+    ldp     x2, x3, [sp, #16]
+    ldp     x0, x1, [sp], #32
+    b       .Lel0_preempt
+// SGI 3: the kernel holds the process this core runs (process.rs `hold`, ARCS.md step 3: its arc is about to move or change its mask). EOI, then from EL0 park the thread as a slice's end does (.Lel0_preempt), so the last of its threads off a core lets the held work run; from EL2 there is nothing to park (the thread is in the kernel already and parks at its trap's end).
+.Lirq_hold:
     msr     S3_0_C12_C12_1, x0     // ICC_EOIR1_EL1
     isb
     mrs     x1, spsr_el2

@@ -67,7 +67,7 @@ pub mod arc {
     use core::arch::asm;
     use core::sync::atomic::{compiler_fence, Ordering};
 
-    /// Why the kernel refused (process.rs `ARC_WHY_*`): past the ceiling, too few free frames, a masked arc with another of its threads running on another core, under what the process was spawned with, over a word the kernel holds, no such op.
+    /// Why the kernel refused (process.rs `ARC_WHY_*`): past the ceiling, too few free frames, (`WHY_BUSY`, no longer answered: a masked arc whose other threads run elsewhere is held until they leave, kernel step 3), under what the process was spawned with, over a word the kernel holds, no such op.
     pub const WHY_CEILING: u64 = 1;
     pub const WHY_MEMORY: u64 = 2;
     pub const WHY_BUSY: u64 = 3;

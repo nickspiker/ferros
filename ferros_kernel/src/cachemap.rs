@@ -557,6 +557,38 @@ pub fn map_slot(va: usize, pa: usize, table: usize, usable: usize) {
     *slot_entry(va) = table as u64 | TABLE_OR_PAGE;
 }
 
+/// A moved frame's level-3 table (process.rs `arc_move`): every entry of the old table at `from`, its permissions kept (W^X, read-only, BTI's guarded bit, kernel-only), its output address the same page of the frame at `pa`. Written before the slot points at it.
+pub fn retable(from: usize, to: usize, pa: usize) {
+    let (a, b) = unsafe { (&*(from as *const [u64; 512]), &mut *(to as *mut [u64; 512])) };
+    for (k, (e, n)) in a.iter().zip(b.iter_mut()).enumerate() {
+        *n = if *e & 1 == 0 { 0 } else { (*e & !OA) | ((pa + k * PAGE) as u64 & OA) };
+    }
+}
+
+/// After an arc's frames were copied (a move): the instruction side made to see the code's new copies. Each page EL0 may execute (UXN clear) is cleaned to the point of unification unless the data cache is coherent there already (CTR_EL0.IDC), then the instruction cache invalidated unless it snoops (CTR_EL0.DIC). A native arc is executable whole; a masked one only its code pages.
+pub fn sync_exec(va: usize, len: usize) {
+    let ctr: u64;
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr) };
+    if ctr & (1 << 28) == 0 {
+        let mut a = va;
+        while a < va + len {
+            if page_entry(a).is_some_and(|e| *e & UXN == 0) {
+                let mut l = a;
+                while l < a + PAGE {
+                    unsafe { asm!("dc cvau, {}", in(reg) l) };
+                    l += 64;
+                }
+            }
+            a += PAGE;
+        }
+    }
+    unsafe { asm!("dsb ish") };
+    if ctr & (1 << 29) == 0 {
+        unsafe { asm!("ic ialluis") };
+    }
+    unsafe { asm!("dsb ish", "isb") };
+}
+
 /// The level-2 entry of window slot `va`. An address outside the windows is a bug in the caller: the index panics.
 fn slot_entry(va: usize) -> &'static mut u64 {
     let g = (va - ARC_VA.0) / GIB;

@@ -144,13 +144,13 @@ pub fn arm_core() -> bool {
     }
     wr(gicr + GICR_SGI + 0x180, 0xFFFF_FFFF);
     let sgi = gicr + GICR_SGI;
-    // The slice timer's PPI (26), the wake SGI (1, process::kick) and the dump SGI (2, `diag core`), group 1, middle priority.
-    for n in [26usize, 1, 2] {
+    // The slice timer's PPI (26), the wake SGI (1, process::kick), the dump SGI (2, `diag core`) and the hold SGI (3, process::hold: park the thread this core runs), group 1, middle priority.
+    for n in [26usize, 1, 2, 3] {
         let pr = sgi + 0x400 + (n & !3);
         wr(pr, (rd(pr) & !(0xFF << ((n & 3) * 8))) | (0x80 << ((n & 3) * 8)));
     }
     wr(sgi + 0x80, 0xFFFF_FFFF);
-    wr(sgi + 0x100, 1 << 26 | 1 << 1 | 1 << 2);
+    wr(sgi + 0x100, 1 << 26 | 1 << 1 | 1 << 2 | 1 << 3);
     unsafe {
         core::arch::asm!(
             "mrs {t}, S3_4_C12_C9_5",
@@ -206,6 +206,21 @@ pub fn enable_ppi(intid: u32) {
     let sgi = GICR + frame as usize * GICR_STRIDE + GICR_SGI;
     let pr = sgi + 0x400 + (intid as usize & !3);
     let sh = (intid as usize & 3) * 8;
+    wr(pr, (rd(pr) & !(0xFF << sh)) | (0x80 << sh));
+    wr(sgi + 0x100, 1 << intid);
+}
+
+/// Enable one SGI (INTID 0..16) on the kernel's core's redistributor, as `enable_ppi` does a PPI: the hold SGI (3, process::hold), so a thread pinned to that core (the display's render thread) parks at once rather than at its slice's end. No-op if `arm` found no redistributor.
+pub fn enable_sgi(intid: u32) {
+    let frame = REPORT[0].load(core::sync::atomic::Ordering::Relaxed);
+    // WHY: no redistributor found (0xFF), or an INTID that is no SGI: the bit would name another line.
+    if frame == 0xFF || intid >= 16 {
+        return;
+    }
+    let sgi = GICR + frame as usize * GICR_STRIDE + GICR_SGI;
+    let pr = sgi + 0x400 + (intid as usize & !3);
+    let sh = (intid as usize & 3) * 8;
+    wr(sgi + 0x80, rd(sgi + 0x80) | 1 << intid);
     wr(pr, (rd(pr) & !(0xFF << sh)) | (0x80 << sh));
     wr(sgi + 0x100, 1 << intid);
 }

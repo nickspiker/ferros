@@ -145,6 +145,20 @@ pub fn take() -> Option<usize> {
     Some(f)
 }
 
+/// A free frame for a move's copy (process.rs `arc_move`), now taken and not zeroed first: the copy fills it whole.
+pub fn take_for_copy() -> Option<usize> {
+    let p = pool();
+    let w = p.used.iter().position(|&w| w != u64::MAX)?;
+    let f = w * 64 + (!p.used[w]).trailing_zeros() as usize;
+    if f >= p.total {
+        return None;
+    }
+    p.used[w] |= 1 << (f % 64);
+    p.clean[w] &= !(1 << (f % 64));
+    p.free -= 1;
+    Some(f)
+}
+
 /// Frame `f` back to the pool, wiped (owner, 2026-11-08: the kernel wipes what a process held as it reclaims it), its table too. Only once no window maps it and every core's TLB has forgotten it (`cachemap::unmapped`).
 pub fn give(f: usize) {
     let p = pool();
