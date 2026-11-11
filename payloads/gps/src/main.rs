@@ -528,7 +528,10 @@ fn keep_last(grants: u64, d: &Deframer) {
     let mut v = [0u8; 8];
     v[..4].copy_from_slice(&d.fix.lat.to_le_bytes());
     v[4..].copy_from_slice(&d.fix.lon.to_le_bytes());
-    store_set(cap(grants, S_STORE), b"last", &v);
+    // Said when refused, not silent (2026-11-10: the Pro started with no `gps.last` after a day of fixes, so whether these writes land is the question).
+    if !store_set(cap(grants, S_STORE), b"last", &v) {
+        console(grants, b"gps: the last fix was not kept: the vault refused gps.last\n");
+    }
 }
 
 /// The capture's place out of a stored replay (owner, 2026-11-04: no place in the device's half, and no GPS while nobody has attested): every `d0 81` position zeroed through `patch_aiding` (its checksum and CRC redone, as at every run; the time fields take the clock's now, which every run rewrites anyway), the replay written back in pieces. The chip is never powered: this takes no fix. The message stays in the replay: cut or zeroed the chip waits 5-8 minutes alike (GPS.md), and zeroed keeps the record sequence the chip acknowledges; the person's own last fix (`gps.last`, the identity class) fills it whenever there is one.
