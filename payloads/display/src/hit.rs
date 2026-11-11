@@ -423,5 +423,6 @@ fn colour(id: u16, seed: u32) -> u32 {
     h ^= h >> 13;
     let mut c = [h & 1023, h >> 10 & 1023, h >> 20 & 1023];
     c[[0, 1, 2, 1][(h >> 30) as usize]] = 1023;
-    pack10(c[0], c[1], c[2])
+    // Every code halved (owner, 2026-11-11: "the colours should be roughly 18% grey in value ... it's just too bright across the board"): the full channel lands at 511, about 22% of white's light on this panel's ~2.2 power law, near the 18% grey he asked for; one shift is the knob.
+    pack10(c[0] >> 1, c[1] >> 1, c[2] >> 1)
 }
