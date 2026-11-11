@@ -1,26 +1,23 @@
-//! orb tune — the console's radio circles on the desktop, every dimension a slider.
+//! The orbs page (orb tune until 2026-11-10, when it became a page of tools/tune): the console's radio circles on the desktop, every dimension a slider.
 //!
 //! Left: one console circle drawn large, and beside it the same circle at its true size on husky's 1344 × 2992 panel (the radius `corner_layout` solves for that radio's corner) and at twice that, so the look is judged at real size.
 //! Right: one slider row per knob, its value in its own unit, in the style of chirp's bell tune.
 //! The circle is the vessel (Lumis's camera-button profile made radial: three channel rings at their own depths, a dark tinted body) and, behind the O toggle, the orb inside it: a Julia set whose c every dimension of the radio's link picks.
 //! GPS (radio 5) has its own orb, the sky dome (sky.rs): its satellites, their fix and the privacy turn on the last fifteen sliders; switched off it shows its map pin.
 //! Keys: R rolls every dimension of the link, S prints every knob (paste-ready as --dump arguments), 0-6 pick the radio, O shows or hides the orb, Space makes it alive (one frame step a redraw, counted in frames, no clock).
-//! `orb-tune --dump <out.vsf> [key=value ...]` writes the left side as a VSF visual (VSF RGB, gamma2tanh at 16 bits) instead of opening a window; `--nuclei` prints each bulb's nucleus.
-
-mod look;
+//! `tune orbs --dump <out.vsf> [key=value ...]` writes the left side as a VSF visual (VSF RGB, gamma2tanh at 16 bits) instead of opening a window; `tune orbs --nuclei` prints each bulb's nucleus.
 
 use orb::sky;
 
-use look::{Look, Prep, RADIOS};
+use crate::look::{self, Look, Prep, RADIOS};
+use crate::{DIM, fail, smooth_min};
 
-use fluor::canvas::{Canvas, PixelRect};
+use fluor::canvas::Canvas;
 use fluor::coord::Coord;
-use fluor::event::{CursorIcon, ElementState, Event, Key, KeyEvent, MouseButton, NamedKey};
+use fluor::event::{ElementState, Key, KeyEvent, NamedKey};
 use fluor::geom::Viewport;
-use fluor::host::app::{Context, EventResponse, FluorApp};
-use fluor::host::chrome::{self, HIT_NONE, HitId, ResizeEdge};
-use fluor::host::chrome_widget::DefaultChrome;
-use fluor::host::widget::{self as widget, Container, TabDir, Widget};
+use fluor::host::app::Context;
+use fluor::host::chrome::HitId;
 use fluor::pixel::{Blend, BlendMode, G2t16, Pixel};
 use fluor::text::{TextRenderer, TextStyle};
 use fluor::widgets::Slider;
@@ -216,7 +213,7 @@ fn from_unit(i: usize, u: f32) -> f32 {
     if kn.step == 0. { v } else { kn.lo + ((v - kn.lo) / kn.step).round() * kn.step }
 }
 
-/// Every knob as `key=value`, paste-ready after `orb-tune --dump <out.vsf>`.
+/// Every knob as `key=value`, paste-ready after `tune orbs --dump <out.vsf>`.
 fn print_knobs(k: &Look) {
     let args: Vec<String> = (0..N_KNOBS).map(|i| format!("{}={}", KNOBS[i].key, get(k, i))).collect();
     println!("{}", args.join(" "));
@@ -225,12 +222,6 @@ fn print_knobs(k: &Look) {
     if k.radio == look::GPS {
         println!("{}", sky::Sky::new(k).report());
     }
-}
-
-/// A smooth (C∞) minimum, (a + b − √((a − b)² + δ²))/2 with δ = 2⁻⁵ of a + b: a hair under the smaller, with no corner where the two cross.
-fn smooth_min(a: f32, b: f32) -> f32 {
-    let d = (a + b) / (1 << 5) as f32;
-    0.5 * (a + b - ((a - b) * (a - b) + d * d).sqrt())
 }
 
 /// A 16-bit composite pixel as the 8-bit one the window shows: each field's top byte (a code's bucket is its top bits).
@@ -250,62 +241,37 @@ fn render_all(k: &Look, text: &mut TextRenderer, big: f32, ss: u32) -> [(Vec<G2t
     })
 }
 
-const LABEL: u32 = 0xFF00_0000 | (0x00C0_C0C0 ^ 0x00FF_FFFF);
-const DIM: u32 = 0xFF00_0000 | (0x0080_8080 ^ 0x00FF_FFFF);
-/// The slider column's ground, a dark blue-grey (as darkness), and the circles' black.
-const COLUMN_BG: u32 = 0xFF00_0000 | (0x0014_161C ^ 0x00FF_FFFF);
-const BLACK8: u32 = 0xFFFF_FFFF;
-
-struct App {
-    chrome: DefaultChrome,
-    hit_counter: HitId,
-    sliders: Vec<Slider>,
-    current_focus: Option<HitId>,
-    dragging: Option<usize>,
-    modifiers: fluor::event::ModifiersState,
+/// The page: its sliders, the look they set, and the three circles drawn from it.
+pub struct Orbs {
+    pub sliders: Vec<Slider>,
     look: Look,
     alive: bool,
     rng: u64,
     dirty: bool,
     /// The three circles and where each goes: (pixels, side, x0, y0).
     images: Vec<(Vec<G2t16>, usize, usize, usize)>,
+    /// The window and its top strip as last laid out (a new radio moves the layout: its true size).
+    vp: Viewport,
+    top: Coord,
     /// The left region's width, the big circle's centre and radius, the small circles' centres.
     split: Coord,
     big: (Coord, Coord, Coord),
     small: [(Coord, Coord); 2],
-    row_pitch: Coord,
 }
 
-impl App {
-    fn new() -> Self {
-        let viewport = Viewport::new(1600, 1000);
-        let mut hit_counter: HitId = HIT_NONE;
-        let chrome = DefaultChrome::new(viewport, "orb tune".to_string(), None, None, &mut hit_counter);
+impl Orbs {
+    pub fn new(hit_counter: &mut HitId) -> Self {
         let look = Look::new(0);
-        let sliders = (0..N_KNOBS).map(|i| Slider::new(&mut hit_counter, 0., 0., 1., 1., to_unit(&look, i))).collect();
-        Self {
-            chrome,
-            hit_counter,
-            sliders,
-            current_focus: None,
-            dragging: None,
-            modifiers: fluor::event::ModifiersState::default(),
-            look,
-            alive: false,
-            rng: 0x6F72_6220_7475_6E65,
-            dirty: true,
-            images: Vec::new(),
-            split: 0.,
-            big: (0., 0., 1.),
-            small: [(0., 0.); 2],
-            row_pitch: 1.,
-        }
+        let sliders = (0..N_KNOBS).map(|i| Slider::new(hit_counter, 0., 0., 1., 1., to_unit(&look, i))).collect();
+        Self { sliders, look, alive: false, rng: 0x6F72_6220_7475_6E65, dirty: true, images: Vec::new(), vp: Viewport::new(1, 1), top: 0., split: 0., big: (0., 0., 1.), small: [(0., 0.); 2] }
     }
 
-    fn update_layout(&mut self, vp: Viewport) {
+    /// Lays the page out under the top strip (`top` tall): the circles on the left, one slider row per knob in the column on the right.
+    pub fn layout(&mut self, vp: Viewport, top: Coord) {
+        self.vp = vp;
+        self.top = top;
         let (w, h) = (vp.width_px as Coord, vp.height_px as Coord);
         let span = vp.effective_span();
-        let top = h / (1 << 4) as Coord;
         let margin = span / (1 << 6) as Coord;
         self.split = w * (1. - 3. / (1 << 3) as Coord);
         // The small circles in a column at the left region's right edge: twice the console's size above, the console's below.
@@ -316,21 +282,12 @@ impl App {
         let room_h = h - top - margin;
         let r = 0.5 * smooth_min(room_w, room_h) * (1. - 1. / (1 << 4) as Coord);
         self.big = (margin + room_w * 0.5, top + room_h * 0.5, r);
-        // One slider row per knob, between the top strip and the bottom.
-        let rows_top = top;
-        self.row_pitch = (h - top - margin) / N_KNOBS as Coord;
-        let cw = w - self.split;
-        let band_h = self.row_pitch * (1. - 1. / (1 << 2) as Coord);
-        let (left, right) = (self.split + cw * 0.34, self.split + cw * 0.76);
-        for (i, s) in self.sliders.iter_mut().enumerate() {
-            let cy = rows_top + (i as Coord + 0.5) * self.row_pitch;
-            s.set_rect((left + right) * 0.5, cy, right - left, band_h * 0.5);
-        }
+        crate::column(&mut self.sliders, self.split, w, top, h - margin, [0.34, 0.76]);
         self.dirty = true;
     }
 
     /// Slider moves into the look; a new radio brings its flavour (and its true size: the layout moves).
-    fn poll_slider_changes(&mut self) -> bool {
+    pub fn poll(&mut self) -> bool {
         let mut changed = false;
         let mut radio_moved = false;
         for i in 0..N_KNOBS {
@@ -345,6 +302,7 @@ impl App {
         }
         if radio_moved {
             self.sync_sliders();
+            self.layout(self.vp, self.top);
         }
         if changed {
             self.dirty = true;
@@ -381,218 +339,57 @@ impl App {
         print_knobs(&self.look);
     }
 
-    fn change_focus(&mut self, new_focus: Option<HitId>, ctx: &mut Context) {
-        if new_focus == self.current_focus {
-            return;
-        }
-        let prior = self.current_focus;
-        widget::apply_focus_change(self as &mut dyn Container, prior, new_focus);
-        self.current_focus = new_focus;
-        ctx.window.request_redraw();
-    }
-
-    fn handle_key(&mut self, kev: &KeyEvent, ctx: &mut Context) -> EventResponse {
+    /// The page's own keys; true if it took the key.
+    pub fn key(&mut self, kev: &KeyEvent) -> bool {
         if kev.state != ElementState::Pressed {
-            return EventResponse::Pass;
+            return false;
         }
         match &kev.logical_key {
-            Key::Named(NamedKey::Tab) => {
-                let dir = if self.modifiers.shift_key() { TabDir::Backward } else { TabDir::Forward };
-                let current = self.current_focus;
-                let next = widget::linear_tab_next(self as &mut dyn Container, current, dir);
-                self.change_focus(next, ctx);
-                return EventResponse::Handled;
-            }
-            Key::Named(NamedKey::Escape) => {
-                self.change_focus(None, ctx);
-                return EventResponse::Handled;
-            }
             Key::Named(NamedKey::Space) => {
                 self.alive = !self.alive;
                 println!("alive: {}", if self.alive { "on" } else { "off" });
                 self.dirty = true;
-                ctx.window.request_redraw();
-                return EventResponse::Handled;
+                true
             }
-            Key::Character(c) => {
-                let c = c.to_ascii_lowercase();
-                let handled = match c.as_str() {
-                    "r" => {
-                        self.roll();
-                        self.update_layout(ctx.viewport);
-                        true
-                    }
-                    "s" => {
-                        print_knobs(&self.look);
-                        true
-                    }
-                    "o" => {
-                        self.look.orb = !self.look.orb;
-                        self.sync_sliders();
-                        true
-                    }
-                    d if d.len() == 1 && (b'0'..=b'6').contains(&d.as_bytes()[0]) => {
-                        set(&mut self.look, K_RADIO, (d.as_bytes()[0] - b'0') as f32);
-                        self.sync_sliders();
-                        self.update_layout(ctx.viewport);
-                        true
-                    }
-                    _ => false,
-                };
-                if handled {
-                    ctx.window.request_redraw();
-                    return EventResponse::Handled;
+            Key::Character(c) => match c.to_ascii_lowercase().as_str() {
+                "r" => {
+                    self.roll();
+                    self.layout(self.vp, self.top);
+                    true
                 }
-            }
-            _ => {}
-        }
-        let Some(focus_id) = self.current_focus else {
-            return EventResponse::Pass;
-        };
-        let mods = self.modifiers;
-        let response = widget::dispatch_key(self as &mut dyn Container, focus_id, kev, mods, ctx.text);
-        if matches!(response, EventResponse::Handled) && self.poll_slider_changes() {
-            self.update_layout(ctx.viewport);
-            ctx.window.request_redraw();
-        }
-        response
-    }
-}
-
-fn look_mix(k: u64) -> u64 {
-    let mut z = k.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-impl Container for App {
-    fn visit(&mut self, f: &mut dyn FnMut(&mut dyn Widget)) {
-        for s in &mut self.sliders {
-            f(s);
-        }
-        self.chrome.visit(f);
-    }
-}
-
-impl FluorApp for App {
-    type UserEvent = ();
-
-    fn title(&self) -> &str {
-        "orb tune"
-    }
-
-    fn initial_size(&self, monitor: (u32, u32)) -> (u32, u32) {
-        let h = monitor.1 * 7 / 8;
-        (h * 8 / 5, h)
-    }
-
-    fn init(&mut self, ctx: &mut Context) {
-        self.chrome.resize(ctx.viewport);
-        self.update_layout(ctx.viewport);
-    }
-
-    fn on_resize(&mut self, _w: u32, _h: u32, ctx: &mut Context) {
-        self.chrome.resize(ctx.viewport);
-        self.chrome.set_full_edge(ctx.is_maximized);
-        self.update_layout(ctx.viewport);
-    }
-
-    fn on_event(&mut self, event: &Event, ctx: &mut Context) -> EventResponse {
-        match event {
-            Event::ModifiersChanged(m) => {
-                self.modifiers = *m;
-                EventResponse::Pass
-            }
-            Event::CursorMoved { .. } => {
-                let (x, y) = (ctx.cursor_x, ctx.cursor_y);
-                if let Some(i) = self.dragging {
-                    self.sliders[i].set_value_from_x(x);
-                    if self.poll_slider_changes() {
-                        if i == K_RADIO {
-                            self.update_layout(ctx.viewport);
-                        }
-                        ctx.window.request_redraw();
-                    }
-                    return EventResponse::Handled;
+                "s" => {
+                    print_knobs(&self.look);
+                    true
                 }
-                if self.chrome.set_hover(self.chrome.hit_at(x, y)) {
-                    ctx.window.request_redraw();
+                "o" => {
+                    self.look.orb = !self.look.orb;
+                    self.sync_sliders();
+                    true
                 }
-                EventResponse::Pass
-            }
-            Event::CursorLeft => {
-                if self.chrome.set_hover(HIT_NONE) {
-                    ctx.window.request_redraw();
+                d if d.len() == 1 && (b'0'..=b'6').contains(&d.as_bytes()[0]) => {
+                    set(&mut self.look, K_RADIO, (d.as_bytes()[0] - b'0') as f32);
+                    self.sync_sliders();
+                    self.layout(self.vp, self.top);
+                    true
                 }
-                EventResponse::Pass
-            }
-            Event::MouseInput { state: ElementState::Pressed, button: MouseButton::Left } => {
-                let (x, y) = (ctx.cursor_x, ctx.cursor_y);
-                let hit = self.chrome.hit_at(x, y);
-                if self.chrome.owns_hit(hit) {
-                    if hit == self.chrome.close_btn.id() {
-                        return EventResponse::Close;
-                    } else if hit == self.chrome.max_btn.id() {
-                        return EventResponse::ToggleMaximized;
-                    } else if hit == self.chrome.min_btn.id() {
-                        return EventResponse::Minimize;
-                    }
-                    return EventResponse::Handled;
-                }
-                if hit != HIT_NONE {
-                    let mods = self.modifiers;
-                    let response = widget::dispatch_click(self as &mut dyn Container, hit, x, y, mods);
-                    self.change_focus(Some(hit), ctx);
-                    self.dragging = self.sliders.iter().position(|s| s.hit_id() == hit);
-                    if self.poll_slider_changes() {
-                        self.update_layout(ctx.viewport);
-                    }
-                    ctx.window.request_redraw();
-                    return response;
-                }
-                let edge = chrome::get_resize_edge(ctx.viewport, x, y);
-                if edge != ResizeEdge::None {
-                    return EventResponse::StartResize(edge);
-                }
-                self.change_focus(None, ctx);
-                EventResponse::StartWindowDrag
-            }
-            Event::MouseInput { state: ElementState::Released, .. } => {
-                if self.dragging.take().is_some() {
-                    // The drag drew the big circle at one sample a pixel; now the full four.
-                    self.dirty = true;
-                    ctx.window.request_redraw();
-                    return EventResponse::Handled;
-                }
-                EventResponse::Pass
-            }
-            Event::KeyboardInput { event: kev } => self.handle_key(kev, ctx),
-            Event::Focused(f) => {
-                if self.chrome.set_focused(*f) {
-                    ctx.window.request_redraw();
-                }
-                EventResponse::Pass
-            }
-            _ => EventResponse::Pass,
+                _ => false,
+            },
+            _ => false,
         }
     }
 
-    fn damage_rect(&mut self, viewport: Viewport) -> Option<PixelRect> {
-        Some(PixelRect::new(0, 0, viewport.width_px as usize, viewport.height_px as usize))
+    /// A drag ended: the big circle was drawn at one sample a pixel while it lasted; now the full four.
+    pub fn released(&mut self) {
+        self.dirty = true;
     }
 
-    fn hit_test_map(&self) -> Option<(&[HitId], usize, usize)> {
-        let (w, h) = self.chrome.dims();
-        Some((self.chrome.hit_test_map(), w, h))
+    /// Whether the circles move by themselves (Space): the app asks for the next frame after each.
+    pub fn alive(&self) -> bool {
+        self.alive
     }
 
-    fn overlay_deltas(&mut self) -> Vec<u32> {
-        let count = self.hit_counter as usize + 1;
-        widget::build_overlay_deltas(self, count)
-    }
-
-    fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
+    /// The front of the page: the sliders, their labels and values, and the notes under the small circles (the circles themselves go under the chrome, `render_back`).
+    pub fn render_front(&mut self, target: &mut [u32], ctx: &mut Context, hit_map: &mut [HitId], dragging: bool) {
         let (w, h) = (ctx.viewport.width_px as usize, ctx.viewport.height_px as usize);
         // Alive: one frame step a redraw, then ask for the next.
         if self.alive {
@@ -603,48 +400,30 @@ impl FluorApp for App {
         }
         if self.dirty {
             // While dragging or alive, one sample a pixel for the big circle; four when still.
-            let ss = if self.dragging.is_some() || self.alive { 1 } else { 2 };
+            let ss = if dragging || self.alive { 1 } else { 2 };
             let imgs = render_all(&self.look, ctx.text, self.big.2, ss);
             let centres = [(self.big.0, self.big.1), self.small[0], self.small[1]];
-            self.images = imgs
-                .into_iter()
-                .zip(centres)
-                .map(|((px, side), (cx, cy))| (px, side, (cx - side as Coord * 0.5) as usize, (cy - side as Coord * 0.5) as usize))
-                .collect();
+            self.images = imgs.into_iter().zip(centres).map(|((px, side), (cx, cy))| (px, side, (cx - side as Coord * 0.5) as usize, (cy - side as Coord * 0.5) as usize)).collect();
             self.dirty = false;
         }
-
-        self.chrome.rasterize_perimeter(target, w, h, ctx.clip_mask);
-        self.chrome.rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
-
-        // Front to back: the sliders and their text, the chrome, the circles, then the grounds.
         let span = ctx.viewport.effective_span();
-        let font = span / (1 << 6) as Coord * 1.25;
-        let cw = w as Coord - self.split;
-        for i in 0..N_KNOBS {
+        let font = crate::font(span);
+        let shown: Vec<String> = (0..N_KNOBS).map(|i| show(&self.look, i)).collect();
+        crate::draw_column(&mut self.sliders, target, ctx, hit_map, self.split, &KNOBS.map(|k| k.label), &shown);
+        let r0 = RADIOS[self.look.radio].console_r;
+        let notes = [(format!("2× ({} px)", 2. * r0), self.small[0], 2. * r0), (format!("true size ({r0} px)"), self.small[1], r0)];
+        for (t, (cx, cy), r) in notes {
             let mut canvas = Canvas::new(target, w, h, ctx.damage);
-            let id = self.sliders[i].hit_id();
-            self.sliders[i].render_content_into(&mut canvas, Some(&mut self.chrome.hit_test_map), id);
-            let b = self.sliders[i].bbox();
-            let cy = b.y + b.h * 0.5;
-            let mut canvas = Canvas::new(target, w, h, ctx.damage);
-            ctx.text.draw_text_left(&mut canvas, KNOBS[i].label, self.split + cw / (1 << 5) as Coord, cy, &TextStyle::new(font, LABEL), None, None);
-            let mut canvas = Canvas::new(target, w, h, ctx.damage);
-            ctx.text.draw_text_left(&mut canvas, &show(&self.look, i), self.split + cw * 0.78, cy, &TextStyle::new(font, LABEL), None, None);
+            ctx.text.draw_text_center(&mut canvas, &t, cx, cy + r + font, &TextStyle::new(font * 0.8, DIM), None, None);
         }
-        {
-            let r0 = RADIOS[self.look.radio].console_r;
-            let notes = [(format!("2× ({} px)", 2. * r0), self.small[0], 2. * r0), (format!("true size ({r0} px)"), self.small[1], r0)];
-            for (t, (cx, cy), r) in notes {
-                let mut canvas = Canvas::new(target, w, h, ctx.damage);
-                ctx.text.draw_text_center(&mut canvas, &t, cx, cy + r + font, &TextStyle::new(font * 0.8, DIM), None, None);
-            }
-            let c = Prep::new(&self.look).c();
-            let mut canvas = Canvas::new(target, w, h, ctx.damage);
-            let line = format!("c = {:+.5} {:+.5}i{}", c.re, c.im, if self.alive { "   alive" } else { "" });
-            ctx.text.draw_text_left(&mut canvas, &line, span / (1 << 6) as Coord, h as Coord - font, &TextStyle::new(font * 0.8, DIM), None, None);
-        }
-        self.chrome.flatten_into(target, w, h, None);
+        let c = Prep::new(&self.look).c();
+        let mut canvas = Canvas::new(target, w, h, ctx.damage);
+        let line = format!("c = {:+.5} {:+.5}i{}", c.re, c.im, if self.alive { "   alive" } else { "" });
+        ctx.text.draw_text_left(&mut canvas, &line, span / (1 << 6) as Coord, h as Coord - font, &TextStyle::new(font * 0.8, DIM), None, None);
+    }
+
+    /// The circles, under everything in front of them; then the grounds (`crate::grounds`).
+    pub fn render_back(&self, target: &mut [u32], w: usize, h: usize) {
         for (px, side, x0, y0) in &self.images {
             for (j, row) in px.chunks(*side).enumerate() {
                 let y = y0 + j;
@@ -661,35 +440,19 @@ impl FluorApp for App {
                 }
             }
         }
-        let split = self.split as usize;
-        for row in target.chunks_mut(w) {
-            for (x, d) in row.iter_mut().enumerate() {
-                *d = d.under(if x < split { BLACK8 } else { COLUMN_BG }, BlendMode::Normal);
-            }
-        }
-        ctx.damage.add_bounds(0, 0, w, h);
-        if self.alive {
-            ctx.window.request_redraw();
-        }
-    }
-
-    fn cursor_for(&self, x: Coord, y: Coord, ctx: &Context) -> CursorIcon {
-        let hit = self.chrome.hit_at(x, y);
-        if self.chrome.owns_hit(hit) || self.sliders.iter().any(|s| s.hit_id() == hit) {
-            return CursorIcon::Pointer;
-        }
-        match chrome::get_resize_edge(ctx.viewport, x, y) {
-            ResizeEdge::Top | ResizeEdge::Bottom => CursorIcon::NsResize,
-            ResizeEdge::Left | ResizeEdge::Right => CursorIcon::EwResize,
-            ResizeEdge::TopLeft | ResizeEdge::BottomRight => CursorIcon::NwseResize,
-            ResizeEdge::TopRight | ResizeEdge::BottomLeft => CursorIcon::NeswResize,
-            ResizeEdge::None => CursorIcon::Default,
-        }
+        crate::grounds(target, w, self.split as usize);
     }
 }
 
-/// --dump: the big circle (radius 2⁸ + 2⁷ px, 2 × 2 samples), the 2× and the true size beside it, on black, written as a VSF visual.
-fn dump(out: &str, args: &[String]) {
+fn look_mix(k: u64) -> u64 {
+    let mut z = k.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// `tune orbs --dump`: the big circle (radius 2⁸ + 2⁷ px, 2 × 2 samples), the 2× and the true size beside it, on black, written as a VSF visual.
+pub fn dump(out: &str, args: &[String]) {
     let mut k = Look::new(0);
     for a in args {
         let Some((key, val)) = a.split_once('=') else { fail(&format!("not key=value: {a}")) };
@@ -738,34 +501,20 @@ fn dump(out: &str, args: &[String]) {
     println!("{out}: {w}x{h}; big circle r {big} at (0, 0) side {s0}, 2x at ({}, 0) side {s1}, true size at ({}, {}) side {s2}; c = {:+.6} {:+.6}i", s0 + gap, places[2].0, places[2].1, c.re, c.im);
 }
 
-fn fail(m: &str) -> ! {
-    eprintln!("orb-tune: {m}");
-    std::process::exit(1)
-}
-
-fn main() {
-    let a: Vec<String> = std::env::args().collect();
-    match a.get(1).map(|s| s.as_str()) {
-        Some("--dump") => {
-            let Some(out) = a.get(2) else { fail("usage: orb-tune --dump <out.vsf> [key=value ...]") };
-            dump(out, &a[3..]);
-        }
-        Some("--nuclei") => {
-            for p in 1..=8 {
-                let c = look::nucleus(p);
-                // Its exact period: the first k with f_c^k(0) back at 0.
-                let mut z = look::C::new(0., 0.);
-                let mut period = 0;
-                for k in 1..=p {
-                    z = z.sq() + c;
-                    if z.abs() < 1e-9 {
-                        period = k;
-                        break;
-                    }
-                }
-                println!("period {p}: nucleus {:+.9} {:+.9}i (returns to 0 after {period})", c.re, c.im);
+/// `tune orbs --nuclei`: each period's bulb nucleus, and the period it really returns to 0 after.
+pub fn nuclei() {
+    for p in 1..=8 {
+        let c = look::nucleus(p);
+        // Its exact period: the first k with f_c^k(0) back at 0.
+        let mut z = look::C::new(0., 0.);
+        let mut period = 0;
+        for k in 1..=p {
+            z = z.sq() + c;
+            if z.abs() < 1e-9 {
+                period = k;
+                break;
             }
         }
-        _ => fluor::host::app::run_app(App::new()).expect("event loop"),
+        println!("period {p}: nucleus {:+.9} {:+.9}i (returns to 0 after {period})", c.re, c.im);
     }
 }

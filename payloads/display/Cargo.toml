@@ -13,7 +13,7 @@ tatau = { path = "../../../tatau" }
 ferros_sys = { path = "../../ferros_sys" }
 # The person's default wallpaper, a Julia set from their wallpaper seed (op 42).
 wallpaper = { path = "../../wallpaper" }
-# The radio circles' orbs, the maths tools/orb-tune tunes (console_draw).
+# The radio circles' orbs, the maths tools/tune's orbs page tunes (console_draw).
 orb = { path = "../../orb" }
 # The person's own wallpaper, a VSF visual read from their space over the vault (main.rs `wall_own`).
 vsf = { path = "../../../vsf", default-features = false }

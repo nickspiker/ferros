@@ -4711,7 +4711,7 @@ fn battery_flavour(charge: u64) -> (f32, f32, f32) {
     (code(lin[0]), code(lin[1]), code(lin[2]))
 }
 
-/// The vessel's rim, in the circle's radius (tools/orb-tune's defaults, Lumis's proportions: its rings at 0.052h, 0.048h, 0.039h of a box h tall): the green ring's depth from the edge; each ring's inner tail λ (it fades e-fold every λ inward: Lumis's v = k³w⁹ moves e-fold every 0.0063h) and its outer sharpness s (the profile exp(−s(e^{t/s} − 1 − t/s)), at s = ¼ down to 0.5 % where Lumis's reaches zero); and the channels' separation (blue that much further out, red half of it further in; orb-tune's default at its band 1, 0.018 widened half a stop).
+/// The vessel's rim, in the circle's radius (the defaults of tools/tune's orbs page, Lumis's proportions: its rings at 0.052h, 0.048h, 0.039h of a box h tall): the green ring's depth from the edge; each ring's inner tail λ (it fades e-fold every λ inward: Lumis's v = k³w⁹ moves e-fold every 0.0063h) and its outer sharpness s (the profile exp(−s(e^{t/s} − 1 − t/s)), at s = ¼ down to 0.5 % where Lumis's reaches zero); and the channels' separation (blue that much further out, red half of it further in; the orbs page's default at its band 1, 0.018 widened half a stop).
 const VESSEL_DEPTH: f32 = 0.096;
 /// NFC's symbol lit by the inverse square of the distance instead of its log (owner, 2026-11-07: to compare the two).
 const NFC_INV_SQ: bool = false;
@@ -4745,15 +4745,15 @@ fn radio_of(what: Corner) -> Option<usize> {
     }
 }
 
-/// A live radio's orb (owner, 2026-11-07: the circles' orbs drawn from the radios' live measures, by tools/orb-tune's maths): the `orb` crate's knobs from the driver's measures (`ms`, its eight slots), as orb-tune's sliders read them.
-/// A measure the driver does not publish keeps orb-tune's own starting value (`orb::Look::new`: SNR 30 dB, signal −55 dBm, noise floor −92 dBm, the middle band, the radio's typical channel width and constellation, delay spread 32 ns, no loss), unless the radio's kind says better (below). Not animated: frame 0.
+/// A live radio's orb (owner, 2026-11-07: the circles' orbs drawn from the radios' live measures, by the maths of tools/tune's orbs page): the `orb` crate's knobs from the driver's measures (`ms`, its eight slots), as the orbs page's sliders read them.
+/// A measure the driver does not publish keeps the orbs page's own starting value (`orb::Look::new`: SNR 30 dB, signal −55 dBm, noise floor −92 dBm, the middle band, the radio's typical channel width and constellation, delay spread 32 ns, no loss), unless the radio's kind says better (below). Not animated: frame 0.
 /// The meaning of each knob: SNR the bulb's depth (how firmly orbits settle, and the constellation's sharpness); the signal the orb's light (a stop every 10 dB); the noise floor its turbulence and the grain in its hue; the band a small turn of its hue; the channel's width how far the I/Q phase swings the hue; the period (the bulb's arms) the spatial streams; loss the sparks; delay spread the multipath fringes.
 fn orb_look(ri: usize, ms: &[u64], state: i64) -> orb::Look {
     use ferros_sys::measure as k;
     let get = |kind: u16| ms.iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == kind).map(|m| m.1);
     // A measure in thousandths (milli-dBm, milli-dB, kHz) in its whole unit (dBm, dB, MHz).
     let milli = |kind: u16| get(kind).map(|v| v as f32 * (1.0 / 1000.0));
-    // orb-tune's radios: WiFi 0, LTE 1, NR 2, Bluetooth 3, NFC 4, GPS 5, USB 6; cellular is LTE unless the modem says NR.
+    // the orbs page's radios: WiFi 0, LTE 1, NR 2, Bluetooth 3, NFC 4, GPS 5, USB 6; cellular is LTE unless the modem says NR.
     let radio = match ri {
         0 if get(k::TECH) == Some(ferros_sys::TECH_NR as i64) => 2,
         0 => 1,
@@ -4770,7 +4770,7 @@ fn orb_look(ri: usize, ms: &[u64], state: i64) -> orb::Look {
     l.state = if state == 2 { 2 } else { 1 };
     match ri {
         0 => {
-            // Cellular: RSSI the light, or RSRP 32 dB up (a 20 MHz carrier's 1200 subcarriers, fully loaded, are 10·log₁₀ 1200 = 30.8 dB over one), else −90 dBm. SNR as it is, else 10 dB. RSRQ (−3 dB a clean cell, −20 a loaded or interfered one) is the roughness: the noise floor −100 dBm at −3 dB, 2 dB up for each dB worse, else RSRQ −10 dB. Streams by technology: LTE 2 × 2, NR 4 × 4 (husky's NR receive). The channel width and constellation orb-tune's typical ones (LTE 20 MHz 64-QAM, NR 100 MHz 256-QAM): the modem publishes neither. Delay spread 256 ns, an urban macro cell's.
+            // Cellular: RSSI the light, or RSRP 32 dB up (a 20 MHz carrier's 1200 subcarriers, fully loaded, are 10·log₁₀ 1200 = 30.8 dB over one), else −90 dBm. SNR as it is, else 10 dB. RSRQ (−3 dB a clean cell, −20 a loaded or interfered one) is the roughness: the noise floor −100 dBm at −3 dB, 2 dB up for each dB worse, else RSRQ −10 dB. Streams by technology: LTE 2 × 2, NR 4 × 4 (husky's NR receive). The channel width and constellation the orbs page's typical ones (LTE 20 MHz 64-QAM, NR 100 MHz 256-QAM): the modem publishes neither. Delay spread 256 ns, an urban macro cell's.
             l.rssi_dbm = milli(k::RSSI).or(milli(k::RSRP).map(|v| v + (1 << 5) as f32)).unwrap_or(-90.0);
             l.snr_db = milli(k::SNR).unwrap_or(10.0);
             l.noise_dbm = -100.0 + (1 << 1) as f32 * (-3.0 - milli(k::RSRQ).unwrap_or(-10.0));
@@ -4792,7 +4792,7 @@ fn orb_look(ri: usize, ms: &[u64], state: i64) -> orb::Look {
             };
             let bw = milli(k::BANDWIDTH).unwrap_or(80.0);
             l.bw_log2 = libm::log2f(bw);
-            // WHY the min: a period is a count of the bulb's arms, and the driver's rate is external input; past 8 (orb-tune's top) a bulb is under a pixel at the console's size, and a misread rate (a counter in the wrong unit) would ask for hundreds, each a Newton solve of 2⁶ · 2⁵ · p steps.
+            // WHY the min: a period is a count of the bulb's arms, and the driver's rate is external input; past 8 (the orbs page's top) a bulb is under a pixel at the console's size, and a misread rate (a counter in the wrong unit) would ask for hundreds, each a Newton solve of 2⁶ · 2⁵ · p steps.
             l.period = match get(k::RATE_DOWN) {
                 Some(rate) => (1 + (rate as f32 / (bw * 1_000_000.0) * (1.0 / (1 << 3) as f32)) as u32).min(8),
                 None => 2,
@@ -5104,7 +5104,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             if what == Corner::Gps && live && !switched_off && !sats.is_empty() {
                 gps_rings(&sats, x, y, r * (1.0 - 2.0 * VESSEL_DEPTH), flav, &mut |px, py| at(px, py), console, cut);
             } else if what == Corner::Gps && !(live && !switched_off) {
-                // GPS switched off shows its symbol, not its name (owner, 2026-11-07: "the classic teardrop with a hole punch"): a map pin, the convex hull of a round head and the tip below it (its sides the tangents from the tip), a hole through the head's centre, in the ink, its edge the C∞ step across two pixels. By its signed distance (the orb crate's `pin_sd`, in the circle's radius, the one tools/orb-tune draws), so it is sharp at any size.
+                // GPS switched off shows its symbol, not its name (owner, 2026-11-07: "the classic teardrop with a hole punch"): a map pin, the convex hull of a round head and the tip below it (its sides the tangents from the tip), a hole through the head's centre, in the ink, its edge the C∞ step across two pixels. By its signed distance (the orb crate's `pin_sd`, in the circle's radius, the one tools/tune's orbs page draws), so it is sharp at any size.
                 let (a, l) = (r * 0.3, r * 0.6);
                 // The head's centre, so the pin from the head's top to the tip sits centred in the circle.
                 let (cx, cy) = (x, y - (l - a) * 0.5);
@@ -5253,7 +5253,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 }
             }
         }
-        // Then the vessel, under its text (the orb crate's `Vessel`, tools/orb-tune's defaults; owner, 2026-11-07: Lumis's camera-picker button made round): each channel of the fill a ring of its own at its own depth from the edge (blue outermost, red innermost: a prism; a channel the fill does not have draws nothing), Lumis's shape made smooth (a cliff on its outer side, a tail e-folding every λ on its inner) widened by the pixel's footprint, the outermost ring the fill has at half its light exactly at the circle's radius (its cliff is the circle's edge, so tangent circles meet rim to rim at the tangent point) and nothing drawn outside; then under them the body, the fill four stops darker, opaque but for a sixteenth, rising by a logistic under the green ring. Between the edge and the body the scene shows through. Every term C∞.
+        // Then the vessel, under its text (the orb crate's `Vessel`, the defaults of tools/tune's orbs page; owner, 2026-11-07: Lumis's camera-picker button made round): each channel of the fill a ring of its own at its own depth from the edge (blue outermost, red innermost: a prism; a channel the fill does not have draws nothing), Lumis's shape made smooth (a cliff on its outer side, a tail e-folding every λ on its inner) widened by the pixel's footprint, the outermost ring the fill has at half its light exactly at the circle's radius (its cliff is the circle's edge, so tangent circles meet rim to rim at the tangent point) and nothing drawn outside; then under them the body, the fill four stops darker, opaque but for a sixteenth, rising by a logistic under the green ring. Between the edge and the body the scene shows through. Every term C∞.
         let fl = [fill.0, fill.1, fill.2].map(|v| { let c = v * (1.0 / 16384.0); c * c });
         let vessel = orb::Vessel::new(fl, VESSEL_DEPTH, VESSEL_LAMBDA, VESSEL_SHARP, VESSEL_SEP, 0.0, 4.0);
         let fs = 1.0 / r;
@@ -5264,7 +5264,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         for (j, e) in lut.iter_mut().enumerate() {
             *e = vessel.at(1.0 - (j as f32 + 0.5) * (1.0 / SUB) * fs, fs);
         }
-        // The orb, between the rings and the body as tools/orb-tune layers it (the rings are the glass, in front), on a live radio not switched off: its grid made again only when its measures changed (`ORB_GRIDS`), each pixel read from it. A circle with text (off, or no radio) has none, so the text and the orb never meet.
+        // The orb, between the rings and the body as tools/tune's orbs page layers it (the rings are the glass, in front), on a live radio not switched off: its grid made again only when its measures changed (`ORB_GRIDS`), each pixel read from it. A circle with text (off, or no radio) has none, so the text and the orb never meet.
         let orb_grid: Option<&[u64]> = match radio {
             Some(ri) if ORBS && live && !switched_off => unsafe {
                 let (key, base, len) = ORB_GRIDS[ri];

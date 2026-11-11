@@ -730,7 +730,7 @@ fn orb(p: &Prep, x: f32, y: f32, rho2: f32, fs: f32) -> [f32; 3] {
 
 
 /// Row `j` of one circle of radius `r` pixels in a square of side 2⌈r⌉ + 4 (`row` that many pixels), `ss` × `ss` samples a pixel (ss a power of two), with the row of the name's layer `text` (a composite, or empty).
-/// The caller spreads the rows over its threads (orb-tune with rayon); each row is independent.
+/// The caller spreads the rows over its threads (tools/tune with rayon); each row is independent.
 pub fn render_row(p: &Prep, r: f32, ss: u32, j: usize, row: &mut [G2t16], text: &[G2t16]) {
     let mid = row.len() as f32 * 0.5;
     let fs = 1. / (r * ss as f32);
