@@ -23,7 +23,7 @@ One word per thing, used the same way in the docs, the kernel, ferros_sys and th
 3. **Spawn** runs only sealed images. No instruction scan at spawn: one BLAKE3 over the image to check the seal, then `eret`.
 4. **Run.** Isolation costs only the masking instructions compiled in — plain `and`/`add`/`sub`, no compares, no branches, nothing for the branch predictor. Zero cost after compilation, the way Rust's checks are.
 
-For kists (2026-11-10, docs/KISTS.md "The installer"): steps 1 and 2 are `SYS_SPAWN` install mode, asked by the installer (payloads/kists) after it checked every egg: the kernel reads the stored capsule back from the vault, gates it where it lies, runs the checker over its masked code and keeps the seal in `sealed`; step 3 is `spawn_kist`, which launches a masked kist only when its seal is there. Native code is never installed from the network.
+For kists (2026-11-10, docs/KISTS.md "The installer"): steps 1 and 2 are `SYS_SPAWN` install mode, asked by the installer (payloads/kists) after it checked every egg against the developer bundle the capsule carries, and that bundle against the one the person trusted for that developer at their first kist (KISTS.md "Trust on first install"): the kernel reads the stored capsule back from the vault, gates it where it lies, runs the checker over its masked code and keeps the seal in `sealed`; step 3 is `spawn_kist`, which launches a masked kist only when its seal is there. Native code is never installed from the network.
 
 ## The invariant
 

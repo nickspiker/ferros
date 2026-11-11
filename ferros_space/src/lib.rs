@@ -13,6 +13,7 @@
 //! | `DEPART` | the leaving device `ke` | its signed departure request `v`, or once denied the signed deny | none: the identity service's own (payloads/fgtw), so a member answers it wherever it is |
 //! | `ZONE` | the fleet's scope `ke` | automatic `u` (1 or 0), then the IANA id by hand `a` when there is one | none: the identity service writes it to the kernel (SYS_ZONE op 4) on each device, which follows it unless its settings say otherwise |
 //! | `LANG` | the fleet's scope `ke` | the language `wl` (its ISO 639-3 code) | none: the identity service writes it to the kernel (SYS_LANG op 2) on each device, which follows it unless its settings say otherwise |
+//! | `PIN` | developer `ke` | the bundle's commitment `hp`, then the developer's name `a` when their first kist gave one; the entry's stamp is when it was pinned | a `pin` section of `kists.list` (trust on first install) |
 //!
 //! The scope of a place and the view is the fleet's (`FLEET`, 32 zero bytes) on every device whose home-screen sync is on (the default), and the device's own key on one where the person switched it off, so that device keeps an arrangement of its own, which follows it through a reset all the same.
 //!
@@ -45,6 +46,8 @@ pub mod kind {
     pub const ZONE: u8 = 7;
     /// The person's language (SETTINGS.md, as the zone: "per identity, you can uncheck and set per device"): chosen on the language page of a device that follows it, written to each device that follows it, never read back from one.
     pub const LANG: u8 = 8;
+    /// A developer the person trusted on first install (owner, 2026-11-10): the commitment of the key bundle that developer's first kist carried, so every device of theirs refuses a kist from that key with another bundle. An uninstall keeps it.
+    pub const PIN: u8 = 9;
 }
 
 /// The scope of the fleet's shared arrangement.
@@ -92,6 +95,20 @@ pub fn kist_id(developer: &[u8; 32], option: &[u8; 32]) -> Vec<VsfType> {
 
 pub fn answer_id(developer: &[u8; 32], option: &[u8; 32], right: u8) -> Vec<VsfType> {
     vec![VsfType::ke(developer.to_vec()), VsfType::hp(option.to_vec()), VsfType::u(right as usize, false)]
+}
+
+/// A pin's id: the developer's key.
+pub fn pin_id(developer: &[u8; 32]) -> Vec<VsfType> {
+    vec![VsfType::ke(developer.to_vec())]
+}
+
+/// A pin's fact value: the bundle's commitment, then the developer's name when there is one.
+fn pin_value(p: &ferros_kist::Pin) -> Vec<VsfType> {
+    let mut v = vec![VsfType::hp(p.bundle.to_vec())];
+    if let Some(n) = &p.name {
+        v.push(VsfType::a(vsf::Ascii::checked("name", n.clone())));
+    }
+    v
 }
 
 pub fn default_id(right: u8) -> Vec<VsfType> {
@@ -386,6 +403,10 @@ fn snapshot(list: &Kists, store: &mut impl Store, scope: &[u8; 32]) -> Result<Ve
             }
         }
     }
+    for p in &list.pins {
+        // No stamp of its own: a device that pinned another bundle for a developer the space already pins takes the space's (the first to reach the person's space stands, as trust on first use wants), rather than the later pin winning by its time. Two pins made apart and merged before either device synced are the space's merge to settle (the later write).
+        facts.push(Fact { kind: kind::PIN, id: pin_id(&p.developer), value: pin_value(p), stamp: None });
+    }
     for r in 0..RIGHTS.len() as u8 {
         facts.push(Fact { kind: kind::DEFAULT, id: default_id(r), value: vec![VsfType::u((list.defaults >> r & 1) as usize, false)], stamp: None });
     }
@@ -406,7 +427,7 @@ fn snapshot(list: &Kists, store: &mut impl Store, scope: &[u8; 32]) -> Result<Ve
 /// Which of the space's entries this device's copy mirrors: every kist and default; an answer only for a want its kist declares here (an answer to a want an older capsule lacks waits in the space, untouched, for the update that brings it); a place only in this device's scope and only for a circle it has; the view in its scope.
 fn managed(list: &Kists, scope: &[u8; 32], k: u8, id: &[VsfType]) -> bool {
     match k {
-        kind::KIST | kind::DEFAULT => true,
+        kind::KIST | kind::DEFAULT | kind::PIN => true,
         kind::ANSWER => match (id.first().and_then(k32), id.get(1).and_then(k32), id.get(2).and_then(|v| v.as_u64())) {
             (Some(d), Some(o), Some(r)) => list.kists.iter().any(|x| x.developer == d && x.option == o && x.wants.iter().any(|w| w.right as u64 == r)),
             _ => false,
@@ -476,6 +497,32 @@ fn apply(w: Write, list: &mut Kists, list_changed: &mut bool, store: &mut impl S
             }
             true
         }
+        Write::Set { kind: kind::PIN, id, value, updated } => {
+            // Each value by its type marker: the commitment `hp`, the name `a`. WHY `try_from`: the length is the space's (another device wrote it); it refuses any but 32 bytes.
+            let bundle = value.iter().find_map(|v| match v {
+                VsfType::hp(h) => <[u8; 32]>::try_from(h.as_slice()).ok(),
+                _ => None,
+            });
+            let (Some(developer), Some(bundle)) = (id.first().and_then(k32), bundle) else { return true };
+            let name = value.iter().find_map(|v| match v {
+                VsfType::a(t) => Some(String::from(t.as_str())),
+                _ => None,
+            });
+            let p = ferros_kist::Pin { developer, bundle, name, pinned: updated };
+            match list.pins.iter_mut().find(|x| x.developer == developer) {
+                Some(x) => *x = p,
+                None => list.pins.push(p),
+            }
+            *list_changed = true;
+            true
+        }
+        Write::Remove { kind: kind::PIN, id } => {
+            if let Some(d) = id.first().and_then(k32) {
+                list.pins.retain(|p| p.developer != d);
+                *list_changed = true;
+            }
+            true
+        }
         Write::Set { kind: kind::PLACE, id, value, .. } => match (place_of(&id), ints_of::<5>(&value)) {
             (Some((_, c)), Some(p)) => match label_of(list, &c) {
                 Some(l) => store.set(Scope::Map, &place_key(l), &encode_place(&p)),
@@ -532,7 +579,7 @@ pub fn sync(space: &mut Space, base: &mut Baseline, store: &mut impl Store, me: 
         // Kists before answers and places: an answer or a place names a kist the list must already hold.
         let (first, rest): (Vec<Write>, Vec<Write>) = writes.into_iter().partition(|w| matches!(w, Write::Set { kind: kind::KIST, .. } | Write::Remove { kind: kind::KIST, .. }));
         for w in first.into_iter().chain(rest) {
-            // Kinds are 0 to 8 (`kind`): a bit each in a u16.
+            // Kinds are 0 to 9 (`kind`): a bit each in a u16.
             kinds |= 1 << match &w { Write::Set { kind, .. } | Write::Remove { kind, .. } => *kind };
             if !apply(w, &mut list, &mut list_changed, store) {
                 *base = before;
@@ -747,6 +794,44 @@ mod tests {
         // Settled on every device.
         assert_eq!(sync(&mut sa, &mut ba, &mut a, &PRO, 2700).unwrap().wrote, 0);
         assert_eq!(sync(&mut sb, &mut bb, &mut b, &OTHER, 2700).unwrap().wrote, 0);
+    }
+
+    /// Trust on first install follows the person: a developer pinned on one device is pinned on the others and on a reset one; an uninstall keeps it; a device that pinned another bundle for that developer before it synced takes the space's, the first to reach it.
+    #[test]
+    fn a_pin_travels_and_the_first_one_stands() {
+        let mut a = arranged_pro();
+        let mut la = read_list(&mut a).unwrap();
+        assert_eq!(la.trust(&MAHERE.0, &[0xC1; 32], Some("Mahere's developer"), 1500), ferros_kist::Trust::First);
+        a.set(Scope::Kists, ferros_kist::LIST, &la.build(1500).unwrap());
+        let (mut sa, mut ba) = (Space::new(), Baseline::default());
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2000).unwrap();
+        // Another device pinned another bundle for the same key while apart (an attacker's capsule reached it first there).
+        let mut b = Vault::default();
+        let mut lb = Kists::default();
+        lb.trust(&MAHERE.0, &[0xEE; 32], Some("someone"), 1900);
+        b.set(Scope::Kists, ferros_kist::LIST, &lb.build(1900).unwrap());
+        let (mut sb, mut bb) = (hand_over(&sa), Baseline::default());
+        sync(&mut sb, &mut bb, &mut b, &OTHER, 2100).unwrap();
+        let lb = read_list(&mut b).unwrap();
+        assert_eq!(lb.pin_of(&MAHERE.0).map(|p| p.bundle), Some([0xC1; 32]), "the space's pin stands");
+        assert_eq!(lb.pin_of(&MAHERE.0).and_then(|p| p.name.clone()).as_deref(), Some("Mahere's developer"));
+        // Uninstalled on the Pro: the pin stays there, in the space and on the other device.
+        let mut la = read_list(&mut a).unwrap();
+        la.remove(&MAHERE.0, &MAHERE.1);
+        a.set(Scope::Kists, ferros_kist::LIST, &la.build(2200).unwrap());
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2201).unwrap();
+        assert!(read_list(&mut a).unwrap().pin_of(&MAHERE.0).is_some());
+        sb.merge(hand_over(&sa));
+        sync(&mut sb, &mut bb, &mut b, &OTHER, 2300).unwrap();
+        assert_eq!(read_list(&mut b).unwrap().pin_of(&MAHERE.0).map(|p| p.bundle), Some([0xC1; 32]));
+        // A reset device comes back with it.
+        let mut fresh = Vault::default();
+        let (mut sf, mut bf) = (hand_over(&sa), Baseline::default());
+        sync(&mut sf, &mut bf, &mut fresh, &FRESH, 2400).unwrap();
+        assert_eq!(read_list(&mut fresh).unwrap().pin_of(&MAHERE.0).map(|p| p.bundle), Some([0xC1; 32]));
+        // Settled.
+        assert_eq!(sync(&mut sf, &mut bf, &mut fresh, &FRESH, 2500).unwrap().wrote, 0);
+        assert_eq!(sync(&mut sb, &mut bb, &mut b, &OTHER, 2500).unwrap().wrote, 0);
     }
 
     /// A vault that will not read (nobody present) syncs nothing and removes nothing.
