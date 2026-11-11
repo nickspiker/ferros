@@ -3112,6 +3112,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     Some(o) => objects.push(o),
                 }
             }
+            // A child handed the Settings capability (the map: the quick row's torch, QUICK.md) gets the torch's send right too, as the slot after its last: init's grants page is full (108 slots), so init cannot hold one to pass on, and the torch's server is the kernel's to start anyway (`ON_DEMAND`, docs/TORCH.md). Who may set the device's settings may light its torch.
+            if !bad && objects.iter().any(|o| matches!(o.0, Object::Settings)) {
+                objects.push((Object::Endpoint(endpoint(b"torch")), RIGHT_SEND));
+            }
             // x2 bit 0: only if no live process has this name — init's keepers start a driver again this way (NOTHING: it is running), never a second beside one that is alive but not serving yet.
             let shown = if name.is_empty() { &key } else { &name };
             if f.x[2] & 1 != 0 && k().procs.iter().flatten().any(|q| q.name == *shown && !q.dying) {
