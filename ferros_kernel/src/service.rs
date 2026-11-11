@@ -754,6 +754,52 @@ fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
     }
 }
 
+/// Attest with a tag (AUTH.md; SYS_UNLOCK ops 6-9, process.rs `tag_syscall`). The flash log names a tag only by the start of its id (a keyed hash of its UID, kvault `TAG_ID_CONTEXT`), never by its UID.
+fn store_tag(op: crate::process::TagOp) -> Result<u64, ()> {
+    use crate::process::TagOp;
+    let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
+    match op {
+        TagOp::Unlock(uid, out) => match st.tag_unlock(uid, crate::process::pref(crate::process::PREF_UNLOCK_AT_BOOT) == 1) {
+            Ok(seed) => {
+                *out = seed;
+                crate::flashlog::line("identity unlocked by a kept tag");
+                Ok(st.identity_entries() as u64)
+            }
+            Err(crate::kvault::KvError::Belongs) => {
+                crate::flashlog::line("tag refused: this device is bound to another identity");
+                Ok(crate::process::NOTHING)
+            }
+            Err(e) => {
+                crate::flashlog::line(&alloc::format!("tag refused ({e:?})"));
+                Err(())
+            }
+        },
+        TagOp::Keep(uid) => match st.tag_keep(uid) {
+            Ok(true) => {
+                crate::flashlog::line("tag kept for the identity present");
+                Ok(0)
+            }
+            Ok(false) => Ok(1),
+            Err(e) => {
+                crate::flashlog::line(&alloc::format!("tag not kept ({e:?})"));
+                Err(())
+            }
+        },
+        TagOp::Forget(which) => {
+            let n = st.tag_forget(which).map_err(|_| ())?;
+            crate::flashlog::line(&alloc::format!("{n} kept tags forgotten"));
+            Ok(n as u64)
+        }
+        TagOp::List(out) => {
+            let tags = st.tag_list().map_err(|_| ())?;
+            for (id, added) in &tags {
+                out.extend_from_slice(id);
+                out.extend_from_slice(&added.to_le_bytes());
+            }
+            Ok(tags.len() as u64)
+        }
+    }
+}
 
 /// The identity's own entries on this device as one VSF document, for the identity service to seal into its fleet before a departure (SYS_UNLOCK op 5; the Fleet page's "save first"): section `identity_export`, one `entry` field per vault name, its values the name (`d`) and the stored bytes (`v'r'`). None while locked.
 fn store_export() -> Option<alloc::vec::Vec<u8>> {
@@ -1699,6 +1745,7 @@ pub fn run(mut b: Boot) -> ! {
         crate::process::DOMAIN_BASE = Some(domain_base);
         crate::process::UNLOCK = Some(store_unlock);
         crate::process::EXPORT = Some(store_export);
+        crate::process::TAG = Some(store_tag);
         crate::platform::BEFORE_RESET = Some(lock_before_reset);
     }
     let mut home_started = !matches!(b.kind, BootKind::Cold);

@@ -1746,6 +1746,76 @@ pub fn export_identity(cap: u64, buf: &mut [u8]) -> Option<usize> {
     }
 }
 
+/// Attest with a tag (AUTH.md "Attest with a tag"): how many bytes of a kept tag's id the list gives and a forget names.
+pub const TAG_SHOWN: usize = 8;
+
+/// A kept tag as the kernel lists it: the start of its id (a keyed hash of its UID, never the UID) and when it was kept (Eagle time, oscillations; 0 when the record does not say).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct KeptTag {
+    pub id: [u8; TAG_SHOWN],
+    pub added: i64,
+}
+
+/// Unlock by a tag (SYS_UNLOCK op 6, the Unlock right): the kernel opens the record it keeps for the tag whose UID this is and unlocks its identity as `unlock_identity` would; the identity's seed lands in `seed`, for the identity service. `Failed` for a tag kept for nothing here, one whose record does not open, a UID that is not 4, 7 or 10 bytes, or no right: one refusal, no detail.
+pub fn unlock_by_tag(cap: u64, uid: &[u8], seed: &mut [u8; 32]) -> Unlock {
+    match svc(nr::UNLOCK, cap, 6, off(uid.as_ptr()), uid.len() as u64, off(seed.as_mut_ptr())) {
+        ERR => Unlock::Failed,
+        NOTHING => Unlock::Belongs,
+        n => Unlock::Opened(n),
+    }
+}
+
+/// Keep the tag whose UID this is for the identity present (SYS_UNLOCK op 7, the Unlock right or Settings): Some(true) kept, Some(false) kept already, None refused (nobody present, or it could not be kept).
+pub fn keep_tag(cap: u64, uid: &[u8]) -> Option<bool> {
+    match svc(nr::UNLOCK, cap, 7, off(uid.as_ptr()), uid.len() as u64, 0) {
+        0 => Some(true),
+        1 => Some(false),
+        _ => None,
+    }
+}
+
+/// Forget the kept tag whose id starts so, or every kept tag (None) (SYS_UNLOCK op 8): how many went, None refused.
+pub fn forget_tag(cap: u64, which: Option<&[u8; TAG_SHOWN]>) -> Option<u64> {
+    let r = match which {
+        Some(w) => svc(nr::UNLOCK, cap, 8, off(w.as_ptr()), TAG_SHOWN as u64, 0),
+        None => svc(nr::UNLOCK, cap, 8, 0, 0, 0),
+    };
+    (r != ERR).then_some(r)
+}
+
+/// The kept tags (SYS_UNLOCK op 9) into `out`: how many are kept and how many of them `out` took, None refused (nobody present).
+pub fn kept_tags(cap: u64, out: &mut [KeptTag]) -> Option<(usize, usize)> {
+    const ENTRY: usize = TAG_SHOWN + 8;
+    let mut b = [0u8; ENTRY << 4];
+    let n = svc(nr::UNLOCK, cap, 9, off(b.as_mut_ptr()), b.len() as u64, 0);
+    if n == ERR {
+        return None;
+    }
+    let took = (n as usize).min(out.len()).min(b.len() / ENTRY);
+    for (k, t) in out[..took].iter_mut().enumerate() {
+        let e = &b[k * ENTRY..(k + 1) * ENTRY];
+        t.id.copy_from_slice(&e[..TAG_SHOWN]);
+        t.added = i64::from_le_bytes([e[8], e[9], e[10], e[11], e[12], e[13], e[14], e[15]]);
+    }
+    Some((n as usize, took))
+}
+
+/// The NFC driver's unlock tags (payloads/nfc ops 9 and 10, attest with a tag).
+pub mod nfc {
+    /// Held until the NFC driver reads an unlock tag (NFC-A, Type 2, a 7- or 10-byte UID): its UID into `uid` and its length; None when the driver let the call go (op 10, or more callers held than it keeps) or is not there. Call it from a thread of its own: it waits as long as no tag comes.
+    pub fn tag_wait(nfc: u64, uid: &mut [u8; 10]) -> Option<usize> {
+        let n = super::call(nfc, &[9], uid);
+        // WHY the check: the length is the driver's word; only a UID length it can send (7 or 10) is one.
+        matches!(n, 7 | 10).then_some(n as usize)
+    }
+
+    /// Every held `tag_wait` let go (answered with nothing). True when the driver answered.
+    pub fn tag_let_go(nfc: u64) -> bool {
+        let mut r = [0u8; 1];
+        super::call_live(nfc, &[10], &mut r) == 1
+    }
+}
+
 /// A granted region reached through its handle (SANDBOX.md, "Handles"): slot `SLOT`'s pair in the handle table at the arc's start (its base and its mask, written by the kernel, read-only to the process), every access `base + (offset & mask)` in exactly the instruction forms the sandbox checker admits: the pair load `ldp x23, x22, [x28, #16·SLOT]`, the masked offset `and x21, off, x22`, the access `[x23, x21]`. Native and masked code run the same instructions; a masked process can reach a granted region no other way. An offset past the region wraps inside it. A grant with no region (an endpoint, a right) has a zero pair: every access lands on address 0 and faults, which is the right answer.
 pub struct Handle<const SLOT: u64>;
 
