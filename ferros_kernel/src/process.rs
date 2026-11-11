@@ -943,6 +943,8 @@ const SYS_ZONE: u64 = 35;
 const SYS_LANG: u64 = 36;
 /// claim(op, …): the rights in use (`CLAIMS`; owner, 2026-11-10: GPS "stays green but no visuals for satellites since we're not rx'ing ... until something like mahere calls it or I open the GPS screen ... or Photon a friend pings for my location", and "we need to be able to see what kists are using each permission"). A right by its code (ferros_kist::RIGHTS); only GPS is claimed today. Op 0: claim x1 the right, x2 the token offset of what proves the caller may use it (for GPS: Settings, the settings page's, or the `gps` endpoint's send right, a kist's granted want) → 0 (also when it held one already), ERR refused (no such right or proof, nobody present, GPS switched off). Op 1: release x1 the right → 0. Op 2: who claims x1 the right, x2 the Settings token, x3/x4 a buffer and its length → how many claims (all of them; records past the buffer are not written), each `CLAIM_REC` bytes: 0 a system process or 1 a kist, then the kist's capsule address (32 bytes, zeros for a system process); ERR without Settings. Op 3: the GPS driver asked thru the kernel for a Settings holder that holds a GPS claim (the map's page: init's grants page has no slot left for its own `use gps`): x1 the driver's op (0 FIX, 2 SATS, payloads/gps), x2 the Settings token, x3/x4 the reply's buffer and its length with CALL_LIVE set, the call the caller's own as SYS_CALL makes it → the reply's length, ERR at once when no driver is receiving yet; or x1 = 3 | the change count last seen << 8, the driver's WATCH, its length bare (no CALL_LIVE): held until the driver's fixes or fix messages move, taken by a driver that starts later, → 4 bytes, the count now. The position passes thru, never kept. Op 4: the claims' doorbell, x1 a word in the caller's arc, x2 the Settings token: GPS_CLAIMS written there now and at every change, its waiters woken → 0.
 const SYS_CLAIM: u64 = 37;
+/// bell(source, word): a doorbell on what the settings pages show (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure. 1s poll can desync too, that needs fixd."). x0 the source: 0-5 a link in the facts' order (its eight measures, its tracks and its detail document: counted when its driver sets one to a value other than the one it held, and when the driver ends and they empty), `BELL_FACTS` the device's facts a settings page shows (`bell_facts`). x1 a word in the caller's arc, 8-aligned as SYS_WAIT takes one: the kernel writes the source's change count there now and at every change, waking whatever of the process waits on it (`bell_ring`). One word a source a process; a second registration moves it. No capability: the measures, tracks and facts are what SYS_FACTS and SYS_TRACKS give anyone, and a detail's count says when it changed, never what it says. → 0, ERR for no such source.
+const SYS_BELL: u64 = 38;
 /// A record of SYS_CLAIM op 2: the kind, then a capsule address.
 pub const CLAIM_REC: usize = 33;
 /// Each link's control block: words 1 to CONTROLS - 1 (word 0 is the generation, `CONTROL_GEN`), all ones until set.
@@ -2099,6 +2101,8 @@ fn drain_dying(cur: usize) -> bool {
     if !kk.threads.iter().any(|x| matches!(x, Some(x) if x.proc == pi)) {
         if let Some(p) = kk.procs[pi].take() {
             arc_free(p.arc);
+            // The slot empty only now: the table changed again (the process count the facts' bell watches, service.rs `bell_facts`).
+            PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
         }
     }
     true
@@ -2585,13 +2589,18 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let slot = [b"modem" as &[u8], b"pcie1", b"bt", b"nfc", b"gps", b"usb"].iter().position(|n| !p.kist && *n == p.name.as_slice());
             f.x[0] = match slot {
                 // The slot comes from the process: bounded so a bad one is refused, not a write past the radio's eight.
+                // A word other than the one it held rings the link's bell (SYS_BELL): the page showing the link draws again, and a driver setting the same word again rings nothing.
                 Some(i) if f.x[0] < 8 => {
-                    STATUS[i][f.x[0] as usize].store(f.x[1], core::sync::atomic::Ordering::Relaxed);
+                    if STATUS[i][f.x[0] as usize].swap(f.x[1], core::sync::atomic::Ordering::Relaxed) != f.x[1] {
+                        bell_count(i);
+                    }
                     0
                 }
                 // Slots 8 and up: the link's tracks, bounded as the measures are.
                 Some(i) if f.x[0] < (8 + TRACKS) as u64 => {
-                    TRACK[i][f.x[0] as usize - 8].store(f.x[1], core::sync::atomic::Ordering::Relaxed);
+                    if TRACK[i][f.x[0] as usize - 8].swap(f.x[1], core::sync::atomic::Ordering::Relaxed) != f.x[1] {
+                        bell_count(i);
+                    }
                     0
                 }
                 Some(_) => ERR,
@@ -2806,16 +2815,23 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     p.write(f.x[3], &out);
                     mine.len() as u64
                 }
-                // The claims' doorbell for a Settings holder (the map's permissions and GPS pages): a word in its arc (x1, 8-aligned, inside the arc as SYS_WAIT takes one) the kernel writes GPS_CLAIMS into now and at every change, waking whatever of it waits there (`claims_publish`). One word a process; a second registration moves it.
+                // The claims' doorbell for a Settings holder (the map's permissions and GPS pages): a word in its arc (x1) the kernel writes GPS_CLAIMS into now and at every change, waking whatever of it waits there (`claims_publish`, one of the bells, SYS_BELL). One word a process; a second registration moves it.
                 4 if matches!(held(f.x[2]), Some(Object::Settings)) => {
-                    let addr = p.arc.base + ((f.x[1] as usize) & p.arc.mask() & !7);
-                    let words = unsafe { &mut *(&raw mut CLAIM_WORDS) };
-                    words.retain(|w| w.0 != pi);
-                    words.push((pi, p.epoch, addr));
-                    unsafe { core::ptr::write_volatile(addr as *mut u64, GPS_CLAIMS.load(core::sync::atomic::Ordering::Acquire)) };
+                    bell_register(p, pi, BELL_CLAIMS, f.x[1], GPS_CLAIMS.load(core::sync::atomic::Ordering::Acquire));
                     0
                 }
                 _ => ERR,
+            };
+            0
+        }
+        SYS_BELL => {
+            // WHY the bound: the source is the caller's, an index into the counts; the claims' bell is SYS_CLAIM op 4's, behind Settings.
+            let source = f.x[0] as usize;
+            f.x[0] = if source <= BELL_FACTS {
+                bell_register(p, pi, source, f.x[1], BELL_COUNT[source].load(core::sync::atomic::Ordering::Acquire));
+                0
+            } else {
+                ERR
             };
             0
         }
@@ -2848,9 +2864,14 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     Some(i) if (f.x[2] as usize) <= DETAIL_MAX => {
                         let n = f.x[2] as usize;
                         let doc = p.read(f.x[1], n);
+                        // A document other than the one kept rings the link's bell (SYS_BELL), as a measure does.
+                        let changed = unsafe { (*(&raw const DETAIL_LEN))[i] != n || (&(*(&raw const DETAIL))[i])[..n] != doc[..] };
                         unsafe {
                             (&mut *(&raw mut DETAIL))[i][..n].copy_from_slice(&doc);
                             (*(&raw mut DETAIL_LEN))[i] = n;
+                        }
+                        if changed {
+                            bell_count(i);
                         }
                         0
                     }
@@ -3359,20 +3380,34 @@ fn right_is_gps(r: u8) -> bool {
     ferros_kist::RIGHTS.get(r as usize) == Some(&"gps")
 }
 
-/// The claims' doorbells (SYS_CLAIM op 4): (the process's slot, its epoch, the word's address in its arc). Under the kernel lock.
-static mut CLAIM_WORDS: Vec<(usize, u64, usize)> = Vec::new();
+/// The bells' sources (SYS_BELL): 0-5 the links in the facts' order, then the facts a settings page shows, then GPS's claims (SYS_CLAIM op 4, for a Settings holder; its word is GPS_CLAIMS itself, which carries its own change count).
+pub const BELL_FACTS: usize = 6;
+const BELL_CLAIMS: usize = 7;
+const BELLS: usize = 8;
+/// Each source's change count (the claims' is GPS_CLAIMS'), so a word registered late starts from the count now and a reader tells a change by inequality.
+static BELL_COUNT: [core::sync::atomic::AtomicU64; BELLS] = [const { core::sync::atomic::AtomicU64::new(0) }; BELLS];
+/// The bells' words (SYS_BELL, SYS_CLAIM op 4): (the process's slot, its epoch, the word's address in its arc, the source). At most one a source a process. Under the kernel lock.
+static mut BELL_WORDS: Vec<(usize, u64, usize, usize)> = Vec::new();
 
-/// The claims changed: GPS's count published with its change counted, written into every registered doorbell word with its waiters woken (a page asleep on it draws again; owner, 2026-11-10: "Needs a doorbell"), and the service loop woken (`sev`) to start or stop the driver, never on a timer. A word whose process has ended (its slot empty, dying, or a successor's) is dropped, never written.
-fn claims_publish() {
-    let n = unsafe { (*(&raw const CLAIMS)).iter().filter(|c| right_is_gps(c.right)).count() } as u64;
-    let g = GPS_CLAIMS.load(core::sync::atomic::Ordering::Relaxed) >> 16;
-    let v = (g + 1) << 16 | n;
-    GPS_CLAIMS.store(v, core::sync::atomic::Ordering::Release);
+/// A word in the caller's arc (`at`, 8-aligned and inside the arc as SYS_WAIT takes one) rung for `source` from now, `value` written there at once; one the process registered for the source before is dropped. Under the kernel lock.
+fn bell_register(p: &Process, pi: usize, source: usize, at: u64, value: u64) {
+    let addr = p.arc.base + ((at as usize) & p.arc.mask() & !7);
+    let words = unsafe { &mut *(&raw mut BELL_WORDS) };
+    words.retain(|w| !(w.0 == pi && w.3 == source));
+    words.push((pi, p.epoch, addr, source));
+    unsafe { core::ptr::write_volatile(addr as *mut u64, value) };
+}
+
+/// `source` changed: `value` written into every word registered for it and the threads of its process waiting there woken, so a page asleep on it, or a loop that reads it, draws again (owner, 2026-11-10: "Needs a doorbell"). A word whose process has ended (its slot empty, dying, or a successor's) is dropped, never written. Under the kernel lock.
+fn bell_ring(source: usize, value: u64) {
     let kk = k();
-    let words = unsafe { &mut *(&raw mut CLAIM_WORDS) };
-    words.retain(|&(pi, epoch, _)| kk.procs.get(pi).and_then(|q| q.as_ref()).is_some_and(|q| q.epoch == epoch && !q.dying));
-    for &(pi, _, addr) in words.iter() {
-        unsafe { core::ptr::write_volatile(addr as *mut u64, v) };
+    let words = unsafe { &mut *(&raw mut BELL_WORDS) };
+    words.retain(|&(pi, epoch, _, _)| kk.procs.get(pi).and_then(|q| q.as_ref()).is_some_and(|q| q.epoch == epoch && !q.dying));
+    for &(pi, _, addr, s) in words.iter() {
+        if s != source {
+            continue;
+        }
+        unsafe { core::ptr::write_volatile(addr as *mut u64, value) };
         for (t, x) in kk.threads.iter_mut().enumerate() {
             if let Some(x) = x {
                 if x.proc == pi && matches!(x.state, State::Waiting(a, _) if a == addr) {
@@ -3383,6 +3418,21 @@ fn claims_publish() {
             }
         }
     }
+}
+
+/// `source` (a link, or `BELL_FACTS`) changed: its count moved on by one and rung. Under the kernel lock: from a syscall, or the service loop thru `with_lock` (service.rs `bell_facts`).
+pub fn bell_count(source: usize) {
+    let v = BELL_COUNT[source].fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1;
+    bell_ring(source, v);
+}
+
+/// The claims changed: GPS's count published with its change counted, rung into every claims bell (`bell_ring`), and the service loop woken (`sev`) to start or stop the driver, never on a timer.
+fn claims_publish() {
+    let n = unsafe { (*(&raw const CLAIMS)).iter().filter(|c| right_is_gps(c.right)).count() } as u64;
+    let g = GPS_CLAIMS.load(core::sync::atomic::Ordering::Relaxed) >> 16;
+    let v = (g + 1) << 16 | n;
+    GPS_CLAIMS.store(v, core::sync::atomic::Ordering::Release);
+    bell_ring(BELL_CLAIMS, v);
     unsafe { core::arch::asm!("sev") };
 }
 
@@ -3423,6 +3473,8 @@ fn link_emptied(name: &[u8]) {
         w.store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
     }
     unsafe { (*(&raw mut DETAIL_LEN))[i] = 0 };
+    // The page showing the link draws it emptied (SYS_BELL).
+    bell_count(i);
 }
 
 /// Bumped whenever a process is made, ends or is killed: what the service loop watches to act on the process table changing (the GPU's clock, service.rs), with no poll.
