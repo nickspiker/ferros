@@ -1663,8 +1663,8 @@ pub mod window {
         if n == super::ERR || n < 7 || r[0] != 0 {
             return None;
         }
-        // WHY the bound: the count byte is the display's, and a reply is cut at the buffer; only whole events that arrived are read.
-        let k = (r[6] as usize).min(EVENTS).min((n as usize - 7) / 2);
+        // WHY the bounds: the count byte and the length are the display's (another process's word), and a reply longer than the buffer is cut at it; only whole events that landed in the buffer are read, at most `out`'s.
+        let k = (r[6] as usize).min(EVENTS).min(((n as usize).min(r.len()) - 7) / 2);
         for (i, e) in out[..k].iter_mut().enumerate() {
             *e = u16::from_le_bytes([r[7 + 2 * i], r[8 + 2 * i]]);
         }
