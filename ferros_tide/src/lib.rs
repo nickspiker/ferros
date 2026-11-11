@@ -19,6 +19,12 @@
 //! Host-tested against NOAA CO-OPS's published highs and lows for 2026-11-01 to 07 at four stations (San Francisco, The Battery, Seattle, Honolulu: semidiurnal to strongly mixed), src/tests.rs: as the printed tables take the constituents ([`Frame::printed`]) every time within 2.1 minutes and every height within 1.3 cm (means 0.3 to 0.7 min, 0.2 to 0.8 cm); as the puck takes them, live ([`Frame::at`]), within 3.3 minutes and 3.0 cm (Seattle's large diurnal tide, where the year-middle f and u differ most from the moment's).
 #![no_std]
 
+#[cfg(feature = "vsf")]
+extern crate alloc;
+/// Stations and their catalog as VSF documents.
+#[cfg(feature = "vsf")]
+pub mod station;
+
 use libm::{acos, atan, atan2, cos, floor, sin, sqrt, tan};
 
 /// Where the Eagle epoch (1969-07-20 20:17:40 UTC) falls in POSIX seconds: vsf's `EAGLE_EPOCH_UNIX_SECS`, repeated here so the engine needs no vsf.

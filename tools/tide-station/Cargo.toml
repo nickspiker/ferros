@@ -1,0 +1,16 @@
+[package]
+name = "tide-station"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Tide stations as VSF (docs/PUCKS.md): converts a source's published harmonic constants (NOAA CO-OPS's JSON, fetched on the host) to a station document, builds the catalog the tide puck finds the nearest station in, and prints a station's highs and lows to check it."
+
+# Its own workspace, as the other host tools under tools/ have: its JSON reader stays out of the device workspace's lock.
+[workspace]
+
+[dependencies]
+# The station and catalog schema, and the engine: the same code the tide puck runs.
+ferros_tide = { path = "../../ferros_tide", features = ["vsf"] }
+vsf = { path = "../../../vsf" }
+# NOAA publishes JSON; it is read here, on the host, and never on the device.
+serde_json = "1"

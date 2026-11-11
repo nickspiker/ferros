@@ -22,7 +22,7 @@ fn nov(d: i64, hh: i64, mm: i64) -> f64 {
     eagle_from_unix(unix(2026, 11, d, hh, mm))
 }
 
-struct Station {
+struct Published {
     name: &'static str,
     msl: f64,
     mllw: f64,
@@ -35,7 +35,7 @@ struct Station {
 const H: bool = true;
 const L: bool = false;
 
-const SAN_FRANCISCO: Station = Station {
+const SAN_FRANCISCO: Published = Published {
     name: "San Francisco 9414290",
     msl: 2.773,
     mllw: 1.822,
@@ -56,7 +56,7 @@ const SAN_FRANCISCO: Station = Station {
     ],
 };
 
-const THE_BATTERY: Station = Station {
+const THE_BATTERY: Published = Published {
     name: "The Battery 8518750",
     msl: 1.785,
     mllw: 1.002,
@@ -77,7 +77,7 @@ const THE_BATTERY: Station = Station {
     ],
 };
 
-const SEATTLE: Station = Station {
+const SEATTLE: Published = Published {
     name: "Seattle 9447130",
     msl: 4.443,
     mllw: 2.419,
@@ -98,7 +98,7 @@ const SEATTLE: Station = Station {
     ],
 };
 
-const HONOLULU: Station = Station {
+const HONOLULU: Published = Published {
     name: "Honolulu 1612340",
     msl: 1.412,
     mllw: 1.161,
@@ -119,7 +119,7 @@ const HONOLULU: Station = Station {
     ],
 };
 
-fn tide_of(s: &Station) -> Tide {
+fn tide_of(s: &Published) -> Tide {
     let mut t = Tide::flat(s.msl - s.mllw);
     for (k, &(a, g)) in s.hc.iter().enumerate() {
         t.set(k, a, g);
@@ -129,11 +129,11 @@ fn tide_of(s: &Station) -> Tide {
 
 /// Every published event against the engine's nearest one of its kind: (the worst |Δt| in minutes, the worst |Δh| in metres, the mean |Δt|, the mean |Δh|), and the counts (published, found).
 /// `printed`: the constituents as the tables take them ([`Frame::printed`]), else at each day's middle ([`Frame::at`], as the puck draws).
-fn compare(s: &Station, printed: bool) -> (f64, f64, f64, f64, usize, usize) {
+fn compare(s: &Published, printed: bool) -> (f64, f64, f64, f64, usize, usize) {
     compare_with(s, tide_of(s), printed)
 }
 
-fn compare_with(s: &Station, tide: Tide, printed: bool) -> (f64, f64, f64, f64, usize, usize) {
+fn compare_with(s: &Published, tide: Tide, printed: bool) -> (f64, f64, f64, f64, usize, usize) {
     let mut found = [Extreme { t: 0., h: 0., high: false }; 1 << 6];
     // A day at a time, as the puck asks.
     let mut n = 0;
@@ -165,7 +165,7 @@ const PRINTED_METRES: f64 = 0.015;
 const LIVE_MINUTES: f64 = 4.;
 const LIVE_METRES: f64 = 0.035;
 
-fn check(s: &Station) {
+fn check(s: &Published) {
     for (printed, minutes, metres) in [(true, PRINTED_MINUTES, PRINTED_METRES), (false, LIVE_MINUTES, LIVE_METRES)] {
         let (wt, wh, mt, mh, published, found) = compare(s, printed);
         println!("{} ({}): {} published, {} found; time worst {:.1} min, mean {:.2} min; height worst {:.1} cm, mean {:.2} cm", s.name, if printed { "printed" } else { "live" }, published, found, wt, mt, wh * 100., mh * 100.);
@@ -290,5 +290,33 @@ fn frames_agree() {
     let t = nov(3, 12, 0);
     assert!((tide.height_in(&a, t) - tide.height_in(&b, t)).abs() < 1e-3);
     assert!((tide.height_in(&a, t) - tide.height(t)).abs() < 1e-3);
+}
+
+/// The station documents tools/tide-station wrote (stations/, from the same published values) read back to the same model, and the catalog finds each station from a point near it.
+#[cfg(feature = "vsf")]
+#[test]
+fn the_station_fixtures_are_the_published_constants() {
+    use crate::station::{Catalog, Station, unit};
+    let docs: [(&[u8], &Published, (f64, f64)); 4] = [
+        (include_bytes!("../stations/9414290.tide.vsf"), &SAN_FRANCISCO, (37.7, -122.6)),
+        (include_bytes!("../stations/8518750.tide.vsf"), &THE_BATTERY, (40.6, -73.9)),
+        (include_bytes!("../stations/9447130.tide.vsf"), &SEATTLE, (47.5, -122.5)),
+        (include_bytes!("../stations/1612340.tide.vsf"), &HONOLULU, (21.4, -157.7)),
+    ];
+    let catalog = Catalog::parse(include_bytes!("../stations/catalog.vsf")).unwrap();
+    for (doc, s, near) in docs {
+        let (station, _) = Station::parse(doc).unwrap();
+        let (tide, unknown) = station.tide();
+        assert!(unknown.is_empty());
+        let want = tide_of(s);
+        assert!((tide.z0 - want.z0).abs() < 1e-6, "{}", s.name);
+        for k in 0..N {
+            // Amplitudes to the micrometre, phases to 2^-32 of a turn.
+            assert!((tide.amp[k] - want.amp[k]).abs() < 1e-6 && (tide.phase[k] - want.phase[k]).abs() < 1e-8, "{} {}", s.name, CONSTITUENTS[k].name);
+        }
+        let (k, _) = catalog.nearest(unit(near.0, near.1)).unwrap();
+        assert_eq!(catalog.stations[k].id, station.id);
+        assert!(s.name.ends_with(station.id.as_str()));
+    }
 }
 

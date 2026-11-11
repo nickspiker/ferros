@@ -3,10 +3,21 @@ name = "ferros_tide"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "The tide engine (docs/PUCKS.md): harmonic prediction from a station's 37 NOAA constituents with Schureman's nodal corrections, astronomical arguments from Eagle time, and the highs and lows by root finding on the rate. no_std, host-tested against NOAA's published predictions."
+description = "The tide engine (docs/PUCKS.md): harmonic prediction from a station's 37 NOAA constituents with Schureman's nodal corrections, astronomical arguments from Eagle time, and the highs and lows by root finding on the rate. no_std, host-tested against NOAA's published predictions. With `vsf`: stations and their catalog as VSF documents."
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
 libm = "0.2"
+# A station's document and the catalog (`station`): read on the device by the tide puck, written on the host by tools/tide-station. no_std + alloc.
+vsf = { path = "../../vsf", default-features = false, optional = true }
+# vsf hashes with blake3: its pure-Rust build, as ferros_kist takes it (its C and assembly do not build for the bare target).
+blake3 = { version = "1", default-features = false, features = ["pure"], optional = true }
+
+[features]
+vsf = ["dep:vsf", "dep:blake3"]
+
+[dev-dependencies]
+# The station fixtures (stations/) read back in the tests.
+vsf = { path = "../../vsf", default-features = false }
