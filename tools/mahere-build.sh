@@ -10,6 +10,9 @@ export AR_aarch64_unknown_ferros=aarch64-linux-gnu-ar
 export CFLAGS_aarch64_unknown_ferros="-ffreestanding -fno-stack-protector -fno-builtin -O2 -isystem $here/tools/std-sysroot/include"
 export CARGO_TARGET_AARCH64_UNKNOWN_FERROS_RUSTFLAGS='--cfg getrandom_backend="custom"'
 export CARGO_TARGET_DIR="$mahere/target/ferros"
+# Release by default (owner, 2026-11-11, Mahere on the Pro: "DAAAAMNNNN is it SSSLLLOOOWWW!": the development build ran every pixel loop unoptimised over 4 Mpx a frame); MAHERE_PROFILE=debug for a development build.
+profile=${MAHERE_PROFILE:-release}
+profile_flag=$( [ "$profile" = release ] && echo --release )
 cd "$mahere"
 cargo +nightly build -Zjson-target-spec -Zbuild-std=core,alloc,std,panic_abort -Zbuild-std-features=compiler-builtins-mem \
     --target "$here/targets/aarch64-unknown-ferros.json" \
@@ -17,6 +20,6 @@ cargo +nightly build -Zjson-target-spec -Zbuild-std=core,alloc,std,panic_abort -
     --config "patch.crates-io.fluor.path='$code/fluor'" \
     --config "patch.crates-io.kete.path='$code/kete'" \
     --config "patch.crates-io.libc.path='$code/ferros-libc'" \
-    -p mahere-ferros --features fluor/host-ferros "$@"
-out="$CARGO_TARGET_DIR/aarch64-unknown-ferros/debug/mahere"
+    -p mahere-ferros --features fluor/host-ferros $profile_flag "$@"
+out="$CARGO_TARGET_DIR/aarch64-unknown-ferros/$profile/mahere"
 aarch64-linux-gnu-objcopy -O binary "$out" "$out.bin" && echo "$out.bin: $(stat -c %s "$out.bin") bytes"
