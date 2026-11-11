@@ -556,6 +556,8 @@ struct Endpoint {
     poller: Option<usize>,
     /// The process (by epoch) that last received on it, a RECV polling or not; 0: none. What CALL_LIVE asks for: that process still alive. A driver that holds the right but has not received yet (still bringing its device up) does not count, and neither does a process that only holds the right to hand it on (init, which stays alive for its keepers since 2026-11-01: counting it, a live call to a dead driver waited forever).
     server: u64,
+    /// Its bit in `ON_DEMAND_WANT` plus one when its server is started on demand (`ON_DEMAND`), else 0.
+    on_demand: u8,
 }
 
 struct Kernel {
@@ -864,8 +866,44 @@ fn endpoint(name: &[u8]) -> usize {
     if let Some(i) = kk.endpoints.iter().position(|e| e.name == name) {
         return i;
     }
-    kk.endpoints.push(Endpoint { name: name.to_vec(), queue: alloc::collections::VecDeque::new(), poller: None, server: 0 });
+    let on_demand = ON_DEMAND.iter().position(|n| *n == name).map_or(0, |i| i as u8 + 1);
+    kk.endpoints.push(Endpoint { name: name.to_vec(), queue: alloc::collections::VecDeque::new(), poller: None, server: 0, on_demand });
     kk.endpoints.len() - 1
+}
+
+/// Endpoints whose server the kernel starts when a call finds none (docs/TORCH.md "Who starts it"; owner, 2026-11-11: the quick settings' torch). init's grants page is full, and a server that runs only while its device is in use holds no arc the rest of the time: the torch process ends itself once the LED is dark and nothing waits. Each name is a process the service loop knows how to start (service.rs `shell_grants`); its index is its bit in `ON_DEMAND_WANT`.
+pub static ON_DEMAND: &[&[u8]] = &[b"torch"];
+/// The on-demand servers a call found missing since the service loop last looked (`on_demand_take`).
+static ON_DEMAND_WANT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// A call on `ep` (or a call left queued on it by a server that ended): if its server is started on demand and none is receiving, the service loop is asked to start one, and woken (`sev`), never on a timer. A server spawned but not yet at its first receive counts as missing here; the service loop sees it alive and leaves it.
+fn on_demand_note(ep: usize) {
+    let d = k().endpoints[ep].on_demand;
+    if d != 0 && !has_receiver(ep) {
+        ON_DEMAND_WANT.fetch_or(1 << (d - 1), core::sync::atomic::Ordering::AcqRel);
+        unsafe { core::arch::asm!("sev") };
+    }
+}
+
+/// Which on-demand servers are wanted (bits by `ON_DEMAND` index), cleared as read: the service loop's, once a pass.
+pub fn on_demand_take() -> u32 {
+    ON_DEMAND_WANT.swap(0, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// An on-demand server that could not be started (no capsule in the vault, no arc free): every call waiting on its endpoint gets ERR now rather than waiting for a server that is not coming. How many were answered. Under the kernel lock.
+pub fn on_demand_refuse_locked(name: &[u8]) -> usize {
+    let kk = k();
+    let Some(ep) = kk.endpoints.iter().position(|e| e.name == name) else { return 0 };
+    let queued: Vec<usize> = kk.endpoints[ep].queue.iter().map(|q| q.0).filter(|&c| c != KERNEL_CALLER).collect();
+    for &caller in queued.iter() {
+        if let Some(ct) = th(caller) {
+            ct.frame.x[0] = ERR;
+            ct.state = State::Runnable;
+            enqueue_back(caller);
+        }
+    }
+    kk.endpoints[ep].queue.retain(|q| q.0 == KERNEL_CALLER);
+    queued.len()
 }
 
 const SYS_EXIT: u64 = 0;
@@ -1864,6 +1902,8 @@ pub static HARDWARE: &[Hw] = &[
     Hw { name: "hsi2c0", base: 0x10C8_0000, size: 0x1000, via_el3: false },
     // Bluetooth (docs/BT.md): the APM's USI1 UART (serial_18). The USI mode word and the chip's power lines are the kernel's (`POWERS`).
     Hw { name: "apm-usi1-uart", base: 0x155D_0000, size: 0x1000, via_el3: false },
+    // The torch (docs/TORCH.md, payloads/torch): hsi2c_14, the LM3644 flash driver's bus, which it shares with the camera PMIC (the kernel's camera tools refuse while the `torch` switch holds it). Pins, clock source, the controller's bring-up and the chip's enable are the kernel's (`POWERS`).
+    Hw { name: "hsi2c14", base: 0x1098_0000, size: 0x1000, via_el3: false },
 ];
 
 /// A device's power switch a spawn can grant (`bridge spawn --power NAME`): the kernel's sequence for the rails, clocks and pin modes behind a userspace driver.
@@ -1871,7 +1911,7 @@ pub struct PowerSwitch {
     pub name: &'static str,
     pub set: fn(bool) -> bool,
 }
-pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gps", set: crate::gps::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }, PowerSwitch { name: "amp", set: crate::amp::power }];
+pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gps", set: crate::gps::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }, PowerSwitch { name: "amp", set: crate::amp::power }, PowerSwitch { name: "torch", set: crate::torch::power }];
 /// A syscall buffer that resolved nowhere (`Process::span`): whose (the process's epoch), the offset as given, its length, and whether the kernel was to write it. The syscall that touched it traps at its end (`buf_trap`). Under the kernel lock: one syscall at a time.
 #[derive(Clone, Copy)]
 struct BufFault {
@@ -3106,6 +3146,12 @@ fn el0_trap(f: &mut Frame) -> u64 {
         }
         SYS_CALL => {
             let token = p.read(f.x[0], 32);
+            // An on-demand server called while none runs (`ON_DEMAND`: the torch): the service loop starts it. A live call still gets ERR now; a waiting one is served by the server once it receives.
+            if let Some((Object::Endpoint(ep), r)) = p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+                if r & RIGHT_SEND != 0 {
+                    on_demand_note(ep);
+                }
+            }
             match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                 Some((Object::Console, r)) if r & RIGHT_SEND != 0 => {
                     let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
@@ -3373,6 +3419,8 @@ fn fail_orphaned_calls() {
         if kk.endpoints[ep].queue.is_empty() {
             continue;
         }
+        // An on-demand server that ended with calls still queued (one came between its last look and its end): another is started for them.
+        on_demand_note(ep);
         let queued: Vec<usize> = kk.endpoints[ep].queue.iter().map(|q| q.0).collect();
         for caller in queued {
             if caller == KERNEL_CALLER {
