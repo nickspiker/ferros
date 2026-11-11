@@ -3,6 +3,7 @@
 //! - **The slide** (owner, 2026-11-11, on the Pro, after the first cut's grow-and-fan: "the top console pulldown is stupidly slow and jerky", then "track the finger down from top tho and slide it in so it doesn't need a re-render, just a move and composite, then do the iterate/2 each frame, like we do for the settings page until it snaps in or out of place"). The row's offset `off`, whole pixels: 0 hidden, `slide` open (the display's length, op 56's reply). A finger that lands in the doorway by the camera (op 41: 10) and goes down moves it one to one (owner, 2026-11-11: "the second console row should only show if drug down from the area in the invisible camera circle"); from open a push up brings it back the same way. The display draws the row once and only moves it.
 //! - **The lift.** The row goes open when it was pulled past a third of the way (or, pushed from open, not back past a third), else hidden: each frame the panel showed, what is left to go halves (a right shift), so it lands in a few frames and holds still (`step`). No timer: the steps are the shown frames (owner, 2026-11-08: "we follow shown frames, not composited").
 //! - **Taps.** In the doorway: the row opens, or shuts. On a quick circle: its action (`tap`). Behind the row while it shows (op 41: 12): it shuts.
+//! - **Full screen** (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"): the display neither draws the row nor gives it, the doorway or the console any pixel of the hit map, so nothing here starts; turned on by the map (the middle circle, home's swipe), the row shuts at once (`shut`).
 //! - **The rings.** A finger on brightness or the torch turns them: the angle it sweeps about the circle's centre, a whole turn the whole range, eased at both ends (`ease`) so the value slows into each end rather than stopping dead.
 //! - **The console's circles** (main.rs): every pixel of the dash is a circle's zone (the display's, nearest rim). Dragged toward the centre a circle opens its page; tapped still a radio switches and any other circle opens its page. No long press (it went 2026-11-11, with drag-to-centre back). Only the doorway pulls or taps the row open.
 
@@ -144,6 +145,15 @@ impl Quick {
         self.last = frame;
     }
 
+    /// Shut at once, no slide (owner, 2026-11-11, on the Pro: in full screen the console is "gone gone"): full screen turned on by the map's own hand (the middle circle, home's swipe). The display draws none of the row in full screen and gives none of it to the hit map, so a slide back would move nothing anyone sees; landed hidden here, the row is not found open when full screen goes off. A finger's grab or a held circle ends with it.
+    pub fn shut(&mut self) {
+        self.grab = None;
+        self.held = None;
+        self.off = 0;
+        self.target = 0;
+        self.settling = false;
+    }
+
     /// One step for each frame the panel showed since the last: what is left to go halves, the half of a pixel dropped (a right shift), so it lands in a few frames and then holds still (owner, 2026-11-11: "then do the iterate/2 each frame, like we do for the settings page until it snaps in or out of place"). Counted in shown frames, never a clock: a missed frame steps twice. Returns whether it still moves.
     pub fn step(&mut self, frame: u32) -> bool {
         if !self.settling {
@@ -257,9 +267,12 @@ impl Quick {
             }
             BRIGHTNESS => {}
             FULL_SCREEN => {
-                // The display switches the app in front's full screen and says how it stands; with no app in front it refuses (status 3) and nothing changes.
+                // The display switches the app in front's full screen and says how it stands; with no app in front it refuses (status 3) and nothing changes. Turned on, the row is gone with the console (`shut`).
                 let mut r = [0u8; 4];
                 let n = call(self.display, &[43], &mut r);
+                if n >= 2 && n != ferros_sys::ERR && r[0] == 0 && r[1] == 1 {
+                    self.shut();
+                }
                 let _ = write!(l, "map: quick: {}\n", match (n >= 2 && n != ferros_sys::ERR, r[0], r[1]) {
                     (true, 0, 1) => "full screen",
                     (true, 0, _) => "full screen off",

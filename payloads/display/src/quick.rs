@@ -302,7 +302,7 @@ fn look(k: usize, s: &Now) -> (f32, bool, Option<f32>, u64) {
         },
         Item::Dnd => if ferros_sys::dnd::on() { (true, LIT_GREY) } else { (false, OFF_GREY) },
         Item::Screencap => (false, OFF_GREY),
-        // Lit while the app in front is full screen (`FULL`); dimmed with no app in front, where it switches nothing.
+        // Lit while the app in front is full screen (`FULL`), which no one sees: the row does not show in full screen (`bar_line`), and the map shuts it as its tap turns full screen on. Dimmed with no app in front, where it switches nothing.
         Item::FullScreen => match (app_live(), unsafe { FULL }) {
             (false, _) => (false, OFF_GREY * stop),
             (true, true) => (true, LIT_GREY),
