@@ -1198,6 +1198,8 @@ struct Map {
     /// Moving after the finger lifted, and the display's frame count the motion last stepped to (None: the first step is one frame).
     settling: bool,
     frame_seen: Option<u32>,
+    /// A flight's trace (development builds): each step's zoom and turn left, as per mille of where they began, `|` between the frames drawn; said on the console as it lands.
+    flight_trace: alloc::string::String,
     /// Taps in a row on About's version line; the unlock-at-boot row armed by its first tap.
     taps: u8,
     armed: bool,
@@ -2463,6 +2465,15 @@ impl Map {
         // The fade in 1024ths: it lands within a thousandth of its end, so landing on the real page shows no step.
         let px = |i: usize, v: f64| if i < 2 { v.abs() * z / (1u64 << 24) as f64 } else if i < 4 { v.abs() * w } else { v.abs() * (1 << 10) as f64 };
         let still = (0..5).any(|i| px(i, p[i].0) >= 0.5 || px(i, p[i].1) >= 0.5);
+        if DEV {
+            let left = |i: usize| if f.off[i] == 0. { 0 } else { libm::round(p[i].0 / f.off[i] * 1000.) as i64 };
+            let _ = core::fmt::Write::write_fmt(&mut self.flight_trace, format_args!(" {}:z{}t{}", f.t, left(2), left(3)));
+        }
+        if !still && DEV && !self.flight_trace.is_empty() {
+            let l = alloc::format!("map: flight landed (zoom G#{:X}, turn {} mrad at the start): frame:zoom left, turn left, per mille;{}\n", t.z, libm::round(f.off[3] * 1000.) as i64, self.flight_trace);
+            console(self.grants, l.as_bytes());
+            self.flight_trace.clear();
+        }
         if !still {
             self.cam = t;
             self.target = None;
@@ -4613,6 +4624,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         spring: None,
         settling: false,
         frame_seen: None,
+        flight_trace: alloc::string::String::new(),
         taps: 0,
         armed: false,
         dev: false,
@@ -5662,6 +5674,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 if !moving {
                     break;
                 }
+            }
+            if DEV && map.flight.is_some() {
+                map.flight_trace.push_str(" |");
             }
             map.settling = moving;
             if option_env!("FERROS_MAP_START") == Some("outhold") && map.leaving && map.flight.is_some_and(|f| f.t >= 8) {

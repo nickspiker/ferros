@@ -610,7 +610,7 @@ const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, icon: 0, l
 /// A circle's state glow (owner, 2026-11-11, on the device: "we just need to change the colour and add the multiply for the negative channel"; then "black-none, running, 500nm, stopped, 600 and for you 400"): the theme's glow (`draw::glow_log`, its falloff, its reach of 1/`GLOW_FRACTION` of the radius, its peaks) with its colour, peak and multiply from ferros_glow, as (colour, peak, reach divisor, multiply Q16). None for a circle with no state; not running is no light, a ring of darkness (owner, 2026-11-11, on the Pro: "Glow states are perfect except for the black, needs more cowbell").
 /// - Colour: the state's wavelength, its positive channels (linear VSF RGB) at the photopic luminance of the theme's ring colour (the glow every circle had), as 8-bit gamma 2 codes as the theme's colours are.
 /// - Peak: running and stopped the theme's thin peak (`glow_peak[1]`), for you its heavy one (`[2]`).
-/// - Reach: 1/`GLOW_FRACTION` of the radius; a for-you glow's divisor shrinks with what is waiting (ferros_glow `reach`: one 1/8, twenty 1/6), and not running reaches as far as for you with one (1/8).
+/// - Reach: 1/`GLOW_FRACTION` of the radius; a for-you glow's divisor shrinks with what is waiting (ferros_glow `reach`), and not running reaches `waiting_reach(1)`.
 /// - Multiply: each channel the wavelength leaves negative darkens that channel of what is behind by `MULT_SHARE` at full intensity. The canvas cannot hold that per channel: a pixel is R, G, B and one α (draw.rs), `under` gives what lands behind it the same room, 1 − α, on every channel, and the wallpaper goes in at the publish thru that one room; a darkening of one channel alone needs that room per channel, three opacities a pixel. So the multiply goes in as a neutral one of the same photopic strength (what it would take from a grey plane: ferros_glow `photopic`).
 fn state_glow(cir: &Circle, th: &ferros_sys::theme::Theme) -> Option<(u32, u32, i64, u32)> {
     let g = ferros_glow::Glow::from_u8(cir.glow);
@@ -628,7 +628,7 @@ fn state_glow(cir: &Circle, th: &ferros_sys::theme::Theme) -> Option<(u32, u32, 
         c * c
     };
     let y = ferros_glow::photopic([lin(th.ring >> 16), lin(th.ring >> 8), lin(th.ring)]);
-    let l = ferros_glow::at_luminance(spec.colour, y);
+    let l = ferros_glow::at_luminance(spec.colour, y).map(|v| v * ferros_glow::light(g));
     let code = |v: f32| (libm::sqrtf(v) * 255. + 0.5) as u32;
     let colour = code(l[0]) << 16 | code(l[1]) << 8 | code(l[2]);
     Some((colour, peak, frac, dark))

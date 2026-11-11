@@ -4,10 +4,10 @@
 //!
 //! | state | λ nm | glow |
 //! |---|---|---|
-//! | not running | - | no light: a ring of darkness, the neutral multiply at `NOT_RUNNING_DEPTH`, reaching as far as a for-you glow with one thing waiting |
+//! | not running | - | no light: a ring of darkness, the neutral multiply at `NOT_RUNNING_DEPTH`, reaching `waiting_reach(1)` |
 //! | running | 500 | the theme's thin peak |
 //! | stopped | 600 | the theme's thin peak |
-//! | for you (anything waiting on the person: a notification from anyone, a question, an approval) | 400 | the theme's heavy peak, reaching farther as the count grows |
+//! | for you (anything waiting on the person: a notification from anyone, a question, an approval) | 400 | the theme's heavy peak at `FOR_YOU_LIGHT` of its light, reaching `FOR_YOU_REACH` farther and farther still as the count grows |
 //!
 //! Colour: a wavelength is its cone response (vsf's Stockman & Sharpe 10° table, 1 nm, linear between samples) in VSF RGB (`LMS2VSF_RGB`). A single wavelength lies outside the primaries' triangle, so a channel comes out negative: the positive channels are the glow's colour, each negative channel a multiply of what is behind (`MULT_SHARE` of it at the glow's full intensity).
 
@@ -25,6 +25,9 @@ pub const FOR_YOU_NM: f32 = 400.;
 pub const MULT_SHARE: f32 = 1. / (1 << 1) as f32;
 /// Not running: the darkening of what is behind at the rim, every channel alike (owner, 2026-11-11, on the Pro: "Glow states are perfect except for the black, needs more cowbell"). The one knob; it falls with the glow's profile to nothing at its reach.
 pub const NOT_RUNNING_DEPTH: f32 = 1. / (1 << 1) as f32;
+/// For you: its reach against the waiting count's, and its light against the theme's ring (owner, 2026-11-11, on the Pro: "1.5x on the for you radius, brightness can go down 0.75x").
+pub const FOR_YOU_REACH: f32 = 1. + 1. / (1 << 1) as f32;
+pub const FOR_YOU_LIGHT: f32 = 1. - 1. / (1 << 2) as f32;
 
 /// A circle's state (the map sends it, display op 57).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -110,11 +113,16 @@ pub fn waiting_reach(n: u16) -> f32 {
     1. + l / (1. + l)
 }
 
-/// How much farther state `g`'s glow reaches than the theme's, with `n` things waiting: for you by its count, not running as far as for you with one (so its darkness reads as a ring), the rest not at all.
+/// How much farther state `g`'s glow reaches than the theme's, with `n` things waiting: for you by its count (times `FOR_YOU_REACH`), not running `waiting_reach(1)`, as far as for you with one reached before `FOR_YOU_REACH` (so its darkness reads as a ring), the rest not at all.
 pub fn reach(g: Glow, n: u16) -> f32 {
     match g {
-        Glow::ForYou => waiting_reach(n),
+        Glow::ForYou => waiting_reach(n) * FOR_YOU_REACH,
         Glow::NotRunning => waiting_reach(1),
         _ => 1.,
     }
+}
+
+/// State `g`'s light against the theme's ring: for you `FOR_YOU_LIGHT`, the rest as the ring.
+pub fn light(g: Glow) -> f32 {
+    if g == Glow::ForYou { FOR_YOU_LIGHT } else { 1. }
 }
