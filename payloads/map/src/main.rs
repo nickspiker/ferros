@@ -14,12 +14,14 @@
 //!
 //! Positions are deterministic until the person arranges by hand; then each moved circle is kept in the vault (`map.place.<name>`) and wins over the seeded place from then on.
 //!
-//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page, and the identity space: the arrangement and kists written from the person's fleet are read again when its generation moves, docs/IDENTITY-SPACE.md).
+//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page, and the identity space: the arrangement and kists written from the person's fleet are read again when its generation moves, docs/IDENTITY-SPACE.md), 6 the vault scope `kists.`, 7 use launch (init), 8 use kists (the installer, payloads/kists: the Kists page installs, updates and uninstalls through it, installer.rs).
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
+
+mod installer;
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -36,6 +38,8 @@ const S_FGTW: u64 = 5;
 const S_KIST_LIST: u64 = 6;
 /// Init's `launch` endpoint: a kist circle tapped asks init to launch it (the map holds none of a kist's rights).
 const S_LAUNCH: u64 = 7;
+/// The installer's `kists` endpoint (payloads/kists): the Kists page installs, updates and uninstalls through it, and reads the directory and the jobs under way.
+const S_INSTALLER: u64 = 8;
 
 /// The heap a link's detail document is verified and read in (ferros_detail): a few kilobytes while a link's page shows, freed after each frame.
 const HEAP_SIZE: usize = 1 << 18;
@@ -718,6 +722,9 @@ enum Choice {
     Pick(u8),
     /// A kist's want on the Kists or Permissions page: (the kist in the person's list, the want), its answer turned over.
     Answer(u8, u8),
+    /// The Kists page: a kist's uninstall (its place in the person's list; two taps), and the directory's install or update (its row).
+    Uninstall(u8),
+    Install(u8),
     /// A right's default for new kists (Permissions).
     Default(u8),
     /// The first-launch question: a want's switch (its index in the kist's wants).
@@ -1118,6 +1125,10 @@ struct Map {
     /// The clock page's zone picker while it is open (`ZonePick`), and the last word on a choice that did not take, shown until the next tap on the page.
     zone_pick: Option<ZonePick>,
     zone_note: Option<&'static str>,
+    /// The installer as last read (installer.rs): the directory's kists and each job under way.
+    installer: installer::Installer,
+    /// The Kists page's uninstall armed on a kist (the first tap of two, as "remove this device").
+    uninstall_armed: Option<u8>,
 }
 
 /// The clock page's zone picker (owner, 2026-11-10: "auto/manual zone, picker, all that"): every zone's id as the kernel lists them (SYS_ZONE op 6, the zones document's order), browsed by region (the IANA id's first part: America, Europe, …) then by place. No typing: the map has no keyboard of its own (the attest screen hosts the one there is), so a list it is.
@@ -2915,6 +2926,20 @@ impl Map {
             "kists" => {
                 // Each installed kist and what it asked for (owner, 2026-11-08: per kist, its rights, switches), the developer's reason under each; a tap changes the answer for every device of the person's (the list is theirs), and a kist running is killed and started again with the answers as they now stand.
                 let ks = self.kists.kists.clone();
+                // The installer's (installer.rs): the directory and the jobs under way. Sizes in the person's number base.
+                let inst = self.installer.clone();
+                let f = ferros_sys::numbers(Style::Glyphs);
+                // A job's bar (fluor's slider track, op 48, its knob no wider than the track) and its stage in words under it; a finished job's words alone.
+                let progress = |m: &mut Map, b: &mut Batch, y: &mut i64, j: &installer::Job| {
+                    if j.stage < installer::DONE {
+                        let (a, z) = m.track(cx);
+                        let tr = uq >> 3;
+                        b.slider(a, z, *y, tr, tr, installer::share(j), white(), dim(), white());
+                        *y += uu(3, 2);
+                    }
+                    let l = installer::words(j, f);
+                    row(m, b, y, note, if j.stage == installer::FAILED { white() } else { grey() }, l.as_str(), None);
+                };
                 if ks.is_empty() {
                     row(self, b, &mut y, small, grey(), "no kists installed", None);
                 }
@@ -2934,7 +2959,55 @@ impl Map {
                         y -= uu(3, 4);
                         row(self, b, &mut y, note, dim(), &w.reason, None);
                     }
+                    // A restore or an uninstall of this kist under way, or one that failed.
+                    if let Some(j) = inst.job_for(&k.capsule).filter(|j| j.stage != installer::DONE) {
+                        progress(self, b, &mut y, j);
+                    }
+                    if inst.here {
+                        let armed = self.uninstall_armed == Some(ki as u8);
+                        button(self, b, &mut y, if armed { "tap again: uninstall" } else { "uninstall" }, armed, Some(Choice::Uninstall(ki as u8)));
+                        if armed {
+                            row(self, b, &mut y, note, dim(), "its answers are kept for when you install it again", None);
+                        }
+                    }
                     y += uu(1, 1);
+                }
+                // The directory (kists.fgtw.org): every kist listed, to install, or to update when a newer one is listed than the one installed.
+                if inst.here {
+                    row(self, b, &mut y, uu(3, 2), white(), "available", None);
+                    match inst.dir_state {
+                        0 | 1 => row(self, b, &mut y, small, grey(), "reading the list of kists", None),
+                        3 => row(self, b, &mut y, small, grey(), "the list of kists could not be reached", None),
+                        _ if inst.dir.is_empty() => row(self, b, &mut y, small, grey(), "no kists listed yet", None),
+                        _ => {}
+                    }
+                    if inst.dir_state == 2 && !inst.dir_checked {
+                        row(self, b, &mut y, note, dim(), "the list's signature is not checked yet", None);
+                    }
+                    for (di, e) in inst.dir.iter().enumerate() {
+                        let mut l = Line::new();
+                        let _ = write!(l, "{} {}.{}.{}", e.name, e.version[0], e.version[1], e.version[2]);
+                        row(self, b, &mut y, small, white(), l.as_str(), None);
+                        y -= uu(3, 4);
+                        row(self, b, &mut y, note, dim(), &e.about, None);
+                        let mine = ks.iter().find(|k| k.developer == e.developer && k.option == e.option);
+                        let job = inst.job_for(&e.capsule).filter(|j| j.stage != installer::DONE);
+                        if let Some(j) = job {
+                            progress(self, b, &mut y, j);
+                        }
+                        // Under way: no button until it is done or has failed.
+                        let busy = job.is_some_and(|j| j.stage < installer::DONE);
+                        if busy {
+                        } else if mine.is_some_and(|k| k.capsule == e.capsule) {
+                            row(self, b, &mut y, note, grey(), "installed", None);
+                        } else {
+                            let mut l = Line::new();
+                            l.s(if mine.is_some() { "update, " } else { "install, " });
+                            let _ = tatau::size_bits(&mut l, f, e.size << 3, 1);
+                            button(self, b, &mut y, l.as_str(), false, Some(Choice::Install(di as u8)));
+                        }
+                        y += uu(1, 2);
+                    }
                 }
             }
             "permissions" => {
@@ -3353,6 +3426,9 @@ impl Map {
                 if row != Some(Choice::FleetRemove) {
                     self.fleet.confirm = false;
                 }
+                if !matches!(row, Some(Choice::Uninstall(_))) {
+                    self.uninstall_armed = None;
+                }
                 // The clock's word on a zone choice that did not take stays until the next tap.
                 self.zone_note = None;
                 let set = |m: &Map, pref: u64, v: u8| {
@@ -3548,6 +3624,34 @@ impl Map {
                             }
                         }
                     }
+                    // Uninstall in two taps (as "remove this device"): the first arms it, the second asks the installer, which keeps the kist's answers.
+                    Some(Choice::Uninstall(k)) => {
+                        if self.uninstall_armed == Some(k) {
+                            self.uninstall_armed = None;
+                            if let Some(kist) = self.kists.kists.get(k as usize) {
+                                let mut m = [0u8; 65];
+                                m[0] = 4;
+                                m[1..33].copy_from_slice(&kist.developer);
+                                m[33..].copy_from_slice(&kist.option);
+                                if installer::ask(self.grants, &m) != Some(0) {
+                                    console(self.grants, b"map: the installer did not take the uninstall\n");
+                                }
+                            }
+                        } else {
+                            self.uninstall_armed = Some(k);
+                        }
+                    }
+                    // Install or update the directory's kist: the installer fetches, checks and seals it, and the page shows each stage as its doorbell rings.
+                    Some(Choice::Install(d)) => {
+                        if let Some(row) = self.installer.dir.get(d as usize) {
+                            let mut m = [0u8; 33];
+                            m[0] = 3;
+                            m[1..].copy_from_slice(&row.capsule);
+                            if installer::ask(self.grants, &m) != Some(0) {
+                                console(self.grants, b"map: the installer did not take the install\n");
+                            }
+                        }
+                    }
                     Some(Choice::Default(r)) => {
                         self.reload_kists();
                         self.kists.defaults ^= 1 << r;
@@ -3696,6 +3800,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         ask: 0,
         zone_pick: None,
         zone_note: None,
+        installer: installer::Installer::default(),
+        uninstall_armed: None,
     };
     let kept = map.load_places_near();
     // Whatever the vault held, no two circles start overlapping (places kept before circles pushed each other could).
@@ -3855,6 +3961,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut fleet_seen = 0u32;
     // Whether the Fleet page showed at the last pass (`FLEET_PAGE`).
     let mut fleet_shown = false;
+    // The installer's copy last taken, the finished jobs in it (a kist installed or uninstalled: the circles follow), and whether the Kists page showed at the last pass (opening it reads the directory again).
+    let (mut installer_seen, mut installer_done, mut kists_shown) = (0u32, 0u64, false);
     let mut last_pass = now();
     let mut draw_us = 0u64;
     let mut move_us = 0u64;
@@ -3866,6 +3974,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The add flow following the Fleet page (`fleet_page_thread`).
     static mut PAGE_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(fleet_page_thread, unsafe { &mut *(&raw mut PAGE_STACK) }, grants);
+    // The installer's doorbell (payloads/kists), for the Kists page: on a thread of its own, never on a timer.
+    static mut INSTALLER_STACK: [u8; 1 << 14] = [0; 1 << 14];
+    ferros_sys::thread_spawn(installer::watch, unsafe { &mut *(&raw mut INSTALLER_STACK) }, grants);
     // FERROS_MAP_START=drag: a synthetic finger instead of the touch server for the first 192 passes — two seconds after start (past the display's first full frame), a pan through the air and back, so the frame pacing can be measured with no one at the panel (it logs passes, draws and the rate).
     let mut synth = 0u32;
     // FERROS_MAP_START=drag: the drag's own rate, for measuring the frame pacing with no one at the panel.
@@ -3919,6 +4030,27 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             let v = FLEET_PAGE.load(core::sync::atomic::Ordering::Acquire);
             FLEET_PAGE.store(((v >> 1) + 1) << 1 | shown as u64, core::sync::atomic::Ordering::Release);
             ferros_sys::wake(&FLEET_PAGE, 1);
+        }
+        // The installer's copy, when its doorbell has rung (installer.rs): taken in, the Kists page drawn again while it shows, and the person's list and circles read again when a job has finished (a kist installed, updated, uninstalled or restored).
+        if let Some((seq, s)) = installer::take(installer_seen) {
+            installer_seen = seq;
+            let done = s.finished();
+            map.installer = s;
+            if done != installer_done {
+                installer_done = done;
+                map.refresh_circles();
+            }
+            if matches!(map.view, View::Open(_)) && PAGES[map.page] == "kists" && !map.settling {
+                map.draw();
+            }
+        }
+        // The Kists page opened: the installer reads the directory again (owner: on opening the page, never on a timer).
+        let shown = matches!(map.view, View::Open(_)) && PAGES[map.page] == "kists";
+        if shown != kists_shown {
+            kists_shown = shown;
+            if shown {
+                let _ = installer::ask(grants, &[1]);
+            }
         }
         // A fleet device's departure waiting on this person: a new one opens the Fleet page on it, Approve or Deny ready (owner, 2026-11-10: "go right to the fleet page and have the unbind request 'Approve' or 'Deny' screen ready to go"). Not over an app in front, and not while a finger is down or the map is settling: a request waiting opens the page once the fingers lift.
         if !map.app_front && !down && !map.settling {
