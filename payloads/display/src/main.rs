@@ -3765,11 +3765,10 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
     let mut out = [(0.0f32, 0.0f32, 0.0f32, Corner::Spare); 16];
     let mut n = 0;
     // Each corner: (left?, top?, middle, along the horizontal edge, along the vertical edge, the next along the horizontal edge). The indicators up top, navigation at the bottom (owner, 2026-11-03); IP is no radio, its measures are the links'. Bluetooth has more to show than NFC, so it takes the larger place, the next along the top (owner, 2026-11-04).
-    // The right corner since 2026-11-09 (owner: "I'd put NFC to the left of BT"): cellular, WiFi, Bluetooth, NFC along the top, nothing down the side. Not on akita, whose fatter glass corners leave no room for the fourth along the top (owner, 2026-11-09: "8a specifically since the corners have a fatter radius we'll have to move nfc back to where it was"): there NFC goes back down the side.
-    let right: (Option<Corner>, &[Corner]) = if ferros_sys::akita() { (Some(Corner::Nfc), &[Corner::Bluetooth]) } else { (None, &[Corner::Bluetooth, Corner::Nfc]) };
+    // The right corner: cellular, WiFi and Bluetooth along the top, NFC down the side, on every board (owner, 2026-11-11: "I'd also think NFC is rarely used so let's move it back to the bottom right like we do on the 8a so we have the same open spot where the camera is"). From 2026-11-09 to then the Pro had NFC along the top left of Bluetooth (owner: "I'd put NFC to the left of BT"); akita never did, its fatter glass corners leaving no room for a fourth along the top. The spot by the camera that leaves open is the quick row's doorway (`quick_doorway`).
     let jobs: [(bool, bool, Corner, Corner, Option<Corner>, &[Corner]); 4] = [
         (true, true, Corner::Clock, Corner::Battery, Some(Corner::Usb), &[Corner::Gps]),
-        (false, true, Corner::Cellular, Corner::Wifi, right.0, right.1),
+        (false, true, Corner::Cellular, Corner::Wifi, Some(Corner::Nfc), &[Corner::Bluetooth]),
         (true, false, Corner::Back, Corner::Spare, Some(Corner::Spare), &[]),
         (false, false, Corner::Home, Corner::Spare, Some(Corner::Spare), &[]),
     ];
