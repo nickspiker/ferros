@@ -300,10 +300,12 @@ fn log2_q16(q: u64) -> i64 {
 }
 
 /// The glow, falling off in log distance (owner, 2026-10-24: no divide, no table): down by the same step every octave of q = d² − r² (the squared distance past the edge), from full `peak` to exactly zero over 2^`oct_log2` octaves — no floor, no tail cut — and reaching 1/`frac` of the radius past the edge, whatever the size (owner: smaller circle, thinner glow; the glow is part of the circle's shape at every zoom). At d = r(1 + 1/frac), q = r²·(2·frac + 1)/frac², which fixes where it ends; full light holds to that over 2^(2^oct_log2). A layer of the glow's colour at α = its intensity, put under what is there (`under`, gamma-2 values), so a circle's opaque interior takes nothing and needs no test (the linear-light try looked worse, 2026-10-24).
-pub fn glow_log(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32, peak: u32, frac: i64, oct_log2: u32) -> Rect {
-    if r < 128 || peak == 0 {
+/// `dark` (Q16, 0 none) is a kist state's multiply (ferros_glow, display op 57; owner, 2026-11-11: "add the multiply for the negative channel"): a second layer in the same pixel, behind the glow's light, black at α = `dark` times the same profile (1 at the rim, nothing at the reach), so what goes under it later (the wallpaper, another circle's glow) is darkened by that share and the glow's own light is not. A neutral filter: the canvas has one α a pixel (main.rs `state_glow`).
+pub fn glow_log(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32, peak: u32, frac: i64, oct_log2: u32, dark: u32) -> Rect {
+    if r < 128 || (peak == 0 && dark == 0) {
         return Rect::EMPTY;
     }
+    let dark = dark as i64;
     let (bx0, by0, bx1, by1) = bounds(width, height);
     let r2 = r * r;
     // Zero at q_max (1/frac of the radius past the edge), full light to q_max over 2^octaves.
@@ -333,6 +335,8 @@ pub fn glow_log(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r:
             // The glow is a layer of its own colour at α = its intensity (i in 2⁻⁸ steps of 255, at most peak · 2⁸ ≤ G#FF00), under what is there (owner, 2026-11-07, option 3): over black the light is what the additive glow gave, overlapping glows stack as 1 − (1 − a)(1 − b) and never pass white, and the pixel carries the glow's opacity, so whatever goes under it later (a wallpaper) shows in exactly the room it leaves.
             let p = &mut px[rowb + x as usize];
             *p = under(*p, at_cover16(colour, (i * 0xFFFF / (255 << 8)) as u32));
+            // The multiply behind the light, on the same profile: black at α = dark · (span − t) / span, Q16 (the product at most 2³² · 2^oct_log2 before the shift).
+            *p = under(*p, (((dark * (span - t)) >> (16 + oct_log2)) as u64) << 48);
             true
         };
         let mut left_stop = x1 + 1;
@@ -409,116 +413,6 @@ pub fn glow(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
         }
     });
     Rect { x0: ((cx - reach) >> 8) as i32 - 1, y0: ((cy - reach) >> 8) as i32 - 1, x1: ((cx + reach) >> 8) as i32 + 2, y1: ((cy + reach) >> 8) as i32 + 2 }.clip(width, height)
-}
-
-/// A state glow's table (ferros_glow, display op 57): 2^LINE_LUT_LOG2 pixels from the rim (s = 0) out to the reach (s = 1), s the squared distance past the rim as a share of the reach's.
-pub const LINE_LUT_LOG2: u32 = 10;
-pub type LineLut = [Px; 1 << LINE_LUT_LOG2];
-
-/// A kist circle's state glow around a disc of radius r centred at (cx, cy), out to `reach` past its rim (all Q8 pixels): its line's light at a falling α, a layer under what is there, so drawn after the circles it lands only in the room they leave (owner, 2026-11-11: "Spectral lines for states").
-/// The falloff is ferros_glow's bump in s = q / q_max (q = d² − r², the squared distance past the rim as `glow_log` walks it, no root), C∞ from the rim to exactly nothing at the reach; it is a table made once per glow at start (`lut`), indexed by q · m without a divide (m = 2⁵⁸ / q_max once per glow), so a pixel costs two multiplies, a load and the `under`.
-/// From each end of the row inward to the circle's edge, as `glow` walks: the circle's inside is never visited. Returns the rectangle it touched.
-pub fn glow_line(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, reach: i64, lut: &LineLut) -> Rect {
-    if r < 128 || reach <= 0 {
-        return Rect::EMPTY;
-    }
-    let (bx0, by0, bx1, by1) = bounds(width, height);
-    let r2 = r * r;
-    let ro = r + reach;
-    let q_max = ro * ro - r2;
-    // q < q_max below, so q · m < 2⁵⁸ and the index, q · m >> 48, is under 2¹⁰: the table's length by construction.
-    let m = (1i64 << 58) / q_max;
-    spans(cx, cy, ro, |y, xo0, xo1, _, _| {
-        if y < by0 || y >= by1 {
-            return;
-        }
-        let rowb = y as usize * width;
-        let dy = (y << 8) + 128 - cy;
-        let dy2 = dy * dy;
-        let (x0, x1) = (xo0.max(bx0), xo1.min(bx1 - 1));
-        // One pixel of glow; false once the walk has reached the circle (q ≤ 0), where it stops.
-        let mut put = |x: i64| -> bool {
-            let dx = (x << 8) + 128 - cx;
-            let q = dx * dx + dy2 - r2;
-            if q <= 0 {
-                return false;
-            }
-            // Past the reach the bump is zero: nothing to put (the spans run a pixel past it).
-            if q >= q_max {
-                return true;
-            }
-            let p = &mut px[rowb + x as usize];
-            *p = under(*p, lut[(q * m >> (58 - LINE_LUT_LOG2)) as usize]);
-            true
-        };
-        let mut left_stop = x1 + 1;
-        let mut x = x0;
-        while x <= x1 {
-            if !put(x) {
-                left_stop = x;
-                break;
-            }
-            x += 1;
-        }
-        let mut x = x1;
-        while x > left_stop {
-            if !put(x) {
-                break;
-            }
-            x -= 1;
-        }
-    });
-    Rect { x0: ((cx - ro) >> 8) as i32 - 1, y0: ((cy - ro) >> 8) as i32 - 1, x1: ((cx + ro) >> 8) as i32 + 2, y1: ((cy + ro) >> 8) as i32 + 2 }.clip(width, height)
-}
-
-/// A kist circle's rim arc (ferros_glow `arc_cover`: needs you at twelve o'clock, or working's progress from twelve round to `share`) on the circle of radius r at (cx, cy) (Q8 pixels), in front of its icon: `light` is the arc's colour at full coverage as working values (gamma 2, white at Q14), and a pixel takes it at its coverage, premultiplied, under what is there.
-/// Only the band's rows and, on each, the two runs between the band's inner and outer edges are visited (a root a row); a pixel costs a root and an arctangent, its steps worked out only within a pixel of an edge or an end.
-pub fn rim_arc(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, rim: ferros_glow::Rim, share: f32, light: [f32; 3]) -> Rect {
-    // Under four pixels across the band is under a pixel: nothing to read.
-    if r < 256 << 2 || rim == ferros_glow::Rim::None {
-        return Rect::EMPTY;
-    }
-    let (bx0, by0, bx1, by1) = bounds(width, height);
-    let ri = r as f32 * (1. / 256.);
-    let (fx, fy) = (cx as f32 * (1. / 256.), cy as f32 * (1. / 256.));
-    // A pixel past each edge, so the steps' tails are inside the runs.
-    let (ro, rn) = (ri * ferros_glow::RIM_BAND.0 + 1., ri * ferros_glow::RIM_BAND.1 - 1.);
-    // WHY the bounds: the circle may reach past the clip (the screen, a band of rows, a pan's strip), and only pixels inside it are written.
-    let (y0, y1) = (((fy - ro) as i64).max(by0), ((fy + ro) as i64 + 1).min(by1 - 1));
-    for y in y0..=y1 {
-        let dy = y as f32 + 0.5 - fy;
-        let wo2 = ro * ro - dy * dy;
-        if wo2 <= 0. {
-            continue;
-        }
-        let wo = libm::sqrtf(wo2);
-        let wi2 = rn * rn - dy * dy;
-        let wi = if wi2 > 0. { libm::sqrtf(wi2) } else { 0. };
-        let rowb = y as usize * width;
-        // Left run, then right run; within a pixel of the inner edge's top or bottom the two would share a pixel, so the row is one run.
-        let one = wi < 1.;
-        let runs = if one { [(fx - wo, fx + wo), (0., -1.)] } else { [(fx - wo, fx - wi), (fx + wi, fx + wo)] };
-        for (k, &(a, b)) in runs.iter().enumerate() {
-            if one && k == 1 {
-                break;
-            }
-            // WHY the bounds: as the rows'.
-            let (xa, xb) = ((a as i64).max(bx0), (b as i64 + 1).min(bx1 - 1));
-            for x in xa..=xb {
-                let dx = x as f32 + 0.5 - fx;
-                let cov = ferros_glow::arc_cover(rim, dx, dy, ri, share);
-                if cov <= 0. {
-                    continue;
-                }
-                let k = cov * 65535.;
-                let ch = |v: f32| (v * cov) as u64;
-                let p = &mut px[rowb + x as usize];
-                *p = under(*p, (k as u64) << 48 | ch(light[2]) << 32 | ch(light[1]) << 16 | ch(light[0]));
-            }
-        }
-    }
-    let rr = ro as i32 + 2;
-    Rect { x0: fx as i32 - rr, y0: fy as i32 - rr, x1: fx as i32 + rr + 1, y1: fy as i32 + rr + 1 }.clip(width, height)
 }
 
 /// One ring of the clock face: how far round it is (Q16 of a turn, clockwise from 12:00; the sweep clicks back to dark when it wraps), whether its fill is the lighter grey (the hour ring after noon), and its tick count.

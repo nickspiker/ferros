@@ -23,7 +23,7 @@
 //! - 15 `batch [len u16][op…]…`: several ops in one call, in order — a frame with an overlay is `begin`, its text and rects and discs, then `camera` with the keep flag, which draws the scene under them and presents. One call per frame rather than one per op: each call is a round trip through the scheduler. The reply is the last op's, its status the first failure's.
 //! - 16 `disc [x i16][y i16][r u16][colour]`: a filled circle in panel pixels (the shell's shapes are circles; a ring is a smaller disc of the ground colour sent first, since what is sent first is on top).
 //! - 17 `scene move [index u8][x i32][y i32][r u16]` (optionally `[cos i16][sin i16]`, the circle's own turn in Q14): one circle of the scene moved, resized and turned in place (the owner arranging by hand).
-//! - 57 `scene state [count u8][count x (index u8, glow u8, count u16, rim u8, share u16 Q16)]`: circles' states as light (ferros_glow; owner, 2026-11-11: "Spectral lines for states"): `glow` 0 none (the theme's glow by `ring`), 1 running, 2 the Back-swipe target, 3 notifications from people (`count` of them sizes its reach), 4 from the system, 5 stopped with a reason, 6 not running; `rim` 0 none, 1 needs you, 2 working (`share` of it done). Cleared with the scene (op 12); kept by `scene move`.
+//! - 57 `scene state [count u8][count x (index u8, glow u8, count u16)]`: circles' states as the colour of their glow (ferros_glow; owner, 2026-11-11: "Spectral lines for states"): `glow` 0 none (the theme's glow by `ring`), 1 running, 2 the Back-swipe target, 3 notifications from people (`count` of them widens its reach), 4 from the system, 5 stopped with a reason, 6 not running, 7 needs you, 8 working. Cleared with the scene (op 12); kept by `scene move`.
 //! - 18 `region [cx i16][cy i16][r u16][ground]`: in place of `begin`, the open circle, landed, as an app's region (COMPOSITOR.md): the page's ops up to the camera op are its front layer, drawn only where they changed; the camera op makes the clean window (the ground, the scene under it) once and then draws no scene. A camera op with no region op before it ends the region.
 //! - 19 `text turned [cx i16][cy i16][px u16][colour][alpha u8][cos i16][sin i16][utf8…]`: text centred on (cx, cy), turned about it (Q14, positive sin clockwise), at opacity alpha (255 opaque): the settings' titles riding the circle.
 //! - 47 `button [cx i16][cy i16][w u16][h u16][px u16][fill][edge top-left][edge bottom-right][ink][utf8 label]` and 48 `slider [x0 i16][x1 i16][cy i16][track r u16 Q8][knob r u16 Q8][at u16 Q16][left][right][knob]`: fluor's button and slider as a page's elements (COMPOSITOR.md "Controls"), drawn like the page's text, in the front layer while a region is up.
@@ -457,49 +457,41 @@ struct Circle {
     /// The circle's own turn (its icon), (cos, sin) in Q14, on top of the camera's: set by `scene move`.
     c: i16,
     s: i16,
-    /// Its state as light (op 57, ferros_glow): the glow outside its rim (`ferros_glow::Glow` as its byte, 0 none: the theme's glow by `ring` as before) and the count that sizes a people glow's reach; the rim's arc (`ferros_glow::Rim`, 0 none) and a working arc's share, Q16.
+    /// Its state (op 57, `ferros_glow::Glow` as its byte; 0 none, the theme's glow by `ring` as ever) and the count of notifications that widens a people glow.
     glow: u8,
     count: u16,
-    rim: u8,
-    share: u16,
 }
-const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, icon: 0, len: 0, label: [0; 16], c: 16384, s: 0, glow: 0, count: 0, rim: 0, share: 0 };
+const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, icon: 0, len: 0, label: [0; 16], c: 16384, s: 0, glow: 0, count: 0 };
 
-/// The state glows' tables (`draw::glow_line`), in `ferros_glow::Glow::ALL`'s order (glow byte − 1), and the rim arcs' light at full coverage (working values, gamma 2, white at Q14), needs you then working: made once at start (`glow_tables`) from ferros_glow's lines, read by every thread that draws the scene. 48 KiB of statics, no heap.
-static mut LINE_LUTS: [draw::LineLut; 6] = [[0; 1 << draw::LINE_LUT_LOG2]; 6];
-static mut RIM_LIGHT: [[f32; 3]; 2] = [[0.; 3]; 2];
-
-/// Linear VSF RGB light to working values (gamma 2, white at Q14).
-fn light_working(l: [f32; 3]) -> [f32; 3] {
-    l.map(|v| libm::sqrtf(v) * 16384.)
-}
-
-/// `LINE_LUTS` and `RIM_LIGHT` from ferros_glow (owner, 2026-11-11: "Spectral lines for states"): entry i of a glow's table is its rim's light and opacity times the bump at s = (i + ½) / 2¹⁰, the light a layer of linear light (its working value the root), its α the opacity; premultiplied as the canvas holds them. The roots and exponentials are here, once, so a glow pixel has none.
-fn glow_tables() {
-    let n = 1usize << draw::LINE_LUT_LOG2;
-    for (k, &g) in ferros_glow::Glow::ALL.iter().enumerate() {
-        let at = ferros_glow::at_rim(g);
-        let lut = unsafe { &mut *(&raw mut LINE_LUTS[k]) };
-        for (i, e) in lut.iter_mut().enumerate() {
-            let f = ferros_glow::falloff((i as f32 + 0.5) / n as f32);
-            let c = light_working(at.light.map(|v| v * f));
-            *e = ((at.alpha * f * 65535.) as u64) << 48 | (c[2] as u64) << 32 | (c[1] as u64) << 16 | c[0] as u64;
+/// A circle's state glow (owner, 2026-11-11, on the device: "we just need to change the colour and add the multiply for the negative channel"): the theme's glow (`draw::glow_log`, its falloff, its reach of 1/`GLOW_FRACTION` of the radius, its peaks) with its colour, peak step and multiply from ferros_glow. None for a circle with no state.
+/// - Colour: the state's line, its positive channels (linear VSF RGB) at the photopic luminance of the theme's ring colour (the glow every circle had), as 8-bit gamma 2 codes as the theme's colours are.
+/// - Peak: high the theme's heavy peak (`glow_peak[2]`), medium its thin one (`[1]`), low half the thin one.
+/// - Reach: 1/`GLOW_FRACTION` of the radius; a people glow's divisor shrinks with its count (ferros_glow `people_reach`: one notification 1/8, twenty 1/6).
+/// - Multiply (`dark`, Q16): each channel the line leaves negative darkens that channel of what is behind by `MULT_SHARE` at full intensity. The canvas cannot hold that per channel: a pixel is R, G, B and one α (draw.rs), `under` gives what lands behind it the same room, 1 − α, on every channel, and the wallpaper goes in at the publish thru that one room; a darkening of one channel alone needs that room per channel, three opacities a pixel. So the multiply goes in as a neutral one of the same photopic strength (what it would take from a grey plane: ferros_glow `photopic`). Not running is a neutral multiply by definition, so it is exact; stopped is a filter passing H-alpha, made neutral the same way.
+fn state_glow(cir: &Circle, th: &ferros_sys::theme::Theme) -> Option<(u32, u32, i64, u32)> {
+    let spec = ferros_glow::spec(ferros_glow::Glow::from_u8(cir.glow))?;
+    let colour = match spec.colour {
+        Some(c) => {
+            let lin = |v: u32| {
+                let g = (v & 0xFF) as f32 * (1. / 255.);
+                g * g
+            };
+            let y = ferros_glow::photopic([lin(th.ring >> 16), lin(th.ring >> 8), lin(th.ring)]);
+            let l = ferros_glow::at_luminance(c, y);
+            let code = |v: f32| (libm::sqrtf(v) * 255. + 0.5) as u32;
+            code(l[0]) << 16 | code(l[1]) << 8 | code(l[2])
         }
-    }
-    unsafe {
-        RIM_LIGHT[0] = light_working(ferros_glow::rim_light(ferros_glow::Rim::NeedsYou));
-        RIM_LIGHT[1] = light_working(ferros_glow::rim_light(ferros_glow::Rim::Working));
-    }
-}
-
-/// A circle's state glow on the screen: its table and its reach past the rim (Q8 pixels) at screen radius `sr`, or None for a circle with none.
-fn state_glow(cir: &Circle, sr: i64) -> Option<(&'static draw::LineLut, i64)> {
-    let g = ferros_glow::Glow::from_u8(cir.glow);
-    if g == ferros_glow::Glow::None {
-        return None;
-    }
-    let reach = (sr as f32 * ferros_glow::reach(g, cir.count)) as i64;
-    Some((unsafe { &*(&raw const LINE_LUTS[cir.glow as usize - 1]) }, reach))
+        None => 0,
+    };
+    let peak = match (spec.colour, spec.level) {
+        (None, _) => 0,
+        (_, ferros_glow::Level::High) => th.glow_peak[2],
+        (_, ferros_glow::Level::Medium) => th.glow_peak[1],
+        (_, ferros_glow::Level::Low) => th.glow_peak[1] >> 1,
+    };
+    let frac = if cir.glow == ferros_glow::Glow::People as u8 { (GLOW_FRACTION as f32 / ferros_glow::people_reach(cir.count)) as i64 } else { GLOW_FRACTION };
+    let dark = (ferros_glow::photopic(spec.mult) * 65535.) as u32;
+    Some((colour, peak, frac, dark))
 }
 
 /// The bundle's codes to canvas values, 16 bits: ICN3 bundles hold VSF RGB gamma2tanh codes (tanh(√L), bucket bottom c/256), the canvas gamma 2 working values with white at Q14 — so atanh(c/256) × 16384, highlights above white kept (to about 3× white at code 255) now the canvas has the headroom. ICN2 (gamma 2 codes, white at 255): c × 16384 / 255.
@@ -2403,11 +2395,8 @@ enum Item {
     Logo(i64, i64, i64, i64, i64, bool),
     Disc(i64, i64, i64, u32, bool),
     Icon(i64, i64, i64, i64, i64, usize, bool),
-    Glow(i64, i64, i64, u32, u32),
-    /// A state glow (ferros_glow): centre, radius, reach past the rim, its table.
-    Line(i64, i64, i64, i64, &'static draw::LineLut),
-    /// A rim arc: centre, radius, the arc (`ferros_glow::Rim` byte), a working arc's share (Q16).
-    Arc(i64, i64, i64, u8, u16),
+    /// A glow: centre, radius, colour, peak, its reach divisor (`GLOW_FRACTION`, a people glow's smaller) and its multiply (Q16, 0 none; `state_glow`).
+    Glow(i64, i64, i64, u32, u32, i64, u32),
 }
 const ITEMS: usize = 1024;
 static mut SCENE_ITEMS: [Item; ITEMS] = [Item::Disc(0, 0, 0, 0, false); ITEMS];
@@ -2421,12 +2410,10 @@ impl Item {
         match *self {
             Item::Blit(_, _, d, _, oy) => (oy, oy + d as i64),
             Item::Logo(_, y, r, _, _, _) | Item::Disc(_, y, r, _, _) | Item::Icon(_, y, r, _, _, _, _) => ((y - r) >> 8, ((y + r) >> 8) + 3),
-            Item::Glow(_, y, r, _, _) => {
-                let reach = r + r / GLOW_FRACTION + 256;
+            Item::Glow(_, y, r, _, _, frac, _) => {
+                let reach = r + r / frac + 256;
                 ((y - reach) >> 8, ((y + reach) >> 8) + 3)
             }
-            Item::Line(_, y, r, reach, _) => ((y - r - reach - 256) >> 8, ((y + r + reach + 256) >> 8) + 3),
-            Item::Arc(_, y, r, _, _) => ((y - r) >> 8, ((y + r) >> 8) + 3),
         }
     }
     fn draw(&self, px: &mut [Px], width: usize, height: usize) {
@@ -2444,20 +2431,12 @@ impl Item {
             Item::Icon(x, y, r, c, s, mp, _) => {
                 draw::icon(px, width, height, x, y, r, c, s, unsafe { &*(mp as *const draw::Mips) });
             }
-            Item::Glow(x, y, r, colour, peak) => {
+            Item::Glow(x, y, r, colour, peak, frac, dark) => {
                 if GLOW_LOG {
-                    draw::glow_log(px, width, height, x, y, r, colour, peak, GLOW_FRACTION, GLOW_OCT_LOG2);
+                    draw::glow_log(px, width, height, x, y, r, colour, peak, frac, GLOW_OCT_LOG2, dark);
                 } else {
                     draw::glow(px, width, height, x, y, r, colour, peak, GLOW_SCALE_Q8, GLOW_FLOOR);
                 }
-            }
-            Item::Line(x, y, r, reach, lut) => {
-                draw::glow_line(px, width, height, x, y, r, reach, lut);
-            }
-            Item::Arc(x, y, r, rim, share) => {
-                let rim = ferros_glow::Rim::from_u8(rim);
-                let light = unsafe { RIM_LIGHT[if rim == ferros_glow::Rim::Working { 1 } else { 0 }] };
-                draw::rim_arc(px, width, height, x, y, r, rim, share as f32 * (1. / 65536.), light);
             }
         }
     }
@@ -6305,8 +6284,6 @@ fn server(grants: u64) -> ! {
             CLOCK_DIRS[k] = ((libm::sinf(a) * 16384.0) as i64, (-libm::cosf(a) * 16384.0) as i64);
         }
     }
-    // The state glows' tables and the rim arcs' light, once (ferros_glow).
-    glow_tables();
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
@@ -6428,7 +6405,7 @@ fn server(grants: u64) -> ! {
                         let i32le = |i: usize| i32::from_le_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]);
                         let mut label = [0u8; 16];
                         label.copy_from_slice(&m[at + 14..at + 30]);
-                        let c = Circle { x: i32le(at), y: i32le(at + 4), r: u16::from_le_bytes([m[at + 8], m[at + 9]]), ring: m[at + 10], lit: m[at + 11], icon: m[at + 12], len: m[at + 13].min(16), label, c: 16384, s: 0, glow: 0, count: 0, rim: 0, share: 0 };
+                        let c = Circle { x: i32le(at), y: i32le(at + 4), r: u16::from_le_bytes([m[at + 8], m[at + 9]]), ring: m[at + 10], lit: m[at + 11], icon: m[at + 12], len: m[at + 13].min(16), label, c: 16384, s: 0, glow: 0, count: 0 };
                         unsafe {
                             SCENE[SCENE_N] = c;
                             SCENE_N += 1;
@@ -6437,28 +6414,23 @@ fn server(grants: u64) -> ! {
                     }
                 }
                 Some(57) if m.len() >= 2 => {
-                    // Circles' states as light (ferros_glow): the clean window and the flight's plane image hold the old glows, so the scene's generation moves.
+                    // Circles' states (ferros_glow): the clean window and the flight's plane image hold the old glows, so the scene's generation moves.
                     unsafe { LAST_FRAME.1 = 0 };
                     client_owned = true;
                     unsafe { CLIENT_DREW = true };
                     unsafe { SCENE_GEN = SCENE_GEN.wrapping_add(1) };
                     let count = m[1] as usize;
                     for k in 0..count {
-                        let at = 2 + k * 7;
+                        let at = 2 + k * 4;
                         // WHY the tests: the message is the map's; a short one or an index past the scene would read or write past what is there.
-                        if at + 7 > m.len() || m[at] as usize >= unsafe { SCENE_N } {
+                        if at + 4 > m.len() || m[at] as usize >= unsafe { SCENE_N } {
                             out[0] = 1;
                             break;
                         }
                         let c = unsafe { &mut *(&raw mut SCENE[m[at] as usize]) };
+                        // An unknown state byte (a newer map) draws as none (`ferros_glow::Glow::from_u8`).
                         c.glow = m[at + 1];
                         c.count = u16::from_le_bytes([m[at + 2], m[at + 3]]);
-                        c.rim = m[at + 4];
-                        c.share = u16::from_le_bytes([m[at + 5], m[at + 6]]);
-                        // WHY: a glow byte past the tables (a newer map) would index past `LINE_LUTS`; it shows no glow.
-                        if ferros_glow::Glow::from_u8(c.glow) == ferros_glow::Glow::None {
-                            c.glow = 0;
-                        }
                     }
                 }
                 Some(14) if m.len() >= 13 => {
@@ -6659,11 +6631,11 @@ fn server(grants: u64) -> ! {
                             let sx = ((((rc * dx - rs * dy) >> 14) * z / 65536 + wq) & !255 | 128) + ox;
                             let sy = ((((rs * dx + rc * dy) >> 14) * z / 65536 + hq) & !255 | 128) + oy;
                             let sr = cir.r as i64 * z >> 8;
-                            // Its state glow (op 57), in place of the theme's: its table and its reach past the rim.
-                            let state = state_glow(&cir, sr);
-                            // Between frames, only what reaches the clip (the circle and its glow: the theme's 1/12 of the radius out, a state glow's own reach) is drawn.
+                            // Its state (op 57): the theme's glow in the state's colour, peak and multiply (`state_glow`).
+                            let state = state_glow(&cir, &th);
+                            // Between frames, only what reaches the clip (the circle and its glow, 1/12 of the radius out, a people glow's farther) is drawn.
                             if clip_k.is_some() || shift.is_some() {
-                                let reach = sr + state.map_or(sr / GLOW_FRACTION, |s| s.1) + 512;
+                                let reach = sr + sr / state.map_or(GLOW_FRACTION, |s| s.2) + 512;
                                 let c = unsafe { draw::CLIP };
                                 if (sx + reach) >> 8 < c.x0 as i64 || (sx - reach) >> 8 >= c.x1 as i64 || (sy + reach) >> 8 < c.y0 as i64 || (sy - reach) >> 8 >= c.y1 as i64 {
                                     continue;
@@ -6671,12 +6643,12 @@ fn server(grants: u64) -> ! {
                             }
                             // Its glow, before the visibility cut: a circle just off the screen still lights its edge.
                             if sr >= 256 && nglow < glows.len() {
-                                if let Some((lut, reach)) = state {
-                                    glows[nglow] = Item::Line(sx, sy, sr, reach, lut);
+                                if let Some((colour, peak, frac, dark)) = state {
+                                    glows[nglow] = Item::Glow(sx, sy, sr, colour, peak, frac, dark);
                                     nglow += 1;
                                 } else if cir.ring > 0 {
                                     let colour = if cir.lit != 0 { th.lit & 0x00FF_FFFF } else { th.ring & 0x00FF_FFFF };
-                                    glows[nglow] = Item::Glow(sx, sy, sr, colour, th.glow_peak[(cir.ring as usize).min(2)]);
+                                    glows[nglow] = Item::Glow(sx, sy, sr, colour, th.glow_peak[(cir.ring as usize).min(2)], GLOW_FRACTION, 0);
                                     nglow += 1;
                                 }
                             }
@@ -6776,10 +6748,6 @@ fn server(grants: u64) -> ! {
                                     ALLOC.reset();
                                 }
                             }
-                            // Its rim arc (op 57: needs you, or working's progress), in front of the circle: on the list before the circle's own pixels.
-                            if cir.rim != 0 {
-                                scene_push(Item::Arc(sx, sy, sr, cir.rim, cir.share), pixels, width, height);
-                            }
                             let t_i = now();
                             let (cc, cs) = (cir.c as i64, cir.s as i64);
                             let (tc, ts) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
@@ -6836,12 +6804,9 @@ fn server(grants: u64) -> ! {
                         let t_g = now();
                         for &g in &glows[..nglow] {
                             scene_push(g, pixels, width, height);
-                            // Its reach, as `draw::glow_log` and `draw::glow_line` give it back.
-                            let (gx, gy, reach) = match g {
-                                Item::Line(gx, gy, gr, reach, _) => (gx, gy, gr + reach + 256),
-                                Item::Glow(gx, gy, gr, _, _) => (gx, gy, gr + gr / GLOW_FRACTION + 256),
-                                _ => continue,
-                            };
+                            // Its reach, as `draw::glow_log` gives it back.
+                            let Item::Glow(gx, gy, gr, _, _, frac, _) = g else { continue };
+                            let reach = gr + gr / frac + 256;
                             let gr_rect = draw::Rect { x0: ((gx - reach) >> 8) as i32 - 1, y0: ((gy - reach) >> 8) as i32 - 1, x1: ((gx + reach) >> 8) as i32 + 2, y1: ((gy + reach) >> 8) as i32 + 2 }.clip(width, height);
                             unsafe { CUR_DMG = CUR_DMG.union(gr_rect) };
                         }

@@ -1,28 +1,19 @@
-//! A kist circle's state as light (owner, 2026-11-11: "Ideas for glow indicating kist states, pending notifications, running or not, etc."; then "I pick spectrum colours as they are colourblind agnostic as long as we always choose monochromatic primaries ... i'd like to cover it all with wavelengths and brightnesses ... Spectral lines for states").
-//! One maths for the device (payloads/display draws it on the home plane) and the desktop (tools/tune's glow page), no I/O, no std.
+//! A kist circle's state as the colour of its glow (owner, 2026-11-11: "Ideas for glow indicating kist states, pending notifications, running or not, etc."; "I pick spectrum colours as they are colourblind agnostic as long as we always choose monochromatic primaries ... map any negative coefficients when computing glow colour to a multiply on the negative channels ... Spectral lines for states").
+//! The glow itself is the display's own (draw.rs `glow_log`: its falloff, its reach, its peaks by the theme); a state changes only its colour, its brightness step and the multiply behind it (owner, on the device: "we just need to change the colour and add the multiply for the negative channel").
+//! No I/O, no std.
 //!
-//! Three channels a circle can show, each at once:
-//! - **glow**: light outside the rim, a layer of its line's colour at a falling α, composed under the circles (`Glow`, `at_rim`, `falloff`, `reach`);
-//! - **rim**: a lit arc on the circle's own edge, in front of its icon (`Rim`, `rim_light`, `arc_cover`);
-//! - the circle itself is left as it is.
-//!
-//! | state | line | λ nm | at the rim |
+//! | state | line | λ nm | brightness |
 //! |---|---|---|---|
-//! | running (background) | H-beta | 486.1 | glow, low, short reach |
-//! | the Back-swipe target | H-beta | 486.1 | glow, medium |
-//! | notifications from people | sodium D | 589.0 | glow, high, reach growing with log2(1 + n) |
-//! | notifications from the system | mercury | 546.1 | glow, medium |
-//! | needs you (a question, a permission, an approval) | H-gamma | 434.0 | the rim's twelve o'clock arc, high |
-//! | working (install, update, fetch) | mercury | 546.1 | the rim's progress arc, medium |
-//! | stopped with a reason | H-alpha | 656.3 | glow as a multiply, low |
-//! | not running | none | - | a neutral multiply under the circle |
+//! | running (background) | H-beta | 486.1 | low |
+//! | the Back-swipe target | H-beta | 486.1 | medium |
+//! | notifications from people | sodium D | 589.0 | high (the count widens its reach) |
+//! | notifications from the system | mercury | 546.1 | medium |
+//! | needs you (a question, a permission, an approval) | H-gamma | 434.0 | high |
+//! | working (install, update, fetch) | mercury | 546.1 | medium |
+//! | stopped with a reason | H-alpha | 656.3 | low, and a multiply passing its line |
+//! | not running | none | - | a neutral multiply only |
 //!
-//! Colour: a line is its cone response (vsf's Stockman & Sharpe 10° table, 1 nm, linear between samples) in VSF RGB (`LMS2VSF_RGB`), scaled to unit photopic luminance by VSF's own weights (`vsf_rgb_to_photopic_f32`).
-//! A spectral line lies outside the primaries' triangle, so one channel comes out negative (owner: "map any negative coefficients when computing glow colour to a multiply on the negative channels").
-//! The positive part is the light; the negative part becomes a filter that darkens what is behind, `MULT_SHARE` of its photopic share.
-//! The display's canvas carries one α a pixel, so the filter is neutral there (it darkens every channel of the wallpaper behind, by the negative part's photopic share): a per-channel multiply needs three opacities a pixel, the owner's call.
-//!
-//! Every knob is one constant here, a power of two where it is a choice.
+//! Colour: a line is its cone response (vsf's Stockman & Sharpe 10° table, 1 nm, linear between samples) in VSF RGB (`LMS2VSF_RGB`). A spectral line lies outside the primaries' triangle, so one channel comes out negative: the positive channels are the glow's colour, each negative channel a multiply of what is behind (`MULT_SHARE` of it at the glow's full intensity).
 
 #![no_std]
 
@@ -36,33 +27,22 @@ pub const MERCURY: f32 = 546.1;
 pub const H_GAMMA: f32 = 434.0;
 pub const H_ALPHA: f32 = 656.3;
 
-/// Brightness at the rim, as photopic luminance relative to white (1): low, medium, high.
-pub const LOW: f32 = 1. / (1 << 4) as f32;
-pub const MEDIUM: f32 = 1. / (1 << 3) as f32;
-pub const HIGH: f32 = 1. / (1 << 2) as f32;
-/// How far a glow reaches past the rim, in the circle's radius: low, medium, high (so a glow reads at every zoom: it is part of the circle's shape).
-pub const REACH_LOW: f32 = 1. / (1 << 1) as f32;
-pub const REACH_MEDIUM: f32 = 3. / (1 << 2) as f32;
-pub const REACH_HIGH: f32 = 1.;
-/// A light glow's opacity at the rim at `HIGH`, a dimmer one's in proportion to its level (medium 1/4, low 1/8): how much of what is behind (the wallpaper) it takes away before its own light goes in, so the colour reads vivid on a bright plane, while a faint glow stays mostly light (owner: the multiply is for the kists not running, "so the glow is vivid anyway").
-pub const VEIL: f32 = 1. / (1 << 1) as f32;
-/// The negative part's filter, as a share of its photopic weight against the positive part's (owner: "share 1/2 to start").
+/// A negative channel's multiply at the glow's full intensity: that channel of what is behind darkened by this share (owner: "share 1/2 to start").
 pub const MULT_SHARE: f32 = 1. / (1 << 1) as f32;
-/// Not running: the neutral multiply's depth at the rim (1/8 darker than the plane there).
+/// Not running: the neutral multiply at the glow's full intensity (1/8 darker than the plane there).
 pub const IDLE_DEPTH: f32 = 1. / (1 << 3) as f32;
-/// Stopped with a reason: the multiply's depth at the rim, with its line's light at `LOW` in it (the H-alpha tint the darkening carries).
+/// Stopped with a reason: the multiply that passes H-alpha, at full intensity, on the channels the line does not light.
 pub const STOP_DEPTH: f32 = 1. / (1 << 2) as f32;
-/// The rim's arcs: their light at full coverage (relative luminance), high and medium; an arc lies over the circle's icon, so it is brighter than a glow on the plane.
-pub const RIM_HIGH: f32 = 1. / (1 << 1) as f32;
-pub const RIM_MEDIUM: f32 = 1. / (1 << 2) as f32;
-/// The arc's band, as shares of the circle's radius: outer and inner edge (the quick row's rings, display quick.rs `RING_BAND`).
-pub const RIM_BAND: (f32, f32) = (0.97, 0.84);
-/// Needs you: the arc's length about twelve o'clock, a share of the turn.
-pub const NEEDS_SHARE: f32 = 1. / (1 << 2) as f32;
-/// Working: the progress arc's unlit rest, as a share of the lit part's coverage (a faint track, so the share left reads).
-pub const RIM_REST: f32 = 1. / (1 << 3) as f32;
 
-/// A circle's glow (the map sends it, display op 57).
+/// A glow's brightness step, mapped by the display onto the theme's glow peaks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Level {
+    Low,
+    Medium,
+    High,
+}
+
+/// A circle's state (the map sends it, display op 57).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Glow {
@@ -73,12 +53,12 @@ pub enum Glow {
     System = 4,
     Stopped = 5,
     Idle = 6,
+    NeedsYou = 7,
+    Working = 8,
 }
 
 impl Glow {
-    /// Every glow that draws, in its wire order.
-    pub const ALL: [Glow; 6] = [Glow::Running, Glow::Back, Glow::People, Glow::System, Glow::Stopped, Glow::Idle];
-    /// From the wire; an unknown byte is no glow.
+    /// From the wire; an unknown byte is no state.
     pub fn from_u8(b: u8) -> Glow {
         match b {
             1 => Glow::Running,
@@ -87,157 +67,70 @@ impl Glow {
             4 => Glow::System,
             5 => Glow::Stopped,
             6 => Glow::Idle,
+            7 => Glow::NeedsYou,
+            8 => Glow::Working,
             _ => Glow::None,
         }
     }
-    /// Its line (nm), none for the neutral multiply.
-    pub fn line(self) -> Option<f32> {
-        match self {
-            Glow::Running | Glow::Back => Some(H_BETA),
-            Glow::People => Some(SODIUM_D),
-            Glow::System => Some(MERCURY),
-            Glow::Stopped => Some(H_ALPHA),
-            Glow::Idle | Glow::None => None,
-        }
-    }
-    /// Its brightness at the rim.
-    pub fn level(self) -> f32 {
-        match self {
-            Glow::Running | Glow::Stopped => LOW,
-            Glow::Back | Glow::System => MEDIUM,
-            Glow::People => HIGH,
-            Glow::Idle | Glow::None => 0.,
-        }
-    }
 }
 
-/// A circle's rim arc (display op 57).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum Rim {
-    None = 0,
-    NeedsYou = 1,
-    Working = 2,
-}
-
-impl Rim {
-    pub fn from_u8(b: u8) -> Rim {
-        match b {
-            1 => Rim::NeedsYou,
-            2 => Rim::Working,
-            _ => Rim::None,
-        }
-    }
-}
-
-/// A wavelength (nm, inside the table's 390 to 830) as linear VSF RGB at unit photopic luminance: its cone response, linear between the table's 1 nm samples, thru `LMS2VSF_RGB`, divided by its luminance. One channel is negative for any line between the primaries (703, 523, 462 nm), as a spectral colour lies outside their triangle.
+/// A wavelength (nm, inside the table's 390 to 830) as linear VSF RGB: its cone response, linear between the table's 1 nm samples, thru `LMS2VSF_RGB`. One channel is negative for any line between the primaries (703, 523, 462 nm).
 pub fn line(nm: f32) -> [f32; 3] {
     let s = &LMS_2000_10DEG_1NM;
     let f = nm - s.start_nm;
     let (i, w) = (f as usize, f - (f as usize) as f32);
     let lms = [0, 1, 2].map(|c| s.data[3 * i + c] * (1. - w) + s.data[3 * i + 3 + c] * w);
-    let rgb = apply_matrix_3x3_f32(&LMS2VSF_RGB, &lms);
-    let y = vsf_rgb_to_photopic_f32(rgb[0], rgb[1], rgb[2]);
-    rgb.map(|v| v / y)
+    apply_matrix_3x3_f32(&LMS2VSF_RGB, &lms)
 }
 
-/// A line's light and filter: the positive part scaled to `level` of white's photopic luminance, and the negative part's photopic weight against the positive's (the filter's share before `MULT_SHARE`).
-pub fn split(nm: f32, level: f32) -> ([f32; 3], f32) {
+/// What a state's glow is: its colour (linear VSF RGB, the line's positive channels, each 0 or more; none for a multiply alone), its brightness step, and its multiply (per channel, the share of what is behind darkened at the glow's full intensity).
+#[derive(Clone, Copy, Debug)]
+pub struct Spec {
+    pub colour: Option<[f32; 3]>,
+    pub level: Level,
+    pub mult: [f32; 3],
+}
+
+/// State `g`'s glow, or None for no state (the theme's glow as ever).
+pub fn spec(g: Glow) -> Option<Spec> {
+    let (nm, level) = match g {
+        Glow::None => return None,
+        Glow::Idle => return Some(Spec { colour: None, level: Level::Low, mult: [IDLE_DEPTH; 3] }),
+        Glow::Running => (H_BETA, Level::Low),
+        Glow::Back => (H_BETA, Level::Medium),
+        Glow::People => (SODIUM_D, Level::High),
+        Glow::System | Glow::Working => (MERCURY, Level::Medium),
+        Glow::NeedsYou => (H_GAMMA, Level::High),
+        Glow::Stopped => (H_ALPHA, Level::Low),
+    };
     let c = line(nm);
     let p = c.map(|v| if v > 0. { v } else { 0. });
-    let n = c.map(|v| if v < 0. { -v } else { 0. });
-    let yp = vsf_rgb_to_photopic_f32(p[0], p[1], p[2]);
-    let yn = vsf_rgb_to_photopic_f32(n[0], n[1], n[2]);
-    (p.map(|v| v * level / yp), yn / yp)
+    let mult = if g == Glow::Stopped {
+        // A filter passing the line: each channel darkened as far as the line leaves it unlit (its share of the brightest channel).
+        let top = p[0].max(p[1]).max(p[2]);
+        p.map(|v| STOP_DEPTH * (1. - v / top))
+    } else {
+        c.map(|v| if v < 0. { MULT_SHARE } else { 0. })
+    };
+    Some(Spec { colour: Some(p), level, mult })
 }
 
-/// A glow at its rim: linear VSF RGB light (each channel ≥ 0) and its opacity (0 to 1). Both fall by `falloff` together out to the reach.
-#[derive(Clone, Copy, Debug)]
-pub struct AtRim {
-    pub light: [f32; 3],
-    pub alpha: f32,
+/// A multiply's photopic share: the light it takes from a grey (equal-energy) plane, by VSF's own weights (R 0.2584, G 0.6346, B 0.1070). The display's canvas has one opacity a pixel, so a per-channel multiply goes in as a neutral one of this strength (display main.rs `state_glow`).
+pub fn photopic(m: [f32; 3]) -> f32 {
+    vsf_rgb_to_photopic_f32(m[0], m[1], m[2])
 }
 
-/// Glow `g` at its rim: a light (running, back, people, system) is its line's positive part at its level, at α = `VEIL` scaled by its level against `HIGH`, plus the negative part's filter; stopped is a multiply of `STOP_DEPTH` carrying its line's light at `LOW`; not running is the neutral multiply, no light at all.
-pub fn at_rim(g: Glow) -> AtRim {
-    match (g, g.line()) {
-        (Glow::Stopped, Some(nm)) => AtRim { light: split(nm, g.level()).0, alpha: STOP_DEPTH },
-        (_, Some(nm)) => {
-            let (light, neg) = split(nm, g.level());
-            AtRim { light, alpha: VEIL * g.level() / HIGH + MULT_SHARE * neg }
-        }
-        (Glow::Idle, None) => AtRim { light: [0.; 3], alpha: IDLE_DEPTH },
-        _ => AtRim { light: [0.; 3], alpha: 0. },
-    }
+/// Linear VSF RGB `l` as light of the same photopic luminance as `y` (relative to white, 1), or as bright as the primaries allow when a channel would pass white (its brightest channel then full, as the console's battery flavour does).
+pub fn at_luminance(l: [f32; 3], y: f32) -> [f32; 3] {
+    let k = y / vsf_rgb_to_photopic_f32(l[0], l[1], l[2]);
+    let top = l[0].max(l[1]).max(l[2]) * k;
+    // WHY the cap: a line of low photopic weight (H-gamma, deep blue) cannot reach the theme's light within white; its brightest channel stops at full.
+    let k = if top > 1. { k / top } else { k };
+    l.map(|v| v * k)
 }
 
-/// The falloff from the rim (s = 0) to the reach (s = 1): the bump exp(1 − 1/(1 − s²)), 1 at the rim with every odd derivative zero there, and zero at the reach with every derivative zero, so the glow meets the plane with no edge at all (C∞).
-/// `s` is the squared distance past the rim as a share of the reach's, q / q_max with q = d² − r² (the display walks q, no root), itself C∞ in the pixel's place. The test is the bump's definition past its end, not a clamp.
-pub fn falloff(s: f32) -> f32 {
-    if s >= 1. {
-        return 0.;
-    }
-    libm::expf(1. - 1. / (1. - s * s))
-}
-
-/// How far glow `g` reaches past the rim, in the circle's radius; people's grows with the count n, from `REACH_LOW` toward `REACH_HIGH` as L / (1 + L) with L = log2(1 + n) (one: 3/4, twenty: 0.91), C∞ in n and never past high.
-pub fn reach(g: Glow, n: u16) -> f32 {
-    match g {
-        Glow::Running | Glow::Stopped | Glow::Idle => REACH_LOW,
-        Glow::Back | Glow::System => REACH_MEDIUM,
-        Glow::People => {
-            let l = libm::log2f(1. + n as f32);
-            REACH_LOW + (REACH_HIGH - REACH_LOW) * l / (1. + l)
-        }
-        Glow::None => 0.,
-    }
-}
-
-/// Rim arc `r`'s light at full coverage (linear VSF RGB, its positive part: an arc is opaque where lit, so the negative part has nothing behind it to filter).
-pub fn rim_light(r: Rim) -> [f32; 3] {
-    match r {
-        Rim::NeedsYou => split(H_GAMMA, RIM_HIGH).0,
-        Rim::Working => split(MERCURY, RIM_MEDIUM).0,
-        Rim::None => [0.; 3],
-    }
-}
-
-/// Rim arc `r`'s lit part, in turns clockwise from twelve o'clock: its centre and half its length. Needs you: `NEEDS_SHARE` about twelve. Working: from twelve round to `share` (0 to 1), as the quick row's rings fill.
-pub fn arc(r: Rim, share: f32) -> (f32, f32) {
-    match r {
-        Rim::NeedsYou => (0., NEEDS_SHARE * 0.5),
-        Rim::Working => (share * 0.5, share * 0.5),
-        Rim::None => (0., 0.),
-    }
-}
-
-/// A C∞ step from 0 at t ≤ 0 to 1 at t ≥ 1 (display draw.rs `bump_step`): the bump exp(−1/t) against its mirror; the two tests are its definition.
-pub fn bump_step(t: f32) -> f32 {
-    if t <= 0. {
-        return 0.;
-    }
-    if t >= 1. {
-        return 1.;
-    }
-    let (a, b) = (libm::expf(-1. / t), libm::expf(-1. / (1. - t)));
-    a / (a + b)
-}
-
-/// A pixel's coverage by rim arc `r` on a circle of radius `ri` pixels: (dx, dy) the pixel's centre from the circle's, `share` the working arc's progress.
-/// The band's two edges and the lit part's two ends are each the C∞ step across a pixel (the quick row's `ring`), so the lit end moves smoothly with the share; past the lit part a working arc keeps `RIM_REST` of its light (the track still to go), a needs-you arc nothing.
-pub fn arc_cover(r: Rim, dx: f32, dy: f32, ri: f32, share: f32) -> f32 {
-    let (r1, r0) = (ri * RIM_BAND.0, ri * RIM_BAND.1);
-    let d = libm::sqrtf(dx * dx + dy * dy);
-    let band = bump_step(r1 - d + 0.5) * bump_step(d - r0 + 0.5);
-    if band <= 0. {
-        return 0.;
-    }
-    let tau = core::f32::consts::TAU;
-    let (centre, half) = arc(r, share);
-    // The turn from the arc's centre, -1/2 to 1/2: the seam opposite the centre is where the lit part never is (short of a full share).
-    let a = libm::atan2f(dx, -dy) * (1. / tau) - centre;
-    let g = a - libm::floorf(a + 0.5);
-    let lit = bump_step((g + half) * tau * d + 0.5) * bump_step((half - g) * tau * d + 0.5);
-    let rest = if r == Rim::Working { RIM_REST } else { 0. };
-    band * (lit + (1. - lit) * rest)
+/// How much farther a people glow reaches with n notifications: 1 + L / (1 + L), L = log2(1 + n) (one: 1.5, twenty: 1.81), never past twice.
+pub fn people_reach(n: u16) -> f32 {
+    let l = libm::log2f(1. + n as f32);
+    1. + l / (1. + l)
 }
