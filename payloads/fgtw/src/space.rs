@@ -467,9 +467,9 @@ impl Client {
             self.depart_frame(None, bytes);
         }
         // A request waiting here whose entry its device gave up (op 20 there): no longer asked, unless this device is countersigning it now.
-        if let Some((leaver, _, salt)) = self.depart_asked() {
+        if let Some((leaver, _, _)) = self.depart_asked() {
             if self.dep.result != 1 && !live.iter().any(|(l, _)| *l == leaver) {
-                self.depart_withdrawn(leaver, salt);
+                self.depart_withdrawn(leaver);
             }
         }
     }

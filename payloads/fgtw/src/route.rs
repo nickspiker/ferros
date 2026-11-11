@@ -38,13 +38,12 @@ impl Sends {
         Sends { out: Vec::new() }
     }
 
-    /// A frame for `device` to go to PT at `to`: true when it is not out there already. The same frame to the same address while one is out is not handed to PT again (a device heard every few seconds would otherwise start a transfer each time); the answer to the one out settles it.
-    pub fn record(&mut self, to: Addr, hash: [u8; 32], device: [u8; 32]) -> bool {
+    /// A frame for `device` handed to PT at `to`. The same frame to the same address while one is out is one entry: PT sends a small one once while it is in flight, and the first answer settles it.
+    pub fn record(&mut self, to: Addr, hash: [u8; 32], device: [u8; 32]) {
         if self.out.iter().any(|(a, h, _)| *a == to && *h == hash) {
-            return false;
+            return;
         }
         self.out.push((to, hash, device));
-        true
     }
 
     /// PT's answer for the frame `hash` to `to`: the device it was for, or None when it was not the machine's (dropped).
@@ -113,15 +112,16 @@ mod tests {
     }
 
     #[test]
-    fn the_same_frame_out_twice_is_one_send() {
+    fn the_same_frame_out_twice_is_one_entry() {
         let mut s = Sends::new();
         let a = v4(2, 4383);
-        assert!(s.record(a, [1; 32], [0xA; 32]));
-        // Heard again while it is out: not handed to PT again.
-        assert!(!s.record(a, [1; 32], [0xA; 32]));
+        s.record(a, [1; 32], [0xA; 32]);
+        s.record(a, [1; 32], [0xA; 32]);
         assert_eq!(s.pending(), 1);
-        // Answered (given up): the next hand-off goes out.
+        // Answered once: the entry is gone, and the next hand-off is recorded afresh.
         assert_eq!(s.answered(&a, &[1; 32]), Some([0xA; 32]));
-        assert!(s.record(a, [1; 32], [0xA; 32]));
+        assert_eq!(s.pending(), 0);
+        s.record(a, [1; 32], [0xA; 32]);
+        assert_eq!(s.pending(), 1);
     }
 }

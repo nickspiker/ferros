@@ -19,20 +19,16 @@ pub enum Kept {
     Unreadable(String),
 }
 
-/// The machine's state as kept: `Depart::to_section` without the handle proof (a root, which goes to disk only with unlock at boot), as one VSF document stamped `time`.
-pub fn to_doc(m: &Depart, time: i64) -> Result<Vec<u8>, String> {
-    let mut sec = m.to_section();
-    sec.fields.retain(|f| f.name != "hp");
-    vsf::VsfBuilder::new().creation_time_oscillations(time).add_section_direct(sec).build().map_err(|e| alloc::format!("depart state: {e}"))
-}
+/// This service reports every send's outcome to the machine (`Event::Sent`, depart.rs), so a device heard again is handed only what gave up or was never handed.
+pub const REPORTS_SENT: bool = true;
 
-/// A kept document read for the roots in hand (`hp`) and this device (`me`): the handle proof put back into the machine's state; the old form (section `depart`, field `rq`, the signed `depart_req` alone) converted, taken up only when its consent's Ed25519 egg verifies for these roots, as it was before the machine.
+/// A kept document read for the roots in hand (`hp`, which the machine's state does not hold: it is a root) and this device (`me`). The old form (section `depart`, field `rq`, the signed `depart_req` alone) is converted, taken up only when its consent's Ed25519 egg verifies for these roots, as it was before the machine.
 pub fn read(doc: &[u8], hp: &[u8; 32], me: &[u8; 32]) -> Kept {
     let (header, end) = match vsf::verification::read_verified(doc, None) {
         Ok(x) => x,
         Err(e) => return Kept::Unreadable(alloc::format!("{e}")),
     };
-    let mut sec = match header.primary_section(doc, end) {
+    let sec = match header.primary_section(doc, end) {
         Ok(s) => s,
         Err(e) => return Kept::Unreadable(alloc::format!("{e}")),
     };
@@ -42,8 +38,7 @@ pub fn read(doc: &[u8], hp: &[u8; 32], me: &[u8; 32]) -> Kept {
     if sec.get_field("me").and_then(|f| f.values.first()).and_then(|v| v.as_bytes()) != Some(&me[..]) {
         return Kept::Foreign;
     }
-    sec.add_field("hp", vsf::VsfType::hP(hp.to_vec()));
-    match Depart::from_section(&sec) {
+    match Depart::from_section(&sec, *hp, REPORTS_SENT) {
         Ok(m) => Kept::Machine(m),
         Err(e) => Kept::Unreadable(e),
     }
@@ -58,13 +53,12 @@ fn from_old(hp: &[u8; 32], me: &[u8; 32], frame: Vec<u8>) -> Kept {
         return Kept::Foreign;
     }
     let mut s = vsf::VsfSection::new("depart");
-    s.add_field("hp", vsf::VsfType::hP(hp.to_vec()));
     s.add_field("me", vsf::VsfType::ke(me.to_vec()));
     s.add_field("own_t", vsf::VsfType::e(vsf::types::EtType::e6(req.t)));
     s.add_field("own_salt", vsf::VsfType::hb(req.salt.to_vec()));
     s.add_field("own_intent", vsf::VsfType::u(req.intent as usize, false));
     s.add_field("own_frame", vsf::VsfType::v(b'r', frame));
-    match Depart::from_section(&s) {
+    match Depart::from_section(&s, *hp, REPORTS_SENT) {
         Ok(m) => Kept::Old(m),
         Err(e) => Kept::Unreadable(e),
     }
@@ -101,7 +95,7 @@ mod tests {
         let sec = m.to_section();
         assert_eq!(sec.eagle("own_t"), Some(T));
         assert_eq!(sec.get_field("own_salt").and_then(|f| f.values.first()).and_then(|v| v.as_bytes()), Some(&salt[..]));
-        assert_eq!(sec.get_field("own_frame").and_then(|f| f.values.first()).and_then(|v| v.as_bytes()), Some(&frame[..]));
+        assert_eq!(m.own_frame(), Some(&frame[..]));
         // Resumed before the fold, then told the members: the same signed frame to the other device, once, and its salt on the tag.
         let r = m.resume();
         assert!(r.actions.iter().any(|a| *a == Action::NfcServe(Some(salt))));
@@ -110,11 +104,11 @@ mod tests {
         let sends: Vec<_> = s.actions.iter().filter_map(|a| if let Action::Send { to, frame: f } = a { Some((*to, f.clone())) } else { None }).collect();
         assert_eq!(sends, alloc::vec![(To::Device(other), frame.clone())]);
         // Kept again in the machine's form (no handle proof in it) and read back: still the same request.
-        let kept = to_doc(&m, T + 2).unwrap();
+        let kept = m.to_vsf(T + 2).unwrap();
         assert!(!kept.windows(32).any(|w| w == HP));
         let Kept::Machine(back) = read(&kept, &HP, &me) else { panic!("the machine's form did not read back") };
         assert!(back.asking());
-        assert_eq!(back.to_section().get_field("own_frame").and_then(|f| f.values.first()).and_then(|v| v.as_bytes()), Some(&frame[..]));
+        assert_eq!(back.own_frame(), Some(&frame[..]));
     }
 
     #[test]
@@ -125,8 +119,8 @@ mod tests {
         assert!(matches!(read(&doc, &[0x22; 32], &me), Kept::Foreign));
         let other = DeviceKeys::derive(&[9; 32]).device_pubkey();
         assert!(matches!(read(&doc, &HP, &other), Kept::Foreign));
-        let m = Depart::new(HP, me);
-        let kept = to_doc(&m, T).unwrap();
+        let m = Depart::new(HP, me, REPORTS_SENT);
+        let kept = m.to_vsf(T).unwrap();
         assert!(matches!(read(&kept, &HP, &other), Kept::Foreign));
     }
 

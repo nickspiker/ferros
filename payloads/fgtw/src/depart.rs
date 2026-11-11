@@ -2,11 +2,12 @@
 //! This file decides nothing about a departure: it tells the machine what happened and carries out what it asks.
 //!
 //! - **Made** once the roots are in hand (`depart_start`), from its state in the vault when there is one, resumed at once (our request handed again, a request asked about offered again), then told the fold of every chain adopted (`depart_fold`).
-//! - **Kept** in the `fgtw.` scope as `depart` (`DEPART_KEY`), whatever unlock-at-boot says: the machine's state as one VSF document without its handle proof (a root, kept on disk only with unlock-at-boot), put back from the roots in hand when it is read.
+//! - **Kept** in the `fgtw.` scope as `depart` (`DEPART_KEY`), whatever unlock-at-boot says: the machine's state as one VSF document (`Depart::to_vsf`), which holds no handle proof (a root, kept on disk only with unlock-at-boot); the roots in hand give it back when it is read.
 //! - **Migrated** at start: a departure kept by the build before the machine (section `depart`, field `rq`: the signed request alone) becomes the machine's own request with the same stamp, salt and signed frame, checked against these roots as before; the denied list kept beside it (`denied`) is told to the machine once and then deleted.
 //! - **Slow work** (signing with every egg, the approval's publish, a chain read) is queued and run by the loop (`depart_work`), pinned to the X3 where it signs, never inside a call another process waits on.
-//! - **Sends** go by Photon Transport to the address the device was last heard at (its beacon, a ping, any frame from it); PT's answer names the frame by its hash, mapped back to the device it was for (route.rs), so another frame's acknowledgement never counts as this one taken. A device with no address yet is handed the frame when it is next heard, and the sponsor named at spawn gets each frame once.
+//! - **Sends** go by Photon Transport to the address the device was last heard at (its beacon, a ping, any frame from it); PT's answer names the frame by its hash, mapped back to the device it was for (route.rs), so another frame's acknowledgement never counts as this one taken. Every send's outcome is reported (`kept::REPORTS_SENT`): a send with no address yet is reported given up at once, so the machine hands it when the device is next heard. The sponsor named at spawn gets each frame once.
 //! - **The identity space** carries the departure too (space.rs), so devices away from this network see it: our request once built, a deny made here, and the entry dropped when our request is given up or an approval here publishes.
+//! - **An approval here** hands the leaving device our new chain (`PushChain`, a `fleet_resp`), so on this network it learns it is out at once. The leaving device still reads fgtw.org's chain every 16 s while its request stands (`depart_seed_check`): ferros has no relay, so an approval made where the push cannot reach it (another network, this device asleep or off, the push given up) reaches it only thru fgtw.org.
 //! - **The Fleet page** (payloads/map) reads op 1 (state 8, leaving), op 13 and the doorbell; its words are fgtw's (`fgtw::text`), picked by the map from those bytes, so each `Note` here sets what those bytes say and puts a line on the console.
 
 use super::*;
@@ -24,6 +25,8 @@ pub enum Work {
     Build { id: u32, frame: FlowFrame },
     /// Countersign and publish a departure approved here (`fgtw::sponsor::approve_departure`) and answer `Approved`.
     Approve { leaver: [u8; 32], t: i64, consent_sig: Vec<u8>, intent: u8 },
+    /// Hand our chain as it stands to this device (`fleet_resp`): a leaving device approved here learns it is out.
+    PushChain { to: [u8; 32] },
     /// Read the chain again (the approval changed it).
     RefreshChain,
 }
@@ -44,11 +47,15 @@ pub struct Departing {
     pub denied_by: Option<[u8; 32]>,
     /// When the seed's chain was last read while our request stands (`depart_seed_check`).
     pub checked_us: u64,
+    /// Sends the machine asked for that never reached PT (no address for the device yet): reported given up once the step's actions are carried out.
+    unsent: Vec<[u8; 32]>,
+    /// Leaving devices approved here, handed our chain once it is read again (`depart_push_chain`).
+    push_to: Vec<[u8; 32]>,
 }
 
 impl Departing {
     pub const fn new() -> Departing {
-        Departing { m: None, work: Vec::new(), sends: route::Sends::new(), given_sent: None, ops_told: 0, result: 0, denied_by: None, checked_us: 0 }
+        Departing { m: None, work: Vec::new(), sends: route::Sends::new(), given_sent: None, ops_told: 0, result: 0, denied_by: None, checked_us: 0, unsent: Vec::new(), push_to: Vec::new() }
     }
 }
 
@@ -68,6 +75,16 @@ impl Client {
         let Some(m) = self.dep.m.as_mut() else { return };
         let step = m.step(ev, eagle());
         self.depart_carry(step.actions);
+        self.depart_unsent();
+    }
+
+    /// The sends that never reached PT, told to the machine as given up: each device is handed its frame when it is next heard or a network comes up.
+    fn depart_unsent(&mut self) {
+        while let Some(to) = self.dep.unsent.pop() {
+            let Some(m) = self.dep.m.as_mut() else { return };
+            let step = m.step(Flow::Sent { to, ok: false }, eagle());
+            self.depart_carry(step.actions);
+        }
     }
 
     /// The machine made, once the roots are in hand: from the vault (either form) or fresh, the old denied list told to it, resumed, and told the fold of the chain held.
@@ -80,7 +97,7 @@ impl Client {
         let migrated = kept.as_ref().is_some_and(|(_, old)| *old);
         self.dep.m = Some(match kept {
             Some((m, _)) => m,
-            None => Depart::new(hp, self.me),
+            None => Depart::new(hp, self.me, kept::REPORTS_SENT),
         });
         if migrated {
             self.log.put(b"fgtw: a departure kept by the build before fgtw's machine: taken up by the machine with its stamp, salt and signed request");
@@ -102,6 +119,7 @@ impl Client {
                 self.log.line();
             }
             self.depart_carry(step.actions);
+            self.depart_unsent();
         }
         // The chain this device holds, if any (the vault's, with unlock at boot): the machine's first fold; a departure whose chain already lacks this device completes here.
         let held = self.held.borrow().get(&hp).cloned();
@@ -137,10 +155,10 @@ impl Client {
         }
     }
 
-    /// The machine's state into the vault (`DEPART_KEY`), its handle proof left out (kept.rs). Whether it was kept.
+    /// The machine's state into the vault (`DEPART_KEY`): no handle proof in it. Whether it was kept.
     fn depart_keep(&mut self) -> bool {
         let Some(m) = self.dep.m.as_ref() else { return false };
-        let kept = match kept::to_doc(m, eagle()) {
+        let kept = match m.to_vsf(eagle()) {
             Ok(doc) => self.store_set_whole(DEPART_KEY, &doc),
             Err(_) => false,
         };
@@ -214,6 +232,7 @@ impl Client {
                     self.log.put(b" released for its new owner");
                     self.log.line();
                 }
+                Action::PushChain { to } => self.dep.work.push(Work::PushChain { to }),
                 Action::RefreshChain => self.dep.work.push(Work::RefreshChain),
                 Action::Note(n) => self.depart_note(n),
                 Action::Wipe => {
@@ -224,15 +243,12 @@ impl Client {
         }
     }
 
-    /// A frame for device `k`: by PT to where it was last heard. With no address yet it waits for the device to be heard (the machine hands it then), and the sponsor named at spawn gets it once.
+    /// A frame for device `k`: by PT to where it was last heard, its answer mapped back to `k`. With no address yet it is reported given up (the machine hands it when the device is heard), and the sponsor named at spawn gets it once.
     fn depart_send(&mut self, k: [u8; 32], frame: Vec<u8>) {
         let hash = *blake3::hash(&frame).as_bytes();
         match self.sponsors.iter().find(|s| s.key == k).map(|s| s.addr) {
             Some(to) => {
-                // Out there already (the device was heard again before PT answered): its answer settles this hand-off too.
-                if !self.dep.sends.record(to, hash, k) {
-                    return;
-                }
+                self.dep.sends.record(to, hash, k);
                 self.log.put(b"fgtw: departure: a frame to ");
                 self.log.fp(&k);
                 self.log.put(b" at ");
@@ -242,6 +258,7 @@ impl Client {
                 self.send_all(out);
             }
             None => {
+                self.dep.unsent.push(k);
                 let Some(to) = self.given else { return };
                 if self.dep.given_sent == Some(hash) {
                     return;
@@ -301,6 +318,7 @@ impl Client {
         use fgtw::sponsor::Approved;
         let seed = self.identity_seed;
         match n {
+            // The Fleet page says it in the person's language (op 5's 4, `fgtw::text::Msg::LastDevice`).
             Note::LastDevice => self.log.put(b"fgtw: this is the identity's last device (or its fleet is not known yet): it cannot ask to leave"),
             Note::DepartAsking => {
                 self.dep.denied_by = None;
@@ -351,6 +369,12 @@ impl Client {
                         self.log.put(e.as_bytes());
                     }
                 }
+            }
+            Note::DepartWithdrawn { leaver } => {
+                self.dep.result = 0;
+                self.log.put(b"fgtw: the departure of ");
+                self.say_device(&leaver, seed);
+                self.log.put(b" was given up on that device: no longer asked here");
             }
             Note::DepartApproveFailed { leaver, reason } => {
                 self.dep.result = 3;
@@ -425,6 +449,8 @@ impl Client {
                     }
                     self.depart_event(Flow::Approved { leaver, result: r.as_ref().map_err(|e| e.as_str()) });
                 }
+                // The chain the approval just published is what the leaving device must see: handed after the next read (`RefreshChain`, which the machine asks for right behind it).
+                Work::PushChain { to } => self.dep.push_to.push(to),
                 Work::RefreshChain => {
                     // The members without the leaver: the chain as the seed (or the held copy) now has it.
                     let Some(hp) = self.hp else { continue };
@@ -439,12 +465,37 @@ impl Client {
                         }
                         self.note_members(&b);
                     }
+                    self.depart_push_chain(&hp);
                 }
             }
         }
     }
 
-    /// Our request while it stands: the seed's copy of the chain every 16 s, for the approver's consented Remove (the approver publishes it to fgtw.org and pushes it to no one, so the leaving device reads it there). Its fold goes to the machine, which completes the departure once this device is not in it.
+    /// Our chain as held now to each leaving device approved here (`fleet_resp` by PT to where it was last heard): its fold no longer lists it, and it completes its departure at once. One with no address here learns it from fgtw.org (`depart_seed_check` on its side).
+    fn depart_push_chain(&mut self, hp: &[u8; 32]) {
+        let to: Vec<[u8; 32]> = core::mem::take(&mut self.dep.push_to);
+        if to.is_empty() {
+            return;
+        }
+        let Some(chain) = self.held.borrow().get(hp).and_then(|b| b.to_vsf_bytes().ok()) else { return };
+        let Ok(frame) = fgtw::protocol::fleet_resp(hp, &chain, &self.keys, eagle()) else { return };
+        for k in to {
+            let Some(addr) = self.sponsors.iter().find(|s| s.key == k).map(|s| s.addr) else {
+                self.log.put(b"fgtw: departure: no address here for ");
+                self.say_device(&k, self.identity_seed);
+                self.log.put(b": it reads the new chain from fgtw.org");
+                self.log.line();
+                continue;
+            };
+            self.log.put(b"fgtw: departure: our new chain to ");
+            self.say_device(&k, self.identity_seed);
+            self.log.line();
+            let out = self.pt.send(addr, frame.clone(), now_us(), eagle());
+            self.send_all(out);
+        }
+    }
+
+    /// Our request while it stands: the seed's copy of the chain every 16 s, for the approver's consented Remove. An approver on this network hands us its new chain (`PushChain`); one this device cannot hear (another network, with no relay here, or a push given up while this device slept) publishes it only to fgtw.org, so it is read there. Its fold goes to the machine, which completes the departure once this device is not in it.
     pub fn depart_seed_check(&mut self, t: u64) {
         if !self.depart_asking() || t - self.dep.checked_us < 16_000_000 {
             return;
@@ -468,25 +519,18 @@ impl Client {
         }
     }
 
-    /// Our request, once built, into the space (the machine's state holds its signed frame).
+    /// Our request, once built, into the space.
     fn depart_space_own(&mut self) {
-        let Some(sec) = self.dep.m.as_ref().filter(|m| m.asking()).map(|m| m.to_section()) else { return };
-        if let Some(frame) = sec.get_field("own_frame").and_then(|f| f.values.first()).and_then(|v| v.as_bytes()).map(|b| b.to_vec()) {
-            self.space_put_depart(&frame);
-        }
+        let Some(frame) = self.dep.m.as_ref().and_then(|m| m.own_frame()).map(|f| f.to_vec()) else { return };
+        self.space_put_depart(&frame);
     }
 
-    /// The request asked about here, withdrawn: its leaving device gave it up (the space's entry for it gone after the request's stamp). Refused here as a denied one would be, so it is never approved: the same request is never asked again, and asking again takes a new salt and a new stamp.
-    pub fn depart_withdrawn(&mut self, leaver: [u8; 32], salt: [u8; 32]) {
-        let Some(t) = self.dep.m.as_ref().map(|m| m.to_section()).and_then(|s| s.eagle("asked_t")) else { return };
-        if !self.space_depart_gone(&leaver).is_some_and(|at| at > t) {
-            return;
+    /// The request asked about here, withdrawn: its leaving device gave it up (the space's entry for it gone after the request's stamp, so an entry left from an earlier request does not count). The machine stops asking (`GaveUp`).
+    pub fn depart_withdrawn(&mut self, leaver: [u8; 32]) {
+        let Some(t) = self.dep.m.as_ref().and_then(|m| m.asked_t()) else { return };
+        if self.space_depart_gone(&leaver).is_some_and(|at| at > t) {
+            self.depart_event(Flow::GaveUp { leaver, t });
         }
-        self.log.put(b"fgtw: the departure of ");
-        self.say_device(&leaver, self.identity_seed);
-        self.log.put(b" was given up: no longer asked here");
-        self.log.line();
-        self.depart_event(Flow::DeniedKnown { denied: &[(leaver, salt, t)] });
     }
 
     /// Op 5: leave the fleet. A fresh salt from the kernel's entropy names the request; the machine refuses on the last device and asks for the frame to be signed, which the loop does (`depart_work`). `intent` is 1 (to a new owner: the approver also releases the device, so another fleet can bind it) or 2 (to the desk). Returns 0 started, 1 not a member of a fleet, 2 an intent that is neither, 4 the identity's last device (or its fleet not known yet).
