@@ -1,0 +1,11 @@
+[package]
+name = "ferros_glow"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A kist circle's state as light: spectral lines (H-beta, sodium D, mercury, H-gamma, H-alpha) in VSF RGB thru the Stockman & Sharpe 10° cones, the glow's bump falloff and reach, and the rim's lit arc; one maths for the device (payloads/display) and the desktop (tools/tune's glow page); no I/O"
+
+[dependencies]
+libm = "0.2"
+# The 10° cone table and VSF RGB's matrix and photopic weights (no_std).
+vsf = { path = "../../vsf", default-features = false }
