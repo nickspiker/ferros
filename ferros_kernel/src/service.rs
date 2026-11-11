@@ -2250,6 +2250,12 @@ pub fn run(mut b: Boot) -> ! {
                 // Development tools: not in a production build at all (FERROS_PRODUCTION=1, build.rs), which answers only the plain DIAG below and a reboot.
                 #[cfg(not(ferros_production))]
                 {
+                // hsi2c_14 has one owner (torch.rs): while the `torch` switch is on it is the torch process's, so the camera tools, whose PMIC is on it, refuse. Every `cam` tool, not only the ones that touch that bus: one rule a person can hold in their head.
+                if cmd.params.starts_with(b"cam") && crate::torch::held() {
+                    resp.extend_from_slice(b"refused: the torch holds hsi2c_14, the camera PMIC's bus (torch.rs); turn the torch off (`[0, 0]` to `torch`) or `diag \"kill torch\"` first\n");
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 // The camera's power domain is gated after boot (pd.rs; the TPU's too, its tools gone 2026-11-01). Its diags refuse while they are: bringing a domain back without Linux's saved CMU registers is not yet trusted (a TPU on/off by hand preceded a reset in the next power window, 2026-10-25). `diag pd on <name>` does it by hand.
                 if let Some(name) = if cmd.params.starts_with(b"cam") { Some("ispfe") } else { None } {
                     if !crate::pd::is_on(name) {

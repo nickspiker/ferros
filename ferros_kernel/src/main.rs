@@ -84,6 +84,8 @@ mod touch;
 #[cfg(feature = "pixel8")]
 mod amp;
 #[cfg(feature = "pixel8")]
+mod torch;
+#[cfg(feature = "pixel8")]
 mod partfs;
 #[cfg(feature = "pixel8")]
 mod flashlog;
