@@ -110,6 +110,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::LatLon => "широта, долгота",
         Msg::DegMinSec => "градусы, минуты, секунды",
         Msg::NoFixYet => "пока нет координат",
+        Msg::HasFix => "координаты получены",
         Msg::StartingUp => "запускается",
         Msg::UsingNow => "используют сейчас",
         // ---- bases ----

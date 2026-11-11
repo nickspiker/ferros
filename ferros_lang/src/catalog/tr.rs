@@ -110,6 +110,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::LatLon => "enlem, boylam",
         Msg::DegMinSec => "derece, dakika, saniye",
         Msg::NoFixYet => "henüz konum yok",
+        Msg::HasFix => "konum bulundu",
         Msg::StartingUp => "başlatılıyor",
         Msg::UsingNow => "şu an kullanan",
         // ---- bases ----

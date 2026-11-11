@@ -817,10 +817,13 @@ fn link_state(k: usize, state: Option<i64>) -> &'static str {
     if k < 5 && ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) >> k & 1 == 1 {
         return tr(Msg::SwitchedOff);
     }
-    match state {
-        Some(0) => tr(Msg::Off),
-        Some(1) => tr(Msg::OnNoLink),
-        Some(2) => tr(Msg::Connected),
+    // GPS links to nothing (owner, 2026-11-10, of its state row "on, no link": "for GPS say searching until a fix"): its driver's 1 is no fix yet and 2 a fix (payloads/gps `now_shown`).
+    match (k, state) {
+        (_, Some(0)) => tr(Msg::Off),
+        (4, Some(1)) => tr(Msg::Searching),
+        (4, Some(2)) => tr(Msg::HasFix),
+        (_, Some(1)) => tr(Msg::OnNoLink),
+        (_, Some(2)) => tr(Msg::Connected),
         _ => "-",
     }
 }
@@ -1360,6 +1363,8 @@ static GPS_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 static mut GPS_SNAP: Option<Option<GpsFix>> = None;
 /// GPS's claims as the kernel writes them here at every change (SYS_CLAIM op 4, ferros_sys::claim::doorbell; fact 85's word): the permissions and GPS pages draw "using now" again when it moves, nothing asked on a timer.
 static CLAIMS_WORD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The kernel's bells (ferros_sys::bell, SYS_BELL): each link's change count in LINKS' order (its measures, tracks and detail), then the facts' (`ferros_sys::BELL_FACTS`: the battery, the processes, the vault's keys, the chip's heat), written here by the kernel at every change. The main loop draws the page that shows one again when it moves, nothing asked on a timer (owner, 2026-11-10: "1s poll can desync too").
+static BELLS: [core::sync::atomic::AtomicU64; ferros_sys::BELL_FACTS as usize + 1] = [const { core::sync::atomic::AtomicU64::new(0) }; ferros_sys::BELL_FACTS as usize + 1];
 
 /// `gps_watch`'s copy published under `GPS_SEQ`.
 fn gps_publish(v: Option<Option<GpsFix>>) {
@@ -2925,14 +2930,15 @@ impl Map {
                             degrees_dms(&mut l, f, fx.lon, 'E', 'W');
                             fact_wrap(b, &mut y, tr(Msg::DegMinSec), l.as_str());
                         }
-                        Some(None) => fact(b, &mut y, tr(Msg::RightGps), tr(Msg::NoFixYet)),
-                        None if self.gps_claimed => fact(b, &mut y, tr(Msg::RightGps), tr(Msg::StartingUp)),
-                        None => fact(b, &mut y, tr(Msg::RightGps), tr(Msg::SwitchedOff)),
+                        // Under its heading alone, "where you are" said once (owner, 2026-11-10: it showed as the heading and again as the row's name); "using it now" the same.
+                        Some(None) => row(self, b, &mut y, small, white(), tr(Msg::NoFixYet), None),
+                        None if self.gps_claimed => row(self, b, &mut y, small, white(), tr(Msg::StartingUp), None),
+                        None => row(self, b, &mut y, small, white(), tr(Msg::SwitchedOff), None),
                     }
                     header(b, &mut y, tr(Msg::UsingNow));
                     let users = self.users(ferros_sys::claim::GPS);
                     if users.is_empty() {
-                        fact(b, &mut y, tr(Msg::UsingNow), tr(Msg::NoneYet));
+                        row(self, b, &mut y, small, white(), tr(Msg::NoneYet), None);
                     }
                     for u in &users {
                         let mut l = Line::new();
@@ -4365,7 +4371,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut grab: Option<usize> = None;
     let mut grab_n = 0usize;
     let mut last_app_check = 0u64;
-    let mut last_facts = 0u64;
+    // The bells as the pages were last drawn with them (BELLS), the radios' switches (preference 15) likewise, and the second the clock or About last drew (`tick`).
+    let mut bells_seen = [0u64; ferros_sys::BELL_FACTS as usize + 1];
+    let mut radios_seen = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF);
+    let mut tick_seen = 0i64;
     // The identity space's generation last read (payloads/fgtw op 17, through `fgtw_poller`).
     let mut space_seen = 0u32;
     // The departure waiting here last seen (its intent and the asking device's name), so the Fleet page opens once for each: a request answered clears it, so the same device asking again opens the page again.
@@ -4402,6 +4411,13 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The claims' doorbell (SYS_CLAIM op 4): the kernel writes GPS's claims into CLAIMS_WORD at every change. A kernel from before refuses it, and "using now" is then read only as a page draws.
     if !ferros_sys::claim::doorbell(cap(grants, S_SETTINGS), &CLAIMS_WORD) {
         console(grants, b"map: the kernel has no claims doorbell\n");
+    }
+    // The links' and the facts' bells (SYS_BELL): the kernel writes each source's change count into BELLS at every change. A kernel from before refuses them, and those pages then draw only as they open or are touched.
+    for (s, w) in BELLS.iter().enumerate() {
+        if !ferros_sys::bell(s as u64, w) {
+            console(grants, b"map: the kernel has no bells\n");
+            break;
+        }
     }
     // FERROS_MAP_START=drag: a synthetic finger instead of the touch server for the first 192 passes — two seconds after start (past the display's first full frame), a pan through the air and back, so the frame pacing can be measured with no one at the panel (it logs passes, draws and the rate).
     let mut synth = 0u32;
@@ -4501,23 +4517,58 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 map.draw();
             }
         }
-        // The driver rang (`gps_watch` published what it read): taken in, and the GPS page drawn again while it holds its claim. The page's measures (the satellites, the accuracy) move with the same fix messages, so they are drawn fresh with it.
+        // What the open page shows moved: drawn again once this pass, whichever of its doorbells rang (the GPS driver's and its link's together draw once). While the page settles it is drawn every frame anyway.
+        let open = matches!(map.view, View::Open(_));
+        let page = PAGES[map.page];
+        let mut page_dirty = false;
+        // The driver rang (`gps_watch` published what it read): taken in, and the GPS page drawn again while it holds its claim.
         if let Some((seq, v)) = gps_take(gps_seen) {
             gps_seen = seq;
             if map.gps_claimed {
                 map.gps_fix = v;
-                if matches!(map.view, View::Open(_)) && PAGES[map.page] == "GPS" && !map.settling {
-                    map.draw();
-                }
+                page_dirty |= open && page == "GPS";
             }
         }
         // GPS's claims moved (the kernel wrote CLAIMS_WORD): the pages that say who is using it drawn again while they show.
         let c = CLAIMS_WORD.load(core::sync::atomic::Ordering::Acquire);
-        if c != claims_seen && !map.settling {
+        if c != claims_seen {
             claims_seen = c;
-            if matches!(map.view, View::Open(_)) && matches!(PAGES[map.page], "permissions" | "GPS") {
-                map.draw();
+            page_dirty |= open && matches!(page, "permissions" | "GPS");
+        }
+        // A link's bell (its measures, tracks or detail moved; SYS_BELL): its page and Connections drawn again while they show, the GPS page among them, since its driver publishes the satellites and the accuracy after the fix messages its own doorbell answers to. The facts' bell (the battery, the processes, the vault's keys, the chip's heat): About.
+        for (s, w) in BELLS.iter().enumerate() {
+            let v = w.load(core::sync::atomic::Ordering::Acquire);
+            if v != bells_seen[s] {
+                bells_seen[s] = v;
+                page_dirty |= open && if s < LINKS.len() { page == "connections" || page == LINKS[s] } else { page == "about" };
             }
+        }
+        // A radio switched on or off (preference 15, from here or from a status circle): its switch and state on Connections and on its page.
+        let radios = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF);
+        if radios != radios_seen {
+            radios_seen = radios;
+            page_dirty |= open && (page == "connections" || LINKS.contains(&page));
+        }
+        // The clock and About's time since power on change with the second: each drawn as its second turns (`tick_at` ends the rest there), not on a timer of its own that drifts against the second. The clock's second is the wall clock's in the zone (a new zone, or the clock read again, turns it too), About's the counter's, which it counts from; a clock not read yet ticks on the counter until it is.
+        let hz = freq();
+        let t = now();
+        let into = match page {
+            "clock" if open => Some(ferros_sys::local_time().unwrap_or(((t / hz) as i64, t % hz))),
+            "about" if open => Some(((t / hz) as i64, t % hz)),
+            _ => None,
+        };
+        // The counter read after the second's own reading, so the turn it gives is never early (a rest that ended before the turn would draw the same second again), only as late as the two reads are apart.
+        let t = now();
+        // When the second the clock or About shows ends (None while neither shows): the rest ends there, so the page's draw lands on the second, not up to a rest later.
+        let tick_at = into.map(|(s, past)| {
+            if s != tick_seen {
+                tick_seen = s;
+                page_dirty = true;
+            }
+            t + hz - past
+        });
+        if page_dirty && !map.settling {
+            map.draw();
         }
         // A fleet device's departure waiting on this person: a new one opens the Fleet page on it, Approve or Deny ready (owner, 2026-11-10: "go right to the fleet page and have the unbind request 'Approve' or 'Deny' screen ready to go"). Not over an app in front, and not while a finger is down or the map is settling: a request waiting opens the page once the fingers lift.
         if !map.app_front && !down && !map.settling {
@@ -4535,12 +4586,6 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 space_seen = g;
                 map.reload_arrangement();
             }
-        }
-
-        // The open settings' live facts (About, Connections, each link's page but GPS's, the clock): drawn again once a second while they show (live data, not motion). Still a timer, because their sources keep no change count to wait on: the kernel's facts (the battery gauge it reads every two seconds, the temperatures, the process count), the radio drivers' measures (SYS_STATUS words, set with no generation), and the clock, whose seconds are the change. GPS's page rides its driver's doorbell instead (`gps_watch`), and the permissions page the claims' (CLAIMS_WORD).
-        if matches!(map.view, View::Open(_)) && matches!(PAGES[map.page], "about" | "connections" | "cellular" | "WiFi" | "Bluetooth" | "NFC" | "USB" | "clock") && !map.settling && now().wrapping_sub(last_facts) > freq() {
-            last_facts = now();
-            map.draw();
         }
 
         // An app in front (a bridge spawn: Hive, for one), asked of the display eight times a second.
@@ -4983,7 +5028,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             continue;
         }
         if held == 0 && !map.settling {
-            sleep_until(now() + freq() / 30);
+            // WHY the min: two deadlines, the rest's and the second's turn on the clock or About (`tick_at`); the earlier ends the rest, so the second is drawn as it turns rather than up to a rest after.
+            let rest = now() + freq() / 30;
+            sleep_until(tick_at.map_or(rest, |at| rest.min(at)));
         } else {
             let mut fr = [0u8; 4];
             call(display, &[24], &mut fr);

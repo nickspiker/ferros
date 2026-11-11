@@ -110,6 +110,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::LatLon => "अक्षांश, देशांतर",
         Msg::DegMinSec => "अंश, मिनट, सेकंड",
         Msg::NoFixYet => "अभी स्थिति नहीं मिली",
+        Msg::HasFix => "स्थिति मिल गई",
         Msg::StartingUp => "शुरू हो रहा है",
         Msg::UsingNow => "अभी इस्तेमाल कर रहे हैं",
         // ---- bases ----

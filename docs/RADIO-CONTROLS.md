@@ -83,7 +83,7 @@ The drivers find their link by their process name (modem, pcie1, bt, nfc, gps, u
 
 ## The pages
 
-A link's page (payloads/map `draw_page`): its switch and state, every measure from its slots and tracks grouped (signal, channel, link, counters, motion) in the device's base, the satellites one a line, its names and addresses, its knobs as rows a tap turns. Addresses are identifiers, not quantities: they are written in hexadecimal grouped as their standards group them (IPv4 by byte with dots, IPv6 by sixteen bits with colons, hardware addresses by byte with colons), in every base. The link pages and the clock redraw once a second while they show.
+A link's page (payloads/map `draw_page`): its switch and state, every measure from its slots and tracks grouped (signal, channel, link, counters, motion) in the device's base, the satellites one a line, its names and addresses, its knobs as rows a tap turns. Addresses are identifiers, not quantities: they are written in hexadecimal grouped as their standards group them (IPv4 by byte with dots, IPv6 by sixteen bits with colons, hardware addresses by byte with colons), in every base. A link's page and Connections draw again when its bell rings (`SYS_BELL`: a measure, a track or the detail changed, or the driver ended), and when its switch moves; the GPS page also at its driver's doorbell (docs/GPS.md); the clock as each second of the wall clock turns, its rest ending on the turn (2026-11-10, owner: "1s poll can desync too"; until then all of them once a second).
 
 ## State (2026-11-07)
 

@@ -110,6 +110,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::LatLon => "lintang, bujur",
         Msg::DegMinSec => "derajat, menit, detik",
         Msg::NoFixYet => "belum ada posisi",
+        Msg::HasFix => "posisi ditemukan",
         Msg::StartingUp => "memulai",
         Msg::UsingNow => "sedang memakainya",
         // ---- bases ----

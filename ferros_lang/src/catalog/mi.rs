@@ -110,6 +110,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::LatLon => "ahopae, ahopou",
         Msg::DegMinSec => "putu, meneti, hēkona",
         Msg::NoFixYet => "kāore anō kia kitea te tūnga",
+        Msg::HasFix => "kua kitea te tūnga",
         Msg::StartingUp => "e tīmata ana",
         Msg::UsingNow => "e whakamahi ana ināianei",
         // ---- bases ----

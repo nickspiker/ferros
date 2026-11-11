@@ -151,7 +151,7 @@ The proposal above, with the owner's gestures ("two finger scale/move for edits 
 - **Nothing animates and nothing is timed** (owner: "no animations ... instant, always, no timers"). A tap is fingers down and up without moving past the slop, however long they rested.
 - **Two fingers** pinch to zoom and twist to turn the map, about the point between them. The turn is a unit vector (cos, sin) in Q14 that each twist composes onto by one complex multiply, so nothing needs a sine. The icons turn with the map.
 - **Two-finger tap** turns a circle over to its back. Another turns it back.
-- **The device's front** is the dashboard: battery, press to ready, since power on, USB, processes, keys in the vault, and the number base. It redraws once a second, every number in the device base, as glyphs. The facts come from the kernel's `SYS_FACTS` (process.rs), which needs no capability: none of them is a key, a handle or a serial.
+- **The device's front** is the dashboard: battery, press to ready, since power on, USB, processes, keys in the vault, and the number base. It draws again when the facts' bell rings (`SYS_BELL` 6: the battery's share or charging, the processes, the vault's keys, the chip's heat) and as each second since power on turns (2026-11-10; once a second until then), every number in the device base, as glyphs. The facts come from the kernel's `SYS_FACTS` (process.rs), which needs no capability: none of them is a key, a handle or a serial.
 - **The device's back** is the settings:
   - the four bases, each a row of two seconds and a mebibyte written in it, with the current one marked;
   - names under circles, on or off;
