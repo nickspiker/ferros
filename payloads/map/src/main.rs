@@ -1219,6 +1219,10 @@ struct Map {
     gps_claimed: bool,
     /// The driver as `gps_watch` last read it while the page holds its claim, at each ring of its doorbell: None not answering yet (starting, its session replaying), Some(None) no fix yet, Some(Some(fix)) the fix. On the page only, never logged, dropped as the page goes.
     gps_fix: Option<Option<GpsFix>>,
+    /// The kist this map last asked init to launch and was told "started" (ferros_kist::launch::STARTED), with the kists' bell count as it stood then (KISTS_WORD): a launch the kernel did not start after all comes back with a later count (ferros_sys::not_started), and only that one is said. Dropped once it is said.
+    asked: Option<([u8; 32], u64)>,
+    /// Why that kist did not start (ferros_kist::launch::why), for its circle (owner, 2026-11-11: Mahere tapped, "nothing opened", it looked stuck): the capsule, the reason, and whether its circle is open on it yet. Not yet: it waits for the plane at rest with nothing held (`show_fault`); then shown on the open circle until the circle closes.
+    fault: Option<([u8; 32], u8, bool)>,
 }
 
 /// A fix as the GPS driver gives it (payloads/gps op 0 FIX): latitude and longitude in 2^-23 degrees. Its error estimate is the page's accuracy measure already (the driver's slot 1).
@@ -1363,6 +1367,8 @@ static GPS_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 static mut GPS_SNAP: Option<Option<GpsFix>> = None;
 /// GPS's claims as the kernel writes them here at every change (SYS_CLAIM op 4, ferros_sys::claim::doorbell; fact 85's word): the permissions and GPS pages draw "using now" again when it moves, nothing asked on a timer.
 static CLAIMS_WORD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The kists' bell as the kernel writes it here (SYS_NOT_STARTED op 1, ferros_sys::not_started::doorbell): its count moves when a kist launch init answered "started" did not start after all, or a kist that had not starts; the main loop then looks for the launch it asked (`kists_rang`), nothing asked on a timer.
+static KISTS_WORD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The kernel's bells (ferros_sys::bell, SYS_BELL): each link's change count in LINKS' order (its measures, tracks and detail), then the facts' (`ferros_sys::BELL_FACTS`: the battery, the processes, the vault's keys, the chip's heat), written here by the kernel at every change. The main loop draws the page that shows one again when it moves, nothing asked on a timer (owner, 2026-11-10: "1s poll can desync too").
 static BELLS: [core::sync::atomic::AtomicU64; ferros_sys::BELL_FACTS as usize + 1] = [const { core::sync::atomic::AtomicU64::new(0) }; ferros_sys::BELL_FACTS as usize + 1];
 
@@ -1621,8 +1627,8 @@ impl Map {
         ok
     }
 
-    /// Ask init to launch kist circle `i`'s kist (KISTS.md): the map holds none of its rights. Init's answer (ferros_kist::launch). A widget's kist is not launched: the display draws it, in its circle, from the scene (`widget`).
-    fn launch(&self, i: usize) -> u8 {
+    /// Ask init to launch kist circle `i`'s kist (KISTS.md): the map holds none of its rights. Init's answer (ferros_kist::launch). A widget's kist is not launched: the display draws it, in its circle, from the scene (`widget`). Answered "started", the kist is remembered with the kists' bell as it stands (`asked`): the kernel may yet not start it, and then its circle says why.
+    fn launch(&mut self, i: usize) -> u8 {
         let Some(k) = self.kist(i) else { return ferros_kist::launch::NOT_INSTALLED };
         if widget(&k.name).is_some() {
             return ferros_kist::launch::RUNNING;
@@ -1631,11 +1637,57 @@ impl Map {
         m[0] = ferros_kist::launch::OP_LAUNCH;
         m[1..].copy_from_slice(&k.capsule);
         let mut r = [ferros_kist::launch::REFUSED; 1];
+        // The bell as it stands before the ask: the kernel's job may fail before init's answer is back here.
+        let bell = KISTS_WORD.load(core::sync::atomic::Ordering::Acquire);
         call(cap(self.grants, S_LAUNCH), &m, &mut r);
         let mut l = Line::new();
         let _ = write!(l, "map: launch {}: {}\n", k.name, match r[0] { 0 => "starting", 1 => "running", 2 => "asking first", 3 => "not installed", 5 => "the list is not readable", _ => "refused" });
         console(self.grants, l.as_str().as_bytes());
+        if r[0] == ferros_kist::launch::STARTED {
+            self.asked = Some((k.capsule, bell));
+            self.fault = None;
+        }
         r[0]
+    }
+
+    /// The kists' bell rang (KISTS_WORD): the launch asked last (`asked`) looked for among the kernel's launches that did not start (ferros_sys::not_started), a record rung after the ask. Found, it is kept for its circle (`fault`) and shown once the plane is at rest (`show_fault`). Records of launches this map did not ask (a relaunch, one asked before) say nothing here.
+    fn kists_rang(&mut self) {
+        let Some((capsule, bell)) = self.asked else { return };
+        // WHY the size and the `take`: one record a kist the person has, and the circles hold at most MAX of them; a list longer than the buffer is cut to whole records by the kernel, and a shorter one leaves the rest of the buffer unwritten, so only the first n records are read.
+        let mut buf = [0u8; ferros_sys::not_started::REC * MAX];
+        let Some(n) = ferros_sys::not_started::list(cap(self.grants, S_SETTINGS), &mut buf) else { return };
+        for r in buf.chunks_exact(ferros_sys::not_started::REC).take(n) {
+            let at = u64::from_le_bytes(r[33..41].try_into().unwrap());
+            if r[1..33] == capsule && at > bell {
+                self.asked = None;
+                self.fault = Some((capsule, r[0], false));
+                let mut l = Line::new();
+                let _ = write!(l, "map: the kist asked last did not start (reason {})\n", r[0]);
+                console(self.grants, l.as_str().as_bytes());
+                return;
+            }
+        }
+    }
+
+    /// A kist that did not start, its circle opened on why, as a tap on it opens it (`fault_page`): once the plane is at rest, nothing is held and no app is in front, so it never pulls the view from under a finger or a flight. Its circle gone meanwhile (the kist uninstalled), nothing is shown.
+    fn show_fault(&mut self) {
+        let Some((capsule, _, false)) = self.fault else { return };
+        if self.view != View::Map || self.settling || self.touching || self.app_front {
+            return;
+        }
+        let Some(i) = (1..self.n).find(|&i| self.kist(i).is_some_and(|k| k.capsule == capsule)) else {
+            self.fault = None;
+            return;
+        };
+        if let Some(f) = self.fault.as_mut() {
+            f.2 = true;
+        }
+        let to = self.at(i);
+        self.back = Some(self.cam);
+        self.view = View::Open(i);
+        self.leaving = false;
+        self.fly(to);
+        self.draw();
     }
 
     /// A running kist relaunched with its answers as they now stand (owner, 2026-11-08: a revoke is a kill and a respawn without that right, and the kill is one shot dead): init's `OP_RELAUNCH`; nothing happens to a kist not running.
@@ -2212,6 +2264,10 @@ impl Map {
                 self.leaving = false;
                 self.view = View::Map;
                 self.picker = false;
+                // A circle that said why its kist did not start has been read and closed.
+                if self.fault.is_some_and(|f| f.2) {
+                    self.fault = None;
+                }
             }
         }
         still
@@ -2381,6 +2437,24 @@ impl Map {
         let (title_y, top, bottom) = self.bands();
         let Some(k) = self.kist(i).cloned() else { return };
         b.text(cx, title_y, uu(2, 1) as u16, white(), 1, &k.name);
+        // Opened on why its launch did not start (`show_fault`): that, in the person's language, and nothing to tap; a tap outside closes it, and a tap on the circle again asks again.
+        if let Some((_, why, true)) = self.fault.filter(|f| f.0 == k.capsule) {
+            use ferros_kist::launch::why as w;
+            let reason = match why {
+                w::ROOM => Msg::NotEnoughMemory,
+                w::NOT_HERE => Msg::NotInstalledHere,
+                w::CHECKS => Msg::FailedItsChecks,
+                w::READ => Msg::CouldNotBeRead,
+                _ => Msg::SomethingWentWrong,
+            };
+            let y = (top + bottom) / 2;
+            b.text(cx, y - uu(1, 1), uu(5, 4) as u16, white(), 1, say(Say::CouldNotStart(&k.name)).as_str());
+            b.text(cx, y + uu(1, 1), uu(1, 1) as u16, grey(), 1, tr(reason));
+            if !region {
+                b.disc(cx, cy, r, fill());
+            }
+            return;
+        }
         let open: alloc::vec::Vec<usize> = (0..k.wants.len()).filter(|&j| k.wants[j].answer.is_none()).collect();
         // The rows' height, centred in the band: a line saying what this is, each want two lines, then start.
         let pitch = uu(7, 2);
@@ -4221,6 +4295,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         gps_claimed: false,
         gps_fix: None,
         uninstall_armed: None,
+        asked: None,
+        fault: None,
     };
     let kept = map.load_places_near();
     // Whatever the vault held, no two circles start overlapping (places kept before circles pushed each other could).
@@ -4412,6 +4488,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     if !ferros_sys::claim::doorbell(cap(grants, S_SETTINGS), &CLAIMS_WORD) {
         console(grants, b"map: the kernel has no claims doorbell\n");
     }
+    // The kists' bell (SYS_NOT_STARTED op 1): a launch init answered "started" that the kernel did not start after all. A kernel from before refuses it, and such a tap shows nothing, as before.
+    if !ferros_sys::not_started::doorbell(cap(grants, S_SETTINGS), &KISTS_WORD) {
+        console(grants, b"map: the kernel has no kists' bell\n");
+    }
+    let mut kists_seen = KISTS_WORD.load(core::sync::atomic::Ordering::Acquire);
     // The links' and the facts' bells (SYS_BELL): the kernel writes each source's change count into BELLS at every change. A kernel from before refuses them, and those pages then draw only as they open or are touched.
     for (s, w) in BELLS.iter().enumerate() {
         if !ferros_sys::bell(s as u64, w) {
@@ -4569,6 +4650,15 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         });
         if page_dirty && !map.settling {
             map.draw();
+        }
+        // The kists' bell rang (KISTS_WORD): the launch asked last looked for among those that did not start (`kists_rang`); one found opens its circle on why once the plane is at rest and no finger is down (`show_fault`), a question already in hand, not a poll.
+        let kw = KISTS_WORD.load(core::sync::atomic::Ordering::Acquire);
+        if kw != kists_seen {
+            kists_seen = kw;
+            map.kists_rang();
+        }
+        if !down {
+            map.show_fault();
         }
         // A fleet device's departure waiting on this person: a new one opens the Fleet page on it, Approve or Deny ready (owner, 2026-11-10: "go right to the fleet page and have the unbind request 'Approve' or 'Deny' screen ready to go"). Not over an app in front, and not while a finger is down or the map is settling: a request waiting opens the page once the fingers lift.
         if !map.app_front && !down && !map.settling {

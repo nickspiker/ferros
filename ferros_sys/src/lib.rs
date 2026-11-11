@@ -57,6 +57,7 @@ pub mod nr {
     pub const LANG: u64 = 36;
     pub const CLAIM: u64 = 37;
     pub const BELL: u64 = 38;
+    pub const NOT_STARTED: u64 = 39;
 }
 
 /// The clock's zone (kernel zone.rs, SYS_ZONE; docs/TIME.md; owner, 2026-11-10): the identity's choice and this device's own, each automatic (the zone found from the cellular network, then GPS) or by hand (an IANA id), and the switch that says which rules.
@@ -537,6 +538,23 @@ pub const BELL_FACTS: u64 = 6;
 /// A doorbell on what the settings pages show (kernel SYS_BELL; owner, 2026-11-10: "Needs a doorbell"): the kernel writes `source`'s change count into `word` now and whenever it changes, waking whatever waits on it (`wait_world`). Source 0-5 a link (its measures, tracks and detail, as its driver sets them, and emptied as it ends), `BELL_FACTS` the facts. A reader that compares the word to the count it last drew with knows to draw again, and asks nothing on a timer. False for no such source, or a kernel without bells.
 pub fn bell(source: u64, word: &core::sync::atomic::AtomicU64) -> bool {
     svc(nr::BELL, source, off(word as *const _ as *const u8), 0, 0, 0) == 0
+}
+
+/// The kist launches that did not start (kernel SYS_NOT_STARTED; owner, 2026-11-11: Mahere's circle tapped, nothing opened, "it looked stuck"). Init answers a launch "started" as soon as it is queued (ferros_kist::launch::STARTED); the kernel then reads the capsule from the vault, checks it and sizes its arc, and a launch that fails there is kept here, one record a capsule, until that kist next starts. For the Settings holder alone (the map), as the claims' users list.
+pub mod not_started {
+    use super::{nr, off, svc, ERR};
+    /// A record of `list`: the reason (ferros_kist::launch::why), the capsule's address (32 bytes), and the kists' bell count it rang (u64 LE), so a reader tells a failure that came after its own ask from one kept before.
+    pub const REC: usize = 41;
+
+    /// The records into `buf` (whole ones, as many as fit), given Settings: how many there are, or None without the capability (or a kernel without them).
+    pub fn list(settings: u64, buf: &mut [u8]) -> Option<usize> {
+        let r = svc(nr::NOT_STARTED, 0, settings, off(buf.as_mut_ptr()), buf.len() as u64, 0);
+        (r != ERR).then_some(r as usize)
+    }
+    /// The kists' doorbell, given Settings: the kernel writes its change count into `word` now and whenever a launch does not start or a kist kept here starts, waking whatever waits on it (`wait_world`). False without the capability, or a kernel without it.
+    pub fn doorbell(settings: u64, word: &core::sync::atomic::AtomicU64) -> bool {
+        svc(nr::NOT_STARTED, 1, off(word as *const _ as *const u8), settings, 0, 0) == 0
+    }
 }
 
 /// Link `link`'s tracks (0 cellular … 5 USB, the facts' order) into `buf`, at most 64: the words written (each a tagged measure, all ones empty), or 0 for none.

@@ -945,6 +945,8 @@ const SYS_LANG: u64 = 36;
 const SYS_CLAIM: u64 = 37;
 /// bell(source, word): a doorbell on what the settings pages show (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure. 1s poll can desync too, that needs fixd."). x0 the source: 0-5 a link in the facts' order (its eight measures, its tracks and its detail document: counted when its driver sets one to a value other than the one it held, and when the driver ends and they empty), `BELL_FACTS` the device's facts a settings page shows (`bell_facts`). x1 a word in the caller's arc, 8-aligned as SYS_WAIT takes one: the kernel writes the source's change count there now and at every change, waking whatever of the process waits on it (`bell_ring`). One word a source a process; a second registration moves it. No capability: the measures, tracks and facts are what SYS_FACTS and SYS_TRACKS give anyone, and a detail's count says when it changed, never what it says. → 0, ERR for no such source.
 const SYS_BELL: u64 = 38;
+/// not_started(op, …): the kist launches init answered "started" for that the kernel's kist job did not start after all (`NOT_STARTED`; owner, 2026-11-11: Mahere tapped, nothing opened, "it looked stuck"), for the Settings holder alone (the map), as the claims' users list. Op 0: x1 the Settings token, x2/x3 a buffer and its length → how many records (all of them; whole records past the buffer are not written), each `NOT_STARTED_REC` bytes: the reason (ferros_kist::launch::why), the capsule's address (32 bytes), the kists' bell count it rang (u64 LE). Op 1: the kists' doorbell, x1 a word in the caller's arc, x2 the Settings token: the bell's change count written there now and whenever a launch does not start or a kist kept here starts, its waiters woken → 0. ERR without Settings, or for no such op.
+const SYS_NOT_STARTED: u64 = 39;
 /// A record of SYS_CLAIM op 2: the kind, then a capsule address.
 pub const CLAIM_REC: usize = 33;
 /// Each link's control block: words 1 to CONTROLS - 1 (word 0 is the generation, `CONTROL_GEN`), all ones until set.
@@ -2837,6 +2839,33 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
+        SYS_NOT_STARTED => {
+            let settings = |at: u64| {
+                let token = p.read(at, 32);
+                matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0)
+            };
+            f.x[0] = match f.x[0] {
+                0 if settings(f.x[1]) => {
+                    let list = unsafe { &*(&raw const NOT_STARTED) };
+                    // WHY the bound: the buffer is the caller's; whole records only, as many as fit, and the count says how many there are.
+                    let fit = (f.x[3] as usize / NOT_STARTED_REC).min(list.len());
+                    let mut out = Vec::with_capacity(fit * NOT_STARTED_REC);
+                    for r in &list[..fit] {
+                        out.push(r.1);
+                        out.extend_from_slice(&r.0);
+                        out.extend_from_slice(&r.2.to_le_bytes());
+                    }
+                    p.write(f.x[2], &out);
+                    list.len() as u64
+                }
+                1 if settings(f.x[2]) => {
+                    bell_register(p, pi, BELL_KISTS, f.x[1], BELL_COUNT[BELL_KISTS].load(core::sync::atomic::Ordering::Acquire));
+                    0
+                }
+                _ => ERR,
+            };
+            0
+        }
         SYS_LANG => {
             let settings = |at: u64| {
                 let token = p.read(at, 32);
@@ -3382,13 +3411,14 @@ fn right_is_gps(r: u8) -> bool {
     ferros_kist::RIGHTS.get(r as usize) == Some(&"gps")
 }
 
-/// The bells' sources (SYS_BELL): 0-5 the links in the facts' order, then the facts a settings page shows, then GPS's claims (SYS_CLAIM op 4, for a Settings holder; its word is GPS_CLAIMS itself, which carries its own change count).
+/// The bells' sources (SYS_BELL): 0-5 the links in the facts' order, then the facts a settings page shows, then GPS's claims (SYS_CLAIM op 4, for a Settings holder; its word is GPS_CLAIMS itself, which carries its own change count), then the kist launches that did not start (`BELL_KISTS`, SYS_NOT_STARTED op 1, for a Settings holder).
 pub const BELL_FACTS: usize = 6;
 const BELL_CLAIMS: usize = 7;
-const BELLS: usize = 8;
+const BELL_KISTS: usize = 8;
+const BELLS: usize = 9;
 /// Each source's change count (the claims' is GPS_CLAIMS'), so a word registered late starts from the count now and a reader tells a change by inequality.
 static BELL_COUNT: [core::sync::atomic::AtomicU64; BELLS] = [const { core::sync::atomic::AtomicU64::new(0) }; BELLS];
-/// The bells' words (SYS_BELL, SYS_CLAIM op 4): (the process's slot, its epoch, the word's address in its arc, the source). At most one a source a process. Under the kernel lock.
+/// The bells' words (SYS_BELL, SYS_CLAIM op 4, SYS_NOT_STARTED op 1): (the process's slot, its epoch, the word's address in its arc, the source). At most one a source a process. Under the kernel lock.
 static mut BELL_WORDS: Vec<(usize, u64, usize, usize)> = Vec::new();
 
 /// A word in the caller's arc (`at`, 8-aligned and inside the arc as SYS_WAIT takes one) rung for `source` from now, `value` written there at once; one the process registered for the source before is dropped. Under the kernel lock.
@@ -4095,49 +4125,56 @@ pub fn kist_masked(head: &[u8], total: usize) -> bool {
 }
 
 /// A masked kist's code where it lies in its staged capsule, gated, its modes read and its seal found in `sealed` (32-byte entries): SANDBOX.md's "spawn runs only sealed images", one BLAKE3 over the image and no checker. Returns the developer's key and identity for the ihi, and the modes.
-fn kist_sealed(capsule: &mut [u8], co: usize, cl: usize, sealed: &[u8]) -> Result<(crate::oracle::Located, crate::oracle::Modes), &'static str> {
-    let g = crate::oracle::gate_located(capsule, co, cl)?;
-    let m = crate::oracle::masked_modes(capsule, co, cl)?;
-    let s = crate::oracle::seal_parts(&g.developer_pubkey, &g.hp, true, &m, &capsule[co..co + cl]).ok_or("no system secret: cannot check a seal")?;
+fn kist_sealed(capsule: &mut [u8], co: usize, cl: usize, sealed: &[u8]) -> Result<(crate::oracle::Located, crate::oracle::Modes), KistFault> {
+    use ferros_kist::launch::why;
+    let g = crate::oracle::gate_located(capsule, co, cl).map_err(|e| (why::CHECKS, e))?;
+    let m = crate::oracle::masked_modes(capsule, co, cl).map_err(|e| (why::CHECKS, e))?;
+    let s = crate::oracle::seal_parts(&g.developer_pubkey, &g.hp, true, &m, &capsule[co..co + cl]).ok_or((why::OTHER, "no system secret: cannot check a seal"))?;
     if !sealed.chunks_exact(32).any(|e| e == s) {
-        return Err("gate: masked kist not installed on this device (no seal)");
+        return Err((why::NOT_HERE, "gate: masked kist not installed on this device (no seal)"));
     }
     Ok((g, m))
 }
 
-/// A kist whose capsule the service loop streamed from the vault into `arc` at the code offset (`total` bytes): it must be the capsule named (its blake3 is its vault address), pass the gate where it lies, and declare every right handed to it in the slot it is handed in (`ferros_kist::want_codes`: nothing undeclared can be granted). Masked code runs only with its seal in `sealed` (the installer's, `install_kist`), the checker never run again; native code only in a development build (the bridge's `kist install`). Then the code moves down, the rest is zeroed, and the process is built with exactly the launch's objects, queued to run. On any refusal the arc goes back to the pool.
-pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Result<(), &'static str> {
+/// A kist launch that did not start: why (`ferros_kist::launch::why`, or `KIST_ALREADY`), and the job's words for the console.
+pub type KistFault = (u8, &'static str);
+/// Not a fault: a process of the kist's name started while its capsule was read, so it runs and nothing is kept for the map.
+pub const KIST_ALREADY: u8 = u8::MAX;
+
+/// A kist whose capsule the service loop streamed from the vault into `arc` at the code offset (`total` bytes): it must be the capsule named (its blake3 is its vault address), pass the gate where it lies, and declare every right handed to it in the slot it is handed in (`ferros_kist::want_codes`: nothing undeclared can be granted). Masked code runs only with its seal in `sealed` (the installer's, `install_kist`), the checker never run again; native code only in a development build (the bridge's `kist install`). Then the code moves down, the rest is zeroed, and the process is built with exactly the launch's objects, queued to run, and what was kept of its last launch not starting dropped (`kist_started`). On any refusal the arc goes back to the pool, and the reason comes back as the map shows it (`ferros_kist::launch::why`).
+pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Result<(), KistFault> {
+    use ferros_kist::launch::why;
     let mut arc = arc;
     let r = (|| {
         if CODE + total + STACK > arc.size {
-            return Err("kist: the capsule does not fit its arc");
+            return Err((why::OTHER, "kist: the capsule does not fit its arc"));
         }
         let capsule = unsafe { core::slice::from_raw_parts_mut((arc.base + CODE) as *mut u8, total) };
         if blake3::hash(capsule).as_bytes() != &l.capsule {
-            return Err("kist: the vault's capsule is not the one named (its blake3)");
+            return Err((why::READ, "kist: the vault's capsule is not the one named (its blake3)"));
         }
-        let wants = ferros_kist::want_codes(capsule)?;
+        let wants = ferros_kist::want_codes(capsule).map_err(|e| (why::READ, e))?;
         if wants.len() != l.codes.len() || wants.iter().zip(&l.codes).any(|(&w, &c)| c != ferros_kist::EMPTY && c != w) {
-            return Err("kist: a right the capsule does not declare in that slot");
+            return Err((why::CHECKS, "kist: a right the capsule does not declare in that slot"));
         }
-        let (co, cl, masked) = locate_code(capsule, total)?;
+        let (co, cl, masked) = locate_code(capsule, total).map_err(|e| (why::READ, e))?;
         let (g, modes) = if masked {
             let (g, m) = kist_sealed(capsule, co, cl, sealed)?;
             (g, Some(m))
         } else {
             if cfg!(ferros_production) {
-                return Err("gate: production refuses unmasked native code");
+                return Err((why::CHECKS, "gate: production refuses unmasked native code"));
             }
-            (crate::oracle::gate_located(capsule, co, cl)?, None)
+            (crate::oracle::gate_located(capsule, co, cl).map_err(|e| (why::CHECKS, e))?, None)
         };
         // A masked arc is the one its code was checked for: fixed mode's exactly 2^K, which a staged capsule's arc is not (it holds the whole capsule first).
         if modes.as_ref().is_some_and(|m| m.fixed != 0 && arc.size != 1 << m.fixed) {
-            return Err("kist: a fixed-mode kist is not launched from the vault yet (its arc must be exactly the sealed size)");
+            return Err((why::OTHER, "kist: a fixed-mode kist is not launched from the vault yet (its arc must be exactly the sealed size)"));
         }
         if masked != (arc.guard != 0) {
-            return Err("kist: the staged arc's kind is not the code's (masked or native)");
+            return Err((why::OTHER, "kist: the staged arc's kind is not the code's (masked or native)"));
         }
-        let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
+        let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or((why::OTHER, "no ira: no system secret, no ihi"))?;
         unsafe {
             core::ptr::copy((arc.base + CODE + co) as *const u8, (arc.base + CODE) as *mut u8, cl);
             core::ptr::write_bytes((arc.base + CODE + cl) as *mut u8, 0, total - cl);
@@ -4164,7 +4201,7 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Resu
         let kk = k();
         if kk.procs.iter().flatten().any(|q| q.name == l.name && !q.dying) {
             arc_free(arc);
-            return Err("kist: a process of that name started meanwhile");
+            return Err((KIST_ALREADY, "kist: a process of that name started meanwhile"));
         }
         // Every slot's object made here (`kist_object`), the codes checked at the request.
         let objects: Vec<(Object, u32)> = l.codes.iter().filter_map(|&c| kist_object(c)).collect();
@@ -4175,14 +4212,41 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Resu
                     q.capsule = Some(l.capsule);
                 }
                 enqueue_back(me);
+                kist_started(&l.capsule);
                 Ok(())
             }
             Err(e) => {
                 arc_free(arc);
-                Err(e)
+                Err((why::OTHER, e))
             }
         }
     })
+}
+
+/// The kist launches that did not start (owner, 2026-11-11: Mahere's circle tapped, "nothing opened", the console alone saying the arc pool had no room): one record a capsule, its reason (`ferros_kist::launch::why`) and the kists' bell count it rang, kept until that kist next starts. A record a kist the person has, at most: a capsule launched again replaces its own. Read by the Settings holder alone (SYS_NOT_STARTED op 0), as the claims' users list. Under the kernel lock.
+static mut NOT_STARTED: Vec<([u8; 32], u8, u64)> = Vec::new();
+/// A record of SYS_NOT_STARTED op 0: the reason, the capsule's address, the kists' bell count it rang (u64 LE).
+pub const NOT_STARTED_REC: usize = 41;
+
+/// The service loop's kist job ended without starting `capsule`'s kist, for `why`: kept (`NOT_STARTED`), and the kists' bell rung, so the map, which asked init to launch it and was answered "started", learns it did not and says why on its circle. Rung even when the record was the same, since each launch the person asks for is told. Takes the kernel lock.
+pub fn kist_not_started(capsule: &[u8; 32], why: u8) {
+    with_lock(|| {
+        let v = BELL_COUNT[BELL_KISTS].load(core::sync::atomic::Ordering::Acquire) + 1;
+        let list = unsafe { &mut *(&raw mut NOT_STARTED) };
+        list.retain(|r| r.0 != *capsule);
+        list.push((*capsule, why, v));
+        bell_count(BELL_KISTS);
+    });
+}
+
+/// `capsule`'s kist started: what was kept of a launch of it that did not is dropped, and the kists' bell rung when there was one (the map's note on its circle goes). Under the kernel lock.
+fn kist_started(capsule: &[u8; 32]) {
+    let list = unsafe { &mut *(&raw mut NOT_STARTED) };
+    let before = list.len();
+    list.retain(|r| r.0 != *capsule);
+    if list.len() != before {
+        bell_count(BELL_KISTS);
+    }
 }
 
 /// An install the installer asked for (`install_request`): the capsule by its vault address, and where to tell it each stage: the process (its slot and epoch, so a word is never written into a successor's arc) and the word's address in its arc.

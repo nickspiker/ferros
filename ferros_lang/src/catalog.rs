@@ -337,6 +337,16 @@ messages! {
     RightEntropy,
     RightGps,
     RightUdp,
+    /// Why a kist the person tapped did not start (ferros_kist::launch::why), under `Say::CouldNotStart` on its open circle: no room in the memory pool.
+    NotEnoughMemory,
+    /// Not installed on this device: no capsule here, or no seal.
+    NotInstalledHere,
+    /// Its checks refused it: its signature, the gate, a right it does not declare.
+    FailedItsChecks,
+    /// Its capsule could not be read from the vault.
+    CouldNotBeRead,
+    /// Anything else.
+    SomethingWentWrong,
 
     // ---- Developer ----
     TemporalDither,
@@ -430,6 +440,8 @@ pub enum Say<'a> {
     NotAskedYet(&'a str),
     /// A kist using a right now (it holds a claim on it, ferros_sys::claim): "Mahere (using now)".
     UsingNow(&'a str),
+    /// A kist the person tapped that did not start (its name): "Mahere could not start", the reason under it (`Msg::NotEnoughMemory` and its neighbours).
+    CouldNotStart(&'a str),
     // ---- the attest screen ----
     /// A network's signal, its dBm written already in the person's base.
     Signal(&'a str),
