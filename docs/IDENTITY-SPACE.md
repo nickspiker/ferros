@@ -18,6 +18,7 @@ One set of typed facts per person (fgtw::space, ferros's vocabulary in ferros_sp
 | HOME_SYNC | a device key | on or off | none: set from the Fleet page |
 | ZONE | the fleet | automatic, and the zone by hand (an IANA id) | none: the identity service writes it to the kernel of each device that follows it (docs/TIME.md); chosen on the clock page |
 | LANG | the fleet | the language (`wl`, its ISO 639-3 code) | none: the identity service writes it to the kernel of each device that follows it (SETTINGS.md); chosen on the language page |
+| DND | the fleet | do not disturb, on or off (`u`) | none: the identity service writes it to the kernel of every device (preference 40, SETTINGS.md); switched on the quick row (QUICK.md) |
 | PIN | developer key | the commitment of the key bundle that developer's first kist carried (`hp`), and their name when it gave one | a `pin` section of `kists.list` (KISTS.md "Trust on first install") |
 
 The scope of a place and the view is the fleet's on every device whose home-screen sync is on (the default) and the device's own key on one switched off, so that device keeps its own arrangement, and gets it back after its own reset too. Kists, answers, defaults and pins always follow the person. A pin carries no stamp of its own into the sync, so a device that pinned another bundle for a developer the space already pins takes the space's: the first pin to reach the person's space stands (two pins made apart and merged before either device synced are settled by the space's merge, the later write).

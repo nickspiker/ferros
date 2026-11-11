@@ -1094,6 +1094,14 @@ pub const PREF_LANG: usize = 32;
 pub const PREF_LANG_DEVICE: usize = 34;
 pub const PREF_LANG_IDENTITY: usize = 36;
 pub const PREF_LANG_OWN: usize = 38;
+/// Preference 39: the sound mode (owner, 2026-11-11: the quick row's "sound/vibrate/silent"), 0 sound (the default), 1 vibrate, 2 silent. A device setting, kept in the device document as `sound`; whatever makes a sound or a buzz reads it (nothing does yet).
+pub const PREF_SOUND: usize = 39;
+/// How many sound modes there are: the valid range of PREF_SOUND.
+pub const SOUNDS: u8 = 3;
+/// Preference 40: do not disturb, the identity's (owner, 2026-11-11: "a fleet/identity preference so it follows the person"), 0 off (the default) or 1 on. Written here only by the identity service (payloads/fgtw, from the person's space: settings flow identity to device only, SETTINGS.md), never by a Settings holder; kept in the device document as `dnd_identity` so the device keeps the person's last word thru a boot before the space is read.
+pub const PREF_DND: usize = 40;
+/// Preference 41: the radios that were switched off when the quick row's "radios off" switched them all off (preference 15's bits), so the next tap puts back exactly those (owner, 2026-11-11: "all radios off (restores what was on)"). Kept in the device document as `radios_before`.
+pub const PREF_RADIOS_BEFORE: usize = 41;
 /// How many preferences there are: the first block's 32 and the second's 16.
 const PREF_COUNT: usize = 48;
 
@@ -1226,6 +1234,9 @@ fn pref_valid(index: usize, value: u8) -> bool {
         PREF_SCALE => (value as i8).unsigned_abs() <= SCALE_REACH as u8,
         // Five radios, a bit each.
         PREF_RADIOS_OFF => value < 1 << 5,
+        PREF_SOUND => value < SOUNDS,
+        PREF_DND => value <= 1,
+        PREF_RADIOS_BEFORE => value < 1 << 5,
         _ => false,
     }
 }
@@ -3016,6 +3027,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let held = matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0);
             // x1 bit 8 (`PREF_LIVE`): applied, not kept — a slider under a finger (owner, 2026-11-08: the brightness slider wrote the settings document into the kernel's vault at every 32nd of a stop, a UFS commit under the kernel lock each, and the settings ran at 20 fps); the value is kept by the call without it, at the lift.
             let (index, value, live) = ((f.x[1] & 0xFF) as usize, f.x[2] as u8, f.x[1] & PREF_LIVE != 0);
+            // Do not disturb is the identity's (PREF_DND): only its service writes it (as SYS_LANG op 2 the language), by name and never a kist, no Settings needed; a Settings holder never does (a device setting is never written into an identity's preference, SETTINGS.md).
+            let held = if index == PREF_DND { !p.kist && p.name.as_slice() == b"fgtw" } else { held };
             f.x[0] = if held && f.x[1] >> 9 == 0 && pref_valid(index, value) && (live || unsafe { PREF_STORE }.map(|st| st(index, value)).unwrap_or(false)) {
                 set_pref_locked(index, value);
                 0

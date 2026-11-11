@@ -5,14 +5,14 @@ use alloc::vec::Vec;
 use vsf::schema::{SectionBuilder, SectionSchema, TypeConstraint};
 use vsf::VsfType;
 
-use crate::process::{PREF_BASE, PREF_BRIGHTNESS, PREF_DITHER, PREF_LABELS, PREF_LAYOUT, PREF_PROX_WAKE, PREF_SCALE, PREF_SCOPE, PREF_RADIOS_OFF, PREF_THEME, PREF_UNLOCK_AT_BOOT};
+use crate::process::{PREF_BASE, PREF_BRIGHTNESS, PREF_DITHER, PREF_DND, PREF_LABELS, PREF_LAYOUT, PREF_PROX_WAKE, PREF_RADIOS_BEFORE, PREF_RADIOS_OFF, PREF_SCALE, PREF_SCOPE, PREF_SOUND, PREF_THEME, PREF_UNLOCK_AT_BOOT};
 
 /// The vault key and the section name.
 pub const KEY: &str = "device";
 const SECTION: &str = "device";
 
-/// Each kept preference: its field name and its index in the preferences block. The screen's on/off (preference 2) is not kept: it is the power key's, every boot starts lit.
-pub const FIELDS: [(&str, usize); 11] = [
+/// Each kept preference: its field name and its index in the preferences block. The screen's on/off (preference 2) is not kept: it is the power key's, every boot starts lit. Do not disturb is the identity's as its service last wrote it (`dnd_identity`, as `language_identity`), never read back into the identity.
+pub const FIELDS: [(&str, usize); 14] = [
     ("base", PREF_BASE),
     ("labels", PREF_LABELS),
     ("brightness", PREF_BRIGHTNESS),
@@ -24,6 +24,9 @@ pub const FIELDS: [(&str, usize); 11] = [
     ("unlock_at_boot", PREF_UNLOCK_AT_BOOT),
     ("scale", PREF_SCALE),
     ("radios_off", PREF_RADIOS_OFF),
+    ("radios_before", PREF_RADIOS_BEFORE),
+    ("sound", PREF_SOUND),
+    ("dnd_identity", PREF_DND),
 ];
 /// The time zone: seconds east of UTC.
 const TZ: &str = "tz";

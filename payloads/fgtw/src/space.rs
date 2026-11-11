@@ -7,6 +7,7 @@
 //! - **The map** reads the generation (op 17), bumped whenever the device's copy was written from the space, and reloads its circles; the Fleet page's switch "sync this device's home screen" is op 18.
 //! - **The person's zone** (ferros_space `ZONE`; owner, 2026-11-10: "it's per identity, you can uncheck and set per device tho"): chosen on the clock page of a device that follows it (op 22), and written to the kernel (SYS_ZONE op 4) at every join where it changed, never read back from the kernel (settings flow identity to device only). Whether this device follows it is the device's own switch, kept by the kernel.
 //! - **The person's language** (ferros_space `LANG`), as the zone: chosen on the language page of a device that follows it (op 23), written to the kernel (SYS_LANG op 2) at every join where it changed, never read back.
+//! - **Do not disturb** (ferros_space `DND`; owner, 2026-11-11: "a fleet/identity preference so it follows the person"): switched on the quick row of any device (op 24), written to the kernel (preference 40) at every join where it changed, never read back. No device keeps its own.
 
 use super::*;
 use ferros_space::space::{Baseline, Sealed, Space};
@@ -48,11 +49,14 @@ pub struct SpaceSync {
     /// The person's language as last written to the kernel (SYS_LANG op 2): None not yet, Some(None) the person has none.
     lang_told: Option<Option<[u8; 3]>>,
     said_lang: bool,
+    /// Do not disturb as last written to the kernel (preference 40): None not yet, Some(None) the person has never switched it.
+    dnd_told: Option<Option<bool>>,
+    said_dnd: bool,
 }
 
 impl SpaceSync {
     pub fn new() -> SpaceSync {
-        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, zone_told: None, said_zone: false, lang_told: None, said_lang: false }
+        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, zone_told: None, said_zone: false, lang_told: None, said_lang: false, dnd_told: None, said_dnd: false }
     }
 }
 
@@ -368,6 +372,7 @@ impl Client {
         // The person's zone and language, which no copy on this device mirrors: to the kernel as they change (from a sibling, fgtw.org, or a choice made here).
         self.space_zone_to_kernel();
         self.space_lang_to_kernel();
+        self.space_dnd_to_kernel();
         match ferros_space::sync(&mut self.space.space, &mut self.space.base, &mut copy, &me, eagle()) {
             Ok(o) => {
                 self.space.said_join = false;
@@ -598,6 +603,41 @@ impl Client {
             self.space_seed(true);
         }
         self.space_lang_to_kernel();
+        0
+    }
+
+    /// Do not disturb written to the kernel when it differs from what was last written (preference 40; settings flow identity to device only: the kernel never hands it back). Never switched is off.
+    fn space_dnd_to_kernel(&mut self) {
+        let d = ferros_space::dnd(&self.space.space);
+        if self.space.dnd_told == Some(d) {
+            return;
+        }
+        if ferros_sys::dnd::set_identity(d == Some(true)) {
+            self.log.put(if d == Some(true) { b"fgtw: space: the person's do not disturb to this device: on".as_slice() } else { b"fgtw: space: the person's do not disturb to this device: off" });
+            self.log.line();
+            self.space.dnd_told = Some(d);
+        } else if !self.space.said_dnd {
+            // Said once: an older kernel without preference 40, or the vault refused it; tried again at the next join.
+            self.space.said_dnd = true;
+            self.log.put(b"fgtw: space: the kernel did not take the person's do not disturb");
+            self.log.line();
+        }
+    }
+
+    /// Op 24 [on]: the person switched do not disturb on this device (the quick row): into the space, out to the fleet and fgtw.org, and to the kernel. → [0 done, 1 not yet: before the first pull, as op 18].
+    pub fn space_dnd(&mut self, on: bool) -> u8 {
+        if self.space_ready().is_none() || !self.space.settled {
+            return 1;
+        }
+        let me = self.me;
+        if ferros_space::set_dnd(&mut self.space.space, &me, on, eagle()) {
+            self.log.put(b"fgtw: space: the person's do not disturb switched here, to the fleet");
+            self.log.line();
+            self.space_keep();
+            self.space_to_fleet();
+            self.space_seed(true);
+        }
+        self.space_dnd_to_kernel();
         0
     }
 

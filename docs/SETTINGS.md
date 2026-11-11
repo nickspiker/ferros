@@ -21,7 +21,7 @@ One spec VSF document in the vault under the key `device` (ferros_kernel `settin
 |---|---|---|---|
 | `base` | unsigned | tatau's code: 10 arabic, 12 DMS, 16 hex, G#8C DLS | DMS |
 | `labels` | unsigned | 0 off, 1 on | 0 |
-| `brightness` | unsigned | 0-8 stops below the brightest white | 2 |
+| `brightness` | unsigned | 32nds of a stop below the brightest white, 0-255 (whole stops 0-8 until 2026-11-08) | 2 |
 | `dither` | unsigned | 0 spatial and temporal, 1 spatial only | 0 |
 | `theme` | unsigned | an index into ferros_sys::theme::THEMES | 0 |
 | `prox_wake` | unsigned | 0 off, 1 on | 0 |
@@ -29,6 +29,9 @@ One spec VSF document in the vault under the key `device` (ferros_kernel `settin
 | `layout` | unsigned | 0 Dvorak, 1 QWERTY with Q on the bottom row (honeycomb) | 0 |
 | `unlock_at_boot` | unsigned | 0 off (the handle is typed each boot, nothing of the identity on disk), 1 on (the seed is stored so the phone unlocks without typing) | 0 |
 | `radios_off` | unsigned | the radios switched off, a bit each: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS (a tap on a status circle; the kernel stops that driver while its bit is set) | 0 |
+| `radios_before` | unsigned | the radios that were off when the quick row's "radios off" switched them all off (`radios_off`'s bits), put back by its next tap (QUICK.md) | 0 |
+| `sound` | unsigned | the sound mode, preference 39: 0 sound, 1 vibrate, 2 silent (the quick row) | 0 |
+| `dnd_identity` | unsigned | do not disturb, preference 40, as the identity's service last wrote it: 0 off, 1 on; never read back into the identity (below) | 0 |
 | `tz` | signed | the fixed offset, seconds east of UTC: used when no zone is in effect | 0 |
 | `zone` | ASCII | this device's zone by hand, an IANA id (docs/TIME.md) | none |
 | `zone_auto` | unsigned | this device's choice: 1 automatic (the zone found from the cellular network, then GPS; `zone` stands in until one is), 0 by hand | 1 |
@@ -54,6 +57,18 @@ The shell speaks Photon's sixteen languages (English, Español, Māori, Portugu�
 - **Read** by every process from its second preferences block (preferences 32-38 at G#FB0: in effect, this device's, the identity's, the follow switch), at draw time (ferros_lang `current`).
 - **The words** are ferros_lang's (the settings pages, the attest screen, the keyboard) and fgtw::text's (the fleet's and identity's, shared with Photon, in Photon's wording where Photon has the message): whole messages with holes, every number in the person's base.
 - **What the display draws.** One face, Oxanium +glyphs, by its character map with no shaping (measured with fc-query, 2026-11-10): Latin-1 and most of Latin Extended-A. Twelve languages draw whole. Russian and Ukrainian (no Cyrillic), Hindi (no Devanagari, and it needs shaping) and Vietnamese (no ơ ư, no precomposed tone letters, and no combining hook above, dot below or horn) do not: they are carried in full, are not offered on the page, and read as English while they are the setting. They need a face that covers them (and, for Hindi, shaping); a font is the owner's decision.
+
+## Do not disturb (the identity's)
+
+Do not disturb is the person's, not the device's (owner, 2026-11-11: "a fleet/identity preference so it follows the person"). No device keeps its own.
+
+- **Kept** in the person's identity space (ferros_space `DND`), switched from the quick row of any of their devices: the map asks the identity service (payloads/fgtw op 24), which puts it in the space, hands it to their fleet and fgtw.org, and writes it to the kernel.
+- **On each device** the identity service writes it to the kernel whenever it changes (preference 40, a call the kernel takes from the process named fgtw alone, as the language's), and the kernel keeps it in the settings document as `dnd_identity`, so the device keeps the person's last word thru a boot before the space is read. A Settings holder cannot set it.
+- **Read** by every process from its preferences (`ferros_sys::dnd::on`). Nothing silences anything by it yet: what it holds back is decided when notifications exist (Photon).
+
+## The sound mode (`device.sound`)
+
+Sound, vibrate or silent, preference 39, a device setting set from the quick row thru the Settings capability and kept as every device setting is. Nothing plays a sound or a buzz by it yet (the audio and haptics drivers come first: AUDIO.md).
 
 ## The number base (`device.base`)
 
