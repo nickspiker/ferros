@@ -23,6 +23,7 @@
 //! - 15 `batch [len u16][op…]…`: several ops in one call, in order — a frame with an overlay is `begin`, its text and rects and discs, then `camera` with the keep flag, which draws the scene under them and presents. One call per frame rather than one per op: each call is a round trip through the scheduler. The reply is the last op's, its status the first failure's.
 //! - 16 `disc [x i16][y i16][r u16][colour]`: a filled circle in panel pixels (the shell's shapes are circles; a ring is a smaller disc of the ground colour sent first, since what is sent first is on top).
 //! - 17 `scene move [index u8][x i32][y i32][r u16]` (optionally `[cos i16][sin i16]`, the circle's own turn in Q14): one circle of the scene moved, resized and turned in place (the owner arranging by hand).
+//! - 57 `scene state [count u8][count x (index u8, glow u8, count u16, rim u8, share u16 Q16)]`: circles' states as light (ferros_glow; owner, 2026-11-11: "Spectral lines for states"): `glow` 0 none (the theme's glow by `ring`), 1 running, 2 the Back-swipe target, 3 notifications from people (`count` of them sizes its reach), 4 from the system, 5 stopped with a reason, 6 not running; `rim` 0 none, 1 needs you, 2 working (`share` of it done). Cleared with the scene (op 12); kept by `scene move`.
 //! - 18 `region [cx i16][cy i16][r u16][ground]`: in place of `begin`, the open circle, landed, as an app's region (COMPOSITOR.md): the page's ops up to the camera op are its front layer, drawn only where they changed; the camera op makes the clean window (the ground, the scene under it) once and then draws no scene. A camera op with no region op before it ends the region.
 //! - 19 `text turned [cx i16][cy i16][px u16][colour][alpha u8][cos i16][sin i16][utf8…]`: text centred on (cx, cy), turned about it (Q14, positive sin clockwise), at opacity alpha (255 opaque): the settings' titles riding the circle.
 //! - 47 `button [cx i16][cy i16][w u16][h u16][px u16][fill][edge top-left][edge bottom-right][ink][utf8 label]` and 48 `slider [x0 i16][x1 i16][cy i16][track r u16 Q8][knob r u16 Q8][at u16 Q16][left][right][knob]`: fluor's button and slider as a page's elements (COMPOSITOR.md "Controls"), drawn like the page's text, in the front layer while a region is up.
@@ -51,7 +52,7 @@ use odt::{odt_tables, panel_gamma, pow};
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use ferros_sys::{cap, console, freq, mmio_read, mmio_write, now};
 use draw::Px;
 
@@ -456,8 +457,50 @@ struct Circle {
     /// The circle's own turn (its icon), (cos, sin) in Q14, on top of the camera's: set by `scene move`.
     c: i16,
     s: i16,
+    /// Its state as light (op 57, ferros_glow): the glow outside its rim (`ferros_glow::Glow` as its byte, 0 none: the theme's glow by `ring` as before) and the count that sizes a people glow's reach; the rim's arc (`ferros_glow::Rim`, 0 none) and a working arc's share, Q16.
+    glow: u8,
+    count: u16,
+    rim: u8,
+    share: u16,
 }
-const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, icon: 0, len: 0, label: [0; 16], c: 16384, s: 0 };
+const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, icon: 0, len: 0, label: [0; 16], c: 16384, s: 0, glow: 0, count: 0, rim: 0, share: 0 };
+
+/// The state glows' tables (`draw::glow_line`), in `ferros_glow::Glow::ALL`'s order (glow byte − 1), and the rim arcs' light at full coverage (working values, gamma 2, white at Q14), needs you then working: made once at start (`glow_tables`) from ferros_glow's lines, read by every thread that draws the scene. 48 KiB of statics, no heap.
+static mut LINE_LUTS: [draw::LineLut; 6] = [[0; 1 << draw::LINE_LUT_LOG2]; 6];
+static mut RIM_LIGHT: [[f32; 3]; 2] = [[0.; 3]; 2];
+
+/// Linear VSF RGB light to working values (gamma 2, white at Q14).
+fn light_working(l: [f32; 3]) -> [f32; 3] {
+    l.map(|v| libm::sqrtf(v) * 16384.)
+}
+
+/// `LINE_LUTS` and `RIM_LIGHT` from ferros_glow (owner, 2026-11-11: "Spectral lines for states"): entry i of a glow's table is its rim's light and opacity times the bump at s = (i + ½) / 2¹⁰, the light a layer of linear light (its working value the root), its α the opacity; premultiplied as the canvas holds them. The roots and exponentials are here, once, so a glow pixel has none.
+fn glow_tables() {
+    let n = 1usize << draw::LINE_LUT_LOG2;
+    for (k, &g) in ferros_glow::Glow::ALL.iter().enumerate() {
+        let at = ferros_glow::at_rim(g);
+        let lut = unsafe { &mut *(&raw mut LINE_LUTS[k]) };
+        for (i, e) in lut.iter_mut().enumerate() {
+            let f = ferros_glow::falloff((i as f32 + 0.5) / n as f32);
+            let c = light_working(at.light.map(|v| v * f));
+            *e = ((at.alpha * f * 65535.) as u64) << 48 | (c[2] as u64) << 32 | (c[1] as u64) << 16 | c[0] as u64;
+        }
+    }
+    unsafe {
+        RIM_LIGHT[0] = light_working(ferros_glow::rim_light(ferros_glow::Rim::NeedsYou));
+        RIM_LIGHT[1] = light_working(ferros_glow::rim_light(ferros_glow::Rim::Working));
+    }
+}
+
+/// A circle's state glow on the screen: its table and its reach past the rim (Q8 pixels) at screen radius `sr`, or None for a circle with none.
+fn state_glow(cir: &Circle, sr: i64) -> Option<(&'static draw::LineLut, i64)> {
+    let g = ferros_glow::Glow::from_u8(cir.glow);
+    if g == ferros_glow::Glow::None {
+        return None;
+    }
+    let reach = (sr as f32 * ferros_glow::reach(g, cir.count)) as i64;
+    Some((unsafe { &*(&raw const LINE_LUTS[cir.glow as usize - 1]) }, reach))
+}
 
 /// The bundle's codes to canvas values, 16 bits: ICN3 bundles hold VSF RGB gamma2tanh codes (tanh(√L), bucket bottom c/256), the canvas gamma 2 working values with white at Q14 — so atanh(c/256) × 16384, highlights above white kept (to about 3× white at code 255) now the canvas has the headroom. ICN2 (gamma 2 codes, white at 255): c × 16384 / 255.
 fn icon_decode() -> [u16; 256] {
@@ -2361,6 +2404,10 @@ enum Item {
     Disc(i64, i64, i64, u32, bool),
     Icon(i64, i64, i64, i64, i64, usize, bool),
     Glow(i64, i64, i64, u32, u32),
+    /// A state glow (ferros_glow): centre, radius, reach past the rim, its table.
+    Line(i64, i64, i64, i64, &'static draw::LineLut),
+    /// A rim arc: centre, radius, the arc (`ferros_glow::Rim` byte), a working arc's share (Q16).
+    Arc(i64, i64, i64, u8, u16),
 }
 const ITEMS: usize = 1024;
 static mut SCENE_ITEMS: [Item; ITEMS] = [Item::Disc(0, 0, 0, 0, false); ITEMS];
@@ -2378,6 +2425,8 @@ impl Item {
                 let reach = r + r / GLOW_FRACTION + 256;
                 ((y - reach) >> 8, ((y + reach) >> 8) + 3)
             }
+            Item::Line(_, y, r, reach, _) => ((y - r - reach - 256) >> 8, ((y + r + reach + 256) >> 8) + 3),
+            Item::Arc(_, y, r, _, _) => ((y - r) >> 8, ((y + r) >> 8) + 3),
         }
     }
     fn draw(&self, px: &mut [Px], width: usize, height: usize) {
@@ -2401,6 +2450,14 @@ impl Item {
                 } else {
                     draw::glow(px, width, height, x, y, r, colour, peak, GLOW_SCALE_Q8, GLOW_FLOOR);
                 }
+            }
+            Item::Line(x, y, r, reach, lut) => {
+                draw::glow_line(px, width, height, x, y, r, reach, lut);
+            }
+            Item::Arc(x, y, r, rim, share) => {
+                let rim = ferros_glow::Rim::from_u8(rim);
+                let light = unsafe { RIM_LIGHT[if rim == ferros_glow::Rim::Working { 1 } else { 0 }] };
+                draw::rim_arc(px, width, height, x, y, r, rim, share as f32 * (1. / 65536.), light);
             }
         }
     }
@@ -2854,6 +2911,55 @@ fn working(p: u64, format: u8) -> u64 {
 }
 static mut WINS: [Option<Win>; SURFACES] = [None; SURFACES];
 static mut RAISES: u32 = 0;
+/// The windows' owners as the kernel holds them (SYS_BELL `BELL_SURFACES`): byte k surface k's live generation (0 once the process it was given to has ended, however it ended), the change count above bit 32. Written by the kernel as a surface changes hands, which wakes `reaper` waiting here.
+static SURF_LIVE: AtomicU64 = AtomicU64::new(0);
+/// Whether that bell is registered; a kernel without it leaves the preference bytes alone, as before 2026-11-11.
+static SURF_BELL: AtomicBool = AtomicBool::new(false);
+/// The windows up, for the receive thread (it never reads `WINS`): byte k the generation `WINS[k]` was shown under, 0 for none (`wins_mirror`).
+static WIN_GENS: AtomicU64 = AtomicU64::new(0);
+static mut REAP_STACK: [u8; 16384] = [0; 16384];
+
+/// Surface k's live generation: its preference byte (bytes 8-11, the kernel's copy in this process's page) and, with the bell registered, the bell's byte too; 0 when either says its owner is gone. The kernel changes both under its lock and only as the surface changes hands, so a disagreement is a hand-over in progress, when a window on the surface belongs to an owner that has ended anyway.
+fn live_gen(k: usize) -> u8 {
+    let g = ferros_sys::pref(8 + k as u64);
+    if SURF_BELL.load(Ordering::Acquire) && (SURF_LIVE.load(Ordering::Acquire) >> (8 * k)) as u8 != g { 0 } else { g }
+}
+
+/// `WINS` as `WIN_GENS`, after every change to it.
+fn wins_mirror() {
+    let mut v = 0u64;
+    for k in 0..SURFACES {
+        if let Some(w) = unsafe { WINS[k] } {
+            v |= (w.generation as u64) << (8 * k);
+        }
+    }
+    WIN_GENS.store(v, Ordering::Release);
+}
+
+/// Op 5's byte 12, an app in front: a window up whose owner lives. From `WIN_GENS` and the live generations, not `APP`, so the map hears the moment a front app's process ends (owner, 2026-11-11, on the Pro: Mahere killed with `diag kill`, op 5 kept saying an app was in front, and the map ignored every gesture but the corners until the display was restarted), whatever the render thread is doing; its next pass drops the window and gives the map the glass (`reaper`).
+fn app_live() -> bool {
+    let w = WIN_GENS.load(Ordering::Acquire);
+    (0..SURFACES).any(|k| {
+        let g = (w >> (8 * k)) as u8;
+        g != 0 && g == live_gen(k)
+    })
+}
+
+/// The windows' owners' doorbell: asleep on the bell word until the kernel rings it (a surface freed as its process ends, or given out), then the render thread woken off the ring's tail for a pass, whose top drops every window whose owner is gone. No timer: a process's end is the only thing that wakes it.
+extern "C" fn reaper(_: u64) -> ! {
+    let mut seen = SURF_LIVE.load(Ordering::Acquire);
+    loop {
+        ferros_sys::wait(&SURF_LIVE, seen, 0);
+        let v = SURF_LIVE.load(Ordering::Acquire);
+        if v != seen {
+            seen = v;
+            REAPS.fetch_add(1, Ordering::Release);
+            ferros_sys::wake(&RING_TAIL, 1);
+        }
+    }
+}
+/// Rings `reaper` has passed on, so the render thread does not sleep thru one that came while it was busy (it compares before it waits).
+static REAPS: AtomicU64 = AtomicU64::new(0);
 /// Bit 63 of a surface pixel: see-through.
 const CLEAR: u64 = 1 << 63;
 /// The rows outside the app's circle at the top and at the bottom (`chrome_rows`): the bars' rows.
@@ -3617,6 +3723,7 @@ static mut CAPTURE: usize = 0;
 fn windows_changed(width: usize, height: usize) {
     let full = draw::Rect::full(width, height);
     layout_build(width, height);
+    wins_mirror();
     unsafe {
         PHASE_DIRTY = [full; PHASES];
         clean_reset_all();
@@ -5648,7 +5755,7 @@ extern "C" fn receive(grants: u64) -> ! {
             out[2..4].copy_from_slice(&h.to_le_bytes());
             out[4..8].copy_from_slice(&(FRAMES.load(Ordering::Relaxed) as u32).to_le_bytes());
             out[8..12].copy_from_slice(&((now() / freq()) as u32).to_le_bytes());
-            out[12] = unsafe { APP }.is_some() as u8;
+            out[12] = app_live() as u8;
             ferros_sys::reply(&tok, &out);
             continue;
         }
@@ -6170,6 +6277,17 @@ fn server(grants: u64) -> ! {
         log.s(b"display: no console worker\n");
         log.flush();
     }
+    // The windows' owners (`reaper`): the kernel's bell on the surfaces changing hands, then the thread asleep on it. A kernel without the bell: the preference bytes alone, read each pass, as before.
+    if ferros_sys::bell(ferros_sys::BELL_SURFACES, &SURF_LIVE) {
+        SURF_BELL.store(true, Ordering::Release);
+        if ferros_sys::thread_spawn(reaper, unsafe { &mut *(&raw mut REAP_STACK) }, 0) != 0 {
+            log.s(b"display: no reaper thread\n");
+            log.flush();
+        }
+    } else {
+        log.s(b"display: no surfaces bell (an older kernel): windows of ended processes go on the next pass\n");
+        log.flush();
+    }
     // The render thread on the big core (KERNEL.md "Cores": pinning by latency class — this is the one real compute path; receive and vsync stay on the workers, where the map and the touch server run, so a call hands off on the caller's own core). After the other threads are spawned: they inherit the mask.
     ferros_sys::pin(ferros_sys::CORES_BIG);
     // A person already unlocked (a display restarted after attest): their wallpaper as their space keeps it, their own or the one made on this device, so a restart does not lose it until the next attest; read by the loader while the screen is drawn. Before attest their space is closed, nothing is read, and the attest screen hands the seed over as ever (op 42).
@@ -6187,6 +6305,8 @@ fn server(grants: u64) -> ! {
             CLOCK_DIRS[k] = ((libm::sinf(a) * 16384.0) as i64, (-libm::cosf(a) * 16384.0) as i64);
         }
     }
+    // The state glows' tables and the rim arcs' light, once (ferros_glow).
+    glow_tables();
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
@@ -6308,12 +6428,37 @@ fn server(grants: u64) -> ! {
                         let i32le = |i: usize| i32::from_le_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]);
                         let mut label = [0u8; 16];
                         label.copy_from_slice(&m[at + 14..at + 30]);
-                        let c = Circle { x: i32le(at), y: i32le(at + 4), r: u16::from_le_bytes([m[at + 8], m[at + 9]]), ring: m[at + 10], lit: m[at + 11], icon: m[at + 12], len: m[at + 13].min(16), label, c: 16384, s: 0 };
+                        let c = Circle { x: i32le(at), y: i32le(at + 4), r: u16::from_le_bytes([m[at + 8], m[at + 9]]), ring: m[at + 10], lit: m[at + 11], icon: m[at + 12], len: m[at + 13].min(16), label, c: 16384, s: 0, glow: 0, count: 0, rim: 0, share: 0 };
                         unsafe {
                             SCENE[SCENE_N] = c;
                             SCENE_N += 1;
                         }
                         at += 30;
+                    }
+                }
+                Some(57) if m.len() >= 2 => {
+                    // Circles' states as light (ferros_glow): the clean window and the flight's plane image hold the old glows, so the scene's generation moves.
+                    unsafe { LAST_FRAME.1 = 0 };
+                    client_owned = true;
+                    unsafe { CLIENT_DREW = true };
+                    unsafe { SCENE_GEN = SCENE_GEN.wrapping_add(1) };
+                    let count = m[1] as usize;
+                    for k in 0..count {
+                        let at = 2 + k * 7;
+                        // WHY the tests: the message is the map's; a short one or an index past the scene would read or write past what is there.
+                        if at + 7 > m.len() || m[at] as usize >= unsafe { SCENE_N } {
+                            out[0] = 1;
+                            break;
+                        }
+                        let c = unsafe { &mut *(&raw mut SCENE[m[at] as usize]) };
+                        c.glow = m[at + 1];
+                        c.count = u16::from_le_bytes([m[at + 2], m[at + 3]]);
+                        c.rim = m[at + 4];
+                        c.share = u16::from_le_bytes([m[at + 5], m[at + 6]]);
+                        // WHY: a glow byte past the tables (a newer map) would index past `LINE_LUTS`; it shows no glow.
+                        if ferros_glow::Glow::from_u8(c.glow) == ferros_glow::Glow::None {
+                            c.glow = 0;
+                        }
                     }
                 }
                 Some(14) if m.len() >= 13 => {
@@ -6502,7 +6647,7 @@ fn server(grants: u64) -> ! {
                             unsafe { draw::CLIP = strips[si] };
                         }
                         // The glows, collected as the circles go and drawn after all of them, so they land behind every circle (front to back: what is drawn later goes under). Each: centre, radius (Q8), colour, peak.
-                        let mut glows = [(0i64, 0i64, 0i64, 0u32, 0u32); 256];
+                        let mut glows = [Item::Disc(0, 0, 0, 0, false); 256];
                         let mut nglow = 0usize;
                         // The theme (ferros_sys::theme, device preference 5): every colour the scene chooses.
                         let th = ferros_sys::theme::current();
@@ -6514,19 +6659,26 @@ fn server(grants: u64) -> ! {
                             let sx = ((((rc * dx - rs * dy) >> 14) * z / 65536 + wq) & !255 | 128) + ox;
                             let sy = ((((rs * dx + rc * dy) >> 14) * z / 65536 + hq) & !255 | 128) + oy;
                             let sr = cir.r as i64 * z >> 8;
-                            // Between frames, only what reaches the clip (the circle and its glow, 1/12 of the radius out) is drawn.
+                            // Its state glow (op 57), in place of the theme's: its table and its reach past the rim.
+                            let state = state_glow(&cir, sr);
+                            // Between frames, only what reaches the clip (the circle and its glow: the theme's 1/12 of the radius out, a state glow's own reach) is drawn.
                             if clip_k.is_some() || shift.is_some() {
-                                let reach = sr + sr / GLOW_FRACTION + 512;
+                                let reach = sr + state.map_or(sr / GLOW_FRACTION, |s| s.1) + 512;
                                 let c = unsafe { draw::CLIP };
                                 if (sx + reach) >> 8 < c.x0 as i64 || (sx - reach) >> 8 >= c.x1 as i64 || (sy + reach) >> 8 < c.y0 as i64 || (sy - reach) >> 8 >= c.y1 as i64 {
                                     continue;
                                 }
                             }
                             // Its glow, before the visibility cut: a circle just off the screen still lights its edge.
-                            if sr >= 256 && cir.ring > 0 && nglow < glows.len() {
-                                let colour = if cir.lit != 0 { th.lit & 0x00FF_FFFF } else { th.ring & 0x00FF_FFFF };
-                                glows[nglow] = (sx, sy, sr, colour, th.glow_peak[(cir.ring as usize).min(2)]);
-                                nglow += 1;
+                            if sr >= 256 && nglow < glows.len() {
+                                if let Some((lut, reach)) = state {
+                                    glows[nglow] = Item::Line(sx, sy, sr, reach, lut);
+                                    nglow += 1;
+                                } else if cir.ring > 0 {
+                                    let colour = if cir.lit != 0 { th.lit & 0x00FF_FFFF } else { th.ring & 0x00FF_FFFF };
+                                    glows[nglow] = Item::Glow(sx, sy, sr, colour, th.glow_peak[(cir.ring as usize).min(2)]);
+                                    nglow += 1;
+                                }
                             }
                             if sr < 256 || sx + sr < 0 || sx - sr > (width as i64) << 8 || sy + sr < 0 || sy - sr > (height as i64) << 8 {
                                 continue;
@@ -6610,13 +6762,23 @@ fn server(grants: u64) -> ! {
                             if sr >= 36 << 8 && cir.len > 0 {
                                 if let Ok(t) = core::str::from_utf8(&cir.label[..cir.len as usize]) {
                                     // A third of the radius, at every zoom (no cap: it stopped at 72 px; the 36-px threshold above is when a name appears at all).
-                                    let px = (sr >> 8) as f32 * 0.32;
-                                    let tw = text_width(&font, t, px);
+                                    let mut px = (sr >> 8) as f32 * 0.32;
+                                    let mut tw = text_width(&font, t, px);
+                                    // A long name (a dummy kist's "not running", 2026-11-11) shrinks to 0.8 of the diameter, so it stays inside its circle. Both sides grow with the radius, so a name keeps one proportion at every zoom: no kink as it zooms.
+                                    let room = (sr >> 8) as f32 * 1.6;
+                                    if tw > room {
+                                        px *= room / tw;
+                                        tw = room;
+                                    }
                                     let (fx, fy) = ((sx >> 8) as f32, (sy >> 8) as f32);
                                     let mut c = Canvas::new(pixels, width, height, &mut damage);
                                     text(&mut c, &font, t, fx - tw * 0.5, fy + px * 0.35, px, if lit { BLACK } else { 0xFF00_0000 | th.text });
                                     ALLOC.reset();
                                 }
+                            }
+                            // Its rim arc (op 57: needs you, or working's progress), in front of the circle: on the list before the circle's own pixels.
+                            if cir.rim != 0 {
+                                scene_push(Item::Arc(sx, sy, sr, cir.rim, cir.share), pixels, width, height);
                             }
                             let t_i = now();
                             let (cc, cs) = (cir.c as i64, cir.s as i64);
@@ -6672,10 +6834,14 @@ fn server(grants: u64) -> ! {
                             unsafe { CUR_DMG = CUR_DMG.union(whole).union(r) };
                         }
                         let t_g = now();
-                        for &(gx, gy, gr, colour, peak) in &glows[..nglow] {
-                            scene_push(Item::Glow(gx, gy, gr, colour, peak), pixels, width, height);
-                            // Its reach, as `draw::glow_log` gives it back.
-                            let reach = gr + gr / GLOW_FRACTION + 256;
+                        for &g in &glows[..nglow] {
+                            scene_push(g, pixels, width, height);
+                            // Its reach, as `draw::glow_log` and `draw::glow_line` give it back.
+                            let (gx, gy, reach) = match g {
+                                Item::Line(gx, gy, gr, reach, _) => (gx, gy, gr + reach + 256),
+                                Item::Glow(gx, gy, gr, _, _) => (gx, gy, gr + gr / GLOW_FRACTION + 256),
+                                _ => continue,
+                            };
                             let gr_rect = draw::Rect { x0: ((gx - reach) >> 8) as i32 - 1, y0: ((gy - reach) >> 8) as i32 - 1, x1: ((gx + reach) >> 8) as i32 + 2, y1: ((gy + reach) >> 8) as i32 + 2 }.clip(width, height);
                             unsafe { CUR_DMG = CUR_DMG.union(gr_rect) };
                         }
@@ -7077,10 +7243,10 @@ fn server(grants: u64) -> ! {
                     let v = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]) as i32;
                     let rect = draw::Rect { x0: v(1), y0: v(3), x1: v(1) + v(5), y1: v(3) + v(7) };
                     let base = u64::from_le_bytes(m[9..17].try_into().unwrap());
-                    match surface_of(base) {
-                        Some(sk) if ten && unsafe { TEMPORAL } && ferros_sys::pref(8 + sk as u64) != 0 => {
+                    // The surface's live generation read once: read twice (once to refuse a dead surface, once to keep), a process ending between the two reads left a window kept under generation 0, which no later byte ever differed from, so it stayed in front for good. 0, its owner gone (a show queued before it ended): refused.
+                    match surface_of(base).map(|sk| (sk, live_gen(sk))) {
+                        Some((sk, generation)) if ten && unsafe { TEMPORAL } && generation != 0 => {
                             let full = draw::Rect::full(width, height);
-                            let generation = ferros_sys::pref(8 + sk as u64);
                             // What changed (ferros_sys `show_changed`: [x u16][y u16][w u16][h u16] after the format byte): only that part is published and owed by the other phases — when the window is already up as it was (same generation, place and level) and the screen composed. Otherwise, and for a plain show, the whole screen.
                             let mode = if m.len() > 27 { m[27] } else { 0 };
                             let same = unsafe { WINS[sk] }.is_some_and(|w| w.generation == generation && w.rect == rect && w.level == m[17] && w.mode == mode) && unsafe { APP }.is_some();
@@ -7092,6 +7258,7 @@ fn server(grants: u64) -> ! {
                                     RAISES += 1;
                                     WINS[sk] = Some(Win { generation, level: m[17], order: RAISES, rect, format: if m.len() > 18 { m[18] } else { 0 }, mode });
                                     layout_build(width, height);
+                                    wins_mirror();
                                 }
                                 if OP22_US[4] == 0 {
                                     OP22_US[0] = t_chrome - t22;
@@ -7373,7 +7540,7 @@ fn server(grants: u64) -> ! {
                     out[2..4].copy_from_slice(&(height as u16).to_le_bytes());
                     out[4..8].copy_from_slice(&(frames as u32).to_le_bytes());
                     out[8..12].copy_from_slice(&((now() / freq()) as u32).to_le_bytes());
-                    out[12] = unsafe { APP }.is_some() as u8;
+                    out[12] = app_live() as u8;
                     len = 13;
                 }
                 // The panel, through DSIM: every write bracketed by the hk3 level-2 unlock/lock as the stock driver does.
@@ -7640,14 +7807,20 @@ fn server(grants: u64) -> ! {
                 }
             }
         }
-        // Windows whose process ended (the kernel cleared or renewed its surface's generation byte): gone, and what was behind them shows. Then the corners' clock, once a minute while windows are up, into every phase over its corner.
+        // Windows whose process ended (the kernel cleared or renewed its surface's generation, `live_gen`; `reaper` wakes this pass when it does): gone, and what was behind them shows; the last one gone, the map has the glass again. Then the corners' clock, once a minute while windows are up, into every phase over its corner.
+        let reaps_seen = REAPS.load(Ordering::Acquire);
         unsafe {
             let mut gone = false;
             for sk in 0..SURFACES {
                 if let Some(w) = WINS[sk] {
-                    if ferros_sys::pref(8 + sk as u64) != w.generation {
+                    if live_gen(sk) != w.generation {
                         WINS[sk] = None;
                         gone = true;
+                        let mut l = Log { grants, buf: [0; 256], n: 0 };
+                        l.s(b"display: the window on surface ");
+                        l.dec(sk as u64);
+                        l.s(b" dropped: its process ended\n");
+                        l.flush();
                     }
                 }
             }
@@ -8056,7 +8229,8 @@ fn server(grants: u64) -> ! {
             }
         }
         let tail = RING_TAIL.load(Ordering::Acquire);
-        if tail == seen_tail {
+        // A ring that came after this pass's top (`reaper`'s wake found this thread busy, not waiting): straight on to the next pass, which drops the window.
+        if tail == seen_tail && REAPS.load(Ordering::Acquire) == reaps_seen {
             ferros_sys::wait(&RING_TAIL, tail, wake);
         }
         seen_tail = RING_TAIL.load(Ordering::Acquire);

@@ -60,6 +60,7 @@ members = [
     "honeycomb",
     "wallpaper",
     "orb",
+    "ferros_glow",
     "ahau_core",
     "payloads/threads",
     "payloads/echo_client",
