@@ -1,0 +1,23 @@
+[package]
+name = "ferros_idea"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Ideas (docs/IDEAS.md): a meaning named by 32 bytes (vsf `hi`), keyed BLAKE3 over its first phrasing's locale and scrubbed words as `x`; phrasings in any language and same-as and related links as signed VSF records; which phrasing a person is shown, as one pure function. no_std + alloc."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# x-full: the `x` codec without std for every Unicode scalar value (7.3 KB of tables plus NFC), so an idea minted in any script hashes and parses on the device; crypto-verify: the header's Ed25519 anchor checked when a sheet is read.
+vsf = { path = "../../vsf", default-features = false, features = ["x-full", "crypto-verify"] }
+# The id's keyed hash, in pure Rust as every payload has it: its C and assembly do not build for the bare target.
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+# NFC for the scrub, without std: the crate vsf's own x encoder normalizes with, so the words kept are the words hashed.
+unicode-normalization = { version = "0.1", default-features = false }
+# A sheet's eggs checked against the signer's whole bundle (`fgtw::release::verify_signed_by`, every scheme, never Ed25519 alone): fgtw's verify-only base, no_std + alloc.
+fgtw = { path = "../../fgtw", default-features = false }
+
+[dev-dependencies]
+# The tests sign sheets with test developer bundles, as kistcat signs a capsule.
+fgtw = { path = "../../fgtw", default-features = false, features = ["sign"] }
