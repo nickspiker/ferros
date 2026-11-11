@@ -23,7 +23,7 @@
 //! - 15 `batch [len u16][op…]…`: several ops in one call, in order — a frame with an overlay is `begin`, its text and rects and discs, then `camera` with the keep flag, which draws the scene under them and presents. One call per frame rather than one per op: each call is a round trip through the scheduler. The reply is the last op's, its status the first failure's.
 //! - 16 `disc [x i16][y i16][r u16][colour]`: a filled circle in panel pixels (the shell's shapes are circles; a ring is a smaller disc of the ground colour sent first, since what is sent first is on top).
 //! - 17 `scene move [index u8][x i32][y i32][r u16]` (optionally `[cos i16][sin i16]`, the circle's own turn in Q14): one circle of the scene moved, resized and turned in place (the owner arranging by hand).
-//! - 57 `scene state [count u8][count x (index u8, glow u8, count u16)]`: circles' states as the colour of their glow (ferros_glow; owner, 2026-11-11: "black-none, running, 500nm, stopped, 600 and for you 400"): `glow` 0 none (the theme's glow by `ring`), 1 not running (no glow at all), 2 running, 3 stopped, 4 for you (`count` things waiting widen its reach). Cleared with the scene (op 12); kept by `scene move`.
+//! - 57 `scene state [count u8][count x (index u8, glow u8, count u16)]`: circles' states as the colour of their glow (ferros_glow; owner, 2026-11-11: "black-none, running, 500nm, stopped, 600 and for you 400"): `glow` 0 none (the theme's glow by `ring`), 1 not running (no light: a ring of darkness, half of what is behind at the rim), 2 running, 3 stopped, 4 for you (`count` things waiting widen its reach). Cleared with the scene (op 12); kept by `scene move`.
 //! - 18 `region [cx i16][cy i16][r u16][ground]`: in place of `begin`, the open circle, landed, as an app's region (COMPOSITOR.md): the page's ops up to the camera op are its front layer, drawn only where they changed; the camera op makes the clean window (the ground, the scene under it) once and then draws no scene. A camera op with no region op before it ends the region.
 //! - 19 `text turned [cx i16][cy i16][px u16][colour][alpha u8][cos i16][sin i16][utf8…]`: text centred on (cx, cy), turned about it (Q14, positive sin clockwise), at opacity alpha (255 opaque): the settings' titles riding the circle.
 //! - 47 `button [cx i16][cy i16][w u16][h u16][px u16][fill][edge top-left][edge bottom-right][ink][utf8 label]` and 48 `slider [x0 i16][x1 i16][cy i16][track r u16 Q8][knob r u16 Q8][at u16 Q16][left][right][knob]`: fluor's button and slider as a page's elements (COMPOSITOR.md "Controls"), drawn like the page's text, in the front layer while a region is up.
@@ -606,16 +606,19 @@ struct Circle {
 }
 const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, icon: 0, len: 0, label: [0; 16], c: 16384, s: 0, glow: 0, count: 0 };
 
-/// A circle's state glow (owner, 2026-11-11, on the device: "we just need to change the colour and add the multiply for the negative channel"; then "black-none, running, 500nm, stopped, 600 and for you 400"): the theme's glow (`draw::glow_log`, its falloff, its reach of 1/`GLOW_FRACTION` of the radius, its peaks) with its colour, peak and multiply from ferros_glow, as (colour, peak, reach divisor, multiply Q16). None for a circle with no state; not running is a glow of nothing (peak and multiply 0).
+/// A circle's state glow (owner, 2026-11-11, on the device: "we just need to change the colour and add the multiply for the negative channel"; then "black-none, running, 500nm, stopped, 600 and for you 400"): the theme's glow (`draw::glow_log`, its falloff, its reach of 1/`GLOW_FRACTION` of the radius, its peaks) with its colour, peak and multiply from ferros_glow, as (colour, peak, reach divisor, multiply Q16). None for a circle with no state; not running is no light, a ring of darkness (owner, 2026-11-11, on the Pro: "Glow states are perfect except for the black, needs more cowbell").
 /// - Colour: the state's wavelength, its positive channels (linear VSF RGB) at the photopic luminance of the theme's ring colour (the glow every circle had), as 8-bit gamma 2 codes as the theme's colours are.
 /// - Peak: running and stopped the theme's thin peak (`glow_peak[1]`), for you its heavy one (`[2]`).
-/// - Reach: 1/`GLOW_FRACTION` of the radius; a for-you glow's divisor shrinks with what is waiting (ferros_glow `waiting_reach`: one 1/8, twenty 1/6).
+/// - Reach: 1/`GLOW_FRACTION` of the radius; a for-you glow's divisor shrinks with what is waiting (ferros_glow `reach`: one 1/8, twenty 1/6), and not running reaches as far as for you with one (1/8).
 /// - Multiply: each channel the wavelength leaves negative darkens that channel of what is behind by `MULT_SHARE` at full intensity. The canvas cannot hold that per channel: a pixel is R, G, B and one α (draw.rs), `under` gives what lands behind it the same room, 1 − α, on every channel, and the wallpaper goes in at the publish thru that one room; a darkening of one channel alone needs that room per channel, three opacities a pixel. So the multiply goes in as a neutral one of the same photopic strength (what it would take from a grey plane: ferros_glow `photopic`).
 fn state_glow(cir: &Circle, th: &ferros_sys::theme::Theme) -> Option<(u32, u32, i64, u32)> {
     let g = ferros_glow::Glow::from_u8(cir.glow);
     let spec = ferros_glow::spec(g)?;
+    let frac = (GLOW_FRACTION as f32 / ferros_glow::reach(g, cir.count)) as i64;
+    let dark = (ferros_glow::photopic(spec.mult) * 65535.) as u32;
     let peak = match spec.level {
-        ferros_glow::Level::Off => return Some((0, 0, GLOW_FRACTION, 0)),
+        // Not running: no light, its darkness alone (ferros_glow `NOT_RUNNING_DEPTH`), black at α = depth times the glow's profile, under like any layer.
+        ferros_glow::Level::Off => return Some((0, 0, frac, dark)),
         ferros_glow::Level::Thin => th.glow_peak[1],
         ferros_glow::Level::Heavy => th.glow_peak[2],
     };
@@ -627,8 +630,6 @@ fn state_glow(cir: &Circle, th: &ferros_sys::theme::Theme) -> Option<(u32, u32, 
     let l = ferros_glow::at_luminance(spec.colour, y);
     let code = |v: f32| (libm::sqrtf(v) * 255. + 0.5) as u32;
     let colour = code(l[0]) << 16 | code(l[1]) << 8 | code(l[2]);
-    let frac = if g == ferros_glow::Glow::ForYou { (GLOW_FRACTION as f32 / ferros_glow::waiting_reach(cir.count)) as i64 } else { GLOW_FRACTION };
-    let dark = (ferros_glow::photopic(spec.mult) * 65535.) as u32;
     Some((colour, peak, frac, dark))
 }
 

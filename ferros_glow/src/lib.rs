@@ -4,7 +4,7 @@
 //!
 //! | state | λ nm | glow |
 //! |---|---|---|
-//! | not running | - | none at all (black) |
+//! | not running | - | no light: a ring of darkness, the neutral multiply at `NOT_RUNNING_DEPTH`, reaching as far as a for-you glow with one thing waiting |
 //! | running | 500 | the theme's thin peak |
 //! | stopped | 600 | the theme's thin peak |
 //! | for you (anything waiting on the person: a notification from anyone, a question, an approval) | 400 | the theme's heavy peak, reaching farther as the count grows |
@@ -23,6 +23,8 @@ pub const FOR_YOU_NM: f32 = 400.;
 
 /// A negative channel's multiply at the glow's full intensity: that channel of what is behind darkened by this share (owner: "share 1/2 to start").
 pub const MULT_SHARE: f32 = 1. / (1 << 1) as f32;
+/// Not running: the darkening of what is behind at the rim, every channel alike (owner, 2026-11-11, on the Pro: "Glow states are perfect except for the black, needs more cowbell"). The one knob; it falls with the glow's profile to nothing at its reach.
+pub const NOT_RUNNING_DEPTH: f32 = 1. / (1 << 1) as f32;
 
 /// A circle's state (the map sends it, display op 57).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,7 +54,7 @@ impl Glow {
 /// A glow's peak, mapped by the display onto the theme's glow peaks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
-    /// No glow at all.
+    /// No light (not running: its multiply alone).
     Off,
     Thin,
     Heavy,
@@ -75,11 +77,11 @@ pub struct Spec {
     pub mult: [f32; 3],
 }
 
-/// State `g`'s glow, or None for no state (the theme's glow as ever). Not running is no glow: no colour, no peak, no multiply.
+/// State `g`'s glow, or None for no state (the theme's glow as ever). Not running is no light, its neutral multiply alone (owner, 2026-11-11, on the Pro: "Glow states are perfect except for the black, needs more cowbell").
 pub fn spec(g: Glow) -> Option<Spec> {
     let (nm, level) = match g {
         Glow::None => return None,
-        Glow::NotRunning => return Some(Spec { colour: [0.; 3], level: Level::Off, mult: [0.; 3] }),
+        Glow::NotRunning => return Some(Spec { colour: [0.; 3], level: Level::Off, mult: [NOT_RUNNING_DEPTH; 3] }),
         Glow::Running => (RUNNING_NM, Level::Thin),
         Glow::Stopped => (STOPPED_NM, Level::Thin),
         Glow::ForYou => (FOR_YOU_NM, Level::Heavy),
@@ -106,4 +108,13 @@ pub fn at_luminance(l: [f32; 3], y: f32) -> [f32; 3] {
 pub fn waiting_reach(n: u16) -> f32 {
     let l = libm::log2f(1. + n as f32);
     1. + l / (1. + l)
+}
+
+/// How much farther state `g`'s glow reaches than the theme's, with `n` things waiting: for you by its count, not running as far as for you with one (so its darkness reads as a ring), the rest not at all.
+pub fn reach(g: Glow, n: u16) -> f32 {
+    match g {
+        Glow::ForYou => waiting_reach(n),
+        Glow::NotRunning => waiting_reach(1),
+        _ => 1.,
+    }
 }
