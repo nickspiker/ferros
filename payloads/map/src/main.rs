@@ -1224,8 +1224,12 @@ struct Map {
     gps_fix: Option<Option<GpsFix>>,
     /// The kist this map last asked init to launch and was told "started" (ferros_kist::launch::STARTED), with the kists' bell count as it stood then (KISTS_WORD): a launch the kernel did not start after all comes back with a later count (ferros_sys::not_started), and only that one is said. Dropped once it is said.
     asked: Option<([u8; 32], u64)>,
-    /// Why that kist did not start (ferros_kist::launch::why), for its circle (owner, 2026-11-11: Mahere tapped, "nothing opened", it looked stuck): the capsule, the reason, and whether its circle is open on it yet. Not yet: it waits for the plane at rest with nothing held (`show_fault`); then shown on the open circle until the circle closes.
+    /// Why that kist did not start, or stopped after it started (ferros_kist::launch::why), for its circle (owner, 2026-11-11: Mahere tapped, "nothing opened", it looked stuck; then Mahere faulting at once, "no toast or anything"): the capsule, the reason, and whether its circle is open on it yet. Not yet: it waits for the plane at rest with nothing held (`show_fault`); then shown on the open circle until the circle closes.
     fault: Option<([u8; 32], u8, bool)>,
+    /// Kists that started and then stopped abnormally (ferros_kist::launch::why::stopped: a fault, a panic, a kill from outside) while not the one asked last (owner, 2026-11-11: Mahere faulted at once, "no toast or anything"): each said once, as its circle is next tapped, before any launch (`tap_inner`). Dropped when the kernel no longer keeps it (that kist started again since).
+    stopped: alloc::vec::Vec<([u8; 32], u8)>,
+    /// The kists' bell count of the newest record already taken (`kists_rang`): a record at or under it was said or passed over before.
+    kists_read: u64,
 }
 
 /// A fix as the GPS driver gives it (payloads/gps op 0 FIX): latitude and longitude in 2^-23 degrees. Its error estimate is the page's accuracy measure already (the driver's slot 1).
@@ -1657,22 +1661,38 @@ impl Map {
         r[0]
     }
 
-    /// The kists' bell rang (KISTS_WORD): the launch asked last (`asked`) looked for among the kernel's launches that did not start (ferros_sys::not_started), a record rung after the ask. Found, it is kept for its circle (`fault`) and shown once the plane is at rest (`show_fault`). Records of launches this map did not ask (a relaunch, one asked before) say nothing here.
+    /// The kists' bell rang (KISTS_WORD): the records the kernel keeps (ferros_sys::not_started) read, each one newer than the last taken (`kists_read`) taken once. The launch asked last (`asked`), rung after the ask, whether it did not start or started and then stopped: kept for its circle (`fault`) and shown once the plane is at rest (`show_fault`), the person having just tapped it or being in it. Any other kist that stopped abnormally (a fault, a panic, a kill from outside): said as its circle is next tapped, once (`stopped`). A start that failed for a launch this map did not ask (a relaunch) says nothing here. A stop the kernel no longer keeps (that kist started again since) is dropped unsaid.
     fn kists_rang(&mut self) {
-        let Some((capsule, bell)) = self.asked else { return };
         // WHY the size and the `take`: one record a kist the person has, and the circles hold at most MAX of them; a list longer than the buffer is cut to whole records by the kernel, and a shorter one leaves the rest of the buffer unwritten, so only the first n records are read.
         let mut buf = [0u8; ferros_sys::not_started::REC * MAX];
         let Some(n) = ferros_sys::not_started::list(cap(self.grants, S_SETTINGS), &mut buf) else { return };
-        for r in buf.chunks_exact(ferros_sys::not_started::REC).take(n) {
+        let records = || buf.chunks_exact(ferros_sys::not_started::REC).take(n);
+        self.stopped.retain(|s| records().any(|r| r[1..33] == s.0 && ferros_kist::launch::why::stopped(r[0])));
+        let read = self.kists_read;
+        for r in records() {
             let at = u64::from_le_bytes(r[33..41].try_into().unwrap());
-            if r[1..33] == capsule && at > bell {
-                self.asked = None;
-                self.fault = Some((capsule, r[0], false));
-                let mut l = Line::new();
-                let _ = write!(l, "map: the kist asked last did not start (reason {})\n", r[0]);
-                console(self.grants, l.as_str().as_bytes());
-                return;
+            if at <= read {
+                continue;
             }
+            // The newest record taken, so the next ring takes only what came after it.
+            if at > self.kists_read {
+                self.kists_read = at;
+            }
+            let capsule: [u8; 32] = r[1..33].try_into().unwrap();
+            let why = r[0];
+            let mut l = Line::new();
+            if self.asked.is_some_and(|(c, bell)| c == capsule && at > bell) {
+                self.asked = None;
+                self.fault = Some((capsule, why, false));
+                let _ = write!(l, "map: the kist asked last {} (reason {why})\n", if ferros_kist::launch::why::stopped(why) { "stopped" } else { "did not start" });
+            } else if ferros_kist::launch::why::stopped(why) {
+                self.stopped.retain(|s| s.0 != capsule);
+                self.stopped.push((capsule, why));
+                let _ = write!(l, "map: a kist stopped (reason {why}), said at its circle's next tap\n");
+            } else {
+                continue;
+            }
+            console(self.grants, l.as_str().as_bytes());
         }
     }
 
@@ -2452,10 +2472,14 @@ impl Map {
                 w::NOT_HERE => Msg::NotInstalledHere,
                 w::CHECKS => Msg::FailedItsChecks,
                 w::READ => Msg::CouldNotBeRead,
+                // Started, then stopped (a fault or a panic: the kind is on the console; a kill from outside).
+                w::FAULT | w::PANIC => Msg::ItCrashed,
+                w::KILLED => Msg::ClosedFromOutside,
                 _ => Msg::SomethingWentWrong,
             };
             let y = (top + bottom) / 2;
-            b.text(cx, y - uu(1, 1), uu(5, 4) as u16, white(), 1, say(Say::CouldNotStart(&k.name)).as_str());
+            let head = if w::stopped(why) { say(Say::Stopped(&k.name)) } else { say(Say::CouldNotStart(&k.name)) };
+            b.text(cx, y - uu(1, 1), uu(5, 4) as u16, white(), 1, head.as_str());
             b.text(cx, y + uu(1, 1), uu(1, 1) as u16, grey(), 1, tr(reason));
             if !region {
                 b.disc(cx, cy, r, fill());
@@ -3889,12 +3913,20 @@ impl Map {
                     if i > 0 {
                         self.reload_kists();
                         let Some(k) = self.kist(i) else { return };
-                        if !k.unanswered() {
-                            self.launch(i);
-                            return;
+                        let capsule = k.capsule;
+                        // A stop it has not said yet (it crashed while the person was elsewhere, `stopped`): this tap opens the circle on that, once, and the next tap launches.
+                        if let Some(s) = self.stopped.iter().position(|s| s.0 == capsule) {
+                            let (c, why) = self.stopped.remove(s);
+                            self.fault = Some((c, why, true));
+                        } else {
+                            let Some(k) = self.kist(i) else { return };
+                            if !k.unanswered() {
+                                self.launch(i);
+                                return;
+                            }
+                            // Each unanswered switch starts at the person's default for its right.
+                            self.ask = k.wants.iter().enumerate().fold(0u64, |a, (j, w)| a | ((self.kists.defaults >> w.right & 1) as u64) << j);
                         }
-                        // Each unanswered switch starts at the person's default for its right.
-                        self.ask = k.wants.iter().enumerate().fold(0u64, |a, (j, w)| a | ((self.kists.defaults >> w.right & 1) as u64) << j);
                     }
                     let to = self.at(i);
                     // The view to come back to when it closes.
@@ -4312,6 +4344,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         uninstall_armed: None,
         asked: None,
         fault: None,
+        stopped: alloc::vec::Vec::new(),
+        kists_read: 0,
     };
     let kept = map.load_places_near();
     // Whatever the vault held, no two circles start overlapping (places kept before circles pushed each other could).
@@ -4514,6 +4548,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         console(grants, b"map: the kernel has no kists' bell\n");
     }
     let mut kists_seen = KISTS_WORD.load(core::sync::atomic::Ordering::Acquire);
+    // What the kernel kept before this map started is not this map's to say.
+    map.kists_read = kists_seen;
     // The links' and the facts' bells (SYS_BELL): the kernel writes each source's change count into BELLS at every change. A kernel from before refuses them, and those pages then draw only as they open or are touched.
     for (s, w) in BELLS.iter().enumerate() {
         if !ferros_sys::bell(s as u64, w) {

@@ -61,6 +61,16 @@ pub mod launch {
         pub const READ: u8 = 3;
         /// Anything else (no system secret, an arc of the wrong kind, the process not built).
         pub const OTHER: u8 = 4;
+        /// It started, then ended abnormally (owner, 2026-11-11: Mahere started, faulted at once, "no toast or anything, just no indication at all"): a fault (a data or instruction abort, anything not a syscall, or a syscall buffer it does not own).
+        pub const FAULT: u8 = 5;
+        /// It started, then panicked (its exit value G#DEAD, ferros_sys::panic_exit and std's abort; or 101, std's main panicking).
+        pub const PANIC: u8 = 6;
+        /// It started, then was ended from outside, not by the person's own relaunch (the bridge's `diag kill`).
+        pub const KILLED: u8 = 7;
+        /// Whether a reason is a stop after a start (`FAULT`, `PANIC`, `KILLED`) rather than a start that did not happen.
+        pub const fn stopped(why: u8) -> bool {
+            why >= FAULT
+        }
     }
 }
 

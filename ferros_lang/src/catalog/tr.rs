@@ -225,6 +225,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FailedItsChecks => "denetimlerinden geçemedi",
         Msg::CouldNotBeRead => "okunamadı",
         Msg::SomethingWentWrong => "bir sorun oluştu",
+        Msg::ItCrashed => "çöktü",
+        Msg::ClosedFromOutside => "dışarıdan kapatıldı",
         // ---- Developer ----
         Msg::TemporalDither => "zamansal dither",
         Msg::LightScope => "ışık skopu",
@@ -303,6 +305,7 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         Say::NotAskedYet(what) => write!(o, "{what} (henüz sorulmadı)"),
         Say::UsingNow(what) => write!(o, "{what} (şu an kullanıyor)"),
         Say::CouldNotStart(name) => write!(o, "{name} başlatılamadı"),
+        Say::Stopped(name) => write!(o, "{name} durdu"),
         Say::Signal(dbm) => write!(o, "Sinyal {dbm} dBm"),
         Say::JoiningNet(name) => write!(o, "{name} ağına katılınıyor."),
         Say::PassphraseFor(name) => write!(o, "{name} ağının parolası."),
