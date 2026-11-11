@@ -35,8 +35,9 @@ const HUSKY: [(usize, usize); 1] = [crate::cachemap::POOL];
 const AKITA: [(usize, usize); 1] = [crate::cachemap::POOL];
 
 /// This board's frame ranges. A `FERROS_FRAMES_HIGH=0` build keeps husky to the two old pools as well: the escape if its high bank ever misbehaves, as `FERROS_X3=0` is the X3's.
+/// After a jump from Android (or a ferros restart, jump style) the high bank stays out of the pool too (2026-11-11, the Pro: a boot that came from a jump ran about a minute after attest and reset with no panic recorded): Android can leave a DMA master running, and a device still writing into high-bank frames would land in a process's memory. The two old pools are what ferros ran from after jumps before ARCS. The high bank comes back after jumps once every master Android left running is fenced or reset (the jump is a killswitch: memory feedback_jump_is_killswitch).
 pub fn map() -> &'static [(usize, usize)] {
-    if crate::board::akita() || option_env!("FERROS_FRAMES_HIGH") == Some("0") { &AKITA } else { &HUSKY }
+    if crate::board::akita() || option_env!("FERROS_FRAMES_HIGH") == Some("0") || crate::platform::jumped() { &AKITA } else { &HUSKY }
 }
 
 /// The ranges as `diag frames` reads them: start, end, and size in MiB.
