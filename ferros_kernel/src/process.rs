@@ -5147,10 +5147,8 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
         }
     };
     // A masked arc's power-of-two slack (ARCS.md step 4): the frames wholly between its image (code, zeroed tail, input) and its first stack's guard page hold nothing it was built with, and masked code reaches only what it was linked with (its statics, its static heaps, its stacks), so they go back to the pool at once (ahau: 20 MiB of its 128). Not exact mode's, whose limit may grow into it; a native arc is whole frames already.
-    if masked && arc.limit == 0 {
-        let p = kk.procs[pi].as_mut().unwrap();
-        let _ = arc_release(pi, p, in_off + input.len(), floor - arc.base);
-    }
+    // Not given back at spawn (2026-11-11, the Pro's first ARCS boot: ahau's thread 7 wrote at arc offset G#760_0000, inside the 18 MiB released here, and faulted, so the device had no attest screen): a masked no_std process's allocator grows into exactly this span, so it is not slack. A process gives back what it knows it no longer needs itself (SYS_ARC op 3).
+    let _ = (masked, floor);
     let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS });
     Ok((me, arc, in_off))
 }
