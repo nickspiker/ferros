@@ -11,6 +11,7 @@ pub mod console;
 pub mod futex;
 pub mod getrandom;
 pub mod heap;
+pub mod layout;
 pub mod random;
 pub mod start;
 pub mod sys;
