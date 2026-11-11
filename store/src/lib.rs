@@ -195,11 +195,35 @@ pub struct Store<A: BlockDev, B: BlockDev, N: Nonces> {
     /// The last head and the last piece opened, by address and a hash of the sealing key that opened them (the address alone is not enough: a caller with the right address key and the wrong sealing key must not be served what it could not open, which the tests caught; a hash, so no key outlives the request it came with, VAULT-OUT.md): a large value is read a few KiB at a time (the kernel hands a process 4 KiB a call), and without these every read opened its head again and a 64 KiB piece sixteen times over. Dropped whenever a value is written or removed.
     last_head: Option<([u8; 32], [u8; 32], Head)>,
     last_piece: Option<([u8; 32], [u8; 32], Vec<u8>)>,
+    /// A counter for `read_with`'s stages (`set_clock`), and what it has counted (`ReadTicks`); none until set.
+    clock: Option<fn() -> u64>,
+    ticks: ReadTicks,
+}
+
+/// Where `read_with`'s own time goes, in the clock's ticks (`Store::set_clock`), summed over reads (owner, 2026-11-11: the 24 MB read measured before it is fixed): fetching the sealed pieces (the engine's index walk to each piece, its furrows' reads, each block's BLAKE3 guard and decode, the furrows joined), and copying the opened pieces into the caller's buffer with the wipe of what was opened. The opening is the opener's to time.
+#[derive(Clone, Copy, Default)]
+pub struct ReadTicks {
+    pub fetch: u64,
+    pub copy: u64,
 }
 
 impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
     pub fn new(vault: Vault<A, B>, nonces: N, now: fn() -> i64) -> Self {
-        Store { vault, nonces, now, last_head: None, last_piece: None }
+        Store { vault, nonces, now, last_head: None, last_piece: None, clock: None, ticks: ReadTicks::default() }
+    }
+
+    /// Time `read_with`'s stages with `clock` (any monotonic counter: the vault process gives the generic timer).
+    pub fn set_clock(&mut self, clock: fn() -> u64) {
+        self.clock = Some(clock);
+    }
+
+    /// The stages' time so far (`ReadTicks`): a reader takes the difference across a read.
+    pub fn read_ticks(&self) -> ReadTicks {
+        self.ticks
+    }
+
+    fn tick(&self) -> u64 {
+        self.clock.map(|c| c()).unwrap_or(0)
     }
 
     /// The engine underneath (its stats, its commit).
@@ -300,7 +324,8 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         let id_k = Self::key_id(d);
         let cached = |s: &Self, addr: &[u8; 32]| matches!(&s.last_piece, Some((a, k, _)) if a == addr && *k == id_k);
         // The pieces the kept one does not cover, sealed, in order.
-        let mut sealed: Vec<Sealed> = Vec::new();
+        let t = self.tick();
+        let mut sealed: Vec<Sealed> = Vec::with_capacity((k1 - k0 + 1) as usize);
         for k in k0..=k1 {
             let addr = Self::piece_addr(d, &h.id, k);
             if !cached(self, &addr) {
@@ -308,12 +333,14 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
                 sealed.push(Sealed { addr, bytes, ok: false });
             }
         }
+        self.ticks.fetch += self.tick() - t;
         if !sealed.is_empty() {
             opener.open_all(&d.seal, &mut sealed);
             if sealed.iter().any(|p| !p.ok) {
                 return Err(Error::Open);
             }
         }
+        let t = self.tick();
         let mut next = 0;
         let mut at = offset;
         for k in k0..=k1 {
@@ -344,6 +371,7 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         for p in sealed.iter_mut() {
             p.bytes.fill(0);
         }
+        self.ticks.copy += self.tick() - t;
         Ok(Some(h.len))
     }
 
