@@ -244,6 +244,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ScopeGreen => "kijani",
         Msg::ScopeClear => "wazi",
         Msg::HitMap => "ramani ya miguso",
+        Msg::PanelChannels => "chaneli za skrini",
+        Msg::ReleaseLook => "mwonekano wa toleo",
+        Msg::UntilReboot => "hadi kuwasha upya",
         // ---- the attest screen ----
         Msg::Attest => "thibitisha",
         Msg::Mint => "zalisha",

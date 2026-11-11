@@ -244,6 +244,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ScopeGreen => "हरा",
         Msg::ScopeClear => "बिना फ़िल्टर",
         Msg::HitMap => "स्पर्श मानचित्र",
+        Msg::PanelChannels => "पैनल चैनल",
+        Msg::ReleaseLook => "रिलीज़ रूप",
+        Msg::UntilReboot => "रीबूट तक",
         // ---- the attest screen ----
         Msg::Attest => "अटेस्ट",
         Msg::Mint => "बनाओ",

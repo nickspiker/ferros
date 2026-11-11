@@ -244,6 +244,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ScopeGreen => "xanh lục",
         Msg::ScopeClear => "không lọc",
         Msg::HitMap => "bản đồ chạm",
+        Msg::PanelChannels => "kênh màn hình",
+        Msg::ReleaseLook => "giao diện bản phát hành",
+        Msg::UntilReboot => "đến khi khởi động lại",
         // ---- the attest screen ----
         Msg::Attest => "chứng thực",
         Msg::Mint => "đúc",

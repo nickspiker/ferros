@@ -26,6 +26,7 @@ mod quick;
 
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, Ordering};
 use ferros_sys::{call, cap, console, freq, now, sleep_until};
 use ferros_lang::{Fleet as FleetMsg, Lang, Msg, Say};
 use tatau::Style;
@@ -130,10 +131,12 @@ const BUTTON_LOOK: [[u32; 4]; 4] = [
 ];
 /// The radio's and the checkbox's look, one of three for the owner to pick from (2026-11-08): 0 a pixel's stroke and the fill alike in the theme's mark colour (white in the default theme, owner 2026-11-08: "no amber"); 1 that hairline round a fill of the theme's text colour, the checkbox ticked in the ground's; 2 fluor's stroke (a 32nd of the label's size, plus a pixel) in the secondary text colour, filled with the theme's lit colour and ticked.
 const MARK_LOOK: u8 = 0;
+/// The development look's orange (G#RRGGBB, VSF RGB codes at gamma 2): full red, green at half its light, no blue; the hairlines' on development builds and the Developer page's "release look" row while it is off.
+const DEV_ORANGE: u32 = 0xFF_B4_00;
 /// The circles' hairline colour, as the display draws the app circle's (display `hairline`): on release, grey (equal codes) at half the photopic light of the theme's ring (VSF RGB's weights on its codes, squared); on development builds, VSF RGB orange, full red and green at half its light.
 fn hairline() -> u32 {
-    if DEV_LOOK {
-        return 0xFF_B4_00;
+    if DEV_LOOK && LOOK.load(Ordering::Relaxed) {
+        return DEV_ORANGE;
     }
     let ring = ferros_sys::theme::current().ring;
     let lin = |sh: u32| {
@@ -722,6 +725,10 @@ enum Choice {
     Dither,
     /// The display's hit map in every fourth frame (Developer; display op 58).
     HitMap,
+    /// One of the panel's channels on or off (Developer; display op 59): 0 red, 1 green, 2 blue.
+    Channel(u8),
+    /// The release look until a reboot (Developer; display op 60).
+    ReleaseLook,
     /// One of the theme swatches.
     Theme(u8),
     /// The brightness slider, continuous (preference 3, 32nds of a stop): the value is decided by x, dragged or tapped.
@@ -793,8 +800,10 @@ enum Choice {
 const PAGES: [&str; 20] = ["appearance", "units", "keyboard", "security", "kists", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "clock", "language", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
-/// Whether it looks like one (the orange hairlines, as the display's): FERROS_RELEASE_LOOK set gives a development build the release look for screen captures (owner, 2026-11-10), its tools kept.
+/// Whether it starts looking like one (the orange hairlines, as the display's): FERROS_RELEASE_LOOK set gives a development build the release look for screen captures (owner, 2026-11-10), its tools kept.
 const DEV_LOOK: bool = DEV && option_env!("FERROS_RELEASE_LOOK").is_none();
+/// The development look as it stands, the display's (its op 60): off for good once the Developer page's "release look" is tapped, until a reboot (owner, 2026-11-11: "upon tap in UI it goes black and stays until a reboot"); a map started again asks the display.
+static LOOK: AtomicBool = AtomicBool::new(DEV_LOOK);
 /// Taps in a row on About's version line that make Developer a page (owner, 2026-11-05: "twelve"), and the tap from which the hint shows and counts down ("don't show a toast hint until four taps"). No time window: any other tap starts the count again.
 const DEV_TAPS: u8 = 12;
 const DEV_HINT: u8 = 4;
@@ -1193,6 +1202,8 @@ struct Map {
     dev: bool,
     /// Whether the display shows its hit map in every fourth frame (display op 58; development builds): the Developer page's checkbox and the two-finger swipe up from back and home together switch it, and the display's answer is kept here.
     hit_view: bool,
+    /// The panel's channels as the display has them (display op 59; development builds): bit 0 red, 1 green, 2 blue, set = on; the Developer page's three checkboxes.
+    channels: u8,
     /// The Fleet page as the identity service last answered: its state (payloads/fgtw: 0 no identity, 1 joining, 2 bound waiting for the key, 3 a member with the key, 4-7 looking up, 8 leaving), the approval words while leaving, the members (their device names, or key prefixes where there is none; which one is this device), and the remove row armed by its first tap.
     fleet: Fleet,
     /// Where the camera is flying (`fly`), and whether the flight leaves the open circle for the plane (the page drawn, shrinking with the circle, until it lands).
@@ -3647,6 +3658,25 @@ impl Map {
                 if DEV {
                     let on = self.hit_view;
                     mark(self, b, &mut y, 50, tr(Msg::HitMap), on, Some(Choice::HitMap));
+                    // The panel's channels (owner, 2026-11-11: "a channel picker in debug that enables/disables red/green/blue of the panel output so I can look at channels"): a checkbox each, all on until a reboot unless changed here; an off channel is code 0 on every pixel the panel gets (display op 59).
+                    b.text(cx, y, note as u16, dim(), 1, tr(Msg::PanelChannels));
+                    y += uu(2, 1);
+                    for (c, name) in [Msg::ScopeRed, Msg::ScopeGreen, Msg::ScopeBlue].into_iter().enumerate() {
+                        let on = self.channels >> c & 1 == 1;
+                        mark(self, b, &mut y, 50, tr(name), on, Some(Choice::Channel(c as u8)));
+                    }
+                    // The release look (owner, same day: "a good spot for the release look, we can have it always be off and show orange, upon tap in UI it goes black and stays until a reboot"): off in the development look, its box and its label in the development orange; one tap and the display (and this map's hairlines) take the release look until a reboot (display op 60), the box checked from then on and taking no more taps. Never stored.
+                    if DEV_LOOK && LOOK.load(Ordering::Relaxed) {
+                        let (sw, colours, _) = mark_look(uu(5, 4));
+                        b.mark(50, cx, y - uu(1, 2), uu(5, 4), uu(1, 1), sw, 0, [DEV_ORANGE, colours[1], DEV_ORANGE, colours[3]], tr(Msg::ReleaseLook));
+                        if hit {
+                            self.push_row(cx - half, cx + half, y - uu(2, 1), y + uu(1, 1), Choice::ReleaseLook);
+                        }
+                        y += uu(3, 1);
+                    } else {
+                        mark(self, b, &mut y, 50, tr(Msg::ReleaseLook), true, None);
+                    }
+                    row(self, b, &mut y, note, grey(), tr(Msg::UntilReboot), None);
                 }
                 let sc = ferros_sys::pref(ferros_sys::PREF_SCOPE);
                 b.text(cx, y, note as u16, dim(), 1, tr(Msg::LightScope));
@@ -3919,6 +3949,23 @@ impl Map {
         }
     }
 
+    /// One of the panel's channels switched (display op 59; development builds), from the Developer page's checkboxes: `c` 0 red, 1 green, 2 blue; the display's answer kept for the checkboxes.
+    fn channel_toggle(&mut self, c: u8) {
+        let mut r = [0u8; 4];
+        if call(self.display, &[59, self.channels ^ 1 << c], &mut r) >= 2 && r[0] == 0 {
+            self.channels = r[1];
+        }
+    }
+
+    /// The release look until a reboot (display op 60; development builds), from the Developer page's row: one way, so the row stays checked and takes no more taps.
+    fn release_look(&mut self) {
+        let mut r = [0u8; 4];
+        if call(self.display, &[60, 1], &mut r) >= 2 && r[0] == 0 && r[1] == 1 {
+            LOOK.store(false, Ordering::Relaxed);
+            console(self.grants, b"map: the release look until a reboot\n");
+        }
+    }
+
     /// A helm button's light (display op 54): `corner` 8 home or 9 back, `level` 0 to 1.
     fn helm_light(&self, corner: u8, level: f32) {
         let q = ((level * 65535.0) as u16).to_le_bytes();
@@ -4105,6 +4152,8 @@ impl Map {
                     Some(Choice::Theme(i)) => set(self, ferros_sys::PREF_THEME, i),
                     Some(Choice::Dither) => set(self, ferros_sys::PREF_DITHER, (ferros_sys::pref(ferros_sys::PREF_DITHER) != 1) as u8),
                     Some(Choice::HitMap) => self.hit_view_toggle(),
+                    Some(Choice::Channel(c)) => self.channel_toggle(c),
+                    Some(Choice::ReleaseLook) => self.release_look(),
                     Some(Choice::Labels) => {
                         set(self, ferros_sys::PREF_LABELS, (ferros_sys::pref(ferros_sys::PREF_LABELS) != 1) as u8);
                         self.send_scene();
@@ -4431,6 +4480,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         armed: false,
         dev: false,
         hit_view: false,
+        channels: 7,
         fleet: Fleet::new(),
         target: None,
         flight: None,
@@ -4470,6 +4520,13 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     if DEV {
         let mut r = [0u8; 4];
         map.hit_view = call(map.display, &[58, 3], &mut r) >= 2 && r[0] == 0 && r[1] == 1;
+        // The panel's channels and the look as the display has them (ops 59 and 60, ask): a map started again finds them as they were left.
+        if call(map.display, &[59, 0x80], &mut r) >= 2 && r[0] == 0 {
+            map.channels = r[1];
+        }
+        if call(map.display, &[60, 0], &mut r) >= 2 && r[0] == 0 && r[1] == 1 {
+            LOOK.store(false, Ordering::Relaxed);
+        }
     }
     let kept = map.load_places_near();
     // Whatever the vault held, no two circles start overlapping (places kept before circles pushed each other could).

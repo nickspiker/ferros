@@ -244,6 +244,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ScopeGreen => "kākāriki",
         Msg::ScopeClear => "mārama",
         Msg::HitMap => "mahere pāwhiri",
+        Msg::PanelChannels => "ngā hongere papamata",
+        Msg::ReleaseLook => "āhua tuku",
+        Msg::UntilReboot => "tae noa ki te tīmata anō",
         // ---- the attest screen ----
         Msg::Attest => "whakaū",
         Msg::Mint => "whakawhānau",
