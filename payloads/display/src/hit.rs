@@ -2,7 +2,7 @@
 //!
 //! - **Written by the compose, front to back.** Each publish writes the rows it composes (`row`), once (the first phase of a publish that carries several), and each pixel once: a row starts as one free run of columns, and each layer, frontmost first, claims the runs it owns, writes its id there and takes them out of the row (`Free`), so nothing behind it is looked at there. What no layer claimed is the ground's.
 //! - **The layers, front to back:**
-//!   - the system's places (`SYS` + op 41's code), as the console's worker leaves them at its own compose step (`bars_row`, from `bar_decode`): outside the app's circle every pixel (the radios' circles 0-4, the doorway by the camera 10, the top's other ground 11, back 9 on the left of the bottom and home 8 on the right), and inside it the quick row's circles while the row stands open (32 + k);
+//!   - the system's places (`SYS` + op 41's code), as the console's worker leaves them at its own compose step (`bars_row`, from `bar_decode`): outside the app's circle every pixel (at the top the doorway by the camera 10 and else the nearest console circle's zone: the radios 0-4, USB 5, the clock 13, the battery 14, with 11 where none reaches; back 9 on the left of the bottom and home 8 on the right), and inside it the quick row's circles while the row stands open (32 + k);
 //!   - behind the quick row while any of it shows on the glass (`SYS` + 12): everything inside the app's circle;
 //!   - with an app in front, its windows by the layer stack (`WINDOW` + surface): a window owns every pixel where it is not see-through, as fluor tags a widget by its shape; where no window is, nobody's;
 //!   - on the home screen: the open circle's page (`REGION`), the map's circles front first (`CIRCLE` + their index in the scene, the dummy kists included), each its disc; the plane under them all (`PLANE`).
@@ -18,7 +18,7 @@ pub const NOBODY: u16 = 0;
 pub const PLANE: u16 = 1;
 /// The open circle's page (the map's region, COMPOSITOR.md).
 pub const REGION: u16 = 2;
-/// The system's places: op 41's code added (0-4 a radio's console circle, 8 home, 9 back, 10 the doorway, 11 the top's other ground, 12 behind the quick row, 32 + k a quick circle).
+/// The system's places: op 41's code added (0-4 a radio's console circle and 5 USB, 13 the clock and 14 the battery (each its zone of the dash), 8 home, 9 back, 10 the doorway, 11 the top's other ground, 12 behind the quick row, 32 + k a quick circle).
 pub const SYS: u16 = 1 << 8;
 /// An app's window: its surface added.
 pub const WINDOW: u16 = 1 << 9;
@@ -179,7 +179,7 @@ pub fn bars_row(b: usize, width: usize, height: usize) {
     let out = unsafe { core::slice::from_raw_parts_mut((BARS_BACK as *mut u16).add(b * width), width) };
     let (cx, cy, rr) = circle(width, height);
     let (il, ir) = chord(cx, cy, rr, y, width).unwrap_or((0, 0));
-    // The runs on the stack, a few: inside the circle the six quick circles cut at most 7, outside it the 16 corner circles and the doorway at most 19 from its 2.
+    // The runs on the stack, a few: inside the circle the six quick circles cut at most 7, outside it the doorway and the dash's zones (at most 16 a row) from its 2.
     let (mut ins, mut outs) = ([(0u16, 0u16); 1 << 3], [(0u16, 0u16); 1 << 5]);
     let mut inside = Free::new(&mut ins, il, ir);
     if let Some(row) = quick::open_circles(width, height) {
