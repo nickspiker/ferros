@@ -164,7 +164,7 @@ struct Utrd {
     dw: [u32; 8],
 }
 
-/// UTP Command Descriptor — Command UPIU + Response UPIU + PRDT. Must be 128-byte aligned. Fixed layout: [0x000..0x200) Command UPIU (512 bytes) [0x200..0x400) Response UPIU (512 bytes) [0x400..0x1400) the PRDT: room for RUN_MAX entries at the 128-byte stride the controller takes when the inline-encryption descriptor type is set (`PRDT_STRIDE`), which holds them at the standard 16 too.
+/// UTP Command Descriptor — Command UPIU + Response UPIU + PRDT. Must be 128-byte aligned. Fixed layout: [0x000..0x200) Command UPIU (512 bytes) [0x200..0x400) Response UPIU (512 bytes) [0x400..0x8400) the PRDT: room for RUN_MAX entries at the 128-byte stride the controller takes when the inline-encryption descriptor type is set (`PRDT_STRIDE`), which holds them at the standard 16 too.
 #[repr(C, align(128))]
 struct Ucd {
     cmd_upiu: [u8; 512],
@@ -172,8 +172,8 @@ struct Ucd {
     prdt: [PrdtEntry; PRDT_SLOTS],
 }
 
-/// The most blocks one command moves (`read_run_lun`, `write_run_lun`): 128 KiB, the kernel's run buffer.
-pub const RUN_MAX: usize = 1 << 5;
+/// The most blocks one command moves (`read_run_lun`, `write_run_lun`): 1 MiB, the kernel's run buffer, a PRDT entry of 4 KiB each (Linux's ufs-exynos holds every segment to 4096 bytes, `max_segment_size`, and its block layer sends up to 1 MiB a command: the shape this controller already takes from Android). 128 KiB until 2026-11-11, when a 24 MB value's 6,200 blocks went in some 370 commands at 175 MB/s, each command's own latency paid at queue depth one (owner, 2026-11-11: "2.9s for a 24MB read is embarassing").
+pub const RUN_MAX: usize = 1 << 8;
 /// PRDT slots of 16 bytes: RUN_MAX entries at the larger stride (128 bytes, eight slots each).
 const PRDT_SLOTS: usize = RUN_MAX << 3;
 

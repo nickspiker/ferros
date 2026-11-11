@@ -804,6 +804,8 @@ impl Facts {
 
 /// The largest transfer one `SYS_STORE` call moves either way (the kernel's process.rs STORE_MAX): 256 KiB since 2026-11-08, four of the vault's 64 KiB pieces, which the vault process opens on four cores at once. 4 KiB before, and a kernel from before refuses a larger buffer (ERR).
 pub const STORE_MAX: usize = 1 << 18;
+/// The largest a get (`store_get_at`, `store_read_at`) reads in one call on a kernel from 2026-11-11 on (the kernel's process.rs STORE_GET_MAX): 1 MiB, sixteen of the vault's pieces opened as one batch, a quarter of the round trips. A kernel from before refuses a get over STORE_MAX (ERR): a reader asks again at STORE_MAX, as the display does.
+pub const STORE_GET_MAX: usize = 1 << 20;
 
 /// Read `key` from the vault scope a Store capability names (the key is relative to the scope): Some(the value's whole length, of which at most `buf.len()` bytes were copied), or None if it is absent or the call was refused.
 pub fn store_get(cap: u64, key: &[u8], buf: &mut [u8]) -> Option<usize> {
@@ -811,14 +813,25 @@ pub fn store_get(cap: u64, key: &[u8], buf: &mut [u8]) -> Option<usize> {
     if r == ERR || r == NOTHING { None } else { Some(r as usize) }
 }
 
-/// Blocks of a window on the ferros partition (a Blocks capability; the vault process's disk, VAULT-OUT.md): `buf.len() / 4096` blocks (1 to 32: one UFS command, 128 KiB; 16 on a kernel from before 2026-11-08, which refuses more) from block `at` of the window, read into `buf`. Returns 0, or ERR (not a window this process holds, out of it, or the UFS command failed).
+/// Blocks of a window on the ferros partition (a Blocks capability; the vault process's disk, VAULT-OUT.md): `buf.len() / 4096` blocks (1 to 256: one UFS command, 1 MiB; 32 on a kernel from 2026-11-08 and 16 on one from before, which refuse more) from block `at` of the window, read into `buf`. Returns 0, or ERR (not a window this process holds, out of it, or the UFS command failed).
 pub fn block_read(cap: u64, at: u64, buf: &mut [u8]) -> u64 {
-    svc(nr::BLOCK, cap, ((buf.len() as u64 >> 12) & 0xFF) << 8, at, off(buf.as_mut_ptr()), 0)
+    svc(nr::BLOCK, cap, ((buf.len() as u64 >> 12) & 0xFFFF) << 8, at, off(buf.as_mut_ptr()), 0)
+}
+
+/// `block_read`, timed by the kernel (SYS_BLOCK bit 1, 2026-11-11): (0 or ERR, and on success the timer ticks of the UFS command and of the kernel's copy into `buf`, or None for those from a kernel that does not time).
+pub fn block_read_timed(cap: u64, at: u64, buf: &mut [u8]) -> (u64, Option<(u64, u64)>) {
+    let op = 2 | ((buf.len() as u64 >> 12) & 0xFFFF) << 8;
+    let (r, cmd, copy): (u64, u64, u64);
+    compiler_fence(Ordering::SeqCst);
+    unsafe { asm!("svc #0", inlateout("x0") cap => r, inlateout("x1") op => cmd, inlateout("x2") at => copy, in("x3") off(buf.as_mut_ptr()), in("x4") 0u64, in("x8") nr::BLOCK, options(nostack)) };
+    compiler_fence(Ordering::SeqCst);
+    // A kernel that does not time leaves x1 and x2 as they went in.
+    (r, (r == 0 && (cmd, copy) != (op, at)).then_some((cmd, copy)))
 }
 
 /// `block_read`'s other half: `buf.len() / 4096` blocks written from `buf` at block `at` of the window.
 pub fn block_write(cap: u64, at: u64, buf: &[u8]) -> u64 {
-    svc(nr::BLOCK, cap, 1 | ((buf.len() as u64 >> 12) & 0xFF) << 8, at, off(buf.as_ptr()), 0)
+    svc(nr::BLOCK, cap, 1 | ((buf.len() as u64 >> 12) & 0xFFFF) << 8, at, off(buf.as_ptr()), 0)
 }
 
 /// The vault process's own call (a Vault capability; VAULT-OUT.md, migration): the `skip`-th entry of the kernel's vault still to move into `buf`, as [class: 1 the person's][the domain's address and sealing keys][the scope prefix's length][the full name]. Its length, NOTHING when none is left, ERR.
