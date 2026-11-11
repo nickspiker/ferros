@@ -1,4 +1,4 @@
-//! The console's radio circles, one maths for the desktop tool (tools/orb-tune) and the device (payloads/display's console).
+//! The console's radio circles, one maths for the desktop tool (tools/tune's orbs page) and the device (payloads/display's console).
 //! A circle is the vessel (Lumis's camera-button profile made radial: three channel rings and a dark body) and, while its radio is live, the orb inside it: a Julia set read as the link's I/Q plane (look.rs), or for GPS the sky dome (sky.rs).
 //! Every layer is linear VSF RGB light encoded to `g2t` codes (tanh √L) at 16 bits, a fluor `G2t16`, composed front to back with fluor's `under` and nothing else.
 //! No I/O and no std: libm for the transcendentals, alloc for the satellites and sparks.
@@ -14,7 +14,7 @@ pub use look::{C, GPS, Look, Prep, RADIOS, Radio, Vessel};
 
 /// The float maths the circles use, by libm: core's f32 and f64 have no transcendentals without std.
 /// Named as std's methods, so the maths reads the same in both builds.
-/// Where std is in the build (tools/orb-tune, whose fluor brings it) its inherent methods outrank these and the trait goes unused: the desktop keeps std's maths, the device has libm's.
+/// Where std is in the build (tools/tune's orbs page, whose fluor brings it) its inherent methods outrank these and the trait goes unused: the desktop keeps std's maths, the device has libm's.
 #[allow(dead_code)]
 pub(crate) trait Fm: Sized {
     fn exp(self) -> Self;

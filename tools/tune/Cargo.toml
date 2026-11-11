@@ -1,0 +1,35 @@
+[package]
+name = "ferros-tune"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "One desktop tuning utility, a page per thing tuned: the console's radio circles (orbs: the vessel and the orb inside it) and a person's default wallpaper (the wallpaper crate's knobs), every dimension a slider, judged at the device's true size."
+
+# Standalone: fluor's host build (winit, cosmic-text, rayon) stays out of the ferros workspace lock.
+[workspace]
+
+[[bin]]
+name = "tune"
+path = "src/main.rs"
+
+[dependencies]
+fluor = { path = "../../../fluor", features = ["host-winit"] }
+# The g2t encoder (tanh √L) for every layer's colour and the screen, and the VSF visual that --dump writes.
+vsf = { path = "../../../vsf" }
+# The circles' maths, shared with the device (payloads/display's console).
+orb = { path = "../../orb" }
+# The wallpaper, drawn by the device's own crate.
+wallpaper = { path = "../../wallpaper" }
+rayon = "1"
+
+# fluor's own development profile, mirrored: profiles come from the binary's crate, not the dependency's, and fluor's paint code relies on wrapping arithmetic (its dev and release profiles both build with overflow checks off). The orb and the wallpaper are per-pixel iteration, so the optimisation level matters too.
+[profile.dev]
+opt-level = 2
+overflow-checks = false
+debug = false
+debug-assertions = false
+incremental = true
+
+# The same for release builds (the tool's usual build): no overflow checks under fluor's paint code.
+[profile.release]
+overflow-checks = false
