@@ -13,6 +13,8 @@ use core::sync::atomic::{compiler_fence, Ordering};
 pub const ERR: u64 = u64::MAX;
 /// A polling `recv` found no message waiting.
 pub const NOTHING: u64 = u64::MAX - 1;
+/// `spawn_kist`'s answer for a kist already running on a surface: this bit, the surface in bits 8-15 and its generation in bits 0-7, so its window can be brought to the front (display op 59, `window::front`).
+pub const RUNNING_ON: u64 = 1 << 62;
 /// OR'd into a `call`'s reply length: fail with ERR instead of waiting when no server is receiving on the endpoint (none alive, or one still bringing its device up and not yet receiving; now, or once its last server ends). Without it a call waits for a server, as across a restart (process.rs CALL_LIVE).
 pub const CALL_LIVE: u64 = 1 << 63;
 
@@ -1195,7 +1197,7 @@ fn spawn_with(grants: u64, name: &[u8], key: &[u8], slots: &[u64], flags: u64) -
     svc(nr::SPAWN, off(req.as_ptr()), at as u64, flags, 0, 0)
 }
 
-/// Launch a kist (KISTS.md; `SYS_SPAWN` kist mode): the capsule stored in the vault under its 32-byte address `capsule` (the `capsules.` scope) as a process called `name`, with one slot per want the capsule declares, in its order: the right's code (ferros_kist::RIGHTS) where the person granted it, G#FF (an empty slot) where they did not. The kernel makes every right's object itself from the Kists capability at grant `kists`, and refuses any right the capsule does not declare in that slot once it has read it. 0 queued (the kernel streams the capsule from the vault and starts it; the outcome goes to the console), NOTHING already running or starting, ERR refused (the reason on the console). At most 64 slots. `replace`: a live process of that name is killed first (one shot dead) and the kist launched again; with none alive, NOTHING and nothing launched.
+/// Launch a kist (KISTS.md; `SYS_SPAWN` kist mode): the capsule stored in the vault under its 32-byte address `capsule` (the `capsules.` scope) as a process called `name`, with one slot per want the capsule declares, in its order: the right's code (ferros_kist::RIGHTS) where the person granted it, G#FF (an empty slot) where they did not. The kernel makes every right's object itself from the Kists capability at grant `kists`, and refuses any right the capsule does not declare in that slot once it has read it. 0 queued (the kernel streams the capsule from the vault and starts it; the outcome goes to the console), `RUNNING_ON` | surface << 8 | generation already running on that surface (its window, display op 59), NOTHING already running with no surface or still starting, ERR refused (the reason on the console). At most 64 slots. `replace`: a live process of that name is killed first (one shot dead) and the kist launched again; with none alive, NOTHING and nothing launched.
 pub fn spawn_kist(grants: u64, kists: u64, name: &[u8], capsule: &[u8; 32], codes: &[u8], replace: bool) -> u64 {
     let mut req = [0u8; 1 + 64 + 32 + 32 + 1 + 64];
     assert!(name.len() <= 64 && codes.len() <= 64, "spawn_kist: a name or a list of slots longer than a request holds");
@@ -1616,6 +1618,57 @@ pub mod window {
         m[11..13].copy_from_slice(&y.to_le_bytes());
         let mut r = [0u8; 4];
         call(display, &m, &mut r) >= 1 && r[0] == 1
+    }
+
+    // ---- front, behind and keys (WINDOWS.md "The helm", owner 2026-11-11: "Home backgrounds the kist so depending on how it was designed, like Photon, it doesn't die but it stops rendering everything and stops playing anything except for notifications", "back should signal escape to the app and go up one page") ----
+
+    /// A window's event (display op 62): its kind in the high byte, then for a key its USB HID usage (keyboard page) in the low one.
+    /// Behind: the window left the glass (home, or a flip to another kist); the process lives on, nothing it shows reaches the glass until it is in front again. Draw nothing; play nothing but notifications.
+    pub const EV_BEHIND: u8 = 1;
+    /// In front again (its circle tapped, a flip back): the display composes it from its surface as it stands.
+    pub const EV_FRONT: u8 = 2;
+    /// A key pressed for this window (back's tap: `KEY_ESCAPE`).
+    pub const EV_KEY: u8 = 3;
+    /// Escape, by its USB HID usage: what back's tap sends the app in front (up one page; nothing at its main page).
+    pub const KEY_ESCAPE: u8 = 0x29;
+    /// How many events op 62 holds a window: the newest, a ring (a window that missed more still learns whether it is behind, the reply's state byte).
+    pub const EVENTS: usize = 1 << 4;
+
+    /// The window shown on `surface` under `generation` to the front of its level (display op 59), and told so (`EV_FRONT`). True when there was such a window.
+    pub fn front(display: u64, surface: u8, generation: u8) -> bool {
+        let mut r = [0u8; 4];
+        call(display, &[59, surface, generation], &mut r) >= 1 && r[0] == 0
+    }
+
+    /// The app window in front to the background (display op 60), told so (`EV_BEHIND`): its surface and generation, None when no app window was in front.
+    pub fn behind(display: u64) -> Option<(u8, u8)> {
+        let mut r = [0u8; 4];
+        (call(display, &[60], &mut r) >= 3 && r[0] == 0).then_some((r[1], r[2]))
+    }
+
+    /// A key, by its USB HID usage, to the app window in front (display op 61, `EV_KEY`): its surface and generation, None when no app window was in front.
+    pub fn key(display: u64, usage: u8) -> Option<(u8, u8)> {
+        let mut r = [0u8; 4];
+        (call(display, &[61, usage], &mut r) >= 3 && r[0] == 0).then_some((r[1], r[2]))
+    }
+
+    /// This window's events after `seen` (display op 62), held by the display until there is one: (the count now, behind, the events since `seen`, oldest first, at most `EVENTS`). None when the display has no such op. Call it from a thread of its own: the call waits.
+    pub fn events(display: u64, base: u64, seen: u32, out: &mut [u16; EVENTS]) -> Option<(u32, bool, usize)> {
+        let mut m = [0u8; 13];
+        m[0] = 62;
+        m[1..9].copy_from_slice(&base.to_le_bytes());
+        m[9..13].copy_from_slice(&seen.to_le_bytes());
+        let mut r = [0u8; 7 + 2 * EVENTS];
+        let n = call(display, &m, &mut r);
+        if n == super::ERR || n < 7 || r[0] != 0 {
+            return None;
+        }
+        // WHY the bound: the count byte is the display's, and a reply is cut at the buffer; only whole events that arrived are read.
+        let k = (r[6] as usize).min(EVENTS).min((n as usize - 7) / 2);
+        for (i, e) in out[..k].iter_mut().enumerate() {
+            *e = u16::from_le_bytes([r[7 + 2 * i], r[8 + 2 * i]]);
+        }
+        Some((u32::from_le_bytes([r[1], r[2], r[3], r[4]]), r[5] & 1 == 1, k))
     }
 
     /// The circle an app lives in: its centre and radius in pixels, and how many rows at the top and bottom reach the corners outside it (the circle is tangent to the screen's top and bottom).

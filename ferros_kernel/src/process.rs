@@ -2238,6 +2238,8 @@ pub fn power_offs_apply() {
 pub const ERR: u64 = u64::MAX;
 /// What a polling `recv` returns when no message is waiting.
 pub const NOTHING: u64 = u64::MAX - 1;
+/// What a kist launch (`SYS_SPAWN` kist mode) answers for a kist already running on a surface: this bit, the surface in bits 8-15, its generation (preference byte 8 + surface) in bits 0-7 (`kist_request`). Bit 62: no length, address or other answer reaches it.
+pub const RUNNING_ON: u64 = 1 << 62;
 /// What `spawn` reports for a process still running when its slice ended (it continues in later slices).
 pub const PREEMPTED: u64 = 0x5110 << 48;
 /// Time slice, in generic-timer ticks per millisecond multiples.
@@ -4725,7 +4727,16 @@ fn kist_request(p: &Process, req: &[u8], replace: bool) -> u64 {
             return NOTHING;
         }
         kill_locked(&name);
-    } else if alive || unsafe { &*(&raw const KIST_STARTING) }.as_slice() == name.as_slice() {
+    } else if alive {
+        // Running: the surface it was given and that surface's generation, so the launcher can bring its window to the front (display op 59; owner, 2026-11-11: a running kist's circle tapped raises it, never a second copy). A kist with no surface (none was free, or it asked for none): NOTHING, as before.
+        let owners = unsafe { &*(&raw const SURFACE_OWNER) };
+        let prefs = unsafe { &*(&raw const PREFS_NOW) };
+        let surface = kk.procs.iter().flatten().find(|q| q.name == name && !q.dying).and_then(|q| owners.iter().position(|&o| o == q.epoch));
+        return match surface {
+            Some(s) => RUNNING_ON | (s as u64) << 8 | prefs[PREF_SURFACES + s] as u64,
+            None => NOTHING,
+        };
+    } else if unsafe { &*(&raw const KIST_STARTING) }.as_slice() == name.as_slice() {
         return NOTHING;
     }
     *slot = Some(KistLaunch { name, capsule: capsule[..].try_into().unwrap(), codes });

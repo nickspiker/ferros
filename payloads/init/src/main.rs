@@ -153,31 +153,34 @@ extern "C" fn launcher(grants: u64) -> ! {
         if n == ERR {
             continue;
         }
-        let answer = if n >= 33 && (msg[0] == OP_LAUNCH || msg[0] == OP_RELAUNCH) { launch(grants, msg[1..33].try_into().unwrap(), msg[0] == OP_RELAUNCH) } else { REFUSED };
-        ferros_sys::reply(&token, &[answer]);
+        let answer = if n >= 33 && (msg[0] == OP_LAUNCH || msg[0] == OP_RELAUNCH) { launch(grants, msg[1..33].try_into().unwrap(), msg[0] == OP_RELAUNCH) } else { [REFUSED, 0, 0, 1] };
+        ferros_sys::reply(&token, &answer[..answer[3] as usize]);
     }
 }
 
-/// One launch (or, `relaunch`, a running kist killed and launched again after the person changed an answer): the kist found in the person's list by its capsule, its slots from their answers (a right granted, or an empty slot), handed to the kernel, which checks them against the capsule itself.
-fn launch(grants: u64, capsule: [u8; 32], relaunch: bool) -> u8 {
+/// One launch (or, `relaunch`, a running kist killed and launched again after the person changed an answer): the kist found in the person's list by its capsule, its slots from their answers (a right granted, or an empty slot), handed to the kernel, which checks them against the capsule itself. The reply's bytes and, last, how many of them go: the answer alone, or RUNNING with the surface and generation the running kist shows on (ferros_kist::launch::RUNNING).
+fn launch(grants: u64, capsule: [u8; 32], relaunch: bool) -> [u8; 4] {
     use ferros_kist::launch::*;
-    let Some(list) = ferros_kist::store::read(cap(grants, S_KIST_LIST)) else { return UNREADABLE };
-    let Some(k) = list.by_capsule(&capsule) else { return NOT_INSTALLED };
-    let Some(codes) = k.launch_codes() else { return ASK };
+    let one = |a: u8| [a, 0, 0, 1];
+    let Some(list) = ferros_kist::store::read(cap(grants, S_KIST_LIST)) else { return one(UNREADABLE) };
+    let Some(k) = list.by_capsule(&capsule) else { return one(NOT_INSTALLED) };
+    let Some(codes) = k.launch_codes() else { return one(ASK) };
     // WHY: the name is the installer's ASCII; a process name and a request hold 64 bytes, a slot list 64 slots (a longer one is a capsule no request can launch).
     let name = &k.name.as_bytes()[..k.name.len().min(64)];
     if codes.len() > 64 {
-        return REFUSED;
+        return one(REFUSED);
     }
     match ferros_sys::spawn_kist(grants, S_KISTS, name, &capsule, &codes, relaunch) {
         0 => {
             console(grants, if relaunch { b"init: relaunching ".as_slice() } else { b"init: launching " });
             console(grants, name);
             console(grants, b"\n");
-            STARTED
+            one(STARTED)
         }
-        ferros_sys::NOTHING => RUNNING,
-        _ => REFUSED,
+        ferros_sys::NOTHING => one(RUNNING),
+        // Running on a surface (the kernel's `RUNNING_ON`): which, so the map can bring its window to the front.
+        r if r != ferros_sys::ERR && r & ferros_sys::RUNNING_ON != 0 => [RUNNING, (r >> 8) as u8, r as u8, 3],
+        _ => one(REFUSED),
     }
 }
 

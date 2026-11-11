@@ -38,7 +38,7 @@ pub mod launch {
     pub const OP_RELAUNCH: u8 = 1;
     /// Queued: the kernel streams the capsule from the vault and starts it.
     pub const STARTED: u8 = 0;
-    /// A process of that kist is alive, or starting.
+    /// A process of that kist is alive, or starting. Followed by [surface u8][generation u8] when it runs on a surface of its own: its window, which the map brings to the front (display op 59, ferros_sys::window::front; owner, 2026-11-11: a running kist's circle tapped raises it).
     pub const RUNNING: u8 = 1;
     /// A want is unanswered: the first-launch question first (init never asks; the map does).
     pub const ASK: u8 = 2;
