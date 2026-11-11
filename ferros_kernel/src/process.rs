@@ -1573,7 +1573,7 @@ static mut STORE_STAGE: Option<(Vec<u8>, Vec<u8>)> = None;
 static mut STORE_CACHE: Option<(Vec<u8>, Vec<u8>)> = None;
 /// The largest transfer `SYS_STORE` moves either way: 256 KiB, four of the vault process's 64 KiB pieces (ferros_store PIECE), which it opens on four cores at once (payloads/vault `Openers`). 4 KiB until 2026-11-08, when the person's 24 MB wallpaper took about 5900 round trips and 2.9 s (owner: "24MB from the vault should be imperceptibly fast").
 pub const STORE_MAX: usize = 1 << 18;
-/// The largest a get (`SYS_STORE` op get, forwarded to the vault process) reads in one call: 1 MiB since 2026-11-11, sixteen pieces the vault process fetches and opens as one batch on its four cores, and a quarter of the round trips of a large value read at STORE_MAX (93 for the 24 MB wallpaper, each with its stamp, its hand-offs and the reader's turn between them). The reply goes from the vault process's buffer straight into the caller's (`SYS_REPLY`), never through the kernel's heap. Sets, lists and the kernel's own vault stay at STORE_MAX; a kernel from before refuses a larger get, and a reader drops to STORE_MAX (ferros_sys STORE_GET_MAX).
+/// The largest a get (`SYS_STORE` op get, forwarded to the vault process) reads in one call: 1 MiB since 2026-11-11, sixteen pieces the vault process fetches and opens as one batch on its four cores, and a quarter of the round trips of a large value read at STORE_MAX (93 for the 24 MB wallpaper, each with its stamp, its hand-offs and the reader's turn between them). The reply goes from the vault process's buffer straight into the caller's (`SYS_REPLY`), never through the kernel's heap. Only while the vault process serving has said it answers that much (`SYS_VAULT` op 3, `VAULT_GET`): one from before has a reply buffer of one STORE_MAX transfer. Sets, lists and the kernel's own vault stay at STORE_MAX; a larger get is refused (as a kernel from before refuses it), and a reader drops to STORE_MAX (ferros_sys STORE_GET_MAX).
 pub const STORE_GET_MAX: usize = 1 << 20;
 
 /// The vault process's endpoint (VAULT-OUT.md, step 3). While a process receives on it, every `SYS_STORE` call is forwarded there (`store_forward`), stamped by the kernel with the domain keys of the caller's scope; while none does, the kernel's own vault answers as before. Nothing may call it directly (a message on it is the kernel's), and only a spawn holding the vault right (`Grant::Vault`) may serve it.
@@ -1599,6 +1599,17 @@ fn vault_ep() -> Option<usize> {
     let ep = kk.endpoints.iter().position(|e| e.name == VAULT_EP)?;
     let serving = kk.procs.iter().flatten().any(|p| !p.dying && p.cspace.iter().any(|c| matches!(c.object, Object::Endpoint(e) if e == ep) && c.rights & RIGHT_RECV != 0));
     serving.then_some(ep)
+}
+
+/// The largest get the vault process serving now has said it answers (`SYS_VAULT` op 3: its epoch, the length), else STORE_MAX: a vault process from before 2026-11-11 has a reply buffer of one STORE_MAX transfer, and a larger get would index past it. Under the kernel lock.
+static mut VAULT_GET: (u64, usize) = (u64::MAX, STORE_MAX);
+
+/// The get bound for the vault process serving `ep` (`VAULT_GET` when that process said it, STORE_MAX otherwise).
+fn vault_get_max(ep: usize) -> usize {
+    let kk = k();
+    let (epoch, max) = unsafe { VAULT_GET };
+    let said = kk.procs.iter().flatten().any(|p| !p.dying && p.epoch == epoch && p.cspace.iter().any(|c| matches!(c.object, Object::Endpoint(e) if e == ep) && c.rights & RIGHT_RECV != 0));
+    if said { max } else { STORE_MAX }
 }
 
 /// The scope a full name belongs to, if it may live in the vault process (not reserved, not kept by the kernel).
@@ -1753,7 +1764,7 @@ fn store_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
     let rel = p.read(f.x[2], (f.x[3] as usize).min(97));
     // WHY: the name and the length are the caller's; the same refusals as the kernel's own path (a name of printable ASCII up to 96 bytes or a 32-byte address; one transfer at most: a get's own, larger, STORE_GET_MAX).
     let rel_ok = if raw { rel.len() == 32 || list } else { rel.len() <= 96 && rel.iter().all(|&b| (0x21..0x7F).contains(&b)) && (!rel.is_empty() || list) };
-    let most = if set || del || list { STORE_MAX } else { STORE_GET_MAX };
+    let most = if set || del || list { STORE_MAX } else { vault_get_max(ep) };
     if !rel_ok || len > most {
         f.x[0] = ERR;
         return 0;
@@ -2536,7 +2547,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let (op, len, offset) = (f.x[1] & 0xFF, ((f.x[1] >> 8) & 0xFF_FFFF) as usize, (f.x[1] >> 32) as usize);
             // WHY: the length and the name are the vault process's: one transfer at most, a name as long as a scope's prefix and the longest name the kernel's path accepts.
             let name = || alloc::string::String::from_utf8(p.read(f.x[2], (f.x[3] as usize).min(1 << 7))).unwrap_or_default();
-            f.x[0] = if !ok || len > STORE_MAX {
+            f.x[0] = if ok && op == 3 {
+                // Op 3: this vault process answers gets of up to `len` bytes (its reply buffer), held to the kernel's own bound (WHY the min: the length is the vault process's, and SYS_REPLY copies at most STORE_GET_MAX). Forgotten when another process serves.
+                unsafe { VAULT_GET = (p.epoch, len.min(STORE_GET_MAX)) };
+                0
+            } else if !ok || len > STORE_MAX {
                 ERR
             } else {
                 match op {

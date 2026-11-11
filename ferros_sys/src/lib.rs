@@ -844,6 +844,11 @@ pub fn vault_read(cap: u64, name: &[u8], offset: u64, buf: &mut [u8]) -> u64 {
     svc(nr::VAULT, cap, 1 | (buf.len() as u64) << 8 | offset << 32, off(name.as_ptr()), name.len() as u64, off(buf.as_mut_ptr()))
 }
 
+/// The vault process answers gets of up to `max` bytes (its reply buffer less the value word; the kernel holds it to its own STORE_GET_MAX): until a vault process says so the kernel forwards no get larger than STORE_MAX (2026-11-11). 0, or ERR (no Vault capability, or a kernel from before).
+pub fn vault_gets(cap: u64, max: usize) -> u64 {
+    svc(nr::VAULT, cap, 3 | ((max as u64) & 0xFF_FFFF) << 8, 0, 0, 0)
+}
+
 /// An old entry written and committed in its domain: removed from the kernel's vault. 0, NOTHING if it was not there, ERR.
 pub fn vault_done(cap: u64, name: &[u8]) -> u64 {
     svc(nr::VAULT, cap, 2, off(name.as_ptr()), name.len() as u64, 0)

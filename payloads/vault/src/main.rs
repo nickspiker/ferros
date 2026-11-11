@@ -626,6 +626,8 @@ extern "C" fn work(_: u64) -> ! {
     // One transfer and its stamp each way, with room to spare: in, a set's piece (ferros_sys::STORE_MAX, 256 KiB); out, a get's (ferros_sys::STORE_GET_MAX, 1 MiB since 2026-11-11, the kernel's bound on a forwarded get).
     let mut msg = alloc::vec![0u8; ferros_sys::STORE_MAX + (1 << 12)];
     let mut out = alloc::vec![0u8; ferros_sys::STORE_GET_MAX + (1 << 12)];
+    // The kernel forwards gets larger than one STORE_MAX transfer only once this process says it answers them (a vault from before would index past its reply buffer); a kernel from before refuses the call and its gets stay at STORE_MAX.
+    ferros_sys::vault_gets(cap(grants(), S_VAULT), ferros_sys::STORE_GET_MAX);
     let mut token = [0u8; 32];
     let mut writers: Vec<Pending> = Vec::new();
     let mut epoch: Option<u32> = None;
