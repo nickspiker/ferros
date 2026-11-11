@@ -339,7 +339,7 @@ fn ints_of<const N: usize>(v: &[VsfType]) -> Option<[i64; N]> {
 
 // ── The device's copy as facts, and back ──
 
-/// A kist's fact value: its capsule, name, and wants in slot order (each right and the developer's reason), then where its capsule was fetched from when the installer fetched it (`nu`, last: a reader from before 2026-11-10 takes no URL for a name or a reason and skips it).
+/// A kist's fact value: its capsule, name, and wants in slot order (each right and the developer's reason), then where its capsule was fetched from when the installer fetched it (`nu`, last: a reader from before 2026-11-10 takes no URL for a name or a reason and skips it), then its version, a `z` per part as written (a reader from before takes no `z` for a right, a name or a reason and skips them).
 fn kist_value(k: &Kist) -> Vec<VsfType> {
     let mut v = vec![VsfType::hb(k.capsule.to_vec()), VsfType::a(vsf::Ascii::checked("name", k.name.clone()))];
     for w in &k.wants {
@@ -349,7 +349,22 @@ fn kist_value(k: &Kist) -> Vec<VsfType> {
     if let Some(u) = &k.source {
         v.push(VsfType::nu(u.clone()));
     }
+    if let Some(ver) = &k.version {
+        v.extend(ver.values());
+    }
     v
+}
+
+/// A kist fact's version: its `z` values in order, or None when it carries none.
+fn version_of_fact(v: &[VsfType]) -> Option<ferros_kist::Version> {
+    let parts: Vec<u64> = v
+        .iter()
+        .filter_map(|x| match x {
+            VsfType::z(n) => Some(*n as u64),
+            _ => None,
+        })
+        .collect();
+    (!parts.is_empty()).then_some(ferros_kist::Version(parts))
 }
 
 /// Where a kist fact's capsule was fetched from, if it says.
@@ -468,6 +483,7 @@ fn apply(w: Write, list: &mut Kists, list_changed: &mut bool, store: &mut impl S
             let decl = ferros_kist::Decl { name, wants };
             let i = list.install(capsule, d, o, &decl);
             list.kists[i].source = source_of(&value);
+            list.kists[i].version = version_of_fact(&value);
             *list_changed = true;
             true
         }
@@ -747,7 +763,7 @@ mod tests {
         assert_eq!(reset.map, b.map);
     }
 
-    /// Uninstalled on one device: gone from the other too, the answers kept on both and in the space; installed again later (the installer stamps when), it wins over the uninstall's tombstone and asks nothing anywhere. Its source travels with it.
+    /// Uninstalled on one device: gone from the other too, the answers kept on both and in the space; installed again later (the installer stamps when), it wins over the uninstall's tombstone and asks nothing anywhere. Its source and version travel with it.
     #[test]
     fn an_uninstall_travels_and_an_install_again_asks_nothing() {
         let mut a = arranged_pro();
@@ -773,6 +789,7 @@ mod tests {
         assert!(!la.kists[p].unanswered(), "its answers back from the kept ones");
         la.kists[p].source = Some(String::from("http://kists.fgtw.org/capsules/b2.vsf"));
         la.kists[p].installed = 2400;
+        la.kists[p].version = Some(ferros_kist::Version(vec![0, 2, 0]));
         a.set(Scope::Kists, ferros_kist::LIST, &la.build(2400).unwrap());
         sync(&mut sa, &mut ba, &mut a, &PRO, 2401).unwrap();
         assert!(read_list(&mut a).unwrap().by_identity(&PHOTON.0, &PHOTON.1).is_some(), "not taken back out by the tombstone");
@@ -782,6 +799,7 @@ mod tests {
         let k = lb.by_identity(&PHOTON.0, &PHOTON.1).expect("back on the other device");
         assert_eq!(k.capsule, [0xB2; 32]);
         assert_eq!(k.source.as_deref(), Some("http://kists.fgtw.org/capsules/b2.vsf"));
+        assert_eq!(k.version.as_ref().map(|v| v.0.clone()), Some(vec![0, 2, 0]), "its version, as written");
         assert!(!k.unanswered(), "nothing asked on the other device either");
         assert!(lb.kept.is_empty());
         // A fresh device restored from the space: the source comes with the list, for its restore to fetch from.

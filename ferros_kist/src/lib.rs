@@ -1,14 +1,16 @@
 //! Kists (docs/KISTS.md): what an installed app may be handed, how its developer declares it, and the person's answers.
 //!
 //! - **A right** is one thing a kist can be handed at spawn: a grant (owner, 2026-11-08: "a grant is the permission"). The vocabulary is fixed here, a right named and numbered by its place in `RIGHTS`; the kernel hands each one out as its own object (process.rs `kist_object`).
-//! - **The declaration** is in the signed capsule: a section `kist` (`name`, the app's own name, text) and a section `wants`, one field per right the kist asks for, named by the right, its value one line of the developer's reason (text, a human's words). The fields' order is the kist's grant slot order: slot 1 is the first want, and a right the person said no to is an empty slot, never a fake. Nothing undeclared can be granted: the kernel checks every launch against the capsule it runs.
-//! - **The list** is the person's (`kists.list`, identity class, so it follows them to every device of their fleet): one VSF document, a section `defaults` (a field per right, 1 on or 0 off: what the first-launch question starts each switch at; out of the box every one is off) and a section `kist` per installed kist: `capsule` (hb, the blake3 of the signed capsule, its vault address), `developer` (ke) and `option` (hp; in the capsule it is the `kist` section's `option`, hR), together the kist's identity as the gate sees it, `name` (text), and a field per want named by its right: the reason (ASCII text, `a`: vsf encodes UTF-8 text, `x`, only with std, and the map and init are no_std), and once the person answered, the answer (unsigned, 1 granted or 0 not) and when (Eagle time). A want never answered has no answer and is asked at the next launch, once (owner, 2026-11-08: "asked once, ever, per person, per kist, per permission"). Since 2026-11-10 a kist may carry `source` (`nu`, the URL its capsule was fetched from, for a restore) and `installed` (Eagle time), and a section `kept` per uninstalled kist holds its answers (`developer`, `option`, a field per right: the answer and when) for the day it is installed again; readers from before skip all three. Since 2026-11-10 (trust on first install) a section `pin` per developer holds the commitment of the key bundle their first kist carried (`Pin`, `Kists::trust`); readers from before skip it.
+//! - **The declaration** is in the signed capsule: a section `kist` (`name`, the app's own name, text) and a section `wants`, one field per right the kist asks for, named by the right, its value one line of the developer's reason (text, a human's words). The fields' order is the kist's grant slot order: slot 1 is the first want, and a right the person said no to is an empty slot, never a fake. Nothing undeclared can be granted: the kernel checks every launch against the capsule it runs. Since 2026-11-10 the `kist` section also carries the kist's `version` ([`Version`]: a `z` per part, as many parts as its developer uses), so the version is signed with everything else.
+//! - **The list** is the person's (`kists.list`, identity class, so it follows them to every device of their fleet): one VSF document, a section `defaults` (a field per right, 1 on or 0 off: what the first-launch question starts each switch at; out of the box every one is off) and a section `kist` per installed kist: `capsule` (hb, the blake3 of the signed capsule, its vault address), `developer` (ke) and `option` (hp; in the capsule it is the `kist` section's `option`, hR), together the kist's identity as the gate sees it, `name` (text), and a field per want named by its right: the reason (ASCII text, `a`: vsf encodes UTF-8 text, `x`, only with std, and the map and init are no_std), and once the person answered, the answer (unsigned, 1 granted or 0 not) and when (Eagle time). A want never answered has no answer and is asked at the next launch, once (owner, 2026-11-08: "asked once, ever, per person, per kist, per permission"). Since 2026-11-10 a kist may carry `source` (`nu`, the URL its capsule was fetched from, for a restore) and `installed` (Eagle time) and `version` (a `z` per part, the installed capsule's as its declaration gives it), and a section `kept` per uninstalled kist holds its answers (`developer`, `option`, a field per right: the answer and when) for the day it is installed again; readers from before skip them all. Since 2026-11-10 (trust on first install) a section `pin` per developer holds the commitment of the key bundle their first kist carried (`Pin`, `Kists::trust`); readers from before skip it.
 //! - **Fetching** a capsule (the installer, payloads/kists) is `fetch`: a plain HTTP GET's response decoded as it arrives, and the capsule hashed and its header read as it streams into the vault, never held whole.
 #![no_std]
 
 extern crate alloc;
 
 pub use vsf;
+/// The number bases a version is shown in (`write_version`).
+pub use tatau;
 
 pub mod fetch;
 
@@ -66,6 +68,111 @@ pub struct Decl {
     pub wants: Vec<(u8, String)>,
 }
 
+/// The field of the capsule's `kist` section, and of a directory entry, that carries the version.
+pub const VERSION: &str = "version";
+
+/// A kist's version: its parts, most significant first, as many as its developer uses (owner, 2026-11-10: "we don't limit the .'s like the major, minor, patch"). Written as one field `version` with a `z` value per part: `z` is VSF's own marker for a version, the one Photon's manifest gives its `major`, `minor` and `patch` in.
+///
+/// Kept as its developer wrote it (the signed parts); read only thru its significant parts ([`significant`]), so what a person is shown ([`write_version`]) is what is compared. The order (owner, 2026-11-10):
+/// - **Leading zero parts mean nothing**: "00000123=123", and 0.1.0 is 1.0.
+/// - **The number of parts is the stage, and more parts is newer**: "If I change my clock from ver 12 to ver 1.0 because I think it's ready to go from alpha to beta and then from 45.0 to 1.0.0 when I think it's ready to go mainstream". So 12 < 1.0 < 45.0 < 1.0.0: any two-part version is newer than every one-part version, however large.
+/// - **The same number of parts** compares left to right, as numbers.
+/// - **Equal** when the significant parts are the same.
+#[derive(Clone, Debug, Default)]
+pub struct Version(pub Vec<u64>);
+
+/// A version's significant parts: its parts from the first that is not zero; the single part 0 for a version all zeros or with no parts.
+pub fn significant(parts: &[u64]) -> &[u64] {
+    match parts.iter().position(|&p| p != 0) {
+        Some(at) => &parts[at..],
+        None => &[0],
+    }
+}
+
+impl Version {
+    /// Its significant parts ([`significant`]): what is shown and what is compared.
+    pub fn significant(&self) -> &[u64] {
+        significant(&self.0)
+    }
+}
+
+impl PartialEq for Version {
+    fn eq(&self, other: &Version) -> bool {
+        self.significant() == other.significant()
+    }
+}
+impl Eq for Version {}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Version) -> core::cmp::Ordering {
+        let (a, b) = (self.significant(), other.significant());
+        a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+    }
+}
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Version) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Version {
+    /// A version as a person types it (`0.1.0`): one or more parts of decimal digits, separated by dots. None for anything else: an empty part, a sign, a part past 64 bits.
+    pub fn parse(s: &str) -> Option<Version> {
+        let mut parts = Vec::new();
+        for p in s.split('.') {
+            // WHY: `u64::from_str` takes a leading `+`; a version part is digits only.
+            if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            parts.push(p.parse().ok()?);
+        }
+        Some(Version(parts))
+    }
+
+    /// The `version` field's values: a `z` per part (usize is 64 bits on every target ferros and its tools build for, so a part is kept whole).
+    pub fn values(&self) -> Vec<VsfType> {
+        self.0.iter().map(|&p| VsfType::z(p as usize)).collect()
+    }
+
+    /// The `version` field's values back, each by its type marker: a value that is not `z`, or no value at all, refuses it.
+    pub fn from_values(values: &[VsfType]) -> Result<Version, &'static str> {
+        if values.is_empty() {
+            return Err("a version with no parts");
+        }
+        let mut parts = Vec::with_capacity(values.len());
+        for v in values {
+            match v {
+                VsfType::z(n) => parts.push(*n as u64),
+                _ => return Err("a version part that is not a version number (z)"),
+            }
+        }
+        Ok(Version(parts))
+    }
+}
+
+/// A version as a person reads it, in their number base (`f`, tatau; ferros_sys::numbers gives the device's): its significant parts ([`significant`]) joined by dots, leading parts that are zero left out (owner, 2026-11-10: "don't show leading .'s that are 0"), so 0.1.0 reads 1.0 and 0.0.3 reads 3; a version all zeros (or with no parts) reads 0. What is shown is exactly what [`Version`]'s order compares. A part is written whole in the base's digits: decimal for arabic, hexadecimal for hex, dozenal digits for DMS and DLS. It is a name, not a quantity, so DMS's doubling count and DLS's sign and unit do not apply.
+pub fn write_version(w: &mut impl core::fmt::Write, f: tatau::Fmt, parts: &[u64]) -> core::fmt::Result {
+    for (i, &p) in significant(parts).iter().enumerate() {
+        if i > 0 {
+            w.write_char('.')?;
+        }
+        match f.base {
+            tatau::Base::Arabic => write!(w, "{p}")?,
+            tatau::Base::Hex => write!(w, "{p:X}")?,
+            tatau::Base::Dms | tatau::Base::Dls => tatau::dozenal_whole(w, f.style, p)?,
+        }
+    }
+    Ok(())
+}
+
+/// The version a capsule's `kist` section carries; None for a capsule without one (signed before 2026-11-10, or by the bridge without `--version`).
+pub fn version_of(capsule: &[u8]) -> Result<Option<Version>, &'static str> {
+    match section(capsule, "kist")?.and_then(|s| s.get_field(VERSION).cloned()) {
+        Some(f) => Version::from_values(&f.values).map(Some),
+        None => Ok(None),
+    }
+}
+
 /// One installed kist in the person's list.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Kist {
@@ -78,6 +185,8 @@ pub struct Kist {
     pub source: Option<String>,
     /// When this kist was installed or updated (`installed`, Eagle oscillations; 0 unknown, as a list from before 2026-11-10): the stamp of its fact in the person's space (ferros_space), so an install after an uninstall wins over the uninstall's tombstone.
     pub installed: i64,
+    /// The installed capsule's version as its signed declaration gives it (`version`, a `z` per part, kept as written; since 2026-11-10): what the Kists page compares a listed version against, so it offers an update only when the listed one is newer. None for a kist installed before versions, or from a capsule without one: any listed version is newer.
+    pub version: Option<Version>,
 }
 
 /// The answers of a kist the person uninstalled, kept in their list (a section `kept`: `developer`, `option`, then a field per right answered, the answer and when), so installing the same kist again finds them and asks nothing (owner, 2026-11-07: "asked once, ever").
@@ -253,7 +362,11 @@ impl Kists {
                         }
                         wants.push(Want { right, reason, answer: answer.map(|a| (a, when)) });
                     }
-                    out.kists.push(Kist { capsule, developer, option, name, wants, source, installed });
+                    let version = match s.get_field(VERSION) {
+                        Some(f) => Some(Version::from_values(&f.values)?),
+                        None => None,
+                    };
+                    out.kists.push(Kist { capsule, developer, option, name, wants, source, installed, version });
                 }
                 "kept" => {
                     let (Some(developer), Some(option)) = (s.bytes32("developer"), s.bytes32("option")) else {
@@ -321,6 +434,9 @@ impl Kists {
             }
             if k.installed != 0 {
                 s.add_field("installed", VsfType::e(EtType::e6(k.installed)));
+            }
+            if let Some(v) = k.version.as_ref().filter(|v| !v.0.is_empty()) {
+                s.add_field_multi(VERSION, v.values());
             }
             for w in &k.wants {
                 let mut values = alloc::vec![VsfType::a(vsf::Ascii::checked("reason", w.reason.clone()))];
@@ -405,7 +521,9 @@ impl Kists {
             self.kept.swap_remove(i);
         }
         let (source, installed) = old.map_or((None, 0), |i| (self.kists[i].source.clone(), self.kists[i].installed));
-        let k = Kist { capsule, developer, option, name: d.name.clone(), wants, source, installed };
+        // The version is the new capsule's, which the caller sets from its declaration (`version_of`); the one before stays only while the capsule is the same.
+        let version = old.filter(|&i| self.kists[i].capsule == capsule).and_then(|i| self.kists[i].version.clone());
+        let k = Kist { capsule, developer, option, name: d.name.clone(), wants, source, installed, version };
         match old {
             Some(i) => {
                 self.kists[i] = k;
@@ -482,9 +600,15 @@ mod tests {
         k.kists[i].wants[0].answer = Some((true, 5));
         k.kists[i].wants[1].answer = Some((false, 6));
         assert_eq!(k.kists[i].launch_codes(), Some(alloc::vec![0, EMPTY]));
+        k.kists[i].version = Some(Version(alloc::vec![0, 1, 0]));
         let doc = k.build(7).unwrap();
         let back = Kists::parse(&doc).unwrap();
         assert_eq!(back, k);
+        assert_eq!(back.kists[i].version.as_ref().unwrap().0, alloc::vec![0, 1, 0]);
+        // The same capsule again keeps its version; a new capsule's is its own, set by the installer.
+        let mut same = back.clone();
+        same.install([1; 32], [2; 32], [3; 32], &decl());
+        assert_eq!(same.kists[i].version, Some(Version(alloc::vec![1, 0])));
         // An update that adds a want: the old answers stand, the new want is unanswered.
         let mut d2 = decl();
         d2.wants.push((4, String::from("to keep your places")));
@@ -492,6 +616,7 @@ mod tests {
         let j = k2.install([9; 32], [2; 32], [3; 32], &d2);
         assert_eq!(j, i);
         assert_eq!(k2.kists[j].capsule, [9; 32]);
+        assert_eq!(k2.kists[j].version, None);
         assert_eq!(k2.kists[j].wants[0].answer, Some((true, 5)));
         assert_eq!(k2.kists[j].wants[1].answer, Some((false, 6)));
         assert_eq!(k2.kists[j].wants[2].answer, None);
@@ -561,6 +686,82 @@ mod tests {
         w.add_field("camera", VsfType::a(vsf::Ascii::lit("photos")));
         let file = vsf::VsfBuilder::new().add_section_direct(w).build().unwrap();
         assert!(declaration(&file).is_err());
+    }
+
+    fn shown(f: tatau::Fmt, parts: &[u64]) -> String {
+        let mut s = String::new();
+        write_version(&mut s, f, parts).unwrap();
+        s
+    }
+
+    #[test]
+    fn a_version_drops_its_leading_zero_parts_only() {
+        let a = tatau::Fmt::new(tatau::Base::Arabic, tatau::Style::Words);
+        assert_eq!(shown(a, &[0, 1, 0]), "1.0");
+        assert_eq!(shown(a, &[0, 0, 3]), "3");
+        assert_eq!(shown(a, &[0, 0, 0]), "0");
+        assert_eq!(shown(a, &[]), "0");
+        assert_eq!(shown(a, &[1, 2]), "1.2");
+        assert_eq!(shown(a, &[2, 0, 1]), "2.0.1");
+        assert_eq!(shown(a, &[0, 0, 2, 0, 0, 7, 1, 0, 0, 0, 65536, 0]), "2.0.0.7.1.0.0.0.65536.0");
+        assert_eq!(shown(a, &[u64::MAX]), "18446744073709551615");
+    }
+
+    #[test]
+    fn a_version_reads_in_the_persons_base() {
+        assert_eq!(shown(tatau::Fmt::new(tatau::Base::Hex, tatau::Style::Words), &[0, 1, 10, 255]), "1.A.FF");
+        // Dozenal digits, whole: twelve is Zila Zil, never a doubling count.
+        let w = tatau::Fmt::new(tatau::Base::Dms, tatau::Style::Words);
+        assert_eq!(shown(w, &[0, 1, 0]), "Zila.Zil");
+        assert_eq!(shown(w, &[0, 0, 12]), "Zila Zil");
+        assert_eq!(shown(w, &[0, 0, 0]), "Zil");
+        assert_eq!(shown(tatau::Fmt::new(tatau::Base::Dls, tatau::Style::Words), &[1, 23]), "Zila.Zila Stelor");
+        // Glyphs: the face's digit characters, packed.
+        assert_eq!(shown(tatau::Fmt::new(tatau::Base::Dms, tatau::Style::Glyphs), &[0, 1, 13]), "\u{11}.\u{11}\u{11}");
+    }
+
+    fn v(s: &str) -> Version {
+        Version::parse(s).unwrap()
+    }
+
+    #[test]
+    fn versions_order_by_stage_then_parts() {
+        // The owner's example: alpha 12, beta 1.0, beta 45.0, mainstream 1.0.0.
+        assert!(v("12") < v("1.0"));
+        assert!(v("1.0") < v("45.0"));
+        assert!(v("45.0") < v("1.0.0"));
+        assert!(v("9.9") < v("1.0.0"));
+        assert!(v("999999") < v("0.1.0"));
+        assert!(v("1.2.3") > v("1.2.2"));
+        assert!(v("1.10") > v("1.9"));
+        // Leading zero parts mean nothing.
+        assert_eq!(v("0.1.0"), v("1.0"));
+        assert_eq!(v("00000123"), v("123"));
+        assert_eq!(v("0.0.0"), v("0"));
+        assert_eq!(Version(Vec::new()), v("0"));
+        assert_eq!(v("0.0.3").cmp(&v("3")), core::cmp::Ordering::Equal);
+        assert!(v("0.0.3") < v("0.1.0"));
+        // Inner and trailing zeros do count: 1.0 is a stage past 1.
+        assert!(v("1") < v("1.0"));
+        assert_ne!(v("1.0.0"), v("1.0"));
+        // What is shown is what is compared.
+        let a = tatau::Fmt::new(tatau::Base::Arabic, tatau::Style::Words);
+        assert_eq!(shown(a, &v("0.1.0").0), shown(a, &v("1.0").0));
+    }
+
+    #[test]
+    fn a_version_parses_and_round_trips_as_z_values() {
+        assert_eq!(Version::parse("0.1.0"), Some(Version(alloc::vec![0, 1, 0])));
+        assert_eq!(Version::parse("7"), Some(Version(alloc::vec![7])));
+        assert_eq!(Version::parse("1.2.3.4.5.6.7.8.9"), Some(Version((1..10).collect())));
+        for bad in ["", "1.", ".1", "1..2", "+1", "-1", "1.a", "1 .2", "18446744073709551616"] {
+            assert_eq!(Version::parse(bad), None, "{bad:?}");
+        }
+        // Kept as written: the leading zeros ride in the signed bytes.
+        let v = Version(alloc::vec![0, 1, 0, u64::MAX]);
+        assert_eq!(Version::from_values(&v.values()).unwrap().0, v.0);
+        assert!(Version::from_values(&[]).is_err());
+        assert!(Version::from_values(&[VsfType::z(1), VsfType::u(2, false)]).is_err());
     }
 }
 
@@ -735,9 +936,15 @@ pub mod capsule {
         Ok(b)
     }
 
-    /// A kist's capsule, unsigned: stamped `made` (Eagle oscillations), its header naming the bundle's Ed25519 key with an empty egg slot per scheme (`fgtw::release::release_slots`); then the `kist` section (name, option, the developer's name when given, `kb`), the `wants` section, and the code. Sign it with `fgtw::release::sign_release` and the developer's `SigningBundle`.
-    pub fn unsigned(d: &Decl, option: [u8; 32], developer_name: Option<&str>, bundle: &KeyBundle, code: &Code, made: i64) -> Result<Vec<u8>, String> {
+    /// A kist's capsule, unsigned: stamped `made` (Eagle oscillations), its header naming the bundle's Ed25519 key with an empty egg slot per scheme (`fgtw::release::release_slots`); then the `kist` section (name, option, the version when given, the developer's name when given, `kb`), the `wants` section, and the code. Sign it with `fgtw::release::sign_release` and the developer's `SigningBundle`.
+    pub fn unsigned(d: &Decl, option: [u8; 32], version: Option<&Version>, developer_name: Option<&str>, bundle: &KeyBundle, code: &Code, made: i64) -> Result<Vec<u8>, String> {
         let (mut k, w) = declaration_sections(d, Some(option));
+        if let Some(v) = version {
+            if v.0.is_empty() {
+                return Err(String::from("a version with no parts"));
+            }
+            k.add_field_multi(VERSION, v.values());
+        }
         if let Some(n) = developer_name {
             k.add_field("developer", VsfType::a(vsf::Ascii::new(n).map_err(|e| alloc::format!("the developer's name {n:?}: {e} (a kist's text is ASCII, read by a no_std installer)"))?));
         }
@@ -844,7 +1051,7 @@ pub mod capsule {
 
         fn signed(key: &SigningBundle, name: Option<&str>) -> Vec<u8> {
             let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
-            fgtw::release::sign_release(unsigned(&decl(), [5; 32], name, &key.public(), &code, 9).unwrap(), key).unwrap()
+            fgtw::release::sign_release(unsigned(&decl(), [5; 32], Some(&Version(alloc::vec![0, 1, 0])), name, &key.public(), &code, 9).unwrap(), key).unwrap()
         }
 
         #[test]
@@ -860,6 +1067,8 @@ pub mod capsule {
             assert_eq!(declaration(&c).unwrap(), decl());
             assert_eq!(identity(&c).unwrap(), (key.keypair().public.to_bytes(), [5; 32]));
             assert_eq!(developer_name_of(&c).unwrap().as_deref(), Some("Test Developer"));
+            // The version is in the signed declaration.
+            assert_eq!(version_of(&c).unwrap(), Some(Version(alloc::vec![0, 1, 0])));
             assert_eq!(want_codes(&c).unwrap(), alloc::vec![0]);
         }
 
@@ -879,7 +1088,7 @@ pub mod capsule {
             // Another developer's bundle put in whole (signed by them): its Ed25519 key is not the header's.
             let other = SigningBundle::developer(&[4; 32], "TEST_DEVELOPER");
             let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
-            let mut u = unsigned(&decl(), [5; 32], None, &other.public(), &code, 9).unwrap();
+            let mut u = unsigned(&decl(), [5; 32], None, None, &other.public(), &code, 9).unwrap();
             // The header names this key, the bundle another: built by hand, as an attacker would.
             let ed_other = other.public().ed25519();
             let ed_mine = key.public().ed25519();
@@ -899,6 +1108,7 @@ pub mod capsule {
             assert_eq!(bundle_of(&c), Ok(None));
             assert!(carried(&c).is_err());
             assert_eq!(declaration(&c).unwrap(), decl());
+            assert_eq!(version_of(&c), Ok(None));
         }
 
         /// The installer's steps for one capsule: admit, then (as its store stage does) pin and keep the kist in the list.
@@ -1020,14 +1230,6 @@ pub mod directory {
     pub const HOST: &str = "kists.fgtw.org";
     pub const PATH: &str = "/kists.vsf";
 
-    /// A capsule's version, as Photon's manifest gives its own (`major`, `minor`, `patch`, each `z`).
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
-    pub struct Version {
-        pub major: u64,
-        pub minor: u64,
-        pub patch: u64,
-    }
-
     /// Where the device gets the capsule.
     #[derive(Clone, PartialEq, Debug)]
     pub enum Source {
@@ -1052,7 +1254,7 @@ pub mod directory {
         pub developer_name: Option<String>,
         /// `option` (`hR`): the kist's identity across versions, minted once by its developer.
         pub option: [u8; 32],
-        /// `major`, `minor`, `patch` (`z`).
+        /// `version` (a `z` per part, as the capsule's own declaration carries it). A manifest entry maps the artefact's `major`, `minor`, `patch` into three parts.
         pub version: Version,
         pub source: Source,
         /// `capsule` (`hb`): the blake3 of the signed capsule, as the person's list and the vault name it.
@@ -1088,9 +1290,10 @@ pub mod directory {
             s.add_field("developer_name", text("developer_name", n)?);
         }
         s.add_field("option", VsfType::hR(e.option.to_vec()));
-        s.add_field("major", VsfType::z(e.version.major as usize));
-        s.add_field("minor", VsfType::z(e.version.minor as usize));
-        s.add_field("patch", VsfType::z(e.version.patch as usize));
+        if e.version.0.is_empty() {
+            return Err(alloc::format!("{}: a version with no parts", e.name));
+        }
+        s.add_field_multi(VERSION, e.version.values());
         match &e.source {
             Source::Path(p) => s.add_field("path", text("path", p)?),
             Source::Manifest { url, platform, arch } => {
@@ -1162,13 +1365,6 @@ pub mod directory {
         })
     }
 
-    fn version_part(s: &VsfSection, name: &str) -> Option<u64> {
-        value(s, name, |v| match v {
-            VsfType::z(n) => Some(*n as u64),
-            _ => None,
-        })
-    }
-
     fn entry_of(s: &VsfSection) -> Result<Entry, &'static str> {
         let manifest = value(s, "manifest", |v| match v {
             VsfType::nu(u) => Some(u.clone()),
@@ -1189,11 +1385,7 @@ pub mod directory {
             developer: key(s, "developer").ok_or("an entry without its developer key")?,
             developer_name: ascii(s, "developer_name"),
             option: option(s).ok_or("an entry without its option")?,
-            version: Version {
-                major: version_part(s, "major").ok_or("an entry without its version")?,
-                minor: version_part(s, "minor").ok_or("an entry without its version")?,
-                patch: version_part(s, "patch").ok_or("an entry without its version")?,
-            },
+            version: Version::from_values(&s.get_field(VERSION).ok_or("an entry without its version")?.values)?,
             source,
             // WHY: as `key`.
             capsule: value(s, "capsule", |v| match v {
@@ -1256,7 +1448,7 @@ pub mod directory {
                 developer: [n; 32],
                 developer_name: None,
                 option: [n ^ 1; 32],
-                version: Version { major: 0, minor: 1, patch: 0 },
+                version: Version(alloc::vec![0, 1, 0, 7]),
                 source,
                 capsule: [n ^ 2; 32],
                 size: 700,
@@ -1317,6 +1509,27 @@ pub mod directory {
             let key = SigningBundle::developer(&[3; 32], "TEST_PROJECT");
             let e = entry(1, Source::Path(String::from("/a.vsf")));
             assert_eq!(parse_directory(&signed(&[e.clone(), e], &key)), Err("a kist listed twice"));
+        }
+
+        #[test]
+        fn a_version_of_any_length_round_trips_and_major_minor_patch_is_not_read() {
+            let mut e = entry(1, Source::Path(String::from("/a.vsf")));
+            for v in [alloc::vec![3], alloc::vec![0, 0, 0], (0..32).collect::<Vec<u64>>()] {
+                e.version = Version(v.clone());
+                let back = parse_directory(&build_open(&[e.clone()], 5).unwrap()).unwrap().kists;
+                assert_eq!(back, alloc::vec![e.clone()]);
+                // As the developer wrote it, leading zeros and all.
+                assert_eq!(back[0].version.0, v);
+            }
+            e.version = Version(Vec::new());
+            assert!(build_open(&[e.clone()], 5).is_err());
+            // The shape before 2026-11-10 (three fields): no reader is kept for it.
+            let mut s = entry_section(&entry(1, Source::Path(String::from("/a.vsf")))).unwrap();
+            s.fields.retain(|f| f.name != VERSION);
+            for n in ["major", "minor", "patch"] {
+                s.add_field(n, VsfType::z(1));
+            }
+            assert_eq!(entry_of(&s), Err("an entry without its version"));
         }
 
         #[test]

@@ -3095,7 +3095,9 @@ impl Map {
                     }
                     for (di, e) in inst.dir.iter().enumerate() {
                         let mut l = Line::new();
-                        let _ = write!(l, "{} {}.{}.{}", e.name, e.version[0], e.version[1], e.version[2]);
+                        // Its version in the person's base, leading zero parts left out: what is shown is what the update below compares.
+                        let _ = write!(l, "{} ", e.name);
+                        let _ = ferros_kist::write_version(&mut l, f, &e.version.0);
                         row(self, b, &mut y, small, white(), l.as_str(), None);
                         y -= uu(3, 4);
                         row(self, b, &mut y, note, dim(), &e.about, None);
@@ -3109,6 +3111,12 @@ impl Map {
                         if busy {
                         } else if mine.is_some_and(|k| k.capsule == e.capsule) {
                             row(self, b, &mut y, note, grey(), "installed", None);
+                        } else if let Some(v) = mine.and_then(|k| k.version.as_ref()).filter(|v| e.version <= **v) {
+                            // An update only when the listed version is newer than the one installed (ferros_kist `Version`'s order: more parts is a later stage, leading zeros mean nothing); one installed before versions (None) takes any listed one.
+                            let mut l = Line::new();
+                            l.s("installed ");
+                            let _ = ferros_kist::write_version(&mut l, f, &v.0);
+                            row(self, b, &mut y, note, grey(), l.as_str(), None);
                         } else {
                             let mut l = Line::new();
                             l.s(if mine.is_some() { "update, " } else { "install, " });

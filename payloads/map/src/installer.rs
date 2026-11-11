@@ -42,7 +42,8 @@ pub struct Row {
     pub developer: [u8; 32],
     pub option: [u8; 32],
     pub size: u64,
-    pub version: [u16; 3],
+    /// As its capsule's signed declaration writes it (leading zeros and all): shown and compared by its significant parts (ferros_kist `Version`, `write_version`).
+    pub version: ferros_kist::Version,
     pub name: String,
     pub about: String,
 }
@@ -53,6 +54,8 @@ pub struct Installer {
     pub here: bool,
     pub dir_state: u8,
     pub dir_checked: bool,
+    /// The installer's directory generation (op 0's last word): the rows are read again whenever it moves.
+    pub dir_gen: u32,
     pub dir: Vec<Row>,
     pub jobs: Vec<Job>,
 }
@@ -136,6 +139,11 @@ fn read_status(b: &[u8], into: &mut Installer) -> bool {
         j.who = String::from(core::str::from_utf8(&b[p + 1..p + 1 + n]).unwrap_or(""));
         p += 1 + n;
     }
+    // Last, the directory's generation (an installer from before sends none: it stays as it was).
+    // WHY: the bytes are the installer's; four must be there to read.
+    if p + 4 <= b.len() {
+        into.dir_gen = u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
+    }
     true
 }
 
@@ -155,17 +163,25 @@ fn read_directory(svc: u64) -> Option<Vec<Row>> {
         let (all, got) = (b[0] as usize, b[1] as usize);
         let mut p = 2;
         for _ in 0..got {
-            if p + 32 * 3 + 8 + 6 + 1 > b.len() {
+            // WHY (each length check here): the bytes are the installer's; a record cut short ends the read rather than indexing past the reply.
+            // The fixed head: capsule, developer, option, size, the version's part count.
+            if p + 32 * 3 + 8 + 1 > b.len() {
                 return None;
             }
             let r = &b[p..];
-            let v = |k: usize| u16::from_le_bytes([r[104 + 2 * k], r[105 + 2 * k]]);
-            let nl = r[110] as usize;
-            if p + 111 + nl + 1 > b.len() {
+            let parts = r[104] as usize;
+            // The parts (u64 LE each), then the name's length.
+            let v_end = 105 + (parts << 3);
+            if p + v_end + 1 > b.len() {
                 return None;
             }
-            let al = r[111 + nl] as usize;
-            if p + 112 + nl + al > b.len() {
+            let version = ferros_kist::Version((0..parts).map(|k| u64_at(r, 105 + (k << 3))).collect());
+            let nl = r[v_end] as usize;
+            if p + v_end + 1 + nl + 1 > b.len() {
+                return None;
+            }
+            let al = r[v_end + 1 + nl] as usize;
+            if p + v_end + 2 + nl + al > b.len() {
                 return None;
             }
             rows.push(Row {
@@ -173,11 +189,11 @@ fn read_directory(svc: u64) -> Option<Vec<Row>> {
                 developer: r[32..64].try_into().unwrap(),
                 option: r[64..96].try_into().unwrap(),
                 size: u64_at(r, 96),
-                version: [v(0), v(1), v(2)],
-                name: String::from(core::str::from_utf8(&r[111..111 + nl]).unwrap_or("")),
-                about: String::from(core::str::from_utf8(&r[112 + nl..112 + nl + al]).unwrap_or("")),
+                version,
+                name: String::from(core::str::from_utf8(&r[v_end + 1..v_end + 1 + nl]).unwrap_or("")),
+                about: String::from(core::str::from_utf8(&r[v_end + 2 + nl..v_end + 2 + nl + al]).unwrap_or("")),
             });
-            p += 112 + nl + al;
+            p += v_end + 2 + nl + al;
         }
         if got == 0 || rows.len() >= all {
             return Some(rows);
@@ -191,6 +207,8 @@ pub extern "C" fn watch(grants: u64) -> ! {
     let mut count = u32::MAX;
     let mut absent = freq() >> 6;
     let mut snap = Installer::default();
+    // The directory generation the rows were last read at.
+    let mut rows_gen: Option<u32> = None;
     let mut out = [0u8; 4096];
     loop {
         let mut m = [0u8; 5];
@@ -211,9 +229,11 @@ pub extern "C" fn watch(grants: u64) -> ! {
         }
         count = u32::from_le_bytes(out[..4].try_into().unwrap());
         snap.here = true;
-        if snap.dir_state == 2 && was != 2 {
+        // The rows read again when the directory was read afresh: on the way into "read", or when its generation moved (a read again between two doorbells, which once left the page the rows it had), or when the last read of them failed.
+        if snap.dir_state == 2 && (was != 2 || rows_gen != Some(snap.dir_gen)) {
             if let Some(rows) = read_directory(svc) {
                 snap.dir = rows;
+                rows_gen = Some(snap.dir_gen);
             }
         }
         with(|x| *x = Some(snap.clone()));

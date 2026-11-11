@@ -2,7 +2,7 @@
 //!
 //! - `kistcat build --key <secret> --out <dir> [--web <web/index.html>] [--signer-name NAME] ENTRY...` writes `<dir>/kists.vsf` (signed by the project key with every egg), `<dir>/index.html` (the page for kists.fgtw.org) and, with `--web`, the list on ferros.org between its markers, then prints the wrangler commands that publish them. It uploads nothing.
 //! - `kistcat build --unsigned ...` in place of `--key`: the directory with NO signature, while the project key is not chosen (owner, 2026-11-10: it waits for the FGTW kaitiakitanga). The device reads it unchecked and its Kists page says so; the page says so too.
-//! - An ENTRY is a local capsule, `--capsule <file> --version M.m.p --about TEXT [--icon PATH]`: read for its developer key, option, name, developer's name, blake3 and size, with every egg verified against the developer bundle it carries (or Photon's release bundle), as the device's installer checks it; listed at `/capsules/<blake3>.vsf` on kists.fgtw.org.
+//! - An ENTRY is a local capsule, `--capsule <file> --about TEXT [--icon PATH]`: read for its developer key, option, name, developer's name, version (its signed declaration's, `kistcat kist --version`), blake3 and size, with every egg verified against the developer bundle it carries (or Photon's release bundle), as the device's installer checks it; listed at `/capsules/<blake3>.vsf` on kists.fgtw.org.
 //! - `kistcat kist ...`: a kist signed by its developer's own key (below, `fn kist`).
 //! - Or a developer's manifest, `--manifest <http URL> --name NAME --option HEX --about TEXT [--platform P] [--arch A] [--icon PATH]`: fetched over plain HTTP at build time, every egg verified against the developer's pinned bundle, and its artefact P/A (ferros/arm64 by default) read for the capsule's blake3, size and version. The entry links the manifest rather than copying the artefact's address: the device fetches the manifest and resolves the artefact itself, and the blake3 recorded here is what it must match.
 //! - An entry that cannot be listed (a capsule signed before every-egg kists, a manifest with no ferros artefact yet) is skipped with a warning; a capsule file that is not there stops the build.
@@ -10,7 +10,8 @@
 //! - The key file's first 32 bytes are the Ed25519 seed (ferros.secret is the seed then the public key); nothing of it is printed, copied or written.
 
 mod devkey;
-use ferros_kist::directory::{self, Directory, Entry, Metrics, Source, Version};
+use ferros_kist::Version;
+use ferros_kist::directory::{self, Directory, Entry, Metrics, Source};
 use fgtw::pq::{FleetSigner, KeyBundle, SigningBundle};
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -31,7 +32,7 @@ fn fail(msg: impl std::fmt::Display) -> ! {
 }
 
 fn usage() -> ! {
-    eprintln!("usage:\n  kistcat build (--key <secret> [--signer-name NAME] | --unsigned) --out <dir> [--web <web/index.html>] ENTRY...\n    ENTRY: --capsule <file.vsf> --version M.m.p --about TEXT [--icon PATH]\n         | --manifest <http URL> --name NAME --option HEX64 --about TEXT [--platform P] [--arch A] [--icon PATH]\n  kistcat verify <kists.vsf> [--key <secret> [--signer-name NAME]]\n  kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 [--want RIGHT REASON]... [--record <public record .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf>\n  kistcat devkey new --secret <file> --label LABEL --name NAME [--contact C] [--web W] [--kind K] --record <file>\n  kistcat devkey show <record>");
+    eprintln!("usage:\n  kistcat build (--key <secret> [--signer-name NAME] | --unsigned) --out <dir> [--web <web/index.html>] ENTRY...\n    ENTRY: --capsule <file.vsf> --about TEXT [--icon PATH]\n         | --manifest <http URL> --name NAME --option HEX64 --about TEXT [--platform P] [--arch A] [--icon PATH]\n  kistcat verify <kists.vsf> [--key <secret> [--signer-name NAME]]\n  kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf>\n  kistcat devkey new --secret <file> --label LABEL --name NAME [--contact C] [--web W] [--kind K] --record <file>\n  kistcat devkey show <record>");
     exit(2)
 }
 
@@ -48,7 +49,7 @@ fn main() {
 
 /// One entry as the command line gives it.
 enum Spec {
-    Capsule { file: PathBuf, version: Option<Version>, about: Option<String>, icon: Option<String> },
+    Capsule { file: PathBuf, about: Option<String>, icon: Option<String> },
     Manifest { url: String, name: Option<String>, option: Option<[u8; 32]>, about: Option<String>, icon: Option<String>, platform: String, arch: String },
 }
 
@@ -75,7 +76,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "--web" => a.web = Some(val()?.into()),
             "--signer-name" => a.signer = Some(val()?),
             "--unsigned" => a.unsigned = true,
-            "--capsule" => a.specs.push(Spec::Capsule { file: val()?.into(), version: None, about: None, icon: None }),
+            "--capsule" => a.specs.push(Spec::Capsule { file: val()?.into(), about: None, icon: None }),
             "--manifest" => {
                 let url = val()?;
                 if !url.starts_with("http://") {
@@ -83,10 +84,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 }
                 a.specs.push(Spec::Manifest { url, name: None, option: None, about: None, icon: None, platform: PLATFORM.into(), arch: ARCH.into() });
             }
-            "--version" => match a.specs.last_mut() {
-                Some(Spec::Capsule { version, .. }) => *version = Some(parse_version(&val()?)?),
-                _ => return Err("--version follows a --capsule (a manifest's version is its artefact's)".into()),
-            },
+            "--version" => return Err("--version: a capsule's version is in its signed declaration since 2026-11-10 (kistcat kist --version), and a manifest's is its artefact's".into()),
             "--about" => match a.specs.last_mut() {
                 Some(Spec::Capsule { about, .. } | Spec::Manifest { about, .. }) => *about = Some(val()?),
                 None => return Err("--about follows its --capsule or --manifest".into()),
@@ -114,13 +112,9 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     Ok(a)
 }
 
-/// `M.m.p`, as a person types a version on the command line.
+/// A version as a person types it on the command line: parts of decimal digits, any number of them, separated by dots (`0.1.0`).
 fn parse_version(s: &str) -> Result<Version, String> {
-    let n: Vec<u64> = s.split('.').map(|p| p.parse::<u64>()).collect::<Result<_, _>>().map_err(|_| format!("{s}: a version is major.minor.patch"))?;
-    match n[..] {
-        [major, minor, patch] => Ok(Version { major, minor, patch }),
-        _ => Err(format!("{s}: a version is major.minor.patch")),
-    }
+    Version::parse(s).ok_or_else(|| format!("{s}: a version is parts of decimal digits separated by dots, as many as you use (0.1.0)"))
 }
 
 /// 64 hex digits, as the kist scripts give an option.
@@ -160,14 +154,15 @@ fn sign(kists: &[Entry], made: i64, key: &SigningBundle) -> Result<Vec<u8>, Stri
     fgtw::release::sign_release(unsigned, key)
 }
 
-/// A local capsule as an entry: every egg verified as the device's installer verifies it (ferros_kist `capsule::admit` with a person's list that pins nothing: against the developer bundle the capsule carries, or Photon's release bundle), its identity and name from its own declaration. A capsule the device would refuse is not listed.
-fn capsule_entry(c: &[u8], version: Version, about: String, icon: Option<String>) -> Result<Entry, String> {
+/// A local capsule as an entry: every egg verified as the device's installer verifies it (ferros_kist `capsule::admit` with a person's list that pins nothing: against the developer bundle the capsule carries, or Photon's release bundle), its identity, name and version from its own declaration. A capsule the device would refuse, or one without a version, is not listed.
+fn capsule_entry(c: &[u8], about: String, icon: Option<String>) -> Result<Entry, String> {
     let (signer, eggs, file_hash) = vsf::verification::header_eggs(c).map_err(|e| format!("not signed with eggs ({e}); a kist carries every scheme's signature since 2026-11-10, re-sign it"))?;
     if fgtw::pq::egg_mask(&eggs) != fgtw::release::RELEASE_MASK {
         return Err("signed with only some schemes; a kist carries every egg".into());
     }
     ferros_kist::capsule::admit(c, &signer, &eggs, &file_hash, &ferros_kist::Kists::default()).map_err(|r| format!("{}; re-sign it with kistcat kist", ferros_kist::capsule::refusal_words(&r)))?;
     let (developer, option) = ferros_kist::identity(c)?;
+    let version = ferros_kist::version_of(c)?.ok_or("its declaration has no version; re-sign it with kistcat kist --version")?;
     let capsule = *blake3::hash(c).as_bytes();
     Ok(Entry {
         name: ferros_kist::declaration(c)?.name,
@@ -220,7 +215,8 @@ fn artefact(doc: &[u8], platform: &str, arch: &str) -> Result<Option<Artefact>, 
             capsule,
             size: num("size").ok_or("an artefact without its size")?,
             url,
-            version: Version { major: num("major").unwrap_or(0), minor: num("minor").ok_or("an artefact without its version")?, patch: num("patch").unwrap_or(0) },
+            // Photon's three parts as a version's list (a directory entry has no major, minor or patch of its own).
+            version: Version(vec![num("major").unwrap_or(0), num("minor").ok_or("an artefact without its version")?, num("patch").unwrap_or(0)]),
         }));
     }
     Ok(None)
@@ -280,10 +276,10 @@ fn build(args: &[String]) {
     let mut skipped = 0usize;
     for spec in a.specs {
         match spec {
-            Spec::Capsule { file, version, about, icon } => {
-                let (Some(version), Some(about)) = (version, about) else { fail(format!("{}: needs its --version and --about", file.display())) };
+            Spec::Capsule { file, about, icon } => {
+                let Some(about) = about else { fail(format!("{}: needs its --about", file.display())) };
                 let c = std::fs::read(&file).unwrap_or_else(|e| fail(format!("{}: {e}", file.display())));
-                match capsule_entry(&c, version, about, icon) {
+                match capsule_entry(&c, about, icon) {
                     Ok(e) => {
                         if let Source::Path(p) = &e.source {
                             uploads.push((p.trim_start_matches('/').to_string(), std::fs::canonicalize(&file).unwrap_or(file)));
@@ -377,8 +373,12 @@ fn day(made: i64) -> String {
     vsf::EagleTime::from_oscillations(made).to_datetime().format("%Y-%m-%d").to_string()
 }
 
+/// A version on the page: hex, as the page's other numbers (G#), by the device's rule (ferros_kist `write_version`): leading zero parts left out, so 0.1.0 reads G#1.0.
 fn version_text(v: &Version) -> String {
-    format!("G#{:X}.{:X}.{:X}", v.major, v.minor, v.patch)
+    let mut s = String::from("G#");
+    let hex = ferros_kist::tatau::Fmt::new(ferros_kist::tatau::Base::Hex, ferros_kist::tatau::Style::Words);
+    ferros_kist::write_version(&mut s, hex, &v.0).expect("a String takes any text");
+    s
 }
 
 fn developer_text(e: &Entry) -> String {
@@ -714,7 +714,7 @@ mod tests {
         let image = [7u8; 64];
         let code = ferros_kist::capsule::Code { image: &image, masked: true, text: Some(64), fixed: None, bti: false, exact: false };
         if eggs {
-            return fgtw::release::sign_release(ferros_kist::capsule::unsigned(&d, [5; 32], None, &key.public(), &code, 3).unwrap(), key).unwrap();
+            return fgtw::release::sign_release(ferros_kist::capsule::unsigned(&d, [5; 32], Some(&version()), None, &key.public(), &code, 3).unwrap(), key).unwrap();
         }
         let (k, _) = ferros_kist::declaration_sections(&d, Some([5; 32]));
         let pubkey = key.keypair().public.to_bytes();
@@ -725,14 +725,15 @@ mod tests {
     }
 
     fn version() -> Version {
-        Version { major: 0, minor: 1, patch: 0 }
+        Version(vec![0, 1, 0])
     }
 
     #[test]
     fn build_then_verify_round_trips_and_a_changed_byte_fails() {
         let c = capsule(&developer(), "Clock", true);
-        let e = capsule_entry(&c, version(), "the time, drawn as rings".into(), None).unwrap();
+        let e = capsule_entry(&c, "the time, drawn as rings".into(), None).unwrap();
         assert_eq!(e.name, "Clock");
+        assert_eq!(e.version.0, vec![0, 1, 0], "the version from its own signed declaration, as written");
         assert_eq!(e.option, [5; 32]);
         assert_eq!(e.capsule, *blake3::hash(&c).as_bytes());
         let project = SigningBundle::developer(&[1; 32], SIGNER_NAME);
@@ -750,9 +751,22 @@ mod tests {
     }
 
     #[test]
+    fn a_capsule_without_a_version_is_not_listed() {
+        let key = developer();
+        let d = ferros_kist::Decl { name: "Clock".into(), wants: vec![] };
+        let code = ferros_kist::capsule::Code { image: &[7u8; 64], masked: true, text: Some(64), fixed: None, bti: false, exact: false };
+        let c = fgtw::release::sign_release(ferros_kist::capsule::unsigned(&d, [5; 32], None, None, &key.public(), &code, 3).unwrap(), &key).unwrap();
+        assert!(capsule_entry(&c, "x".into(), None).unwrap_err().contains("no version"));
+        // The build's own `--version` is gone: the capsule carries it.
+        assert!(parse_args(&["--capsule".into(), "c.vsf".into(), "--version".into(), "0.1.0".into()]).is_err());
+        assert_eq!(parse_version("0.1.0.7").unwrap().0, vec![0, 1, 0, 7]);
+        assert!(parse_version("1..2").is_err());
+    }
+
+    #[test]
     fn a_capsule_with_one_egg_is_not_listed() {
         let c = capsule(&developer(), "Clock", false);
-        assert!(capsule_entry(&c, version(), "x".into(), None).is_err());
+        assert!(capsule_entry(&c, "x".into(), None).is_err());
     }
 
     /// A manifest as Photon's tool writes one (photon-manifest): a section per artefact, signed with every egg of the release-shaped key.
@@ -780,7 +794,7 @@ mod tests {
         assert!(manifest_entry(&without, url, "Photon".into(), [8; 32], "x".into(), None, PLATFORM, ARCH, pin).unwrap().is_none());
         let with = manifest(&key, &[("Android", "arm64", "https://example.org/a.apk"), ("ferros", "arm64", "http://example.org/photon.vsf")]);
         let e = manifest_entry(&with, url, "Photon".into(), [8; 32], "x".into(), None, PLATFORM, ARCH, pin).unwrap().unwrap();
-        assert_eq!((e.capsule, e.size, e.version), ([3; 32], 4096, Version { major: 0, minor: 150, patch: 0 }));
+        assert_eq!((e.capsule, e.size, e.version), ([3; 32], 4096, Version(vec![0, 150, 0])));
         assert_eq!(e.source, Source::Manifest { url: url.into(), platform: PLATFORM.into(), arch: ARCH.into() });
         // An https-only artefact: the device could not fetch it.
         let tls = manifest(&key, &[("ferros", "arm64", "https://example.org/photon.vsf")]);
@@ -804,10 +818,10 @@ mod tests {
 
     #[test]
     fn the_page_lists_searches_and_escapes() {
-        let e = capsule_entry(&capsule(&developer(), "Clock", true), version(), "rings <script>".into(), None).unwrap();
+        let e = capsule_entry(&capsule(&developer(), "Clock", true), "rings <script>".into(), None).unwrap();
         let d = Directory { made: 0, signer: Some([0; 32]), kists: vec![e] };
         let p = page(&d);
-        assert!(p.contains("<td>Clock</td>") && p.contains("G#0.1.0") && p.contains("rings &lt;script&gt;"));
+        assert!(p.contains("<td>Clock</td>") && p.contains("G#1.0<") && !p.contains("G#0.1.0") && p.contains("rings &lt;script&gt;"));
         assert!(p.contains("<tr><td>Kists listed</td><td>G#1</td></tr>") && p.contains("id=\"q\""));
         assert!(!fragment(&d).contains("<script"), "ferros.org runs no script");
         let empty = page(&Directory { made: 0, signer: None, kists: vec![] });
@@ -821,7 +835,7 @@ mod tests {
     }
 }
 
-/// `kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 [--want RIGHT REASON]... [--record <public record .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf>`: a kist signed by its developer's own key (owner, 2026-11-10: trust on first install).
+/// `kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf>`: a kist signed by its developer's own key (owner, 2026-11-10: trust on first install).
 /// - The key is the developer's secret (`devkey new`: section `developer_key` { label a, seed kge }); the bundle is derived from it under its label, used here and dropped, and nothing of it is printed or copied.
 /// - The code is a sandboxed image from tools/ferros-masked-build.sh (its flat .bin, and its text length: the .textlen file beside it), as the bridge's `capsule --masked --text-len` takes them; the network installer refuses native code.
 /// - `--record`: the developer's public record (`devkey new --record`), checked with every egg and that it names this key; its name goes into the declaration as `developer`, which the directory lists and the person's pin keeps.
@@ -832,6 +846,7 @@ fn kist(args: &[String]) {
     let mut text: Option<usize> = None;
     let mut name: Option<String> = None;
     let mut option: Option<[u8; 32]> = None;
+    let mut version: Option<Version> = None;
     let mut record: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut fixed: Option<u32> = None;
@@ -846,6 +861,7 @@ fn kist(args: &[String]) {
             "--text-len" => text = Some(val().trim().parse().unwrap_or_else(|_| fail("--text-len takes the image's instruction bytes"))),
             "--name" => name = Some(val()),
             "--option" => option = Some(parse_hex32(&val()).unwrap_or_else(|e| fail(e))),
+            "--version" => version = Some(parse_version(&val()).unwrap_or_else(|e| fail(e))),
             "--record" => record = Some(val().into()),
             "--out" => out = Some(val().into()),
             "--fixed" => fixed = Some(val().parse().unwrap_or_else(|_| fail("--fixed takes K, the arc's size 2^K"))),
@@ -863,8 +879,8 @@ fn kist(args: &[String]) {
             other => fail(format!("unknown argument {other}")),
         }
     }
-    let (Some(key_path), Some(image_path), Some(text), Some(name), Some(option), Some(out)) = (key, image, text, name, option, out) else {
-        fail("kist needs --key, --masked, --text-len, --name, --option and --out")
+    let (Some(key_path), Some(image_path), Some(text), Some(name), Some(option), Some(version), Some(out)) = (key, image, text, name, option, version, out) else {
+        fail("kist needs --key, --masked, --text-len, --name, --option, --version and --out")
     };
     // The text the no_std installer reads is ASCII (`a`): a name or reason it could not read stops here.
     let ascii = |what: &str, s: &str| {
@@ -897,13 +913,13 @@ fn kist(args: &[String]) {
     }
     let decl = ferros_kist::Decl { name, wants };
     let c = ferros_kist::capsule::Code { image: &code, masked: true, text: Some(text), fixed, bti, exact };
-    let unsigned = ferros_kist::capsule::unsigned(&decl, option, developer.as_deref(), &public, &c, vsf::eagle_time_oscillations()).unwrap_or_else(|e| fail(e));
+    let unsigned = ferros_kist::capsule::unsigned(&decl, option, Some(&version), developer.as_deref(), &public, &c, vsf::eagle_time_oscillations()).unwrap_or_else(|e| fail(e));
     let capsule = fgtw::release::sign_release(unsigned, &signer).unwrap_or_else(|e| fail(e));
     drop(signer);
     // Checked as the device checks it, before it is written: every egg against the bundle it carries, with nothing pinned yet.
     let (s, eggs, file_hash) = vsf::verification::header_eggs(&capsule).unwrap_or_else(|e| fail(format!("the capsule just signed does not read: {e}")));
     let admitted = ferros_kist::capsule::admit(&capsule, &s, &eggs, &file_hash, &ferros_kist::Kists::default()).unwrap_or_else(|r| fail(format!("the capsule just signed is refused: {}", ferros_kist::capsule::refusal_words(&r))));
-    if admitted.bundle != Some(public.commit()) || ferros_kist::declaration(&capsule).map(|d| d != decl).unwrap_or(true) {
+    if admitted.bundle != Some(public.commit()) || ferros_kist::declaration(&capsule).map(|d| d != decl).unwrap_or(true) || ferros_kist::version_of(&capsule).ok().flatten().map(|v| v.0) != Some(version.0.clone()) {
         fail("the capsule just signed does not read back as built");
     }
     if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -911,8 +927,9 @@ fn kist(args: &[String]) {
     }
     std::fs::write(&out, &capsule).unwrap_or_else(|e| fail(format!("{}: {e}", out.display())));
     println!(
-        "kist {} by {} (key {}, bundle {}): G#{:X} bytes, blake3 {} -> {}",
+        "kist {} {} by {} (key {}, bundle {}): G#{:X} bytes, blake3 {} -> {}",
         decl.name,
+        version_text(&version),
         developer.as_deref().unwrap_or("its key"),
         short(&public.ed25519()),
         short(&public.commit()),
