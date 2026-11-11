@@ -1,8 +1,9 @@
-//! The departure machine's state as this service keeps it in the vault (depart.rs), and the form kept before the machine.
+//! The departure and add machines' state as this service keeps it in the vault (depart.rs, add.rs), and the departure's form kept before its machine.
 //! Pure: no syscall, no clock, so the conversion of a departure under way is tested on the host (the tests below).
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use fgtw::flow::add::Add;
 use fgtw::flow::depart::Depart;
 
 /// A kept document, read.
@@ -41,6 +42,35 @@ pub fn read(doc: &[u8], hp: &[u8; 32], me: &[u8; 32]) -> Kept {
     match Depart::from_section(&sec, *hp, REPORTS_SENT) {
         Ok(m) => Kept::Machine(m),
         Err(e) => Kept::Unreadable(e),
+    }
+}
+
+/// A kept add, read.
+pub enum KeptAdd {
+    /// The machine's state: an add under way, or none.
+    Machine(Add),
+    /// Another device's: not taken up.
+    Foreign,
+    /// It does not verify or does not read.
+    Unreadable(String),
+}
+
+/// A kept add read for the roots in hand (`hp` and `seed`, which the machine's state does not hold: they are roots) and this device (`me`).
+pub fn read_add(doc: &[u8], hp: &[u8; 32], seed: &[u8; 32], me: &[u8; 32]) -> KeptAdd {
+    let (header, end) = match vsf::verification::read_verified(doc, None) {
+        Ok(x) => x,
+        Err(e) => return KeptAdd::Unreadable(alloc::format!("{e}")),
+    };
+    let sec = match header.primary_section(doc, end) {
+        Ok(s) => s,
+        Err(e) => return KeptAdd::Unreadable(alloc::format!("{e}")),
+    };
+    if sec.get_field("me").and_then(|f| f.values.first()).and_then(|v| v.as_bytes()) != Some(&me[..]) {
+        return KeptAdd::Foreign;
+    }
+    match Add::from_section(&sec, *hp, *seed, REPORTS_SENT) {
+        Ok(m) => KeptAdd::Machine(m),
+        Err(e) => KeptAdd::Unreadable(e),
     }
 }
 
@@ -130,5 +160,64 @@ mod tests {
         section.add_field("rq", vsf::VsfType::v(b'b', alloc::vec![1, 2, 3]));
         let doc = vsf::VsfBuilder::new().creation_time_oscillations(T).add_section_direct(section).build().unwrap();
         assert!(matches!(read(&doc, &HP, &[3; 32]), Kept::Stale));
+    }
+
+    const SEED: [u8; 32] = [0x33; 32];
+
+    /// A sponsor (`me`) in a fleet with one other member, holding the fleet key, its page shown, with a joiner's add bound and growing: the state a restart cuts short.
+    fn growing() -> (Add, [u8; 32], [u8; 32], [u8; 32]) {
+        use fgtw::keys::Keypair;
+        let me = Keypair::from_seed(&[1; 32]).public.to_bytes();
+        let other = Keypair::from_seed(&[2; 32]).public.to_bytes();
+        let j = Keypair::from_seed(&[3; 32]);
+        let dev = j.public.to_bytes();
+        let mut m = Add::new(HP, SEED, me, REPORTS_SENT);
+        m.step(Event::Members { members: &[me, other], locked: &[] }, T);
+        m.step(Event::FleetKey { held: true }, T);
+        m.step(Event::Page { shown: true }, T);
+        let req = fgtw::protocol::bind_request(&j, &SEED, &HP, T, &[0x44; 32]);
+        let frame = fgtw::protocol::bind_req(&req, &HP, &j, T).unwrap();
+        m.step(Event::Frame { bytes: &frame, from: None }, T);
+        // The tag's secret adds at once.
+        let s = m.step(Event::NfcRead { secret: [0x44; 32] }, T);
+        assert!(s.actions.iter().any(|a| matches!(a, Action::Job(fgtw::flow::Job::Bind { .. }))));
+        m.step(Event::Bound { device: dev, result: Ok(()) }, T);
+        (m, me, other, dev)
+    }
+
+    #[test]
+    fn an_add_under_way_is_kept_without_roots_and_only_for_this_device() {
+        let (m, me, _, _) = growing();
+        let doc = m.to_vsf(T).unwrap();
+        assert!(!doc.windows(32).any(|w| w == HP || w == SEED), "no root in the kept add");
+        assert!(matches!(read_add(&doc, &HP, &SEED, &me), KeptAdd::Machine(_)));
+        assert!(matches!(read_add(&doc, &HP, &SEED, &[9; 32]), KeptAdd::Foreign));
+        assert!(matches!(read_add(&[1, 2, 3], &HP, &SEED, &me), KeptAdd::Unreadable(_)));
+    }
+
+    /// Why add.rs resumes a kept add only after the first fold: resumed before the members are known, the machine grows the fan-out to the newcomer alone; resumed after, to every live member and the newcomer.
+    #[test]
+    fn a_kept_grow_resumes_to_the_members_only_once_they_are_told() {
+        let grow_to = |m: &mut Add| -> Vec<[u8; 32]> {
+            m.resume()
+                .actions
+                .into_iter()
+                .find_map(|a| match a {
+                    Action::Job(fgtw::flow::Job::Grow { members, .. }) => Some(members),
+                    _ => None,
+                })
+                .expect("a grow asked for")
+        };
+        let (m, me, other, dev) = growing();
+        let doc = m.to_vsf(T).unwrap();
+        let KeptAdd::Machine(mut early) = read_add(&doc, &HP, &SEED, &me) else { panic!("the kept add did not read") };
+        assert_eq!(grow_to(&mut early), alloc::vec![dev]);
+        let KeptAdd::Machine(mut told) = read_add(&doc, &HP, &SEED, &me) else { panic!("the kept add did not read") };
+        told.step(Event::Members { members: &[me, other, dev], locked: &[] }, T);
+        let mut to = grow_to(&mut told);
+        to.sort();
+        let mut want = alloc::vec![me, other, dev];
+        want.sort();
+        assert_eq!(to, want);
     }
 }

@@ -296,7 +296,7 @@ struct Fleet {
     confirm: bool,
     /// What the last departure request answered (fgtw `leave`: 0 started, 1 not a member, 2 a bad intent, 3 the request did not build).
     leave_result: Option<u8>,
-    /// Adding a device (fgtw op 9): the flow's phase (payloads/fgtw ADD_*: 0 closed, 1 open, 2 adding, 3 a device selected and Add waiting, 4 handing over the key, 5 added, 6 failed), the devices asking to join (the key's first 8 bytes, flags: bit 0 its beacon heard, bit 1 its request heard on this network, bit 2 the one just bound; its name), and the service's note.
+    /// Adding a device (fgtw op 9, payloads/fgtw addview.rs): the flow's phase (0 closed, 1 open, 2 adding, 3 a device selected and Yes waiting, 4 handing over the key, 5 added, 6 failed or refused), the devices asking to join (the key's first 8 bytes, flags: bit 0 its beacon heard, bit 1 its request heard on this network, bit 2 the one being added, bit 3 offered as a pick now, bit 4 another identity's; its name), and the service's note.
     add: u8,
     cand_key: [[u8; 8]; 8],
     cand_flags: [u8; 8],
@@ -305,7 +305,7 @@ struct Fleet {
     cands: usize,
     add_note: [u8; 64],
     add_note_n: usize,
-    /// The device selected (phase 3, fgtw ADD_SELECTED): its name and its masked words, the same it shows.
+    /// The device selected (phase 3): its name and its masked words, the same it shows.
     sel_name: [u8; NAME_BYTES],
     sel_name_n: usize,
     sel_words: [u8; 512],
@@ -426,7 +426,7 @@ impl Fleet {
                 }
                 at += 1 + a[at] as usize;
             }
-            // The selected device's name and words (fgtw `adding_reply`), as far as the reply and the fields hold them.
+            // The selected device's name and words (fgtw op 9, addview.rs `reply`), as far as the reply and the fields hold them.
             self.sel_name_n = 0;
             self.sel_words_n = 0;
             if at < got {
@@ -2559,13 +2559,13 @@ impl Map {
                             _ => FleetMsg::AddingFailed,
                         };
                         row(self, b, &mut y, small, white(), fleet(phase).as_str(), None);
-                        // The identity service's own note on the flow, in its words (payloads/fgtw `adding_reply`).
+                        // The identity service's own note on the flow, in its words (payloads/fgtw add.rs, op 9).
                         if f.add_note_n > 0 {
                             b.text(cx, y - uu(1, 1), note as u16, dim(), 1, core::str::from_utf8(&f.add_note[..f.add_note_n]).unwrap_or(""));
                             y += uu(2, 1);
                         }
                         for i in 0..f.cands {
-                            // A device heard nearby (its request on this network, or its beacon) is a tap to pick; one only the registry knows is matched by its words.
+                            // A device the add machine offers as a pick (flag bit 3: heard nearby, and over Bluetooth only while more than one device asks) is a tap to pick; one only the registry knows is matched by its words.
                             let nearby = f.cand_flags[i] & 3 != 0;
                             let name = named(&f.cand_name[i], f.cand_name_n[i] as usize, FleetMsg::ADevice);
                             let l = fleet(if f.cand_flags[i] & 4 != 0 {
@@ -2575,7 +2575,7 @@ impl Map {
                             } else {
                                 FleetMsg::CandNotNearby(name.as_str())
                             });
-                            let pick = nearby && f.add == 1;
+                            let pick = f.cand_flags[i] & 8 != 0 && f.add == 1;
                             row(self, b, &mut y, small, if pick { white() } else { grey() }, l.as_str(), pick.then_some(Choice::FleetPick(i as u8)));
                         }
                         if f.add == 1 {
@@ -2585,7 +2585,7 @@ impl Map {
                             button(self, b, &mut y, fleet(FleetMsg::TypeItsWordsPill).as_str(), false, Some(Choice::FleetWords));
                             notes(b, &mut y, fleet(FleetMsg::HoldTogether).as_str());
                         }
-                        // Selected (fgtw ADD_SELECTED, owner 2026-11-10: "I need a distinct green add, and note to press back otherwise"): the device and its words, the same it shows, Add in VSF RGB primary green, and Back with nothing to undo.
+                        // Selected (op 9 phase 3, owner 2026-11-10: "I need a distinct green add, and note to press back otherwise"): the device and its words, the same it shows, Add in VSF RGB primary green, and Back with nothing to undo.
                         if f.add == 3 {
                             let name = named(&f.sel_name, f.sel_name_n, FleetMsg::TheDevice);
                             row(self, b, &mut y, small, white(), fleet(FleetMsg::SelectedDevice(name.as_str())).as_str(), None);
