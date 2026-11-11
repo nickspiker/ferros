@@ -9,7 +9,7 @@ Built 2026-11-11 (branch `quick-settings`), not yet run on a device.
 - NFC is down the right side on both boards now (display `corner_layout`), so the top row is clock, battery, GPS on the left and cellular, WiFi, Bluetooth on the right, and the spot by the camera is open on both.
 - **The doorway** is the disc about the camera hole (`ferros_sys::cutout_hole`) out to the nearest top console circle, outside the app's circle (display quick.rs `doorway`; its radius is logged once per size as `display: quick row … doorway N`). Nothing in it is a fixed pixel: the hole is measured glass, the corners are solved from the glass.
 - A still tap in the doorway opens the row, or shuts it.
-- A drag down from the doorway, from the top's other ground (the clock, battery and USB circles and the air between the corners) or from a radio circle pulls it.
+- A drag down that starts in the doorway pulls it; nothing else does (owner, 2026-11-11: "the second console row should only show if drug down from the area in the invisible camera circle"). Until then a drag down from anywhere on the top, a radio circle included, pulled it.
 
 ## Where the row sits: circle fitting inside out
 
@@ -59,16 +59,20 @@ The first cut grew the row out of the point under the camera, every circle drawn
 
 Each circle's word is ferros_lang's, in the person's language, a word a line. A circle is lit while what it switches is on; a finger on it lifts it to the live ink's light.
 
-## Long press on a radio circle
+## The dash's zones, and each circle's page (2026-11-11)
 
-A finger that rests on a radio circle (within the slop) for 64 shown frames (about half a second at 120 Hz) opens that radio's page in settings; a whole ring is drawn round the circle once as the press starts and goes as it ends (until 2026-11-11 it filled frame by frame, which drew the radio's circle again every frame). Its lift then switches nothing. A tap still switches the radio; a drag down from it pulls the row. This replaces the drag toward the centre (2026-11-07), which on the top corners now pulls the row.
+Owner, on the Pro: "the top bar, dragging a console circle to center no longer works. the second console row should only show if drug down from the area in the invisible camera circle. Also, ideally we make each zone in the console always map to a circle, USB, clock, battery, etc. (might have to build a battery page) and then closest to circle wins if it's in the dash area."
 
-This is a hold measured in shown frames, the one place a gesture waits on frames rather than being told by movement: the owner chose it on the proposal ("Long press on a radio circle opens its Settings page"). `LONG_PRESS` in map quick.rs is the one knob.
+- **Every pixel of the dash is a circle's.** The top's chrome rows outside the app's circle are partitioned by the nearest circle's rim: a pixel belongs to the circle with the least |p − c| − r (display main.rs `dash_row`, built once per screen size, kept as runs per row; the hit map takes them, hit.rs `bars_row`). By the rim, not the centre: "closest to circle" is the distance to what the eye sees, a big circle (the clock) keeps air round it in proportion to its size, and inside any circle its own distance is negative, so a touch on a circle is always that circle's. The doorway's disc is claimed first. Ids (op 41): 0-4 the radios, 5 USB, 13 the clock, 14 the battery.
+- **Drag toward the centre** (past a twelfth of the screen's harmonic span, as the helm's): that circle's page: the radios' and USB's link pages, GPS its page, the clock its page, the battery its page (new: charge, whether it charges, voltage, current, power, temperature, each in the person's base, from the gauge's facts; the gauge's health is not read by the kernel yet). Restored as it was before the quick row took that drag.
+- **Tap**: a radio switches on or off (preference 15), as before; USB, the clock and the battery open their page.
+- **No long press.** It went with drag-to-centre back (it was a hold measured in frames, the one gesture that waited on time; the press ring with it).
+- **The quick row** opens only from the doorway; a drag down anywhere else on the top does nothing to it.
 
 ## Who does what
 
 - **Display** (payloads/display quick.rs): the geometry (`layout`, `doorway_disc`), the sprites (`init`, `render`, `update`) and their composite (`compose`, from `bar_decode`), op 56 (the map's state of the row: the offset in a word, the looks in two more, the console's worker nudged; the reply the slide's length), the ids op 41 reads from the hit map (written at the bars' compose step, hit.rs `bars_row`: 32 + k while the row stands open, its centre and radius from `layout`; 10 the doorway, `doorway_disc`; 11 the top's other ground; 12 behind the row, everything inside the app's circle while any of it shows, so op 27 gives an app no point there), and the screencap.
-- **Map** (payloads/map quick.rs): the finger, the offset, its halving, the rings' turning, the long press, every action, op 56 sent whenever anything in it moved. Touches reach the map first for the system's places, with an app in front too, as the corners' always have.
+- **Map** (payloads/map quick.rs): the finger, the offset, its halving, the rings' turning every action, op 56 sent whenever anything in it moved. Touches reach the map first for the system's places, with an app in front too, as the corners' always have.
 - **Kernel**: preferences 39 (sound), 40 (do not disturb, the identity's, taken from the process named fgtw alone) and 41 (radios before), kept in the device document; and the torch's send right handed to whoever it hands Settings (the map's slot 9), since init's grants page is full.
 - **fgtw** (payloads/fgtw space.rs): op 24, the person's do not disturb into the space and to the kernel; ferros_space kind `DND`.
 

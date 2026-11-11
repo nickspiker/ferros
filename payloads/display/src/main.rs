@@ -30,7 +30,7 @@
 //! - 49 `radio` and 50 `check [cx i16][cy i16][px u16][mark u16][stroke u16 Q8][state u8][stroke colour][fill][ink][tick][utf8 label]`: a radio button or a checkbox with its label, centred together (COMPOSITOR.md "Controls").
 //! - 22 `app [x u16][y u16][w u16][h u16]`: the app in front's frame, its 16-bit pixels in the `app-surface` region (R, G, B in bits 0-15, 16-31, 32-47: working values, gamma 2, white = Q14; bit 48 = no dither), published at full precision; 23 `app done`: the screen is the map's again. Op 5's reply carries whether an app is in front (byte 12).
 //! - 21 `ramps [column u8]`: the present stage's test screen, or one column of it alone on black between two thin white lines (dithered bands: our 4×4 to 8 bits, 12 effective; undithered: the 8-bit truncation), straight from 16-bit working values (see `ramps`); status 3 when the pipe is not in 10 bits.
-//! - 56 `quick [offset i32][flags u8][torch level u8][held u8][press radio u8][brightness ring u16 Q16][torch ring u16 Q16][unused u16]`: the quick row's state from the map (quick.rs `set`, docs/QUICK.md): its slide offset in whole pixels and its circles' looks, composed by the console's worker; answered at once with [0][the slide's length u16]. Op 41 answers the row's circles (32 + k, then x, y, r u16) while it is open, its doorway (10), the top's other ground (11) and behind it (12).
+//! - 56 `quick [offset i32][flags u8][torch level u8][held u8][unused u8][brightness ring u16 Q16][torch ring u16 Q16][unused u16]`: the quick row's state from the map (quick.rs `set`, docs/QUICK.md): its slide offset in whole pixels and its circles' looks, composed by the console's worker; answered at once with [0][the slide's length u16]. Op 41 answers the row's circles (32 + k, then x, y, r u16) while it is open, its doorway (10), the top's other ground (11) and behind it (12).
 //! - 27 `whose point` and 41 `what of the system's` read the hit map (hit.rs: a u16 a pixel, the owner the compose wrote there, front to back); 58 `hit view [0 off, 1 on, 2 toggle, 3 ask]` → [0][on]: the map shown in the fourth temporal phase, a new palette each redraw (development builds; status 1 on a release build).
 //! - 24 `frame wait`: returns once the panel's next frame has started, or after a hundred-and-twentieth of a second when no frame is in flight (a command-mode panel starts a frame only when one is armed); the reply is the frame-start count, u32. A client that draws once per return is locked to the panel's refresh: it reads its input right after a frame starts and its update is ready for the next one (the map, while a finger is down).
 //! The scene is retained here so a frame costs the client three numbers rather than one call per circle: nothing on the map ever moves, so between scene changes only the camera does.
@@ -4151,6 +4151,83 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
     (out, n)
 }
 
+/// The dash's zones (owner, 2026-11-11: "ideally we make each zone in the console always map to a circle, USB, clock, battery, etc. ... and then closest to circle wins if it's in the dash area"): every pixel of the top's chrome rows belongs to the top console circle whose rim is nearest, the distance to a circle being |p − c| − r (negative inside it). The rim, not the centre: "closest to circle" is the distance to what the eye sees, and by the rim a big circle (the clock) keeps the air round it in proportion to its size, where by the centre a small neighbour's zone would reach into the big one's own disc; and inside any circle its own distance is negative, so a touch on a circle is always that circle's (the circles never overlap). The zones' borders are hyperbolas between each pair (the additively weighted Voronoi diagram); found per pixel once per screen size and kept as runs per row (`DASH`, at most `DASH_RUNS` a row), the console's ids (op 41): 0-4 the radios, 5 USB, 13 the clock, 14 the battery. The hit map takes them from here (hit.rs `bars_row`), the doorway's disc claimed first.
+const DASH_RUNS: usize = 1 << 4;
+/// The table, fixed in size so the worker never allocates it from its arena (reset each pass): chrome rows up to `DASH_ROWS` (husky 288, akita 239).
+const DASH_ROWS: usize = 1 << 9;
+static mut DASH: [[(u16, u16, u16); DASH_RUNS]; DASH_ROWS] = [[(0, 0, 0); DASH_RUNS]; DASH_ROWS];
+static mut DASH_FOR: (usize, usize) = (0, 0);
+
+/// A top console circle's id in the hit map (op 41's answer); None for one that is nobody's (spares).
+fn dash_id(what: Corner) -> Option<u16> {
+    Some(match what {
+        Corner::Cellular => 0,
+        Corner::Wifi => 1,
+        Corner::Bluetooth => 2,
+        Corner::Nfc => 3,
+        Corner::Gps => 4,
+        Corner::Usb => 5,
+        Corner::Clock => 13,
+        Corner::Battery => 14,
+        _ => return None,
+    })
+}
+
+/// Row `y` of the dash (a chrome row at the top): its runs (from, to, id), left to right over the whole width; empty past the chrome rows. Built whole at the first call for a size (the console's worker, at its first decode).
+fn dash_row(y: usize, width: usize, height: usize) -> &'static [(u16, u16, u16)] {
+    let top = unsafe { CHROME_TOP };
+    if y >= top {
+        return &[];
+    }
+    unsafe {
+        if DASH_FOR != (width, height) {
+            let (circles, n) = corner_layout(width, height);
+            let tops: alloc::vec::Vec<(f32, f32, f32, u16)> = circles[..n].iter().filter(|c| c.1 < height as f32 * 0.5).filter_map(|&(x, y, r, w)| dash_id(w).map(|id| (x, y, r, id))).collect();
+            assert!(top <= DASH_ROWS, "dash: more chrome rows than the table holds");
+            let runs = &mut *(&raw mut DASH);
+            let mut longest = 0;
+            for row in 0..top {
+                runs[row] = [(0, 0, 0); DASH_RUNS];
+                let fy = row as f32 + 0.5;
+                let mut k = 0;
+                let mut start = 0usize;
+                let mut cur = u16::MAX;
+                for x in 0..=width {
+                    let id = if x == width {
+                        u16::MAX - 1
+                    } else {
+                        let fx = x as f32 + 0.5;
+                        tops.iter().map(|&(cx, cy, r, id)| (libm::sqrtf((fx - cx) * (fx - cx) + (fy - cy) * (fy - cy)) - r, id)).fold((f32::MAX, 11), |a, b| if b.0 < a.0 { b } else { a }).1
+                    };
+                    if id != cur {
+                        // WHY the bound: a row holds at most DASH_RUNS zones (eight circles, each crossing a row once or twice); a ninth run would only come from a layout that has more circles than the console draws, and it joins the last.
+                        if cur != u16::MAX && k < DASH_RUNS {
+                            runs[row][k] = (start as u16, x as u16, cur);
+                            k += 1;
+                        } else if cur != u16::MAX {
+                            runs[row][k - 1].1 = x as u16;
+                        }
+                        start = x;
+                        cur = id;
+                    }
+                }
+                longest = longest.max(k);
+            }
+            DASH_FOR = (width, height);
+            let mut l = Log { grants: PANIC_GRANTS, buf: [0; 256], n: 0 };
+            l.s(b"display: dash zones over ");
+            l.dec(top as u64);
+            l.s(b" rows, at most ");
+            l.dec(longest as u64);
+            l.s(b" a row\n");
+            l.flush();
+        }
+        let row = &(*(&raw const DASH))[y];
+        let n = row.iter().position(|r| r.0 == r.1).unwrap_or(DASH_RUNS);
+        &row[..n]
+    }
+}
+
 /// Each radio's flavour (owner, 2026-11-07): WiFi 497 nm, cellular 598 nm, Bluetooth VSF blue, NFC VSF RGB 7F00FF (gamma-2 codes), GPS 550 nm (owner, 2026-11-09; VSF green before), USB VSF red. A wavelength is its cone response (vsf LMS_2000_10DEG_1NM) in VSF RGB, moved toward white (E, equal codes) just far enough that no channel is negative: the same hue at the most saturation the primaries reach, its third channel black. Each scaled to the light of the grey it replaces by VSF's photopic weights (R 0.2584, G 0.6346, B 0.1070): the ring at RING_ON's light (0.3017 linear), the name at INK's (0.4507), or as far as the colour goes with its brightest channel full (blue 0.107, NFC 0.171, red 0.258; cellular's name stops at its red). As working values, gamma 2, white at Q14. The rest grey, equal codes.
 fn flavour(what: Corner) -> ((f32, f32, f32), (f32, f32, f32)) {
     const RING_ON: f32 = 9000.0;
@@ -5242,9 +5319,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         time_h = (time_h.rotate_left(7) ^ c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
     // A person present or not (fact 83) too: GPS on is lit by it, its driver running or not.
-    // The radio circle a finger presses (the quick row's long press, QUICK.md): its ring drawn once as the press starts and gone as it ends, never per frame (owner, 2026-11-11: "the top console pulldown is stupidly slow and jerky").
-    let pressed = quick::state().press;
-    let k = (((time_h >> 9) as i64) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64 ^ (off as i64) << 40 ^ ((facts[83] & 3) as i64) << 48 ^ (pressed.map_or(0xFF, |p| p as i64)) << 52;
+    let k = (((time_h >> 9) as i64) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64 ^ (off as i64) << 40 ^ ((facts[83] & 3) as i64) << 48;
     if !force && k == unsafe { CONSOLE_KEY } {
         return false;
     }
@@ -5366,9 +5441,6 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             mix(az.to_bits() as u64 | (el.to_bits() as u64) << 32);
             mix(wt.to_bits() as u64);
         }
-        // A radio circle a finger presses: a whole ring, drawn once as the press starts.
-        let press = radio.is_some() && radio == pressed;
-        mix(press as u64);
         // Never 0, which is "not drawn yet".
         let key = key | 1;
         if pass == 0 {
@@ -5400,10 +5472,6 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         };
         // A box of pixels (x0, x1, y0, y1) cut to the region's: only the work, as `at` alone keeps the drawing inside the region.
         let cut = |b: (i64, i64, i64, i64)| (b.0.max(rbox.0), b.1.min(rbox.1), b.2.max(rbox.2), b.3.min(rbox.3));
-        // Frontmost, a radio circle's press (QUICK.md "Long press"): a whole ring inside the vessel's rim, drawn once.
-        if press {
-            quick::ring(x, y, r * (1.0 - 2.0 * VESSEL_DEPTH), 1., ink, console, &at, &cut);
-        }
         // The text first: it is in front of its vessel. Since 2026-11-09 (owner: "switch to the most useful stats, similar to the battery for all the radios except for GPS") a radio on carries its name and its measures, a line each, as the battery its readings; GPS on draws its satellites' rings (`gps_rings`); a radio switched off its field, GPS off its pin. Before: a radio carried words only while off (2026-11-07), its orb speaking for it on (`ORBS`). for it, and its numbers are on its detail page. The clock and the battery keep theirs.
         {
             let mut lines = [Txt::new(); 9];
@@ -5943,7 +6011,7 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         if op == 41 && n >= 5 {
-            // What the system has at this point: [x u16][y u16] → its place, one read of the hit map (hit.rs, the system's ids as the bars' compose leaves them): in the lower half outside the app's circle, a region (owner, 2026-11-07): 9 back on the left, 8 home on the right, whole (the arrow and the ring are only drawn there, nothing to aim at); in the upper half, the console's radio circle under it, by its bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS), the doorway by the camera 10, the rest of the top's ground 11 (corner circles that are no radio, and the air between them). The quick row (QUICK.md), in front of what is inside the app's circle: its circle under the point while it stands open as 32 + its index, with its centre and radius after (x, y, r u16 each, as `quick::layout` draws it), or 12 anywhere else inside the app's circle while any of it shows (behind the row). G#FF for nothing of the system's: inside the circle with the row shut (an app's window, the map's plane), or off the glass.
+            // What the system has at this point: [x u16][y u16] → its place, one read of the hit map (hit.rs, the system's ids as the bars' compose leaves them): in the lower half outside the app's circle, a region (owner, 2026-11-07): 9 back on the left, 8 home on the right, whole (the arrow and the ring are only drawn there, nothing to aim at); in the upper half, the doorway by the camera 10, else the console circle whose zone it is (every pixel of the dash is the nearest circle's, `dash_row`): the radios by their bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS), 5 USB, 13 the clock, 14 the battery; 11 where no zone reaches (none on these screens). The quick row (QUICK.md), in front of what is inside the app's circle: its circle under the point while it stands open as 32 + its index, with its centre and radius after (x, y, r u16 each, as `quick::layout` draws it), or 12 anywhere else inside the app's circle while any of it shows (behind the row). G#FF for nothing of the system's: inside the circle with the row shut (an app's window, the map's plane), or off the glass.
             let (w, h) = unsafe { SCREEN_WH };
             let (x, y) = (u16::from_le_bytes([msg[1], msg[2]]) as i64, u16::from_le_bytes([msg[3], msg[4]]) as i64);
             let id = hit::at(x, y);

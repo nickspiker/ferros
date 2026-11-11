@@ -134,6 +134,14 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Silent => "kimya",
         Msg::DoNotDisturb => "usinisumbue",
         Msg::Screencap => "picha ya skrini",
+        // ---- the battery's page ----
+        Msg::Charge => "chaji",
+        Msg::Voltage => "volteji",
+        Msg::Current => "mkondo",
+        Msg::PowerDraw => "nguvu",
+        Msg::Temperature => "joto",
+        Msg::Charging => "inachaji",
+        Msg::Discharging => "inapunguza chaji",
         // ---- Keyboard ----
         Msg::Layout => "mpangilio",
         // ---- Security ----

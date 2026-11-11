@@ -134,6 +134,14 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Silent => "im lặng",
         Msg::DoNotDisturb => "không làm phiền",
         Msg::Screencap => "chụp màn hình",
+        // ---- the battery's page ----
+        Msg::Charge => "mức pin",
+        Msg::Voltage => "điện áp",
+        Msg::Current => "dòng điện",
+        Msg::PowerDraw => "công suất",
+        Msg::Temperature => "nhiệt độ",
+        Msg::Charging => "đang sạc",
+        Msg::Discharging => "đang xả",
         // ---- Keyboard ----
         Msg::Layout => "bố cục",
         // ---- Security ----

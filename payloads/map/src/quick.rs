@@ -1,10 +1,10 @@
 //! The quick row's gestures, its physics and its actions (docs/QUICK.md; owner, 2026-11-11: "gesture ideas, would be nice to have the torch, brightness and maybe a few other things", the proposal answered "Works", then "any tap in that area or drag down should bring up said second row of consoleness"). The display draws the row (its quick.rs) from the state sent here (op 56); the map owns the finger, the frames and what a tap does.
 //!
-//! - **The slide** (owner, 2026-11-11, on the Pro, after the first cut's grow-and-fan: "the top console pulldown is stupidly slow and jerky", then "track the finger down from top tho and slide it in so it doesn't need a re-render, just a move and composite, then do the iterate/2 each frame, like we do for the settings page until it snaps in or out of place"). The row's offset `off`, whole pixels: 0 hidden, `slide` open (the display's length, op 56's reply). A finger that lands in the doorway by the camera (op 41: 10), on the top's other ground (11) or on a radio circle and then goes down moves it one to one; from open a push up brings it back the same way. The display draws the row once and only moves it.
+//! - **The slide** (owner, 2026-11-11, on the Pro, after the first cut's grow-and-fan: "the top console pulldown is stupidly slow and jerky", then "track the finger down from top tho and slide it in so it doesn't need a re-render, just a move and composite, then do the iterate/2 each frame, like we do for the settings page until it snaps in or out of place"). The row's offset `off`, whole pixels: 0 hidden, `slide` open (the display's length, op 56's reply). A finger that lands in the doorway by the camera (op 41: 10) and goes down moves it one to one (owner, 2026-11-11: "the second console row should only show if drug down from the area in the invisible camera circle"); from open a push up brings it back the same way. The display draws the row once and only moves it.
 //! - **The lift.** The row goes open when it was pulled past a third of the way (or, pushed from open, not back past a third), else hidden: each frame the panel showed, what is left to go halves (a right shift), so it lands in a few frames and holds still (`step`). No timer: the steps are the shown frames (owner, 2026-11-08: "we follow shown frames, not composited").
 //! - **Taps.** In the doorway: the row opens, or shuts. On a quick circle: its action (`tap`). Behind the row while it shows (op 41: 12): it shuts.
 //! - **The rings.** A finger on brightness or the torch turns them: the angle it sweeps about the circle's centre, a whole turn the whole range, eased at both ends (`ease`) so the value slows into each end rather than stopping dead.
-//! - **Long press** on a radio circle: its page in settings once the finger has held still on it for `LONG_PRESS` shown frames, a whole ring drawn round it once as the press starts (owner, 2026-11-11, on the proposal: "Long press on a radio circle opens its Settings page; the quick row is one-tap things only"). A tap still switches the radio; a drag down pulls the row.
+//! - **The console's circles** (main.rs): every pixel of the dash is a circle's zone (the display's, nearest rim). Dragged toward the centre a circle opens its page; tapped still a radio switches and any other circle opens its page. No long press (it went 2026-11-11, with drag-to-centre back). Only the doorway pulls or taps the row open.
 
 use super::*;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -12,6 +12,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// The map's corner sessions for the row (main.rs `corner`): a finger pulling it, behind it, or on its circle k (ITEM | k).
 pub const PULL: u8 = 0x40;
 pub const BEHIND: u8 = 0x60;
+/// The top's ground no zone holds (op 41: 11): the system's, a touch there does nothing.
+pub const NOTHING: u8 = 0x30;
 pub const ITEM: u8 = 0x80;
 /// The row's circles, left to right, as the display's quick::ITEMS has them.
 pub const RADIOS_OFF: usize = 0;
@@ -23,8 +25,6 @@ pub const SCREENCAP: usize = 5;
 
 /// Half the width of `ease`'s ends (a ring's share eased at both ends).
 const EASE_HALF: f32 = 1. / (1 << 3) as f32;
-/// A long press: the shown frames a finger rests on a radio circle before its page opens (about half a second at 120 Hz).
-const LONG_PRESS: u32 = 1 << 6;
 
 /// A ring's share eased at its ends: the value itself thru the middle, exactly 0 below and 1 above, C∞ (the ramp's two corners smoothed by a bump step of half-width EASE_HALF), so a turned ring slows into each end rather than stopping dead.
 pub fn ease(p: f32) -> f32 {
@@ -85,8 +85,6 @@ pub struct Quick {
     /// The shares a turn shows (op 56), None while no finger turns that ring.
     bright_arc: Option<f32>,
     torch_arc: Option<f32>,
-    /// The radio circle a finger presses and the shown frame it landed on.
-    press: Option<(u8, u32)>,
     /// A screencap wanted once the row is hidden.
     capture: bool,
     /// The torch's level to light at a tap (the last it was lit at, the whole dimmer at first).
@@ -102,7 +100,7 @@ pub struct Quick {
 impl Quick {
     pub fn new(display: u64, grants: u64, w: i64, h: i64) -> Quick {
         let span = 2 * w * h / (w + h);
-        Quick { display, grants, off: 0, slide: span >> 3, target: 0, settling: false, grab: None, from_open: false, last: 0, held: None, turn: None, bright_arc: None, torch_arc: None, press: None, capture: false, torch_lit: 255, torch_sent: 0, torch_asked: false, sent: [0xEE; 15] }
+        Quick { display, grants, off: 0, slide: span >> 3, target: 0, settling: false, grab: None, from_open: false, last: 0, held: None, turn: None, bright_arc: None, torch_arc: None, capture: false, torch_lit: 255, torch_sent: 0, torch_asked: false, sent: [0xEE; 15] }
     }
 
     /// A finger took hold of the row at screen row `y` (a drag that began in the doorway, on the top's ground, on a radio circle or on a quick circle): the stepping lets go of it, and it follows the finger from where it is.
@@ -284,27 +282,7 @@ impl Quick {
         }
     }
 
-    /// A finger landed on radio circle `radio` (its bit) at shown frame `frame`: the press starts, its ring drawn at once and once (owner, 2026-11-11: the console's motions "slow and jerky"; a ring that filled frame by frame redrew the radio's circle every frame).
-    pub fn press_start(&mut self, radio: u8, frame: u32) {
-        self.press = Some((radio, frame));
-    }
-
-    /// The press goes (the finger moved or lifted).
-    pub fn press_end(&mut self) {
-        self.press = None;
-    }
-
-    /// The press at shown frame `frame`: Some(radio) the pass it has held long enough (its page opens; the press is over).
-    pub fn press_at(&mut self, frame: u32) -> Option<u8> {
-        let (radio, from) = self.press?;
-        if frame.wrapping_sub(from) >= LONG_PRESS {
-            self.press_end();
-            return Some(radio);
-        }
-        None
-    }
-
-    /// Op 56 to the display when anything in it moved: the offset, the torch, the held circle, the press, the rings' shares, and a screencap once the row has landed hidden. The reply says the slide's length, kept for the next drag.
+    /// Op 56 to the display when anything in it moved: the offset, the torch, the held circle, the rings' shares, and a screencap once the row has landed hidden. The reply says the slide's length, kept for the next drag.
     pub fn send(&mut self) {
         // The torch asked its level once each time the row starts to show, until it has answered: its first call starts it (docs/TORCH.md), and it ends itself again while dark.
         if self.off > 0 && !self.torch_asked {
@@ -324,7 +302,7 @@ impl Quick {
         m[5] = torch.is_some() as u8 | ((self.capture && landed_hidden) as u8) << 1;
         m[6] = torch.unwrap_or(0);
         m[7] = self.held.map_or(0xFF, |k| k as u8);
-        m[8] = self.press.map_or(0xFF, |p| p.0);
+        m[8] = 0xFF;
         // A share as Q16, G#FFFF for none. WHY the min: a full share (1, or the hair past it `ease` allows) would read as none on the wire; G#FFFE is a 65535th short of full, under a hundredth of a pixel of arc.
         let q16 = |v: Option<f32>| v.map_or(0xFFFF, |s| ((s * 65535.) as u16).min(0xFFFE)).to_le_bytes();
         let (b, t) = (q16(self.bright_arc), q16(self.torch_arc));

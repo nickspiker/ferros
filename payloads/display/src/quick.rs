@@ -170,7 +170,7 @@ pub static OFFSET: AtomicU64 = AtomicU64::new(0);
 pub static SLIDE: AtomicU64 = AtomicU64::new(0);
 
 /// The row as the map last set it (op 56), in two words the receive thread stores and the console's worker reads without a lock (a pass that reads one new and the other old is put right by the next):
-/// - `STATE_A`: flags in bits 32-39 (bit 0 the torch answers, bit 1 a screencap once the row is hidden); the torch's level in 40-47; the quick circle a finger holds in 48-55 (G#FF none); the radio circle a finger presses in 56-63 (G#FF none).
+/// - `STATE_A`: flags in bits 32-39 (bit 0 the torch answers, bit 1 a screencap once the row is hidden); the torch's level in 40-47; the quick circle a finger holds in 48-55 (G#FF none); bits 56-63 unused (the radio press ring, drawn until 2026-11-11, when the long press went).
 /// - `STATE_B`: the brightness ring's lit share (u16 Q16, G#FFFF: from preference 3) in bits 0-15, the torch ring's (G#FFFF: from its level) in 16-31.
 pub static STATE_A: AtomicU64 = AtomicU64::new(0xFFFF << 48);
 pub static STATE_B: AtomicU64 = AtomicU64::new(0xFFFF_FFFF);
@@ -189,9 +189,8 @@ pub struct Now {
     /// The rings' lit shares while a finger turns them (else from preference 3 and the torch's level).
     pub bright_arc: Option<f32>,
     pub torch_arc: Option<f32>,
-    /// The quick circle a finger holds (shown lighter), and the radio circle a finger presses (its ring, drawn once).
+    /// The quick circle a finger holds (shown lighter).
     pub held: Option<usize>,
-    pub press: Option<usize>,
 }
 
 pub fn state() -> Now {
@@ -204,11 +203,10 @@ pub fn state() -> Now {
         bright_arc: (b & 0xFFFF != 0xFFFF).then(|| q16(b)),
         torch_arc: (b >> 16 & 0xFFFF != 0xFFFF).then(|| q16(b >> 16)),
         held: idx(a >> 48),
-        press: idx(a >> 56),
     }
 }
 
-/// Op 56 `quick [offset i32][flags u8][torch level u8][held u8][press radio u8][brightness ring u16 Q16][torch ring u16 Q16][unused u16]` (15 bytes): the map's state of the row, stored for the console's worker, which is nudged. Answered at once by the receive thread with [0][the slide's length u16], so the map knows how far the row travels.
+/// Op 56 `quick [offset i32][flags u8][torch level u8][held u8][unused u8][brightness ring u16 Q16][torch ring u16 Q16][unused u16]` (15 bytes): the map's state of the row, stored for the console's worker, which is nudged. Answered at once by the receive thread with [0][the slide's length u16], so the map knows how far the row travels.
 pub fn set(m: &[u8]) -> [u8; 3] {
     let w16 = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]) as u64;
     let off = i32::from_le_bytes([m[1], m[2], m[3], m[4]]);
@@ -470,7 +468,7 @@ pub const RING_INNER: f32 = 0.78;
 const RING_LIT: f32 = CAL_SWEPT;
 const RING_REST: f32 = CAL_REST;
 
-/// A ring about (x, y) inside inner radius `ri`, `share` of it lit clockwise from twelve o'clock (a quick circle's value, or a radio's press toward its page): the band's edges and the lit arc's two ends each the C∞ step across a pixel, as the clock's calendar rings are drawn, so the lit end moves smoothly with the share, never a pixel at a time. Front to back by `under` into the console.
+/// A ring about (x, y) inside inner radius `ri`, `share` of it lit clockwise from twelve o'clock (a quick circle's value): the band's edges and the lit arc's two ends each the C∞ step across a pixel, as the clock's calendar rings are drawn, so the lit end moves smoothly with the share, never a pixel at a time. Front to back by `under` into the console.
 pub fn ring(x: f32, y: f32, ri: f32, share: f32, ink: u64, console: &mut [u64], at: &dyn Fn(i64, i64) -> Option<usize>, cut: &dyn Fn((i64, i64, i64, i64)) -> (i64, i64, i64, i64)) {
     use fluor::pixel::{Blend, BlendMode};
     let tau = core::f32::consts::TAU;

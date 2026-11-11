@@ -790,7 +790,7 @@ enum Choice {
 }
 
 /// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The clock after the links (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
-const PAGES: [&str; 19] = ["appearance", "units", "keyboard", "security", "kists", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "clock", "language", "about", "developer"];
+const PAGES: [&str; 20] = ["appearance", "units", "keyboard", "security", "kists", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "clock", "language", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Whether it looks like one (the orange hairlines, as the display's): FERROS_RELEASE_LOOK set gives a development build the release look for screen captures (owner, 2026-11-10), its tools kept.
@@ -800,6 +800,16 @@ const DEV_TAPS: u8 = 12;
 const DEV_HINT: u8 = 4;
 /// The radios and USB in the kernel's facts order (facts 33 + 8 · link, ferros_sys::measure), as the Connections page names them.
 const LINKS: [&str; 6] = ["cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB"];
+
+/// A console circle's page by its zone's id (the display's dash zones, op 41): the radios and USB their link pages, 13 the clock, 14 the battery.
+fn dash_page(id: u8) -> &'static str {
+    match id {
+        13 => "clock",
+        14 => "battery",
+        // 0-5 by the facts' order; the display gives no other id here.
+        _ => LINKS[id as usize % LINKS.len()],
+    }
+}
 
 /// A page's title in the person's language, by its key in `PAGES` (a link's own name is a name, and stays; cellular is a word, and is translated).
 fn page_title(key: &'static str) -> &'static str {
@@ -817,6 +827,7 @@ fn page_title(key: &'static str) -> &'static str {
         "clock" => Msg::PageClock,
         "language" => Msg::PageLanguage,
         "about" => Msg::PageAbout,
+        "battery" => Msg::Battery,
         "developer" => Msg::PageDeveloper,
         _ => return key,
     })
@@ -3389,6 +3400,51 @@ impl Map {
                     row(self, b, &mut y, note, white(), tr(t), None);
                 }
             }
+            "battery" => {
+                // The battery (owner, 2026-11-11: "might have to build a battery page"), the console's battery circle's page: what the kernel's gauge reads every two seconds (facts 1-4, the MAX77759 fuel gauge), each in the person's base, drawn again at the facts' bell. The charge, then the current's way, the cell's voltage, the current, their product and the temperature. The gauge's health (full capacity against design, cycles) is not read by the kernel yet.
+                let f = ferros_sys::numbers(Style::Glyphs);
+                let facts = ferros_sys::facts();
+                // A whole count in the base with its unit, signed.
+                let num = |n: i64, unit: &str| {
+                    let mut l = Line::new();
+                    if n < 0 {
+                        l.s("-");
+                    }
+                    if let Ok(tatau::Out::Nothing) = tatau::count(&mut l, f, n.unsigned_abs(), 1) {
+                        l.s("0");
+                    }
+                    l.s(unit);
+                    l
+                };
+                let not_read = || {
+                    let mut l = Line::new();
+                    l.s(tr(Msg::NotRead));
+                    l
+                };
+                let charge = match facts.battery_pct() {
+                    Some(p) => {
+                        let mut l = Line::new();
+                        let _ = tatau::share(&mut l, f, p, 100, 2);
+                        l
+                    }
+                    None => not_read(),
+                };
+                b.text(cx, y, (uu(3, 1)) as u16, white(), 1, charge.as_str());
+                y += uu(3, 1);
+                let (uv, ua) = (facts.cell_uv(), facts.battery_ua());
+                if let Some(ua) = ua {
+                    row(self, b, &mut y, small, grey(), tr(if ua > 0 { Msg::Charging } else { Msg::Discharging }), None);
+                }
+                fact(b, &mut y, tr(Msg::Charge), charge.as_str());
+                fact(b, &mut y, tr(Msg::Voltage), uv.map_or_else(not_read, |v| num((v / 1000) as i64, " mV")).as_str());
+                fact(b, &mut y, tr(Msg::Current), ua.map_or_else(not_read, |a| num(a / 1000, " mA")).as_str());
+                let power = match (uv, ua) {
+                    (Some(v), Some(a)) => num((v as i64 / 1000) * (a / 1000) / 1000, " mW"),
+                    _ => not_read(),
+                };
+                fact(b, &mut y, tr(Msg::PowerDraw), power.as_str());
+                fact(b, &mut y, tr(Msg::Temperature), facts.battery_temp_cc().map_or_else(not_read, |c| num(c / 100, " °C")).as_str());
+            }
             "about" => {
                 let f = ferros_sys::numbers(Style::Glyphs);
                 let facts = ferros_sys::facts();
@@ -4749,7 +4805,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             let v = w.load(core::sync::atomic::Ordering::Acquire);
             if v != bells_seen[s] {
                 bells_seen[s] = v;
-                page_dirty |= open && if s < LINKS.len() { page == "connections" || page == LINKS[s] } else { page == "about" };
+                page_dirty |= open && if s < LINKS.len() { page == "connections" || page == LINKS[s] } else { matches!(page, "about" | "battery") };
             }
         }
         // A radio switched on or off (preference 15, from here or from a status circle): its switch and state on Connections and on its page.
@@ -4947,12 +5003,13 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             let mut q = [0u8; 8];
             let (xb, yb) = ((f.1 as u16).to_le_bytes(), (f.2 as u16).to_le_bytes());
             let hit = if call(map.display, &[41, xb[0], xb[1], yb[0], yb[1]], &mut q) >= 1 { q[0] } else { 0xFF };
-            // A radio's console circle too (0-4, as 16 + its bit): held still it opens that radio's page (a long press, its ring filling), dragged down it pulls the quick row, tapped still it switches as before.
-            // The quick row (QUICK.md): the doorway by the camera (10) or the top's other ground (11) pull it; a quick circle (32 + k, its centre after) is held, a ring turned; behind the row while it shows (12) shuts it, and the touch goes no further.
+            // A console circle's zone (owner, 2026-11-11: "each zone in the console always map to a circle ... closest to circle wins if it's in the dash area"; the display's dash zones: 0-4 the radios, 5 USB, 13 the clock, 14 the battery, as 16 + its id): dragged toward the centre it opens that circle's page (owner: "dragging a console circle to center no longer works", restored), tapped still a radio switches and any other opens its page.
+            // The quick row (QUICK.md): only the doorway by the camera (10) pulls or taps it open (owner: "the second console row should only show if drug down from the area in the invisible camera circle"); a quick circle (32 + k, its centre after) is held, a ring turned; behind the row while it shows (12) shuts it, and the touch goes no further. The top's ground with no zone (11, none on these screens) is the system's and does nothing.
             corner = match hit {
                 8 | 9 => hit,
-                0..=4 => 16 | hit,
-                10 | 11 => quick::PULL,
+                0..=5 | 13 | 14 => 16 | hit,
+                10 => quick::PULL,
+                11 => quick::NOTHING,
                 12 => quick::BEHIND,
                 32..=37 => quick::ITEM | (hit - 32),
                 _ => 0,
@@ -4965,7 +5022,6 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 frame_count = u32::from_le_bytes(fr);
             }
             match corner {
-                c if c & 16 != 0 && c < 32 => qr.press_start(c & 15, frame_count),
                 quick::PULL => qr.take(f.2, frame_count),
                 quick::BEHIND => qr.settle_to(0, frame_count),
                 c if c & quick::ITEM != 0 => {
@@ -5009,15 +5065,21 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     map.pressed = None;
                 }
             }
-            // The quick row's sessions (QUICK.md): the pull follows the finger from where it landed (or from where a drag down took it over), a ring turns with it, a radio circle's press ends as it moves and a drag down from it pulls the row; a quick circle dragged up or down pulls the row too (pushed back up, it shuts).
+            // The quick row's sessions (QUICK.md): the pull follows the finger from where it landed in the doorway, a ring turns with it; a quick circle dragged up or down moves the open row too (pushed back up, it shuts).
             if held >= 1 && corner != 0 && corner != 8 && corner != 9 {
                 let (fx, fy) = (cur[ids[0]].1, cur[ids[0]].2);
                 let (dx, dy) = (fx - corner_from.0, fy - corner_from.1);
-                if corner & 16 != 0 && corner < 32 && moved {
-                    qr.press_end();
-                    if dy > 0 && dy > dx.abs() {
-                        corner = quick::PULL;
-                        qr.take(fy, frame_count);
+                if corner & 16 != 0 && corner < 32 && !corner_done {
+                    // A console circle's swipe inward, as the helm's (below): the finger's travel toward the screen's centre past a twelfth of the harmonic span opens its page, once a touch (with an app in front the settings circle is not on the screen: nothing).
+                    let (ux, uy) = ((w / 2 - corner_from.0) as f64, (h / 2 - corner_from.1) as f64);
+                    let inward = (dx as f64 * ux + dy as f64 * uy) / libm::sqrt(ux * ux + uy * uy);
+                    let span = (2 * w * h) as f64 / (w + h) as f64;
+                    if inward > span / 12. {
+                        corner_done = true;
+                        if !map.app_front {
+                            map.show_page(dash_page(corner & 15));
+                            map.draw();
+                        }
                     }
                 } else if corner & quick::ITEM != 0 && moved {
                     let k = (corner & 7) as usize;
@@ -5088,7 +5150,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             // A corner's session let go: it acted while moving (above), if it went far enough inward. A still tap on a corner circle is a tap as before (on the home circle it closes the open settings; on a radio's, it switches it).
             let mut tap_thru = !moved;
-            // The quick row's sessions end here (QUICK.md): a still tap in the doorway opens or shuts the row, any other pull settles by the spring from its speed; a quick circle acts (or its turn is kept); behind the row the touch already shut it and goes no further; a radio held long enough has opened its page, so its lift switches nothing.
+            // The quick row's sessions end here (QUICK.md): a still tap in the doorway opens or shuts the row, any other pull settles by halving; a quick circle acts (or its turn is kept); behind the row the touch already shut it and goes no further. A console circle tapped still: a radio switches (preference 15), any other opens its page; dragged in it already opened its page; dragged elsewhere nothing.
             match corner {
                 quick::PULL => {
                     if !moved && quick_door {
@@ -5104,11 +5166,20 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     tap_thru = false;
                 }
                 c if c & 16 != 0 && c < 32 => {
-                    qr.press_end();
-                    if corner_done {
-                        tap_thru = false;
+                    tap_thru = false;
+                    let id = c & 15;
+                    if !moved && id < 5 {
+                        let off = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF) ^ (1 << id);
+                        ferros_sys::set_pref(cap(grants, S_SETTINGS), ferros_sys::PREF_RADIOS_OFF, off);
+                        let mut l = Line::new();
+                        let _ = write!(l, "map: status circle {id} tapped: radios off G#{off:02X}\n");
+                        console(grants, l.as_str().as_bytes());
+                    } else if !moved && !map.app_front {
+                        map.show_page(dash_page(id));
+                        map.draw();
                     }
                 }
+                quick::NOTHING => tap_thru = false,
                 _ => {}
             }
             if corner != 0 && tap_thru {
@@ -5185,16 +5256,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
         }
 
-        // The quick row this pass (QUICK.md): a radio circle pressed still long enough opens its page (with an app in front the settings circle is not on the screen: nothing); the spring stepped by the frames the panel showed since its last step; its state to the display when anything in it moved.
-        if down && corner & 16 != 0 && corner < 32 && !moved && !corner_done {
-            if let Some(radio) = qr.press_at(frame_count) {
-                corner_done = true;
-                if !map.app_front {
-                    map.show_page(LINKS[radio as usize]);
-                    map.draw();
-                }
-            }
-        }
+        // The quick row this pass (QUICK.md): stepped by the frames the panel showed since its last step; its state to the display when anything in it moved.
         if !down {
             qr.step(frame_count);
         }

@@ -134,6 +134,14 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Silent => "без звуку",
         Msg::DoNotDisturb => "не турбувати",
         Msg::Screencap => "знімок екрана",
+        // ---- the battery's page ----
+        Msg::Charge => "заряд",
+        Msg::Voltage => "напруга",
+        Msg::Current => "струм",
+        Msg::PowerDraw => "потужність",
+        Msg::Temperature => "температура",
+        Msg::Charging => "заряджається",
+        Msg::Discharging => "розряджається",
         // ---- Keyboard ----
         Msg::Layout => "розкладка",
         // ---- Security ----

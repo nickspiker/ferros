@@ -2,7 +2,7 @@
 
 Every link's numbers, names and knobs, from its driver to its page in settings (owner, 2026-11-07: "Be able to turn every knob our radio has, frequency lock, tech, etc. carrier stats, all the goodness. same with the wifi's, gps's, clock, USB. All the things.").
 
-The console's circles stay orbs without words (they draw the measures); a link's page in settings is the only place with numbers and knobs, reached by a long press on its circle (since 2026-11-11, QUICK.md; until then by dragging it toward the centre, which now pulls down the quick row) or from Connections.
+The console's circles stay orbs without words (they draw the measures); a link's page in settings is the only place with numbers and knobs, reached by dragging its circle toward the centre (or tapping a circle that is no switch: USB, the clock, the battery), or from Connections. Every pixel of the dash is some circle's (QUICK.md "The dash's zones").
 
 ## Three ways out of a driver, one way in
 

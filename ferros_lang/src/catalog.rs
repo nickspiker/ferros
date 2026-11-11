@@ -228,6 +228,21 @@ messages! {
     /// A capture of the screen.
     Screencap,
 
+    // ---- the battery's page (the console's battery circle; its title is `Battery`) ----
+    /// The state of charge.
+    Charge,
+    /// The cell's voltage.
+    Voltage,
+    /// The current in or out of the cell.
+    Current,
+    /// The power in or out of the cell (voltage times current).
+    PowerDraw,
+    /// The cell's temperature.
+    Temperature,
+    /// The current's direction: into the cell, or out of it.
+    Charging,
+    Discharging,
+
     // ---- Keyboard ----
     /// The keyboard layout's heading (Dvorak, QWERTY stay).
     Layout,
