@@ -137,6 +137,9 @@ mod oracle;
 // Processes: EL0 in an arc, capabilities, the syscall boundary.
 #[cfg(feature = "pixel8")]
 mod process;
+// The frame pool: the DRAM every arc is made of, in 2 MiB frames (frames.rs, ARCS.md).
+#[cfg(feature = "pixel8")]
+mod frames;
 // The "Ready?" gate: the boot proper starts at the power key's press (BOOT.md). Compiled into the handoff build too, for the gate telemetry and marks the shared service reads.
 #[cfg(feature = "pixel8")]
 mod ready;

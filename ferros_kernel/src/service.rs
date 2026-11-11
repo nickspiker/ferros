@@ -2946,6 +2946,12 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                // `diag frames`: the frame pool's memory map on this board (frames.rs, BOARDS.md "Memory map").
+                if cmd.params == b"frames" {
+                    resp.extend_from_slice(crate::frames::map_report().as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if let Some(names) = cmd.params.strip_prefix(b"restart ") {
                     restart(&mut store, names, &mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
