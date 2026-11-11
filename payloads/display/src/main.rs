@@ -5289,18 +5289,20 @@ extern "C" fn console_worker(arg: u64) -> ! {
         if quick_only {
             // Only the quick row moved or changed its look (owner, 2026-11-11: "no reason we can't hit 120fps with a sliding console row"): the rows that differ are the row's band where the front has it and where the back has it now (quick.rs `update`; the console's rows re-decoded from `CON_DEC` are the front's again), and within a row only the columns where either holds anything of the bars, each row's span (`BAR_SPAN`, front and back; outside its span a decoded row is clear), with any whose owner changed in the hit map's bars' ids (`hit::bars_changed`). No pixel compared: the diff that did it was 1.4 ms of a step on the Pro.
             let (fs, ks) = unsafe { (core::slice::from_raw_parts(BAR_SPAN as *const (u16, u16), top + bot), core::slice::from_raw_parts(BAR_SPAN_BACK as *const (u16, u16), top + bot)) };
-            if let Some((a, b)) = quick {
-                for row in a..b {
-                    let (mut x0, mut x1) = (width, 0usize);
-                    for s in [fs[row], ks[row], hit::bars_changed(row, width).map_or((0, 0), |(p, q)| (p as u16, q as u16))] {
-                        if s.0 < s.1 {
-                            x0 = x0.min(s.0 as usize);
-                            x1 = x1.max(s.1 as usize);
-                        }
+            let (a, b) = quick.unwrap_or((0, 0));
+            // Every row composed is asked of the hit map (its owners are written there, `hit::bars_row`); the spans only where the row's band was or is.
+            for row in lo..hi {
+                let band = row >= a && row < b;
+                let (mut x0, mut x1) = (width, 0usize);
+                for s in [if band { fs[row] } else { (0, 0) }, if band { ks[row] } else { (0, 0) }, hit::bars_changed(row, width).map_or((0, 0), |(p, q)| (p as u16, q as u16))] {
+                    if s.0 < s.1 {
+                        x0 = x0.min(s.0 as usize);
+                        x1 = x1.max(s.1 as usize);
                     }
-                    if x0 < x1 {
-                        rects[0] = rects[0].union(draw::Rect { x0: x0 as i32, y0: row as i32, x1: x1 as i32, y1: row as i32 + 1 });
-                    }
+                }
+                if x0 < x1 {
+                    let (which, y) = if row < top { (0, row) } else { (1, height - bot + (row - top)) };
+                    rects[which] = rects[which].union(draw::Rect { x0: x0 as i32, y0: y as i32, x1: x1 as i32, y1: y as i32 + 1 });
                 }
             }
         } else {
