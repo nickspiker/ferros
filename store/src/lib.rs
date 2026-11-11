@@ -59,6 +59,17 @@ pub struct Sealed {
     pub addr: [u8; 32],
     pub bytes: Vec<u8>,
     pub ok: bool,
+    /// The piece's furrows as read from the disk, unchecked, and the size its leaf gives (2026-11-11): `open_piece` holds them to manifestus's furrow checks and joins them into `bytes` before opening, on whichever thread opens it. Empty when the piece came whole (a lone value, or already joined).
+    pub raw: Vec<manifestus::Block>,
+    pub size: u64,
+    /// The furrows failed their checks (a block's seal, owner, place, or the joined size): the read fails as the engine's own read would.
+    pub corrupt: bool,
+}
+
+impl Sealed {
+    fn empty() -> Sealed {
+        Sealed { addr: [0; 32], bytes: Vec::new(), ok: false, raw: Vec::new(), size: 0, corrupt: false }
+    }
 }
 
 /// Opens a read's pieces under the request's sealing key, perhaps several at once on other threads (the vault process's helpers). Each piece is opened by `open_piece`.
@@ -93,8 +104,19 @@ impl Opener for Serial {
     }
 }
 
-/// One sealed piece opened in place: its plaintext then lies at `bytes[NONCE..len - TAG]`; sets and returns `ok`. Touches nothing else and allocates nothing, so any thread may run it on its own piece.
+/// One sealed piece opened in place: its furrows first checked and joined (`raw`: each block's BLAKE3 guard, schema, owner and place, the joined size, as manifestus's own read checks them; failing, `corrupt`), then opened; its plaintext then lies at `bytes[NONCE..len - TAG]`; sets and returns `ok`. Touches nothing but the piece (it allocates the joined bytes), so any thread may run it on its own piece: the furrows' guards, most of a large read's time on the serving thread until 2026-11-11, are spread over the helpers with the opening.
 pub fn open_piece(seal: &[u8; 32], p: &mut Sealed) -> bool {
+    if !p.raw.is_empty() {
+        let raw = core::mem::take(&mut p.raw);
+        let mut joined = Vec::with_capacity(p.size as usize);
+        let checked = manifestus::check_furrows(&raw, &p.addr, 0, &mut joined).and_then(|_| manifestus::furrows_whole(p.size, &joined));
+        if checked.is_err() {
+            p.corrupt = true;
+            p.ok = false;
+            return false;
+        }
+        p.bytes = joined;
+    }
     let n = p.bytes.len();
     // WHY: the sealed bytes are the disk's; shorter than a nonce and a tag they cannot be a piece, and the split below would panic.
     if n < NONCE + TAG {
@@ -221,6 +243,8 @@ pub struct Store<A: BlockDev, B: BlockDev, N: Nonces> {
 pub struct ReadTicks {
     pub fetch: u64,
     pub copy: u64,
+    /// Of `fetch`, the index walks alone (manifestus `locate`: each node read from the index cache, its BLAKE3 guard and decode, to the piece's leaf). Since 2026-11-11 the fetch is the walk and the furrows' unchecked reads; their checks run with the opening (`open_piece`).
+    pub walk: u64,
 }
 
 impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
@@ -299,6 +323,28 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         Ok(Some((at, h)))
     }
 
+    /// A piece fetched for opening: the engine's index walk to it (`locate`, every node and the leaf checked), then its furrows read as they lie, unchecked, each run of consecutive positions one read; their checks are `open_piece`'s, on whichever thread opens it. A lone piece (one that fit its leaf) comes whole. Absent: the value is not whole (`Format`).
+    fn fetch_piece(&mut self, addr: &[u8; 32]) -> Result<Sealed> {
+        let t = self.tick();
+        let at = self.vault.locate(addr);
+        self.ticks.walk += self.tick() - t;
+        match at? {
+            manifestus::Located::Absent => Err(Error::Format),
+            manifestus::Located::Lone(bytes) => Ok(Sealed { addr: *addr, bytes, ..Sealed::empty() }),
+            manifestus::Located::Furrows { size, furrows } => {
+                let mut raw: Vec<manifestus::Block> = alloc::vec![manifestus::ZERO_BLOCK; furrows.len()];
+                let mut start = 0;
+                for i in 1..=furrows.len() {
+                    if i == furrows.len() || furrows[i] != furrows[i - 1] + 1 {
+                        self.vault.read_tract_run(furrows[start], &mut raw[start..i])?;
+                        start = i;
+                    }
+                }
+                Ok(Sealed { addr: *addr, raw, size, ..Sealed::empty() })
+            }
+        }
+    }
+
     /// What the cache knows a sealing key by.
     fn key_id(d: &Domain) -> [u8; 32] {
         *blake3::hash(&d.seal).as_bytes()
@@ -343,7 +389,7 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         let t = self.tick();
         let want: Vec<[u8; 32]> = (k0..=k1).map(|k| Self::piece_addr(d, &h.id, k)).filter(|a| !cached(self, a)).collect();
         let n = want.len();
-        let mut sealed: Vec<Sealed> = (0..n).map(|_| Sealed { addr: [0; 32], bytes: Vec::new(), ok: false }).collect();
+        let mut sealed: Vec<Sealed> = (0..n).map(|_| Sealed::empty()).collect();
         let base = sealed.as_mut_ptr();
         let mut fetched: Result<()> = Ok(());
         if n > 0 {
@@ -352,10 +398,9 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
             for (i, addr) in want.iter().enumerate() {
                 // After a failed fetch the rest stay empty (they fail to open, at once) and are handed over all the same, so `finish` still waits for whatever was already being opened.
                 if fetched.is_ok() {
-                    match self.vault.get(addr) {
-                        Ok(Some(bytes)) => unsafe { *base.add(i) = Sealed { addr: *addr, bytes, ok: false } },
-                        Ok(None) => fetched = Err(Error::Format),
-                        Err(e) => fetched = Err(e.into()),
+                    match self.fetch_piece(addr) {
+                        Ok(p) => unsafe { *base.add(i) = p },
+                        Err(e) => fetched = Err(e),
                     }
                 }
                 opener.ready(i);
@@ -371,6 +416,10 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
                     p.bytes.fill(0);
                 }
                 fetched?;
+                // A piece whose furrows failed their checks fails as the engine's own read fails; one that would not open, as before.
+                if sealed.iter().any(|p| p.corrupt) {
+                    return Err(Error::Engine(manifestus::Error::Corrupt("a piece's furrows failed their checks".into())));
+                }
                 return Err(Error::Open);
             }
         }
@@ -668,6 +717,25 @@ mod tests {
         let m = Mirror::new(Mem(vec![[0u8; 4096]; blocks]), Mem(vec![[0u8; 4096]; blocks]));
         let v = Vault::open(m, 8, 1, DeletePolicy::UnlinkOnly).expect("vault");
         Store::new(v, Counter(0), now)
+    }
+
+    /// A piece's furrows are fetched unchecked and checked where it opens (`open_piece`): as fetched they open to the value's bytes; one bit flipped in a furrow is refused as corrupt, before any opening.
+    #[test]
+    fn furrows_checked_at_open() {
+        let mut s = store(1 << 12);
+        let d = domain(3);
+        let v = bytes(200_000, 5);
+        s.put(&d, b"v", &v).unwrap();
+        let (_, h) = s.head(&d, b"v").unwrap().unwrap();
+        let addr = Store::<Mem, Mem, Counter>::piece_addr(&d, &h.id, 1);
+        let mut p = s.fetch_piece(&addr).unwrap();
+        assert!(!p.raw.is_empty());
+        let mut q = Sealed { addr, raw: p.raw.clone(), size: p.size, ..Sealed::empty() };
+        assert!(open_piece(&d.seal, &mut p));
+        assert_eq!(&p.bytes[NONCE..p.bytes.len() - TAG], &v[PIECE..2 * PIECE]);
+        q.raw[3][2000] ^= 1;
+        assert!(!open_piece(&d.seal, &mut q));
+        assert!(q.corrupt);
     }
 
     fn domain(k: u8) -> Domain {

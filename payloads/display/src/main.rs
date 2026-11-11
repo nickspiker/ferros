@@ -4497,6 +4497,8 @@ struct VaultSource {
     len: u64,
     /// The piece-aligned stretch of the value small reads come from: its offset, its length, the bytes.
     win: core::cell::RefCell<(u64, usize, alloc::vec::Vec<u8>)>,
+    /// The value's first and last stretches, read whole before the document opens (`wall_own`, the loader's two stretch buffers): each its offset, length and bytes. vsf's opening reads (the trailer, the header, the plane's section stepped through to its end) fall in them, so the opening is two vault calls; until 2026-11-11 each of its small reads that missed the window was a call of its own, 28 of them and 276 ms on a cold attest, each waiting for the vault's thread to get the X3.
+    spans: [(u64, usize, *const u8); 2],
 }
 
 /// A small read's window (`VaultSource::win`): one of the vault's pieces (ferros_store PIECE, 64 KiB), so a fill opens one piece; a read this large or larger goes straight to the vault.
@@ -4542,6 +4544,16 @@ impl vsf::container::ByteSource for VaultSource {
         // WHY: the range is vsf's, read from the document's own bytes; past the value's end there is nothing to read, and the window's arithmetic below assumes the range inside it.
         if offset.checked_add(buf.len() as u64).is_none_or(|end| end > self.len) {
             return Err(vsf::container::SourceError::OutOfRange { offset, len: buf.len() as u64, size: self.len });
+        }
+        for &(at, n, bytes) in &self.spans {
+            // Whether this span holds the whole range (the copy reads only inside it).
+            if offset >= at && offset + buf.len() as u64 <= at + n as u64 {
+                // SAFETY: the span's `n` bytes were read before the document opened and stay until the document is dropped, before the plane's reads reuse the buffers (`wall_own`).
+                let span = unsafe { core::slice::from_raw_parts(bytes, n) };
+                let from = (offset - at) as usize;
+                buf.copy_from_slice(&span[from..from + buf.len()]);
+                return Ok(());
+            }
         }
         let start = offset & !(WIN as u64 - 1);
         // A large read, or one across a piece's edge: straight to the vault.
@@ -4694,7 +4706,19 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
     let (calls0, call_t0) = (VAULT_CALLS.load(Ordering::Relaxed), VAULT_CALL_TICKS.load(Ordering::Relaxed));
     VAULT_CALL_MAX.store(0, Ordering::Relaxed);
     let mut l = Log { grants, buf: [0; 256], n: 0 };
-    let doc = match vsf::container::Document::open(VaultSource { cap: c, key, len: len as u64, win: core::cell::RefCell::new((0, 0, alloc::vec::Vec::new())) }) {
+    // The value's first stretch and its last, read whole before the document opens (two vault calls, the reader thread taking the first while this one reads the last), into the loader's two stretch buffers: vsf's opening reads come from them (`VaultSource::spans`). The last starts at a piece's boundary past the value's end less a stretch, so it is never longer than a stretch. A value no longer than a stretch is all in the first.
+    let ptrs = unsafe { [(*(&raw mut STRETCH_BUFS))[0].as_mut_ptr(), (*(&raw mut STRETCH_BUFS))[1].as_mut_ptr()] };
+    let whole = len as u64;
+    // WHY the min: a value shorter than a stretch is read whole.
+    let head = whole.min(STRETCH as u64) as usize;
+    let tail_at = if whole > STRETCH as u64 { (whole - STRETCH as u64 + WIN as u64 - 1) & !(WIN as u64 - 1) } else { whole };
+    let seq = read_post(c, key, 0, ptrs[0], head);
+    // SAFETY: the second buffer is no job's; `whole - tail_at` is at most a stretch.
+    let tail_ok = tail_at == whole || vault_read(c, key, tail_at, unsafe { core::slice::from_raw_parts_mut(ptrs[1], (whole - tail_at) as usize) });
+    let spans_ok = read_wait(seq) && tail_ok;
+    let spans = if spans_ok { [(0, head, ptrs[0] as *const u8), (tail_at, (whole - tail_at) as usize, ptrs[1] as *const u8)] } else { [(0, 0, ptrs[0] as *const u8); 2] };
+    let t_spans = ferros_sys::us_since(t0);
+    let doc = match vsf::container::Document::open(VaultSource { cap: c, key, len: len as u64, win: core::cell::RefCell::new((0, 0, alloc::vec::Vec::new())), spans }) {
         Ok(d) => d,
         Err(e) => {
             // What vsf refused, and where: until 2026-11-08 the error was dropped, and the made wallpaper (24 MB, written whole by wallgen) was refused with no word why.
@@ -4718,26 +4742,30 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
         l.flush();
         return false;
     };
+    // The document is done with: its source's spans are the stretch buffers the plane's reads now reuse.
+    drop(doc);
     let t_open = ferros_sys::us_since(t0);
     let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, n) };
     let table = unsafe { core::slice::from_raw_parts(G2T16_Q14, 1 << 16) };
-    // Stretches of half a MiB at their own boundaries in the value (eight of the vault's pieces, opened as one batch; on an older kernel `vault_read` moves one in its own smaller calls, still at piece boundaries), two buffers: the reader thread fills one (`read_post`) while this thread converts the other.
+    // Stretches of a MiB at their own boundaries in the value (sixteen of the vault's pieces, opened as one batch; on an older kernel `vault_read` moves one in its own smaller calls, still at piece boundaries), two buffers: the reader thread fills one (`read_post`) while this thread converts the other.
     // The two stretches are statics, not the loader's arena (2026-11-11, the Pro: "memory allocation of 524288 bytes failed" at start, the 2 MiB arena already holding ~1.87 MiB of the document's reading): one load at a time uses them (`LOADING`).
-    let ptrs = unsafe { [(*(&raw mut STRETCH_BUFS))[0].as_mut_ptr(), (*(&raw mut STRETCH_BUFS))[1].as_mut_ptr()] };
     let (first, end) = (span.data_offset, span.data_offset + span.data_len);
     // To the next stretch boundary of the value, or the plane's end.
     let next_to = |at: u64| ((at / STRETCH as u64 + 1) * STRETCH as u64).min(end);
+    // The plane's first stretch is already in the first buffer (read for the opening, at the value's own offsets): converted from there, not read again.
+    let first_held = spans_ok && next_to(first) <= head as u64;
     // The sample being filled (all three planes in a row), and a byte carried over a stretch's edge (a plane starting at an odd offset of the value).
     let (mut s, mut carry): (usize, Option<u8>) = (0, None);
     let mut at = first;
     let (mut t_wait, mut t_conv) = (0u64, 0u64);
     let t_reads = now();
-    let mut seq = read_post(c, key, at, ptrs[0], (next_to(at) - at) as usize);
+    let mut seq = if first_held { 0 } else { read_post(c, key, at, ptrs[0], (next_to(at) - at) as usize) };
     let mut k = 0;
     while at < end {
         let to = next_to(at);
+        let held = k == 0 && first_held;
         let t = now();
-        if !read_wait(seq) {
+        if !held && !read_wait(seq) {
             l.s(b"display: the person's own wallpaper could not be read whole; theirs from the seed shows\n");
             l.flush();
             return false;
@@ -4747,8 +4775,8 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
         if to < end {
             seq = read_post(c, key, to, ptrs[(k + 1) & 1], (next_to(to) - to) as usize);
         }
-        // SAFETY: the job just waited for filled these `to - at` bytes and is done; the job posted after it writes only the other buffer, and this one is not posted again until it has been converted.
-        let bytes = unsafe { core::slice::from_raw_parts(ptrs[k & 1] as *const u8, (to - at) as usize) };
+        // SAFETY: the job just waited for filled these `to - at` bytes and is done (or, the first stretch held, the opening's read put them at the value's own offsets in the first buffer); the job posted after it writes only the other buffer, and this one is not posted again until it has been converted.
+        let bytes = unsafe { core::slice::from_raw_parts((ptrs[k & 1] as *const u8).add(if held { at as usize } else { 0 }), (to - at) as usize) };
         let t = now();
         let mut i = 0;
         if let Some(hi) = carry.take() {
@@ -4788,11 +4816,13 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
     l.dec(len as u64 / total);
     l.s(b" MB/s): opening the document ");
     l.dec(t_open / 1000);
-    l.s(b" ms, the plane ");
+    l.s(b" ms (its ends ");
+    l.dec(t_spans / 1000);
+    l.s(b"), the plane ");
     l.dec(ms(t_plane));
     l.s(b" ms (waiting on the vault ");
     l.dec(ms(t_wait));
-    l.s(b" ms, the codes to working values ");
+    l.s(b" ms, the codes ");
     l.dec(ms(t_conv));
     l.s(b" ms beside its reads); ");
     l.dec(VAULT_CALLS.load(Ordering::Relaxed) - calls0);
