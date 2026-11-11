@@ -19,6 +19,11 @@ GPU.md is the driver as built; this is what it grows into.
 - **The kept wallpaper's read first** (2026-11-11): "2.9s for a 24MB read is embarassing by the way... that def needs fixed BEFORE we decide to take the pre-rendered disk read out." (open question 3 waits on that fix).
 - **No GPU, no picture** (2026-11-11): "Black until we bring the GPU up. I did say no fallbacks." (open question 4 closed).
 - **Spirix** (2026-11-11): "Spirix is a ways out, I wish but hardware ain't there yet."
+- **No GPU right** (2026-11-11): "No GPU prompt, that's implicit." Every kist computes on the GPU as it does on the CPU, in its own GPU address space (open question 5 closed).
+- **Loops, the progress timer** (owner: "Your call on loops"): no bounded-loop rule (termination is not provable in general and the rule would refuse honest kernels); the firmware's progress timer stops a runaway, costing only that client's job (open question 6 closed).
+- **Power and clocks** (owner: "Your call on the last two"): the GPU powers up when work is queued and gates when its queue empties, as events, never a timer; its clock steps with load inside the measured floors (open question 7 closed).
+- **naga in the developer's tools only** (same): it parses WGSL on the developer's machine; the device runs ferros's own validator over the VSF form, never naga (open question 8 closed).
+- **Build it** (2026-11-11): "I say we build it!"
 - **Source language, proposed** (owner: "Not sure on the source language, thoughts?"): the VSF form is the contract and any front end that emits it is welcome, all on the developer's machine: WGSL first (Mahere's compose is WGSL, naga parses it), Rust next (rust-gpu to SPIR-V, naga reads SPIR-V into the same form), ferros's own kernels from the `valhall` crate's recorded Rust into the same form, and a Spirix type in the form once Spirix replaces IEEE.
 
 ## 0. Study
