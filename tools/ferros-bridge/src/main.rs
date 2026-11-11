@@ -599,7 +599,7 @@ fn build_cmd(cap_name: &[u8], op: ferros_pt::Op, params: &[u8]) -> Vec<u8> {
 // Commands
 // ---------------------------------------------------------------------------
 
-/// Wrap position-independent native code in a signed capsule (toka's capsule format: a VSF file, section `aarch64` field `code`, signed with Ed25519 over the whole file). The developer key is the 64-byte keypair at $FERROS_DEV_KEY (default: the ferros key in the keys dir); only its 32-byte seed is used, and it never leaves this process. A kist (`--kist NAME --option HEX [--want RIGHT REASON]... [--developer NAME] [--version 0.1.0]`) is built by ferros_kist::capsule, as tools/kistcat `kist` builds one: its developer's whole public bundle in it (`kb`) and an egg per scheme, so $FERROS_DEV_KEY is then a developer key (VSF, kistcat `devkey new`) or Photon's release seed.
+/// Wrap position-independent native code in a signed capsule (toka's capsule format: a VSF file, section `aarch64` field `code`, signed with Ed25519 over the whole file). The developer key is the VSF key at $FERROS_DEV_KEY (default: the ferros key, keys/ferros.key.vsf; section `developer_key` { label a, seed kge }, read thru ferros_kist::secret, the one reader); only its seed is used, and it never leaves this process. A raw key file (the form before 2026-11-10) is refused, naming the conversion (kistcat `devkey convert`). A kist (`--kist NAME --option HEX [--want RIGHT REASON]... [--developer NAME] [--version 0.1.0]`) is built by ferros_kist::capsule, as tools/kistcat `kist` builds one: its developer's whole public bundle in it (`kb`) and an egg per scheme, derived under the key's label, or fgtw's release bundle when the key is Photon's release key.
 /// `--text-len N`: for a masked capsule, how many bytes of the image are instructions (the rest is read-only data).
 fn text_len_arg(args: &[String]) -> Option<usize> {
     args.iter().position(|a| a == "--text-len").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok())
@@ -659,38 +659,36 @@ fn option_arg() -> Option<[u8; 32]> {
     }
 }
 
-/// The kist signer's bundle from the key file: a developer's key (VSF, section `developer_key` { label a, seed kge }: tools/kistcat `devkey new`), its post-quantum halves derived under its label; or a raw seed that is Photon's release key (its bundle fgtw's). Any other raw seed is refused: a kist is never signed with one egg.
-fn kist_signer(key: &[u8], key_path: &str) -> fgtw::pq::SigningBundle {
-    use fgtw::pq::FleetSigner;
-    if key.starts_with("RÅ<".as_bytes()) {
-        let (label, mut seed) = ferros_kist::capsule::developer_key(key).unwrap_or_else(|e| {
-            eprintln!("{key_path}: {e}");
-            std::process::exit(1);
-        });
-        let b = fgtw::pq::SigningBundle::developer(&seed, &label);
-        seed.fill(0);
+/// The kist signer's bundle from the key's label and seed: Photon's release key (known by its Ed25519 public key) signs with fgtw's release bundle; any other key with its post-quantum halves derived under its label (fgtw `SigningBundle::developer`, as kistcat `kist` does).
+fn kist_signer(label: &str, seed: &[u8; 32]) -> fgtw::pq::SigningBundle {
+    let b = fgtw::pq::SigningBundle::release(seed);
+    if b.public().ed25519() == fgtw::release::RELEASE_ED25519 {
         return b;
     }
-    let seed: [u8; 32] = key[..32].try_into().unwrap();
-    let b = fgtw::pq::SigningBundle::release(&seed);
-    if b.keypair().public.to_bytes() != fgtw::release::RELEASE_ED25519 {
-        eprintln!("{key_path}: a kist is signed with every scheme of its developer's bundle: give a developer key (kistcat devkey new) or Photon's release key, not a bare seed");
+    fgtw::pq::SigningBundle::developer(seed, label)
+}
+
+/// The developer key's file when $FERROS_DEV_KEY is unset: the ferros key as VSF (kistcat `devkey convert` writes it from the raw keys/ferros.secret).
+const DEV_KEY: &str = "/mnt/Harbor/Code/keys/ferros.key.vsf";
+
+/// The developer key at $FERROS_DEV_KEY (default [`DEV_KEY`]) read thru ferros_kist::secret, the one reader: its label and seed. The file's bytes are wiped once read; a raw key file is refused, naming the conversion.
+fn dev_key() -> (String, [u8; 32]) {
+    let key_path = std::env::var("FERROS_DEV_KEY").unwrap_or_else(|_| DEV_KEY.to_string());
+    let mut doc = std::fs::read(&key_path).unwrap_or_else(|e| {
+        eprintln!("No developer key at {key_path}: {e} (the ferros key as VSF is written once from the raw keys/ferros.secret: cargo run --release --manifest-path tools/kistcat/Cargo.toml -- devkey convert --raw /mnt/Harbor/Code/keys/ferros.secret --label FERROS_PROJECT --secret {DEV_KEY})");
         std::process::exit(1);
-    }
-    b
+    });
+    let read = ferros_kist::secret::read(&doc);
+    doc.fill(0);
+    read.unwrap_or_else(|e| {
+        eprintln!("Developer key at {key_path}: {e}");
+        std::process::exit(1);
+    })
 }
 
 fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8> {
     use ed25519_dalek::SigningKey;
-    let key_path = std::env::var("FERROS_DEV_KEY").unwrap_or_else(|_| "/mnt/Harbor/Code/keys/ferros.secret".to_string());
-    let key = std::fs::read(&key_path).unwrap_or_else(|e| {
-        eprintln!("No developer key at {key_path}: {e}");
-        std::process::exit(1);
-    });
-    if key.len() < 32 {
-        eprintln!("Developer key at {key_path} is too short");
-        std::process::exit(1);
-    }
+    let (label, mut seed) = dev_key();
     // The code's section, as kistcat writes it (ferros_kist::capsule): `--bti` (the image carries BTI landing pads; the kernel maps its code on guarded pages, SANDBOX.md "BTI") and `--exact` (exact mode, the subtract and unsigned compare; needs `--bti`).
     let c = ferros_kist::capsule::Code { image: code, masked, text: text_len, fixed: fixed_arg(), bti: std::env::args().any(|a| a == "--bti"), exact: std::env::args().any(|a| a == "--exact") };
     // A kist: its declaration before its code (the kernel and the installer read it from the capsule's first bytes), its option in it (`kist`'s `option`), its developer's whole public bundle in it (`kb`), and an egg per scheme (owner, 2026-11-10: "no single eggs"; trust on first install), built by the one builder kistcat's `kist` uses.
@@ -699,7 +697,8 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
             eprintln!("a kist needs its --option (its identity across versions, minted once)");
             std::process::exit(1);
         };
-        let signer = kist_signer(&key, &key_path);
+        let signer = kist_signer(&label, &seed);
+        seed.fill(0);
         let developer = std::env::args().collect::<Vec<_>>().windows(2).find(|w| w[0] == "--developer").map(|w| w[1].clone());
         // `--version 0.1.0` (any number of parts): the kist's version, in its signed declaration.
         let version = std::env::args().collect::<Vec<_>>().windows(2).find(|w| w[0] == "--version").map(|w| {
@@ -718,7 +717,6 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
         });
     }
     // Every other capsule (the shell's processes, under ferros's key) keeps its one Ed25519 signature.
-    let seed: [u8; 32] = key[..32].try_into().unwrap();
     let pubkey = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
     let unsigned = vsf::VsfBuilder::new()
         .add_section_direct(ferros_kist::capsule::code_section(&c))
@@ -730,10 +728,13 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
         });
     // Test switches for the gate (it must refuse both): FERROS_ZERO_SIG sends the capsule with its signature slot still all zeros; FERROS_RANDOM_SIG signs it, then overwrites the signature with other bytes.
     if std::env::var("FERROS_ZERO_SIG").is_ok() {
+        seed.fill(0);
         return unsigned;
     }
     let plain = unsigned.clone();
-    let mut signed = vsf::verification::sign_file(unsigned, &seed).unwrap_or_else(|e| {
+    let signed = vsf::verification::sign_file(unsigned, &seed);
+    seed.fill(0);
+    let mut signed = signed.unwrap_or_else(|e| {
         eprintln!("Capsule signing failed: {e}");
         std::process::exit(1);
     });

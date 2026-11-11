@@ -1,13 +1,14 @@
 //! kistcat: the kist directory (docs/KISTS.md "The directory"; owner, 2026-11-10).
 //!
-//! - `kistcat build --key <secret> --out <dir> [--web <web/index.html>] [--signer-name NAME] ENTRY...` writes `<dir>/kists.vsf` (signed by the project key with every egg), `<dir>/index.html` (the page for kists.fgtw.org) and, with `--web`, the list on ferros.org between its markers, then prints the wrangler commands that publish them. It uploads nothing.
+//! - `kistcat build --key <secret> --out <dir> [--web <web/index.html>] ENTRY...` writes `<dir>/kists.vsf` (signed by the project key with every egg), `<dir>/index.html` (the page for kists.fgtw.org) and, with `--web`, the list on ferros.org between its markers, then prints the wrangler commands that publish them. It uploads nothing.
 //! - `kistcat build --unsigned ...` in place of `--key`: the directory with NO signature, while the project key is not chosen (owner, 2026-11-10: it waits for the FGTW kaitiakitanga). The device reads it unchecked and its Kists page says so; the page says so too.
 //! - An ENTRY is a local capsule, `--capsule <file> --about TEXT [--icon PATH]`: read for its developer key, option, name, developer's name, version (its signed declaration's, `kistcat kist --version`), blake3 and size, with every egg verified against the developer bundle it carries (or Photon's release bundle), as the device's installer checks it; listed at `/capsules/<blake3>.vsf` on kists.fgtw.org.
 //! - `kistcat kist ...`: a kist signed by its developer's own key (below, `fn kist`).
 //! - Or a developer's manifest, `--manifest <http URL> --name NAME --option HEX --about TEXT [--platform P] [--arch A] [--icon PATH]`: fetched over plain HTTP at build time, every egg verified against the developer's pinned bundle, and its artefact P/A (ferros/arm64 by default) read for the capsule's blake3, size and version. The entry links the manifest rather than copying the artefact's address: the device fetches the manifest and resolves the artefact itself, and the blake3 recorded here is what it must match.
 //! - An entry that cannot be listed (a capsule signed before every-egg kists, a manifest with no ferros artefact yet) is skipped with a warning; a capsule file that is not there stops the build.
-//! - `kistcat verify <kists.vsf> [--key <secret>] [--signer-name NAME]`: every egg against the project key's bundle, then every entry's shape (`ferros_kist::directory::verify_directory`, as the device checks it); an unsigned directory is read unchecked and said to be.
-//! - The key file's first 32 bytes are the Ed25519 seed (ferros.secret is the seed then the public key); nothing of it is printed, copied or written.
+//! - `kistcat verify <kists.vsf> [--key <secret>]`: every egg against the project key's bundle, then every entry's shape (`ferros_kist::directory::verify_directory`, as the device checks it); an unsigned directory is read unchecked and said to be.
+//! - `kistcat devkey convert --raw <old key file> --label LABEL --secret <new .key.vsf>`: a key kept in the form before 2026-11-10 (a raw 32-byte seed, or ferros-mkimg's 64-byte seed and public key) written as VSF to a new file, owner-only; the old file is left as it was. The ferros key: `--raw keys/ferros.secret --label FERROS_PROJECT --secret keys/ferros.key.vsf`.
+//! - A key file (`--key`) is VSF, section `developer_key` { label a, seed kge }, read thru ferros_kist::secret (the one reader, shared with the bridge and ferros-mkimg); the project key's post-quantum halves derive under its label (the ferros key's: FERROS_PROJECT). A raw key file is refused with the conversion. Nothing of a key is printed, copied or written.
 
 mod devkey;
 use ferros_kist::Version;
@@ -17,8 +18,6 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use vsf::VsfType;
 
-/// The developer name the project key's post-quantum halves are derived under (fgtw `SigningBundle::developer`). It is part of the key: never changed once a directory is published.
-const SIGNER_NAME: &str = "FERROS_PROJECT";
 /// The artefact a manifest entry names unless told otherwise (Photon's manifest: `platform` and `arch`).
 const PLATFORM: &str = "ferros";
 const ARCH: &str = "arm64";
@@ -32,7 +31,7 @@ fn fail(msg: impl std::fmt::Display) -> ! {
 }
 
 fn usage() -> ! {
-    eprintln!("usage:\n  kistcat build (--key <secret> [--signer-name NAME] | --unsigned) --out <dir> [--web <web/index.html>] ENTRY...\n    ENTRY: --capsule <file.vsf> --about TEXT [--icon PATH]\n         | --manifest <http URL> --name NAME --option HEX64 --about TEXT [--platform P] [--arch A] [--icon PATH]\n  kistcat verify <kists.vsf> [--key <secret> [--signer-name NAME]]\n  kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf>\n  kistcat devkey new --secret <file> --label LABEL --name NAME [--contact C] [--web W] [--kind K] --record <file>\n  kistcat devkey show <record>");
+    eprintln!("usage:\n  kistcat build (--key <secret .key.vsf> | --unsigned) --out <dir> [--web <web/index.html>] ENTRY...\n    ENTRY: --capsule <file.vsf> --about TEXT [--icon PATH]\n         | --manifest <http URL> --name NAME --option HEX64 --about TEXT [--platform P] [--arch A] [--icon PATH]\n  kistcat verify <kists.vsf> [--key <secret .key.vsf>]\n  kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf>\n  kistcat devkey new --secret <file> --label LABEL --name NAME [--contact C] [--web W] [--kind K] --record <file>\n  kistcat devkey show <record>\n  kistcat devkey convert --raw <old key file> --label LABEL --secret <new .key.vsf>   (the ferros key: --label FERROS_PROJECT)");
     exit(2)
 }
 
@@ -58,7 +57,6 @@ struct Args {
     key: Option<PathBuf>,
     out: Option<PathBuf>,
     web: Option<PathBuf>,
-    signer: Option<String>,
     /// `--unsigned`: the directory with no signature (no project key chosen yet).
     unsigned: bool,
     doc: Option<PathBuf>,
@@ -74,7 +72,6 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "--key" => a.key = Some(val()?.into()),
             "--out" => a.out = Some(val()?.into()),
             "--web" => a.web = Some(val()?.into()),
-            "--signer-name" => a.signer = Some(val()?),
             "--unsigned" => a.unsigned = true,
             "--capsule" => a.specs.push(Spec::Capsule { file: val()?.into(), about: None, icon: None }),
             "--manifest" => {
@@ -139,13 +136,9 @@ fn short(k: &[u8; 32]) -> String {
     format!("G#{:02X}{:02X}_{:02X}{:02X}", k[0], k[1], k[2], k[3])
 }
 
-/// The project key's bundle from its secret file: the first 32 bytes are the Ed25519 seed, and the post-quantum halves are derived from it under `name`.
-fn signing_bundle(path: &Path, name: &str) -> SigningBundle {
-    let key = std::fs::read(path).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
-    // WHY: the file is outside input; a file shorter than a seed has none, and the slice below would panic on it.
-    let Some(seed) = key.get(..32) else { fail(format!("{}: shorter than a 32-byte seed", path.display())) };
-    let seed: [u8; 32] = seed.try_into().unwrap();
-    SigningBundle::developer(&seed, name)
+/// The project key's bundle from its secret file (VSF, read thru ferros_kist::secret): the post-quantum halves derived from its seed under its own label.
+fn signing_bundle(path: &Path) -> SigningBundle {
+    devkey::read_secret(path).unwrap_or_else(|e| fail(e)).1
 }
 
 /// The directory signed with every egg of `key` (the bridge's machinery for a kist: the release slots, then `sign_release`).
@@ -264,7 +257,7 @@ fn build(args: &[String]) {
     // The project key, or UNSIGNED: no key chosen yet (owner, 2026-11-10: the directory's signature waits for the project key).
     let key = match (&a.key, a.unsigned) {
         (Some(_), true) => fail("--key and --unsigned: one or the other"),
-        (Some(p), false) => Some(signing_bundle(p, a.signer.as_deref().unwrap_or(SIGNER_NAME))),
+        (Some(p), false) => Some(signing_bundle(p)),
         (None, true) => {
             eprintln!("kistcat: UNSIGNED directory: no project key is chosen yet, so kists.vsf carries no signature; the device reads it unchecked and its Kists page says so");
             None
@@ -350,7 +343,7 @@ fn verify(args: &[String]) {
     // An unsigned directory (`build --unsigned`) is read as the device reads it, unchecked, and said so; a signed one needs the key it is checked against.
     let read = match (&a.key, directory::parse_directory(&doc).map(|d| d.signer)) {
         (_, Ok(None)) => directory::parse_directory(&doc).map_err(String::from).map(|d| (d, "UNSIGNED: read unchecked")),
-        (Some(key_path), _) => directory::verify_directory(&doc, &signing_bundle(key_path, a.signer.as_deref().unwrap_or(SIGNER_NAME)).public()).map(|d| (d, "signed with every egg")),
+        (Some(key_path), _) => directory::verify_directory(&doc, &signing_bundle(key_path).public()).map(|d| (d, "signed with every egg")),
         (None, _) => usage(),
     };
     match read {
@@ -736,7 +729,7 @@ mod tests {
         assert_eq!(e.version.0, vec![0, 1, 0], "the version from its own signed declaration, as written");
         assert_eq!(e.option, [5; 32]);
         assert_eq!(e.capsule, *blake3::hash(&c).as_bytes());
-        let project = SigningBundle::developer(&[1; 32], SIGNER_NAME);
+        let project = SigningBundle::developer(&[1; 32], ferros_kist::secret::FERROS_LABEL);
         let doc = sign(&[e.clone()], 7, &project).unwrap();
         let d = directory::verify_directory(&doc, &project.public()).unwrap();
         assert_eq!(d.kists, vec![e]);
@@ -746,7 +739,7 @@ mod tests {
             assert!(directory::verify_directory(&t, &project.public()).is_err(), "a byte changed at {at}");
         }
         // Another key's directory is not the project's.
-        let other = SigningBundle::developer(&[2; 32], SIGNER_NAME);
+        let other = SigningBundle::developer(&[2; 32], ferros_kist::secret::FERROS_LABEL);
         assert!(directory::verify_directory(&doc, &other.public()).is_err());
     }
 
@@ -955,6 +948,15 @@ fn devkey(args: &[String]) {
             std::fs::write(&record_path, &doc).unwrap_or_else(|e| fail(format!("{}: {e}", record_path.display())));
             let back = devkey::read_record(&doc).unwrap_or_else(|e| fail(format!("the record does not verify: {e}")));
             println!("developer key {} ({}): secret {} (owner-only), public record {} ({} bytes, every egg verified)", short(&back.ed25519), back.name, secret.display(), record_path.display(), doc.len());
+        }
+        // A raw key file written as VSF to a new file (owner, 2026-11-10: secrets move to VSF). Says only the public key's first bytes; the raw file is left for the owner to retire.
+        Some("convert") => {
+            let get = |k: &str| args.windows(2).find(|w| w[0] == k).map(|w| w[1].clone());
+            let raw = PathBuf::from(get("--raw").unwrap_or_else(|| fail("--raw <the old key file>")));
+            let label = get("--label").unwrap_or_else(|| fail("--label LABEL (part of the key, never changed; the ferros key: FERROS_PROJECT)"));
+            let secret = PathBuf::from(get("--secret").unwrap_or_else(|| fail("--secret <a new file for the VSF key, e.g. keys/ferros.key.vsf>")));
+            let public = devkey::convert(&raw, &label, &secret, vsf::eagle_time_oscillations()).unwrap_or_else(|e| fail(e));
+            println!("key {} (label {label}): {} written owner-only and read back; {} is unchanged: retire it once nothing reads it", short(&public), secret.display(), raw.display());
         }
         Some("show") => {
             let p = args.get(1).unwrap_or_else(|| fail("kistcat devkey show <record>"));

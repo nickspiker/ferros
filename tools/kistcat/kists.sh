@@ -3,7 +3,7 @@
 # A local capsule entry: --capsule <file> --about TEXT. Its developer key, option, name, developer's name, version (its signed declaration's: kistcat kist --version), blake3 and size come from the capsule; it is published at /capsules/<blake3>.vsf.
 # A manifest entry: --manifest <plain-http URL> --name NAME --option HEX --about TEXT. The manifest is fetched and verified now; its ferros/arm64 artefact gives the blake3, size and version; the device resolves the capsule thru the manifest. A manifest without that artefact is skipped with a warning.
 # Descriptions are one line of ASCII (the device's installer is no_std), no em dashes.
-# UNSIGNED for now (owner, 2026-11-10): the directory's signature waits for the project key, which the FGTW kaitiakitanga has not chosen. The device reads it unchecked and its Kists page says so. Once the key exists, replace --unsigned with --key <its secret>.
+# UNSIGNED for now (owner, 2026-11-10): the directory's signature waits for the project key, which the FGTW kaitiakitanga has not chosen. The device reads it unchecked and its Kists page says so. Once the key exists, replace --unsigned with --key <its .key.vsf> (VSF, ferros_kist::secret; its post-quantum halves derive under the label kept in it).
 set -euo pipefail
 here=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$here"

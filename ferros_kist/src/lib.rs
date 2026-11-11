@@ -13,6 +13,8 @@ pub use vsf;
 pub use tatau;
 
 pub mod fetch;
+/// A signing key kept as VSF: its one reader and writer (the host tools).
+pub mod secret;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -1029,16 +1031,6 @@ pub mod capsule {
         }
     }
 
-    /// A developer key's secret (tools/kistcat `devkey new`: section `developer_key` { label a, seed kge }) read: its label and its 32-byte seed. The caller derives the bundle (`fgtw::pq::SigningBundle::developer(&seed, &label)`) and wipes the seed.
-    pub fn developer_key(doc: &[u8]) -> Result<(String, [u8; 32]), &'static str> {
-        let (header, end) = VsfHeader::decode(doc).map_err(|_| "not a VSF file")?;
-        let s = header.sections(doc, end).map_err(|_| "sections that do not parse")?.into_iter().find(|s| s.name == "developer_key").ok_or("no developer_key section")?;
-        let label = s.get_field("label").and_then(|f| f.values.iter().find_map(|v| if let VsfType::a(t) = v { Some(String::from(t.as_str())) } else { None })).ok_or("no label")?;
-        // WHY: the length is the file's; `try_into` refuses a seed of any other length.
-        let seed = s.get_field("seed").and_then(|f| f.values.iter().find_map(|v| if let VsfType::kge(k) = v { <[u8; 32]>::try_from(k.as_slice()).ok() } else { None })).ok_or("no 32-byte kge seed")?;
-        Ok((label, seed))
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1203,15 +1195,6 @@ pub mod capsule {
             let (developer, option) = identity(&t.first).unwrap();
             assert_eq!(list.trust(&developer, &a.bundle.unwrap(), a.name.as_deref(), 1), Trust::First);
             std::println!("{} by {:?}: developer {:02X?}, option {:02X?}, wants {:?}, bundle {:02X?}", declaration(&t.first).unwrap().name, a.name, &developer[..4], &option[..4], want_codes(&t.first).unwrap(), &a.bundle.unwrap()[..4]);
-        }
-
-        #[test]
-        fn a_developer_key_secret_reads() {
-            let mut s = VsfSection::new("developer_key");
-            s.add_field("label", VsfType::a(vsf::Ascii::lit("TEST_DEVELOPER")));
-            s.add_field("seed", VsfType::kge(alloc::vec![3; 32]));
-            let doc = vsf::VsfBuilder::new().creation_time_oscillations(1).provenance_only().add_section_direct(s).build().unwrap();
-            assert_eq!(developer_key(&doc).unwrap(), (String::from("TEST_DEVELOPER"), [3; 32]));
         }
     }
 }

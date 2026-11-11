@@ -9,14 +9,14 @@
 //! # Build Android boot.img for fastboot:
 //! ferros-mkimg boot kernel.elf -o ferros.img
 //!
-//! # Generate Ed25519 keypair:
+//! # Generate the ferros Ed25519 key (keys/ferros.key.vsf, VSF: ferros_kist::secret; and keys/ferros.pub):
 //! ferros-mkimg keygen -o keys/
 //!
 //! # Sign a kernel binary:
-//! ferros-mkimg sign-kernel kernel.elf --key keys/ferros.secret -o kernel.signed
+//! ferros-mkimg sign-kernel kernel.elf --key keys/ferros.key.vsf -o kernel.signed
 //!
 //! # Build signed seed boot.img:
-//! ferros-mkimg seed seed.elf --key keys/ferros.secret -o seed.img
+//! ferros-mkimg seed seed.elf --key keys/ferros.key.vsf -o seed.img
 //!
 //! # Generate a random anchor key image:
 //! ferros-mkimg anchor-key -o anchor.img
@@ -83,8 +83,8 @@ fn usage() {
     eprintln!("  ferros-mkimg flat <kernel.elf> -o <output.bin>");
     eprintln!("  ferros-mkimg boot <kernel.elf> [--pad <MiB>] -o <output.img>");
     eprintln!("  ferros-mkimg keygen -o <dir/>");
-    eprintln!("  ferros-mkimg sign-kernel <kernel.elf> --key <secret> -o <kernel.signed>");
-    eprintln!("  ferros-mkimg seed <seed.elf> --key <secret> [--pad <MiB>] -o <seed.img>");
+    eprintln!("  ferros-mkimg sign-kernel <kernel.elf> --key <secret .key.vsf> -o <kernel.signed>");
+    eprintln!("  ferros-mkimg seed <seed.elf> --key <secret .key.vsf> [--pad <MiB>] -o <seed.img>");
     eprintln!("  ferros-mkimg anchor-key -o <anchor.img>");
     eprintln!("  ferros-mkimg avb-keygen -o <keys dir>                 (RSA-4096 for avb_custom_key, as <dir>/avb.vsf: kgr + kvr)");
     eprintln!("  ferros-mkimg avb-pubkey --key <avb.vsf> -o <avb_custom_key.bin>");
@@ -446,19 +446,22 @@ fn find_arg<'a>(args: &'a [String], long: &str, short: &str) -> Option<&'a str> 
 }
 
 /// Load Ed25519 secret key from file (64 bytes).
+/// The signing key from its VSF file (section `developer_key` { label a, seed kge }), read thru ferros_kist::secret, the one reader the bridge and kistcat use; only the seed is used here. The file's bytes are wiped once read; a raw key file (this tool's old 64-byte form) is refused, naming the conversion.
 fn load_secret_key(path: &str) -> ed25519_compact::SecretKey {
-    let data = fs::read(path).unwrap_or_else(|e| {
+    let mut data = fs::read(path).unwrap_or_else(|e| {
         eprintln!("Error reading key {}: {}", path, e);
         process::exit(1);
     });
-    if data.len() != 64 {
-        eprintln!("Error: secret key must be 64 bytes, got {}", data.len());
+    let read = ferros_kist::secret::read(&data);
+    data.fill(0);
+    let (_, seed) = read.unwrap_or_else(|e| {
+        eprintln!("Error: key {}: {}", path, e);
         process::exit(1);
-    }
-    ed25519_compact::SecretKey::from_slice(&data).unwrap_or_else(|e| {
-        eprintln!("Error: invalid Ed25519 secret key: {}", e);
-        process::exit(1);
-    })
+    });
+    let seed = ed25519_compact::Seed::new(seed);
+    let sk = ed25519_compact::KeyPair::from_seed(seed).sk;
+    seed.wipe();
+    sk
 }
 
 // ---------------------------------------------------------------------------
@@ -590,7 +593,7 @@ fn elf_find_symbol_suffix(elf_data: &[u8], suffix: &str) -> Option<u64> {
 
 const SIGNED_TRAILER_MAGIC: &[u8; 8] = b"FERROSIG";
 
-/// Generate Ed25519 keypair.
+/// Generate the ferros Ed25519 key: `<dir>/ferros.key.vsf` (ferros_kist::secret's form, label FERROS_PROJECT; owner-only from creation) and its public key `<dir>/ferros.pub`. Refuses if either exists: a key is never overwritten.
 fn cmd_keygen(args: &[String]) {
     let dir = if args.len() >= 2 && args[0] == "-o" {
         args[1].clone()
@@ -603,23 +606,43 @@ fn cmd_keygen(args: &[String]) {
         process::exit(1);
     });
 
-    let kp = ed25519_compact::KeyPair::generate();
-
-    let secret_path = format!("{}/ferros.secret", dir);
+    let secret_path = format!("{}/ferros.key.vsf", dir);
     let pub_path = format!("{}/ferros.pub", dir);
+    let new_file = |path: &str, mode: u32| {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(path).unwrap_or_else(|e| {
+            eprintln!("Error: {}: {} (an existing key is never overwritten)", path, e);
+            process::exit(1);
+        })
+    };
 
-    fs::write(&secret_path, kp.sk.as_ref()).unwrap();
-    fs::write(&pub_path, kp.pk.as_ref()).unwrap();
-
-    // Restrict secret key permissions
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600)).ok();
+    let seed = ed25519_compact::Seed::generate();
+    let pk = ed25519_compact::KeyPair::from_seed(seed).pk;
+    let doc = ferros_kist::secret::document(ferros_kist::secret::FERROS_LABEL, &*seed, vsf::eagle_time_oscillations());
+    seed.wipe();
+    let doc = doc.unwrap_or_else(|e| {
+        eprintln!("Error: the key document: {}", e);
+        process::exit(1);
+    });
+    let mut secret = new_file(&secret_path, 0o600);
+    std::io::Write::write_all(&mut secret, &doc).unwrap_or_else(|e| {
+        eprintln!("Error writing {}: {}", secret_path, e);
+        process::exit(1);
+    });
+    drop(secret);
+    // Read back: the file on disk must make the same public key.
+    if load_secret_key(&secret_path).public_key() != pk {
+        eprintln!("Error: {}: the key read back is not the one generated: unusable", secret_path);
+        process::exit(1);
     }
+    let mut public = new_file(&pub_path, 0o644);
+    std::io::Write::write_all(&mut public, pk.as_ref()).unwrap_or_else(|e| {
+        eprintln!("Error writing {}: {}", pub_path, e);
+        process::exit(1);
+    });
 
-    let fingerprint = blake3::hash(kp.pk.as_ref());
-    eprintln!("Generated Ed25519 keypair");
+    let fingerprint = blake3::hash(pk.as_ref());
+    eprintln!("Generated Ed25519 key (VSF, label {})", ferros_kist::secret::FERROS_LABEL);
     eprintln!("  Secret: {}", secret_path);
     eprintln!("  Public: {}", pub_path);
     eprintln!("  Fingerprint: {}", &fingerprint.to_hex()[..16]);

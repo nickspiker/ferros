@@ -19,3 +19,5 @@ rsa = "0.9"
 sha2 = { version = "0.10", features = ["oid"] }
 rand = "0.8"
 vsf = { path = "../../../vsf" }
+# The ferros key as VSF (keys/ferros.key.vsf): its one reader and writer, ferros_kist::secret, shared with the bridge and kistcat. No features: the secret module needs only vsf.
+ferros_kist = { path = "../../ferros_kist" }
