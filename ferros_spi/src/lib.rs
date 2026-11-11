@@ -1,6 +1,6 @@
-//! The HSI0 USI SPI controllers (s3c64xx family) in CPU mode with byte transfers, as Android runs them (no `dma-mode` in the tree): one copy for everything that runs a port (KERNEL-OUT.md move 7). The kernel's power switches set each port up after opening its clocks (ferros_kernel spi.rs); the drivers run the transfers through their register grant: touch (USI2, docs/oracle/TOUCH.md), GPS (USI3, GPS.md), the speaker amplifiers (USI1, AUDIO.md).
+//! The HSI0 USI SPI controllers (s3c64xx family) in CPU mode with byte transfers, as Android runs them (no `dma-mode` in the tree): one copy for everything that runs a port (KERNEL-OUT.md move 7). The kernel's power switches set each port up after opening its clocks (ferros_kernel spi.rs); the drivers run the transfers thru their register grant: touch (USI2, docs/oracle/TOUCH.md), GPS (USI3, GPS.md), the speaker amplifiers (USI1, AUDIO.md).
 //!
-//! The controller is reached through `Regs`, offsets from the port's base: the kernel's physical addresses, or a process's hardware grant (a syscall per access). Every transfer but `stream` fits the 64-byte FIFO.
+//! The controller is reached thru `Regs`, offsets from the port's base: the kernel's physical addresses, or a process's hardware grant (a syscall per access). Every transfer but `stream` fits the 64-byte FIFO.
 #![no_std]
 
 /// A port's registers and the generic timer, as the caller reaches them.

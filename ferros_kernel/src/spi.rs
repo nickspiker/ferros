@@ -1,4 +1,4 @@
-//! The HSI0 USI SPI ports' clock paths: what the touch, GPS and amplifier power switches open before their drivers run the port (KERNEL-OUT.md move 7). The CMU and the USI mode word are shared by every port, so they stay the kernel's; the controller itself is set up and run by ferros_spi, the same code the drivers use through their register grants (payloads/touch, payloads/gps, payloads/amp).
+//! The HSI0 USI SPI ports' clock paths: what the touch, GPS and amplifier power switches open before their drivers run the port (KERNEL-OUT.md move 7). The CMU and the USI mode word are shared by every port, so they stay the kernel's; the controller itself is set up and run by ferros_spi, the same code the drivers use thru their register grants (payloads/touch, payloads/gps, payloads/amp).
 //!
 //! Each port is clocked from the 24.576 MHz oscillator (÷1; the controller divides by 4 inside: about 6.1 MHz on the wire), its USI switched to SPI in sysreg_hsi0, its USI reset released, and set up as `s3c64xx_spi_hwinit` does.
 

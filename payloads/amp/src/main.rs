@@ -1,6 +1,6 @@
 //! The speaker amplifiers' control side (AUDIO.md, KERNEL-OUT.md move 7): two Cirrus CS35L41 on spi_19 (HSI0 USI1), the left on the controller's own select, the right on gpn1-0. Audio itself reaches them over TDM from the always-on DSP (AoC); this is only their registers, until audio is built. What was the kernel's `diag amp state|up` (amp.rs), as a process.
 //!
-//! The kernel keeps what a process may not do behind the `amp` power switch (kernel amp.rs `power`): the port's clocks and USI mode (the HSI0 CMU every port shares), the sub PMIC's buck A (VA) over ACPM, the pins' modes, and both resets pulsed (the right's, gph2-1, sits in HSI1's bank, the modem's). Here, through register grants: the port, the right's select (gpn1's data bit; touch drives only gpn0's registers in that block), and the left's reset data bit (gpp1-1; the display and GPS drive other banks of that block), held low only to prove the right answers on its own select.
+//! The kernel keeps what a process may not do behind the `amp` power switch (kernel amp.rs `power`): the port's clocks and USI mode (the HSI0 CMU every port shares), the sub PMIC's buck A (VA) over ACPM, the pins' modes, and both resets pulsed (the right's, gph2-1, sits in HSI1's bank, the modem's). Here, thru register grants: the port, the right's select (gpn1's data bit; touch drives only gpn0's registers in that block), and the left's reset data bit (gpp1-1; the display and GPS drive other banks of that block), held low only to prove the right answers on its own select.
 //!
 //! From Google's driver (private/google-modules/amplifiers/cs35l41) and the husky DT (zuma-shusky-audio.dtsi): registers are 32-bit, addressed by a 32-bit word with bit 31 set for a read, then 16 bits of padding, then the 32-bit value big-endian. Out of reset the chip boots from its OTP and says so in IRQ1_STATUS4; then the ID registers (DEVID G#35A40, or G#35B40 for the R part).
 //!
@@ -59,7 +59,7 @@ macro_rules! say {
     }};
 }
 
-/// The port through its hardware grant.
+/// The port thru its hardware grant.
 struct Grant(u64);
 impl Regs for Grant {
     fn rd(&self, off: usize) -> u32 {

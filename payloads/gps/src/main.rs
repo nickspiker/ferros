@@ -43,7 +43,7 @@ const EINT_PEND: u64 = 0xA00;
 const SPI_MODE: u32 = 0xC;
 const SPI_FB: u32 = 1;
 
-/// The SPI port through its hardware grant.
+/// The SPI port thru its hardware grant.
 struct Port(u64);
 impl ferros_spi::Regs for Port {
     fn rd(&self, off: usize) -> u32 {

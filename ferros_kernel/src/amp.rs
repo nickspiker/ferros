@@ -1,4 +1,4 @@
-//! The two speaker amplifiers' power (AUDIO.md, KERNEL-OUT.md move 7): Cirrus CS35L41 on spi_19 (HSI0 USI1), left on the controller's CS0, right on GPIO gpn1-0. Their registers are the `amp` process's (payloads/amp, through its grants: the port, gpn1's data bit, gpp1's); this is what it may not do. The kernel's `diag amp state|up` went with the move (2026-11-10).
+//! The two speaker amplifiers' power (AUDIO.md, KERNEL-OUT.md move 7): Cirrus CS35L41 on spi_19 (HSI0 USI1), left on the controller's CS0, right on GPIO gpn1-0. Their registers are the `amp` process's (payloads/amp, thru its grants: the port, gpn1's data bit, gpp1's); this is what it may not do. The kernel's `diag amp state|up` went with the move (2026-11-10).
 //!
 //! From the husky DT (zuma-shusky-audio.dtsi) and Google's driver (private/google-modules/amplifiers/cs35l41): VA = the sub PMIC's buck A, VP = the battery directly; reset gpp1-1 (left) and gph2-1 (right), active high.
 

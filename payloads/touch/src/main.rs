@@ -29,7 +29,7 @@ const S_IRQ: u64 = 4;
 /// The `touch` power switch: clocks, rails and reset (the kernel's touch.rs `power`).
 const S_POWER: u64 = 5;
 
-/// The SPI port through its hardware grant, for ferros_spi (the kernel's `touch` switch sets it up with the same code): mode 0, no feedback delay, byte transfers inside the 64-byte FIFO, no DMA.
+/// The SPI port thru its hardware grant, for ferros_spi (the kernel's `touch` switch sets it up with the same code): mode 0, no feedback delay, byte transfers inside the 64-byte FIFO, no DMA.
 struct Spi(u64);
 impl ferros_spi::Regs for Spi {
     fn rd(&self, off: usize) -> u32 {
