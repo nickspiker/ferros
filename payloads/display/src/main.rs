@@ -4998,9 +4998,8 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             let name: &str = match what {
                 Corner::Clock => time,
                 Corner::Cellular => match tech {
-                    // The generation a person knows (owner, 2026-11-10: "LTE? Is it 4G? 5G Freq? what should we actually put up there?"): LTE is 4G, NR is 5G, and 5G only while the NR link itself is up. The band and its frequency go under it once the modem driver decodes the serving cell.
-                    Some(14) => "4G",
-                    Some(20) => "5G",
+                    Some(14) => "LTE",
+                    Some(20) => "NR",
                     _ => "cell",
                 },
                 Corner::Wifi => "WiFi",
