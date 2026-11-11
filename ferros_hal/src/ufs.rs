@@ -179,6 +179,8 @@ const PRDT_SLOTS: usize = RUN_MAX << 3;
 
 /// The controller's PRDT entry stride, learned once (`probe_prdt_stride`): 0 not yet known, 16 the standard entry, 128 the inline-encryption entry (FMPSECURITY0.DESCTYPE 3, set through EL3 by Linux's pixel-ufs-crypto: a jump from Android leaves it so; ABL's cold path is not known to), 1 multi-entry commands refused (the probe failed: runs go a block a command, as before). A single-entry command reads its one entry at offset 0 either way, which is why the block-at-a-time path never had to know.
 pub static PRDT_STRIDE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Every command's time split (2026-11-11, measuring the vault's 24 MB read before fixing it), in counter ticks: [0] the cache upkeep around it (the descriptors' and the data's clean before the doorbell and clean-and-invalidate after: ferros runs UFS non-coherent, kernel cold_ufs.rs, so the upkeep is per line of every byte moved), [1] the doorbell to completion (the link and the device). Read by the kernel's `diag "ufs runs"`, zeroed by its reset.
+pub static CMD_TICKS: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
 /// Runs off by hand (`diag "ufs runs off"`): every run a block a command, to measure the difference on the same boot.
 pub static RUNS_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
@@ -725,6 +727,7 @@ impl UfsController {
             (*buf).utrd.dw[7] = (0x0100 << 16) | (prdt_count as u32); // prdt: offset=0x100 DW
 
             // Cache clean UTRD + UCD (its two UPIUs and the PRDT in use) + the data
+            let t0 = ticks();
             let utrd_phys = &raw const (*buf).utrd as usize;
             let ucd_phys = &raw const (*buf).ucd as usize;
             let ucd_len = 1024 + prdt_bytes;
@@ -734,6 +737,7 @@ impl UfsController {
             core::arch::asm!("dsb sy");
 
             // Ring doorbell
+            let t1 = ticks();
             self.nexus(cmd_type == 0); // SCSI (cmd_type 0) sets the nexus bit, native UFS (query) clears it
             self.write_reg(regs::UTRLDBR, 1);
 
@@ -741,9 +745,13 @@ impl UfsController {
             let _ = self.wait_transfer(4000);
 
             // Invalidate caches to see DMA results
+            let t2 = ticks();
             crate::mmio::cache_invalidate(utrd_phys, 32);
             crate::mmio::cache_invalidate(ucd_phys, ucd_len);
             crate::mmio::cache_invalidate(data.0, data.1);
+            use core::sync::atomic::Ordering::Relaxed;
+            CMD_TICKS[0].fetch_add(t1 - t0 + ticks() - t2, Relaxed);
+            CMD_TICKS[1].fetch_add(t2 - t1, Relaxed);
 
             ((*buf).utrd.dw[2] & 0xFF) as u8
         }
