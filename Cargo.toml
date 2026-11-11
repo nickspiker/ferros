@@ -44,6 +44,7 @@ members = [
     "payloads/init",
     "payloads/ramps",
     "payloads/capture",
+    "payloads/copybench",
     "payloads/inject",
     "payloads/switchtest",
     "payloads/tecount",
