@@ -134,6 +134,14 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Silent => "tahimik",
         Msg::DoNotDisturb => "huwag istorbohin",
         Msg::Screencap => "screenshot",
+        // ---- the battery's page ----
+        Msg::Charge => "karga",
+        Msg::Voltage => "boltahe",
+        Msg::Current => "kuryente",
+        Msg::PowerDraw => "lakas",
+        Msg::Temperature => "temperatura",
+        Msg::Charging => "nagcha-charge",
+        Msg::Discharging => "nagdi-discharge",
         // ---- Keyboard ----
         Msg::Layout => "ayos",
         // ---- Security ----

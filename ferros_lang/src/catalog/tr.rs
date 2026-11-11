@@ -134,6 +134,14 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Silent => "sessiz",
         Msg::DoNotDisturb => "rahatsız etmeyin",
         Msg::Screencap => "ekran görüntüsü",
+        // ---- the battery's page ----
+        Msg::Charge => "şarj",
+        Msg::Voltage => "gerilim",
+        Msg::Current => "akım",
+        Msg::PowerDraw => "güç",
+        Msg::Temperature => "sıcaklık",
+        Msg::Charging => "şarj oluyor",
+        Msg::Discharging => "boşalıyor",
         // ---- Keyboard ----
         Msg::Layout => "düzen",
         // ---- Security ----
