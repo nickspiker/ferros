@@ -303,8 +303,12 @@ fn look(k: usize, s: &Now) -> (f32, bool, Option<f32>, u64) {
 }
 
 /// Circle k drawn into its sprite at its size, front to back from empty: its ring, its word, then its vessel under them (the console's vessel, `orb::Vessel`, by a table over the radius); then decoded in place to working values.
+/// The sprites drawn since the slide's last measurement line (main.rs `SLIDE_US`).
+pub static RENDERS: AtomicU64 = AtomicU64::new(0);
+
 fn render(k: usize, grey: f32, on: bool, ring_share: Option<f32>, width: usize, height: usize) {
     use fluor::pixel::{Blend, BlendMode};
+    RENDERS.fetch_add(1, Ordering::Relaxed);
     let (x, y, r) = layout(width, height)[k];
     let Some(sp) = (unsafe { (*(&raw mut SPRITES))[k].as_mut() }) else { return };
     let (y0, span) = (sp.y0, sp.span);
@@ -407,27 +411,41 @@ pub fn compose(y: usize, out: &mut [u64], width: usize, height: usize) -> (usize
             continue;
         }
         let (x0, x1, o) = sp.span[j as usize];
-        // The chord's whole pixels, and its two part ones.
+        // The chord's whole pixels [wa, wb), and its two part ones at either end (`a` and `b - 1` when the arc crosses this sprite's span): the coverage worked out only there, never in the inner loop (2026-11-11: it was worked out at every pixel, a slide step's compose 2.8 ms on the Pro).
         let (a, b) = (if (x0 as f32) < cl { libm::floorf(cl) as usize } else { x0 as usize }, if (x1 as f32) > cr { libm::ceilf(cr) as usize } else { x1 as usize });
-        for x in a..b {
-            let mut s = sp.data[o as usize + x - x0 as usize];
-            if s >> 63 != 0 {
-                continue;
-            }
-            // A column the arc crosses: the layer scaled by the share of the pixel inside it. WHY the bounds: coverage is the overlap of [x, x + 1] with the chord, a share by definition.
-            let cov = { let (p, q) = (if (x as f32) > cl { x as f32 } else { cl }, if ((x + 1) as f32) < cr { (x + 1) as f32 } else { cr }); q - p };
-            if cov < 1. {
-                if cov <= 0. {
-                    continue;
-                }
-                let q = (cov * 65536.) as u64;
-                s = scale_q16(s, q) | (16384 - ((16384 - trans(s)) * q >> 16)) << 49;
-            }
+        if a >= b {
+            continue;
+        }
+        let (wa, wb) = (if (a as f32) < cl { a + 1 } else { a }, if (b as f32) > cr { b - 1 } else { b });
+        // This row of the sprite, indexed by screen column from x0.
+        let data = &sp.data[o as usize..];
+        let x0 = x0 as usize;
+        let mut put = |x: usize, s: u64| {
             let f = out[x];
             out[x] = if f >> 63 != 0 { s } else { let (ch, t) = under_pm(f & ((1 << 48) - 1), trans(f), s & ((1 << 48) - 1), trans(s)); ch | t << 49 };
-            lo = lo.min(x);
-            hi = hi.max(x + 1);
+        };
+        for x in wa..wb.max(wa) {
+            let s = data[x - x0];
+            if s >> 63 == 0 {
+                put(x, s);
+            }
         }
+        // A column the arc crosses: the layer scaled by the share of the pixel inside it. WHY the bounds: coverage is the overlap of [x, x + 1] with the chord, a share by definition.
+        let edges = if b - 1 == a { [a, a] } else { [a, b - 1] };
+        for (k, &x) in edges.iter().enumerate() {
+            if (x >= wa && x < wb) || (k == 1 && edges[1] == edges[0]) {
+                continue;
+            }
+            let s = data[x - x0];
+            let cov = { let (p, q) = (if (x as f32) > cl { x as f32 } else { cl }, if ((x + 1) as f32) < cr { (x + 1) as f32 } else { cr }); q - p };
+            if s >> 63 != 0 || cov <= 0. {
+                continue;
+            }
+            let q = (cov * 65536.) as u64;
+            put(x, scale_q16(s, q) | (16384 - ((16384 - trans(s)) * q >> 16)) << 49);
+        }
+        lo = lo.min(a);
+        hi = hi.max(b);
     }
     if lo < hi { (lo, hi) } else { (0, 0) }
 }

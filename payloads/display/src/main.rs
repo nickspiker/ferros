@@ -5063,6 +5063,9 @@ extern "C" fn console_worker(arg: u64) -> ! {
                         l.s(b"/");
                         l.dec(s.max[j]);
                     }
+                    // How many of the row's sprites were drawn in those passes (a look that changed: a tap, the torch answering): a slide alone draws none.
+                    l.s(b"; sprites drawn ");
+                    l.dec(quick::RENDERS.swap(0, Ordering::Relaxed));
                     l.s(b"\n");
                     l.flush();
                     *s = SlideUs::ZERO;
