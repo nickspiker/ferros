@@ -110,6 +110,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::LatLon => "latitudine, longitudine",
         Msg::DegMinSec => "gradi, minuti, secondi",
         Msg::NoFixYet => "ancora nessuna posizione",
+        Msg::HasFix => "posizione trovata",
         Msg::StartingUp => "avvio",
         Msg::UsingNow => "lo usano ora",
         // ---- bases ----

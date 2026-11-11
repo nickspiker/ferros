@@ -110,6 +110,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::LatLon => "vĩ độ, kinh độ",
         Msg::DegMinSec => "độ, phút, giây",
         Msg::NoFixYet => "chưa định vị",
+        Msg::HasFix => "đã định vị",
         Msg::StartingUp => "đang khởi động",
         Msg::UsingNow => "đang dùng",
         // ---- bases ----

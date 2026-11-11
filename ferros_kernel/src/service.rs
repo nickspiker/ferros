@@ -1373,6 +1373,7 @@ fn thermal_poll() {
     } else if from != 0 && cpu < at.saturating_sub(10) && crate::acpm::dvfs_set(4, from).is_ok() {
         THROTTLED_FROM.store(0, Relaxed);
     }
+    bell_facts();
 }
 
 /// The vault's key count for fact 7, kept by the service loop (gauge_poll).
@@ -1581,6 +1582,26 @@ static mut FRAMES_FAST_AT: u64 = 0;
 /// Idle sleeps the EL2 timer's backstop ended (the event stream did not): DIAG BACKSTOP_WAKES.
 static BACKSTOP_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The facts a settings page shows as the facts' bell last rang for them (`bell_facts`): the battery's share, whether it charges, the processes alive, the vault's keys, the hottest zone, the throttle. Only the service loop touches it.
+static mut FACTS_SHOWN: [u64; 6] = [crate::process::FACT_UNKNOWN; 6];
+/// The processes alive as last counted (`bell_facts`, when the table changed).
+static ALIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The facts' bell (process.rs SYS_BELL, `BELL_FACTS`; owner, 2026-11-10: "Needs a doorbell"): rung when a fact the settings show differs from what it last rang for, so the About page draws again on a change and never on a timer. Called where those facts are published, on the service loop: the gauge's sample (every two seconds, the kernel's own sampling of the hardware, unchanged), the thermal zones' read (once a second), and the process table changing (PROCS_GEN). A sample that changes nothing shown (the cell's voltage, the battery's temperature, a current that stays on its side of zero) rings nothing.
+fn bell_facts() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let g = unsafe { (*(&raw const GAUGE)).0 };
+    // Charging as the About page says it: the current's sign, positive charging (fact 4), unknown kept apart from either.
+    let charging = if g[3] == crate::process::FACT_UNKNOWN { 2 } else { (g[3] as i64 > 0) as u64 };
+    let hottest = THERMAL.iter().map(|t| t.load(Relaxed)).max().unwrap_or(0) as u64;
+    let now = [g[0], charging, ALIVE.load(Relaxed), VAULT_KEYS.load(Relaxed), hottest, (THROTTLED_FROM.load(Relaxed) != 0) as u64];
+    let shown = unsafe { &mut *(&raw mut FACTS_SHOWN) };
+    if now != *shown {
+        *shown = now;
+        crate::process::with_lock(|| crate::process::bell_count(crate::process::BELL_FACTS));
+    }
+}
+
 /// From the service loop on the kernel's core: the battery gauge every two seconds, for facts 1-4, and the vault's key count, for fact 7.
 fn gauge_poll() {
     let (f, now) = (cntfrq(), cntpct());
@@ -1599,6 +1620,7 @@ fn gauge_poll() {
                     VAULT_KEYS.store(keys.len() as u64, core::sync::atomic::Ordering::Relaxed);
                 }
             }
+            bell_facts();
         }
     }
 }
@@ -2110,6 +2132,9 @@ pub fn run(mut b: Boot) -> ! {
         let table = crate::process::PROCS_GEN.load(core::sync::atomic::Ordering::Acquire);
         if table != unsafe { PROCS_SEEN } {
             unsafe { PROCS_SEEN = table };
+            // The process count for the facts' bell (the About page's), counted only when the table changed.
+            ALIVE.store(crate::process::alive() as u64, core::sync::atomic::Ordering::Relaxed);
+            bell_facts();
             let live = crate::process::running(b"gpu");
             if live != unsafe { GPU_CLOCKED } {
                 unsafe { GPU_CLOCKED = live };

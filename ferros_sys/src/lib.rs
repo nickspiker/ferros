@@ -56,6 +56,7 @@ pub mod nr {
     pub const ZONE: u64 = 35;
     pub const LANG: u64 = 36;
     pub const CLAIM: u64 = 37;
+    pub const BELL: u64 = 38;
 }
 
 /// The clock's zone (kernel zone.rs, SYS_ZONE; docs/TIME.md; owner, 2026-11-10): the identity's choice and this device's own, each automatic (the zone found from the cellular network, then GPS) or by hand (an IANA id), and the switch that says which rules.
@@ -528,6 +529,14 @@ pub fn measure_of(w: u64) -> Option<(u16, i64)> {
 /// This driver's track `k` (0-63; `tracks`), as `status` sets a measure.
 pub fn status_track(k: usize, word: u64) -> u64 {
     status(8 + k as u64, word)
+}
+
+/// The facts' bell source (`bell`): the facts a settings page shows (the battery's share and whether it charges, the processes alive, the vault's keys, the hottest part of the chip and its throttle). Sources 0-5 are the links in the facts' order.
+pub const BELL_FACTS: u64 = 6;
+
+/// A doorbell on what the settings pages show (kernel SYS_BELL; owner, 2026-11-10: "Needs a doorbell"): the kernel writes `source`'s change count into `word` now and whenever it changes, waking whatever waits on it (`wait_world`). Source 0-5 a link (its measures, tracks and detail, as its driver sets them, and emptied as it ends), `BELL_FACTS` the facts. A reader that compares the word to the count it last drew with knows to draw again, and asks nothing on a timer. False for no such source, or a kernel without bells.
+pub fn bell(source: u64, word: &core::sync::atomic::AtomicU64) -> bool {
+    svc(nr::BELL, source, off(word as *const _ as *const u8), 0, 0, 0) == 0
 }
 
 /// Link `link`'s tracks (0 cellular … 5 USB, the facts' order) into `buf`, at most 64: the words written (each a tagged measure, all ones empty), or 0 for none.

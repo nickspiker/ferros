@@ -188,6 +188,8 @@ messages! {
     /// "degrees, minutes, seconds".
     DegMinSec,
     NoFixYet,
+    /// A GPS link's state once its driver has a fix (its state row; owner, 2026-11-10: `Searching` until then).
+    HasFix,
     /// The GPS driver started for the page and not answering yet.
     StartingUp,
     /// The heading over who is using GPS now.
