@@ -172,7 +172,7 @@ fn chord_q8(cx: i64, cy: i64, r: i64, y: usize, width: usize) -> Option<(usize, 
     (lo < hi).then_some((lo, hi))
 }
 
-/// The bars' ids for bar row `b` (`bar_decode`, on the console's worker, as it composes that row: the console's ids at its own compose step), into the back buffer. Front to back as the bars draw: outside the app's circle at the top the doorway's disc and then the dash's zones (every pixel the nearest console circle's), back and home at the bottom; inside it the quick row's circles while it stands open as composed; nobody's elsewhere.
+/// The bars' ids for bar row `b` (`bar_decode`, on the console's worker, as it composes that row: the console's ids at its own compose step), into the back buffer. Front to back as the bars draw: outside the app's circle at the top the dash's zones (every pixel the nearest centre's: a console circle's, or the camera's, the doorway), back and home at the bottom; inside it the quick row's circles while it stands open as composed; nobody's elsewhere.
 pub fn bars_row(b: usize, width: usize, height: usize) {
     let (top, bot) = unsafe { (BAR_TOP, CHROME_BOT) };
     let y = if b < top { b } else { height - bot + (b - top) };
@@ -198,11 +198,7 @@ pub fn bars_row(b: usize, width: usize, height: usize) {
         outside.rest(|a, z| out[a..z].fill(SYS + 9));
         return;
     }
-    // The doorway's disc first (the quick row opens only from there), then the dash's zones: every other pixel of the chrome rows is the nearest console circle's (main.rs `dash_row`, owner 2026-11-11: "closest to circle wins if it's in the dash area"); 11 only where no zone reaches (none on these screens).
-    let (hx, hy, door) = quick::doorway_disc(width, height);
-    if let Some((a, z)) = chord(hx, hy, door, y, width) {
-        outside.claim(a, z, |a, z| out[a..z].fill(SYS + 10));
-    }
+    // The dash's zones: every pixel of the chrome rows is the nearest centre's, a console circle's or the camera's (the doorway, 10, from which alone the quick row opens), a drawn circle's own pixels its own first (main.rs `dash_row`; owner 2026-11-11: "that should be a point and a dist from BT and GPS"); 11 only where no zone reaches (none on these screens).
     for &(a, z, id) in dash_row(y, width, height) {
         outside.claim(a as usize, z as usize, |a, z| out[a..z].fill(SYS + id));
     }

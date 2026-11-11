@@ -22,11 +22,9 @@ pub enum Item {
 pub const N: usize = 6;
 pub const ITEMS: [Item; N] = [Item::RadiosOff, Item::Sound, Item::Brightness, Item::Torch, Item::Dnd, Item::Screencap];
 
-/// The row at rest, open: (x, y, r) a circle, left to right, solved once per screen size; and the doorway's radius about the camera hole, its own cache (it needs the corners, which the row does not).
+/// The row at rest, open: (x, y, r) a circle, left to right, solved once per screen size.
 static mut LAYOUT: [(f32, f32, f32); N] = [(0., 0., 0.); N];
 static mut LAYOUT_FOR: (usize, usize) = (0, 0);
-static mut DOOR: f32 = 0.;
-static mut DOOR_FOR: (usize, usize) = (0, 0);
 
 /// Bisection steps: each halves a bracket, and the widest here (half the screen) comes down under a 64th of a pixel in 16.
 const STEPS: u32 = 1 << 4;
@@ -138,27 +136,6 @@ pub fn rows(width: usize, height: usize, chrome_top: usize) -> usize {
     if need > chrome_top { need } else { chrome_top }
 }
 
-/// The doorway's radius: the disc about the camera hole out to the nearest of the top's console circles (outside the app's circle, the open spot NFC left).
-fn door(width: usize, height: usize) -> f32 {
-    unsafe {
-        if DOOR_FOR == (width, height) {
-            return DOOR;
-        }
-    }
-    let (hx, hy, _) = ferros_sys::cutout_hole();
-    let (corners, n) = corner_layout(width, height);
-    let d = corners[..n].iter().filter(|c| c.1 < height as f32 * 0.5).map(|c| libm::sqrtf((c.0 - hx) * (c.0 - hx) + (c.1 - hy) * (c.1 - hy)) - c.2).fold(f32::MAX, f32::min);
-    let mut l = Log { grants: unsafe { PANIC_GRANTS }, buf: [0; 256], n: 0 };
-    l.s(b"display: quick row doorway ");
-    l.dec(d as u64);
-    l.s(b"\n");
-    l.flush();
-    unsafe {
-        DOOR = d;
-        DOOR_FOR = (width, height);
-    }
-    d
-}
 
 // ---- the slide (owner, 2026-11-11, on the Pro: "the top console pulldown is stupidly slow and jerky"; then "track the finger down from top tho and slide it in so it doesn't need a re-render, just a move and composite, then do the iterate/2 each frame, like we do for the settings page until it snaps in or out of place") ----
 //
@@ -229,12 +206,6 @@ pub fn set(m: &[u8]) -> [u8; 3] {
 pub fn open_circles(width: usize, height: usize) -> Option<[(f32, f32, f32); N]> {
     let slide = SLIDE.load(Ordering::Acquire) as i64;
     (slide > 0 && unsafe { COMPOSED } == slide).then(|| layout(width, height))
-}
-
-/// The doorway (the open spot by the camera, op 41's 10): the disc about the camera hole out to the nearest top console circle, (x, y, r). Outside the app's circle only, which the hit map's order sees to (hit.rs `bars_row` claims it among the places outside the circle).
-pub fn doorway_disc(width: usize, height: usize) -> (f32, f32, f32) {
-    let (hx, hy, _) = ferros_sys::cutout_hole();
-    (hx, hy, door(width, height))
 }
 
 /// One circle's sprite: every pixel the circle draws (out to its reach past the radius), row by row from `y0`, each row a span of columns [x0, x1) at `at` in `data`. Drawn in fluor's α + darkness, then decoded in place to working values (`working`), as the bars are, so a frame of the slide only copies and folds.

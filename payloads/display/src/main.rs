@@ -4158,7 +4158,7 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
     (out, n)
 }
 
-/// The dash's zones (owner, 2026-11-11: "ideally we make each zone in the console always map to a circle, USB, clock, battery, etc. ... and then closest to circle wins if it's in the dash area"; then, on the hit map's view: "I literally meant on the hitmap just square the diff, x and y of the two in question to pick closer"): every pixel of the top's chrome rows belongs to the top console circle whose centre is nearest, dx² + dy² against each, smallest wins, no root and no radius (the plain Voronoi diagram: straight borders). A pixel inside a circle is that circle's first (d² ≤ r²): by centres alone a big circle's rim next to a small neighbour would go to the neighbour (owner: "a pixel inside a circle is that circle's anyway"). Until this the rim's distance |p − c| − r picked (borders hyperbolas bending round each circle, read on the view as more circles). Found per pixel once per screen size and kept as runs per row (`DASH`, at most `DASH_RUNS` a row), the console's ids (op 41): 0-4 the radios, 5 USB, 13 the clock, 14 the battery. The hit map takes them from here (hit.rs `bars_row`), the doorway's disc claimed first.
+/// The dash's zones (owner, 2026-11-11: "ideally we make each zone in the console always map to a circle, USB, clock, battery, etc. ... and then closest to circle wins if it's in the dash area"; then, on the hit map's view: "I literally meant on the hitmap just square the diff, x and y of the two in question to pick closer"): every pixel of the top's chrome rows belongs to the top console circle whose centre is nearest, dx² + dy² against each, smallest wins, no root and no radius (the plain Voronoi diagram: straight borders). A pixel inside a circle is that circle's first (d² ≤ r²): by centres alone a big circle's rim next to a small neighbour would go to the neighbour (owner: "a pixel inside a circle is that circle's anyway"). Until this the rim's distance |p − c| − r picked (borders hyperbolas bending round each circle, read on the view as more circles). Found per pixel once per screen size and kept as runs per row (`DASH`, at most `DASH_RUNS` a row), the console's ids (op 41): 0-4 the radios, 5 USB, 13 the clock, 14 the battery. The hit map takes them from here (hit.rs `bars_row`), the camera hole's centre one more point (the doorway, 10; owner: "that should be a point and a dist from BT and GPS").
 const DASH_RUNS: usize = 1 << 4;
 /// The table, fixed in size so the worker never allocates it from its arena (reset each pass): chrome rows up to `DASH_ROWS` (husky 288, akita 239).
 const DASH_ROWS: usize = 1 << 9;
@@ -4190,6 +4190,9 @@ fn dash_row(y: usize, width: usize, height: usize) -> &'static [(u16, u16, u16)]
         if DASH_FOR != (width, height) {
             let (circles, n) = corner_layout(width, height);
             let tops: alloc::vec::Vec<(f32, f32, f32, u16)> = circles[..n].iter().filter(|c| c.1 < height as f32 * 0.5).filter_map(|&(x, y, r, w)| dash_id(w).map(|id| (x, y, r, id))).collect();
+            // The doorway is one more centre, the camera hole's, with no disc of its own (owner, 2026-11-11: "I still see a circle around the camera, that should be a point and a dist from BT and GPS"): its zone is the pixels nearer it than any console circle's centre, op 41's 10.
+            let (hx, hy, _) = ferros_sys::cutout_hole();
+            let sites: alloc::vec::Vec<(f32, f32, u16)> = tops.iter().map(|&(x, y, _, id)| (x, y, id)).chain(core::iter::once((hx, hy, 10))).collect();
             assert!(top <= DASH_ROWS, "dash: more chrome rows than the table holds");
             let runs = &mut *(&raw mut DASH);
             let mut longest = 0;
@@ -4208,7 +4211,7 @@ fn dash_row(y: usize, width: usize, height: usize) -> &'static [(u16, u16, u16)]
                         let d2 = |cx: f32, cy: f32| (fx - cx) * (fx - cx) + (fy - cy) * (fy - cy);
                         match tops.iter().find(|&&(cx, cy, r, _)| d2(cx, cy) <= r * r) {
                             Some(c) => c.3,
-                            None => tops.iter().map(|&(cx, cy, _, id)| (d2(cx, cy), id)).fold((f32::MAX, 11), |a, b| if b.0 < a.0 { b } else { a }).1,
+                            None => sites.iter().map(|&(cx, cy, id)| (d2(cx, cy), id)).fold((f32::MAX, 11), |a, b| if b.0 < a.0 { b } else { a }).1,
                         }
                     };
                     if id != cur {
