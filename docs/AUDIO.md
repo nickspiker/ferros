@@ -11,15 +11,25 @@ Two Cirrus Logic CS35L41 smart amplifiers on `spi_19` (BLK_HSI0 USI1, G#111C_000
 | VA | sub PMIC buck A (S2MPG15 G#29 ctrl / G#2A out; on at cold boot: ctrl G#F8) | same |
 | VP | the battery directly | same |
 
-SPI: 32-bit register address (bit 31 set for a read), 16 bits of padding, 32-bit value, all big-endian; mode 0, up to 25 MHz (ferros runs ~6.1 MHz from the oscillator, `spi.rs`). The controller only clocks with its select logic active: for the GPIO-selected right amplifier it must be in auto mode (`SLAVE_AUTO | NSC_CNT_2`); with the native select held inactive every transfer times out.
+SPI: 32-bit register address (bit 31 set for a read), 16 bits of padding, 32-bit value, all big-endian; mode 0, up to 25 MHz (ferros runs ~6.1 MHz from the oscillator: the kernel's `spi.rs` opens the clock path, `ferros_spi` runs the controller). The controller only clocks with its select logic active: for the GPIO-selected right amplifier it must be in auto mode (`SLAVE_AUTO | NSC_CNT_2`); with the native select held inactive every transfer times out.
 The HSI1 power-domain status (PMU G#1546_2B04) is a plain read; EL3's priv-reg read refuses it (-22), as it does for pd_ispfe.
 
-`ferros-bridge diag "amp up"` from a cold ferros: reset 2 ms low / 2 ms high, IRQ1_STATUS4 (G#1_001C) OTP_BOOT_DONE already set, then
+The kernel's `diag "amp up"` from a cold ferros (2026-10-20): reset 2 ms low / 2 ms high, IRQ1_STATUS4 (G#1_001C) OTP_BOOT_DONE already set, then
 
 ```
 left: DEVID G#35A40 REVID G#B2 FABID G#69
 right: DEVID G#35A40 REVID G#B2 FABID G#69
 with the left held in reset: right DEVID G#35A40, left DEVID G#0
+```
+
+### As a process (2026-11-10, KERNEL-OUT.md move 7)
+
+The kernel's `amp.rs` is now only the `amp` power switch: the port's clocks and USI mode, buck A on if it was off, the pins' modes, the right's select held high, and both resets pulsed (on); both held in reset (off, and when the process ends). The registers are `payloads/amp`'s, through the shared SPI crate (`ferros_spi`) and three grants: `usi1-spi` (the port), `gpio-gpn0` (gpn1's data bit, the right's select; touch drives only gpn0's registers in that block) and `gpio-gpp0` (gpp1's data bit, the left's reset, held low only for the right-alone check). At its start it prints the same three lines as the kernel's tool did, then serves `amp`: op 0 both DEVIDs, op 1 one register of either amplifier. A development tool until audio is built, so started by hand, never by init:
+
+```
+ferros-bridge spawn amp.bin --name amp --serve amp --hw usi1-spi --hw gpio-gpn0 --hw gpio-gpp0 --power amp
+ferros-bridge diag console          # amp: left/right OTP boot, DEVID/REVID/FABID, the right alone
+ferros-bridge diag "kill amp"       # the switch's off: both amplifiers held in reset
 ```
 
 ## Next: the audio path

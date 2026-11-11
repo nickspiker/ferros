@@ -3399,18 +3399,6 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                if cmd.params == b"amp state" {
-                    // `diag amp state`: the speaker amplifiers' SPI clock path, pins and supply, read only (amp.rs).
-                    crate::amp::state(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"amp up" {
-                    // `diag amp up`: SPI up, supply, each amplifier's reset, boot-done and chip IDs.
-                    crate::amp::up(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
                 if cmd.params == b"cam state" {
                     // `diag cam state`: the main camera's power-up dependencies, read only (camera.rs), so a cold boot is measured before anything is written.
                     crate::camera::state(&mut resp);

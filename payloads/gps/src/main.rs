@@ -39,22 +39,26 @@ const EINT_CON: u64 = 0x700;
 const EINT_MASK: u64 = 0x900;
 const EINT_PEND: u64 = 0xA00;
 
-// The s3c64xx SPI registers (ferros_kernel/src/spi.rs); this port runs mode 3 with feedback delay 1.
-const CH_CFG: u64 = 0x00;
-const MODE_CFG: u64 = 0x08;
-const SLAVE_SEL: u64 = 0x0C;
-const STATUS: u64 = 0x14;
-const TX_DATA: u64 = 0x18;
-const RX_DATA: u64 = 0x1C;
-const PACKET_CNT: u64 = 0x20;
-const FB_CLK: u64 = 0x2C;
-const CH_TX_ON: u32 = 1 << 0;
-const CH_RX_ON: u32 = 1 << 1;
-const CH_SW_RST: u32 = 1 << 5;
-const PACKET_CNT_EN: u32 = 1 << 16;
-const MODE_BYTE: u32 = 0x1FF8_0000;
+/// The port (ferros_spi, the kernel's power switch runs the same code to set it up) runs mode 3 with feedback delay 1.
 const SPI_MODE: u32 = 0xC;
 const SPI_FB: u32 = 1;
+
+/// The SPI port through its hardware grant.
+struct Port(u64);
+impl ferros_spi::Regs for Port {
+    fn rd(&self, off: usize) -> u32 {
+        mmio_read(self.0, off as u64) as u32
+    }
+    fn wr(&self, off: usize, v: u32) {
+        mmio_write(self.0, off as u64, v);
+    }
+    fn now(&self) -> u64 {
+        now()
+    }
+    fn freq(&self) -> u64 {
+        freq()
+    }
+}
 
 /// (grant slot, data register offset, pin) for each line; a bank's data register is at +4.
 const HOST_REQ: (u64, u64, u32) = (S_FAR, 0x04, 3);
@@ -64,14 +68,12 @@ const NSTANDBY: (u64, u64, u32) = (S_HSI2, 0x04, 3);
 
 struct Chip {
     grants: u64,
+    spi: ferros_spi::Spi<Port>,
 }
 
 impl Chip {
-    fn rd(&self, off: u64) -> u32 {
-        mmio_read(cap(self.grants, S_SPI), off) as u32
-    }
-    fn wr(&self, off: u64, v: u32) {
-        mmio_write(cap(self.grants, S_SPI), off, v);
+    fn new(grants: u64) -> Chip {
+        Chip { grants, spi: ferros_spi::Spi { regs: Port(cap(grants, S_SPI)), mode: SPI_MODE, fb: SPI_FB } }
     }
     fn get(&self, l: (u64, u64, u32)) -> bool {
         (mmio_read(cap(self.grants, l.0), l.1) as u32 >> l.2) & 1 == 1
@@ -81,52 +83,9 @@ impl Chip {
         let v = mmio_read(c, l.1) as u32;
         mmio_write(c, l.1, if high { v | 1 << l.2 } else { v & !(1 << l.2) });
     }
-    fn flush(&self) {
-        self.wr(CH_CFG, self.rd(CH_CFG) & !(CH_TX_ON | CH_RX_ON));
-        self.wr(PACKET_CNT, 0);
-        self.wr(CH_CFG, self.rd(CH_CFG) | CH_SW_RST);
-        let t = now() + freq() / 1000;
-        while (self.rd(STATUS) >> 6) & 0x1FF != 0 || (self.rd(STATUS) >> 15) & 0x1FF != 0 {
-            if now() > t {
-                break;
-            }
-        }
-        self.wr(CH_CFG, self.rd(CH_CFG) & !CH_SW_RST);
-    }
-    /// A streaming full-duplex transfer under the port's own chip select, at most 32 bytes in flight (kernel spi.rs `stream`).
+    /// A streaming full-duplex transfer under the port's own chip select, at most 32 bytes in flight (ferros_spi `stream`).
     fn stream(&self, tx: &[u8], rx: &mut [u8]) -> bool {
-        let n = tx.len().min(rx.len());
-        self.wr(FB_CLK, SPI_FB);
-        self.wr(SLAVE_SEL, 0);
-        self.wr(PACKET_CNT, 0);
-        self.wr(PACKET_CNT, n as u32);
-        self.wr(PACKET_CNT, n as u32 | PACKET_CNT_EN);
-        self.wr(MODE_CFG, MODE_BYTE);
-        let ch = (self.rd(CH_CFG) & !(CH_TX_ON | CH_RX_ON | 0xC)) | SPI_MODE;
-        self.wr(CH_CFG, ch | CH_RX_ON | CH_TX_ON);
-        let (mut ti, mut ri) = (0usize, 0usize);
-        let t = now() + freq() / 5;
-        let mut ok = true;
-        while ri < n {
-            while ti < n && ti - ri < 32 {
-                self.wr(TX_DATA, tx[ti] as u32);
-                ti += 1;
-            }
-            let have = ((self.rd(STATUS) >> 15) & 0x1FF) as usize;
-            for _ in 0..have.min(n - ri) {
-                rx[ri] = self.rd(RX_DATA) as u8;
-                ri += 1;
-            }
-            if now() > t {
-                ok = false;
-                break;
-            }
-        }
-        self.flush();
-        let t = now() + freq() / 100_000;
-        while now() < t {}
-        self.wr(SLAVE_SEL, 1);
-        ok
+        self.spi.stream(tx, rx).is_ok()
     }
     /// One SSI transfer (bcm_gps_spi.c): out `[G#50, len lo, len hi, data]`, in the same clocks `[status, its len lo, hi, its data]`; the chip's bytes are appended to `sink`.
     fn ssi(&self, data: &[u8], sink: &mut Buf) -> bool {
@@ -577,7 +536,7 @@ fn scrub(grants: u64, store: u64, key: &[u8]) {
 pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     // Linked -pie: the image's own relocations first, before anything reaches a vtable.
     unsafe { ferros_sys::relocate() };
-    let chip = Chip { grants };
+    let chip = Chip::new(grants);
     let sky = input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } & 1 == 1;
     let key: &[u8] = if sky { b"replay.sky" } else { b"replay" };
     let store = cap(grants, S_STORE);

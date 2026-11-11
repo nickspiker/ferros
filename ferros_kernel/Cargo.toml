@@ -17,6 +17,8 @@ ferros_sandbox = { path = "../ferros_sandbox" }
 ferros_hal = { path = "../ferros_hal", default-features = false, features = ["alloc"] }
 ferros_hal_m1 = { path = "../ferros_hal_m1", optional = true }
 ferros_layout = { path = "../ferros_layout" }
+# The SPI controller (KERNEL-OUT.md move 7): the power switches set a port up with the same code its driver runs.
+ferros_spi = { path = "../ferros_spi" }
 ferros_ext4 = { path = "../ferros_ext4" }
 ferros_f2fs = { path = "../ferros_f2fs" }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
