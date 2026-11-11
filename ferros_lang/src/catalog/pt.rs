@@ -244,6 +244,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ScopeGreen => "verde",
         Msg::ScopeClear => "sem filtro",
         Msg::HitMap => "mapa de toques",
+        Msg::PanelChannels => "canais do painel",
+        Msg::ReleaseLook => "aspecto de versão final",
+        Msg::UntilReboot => "até reiniciar",
         // ---- the attest screen ----
         Msg::Attest => "atestar",
         Msg::Mint => "cunhar",

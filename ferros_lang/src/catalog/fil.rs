@@ -244,6 +244,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ScopeGreen => "berde",
         Msg::ScopeClear => "walang filter",
         Msg::HitMap => "mapa ng pindot",
+        Msg::PanelChannels => "mga channel ng panel",
+        Msg::ReleaseLook => "itsura ng release",
+        Msg::UntilReboot => "hanggang mag-reboot",
         // ---- the attest screen ----
         Msg::Attest => "patotohanan",
         Msg::Mint => "buuin",

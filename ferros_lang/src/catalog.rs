@@ -384,7 +384,7 @@ messages! {
     // ---- Developer ----
     TemporalDither,
     LightScope,
-    /// The light scope's channels (IR stays; "off" is `Off`).
+    /// The light scope's channels (IR stays; "off" is `Off`); red, green and blue name the panel's channels too.
     ScopeRed,
     ScopeVisible,
     ScopeBlue,
@@ -392,6 +392,12 @@ messages! {
     ScopeClear,
     /// The display's hit map shown in every fourth frame (development builds).
     HitMap,
+    /// The heading over the panel's red, green and blue checkboxes (development builds).
+    PanelChannels,
+    /// The display's release look (no orange) for the rest of this boot (development builds).
+    ReleaseLook,
+    /// Under the panel's channels and the release look: nothing there is kept past a reboot.
+    UntilReboot,
 
     // ---- the attest screen (payloads/ahau): its button ----
     /// The button that attests the typed handle (owner, 2026-11-10: "needs to say attest, not unlock. always attest").

@@ -1759,7 +1759,7 @@ fn fps_dot(mask: u32, width: usize, height: usize) {
     if FPS_DOT && RAW_HOLD.load(Ordering::Acquire) == 0 {
         for k in 0..PHASES {
             if mask >> k & 1 == 1 {
-                phase_slice(k, width * height)[height / 2 * width + width / 2] = FPS_DOT_WORDS[k];
+                phase_slice(k, width * height)[height / 2 * width + width / 2] = FPS_DOT_WORDS[k] & word_mask();
             }
         }
     }
@@ -3387,11 +3387,77 @@ fn glass_radius() -> f32 {
 }
 /// Whether this is a development build.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
-/// Whether it looks like one (the orange outside the edge and on the hairlines): a development build built with FERROS_RELEASE_LOOK set looks as a release does, for screen captures to show (owner, 2026-11-10: "so I don't get orange in my screencaps"), and keeps every development tool.
+/// Whether it starts looking like one (the orange outside the edge and on the hairlines): a development build built with FERROS_RELEASE_LOOK set starts in the release look, for screen captures to show (owner, 2026-11-10: "so I don't get orange in my screencaps"), and keeps every development tool.
 const DEV_LOOK: bool = DEV && option_env!("FERROS_RELEASE_LOOK").is_none();
+/// The development look as it stands (owner, 2026-11-11: "a good spot for the release look, we can have it always be off and show orange, upon tap in UI it goes black and stays until a reboot"): on from `DEV_LOOK`, off for good by op 60 (the Developer page's "release look"), never on again until the display starts again; never stored. A release build has it off from the start and can never turn it on.
+static LOOK: AtomicBool = AtomicBool::new(DEV_LOOK);
+/// Whether the glass looks like a development build's now (`LOOK`); a constant false on release builds and on FERROS_RELEASE_LOOK builds, so their paths fold the orange away.
+#[inline(always)]
+fn dev_look() -> bool {
+    DEV_LOOK && LOOK.load(Ordering::Relaxed)
+}
 /// Outside the screen's edge: black on release; on development builds an orange (full red over the root of two, green at half: VSF RGB codes, half the light of full orange at gamma 2), so a dev image is told at a glance and the mask is still a mask. The edge's hairline is drawn in it too (`glass_front`).
 /// Two stops darker since 2026-11-09 (owner: "a bit bright and makes it hard to compose"): a quarter of the light, half the working value (gamma 2), red full over 2√2 and green a quarter.
-const EDGE_MASK: u64 = if DEV_LOOK { 1 << 48 | 11585 >> 1 | (8192 >> 1) << 16 } else { 1 << 48 };
+const EDGE_ORANGE: u64 = 1 << 48 | 11585 >> 1 | (8192 >> 1) << 16;
+/// The mask's colour now: the orange in the development look, black (no dither) otherwise.
+#[inline(always)]
+fn edge_mask() -> u64 {
+    if dev_look() { EDGE_ORANGE } else { 1 << 48 }
+}
+
+/// The panel's channels (owner, 2026-11-11: "a channel picker in debug that enables/disables red/green/blue of the panel output so I can look at channels"): bit 0 red, 1 green, 2 blue, set = on; all on from the start and after every restart, never stored. Op 59 (the Developer page's three checkboxes) sets it; development builds only. An off channel is code 0 on every pixel the panel gets, in every phase: the console, the windows, the map, a flight, the hit map's view and the test patterns alike.
+/// Where: the ODT's matrix row for that panel channel is zeroed (`odt_masked`), so its light is 0 before the output table, the table's code for 0 is 0, and the dither's threshold (at most 63, under one step of 64) never lifts it: code 0, exactly, at no cost a pixel (the table is rebuilt once when the mask changes, as for a brightness). The words written without the ODT (`pack10`: the hit map's view, the patterns; the dev dot; the 8 bpc path) take the mask as one AND a word.
+static CHANNELS: AtomicU32 = AtomicU32::new(7);
+/// The ODT's tables for a white and its peak (odt.rs `odt_tables`), each panel channel the mask has off zeroed in the matrix (`CHANNELS`): its row of E's gains and of K (c0 lanes 0, 3, 4 red; 1, 5, 6 green; 2, 7 and c1 lane 0 blue), so p = 0 for that channel whatever the pixel.
+fn odt_masked(white: f32, peak_e: f32) -> neon::Odt {
+    let mut t = odt_tables(white, peak_e);
+    let m = CHANNELS.load(Ordering::Acquire);
+    use core::arch::aarch64::*;
+    // A lane kept whole (G#FFFF) where its channel is on, zeroed where it is off: the bit's two's complement.
+    let on = |c: u32| ((m >> c & 1) as u16).wrapping_neg();
+    let (r, g, b) = (on(0), on(1), on(2));
+    let lanes0 = [r, g, b, r, r, g, g, b];
+    let lanes1 = [b, 0, 0, 0, 0, 0, 0, 0];
+    unsafe {
+        t.c0 = vandq_u16(t.c0, vld1q_u16(lanes0.as_ptr()));
+        t.c1 = vandq_u16(t.c1, vld1q_u16(lanes1.as_ptr()));
+    }
+    t
+}
+/// The mask as a 10-bit word's (B[31:22] G[21:12] R[11:2] A[1:0]): each channel's ten bits where it is on, the alpha bits always.
+#[inline(always)]
+fn word_mask() -> u32 {
+    let m = CHANNELS.load(Ordering::Relaxed);
+    3 | (m & 1) * 0x3FF << 2 | (m >> 1 & 1) * 0x3FF << 12 | (m >> 2 & 1) * 0x3FF << 22
+}
+/// Each change of the look or the channels counted (ops 59, 60), so the render thread rebuilds the table and owes every phase the whole screen (`dev_step`).
+static DEV_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Op 59 `channels [what u8]` → [0][mask u8]: bits 0-2 of `what` the panel's red, green and blue on (set) or off; bit 7 set asks, changing nothing. Status 1 on a release build, which has every channel on always. The receive thread's, answered at once; the render thread is woken to apply it.
+fn channels_op(what: u8) -> [u8; 2] {
+    if !DEV {
+        return [1, 7];
+    }
+    let was = CHANNELS.load(Ordering::Acquire);
+    if what & 0x80 == 0 && what as u32 & 7 != was {
+        CHANNELS.store(what as u32 & 7, Ordering::Release);
+        DEV_GEN.fetch_add(1, Ordering::AcqRel);
+        ferros_sys::wake(&RING_TAIL, 1);
+    }
+    [0, CHANNELS.load(Ordering::Acquire) as u8]
+}
+
+/// Op 60 `look [what u8: 0 ask, 1 release]` → [0][release u8]: the release look from now until the display starts again (no way back, and nothing stored: a reboot is the way back). Status 1 on a release build, which is in the release look always. The receive thread's, answered at once.
+fn look_op(what: u8) -> [u8; 2] {
+    if !DEV {
+        return [1, 1];
+    }
+    if what == 1 && LOOK.swap(false, Ordering::AcqRel) {
+        DEV_GEN.fetch_add(1, Ordering::AcqRel);
+        ferros_sys::wake(&RING_TAIL, 1);
+    }
+    [0, !dev_look() as u8]
+}
 
 /// The glass's shape, planned once per screen size (owner, 2026-11-02: "maintain a global compressed mask since most will be opaque for the OS in general"): the circle an app lives in (the corners outside it are the system's chrome) and the screen's own edge, as Photon draws its window on Android glass (fluor paint/edge.rs `glass_corner_params`, Nick 2026-09-17: a superellipse corner inside the glass's circular arc, cutting one and a half glass insets deeper at the diagonal, exponent 6 or the first lower one whose corners fit, nine tenths of the fitted size; the top-left and bottom-right corners twice the top-right and bottom-left, the 2:1 asymmetry).
 /// Per row: the columns of chrome from the left and from the right (the circle's outside), the columns masked from the left and from the right (the edge's outside, over the chrome), then the row's antialiased pixels in the order they apply (column, shape, coverage Q16, hairline alpha Q16): the circle's first, in column order, then the edge's, then the camera hole's knockout (every column of its range). `GLASS_ROWS` has height + 1 entries; a row's pixels run from its `first` to the next row's. Everything else on a row is glass, untouched: the publish path does no geometry at all, it copies runs and blends the listed pixels.
@@ -3619,7 +3685,7 @@ fn chrome_rows(width: usize, height: usize) -> (usize, usize) {
 
 /// The hairline's colour (owner, 2026-11-02). Release builds: standard-illuminant-E grey (equal VSF RGB codes) one stop darker than the theme's ring: the ring's photopic light (VSF RGB's weights, as vsf::colour::convert::vsf_rgb_to_photopic_f32 has them: R 0.2584, G 0.6346, B 0.1070, on gamma-2 codes) halved, back to a code. Development builds: bright orange in VSF RGB, full red, half-light green, no blue, so a dev image is told at a glance.
 fn hairline() -> u64 {
-    if !DEV_LOOK {
+    if !dev_look() {
         let ring = draw::opaque(ferros_sys::theme::current().ring);
         let lin = |sh: u32| { let c = (ring >> sh & 0xFFFF) as f32 * (1.0 / 16384.0); c * c };
         let light = 0.2584 * lin(0) + 0.6346 * lin(16) + 0.1070 * lin(32);
@@ -3671,8 +3737,9 @@ fn edge_cols(g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], width: usize) -> (u
 /// What the glass shows at column `x` of a row (`g`, its listed edge pixels `edge_px`), front to back, each layer under the ones before (`under_pm`): the glass's edge and the camera hole's knockout first, then the console's decoded pixel `c` (`CLEAR` where it has none), then the scene `p` (working values, opaque) last. Outside the masked columns the mask is opaque, so nothing behind it is read. On a listed edge pixel the mask is in front by its coverage's complement, and the edge's hairline under it in the mask's own colour (as Photon's release build on Android draws its hairline black, so the glass's corner is black to the curve). On development builds too, since the mask itself turned orange: a full-light orange hairline there stood a stop brighter than the mask beside it, a bright jagged stroke along the curve (owner, 2026-11-07). The hole's knockout (`edge_px`'s last `hole_r − hole_l` pixels, one a column from `hole_l`) is the mask by its coverage the same way, with no hairline; where it covers the pixel whole it is the mask as outside the edge, undithered.
 #[inline]
 fn glass_front(x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], c: u64, p: u64) -> u64 {
+    let mask = edge_mask();
     if x < g.mask_l as usize || x >= g.mask_r as usize {
-        return EDGE_MASK;
+        return mask;
     }
     let (hl, hr) = (g.hole_l as usize, g.hole_r as usize);
     let (edge_px, hole_px) = edge_px.split_at(edge_px.len() - (hr - hl));
@@ -3680,7 +3747,7 @@ fn glass_front(x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], c: u64,
     let edge = if x >= hl && x < hr {
         let e = &hole_px[x - hl];
         if e.2 == 0 {
-            return EDGE_MASK;
+            return mask;
         }
         Some(e)
     } else {
@@ -3692,9 +3759,9 @@ fn glass_front(x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], c: u64,
     }
     let (mut acc, mut t) = (0u64, 16384u64);
     if let Some(&(_, _, cov, h)) = edge {
-        acc = scale_q16(EDGE_MASK, 65536 - q16(cov));
+        acc = scale_q16(mask, 65536 - q16(cov));
         t = q16(cov) >> 2;
-        (acc, t) = under_pm(acc, t, scale_q16(EDGE_MASK, q16(h)), 16384 - (q16(h) >> 2));
+        (acc, t) = under_pm(acc, t, scale_q16(mask, q16(h)), 16384 - (q16(h) >> 2));
     }
     if c >> 63 == 0 {
         (acc, t) = under_pm(acc, t, c & ((1 << 48) - 1), trans(c));
@@ -5973,10 +6040,10 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
 static mut PREV_DMG: draw::Rect = draw::Rect { x0: 0, y0: 0, x1: 4096, y1: 4096 };
 static mut CUR_DMG: draw::Rect = draw::Rect::EMPTY;
 
-/// A 10-bit pixel as the hardware takes it once DMA, DPP and HDR-common agree (kernel `Panel::set_10bit`): B[31:22] G[21:12] R[11:2] A[1:0].
+/// A 10-bit pixel as the hardware takes it once DMA, DPP and HDR-common agree (kernel `Panel::set_10bit`): B[31:22] G[21:12] R[11:2] A[1:0]; the panel's channels that are off (`CHANNELS`, op 59) at code 0.
 #[inline(always)]
 fn pack10(r: u32, g: u32, b: u32) -> u32 {
-    b << 22 | g << 12 | r << 2 | 3
+    (b << 22 | g << 12 | r << 2 | 3) & word_mask()
 }
 
 /// The 8-bit canvas through the present stage with the spatial dither only (temporal off): the ODT 16 pixels a step (neon.rs `sixteen_odt`) with this row's Bayer thresholds, a row at a time through a cached buffer, then one wide copy into the non-cacheable framebuffer.
@@ -6067,8 +6134,11 @@ fn publish(back: &[Px], screen: &mut [u32]) {
     let (w, h) = unsafe { SCREEN_WH };
     hit::refresh(w as usize, h as usize, draw::Rect::full(w as usize, h as usize));
     let c8 = |v: u64| ((v & 0xFFFF) * 255 / 16384).min(255) as u32;
+    // The panel's channels that are off (`CHANNELS`, op 59) at 0, in this path's XRGB bytes.
+    let m = CHANNELS.load(Ordering::Relaxed);
+    let keep = 0xFF00_0000 | (m & 1) * 0xFF << 16 | (m >> 1 & 1) * 0xFF << 8 | (m >> 2 & 1) * 0xFF;
     for (d, &p) in screen.iter_mut().zip(back.iter()) {
-        *d = 0xFF00_0000 | c8(p) << 16 | c8(p >> 16) << 8 | c8(p >> 32);
+        *d = (0xFF00_0000 | c8(p) << 16 | c8(p >> 16) << 8 | c8(p >> 32)) & keep;
     }
 }
 
@@ -6178,6 +6248,16 @@ extern "C" fn receive(grants: u64) -> ! {
         // 58 `hit view [what u8: 0 off, 1 on, 2 toggle, 3 ask]` → [0][on u8]: the hit map in the fourth temporal phase (hit.rs; development builds only, status 1 on a release build). Answered here, at once.
         if op == 58 && n >= 2 {
             ferros_sys::reply(&tok, &hit::view_op(msg[1]));
+            continue;
+        }
+        // 59 `channels [what u8: bits 0-2 red, green, blue on; G#80 ask]` → [0][mask u8]: the panel's channels (`channels_op`; development builds only, status 1 on a release build). Answered here, at once.
+        if op == 59 && n >= 2 {
+            ferros_sys::reply(&tok, &channels_op(msg[1]));
+            continue;
+        }
+        // 60 `look [what u8: 0 ask, 1 release]` → [0][release u8]: the release look until the display starts again (`look_op`; development builds only, status 1 on a release build). Answered here, at once.
+        if op == 60 && n >= 2 {
+            ferros_sys::reply(&tok, &look_op(msg[1]));
             continue;
         }
         if op == 24 {
@@ -6413,7 +6493,9 @@ fn server(grants: u64) -> ! {
     build_lut(lut, white0, peak0);
     unsafe { LUT_FOR = bright };
     // The ODT's tables for this white (neon.rs `Odt`): every pixel's path.
-    let mut tabs = odt_tables(white0, peak0);
+    let mut tabs = odt_masked(white0, peak0);
+    // The ops 59 and 60 changes the render loop has applied (`DEV_GEN`).
+    let mut dev_seen = 0u64;
     let lut_ms = ferros_sys::us_since(t_lut) / 1000;
     // Each app icon's mip chain (draw::Mips), premultiplied, built once and kept.
     let mips: &'static [draw::Mips] = {
@@ -8505,7 +8587,7 @@ fn server(grants: u64) -> ! {
         if b != bright && ten {
             bright = b;
             let (white, peak_e, hbm, dbv) = brightness(b);
-            tabs = odt_tables(white, peak_e);
+            tabs = odt_masked(white, peak_e);
             // The panel's own setting, by the panel thread.
             PANEL_BRIGHT.store((hbm as u64) << 16 | dbv as u64, Ordering::Release);
             PANEL_SEQ.fetch_add(1, Ordering::AcqRel);
@@ -8538,6 +8620,32 @@ fn server(grants: u64) -> ! {
                 log.dec(dbv as u64);
                 log.s(b")\n");
             }
+            log.flush();
+        }
+        // The panel's channels or the look switched (ops 59, 60; development builds): the table again with the channels' rows (`odt_masked`), and every pixel published again from the back buffer as a brightness does, so no phase keeps the old channels or the orange. With an app in front the idle fill brings the phases round.
+        let g = DEV_GEN.load(Ordering::Acquire);
+        if g != dev_seen {
+            dev_seen = g;
+            let (white, peak_e, _, _) = brightness(bright);
+            tabs = odt_masked(white, peak_e);
+            let full = draw::Rect::full(width, height);
+            unsafe {
+                PHASE_DIRTY = [full; PHASES];
+                clean_reset_all();
+            }
+            if ten && unsafe { TEMPORAL } && client_owned {
+                pipe.settle(&mut armed, true);
+                publish_next(pixels, width, height, &tabs, full);
+                ferros_sys::dma_barrier();
+                pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
+                armed = Some(pipe.arm(win));
+            }
+            let m = CHANNELS.load(Ordering::Acquire);
+            log.s(b"display: panel channels");
+            log.s(if m & 1 != 0 { b" red" } else { b" -" });
+            log.s(if m & 2 != 0 { b" green" } else { b" -" });
+            log.s(if m & 4 != 0 { b" blue" } else { b" -" });
+            log.s(if dev_look() { b"; development look\n" } else { b"; release look until a restart\n" });
             log.flush();
         }
         // The power key (kernel preference 2): the panel's display off and sleep in while the screen is off, sleep out and display on when it comes back, with the frame the layer already holds. No flips while dark.

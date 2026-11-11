@@ -244,6 +244,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ScopeGreen => "hijau",
         Msg::ScopeClear => "bening",
         Msg::HitMap => "peta sentuhan",
+        Msg::PanelChannels => "kanal panel",
+        Msg::ReleaseLook => "tampilan rilis",
+        Msg::UntilReboot => "sampai dimulai ulang",
         // ---- the attest screen ----
         Msg::Attest => "sahkan",
         Msg::Mint => "cetak",

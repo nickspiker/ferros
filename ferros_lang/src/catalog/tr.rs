@@ -244,6 +244,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ScopeGreen => "yeşil",
         Msg::ScopeClear => "filtresiz",
         Msg::HitMap => "dokunma haritası",
+        Msg::PanelChannels => "panel kanalları",
+        Msg::ReleaseLook => "sürüm görünümü",
+        Msg::UntilReboot => "yeniden başlatmaya kadar",
         // ---- the attest screen ----
         Msg::Attest => "tasdikle",
         Msg::Mint => "bas",
