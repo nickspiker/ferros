@@ -65,6 +65,7 @@ members = [
     "ferros_sys",
     "ferros_kist",
     "ferros_lang",
+    "ferros_idea",
     "ferros_tz",
     "ferros_space",
     "ferros_inject",
