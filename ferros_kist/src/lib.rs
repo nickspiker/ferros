@@ -48,6 +48,20 @@ pub mod launch {
     pub const REFUSED: u8 = 4;
     /// The person's list could not be read (nobody present).
     pub const UNREADABLE: u8 = 5;
+
+    /// Why a launch init answered STARTED did not start after all (owner, 2026-11-11: Mahere's circle tapped, nothing opened, and only the console said "the arc pool has no room for the kist"). The kernel's kist job keeps the reason per capsule until that kist next starts, and rings the Settings holder's word (ferros_sys::not_started).
+    pub mod why {
+        /// No room in the memory pool for the kist's arc, and nothing is coming back to it.
+        pub const ROOM: u8 = 0;
+        /// Not installed on this device: no capsule at its address in the vault, or a masked kist with no seal here.
+        pub const NOT_HERE: u8 = 1;
+        /// Its checks refused it: its signature or the gate, a right it does not declare, native code in a production build.
+        pub const CHECKS: u8 = 2;
+        /// Its capsule could not be read: the vault process gone or busy, a read that failed, a length that changed, bytes that do not frame a capsule, or not the capsule its address names.
+        pub const READ: u8 = 3;
+        /// Anything else (no system secret, an arc of the wrong kind, the process not built).
+        pub const OTHER: u8 = 4;
+    }
 }
 
 /// A right's code from its name; None for a name outside the vocabulary.

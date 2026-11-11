@@ -439,6 +439,9 @@ enum KistDone {
     Sealed([u8; 32]),
 }
 
+use crate::process::KistFault;
+use ferros_kist::launch::why;
+
 /// The kist job's next read (from `got`); false when the channel would not take it.
 fn kist_call(job: &KistJob) -> bool {
     let mut rest = [0u8; 12];
@@ -451,15 +454,15 @@ fn kist_call(job: &KistJob) -> bool {
 }
 
 /// The kist's arc, sized from its first bytes (`kist_need`), masked when its code is (the guard above it), with those bytes copied in. Ok(false): the pool has no room yet while a process ends (a relaunch's own predecessor still leaving a core, its arc coming back at its next trap), so the job waits for that, not for a time; Err when there is no room and nothing is coming back.
-fn kist_arc(job: &mut KistJob) -> Result<bool, &'static str> {
-    let need = crate::process::kist_need(&job.head, job.total)?;
+fn kist_arc(job: &mut KistJob) -> Result<bool, KistFault> {
+    let need = crate::process::kist_need(&job.head, job.total).map_err(|e| (why::READ, e))?;
     let masked = crate::process::kist_masked(&job.head, job.total);
     let Some(arc) = crate::process::with_lock(|| crate::process::arc_alloc(need, masked)) else {
-        return if crate::process::any_dying() { Ok(false) } else { Err("the arc pool has no room for the kist") };
+        return if crate::process::any_dying() { Ok(false) } else { Err((why::ROOM, "the arc pool has no room for the kist")) };
     };
     if crate::process::CODE + job.total > arc.size {
         crate::process::with_lock(|| crate::process::arc_free(arc));
-        return Err("the kist's arc is smaller than its capsule");
+        return Err((why::OTHER, "the kist's arc is smaller than its capsule"));
     }
     unsafe { core::ptr::copy_nonoverlapping(job.head.as_ptr(), (arc.base + crate::process::CODE) as *mut u8, job.head.len()) };
     job.arc = Some(arc);
@@ -475,9 +478,9 @@ fn kist_tell(job: &KistJob, stage: u64, value: u64) {
 }
 
 /// The kist job after its last bytes or its arc: a launch's process built once the capsule is whole; an install told it is read and its checker due on the next pass; else the next read.
-fn kist_next(job: &mut KistJob) -> Option<Result<KistDone, &'static str>> {
+fn kist_next(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
     if job.got >= job.total {
-        let Some(arc) = job.arc.take() else { return Some(Err("the capsule ended before its code")) };
+        let Some(arc) = job.arc.take() else { return Some(Err((why::READ, "the capsule ended before its code"))) };
         return match &job.why {
             KistWhy::Launch(l) => Some(crate::process::spawn_kist(l, arc, job.total, &job.sealed).map(|()| KistDone::Launched)),
             KistWhy::Install(_) => {
@@ -491,15 +494,15 @@ fn kist_next(job: &mut KistJob) -> Option<Result<KistDone, &'static str>> {
         };
     }
     if !kist_call(job) {
-        return Some(Err("the kernel's channel to the vault process would not take the next read"));
+        return Some(Err((why::READ, "the kernel's channel to the vault process would not take the next read")));
     }
     None
 }
 
 /// An install's stage after its reading, one a pass: the checker (SANDBOX.md: once, at install), then the seal. Done: its seal, for the service loop to keep in `sealed`.
-fn install_step(job: &mut KistJob) -> Option<Result<KistDone, &'static str>> {
+fn install_step(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
     let arc = job.arc?;
-    let why = match job.checked.take() {
+    let code = match job.checked.take() {
         None => match crate::process::install_check(&arc, job.total, &job.capsule) {
             Ok(c) => {
                 job.checked = Some(c);
@@ -507,7 +510,7 @@ fn install_step(job: &mut KistJob) -> Option<Result<KistDone, &'static str>> {
                 unsafe { core::arch::asm!("sev") };
                 return None;
             }
-            Err(why) => why,
+            Err(c) => c,
         },
         Some((g, m, co, cl)) => match crate::process::install_seal(&arc, &g, &m, co, cl) {
             Ok(seal) => {
@@ -515,16 +518,16 @@ fn install_step(job: &mut KistJob) -> Option<Result<KistDone, &'static str>> {
                 crate::process::with_lock(|| crate::process::arc_free(arc));
                 return Some(Ok(KistDone::Sealed(seal)));
             }
-            Err(why) => why,
+            Err(c) => c,
         },
     };
-    kist_tell(job, crate::process::INSTALL_REFUSED, why);
+    kist_tell(job, crate::process::INSTALL_REFUSED, code);
     job.told = true;
-    Some(Err("refused (the reason is on the console)"))
+    Some(Err((why::CHECKS, "refused (the reason is on the console)")))
 }
 
 /// One step of the kist job: waiting for its arc, an install's next stage once it is read, or the answer to its last read if it has come, then its next read. Some(the outcome) once it is done; the arc is the process's or back in the pool by then.
-fn kist_step(job: &mut KistJob) -> Option<Result<KistDone, &'static str>> {
+fn kist_step(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
     use crate::process::{ERR, NOTHING};
     let r = (|| {
         if job.read {
@@ -542,21 +545,21 @@ fn kist_step(job: &mut KistJob) -> Option<Result<KistDone, &'static str>> {
         }
         let (value, bytes) = match crate::process::vault_answer()? {
             Ok(a) => a,
-            Err(()) => return Some(Err("the vault process ended while the capsule was read")),
+            Err(()) => return Some(Err((why::READ, "the vault process ended while the capsule was read"))),
         };
         match value {
-            NOTHING => return Some(Err("no such capsule in the vault (install it first)")),
-            ERR => return Some(Err("the vault process could not read the capsule")),
+            NOTHING => return Some(Err((why::NOT_HERE, "no such capsule in the vault (install it first)"))),
+            ERR => return Some(Err((why::READ, "the vault process could not read the capsule"))),
             _ => {}
         }
         // WHY the bounds: the length is the vault's word; a capsule of nothing, or past the gigabyte the arc pool can hold, is refused before any arc is asked for.
         if value == 0 || value > 1 << 30 || (job.total != 0 && value as usize != job.total) {
-            return Some(Err("the capsule's length is not one an arc can hold, or it changed while it was read"));
+            return Some(Err((why::READ, "the capsule's length is not one an arc can hold, or it changed while it was read")));
         }
         job.total = value as usize;
         // WHY: the piece is the vault's; past the capsule's length it would land past the staging the arc was sized for, and nothing at all while the capsule is not whole would ask for the same piece for ever.
         if job.got + bytes.len() > job.total || (bytes.is_empty() && job.got < job.total) {
-            return Some(Err("the vault process answered past the capsule's end, or nothing"));
+            return Some(Err((why::READ, "the vault process answered past the capsule's end, or nothing")));
         }
         let before = job.got;
         match job.arc {
@@ -1989,6 +1992,7 @@ pub fn run(mut b: Boot) -> ! {
                     match &job.why {
                         KistWhy::Launch(l) => {
                             crate::process::push_console(alloc::format!("kist {}: not started: no vault process, or the kernel's channel to it is busy\n", core::str::from_utf8(&l.name).unwrap_or("?")).as_bytes());
+                            crate::process::kist_not_started(&l.capsule, why::READ);
                             crate::process::kist_done();
                         }
                         KistWhy::Install(i) => {
@@ -2004,7 +2008,13 @@ pub fn run(mut b: Boot) -> ! {
                 let ms = (cntpct() - job.t0) * 1000 / cntfrq();
                 let line = match (&job.why, r) {
                     (KistWhy::Launch(l), Ok(_)) => alloc::format!("kist {}: started from the vault ({} bytes read in {ms} ms)\n", core::str::from_utf8(&l.name).unwrap_or("?"), job.total),
-                    (KistWhy::Launch(l), Err(e)) => alloc::format!("kist {}: not started: {e}\n", core::str::from_utf8(&l.name).unwrap_or("?")),
+                    // Kept with its reason for the map, which init told "started" (`kist_not_started`): its circle says why. One that started under the same name meanwhile runs, and nothing is kept.
+                    (KistWhy::Launch(l), Err((code, e))) => {
+                        if code != crate::process::KIST_ALREADY {
+                            crate::process::kist_not_started(&l.capsule, code);
+                        }
+                        alloc::format!("kist {}: not started: {e}\n", core::str::from_utf8(&l.name).unwrap_or("?"))
+                    }
                     // Checked and sealed (SANDBOX.md "Lifecycle"): the seal joins the vault's `sealed` list, which every masked spawn reads; the installer is told once it is kept.
                     (KistWhy::Install(i), Ok(KistDone::Sealed(seal))) => {
                         let kept = crate::process::with_lock(|| {
@@ -2023,11 +2033,11 @@ pub fn run(mut b: Boot) -> ! {
                         }
                     }
                     (KistWhy::Install(_), Ok(KistDone::Launched)) => alloc::string::String::new(),
-                    (KistWhy::Install(i), Err(e)) => {
-                        // A refusal the checker or the seal told already; anything else (the vault, the arc pool) is told here.
+                    (KistWhy::Install(i), Err((code, e))) => {
+                        // A refusal the checker or the seal told already; anything else (the vault, the arc pool) is told here, by the job's reason.
                         if !job.told {
-                            let why = if e.contains("arc") { crate::process::INSTALL_WHY_ROOM } else { crate::process::INSTALL_WHY_READ };
-                            crate::process::install_tell(i, crate::process::INSTALL_REFUSED, why);
+                            let told = if matches!(code, why::ROOM | why::OTHER) { crate::process::INSTALL_WHY_ROOM } else { crate::process::INSTALL_WHY_READ };
+                            crate::process::install_tell(i, crate::process::INSTALL_REFUSED, told);
                         }
                         alloc::format!("kist install: not installed: {e}\n")
                     }
