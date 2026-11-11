@@ -198,7 +198,7 @@ fn seconds() -> i64 {
 }
 
 struct Log {
-    b: [u8; 256],
+    b: [u8; 512],
     n: usize,
 }
 
@@ -213,7 +213,7 @@ impl core::fmt::Write for Log {
 
 macro_rules! say {
     ($($a:tt)*) => {{
-        let mut l = Log { b: [0; 256], n: 0 };
+        let mut l = Log { b: [0; 512], n: 0 };
         let _ = core::fmt::Write::write_fmt(&mut l, format_args!($($a)*));
         let _ = core::fmt::Write::write_str(&mut l, "\n");
         console(grants(), &l.b[..l.n]);
@@ -602,22 +602,23 @@ struct Counts {
     opened: u64,
     fetch: u64,
     copy: u64,
+    walk: u64,
 }
 
 impl Counts {
-    const ZERO: Counts = Counts { io: 0, ahead: 0, call: 0, blocks: 0, calls: 0, cmd: 0, kcopy: 0, hits: 0, open: 0, span: 0, opened: 0, fetch: 0, copy: 0 };
+    const ZERO: Counts = Counts { io: 0, ahead: 0, call: 0, blocks: 0, calls: 0, cmd: 0, kcopy: 0, hits: 0, open: 0, span: 0, opened: 0, fetch: 0, copy: 0, walk: 0 };
     fn now(st: ferros_store::ReadTicks) -> Counts {
         let l = |a: &AtomicU64| a.load(Relaxed);
-        Counts { io: l(&IO_TICKS), ahead: l(&AHEAD_TICKS), call: l(&IO_CALL_TICKS), blocks: l(&IO_BLOCKS), calls: l(&IO_CALLS), cmd: l(&IO_CMD), kcopy: l(&IO_COPY), hits: l(&AHEAD_HITS), open: l(&OPEN_TICKS), span: l(&OPEN_SPAN), opened: l(&OPEN_BYTES), fetch: st.fetch, copy: st.copy }
+        Counts { io: l(&IO_TICKS), ahead: l(&AHEAD_TICKS), call: l(&IO_CALL_TICKS), blocks: l(&IO_BLOCKS), calls: l(&IO_CALLS), cmd: l(&IO_CMD), kcopy: l(&IO_COPY), hits: l(&AHEAD_HITS), open: l(&OPEN_TICKS), span: l(&OPEN_SPAN), opened: l(&OPEN_BYTES), fetch: st.fetch, copy: st.copy, walk: st.walk }
     }
     /// What happened between `self` and `then`, counter by counter (each only grows).
     fn since(&self, then: &Counts) -> Counts {
-        Counts { io: self.io - then.io, ahead: self.ahead - then.ahead, call: self.call - then.call, blocks: self.blocks - then.blocks, calls: self.calls - then.calls, cmd: self.cmd - then.cmd, kcopy: self.kcopy - then.kcopy, hits: self.hits - then.hits, open: self.open - then.open, span: self.span - then.span, opened: self.opened - then.opened, fetch: self.fetch - then.fetch, copy: self.copy - then.copy }
+        Counts { io: self.io - then.io, ahead: self.ahead - then.ahead, call: self.call - then.call, blocks: self.blocks - then.blocks, calls: self.calls - then.calls, cmd: self.cmd - then.cmd, kcopy: self.kcopy - then.kcopy, hits: self.hits - then.hits, open: self.open - then.open, span: self.span - then.span, opened: self.opened - then.opened, fetch: self.fetch - then.fetch, copy: self.copy - then.copy, walk: self.walk - then.walk }
     }
 }
 
 /// A large value read in one stretch, measured stage by stage (owner, 2026-11-08: "Report MB/s per stage"; 2026-11-11: "2.9s for a 24MB read is embarassing", so one device run says where every millisecond goes). A run is the requests that follow on from each other in the value (each starting where the last ended); it ends at the value's end, or at a request that does not follow on (reported with the counts as they stood before it). A run of at least METER_MIN bytes says two console lines; shorter ones (a document's opening, a probe) say nothing. Until 2026-11-11 a report began only at offset 0 and ended at the first read to reach the value's end: the display's wallpaper load opens the document at offset 0, and vsf's walk of the plane's section reads its last bytes, so the 27 requests of the opening were reported (19 ms) and the plane's 48, starting at its data offset, never were.
-/// - `vault: read …`: the run's bytes, where it started in the value, the requests, first to last; serving split into the fetch (manifestus's index walk to each piece, each block's BLAKE3 guard and decode, the furrows joined, the pieces handed to the helpers: `ReadTicks::fetch` less the block reads inside it), the block reads, the opening left after them (XChaCha20-Poly1305 on this thread and the helpers; the helpers open beside the fetch, and "all" is each batch from its first piece handed over to its last opened), the copy out (into the reply, the opened pieces wiped) and the rest (the head, the bookkeeping); and the time between requests (from a reply to the next request's start: the kernel's hand-back, the reader's own work, the stamp and hand-off of the next call, and the wait for a core this thread may run on; while it is pinned to the X3 that is the X3's turn after the render thread and the kernel's service pass).
+/// - `vault: read …`: the run's bytes, where it started in the value, the requests, first to last; serving split into the fetch (manifestus's index walk to each piece, "walk", then its furrows copied out of the read-ahead unchecked, and the pieces handed to the helpers: `ReadTicks::fetch` less the block reads inside it), the block reads, the checks and opening left after them (each furrow's BLAKE3 guard and decode, the furrows joined, and XChaCha20-Poly1305, on this thread and the helpers, since 2026-11-11 with manifestus `locate` and `check_furrows`; the helpers open beside the fetch, and "all" is each batch from its first piece handed over to its last opened), the copy out (into the reply, the opened pieces wiped) and the rest (the head, the bookkeeping); and the time between requests (from a reply to the next request's start: the kernel's hand-back, the reader's own work, the stamp and hand-off of the next call, and the wait for a core this thread may run on; while it is pinned to the X3 that is the X3's turn after the render thread and the kernel's service pass).
 ///   The block reads are the serving thread's own and its waits for the next window; "beside it" is the reader thread's reading of the next windows while the serving thread fetched.
 /// - `vault: read blocks …`: the block reads' bytes, kernel calls (both threads') and their time, the kernel's split of those calls (in the UFS commands, copying into this process, the rest of the syscalls: entry, the kernel lock's wait), and the blocks the read-ahead gave without a call.
 struct Meter {
@@ -678,7 +679,7 @@ impl Meter {
         let fetch = ms(c.fetch) as i64 - ms(c.io) as i64;
         let rest = ms(self.serving) as i64 - ms(c.fetch) as i64 - ms(c.open) as i64 - ms(c.copy) as i64;
         say!(
-            "vault: read {} B from {} of {} in {} requests ({} on the X3), {} ms first to last ({} MB/s): serving {} ms = fetch {} + block reads {} (beside it {}) + opening after them {} (all {} ms, {} cores) + copy out {} + rest {}; between requests {} ms",
+            "vault: read {} B from {} of {} in {} requests ({} on the X3), {} ms first to last ({} MB/s): serving {} ms = fetch {} (walk {}) + block reads {} (beside it {}) + checks and opening after them {} (all {} ms, {} cores) + copy out {} + rest {}; between requests {} ms",
             self.bytes,
             self.from,
             self.whole,
@@ -688,6 +689,7 @@ impl Meter {
             rate(self.bytes, wall),
             ms(self.serving),
             fetch,
+            ms(c.walk),
             ms(c.io),
             ms(c.ahead),
             ms(c.open),
