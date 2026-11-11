@@ -1,6 +1,7 @@
 //! The quick row (docs/QUICK.md; owner, 2026-11-11: "gesture ideas, would be nice to have the torch, brightness and maybe a few other things", and on the proposal "Works"; then "any tap in that area or drag down should bring up said second row of consoleness, however we want to do that, some circle fitting goodness I suspect").
 //!
-//! - **Where.** Six circles in the lens between the top of the app's circle and the first row where its chord is the screen's whole width (the console's last row): inside the app's circle, under the camera, below the top row of console circles that sit outside it. Each is tangent to the app's circle from inside and to that row from above, and to its neighbours: the fit `corner_layout` makes in the corners, turned inside out (`layout`).
+//! - **Where.** Six circles inside the app's circle, under the camera, below the top row of console circles that sit outside it: each tangent to the app's circle from inside, to a horizontal floor from above and to its neighbours, the outer pair to the glass's left and right edges, the floor as low as that takes (owner, 2026-11-11, on the Pro: "Let's make the circles always touch the left/right sides so move the bottom horizontal guide down until they scale up and touch"). The fit `corner_layout` makes in the corners, turned inside out (`layout`). Until then the floor was the console's last row and the row stopped short of the sides.
+//! - **Collisions, by construction.** The console's corner circles are outside the app's circle and these inside it, both tangent to it, so they never overlap (their drawn rims, two and a half pixels, can meet, and the console's region redraw composes both). The camera hole is above the app's circle; the middle pair clear it by 56 pixels on husky, 41 on akita.
 //! - **How it opens.** The map owns the finger and the physics and sends the pull `p` (op 56): 0 shut, 1 open, any value between or past. The circles are drawn at `ease(p)`, C∞ in `p` and exactly 0 or 1 past either end, so the finger is followed one to one thru the middle and the row never kinks at its ends. At level `o` every circle has `o` of its radius and `o` of its angle about the app circle's centre, still tangent to that circle from inside: they grow out of the point under the camera and fan out along the arc (`at`).
 //! - **What draws it.** The console's worker, in the console's own buffer and its region machinery (`console_draw`): the quick circles are console circles that move.
 //! - **Where a finger lands.** Op 41 answers which quick circle (32 + its index, with its centre and radius), the doorway (10), the top's other system ground (11), or behind the row while it shows (12).
@@ -8,7 +9,7 @@
 use super::*;
 use core::sync::atomic::AtomicBool;
 
-/// The row's circles, left to right: the outer pair the smallest (the lens thins toward the sides), the middle pair the two rings (owner: "brightness as a ring you turn around a circle", "torch (tap on/off, ring for intensity)").
+/// The row's circles, left to right: the outer pair the smallest (the room under the arc thins toward the sides), the middle pair the two rings (owner: "brightness as a ring you turn around a circle", "torch (tap on/off, ring for intensity)").
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Item {
     RadiosOff,
@@ -31,65 +32,87 @@ pub fn ease(p: f32) -> f32 {
     1. - (1. - q) * s(1. - q)
 }
 
-/// The row at rest, open: (x, y, r) a circle, left to right, and the doorway's radius about the camera hole; solved once per screen size.
+/// The row at rest, open: (x, y, r) a circle, left to right, solved once per screen size; and the doorway's radius about the camera hole, its own cache (it needs the corners, which the row does not).
 static mut LAYOUT: [(f32, f32, f32); N] = [(0., 0., 0.); N];
-static mut DOOR: f32 = 0.;
 static mut LAYOUT_FOR: (usize, usize) = (0, 0);
+static mut DOOR: f32 = 0.;
+static mut DOOR_FOR: (usize, usize) = (0, 0);
 
-/// The row's circles at rest, open (`LAYOUT`).
+/// Bisection steps: each halves a bracket, and the widest here (half the screen) comes down under a 64th of a pixel in 16.
+const STEPS: u32 = 1 << 4;
+/// The chain's own roots (`chain`) bisect brackets of at most half the width, to under a millionth of a pixel.
+const FINE: u32 = 1 << 5;
+
+/// One side's chain under a floor (owner, 2026-11-11: "move the bottom horizontal guide down until they scale up and touch"): three circles from the split line x = `m` outward (`dir` +1 right, −1 left), each tangent to the app's circle from inside (`inner`, its rim taken off as the corners take it) and to the floor `floor` from above, the first also to the split line (its twin on the other side touches it there), each next to the one before. A circle's centre is on the lens's middle line, where the arc's room and the floor's are equal (`medial`), and the chain steps out along it.
+fn chain(app: (f32, f32, f32), floor: f32, m: f32, dir: f32, reach: f32) -> [(f32, f32, f32); N / 2] {
+    let (cx, cy, rr) = app;
+    let inner = |x: f32, y: f32| rr - CIRCLE_RIM - libm::sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy));
+    let clear = |x: f32, y: f32| {
+        let (a, b) = (inner(x, y), floor - y);
+        if a < b { a } else { b }
+    };
+    // The point at column s as far from the arc as from the floor, in closed form: R' − √(dx² + (y − cy)²) = floor − y with R' the arc's radius less the rim, so with k = R' − floor, √(dx² + (y − cy)²) = y + k, and squared y = (dx² + cy² − k²) / 2(cy + k) (cy + k is the circle's bottom less the floor, positive). In f64: cy² is millions of square pixels, and f32 would keep a quarter of one.
+    let medial = |s: f32| -> (f32, f32) {
+        let (dx, cy, k) = ((s - cx) as f64, cy as f64, (rr - CIRCLE_RIM - floor) as f64);
+        (s, ((dx * dx + cy * cy - k * k) / (2. * (cy + k))) as f32)
+    };
+    let mut out = [(0f32, 0f32, 0f32); N / 2];
+    let u = root(&|u: f32| { let (x, y) = medial(m + dir * u); u - clear(x, y) }, 0., reach, FINE);
+    let (x, y) = medial(m + dir * u);
+    out[0] = (x, y, clear(x, y));
+    for k in 1..N / 2 {
+        let p = out[k - 1];
+        let u = root(&|u: f32| { let (x, y) = medial(p.0 + dir * u); libm::sqrtf((x - p.0) * (x - p.0) + (y - p.1) * (y - p.1)) - p.2 - clear(x, y) }, 0., (1 << 2) as f32 * p.2, FINE);
+        let (x, y) = medial(p.0 + dir * u);
+        out[k] = (x, y, clear(x, y));
+    }
+    out
+}
+
+/// The root of an increasing `g` between `lo` (below it) and `hi` (above it), `steps` bisections.
+fn root(g: &dyn Fn(f32) -> f32, mut lo: f32, mut hi: f32, steps: u32) -> f32 {
+    for _ in 0..steps {
+        let mid = (lo + hi) * 0.5;
+        if g(mid) < 0. { lo = mid } else { hi = mid }
+    }
+    hi
+}
+
+/// The row's circles at rest, open (`LAYOUT`), solved (owner, 2026-11-11, on the Pro: "Let's make the circles always touch the left/right sides so move the bottom horizontal guide down until they scale up and touch"):
+/// - Each side is a chain under the floor (`chain`): tangent to the app's arc from inside, to the floor, to its neighbour.
+/// - The outer pair are tangent to the glass's own left and right edges, exactly as `corner_layout` measures the glass (`GlassOutline`, its hairline and the circle's rim taken off): the corners are rounded and not alike (the big one top left), so the walls are not mirror images.
+/// - Two unknowns, two equations, solved by bisection, never stepped on a timer: for a floor, the split between the middle pair moves until both outer circles are as near their walls (moving it right brings the right wall nearer and takes the left away); then the floor moves down until that nearness is nought (a lower floor grows every circle, so the chain reaches further out). On husky the split lands a pixel right of centre, on akita six (its fat corner is rounder).
+/// - Lower floor, bigger circles: on husky the middle pair reach row 413, past the console's old last row (288): the console's rows reach the row's floor since 2026-11-11 (`rows`).
 pub fn layout(width: usize, height: usize) -> [(f32, f32, f32); N] {
     unsafe {
         if LAYOUT_FOR == (width, height) {
             return LAYOUT;
         }
     }
-    let (cx, cy, rr) = circle(width, height);
-    // The floor: a circle's drawing reaches two and a half pixels past its radius (the console's REACH), and the console holds rows up to CHROME_TOP alone, so every circle stays four rows above that.
-    let floor = unsafe { CHROME_TOP } as f32 - (1 << 2) as f32;
-    // A point's room inside the app's circle, the rim a console circle draws past its radius taken off as the corners take it (CIRCLE_RIM).
-    let inner = |x: f32, y: f32| rr - CIRCLE_RIM - libm::sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy));
-    let clear = |x: f32, y: f32| {
-        let (a, b) = (inner(x, y), floor - y);
-        if a < b { a } else { b }
+    let t0 = ferros_sys::now();
+    let app = circle(width, height);
+    let (w, cx) = (width as f32, app.0);
+    let outline = GlassOutline::new(width, height);
+    // A circle's room to the glass, as the corners have it (`corner_layout`'s `glass`).
+    let wall = |c: (f32, f32, f32)| outline.dist(c.0, c.1) - EDGE_HAIRLINE - CIRCLE_RIM - c.2;
+    let reach = w * 0.5;
+    let ends = |floor: f32, m: f32| (wall(chain(app, floor, m, -1., reach)[N / 2 - 1]), wall(chain(app, floor, m, 1., reach)[N / 2 - 1]));
+    // For a floor: the split where both outer circles are as near their walls, and how near.
+    let split = |floor: f32| -> (f32, f32) {
+        let m = root(&|m: f32| { let (l, r) = ends(floor, m); l - r }, cx - w * 0.125, cx + w * 0.125, STEPS);
+        (m, ends(floor, m).1)
     };
-    // The point at column s as far from the arc as from the floor (the lens's middle line there): bisected between the arc and the floor, where the arc's room grows and the floor's shrinks.
-    let medial = |s: f32| -> (f32, f32) {
-        let (mut lo, mut hi) = (cy - libm::sqrtf(rr * rr - (s - cx) * (s - cx)), floor);
-        for _ in 0..40 {
-            let mid = (lo + hi) * 0.5;
-            if inner(s, mid) < floor - mid { lo = mid } else { hi = mid }
-        }
-        (s, (lo + hi) * 0.5)
-    };
-    // The root of an increasing `g` between `lo` (below it) and `hi` (above it).
-    let root = |g: &dyn Fn(f32) -> f32, mut lo: f32, mut hi: f32| {
-        for _ in 0..40 {
-            let mid = (lo + hi) * 0.5;
-            if g(mid) < 0. { lo = mid } else { hi = mid }
-        }
-        hi
-    };
-    // Right of the centre: the first circle tangent to the arc, the floor and the centre line (its twin on the left touches it there); then each tangent to the arc, the floor and the one before it.
-    let mut right = [(0f32, 0f32, 0f32); N / 2];
-    let s = root(&|s: f32| { let (x, y) = medial(s); (s - cx) - clear(x, y) }, cx, cx + (width >> 2) as f32);
-    let (x, y) = medial(s);
-    right[0] = (x, y, clear(x, y));
-    for k in 1..N / 2 {
-        let p = right[k - 1];
-        let s = root(&|s: f32| { let (x, y) = medial(s); libm::sqrtf((x - p.0) * (x - p.0) + (y - p.1) * (y - p.1)) - p.2 - clear(x, y) }, p.0, p.0 + (1 << 2) as f32 * p.2);
-        let (x, y) = medial(s);
-        right[k] = (x, y, clear(x, y));
-    }
+    // The floor between a 32nd of the width under the app circle's top (circles far short of the walls) and half the width under it (far past touching on any glass like these).
+    let top = app.1 - app.2;
+    let floor = root(&|f: f32| -split(f).1, top + w * (1. / (1 << 5) as f32), top + reach, STEPS);
+    let m = split(floor).0;
+    let (left, right) = (chain(app, floor, m, -1., reach), chain(app, floor, m, 1., reach));
     let mut out = [(0f32, 0f32, 0f32); N];
     for k in 0..N / 2 {
         out[N / 2 + k] = right[k];
-        out[N / 2 - 1 - k] = (2. * cx - right[k].0, right[k].1, right[k].2);
+        out[N / 2 - 1 - k] = left[k];
     }
-    // The doorway: the disc about the camera hole out to the nearest of the top's console circles (outside the app's circle, the open spot NFC left).
-    let (hx, hy, _) = ferros_sys::cutout_hole();
-    let (corners, n) = corner_layout(width, height);
-    let door = corners[..n].iter().filter(|c| c.1 < height as f32 * 0.5).map(|c| libm::sqrtf((c.0 - hx) * (c.0 - hx) + (c.1 - hy) * (c.1 - hy)) - c.2).fold(f32::MAX, f32::min);
-    // The solved row, once per size, to the console: (x, y, r) in pixels, and the doorway's radius.
+    // The solved row, once per size, to the console: (x, y, r) in pixels, the floor, and the time the solve took.
     let mut l = Log { grants: unsafe { PANIC_GRANTS }, buf: [0; 256], n: 0 };
     l.s(b"display: quick row");
     for c in &out {
@@ -101,17 +124,52 @@ pub fn layout(width: usize, height: usize) -> [(f32, f32, f32); N] {
         l.dec(c.2 as u64);
         l.s(b")");
     }
-    l.s(b", doorway ");
-    l.dec(door as u64);
-    l.s(b"\n");
+    l.s(b", floor ");
+    l.dec(floor as u64);
+    l.s(b", walls ");
+    l.dec((wall(out[0]) * 100.) as u64);
+    l.s(b"/");
+    l.dec((wall(out[N - 1]) * 100.) as u64);
+    l.s(b" hundredths, solved in ");
+    l.dec(ferros_sys::us_since(t0));
+    l.s(b" us\n");
     l.flush();
     unsafe {
         LAYOUT = out;
-        DOOR = door;
         LAYOUT_FOR = (width, height);
     }
     out
 }
+
+/// The console's rows (the bars' top rows): the app circle's chrome rows (`chrome_rows`), or down to the quick row's floor and the reach its circles draw past their radius (the console's REACH, two and a half pixels, and a row of slack), whichever is lower. Each row is three rows of the bars' buffers (`BAR`, `BAR_W`, `BAR_W_BACK`), 8 bytes a pixel: on husky the floor at 413 costs 129 rows, 4.2 MiB of the display heap.
+pub fn rows(width: usize, height: usize, chrome_top: usize) -> usize {
+    let floor = layout(width, height).iter().map(|c| c.1 + c.2).fold(0., f32::max);
+    let need = floor as usize + (1 << 2);
+    if need > chrome_top { need } else { chrome_top }
+}
+
+/// The doorway's radius: the disc about the camera hole out to the nearest of the top's console circles (outside the app's circle, the open spot NFC left).
+fn door(width: usize, height: usize) -> f32 {
+    unsafe {
+        if DOOR_FOR == (width, height) {
+            return DOOR;
+        }
+    }
+    let (hx, hy, _) = ferros_sys::cutout_hole();
+    let (corners, n) = corner_layout(width, height);
+    let d = corners[..n].iter().filter(|c| c.1 < height as f32 * 0.5).map(|c| libm::sqrtf((c.0 - hx) * (c.0 - hx) + (c.1 - hy) * (c.1 - hy)) - c.2).fold(f32::MAX, f32::min);
+    let mut l = Log { grants: unsafe { PANIC_GRANTS }, buf: [0; 256], n: 0 };
+    l.s(b"display: quick row doorway ");
+    l.dec(d as u64);
+    l.s(b"\n");
+    l.flush();
+    unsafe {
+        DOOR = d;
+        DOOR_FOR = (width, height);
+    }
+    d
+}
+
 
 /// The row at level `o` (0 shut, 1 open): each circle `o` of its radius, its centre `o` of its angle about the app's circle's centre and still tangent to that circle from inside, so the row grows out of the point under the camera and fans out along the arc; at 1 exactly `layout`. Neighbours never overlap on the way: their centres are further apart than at rest for the radii they have.
 pub fn at(width: usize, height: usize, o: f32) -> [(f32, f32, f32); N] {
@@ -188,9 +246,8 @@ pub fn hit(x: f32, y: f32, width: usize, height: usize) -> Option<(usize, (f32, 
 
 /// Whether a point is in the doorway: the disc about the camera hole out to the nearest top console circle, outside the app's circle.
 pub fn doorway(x: f32, y: f32, width: usize, height: usize) -> bool {
-    layout(width, height);
     let (hx, hy, _) = ferros_sys::cutout_hole();
-    let door = unsafe { DOOR };
+    let door = door(width, height);
     (x - hx) * (x - hx) + (y - hy) * (y - hy) < door * door && !in_circle(x as i64, y as i64, width, height)
 }
 

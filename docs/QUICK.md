@@ -13,18 +13,24 @@ Built 2026-11-11 (branch `quick-settings`), not yet run on a device.
 
 ## Where the row sits: circle fitting inside out
 
-The corners' circles are each tangent to the glass, the app's circle (from outside) and their neighbour. The quick row is the same fit turned inside out: six circles in the lens between the top of the app's circle and the console's last row (the first row where the app circle's chord is the whole width), each tangent to the app's circle from inside, to that row from above, and to its neighbour (display quick.rs `layout`). The middle pair touch each other on the centre line, under the camera; the lens thins toward the sides, so the circles shrink outward.
+The corners' circles are each tangent to the glass, the app's circle (from outside) and their neighbour. The quick row is the same fit turned inside out: six circles inside the app's circle, each tangent to it from inside, to a horizontal floor from above and to its neighbour, and the outer pair tangent to the glass's left and right edges (display quick.rs `layout`).
+
+Owner, 2026-11-11, after trying the first cut on the Pro: "Good idea on the swipe down console! Let's make the circles always touch the left/right sides so move the bottom horizontal guide down until they scale up and touch." Until then the floor was the console's last row (the first row where the app circle's chord is the whole width) and the row stopped well short of the sides (husky r 81, 72, 58).
+
+- **The solve.** Two unknowns: the floor, and the split between the middle pair (the line both touch). For a floor, the split moves until both outer circles are as near their walls; then the floor moves down until that nearness is nought. Both by bisection, the circles' centres on the closed-form line where the arc's room equals the floor's. Once per screen size, logged with its time (`display: quick row (x,y,r) … floor F, walls L/R hundredths, solved in N us`).
+- **The walls are the glass, not the screen's edge**: measured as `corner_layout` measures them (`GlassOutline`, hairline and rim off). The glass's corners are not alike (the big one top left), so the split is not the centre: a pixel right of it on husky, six on akita, whose fat corner is rounder.
+- **Collisions.** The console's corner circles (clock top left, cellular, WiFi, Bluetooth and NFC top right) are outside the app's circle and these inside it, both tangent to it, so they cannot overlap; their drawn rims (two and a half pixels) can meet, and the console's region redraw composes both. The camera hole is above the app's circle; the middle pair clear it by 54 to 56 pixels on husky, 41 to 49 on akita.
 
 Left to right: radios off, sound, brightness | torch, do not disturb, screencap. The two rings (brightness, torch) are the middle, largest pair.
 
-Solved on the host from the same equations (the device logs its own):
+Solved on the host from the same equations, the glass from fluor's corner parameters (the device logs its own):
 
-| | Middle pair | Next | Outer |
-|---|---|---|---|
-| husky (1344 × 2992) | r 81 at x 672 ± 81, y 203 | r 72 at ± 234, y 212 | r 58 at ± 363, y 226 |
-| akita (1080 × 2400) | r 65 at x 540 ± 65, y 170 | r 58 at ± 188, y 177 | r 46 at ± 292, y 189 |
+| | Floor | Left outer | Left next | Left middle | Right middle | Right next | Right outer |
+|---|---|---|---|---|---|---|---|
+| husky (1344 × 2992) | 413 | (82, 334) r 79 | (273, 297) r 116 | (530, 270) r 143 | (816, 270) r 143 | (1072, 297) r 116 | (1263, 334) r 79 |
+| akita (1080 × 2400) | 337 | (71, 273) r 64 | (225, 244) r 93 | (432, 223) r 114 | (660, 224) r 114 | (864, 246) r 92 | (1016, 275) r 62 |
 
-The row is drawn by the console's worker in the console's own buffer (it lies within the console's rows), with the console's region machinery: the quick circles are console circles that move, and a redraw empties where each was as well as where it is. No new buffer, no new layer; the bars are already composed in front of the home screen, every app and the flight.
+The row is drawn by the console's worker in the console's own buffer, with the console's region machinery: the quick circles are console circles that move, and a redraw empties where each was as well as where it is. No new layer; the bars are already composed in front of the home screen, every app and the flight. The floor is below the chrome rows (husky 288, akita 239), so the console's band now reaches the floor (`BAR_TOP`, quick.rs `rows`: 417 rows on husky, 341 on akita). Its three buffers grow by that many rows: 4.2 MiB of the display heap on husky (about 25.5 MiB used before, so about 29.7 of 32), 2.6 MiB on akita.
 
 ## The pull and its physics
 
