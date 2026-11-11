@@ -630,7 +630,7 @@ pub fn bell(source: u64, word: &core::sync::atomic::AtomicU64) -> bool {
     svc(nr::BELL, source, off(word as *const _ as *const u8), 0, 0, 0) == 0
 }
 
-/// The kist launches that did not start (kernel SYS_NOT_STARTED; owner, 2026-11-11: Mahere's circle tapped, nothing opened, "it looked stuck"). Init answers a launch "started" as soon as it is queued (ferros_kist::launch::STARTED); the kernel then reads the capsule from the vault, checks it and sizes its arc, and a launch that fails there is kept here, one record a capsule, until that kist next starts. For the Settings holder alone (the map), as the claims' users list.
+/// The kist launches that did not start (kernel SYS_NOT_STARTED; owner, 2026-11-11: Mahere's circle tapped, nothing opened, "it looked stuck"). Init answers a launch "started" as soon as it is queued (ferros_kist::launch::STARTED); the kernel then reads the capsule from the vault, checks it and sizes its arc, and a launch that fails there is kept here, one record a capsule, until that kist next starts; a kist that started and then ended by a fault, a panic or a kill from outside is kept the same way; and the kists alive now (`live`). For the Settings holder alone (the map), as the claims' users list.
 pub mod not_started {
     use super::{nr, off, svc, ERR};
     /// A record of `list`: the reason (ferros_kist::launch::why), the capsule's address (32 bytes), and the kists' bell count it rang (u64 LE), so a reader tells a failure that came after its own ask from one kept before.
@@ -641,9 +641,14 @@ pub mod not_started {
         let r = svc(nr::NOT_STARTED, 0, settings, off(buf.as_mut_ptr()), buf.len() as u64, 0);
         (r != ERR).then_some(r as usize)
     }
-    /// The kists' doorbell, given Settings: the kernel writes its change count into `word` now and whenever a launch does not start or a kist kept here starts, waking whatever waits on it (`wait_world`). False without the capability, or a kernel without it.
+    /// The kists' doorbell, given Settings: the kernel writes its change count into `word` now and whenever a launch does not start, a kist starts, or a kist ends any way, waking whatever waits on it (`wait_world`). False without the capability, or a kernel without it.
     pub fn doorbell(settings: u64, word: &core::sync::atomic::AtomicU64) -> bool {
         svc(nr::NOT_STARTED, 1, off(word as *const _ as *const u8), settings, 0, 0) == 0
+    }
+    /// The kists alive now into `buf`, given Settings (op 2; owner, 2026-11-11: their circles glow running, stopped or not running): each a capsule's address, 32 bytes, as many whole ones as fit; how many there are, or None without the capability (or a kernel from before, which refuses the op).
+    pub fn live(settings: u64, buf: &mut [u8]) -> Option<usize> {
+        let r = svc(nr::NOT_STARTED, 2, settings, off(buf.as_mut_ptr()), buf.len() as u64, 0);
+        (r != ERR).then_some(r as usize)
     }
 }
 

@@ -21,3 +21,5 @@ tatau = { path = "../../../tatau" }
 ferros_kist = { path = "../../ferros_kist", features = ["process"] }
 # The words on the settings pages in the person's language (Photon's sixteen; the fleet's words are fgtw's, thru it).
 ferros_lang = { path = "../../ferros_lang", features = ["process"] }
+# The kist circles' states as their glows (display op 57): the state's byte.
+ferros_glow = { path = "../../ferros_glow" }

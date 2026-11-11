@@ -8,8 +8,11 @@
 //! | running | 500 | the theme's thin peak |
 //! | stopped | 600 | the theme's thin peak |
 //! | for you (anything waiting on the person: a notification from anyone, a question, an approval) | 400 | the theme's heavy peak at `FOR_YOU_LIGHT` of its light, reaching `FOR_YOU_REACH` farther and farther still as the count grows |
+//! | system (the settings circle, built in: never a kist) | 703 | the theme's thin peak, the VSF red primary itself, so no multiply |
 //!
-//! Colour: a wavelength is its cone response (vsf's Stockman & Sharpe 10° table, 1 nm, linear between samples) in VSF RGB (`LMS2VSF_RGB`). A single wavelength lies outside the primaries' triangle, so a channel comes out negative: the positive channels are the glow's colour, each negative channel a multiply of what is behind (`MULT_SHARE` of it at the glow's full intensity).
+//! What the kist states mean, as the map sends them (payloads/map `send_states`, docs/KISTS.md "Kist states"): running, a live process of that kist (in front or behind); stopped, its last process ended without the person ending it (a fault, a panic, a kill from outside) or its last launch did not start, and it has not started since; not running, installed and neither; for you, something waiting on the person for that kist (nothing sets it yet: there are no notifications).
+//!
+//! Colour: a wavelength is its cone response (vsf's Stockman & Sharpe 10° table, 1 nm, linear between samples) in VSF RGB (`LMS2VSF_RGB`). A single wavelength lies outside the primaries' triangle, so a channel comes out negative: the positive channels are the glow's colour, each negative channel a multiply of what is behind (`MULT_SHARE` of it at the glow's full intensity). A primary's own wavelength (703, 523, 462 nm) is inside the triangle, at its corner: its other two channels are zero but for the f32 matrix's rounding (`ROUNDING`), so it has no multiply.
 
 #![no_std]
 
@@ -20,6 +23,11 @@ use vsf::colour::spectral::constants::{LMS2VSF_RGB, LMS_2000_10DEG_1NM};
 pub const RUNNING_NM: f32 = 500.;
 pub const STOPPED_NM: f32 = 600.;
 pub const FOR_YOU_NM: f32 = 400.;
+/// The settings circle's own (owner, 2026-11-11, on the Pro: "For the ferros settings specifically, I think 703nm (I think that's VSF red?)"): VSF RGB's red primary (vsf colour::spectral, "Red (R): 703nm").
+pub const SYSTEM_NM: f32 = 703.;
+
+/// A channel nearer zero than this share of the line's brightest channel is zero: the cone table and `LMS2VSF_RGB` are f32, and a primary's own wavelength leaves its other channels at about 1/2^29 of its own (703 nm: green -1.2e-9 of red, blue 2.2e-12; 462 nm: red -8.2e-9 of blue), where the multiply would otherwise take a whole `MULT_SHARE` for nothing. The nearest real negative of the lines in use is 600 nm's blue, 1/2^8 of its red, far above.
+pub const ROUNDING: f32 = 1. / (1 << 16) as f32;
 
 /// A negative channel's multiply at the glow's full intensity: that channel of what is behind darkened by this share (owner: "share 1/2 to start").
 pub const MULT_SHARE: f32 = 1. / (1 << 1) as f32;
@@ -39,6 +47,8 @@ pub enum Glow {
     Running = 2,
     Stopped = 3,
     ForYou = 4,
+    /// The settings circle (the map's circle 0): built in, the system's own, never a kist's state.
+    System = 5,
 }
 
 impl Glow {
@@ -49,6 +59,7 @@ impl Glow {
             2 => Glow::Running,
             3 => Glow::Stopped,
             4 => Glow::ForYou,
+            5 => Glow::System,
             _ => Glow::None,
         }
     }
@@ -88,9 +99,13 @@ pub fn spec(g: Glow) -> Option<Spec> {
         Glow::Running => (RUNNING_NM, Level::Thin),
         Glow::Stopped => (STOPPED_NM, Level::Thin),
         Glow::ForYou => (FOR_YOU_NM, Level::Heavy),
+        // Thin, as running: a mark of what the circle is, not a call for the person's eye.
+        Glow::System => (SYSTEM_NM, Level::Thin),
     };
     let c = line(nm);
-    Some(Spec { colour: c.map(|v| if v > 0. { v } else { 0. }), level, mult: c.map(|v| if v < 0. { MULT_SHARE } else { 0. }) })
+    // WHY the floor: `ROUNDING`, a primary's other channels are the matrix's rounding, not light or a multiply.
+    let floor = c[0].max(c[1]).max(c[2]) * ROUNDING;
+    Some(Spec { colour: c.map(|v| if v > floor { v } else { 0. }), level, mult: c.map(|v| if v < -floor { MULT_SHARE } else { 0. }) })
 }
 
 /// A multiply's photopic share: the light it takes from a grey (equal-energy) plane, by VSF's own weights (R 0.2584, G 0.6346, B 0.1070). The display's canvas has one opacity a pixel, so a per-channel multiply goes in as a neutral one of this strength (display main.rs `state_glow`).
@@ -125,4 +140,50 @@ pub fn reach(g: Glow, n: u16) -> f32 {
 /// State `g`'s light against the theme's ring: for you `FOR_YOU_LIGHT`, the rest as the ring.
 pub fn light(g: Glow) -> f32 {
     if g == Glow::ForYou { FOR_YOU_LIGHT } else { 1. }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+
+    /// The display's colour for state `g` on a theme whose ring is `ring` (G#RRGGBB), as payloads/display `state_glow` makes it: 8-bit gamma 2 codes.
+    fn code(g: Glow, ring: u32) -> u32 {
+        let s = spec(g).unwrap();
+        let lin = |v: u32| {
+            let c = (v & 0xFF) as f32 * (1. / 255.);
+            c * c
+        };
+        let y = photopic([lin(ring >> 16), lin(ring >> 8), lin(ring)]);
+        let l = at_luminance(s.colour, y).map(|v| v * light(g));
+        let c = |v: f32| (libm::sqrtf(v) * 255. + 0.5) as u32;
+        c(l[0]) << 16 | c(l[1]) << 8 | c(l[2])
+    }
+
+    /// The settings circle's 703 nm is the red primary: red alone, no multiply, and red full on the grey theme (its photopic weight, 0.2584, is under the ring's 0.293, so the brightest channel stops at full).
+    #[test]
+    fn system_is_the_red_primary() {
+        let l = line(SYSTEM_NM);
+        let s = spec(Glow::System).unwrap();
+        std::println!("703 nm line {l:?}; colour {:?}, multiply {:?} (photopic {}), grey theme G#{:06X}", s.colour, s.mult, photopic(s.mult), code(Glow::System, 0x8A8A8A));
+        assert!(l[1].abs() < l[0] * ROUNDING && l[2].abs() < l[0] * ROUNDING);
+        assert_eq!(s.mult, [0.; 3]);
+        assert_eq!(s.level, Level::Thin);
+        assert!(s.colour[0] > 0. && s.colour[1] == 0. && s.colour[2] == 0.);
+        assert_eq!(code(Glow::System, 0x8A8A8A), 0xFF0000);
+        assert_eq!(Glow::from_u8(5), Glow::System);
+    }
+
+    /// `ROUNDING` leaves the owner's three lines as they were: each keeps its one negative channel's multiply.
+    #[test]
+    fn lines_keep_their_multiply() {
+        let h = MULT_SHARE;
+        for (g, m) in [(Glow::Running, [h, 0., 0.]), (Glow::Stopped, [0., 0., h]), (Glow::ForYou, [0., h, 0.])] {
+            let s = spec(g).unwrap();
+            std::println!("{g:?}: colour {:?}, multiply {:?} (photopic {}), grey theme G#{:06X}", s.colour, s.mult, photopic(s.mult), code(g, 0x8A8A8A));
+            assert_eq!(s.mult, m);
+        }
+        assert_eq!(code(Glow::Running, 0x8A8A8A), 0x00AA4C);
+        assert_eq!(code(Glow::Stopped, 0x8A8A8A), 0xDA6700);
+    }
 }

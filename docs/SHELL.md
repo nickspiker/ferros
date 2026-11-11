@@ -51,6 +51,8 @@ The device measures what you do; you declare what matters. When a circle lights,
 
 **The graphic never changes; the glow says the state** (owner, 2026-11-08: "we'll use the glow to indicate state. Circle graphic always stays the same for recognizability"). An icon is always drawn in its own colours, so a circle is recognised by its look at every moment; whether it changed since it was last seen shows as its glow (a layer of its own colour and α, composed under the circle like any other). This replaces "grey at rest, colour when lit", which a session recorded from a 2026-10-21 "sure on colour" the owner did not mean that way; the bundle's photopic grey (tools/app-icons) is no longer drawn.
 
+**A kist circle's glow is its state** (2026-11-11; KISTS.md "Kist states", ferros_glow): running at 500 nm, stopped at 600 nm, not running as a ring of darkness, for you at 400 nm (nothing sets it yet); the settings circle glows at 703 nm, VSF's red primary.
+
 **Lit** means changed since last seen. Seeing a circle — zooming in until it can be read — updates its last-seen time. That is the only signal on the map: no counts, no badges, no motion.
 
 **Apps lose the right to speak.** The only path that may update a circle's last-changed time is a message a human originated, arriving through Photon. An app has no channel to light its own circle; that is a property of the shell, not a permission an app could request.

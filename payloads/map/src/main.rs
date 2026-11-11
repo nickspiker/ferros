@@ -659,11 +659,6 @@ impl Batch {
     }
 }
 
-/// Dummy kists for judging the state glows (owner, 2026-11-11: "Gimme a few dummy kists with text in each one to label the state and I'll pan/zoom/fling and see how it looks"): a development switch, FERROS_DUMMY_KISTS set at build (=1), never on a production build. Four circles, one per state (owner, 2026-11-11: "for the four states, nix the rest of the circles"), in the display's scene only (never the person's kists or the vault), a grid of two by two to the right of every circle the map has, each labelled with its state and tapped to nothing (`Map::hit` knows only the map's own).
-const DUMMY_KISTS: bool = DEV && option_env!("FERROS_DUMMY_KISTS").is_some();
-/// Each dummy: its label, its state (ferros_glow::Glow's byte: 1 not running, 2 running, 3 stopped, 4 for you) and how many things wait on the person (for you).
-const DUMMIES: [(&str, u8, u16); 4] = [("not running", 1, 0), ("running", 2, 0), ("stopped", 3, 0), ("for you", 4, 1)];
-
 /// FERROS_MAP_START=crowd's extra circles (`Map::crowd`): x, y, r in world units, and how many.
 static mut CROWD: ([i64; 256], [i64; 256], [i64; 256], usize) = ([0; 256], [0; 256], [0; 256], 0);
 
@@ -1270,6 +1265,14 @@ struct Map {
     stopped: alloc::vec::Vec<([u8; 32], u8)>,
     /// The kists' bell count of the newest record already taken (`kists_rang`): a record at or under it was said or passed over before.
     kists_read: u64,
+    /// The kists alive as the kernel last said (ferros_sys::not_started::live, at each ring of the kists' bell), by capsule; None until it has (a kernel without op 2), when kist circles show no state.
+    live: Option<alloc::vec::Vec<[u8; 32]>>,
+    /// The kists the kernel keeps a record for (ferros_sys::not_started::list: a start that did not happen, or a stop by a fault, a panic or a kill from outside), by capsule: stopped on their circles until they start again.
+    ended: alloc::vec::Vec<[u8; 32]>,
+    /// Things waiting on the person, by kist capsule, with how many: a for-you glow, its reach growing with the count. Nothing adds to it yet: ferros has no notifications (owner, 2026-11-11: for you is "anything waiting on the person"), and whatever brings them sets the count here and calls `send_states`.
+    waiting: alloc::vec::Vec<([u8; 32], u16)>,
+    /// Each circle's state as last sent to the display (op 57: the glow's byte and the count), so a ring of the kists' bell sends only what changed.
+    sent: [(u8, u16); MAX],
 }
 
 /// A fix as the GPS driver gives it (payloads/gps op 0 FIX): latitude and longitude in 2^-23 degrees. Its error estimate is the page's accuracy measure already (the driver's slot 1).
@@ -1618,6 +1621,8 @@ impl Map {
         // WHY: the arrays hold MAX circles (as at start).
         let n = (1 + self.kists.kists.len()).min(MAX);
         if n == self.n {
+            // As many circles, but a circle may hold another kist now (one uninstalled, another installed): its state follows, drawn with the next frame as a new scene is.
+            let _ = self.send_states(false);
             return;
         }
         self.place_circles(n);
@@ -1757,12 +1762,14 @@ impl Map {
         }
     }
 
-    /// The kists' bell rang (KISTS_WORD): the records the kernel keeps (ferros_sys::not_started) read, each one newer than the last taken (`kists_read`) taken once. The launch asked last (`asked`), rung after the ask, whether it did not start or started and then stopped: kept for its circle (`fault`) and shown once the plane is at rest (`show_fault`), the person having just tapped it or being in it. Any other kist that stopped abnormally (a fault, a panic, a kill from outside): said as its circle is next tapped, once (`stopped`). A start that failed for a launch this map did not ask (a relaunch) says nothing here. A stop the kernel no longer keeps (that kist started again since) is dropped unsaid.
+    /// The kists' bell rang (KISTS_WORD): the records the kernel keeps (ferros_sys::not_started) read, each one newer than the last taken (`kists_read`) taken once. The launch asked last (`asked`), rung after the ask, whether it did not start or started and then stopped: kept for its circle (`fault`) and shown once the plane is at rest (`show_fault`), the person having just tapped it or being in it. Any other kist that stopped abnormally (a fault, a panic, a kill from outside): said as its circle is next tapped, once (`stopped`). A start that failed for a launch this map did not ask (a relaunch) says nothing here. A stop the kernel no longer keeps (that kist started again since) is dropped unsaid. Then the kists alive read, and the circles' states sent where they changed (`state`, `send_states`).
     fn kists_rang(&mut self) {
         // WHY the size and the `take`: one record a kist the person has, and the circles hold at most MAX of them; a list longer than the buffer is cut to whole records by the kernel, and a shorter one leaves the rest of the buffer unwritten, so only the first n records are read.
         let mut buf = [0u8; ferros_sys::not_started::REC * MAX];
         let Some(n) = ferros_sys::not_started::list(cap(self.grants, S_SETTINGS), &mut buf) else { return };
         let records = || buf.chunks_exact(ferros_sys::not_started::REC).take(n);
+        // Every kist the kernel keeps a record for is stopped on its circle (`state`), whatever the reason, until it starts again.
+        self.ended = records().map(|r| r[1..33].try_into().unwrap()).collect();
         self.stopped.retain(|s| records().any(|r| r[1..33] == s.0 && ferros_kist::launch::why::stopped(r[0])));
         let read = self.kists_read;
         for r in records() {
@@ -1789,6 +1796,15 @@ impl Map {
                 continue;
             }
             console(self.grants, l.as_str().as_bytes());
+        }
+        // The kists alive (op 2), and every circle whose state that changed sent again (`state`): the bell rings at each kist's start and end, so the glows follow them with nothing asked on a timer. A kernel without op 2 leaves them with no state.
+        // WHY the size: one capsule a kist circle, at most MAX of them; a longer list is cut to whole addresses by the kernel, and only the first `k` are read.
+        let mut live = [0u8; 32 * MAX];
+        if let Some(k) = ferros_sys::not_started::live(cap(self.grants, S_SETTINGS), &mut live) {
+            self.live = Some(live.chunks_exact(32).take(k).map(|c| c.try_into().unwrap()).collect());
+        }
+        if self.send_states(false) && !self.app_front {
+            self.draw();
         }
     }
 
@@ -2110,8 +2126,8 @@ impl Map {
         best
     }
 
-    /// The whole scene to the display server: clear, then every circle in one call.
-    fn send_scene(&self) {
+    /// The whole scene to the display server: clear, then every circle in one call, then every circle's state (a fresh scene has none: `send_states`).
+    fn send_scene(&mut self) {
         let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
         let mut r = [0u8; 4];
         call(self.display, &[12], &mut r);
@@ -2134,9 +2150,6 @@ impl Map {
             m[at + 14..at + 14 + len].copy_from_slice(&label[..len]);
         }
         call(self.display, &m, &mut r);
-        if DUMMY_KISTS {
-            self.send_dummies();
-        }
         self.send_crowd();
         // The circles' own turns ride on `scene move`: a fresh scene starts every circle upright.
         for i in 0..self.n {
@@ -2144,41 +2157,59 @@ impl Map {
                 self.send_move(i);
             }
         }
+        let _ = self.send_states(true);
     }
 
-    /// The dummy kists (`DUMMY_KISTS`), appended to the display's scene after the map's own circles (display indices n to n + 3), then their states (display op 57).
-    /// Placed from the circles as they are now, so they follow every renormalise and arrangement: each half the settings circle's radius, on a grid of two by two at a pitch of three radii (a radius of plane between neighbours: a glow reaches 1/12 of the radius, a for-you glow at most 1/6), its left column two radii past the rightmost edge of any circle, centred on the settings circle's height.
-    fn send_dummies(&self) {
-        let rd = self.rs[0] / 2;
-        let pitch = rd * 3;
-        let right = (0..self.n).map(|i| (self.xs[i] >> 8) + self.rs[i]).max().unwrap_or(0);
-        let (x0, y0) = (right + 3 * rd, (self.ys[0] >> 8) - pitch / 2);
-        let mut m = [0u8; 2 + 30 * DUMMIES.len()];
-        m[0] = 13;
-        m[1] = DUMMIES.len() as u8;
-        for (k, d) in DUMMIES.iter().enumerate() {
-            let at = 2 + k * 30;
-            let (x, y) = (x0 + (k % 2) as i64 * pitch, y0 + (k / 2) as i64 * pitch);
-            m[at..at + 4].copy_from_slice(&(x as i32).to_le_bytes());
-            m[at + 4..at + 8].copy_from_slice(&(y as i32).to_le_bytes());
-            m[at + 8..at + 10].copy_from_slice(&(rd as u16).to_le_bytes());
-            // No theme glow (ring 0), not lit, no icon: the label shows and the state's light is all there is.
-            let label = fit(d.0, 16).as_bytes();
-            m[at + 13] = label.len() as u8;
-            m[at + 14..at + 14 + label.len()].copy_from_slice(label);
+    /// Circle `i`'s state as its glow (ferros_glow, display op 57; owner, 2026-11-11, on the Pro: "glow is good! you can nix the test circles and use those colours for realzies"), with the count of things waiting on the person. The settings circle is the system's own, 703 nm (owner: "For the ferros settings specifically, I think 703nm"). A kist circle, from what the kernel last said (`kists_rang`), first that matches:
+    /// - for you (400 nm): something waits on the person for it (`waiting`; nothing adds to it yet, there are no notifications).
+    /// - running (500 nm): a live process of it, in front or behind (home leaves it alive behind). A widget the display draws itself (the clock) is running too: it is never a process, and it is live on the glass.
+    /// - stopped (600 nm): the kernel keeps a record for it (ferros_sys::not_started): its last process ended by a fault, a panic or a kill from outside, or its last launch did not start; gone once it starts again.
+    /// - not running (a ring of darkness): installed and none of those (not launched since boot, or ended by its own exit or the person's relaunch).
+    /// Before the kernel has said (a kernel without op 2), a kist circle has no state: the theme's glow as before.
+    fn state(&self, i: usize) -> (ferros_glow::Glow, u16) {
+        use ferros_glow::Glow;
+        let Some(k) = self.kist(i) else { return (Glow::System, 0) };
+        if let Some(w) = self.waiting.iter().find(|w| w.0 == k.capsule).filter(|w| w.1 > 0) {
+            return (Glow::ForYou, w.1);
         }
+        if widget(&k.name).is_some() {
+            return (Glow::Running, 0);
+        }
+        let Some(live) = self.live.as_ref() else { return (Glow::None, 0) };
+        if live.contains(&k.capsule) {
+            (Glow::Running, 0)
+        } else if self.ended.contains(&k.capsule) {
+            (Glow::Stopped, 0)
+        } else {
+            (Glow::NotRunning, 0)
+        }
+    }
+
+    /// The circles' states to the display (op 57): every circle's after a fresh scene (`all`), else only those changed since last sent. Whether any was sent.
+    fn send_states(&mut self, all: bool) -> bool {
+        let mut m = [0u8; 2 + 4 * MAX];
+        m[0] = 57;
+        let mut count = 0;
+        for i in 0..self.n {
+            let (g, n) = self.state(i);
+            let s = (g as u8, n);
+            if !all && self.sent[i] == s {
+                continue;
+            }
+            self.sent[i] = s;
+            let at = 2 + count * 4;
+            m[at] = i as u8;
+            m[at + 1] = s.0;
+            m[at + 2..at + 4].copy_from_slice(&n.to_le_bytes());
+            count += 1;
+        }
+        if count == 0 {
+            return false;
+        }
+        m[1] = count as u8;
         let mut r = [0u8; 4];
-        call(self.display, &m, &mut r);
-        let mut s = [0u8; 2 + 4 * DUMMIES.len()];
-        s[0] = 57;
-        s[1] = DUMMIES.len() as u8;
-        for (k, d) in DUMMIES.iter().enumerate() {
-            let at = 2 + k * 4;
-            s[at] = (self.n + k) as u8;
-            s[at + 1] = d.1;
-            s[at + 2..at + 4].copy_from_slice(&d.2.to_le_bytes());
-        }
-        call(self.display, &s, &mut r);
+        call(self.display, &m[..2 + 4 * count], &mut r);
+        true
     }
 
     /// The crowd's circles (world units: x, y, r), kept so every `send_scene` appends them again after the map's own.
@@ -4666,6 +4697,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         fault: None,
         stopped: alloc::vec::Vec::new(),
         kists_read: 0,
+        live: None,
+        ended: alloc::vec::Vec::new(),
+        waiting: alloc::vec::Vec::new(),
+        sent: [(0, 0); MAX],
     };
     // The display's hit map view as it stands (op 58, ask), for the Developer page's checkbox: a map started again finds it as it was left.
     if DEV {
@@ -4887,6 +4922,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut kists_seen = KISTS_WORD.load(core::sync::atomic::Ordering::Acquire);
     // What the kernel kept before this map started is not this map's to say.
     map.kists_read = kists_seen;
+    // The kist circles' states as they stand (`kists_rang` says nothing kept before this map started): a map started again finds a running kist running and a stopped one stopped.
+    map.kists_rang();
     // The links' and the facts' bells (SYS_BELL): the kernel writes each source's change count into BELLS at every change. A kernel from before refuses them, and those pages then draw only as they open or are touched.
     for (s, w) in BELLS.iter().enumerate() {
         if !ferros_sys::bell(s as u64, w) {
