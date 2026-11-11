@@ -405,7 +405,7 @@ impl Client {
         }
     }
 
-    /// This device's departure request into the space and out to the fleet and fgtw.org at once, so a member approves it wherever it is, on any network (owner, 2026-11-09: "broadcast to the devices like a regular message"); the local hand-over (`depart_hand`) stays the fast path.
+    /// This device's departure request into the space and out to the fleet and fgtw.org at once, so a member approves it wherever it is, on any network (owner, 2026-11-09: "broadcast to the devices like a regular message"); the hand-over on this network (depart.rs) stays the fast path.
     pub fn space_put_depart(&mut self, request: &[u8]) {
         if self.space_ready().is_none() {
             return;
@@ -443,13 +443,18 @@ impl Client {
         }
     }
 
-    /// The departures the space carries: another member's goes to the intake a local hand-over takes (`on_depart_req`, which checks its signature and keeps it for the Fleet page); one whose device is no longer a member is marked gone.
+    /// When `leaver`'s departure entry was marked gone (given up, published, or its device no longer a member), if it is.
+    pub fn space_depart_gone(&self, leaver: &[u8; 32]) -> Option<i64> {
+        self.space.space.get(ferros_space::kind::DEPART, &ferros_space::depart_id(leaver)).filter(|e| e.gone).map(|e| e.updated)
+    }
+
+    /// The departures the space carries, to the departure machine as a frame from a LAN hand-over is (depart.rs; the machine checks the signer and keeps a request for the Fleet page); one whose device is no longer a member is marked gone.
     fn space_departures(&mut self) {
         let live = ferros_space::departures(&self.space.space);
         for (leaver, bytes) in &live {
             // A deny, wherever it was made: this device's own request among them.
             if fgtw::protocol::parse_depart_deny(bytes).is_ok() {
-                self.on_depart_deny(bytes);
+                self.depart_frame(None, bytes);
                 continue;
             }
             if *leaver == self.me {
@@ -459,11 +464,13 @@ impl Client {
                 self.space_drop_depart(leaver);
                 continue;
             }
-            self.on_depart_req(bytes);
+            self.depart_frame(None, bytes);
         }
-        // A request waiting here whose entry is gone (approved on another device, or given up): cleared, unless this device is countersigning it now.
-        if self.depart_ask.as_ref().is_some_and(|d| !d.approve && d.result == 0 && !live.iter().any(|(l, _)| *l == d.leaver)) {
-            self.depart_ask = None;
+        // A request waiting here whose entry its device gave up (op 20 there): no longer asked, unless this device is countersigning it now.
+        if let Some((leaver, _, _)) = self.depart_asked() {
+            if self.dep.result != 1 && !live.iter().any(|(l, _)| *l == leaver) {
+                self.depart_withdrawn(leaver);
+            }
         }
     }
 

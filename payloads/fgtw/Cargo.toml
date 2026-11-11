@@ -12,7 +12,9 @@ path = "src/main.rs"
 ferros_sys = { path = "../../ferros_sys" }
 ferros_heap = { path = "../../ferros_heap" }
 photon_core = { path = "../../photon_core" }
-fgtw = { path = "../../../fgtw", default-features = false, features = ["fanout", "protocol"] }
+fgtw = { path = "../../../fgtw", default-features = false, features = ["fanout", "protocol", "flow"] }
+# Photon Transport names a frame by its BLAKE3 when it answers a send (depart.rs, route.rs): the same pure build photon_core takes.
+blake3 = { version = "1", default-features = false, features = ["pure"] }
 ed25519-dalek = { version = "2", default-features = false }
 vsf = { path = "../../../vsf", default-features = false }
 # The person's identity space (space.rs): ferros's vocabulary for fgtw::space and the sync with this device's copy.

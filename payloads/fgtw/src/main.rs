@@ -4,7 +4,7 @@
 //!
 //! Identity: the device key is rooted in the kernel's ira (`ira_key("fgtw device")` → `join::DeviceKeys::derive`; "photon device" until 2026-11-04, changed when no fleet held this device), the same after a factory reset; the identity roots (`identity_seed`, `handle_proof`) come from the attest screen (op 4, in RAM) or are pushed into the vault scope `fgtw.` by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the device. Once bound, the chain (`fgtw.chain`) and the fleet key (`fgtw.fleet_key`) live in the same scope. A departure under way is kept there too (`fgtw.depart`, whatever unlock-at-boot says: it holds no root) until it completes, so a restart resumes it. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
 //!
-//! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the binding request (and a departure request) to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same 19 bytes for the boot-started service] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock --store map --store kists. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving) and the words the 23 pairing words while joining or the 3 approval words while leaving; op 1 the state alone, op 2 mint (a result byte first), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk). Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes), 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space: their home screen and their kists, joined to their fleet's, space.rs): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
+//! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the binding request (and a departure request) to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same 19 bytes for the boot-started service] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock --store map --store kists. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving) and the words the 23 pairing words while joining (none while leaving); op 1 the state alone, op 2 mint (a result byte first), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk; the departure runs on fgtw's shared machine, depart.rs). Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes), 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space: their home screen and their kists, joined to their fleet's, space.rs): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
 
 #![no_std]
 #![no_main]
@@ -19,6 +19,9 @@ use photon_core::join::{self, DeviceKeys, Inbound};
 use photon_core::pt::{self, Addr, Event, Pt};
 use photon_core::wire::{self, Frame};
 
+mod depart;
+mod kept;
+mod route;
 mod space;
 
 /// The heap and the work thread's stack, in .bss: the entry's header (`ferrosRT`, ferros_rt's) tells the kernel how much zeroed memory follows the code, so the arc holds them (payload.ld). Was 160 KiB in .data to fit a 1 MiB arc: a re-minted binding request (an SLH-DSA signature, 7856 B) then found no free run once the client had run a while, and the client panicked (2026-10-28).
@@ -353,17 +356,7 @@ impl Udp {
     }
 }
 
-/// A departure from the fleet in progress (pairing-v2 "Chain changes": removal is bilateral, the leaver's consent countersigned by a surviving member).
-/// Kept in the vault as `fgtw.depart` (`DEPART_KEY`) from the moment it starts until it completes, so a reboot resumes it rather than dropping it (`keep_depart`, `resume_depart`).
-struct Depart {
-    t: i64,
-    /// The request's salt (fgtw::protocol::DepartReq): a denied request is never asked again, so a new one takes a new salt.
-    salt: [u8; 32],
-    frame: Vec<u8>,
-    checked_us: u64,
-}
-
-/// Where this device stands with the identity whose roots it holds (the `fgtw` endpoint's op 1 state byte; pairing-v2's lamp). 0 no roots, 1 joining (the identity has a fleet, this device is not in it yet: RED, words shown), 2 bound waiting for the fleet key, 3 a member with the key, 4 looking the identity up, 5 fresh (fgtw.org holds no chain and no fleet device is heard: it may be minted), 6 wrong fleet (the seed's chain for this handle has another identity's genesis), 7 unreachable (no peer heard and no seed answer: GREY, never a verdict), 8 leaving (a departure request out, its approval words shown), 9 owned elsewhere (fgtw.org says this device is in another identity's fleet: no words).
+/// Where this device stands with the identity whose roots it holds (the `fgtw` endpoint's op 1 state byte; pairing-v2's lamp). 0 no roots, 1 joining (the identity has a fleet, this device is not in it yet: RED, words shown), 2 bound waiting for the fleet key, 3 a member with the key, 4 looking the identity up, 5 fresh (fgtw.org holds no chain and no fleet device is heard: it may be minted), 6 wrong fleet (the seed's chain for this handle has another identity's genesis), 7 unreachable (no peer heard and no seed answer: GREY, never a verdict), 8 leaving (a departure request out), 9 owned elsewhere (fgtw.org says this device is in another identity's fleet: no words).
 const V_NONE: u8 = 0;
 const V_JOIN: u8 = 1;
 const V_LOOKING: u8 = 4;
@@ -377,11 +370,6 @@ const V_OWNED: u8 = 9;
 /// Selected: a member picked this joining device (the Fleet page's button or an NFC tap) and said so (`bind_select`, owner 2026-11-10: "if you tap, it shouldn't become part of the fleet, it should just get notified it was selected"). Nothing is bound: the attest screen turns green with the selecting device's name (op 1's words), and the join completes when the new chain folds this device in and a fan-out wrap opens, as before. Op 1 only; never a verdict.
 const V_SELECTED: u8 = 10;
 
-/// The kept departure's name in the `fgtw.` scope: one VSF document, section `depart`, with `rq` the signed `depart_req` frame as a binary blob (its stamp, consent and salt inside it).
-/// Nothing of the identity is in it: the frame is this device's signature over its consent, and which identity it leaves is proven again at resume by checking the consent's Ed25519 egg against the roots then in hand (`resume_depart`).
-const DEPART_KEY: &[u8] = b"depart";
-/// The departure requests denied (`Client::denied`): one VSF document, section `denied`, a `request` field each (the leaving device `ke`, the salt `hb`, the consent stamp `e`).
-const DENIED_KEY: &[u8] = b"denied";
 /// One transfer of the vault (the kernel's STORE_MAX): larger values go in pieces.
 const STORE_PIECE: usize = 4096;
 
@@ -437,8 +425,6 @@ fn now_us() -> u64 {
 struct Sponsor {
     key: [u8; 32],
     addr: Addr,
-    /// The departure stamp this sibling was handed last (0 = none yet).
-    depart_t: i64,
     /// The request stamp this sponsor was handed last (0 = none yet).
     asked_t: i64,
     heard_us: u64,
@@ -490,19 +476,6 @@ impl Adding {
     }
 }
 
-/// A sibling's departure waiting for this device's person to approve it (`depart_req`, checked on receipt): the leaving device, its consent stamp and eggs, its intent, its words' commitment, and an approval asked for (the words matched; the loop countersigns).
-struct DepartAsk {
-    leaver: [u8; 32],
-    t: i64,
-    sig: Vec<u8>,
-    intent: u8,
-    /// The request's salt, which a Deny names.
-    salt: [u8; 32],
-    approve: bool,
-    /// What happened to the approval (0 waiting, 1 approving, 2 approved, 3 failed).
-    result: u8,
-}
-
 
 struct Client {
     log: Log,
@@ -528,8 +501,8 @@ struct Client {
     radios_last: Option<([u8; 32], [u8; 16])>,
     radios_missed: bool,
     radios_at: u64,
-    /// A departure in progress (op 5): its stamp, the approval words this screen shows, the signed `depart_req`, and when the chain was last checked for our absence.
-    depart: Option<Depart>,
+    /// A device leaving its fleet, both halves, on fgtw's machine (depart.rs): this device's own request and a fleet device's request waiting for this device's person.
+    dep: depart::Departing,
     /// Whether IPv4 has been up (the first lease triggers a look-up), and the look-up ticks spent with no network while looking.
     net_up: bool,
     offline_looks: u8,
@@ -550,8 +523,6 @@ struct Client {
     /// A sponsor named at spawn (its address; the key is learnt from its frames), handed the request directly.
     given: Option<Addr>,
     given_asked_t: i64,
-    /// The departure stamp the named sponsor was handed last (0 = none yet).
-    given_depart_t: i64,
     /// The chains and fan-outs this device holds (fgtw::held, the rule Photon's held set follows): the seed's copy when it answers, this one when it does not.
     held: core::cell::RefCell<fgtw::held::HeldChains>,
     held_fan: core::cell::RefCell<fgtw::held::HeldFanouts>,
@@ -560,19 +531,13 @@ struct Client {
     lan_reqs: Vec<fgtw::fleet::BindRequest>,
     lan_from: Vec<([u8; 32], Addr, u64)>,
     ble_heard: Vec<([u8; fgtw::pair::BEACON_UUID_LEN], u64)>,
-    /// Whether the radios are listening for newcomers (the BLE scan, the NFC reader) while the add flow is open (`sponsor_radios`).
-    listening: bool,
+    /// Whether the radios are listening (`sponsor_radios`): the NFC reader while the add flow is open or a fleet device's departure waits here (a tap of the leaving device approves it), the BLE scan while the add flow is open.
+    listening: (bool, bool),
     /// Loop passes since the radios were last told to listen: told again every 64 while the add flow is open, so a driver restarted meanwhile listens again (both answer a repeat with nothing changed). And what they last answered, so only a change is said.
     listen_pass: u32,
     listen_said: (u8, u8),
     /// The beacon ids heard and the candidates heard by Bluetooth at the last look, so only a change is said.
     ble_said: (usize, usize),
-    /// A sibling's departure waiting for approval here.
-    depart_ask: Option<DepartAsk>,
-    /// Departure requests denied here or by another fleet device: (the leaving device, the request's salt, its consent stamp), kept in the vault (`DENIED_KEY`), so the same request is never asked or approved again; the newest 32.
-    denied: Vec<([u8; 32], [u8; 32], i64)>,
-    /// This device's own departure denied: the device that denied it, shown on the Fleet page until the person asks again.
-    depart_denied: Option<[u8; 32]>,
     /// The members of the latest chain for our handle handed to this device before it was bound (a sponsor pushes it ahead of its `bind_select`): what a select's sender is checked against.
     offered: Vec<[u8; 32]>,
     /// A `bind_select` for this device that came before any chain its sender is in (the frames crossed): its sender, checked again when a chain arrives.
@@ -678,31 +643,23 @@ impl Client {
             self.fleet_key = Some(b);
         }
         // The chain we hold, if bound before: folded again against our roots, so a bad write never binds us.
-        let mut held: Option<Vec<u8>> = None;
         if let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) {
             // Read whole, piece by piece, exactly its own size (one transfer holds at most 4096 bytes, and a fleet chain grows past that; a 128 KiB buffer asked of a 160 KiB heap that has been running a while need not find one free run).
-            if let Some(mut chain) = self.store_get_whole(b"chain") {
-                let n = chain.len();
-                if n > 0 {
-                    if let Ok((blob, bound)) = join::adopt_chain(&hp, &seed, &self.me, &chain[..n]) {
+            if let Some(chain) = self.store_get_whole(b"chain") {
+                if !chain.is_empty() {
+                    if let Ok((blob, bound)) = join::adopt_chain(&hp, &seed, &self.me, &chain) {
                         self.bound = bound;
                         self.note_members(&blob);
                         self.log.put(b"fgtw: chain held, ");
                         self.log.dec(blob.ops.len() as u64);
                         self.log.put(if bound { b" op(s), this device is a member" } else { b" op(s), this device is not in it" });
                         self.log.line();
-                        chain.truncate(n);
-                        held = Some(chain);
                     }
                 }
             }
         }
-        // A departure that was under way when the device last stopped: resumed, and finished at once if the chain held here already lacks this device. The requests denied before, so none is asked again.
-        self.load_denied();
-        self.resume_depart();
-        if let Some(c) = held {
-            self.depart_check(&c);
-        }
+        // The departure machine (depart.rs), made now the roots are in hand: a departure under way when the device last stopped is resumed, and finished at once if the chain held here (the machine's first fold) already lacks this device.
+        self.depart_start();
         if !say && self.hp.is_none() {
             return;
         }
@@ -719,8 +676,8 @@ impl Client {
 
     fn show_words(&mut self) {
         let (Some(seed), false) = (self.identity_seed, self.bound) else { return };
-        // Leaving (a departure resumed before the chain is adopted again): the approval words are what this device shows, never the pairing words.
-        if self.depart.is_some() {
+        // Leaving (a departure resumed before the chain is adopted again): no pairing words.
+        if self.depart_asking() {
             return;
         }
         let words = join::pair_words(&self.me, &seed);
@@ -760,8 +717,6 @@ impl Client {
                 self.send_all(out);
             }
         }
-        // Leaving: the departure request to the named sponsor too, once per stamp (a departure resumed after a restart reaches it here).
-        self.depart_hand_given();
     }
 
     /// The lookup's question to FGTW: a signed `fleet_req` for this handle proof to this network (the beacon groups and the subnet broadcast, where beacons go) and to each fleet peer known by address. Answered by a member with its beacon, or its chain for a device it knows (`on_fleet_req`).
@@ -846,7 +801,7 @@ impl Client {
                 self.log.put(b" beaconing at ");
                 self.log.addr(&addr);
                 self.log.line();
-                self.sponsors.push(Sponsor { key, addr, depart_t: 0, asked_t: 0, heard_us: t, online: false });
+                self.sponsors.push(Sponsor { key, addr, asked_t: 0, heard_us: t, online: false });
                 // A device beaconing under our handle: the identity has a fleet, whatever the seed said.
                 if matches!(self.verdict, V_LOOKING | V_FRESH | V_UNREACHABLE) {
                     self.verdict = V_JOIN;
@@ -854,7 +809,8 @@ impl Client {
                 self.sponsors.len() - 1
             }
         };
-        self.depart_hand(idx);
+        // A fleet device heard: handed whatever departure frame it has not taken.
+        self.depart_reachable(key);
         if !self.bound && !self.request_frame.is_empty() && self.sponsors[idx].asked_t != self.request_t {
             self.sponsors[idx].asked_t = self.request_t;
             self.log.put(b"fgtw: handing our binding request to ");
@@ -1043,158 +999,6 @@ impl Client {
         }
         r
     }
-    /// Op 5: leave the fleet (pairing-v2's bilateral removal, the app's sign-out): this device's consent eggs over the departure bytes, three fresh approval words, and the signed `depart_req` (fgtw::protocol) handed to every sibling heard on this network, and to each one heard later. A surviving device's user types the words shown here and publishes the consented Remove; once the chain no longer holds this device, the identity is forgotten here (`depart_check`). `intent` is 1 (to a new owner: the approver also releases the device, so another fleet can bind it) or 2 (to the desk). Returns 0 started, 1 not a member of a fleet, 2 an intent that is neither, 3 the frame did not build.
-    fn leave(&mut self, intent: u8) -> u8 {
-        let Some(hp) = self.hp else { return 1 };
-        if !self.bound {
-            return 1;
-        }
-        if intent != join::DEPART_NEW_OWNER && intent != join::DEPART_DESK {
-            return 2;
-        }
-        let t = eagle();
-        let consent = join::depart_consent(&self.keys, &hp, t);
-        // A fresh salt names this request (owner, 2026-11-10: "upon deny another request will have to use a new salt").
-        let mut salt = [0u8; 32];
-        kernel_entropy(&mut salt);
-        let req = join::DepartReq { t, consent_sig: consent, intent, salt };
-        let frame = match join::depart_req(&req, &self.keys, t) {
-            Ok(f) => f,
-            Err(e) => {
-                self.log.put(b"fgtw: the departure request did not build: ");
-                self.log.put(e.as_bytes());
-                self.log.line();
-                return 3;
-            }
-        };
-        self.log.put(if intent == join::DEPART_NEW_OWNER { b"fgtw: leaving the fleet (to a new owner): asking this identity's devices, Approve or Deny on any of them".as_slice() } else { b"fgtw: leaving the fleet: asking this identity's devices, Approve or Deny on any of them" });
-        self.log.line();
-        self.depart_denied = None;
-        self.depart = Some(Depart { t, salt, frame, checked_us: 0 });
-        self.keep_depart();
-        let request = self.depart.as_ref().map(|d| d.frame.clone()).unwrap_or_default();
-        self.space_put_depart(&request);
-        for i in 0..self.sponsors.len() {
-            self.depart_hand(i);
-        }
-        self.depart_hand_given();
-        0
-    }
-
-    /// Op 20: the departure under way given up: 0, or 1 when there is none.
-    fn give_up_depart(&mut self) -> u8 {
-        if self.depart.take().is_none() {
-            return 1;
-        }
-        let _ = ferros_sys::store_delete(cap(self.log.grants, S_STORE), DEPART_KEY);
-        let me = self.me;
-        self.space_drop_depart(&me);
-        self.log.put(b"fgtw: the departure given up: this device stays in the fleet");
-        self.log.line();
-        0
-    }
-
-    /// The departure under way into the vault (`DEPART_KEY`), so a reboot before a device of the fleet approves resumes it with the same request (the same salt).
-    /// Kept whether or not unlock-at-boot is on: it holds no root, and without it a reboot would leave the fleet's devices asking about a request this device had forgotten.
-    fn keep_depart(&mut self) {
-        let Some(d) = &self.depart else { return };
-        let mut section = vsf::VsfSection::new("depart");
-        section.add_field("rq", vsf::VsfType::v(b'b', d.frame.clone()));
-        let kept = match vsf::VsfBuilder::new().creation_time_oscillations(eagle()).add_section_direct(section).build() {
-            Ok(doc) => self.store_set_whole(DEPART_KEY, &doc),
-            Err(_) => false,
-        };
-        if !kept {
-            self.log.put(b"fgtw: the departure was not kept in the vault: a reboot before it is approved drops it");
-            self.log.line();
-        }
-    }
-
-    /// A departure kept in the vault (`keep_depart`), taken up again once the roots are in hand: its request and words as they were, handed to siblings as they are heard and checked against the chain as `leave` leaves them.
-    /// Taken up only for the identity it leaves: the request must be this device's, and its consent's Ed25519 egg must verify over these roots' departure bytes (`fleet::departreq_signing_bytes`); a departure from another identity stays in the vault untouched.
-    fn resume_depart(&mut self) {
-        let Some(hp) = self.hp else { return };
-        if self.depart.is_some() || self.identity_seed.is_none() {
-            return;
-        }
-        let Some(doc) = self.store_get_whole(DEPART_KEY) else { return };
-        let Ok((header, end)) = vsf::verification::read_verified(&doc, None) else {
-            self.log.put(b"fgtw: a kept departure does not verify: left as it is");
-            self.log.line();
-            return;
-        };
-        let Ok(section) = header.primary_section(&doc, end) else { return };
-        let Some(frame) = section.get_field("rq").and_then(|f| f.values.first()).and_then(|v| v.as_bytes()).map(|b| b.to_vec()) else { return };
-        // A request kept by a build from before 2026-11-10 (words, no salt) does not parse: dropped, and the person asks again.
-        let Ok((req, leaver)) = fgtw::protocol::parse_depart_req(&frame) else {
-            let _ = ferros_sys::store_delete(cap(self.log.grants, S_STORE), DEPART_KEY);
-            return;
-        };
-        let msg = fgtw::fleet::departreq_signing_bytes(&hp, &self.me, req.t);
-        let ours = leaver == self.me
-            && fgtw::pq::eggs_from_bytes(&req.consent_sig).is_ok_and(|eggs| eggs.iter().any(|e| e.scheme == fgtw::fleet::scheme::ED25519 && fgtw::pq::verify_egg(e.scheme, &self.me, &msg, &e.sig)));
-        if !ours {
-            return;
-        }
-        self.log.put(b"fgtw: resuming the departure kept from before the restart: asking this identity's devices again");
-        self.log.line();
-        self.depart = Some(Depart { t: req.t, salt: req.salt, frame, checked_us: 0 });
-        let request = self.depart.as_ref().map(|d| d.frame.clone()).unwrap_or_default();
-        self.space_put_depart(&request);
-        for i in 0..self.sponsors.len() {
-            self.depart_hand(i);
-        }
-    }
-
-    /// Hand the departure request to the named sponsor (spawn input or `fgtw.sponsor`, the address the binding request goes to directly), once per request: on a network whose access point passes no multicast between its wireless clients no sibling is ever heard beaconing, and the named sponsor is the one device of the fleet this device can reach.
-    fn depart_hand_given(&mut self) {
-        let (Some(d), Some(to)) = (&self.depart, self.given) else { return };
-        if self.given_depart_t == d.t {
-            return;
-        }
-        self.given_depart_t = d.t;
-        let frame = d.frame.clone();
-        self.log.put(b"fgtw: handing our departure request to the named sponsor, ");
-        self.log.addr(&to);
-        self.log.line();
-        let out = self.pt.send(to, frame, now_us(), eagle());
-        self.send_all(out);
-    }
-
-    /// Hand the departure request to sibling `i`, once per request.
-    fn depart_hand(&mut self, i: usize) {
-        let Some(d) = &self.depart else { return };
-        if self.sponsors[i].depart_t == d.t {
-            return;
-        }
-        self.sponsors[i].depart_t = d.t;
-        let (frame, to, key) = (d.frame.clone(), self.sponsors[i].addr, self.sponsors[i].key);
-        self.log.put(b"fgtw: handing our departure request to ");
-        self.log.fp(&key);
-        self.log.line();
-        let out = self.pt.send(to, frame, now_us(), eagle());
-        self.send_all(out);
-    }
-
-    /// A chain read while leaving: once it folds without this device, the departure is complete — the identity's roots, chain and key are forgotten here, on disk and in RAM.
-    fn depart_check(&mut self, chain: &[u8]) {
-        if self.depart.is_none() {
-            return;
-        }
-        let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
-        if let Ok((_, false)) = join::adopt_chain(&hp, &seed, &self.me, chain) {
-            self.log.put(b"fgtw: the fleet's chain no longer holds this device: departed; the identity is forgotten here");
-            self.log.line();
-            self.depart = None;
-            let _ = ferros_sys::store_delete(cap(self.log.grants, S_STORE), DEPART_KEY);
-            self.forget_disk();
-            self.forget_identity();
-            if !ferros_sys::release_identity(cap(unsafe { GRANTS }, S_UNLOCK)) {
-                self.log.put(b"fgtw: the kernel did not release the device's identity space");
-                self.log.line();
-            }
-        }
-    }
 
     /// The proximity carriers: with a request, its secret served on the NFC tag and its beacon id advertised; without, both stopped. The calls carry CALL_LIVE: a driver that is down, or still bringing its chip up (Bluetooth gives WiFi 16 s at boot), fails the call at once instead of holding this client and, through it, the attest screen. One that missed its handover is tried again every 16 s from the loop (`radios_retry`); the words work meanwhile.
     fn radios(&mut self, on: Option<(&[u8; 32], &[u8; 16])>) {
@@ -1230,7 +1034,7 @@ impl Client {
 
     /// Everything held for the identity whose roots were in the vault: its roots, chain standing, key, sponsors and request.
     fn forget_identity(&mut self) {
-        self.depart = None;
+        self.dep = depart::Departing::new();
         if self.radios_on {
             self.radios(None);
         }
@@ -1510,6 +1314,8 @@ impl Client {
                 if let Some(s) = self.sponsors.iter_mut().find(|s| s.key == key) {
                     s.addr = from;
                     s.heard_us = t;
+                    // A fleet device pinging us is reachable: handed whatever departure frame it has not taken.
+                    self.depart_reachable(key);
                 }
                 return;
             }
@@ -1524,8 +1330,8 @@ impl Client {
                         self.log.put(b" answers our pings");
                         self.log.line();
                     }
-                    // A departure it has not taken yet (its hand-off given up on, or never made): handed now that it answers.
-                    self.depart_hand(i);
+                    // A departure frame it has not taken yet (its hand-off given up on, or never made): handed now that it answers.
+                    self.depart_reachable(key);
                 }
                 return;
             }
@@ -1547,6 +1353,13 @@ impl Client {
         if !via_transfer {
             let ack = pt::packet_ack(eagle(), bytes);
             self.udp.send(&from, join::PORT, &ack);
+        }
+        // A frame signed by a member of our fleet: its address learnt, and it is reachable (handed whatever departure frame it has not taken).
+        if let Ok((_, signer)) = &parsed {
+            if self.bound && *signer != self.me && self.members.contains(signer) {
+                self.learn(*signer, from);
+                self.depart_reachable(*signer);
+            }
         }
         match parsed {
             Ok((Inbound::FleetResp { hp, chain }, signer)) => {
@@ -1580,7 +1393,8 @@ impl Client {
                             self.hold_chain(&chain);
                             self.verdict = V_JOIN;
                         }
-                        self.depart_check(&chain);
+                        // The departure machine's fold: a member's request settled, or ours complete once this device is not in it.
+                        self.depart_fold(&blob);
                     }
                     Err(e) => {
                         self.log.put(b"fgtw: a chain from ");
@@ -1631,8 +1445,7 @@ impl Client {
             }
             // A newcomer asking this device to add it, and a sibling asking to leave: the sponsor's and the approver's frames (fgtw::sponsor).
             Ok((Inbound::Other(name), _)) if name == "bind_req" => self.on_bind_req(from, bytes),
-            Ok((Inbound::Other(name), _)) if name == "depart_req" => self.on_depart_req(bytes),
-            Ok((Inbound::Other(name), _)) if name == "depart_deny" => self.on_depart_deny(bytes),
+            Ok((Inbound::Other(name), _)) if name == "depart_req" || name == "depart_deny" => self.depart_frame(Some(from), bytes),
             // The person's identity space from a sibling (space.rs).
             Ok((Inbound::Other(name), _)) if name == "space_push" => self.on_space_push(from, bytes),
             Ok((Inbound::Other(name), _)) if name == "space_want" => self.on_space_want(from, bytes),
@@ -1710,17 +1523,15 @@ impl Client {
                 for e in self.pt.take_events() {
                     match e {
                         Event::Frame { from, bytes, signer } => self.on_frame(from, &bytes, signer.is_some()),
-                        Event::Sent { to, ok, .. } => {
+                        Event::Sent { to, hash, ok } => {
                             if !ok {
                                 self.log.put(b"fgtw: a frame to ");
                                 self.log.addr(&to);
                                 self.log.put(b" was given up on");
                                 self.log.line();
-                                // A departure to that device is handed again at its next answer (`Pong`): the desktop restarted 14 s before one arrived, and with no retry it never saw it (2026-11-10).
-                                for s in self.sponsors.iter_mut().filter(|s| s.addr.fam == to.fam && s.addr.ip == to.ip && s.addr.port == to.port) {
-                                    s.depart_t = 0;
-                                }
                             }
+                            // A departure frame given up on is handed again when its device is next heard (the desktop restarted 14 s before one arrived, and with no retry it never saw it, 2026-11-10); one that arrived is not.
+                            self.depart_sent(&to, &hash, ok);
                         }
                     }
                 }
@@ -1741,7 +1552,7 @@ impl Client {
                 busy = true;
                 // WHY the min: `n` is what the caller sent, which may be more than the buffer took.
                 let got = (n as usize).min(req.len());
-                // The sponsor's and the approver's ops (the Fleet page's add flow and approvals, fgtw::sponsor): each answers alone, nothing of the state after it. 8 [on] open or close the add flow → [0]; 9 → the add flow (`adding_reply`); 10 [key 8] pick a nearby candidate → [result]; 11 [words] the words typed so far → the match (`type_words`); 12 confirm a nearby pick → [result]; 13 → a departure waiting (`depart_ask_reply`); 14 [words] approve it → [result]; 15 [kind] words wanted from the person (0 none, 1 a newcomer's, 2 a leaver's) → [0]; 16 → the words wanted now [kind] (the keyboard's host asks).
+                // The sponsor's and the approver's ops (the Fleet page's add flow and approvals, fgtw::sponsor): each answers alone, nothing of the state after it. 8 [on] open or close the add flow → [0]; 9 → the add flow (`adding_reply`); 10 [key 8] pick a nearby candidate → [result]; 11 [words] the words typed so far → the match (`type_words`); 12 confirm a nearby pick → [result]; 13 → a departure waiting (`depart_ask_reply`); 14 [1 Approve, 0 Deny] → [result] (depart.rs); 15 [kind] words wanted from the person (0 none, 1 a newcomer's) → [0]; 16 → the words wanted now [kind] (the keyboard's host asks).
                 // The identity space (space.rs): 17 → its state for the map (`space_reply`: the generation the map reloads its circles on, this device's home-screen sync, the first pull done, the facts); 18 [on] this device's home screen follows the fleet's or keeps its own → [0 done, 1 not yet: before the first pull].
                 if n >= 1 && req[0] == 17 {
                     let r = self.space_reply();
@@ -1871,10 +1682,10 @@ impl Client {
                     self.fgtw_asked_us = 0;
                     self.log.put(if self.persist { b"fgtw: roots set in RAM and kept on disk (unlock at boot on)" } else { b"fgtw: roots set in RAM only (nothing of the identity on disk)" });
                     self.log.line();
-                    // A departure kept from before a restart: these roots are the first chance to take it up (with unlock-at-boot off, nothing of the identity is on disk at `load`).
-                    self.resume_depart();
+                    // The departure machine, made with these roots: a departure kept from before a restart is taken up now (with unlock-at-boot off, nothing of the identity is on disk at `load`).
+                    self.depart_start();
                 }
-                // Op 5: leave the fleet, `[5][intent]` (1 to a new owner, 2 to the desk) → [result: 0 started, else why not], then the state (8 leaving, with the approval words).
+                // Op 5: leave the fleet, `[5][intent]` (1 to a new owner, 2 to the desk) → [result: 0 started, 4 the identity's last device, else why not (depart.rs `leave`)], then the state (8 leaving).
                 if n >= 2 && req[0] == 5 {
                     let r = self.leave(req[1]);
                     reply.push(r);
@@ -1885,49 +1696,31 @@ impl Client {
                     (true, true, false) => 2,
                     (true, true, true) => 3,
                 };
-                let state = if self.depart.is_some() { V_LEAVING } else { state };
+                let leaving = self.depart_asking();
+                let state = if leaving { V_LEAVING } else { state };
                 // Selected by a member and not bound yet: the green screen, the selecting device's name after the state.
-                let state = if !self.bound && self.depart.is_none() && self.selected_by.is_some() { V_SELECTED } else { state };
+                let state = if !self.bound && !leaving && self.selected_by.is_some() { V_SELECTED } else { state };
                 reply.push(state);
                 reply.push(self.sponsors.len().min(255) as u8);
                 if let (Some(seed), V_SELECTED, Some(by)) = (self.identity_seed, state, self.selected_by) {
                     reply.extend_from_slice(fgtw::pair::device_name_default(&by, &seed).as_bytes());
                 }
                 // Joining's pairing words follow the state, the last resort when a tap and BLE fail; a departure shows none (owner, 2026-11-10), even one resumed before the chain is adopted again.
-                if let (Some(seed), false, V_JOIN, None, None) = (self.identity_seed, self.bound, self.verdict, &self.depart, self.selected_by) {
+                if let (Some(seed), false, V_JOIN, false, None) = (self.identity_seed, self.bound, self.verdict, leaving, self.selected_by) {
                     reply.extend_from_slice(join::pair_words(&self.me, &seed).as_bytes());
                 }
                 svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, reply.as_ptr() as u64 - self.udp.base, reply.len() as u64, 0, 0);
             }
             // Joining: the seed's copy of the chain every 16 s, for the sponsor's Add. A sponsor hands the chain and the fan-out to a newcomer at the address its request came from on the LAN; one it knows only from the registry or the tap has no address, and the newcomer has to look (2026-11-04: Brittany's phone bound this device by the tap and the words stayed up). The clock only moves forward, so `t` is never behind the last check.
-            if !self.bound && self.depart.is_none() && self.verdict == V_JOIN && t - self.join_checked_us >= 16_000_000 {
+            if !self.bound && !self.depart_asking() && self.verdict == V_JOIN && t - self.join_checked_us >= 16_000_000 {
                 self.join_checked_us = t;
                 self.join_check();
             }
-            // Leaving: the seed's copy of the chain every 16 s, for the approver's consented Remove (a sibling's push may never reach a device it no longer counts as a sibling). The clock only moves forward, so `t` is never behind the last check.
-            if self.depart.as_ref().is_some_and(|d| t - d.checked_us >= 16_000_000) {
-                if let Some(d) = self.depart.as_mut() {
-                    d.checked_us = t;
-                }
-                if let Some(hp) = self.hp {
-                    fgtw::set_clock(eagle());
-                    let (fetched, ip) = {
-                        let s = self.seed();
-                        let r = fgtw::client::fetch(&s, &hp);
-                        (r, s.ip.get())
-                    };
-                    self.seed_ip = ip;
-                    if fetched.is_ok() {
-                        self.seed_heard_us = now_us();
-                    }
-                    if let Ok(Some(b)) = fetched {
-                        if let Ok(bytes) = b.to_vsf_bytes() {
-                            self.depart_check(&bytes);
-                        }
-                    }
-                }
-            }
-            // Sponsoring and approving (fgtw::sponsor): the add flow's listing, binding and growing, the radios listening for newcomers, an approved departure.
+            // Leaving: the seed's copy of the chain every 16 s, its fold to the departure machine (depart.rs).
+            self.depart_seed_check(t);
+            // The departure machine's slow work: signing a request or a deny, an approval's publish, a chain read (depart.rs), here in the loop and never inside a call another process waits on.
+            self.depart_work();
+            // Sponsoring (fgtw::sponsor): the add flow's listing, binding and growing, the radios listening for newcomers and for a departure's tap.
             self.sponsor_step(t);
             // The person's identity space: the first pull, then this device's copy joined to it and handed on (space.rs).
             self.space_step(t);
@@ -1940,6 +1733,8 @@ impl Client {
                 self.fgtw_asked_us = 0;
                 self.log.put(b"fgtw: the network is up (IPv4)");
                 self.log.line();
+                // A departure frame given up on is handed again on the new network.
+                self.depart_event(fgtw::flow::Event::LinkUp);
             }
             // Also the moment FGTW's answer window closes (`lookup`), so fgtw.org follows a silent network a quarter second later, not at the next 2 s.
             let window_closed = self.fgtw_asked_us != 0 && t.wrapping_sub(self.fgtw_asked_us) >= 1 << 18;
@@ -1960,7 +1755,7 @@ impl Client {
                 }
             }
             // The binding request only once there is a fleet to ask (the verdict says joining): minting it signs in three families, SLH-DSA-128s among them, which takes seconds; it is done here in the loop, never inside a call another process waits on.
-            if !self.bound && self.depart.is_none() && self.hp.is_some() && self.verdict == V_JOIN && self.request_frame.is_empty() {
+            if !self.bound && !self.depart_asking() && self.hp.is_some() && self.verdict == V_JOIN && self.request_frame.is_empty() {
                 self.mint_request();
             }
             // Bound: nothing left to prove proximity for.
@@ -2008,13 +1803,13 @@ impl Client {
 
     /// What the Fleet page and the map read, in one piece: the state (op 1's), the members (op 6), a departure waiting (op 13), the add flow (op 9), this device's own departure denied, and the space (op 17).
     fn watch_state(&mut self) -> Vec<u8> {
-        let mut v = alloc::vec![self.hp.is_some() as u8, self.bound as u8, self.fleet_key.is_some() as u8, self.depart.is_some() as u8, self.verdict, self.sponsors.len() as u8];
+        let mut v = alloc::vec![self.hp.is_some() as u8, self.bound as u8, self.fleet_key.is_some() as u8, self.depart_asking() as u8, self.verdict, self.sponsors.len() as u8];
         // The select too: the attest screen turns green on it.
         v.extend_from_slice(self.selected_by.as_ref().map_or(&[0u8; 32][..], |s| &s[..]));
         v.extend_from_slice(&self.members_reply());
         v.extend_from_slice(&self.depart_ask_reply());
         v.extend_from_slice(&self.adding_reply());
-        v.extend_from_slice(self.depart_denied.as_ref().map_or(&[0u8; 32][..], |d| &d[..]));
+        v.extend_from_slice(self.dep.denied_by.as_ref().map_or(&[0u8; 32][..], |d| &d[..]));
         v.extend_from_slice(&self.space_reply());
         v
     }
@@ -2217,12 +2012,9 @@ impl Client {
         0
     }
 
-    /// Op 16: the words wanted from the person now, dropped once nothing is left to type them for (the add flow past picking, the departure approved or gone).
+    /// Op 16: the words wanted from the person now, dropped once nothing is left to type them for (the add flow past picking). A departure takes no words (op 15 sets 0 or 1 only).
     fn entry_wanted(&mut self) -> u8 {
         if self.entry == 1 && self.adding.phase != ADD_OPEN {
-            self.entry = 0;
-        }
-        if self.entry == 2 && !self.depart_ask.as_ref().is_some_and(|d| d.result == 0 || d.result == 3) {
             self.entry = 0;
         }
         self.entry
@@ -2456,210 +2248,12 @@ impl Client {
         self.adding.phase = ADD_DONE;
     }
 
-    /// A sibling's departure request (`depart_req`): kept for this device's person to approve when the leaver is a current member other than this device and its consent's Ed25519 egg verifies (fgtw::sponsor::depart_receipt_valid). The countersign happens only on the person's approval with the leaver's words.
-    pub fn on_depart_req(&mut self, bytes: &[u8]) {
-        let Ok((req, leaver)) = fgtw::protocol::parse_depart_req(bytes) else { return };
-        let Some(hp) = self.hp else { return };
-        if !self.bound || leaver == self.me || !self.members.contains(&leaver) {
-            return;
-        }
-        if !fgtw::sponsor::depart_receipt_valid(&hp, &leaver, req.t, &req.consent_sig) {
-            self.log.put(b"fgtw: a departure request from ");
-            self.log.fp(&leaver);
-            self.log.put(b" carries an invalid signature: dropped");
-            self.log.line();
-            return;
-        }
-        if self.depart_ask.as_ref().is_some_and(|d| d.leaver == leaver && d.t == req.t) {
-            return;
-        }
-        // A request denied once is never asked again, by its salt or by its consent stamp (the same consent under a new salt is the same request).
-        if self.denied.iter().any(|&(l, s, t)| l == leaver && (s == req.salt || t == req.t)) {
-            return;
-        }
-        self.log.put(b"fgtw: ");
-        if let Some(seed) = self.identity_seed {
-            self.log.put(fgtw::pair::device_name_default(&leaver, &seed).as_bytes());
-            self.log.put(b" (");
-            self.log.fp(&leaver);
-            self.log.put(b")");
-        }
-        self.log.put(b" asks to leave the fleet: Approve or Deny on the Fleet page");
-        self.log.line();
-        self.depart_ask = Some(DepartAsk { leaver, t: req.t, sig: req.consent_sig, intent: req.intent, salt: req.salt, approve: false, result: 0 });
-    }
-
-    /// Op 13, a departure waiting here: [1][intent][result: 0 waiting, 1 approving, 2 approved, 3 failed][name length][name]; or this device's own departure denied: [2][0][0][name length][the name of the device that denied it]; else [0][0][0][0].
-    fn depart_ask_reply(&self) -> Vec<u8> {
-        let mut r = Vec::with_capacity(48);
-        match (&self.depart_ask, self.depart_denied, self.identity_seed) {
-            (Some(d), _, Some(seed)) => {
-                let name = fgtw::pair::device_name_default(&d.leaver, &seed);
-                r.extend_from_slice(&[1, d.intent, d.result, name.len() as u8]);
-                r.extend_from_slice(name.as_bytes());
-            }
-            (None, Some(by), Some(seed)) => {
-                let name = fgtw::pair::device_name_default(&by, &seed);
-                r.extend_from_slice(&[2, 0, 0, name.len() as u8]);
-                r.extend_from_slice(name.as_bytes());
-            }
-            _ => r.extend_from_slice(&[0, 0, 0, 0]),
-        }
-        r
-    }
-
-    /// Op 14, the person's answer to the departure waiting here (owner, 2026-11-10: a yes or no question): `[14][1]` Approve (the loop countersigns), `[14][0]` Deny. Returns 0 done, 1 no departure waiting.
-    fn answer_depart(&mut self, approve: bool) -> u8 {
-        let Some(d) = self.depart_ask.as_mut() else { return 1 };
-        if approve {
-            d.approve = true;
-            d.result = 1;
-            return 0;
-        }
-        let (leaver, salt, t) = (d.leaver, d.salt, d.t);
-        self.depart_ask = None;
-        self.note_denied(leaver, salt, t);
-        let Some(hp) = self.hp else { return 0 };
-        self.log.put(b"fgtw: the departure of ");
-        self.log.fp(&leaver);
-        self.log.put(b" denied here: the fleet's devices are told, and that request is never asked again");
-        self.log.line();
-        // To every fleet device heard (the leaving one among them), and into the space for the rest (the entry's value becomes the deny: fgtw.org carries it to a device away from here).
-        if let Ok(frame) = fgtw::protocol::depart_deny(&hp, &leaver, &salt, t, self.keys.keypair(), eagle()) {
-            for i in 0..self.sponsors.len() {
-                let to = self.sponsors[i].addr;
-                let out = self.pt.send(to, frame.clone(), now_us(), eagle());
-                self.send_all(out);
-            }
-            self.space_deny_depart(&leaver, &frame);
-        }
-        0
-    }
-
-    /// A departure denied, remembered so it is never asked again (`denied`, kept in the vault as `DENIED_KEY`).
-    fn note_denied(&mut self, leaver: [u8; 32], salt: [u8; 32], t: i64) {
-        if self.denied.iter().any(|&(l, s, _)| l == leaver && s == salt) {
-            return;
-        }
-        self.denied.push((leaver, salt, t));
-        // WHY the cap: a list kept whole in the vault; the newest 32 cover every request a person could have pending.
-        if self.denied.len() > 32 {
-            self.denied.remove(0);
-        }
-        let mut section = vsf::VsfSection::new("denied");
-        for &(l, s, t) in &self.denied {
-            section.add_field_multi("request", alloc::vec![vsf::VsfType::ke(l.to_vec()), vsf::VsfType::hb(s.to_vec()), vsf::VsfType::e(vsf::types::EtType::e6(t))]);
-        }
-        if let Ok(doc) = vsf::VsfBuilder::new().creation_time_oscillations(eagle()).add_section_direct(section).build() {
-            if !self.store_set_whole(DENIED_KEY, &doc) {
-                self.log.put(b"fgtw: the denied request was not kept in the vault");
-                self.log.line();
-            }
-        }
-    }
-
-    /// The denied requests kept in the vault (`note_denied`), read once the roots are in hand.
-    fn load_denied(&mut self) {
-        let Some(doc) = self.store_get_whole(DENIED_KEY) else { return };
-        let Ok((header, end)) = vsf::verification::read_verified(&doc, None) else { return };
-        let Ok(section) = header.primary_section(&doc, end) else { return };
-        self.denied.clear();
-        for f in section.get_fields("request") {
-            let v = &f.values;
-            if let (Some(vsf::VsfType::ke(l)), Some(vsf::VsfType::hb(s)), Some(t)) = (v.first(), v.get(1), v.get(2).and_then(|x| x.as_eagle())) {
-                if let (Ok(l), Ok(s)) = (<[u8; 32]>::try_from(l.as_slice()), <[u8; 32]>::try_from(s.as_slice())) {
-                    self.denied.push((l, s, t));
-                }
-            }
-        }
-    }
-
-    /// A `depart_deny` from a fleet device (on the LAN, or the space's departure entry): the request it names cleared here and never asked again; this device's own request denied ends its departure (the person may ask again: a new request, a new salt).
-    pub fn on_depart_deny(&mut self, bytes: &[u8]) {
-        let Ok((hp, leaver, salt, t, denier)) = fgtw::protocol::parse_depart_deny(bytes) else { return };
-        if self.hp != Some(hp) || !self.bound || !self.members.contains(&denier) || denier == leaver {
-            return;
-        }
-        let known = self.denied.iter().any(|&(l, s, _)| l == leaver && s == salt);
-        self.note_denied(leaver, salt, t);
-        if self.depart_ask.as_ref().is_some_and(|d| d.leaver == leaver && (d.salt == salt || d.t == t)) {
-            self.depart_ask = None;
-        }
-        if leaver == self.me && self.depart.as_ref().is_some_and(|d| d.salt == salt) {
-            self.depart = None;
-            let _ = ferros_sys::store_delete(cap(self.log.grants, S_STORE), DEPART_KEY);
-            self.depart_denied = Some(denier);
-            self.log.put(b"fgtw: our departure was denied by ");
-            self.log.fp(&denier);
-            self.log.put(b": this device stays in the fleet");
-            self.log.line();
-        } else if !known {
-            self.log.put(b"fgtw: the departure of ");
-            self.log.fp(&leaver);
-            self.log.put(b" was denied by ");
-            self.log.fp(&denier);
-            self.log.line();
-        }
-    }
-
-    /// The approved departure countersigned and published (fgtw::sponsor::approve_departure), the device's brand released when it leaves to a new owner; the chain is read again so the members drop the leaver.
-    fn approve_now(&mut self) {
-        let Some(hp) = self.hp else { return };
-        let Some(d) = self.depart_ask.as_mut() else { return };
-        d.approve = false;
-        let (leaver, t, sig, intent) = (d.leaver, d.t, d.sig.clone(), d.intent);
-        ferros_sys::pin(ferros_sys::CORES_BIG);
-        ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000);
-        fgtw::set_clock(eagle());
-        let r = {
-            let s = self.seed();
-            let r = fgtw::sponsor::approve_departure(&s, &self.keys, &hp, &leaver, t, &sig, intent);
-            self.seed_ip = s.ip.get();
-            r
-        };
-        ferros_sys::pin(0);
-        let ok = r.is_ok();
-        self.log.put(b"fgtw: the departure of ");
-        self.log.fp(&leaver);
-        match r {
-            Ok(fgtw::sponsor::Approved::BrandKept) => self.log.put(b" approved: the consented Remove is published"),
-            Ok(fgtw::sponsor::Approved::Released(Ok(()))) => self.log.put(b" approved: the consented Remove is published and the device released for its new owner"),
-            Ok(fgtw::sponsor::Approved::Released(Err(e))) => {
-                self.log.put(b" approved: the consented Remove is published; the release failed: ");
-                self.log.put(e.as_bytes());
-            }
-            Err(e) => {
-                self.log.put(b" was not published: ");
-                self.log.put(e.as_bytes());
-            }
-        }
-        self.log.line();
-        if let Some(d) = self.depart_ask.as_mut() {
-            d.result = if ok { 2 } else { 3 };
-        }
-        if ok {
-            self.space_drop_depart(&leaver);
-            // The members without the leaver: the chain as the seed (or the held copy) now has it.
-            fgtw::set_clock(eagle());
-            let fetched = {
-                let s = self.seed();
-                fgtw::held::fetch(&s, &self.held, &hp)
-            };
-            if let Ok(Some(b)) = fetched {
-                self.note_members(&b);
-                if let Ok(bytes) = b.to_vsf_bytes() {
-                    self.persist_set(b"chain", &bytes);
-                }
-            }
-        }
-    }
-
-    /// The radios listening for newcomers while the add flow is open: the Bluetooth driver scanning for pairing beacons (op 3 on, op 4 off) and the NFC driver reading a tapped device's tag (op 4 on, op 5 off). CALL_LIVE: a driver that is down fails at once.
-    fn sponsor_radios(&mut self, on: bool) {
+    /// The radios listening: the NFC driver reading a tapped device's tag (op 4 on, op 5 off) while the add flow is open or a fleet device's departure waits here, the Bluetooth driver scanning for pairing beacons (op 3 on, op 4 off) while the add flow is open. CALL_LIVE: a driver that is down fails at once.
+    fn sponsor_radios(&mut self, on: (bool, bool)) {
         let (nfc, bt) = (cap(unsafe { GRANTS }, S_NFC), cap(unsafe { GRANTS }, S_BT));
         let (mut ra, mut rb) = ([0u8; 4], [0u8; 4]);
-        let a = ferros_sys::call_live(nfc, &[if on { 4 } else { 5 }], &mut ra);
-        let b = ferros_sys::call_live(bt, &[if on { 3 } else { 4 }], &mut rb);
+        let a = ferros_sys::call_live(nfc, &[if on.0 { 4 } else { 5 }], &mut ra);
+        let b = ferros_sys::call_live(bt, &[if on.1 { 3 } else { 4 }], &mut rb);
         let changed = on != self.listening;
         self.listening = on;
         self.listen_pass = 0;
@@ -2670,7 +2264,11 @@ impl Client {
         }
         self.listen_said = now_said;
         let said = |n: u64, r: &[u8; 4]| -> &'static [u8] { if n == ERR { b"not running" } else if n >= 1 && r[0] != 0 { b"refused" } else { b"ok" } };
-        self.log.put(if on { b"fgtw: listening for newcomers: nfc reader ".as_slice() } else { b"fgtw: no longer listening for newcomers: nfc reader " });
+        self.log.put(match on {
+            (true, true) => b"fgtw: listening for newcomers: nfc reader ".as_slice(),
+            (true, false) => b"fgtw: listening for a departure's tap: nfc reader ",
+            _ => b"fgtw: no longer listening: nfc reader ",
+        });
         self.log.put(said(a, &ra));
         self.log.put(b", bt scan ");
         self.log.put(said(b, &rb));
@@ -2678,10 +2276,11 @@ impl Client {
     }
 
     /// What the radios heard: the Bluetooth driver's pairing beacons (op 5: [count][count × 16 bytes]) and the NFC driver's last tag read (op 6: [32 bytes] once, then nothing). A tag whose secret opens a candidate's commitment picks it, its key following at once (Photon's tap).
-    fn sponsor_hear(&mut self) {
+    /// A tag whose secret is the salt of the departure asked about here approves it (fgtw's machine, `NfcRead`). `on` is what listens: (the NFC reader, the BLE scan).
+    fn sponsor_hear(&mut self, on: (bool, bool)) {
         let (nfc, bt) = (cap(unsafe { GRANTS }, S_NFC), cap(unsafe { GRANTS }, S_BT));
         let mut r = [0u8; 1 + 16 * fgtw::pair::BEACON_UUID_LEN];
-        let n = ferros_sys::call_live(bt, &[5], &mut r);
+        let n = if on.1 { ferros_sys::call_live(bt, &[5], &mut r) } else { ERR };
         let mut changed = false;
         if n != ERR && n >= 1 {
             // WHY: the count is the driver's word, and the reply's length may run past this buffer (it says what was sent): only the ids both hold are read.
@@ -2700,23 +2299,14 @@ impl Client {
             }
         }
         let mut s = [0u8; 32];
-        if ferros_sys::call_live(nfc, &[6], &mut s) == 32 {
-            match fgtw::sponsor::nfc_match(&s, &self.adding.cands) {
-                // NFC adds at once (owner, 2026-11-10: "Touch on screen ... required for BLE OR no touch on screen, just physical proximity (NFC). Both of which need the fleet page open"): the device held within a few centimetres, its tag's secret opening its request's commitment, the Fleet page open here and the newcomer attested is the whole consent. Bound and grown as one act, as Add does. A device picked on the screen still selects, turns green, and waits for Add.
-                Some(i) if matches!(self.adding.phase, ADD_OPEN | ADD_SELECTED) => {
-                    self.log.put(b"fgtw: a tapped device's tag matches ");
-                    self.log.put(self.adding.cands[i].name.as_bytes());
-                    self.log.put(b": adding it");
-                    self.log.line();
-                    self.adding.selected = None;
-                    self.adding.picked = Some((self.adding.cands[i].req.clone(), "an NFC tap"));
-                    self.adding.phase = ADD_BINDING;
-                }
-                Some(_) => {}
-                None => {
-                    self.log.put(b"fgtw: a tapped tag's secret matches no device asking to join (a stale request, or not a newcomer's)");
-                    self.log.line();
-                }
+        if on.0 && ferros_sys::call_live(nfc, &[6], &mut s) == 32 {
+            // The leaving device's tag: its salt names the request asked about here.
+            if self.depart_asked().is_some_and(|(_, _, salt)| salt == s) {
+                self.log.put(b"fgtw: a tapped device's tag is the departure asked about here: approving it");
+                self.log.line();
+                self.depart_event(fgtw::flow::Event::NfcRead { secret: s });
+            } else if on.1 {
+                self.nfc_newcomer(&s);
             }
         }
         if changed {
@@ -2724,16 +2314,39 @@ impl Client {
         }
     }
 
-    /// The sponsor's work, once a pass of the loop: the registry listed every 8 s while the add flow is open, the radios listening while it is, a pick bound, a confirm grown, an approval countersigned.
-    fn sponsor_step(&mut self, t: u64) {
-        // Listening (NFC reader, BLE scan, the registry's list) only while the add flow is open for a member holding the fleet key: never on a failed or finished flow.
-        let open = matches!(self.adding.phase, ADD_OPEN | ADD_SELECTED | ADD_BINDING | ADD_GROWING) && self.bound && self.fleet_key.is_some();
-        self.listen_pass += 1;
-        if open != self.listening || (open && self.listen_pass >= 64) {
-            self.sponsor_radios(open);
+    /// A tag read while the add flow is open: a secret that opens a candidate's commitment picks it, its key following at once (Photon's tap).
+    fn nfc_newcomer(&mut self, s: &[u8; 32]) {
+        match fgtw::sponsor::nfc_match(s, &self.adding.cands) {
+            // NFC adds at once (owner, 2026-11-10: "Touch on screen ... required for BLE OR no touch on screen, just physical proximity (NFC). Both of which need the fleet page open"): the device held within a few centimetres, its tag's secret opening its request's commitment, the Fleet page open here and the newcomer attested is the whole consent. Bound and grown as one act, as Add does. A device picked on the screen still selects, turns green, and waits for Add.
+            Some(i) if matches!(self.adding.phase, ADD_OPEN | ADD_SELECTED) => {
+                self.log.put(b"fgtw: a tapped device's tag matches ");
+                self.log.put(self.adding.cands[i].name.as_bytes());
+                self.log.put(b": adding it");
+                self.log.line();
+                self.adding.selected = None;
+                self.adding.picked = Some((self.adding.cands[i].req.clone(), "an NFC tap"));
+                self.adding.phase = ADD_BINDING;
+            }
+            Some(_) => {}
+            None => {
+                self.log.put(b"fgtw: a tapped tag's secret matches no device asking to join (a stale request, or not a newcomer's)");
+                self.log.line();
+            }
         }
-        if open {
-            self.sponsor_hear();
+    }
+
+    /// The sponsor's work, once a pass of the loop: the registry listed every 8 s while the add flow is open, the radios listening while it is (the NFC reader also while a fleet device's departure waits here), a pick bound, a confirm grown.
+    fn sponsor_step(&mut self, t: u64) {
+        // Listening (NFC reader, BLE scan, the registry's list) only while the add flow is open for a member holding the fleet key: never on a failed or finished flow. The NFC reader also while a departure is asked about here, so a tap of the leaving device (its tag serves the request's salt) approves it.
+        let open = matches!(self.adding.phase, ADD_OPEN | ADD_SELECTED | ADD_BINDING | ADD_GROWING) && self.bound && self.fleet_key.is_some();
+        let asked = self.bound && self.depart_asked().is_some();
+        let on = (open || asked, open);
+        self.listen_pass += 1;
+        if on != self.listening || (on != (false, false) && self.listen_pass >= 64) {
+            self.sponsor_radios(on);
+        }
+        if on != (false, false) {
+            self.sponsor_hear(on);
         }
         if self.adding.phase == ADD_OPEN && self.net_up && t - self.adding.listed_us >= 8_000_000 {
             self.adding.listed_us = t;
@@ -2770,9 +2383,6 @@ impl Client {
         }
         if self.adding.phase == ADD_GROWING && self.adding.confirm {
             self.grow_for_newcomer();
-        }
-        if self.depart_ask.as_ref().is_some_and(|d| d.approve) {
-            self.approve_now();
         }
     }
 }
@@ -2814,7 +2424,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, given_depart_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: false, listen_pass: 0, listen_said: (255, 255), ble_said: (0, 0), depart_ask: None, denied: Vec::new(), depart_denied: None, offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), ble_said: (0, 0), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0 };
     c.run()
 }
 

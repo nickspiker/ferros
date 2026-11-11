@@ -2632,8 +2632,11 @@ impl Map {
                     if f.confirm {
                         notes(b, &mut y, tr(Msg::RemoveNote));
                     }
-                    if f.leave_result.is_some_and(|r| r != 0) {
-                        row(self, b, &mut y, small, white(), fleet(FleetMsg::DepartNotStarted).as_str(), None);
+                    // 4: the identity's last device cannot leave (fgtw's departure machine refuses it); any other refusal, the departure did not start.
+                    match f.leave_result {
+                        Some(4) => rows(self, b, &mut y, small, white(), fleet(FleetMsg::LastDevice).as_str()),
+                        Some(r) if r != 0 => row(self, b, &mut y, small, white(), fleet(FleetMsg::DepartNotStarted).as_str(), None),
+                        _ => {}
                     }
                 }
                 }

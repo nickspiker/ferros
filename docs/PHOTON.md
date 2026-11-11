@@ -70,6 +70,8 @@ Removal is bilateral (photon docs/pairing-v2.md "Chain changes"), the same as in
 6. Approve publishes the consented Remove. Deny records the request's salt as denied and tells the fleet, so every device clears the request and refuses that salt; the leaving device hears it, says so, and a new request takes a new salt.
 7. The leaving device checks the seed's chain every 16 s, and any chain a sibling pushes. Once the chain folds without this device, the identity's roots, chain and key are forgotten here.
 
+**Since 2026-11-10 both halves run on fgtw's shared machine** (`fgtw::flow::depart`, the one Photon runs; payloads/fgtw/src/depart.rs carries out its actions). What it adds here: the identity's last device cannot ask to leave (op 5 answers 4, the Fleet page says so in `fgtw::text`'s words), a frame given up on is handed again when its device is next heard or a network comes up, and an approval by NFC tap reads the leaving device's tag, which serves the request's salt while it stands. An approval here hands the leaving device the new chain at once (`fleet_resp`); its 16 s read of fgtw.org's chain stays for an approval the push cannot reach (another network: ferros has no relay). A request its device gave up (its space entry gone) stops being asked. The machine's state is kept as `fgtw.depart` without the handle proof; a departure kept in the form before it (the signed request alone) is taken up with the same stamp, salt and frame, and the old denied list (`fgtw.denied`) is read into it once and deleted.
+
 Verified on the host: photon-interop shows the app parsing the device's `depart_req` and its consent verifying under every scheme the device holds. Not yet run against a live approver.
 
 ## Findings
