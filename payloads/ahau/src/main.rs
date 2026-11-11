@@ -2182,7 +2182,8 @@ impl Ahau {
                 ferros_sys::Unlock::Opened(_) => console(self.grants, b"ahau: unlocked; this device is not bound to a fleet yet: looking the identity up\n"),
                 ferros_sys::Unlock::Belongs => {
                     console(self.grants, b"ahau: refused: this device belongs to another identity\n");
-                    self.wipe();
+                    // The handle stays as typed, the caret at its end (owner, 2026-11-11: "not have it clear the handle if you attest with a wrong letter, usually it's just one that needs fixed"): a handle is not a secret (owner, 2026-10-28), and the seed derived from it was never kept.
+                    self.caret = self.len;
                     self.status(fl(ferros_lang::Fleet::DeniedBoundOther).as_str());
                     self.denied.set(true);
                     self.entry();
