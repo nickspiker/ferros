@@ -4419,8 +4419,10 @@ const WIN: usize = 1 << 16;
 
 /// The transfer a vault read moves: ferros_sys::STORE_GET_MAX (1 MiB) on a kernel from 2026-11-11 on, STORE_MAX (256 KiB) on one from 2026-11-08, 4 KiB before; each refusal drops to the next for good.
 static TRANSFER: AtomicU64 = AtomicU64::new(ferros_sys::STORE_GET_MAX as u64);
-/// The vault calls a load made (`vault_read`), for its console line.
+/// The vault calls a load made (`vault_read`), for its console line: how many, the timer ticks inside them (each store call from its start to its return: the kernel's stamp and hand-off, the wait for the vault's serving thread to be given a core, its serving, the reply's copy and the hand-back), and the longest (2026-11-11: the display waited 283 ms on a read the vault served in a fraction of that).
 static VAULT_CALLS: AtomicU64 = AtomicU64::new(0);
+static VAULT_CALL_TICKS: AtomicU64 = AtomicU64::new(0);
+static VAULT_CALL_MAX: AtomicU64 = AtomicU64::new(0);
 
 /// `buf.len()` bytes of the value under `key` from `offset`, a transfer a call; whether the vault gave them.
 fn vault_read(cap: u64, key: &[u8], offset: u64, buf: &mut [u8]) -> bool {
@@ -4428,7 +4430,12 @@ fn vault_read(cap: u64, key: &[u8], offset: u64, buf: &mut [u8]) -> bool {
     while at < buf.len() {
         let n = (buf.len() - at).min(TRANSFER.load(Ordering::Relaxed) as usize);
         VAULT_CALLS.fetch_add(1, Ordering::Relaxed);
-        if ferros_sys::store_get_at(cap, key, offset as usize + at, &mut buf[at..at + n]).is_none() {
+        let t = now();
+        let got = ferros_sys::store_get_at(cap, key, offset as usize + at, &mut buf[at..at + n]);
+        let took = now() - t;
+        VAULT_CALL_TICKS.fetch_add(took, Ordering::Relaxed);
+        VAULT_CALL_MAX.fetch_max(took, Ordering::Relaxed);
+        if got.is_none() {
             let smaller = if n > ferros_sys::STORE_MAX { ferros_sys::STORE_MAX } else { 1 << 12 };
             if n > smaller {
                 TRANSFER.store(smaller as u64, Ordering::Relaxed);
@@ -4506,8 +4513,8 @@ static mut READ_JOB: (u64, &'static [u8], u64, usize, usize) = (0, b"", 0, 0, 0)
 static mut READ_STACK: [u8; 1 << 15] = [0; 1 << 15];
 /// The reader thread started; without it a job is read on the loader's own thread, at once.
 static READER_UP: AtomicBool = AtomicBool::new(false);
-/// The plane's stretches: half of the 1 MiB the loader read at once before (one 1 MiB arena for the two), each a batch of eight of the vault's pieces.
-const STRETCH: usize = 1 << 19;
+/// The plane's stretches: a get's largest (ferros_sys STORE_GET_MAX, 1 MiB), each a batch of sixteen of the vault's pieces. Half that until 2026-11-11: measured on the Pro, the display waited 283 ms on 48 such reads; the vault's serving thread is pinned to the X3 for a large value's read, and every request waits for that core to come round (behind the display's own render thread and the kernel's service pass), so the count of requests sets the wait as much as their bytes.
+const STRETCH: usize = 1 << 20;
 /// The loader's two stretches (`wall_load_kept`), each `STRETCH` bytes, read into in turn.
 static mut STRETCH_BUFS: [[u8; STRETCH]; 2] = [[0; STRETCH]; 2];
 
@@ -4599,7 +4606,8 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
     let c = cap(grants, S_MAP_SCOPE);
     let Some(len) = ferros_sys::store_get(c, key, &mut []) else { return false };
     let t0 = now();
-    let calls0 = VAULT_CALLS.load(Ordering::Relaxed);
+    let (calls0, call_t0) = (VAULT_CALLS.load(Ordering::Relaxed), VAULT_CALL_TICKS.load(Ordering::Relaxed));
+    VAULT_CALL_MAX.store(0, Ordering::Relaxed);
     let mut l = Log { grants, buf: [0; 256], n: 0 };
     let doc = match vsf::container::Document::open(VaultSource { cap: c, key, len: len as u64, win: core::cell::RefCell::new((0, 0, alloc::vec::Vec::new())) }) {
         Ok(d) => d,
@@ -4703,9 +4711,13 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
     l.dec(ms(t_conv));
     l.s(b" ms beside its reads); ");
     l.dec(VAULT_CALLS.load(Ordering::Relaxed) - calls0);
-    l.s(b" vault calls of up to ");
+    l.s(b" calls of up to ");
     l.dec(TRANSFER.load(Ordering::Relaxed) >> 10);
-    l.s(b" KiB\n");
+    l.s(b" KiB, ");
+    l.dec(ms(VAULT_CALL_TICKS.load(Ordering::Relaxed) - call_t0));
+    l.s(b" ms in them, longest ");
+    l.dec(VAULT_CALL_MAX.load(Ordering::Relaxed) * 1_000_000 / freq());
+    l.s(b" us\n");
     l.flush();
     true
 }
