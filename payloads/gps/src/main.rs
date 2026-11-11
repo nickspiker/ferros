@@ -11,6 +11,9 @@
 //! - `0` FIX: `valid u8`, `fixes u32`, `age ms u32` (since the latest), `lat i32`, `lon i32` (2⁻²³ degrees), `alt i32` (m), `err u32` (m), `speed i32`, `track i32` (1/64 m/s, 1/64 °) — little-endian, 33 bytes.
 //! - `1` STOP: the process exits after replying; the kernel powers the chip down as it ends (the last fix is kept whenever it changes).
 //! - `2` SATS: the signals the chip tracked at the latest fix message (sky.rs, GPS.md "The satellites"): `n u8`, `msgs u32` (fix messages decoded so far), `age ms u32` (since the latest), then `n` records of 25 bytes — `system u8` (the chip's code: 0 GPS, 8 GLONASS), `band u8` (0 L1 or GLONASS G1, 2 L5), `prn u8` (GLONASS: the orbital slot), `flags u8` (bit 0 used in the fix, bit 1 the chip's unnamed flag), `el i8`, `az u16` (degrees), `d_el i16`, `d_az i16` (degrees since the previous fix that had the signal, the azimuth the short way round north), `cn0 u16` (quarter dB-Hz), `d_ms u32` (the chip's ms between the two fixes, 0 for a signal new in this one), `el_rate i32`, `az_rate i32` (millidegrees a second between the first and the latest one-degree step seen, `i32::MIN` until there are two) — little-endian, at most 64 records.
+//! - `3` WATCH (2026-11-10): `count u32`, the change count the caller last saw (its fixes plus its fix messages) → `count u32` now, held until it differs: the doorbell the map's GPS page waits on, thru the kernel (SYS_CLAIM op 3), instead of asking every second.
+//!
+//! The loop sleeps in one wait for HOST_REQ's interrupt and a call to `gps` (the kernel wakes the endpoint's poller out of it), no deadline.
 //!
 //! Measures (ferros_sys::status, the corners' GPS circle): slot 0 the state, 1 the error estimate, 2 the satellites tracked, 3 those used in the fix, 4 the best C/N0.
 #![no_std]
@@ -677,11 +680,15 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let mut tracks_filled = 0usize;
     // The fix count the altitude, speed and heading were last published for (u32::MAX: never, so the first pass empties their slots).
     let mut published_fix = u32::MAX;
+    // The WATCH calls held (op 3): each its reply token and the change count its caller last saw, answered when the count moves. Four at most; only the map's GPS page watches today.
+    let mut watches: [Option<([u8; 32], u32)>; 1 << 2] = [None; 1 << 2];
+    // Whether the endpoint has been polled once: from then the kernel knows this thread as its poller and wakes it out of the interrupt wait for a call (process.rs wake_server).
+    let mut polled = false;
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
-        // Asleep until the chip asks or 1/64 s passes (the endpoint is looked at between).
-        ferros_sys::irq_wait(cap(grants, S_IRQ), now() + f / 64);
+        // Asleep until the chip asks (HOST_REQ) or a call comes to `gps`, one wait for both (owner, 2026-11-10: no polling): the kernel wakes the endpoint's poller out of an interrupt wait for a call, and returns at once when one was already queued. Until then the endpoint was looked at every 1/64 s. The first pass, before the kernel knows the poller, does not wait (a deadline already past).
+        ferros_sys::irq_wait_world(cap(grants, S_IRQ), if polled { 0 } else { 1 });
         while chip.get(HOST_REQ) {
             asks += 1;
             chip.set(MCU_REQ, true);
@@ -797,12 +804,45 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                     }
                     reply(&token, &r[..9 + REC * n]);
                 }
+                // WATCH (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure"): `count u32`, the change count the caller last saw → `count u32` now, answered at once when it differs, else held until it moves (below). A fifth watch while four are held answers the oldest with the count as it is, which asks again.
+                3 if n >= 5 => {
+                    let seen = u32::from_le_bytes([msg[1], msg[2], msg[3], msg[4]]);
+                    let c = changes(&d);
+                    if c != seen {
+                        reply(&token, &c.to_le_bytes());
+                    } else {
+                        if watches.iter().all(|w| w.is_some()) {
+                            if let Some((t, _)) = watches[0].take() {
+                                reply(&t, &c.to_le_bytes());
+                            }
+                            watches.rotate_left(1);
+                        }
+                        if let Some(w) = watches.iter_mut().find(|w| w.is_none()) {
+                            *w = Some((token, seen));
+                        }
+                    }
+                }
                 _ => {
                     reply(&token, &[]);
                 }
             }
         }
+        polled = true;
+        // The held watches whose count has moved: answered with the count now.
+        let c = changes(&d);
+        for w in watches.iter_mut() {
+            if w.is_some_and(|(_, seen)| seen != c) {
+                if let Some((t, _)) = w.take() {
+                    reply(&t, &c.to_le_bytes());
+                }
+            }
+        }
     }
+}
+
+/// The driver's change count for WATCH: its fixes and the fix messages decoded or refused, summed (each only grows, so any change moves the sum; it wraps, and a watcher compares for difference only).
+fn changes(d: &Deframer) -> u32 {
+    d.fixes.wrapping_add(d.sky.msgs).wrapping_add(d.sky.bad)
 }
 
 #[panic_handler]
