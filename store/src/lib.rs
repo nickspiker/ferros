@@ -347,7 +347,7 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         let base = sealed.as_mut_ptr();
         let mut fetched: Result<()> = Ok(());
         if n > 0 {
-            // SAFETY: `sealed` is neither moved nor resized, and `d` outlives the batch, until `finish` returns below; each slot is written through `base` before its `ready` and not touched from it until then.
+            // SAFETY: `sealed` is neither moved nor resized, and `d` outlives the batch, until `finish` returns below; each slot is written thru `base` before its `ready` and not touched from it until then.
             unsafe { opener.start(&d.seal, base, n) };
             for (i, addr) in want.iter().enumerate() {
                 // After a failed fetch the rest stay empty (they fail to open, at once) and are handed over all the same, so `finish` still waits for whatever was already being opened.

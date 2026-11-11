@@ -117,7 +117,7 @@ impl BlockDev for Half {
         }
         Ok(())
     }
-    /// Up to `RUN_NOW` blocks a kernel call (one UFS command each on a kernel from 2026-11-08 on). While a large value is read in bulk (`AHEAD_ON`), a run comes through the read-ahead (`ahead_run`): a copy from the window, or from the next window read beside it, or a fresh fill from the run's first block.
+    /// Up to `RUN_NOW` blocks a kernel call (one UFS command each on a kernel from 2026-11-08 on). While a large value is read in bulk (`AHEAD_ON`), a run comes thru the read-ahead (`ahead_run`): a copy from the window, or from the next window read beside it, or a fresh fill from the run's first block.
     fn read_run(&mut self, lba: u64, out: &mut [Block]) -> manifestus::Result<()> {
         self.io(lba, out.len() as u64)?;
         let bytes = unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() << 12) };
@@ -500,7 +500,7 @@ extern "C" fn helper(_: u64) -> ! {
     }
 }
 
-/// The serving thread's opener (streamed, `ferros_store::Opener`): each piece goes on the board as it is fetched, and the helpers open it while the serving thread fetches the next (the fetch, with every block's BLAKE3 guard, is the engine's and runs on this thread alone; before 2026-11-11 the helpers sat idle through it and the fetch through the opening); at the end this thread opens what is still unclaimed, waits for the rest and wipes the key. A batch of one piece is opened here at `finish`: the board's hand-offs would cost more than the piece.
+/// The serving thread's opener (streamed, `ferros_store::Opener`): each piece goes on the board as it is fetched, and the helpers open it while the serving thread fetches the next (the fetch, with every block's BLAKE3 guard, is the engine's and runs on this thread alone; before 2026-11-11 the helpers sat idle thru it and the fetch thru the opening); at the end this thread opens what is still unclaimed, waits for the rest and wipes the key. A batch of one piece is opened here at `finish`: the board's hand-offs would cost more than the piece.
 #[derive(Default)]
 struct Helpers {
     /// The batch is one piece, kept off the board.
