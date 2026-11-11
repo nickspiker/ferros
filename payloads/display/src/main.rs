@@ -3,7 +3,7 @@
 //! What it owns: the `display-fb` DMA region (the surface the layer DMA reads), a heap region, DECON0's main/win/wincon blocks, layer 0's DMA / DPP / SRAMC / HDR-common blocks, DSIM0 with its PHY, and the GPIO bank with the TE pin. What it takes from the pipe as found: the raster (the layer DMA's image size) and the modeset ABL or the kernel left — the panel, DSIM's link and DECON's own geometry stay as they are. The layer it programs itself, every word (`Pipe::program_layer`), so nothing about window 5 is inherited.
 //!
 //! Spawn: ferros-bridge spawn display.bin 00 --name display --serve display --hw decon0-main --hw decon0-win --hw decon0-wincon --hw dpu-dma0 --hw dpp0 --hw gpio-gpp0 --dma display-fb --dma display-heap --hw dsim0 --hw dphy0 --hw sramc0 --hw hdrcomm0
-//! Grant slots, in that order: 0 console, 1 the `display` endpoint (serve), 2 DECON main, 3 DECON win, 4 DECON wincon, 5 DMA0, 6 DPP0, 7 GPP0, 8 the framebuffer region, 9 the heap region (cacheable; the arc pool is too small for a typeface and the framebuffer region too slow), 10 DSIM0, 11 its PHY (the link rate for the TE timers), 12 SRAMC0, 13 HDRCOMM0 (the layer's geometry words); then 14-22 below (the phases, the app surfaces, the frame-start line, the sprites, the canvas, and the modeset's blocks).
+//! Grant slots, in that order: 0 console, 1 the `display` endpoint (serve), 2 DECON main, 3 DECON win, 4 DECON wincon, 5 DMA0, 6 DPP0, 7 GPP0, 8 the framebuffer region, 9 the old heap region (not read since 2026-11-11: the heap is the display's own arc, grown on demand), 10 DSIM0, 11 its PHY (the link rate for the TE timers), 12 SRAMC0, 13 HDRCOMM0 (the layer's geometry words); then 14-22 below (the phases, the app surfaces, the frame-start line, the sprites, the canvas, and the modeset's blocks).
 //!
 //! The `display` endpoint (SHELL.md: the shell draws lists, this process paints). One op per call, first byte the op, coordinates u16 little-endian in panel pixels, colours u32 little-endian G#00RRGGBB, one status byte back (0 = ok, 1 = bad message, 2 = too big):
 //! - 1 `begin`: a new frame — the whole surface transparent. Until a client's first `begin`, this process paints its own first-boot screen.
@@ -31,6 +31,7 @@
 //! - 22 `app [x u16][y u16][w u16][h u16]`: the app in front's frame, its 16-bit pixels in the `app-surface` region (R, G, B in bits 0-15, 16-31, 32-47: working values, gamma 2, white = Q14; bit 48 = no dither), published at full precision; 23 `app done`: the screen is the map's again. Op 5's reply carries whether an app is in front (byte 12).
 //! - 21 `ramps [column u8]`: the present stage's test screen, or one column of it alone on black between two thin white lines (dithered bands: our 4×4 to 8 bits, 12 effective; undithered: the 8-bit truncation), straight from 16-bit working values (see `ramps`); status 3 when the pipe is not in 10 bits.
 //! - 56 `quick [offset i32][flags u8][torch level u8][held u8][press radio u8][brightness ring u16 Q16][torch ring u16 Q16][unused u16]`: the quick row's state from the map (quick.rs `set`, docs/QUICK.md): its slide offset in whole pixels and its circles' looks, composed by the console's worker; answered at once with [0][the slide's length u16]. Op 41 answers the row's circles (32 + k, then x, y, r u16) while it is open, its doorway (10), the top's other ground (11) and behind it (12).
+//! - 27 `whose point` and 41 `what of the system's` read the hit map (hit.rs: a u16 a pixel, the owner the compose wrote there, front to back); 58 `hit view [0 off, 1 on, 2 toggle, 3 ask]` → [0][on]: the map shown in the fourth temporal phase, a new palette each redraw (development builds; status 1 on a release build).
 //! - 24 `frame wait`: returns once the panel's next frame has started, or after a hundred-and-twentieth of a second when no frame is in flight (a command-mode panel starts a frame only when one is armed); the reply is the frame-start count, u32. A client that draws once per return is locked to the panel's refresh: it reads its input right after a frame starts and its update is ready for the next one (the map, while a finger is down).
 //! The scene is retained here so a frame costs the client three numbers rather than one call per circle: nothing on the map ever moves, so between scene changes only the camera does.
 //! fluor's order holds inside a frame: what a client sends first is on top.
@@ -44,6 +45,7 @@ extern crate alloc;
 
 mod draw;
 mod glyphs;
+mod hit;
 mod modeset;
 mod neon;
 mod odt;
@@ -99,6 +101,8 @@ const S_DMA0: u64 = 5;
 const S_DPP0: u64 = 6;
 const S_GPP0: u64 = 7;
 const S_FB: u64 = 8;
+/// 9: the `display-heap` region until 2026-11-11, not read since (the heap is the display's own arc, `heap_init`); the slot stays so every later one keeps its number.
+#[allow(dead_code)]
 const S_HEAP: u64 = 9;
 const S_DSIM: u64 = 10;
 const S_DPHY: u64 = 11;
@@ -357,16 +361,29 @@ const IDMA_IRQ_CLEAR: u32 = 0xDFB << 16;
 /// The TE pin: GPP0 DAT bit 3.
 const GPP0_DAT: u64 = 0x0004;
 
-/// The heap region (cachemap DISPLAY_HEAP): 32 MiB, cacheable. Its top holds the back buffer (see `_entry`); the rest is the allocator's. The typeface parse alone allocates 14.7 MiB in total (3.7 MiB live at the peak) and this allocator frees nothing until the frame arena resets, so what is left under the back buffer has to hold the whole parse.
-const HEAP_REGION: usize = 32 << 20;
+/// The heap's ceiling: the most the display's arc grows to for its heap (docs/ARCS.md step 2), declared in its image header (`ferros_sys::entry!` below, `grows`), so the kernel sizes the arc's window for it and maps frames only as they are asked for.
+/// Until 2026-11-11 the heap was a fixed 32 MiB region the kernel granted (cachemap DISPLAY_HEAP, `display-heap`), and on the Pro that night the display panicked at start, "memory allocation of 2097152 bytes failed": the quick row's band (+4.2 MiB) and the night's other additions had taken it past 32 MiB. Nothing in the heap is DMA (the back buffer is the canvas region, the framebuffers and the phases their own), so it may lie in any frames of the pool, and move.
+/// A power of two, four times the start as estimated that night (about 27 MiB in this heap on husky, COMPOSITOR.md "Memory"): room for the hit map and what comes after without a rebuild, while the window (the next power of two above it) costs addresses only.
+const HEAP_CEILING: usize = 1 << 27;
+/// The least one grow asks for: four frames, so a heap that keeps growing asks a few times rather than once an allocation (ferros_rt asks the same way).
+const HEAP_GROW_MIN: usize = 8 << 20;
+/// What the kernel maps after .bss at spawn for an image whose heap grows (process.rs `HEAP_START`, 4 MiB): the console worker's and the wallpaper loader's fixed arenas live there (`heap_init`), the rest of the heap above the first stack, where the arc grows.
+const HEAP_SPARE: usize = 4 << 20;
+const _: () = assert!((1 << 20) + LOAD_HEAP_BYTES <= HEAP_SPARE, "the console's and the loader's arenas must fit the spare the kernel maps after .bss");
 
-/// A bump allocator over the heap in the framebuffer region, with a mark: everything allocated before `mark()` (the parsed typeface) lives for the process; everything after it is the frame's scratch (glyph bitmaps), thrown away by `reset()` after each frame.
+/// A bump allocator with a mark: everything allocated before `mark()` (the parsed typeface, the bars, the hit map) lives for the process; everything after it is the frame's scratch (glyph bitmaps), thrown away by `reset()` after each frame. The render thread's (`ALLOC`) grows the arc when it runs out (`more`); the console worker's and the loader's are fixed arenas.
 struct Bump {
     base: UnsafeCell<usize>,
     next: UnsafeCell<usize>,
     mark: UnsafeCell<usize>,
     end: UnsafeCell<usize>,
+    /// The most it ever held (`next − base`), for the heap's log lines.
+    peak: UnsafeCell<usize>,
+    /// Whether it may grow the arc (`ALLOC` only, and only on a kernel with SYS_ARC).
+    grows: UnsafeCell<bool>,
 }
+/// A bump not yet set up (non-zero initialisers keep it in `.data`, see `ALLOC`).
+const BUMP_NONE: Bump = Bump { base: UnsafeCell::new(1), next: UnsafeCell::new(1), mark: UnsafeCell::new(1), end: UnsafeCell::new(1), peak: UnsafeCell::new(1), grows: UnsafeCell::new(false) };
 unsafe impl Sync for Bump {}
 
 unsafe impl GlobalAlloc for Bump {
@@ -390,34 +407,61 @@ unsafe impl GlobalAlloc for Bump {
 static mut CON_STACK_LO: usize = usize::MAX;
 static mut CON_STACK_LEN: usize = 1;
 static mut CON_STACK: [u8; 1 << 18] = [0; 1 << 18];
-static CON_HEAP: Bump = Bump { base: UnsafeCell::new(1), next: UnsafeCell::new(1), mark: UnsafeCell::new(1), end: UnsafeCell::new(1) };
+static CON_HEAP: Bump = BUMP_NONE;
 
 impl Bump {
-    /// The bump itself: the next aligned bytes of this arena, null when it is full or not yet set up.
+    /// The bump itself: the next aligned bytes of this arena, null when it is full (and cannot grow) or not yet set up.
     unsafe fn bump(&self, l: Layout) -> *mut u8 {
-        let base = *self.base.get();
-        if base <= 1 {
-            return core::ptr::null_mut();
+        unsafe {
+            let base = *self.base.get();
+            if base <= 1 {
+                return core::ptr::null_mut();
+            }
+            loop {
+                let start = (*self.next.get() + l.align() - 1) & !(l.align() - 1);
+                if start + l.size() <= *self.end.get() {
+                    *self.next.get() = start + l.size();
+                    // WHY the max: the high water, for the log; next falls back at every reset.
+                    *self.peak.get() = (*self.peak.get()).max(start + l.size() - base);
+                    return start as *mut u8;
+                }
+                if !*self.grows.get() || !self.more(start + l.size() - *self.end.get()) {
+                    return core::ptr::null_mut();
+                }
+            }
         }
-        let start = (*self.next.get() + l.align() - 1) & !(l.align() - 1);
-        if start + l.size() > *self.end.get() {
-            return core::ptr::null_mut();
+    }
+
+    /// The arc grown by at least `short` bytes (SYS_ARC, docs/ARCS.md): the new frames are mapped right above the old top, which is this bump's end, so the run goes on unbroken. False when the kernel refuses (the ceiling, or the pool out of frames): the allocation fails as it always did, loudly (the panic names the size).
+    unsafe fn more(&self, short: usize) -> bool {
+        unsafe {
+            let held = *self.end.get() - *self.base.get();
+            // WHY the sizes: the least a grow asks for, a quarter of what the heap holds when that is more (a heap that keeps growing asks a few times), and only what is short when that much would pass the ceiling (the kernel refuses the lot, and `short` alone may fit).
+            let want = short.max(HEAP_GROW_MIN).max(held / 4);
+            let r = match ferros_sys::arc::grow(want) {
+                Err(_) if want > short => ferros_sys::arc::grow(short),
+                r => r,
+            };
+            let Ok((top, was)) = r else { return false };
+            let arc = ferros_sys::arc_base() as usize;
+            // Not where this run ends (something else grew the arc): the new frames start a run of their own, the old one's tail left unused.
+            if arc + was != *self.end.get() {
+                *self.next.get() = arc + was;
+            }
+            *self.end.get() = arc + top;
+            true
         }
-        *self.next.get() = start + l.size();
-        start as *mut u8
     }
 }
 
 impl Bump {
-    fn init(&self, base: usize) {
-        self.init_at(base, HEAP_REGION);
-    }
     fn init_at(&self, base: usize, len: usize) {
         unsafe {
             *self.base.get() = base;
             *self.next.get() = base;
             *self.mark.get() = base;
             *self.end.get() = base + len;
+            *self.peak.get() = 0;
         }
     }
     fn mark(&self) {
@@ -429,11 +473,110 @@ impl Bump {
     fn used(&self) -> usize {
         unsafe { *self.next.get() - *self.base.get() }
     }
+    /// What lives for the process (to the mark), the most it ever held, and how much is mapped for it.
+    fn kept(&self) -> usize {
+        unsafe { *self.mark.get() - *self.base.get() }
+    }
+    fn peak(&self) -> usize {
+        unsafe { *self.peak.get() }
+    }
+    fn mapped(&self) -> usize {
+        unsafe { *self.end.get() - *self.base.get() }
+    }
 }
 
-/// Non-zero initialisers keep these in `.data`: the flat image carries no `.bss`, and whatever the kernel copies after the code (the input) would otherwise share their bytes. `init` sets the real values.
+/// The heaps set up, first thing (owner, 2026-11-11: room that scales; docs/ARCS.md, COMPOSITOR.md "Memory"):
+/// - The kernel maps `HEAP_SPARE` zeroed bytes right after .bss at spawn (an image whose heap grows starts with that much of it): the console worker's 1 MiB arena and the wallpaper loader's 2 MiB go there.
+/// - The render thread's heap (`ALLOC`) starts empty at the arc's top, above the first stack, and grows the arc a few frames at a time as it fills.
+/// - A kernel from before ARCS (no SYS_ARC) maps the whole declared heap after .bss instead: the render thread's heap is then the rest of it, fixed.
+/// Returns the arc's top and ceiling as the kernel answered them (the top G#FFFF… on a kernel without SYS_ARC).
+fn heap_init() -> (usize, usize) {
+    unsafe extern "C" {
+        static __image_end: u8;
+    }
+    // WHY the rounding: the kernel's zeroed tail runs to .bss's end plus 16 (payload.ld `__ferros_tail`), and the arenas start on a cache line past it.
+    let spare = ((&raw const __image_end) as usize + 16 + 63) & !63;
+    CON_HEAP.init_at(spare, 1 << 20);
+    LOAD_HEAP.init_at(spare + (1 << 20), LOAD_HEAP_BYTES);
+    let used = (1 << 20) + LOAD_HEAP_BYTES;
+    let (top, ceiling) = ferros_sys::arc::size();
+    if top as u64 == ferros_sys::ERR {
+        ALLOC.init_at(spare + used, HEAP_CEILING - used - 64);
+    } else {
+        ALLOC.init_at(ferros_sys::arc_base() as usize + top, 0);
+        unsafe { *ALLOC.grows.get() = true };
+    }
+    (top, ceiling)
+}
+
+/// The start's steps the heap is measured after (`heap_start_log`): the typeface parsed (and its glyph cache), the tables and the icons' mips, the bars' buffers and the quick row's sprites, the hit map (hit.rs: the glass's, and the bars' two), the rest up to the mark.
+const HEAP_STEPS: usize = 5;
+const HEAP_STEP_NAMES: [&[u8]; HEAP_STEPS] = [b"typeface and glyph cache ", b", tables and icons ", b", bars and quick row ", b", hit map ", b", the rest "];
+
+/// The heap at start, once, after the mark (owner, 2026-11-11: measure it, at start and once the console and the quick row are up): what each step kept, what is mapped for it, and the arc's top and ceiling as the kernel answered them.
+fn heap_start_log(log: &mut Log, at: &[usize; HEAP_STEPS], top: usize, ceiling: usize) {
+    log.s(b"display: heap at start ");
+    log.dec(ALLOC.kept() as u64 >> 10);
+    log.s(b" KiB kept (");
+    let mut was = 0;
+    for (k, name) in HEAP_STEP_NAMES.iter().enumerate() {
+        log.s(name);
+        log.dec((at[k] - was) as u64 >> 10);
+        was = at[k];
+    }
+    log.s(b" KiB), ");
+    log.dec(ALLOC.mapped() as u64 >> 10);
+    log.s(b" KiB mapped for it; console arena ");
+    log.dec(CON_HEAP.mapped() as u64 >> 10);
+    log.s(b" KiB, loader ");
+    log.dec(LOAD_HEAP.mapped() as u64 >> 10);
+    log.s(b" KiB, after .bss; ");
+    if top as u64 == ferros_sys::ERR {
+        log.s(b"no SYS_ARC: the whole heap mapped at spawn\n");
+    } else {
+        log.s(b"arc top G#");
+        log.hex(top as u32);
+        log.s(b" at the start, ceiling G#");
+        log.hex(ceiling as u32);
+        log.s(b"\n");
+    }
+    log.flush();
+}
+
+/// The heaps' high water as last said (`heap_water`): the render thread's, the console worker's and the loader's, in KiB.
+static mut HEAP_SAID: [u64; 3] = [0; 3];
+
+/// Said again whenever a heap's high water passed a new MiB (the frame's scratch growing, the console's arena filling as the quick row and its words come up), from the render loop's pass top; nothing on a pass where none did. One line, no allocation.
+fn heap_water(log: &mut Log) {
+    let now = [ALLOC.peak() as u64 >> 10, CON_HEAP.peak() as u64 >> 10, LOAD_HEAP.peak() as u64 >> 10];
+    let said = unsafe { HEAP_SAID };
+    if now.iter().zip(said.iter()).all(|(n, s)| n >> 10 <= s >> 10) {
+        return;
+    }
+    unsafe { HEAP_SAID = now };
+    log.s(b"display: heap high water ");
+    log.dec(now[0]);
+    log.s(b" KiB (kept ");
+    log.dec(ALLOC.kept() as u64 >> 10);
+    log.s(b", mapped ");
+    log.dec(ALLOC.mapped() as u64 >> 10);
+    log.s(b" of ");
+    log.dec(HEAP_CEILING as u64 >> 10);
+    log.s(b"), console arena ");
+    log.dec(now[1]);
+    log.s(b" of ");
+    log.dec(CON_HEAP.mapped() as u64 >> 10);
+    log.s(b", loader ");
+    log.dec(now[2]);
+    log.s(b" of ");
+    log.dec(LOAD_HEAP.mapped() as u64 >> 10);
+    log.s(b" KiB\n");
+    log.flush();
+}
+
+/// Non-zero initialisers keep these in `.data`: the flat image carries no `.bss`, and whatever the kernel copies after the code (the input) would otherwise share their bytes. `heap_init` sets the real values.
 #[global_allocator]
-static ALLOC: Bump = Bump { base: UnsafeCell::new(1), next: UnsafeCell::new(1), mark: UnsafeCell::new(1), end: UnsafeCell::new(1) };
+static ALLOC: Bump = BUMP_NONE;
 
 /// Oxanium (OFL, assets/fonts), the owner's choice for ferros's face — the same family as the "Ready?" screen — in its +glyphs cut, which adds tatau's twelve dozenal digit glyphs at G#10–G#1B, so numbers draw in the device base as glyphs (SETTINGS.md).
 static FONT: &[u8] = include_bytes!("../../../assets/fonts/Oxanium-Regular+glyphs.ttf");
@@ -1665,8 +1808,8 @@ static PUB_FINISHED: AtomicU64 = AtomicU64::new(0);
 /// The job: canvas base, width, height, phase mask, the rect, the stripe count.
 static mut PUB_PARAMS: (usize, usize, usize, u32, draw::Rect, usize) = (0, 0, 0, 0, draw::Rect::EMPTY, 1);
 static mut PUB_TABS: neon::Odt = unsafe { core::mem::zeroed() };
-/// A publish worker's stack, bytes.
-const PUB_STACK: usize = 16384;
+/// A publish worker's stack, bytes: 32 KiB since 2026-11-11, when the hit map's row (`hit::row`, its 2 KiB of free runs) joined the publish's own 5 KiB row buffer and the flight's scratch on the same stack (16 KiB before).
+const PUB_STACK: usize = 1 << 15;
 static mut PUB_STACKS: [[u8; PUB_STACK]; PUB_WORKERS] = [[0; PUB_STACK]; PUB_WORKERS];
 
 /// Take stripes of job `job` until none are left; each one finished is counted. Returns when the job has no stripe left to take (others may still be finishing theirs).
@@ -1690,6 +1833,9 @@ fn pub_take(job: u64) {
             // The scene's list (`scene_split`): this stripe's rows drawn into the canvas, which no other stripe touches.
             let px = unsafe { core::slice::from_raw_parts_mut(base as *mut Px, w * h) };
             scene_stripe(px, w, h, stripe);
+        } else if unsafe { PUB_KIND } == 2 {
+            // The hit map written again (`hit::refresh`): this stripe's rows of it.
+            hit::stripe(w, h, stripe);
         } else {
             let back = unsafe { core::slice::from_raw_parts(base as *const Px, w * h) };
             publish_band(back, w, h, unsafe { &*(&raw const PUB_TABS) }, mask, stripe);
@@ -1719,6 +1865,8 @@ fn publish10x4(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask:
     if r.is_empty() {
         return;
     }
+    // The hit map is written again over `r` by this publish: a new palette for the development view (hit.rs).
+    hit::fresh();
     // A publish that is not the clock's own may carry an older clock (the back buffer's, whenever it was drawn): its next redraw is whole.
     if unsafe { CLIP_PHASE }.is_none() {
         for k in 0..PHASES {
@@ -1774,12 +1922,28 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
     // Which phases hold only the background at each 16-pixel block (`CLEAN`): rows are this call's own, so no other publisher touches their bytes.
     let clean_w = unsafe { CLEAN_W };
     let clean = unsafe { core::slice::from_raw_parts_mut(CLEAN as *mut u8, clean_w * height) };
+    // The hit map (hit.rs): written with the first phase this publish composes, over its columns; shown in its phase in development.
+    let hk = mask.trailing_zeros() as usize;
+    let (hx0, hx1) = (r.x0 as usize, r.x1 as usize);
+    let view = hit::view();
     for k in 0..PHASES {
         if mask >> k & 1 == 0 {
             continue;
         }
         let dst = phase_slice(k, width * height);
         for y in r.y0 as usize..r.y1 as usize {
+            if k == hk {
+                hit::row(y, hx0, hx1, width, height, false);
+            }
+            if view && k == hit::PHASE {
+                hit::paint(y, hx0, hx1, width, &mut row);
+                dst[y * width + hx0..y * width + hx1].copy_from_slice(&row[hx0..hx1]);
+                // The phase holds the map here, not the background: its blocks are composed afresh once the view is off.
+                for ci in y * clean_w + x0 / 16..y * clean_w + x1 / 16 {
+                    clean[ci] &= !(1u8 << k | wall_bit(k));
+                }
+                continue;
+            }
             // The row's edge: its masked columns and its listed edge pixels, as the columns from the left and from the right that need it.
             let g = &rows[y];
             let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), rows[y + 1].first as usize) };
@@ -1934,7 +2098,7 @@ static mut WALL_ON: bool = false;
 static mut WALL_PENDING: Option<[u8; 32]> = None;
 /// The job's choices (`wallpaper::params`, worked out once by the render loop as it starts the job), read by its threads.
 static mut WALL_P: Option<wallpaper::Params> = None;
-/// The refining mask (a bit a pixel, `wallpaper::mask_stride` bytes a row), allocated at the first job and kept.
+/// The refining mask (a bit a pixel, `wallpaper::mask_stride` bytes a row), allocated at start before the heap's mark and kept.
 static mut WALL_MASK: usize = 0;
 /// Whether a job is running (set by the render loop as it starts one, cleared when it sees the job done).
 static mut WALL_RUNNING: bool = false;
@@ -2342,6 +2506,7 @@ fn front_frame(front: &mut [Px], width: usize, height: usize) -> draw::Rect {
 fn region_off(width: usize, height: usize) {
     unsafe {
         REGION_ON = false;
+        hit::region_gone();
         CLEAN_KEY = None;
         FRONT_OLD.k = 0;
         FRONT_OLD.n = 0;
@@ -2479,32 +2644,41 @@ fn scene_split(px: &mut [Px], width: usize, height: usize) {
         if SCENE_NI == 0 {
             return;
         }
-        let full = draw::Rect::full(width, height);
-        let workers = PUB_UP.load(Ordering::Acquire) as usize;
         draw::BANDED = true;
-        if workers == 0 {
-            scene_stripe(px, width, height, full);
-        } else {
-            let n = ((height as i32 + PUB_STRIPE - 1) / PUB_STRIPE) as usize;
-            let job = PUB_JOB.load(Ordering::Acquire) + 1;
-            PUB_KIND = 1;
-            PUB_PARAMS = (px.as_mut_ptr() as usize, width, height, 0, full, n);
-            PUB_FINISHED.store((job & 0xFFFF_FFFF) << 32, Ordering::Release);
-            PUB_CLAIM.store((job & 0xFFFF_FFFF) << 32, Ordering::Release);
-            PUB_JOB.store(job, Ordering::Release);
-            ferros_sys::wake(&PUB_JOB, PUB_WORKERS as u64);
-            pub_take(job);
-            loop {
-                let f = PUB_FINISHED.load(Ordering::Acquire);
-                if (f & 0xFFFF_FFFF) as usize >= n {
-                    break;
-                }
-                ferros_sys::wait(&PUB_FINISHED, f, now() + freq() / 1000);
-            }
-            PUB_KIND = 0;
-        }
+        stripes(1, px.as_mut_ptr() as usize, width, height, draw::Rect::full(width, height));
         draw::BANDED = false;
         SCENE_NI = 0;
+    }
+}
+
+/// A job of `kind` (`PUB_KIND`: 1 the scene's list, 2 the hit map) over `r`, by stripes of rows taken by the publish workers and this thread, as `publish10x4` splits a publish; returns when every stripe is done. With no workers up, this thread does it all.
+fn stripes(kind: u8, base: usize, width: usize, height: usize, r: draw::Rect) {
+    unsafe {
+        let workers = PUB_UP.load(Ordering::Acquire) as usize;
+        if workers == 0 {
+            match kind {
+                1 => scene_stripe(core::slice::from_raw_parts_mut(base as *mut Px, width * height), width, height, r),
+                _ => hit::stripe(width, height, r),
+            }
+            return;
+        }
+        let n = ((r.y1 - r.y0 + PUB_STRIPE - 1) / PUB_STRIPE) as usize;
+        let job = PUB_JOB.load(Ordering::Acquire) + 1;
+        PUB_KIND = kind;
+        PUB_PARAMS = (base, width, height, 0, r, n);
+        PUB_FINISHED.store((job & 0xFFFF_FFFF) << 32, Ordering::Release);
+        PUB_CLAIM.store((job & 0xFFFF_FFFF) << 32, Ordering::Release);
+        PUB_JOB.store(job, Ordering::Release);
+        ferros_sys::wake(&PUB_JOB, PUB_WORKERS as u64);
+        pub_take(job);
+        loop {
+            let f = PUB_FINISHED.load(Ordering::Acquire);
+            if (f & 0xFFFF_FFFF) as usize >= n {
+                break;
+            }
+            ferros_sys::wait(&PUB_FINISHED, f, now() + freq() / 1000);
+        }
+        PUB_KIND = 0;
     }
 }
 
@@ -3440,28 +3614,6 @@ fn chrome_rows(width: usize, height: usize) -> (usize, usize) {
     ((cy - half) as usize + 3, (height as f32 - (cy + half)) as usize + 3)
 }
 
-/// Whether the screen point is inside the circle.
-fn in_circle(x: i64, y: i64, width: usize, height: usize) -> bool {
-    let (cx, cy, r) = circle(width, height);
-    let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
-    dx * dx + dy * dy <= r * r
-}
-
-/// The window that owns a screen point: the frontmost whose rectangle holds it and whose pixel there is not see-through, inside the circle (the corners are the system's).
-fn owner_at(x: i64, y: i64, width: usize, height: usize) -> Option<usize> {
-    if x < 0 || y < 0 || x >= width as i64 || y >= height as i64 || !in_circle(x, y, width, height) {
-        return None;
-    }
-    let (ord, n) = front_order();
-    for &(k, w) in &ord[..n] {
-        let r = w.rect;
-        if (x as i32) >= r.x0 && (x as i32) < r.x1 && (y as i32) >= r.y0 && (y as i32) < r.y1 && working(surface(k, width, height)[y as usize * width + x as usize], w.format) & CLEAR == 0 {
-            return Some(k);
-        }
-    }
-    None
-}
-
 /// The hairline's colour (owner, 2026-11-02). Release builds: standard-illuminant-E grey (equal VSF RGB codes) one stop darker than the theme's ring: the ring's photopic light (VSF RGB's weights, as vsf::colour::convert::vsf_rgb_to_photopic_f32 has them: R 0.2584, G 0.6346, B 0.1070, on gamma-2 codes) halved, back to a code. Development builds: bright orange in VSF RGB, full red, half-light green, no blue, so a dev image is told at a glance.
 fn hairline() -> u64 {
     if !DEV_LOOK {
@@ -3547,11 +3699,16 @@ fn glass_front(x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], c: u64,
     under_pm(acc, t, p & ((1 << 48) - 1), 0).0
 }
 /// The windows into phase `k` over `r` (screen coordinates): each row composed frontmost first (a pixel comes from the first window that covers it; nothing behind the windows but black), cut to the circle with its edge antialiased, the corners from the chrome; then each pixel's R, G, B (bits 0-15, 16-31, 32-47, working values: gamma 2, white = Q14) through the one table, E's gains and the dither, bit 48 set = no dither for that pixel.
-fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: usize) {
+/// `hits`: this call writes the hit map's rows too (hit.rs; the first of several phases published together, never a capture), and in development shows the map instead of the image when `k` is its phase.
+fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: usize, hits: bool) {
     let r = r.clip(width, height);
     if r.is_empty() || RAW_HOLD.load(Ordering::Acquire) == 1 {
         return;
     }
+    if hits {
+        hit::fresh();
+    }
+    let view = hit::view() && k == hit::PHASE && unsafe { CAPTURE } == 0;
     let dst = phase_slice(k, width * height);
     unsafe {
         PHASE_CLOCK[k] = None;
@@ -3562,6 +3719,14 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
     let mut px = [0u64; 1344];
     let (xa, xb) = (r.x0 as usize, r.x1 as usize);
     for y in r.y0 as usize..r.y1 as usize {
+        if hits {
+            hit::row(y, xa, xb, width, height, true);
+        }
+        if view {
+            hit::paint(y, xa, xb, width, &mut row);
+            dst[y * width + xa..y * width + xb].copy_from_slice(&row[xa..xb]);
+            continue;
+        }
         // The row's spans (`layout_build`): each one's chain, frontmost first, into the row.
         let bands = unsafe { core::slice::from_raw_parts(&raw const BANDS as *const Band, NBANDS) };
         let order = unsafe { core::slice::from_raw_parts(&raw const ORDER as *const (u8, u8, u8), SURFACES) };
@@ -4305,9 +4470,6 @@ fn wall_step(grants: u64, width: usize, height: usize) {
         }
         if !WALL_RUNNING {
             let Some(seed) = (*(&raw mut WALL_PENDING)).take() else { return };
-            if WALL_MASK == 0 {
-                WALL_MASK = alloc::vec![0u8; wallpaper::mask_stride(width) * height].leak().as_mut_ptr() as usize;
-            }
             WALL_ON = false;
             clean_reset_all();
             WALL_P = Some(wallpaper::params(&seed, width, height));
@@ -4408,7 +4570,7 @@ static mut LOADING: bool = false;
 static mut LOAD_STACK: [u8; 1 << 18] = [0; 1 << 18];
 static mut LOAD_STACK_LO: usize = usize::MAX;
 static mut LOAD_STACK_LEN: usize = 1;
-static LOAD_HEAP: Bump = Bump { base: UnsafeCell::new(1), next: UnsafeCell::new(1), mark: UnsafeCell::new(1), end: UnsafeCell::new(1) };
+static LOAD_HEAP: Bump = BUMP_NONE;
 const LOAD_HEAP_BYTES: usize = 2 << 20;
 
 extern "C" fn wall_loader(grants: u64) -> ! {
@@ -4844,6 +5006,8 @@ fn bar_decode(b0: usize, rows: usize, width: usize, height: usize) {
             }
         }
         span[yy] = if l < rr { (l as u16, rr as u16) } else { (0, 0) };
+        // The system's places on this row of the bars, for the hit map (the console's ids at its own compose step).
+        hit::bars_row(b, width, height);
     }
 }
 
@@ -5592,6 +5756,8 @@ fn pack10(r: u32, g: u32, b: u32) -> u32 {
 
 /// The 8-bit canvas through the present stage with the spatial dither only (temporal off): the ODT 16 pixels a step (neon.rs `sixteen_odt`) with this row's Bayer thresholds, a row at a time through a cached buffer, then one wide copy into the non-cacheable framebuffer.
 fn publish10(back: &[Px], screen: &mut [u32], width: usize, tabs: &neon::Odt) {
+    // The hit map with it (hit.rs): this path publishes the whole screen, with no phases to write it in.
+    hit::refresh(width, back.len() / width, draw::Rect::full(width, back.len() / width));
     let mut row = [0u32; 4096];
     let w16 = width & !15;
     for (y, (src, dst)) in back.chunks(width).zip(screen.chunks_mut(width)).enumerate() {
@@ -5672,6 +5838,9 @@ fn ramps(outs: &mut [&mut [u32]], width: usize, height: usize, lut: &[u16], only
 
 /// The finished frame out to the framebuffer. There is no black pass: the layer is BGRX, so the panel never sees the alpha byte, an empty pixel (0) already shows black, and black blended under an antialiased edge adds nothing to its colour — only to the alpha the panel ignores. The pass that did it cost 15-25 ms a frame and changed no visible pixel (2026-10-22).
 fn publish(back: &[Px], screen: &mut [u32]) {
+    // The hit map with it, as `publish10` writes it.
+    let (w, h) = unsafe { SCREEN_WH };
+    hit::refresh(w as usize, h as usize, draw::Rect::full(w as usize, h as usize));
     let c8 = |v: u64| ((v & 0xFFFF) * 255 / 16384).min(255) as u32;
     for (d, &p) in screen.iter_mut().zip(back.iter()) {
         *d = 0xFF00_0000 | c8(p) << 16 | c8(p >> 16) << 8 | c8(p >> 32);
@@ -5739,12 +5908,10 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         if op == 27 && n >= 13 {
-            // Whose is this point (WINDOWS.md): [base u64][x u16][y u16] → 1 if the caller's window is the frontmost that covers it (inside the circle, not see-through there), else 0. Answered here: a client asks it on every finger down.
-            let (w, h) = unsafe { SCREEN_WH };
+            // Whose is this point (WINDOWS.md): [base u64][x u16][y u16] → 1 if the caller's window owns it on the glass, else 0: one read of the hit map (hit.rs), where a window owns the pixels it is frontmost and not see-through at, inside the circle, and never one the system holds (the corners, the quick row and what is behind it while it shows). Answered here: a client asks it on every finger down.
             let mine = surface_of(u64::from_le_bytes(msg[1..9].try_into().unwrap()));
             let (x, y) = (u16::from_le_bytes([msg[9], msg[10]]) as i64, u16::from_le_bytes([msg[11], msg[12]]) as i64);
-            // The quick row's circles are the system's wherever they show (QUICK.md).
-            let yes = mine.is_some() && owner_at(x, y, w as usize, h as usize) == mine && quick::hit(x as f32 + 0.5, y as f32 + 0.5, w as usize, h as usize).is_none();
+            let yes = mine.is_some_and(|k| hit::at(x, y) == hit::WINDOW + k as u16);
             ferros_sys::reply(&tok, &[yes as u8]);
             continue;
         }
@@ -5766,44 +5933,26 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         if op == 41 && n >= 5 {
-            // What the system has at this point: [x u16][y u16] → in the lower half outside the app's circle, a region (owner, 2026-11-07): 9 back on the left, 8 home on the right, whole (the arrow and the ring are only drawn there, nothing to aim at); in the upper half, the console's radio circle under it, by its bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS). The quick row (QUICK.md) first, wherever it shows: its circle under the point as 32 + its index, with its centre and radius after (x, y, r u16 each), or 12 anywhere else inside the app's circle (behind the row); then, upper half outside the app's circle, the doorway by the camera 10 and the rest of the top's ground 11 (corner circles that are no radio, and the air between them). G#FF for nothing: inside the circle with the row shut, or the bottom's air.
+            // What the system has at this point: [x u16][y u16] → its place, one read of the hit map (hit.rs, the system's ids as the bars' compose leaves them): in the lower half outside the app's circle, a region (owner, 2026-11-07): 9 back on the left, 8 home on the right, whole (the arrow and the ring are only drawn there, nothing to aim at); in the upper half, the console's radio circle under it, by its bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS), the doorway by the camera 10, the rest of the top's ground 11 (corner circles that are no radio, and the air between them). The quick row (QUICK.md), in front of what is inside the app's circle: its circle under the point while it stands open as 32 + its index, with its centre and radius after (x, y, r u16 each, as `quick::layout` draws it), or 12 anywhere else inside the app's circle while any of it shows (behind the row). G#FF for nothing of the system's: inside the circle with the row shut (an app's window, the map's plane), or off the glass.
             let (w, h) = unsafe { SCREEN_WH };
-            let (x, y) = (u16::from_le_bytes([msg[1], msg[2]]) as f32 + 0.5, u16::from_le_bytes([msg[3], msg[4]]) as f32 + 0.5);
-            if let Some((k, c)) = quick::hit(x, y, w as usize, h as usize) {
-                let mut r = [32 + k as u8, 0, 0, 0, 0, 0, 0];
+            let (x, y) = (u16::from_le_bytes([msg[1], msg[2]]) as i64, u16::from_le_bytes([msg[3], msg[4]]) as i64);
+            let id = hit::at(x, y);
+            let code = if (hit::SYS..hit::WINDOW).contains(&id) { (id - hit::SYS) as u8 } else { 0xFF };
+            if (32..32 + quick::N as u8).contains(&code) {
+                let c = quick::layout(w as usize, h as usize)[(code - 32) as usize];
+                let mut r = [code, 0, 0, 0, 0, 0, 0];
                 r[1..3].copy_from_slice(&(c.0 as u16).to_le_bytes());
                 r[3..5].copy_from_slice(&(c.1 as u16).to_le_bytes());
                 r[5..7].copy_from_slice(&(c.2 as u16).to_le_bytes());
                 ferros_sys::reply(&tok, &r);
                 continue;
             }
-            let mut hit = 0xFFu8;
-            if in_circle(x as i64, y as i64, w as usize, h as usize) {
-                // The app's (or the map's): nothing of the system's, but behind the quick row while it shows.
-                if quick::showing() {
-                    hit = 12;
-                }
-            } else if y > h as f32 * 0.5 {
-                hit = if x > w as f32 * 0.5 { 8 } else { 9 };
-            } else {
-                let (circles, cn) = corner_layout(w as usize, h as usize);
-                for &(cx, cy, r, what) in &circles[..cn] {
-                    if (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r * r {
-                        hit = match what {
-                            Corner::Cellular => 0,
-                            Corner::Wifi => 1,
-                            Corner::Bluetooth => 2,
-                            Corner::Nfc => 3,
-                            Corner::Gps => 4,
-                            _ => 11,
-                        };
-                    }
-                }
-                if hit == 0xFF {
-                    hit = if quick::doorway(x, y, w as usize, h as usize) { 10 } else { 11 };
-                }
-            }
-            ferros_sys::reply(&tok, &[hit]);
+            ferros_sys::reply(&tok, &[code]);
+            continue;
+        }
+        // 58 `hit view [what u8: 0 off, 1 on, 2 toggle, 3 ask]` → [0][on u8]: the hit map in the fourth temporal phase (hit.rs; development builds only, status 1 on a release build). Answered here, at once.
+        if op == 58 && n >= 2 {
+            ferros_sys::reply(&tok, &hit::view_op(msg[1]));
             continue;
         }
         if op == 24 {
@@ -5882,13 +6031,8 @@ fn server(grants: u64) -> ! {
         log.flush();
         ferros_sys::exit(1);
     }
-    let heap = ferros_sys::dma(cap(grants, S_HEAP)) as usize;
-    if heap == 0 || heap == u64::MAX as usize {
-        log.s(b"display: no heap region\n");
-        log.flush();
-        ferros_sys::exit(1);
-    }
-    ALLOC.init(heap);
+    // The heap in the display's own arc (`heap_init`); slot 9, the `display-heap` region it was until 2026-11-11, is not read.
+    let (arc_top, arc_ceiling) = heap_init();
 
     // The DPU powered down (SYS_FACTS 30 = 1: Android's DECON hibernation at a jump, or ferros's own `dpu off`): no DECON or DSIM register may be touched before the kernel's `dpu` switch has powered it (the EL3 poison rule, the kernel's display.rs); then the whole pipe from reset (modeset::from_off, DISPLAY-DESIGN.md §8).
     // On the X3 for the power switches and the modeset: the kernel takes SYS_POWER only from its own core, and a thread nobody pinned runs on the workers. Unpinned, this thread started on the X3 (where init spawned it), took the `dpu` and `panel` switches there, and was on a worker by the modeset's `panel-vddd`, refused without the switch ever running: the panel came up without VDDD after two jumps, ran a few frames and stopped (2026-11-04). Unpinned again before any thread is spawned: they inherit the mask.
@@ -6023,6 +6167,10 @@ fn server(grants: u64) -> ! {
         }
     }
     let font = Font;
+    // The heap at each step of the start (`HEAP_STEP_NAMES`' order), for the budget line below (COMPOSITOR.md "Memory").
+    let mut heap_at = [0usize; HEAP_STEPS];
+    let mut hit_bytes = (0usize, 0usize);
+    heap_at[0] = ALLOC.used();
     // The present stage's table and its 8-bit slice, built before the mark so they live for the process.
     let t_lut = now();
     let lut: &'static mut [u16] = alloc::vec![0u16; 65536].leak();
@@ -6053,6 +6201,7 @@ fn server(grants: u64) -> ! {
         }
         v.leak()
     };
+    heap_at[1] = ALLOC.used();
     unsafe {
         let sprites = ferros_sys::dma(cap(grants, S_SPRITES));
         if sprites != 0 && sprites != ferros_sys::ERR {
@@ -6081,22 +6230,28 @@ fn server(grants: u64) -> ! {
         CLEAN_W = width / 16;
         CLEAN = alloc::vec![0u8; (width / 16) * height].leak().as_mut_ptr() as usize;
         BAR_SPAN_BACK = alloc::vec![(0u16, 0u16); top + bot].leak().as_mut_ptr() as usize;
-        // The console worker's heap (1 MiB: a draw's tables and the glyphs it rasterises, reset after each draw), its stack (its allocations are told by it), and its own glyph engine.
-        CON_HEAP.init_at(alloc::vec![0u8; 1 << 20].leak().as_mut_ptr() as usize, 1 << 20);
+        heap_at[2] = ALLOC.used();
+        // The hit map (hit.rs): the glass's, a u16 a pixel, and the bars' ids, front and back.
+        let (glass_b, bars_b) = hit::alloc(width, height);
+        hit_bytes = (glass_b, bars_b);
+        heap_at[3] = ALLOC.used();
+        // The console worker's heap (1 MiB: a draw's tables and the glyphs it rasterises, reset after each draw) is in the spare the kernel maps after .bss (`heap_init`); its stack (its allocations are told by it), and its own glyph engine.
         CON_STACK_LEN = (*(&raw const CON_STACK)).len();
         CON_STACK_LO = (&raw const CON_STACK) as usize;
         CON_GLYPHS = glyphs::Glyphs::with_arena(FONT, 1 << 17);
-        // The wallpaper loader's heap and stack (`wall_loader`).
-        LOAD_HEAP.init_at(alloc::vec![0u8; LOAD_HEAP_BYTES].leak().as_mut_ptr() as usize, LOAD_HEAP_BYTES);
+        // The wallpaper loader's stack (`wall_loader`); its heap is in the spare too.
         LOAD_STACK_LEN = (*(&raw const LOAD_STACK)).len();
         LOAD_STACK_LO = (&raw const LOAD_STACK) as usize;
         LOAD_SIZE = (width, height);
+        // The wallpaper's refining mask, kept for the process (before the mark): it was allocated at the first wallpaper job until 2026-11-11, after the mark, where the next frame's reset handed its bytes to the frame's scratch while the wallpaper's threads still read and wrote them.
+        WALL_MASK = alloc::vec![0u8; wallpaper::mask_stride(width) * height].leak().as_mut_ptr() as usize;
     }
     // Each publishing thread's flight scratch (`flight_row_buf`), kept with the rest.
     unsafe {
         FLIGHT_ROWS = alloc::vec![0u64; FLIGHT_SCRATCH * (PUB_WORKERS + 1)].leak().as_mut_ptr() as usize;
         FLIGHT_TEXT = alloc::vec![0u32; height].leak().as_mut_ptr() as usize;
     }
+    heap_at[4] = ALLOC.used();
     // The publish workers' stacks, so the draw functions tell a worker's band of the scene by the stack it runs on (`draw::thread_slot`).
     unsafe { draw::WORKER_STACKS = (&raw const PUB_STACKS as usize, PUB_STACK, PUB_WORKERS) };
     ALLOC.mark();
@@ -6112,9 +6267,14 @@ fn server(grants: u64) -> ! {
     log.flush();
     log.s(b"display: typeface up in ");
     log.dec(ferros_sys::us_since(t_font) / 1000);
-    log.s(b" ms, heap ");
-    log.dec(ALLOC.used() as u64 >> 10);
-    log.s(b" KiB\n");
+    log.s(b" ms\n");
+    log.flush();
+    heap_start_log(&mut log, &heap_at, arc_top, arc_ceiling);
+    log.s(b"display: hit map ");
+    log.dec(hit_bytes.0 as u64 >> 10);
+    log.s(b" KiB (a u16 a pixel), the bars' ids ");
+    log.dec(hit_bytes.1 as u64 >> 10);
+    log.s(if DEV { b" KiB (two); its view in the fourth phase by op 58\n" } else { b" KiB (two)\n" });
     log.flush();
     // The camera hole's knockout as planned: its rows and pixels (none while the board's hole is unmeasured, `HOLE_HUSKY`).
     {
@@ -6613,6 +6773,26 @@ fn server(grants: u64) -> ! {
                     let mut t_phase = now();
                     unsafe { SCENE_US = [0; 3]; PUB_TICKS = [0; 3]; PUB_BLOCKS = [0; 3] };
                     let (wq, hq) = ((width as i64) << 7, (height as i64) << 7);
+                    // The hit map's circles (hit.rs): every circle this frame shows, where it shows it, front first, by the same transform the loop below draws with (a shifted frame's circles all at the anchor's camera moved by the shift, as its canvas holds them); and the open circle's ground in front of them while a region is up. A redraw between frames (a clip) moves nothing.
+                    if clip_k.is_none() {
+                        let discs = hit::discs();
+                        let mut n = 0;
+                        for i in 0..scene_n {
+                            let cir = unsafe { SCENE[i] };
+                            let (dx, dy) = (((cir.x as i64) << 8) - cx, ((cir.y as i64) << 8) - cy);
+                            let sx = ((((rc * dx - rs * dy) >> 14) * z / 65536 + wq) & !255 | 128) + ox;
+                            let sy = ((((rs * dx + rc * dy) >> 14) * z / 65536 + hq) & !255 | 128) + oy;
+                            let sr = cir.r as i64 * z >> 8;
+                            // Drawn only as the loop draws it: at least a pixel across and on the screen.
+                            if sr < 256 || sx + sr < 0 || sx - sr > (width as i64) << 8 || sy + sr < 0 || sy - sr > (height as i64) << 8 {
+                                continue;
+                            }
+                            discs[n] = (i as u16, sx, sy, sr);
+                            n += 1;
+                        }
+                        let disc = region.map(|q| { let (gx, gy, gr, _) = ground(&q); (gx, gy, gr) });
+                        hit::scene(n, disc);
+                    }
                     // Shifted (a pan from the last frame), once for each strip the shift uncovered, clipped to it; else once, whole.
                     for si in 0..nstrips {
                         if shift.is_some() {
@@ -7238,7 +7418,7 @@ fn server(grants: u64) -> ! {
                             let k = unsafe { (CUR_PHASE + 1) % PHASES };
                             let t_pub = now();
                             // Everything phase k owes, which now holds `changed`: it is about to be shown, and its dirty region is cleared below. Publishing `changed` alone dropped what it still owed from earlier shows, and stale strips of older frames flashed as the phases rotated (2026-11-01).
-                            publish_app(unsafe { PHASE_DIRTY[k] }, &tabs, k, width, height);
+                            publish_app(unsafe { PHASE_DIRTY[k] }, &tabs, k, width, height, true);
                             unsafe {
                                 PHASE_DIRTY[k] = draw::Rect::EMPTY;
                                 CUR_PHASE = k;
@@ -7467,7 +7647,7 @@ fn server(grants: u64) -> ! {
                         (true, Some(k)) => {
                             let s = surface(k, width, height);
                             unsafe { CAPTURE = s.as_mut_ptr() as usize };
-                            publish_app(draw::Rect::full(width, height), &tabs, 0, width, height);
+                            publish_app(draw::Rect::full(width, height), &tabs, 0, width, height, false);
                             unsafe { CAPTURE = 0 };
                             alloc::format!("G#{:X}\n", s.as_ptr() as usize)
                         }
@@ -7772,6 +7952,10 @@ fn server(grants: u64) -> ! {
                 }
             }
         }
+        // The heaps' high water, said when one passed a new MiB (`heap_water`).
+        heap_water(&mut tlog);
+        // The hit map's development view switched (op 58): its phase owes the whole screen.
+        hit::view_step(width, height);
         // Windows whose process ended (the kernel cleared or renewed its surface's generation, `live_gen`; `reaper` wakes this pass when it does): gone, and what was behind them shows; the last one gone, the map has the glass again. Then the corners' clock, once a minute while windows are up, into every phase over its corner.
         let reaps_seen = REAPS.load(Ordering::Acquire);
         unsafe {
@@ -7811,6 +7995,8 @@ fn server(grants: u64) -> ! {
                 let r = CON_RECT;
                 // Whether the bars now on the screen hold any of the quick row (a screencap it asked for waits until they hold none).
                 quick::EMPTY_FRONT = quick::EMPTY_BACK.load(Ordering::Acquire);
+                // The hit map's share of the bars with them; the whole map again when the row came or went (everything inside the app's circle changed hands).
+                hit::bars_swap(width, height);
                 CON_READY.store(0, Ordering::Release);
                 attest_mark(grants, 4, b"console frame taken");
                 r
@@ -7823,7 +8009,7 @@ fn server(grants: u64) -> ! {
                 }
                 if { APP }.is_some() {
                     for k in 0..PHASES {
-                        publish_app(r, &tabs, k, width, height);
+                        publish_app(r, &tabs, k, width, height, k == 0);
                     }
                 } else {
                     // The home screen: the canvas by its address (`pixels` is held by the request handler's closure here).
@@ -8055,7 +8241,12 @@ fn server(grants: u64) -> ! {
                 tlog.dec(unsafe { SEC_US[3] } / 1000);
                 tlog.s(b" ms, in ");
                 tlog.dec(unsafe { SEC_US[4] });
-                tlog.s(b" camera ops\n");
+                // The hit map's rows (hit.rs) over these ten seconds: their time summed over the publishing threads, and how many.
+                tlog.s(b" camera ops; hit map ");
+                tlog.dec(hit::TICKS.swap(0, Ordering::Relaxed) * 1_000_000 / freq());
+                tlog.s(b" us in ");
+                tlog.dec(hit::ROWS.swap(0, Ordering::Relaxed));
+                tlog.s(b" rows\n");
                 tlog.flush();
             }
             unsafe { SEC_US = [0; 8] };
@@ -8127,7 +8318,7 @@ fn server(grants: u64) -> ! {
             let k = unsafe { (CUR_PHASE + 1) % PHASES };
             if unsafe { !PHASE_DIRTY[k].is_empty() } {
                 match unsafe { APP } {
-                    Some(_) => publish_app(unsafe { PHASE_DIRTY[k] }, &tabs, k, width, height),
+                    Some(_) => publish_app(unsafe { PHASE_DIRTY[k] }, &tabs, k, width, height, true),
                     None => publish10x4(pixels, width, height, &tabs, 1 << k, unsafe { PHASE_DIRTY[k] }),
                 }
                 unsafe { PHASE_DIRTY[k] = draw::Rect::EMPTY };
@@ -8227,8 +8418,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 /// The console grant for the panic handler (set first thing in `_entry`; `.data`, see ALLOC).
 static mut PANIC_GRANTS: u64 = 1;
 
-// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
-ferros_sys::entry!(display_main);
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss), its heap growing on demand up to `HEAP_CEILING` (`heap_init`).
+ferros_sys::entry!(display_main, grows HEAP_CEILING);
 
 /// The radios' orbs (`orb_look`, the console's orb grids): off since 2026-11-09 (owner: "I haven't thought thru what I want it to look like and get used to the numbers so switch to the most useful stats"), kept for when the look is decided.
 const ORBS: bool = false;

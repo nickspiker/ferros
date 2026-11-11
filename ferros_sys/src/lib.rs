@@ -1782,6 +1782,28 @@ _entry:
             main = sym $main
         );
     };
+    // A payload whose heap grows on demand (docs/ARCS.md step 2; the display's since 2026-11-11, when its fixed 32 MiB heap region ran out at start): bit 0 of the pad word set (process.rs `image_grows`), and the heap's ceiling at offset 48. The kernel maps the first 4 MiB of that heap after .bss at spawn (`HEAP_START`) and sizes the arc's window for the whole ceiling; the rest is the process's to ask for (SYS_ARC, `arc::grow`), whole frames above its first stack.
+    ($main:path, grows $ceiling:expr) => {
+        core::arch::global_asm!(
+            r#"
+    .section .text.entry, "ax"
+    .globl _entry
+    .type _entry, %function
+_entry:
+    b {main}
+    .4byte 1
+    .ascii "ferrosRT"
+    .quad __ferros_tail
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad {ceiling}
+    .size _entry, . - _entry
+"#,
+            main = sym $main,
+            ceiling = const $ceiling
+        );
+    };
 }
 
 /// Whether a data link is up: cellular or WiFi in state 2, connected (facts 33-48, `measure::STATE`; links 0 cellular, 1 WiFi). For a screen that waits on the network to say so (ahau, owner 2026-11-09: "should say something like 'waiting for connectivity'").

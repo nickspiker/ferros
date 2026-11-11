@@ -235,6 +235,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ScopeBlue => "xanh lam",
         Msg::ScopeGreen => "xanh lục",
         Msg::ScopeClear => "không lọc",
+        Msg::HitMap => "bản đồ chạm",
         // ---- the attest screen ----
         Msg::Attest => "chứng thực",
         Msg::Mint => "đúc",
