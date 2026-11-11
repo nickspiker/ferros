@@ -4896,7 +4896,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             match corner {
                 c if c & 16 != 0 && c < 32 => qr.press_start(c & 15, frame_count),
                 quick::PULL => qr.take(f.2, frame_count),
-                quick::BEHIND => qr.settle_to(0., frame_count),
+                quick::BEHIND => qr.settle_to(0, frame_count),
                 c if c & quick::ITEM != 0 => {
                     let (cx, cy) = (u16::from_le_bytes([q[1], q[2]]) as f32 + 0.5, u16::from_le_bytes([q[3], q[4]]) as f32 + 0.5);
                     qr.hold((c & 7) as usize, f.1, f.2, cx, cy);

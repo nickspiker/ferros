@@ -2,9 +2,9 @@
 //!
 //! - **Where.** Six circles inside the app's circle, under the camera, below the top row of console circles that sit outside it: each tangent to the app's circle from inside, to a horizontal floor from above and to its neighbours, the outer pair to the glass's left and right edges, the floor as low as that takes (owner, 2026-11-11, on the Pro: "Let's make the circles always touch the left/right sides so move the bottom horizontal guide down until they scale up and touch"). The fit `corner_layout` makes in the corners, turned inside out (`layout`). Until then the floor was the console's last row and the row stopped short of the sides.
 //! - **Collisions, by construction.** The console's corner circles are outside the app's circle and these inside it, both tangent to it, so they never overlap (their drawn rims, two and a half pixels, can meet, and the console's region redraw composes both). The camera hole is above the app's circle; the middle pair clear it by 56 pixels on husky, 41 on akita.
-//! - **How it opens.** The map owns the finger and the physics and sends the pull `p` (op 56): 0 shut, 1 open, any value between or past. The circles are drawn at `ease(p)`, C∞ in `p` and exactly 0 or 1 past either end, so the finger is followed one to one thru the middle and the row never kinks at its ends. At level `o` every circle has `o` of its radius and `o` of its angle about the app circle's centre, still tangent to that circle from inside: they grow out of the point under the camera and fan out along the arc (`at`).
-//! - **What draws it.** The console's worker, in the console's own buffer and its region machinery (`console_draw`): the quick circles are console circles that move.
-//! - **Where a finger lands.** Op 41 answers which quick circle (32 + its index, with its centre and radius), the doorway (10), the top's other system ground (11), or behind the row while it shows (12).
+//! - **How it opens: a slide** (owner, 2026-11-11: "track the finger down from top tho and slide it in so it doesn't need a re-render, just a move and composite, then do the iterate/2 each frame, like we do for the settings page until it snaps in or out of place"). The map owns the finger and the stepping and sends the row's offset (op 56): 0 hidden, `SLIDE` open, whole pixels. The row is drawn once at its size into its own sprites; a frame of the slide is the sprites composed under the console's circles at the offset, clipped to the app's circle so the row comes out from behind its top. The grow-and-fan animation of the first cut (C∞ in the pull) is gone: the owner waived it ("Simply appearing and disappearing is fine too. no need for a scale in/out animation").
+//! - **What draws it.** The console's worker: each circle into its sprite only when its look changes (`update`, `render`), and the composite into the bars' decoded rows (`compose`, from `bar_decode`).
+//! - **Where a finger lands.** Op 41 answers which quick circle (32 + its index, with its centre and radius) while the row is all the way open, the doorway (10), the top's other system ground (11), or behind the row while any of it shows (12).
 
 use super::*;
 use core::sync::atomic::AtomicBool;
@@ -21,16 +21,6 @@ pub enum Item {
 }
 pub const N: usize = 6;
 pub const ITEMS: [Item; N] = [Item::RadiosOff, Item::Sound, Item::Brightness, Item::Torch, Item::Dnd, Item::Screencap];
-
-/// Half the width of the ends of `ease`, in the pull's own unit: past `1 + EASE_HALF` the row is exactly open, short of `-EASE_HALF` exactly shut.
-const EASE_HALF: f32 = 1. / (1 << 3) as f32;
-
-/// The pull `p` as the row's level: `p` itself thru the middle, held to exactly 0 below and 1 above, C∞ everywhere (no clamp: GUI continuity). A C∞ step s (the bump against its mirror, `draw::bump_step`) of half-width EASE_HALF about 0 turns `p` into q = p·s(p), the ramp with its corner smoothed; the same at 1 from the other side. Its overshoot past either end is under a sixteenth of EASE_HALF (a 128th of the pull: under a pixel of the largest radius, inside the floor's slack), and only while it moves. The map's twin is payloads/map quick.rs `ease`.
-pub fn ease(p: f32) -> f32 {
-    let s = |t: f32| draw::bump_step((t + EASE_HALF) * (1. / (2. * EASE_HALF)));
-    let q = p * s(p);
-    1. - (1. - q) * s(1. - q)
-}
 
 /// The row at rest, open: (x, y, r) a circle, left to right, solved once per screen size; and the doorway's radius about the camera hole, its own cache (it needs the corners, which the row does not).
 static mut LAYOUT: [(f32, f32, f32); N] = [(0., 0., 0.); N];
@@ -170,42 +160,38 @@ fn door(width: usize, height: usize) -> f32 {
     d
 }
 
+// ---- the slide (owner, 2026-11-11, on the Pro: "the top console pulldown is stupidly slow and jerky"; then "track the finger down from top tho and slide it in so it doesn't need a re-render, just a move and composite, then do the iterate/2 each frame, like we do for the settings page until it snaps in or out of place") ----
+//
+// Until then the row grew out of the camera point, every circle drawn again at a new size each frame (vessel, rings, words: up to 9.5 ms a console draw, over a 120 Hz frame). Now each circle is drawn once at its size into its own sprite (`render`), and the row only moves: its offset `off` (0 hidden, `slide` open) shifts every sprite down by whole pixels, and the console's worker composes the shifted sprites under the console's own circles into the bars' decoded rows (`compose`, from `bar_decode`), clipped to the app's circle, so the row comes out from behind the top of it. Per frame: no drawing, one band of rows composed and published.
 
-/// The row at level `o` (0 shut, 1 open): each circle `o` of its radius, its centre `o` of its angle about the app's circle's centre and still tangent to that circle from inside, so the row grows out of the point under the camera and fans out along the arc; at 1 exactly `layout`. Neighbours never overlap on the way: their centres are further apart than at rest for the radii they have.
-pub fn at(width: usize, height: usize, o: f32) -> [(f32, f32, f32); N] {
-    let (cx, cy, rr) = circle(width, height);
-    layout(width, height).map(|(x, y, r)| {
-        let th = libm::atan2f(x - cx, cy - y) * o;
-        let rad = r * o;
-        let d = rr - CIRCLE_RIM - rad;
-        (cx + d * libm::sinf(th), cy - d * libm::cosf(th), rad)
-    })
-}
+/// The row's offset as the map last sent it (op 56), whole pixels: 0 hidden, `slide` open. The map follows the finger and halves the rest each frame after the lift.
+pub static OFFSET: AtomicU64 = AtomicU64::new(0);
+/// The slide's length (`slide`), for op 56's reply: the map's travel.
+pub static SLIDE: AtomicU64 = AtomicU64::new(0);
 
-/// The row as the map last set it (op 56), in two words so the receive thread stores it and the console's worker reads it without a lock (a draw that reads one word new and the other old is put right by the next):
-/// - `STATE_A`: the pull (i32, Q16) in bits 0-31; flags in 32-39 (bit 0 the torch answers, bit 1 a screencap once the row is shut); the torch's level in 40-47; the quick circle a finger holds in 48-55 (G#FF none); the radio circle a finger presses in 56-63 (G#FF none).
-/// - `STATE_B`: the brightness ring's lit share (u16 Q16, G#FFFF: from preference 3) in bits 0-15, the torch ring's (G#FFFF: from its level) in 16-31, the press's share in 32-47.
+/// The row as the map last set it (op 56), in two words the receive thread stores and the console's worker reads without a lock (a pass that reads one new and the other old is put right by the next):
+/// - `STATE_A`: flags in bits 32-39 (bit 0 the torch answers, bit 1 a screencap once the row is hidden); the torch's level in 40-47; the quick circle a finger holds in 48-55 (G#FF none); the radio circle a finger presses in 56-63 (G#FF none).
+/// - `STATE_B`: the brightness ring's lit share (u16 Q16, G#FFFF: from preference 3) in bits 0-15, the torch ring's (G#FFFF: from its level) in 16-31.
 pub static STATE_A: AtomicU64 = AtomicU64::new(0xFFFF << 48);
 pub static STATE_B: AtomicU64 = AtomicU64::new(0xFFFF_FFFF);
-/// A screencap asked for once the row is shut (op 56 flag bit 1): the render thread takes it as soon as the bars on the screen hold no quick circle (`EMPTY_FRONT`).
+/// A screencap asked for once the row is hidden (op 56 flag bit 1): the render thread takes it as soon as the bars on the screen hold none of the row (`EMPTY_FRONT`).
 pub static CAPTURE: AtomicBool = AtomicBool::new(false);
-/// Whether the console's last draw had no quick circle in it (the worker sets it with its result), and whether the bars on the screen have none (the render thread's, at the swap).
+/// Whether the bars the worker last decoded hold none of the row (offset 0), and whether those on the screen do (the render thread's, at the swap).
 pub static EMPTY_BACK: AtomicBool = AtomicBool::new(true);
 pub static mut EMPTY_FRONT: bool = true;
 
-/// The row's state now (`STATE_A`, `STATE_B`).
+/// The row's state now (`STATE_A`, `STATE_B`, `OFFSET`).
 #[derive(Clone, Copy)]
 pub struct Now {
-    /// The level, `ease` of the pull.
-    pub o: f32,
+    pub off: i64,
     /// The torch's level, None when the map found no torch to call.
     pub torch: Option<u8>,
     /// The rings' lit shares while a finger turns them (else from preference 3 and the torch's level).
     pub bright_arc: Option<f32>,
     pub torch_arc: Option<f32>,
-    /// The quick circle a finger holds (shown lighter), and the radio circle a finger presses with how far the press has come (its ring).
+    /// The quick circle a finger holds (shown lighter), and the radio circle a finger presses (its ring, drawn once).
     pub held: Option<usize>,
-    pub press: Option<(usize, f32)>,
+    pub press: Option<usize>,
 }
 
 pub fn state() -> Now {
@@ -213,35 +199,40 @@ pub fn state() -> Now {
     let q16 = |v: u64| (v & 0xFFFF) as f32 * (1. / 65535.);
     let idx = |v: u64| if v & 0xFF == 0xFF { None } else { Some((v & 0xFF) as usize) };
     Now {
-        o: ease((a as u32 as i32) as f32 * (1. / 65536.)),
+        off: OFFSET.load(Ordering::Acquire) as i64,
         torch: (a >> 32 & 1 == 1).then_some((a >> 40) as u8),
         bright_arc: (b & 0xFFFF != 0xFFFF).then(|| q16(b)),
         torch_arc: (b >> 16 & 0xFFFF != 0xFFFF).then(|| q16(b >> 16)),
         held: idx(a >> 48),
-        press: idx(a >> 56).map(|r| (r, q16(b >> 32))),
+        press: idx(a >> 56),
     }
 }
 
-/// Op 56 `quick [pull i32 Q16][flags u8][torch level u8][held u8][press radio u8][brightness ring u16 Q16][torch ring u16 Q16][press u16 Q16]` (15 bytes): the map's state of the row, stored for the console's worker, which is nudged to draw it. Answered at once by the receive thread.
-pub fn set(m: &[u8]) {
+/// Op 56 `quick [offset i32][flags u8][torch level u8][held u8][press radio u8][brightness ring u16 Q16][torch ring u16 Q16][unused u16]` (15 bytes): the map's state of the row, stored for the console's worker, which is nudged. Answered at once by the receive thread with [0][the slide's length u16], so the map knows how far the row travels.
+pub fn set(m: &[u8]) -> [u8; 3] {
     let w16 = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]) as u64;
-    let pull = u32::from_le_bytes([m[1], m[2], m[3], m[4]]) as u64;
-    STATE_A.store(pull | (m[5] as u64) << 32 | (m[6] as u64) << 40 | (m[7] as u64) << 48 | (m[8] as u64) << 56, Ordering::Release);
-    STATE_B.store(w16(9) | w16(11) << 16 | w16(13) << 32, Ordering::Release);
+    let off = i32::from_le_bytes([m[1], m[2], m[3], m[4]]);
+    // WHY the bounds: the offset is the map's, and the bars hold the row's rows only between hidden and open (the row's band and the bars' rows end at its floor); past either end there is nothing to compose.
+    let slide = SLIDE.load(Ordering::Acquire) as i32;
+    let off = if off < 0 { 0 } else if off > slide { slide } else { off };
+    OFFSET.store(off as u64, Ordering::Release);
+    STATE_A.store((m[5] as u64) << 32 | (m[6] as u64) << 40 | (m[7] as u64) << 48 | (m[8] as u64) << 56, Ordering::Release);
+    STATE_B.store(w16(9) | w16(11) << 16, Ordering::Release);
     if m[5] & 2 != 0 {
         CAPTURE.store(true, Ordering::Release);
     }
     CON_NUDGE.fetch_add(1, Ordering::Release);
     ferros_sys::wake(&CON_NUDGE, 1);
+    let s = (slide as u16).to_le_bytes();
+    [0, s[0], s[1]]
 }
 
-/// The quick circle under a point at the row's level now: its index and (x, y, r). None while the row is shut.
+/// The quick circle under a point, open: its index and (x, y, r). None unless the row is all the way open (while it slides, a finger on it is the slide's).
 pub fn hit(x: f32, y: f32, width: usize, height: usize) -> Option<(usize, (f32, f32, f32))> {
-    let o = state().o;
-    if o <= 0. {
+    if state().off < SLIDE.load(Ordering::Acquire) as i64 || SLIDE.load(Ordering::Acquire) == 0 {
         return None;
     }
-    at(width, height, o).iter().enumerate().find(|(_, c)| (x - c.0) * (x - c.0) + (y - c.1) * (y - c.1) <= c.2 * c.2).map(|(k, &c)| (k, c))
+    layout(width, height).iter().enumerate().find(|(_, c)| (x - c.0) * (x - c.0) + (y - c.1) * (y - c.1) <= c.2 * c.2).map(|(k, &c)| (k, c))
 }
 
 /// Whether a point is in the doorway: the disc about the camera hole out to the nearest top console circle, outside the app's circle.
@@ -251,9 +242,233 @@ pub fn doorway(x: f32, y: f32, width: usize, height: usize) -> bool {
     (x - hx) * (x - hx) + (y - hy) * (y - hy) < door * door && !in_circle(x as i64, y as i64, width, height)
 }
 
-/// Whether the row shows now (op 41's "behind"): its largest circle at least half a pixel, as the console draws it. A pull that never left the ease's first stretch (a finger resting on the top's ground) shows nothing, and a touch behind it is the app's.
-pub fn showing(width: usize, height: usize) -> bool {
-    state().o * layout(width, height)[N / 2].2 >= 0.5
+/// Whether any of the row shows now (op 41's "behind").
+pub fn showing() -> bool {
+    state().off > 0
+}
+
+/// One circle's sprite: every pixel the circle draws (out to its reach past the radius), row by row from `y0`, each row a span of columns [x0, x1) at `at` in `data`. Drawn in fluor's α + darkness, then decoded in place to working values (`working`), as the bars are, so a frame of the slide only copies and folds.
+struct Sprite {
+    y0: i64,
+    span: &'static [(u16, u16, u32)],
+    data: &'static mut [u64],
+    /// The look it was drawn with (`look`); 0 not drawn.
+    key: u64,
+}
+
+static mut SPRITES: [Option<Sprite>; N] = [const { None }; N];
+/// The rows the six sprites cover at rest, open, [top, bottom): the band the slide moves.
+static mut BAND: (i64, i64) = (0, 0);
+/// The offset the bars were last composed at.
+static mut COMPOSED: i64 = -1;
+
+/// A circle's drawing reaches past its radius: the vessel's table runs to r + 2, its rim antialiased half a pixel more (the console's REACH), and a pixel of slack.
+const SPRITE_REACH: f32 = 3.;
+
+/// The slide's length: from hidden (every pixel of the row above the app circle's top, so clipped away) to open, whole pixels.
+fn slide_len(width: usize, height: usize) -> i64 {
+    let (_, cy, rr) = circle(width, height);
+    unsafe { BAND.1 - libm::floorf(cy - rr) as i64 }
+}
+
+/// The sprites, made once at start (before the heap's mark, kept for the process): each circle's rows and spans from the layout, its data zeroed (drawn at the first `update`). On husky about 265 thousand pixels, 2.1 MiB.
+pub fn init(width: usize, height: usize) {
+    let lay = layout(width, height);
+    let (mut top, mut bot) = (i64::MAX, i64::MIN);
+    for (k, &(x, y, r)) in lay.iter().enumerate() {
+        let re = r + SPRITE_REACH;
+        let (y0, y1) = (libm::floorf(y - re) as i64, libm::ceilf(y + re) as i64);
+        let mut span = alloc::vec::Vec::with_capacity((y1 - y0) as usize);
+        let mut at = 0u32;
+        for row in y0..y1 {
+            let dy = row as f32 + 0.5 - y;
+            let h2 = re * re - dy * dy;
+            // WHY the bounds: a row past the disc's reach has no chord; and the outer circles touch the glass's sides, so their reach runs a few pixels past the screen's edges, which hold no columns.
+            let half = if h2 > 0. { libm::sqrtf(h2) } else { 0. };
+            let (a, b) = (libm::floorf(x - half), libm::ceilf(x + half));
+            let x0 = if a < 0. { 0 } else { a as u16 };
+            let x1 = if b > width as f32 { width as u16 } else { b as u16 };
+            let x1 = if x1 < x0 { x0 } else { x1 };
+            span.push((x0, x1, at));
+            at += (x1 - x0) as u32;
+        }
+        top = top.min(y0);
+        bot = bot.max(y1);
+        let data = alloc::vec![0u64; at as usize].leak();
+        unsafe { (*(&raw mut SPRITES))[k] = Some(Sprite { y0, span: span.leak(), data, key: 0 }) };
+    }
+    unsafe { BAND = (top, bot) };
+    SLIDE.store(slide_len(width, height) as u64, Ordering::Release);
+}
+
+/// Working values (gamma 2, white at Q14), as the console's: the grey of a lit circle, of one that is off, and the inks.
+const LIT_GREY: f32 = 9000.;
+const OFF_GREY: f32 = 3200.;
+const LIVE_INK: f32 = 11000.;
+const LIGHT_INK: f32 = 7000.;
+
+/// A quick circle's look now: its grey (lit while what it switches is on; a stop darker for vibrate; the off grey; a stop under that for a torch that does not answer; the live ink's light under a finger), whether it is on (its ink), its ring's lit share (brightness by preference 3, 0 the brightest; the torch by its level; while a finger turns one, the share the map sent), and as one key with its word's language and the sound mode.
+fn look(k: usize, s: &Now) -> (f32, bool, Option<f32>, u64) {
+    let stop = core::f32::consts::FRAC_1_SQRT_2;
+    let off = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF);
+    let sound = ferros_sys::pref(ferros_sys::PREF_SOUND);
+    let (on, grey) = match ITEMS[k] {
+        Item::Brightness => (true, LIT_GREY),
+        Item::Torch => match s.torch {
+            None => (false, OFF_GREY * stop),
+            Some(0) => (false, OFF_GREY),
+            Some(_) => (true, LIT_GREY),
+        },
+        Item::RadiosOff => if off & 0x1F == 0x1F { (true, LIT_GREY) } else { (false, OFF_GREY) },
+        Item::Sound => match sound {
+            ferros_sys::SOUND => (true, LIT_GREY),
+            ferros_sys::VIBRATE => (true, LIT_GREY * stop),
+            _ => (false, OFF_GREY),
+        },
+        Item::Dnd => if ferros_sys::dnd::on() { (true, LIT_GREY) } else { (false, OFF_GREY) },
+        Item::Screencap => (false, OFF_GREY),
+    };
+    let grey = if s.held == Some(k) { LIVE_INK } else { grey };
+    let ring = match ITEMS[k] {
+        Item::Brightness => Some(s.bright_arc.unwrap_or(1. - ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS) as f32 * (1. / 255.))),
+        Item::Torch => s.torch.map(|l| s.torch_arc.unwrap_or(l as f32 * (1. / 255.))),
+        _ => None,
+    };
+    let mut key = 0x9E37_79B9_7F4A_7C15u64 ^ k as u64;
+    for v in [grey.to_bits() as u64 | (on as u64) << 32, ring.map_or(u64::MAX, |f| f.to_bits() as u64), sound as u64 | (ferros_sys::pref(ferros_sys::PREF_LANG) as u64) << 8 | (ferros_sys::pref(ferros_sys::PREF_LANG + 1) as u64) << 16] {
+        key = (key.rotate_left(7) ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    (grey, on, ring, key | 1)
+}
+
+/// Circle k drawn into its sprite at its size, front to back from empty: its ring, its word, then its vessel under them (the console's vessel, `orb::Vessel`, by a table over the radius); then decoded in place to working values.
+fn render(k: usize, grey: f32, on: bool, ring_share: Option<f32>, width: usize, height: usize) {
+    use fluor::pixel::{Blend, BlendMode};
+    let (x, y, r) = layout(width, height)[k];
+    let Some(sp) = (unsafe { (*(&raw mut SPRITES))[k].as_mut() }) else { return };
+    let (y0, span) = (sp.y0, sp.span);
+    let data = &mut *sp.data;
+    data.fill(0);
+    // A pixel's place in the sprite. WHY the tests: the ring's box, the word's glyphs and the vessel's square reach a little past the disc the sprite holds; there is nothing of the circle there.
+    let at = |px: i64, py: i64| -> Option<usize> {
+        let j = py - y0;
+        if j < 0 || j >= span.len() as i64 {
+            return None;
+        }
+        let (x0, x1, o) = span[j as usize];
+        if px < x0 as i64 || px >= x1 as i64 {
+            return None;
+        }
+        Some(o as usize + (px - x0 as i64) as usize)
+    };
+    let ink = g2t_colour(if on { (LIVE_INK, LIVE_INK, LIVE_INK) } else { (LIGHT_INK, LIGHT_INK, LIGHT_INK) });
+    if let Some(share) = ring_share {
+        ring(x, y, r * (1.0 - 2.0 * VESSEL_DEPTH), share, ink, data, &at, &|b| b);
+    }
+    let eng = unsafe { (*(&raw mut CON_GLYPHS)).as_mut().expect("console glyphs") };
+    word(k, x, y, r * if ring_share.is_some() { RING_INNER } else { 1.0 }, ink, data, &at, eng);
+    // The vessel: as the console draws its circles (`console_draw`), a table over the radius by sixteenths of a pixel, so each pixel is a root and a lookup.
+    let fl = [grey; 3].map(|v| { let c = v * (1.0 / 16384.0); c * c });
+    let vessel = orb::Vessel::new(fl, VESSEL_DEPTH, VESSEL_LAMBDA, VESSEL_SHARP, VESSEL_SEP, 0.0, 4.0);
+    let fs = 1.0 / r;
+    const SUB: f32 = (1 << 4) as f32;
+    let lut: alloc::vec::Vec<(u64, u64)> = (0..((r + 2.0) * SUB) as usize).map(|j| vessel.at(1.0 - (j as f32 + 0.5) * (1.0 / SUB) * fs, fs)).collect();
+    for (j, &(x0, x1, o)) in span.iter().enumerate() {
+        let dy = (y0 + j as i64) as f32 + 0.5 - y;
+        for px in x0..x1 {
+            let dx = px as f32 + 0.5 - x;
+            // Past the table's end (outside r + 2) the vessel is nothing.
+            let Some(&(rg, body)) = lut.get((libm::sqrtf(dx * dx + dy * dy) * SUB) as usize) else { continue };
+            let i = o as usize + (px - x0) as usize;
+            data[i] = data[i].under(rg, BlendMode::Normal).under(body, BlendMode::Normal);
+        }
+    }
+    for p in data.iter_mut() {
+        *p = working(*p, G2T16);
+    }
+}
+
+/// The worker's pass over the row (`console_worker`): any circle whose look changed drawn again into its sprite (a tap, a ring turned, a language), and the offset taken. Returns the bars' rows owed a compose: those a changed sprite covers where it stands now, and the band where the row was and is when it moved. What it took is the next `compose`'s.
+pub fn update(width: usize, height: usize) -> Option<(usize, usize)> {
+    let s = state();
+    let slide = SLIDE.load(Ordering::Acquire) as i64;
+    let (top, bot) = unsafe { BAND };
+    let mut rows: Option<(i64, i64)> = None;
+    let mut owe = |a: i64, b: i64| rows = Some(rows.map_or((a, b), |(p, q)| (p.min(a), q.max(b))));
+    for k in 0..N {
+        let (grey, on, ring_share, key) = look(k, &s);
+        let Some(sp) = (unsafe { (*(&raw mut SPRITES))[k].as_mut() }) else { continue };
+        if sp.key == key {
+            continue;
+        }
+        sp.key = key;
+        let (y0, n) = (sp.y0, sp.span.len() as i64);
+        render(k, grey, on, ring_share, width, height);
+        if s.off > 0 {
+            let d = s.off - slide;
+            owe(y0 + d, y0 + n + d);
+        }
+    }
+    let was = unsafe { COMPOSED };
+    if s.off != was {
+        for o in [s.off, was] {
+            if o > 0 {
+                owe(top + o - slide, bot + o - slide);
+            }
+        }
+        unsafe { COMPOSED = s.off };
+    }
+    EMPTY_BACK.store(s.off == 0, Ordering::Release);
+    // WHY the bounds: the band moved up by the slide reaches above the screen's top; only the bars' top rows exist.
+    let lim = unsafe { BAR_TOP } as i64;
+    rows.map(|(a, b)| ((if a < 0 { 0 } else { a }) as usize, (if b > lim { lim } else { b }) as usize)).filter(|r| r.0 < r.1)
+}
+
+/// The row composed into one decoded row of the bars, screen row `y` (`bar_decode`), under the console's circles already there: each sprite's row at the offset taken (`COMPOSED`), clipped to the app's circle (exact area coverage across its two edge columns), copied where nothing of the console is and folded under it (`under_pm`) where something is. Returns the columns written, [from, to), (0, 0) for none.
+pub fn compose(y: usize, out: &mut [u64], width: usize, height: usize) -> (usize, usize) {
+    let off = unsafe { COMPOSED };
+    if off <= 0 {
+        return (0, 0);
+    }
+    let d = off - SLIDE.load(Ordering::Acquire) as i64;
+    let (cx, cy, rr) = circle(width, height);
+    let dy = y as f32 + 0.5 - cy;
+    let h2 = rr * rr - dy * dy;
+    if h2 <= 0. {
+        return (0, 0);
+    }
+    let half = libm::sqrtf(h2);
+    let (cl, cr) = (cx - half, cx + half);
+    let (mut lo, mut hi) = (width, 0usize);
+    for sp in unsafe { (*(&raw const SPRITES)).iter().flatten() } {
+        let j = y as i64 - d - sp.y0;
+        if j < 0 || j >= sp.span.len() as i64 {
+            continue;
+        }
+        let (x0, x1, o) = sp.span[j as usize];
+        // The chord's whole pixels, and its two part ones.
+        let (a, b) = (if (x0 as f32) < cl { libm::floorf(cl) as usize } else { x0 as usize }, if (x1 as f32) > cr { libm::ceilf(cr) as usize } else { x1 as usize });
+        for x in a..b {
+            let mut s = sp.data[o as usize + x - x0 as usize];
+            if s >> 63 != 0 {
+                continue;
+            }
+            // A column the arc crosses: the layer scaled by the share of the pixel inside it. WHY the bounds: coverage is the overlap of [x, x + 1] with the chord, a share by definition.
+            let cov = { let (p, q) = (if (x as f32) > cl { x as f32 } else { cl }, if ((x + 1) as f32) < cr { (x + 1) as f32 } else { cr }); q - p };
+            if cov < 1. {
+                if cov <= 0. {
+                    continue;
+                }
+                let q = (cov * 65536.) as u64;
+                s = scale_q16(s, q) | (16384 - ((16384 - trans(s)) * q >> 16)) << 49;
+            }
+            let f = out[x];
+            out[x] = if f >> 63 != 0 { s } else { let (ch, t) = under_pm(f & ((1 << 48) - 1), trans(f), s & ((1 << 48) - 1), trans(s)); ch | t << 49 };
+            lo = lo.min(x);
+            hi = hi.max(x + 1);
+        }
+    }
+    if lo < hi { (lo, hi) } else { (0, 0) }
 }
 
 /// A ring's band, as shares of the circle's inner radius (inside the vessel's rim): outer and inner edge. The word of a circle with a ring stays inside `RING_INNER` of its radius.
