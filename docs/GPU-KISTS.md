@@ -13,6 +13,18 @@ GPU.md is the driver as built; this is what it grows into.
 - **Look, not bits** (2026-11-05): "bit identical-ish is totally fine".
 - **Mahere** (2026-11-11): "completely triangle raster all the way down. Except for place labels"; "no tilting or 3Dness"; "2-8 triangles per pixel, and each triangle of course has several layers but is one colour"; "The triangle shader shit is more for textures on things, to which we don't have rectangles, no?"; on exact coverage, "and then it'd be a 1:1 per px too, rather than our oversample now, I think 9x or so?"
 - **The order** (2026-11-11): "a proper study, design, plan and then if it looks good, we can build the GPU!"
+- **f16** (2026-11-11): "f16 is likely worth it, we get 2x and most of the mahere composite work can either be done in integer or f16." Valhall's paired half-precision ops run at twice the rate; light, colour, coverage weights and lookups are f16, coordinates stay integer (Mahere's Q30.16 texel addressing: f16's 11 bits cannot hold them).
+- **What a capsule carries** (2026-11-11): "ideally WGSL text becomes VSF compiled by the dev that gets checked and optimized by ferros." The developer's tools compile the source into a typed intermediate form stored as VSF in the capsule; the device validates it (types, buffer bounds, loop limits), optimises it, lowers it to Valhall at install and seals the result; the device never parses shader text (open question 0 closed).
+- **Looks the same, never bit for bit** (2026-11-11): "if it looks roughly similar, that's totally fine. the aspect and resolution from one device to another is going to fuck it up more than anything and the human WILL NOT NOTICE. Just needs to look the same." (open question 2 closed; the wallpaper crate's own promise rewritten to match).
+- **The kept wallpaper's read first** (2026-11-11): "2.9s for a 24MB read is embarassing by the way... that def needs fixed BEFORE we decide to take the pre-rendered disk read out." (open question 3 waits on that fix).
+- **No GPU, no picture** (2026-11-11): "Black until we bring the GPU up. I did say no fallbacks." (open question 4 closed).
+- **Spirix** (2026-11-11): "Spirix is a ways out, I wish but hardware ain't there yet."
+- **No GPU right** (2026-11-11): "No GPU prompt, that's implicit." Every kist computes on the GPU as it does on the CPU, in its own GPU address space (open question 5 closed).
+- **Loops, the progress timer** (owner: "Your call on loops"): no bounded-loop rule (termination is not provable in general and the rule would refuse honest kernels); the firmware's progress timer stops a runaway, costing only that client's job (open question 6 closed).
+- **Power and clocks** (owner: "Your call on the last two"): the GPU powers up when work is queued and gates when its queue empties, as events, never a timer; its clock steps with load inside the measured floors (open question 7 closed).
+- **naga in the developer's tools only** (same): it parses WGSL on the developer's machine; the device runs ferros's own validator over the VSF form, never naga (open question 8 closed).
+- **Build it** (2026-11-11): "I say we build it!"
+- **Source language, proposed** (owner: "Not sure on the source language, thoughts?"): the VSF form is the contract and any front end that emits it is welcome, all on the developer's machine: WGSL first (Mahere's compose is WGSL, naga parses it), Rust next (rust-gpu to SPIR-V, naga reads SPIR-V into the same form), ferros's own kernels from the `valhall` crate's recorded Rust into the same form, and a Spirix type in the form once Spirix replaces IEEE.
 
 ## 0. Study
 

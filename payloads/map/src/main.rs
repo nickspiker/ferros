@@ -658,17 +658,17 @@ impl Batch {
 
 /// Dummy kists for judging the state glows (owner, 2026-11-11: "Gimme a few dummy kists with text in each one to label the state and I'll pan/zoom/fling and see how it looks"): a development switch, FERROS_DUMMY_KISTS set at build (=1), never on a production build. Nine circles in the display's scene only (never the person's kists or the vault), a grid of three by three to the right of every circle the map has, each labelled with its state and tapped to nothing (`Map::hit` knows only the map's own).
 const DUMMY_KISTS: bool = DEV && option_env!("FERROS_DUMMY_KISTS").is_some();
-/// Each dummy: its label, its glow (ferros_glow::Glow's byte: 1 running, 2 the Back target, 3 people, 4 the system, 5 stopped, 6 not running), its people count, its rim (1 needs you, 2 working) and the working share (Q16).
-const DUMMIES: [(&str, u8, u16, u8, u16); 9] = [
-    ("running", 1, 0, 0, 0),
-    ("back target", 2, 0, 0, 0),
-    ("people 1", 3, 1, 0, 0),
-    ("people 20", 3, 20, 0, 0),
-    ("system", 4, 0, 0, 0),
-    ("needs you", 0, 0, 1, 0),
-    ("working", 0, 0, 2, 26214),
-    ("stopped", 5, 0, 0, 0),
-    ("not running", 6, 0, 0, 0),
+/// Each dummy: its label, its state (ferros_glow::Glow's byte: 1 running, 2 the Back target, 3 people, 4 the system, 5 stopped, 6 not running, 7 needs you, 8 working) and its people count.
+const DUMMIES: [(&str, u8, u16); 9] = [
+    ("running", 1, 0),
+    ("back target", 2, 0),
+    ("people 1", 3, 1),
+    ("people 20", 3, 20),
+    ("system", 4, 0),
+    ("needs you", 7, 0),
+    ("working", 8, 0),
+    ("stopped", 5, 0),
+    ("not running", 6, 0),
 ];
 
 /// FERROS_MAP_START=crowd's extra circles (`Map::crowd`): x, y, r in world units, and how many.
@@ -2070,10 +2070,10 @@ impl Map {
     }
 
     /// The dummy kists (`DUMMY_KISTS`), appended to the display's scene after the map's own circles (display indices n to n + 8), then their states (display op 57).
-    /// Placed from the circles as they are now, so they follow every renormalise and arrangement: each half the settings circle's radius, on a grid of three by three at a pitch of 9/2 of their radius (a high glow reaches one radius, so neighbours' glows just meet), its left column two radii past the rightmost edge of any circle, centred on the settings circle's height.
+    /// Placed from the circles as they are now, so they follow every renormalise and arrangement: each half the settings circle's radius, on a grid of three by three at a pitch of three radii (a radius of plane between neighbours: a glow reaches 1/12 of the radius, a people glow at most 1/6), its left column two radii past the rightmost edge of any circle, centred on the settings circle's height.
     fn send_dummies(&self) {
         let rd = self.rs[0] / 2;
-        let pitch = rd * 9 / 2;
+        let pitch = rd * 3;
         let right = (0..self.n).map(|i| (self.xs[i] >> 8) + self.rs[i]).max().unwrap_or(0);
         let (x0, y0) = (right + 3 * rd, (self.ys[0] >> 8) - pitch);
         let mut m = [0u8; 2 + 30 * DUMMIES.len()];
@@ -2092,16 +2092,14 @@ impl Map {
         }
         let mut r = [0u8; 4];
         call(self.display, &m, &mut r);
-        let mut s = [0u8; 2 + 7 * DUMMIES.len()];
+        let mut s = [0u8; 2 + 4 * DUMMIES.len()];
         s[0] = 57;
         s[1] = DUMMIES.len() as u8;
         for (k, d) in DUMMIES.iter().enumerate() {
-            let at = 2 + k * 7;
+            let at = 2 + k * 4;
             s[at] = (self.n + k) as u8;
             s[at + 1] = d.1;
             s[at + 2..at + 4].copy_from_slice(&d.2.to_le_bytes());
-            s[at + 4] = d.3;
-            s[at + 5..at + 7].copy_from_slice(&d.4.to_le_bytes());
         }
         call(self.display, &s, &mut r);
     }

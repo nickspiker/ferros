@@ -1,5 +1,5 @@
 //! A person's default wallpaper: a Julia set drawn from a 32-byte seed, in the family of the owner's own wallpaper (a deep blue field, glowing periwinkle dendrites wound into spirals, small warm sparks where the filaments knot).
-//! The picture is a pure function of the seed and the frame's size: the same seed gives the same pixels bit for bit on every device, and different seeds give clearly different pictures.
+//! The picture is a pure function of the seed and the frame's size: the same seed gives a picture that looks the same on every device (owner, 2026-11-11: "if it looks roughly similar, that's totally fine ... the human WILL NOT NOTICE. Just needs to look the same"; aspect and resolution differ per device anyway), and different seeds give clearly different pictures.
 //!
 //! What the seed chooses (`candidate`):
 //! - c, the Julia constant, just outside the Mandelbrot set, where the Julia set is a lace of spiralling dendrites: either a small step out from the main cardioid's boundary, c = e^{iθ}/2 − e^{2iθ}/4 + ε·n̂ (n̂ the outward normal), or out from the period-2 bulb's, c = −1 + (1 + ε)·e^{iφ}/4, conjugated half the time.
