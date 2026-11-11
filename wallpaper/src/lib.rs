@@ -18,11 +18,17 @@
 //! Each colour is a VSF RGB colour, held and mixed as its working code (√light, white at 1), as the display and fluor mix theirs: in light the mixes came out much lighter than they look they should (owner, 2026-11-07).
 //!
 //! Output: the display's working values, a u64 per pixel, R, G and B in bits 0-15, 16-31 and 32-47 as √light × 16384, α G#FFFF in bits 48-63.
-//! f32 and libm only: no fused multiply-add is ever formed (Rust never contracts), the square root is correctly rounded everywhere (aarch64's fsqrt, x86's sqrtss), and libm's logarithms are the same software on every target, so a row is the same wherever it is computed.
+//! One source for the CPU and the GPU (GPU-KISTS.md plan step 0; owner, 2026-11-11: "We should be using GPU path for the brot in all cases"): the orbit and the colouring are written over a lane (`lane.rs`, tapuwae's route). On the device it is valhall's recording type (`gpu.rs`, feature `gpu`): wallgen draws the picture with those kernels, and the CPU path stays for tests and tools/tune.
+//! On the CPU, f32 and libm only: no fused multiply-add is ever formed (Rust never contracts), the square root is correctly rounded everywhere (aarch64's fsqrt, x86's sqrtss), and libm's logarithms are the same software on every target, so a row is the same wherever it is computed. The GPU's picture looks the same, not the same bits (gpu.rs).
 #![cfg_attr(not(test), no_std)]
+
+pub mod lane;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 
 use core::f32::consts::{PI, TAU};
 use core::ops::Range;
+use lane::{pick, Lane};
 use vsf::colour::{LMS2PHOTOPIC, LMS2VSF_RGB, VSF_RGB2LMS};
 
 /// The most iterations a pixel's orbit is followed.
@@ -284,12 +290,17 @@ pub fn params_with(seed: &[u8; 32], width: usize, height: usize, k: &Knobs) -> P
 }
 
 /// `params_with`, handing each candidate to `seen` as it is surveyed (its `survey` filled in), so tools/tune can show why each attempt failed.
-pub fn params_seen(seed: &[u8; 32], width: usize, height: usize, k: &Knobs, mut seen: impl FnMut(&Params)) -> Params {
+pub fn params_seen(seed: &[u8; 32], width: usize, height: usize, k: &Knobs, seen: impl FnMut(&Params)) -> Params {
+    params_by(seed, width, height, k, |p| survey_with(p, k), seen)
+}
+
+/// `params_seen` with each candidate surveyed by `look`: the CPU's orbits (`survey_with`), or the GPU's (wallgen: `gpu::survey_kernel` run, its counts and distances read back and `tally`d), which is how the device chooses (owner, 2026-11-11: the brot on the GPU in all cases).
+pub fn params_by(seed: &[u8; 32], width: usize, height: usize, k: &Knobs, mut look: impl FnMut(&Params) -> Survey, mut seen: impl FnMut(&Params)) -> Params {
     let mut best = candidate_with(seed, 0, width, height, k);
     let mut best_score = f32::MIN;
     for a in 0..k.attempts {
         let mut p = candidate_with(seed, a, width, height, k);
-        let s = survey_with(&p, k);
+        let s = look(&p);
         p.survey = s;
         seen(&p);
         if s.passes_with(k) {
@@ -316,8 +327,9 @@ pub fn render_rows(p: &Params, rows: Range<usize>, out: &mut [u64]) {
     let f = Frame::new(p);
     let w = p.width;
     for (k, y) in rows.enumerate() {
-        let line = &mut out[k * w..k * w + w];
-        f.row(y, line);
+        for x in 0..w {
+            out[k * w + x] = pack(f.pixel(x as f32 + 0.5 - f.half[0], y as f32 + 0.5 - f.half[1]));
+        }
     }
 }
 
@@ -357,33 +369,12 @@ pub fn refine_rows(p: &Params, rows: Range<usize>, mask: &[u8], out: &mut [u64])
     assert_eq!(out.len(), rows.len() * w);
     assert_eq!(mask.len(), rows.len() * stride);
     let f = Frame::new(p);
-    let far_ds = f.views[FAR_VIEW].2;
-    let n = (REFINE * REFINE) as f32;
     for (k, y) in rows.enumerate() {
         for x in 0..w {
             if mask[k * stride + x / 8] >> (x % 8) & 1 == 0 {
                 continue;
             }
-            let (cx, cy) = (x as f32 + 0.5 - f.half[0], y as f32 + 0.5 - f.half[1]);
-            let (zx, zy) = f.z_at(FAR_VIEW, cx, cy);
-            let t = orbit(zx, zy, p.c[0], p.c[1]).d * far_ds * FAR_INV;
-            let far = 1. / (1. + t * t);
-            let mut sum = [0f32; 3];
-            // A row of samples at a time through `orbit4` (REFINE is its four lanes).
-            for j in 0..REFINE {
-                let fy = y as f32 + (j as f32 + 0.5) / REFINE as f32 - f.half[1];
-                let fxs: [f32; REFINE] = core::array::from_fn(|i| x as f32 + (i as f32 + 0.5) / REFINE as f32 - f.half[0]);
-                let (mut zx, mut zy) = ([0f32; 4], [0f32; 4]);
-                for i in 0..REFINE {
-                    (zx[i], zy[i]) = f.z_at(NEAR_VIEW, fxs[i], fy);
-                }
-                let o = orbit4(zx, zy, p.c[0], p.c[1]);
-                for i in 0..REFINE {
-                    let c = f.colour(fxs[i], fy, o[i], far);
-                    sum = [sum[0] + c[0], sum[1] + c[1], sum[2] + c[2]];
-                }
-            }
-            out[k * w + x] = pack([sum[0] / n, sum[1] / n, sum[2] / n]);
+            out[k * w + x] = pack(f.refined(x as f32, y as f32));
         }
     }
 }
@@ -397,103 +388,121 @@ pub fn pack(c: [f32; 3]) -> u64 {
 }
 
 /// What a pixel's orbit gives: its smooth escape count, its distance to the set in plane units, its stripe average (the field's rays), and the set's relief there: the unit direction of z / (dz/dz₀) at the escape, the potential's gradient, which lighting takes as the surface's normal (zero inside the set).
+/// A lane each (`lane.rs`): f32 on the CPU, a recorded value on the GPU.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Orbit {
-    pub n: f32,
-    pub d: f32,
-    pub s: f32,
-    pub u: [f32; 2],
+pub struct Orbit<L = f32> {
+    pub n: L,
+    pub d: L,
+    pub s: L,
+    pub u: [L; 2],
     /// The flame (mandelbrot-exploder's, as tapuwae colours it): (conj(fc) − fq)·ln(n)/2⁴, fq the orbit's mean direction weighted by step² and fc its mean 1/z weighted by 1/|z| (owner, 2026-11-07: "more flames"); zero inside the set.
-    pub f: [f32; 2],
+    pub f: [L; 2],
 }
 
-/// An orbit that never escaped: the count's own limit, on the set, no rays.
-const INSIDE_ORBIT: Orbit = Orbit { n: (MAX_ITER + 1) as f32, d: 0., s: 0., u: [0., 0.], f: [0., 0.] };
-
-/// One pixel's orbit under z ↦ z² + c from (zx, zy).
-/// The count runs continuously from i to i + 1 across the iteration where the orbit escapes, and an orbit that never escapes gets MAX_ITER + 1, the count's own limit, and distance 0.
-/// dz/dz₀ grows by 2|z| ≤ 512 a step; once |dz|² passes 2^62 it is scaled down by 2^32 (exact, a power of two) and the scale kept in `e`, so it never overflows f32.
-/// The stripe average (Härkönen's): sin 4·arg z_k averaged over the orbit from z₁ on, blended across the escaping step by the count's fraction so it runs on continuously where the escape time steps; it draws rays out of the set through the field.
-/// `orbit4` is the same orbit for four pixels side by side, operation for operation, so the two agree bit for bit (tested).
-#[inline]
-pub fn orbit(zx: f32, zy: f32, cx: f32, cy: f32) -> Orbit {
-    let (mut x, mut y) = (zx, zy);
-    let (mut dx, mut dy) = (1f32, 0f32);
-    let mut e = 0i32;
-    let mut sum = 0f32;
-    let mut fl = Flame::default();
-    let mut i = 0u32;
-    loop {
-        let (xx, yy) = (x * x, y * y);
-        let r2 = xx + yy;
-        if r2 > R2 {
-            return escaped(i, x, y, dx, dy, e, sum, fl);
-        }
-        if i == MAX_ITER {
-            return INSIDE_ORBIT;
-        }
-        if i > 0 {
-            sum += stripe(x, y, xx, yy, r2);
-        }
-        fl = fl.step(x, y, r2, i);
-        let ndx = 2. * (x * dx - y * dy);
-        dy = 2. * (x * dy + y * dx);
-        dx = ndx;
-        if dx * dx + dy * dy > DZ_BIG {
-            dx *= DZ_SCALE;
-            dy *= DZ_SCALE;
-            e += 32;
-        }
-        y = 2. * x * y + cy;
-        x = xx - yy + cx;
-        i += 1;
+impl<L: Lane> Orbit<L> {
+    /// An orbit that never escaped: the count's own limit, on the set, no rays.
+    fn inside() -> Orbit<L> {
+        let z = L::splat(0.);
+        Orbit { n: L::splat((MAX_ITER + 1) as f32), d: z, s: z, u: [z, z], f: [z, z] }
+    }
+    /// `a` where `m` holds, `b` elsewhere, field by field.
+    fn select(m: L::M, a: Orbit<L>, b: Orbit<L>) -> Orbit<L> {
+        let s = |x: L, y: L| L::select(m, x, y);
+        Orbit { n: s(a.n, b.n), d: s(a.d, b.d), s: s(a.s, b.s), u: [s(a.u[0], b.u[0]), s(a.u[1], b.u[1])], f: [s(a.f[0], b.f[0]), s(a.f[1], b.f[1])] }
     }
 }
 
-/// The flame's sums over an orbit (tapuwae's, from mandelbrot-exploder): z's direction weighted by the step's number squared, and that weight; z̄ / |z|² weighted by 1/|z|, and that weight.
-/// The z-flame's weight tapers to nothing as the orbit nears the bailout (`taper`), so the sums run on continuously where the escape step changes from pixel to pixel; without it the flames came out as blocky tiles (2026-11-07).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Flame {
-    q: [f32; 2],
-    qw: f32,
-    c: [f32; 2],
-    cw: f32,
+/// The orbit's state round its loop (`orbit`, through `Lane::iterate`), every field a lane, so the GPU carries it as a row of values: z; dz/dz₀ and its scale (1, times DZ_SCALE each time dz was scaled down); the stripe sum; the flame's sums (z's direction weighted by the step's number squared and that weight, z̄ / |z|² weighted by 1/|z| and that weight); and the head's: x², y², |z|² and the step's number.
+#[derive(Clone, Copy)]
+struct Step<L> {
+    x: L,
+    y: L,
+    dx: L,
+    dy: L,
+    sc: L,
+    sum: L,
+    q0: L,
+    q1: L,
+    qw: L,
+    c0: L,
+    c1: L,
+    cw: L,
+    xx: L,
+    yy: L,
+    r2: L,
+    i: L,
+}
+
+/// One pixel's orbit under z ↦ z² + c from (zx, zy).
+/// The count runs continuously from i to i + 1 across the iteration where the orbit escapes, and an orbit that never escapes gets MAX_ITER + 1, the count's own limit, and distance 0.
+/// dz/dz₀ grows by 2|z| ≤ 512 a step; once |dz|² passes 2^62 it is scaled down by 2^32 (exact, a power of two) and the scale kept, so it never overflows f32; the distance is multiplied by the scale at the end (until 2026-11-11 an integer exponent and ldexp, which the GPU has no instruction for: the same bits wherever the result is a normal float, and where it is not the distance is below any use of it).
+/// The stripe average (Härkönen's): sin 4·arg z_k averaged over the orbit from z₁ on, blended across the escaping step by the count's fraction so it runs on continuously where the escape time steps; it draws rays out of the set through the field.
+/// The loop is `Lane::iterate`: MAX_ITER + 1 passes, the last one's head finding the orbit escaped at MAX_ITER or never.
+#[inline]
+pub fn orbit<L: Lane>(zx: L, zy: L, cx: f32, cy: f32) -> Orbit<L> {
+    let (zero, one) = (L::splat(0.), L::splat(1.));
+    let init = Step { x: zx, y: zy, dx: one, dy: zero, sc: one, sum: zero, q0: zero, q1: zero, qw: zero, c0: zero, c1: zero, cw: zero, xx: zero, yy: zero, r2: zero, i: zero };
+    let s = L::iterate(
+        MAX_ITER + 1,
+        init,
+        |n, mut s| {
+            s.xx = s.x * s.x;
+            s.yy = s.y * s.y;
+            s.r2 = s.xx + s.yy;
+            s.i = n;
+            // Running while |z|² ≤ 2^16 (not escaped) and below the cap.
+            let running = L::splat(R2).ge(s.r2) & n.lt(L::splat(MAX_ITER as f32));
+            (s, running)
+        },
+        |n, mut s| {
+            let (x, y, xx, yy, r2) = (s.x, s.y, s.xx, s.yy, s.r2);
+            s.sum = pick::<L, L>(n.gt(zero), || s.sum + stripe(x, y, xx, yy, r2), s.sum, L::select);
+            // The flame's sums, this step the n-th (from 0).
+            let inv = one / (r2.sqrt() + FLAME_EPS);
+            let inv2 = inv * inv;
+            let it = n + 1.;
+            let wt = it * it * taper(r2);
+            let wq = wt * inv;
+            s.q0 = s.q0 + x * wq;
+            s.q1 = s.q1 + y * wq;
+            s.qw = s.qw + wt;
+            s.c0 = s.c0 + x * inv2;
+            s.c1 = s.c1 - y * inv2;
+            s.cw = s.cw + inv;
+            let ndx = (x * s.dx - y * s.dy) * 2.;
+            let ndy = (x * s.dy + y * s.dx) * 2.;
+            // Multiplying by 1 is exact, so dz is unchanged where it is not scaled.
+            let f = L::select((ndx * ndx + ndy * ndy).gt(L::splat(DZ_BIG)), L::splat(DZ_SCALE), one);
+            s.dx = ndx * f;
+            s.dy = ndy * f;
+            s.sc = s.sc * f;
+            s.y = x * 2. * y + cy;
+            s.x = xx - yy + cx;
+            s
+        },
+    );
+    pick::<L, _>(s.r2.gt(L::splat(R2)), || escaped(s), Orbit::inside(), Orbit::select)
 }
 
 /// Added to |z| under the flame's division: z = 0 exactly (a preimage of −c can land there) would divide by zero; anywhere |z| > 2^-76 it is below f32's resolution of |z| and changes nothing.
 const FLAME_EPS: f32 = STRIPE_EPS;
 
 /// The z-flame's taper at |z|² = r2 (tapuwae's, from mandelbrot-exploder): 1 while |z|² ≤ 4, then (1 − t²)³ with t = (ln ln |z|² − ln(2 ln 2)) / ln ln bail, which for this bailout (2^16) is (log₂ log₂ |z|² − 1) / 3, from 0 at |z|² = 4 to 1 at the bailout, where the weight reaches 0 with its slope.
-/// Only the last few steps of an orbit pass |z|² = 4, so its two logarithms are rare; `orbit4_neon` takes it lane by lane from this same function.
+/// Only the last few steps of an orbit pass |z|² = 4, so on the CPU its two logarithms are rare.
+/// It tapers the z-flame's weight to nothing as the orbit nears the bailout, so the sums run on continuously where the escape step changes from pixel to pixel; without it the flames came out as blocky tiles (2026-11-07).
 #[inline]
-pub fn taper(r2: f32) -> f32 {
-    if r2 <= 4. {
-        return 1.;
-    }
-    let t = (libm::log2f(libm::log2f(r2)) - 1.) * (1. / 3.);
-    let u = 1. - t * t;
-    u * u * u
-}
-
-impl Flame {
-    /// One step at z = (x, y), |z|² = r2, the `i`-th (from 0). `orbit4`'s lanes take these operations in this order, so every lane's sums are `orbit`'s.
-    #[inline]
-    fn step(self, x: f32, y: f32, r2: f32, i: u32) -> Flame {
-        let inv = 1. / (libm::sqrtf(r2) + FLAME_EPS);
-        let inv2 = inv * inv;
-        let it = (i + 1) as f32;
-        let wt = it * it * taper(r2);
-        let wq = wt * inv;
-        Flame { q: [self.q[0] + x * wq, self.q[1] + y * wq], qw: self.qw + wt, c: [self.c[0] + x * inv2, self.c[1] - y * inv2], cw: self.cw + inv }
-    }
-    /// The flame at the escape, after `n` (the smooth count): (conj(fc) − fq)·ln(n)/2⁴, as tapuwae has it.
-    #[inline]
-    fn value(self, n: f32) -> [f32; 2] {
-        // An orbit escapes only after at least one step from the frame's view (it starts within a few units of the set, |z| < 256), so both weights are above zero.
-        let (fq, fc) = ([self.q[0] / self.qw, self.q[1] / self.qw], [self.c[0] / self.cw, self.c[1] / self.cw]);
-        let g = libm::logf(n) * (1. / (1 << 4) as f32);
-        [(fc[0] - fq[0]) * g, (-fc[1] - fq[1]) * g]
-    }
+pub fn taper<L: Lane>(r2: L) -> L {
+    let one = L::splat(1.);
+    pick::<L, L>(
+        r2.gt(L::splat(4.)),
+        || {
+            let t = (r2.log2().log2() - 1.) * (1. / 3.);
+            let u = one - t * t;
+            u * u * u
+        },
+        one,
+        L::select,
+    )
 }
 
 /// |dz|² past which dz is scaled down, and the scale (2^-32, exact).
@@ -504,183 +513,37 @@ const STRIPE_EPS: f32 = 1. / (1u128 << 100) as f32;
 
 /// sin 4·arg z = Im z⁴ / |z|⁴, without a trigonometric function.
 #[inline]
-fn stripe(x: f32, y: f32, xx: f32, yy: f32, r2: f32) -> f32 {
-    4. * x * y * (xx - yy) / (r2 * r2 + STRIPE_EPS)
+fn stripe<L: Lane>(x: L, y: L, xx: L, yy: L, r2: L) -> L {
+    x * 4. * y * (xx - yy) / (r2 * r2 + STRIPE_EPS)
 }
 
-/// The orbit that escaped after `i` steps at z = (x, y), with dz/dz₀ = (dx, dy)·2^e and the stripe sum over z₁ … z_{i−1}.
+/// The orbit that escaped in the state `s`: after `s.i` steps at z, with dz/dz₀ times its scale and the stripe sum over z₁ … z_{i−1}.
 #[inline]
-fn escaped(i: u32, x: f32, y: f32, dx: f32, dy: f32, e: i32, sum: f32, fl: Flame) -> Orbit {
-    let (xx, yy) = (x * x, y * y);
-    let r2 = xx + yy;
+fn escaped<L: Lane>(s: Step<L>) -> Orbit<L> {
+    let (x, y, dx, dy, xx, yy, r2, i) = (s.x, s.y, s.dx, s.dy, s.xx, s.yy, s.r2, s.i);
     // log₂|z|² > 16 here, so the count's log is of a value above 4 and its fraction 5 − log₂ log₂|z|² lies in [0, 1).
-    let l2 = libm::log2f(r2);
-    let frac = 5. - libm::log2f(l2);
-    let n = i as f32 + frac;
-    let dz = libm::sqrtf(dx * dx + dy * dy);
-    let d = libm::sqrtf(r2) * (0.5 * core::f32::consts::LN_2) * l2 / dz;
+    let l2 = r2.log2();
+    let frac = L::splat(5.) - l2.log2();
+    let n = i + frac;
+    let dz = (dx * dx + dy * dy).sqrt();
+    let d = r2.sqrt() * (0.5 * core::f32::consts::LN_2) * l2 / dz;
     // The average with this step's term and without it, each over a prior of two zero terms (so neither divides by zero): an orbit that escapes just past the bailout (fraction near 1) takes the first, one that escaped a step later from far out (fraction near 0) the second, and the two meet.
-    let all = sum + stripe(x, y, xx, yy, r2);
-    let with = all / (i + 2) as f32;
-    let without = sum / (i + 1) as f32;
-    // z / dz's direction, z·conj(dz) normalised (the scale 2^e does not turn it); both are far from zero here (|z| > 256, and dz has grown every step), so the length is never zero.
+    let all = s.sum + stripe(x, y, xx, yy, r2);
+    let with = all / (i + 2.);
+    let without = s.sum / (i + 1.);
+    // z / dz's direction, z·conj(dz) normalised (the scale does not turn it); both are far from zero here (|z| > 256, and dz has grown every step), so the length is never zero.
     let (ux, uy) = (x * dx + y * dy, y * dx - x * dy);
-    let um = libm::sqrtf(ux * ux + uy * uy);
-    Orbit { n, d: if e == 0 { d } else { libm::ldexpf(d, -e) }, s: without + (with - without) * frac, u: [ux / um, uy / um], f: fl.value(n) }
-}
-
-/// Four orbits side by side (four pixels of a row): every lane takes the same steps as `orbit`, and a lane that has escaped keeps its state while the others run on, so each lane's result is `orbit`'s.
-/// Four independent chains hide the multiply's latency, and the lanes map onto one NEON register.
-#[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
-#[inline]
-pub fn orbit4(zx: [f32; 4], zy: [f32; 4], cx: f32, cy: f32) -> [Orbit; 4] {
-    let (mut x, mut y) = (zx, zy);
-    let (mut dx, mut dy) = ([1f32; 4], [0f32; 4]);
-    let mut e = [0u32; 4];
-    let mut fl = [Flame::default(); 4];
-    let mut sum = [0f32; 4];
-    let mut i = [0u32; 4];
-    for k in 0..MAX_ITER {
-        let mut live = [false; 4];
-        for j in 0..4 {
-            live[j] = x[j] * x[j] + y[j] * y[j] <= R2;
-        }
-        if !(live[0] | live[1] | live[2] | live[3]) {
-            break;
-        }
-        for j in 0..4 {
-            let (xx, yy) = (x[j] * x[j], y[j] * y[j]);
-            let t = stripe(x[j], y[j], xx, yy, xx + yy);
-            let mut ndx = 2. * (x[j] * dx[j] - y[j] * dy[j]);
-            let mut ndy = 2. * (x[j] * dy[j] + y[j] * dx[j]);
-            let big = ndx * ndx + ndy * ndy > DZ_BIG;
-            // Multiplying by 1 is exact, so a lane that is not rescaled is unchanged, as in `orbit`.
-            let f = if big { DZ_SCALE } else { 1. };
-            ndx *= f;
-            ndy *= f;
-            let ny = 2. * x[j] * y[j] + cy;
-            let nx = xx - yy + cx;
-            let l = live[j];
-            // A live lane's step count is k, so `k > 0` is `orbit`'s `i > 0`.
-            sum[j] = if l && k > 0 { sum[j] + t } else { sum[j] };
-            // A live lane's step number is k, as `orbit`'s i.
-            fl[j] = if l { fl[j].step(x[j], y[j], xx + yy, k) } else { fl[j] };
-            x[j] = if l { nx } else { x[j] };
-            y[j] = if l { ny } else { y[j] };
-            dx[j] = if l { ndx } else { dx[j] };
-            dy[j] = if l { ndy } else { dy[j] };
-            e[j] += (l & big) as u32 * 32;
-            i[j] += l as u32;
-        }
-    }
-    finish4(x, y, dx, dy, e, sum, i, fl)
-}
-
-/// `orbit4` on NEON: the same steps in one register per quantity, each operation the lane-wise IEEE twin of the scalar one (fmul, fadd, fsub, fdiv, never a fused fmla; AArch64's vector floating point rounds exactly as its scalar does, under the same FPCR), so every lane is `orbit`'s result bit for bit.
-/// LLVM does not vectorise the portable form (its data-dependent exit and per-lane selects), so the lanes are written out.
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-#[inline]
-pub fn orbit4(zx: [f32; 4], zy: [f32; 4], cx: f32, cy: f32) -> [Orbit; 4] {
-    // SAFETY: the only requirement of a `target_feature` function is that the CPU has the feature, and this is compiled only where `neon` is part of the target itself (aarch64-unknown-none has it; every AArch64 core does).
-    unsafe { orbit4_neon(zx, zy, cx, cy) }
-}
-
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-#[target_feature(enable = "neon")]
-fn orbit4_neon(zx: [f32; 4], zy: [f32; 4], cx: f32, cy: f32) -> [Orbit; 4] {
-    use core::arch::aarch64::*;
-    let lanes = |a: [f32; 4]| {
-        let v = vdupq_n_f32(a[0]);
-        let v = vsetq_lane_f32::<1>(a[1], v);
-        let v = vsetq_lane_f32::<2>(a[2], v);
-        vsetq_lane_f32::<3>(a[3], v)
-    };
-    let get = |v: float32x4_t| [vgetq_lane_f32::<0>(v), vgetq_lane_f32::<1>(v), vgetq_lane_f32::<2>(v), vgetq_lane_f32::<3>(v)];
-    let (mut x, mut y) = (lanes(zx), lanes(zy));
-    let (cxv, cyv) = (vdupq_n_f32(cx), vdupq_n_f32(cy));
-    let (two, four, one) = (vdupq_n_f32(2.), vdupq_n_f32(4.), vdupq_n_f32(1.));
-    let (r2max, big, scale, eps) = (vdupq_n_f32(R2), vdupq_n_f32(DZ_BIG), vdupq_n_f32(DZ_SCALE), vdupq_n_f32(STRIPE_EPS));
-    let (mut dx, mut dy) = (one, vdupq_n_f32(0.));
-    let mut sum = vdupq_n_f32(0.);
-    let mut e = vdupq_n_u32(0);
-    let mut i = vdupq_n_u32(0);
-    // The flame's sums (`Flame`), lane by lane.
-    let epsv = vdupq_n_f32(FLAME_EPS);
-    let (mut q0, mut q1, mut qw) = (vdupq_n_f32(0.), vdupq_n_f32(0.), vdupq_n_f32(0.));
-    let (mut c0, mut c1, mut cw) = (vdupq_n_f32(0.), vdupq_n_f32(0.), vdupq_n_f32(0.));
-    for k in 0..MAX_ITER {
-        let xx = vmulq_f32(x, x);
-        let yy = vmulq_f32(y, y);
-        let r2 = vaddq_f32(xx, yy);
-        let live = vcleq_f32(r2, r2max);
-        if vmaxvq_u32(live) == 0 {
-            break;
-        }
-        if k > 0 {
-            let t = vdivq_f32(vmulq_f32(vmulq_f32(vmulq_f32(four, x), y), vsubq_f32(xx, yy)), vaddq_f32(vmulq_f32(r2, r2), eps));
-            sum = vbslq_f32(live, vaddq_f32(sum, t), sum);
-        }
-        // `Flame::step`, operation for operation: a live lane's step number is k.
-        let inv = vdivq_f32(one, vaddq_f32(vsqrtq_f32(r2), epsv));
-        let inv2 = vmulq_f32(inv, inv);
-        let it = vdupq_n_f32((k + 1) as f32);
-        // The taper lane by lane from `taper` itself, and only on a step where some lane is past |z|² = 4 (it is 1 everywhere else).
-        let tp = if vmaxvq_u32(vcgtq_f32(r2, four)) == 0 {
-            one
-        } else {
-            let r = get(r2);
-            lanes([taper(r[0]), taper(r[1]), taper(r[2]), taper(r[3])])
-        };
-        let wt = vmulq_f32(vmulq_f32(it, it), tp);
-        let wq = vmulq_f32(wt, inv);
-        q0 = vbslq_f32(live, vaddq_f32(q0, vmulq_f32(x, wq)), q0);
-        q1 = vbslq_f32(live, vaddq_f32(q1, vmulq_f32(y, wq)), q1);
-        qw = vbslq_f32(live, vaddq_f32(qw, wt), qw);
-        c0 = vbslq_f32(live, vaddq_f32(c0, vmulq_f32(x, inv2)), c0);
-        c1 = vbslq_f32(live, vsubq_f32(c1, vmulq_f32(y, inv2)), c1);
-        cw = vbslq_f32(live, vaddq_f32(cw, inv), cw);
-        let ndx = vmulq_f32(two, vsubq_f32(vmulq_f32(x, dx), vmulq_f32(y, dy)));
-        let ndy = vmulq_f32(two, vaddq_f32(vmulq_f32(x, dy), vmulq_f32(y, dx)));
-        let bigm = vcgtq_f32(vaddq_f32(vmulq_f32(ndx, ndx), vmulq_f32(ndy, ndy)), big);
-        let f = vbslq_f32(bigm, scale, one);
-        let ny = vaddq_f32(vmulq_f32(vmulq_f32(two, x), y), cyv);
-        let nx = vaddq_f32(vsubq_f32(xx, yy), cxv);
-        x = vbslq_f32(live, nx, x);
-        y = vbslq_f32(live, ny, y);
-        dx = vbslq_f32(live, vmulq_f32(ndx, f), dx);
-        dy = vbslq_f32(live, vmulq_f32(ndy, f), dy);
-        e = vaddq_u32(e, vandq_u32(vandq_u32(bigm, live), vdupq_n_u32(32)));
-        // A live lane's mask is all ones, −1 as an integer: subtracting it counts the step.
-        i = vsubq_u32(i, live);
-    }
-    let geti = |v: uint32x4_t| [vgetq_lane_u32::<0>(v), vgetq_lane_u32::<1>(v), vgetq_lane_u32::<2>(v), vgetq_lane_u32::<3>(v)];
-    let (q0, q1, qw, c0, c1, cw) = (get(q0), get(q1), get(qw), get(c0), get(c1), get(cw));
-    let fl = core::array::from_fn(|j| Flame { q: [q0[j], q1[j]], qw: qw[j], c: [c0[j], c1[j]], cw: cw[j] });
-    finish4(get(x), get(y), get(dx), get(dy), geti(e), get(sum), geti(i), fl)
-}
-
-/// Each lane's result from its final state, as `orbit` gives it.
-#[inline]
-fn finish4(x: [f32; 4], y: [f32; 4], dx: [f32; 4], dy: [f32; 4], e: [u32; 4], sum: [f32; 4], i: [u32; 4], fl: [Flame; 4]) -> [Orbit; 4] {
-    let mut out = [INSIDE_ORBIT; 4];
-    for j in 0..4 {
-        let r2 = x[j] * x[j] + y[j] * y[j];
-        if r2 > R2 {
-            out[j] = escaped(i[j], x[j], y[j], dx[j], dy[j], e[j] as i32, sum[j], fl[j]);
-        }
-    }
-    out
+    let um = (ux * ux + uy * uy).sqrt();
+    // The flame at the escape: (conj(fc) − fq)·ln(n)/2⁴, as tapuwae has it. An orbit escapes only after at least one step from the frame's view (it starts within a few units of the set, |z| < 256), so both weights are above zero.
+    let (fq, fc) = ([s.q0 / s.qw, s.q1 / s.qw], [s.c0 / s.cw, s.c1 / s.cw]);
+    let g = n.ln() * (1. / (1 << 4) as f32);
+    Orbit { n, d: d * s.sc, s: without + (with - without) * frac, u: [ux / um, uy / um], f: [(fc[0] - fq[0]) * g, (-fc[1] - fq[1]) * g] }
 }
 
 /// A C∞ step from 0 to 1, the algebraic sigmoid: ½ + ½·x/√(1 + x²).
 #[inline]
-fn sig(x: f32) -> f32 {
-    0.5 + 0.5 * x / libm::sqrtf(1. + x * x)
-}
-
-#[inline]
-fn lerp(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
-    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+fn sig<L: Lane>(x: L) -> L {
+    x * 0.5 / (x * x + 1.).sqrt() + 0.5
 }
 
 /// A frame's constants, worked out once per call.
@@ -703,99 +566,97 @@ impl<'a> Frame<'a> {
         Frame { p, half: [p.width as f32 * 0.5, p.height as f32 * 0.5], span: span(p.width, p.height), views: [(p.centre, p.step, ds(p.step)), (p.far_centre, p.far_step, ds(p.far_step))] }
     }
 
-    /// The plane under pixel (x, y) in view `v`.
-    #[inline]
-    fn z(&self, v: usize, x: usize, y: usize) -> (f32, f32) {
-        self.z_at(v, x as f32 + 0.5 - self.half[0], y as f32 + 0.5 - self.half[1])
-    }
-
     /// The plane in view `v` at (fx, fy) pixels from the frame's centre (any fraction: the refining pass samples inside a pixel).
     #[inline]
-    fn z_at(&self, v: usize, fx: f32, fy: f32) -> (f32, f32) {
+    fn z_at<L: Lane>(&self, v: usize, fx: L, fy: L) -> (L, L) {
         let (centre, step, _) = self.views[v];
-        (centre[0] + fx * step[0] - fy * step[1], centre[1] + fx * step[1] + fy * step[0])
+        (fx * step[0] + centre[0] - fy * step[1], fx * step[1] + centre[1] + fy * step[0])
     }
 
-    /// Row y's orbits in view `v`, each handed to `f` with its column: four pixels at a time through `orbit4`, any left over one at a time through `orbit` (the same values).
+    /// The far layer's weight at (fx, fy) pixels from the frame's centre: its soft glow, 1 / (1 + t²) with t the far view's distance in its spans, times FAR_INV.
     #[inline]
-    fn each(&self, v: usize, y: usize, mut f: impl FnMut(usize, Orbit)) {
-        let p = self.p;
-        let quads = p.width / 4;
-        for q in 0..quads {
-            let x0 = q * 4;
-            let mut zx = [0f32; 4];
-            let mut zy = [0f32; 4];
-            for j in 0..4 {
-                (zx[j], zy[j]) = self.z(v, x0 + j, y);
-            }
-            let o = orbit4(zx, zy, p.c[0], p.c[1]);
-            for j in 0..4 {
-                f(x0 + j, o[j]);
-            }
-        }
-        for x in quads * 4..p.width {
-            let (zx, zy) = self.z(v, x, y);
-            f(x, orbit(zx, zy, p.c[0], p.c[1]));
-        }
+    fn far<L: Lane>(&self, fx: L, fy: L) -> L {
+        let (zx, zy) = self.z_at(FAR_VIEW, fx, fy);
+        let t = orbit(zx, zy, self.p.c[0], self.p.c[1]).d * self.views[FAR_VIEW].2 * FAR_INV;
+        L::splat(1.) / (t * t + 1.)
     }
 
-    /// Row y into `line`, in two passes over the row: the far layer's weight first, kept in each pixel's slot (its f32's bits) until the near pass reads it as it colours the pixel.
-    fn row(&self, y: usize, line: &mut [u64]) {
-        let far_ds = self.views[FAR_VIEW].2;
-        self.each(FAR_VIEW, y, |x, o| {
-            let t = o.d * far_ds * FAR_INV;
-            line[x] = (1. / (1. + t * t)).to_bits() as u64;
-        });
-        self.each(NEAR_VIEW, y, |x, o| line[x] = pack(self.colour(x as f32 + 0.5 - self.half[0], y as f32 + 0.5 - self.half[1], o, f32::from_bits(line[x] as u32))));
+    /// The first pass's pixel, one sample at its centre (fx, fy pixels from the frame's centre): the far layer's weight, then the near orbit coloured.
+    #[inline]
+    fn pixel<L: Lane>(&self, fx: L, fy: L) -> [L; 3] {
+        let far = self.far(fx, fy);
+        let (zx, zy) = self.z_at(NEAR_VIEW, fx, fy);
+        self.colour(fx, fy, orbit(zx, zy, self.p.c[0], self.p.c[1]), far)
     }
 
-    /// Pixel (x, y)'s linear light, from its near orbit and the far layer's weight there.
+    /// The refining pass's pixel at column x and row y: the mean of REFINE × REFINE samples spread evenly across it, of working codes as the layers are mixed. The far layer is a soft glow, so it is sampled once at the pixel's centre.
+    #[inline]
+    fn refined<L: Lane>(&self, x: L, y: L) -> [L; 3] {
+        let far = self.far(x + 0.5 - self.half[0], y + 0.5 - self.half[1]);
+        let zero = L::splat(0.);
+        let mut sum = [zero; 3];
+        for j in 0..REFINE {
+            let fy = y + (j as f32 + 0.5) / REFINE as f32 - self.half[1];
+            for i in 0..REFINE {
+                let fx = x + (i as f32 + 0.5) / REFINE as f32 - self.half[0];
+                let (zx, zy) = self.z_at(NEAR_VIEW, fx, fy);
+                let c = self.colour(fx, fy, orbit(zx, zy, self.p.c[0], self.p.c[1]), far);
+                sum = [sum[0] + c[0], sum[1] + c[1], sum[2] + c[2]];
+            }
+        }
+        let n = (REFINE * REFINE) as f32;
+        [sum[0] / n, sum[1] / n, sum[2] / n]
+    }
+
+    /// Pixel (fx, fy)'s working codes, from its near orbit and the far layer's weight there.
     /// Front to back (owner's rule, AGENT.md "Compositing: Front to Back, `under` Only"): each layer a colour at its weight α, taking its share of the light that is still uncovered (`t`), which it then covers by α; the frontmost goes first: the warm sparks, the white-hot core, the filament, the sheen, the halo, the flame's glow, the far layer, the field's shade, and the background last, opaque, so every pixel's light is a convex sum of the palette's.
     #[inline]
-    fn colour(&self, fx: f32, fy: f32, o: Orbit, far: f32) -> [f32; 3] {
+    fn colour<L: Lane>(&self, fx: L, fy: L, o: Orbit<L>, far: L) -> [L; 3] {
         let p = self.p;
-        let v = (libm::log2f(1. + o.n) - p.l_lo) * p.l_inv;
+        let one = L::splat(1.);
+        let v = ((o.n + 1.).log2() - p.l_lo) * p.l_inv;
         let ds = o.d * self.views[NEAR_VIEW].2;
-        let map = |t: f32| gmap(&p.stops, t);
+        let map = |t: L| gmap(&p.stops, t);
+        let konst = |c: [f32; 3]| [L::splat(c[0]), L::splat(c[1]), L::splat(c[2])];
         // The lamp on the relief: Lambert, smooth, and the sheen where the relief faces it.
         let l = o.u[0] * p.lamp[0] + o.u[1] * p.lamp[1];
         let lam = (l + LAMP_H) * (1. / (1. + LAMP_H));
         let s = (l + 1.) * 0.5;
         let (s2, s4) = (s * s, s * s * s * s);
         let sheen = s4 * s4 * s2 * s2 * s4;
-        let lit = |c: [f32; 3], k: f32| [c[0] * k, c[1] * k, c[2] * k];
-        let mut acc = [0f32; 3];
-        let mut t = 1f32;
-        let mut put = |c: [f32; 3], a: f32| {
+        let lit = |c: [L; 3], k: L| [c[0] * k, c[1] * k, c[2] * k];
+        let mut acc = [L::splat(0.); 3];
+        let mut t = one;
+        let mut put = |c: [L; 3], a: L| {
             let w = a * t;
             acc = [acc[0] + c[0] * w, acc[1] + c[1] * w, acc[2] + c[2] * w];
-            t *= 1. - a;
+            t = t * (one - a);
         };
         let slow = sig((v - SHADE_V) * SHADE_K);
         let tw = ds * WARM_INV;
-        put(p.warm, sig((v - WARM_V) * WARM_K) / (1. + tw * tw));
+        put(konst(p.warm), sig((v - WARM_V) * WARM_K) / (tw * tw + 1.));
         let tc = ds * CORE_INV;
-        let core = 1. / (1. + tc * tc);
+        let core = one / (tc * tc + 1.);
         let core = core * core;
-        put(p.hot, core * sig((v - HOT_V) * HOT_K));
-        put(lit(map(1.), lam), FIL_A * core);
+        put(konst(p.hot), core * sig((v - HOT_V) * HOT_K));
+        put(lit(map(one), lam), core * FIL_A);
         let th = ds * HALO_INV;
-        let near_halo = 1. / (1. + th * th);
-        put(p.hot, SHEEN_A * sheen * near_halo);
-        put(lit(map(HALO_T[0] + (HALO_T[1] - HALO_T[0]) * slow), AMBIENT + (1. - AMBIENT) * lam), HALO_A * near_halo);
+        let near_halo = one / (th * th + 1.);
+        put(konst(p.hot), sheen * SHEEN_A * near_halo);
+        put(lit(map(slow * (HALO_T[1] - HALO_T[0]) + HALO_T[0]), lam * (1. - AMBIENT) + AMBIENT), near_halo * HALO_A);
         let tg = ds * GLOW_INV;
         let rays = sig((o.s - RAYS_MID) * RAYS_K);
         // The flame's glow is not lit: far from the set the potential's gradient spins round its critical points, and lit it drew small dark stars in the open field.
-        put(map(RAYS_T[0] + (RAYS_T[1] - RAYS_T[0]) * rays), RAYS_A * rays / (1. + tg * tg));
-        put(map(FAR_T[0] + (FAR_T[1] - FAR_T[0]) * far), FAR_A * far);
+        put(map(rays * (RAYS_T[1] - RAYS_T[0]) + RAYS_T[0]), rays * RAYS_A / (tg * tg + 1.));
+        put(map(far * (FAR_T[1] - FAR_T[0]) + FAR_T[0]), far * FAR_A);
         // The field, opaque, last: the map's dark end, by the background's seeded gradient and where escape is slow.
         // The soft flame on the field: its hue wave moves where the field reads the map, its lightness wave darkens it, both fading in away from the set.
         let px = ds * self.span;
         let fade = px * px / (px * px + FLAME_FADE * FLAME_FADE);
-        let hue_wave = libm::sinf(o.f[0] * FLAME_F * TAU) * FLAME_T * fade;
-        let dark = 1. - FLAME_L * (0.5 + 0.5 * libm::sinf(o.f[1] * FLAME_F * TAU)) * fade;
+        let hue_wave = (o.f[0] * FLAME_F).sin_turns() * FLAME_T * fade;
+        let dark = one - ((o.f[1] * FLAME_F).sin_turns() * 0.5 + 0.5) * FLAME_L * fade;
         let pos = sig(fx * p.grad[0] + fy * p.grad[1]);
-        put(lit(map(FIELD_T * (pos + SHADE_A * slow) * (1. / (1. + SHADE_A)) + hue_wave), dark), 1.);
+        put(lit(map((pos + slow * SHADE_A) * FIELD_T * (1. / (1. + SHADE_A)) + hue_wave), dark), one);
         acc
     }
 }
@@ -807,14 +668,15 @@ fn codes(c: [f32; 3]) -> [f32; 3] {
 
 /// The density gradient map at `t` (0 the dark end, 1 the light): each stop weighted by a Cauchy bump about its place, the weights normalised, so the colour is a convex sum of the stops' and C∞ in t.
 #[inline]
-fn gmap(stops: &[[f32; 3]; STOPS], t: f32) -> [f32; 3] {
-    let mut c = [0f32; 3];
-    let mut sum = 0f32;
+fn gmap<L: Lane>(stops: &[[f32; 3]; STOPS], t: L) -> [L; 3] {
+    let zero = L::splat(0.);
+    let mut c = [zero; 3];
+    let mut sum = zero;
     for (k, s) in stops.iter().enumerate() {
         let d = (t - k as f32 * (1. / (STOPS - 1) as f32)) * GM_K;
-        let w = 1. / (1. + d * d);
-        c = [c[0] + s[0] * w, c[1] + s[1] * w, c[2] + s[2] * w];
-        sum += w;
+        let w = L::splat(1.) / (d * d + 1.);
+        c = [c[0] + w * s[0], c[1] + w * s[1], c[2] + w * s[2]];
+        sum = sum + w;
     }
     [c[0] / sum, c[1] / sum, c[2] / sum]
 }
@@ -1021,37 +883,55 @@ pub fn survey(p: &Params) -> Survey {
     survey_with(p, &Knobs::DEFAULT)
 }
 
-/// Looks at a candidate at a sixteenth of its size, "near the set" within `k.near_span` of a span.
+/// Looks at a candidate at a sixteenth of its size, "near the set" within `k.near_span` of a span: each preview pixel's orbit on the CPU, tallied (`tally`).
 pub fn survey_with(p: &Params, k: &Knobs) -> Survey {
-    let (w, h) = (p.width / PREVIEW, p.height / PREVIEW);
+    let q = preview(p);
+    let f = Frame::new(&q);
+    tally(p, k, |emit| {
+        for y in 0..q.height {
+            for x in 0..q.width {
+                let (zx, zy) = f.z_at(NEAR_VIEW, x as f32 + 0.5 - f.half[0], y as f32 + 0.5 - f.half[1]);
+                let o = orbit(zx, zy, p.c[0], p.c[1]);
+                emit(x, y, o.n, o.d);
+            }
+        }
+    })
+}
+
+/// A candidate's frame at a sixteenth of its size, which the survey looks at: one preview pixel per PREVIEW × PREVIEW of the frame, the same views at PREVIEW times the step.
+pub fn preview(p: &Params) -> Params {
     let mut q = *p;
-    q.width = w;
-    q.height = h;
+    q.width = p.width / PREVIEW;
+    q.height = p.height / PREVIEW;
     q.step = [p.step[0] * PREVIEW as f32, p.step[1] * PREVIEW as f32];
     q.far_step = [p.far_step[0] * PREVIEW as f32, p.far_step[1] * PREVIEW as f32];
+    q
+}
+
+/// What a sixteenth-scale look at `p` found, from every preview pixel's column, row, smooth count and distance, as `samples` hands them to the function it is given: the CPU's orbits (`survey_with`) or the GPU's read back (`gpu::survey_kernel`, wallgen). How much of the frame lies near the set, in the whole and in each third along its long side; how much never escapes; and log₂(1 + n)'s median and 99th percentile from a histogram of the escaped.
+pub fn tally(p: &Params, k: &Knobs, samples: impl FnOnce(&mut dyn FnMut(usize, usize, f32, f32))) -> Survey {
+    let q = preview(p);
+    let (w, h) = (q.width, q.height);
     let f = Frame::new(&q);
     let near_d = k.near_span / f.views[NEAR_VIEW].2;
     let lmax = libm::log2f((MAX_ITER + 2) as f32);
-    // An escaped count is below MAX_ITER + 1, so its bin is below BINS; the extra bin takes a value that rounds up to the top edge, so no index is ever out of range.
+    // An escaped count is below MAX_ITER + 1, so its bin is below BINS; the extra bin takes a value that rounds up to the top edge, so no index is ever out of range. A count from the GPU is held to the same: one above MAX_ITER is counted inside, and a NaN's bin is 0 (`as usize`).
     let mut hist = [0u32; BINS + 1];
     let mut thirds = [0u32; 3];
     let (mut near, mut inside, mut outside) = (0u32, 0u32, 0u32);
     let long = if h >= w { h } else { w };
-    for y in 0..h {
-        f.each(NEAR_VIEW, y, |x, o| {
-            let (n, d) = (o.n, o.d);
-            if d < near_d {
-                near += 1;
-                thirds[if h >= w { y } else { x } * 3 / long] += 1;
-            }
-            if n > MAX_ITER as f32 {
-                inside += 1;
-            } else {
-                outside += 1;
-                hist[(libm::log2f(1. + n) / lmax * BINS as f32) as usize] += 1;
-            }
-        });
-    }
+    samples(&mut |x, y, n, d| {
+        if d < near_d {
+            near += 1;
+            thirds[if h >= w { y } else { x } * 3 / long] += 1;
+        }
+        if n > MAX_ITER as f32 {
+            inside += 1;
+        } else {
+            outside += 1;
+            hist[(libm::log2f(1. + n) / lmax * BINS as f32) as usize] += 1;
+        }
+    });
     let total = (w * h) as f32;
     let pct = |frac: f32| -> f32 {
         let want = frac * outside as f32;
@@ -1088,28 +968,6 @@ pub fn seed_of(n: u64) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `orbit4` (on this target's path) agrees with `orbit` bit for bit, across escaping, slow and interior points.
-    #[test]
-    fn lanes_match_scalar() {
-        let cs = [(-0.835f32, -0.2321f32), (0.285, 0.01), (-0.12, 0.75), (-0.75, 0.11), (0.3773, 0.1933), (-1.2, 0.)];
-        let bits = |o: Orbit| (o.n.to_bits(), o.d.to_bits(), o.s.to_bits(), o.u[0].to_bits(), o.u[1].to_bits(), o.f[0].to_bits(), o.f[1].to_bits());
-        for &(cx, cy) in &cs {
-            for k in 0..(1 << 12) {
-                let mut zx = [0f32; 4];
-                let mut zy = [0f32; 4];
-                for j in 0..4 {
-                    let t = (k * 4 + j) as f32;
-                    zx[j] = -1.6 + 3.2 * libm::fmodf(t * 0.618_034, 1.);
-                    zy[j] = -1.2 + 2.4 * libm::fmodf(t * 0.754_877_7, 1.);
-                }
-                let o = orbit4(zx, zy, cx, cy);
-                for j in 0..4 {
-                    assert_eq!(bits(o[j]), bits(orbit(zx[j], zy[j], cx, cy)), "c {cx} {cy} z {} {}", zx[j], zy[j]);
-                }
-            }
-        }
-    }
 
     /// Every palette colour, turned to any of 4096 hues round the whole circle (and the warm sparks past it by their jitter), stays a real colour: no negative cone response, every channel within black and white; and its lightness J is unchanged.
     #[test]
