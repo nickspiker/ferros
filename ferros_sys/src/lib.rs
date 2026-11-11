@@ -105,6 +105,15 @@ pub mod arc {
         let (a, b) = call(2, 0);
         (a as usize, b as usize)
     }
+
+    /// Give back the 2 MiB frames wholly inside `len` bytes from arc offset `off` while the arc keeps its size (kernel ARC_RELEASE, docs/ARCS.md step 4): what a process no longer needs in the middle of its arc (ahau's attest mark after attest). Those bytes must never be touched again (a fault ends the process) until a grow over them; no syscall buffer may lie there. Never the arc's first frame. Ok(the bytes given back), Err(the reason).
+    pub fn release(off: u64, len: usize) -> Result<usize, u64> {
+        let (a, b): (u64, u64);
+        compiler_fence(Ordering::SeqCst);
+        unsafe { asm!("svc #0", inlateout("x0") 3u64 => a, inlateout("x1") off => b, in("x2") len as u64, in("x8") nr::ARC, options(nostack)) };
+        compiler_fence(Ordering::SeqCst);
+        if a == ERR { Err(b) } else { Ok(a as usize) }
+    }
 }
 
 /// The clock's zone (kernel zone.rs, SYS_ZONE; docs/TIME.md; owner, 2026-11-10): the identity's choice and this device's own, each automatic (the zone found from the cellular network, then GPS) or by hand (an IANA id), and the switch that says which rules.
