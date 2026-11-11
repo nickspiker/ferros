@@ -311,8 +311,12 @@ pub fn arc_alloc(bytes: usize, masked: bool) -> Option<Arc> {
     Some(Arc { base, size: want, block: want, guard: GUARD, limit: 0 })
 }
 
+/// Arcs returned to the pools so far: a spawn refused for want of room is tried again only once this has moved (service.rs, the installer after attest), never on a timer.
+pub static ARC_FREES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Return an arc to its pool, merging buddies; a masked arc's guard goes back with it.
 pub fn arc_free(arc: Arc) {
+    ARC_FREES.fetch_add(1, core::sync::atomic::Ordering::Release);
     // Whatever the process held is gone with it: the kernel wipes the arc as it reclaims it, so no process wipes its own secrets on its way out (owner, 2026-11-08: every end is one shot dead, no cleanup; the arc was zeroed only when handed out again until then).
     // After the reset: the grants page and the code are read-only until it returns the arc to writable data.
     crate::cachemap::arc_reset(arc.base, arc.block);

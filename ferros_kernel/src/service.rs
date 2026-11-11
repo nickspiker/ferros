@@ -1752,6 +1752,8 @@ pub fn run(mut b: Boot) -> ! {
     let mut gps_started = false;
     // The installer (payloads/kists) started for the person present, as GPS is.
     let mut kists_started = false;
+    // ARC_FREES when the installer's spawn was last refused for want of an arc (the 8a, 2026-11-10: "arc pool exhausted" at attest, beside the wallpaper's start, and no installer for the rest of the boot): tried again once an arc has come back since.
+    let mut kists_refused_at: Option<u64> = None;
     // The panel's VCI as ABL or Android left it (SYS_FACTS 81): the display server reads it to know a panel it must power up (state B).
     crate::panel_power::read_state();
     // The display engine fenced to its own regions when the DPU is up already (ABL's splash, or a jump from a lit Android); a DPU that is down is fenced by the `dpu` switch as it powers it (s2mpu::fence_dpu). Before init starts the display server, so it never runs unfenced.
@@ -1815,15 +1817,22 @@ pub fn run(mut b: Boot) -> ! {
         // GPS switched on, a person attested, and no driver running: started once each time a person is in (no one in, the next attest may start it again). Nothing else started it: init's page has no room for its grants, and the switch above only acts on a change, so a GPS left on was never driven (2026-11-08).
         let person = store.as_ref().is_some_and(|s| s.unlocked());
         // The installer (payloads/kists), once each time a person is in, as GPS below: it serves the map's Kists page and fetches back the capsules a restored list names. Its grants are its own (`kists_grants`), init's page being full.
+        let frees = crate::process::ARC_FREES.load(core::sync::atomic::Ordering::Acquire);
         if !person {
             kists_started = false;
-        } else if !kists_started {
+            kists_refused_at = None;
+        } else if !kists_started && kists_refused_at != Some(frees) {
             kists_started = true;
             let running = crate::process::with_lock(|| crate::process::named_alive_locked(&[b"kists"])) != 0;
             if !running {
                 let mut rep = alloc::vec::Vec::new();
                 restart(&mut store, b"kists", &mut rep);
                 crate::flashlog::line(&alloc::format!("kists after attest: {}", core::str::from_utf8(&rep).unwrap_or("").trim_end()));
+                // Refused for room, and only that (an installer that started and died is not tried again): the next arc back (a process ending) brings another try.
+                if rep.windows(18).any(|w| w == b"arc pool exhausted") {
+                    kists_started = false;
+                    kists_refused_at = Some(frees);
+                }
             }
         }
         if !person {
