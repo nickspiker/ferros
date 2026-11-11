@@ -978,6 +978,12 @@ fn kists_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![Use(b"udp"), Store(b"capsules"), Store(b"kists"), Serve(b"kists"), Use(b"fgtw"), Install]
 }
 
+/// The torch's grants in its slot order (payloads/torch, docs/TORCH.md): 1 serve torch, 2 hsi2c_14 (the LM3644's bus), 3 the `torch` switch. Its own list, as the GPS driver's: init's page is full, and the kernel starts it when a call on `torch` finds no server (process.rs `ON_DEMAND`).
+fn torch_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
+    use crate::process::Grant::*;
+    alloc::vec![Serve(b"torch"), Hardware(b"hsi2c14"), Power(b"torch")]
+}
+
 /// Each shell process's capabilities, as init hands them out (payloads/init: the slots of `home_grants`, 1-based), for restarting one from the vault without a reboot.
 fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'static>>> {
     if name == b"vault" {
@@ -991,6 +997,9 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
     }
     if name == b"gpu" {
         return Some(gpu_grants());
+    }
+    if name == b"torch" {
+        return Some(torch_grants());
     }
     let slots: &[usize] = match name {
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
@@ -1898,6 +1907,22 @@ pub fn run(mut b: Boot) -> ! {
             let powered_down = killed && crate::gps::power(false);
             crate::flashlog::line(&alloc::format!("gps unclaimed: driver {}, power {}", if killed { "stopped" } else { "was not running" }, if powered_down { "down" } else { "left" }));
         }
+        // Servers started on demand (process.rs ON_DEMAND: the torch): a call found none receiving, so one is started from its capsule; the call waits for it (a live call has had its ERR already, and the next one finds it). Already alive (spawned, not yet at its first receive) is left alone. One that cannot start answers its waiting calls ERR, so none waits on a server that is not coming, and is tried again at the next call.
+        let wanted = crate::process::on_demand_take();
+        for (i, name) in crate::process::ON_DEMAND.iter().enumerate() {
+            if wanted >> i & 1 == 0 || crate::process::with_lock(|| crate::process::named_alive_locked(&[name])) != 0 {
+                continue;
+            }
+            let mut rep = alloc::vec::Vec::new();
+            restart(&mut store, name, &mut rep);
+            let nm = core::str::from_utf8(name).unwrap_or("?");
+            if rep.starts_with(name) && rep.ends_with(b" started\n") {
+                crate::flashlog::line(&alloc::format!("{nm} started on demand"));
+            } else {
+                let n = crate::process::with_lock(|| crate::process::on_demand_refuse_locked(name));
+                crate::flashlog::line(&alloc::format!("{nm} on demand: not started ({}); A#{n} waiting calls answered ERR", core::str::from_utf8(&rep).unwrap_or("").trim_end()));
+            }
+        }
         // Released (a completed departure): restart, so the device comes back at the attest screen with nothing of the identity left.
         // First the person's domains in the vault process are dropped, a call a pass through the kernel's channel (none while a bridge command holds it); a drop that fails, or no vault to send it to, is logged and the restart goes ahead: the renewed device-only secret already makes those entries unopenable.
         #[cfg(not(ferros_production))]
@@ -2250,6 +2275,12 @@ pub fn run(mut b: Boot) -> ! {
                 // Development tools: not in a production build at all (FERROS_PRODUCTION=1, build.rs), which answers only the plain DIAG below and a reboot.
                 #[cfg(not(ferros_production))]
                 {
+                // hsi2c_14 has one owner (torch.rs): while the `torch` switch is on it is the torch process's, so the camera tools, whose PMIC is on it, refuse. Every `cam` tool, not only the ones that touch that bus: one rule a person can hold in their head.
+                if cmd.params.starts_with(b"cam") && crate::torch::held() {
+                    resp.extend_from_slice(b"refused: the torch holds hsi2c_14, the camera PMIC's bus (torch.rs); turn the torch off (`[0, 0]` to `torch`) or `diag \"kill torch\"` first\n");
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 // The camera's power domain is gated after boot (pd.rs; the TPU's too, its tools gone 2026-11-01). Its diags refuse while they are: bringing a domain back without Linux's saved CMU registers is not yet trusted (a TPU on/off by hand preceded a reset in the next power window, 2026-10-25). `diag pd on <name>` does it by hand.
                 if let Some(name) = if cmd.params.starts_with(b"cam") { Some("ispfe") } else { None } {
                     if !crate::pd::is_on(name) {
