@@ -930,16 +930,16 @@ pub fn wallgen_after_unlock(seed: [u8; 32]) {
     unsafe { WALLGEN_SEED = Some(seed) };
 }
 
-/// wallgen (payloads/wallgen) with the person's wallpaper seed as its input, from its capsule in the kernel's vault: it makes their wallpaper once on this device and keeps it in their space, or ends at once if it already has. 1 the vault scope `map.`, 2 use display. Started from the service loop, after an unlock (an unlock is a syscall, under the kernel's lock: no spawn there).
+/// wallgen (payloads/wallgen) with the person's wallpaper seed as its input, from its capsule in the kernel's vault: it makes their wallpaper once on this device, on the GPU, and keeps it in their space, or ends at once if it already has. 1 the vault scope `map.`, 2 use display, 3 use gpu, 4 the layer arena (GPU-KISTS.md plan step 0: the picture drawn only by the GPU service, in wallgen's region of the arena). Started from the service loop, after an unlock (an unlock is a syscall, under the kernel's lock: no spawn there).
 fn spawn_wallgen(store: &mut Option<ShimStore>, seed: &[u8; 32]) {
     // Under the kernel lock, as every UFS command must be: the vault process drives the same controller from the workers (SYS_BLOCK), and a read outside the lock collided with its moves at an attest and wedged the link (2026-11-07).
     let Some(capsule) = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("wallgen").ok().flatten())) else {
-        crate::process::push_console(b"home: no wallgen capsule in the vault; the display draws the wallpaper at every attest\n");
+        crate::process::push_console(b"home: no wallgen capsule in the vault; no wallpaper is made (the display draws none itself)\n");
         return;
     };
     let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
     use crate::process::Grant::*;
-    match crate::process::spawn_capsule(b"wallgen", &capsule, seed, &[Store(b"map"), Use(b"display")], &sealed) {
+    match crate::process::spawn_capsule(b"wallgen", &capsule, seed, &[Store(b"map"), Use(b"display"), Use(b"gpu"), Dma(b"layers")], &sealed) {
         Ok(o) => {
             mark_ran(&o);
             crate::process::push_console(&o.console);
