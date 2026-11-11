@@ -4,12 +4,13 @@
 //! What the seed chooses (`candidate`):
 //! - c, the Julia constant, just outside the Mandelbrot set, where the Julia set is a lace of spiralling dendrites: either a small step out from the main cardioid's boundary, c = e^{iθ}/2 − e^{2iθ}/4 + ε·n̂ (n̂ the outward normal), or out from the period-2 bulb's, c = −1 + (1 + ε)·e^{iφ}/4, conjugated half the time.
 //!   Inside the set the picture would carry filled blobs, and far outside it thins to dust; the ranges keep it in the lace.
-//! - The view: a point of the Julia set (the β fixed point taken back through a seeded run of preimages), pulled a seeded way toward the set's centre, a seeded size and a seeded turn.
+//! - The view: a point of the Julia set (the β fixed point taken back through a seeded run of preimages), pulled a seeded way toward the set's centre (`Anchor::Today`, the device's), or a spiral point (α or a seeded preimage of it) at the frame's centre or at a seeded third (`Anchor::AlphaCentre`, `Anchor::AlphaAt`); a seeded size and a seeded turn.
 //! - The colours: one palette (the owner's) turned a seeded small angle about the grey axis, the warm sparks turned on their own, and the background's soft gradient in a seeded direction.
 //!
 //! Every candidate is looked at first at a sixteenth of the frame's size (`survey`): how much of the frame lies near the set, in the whole and in each third along its long side, and how much never escapes.
 //! A candidate that leaves a third empty, covers too little or too much, or carries a filled blob is passed over, and the seed's next candidate (the same seed hashed with the attempt's number) is tried; after `ATTEMPTS` the best seen is kept.
 //! So the result is always a filled composition, and still a function of the seed alone.
+//! Every choice above is a field of `Knobs` (`params_with`), `Knobs::DEFAULT` the constants below; tools/tune moves them on the desktop.
 //!
 //! Colour: each pixel's orbit gives its smooth escape count n and its distance d to the set (the exterior distance estimate |z| ln|z| / |dz/dz₀|).
 //! d, measured in spans of the frame, draws the filaments and their halo, so their width is the same fraction of the frame on every display; log₂(1 + n), normalised to the survey's median and 99th percentile, shades the field and lights the hottest filaments white and the knots warm.
@@ -127,6 +128,91 @@ const FLAME_L: f32 = 3. / 8.;
 /// Saturation from the seed too (owner, 2026-11-07: "balanced around grey, saturation/hue dependent upon hash"): the palette's chroma times a seeded factor in this range, muted to rich, so over all people the colours average to grey.
 const SAT: [f32; 2] = [1. / 2., 1.];
 
+/// The choices a seed is turned into, as data (owner, 2026-11-10: "It would [change everyone's wallpaper], which is why I wanted to fidoodle with it some before we ship it"): what `candidate` draws c, the view and the hues from, and what `survey` holds a composition to.
+/// `Knobs::DEFAULT` is the constants above, the device's wallpaper; tools/tune moves them on the desktop and prints the result as these constants' source.
+/// The colouring's own weights (the layers' strengths and widths, the lamp, the flame) stay constants.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Knobs {
+    /// CARDIOID_T: the cardioid family's θ range in turns of its boundary; CARDIOID_EPS_LOG2: its step out, log₂ ε.
+    pub cardioid_t: [f32; 2],
+    pub cardioid_eps_log2: [f32; 2],
+    /// BULB_PHI: the period-2 bulb's φ range in half turns; BULB_EPS: its step out, a fraction of the bulb's radius.
+    pub bulb_phi: [f32; 2],
+    pub bulb_eps: [f32; 2],
+    /// BACK_STEPS: preimages taken back from β to find the point of the set the view is built on (`Anchor::Today`), each sign a bit of one 64-bit draw (past 64 steps the signs repeat).
+    pub back_steps: u32,
+    /// PULL: how far that point is pulled toward 0 (`Anchor::Today` only).
+    pub pull: [f32; 2],
+    /// VIEW_SPAN: the view's size in the plane per span of the frame.
+    pub view_span: [f32; 2],
+    /// FAR_ZOOM, FAR_TURN (radians, either way) and FAR_SHIFT (the far view's spans): the far layer against the near view.
+    pub far_zoom: [f32; 2],
+    pub far_turn: [f32; 2],
+    pub far_shift: f32,
+    /// WARM_HUE, FAR_HUE, HUE_STEP (radians): the warm sparks' and the far layer's turn off the palette's hue, and the map's step from stop to stop; SAT: the saturation's range.
+    pub warm_hue: [f32; 2],
+    pub far_hue: [f32; 2],
+    pub hue_step: [f32; 2],
+    pub sat: [f32; 2],
+    /// GRAD_SPANS: how far the background gradient's ends sit apart, in spans.
+    pub grad_spans: f32,
+    /// ATTEMPTS: candidates surveyed before the best seen is kept.
+    pub attempts: u32,
+    /// NEAR, NEAR_THIRD, INSIDE, NEAR_SPAN: the survey's thresholds (`Survey::passes_with`).
+    pub near: [f32; 2],
+    pub near_third: f32,
+    pub inside: f32,
+    pub near_span: f32,
+    /// Where the view is built (`Anchor`).
+    pub anchor: Anchor,
+    /// The spiral point for the α anchors: α itself at 0, else this many preimages back from it, each sign from the seed (every preimage of α is a conformal copy of its spiral), signs from the same draw as BACK_STEPS.
+    pub alpha_steps: u32,
+    /// `Anchor::AlphaAt`: where the spiral point lands in the frame, as fractions of its width and height from the top left (thirds by default), and whether the seed mirrors it across either axis (so thirds land on any of the four crossings).
+    pub at: [f32; 2],
+    pub at_mirror: bool,
+}
+
+/// Where a seed's view is built (owner, 2026-11-10, asked how the centre and the spiral are chosen).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Anchor {
+    /// The device's today: a point of the Julia set BACK_STEPS seeded preimages back from β, pulled toward 0 by PULL, so the frame's centre usually sits in a gap and the spirals land wherever they fall.
+    Today,
+    /// The view's centre on the spiral point: α = ½ − √(¼ − c) (the repelling fixed point the dendrites wind round) or `alpha_steps` seeded preimages back from it, no pull.
+    AlphaCentre,
+    /// The spiral point at `at` in the frame (thirds, mirrored by the seed), the view's centre offset so the point lands there after the view's turn and scale.
+    AlphaAt,
+}
+
+impl Knobs {
+    /// The device's wallpaper: the constants above, the α anchors' knobs at their own defaults (unused by `Anchor::Today`).
+    pub const DEFAULT: Knobs = Knobs {
+        cardioid_t: CARDIOID_T,
+        cardioid_eps_log2: CARDIOID_EPS_LOG2,
+        bulb_phi: BULB_PHI,
+        bulb_eps: BULB_EPS,
+        back_steps: BACK_STEPS,
+        pull: PULL,
+        view_span: VIEW_SPAN,
+        far_zoom: FAR_ZOOM,
+        far_turn: FAR_TURN,
+        far_shift: FAR_SHIFT,
+        warm_hue: WARM_HUE,
+        far_hue: FAR_HUE,
+        hue_step: HUE_STEP,
+        sat: SAT,
+        grad_spans: GRAD_SPANS,
+        attempts: ATTEMPTS,
+        near: NEAR,
+        near_third: NEAR_THIRD,
+        inside: INSIDE,
+        near_span: NEAR_SPAN,
+        anchor: Anchor::Today,
+        alpha_steps: 0,
+        at: [1. / 3., 1. / 3.],
+        at_mirror: true,
+    };
+}
+
 /// Everything a wallpaper is drawn from: the seed's choices, worked out once (`params`) and shared by every core that draws rows of it.
 #[derive(Clone, Copy, Debug)]
 pub struct Params {
@@ -152,6 +238,8 @@ pub struct Params {
     /// log₂(1 + n) at the survey's median, and the inverse of its spread to the 99th percentile: v = (log₂(1 + n) − l_lo) · l_inv.
     pub l_lo: f32,
     pub l_inv: f32,
+    /// The plane point the view was built on (`Anchor`): the point of the set pulled toward 0 for `Today`, the spiral point for the α anchors.
+    pub anchor: [f32; 2],
     /// Which attempt was kept, and what its survey found.
     pub attempt: u32,
     pub survey: Survey,
@@ -171,29 +259,44 @@ pub struct Survey {
 }
 
 impl Survey {
-    /// Whether the composition is good enough to keep.
+    /// Whether the composition is good enough to keep, by the device's thresholds.
     pub fn passes(&self) -> bool {
-        self.near > NEAR[0] && self.near < NEAR[1] && self.near_min_third > NEAR_THIRD && self.inside < INSIDE
+        self.passes_with(&Knobs::DEFAULT)
+    }
+    /// Whether the composition is good enough to keep, by `k`'s thresholds.
+    pub fn passes_with(&self, k: &Knobs) -> bool {
+        self.near > k.near[0] && self.near < k.near[1] && self.near_min_third > k.near_third && self.inside < k.inside
     }
     /// How close a failing candidate came, to keep the best when none passes.
-    fn score(&self) -> f32 {
-        self.near_min_third - self.inside - libm::fabsf(self.near - (NEAR[0] + NEAR[1]) * 0.5)
+    pub fn score_with(&self, k: &Knobs) -> f32 {
+        self.near_min_third - self.inside - libm::fabsf(self.near - (k.near[0] + k.near[1]) * 0.5)
     }
 }
 
-/// A seed's wallpaper for a `width` × `height` frame.
+/// A seed's wallpaper for a `width` × `height` frame, as the device draws it (`Knobs::DEFAULT`).
 pub fn params(seed: &[u8; 32], width: usize, height: usize) -> Params {
-    let mut best = candidate(seed, 0, width, height);
+    params_with(seed, width, height, &Knobs::DEFAULT)
+}
+
+/// A seed's wallpaper for a `width` × `height` frame under the knobs `k`.
+pub fn params_with(seed: &[u8; 32], width: usize, height: usize, k: &Knobs) -> Params {
+    params_seen(seed, width, height, k, |_| {})
+}
+
+/// `params_with`, handing each candidate to `seen` as it is surveyed (its `survey` filled in), so tools/tune can show why each attempt failed.
+pub fn params_seen(seed: &[u8; 32], width: usize, height: usize, k: &Knobs, mut seen: impl FnMut(&Params)) -> Params {
+    let mut best = candidate_with(seed, 0, width, height, k);
     let mut best_score = f32::MIN;
-    for a in 0..ATTEMPTS {
-        let mut p = candidate(seed, a, width, height);
-        let s = survey(&p);
+    for a in 0..k.attempts {
+        let mut p = candidate_with(seed, a, width, height, k);
+        let s = survey_with(&p, k);
         p.survey = s;
-        if s.passes() {
+        seen(&p);
+        if s.passes_with(k) {
             return tune(p);
         }
-        if s.score() > best_score {
-            best_score = s.score();
+        if s.score_with(k) > best_score {
+            best_score = s.score_with(k);
             best = p;
         }
     }
@@ -801,13 +904,19 @@ fn turned(code: [u16; 3], a: f32, chroma: f32) -> ([f32; 3], [f32; 3]) {
     (q, cols(&LMS2VSF_RGB, [q[0] * q[0], q[1] * q[1], q[2] * q[2]]))
 }
 
-/// The seed's candidate for one attempt: c, the view and the colours.
+/// The seed's candidate for one attempt: c, the view and the colours, as the device draws it (`Knobs::DEFAULT`).
 pub fn candidate(seed: &[u8; 32], attempt: u32, width: usize, height: usize) -> Params {
+    candidate_with(seed, attempt, width, height, &Knobs::DEFAULT)
+}
+
+/// The seed's candidate for one attempt under the knobs `k`.
+/// Every anchor takes the same draws in the same order (the α anchors draw where to land last, after all the rest), so moving between anchors keeps a seed's c, size, turn and colours, and only the view's centre moves.
+pub fn candidate_with(seed: &[u8; 32], attempt: u32, width: usize, height: usize, k: &Knobs) -> Params {
     let mut r = Rng::new(seed, attempt);
     let flip = if r.next() & 1 == 0 { 1. } else { -1. };
     let (cx, cy) = if r.next() & 1 == 0 {
-        let th = r.range(CARDIOID_T) * TAU;
-        let eps = libm::exp2f(r.range(CARDIOID_EPS_LOG2));
+        let th = r.range(k.cardioid_t) * TAU;
+        let eps = libm::exp2f(r.range(k.cardioid_eps_log2));
         let (ct, st) = (libm::cosf(th), libm::sinf(th));
         let (c2, s2) = (libm::cosf(2. * th), libm::sinf(2. * th));
         // The boundary point e^{iθ}/2 − e^{2iθ}/4, and its outward normal e^{iθ}(1 − e^{iθ}), never zero for θ inside (0, 1) turns.
@@ -815,60 +924,84 @@ pub fn candidate(seed: &[u8; 32], attempt: u32, width: usize, height: usize) -> 
         let nm = libm::sqrtf(nx * nx + ny * ny);
         (0.5 * ct - 0.25 * c2 + eps * nx / nm, 0.5 * st - 0.25 * s2 + eps * ny / nm)
     } else {
-        let phi = r.range(BULB_PHI) * PI;
-        let rad = 0.25 * (1. + r.range(BULB_EPS));
+        let phi = r.range(k.bulb_phi) * PI;
+        let rad = 0.25 * (1. + r.range(k.bulb_eps));
         (-1. + rad * libm::cosf(phi), rad * libm::sinf(phi))
     };
     let cy = flip * cy;
-    // The β fixed point ½ + √(¼ − c), repelling, then preimages ±√(z − c) with seeded signs: a point of the Julia set.
+    // The two fixed points ½ ± √(¼ − c), both repelling outside the main cardioid: β (+) at the set's outer tip, α (−) where the dendrites wind.
     let (sx, sy) = csqrt(0.25 - cx, -cy);
-    let (mut zx, mut zy) = (0.5 + sx, sy);
+    // Preimages ±√(z − c) from (zx, zy), the signs bits of one draw (bit k for step k, rotated so past 64 steps they repeat): every preimage of a point of the Julia set is in it, and of α a copy of its spiral.
     let bits = r.next();
-    for k in 0..BACK_STEPS {
-        let (a, b) = csqrt(zx - cx, zy - cy);
-        let s = if (bits >> k) & 1 == 0 { 1. } else { -1. };
-        zx = s * a;
-        zy = s * b;
-    }
-    let pull = r.range(PULL);
-    let sc = r.range(VIEW_SPAN) / span(width, height);
+    let back = |mut zx: f32, mut zy: f32, steps: u32| {
+        for j in 0..steps {
+            let (a, b) = csqrt(zx - cx, zy - cy);
+            let s = if bits.rotate_right(j) & 1 == 0 { 1. } else { -1. };
+            zx = s * a;
+            zy = s * b;
+        }
+        [zx, zy]
+    };
+    let pull = r.range(k.pull);
+    let sc = r.range(k.view_span) / span(width, height);
     let view_turn = r.unit() * TAU;
     let grad_turn = r.unit() * TAU;
     // The far layer: zoomed out, turned and shifted from the near view, all seeded.
-    let far_sc = sc * r.range(FAR_ZOOM);
-    let far_turn = view_turn + r.range(FAR_TURN) * if r.next() & 1 == 0 { 1. } else { -1. };
+    let far_sc = sc * r.range(k.far_zoom);
+    let far_turn = view_turn + r.range(k.far_turn) * if r.next() & 1 == 0 { 1. } else { -1. };
     let shift_turn = r.unit() * TAU;
-    let shift = FAR_SHIFT * far_sc * span(width, height);
+    let shift = k.far_shift * far_sc * span(width, height);
     let lamp_turn = r.unit() * TAU;
+    let step = [sc * libm::cosf(view_turn), sc * libm::sinf(view_turn)];
+    let (anchor, centre) = match k.anchor {
+        Anchor::Today => {
+            let z = back(0.5 + sx, sy, k.back_steps);
+            ([z[0] * pull, z[1] * pull], [z[0] * pull, z[1] * pull])
+        }
+        Anchor::AlphaCentre => {
+            let a = back(0.5 - sx, -sy, k.alpha_steps);
+            (a, a)
+        }
+        Anchor::AlphaAt => {
+            let a = back(0.5 - sx, -sy, k.alpha_steps);
+            // The place in the frame, the seed mirroring it across either axis; then in pixels from the frame's centre, and the centre set back from the spiral point by the view's step (`Frame::z_at`), so the point lands there.
+            let m = r.next();
+            let fx = if k.at_mirror && m & 1 == 1 { 1. - k.at[0] } else { k.at[0] };
+            let fy = if k.at_mirror && m & 2 == 2 { 1. - k.at[1] } else { k.at[1] };
+            let (px, py) = ((fx - 0.5) * width as f32, (fy - 0.5) * height as f32);
+            (a, [a[0] - (px * step[0] - py * step[1]), a[1] - (px * step[1] + py * step[0])])
+        }
+    };
     let mut hr = Rng::new(seed, HUE_STREAM);
     let hue = hr.unit() * TAU;
-    let warm_hue = hue + hr.range(WARM_HUE);
-    let far_hue = hue + hr.range(FAR_HUE);
-    let sat = hr.range(SAT);
+    let warm_hue = hue + hr.range(k.warm_hue);
+    let far_hue = hue + hr.range(k.far_hue);
+    let sat = hr.range(k.sat);
     // The map's hues: a walk round the circle from the seed's hue, a seeded step either way at each stop.
     let mut stops = [[0f32; 3]; STOPS];
     let mut h = hue;
-    for k in 0..STOPS {
-        stops[k] = codes(turn(STOP_CODES[k], h, sat));
-        let s = hr.range(HUE_STEP);
+    for j in 0..STOPS {
+        stops[j] = codes(turn(STOP_CODES[j], h, sat));
+        let s = hr.range(k.hue_step);
         h += if hr.next() & 1 == 0 { s } else { -s };
     }
-    let g = 1. / (GRAD_SPANS * span(width, height));
+    let g = 1. / (k.grad_spans * span(width, height));
     Params {
         width,
         height,
         c: [cx, cy],
-        centre: [zx * pull, zy * pull],
-        step: [sc * libm::cosf(view_turn), sc * libm::sinf(view_turn)],
+        centre,
+        step,
         grad: [g * libm::cosf(grad_turn), g * libm::sinf(grad_turn)],
         stops,
         hot: codes(turn(HOT, far_hue, sat)),
         warm: codes(turn(WARM, warm_hue, sat)),
-        far_centre: [zx * pull + shift * libm::cosf(shift_turn), zy * pull + shift * libm::sinf(shift_turn)],
+        far_centre: [centre[0] + shift * libm::cosf(shift_turn), centre[1] + shift * libm::sinf(shift_turn)],
         far_step: [far_sc * libm::cosf(far_turn), far_sc * libm::sinf(far_turn)],
         lamp: [libm::cosf(lamp_turn), libm::sinf(lamp_turn)],
         l_lo: 0.,
         l_inv: 1.,
+        anchor,
         attempt,
         survey: Survey::default(),
     }
@@ -883,8 +1016,13 @@ fn tune(mut p: Params) -> Params {
     p
 }
 
-/// Looks at a candidate at a sixteenth of its size.
+/// Looks at a candidate at a sixteenth of its size, "near the set" as the device holds it (`Knobs::DEFAULT`).
 pub fn survey(p: &Params) -> Survey {
+    survey_with(p, &Knobs::DEFAULT)
+}
+
+/// Looks at a candidate at a sixteenth of its size, "near the set" within `k.near_span` of a span.
+pub fn survey_with(p: &Params, k: &Knobs) -> Survey {
     let (w, h) = (p.width / PREVIEW, p.height / PREVIEW);
     let mut q = *p;
     q.width = w;
@@ -892,7 +1030,7 @@ pub fn survey(p: &Params) -> Survey {
     q.step = [p.step[0] * PREVIEW as f32, p.step[1] * PREVIEW as f32];
     q.far_step = [p.far_step[0] * PREVIEW as f32, p.far_step[1] * PREVIEW as f32];
     let f = Frame::new(&q);
-    let near_d = NEAR_SPAN / f.views[NEAR_VIEW].2;
+    let near_d = k.near_span / f.views[NEAR_VIEW].2;
     let lmax = libm::log2f((MAX_ITER + 2) as f32);
     // An escaped count is below MAX_ITER + 1, so its bin is below BINS; the extra bin takes a value that rounds up to the top edge, so no index is ever out of range.
     let mut hist = [0u32; BINS + 1];
@@ -1072,6 +1210,39 @@ mod tests {
         println!("full {full:X?}");
         assert_eq!(got, TODAY_PIXELS);
         assert_eq!(full, TODAY_FULL);
+    }
+
+    /// The α anchors: the spiral point is α (z² + c = z) at no steps, a preimage of it after some (taken forward that many steps it comes back to α), the view's centre for `AlphaCentre` and under the chosen third for `AlphaAt`; and every anchor keeps the seed's c, size, turn and colours.
+    #[test]
+    fn anchors_place_the_spiral() {
+        let (w, h) = (1344, 2992);
+        let fwd = |z: [f32; 2], c: [f32; 2]| [z[0] * z[0] - z[1] * z[1] + c[0], 2. * z[0] * z[1] + c[1]];
+        for n in 0..16 {
+            let s = seed_of(n);
+            let today = candidate(&s, 0, w, h);
+            for steps in [0u32, 3] {
+                let centre = candidate_with(&s, 0, w, h, &Knobs { anchor: Anchor::AlphaCentre, alpha_steps: steps, ..Knobs::DEFAULT });
+                let at = candidate_with(&s, 0, w, h, &Knobs { anchor: Anchor::AlphaAt, alpha_steps: steps, ..Knobs::DEFAULT });
+                for p in [&centre, &at] {
+                    assert_eq!((p.c, p.step, p.far_step, p.stops, p.lamp), (today.c, today.step, today.far_step, today.stops, today.lamp));
+                }
+                let mut z = centre.anchor;
+                for _ in 0..steps {
+                    z = fwd(z, centre.c);
+                }
+                let f = fwd(z, centre.c);
+                assert!((f[0] - z[0]).abs() + (f[1] - z[1]).abs() < 1. / (1 << 12) as f32, "seed {n}: α {z:?} goes to {f:?}");
+                assert_eq!(centre.centre, centre.anchor);
+                assert_eq!(at.anchor, centre.anchor);
+                // Under some crossing of the thirds: the plane at that place is the spiral point.
+                let fr = Frame::new(&at);
+                let hit = [(1., 1.), (1., 2.), (2., 1.), (2., 2.)].iter().any(|&(a, b)| {
+                    let z = fr.z_at(NEAR_VIEW, (a / 3. - 0.5) * w as f32, (b / 3. - 0.5) * h as f32);
+                    (z.0 - at.anchor[0]).abs() + (z.1 - at.anchor[1]).abs() < 1. / (1 << 16) as f32
+                });
+                assert!(hit, "seed {n}: the spiral point lands on no third");
+            }
+        }
     }
 
     /// The device's composition, for a handful of seeds: each passes the survey (the example `validate` runs many more, built for speed).
