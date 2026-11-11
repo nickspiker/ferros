@@ -375,6 +375,8 @@ messages! {
     ScopeBlue,
     ScopeGreen,
     ScopeClear,
+    /// The display's hit map shown in every fourth frame (development builds).
+    HitMap,
 
     // ---- the attest screen (payloads/ahau): its button ----
     /// The button that attests the typed handle (owner, 2026-11-10: "needs to say attest, not unlock. always attest").

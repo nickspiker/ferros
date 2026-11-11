@@ -4,7 +4,7 @@
 //! - **Collisions, by construction.** The console's corner circles are outside the app's circle and these inside it, both tangent to it, so they never overlap (their drawn rims, two and a half pixels, can meet, and the console's region redraw composes both). The camera hole is above the app's circle; the middle pair clear it by 56 pixels on husky, 41 on akita.
 //! - **How it opens: a slide** (owner, 2026-11-11: "track the finger down from top tho and slide it in so it doesn't need a re-render, just a move and composite, then do the iterate/2 each frame, like we do for the settings page until it snaps in or out of place"). The map owns the finger and the stepping and sends the row's offset (op 56): 0 hidden, `SLIDE` open, whole pixels. The row is drawn once at its size into its own sprites; a frame of the slide is the sprites composed under the console's circles at the offset, clipped to the app's circle so the row comes out from behind its top. The grow-and-fan animation of the first cut (C∞ in the pull) is gone: the owner waived it ("Simply appearing and disappearing is fine too. no need for a scale in/out animation").
 //! - **What draws it.** The console's worker: each circle into its sprite only when its look changes (`update`, `render`), and the composite into the bars' decoded rows (`compose`, from `bar_decode`).
-//! - **Where a finger lands.** Op 41 answers which quick circle (32 + its index, with its centre and radius) while the row is all the way open, the doorway (10), the top's other system ground (11), or behind the row while any of it shows (12).
+//! - **Where a finger lands.** Op 41 answers which quick circle (32 + its index, with its centre and radius) while the row is all the way open, the doorway (10), the top's other system ground (11), or behind the row while any of it shows (12): one read of the hit map (hit.rs), whose bars' ids the console's worker writes as it composes the row (`open_circles`, `doorway_disc`).
 
 use super::*;
 use core::sync::atomic::AtomicBool;
@@ -227,24 +227,16 @@ pub fn set(m: &[u8]) -> [u8; 3] {
     [0, s[0], s[1]]
 }
 
-/// The quick circle under a point, open: its index and (x, y, r). None unless the row is all the way open (while it slides, a finger on it is the slide's).
-pub fn hit(x: f32, y: f32, width: usize, height: usize) -> Option<(usize, (f32, f32, f32))> {
-    if state().off < SLIDE.load(Ordering::Acquire) as i64 || SLIDE.load(Ordering::Acquire) == 0 {
-        return None;
-    }
-    layout(width, height).iter().enumerate().find(|(_, c)| (x - c.0) * (x - c.0) + (y - c.1) * (y - c.1) <= c.2 * c.2).map(|(k, &c)| (k, c))
+/// The row's circles as the bars hold them (`compose`, at the offset the worker took) when it stands all the way open; None while it is hidden or slides (a finger on it is then the slide's). The hit map's quick circles (hit.rs `bars_row`), at the worker's compose step.
+pub fn open_circles(width: usize, height: usize) -> Option<[(f32, f32, f32); N]> {
+    let slide = SLIDE.load(Ordering::Acquire) as i64;
+    (slide > 0 && unsafe { COMPOSED } == slide).then(|| layout(width, height))
 }
 
-/// Whether a point is in the doorway: the disc about the camera hole out to the nearest top console circle, outside the app's circle.
-pub fn doorway(x: f32, y: f32, width: usize, height: usize) -> bool {
+/// The doorway (the open spot by the camera, op 41's 10): the disc about the camera hole out to the nearest top console circle, (x, y, r). Outside the app's circle only, which the hit map's order sees to (hit.rs `bars_row` claims it among the places outside the circle).
+pub fn doorway_disc(width: usize, height: usize) -> (f32, f32, f32) {
     let (hx, hy, _) = ferros_sys::cutout_hole();
-    let door = door(width, height);
-    (x - hx) * (x - hx) + (y - hy) * (y - hy) < door * door && !in_circle(x as i64, y as i64, width, height)
-}
-
-/// Whether any of the row shows now (op 41's "behind").
-pub fn showing() -> bool {
-    state().off > 0
+    (hx, hy, door(width, height))
 }
 
 /// One circle's sprite: every pixel the circle draws (out to its reach past the radius), row by row from `y0`, each row a span of columns [x0, x1) at `at` in `data`. Drawn in fluor's α + darkness, then decoded in place to working values (`working`), as the bars are, so a frame of the slide only copies and folds.

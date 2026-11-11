@@ -235,6 +235,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ScopeBlue => "asul",
         Msg::ScopeGreen => "berde",
         Msg::ScopeClear => "walang filter",
+        Msg::HitMap => "mapa ng pindot",
         // ---- the attest screen ----
         Msg::Attest => "patotohanan",
         Msg::Mint => "buuin",

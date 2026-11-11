@@ -730,6 +730,8 @@ enum Choice {
     Base(u8),
     Labels,
     Dither,
+    /// The display's hit map in every fourth frame (Developer; display op 58).
+    HitMap,
     /// One of the theme swatches.
     Theme(u8),
     /// The brightness slider, continuous (preference 3, 32nds of a stop): the value is decided by x, dragged or tapped.
@@ -1188,6 +1190,8 @@ struct Map {
     armed: bool,
     /// Developer made a page by the twelve taps (the vault, `map.dev`).
     dev: bool,
+    /// Whether the display shows its hit map in every fourth frame (display op 58; development builds): the Developer page's checkbox and the two-finger swipe up from back and home together switch it, and the display's answer is kept here.
+    hit_view: bool,
     /// The Fleet page as the identity service last answered: its state (payloads/fgtw: 0 no identity, 1 joining, 2 bound waiting for the key, 3 a member with the key, 4-7 looking up, 8 leaving), the approval words while leaving, the members (their device names, or key prefixes where there is none; which one is this device), and the remove row armed by its first tap.
     fleet: Fleet,
     /// Where the camera is flying (`fly`), and whether the flight leaves the open circle for the plane (the page drawn, shrinking with the circle, until it lands).
@@ -3595,6 +3599,11 @@ impl Map {
                 let spatial = ferros_sys::pref(ferros_sys::PREF_DITHER) == 1;
                 // The temporal dither a checkbox (unchecked, spatial alone: the panel rests); the light scope's channel a radio group.
                 mark(self, b, &mut y, 50, tr(Msg::TemporalDither), !spatial, Some(Choice::Dither));
+                // The display's hit map in every fourth frame (owner, 2026-11-11: "a debug/devel checkbox for toggling on/off the hitmap on the fourth frame"); development builds only, as the display's view is.
+                if DEV {
+                    let on = self.hit_view;
+                    mark(self, b, &mut y, 50, tr(Msg::HitMap), on, Some(Choice::HitMap));
+                }
                 let sc = ferros_sys::pref(ferros_sys::PREF_SCOPE);
                 b.text(cx, y, note as u16, dim(), 1, tr(Msg::LightScope));
                 y += uu(2, 1);
@@ -3857,6 +3866,15 @@ impl Map {
         self.page_dx != 0 || self.fling != 0. || self.spring.is_some() || self.pan.is_some() || self.knob.is_some() || flying
     }
 
+    /// The display's hit map in every fourth frame switched (display op 58, toggle; development builds), from the Developer page's checkbox or the two-finger swipe up from back and home: the display's answer kept for the checkbox, and said on the console.
+    fn hit_view_toggle(&mut self) {
+        let mut r = [0u8; 4];
+        if call(self.display, &[58, 2], &mut r) >= 2 && r[0] == 0 {
+            self.hit_view = r[1] == 1;
+            console(self.grants, if self.hit_view { b"map: hit map on (every fourth frame)\n" } else { b"map: hit map off\n" });
+        }
+    }
+
     /// A helm button's light (display op 54): `corner` 8 home or 9 back, `level` 0 to 1.
     fn helm_light(&self, corner: u8, level: f32) {
         let q = ((level * 65535.0) as u16).to_le_bytes();
@@ -4042,6 +4060,7 @@ impl Map {
                     Some(Choice::ScopeSet(v)) => set(self, ferros_sys::PREF_SCOPE, v),
                     Some(Choice::Theme(i)) => set(self, ferros_sys::PREF_THEME, i),
                     Some(Choice::Dither) => set(self, ferros_sys::PREF_DITHER, (ferros_sys::pref(ferros_sys::PREF_DITHER) != 1) as u8),
+                    Some(Choice::HitMap) => self.hit_view_toggle(),
                     Some(Choice::Labels) => {
                         set(self, ferros_sys::PREF_LABELS, (ferros_sys::pref(ferros_sys::PREF_LABELS) != 1) as u8);
                         self.send_scene();
@@ -4367,6 +4386,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         taps: 0,
         armed: false,
         dev: false,
+        hit_view: false,
         fleet: Fleet::new(),
         target: None,
         flight: None,
@@ -4402,6 +4422,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         stopped: alloc::vec::Vec::new(),
         kists_read: 0,
     };
+    // The display's hit map view as it stands (op 58, ask), for the Developer page's checkbox: a map started again finds it as it was left.
+    if DEV {
+        let mut r = [0u8; 4];
+        map.hit_view = call(map.display, &[58, 3], &mut r) >= 2 && r[0] == 0 && r[1] == 1;
+    }
     let kept = map.load_places_near();
     // Whatever the vault held, no two circles start overlapping (places kept before circles pushed each other could).
     map.push_apart(MAX);
@@ -4546,6 +4571,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // Where that finger landed, and whether the corner has acted this touch.
     let mut corner_from = (0i64, 0i64);
     let mut corner_done = false;
+    // Two fingers on back and home together (development builds): 0 not looked at yet this touch, 1 they are, 2 they are not; and whether their swipe up has switched the hit map this touch.
+    let mut pair = 0u8;
+    let mut pair_done = false;
     // The quick row (quick.rs): its pull, physics and actions; and whether the session's finger landed in its doorway by the camera (a still tap there opens or shuts it).
     let mut qr = quick::Quick::new(display, grants, w, h);
     let mut quick_door = false;
@@ -4965,6 +4993,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             corner_at = (f.1, f.2);
             corner_from = (f.1, f.2);
             corner_done = false;
+            pair = 0;
+            pair_done = false;
             // Measuring (the first cut did not fire for the owner): a touch in the bottom sixth, what the display said is under it.
             if f.2 > h - h / 6 {
                 let mut l = Line::new();
@@ -5015,7 +5045,30 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     qr.drag(fy, frame_count);
                 }
             }
-            if (corner == 8 || corner == 9) && held >= 1 {
+            // Two fingers swiped up from back and home together (owner, 2026-11-11: "Quick shortcut in dev only is swipe up from both back and home to toggle on/off"): the display's hit map in every fourth frame, once a touch. The second finger's landing is asked of the display as the first's was (op 41); while the two are a pair the corner's own swipe does nothing.
+            if DEV && (corner == 8 || corner == 9) && held >= 2 && pair == 0 {
+                pair = 2;
+                if let Some(&id) = ids[..held].iter().find(|&&id| (start[id].1, start[id].2) != corner_from) {
+                    let (xb, yb) = ((start[id].1 as u16).to_le_bytes(), (start[id].2 as u16).to_le_bytes());
+                    let mut q = [0u8; 8];
+                    if call(map.display, &[41, xb[0], xb[1], yb[0], yb[1]], &mut q) >= 1 && q[0] == 17 - corner {
+                        pair = 1;
+                    }
+                }
+            }
+            if pair == 1 && !pair_done && held >= 2 {
+                // Up past the corner's own threshold (a twelfth of the screen's harmonic span), both of them.
+                let span = (2 * w * h) as f64 / (w + h) as f64;
+                if ids[..held].iter().filter(|&&id| (start[id].2 - cur[id].2) as f64 > span / 12.).count() >= 2 {
+                    pair_done = true;
+                    map.hit_view_toggle();
+                    // The Developer page, if it is on show, draws its checkbox anew.
+                    if !map.app_front && matches!(map.view, View::Open(_)) {
+                        map.draw();
+                    }
+                }
+            }
+            if (corner == 8 || corner == 9) && held >= 1 && pair != 1 {
                 corner_at = (cur[ids[0]].1, cur[ids[0]].2);
                 // The swipe inward: the finger's travel along the line from where it landed toward the screen's centre. Past a twelfth of the screen's harmonic span (2wh/(w+h); owner, 2026-11-07), the corner acts, once a touch: home, full screen on or off (op 43); back, the map zoomed out to every circle (`home`), the map being recents (WINDOWS.md).
                 let (ux, uy) = ((w / 2 - corner_from.0) as f64, (h / 2 - corner_from.1) as f64);
