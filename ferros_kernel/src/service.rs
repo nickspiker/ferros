@@ -1488,6 +1488,10 @@ const CLOCKS_DARK: [(u32, u32); 7] = [(4, 500_000), (0, 421_000), (1, 178_000), 
 const CLOCKS_ACTIVE: [(u32, u32); 7] = [(0, 2_028_000), (5, 1_197_000), (1, 356_000), (3, 1_065_000), (2, 1_425_000), (14, 400_000), (4, 2_914_000)];
 /// The policy's state: 0 not yet applied, 1 rest, 2 active, 3 dark; and whether it runs (`diag dvfs policy off` holds the clocks wherever `dvfs set` puts them, for measuring). Switches counted for DIAG.
 static mut CLOCK_STATE: u8 = 0;
+/// The clock policy's state now (`CLOCK_STATE`), for the store calls' measure (process.rs `STORE_BY_CLOCK`): a byte written by the service loop alone, read as it stands.
+pub fn clock_state() -> u8 {
+    unsafe { core::ptr::read_volatile(&raw const CLOCK_STATE) }
+}
 static mut CLOCK_POLICY_ON: bool = true;
 static mut CLOCK_SWITCHES: u32 = 0;
 static mut CLOCK_WAIT_MAX_US: u64 = 0;
@@ -3318,13 +3322,18 @@ pub fn run(mut b: Boot) -> ! {
                     // `diag "store gets [reset]"` (2026-11-11): the forwarded store calls the vault process answered: how many, the bytes handed back, the time from each call to its reply (the stamp, the wait for the vault's thread to be given a core, its serving) on average and at the longest, and the replies' copies into the callers. With the vault's own read report (its serving and the time between its requests) and the reader's own count of its calls, it says where a slow read waits.
                     use core::sync::atomic::Ordering::Relaxed;
                     if &cmd.params[..] == b"store gets reset" {
-                        crate::process::STORE_GETS.iter().for_each(|s| s.store(0, Relaxed));
+                        crate::process::STORE_GETS.iter().chain(crate::process::STORE_LONGEST.iter()).chain(crate::process::STORE_BY_CLOCK.iter()).for_each(|s| s.store(0, Relaxed));
                     }
+                    // The longest call: whose, and what (op 0 set, 1 get, 2 delete, 3 list, 5 export; a set's `more`; length; offset). The clock states the calls were answered under, and the X3's clock now.
+                    let (who, what) = (crate::process::STORE_LONGEST[0].load(Relaxed), crate::process::STORE_LONGEST[1].load(Relaxed));
+                    let c = |i: usize| crate::process::STORE_BY_CLOCK[i].load(Relaxed);
+                    let longest = alloc::format!("  the longest: {}, op A#{}{}, A#{} bytes at A#{}; answered at the boot's clocks A#{}, rest A#{}, active A#{}, dark A#{}; X3 now A#{} kHz (state A#{})\n", alloc::string::String::from_utf8_lossy(&who.to_le_bytes()).trim_end_matches('\0'), what & 0x7F, if what & 0x80 != 0 { " (more)" } else { "" }, (what >> 8) & 0xFF_FFFF, what >> 32, c(0), c(1), c(2), c(3), crate::acpm::dvfs_get(4).unwrap_or(0), clock_state());
                     let s = |i: usize| crate::process::STORE_GETS[i].load(Relaxed);
                     let us = |t: u64| t * 1_000_000 / cntfrq();
                     // WHY the max: no calls yet would divide by zero.
                     let calls = s(0);
                     resp.extend_from_slice(alloc::format!("store gets: A#{} calls, A#{} bytes back; call to reply A#{} ms in all, A#{} us a call, A#{} us the longest; copying replies A#{} us in all\n", calls, s(1), us(s(2)) / 1000, us(s(2)) / calls.max(1), us(s(3)), us(s(4))).as_bytes());
+                    resp.extend_from_slice(longest.as_bytes());
                     resp.extend_from_slice(alloc::format!("pin off: {}\n", { let k = crate::process::PIN_OFF.load(Relaxed); if k == 0 { alloc::string::String::from("none") } else { alloc::string::String::from_utf8_lossy(&k.to_le_bytes()).trim_end_matches('\0').into() } }).as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;

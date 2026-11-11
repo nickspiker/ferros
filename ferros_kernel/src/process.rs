@@ -547,9 +547,14 @@ struct Thread {
     state: State,
     /// Which cores may run it (bit = core index): the workers by default; a thread pins itself with `SYS_PIN` (the display's render thread to the X3). If none of its cores is up, any core takes it.
     mask: u16,
-    /// When its last forwarded store call went to the vault process (`store_forward`), for `STORE_GETS`.
+    /// When its last forwarded store call went to the vault process (`store_forward`), for `STORE_GETS`, and what it was: the op (`VOP_*`) in bits 0-6, a set's `more` bit 7, the length in bits 8-31, the offset above.
     called: u64,
+    what: u64,
 }
+
+/// The longest forwarded store call (`STORE_GETS[3]`): its caller's name (`pin_key`), and what it was (`Thread::what`); and the calls answered while the clock policy held each of its states (0 not yet applied: the boot's own clocks, 1 rest, 2 active, 3 dark; service.rs `clock_state`), so a slow read says whether the cores were at their reading clocks (2026-11-11).
+pub static STORE_LONGEST: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+pub static STORE_BY_CLOCK: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Forwarded store calls answered (`SYS_REPLY` of a `store_forward` call; owner, 2026-11-11: the display waited 283 ms on the vault's reads of its wallpaper while the vault process served a fraction of that): [0] calls, [1] bytes handed back, [2] timer ticks from the call to the vault's reply (the stamp, the wait for the vault's thread to be given a core, its serving), [3] the longest of those, [4] ticks copying the replies into the callers. `diag "store gets [reset]"`. Under the kernel lock.
 pub static STORE_GETS: [core::sync::atomic::AtomicU64; 5] = [const { core::sync::atomic::AtomicU64::new(0) }; 5];
@@ -1825,6 +1830,7 @@ fn store_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
     let rcap = if set || del { 0 } else { len as u64 };
     if let Some(t) = th(cur) {
         t.called = crate::platform::cntpct();
+        t.what = op as u64 | (more as u64) << 7 | (len as u64) << 8 | offset << 32;
     }
     call_endpoint(f, cur, ep, msg, f.x[4], rcap | STORE_REPLY)
 }
@@ -1865,6 +1871,7 @@ fn export_forward(f: &mut Frame, cur: usize, ep: usize) -> u64 {
     };
     if let Some(t) = th(cur) {
         t.called = crate::platform::cntpct();
+        t.what = VOP_EXPORT as u64 | (len as u64) << 8;
     }
     call_endpoint(f, cur, ep, msg, f.x[2], len as u64 | STORE_REPLY)
 }
@@ -2386,7 +2393,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 frame.x[26] = p.arc.base as u64;
                 frame.x[0] = arg;
                 let mask = t.mask;
-                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask, called: 0 });
+                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask, called: 0, what: 0 });
                 enqueue_back(nt);
                 tr(TR_RUN, nt, 0xFFFF);
                 f.x[0] = 0;
@@ -3559,7 +3566,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
                                 STORE_GETS[0].fetch_add(1, Relaxed);
                                 STORE_GETS[1].fetch_add(n as u64, Relaxed);
                                 STORE_GETS[2].fetch_add(waited, Relaxed);
-                                STORE_GETS[3].fetch_max(waited, Relaxed);
+                                if STORE_GETS[3].fetch_max(waited, Relaxed) < waited {
+                                    STORE_LONGEST[0].store(pin_key(&cp.name), Relaxed);
+                                    STORE_LONGEST[1].store(ct.what, Relaxed);
+                                }
+                                STORE_BY_CLOCK[crate::service::clock_state() as usize & 3].fetch_add(1, Relaxed);
                                 STORE_GETS[4].fetch_add(crate::platform::cntpct() - t0, Relaxed);
                             } else {
                                 let msg = p.read(f.x[1], len);
@@ -5306,7 +5317,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // A masked arc's power-of-two slack (ARCS.md step 4): the frames wholly between its image (code, zeroed tail, input) and its first stack's guard page hold nothing it was built with, and masked code reaches only what it was linked with (its statics, its static heaps, its stacks), so they go back to the pool at once (ahau: 20 MiB of its 128). Not exact mode's, whose limit may grow into it; a native arc is whole frames already.
     // Not given back at spawn (2026-11-11, the Pro's first ARCS boot: ahau's thread 7 wrote at arc offset G#760_0000, inside the 18 MiB released here, and faulted, so the device had no attest screen): a masked no_std process's allocator grows into exactly this span, so it is not slack. A process gives back what it knows it no longer needs itself (SYS_ARC op 3).
     let _ = (masked, floor);
-    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS, called: 0 });
+    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS, called: 0, what: 0 });
     Ok((me, arc, in_off))
 }
 
