@@ -60,6 +60,11 @@ const WORDS: usize = MAX_FRAMES / 64;
 const TABLE: usize = 1 << 12;
 /// Tables in one frame.
 const TABLES_PER_FRAME: usize = FRAME / TABLE;
+/// A map of at most this many frames keeps its level-3 tables here, in the kernel's .bss (Normal memory the table walker reads), not in frames of its own.
+const SMALL_TABLES: usize = 1 << 3;
+#[repr(C, align(4096))]
+struct Small([[u64; 512]; SMALL_TABLES]);
+static mut SMALL: Small = Small([[0; 512]; SMALL_TABLES]);
 
 /// The frames, by index across the map's ranges in order: which are taken, which are known to hold zeros (every frame given back is wiped; a frame not yet taken this boot holds whatever DRAM held), and how many of the first frames hold the level-3 tables (frame k's is table k % 512 of frame k / 512; never handed out, and not one run: husky's ten spill from the page pool's range into the big pool's).
 struct Pool {
@@ -81,7 +86,8 @@ fn pool() -> &'static mut Pool {
         p.total = map().iter().map(|&(lo, hi)| (hi - lo) / FRAME).sum();
         assert!(p.total <= MAX_FRAMES, "frames: the map holds more frames than the pool counts");
         // The tables first, in the first frames: one table per frame, those holding tables included (never mapped, so their own tables are spare).
-        p.table_frames = (p.total * TABLE).div_ceil(FRAME);
+        // A map of a few frames (the handoff path's one 2 MiB pool) keeps its tables in the kernel's own memory (`SMALL`): one frame of tables would leave it none for arcs.
+        p.table_frames = if p.total <= SMALL_TABLES { 0 } else { (p.total * TABLE).div_ceil(FRAME) };
         for f in 0..p.table_frames {
             p.used[f / 64] |= 1 << (f % 64);
             zero(pa(f));
@@ -106,13 +112,18 @@ pub fn pa(f: usize) -> usize {
 
 /// Frame `f`'s level-3 table (the one `cachemap::map_slot` fills when the frame joins an arc).
 pub fn table(f: usize) -> usize {
-    pool();
+    if pool().table_frames == 0 {
+        return (&raw const SMALL) as usize + f * TABLE;
+    }
     pa(f / TABLES_PER_FRAME) + (f % TABLES_PER_FRAME) * TABLE
 }
 
 /// The frame a level-3 table belongs to (`cachemap::slot_table` gives the table of a mapped slot).
 pub fn of_table(t: usize) -> usize {
     let p = pool();
+    if p.table_frames == 0 {
+        return (t - (&raw const SMALL) as usize) / TABLE;
+    }
     let j = (0..p.table_frames).find(|&j| t >= pa(j) && t < pa(j) + FRAME).expect("frames: not a frame's table");
     j * TABLES_PER_FRAME + (t - pa(j)) / TABLE
 }
