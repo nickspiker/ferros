@@ -230,6 +230,19 @@ extern "C" fn panel(grants: u64) -> ! {
         l.s(b"\n");
         l.flush();
     }
+    // akita: the panel's state as ABL left it, once frames run (the reference a later wake is read against).
+    if ferros_sys::akita() {
+        let t0 = now();
+        while FRAME_STARTS.load(Ordering::Acquire) == 0 && now().wrapping_sub(t0) < freq() / 4 {
+            ferros_sys::sleep_until(now() + freq() / 256);
+        }
+        let mut l = Log { grants, buf: [0; 256], n: 0 };
+        l.s(b"display: AK3B at start");
+        dsi_lock();
+        ak3b_state(&dsi, &mut l);
+        dsi_unlock();
+        l.flush();
+    }
     loop {
         let seq = PANEL_SEQ.load(Ordering::Acquire);
         if seq == seen {
@@ -247,6 +260,12 @@ extern "C" fn panel(grants: u64) -> ! {
         if off != screen_off && dsi.alive() {
             screen_off = off;
             dsi_lock();
+            if off && ferros_sys::akita() {
+                let mut l = Log { grants, buf: [0; 256], n: 0 };
+                l.s(b"display: AK3B before its sleep");
+                ak3b_state(&dsi, &mut l);
+                l.flush();
+            }
             if off {
                 let _ = dsi.dcs(&[0x28]);
                 let _ = dsi.dcs(&[0x10]);
@@ -254,15 +273,27 @@ extern "C" fn panel(grants: u64) -> ! {
                 let _ = dsi.dcs(&[0x11]);
                 // The panel's sleep-out settling time before display on (DCS, 120 ms): this thread sleeps, the frames go on.
                 ferros_sys::sleep_until(now() + freq() * 120 / 1000);
+                // akita: GPO_DC again, as Google sends it after every sleep out (`ak3b_init_cmds`, then 110 ms). The sleep drops it from FF to 7F (read back 2026-11-10, before and after a screen off and on), and the panel lights its picture bright at the top and black at the bottom, flickering at half the rate; these five packets sent by hand brought FF and the power mode G#9F back.
+                if ferros_sys::akita() {
+                    for p in [&[0xF0, 0x5A, 0x5A][..], &[0xB0, 0x00, 0x1F, 0xCB], &[0xCB, 0xFF], &[0xF7, 0x0F], &[0xF0, 0xA5, 0xA5]] {
+                        let _ = dsi.dcs(p);
+                    }
+                    ferros_sys::sleep_until(now() + freq() * 110 / 1000);
+                }
                 let _ = dsi.dcs(&[0x29]);
                 // The brightness again (preference 3), with TE2: the panel woke very dark (owner, 2026-11-01), its DBV/HBM sent only when the preference changed.
                 let (_, _, hbm, dbv) = brightness(ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS));
                 set_panel(&dsi, hbm, dbv);
                 PANEL_REPRESENT.store(1, Ordering::Release);
             }
-            dsi_unlock();
             let mut l = Log { grants, buf: [0; 256], n: 0 };
             l.s(if off { b"display: screen off\n" } else { b"display: screen on\n" });
+            // akita: the panel's state after it woke (ak3b_state), against the one logged before it slept.
+            if ferros_sys::akita() && !off {
+                l.s(b"display: AK3B after its wake");
+                ak3b_state(&dsi, &mut l);
+            }
+            dsi_unlock();
             l.flush();
         }
     }
@@ -1368,6 +1399,60 @@ fn set_panel(dsi: &ferros_dsi::Dsim<DsiGrant>, hbm: bool, dbv: u16) -> bool {
     let r = dsi.dcs(&[0xF0, 0x5A, 0x5A]).and_then(|_| dsi.dcs(&[0x53, if hbm { 0xE0 } else { 0x20 }])).and_then(|_| dsi.dcs(&[0x51, (dbv >> 8) as u8, dbv as u8])).and_then(|_| dsi.dcs(&[0xF0, 0xA5, 0xA5]));
     te2(dsi);
     r.is_ok()
+}
+
+/// akita's AK3B read back into `l` (owner, 2026-11-10: after a screen off and on the 8a showed the picture bright at the top and black at the bottom, flickering at half the rate, until a reboot; its power mode read G#9F, awake and on, so the readback is of what Google's driver sends at every wake and ferros does not): the power mode, the DSI error count, DBV, WRCTRLD, the frequency select, the TE select, the pulse settings (F2 at G#0B, BD at G#01 and G#2F), AOD without blink (BB at G#03) and GPO_DC (CB at G#1F), the offset ones addressed by `B0` as Google writes them. Each read twice and the second kept: on akita a read returned the previous read's answer (2026-11-10, op 10, every register in turn).
+fn ak3b_state(dsi: &ferros_dsi::Dsim<DsiGrant>, l: &mut Log) {
+    const READS: [(u8, u8, u8); 11] = [(0x0A, 0, 1), (0x05, 0, 1), (0x52, 0, 2), (0x54, 0, 1), (0x60, 0, 2), (0xB9, 0, 1), (0xF2, 0x0B, 3), (0xBD, 0x01, 4), (0xBD, 0x2F, 1), (0xBB, 0x03, 2), (0xCB, 0x1F, 1)];
+    let mut h = |l: &mut Log, b: u8| l.s(&[b"0123456789ABCDEF"[(b >> 4) as usize], b"0123456789ABCDEF"[(b & 15) as usize]]);
+    let _ = dsi.dcs(&[0xF0, 0x5A, 0x5A]);
+    l.s(b" (G#)");
+    for &(reg, off, n) in READS.iter() {
+        let mut b = [0u8; 4];
+        let mut got = Err(0);
+        for _ in 0..2 {
+            if off != 0 {
+                let _ = dsi.dcs(&[0xB0, 0x00, off, reg]);
+            }
+            got = dsi.read(reg, &mut b[..n as usize]);
+        }
+        l.s(b" ");
+        h(l, reg);
+        if off != 0 {
+            l.s(b"@");
+            h(l, off);
+        }
+        l.s(b":");
+        match got {
+            Ok(k) => b[..k].iter().for_each(|&v| h(l, v)),
+            Err(_) => l.s(b"--"),
+        }
+    }
+    let _ = dsi.dcs(&[0xF0, 0xA5, 0xA5]);
+    l.s(b"\n");
+}
+
+/// What Google's driver sends AK3B at every wake after its sleep out (panel-google-ak3b.c `ak3b_enable`), less the reset, the DSC and PPS (the picture decodes right) and the local HBM: GPO_DC and its 110 ms, HS60, TE on, the column and page window, AOD without blink, then `ak3b_update_wrctrld`'s pulse settings (EVT1 and later, no local HBM) and WRCTRLD. ferros sends none of it at a wake; a test by hand (op 26 with 1) until the readback says which part a sleep loses.
+fn ak3b_wake(dsi: &ferros_dsi::Dsim<DsiGrant>, hbm: bool) -> bool {
+    let on = [0xF0, 0x5A, 0x5A];
+    let off = [0xF0, 0xA5, 0xA5];
+    let steps: [&[u8]; 25] = [
+        &on, &[0xB0, 0x00, 0x1F, 0xCB], &[0xCB, 0xFF], &[0xF7, 0x0F], &off,
+        &on, &[0x60, 0x08, 0x00], &[0xF7, 0x0F], &off,
+        &[0x35], &[0x2A, 0x00, 0x00, 0x04, 0x37], &[0x2B, 0x00, 0x00, 0x09, 0x5F],
+        &on, &[0xB0, 0x00, 0x03, 0xBB], &[0xBB, 0x01, 0x0C], &off,
+        &on, &[0xB0, 0x00, 0x0B, 0xF2], &[0xF2, 0x0C, 0x00, 0x24], &[0xB0, 0x00, 0x01, 0xBD], &[0xBD, 0x81, 0x01, 0x03, 0x03], &[0xB0, 0x00, 0x2F, 0xBD], &[0xBD, 0x02], &[0x60, 0x08, 0x00], &[0xF7, 0x0F],
+    ];
+    let mut ok = true;
+    for (i, s) in steps.iter().enumerate() {
+        ok &= dsi.dcs(s).is_ok();
+        // GPO_DC's settling (Google: "Delay 110 ms after sending GPO_DC settings").
+        if i == 4 {
+            ferros_sys::sleep_until(now() + freq() * 110 / 1000);
+        }
+    }
+    ok &= dsi.dcs(&off).is_ok();
+    ok & dsi.dcs(&[0x53, if hbm { 0xE0 } else { 0x20 }]).is_ok()
 }
 
 /// The panel's TE2 output, the beat the under-display light and proximity sensor (TMD3719) times its bursts to: on, changeable, rising edge G#10 and falling G#30 lines into the frame (panel-google-hk3.c `hk3_update_te2_internal`; ABL leaves it off, and without it the sensor never measured, 2026-10-24). Sent with the brightness and after every display on.
@@ -7234,6 +7319,22 @@ fn server(grants: u64) -> ! {
                     client_owned = true;
                     unsafe { CLIENT_DREW = true };
                     out[1] = moved as u8;
+                    len = 2;
+                }
+                // akita's panel by hand (2026-11-10, the gradient after a wake): `[26]` its state logged (ak3b_state), `[26, 1]` Google's wake set sent first (ak3b_wake). out[1] 1 when every packet of the wake set went.
+                Some(26) if akita => {
+                    let mut l = Log { grants, buf: [0; 256], n: 0 };
+                    dsi_lock();
+                    if m.get(1) == Some(&1) {
+                        let (_, _, hbm, _) = brightness(ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS));
+                        out[1] = ak3b_wake(&dsi, hbm) as u8;
+                        l.s(b"display: AK3B after Google's wake set");
+                    } else {
+                        l.s(b"display: AK3B now");
+                    }
+                    ak3b_state(&dsi, &mut l);
+                    dsi_unlock();
+                    l.flush();
                     len = 2;
                 }
                 Some(10) if m.len() >= 3 => {
