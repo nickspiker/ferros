@@ -1053,7 +1053,7 @@ const SYS_ZONE: u64 = 35;
 const SYS_LANG: u64 = 36;
 /// claim(op, …): the rights in use (`CLAIMS`; owner, 2026-11-10: GPS "stays green but no visuals for satellites since we're not rx'ing ... until something like mahere calls it or I open the GPS screen ... or Photon a friend pings for my location", and "we need to be able to see what kists are using each permission"). A right by its code (ferros_kist::RIGHTS); only GPS is claimed today. Op 0: claim x1 the right, x2 the token offset of what proves the caller may use it (for GPS: Settings, the settings page's, or the `gps` endpoint's send right, a kist's granted want) → 0 (also when it held one already), ERR refused (no such right or proof, nobody present, GPS switched off). Op 1: release x1 the right → 0. Op 2: who claims x1 the right, x2 the Settings token, x3/x4 a buffer and its length → how many claims (all of them; records past the buffer are not written), each `CLAIM_REC` bytes: 0 a system process or 1 a kist, then the kist's capsule address (32 bytes, zeros for a system process); ERR without Settings. Op 3: the GPS driver asked thru the kernel for a Settings holder that holds a GPS claim (the map's page: init's grants page has no slot left for its own `use gps`): x1 the driver's op (0 FIX, 2 SATS, payloads/gps), x2 the Settings token, x3/x4 the reply's buffer and its length with CALL_LIVE set, the call the caller's own as SYS_CALL makes it → the reply's length, ERR at once when no driver is receiving yet; or x1 = 3 | the change count last seen << 8, the driver's WATCH, its length bare (no CALL_LIVE): held until the driver's fixes or fix messages move, taken by a driver that starts later, → 4 bytes, the count now. The position passes thru, never kept. Op 4: the claims' doorbell, x1 a word in the caller's arc, x2 the Settings token: GPS_CLAIMS written there now and at every change, its waiters woken → 0.
 const SYS_CLAIM: u64 = 37;
-/// bell(source, word): a doorbell on what the settings pages show (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure. 1s poll can desync too, that needs fixd."). x0 the source: 0-5 a link in the facts' order (its eight measures, its tracks and its detail document: counted when its driver sets one to a value other than the one it held, and when the driver ends and they empty), `BELL_FACTS` the device's facts a settings page shows (`bell_facts`). x1 a word in the caller's arc, 8-aligned as SYS_WAIT takes one: the kernel writes the source's change count there now and at every change, waking whatever of the process waits on it (`bell_ring`). One word a source a process; a second registration moves it. No capability: the measures, tracks and facts are what SYS_FACTS and SYS_TRACKS give anyone, and a detail's count says when it changed, never what it says. → 0, ERR for no such source.
+/// bell(source, word): a doorbell on what the settings pages show (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure. 1s poll can desync too, that needs fixd."). x0 the source: 0-5 a link in the facts' order (its eight measures, its tracks and its detail document: counted when its driver sets one to a value other than the one it held, and when the driver ends and they empty), `BELL_FACTS` the device's facts a settings page shows (`bell_facts`). `BELL_SURFACES` (9), for the holder of the `surfaces` region alone (the display server): the windows' owners, the word not a count but the four surfaces' live generations, byte k surface k's (its preference byte 8 + k while the process it was given to is alive, 0 otherwise) and a change count above bit 32 (`surfaces_ring`; 2026-11-11, Mahere killed from outside and its window kept the glass). x1 a word in the caller's arc, 8-aligned as SYS_WAIT takes one: the kernel writes the source's change count there now and at every change, waking whatever of the process waits on it (`bell_ring`). One word a source a process; a second registration moves it. No capability: the measures, tracks and facts are what SYS_FACTS and SYS_TRACKS give anyone, and a detail's count says when it changed, never what it says. → 0, ERR for no such source (or the surfaces' without the region).
 const SYS_BELL: u64 = 38;
 /// not_started(op, …): the kist launches init answered "started" for that the kernel's kist job did not start after all, and the kists that started and then ended by a fault, a panic or a kill from outside (`NOT_STARTED`; owner, 2026-11-11: Mahere tapped, nothing opened, "it looked stuck"; then Mahere faulting at once, "no toast or anything"), for the Settings holder alone (the map), as the claims' users list. Op 0: x1 the Settings token, x2/x3 a buffer and its length → how many records (all of them; whole records past the buffer are not written), each `NOT_STARTED_REC` bytes: the reason (ferros_kist::launch::why), the capsule's address (32 bytes), the kists' bell count it rang (u64 LE). Op 1: the kists' doorbell, x1 a word in the caller's arc, x2 the Settings token: the bell's change count written there now and whenever a launch does not start or a kist kept here starts, its waiters woken → 0. ERR without Settings, or for no such op.
 const SYS_NOT_STARTED: u64 = 39;
@@ -1440,7 +1440,7 @@ fn surface_take(epoch: u64) -> Option<usize> {
     Some(k)
 }
 
-/// The surfaces of the process with `epoch` back to free. Under the lock.
+/// The surfaces of the process with `epoch` back to free, and the windows' owners rung (`surfaces_ring`). Under the lock.
 fn surfaces_free(epoch: u64) {
     let owners = unsafe { &mut *(&raw mut SURFACE_OWNER) };
     for k in 0..SURFACE_COUNT {
@@ -1450,6 +1450,36 @@ fn surfaces_free(epoch: u64) {
             write_pref_all(PREF_SURFACES + k, 0);
         }
     }
+    surfaces_ring();
+}
+
+/// The surfaces' bell word as last rung (`BELL_SURFACES`): byte k surface k's live generation, the change count above bit 32.
+static SURFACES_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The windows' owners, from the kernel's own table (owner, 2026-11-11, on the Pro: Mahere killed with `diag kill`, its window stayed in the display's table, op 5 still said an app was in front, and the map ignored every gesture but the corners until the display was restarted): each surface's generation while the process it was given to is alive and not ending, 0 otherwise, rung into the display's bell word when that differs from what was rung last, waking its thread there. Not a copy in each process's preferences page, read on the display's next pass: the kernel's answer to "is this window's owner alive", pushed as it changes. Called where a surface changes hands: freed (every end, `end_process` and `kill_locked` alike, thru `surfaces_free`) and given (once its process is in the table, `build_from`). Under the lock.
+fn surfaces_ring() {
+    let kk = k();
+    let owners = unsafe { &*(&raw const SURFACE_OWNER) };
+    let prefs = unsafe { &*(&raw const PREFS_NOW) };
+    let mut live = 0u64;
+    for s in 0..SURFACE_COUNT {
+        let o = owners[s];
+        if o != 0 && kk.procs.iter().flatten().any(|p| p.epoch == o && !p.dying) {
+            live |= (prefs[PREF_SURFACES + s] as u64) << (8 * s);
+        }
+    }
+    let was = SURFACES_LIVE.load(core::sync::atomic::Ordering::Acquire);
+    if was & 0xFFFF_FFFF == live {
+        return;
+    }
+    let v = ((was >> 32) + 1) << 32 | live;
+    SURFACES_LIVE.store(v, core::sync::atomic::Ordering::Release);
+    bell_ring(BELL_SURFACES, v);
+}
+
+/// Whether process `p` holds the `surfaces` region (the display server: it composes every app's surface, so it alone may watch their owners).
+fn holds_surfaces(p: &Process) -> bool {
+    p.cspace.iter().any(|c| matches!(c.object, Object::Dma(i) if DMA[i].name == "surfaces"))
 }
 /// A named scope of the device vault a spawn can grant: every key under `prefix`. A process names keys relative to its scope and cannot reach outside it (no `/`-style escapes exist: the kernel only ever prepends).
 pub struct StoreScope {
@@ -2995,6 +3025,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let source = f.x[0] as usize;
             f.x[0] = if source <= BELL_FACTS {
                 bell_register(p, pi, source, f.x[1], BELL_COUNT[source].load(core::sync::atomic::Ordering::Acquire))
+            } else if source == BELL_SURFACES && holds_surfaces(p) {
+                bell_register(p, pi, source, f.x[1], SURFACES_LIVE.load(core::sync::atomic::Ordering::Acquire))
             } else {
                 ERR
             };
@@ -3603,11 +3635,12 @@ fn right_is_gps(r: u8) -> bool {
     ferros_kist::RIGHTS.get(r as usize) == Some(&"gps")
 }
 
-/// The bells' sources (SYS_BELL): 0-5 the links in the facts' order, then the facts a settings page shows, then GPS's claims (SYS_CLAIM op 4, for a Settings holder; its word is GPS_CLAIMS itself, which carries its own change count), then the kist launches that did not start (`BELL_KISTS`, SYS_NOT_STARTED op 1, for a Settings holder).
+/// The bells' sources (SYS_BELL): 0-5 the links in the facts' order, then the facts a settings page shows, then GPS's claims (SYS_CLAIM op 4, for a Settings holder; its word is GPS_CLAIMS itself, which carries its own change count), then the kist launches that did not start (`BELL_KISTS`, SYS_NOT_STARTED op 1, for a Settings holder), then the windows' owners (`BELL_SURFACES`, for the holder of the `surfaces` region; its word is `SURFACES_LIVE`, the generations with their own change count).
 pub const BELL_FACTS: usize = 6;
 const BELL_CLAIMS: usize = 7;
 const BELL_KISTS: usize = 8;
-const BELLS: usize = 9;
+const BELL_SURFACES: usize = 9;
+const BELLS: usize = 10;
 /// Each source's change count (the claims' is GPS_CLAIMS'), so a word registered late starts from the count now and a reader tells a change by inequality.
 static BELL_COUNT: [core::sync::atomic::AtomicU64; BELLS] = [const { core::sync::atomic::AtomicU64::new(0) }; BELLS];
 /// The bells' words (SYS_BELL, SYS_CLAIM op 4, SYS_NOT_STARTED op 1): (the process's slot, its epoch, the word's address in its arc, the source). At most one a source a process. Under the kernel lock.
@@ -4292,7 +4325,8 @@ pub fn kill(name: &[u8]) -> bool {
 fn kill_locked(name: &[u8]) -> bool {
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     let kk = k();
-    let Some(i) = kk.procs.iter().position(|p| matches!(p, Some(p) if p.name == name)) else { return false };
+    // A live process of that name, never one already ending: a process left `dying` (a thread of it still on a core) ahead of its relaunch in the table was found first, killed again, and the live one ran on (as `kill`'s record and `kist_request` already skip one).
+    let Some(i) = kk.procs.iter().position(|p| matches!(p, Some(p) if p.name == name && !p.dying)) else { return false };
     surfaces_free(kk.procs[i].as_ref().unwrap().epoch);
     crate::sensorlink::ended(kk.procs[i].as_ref().unwrap().epoch);
     power_orphaned(kk.procs[i].as_ref().unwrap().epoch);
@@ -5104,13 +5138,21 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     let mut cspace = alloc::vec![CapEntry { token: mint(Object::Console, RIGHT_SEND, epoch), object: Object::Console, rights: RIGHT_SEND }];
     for &(object, rights) in objects {
         let object = match object {
-            Object::NewSurface => Object::Dma(surface0() + surface_take(epoch).ok_or("no free surface (four are in use)")?),
+            Object::NewSurface => match surface_take(epoch) {
+                Some(s) => Object::Dma(surface0() + s),
+                // A spawn refused after a surface was given (a second surface, or the grants page full below) gives it back: no process of that epoch will ever end to free it, and a surface held by nobody is lost until a reboot.
+                None => {
+                    surfaces_free(epoch);
+                    return Err("no free surface (four are in use)");
+                }
+            },
             o => o,
         };
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }
     // The tokens end at PREFS_HI (G#FB0, the second preferences block, then the first at G#FC0 and the ihi at G#FE0): a 109th slot's token was once written over the preferences and overwritten by the next preferences write, so init's spawn of the GPU service was refused for a token it held (2026-11-05). Refused here, with the reason, rather than corrupted.
     if TOKENS + 4 + 32 * cspace.len() > PREFS_HI {
+        surfaces_free(epoch);
         return Err("spawn: more grants than the grants page holds (108 slots and the console)");
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };
@@ -5170,6 +5212,8 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
             kk.procs.len() - 1
         }
     };
+    // Its surface's owner alive from here: the display's bell says so before the process can show a window on it.
+    surfaces_ring();
     // A masked arc's power-of-two slack (ARCS.md step 4): the frames wholly between its image (code, zeroed tail, input) and its first stack's guard page hold nothing it was built with, and masked code reaches only what it was linked with (its statics, its static heaps, its stacks), so they go back to the pool at once (ahau: 20 MiB of its 128). Not exact mode's, whose limit may grow into it; a native arc is whole frames already.
     // Not given back at spawn (2026-11-11, the Pro's first ARCS boot: ahau's thread 7 wrote at arc offset G#760_0000, inside the 18 MiB released here, and faulted, so the device had no attest screen): a masked no_std process's allocator grows into exactly this span, so it is not slack. A process gives back what it knows it no longer needs itself (SYS_ARC op 3).
     let _ = (masked, floor);

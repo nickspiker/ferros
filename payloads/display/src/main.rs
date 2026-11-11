@@ -52,7 +52,7 @@ use odt::{odt_tables, panel_gamma, pow};
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use ferros_sys::{cap, console, freq, mmio_read, mmio_write, now};
 use draw::Px;
 
@@ -2911,6 +2911,55 @@ fn working(p: u64, format: u8) -> u64 {
 }
 static mut WINS: [Option<Win>; SURFACES] = [None; SURFACES];
 static mut RAISES: u32 = 0;
+/// The windows' owners as the kernel holds them (SYS_BELL `BELL_SURFACES`): byte k surface k's live generation (0 once the process it was given to has ended, however it ended), the change count above bit 32. Written by the kernel as a surface changes hands, which wakes `reaper` waiting here.
+static SURF_LIVE: AtomicU64 = AtomicU64::new(0);
+/// Whether that bell is registered; a kernel without it leaves the preference bytes alone, as before 2026-11-11.
+static SURF_BELL: AtomicBool = AtomicBool::new(false);
+/// The windows up, for the receive thread (it never reads `WINS`): byte k the generation `WINS[k]` was shown under, 0 for none (`wins_mirror`).
+static WIN_GENS: AtomicU64 = AtomicU64::new(0);
+static mut REAP_STACK: [u8; 16384] = [0; 16384];
+
+/// Surface k's live generation: its preference byte (bytes 8-11, the kernel's copy in this process's page) and, with the bell registered, the bell's byte too; 0 when either says its owner is gone. The kernel changes both under its lock and only as the surface changes hands, so a disagreement is a hand-over in progress, when a window on the surface belongs to an owner that has ended anyway.
+fn live_gen(k: usize) -> u8 {
+    let g = ferros_sys::pref(8 + k as u64);
+    if SURF_BELL.load(Ordering::Acquire) && (SURF_LIVE.load(Ordering::Acquire) >> (8 * k)) as u8 != g { 0 } else { g }
+}
+
+/// `WINS` as `WIN_GENS`, after every change to it.
+fn wins_mirror() {
+    let mut v = 0u64;
+    for k in 0..SURFACES {
+        if let Some(w) = unsafe { WINS[k] } {
+            v |= (w.generation as u64) << (8 * k);
+        }
+    }
+    WIN_GENS.store(v, Ordering::Release);
+}
+
+/// Op 5's byte 12, an app in front: a window up whose owner lives. From `WIN_GENS` and the live generations, not `APP`, so the map hears the moment a front app's process ends (owner, 2026-11-11, on the Pro: Mahere killed with `diag kill`, op 5 kept saying an app was in front, and the map ignored every gesture but the corners until the display was restarted), whatever the render thread is doing; its next pass drops the window and gives the map the glass (`reaper`).
+fn app_live() -> bool {
+    let w = WIN_GENS.load(Ordering::Acquire);
+    (0..SURFACES).any(|k| {
+        let g = (w >> (8 * k)) as u8;
+        g != 0 && g == live_gen(k)
+    })
+}
+
+/// The windows' owners' doorbell: asleep on the bell word until the kernel rings it (a surface freed as its process ends, or given out), then the render thread woken off the ring's tail for a pass, whose top drops every window whose owner is gone. No timer: a process's end is the only thing that wakes it.
+extern "C" fn reaper(_: u64) -> ! {
+    let mut seen = SURF_LIVE.load(Ordering::Acquire);
+    loop {
+        ferros_sys::wait(&SURF_LIVE, seen, 0);
+        let v = SURF_LIVE.load(Ordering::Acquire);
+        if v != seen {
+            seen = v;
+            REAPS.fetch_add(1, Ordering::Release);
+            ferros_sys::wake(&RING_TAIL, 1);
+        }
+    }
+}
+/// Rings `reaper` has passed on, so the render thread does not sleep thru one that came while it was busy (it compares before it waits).
+static REAPS: AtomicU64 = AtomicU64::new(0);
 /// Bit 63 of a surface pixel: see-through.
 const CLEAR: u64 = 1 << 63;
 /// The rows outside the app's circle at the top and at the bottom (`chrome_rows`): the bars' rows.
@@ -3674,6 +3723,7 @@ static mut CAPTURE: usize = 0;
 fn windows_changed(width: usize, height: usize) {
     let full = draw::Rect::full(width, height);
     layout_build(width, height);
+    wins_mirror();
     unsafe {
         PHASE_DIRTY = [full; PHASES];
         clean_reset_all();
@@ -5696,7 +5746,7 @@ extern "C" fn receive(grants: u64) -> ! {
             out[2..4].copy_from_slice(&h.to_le_bytes());
             out[4..8].copy_from_slice(&(FRAMES.load(Ordering::Relaxed) as u32).to_le_bytes());
             out[8..12].copy_from_slice(&((now() / freq()) as u32).to_le_bytes());
-            out[12] = unsafe { APP }.is_some() as u8;
+            out[12] = app_live() as u8;
             ferros_sys::reply(&tok, &out);
             continue;
         }
@@ -6215,6 +6265,17 @@ fn server(grants: u64) -> ! {
     // The bars' producer (`console_worker`), on the workers with the rest.
     if ferros_sys::thread_spawn(console_worker, unsafe { &mut *(&raw mut CON_STACK) }, (width as u64) << 32 | height as u64) != 0 {
         log.s(b"display: no console worker\n");
+        log.flush();
+    }
+    // The windows' owners (`reaper`): the kernel's bell on the surfaces changing hands, then the thread asleep on it. A kernel without the bell: the preference bytes alone, read each pass, as before.
+    if ferros_sys::bell(ferros_sys::BELL_SURFACES, &SURF_LIVE) {
+        SURF_BELL.store(true, Ordering::Release);
+        if ferros_sys::thread_spawn(reaper, unsafe { &mut *(&raw mut REAP_STACK) }, 0) != 0 {
+            log.s(b"display: no reaper thread\n");
+            log.flush();
+        }
+    } else {
+        log.s(b"display: no surfaces bell (an older kernel): windows of ended processes go on the next pass\n");
         log.flush();
     }
     // The render thread on the big core (KERNEL.md "Cores": pinning by latency class — this is the one real compute path; receive and vsync stay on the workers, where the map and the touch server run, so a call hands off on the caller's own core). After the other threads are spawned: they inherit the mask.
@@ -7172,10 +7233,10 @@ fn server(grants: u64) -> ! {
                     let v = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]) as i32;
                     let rect = draw::Rect { x0: v(1), y0: v(3), x1: v(1) + v(5), y1: v(3) + v(7) };
                     let base = u64::from_le_bytes(m[9..17].try_into().unwrap());
-                    match surface_of(base) {
-                        Some(sk) if ten && unsafe { TEMPORAL } && ferros_sys::pref(8 + sk as u64) != 0 => {
+                    // The surface's live generation read once: read twice (once to refuse a dead surface, once to keep), a process ending between the two reads left a window kept under generation 0, which no later byte ever differed from, so it stayed in front for good. 0, its owner gone (a show queued before it ended): refused.
+                    match surface_of(base).map(|sk| (sk, live_gen(sk))) {
+                        Some((sk, generation)) if ten && unsafe { TEMPORAL } && generation != 0 => {
                             let full = draw::Rect::full(width, height);
-                            let generation = ferros_sys::pref(8 + sk as u64);
                             // What changed (ferros_sys `show_changed`: [x u16][y u16][w u16][h u16] after the format byte): only that part is published and owed by the other phases — when the window is already up as it was (same generation, place and level) and the screen composed. Otherwise, and for a plain show, the whole screen.
                             let mode = if m.len() > 27 { m[27] } else { 0 };
                             let same = unsafe { WINS[sk] }.is_some_and(|w| w.generation == generation && w.rect == rect && w.level == m[17] && w.mode == mode) && unsafe { APP }.is_some();
@@ -7187,6 +7248,7 @@ fn server(grants: u64) -> ! {
                                     RAISES += 1;
                                     WINS[sk] = Some(Win { generation, level: m[17], order: RAISES, rect, format: if m.len() > 18 { m[18] } else { 0 }, mode });
                                     layout_build(width, height);
+                                    wins_mirror();
                                 }
                                 if OP22_US[4] == 0 {
                                     OP22_US[0] = t_chrome - t22;
@@ -7468,7 +7530,7 @@ fn server(grants: u64) -> ! {
                     out[2..4].copy_from_slice(&(height as u16).to_le_bytes());
                     out[4..8].copy_from_slice(&(frames as u32).to_le_bytes());
                     out[8..12].copy_from_slice(&((now() / freq()) as u32).to_le_bytes());
-                    out[12] = unsafe { APP }.is_some() as u8;
+                    out[12] = app_live() as u8;
                     len = 13;
                 }
                 // The panel, through DSIM: every write bracketed by the hk3 level-2 unlock/lock as the stock driver does.
@@ -7735,14 +7797,20 @@ fn server(grants: u64) -> ! {
                 }
             }
         }
-        // Windows whose process ended (the kernel cleared or renewed its surface's generation byte): gone, and what was behind them shows. Then the corners' clock, once a minute while windows are up, into every phase over its corner.
+        // Windows whose process ended (the kernel cleared or renewed its surface's generation, `live_gen`; `reaper` wakes this pass when it does): gone, and what was behind them shows; the last one gone, the map has the glass again. Then the corners' clock, once a minute while windows are up, into every phase over its corner.
+        let reaps_seen = REAPS.load(Ordering::Acquire);
         unsafe {
             let mut gone = false;
             for sk in 0..SURFACES {
                 if let Some(w) = WINS[sk] {
-                    if ferros_sys::pref(8 + sk as u64) != w.generation {
+                    if live_gen(sk) != w.generation {
                         WINS[sk] = None;
                         gone = true;
+                        let mut l = Log { grants, buf: [0; 256], n: 0 };
+                        l.s(b"display: the window on surface ");
+                        l.dec(sk as u64);
+                        l.s(b" dropped: its process ended\n");
+                        l.flush();
                     }
                 }
             }
@@ -8149,7 +8217,8 @@ fn server(grants: u64) -> ! {
             }
         }
         let tail = RING_TAIL.load(Ordering::Acquire);
-        if tail == seen_tail {
+        // A ring that came after this pass's top (`reaper`'s wake found this thread busy, not waiting): straight on to the next pass, which drops the window.
+        if tail == seen_tail && REAPS.load(Ordering::Acquire) == reaps_seen {
             ferros_sys::wait(&RING_TAIL, tail, wake);
         }
         seen_tail = RING_TAIL.load(Ordering::Acquire);
