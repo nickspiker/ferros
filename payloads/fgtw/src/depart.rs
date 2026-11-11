@@ -387,7 +387,7 @@ impl Client {
                 self.log.put(reason.as_bytes());
             }
             // The add's notes (add.rs): the departure machine says none of them.
-            Note::AddNoFleetKey | Note::AsksToJoin { .. } | Note::Picked { .. } | Note::PickUnreachable { .. } | Note::AddBusy | Note::AddLockedOut { .. } | Note::AddOwnedElsewhere { .. } | Note::Adding { .. } | Note::Added { .. } | Note::AddFailed { .. } => return,
+            Note::AddNoFleetKey | Note::AsksToJoin { .. } | Note::Picked { .. } | Note::PickUnreachable { .. } | Note::AddBusy | Note::AddLockedOut { .. } | Note::AddOwnedElsewhere { .. } | Note::Adding { .. } | Note::Added { .. } | Note::AddFailed { .. } | Note::ListFailed { .. } => return,
         }
         self.log.line();
     }

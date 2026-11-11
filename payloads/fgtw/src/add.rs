@@ -1,9 +1,9 @@
 //! Adding a device to the fleet, the sponsor's side, on fgtw's shared machine (`fgtw::flow::add`, FLOWS.md stage 3, the one Photon runs): the Fleet page shown opens the flow and the radios, an NFC tap or fully typed words add at once, a touch on a row selects (the device turns green, Yes adds, No drops the pick), only a member holding the fleet key adds, locked and owned-elsewhere devices are refused, and a grow never reaches a locked device.
 //! This file decides nothing about an add: it tells the machine what happened and carries out what it asks.
 //!
-//! - **Made** once the roots are in hand (`add_start`), from its state in the vault when there is one, then told the fold of every chain adopted (`add_fold`: members, locked devices, locked plates) and whether this device holds the fleet key (`add_key`). An add under way when the device stopped is resumed only once a fold has been told (`add_resume`): a grow resumed before the members are known would seal the key to the newcomer alone.
+//! - **Made** once the roots are in hand (`add_start`), from its state in the vault when there is one, then told the fold of every chain adopted (`add_fold`: members, locked devices, locked plates) and whether this device holds the fleet key when it arrives or goes (`add_key`). An add under way when the device stopped is resumed as soon as the machine is made: before any fold the machine waits, and the first fold carries the resume out, so a grow names the whole fleet.
 //! - **Kept** in the `fgtw.` scope as `add` (`ADD_KEY`), whatever unlock-at-boot says: the machine's state as one VSF document (`Add::to_vsf`), the newcomer's key and how far its add got; no root is in it, the roots in hand give it back when it is read (kept.rs).
-//! - **Fed**: the Fleet page shown or gone (op 8), a `bind_req` from the LAN with its source address, a beacon under our handle from a device not in the fold (`LanHeard`), the BLE beacon ids the Bluetooth driver lists (op 5: a new id at once, every listed id again at the machine's wake), a tag's secret the NFC reader read (op 6), the person's touch (op 10), Yes (op 12), No (op 8 [1] while a device is selected, the map's No), words typed (op 11), "type its words" (op 15 [1], the edge that reads fgtw.org's registry), PT's word on each send, a member reachable, a network up, and each job's answer.
+//! - **Fed**: the Fleet page shown or gone (op 8), a `bind_req` from the LAN with its source address, a beacon under our handle from a device not in the fold (`LanHeard`), the BLE beacon ids the Bluetooth driver lists (op 5: a new id at once, every id still listed again at the machine's wake, then the wake itself), a failed read of fgtw.org's registry, a tag's secret the NFC reader read (op 6), the person's touch (op 10), Yes (op 12), No (op 8 [1] while a device is selected, the map's No), words typed (op 11), "type its words" (op 15 [1], the edge that reads fgtw.org's registry), PT's word on each send, a member reachable, a network up, and each job's answer.
 //! - **Slow work** (signing a frame, the registry's read, the bind, the grow, our chain to a device or the fleet) is queued and run by the loop (`add_work`), pinned to the X3 where it signs or publishes, never inside a call another process waits on.
 //! - **Sends** go by Photon Transport to the address the device was last heard at: a member's from the fleet devices heard (`sponsors`), a newcomer's from its `bind_req` (`Seen`). PT's answer names the frame by its hash, mapped back to the device (route.rs). A device with no address here is reported given up at once (ferros has no relay): a selected device so reached is `PickUnreachable`, and a fan-out member is handed the key when it is next heard.
 //! - **The Fleet page** (payloads/map) reads op 9, built from the machine's view (addview.rs), and the doorbell; each `Note` sets what op 9's note says and puts a line on the console.
@@ -46,27 +46,23 @@ pub struct Sponsoring {
     shown: bool,
     /// The radios the machine wants: (the NFC reader, the BLE scan).
     pub radios: (bool, bool),
-    /// The machine's one deadline (Eagle oscillations): a request or a nearby mark lapses then.
-    wake: Option<i64>,
-    /// The fold told last (members, locked) and its chain's op count: a chain with fewer ops is older than the fleet as told and is not told.
+    /// The machine's one deadline (Eagle oscillations) and why: a request or a nearby mark lapses then.
+    wake: Option<(i64, fgtw::flow::Wake)>,
+    /// The fold told last (its members) and its chain's op count: a chain with fewer ops is older than the fleet as told and is not told.
     members: Vec<[u8; 32]>,
-    locked: Vec<[u8; 32]>,
     ops_told: usize,
-    /// A kept add waits for the first fold before it resumes.
-    resumed: bool,
     /// The beacon ids the Bluetooth driver listed at its last read, and how many and how many of the rows matched one when last said.
     ble: Vec<[u8; fgtw::pair::BEACON_UUID_LEN]>,
     ble_said: (usize, usize),
-    /// What op 9's note says (the last `Note`), and the page refused for want of the fleet key.
+    /// What op 9's note says (the last `Note`), the page refused for want of the fleet key, and the note being a failed registry read (a read that then succeeds takes it away).
     note: String,
     refused: bool,
-    /// The device the add under way is for (op 9's `ROW_ADDING`).
-    adding: Option<[u8; 32]>,
+    list_failed: bool,
 }
 
 impl Sponsoring {
     pub const fn new() -> Sponsoring {
-        Sponsoring { m: None, work: Vec::new(), sends: route::Sends::new(), unsent: Vec::new(), addrs: Vec::new(), shown: false, radios: (false, false), wake: None, members: Vec::new(), locked: Vec::new(), ops_told: 0, resumed: false, ble: Vec::new(), ble_said: (0, 0), note: String::new(), refused: false, adding: None }
+        Sponsoring { m: None, work: Vec::new(), sends: route::Sends::new(), unsent: Vec::new(), addrs: Vec::new(), shown: false, radios: (false, false), wake: None, members: Vec::new(), ops_told: 0, ble: Vec::new(), ble_said: (0, 0), note: String::new(), refused: false, list_failed: false }
     }
 
     /// Everything of an identity forgotten (new roots, a departure's wipe); whether the page shows is the map's and stays.
@@ -92,10 +88,15 @@ impl Client {
     pub fn add_event(&mut self, ev: Flow) -> Vec<Note> {
         let Some(m) = self.add.m.as_mut() else { return Vec::new() };
         let step = m.step(ev, eagle());
-        self.add.wake = step.wake.map(|(t, _)| t);
+        self.add.wake = step.wake;
         let notes = step.actions.iter().filter_map(|a| if let Action::Note(n) = a { Some(n.clone()) } else { None }).collect();
         self.add_carry(step.actions);
         self.add_unsent();
+        // A refusal the page showed is gone once the flow opens, whatever opened it (the fleet key arriving, or a fold naming this device while the page shows).
+        if self.add.refused && self.add_phase() != Phase::Closed {
+            self.add.refused = false;
+            self.add.note.clear();
+        }
         notes
     }
 
@@ -104,7 +105,7 @@ impl Client {
         while let Some(to) = self.add.unsent.pop() {
             let Some(m) = self.add.m.as_mut() else { return };
             let step = m.step(Flow::Sent { to, ok: false }, eagle());
-            self.add.wake = step.wake.map(|(t, _)| t);
+            self.add.wake = step.wake;
             self.add_carry(step.actions);
         }
     }
@@ -130,9 +131,16 @@ impl Client {
                 None
             }
         });
-        // A kept add resumes once a fold is told; a fresh machine has nothing to resume.
-        self.add.resumed = kept.is_none();
-        self.add.m = Some(kept.unwrap_or_else(|| Add::new(hp, seed, self.me, kept::REPORTS_SENT)));
+        let mut m = kept.unwrap_or_else(|| Add::new(hp, seed, self.me, kept::REPORTS_SENT));
+        // An add kept from before the restart carries on: before any fold the machine asks for nothing and waits, and the first fold (just below, or a chain adopted later) runs it with the members it names.
+        let resumed = m.view().adding.is_some().then(|| m.resume());
+        self.add.m = Some(m);
+        if let Some(step) = resumed {
+            self.log.put(b"fgtw: resuming the add kept from before the restart");
+            self.log.line();
+            self.add_carry(step.actions);
+            self.add_unsent();
+        }
         self.add_key();
         let held = self.held.borrow().get(&hp).cloned();
         if let Some(blob) = held {
@@ -143,30 +151,10 @@ impl Client {
         }
     }
 
-    /// A kept add carried on, once the members are known.
-    fn add_resume(&mut self) {
-        if self.add.resumed {
-            return;
-        }
-        self.add.resumed = true;
-        let Some(m) = self.add.m.as_mut() else { return };
-        let step = m.resume();
-        if !step.actions.is_empty() {
-            self.log.put(b"fgtw: resuming the add kept from before the restart");
-            self.log.line();
-        }
-        self.add_carry(step.actions);
-        self.add_unsent();
-    }
-
-    /// Whether this device holds the fleet key, told to the machine (it opens a page already shown when the key arrives, and so when the fold that names this device a member arrives after the page was shown: `add_fold` tells it again). A refusal the page showed is gone once the flow opens.
+    /// Whether this device holds the fleet key, told to the machine when it arrives or goes (it opens a page already shown when the key arrives; the machine re-checks the same gate itself at every fold).
     pub fn add_key(&mut self) {
         let held = self.fleet_key.is_some();
         self.add_event(Flow::FleetKey { held });
-        if self.add.refused && self.add_phase() != Phase::Closed {
-            self.add.refused = false;
-            self.add.note.clear();
-        }
     }
 
     /// A chain's fold for the machine (every adoption): its members, the locked devices and their plates. A chain with fewer ops than one already told is older and is left out.
@@ -177,14 +165,9 @@ impl Client {
         let (Ok(members), Ok(locked), Ok(plates)) = (blob.fold(), blob.locked_out(), blob.locked_plates()) else { return };
         self.add.ops_told = blob.ops.len();
         self.add_event(Flow::LockedPlates { plates: &plates });
+        // The machine re-checks the fleet-key gate at every fold while the page shows (a page shown before this device's fold was known opens now), and runs an add resumed before it.
         self.add_event(Flow::Members { members: &members, locked: &locked });
         self.add.members = members;
-        self.add.locked = locked;
-        // The machine opens a shown page on the fleet key's edge only; a page shown before this device's fold was known (unlock-at-boot off: the chain comes after the roots) opens now.
-        if self.add.shown {
-            self.add_key();
-        }
-        self.add_resume();
     }
 
     /// A `bind_req` from the LAN, with the address it came from.
@@ -239,9 +222,9 @@ impl Client {
         }
     }
 
-    /// The machine's deadline, checked once a pass of the loop: what lapses then is told by the fold again (the machine rebuilds its rows on it), after every beacon id the driver still lists, so a device still heard stays nearby.
+    /// The machine's deadline, checked once a pass of the loop: told to it as come (`Wake`, it rebuilds its rows on what lapsed), after every beacon id the driver still lists, which is a measurement and no stand-in: the driver lists an id each read while it hears it, this file tells an id only when it first appears, so without these a device heard all along would lapse from nearby.
     pub fn add_wake_check(&mut self) {
-        let Some(at) = self.add.wake else { return };
+        let Some((at, reason)) = self.add.wake else { return };
         if eagle() < at {
             return;
         }
@@ -249,12 +232,7 @@ impl Client {
         for id in self.add.ble.clone() {
             self.add_event(Flow::BeaconHeard { id });
         }
-        // Before any fold there is no fleet to tell again (and the flow cannot be open, so no wake is asked for).
-        if self.add.ops_told == 0 {
-            return;
-        }
-        let (members, locked) = (self.add.members.clone(), self.add.locked.clone());
-        self.add_event(Flow::Members { members: &members, locked: &locked });
+        self.add_event(Flow::Wake { reason });
     }
 
     /// Op 8: the Fleet page shown (1) or gone (0). The map's No on a selected device is also [8][1] (No does what Back does): it drops the pick. Answers 0.
@@ -303,16 +281,9 @@ impl Client {
             return alloc::vec![6, 0];
         }
         let seen = self.add_event(Flow::Words { text });
-        let added = seen.iter().find_map(|n| match n {
-            Note::Adding { device } => Some(*device),
-            _ => None,
-        });
-        let name = match (added, self.identity_seed) {
-            (Some(d), Some(seed)) => Some(fgtw::pair::device_name_default(&d, &seed)),
-            _ => None,
-        };
+        let added = seen.iter().any(|n| matches!(n, Note::Adding { .. }));
         match self.add_view() {
-            Some(v) => addview::words(&v, name.as_deref()),
+            Some(v) => addview::words(&v, added),
             None => alloc::vec![6, 0],
         }
     }
@@ -325,8 +296,8 @@ impl Client {
     /// Op 9, the add flow for the Fleet page (addview.rs `reply`).
     pub fn add_reply(&self) -> Vec<u8> {
         match self.add_view() {
-            Some(v) => addview::reply(&v, self.add.refused, self.add.adding, &self.add.note, self.net_up),
-            None => alloc::vec![0, 0, 0, 0, 0, 0],
+            Some(v) => addview::reply(&v, self.add.refused, &self.add.note, self.net_up),
+            None => alloc::vec![0, 0, 0, 0, 0, 0, 0],
         }
     }
 
@@ -401,6 +372,7 @@ impl Client {
     /// What the machine says the person should be told: op 9's note and a line on the console.
     fn add_note(&mut self, n: Note) {
         let seed = self.identity_seed;
+        self.add.list_failed = matches!(n, Note::ListFailed { .. });
         match n {
             Note::AddNoFleetKey => {
                 self.add.refused = self.add_phase() == Phase::Closed;
@@ -442,26 +414,29 @@ impl Client {
                 self.log.put(b" belongs to another identity's fleet: refused");
             }
             Note::Adding { device } => {
-                self.add.adding = Some(device);
                 self.add.note.clear();
                 self.log.put(b"fgtw: adding ");
                 self.say_device(&device, seed);
                 self.log.put(b" to the fleet");
             }
             Note::Added { device } => {
-                self.add.adding = None;
                 self.add.note = String::from("added");
                 self.log.put(b"fgtw: ");
                 self.say_device(&device, seed);
                 self.log.put(b" is in the fleet; the fleet key is on its way to it and the members");
             }
             Note::AddFailed { device, reason } => {
-                self.add.adding = None;
                 self.log.put(b"fgtw: adding ");
                 self.say_device(&device, seed);
                 self.log.put(b" failed: ");
                 self.log.put(reason.as_bytes());
                 self.add.note = reason;
+            }
+            // The rows already shown stay; the page says the read failed, and a read that succeeds later takes the note away (`Work::List`).
+            Note::ListFailed { reason } => {
+                self.log.put(b"fgtw: fgtw.org's list of devices asking was not read: ");
+                self.log.put(reason.as_bytes());
+                self.add.note = alloc::format!("fgtw.org could not be read: {reason}");
             }
             // The departure's notes: the add machine says none of them.
             Note::LastDevice | Note::DepartAsking | Note::DepartNotSent(_) | Note::DepartDenied { .. } | Note::DepartDone | Note::DepartAsked { .. } | Note::DepartDeniedHere { .. } | Note::DepartDeniedElsewhere { .. } | Note::DepartSettled { .. } | Note::DepartWithdrawn { .. } | Note::DepartApproved { .. } | Note::DepartApproveFailed { .. } => return,
@@ -507,11 +482,9 @@ impl Client {
                     };
                 }
                 Work::List => {
-                    // Offline the read would only wait out its timeout: nothing listed, said so.
+                    // Offline the read would only wait out its timeout: failed at once, the rows kept.
                     if !self.net_up {
-                        self.log.put(b"fgtw: no network: fgtw.org's devices asking are not read");
-                        self.log.line();
-                        self.add_event(Flow::Listed { reqs: &[], owned_elsewhere: &[] });
+                        self.add_event(Flow::ListFailed { reason: "no network" });
                         continue;
                     }
                     ferros_sys::pin(ferros_sys::CORES_BIG);
@@ -538,13 +511,14 @@ impl Client {
                             self.log.dec(owned.len() as u64);
                             self.log.put(b" of them another identity's");
                             self.log.line();
+                            if self.add.list_failed {
+                                self.add.list_failed = false;
+                                self.add.note.clear();
+                            }
                             self.add_event(Flow::Listed { reqs: &reqs, owned_elsewhere: &owned });
                         }
                         Err(e) => {
-                            self.log.put(b"fgtw: fgtw.org's list of devices asking failed: ");
-                            self.log.put(e.as_bytes());
-                            self.log.line();
-                            self.add_event(Flow::Listed { reqs: &[], owned_elsewhere: &[] });
+                            self.add_event(Flow::ListFailed { reason: &e });
                         }
                     }
                 }

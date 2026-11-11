@@ -195,29 +195,28 @@ mod tests {
         assert!(matches!(read_add(&[1, 2, 3], &HP, &SEED, &me), KeptAdd::Unreadable(_)));
     }
 
-    /// Why add.rs resumes a kept add only after the first fold: resumed before the members are known, the machine grows the fan-out to the newcomer alone; resumed after, to every live member and the newcomer.
+    /// Why add.rs resumes a kept add as soon as the machine is made: resumed before the members are known, the machine asks for nothing and waits, and the first fold grows the fan-out to every live member and the newcomer; resumed after, the same grow at once.
     #[test]
-    fn a_kept_grow_resumes_to_the_members_only_once_they_are_told() {
-        let grow_to = |m: &mut Add| -> Vec<[u8; 32]> {
-            m.resume()
-                .actions
-                .into_iter()
-                .find_map(|a| match a {
-                    Action::Job(fgtw::flow::Job::Grow { members, .. }) => Some(members),
-                    _ => None,
-                })
-                .expect("a grow asked for")
+    fn a_kept_grow_resumes_to_the_members_whenever_resume_comes() {
+        let grow = |actions: Vec<Action>| -> Option<Vec<[u8; 32]>> {
+            actions.into_iter().find_map(|a| match a {
+                Action::Job(fgtw::flow::Job::Grow { mut members, .. }) => {
+                    members.sort();
+                    Some(members)
+                }
+                _ => None,
+            })
         };
         let (m, me, other, dev) = growing();
-        let doc = m.to_vsf(T).unwrap();
-        let KeptAdd::Machine(mut early) = read_add(&doc, &HP, &SEED, &me) else { panic!("the kept add did not read") };
-        assert_eq!(grow_to(&mut early), alloc::vec![dev]);
-        let KeptAdd::Machine(mut told) = read_add(&doc, &HP, &SEED, &me) else { panic!("the kept add did not read") };
-        told.step(Event::Members { members: &[me, other, dev], locked: &[] }, T);
-        let mut to = grow_to(&mut told);
-        to.sort();
         let mut want = alloc::vec![me, other, dev];
         want.sort();
-        assert_eq!(to, want);
+        let doc = m.to_vsf(T).unwrap();
+        let KeptAdd::Machine(mut early) = read_add(&doc, &HP, &SEED, &me) else { panic!("the kept add did not read") };
+        assert!(early.resume().actions.is_empty(), "a resume before the fold asks for nothing");
+        let s = early.step(Event::Members { members: &[me, other, dev], locked: &[] }, T);
+        assert_eq!(grow(s.actions), Some(want.clone()), "the first fold runs the waiting resume");
+        let KeptAdd::Machine(mut told) = read_add(&doc, &HP, &SEED, &me) else { panic!("the kept add did not read") };
+        told.step(Event::Members { members: &[me, other, dev], locked: &[] }, T);
+        assert_eq!(grow(told.resume().actions), Some(want));
     }
 }
