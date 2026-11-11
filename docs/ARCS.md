@@ -1,6 +1,6 @@
 # ARCS: process memory that scales on demand
 
-A proposal for the owner to mark up (2026-11-11). Nothing here is built yet.
+Approved 2026-11-11 (owner: "Looks good, build it!"): 2 MiB frames for every arc ("2MB frame size across the board is totally fine by me"), a move at any moment ("a move can happen at any moment"), and the Mahere changes below.
 KERNEL.md module 3 (ring memory) and SANDBOX.md (the three masking modes) are the design this serves; this doc is how the kernel gets from today's arcs to theirs.
 
 ## Why (2026-11-10, Mahere would not open)
@@ -61,7 +61,5 @@ Capsules, seals, the three masking modes, the checker, grants and capability IPC
 
 ## For the owner
 
-- Frame sizes: 2 MiB and 4 KiB, or 2 MiB only (simpler, wastes up to 2 MiB per small driver; there are about 20 of them).
 - A process's ceiling: from its build (`__ferros_heap` as a cap), from a person's setting per kist, or none (the device's free memory is the only limit).
-- Whether a move may happen while an app is in front, or only at a launch, a background or a screen off.
 - Mahere's own changes (owner, 2026-11-11: "a few things should be redesigned in mahere, check"): draw into a display surface instead of three full-screen frames of its own (about 32 MB back), and its heap as a ceiling once step 2 exists.
