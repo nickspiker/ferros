@@ -30,7 +30,7 @@
 //! - 49 `radio` and 50 `check [cx i16][cy i16][px u16][mark u16][stroke u16 Q8][state u8][stroke colour][fill][ink][tick][utf8 label]`: a radio button or a checkbox with its label, centred together (COMPOSITOR.md "Controls").
 //! - 22 `app [x u16][y u16][w u16][h u16]`: the app in front's frame, its 16-bit pixels in the `app-surface` region (R, G, B in bits 0-15, 16-31, 32-47: working values, gamma 2, white = Q14; bit 48 = no dither), published at full precision; 23 `app done`: the screen is the map's again. Op 5's reply carries whether an app is in front (byte 12).
 //! - 21 `ramps [column u8]`: the present stage's test screen, or one column of it alone on black between two thin white lines (dithered bands: our 4×4 to 8 bits, 12 effective; undithered: the 8-bit truncation), straight from 16-bit working values (see `ramps`); status 3 when the pipe is not in 10 bits.
-//! - 56 `quick [pull i32 Q16][flags u8][torch level u8][held u8][press radio u8][brightness ring u16 Q16][torch ring u16 Q16][press u16 Q16]`: the quick row's state from the map (quick.rs `set`, docs/QUICK.md), drawn by the console's worker; answered at once. Op 41 answers the row's circles (32 + k, then x, y, r u16), its doorway (10), the top's other ground (11) and behind it (12).
+//! - 56 `quick [offset i32][flags u8][torch level u8][held u8][press radio u8][brightness ring u16 Q16][torch ring u16 Q16][unused u16]`: the quick row's state from the map (quick.rs `set`, docs/QUICK.md): its slide offset in whole pixels and its circles' looks, composed by the console's worker; answered at once with [0][the slide's length u16]. Op 41 answers the row's circles (32 + k, then x, y, r u16) while it is open, its doorway (10), the top's other ground (11) and behind it (12).
 //! - 24 `frame wait`: returns once the panel's next frame has started, or after a hundred-and-twentieth of a second when no frame is in flight (a command-mode panel starts a frame only when one is armed); the reply is the frame-start count, u32. A client that draws once per return is locked to the panel's refresh: it reads its input right after a frame starts and its update is ready for the next one (the map, while a finger is down).
 //! The scene is retained here so a frame costs the client three numbers rather than one call per circle: nothing on the map ever moves, so between scene changes only the camera does.
 //! fluor's order holds inside a frame: what a client sends first is on top.
@@ -2987,10 +2987,10 @@ static mut CON_GLYPHS: Option<glyphs::Glyphs> = None;
 static mut CONSOLE_KEY: i64 = -1;
 /// Each console circle's look at its last draw (`console_draw`; 0 not drawn), whether the console was ever drawn whole, and the rows the last draw changed, [lo, hi) of the bars' rows.
 static mut CON_CIRCLE_KEYS: [u64; CON_CIRCLES] = [0; CON_CIRCLES];
-/// Each console circle where it was last drawn (x, y, r): a quick circle moves, and a redraw empties where it was as well as where it is.
+/// Each console circle where it was last drawn (x, y, r): a circle that moved empties where it was as well as where it is (none moves today: the quick row moved until 2026-11-11, and slides in its own sprite now).
 static mut CON_CIRCLE_AT: [(f32, f32, f32); CON_CIRCLES] = [(0., 0., 0.); CON_CIRCLES];
-/// The console's circles: the corners' (at most 16) and the quick row's.
-const CON_CIRCLES: usize = 16 + quick::N;
+/// The console's circles: the corners' (at most 16).
+const CON_CIRCLES: usize = 16;
 static mut CON_DRAWN: bool = false;
 static mut CON_ROWS: (usize, usize) = (0, 0);
 /// Measuring the console's redraws: the parts of its key at the last draw, how often each has moved, the draws' summed time and their count.
@@ -3749,8 +3749,6 @@ enum Corner {
     Home,
     Back,
     Spare,
-    /// The quick row's circle by its index (quick::ITEMS), drawn with the console's (QUICK.md).
-    Quick(u8),
 }
 
 /// The glass's own outline, exact (owner, 2026-11-08: "make sure the console circles are all dimensioned properly in regards to the new screen curves and center big circle"): fluor's corners as `plan_glass` draws them, superellipses ((R − a)/R)^n + ((R − b)/R)^n = 1 with a and b the distances in from the corner's two edges, R the big radius at the top-left and bottom-right and the small at the other two (`glass_corner_params`), each a polyline of `GLASS_SEGS` segments (chord error under a thousandth of a pixel at these radii), joined by the screen's straight edges. Until 2026-11-08 the solver measured to each row's whole masked columns at the row's centre, which misses the edge between rows where the curve runs nearly flat: circles reached into the mask in one corner and stopped short of it in another.
@@ -4608,7 +4606,7 @@ fn helm_draw(width: usize, height: usize) -> bool {
         return false;
     }
     unsafe { HELM_DRAWN = true };
-    let (top, bot) = unsafe { (BAR_TOP, CHROME_BOT) };
+    let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
     let bar = unsafe { core::slice::from_raw_parts_mut((BAR as *mut u64).add(top * width), bot * width) };
     bar.fill(0);
     // The strokes' grey: the console's lit grey (working values, white at Q14).
@@ -4697,6 +4695,19 @@ fn px_out(y: i64, height: usize) -> bool {
 }
 
 /// The bars' producer (COMPOSITOR.md, step 1: producers never draw on the render thread). Woken on every render pass (`CON_NUDGE`), it looks at the console's key; when it changed, and the render thread has taken the last result, it draws the console (and the helm, the first time) into `BAR`, decodes the whole of the bars into the back buffers, finds what differs from the front (the top bar's and the bottom bar's rectangles), and says so (`CON_READY`), waking the render thread. On its own stack and heap (`CON_STACK`, `CON_HEAP`).
+/// The slide's measurement (`console_worker`): passes, per part the sum and the worst (circles, sprites, compose, diff, pass, rows, publish), and the frame count when it began.
+struct SlideUs {
+    n: u64,
+    sum: [u64; 7],
+    max: [u64; 7],
+    frames0: u64,
+}
+impl SlideUs {
+    const ZERO: SlideUs = SlideUs { n: 0, sum: [0; 7], max: [0; 7], frames0: 0 };
+}
+static mut SLIDE_US: SlideUs = SlideUs::ZERO;
+/// The bars' publish on the render thread at its last swap, µs (stage 2 of its pass).
+static CON_PUB_US: AtomicU64 = AtomicU64::new(0);
 /// The console's draws said so far (the first few are logged).
 static mut CON_DRAWS: u64 = 0;
 
@@ -4720,15 +4731,22 @@ extern "C" fn console_worker(arg: u64) -> ! {
         }
         let t_draw = now();
         let console = console_draw(width, height, false);
+        let t_q = now();
+        // The quick row: a circle drawn into its sprite only when its look changed, and the rows its slide owes (quick.rs `update`).
+        let quick = quick::update(width, height);
+        let q_us = ferros_sys::us_since(t_q);
         let helm = helm_draw(width, height);
         CON_HEAP.reset();
         let draw_us = ferros_sys::us_since(t_draw);
-        if !console && !helm {
+        if !console && !helm && quick.is_none() {
             continue;
         }
         let (top, bot) = unsafe { (BAR_TOP, CHROME_BOT) };
-        // The rows to decode: the console's drawn this time and the last (the back buffer is the front of two draws ago), and the helm's whole when it drew. Decoding every row of the bars each draw was a few ms of the worker's for one circle's change.
-        let now_rows = if console { unsafe { CON_ROWS } } else { (0, 0) };
+        // The rows to decode: the console's drawn this time and the last (the back buffer is the front of two draws ago), the quick row's owed, and the helm's whole when it drew. Decoding every row of the bars each draw was a few ms of the worker's for one circle's change.
+        let mut now_rows = if console { unsafe { CON_ROWS } } else { (0, 0) };
+        if let Some((a, b)) = quick {
+            now_rows = if now_rows.0 < now_rows.1 { (now_rows.0.min(a), now_rows.1.max(b)) } else { (a, b) };
+        }
         let (mut lo, mut hi) = (now_rows.0.min(prev_rows.0), now_rows.1.max(prev_rows.1));
         if now_rows.0 >= now_rows.1 {
             (lo, hi) = prev_rows;
@@ -4745,8 +4763,10 @@ extern "C" fn console_worker(arg: u64) -> ! {
         helm_prev = helm;
         let t_dec = now();
         if lo < hi {
-            bar_decode(lo, hi - lo, width);
+            bar_decode(lo, hi - lo, width, height);
         }
+        let dec_us = ferros_sys::us_since(t_dec);
+        let con_us = (t_q - t_draw) * 1_000_000 / freq();
         // Measuring (owner, 2026-11-09: "the console 2s after attest"): the first draws, when (ms since boot) and what each took.
         unsafe {
             if CON_DRAWS < 2 && (console || helm) {
@@ -4765,6 +4785,7 @@ extern "C" fn console_worker(arg: u64) -> ! {
 
             }
         }
+        let t_diff = now();
         // What changed, row by row, back against front: the columns from the first differing pixel to the last.
         let (front, back) = unsafe { (core::slice::from_raw_parts(BAR_W as *const u64, (top + bot) * width), core::slice::from_raw_parts(BAR_W_BACK as *const u64, (top + bot) * width)) };
         let mut rects = [draw::Rect::EMPTY; 2];
@@ -4775,25 +4796,72 @@ extern "C" fn console_worker(arg: u64) -> ! {
             let (which, y) = if b < top { (0, b) } else { (1, height - bot + (b - top)) };
             rects[which] = rects[which].union(draw::Rect { x0: x0 as i32, y0: y as i32, x1: x1 as i32, y1: y as i32 + 1 });
         }
+        // Measuring the slide (owner, 2026-11-11: "the top console pulldown is stupidly slow and jerky"): each pass that composed the quick row, by part (the console's circles drawn, the row's sprites drawn, the rows decoded and composed, the diff against the front), the whole pass, the rows, and the bars' publish on the render thread (`CON_PUB_US`, the pass before); summed and their worst, with the frames the panel showed meanwhile, said every 32 such passes.
+        if quick.is_some() {
+            let parts = [con_us, q_us, dec_us, ferros_sys::us_since(t_diff), ferros_sys::us_since(t_draw), (hi - lo) as u64, CON_PUB_US.load(Ordering::Relaxed)];
+            unsafe {
+                let s = &mut *(&raw mut SLIDE_US);
+                if s.n == 0 {
+                    s.frames0 = FRAME_STARTS.load(Ordering::Relaxed);
+                }
+                s.n += 1;
+                for j in 0..parts.len() {
+                    s.sum[j] += parts[j];
+                    s.max[j] = s.max[j].max(parts[j]);
+                }
+                if s.n == 1 << 5 {
+                    let mut l = Log { grants: PANIC_GRANTS, buf: [0; 256], n: 0 };
+                    l.s(b"display: slide: 32 passes in ");
+                    l.dec(FRAME_STARTS.load(Ordering::Relaxed).wrapping_sub(s.frames0));
+                    l.s(b" frames; us mean/worst: circles ");
+                    for (j, name) in [b"" as &[u8], b", sprites ", b", compose ", b", diff ", b", pass ", b"; rows ", b"; publish "].iter().enumerate() {
+                        l.s(name);
+                        l.dec(s.sum[j] >> 5);
+                        l.s(b"/");
+                        l.dec(s.max[j]);
+                    }
+                    l.s(b"\n");
+                    l.flush();
+                    *s = SlideUs::ZERO;
+                }
+            }
+        }
         unsafe { CON_RECT = rects };
         CON_READY.store(1, Ordering::Release);
         ferros_sys::wake(&RING_TAIL, 1);
     }
 }
 
-/// The bars' rows `b0..b0 + rows` decoded for publishing (`BAR_W`, by `working`), and each row's columns holding any of them (`BAR_SPAN`).
-fn bar_decode(b0: usize, rows: usize, width: usize) {
-    let (bar, cw, span) = unsafe { (core::slice::from_raw_parts((BAR as *const u64).add(b0 * width), rows * width), core::slice::from_raw_parts_mut((BAR_W_BACK as *mut u64).add(b0 * width), rows * width), core::slice::from_raw_parts_mut((BAR_SPAN_BACK as *mut (u16, u16)).add(b0), rows)) };
+/// The bars' rows `b0..b0 + rows` decoded for publishing (`BAR_W`, by `working`), and each row's columns holding any of them (`BAR_SPAN`). A decoded row is a screen row of the top band (`BAR_TOP` rows) or of the helm's; the drawn ones (`BAR`) are the chrome rows of the top (`CHROME_TOP`) and the helm's, so the top band's rows past the chrome rows are empty of the console, and only the quick row's sprites go there. On every row of the top band the quick row is composed under the console's circles (quick.rs `compose`).
+fn bar_decode(b0: usize, rows: usize, width: usize, height: usize) {
+    let (ct, bt) = unsafe { (CHROME_TOP, BAR_TOP) };
+    let (cw, span) = unsafe { (core::slice::from_raw_parts_mut((BAR_W_BACK as *mut u64).add(b0 * width), rows * width), core::slice::from_raw_parts_mut((BAR_SPAN_BACK as *mut (u16, u16)).add(b0), rows)) };
     for yy in 0..rows {
+        let b = b0 + yy;
+        let out = &mut cw[yy * width..(yy + 1) * width];
         let (mut l, mut rr) = (width, 0);
-        for xx in 0..width {
-            let i = yy * width + xx;
-            cw[i] = working(bar[i], G2T16);
-            if bar[i] >> 48 != 0 {
-                if l == width {
-                    l = xx;
+        // The drawn row this decoded row comes from: the same in the chrome rows, none below them in the top band, and the helm's after the gap.
+        let src = if b < ct { Some(b) } else if b < bt { None } else { Some(b - (bt - ct)) };
+        match src {
+            Some(s) => {
+                let bar = unsafe { core::slice::from_raw_parts((BAR as *const u64).add(s * width), width) };
+                for xx in 0..width {
+                    out[xx] = working(bar[xx], G2T16);
+                    if bar[xx] >> 48 != 0 {
+                        if l == width {
+                            l = xx;
+                        }
+                        rr = xx + 1;
+                    }
                 }
-                rr = xx + 1;
+            }
+            None => out.fill(CLEAR),
+        }
+        if b < bt {
+            let (ql, qr) = quick::compose(b, out, width, height);
+            if ql < qr {
+                l = l.min(ql);
+                rr = rr.max(qr);
             }
         }
         span[yy] = if l < rr { (l as u16, rr as u16) } else { (0, 0) };
@@ -5021,10 +5089,9 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         time_h = (time_h.rotate_left(7) ^ c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
     // A person present or not (fact 83) too: GPS on is lit by it, its driver running or not.
-    // The quick row (QUICK.md): the map's state of it and the preferences its circles show (brightness, the sound mode, do not disturb, the language of its words).
-    let qk = [quick::STATE_A.load(Ordering::Acquire), quick::STATE_B.load(Ordering::Acquire), ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS) as u64 | (ferros_sys::pref(ferros_sys::PREF_SOUND) as u64) << 8 | (ferros_sys::pref(ferros_sys::PREF_DND) as u64) << 16 | (ferros_sys::pref(ferros_sys::PREF_LANG) as u64) << 24 | (ferros_sys::pref(ferros_sys::PREF_LANG + 1) as u64) << 32];
-    let qh = qk.iter().fold(0u64, |h, &v| (h.rotate_left(7) ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    let k = (((time_h >> 9) as i64) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64 ^ (off as i64) << 40 ^ ((facts[83] & 3) as i64) << 48 ^ qh as i64;
+    // The radio circle a finger presses (the quick row's long press, QUICK.md): its ring drawn once as the press starts and gone as it ends, never per frame (owner, 2026-11-11: "the top console pulldown is stupidly slow and jerky").
+    let pressed = quick::state().press;
+    let k = (((time_h >> 9) as i64) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64 ^ (off as i64) << 40 ^ ((facts[83] & 3) as i64) << 48 ^ (pressed.map_or(0xFF, |p| p as i64)) << 52;
     if !force && k == unsafe { CONSOLE_KEY } {
         return false;
     }
@@ -5042,7 +5109,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         CONSOLE_PARTS = parts;
     }
     let t_draw = ferros_sys::now();
-    let rows = unsafe { BAR_TOP };
+    let rows = unsafe { CHROME_TOP };
     let console = unsafe { core::slice::from_raw_parts_mut(BAR as *mut u64, rows * width) };
     // Only the circles whose own look changed are drawn again (2026-11-08: the battery's live readings every two seconds redrew every circle, the off radios' fields with them, 61 ms a draw); the first draw, or a forced one, starts from empty.
     let whole = force || !unsafe { CON_DRAWN };
@@ -5061,18 +5128,8 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
     const OFF_GREY: f32 = 3200.0;
     const LIVE_INK: f32 = 11000.0;
     const LIGHT_INK: f32 = 7000.0;
-    // The corners' circles, then the quick row's at its level now (QUICK.md): circles that move, so a changed one empties where it was drawn last as well as where it is.
-    let (corners, nc) = corner_layout(width, height);
-    let qs = quick::state();
-    let qat = quick::at(width, height, qs.o);
-    let mut circles = [(0f32, 0f32, 0f32, Corner::Spare); CON_CIRCLES];
-    circles[..nc].copy_from_slice(&corners[..nc]);
-    for k in 0..quick::N {
-        circles[nc + k] = (qat[k].0, qat[k].1, qat[k].2, Corner::Quick(k as u8));
-    }
-    let n = nc + quick::N;
-    // A circle smaller than half a pixel draws nothing (the row shut, or just opening).
-    const QUICK_MIN: f32 = 0.5;
+    // The corners' circles. The quick row is not among them since 2026-11-11: it is drawn once into its own sprite and slid (quick.rs).
+    let (circles, n) = corner_layout(width, height);
     // Each circle draws out to two and a half pixels past its radius (its vessel's table runs to r + 2), and tangent circles' reaches overlap there. So a redraw is of a region, not of a circle (owner, 2026-11-08: "it flickers between the GPS being on top or the battery being on top where they overlap": a circle redrawn alone emptied its neighbour's rim and drew over the rest): the first pass finds the circles whose look changed, the region is their discs out to that reach, emptied; the second pass draws every circle that reaches into the region, each pixel only inside it, all of them front to back by `under` in the layout's order. Every pixel of the region is then composed from empty by the same circles in the same order however the redraw came about.
     const REACH: f32 = 2.5;
     let mut changed = [false; CON_CIRCLES];
@@ -5081,36 +5138,6 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
     let mut region = [(0.0f32, 0.0f32, 0.0f32); 2 * CON_CIRCLES];
     let mut nreg = 0;
     let mut rbox = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
-    // A quick circle's look (QUICK.md): whether what it switches is on, and its grey: lit; a stop darker for vibrate; the off grey; a stop under that for a torch that does not answer (the map found no torch to call). A finger on it lifts it to the live ink's light.
-    let sound = ferros_sys::pref(ferros_sys::PREF_SOUND);
-    let quick_fill = |k: usize| -> (bool, f32) {
-        let stop = core::f32::consts::FRAC_1_SQRT_2;
-        let (on, grey) = match quick::ITEMS[k] {
-            quick::Item::Brightness => (true, LIT_GREY),
-            quick::Item::Torch => match qs.torch {
-                None => (false, OFF_GREY * stop),
-                Some(0) => (false, OFF_GREY),
-                Some(_) => (true, LIT_GREY),
-            },
-            quick::Item::RadiosOff => if off & 0x1F == 0x1F { (true, LIT_GREY) } else { (false, OFF_GREY) },
-            quick::Item::Sound => match sound {
-                ferros_sys::SOUND => (true, LIT_GREY),
-                ferros_sys::VIBRATE => (true, LIT_GREY * stop),
-                _ => (false, OFF_GREY),
-            },
-            quick::Item::Dnd => if ferros_sys::dnd::on() { (true, LIT_GREY) } else { (false, OFF_GREY) },
-            quick::Item::Screencap => (false, OFF_GREY),
-        };
-        (on, if qs.held == Some(k) { LIVE_INK } else { grey })
-    };
-    // A quick circle's ring, the share of it lit: brightness by preference 3 (0 the brightest, 255 the dimmest, so the lit share is how bright), the torch by its level; while a finger turns one, the share it sent (op 56), which moves smoothly between the preference's steps.
-    let quick_ring = |k: usize| -> Option<f32> {
-        match quick::ITEMS[k] {
-            quick::Item::Brightness => Some(qs.bright_arc.unwrap_or(1. - ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS) as f32 * (1. / 255.))),
-            quick::Item::Torch => qs.torch.map(|l| qs.torch_arc.unwrap_or(l as f32 * (1. / 255.))),
-            _ => None,
-        }
-    };
     for pass in 0..2 {
     for (ci, &(x, y, r, what)) in circles[..n].iter().enumerate() {
         if y >= height as f32 * 0.5 || pass == 1 && !touched[ci] {
@@ -5129,8 +5156,6 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             // The gauge answered (facts 1-4, the kernel's two-second poll of the MAX77759 on hsi2c_11).
             Corner::Battery => facts[1] != u64::MAX,
             Corner::Home | Corner::Back | Corner::Spare => false,
-            // The quick row: lit while what it switches is on (`quick_fill`).
-            Corner::Quick(k) => quick_fill(k as usize).0,
         };
         // The radio's measures, as its driver published them (facts 33 + 8 · radio): every one shown as itself, in its unit, a line each; none folded into a level, no bars (owner, 2026-11-03).
         let radio = radio_of(what);
@@ -5154,14 +5179,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         };
         let (flav, _) = flavour(what);
         let stop = core::f32::consts::FRAC_1_SQRT_2;
-        let quick_k = match what {
-            Corner::Quick(k) => Some(k as usize),
-            _ => None,
-        };
-        let fill = if let Some(k) = quick_k {
-            let f = quick_fill(k).1;
-            (f, f, f)
-        } else if switched_off {
+        let fill = if switched_off {
             (OFF_GREY * stop, OFF_GREY * stop, OFF_GREY * stop)
         } else if !live {
             (OFF_GREY, OFF_GREY, OFF_GREY)
@@ -5195,17 +5213,9 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             mix(az.to_bits() as u64 | (el.to_bits() as u64) << 32);
             mix(wt.to_bits() as u64);
         }
-        // A quick circle: where it is and how big, its ring's lit share and its word (the sound mode's, in the language now); a radio circle a finger presses: how far the press has come (its ring).
-        let ring = quick_k.and_then(quick_ring);
-        let press = match (radio, qs.press) {
-            (Some(ri), Some((pr, share))) if ri == pr && share > 0. => Some(share),
-            _ => None,
-        };
-        if quick_k.is_some() {
-            mix(x.to_bits() as u64 | (y.to_bits() as u64) << 32);
-            mix(r.to_bits() as u64 | (ferros_sys::pref(ferros_sys::PREF_SOUND) as u64) << 32 | (ferros_sys::pref(ferros_sys::PREF_LANG) as u64) << 40 | (ferros_sys::pref(ferros_sys::PREF_LANG + 1) as u64) << 48);
-        }
-        mix(ring.map_or(u64::MAX, |f| f.to_bits() as u64) ^ press.map_or(0, |f| (f.to_bits() as u64) << 32));
+        // A radio circle a finger presses: a whole ring, drawn once as the press starts.
+        let press = radio.is_some() && radio == pressed;
+        mix(press as u64);
         // Never 0, which is "not drawn yet".
         let key = key | 1;
         if pass == 0 {
@@ -5213,17 +5223,23 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             unsafe { CON_CIRCLE_KEYS[ci] = key };
             continue;
         }
-        // Too small to draw (the quick row shut or just opening): its old place was emptied, nothing goes there now.
-        if r < QUICK_MIN {
-            continue;
-        }
         // A screen pixel's place in the console, inside the region. WHY the bounds test: glyph and disc positions come from the layout's float geometry, and a disc's box or a glyph's edge can reach past the screen's sides or below the console's rows; an index from there would land in another row or past the buffer. WHY the region test: outside it the console holds every circle's last draw, composed already; drawing there again would lay this circle under itself.
+        // Only the region's discs this circle reaches are asked at each pixel (2026-11-11: every pixel asked every disc of the region).
+        let mut near = [(0f32, 0f32, 0f32); 2 * CON_CIRCLES];
+        let mut nn = 0;
+        for &(cx, cy, re) in &region[..nreg] {
+            let s = r + REACH + re;
+            if (x - cx) * (x - cx) + (y - cy) * (y - cy) < s * s {
+                near[nn] = (cx, cy, re);
+                nn += 1;
+            }
+        }
         let at = |px: i64, py: i64| -> Option<usize> {
             if px < 0 || px >= width as i64 || py < 0 || py >= rows as i64 {
                 return None;
             }
             let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
-            if whole || region[..nreg].iter().any(|&(cx, cy, re)| (fx - cx) * (fx - cx) + (fy - cy) * (fy - cy) <= re * re) {
+            if whole || near[..nn].iter().any(|&(cx, cy, re)| (fx - cx) * (fx - cx) + (fy - cy) * (fy - cy) <= re * re) {
                 Some(py as usize * width + px as usize)
             } else {
                 None
@@ -5231,14 +5247,9 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         };
         // A box of pixels (x0, x1, y0, y1) cut to the region's: only the work, as `at` alone keeps the drawing inside the region.
         let cut = |b: (i64, i64, i64, i64)| (b.0.max(rbox.0), b.1.min(rbox.1), b.2.max(rbox.2), b.3.min(rbox.3));
-        // Frontmost, a ring: a quick circle's lit share (brightness, the torch), or a radio circle's press filling toward its page (QUICK.md "Long press"); its band inside the vessel's rim.
-        if let Some(share) = ring.or(press) {
-            quick::ring(x, y, r * (1.0 - 2.0 * VESSEL_DEPTH), share, ink, console, &at, &cut);
-        }
-        // A quick circle's word (the person's language), stacked a word a line, inside its ring where it has one.
-        if let Some(k) = quick_k {
-            let eng = unsafe { (*(&raw mut CON_GLYPHS)).as_mut().expect("console glyphs") };
-            quick::word(k, x, y, r * if ring.is_some() { quick::RING_INNER } else { 1.0 }, ink, console, &at, eng);
+        // Frontmost, a radio circle's press (QUICK.md "Long press"): a whole ring inside the vessel's rim, drawn once.
+        if press {
+            quick::ring(x, y, r * (1.0 - 2.0 * VESSEL_DEPTH), 1., ink, console, &at, &cut);
         }
         // The text first: it is in front of its vessel. Since 2026-11-09 (owner: "switch to the most useful stats, similar to the battery for all the radios except for GPS") a radio on carries its name and its measures, a line each, as the battery its readings; GPS on draws its satellites' rings (`gps_rings`); a radio switched off its field, GPS off its pin. Before: a radio carried words only while off (2026-11-07), its orb speaking for it on (`ORBS`). for it, and its numbers are on its detail page. The clock and the battery keep theirs.
         {
@@ -5293,7 +5304,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 Corner::Usb => "USB",
                 Corner::Battery if charge.n > 0 => charge.str(),
                 Corner::Battery => "batt",
-                Corner::Home | Corner::Back | Corner::Spare | Corner::Quick(_) => "",
+                Corner::Home | Corner::Back | Corner::Spare => "",
             };
             if what == Corner::Gps && live && !switched_off && !sats.is_empty() {
                 gps_rings(&sats, x, y, r * (1.0 - 2.0 * VESSEL_DEPTH), flav, &mut |px, py| at(px, py), console, cut);
@@ -5587,8 +5598,6 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         }
         CON_ROWS = if whole { (0, rows) } else { (dirty_lo, dirty_hi) };
     }
-    // Whether this draw holds any of the quick row: a screencap it asked for waits for bars that hold none (`quick::CAPTURE`).
-    quick::EMPTY_BACK.store(qat.iter().all(|c| c.2 < QUICK_MIN), Ordering::Release);
     true
 }
 
@@ -5771,10 +5780,10 @@ extern "C" fn receive(grants: u64) -> ! {
             ferros_sys::reply(&tok, &[0]);
             continue;
         }
-        // 56 `quick`: the quick row's state from the map (quick.rs `set`, QUICK.md). → [0].
+        // 56 `quick`: the quick row's state from the map (quick.rs `set`, QUICK.md). → [0][the slide's length u16].
         if op == 56 && n >= 15 {
-            quick::set(&msg[..15]);
-            ferros_sys::reply(&tok, &[0]);
+            let r = quick::set(&msg[..15]);
+            ferros_sys::reply(&tok, &r);
             continue;
         }
         if op == 41 && n >= 5 {
@@ -5792,7 +5801,7 @@ extern "C" fn receive(grants: u64) -> ! {
             let mut hit = 0xFFu8;
             if in_circle(x as i64, y as i64, w as usize, h as usize) {
                 // The app's (or the map's): nothing of the system's, but behind the quick row while it shows.
-                if quick::showing(w as usize, h as usize) {
+                if quick::showing() {
                     hit = 12;
                 }
             } else if y > h as f32 * 0.5 {
@@ -6081,10 +6090,11 @@ fn server(grants: u64) -> ! {
         CHROME_TOP = top;
         CHROME_BOT = bot;
         plan_glass(width, height);
-        // The console's band reaches the quick row's floor (quick.rs `rows`): every buffer of the bars' top band below is that many rows.
+        // The console's circles are drawn in `BAR` over the chrome rows alone; the bars' decoded rows (`BAR_W`, its spans, its back buffers) reach the quick row's floor (quick.rs `rows`), where the row's sprites are composed (`bar_decode`). The sprites, kept for the process (quick.rs `init`).
+        BAR = alloc::vec![0u64; (top + bot) * width].leak().as_mut_ptr() as usize;
         let top = quick::rows(width, height, top);
         BAR_TOP = top;
-        BAR = alloc::vec![0u64; (top + bot) * width].leak().as_mut_ptr() as usize;
+        quick::init(width, height);
         BAR_W = alloc::vec![CLEAR; (top + bot) * width].leak().as_mut_ptr() as usize;
         BAR_SPAN = alloc::vec![(0u16, 0u16); top + bot].leak().as_mut_ptr() as usize;
         BAR_W_BACK = alloc::vec![CLEAR; (top + bot) * width].leak().as_mut_ptr() as usize;
@@ -7857,6 +7867,8 @@ fn server(grants: u64) -> ! {
                 }
             }
             stage_us[2] = ferros_sys::us_since(t_bars);
+            // For the console worker's slide measurement: the bars' publish this pass (quick.rs, QUICK.md).
+            CON_PUB_US.store(stage_us[2], Ordering::Relaxed);
         }
         // The quick row's screencap (QUICK.md; op 56 flag bit 1): taken as op 30 takes one, the pass the bars on the screen hold none of the row, so the row that asked for it is not in it. Until the clipboard exists (owner, 2026-11-07: "when we get the clipboard running that's where the screencap will live") the frame stays in the free surface op 30 wrote it to, its address on the console for tools/screencap's reader.
         if quick::CAPTURE.load(Ordering::Acquire) && unsafe { quick::EMPTY_FRONT } {
