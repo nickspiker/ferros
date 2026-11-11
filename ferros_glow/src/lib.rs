@@ -44,7 +44,7 @@ pub const HIGH: f32 = 1. / (1 << 2) as f32;
 pub const REACH_LOW: f32 = 1. / (1 << 1) as f32;
 pub const REACH_MEDIUM: f32 = 3. / (1 << 2) as f32;
 pub const REACH_HIGH: f32 = 1.;
-/// A light glow's opacity at the rim: how much of what is behind (the wallpaper) it takes away before its own light goes in, so the colour reads vivid on a bright plane.
+/// A light glow's opacity at the rim at `HIGH`, a dimmer one's in proportion to its level (medium 1/4, low 1/8): how much of what is behind (the wallpaper) it takes away before its own light goes in, so the colour reads vivid on a bright plane, while a faint glow stays mostly light (owner: the multiply is for the kists not running, "so the glow is vivid anyway").
 pub const VEIL: f32 = 1. / (1 << 1) as f32;
 /// The negative part's filter, as a share of its photopic weight against the positive part's (owner: "share 1/2 to start").
 pub const MULT_SHARE: f32 = 1. / (1 << 1) as f32;
@@ -158,13 +158,13 @@ pub struct AtRim {
     pub alpha: f32,
 }
 
-/// Glow `g` at its rim: a light (running, back, people, system) is its line's positive part at its level, at α = `VEIL` plus the negative part's filter; stopped is a multiply of `STOP_DEPTH` carrying its line's light at `LOW`; not running is the neutral multiply, no light at all.
+/// Glow `g` at its rim: a light (running, back, people, system) is its line's positive part at its level, at α = `VEIL` scaled by its level against `HIGH`, plus the negative part's filter; stopped is a multiply of `STOP_DEPTH` carrying its line's light at `LOW`; not running is the neutral multiply, no light at all.
 pub fn at_rim(g: Glow) -> AtRim {
     match (g, g.line()) {
         (Glow::Stopped, Some(nm)) => AtRim { light: split(nm, g.level()).0, alpha: STOP_DEPTH },
         (_, Some(nm)) => {
             let (light, neg) = split(nm, g.level());
-            AtRim { light, alpha: VEIL + MULT_SHARE * neg }
+            AtRim { light, alpha: VEIL * g.level() / HIGH + MULT_SHARE * neg }
         }
         (Glow::Idle, None) => AtRim { light: [0.; 3], alpha: IDLE_DEPTH },
         _ => AtRim { light: [0.; 3], alpha: 0. },
