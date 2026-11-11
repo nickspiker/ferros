@@ -43,7 +43,7 @@ The first cut grew the row out of the point under the camera, every circle drawn
 
 - **The offset** follows the finger one to one from where the drag took hold (the doorway, the top's ground, a radio circle dragged down, or a quick circle other than the rings dragged up or down), between hidden and open.
 - **The lift**: from hidden, the row goes open if it was pulled past a third of the way, else hidden; from open, hidden if pushed back past a third, else open. Each frame the panel showed, what is left to go halves (a right shift, the half pixel dropped), so it lands in a few frames and holds still (map quick.rs `step`). A still tap in the doorway sends it open or hidden the same way.
-- **Frame timer on shown frames**: one step for each frame the panel showed (display op 24's frame-start count), never on a clock, so a missed render steps twice rather than slowing.
+- **Frame timer on shown frames**: one step for each frame the panel showed (display op 24's frame-start count), never on a clock, so a missed render steps twice rather than slowing. The display arms a frame as soon as the bars it swaps in changed, so each step is on the glass at the next frame (2026-11-11: until then the change waited for the 10 Hz flips and the slide showed at 10 frames a second on the Pro, its steps waiting on those frames). Measured there before the fix: a step's work 5.4 ms mean (circles 0.09, sprites 1.2, compose 2.8, diff 1.3) and the bars' publish 2.4 ms, worst 12.3 and 14.2.
 - **Shutting**: push it back up, a still tap in the doorway, or a touch anywhere behind the row (that touch goes no further).
 - **Taps on the row** count only once it is all the way open; while it slides, a finger on it is the slide's.
 

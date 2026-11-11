@@ -6560,6 +6560,8 @@ fn server(grants: u64) -> ! {
     // A frame armed and not yet seen to start (Pipe::arm / settle).
     // The modeset re-sent the panel its PPS, raster and rate, and the panel drops what it was showing: black from here to the first client frame (464 to 1033 ms after the press, measured 2026-11-05). The layer is still on the boot ring's surface, so one frame now puts the ring back until the attest screen replaces it. Armed, not waited for (the frame-start count is not running yet; waiting cost a quarter second): the main loop's settle masks the trigger once the frame has started. A cold or jumped panel has shown nothing yet: the same frame is its first.
     let mut armed: Option<u32> = Some(pipe.arm(win));
+    // Whether this pass swapped in bars that changed: armed for the next frame at the pass's end (the flip's place).
+    let mut bars_present = false;
 
     let mut frames = 0u64;
     // A client owns the surface from its first `begin` on; until then this process paints its own screen and clock.
@@ -8211,6 +8213,9 @@ fn server(grants: u64) -> ! {
                     publish10x4(canvas, width, height, &tabs, (1 << PHASES) - 1, r);
                 }
             }
+            // The bars changed: on the glass at the next frame, not the next 10 Hz flip (owner, 2026-11-11: "the fps is stupidly bad, especially the console second row slide up/down"; the Pro showed the slide at 10 frames a second, the phases holding each step until a flip sent one). The panel is in command mode: a frame reaches the glass only when one is armed. Every phase holds the change (published into all four above), so the phase on the layer is armed again as it is, as a camera op's frame is, waiting only for the last armed one to have started. A slide's next step comes from the map once this frame has started (its count of shown frames, op 24), so the slide runs at the rate frames are shown.
+            // Armed at the pass's end (`bars_present`), where the flip arms.
+            bars_present = !changed[0].is_empty() || !changed[1].is_empty();
             stage_us[2] = ferros_sys::us_since(t_bars);
             // For the console worker's slide measurement: the bars' publish this pass (quick.rs, QUICK.md).
             CON_PUB_US.store(stage_us[2], Ordering::Relaxed);
@@ -8544,7 +8549,16 @@ fn server(grants: u64) -> ! {
             let _ = pipe.present(win);
             frames += 1;
                         FRAMES.store(frames, Ordering::Relaxed);
+        } else if bars_present && !screen_off && RAW_HOLD.load(Ordering::Acquire) == 0 {
+            // The bars changed this pass (`bars_present`): the phase on the layer, which holds the change (published into all four), armed again for the next frame, as a camera op's frame is (owner, 2026-11-11: "the fps is stupidly bad, especially the console second row slide up/down": the slide showed at the 10 Hz flips). The map steps the slide by these shown frames (op 24), so it runs at the rate they go out.
+            pipe.settle(&mut armed, true);
+            ferros_sys::dma_barrier();
+            pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
+            armed = Some(pipe.arm(win));
+            frames += 1;
+            FRAMES.store(frames, Ordering::Relaxed);
         }
+        bars_present = false;
         let flip_us = ferros_sys::us_since(t_flip);
         let pass_us = ferros_sys::us_since(t_pass);
         if pass_us > 30_000 {
