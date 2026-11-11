@@ -101,8 +101,10 @@ impl BlockDev for Half {
     }
     fn read(&mut self, lba: u64, buf: &mut Block) -> manifestus::Result<()> {
         self.io(lba, 1)?;
-        // A block the read-ahead holds (a piece's leaf, just past the furrows of the piece before it) is a copy; any other is one block, never a fill: the index walk's nodes lie anywhere.
-        if !ahead_copy(self.base + lba, buf) && !blocks_read(self.base + lba, buf) {
+        // A block the read-ahead holds (a piece's leaf, just past its furrows) is a copy, from the window or the next one read beside it (which then becomes the window); any other is one block, never a fill: the index walk's nodes lie anywhere.
+        let at = self.base + lba;
+        let next = unsafe { AHEAD_ON && NEXT_POSTED && at >= NEXT_AT.0 && at < NEXT_AT.0 + NEXT_AT.1 as u64 };
+        if !ahead_copy(at, buf) && !(next && ahead_run(at, buf, self.base + self.blocks)) && !blocks_read(at, buf, &IO_TICKS) {
             return Err(manifestus::Error::Corrupt(alloc::format!("block read failed at {lba}")));
         }
         Ok(())
@@ -115,13 +117,12 @@ impl BlockDev for Half {
         }
         Ok(())
     }
-    /// Up to `RUN_NOW` blocks a kernel call (one UFS command each on a kernel from 2026-11-08 on). While a large value is read in bulk (`AHEAD_ON`), a run the read-ahead does not hold fills it from the run's first block (`ahead_fill`), and the runs and leaves after it are copies.
+    /// Up to `RUN_NOW` blocks a kernel call (one UFS command each on a kernel from 2026-11-08 on). While a large value is read in bulk (`AHEAD_ON`), a run comes through the read-ahead (`ahead_run`): a copy from the window, or from the next window read beside it, or a fresh fill from the run's first block.
     fn read_run(&mut self, lba: u64, out: &mut [Block]) -> manifestus::Result<()> {
         self.io(lba, out.len() as u64)?;
         let bytes = unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() << 12) };
         let at = self.base + lba;
-        // WHY the min: the fill is AHEAD blocks unless this mirror ends sooner, and past its end lie the other mirror's blocks (or the window's end).
-        let ok = ahead_copy(at, bytes) || (unsafe { AHEAD_ON } && out.len() <= AHEAD && ahead_fill(at, (self.blocks - lba).min(AHEAD as u64) as usize) && ahead_copy(at, bytes)) || blocks_read(at, bytes);
+        let ok = ahead_copy(at, bytes) || (unsafe { AHEAD_ON } && out.len() <= AHEAD && ahead_run(at, bytes, self.base + self.blocks)) || blocks_read(at, bytes, &IO_TICKS);
         if !ok {
             return Err(manifestus::Error::Corrupt(alloc::format!("block read failed at {lba}")));
         }
@@ -256,22 +257,26 @@ fn run_down(m: usize) -> Option<usize> {
     }
 }
 
-/// Block reads, measured for the read report (`Meter`): the calls' time in timer ticks, blocks, calls, and the kernel's own split of the calls (SYS_BLOCK timed: ticks in the UFS commands, ticks copying into this process), and blocks the read-ahead gave without a call.
+/// Block reads, measured for the read report (`Meter`): the serving thread's time in them (`IO_TICKS`, with its waits for the next window read beside it), the reader thread's (`AHEAD_TICKS`, beside the fetch), every call's own time, blocks, calls, and the kernel's own split of the calls (SYS_BLOCK timed: ticks in the UFS commands, ticks copying into this process), and blocks the read-ahead gave without a call.
 static IO_TICKS: AtomicU64 = AtomicU64::new(0);
+static AHEAD_TICKS: AtomicU64 = AtomicU64::new(0);
+static IO_CALL_TICKS: AtomicU64 = AtomicU64::new(0);
 static IO_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static IO_CALLS: AtomicU64 = AtomicU64::new(0);
 static IO_CMD: AtomicU64 = AtomicU64::new(0);
 static IO_COPY: AtomicU64 = AtomicU64::new(0);
 static AHEAD_HITS: AtomicU64 = AtomicU64::new(0);
 
-/// `buf.len() / 4096` blocks of the window from `at` into `buf`, `RUN_NOW` blocks a call.
-fn blocks_read(at: u64, buf: &mut [u8]) -> bool {
+/// `buf.len() / 4096` blocks of the window from `at` into `buf`, `RUN_NOW` blocks a call; the time it took is added to `spent` (the thread's own counter).
+fn blocks_read(at: u64, buf: &mut [u8], spent: &AtomicU64) -> bool {
     let t = now();
     let n = buf.len() >> 12;
     let mut k = 0;
     while k < n {
         let m = (n - k).min(RUN_NOW.load(Relaxed));
+        let tc = now();
         let (r, split) = ferros_sys::block_read_timed(cap(grants(), S_BLOCKS), at + k as u64, &mut buf[k << 12..(k + m) << 12]);
+        IO_CALL_TICKS.fetch_add(now() - tc, Relaxed);
         IO_CALLS.fetch_add(1, Relaxed);
         if r != 0 {
             // A kernel from before refuses a larger run than its own: once, then the next smaller.
@@ -289,7 +294,7 @@ fn blocks_read(at: u64, buf: &mut [u8]) -> bool {
         }
         k += m;
     }
-    IO_TICKS.fetch_add(now() - t, Relaxed);
+    spent.fetch_add(now() - t, Relaxed);
     IO_BLOCKS.fetch_add(n as u64, Relaxed);
     true
 }
@@ -314,17 +319,29 @@ fn blocks_write(at: u64, buf: &[u8]) -> bool {
     true
 }
 
-/// The read-ahead (owner, 2026-11-11: "2.9s for a 24MB read is embarassing"): a large value's blocks lie in one stretch of the tract, each piece's furrows then its leaf, the next piece's after, so while one is read in bulk (`AHEAD_ON`, a get of a transfer or more) a furrow run the window does not hold fills it with AHEAD blocks from the run's first (one UFS command of 1 MiB: about fifteen pieces, leaves and all), and the leaves and runs after it are copies. It was two commands a piece: the leaf's block (when not in the index cache) and the 17-block run, 370 pieces' worth for a 24 MB value, each command's latency paid at queue depth one. Nothing checks less: every block still meets its BLAKE3 guard in manifestus and every piece its seal. It holds only what the disk holds: the serving thread alone reads and writes blocks, and every write drops it (`ahead_drop`), as does a mirror the engine stages over (manifestus reads staged blocks from its own staging before asking this device).
+/// The read-ahead (owner, 2026-11-11: "2.9s for a 24MB read is embarassing"): a large value's blocks lie in one stretch of the tract, each piece's furrows then its leaf, the next piece's after, so while one is read in bulk (`AHEAD_ON`, a get of a transfer or more) a furrow run the window does not hold fills it with AHEAD blocks from the run's first (one UFS command of 1 MiB: about fifteen pieces, leaves and all), and the leaves and runs after it are copies. It was two commands a piece: the leaf's block (when not in the index cache) and the 17-block run, 370 pieces' worth for a 24 MB value, each command's latency paid at queue depth one.
+/// Each fill posts the window after it to the reader thread (`ahead_reader`), which reads it into the second buffer while this thread hashes and decodes the blocks of the first; a run in the second makes it the window (the buffers swap) and posts the one after. Anything else (a run neither holds: another value, a piece out of order) fills afresh from the run.
+/// Nothing checks less: every block still meets its BLAKE3 guard in manifestus and every piece its seal. The windows hold only what the disk holds: the serving thread alone writes blocks, and every write first waits out a read beside it and drops both (`ahead_drop`); manifestus reads blocks it has staged and not yet written from its own staging, never from this device.
 const AHEAD: usize = RUN_MAX;
-/// Window blocks: the first block (of the vault's window, both mirrors' numbering), how many are held; the bytes.
+/// The window: its first block (of the vault's window, both mirrors' numbering), how many it holds; the bytes. The serving thread's alone.
 static mut AHEAD_AT: (u64, usize) = (0, 0);
 static mut AHEAD_BUF: Vec<u8> = Vec::new();
+/// The next window, read beside: its first block and length, its bytes (the reader thread's from the post until its done word says so), and whether one is posted and not yet taken.
+static mut NEXT_AT: (u64, usize) = (0, 0);
+static mut NEXT_BUF: Vec<u8> = Vec::new();
+static mut NEXT_POSTED: bool = false;
+/// The reader thread's job (a sequence number; its first block, length and buffer in `NEXT_JOB`) and its done word (the number shifted up one, whether every block came in bit 0); whether it started.
+static NEXT_REQ: AtomicU64 = AtomicU64::new(0);
+static NEXT_DONE: AtomicU64 = AtomicU64::new(0);
+static mut NEXT_JOB: (u64, usize, usize) = (0, 0, 0);
+static READER_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static READER_STACK: Region<{ 1 << 16 }> = Region(UnsafeCell::new([0; 1 << 16]));
 /// A large value is being read in bulk: furrow runs may fill the window. Set around a bulk get (`serve`).
 static mut AHEAD_ON: bool = false;
 
 /// `buf.len() / 4096` blocks from `at` out of the window, if it holds them all.
 fn ahead_copy(at: u64, buf: &mut [u8]) -> bool {
-    // SAFETY: the serving thread alone reads blocks (helpers only open pieces), so nothing else touches the window.
+    // SAFETY: the window is the serving thread's alone (the reader thread writes only the next one).
     let ((first, held), win) = unsafe { (AHEAD_AT, &*(&raw const AHEAD_BUF)) };
     let n = (buf.len() >> 12) as u64;
     // Whether the window holds them all (the copy below reads only inside what it holds).
@@ -337,20 +354,100 @@ fn ahead_copy(at: u64, buf: &mut [u8]) -> bool {
     true
 }
 
-/// The window filled with `n` blocks from `at` (one kernel call on a kernel from 2026-11-11 on); false (and empty) if the read failed.
-fn ahead_fill(at: u64, n: usize) -> bool {
+/// A furrow run of a bulk read (`buf.len() / 4096` blocks from `at`, no more than AHEAD) the window does not hold, from blocks below `limit` (the mirror's end): out of the next window once its read is done, else from a fresh fill; then the window after posted. Whether it came.
+fn ahead_run(at: u64, buf: &mut [u8], limit: u64) -> bool {
+    let n = (buf.len() >> 12) as u64;
+    let (next, posted) = unsafe { (NEXT_AT, NEXT_POSTED) };
+    if posted && at >= next.0 && at + n <= next.0 + next.1 as u64 {
+        let ok = ahead_settle();
+        if ok {
+            // SAFETY: the reader thread is done with the next buffer (`ahead_settle`), and both buffers are otherwise the serving thread's.
+            unsafe {
+                core::mem::swap(&mut *(&raw mut AHEAD_BUF), &mut *(&raw mut NEXT_BUF));
+                AHEAD_AT = next;
+            }
+            ahead_post(next.0 + next.1 as u64, limit);
+            return ahead_copy(at, buf);
+        }
+    }
+    // A fresh fill: the next buffer's read (if one runs) is let finish first, as it is reused for the one after.
+    ahead_settle();
+    // WHY the min: the fill is AHEAD blocks unless this mirror ends sooner, and past its end lie the other mirror's blocks (or the window's end).
+    let m = (limit - at).min(AHEAD as u64) as usize;
     // SAFETY: as `ahead_copy`.
     let win = unsafe { &mut *(&raw mut AHEAD_BUF) };
     if win.len() < AHEAD << 12 {
         win.resize(AHEAD << 12, 0);
     }
-    let ok = blocks_read(at, &mut win[..n << 12]);
-    unsafe { AHEAD_AT = (at, if ok { n } else { 0 }) };
+    let ok = blocks_read(at, &mut win[..m << 12], &IO_TICKS);
+    unsafe { AHEAD_AT = (at, if ok { m } else { 0 }) };
+    if ok {
+        ahead_post(at + m as u64, limit);
+    }
+    ok && ahead_copy(at, buf)
+}
+
+/// The window after the current one (from `at`, below `limit`) posted to the reader thread; nothing when it is not up or the mirror ends.
+fn ahead_post(at: u64, limit: u64) {
+    if !READER_UP.load(Relaxed) || at >= limit {
+        return;
+    }
+    // WHY the min: as in `ahead_run`.
+    let m = (limit - at).min(AHEAD as u64) as usize;
+    // SAFETY: no read is posted (`ahead_settle` ran before every post), so the next buffer is the serving thread's.
+    let next = unsafe { &mut *(&raw mut NEXT_BUF) };
+    if next.len() < AHEAD << 12 {
+        next.resize(AHEAD << 12, 0);
+    }
+    let seq = NEXT_REQ.load(Relaxed) + 1;
+    unsafe {
+        NEXT_JOB = (at, m, next.as_mut_ptr() as usize);
+        NEXT_AT = (at, m);
+        NEXT_POSTED = true;
+    }
+    NEXT_REQ.store(seq, Release);
+    ferros_sys::wake(&NEXT_REQ, 1);
+}
+
+/// The posted read, if any, waited out and taken (no longer posted): whether every block came. The wait counts as the serving thread's block reading.
+fn ahead_settle() -> bool {
+    if !unsafe { NEXT_POSTED } {
+        return false;
+    }
+    unsafe { NEXT_POSTED = false };
+    let (t, seq) = (now(), NEXT_REQ.load(Relaxed));
+    let ok = loop {
+        let d = NEXT_DONE.load(Acquire);
+        if d >> 1 == seq {
+            break d & 1 != 0;
+        }
+        ferros_sys::wait(&NEXT_DONE, d, 0);
+    };
+    IO_TICKS.fetch_add(now() - t, Relaxed);
     ok
 }
 
-/// A write is coming: the window may no longer be what the disk holds.
+/// The reader thread: each posted window read into the next buffer, then said done.
+extern "C" fn ahead_reader(_: u64) -> ! {
+    let mut seen = 0;
+    loop {
+        let r = NEXT_REQ.load(Acquire);
+        if r == seen {
+            ferros_sys::wait(&NEXT_REQ, r, 0);
+            continue;
+        }
+        seen = r;
+        let (at, m, buf) = unsafe { NEXT_JOB };
+        // SAFETY: the serving thread posted `m` blocks of its next buffer and touches it no more until this job's done word says so (`ahead_settle`).
+        let ok = blocks_read(at, unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, m << 12) }, &AHEAD_TICKS);
+        NEXT_DONE.store(r << 1 | ok as u64, Release);
+        ferros_sys::wake(&NEXT_DONE, 1);
+    }
+}
+
+/// A write is coming: a read beside is let finish, and neither window may still be what the disk holds.
 fn ahead_drop() {
+    ahead_settle();
     unsafe { AHEAD_AT = (0, 0) };
 }
 
@@ -483,6 +580,8 @@ static OPEN_SPAN: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy)]
 struct Counts {
     io: u64,
+    ahead: u64,
+    call: u64,
     blocks: u64,
     calls: u64,
     cmd: u64,
@@ -496,20 +595,21 @@ struct Counts {
 }
 
 impl Counts {
-    const ZERO: Counts = Counts { io: 0, blocks: 0, calls: 0, cmd: 0, kcopy: 0, hits: 0, open: 0, span: 0, opened: 0, fetch: 0, copy: 0 };
+    const ZERO: Counts = Counts { io: 0, ahead: 0, call: 0, blocks: 0, calls: 0, cmd: 0, kcopy: 0, hits: 0, open: 0, span: 0, opened: 0, fetch: 0, copy: 0 };
     fn now(st: ferros_store::ReadTicks) -> Counts {
         let l = |a: &AtomicU64| a.load(Relaxed);
-        Counts { io: l(&IO_TICKS), blocks: l(&IO_BLOCKS), calls: l(&IO_CALLS), cmd: l(&IO_CMD), kcopy: l(&IO_COPY), hits: l(&AHEAD_HITS), open: l(&OPEN_TICKS), span: l(&OPEN_SPAN), opened: l(&OPEN_BYTES), fetch: st.fetch, copy: st.copy }
+        Counts { io: l(&IO_TICKS), ahead: l(&AHEAD_TICKS), call: l(&IO_CALL_TICKS), blocks: l(&IO_BLOCKS), calls: l(&IO_CALLS), cmd: l(&IO_CMD), kcopy: l(&IO_COPY), hits: l(&AHEAD_HITS), open: l(&OPEN_TICKS), span: l(&OPEN_SPAN), opened: l(&OPEN_BYTES), fetch: st.fetch, copy: st.copy }
     }
     /// What happened between `self` and `then`, counter by counter (each only grows).
     fn since(&self, then: &Counts) -> Counts {
-        Counts { io: self.io - then.io, blocks: self.blocks - then.blocks, calls: self.calls - then.calls, cmd: self.cmd - then.cmd, kcopy: self.kcopy - then.kcopy, hits: self.hits - then.hits, open: self.open - then.open, span: self.span - then.span, opened: self.opened - then.opened, fetch: self.fetch - then.fetch, copy: self.copy - then.copy }
+        Counts { io: self.io - then.io, ahead: self.ahead - then.ahead, call: self.call - then.call, blocks: self.blocks - then.blocks, calls: self.calls - then.calls, cmd: self.cmd - then.cmd, kcopy: self.kcopy - then.kcopy, hits: self.hits - then.hits, open: self.open - then.open, span: self.span - then.span, opened: self.opened - then.opened, fetch: self.fetch - then.fetch, copy: self.copy - then.copy }
     }
 }
 
 /// A large value read from its first byte to its last, measured stage by stage (owner, 2026-11-08: "Report MB/s per stage"; 2026-11-11: "2.9s for a 24MB read is embarassing", so one device run says where every millisecond goes). Two console lines when the read reaches the value's end:
 /// - `vault: read …`: the value, the requests, first to last; serving split into the fetch (manifestus's index walk to each piece, each block's BLAKE3 guard and decode, the furrows joined, the pieces handed to the helpers: `ReadTicks::fetch` less the block reads inside it), the block reads, the opening left after them (XChaCha20-Poly1305 on this thread and the helpers; the helpers open beside the fetch, and "all" is each batch from its first piece handed over to its last opened), the copy out (into the reply, the opened pieces wiped) and the rest (the head, the bookkeeping); and the time between requests (the kernel's stamp and hand-offs both ways, the reply's copy into the reader, the reader's own work).
-/// - `vault: read blocks …`: the block reads' bytes and kernel calls, the kernel's split of those calls (in the UFS commands, copying into this process, the rest of the syscalls), and the blocks the read-ahead gave without a call.
+///   The block reads are the serving thread's own and its waits for the next window; "beside it" is the reader thread's reading of the next windows while the serving thread fetched.
+/// - `vault: read blocks …`: the block reads' bytes, kernel calls (both threads') and their time, the kernel's split of those calls (in the UFS commands, copying into this process, the rest of the syscalls: entry, the kernel lock's wait), and the blocks the read-ahead gave without a call.
 struct Meter {
     on: bool,
     t0: u64,
@@ -547,7 +647,7 @@ impl Meter {
         let fetch = ms(c.fetch) as i64 - ms(c.io) as i64;
         let rest = ms(self.serving) as i64 - ms(c.fetch) as i64 - ms(c.open) as i64 - ms(c.copy) as i64;
         say!(
-            "vault: read {} B in {} requests, {} ms first to last ({} MB/s): serving {} ms = fetch {} + block reads {} + opening after them {} (all {} ms, {} MB/s, {} cores) + copy out {} + rest {}; between requests {} ms",
+            "vault: read {} B in {} requests, {} ms first to last ({} MB/s): serving {} ms = fetch {} + block reads {} (beside it {}) + opening after them {} (all {} ms, {} MB/s, {} cores) + copy out {} + rest {}; between requests {} ms",
             whole,
             self.requests,
             ms(wall),
@@ -555,6 +655,7 @@ impl Meter {
             ms(self.serving),
             fetch,
             ms(c.io),
+            ms(c.ahead),
             ms(c.open),
             ms(c.span),
             rate(c.opened, c.span),
@@ -564,12 +665,13 @@ impl Meter {
             ms(wall - self.serving)
         );
         // Signed: a kernel that does not time leaves the split at 0.
-        let sys = ms(c.io) as i64 - ms(c.cmd) as i64 - ms(c.kcopy) as i64;
+        let sys = ms(c.call) as i64 - ms(c.cmd) as i64 - ms(c.kcopy) as i64;
         say!(
-            "vault: read blocks {} B in {} calls ({} MB/s): in the UFS commands {} ms ({} MB/s), the kernel's copies {} ms, the rest of the calls {} ms; read-ahead gave {} blocks",
+            "vault: read blocks {} B in {} calls, {} ms in them ({} MB/s): in the UFS commands {} ms ({} MB/s), the kernel's copies {} ms, the rest of the calls {} ms; read-ahead gave {} blocks",
             c.blocks << 12,
             c.calls,
-            rate(c.blocks << 12, c.io),
+            ms(c.call),
+            rate(c.blocks << 12, c.call),
             ms(c.cmd),
             rate(c.blocks << 12, c.cmd),
             ms(c.kcopy),
@@ -622,6 +724,12 @@ extern "C" fn work(_: u64) -> ! {
         if ferros_sys::thread_spawn(helper, unsafe { &mut *s.0.get() }, 0) == ERR {
             say!("vault: a helper did not start; reads open their pieces on fewer cores");
         }
+    }
+    // The read-ahead's reader (`ahead_reader`), idle until a bulk read posts the next window; without it each window is read when it is reached.
+    if ferros_sys::thread_spawn(ahead_reader, unsafe { &mut *READER_STACK.0.get() }, 0) == ERR {
+        say!("vault: the read-ahead's reader did not start; each window is read when reached");
+    } else {
+        READER_UP.store(true, Relaxed);
     }
     // One transfer and its stamp each way, with room to spare: in, a set's piece (ferros_sys::STORE_MAX, 256 KiB); out, a get's (ferros_sys::STORE_GET_MAX, 1 MiB since 2026-11-11, the kernel's bound on a forwarded get).
     let mut msg = alloc::vec![0u8; ferros_sys::STORE_MAX + (1 << 12)];
