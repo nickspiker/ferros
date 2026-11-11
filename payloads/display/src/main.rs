@@ -3,7 +3,7 @@
 //! What it owns: the `display-fb` DMA region (the surface the layer DMA reads), a heap region, DECON0's main/win/wincon blocks, layer 0's DMA / DPP / SRAMC / HDR-common blocks, DSIM0 with its PHY, and the GPIO bank with the TE pin. What it takes from the pipe as found: the raster (the layer DMA's image size) and the modeset ABL or the kernel left — the panel, DSIM's link and DECON's own geometry stay as they are. The layer it programs itself, every word (`Pipe::program_layer`), so nothing about window 5 is inherited.
 //!
 //! Spawn: ferros-bridge spawn display.bin 00 --name display --serve display --hw decon0-main --hw decon0-win --hw decon0-wincon --hw dpu-dma0 --hw dpp0 --hw gpio-gpp0 --dma display-fb --dma display-heap --hw dsim0 --hw dphy0 --hw sramc0 --hw hdrcomm0
-//! Grant slots, in that order: 0 console, 1 the `display` endpoint (serve), 2 DECON main, 3 DECON win, 4 DECON wincon, 5 DMA0, 6 DPP0, 7 GPP0, 8 the framebuffer region, 9 the heap region (cacheable; the arc pool is too small for a typeface and the framebuffer region too slow), 10 DSIM0, 11 its PHY (the link rate for the TE timers), 12 SRAMC0, 13 HDRCOMM0 (the layer's geometry words); then 14-22 below (the phases, the app surfaces, the frame-start line, the sprites, the canvas, and the modeset's blocks).
+//! Grant slots, in that order: 0 console, 1 the `display` endpoint (serve), 2 DECON main, 3 DECON win, 4 DECON wincon, 5 DMA0, 6 DPP0, 7 GPP0, 8 the framebuffer region, 9 the old heap region (not read since 2026-11-11: the heap is the display's own arc, grown on demand), 10 DSIM0, 11 its PHY (the link rate for the TE timers), 12 SRAMC0, 13 HDRCOMM0 (the layer's geometry words); then 14-22 below (the phases, the app surfaces, the frame-start line, the sprites, the canvas, and the modeset's blocks).
 //!
 //! The `display` endpoint (SHELL.md: the shell draws lists, this process paints). One op per call, first byte the op, coordinates u16 little-endian in panel pixels, colours u32 little-endian G#00RRGGBB, one status byte back (0 = ok, 1 = bad message, 2 = too big):
 //! - 1 `begin`: a new frame — the whole surface transparent. Until a client's first `begin`, this process paints its own first-boot screen.
@@ -99,6 +99,8 @@ const S_DMA0: u64 = 5;
 const S_DPP0: u64 = 6;
 const S_GPP0: u64 = 7;
 const S_FB: u64 = 8;
+/// 9: the `display-heap` region until 2026-11-11, not read since (the heap is the display's own arc, `heap_init`); the slot stays so every later one keeps its number.
+#[allow(dead_code)]
 const S_HEAP: u64 = 9;
 const S_DSIM: u64 = 10;
 const S_DPHY: u64 = 11;
@@ -357,16 +359,29 @@ const IDMA_IRQ_CLEAR: u32 = 0xDFB << 16;
 /// The TE pin: GPP0 DAT bit 3.
 const GPP0_DAT: u64 = 0x0004;
 
-/// The heap region (cachemap DISPLAY_HEAP): 32 MiB, cacheable. Its top holds the back buffer (see `_entry`); the rest is the allocator's. The typeface parse alone allocates 14.7 MiB in total (3.7 MiB live at the peak) and this allocator frees nothing until the frame arena resets, so what is left under the back buffer has to hold the whole parse.
-const HEAP_REGION: usize = 32 << 20;
+/// The heap's ceiling: the most the display's arc grows to for its heap (docs/ARCS.md step 2), declared in its image header (`ferros_sys::entry!` below, `grows`), so the kernel sizes the arc's window for it and maps frames only as they are asked for.
+/// Until 2026-11-11 the heap was a fixed 32 MiB region the kernel granted (cachemap DISPLAY_HEAP, `display-heap`), and on the Pro that night the display panicked at start, "memory allocation of 2097152 bytes failed": the quick row's band (+4.2 MiB) and the night's other additions had taken it past 32 MiB. Nothing in the heap is DMA (the back buffer is the canvas region, the framebuffers and the phases their own), so it may lie in any frames of the pool, and move.
+/// A power of two, four times the start as estimated that night (about 27 MiB in this heap on husky, COMPOSITOR.md "Memory"): room for the hit map and what comes after without a rebuild, while the window (the next power of two above it) costs addresses only.
+const HEAP_CEILING: usize = 1 << 27;
+/// The least one grow asks for: four frames, so a heap that keeps growing asks a few times rather than once an allocation (ferros_rt asks the same way).
+const HEAP_GROW_MIN: usize = 8 << 20;
+/// What the kernel maps after .bss at spawn for an image whose heap grows (process.rs `HEAP_START`, 4 MiB): the console worker's and the wallpaper loader's fixed arenas live there (`heap_init`), the rest of the heap above the first stack, where the arc grows.
+const HEAP_SPARE: usize = 4 << 20;
+const _: () = assert!((1 << 20) + LOAD_HEAP_BYTES <= HEAP_SPARE, "the console's and the loader's arenas must fit the spare the kernel maps after .bss");
 
-/// A bump allocator over the heap in the framebuffer region, with a mark: everything allocated before `mark()` (the parsed typeface) lives for the process; everything after it is the frame's scratch (glyph bitmaps), thrown away by `reset()` after each frame.
+/// A bump allocator with a mark: everything allocated before `mark()` (the parsed typeface, the bars, the hit map) lives for the process; everything after it is the frame's scratch (glyph bitmaps), thrown away by `reset()` after each frame. The render thread's (`ALLOC`) grows the arc when it runs out (`more`); the console worker's and the loader's are fixed arenas.
 struct Bump {
     base: UnsafeCell<usize>,
     next: UnsafeCell<usize>,
     mark: UnsafeCell<usize>,
     end: UnsafeCell<usize>,
+    /// The most it ever held (`next − base`), for the heap's log lines.
+    peak: UnsafeCell<usize>,
+    /// Whether it may grow the arc (`ALLOC` only, and only on a kernel with SYS_ARC).
+    grows: UnsafeCell<bool>,
 }
+/// A bump not yet set up (non-zero initialisers keep it in `.data`, see `ALLOC`).
+const BUMP_NONE: Bump = Bump { base: UnsafeCell::new(1), next: UnsafeCell::new(1), mark: UnsafeCell::new(1), end: UnsafeCell::new(1), peak: UnsafeCell::new(1), grows: UnsafeCell::new(false) };
 unsafe impl Sync for Bump {}
 
 unsafe impl GlobalAlloc for Bump {
@@ -390,34 +405,61 @@ unsafe impl GlobalAlloc for Bump {
 static mut CON_STACK_LO: usize = usize::MAX;
 static mut CON_STACK_LEN: usize = 1;
 static mut CON_STACK: [u8; 1 << 18] = [0; 1 << 18];
-static CON_HEAP: Bump = Bump { base: UnsafeCell::new(1), next: UnsafeCell::new(1), mark: UnsafeCell::new(1), end: UnsafeCell::new(1) };
+static CON_HEAP: Bump = BUMP_NONE;
 
 impl Bump {
-    /// The bump itself: the next aligned bytes of this arena, null when it is full or not yet set up.
+    /// The bump itself: the next aligned bytes of this arena, null when it is full (and cannot grow) or not yet set up.
     unsafe fn bump(&self, l: Layout) -> *mut u8 {
-        let base = *self.base.get();
-        if base <= 1 {
-            return core::ptr::null_mut();
+        unsafe {
+            let base = *self.base.get();
+            if base <= 1 {
+                return core::ptr::null_mut();
+            }
+            loop {
+                let start = (*self.next.get() + l.align() - 1) & !(l.align() - 1);
+                if start + l.size() <= *self.end.get() {
+                    *self.next.get() = start + l.size();
+                    // WHY the max: the high water, for the log; next falls back at every reset.
+                    *self.peak.get() = (*self.peak.get()).max(start + l.size() - base);
+                    return start as *mut u8;
+                }
+                if !*self.grows.get() || !self.more(start + l.size() - *self.end.get()) {
+                    return core::ptr::null_mut();
+                }
+            }
         }
-        let start = (*self.next.get() + l.align() - 1) & !(l.align() - 1);
-        if start + l.size() > *self.end.get() {
-            return core::ptr::null_mut();
+    }
+
+    /// The arc grown by at least `short` bytes (SYS_ARC, docs/ARCS.md): the new frames are mapped right above the old top, which is this bump's end, so the run goes on unbroken. False when the kernel refuses (the ceiling, or the pool out of frames): the allocation fails as it always did, loudly (the panic names the size).
+    unsafe fn more(&self, short: usize) -> bool {
+        unsafe {
+            let held = *self.end.get() - *self.base.get();
+            // WHY the sizes: the least a grow asks for, a quarter of what the heap holds when that is more (a heap that keeps growing asks a few times), and only what is short when that much would pass the ceiling (the kernel refuses the lot, and `short` alone may fit).
+            let want = short.max(HEAP_GROW_MIN).max(held / 4);
+            let r = match ferros_sys::arc::grow(want) {
+                Err(_) if want > short => ferros_sys::arc::grow(short),
+                r => r,
+            };
+            let Ok((top, was)) = r else { return false };
+            let arc = ferros_sys::arc_base() as usize;
+            // Not where this run ends (something else grew the arc): the new frames start a run of their own, the old one's tail left unused.
+            if arc + was != *self.end.get() {
+                *self.next.get() = arc + was;
+            }
+            *self.end.get() = arc + top;
+            true
         }
-        *self.next.get() = start + l.size();
-        start as *mut u8
     }
 }
 
 impl Bump {
-    fn init(&self, base: usize) {
-        self.init_at(base, HEAP_REGION);
-    }
     fn init_at(&self, base: usize, len: usize) {
         unsafe {
             *self.base.get() = base;
             *self.next.get() = base;
             *self.mark.get() = base;
             *self.end.get() = base + len;
+            *self.peak.get() = 0;
         }
     }
     fn mark(&self) {
@@ -429,11 +471,110 @@ impl Bump {
     fn used(&self) -> usize {
         unsafe { *self.next.get() - *self.base.get() }
     }
+    /// What lives for the process (to the mark), the most it ever held, and how much is mapped for it.
+    fn kept(&self) -> usize {
+        unsafe { *self.mark.get() - *self.base.get() }
+    }
+    fn peak(&self) -> usize {
+        unsafe { *self.peak.get() }
+    }
+    fn mapped(&self) -> usize {
+        unsafe { *self.end.get() - *self.base.get() }
+    }
 }
 
-/// Non-zero initialisers keep these in `.data`: the flat image carries no `.bss`, and whatever the kernel copies after the code (the input) would otherwise share their bytes. `init` sets the real values.
+/// The heaps set up, first thing (owner, 2026-11-11: room that scales; docs/ARCS.md, COMPOSITOR.md "Memory"):
+/// - The kernel maps `HEAP_SPARE` zeroed bytes right after .bss at spawn (an image whose heap grows starts with that much of it): the console worker's 1 MiB arena and the wallpaper loader's 2 MiB go there.
+/// - The render thread's heap (`ALLOC`) starts empty at the arc's top, above the first stack, and grows the arc a few frames at a time as it fills.
+/// - A kernel from before ARCS (no SYS_ARC) maps the whole declared heap after .bss instead: the render thread's heap is then the rest of it, fixed.
+/// Returns the arc's top and ceiling as the kernel answered them (the top G#FFFF… on a kernel without SYS_ARC).
+fn heap_init() -> (usize, usize) {
+    unsafe extern "C" {
+        static __image_end: u8;
+    }
+    // WHY the rounding: the kernel's zeroed tail runs to .bss's end plus 16 (payload.ld `__ferros_tail`), and the arenas start on a cache line past it.
+    let spare = ((&raw const __image_end) as usize + 16 + 63) & !63;
+    CON_HEAP.init_at(spare, 1 << 20);
+    LOAD_HEAP.init_at(spare + (1 << 20), LOAD_HEAP_BYTES);
+    let used = (1 << 20) + LOAD_HEAP_BYTES;
+    let (top, ceiling) = ferros_sys::arc::size();
+    if top as u64 == ferros_sys::ERR {
+        ALLOC.init_at(spare + used, HEAP_CEILING - used - 64);
+    } else {
+        ALLOC.init_at(ferros_sys::arc_base() as usize + top, 0);
+        unsafe { *ALLOC.grows.get() = true };
+    }
+    (top, ceiling)
+}
+
+/// The start's steps the heap is measured after (`heap_start_log`): the typeface parsed (and its glyph cache), the tables and the icons' mips, the bars' buffers and the quick row's sprites, the rest up to the mark.
+const HEAP_STEPS: usize = 4;
+const HEAP_STEP_NAMES: [&[u8]; HEAP_STEPS] = [b"typeface and glyph cache ", b", tables and icons ", b", bars and quick row ", b", the rest "];
+
+/// The heap at start, once, after the mark (owner, 2026-11-11: measure it, at start and once the console and the quick row are up): what each step kept, what is mapped for it, and the arc's top and ceiling as the kernel answered them.
+fn heap_start_log(log: &mut Log, at: &[usize; HEAP_STEPS], top: usize, ceiling: usize) {
+    log.s(b"display: heap at start ");
+    log.dec(ALLOC.kept() as u64 >> 10);
+    log.s(b" KiB kept (");
+    let mut was = 0;
+    for (k, name) in HEAP_STEP_NAMES.iter().enumerate() {
+        log.s(name);
+        log.dec((at[k] - was) as u64 >> 10);
+        was = at[k];
+    }
+    log.s(b" KiB), ");
+    log.dec(ALLOC.mapped() as u64 >> 10);
+    log.s(b" KiB mapped for it; console arena ");
+    log.dec(CON_HEAP.mapped() as u64 >> 10);
+    log.s(b" KiB, loader ");
+    log.dec(LOAD_HEAP.mapped() as u64 >> 10);
+    log.s(b" KiB, after .bss; ");
+    if top as u64 == ferros_sys::ERR {
+        log.s(b"no SYS_ARC: the whole heap mapped at spawn\n");
+    } else {
+        log.s(b"arc top G#");
+        log.hex(top as u32);
+        log.s(b" at the start, ceiling G#");
+        log.hex(ceiling as u32);
+        log.s(b"\n");
+    }
+    log.flush();
+}
+
+/// The heaps' high water as last said (`heap_water`): the render thread's, the console worker's and the loader's, in KiB.
+static mut HEAP_SAID: [u64; 3] = [0; 3];
+
+/// Said again whenever a heap's high water passed a new MiB (the frame's scratch growing, the console's arena filling as the quick row and its words come up), from the render loop's pass top; nothing on a pass where none did. One line, no allocation.
+fn heap_water(log: &mut Log) {
+    let now = [ALLOC.peak() as u64 >> 10, CON_HEAP.peak() as u64 >> 10, LOAD_HEAP.peak() as u64 >> 10];
+    let said = unsafe { HEAP_SAID };
+    if now.iter().zip(said.iter()).all(|(n, s)| n >> 10 <= s >> 10) {
+        return;
+    }
+    unsafe { HEAP_SAID = now };
+    log.s(b"display: heap high water ");
+    log.dec(now[0]);
+    log.s(b" KiB (kept ");
+    log.dec(ALLOC.kept() as u64 >> 10);
+    log.s(b", mapped ");
+    log.dec(ALLOC.mapped() as u64 >> 10);
+    log.s(b" of ");
+    log.dec(HEAP_CEILING as u64 >> 10);
+    log.s(b"), console arena ");
+    log.dec(now[1]);
+    log.s(b" of ");
+    log.dec(CON_HEAP.mapped() as u64 >> 10);
+    log.s(b", loader ");
+    log.dec(now[2]);
+    log.s(b" of ");
+    log.dec(LOAD_HEAP.mapped() as u64 >> 10);
+    log.s(b" KiB\n");
+    log.flush();
+}
+
+/// Non-zero initialisers keep these in `.data`: the flat image carries no `.bss`, and whatever the kernel copies after the code (the input) would otherwise share their bytes. `heap_init` sets the real values.
 #[global_allocator]
-static ALLOC: Bump = Bump { base: UnsafeCell::new(1), next: UnsafeCell::new(1), mark: UnsafeCell::new(1), end: UnsafeCell::new(1) };
+static ALLOC: Bump = BUMP_NONE;
 
 /// Oxanium (OFL, assets/fonts), the owner's choice for ferros's face — the same family as the "Ready?" screen — in its +glyphs cut, which adds tatau's twelve dozenal digit glyphs at G#10–G#1B, so numbers draw in the device base as glyphs (SETTINGS.md).
 static FONT: &[u8] = include_bytes!("../../../assets/fonts/Oxanium-Regular+glyphs.ttf");
@@ -1942,7 +2083,7 @@ static mut WALL_ON: bool = false;
 static mut WALL_PENDING: Option<[u8; 32]> = None;
 /// The job's choices (`wallpaper::params`, worked out once by the render loop as it starts the job), read by its threads.
 static mut WALL_P: Option<wallpaper::Params> = None;
-/// The refining mask (a bit a pixel, `wallpaper::mask_stride` bytes a row), allocated at the first job and kept.
+/// The refining mask (a bit a pixel, `wallpaper::mask_stride` bytes a row), allocated at start before the heap's mark and kept.
 static mut WALL_MASK: usize = 0;
 /// Whether a job is running (set by the render loop as it starts one, cleared when it sees the job done).
 static mut WALL_RUNNING: bool = false;
@@ -4326,9 +4467,6 @@ fn wall_step(grants: u64, width: usize, height: usize) {
         }
         if !WALL_RUNNING {
             let Some(seed) = (*(&raw mut WALL_PENDING)).take() else { return };
-            if WALL_MASK == 0 {
-                WALL_MASK = alloc::vec![0u8; wallpaper::mask_stride(width) * height].leak().as_mut_ptr() as usize;
-            }
             WALL_ON = false;
             clean_reset_all();
             WALL_P = Some(wallpaper::params(&seed, width, height));
@@ -4429,7 +4567,7 @@ static mut LOADING: bool = false;
 static mut LOAD_STACK: [u8; 1 << 18] = [0; 1 << 18];
 static mut LOAD_STACK_LO: usize = usize::MAX;
 static mut LOAD_STACK_LEN: usize = 1;
-static LOAD_HEAP: Bump = Bump { base: UnsafeCell::new(1), next: UnsafeCell::new(1), mark: UnsafeCell::new(1), end: UnsafeCell::new(1) };
+static LOAD_HEAP: Bump = BUMP_NONE;
 const LOAD_HEAP_BYTES: usize = 2 << 20;
 
 extern "C" fn wall_loader(grants: u64) -> ! {
@@ -5903,13 +6041,8 @@ fn server(grants: u64) -> ! {
         log.flush();
         ferros_sys::exit(1);
     }
-    let heap = ferros_sys::dma(cap(grants, S_HEAP)) as usize;
-    if heap == 0 || heap == u64::MAX as usize {
-        log.s(b"display: no heap region\n");
-        log.flush();
-        ferros_sys::exit(1);
-    }
-    ALLOC.init(heap);
+    // The heap in the display's own arc (`heap_init`); slot 9, the `display-heap` region it was until 2026-11-11, is not read.
+    let (arc_top, arc_ceiling) = heap_init();
 
     // The DPU powered down (SYS_FACTS 30 = 1: Android's DECON hibernation at a jump, or ferros's own `dpu off`): no DECON or DSIM register may be touched before the kernel's `dpu` switch has powered it (the EL3 poison rule, the kernel's display.rs); then the whole pipe from reset (modeset::from_off, DISPLAY-DESIGN.md §8).
     // On the X3 for the power switches and the modeset: the kernel takes SYS_POWER only from its own core, and a thread nobody pinned runs on the workers. Unpinned, this thread started on the X3 (where init spawned it), took the `dpu` and `panel` switches there, and was on a worker by the modeset's `panel-vddd`, refused without the switch ever running: the panel came up without VDDD after two jumps, ran a few frames and stopped (2026-11-04). Unpinned again before any thread is spawned: they inherit the mask.
@@ -6044,6 +6177,9 @@ fn server(grants: u64) -> ! {
         }
     }
     let font = Font;
+    // The heap at each step of the start (`HEAP_STEP_NAMES`' order), for the budget line below (COMPOSITOR.md "Memory").
+    let mut heap_at = [0usize; HEAP_STEPS];
+    heap_at[0] = ALLOC.used();
     // The present stage's table and its 8-bit slice, built before the mark so they live for the process.
     let t_lut = now();
     let lut: &'static mut [u16] = alloc::vec![0u16; 65536].leak();
@@ -6074,6 +6210,7 @@ fn server(grants: u64) -> ! {
         }
         v.leak()
     };
+    heap_at[1] = ALLOC.used();
     unsafe {
         let sprites = ferros_sys::dma(cap(grants, S_SPRITES));
         if sprites != 0 && sprites != ferros_sys::ERR {
@@ -6102,22 +6239,24 @@ fn server(grants: u64) -> ! {
         CLEAN_W = width / 16;
         CLEAN = alloc::vec![0u8; (width / 16) * height].leak().as_mut_ptr() as usize;
         BAR_SPAN_BACK = alloc::vec![(0u16, 0u16); top + bot].leak().as_mut_ptr() as usize;
-        // The console worker's heap (1 MiB: a draw's tables and the glyphs it rasterises, reset after each draw), its stack (its allocations are told by it), and its own glyph engine.
-        CON_HEAP.init_at(alloc::vec![0u8; 1 << 20].leak().as_mut_ptr() as usize, 1 << 20);
+        heap_at[2] = ALLOC.used();
+        // The console worker's heap (1 MiB: a draw's tables and the glyphs it rasterises, reset after each draw) is in the spare the kernel maps after .bss (`heap_init`); its stack (its allocations are told by it), and its own glyph engine.
         CON_STACK_LEN = (*(&raw const CON_STACK)).len();
         CON_STACK_LO = (&raw const CON_STACK) as usize;
         CON_GLYPHS = glyphs::Glyphs::with_arena(FONT, 1 << 17);
-        // The wallpaper loader's heap and stack (`wall_loader`).
-        LOAD_HEAP.init_at(alloc::vec![0u8; LOAD_HEAP_BYTES].leak().as_mut_ptr() as usize, LOAD_HEAP_BYTES);
+        // The wallpaper loader's stack (`wall_loader`); its heap is in the spare too.
         LOAD_STACK_LEN = (*(&raw const LOAD_STACK)).len();
         LOAD_STACK_LO = (&raw const LOAD_STACK) as usize;
         LOAD_SIZE = (width, height);
+        // The wallpaper's refining mask, kept for the process (before the mark): it was allocated at the first wallpaper job until 2026-11-11, after the mark, where the next frame's reset handed its bytes to the frame's scratch while the wallpaper's threads still read and wrote them.
+        WALL_MASK = alloc::vec![0u8; wallpaper::mask_stride(width) * height].leak().as_mut_ptr() as usize;
     }
     // Each publishing thread's flight scratch (`flight_row_buf`), kept with the rest.
     unsafe {
         FLIGHT_ROWS = alloc::vec![0u64; FLIGHT_SCRATCH * (PUB_WORKERS + 1)].leak().as_mut_ptr() as usize;
         FLIGHT_TEXT = alloc::vec![0u32; height].leak().as_mut_ptr() as usize;
     }
+    heap_at[3] = ALLOC.used();
     // The publish workers' stacks, so the draw functions tell a worker's band of the scene by the stack it runs on (`draw::thread_slot`).
     unsafe { draw::WORKER_STACKS = (&raw const PUB_STACKS as usize, PUB_STACK, PUB_WORKERS) };
     ALLOC.mark();
@@ -6133,10 +6272,9 @@ fn server(grants: u64) -> ! {
     log.flush();
     log.s(b"display: typeface up in ");
     log.dec(ferros_sys::us_since(t_font) / 1000);
-    log.s(b" ms, heap ");
-    log.dec(ALLOC.used() as u64 >> 10);
-    log.s(b" KiB\n");
+    log.s(b" ms\n");
     log.flush();
+    heap_start_log(&mut log, &heap_at, arc_top, arc_ceiling);
     // The camera hole's knockout as planned: its rows and pixels (none while the board's hole is unmeasured, `HOLE_HUSKY`).
     {
         let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
@@ -7807,6 +7945,8 @@ fn server(grants: u64) -> ! {
                 }
             }
         }
+        // The heaps' high water, said when one passed a new MiB (`heap_water`).
+        heap_water(&mut tlog);
         // Windows whose process ended (the kernel cleared or renewed its surface's generation, `live_gen`; `reaper` wakes this pass when it does): gone, and what was behind them shows; the last one gone, the map has the glass again. Then the corners' clock, once a minute while windows are up, into every phase over its corner.
         let reaps_seen = REAPS.load(Ordering::Acquire);
         unsafe {
@@ -8262,8 +8402,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 /// The console grant for the panic handler (set first thing in `_entry`; `.data`, see ALLOC).
 static mut PANIC_GRANTS: u64 = 1;
 
-// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
-ferros_sys::entry!(display_main);
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss), its heap growing on demand up to `HEAP_CEILING` (`heap_init`).
+ferros_sys::entry!(display_main, grows HEAP_CEILING);
 
 /// The radios' orbs (`orb_look`, the console's orb grids): off since 2026-11-09 (owner: "I haven't thought thru what I want it to look like and get used to the numbers so switch to the most useful stats"), kept for when the look is decided.
 const ORBS: bool = false;
