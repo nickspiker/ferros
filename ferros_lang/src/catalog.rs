@@ -267,6 +267,22 @@ messages! {
     /// Two lines.
     AttestAtBootNote,
 
+    // ---- the NFC page: attest with a tag (AUTH.md "Attest with a tag"; owner, 2026-11-11) ----
+    /// The heading over the tags kept to attest with.
+    TagAttest,
+    /// The button that keeps the next tag held to the device.
+    TagAdd,
+    /// While it waits for that tag (the button then cancels: `Cancel`).
+    TagHold,
+    /// What the last add did: kept, kept already, not kept.
+    TagKeptNow,
+    TagKeptAlready,
+    TagNotKept,
+    /// Two lines, under the list: what a kept tag does (the warning, as attest at boot's).
+    TagNote,
+    /// A kept tag's button.
+    TagRemove,
+
     // ---- Fleet: ferros's own lines (the fleet's and the identity's words are fgtw's, shared with Photon: fgtw::text) ----
     FleetServiceNotRunning,
     HomeFetching,
@@ -433,6 +449,8 @@ messages! {
     RecordMismatch,
     Minting,
     MintingFailed,
+    /// A tag held to the attest screen that does not open the device: one refusal, no detail (AUTH.md "Attest with a tag").
+    TagDenied,
     ComputingKeys,
     IdentityServiceNotAnswering,
     // Its network page.

@@ -1061,7 +1061,7 @@ const SYS_LIGHT: u64 = 21;
 const SYS_POWER: u64 = 22;
 /// ira_key(cap, domain, domain len, out): x0 the Ira capability's token offset, x1/x2 a domain string in the caller's arc (1-64 bytes), x3 a 32-byte buffer that receives `blake3::derive_key("ferros process ira v1 " ‖ domain, ira)`. Returns 32, or ERR (no ira this boot, no capability, bad domain).
 const SYS_IRA: u64 = 23;
-/// unlock(cap, op, seed): x0 the Unlock capability, x1 the op — 0 the state (bit 0 an identity is unlocked, bit 1 the device is bound to one), 1 unlock the identity whose 32-byte seed is at x2 (the number of entries it has on this device; NOTHING: the device is bound to another identity; ERR: no vault or no ira), 2 lock, 3 bind the device to the unlocked identity, 4 release the device (every identity entry deleted) (0, or ERR). AUTH.md.
+/// unlock(cap, op, seed): x0 the Unlock capability, x1 the op — 0 the state (bit 0 an identity is unlocked, bit 1 the device is bound to one), 1 unlock the identity whose 32-byte seed is at x2 (the number of entries it has on this device; NOTHING: the device is bound to another identity; ERR: no vault or no ira), 2 lock, 3 bind the device to the unlocked identity, 4 release the device (every identity entry deleted) (0, or ERR), 5 the person's export, 6-9 attest with a tag (`tag_syscall`: unlock by a tag, keep, forget, list). AUTH.md.
 const SYS_UNLOCK: u64 = 24;
 /// pt(cap, op, ptr, len, offset): the kernel's PT commands for the USB driver process (ptlink.rs). `ptr` is an offset in the arc, or `DMA_ADDR | address` inside a DMA region the caller holds. Op 0 hands over a command of `len` bytes at `ptr` (op 3: the same command again, to act once its reply is out) → 0 or ERR (one is already in, or too large). Op 2 says a transfer is moving (the clock policy counts it as activity) → 0. Op 1 copies its reply from `offset` into `len` bytes at `ptr` → the reply's full length, plus bit 32 when the command waits to act and bit 33 when it gave no reply at all; NOTHING while it runs; ERR when none was handed over.
 const SYS_PT: u64 = 25;
@@ -1591,6 +1591,20 @@ pub static mut STORE_KEYS: Option<fn() -> Result<Vec<alloc::string::String>, ()>
 pub static mut UNLOCK: Option<fn(u8, Option<&[u8; 32]>) -> Result<u64, ()>> = None;
 /// The identity's entries as one VSF document (service.rs `store_export`), for SYS_UNLOCK op 5.
 pub static mut EXPORT: Option<fn() -> Option<alloc::vec::Vec<u8>>> = None;
+/// Attest with a tag (AUTH.md), SYS_UNLOCK ops 6-9 (`tag_syscall`), as the vault's owner serves them (service.rs `store_tag`).
+pub enum TagOp<'a> {
+    /// Unlock by the tag whose UID this is; the seed into the second, on success.
+    Unlock(&'a [u8], &'a mut [u8; 32]),
+    /// Keep the tag whose UID this is for the unlocked identity.
+    Keep(&'a [u8]),
+    /// Forget the tag whose id starts so, or every tag.
+    Forget(Option<[u8; crate::kvault::TAG_SHOWN]>),
+    /// The kept tags, `TAG_ENTRY` bytes each, into the vector.
+    List(&'a mut Vec<u8>),
+}
+pub static mut TAG: Option<fn(TagOp) -> Result<u64, ()>> = None;
+/// One kept tag as op 9 lists it: the first `TAG_SHOWN` bytes of its id, then when it was kept (Eagle time in oscillations, i64 LE).
+pub const TAG_ENTRY: usize = crate::kvault::TAG_SHOWN + 8;
 /// The export being read (op 5 without a vault process), from its build at offset 0 until it is read to its end; the person's plaintext, wiped then. Under the kernel lock.
 static mut EXPORT_DOC: Option<alloc::vec::Vec<u8>> = None;
 /// An entry kept by 32-byte address rather than by name (SYS_STORE bit 5): kete on ferros keeps its vaults this way — the address is kete's, the kernel scopes it (kvault `addr_scoped`).
@@ -1863,6 +1877,66 @@ fn export_route(p: &Process, f: &Frame) -> Option<usize> {
     let ep = vault_ep()?;
     let token = p.read(f.x[0], 32);
     matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Unlock, r)) if r & RIGHT_SEND != 0).then_some(ep)
+}
+
+/// `SYS_UNLOCK` ops 6-9, attest with a tag (AUTH.md "Attest with a tag"):
+/// - 6 unlock by tag (x2 the UID, x3 its length, x4 32 bytes the seed lands in), the Unlock right only → the entry count as op 1, NOTHING (the device is bound to another identity), or ERR: one refusal for a tag kept for nothing here and for one whose record does not open, no detail;
+/// - 7 keep a tag for the unlocked identity (x2, x3 the UID) → 0 kept, 1 kept already, ERR (nobody present, or it could not be kept);
+/// - 8 forget (x2 the first `TAG_SHOWN` bytes of a tag's id as op 9 gives them, x3 that length; x3 0: every tag) → how many went;
+/// - 9 list (x2 a buffer, x3 its length) → how many tags are kept, as many `TAG_ENTRY` entries written as the buffer holds whole.
+/// Ops 7-9 are also a Settings holder's (the settings page keeps tags and holds no right to unlock); none acts while nobody is present.
+fn tag_syscall(p: &Process, f: &Frame) -> u64 {
+    let token = p.read(f.x[0], 32);
+    let op = f.x[1];
+    let right = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+        Some((Object::Unlock, r)) => r & RIGHT_SEND != 0,
+        Some((Object::Settings, r)) => r & RIGHT_SEND != 0 && op != 6,
+        _ => false,
+    };
+    let Some(tag) = (unsafe { TAG }) else { return ERR };
+    if !right {
+        return ERR;
+    }
+    // WHY the lengths: the UID and its length are the caller's (and, before it, the radio's); an NFC-A UID is 4, 7 or 10 bytes (ISO/IEC 14443-3) and anything else is not one, refused before anything is read.
+    let uid_len = |n: u64| matches!(n, 4 | 7 | 10);
+    match op {
+        6 if uid_len(f.x[3]) => {
+            let mut uid = p.read(f.x[2], f.x[3] as usize);
+            let mut seed = [0u8; 32];
+            let r = tag(TagOp::Unlock(&uid, &mut seed));
+            if r.is_ok_and(|n| n != NOTHING) {
+                p.write(f.x[4], &seed);
+            }
+            seed.fill(0);
+            uid.fill(0);
+            r.unwrap_or(ERR)
+        }
+        7 if uid_len(f.x[3]) => {
+            let mut uid = p.read(f.x[2], f.x[3] as usize);
+            let r = tag(TagOp::Keep(&uid));
+            uid.fill(0);
+            r.unwrap_or(ERR)
+        }
+        8 if f.x[3] == 0 => tag(TagOp::Forget(None)).unwrap_or(ERR),
+        8 if f.x[3] == crate::kvault::TAG_SHOWN as u64 => {
+            let mut which = [0u8; crate::kvault::TAG_SHOWN];
+            which.copy_from_slice(&p.read(f.x[2], crate::kvault::TAG_SHOWN));
+            tag(TagOp::Forget(Some(which))).unwrap_or(ERR)
+        }
+        9 => {
+            let mut list = Vec::new();
+            match tag(TagOp::List(&mut list)) {
+                Ok(n) => {
+                    // WHY: the buffer's length is the caller's; only whole entries that fit go back.
+                    let fit = (f.x[3] as usize / TAG_ENTRY * TAG_ENTRY).min(list.len());
+                    p.write(f.x[2], &list[..fit]);
+                    n
+                }
+                Err(()) => ERR,
+            }
+        }
+        _ => ERR,
+    }
 }
 
 /// `SYS_UNLOCK` op 5 forwarded to the vault process as a call from the caller, who waits as for a store call: stamped with the person's domain in every scope that holds their names, less those the identity service keeps to itself (kvault `EXPORT_SKIP`, as the kernel's own export). The vault builds the document and hands it out from the offset (x4), one transfer at most (x3, the caller's length). ERR while the person is locked.
@@ -2763,6 +2837,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
         SYS_UNLOCK if f.x[1] == 5 && export_route(p, f).is_some() => {
             let ep = export_route(p, f).unwrap();
             export_forward(f, cur, ep)
+        }
+        // Attest with a tag (ops 6-9): the Unlock right, or Settings for keeping, forgetting and listing (`tag_syscall`).
+        SYS_UNLOCK if (6..=9).contains(&f.x[1]) => {
+            f.x[0] = tag_syscall(p, f);
+            0
         }
         SYS_UNLOCK => {
             let token = p.read(f.x[0], 32);

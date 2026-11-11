@@ -4,6 +4,7 @@
 //!
 //! - Default: the handle is typed each boot. Its proof (ihi's memory-hard proof, 24.9 MB of scratch, 17 rounds) is derived, the seed and proof go to the identity service (fgtw) in RAM, and the client looks the identity up. A member unlocks; a fleet to join shows the words; a free handle is minted.
 //! - Opt-in (unlock at boot): the seed is stored, the client loads it from the vault at boot, and the screen unlocks as soon as the client reports membership, with no handle typed.
+//! - A kept tag (AUTH.md "Attest with a tag"; owner, 2026-11-05 and 2026-11-11): while the entry is up, a tag kept from settings held to the device attests in place of the handle. The NFC driver hands its UID here (a held call, `tag_thread`), the kernel opens the seed it sealed for that tag and unlocks, and the rest is a typed handle's.
 //!
 //! The handle shows as it is typed: it is a name the person proves, not a password (owner, 2026-10-27: "this is NOT a password"). A wrong one stays on screen to be corrected; the bar's left key clears it. Minting a new identity asks for the handle a second time, shown as typed like the first, the first cleared so a typo is not simply copied (owner, 2026-10-27: "you only do that once"); clear during the second goes back to the first. The buffer is wiped once attest succeeds.
 //!
@@ -13,7 +14,7 @@
 //!
 //! A first entry is not a claim (2026-10-28, after it let a person in under a handle that already had a fleet): the handle's roots go into the vault and the identity service (fgtw) looks the identity up, its fleet's devices nearby first and fgtw.org last (photon docs/pairing-v2.md, peers-are-fgtw.md). A fleet: this device joins it, its pairing words shown for one of the fleet's devices to add it. No fleet anywhere: the permanence warning, the handle again, and the client mints the genesis. Nothing answering: nothing is decided, and the screen waits while the client keeps looking. There is no way past the screen but a bind or a mint (owner, 2026-11-04, of the "go on" that let a person in mid-join: "I do not see a point. seems like another security nightmare"); `back` returns to the entry.
 //!
-//! Grant slots: 0 console, 1 display (use), 2 touch (use), 3 its surface, 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings, 8 the identity service, fgtw (use), 9 the identity unlock right, 10 a second surface (the keyboard's back buffer).
+//! Grant slots: 0 console, 1 display (use), 2 touch (use), 3 its surface, 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings, 8 the identity service, fgtw (use), 9 the identity unlock right, 10 a second surface (the keyboard's back buffer), 11 the GPU service (use), 12 the layer arena, 13 use wlan, 14 use nfc (attest with a tag).
 #![no_std]
 #![no_main]
 
@@ -336,6 +337,56 @@ fn nets_take(seen: u32) -> Option<(u32, ([u8; 1 << 11], usize))> {
 }
 /// Grant slot 9: the identity unlock right (SYS_UNLOCK, AUTH.md): the person's space opens from the seed, before the proof.
 const S_UNLOCK: u64 = 9;
+/// Slot 14: use nfc (payloads/nfc), for attest with a tag (AUTH.md; owner, 2026-11-11: "have NFC be on if the screen is on at the attest and have that NFC locked capsule for easy handle entry"). An older init leaves it empty: the tag thread's call then fails and the screen is as before.
+const S_NFC: u64 = 14;
+
+/// Attest with a tag: `tag_thread` holds the NFC driver's TAG (op 9) while TAG_WANT is set (the attest screen's entry is up) and publishes each unlock tag's UID it is answered with (bytes, length) under TAG_SEQ (odd while written); the screen's loop takes it as it takes `client_thread`'s copy, nothing asked on a timer. The screen off stops the driver's discovery, so nothing is read in the dark.
+static TAG_WANT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+static TAG_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static mut TAG_UID: ([u8; 10], usize) = ([0; 10], 0);
+static mut TAG_STACK: [u8; 1 << 14] = [0; 1 << 14];
+
+extern "C" fn tag_thread(grants: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    let nfc = cap(grants, S_NFC);
+    let mut absent = freq() >> 6;
+    loop {
+        let w = TAG_WANT.load(Ordering::Acquire);
+        if w == 0 {
+            ferros_sys::wait_world(&TAG_WANT, 0, 0);
+            continue;
+        }
+        let mut uid = [0u8; 10];
+        match call(nfc, &[9], &mut uid) {
+            // WHY the lengths: the reply's length is the driver's word; only an unlock tag's UID (7 or 10 bytes) is one.
+            n @ (7 | 10) => {
+                absent = freq() >> 6;
+                TAG_SEQ.fetch_add(1, Ordering::AcqRel);
+                unsafe { *(&raw mut TAG_UID) = (uid, n as usize) };
+                TAG_SEQ.fetch_add(1, Ordering::AcqRel);
+            }
+            // The call failed (no driver behind the slot: it ended while holding the call, or an init without the slot): asked again after the doubling wait `absent_wait` gives, since no doorbell exists for a driver coming up.
+            ferros_sys::ERR => absent_wait(&mut absent),
+            // Let go (op 10: the settings page's, or this screen's own as it closes): asked again at once while still wanted.
+            _ => absent = freq() >> 6,
+        }
+    }
+}
+
+/// The UID `tag_thread` last published and its sequence count; None when it has not moved from `seen`.
+fn tag_take(seen: u32) -> Option<(u32, ([u8; 10], usize))> {
+    use core::sync::atomic::Ordering;
+    loop {
+        let s0 = TAG_SEQ.load(Ordering::Acquire);
+        if s0 == seen {
+            return None;
+        }
+        let v = unsafe { *(&raw const TAG_UID) };
+        if s0 & 1 == 0 && TAG_SEQ.load(Ordering::Acquire) == s0 {
+            return Some((s0, v));
+        }
+    }
+}
 /// Slot 10: a second surface, the keyboard's back buffer: a board that a key's tap will redraw (shift, a page, a layout) is drawn there whole while the finger is down and copied in at the lift (`prepare`), as the mark's frame is rendered ahead by its thread. Without it the lift redrew the board in place, 59 ms (2026-11-01: draw 14, the key map 37, the tint 8), and the shift showed a few frames late.
 const S_BACK: u64 = 10;
 /// Slots 11 and 12: the GPU service (`use gpu`) and the layer arena, where the mark's quick pass is drawn on the GPU (GPU.md, "The resident service, and the attest mark's path"). Without them (after a jump, no GPU service) the quick pass stays on the CPU.
@@ -2247,6 +2298,35 @@ impl Ahau {
         }
     }
 
+    /// Attest with a tag (AUTH.md; owner, 2026-11-05: the tag in his glasses, no handle typed): the kernel opens what it keeps for this tag and unlocks its identity as a typed handle's seed would, handing the seed back. On a bound device the screen goes now (`unlocked_known`); on one not bound yet the look-up and join run as after a first entry. Refused: the denial on the status line, cleared by the next press. True when it opened.
+    fn tag_attest(&mut self, uid: &[u8]) -> bool {
+        let mut seed = [0u8; 32];
+        match ferros_sys::unlock_by_tag(cap(self.grants, S_UNLOCK), uid, &mut seed) {
+            ferros_sys::Unlock::Opened(_) if ferros_sys::identity_bound(cap(self.grants, S_UNLOCK)) == Some(true) => {
+                console(self.grants, b"ahau: unlocked by a kept tag\n");
+                self.unlocked_known(seed)
+            }
+            ferros_sys::Unlock::Opened(_) => {
+                console(self.grants, b"ahau: unlocked by a kept tag; this device is not bound to a fleet yet: looking the identity up\n");
+                let proof = self.proof_for(&seed, true);
+                self.send_roots(&seed, &proof);
+                self.wipe();
+                self.mode = Mode::Looking(seed);
+                self.status(self.prompt().as_str());
+                self.entry();
+                seed.fill(0);
+                true
+            }
+            // One refusal for every way a tag does not open (AUTH.md): kept for nothing here, a record that does not open, another identity's.
+            _ => {
+                console(self.grants, b"ahau: a tag was refused\n");
+                self.status(tx(ferros_lang::Msg::TagDenied).as_str());
+                self.denied.set(true);
+                false
+            }
+        }
+    }
+
     /// Clear during the mint's second entry only clears it: the verdict stands.
     fn unconfirm(&mut self) {}
 
@@ -2337,6 +2417,9 @@ impl Ahau {
         self.wipe();
         self.mode = Mode::Hosting;
         window::done(self.display, self.base);
+        // Attest is over: no tag is wanted here any more, and the NFC driver lets the held call go (the settings page's too, if one is held; it asks again).
+        TAG_WANT.store(0, core::sync::atomic::Ordering::Release);
+        ferros_sys::nfc::tag_let_go(cap(self.grants, S_NFC));
         console(self.grants, b"ahau: staying as the keyboard for words the identity service asks for (the Fleet page)\n");
         let touch = cap(self.grants, S_TOUCH);
         let mut touches = Touches::new(self.w);
@@ -3001,6 +3084,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     ferros_sys::thread_spawn(client_thread, unsafe { &mut *(&raw mut CLIENT_STACK) }, grants);
     // The network page's list (`wlan_thread`): it sleeps until the page opens.
     ferros_sys::thread_spawn(wlan_thread, unsafe { &mut *(&raw mut WLAN_STACK) }, grants);
+    // Attest with a tag (`tag_thread`): the NFC driver's TAG held while this screen is up.
+    ferros_sys::thread_spawn(tag_thread, unsafe { &mut *(&raw mut TAG_STACK) }, grants);
     start_fresh_mark(grants, w / 3);
     a.retint();
     a.all();
@@ -3033,6 +3118,9 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut pressed: Option<Key> = None;
     // The last frame of the mark put on the glass (FRESH_DONE's count).
     let mut mark_shown = 0u64;
+    // `tag_thread`'s copy last taken, and the tag last refused (its UID and length) while its denial stands.
+    let mut tag_seen = 0u32;
+    let mut tag_refused: Option<([u8; 10], usize)> = None;
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
@@ -3290,6 +3378,15 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             a.light(key, false);
             publish_fresh_text(&a.handle[..a.len], true);
+        }
+        // A tag read (`tag_thread`'s copy, read when it moved): on the entry it attests as a typed handle would (`tag_attest`). The driver reads a tag held to the device every half second, so a tag refused is not tried again while its denial stands; the next press clears both.
+        if let Some((seq, (uid, n))) = tag_take(tag_seen) {
+            tag_seen = seq;
+            let again = a.denied.get() && tag_refused == Some((uid, n));
+            if a.mode == Mode::Fresh && !again {
+                tag_refused = if a.tag_attest(&uid[..n]) { None } else { Some((uid, n)) };
+                a.show();
+            }
         }
         // Following the identity service's verdict while the identity is looked up or joined: `client_thread`'s copy, read when it moved (no call here).
         polls += 1;

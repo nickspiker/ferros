@@ -62,6 +62,22 @@ const ID_PAYLOAD_CONTEXT: &str = "ferros identity vault payload v1";
 /// The base the kernel derives the person's vault domains from (process.rs `domain_keys`, VAULT-OUT.md): one per unlock, wiped at lock.
 const ID_DOMAIN_CONTEXT: &str = "ferros 2026-11-07 identity vault domain";
 const ID_SECRET_CONTEXT: &str = "ferros identity secret v1";
+/// Attest with a tag (AUTH.md "Attest with a tag"; owner, 2026-11-05: a plain NTAG-type tag in his glasses opens the device without the handle typed, and nothing is remembered without the tag). One record per kept tag, in the device class, kept by its id (a hash of its UID, never the UID) as an address under this reserved prefix (`set_addr`), so the address list is the list of kept tags and nothing names them.
+const TAGS: &str = "\0tag.";
+/// The ira-derived device key a tag's id and seal key are made from (`tag_keys`): derived in the kernel, the ira never handed out (keys in registers).
+const TAG_DEVICE_CONTEXT: &str = "ferros 2026-11-11 tag unlock device";
+/// A tag's id: BLAKE3 derive_key over (the device key ‖ the UID). Keyed by the device, so the id says nothing of the UID to anyone without this device's ira, and differs on every device. The record's address and its seal's associated data.
+const TAG_ID_CONTEXT: &str = "ferros 2026-11-11 tag unlock id v0";
+/// A tag's seal key: BLAKE3 derive_key over (the device key ‖ the device-only secret ‖ the UID). The secret too, as the identity key takes it, so the chips' published values and the tag are not enough without this device's own 32 bytes, and a release (which renews the secret) leaves any record it missed unopenable.
+const TAG_SEAL_CONTEXT: &str = "ferros 2026-11-11 tag unlock v0";
+/// A tag record (VSF, its own section): `added`, when it was kept (Eagle time), and `seal`, the identity seed sealed with XChaCha20-Poly1305 under the tag's seal key (a fresh 24-byte nonce in front, the 16-byte tag behind, the tag's id as associated data).
+const TAG_SECTION: &str = "tag_unlock";
+const TAG_ADDED: &str = "added";
+const TAG_SEAL: &str = "seal";
+/// A sealed seed's length: nonce, seed, Poly1305 tag.
+const TAG_SEALED: usize = 24 + 32 + 16;
+/// How many bytes of a tag's id the list shows and a forget names: 64 bits, enough to tell a person's few tags apart, and what settings shows.
+pub const TAG_SHOWN: usize = 8;
 
 /// Which keys an entry is sealed under.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,6 +96,8 @@ struct IdKeys {
     payload_key: [u8; 32],
     /// The base of the person's vault domains (the vault process's, VAULT-OUT.md).
     domain: [u8; 32],
+    /// The identity seed itself, held only while the person is present so a tag can be kept from the settings page (`tag_keep`), which never sees the seed. The identity service holds it in RAM for as long anyway (its roots); wiped with the keys at `lock`.
+    seed: [u8; 32],
 }
 
 /// Block I/O counters for `selftest`.
@@ -401,7 +419,7 @@ impl KVault {
         let addr_key = blake3::derive_key(ID_ADDR_CONTEXT, &k);
         let payload_key = blake3::derive_key(ID_PAYLOAD_CONTEXT, &k);
         let domain = blake3::derive_key(ID_DOMAIN_CONTEXT, &k);
-        self.id = Some(IdKeys { addr_key, payload_key, domain });
+        self.id = Some(IdKeys { addr_key, payload_key, domain, seed: *seed });
         // What the person had in the kernel's vault may now move to the vault process.
         crate::process::MIGRATE_PENDING.store(true, core::sync::atomic::Ordering::Release);
         PERSON.store(true, core::sync::atomic::Ordering::Release);
@@ -435,6 +453,7 @@ impl KVault {
             k.addr_key.fill(0);
             k.payload_key.fill(0);
             k.domain.fill(0);
+            k.seed.fill(0);
             core::hint::black_box(&k);
         }
     }
@@ -477,8 +496,9 @@ impl KVault {
         Ok(n)
     }
 
-    /// Every identity-class entry deleted by its address (`ID_ADDRS`), without needing its key. Returns how many.
+    /// Every identity-class entry deleted by its address (`ID_ADDRS`), without needing its key, and every kept tag with them (a tag opens only the identity it was kept for, which goes here: on release, and when another handle unlocks a device not bound yet). Returns how many identity entries.
     fn wipe_identity(&mut self) -> Result<usize, KvError> {
+        self.wipe_tags()?;
         let list = self.raw_get(ID_ADDRS)?.unwrap_or_default();
         for a in list.chunks_exact(32) {
             let mut b = [0u8; 32];
@@ -549,6 +569,152 @@ impl KVault {
             }
             _ => Ok(false),
         }
+    }
+
+    /// A tag's id and seal key from its UID (`TAG_ID_CONTEXT`, `TAG_SEAL_CONTEXT`), both from the ira-derived device key; the seal key with the device-only secret too. None without the ira this boot, or before any identity has unlocked here (no secret yet, so nothing can have been kept).
+    fn tag_keys(&mut self, uid: &[u8]) -> Result<([u8; 32], [u8; 32]), KvError> {
+        let mut secret = match self.raw_get(ID_SECRET)? {
+            Some(s) if s.len() == 32 => s,
+            _ => return Err(KvError::Open),
+        };
+        let mut dev = crate::ira::derive(TAG_DEVICE_CONTEXT).ok_or(KvError::NoIra)?;
+        let id = *blake3::Hasher::new_derive_key(TAG_ID_CONTEXT).update(&dev).update(uid).finalize().as_bytes();
+        let key = *blake3::Hasher::new_derive_key(TAG_SEAL_CONTEXT).update(&dev).update(&secret).update(uid).finalize().as_bytes();
+        dev.fill(0);
+        secret.fill(0);
+        Ok((id, key))
+    }
+
+    fn tag_schema() -> vsf::schema::SectionSchema {
+        use vsf::schema::{SectionSchema, TypeConstraint};
+        SectionSchema::new(TAG_SECTION).field(TAG_ADDED, TypeConstraint::AnyEagleTime).field(TAG_SEAL, TypeConstraint::Wrapped(b'e'))
+    }
+
+    /// A record read back: when it was kept, and the sealed seed. None for anything that is not a tag record of this shape.
+    fn tag_record(doc: &[u8]) -> Option<(i64, Vec<u8>)> {
+        let section = vsf::schema::SectionBuilder::parse_document(Self::tag_schema(), doc, None).ok()?;
+        let first = |name: &str| section.get_fields(name).first().and_then(|f| f.values.first()).cloned();
+        let added = match first(TAG_ADDED) {
+            Some(vsf::VsfType::e(vsf::EtType::e6(t))) => t,
+            _ => 0,
+        };
+        match first(TAG_SEAL) {
+            Some(vsf::VsfType::v(b'e', s)) if s.len() == TAG_SEALED => Some((added, s)),
+            _ => None,
+        }
+    }
+
+    /// Keep a tag for the unlocked identity (settings' "add a tag", AUTH.md): its seed sealed under the tag's key, the record stored in the device class under the tag's id, stamped with the Eagle time. Ok(true) kept, Ok(false) this tag is kept already (its record left as it is); `Locked` while nobody is present.
+    pub fn tag_keep(&mut self, uid: &[u8]) -> Result<bool, KvError> {
+        let seed = self.id.as_ref().map(|k| k.seed).ok_or(KvError::Locked);
+        let mut seed = seed?;
+        let (id, mut key) = self.tag_keys(uid)?;
+        if self.get_addr(TAGS, &id)?.is_some() {
+            key.fill(0);
+            seed.fill(0);
+            return Ok(false);
+        }
+        let n = self.nonce.next_nonce();
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+        let mut sealed = Vec::with_capacity(TAG_SEALED);
+        sealed.extend_from_slice(&n[..]);
+        sealed.extend_from_slice(&seed);
+        let tag = cipher.encrypt_in_place_detached(XNonce::from_slice(&n), &id, &mut sealed[24..]);
+        key.fill(0);
+        seed.fill(0);
+        sealed.extend_from_slice(&tag.map_err(|_| KvError::Seal)?);
+        let now = crate::settings::eagle_now();
+        let section = Self::tag_schema().build().set(TAG_ADDED, vsf::VsfType::e(vsf::EtType::e6(now))).and_then(|b| b.set(TAG_SEAL, vsf::VsfType::v(b'e', sealed))).and_then(|b| b.encode()).map_err(|_| KvError::Seal)?;
+        let doc = vsf::VsfBuilder::new().creation_time_oscillations(now).provenance_only().add_unboxed(TAG_SECTION, section).build().map_err(|_| KvError::Seal)?;
+        self.set_addr(TAGS, &id, &doc)?;
+        Ok(true)
+    }
+
+    /// Unlock by tag (the attest screen, AUTH.md): the record kept under the tag's id opened with its seal key, and its seed unlocked exactly as a typed handle's is (`unlock`, the same binding rule: a bound device opens only its own identity). The seed is returned for the attest screen to hand to the identity service, as it would the one it derived. `Open` for a tag kept for nothing here or a record that does not open (one refusal, no detail).
+    pub fn tag_unlock(&mut self, uid: &[u8], keep: bool) -> Result<[u8; 32], KvError> {
+        let (id, mut key) = self.tag_keys(uid)?;
+        let record = self.get_addr(TAGS, &id)?.and_then(|d| Self::tag_record(&d));
+        let Some((_, mut sealed)) = record else {
+            key.fill(0);
+            return Err(KvError::Open);
+        };
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+        key.fill(0);
+        let mut n = [0u8; 24];
+        n.copy_from_slice(&sealed[..24]);
+        sealed.drain(..24);
+        // The AEAD's check is what binds the record to the tag: a wrong one is a clean refusal here, never a garbage seed (which, on a device not bound yet, would open and make a junk identity space).
+        if cipher.decrypt_in_place(XNonce::from_slice(&n), &id, &mut sealed).is_err() {
+            sealed.fill(0);
+            return Err(KvError::Open);
+        }
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&sealed);
+        sealed.fill(0);
+        match self.unlock(&seed, keep) {
+            Ok(()) => Ok(seed),
+            Err(e) => {
+                seed.fill(0);
+                Err(e)
+            }
+        }
+    }
+
+    /// The kept tags while a person is present: each one's id, first `TAG_SHOWN` bytes, and when it was kept (Eagle time, 0 if the record does not say). `Locked` while nobody is present.
+    pub fn tag_list(&mut self) -> Result<Vec<([u8; TAG_SHOWN], i64)>, KvError> {
+        if self.id.is_none() {
+            return Err(KvError::Locked);
+        }
+        let ids = self.addrs(TAGS)?;
+        let mut out = Vec::new();
+        for c in ids.chunks_exact(32) {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(c);
+            let added = self.get_addr(TAGS, &id)?.and_then(|d| Self::tag_record(&d)).map_or(0, |r| r.0);
+            let mut shown = [0u8; TAG_SHOWN];
+            shown.copy_from_slice(&id[..TAG_SHOWN]);
+            out.push((shown, added));
+        }
+        Ok(out)
+    }
+
+    /// Forget a kept tag by the start of its id as the list shows it, or every tag (None). How many went. `Locked` while nobody is present.
+    pub fn tag_forget(&mut self, which: Option<[u8; TAG_SHOWN]>) -> Result<usize, KvError> {
+        if self.id.is_none() {
+            return Err(KvError::Locked);
+        }
+        match which {
+            None => self.wipe_tags(),
+            Some(p) => {
+                let ids = self.addrs(TAGS)?;
+                let mut n = 0;
+                for c in ids.chunks_exact(32) {
+                    if c[..TAG_SHOWN] == p {
+                        let mut id = [0u8; 32];
+                        id.copy_from_slice(c);
+                        self.remove_addr(TAGS, &id)?;
+                        n += 1;
+                    }
+                }
+                Ok(n)
+            }
+        }
+    }
+
+    /// Every kept tag deleted, and their list, needing no key: on release, and with the identity they open (`wipe_identity`).
+    fn wipe_tags(&mut self) -> Result<usize, KvError> {
+        let ids = self.addrs(TAGS)?;
+        for c in ids.chunks_exact(32) {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(c);
+            let a = self.addr_scoped(TAGS, &id)?;
+            self.vault.delete(&a, now())?;
+        }
+        if !ids.is_empty() {
+            let a = self.addr(Class::Device, &Self::addrs_name(TAGS))?;
+            self.vault.delete(&a, now())?;
+        }
+        Ok(ids.len() / 32)
     }
 
     /// `diag kv selftest`: put a 30 000-byte pattern, count the block I/O it costs, re-read every block the put appended (mirror A) and count how many still carry a valid seal, then get the value back and compare.
