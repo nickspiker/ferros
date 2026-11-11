@@ -3314,6 +3314,30 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params.starts_with(b"store gets") {
+                    // `diag "store gets [reset]"` (2026-11-11): the forwarded store calls the vault process answered: how many, the bytes handed back, the time from each call to its reply (the stamp, the wait for the vault's thread to be given a core, its serving) on average and at the longest, and the replies' copies into the callers. With the vault's own read report (its serving and the time between its requests) and the reader's own count of its calls, it says where a slow read waits.
+                    use core::sync::atomic::Ordering::Relaxed;
+                    if &cmd.params[..] == b"store gets reset" {
+                        crate::process::STORE_GETS.iter().for_each(|s| s.store(0, Relaxed));
+                    }
+                    let s = |i: usize| crate::process::STORE_GETS[i].load(Relaxed);
+                    let us = |t: u64| t * 1_000_000 / cntfrq();
+                    // WHY the max: no calls yet would divide by zero.
+                    let calls = s(0);
+                    resp.extend_from_slice(alloc::format!("store gets: A#{} calls, A#{} bytes back; call to reply A#{} ms in all, A#{} us a call, A#{} us the longest; copying replies A#{} us in all\n", calls, s(1), us(s(2)) / 1000, us(s(2)) / calls.max(1), us(s(3)), us(s(4))).as_bytes());
+                    resp.extend_from_slice(alloc::format!("pin off: {}\n", { let k = crate::process::PIN_OFF.load(Relaxed); if k == 0 { alloc::string::String::from("none") } else { alloc::string::String::from_utf8_lossy(&k.to_le_bytes()).trim_end_matches('\0').into() } }).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params.starts_with(b"pin off ") || &cmd.params[..] == b"pin on" {
+                    // `diag "pin off <name>"`: that process's SYS_PIN is ignored from now (its threads stay on the workers, or go back there at their next pin); `diag "pin on"` ends it. For measuring the vault's bulk reads on the X3 and on the workers on one boot (2026-11-11).
+                    use core::sync::atomic::Ordering::Relaxed;
+                    let key = if &cmd.params[..] == b"pin on" { 0 } else { crate::process::pin_key(&cmd.params[8..]) };
+                    crate::process::PIN_OFF.store(key, Relaxed);
+                    resp.extend_from_slice(alloc::format!("pin off: {}\n", if key == 0 { "none".into() } else { alloc::string::String::from_utf8_lossy(&cmd.params[8..]).into_owned() }).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params.starts_with(b"ufs runs") {
                     // `diag "ufs runs [on|off|reset]"`: SYS_BLOCK's multi-block commands (a run a command, ferros_hal `read_run_lun`) and what the vault process's block calls cost: calls, blocks, time inside them, MB/s, reads and writes. `off` sends every run a block a command again, to measure both on one boot; `reset` zeroes the counts.
                     use core::sync::atomic::Ordering::Relaxed;

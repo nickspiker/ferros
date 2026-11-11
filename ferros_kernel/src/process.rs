@@ -547,6 +547,23 @@ struct Thread {
     state: State,
     /// Which cores may run it (bit = core index): the workers by default; a thread pins itself with `SYS_PIN` (the display's render thread to the X3). If none of its cores is up, any core takes it.
     mask: u16,
+    /// When its last forwarded store call went to the vault process (`store_forward`), for `STORE_GETS`.
+    called: u64,
+}
+
+/// Forwarded store calls answered (`SYS_REPLY` of a `store_forward` call; owner, 2026-11-11: the display waited 283 ms on the vault's reads of its wallpaper while the vault process served a fraction of that): [0] calls, [1] bytes handed back, [2] timer ticks from the call to the vault's reply (the stamp, the wait for the vault's thread to be given a core, its serving), [3] the longest of those, [4] ticks copying the replies into the callers. `diag "store gets [reset]"`. Under the kernel lock.
+pub static STORE_GETS: [core::sync::atomic::AtomicU64; 5] = [const { core::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// A process whose `SYS_PIN` is ignored (its threads stay on the workers), its name's first eight bytes little-endian, 0 for none: `diag "pin off <name>"`, `diag "pin on"` (2026-11-11), to measure on one boot whether the vault's bulk reads are faster on the X3, where each request waits for the core behind the render thread and the kernel's service pass, or on the workers, where a call is handed off on the caller's own core.
+pub static PIN_OFF: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A name's first eight bytes as `PIN_OFF` keeps them.
+pub fn pin_key(name: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    // WHY the min: the key is the name's first eight bytes; a shorter name is padded with zeros.
+    let n = name.len().min(8);
+    b[..n].copy_from_slice(&name[..n]);
+    u64::from_le_bytes(b)
 }
 /// The A715s (cores 4-7): where processes run unless they ask otherwise.
 pub const MASK_WORKERS: u16 = 0x00F0;
@@ -1806,6 +1823,9 @@ fn store_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
         return 0;
     };
     let rcap = if set || del { 0 } else { len as u64 };
+    if let Some(t) = th(cur) {
+        t.called = crate::platform::cntpct();
+    }
     call_endpoint(f, cur, ep, msg, f.x[4], rcap | STORE_REPLY)
 }
 
@@ -1843,6 +1863,9 @@ fn export_forward(f: &mut Frame, cur: usize, ep: usize) -> u64 {
         f.x[0] = ERR;
         return 0;
     };
+    if let Some(t) = th(cur) {
+        t.called = crate::platform::cntpct();
+    }
     call_endpoint(f, cur, ep, msg, f.x[2], len as u64 | STORE_REPLY)
 }
 
@@ -2363,7 +2386,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 frame.x[26] = p.arc.base as u64;
                 frame.x[0] = arg;
                 let mask = t.mask;
-                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask });
+                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask, called: 0 });
                 enqueue_back(nt);
                 tr(TR_RUN, nt, 0xFFFF);
                 f.x[0] = 0;
@@ -2371,7 +2394,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
             0
         }
         SYS_PIN => {
-            t.mask = if f.x[0] as u16 == 0 { MASK_WORKERS } else { f.x[0] as u16 };
+            let off = PIN_OFF.load(core::sync::atomic::Ordering::Relaxed);
+            t.mask = if f.x[0] as u16 == 0 || (off != 0 && off == pin_key(&p.name)) { MASK_WORKERS } else { f.x[0] as u16 };
             f.x[0] = 0;
             0
         }
@@ -3520,14 +3544,23 @@ fn el0_trap(f: &mut Frame) -> u64 {
                             if rcap & STORE_REPLY != 0 {
                                 // A forwarded store call (`store_forward`): the vault's reply is the syscall's value, then the bytes for the caller's buffer, as many as it asked for (a get up to STORE_GET_MAX), copied from the vault process's buffer straight into the caller's: until 2026-11-11 each quarter MiB went thru a zeroed heap vector first, three passes over every byte of a 24 MB read under the kernel lock. WHY the checks: the reply is the vault process's, its length its own; shorter than the value it carries nothing, and the caller is refused.
                                 let len = (f.x[2] as usize).min(STORE_GET_MAX + 8);
+                                let t0 = crate::platform::cntpct();
+                                let mut n = 0;
                                 match p.view(f.x[1], len) {
                                     Some(msg) if msg.len() >= 8 => {
-                                        let n = (msg.len() - 8).min((rcap & !STORE_REPLY) as usize);
+                                        n = (msg.len() - 8).min((rcap & !STORE_REPLY) as usize);
                                         cp.write(roff, &msg[8..8 + n]);
                                         ct.frame.x[0] = u64::from_le_bytes(msg[..8].try_into().unwrap());
                                     }
                                     _ => ct.frame.x[0] = ERR,
                                 }
+                                use core::sync::atomic::Ordering::Relaxed;
+                                let waited = t0 - ct.called;
+                                STORE_GETS[0].fetch_add(1, Relaxed);
+                                STORE_GETS[1].fetch_add(n as u64, Relaxed);
+                                STORE_GETS[2].fetch_add(waited, Relaxed);
+                                STORE_GETS[3].fetch_max(waited, Relaxed);
+                                STORE_GETS[4].fetch_add(crate::platform::cntpct() - t0, Relaxed);
                             } else {
                                 let msg = p.read(f.x[1], len);
                                 let n = msg.len().min(rcap as usize);
@@ -5273,7 +5306,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // A masked arc's power-of-two slack (ARCS.md step 4): the frames wholly between its image (code, zeroed tail, input) and its first stack's guard page hold nothing it was built with, and masked code reaches only what it was linked with (its statics, its static heaps, its stacks), so they go back to the pool at once (ahau: 20 MiB of its 128). Not exact mode's, whose limit may grow into it; a native arc is whole frames already.
     // Not given back at spawn (2026-11-11, the Pro's first ARCS boot: ahau's thread 7 wrote at arc offset G#760_0000, inside the 18 MiB released here, and faulted, so the device had no attest screen): a masked no_std process's allocator grows into exactly this span, so it is not slack. A process gives back what it knows it no longer needs itself (SYS_ARC op 3).
     let _ = (masked, floor);
-    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS });
+    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS, called: 0 });
     Ok((me, arc, in_off))
 }
 
