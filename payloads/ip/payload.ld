@@ -11,6 +11,8 @@ SECTIONS {
     __file_end = .;
     . = ALIGN(64);
     .bss : { *(.bss*) *(COMMON) }
+    /* The image's end, .bss included: the heap the kernel maps for a growing image starts 16 bytes past it (process.rs `image_tail`), where ip keeps its first connections' buffers. */
+    __image_end = .;
     /DISCARD/ : { *(.comment) *(.eh_frame*) }
 }
 /* The zeroed tail from the file's end (alignment padding included) to .bss's end, plus 16. */

@@ -273,6 +273,7 @@ impl Udp {
     }
 
     /// One HTTP POST of `body` to `/` on `ip:80` (the `ip` process's client TCP, ops 4-7), as (status, body); None when the connection or the exchange fails, or takes longer than 16 s.
+    /// The request goes into the connection's send buffer as soon as it is asked for (ip sends it once the connection opens); each receive is held by ip until data comes or the connection's state changes, a second at most, never a poll (owner, 2026-11-10: "No polling!").
     fn post(&self, ip: [u8; 4], host: &[u8], body: &[u8]) -> Option<(u16, Vec<u8>)> {
         let f = ferros_sys::freq();
         let deadline = now() + 16 * f;
@@ -304,13 +305,16 @@ impl Udp {
         req.extend_from_slice(&digits[k..]);
         req.extend_from_slice(b"\r\n\r\n");
         req.extend_from_slice(body);
-        let (mut sent, mut connected) = (0usize, false);
+        let mut sent = 0usize;
         let mut got = Vec::new();
-        let mut out = alloc::vec![0u8; 4096];
+        // One receive's most: 4 KiB on the heap, the state byte ahead of it.
+        let most: usize = 1 << 12;
+        let mut out = alloc::vec![0u8; 1 + most];
         let mut state = 0u8;
         while now() < deadline {
-            if connected && sent < req.len() {
-                let n = (req.len() - sent).min(1400);
+            if sent < req.len() {
+                // A call carries 4096 bytes: the op and handle, and 4094 of the request.
+                let n = (req.len() - sent).min((1 << 12) - 2);
                 let mut s = Vec::with_capacity(2 + n);
                 s.extend_from_slice(&[5, h]);
                 s.extend_from_slice(&req[sent..sent + n]);
@@ -318,18 +322,22 @@ impl Udp {
                     sent += u16::from_be_bytes([r[1], r[2]]) as usize;
                 }
             }
-            let n = self.call(&[6, h], &mut out);
+            // Held a second at most once the request is all in ip's hands; at once while it is not.
+            let wait = if sent < req.len() { 0 } else { 1 };
+            let mut q = [6, h, wait, 0, 0, 0, 0];
+            q[3..7].copy_from_slice(&(most as u32).to_be_bytes());
+            let n = self.call(&q, &mut out);
             if n == 0 || n == ERR {
                 break;
             }
             let n = (n as usize).min(out.len());
             state = out[0];
-            connected |= state >= 2;
             got.extend_from_slice(&out[1..n]);
             if state >= 3 && n == 1 {
                 break;
             }
-            if n == 1 {
+            // The send buffer full (a body larger than its 256 KiB): a millisecond before more of it.
+            if n == 1 && wait == 0 {
                 ferros_sys::sleep_until(now() + f / 1000);
             }
         }

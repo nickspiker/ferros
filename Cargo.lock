@@ -977,6 +977,7 @@ name = "ferros-payload-ip"
 version = "0.1.0"
 dependencies = [
  "ferros_sys",
+ "ferros_tcp",
 ]
 
 [[package]]
@@ -1314,6 +1315,10 @@ version = "0.1.0"
 dependencies = [
  "tatau",
 ]
+
+[[package]]
+name = "ferros_tcp"
+version = "0.1.0"
 
 [[package]]
 name = "ferros_vault"
