@@ -366,7 +366,7 @@ fn ahead_run(at: u64, buf: &mut [u8], limit: u64) -> bool {
                 core::mem::swap(&mut *(&raw mut AHEAD_BUF), &mut *(&raw mut NEXT_BUF));
                 AHEAD_AT = next;
             }
-            ahead_post(next.0 + next.1 as u64, limit);
+            ahead_post_after(next.0, next.1, limit);
             return ahead_copy(at, buf);
         }
     }
@@ -382,12 +382,22 @@ fn ahead_run(at: u64, buf: &mut [u8], limit: u64) -> bool {
     let ok = blocks_read(at, &mut win[..m << 12], &IO_TICKS);
     unsafe { AHEAD_AT = (at, if ok { m } else { 0 }) };
     if ok {
-        ahead_post(at + m as u64, limit);
+        ahead_post_after(at, m, limit);
     }
     ok && ahead_copy(at, buf)
 }
 
-/// The window after the current one (from `at`, below `limit`) posted to the reader thread; nothing when it is not up or the mirror ends.
+/// How far the next window reaches back into the one before it: past a piece's 17 furrows and its leaf. Without it a piece whose blocks crossed a window's end (most windows' last piece: 256 blocks are not a whole number of 18-block pieces) lay in neither, so the serving thread waited out the read beside, threw it away and filled afresh from that piece, a 1 MiB command on its own time at nearly every window (2026-11-11).
+const OVERLAP: u64 = 1 << 5;
+
+/// The window after one of `held` blocks from `first`, posted: it begins OVERLAP blocks before that one ends. Nothing after a window no longer than the overlap: it is the mirror's last few blocks.
+fn ahead_post_after(first: u64, held: usize, limit: u64) {
+    if held as u64 > OVERLAP {
+        ahead_post(first + held as u64 - OVERLAP, limit);
+    }
+}
+
+/// The window from `at` (below `limit`) posted to the reader thread; nothing when it is not up or the mirror ends.
 fn ahead_post(at: u64, limit: u64) {
     if !READER_UP.load(Relaxed) || at >= limit {
         return;
@@ -606,8 +616,8 @@ impl Counts {
     }
 }
 
-/// A large value read from its first byte to its last, measured stage by stage (owner, 2026-11-08: "Report MB/s per stage"; 2026-11-11: "2.9s for a 24MB read is embarassing", so one device run says where every millisecond goes). Two console lines when the read reaches the value's end:
-/// - `vault: read …`: the value, the requests, first to last; serving split into the fetch (manifestus's index walk to each piece, each block's BLAKE3 guard and decode, the furrows joined, the pieces handed to the helpers: `ReadTicks::fetch` less the block reads inside it), the block reads, the opening left after them (XChaCha20-Poly1305 on this thread and the helpers; the helpers open beside the fetch, and "all" is each batch from its first piece handed over to its last opened), the copy out (into the reply, the opened pieces wiped) and the rest (the head, the bookkeeping); and the time between requests (the kernel's stamp and hand-offs both ways, the reply's copy into the reader, the reader's own work).
+/// A large value read in one stretch, measured stage by stage (owner, 2026-11-08: "Report MB/s per stage"; 2026-11-11: "2.9s for a 24MB read is embarassing", so one device run says where every millisecond goes). A run is the requests that follow on from each other in the value (each starting where the last ended); it ends at the value's end, or at a request that does not follow on (reported with the counts as they stood before it). A run of at least METER_MIN bytes says two console lines; shorter ones (a document's opening, a probe) say nothing. Until 2026-11-11 a report began only at offset 0 and ended at the first read to reach the value's end: the display's wallpaper load opens the document at offset 0, and vsf's walk of the plane's section reads its last bytes, so the 27 requests of the opening were reported (19 ms) and the plane's 48, starting at its data offset, never were.
+/// - `vault: read …`: the run's bytes, where it started in the value, the requests, first to last; serving split into the fetch (manifestus's index walk to each piece, each block's BLAKE3 guard and decode, the furrows joined, the pieces handed to the helpers: `ReadTicks::fetch` less the block reads inside it), the block reads, the opening left after them (XChaCha20-Poly1305 on this thread and the helpers; the helpers open beside the fetch, and "all" is each batch from its first piece handed over to its last opened), the copy out (into the reply, the opened pieces wiped) and the rest (the head, the bookkeeping); and the time between requests (from a reply to the next request's start: the kernel's hand-back, the reader's own work, the stamp and hand-off of the next call, and the wait for a core this thread may run on; while it is pinned to the X3 that is the X3's turn after the render thread and the kernel's service pass).
 ///   The block reads are the serving thread's own and its waits for the next window; "beside it" is the reader thread's reading of the next windows while the serving thread fetched.
 /// - `vault: read blocks …`: the block reads' bytes, kernel calls (both threads') and their time, the kernel's split of those calls (in the UFS commands, copying into this process, the rest of the syscalls: entry, the kernel lock's wait), and the blocks the read-ahead gave without a call.
 struct Meter {
@@ -615,50 +625,73 @@ struct Meter {
     t0: u64,
     requests: u64,
     serving: u64,
+    /// The run's bytes, where it began and where the next request must begin to follow on; the value's length.
+    bytes: u64,
+    from: u64,
+    next: u64,
+    whole: u64,
+    /// Requests served while this thread was pinned to the X3.
+    pinned: u64,
     at: Counts,
 }
 
-/// Values at least this large get a read report.
+/// Runs at least this large get a read report (and only values at least this large are followed).
 const METER_MIN: u64 = 1 << 20;
 
 impl Meter {
-    /// A read of `len` bytes from `offset` of a value `whole` bytes long, served in `ticks`, the store's stage time `st` after it: starts at offset 0, said when it reaches the end.
-    fn note(&mut self, offset: u64, data: u64, whole: u64, ticks: u64, t_start: u64, before: Counts, st: ferros_store::ReadTicks) {
-        if offset == 0 && whole >= METER_MIN {
-            *self = Meter { on: true, t0: t_start, requests: 0, serving: 0, at: before };
+    /// A read of `data` bytes from `offset` of a value `whole` bytes long, served in `ticks` from `t_start` (on the X3 if `big`), the counters as they stood before it (`before`) and the store's stage time `st` after it.
+    fn note(&mut self, offset: u64, data: u64, whole: u64, ticks: u64, t_start: u64, big: bool, before: Counts, st: ferros_store::ReadTicks) {
+        if self.on && (offset != self.next || whole != self.whole) {
+            self.say(&before, t_start);
+            self.on = false;
         }
         if !self.on {
-            return;
+            if whole < METER_MIN {
+                return;
+            }
+            *self = Meter { on: true, t0: t_start, requests: 0, serving: 0, bytes: 0, from: offset, next: offset, whole, pinned: 0, at: before };
         }
         self.requests += 1;
         self.serving += ticks;
-        if offset + data < whole {
+        self.bytes += data;
+        self.next = offset + data;
+        self.pinned += big as u64;
+        if self.next >= whole {
+            self.say(&Counts::now(st), now());
+            self.on = false;
+        }
+    }
+
+    /// The run's two lines, the counters at its end being `end` and its end `t_end`; nothing for a short run.
+    fn say(&self, end: &Counts, t_end: u64) {
+        if self.bytes < METER_MIN {
             return;
         }
-        self.on = false;
-        let c = Counts::now(st).since(&self.at);
+        let c = end.since(&self.at);
         let f = freq();
         let us = |t: u64| t * 1_000_000 / f;
         let ms = |t: u64| us(t) / 1000;
         // WHY the max: a stage that took no time (every piece already open, no block read) would divide by zero, and the report is not worth the process.
         let rate = |bytes: u64, t: u64| bytes / us(t).max(1);
-        let wall = now() - self.t0;
+        let wall = t_end - self.t0;
         // Signed: block reads made by a migration in the same requests count in `io` too, outside the fetch.
         let fetch = ms(c.fetch) as i64 - ms(c.io) as i64;
         let rest = ms(self.serving) as i64 - ms(c.fetch) as i64 - ms(c.open) as i64 - ms(c.copy) as i64;
         say!(
-            "vault: read {} B in {} requests, {} ms first to last ({} MB/s): serving {} ms = fetch {} + block reads {} (beside it {}) + opening after them {} (all {} ms, {} MB/s, {} cores) + copy out {} + rest {}; between requests {} ms",
-            whole,
+            "vault: read {} B from {} of {} in {} requests ({} on the X3), {} ms first to last ({} MB/s): serving {} ms = fetch {} + block reads {} (beside it {}) + opening after them {} (all {} ms, {} cores) + copy out {} + rest {}; between requests {} ms",
+            self.bytes,
+            self.from,
+            self.whole,
             self.requests,
+            self.pinned,
             ms(wall),
-            rate(whole, wall),
+            rate(self.bytes, wall),
             ms(self.serving),
             fetch,
             ms(c.io),
             ms(c.ahead),
             ms(c.open),
             ms(c.span),
-            rate(c.opened, c.span),
             HELPERS + 1,
             ms(c.copy),
             rest,
@@ -681,7 +714,7 @@ impl Meter {
     }
 }
 
-static mut METER: Meter = Meter { on: false, t0: 0, requests: 0, serving: 0, at: Counts::ZERO };
+static mut METER: Meter = Meter { on: false, t0: 0, requests: 0, serving: 0, bytes: 0, from: 0, next: 0, whole: 0, pinned: 0, at: Counts::ZERO };
 
 type St = Store<Half, Half, Entropy>;
 
@@ -929,6 +962,7 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
                 unsafe { AHEAD_ON = bulk };
                 let r = store.read_with(&d, name, offset, &mut out[8..8 + len], &mut Helpers::default());
                 unsafe { AHEAD_ON = false };
+                let big = unsafe { ON_BIG };
                 let done = !matches!(r, Ok(Some(whole)) if bulk && offset + (len as u64) < whole);
                 if done && unsafe { ON_BIG } {
                     ferros_sys::pin(0);
@@ -938,7 +972,7 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
                     Ok(Some(whole)) => {
                         // WHY: the offset is the caller's and may lie past the end (nothing to send then: the subtraction stops at 0).
                         data = (whole.saturating_sub(offset) as usize).min(len);
-                        unsafe { (*(&raw mut METER)).note(offset, data as u64, whole, now() - t, t, before, store.read_ticks()) };
+                        unsafe { (*(&raw mut METER)).note(offset, data as u64, whole, now() - t, t, big, before, store.read_ticks()) };
                         whole
                     }
                     Ok(None) => NOTHING,
