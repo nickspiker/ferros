@@ -17,6 +17,8 @@
 //! - `3` READS: activations u32, S served u32, field-on events u32 (little-endian, 12 bytes): a ceremony's caller watches S served move to know the sponsor's phone read it.
 //! - `7` MOTOR: the vibration motor's DEVID and REVID (u32 LE each, 0 for a read that failed), and its state on the console.
 //! - `8` BUZZ + n (one byte, at most G#26): the motor plays ROM waveform n. → [0], or [1] refused (n too large) or a write failed.
+//! - `9` TAG: held until discovery reads an unlock tag (NFC-A, Type 2, a 7- or 10-byte UID), then → its UID; → nothing when let go (op 10, or a fifth caller held). Attest with a tag (AUTH.md): the attest screen holds it while it shows, the settings page while it adds a tag. The screen off stops discovery, so nothing is read in the dark.
+//! - `10` TAG STOP: every held TAG answered with nothing. → [0].
 //!
 //! The vibration motor (a CS40L26 at G#43) shares this bus, so its driver is here, the bus's one owner (KERNEL-OUT.md decision 8, the kernel's haptics.rs until 2026-11-10): the `nfc` switch pulses its reset with the NFC chip's, and ops 7 and 8 run between NCI exchanges, never during one.
 #![no_std]
@@ -149,7 +151,13 @@ struct Nfc {
     quiet: bool,
     /// A CORE_RESET_NTF seen since this was cleared (`init`).
     reset_seen: bool,
+    /// Op 9's held calls (attest with a tag, AUTH.md): each a reply token, answered with the UID of the next unlock tag discovery reads (`tag_read`), or with nothing by op 10. At most `HELD`, the oldest giving way.
+    held: [[u8; 32]; HELD],
+    nheld: usize,
 }
+
+/// How many op 9 calls are held at once: the attest screen's and the settings page's, with room.
+const HELD: usize = 1 << 2;
 
 impl Nfc {
     fn rd(&self, off: u64) -> u32 {
@@ -444,7 +452,13 @@ impl Nfc {
                     let tl = pl.get(6).copied().unwrap_or(0) as usize;
                     let tp = pl.get(7..7 + tl).unwrap_or(&[]);
                     let uid = if mode == 0 { tp.get(2).and_then(|&l| tp.get(3..3 + l as usize)).unwrap_or(&[]) } else { &[] };
-                    say!(self.grants, "nfc: tag: mode G#{mode:02X}, protocol G#{:02X}, interface G#{:02X}, UID {}, parameters {}\n", pl.get(2).copied().unwrap_or(0), pl.get(1).copied().unwrap_or(0), Hex(uid), Hex(tp));
+                    let protocol = pl.get(2).copied().unwrap_or(0);
+                    // The UID is never logged since it opens the device (attest with a tag, 2026-11-11): its length only, and the SENS_RES that says the tag's kind.
+                    say!(self.grants, "nfc: tag: mode G#{mode:02X}, protocol G#{protocol:02X}, interface G#{:02X}, a A#{}-byte UID, SENS_RES {}\n", pl.get(1).copied().unwrap_or(0), uid.len(), Hex(tp.get(..2).unwrap_or(&[])));
+                    // An unlock tag: NFC-A (mode 0), Type 2 (protocol G#02, NTAG and its kin), a double or triple size UID, which a tag keeps for life (a 4-byte one may be random at every read, ISO/IEC 14443-3).
+                    if mode == 0 && protocol == 0x02 && matches!(uid.len(), 7 | 10) {
+                        self.tag_read(uid);
+                    }
                     if let Err(e) = self.send(&[0x21, 0x06, 0x01, 0x03]) {
                         say!(self.grants, "nfc: release failed G#{e:X}\n");
                     }
@@ -642,6 +656,36 @@ impl Nfc {
         }
     }
 
+    /// An unlock tag read: every held op 9 answered with its UID, and none held after. A tag held to the device is read again at each discovery cycle (TOTAL_DURATION, 500 ms), so a caller still waiting hears it again then.
+    fn tag_read(&mut self, uid: &[u8]) {
+        for t in &self.held[..self.nheld] {
+            reply(t, uid);
+        }
+        if self.nheld > 0 {
+            say!(self.grants, "nfc: an unlock tag's UID to A#{} waiting\n", self.nheld);
+        }
+        self.nheld = 0;
+    }
+
+    /// Op 9 held: answered at the next unlock tag (`tag_read`) or by op 10. Full, the oldest gives way (answered with nothing, so its caller asks again if it still wants one).
+    fn tag_hold(&mut self, token: [u8; 32]) {
+        if self.nheld == HELD {
+            reply(&self.held[0], &[]);
+            self.held.copy_within(1.., 0);
+            self.nheld -= 1;
+        }
+        self.held[self.nheld] = token;
+        self.nheld += 1;
+    }
+
+    /// Op 10: every held op 9 let go, answered with nothing.
+    fn tag_let_go(&mut self) {
+        for t in &self.held[..self.nheld] {
+            reply(t, &[]);
+        }
+        self.nheld = 0;
+    }
+
     /// Reader mode on or off. Discovery stays as it is (listening and polling, interleaved): a tapped device found while this one polls is asked for Photon's tag. A poll-only discovery (NFC-A alone, `21 03 03 01 00 01`) went unanswered by this controller every time (2026-11-08), so the tap rides the polling discovery already does.
     fn set_reading(&mut self, on: bool) -> bool {
         if self.reading != on {
@@ -747,7 +791,7 @@ impl Nfc {
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    let mut nfc = Nfc { grants, secret: None, credits: 0, apdu: [0; 512], apdu_len: 0, activations: 0, served: 0, fields: 0, tags: 0, version: [0; 4], config: [0; 2], discovering: false, field: false, reading: false, rstage: 0, read_secret: None, discover_failures: 0, quiet: false, reset_seen: false };
+    let mut nfc = Nfc { grants, secret: None, credits: 0, apdu: [0; 512], apdu_len: 0, activations: 0, served: 0, fields: 0, tags: 0, version: [0; 4], config: [0; 2], discovering: false, field: false, reading: false, rstage: 0, read_secret: None, discover_failures: 0, quiet: false, reset_seen: false, held: [[0; 32]; HELD], nheld: 0 };
     let mut p: Packet = [0; 258];
     if !ferros_sys::power(cap(grants, S_POWER), true) {
         say!(grants, "nfc: power on failed (HSI1 off?)\n");
@@ -875,6 +919,14 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
                 8 => {
                     reply(&token, &[1]);
+                }
+                // Attest with a tag (AUTH.md): the next unlock tag's UID, held until discovery reads one (no polling by the caller), or let go by op 10. Not gated on a person present: this is the owner's exception to "no NFC action while locked" (2026-11-11), and while locked only the attest screen holds this endpoint (fgtw, its other holder, starts once a person is present), which hands the UID to the kernel and nowhere else.
+                9 => {
+                    nfc.tag_hold(token);
+                }
+                10 => {
+                    nfc.tag_let_go();
+                    reply(&token, &[0]);
                 }
                 _ => {
                     reply(&token, &[]);

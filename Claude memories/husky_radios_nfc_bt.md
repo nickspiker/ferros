@@ -14,7 +14,7 @@ Bring-up facts:
 - NFC: the ST54L is on hsi2c_0 G#08. Firmware is already on the chip, so nothing is flashed.
 - BT: patch from vendor_a `/firmware/brcm/BCM.hcd` at 4 Mbaud, about 3 s.
 - Verified on 2026-10-31:
-  - a tag read (UID 04 6D F0 EA D2 5B 80);
+  - a tag read (its UID not written down: it attests the owner since 2026-11-11, AUTH.md "Attest with a tag");
   - the beacon heard by the dev box's BlueZ.
 
 **The REG_ON rule:** cycling WiFi's WL_REG_ON while the BT core is powered wedged the combo chip, and through PCIe the whole phone. That caused two watchdog resets, each within a minute of the WiFi keeper restarting pcie1. Bluetooth itself runs with WL_REG_ON low (measured on the Pro 2026-11-09; the kernel no longer refuses it): the rule is only about cycling WL_REG_ON under a powered Bluetooth core.

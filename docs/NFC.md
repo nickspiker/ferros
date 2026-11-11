@@ -34,7 +34,7 @@ ABL leaves the chip running and the bus up. The NCI sequence is Android's, captu
    - listen parameters: SEL_INFO G#20 (ISO-DEP);
    - field-info notifications;
    - TOTAL_DURATION 500 ms.
-8. `21 03` discover: listen as a card on A and B, and poll for tags on A, B and V. A polled tag's UID is logged, then the tag is released back to discovery.
+8. `21 03` discover: listen as a card on A and B, and poll for tags on A, B and V. A polled tag is logged (its kind and its UID's length, never the UID), an unlock tag's UID goes to whoever holds op 9, and the tag is released back to discovery.
 
 Not touched:
 - the eSE (NFCEE G#86);
@@ -63,6 +63,18 @@ The `nfc` endpoint:
 | 4 READER, 5 READER STOP, 6 READ SECRET | (payloads/nfc's header) | |
 | 7 MOTOR | | the motor's DEVID, REVID (u32 LE each, 0 for a failed read); its state on the console |
 | 8 BUZZ | n (one byte, at most G#26) | [0] played, [1] refused or a write failed |
+| 9 TAG | — | held until discovery reads an unlock tag, then its UID (7 or 10 bytes); nothing when let go |
+| 10 TAG STOP | — | [0]; every held TAG answered with nothing |
+
+## Unlock tags (attest with a tag, 2026-11-11)
+
+AUTH.md "Attest with a tag" has the whole of it; this is the driver's part.
+
+- **Nothing new is switched on.** Discovery (`21 03`) already polls for tags on A, B and V between its listens whenever the screen is on, attest screen or not, and stops when the screen goes off (`Nfc::screen`). So NFC is on at the attest screen exactly while the screen is, and a tag held to a dark device is never read. Photon's tag (card emulation) and the sponsor's reader (op 4) run in the same discovery, unchanged.
+- **Which tags:** an RF_INTF_ACTIVATED_NTF from a poll on NFC-A (mode 0) with protocol T2T (G#02) and a 7- or 10-byte UID. A 4-byte UID may be random at every read (ISO/IEC 14443-3), so none is offered.
+- **The doorbell:** op 9 is held (at most four callers, the oldest giving way) and answered with the UID when such a tag is read, so nobody asks the driver on a timer. The attest screen holds it while its entry is up; the settings NFC page holds it while it adds a tag. Op 10 lets every held call go: the page going, an add cancelled, the attest screen closing. A tag held to the device is read again each discovery cycle (TOTAL_DURATION, 500 ms), so a caller still waiting hears it again then.
+- **Not gated on a person present,** unlike ops 1 and 4: the attest screen needs it while locked, the owner's exception to "no NFC action while locked" (AUTH.md "Radios while locked"). While locked the attest screen is the endpoint's only holder; it hands the UID to the kernel and nowhere else.
+- **The UID is never logged:** a tag's line says its mode, protocol, interface, the UID's length and SENS_RES.
 
 ## The vibration motor
 
@@ -80,7 +92,7 @@ tools/husky-radio.sh call nfc 0801     # ROM waveform 1
 ## Status (2026-10-31)
 
 - Up from cold on ferros: listening, polling.
-- RF path verified: the owner's tag read as NFC-A Type 2, UID 04 6D F0 EA D2 5B 80 (SENS_RES 0044, SEL_RES 00), re-read each discovery cycle while held.
+- RF path verified: the owner's tag read as NFC-A Type 2, a 7-byte UID (not written down since 2026-11-11: with this device it opens the owner's identity, AUTH.md "Attest with a tag") (SENS_RES 0044, SEL_RES 00), re-read each discovery cycle while held.
 - Next:
   - a sponsor device's read of S (the APDU path);
   - the interrupt line instead of polling;

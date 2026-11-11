@@ -114,7 +114,7 @@ Its pages are Photon's split (photon docs/settings-panel.md), a ring a swipe goe
 | Keyboard | layout: Dvorak or QWERTY | shape writing |
 | Security | unlock at boot, two taps to turn on, the theft warning under it | lock, wipe |
 | Power | proximity wake | |
-| Connections | the links' states | choosing a WiFi network, Bluetooth accessories, the NFC tag |
+| Connections | the links' states, each a door to its link's page; the NFC page holds the tags kept to attest with (add a tag, each kept one listed with when and a remove, the warning under them; AUTH.md "Attest with a tag") | choosing a WiFi network, Bluetooth accessories |
 | About | version, press to ready, since power on, battery, processes, the vault, the chip | validate-on-demand for the firmware |
 | Developer | dither, hit map, panel channels (red, green, blue), release look, light scope; the hit map, the channels and the release look on development builds only, none of them kept past a reboot | |
 

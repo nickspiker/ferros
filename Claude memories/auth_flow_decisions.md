@@ -1,6 +1,6 @@
 ---
 name: auth-flow-decisions
-description: "Owner decisions 2026-10-31 for the ferros auth flow — device vs identity vault classes, WiFi creds + BT pairings move with the identity, key bound to phone, lock only on power loss or OS switch, auth mostly in kernel; instant unlock from seed + phone-only secret; one identity per phone (built, AUTH.md)"
+description: "Owner decisions 2026-10-31 for the ferros auth flow — device vs identity vault classes, WiFi creds + BT pairings move with the identity, key bound to phone, lock only on power loss or OS switch, auth mostly in kernel; instant unlock from seed + phone-only secret; one identity per phone (built, AUTH.md); NFC tag unlock built 2026-11-11 (AUTH.md \"Attest with a tag\")"
 metadata:
   node_type: memory
   type: project
@@ -44,4 +44,6 @@ Related: [[identity-not-on-disk-default]], [[ferros-attest-os-level]], [[radio-a
 - **How:** the identity seed is kept in the vault, sealed under a KDF of the ira and the tag's number. Device plus tag unlocks.
 - **The owner's threat view:** acceptable, since it needs his device and his glasses. The handle isn't secret anyway (a coworker knows it; a handle is a name, not a password).
 - **Later:** "would be nice to have PIPE on tag".
-- **Order:** build it after the GPU attest mark.
+- **Built 2026-11-11** (branch nfc-unlock; owner: "have NFC be on if the screen is on at the attest ... and ideally something in settings to add a tag"). Spec: AUTH.md "Attest with a tag".
+  - Kernel: SYS_UNLOCK ops 6 unlock by tag (Unlock right, seed handed back), 7 keep, 8 forget, 9 list (7-9 also under Settings). kvault `tag_*`: one VSF record per tag at `\0tag.` + id, id = derive_key(device key ‖ UID), seal key = derive_key(device key ‖ device-only secret ‖ UID), XChaCha20-Poly1305 with the id as AD. The kernel now holds the seed while unlocked (IdKeys.seed) so settings can keep a tag. Release and an unbound re-unlock wipe the tags.
+  - nfc: op 9 TAG held (NFC-A, T2T, 7/10-byte UID), op 10 lets go; the UID is never logged. ahau holds it while its entry is up (slot 14); the map's NFC page holds it while adding (slot 9, torch moved to 10).

@@ -14,7 +14,7 @@
 //!
 //! Positions are deterministic until the person arranges by hand; then each moved circle is kept in the vault (`map.place.<name>`) and wins over the seeded place from then on.
 //!
-//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page, and the identity space: the arrangement and kists written from the person's fleet are read again when its generation moves, docs/IDENTITY-SPACE.md), 6 the vault scope `kists.`, 7 use launch (init), 8 use kists (the installer, payloads/kists: the Kists page installs, updates and uninstalls through it, installer.rs), 9 use torch (the kernel's, not init's: the quick row, quick.rs).
+//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page, and the identity space: the arrangement and kists written from the person's fleet are read again when its generation moves, docs/IDENTITY-SPACE.md), 6 the vault scope `kists.`, 7 use launch (init), 8 use kists (the installer, payloads/kists: the Kists page installs, updates and uninstalls through it, installer.rs), 9 use nfc (attest with a tag: the NFC page adds a tag, AUTH.md), 10 use torch (the kernel's, not init's, the slot after the last: the quick row, quick.rs).
 
 #![no_std]
 #![no_main]
@@ -72,8 +72,56 @@ const S_KIST_LIST: u64 = 6;
 const S_LAUNCH: u64 = 7;
 /// The installer's `kists` endpoint (payloads/kists): the Kists page installs, updates and uninstalls through it, and reads the directory and the jobs under way.
 const S_INSTALLER: u64 = 8;
-/// The torch (payloads/torch, docs/TORCH.md): its send right, which the kernel hands whoever it hands Settings, as the slot after the last (init's grants page is full); the quick row's torch circle calls it. An older kernel leaves the slot empty, a call on it fails, and the circle is drawn dimmed.
-const S_TORCH: u64 = 9;
+/// The NFC driver (payloads/nfc): its TAG (op 9) held while the NFC page adds a tag (attest with a tag, AUTH.md; owner, 2026-11-11: "ideally something in settings to add a tag").
+const S_NFC: u64 = 9;
+/// The torch (payloads/torch, docs/TORCH.md): its send right, which the kernel hands whoever it hands Settings, as the slot after the last (init's grants page is full); the quick row's torch circle calls it. An older kernel leaves the slot empty, a call on it fails, and the circle is drawn dimmed. 9 until init granted use nfc before it (2026-11-11).
+const S_TORCH: u64 = 10;
+
+/// The NFC page's "add a tag", as the main loop sets it: 0 not adding, else which add this is (counted from 1), so a tag answered for an add that has since ended is never kept. `tag_add_thread` holds the NFC driver's TAG while it is set and keeps the tag it is answered with (SYS_UNLOCK op 7, under Settings), then writes the outcome to TAG_DONE: the add's count << 2, then 1 kept, 2 kept already, 3 not kept. The main loop reads TAG_DONE each pass (a word, no call), as it reads the GPS copy.
+static TAG_ADD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TAG_DONE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The add's thread (a held call never waits on the main loop's thread): asleep on TAG_ADD while not adding; adding, the NFC driver's TAG held until a tag is read (the person's tap on the page is the consent, AUTH.md "An NFC tap is consent") or the call is let go (op 10: the page went, or the add was cancelled).
+extern "C" fn tag_add_thread(grants: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    let (nfc, settings) = (cap(grants, S_NFC), cap(grants, S_SETTINGS));
+    let mut absent = freq() >> 6;
+    loop {
+        let w = TAG_ADD.load(Ordering::Acquire);
+        if w == 0 || TAG_DONE.load(Ordering::Acquire) >> 2 == w {
+            ferros_sys::wait_world(&TAG_ADD, w, 0);
+            continue;
+        }
+        let mut uid = [0u8; 10];
+        match call(nfc, &[9], &mut uid) {
+            // WHY the lengths: the reply's length is the driver's word; only an unlock tag's UID (7 or 10 bytes) is one.
+            n @ (7 | 10) => {
+                absent = freq() >> 6;
+                // The add ended while the call was held: this tag is not kept.
+                if TAG_ADD.load(Ordering::Acquire) != w {
+                    uid.fill(0);
+                    continue;
+                }
+                let r = match ferros_sys::keep_tag(settings, &uid[..n as usize]) {
+                    Some(true) => 1,
+                    Some(false) => 2,
+                    None => 3,
+                };
+                uid.fill(0);
+                TAG_DONE.store(w << 2 | r, Ordering::Release);
+            }
+            // No driver behind the slot (NFC switched off and its driver gone, or an init without the slot): asked again after a doubling wait, as `fgtw_poller` does for a service not up, while the add stands.
+            ferros_sys::ERR => {
+                sleep_until(now() + absent);
+                if absent < freq() {
+                    absent <<= 1;
+                }
+            }
+            // Let go (op 10): the loop looks at TAG_ADD again.
+            _ => {}
+        }
+    }
+}
 
 /// The heap a link's detail document is verified and read in (ferros_detail): a few kilobytes while a link's page shows, freed after each frame.
 const HEAP_SIZE: usize = 1 << 18;
@@ -792,6 +840,9 @@ enum Choice {
     AskWant(u8),
     /// The first-launch question answered: the answers kept and the kist launched.
     AskGo,
+    /// The NFC page's "add a tag" (or its cancel while it waits), and a kept tag's remove (its place in the list), attest with a tag (AUTH.md).
+    TagAdd,
+    TagRemove(u8),
 }
 
 /// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The clock after the links (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
@@ -1257,6 +1308,12 @@ struct Map {
     gps_claimed: bool,
     /// The driver as `gps_watch` last read it while the page holds its claim, at each ring of its doorbell: None not answering yet (starting, its session replaying), Some(None) no fix yet, Some(Some(fix)) the fix. On the page only, never logged, dropped as the page goes.
     gps_fix: Option<Option<GpsFix>>,
+    /// Attest with a tag (the NFC page, AUTH.md): the kept tags as the kernel last listed them (SYS_UNLOCK op 9, read as the page comes and after each change; never the UIDs, which the kernel never gives), how many, and what the last add said (0 nothing, else `TAG_DONE`'s outcome).
+    tags: [ferros_sys::KeptTag; 1 << 4],
+    ntags: usize,
+    tag_said: u64,
+    /// How many adds this map has started (`TAG_ADD`'s values).
+    tag_adds: u64,
     /// The kist this map last asked init to launch and was told "started" (ferros_kist::launch::STARTED), with the kists' bell count as it stood then (KISTS_WORD): a launch the kernel did not start after all comes back with a later count (ferros_sys::not_started), and only that one is said. Dropped once it is said.
     asked: Option<([u8; 32], u64)>,
     /// Why that kist did not start, or stopped after it started (ferros_kist::launch::why), for its circle (owner, 2026-11-11: Mahere tapped, "nothing opened", it looked stuck; then Mahere faulting at once, "no toast or anything"): the capsule, the reason, and whether its circle is open on it yet. Not yet: it waits for the plane at rest with nothing held (`show_fault`); then shown on the open circle until the circle closes.
@@ -1369,6 +1426,18 @@ fn degrees_dms(l: &mut Line, f: tatau::Fmt, v: i32, pos: char, neg: char) {
 }
 
 impl Map {
+    /// The kept tags read again from the kernel (SYS_UNLOCK op 9, under Settings): as the NFC page comes, and after an add or a remove. None read (refused) lists none.
+    fn tags_read(&mut self) {
+        self.ntags = ferros_sys::kept_tags(cap(self.grants, S_SETTINGS), &mut self.tags).map_or(0, |(_, took)| took);
+    }
+
+    /// An add that is waiting ended (cancelled, or its page gone): the NFC driver lets the held call go (op 10; a call to it from this thread is answered on the driver's next pass, a millisecond apart).
+    fn tag_stop(&mut self) {
+        TAG_ADD.store(0, core::sync::atomic::Ordering::Release);
+        ferros_sys::wake(&TAG_ADD, 1);
+        ferros_sys::nfc::tag_let_go(cap(self.grants, S_NFC));
+    }
+
     /// Who is using right `right` now (ferros_sys::claim::users; owner, 2026-11-10: "we need to be able to see what kists are using each permission"): each claim's kist capsule, None for a system process (this page's own). At most sixteen: more than the page lists. Read at each draw of the pages that show it, one call; the kernel keeps nothing for the map to ask about later.
     fn users(&self, right: u64) -> Vec<Option<[u8; 32]>> {
         use ferros_sys::claim::REC;
@@ -3362,6 +3431,47 @@ impl Map {
                         }
                     }
                 }
+                // Attest with a tag (AUTH.md; owner, 2026-11-11: "ideally something in settings to add a tag"): the tags kept to attest this device with, each by the start of its id (a keyed hash of its UID: the UID never comes back from the kernel) and when it was kept, each with its remove; "add a tag", which waits for the next tag held to the device while this page shows (the tap on the page is the consent, AUTH.md "An NFC tap is consent"); and what a kept tag means, warned as attest at boot is.
+                if k == 3 {
+                    header(b, &mut y, tr(Msg::TagAttest));
+                    let tags = self.tags;
+                    for (i, t) in tags[..self.ntags].iter().enumerate() {
+                        let mut name = Line::new();
+                        name.s("G#");
+                        for byte in &t.id[..4] {
+                            let _ = write!(name, "{byte:02X}");
+                        }
+                        let mut when = Line::new();
+                        if t.added == 0 {
+                            when.s("-");
+                        } else {
+                            // Eagle time to the wall clock in the zone, for the eye only (tatau writes it in the device's base; hex shows the Eagle stamp itself).
+                            const EPOCH_UNIX: i64 = -14_182_940;
+                            let ops = ferros_kist::vsf::OSCILLATIONS_PER_SECOND as i64;
+                            let secs = t.added.div_euclid(ops) + EPOCH_UNIX + ferros_sys::zone();
+                            let ns = (t.added.rem_euclid(ops) as i128 * 1_000_000_000 / ops as i128) as u32;
+                            let _ = tatau::date_time(&mut when, f, secs, ns, t.added);
+                        }
+                        fact(b, &mut y, name.as_str(), when.as_str());
+                        button(self, b, &mut y, tr(Msg::TagRemove), false, Some(Choice::TagRemove(i as u8)));
+                    }
+                    if self.ntags == 0 {
+                        row(self, b, &mut y, small, white(), tr(Msg::NoneYet), None);
+                    }
+                    let adding = TAG_ADD.load(core::sync::atomic::Ordering::Acquire) != 0;
+                    button(self, b, &mut y, tr(if adding { Msg::Cancel } else { Msg::TagAdd }), adding, Some(Choice::TagAdd));
+                    let said = match self.tag_said {
+                        _ if adding => Some(Msg::TagHold),
+                        1 => Some(Msg::TagKeptNow),
+                        2 => Some(Msg::TagKeptAlready),
+                        3 => Some(Msg::TagNotKept),
+                        _ => None,
+                    };
+                    if let Some(m) = said {
+                        row(self, b, &mut y, small, white(), tr(m), None);
+                    }
+                    notes(b, &mut y, tr(Msg::TagNote));
+                }
                 // The knobs (ferros_sys::control): a value goes round its choices at each tap, an action happens at its tap.
                 header(b, &mut y, tr(Msg::Settings));
                 let c = ferros_sys::controls(k as u64);
@@ -4410,6 +4520,25 @@ impl Map {
                             }
                         }
                     }
+                    // Attest with a tag: an add started (the next tag held to the device is kept, `tag_add_thread`), or the one waiting cancelled.
+                    Some(Choice::TagAdd) => {
+                        if TAG_ADD.load(core::sync::atomic::Ordering::Acquire) != 0 {
+                            self.tag_stop();
+                        } else {
+                            self.tag_adds += 1;
+                            self.tag_said = 0;
+                            TAG_ADD.store(self.tag_adds, core::sync::atomic::Ordering::Release);
+                            ferros_sys::wake(&TAG_ADD, 1);
+                        }
+                    }
+                    // A kept tag forgotten (one tap: nothing of the identity goes with it, and the tag can be kept again).
+                    Some(Choice::TagRemove(i)) => {
+                        if ferros_sys::forget_tag(cap(self.grants, S_SETTINGS), Some(&self.tags[i as usize].id)).is_none() {
+                            console(self.grants, b"map: the kernel did not forget the tag\n");
+                        }
+                        self.tag_said = 0;
+                        self.tags_read();
+                    }
                     // A neighbour's title: that page, coming in from its side and settling as a swipe does.
                     Some(Choice::Link(k)) => {
                         // Connections' row: that link's own page, straight there.
@@ -4699,6 +4828,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         installer: installer::Installer::default(),
         gps_claimed: false,
         gps_fix: None,
+        tags: [ferros_sys::KeptTag::default(); 1 << 4],
+        ntags: 0,
+        tag_said: 0,
+        tag_adds: 0,
         uninstall_armed: None,
         asked: None,
         fault: None,
@@ -4898,6 +5031,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut gps_seen = 0u32;
     // Whether the GPS page showed (with GPS on and the screen on) at the last pass: its claim follows it.
     let mut gps_shown = false;
+    // Whether the NFC page showed last pass (its kept tags read as it comes, an add ended as it goes), and TAG_DONE as last taken.
+    let mut nfc_shown = false;
+    let mut tag_done_seen = 0u64;
     let mut last_pass = now();
     let mut draw_us = 0u64;
     let mut move_us = 0u64;
@@ -4915,6 +5051,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The GPS driver's doorbell, for the GPS page (`gps_watch`): on a thread of its own, asleep while the page is not open.
     static mut GPS_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(gps_watch, unsafe { &mut *(&raw mut GPS_STACK) }, grants);
+    // The NFC page's "add a tag" (`tag_add_thread`): asleep until an add starts.
+    static mut TAG_STACK: [u8; 1 << 14] = [0; 1 << 14];
+    ferros_sys::thread_spawn(tag_add_thread, unsafe { &mut *(&raw mut TAG_STACK) }, grants);
     // The quick row's slow calls (the torch, the identity service's do not disturb), on a thread of their own (quick.rs `worker`).
     static mut QUICK_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(quick::worker, unsafe { &mut *(&raw mut QUICK_STACK) }, grants);
@@ -5034,6 +5173,33 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             ferros_sys::wake(&GPS_PAGE, 1);
             if !map.settling {
                 map.draw();
+            }
+        }
+        // Attest with a tag: the NFC page's kept tags read as it comes; an add waiting ends as it goes (reader mode only while the page shows, AUTH.md).
+        let shown = matches!(map.view, View::Open(_)) && PAGES[map.page] == "NFC";
+        if shown != nfc_shown {
+            nfc_shown = shown;
+            map.tag_said = 0;
+            if shown {
+                map.tags_read();
+            } else if TAG_ADD.load(core::sync::atomic::Ordering::Acquire) != 0 {
+                map.tag_stop();
+            }
+            if !map.settling {
+                map.draw();
+            }
+        }
+        // An add's tag was kept, or not (`tag_add_thread` wrote TAG_DONE): one tag an add, its outcome said, the list read again.
+        let done = TAG_DONE.load(core::sync::atomic::Ordering::Acquire);
+        if done != tag_done_seen {
+            tag_done_seen = done;
+            if done >> 2 == TAG_ADD.load(core::sync::atomic::Ordering::Acquire) {
+                map.tag_said = done & 3;
+                TAG_ADD.store(0, core::sync::atomic::Ordering::Release);
+                map.tags_read();
+                if !map.settling {
+                    map.draw();
+                }
             }
         }
         // What the open page shows moved: drawn again once this pass, whichever of its doorbells rang (the GPS driver's and its link's together draw once). While the page settles it is drawn every frame anyway.
