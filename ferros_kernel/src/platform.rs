@@ -544,11 +544,9 @@ pub fn scrub_memory() {
         return;
     }
     reset_step(2);
-    let regions: [(usize, usize); 14] = [
+    let regions: [(usize, usize); 12] = [
         (hb, he),
         crate::cachemap::HEAP2,
-        crate::cachemap::POOL,
-        crate::cachemap::POOL_BIG,
         crate::cachemap::DMA_POOL,
         crate::cachemap::USB_DMA,
         crate::cachemap::DISPLAY_FB,
@@ -560,11 +558,11 @@ pub fn scrub_memory() {
         crate::cachemap::GPU_MEM,
         crate::cachemap::LAYERS,
     ];
-    let total: usize = regions.iter().map(|&(lo, hi)| if hi > lo { hi - lo } else { 0 }).sum();
+    // The processes' memory: every frame an arc holds (frames.rs; until 2026-11-11 the two arc pools whole). Free frames were wiped as they came back.
+    let total: usize = regions.iter().map(|&(lo, hi)| if hi > lo { hi - lo } else { 0 }).sum::<usize>() + crate::frames::taken_bytes();
     // Said before the zeroing: the allocator's own lists are in the heap, so nothing may allocate after it (the first cut formatted its line after, and the reset path died short of the EL3 reboot-mode stamp: two reboots to fastboot that landed as plain boots, 2026-11-03).
     pstore(alloc::format!("memory scrub before the reset: {} MiB\n", total >> 20).as_bytes());
     crate::smp::stop_all();
-    crate::cachemap::pools_to_kernel();
     reset_step(3);
     let t0 = cntpct();
     for &(lo, hi) in &regions {
@@ -577,6 +575,8 @@ pub fn scrub_memory() {
             a += 64;
         }
     }
+    // The frames by their own addresses, which are the kernel's and writable (cachemap frame_block): a grants page or a masked process's code is read-only only through its window. Until 2026-11-11 the pools themselves were those read-only pages, and the scrub had to turn them back first (akita, 2026-11-06: FAR G#8300_0000).
+    crate::frames::scrub();
     unsafe { core::arch::asm!("dsb sy") };
     let us = cntpct().wrapping_sub(t0) * 1_000_000 / cntfrq();
     reset_step(4);

@@ -59,6 +59,33 @@ Capsules, seals, the three masking modes, the checker, grants and capability IPC
 4. Compaction on a failed spawn or grow; ahau's give-back after attest.
 5. Rotation, if the measurements say it is free.
 
+## Built (2026-11-11, branch `arcs`; on the device: not yet)
+
+Every step below compiles and leaves the kernel bootable on its own; none has run on a device yet, so every figure still to measure says so.
+
+### Found while building: every mode needs the window
+
+The proposal moved fixed and ring arcs by their base register alone, since masked code keeps only the low bits of a data pointer.
+Its code pointers are whole addresses: the return addresses `bl` leaves in x30 and on the stack, the function pointers its relocations filled at start (vtables), and an indirect branch is not masked (SANDBOX.md: `br`, `blr`, `ret` are allowed as they are).
+After a copy to a new base the first `ret` would jump into the old frames: freed, so a fault, or another process's code.
+So every arc, masked or native, is now a window of virtual addresses, and its frames lie wherever the pool has them: a move is the copy and a remap, and no register, pointer or kernel record changes.
+
+### Step 0: the memory map (built)
+
+`ferros_kernel/src/frames.rs` and BOARDS.md "Memory map": per board, the ranges and their proof, in the order frames are taken; `diag frames` reads them back.
+husky: the two old pools (336 MiB) and the high bank's 9092 MiB that Android's memblock left unreserved (its boot log of 2026-08-17).
+akita: the two old pools only, until a memblock capture proves its high bank (the commands are in BOARDS.md).
+
+### Step 1: one frame pool, every arc a window (built)
+
+- **The pool** (frames.rs): a bitmap of 2 MiB frames over the map, taken first-free in the map's order (the old pools fill before the high bank), wiped as they come back, zeroed on first use; the scrub before a reset zeroes only the frames arcs hold.
+- **The windows** (cachemap ARC_VA): 64 GiB of addresses from G#40_0000_0000, past every physical address, given out by a buddy allocator as powers of two aligned to their size (the old buddy code, over addresses now instead of memory).
+- **The page tables:** every frame owns one level-3 table (held in the pool's first frames: 10 on husky, 1 on akita), sized from the map rather than a fixed 256; a window's 2 MiB slot points at the table of the frame it holds. W^X, the read-only grants page, BTI's guarded pages and the stack's guard page are set in those tables exactly as before. The frames themselves are mapped once more at their own addresses, the kernel's alone (zeroing, copying, the scrub).
+- **Sizes:** a masked arc is a power of two (64 KiB at least) aligned to it, as its mask needs, in whole frames, the rest of its last frame and the unmapped rest of its window its guard; a native arc is a whole number of frames (Mahere's 205 MB takes 206 MiB, not 256).
+- **Offsets a syscall names as words** (SYS_WAIT, SYS_WAKE, the bells, the installer's word, a thread's entry and stack) are checked against the arc's size, not masked: a native arc is no power of two now. Outside it, a word traps the caller (`bad_buf`) and a thread is refused.
+- **Escape:** a `FERROS_FRAMES_HIGH=0` build keeps husky to the two old pools.
+- **A RELOAD on akita** carries the board in x0 bit 63: a reloaded kernel has no device tree, and husky's map names DRAM akita does not have.
+
 ## For the owner
 
 - A process's ceiling: from its build (`__ferros_heap` as a cap), from a person's setting per kist, or none (the device's free memory is the only limit).

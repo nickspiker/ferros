@@ -1663,7 +1663,7 @@ pub(crate) fn tcpc_usb_switch(log: bool) {
 pub fn run(mut b: Boot) -> ! {
     // Report now too: if the USB bring-up wedges, the watchdog's reset still shows the vault result (handoff) and the crumb shows how far USB got.
     report(&b, 0xA0);
-    let generation = if b.x0 & 1 == 1 { b.x0 >> 1 } else { 0 };
+    let generation = if b.x0 & 1 == 1 { (b.x0 & !crate::board::RELOAD_AKITA) >> 1 } else { 0 };
     let mut store = b.store.take();
     unsafe {
         SPAWN_STORE = &raw mut store;
@@ -2949,6 +2949,7 @@ pub fn run(mut b: Boot) -> ! {
                 // `diag frames`: the frame pool's memory map on this board (frames.rs, BOARDS.md "Memory map").
                 if cmd.params == b"frames" {
                     resp.extend_from_slice(crate::frames::map_report().as_bytes());
+                    resp.extend_from_slice(crate::process::with_lock(crate::frames::pool_report).as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
@@ -3921,7 +3922,8 @@ pub fn run(mut b: Boot) -> ! {
                         platform::handover_stamp(b'R');
                         crate::cachemap::off_for_handover();
                         let len = (reload_size + 7) & !7;
-                        let next_x0 = ((generation + 1) << 1) | 1;
+                        // Bit 63 carries the board (board::RELOAD_AKITA): a reloaded kernel has no device tree to read it from, and husky's frame map names DRAM akita does not have (frames.rs).
+                        let next_x0 = ((generation + 1) << 1) | 1 | if crate::board::akita() { crate::board::RELOAD_AKITA } else { 0 };
                         core::arch::asm!(
                             "dsb sy",
                             "ic iallu",
