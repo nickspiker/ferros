@@ -26,12 +26,13 @@ use core::cell::UnsafeCell;
 
 // ---------------------------------------------------------------- arcs
 
-/// Smallest arc: 64 KiB. The pool (cachemap::POOL) is a power of two.
+/// Smallest arc: 64 KiB (a masked arc's size; it still takes a whole frame).
 const ARC_MIN_LOG2: u32 = 16;
 
+/// The windows' address space (cachemap ARC_VA) as a buddy allocator: a window is a power of two at an address aligned to it, so a masked arc's base is aligned to any size it can grow to.
 struct Arcs {
-    /// Free blocks per size class (log2 size → block bases).
-    free: [Vec<usize>; 32],
+    /// Free blocks per size class (log2 size → block bases): up to 2^39, past the 64 GiB of windows.
+    free: [Vec<usize>; 40],
     init: bool,
 }
 
@@ -199,27 +200,15 @@ fn enqueue_front(t: usize) {
     kick(mask_of(t));
 }
 
-static ARCS: Global<Arcs> = Global(UnsafeCell::new(Arcs { free: [const { Vec::new() }; 32], init: false }));
-/// The big pool's buddy lists (cachemap POOL_BIG): arcs of 16 MiB and up, 2 MiB blocks, no per-page W^X.
-static ARCS_BIG: Global<Arcs> = Global(UnsafeCell::new(Arcs { free: [const { Vec::new() }; 32], init: false }));
-const BIG_FROM: usize = 16 << 20;
+
+/// The windows' free address space (cachemap ARC_VA).
+static ARCS: Global<Arcs> = Global(UnsafeCell::new(Arcs { free: [const { Vec::new() }; 40], init: false }));
 
 fn arcs() -> &'static mut Arcs {
     let a = unsafe { &mut *ARCS.0.get() };
     if !a.init {
-        let (p0, p1) = crate::cachemap::POOL;
-        let size = p1 - p0;
-        a.free[size.trailing_zeros() as usize].push(p0);
-        a.init = true;
-    }
-    a
-}
-
-fn arcs_big() -> &'static mut Arcs {
-    let a = unsafe { &mut *ARCS_BIG.0.get() };
-    if !a.init {
-        // The pool as aligned power-of-two chunks, largest first: its end is where the secure carveout begins, not a power of two from its start.
-        let (p0, p1) = crate::cachemap::POOL_BIG;
+        // The windows' space as aligned power-of-two chunks, largest first (64 GiB: one chunk).
+        let (p0, p1) = crate::cachemap::ARC_VA;
         let mut at = p0;
         while at < p1 {
             let order = (at.trailing_zeros() as usize).min(usize::BITS as usize - 1 - (p1 - at).leading_zeros() as usize);
@@ -231,19 +220,13 @@ fn arcs_big() -> &'static mut Arcs {
     a
 }
 
-/// Which pool an address is in.
-fn pool_of(base: usize) -> (&'static mut Arcs, (usize, usize)) {
-    let (b0, b1) = crate::cachemap::POOL_BIG;
-    if base >= b0 && base < b1 { (arcs_big(), (b0, b1)) } else { (arcs(), crate::cachemap::POOL) }
-}
-
 fn buddy_take(a: &mut Arcs, block: usize) -> Option<usize> {
     let k = block.trailing_zeros() as usize;
     let mut j = k;
-    while j < 32 && a.free[j].is_empty() {
+    while j < a.free.len() && a.free[j].is_empty() {
         j += 1;
     }
-    if j >= 32 {
+    if j >= a.free.len() {
         return None;
     }
     let base = a.free[j].pop()?;
@@ -254,83 +237,10 @@ fn buddy_take(a: &mut Arcs, block: usize) -> Option<usize> {
     Some(base)
 }
 
-/// An arc: `size` usable bytes at `base` (a power of two, base aligned to `size`), carved from a `block`-byte buddy block (= `size`, or `2 * size` for a guarded arc, whose upper half is unused guard so an in-arc immediate offset can't reach another arc — SANDBOX.md).
-#[derive(Clone, Copy)]
-pub struct Arc {
-    pub base: usize,
-    pub size: usize,
-    pub block: usize,
-    /// A masked arc's guard above it (GUARD bytes at base + size, kernel-only pages), 0 for a native arc.
-    pub guard: usize,
-    /// Exact mode's limit (SANDBOX.md, "Modes"): checked code reaches [base, base + limit); 0 in the other modes, whose x27 is the mask.
-    pub limit: usize,
-}
-
-/// The guard above a masked arc: the reach of an immediate offset past its last byte (SANDBOX.md: 65520 + 15).
-const GUARD: usize = 64 << 10;
-
-impl Arc {
-    pub fn mask(&self) -> usize {
-        self.size - 1
-    }
-    /// What a process's x27 holds: exact mode's limit, or the mask.
-    pub fn x27(&self) -> usize {
-        if self.limit != 0 { self.limit } else { self.size - 1 }
-    }
-    /// The top of what the process may use (its first stack is just under it): the limit in exact mode, the arc's end otherwise.
-    pub fn top(&self) -> usize {
-        self.base + if self.limit != 0 { self.limit } else { self.size }
-    }
-}
-
-/// Allocate the smallest arc of at least `bytes` (buddy split from the pool), zeroed. `guard` reserves a guard of the arc's own size on each side (a 2S block, SANDBOX.md): the base is 2S-aligned, hence S-aligned, so masking stays a single `and`, and the usable arc never abuts another.
-pub fn arc_alloc(bytes: usize, masked: bool) -> Option<Arc> {
-    let want = bytes.max(1 << ARC_MIN_LOG2).next_power_of_two();
-    let block = if masked { want * 2 } else { want };
-    // Masked (guarded) arcs need the page pool's per-page W^X; a big native arc goes to the big pool, and a small one too when the page pool is full.
-    // Both pools carry 4 KiB pages since 2026-11-03, so a masked arc may live in either: the page pool first, the big pool when it is large or the page pool is full.
-    let base = if masked && block < BIG_FROM {
-        buddy_take(arcs(), block).or_else(|| buddy_take(arcs_big(), block))?
-    } else if block >= BIG_FROM {
-        buddy_take(arcs_big(), block).or_else(|| buddy_take(arcs(), block))?
-    } else {
-        buddy_take(arcs(), block).or_else(|| buddy_take(arcs_big(), block))?
-    };
-    unsafe { core::ptr::write_bytes(base as *mut u8, 0, want) };
-    if !masked {
-        return Some(Arc { base, size: want, block, guard: 0, limit: 0 });
-    }
-    // The doubled block is kept only for its alignment: the arc, then a 64 KiB guard nobody can read (its pages kernel-only, so neither another process nor stale data from an arc freed there is in reach), and the rest of the upper half back to the pool as aligned chunks (64 KiB at S + 64 KiB, 128 KiB at S + 128 KiB, ... S/2 at S + S/2). A 128 MiB arc costs 128 MiB and 64 KiB, not 256 MiB.
-    crate::cachemap::guard_pages(base + want, GUARD, true);
-    let (a, _) = pool_of(base);
-    let mut piece = GUARD;
-    while piece < want {
-        a.free[piece.trailing_zeros() as usize].push(base + want + piece);
-        piece <<= 1;
-    }
-    Some(Arc { base, size: want, block: want, guard: GUARD, limit: 0 })
-}
-
-/// Arcs returned to the pools so far: a spawn refused for want of room is tried again only once this has moved (service.rs, the installer after attest), never on a timer.
-pub static ARC_FREES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Return an arc to its pool, merging buddies; a masked arc's guard goes back with it.
-pub fn arc_free(arc: Arc) {
-    ARC_FREES.fetch_add(1, core::sync::atomic::Ordering::Release);
-    // Whatever the process held is gone with it: the kernel wipes the arc as it reclaims it, so no process wipes its own secrets on its way out (owner, 2026-11-08: every end is one shot dead, no cleanup; the arc was zeroed only when handed out again until then).
-    // After the reset: the grants page and the code are read-only until it returns the arc to writable data.
-    crate::cachemap::arc_reset(arc.base, arc.block);
-    unsafe { core::ptr::write_bytes(arc.base as *mut u8, 0, arc.size) };
-    if arc.guard != 0 {
-        crate::cachemap::guard_pages(arc.base + arc.size, arc.guard, false);
-        buddy_give(arc.base + arc.size, arc.guard);
-    }
-    buddy_give(arc.base, arc.block);
-}
-
-/// A free block of `block` bytes at `base` back to its pool's lists, merged with its buddies while they are free.
+/// A free window of `block` bytes at `base` back to the windows' space, merged with its buddies while they are free.
 fn buddy_give(base: usize, block: usize) {
-    let (a, (p0, p1)) = pool_of(base);
+    let a = arcs();
+    let (p0, p1) = crate::cachemap::ARC_VA;
     let mut base = base;
     let mut k = block.trailing_zeros() as usize;
     while (1usize << k) < p1 - p0 {
@@ -346,6 +256,144 @@ fn buddy_give(base: usize, block: usize) {
     }
     a.free[k].push(base);
 }
+
+/// An arc (ARCS.md, built 2026-11-11): a window of addresses (`window` bytes at `base`, a power of two aligned to its size, in cachemap ARC_VA) of which the first `mapped` bytes are 2 MiB frames from the pool (frames.rs), wherever those lie, and the first `size` of those the process's. Before 2026-11-11 an arc was a physically contiguous power-of-two block of one of two boot-time pools, at its own physical address.
+#[derive(Clone, Copy)]
+pub struct Arc {
+    pub base: usize,
+    /// What the process may use: [base, base + size). Masked arcs a power of two (the mask x27 describes, the alignment the base gives); native arcs a whole number of frames.
+    pub size: usize,
+    /// The frames mapped: `size` rounded up to whole frames. Past `size`, the last frame's pages are kernel-only (a masked arc's guard lies there or in the unmapped rest of the window).
+    pub mapped: usize,
+    /// A masked arc's guard above it (GUARD bytes at base + size that no process reaches), 0 for a native arc.
+    pub guard: usize,
+    /// Exact mode's limit (SANDBOX.md, "Modes"): checked code reaches [base, base + limit); 0 in the other modes, whose x27 is the mask.
+    pub limit: usize,
+    /// The most `size` may grow to (SYS_ARC): the image's whole declared heap counted (`image_tail_ceiling`), a power of two for a masked arc; `size` itself for one that never grows (fixed mode, an image without ferros_rt's growing heap).
+    pub ceiling: usize,
+    /// The window's whole span: the ceiling plus the guard, to a power of two. Unmapped past `mapped`.
+    pub window: usize,
+}
+
+/// The guard above a masked arc: the reach of an immediate offset past its last byte (SANDBOX.md: 65520 + 15).
+const GUARD: usize = 64 << 10;
+
+impl Arc {
+    /// What a process's x27 holds: exact mode's limit, or the mask (a native arc's size less one: ferros_rt reads its top from it, `start.rs`).
+    pub fn x27(&self) -> usize {
+        if self.limit != 0 { self.limit } else { self.size - 1 }
+    }
+    /// The top of what the process may use (its first stack is just under it): the limit in exact mode, the arc's end otherwise.
+    pub fn top(&self) -> usize {
+        self.base + if self.limit != 0 { self.limit } else { self.size }
+    }
+    /// The 8-byte word a syscall names at arc offset `off` (rounded down to 8), None when it is not inside the arc. Was `base + (off & mask)` while every arc was a power of two; a native arc is any number of frames now, where the mask would not keep an offset inside it.
+    pub fn word(&self, off: u64) -> Option<usize> {
+        // WHY: the offset is the process's; a word past the arc's size lies in kernel-only pages or an unmapped slot of its window, where the kernel's own access would fault at EL2. size >= 64 KiB, so the subtraction cannot wrap.
+        let o = off & !7;
+        (o <= self.size as u64 - 8).then_some(self.base + o as usize)
+    }
+}
+
+/// An arc's size for `bytes` in its mode: a masked arc a power of two (64 KiB at least, as its mask needs), a native arc whole frames.
+fn arc_shape(bytes: usize, masked: bool) -> usize {
+    if masked { bytes.max(1 << ARC_MIN_LOG2).next_power_of_two() } else { bytes.max(1).next_multiple_of(crate::frames::FRAME) }
+}
+
+/// An arc of at least `bytes` that never grows (`arc_alloc_room`).
+pub fn arc_alloc(bytes: usize, masked: bool) -> Option<Arc> {
+    arc_alloc_room(bytes, bytes, masked)
+}
+
+/// An arc of at least `bytes`, zeroed, in a window of its own with room to grow to `ceiling` (SYS_ARC): masked arcs a power of two with the guard above, native arcs whole frames. None when the pool has too few free frames, which need not lie together anywhere.
+pub fn arc_alloc_room(bytes: usize, ceiling: usize, masked: bool) -> Option<Arc> {
+    let size = arc_shape(bytes, masked);
+    // WHY the max: a ceiling under the size asked for is a caller's sum that left something out (a staged capsule bigger than its image); the arc never starts above its own ceiling.
+    let ceiling = arc_shape(ceiling, masked).max(size);
+    let guard = if masked { GUARD } else { 0 };
+    // The window: a power of two that holds the ceiling and the guard, so a masked arc's base is aligned to any size it grows to and every address past its guard is unmapped.
+    let window = (ceiling + guard).next_power_of_two().max(crate::frames::FRAME);
+    if crate::frames::free() < size.div_ceil(crate::frames::FRAME) {
+        return None;
+    }
+    let base = buddy_take(arcs(), window)?;
+    let mut arc = Arc { base, size: 0, mapped: 0, guard, limit: 0, ceiling, window };
+    // Counted free above, under the same lock: the frames are there, and the window goes back if they were not.
+    if arc_resize(&mut arc, size).is_err() {
+        buddy_give(base, window);
+        return None;
+    }
+    Some(arc)
+}
+
+/// Make the arc's size `size` (a shape its mode takes, at most its ceiling): frames mapped for every slot it now reaches, from anywhere in the pool, and given back from every slot it no longer does; inside its last frame the pages up to `size` the process's, those past it kernel-only (a masked arc's guard). Err(ARC_WHY_MEMORY) when the pool has too few free frames: nothing changed then. Every core's TLB forgets what was taken away before its frames are wiped and handed on.
+fn arc_resize(arc: &mut Arc, size: usize) -> Result<(), u64> {
+    use crate::frames::FRAME;
+    let mapped = size.next_multiple_of(FRAME);
+    if mapped > arc.mapped && crate::frames::free() < (mapped - arc.mapped) / FRAME {
+        return Err(ARC_WHY_MEMORY);
+    }
+    // The old last frame's pages between the two sizes change hands (a masked arc smaller than a frame): the process's when growing, kernel-only when shrinking.
+    let part = if arc.mapped < mapped { arc.mapped } else { mapped };
+    if size > arc.size && part > arc.size {
+        crate::cachemap::pages_open(arc.base + arc.size, part - arc.size, true);
+    }
+    if size < arc.size && part > size {
+        crate::cachemap::pages_open(arc.base + size, part - size, false);
+    }
+    let mut at = arc.mapped;
+    while at < mapped {
+        // Counted free above, under the same lock: every take succeeds.
+        let f = crate::frames::take().unwrap();
+        // The bytes of this frame that are the process's: all of it but in the last frame of a masked arc smaller than a frame.
+        let usable = if size - at < FRAME { size - at } else { FRAME };
+        crate::cachemap::map_slot(arc.base + at, crate::frames::pa(f), crate::frames::table(f), usable);
+        at += FRAME;
+    }
+    crate::cachemap::mapped();
+    if mapped < arc.mapped {
+        let mut gone = Vec::with_capacity((arc.mapped - mapped) / FRAME);
+        let mut at = mapped;
+        while at < arc.mapped {
+            if let Some(t) = crate::cachemap::slot_table(arc.base + at) {
+                gone.push(crate::frames::of_table(t));
+                crate::cachemap::set_slot(arc.base + at, 0);
+            }
+            at += FRAME;
+        }
+        crate::cachemap::unmapped(arc.base + mapped, arc.mapped - mapped);
+        for f in gone {
+            crate::frames::give(f);
+        }
+    }
+    arc.size = size;
+    arc.mapped = mapped;
+    Ok(())
+}
+
+/// Arcs returned to the pools so far: a spawn refused for want of room is tried again only once this has moved (service.rs, the installer after attest), never on a timer.
+pub static ARC_FREES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Return an arc's frames to the pool and its window to the windows' space. Whatever the process held is gone with it: its frames are wiped as they go back (owner, 2026-11-08: every end is one shot dead, no cleanup; the arc was zeroed only when handed out again until then).
+pub fn arc_free(arc: Arc) {
+    ARC_FREES.fetch_add(1, core::sync::atomic::Ordering::Release);
+    let mut taken = Vec::with_capacity(arc.mapped / crate::frames::FRAME);
+    let mut at = 0;
+    while at < arc.mapped {
+        if let Some(t) = crate::cachemap::slot_table(arc.base + at) {
+            taken.push(crate::frames::of_table(t));
+            crate::cachemap::set_slot(arc.base + at, 0);
+        }
+        at += crate::frames::FRAME;
+    }
+    // Every core forgets the window before its frames are wiped and handed on.
+    crate::cachemap::unmapped(arc.base, arc.mapped);
+    for f in taken {
+        crate::frames::give(f);
+    }
+    buddy_give(arc.base, arc.window);
+}
+
 
 // ---------------------------------------------------------------- capabilities
 
@@ -488,6 +536,8 @@ enum State {
     Sleeping(u64),
     /// In `wait` on a word of its arc (the word's address, and a deadline or 0): `wake` on that word by another thread of the process makes it runnable (x0 = 0), or the deadline passing does (x0 = 2).
     Waiting(usize, u64),
+    /// Its SYS_ARC waits for the rest of its process to leave the cores (`hold`): the masked arc's mask or limit changes in every thread at once.
+    Held,
 }
 
 /// A thread: what the scheduler runs. A saved frame, a state, and the process it belongs to; threads of one process share its arc and every capability in it (KERNEL.md "Threads, interrupts and cores"). Threads are not addressable: nothing outside the kernel names one.
@@ -546,6 +596,17 @@ struct Process {
     kist: bool,
     /// A kist's capsule address (its vault address, the blake3 of the signed capsule), as launched: what names it in the person's list, for the rights it is using (`CLAIMS`). None for a system process.
     capsule: Option<[u8; 32]>,
+    /// The arc's top at spawn (its size, exact mode's limit): a shrink (SYS_ARC) never goes under it, so the grants page, the code, the input and the first stack stay.
+    floor: usize,
+    /// SYS_ARC grows and shrinks granted so far (`diag arcs`).
+    grows: u32,
+    shrinks: u32,
+    /// Held off the cores (ARCS.md step 3): what waits for its last thread to leave (`hold_try`), and when it was asked (the pause, measured).
+    hold: Option<Hold>,
+    /// Moves so far (`diag arcs`).
+    moves: u32,
+    /// Ranges of the arc whose frames were given back while the arc kept its size (ARCS.md step 4): arc offsets, whole frames. A masked arc's power-of-two slack between its image and its first stack at spawn, and what the process gives back (SYS_ARC `ARC_RELEASE`). Unmapped: the process faults there, and no syscall buffer may lie there (`span`, `word`).
+    holes: Vec<(usize, usize)>,
 }
 
 struct Endpoint {
@@ -619,6 +680,7 @@ pub fn threads_report(out: &mut Vec<u8>) {
             State::Sleeping(d) => alloc::format!("sleeping, A#{} ms left", d.saturating_sub(now) * 1000 / f),
             State::Waiting(a, d) if a < 1024 => alloc::format!("irq_wait on INTID A#{a}{}, pending {}", if d != 0 { alloc::format!(", A#{} ms left", d.saturating_sub(now) * 1000 / f) } else { alloc::string::String::new() }, unsafe { core::ptr::read_volatile(&raw const __irq_pending[a]) }),
             State::Waiting(a, d) => alloc::format!("wait on word G#{a:X}{}", if d != 0 { alloc::format!(", A#{} ms left", d.saturating_sub(now) * 1000 / f) } else { alloc::string::String::new() }),
+            State::Held => alloc::format!("held: its arc changes once its process is off the cores"),
         };
         out.extend_from_slice(alloc::format!("thread A#{i} {} (process A#{}, cores G#{:X}, spsr G#{:X}, pc +G#{:X}): {st}\n", alloc::string::String::from_utf8_lossy(&thread_name(i)), t.proc, t.mask, t.frame.spsr, t.frame.elr.wrapping_sub(kk.procs.get(t.proc).and_then(|p| p.as_ref()).map(|p| p.arc.base as u64).unwrap_or(0)) & 0xFF_FFFF).as_bytes());
     }
@@ -748,9 +810,19 @@ impl Process {
         let size = self.arc.size as u64;
         // WHY: the offset and length are the process's; the subtraction is taken only once the offset is inside the arc, so it cannot wrap.
         if off < size && len as u64 <= size - off {
-            return Some(self.arc.base + off as usize);
+            // Not over frames the process gave back (`holes`): unmapped, the kernel's own access there would fault at EL2.
+            return (!self.in_hole(off as usize, len)).then_some(self.arc.base + off as usize);
         }
         self.dma_span((self.arc.base as u64).wrapping_add(off) & !DMA_ADDR, len)
+    }
+    /// Whether `len` bytes at arc offset `off` touch a range the process gave back (`holes`).
+    fn in_hole(&self, off: usize, len: usize) -> bool {
+        self.holes.iter().any(|&(lo, hi)| off < hi && off + len > lo)
+    }
+    /// The 8-byte word a syscall names at arc offset `off` (`Arc::word`), None also over a range the process gave back.
+    fn word(&self, off: u64) -> Option<usize> {
+        let a = self.arc.word(off)?;
+        (!self.in_hole(a - self.arc.base, 8)).then_some(a)
     }
     /// A buffer the kernel will touch later (a receive buffer, a reply buffer): resolved now, at the syscall that names it, so a bad one traps there and not inside another process's call.
     fn check(&self, off: u64, len: usize) {
@@ -985,6 +1057,21 @@ const SYS_CLAIM: u64 = 37;
 const SYS_BELL: u64 = 38;
 /// not_started(op, …): the kist launches init answered "started" for that the kernel's kist job did not start after all (`NOT_STARTED`; owner, 2026-11-11: Mahere tapped, nothing opened, "it looked stuck"), for the Settings holder alone (the map), as the claims' users list. Op 0: x1 the Settings token, x2/x3 a buffer and its length → how many records (all of them; whole records past the buffer are not written), each `NOT_STARTED_REC` bytes: the reason (ferros_kist::launch::why), the capsule's address (32 bytes), the kists' bell count it rang (u64 LE). Op 1: the kists' doorbell, x1 a word in the caller's arc, x2 the Settings token: the bell's change count written there now and whenever a launch does not start or a kist kept here starts, its waiters woken → 0. ERR without Settings, or for no such op.
 const SYS_NOT_STARTED: u64 = 39;
+/// arc(op, bytes): the caller's own arc grows or shrinks (ARCS.md step 2; owner, 2026-11-11: "why we cannot scale on demand, that was the whole point of ring memory"). No capability: a process reaches only its own arc, and only as far as its ceiling (`Arc::ceiling`: the most its build declared, its header's heap counted whole; fixed mode's size). Op 0 `ARC_GROW`: at least x1 more bytes (native: whole frames; ring: the mask doubles until they fit; exact: the limit moves) → x0 the new top (the arc's size, exact mode's limit), x1 the old one; the bytes between are new, zeroed, the process's. Op 1 `ARC_SHRINK`: keep the first x1 bytes (rounded up as the mode needs; never under what the process was spawned with) and give the rest back → x0 the new top, x1 the old. Op 2 `ARC_SIZE` → x0 the top, x1 the ceiling. Op 3 `ARC_RELEASE`: the frames wholly inside x2 bytes from arc offset x1 given back while the arc keeps its size (step 4; never the first frame, nor one the kernel holds a word in): a hole the process must not touch again until a grow over it → x0 the bytes given back, x1 the top. A masked arc's grow or shrink while another of its threads runs elsewhere holds the process off the cores first (`hold`, step 3): its mask or limit changes in every thread at once. Refused: x0 = ERR, x1 the reason (`ARC_WHY_*`), said on the console too.
+const SYS_ARC: u64 = 40;
+pub const ARC_GROW: u64 = 0;
+pub const ARC_SHRINK: u64 = 1;
+pub const ARC_SIZE: u64 = 2;
+pub const ARC_RELEASE: u64 = 3;
+/// Why SYS_ARC refused: past the arc's ceiling, too few free frames in the pool, (no longer: a masked arc with another of its threads running on another core, which is held now), under what the process was spawned with, over a word the kernel holds in it (a bell, the sensors' block, the installer's word), an unknown op.
+pub const ARC_WHY_CEILING: u64 = 1;
+pub const ARC_WHY_MEMORY: u64 = 2;
+/// Answered only before step 3 held the process instead (2026-11-11): kept so the number is never reused.
+#[allow(dead_code)]
+pub const ARC_WHY_BUSY: u64 = 3;
+pub const ARC_WHY_FLOOR: u64 = 4;
+pub const ARC_WHY_HELD: u64 = 5;
+pub const ARC_WHY_OP: u64 = 6;
 /// A record of SYS_CLAIM op 2: the kind, then a capsule address.
 pub const CLAIM_REC: usize = 33;
 /// Each link's control block: words 1 to CONTROLS - 1 (word 0 is the generation, `CONTROL_GEN`), all ones until set.
@@ -2115,7 +2202,8 @@ fn switch_to_next(f: &mut Frame) -> bool {
 /// The first queued thread this core may run, taken off the queue (a dead entry is dropped and the next tried).
 fn pick_runnable() -> Option<usize> {
     let kk = k();
-    let i = kk.runnable.iter().position(|&t| kk.threads.get(t).and_then(|x| x.as_ref()).is_none_or(|x| allowed_here(x.mask)))?;
+    // A thread of a held process waits in the queue until the hold ends (`hold_try`): its arc is moving or changing its mask.
+    let i = kk.runnable.iter().position(|&t| kk.threads.get(t).and_then(|x| x.as_ref()).is_none_or(|x| allowed_here(x.mask) && !kk.procs.get(x.proc).and_then(|p| p.as_ref()).is_some_and(|p| p.hold.is_some())))?;
     let t = kk.runnable.remove(i);
     runnable_sync();
     t
@@ -2198,19 +2286,23 @@ fn el0_trap(f: &mut Frame) -> u64 {
         SYS_EXIT => end(f, f.x[0]),
         SYS_THREAD_SPAWN => {
             let (entry, stack, arg) = (f.x[0], f.x[1], f.x[2]);
-            let m = p.arc.mask() as u64;
-            let mut frame = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };
-            frame.elr = p.arc.base as u64 + (entry & m);
-            frame.sp_el0 = p.arc.base as u64 + (stack & m & !15);
-            frame.x[28] = p.arc.base as u64;
-            frame.x[27] = p.arc.x27() as u64;
-            frame.x[26] = p.arc.base as u64;
-            frame.x[0] = arg;
-            let mask = t.mask;
-            let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask });
-            enqueue_back(nt);
-            tr(TR_RUN, nt, 0xFFFF);
-            f.x[0] = 0;
+            // WHY: the entry and the stack are the process's offsets, and a thread must start inside its own arc (a masked process's first instruction is checked code only there). Masked into the arc while every arc was a power of two; a native arc is any number of frames now, so they are checked: one outside is refused.
+            if entry >= p.arc.size as u64 || stack > p.arc.size as u64 {
+                f.x[0] = ERR;
+            } else {
+                let mut frame = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };
+                frame.elr = p.arc.base as u64 + entry;
+                frame.sp_el0 = p.arc.base as u64 + (stack & !15);
+                frame.x[28] = p.arc.base as u64;
+                frame.x[27] = p.arc.x27() as u64;
+                frame.x[26] = p.arc.base as u64;
+                frame.x[0] = arg;
+                let mask = t.mask;
+                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask });
+                enqueue_back(nt);
+                tr(TR_RUN, nt, 0xFFFF);
+                f.x[0] = 0;
+            }
             0
         }
         SYS_PIN => {
@@ -2279,39 +2371,47 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 }
             }
         }
-        SYS_WAIT => {
-            let addr = p.arc.base + ((f.x[0] as usize) & p.arc.mask() & !7);
-            let now = unsafe { core::ptr::read_volatile(addr as *const u64) };
-            let deadline = f.x[2];
-            let t_now: u64;
-            unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t_now) };
-            if now != f.x[1] {
-                f.x[0] = 1;
+        SYS_WAIT => match p.word(f.x[0]) {
+            // A word outside the arc: the syscall resolves or traps (`bad_buf`).
+            None => {
+                p.bad_buf(f.x[0], 8, false);
+                f.x[0] = ERR;
                 0
-            } else if deadline != 0 && deadline <= t_now {
-                f.x[0] = 2;
-                0
-            } else {
-                // A wait on the world (x3 bit 0): the watchdog's clock paused while the thread that pets is in it.
-                if f.x[3] & 1 != 0 && cur == p.pet_thread {
-                    p.paused_at = t_now;
-                }
-                t.state = State::Waiting(addr, deadline);
-                t.frame = *f;
-                t.frame.x[0] = 0;
-                tr(TR_SLEEP, cur, 0xFFFF);
-                if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
             }
-        }
+            Some(addr) => {
+                let now = unsafe { core::ptr::read_volatile(addr as *const u64) };
+                let deadline = f.x[2];
+                let t_now: u64;
+                unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t_now) };
+                if now != f.x[1] {
+                    f.x[0] = 1;
+                    0
+                } else if deadline != 0 && deadline <= t_now {
+                    f.x[0] = 2;
+                    0
+                } else {
+                    // A wait on the world (x3 bit 0): the watchdog's clock paused while the thread that pets is in it.
+                    if f.x[3] & 1 != 0 && cur == p.pet_thread {
+                        p.paused_at = t_now;
+                    }
+                    t.state = State::Waiting(addr, deadline);
+                    t.frame = *f;
+                    t.frame.x[0] = 0;
+                    tr(TR_SLEEP, cur, 0xFFFF);
+                    if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
+                }
+            }
+        },
         SYS_WAKE => {
-            let addr = p.arc.base + ((f.x[0] as usize) & p.arc.mask() & !7);
+            // A word outside the arc has no waiter (a wait there is refused): none woken.
+            let addr = p.word(f.x[0]);
             let mut n = 0u64;
             for (i, x) in kk.threads.iter_mut().enumerate() {
                 if n >= f.x[1] {
                     break;
                 }
                 if let Some(x) = x {
-                    if x.proc == pi && matches!(x.state, State::Waiting(a, _) if a == addr) {
+                    if x.proc == pi && matches!(x.state, State::Waiting(a, _) if Some(a) == addr) {
                         x.state = State::Runnable;
                         enqueue_back(i);
                         tr(TR_WAKE, i, 0xFFFF);
@@ -2322,6 +2422,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
             f.x[0] = n;
             0
         }
+        SYS_ARC => arc_call(f, cur, pi),
         SYS_BLOCK => {
             let token = p.read(f.x[0], 32);
             let window = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
@@ -2798,6 +2899,17 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     p.write(f.x[1], &v[..n]);
                     v.len() as u64
                 }
+                // The GPS driver: the zone in effect's principal place, its first aid when the person has no last fix (owner, 2026-11-11, "can't we figure that out from the orbital data anyway?": the chip needs to know roughly where it is to know which sky to look at). Into x1, 8 bytes: latitude, longitude, i32 arc-seconds.
+                7 if named(b"gps") => match crate::zone::place() {
+                    Some((lat, lon)) => {
+                        let mut b = [0u8; 8];
+                        b[..4].copy_from_slice(&lat.to_le_bytes());
+                        b[4..].copy_from_slice(&lon.to_le_bytes());
+                        p.write(f.x[1], &b);
+                        8
+                    }
+                    None => ERR,
+                },
                 _ => ERR,
             };
             0
@@ -2872,8 +2984,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 }
                 // The claims' doorbell for a Settings holder (the map's permissions and GPS pages): a word in its arc (x1) the kernel writes GPS_CLAIMS into now and at every change, waking whatever of it waits there (`claims_publish`, one of the bells, SYS_BELL). One word a process; a second registration moves it.
                 4 if matches!(held(f.x[2]), Some(Object::Settings)) => {
-                    bell_register(p, pi, BELL_CLAIMS, f.x[1], GPS_CLAIMS.load(core::sync::atomic::Ordering::Acquire));
-                    0
+                    bell_register(p, pi, BELL_CLAIMS, f.x[1], GPS_CLAIMS.load(core::sync::atomic::Ordering::Acquire))
                 }
                 _ => ERR,
             };
@@ -2883,8 +2994,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
             // WHY the bound: the source is the caller's, an index into the counts; the claims' bell is SYS_CLAIM op 4's, behind Settings.
             let source = f.x[0] as usize;
             f.x[0] = if source <= BELL_FACTS {
-                bell_register(p, pi, source, f.x[1], BELL_COUNT[source].load(core::sync::atomic::Ordering::Acquire));
-                0
+                bell_register(p, pi, source, f.x[1], BELL_COUNT[source].load(core::sync::atomic::Ordering::Acquire))
             } else {
                 ERR
             };
@@ -2910,8 +3020,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     list.len() as u64
                 }
                 1 if settings(f.x[2]) => {
-                    bell_register(p, pi, BELL_KISTS, f.x[1], BELL_COUNT[BELL_KISTS].load(core::sync::atomic::Ordering::Acquire));
-                    0
+                    bell_register(p, pi, BELL_KISTS, f.x[1], BELL_COUNT[BELL_KISTS].load(core::sync::atomic::Ordering::Acquire))
                 }
                 _ => ERR,
             };
@@ -2984,7 +3093,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let (op, off, len) = (f.x[1], f.x[2] as usize, f.x[3] as usize);
             f.x[0] = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                 // The block must lie whole in the caller's arc, unwrapped: the kernel reads it in place.
-                Some((Object::Sensors, r)) if r & RIGHT_SEND != 0 && op == 0 && len >= crate::sensorlink::BYTES && off.checked_add(len).is_some_and(|e| e <= p.arc.size) => {
+                Some((Object::Sensors, r)) if r & RIGHT_SEND != 0 && op == 0 && len >= crate::sensorlink::BYTES && off.checked_add(len).is_some_and(|e| e <= p.arc.size) && !p.in_hole(off, len) => {
                     crate::sensorlink::publish(p.epoch, p.arc.base + off);
                     0
                 }
@@ -3375,6 +3484,24 @@ fn el0_trap(f: &mut Frame) -> u64 {
         }
         None => r,
     };
+    // A hold on this thread's process (ARCS.md step 3): it does not go back to EL0 but parks runnable (picked again once the hold ends), and the last of the process's threads off a core does the held work (`hold_try`), here when that is this one.
+    let r = if kk.procs.get(pi).and_then(|x| x.as_ref()).is_some_and(|p| p.hold.is_some()) {
+        if r == 0 && cur_get() == Some(cur) {
+            if let Some(t) = th(cur) {
+                t.frame = *f;
+                t.state = State::Runnable;
+            }
+            enqueue_back(cur);
+            cur_set(None);
+            hold_try(pi);
+            if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
+        } else {
+            hold_try(pi);
+            r
+        }
+    } else {
+        r
+    };
     // Leaving: the number, the process the trap entered from (bits 8-15), the process it returns into or FF when it leaves EL0 (bits 16-23).
     crate::platform::crumb(0x70 + nr.min(SYS_LAST) | (cur as u64) << 8 | cur_get().map(|c| c as u64).unwrap_or(0xFF) << 16);
     deadlines_sync();
@@ -3486,13 +3613,351 @@ static BELL_COUNT: [core::sync::atomic::AtomicU64; BELLS] = [const { core::sync:
 /// The bells' words (SYS_BELL, SYS_CLAIM op 4, SYS_NOT_STARTED op 1): (the process's slot, its epoch, the word's address in its arc, the source). At most one a source a process. Under the kernel lock.
 static mut BELL_WORDS: Vec<(usize, u64, usize, usize)> = Vec::new();
 
+/// SYS_ARC (ARCS.md step 2): the caller's arc grown, shrunk or read; x0 and x1 as the call's doc says, the reason in x1 and on the console when refused. Under the kernel lock, in the caller's trap: `f` is its live frame. Returns the trap's result: a masked arc's grow or shrink with another of its threads at EL0 elsewhere holds the process (`hold`, step 3) and the caller waits for it (`State::Held`).
+fn arc_call(f: &mut Frame, cur: usize, pi: usize) -> u64 {
+    let kk = k();
+    let Some(p) = kk.procs.get(pi).and_then(|x| x.as_ref()) else { return 0 };
+    let (op, n) = (f.x[0], f.x[1]);
+    // A masked arc's mask (ring) or limit (exact) changes in every thread at once: one of its threads at EL0 on another core now would go on with the old one. It is held until they have all left; a native thread never reads x27 after its start, so a native arc changes under its running threads.
+    let elsewhere = kk.threads.iter().enumerate().any(|(i, x)| i != cur && matches!(x, Some(x) if x.proc == pi) && on_a_core(i));
+    if p.arc.guard != 0 && elsewhere && (op == ARC_GROW || op == ARC_SHRINK) {
+        if let Some(t) = th(cur) {
+            t.frame = *f;
+            t.state = State::Held;
+        }
+        cur_set(None);
+        hold(pi, Some((cur, op, n)), false);
+        return if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 };
+    }
+    // Frames given back inside the arc (step 4): no mask or limit changes, so no hold. x0 the bytes given back, x1 the arc's top.
+    if op == ARC_RELEASE {
+        let (off, len) = (f.x[1] as usize, f.x[2] as usize);
+        let p = kk.procs.get_mut(pi).and_then(|x| x.as_mut()).unwrap();
+        let top = if p.arc.limit != 0 { p.arc.limit } else { p.arc.size };
+        // WHY: the range is the process's; an end that wraps or passes the arc names nothing to give back past it.
+        let end = match off.checked_add(len) {
+            Some(e) if e <= top => e,
+            _ => top,
+        };
+        let r = arc_release(pi, p, off, end).map(|n| (n as u64, top as u64));
+        if let Ok((bytes, _)) = r {
+            let line = alloc::format!("{}: arc gave back A#{} MiB inside it ({} frames free)\n", core::str::from_utf8(&p.name).unwrap_or("?"), bytes >> 20, crate::frames::free());
+            kk.console.extend_from_slice(line.as_bytes());
+        }
+        match r {
+            Ok((bytes, top)) => {
+                f.x[0] = bytes;
+                f.x[1] = top;
+            }
+            Err(why) => arc_answer(pi, op, n, Err(why), f),
+        }
+        return 0;
+    }
+    let r = arc_op(pi, op, n);
+    // The caller's own x27 is live in `f` (`arc_op` set every thread off a core).
+    if let (Ok(_), Some(p)) = (&r, kk.procs.get(pi).and_then(|x| x.as_ref())) {
+        f.x[27] = p.arc.x27() as u64;
+    }
+    arc_answer(pi, op, n, r, f);
+    0
+}
+
+/// SYS_ARC's answer into a frame (the caller's live one, or a held caller's saved one), and its console line: each grow and shrink, each refusal with its reason.
+fn arc_answer(pi: usize, op: u64, n: u64, r: Result<(u64, u64), u64>, f: &mut Frame) {
+    let kk = k();
+    let Some(p) = kk.procs.get_mut(pi).and_then(|x| x.as_mut()) else { return };
+    let name = core::str::from_utf8(&p.name).unwrap_or("?");
+    match r {
+        Ok((top, was)) => {
+            if top != was {
+                if op == ARC_GROW { p.grows += 1 } else { p.shrinks += 1 }
+                let line = alloc::format!("{name}: arc {} G#{was:X} to G#{top:X} ({} frames free)\n", if op == ARC_GROW { "grew" } else { "shrank" }, crate::frames::free());
+                kk.console.extend_from_slice(line.as_bytes());
+            }
+            f.x[0] = top;
+            f.x[1] = was;
+        }
+        Err(why) => {
+            let reason = ["", "past its ceiling", "the pool has too few free frames", "another of its threads runs on another core", "under what it was spawned with", "a word the kernel holds lies past the new end", "no such op"][why as usize];
+            let line = alloc::format!("{name}: arc op {op} of G#{n:X} refused: {reason}\n");
+            kk.console.extend_from_slice(line.as_bytes());
+            f.x[0] = ERR;
+            f.x[1] = why;
+        }
+    }
+}
+
+/// SYS_ARC's work on process `pi`'s arc, every thread of it that is off a core given the new x27 (the caller's live frame is the caller's to set): Ok((the new top, the old)), or Err(the reason). Under the kernel lock.
+fn arc_op(pi: usize, op: u64, n: u64) -> Result<(u64, u64), u64> {
+    use crate::frames::FRAME;
+    let kk = k();
+    let Some(p) = kk.procs.get_mut(pi).and_then(|x| x.as_mut()) else { return Err(ARC_WHY_OP) };
+    let (masked, exact) = (p.arc.guard != 0, p.arc.limit != 0);
+    // The top a mode reaches: exact mode's limit, the arc's size otherwise.
+    let old = if exact { p.arc.limit } else { p.arc.size };
+    if op == ARC_SIZE {
+        return Ok((old as u64, p.arc.ceiling as u64));
+    }
+    if op != ARC_GROW && op != ARC_SHRINK {
+        return Err(ARC_WHY_OP);
+    }
+    let n = n as usize;
+    // WHY the bound: n is the process's; a grow past the 64 GiB no window reaches is refused before the sum could wrap.
+    if op == ARC_GROW && n > 1 << 36 {
+        return Err(ARC_WHY_CEILING);
+    }
+    let want = if op == ARC_GROW { old + n } else { n };
+    // The new top in the mode's shape: whole frames native, a power of two ring (its mask), 16 bytes exact (its stack pointer's alignment).
+    let top = if !masked { want.next_multiple_of(FRAME) } else if exact { want.next_multiple_of(16) } else { arc_shape(want, true) };
+    if (op == ARC_GROW && top <= old) || (op == ARC_SHRINK && top >= old) {
+        return Ok((old as u64, old as u64));
+    }
+    if top > p.arc.ceiling {
+        return Err(ARC_WHY_CEILING);
+    }
+    if top < p.floor {
+        return Err(ARC_WHY_FLOOR);
+    }
+    // Exact mode maps whole pages up to its limit (a grow inside what it maps already maps nothing); the others are their top.
+    let size = if !exact { top } else if op == ARC_GROW && top <= p.arc.size { p.arc.size } else { top.next_multiple_of(1 << 12) };
+    if size < p.arc.size && held_in(pi, p.epoch, p.arc.base + size, usize::MAX) {
+        return Err(ARC_WHY_HELD);
+    }
+    // A grow over frames given back (exact mode's limit coming back over a released range) maps them again first.
+    if op == ARC_GROW {
+        arc_refill(p, old, top)?;
+    }
+    arc_resize(&mut p.arc, size)?;
+    if exact {
+        p.arc.limit = top;
+    }
+    // A shrink takes the holes past the new end with it.
+    let mapped = p.arc.mapped;
+    p.holes.retain(|&(a, _)| a < mapped);
+    for h in p.holes.iter_mut() {
+        // WHY: interval arithmetic, the part of the hole the arc still holds.
+        if h.1 > mapped {
+            h.1 = mapped;
+        }
+    }
+    let x27 = p.arc.x27() as u64;
+    for (i, x) in kk.threads.iter_mut().enumerate() {
+        if let Some(x) = x {
+            if x.proc == pi && !on_a_core(i) {
+                x.frame.x[27] = x27;
+            }
+        }
+    }
+    Ok((top as u64, old as u64))
+}
+
+// ---------------------------------------------------------------- holds and moves (ARCS.md step 3)
+
+/// What a held process waits for, both at once when both were asked: SYS_ARC from a thread on a masked arc (the thread, the op, the bytes), and a move of its arc to other frames; and when the hold began (the pause, measured).
+#[derive(Clone, Copy)]
+struct Hold {
+    arc: Option<(usize, u64, u64)>,
+    mv: bool,
+    t0: u64,
+}
+
+/// Hold process `pi` off the cores for a SYS_ARC (`arc`) or a move (`mv`) (owner, 2026-11-11: "a move can happen at any moment"): none of its threads is picked to run until it is done, every core running one now is asked to park it (SGI 3, `.Lirq_hold`: as a slice's end), and the last of them to leave does it (`hold_try`), at once when none is on a core. A hold already pending takes the new ask too. Under the kernel lock.
+fn hold(pi: usize, arc: Option<(usize, u64, u64)>, mv: bool) {
+    let kk = k();
+    let Some(p) = kk.procs.get_mut(pi).and_then(|x| x.as_mut()) else { return };
+    let h = p.hold.get_or_insert(Hold { arc: None, mv: false, t0: crate::platform::cntpct() });
+    // A held SYS_ARC cannot be asked twice (its caller is held), so `arc` fills an empty place.
+    if arc.is_some() {
+        h.arc = arc;
+    }
+    h.mv |= mv;
+    let me = core();
+    for (c, t) in unsafe { *(&raw const CURRENT) }.iter().enumerate() {
+        if c != me && t.is_some_and(|t| kk.threads.get(t).and_then(|x| x.as_ref()).is_some_and(|x| x.proc == pi)) {
+            // SGI 3 to core c (ICC_SGI1R_EL1: INTID bits 24-27, Aff1 bits 16-23, target list bit 0 = Aff0 0), as `diag core` sends SGI 2.
+            unsafe { core::arch::asm!("dsb sy", "msr S3_0_C12_C11_5, {v}", "isb", v = in(reg) ((c as u64) << 16) | (3u64 << 24) | 1) };
+        }
+    }
+    hold_try(pi);
+}
+
+/// Process `pi`'s hold done, if none of its threads is on a core any more: the held SYS_ARC answered into its caller's saved frame (the caller runnable again), then the move made; then its threads may run. Called wherever a thread of it leaves a core: the end of its trap, a slice's end or the hold SGI (`ferros_el0_preempt`). Under the kernel lock.
+fn hold_try(pi: usize) {
+    let kk = k();
+    let Some(h) = kk.procs.get(pi).and_then(|x| x.as_ref()).and_then(|p| p.hold) else { return };
+    if kk.threads.iter().enumerate().any(|(i, x)| matches!(x, Some(x) if x.proc == pi) && on_a_core(i)) {
+        return;
+    }
+    if let Some((caller, op, n)) = h.arc {
+        let r = arc_op(pi, op, n);
+        if let Some(t) = th(caller) {
+            let mut f = t.frame;
+            arc_answer(pi, op, n, r, &mut f);
+            let t = th(caller).unwrap();
+            t.frame = f;
+            t.state = State::Runnable;
+            enqueue_back(caller);
+        }
+    }
+    if h.mv {
+        arc_move(pi, crate::platform::cntpct().wrapping_sub(h.t0));
+    }
+    if let Some(p) = kk.procs.get_mut(pi).and_then(|x| x.as_mut()) {
+        p.hold = None;
+    }
+    // Its threads queued meanwhile may run now: every core told.
+    kick(0xFFFF);
+}
+
+/// Process `pi`'s arc moved to other frames, while none of its threads is on a core: each frame copied by its own address (the kernel's: cachemap frame_block) to a frame `frames::take` gives (the first free in the map's order), the copy's level-3 table written from the old one with every page's permissions kept (W^X, the grants page, BTI's guarded pages, the guards), the window's slot pointed at it, every core's TLB told, the old frames wiped back into the pool. The window, so every address the process holds, x28, x27 and every kernel record of the arc (bells, waits, the installer's word, the sensors' block), stay as they were: nothing is rewritten. DMA regions are not in an arc and never move. `held` is how long the process waited off the cores for it; the copy and the whole pause go on the console. Under the kernel lock.
+fn arc_move(pi: usize, held: u64) {
+    use crate::frames::FRAME;
+    let kk = k();
+    let Some(p) = kk.procs.get_mut(pi).and_then(|x| x.as_mut()) else { return };
+    let name = core::str::from_utf8(&p.name).unwrap_or("?");
+    let slots = p.arc.mapped / FRAME;
+    if crate::frames::free() < slots {
+        let line = alloc::format!("{name}: arc not moved: the pool has A#{} free frames, the arc A#{slots}\n", crate::frames::free());
+        kk.console.extend_from_slice(line.as_bytes());
+        return;
+    }
+    let t0 = crate::platform::cntpct();
+    let mut old = Vec::with_capacity(slots);
+    for k in 0..slots {
+        let va = p.arc.base + k * FRAME;
+        let Some(t) = crate::cachemap::slot_table(va) else { continue };
+        let from = crate::frames::of_table(t);
+        // Counted free above, under the same lock: every take succeeds. Not zeroed first: the copy fills it whole.
+        let to = crate::frames::take_for_copy().unwrap();
+        unsafe { core::ptr::copy_nonoverlapping(crate::frames::pa(from) as *const u8, crate::frames::pa(to) as *mut u8, FRAME) };
+        crate::cachemap::retable(t, crate::frames::table(to), crate::frames::pa(to));
+        crate::cachemap::set_slot(va, crate::frames::table(to));
+        old.push(from);
+    }
+    let copied = crate::platform::cntpct().wrapping_sub(t0);
+    // Every core forgets the old frames before they are wiped; the code's new copies reach the instruction side.
+    crate::cachemap::unmapped(p.arc.base, p.arc.mapped);
+    crate::cachemap::sync_exec(p.arc.base, p.arc.size);
+    for f in old {
+        crate::frames::give(f);
+    }
+    p.moves += 1;
+    let f = crate::platform::cntfrq();
+    let total = crate::platform::cntpct().wrapping_sub(t0) + held;
+    let line = alloc::format!("{name}: arc moved, A#{} MiB copied in A#{} us, held A#{} us in all (waiting A#{} us for its threads to leave)\n", p.arc.mapped >> 20, copied * 1_000_000 / f, total * 1_000_000 / f, held * 1_000_000 / f);
+    crate::platform::pstore(line.as_bytes());
+    kk.console.extend_from_slice(line.as_bytes());
+}
+
+/// `diag move <name>`: the process's arc moved to other frames, now if none of its threads is on a core, else as the last of them leaves (its console line says when, how long the copy took and how long it was held). False when no process has that name.
+pub fn move_named(name: &[u8]) -> bool {
+    lock();
+    let kk = k();
+    let found = kk.procs.iter().position(|p| matches!(p, Some(p) if p.name == name && !p.dying));
+    if let Some(pi) = found {
+        hold(pi, None, true);
+    }
+    unlock();
+    found.is_some()
+}
+
+/// Whether the kernel holds an address in process `pi`'s arc inside [lo, hi) (a bell's word, the sensors' block): a shrink or a release there would leave it pointing at an unmapped slot, the kernel's own fault when it next writes or reads there.
+fn held_in(pi: usize, epoch: u64, lo: usize, hi: usize) -> bool {
+    let words = unsafe { &*(&raw const BELL_WORDS) };
+    let (se, sa) = crate::sensorlink::block();
+    words.iter().any(|w| w.0 == pi && w.1 == epoch && w.2 + 8 > lo && w.2 < hi) || (se == epoch && sa + crate::sensorlink::BYTES > lo && sa < hi)
+}
+
+/// Give back the frames wholly inside arc offsets [lo, hi) of process `pi` while its arc keeps its size (ARCS.md step 4): unmapped, every core's TLB told, wiped into the pool, the range a hole (`Process::holes`) until a grow over it fills it again. Never the first frame (the grants page, which the kernel writes into, and the code). Returns the bytes given back; Err(ARC_WHY_HELD) when the kernel holds a word there, Err(ARC_WHY_FLOOR) for the first frame. Under the kernel lock.
+fn arc_release(pi: usize, p: &mut Process, lo: usize, hi: usize) -> Result<usize, u64> {
+    use crate::frames::FRAME;
+    // Whole frames inside the range, and inside what is mapped.
+    let lo = lo.next_multiple_of(FRAME);
+    // WHY the bound: the range is the process's (or the kernel's own sum at spawn); past the frames mapped there is nothing to give back.
+    let hi = if hi / FRAME * FRAME > p.arc.mapped { p.arc.mapped } else { hi / FRAME * FRAME };
+    if hi <= lo {
+        return Ok(0);
+    }
+    if lo < FRAME {
+        return Err(ARC_WHY_FLOOR);
+    }
+    if held_in(pi, p.epoch, p.arc.base + lo, p.arc.base + hi) {
+        return Err(ARC_WHY_HELD);
+    }
+    let mut gone = Vec::with_capacity((hi - lo) / FRAME);
+    let mut at = lo;
+    while at < hi {
+        if let Some(t) = crate::cachemap::slot_table(p.arc.base + at) {
+            gone.push(crate::frames::of_table(t));
+            crate::cachemap::set_slot(p.arc.base + at, 0);
+        }
+        at += FRAME;
+    }
+    crate::cachemap::unmapped(p.arc.base + lo, hi - lo);
+    let n = gone.len() * FRAME;
+    for f in gone {
+        crate::frames::give(f);
+    }
+    p.holes.push((lo, hi));
+    Ok(n)
+}
+
+/// A grow over process `pi`'s holes inside arc offsets [lo, hi): fresh zeroed frames mapped again where they were given back, and the holes trimmed to what is left outside the range (exact mode's limit can grow back over a range it released). Err(ARC_WHY_MEMORY) with nothing changed when the pool has too few frames. Under the kernel lock.
+fn arc_refill(p: &mut Process, lo: usize, hi: usize) -> Result<(), u64> {
+    use crate::frames::FRAME;
+    let (lo, hi) = (lo / FRAME * FRAME, hi.next_multiple_of(FRAME));
+    let mut slots = Vec::new();
+    for &(a, b) in &p.holes {
+        // WHY the choices here and below: interval arithmetic, each hole's overlap with the range (and what is left of it outside), not a bound on anyone's value.
+        let mut at = if a > lo { a } else { lo };
+        while at < b && at < hi && at < p.arc.mapped {
+            // Only a slot still unmapped (a hole is, but a shrink and a grow since may have mapped it whole).
+            if crate::cachemap::slot_table(p.arc.base + at).is_none() {
+                slots.push(at);
+            }
+            at += FRAME;
+        }
+    }
+    if slots.is_empty() {
+        return Ok(());
+    }
+    if crate::frames::free() < slots.len() {
+        return Err(ARC_WHY_MEMORY);
+    }
+    for &at in &slots {
+        // Counted free above, under the same lock: every take succeeds.
+        let f = crate::frames::take().unwrap();
+        // The bytes of this frame that are the process's: all of it but past the arc's size in its last frame.
+        let usable = if p.arc.size - at < FRAME { p.arc.size - at } else { FRAME };
+        crate::cachemap::map_slot(p.arc.base + at, crate::frames::pa(f), crate::frames::table(f), usable);
+    }
+    crate::cachemap::mapped();
+    // What is left of each hole outside [lo, hi).
+    let mut kept = Vec::new();
+    for &(a, b) in &p.holes {
+        if a < lo {
+            kept.push((a, if b < lo { b } else { lo }));
+        }
+        if b > hi {
+            kept.push((if a > hi { a } else { hi }, b));
+        }
+    }
+    p.holes = kept;
+    Ok(())
+}
+
 /// A word in the caller's arc (`at`, 8-aligned and inside the arc as SYS_WAIT takes one) rung for `source` from now, `value` written there at once; one the process registered for the source before is dropped. Under the kernel lock.
-fn bell_register(p: &Process, pi: usize, source: usize, at: u64, value: u64) {
-    let addr = p.arc.base + ((at as usize) & p.arc.mask() & !7);
+fn bell_register(p: &Process, pi: usize, source: usize, at: u64, value: u64) -> u64 {
+    // A word outside the arc: the syscall resolves or traps (`bad_buf`).
+    let Some(addr) = p.word(at) else {
+        p.bad_buf(at, 8, true);
+        return ERR;
+    };
     let words = unsafe { &mut *(&raw mut BELL_WORDS) };
     words.retain(|w| !(w.0 == pi && w.3 == source));
     words.push((pi, p.epoch, addr, source));
     unsafe { core::ptr::write_volatile(addr as *mut u64, value) };
+    0
 }
 
 /// `source` changed: `value` written into every word registered for it and the threads of its process waiting there woken, so a page asleep on it, or a loop that reads it, draws again (owner, 2026-11-10: "Needs a doorbell"). A word whose process has ended (its slot empty, dying, or a successor's) is dropped, never written. Under the kernel lock.
@@ -3674,17 +4139,23 @@ fn fault_report(f: &Frame, base: u64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn ferros_el0_preempt(f: &mut Frame) -> u64 {
     lock();
+    let mut held = None;
     if let Some(cur) = cur_get() {
         if !drain_dying(cur) {
             if let Some(p) = th(cur) {
                 p.frame = *f;
                 p.state = State::Runnable;
+                held = Some(p.proc);
                 enqueue_back(cur);
             }
             tr(TR_PREEMPT, cur, 0);
         }
     }
     cur_set(None);
+    // A slice's end or the hold SGI (`.Lirq_hold`): if its process is held, this may have been the last of its threads on a core.
+    if let Some(pi) = held {
+        hold_try(pi);
+    }
     f.x[0] = PREEMPTED;
     unlock();
     1
@@ -3701,6 +4172,7 @@ fn arm_slice() {
     static PPI: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if !PPI.swap(true, core::sync::atomic::Ordering::Relaxed) {
         crate::killswitch::enable_ppi(26);
+        crate::killswitch::enable_sgi(3);
     }
     let ticks = crate::platform::cntfrq() / 1000 * SLICE_MS;
     unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", t = in(reg) ticks, c = out(reg) _) };
@@ -4172,7 +4644,7 @@ pub fn locate_code(capsule: &[u8], whole: usize) -> Result<(usize, usize, bool),
 }
 
 /// The arc a kist's capsule needs, from its first bytes (`head`: the header, the declaration and the start of its code) and its whole length: the capsule staged at the code offset, or the code with its zeroed tail (`image_tail`), whichever is more, the entry stack and the room a streamed spawn leaves (the bridge's 64 KiB).
-pub fn kist_need(head: &[u8], total: usize) -> Result<usize, &'static str> {
+pub fn kist_need(head: &[u8], total: usize) -> Result<(usize, usize), &'static str> {
     let (co, cl, _) = locate_code(head, total)?;
     if co + 56 > head.len() {
         return Err("kist: the code's header is past the first bytes read");
@@ -4181,7 +4653,9 @@ pub fn kist_need(head: &[u8], total: usize) -> Result<usize, &'static str> {
         return Err("kist: the image has no header (ferros_sys::entry!), so its .bss is unknown");
     }
     let tail = image_tail(&head[co..co + 56]);
-    Ok(CODE + total.max(cl + tail) + STACK + (1 << 16))
+    // And the most it may grow to (SYS_ARC): the code with its whole declared heap.
+    let ceiling = image_tail_ceiling(&head[co..co + 56]);
+    Ok((CODE + total.max(cl + tail) + STACK + (1 << 16), CODE + total.max(cl + ceiling) + STACK + (1 << 16)))
 }
 
 /// Whether a kist's capsule carries masked code, from its first bytes (its header's table names the section): its arc is then taken masked, with the guard above it (SANDBOX.md "Placement and guards").
@@ -4361,9 +4835,9 @@ fn install_request(p: &Process, pi: usize, req: &[u8]) -> u64 {
     if slot.is_some() {
         return refuse("another install is still under way");
     }
-    let off = u64::from_le_bytes(req[64..72].try_into().unwrap()) as usize;
-    // The word inside the caller's own arc, as `SYS_WAIT` finds it: masked into it and aligned.
-    let word = p.arc.base + (off & p.arc.mask() & !7);
+    let off = u64::from_le_bytes(req[64..72].try_into().unwrap());
+    // The word inside the caller's own arc, as `SYS_WAIT` finds it: aligned, and refused outside the arc.
+    let Some(word) = p.word(off) else { return refuse("the word is outside the caller's arc") };
     *slot = Some(KistInstall { capsule: req[..32].try_into().unwrap(), proc: pi, epoch: p.epoch, word });
     unsafe { core::arch::asm!("sev") };
     0
@@ -4378,7 +4852,8 @@ pub fn install_take() -> Option<KistInstall> {
 pub fn install_tell(i: &KistInstall, stage: u64, value: u64) {
     with_lock(|| {
         let kk = k();
-        if !kk.procs.get(i.proc).and_then(|q| q.as_ref()).is_some_and(|q| q.epoch == i.epoch && !q.dying) {
+        // WHY the arc's end and its holes: the installer may have shrunk its arc or given frames back (SYS_ARC) since it named the word; one there is not written (it would be an unmapped slot, the kernel's own fault).
+        if !kk.procs.get(i.proc).and_then(|q| q.as_ref()).is_some_and(|q| q.epoch == i.epoch && !q.dying && i.word + 8 <= q.arc.base + q.arc.size && !q.in_hole(i.word - q.arc.base, 8)) {
             return;
         }
         unsafe { core::ptr::write_volatile(i.word as *mut u64, stage << 56 | value & ((1 << 56) - 1)) };
@@ -4531,14 +5006,35 @@ fn has_image_header(code: &[u8]) -> bool {
 /// The page under the first thread's stack, kernel-only (owner, 2026-11-09): a stack run past its 64 KiB, or statics grown up into it, faults there with the process named, not into memory it does not own.
 const STACK_GUARD: usize = 1 << 12;
 
+/// The heap a growing image starts with (ARCS.md step 2): 4 MiB, two frames, enough for ferros_rt's 1 MiB main stack, the TLS blocks and the first allocations; everything past it is asked for (SYS_ARC) as the heap runs out, up to the heap the build declared.
+const HEAP_START: usize = 4 << 20;
+
+/// Whether the image's heap grows on demand: bit 0 of its header's word at offset 4 (ferros_rt's `_entry` sets it since 2026-11-11; the pad word was 0 before, and `ferros_sys::entry!` leaves it 0). Its declared heap (`__ferros_heap`) is then a ceiling, not a reservation.
+fn image_grows(code: &[u8]) -> bool {
+    has_image_header(code) && code[4] & 1 == 1
+}
+
+/// The zeroed tail the kernel maps after an image at spawn: .bss plus 16 and the heap, or, for a growing image, the heap it starts with (`HEAP_START`, or less when it declared less).
 fn image_tail(code: &[u8]) -> usize {
-    if code.len() >= 56 && &code[8..16] == b"ferrosRT" {
-        // Two words, summed here: .bss plus 16 (the linker script's own arithmetic) and the heap (a --defsym the script only forwards; summing them in the script took the default heap once, 2026-10-27).
-        let w = |at: usize| u64::from_le_bytes(code[at..at + 8].try_into().unwrap()) as usize;
-        (w(16) + w(48)).min(1 << 30)
-    } else {
-        0
+    if !has_image_header(code) {
+        return 0;
     }
+    let w = |at: usize| u64::from_le_bytes(code[at..at + 8].try_into().unwrap()) as usize;
+    // Two words, summed here: .bss plus 16 (the linker script's own arithmetic) and the heap (a --defsym the script only forwards; summing them in the script took the default heap once, 2026-10-27).
+    // WHY the choice: a growing image starts with HEAP_START, never with more than its build declared.
+    let heap = if image_grows(code) && w(48) > HEAP_START { HEAP_START } else { w(48) };
+    // WHY the min: both words are the image's, a gigabyte is past any arc the pool would give (an image declaring more is refused for room, not sized past the windows).
+    (w(16) + heap).min(1 << 30)
+}
+
+/// The zeroed tail at its most: .bss plus 16 and the whole declared heap (the arc's ceiling).
+fn image_tail_ceiling(code: &[u8]) -> usize {
+    if !has_image_header(code) {
+        return 0;
+    }
+    let w = |at: usize| u64::from_le_bytes(code[at..at + 8].try_into().unwrap()) as usize;
+    // WHY the min: as `image_tail`'s.
+    (w(16) + w(48)).min(1 << 30)
 }
 
 /// Make a process — arc, capability table (console first, then `objects` in order), grants page, code, input — and its first thread, in the tables, not yet running. Returns (the thread's index, the arc, the input's offset).
@@ -4553,11 +5049,13 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
     // `fixed` carries the mode word: bits 0-7 fixed mode's K (0: not fixed), bit 8 BTI (guarded code pages), bit 9 exact mode.
     let (fixed, bti, exact) = (fixed & 0xFF, fixed >> 8 & 1 == 1, fixed >> 9 & 1 == 1);
     let need = CODE + code.len() + tail + inline + STACK_GUARD + STACK;
-    // Fixed mode (SANDBOX.md, "Modes"): the arc is exactly the sealed 2^K, the size every `bfi` in the code assumes.
+    // The most it may grow to (SYS_ARC): its whole declared heap; the same as `need` for an image whose heap does not grow.
+    let ceiling = need - tail + image_tail_ceiling(code);
+    // Fixed mode (SANDBOX.md, "Modes"): the arc is exactly the sealed 2^K, the size every `bfi` in the code assumes, and never grows.
     if fixed != 0 && need > 1 << fixed {
         return Err("spawn: the image does not fit its fixed arc");
     }
-    let mut arc = arc_alloc(if fixed != 0 { 1 << fixed } else { need }, masked).ok_or("arc pool exhausted")?;
+    let mut arc = if fixed != 0 { arc_alloc(1 << fixed, masked) } else { arc_alloc_room(need, ceiling, masked) }.ok_or("arc pool exhausted")?;
     // Exact mode: the limit is what the image needs, rounded to the 16 bytes the stack pointer must keep; the arc around it is the power of two the pool hands out, its rest the room the limit can grow into.
     if exact {
         arc.limit = (need + 15) & !15;
@@ -4597,7 +5095,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
         c.token = [0; 32];
     }
     let domain = ihi.map(|i| blake3::derive_key(KIST_DOMAIN_CONTEXT, &i));
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, capsule: None };
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new() };
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.
     p.write_grants(TOKENS as u64, &(p.cspace.len() as u32).to_le_bytes());
@@ -4620,11 +5118,11 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     p.write(in_off as u64, input);
     crate::cachemap::sync_code(arc.base + CODE, code_len);
     // W^X (SANDBOX.md): a masked process may execute only its checked .text ([CODE, CODE+exec_len)), read-only, and may not write it; everything else is non-executable. A native dev process gets the whole arc RWX. The arc returns to writable data on free (arc_free → arc_reset).
-    crate::cachemap::set_arc_wx(arc.base, arc.block, arc.base + CODE, arc.base + CODE + exec_len, !masked, bti);
+    crate::cachemap::set_arc_wx(arc.base, arc.size, arc.base + CODE, arc.base + CODE + exec_len, !masked, bti);
     // The grants page read-only (the handle table, the tokens, the preferences, the ihi): nothing in it is the process's to write.
     crate::cachemap::grants_page(arc.base, false);
     // The stack's guard: the page under it (`floor`, checked above to lie past the image, its tail and the input).
-    crate::cachemap::guard_pages(floor, STACK_GUARD, true);
+    crate::cachemap::guard_pages(floor, STACK_GUARD);
     // The frame a queued start resumes into: exactly what `ferros_el0_enter` sets up (entry, stack at the arc's top, the arc's base and mask in x28/x27 for masked code, grants/input/length in x0-x2, EL0t with interrupts open).
     let mut frame = zero;
     frame.elr = (arc.base + CODE) as u64;
@@ -4648,6 +5146,11 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
             kk.procs.len() - 1
         }
     };
+    // A masked arc's power-of-two slack (ARCS.md step 4): the frames wholly between its image (code, zeroed tail, input) and its first stack's guard page hold nothing it was built with, and masked code reaches only what it was linked with (its statics, its static heaps, its stacks), so they go back to the pool at once (ahau: 20 MiB of its 128). Not exact mode's, whose limit may grow into it; a native arc is whole frames already.
+    if masked && arc.limit == 0 {
+        let p = kk.procs[pi].as_mut().unwrap();
+        let _ = arc_release(pi, p, in_off + input.len(), floor - arc.base);
+    }
     let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS });
     Ok((me, arc, in_off))
 }
@@ -4686,13 +5189,14 @@ fn handle_of(object: Object) -> (u64, u64) {
     (base as u64, (size - 1) as u64)
 }
 
-/// `diag arcs`: every process's arc, for reading the pools' state: name, base, size, block, under the lock.
+/// `diag arcs`: every process's arc, under the lock: name, base (its window's address), size, frames mapped, window, and the frame pool's state after them.
 pub fn arcs_report() -> alloc::string::String {
     lock();
     let mut s = alloc::string::String::new();
     for p in k().procs.iter().flatten() {
-        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{} base G#{:X} size G#{:X} block G#{:X} {}\n", core::str::from_utf8(&p.name).unwrap_or("?"), p.arc.base, p.arc.size, p.arc.block, if p.arc.guard != 0 { "masked" } else { "native" }));
+        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{} base G#{:X} size G#{:X} frames A#{} ceiling G#{:X} window G#{:X} {} grew A#{} shrank A#{} moved A#{} gave back A#{} MiB inside\n", core::str::from_utf8(&p.name).unwrap_or("?"), p.arc.base, p.arc.size, p.arc.mapped / crate::frames::FRAME, p.arc.ceiling, p.arc.window, if p.arc.guard != 0 { "masked" } else { "native" }, p.grows, p.shrinks, p.moves, p.holes.iter().map(|h| h.1 - h.0).sum::<usize>() >> 20));
     }
+    s.push_str(&crate::frames::pool_report());
     unlock();
     s
 }

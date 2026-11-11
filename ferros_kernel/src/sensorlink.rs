@@ -34,6 +34,11 @@ pub fn publish(epoch: u64, addr: usize) {
     unsafe { BLOCK = (epoch, addr) };
 }
 
+/// The published block: (the process's epoch, its address), (0, 0) when none (process.rs: a shrink must not drop it).
+pub fn block() -> (u64, usize) {
+    unsafe { BLOCK }
+}
+
 /// The process with `epoch` has ended: its block is gone with it.
 pub fn ended(epoch: u64) {
     unsafe {

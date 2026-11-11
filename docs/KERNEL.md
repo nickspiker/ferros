@@ -556,7 +556,7 @@ Vault objects additionally carry cryptographic access control:
 
 ## Module 3: Ring Memory
 
-**Built so far, and the way there (2026-11-11):** one arc per process, sized at spawn and physically contiguous, from two pools carved at boot (16 MB and 320 MB); no growth, no second arc, no rotation yet. [ARCS.md](ARCS.md) is the plan from that to this module: one frame pool of all free DRAM, arcs that grow in place or move, DMA pinned.
+**Built (2026-11-11, branch `arcs`, [ARCS.md](ARCS.md) steps 0-4; not yet run on a device):** one frame pool of the DRAM memblock proves free (husky: the two old pools and 9 GiB of the high bank; akita: the two old pools until its capture), in 2 MiB frames; every arc a window of virtual addresses whose frames lie anywhere in the pool; arcs grow and shrink on demand (SYS_ARC, ferros_rt's heap a ceiling), give frames back inside themselves, and move at any moment by copy and remap, held off the cores for it. Still one arc per process, no rotation yet (step 5), DMA pinned outside the arcs.
 
 ### Principle
 

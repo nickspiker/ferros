@@ -58,6 +58,62 @@ pub mod nr {
     pub const CLAIM: u64 = 37;
     pub const BELL: u64 = 38;
     pub const NOT_STARTED: u64 = 39;
+    pub const ARC: u64 = 40;
+}
+
+/// The caller's own arc, grown or shrunk on demand (kernel SYS_ARC, docs/ARCS.md step 2; owner, 2026-11-11: "why we cannot scale on demand, that was the whole point of ring memory"). No capability: a process reaches only its own arc, and only up to its ceiling (the heap its build declared, counted whole; fixed mode's size). A top is an arc offset: the arc's size, or exact mode's limit.
+pub mod arc {
+    use super::{nr, ERR};
+    use core::arch::asm;
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    /// Why the kernel refused (process.rs `ARC_WHY_*`): past the ceiling, too few free frames, (`WHY_BUSY`, no longer answered: a masked arc whose other threads run elsewhere is held until they leave, kernel step 3), under what the process was spawned with, over a word the kernel holds, no such op.
+    pub const WHY_CEILING: u64 = 1;
+    pub const WHY_MEMORY: u64 = 2;
+    pub const WHY_BUSY: u64 = 3;
+    pub const WHY_FLOOR: u64 = 4;
+    pub const WHY_HELD: u64 = 5;
+    pub const WHY_OP: u64 = 6;
+
+    /// The trap with both result registers: (x0, x1).
+    fn call(op: u64, n: u64) -> (u64, u64) {
+        let (a, b): (u64, u64);
+        compiler_fence(Ordering::SeqCst);
+        unsafe { asm!("svc #0", inlateout("x0") op => a, inlateout("x1") n => b, in("x8") nr::ARC, options(nostack)) };
+        compiler_fence(Ordering::SeqCst);
+        (a, b)
+    }
+
+    /// At least `bytes` more: Ok((the new top, the old top)); the bytes between are new, zeroed and the caller's. Err(the reason).
+    pub fn grow(bytes: usize) -> Result<(usize, usize), u64> {
+        match call(0, bytes as u64) {
+            (ERR, why) => Err(why),
+            (top, was) => Ok((top as usize, was as usize)),
+        }
+    }
+
+    /// Keep the first `bytes` of the arc (rounded up as its mode needs, never under what it was spawned with) and give the rest back: Ok((the new top, the old top)). Nothing past the new top may be touched again.
+    pub fn shrink(bytes: usize) -> Result<(usize, usize), u64> {
+        match call(1, bytes as u64) {
+            (ERR, why) => Err(why),
+            (top, was) => Ok((top as usize, was as usize)),
+        }
+    }
+
+    /// (the top now, the ceiling).
+    pub fn size() -> (usize, usize) {
+        let (a, b) = call(2, 0);
+        (a as usize, b as usize)
+    }
+
+    /// Give back the 2 MiB frames wholly inside `len` bytes from arc offset `off` while the arc keeps its size (kernel ARC_RELEASE, docs/ARCS.md step 4): what a process no longer needs in the middle of its arc (ahau's attest mark after attest). Those bytes must never be touched again (a fault ends the process) until a grow over them; no syscall buffer may lie there. Never the arc's first frame. Ok(the bytes given back), Err(the reason).
+    pub fn release(off: u64, len: usize) -> Result<usize, u64> {
+        let (a, b): (u64, u64);
+        compiler_fence(Ordering::SeqCst);
+        unsafe { asm!("svc #0", inlateout("x0") 3u64 => a, inlateout("x1") off => b, in("x2") len as u64, in("x8") nr::ARC, options(nostack)) };
+        compiler_fence(Ordering::SeqCst);
+        if a == ERR { Err(b) } else { Ok(a as usize) }
+    }
 }
 
 /// The clock's zone (kernel zone.rs, SYS_ZONE; docs/TIME.md; owner, 2026-11-10): the identity's choice and this device's own, each automatic (the zone found from the cellular network, then GPS) or by hand (an IANA id), and the switch that says which rules.
@@ -179,6 +235,12 @@ pub mod zone {
     /// A new position (the GPS driver only), in 2^-23 degrees: the kernel finds the zone again once it has moved some 30 km.
     pub fn position(lat: i32, lon: i32) -> bool {
         svc(nr::ZONE, 1, lat as i64 as u64, lon as i64 as u64, 0, 0) == 0
+    }
+
+    /// The zone in effect's principal place (the GPS driver only; the zones document's city, never anyone's place): latitude and longitude in arc-seconds. None with no zone in effect (a fixed offset), no zones document, or an older kernel.
+    pub fn place() -> Option<(i32, i32)> {
+        let mut b = [0u8; 8];
+        (svc(nr::ZONE, 7, off(b.as_mut_ptr()), 0, 0, 0) == 8).then(|| (i32::from_le_bytes([b[0], b[1], b[2], b[3]]), i32::from_le_bytes([b[4], b[5], b[6], b[7]])))
     }
 }
 /// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.

@@ -19,6 +19,34 @@ ferros runs on two Tensor G3 (zuma) phones. The kernel tells them apart at entry
 
 akita's repeater tune, from its MP board overlay (`repeater_tune1..5`): G#50 = G#0A, G#70 = G#5F, G#71 = G#2E, G#73 = G#80, G#79 = G#40 (ferros_hal `AKITA_REPEATER_TUNE`).
 
+## Memory map: where arcs come from (ARCS.md step 0, 2026-11-11)
+
+Every process's arc is made of 2 MiB frames from one pool (ARCS.md).
+The pool's ranges are listed here and in `ferros_kernel/src/frames.rs`, in the order frames are taken; `diag frames` reads them back from the running kernel.
+A range goes in only with memblock's proof that nothing else owns it, never a device tree node alone (HV.md "the reservation that never was"), or because ferros has run processes there since before this map.
+
+| Range | Size | husky | akita | Proof |
+|---|---|---|---|---|
+| G#8300_0000-G#8400_0000 | 16 MiB | yes | yes | The page pool since 2026-10-26; husky's memblock: plain memory |
+| G#A000_0000-G#B400_0000 | 320 MiB | yes | yes | The big pool since 2026-10-27; husky's memblock: plain memory (G#9740_0000-G#B61F_FFFF), sec_dram from G#B620_0000 |
+| G#8_8000_0000-G#9_BE40_0000 | 5092 MiB | yes | needs a capture | husky's memblock: the high bank's memory, no reservation below the camera and video pools |
+| G#A_0000_0000-G#A_FA00_0000 | 4000 MiB | yes | not DRAM | husky's memblock: memory past those pools; the frame under the hv left out (the hv copies Linux's device tree to G#A_FBF0_0000) |
+
+husky's proof is Android's own boot log, captured 2026-08-17 (`/mnt/Harbor/tmp/linux_full_dmesg.txt`, stock 6.1.124): memblock's memory ("Early memory node ranges": G#8000_0000-G#FFFF_FFFF and G#8_8000_0000-G#A_FFFF_FFFF) and every reservation it made from the device tree, each with the size memblock took ("OF: reserved mem").
+In the high bank they are one run, G#9_BE40_0000-G#9_FFFF_FFFF (vscaler, farawimg, famodel, faceauth, vstream, faprev, vframe, gcma_camera); the hv's 64 MiB at the top has read `reserved` in /proc/iomem since 2026-10-19.
+That log is from before the hv, and it lists the device tree's reservations, not the bootloader's `/memreserve/` entries, so a fresh capture under today's Android is the stronger proof; the same commands prove akita's high bank (G#8_8000_0000-G#A_0000_0000 less its carve-outs and the hv at G#9_0000_0000), which stays out of the pool until they are run:
+
+```bash
+adb root
+adb shell 'mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null; cat /sys/kernel/debug/memblock/memory' > memblock-memory.txt
+adb shell cat /sys/kernel/debug/memblock/reserved > memblock-reserved.txt
+adb shell cat /proc/iomem > iomem.txt
+adb shell dmesg | grep -E "OF: reserved mem|node   0: \[mem|Memory:" > dmesg-memory.txt
+```
+
+A range is free when it lies in `memory`, in no line of `reserved` and under `System RAM` in iomem with no `reserved` inside; the dmesg lines are the fallback when debugfs is closed (they hold only while the boot's first lines are still in the log).
+Not in the pool on either board: the kernel's window, the DMA regions (display, USB, gpu-mem, layers, the modem's windows), the surfaces and canvas, the low bank's firmware carve-outs, and the hv.
+
 
 ## Every new model, profiled on the unit before release (owner, 2026-11-08)
 

@@ -280,6 +280,13 @@ pub fn text(m: Msg) -> &'static str {
 pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
     match m {
         Say::SatPlace { up, round, cn0, used } => write!(o, "{up}\u{b0} up, {round}\u{b0} round, {cn0} dB-Hz{}", if used { ", in the fix" } else { "" }),
+        Say::ChipHeard { messages, kinds } => {
+            o.write_str("messages from the chip: ")?;
+            num(o, f, messages)?;
+            o.write_str(", kinds: ")?;
+            num(o, f, kinds)?;
+            o.write_str("; satellites come with its first fix")
+        }
         Say::DaylightTime(utc) => write!(o, "{utc}, daylight time"),
         Say::HeardMcc(mcc) => write!(o, "heard: MCC {mcc}"),
         Say::HeardMccIn { mcc, country } => write!(o, "heard: MCC {mcc}, {country}"),

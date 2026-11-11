@@ -60,7 +60,7 @@ What gpsd sends after the patch download, from the on-chip capture (lhd4): the c
 - **`d0 81` is needed:** cut, or with its position zeroed, the chip stays silent for 5-8 minutes (a zero position with whatever uncertainty the message carries points it at the wrong sky). Decoded so far: latitude u32 in 2⁻¹⁶ degrees at body offset 2 (10 bytes after `c0 c1`), longitude u32 in 2⁻¹⁵ degrees, west positive, at body offset 14; the rest (likely altitude and uncertainties) not yet.
 - **ferros's own position:** every session's last fix goes into the vault (`gps.last`), and the next session's `d0 81` carries it (gps.rs `patch_aiding`). **With no LTO, ferros's last fix and the RTC's time: first fix at 92 s, 393 fixes in 8 minutes, ±6 m** (`diag gps boot 480 sky`). What remains from the capture is Broadcom's firmware and gpsd's configuration, not data about the sky.
 - The replay with the LTO kept (`gps.replay`) slowed as its aiding aged: 11-18 s on 2026-10-25, 78 s and once nothing in 90 s the next morning.
-- Open: the first start with no position at all (the uncertainty field), and the three unidentified messages.
+- Open: the three unidentified messages; the uncertainty field is narrowed to one of two (below, "The position aiding, d0 81", 2026-11-11), and a start with no last fix now carries the zone's place ("A rough start from the zone").
 
 ## The driver is a process (2026-10-26)
 
@@ -98,9 +98,9 @@ The replay carries gpsd's aiding from the capture night: the time (ferros rewrit
   - The driver's scrub mode (input G#02) zeroes those positions through `patch_aiding`, so the checksum and CRC are redone, and writes the replays back in pieces. It never powers the chip.
   - Run once on 2026-11-04. Verified on the stored bytes: no latitude or longitude left in either replay.
   - The messages themselves stay: cut or zeroed, the chip waits 5-8 minutes alike, and zeroed keeps the record sequence the chip acknowledges.
-  - The driver now says "position from none" when there is no last fix of the person's.
+  - The driver says where the aid's place came from: "position from the last fix", "from the zone in effect, <zone>" (2026-11-11), or "from none".
 - **Not checked:** the replays' `92 81` and `8e 81` messages are not decoded, so I can't rule out that they also carry a place. The capture's own files stay on Harbor.
-- **A first fix with no last position starts cold** (about 5-8 minutes, measured with a zeroed position). Every fix after it, in that person's session, starts from their own last fix.
+- **A first fix with no last position starts cold** (about 5-8 minutes, measured with a zeroed position); since 2026-11-11 it starts from the zone in effect's principal place when there is one ("A rough start from the zone"). Every fix after it, in that person's session, starts from their own last fix.
 
 ## The satellites (2026-11-07)
 
@@ -145,7 +145,72 @@ So the driver keeps both: the plain change since the previous fix that had the s
 **In the driver** (`payloads/gps/src/sky.rs`): a fixed table of 64 signals, two of them swapped at each message, a signal found in the previous one by (system, band, PRN).
 Op 2 SATS on the `gps` endpoint serves the latest list (layout in main.rs's header: 25 bytes a signal), and the measure slots carry SATS_SEEN (a satellite on L1 and L5 counts once), SATS_USED and CN0 (the best, milli-dB-Hz) beside the state and the error estimate.
 `gpstest 02` prints the list.
-Satellites come only with fix messages: while the chip searches before its first fix there is no list.
+Satellites come only with fix messages: while the chip searches before its first fix there is no list (next section).
+
+## What the chip sends before a fix (2026-11-11)
+
+Owner, 2026-11-11, the Pro's GPS page showing zero satellites for hours: "can't we figure that out from the orbital data anyway? Like there's zero satellites showing on this page is the thing" ... "Please. I'd like to see what's actually going on in this thing."
+The driver's 32 s report then said about 2,900 frames per 32 s (90 a second), some 2 KB/s, 0 fix messages: some 22 bytes a frame on the wire, none decoded.
+
+**The capture has no message from the chip before an on-chip fix.**
+Every CRC-good frame of the captures, counted by its kind (flags, the second flags byte, the payload's first two bytes, the inner frame's class; the scratch decoder that found the satellites):
+
+| Capture, stretch | Kinds (count, bytes a frame deframed) |
+|---|---|
+| lhd4 (on-chip), the configuration's end (406.2 s) to the first fix (415.2 s) | acks `05` ×5 (6 B): nothing else |
+| lhd4, 32 s after the fix (450-482 s) | `1f80/0181` ×64 (108 B: the fix G#16 and the 14-byte id 08, one each a second), `1f80/0381` ×32 (35 B), `1f80/0481` ×32 (135 B) |
+| lhd3 (gpsd's own engine on the chip's measurements, 60-92 s) | `1f80/0280` ×5403 (114 B), `1f80/0481` ×814 (135 B), acks ×231, flags G#40 `1f80`/`1f81` `0280` ×258 (some 265 B) |
+
+- In on-chip mode the chip says nothing between the end of its configuration and its first fix (9 s in lhd4); after it, the four messages a second above, satellites only inside the fix.
+- `02 80` is the measurement stream gpsd's own engine reads (its log's `GlPe_MeIfImpl::ChipData`): 100 to 200 messages a second, 10 to 25 KB/s, a byte stream split across messages (a length u16 after the checksum, then the stream, G#E0 marking records of its own). It carries the per-satellite measurements gpsd turns into a position, so it is the place tracking state would be; it is not decoded, and it comes only in host mode, which the driver's replay is not.
+- The Pro's 90 frames a second at 22 bytes match neither: no layout for satellites before a fix can be decided from the capture.
+
+**So the driver counts what comes, by kind, on the device** (payloads/gps `tally`, op 4 FRAMES):
+- Every CRC-good frame is counted by its kind (key `[flags, second flags byte or 0, the payload's first two bytes, the inner class]`, 16 kinds at most, more counted as "past the table"), with its bytes and when the latest came; the latest two frames of each kind are kept (256 bytes each), never a fix message (its position is the person's).
+- The 32 s report has a second line: `gps: frames by kind, the last 32 s: 05/0000/0000 x5 (6 B) 00/1f80/0381 x32 (35 B) …` (flags, `.`second flags byte, `/` the RPC, `/` the class, the count since the last report, the mean bytes deframed). It says what the chip sends without a byte of what it says.
+- `gpstest 04` lists the kinds with their counts; `gpstest 04<k>` (`0402`: kind 2) prints kind k's latest two frames in hex, 32 bytes a line. Those bytes are the chip's: a kind other than the fix could echo the aiding's place, so a capture of them stays on Harbor.
+- Reading a kind: `80.01/0101/0000` is the chip's sync packet (it restarted its transport and waits for the host's); `05/0000/0000` an ack; `00/1f80/0280` the measurement stream (the chip working as gpsd's measurement engine); `00/1f80/0381` and `0481` its per-second companions of the fix.
+- FIX's reply carries the frame count and the kinds after the fix (bytes 33-37), and WATCH's change count moves every 64 frames, so the map's GPS page says, before a fix, how many messages of how many kinds have come (ferros_lang `Say::ChipHeard`), moving as the chip talks. The console's GPS circle says "searching" (the driver's STATE 1) instead of "no satellites"; it has no rings to draw until the first fix brings satellites.
+
+The owner's other thought, the sky from the orbits: the satellites above a place at a time follow from an almanac or the LTO file and a rough position, with no word from the chip. ferros has no almanac of its own yet (the replay's LTO is the capture's, past its 7 days); a predicted sky would say which satellites should be up, not which the chip hears, so it would sit beside this, not replace it.
+
+## The position aiding, d0 81 (2026-11-11)
+
+Decided from the two sessions that sent it: lhd4 (three identical messages at 406.1-407.0 s) and lhd2 (three at 1478.7-1479.7 s), 82 bytes from the class, byte offsets from the class, little-endian (no place written here: the position words are masked in what was read):
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 2 | class `d0 81` |
+| 2 | 2 | length, 80 (the bytes after it) |
+| 4 | 2 | checksum (`87 81`'s rule) |
+| 6 | 2 | 0 in both |
+| 8 | 4 + 4 | latitude, 32.32 fixed: the high word in 2⁻¹⁶ degrees (what the driver writes), then its fraction word |
+| 16 | 4 | 6 in both |
+| 20 | 4 + 4 | longitude, 32.32, the high word in 2⁻¹⁵ degrees west positive, then its fraction |
+| 28 | 4 | 7 in both |
+| 32 | 4 + 4 | a 32.32 value, a few tens (of metres, if metres) in each, the two sessions eight apart |
+| 40 | 4 | 8 in lhd4, 7 in lhd2 |
+| 44 | 4 + 4 | a 32.32 value, a few tens in each, the two thirteen apart |
+| 52 | 4 | 13 in lhd4, 10 in lhd2 |
+| 56 | 2 + 2 | GPS week, then 0 |
+| 60 | 4 | time of week, ms |
+| 64 | 4 | 0 |
+| 68 | 2 | 436 in lhd4, 455 in lhd2 |
+| 70 | 2 | 98 in both |
+| 72 | 8 | 0 |
+| 80 | 2 | the RPC trailer counter |
+
+- The fraction words are why the driver writing the high words alone works: they are under 2⁻¹⁶ degrees, two metres at most.
+- **The uncertainty field is not decided.** The two values at +32 and +44 are an altitude and an uncertainty by their size and their pattern (each a 32.32 followed by a small integer, like the position's), but which is which the capture cannot say: gpsd logs its aiding position with `HorzUnc` and `VertUnc` (`GlPeAsstPosMgr: New position`) only in host mode, which never sends `d0 81`, and the two sessions that did have no plain log of it (lhd4's gpsd writes it in its encoded form, `~^~{…}`; lhd2 has no log). The small integers (6, 7, 7 or 8, 10 or 13) and the u16 at +68 are not known either.
+- The candidate for the horizontal uncertainty is +44 (its high word whole metres): a few minutes after a session of fixes, tens of metres is what gpsd's propagation gives. The driver writes it only when asked (input bit 2, `Aid::unc`): the test is one start with the zone's place and the candidate set against one without, from the same place. A first fix much sooner with it set says +44 is the uncertainty; a chip that never fixes says it is the altitude.
+
+## A rough start from the zone (2026-11-11)
+
+With no last fix of the person's (`gps.last`), the `d0 81` aiding carries the zone in effect's principal place instead of the zeroed one: the zones document's city for that zone (zone1970.tab's, TIME.md "The zones document"), from the kernel (SYS_ZONE op 7, the GPS driver only, ferros_sys `zone::place`, arc-seconds to 2⁻²³ degrees in the driver).
+- Never a precise place: a city anyone can read in tzdata, which says only which part of the Earth the device is in. The console line says which source was used and the zone's name, never the numbers: `gps: position from the zone in effect, <zone id> (its principal place)`. No zone in effect (a fixed offset), or no zones document: the zeroed place, as before (`position from none`).
+- A zone's principal place can be 2000 km from the person (the Pacific zone from Los Angeles reaches Seattle at 1550 km), about 18° of the Earth's arc: the chip still looks at the right half of the sky, where the zeroed place (the Gulf of Guinea) is the wrong one for most of the world.
+- The uncertainty stays the replay's (above) unless the driver is asked to write the candidate: `ZONE_UNC_M` = 1 << 21 m (some 2100 km), covering nearly every zone from its principal place.
+- The zone follows the device's choice: found by the cellular network (NITZ and the MCC's country, before any fix) or by an earlier position, or set by hand.
 
 ## Next
 

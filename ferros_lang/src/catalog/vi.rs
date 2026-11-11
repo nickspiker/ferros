@@ -280,6 +280,13 @@ pub fn text(m: Msg) -> &'static str {
 pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
     match m {
         Say::SatPlace { up, round, cn0, used } => write!(o, "cao {up}°, hướng {round}°, {cn0} dB-Hz{}", if used { ", dùng để định vị" } else { "" }),
+        Say::ChipHeard { messages, kinds } => {
+            o.write_str("tin nhắn từ chip: ")?;
+            num(o, f, messages)?;
+            o.write_str(", loại: ")?;
+            num(o, f, kinds)?;
+            o.write_str("; vệ tinh hiện ra khi có vị trí đầu tiên")
+        }
         Say::DaylightTime(utc) => write!(o, "{utc}, giờ mùa hè"),
         Say::HeardMcc(mcc) => write!(o, "nghe thấy: MCC {mcc}"),
         Say::HeardMccIn { mcc, country } => write!(o, "nghe thấy: MCC {mcc}, {country}"),

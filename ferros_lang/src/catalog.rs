@@ -433,6 +433,8 @@ pub enum Say<'a> {
     // ---- a link's page ----
     /// Where a satellite stands and how strong it is: its elevation and azimuth (degrees) and carrier to noise (dB-Hz), each written already in the person's base; `used` whether the fix uses it.
     SatPlace { up: &'a str, round: &'a str, cn0: &'a str, used: bool },
+    /// The GPS page before a fix (2026-11-11): what the chip has sent so far, its frames and how many kinds of them (payloads/gps op 4), and that satellites come with its first fix.
+    ChipHeard { messages: u64, kinds: u64 },
     // ---- the clock page ----
     /// The legal offset (written already: "UTC + 1 h") while daylight time is in it.
     DaylightTime(&'a str),

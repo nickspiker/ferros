@@ -292,6 +292,13 @@ fn form(n: u64, one: &'static str, few: &'static str, many: &'static str) -> &'s
 pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
     match m {
         Say::SatPlace { up, round, cn0, used } => write!(o, "висота {up}°, азимут {round}°, {cn0} dB-Hz{}", if used { ", використовується" } else { "" }),
+        Say::ChipHeard { messages, kinds } => {
+            o.write_str("повідомлень від чипа: ")?;
+            num(o, f, messages)?;
+            o.write_str(", видів: ")?;
+            num(o, f, kinds)?;
+            o.write_str("; супутники з’являться з першим місцезнаходженням")
+        }
         Say::DaylightTime(utc) => write!(o, "{utc}, літній час"),
         Say::HeardMcc(mcc) => write!(o, "почуто: MCC {mcc}"),
         Say::HeardMccIn { mcc, country } => write!(o, "почуто: MCC {mcc}, {country}"),

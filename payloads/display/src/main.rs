@@ -8093,6 +8093,8 @@ fn radio_lines(what: Corner, ms: &[u64], state: Option<i64>, lines: &mut [Txt; 9
     // Not linked yet: WiFi not joined (its STATE 1), cellular not registered (no technology yet; its STATE says only whether the data call is up).
     let searching = match what {
         Corner::Wifi => state == Some(1),
+        // GPS receiving with no fix yet (its STATE 1): searching, rather than "no satellites" (owner, 2026-11-11: "there's zero satellites showing on this page is the thing"). The chip names no satellite before its first fix (GPS.md "What the chip sends before a fix"), so there are no rings to draw until then.
+        Corner::Gps => state == Some(1),
         Corner::Cellular => !ms.iter().filter_map(|&w| ferros_sys::measure_of(w)).any(|x| x.0 == m::TECH),
         _ => false,
     };

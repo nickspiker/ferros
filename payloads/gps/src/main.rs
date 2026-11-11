@@ -2,16 +2,17 @@
 //!
 //! The kernel keeps only what a process cannot do: the chip's three rails (ACPM), the SPI port's clocks and USI mode, and the lines' pin modes, behind the `gps` power capability (`SYS_POWER`, kernel gps.rs `power`). Everything else is here, through MMIO grants: the port's registers, and the data bits of the four lines (HOST_REQ gpa5-3, MCU_REQ gpp4-3, MCU_RESP gph3-2, nSTANDBY gph3-3).
 //!
-//! The session: the vault's `gps.replay` (or `gps.replay.sky`, the same without the LTO orbits) is gpsd's on-chip session cut from a capture — the patch download, the second firmware stage, the configuration, the aiding — played record by record, each reliable packet waiting for the chip's ack. Before it goes out, the aiding is ferros's own: the time from the RTC, the position from the last fix (`gps.last`). Then the chip navigates alone and sends a fix a second; the latest is kept, and written back to `gps.last` whenever it moves (every change hits disk; nothing is written on the way out).
+//! The session: the vault's `gps.replay` (or `gps.replay.sky`, the same without the LTO orbits) is gpsd's on-chip session cut from a capture (the patch download, the second firmware stage, the configuration, the aiding), played record by record, each reliable packet waiting for the chip's ack. Before it goes out, the aiding is ferros's own: the time from the RTC, the position from the last fix (`gps.last`), else the zone in effect's principal place (2026-11-11), else none. Then the chip navigates alone and sends a fix a second; the latest is kept, and written back to `gps.last` whenever it moves (every change hits disk; nothing is written on the way out).
 //!
 //! Spawn: ferros-bridge spawn gps.bin <flags> --name gps --serve gps --hw usi3-spi --hw gpio-far-alive --hw gpio-gpp0 --hw gpio-hsi2 --store gps --power gps --irq gps-host-req
-//! Grant slots, in that order: 0 console, 1 the `gps` endpoint (serve), 2 the SPI port, 3 gpio-far-alive, 4 gpio-gpp0 (PERIC0), 5 gpio-hsi2, 6 the vault scope `gps.`, 7 the power switch, 8 HOST_REQ's interrupt. Input byte 0: bit 0 = the sky replay.
+//! Grant slots, in that order: 0 console, 1 the `gps` endpoint (serve), 2 the SPI port, 3 gpio-far-alive, 4 gpio-gpp0 (PERIC0), 5 gpio-hsi2, 6 the vault scope `gps.`, 7 the power switch, 8 HOST_REQ's interrupt. Input byte 0: bit 0 = the sky replay. Bit 1: scrub the replays of the capture's place and end. Bit 2: with the zone's place as the aid, also write the zone's width into the uncertainty candidate (`Aid`), the on-device test of that field.
 //!
 //! The `gps` endpoint, first byte the op:
-//! - `0` FIX: `valid u8`, `fixes u32`, `age ms u32` (since the latest), `lat i32`, `lon i32` (2⁻²³ degrees), `alt i32` (m), `err u32` (m), `speed i32`, `track i32` (1/64 m/s, 1/64 °) — little-endian, 33 bytes.
+//! - `0` FIX: `valid u8`, `fixes u32`, `age ms u32` (since the latest), `lat i32`, `lon i32` (2⁻²³ degrees), `alt i32` (m), `err u32` (m), `speed i32`, `track i32` (1/64 m/s, 1/64 °), little-endian, 33 bytes; then (2026-11-11) `frames u32` (every frame from the chip so far, acks and all) and `kinds u8` (the kinds among them, op 4), 38 in all. A caller asking 33 gets the fix alone.
 //! - `1` STOP: the process exits after replying; the kernel powers the chip down as it ends (the last fix is kept whenever it changes).
 //! - `2` SATS: the signals the chip tracked at the latest fix message (sky.rs, GPS.md "The satellites"): `n u8`, `msgs u32` (fix messages decoded so far), `age ms u32` (since the latest), then `n` records of 25 bytes — `system u8` (the chip's code: 0 GPS, 8 GLONASS), `band u8` (0 L1 or GLONASS G1, 2 L5), `prn u8` (GLONASS: the orbital slot), `flags u8` (bit 0 used in the fix, bit 1 the chip's unnamed flag), `el i8`, `az u16` (degrees), `d_el i16`, `d_az i16` (degrees since the previous fix that had the signal, the azimuth the short way round north), `cn0 u16` (quarter dB-Hz), `d_ms u32` (the chip's ms between the two fixes, 0 for a signal new in this one), `el_rate i32`, `az_rate i32` (millidegrees a second between the first and the latest one-degree step seen, `i32::MIN` until there are two) — little-endian, at most 64 records.
-//! - `3` WATCH (2026-11-10): `count u32`, the change count the caller last saw (its fixes plus its fix messages) → `count u32` now, held until it differs: the doorbell the map's GPS page waits on, thru the kernel (SYS_CLAIM op 3), instead of asking every second.
+//! - `3` WATCH (2026-11-10): `count u32`, the change count the caller last saw (its fixes plus its fix messages, and since 2026-11-11 its frames in steps of 64) → `count u32` now, held until it differs: the doorbell the map's GPS page waits on, thru the kernel (SYS_CLAIM op 3), instead of asking every second.
+//! - `4` FRAMES (2026-11-11, GPS.md "What the chip sends before a fix"): every frame from the chip is counted by its kind (`tally`: flags, flags' second byte, the payload's first two bytes, the inner frame's class), 16 kinds at most, the latest two of each kept (256 bytes each; never a fix message, which carries the person's position). `[4]` → `kinds u8`, `frames u32`, `crc_bad u32`, then per kind `key [u8; 6]`, `count u32`, `bytes u32`, `age ms u32` (since its latest). `[4, k]` → kind k's `key [u8; 6]`, `n u8`, then n frames, the latest first, each `len u16` (its whole length, deframed: sequence, length, flags, the flag bytes, the payload, the CRC), `kept u16`, the first `kept` bytes. Not thru the kernel's op 3: a caller holding the `gps` endpoint (payloads/gpstest `04`).
 //!
 //! The loop sleeps in one wait for HOST_REQ's interrupt and a call to `gps` (the kernel wakes the endpoint's poller out of it), no deadline.
 //!
@@ -32,6 +33,10 @@ const S_PERIC0: u64 = 4;
 const S_HSI2: u64 = 5;
 const S_STORE: u64 = 6;
 const S_POWER: u64 = 7;
+/// FIX's reply: the fix (33 bytes), then the chip's frames so far and their kinds (5).
+const FIX_LEN: usize = 33 + 5;
+/// FRAMES' record for a kind: key 6, count, bytes, age.
+const KIND_REC: usize = 6 + 4 + 4 + 4;
 /// HOST_REQ's interrupt (kernel `gps-host-req`): the loop sleeps on it instead of polling the line, which missed the chip's requests (2026-10-26: a fix, then nothing).
 const S_IRQ: u64 = 8;
 /// The far-alive bank's external-interrupt registers (pinctrl-exynos.h; gpa5 is the bank's only one): control (a nibble per pin, 1 = high level), mask, pending.
@@ -246,6 +251,85 @@ fn parse_fix(m: &[u8]) -> Option<Fix> {
     (x.lat.unsigned_abs() <= 90 << 23 && x.lon.unsigned_abs() <= 180 << 23 && x.err < 1023 && (x.lat, x.lon) != (0, 0)).then_some(x)
 }
 
+/// The kinds of frame the chip sends, counted, the latest of each kept (GPS.md "What the chip sends before a fix"; owner, 2026-11-11: "I'd like to see what's actually going on in this thing"). The Pro sat for hours at some 90 frames a second, 0 fix messages, and the 2026-10-25 capture has no message at all from the chip in on-chip mode before its first fix, so what those frames are is read here, on the device.
+/// A kind is `[flags, flags' second byte (0 without one), the payload's first two bytes (the RPC: 1f 80 from the chip), the inner frame's class (0 0 without a c0 c1 frame)]`: acks, sync packets and each message class apart.
+const KINDS: usize = 1 << 4;
+/// Frames kept per kind, the latest; and the bytes kept of each (a frame is at most 2048 after deframing; the first 256 hold an RPC header and a message's start).
+const KEEP: usize = 1 << 1;
+const KEEP_LEN: usize = 1 << 8;
+
+#[derive(Clone, Copy)]
+struct Kind {
+    key: [u8; 6],
+    count: u32,
+    /// Bytes of deframed frame; the count and the bytes at the last 32 s report.
+    bytes: u32,
+    said: u32,
+    bytes_said: u32,
+    /// The counter at the latest.
+    at: u64,
+    kept: [[u8; KEEP_LEN]; KEEP],
+    len: [u16; KEEP],
+    /// Where the next one goes in `kept`, and a bit for each slot written.
+    next: u8,
+    filled: u8,
+}
+
+const KIND0: Kind = Kind { key: [0; 6], count: 0, bytes: 0, said: 0, bytes_said: 0, at: 0, kept: [[0; KEEP_LEN]; KEEP], len: [0; KEEP], next: 0, filled: 0 };
+
+/// In .bss, off the stack: 16 kinds of 548 bytes (the session's buffers already take some 30 KiB of the 64 KiB stack). Only the main thread touches it.
+static mut KIND_T: [Kind; KINDS] = [KIND0; KINDS];
+/// Kinds in use, and frames whose kind did not fit (a 17th kind: counted, not kept).
+static mut KIND_N: usize = 0;
+static mut KIND_OVER: u32 = 0;
+
+fn kinds() -> &'static mut [Kind; KINDS] {
+    unsafe { &mut *(&raw mut KIND_T) }
+}
+fn kinds_n() -> usize {
+    unsafe { KIND_N }
+}
+
+/// One frame (`f`, deframed, CRC good, its payload from `k`) into its kind. A fix message (`fix`) is counted and never kept: its position is the person's, served on FIX alone.
+fn tally(f: &[u8], k: usize, fix: bool) {
+    // f is at least 4 bytes (`frame`), so its fourth is there when the flags say a second byte follows.
+    let hi = if f[2] & 0x80 != 0 { f[3] } else { 0 };
+    let p = &f[k..f.len() - 1];
+    // WHY the defaults: an ack or a sync packet has no payload, or one shorter than an RPC header; those bytes read as 0 in the kind.
+    let (p0, p1) = (p.first().copied().unwrap_or(0), p.get(1).copied().unwrap_or(0));
+    // WHY the get: the chip's payload can end right after its `c0 c1`; a class cut short reads as none.
+    let cls = p.iter().take(8).zip(p.iter().skip(1)).position(|(&a, &b)| a == 0xC0 && b == 0xC1).and_then(|c| Some((*p.get(c + 2)?, *p.get(c + 3)?))).unwrap_or((0, 0));
+    let key = [f[2], hi, p0, p1, cls.0, cls.1];
+    let t = kinds();
+    let n = kinds_n();
+    let i = match t[..n].iter().position(|x| x.key == key) {
+        Some(i) => i,
+        // WHY the bound: the kinds are the chip's to choose and the table is fixed; a kind past it is counted in KIND_OVER instead of written past the table.
+        None if n < KINDS => {
+            t[n].key = key;
+            unsafe { KIND_N = n + 1 };
+            n
+        }
+        None => {
+            unsafe { KIND_OVER += 1 };
+            return;
+        }
+    };
+    let x = &mut t[i];
+    x.count = x.count.wrapping_add(1);
+    x.bytes = x.bytes.wrapping_add(f.len() as u32);
+    x.at = now();
+    if !fix {
+        let s = x.next as usize;
+        // WHY the min: a frame is up to 2048 bytes deframed; the first KEEP_LEN are kept, its whole length beside them.
+        let m = f.len().min(KEEP_LEN);
+        x.kept[s][..m].copy_from_slice(&f[..m]);
+        x.len[s] = f.len() as u16;
+        x.next = ((s + 1) % KEEP) as u8;
+        x.filled |= 1 << s;
+    }
+}
+
 /// The chip's side, deframed: acks by sequence, fixes and the satellites that came with them, CRC failures.
 struct Deframer {
     acked: [bool; 256],
@@ -298,12 +382,14 @@ impl Deframer {
         let k = payload_start(f);
         // An ack: flags bits 0 and 2, the acknowledged host sequence first, no payload.
         let flags = f[2] as u16;
+        let mut m = [0u8; 512];
+        let fixm = fix_msg(&f[k..f.len() - 1], &mut m);
+        tally(f, k, fixm.is_some());
         if flags & 0x05 == 0x05 && k == f.len() - 1 {
             self.acked[f[3] as usize] = true;
             return;
         }
-        let mut m = [0u8; 512];
-        let Some(n) = fix_msg(&f[k..f.len() - 1], &mut m) else {
+        let Some(n) = fixm else {
             return;
         };
         self.sky.take(&m[..n]);
@@ -337,8 +423,19 @@ fn gps_ms_now() -> Option<u64> {
     Some((t / f * 1000 + t % f * 1000 / f).checked_sub(315_964_800_000)? + 18_000)
 }
 
+/// What the `d0 81` aiding says of the place: a position (2^-23 degrees; None leaves the replay's), and the uncertainty candidate in whole metres (None leaves the replay's).
+/// The candidate (GPS.md "The position aiding, d0 81"): the 32.32 word pair at +46/+50 read a few tens (of metres, if metres) in the only two captured sessions, plausible for gpsd's horizontal uncertainty minutes after a fix, but no log names it, and it could as well be the altitude; so it is written only when the driver is asked to try it (input bit 2).
+#[derive(Clone, Copy)]
+struct Aid {
+    pos: Option<(i32, i32)>,
+    unc: Option<u32>,
+}
+
+/// A zone's whole width as the aid's uncertainty, in metres (input bit 2): 1 << 21, some 2100 km, covers nearly every zone from its principal place (the Pacific zone from Los Angeles to Seattle is 1550 km); a few are wider (China's single zone, Russia's Moscow zone), where the chip still starts from the right half of the sky.
+const ZONE_UNC_M: u32 = 1 << 21;
+
 /// gpsd's aiding in a record rewritten with ferros's own (kernel gps.rs `patch_aiding`): `87 81` time (week at +8, time of week at +10 from the inner `c0 c1`), `d0 81` position and time (latitude u32 2⁻¹⁶ ° at +10, longitude u32 2⁻¹⁵ ° west-positive at +22, week +58, time of week +62). The inner checksum moves by the bytes' difference; a value whose bytes would need the C0 escape moves on by one unit. Returns the new record's length in `out`, or None when nothing changed.
-fn patch_aiding(rec: &[u8], pos: Option<(i32, i32)>, out: &mut [u8]) -> Option<usize> {
+fn patch_aiding(rec: &[u8], aid: Aid, out: &mut [u8]) -> Option<usize> {
     let now = gps_ms_now()?;
     let (mut i, mut o, mut changed) = (0usize, 0usize, false);
     let mut put = |out: &mut [u8], o: &mut usize, b: u8| {
@@ -367,7 +464,7 @@ fn patch_aiding(rec: &[u8], pos: Option<(i32, i32)>, out: &mut [u8]) -> Option<u
             n += 1;
         }
         i = e + 2;
-        if patch_frame(&mut f[..n], now, pos) {
+        if patch_frame(&mut f[..n], now, aid) {
             changed = true;
         }
         put(out, &mut o, 0xB0);
@@ -386,7 +483,7 @@ fn patch_aiding(rec: &[u8], pos: Option<(i32, i32)>, out: &mut [u8]) -> Option<u
     changed.then_some(o)
 }
 
-fn patch_frame(f: &mut [u8], now: u64, pos: Option<(i32, i32)>) -> bool {
+fn patch_frame(f: &mut [u8], now: u64, aid: Aid) -> bool {
     if f.len() < 4 {
         return false;
     }
@@ -398,7 +495,7 @@ fn patch_frame(f: &mut [u8], now: u64, pos: Option<(i32, i32)>) -> bool {
     };
     let (week_at, tow_at, place) = match p.get(c + 2..c + 4) {
         Some([0x87, 0x81]) => (c + 8, c + 10, None),
-        Some([0xD0, 0x81]) => (c + 58, c + 62, pos.map(|(lat, lon)| (c + 10, (lat >> 7) as u32, c + 22, (-(lon >> 8)) as u32))),
+        Some([0xD0, 0x81]) => (c + 58, c + 62, aid.pos.map(|(lat, lon)| (c + 10, (lat >> 7) as u32, c + 22, (-(lon >> 8)) as u32))),
         _ => return false,
     };
     if p.len() < tow_at + 4 || p[c + 2..tow_at + 4].contains(&0xC0) {
@@ -409,7 +506,7 @@ fn patch_frame(f: &mut [u8], now: u64, pos: Option<(i32, i32)>) -> bool {
     let ck = u16::from_le_bytes([p[c + 6], p[c + 7]]);
     for d in 0..16u32 {
         // (offset, the new bytes, how many)
-        let mut at = [(0usize, [0u8; 4], 0usize); 4];
+        let mut at = [(0usize, [0u8; 4], 0usize); 6];
         at[0] = (week_at, [week as u8, (week >> 8) as u8, 0, 0], 2);
         at[1] = (tow_at, (tow + d).to_le_bytes(), 4);
         let mut na = 2;
@@ -417,6 +514,12 @@ fn patch_frame(f: &mut [u8], now: u64, pos: Option<(i32, i32)>) -> bool {
             at[2] = (lat_at, (lat + d).to_le_bytes(), 4);
             at[3] = (lon_at, (lon + d).to_le_bytes(), 4);
             na = 4;
+            // The uncertainty candidate (`Aid::unc`): whole metres in the word at +46, its fraction word at +50 zeroed.
+            if let Some(u) = aid.unc {
+                at[4] = (c + 46, (u + d).to_le_bytes(), 4);
+                at[5] = (c + 50, [0; 4], 4);
+                na = 6;
+            }
         }
         let at = &at[..na];
         let old: u32 = at.iter().map(|(o, _, n)| p[*o..*o + n].iter().map(|&b| b as u32).sum::<u32>()).sum();
@@ -480,6 +583,47 @@ macro_rules! say {
     }};
 }
 
+/// The 32 s report's second line: each kind of frame the chip sent since the last, as `flags[.second]/rpc/class x<count> (<mean bytes>)`, the kind's key in hex (`tally`), so a console capture says what the chip is sending without a byte of what it says.
+fn say_kinds(grants: u64) {
+    let mut l = Line { b: [0; 160], n: 0 };
+    let _ = write!(l, "gps: frames by kind, the last 32 s:");
+    let t = kinds();
+    let mut any = false;
+    for x in t[..kinds_n()].iter_mut() {
+        let new = x.count.wrapping_sub(x.said);
+        let new_bytes = x.bytes.wrapping_sub(x.bytes_said);
+        (x.said, x.bytes_said) = (x.count, x.bytes);
+        if new == 0 {
+            continue;
+        }
+        any = true;
+        let k = x.key;
+        let mut w = Line { b: [0; 160], n: 0 };
+        let _ = write!(w, " {:02x}", k[0]);
+        if k[1] != 0 {
+            let _ = write!(w, ".{:02x}", k[1]);
+        }
+        let _ = write!(w, "/{:02x}{:02x}/{:02x}{:02x} x{} ({} B)", k[2], k[3], k[4], k[5], new, new_bytes / new);
+        // A line full: out, and the rest on the next. Every append below leaves room for this newline (l.n + w.n + 1 at most the line), so l.b[l.n] is inside it.
+        if l.n + w.n + 1 > l.b.len() {
+            l.b[l.n] = b'\n';
+            console(grants, &l.b[..l.n + 1]);
+            l.n = 0;
+            let _ = write!(l, "gps: frames by kind, more:");
+        }
+        let _ = l.write_str(core::str::from_utf8(&w.b[..w.n]).unwrap_or(""));
+    }
+    let over = unsafe { KIND_OVER };
+    if over > 0 {
+        let _ = write!(l, " (and {} of kinds past the table)", over);
+    }
+    if !any {
+        let _ = write!(l, " none");
+    }
+    let _ = l.write_str("\n");
+    console(grants, &l.b[..l.n]);
+}
+
 fn keep_last(grants: u64, d: &Deframer) {
     if d.fixes == 0 {
         return;
@@ -517,7 +661,7 @@ fn scrub(grants: u64, store: u64, key: &[u8]) {
             got += k;
         }
         at += 4 + len;
-        let body: &[u8] = match patch_aiding(&rec[..len], Some((0, 0)), &mut patched) {
+        let body: &[u8] = match patch_aiding(&rec[..len], Aid { pos: Some((0, 0)), unc: None }, &mut patched) {
             Some(n) => &patched[..n],
             None => &rec[..len],
         };
@@ -547,7 +691,13 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         ferros_sys::exit(0);
     }
     let mut last = [0u8; 8];
-    let pos = (ferros_sys::store_get(store, b"last", &mut last) == Some(8)).then(|| (i32::from_le_bytes([last[0], last[1], last[2], last[3]]), i32::from_le_bytes([last[4], last[5], last[6], last[7]])));
+    let last = (ferros_sys::store_get(store, b"last", &mut last) == Some(8)).then(|| (i32::from_le_bytes([last[0], last[1], last[2], last[3]]), i32::from_le_bytes([last[4], last[5], last[6], last[7]])));
+    // The aid's place (owner, 2026-11-11: "can't we figure that out from the orbital data anyway?"; the chip picks its sky from where it is told it is, and a zeroed place points it at the wrong one for 5-8 minutes): the person's own last fix; else the zone in effect's principal place (kernel zone.rs, the zones document's city: never anyone's place, only which part of the Earth); else none, the replay's zeroed one.
+    // Arc-seconds to 2^-23 degrees: × 2^23 / 3600, in i64 (a latitude of 90° is 2^28.3 in 2^-23 degrees, the product fits).
+    let zone = if last.is_none() { ferros_sys::zone::place().map(|(la, lo)| ((la as i64 * (1 << 23) / 3600) as i32, (lo as i64 * (1 << 23) / 3600) as i32)) } else { None };
+    // Input bit 2: also write the zone's width into the uncertainty candidate (`Aid`), the on-device test of which field it is.
+    let try_unc = input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } & 4 == 4;
+    let aid = Aid { pos: last.or(zone), unc: (zone.is_some() && try_unc).then_some(ZONE_UNC_M) };
     let mut head = [0u8; 4];
     let Some(total) = store_get_at(store, key, 0, &mut head) else {
         say!(grants, "gps: no {} in the vault\n", if sky { "gps.replay.sky" } else { "gps.replay" });
@@ -563,7 +713,16 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     chip.set(NSTANDBY, true);
     sleep_ms(250);
     let woke = chip.wake(100);
-    say!(grants, "gps: powered, the chip {} its wake; replaying {} B ({}), position from {}\n", if woke { "answered" } else { "did not answer" }, total, if sky { "without the LTO" } else { "with the capture's LTO" }, if pos.is_some() { "the last fix" } else { "none (the replay's is zeroed: no place is kept in the device's half)" });
+    say!(grants, "gps: powered, the chip {} its wake; replaying {} B ({})\n", if woke { "answered" } else { "did not answer" }, total, if sky { "without the LTO" } else { "with the capture's LTO" });
+    // Which place the aid carries, by its source and the zone's name, never its numbers (the zone's city is public, but the line says where the person is to a zone).
+    if last.is_some() {
+        say!(grants, "gps: position from the last fix\n");
+    } else if zone.is_some() {
+        let id = ferros_sys::zone::state().map(|s| s.effective).filter(|z| !z.is_none());
+        say!(grants, "gps: position from the zone in effect, {} (its principal place){}\n", id.as_ref().map_or("?", |z| z.as_str()), if aid.unc.is_some() { ", the zone's width written as the uncertainty candidate (input bit 2)" } else { "" });
+    } else {
+        say!(grants, "gps: position from none: no last fix and no zone in effect (the replay's is zeroed: no place is kept in the device's half)\n");
+    }
 
     let t_all = now();
     let f = freq();
@@ -586,7 +745,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         }
         at += 4 + len;
         recs += 1;
-        let out: &[u8] = match patch_aiding(&rec[..len], pos, &mut patched) {
+        let out: &[u8] = match patch_aiding(&rec[..len], aid, &mut patched) {
             Some(n) => &patched[..n],
             None => &rec[..len],
         };
@@ -671,6 +830,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         if now().wrapping_sub(said) > 32 * f {
             let (seen, used, cn0) = d.sky.counts();
             say!(grants, "gps: the last 32 s: HOST_REQ {} times, MCU_RESP silent {}, {} bytes read; {} frames, {} fixes in all; {} satellites tracked, {} in the fix, best C/N0 {} dB-Hz ({} fix messages laid out otherwise)\n", asks, silent, bytes, d.frames, d.fixes, seen, used, cn0 >> 2, d.sky.bad);
+            say_kinds(grants);
             (asks, silent, bytes, said) = (0, 0, 0, now());
         }
         if d.fixes > shown {
@@ -740,13 +900,16 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         if n != NOTHING && n != ferros_sys::ERR && n > 0 {
             match msg[0] {
                 0 => {
-                    let mut r = [0u8; 33];
+                    let mut r = [0u8; FIX_LEN];
                     r[0] = (d.fixes > 0) as u8;
                     r[1..5].copy_from_slice(&d.fixes.to_le_bytes());
                     r[5..9].copy_from_slice(&((now().wrapping_sub(d.fix_at) * 1000 / f) as u32).to_le_bytes());
                     for (k, v) in [d.fix.lat, d.fix.lon, d.fix.alt, d.fix.err as i32, d.fix.speed, d.fix.track].iter().enumerate() {
                         r[9 + 4 * k..13 + 4 * k].copy_from_slice(&v.to_le_bytes());
                     }
+                    // What the chip is doing, for a page with no fix yet (2026-11-11): its frames so far and their kinds. A caller asking 33 bytes gets the fix alone (a reply is cut to what the caller asked).
+                    r[33..37].copy_from_slice(&d.frames.to_le_bytes());
+                    r[37] = kinds_n() as u8;
                     reply(&token, &r);
                 }
                 // STOP: one shot (owner, 2026-11-08): the reply, then gone; the kernel powers the chip down as this process ends (it switched it on), and the last fix was kept when it came.
@@ -784,6 +947,48 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                         }
                     }
                 }
+                // FRAMES (2026-11-11, GPS.md "What the chip sends before a fix"): `[4]` the kinds, `[4, k]` kind k's latest frames (main.rs's header has both layouts).
+                4 => {
+                    let t = kinds();
+                    let nk = kinds_n();
+                    if n < 2 {
+                        let mut r = [0u8; 9 + KINDS * KIND_REC];
+                        r[0] = nk as u8;
+                        r[1..5].copy_from_slice(&d.frames.to_le_bytes());
+                        r[5..9].copy_from_slice(&d.crc_bad.to_le_bytes());
+                        for (i, x) in t[..nk].iter().enumerate() {
+                            let o = 9 + KIND_REC * i;
+                            r[o..o + 6].copy_from_slice(&x.key);
+                            r[o + 6..o + 10].copy_from_slice(&x.count.to_le_bytes());
+                            r[o + 10..o + 14].copy_from_slice(&x.bytes.to_le_bytes());
+                            r[o + 14..o + 18].copy_from_slice(&((now().wrapping_sub(x.at) * 1000 / f) as u32).to_le_bytes());
+                        }
+                        reply(&token, &r[..9 + KIND_REC * nk]);
+                    } else if (msg[1] as usize) < nk {
+                        // WHY the bound: the index is the caller's; past the kinds in use it names none, and is answered empty below.
+                        let x = &t[msg[1] as usize];
+                        let mut r = [0u8; 7 + KEEP * (4 + KEEP_LEN)];
+                        r[..6].copy_from_slice(&x.key);
+                        let mut o = 7;
+                        // The latest first: the slot before `next`, then round.
+                        for j in 1..=KEEP {
+                            let s = (x.next as usize + KEEP - j) % KEEP;
+                            if x.filled & 1 << s == 0 {
+                                continue;
+                            }
+                            // WHY the min: `len` is the frame's whole length, up to 2048; KEEP_LEN of it were kept (`tally`).
+                            let kept = (x.len[s] as usize).min(KEEP_LEN);
+                            r[o..o + 2].copy_from_slice(&x.len[s].to_le_bytes());
+                            r[o + 2..o + 4].copy_from_slice(&(kept as u16).to_le_bytes());
+                            r[o + 4..o + 4 + kept].copy_from_slice(&x.kept[s][..kept]);
+                            o += 4 + kept;
+                            r[6] += 1;
+                        }
+                        reply(&token, &r[..o]);
+                    } else {
+                        reply(&token, &[]);
+                    }
+                }
                 _ => {
                     reply(&token, &[]);
                 }
@@ -802,9 +1007,9 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     }
 }
 
-/// The driver's change count for WATCH: its fixes and the fix messages decoded or refused, summed (each only grows, so any change moves the sum; it wraps, and a watcher compares for difference only).
+/// The driver's change count for WATCH: its fixes and the fix messages decoded or refused, and its frames in steps of 64 (2026-11-11: a page with no fix yet shows what the chip sends, so it moves while the chip talks; at the Pro's 90 frames a second before a fix, under twice a second), summed (each only grows, so any change moves the sum; it wraps, and a watcher compares for difference only).
 fn changes(d: &Deframer) -> u32 {
-    d.fixes.wrapping_add(d.sky.msgs).wrapping_add(d.sky.bad)
+    d.fixes.wrapping_add(d.sky.msgs).wrapping_add(d.sky.bad).wrapping_add(d.frames >> 6)
 }
 
 #[panic_handler]

@@ -455,9 +455,9 @@ fn kist_call(job: &KistJob) -> bool {
 
 /// The kist's arc, sized from its first bytes (`kist_need`), masked when its code is (the guard above it), with those bytes copied in. Ok(false): the pool has no room yet while a process ends (a relaunch's own predecessor still leaving a core, its arc coming back at its next trap), so the job waits for that, not for a time; Err when there is no room and nothing is coming back.
 fn kist_arc(job: &mut KistJob) -> Result<bool, KistFault> {
-    let need = crate::process::kist_need(&job.head, job.total).map_err(|e| (why::READ, e))?;
+    let (need, ceiling) = crate::process::kist_need(&job.head, job.total).map_err(|e| (why::READ, e))?;
     let masked = crate::process::kist_masked(&job.head, job.total);
-    let Some(arc) = crate::process::with_lock(|| crate::process::arc_alloc(need, masked)) else {
+    let Some(arc) = crate::process::with_lock(|| crate::process::arc_alloc_room(need, ceiling, masked)) else {
         return if crate::process::any_dying() { Ok(false) } else { Err((why::ROOM, "the arc pool has no room for the kist")) };
     };
     if crate::process::CODE + job.total > arc.size {
@@ -1672,7 +1672,7 @@ pub(crate) fn tcpc_usb_switch(log: bool) {
 pub fn run(mut b: Boot) -> ! {
     // Report now too: if the USB bring-up wedges, the watchdog's reset still shows the vault result (handoff) and the crumb shows how far USB got.
     report(&b, 0xA0);
-    let generation = if b.x0 & 1 == 1 { b.x0 >> 1 } else { 0 };
+    let generation = if b.x0 & 1 == 1 { (b.x0 & !crate::board::RELOAD_AKITA) >> 1 } else { 0 };
     let mut store = b.store.take();
     unsafe {
         SPAWN_STORE = &raw mut store;
@@ -2977,6 +2977,22 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                // `diag move <name>…`: each named process's arc moved to other frames (ARCS.md step 3), at once or as its last thread leaves a core; the console line says how long the copy and the whole pause took (`diag console`).
+                if let Some(names) = cmd.params.strip_prefix(b"move ") {
+                    for name in names.split(|&b| b == b' ').filter(|n| !n.is_empty()) {
+                        resp.extend_from_slice(name);
+                        resp.extend_from_slice(if crate::process::move_named(name) { b": held for its move (the console says when it moved)\n" } else { b": no such process\n" });
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                // `diag frames`: the frame pool's memory map on this board (frames.rs, BOARDS.md "Memory map").
+                if cmd.params == b"frames" {
+                    resp.extend_from_slice(crate::frames::map_report().as_bytes());
+                    resp.extend_from_slice(crate::process::with_lock(crate::frames::pool_report).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if let Some(names) = cmd.params.strip_prefix(b"restart ") {
                     restart(&mut store, names, &mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
@@ -3946,7 +3962,8 @@ pub fn run(mut b: Boot) -> ! {
                         platform::handover_stamp(b'R');
                         crate::cachemap::off_for_handover();
                         let len = (reload_size + 7) & !7;
-                        let next_x0 = ((generation + 1) << 1) | 1;
+                        // Bit 63 carries the board (board::RELOAD_AKITA): a reloaded kernel has no device tree to read it from, and husky's frame map names DRAM akita does not have (frames.rs).
+                        let next_x0 = ((generation + 1) << 1) | 1 | if crate::board::akita() { crate::board::RELOAD_AKITA } else { 0 };
                         core::arch::asm!(
                             "dsb sy",
                             "ic iallu",
