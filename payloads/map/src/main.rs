@@ -4685,6 +4685,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut last_app_check = 0u64;
     // The bells as the pages were last drawn with them (BELLS), the radios' switches (preference 15) likewise, and the second the clock or About last drew (`tick`).
     let mut bells_seen = [0u64; ferros_sys::BELL_FACTS as usize + 1];
+    // The display's frame count as last read on a facts bell: a smaller one means the display restarted.
+    let mut display_frames_seen = 0u32;
     let mut radios_seen = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF);
     let mut tick_seen = 0i64;
     // The identity space's generation last read (payloads/fgtw op 17, through `fgtw_poller`).
@@ -4863,6 +4865,19 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             if v != bells_seen[s] {
                 bells_seen[s] = v;
                 page_dirty |= open && if s < LINKS.len() { page == "connections" || page == LINKS[s] } else { matches!(page, "about" | "battery") };
+                // The facts' bell also rings when the process table changes: a display that restarted (its frame count, op 5 bytes 4-7, starts again from zero) has no scene, and showed black until a touch woke the map (owner, 2026-11-11: "it showed black until I touched it"); so the scene goes again at once.
+                if s == ferros_sys::BELL_FACTS as usize {
+                    let mut q = [0u8; 16];
+                    if call(map.display, &[5], &mut q) >= 8 {
+                        let frames = u32::from_le_bytes([q[4], q[5], q[6], q[7]]);
+                        if frames < display_frames_seen {
+                            console(grants, b"map: the display started again; its scene sent anew\n");
+                            map.send_scene();
+                            map.draw();
+                        }
+                        display_frames_seen = frames;
+                    }
+                }
             }
         }
         // A radio switched on or off (preference 15, from here or from a status circle): its switch and state on Connections and on its page.
