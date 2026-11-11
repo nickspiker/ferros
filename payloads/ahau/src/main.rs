@@ -341,6 +341,8 @@ const S_BACK: u64 = 10;
 /// Slots 11 and 12: the GPU service (`use gpu`) and the layer arena, where the mark's quick pass is drawn on the GPU (GPU.md, "The resident service, and the attest mark's path"). Without them (after a jump, no GPU service) the quick pass stays on the CPU.
 const S_GPU: u64 = 11;
 const S_LAYERS: u64 = 12;
+/// The layer arena through its handle (SANDBOX.md "Handles"), the only way a masked ahau reaches it: every access `base + (offset & mask)`, offsets into the arena. Until 2026-11-11 ahau reached the arena by pointer (`dma` + offset), and the masked build masks a pointer into ahau's own arc (`and x26, xN, x27`): the kernel's words, the stage and both outputs landed 96 MiB and more into its 128 MiB arc, over its own statics (the first ARCS boot's fault at arc offset G#760_0000 was GPU_OUT2's start there), while the GPU service ran whatever the real arena held at GPU_CODE and the screen showed ahau's own arc as the GPU's output. After a scrubbed reset that is zeros: CS_FAULT G#C51 (INSTR_INVALID_ENC) on the Pro, 2026-11-11, and the GPU's queue wedged.
+type Arena = ferros_sys::Handle<S_LAYERS>;
 /// The WiFi driver's `wlan` (init's slot 44): the network page's SCAN, JOIN and STATUS (pcie1, ATTEST-UI.md "WiFi connect").
 const S_WLAN: u64 = 13;
 /// The GPU's view of the layer arena (payloads/gpu ARENA_VA), and ahau's own region of it: the kernel's words at 32 MiB, the quick pass's pixels from 33 MiB (gputest uses the first 32).
@@ -349,12 +351,12 @@ const GPU_CODE: usize = 32 << 20;
 const GPU_OUT: usize = 33 << 20;
 /// The GPU's second output, past the fine passes' sums (43 MiB, 16 bytes a staged pixel): the passes alternate between the two, so the screen shows one while the GPU writes the other.
 const GPU_OUT2: usize = 54 << 20;
-/// Where the mark is drawn from (`draw_mark`): 0 for FRESH (the CPU drew it), else the address of the GPU output the last pass landed in. No copy out of the arena (1.3 ms a pass for a 900 px mark, 2026-11-05), and no frame showing a pass half written.
+/// Where the mark is drawn from (`draw_mark`): 0 for FRESH (the CPU drew it), else the arena offset of the GPU output the last pass landed in (GPU_OUT or GPU_OUT2, never 0). No copy out of the arena (1.3 ms a pass for a 900 px mark, 2026-11-05), and no frame showing a pass half written.
 static MARK_FRONT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// The GPU output the next pass writes: whichever of the two the screen is not showing.
-fn gpu_back(arena: usize) -> usize {
-    if MARK_FRONT.load(core::sync::atomic::Ordering::Acquire) == arena + GPU_OUT { GPU_OUT2 } else { GPU_OUT }
+fn gpu_back() -> usize {
+    if MARK_FRONT.load(core::sync::atomic::Ordering::Acquire) == GPU_OUT { GPU_OUT2 } else { GPU_OUT }
 }
 
 /// The surfaces through their handles (SANDBOX.md, "Handles"): the screen draws into `BUF`, a frame-sized buffer in its own arc, and presents the rows it touched through the shown surface's handle, so the same binary runs native and masked and the drawing code (honeycomb, tapuwae, the pills) never holds a pointer outside the arc. Text is the display's to draw, into a surface it knows: the rows go to that surface first (`put_rows`), the text is asked for, and the rows come back (`get_rows`) before anything more is drawn over them. The second surface stays a display surface for that, reached through its own handle. Labels the keyboard draws are recorded while it draws and asked for after the rows are presented, or the presenting would wipe them.
@@ -459,7 +461,7 @@ static GPU_JOB_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// The last quick pass's other parts (µs): the handle's parameters, the stage (0 when it was already made), the whole GPU call.
 static GPU_PARTS_US: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
 
-fn gpu_run(grants: u64, arena: usize, addrs: &[u64], groups: u32, make: impl FnOnce() -> tapuwae::gpu::Compiled) -> bool {
+fn gpu_run(grants: u64, what: &str, addrs: &[u64], groups: u32, make: impl FnOnce() -> tapuwae::gpu::Compiled) -> bool {
     if HEAP_USE.compare_exchange(0, 1, core::sync::atomic::Ordering::Acquire, core::sync::atomic::Ordering::Relaxed).is_err() {
         return false;
     }
@@ -467,11 +469,10 @@ fn gpu_run(grants: u64, arena: usize, addrs: &[u64], groups: u32, make: impl FnO
     let t0 = now();
     let k = make();
     GPU_COMPILE_US.store(ferros_sys::us_since(t0), core::sync::atomic::Ordering::Relaxed);
-    for (i, &w) in k.words.iter().enumerate() {
-        unsafe { core::ptr::write_volatile((arena + GPU_CODE + 8 * i) as *mut u64, w) };
-    }
-    // [1][preload u16, bit 15: 64 registers][code offset u32][words u16][groups x u32][groups y u32][n u8][n × u64].
-    let mut msg = [0u8; 18 + 8 * 16];
+    // Into the arena through its handle: a pointer store lands in ahau's own arc under the mask (`Arena`).
+    Arena::write_words(GPU_CODE as u64, &k.words);
+    // [1][preload u16, bit 15: 64 registers][code offset u32][words u16][groups x u32][groups y u32][n u8][n × u64], then [n u8]["ahau"][n u8][the kernel's name] (payloads/gpu `label`: a failure says whose job it was).
+    let mut msg = [0u8; 18 + 8 * 16 + 2 + 32];
     msg[0] = 1;
     msg[1..3].copy_from_slice(&(0x1000u16 | if k.regs64 { 0x8000 } else { 0 }).to_le_bytes());
     msg[3..7].copy_from_slice(&(GPU_CODE as u32).to_le_bytes());
@@ -483,29 +484,33 @@ fn gpu_run(grants: u64, arena: usize, addrs: &[u64], groups: u32, make: impl FnO
     for (i, a) in addrs.iter().chain(k.consts.iter()).enumerate() {
         msg[18 + 8 * i..26 + 8 * i].copy_from_slice(&a.to_le_bytes());
     }
+    let mut len = 18 + 8 * nu;
+    for name in [&b"ahau"[..], what.as_bytes()] {
+        msg[len] = name.len() as u8;
+        msg[len + 1..len + 1 + name.len()].copy_from_slice(name);
+        len += 1 + name.len();
+    }
     drop(k);
     heap_reset(mark);
     HEAP_USE.store(0, core::sync::atomic::Ordering::Release);
     let mut reply = [1u8, 0, 0, 0, 0];
-    let n = ferros_sys::call_live(cap(grants, S_GPU), &msg[..18 + 8 * nu], &mut reply);
+    let n = ferros_sys::call_live(cap(grants, S_GPU), &msg[..len], &mut reply);
     GPU_JOB_US.store(u32::from_le_bytes([reply[1], reply[2], reply[3], reply[4]]) as u64, core::sync::atomic::Ordering::Relaxed);
     n != ferros_sys::ERR && reply[0] == 0
 }
 
 /// The circle's stage for radius `r` in ahau's region of the arena, made once per size: every pixel the passes draw (tapuwae::gpu::button_stage); the frame zeroed with it, since no pass writes outside the circle. Returns how many pixels it holds.
-fn ensure_stage(arena: usize, r: usize) -> usize {
+fn ensure_stage(r: usize) -> usize {
     if unsafe { STAGED.1 } != r {
         let side = 2 * r + 4;
         // Both outputs zeroed (no pass writes outside the circle); the screen back on FRESH until a pass lands at this size.
         MARK_FRONT.store(0, core::sync::atomic::Ordering::Release);
         for out in [GPU_OUT, GPU_OUT2] {
-            for i in 0..side * side {
-                unsafe { core::ptr::write_volatile((arena + out + 8 * i) as *mut u64, 0) };
-            }
+            Arena::fill64(out as u64, (side * side) as u64, 0);
         }
         let mut n = 0usize;
         tapuwae::gpu::button_stage(r as f32, |i| {
-            unsafe { core::ptr::write_volatile((arena + GPU_STAGE + 4 * n) as *mut u32, i) };
+            Arena::write32((GPU_STAGE + 4 * n) as u64, i);
             n += 1;
         });
         unsafe { STAGED = (n, r) };
@@ -513,26 +518,27 @@ fn ensure_stage(arena: usize, r: usize) -> usize {
     unsafe { STAGED.0 }
 }
 
-/// The layer arena as ahau sees it, if granted.
-fn arena(grants: u64) -> Option<usize> {
-    let a = ferros_sys::dma(cap(grants, S_LAYERS)) as usize;
-    if a == 0 || a == usize::MAX { None } else { Some(a) }
+/// Whether the layer arena is granted: its handle names a region (the pair is zero when not, SANDBOX.md "Handles"). WHY the size: the handle masks every offset by the region's size, so in a region smaller than the 64 MiB ahau's offsets assume (GPU_OUT2's frame ends past 60 MiB) they would wrap onto one another without a fault.
+fn arena_granted() -> bool {
+    Arena::len() >= 64 << 20
 }
 
 /// The bonded button's quick pass on the GPU: tapuwae's own shading recorded through valhall (tapuwae::gpu), run by the GPU service into the output of ahau's region of the layer arena the screen is not showing (side x side pack16 words, as render_button_pack16 writes them), which it shows from then (MARK_FRONT). False when the GPU did not draw it: the CPU draws it then.
 fn gpu_quick(grants: u64, r: usize, p: &tapuwae::Params) -> bool {
-    let Some(arena) = arena(grants) else { return false };
+    if !arena_granted() {
+        return false;
+    }
     // Over the circle's stage only: nothing outside it is computed (~22 % of the square).
     let t = now();
-    let staged = ensure_stage(arena, r);
+    let staged = ensure_stage(r);
     GPU_PARTS_US[1].store(ferros_sys::us_since(t), core::sync::atomic::Ordering::Relaxed);
     let t = now();
-    let back = gpu_back(arena);
-    if !gpu_run(grants, arena, &[ARENA_VA + back as u64, ARENA_VA + GPU_STAGE as u64], staged.div_ceil(16) as u32, || tapuwae::gpu::button_quick_staged_kernel(r as f32, p, &tapuwae::Look::attest())) {
+    let back = gpu_back();
+    if !gpu_run(grants, "quick", &[ARENA_VA + back as u64, ARENA_VA + GPU_STAGE as u64], staged.div_ceil(16) as u32, || tapuwae::gpu::button_quick_staged_kernel(r as f32, p, &tapuwae::Look::attest())) {
         return false;
     }
     GPU_PARTS_US[2].store(ferros_sys::us_since(t), core::sync::atomic::Ordering::Relaxed);
-    MARK_FRONT.store(arena + back, core::sync::atomic::Ordering::Release);
+    MARK_FRONT.store(back, core::sync::atomic::Ordering::Release);
     true
 }
 
@@ -566,8 +572,10 @@ fn placed(salt: &[u8; 32], text: &str) -> tapuwae::Params {
 fn gpu_fine_passes(g: u64, frames: &mut u64) -> bool {
     let (grants, r, salt) = unsafe { FRESH_JOB };
     let side = 2 * r + 4;
-    let Some(arena) = arena(grants) else { return false };
-    let staged = ensure_stage(arena, r);
+    if !arena_granted() {
+        return false;
+    }
+    let staged = ensure_stage(r);
     let mut text = [0u8; 4 * MAX_CHARS];
     let n = with_fresh_text(|t, n| {
         text[..n].copy_from_slice(&t[..n]);
@@ -582,12 +590,12 @@ fn gpu_fine_passes(g: u64, frames: &mut u64) -> bool {
         if FRESH_GEN.load(core::sync::atomic::Ordering::Acquire) != g {
             return false;
         }
-        let back = gpu_back(arena);
+        let back = gpu_back();
         let addrs = [ARENA_VA + back as u64, ARENA_VA + GPU_STAGE as u64, ARENA_VA + GPU_SUMS as u64];
-        if !gpu_run(grants, arena, &addrs, staged.div_ceil(16) as u32, || tapuwae::gpu::button_fine_kernel(r as f32, &p, &tapuwae::Look::attest(), m)) {
+        if !gpu_run(grants, "fine", &addrs, staged.div_ceil(16) as u32, || tapuwae::gpu::button_fine_kernel(r as f32, &p, &tapuwae::Look::attest(), m)) {
             return false;
         }
-        MARK_FRONT.store(arena + back, core::sync::atomic::Ordering::Release);
+        MARK_FRONT.store(back, core::sync::atomic::Ordering::Release);
         *frames += 1;
         FRESH_DONE_GEN.store(g, core::sync::atomic::Ordering::Release);
         FRESH_DONE.store(*frames, core::sync::atomic::Ordering::Release);
@@ -2924,11 +2932,12 @@ fn draw_mark(s: &mut [u64], w: usize, cx: usize, cy: usize, r: usize) {
     }
     let side = unsafe { FRESH_SIDE };
     let front = MARK_FRONT.load(core::sync::atomic::Ordering::Acquire);
-    let buf = if front == 0 { unsafe { &(&*(&raw const FRESH))[..side * side] } } else { unsafe { core::slice::from_raw_parts(front as *const u64, side * side) } };
+    let fresh = unsafe { &(&*(&raw const FRESH))[..side * side] };
     let (x0, y0) = (cx - side / 2, cy - side / 2);
     for y in 0..side {
         for x in 0..side {
-            let d = buf[y * side + x];
+            // A GPU pass's output is read where it lies in the arena, through the handle (`Arena`); the CPU's from FRESH in the arc.
+            let d = if front == 0 { fresh[y * side + x] } else { Arena::read64((front + 8 * (y * side + x)) as u64) };
             if d >> 48 == 0 {
                 continue;
             }

@@ -492,23 +492,43 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         ferros_sys::irq_ack(irq);
         raw
     };
+    // The fault the stream raised in the last job, as the stream's output block holds it: CS_FAULT (exception type bits 7:0, its data 31:8), CS_FAULT_INFO and CS_STATUS_CMD_PTR (kbase mali_kbase_csf_registers.h, output +G#80, +G#88, +G#40); all zero when the job raised none. CS_FAULT itself keeps the last fault's value for ever after, so a fault is told by CS_REQ's FAULT bit (31) against CS_ACK's, never by that register.
+    let last_fault = core::cell::Cell::new((0u32, 0u64, 0u64));
+    // A recoverable fault noted, then acknowledged as kbase acknowledges one (mali_kbase_csf.c handle_fault_event and kbase_csf_ring_cs_kernel_doorbell): CS_REQ's FAULT bit matched to CS_ACK's, the stream's bit of CSG_DB_REQ toggled against CSG_DB_ACK, the group's bit of GLB_DB_REQ against GLB_DB_ACK, doorbell 0. Without it the stream stays halted at the fault, and every later job waits out its guard with no interrupt (2026-11-11 on the Pro: CS_FAULT G#C51 once, then each serve 1 s with 0 interrupts until `diag "restart gpu"`). Not yet seen on the device: whether the stream then runs the job's tail (its WAIT, FLUSH_CACHE2 and done flag) is the next fault's to show.
+    let fault_ack = || -> bool {
+        let (req, ack) = (sh.rd(sin), sh.rd(sout));
+        if (req ^ ack) & 1 << 31 == 0 {
+            return false;
+        }
+        last_fault.set((sh.rd(sout + 0x80), sh.rd(sout + 0x88) as u64 | (sh.rd(sout + 0x8C) as u64) << 32, sh.rd(sout + 0x40) as u64 | (sh.rd(sout + 0x44) as u64) << 32));
+        sh.wr(sin, (req & !(1 << 31)) | (ack & 1 << 31));
+        unsafe { core::arch::asm!("dmb osh") };
+        sh.wr(cin + 0x08, (sh.rd(cin + 0x08) & !1) | ((sh.rd(cout + 0x08) ^ 1) & 1));
+        sh.wr(gin + 0x08, (sh.rd(gin + 0x08) & !1) | ((sh.rd(gout + 0x08) ^ 1) & 1));
+        g.doorbell(0);
+        true
+    };
+    // A job that raised a fault failed even when its done flag lands after the acknowledgement lets the stream run on.
     let run_for = |name: &str, words: &[u64], check: &dyn Fn() -> bool, ms: u64| -> bool {
         let t0 = now();
+        last_fault.set((0, 0, 0));
         q.submit(&g, words);
         let deadline = t0 + g.f / 1000 * ms;
-        let mut wakes = 0;
+        let (mut wakes, mut faulted) = (0, false);
         while !check() && now() < deadline {
             if ferros_sys::irq_wait(irq, deadline) == 0 {
                 wakes += 1;
                 events(&g);
+                faulted |= fault_ack();
             }
         }
-        let ok = check();
-        say!(grants, "gpu: job {name}: {} in {} us after {wakes} interrupts; CS_FAULT G#{:X}, CS_FATAL G#{:X}; CSG_REQ G#{:X} CSG_ACK G#{:X}\n", if ok { "done" } else { "did not finish" }, ferros_sys::us_since(t0), sh.rd(sout + 0x80), sh.rd(sout + 0x84), sh.rd(cin), sh.rd(cout));
+        faulted |= fault_ack();
+        let ok = check() && !faulted;
+        say!(grants, "gpu: job {name}: {} in {} us after {wakes} interrupts; CS_FAULT G#{:X}, CS_FATAL G#{:X}; CSG_REQ G#{:X} CSG_ACK G#{:X}\n", if ok { "done" } else if faulted { "faulted" } else { "did not finish" }, ferros_sys::us_since(t0), sh.rd(sout + 0x80), sh.rd(sout + 0x84), sh.rd(cin), sh.rd(cout));
         ok
     };
     let run = |name: &str, words: &[u64], check: &dyn Fn() -> bool| run_for(name, words, check, 100);
-    // The resident service (GPU.md "Layers", owner 2026-11-05): kernels for the clients' layers, one at a time, until the device goes down. A run: [1][preload u16, bit 15 = 64 registers a thread][code at an arena offset u32][code words u16][groups x u32][groups y u32][uniforms n u8][n × u64]; the code is copied from the arena into the service's own executable region, the job runs on the queue, and the reply is [status][µs u32]: 0 done, 1 a request it cannot take, 2 the job never finished (a guard, not a wait: the process watchdog will own hangs, RELEASE.md).
+    // The resident service (GPU.md "Layers", owner 2026-11-05): kernels for the clients' layers, one at a time, until the device goes down. A run: [1][preload u16, bit 15 = 64 registers a thread][code at an arena offset u32][code words u16][groups x u32][groups y u32][uniforms n u8][n × u64], then optionally who asks and for what, [n u8][the client's name][n u8][the kernel's name] (`label`; since 2026-11-11, so a failure says whose job it was); the code is copied from the arena into the service's own executable region, the job runs on the queue, and the reply is [status][µs u32]: 0 done, 1 a request it cannot take, 2 the job faulted or never finished (a guard, not a wait: the process watchdog will own hangs, RELEASE.md), 3 its code starts with a zero word (its words never reached the arena), refused before the queue sees it.
     if serving {
         let big = Compute { code: code_big, desc, code_va: CODE_BIG_VA, desc_va: DESC_VA, max_threads: g.rd(THREAD_MAX_THREADS) };
         let flag = OUT_VA + 0x200;
@@ -532,6 +552,16 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                 let fits = m.len() >= 18 + 8 * nu && nu <= 16 && words > 0 && words + 16 <= CODE_PAGES * PAGE / 8 && code_off % 8 == 0 && code_off + 8 * words <= ARENA_BYTES && groups.0 > 0 && groups.1 > 0;
                 if fits {
                     let code = unsafe { core::slice::from_raw_parts((arena + code_off) as *const u64, words) };
+                    // Who asked, and for which kernel: the request's tail past its uniforms, as the client names itself (`label`). Words for the lines below, never acted on.
+                    let (client, rest) = label(&m[18 + 8 * nu..]);
+                    let (kernel, _) = label(rest);
+                    // WHY: a kernel's first word is an instruction, and the zero word is none a client emits (opcode 0 is NOP, which the valhall builder has no form for, and even Mesa's NOP sets bits 47:46: NOP.end is G#7800_C000_0000_0000, assembler-cases.txt). Zeros there mean the client's words never reached the arena: masked ahau's pointer stores landed in its own arc (2026-11-11, the arena's zeroed region run as code: CS_FAULT G#C51, INSTR_INVALID_ENC, and the queue wedged for every client). Refused before the queue sees it, said with whose it was.
+                    if code[0] == 0 {
+                        say!(grants, "gpu: refused {client}'s {kernel} kernel: its code at arena offset G#{code_off:X} ({words} words) starts with a zero word, so its words never reached the arena\n");
+                        reply = [3, 0, 0, 0, 0];
+                        ferros_sys::reply(&token, &reply);
+                        continue;
+                    }
                     let mut uniforms = [0u64; 16];
                     for (k, u) in uniforms[..nu].iter_mut().enumerate() {
                         *u = u64::from_le_bytes(m[18 + 8 * k..26 + 8 * k].try_into().unwrap());
@@ -543,6 +573,14 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                     let ok = run_for("serve", &job[..len], &|| rd32(out + 0x200) == 1, 1000);
                     reply = [if ok { 0 } else { 2 }, 0, 0, 0, 0];
                     reply[1..5].copy_from_slice(&(ferros_sys::us_since(t0) as u32).to_le_bytes());
+                    // Whose job failed, and what ran: the words as the service's region holds them (what the GPU fetched), and the fault.
+                    if !ok {
+                        let ran = |k: usize| unsafe { core::ptr::read_volatile((code_big + 8 * k) as *const u64) };
+                        let (fault, info, ptr) = last_fault.get();
+                        // Two lines: one holds 200 bytes.
+                        say!(grants, "gpu: {client}'s {kernel} kernel failed: {words} words from arena G#{code_off:X}, first G#{:X} G#{:X}, last G#{:X}; {} x {} groups, preload G#{preload:X}, {nu} uniforms\n", ran(0), ran(1), ran(words - 1), groups.0, groups.1);
+                        say!(grants, "gpu: {client}'s {kernel} kernel: CS_FAULT G#{fault:X} ({}), CS_FAULT_INFO G#{info:X}, CS_STATUS_CMD_PTR G#{ptr:X}\n", exception(fault));
+                    }
                 }
             }
             ferros_sys::reply(&token, &reply);
@@ -1079,6 +1117,38 @@ impl Compute {
         ];
         out[..words.len()].copy_from_slice(&words);
         words.len()
+    }
+}
+
+/// One name from a request's tail: [n u8][n bytes of UTF-8], and the bytes after it. "a client that did not say" when the tail is empty, cut short or not UTF-8 (a client from before the names, or gputest).
+fn label(b: &[u8]) -> (&str, &[u8]) {
+    // WHY: the tail is another process's bytes; a length past what was sent names nothing.
+    match b.split_first() {
+        Some((&n, rest)) if rest.len() >= n as usize => (core::str::from_utf8(&rest[..n as usize]).unwrap_or("a client that did not say"), &rest[n as usize..]),
+        _ => ("a client that did not say", &[]),
+    }
+}
+
+/// CS_FAULT's exception type (bits 7:0) by kbase's name for it (mali_kbase_csf_registers.h CS_FAULT_EXCEPTION_TYPE_*), for the line saying why a job failed.
+fn exception(fault: u32) -> &'static str {
+    match fault & 0xFF {
+        0x00 => "none",
+        0x05 => "KABOOM",
+        0x0F => "CS_RESOURCE_TERMINATED",
+        0x48 => "CS_BUS_FAULT",
+        0x4B => "CS_INHERIT_FAULT",
+        0x50 => "INSTR_INVALID_PC",
+        0x51 => "INSTR_INVALID_ENC",
+        0x55 => "INSTR_BARRIER_FAULT",
+        0x56 => "RT_STACK_OVERFLOW",
+        0x58 => "DATA_INVALID_FAULT",
+        0x59 => "TILE_RANGE_FAULT",
+        0x5A => "ADDR_RANGE_FAULT",
+        0x5B => "IMPRECISE_FAULT",
+        0x69 => "RESOURCE_EVICTION_TIMEOUT",
+        0xC0..=0xC4 => "TRANSLATION_FAULT",
+        0xC8..=0xCB => "PERMISSION_FAULT",
+        _ => "another type: kbase CS_FAULT_EXCEPTION_TYPE",
     }
 }
 

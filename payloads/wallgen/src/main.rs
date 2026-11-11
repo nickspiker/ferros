@@ -116,8 +116,8 @@ impl Gpu {
         // SAFETY: the code area lies inside wallgen's region of the arena (checked against REGION when it was placed), which no other process writes while wallgen runs; the service reads it only during the call below.
         let code = unsafe { core::slice::from_raw_parts_mut((self.arena + self.code) as *mut u64, k.words.len()) };
         code.copy_from_slice(&k.words);
-        // [1][preload u16, bit 15: 64 registers][code offset u32][words u16][groups x u32][groups y u32][n u8][n × u64], as payloads/gpu takes a run.
-        let mut msg = [0u8; 18 + 8 * 16];
+        // [1][preload u16, bit 15: 64 registers][code offset u32][words u16][groups x u32][groups y u32][n u8][n × u64], then [n u8]["wallgen"][n u8][the kernel's name], as payloads/gpu takes a run (the names say whose job a failure was).
+        let mut msg = [0u8; 18 + 8 * 16 + 2 + 32];
         msg[0] = 1;
         msg[1..3].copy_from_slice(&(0x1000u16 | if k.regs64 { 0x8000 } else { 0 }).to_le_bytes());
         msg[3..7].copy_from_slice(&(self.code as u32).to_le_bytes());
@@ -129,8 +129,14 @@ impl Gpu {
         for (i, a) in addrs.iter().chain(k.consts.iter()).enumerate() {
             msg[18 + 8 * i..26 + 8 * i].copy_from_slice(&a.to_le_bytes());
         }
+        let mut len = 18 + 8 * nu;
+        for name in [&b"wallgen"[..], what.as_bytes()] {
+            msg[len] = name.len() as u8;
+            msg[len + 1..len + 1 + name.len()].copy_from_slice(name);
+            len += 1 + name.len();
+        }
         let mut reply = [1u8, 0, 0, 0, 0];
-        let n = ferros_sys::call_live(self.cap, &msg[..18 + 8 * nu], &mut reply);
+        let n = ferros_sys::call_live(self.cap, &msg[..len], &mut reply);
         if n == ERR {
             say!("wallgen: no GPU service receiving (after a jump, or not started); no wallpaper until the GPU is up");
             ferros_sys::exit(1);
