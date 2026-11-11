@@ -14,6 +14,8 @@ fn every_say() -> Vec<(Say<'static>, usize)> {
     vec![
         (Say::SatPlace { up: H, round: H, cn0: H, used: false }, 3),
         (Say::SatPlace { up: H, round: H, cn0: H, used: true }, 3),
+        (Say::ChipHeard { messages: 1, kinds: 1 }, 0),
+        (Say::ChipHeard { messages: 2900, kinds: 5 }, 0),
         (Say::DaylightTime(H), 1),
         (Say::HeardMcc(H), 1),
         (Say::HeardMccIn { mcc: H, country: H }, 2),

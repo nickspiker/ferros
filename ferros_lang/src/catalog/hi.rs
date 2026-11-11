@@ -272,6 +272,13 @@ pub fn text(m: Msg) -> &'static str {
 pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
     match m {
         Say::SatPlace { up, round, cn0, used } => write!(o, "ऊँचाई {up}°, दिशा {round}°, {cn0} dB-Hz{}", if used { ", फ़िक्स में" } else { "" }),
+        Say::ChipHeard { messages, kinds } => {
+            o.write_str("चिप से संदेश: ")?;
+            num(o, f, messages)?;
+            o.write_str(", प्रकार: ")?;
+            num(o, f, kinds)?;
+            o.write_str("; उपग्रह पहली स्थिति के साथ आते हैं")
+        }
         Say::DaylightTime(utc) => write!(o, "{utc}, गर्मियों का समय"),
         Say::HeardMcc(mcc) => write!(o, "सुना: MCC {mcc}"),
         Say::HeardMccIn { mcc, country } => write!(o, "सुना: MCC {mcc}, {country}"),

@@ -272,6 +272,13 @@ pub fn text(m: Msg) -> &'static str {
 pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
     match m {
         Say::SatPlace { up, round, cn0, used } => write!(o, "{up}\u{b0} juu, {round}\u{b0} mzunguko, {cn0} dB-Hz{}", if used { ", inatumika kwa mahali" } else { "" }),
+        Say::ChipHeard { messages, kinds } => {
+            o.write_str("jumbe kutoka kwa chipu: ")?;
+            num(o, f, messages)?;
+            o.write_str(", aina: ")?;
+            num(o, f, kinds)?;
+            o.write_str("; setilaiti huja na mahali pake pa kwanza")
+        }
         Say::DaylightTime(utc) => write!(o, "{utc}, saa za kuokoa mchana"),
         Say::HeardMcc(mcc) => write!(o, "imesikika: MCC {mcc}"),
         Say::HeardMccIn { mcc, country } => write!(o, "imesikika: MCC {mcc}, {country}"),
