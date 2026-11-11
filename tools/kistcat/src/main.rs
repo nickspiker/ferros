@@ -7,6 +7,7 @@
 //! - `kistcat verify <kists.vsf> --key <secret> [--signer-name NAME]`: every egg against the project key's bundle, then every entry's shape (`ferros_kist::directory::verify_directory`, as the device checks it).
 //! - The key file's first 32 bytes are the Ed25519 seed (ferros.secret is the seed then the public key); nothing of it is printed, copied or written.
 
+mod devkey;
 use ferros_kist::directory::{self, Directory, Entry, Metrics, Source, Version};
 use fgtw::pq::{FleetSigner, KeyBundle, SigningBundle};
 use std::path::{Path, PathBuf};
@@ -37,6 +38,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("build") => build(&args[1..]),
         Some("verify") => verify(&args[1..]),
+        Some("devkey") => devkey(&args[1..]),
         _ => usage(),
     }
 }
@@ -779,5 +781,32 @@ mod tests {
     #[test]
     fn developer_text_is_escaped() {
         assert_eq!(esc("<b>\"x\" & 'y'</b>"), "&lt;b&gt;&quot;x&quot; &amp; &#39;y&#39;&lt;/b&gt;");
+    }
+}
+
+/// `kistcat devkey new --secret <file> --label LABEL --name NAME [--contact C] [--web W] [--kind K] --record <file>`: a new developer key, its secret into the keys directory, its signed public record beside it; `kistcat devkey show <record>`: the record checked and printed.
+fn devkey(args: &[String]) {
+    match args.first().map(String::as_str) {
+        Some("new") => {
+            let get = |k: &str| args.windows(2).find(|w| w[0] == k).map(|w| w[1].clone());
+            let secret = PathBuf::from(get("--secret").unwrap_or_else(|| fail("--secret <file in the keys directory>")));
+            let label = get("--label").unwrap_or_else(|| fail("--label LABEL (part of the key, never changed: e.g. FERROS_DEVELOPER_NICK)"));
+            let name = get("--name").unwrap_or_else(|| fail("--name NAME"));
+            let record_path = PathBuf::from(get("--record").unwrap_or_else(|| fail("--record <file for the public record>")));
+            let made = vsf::eagle_time_oscillations();
+            let key = devkey::new_secret(&secret, &label, made).unwrap_or_else(|e| fail(e));
+            let r = devkey::Record { label, name, contact: get("--contact"), web: get("--web"), kind: get("--kind").unwrap_or_else(|| "person".into()), created: made, revision: 1, ed25519: key.public().ed25519() };
+            let doc = devkey::record(&r, &key).unwrap_or_else(|e| fail(e));
+            std::fs::write(&record_path, &doc).unwrap_or_else(|e| fail(format!("{}: {e}", record_path.display())));
+            let back = devkey::read_record(&doc).unwrap_or_else(|e| fail(format!("the record does not verify: {e}")));
+            println!("developer key {} ({}): secret {} (owner-only), public record {} ({} bytes, every egg verified)", short(&back.ed25519), back.name, secret.display(), record_path.display(), doc.len());
+        }
+        Some("show") => {
+            let p = args.get(1).unwrap_or_else(|| fail("kistcat devkey show <record>"));
+            let doc = std::fs::read(p).unwrap_or_else(|e| fail(format!("{p}: {e}")));
+            let r = devkey::read_record(&doc).unwrap_or_else(|e| fail(e));
+            println!("{} ({}), {} key {}, label {}, revision {}, made {}{}{}, every egg verified", r.name, r.kind, "developer", short(&r.ed25519), r.label, r.revision, day(r.created), r.contact.map(|c| format!(", contact {c}")).unwrap_or_default(), r.web.map(|w| format!(", web {w}")).unwrap_or_default());
+        }
+        _ => usage(),
     }
 }
