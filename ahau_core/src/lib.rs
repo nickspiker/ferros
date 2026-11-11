@@ -1,10 +1,10 @@
 //! ahau's identity derivation (Claude memories/ferros_attest_os_level.md): what the attest screen computes from the handle typed on the honeycomb keyboard, with no std and without vsf's 8.9 MB text tables.
 //!
-//! The identity seed is ihi's `handle_to_hash`: BLAKE3 over vsf's `x` encoding of the handle, which is `x`, the character count after NFC as a vsf number, then each character's Huffman code most significant bit first, zero-padded to a byte. `codes::CODES` is generated at build time (build.rs) for exactly the characters the keyboard can type, from the frozen codebook, and the build refuses a key whose character is not its own NFC form or is a combining mark, so NFC changes nothing and those codes are all the encoder needs. A character outside the table is refused, never guessed: the seed must be byte-exact or it names someone else.
+//! The identity seed is ihi's `handle_to_hash`: BLAKE3 over vsf's `x` encoding of the handle, which is `x`, the character count after NFC as a vsf number, then each character's Huffman code most significant bit first, zero-padded to a byte. `codes::CODES` is frozen in frozen_codes.rs (generated once from ihi's codebook, vsf 0.6.42's; vsf main has since reissued its own) for exactly the characters the keyboard can type, and the build (build.rs) refuses an edit to it, a key with no code there, a key whose character is not its own NFC form or is a combining mark, so NFC changes nothing and those codes are all the encoder needs. A character outside the table is refused, never guessed: the seed must be byte-exact or it names someone else.
 #![no_std]
 
 mod codes {
-    include!(concat!(env!("OUT_DIR"), "/codes.rs"));
+    include!("frozen_codes.rs");
 }
 pub use codes::CODES;
 
