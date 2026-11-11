@@ -2747,6 +2747,17 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     p.write(f.x[1], &v[..n]);
                     v.len() as u64
                 }
+                // The GPS driver: the zone in effect's principal place, its first aid when the person has no last fix (owner, 2026-11-11, "can't we figure that out from the orbital data anyway?": the chip needs to know roughly where it is to know which sky to look at). Into x1, 8 bytes: latitude, longitude, i32 arc-seconds.
+                7 if named(b"gps") => match crate::zone::place() {
+                    Some((lat, lon)) => {
+                        let mut b = [0u8; 8];
+                        b[..4].copy_from_slice(&lat.to_le_bytes());
+                        b[4..].copy_from_slice(&lon.to_le_bytes());
+                        p.write(f.x[1], &b);
+                        8
+                    }
+                    None => ERR,
+                },
                 _ => ERR,
             };
             0

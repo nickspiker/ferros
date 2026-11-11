@@ -279,6 +279,13 @@ pub fn rule_of(id: &[u8]) -> Option<ferros_tz::Rule> {
     t.ids.iter().position(|z| z.as_slice() == id).map(|i| t.rules[i])
 }
 
+/// The zone in effect's principal place (the zones document's `at`, zone1970.tab's: a city, never anyone's place), latitude and longitude in arc-seconds, for the GPS driver's first aid when the person has no last fix (op 7; GPS.md "A rough start from the zone"). None with no zone (a fixed offset) or no table.
+pub fn place() -> Option<(i32, i32)> {
+    let t = unsafe { (*(&raw const TABLE)).as_ref() }?;
+    let (id, _) = effective();
+    t.ids.iter().position(|z| z.as_slice() == id.as_bytes()).map(|i| t.at[i])
+}
+
 pub fn table_read() -> bool {
     unsafe { (*(&raw const TABLE)).is_some() }
 }
