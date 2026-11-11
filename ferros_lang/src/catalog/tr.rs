@@ -135,6 +135,11 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DoNotDisturb => "rahatsız etmeyin",
         Msg::Screencap => "ekran görüntüsü",
         Msg::FullScreen => "tam ekran",
+        // ---- the torch's page ----
+        Msg::Strobe => "flaşör",
+        Msg::LitPerFlash => "her flaşta yanma",
+        Msg::TurnsOffAfter => "kapanma süresi",
+        Msg::Never => "asla",
         // ---- the battery's page ----
         Msg::Charge => "şarj",
         Msg::Voltage => "gerilim",

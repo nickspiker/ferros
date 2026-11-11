@@ -135,6 +135,11 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DoNotDisturb => "usinisumbue",
         Msg::Screencap => "picha ya skrini",
         Msg::FullScreen => "skrini nzima",
+        // ---- the torch's page ----
+        Msg::Strobe => "mmweko",
+        Msg::LitPerFlash => "inawaka kwa kila mmweko",
+        Msg::TurnsOffAfter => "huzima baada ya",
+        Msg::Never => "kamwe",
         // ---- the battery's page ----
         Msg::Charge => "chaji",
         Msg::Voltage => "volteji",

@@ -135,6 +135,11 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DoNotDisturb => "huwag istorbohin",
         Msg::Screencap => "screenshot",
         Msg::FullScreen => "full screen",
+        // ---- the torch's page ----
+        Msg::Strobe => "strobe",
+        Msg::LitPerFlash => "ilaw bawat kislap",
+        Msg::TurnsOffAfter => "mamamatay pagkalipas ng",
+        Msg::Never => "hindi kailanman",
         // ---- the battery's page ----
         Msg::Charge => "karga",
         Msg::Voltage => "boltahe",

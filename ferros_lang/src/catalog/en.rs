@@ -135,6 +135,11 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DoNotDisturb => "do not disturb",
         Msg::Screencap => "screencap",
         Msg::FullScreen => "full screen",
+        // ---- the torch's page ----
+        Msg::Strobe => "strobe",
+        Msg::LitPerFlash => "lit per flash",
+        Msg::TurnsOffAfter => "turns off after",
+        Msg::Never => "never",
         // ---- the battery's page ----
         Msg::Charge => "charge",
         Msg::Voltage => "voltage",

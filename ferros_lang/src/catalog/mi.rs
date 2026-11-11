@@ -135,6 +135,11 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DoNotDisturb => "kaua e whakararu",
         Msg::Screencap => "hopu mata",
         Msg::FullScreen => "mata katoa",
+        // ---- the torch's page ----
+        Msg::Strobe => "hikohiko",
+        Msg::LitPerFlash => "ka kā i ia hiko",
+        Msg::TurnsOffAfter => "ka weto ā muri i",
+        Msg::Never => "kore rawa",
         // ---- the battery's page ----
         Msg::Charge => "utu",
         Msg::Voltage => "ngaohiko",

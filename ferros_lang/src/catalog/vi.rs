@@ -135,6 +135,11 @@ pub fn text(m: Msg) -> &'static str {
         Msg::DoNotDisturb => "không làm phiền",
         Msg::Screencap => "chụp màn hình",
         Msg::FullScreen => "toàn màn hình",
+        // ---- the torch's page ----
+        Msg::Strobe => "nhấp nháy",
+        Msg::LitPerFlash => "sáng mỗi lần nháy",
+        Msg::TurnsOffAfter => "tắt sau",
+        Msg::Never => "không bao giờ",
         // ---- the battery's page ----
         Msg::Charge => "mức pin",
         Msg::Voltage => "điện áp",

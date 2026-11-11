@@ -230,6 +230,16 @@ messages! {
     /// The app in front to the glass's edge, no circle and no bars (the quick row's middle circle).
     FullScreen,
 
+    // ---- the torch's page (its title is `Torch`; its first slider is `Brightness`, its on and off `On`) ----
+    /// The torch flashing on and off: the name of its slider, whose value is `Off` or how long each flash and its gap take together (a time).
+    Strobe,
+    /// How much of each flash's period the torch is lit, a share (the duty cycle).
+    LitPerFlash,
+    /// The torch turns itself off after this long, a time or `Never`.
+    TurnsOffAfter,
+    /// The timeout's "off": the torch stays lit until switched off.
+    Never,
+
     // ---- the battery's page (the console's battery circle; its title is `Battery`) ----
     /// The state of charge.
     Charge,

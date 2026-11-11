@@ -42,7 +42,7 @@ The first cut grew the row out of the point under the camera, every circle drawn
 
 ## The slide and its stepping
 
-- **The offset** follows the finger one to one from where the drag took hold (the doorway, the top's ground, a radio circle dragged down, or a quick circle other than the rings dragged up or down), between hidden and open.
+- **The offset** follows the finger one to one from where the drag took hold (the doorway, the top's ground, a radio circle dragged down, or a quick circle with no level dragged up, or with no page dragged down: "Quick pages" below), between hidden and open.
 - **The lift**: from hidden, the row goes open if it was pulled past a third of the way, else hidden; from open, hidden if pushed back past a third, else open. Each frame the panel showed, what is left to go halves (a right shift, the half pixel dropped), so it lands in a few frames and holds still (map quick.rs `step`). A still tap in the doorway sends it open or hidden the same way.
 - **Frame timer on shown frames**: one step for each frame the panel showed (display op 24's frame-start count), never on a clock, so a missed render steps twice rather than slowing. The display arms a frame as soon as the bars it swaps in changed, so each step is on the glass at the next frame (2026-11-11: until then the change waited for the 10 Hz flips and the slide showed at 10 frames a second on the Pro, its steps waiting on those frames). Measured there before the fix: a step's work 5.4 ms mean (circles 0.09, sprites 1.2, compose 2.8, diff 1.3) and the bars' publish 2.4 ms, worst 12.3 and 14.2.
 - **Shutting**: push it back up, a still tap in the doorway, or a touch anywhere behind the row (that touch goes no further).
@@ -50,9 +50,9 @@ The first cut grew the row out of the point under the camera, every circle drawn
 
 ## The circles
 
-- **Brightness** (a ring): a finger on it turns it, a whole turn the whole range of preference 3 (32nds of a stop, 0 the brightest, 255 the dimmest), eased at both ends (a C∞ ramp), so the value slows into each end. Applied live while the finger turns (`set_pref_live`) and kept once at the lift (`set_pref`), as the Appearance slider does. The ring's lit share is how bright it is; while a finger turns it, the display draws the exact share the map sent into that circle's sprite again (the one circle that changed), so the lit end moves smoothly between the preference's steps.
-- **Torch** (a ring): a tap lights it at the last level it was lit at (the whole dimmer at first) or puts it out; a turn sets the level, 1-255 the torch's own perceptual dimmer (docs/TORCH.md). The map calls the `torch` endpoint waiting (`call`, not `call_live`: the kernel starts the torch process on demand and a live call would be refused while it starts), from a thread of its own (map quick.rs `worker`), so the main loop never waits on it. The torch's level is asked once each time the row starts to show until it has answered. A torch that does not answer (no capsule stored, an older kernel with no grant) draws dimmed and a tap does nothing.
-- **Radios off**: every radio off at once, the set that was off before kept (preference 41, `radios_before`); a tap from all off puts that set back (all on when it was every radio).
+- **Brightness** (a ring): a pull down from it is its level, preference 3 (32nds of a stop, 0 the brightest, 255 the dimmest), and past the bright end it opens Appearance ("Quick pages" below; until 2026-11-11 a finger turned the ring about its centre, a whole turn the whole range). Applied live while the finger pulls (`set_pref_live`) and kept once at the lift (`set_pref`), as the Appearance slider does. A tap opens Appearance (it has nothing to switch). The ring's lit share is how bright it is; while a finger pulls it, the display draws the exact share the map sent into that circle's sprite again (the one circle that changed), so the lit end moves smoothly between the preference's steps.
+- **Torch** (a ring): a tap lights it at the level it was last set to (preference 42; the whole dimmer at first), with the strobe and timeout set on its page, or puts it out; a pull down sets the level, 1-255 the torch's own perceptual dimmer (docs/TORCH.md), and past the bright end opens its page ("Quick pages" below). The map calls the `torch` endpoint waiting (`call`, not `call_live`: the kernel starts the torch process on demand and a live call would be refused while it starts), from a thread of its own (map quick.rs `worker`), so the main loop never waits on it. The torch's level is asked once each time the row starts to show, until it has answered and while it was last lit (its timeout may have put it out since). A torch that does not answer (no capsule stored, an older kernel with no grant) draws dimmed and a tap does nothing.
+- **Radios off**: every radio off at once, the set that was off before kept (preference 41, `radios_before`); a tap from all off puts that set back (all on when it was every radio). A pull down opens Connections ("Quick pages" below).
 - **Sound**: a tap goes round sound, vibrate, silent (preference 39, a device setting). Its word is the mode now. Nothing plays a sound or a buzz by it yet.
 - **Do not disturb**: the person's, not the device's (SETTINGS.md). A tap asks the identity service (fgtw op 24) from the map's worker thread; the service puts it in the person's space, hands it to their fleet and fgtw.org, and writes it to the kernel (preference 40), which the circle shows. Before the identity service's first pull it is refused and the circle does not change. Nothing is silenced by it yet.
 - **Screencap**: the row shuts first; when it has landed the map sends op 56 with the capture flag, and the display takes the capture (as op 30 does) the first pass the bars on the screen hold none of the row, so the row is not in the picture. There is no clipboard yet (owner, 2026-11-07: "when we get the clipboard running that's where the screencap will live"), so the frame stays in the free surface op 30 wrote it to and its address goes to the console (`display: quick row screencap (no clipboard yet): G#…`).
@@ -71,11 +71,81 @@ Owner, on the Pro: "the top bar, dragging a console circle to center no longer w
 - **No long press.** It went with drag-to-centre back (it was a hold measured in frames, the one gesture that waited on time; the press ring with it).
 - **The quick row** opens only from the doorway; a drag down anywhere else on the top does nothing to it.
 
+## Quick pages: tap acts, drag opens (2026-11-11)
+
+Owner, 2026-11-11: "flashlight and brightness and other controls, like flashlight we may want to control the brightness and strobe frequency and duty cycle and timeout and... brightness not sure if we'll have much more on that screen. trying to figure out a good way to unify all those settings tho as I like the tap to toggle on/off but the slide down to open the details. ideas?" To the proposal below: "Please."
+
+Built 2026-11-11 (branch `quick-pages`), not yet run on a device. The open questions are at the end of this section, for the owner.
+
+### The grammar
+
+One rule for every circle of the system: **a tap acts, a drag opens.**
+- The console's circles already work so: a tap on a radio switches it, a drag toward the centre opens its page; the helm's tap and swipe in are the same pair.
+- In the quick row a tap is the circle's action at the settings it was last given (the torch on at its level, strobe and timeout; sound round its modes; radios off and back). A circle with nothing to switch opens its page on a tap (brightness: Appearance), as USB, the clock and the battery do on the console.
+- A drag down from a quick circle opens its page. On the way there the drag is a control (below), so one motion is both the quick adjust and the way into the details.
+- No long press anywhere: it would be a hold measured in time, the timer the house does without (it went from the console on 2026-11-11 for the same reason).
+
+### The pull: the drag down as a control
+
+Where it starts: on a quick circle while the row stands all the way open (the hit map gives a quick circle's id, 32 + k, only then). The finger is held (the circle lightens) and nothing moves until it passes the slop (map `SLOP`, as every drag).
+
+Which way it goes, decided at the slop and kept for the rest of the touch:
+- **A ring** (brightness, the torch): every move is its pull, up or down.
+- **A circle with a page and no level** (radios off): down is its pull toward the page; up moves the row, as before (pushed back past a third, it shuts).
+- **A circle with no page** (sound, full screen, do not disturb, screencap): up or down moves the row, as before.
+- A sideways drag does nothing: the row does not turn sideways today. If it ever does (more circles than fit), the slop's first motion decides, across the row's and up and down the circle's.
+
+How far it goes. Every length is a share of the screen's harmonic span 2wh/(w + h) (husky 1854 px, akita 1489):
+- **The pull counts from where it took hold** (the slop's edge, not where the finger landed), so the level does not jump by the slop at its first step.
+- **The level follows the finger one to one**: down brighter, up dimmer, the whole range in a quarter of the span (`range`, husky 463 px, akita 372). Its share is `ease(start + depth / range)`, the ring's own ease (map quick.rs: the value itself thru the middle, a C∞ bump step across an eighth at each end), so the lit arc slows into each end and never stops dead. The start is the share the ring showed when the finger landed (dark for an unlit torch): no jump at the first step.
+- **Past the bright end the page opens**: where the ease reaches exactly full (an eighth past the range's end) and a twelfth of the span further on (`open`, the helm's swipe: husky 154 px, akita 124). From full that is the twelfth alone; from dark the whole dimmer and the twelfth (husky about 733 px, akita 589: the torch circle sits about 264 px down on husky, so the page opens about a third of the way down the glass).
+- **A circle with no level** opens its page a twelfth of the span below where its pull took hold.
+- **What the level does**: brightness is applied live (`set_pref_live`, the panel follows the finger) and kept at the lift (`set_pref`); the torch is asked each new level from the map's worker thread (its endpoint, op 0), and at the lift its level is kept as the one a tap lights it at (preference 42; pulled to dark, the kept level stays what it was).
+- **When the page opens** the level stays where the pull left it (full: the person pulled it there), once a touch; the row shuts (each shown frame halves what is left, as any shut); the settings fly open on the page (`show_page`) once the finger lifts, as a console circle's page does (the map steps nothing of its own while a system place holds the finger).
+- **Let go partway**: the level is kept and nothing moves. There is no settling motion for a level: it is where the finger left it. The row stays open.
+- **Pushing the row shut** goes from the doorway (a tap), from behind the row (a touch), or up from a circle with no level; a ring's up is dimmer, not the row's.
+
+### Pages from typed settings
+
+A control declares its settings as typed values, and its page is drawn from that list with one kit (map typed.rs):
+- **Kinds** (`typed::Kind`): a level (1-255 on the control's own dimmer; the slider is its value, no words), a share either side of a half (a signed byte of 256ths; its words the share in the person's base), and steps of an octave of a time with an off at the left end (its words "off"/"never" or the time in the person's base). An on and off is a checkbox. A choice of a few (the base, the layout) is the settings' radio group, as it was.
+- **The kit is the settings pages' own** (COMPOSITOR.md "Controls"): a typed setting is its name and its value in words (the battery page's fact row), then fluor's slider under it, dragged or tapped, the value under the finger shown as it moves, applied live and kept at the lift, the knob springing to its step's place after the lift (stepped in shown frames). Nothing new for the display to draw: the proposal said rings, and pages draw sliders today (open question 1).
+- **Every power-of-two step** (ferros_sys::torch): 32nds of an octave for the strobe, 16ths of an octave for the timeout, 256ths for the share, as brightness is 32nds of a stop; no decimal knob.
+
+### A quick circle's page is a settings page
+
+There is one set of pages, the settings' ring (map `PAGES`); a quick circle's page is the one that holds what the circle switches, opened a second way. The torch's is a page of its own in the ring (after battery); brightness's is Appearance, where its slider already lives (the owner doubts it will hold much more); radios off's is Connections. Swiping round the ring from there goes on to the neighbours as from anywhere.
+
+### Where each value is kept
+
+| What | Where | Why |
+|---|---|---|
+| Brightness | the device (`brightness`, preference 3) | as before: the panel is the device's |
+| The torch's level, strobe, lit share, timeout | the device (`torch_level`, `torch_strobe`, `torch_duty`, `torch_timeout`, preferences 42-45, SETTINGS.md) | the LED, its driver and its cap differ by hardware |
+| Do not disturb | the identity (as before) | it is the person's |
+
+Nothing here flows from the identity yet. A per-person default (a torch timeout a person always wants, say) would be an identity setting written to each device as the language is, never read back (SETTINGS.md); open question 4.
+
+### The torch page
+
+On (a checkbox: the torch lit at its level, strobe and timeout, or dark, as the circle's tap), brightness (a level), strobe (off, or a flash every 4 s to 16 a second, read as its period), lit (the share of each flash, 8/256 to 248/256), turns off after (never, or 16 s to about 4 h 33 min). Every value is the torch's own to act on: the strobe and the timeout run on the torch driver's clock (docs/TORCH.md "Settings"), not in the map. Set with the torch dark, they wait for its next light; set while it is lit, it reads them again at once (its op 3). A torch the timeout put out is asked again as the row next shows, so its circle and page read dark.
+
+### Open questions for the owner
+
+0. **The page past the bright end.** A pull from a dark torch lights it all the way up before the page opens, and the page opens with the torch at full (likewise brightness at its brightest). Kept that way because the level then never jumps, and on the torch page the light shows each strobe change live. The alternatives: down dims and the page lies past the dark end (a pull from a dark torch goes straight to the page, no light, but there is little room above the row to pull a dark torch up to full); the level going back to where it was as the page opens (a jump in the light); or the level sideways and down only the page (two axes on one circle). Which?
+1. **Rings or sliders on the pages.** The proposal said levels as rings like the brightness ring; the settings pages draw fluor's slider, so the torch page does too (one kit, nothing new in the display, no conflict with the quick row's compose). A ring control would be a display op beside the slider and would then serve every page. Rings or sliders?
+2. **The strobe's range and safety.** 1/4 Hz to 16 Hz; flashes between about 3 and 30 a second can bring on seizures in people with photosensitive epilepsy. Cap it lower, warn on the page, or leave it to the person? And is its value better read as a period ("½ s", as now, in the person's base with the house's doublings) or as flashes a second?
+3. **The lit share's range**: 8/256 to 248/256 (at 16 a second the shortest flash is 1.95 ms, past the chip's 1 ms ramp). Right?
+4. **The timeout**: 16 s to 2^14 s in 16ths of an octave, counted again from every touch of the torch (a tap, a pull, a page change), never by default. Should a default follow the person (an identity setting)?
+5. **With an app in front** the pull still sets the level, but past the end opens nothing (the pages live on the plane). Send the app behind and open the page, as home's tap would?
+6. **Brightness's tap** opens Appearance. Or should brightness have its own page, or a tap do something else (nothing, as before)?
+7. **Sound, do not disturb, full screen and screencap** have no pages: sound's would be the audio page (AUDIO.md, not built), do not disturb's the person's (an identity page). A drag on them moves the row as before.
+
 ## Who does what
 
 - **Display** (payloads/display quick.rs): the geometry (`layout`, `doorway_disc`), the sprites (`init`, `render`, `update`) and their composite (`compose`, from `bar_decode`), op 56 (the map's state of the row: the offset in a word, the looks in two more, the console's worker nudged; the reply the slide's length), the ids op 41 reads from the hit map (written at the bars' compose step, hit.rs `bars_row`: 32 + k while the row stands open, its centre and radius from `layout`; 10 the doorway, `doorway_disc`; 11 the top's other ground; 12 behind the row, everything inside the app's circle while any of it shows, so op 27 gives an app no point there; none of these in full screen, hit.rs `row` reading the bars' ids on the helm's rows alone), and the screencap.
-- **Map** (payloads/map quick.rs): the finger, the offset, its halving, the rings' turning every action, op 56 sent whenever anything in it moved. Touches reach the map first for the system's places, with an app in front too, as the corners' always have.
-- **Kernel**: preferences 39 (sound), 40 (do not disturb, the identity's, taken from the process named fgtw alone) and 41 (radios before), kept in the device document; and the torch's send right handed to whoever it hands Settings (the map's slot 9), since init's grants page is full.
+- **Map** (payloads/map quick.rs): the finger, the offset, its halving, each circle's pull and every action, the torch page and the typed settings kit (typed.rs), op 56 sent whenever anything in it moved. Touches reach the map first for the system's places, with an app in front too, as the corners' always have.
+- **Kernel**: preferences 39 (sound), 40 (do not disturb, the identity's, taken from the process named fgtw alone), 41 (radios before) and 42-45 (the torch's settings), kept in the device document; and the torch's send right handed to whoever it hands Settings (the map's slot 9), since init's grants page is full.
 - **fgtw** (payloads/fgtw space.rs): op 24, the person's do not disturb into the space and to the kernel; ferros_space kind `DND`.
 
 ## Op 56

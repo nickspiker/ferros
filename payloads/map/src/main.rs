@@ -23,6 +23,7 @@ extern crate alloc;
 
 mod installer;
 mod quick;
+mod typed;
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -733,6 +734,10 @@ enum Choice {
     Brightness,
     /// The UI scale slider (preference 14), half to twice: the scale decided by x.
     Scale,
+    /// A typed setting's slider (typed.rs, its index in `typed::ALL`): its kept byte decided by x, live while the finger is on it and kept at the lift, as brightness's.
+    Typed(u8),
+    /// The torch page's on and off: the torch lit at its level (and strobe, and timeout) or dark, as its quick circle's tap.
+    TorchOn,
     /// A link's value knob set to one of its choices (its radio group): link, slot, value.
     KnobSet(u8, u8, u8),
     /// The light scope's channel (preference 7) set to one of its radio group, 0 off to 6.
@@ -794,8 +799,8 @@ enum Choice {
     AskGo,
 }
 
-/// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The clock after the links (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
-const PAGES: [&str; 20] = ["appearance", "units", "keyboard", "security", "kists", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "clock", "language", "about", "developer"];
+/// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The torch after the battery (owner, 2026-11-11: its brightness, strobe, lit share and timeout; QUICK.md "Quick pages"), opened from its quick circle by a pull down as well. The clock after them (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
+const PAGES: [&str; 21] = ["appearance", "units", "keyboard", "security", "kists", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "torch", "clock", "language", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Whether it starts looking like one (the orange hairlines, as the display's): FERROS_RELEASE_LOOK set gives a development build the release look for screen captures (owner, 2026-11-10), its tools kept.
@@ -835,6 +840,7 @@ fn page_title(key: &'static str) -> &'static str {
         "language" => Msg::PageLanguage,
         "about" => Msg::PageAbout,
         "battery" => Msg::Battery,
+        "torch" => Msg::Torch,
         "developer" => Msg::PageDeveloper,
         _ => return key,
     })
@@ -3611,6 +3617,28 @@ impl Map {
                 fact(b, &mut y, tr(Msg::PowerDraw), power.as_str());
                 fact(b, &mut y, tr(Msg::Temperature), facts.battery_temp_cc().map_or_else(not_read, |c| num(c / 100, " °C")).as_str());
             }
+            "torch" => {
+                // The torch (docs/TORCH.md "Settings"; owner, 2026-11-11: "like flashlight we may want to control the brightness and strobe frequency and duty cycle and timeout"), its quick circle's page (QUICK.md "Quick pages"): on and off as the circle's tap, then each of its typed settings (typed.rs), its name with its value in words, its slider under it, the value under a finger as it moves. Set with the torch dark, they wait for its next light.
+                let lit = quick::torch_now().is_some_and(|l| l > 0);
+                mark(self, b, &mut y, 50, tr(Msg::On), lit, Some(Choice::TorchOn));
+                for i in typed::TORCH {
+                    let s = typed::ALL[i];
+                    let what = Choice::Typed(i as u8);
+                    let v = match self.slide {
+                        Some((c, t)) if c == what => s.value(t),
+                        _ => s.now(),
+                    };
+                    let mut words = Line::new();
+                    s.words(v, &mut words);
+                    if words.as_str().is_empty() {
+                        b.text(cx, y, small as u16, grey(), 1, tr(s.name));
+                        y += uu(2, 1);
+                    } else {
+                        fact(b, &mut y, tr(s.name), words.as_str());
+                    }
+                    slider(self, b, &mut y, what);
+                }
+            }
             "about" => {
                 let f = ferros_sys::numbers(Style::Glyphs);
                 let facts = ferros_sys::facts();
@@ -3854,6 +3882,10 @@ impl Map {
         match what {
             Choice::Brightness => (255 - ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS)) as f64 / 255.,
             Choice::Scale => (self.scale_live.unwrap_or(ferros_sys::ui_scale() as f32) as f64 + 64.) / 128.,
+            Choice::Typed(i) => {
+                let s = typed::ALL[i as usize];
+                s.place(s.now())
+            }
             _ => 0.,
         }
     }
@@ -3890,6 +3922,21 @@ impl Map {
                 }
             }
             Choice::Scale => self.scale_live = Some((t * 128. - 64.) as f32),
+            // A typed setting: its byte applied live as it changes (`set_pref_live`), kept at the lift (`slide_done`). The torch's: its level asked of it while it is lit (dark, the level waits for the next light), the rest read again by it (`torch_apply`, only while lit).
+            Choice::Typed(i) => {
+                let s = typed::ALL[i as usize];
+                let v = s.value(t);
+                if v != ferros_sys::pref(s.pref) {
+                    ferros_sys::set_pref_live(cap(self.grants, S_SETTINGS), s.pref, v);
+                    if i as usize == typed::TORCH_LEVEL {
+                        if quick::torch_now().is_some_and(|l| l > 0) {
+                            quick::torch_ask(Some(v));
+                        }
+                    } else if typed::TORCH.contains(&(i as usize)) {
+                        quick::torch_apply();
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -3899,6 +3946,7 @@ impl Map {
         if what == Choice::Brightness {
             self.brightness_kept();
         }
+        self.typed_kept(what);
         let rest = match what {
             // The scale is kept rounded to its 64ths (the lift writes it).
             Choice::Scale => (libm::round(t * 128. - 64.) + 64.) / 128.,
@@ -3951,6 +3999,13 @@ impl Map {
     fn brightness_kept(&self) {
         ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BRIGHTNESS, ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS));
     }
+    /// A typed setting as its slider left it, kept in the vault (the drag applied it live); anything else, nothing.
+    fn typed_kept(&self, what: Choice) {
+        if let Choice::Typed(i) = what {
+            let p = typed::ALL[i as usize].pref;
+            ferros_sys::set_pref(cap(self.grants, S_SETTINGS), p, ferros_sys::pref(p));
+        }
+    }
     /// The settings' row under a panel point, as the last frame laid them out.
     fn row_at(&self, sx: i64, sy: i64) -> Option<Choice> {
         self.rows[..self.nrows].iter().find(|r| sx >= r.0 && sx < r.1 && sy >= r.2 && sy < r.3).map(|r| r.4)
@@ -3969,7 +4024,7 @@ impl Map {
         if self.swipe == 0 {
             self.swipe = if dx.abs() >= dy.abs() { 1 } else { 2 };
             // Across, from a slider: the drag is the slider's (3), not the strip's; up and down still scrolls the page.
-            if self.swipe == 1 && matches!(self.row_at(start.1, start.2), Some(Choice::Brightness | Choice::Scale)) {
+            if self.swipe == 1 && matches!(self.row_at(start.1, start.2), Some(Choice::Brightness | Choice::Scale | Choice::Typed(_))) {
                 self.swipe = 3;
             }
         }
@@ -4318,12 +4373,13 @@ impl Map {
                 match row {
                     Some(Choice::Base(code)) => set(self, ferros_sys::PREF_BASE, code),
                     // A slider tapped: its knob and its value there at once, as a drag would leave them; the scale is kept now (the lift that wrote a drag's has passed).
-                    Some(c @ (Choice::Brightness | Choice::Scale)) => {
+                    Some(c @ (Choice::Brightness | Choice::Scale | Choice::Typed(_))) => {
                         self.slide_to(c, sx);
                         self.slide = None;
                         if c == Choice::Brightness {
                             self.brightness_kept();
                         }
+                        self.typed_kept(c);
                         if let Some(s) = self.scale_live.take() {
                             set(self, ferros_sys::PREF_SCALE, libm::roundf(s) as i8 as u8);
                         }
@@ -4335,6 +4391,8 @@ impl Map {
                         }
                     }
                     Some(Choice::ScopeSet(v)) => set(self, ferros_sys::PREF_SCOPE, v),
+                    // The torch on at its level (and its strobe and timeout, which it reads itself) or off, as its quick circle's tap; one not heard from yet is asked to light (its first call starts it).
+                    Some(Choice::TorchOn) => quick::torch_ask(Some(if quick::torch_now().is_some_and(|l| l > 0) { 0 } else { ferros_sys::torch::level() })),
                     Some(Choice::Theme(i)) => set(self, ferros_sys::PREF_THEME, i),
                     Some(Choice::Dither) => set(self, ferros_sys::PREF_DITHER, (ferros_sys::pref(ferros_sys::PREF_DITHER) != 1) as u8),
                     Some(Choice::HitMap) => self.hit_view_toggle(),
@@ -4881,6 +4939,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The display's frame count as last read on a facts bell: a smaller one means the display restarted.
     let mut display_frames_seen = 0u32;
     let mut radios_seen = ferros_sys::pref(ferros_sys::PREF_RADIOS_OFF);
+    // The torch as last drawn: its answer and its four settings (preferences 42-45).
+    const TORCH_PREFS: [u64; 4] = [ferros_sys::PREF_TORCH_LEVEL, ferros_sys::PREF_TORCH_STROBE, ferros_sys::PREF_TORCH_DUTY, ferros_sys::PREF_TORCH_TIMEOUT];
+    let mut torch_seen = (quick::torch_now(), TORCH_PREFS.map(ferros_sys::pref));
     let mut tick_seen = 0i64;
     // The identity space's generation last read (payloads/fgtw op 17, through `fgtw_poller`).
     let mut space_seen = 0u32;
@@ -5080,6 +5141,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if radios != radios_seen {
             radios_seen = radios;
             page_dirty |= open && (page == "connections" || LINKS.contains(&page));
+        }
+        // The torch answered (lit, dark, or put out by its timeout and asked again) or its settings moved (here, or from the bridge): its page drawn again while it shows. Its answer comes from the quick row's worker thread, read here as every pass reads it.
+        let torch = (quick::torch_now(), TORCH_PREFS.map(ferros_sys::pref));
+        if torch != torch_seen {
+            torch_seen = torch;
+            page_dirty |= open && page == "torch";
         }
         // The clock and About's time since power on change with the second: each drawn as its second turns (`tick_at` ends the rest there), not on a timer of its own that drifts against the second. The clock's second is the wall clock's in the zone (a new zone, or the clock read again, turns it too), About's the counter's, which it counts from; a clock not read yet ticks on the counter until it is.
         let hz = freq();
@@ -5292,10 +5359,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             match corner {
                 quick::PULL => qr.take(f.2, frame_count),
                 quick::BEHIND => qr.settle_to(0, frame_count),
-                c if c & quick::ITEM != 0 => {
-                    let (cx, cy) = (u16::from_le_bytes([q[1], q[2]]) as f32 + 0.5, u16::from_le_bytes([q[3], q[4]]) as f32 + 0.5);
-                    qr.hold((c & 7) as usize, f.1, f.2, cx, cy);
-                }
+                c if c & quick::ITEM != 0 => qr.hold((c & 7) as usize),
                 _ => {}
             }
             // A helm button under the finger: lit at once (display op 54).
@@ -5350,9 +5414,19 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                         }
                     }
                 } else if corner & quick::ITEM != 0 && moved {
+                    // Tap acts, drag opens (QUICK.md "Quick pages"; owner, 2026-11-11: "the slide down to open the details"): a ring's every move is its pull (down brighter, up dimmer, on past the bright end its page); a circle with a page and no level pulls down toward its page; up, or a circle with no page, moves the row as before (pushed back up, it shuts). Once a pull took hold it keeps the finger whichever way it goes. The page opens over the plane (with an app in front, nothing: open question); the row shuts as it does, and the flight to it runs once the finger lifts, as a console circle's page does.
                     let k = (corner & 7) as usize;
-                    if k == quick::BRIGHTNESS || k == quick::TORCH {
-                        qr.turn_to(fx, fy);
+                    if qr.pulling() || quick::level(k) || quick::page(k).is_some() && dy > 0 && dy.abs() > dx.abs() {
+                        if let Some(page) = qr.pull_to(fy) {
+                            if !map.app_front {
+                                qr.settle_to(0, frame_count);
+                                map.show_page(page);
+                                map.draw();
+                            }
+                            let mut l = Line::new();
+                            let _ = write!(l, "map: quick: pulled down to the {page} page\n");
+                            console(grants, l.as_str().as_bytes());
+                        }
                     } else if dy.abs() > dx.abs() {
                         qr.let_go(true, frame_count);
                         corner = quick::PULL;
@@ -5440,7 +5514,14 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
                 quick::BEHIND => tap_thru = false,
                 c if c & quick::ITEM != 0 => {
-                    qr.let_go(moved, frame_count);
+                    // A tap on a circle with nothing to switch (brightness) opens its page, the row shutting as it does.
+                    if let Some(page) = qr.let_go(moved, frame_count) {
+                        if !map.app_front {
+                            qr.settle_to(0, frame_count);
+                            map.show_page(page);
+                            map.draw();
+                        }
+                    }
                     tap_thru = false;
                 }
                 c if c & 16 != 0 && c < 32 => {
