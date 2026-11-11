@@ -1,0 +1,286 @@
+//! A host emulator of Valhall words (feature `sim`, host only): the forms the SSA compiler emits and the device-verified kernels use, decoded from the words themselves, one invocation at a time.
+//! It is how a kernel is checked before it reaches the device (owner, 2026-11-11: "Prove on the host what you can"): the compiler's register allocation, its loop copies, its constants in LUT, uniform and register places, its branches, run as the GPU would run them, not the recording they came from.
+//! It is checked itself against the words the device ran (tests: the Mandelbrot kernel, bit for bit against the CPU as on the device).
+//!
+//! What it is not: the hardware's rounding of the special function unit. FRCP and FRSQ come out correctly rounded here (within an ulp on the device, gputest 10); FLOGD, FADD_LSCALE and FREXPE's `log` form are one self-consistent split x = m · 2^e with m in [0.75, 1.5) whose sequence (`F::log2_hw`) gives log₂ x (within an ulp on the device, gputest 12); FEXP is 2 to the fixed-point power. A picture through these looks as the device's does; its bits may differ from the device's by an ulp here and there, as they may from the CPU's.
+//!
+//! An invocation runs alone, so a divergent branch is a plain jump: the per-thread result is the warp's, since nothing here reads another lane.
+
+extern crate std;
+
+use crate::LUT;
+
+/// The memory a kernel sees: `bytes` at GPU virtual address `base`.
+pub struct Memory {
+    pub base: u64,
+    pub bytes: std::vec::Vec<u8>,
+}
+
+impl Memory {
+    /// The byte offset of `va`, `n` bytes long. An address outside is a fault on the device (the GPU's MMU), so here a panic naming it.
+    fn at(&self, va: u64, n: usize) -> usize {
+        // WHY: the address is the kernel's own arithmetic; one outside the buffer is the bug this emulator exists to show, as the device's MMU would fault it.
+        assert!(va >= self.base && va + n as u64 <= self.base + self.bytes.len() as u64, "valhall::sim: an access at G#{va:X} outside G#{:X}..G#{:X}", self.base, self.base + self.bytes.len() as u64);
+        (va - self.base) as usize
+    }
+    pub fn read32(&self, va: u64) -> u32 {
+        let o = self.at(va, 4);
+        u32::from_le_bytes(self.bytes[o..o + 4].try_into().unwrap())
+    }
+    pub fn write32(&mut self, va: u64, v: u32) {
+        let o = self.at(va, 4);
+        self.bytes[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// Instructions one invocation may run before the emulator calls it endless (the device's progress timer would stop it).
+const STEPS: u64 = 1 << 32;
+
+/// Runs `words` for one invocation: r60 the global id X and r61 Y (the service's preload), `uniforms` its FAU slots, over `mem`. Returns how many instructions it ran.
+pub fn run(words: &[u64], uniforms: &[u64], gid: [u32; 2], mem: &mut Memory) -> u64 {
+    let mut reg = [0u32; 64];
+    reg[60] = gid[0];
+    reg[61] = gid[1];
+    let mut pc = 0usize;
+    let mut steps = 0u64;
+    loop {
+        let w = words[pc];
+        steps += 1;
+        assert!(steps < STEPS, "valhall::sim: no end after 2^32 instructions");
+        let page = (w >> 57) & 3;
+        // A source byte: a register, a uniform word (its slot's low 5 bits, the page above), or a LUT entry.
+        let src = |reg: &[u32; 64], byte: u64| -> u32 {
+            let b = byte & 0xFF;
+            match b >> 6 {
+                0 => reg[(b & 63) as usize],
+                2 => {
+                    let slot = (page << 5 | (b >> 1) & 31) as usize;
+                    (uniforms[slot] >> (32 * (b & 1))) as u32
+                }
+                3 => LUT[(b & 31) as usize],
+                _ => panic!("valhall::sim: source byte G#{b:X} at {pc}"),
+            }
+        };
+        // A 32-bit source in ALU position i, and as an f32 with its modifiers (abs, then negate).
+        let s = |reg: &[u32; 64], i: u32| src(reg, w >> (8 * i));
+        let f = |reg: &[u32; 64], i: u32| {
+            let mut v = f32::from_bits(s(reg, i));
+            if (w >> (39 - 2 * i)) & 1 == 1 {
+                v = v.abs();
+            }
+            if (w >> (38 - 2 * i)) & 1 == 1 {
+                v = -v;
+            }
+            v
+        };
+        let dst = ((w >> 40) & 63) as usize;
+        // A full 32-bit destination (write mask 3): the f16 halves are the present stage's, not emulated.
+        let full = (w >> 46) & 3 == 3;
+        let op = (w >> 48) & 0x1FF;
+        let op2 = (w >> 16) & 0xF;
+        let put = |reg: &mut [u32; 64], v: u32| {
+            assert!(full, "valhall::sim: a half-register destination at {pc} (G#{w:016X})");
+            reg[dst] = v;
+        };
+        let mut next = pc + 1;
+        match op {
+            // IADD_IMM.i32: a + the immediate in 39:8.
+            0x110 => {
+                let v = s(&reg, 0).wrapping_add((w >> 8) as u32);
+                put(&mut reg, v);
+            }
+            // MOV.i32.
+            0x091 => {
+                let v = s(&reg, 0);
+                put(&mut reg, v);
+            }
+            // IADD.u32 (opcode2 0), IMUL.i32 (G#A).
+            0x0A0 => {
+                let (a, b) = (s(&reg, 0), s(&reg, 1));
+                let v = match op2 {
+                    0 => a.wrapping_add(b),
+                    0xA => a.wrapping_mul(b),
+                    _ => panic!("valhall::sim: G#0A0 opcode2 {op2} at {pc}"),
+                };
+                put(&mut reg, v);
+            }
+            // ISUB.s32 (opcode2 1).
+            0x0A8 => {
+                assert_eq!(op2, 1, "valhall::sim: G#0A8 opcode2 at {pc}");
+                let v = s(&reg, 0).wrapping_sub(s(&reg, 1));
+                put(&mut reg, v);
+            }
+            // SHADDX.u64: a (a pair or a uniform slot) + (b's low word << 22:20).
+            0x1A3 => {
+                let a = w & 0xFF;
+                let base = if a >> 6 == 2 { uniforms[(page << 5 | (a >> 1) & 31) as usize] } else { reg[(a & 63) as usize] as u64 | (reg[(a & 63) as usize + 1] as u64) << 32 };
+                let b = reg[((w >> 8) & 63) as usize] as u64;
+                let v = base.wrapping_add(b << ((w >> 20) & 7));
+                reg[dst] = v as u32;
+                reg[dst + 1] = (v >> 32) as u32;
+            }
+            // The shift group: A (0), the shift (byte 29:26 - 4 of source 1), B (2); bit 32 shifts left, 25:24 is and, or, xor.
+            0x0B4 => {
+                let (a, sh, b) = (s(&reg, 0), s(&reg, 1), s(&reg, 2));
+                let amount = (sh >> (8 * (((w >> 26) & 15) - 4))) & 0xFF;
+                let shifted = if (w >> 32) & 1 == 1 { a.wrapping_shl(amount) } else { a.wrapping_shr(amount) };
+                // WHY: a shift of 32 or more is not something the compiler emits (it shifts by constants below 32 and by the LUT's byte indices); `wrapping_` would hide one as a smaller shift.
+                assert!(amount < 32, "valhall::sim: a shift by {amount} at {pc}");
+                let v = match (w >> 24) & 3 {
+                    0 => shifted & b,
+                    1 => shifted | b,
+                    2 => shifted ^ b,
+                    _ => panic!("valhall::sim: shift op at {pc}"),
+                };
+                put(&mut reg, v);
+            }
+            // MUX.i32.bit: a's bits where the mask's are set.
+            0x0B8 => {
+                assert_eq!((w >> 32) & 3, 3, "valhall::sim: MUX other than .bit at {pc}");
+                let (a, b, m) = (s(&reg, 0), s(&reg, 1), s(&reg, 2));
+                put(&mut reg, (a & m) | (b & !m));
+            }
+            // ICMP_OR.u32 and FCMP_OR.f32: the compare as the result form (I1 0 or 1, F1 0.0 or 1.0, M1 0 or all ones), OR source 2.
+            0x0F0 | 0x0F4 => {
+                let cond = (w >> 32) & 7;
+                let t = if op == 0x0F0 {
+                    let (a, b) = (s(&reg, 0), s(&reg, 1));
+                    match cond {
+                        0 => a == b,
+                        1 => a > b,
+                        2 => a >= b,
+                        3 => a != b,
+                        4 => a < b,
+                        5 => a <= b,
+                        _ => panic!("valhall::sim: ICMP cond {cond} at {pc}"),
+                    }
+                } else {
+                    let (a, b) = (f(&reg, 0), f(&reg, 1));
+                    match cond {
+                        0 => a == b,
+                        1 => a > b,
+                        2 => a >= b,
+                        3 => a != b,
+                        4 => a < b,
+                        5 => a <= b,
+                        6 => a < b || a > b,
+                        _ => panic!("valhall::sim: FCMP cond {cond} at {pc}"),
+                    }
+                };
+                let v = match (w >> 30) & 3 {
+                    0 => t as u32,
+                    1 => (t as u32 as f32).to_bits(),
+                    2 => if t { u32::MAX } else { 0 },
+                    _ => panic!("valhall::sim: compare result form at {pc}"),
+                };
+                let v = v | s(&reg, 2);
+                put(&mut reg, v);
+            }
+            // Conversions (opcode2 20:16): U32_TO_F32 G#19, S32_TO_F32 9, F32_TO_S32 G#C, F32_TO_U32 G#1C, FROUND G#D, U16_TO_U32 G#14; the round mode 31:30.
+            0x090 => {
+                let a = s(&reg, 0);
+                let round = |x: f32| match (w >> 30) & 3 {
+                    0 => x.round_ties_even(),
+                    1 => x.ceil(),
+                    2 => x.floor(),
+                    _ => x.trunc(),
+                };
+                let v = match (w >> 16) & 0x1F {
+                    0x19 => (a as f32).to_bits(),
+                    0x09 => (a as i32 as f32).to_bits(),
+                    0x0C => round(f32::from_bits(a)) as i32 as u32,
+                    0x1C => round(f32::from_bits(a)) as u32,
+                    0x0D => round(f32::from_bits(a)).to_bits(),
+                    0x14 => (a >> (16 * ((w >> 28) & 1))) & 0xFFFF,
+                    o => panic!("valhall::sim: conversion G#{o:X} at {pc}"),
+                };
+                put(&mut reg, v);
+            }
+            // FREXPE (opcode2 2), the `log` form (bit 25): the e of x = m · 2^e with m in [0.75, 1.5).
+            0x099 => {
+                assert!(op2 == 2 && (w >> 24) & 3 == 2, "valhall::sim: FREXPE other than the log form at {pc}");
+                let e = split(f32::from_bits(s(&reg, 0))).1;
+                put(&mut reg, e as u32);
+            }
+            // The special function unit: FRCP (0), FRSQ (2), FLOGD (8).
+            0x09C => {
+                let a = f(&reg, 0) as f64;
+                let v = match op2 {
+                    0 => (1. / a) as f32,
+                    2 => (1. / a.sqrt()) as f32,
+                    8 => {
+                        let m = split(a as f32).0 as f64;
+                        // log₂ m / (m − 1), whose limit at m = 1 is 1 / ln 2.
+                        if m == 1. { core::f64::consts::LOG2_E as f32 } else { (m.log2() / (m - 1.)) as f32 }
+                    }
+                    _ => panic!("valhall::sim: SFU opcode2 {op2} at {pc}"),
+                };
+                put(&mut reg, v.to_bits());
+            }
+            // The G#A4 group: FADD (0), FMIN (2), FMAX (3), FEXP (8: a fixed point 8:24 source and the float), FADD_LSCALE (9: a + the mantissa of b).
+            0x0A4 => {
+                let v = match op2 {
+                    0 => f(&reg, 0) + f(&reg, 1),
+                    2 => f(&reg, 0).min(f(&reg, 1)),
+                    3 => f(&reg, 0).max(f(&reg, 1)),
+                    8 => ((s(&reg, 0) as i32 as f64) / (1u32 << 24) as f64).exp2() as f32,
+                    9 => f(&reg, 0) + split(f(&reg, 1)).0,
+                    _ => panic!("valhall::sim: G#0A4 opcode2 {op2} at {pc}"),
+                };
+                put(&mut reg, v.to_bits());
+            }
+            // FMA.f32, one rounding.
+            0x0B2 => {
+                let v = f(&reg, 0).mul_add(f(&reg, 1), f(&reg, 2));
+                put(&mut reg, v.to_bits());
+            }
+            // BRANCHZ: taken when the source is nonzero, or zero with .eq (bit 36); the offset 34:8 in instructions from the next.
+            0x01F => {
+                let c = s(&reg, 0);
+                let taken = if (w >> 36) & 1 == 1 { c == 0 } else { c != 0 };
+                if taken {
+                    let off = (((w >> 8) & ((1 << 27) - 1)) as i64) << 37 >> 37;
+                    next = (pc as i64 + 1 + off) as usize;
+                }
+            }
+            // LOAD.i32 (size 3 at 29:27): the staging register 45:40, the signed offset 23:8, the address pair 7:0.
+            0x060 => {
+                assert_eq!((w >> 27) & 7, 3, "valhall::sim: a load other than i32 at {pc}");
+                let va = addr(&reg, w);
+                reg[dst] = mem.read32(va);
+            }
+            // STORE.i32.
+            0x061 => {
+                assert_eq!((w >> 27) & 7, 3, "valhall::sim: a store other than i32 at {pc}");
+                let va = addr(&reg, w);
+                mem.write32(va, reg[dst]);
+            }
+            _ => panic!("valhall::sim: opcode G#{op:X} at {pc} (G#{w:016X})"),
+        }
+        if (w >> 59) & 15 == 15 {
+            return steps;
+        }
+        pc = next;
+    }
+}
+
+/// A load's or store's address: the pair in 7:0 plus the signed offset in 23:8.
+fn addr(reg: &[u32; 64], w: u64) -> u64 {
+    let p = (w & 63) as usize;
+    let base = reg[p] as u64 | (reg[p + 1] as u64) << 32;
+    base.wrapping_add((w >> 8) as u16 as i16 as i64 as u64)
+}
+
+/// x as m · 2^e with m in [0.75, 1.5) (FREXPE's `log` form as this emulator takes it); 0 and the specials as they are, with e 0.
+fn split(x: f32) -> (f32, i32) {
+    if x == 0. || !x.is_finite() {
+        return (x, 0);
+    }
+    let mut e = x.abs().log2().floor() as i32;
+    let mut m = x / (e as f32).exp2();
+    if m.abs() >= 1.5 {
+        m *= 0.5;
+        e += 1;
+    }
+    (m, e)
+}

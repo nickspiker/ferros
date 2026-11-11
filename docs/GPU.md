@@ -206,6 +206,7 @@ The owner's direction: the GPU produces compute-dense layers (the Mandelbrot and
 - **The grant:** `layers` (the GPU driver and the display server; one shared arena for now, with no isolation between its users).
 - **In the GPU's fence:** beside `gpu-mem`, both in one GiB.
 - **Zeroed before every reset.**
+- **Who uses which part** (no isolation yet, GPU-KISTS.md plan step 1): the first 32 MiB wallgen's (the person's wallpaper on the GPU since 2026-11-11: the frame, the refine's list, the kernel's words) and gputest's bench, never at once; from 32 MiB ahau's (the mark's words, outputs, stage and sums).
 - **Where:** the device tree reserves nothing in G#9800_0000-G#A000_0000 (USB's 4 MiB end at G#9740_0000). It reads and writes as ordinary non-secure DRAM.
 
 The GPU driver maps it coherent (MEMATTR index 6, shareable both ways) at GPU VA G#8000_0000. With input bit 6 and `--dma layers` as grant slot 5, the test runs both ways:

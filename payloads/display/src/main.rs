@@ -2090,18 +2090,10 @@ static mut ARENA: usize = 1;
 static mut ARENA_NEXT: usize = 1;
 /// The arena's size in words: the `display-sprites` region's 32 MiB when granted (a screen packed with circles needs ~20 MB of square sprites; 6 MiB thrashed at 200, 2026-10-24), else 6 MiB of the heap (the 16 MiB below the back buffer, where the 256-px icon mips, 4.4 MB, and the glyph cache, 2 MiB, left no room for 10, 2026-10-23).
 static mut ARENA_WORDS: usize = (6 << 20) / 8;
-/// The wallpaper (owner, 2026-11-07): under everything on the home screen, a full screen of working values (premultiplied, opaque) in the upper half of the `display-sprites` region; 0 when there is no region for it. Unlocked with the person: it is made from their wallpaper seed (op 42, from the attest screen: the `wallpaper` crate's Julia set, the same on every device of theirs and theirs alone) unless they set their own (`map.wallpaper` in their space, a VSF visual), and before attest there is none.
+/// The wallpaper (owner, 2026-11-07): under everything on the home screen, a full screen of working values (premultiplied, opaque) in the upper half of the `display-sprites` region; 0 when there is no region for it. Unlocked with the person: their own (`map.wallpaper` in their space, a VSF visual) if they set one, else the one made from their wallpaper seed (the `wallpaper` crate's Julia set, the same on every device of theirs and theirs alone), which wallgen draws on the GPU and keeps (`map.wallpaper.made`, op 44); before attest there is none. The display draws none itself (owner, 2026-11-11: "We should be using GPU path for the brot in all cases and never 'falling back' to the CPU", "Black until we bring the GPU up"): until wallgen has made it, none shows.
 static mut WALL_BUF: usize = 0;
 /// Whether `WALL_BUF` holds a finished wallpaper (publishing puts it under the canvas only then).
 static mut WALL_ON: bool = false;
-/// A seed waiting to be made into the wallpaper: the render loop starts the job when none is running (one job at a time, so its threads never write a wallpaper being replaced).
-static mut WALL_PENDING: Option<[u8; 32]> = None;
-/// The job's choices (`wallpaper::params`, worked out once by the render loop as it starts the job), read by its threads.
-static mut WALL_P: Option<wallpaper::Params> = None;
-/// The refining mask (a bit a pixel, `wallpaper::mask_stride` bytes a row), allocated at start before the heap's mark and kept.
-static mut WALL_MASK: usize = 0;
-/// Whether a job is running (set by the render loop as it starts one, cleared when it sees the job done).
-static mut WALL_RUNNING: bool = false;
 const SPRITE_MAX: usize = 1100;
 
 /// Circle i's sprite for this key: reused if it is current, else drawn (into its own space if that is big enough, otherwise new space, the arena started over when full). The sprite is d × d pixels with the circle at its centre pixel, followed by d words of row extents (first | last << 16, both inclusive; first > last for an empty row). Returns the sprite's words and extents.
@@ -4337,68 +4329,6 @@ fn measure_text(t: &mut Txt, kind: u16, v: i64) {
     };
 }
 
-/// The wallpaper's threads (owner, 2026-11-07: twelve seconds on the render thread alone was too long). Besides the render loop, which never waits on them, they take bands of rows of the job's three passes: drawing (one sample a pixel), marking (the pixels whose colour differs from a neighbour's, `wallpaper::mark_rows`), and refining (those again at 4 × 4 samples, `wallpaper::refine_rows`). A band is claimed by a compare-and-swap on (pass, next band), so the cores' different rates even out, and whoever finishes a pass's last band moves the job to the next pass and wakes the others. Marking reads the finished first pass and writes only its own rows' bits; refining writes only its own rows; no band ever writes what another reads, and the picture is the same however the bands fall.
-const WALL_THREADS: usize = 4;
-/// Rows a band.
-const WALL_BAND: usize = 1 << 5;
-static mut WALL_STACKS: [[u8; 1 << 15]; WALL_THREADS] = [[0; 1 << 15]; WALL_THREADS];
-/// The pass (bits 16-23: 0 drawing, 1 marking, 2 refining, 3 none running) and its next band (bits 0-15).
-static WALL_CLAIM: AtomicU64 = AtomicU64::new(3 << 16);
-/// Bands of the current pass finished.
-static WALL_DONE: AtomicU64 = AtomicU64::new(0);
-/// Passes finished, ever: the render loop counts from the job's start to see the first pass done and the last.
-static WALL_PASSES: AtomicU64 = AtomicU64::new(0);
-/// `WALL_PASSES` when the running job started, and the counter then (for its timing line).
-static mut WALL_BASE: (u64, u64) = (0, 0);
-
-extern "C" fn wall_thread(_idx: u64) -> ! {
-    loop {
-        let c = WALL_CLAIM.load(Ordering::Acquire);
-        let (pass, band) = ((c >> 16) & 0xFF, (c & 0xFFFF) as usize);
-        if pass >= 3 {
-            ferros_sys::wait(&WALL_CLAIM, c, 0);
-            continue;
-        }
-        // The job's choices, set by the render loop before it opened the first pass.
-        let Some(p) = (unsafe { WALL_P }) else { panic!("wallpaper: a pass with no job") };
-        let bands = p.height.div_ceil(WALL_BAND);
-        if band >= bands {
-            ferros_sys::wait(&WALL_CLAIM, c, 0);
-            continue;
-        }
-        if WALL_CLAIM.compare_exchange(c, c + 1, Ordering::AcqRel, Ordering::Relaxed).is_err() {
-            continue;
-        }
-        wall_band(&p, pass, band);
-        if WALL_DONE.fetch_add(1, Ordering::AcqRel) + 1 == bands as u64 {
-            // The pass's last band: every band of it is claimed and finished, so the count starts again for the next.
-            WALL_DONE.store(0, Ordering::Release);
-            WALL_CLAIM.store((pass + 1) << 16, Ordering::Release);
-            WALL_PASSES.fetch_add(1, Ordering::AcqRel);
-            ferros_sys::wake(&WALL_CLAIM, WALL_THREADS as u64);
-        }
-    }
-}
-
-/// One band of one pass of the wallpaper job `p`.
-fn wall_band(p: &wallpaper::Params, pass: u64, band: usize) {
-    let (w, h) = (p.width, p.height);
-    // The last band stops at the frame's bottom.
-    let rows = band * WALL_BAND..((band + 1) * WALL_BAND).min(h);
-    let stride = wallpaper::mask_stride(w);
-    let (buf, mask) = unsafe { (WALL_BUF as *mut u64, WALL_MASK as *mut u8) };
-    let n = rows.len();
-    unsafe {
-        let mine = core::slice::from_raw_parts_mut(buf.add(rows.start * w), n * w);
-        let bits = core::slice::from_raw_parts_mut(mask.add(rows.start * stride), n * stride);
-        match pass {
-            0 => wallpaper::render_rows(p, rows, mine),
-            1 => wallpaper::mark_rows(p, core::slice::from_raw_parts(buf, w * h), rows, bits),
-            _ => wallpaper::refine_rows(p, rows, bits, mine),
-        }
-    }
-}
-
 /// Measuring an attest (owner, 2026-11-09: "why the wallpaper still takes about 1s to show and the console 2s after attest"): when op 42 came (timer ticks, 0 never), and which of its marks have been said (bits).
 static mut ATTEST_T: (u64, u32) = (0, 0);
 
@@ -4419,10 +4349,9 @@ fn attest_mark(grants: u64, bit: u32, what: &[u8]) {
     }
 }
 
-/// The render loop's side of the wallpaper job, each pass of the loop: a waiting seed starts a job when none runs; the first pass done shows the wallpaper, the refining done shows it again. Each with its time to the console.
+/// The render loop's side of the wallpaper, each pass of the loop: a load wanted is started, and a load's result is shown the pass it arrives. Each with its line to the console. The display draws no wallpaper itself: the one made from the person's seed is wallgen's, drawn on the GPU (op 44 when it is kept).
 fn wall_step(grants: u64, width: usize, height: usize) {
     unsafe {
-        // A load (`wall_loader`): its result shown the pass it arrives, or the seed's job wanted when nothing was kept.
         if LOADING {
             let d = LOAD_DONE.load(Ordering::Acquire);
             let r = LOAD_REQ.load(Ordering::Acquire);
@@ -4430,12 +4359,11 @@ fn wall_step(grants: u64, width: usize, height: usize) {
                 return;
             }
             LOADING = false;
-            let seed_late = LOAD_SEED_LATE;
-            LOAD_SEED_LATE = false;
-            // A newer load wanted meanwhile (another attest): this result is not shown; that load starts next pass.
+            // A newer load wanted meanwhile (another attest, or wallgen's op 44): this result is not shown; that load starts next pass.
             if LOAD_WANTED != 0 {
                 return;
             }
+            WALL_OWN = d & 0xFF == FOUND_OWN;
             match d & 0xFF {
                 FOUND_OWN => {
                     console(grants, b"display: wallpaper: the person's own\n");
@@ -4447,18 +4375,12 @@ fn wall_step(grants: u64, width: usize, height: usize) {
                     wall_ready(width, height);
                     attest_mark(grants, 2, b"wallpaper shown");
                 }
-                _ if r & LOAD_SEED != 0 || seed_late => {
-                    console(grants, b"display: wallpaper: made from the person's seed\n");
-                    WALL_PENDING = Some(LOAD_SEED_BYTES);
-                }
-                // Said, not silent (the Pro, 2026-11-10: the home screen without its wallpaper mid-boot, nothing in the log to say why): the load took the wallpaper off the glass and has nothing to put back.
-                _ => console(grants, b"display: wallpaper: nothing kept and no seed with the load; none shown\n"),
+                // Said, not silent (the Pro, 2026-11-10: the home screen without its wallpaper mid-boot, nothing in the log to say why).
+                _ => console(grants, b"display: wallpaper: none kept yet; none shown until wallgen has made it on the GPU (op 44)\n"),
             }
             return;
         }
-        if !WALL_RUNNING && LOAD_WANTED != 0 {
-            // Started only between jobs: the loader and the job's threads both write `WALL_BUF`. A seed waiting for its job gives way: the load falls back to it if nothing is kept.
-            WALL_PENDING = None;
+        if LOAD_WANTED != 0 {
             LOADING = true;
             WALL_ON = false;
             attest_mark(grants, 1, b"wallpaper load started");
@@ -4466,38 +4388,6 @@ fn wall_step(grants: u64, width: usize, height: usize) {
             LOAD_REQ.store(seq << 8 | LOAD_WANTED, Ordering::Release);
             LOAD_WANTED = 0;
             ferros_sys::wake(&LOAD_REQ, 1);
-            return;
-        }
-        if !WALL_RUNNING {
-            let Some(seed) = (*(&raw mut WALL_PENDING)).take() else { return };
-            WALL_ON = false;
-            clean_reset_all();
-            WALL_P = Some(wallpaper::params(&seed, width, height));
-            WALL_BASE = (WALL_PASSES.load(Ordering::Acquire), now());
-            WALL_RUNNING = true;
-            WALL_DONE.store(0, Ordering::Release);
-            WALL_CLAIM.store(0, Ordering::Release);
-            ferros_sys::wake(&WALL_CLAIM, WALL_THREADS as u64);
-            return;
-        }
-        let done = WALL_PASSES.load(Ordering::Acquire) - WALL_BASE.0;
-        let ms = |l: &mut Log| l.dec(ferros_sys::us_since(WALL_BASE.1) / 1000);
-        if done >= 1 && !WALL_ON {
-            wall_ready(width, height);
-            let mut l = Log { grants, buf: [0; 256], n: 0 };
-            l.s(b"display: wallpaper drawn in ");
-            ms(&mut l);
-            l.s(b" ms; refining\n");
-            l.flush();
-        }
-        if done >= 3 {
-            wall_ready(width, height);
-            WALL_RUNNING = false;
-            let mut l = Log { grants, buf: [0; 256], n: 0 };
-            l.s(b"display: wallpaper refined in ");
-            ms(&mut l);
-            l.s(b" ms\n");
-            l.flush();
         }
     }
 }
@@ -4547,23 +4437,21 @@ impl vsf::container::ByteSource for VaultSource {
     }
 }
 
-/// The wallpaper's loader (owner, 2026-11-08: "4 seconds from attest to showing homescreen. that's real bad... should be milliseconds"): the person's wallpaper read from the vault on a thread of its own, so the home screen is drawn at once and the wallpaper appears under it in the first frame after it is whole (no fade). Until then the 24 MB read held the render thread for 2.9 s, and the attest screen's call (op 42) with it. The render loop starts a load (`LOAD_REQ`: a sequence number, then what to try in the low byte) only while no wallpaper job runs, and takes its result (`LOAD_DONE`: the same number, then what was found) in `wall_step`; meanwhile nothing publishes `WALL_BUF` (`WALL_ON` is false).
+/// The wallpaper's loader (owner, 2026-11-08: "4 seconds from attest to showing homescreen. that's real bad... should be milliseconds"): the person's wallpaper read from the vault on a thread of its own, so the home screen is drawn at once and the wallpaper appears under it in the first frame after it is whole (no fade). Until then the 24 MB read held the render thread for 2.9 s, and the attest screen's call (op 42) with it. The render loop starts a load (`LOAD_REQ`: a sequence number, then what to try in the low byte) when one is wanted, and takes its result (`LOAD_DONE`: the same number, then what was found) in `wall_step`; meanwhile nothing publishes `WALL_BUF` (`WALL_ON` is false).
 static LOAD_REQ: AtomicU64 = AtomicU64::new(0);
 static LOAD_DONE: AtomicU64 = AtomicU64::new(0);
-/// What a load tries (`LOAD_REQ`'s low byte): their own, then the one made on this device; and then (`LOAD_SEED`) the seed, drawn here, when neither is kept.
+/// What a load tries (`LOAD_REQ`'s low byte): their own, then the one made on this device.
 const LOAD_KEPT: u64 = 1;
-const LOAD_SEED: u64 = 2;
 /// What a load found (`LOAD_DONE`'s low byte).
 const FOUND_OWN: u64 = 1;
 const FOUND_MADE: u64 = 2;
 const FOUND_NONE: u64 = 3;
 /// The screen's size, for the loader.
 static mut LOAD_SIZE: (usize, usize) = (0, 0);
-/// The seed a load falls back to (op 42's), and a load wanted but not started (a job was running): its low byte as `LOAD_REQ`'s.
-static mut LOAD_SEED_BYTES: [u8; 32] = [0; 32];
+/// A load wanted and not started yet (the render loop starts it next pass): its low byte as `LOAD_REQ`'s.
 static mut LOAD_WANTED: u64 = 0;
-/// A seed to fall back to that came while a load of the kept wallpaper was already running (`wall_load`): that load's result stands, and when nothing was kept the seed's wallpaper is made.
-static mut LOAD_SEED_LATE: bool = false;
+/// Whether the wallpaper shown is the person's own (`map.wallpaper`), which wallgen's made one never replaces (op 44).
+static mut WALL_OWN: bool = false;
 /// A load running (from its start in `wall_step` to its result taken there).
 static mut LOADING: bool = false;
 /// The loader's stack (its allocations are told by it, as the console worker's are) and heap: vsf's header parse and the transfer buffer, dropped after each load. Non-zero initialisers (see `ALLOC`).
@@ -4597,18 +4485,13 @@ extern "C" fn wall_loader(grants: u64) -> ! {
     }
 }
 
-/// A load wanted (`what`: `LOAD_KEPT`, or with `LOAD_SEED` falling back to the seed): started by `wall_step` as soon as no job runs. The wallpaper on the glass goes now: the load writes the buffer it is published from.
-fn wall_load(what: u64, seed: Option<[u8; 32]>) {
+/// A load of the kept wallpaper wanted, started by `wall_step` next pass. The wallpaper on the glass goes now: the load writes the buffer it is published from. A read already under way is kept unless `again` (wallgen's op 44: it has just stored what that read may have missed): a display started after the person unlocked reads at once, and the attest's op 42 follows; until 2026-11-09 the second request threw the first read away and read the 24 MB again (shown at +1716 ms where one read takes about 420).
+fn wall_load(again: bool) {
     unsafe {
-        if let Some(s) = seed {
-            LOAD_SEED_BYTES = s;
-        }
-        // The kept wallpaper's read already under way (a display started after the person unlocked reads it at once, and the attest's op 42 follows): the same read, so it is kept and the seed made its fallback. Until 2026-11-09 the second request threw the first read away and read the 24 MB again: shown at +1716 ms where one read takes about 420.
-        if LOADING && what & LOAD_KEPT != 0 && LOAD_REQ.load(Ordering::Acquire) & LOAD_KEPT != 0 {
-            LOAD_SEED_LATE |= what & LOAD_SEED != 0;
+        if LOADING && !again && LOAD_REQ.load(Ordering::Acquire) & LOAD_KEPT != 0 {
             return;
         }
-        LOAD_WANTED = what;
+        LOAD_WANTED = LOAD_KEPT;
         WALL_ON = false;
     }
     clean_reset_all();
@@ -6243,8 +6126,6 @@ fn server(grants: u64) -> ! {
         LOAD_STACK_LEN = (*(&raw const LOAD_STACK)).len();
         LOAD_STACK_LO = (&raw const LOAD_STACK) as usize;
         LOAD_SIZE = (width, height);
-        // The wallpaper's refining mask, kept for the process (before the mark): it was allocated at the first wallpaper job until 2026-11-11, after the mark, where the next frame's reset handed its bytes to the frame's scratch while the wallpaper's threads still read and wrote them.
-        WALL_MASK = alloc::vec![0u8; wallpaper::mask_stride(width) * height].leak().as_mut_ptr() as usize;
     }
     // Each publishing thread's flight scratch (`flight_row_buf`), kept with the rest.
     unsafe {
@@ -6393,13 +6274,6 @@ fn server(grants: u64) -> ! {
         log.s(b"display: no panel thread\n");
         log.flush();
     }
-    // The wallpaper's threads, idle until a job (`wall_thread`); spawned before the render thread pins itself to the big core, so they run on any.
-    for i in 0..WALL_THREADS {
-        if ferros_sys::thread_spawn(wall_thread, unsafe { &mut (*(&raw mut WALL_STACKS))[i] }, i as u64) != 0 {
-            log.s(b"display: no wallpaper thread\n");
-            log.flush();
-        }
-    }
     // The wallpaper's loader (`wall_loader`), idle until a load.
     if ferros_sys::thread_spawn(wall_loader, unsafe { &mut *(&raw mut LOAD_STACK) }, grants) != 0 {
         log.s(b"display: no wallpaper loader\n");
@@ -6429,9 +6303,9 @@ fn server(grants: u64) -> ! {
     }
     // The render thread on the big core (KERNEL.md "Cores": pinning by latency class — this is the one real compute path; receive and vsync stay on the workers, where the map and the touch server run, so a call hands off on the caller's own core). After the other threads are spawned: they inherit the mask.
     ferros_sys::pin(ferros_sys::CORES_BIG);
-    // A person already unlocked (a display restarted after attest): their wallpaper as their space keeps it, their own or the one made on this device, so a restart does not lose it until the next attest; read by the loader while the screen is drawn. Before attest their space is closed, nothing is read, and the attest screen hands the seed over as ever (op 42).
+    // A person already unlocked (a display restarted after attest): their wallpaper as their space keeps it, their own or the one made on this device, so a restart does not lose it until the next attest; read by the loader while the screen is drawn. Before attest their space is closed, nothing is read, and the attest screen says when it opens (op 42).
     if unsafe { WALL_BUF } != 0 {
-        wall_load(LOAD_KEPT, None);
+        wall_load(false);
     }
     // What the ring's tail was when this pass last looked: the wait at the end of a pass returns as soon as it moves.
     let mut seen_tail = 0u64;
@@ -7560,28 +7434,25 @@ fn server(grants: u64) -> ! {
                     }
                 }
                 // 30 `capture`: the frame as it is composed for the panel (windows, the corners, the glass) but in working values, before the panel's table and dither, into a surface no window holds; replies its physical address as text, `G#…` (tools/screencap reads it; the reply holds 16 bytes). With no window up the canvas is the screen: replies `canvas`.
-                // 42 `wallpaper` [seed 32]: a person attested, and this is their wallpaper seed (the attest screen derives it from their identity seed; the same on every device of theirs). Their own wallpaper if they set one (`map.wallpaper`, in their space, readable now), else the one made from the seed, by its threads (`wall_thread`, started from the render loop: `wall_step`); until the first pass is drawn the home screen shows none. Replies 0, or 1 with no wallpaper buffer.
+                // 42 `wallpaper` [seed 32]: a person attested (the attest screen sends their wallpaper seed, which the display no longer needs: wallgen has it from the kernel and draws it on the GPU). Their own wallpaper if they set one (`map.wallpaper`, in their space, readable now), else the one made from the seed and kept on this device (payloads/wallgen; owner, 2026-11-07: not drawn again at every attest); else none until wallgen has made it (op 44). Replies 0, or 1 with no wallpaper buffer.
                 Some(42) if m.len() >= 33 => {
                     if unsafe { WALL_BUF } == 0 {
                         out[0] = 1;
                     } else {
-                        let mut seed = [0u8; 32];
-                        seed.copy_from_slice(&m[1..33]);
                         unsafe { ATTEST_T = (now(), 0) };
-                        // Read by the loader (`wall_loader`) and answered now: their own, else the one made on this device from their seed and kept (payloads/wallgen; owner, 2026-11-07: not drawn again at every attest), else drawn here from the seed meanwhile, while wallgen makes and keeps it (it says when, op 44). The home screen does not wait for it (owner, 2026-11-08).
-                        wall_load(LOAD_KEPT | LOAD_SEED, Some(seed));
+                        // Read by the loader (`wall_loader`) and answered now: the home screen does not wait for it (owner, 2026-11-08).
+                        wall_load(false);
                     }
                 }
-                // 44 `wallpaper kept`: wallgen has made the person's wallpaper and kept it on this device (`map.wallpaper.made`): shown from there, unless their own is set, or this display is still drawing the same picture itself (its threads write the buffer; it finishes with what wallgen made).
-                // Read by the loader, and only when no wallpaper is up: one this display drew from the same seed is the same picture, and loading it again would take it off the glass while it is read.
+                // 44 `wallpaper kept`: wallgen has made the person's wallpaper on the GPU and kept it on this device (`map.wallpaper.made`): read by the loader and shown, unless their own is up. A read already under way (op 42's, which may have found nothing yet) gives way to this one.
                 Some(44) => {
-                    if unsafe { WALL_BUF != 0 && !WALL_RUNNING && !WALL_ON && !LOADING } {
-                        wall_load(LOAD_KEPT, None);
+                    if unsafe { WALL_BUF != 0 && !(WALL_ON && WALL_OWN) } {
+                        wall_load(true);
                     }
                 }
-                // 32 `wallpaper state` (2026-11-10, the Pro's wallpaper gone with no line to say why): out[1] bits, 0 a buffer, 1 shown, 2 a load under way, 3 a drawing job running, 4 a seed waiting, 5 a load wanted; logged the same.
+                // 32 `wallpaper state` (2026-11-10, the Pro's wallpaper gone with no line to say why): out[1] bits, 0 a buffer, 1 shown, 2 a load under way, 3 the person's own shown, 5 a load wanted; logged the same. (Bits 3 and 4 were the display's own drawing job and its waiting seed until 2026-11-11, when the wallpaper went to the GPU.)
                 Some(32) => {
-                    let s = unsafe { (WALL_BUF != 0) as u8 | (WALL_ON as u8) << 1 | (LOADING as u8) << 2 | (WALL_RUNNING as u8) << 3 | ((*(&raw const WALL_PENDING)).is_some() as u8) << 4 | ((LOAD_WANTED != 0) as u8) << 5 };
+                    let s = unsafe { (WALL_BUF != 0) as u8 | (WALL_ON as u8) << 1 | (LOADING as u8) << 2 | ((WALL_ON && WALL_OWN) as u8) << 3 | ((LOAD_WANTED != 0) as u8) << 5 };
                     out[1] = s;
                     len = 2;
                     let mut l = Log { grants, buf: [0; 256], n: 0 };

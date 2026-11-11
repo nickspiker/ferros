@@ -3,13 +3,19 @@ name = "wallpaper"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "A person's default wallpaper: a Julia set drawn from a 32-byte seed, the same image bit for bit on every device, into the display's 64-bit working values; no I/O"
+description = "A person's default wallpaper: a Julia set drawn from a 32-byte seed, looking the same on every device, into the display's 64-bit working values; one source for the CPU and, through valhall, the GPU; no I/O"
+
+[features]
+# gpu: the picture as Mali-G715 kernels through valhall's recording lane type (src/gpu.rs): the device's path (payloads/wallgen).
+gpu = ["dep:valhall"]
 
 [dependencies]
 libm = "0.2"
 # The cone matrices and photopic shares the palette is turned round the hue circle with (no_std).
 vsf = { path = "../../vsf", default-features = false }
+valhall = { path = "../valhall", features = ["ssa"], optional = true }
 
-# The host example writes a seed's wallpaper as a VSF visual to look at (examples/render.rs), the way tools/screencap writes the screen.
+# The host example writes a seed's wallpaper as a VSF visual to look at (examples/render.rs), the way tools/screencap writes the screen; the GPU tests run the kernels in valhall's emulator.
 [dev-dependencies]
 vsf = { path = "../../vsf" }
+valhall = { path = "../valhall", features = ["ssa", "sim"] }
