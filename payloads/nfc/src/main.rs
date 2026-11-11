@@ -1,6 +1,6 @@
 //! The NFC driver (docs/NFC.md): an EL0 process that runs the ST54L's NFC controller over NCI 2.0 on hsi2c_0 and answers as Photon's pairing tag, the same "dumb tag" Android's PhotonHceService is (photon docs/pairing-v2.md): under Photon's AID, SELECT → 9000, GET DATA → the live pairing secret S ‖ 9000 while a ceremony is live, else 6A82; anything else 6D00.
 //!
-//! The kernel keeps what a process cannot do behind the `nfc` power capability (kernel nfc.rs): the bus's pin modes and controller from cold, the chip's reset pulse, the PMU clock pad. Everything else is here, through MMIO grants: the bus's registers, and the interrupt line's level (gpa7-6, high while the chip holds a message).
+//! The kernel keeps what a process cannot do behind the `nfc` power capability (kernel nfc.rs): the bus's pin modes and controller from cold, the chip's reset pulse, the PMU clock pad, the motor's reset. Everything else is here, through MMIO grants: the bus's registers, and the interrupt line's level (gpa7-6, high while the chip holds a message).
 //!
 //! The chip, as Android brings it up (captured 2026-10-31 from Android's i2c trace and the August bugreport's NFC snoop): after reset it holds a CORE_RESET notification; CORE_RESET (keep config), CORE_INIT (NCI 2.0), ST's PROP_NFC_MODE_SET on (the chip resets into NFC mode and says so again), CORE_INIT again, ST's CORE_CONF_PROP, then the stack's RF set-up. The eSE (NFCEE G#86) is never touched: every listen route here goes to the host. Firmware and RF config are already the image's (version 02 06 17 50, config 76 DA): nothing is flashed.
 //!
@@ -15,6 +15,10 @@
 //! - `5` READER STOP. → [0].
 //! - `6` READ SECRET: the secret read off a tapped device since the last ask (32 bytes, once), else nothing.
 //! - `3` READS: activations u32, S served u32, field-on events u32 (little-endian, 12 bytes): a ceremony's caller watches S served move to know the sponsor's phone read it.
+//! - `7` MOTOR: the vibration motor's DEVID and REVID (u32 LE each, 0 for a read that failed), and its state on the console.
+//! - `8` BUZZ + n (one byte, at most G#26): the motor plays ROM waveform n. → [0], or [1] refused (n too large) or a write failed.
+//!
+//! The vibration motor (a CS40L26 at G#43) shares this bus, so its driver is here, the bus's one owner (KERNEL-OUT.md decision 8, the kernel's haptics.rs until 2026-11-10): the `nfc` switch pulses its reset with the NFC chip's, and ops 7 and 8 run between NCI exchanges, never during one.
 #![no_std]
 #![no_main]
 
@@ -30,6 +34,19 @@ const TARGET: u8 = 0x08;
 /// gpa7's data word in gpio-alive (the bank at +G#C0): pin 6 is the chip's interrupt.
 const GPA7_DAT: u64 = 0xC4;
 const IRQ_PIN: u32 = 6;
+/// The vibration motor's driver, a Cirrus CS40L26 at G#43 on the same bus (zuma-shusky-haptics.dtsi; Google's google-modules/amplifiers/cs40l26). Its registers are 32-bit, addressed by a 32-bit big-endian word, values 32-bit big-endian (the driver's regmap). It runs its ROM firmware out of reset (the `nfc` switch pulses its reset with the NFC chip's); in the driver's `cirrus,fw-rom-only` mode a ROM waveform is queued by writing its index (G#0180_0000 + n, n at most G#26) to the DSP's virtual mailbox G#13020, after a "prevent hibernate" command there. The tuning (boost to 11 V, 2.5 A peak, f0 145 Hz, ReDC 13 Ω) is the RAM firmware's business and is not applied.
+const MOTOR: u8 = 0x43;
+const M_DEVID: u32 = 0x0;
+const M_REVID: u32 = 0x4;
+const M_IRQ1_STATUS: u32 = 0x10004;
+const M_IRQ1_EINT_1: u32 = 0x10010;
+const M_MBOX: u32 = 0x13020;
+const M_PREVENT_HIBER: u32 = 0x0200_0003;
+const M_ROM_INDEX: u32 = 0x0180_0000;
+const M_ROM_LAST: u8 = 0x26;
+/// The ROM firmware's power-state word, by silicon revision (cs40l26.c rom_regs): B2, then A1/B0/B1.
+const M_PM_STATE_B2: u32 = 0x0280_1F98;
+const M_PM_STATE_A1: u32 = 0x0280_0370;
 /// Photon's AID (photon PhotonNfc.AID).
 const AID: [u8; 8] = [0xF0, 0x50, 0x48, 0x4F, 0x54, 0x4F, 0x4E, 0x01];
 
@@ -169,8 +186,13 @@ impl Nfc {
         Err(E_TIMEOUT)
     }
 
-    /// One auto-mode transfer with STOP: `tx` written, or `rx` filled. The RX FIFO (64 deep) is drained as the bytes come, so a read of any NCI packet's length works.
+    /// One auto-mode transfer to the NFC chip with STOP: `tx` written, or `rx` filled.
     fn transfer(&self, tx: &[u8], rx: &mut [u8]) -> Result<(), u32> {
+        self.xfer(TARGET, tx, rx, false)
+    }
+
+    /// One auto-mode transfer to `target` on the bus: `tx` written, or `rx` filled, with STOP after it unless `hold` keeps the bus for the read that follows (the motor's register reads: a 32-bit address, then the value). The RX FIFO (64 deep) is drained as the bytes come, so a read of any NCI packet's length works.
+    fn xfer(&self, target: u8, tx: &[u8], rx: &mut [u8], hold: bool) -> Result<(), u32> {
         let mut idle = false;
         for _ in 0..WAIT_POLLS {
             if self.rd(TRANS_STATUS) & TRANS_MASTER_BUSY == 0 {
@@ -186,9 +208,9 @@ impl Nfc {
         self.wr(FIFO_CTL, if read { 0x0002_0023 } else { 0x0001_0013 });
         self.wr(CTL, CTL_MASTER | if read { CTL_RXCHON } else { CTL_TXCHON });
         self.wr(INT_STATUS, self.rd(INT_STATUS));
-        self.wr(ADDR, ADDR_MASTER_ID_7 | (TARGET as u32) << 10);
+        self.wr(ADDR, ADDR_MASTER_ID_7 | (target as u32) << 10);
         self.wr(INT_ENABLE, INT_TRANSFER_DONE | INT_ERRORS);
-        let auto = len | if read { AUTO_READ } else { 0 } | AUTO_STOP_AFTER_TRANS;
+        let auto = len | if read { AUTO_READ } else { 0 } | if hold { 0 } else { AUTO_STOP_AFTER_TRANS };
         self.wr(AUTO_CONF, auto);
         self.wr(AUTO_CONF, auto | AUTO_MASTER_RUN);
         if read {
@@ -614,6 +636,60 @@ impl Nfc {
     fn state(&self, out: &mut Line) {
         let _ = write!(out, "firmware {}, RF config {}; {}; S {}; activations {}, S served {}, fields {}, tags {}", Hex(&self.version), Hex(&self.config), if self.discovering { "listening (A, B), polling (A, B, V)" } else { "not listening" }, if self.secret.is_some() { "live" } else { "none" }, self.activations, self.served, self.fields, self.tags);
     }
+
+    /// One of the motor's registers: its address written without STOP, then the value read.
+    fn motor_read(&self, reg: u32) -> Result<u32, u32> {
+        let mut b = [0u8; 4];
+        self.xfer(MOTOR, &reg.to_be_bytes(), &mut [], true)?;
+        self.xfer(MOTOR, &[], &mut b, false)?;
+        Ok(u32::from_be_bytes(b))
+    }
+    fn motor_write(&self, reg: u32, v: u32) -> Result<(), u32> {
+        let mut w = [0u8; 8];
+        w[..4].copy_from_slice(&reg.to_be_bytes());
+        w[4..].copy_from_slice(&v.to_be_bytes());
+        self.xfer(MOTOR, &w, &mut [], false)
+    }
+
+    /// The motor's IDs and state on the console (what the kernel's `diag haptic` printed): DEVID, REVID, IRQ1 status and EINT1, the mailbox, the ROM's power state. DEVID and REVID returned (0 for a read that failed).
+    fn motor_report(&self) -> (u32, u32) {
+        let mut l = Line { b: [0; 512], n: 0 };
+        let h = |l: &mut Line, r: Result<u32, u32>| {
+            let _ = match r {
+                Ok(v) => write!(l, "G#{v:X}"),
+                Err(e) => write!(l, "error G#{e:X}"),
+            };
+        };
+        let (id, rev) = (self.motor_read(M_DEVID), self.motor_read(M_REVID));
+        let pm = if rev == Ok(0xB2) { M_PM_STATE_B2 } else { M_PM_STATE_A1 };
+        let _ = write!(l, "nfc: motor CS40L26: DEVID ");
+        h(&mut l, id);
+        let _ = write!(l, " (G#40A260 A, G#40A26B B) REVID ");
+        h(&mut l, rev);
+        let _ = write!(l, "; IRQ1 status ");
+        h(&mut l, self.motor_read(M_IRQ1_STATUS));
+        let _ = write!(l, " EINT1 ");
+        h(&mut l, self.motor_read(M_IRQ1_EINT_1));
+        let _ = write!(l, "; mailbox ");
+        h(&mut l, self.motor_read(M_MBOX));
+        let _ = write!(l, "; ROM power state ");
+        h(&mut l, self.motor_read(pm));
+        let _ = writeln!(l, " (0 hibernate, 1 shutdown, 2 standby, 3 active)");
+        console(self.grants, &l.b[..l.n]);
+        (id.unwrap_or(0), rev.unwrap_or(0))
+    }
+
+    /// ROM waveform `n` played (the kernel's `diag haptic play`): the ROM firmware kept awake, 2 ms, the waveform's index queued, 20 ms, the state before and after on the console.
+    fn motor_play(&self, n: u8) -> bool {
+        self.motor_report();
+        let a = self.motor_write(M_MBOX, M_PREVENT_HIBER);
+        sleep_ms(2);
+        let b = self.motor_write(M_MBOX, M_ROM_INDEX + n as u32);
+        say!(self.grants, "nfc: motor: prevent hibernate {a:?}, ROM waveform {n} {b:?}\n");
+        sleep_ms(20);
+        self.motor_report();
+        a.is_ok() && b.is_ok()
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -731,6 +807,22 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                         Some(s) => reply(&token, &s),
                         None => reply(&token, &[]),
                     };
+                }
+                // The vibration motor, this bus's other device (KERNEL-OUT.md decision 8: the bus's owner serves its neighbour): its state, and a ROM waveform played.
+                7 => {
+                    let (id, rev) = nfc.motor_report();
+                    let mut r = [0u8; 8];
+                    r[..4].copy_from_slice(&id.to_le_bytes());
+                    r[4..].copy_from_slice(&rev.to_le_bytes());
+                    reply(&token, &r);
+                }
+                // WHY the refusal: the ROM holds waveforms 0 to G#26 (the driver's limit); a larger index is a caller's mistake, said rather than played as something else.
+                8 if n == 2 && msg[1] <= M_ROM_LAST => {
+                    let ok = nfc.motor_play(msg[1]);
+                    reply(&token, &[!ok as u8]);
+                }
+                8 => {
+                    reply(&token, &[1]);
                 }
                 _ => {
                     reply(&token, &[]);

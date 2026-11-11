@@ -2763,19 +2763,6 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                if cmd.params == b"haptic" || cmd.params.starts_with(b"haptic ") {
-                    // `diag haptic` (state, read only), `diag haptic up` (bus, reset, IDs), `diag haptic play <n>` (ROM waveform n): the vibration motor's CS40L26 (haptics.rs).
-                    let a = core::str::from_utf8(&cmd.params[6..]).unwrap_or("").trim();
-                    if a == "up" {
-                        crate::haptics::up(&mut resp);
-                    } else if let Some(n) = a.strip_prefix("play").and_then(|t| t.trim().parse::<u32>().ok()) {
-                        crate::haptics::play(n, &mut resp);
-                    } else {
-                        crate::haptics::state(&mut resp);
-                    }
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
                 if cmd.params == b"aoc" {
                     // `diag aoc`: the AoC block from the AP (aoc.rs `report`). Its bring-up tools (on, off, peek, boot, log, mmu, fault, services, svc, usf, pins, gpio; gsa, ffa, trusty) went on 2026-11-01: the `sensors` switch starts it.
                     crate::aoc::report(&mut resp);

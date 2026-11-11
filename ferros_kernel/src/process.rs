@@ -1858,7 +1858,7 @@ pub static HARDWARE: &[Hw] = &[
     Hw { name: "usi3-spi", base: 0x111E_0000, size: 0x1000, via_el3: false },
     // The speaker amplifiers (AUDIO.md, payloads/amp): HSI0 USI1's SPI port (spi_19). The right's select (gpn1-0) is in gpio-gpn0 and the left's reset (gpp1-1) in gpio-gpp0, above. Clocks, buck A, pin modes and the right's reset are the kernel's (`POWERS`).
     Hw { name: "usi1-spi", base: 0x111C_0000, size: 0x1000, via_el3: false },
-    // The NFC controller (docs/NFC.md): hsi2c_0, the bus it shares with the vibration motor (whose driver is the kernel's diag, never running beside the `nfc` process). Its interrupt line gpa7-6 is read in gpio-alive, above. Pin modes, the reset and the clock pad are the kernel's (`POWERS`).
+    // The NFC controller (docs/NFC.md): hsi2c_0, the bus it shares with the vibration motor, both run by the `nfc` process (KERNEL-OUT.md decision 8: the bus has one owner). Its interrupt line gpa7-6 is read in gpio-alive, above. Pin modes, both chips' resets and the clock pad are the kernel's (`POWERS`).
     Hw { name: "hsi2c0", base: 0x10C8_0000, size: 0x1000, via_el3: false },
     // Bluetooth (docs/BT.md): the APM's USI1 UART (serial_18). The USI mode word and the chip's power lines are the kernel's (`POWERS`).
     Hw { name: "apm-usi1-uart", base: 0x155D_0000, size: 0x1000, via_el3: false },
