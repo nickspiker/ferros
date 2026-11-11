@@ -286,6 +286,30 @@ pub const PREF_LANG: u64 = 32;
 pub const PREF_LANG_DEVICE: u64 = 34;
 pub const PREF_LANG_IDENTITY: u64 = 36;
 pub const PREF_LANG_OWN: u64 = 38;
+/// Preference 39: the sound mode, `SOUND`, `VIBRATE` or `SILENT` (the quick row's; owner, 2026-11-11). A device setting, set with `set_pref` thru the Settings capability.
+pub const PREF_SOUND: u64 = 39;
+pub const SOUND: u8 = 0;
+pub const VIBRATE: u8 = 1;
+pub const SILENT: u8 = 2;
+/// Preference 40: do not disturb, the identity's (0 off, 1 on): written only by the identity service from the person's space (`dnd::set_identity`), read by everyone. To change it, a device asks the identity service (payloads/fgtw op 24), which puts it in the space and so on every device of the person's.
+pub const PREF_DND: u64 = 40;
+/// Preference 41: the radios that were off when "radios off" switched them all off (preference 15's bits), put back by its next tap.
+pub const PREF_RADIOS_BEFORE: u64 = 41;
+
+/// Do not disturb (preference 40; SETTINGS.md): the person's, carried by their identity space.
+pub mod dnd {
+    use super::{nr, pref, svc, PREF_DND};
+
+    /// Whether the person has do not disturb on, as their identity service last wrote it here.
+    pub fn on() -> bool {
+        pref(PREF_DND) == 1
+    }
+
+    /// The identity service writes the person's choice to this device (the kernel takes it from the process named fgtw alone, as SYS_LANG op 2). True when taken and kept.
+    pub fn set_identity(on: bool) -> bool {
+        svc(nr::SET_PREF, 0, PREF_DND, on as u64, 0, 0) == 0
+    }
+}
 
 /// A preference byte as this process's copy holds it now.
 pub fn pref(index: u64) -> u8 {

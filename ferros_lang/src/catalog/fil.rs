@@ -126,6 +126,14 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ThemeSlate => "pisara",
         Msg::ThemeEmber => "baga",
         Msg::ThemeNight => "gabi",
+        // ---- the quick row ----
+        Msg::Torch => "flashlight",
+        Msg::RadiosOff => "patay ang mga radyo",
+        Msg::SoundOn => "tunog",
+        Msg::Vibrate => "vibrate",
+        Msg::Silent => "tahimik",
+        Msg::DoNotDisturb => "huwag istorbohin",
+        Msg::Screencap => "screenshot",
         // ---- Keyboard ----
         Msg::Layout => "ayos",
         // ---- Security ----

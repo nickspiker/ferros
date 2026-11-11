@@ -126,6 +126,14 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ThemeSlate => "ardósia",
         Msg::ThemeEmber => "brasa",
         Msg::ThemeNight => "noite",
+        // ---- the quick row ----
+        Msg::Torch => "lanterna",
+        Msg::RadiosOff => "rádios desligados",
+        Msg::SoundOn => "som",
+        Msg::Vibrate => "vibrar",
+        Msg::Silent => "silêncio",
+        Msg::DoNotDisturb => "não perturbe",
+        Msg::Screencap => "captura de tela",
         // ---- Keyboard ----
         Msg::Layout => "disposição",
         // ---- Security ----

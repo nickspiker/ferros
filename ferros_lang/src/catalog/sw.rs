@@ -126,6 +126,14 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ThemeSlate => "kijivu cha bluu",
         Msg::ThemeEmber => "kaa la moto",
         Msg::ThemeNight => "usiku",
+        // ---- the quick row ----
+        Msg::Torch => "tochi",
+        Msg::RadiosOff => "redio zimezimwa",
+        Msg::SoundOn => "sauti",
+        Msg::Vibrate => "mtetemo",
+        Msg::Silent => "kimya",
+        Msg::DoNotDisturb => "usinisumbue",
+        Msg::Screencap => "picha ya skrini",
         // ---- Keyboard ----
         Msg::Layout => "mpangilio",
         // ---- Security ----

@@ -126,6 +126,14 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ThemeSlate => "batu tulis",
         Msg::ThemeEmber => "bara",
         Msg::ThemeNight => "malam",
+        // ---- the quick row ----
+        Msg::Torch => "senter",
+        Msg::RadiosOff => "radio mati",
+        Msg::SoundOn => "suara",
+        Msg::Vibrate => "getar",
+        Msg::Silent => "senyap",
+        Msg::DoNotDisturb => "jangan ganggu",
+        Msg::Screencap => "tangkapan layar",
         // ---- Keyboard ----
         Msg::Layout => "tata letak",
         // ---- Security ----

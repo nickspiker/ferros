@@ -126,6 +126,14 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ThemeSlate => "kiwikiwi kahurangi",
         Msg::ThemeEmber => "kora",
         Msg::ThemeNight => "pō",
+        // ---- the quick row ----
+        Msg::Torch => "rama",
+        Msg::RadiosOff => "kua weto ngā reo irirangi",
+        Msg::SoundOn => "oro",
+        Msg::Vibrate => "wiri",
+        Msg::Silent => "wahangū",
+        Msg::DoNotDisturb => "kaua e whakararu",
+        Msg::Screencap => "hopu mata",
         // ---- Keyboard ----
         Msg::Layout => "tahora",
         // ---- Security ----

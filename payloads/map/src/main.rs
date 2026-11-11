@@ -14,7 +14,7 @@
 //!
 //! Positions are deterministic until the person arranges by hand; then each moved circle is kept in the vault (`map.place.<name>`) and wins over the seeded place from then on.
 //!
-//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page, and the identity space: the arrangement and kists written from the person's fleet are read again when its generation moves, docs/IDENTITY-SPACE.md), 6 the vault scope `kists.`, 7 use launch (init), 8 use kists (the installer, payloads/kists: the Kists page installs, updates and uninstalls through it, installer.rs).
+//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page, and the identity space: the arrangement and kists written from the person's fleet are read again when its generation moves, docs/IDENTITY-SPACE.md), 6 the vault scope `kists.`, 7 use launch (init), 8 use kists (the installer, payloads/kists: the Kists page installs, updates and uninstalls through it, installer.rs), 9 use torch (the kernel's, not init's: the quick row, quick.rs).
 
 #![no_std]
 #![no_main]
@@ -22,6 +22,7 @@
 extern crate alloc;
 
 mod installer;
+mod quick;
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -70,6 +71,8 @@ const S_KIST_LIST: u64 = 6;
 const S_LAUNCH: u64 = 7;
 /// The installer's `kists` endpoint (payloads/kists): the Kists page installs, updates and uninstalls through it, and reads the directory and the jobs under way.
 const S_INSTALLER: u64 = 8;
+/// The torch (payloads/torch, docs/TORCH.md): its send right, which the kernel hands whoever it hands Settings, as the slot after the last (init's grants page is full); the quick row's torch circle calls it. An older kernel leaves the slot empty, a call on it fails, and the circle is drawn dimmed.
+const S_TORCH: u64 = 9;
 
 /// The heap a link's detail document is verified and read in (ferros_detail): a few kilobytes while a link's page shows, freed after each frame.
 const HEAP_SIZE: usize = 1 << 18;
@@ -4454,6 +4457,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // Where that finger landed, and whether the corner has acted this touch.
     let mut corner_from = (0i64, 0i64);
     let mut corner_done = false;
+    // The quick row (quick.rs): its pull, physics and actions; and whether the session's finger landed in its doorway by the camera (a still tap there opens or shuts it).
+    let mut qr = quick::Quick::new(display, grants, w, h);
+    let mut quick_door = false;
     let mut start = [(false, 0i64, 0i64); 16];
     // The circle the fingers hold, decided again whenever the number of moving fingers changes (one finger: the circle it started on; two: the circle both are inside), and for how many fingers it was decided.
     let mut grab: Option<usize> = None;
@@ -4496,6 +4502,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The GPS driver's doorbell, for the GPS page (`gps_watch`): on a thread of its own, asleep while the page is not open.
     static mut GPS_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(gps_watch, unsafe { &mut *(&raw mut GPS_STACK) }, grants);
+    // The quick row's slow calls (the torch, the identity service's do not disturb), on a thread of their own (quick.rs `worker`).
+    static mut QUICK_STACK: [u8; 1 << 14] = [0; 1 << 14];
+    ferros_sys::thread_spawn(quick::worker, unsafe { &mut *(&raw mut QUICK_STACK) }, grants);
     // The claims' doorbell (SYS_CLAIM op 4): the kernel writes GPS's claims into CLAIMS_WORD at every change. A kernel from before refuses it, and "using now" is then read only as a page draws.
     if !ferros_sys::claim::doorbell(cap(grants, S_SETTINGS), &CLAIMS_WORD) {
         console(grants, b"map: the kernel has no claims doorbell\n");
@@ -4828,11 +4837,36 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.settling = map.target.is_some();
             // Where the first finger landed: on the home or back circle, the session is the corner's.
             let f = cur[ids[0]];
-            let mut q = [0u8; 4];
+            let mut q = [0u8; 8];
             let (xb, yb) = ((f.1 as u16).to_le_bytes(), (f.2 as u16).to_le_bytes());
             let hit = if call(map.display, &[41, xb[0], xb[1], yb[0], yb[1]], &mut q) >= 1 { q[0] } else { 0xFF };
-            // A radio's console circle too (0-4, as 16 + its bit): dragged toward the centre it opens that radio's page; tapped still, it switches as before.
-            corner = if hit == 8 || hit == 9 { hit } else if hit < 5 { 16 | hit } else { 0 };
+            // A radio's console circle too (0-4, as 16 + its bit): held still it opens that radio's page (a long press, its ring filling), dragged down it pulls the quick row, tapped still it switches as before.
+            // The quick row (QUICK.md): the doorway by the camera (10) or the top's other ground (11) pull it; a quick circle (32 + k, its centre after) is held, a ring turned; behind the row while it shows (12) shuts it, and the touch goes no further.
+            corner = match hit {
+                8 | 9 => hit,
+                0..=4 => 16 | hit,
+                10 | 11 => quick::PULL,
+                12 => quick::BEHIND,
+                32..=37 => quick::ITEM | (hit - 32),
+                _ => 0,
+            };
+            quick_door = hit == 10;
+            // The panel's frame count now (op 24: the next frame's start): at rest the loop sleeps between passes and the count it holds is old, and a press, a pull or the spring counted from it would take every frame since as its own.
+            if corner != 0 {
+                let mut fr = [0u8; 4];
+                call(map.display, &[24], &mut fr);
+                frame_count = u32::from_le_bytes(fr);
+            }
+            match corner {
+                c if c & 16 != 0 && c < 32 => qr.press_start(c & 15, frame_count),
+                quick::PULL => qr.take(f.2, frame_count),
+                quick::BEHIND => qr.settle_to(0., frame_count),
+                c if c & quick::ITEM != 0 => {
+                    let (cx, cy) = (u16::from_le_bytes([q[1], q[2]]) as f32 + 0.5, u16::from_le_bytes([q[3], q[4]]) as f32 + 0.5);
+                    qr.hold((c & 7) as usize, f.1, f.2, cx, cy);
+                }
+                _ => {}
+            }
             // A helm button under the finger: lit at once (display op 54).
             if corner == 8 || corner == 9 {
                 map.helm_light(corner, 0.5);
@@ -4866,25 +4900,42 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     map.pressed = None;
                 }
             }
-            if corner != 0 && held >= 1 {
+            // The quick row's sessions (QUICK.md): the pull follows the finger from where it landed (or from where a drag down took it over), a ring turns with it, a radio circle's press ends as it moves and a drag down from it pulls the row; a quick circle dragged up or down pulls the row too (pushed back up, it shuts).
+            if held >= 1 && corner != 0 && corner != 8 && corner != 9 {
+                let (fx, fy) = (cur[ids[0]].1, cur[ids[0]].2);
+                let (dx, dy) = (fx - corner_from.0, fy - corner_from.1);
+                if corner & 16 != 0 && corner < 32 && moved {
+                    qr.press_end();
+                    if dy > 0 && dy > dx.abs() {
+                        corner = quick::PULL;
+                        qr.take(fy, frame_count);
+                    }
+                } else if corner & quick::ITEM != 0 && moved {
+                    let k = (corner & 7) as usize;
+                    if k == quick::BRIGHTNESS || k == quick::TORCH {
+                        qr.turn_to(fx, fy);
+                    } else if dy.abs() > dx.abs() {
+                        qr.let_go(true, frame_count);
+                        corner = quick::PULL;
+                        qr.take(fy, frame_count);
+                    }
+                }
+                if corner == quick::PULL {
+                    qr.drag(fy, frame_count);
+                }
+            }
+            if (corner == 8 || corner == 9) && held >= 1 {
                 corner_at = (cur[ids[0]].1, cur[ids[0]].2);
                 // The swipe inward: the finger's travel along the line from where it landed toward the screen's centre. Past a twelfth of the screen's harmonic span (2wh/(w+h); owner, 2026-11-07), the corner acts, once a touch: home, full screen on or off (op 43); back, the map zoomed out to every circle (`home`), the map being recents (WINDOWS.md).
                 let (ux, uy) = ((w / 2 - corner_from.0) as f64, (h / 2 - corner_from.1) as f64);
                 let inward = ((corner_at.0 - corner_from.0) as f64 * ux + (corner_at.1 - corner_from.1) as f64 * uy) / libm::sqrt(ux * ux + uy * uy);
                 let span = (2 * w * h) as f64 / (w + h) as f64;
                 // The helm button's light follows the swipe: half at the landing, toward full as the finger comes in (½(1 + tanh(inward / threshold)), C∞, lower again if it pulls away), full once it acted.
-                if corner == 8 || corner == 9 {
-                    let lvl = if corner_done { 1.0 } else { 0.5 * (1.0 + libm::tanh(inward / (span / 12.))) };
-                    map.helm_light(corner, lvl as f32);
-                }
+                let lvl = if corner_done { 1.0 } else { 0.5 * (1.0 + libm::tanh(inward / (span / 12.))) };
+                map.helm_light(corner, lvl as f32);
                 if !corner_done && inward > span / 12. {
                     corner_done = true;
-                    if corner & 16 != 0 {
-                        // A radio's circle dragged in: its page in settings (with an app in front, the settings circle is not on the screen: nothing).
-                        if !map.app_front {
-                            map.show_page(LINKS[(corner & 15) as usize]);
-                        }
-                    } else if corner == 8 {
+                    if corner == 8 {
                         let mut q = [0u8; 4];
                         let n = call(map.display, &[43], &mut q);
                         console(grants, if n >= 2 && q[1] == 1 { b"map: full screen\n" } else { b"map: full screen off\n" });
@@ -4903,8 +4954,32 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             if corner == 8 || corner == 9 {
                 map.helm_light(corner, 0.0);
             }
-            // A corner's session let go: it acted while moving (above), if it went far enough inward. A still tap on a corner circle is a tap as before (on the home circle it closes the open settings).
-            if corner != 0 && !moved {
+            // A corner's session let go: it acted while moving (above), if it went far enough inward. A still tap on a corner circle is a tap as before (on the home circle it closes the open settings; on a radio's, it switches it).
+            let mut tap_thru = !moved;
+            // The quick row's sessions end here (QUICK.md): a still tap in the doorway opens or shuts the row, any other pull settles by the spring from its speed; a quick circle acts (or its turn is kept); behind the row the touch already shut it and goes no further; a radio held long enough has opened its page, so its lift switches nothing.
+            match corner {
+                quick::PULL => {
+                    if !moved && quick_door {
+                        qr.toggle(frame_count);
+                        tap_thru = false;
+                    } else {
+                        qr.release(frame_count);
+                    }
+                }
+                quick::BEHIND => tap_thru = false,
+                c if c & quick::ITEM != 0 => {
+                    qr.let_go(moved, frame_count);
+                    tap_thru = false;
+                }
+                c if c & 16 != 0 && c < 32 => {
+                    qr.press_end();
+                    if corner_done {
+                        tap_thru = false;
+                    }
+                }
+                _ => {}
+            }
+            if corner != 0 && tap_thru {
                 corner = 0;
             }
             if corner != 0 {
@@ -4978,10 +5053,30 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
         }
 
-        // A corner's session moves nothing on the map; with an app in front the map does nothing else at all, reading touches only for the corners, a hundred and twenty-eighth of a second apart while one is held, a sixty-fourth between.
+        // The quick row this pass (QUICK.md): a radio circle pressed still long enough opens its page (with an app in front the settings circle is not on the screen: nothing); the spring stepped by the frames the panel showed since its last step; its state to the display when anything in it moved.
+        if down && corner & 16 != 0 && corner < 32 && !moved && !corner_done {
+            if let Some(radio) = qr.press_at(frame_count) {
+                corner_done = true;
+                if !map.app_front {
+                    map.show_page(LINKS[radio as usize]);
+                    map.draw();
+                }
+            }
+        }
+        if !down {
+            qr.step(frame_count);
+        }
+        qr.send();
+        // A corner's session moves nothing on the map; with an app in front the map does nothing else at all, reading touches only for the corners. While a corner session or the quick row is under way, each pass starts as the panel's next frame does (op 24, as a drag's), so the row and a press move by shown frames; otherwise a sixty-fourth of a second between looks while an app is in front.
         if corner != 0 || map.app_front {
             prev = cur;
-            sleep_until(now() + freq() / if down { 1 << 7 } else { 1 << 6 });
+            if corner != 0 || qr.settling {
+                let mut fr = [0u8; 4];
+                call(display, &[24], &mut fr);
+                frame_count = u32::from_le_bytes(fr);
+            } else {
+                sleep_until(now() + freq() / (1 << 6));
+            }
             continue;
         }
         // Drags and pinches, once the fingers have moved past the slop: the contacts present both now and last frame are the ones that moved.
@@ -5129,7 +5224,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             sleep_until(now() + freq() / (1 << 3));
             continue;
         }
-        if held == 0 && !map.settling {
+        if held == 0 && !map.settling && !qr.settling {
             // WHY the min: two deadlines, the rest's and the second's turn on the clock or About (`tick_at`); the earlier ends the rest, so the second is drawn as it turns rather than up to a rest after.
             let rest = now() + freq() / 30;
             sleep_until(tick_at.map_or(rest, |at| rest.min(at)));

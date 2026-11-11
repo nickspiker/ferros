@@ -13,6 +13,7 @@
 //! | `DEPART` | the leaving device `ke` | its signed departure request `v`, or once denied the signed deny | none: the identity service's own (payloads/fgtw), so a member answers it wherever it is |
 //! | `ZONE` | the fleet's scope `ke` | automatic `u` (1 or 0), then the IANA id by hand `a` when there is one | none: the identity service writes it to the kernel (SYS_ZONE op 4) on each device, which follows it unless its settings say otherwise |
 //! | `LANG` | the fleet's scope `ke` | the language `wl` (its ISO 639-3 code) | none: the identity service writes it to the kernel (SYS_LANG op 2) on each device, which follows it unless its settings say otherwise |
+//! | `DND` | the fleet's scope `ke` | on `u` (1 or 0) | none: the identity service writes it to the kernel (preference 40) on each device |
 //! | `PIN` | developer `ke` | the bundle's commitment `hp`, then the developer's name `a` when their first kist gave one; the entry's stamp is when it was pinned | a `pin` section of `kists.list` (trust on first install) |
 //!
 //! The scope of a place and the view is the fleet's (`FLEET`, 32 zero bytes) on every device whose home-screen sync is on (the default), and the device's own key on one where the person switched it off, so that device keeps an arrangement of its own, which follows it through a reset all the same.
@@ -48,6 +49,8 @@ pub mod kind {
     pub const LANG: u8 = 8;
     /// A developer the person trusted on first install (owner, 2026-11-10): the commitment of the key bundle that developer's first kist carried, so every device of theirs refuses a kist from that key with another bundle. An uninstall keeps it.
     pub const PIN: u8 = 9;
+    /// Do not disturb (owner, 2026-11-11: "a fleet/identity preference so it follows the person"): the person's one switch, set from the quick row of any of their devices, written to each device (the kernel's preference 40), never read back from one.
+    pub const DND: u8 = 10;
 }
 
 /// The scope of the fleet's shared arrangement.
@@ -248,6 +251,26 @@ pub fn set_language(space: &mut Space, by: &[u8; 32], code: [u8; 3], now: i64) -
     }
     let updated = space.get(kind::LANG, &language_id()).map_or(now, |e| now.max(e.updated + 1));
     space.put(Entry { kind: kind::LANG, id: language_id(), value: vec![VsfType::wl(vsf::Language::new(code))], updated, by: *by, gone: false })
+}
+
+/// Do not disturb's id: the fleet's scope, one switch for the person.
+pub fn dnd_id() -> Vec<VsfType> {
+    vec![VsfType::ke(FLEET.to_vec())]
+}
+
+/// Whether the person has do not disturb on; None until they have ever switched it.
+pub fn dnd(space: &Space) -> Option<bool> {
+    let e = space.get(kind::DND, &dnd_id()).filter(|e| !e.gone)?;
+    e.value.iter().find_map(|v| v.as_u64()).map(|v| v == 1)
+}
+
+/// The person switched do not disturb on one of their devices (its quick row): written straight into the space, stamped past its last write so it wins the merge whatever the clocks say. True when the space changed.
+pub fn set_dnd(space: &mut Space, by: &[u8; 32], on: bool, now: i64) -> bool {
+    if dnd(space) == Some(on) {
+        return false;
+    }
+    let updated = space.get(kind::DND, &dnd_id()).map_or(now, |e| now.max(e.updated + 1));
+    space.put(Entry { kind: kind::DND, id: dnd_id(), value: vec![VsfType::u(on as usize, false)], updated, by: *by, gone: false })
 }
 
 // ── The map's own forms (payloads/map: `place_key`, `save_place`, `save_view`) ──
@@ -916,6 +939,25 @@ mod tests {
         let o = sync(&mut sa, &mut b, &mut v, &PRO, 3000).unwrap();
         assert_eq!(o.kinds >> kind::LANG & 1, 0);
         assert_eq!(language(&sa), Some(*b"spa"));
+    }
+
+    /// Do not disturb, as the language: never switched until it is; switched on one device, it crosses the fleet sealed; the later switch wins even from a device whose clock runs behind; the device's own copy is never touched by the sync.
+    #[test]
+    fn do_not_disturb_follows_the_person() {
+        let mut sa = Space::new();
+        assert_eq!(dnd(&sa), None);
+        assert!(set_dnd(&mut sa, &PRO, true, 2000));
+        assert!(!set_dnd(&mut sa, &PRO, true, 2001), "the same switch changes nothing");
+        let mut sb = hand_over(&sa);
+        assert_eq!(dnd(&sb), Some(true));
+        assert!(set_dnd(&mut sb, &OTHER, false, 1500));
+        sa.merge(hand_over(&sb));
+        assert_eq!(dnd(&sa), Some(false));
+        let mut v = arranged_pro();
+        let mut b = Baseline::default();
+        let o = sync(&mut sa, &mut b, &mut v, &PRO, 3000).unwrap();
+        assert_eq!(o.kinds >> kind::DND & 1, 0);
+        assert_eq!(dnd(&sa), Some(false));
     }
 }
 

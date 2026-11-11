@@ -126,6 +126,14 @@ pub fn text(m: Msg) -> &'static str {
         Msg::ThemeSlate => "đá phiến",
         Msg::ThemeEmber => "than hồng",
         Msg::ThemeNight => "đêm",
+        // ---- the quick row ----
+        Msg::Torch => "đèn pin",
+        Msg::RadiosOff => "tắt sóng",
+        Msg::SoundOn => "âm thanh",
+        Msg::Vibrate => "rung",
+        Msg::Silent => "im lặng",
+        Msg::DoNotDisturb => "không làm phiền",
+        Msg::Screencap => "chụp màn hình",
         // ---- Keyboard ----
         Msg::Layout => "bố cục",
         // ---- Security ----
