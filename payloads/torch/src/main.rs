@@ -1,4 +1,4 @@
-//! The torch (docs/TORCH.md; owner, 2026-11-11: "would be nice to have the torch", then "can we vary the brightness of it at all?"): the rear flash LED lit in torch mode, at a level the quick settings' ring turns. The LED's driver is a TI LM3644 at G#63 on hsi2c_14 (husky and akita alike, from their camera device trees); its torch mode only, never flash or strobe.
+//! The torch (docs/TORCH.md; owner, 2026-11-11: "would be nice to have the torch", then "can we vary the brightness of it at all?"): the rear flash LED lit in torch mode, at a level the quick settings' ring turns. The LED's driver is a TI LM3644 at G#63 on hsi2c_14 (husky and akita alike, from their camera device trees); its torch mode only, never the chip's flash or its strobe input (the strobe here is this driver's own, torch mode switched on and off by its clock).
 //!
 //! The kernel keeps what a process may not do behind the `torch` power switch (kernel torch.rs): the bus's pins, clock source and controller, and the chip's hardware enable (HWEN, gpp8-2). Switched off, HWEN is low and the chip is in shutdown, every register back at its default: dark whatever was written here. Here, thru the `hsi2c14` grant: the chip's registers, only while the switch is on (the camera PMIC shares the bus, and the kernel's camera tools refuse while the switch is on).
 //!
@@ -10,13 +10,19 @@
 //! - `0` SET + level (u8): 0 off, 1-255 dimmest to brightest (`LEVELS`). → [the level now]: the one asked, or 0 when it could not be lit (the console says why).
 //! - `1` LEVEL. → [the level now].
 //! - `2` REPORT (development): → [level, torch code, device ID, enable register, flags 1, flags 2], the chip's four read now (reading the flags clears them); zeros for those while dark (the chip is in shutdown and does not answer).
+//! - `3` APPLY: the torch's settings read again (its preferences, below) and put in effect at the level it has. → [the level now].
 //!
-//! Dark and nothing waiting, it ends (one shot dead, no cleanup: the switch is off already): a torch that is off holds no arc. The kernel starts another at the next call.
+//! **Its settings** (owner, 2026-11-11: "like flashlight we may want to control the brightness and strobe frequency and duty cycle and timeout"; docs/TORCH.md "Settings"): the device's preferences 42-45, one encoding with the map that sets them (ferros_sys::torch), read at every request. The strobe (a flash every 4 s to 16 a second, the lit share of each) and the timeout are this driver's own clock: the light thread sleeps on the kernel's deadline to the next edge or the end, never a poll, and the map knows none of it.
+//!
+//! **Two threads.** This one receives and answers; the light thread (`light`) owns the bus, the switch and the clock, and does everything that touches the chip, so a strobe edge never meets a request's write on the bus. A request is a word (`WANT`) and its answer another (`NOW`), each a doorbell (wait and wake).
+//!
+//! Dark and nothing waiting, it ends (one shot dead, no cleanup: the switch is off already): a torch that is off holds no arc. The kernel starts another at the next call. A torch its timeout put out ends at its next call (this thread is in a receive that nothing interrupts until then).
 #![no_std]
 #![no_main]
 
 use core::fmt::Write;
-use ferros_sys::{cap, console, mmio_read, mmio_write, recv, reply, ERR, NOTHING};
+use core::sync::atomic::{AtomicU64, Ordering};
+use ferros_sys::{cap, console, mmio_read, mmio_write, recv, reply, torch as kept, ERR, NOTHING};
 
 const S_TORCH: u64 = 1;
 const S_BUS: u64 = 2;
@@ -131,14 +137,26 @@ macro_rules! say {
     }};
 }
 
+/// The light thread's state: only that thread touches it.
 struct Torch {
     grants: u64,
     /// The level now (0 dark).
     level: u8,
     /// The switch on: HWEN high, the bus ours.
     lit: bool,
+    /// The chip in torch mode now (the Enable register at `TORCH_LED1`): always while lit and steady; in a strobe, in each flash's lit part.
+    on: bool,
     /// The device ID read at the first light, said once.
     said_id: bool,
+    /// The strobe and lit share in effect (their kept codes), and from them the period and each flash's lit part in timer ticks (period 0: steady).
+    strobe: u8,
+    duty: u8,
+    period: u64,
+    lit_ticks: u64,
+    /// The timer count the strobe's flashes are counted from: each flash starts a whole number of periods after it, so the edges never drift (no delay is ever added to another).
+    anchor: u64,
+    /// The timer count the timeout ends at (0: none).
+    off_at: u64,
 }
 
 impl Torch {
@@ -242,7 +260,7 @@ impl Torch {
         Ok(v[0])
     }
 
-    /// Dark: standby asked (a courtesy; it may fail with the chip already gone), then the switch off, HWEN low, which is what makes it dark.
+    /// Dark: standby asked (a courtesy; it may fail with the chip already gone), then the switch off, HWEN low, which is what makes it dark. The timeout and the strobe end with it.
     fn dark(&mut self) {
         if self.lit {
             let _ = self.write(ENABLE, STANDBY);
@@ -251,23 +269,24 @@ impl Torch {
             }
             self.lit = false;
         }
+        self.on = false;
         self.level = 0;
+        self.off_at = 0;
     }
 
-    /// The torch to `level`: its current set before torch mode is enabled, so it never lights at the reset code first; a level change while lit only moves the current. Any failure leaves it dark.
+    /// The torch to `level` with its settings as kept now (ferros_sys::torch, read at every request): its current set before torch mode is enabled, so it never lights at the reset code first; a level change while lit only moves the current. The strobe's flashes count from a new anchor only when it was dark or the strobe or its lit share changed, so turning the level mid-strobe keeps the rhythm. The timeout counts again from every request: any touch of the torch is the person using it. Any failure leaves it dark.
     fn set(&mut self, level: u8) {
-        if level == self.level {
-            return;
-        }
         if level == 0 {
             return self.dark();
         }
+        let was = self.level;
         if !self.lit {
             if !ferros_sys::power(cap(self.grants, S_POWER), true) {
                 say!(self.grants, "torch: the switch refused on (hsi2c_14 not ready)\n");
                 return;
             }
             self.lit = true;
+            self.on = false;
             match self.read(DEVICE_ID) {
                 Ok(id) if !self.said_id => {
                     self.said_id = true;
@@ -281,17 +300,56 @@ impl Torch {
             }
         }
         let code = LEVELS[level as usize - 1];
-        let r = self.write(LED1_TORCH, code).and_then(|_| if self.level == 0 { self.write(ENABLE, TORCH_LED1) } else { Ok(()) });
-        if let Err(e) = r {
-            say!(self.grants, "torch: a write failed (G#{e:X}); dark\n");
-            return self.dark();
+        if level != was {
+            if let Err(e) = self.write(LED1_TORCH, code) {
+                say!(self.grants, "torch: a write failed (G#{e:X}); dark\n");
+                return self.dark();
+            }
         }
         self.level = level;
+        let now = ferros_sys::now();
+        let hz = ferros_sys::freq() as u128;
+        let ticks = |ns: u64| (ns as u128 * hz / 1_000_000_000) as u64;
+        let (strobe, duty) = (kept::strobe(), kept::duty());
+        if was == 0 || strobe != self.strobe || duty != self.duty {
+            self.strobe = strobe;
+            self.duty = duty;
+            self.period = kept::strobe_period_ns(strobe).map_or(0, ticks);
+            self.lit_ticks = self.period * kept::duty_256(duty) as u64 >> 8;
+            self.anchor = now;
+        }
+        self.off_at = kept::timeout_ns(kept::timeout()).map_or(0, |ns| now + ticks(ns));
+        self.drive(now);
+        if !self.lit {
+            return;
+        }
         // A fault the chip latched (short, thermal shutdown, undervoltage, overvoltage) shows here; reading clears them.
         let (f1, f2) = (self.read(FLAGS1).unwrap_or(0), self.read(FLAGS2).unwrap_or(0));
         if f1 | f2 != 0 {
             say!(self.grants, "torch: level A#{level} (code A#{code}): flags G#{f1:02X} G#{f2:02X}\n");
         }
+    }
+
+    /// The chip's mode as the clock says it should be at timer count `now`: steady, in torch mode; in a strobe, in torch mode for each flash's lit part and in standby for the rest, counted in whole periods from the anchor. One Enable write when it changes (the current stays in its register thru standby, HWEN high). Returns the next edge's count, 0 for none (steady or dark).
+    fn drive(&mut self, now: u64) -> u64 {
+        if !self.lit {
+            return 0;
+        }
+        let (want, next) = if self.period == 0 {
+            (true, 0)
+        } else {
+            let phase = (now - self.anchor) % self.period;
+            if phase < self.lit_ticks { (true, now - phase + self.lit_ticks) } else { (false, now - phase + self.period) }
+        };
+        if want != self.on {
+            if let Err(e) = self.write(ENABLE, if want { TORCH_LED1 } else { STANDBY }) {
+                say!(self.grants, "torch: a write failed (G#{e:X}); dark\n");
+                self.dark();
+                return 0;
+            }
+            self.on = want;
+        }
+        next
     }
 
     fn report(&self) -> [u8; 6] {
@@ -304,38 +362,103 @@ impl Torch {
     }
 }
 
+/// A request to the light thread: its number in bits 32-63 (counted up by the receiving thread), the level in bits 0-7, bit 8 a report only (the chip's registers read, nothing set).
+static WANT: AtomicU64 = AtomicU64::new(0);
+const WANT_REPORT: u64 = 1 << 8;
+/// The light thread's answer: the request it last took in bits 32-63, the level now in bits 0-7 (0 too once its timeout put it out).
+static NOW: AtomicU64 = AtomicU64::new(0);
+/// The last report's six bytes.
+static REPORT: AtomicU64 = AtomicU64::new(0);
+/// The light thread's stack.
+static mut LIGHT_STACK: [u8; 1 << 14] = [0; 1 << 14];
+
+/// The light thread: every request taken as it comes, then the chip driven by the clock, asleep until the next request, the strobe's next edge or the timeout's end, whichever is first (the kernel's deadline, `wait_world`: a person or a time the person chose is what it waits for, so the process watchdog does not count it). Steady with no timeout it sleeps until the next request.
+extern "C" fn light(grants: u64) -> ! {
+    let mut t = Torch { grants, level: 0, lit: false, on: false, said_id: false, strobe: 0, duty: 0, period: 0, lit_ticks: 0, anchor: 0, off_at: 0 };
+    let mut seen = 0u64;
+    loop {
+        let w = WANT.load(Ordering::Acquire);
+        if w >> 32 != seen {
+            seen = w >> 32;
+            if w & WANT_REPORT != 0 {
+                let r = t.report();
+                REPORT.store(r.iter().rev().fold(0u64, |a, &b| a << 8 | b as u64), Ordering::Release);
+            } else {
+                t.set(w as u8);
+            }
+            NOW.store(seen << 32 | t.level as u64, Ordering::Release);
+            ferros_sys::wake(&NOW, 1);
+        }
+        let now = ferros_sys::now();
+        if t.level != 0 && t.off_at != 0 && now >= t.off_at {
+            say!(grants, "torch: its timeout ended; dark\n");
+            t.dark();
+            NOW.store(seen << 32, Ordering::Release);
+        }
+        let edge = t.drive(now);
+        // The nearer of the two, 0 for neither (the kernel's "no deadline").
+        let deadline = match (edge, t.off_at) {
+            (0, o) => o,
+            (e, 0) => e,
+            (e, o) => e.min(o),
+        };
+        ferros_sys::wait_world(&WANT, w, deadline);
+    }
+}
+
+/// A request to the light thread and its answer: the level now. A short wait on the light thread's own work (a bus write or two), so a plain `wait`.
+fn ask(n: &mut u64, level: u8, report: bool) -> u8 {
+    *n += 1;
+    WANT.store(*n << 32 | if report { WANT_REPORT } else { 0 } | level as u64, Ordering::Release);
+    ferros_sys::wake(&WANT, 1);
+    loop {
+        let v = NOW.load(Ordering::Acquire);
+        if v >> 32 == *n {
+            return v as u8;
+        }
+        ferros_sys::wait(&NOW, v, 0);
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    let mut t = Torch { grants, level: 0, lit: false, said_id: false };
+    ferros_sys::thread_spawn(light, unsafe { &mut *(&raw mut LIGHT_STACK) }, grants);
+    let mut n = 0u64;
     let mut msg = [0u8; 64];
     let mut token = [0u8; 32];
     let mut poll = false;
     loop {
-        let n = recv(cap(grants, S_TORCH), &mut msg, &mut token, poll);
+        let got = recv(cap(grants, S_TORCH), &mut msg, &mut token, poll);
         // Dark and nothing waiting: end. A call that comes after this look is left queued, and the kernel starts another torch for it (process.rs `fail_orphaned_calls`).
-        if n == NOTHING {
+        if got == NOTHING {
             ferros_sys::exit(0);
         }
-        if n == ERR || n == 0 {
+        if got == ERR || got == 0 {
             continue;
         }
+        let level = NOW.load(Ordering::Acquire) as u8;
         match msg[0] {
-            0 if n == 2 => {
-                t.set(msg[1]);
-                reply(&token, &[t.level]);
+            0 if got == 2 => {
+                let l = ask(&mut n, msg[1], false);
+                reply(&token, &[l]);
             }
             1 => {
-                reply(&token, &[t.level]);
+                reply(&token, &[level]);
             }
             2 => {
-                reply(&token, &t.report());
+                ask(&mut n, level, true);
+                reply(&token, &REPORT.load(Ordering::Acquire).to_le_bytes()[..6]);
+            }
+            3 => {
+                let l = ask(&mut n, level, false);
+                reply(&token, &[l]);
             }
             _ => {
                 reply(&token, &[]);
             }
         }
-        poll = t.level == 0;
+        poll = NOW.load(Ordering::Acquire) as u8 == 0;
     }
 }
 

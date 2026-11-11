@@ -1270,6 +1270,15 @@ pub const SOUNDS: u8 = 3;
 pub const PREF_DND: usize = 40;
 /// Preference 41: the radios that were switched off when the quick row's "radios off" switched them all off (preference 15's bits), so the next tap puts back exactly those (owner, 2026-11-11: "all radios off (restores what was on)"). Kept in the device document as `radios_before`.
 pub const PREF_RADIOS_BEFORE: usize = 41;
+/// Preferences 42-45: the torch's settings (owner, 2026-11-11: "like flashlight we may want to control the brightness and strobe frequency and duty cycle and timeout"; ferros_sys::torch is their one encoding, docs/TORCH.md "Settings"), device settings (the LED and its driver are this device's): 42 the level a tap lights it at (0 never set: the whole dimmer), 43 the strobe (0 steady, 1-193 32nds of an octave up from a flash every 4 s), 44 the lit share of a flash (a signed byte, 256ths either side of a half, within 120), 45 when it turns itself off (0 never, 1-161 16ths of an octave up from 16 s). Kept in the device document as `torch_level`, `torch_strobe`, `torch_duty`, `torch_timeout`.
+pub const PREF_TORCH_LEVEL: usize = 42;
+pub const PREF_TORCH_STROBE: usize = 43;
+pub const PREF_TORCH_DUTY: usize = 44;
+pub const PREF_TORCH_TIMEOUT: usize = 45;
+/// The torch's ranges (ferros_sys::torch `STROBE_STEPS`, `DUTY_REACH`, `TIMEOUT_STEPS`).
+const TORCH_STROBE_STEPS: u8 = 6 * (1 << 5) + 1;
+const TORCH_DUTY_REACH: i8 = 120;
+const TORCH_TIMEOUT_STEPS: u8 = 10 * (1 << 4) + 1;
 /// How many preferences there are: the first block's 32 and the second's 16.
 const PREF_COUNT: usize = 48;
 
@@ -1405,6 +1414,10 @@ fn pref_valid(index: usize, value: u8) -> bool {
         PREF_SOUND => value < SOUNDS,
         PREF_DND => value <= 1,
         PREF_RADIOS_BEFORE => value < 1 << 5,
+        PREF_TORCH_LEVEL => true,
+        PREF_TORCH_STROBE => value <= TORCH_STROBE_STEPS,
+        PREF_TORCH_DUTY => (value as i8).unsigned_abs() <= TORCH_DUTY_REACH as u8,
+        PREF_TORCH_TIMEOUT => value <= TORCH_TIMEOUT_STEPS,
         _ => false,
     }
 }

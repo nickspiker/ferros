@@ -297,6 +297,111 @@ pub const SILENT: u8 = 2;
 pub const PREF_DND: u64 = 40;
 /// Preference 41: the radios that were off when "radios off" switched them all off (preference 15's bits), put back by its next tap.
 pub const PREF_RADIOS_BEFORE: u64 = 41;
+/// Preferences 42-45: the torch's settings (`torch`; docs/TORCH.md "Settings", QUICK.md "Quick pages"), device settings set thru the Settings capability: the level a tap lights it at, the strobe, the lit share of each flash, and when it turns itself off.
+pub const PREF_TORCH_LEVEL: u64 = 42;
+pub const PREF_TORCH_STROBE: u64 = 43;
+pub const PREF_TORCH_DUTY: u64 = 44;
+pub const PREF_TORCH_TIMEOUT: u64 = 45;
+
+/// The torch's settings as the device keeps them (preferences 42-45; owner, 2026-11-11: "like flashlight we may want to control the brightness and strobe frequency and duty cycle and timeout"). One encoding for the map that sets them and the torch that obeys them, so the two cannot disagree. Every step is a power-of-two fraction of an octave, as brightness is 32nds of a stop: no decimal knob anywhere.
+pub mod torch {
+    use super::{pref, PREF_TORCH_DUTY, PREF_TORCH_LEVEL, PREF_TORCH_STROBE, PREF_TORCH_TIMEOUT};
+
+    /// The strobe's steps an octave (32nds of an octave of frequency) and how many octaves it spans: code 1 a flash every 4 s, each further code a 32nd of an octave faster, the last (193) 16 a second.
+    pub const STROBE_PER_OCTAVE: u8 = 1 << 5;
+    pub const STROBE_OCTAVES: u8 = 6;
+    /// The strobe's highest code: 0 is steady.
+    pub const STROBE_STEPS: u8 = STROBE_OCTAVES * STROBE_PER_OCTAVE + 1;
+    /// The slowest strobe's period: 4 s (a quarter of a hertz).
+    const STROBE_SLOWEST_NS: u64 = 4_000_000_000;
+    /// The lit share's reach either side of a half, in 256ths: 8/256 to 248/256 lit. WHY not the whole byte: at the fastest strobe (16 a second, 62.5 ms) the shortest flash is then 1.95 ms, past the LM3644's 1 ms torch ramp and the bus write that starts it (docs/TORCH.md "Strobe"); shorter would light dimmer than asked, or not at all.
+    pub const DUTY_REACH: u8 = 120;
+    /// The timeout's steps an octave (16ths of an octave of time) and how many octaves it spans: code 1 is 16 s, the last (161) 2^14 s, about 4 h 33 min.
+    pub const TIMEOUT_PER_OCTAVE: u8 = 1 << 4;
+    pub const TIMEOUT_OCTAVES: u8 = 10;
+    /// The timeout's highest code: 0 is never.
+    pub const TIMEOUT_STEPS: u8 = TIMEOUT_OCTAVES * TIMEOUT_PER_OCTAVE + 1;
+    /// The shortest timeout: 16 s.
+    const TIMEOUT_SHORTEST_NS: u64 = 16_000_000_000;
+
+    /// 2^(i/32) for i in 0..32, Q30, computed at build time (the 32nd root of two by bisection, then its powers): no float at run time.
+    const POW2_32: [u64; 32] = pow2_32();
+    const fn pow2_32() -> [u64; 32] {
+        // The root by 64 halvings of [1, 2] (past f64's precision): r^32 against 2.
+        let (mut lo, mut hi) = (1.0f64, 2.0f64);
+        let mut i = 0;
+        while i < 64 {
+            let mid = (lo + hi) / 2.;
+            let mut p = 1.0f64;
+            let mut k = 0;
+            while k < 32 {
+                p *= mid;
+                k += 1;
+            }
+            if p < 2. {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+            i += 1;
+        }
+        let mut t = [0u64; 32];
+        let mut v = 1.0f64;
+        let mut k = 0;
+        while k < 32 {
+            t[k] = (v * (1u64 << 30) as f64 + 0.5) as u64;
+            v *= lo;
+            k += 1;
+        }
+        t
+    }
+
+    /// The level a tap lights the torch at (preference 42): the last it was set to, 1-255 on its perceptual dimmer; the whole dimmer while it was never set (0).
+    pub fn level() -> u8 {
+        match pref(PREF_TORCH_LEVEL) {
+            0 => 255,
+            l => l,
+        }
+    }
+
+    /// The strobe as kept (preference 43): 0 steady, else its code.
+    pub fn strobe() -> u8 {
+        pref(PREF_TORCH_STROBE)
+    }
+    /// The lit share as kept (preference 44): a signed byte, 256ths either side of a half (0, the default, a half).
+    pub fn duty() -> u8 {
+        pref(PREF_TORCH_DUTY)
+    }
+    /// The timeout as kept (preference 45): 0 never, else its code.
+    pub fn timeout() -> u8 {
+        pref(PREF_TORCH_TIMEOUT)
+    }
+
+    /// A strobe code's period in nanoseconds: None for 0 (steady). The kernel keeps the preference within `STROBE_STEPS` (it refuses anything past it), and any byte would still index the table in range (the fraction is below 32).
+    pub fn strobe_period_ns(code: u8) -> Option<u64> {
+        if code == 0 {
+            return None;
+        }
+        let k = (code - 1) as u32;
+        let (whole, frac) = (k / STROBE_PER_OCTAVE as u32, k % STROBE_PER_OCTAVE as u32);
+        Some((((STROBE_SLOWEST_NS as u128) << 30) / POW2_32[frac as usize] as u128 >> whole) as u64)
+    }
+
+    /// The lit share of a flash, in 256ths, from the kept signed byte (`duty`): a half and the byte. The kernel keeps the preference within `DUTY_REACH` either side (it refuses anything past it).
+    pub fn duty_256(code: u8) -> u32 {
+        (128 + code as i8 as i32) as u32
+    }
+
+    /// A timeout code's length in nanoseconds: None for 0 (never). The kernel keeps the preference within `TIMEOUT_STEPS`; even the byte's top (15 octaves) is far inside a u128 here.
+    pub fn timeout_ns(code: u8) -> Option<u64> {
+        if code == 0 {
+            return None;
+        }
+        let k = (code - 1) as u32;
+        let (whole, frac) = (k / TIMEOUT_PER_OCTAVE as u32, (k % TIMEOUT_PER_OCTAVE as u32) * (32 / TIMEOUT_PER_OCTAVE as u32));
+        Some((((TIMEOUT_SHORTEST_NS as u128) << whole) * POW2_32[frac as usize] as u128 >> 30) as u64)
+    }
+}
 
 /// Do not disturb (preference 40; SETTINGS.md): the person's, carried by their identity space.
 pub mod dnd {
