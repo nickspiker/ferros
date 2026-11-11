@@ -296,7 +296,7 @@ struct Fleet {
     confirm: bool,
     /// What the last departure request answered (fgtw `leave`: 0 started, 1 not a member, 2 a bad intent, 3 the request did not build).
     leave_result: Option<u8>,
-    /// Adding a device (fgtw op 9, payloads/fgtw addview.rs): the flow's phase (0 closed, 1 open, 2 adding, 3 a device selected and Yes waiting, 4 handing over the key, 5 added, 6 failed or refused), the devices asking to join (the key's first 8 bytes, flags: bit 0 its beacon heard, bit 1 its request heard on this network, bit 2 the one being added, bit 3 offered as a pick now, bit 4 another identity's; its name), and the service's note.
+    /// Adding a device (fgtw op 9, payloads/fgtw addview.rs): the flow's phase (0 closed, 1 open, 2 adding, 3 a device selected and Yes waiting, 4 handing over the key, 5 added, 6 failed or refused), the devices asking to join (the key's first 8 bytes, flags: bit 0 its beacon heard, bit 1 its request heard on this network, bit 2 the one being added, bit 3 offered as a pick now, bit 4 another identity's; its name), the service's note, and the device being added by name.
     add: u8,
     cand_key: [[u8; 8]; 8],
     cand_flags: [u8; 8],
@@ -310,6 +310,9 @@ struct Fleet {
     sel_name_n: usize,
     sel_words: [u8; 512],
     sel_words_n: usize,
+    /// The device being added (phases 2 and 4): its name.
+    adding_name: [u8; NAME_BYTES],
+    adding_name_n: usize,
     /// A sibling's departure waiting for approval here (fgtw op 13): its intent and how the approval stands (0 waiting, 1 approving, 2 approved, 3 failed), and its name.
     depart: Option<(u8, u8)>,
     depart_name: [u8; NAME_BYTES],
@@ -321,7 +324,7 @@ struct Fleet {
 
 impl Fleet {
     const fn new() -> Self {
-        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, sel_name: [0; NAME_BYTES], sel_name_n: 0, sel_words: [0; 512], sel_words_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0, denied_by: [0; NAME_BYTES], denied_by_n: 0, home: None, space_gen: None, sent: false, left: [0; NAME_BYTES], left_n: 0 }
+        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, sel_name: [0; NAME_BYTES], sel_name_n: 0, sel_words: [0; 512], sel_words_n: 0, adding_name: [0; NAME_BYTES], adding_name_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0, denied_by: [0; NAME_BYTES], denied_by_n: 0, home: None, space_gen: None, sent: false, left: [0; NAME_BYTES], left_n: 0 }
     }
 
     /// A fresh copy from `fgtw_poller` taken in, the page's own state kept: the remove row's arming, the last request's answer, a departure sent and not yet under way, and a departure approved here that has now gone (said as left).
@@ -395,7 +398,7 @@ impl Fleet {
 
     /// The add flow and a departure waiting (fgtw ops 9 and 13). WHY the checks: the counts and lengths are another process's words; a row or a name that would run past what the reply holds or a slot keeps ends the reading there.
     fn poll_add(&mut self, svc: u64) {
-        let mut a = [0u8; 2 + 8 * (8 + 2 + NAME_BYTES) + 1 + 255 + 1 + NAME_BYTES + 2 + 512];
+        let mut a = [0u8; 2 + 8 * (8 + 2 + NAME_BYTES) + 1 + 255 + 1 + NAME_BYTES + 2 + 512 + 1 + NAME_BYTES];
         let k = ferros_sys::call_live(svc, &[9], &mut a);
         self.cands = 0;
         self.add_note_n = 0;
@@ -442,6 +445,16 @@ impl Fleet {
                 if at + 2 + len <= got && len <= self.sel_words.len() {
                     self.sel_words[..len].copy_from_slice(&a[at + 2..at + 2 + len]);
                     self.sel_words_n = len;
+                }
+                at += 2 + len;
+            }
+            // The device being added (addview.rs `reply`, last), as far as the reply and the field hold it.
+            self.adding_name_n = 0;
+            if at < got {
+                let len = a[at] as usize;
+                if at + 1 + len <= got && len <= NAME_BYTES {
+                    self.adding_name[..len].copy_from_slice(&a[at + 1..at + 1 + len]);
+                    self.adding_name_n = len;
                 }
             }
         } else {
@@ -2558,6 +2571,11 @@ impl Map {
                             5 => FleetMsg::Added,
                             _ => FleetMsg::AddingFailed,
                         };
+                        // Binding or handing over the key (phases 2 and 4): the device being added by name, over what is being done with it (op 9's last field).
+                        if matches!(f.add, 2 | 4) && f.adding_name_n > 0 {
+                            let name = named(&f.adding_name, f.adding_name_n, FleetMsg::TheDevice);
+                            row(self, b, &mut y, small, white(), fleet(FleetMsg::AddingDevice(name.as_str())).as_str(), None);
+                        }
                         row(self, b, &mut y, small, white(), fleet(phase).as_str(), None);
                         // The identity service's own note on the flow, in its words (payloads/fgtw add.rs, op 9).
                         if f.add_note_n > 0 {

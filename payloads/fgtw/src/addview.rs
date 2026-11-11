@@ -2,8 +2,7 @@
 //! Pure: no syscall, no clock, so the mapping is tested on the host (the tests below).
 
 use alloc::vec::Vec;
-use fgtw::flow::add::{Phase, Row, View};
-use fgtw::sponsor::WordMatch;
+use fgtw::flow::add::{Phase, Row, View, WordState};
 
 /// Op 9's row flags: its BLE beacon heard, its request heard on this network, the device being added, offered as a pick now (nearby, and over Bluetooth only while the add is contended), and owned by another identity's fleet.
 pub const ROW_BLE: u8 = 1;
@@ -65,15 +64,16 @@ pub fn quiet_note(v: &View, net_up: bool) -> &'static str {
     }
 }
 
-/// Op 9: [phase][rows], each row [the key's first 8 bytes][flags, `ROW_*`][name length][name], then [note length][note], then the selected device's [name length][name][masked words length, u16 LE][masked words], both empty when none is selected.
+/// Op 9: [phase][rows], each row [the key's first 8 bytes][flags, `ROW_*`][name length][name], then [note length][note], then the selected device's [name length][name][masked words length, u16 LE][masked words], both empty when none is selected, then the device being added (binding or handing over the key, `View::adding`) [name length][name], empty when no add is under way.
 /// `note` is the executor's last word on the flow; empty, the open flow's quiet note stands in.
-pub fn reply(v: &View, refused: bool, adding: Option<[u8; 32]>, note: &str, net_up: bool) -> Vec<u8> {
+pub fn reply(v: &View, refused: bool, note: &str, net_up: bool) -> Vec<u8> {
     let mut r = Vec::with_capacity(256);
     let ph = phase(v, refused);
     r.push(ph);
     // WHY the cap: the Fleet page lays out at most 8 candidates, and the count is one byte.
     let n = v.rows.len().min(8);
     r.push(n as u8);
+    let adding = v.adding.as_ref().map(|(k, _)| *k);
     for row in &v.rows[..n] {
         r.extend_from_slice(&row.device[..8]);
         r.push(flags(row, adding));
@@ -98,43 +98,49 @@ pub fn reply(v: &View, refused: bool, adding: Option<[u8; 32]>, note: &str, net_
         }
         None => r.extend_from_slice(&[0, 0, 0]),
     }
+    match &v.adding {
+        // A device name is two voca words, at most 36 bytes (the longest word is 18): its length fits the byte.
+        Some((_, name)) => {
+            r.push(name.len() as u8);
+            r.extend_from_slice(name.as_bytes());
+        }
+        None => r.push(0),
+    }
     r
 }
 
-/// Op 11, the words typed so far as the machine left them: [kind][count], then the word to flag or the matched name. Kind 0 no candidates yet (the voca spell-check's first bad word after), 1 nothing typed (the count asking), 2 matched and being added (`added`, its name), 3 no device has this word, 4 one device still matches (its name), 5 several do (how many), 6 the flow is not open for words.
-pub fn words(v: &View, added: Option<&str>) -> Vec<u8> {
+/// Op 11, the words typed so far as the machine left them: [kind][count], then the word to flag or the matched name. Kind 0 no candidates yet (the voca spell-check's first bad word after), 1 nothing typed (the count asking), 2 matched and being added (`added`: these words started the add, `View::adding` its name), 3 no device has this word, 4 one device still matches (its name), 5 several do (how many), 6 the flow is not open for words.
+pub fn words(v: &View, added: bool) -> Vec<u8> {
     let mut r = Vec::with_capacity(48);
-    if let Some(name) = added {
+    if let (true, Some((_, name))) = (added, &v.adding) {
         r.extend_from_slice(&[2, 1]);
         r.extend_from_slice(name.as_bytes());
         return r;
     }
-    // The machine matched against its word pool: every candidate, or only those heard over Bluetooth while the add is contended, in row order.
-    let pool: Vec<&Row> = v.rows.iter().filter(|row| !v.contended || row.ble).collect();
     match &v.words {
-        Some(WordMatch::NoCandidates { typo }) => {
+        Some(WordState::NoCandidates { typo }) => {
             r.extend_from_slice(&[0, 0]);
             if let Some(w) = typo {
                 r.extend_from_slice(w.as_bytes());
             }
         }
         // WHY the cap: a byte on the wire; past 255 devices asking the page has nothing different to say.
-        Some(WordMatch::Nothing { asking }) => r.extend_from_slice(&[1, (*asking).min(255) as u8]),
-        Some(WordMatch::NoMatch(w)) => {
+        Some(WordState::Nothing { asking }) => r.extend_from_slice(&[1, (*asking).min(255) as u8]),
+        Some(WordState::NoMatch(w)) => {
             r.extend_from_slice(&[3, 0]);
             r.extend_from_slice(w.as_bytes());
         }
-        Some(WordMatch::One(i)) => {
+        Some(WordState::One(k)) => {
             r.extend_from_slice(&[4, 1]);
-            // WHY .get: the index names the machine's own pool, which the view does not carry; it is rebuilt here from the rows by the machine's filter, and a pool that ever differs (a machine change) leaves the name out rather than ending the identity service.
-            if let Some(row) = pool.get(*i) {
+            // WHY the find: the words stand as the last stroke left them, while the rows are rebuilt at every lapse, so the device they name can have lapsed off the rows since; then the name is left out until the next stroke.
+            if let Some(row) = v.rows.iter().find(|row| row.device == *k) {
                 r.extend_from_slice(row.name.as_bytes());
             }
         }
         // WHY the cap: as above.
-        Some(WordMatch::Many(k)) => r.extend_from_slice(&[5, (*k).min(255) as u8]),
+        Some(WordState::Many(k)) => r.extend_from_slice(&[5, (*k).min(255) as u8]),
         // A full match is never left standing (the machine adds at once and clears the words); one refused (locked out, another fleet's) is said on the Fleet page, and the words end.
-        Some(WordMatch::Full(_)) | None => r.extend_from_slice(&[6, 0]),
+        None => r.extend_from_slice(&[6, 0]),
     }
     r
 }
@@ -149,7 +155,7 @@ mod tests {
     }
 
     fn view(phase: Phase, rows: Vec<Row>) -> View {
-        View { phase, rows, selected: None, words: None, contended: false, listing: false, last: None }
+        View { phase, rows, selected: None, words: None, adding: None, contended: false, listing: false, last: None }
     }
 
     #[test]
@@ -176,7 +182,8 @@ mod tests {
         let mut v = view(Phase::Selected, alloc::vec![row(1, true, false, true), row(2, false, true, false)]);
         v.rows[1].owned_elsewhere = true;
         v.selected = Some(([1; 32], "dev1".to_string(), "alpha **** gamma".to_string()));
-        let r = reply(&v, false, Some([2; 32]), "", true);
+        v.adding = Some(([2; 32], "dev2".to_string()));
+        let r = reply(&v, false, "", true);
         assert_eq!(r[0], 3);
         assert_eq!(r[1], 2);
         // Row 0: key prefix, flags (BLE, pickable), name.
@@ -193,40 +200,45 @@ mod tests {
         assert_eq!(&r[at + 2..at + 6], b"dev1");
         let wl = u16::from_le_bytes([r[at + 6], r[at + 7]]) as usize;
         assert_eq!(&r[at + 8..at + 8 + wl], b"alpha **** gamma");
-        assert_eq!(r.len(), at + 8 + wl);
+        // The device being added, by name, last.
+        let at = at + 8 + wl;
+        assert_eq!(&r[at..], b"\x04dev2");
     }
 
     #[test]
     fn an_open_flow_with_nothing_said_says_why_it_is_quiet() {
         let v = view(Phase::Open, Vec::new());
-        let r = reply(&v, false, None, "", false);
+        let r = reply(&v, false, "", false);
         let note = quiet_note(&v, false);
         assert_eq!(&r[..3], &[1, 0, note.len() as u8]);
         assert_eq!(&r[3..3 + note.len()], note.as_bytes());
-        assert_eq!(&r[3 + note.len()..], &[0, 0, 0]);
+        assert_eq!(&r[3 + note.len()..], &[0, 0, 0, 0]);
         // A note said stands over the quiet one; a closed flow says nothing of its own.
-        let r = reply(&v, false, None, "added", true);
+        let r = reply(&v, false, "added", true);
         assert_eq!(&r[2..8], b"\x05added");
-        let r = reply(&view(Phase::Closed, Vec::new()), false, None, "", true);
-        assert_eq!(r, alloc::vec![0, 0, 0, 0, 0, 0]);
+        let r = reply(&view(Phase::Closed, Vec::new()), false, "", true);
+        assert_eq!(r, alloc::vec![0, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]
-    fn a_word_match_names_the_device_from_the_machines_pool() {
+    fn a_word_match_names_the_device_by_its_key() {
         let mut v = view(Phase::Open, alloc::vec![row(1, false, true, true), row(2, true, false, true)]);
-        v.words = Some(WordMatch::One(0));
-        assert_eq!(words(&v, None), b"\x04\x01dev1".to_vec());
-        // Contended: the pool is the Bluetooth-heard rows only, so index 0 is the second row.
-        v.contended = true;
-        assert_eq!(words(&v, None), b"\x04\x01dev2".to_vec());
-        v.words = Some(WordMatch::NoMatch(String::from("zebra")));
-        assert_eq!(words(&v, None), b"\x03\x00zebra".to_vec());
-        v.words = Some(WordMatch::Many(300));
-        assert_eq!(words(&v, None), alloc::vec![5, 255]);
-        v.words = Some(WordMatch::NoCandidates { typo: None });
-        assert_eq!(words(&v, None), alloc::vec![0, 0]);
+        v.words = Some(WordState::One([2; 32]));
+        assert_eq!(words(&v, false), b"\x04\x01dev2".to_vec());
+        // A device that lapsed off the rows since the stroke: still one match, its name left out.
+        v.words = Some(WordState::One([3; 32]));
+        assert_eq!(words(&v, false), alloc::vec![4, 1]);
+        v.words = Some(WordState::NoMatch(String::from("zebra")));
+        assert_eq!(words(&v, false), b"\x03\x00zebra".to_vec());
+        v.words = Some(WordState::Many(300));
+        assert_eq!(words(&v, false), alloc::vec![5, 255]);
+        v.words = Some(WordState::NoCandidates { typo: None });
+        assert_eq!(words(&v, false), alloc::vec![0, 0]);
         v.words = None;
-        assert_eq!(words(&v, None), alloc::vec![6, 0]);
-        assert_eq!(words(&v, Some("dev2")), b"\x02\x01dev2".to_vec());
+        assert_eq!(words(&v, false), alloc::vec![6, 0]);
+        // The words that started an add: the machine's device being added, by name.
+        v.phase = Phase::Binding;
+        v.adding = Some(([2; 32], "dev2".to_string()));
+        assert_eq!(words(&v, true), b"\x02\x01dev2".to_vec());
     }
 }
