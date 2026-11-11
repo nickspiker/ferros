@@ -34,6 +34,7 @@ members = [
     "payloads/gps",
     "payloads/nfc",
     "payloads/amp",
+    "payloads/torch",
     "payloads/bt",
     "payloads/usb",
     "payloads/gpstest",
