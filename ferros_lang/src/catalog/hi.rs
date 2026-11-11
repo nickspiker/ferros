@@ -225,6 +225,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FailedItsChecks => "अपनी जाँच में सफल नहीं हुआ",
         Msg::CouldNotBeRead => "पढ़ा नहीं जा सका",
         Msg::SomethingWentWrong => "कुछ गड़बड़ हो गई",
+        Msg::ItCrashed => "यह क्रैश हो गया",
+        Msg::ClosedFromOutside => "इसे बाहर से बंद किया गया",
         // ---- Developer ----
         Msg::TemporalDither => "टेम्पोरल डिदर",
         Msg::LightScope => "रोशनी स्कोप",
@@ -302,6 +304,7 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         Say::NotAskedYet(what) => write!(o, "{what} (अभी पूछा नहीं)"),
         Say::UsingNow(what) => write!(o, "{what} (अभी इस्तेमाल में)"),
         Say::CouldNotStart(name) => write!(o, "{name} शुरू नहीं हो सका"),
+        Say::Stopped(name) => write!(o, "{name} रुक गया"),
         Say::Signal(dbm) => write!(o, "सिग्नल {dbm} dBm"),
         Say::JoiningNet(name) => write!(o, "{name} से जुड़ रहे हैं।"),
         Say::PassphraseFor(name) => write!(o, "{name} का पासवर्ड।"),

@@ -361,6 +361,10 @@ messages! {
     CouldNotBeRead,
     /// Anything else.
     SomethingWentWrong,
+    /// Why a kist that started then stopped, under `Say::Stopped`: a fault or a panic.
+    ItCrashed,
+    /// Ended from outside (the bridge's `diag kill`), not by the person's own relaunch.
+    ClosedFromOutside,
 
     // ---- Developer ----
     TemporalDither,
@@ -458,6 +462,8 @@ pub enum Say<'a> {
     UsingNow(&'a str),
     /// A kist the person tapped that did not start (its name): "Mahere could not start", the reason under it (`Msg::NotEnoughMemory` and its neighbours).
     CouldNotStart(&'a str),
+    /// A kist that started and then stopped abnormally (its name): "Mahere stopped", the reason under it (`Msg::ItCrashed`, `Msg::ClosedFromOutside`).
+    Stopped(&'a str),
     // ---- the attest screen ----
     /// A network's signal, its dBm written already in the person's base.
     Signal(&'a str),

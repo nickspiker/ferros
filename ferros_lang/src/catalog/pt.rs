@@ -225,6 +225,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FailedItsChecks => "não passou nas verificações",
         Msg::CouldNotBeRead => "não pôde ser lido",
         Msg::SomethingWentWrong => "algo deu errado",
+        Msg::ItCrashed => "travou",
+        Msg::ClosedFromOutside => "foi fechado de fora",
         // ---- Developer ----
         Msg::TemporalDither => "pontilhado temporal",
         Msg::LightScope => "visor de luz",
@@ -300,6 +302,7 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         Say::NotAskedYet(what) => write!(o, "{what} (ainda não perguntado)"),
         Say::UsingNow(what) => write!(o, "{what} (usando agora)"),
         Say::CouldNotStart(name) => write!(o, "{name} não pôde iniciar"),
+        Say::Stopped(name) => write!(o, "{name} parou"),
         Say::Signal(dbm) => write!(o, "Sinal {dbm} dBm"),
         Say::JoiningNet(name) => write!(o, "Conectando a {name}."),
         Say::PassphraseFor(name) => write!(o, "A senha de {name}."),

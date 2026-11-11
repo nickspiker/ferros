@@ -225,6 +225,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FailedItsChecks => "tidak lolos pemeriksaannya",
         Msg::CouldNotBeRead => "tidak dapat dibaca",
         Msg::SomethingWentWrong => "terjadi kesalahan",
+        Msg::ItCrashed => "mengalami crash",
+        Msg::ClosedFromOutside => "ditutup dari luar",
         // ---- Developer ----
         Msg::TemporalDither => "dither temporal",
         Msg::LightScope => "pengamat cahaya",
@@ -301,6 +303,7 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         Say::NotAskedYet(what) => write!(o, "{what} (belum ditanyakan)"),
         Say::UsingNow(what) => write!(o, "{what} (sedang dipakai)"),
         Say::CouldNotStart(name) => write!(o, "{name} tidak dapat dimulai"),
+        Say::Stopped(name) => write!(o, "{name} berhenti"),
         Say::Signal(dbm) => write!(o, "Sinyal {dbm} dBm"),
         Say::JoiningNet(name) => write!(o, "Bergabung ke {name}."),
         Say::PassphraseFor(name) => write!(o, "Frasa sandi untuk {name}."),

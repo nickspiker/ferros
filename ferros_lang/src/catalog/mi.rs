@@ -225,6 +225,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FailedItsChecks => "kāore i puta i ōna arowhai",
         Msg::CouldNotBeRead => "kāore i taea te pānui",
         Msg::SomethingWentWrong => "i hē tētahi mea",
+        Msg::ItCrashed => "i hinga",
+        Msg::ClosedFromOutside => "i katia mai i waho",
         // ---- Developer ----
         Msg::TemporalDither => "dither ā-wā",
         Msg::LightScope => "tirohanga rama",
@@ -307,6 +309,7 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         Say::NotAskedYet(what) => write!(o, "{what} (kāore anō kia pātaitia)"),
         Say::UsingNow(what) => write!(o, "{what} (e whakamahi ana ināianei)"),
         Say::CouldNotStart(name) => write!(o, "Kāore i taea e {name} te tīmata"),
+        Say::Stopped(name) => write!(o, "I tū a {name}"),
         Say::Signal(dbm) => write!(o, "Tohu {dbm} dBm"),
         Say::JoiningNet(name) => write!(o, "E hono ana ki {name}."),
         Say::PassphraseFor(name) => write!(o, "Te kupuhipa mō {name}."),

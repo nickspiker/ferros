@@ -225,6 +225,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FailedItsChecks => "không vượt qua được kiểm tra",
         Msg::CouldNotBeRead => "không đọc được",
         Msg::SomethingWentWrong => "đã xảy ra lỗi",
+        Msg::ItCrashed => "bị lỗi và thoát",
+        Msg::ClosedFromOutside => "bị đóng từ bên ngoài",
         // ---- Developer ----
         Msg::TemporalDither => "dither theo thời gian",
         Msg::LightScope => "máy soi ánh sáng",
@@ -302,6 +304,7 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         Say::NotAskedYet(what) => write!(o, "{what} (chưa hỏi)"),
         Say::UsingNow(what) => write!(o, "{what} (đang dùng)"),
         Say::CouldNotStart(name) => write!(o, "{name} không thể khởi động"),
+        Say::Stopped(name) => write!(o, "{name} đã dừng"),
         Say::Signal(dbm) => write!(o, "Tín hiệu {dbm} dBm"),
         Say::JoiningNet(name) => write!(o, "Đang kết nối {name}."),
         Say::PassphraseFor(name) => write!(o, "Mật khẩu của {name}."),

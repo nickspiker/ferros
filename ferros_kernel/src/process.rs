@@ -1055,7 +1055,7 @@ const SYS_LANG: u64 = 36;
 const SYS_CLAIM: u64 = 37;
 /// bell(source, word): a doorbell on what the settings pages show (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure. 1s poll can desync too, that needs fixd."). x0 the source: 0-5 a link in the facts' order (its eight measures, its tracks and its detail document: counted when its driver sets one to a value other than the one it held, and when the driver ends and they empty), `BELL_FACTS` the device's facts a settings page shows (`bell_facts`). x1 a word in the caller's arc, 8-aligned as SYS_WAIT takes one: the kernel writes the source's change count there now and at every change, waking whatever of the process waits on it (`bell_ring`). One word a source a process; a second registration moves it. No capability: the measures, tracks and facts are what SYS_FACTS and SYS_TRACKS give anyone, and a detail's count says when it changed, never what it says. → 0, ERR for no such source.
 const SYS_BELL: u64 = 38;
-/// not_started(op, …): the kist launches init answered "started" for that the kernel's kist job did not start after all (`NOT_STARTED`; owner, 2026-11-11: Mahere tapped, nothing opened, "it looked stuck"), for the Settings holder alone (the map), as the claims' users list. Op 0: x1 the Settings token, x2/x3 a buffer and its length → how many records (all of them; whole records past the buffer are not written), each `NOT_STARTED_REC` bytes: the reason (ferros_kist::launch::why), the capsule's address (32 bytes), the kists' bell count it rang (u64 LE). Op 1: the kists' doorbell, x1 a word in the caller's arc, x2 the Settings token: the bell's change count written there now and whenever a launch does not start or a kist kept here starts, its waiters woken → 0. ERR without Settings, or for no such op.
+/// not_started(op, …): the kist launches init answered "started" for that the kernel's kist job did not start after all, and the kists that started and then ended by a fault, a panic or a kill from outside (`NOT_STARTED`; owner, 2026-11-11: Mahere tapped, nothing opened, "it looked stuck"; then Mahere faulting at once, "no toast or anything"), for the Settings holder alone (the map), as the claims' users list. Op 0: x1 the Settings token, x2/x3 a buffer and its length → how many records (all of them; whole records past the buffer are not written), each `NOT_STARTED_REC` bytes: the reason (ferros_kist::launch::why), the capsule's address (32 bytes), the kists' bell count it rang (u64 LE). Op 1: the kists' doorbell, x1 a word in the caller's arc, x2 the Settings token: the bell's change count written there now and whenever a launch does not start or a kist kept here starts, its waiters woken → 0. ERR without Settings, or for no such op.
 const SYS_NOT_STARTED: u64 = 39;
 /// arc(op, bytes): the caller's own arc grows or shrinks (ARCS.md step 2; owner, 2026-11-11: "why we cannot scale on demand, that was the whole point of ring memory"). No capability: a process reaches only its own arc, and only as far as its ceiling (`Arc::ceiling`: the most its build declared, its header's heap counted whole; fixed mode's size). Op 0 `ARC_GROW`: at least x1 more bytes (native: whole frames; ring: the mask doubles until they fit; exact: the limit moves) → x0 the new top (the arc's size, exact mode's limit), x1 the old one; the bytes between are new, zeroed, the process's. Op 1 `ARC_SHRINK`: keep the first x1 bytes (rounded up as the mode needs; never under what the process was spawned with) and give the rest back → x0 the new top, x1 the old. Op 2 `ARC_SIZE` → x0 the top, x1 the ceiling. Op 3 `ARC_RELEASE`: the frames wholly inside x2 bytes from arc offset x1 given back while the arc keeps its size (step 4; never the first frame, nor one the kernel holds a word in): a hole the process must not touch again until a grow over it → x0 the bytes given back, x1 the top. A masked arc's grow or shrink while another of its threads runs elsewhere holds the process off the cores first (`hold`, step 3): its mask or limit changes in every thread at once. Refused: x0 = ERR, x1 the reason (`ARC_WHY_*`), said on the console too.
 const SYS_ARC: u64 = 40;
@@ -4072,6 +4072,8 @@ fn end_process(pi: usize, cur: usize, value: u64) {
             kk.console.push(b'\n');
         }
         let name = p.name.clone();
+        // A kist ended by a fault or a panic: kept for the map's circle (`kist_stopped`).
+        kist_stopped(p, value);
         surfaces_free(p.epoch);
         crate::sensorlink::ended(p.epoch);
         power_orphaned(p.epoch);
@@ -4278,6 +4280,10 @@ pub fn take_console() -> Vec<u8> {
 /// End a process by name from outside (the service loop, `diag restart`), whatever it is doing: its arc freed, its calls still queued on any endpoint dropped, and every reply capability pointing at it removed from every other process — so a late reply can never reach whatever process takes its slot next. A server's queued callers stay queued on the endpoint for the next server. Returns whether a process of that name was found. Never call it for the process that is running (only from the kernel's own loop, where none is).
 pub fn kill(name: &[u8]) -> bool {
     lock();
+    // A kist ended from outside (the bridge's `diag kill`): kept for the map's circle, as a fault is. The person's own relaunch kills by `kill_locked` alone and keeps nothing.
+    if let Some(c) = k().procs.iter().flatten().find(|p| p.name == name && p.kist && !p.dying).and_then(|p| p.capsule) {
+        kist_record(&c, ferros_kist::launch::why::KILLED);
+    }
     let r = kill_locked(name);
     unlock();
     r
@@ -4762,20 +4768,37 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Resu
     })
 }
 
-/// The kist launches that did not start (owner, 2026-11-11: Mahere's circle tapped, "nothing opened", the console alone saying the arc pool had no room): one record a capsule, its reason (`ferros_kist::launch::why`) and the kists' bell count it rang, kept until that kist next starts. A record a kist the person has, at most: a capsule launched again replaces its own. Read by the Settings holder alone (SYS_NOT_STARTED op 0), as the claims' users list. Under the kernel lock.
+/// The kist launches that did not start (owner, 2026-11-11: Mahere's circle tapped, "nothing opened", the console alone saying the arc pool had no room), and the kists that started and then stopped abnormally (`kist_stopped`, the `kill` from outside): one record a capsule, its reason (`ferros_kist::launch::why`) and the kists' bell count it rang, kept until that kist next starts. A record a kist the person has, at most: a capsule launched again replaces its own. Read by the Settings holder alone (SYS_NOT_STARTED op 0), as the claims' users list. Under the kernel lock.
 static mut NOT_STARTED: Vec<([u8; 32], u8, u64)> = Vec::new();
 /// A record of SYS_NOT_STARTED op 0: the reason, the capsule's address, the kists' bell count it rang (u64 LE).
 pub const NOT_STARTED_REC: usize = 41;
 
 /// The service loop's kist job ended without starting `capsule`'s kist, for `why`: kept (`NOT_STARTED`), and the kists' bell rung, so the map, which asked init to launch it and was answered "started", learns it did not and says why on its circle. Rung even when the record was the same, since each launch the person asks for is told. Takes the kernel lock.
 pub fn kist_not_started(capsule: &[u8; 32], why: u8) {
-    with_lock(|| {
-        let v = BELL_COUNT[BELL_KISTS].load(core::sync::atomic::Ordering::Acquire) + 1;
-        let list = unsafe { &mut *(&raw mut NOT_STARTED) };
-        list.retain(|r| r.0 != *capsule);
-        list.push((*capsule, why, v));
-        bell_count(BELL_KISTS);
-    });
+    with_lock(|| kist_record(capsule, why));
+}
+
+/// `capsule`'s kist kept with `why` (a start that did not happen, or a stop after one: `kist_stopped`), replacing what was kept for it, and the kists' bell rung. Under the kernel lock.
+fn kist_record(capsule: &[u8; 32], why: u8) {
+    let v = BELL_COUNT[BELL_KISTS].load(core::sync::atomic::Ordering::Acquire) + 1;
+    let list = unsafe { &mut *(&raw mut NOT_STARTED) };
+    list.retain(|r| r.0 != *capsule);
+    list.push((*capsule, why, v));
+    bell_count(BELL_KISTS);
+}
+
+/// A process ended with `value` (its exit value, or the kernel's FAULT word): a kist that ended abnormally is kept with why, as a launch that did not start is (owner, 2026-11-11: Mahere started, faulted at once, "no toast or anything, just no indication at all"), so the map can say so on its circle. A fault (`FAULT` in the top byte, a syscall's bad buffer among them) or a panic (G#DEAD, ferros_sys::panic_exit and std's abort; 101, std's main panicking); any other exit value is the kist's own and keeps nothing. Under the kernel lock.
+fn kist_stopped(p: &Process, value: u64) {
+    use ferros_kist::launch::why;
+    let Some(capsule) = p.capsule.filter(|_| p.kist) else { return };
+    let r = if value >> 56 == FAULT >> 56 {
+        why::FAULT
+    } else if value == 0xDEAD || value == 101 {
+        why::PANIC
+    } else {
+        return;
+    };
+    kist_record(&capsule, r);
 }
 
 /// `capsule`'s kist started: what was kept of a launch of it that did not is dropped, and the kists' bell rung when there was one (the map's note on its circle goes). Under the kernel lock.

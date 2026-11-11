@@ -225,6 +225,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FailedItsChecks => "haikupita ukaguzi wake",
         Msg::CouldNotBeRead => "haikuweza kusomwa",
         Msg::SomethingWentWrong => "kuna hitilafu",
+        Msg::ItCrashed => "imeanguka",
+        Msg::ClosedFromOutside => "ilifungwa kutoka nje",
         // ---- Developer ----
         Msg::TemporalDither => "dither ya muda",
         Msg::LightScope => "kipima mwanga",
@@ -302,6 +304,7 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         Say::NotAskedYet(what) => write!(o, "{what} (bado haijaulizwa)"),
         Say::UsingNow(what) => write!(o, "{what} (inatumia sasa)"),
         Say::CouldNotStart(name) => write!(o, "{name} haikuweza kuanza"),
+        Say::Stopped(name) => write!(o, "{name} imesimama"),
         Say::Signal(dbm) => write!(o, "Mawimbi {dbm} dBm"),
         Say::JoiningNet(name) => write!(o, "Inajiunga na {name}."),
         Say::PassphraseFor(name) => write!(o, "Nywila ya {name}."),

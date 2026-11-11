@@ -225,6 +225,8 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FailedItsChecks => "hindi pumasa sa mga pagsusuri nito",
         Msg::CouldNotBeRead => "hindi ito mabasa",
         Msg::SomethingWentWrong => "may nagkamali",
+        Msg::ItCrashed => "nag-crash ito",
+        Msg::ClosedFromOutside => "isinara ito mula sa labas",
         // ---- Developer ----
         Msg::TemporalDither => "temporal dither",
         Msg::LightScope => "light scope",
@@ -301,6 +303,7 @@ pub fn say(m: Say, f: tatau::Fmt, o: &mut dyn Write) -> fmt::Result {
         Say::NotAskedYet(what) => write!(o, "{what} (hindi pa naitatanong)"),
         Say::UsingNow(what) => write!(o, "{what} (ginagamit ngayon)"),
         Say::CouldNotStart(name) => write!(o, "Hindi makapagsimula ang {name}"),
+        Say::Stopped(name) => write!(o, "Huminto ang {name}"),
         Say::Signal(dbm) => write!(o, "Signal {dbm} dBm"),
         Say::JoiningNet(name) => write!(o, "Sumasali sa {name}."),
         Say::PassphraseFor(name) => write!(o, "Ang passphrase para sa {name}."),
