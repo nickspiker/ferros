@@ -39,7 +39,7 @@ pub fn read(doc: &[u8], hp: &[u8; 32], me: &[u8; 32]) -> Kept {
     if sec.get_field("me").and_then(|f| f.values.first()).and_then(|v| v.as_bytes()) != Some(&me[..]) {
         return Kept::Foreign;
     }
-    match Depart::from_section(&sec, *hp, REPORTS_SENT) {
+    match Depart::from_section(&sec, *hp, *me, REPORTS_SENT) {
         Ok(m) => Kept::Machine(m),
         Err(e) => Kept::Unreadable(e),
     }
@@ -68,7 +68,7 @@ pub fn read_add(doc: &[u8], hp: &[u8; 32], seed: &[u8; 32], me: &[u8; 32]) -> Ke
     if sec.get_field("me").and_then(|f| f.values.first()).and_then(|v| v.as_bytes()) != Some(&me[..]) {
         return KeptAdd::Foreign;
     }
-    match Add::from_section(&sec, *hp, *seed, REPORTS_SENT) {
+    match Add::from_section(&sec, *hp, *seed, *me, REPORTS_SENT) {
         Ok(m) => KeptAdd::Machine(m),
         Err(e) => KeptAdd::Unreadable(e),
     }
@@ -88,7 +88,7 @@ fn from_old(hp: &[u8; 32], me: &[u8; 32], frame: Vec<u8>) -> Kept {
     s.add_field("own_salt", vsf::VsfType::hb(req.salt.to_vec()));
     s.add_field("own_intent", vsf::VsfType::u(req.intent as usize, false));
     s.add_field("own_frame", vsf::VsfType::v(b'r', frame));
-    match Depart::from_section(&s, *hp, REPORTS_SENT) {
+    match Depart::from_section(&s, *hp, *me, REPORTS_SENT) {
         Ok(m) => Kept::Old(m),
         Err(e) => Kept::Unreadable(e),
     }
