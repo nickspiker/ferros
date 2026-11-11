@@ -1,6 +1,6 @@
 # GPU kists: one compute path for the system and for kists
 
-Status: study, design and plan, 2026-11-11; nothing here is built.
+Status: study, design and plan, 2026-11-11; plan step 0 built the same day (below), measured on the host, not yet on the device.
 Everything not quoted from the owner is a proposal.
 GPU.md is the driver as built; this is what it grows into.
 
@@ -173,6 +173,14 @@ Each step is measured on the Pro before the next; sizes are estimates.
 0. **The wallpaper on the GPU, Rust recorded:** the wallpaper crate over a lane type (tapuwae's route), thru today's service; the display's and wallgen's CPU paths go, the CPU code kept only for tests and tools/tune.
    - Proof: the refined 1344 × 2992 wallpaper's time against 33.4 s, its difference from the CPU's measured and shown to the owner.
    - Size: 1-1.5k lines (sin and cos, ldexp in the builder; the survey's histogram read back).
+   - **Built (2026-11-11), about 1.3k lines:**
+     - `wallpaper` over a lane (lane.rs): f32 and libm on the CPU, bit for bit the old picture (its pinned hashes hold); valhall's recording type on the GPU (gpu.rs). dz's ldexp became a scale multiplied in; sin 2πt a polynomial on the GPU; no builder change for either.
+     - Three kernels: the survey (a preview pixel an invocation, counts and distances read back and tallied on the CPU), the first pass (1030 words, run in bands of 2^20 pixels by a uniform), the refine (a listed pixel's 4 × 4 samples, 17 loops, 13812 words of the service's 16368). The marks stay on the CPU (integer compares over the first pass where the GPU left it).
+     - valhall: `ssa::uniform`, U + U, 64 labels a kernel, and `sim`, an emulator of the emitted words, checked against the device's Mandelbrot (its sum and cap count, every pixel).
+     - wallgen draws it this way only, in the arena's first 32 MiB (gputest's bench region); without the GPU service, no wallpaper. The display's job and its four threads are gone: it shows the person's own or wallgen's, else none.
+     - On the host, the words in the emulator against the CPU at an eighth of husky's frame, ΔE in the crate's opponent space × 100: the survey keeps the CPU's candidate for 8 of 8 seeds; the first pass mean 0.02-0.05, 0.3-0.7 % of pixels above 1 (the set's edge); refined mean 0.02-0.04, 99th percentile 0.5-1.1, most 4.1.
+     - f16, measured not built: the colour stage looks the same in f16 (mean 0.03), the orbit does not (mean about 50). The recorder has no f16 type; the 2× needs paired v2f16 and lands on the colour stage only.
+     - To measure on the device: wallgen's line (survey, first pass, marks, refine, each GPU µs and compile), the refined time against 33.4 s, a capture by eye.
 1. **The one path's service, system clients only:** a group and address space per client, pinned buffers and layers with the fence per frame, held calls and bells by interrupt, MMU faults and the progress timer, priorities; clients wallgen, ahau, gputest.
    - Proof: gputest and ahau at once; a gputest kernel reading past its buffer faults alone while the mark lands; an endless kernel stopped with no host timer while the mark draws; the fence logs nothing.
    - Size: 2-2.5k lines in the service, 300-500 in the kernel.

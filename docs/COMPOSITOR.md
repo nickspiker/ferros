@@ -146,7 +146,7 @@ The budget on husky (1344 × 2992), what lives for the process (before the heap'
 | The bars: `BAR` (the chrome rows), `BAR_W` and its back buffer (to the quick row's floor, 8 bytes a pixel) | about 15 MiB | `server`, QUICK.md "Memory" |
 | The quick row's six sprites | 2.1 MiB | `quick::init` |
 | The hit map (a u16 a pixel) and the bars' ids (two) | 7.7 + about 2.8 MiB | `hit::alloc`, "The hit map" below |
-| The compose-once bitmap, the wallpaper's refining mask, the flight's scratch, the glass's plan | about 1 MiB | `server`, `plan_glass` |
+| The compose-once bitmap, the flight's scratch, the glass's plan (the wallpaper's refining mask, 0.5 MiB, went with its CPU job, 2026-11-11: wallgen draws it on the GPU) | about 0.5 MiB | `server`, `plan_glass` |
 | Outside the bump: the console's arena and the loader's | 3 MiB | the 4 MiB after .bss |
 
 About 27.4 MiB kept in the bump before the hit map (the 30.4 of QUICK.md less the two arenas now outside it), about 38 MiB with it, then each frame's scratch on top (glyph bitmaps, a draw's tables), reset every frame. The measured figures are the display's own lines:
