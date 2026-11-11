@@ -13,22 +13,22 @@ Built 2026-11-11 (branch `quick-settings`), not yet run on a device.
 
 ## Where the row sits: circle fitting inside out
 
-The corners' circles are each tangent to the glass, the app's circle (from outside) and their neighbour. The quick row is the same fit turned inside out: six circles inside the app's circle, each tangent to it from inside, to a horizontal floor from above and to its neighbour, and the outer pair tangent to the glass's left and right edges (display quick.rs `layout`).
+The corners' circles are each tangent to the glass, the app's circle (from outside) and their neighbour. The quick row is the same fit turned inside out: seven circles inside the app's circle (six until full screen joined them, 2026-11-11), each tangent to it from inside, to a horizontal floor from above and to its neighbour, and the outer pair tangent to the glass's left and right edges (display quick.rs `layout`).
 
 Owner, 2026-11-11, after trying the first cut on the Pro: "Good idea on the swipe down console! Let's make the circles always touch the left/right sides so move the bottom horizontal guide down until they scale up and touch." Until then the floor was the console's last row (the first row where the app circle's chord is the whole width) and the row stopped well short of the sides (husky r 81, 72, 58).
 
-- **The solve.** Two unknowns: the floor, and the split between the middle pair (the line both touch). For a floor, the split moves until both outer circles are as near their walls; then the floor moves down until that nearness is nought. Both by bisection, the circles' centres on the closed-form line where the arc's room equals the floor's. Once per screen size, logged with its time (`display: quick row (x,y,r) … floor F, walls L/R hundredths, solved in N us`).
+- **The solve.** Two unknowns: the floor, and the split, where the middle circle is centred (`middle`: tangent to the arc and the floor; each side's chain starts tangent to it). Until the seventh circle the split was the line the middle pair both touched. For a floor, the split moves until both outer circles are as near their walls; then the floor moves down until that nearness is nought. Both by bisection, the circles' centres on the closed-form line where the arc's room equals the floor's. Once per screen size, logged with its time (`display: quick row (x,y,r) … floor F, walls L/R hundredths, solved in N us`).
 - **The walls are the glass, not the screen's edge**: measured as `corner_layout` measures them (`GlassOutline`, hairline and rim off). The glass's corners are not alike (the big one top left), so the split is not the centre: a pixel right of it on husky, six on akita, whose fat corner is rounder.
-- **Collisions.** The console's corner circles (clock top left, cellular, WiFi, Bluetooth and NFC top right) are outside the app's circle and these inside it, both tangent to it, so they cannot overlap; their drawn rims (two and a half pixels) can meet, and the console's region redraw composes both. The camera hole is above the app's circle; the middle pair clear it by 54 to 56 pixels on husky, 41 to 49 on akita.
+- **Collisions.** The console's corner circles (clock top left, cellular, WiFi, Bluetooth and NFC top right) are outside the app's circle and these inside it, both tangent to it, so they cannot overlap; their drawn rims (two and a half pixels) can meet, and the console's region redraw composes both. The camera hole is above the app's circle, and the middle circle, centred under it, meets the app circle's top where the hole touches it from outside (a pixel apart on both boards); the compose clips the row to the app's circle, so none of its rim reaches the hole.
 
-Left to right: radios off, sound, brightness | torch, do not disturb, screencap. The two rings (brightness, torch) are the middle, largest pair.
+Left to right: radios off, sound, brightness, full screen, torch, do not disturb, screencap. Full screen is the middle, largest circle (owner, 2026-11-11: full screen moves from the home swipe "to a quick-row circle"); the two rings (brightness, torch) are the pair either side of it.
 
 Solved on the host from the same equations, the glass from fluor's corner parameters (the device logs its own):
 
-| | Floor | Left outer | Left next | Left middle | Right middle | Right next | Right outer |
-|---|---|---|---|---|---|---|---|
-| husky (1344 × 2992) | 413 | (82, 334) r 79 | (273, 297) r 116 | (530, 270) r 143 | (816, 270) r 143 | (1072, 297) r 116 | (1263, 334) r 79 |
-| akita (1080 × 2400) | 337 | (71, 273) r 64 | (225, 244) r 93 | (432, 223) r 114 | (660, 224) r 114 | (864, 246) r 92 | (1016, 275) r 62 |
+| | Floor | Left outer | Left next | Left ring | Middle | Right ring | Right next | Right outer |
+|---|---|---|---|---|---|---|---|---|
+| husky (1344 × 2992) | 383 | (64, 322) r 61 | (213, 292) r 91 | (422, 263) r 120 | (674, 251) r 132 | (925, 264) r 120 | (1133, 292) r 91 | (1281, 323) r 61 |
+| akita (1080 × 2400) | 313 | (57, 264) r 49 | (178, 239) r 74 | (347, 217) r 96 | (548, 208) r 105 | (748, 218) r 95 | (913, 242) r 72 | (1030, 266) r 48 |
 
 ## Drawn once, then slid (2026-11-11)
 
@@ -55,6 +55,7 @@ The first cut grew the row out of the point under the camera, every circle drawn
 - **Sound**: a tap goes round sound, vibrate, silent (preference 39, a device setting). Its word is the mode now. Nothing plays a sound or a buzz by it yet.
 - **Do not disturb**: the person's, not the device's (SETTINGS.md). A tap asks the identity service (fgtw op 24) from the map's worker thread; the service puts it in the person's space, hands it to their fleet and fgtw.org, and writes it to the kernel (preference 40), which the circle shows. Before the identity service's first pull it is refused and the circle does not change. Nothing is silenced by it yet.
 - **Screencap**: the row shuts first; when it has landed the map sends op 56 with the capture flag, and the display takes the capture (as op 30 does) the first pass the bars on the screen hold none of the row, so the row is not in the picture. There is no clipboard yet (owner, 2026-11-07: "when we get the clipboard running that's where the screencap will live"), so the frame stays in the free surface op 30 wrote it to and its address goes to the console (`display: quick row screencap (no clipboard yet): G#…`).
+- **Full screen** (the middle circle): a tap switches the app in front full screen or back (display op 43, the app window's own flag, kept while it is behind). Lit while it is full screen; dimmed with no app in front, where a tap does nothing. In full screen the console's rows show only while the bars on the glass hold some of the row, so a pull from the doorway brings the console and the row back over the app and this circle can switch it off.
 - Rotation lock: none (no rotation today).
 
 Each circle's word is ferros_lang's, in the person's language, a word a line. A circle is lit while what it switches is on; a finger on it lifts it to the live ink's light.
