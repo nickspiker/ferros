@@ -1129,6 +1129,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-tidetest"
+version = "0.1.0"
+dependencies = [
+ "ferros_heap",
+ "ferros_sys",
+ "ferros_tide",
+]
+
+[[package]]
 name = "ferros-payload-touch"
 version = "0.1.0"
 dependencies = [

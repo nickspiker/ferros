@@ -527,5 +527,53 @@ impl Tide {
     }
 }
 
+/// Samples of the curve a face carries.
+pub const CURVE: usize = 1 << 6;
+/// How far before the face's moment its curve starts: a quarter of its span (2^-2 of a day).
+pub const CURVE_BEFORE: f64 = DAY / (1 << 2) as f64;
+
+/// What the tide puck shows, made once and good until `until` (docs/PUCKS.md): the picture changes in words only when a high or a low passes, so that moment is the puck's one deadline; between, the display moves "now" along the curve on its own clock.
+#[derive(Clone, Copy, Debug)]
+pub struct Face {
+    /// When it was made (Eagle seconds).
+    pub made: f64,
+    /// The height then and its rate (metres, metres a second): rising when the rate is above zero.
+    pub height: f64,
+    pub rate: f64,
+    pub next_high: Extreme,
+    pub next_low: Extreme,
+    /// The curve over [start, start + a day): `CURVE` heights and their rates, evenly spaced, so a drawer can join them with cubic Hermite pieces that are C¹ and pass thru every sample at its true slope.
+    pub start: f64,
+    pub heights: [f32; CURVE],
+    pub rates: [f32; CURVE],
+    /// The curve's lowest and highest sample, for its scale.
+    pub lo: f32,
+    pub hi: f32,
+    /// When the words go stale: the earlier of the next high and the next low.
+    pub until: f64,
+}
+
+impl Face {
+    /// The face at Eagle second `now`; None only when the next day and a half hold no high or no low (a flat sea: a station with no constituents).
+    pub fn at(tide: &Tide, now: f64) -> Option<Face> {
+        let (high, low) = tide.next(now);
+        let (next_high, next_low) = (high?, low?);
+        let start = now - CURVE_BEFORE;
+        let fr = Frame::at(start + 0.5 * DAY);
+        let step = DAY / CURVE as f64;
+        let mut f = Face { made: now, height: tide.height(now), rate: tide.rate(now), next_high, next_low, start, heights: [0.; CURVE], rates: [0.; CURVE], lo: f32::MAX, hi: f32::MIN, until: next_high.t.min(next_low.t) };
+        for k in 0..CURVE {
+            let t = start + k as f64 * step;
+            let h = tide.height_in(&fr, t) as f32;
+            f.heights[k] = h;
+            // Metres per sample step, as a Hermite piece over one step wants its tangents.
+            f.rates[k] = (tide.rate_in(&fr, t) * step) as f32;
+            f.lo = f.lo.min(h);
+            f.hi = f.hi.max(h);
+        }
+        Some(f)
+    }
+}
+
 #[cfg(test)]
 mod tests;

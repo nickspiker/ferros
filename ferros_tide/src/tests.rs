@@ -292,6 +292,32 @@ fn frames_agree() {
     assert!((tide.height_in(&a, t) - tide.height(t)).abs() < 1e-3);
 }
 
+/// A face: its words are the next extremes, its deadline the earlier of them, and its curve joined by cubic Hermite pieces (the drawer's C¹ curve) stays within a centimetre of the true tide between samples at every station.
+#[test]
+fn a_face_carries_its_day() {
+    for s in [&SAN_FRANCISCO, &THE_BATTERY, &SEATTLE, &HONOLULU] {
+        let tide = tide_of(s);
+        let now = nov(4, 9, 30);
+        let f = Face::at(&tide, now).unwrap();
+        assert!(f.next_high.high && !f.next_low.high && f.next_high.t > now && f.next_low.t > now);
+        assert_eq!(f.until, f.next_high.t.min(f.next_low.t));
+        assert_eq!(f.rate > 0., f.next_high.t < f.next_low.t, "{}: rising means the high comes first", s.name);
+        let step = 86_400. / CURVE as f64;
+        let mut worst = 0f64;
+        for k in 0..CURVE - 1 {
+            for j in 1..(1 << 3) {
+                let x = j as f64 / (1 << 3) as f64;
+                let (h00, h10, h01, h11) = (2. * x * x * x - 3. * x * x + 1., x * x * x - 2. * x * x + x, -2. * x * x * x + 3. * x * x, x * x * x - x * x);
+                let h = h00 * f.heights[k] as f64 + h10 * f.rates[k] as f64 + h01 * f.heights[k + 1] as f64 + h11 * f.rates[k + 1] as f64;
+                worst = worst.max((h - tide.height(f.start + (k as f64 + x) * step)).abs());
+            }
+        }
+        println!("{}: the face's curve within {:.2} mm", s.name, worst * 1e3);
+        assert!(worst < 0.01, "{}: {worst}", s.name);
+        assert!(f.lo <= f.height as f32 + 1e-3 && f.height as f32 <= f.hi + 1e-3);
+    }
+}
+
 /// The station documents tools/tide-station wrote (stations/, from the same published values) read back to the same model, and the catalog finds each station from a point near it.
 #[cfg(feature = "vsf")]
 #[test]

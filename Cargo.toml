@@ -40,6 +40,7 @@ members = [
     "payloads/gpstest",
     "payloads/focustest",
     "payloads/clock",
+    "payloads/tidetest",
     "payloads/touchtest",
     "payloads/map",
     "payloads/init",
