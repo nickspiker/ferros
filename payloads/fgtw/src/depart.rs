@@ -239,6 +239,8 @@ impl Client {
                     self.depart_wipe();
                     return;
                 }
+                // The Add machine's actions (radios, chain news): never from the Depart machine, which shares the Action type.
+                _ => {}
             }
         }
     }
@@ -383,6 +385,8 @@ impl Client {
                 self.log.put(b" was not published: ");
                 self.log.put(reason.as_bytes());
             }
+            // The Add machine's notes: never from the Depart machine, which shares the Note type.
+            _ => {}
         }
         self.log.line();
     }
@@ -428,6 +432,8 @@ impl Client {
                                 }
                             }
                             FlowFrame::DepartDeny { leaver, .. } => self.space_deny_depart(&leaver, &bytes),
+                            // The Add machine's frames (bind_select, fanout_resp): the Depart machine builds none.
+                            _ => {}
                         }
                     }
                 }
