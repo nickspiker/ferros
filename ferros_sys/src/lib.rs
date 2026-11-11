@@ -493,6 +493,16 @@ pub mod claim {
     pub fn gps_ask(settings: u64, op: u8, reply: &mut [u8]) -> u64 {
         svc(nr::CLAIM, 3, op as u64, settings, off(reply.as_mut_ptr()), reply.len() as u64 | CALL_LIVE)
     }
+    /// The GPS driver's doorbell (payloads/gps op 3 WATCH) for a Settings holder that holds a GPS claim: blocks until the driver's change count (its fixes and fix messages) is other than `seen`, then the count now. A driver not receiving yet (starting, or not started for the claim yet) takes the call when it first receives. None: refused (no claim, no capability), or the driver ended while it held the call. Call it from a thread of its own: it waits as long as nothing changes.
+    pub fn gps_watch(settings: u64, seen: u32) -> Option<u32> {
+        let mut r = [0u8; 4];
+        let n = svc(nr::CLAIM, 3, 3 | (seen as u64) << 8, settings, off(r.as_mut_ptr()), r.len() as u64);
+        (n == 4).then(|| u32::from_le_bytes(r))
+    }
+    /// The claims' doorbell (kernel op 4), given Settings: the kernel writes GPS's claims (`FACT`'s word: the count, and a change count above bit 16) into `word` now and whenever they change, waking whatever waits on it (`wait_world`). False without the capability.
+    pub fn doorbell(settings: u64, word: &core::sync::atomic::AtomicU64) -> bool {
+        svc(nr::CLAIM, 4, off(word as *const _ as *const u8), settings, 0, 0) == 0
+    }
 }
 
 pub const MEASURE_NONE: u64 = u64::MAX;

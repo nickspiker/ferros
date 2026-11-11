@@ -1214,7 +1214,7 @@ struct Map {
     uninstall_armed: Option<u8>,
     /// The GPS page's claim (owner, 2026-11-10: "open the GPS screen (which should turn it on whilist GPS screen is open)"; ferros_sys::claim): held while the page shows, the screen is on and GPS is switched on.
     gps_claimed: bool,
-    /// The driver as last asked thru the kernel while the page holds its claim (`gps_read`): None not answering yet (starting, its session replaying), Some(None) no fix yet, Some(Some(fix)) the fix. On the page only, never logged, dropped as the page goes.
+    /// The driver as `gps_watch` last read it while the page holds its claim, at each ring of its doorbell: None not answering yet (starting, its session replaying), Some(None) no fix yet, Some(Some(fix)) the fix. On the page only, never logged, dropped as the page goes.
     gps_fix: Option<Option<GpsFix>>,
 }
 
@@ -1225,20 +1225,90 @@ struct GpsFix {
     lon: i32,
 }
 
-/// One of a fix's coordinates in decimal degrees, as other maps take it (owner, 2026-11-10: "the dymaxion words, lat/lon decimal and dms all for display"): arabic digits whatever the device's base, a standard written form to be read out or copied, six places (a tenth of a metre; the fix is in 2^-23 degrees, about a centimetre).
-fn degrees_decimal(l: &mut Line, v: i32) {
-    let a = v.unsigned_abs() as u64;
-    // Millionths of a degree, rounded at the half: 2^-23 degrees times 10^6, plus half of 2^23, over 2^23.
-    let micro = (a * 1_000_000 + (1 << 22)) >> 23;
-    let _ = write!(l, "{}{}.{:06}", if v < 0 { "-" } else { "" }, micro / 1_000_000, micro % 1_000_000);
+/// The radix of the device's base as the coordinates write it (`degrees_linear`, `degrees_dms`): ten, sixteen, or twelve for both dozenal scales (a coordinate is a place, so DMS writes it linear too, as DLS does).
+fn coord_radix(f: tatau::Fmt) -> u64 {
+    match f.base {
+        tatau::Base::Arabic => 10,
+        tatau::Base::Hex => 1 << 4,
+        tatau::Base::Dms | tatau::Base::Dls => 12,
+    }
 }
 
-/// One of a fix's coordinates in degrees, minutes and seconds with its hemisphere (N S for a latitude, E W for a longitude), seconds to a tenth (three metres or less), arabic digits as `degrees_decimal`.
-fn degrees_dms(l: &mut Line, v: i32, pos: char, neg: char) {
+/// `v` in the device's base at `width` digits or more: arabic and hex as Rust writes them, dozenal digit by digit in the style's glyphs or words (tatau's: words a space apart, none across the radix point, which the caller writes).
+fn coord_digits(l: &mut Line, f: tatau::Fmt, v: u64, width: usize) {
+    match f.base {
+        tatau::Base::Arabic => {
+            let _ = write!(l, "{v:0width$}");
+        }
+        tatau::Base::Hex => {
+            let _ = write!(l, "{v:0width$X}");
+        }
+        tatau::Base::Dms | tatau::Base::Dls => {
+            // Least significant first. Twenty-four places hold any u64 in base twelve (eighteen digits) and every width asked here (two at most).
+            let mut d = [0u8; 24];
+            let (mut n, mut x) = (0, v);
+            loop {
+                d[n] = (x % 12) as u8;
+                n += 1;
+                x /= 12;
+                if x == 0 && n >= width {
+                    break;
+                }
+            }
+            for i in (0..n).rev() {
+                match f.style {
+                    tatau::Style::Glyphs => {
+                        let _ = l.write_char(char::from_u32(tatau::GLYPH_ZERO + d[i] as u32).unwrap_or('?'));
+                    }
+                    tatau::Style::Words => {
+                        if i + 1 != n {
+                            l.s(" ");
+                        }
+                        l.s(tatau::NAMES[d[i] as usize]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The radix point in the device's base: a full stop in arabic and hex, tatau's `·` in dozenal.
+fn coord_point(l: &mut Line, f: tatau::Fmt) {
+    let _ = l.write_char(if f.base.dozenal() { tatau::POINT } else { '.' });
+}
+
+/// One of a fix's coordinates in degrees and a fraction of one (owner, 2026-11-10: "the dymaxion words, lat/lon decimal and dms all for display", and of the digits: "follow the base, yes"), in the device's base: arabic six places, hex five (16^5 near 10^6), dozenal six (12^6 near 3·10^6), each about a tenth of a metre or finer (the fix is in 2^-23 degrees, about a centimetre). The sign a minus in arabic and hex, tatau's arrows in dozenal (always shown, as DLS shows them).
+fn degrees_linear(l: &mut Line, f: tatau::Fmt, v: i32) {
     let a = v.unsigned_abs() as u64;
-    // Tenths of an arcsecond, rounded: 2^-23 degrees times 36000, plus half of 2^23, over 2^23.
-    let t = (a * 36_000 + (1 << 22)) >> 23;
-    let _ = write!(l, "{}\u{b0} {:02}\u{2032} {:02}.{}\u{2033} {}", t / 36_000, t / 600 % 60, t / 10 % 60, t % 10, if v < 0 { neg } else { pos });
+    let radix = coord_radix(f);
+    let places = if radix == 1 << 4 { 5 } else { 6 };
+    let scale = radix.pow(places as u32);
+    // The fraction's last digit, rounded at the half: 2^-23 degrees times the scale, plus half of 2^23, over 2^23. A coordinate is at most 180 degrees (below 2^31 in 2^-23 degrees) and the scale below 2^22, so the product stays below 2^53.
+    let r = (a * scale + (1 << 22)) >> 23;
+    if f.base.dozenal() {
+        let _ = l.write_char(if v < 0 { tatau::DOWN } else { tatau::UP });
+    } else if v < 0 {
+        l.s("-");
+    }
+    coord_digits(l, f, r / scale, 1);
+    coord_point(l, f);
+    coord_digits(l, f, r % scale, places);
+}
+
+/// One of a fix's coordinates in degrees, minutes and seconds with its hemisphere (N S for a latitude, E W for a longitude), each number in the device's base (the sixty and sixty stay: they are the unit), seconds to one digit after the point (a tenth, a sixteenth or a twelfth of a second of arc: three metres or less).
+fn degrees_dms(l: &mut Line, f: tatau::Fmt, v: i32, pos: char, neg: char) {
+    let a = v.unsigned_abs() as u64;
+    let radix = coord_radix(f);
+    // Seconds of arc in units of one digit after the point, rounded: 2^-23 degrees times 3600 times the radix, plus half of 2^23, over 2^23 (below 2^31 · 2^16, no overflow).
+    let t = (a * 3600 * radix + (1 << 22)) >> 23;
+    coord_digits(l, f, t / (3600 * radix), 1);
+    l.s("\u{b0} ");
+    coord_digits(l, f, t / (60 * radix) % 60, 2);
+    l.s("\u{2032} ");
+    coord_digits(l, f, t / radix % 60, 2);
+    coord_point(l, f);
+    coord_digits(l, f, t % radix, 1);
+    let _ = write!(l, "\u{2033} {}", if v < 0 { neg } else { pos });
 }
 
 impl Map {
@@ -1281,22 +1351,72 @@ impl Map {
         }
     }
 
-    /// The GPS driver's fix asked thru the kernel (ferros_sys::claim::gps_ask) for the page holding its claim: `gps_fix` as above.
-    fn gps_read(&mut self) {
-        if !self.gps_claimed {
-            self.gps_fix = None;
-            return;
+}
+
+/// Whether the GPS page holds its claim, as the main loop last saw it (bit 0), counted in the bits above so each change is a new word (as `FLEET_PAGE`): `gps_watch` follows it.
+static GPS_PAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// What `gps_watch` last read from the driver (`Map::gps_fix`'s meaning), under a sequence count (odd while it is written; it moves only when the driver's doorbell rang).
+static GPS_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static mut GPS_SNAP: Option<Option<GpsFix>> = None;
+/// GPS's claims as the kernel writes them here at every change (SYS_CLAIM op 4, ferros_sys::claim::doorbell; fact 85's word): the permissions and GPS pages draw "using now" again when it moves, nothing asked on a timer.
+static CLAIMS_WORD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `gps_watch`'s copy published under `GPS_SEQ`.
+fn gps_publish(v: Option<Option<GpsFix>>) {
+    use core::sync::atomic::Ordering;
+    GPS_SEQ.fetch_add(1, Ordering::AcqRel);
+    unsafe { *(&raw mut GPS_SNAP) = v };
+    GPS_SEQ.fetch_add(1, Ordering::AcqRel);
+}
+
+/// The GPS page's doorbell on a thread of its own (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure. 1s poll can desync too"): while the page holds its claim, the driver's WATCH (thru the kernel, ferros_sys::claim::gps_watch) is held until its fixes or fix messages move, then its fix is read (FIX) and published. A driver still replaying, or not started yet, takes the watch when it first receives, so "starting" turns into the fix with nothing asked again. Refused, or the driver gone while it held the watch (it is not started again while the claim stands), the page shows "starting" and the thread sleeps until the page changes. Until then the main loop asked the fix once a second.
+extern "C" fn gps_watch(grants: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    let settings = cap(grants, S_SETTINGS);
+    // The driver's change count last seen; u32::MAX at each new claim, so the first watch is answered as soon as a driver receives it.
+    let mut count = u32::MAX;
+    loop {
+        let v = GPS_PAGE.load(Ordering::Acquire);
+        if v & 1 == 0 {
+            count = u32::MAX;
+            ferros_sys::wait_world(&GPS_PAGE, v, 0);
+            continue;
         }
-        let mut r = [0u8; 33];
-        let n = ferros_sys::claim::gps_ask(cap(self.grants, S_SETTINGS), 0, &mut r);
-        let at = |k: usize| i32::from_le_bytes([r[k], r[k + 1], r[k + 2], r[k + 3]]);
-        self.gps_fix = if n == ferros_sys::ERR || n < 33 {
-            None
-        } else if r[0] == 0 {
-            Some(None)
-        } else {
-            Some(Some(GpsFix { lat: at(9), lon: at(13) }))
-        };
+        match ferros_sys::claim::gps_watch(settings, count) {
+            Some(c) => {
+                count = c;
+                let mut r = [0u8; 33];
+                let n = ferros_sys::claim::gps_ask(settings, 0, &mut r);
+                let at = |k: usize| i32::from_le_bytes([r[k], r[k + 1], r[k + 2], r[k + 3]]);
+                gps_publish(if n == ferros_sys::ERR || n < 33 {
+                    None
+                } else if r[0] == 0 {
+                    Some(None)
+                } else {
+                    Some(Some(GpsFix { lat: at(9), lon: at(13) }))
+                });
+            }
+            None => {
+                gps_publish(None);
+                count = u32::MAX;
+                ferros_sys::wait_world(&GPS_PAGE, v, 0);
+            }
+        }
+    }
+}
+
+/// The copy `gps_watch` last published and its sequence count, read whole (again if it was being written); None when it has not moved from `seen`.
+fn gps_take(seen: u32) -> Option<(u32, Option<Option<GpsFix>>)> {
+    use core::sync::atomic::Ordering;
+    loop {
+        let s0 = GPS_SEQ.load(Ordering::Acquire);
+        if s0 == seen {
+            return None;
+        }
+        let v = unsafe { *(&raw const GPS_SNAP) };
+        if s0 & 1 == 0 && GPS_SEQ.load(Ordering::Acquire) == s0 {
+            return Some((s0, v));
+        }
     }
 }
 
@@ -2795,14 +2915,14 @@ impl Map {
                             let words = ferros_kist::vsf::types::WorldCoord::from_lat_lon(deg(fx.lat), deg(fx.lon)).to_words();
                             fact_wrap(b, &mut y, tr(Msg::PositionWords), &words);
                             let mut l = Line::new();
-                            degrees_decimal(&mut l, fx.lat);
+                            degrees_linear(&mut l, f, fx.lat);
                             l.s(", ");
-                            degrees_decimal(&mut l, fx.lon);
+                            degrees_linear(&mut l, f, fx.lon);
                             fact_wrap(b, &mut y, tr(Msg::LatLon), l.as_str());
                             let mut l = Line::new();
-                            degrees_dms(&mut l, fx.lat, 'N', 'S');
+                            degrees_dms(&mut l, f, fx.lat, 'N', 'S');
                             l.s(", ");
-                            degrees_dms(&mut l, fx.lon, 'E', 'W');
+                            degrees_dms(&mut l, f, fx.lon, 'E', 'W');
                             fact_wrap(b, &mut y, tr(Msg::DegMinSec), l.as_str());
                         }
                         Some(None) => fact(b, &mut y, tr(Msg::RightGps), tr(Msg::NoFixYet)),
@@ -4256,8 +4376,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut fleet_shown = false;
     // The installer's copy last taken, the finished jobs in it (a kist installed or uninstalled: the circles follow), and whether the Kists page showed at the last pass (opening it reads the directory again).
     let (mut installer_seen, mut installer_done, mut kists_shown) = (0u32, 0u64, false);
-    // GPS's claims as the permissions page was last drawn with them (fact 85, its change count): a change draws it again.
+    // GPS's claims as the permissions and GPS pages were last drawn with them (CLAIMS_WORD, the kernel's doorbell): a change draws them again.
     let mut claims_seen = 0u64;
+    // `gps_watch`'s copy last taken (its sequence count).
+    let mut gps_seen = 0u32;
     // Whether the GPS page showed (with GPS on and the screen on) at the last pass: its claim follows it.
     let mut gps_shown = false;
     let mut last_pass = now();
@@ -4274,6 +4396,13 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The installer's doorbell (payloads/kists), for the Kists page: on a thread of its own, never on a timer.
     static mut INSTALLER_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(installer::watch, unsafe { &mut *(&raw mut INSTALLER_STACK) }, grants);
+    // The GPS driver's doorbell, for the GPS page (`gps_watch`): on a thread of its own, asleep while the page is not open.
+    static mut GPS_STACK: [u8; 1 << 14] = [0; 1 << 14];
+    ferros_sys::thread_spawn(gps_watch, unsafe { &mut *(&raw mut GPS_STACK) }, grants);
+    // The claims' doorbell (SYS_CLAIM op 4): the kernel writes GPS's claims into CLAIMS_WORD at every change. A kernel from before refuses it, and "using now" is then read only as a page draws.
+    if !ferros_sys::claim::doorbell(cap(grants, S_SETTINGS), &CLAIMS_WORD) {
+        console(grants, b"map: the kernel has no claims doorbell\n");
+    }
     // FERROS_MAP_START=drag: a synthetic finger instead of the touch server for the first 192 passes — two seconds after start (past the display's first full frame), a pan through the air and back, so the frame pacing can be measured with no one at the panel (it logs passes, draws and the rate).
     let mut synth = 0u32;
     // FERROS_MAP_START=drag: the drag's own rate, for measuring the frame pacing with no one at the panel.
@@ -4363,8 +4492,30 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 ferros_sys::claim::release(ferros_sys::claim::GPS);
                 map.gps_claimed = false;
             }
-            map.gps_read();
+            // The doorbell thread follows the claim (`gps_watch`); the page starts at "starting" until the driver rings.
+            map.gps_fix = None;
+            let v = GPS_PAGE.load(core::sync::atomic::Ordering::Acquire);
+            GPS_PAGE.store(((v >> 1) + 1) << 1 | map.gps_claimed as u64, core::sync::atomic::Ordering::Release);
+            ferros_sys::wake(&GPS_PAGE, 1);
             if !map.settling {
+                map.draw();
+            }
+        }
+        // The driver rang (`gps_watch` published what it read): taken in, and the GPS page drawn again while it holds its claim. The page's measures (the satellites, the accuracy) move with the same fix messages, so they are drawn fresh with it.
+        if let Some((seq, v)) = gps_take(gps_seen) {
+            gps_seen = seq;
+            if map.gps_claimed {
+                map.gps_fix = v;
+                if matches!(map.view, View::Open(_)) && PAGES[map.page] == "GPS" && !map.settling {
+                    map.draw();
+                }
+            }
+        }
+        // GPS's claims moved (the kernel wrote CLAIMS_WORD): the pages that say who is using it drawn again while they show.
+        let c = CLAIMS_WORD.load(core::sync::atomic::Ordering::Acquire);
+        if c != claims_seen && !map.settling {
+            claims_seen = c;
+            if matches!(map.view, View::Open(_)) && matches!(PAGES[map.page], "permissions" | "GPS") {
                 map.draw();
             }
         }
@@ -4386,23 +4537,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
         }
 
-        // The open settings' live facts (About, Connections, each link's page, the clock): drawn again once a second while they show (live data, not motion).
-        if matches!(map.view, View::Open(_)) && matches!(PAGES[map.page], "about" | "connections" | "cellular" | "WiFi" | "Bluetooth" | "NFC" | "GPS" | "USB" | "clock") && !map.settling && now().wrapping_sub(last_facts) > freq() {
+        // The open settings' live facts (About, Connections, each link's page but GPS's, the clock): drawn again once a second while they show (live data, not motion). Still a timer, because their sources keep no change count to wait on: the kernel's facts (the battery gauge it reads every two seconds, the temperatures, the process count), the radio drivers' measures (SYS_STATUS words, set with no generation), and the clock, whose seconds are the change. GPS's page rides its driver's doorbell instead (`gps_watch`), and the permissions page the claims' (CLAIMS_WORD).
+        if matches!(map.view, View::Open(_)) && matches!(PAGES[map.page], "about" | "connections" | "cellular" | "WiFi" | "Bluetooth" | "NFC" | "USB" | "clock") && !map.settling && now().wrapping_sub(last_facts) > freq() {
             last_facts = now();
-            // The GPS page: the driver's fix asked with the facts, drawn with them.
-            if PAGES[map.page] == "GPS" {
-                map.gps_read();
-            }
             map.draw();
-        }
-        // The permissions page: drawn again when the GPS claims change (fact 85's change count), looked at with the other pages' facts, once a second while it shows.
-        if matches!(map.view, View::Open(_)) && PAGES[map.page] == "permissions" && !map.settling && now().wrapping_sub(last_facts) > freq() {
-            last_facts = now();
-            let c = ferros_sys::facts().0[ferros_sys::claim::FACT] >> 16;
-            if c != claims_seen {
-                claims_seen = c;
-                map.draw();
-            }
         }
 
         // An app in front (a bridge spawn: Hive, for one), asked of the display eight times a second.

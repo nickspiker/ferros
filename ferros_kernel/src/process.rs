@@ -941,7 +941,7 @@ const SYS_DETAIL: u64 = 34;
 const SYS_ZONE: u64 = 35;
 /// lang(op, …): the language the shell speaks (lang.rs, SETTINGS.md), a packed ISO 639-3 code (vsf `wl`'s letters; 0 none, English). Op 0, Settings at x1: this device's own language, x2 the code. Op 1, Settings at x1: x2 1 this device keeps its own, 0 it follows the identity's. Op 2, the identity service (by its name, fgtw, as SYS_ZONE op 4): the identity's language, x1 the code (0: it has none). Each keeps the settings document, put back as it was when the vault refuses. The state is read from the preferences block (PREF_LANG…), not here. → 0 or ERR.
 const SYS_LANG: u64 = 36;
-/// claim(op, …): the rights in use (`CLAIMS`; owner, 2026-11-10: GPS "stays green but no visuals for satellites since we're not rx'ing ... until something like mahere calls it or I open the GPS screen ... or Photon a friend pings for my location", and "we need to be able to see what kists are using each permission"). A right by its code (ferros_kist::RIGHTS); only GPS is claimed today. Op 0: claim x1 the right, x2 the token offset of what proves the caller may use it (for GPS: Settings, the settings page's, or the `gps` endpoint's send right, a kist's granted want) → 0 (also when it held one already), ERR refused (no such right or proof, nobody present, GPS switched off). Op 1: release x1 the right → 0. Op 2: who claims x1 the right, x2 the Settings token, x3/x4 a buffer and its length → how many claims (all of them; records past the buffer are not written), each `CLAIM_REC` bytes: 0 a system process or 1 a kist, then the kist's capsule address (32 bytes, zeros for a system process); ERR without Settings. Op 3: the GPS driver asked thru the kernel for a Settings holder that holds a GPS claim (the map's page: init's grants page has no slot left for its own `use gps`): x1 the driver's op (0 FIX, 2 SATS, payloads/gps), x2 the Settings token, x3/x4 the reply's buffer and its length with CALL_LIVE set, the call the caller's own as SYS_CALL makes it → the reply's length, ERR at once when no driver is receiving yet. The position passes thru, never kept.
+/// claim(op, …): the rights in use (`CLAIMS`; owner, 2026-11-10: GPS "stays green but no visuals for satellites since we're not rx'ing ... until something like mahere calls it or I open the GPS screen ... or Photon a friend pings for my location", and "we need to be able to see what kists are using each permission"). A right by its code (ferros_kist::RIGHTS); only GPS is claimed today. Op 0: claim x1 the right, x2 the token offset of what proves the caller may use it (for GPS: Settings, the settings page's, or the `gps` endpoint's send right, a kist's granted want) → 0 (also when it held one already), ERR refused (no such right or proof, nobody present, GPS switched off). Op 1: release x1 the right → 0. Op 2: who claims x1 the right, x2 the Settings token, x3/x4 a buffer and its length → how many claims (all of them; records past the buffer are not written), each `CLAIM_REC` bytes: 0 a system process or 1 a kist, then the kist's capsule address (32 bytes, zeros for a system process); ERR without Settings. Op 3: the GPS driver asked thru the kernel for a Settings holder that holds a GPS claim (the map's page: init's grants page has no slot left for its own `use gps`): x1 the driver's op (0 FIX, 2 SATS, payloads/gps), x2 the Settings token, x3/x4 the reply's buffer and its length with CALL_LIVE set, the call the caller's own as SYS_CALL makes it → the reply's length, ERR at once when no driver is receiving yet; or x1 = 3 | the change count last seen << 8, the driver's WATCH, its length bare (no CALL_LIVE): held until the driver's fixes or fix messages move, taken by a driver that starts later, → 4 bytes, the count now. The position passes thru, never kept. Op 4: the claims' doorbell, x1 a word in the caller's arc, x2 the Settings token: GPS_CLAIMS written there now and at every change, its waiters woken → 0.
 const SYS_CLAIM: u64 = 37;
 /// A record of SYS_CLAIM op 2: the kind, then a capsule address.
 pub const CLAIM_REC: usize = 33;
@@ -2189,6 +2189,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     } else if irq_pending_take(intid) {
                         f.x[0] = 0;
                         0
+                    } else if kk.endpoints.iter().any(|e| e.poller == Some(cur) && !e.queue.is_empty()) {
+                        // A call already waiting on an endpoint this thread polls: back at once with 2, as `wake_server` would have woken it (2026-11-10). A driver that waits on its device and its endpoint in one wait (the GPS driver, with no deadline since then) could otherwise miss a call that came between its last poll and this wait, and answer it only at its device's next interrupt.
+                        f.x[0] = 2;
+                        0
                     } else {
                         crate::killswitch::enable_spi(intid);
                         let deadline = f.x[1];
@@ -2740,9 +2744,14 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let settings = matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0);
             let claimed = unsafe { (*(&raw const CLAIMS)).iter().any(|c| c.epoch == p.epoch && right_is_gps(c.right)) };
             let ep = endpoint(b"gps");
-            // Only the driver's two reading ops pass: FIX and SATS. STOP (1) is the kernel's to give, by the claims.
-            if settings && claimed && matches!(f.x[1], 0 | 2) && f.x[4] & CALL_LIVE != 0 && has_receiver(ep) {
-                call_endpoint(f, cur, ep, alloc::vec![f.x[1] as u8], f.x[3], f.x[4] & !CALL_LIVE)
+            // Only the driver's reading ops pass: FIX and SATS, CALL_LIVE; and WATCH (3, x1 bits 8-39 the change count last seen), the driver's doorbell, held by it until its fixes or fix messages move. WATCH is not CALL_LIVE (the caller passes the bare length): a driver still replaying its session, or not yet started for the claim, takes it when it first receives, so the page learns the driver came up without asking again. STOP (1) is the kernel's to give, by the claims.
+            let op = f.x[1] & 0xFF;
+            if settings && claimed && matches!(op, 0 | 2) && f.x[4] & CALL_LIVE != 0 && has_receiver(ep) {
+                call_endpoint(f, cur, ep, alloc::vec![op as u8], f.x[3], f.x[4] & !CALL_LIVE)
+            } else if settings && claimed && op == 3 && f.x[4] & CALL_LIVE == 0 {
+                let mut msg = alloc::vec![3u8];
+                msg.extend_from_slice(&((f.x[1] >> 8) as u32).to_le_bytes());
+                call_endpoint(f, cur, ep, msg, f.x[3], f.x[4])
             } else {
                 f.x[0] = ERR;
                 0
@@ -2796,6 +2805,15 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     }
                     p.write(f.x[3], &out);
                     mine.len() as u64
+                }
+                // The claims' doorbell for a Settings holder (the map's permissions and GPS pages): a word in its arc (x1, 8-aligned, inside the arc as SYS_WAIT takes one) the kernel writes GPS_CLAIMS into now and at every change, waking whatever of it waits there (`claims_publish`). One word a process; a second registration moves it.
+                4 if matches!(held(f.x[2]), Some(Object::Settings)) => {
+                    let addr = p.arc.base + ((f.x[1] as usize) & p.arc.mask() & !7);
+                    let words = unsafe { &mut *(&raw mut CLAIM_WORDS) };
+                    words.retain(|w| w.0 != pi);
+                    words.push((pi, p.epoch, addr));
+                    unsafe { core::ptr::write_volatile(addr as *mut u64, GPS_CLAIMS.load(core::sync::atomic::Ordering::Acquire)) };
+                    0
                 }
                 _ => ERR,
             };
@@ -3341,11 +3359,30 @@ fn right_is_gps(r: u8) -> bool {
     ferros_kist::RIGHTS.get(r as usize) == Some(&"gps")
 }
 
-/// The claims changed: GPS's count published with its change counted, and the service loop woken (`sev`) to start or stop the driver, never on a timer.
+/// The claims' doorbells (SYS_CLAIM op 4): (the process's slot, its epoch, the word's address in its arc). Under the kernel lock.
+static mut CLAIM_WORDS: Vec<(usize, u64, usize)> = Vec::new();
+
+/// The claims changed: GPS's count published with its change counted, written into every registered doorbell word with its waiters woken (a page asleep on it draws again; owner, 2026-11-10: "Needs a doorbell"), and the service loop woken (`sev`) to start or stop the driver, never on a timer. A word whose process has ended (its slot empty, dying, or a successor's) is dropped, never written.
 fn claims_publish() {
     let n = unsafe { (*(&raw const CLAIMS)).iter().filter(|c| right_is_gps(c.right)).count() } as u64;
     let g = GPS_CLAIMS.load(core::sync::atomic::Ordering::Relaxed) >> 16;
-    GPS_CLAIMS.store((g + 1) << 16 | n, core::sync::atomic::Ordering::Release);
+    let v = (g + 1) << 16 | n;
+    GPS_CLAIMS.store(v, core::sync::atomic::Ordering::Release);
+    let kk = k();
+    let words = unsafe { &mut *(&raw mut CLAIM_WORDS) };
+    words.retain(|&(pi, epoch, _)| kk.procs.get(pi).and_then(|q| q.as_ref()).is_some_and(|q| q.epoch == epoch && !q.dying));
+    for &(pi, _, addr) in words.iter() {
+        unsafe { core::ptr::write_volatile(addr as *mut u64, v) };
+        for (t, x) in kk.threads.iter_mut().enumerate() {
+            if let Some(x) = x {
+                if x.proc == pi && matches!(x.state, State::Waiting(a, _) if a == addr) {
+                    x.state = State::Runnable;
+                    x.frame.x[0] = 0;
+                    enqueue_back(t);
+                }
+            }
+        }
+    }
     unsafe { core::arch::asm!("sev") };
 }
 
