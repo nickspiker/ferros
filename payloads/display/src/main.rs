@@ -4508,6 +4508,8 @@ static mut READ_STACK: [u8; 1 << 15] = [0; 1 << 15];
 static READER_UP: AtomicBool = AtomicBool::new(false);
 /// The plane's stretches: half of the 1 MiB the loader read at once before (one 1 MiB arena for the two), each a batch of eight of the vault's pieces.
 const STRETCH: usize = 1 << 19;
+/// The loader's two stretches (`wall_load_kept`), each `STRETCH` bytes, read into in turn.
+static mut STRETCH_BUFS: [[u8; STRETCH]; 2] = [[0; STRETCH]; 2];
 
 extern "C" fn wall_reader(_: u64) -> ! {
     let mut seen = 0;
@@ -4627,8 +4629,8 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
     let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, n) };
     let table = unsafe { core::slice::from_raw_parts(G2T16_Q14, 1 << 16) };
     // Stretches of half a MiB at their own boundaries in the value (eight of the vault's pieces, opened as one batch; on an older kernel `vault_read` moves one in its own smaller calls, still at piece boundaries), two buffers: the reader thread fills one (`read_post`) while this thread converts the other.
-    let mut bufs = [alloc::vec![0u8; STRETCH], alloc::vec![0u8; STRETCH]];
-    let ptrs = [bufs[0].as_mut_ptr(), bufs[1].as_mut_ptr()];
+    // The two stretches are statics, not the loader's arena (2026-11-11, the Pro: "memory allocation of 524288 bytes failed" at start, the 2 MiB arena already holding ~1.87 MiB of the document's reading): one load at a time uses them (`LOADING`).
+    let ptrs = unsafe { [(*(&raw mut STRETCH_BUFS))[0].as_mut_ptr(), (*(&raw mut STRETCH_BUFS))[1].as_mut_ptr()] };
     let (first, end) = (span.data_offset, span.data_offset + span.data_len);
     // To the next stretch boundary of the value, or the plane's end.
     let next_to = |at: u64| ((at / STRETCH as u64 + 1) * STRETCH as u64).min(end);
@@ -4682,7 +4684,6 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
         k += 1;
     }
     let t_plane = now() - t_reads;
-    drop(bufs);
     // Measuring (owner, 2026-11-08: "the unlock process took way too long"): the whole load over the vault, and where it went.
     let ms = |t: u64| t * 1000 / freq();
     let total = ferros_sys::us_since(t0);
