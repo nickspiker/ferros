@@ -16,7 +16,7 @@
 //!
 //! `kists` ops (the map's, first byte):
 //! - 0 [count u32 LE]: the doorbell. Answered at once with the status when its count is not the caller's, else held until it changes: [count u32 LE][directory: 0 not read, 1 fetching, 2 read, 3 not reachable][1 the directory's signature checked, 0 not (the project key not pinned yet)][jobs n][per job: kind (0 install, 1 uninstall, 2 restore), stage (`STAGE_*`), why (`WHY_*`), the capsule 32, bytes so far u64 LE, bytes in all u64 LE, name length, name].
-//! - 1: fetch the directory again (the page opened) → [0].
+//! - 1: fetch the directory again and look for missing capsules again (the page opened) → [0].
 //! - 2 [from]: the directory's entries from `from` → [entries in all][n][per entry: capsule 32, developer 32, option 32, size u64 LE, major, minor, patch u16 LE each, name length, name, about length, about], as many as fit one reply.
 //! - 3 [capsule 32]: install (or update to) the directory's entry with that capsule → [0 queued, 1 not in the directory, 2 already under way, 3 too many under way].
 //! - 4 [developer 32][option 32]: uninstall that kist → [0 queued, 1 not installed, 3 too many under way].
@@ -278,8 +278,12 @@ fn serve(grants: u64) -> ! {
                     reply(&tok, &msg);
                 }
             }
+            // The page opened: the directory read again, and a restore that failed (no network then) tried again, on the person's own act.
             1 => {
-                with(|s| s.dir_wanted = true);
+                with(|s| {
+                    s.dir_wanted = true;
+                    s.restore_wanted = true;
+                });
                 kick();
                 reply(&tok, &[0]);
             }
