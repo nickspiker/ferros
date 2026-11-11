@@ -1239,6 +1239,8 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     v[32] = crate::process::named_alive_locked(&[b"modem", b"pcie1", b"bt", b"nfc", b"gps", b"ip"]);
     // 83: whether a person is present (an identity unlocked: 2 yes, 1 no; kvault PERSON), so the radios' drivers can refuse what only a person may start while locked (AUTH.md "Radios while locked").
     v[83] = 1 + crate::kvault::PERSON.load(core::sync::atomic::Ordering::Acquire) as u64;
+    // 85: GPS's claims (process.rs GPS_CLAIMS, SYS_CLAIM): bits 0-15 how many processes are using it now, bits 16 and up a count of every change. The console draws satellites only while the driver runs, which is while this is not zero; the settings pages read who is using it again when it moves.
+    v[85] = crate::process::GPS_CLAIMS.load(core::sync::atomic::Ordering::Acquire);
     // 84: which board (ferros_kernel board.rs): 1 husky (Pixel 8 Pro), 2 akita (Pixel 8a). For the drivers whose part differs between them (the touch controller).
     v[84] = 1 + crate::board::akita() as u64;
     // 82: whether this device allows Android from within ferros (ANDROID_ALLOWED: 2 yes, 1 no).
@@ -1749,8 +1751,11 @@ pub fn run(mut b: Boot) -> ! {
     let mut ipc_marked = false;
     // The radios switched off (preference 15) as the loop last applied them: init started only the ones left on.
     let mut radios_applied = crate::process::pref(crate::process::PREF_RADIOS_OFF) & 0x1F;
-    let mut gps_started = false;
-    // The installer (payloads/kists) started for the person present, as GPS is.
+    // The GPS driver started for the claims held now (process.rs CLAIMS): set as the first claim starts it, cleared as the last one goes and stops it. A driver that ends by itself while claimed is not started again until the claims go to none and back.
+    let mut gps_on = false;
+    // ARC_FREES when the driver's spawn was last refused for want of an arc, as the installer's below: tried again once an arc has come back.
+    let mut gps_refused_at: Option<u64> = None;
+    // The installer (payloads/kists) started for the person present.
     let mut kists_started = false;
     // ARC_FREES when the installer's spawn was last refused for want of an arc (the 8a, 2026-11-10: "arc pool exhausted" at attest, beside the wallpaper's start, and no installer for the rest of the boot): tried again once an arc has come back since.
     let mut kists_refused_at: Option<u64> = None;
@@ -1806,6 +1811,9 @@ pub fn run(mut b: Boot) -> ! {
                         _ => false,
                     };
                     crate::flashlog::line(&alloc::format!("radio {} switched off: driver {}, power {}", core::str::from_utf8(name).unwrap_or("?"), if killed { "stopped" } else { "was not running" }, if powered_down { "down" } else { "left" }));
+                } else if radios_off & bit == 0 && radios_applied & bit != 0 && i == 4 {
+                    // GPS switched on is allowed, not started: the driver comes with the first claim (below).
+                    crate::flashlog::line("radio gps switched on: allowed, started when something claims it");
                 } else if radios_off & bit == 0 && radios_applied & bit != 0 {
                     let mut rep = alloc::vec::Vec::new();
                     restart(&mut store, name, &mut rep);
@@ -1814,9 +1822,8 @@ pub fn run(mut b: Boot) -> ! {
             }
             radios_applied = radios_off;
         }
-        // GPS switched on, a person attested, and no driver running: started once each time a person is in (no one in, the next attest may start it again). Nothing else started it: init's page has no room for its grants, and the switch above only acts on a change, so a GPS left on was never driven (2026-11-08).
         let person = store.as_ref().is_some_and(|s| s.unlocked());
-        // The installer (payloads/kists), once each time a person is in, as GPS below: it serves the map's Kists page and fetches back the capsules a restored list names. Its grants are its own (`kists_grants`), init's page being full.
+        // The installer (payloads/kists), once each time a person is in: it serves the map's Kists page and fetches back the capsules a restored list names. Its grants are its own (`kists_grants`), init's page being full.
         let frees = crate::process::ARC_FREES.load(core::sync::atomic::Ordering::Acquire);
         if !person {
             kists_started = false;
@@ -1835,16 +1842,36 @@ pub fn run(mut b: Boot) -> ! {
                 }
             }
         }
+        // GPS on demand (owner, 2026-11-10: "Wire it so GPS stays green but no visuals for satellites since we're not rx'ing and all that until something like mahere calls it or I open the GPS screen (which should turn it on whilist GPS screen is open) or Photon a friend pings for my location"): the switch on means GPS is allowed, not that the chip receives. The driver runs while at least one process holds a claim on it (process.rs CLAIMS, SYS_CLAIM: the map's GPS page while it is open, a kist granted GPS while it asks), started as the first claim comes and stopped as the last goes; a claim's change wakes this loop (`sev`), never a timer. From 2026-11-08 until then the driver started at every attest and ran for as long as the switch stayed on.
+        // Locked until a person attests (radios at attest), and a GPS switched off holds no claims: either drops every claim, and the driver stops below.
+        let gps_allowed = person && radios_off & 1 << 4 == 0;
+        if !gps_allowed && crate::process::gps_claims() != 0 {
+            let n = crate::process::with_lock(crate::process::gps_claims_drop);
+            crate::flashlog::line(&alloc::format!("gps: A#{n} claims dropped ({})", if person { "switched off" } else { "nobody present" }));
+        }
         if !person {
-            gps_started = false;
-        } else if !gps_started && radios_off & 1 << 4 == 0 {
-            gps_started = true;
+            gps_refused_at = None;
+        }
+        let gps_wanted = gps_allowed && crate::process::gps_claims() != 0;
+        if gps_wanted && !gps_on && gps_refused_at != Some(frees) {
+            gps_on = true;
             let running = crate::process::with_lock(|| crate::process::named_alive_locked(&[b"gps"])) != 0;
             if !running {
                 let mut rep = alloc::vec::Vec::new();
                 restart(&mut store, b"gps", &mut rep);
-                crate::flashlog::line(&alloc::format!("gps after attest: {}", core::str::from_utf8(&rep).unwrap_or("").trim_end()));
+                crate::flashlog::line(&alloc::format!("gps claimed (A#{} claims): {}", crate::process::gps_claims(), core::str::from_utf8(&rep).unwrap_or("").trim_end()));
+                // Refused for room, as the installer's above: the next arc back brings another try while the claim stands.
+                if rep.windows(18).any(|w| w == b"arc pool exhausted") {
+                    gps_on = false;
+                    gps_refused_at = Some(frees);
+                }
             }
+        } else if !gps_wanted && gps_on {
+            // The last claim gone: the driver killed, one shot dead (its last fix was kept as it came), and the chip powered down, as the switch does.
+            gps_on = false;
+            let killed = crate::process::kill(b"gps");
+            let powered_down = killed && crate::gps::power(false);
+            crate::flashlog::line(&alloc::format!("gps unclaimed: driver {}, power {}", if killed { "stopped" } else { "was not running" }, if powered_down { "down" } else { "left" }));
         }
         // Released (a completed departure): restart, so the device comes back at the attest screen with nothing of the identity left.
         // First the person's domains in the vault process are dropped, a call a pass through the kernel's channel (none while a bridge command holds it); a drop that fails, or no vault to send it to, is logged and the restart goes ahead: the renewed device-only secret already makes those entries unopenable.

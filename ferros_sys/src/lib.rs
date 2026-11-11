@@ -55,6 +55,7 @@ pub mod nr {
     pub const DETAIL: u64 = 34;
     pub const ZONE: u64 = 35;
     pub const LANG: u64 = 36;
+    pub const CLAIM: u64 = 37;
 }
 
 /// The clock's zone (kernel zone.rs, SYS_ZONE; docs/TIME.md; owner, 2026-11-10): the identity's choice and this device's own, each automatic (the zone found from the cellular network, then GPS) or by hand (an IANA id), and the switch that says which rules.
@@ -463,6 +464,35 @@ pub fn detail_set(doc: &[u8]) -> bool {
 pub fn detail(cap: u64, link: u64, buf: &mut [u8]) -> Option<usize> {
     let r = svc(nr::DETAIL, 1, cap, link, off(buf.as_mut_ptr()), buf.len() as u64);
     (r != ERR).then_some(r as usize)
+}
+
+/// The rights in use (kernel process.rs CLAIMS, SYS_CLAIM; owner, 2026-11-10): a process says it is using a right now, and the kernel keeps that until it releases it or ends. GPS is the first: its driver runs only while something claims it (the map's GPS page while it is open; a kist granted GPS while it wants a position), the switch on meaning allowed, not receiving. A kist calls `claim(GPS, its gps slot)` and then its `gps` endpoint (payloads/gps: FIX, SATS) with `call_live`, which answers ERR while the driver is still starting; it releases when done, or simply ends.
+pub mod claim {
+    use super::{nr, off, svc, CALL_LIVE, ERR};
+    /// GPS's code in ferros_kist::RIGHTS.
+    pub const GPS: u64 = 6;
+    /// A record of `users`: the kind (0 a system process, 1 a kist), then the kist's capsule address (zeros for a system process).
+    pub const REC: usize = 33;
+    /// GPS's claims in the facts (fact 85): bits 0-15 how many, bits 16 and up a count of every change.
+    pub const FACT: usize = 85;
+
+    /// Claim right `right`, proved by the token at `proof` (for GPS: Settings, or the `gps` endpoint's send right). False when refused: no such proof, nobody present, GPS switched off. Claiming again is no second claim.
+    pub fn claim(right: u64, proof: u64) -> bool {
+        svc(nr::CLAIM, 0, right, proof, 0, 0) == 0
+    }
+    /// Release right `right` (nothing when not held).
+    pub fn release(right: u64) {
+        svc(nr::CLAIM, 1, right, 0, 0, 0);
+    }
+    /// Who claims `right` now, given Settings: records of `REC` bytes into `buf` (whole ones, as many as fit), and how many there are; None without the capability.
+    pub fn users(settings: u64, right: u64, buf: &mut [u8]) -> Option<usize> {
+        let r = svc(nr::CLAIM, 2, right, settings, off(buf.as_mut_ptr()), buf.len() as u64);
+        (r != ERR).then_some(r as usize)
+    }
+    /// The GPS driver's op `op` (0 FIX, 2 SATS) asked thru the kernel for a Settings holder that holds a GPS claim (the map: no `use gps` of its own), its reply into `reply`: the reply's length, or ERR (no claim, no capability, or no driver receiving yet).
+    pub fn gps_ask(settings: u64, op: u8, reply: &mut [u8]) -> u64 {
+        svc(nr::CLAIM, 3, op as u64, settings, off(reply.as_mut_ptr()), reply.len() as u64 | CALL_LIVE)
+    }
 }
 
 pub const MEASURE_NONE: u64 = u64::MAX;
