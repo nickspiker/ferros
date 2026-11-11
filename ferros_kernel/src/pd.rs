@@ -84,6 +84,12 @@ fn off(name: &str, cmu: usize, pmu_off: u64, out: &mut alloc::vec::Vec<u8>) {
         out.extend_from_slice(alloc::format!("{name}: already off\n").as_bytes());
         return;
     }
+    // STATUS as well (the block's +4, bit 0, read plainly: the PMU is readable from here, and EL3's read of a STATUS register does not return it), as the hv's jump checks the display's domains: CONFIGURATION is only the request, and reads on while a domain is still coming up or going down. A CMU access in a domain that is down poisons EL3 (display.rs, the EL3 poison rule): the next firmware call never returns. After a jump Android's runtime power management can leave a domain exactly there; the Pro's kernel froze inside g2d's off on 2026-11-10, its last line "pd: gating g2d after the jump".
+    let status = rd((PMU + pmu_off) as usize + 4);
+    if status & 1 == 0 {
+        out.extend_from_slice(alloc::format!("{name}: requested on (G#{before:X}) but its status reads off (G#{status:X}): left alone, no CMU access\n").as_bytes());
+        return;
+    }
     let s = tz_save(cmu + 0x1_0204);
     wr(cmu + 0x800, rd(cmu + 0x800) & !(1 << 24));
     let w = priv_reg(PMU + pmu_off, true, before & !1);
