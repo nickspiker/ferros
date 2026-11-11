@@ -2,8 +2,8 @@
 //!
 //! - **Written by the compose, front to back.** Each publish writes the rows it composes (`row`), once (the first phase of a publish that carries several), and each pixel once: a row starts as one free run of columns, and each layer, frontmost first, claims the runs it owns, writes its id there and takes them out of the row (`Free`), so nothing behind it is looked at there. What no layer claimed is the ground's.
 //! - **The layers, front to back:**
-//!   - the system's places (`SYS` + op 41's code), as the console's worker leaves them at its own compose step (`bars_row`, from `bar_decode`): outside the app's circle every pixel (at the top the doorway by the camera 10 and else the nearest console circle's zone: the radios 0-4, USB 5, the clock 13, the battery 14, with 11 where none reaches; back 9 on the left of the bottom and home 8 on the right), and inside it the quick row's circles while the row stands open (32 + k); full screen (`FULL`) or not, as full screen hides only their drawing (so home's swipe over a full-screen app shows the controls again; WINDOWS.md "The helm");
-//!   - behind the quick row while any of it shows on the glass (`SYS` + 12): everything inside the app's circle;
+//!   - the system's places (`SYS` + op 41's code), as the console's worker leaves them at its own compose step (`bars_row`, from `bar_decode`): outside the app's circle every pixel (at the top the doorway by the camera 10 and else the nearest console circle's zone: the radios 0-4, USB 5, the clock 13, the battery 14, with 11 where none reaches; back 9 on the left of the bottom and home 8 on the right), and inside it the quick row's circles while the row stands open (32 + k). In full screen (`FULL`; owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone") only the helm's: back and home stay the system's, undrawn (so home's swipe over a full-screen app shows the controls again; WINDOWS.md "The helm"), and the console's rows are not read at all (`row`, one test a row), their pixels the app's;
+//!   - behind the quick row while any of it shows on the glass (`SYS` + 12): everything inside the app's circle (never in full screen, where the row does not show);
 //!   - with an app in front, its windows by the layer stack (`WINDOW` + surface): a window owns every pixel where it is not see-through, as fluor tags a widget by its shape; where no window is, nobody's;
 //!   - on the home screen: the open circle's page (`REGION`), the map's circles front first (`CIRCLE` + their index in the scene, the crowd's included), each its disc; the plane under them all (`PLANE`).
 //! - **Read by one lookup.** Op 27 ("is this point my window's") and op 41 ("what of the system's is here") read the pixel (`at`); the geometry they kept of their own (the windows' rectangles and clear bits, the console's circles, the quick row's, the doorway, the helm's halves) went with them; it lives on only where it also draws.
@@ -238,8 +238,10 @@ pub fn row(y: usize, xa: usize, xb: usize, width: usize, height: usize, app: boo
     let t0 = now();
     let out = unsafe { core::slice::from_raw_parts_mut((MAP as *mut u16).add(y * width), width) };
     let mut free = Free::new(slot_runs(), xa, xb);
-    // The system's, frontmost: runs of the bars' ids (every pixel outside the app's circle is one of them).
-    if let Some(b) = bar_row(y, height) {
+    // Full screen (`FULL`; owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"): the console's rows hold nothing of the system's, so the bars' ids are read on the helm's rows alone and the top falls to the windows, and nothing is behind the quick row, which does not show (`bar_line`). One test a row, never a pixel; every phase is published whole when `FULL` changes (op 43, `full_follow`), and with it every row of the map.
+    let full = unsafe { FULL };
+    // The system's, frontmost: runs of the bars' ids (every pixel outside the app's circle is one of them, but the console's in full screen).
+    if let Some(b) = bar_row(y, height).filter(|&b| !full || b >= unsafe { BAR_TOP }) {
         let ids = unsafe { core::slice::from_raw_parts((BARS as *const u16).add(b * width), width) };
         let mut x = xa;
         while x < xb {
@@ -254,7 +256,7 @@ pub fn row(y: usize, xa: usize, xb: usize, width: usize, height: usize, app: boo
             x = e;
         }
     }
-    if unsafe { BEHIND } {
+    if unsafe { BEHIND } && !full {
         free.rest(|a, z| out[a..z].fill(SYS + 12));
     } else if app {
         windows(y, &mut free, out, width);

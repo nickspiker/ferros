@@ -4168,7 +4168,7 @@ impl Map {
         "map: back: zoomed out to every circle"
     }
 
-    /// Home's swipe with an app in front (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls"): the app in front full screen or not (display op 43, as the quick row's middle circle switches it), the kist staying in front. Full screen hides ferros's controls (the console, the helm, the app's circle); the corners outside the circle stay the system's on the hit map (hit.rs `bars_row`, written whatever `FULL` is), undrawn, so this same swipe brings them back. The new state, or None with no app in front (the display's refusal, status 3: its word on what is in front, not the map's).
+    /// Home's swipe with an app in front (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls"): the app in front full screen or not (display op 43, as the quick row's middle circle switches it), the kist staying in front. Full screen hides ferros's controls (the console, the helm, the app's circle); the helm's wedges stay the system's on the hit map, undrawn, so this same swipe brings them back, and the console's rows are the app's (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"; display hit.rs `row`), the quick row shut with them. The new state, or None with no app in front (the display's refusal, status 3: its word on what is in front, not the map's).
     fn full_switch(&mut self) -> Option<bool> {
         let mut r = [0u8; 4];
         let n = call(self.display, &[43], &mut r);
@@ -5400,7 +5400,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     // The helm's swipes (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls. on the home screen it auto-fits"; "Can't hide controls on home screen"). Home's: with an app in front, its full screen on or off (`full_switch`; the kist stays in front, where until then this swipe sent it behind first); with none, the plane flies out to every circle at the turn that fits them largest ("so it spins into place"), the controls always shown there. The display's answer decides which, not `app_front`. Back's: a flip to the kist before (this one behind). The quick row's middle circle switches full screen too.
                     let said = if corner == 8 {
                         match map.full_switch() {
-                            Some(true) => "map: home: full screen, the controls hidden",
+                            Some(true) => {
+                                // The quick row goes with the console (`quick::Quick::shut`).
+                                qr.shut();
+                                "map: home: full screen, the controls hidden"
+                            }
                             Some(false) => "map: home: full screen off, the controls shown",
                             None => {
                                 map.home_fly();

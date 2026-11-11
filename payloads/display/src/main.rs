@@ -3121,7 +3121,7 @@ const CLEAR: u64 = 1 << 63;
 static mut CHROME_TOP: usize = 0;
 /// The console's rows, the bars' top band: `CHROME_TOP`, or down to the quick row's floor where that is lower (quick.rs `rows`; since 2026-11-11 the row reaches past the chrome rows to touch the glass's sides).
 static mut BAR_TOP: usize = 0;
-/// Full screen (owner, 2026-11-07, then the home swipe; 2026-11-11 the quick row's middle circle, and later that day the home swipe again with an app in front: "the swipe in on home whilist in a kist needs to show/hide controls"): the console, the helm and the app's circle hidden, only the glass's edge left (black, and orange on development builds). The app window in front's own flag (`Win::full`, switched by op 43), followed by `full_follow` whenever the windows change; off with no app in front. A drawing change only: the corners stay the system's on the hit map (hit.rs `bars_row` never reads this), undrawn, so home's swipe there switches it back; and the console's rows show while the quick row is out (`bar_line`), so its circle switches it back too.
+/// Full screen (owner, 2026-11-07, then the home swipe; 2026-11-11 the quick row's middle circle, and later that day the home swipe again with an app in front: "the swipe in on home whilist in a kist needs to show/hide controls"): the console, the helm and the app's circle hidden, only the glass's edge left (black, and orange on development builds). The app window in front's own flag (`Win::full`, switched by op 43), followed by `full_follow` whenever the windows change; off with no app in front. The helm is hidden but stays the system's on the hit map, undrawn, so home's swipe there switches it back; the console and the quick row are gone, not drawn (`bar_line`) and not on the hit map (hit.rs `row`, which reads the bars' ids on the helm's rows alone while this is on), so the app has those pixels and their touches (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"). The map shuts the quick row at once when it turns this on itself (its middle circle, home's swipe).
 static mut FULL: bool = false;
 static mut CHROME_BOT: usize = 0;
 /// The bars (owner, 2026-11-07): the console, the circles at the top of the screen (the radios' switches and the system's indicators), over the `BAR_TOP` rows (the quick row with them), then the helm, home and back at the bottom, over the `CHROME_BOT` rows. They are the frontmost layer but the glass's edge, over the home screen and every app alike, in screen coordinates, so nothing transforms them. Drawn as fluor draws: front to back from empty, into fluor's 16-bit α + darkness (`G2T16`), by fluor's one `under`; redrawn only when what they show changes (`console_draw`, `helm_draw`).
@@ -3170,8 +3170,8 @@ fn bar_row(y: usize, height: usize) -> Option<usize> {
 /// The bars at screen row `y`: the columns holding any of them (from, to) and the row's decoded pixels (`BAR_W`); an empty span and no pixels off their rows.
 #[inline]
 fn bar_line(y: usize, width: usize, height: usize) -> ((usize, usize), &'static [u64]) {
-    // Full screen: the bars hidden, every publish passes their rows untouched; but the console's rows show while the bars on the glass hold any of the quick row (pulled from the doorway, which stays the system's), so its full screen circle can be reached and the row is never drawn over nothing.
-    if unsafe { FULL && (quick::EMPTY_FRONT || y >= BAR_TOP) } {
+    // Full screen: the bars hidden, the quick row with them, every publish passing their rows untouched (owner, 2026-11-11: the console "gone gone"; until then its rows showed while the bars held any of the quick row, pulled from the doorway, so the row's circle could switch full screen off; home's swipe is the way back now).
+    if unsafe { FULL } {
         return ((0, 0), &[]);
     }
     match bar_row(y, height) {
@@ -6229,7 +6229,7 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         if op == 27 && n >= 13 {
-            // Whose is this point (WINDOWS.md): [base u64][x u16][y u16] → 1 if the caller's window owns it on the glass, else 0: one read of the hit map (hit.rs), where a window owns the pixels it is frontmost and not see-through at, inside the circle, and never one the system holds (the corners, the quick row and what is behind it while it shows). Answered here: a client asks it on every finger down.
+            // Whose is this point (WINDOWS.md): [base u64][x u16][y u16] → 1 if the caller's window owns it on the glass, else 0: one read of the hit map (hit.rs), where a window owns the pixels it is frontmost and not see-through at, inside the circle (in full screen to the glass's edge but the helm's two wedges, the console's rows the app's), and never one the system holds (the corners, the quick row and what is behind it while it shows). Answered here: a client asks it on every finger down.
             let mine = surface_of(u64::from_le_bytes(msg[1..9].try_into().unwrap()));
             let (x, y) = (u16::from_le_bytes([msg[9], msg[10]]) as i64, u16::from_le_bytes([msg[11], msg[12]]) as i64);
             let yes = mine.is_some_and(|k| hit::at(x, y) == hit::WINDOW + k as u16);
@@ -6254,7 +6254,7 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         if op == 41 && n >= 5 {
-            // What the system has at this point: [x u16][y u16] → its place, one read of the hit map (hit.rs, the system's ids as the bars' compose leaves them): in the lower half outside the app's circle, a region (owner, 2026-11-07): 9 back on the left, 8 home on the right, whole (the arrow and the ring are only drawn there, nothing to aim at); in the upper half, the doorway by the camera 10, else the console circle whose zone it is (every pixel of the dash is the nearest circle's, `dash_row`): the radios by their bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS), 5 USB, 13 the clock, 14 the battery; 11 where no zone reaches (none on these screens). The quick row (QUICK.md), in front of what is inside the app's circle: its circle under the point while it stands open as 32 + its index, with its centre and radius after (x, y, r u16 each, as `quick::layout` draws it), or 12 anywhere else inside the app's circle while any of it shows (behind the row). G#FF for nothing of the system's: inside the circle with the row shut (an app's window, the map's plane), or off the glass.
+            // What the system has at this point: [x u16][y u16] → its place, one read of the hit map (hit.rs, the system's ids as the bars' compose leaves them): in the lower half outside the app's circle, a region (owner, 2026-11-07): 9 back on the left, 8 home on the right, whole (the arrow and the ring are only drawn there, nothing to aim at); in the upper half, the doorway by the camera 10, else the console circle whose zone it is (every pixel of the dash is the nearest circle's, `dash_row`): the radios by their bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS), 5 USB, 13 the clock, 14 the battery; 11 where no zone reaches (none on these screens). The quick row (QUICK.md), in front of what is inside the app's circle: its circle under the point while it stands open as 32 + its index, with its centre and radius after (x, y, r u16 each, as `quick::layout` draws it), or 12 anywhere else inside the app's circle while any of it shows (behind the row). G#FF for nothing of the system's: inside the circle with the row shut (an app's window, the map's plane), or off the glass; and in full screen everywhere on the console's rows (the console and the doorway gone, their pixels the app's; owner, 2026-11-11: "whilist console should be gone gone"), so a touch there is no corner's and the row cannot be pulled.
             let (w, h) = unsafe { SCREEN_WH };
             let (x, y) = (u16::from_le_bytes([msg[1], msg[2]]) as i64, u16::from_le_bytes([msg[3], msg[4]]) as i64);
             let id = hit::at(x, y);
@@ -7892,7 +7892,7 @@ fn server(grants: u64) -> ! {
                     }
                 }
                 Some(43) => {
-                    // Full screen on or off for the app window in front (`Win::full`, `FULL`; the quick row's circle since 2026-11-11, owner: full screen "moves to a quick-row circle", where the home swipe toggled it for the whole screen until then): every phase republished, the bars and the circle gone or back. Replies the new state; status 3 and the state unchanged with no app in front (the home screen always has its bars).
+                    // Full screen on or off for the app window in front (`Win::full`, `FULL`; the quick row's circle since 2026-11-11, owner: full screen "moves to a quick-row circle", where the home swipe toggled it for the whole screen until then): every phase republished, the bars and the circle gone or back, and with the publish every row of the hit map written again (hit.rs `row`: the console's rows the app's in full screen, the helm's still the system's). Replies the new state; status 3 and the state unchanged with no app in front (the home screen always has its bars).
                     match front_app() {
                         Some(k) => unsafe {
                             if let Some(w) = (*(&raw mut WINS))[k].as_mut() {
@@ -8426,12 +8426,7 @@ fn server(grants: u64) -> ! {
                 BAR_SPAN_BACK = s;
                 let mut r = CON_RECT;
                 // Whether the bars now on the screen hold any of the quick row (a screencap it asked for waits until they hold none).
-                let was_empty = quick::EMPTY_FRONT;
                 quick::EMPTY_FRONT = quick::EMPTY_BACK.load(Ordering::Acquire);
-                // Full screen: the console's rows come and go with the row (`bar_line`), so all of them are published as it does.
-                if FULL && was_empty != quick::EMPTY_FRONT {
-                    r[0] = r[0].union(draw::Rect { x0: 0, y0: 0, x1: width as i32, y1: BAR_TOP as i32 });
-                }
                 // The hit map's share of the bars with them; the whole map again when the row came or went (everything inside the app's circle changed hands).
                 hit::bars_swap(width, height);
                 CON_READY.store(0, Ordering::Release);
