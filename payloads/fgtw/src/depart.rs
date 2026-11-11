@@ -192,10 +192,11 @@ impl Client {
         }
     }
 
-    /// A member showed it is reachable (its pong, its beacon, a frame from it): handed what it has not taken.
-    pub fn depart_reachable(&mut self, from: [u8; 32]) {
+    /// A member showed it is reachable (its pong, its beacon, a frame from it): handed what it has not taken, by both machines (the departure's request or deny, the add's grown fan-out).
+    pub fn reachable(&mut self, from: [u8; 32]) {
         if from != self.me {
             self.depart_event(Flow::Reachable { from });
+            self.add_event(Flow::Reachable { from });
         }
     }
 
@@ -239,6 +240,8 @@ impl Client {
                     self.depart_wipe();
                     return;
                 }
+                // The add's actions (add.rs): the departure machine asks for none of them.
+                Action::ChainNews { .. } | Action::Radios { .. } | Action::Job(Job::ListRequests | Job::Bind { .. } | Job::Grow { .. }) => {}
             }
         }
     }
@@ -383,6 +386,8 @@ impl Client {
                 self.log.put(b" was not published: ");
                 self.log.put(reason.as_bytes());
             }
+            // The add's notes (add.rs): the departure machine says none of them.
+            Note::AddNoFleetKey | Note::AsksToJoin { .. } | Note::Picked { .. } | Note::PickUnreachable { .. } | Note::AddBusy | Note::AddLockedOut { .. } | Note::AddOwnedElsewhere { .. } | Note::Adding { .. } | Note::Added { .. } | Note::AddFailed { .. } => return,
         }
         self.log.line();
     }
@@ -392,6 +397,7 @@ impl Client {
         self.log.put(b"fgtw: departed; the identity is forgotten here");
         self.log.line();
         let _ = ferros_sys::store_delete(cap(self.log.grants, S_STORE), DEPART_KEY);
+        let _ = ferros_sys::store_delete(cap(self.log.grants, S_STORE), add::ADD_KEY);
         self.forget_disk();
         self.forget_identity();
         if !ferros_sys::release_identity(cap(unsafe { GRANTS }, S_UNLOCK)) {
@@ -428,6 +434,8 @@ impl Client {
                                 }
                             }
                             FlowFrame::DepartDeny { leaver, .. } => self.space_deny_depart(&leaver, &bytes),
+                            // The add's frames (add.rs): the departure machine builds none of them.
+                            FlowFrame::BindSelect { .. } | FlowFrame::FanoutResp { .. } => {}
                         }
                     }
                 }

@@ -19,6 +19,8 @@ use photon_core::join::{self, DeviceKeys, Inbound};
 use photon_core::pt::{self, Addr, Event, Pt};
 use photon_core::wire::{self, Frame};
 
+mod add;
+mod addview;
 mod depart;
 mod kept;
 mod route;
@@ -431,51 +433,6 @@ struct Sponsor {
     online: bool,
 }
 
-/// The add flow's phases, as the Fleet page reads them (op 9).
-const ADD_CLOSED: u8 = 0;
-/// Open: candidates listed from the registry and the LAN, nothing picked.
-const ADD_OPEN: u8 = 1;
-/// A candidate picked (by its words, its tag, or nearby): the Add being signed and published.
-const ADD_BINDING: u8 = 2;
-/// Selected (a nearby row touched on the screen): nothing bound; the device was told (`bind_select`) and should be green, and Add binds and grows it as one act. Back returns to the list with nothing to undo (owner, 2026-11-10, after a pick 50 ft away stayed bound when Back was pressed).
-const ADD_SELECTED: u8 = 3;
-/// The fan-out being grown to the newcomer.
-const ADD_GROWING: u8 = 4;
-/// Added: the newcomer is in the chain and holds the fleet key.
-const ADD_DONE: u8 = 5;
-/// The last step failed; `note` says why.
-const ADD_FAILED: u8 = 6;
-
-/// How long a binding request heard over the LAN, or a beacon over BLE, counts as "nearby" (Photon's LAN_HEARD_FRESH).
-const NEARBY_US: u64 = 30_000_000;
-
-/// The sponsor's side of adding a device to this fleet (fgtw::sponsor; photon docs/pairing-v2.md), while the Fleet page's add flow is open. The newcomer's binding request reaches this device from the seed's registry (listed every 8 s while open) and over the LAN (`bind_req`, kept whether or not the flow is open, as Photon keeps it); its BLE beacon and NFC tag are read by the radios' drivers.
-struct Adding {
-    phase: u8,
-    /// The registry's last list, and when it was asked.
-    registry: Vec<fgtw::fleet::BindRequest>,
-    listed_us: u64,
-    /// The candidate rows (fgtw::sponsor::candidates), rebuilt whenever a source changes.
-    cands: Vec<fgtw::sponsor::Candidate>,
-    /// The request picked and how (its words matched, Add pressed on a selected device, or an NFC tap), and the device bound. Either way the key follows at once.
-    picked: Option<(fgtw::fleet::BindRequest, &'static str)>,
-    bound: Option<[u8; 32]>,
-    /// The device selected and told so, waiting for the person's Add (`select`).
-    selected: Option<fgtw::fleet::BindRequest>,
-    /// The person's confirm, waiting for the loop to grow the fan-out.
-    confirm: bool,
-    /// The words typed so far (op 11), matched live.
-    words: alloc::string::String,
-    /// What the Fleet page shows under the phase.
-    note: alloc::string::String,
-}
-
-impl Adding {
-    const fn new() -> Self {
-        Adding { phase: ADD_CLOSED, registry: Vec::new(), listed_us: 0, cands: Vec::new(), picked: None, bound: None, selected: None, confirm: false, words: alloc::string::String::new(), note: alloc::string::String::new() }
-    }
-}
-
 
 struct Client {
     log: Log,
@@ -526,18 +483,13 @@ struct Client {
     /// The chains and fan-outs this device holds (fgtw::held, the rule Photon's held set follows): the seed's copy when it answers, this one when it does not.
     held: core::cell::RefCell<fgtw::held::HeldChains>,
     held_fan: core::cell::RefCell<fgtw::held::HeldFanouts>,
-    /// Sponsoring: the add flow, the binding requests handed over the LAN (checked, the newest per device) and where each came from and when, and the beacon ids the Bluetooth driver heard.
-    adding: Adding,
-    lan_reqs: Vec<fgtw::fleet::BindRequest>,
-    lan_from: Vec<([u8; 32], Addr, u64)>,
-    ble_heard: Vec<([u8; fgtw::pair::BEACON_UUID_LEN], u64)>,
-    /// Whether the radios are listening (`sponsor_radios`): the NFC reader while the add flow is open or a fleet device's departure waits here (a tap of the leaving device approves it), the BLE scan while the add flow is open.
+    /// Adding a device, the sponsor's side, on fgtw's machine (add.rs).
+    add: add::Sponsoring,
+    /// Whether the radios are listening (`sponsor_radios`): the NFC reader while the add machine wants it or a fleet device's departure waits here (a tap of the leaving device approves it), the BLE scan while the add machine wants it.
     listening: (bool, bool),
-    /// Loop passes since the radios were last told to listen: told again every 64 while the add flow is open, so a driver restarted meanwhile listens again (both answer a repeat with nothing changed). And what they last answered, so only a change is said.
+    /// Loop passes since the radios were last told to listen: told again every 64 while either listens, so a driver restarted meanwhile listens again (both answer a repeat with nothing changed). And what they last answered, so only a change is said.
     listen_pass: u32,
     listen_said: (u8, u8),
-    /// The beacon ids heard and the candidates heard by Bluetooth at the last look, so only a change is said.
-    ble_said: (usize, usize),
     /// The members of the latest chain for our handle handed to this device before it was bound (a sponsor pushes it ahead of its `bind_select`): what a select's sender is checked against.
     offered: Vec<[u8; 32]>,
     /// A `bind_select` for this device that came before any chain its sender is in (the frames crossed): its sender, checked again when a chain arrives.
@@ -660,6 +612,8 @@ impl Client {
         }
         // The departure machine (depart.rs), made now the roots are in hand: a departure under way when the device last stopped is resumed, and finished at once if the chain held here (the machine's first fold) already lacks this device.
         self.depart_start();
+        // The add machine (add.rs), made the same way: an add kept from before a restart is resumed once a fold is told.
+        self.add_start();
         if !say && self.hp.is_none() {
             return;
         }
@@ -689,6 +643,21 @@ impl Client {
     fn send_all(&mut self, out: Vec<(Addr, Vec<u8>)>) {
         for (to, d) in out {
             self.udp.send(&to, join::PORT, &d);
+        }
+    }
+
+    /// A frame to every fleet device heard in the last two minutes (as the pings go), and to `extra` (a newcomer's address) once.
+    fn push_to_fleet(&mut self, frame: Vec<u8>, extra: Option<Addr>) {
+        let t = now_us();
+        let mut to: Vec<Addr> = self.sponsors.iter().filter(|s| t - s.heard_us < 120_000_000).map(|s| s.addr).collect();
+        if let Some(a) = extra {
+            if !to.iter().any(|x| x.fam == a.fam && x.ip == a.ip && x.port == a.port) {
+                to.push(a);
+            }
+        }
+        for a in to {
+            let out = self.pt.send(a, frame.clone(), now_us(), eagle());
+            self.send_all(out);
         }
     }
 
@@ -809,8 +778,11 @@ impl Client {
                 self.sponsors.len() - 1
             }
         };
-        // A fleet device heard: handed whatever departure frame it has not taken.
-        self.depart_reachable(key);
+        // A fleet device heard: handed whatever departure frame or fan-out it has not taken. One not in the fold is a newcomer on this network, nearby for the add machine.
+        self.reachable(key);
+        if self.bound {
+            self.add_lan_heard(key);
+        }
         if !self.bound && !self.request_frame.is_empty() && self.sponsors[idx].asked_t != self.request_t {
             self.sponsors[idx].asked_t = self.request_t;
             self.log.put(b"fgtw: handing our binding request to ");
@@ -853,6 +825,7 @@ impl Client {
             self.persist_set(b"fleet_key", &k);
             self.log.put(b"fgtw: the fleet key recovered from the published fan-out");
             self.log.line();
+            self.add_key();
         }
     }
 
@@ -895,13 +868,14 @@ impl Client {
     }
 
 
-    /// Keep the members a chain folds to (the Fleet page's list).
+    /// Keep the members a chain folds to (the Fleet page's list), and tell the add machine its fold.
     fn note_members(&mut self, blob: &fgtw::fleet::MembershipBlob) {
         if let Ok(m) = blob.fold() {
             self.members = m;
             self.say_chain(blob);
             // The held copy too (fgtw::held): what a sponsor's Add extends when the seed does not answer.
             fgtw::held::ChainHold::hold(&self.held, blob);
+            self.add_fold(blob);
         }
     }
 
@@ -1035,6 +1009,7 @@ impl Client {
     /// Everything held for the identity whose roots were in the vault: its roots, chain standing, key, sponsors and request.
     fn forget_identity(&mut self) {
         self.dep = depart::Departing::new();
+        self.add.reset();
         if self.radios_on {
             self.radios(None);
         }
@@ -1314,8 +1289,8 @@ impl Client {
                 if let Some(s) = self.sponsors.iter_mut().find(|s| s.key == key) {
                     s.addr = from;
                     s.heard_us = t;
-                    // A fleet device pinging us is reachable: handed whatever departure frame it has not taken.
-                    self.depart_reachable(key);
+                    // A fleet device pinging us is reachable: handed whatever departure frame or fan-out it has not taken.
+                    self.reachable(key);
                 }
                 return;
             }
@@ -1330,8 +1305,8 @@ impl Client {
                         self.log.put(b" answers our pings");
                         self.log.line();
                     }
-                    // A departure frame it has not taken yet (its hand-off given up on, or never made): handed now that it answers.
-                    self.depart_reachable(key);
+                    // A departure frame or fan-out it has not taken yet (its hand-off given up on, or never made): handed now that it answers.
+                    self.reachable(key);
                 }
                 return;
             }
@@ -1354,11 +1329,11 @@ impl Client {
             let ack = pt::packet_ack(eagle(), bytes);
             self.udp.send(&from, join::PORT, &ack);
         }
-        // A frame signed by a member of our fleet: its address learnt, and it is reachable (handed whatever departure frame it has not taken).
+        // A frame signed by a member of our fleet: its address learnt, and it is reachable (handed whatever departure frame or fan-out it has not taken).
         if let Ok((_, signer)) = &parsed {
             if self.bound && *signer != self.me && self.members.contains(signer) {
                 self.learn(*signer, from);
-                self.depart_reachable(*signer);
+                self.reachable(*signer);
             }
         }
         match parsed {
@@ -1393,8 +1368,9 @@ impl Client {
                             self.hold_chain(&chain);
                             self.verdict = V_JOIN;
                         }
-                        // The departure machine's fold: a member's request settled, or ours complete once this device is not in it.
+                        // The departure machine's fold: a member's request settled, or ours complete once this device is not in it. The add machine's too.
                         self.depart_fold(&blob);
+                        self.add_fold(&blob);
                     }
                     Err(e) => {
                         self.log.put(b"fgtw: a chain from ");
@@ -1421,6 +1397,8 @@ impl Client {
                         if self.fleet_key != Some(key) {
                             self.fleet_key = Some(key);
                             self.persist_set(b"fleet_key", &key);
+                            // A key that arrives while the Fleet page shows opens the add flow there.
+                            self.add_key();
                         }
                     }
                     Ok(None) => {
@@ -1444,7 +1422,12 @@ impl Client {
                 self.select_from(signer);
             }
             // A newcomer asking this device to add it, and a sibling asking to leave: the sponsor's and the approver's frames (fgtw::sponsor).
-            Ok((Inbound::Other(name), _)) if name == "bind_req" => self.on_bind_req(from, bytes),
+            // A newcomer's request reaches the add machine only on a bound device (add.rs): one not in a fleet has nobody to add it to.
+            Ok((Inbound::Other(name), _)) if name == "bind_req" => {
+                if self.bound {
+                    self.add_frame(from, bytes);
+                }
+            }
             Ok((Inbound::Other(name), _)) if name == "depart_req" || name == "depart_deny" => self.depart_frame(Some(from), bytes),
             // The person's identity space from a sibling (space.rs).
             Ok((Inbound::Other(name), _)) if name == "space_push" => self.on_space_push(from, bytes),
@@ -1532,6 +1515,8 @@ impl Client {
                             }
                             // A departure frame given up on is handed again when its device is next heard (the desktop restarted 14 s before one arrived, and with no retry it never saw it, 2026-11-10); one that arrived is not.
                             self.depart_sent(&to, &hash, ok);
+                            // The add machine's sends the same way (a select, the grown fan-out).
+                            self.add_sent(&to, &hash, ok);
                         }
                     }
                 }
@@ -1552,7 +1537,7 @@ impl Client {
                 busy = true;
                 // WHY the min: `n` is what the caller sent, which may be more than the buffer took.
                 let got = (n as usize).min(req.len());
-                // The sponsor's and the approver's ops (the Fleet page's add flow and approvals, fgtw::sponsor): each answers alone, nothing of the state after it. 8 [on] open or close the add flow → [0]; 9 → the add flow (`adding_reply`); 10 [key 8] pick a nearby candidate → [result]; 11 [words] the words typed so far → the match (`type_words`); 12 confirm a nearby pick → [result]; 13 → a departure waiting (`depart_ask_reply`); 14 [1 Approve, 0 Deny] → [result] (depart.rs); 15 [kind] words wanted from the person (0 none, 1 a newcomer's) → [0]; 16 → the words wanted now [kind] (the keyboard's host asks).
+                // The sponsor's and the approver's ops (the Fleet page's add flow and approvals, on fgtw's machines, add.rs and depart.rs): each answers alone, nothing of the state after it. 8 [on] the Fleet page shown or gone, and [8][1] on a selected device is No → [0]; 9 → the add flow (`add_reply`, addview.rs); 10 [key 8] a row touched → [result]; 11 [words] the words typed so far → the match (`add_words`); 12 Yes on a selected device → [result]; 13 → a departure waiting (`depart_ask_reply`); 14 [1 Approve, 0 Deny] → [result] (depart.rs); 15 [kind] words wanted from the person (0 none, 1 a newcomer's, which also reads fgtw.org's registry once) → [0]; 16 → the words wanted now [kind] (the keyboard's host asks).
                 // The identity space (space.rs): 17 → its state for the map (`space_reply`: the generation the map reloads its circles on, this device's home-screen sync, the first pull done, the facts); 18 [on] this device's home screen follows the fleet's or keeps its own → [0 done, 1 not yet: before the first pull].
                 if n >= 1 && req[0] == 17 {
                     let r = self.space_reply();
@@ -1603,22 +1588,19 @@ impl Client {
                 if n >= 1 && (8..=16).contains(&req[0]) {
                     let text = core::str::from_utf8(&req[1..got]).unwrap_or("");
                     let r: Vec<u8> = match req[0] {
-                        8 if n >= 2 => {
-                            self.open_add(req[1] != 0);
-                            alloc::vec![0]
-                        }
-                        9 => self.adding_reply(),
-                        10 if n >= 9 => {
-                            let mut k = [0u8; 8];
-                            k.copy_from_slice(&req[1..9]);
-                            alloc::vec![self.pick_nearby(&k)]
-                        }
-                        11 => self.type_words(text),
-                        12 => alloc::vec![self.confirm_add()],
+                        8 if n >= 2 => alloc::vec![self.add_page(req[1] != 0)],
+                        9 => self.add_reply(),
+                        10 if n >= 9 => alloc::vec![self.add_pick(&req[1..9])],
+                        11 => self.add_words(text),
+                        12 => alloc::vec![self.add_yes()],
                         13 => self.depart_ask_reply(),
                         14 if n >= 2 => alloc::vec![self.answer_depart(req[1] != 0)],
                         15 if n >= 2 && req[1] <= 1 => {
                             self.entry = req[1];
+                            // "Type its words": the person's edge that reads fgtw.org's registry (owner, 2026-11-10: never on a timer).
+                            if req[1] == 1 {
+                                self.add_look();
+                            }
                             alloc::vec![0]
                         }
                         16 => alloc::vec![self.entry_wanted()],
@@ -1682,8 +1664,9 @@ impl Client {
                     self.fgtw_asked_us = 0;
                     self.log.put(if self.persist { b"fgtw: roots set in RAM and kept on disk (unlock at boot on)" } else { b"fgtw: roots set in RAM only (nothing of the identity on disk)" });
                     self.log.line();
-                    // The departure machine, made with these roots: a departure kept from before a restart is taken up now (with unlock-at-boot off, nothing of the identity is on disk at `load`).
+                    // The departure and add machines, made with these roots: a departure or an add kept from before a restart is taken up now (with unlock-at-boot off, nothing of the identity is on disk at `load`).
                     self.depart_start();
+                    self.add_start();
                 }
                 // Op 5: leave the fleet, `[5][intent]` (1 to a new owner, 2 to the desk) → [result: 0 started, 4 the identity's last device, else why not (depart.rs `leave`)], then the state (8 leaving).
                 if n >= 2 && req[0] == 5 {
@@ -1720,8 +1703,8 @@ impl Client {
             self.depart_seed_check(t);
             // The departure machine's slow work: signing a request or a deny, an approval's publish, a chain read (depart.rs), here in the loop and never inside a call another process waits on.
             self.depart_work();
-            // Sponsoring (fgtw::sponsor): the add flow's listing, binding and growing, the radios listening for newcomers and for a departure's tap.
-            self.sponsor_step(t);
+            // Sponsoring (add.rs): the radios listening for newcomers and for a departure's tap, the add machine's deadline, and its slow work (signing, the registry's read, the bind, the grow), here in the loop and never inside a call another process waits on.
+            self.sponsor_step();
             // The person's identity space: the first pull, then this device's copy joined to it and handed on (space.rs).
             self.space_step(t);
             // The verdict: looked up once the network is up, and again every 30 s while GREY or while a fresh handle waits (someone else may mint it meanwhile).
@@ -1733,8 +1716,9 @@ impl Client {
                 self.fgtw_asked_us = 0;
                 self.log.put(b"fgtw: the network is up (IPv4)");
                 self.log.line();
-                // A departure frame given up on is handed again on the new network.
+                // A departure frame or a fan-out given up on is handed again on the new network.
                 self.depart_event(fgtw::flow::Event::LinkUp);
+                self.add_event(fgtw::flow::Event::LinkUp);
             }
             // Also the moment FGTW's answer window closes (`lookup`), so fgtw.org follows a silent network a quarter second later, not at the next 2 s.
             let window_closed = self.fgtw_asked_us != 0 && t.wrapping_sub(self.fgtw_asked_us) >= 1 << 18;
@@ -1808,7 +1792,7 @@ impl Client {
         v.extend_from_slice(self.selected_by.as_ref().map_or(&[0u8; 32][..], |s| &s[..]));
         v.extend_from_slice(&self.members_reply());
         v.extend_from_slice(&self.depart_ask_reply());
-        v.extend_from_slice(&self.adding_reply());
+        v.extend_from_slice(&self.add_reply());
         v.extend_from_slice(self.dep.denied_by.as_ref().map_or(&[0u8; 32][..], |d| &d[..]));
         v.extend_from_slice(&self.space_reply());
         v
@@ -1838,417 +1822,17 @@ impl Client {
 }
 
 
-/// The sponsor's and the approver's side (fgtw::sponsor, the code Photon's Devices screen runs): adding another device to this fleet, and approving a sibling's departure. Everything that signs or reaches the seed runs in the loop (`sponsor_step`), never inside a call another process waits on; the Fleet page's ops only record what the person asked.
+/// The sponsor's and the approver's radios and the add machine's turn in the loop (add.rs carries the machine's actions out). Everything that signs or reaches the seed runs in the loop (`sponsor_step`), never inside a call another process waits on; the Fleet page's ops only tell the machine what the person did.
 impl Client {
-    /// The candidate rows again, from the registry's last list and the LAN's requests, each marked nearby when its request came over the LAN or its beacon was heard within `NEARBY_US`.
-    fn rebuild_candidates(&mut self) {
-        let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
-        fgtw::sponsor::retain_fresh(&mut self.lan_reqs, eagle());
-        let t = now_us();
-        // The clock only moves forward, so `t` is never behind a stamp taken earlier.
-        self.ble_heard.retain(|(_, at)| t - at < NEARBY_US);
-        let reqs = fgtw::sponsor::merge_requests(&self.adding.registry, &self.lan_reqs);
-        let ble: Vec<[u8; fgtw::pair::BEACON_UUID_LEN]> = self.ble_heard.iter().map(|(u, _)| *u).collect();
-        let lan: Vec<[u8; 32]> = self.lan_from.iter().filter(|(_, _, at)| t - at < NEARBY_US).map(|(k, _, _)| *k).collect();
-        self.adding.cands = fgtw::sponsor::candidates(reqs, &seed, &hp, &ble, &lan);
-        // Measuring the nearby path: how many beacon ids Bluetooth hears, and how many devices asking match one (fgtw::pair::beacon_matches), said when either changes.
-        let matched = self.adding.cands.iter().filter(|c| c.heard_ble).count();
-        if (ble.len(), matched) != self.ble_said {
-            self.ble_said = (ble.len(), matched);
-            self.log.put(b"fgtw: Bluetooth hears ");
-            self.log.dec(ble.len() as u64);
-            self.log.put(b" service id(s); ");
-            self.log.dec(matched as u64);
-            self.log.put(b" of the ");
-            self.log.dec(self.adding.cands.len() as u64);
-            self.log.put(b" device(s) asking to join match one");
-            self.log.line();
-        }
-        // A device asking is known only from fgtw.org's registry or a request on this network: a beacon alone names no request to match. With neither, the page says so.
-        if self.adding.phase == ADD_OPEN {
-            self.adding.note.clear();
-            if self.adding.cands.is_empty() {
-                self.adding.note.push_str(if self.net_up { "waiting for a device to ask (fgtw.org, this network)" } else { "no network: a device asking is found through fgtw.org (cellular or WiFi)" });
-            }
-        }
-    }
-
-    /// A newcomer's binding request handed to this device over the LAN (`bind_req`): taken only by a member of the fleet it names, checked exactly as a registry row is (fgtw::sponsor::check_lan_request), kept as the newest from its device, and its address remembered for the hand-over.
-    fn on_bind_req(&mut self, from: Addr, bytes: &[u8]) {
-        let Ok((hp, req, _)) = fgtw::protocol::parse_bind_req(bytes) else { return };
-        let (Some(our_hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
-        if hp != our_hp || !self.bound {
-            return;
-        }
-        let key = req.device_pubkey;
-        match fgtw::sponsor::check_lan_request(&req, &hp, &seed, eagle()) {
-            Ok(()) => {}
-            Err(why) => {
-                self.log.put(b"fgtw: a binding request from ");
-                self.log.fp(&key);
-                self.log.put(if why == fgtw::sponsor::LanRefusal::Stale { b" is stale: ignored".as_slice() } else { b" does not verify for our fleet: ignored" });
-                self.log.line();
-                return;
-            }
-        }
-        if fgtw::sponsor::offer_lan(&mut self.lan_reqs, req) == fgtw::sponsor::Offered::Unchanged {
-            return;
-        }
-        let t = now_us();
-        match self.lan_from.iter_mut().find(|(k, _, _)| *k == key) {
-            Some(e) => {
-                e.1 = from;
-                e.2 = t;
-            }
-            None => {
-                self.log.put(b"fgtw: ");
-                self.log.put(fgtw::pair::device_name_default(&key, &seed).as_bytes());
-                self.log.put(b" (");
-                self.log.fp(&key);
-                self.log.put(b") asks to join from ");
-                self.log.addr(&from);
-                self.log.line();
-                self.lan_from.push((key, from, t));
-            }
-        }
-        self.rebuild_candidates();
-    }
-
-    /// Op 8: the Fleet page's add flow opened (1) or closed (0). Opening lists the registry at once and starts the radios listening; closing stops them, and forgets a finished or failed add.
-    fn open_add(&mut self, on: bool) {
-        // Back from a selected device: the list again, nothing to undo (nothing was bound).
-        if on && self.adding.phase == ADD_SELECTED {
-            self.adding.selected = None;
-            self.adding.note.clear();
-            self.adding.phase = ADD_OPEN;
-            return;
-        }
-        // Only a member holding the fleet key adds (owner, 2026-11-10: "Fleet key check, yes"): a bound device without it would write the Add into the chain and then fail to hand the key over, leaving a keyless member (tonight's baf3dec7). Said on the page, and nothing listens.
-        if on && self.adding.phase == ADD_CLOSED && (!self.bound || self.fleet_key.is_none()) {
-            self.adding.note.clear();
-            self.adding.note.push_str("this device does not hold the fleet key, so it cannot add devices");
-            self.adding.phase = ADD_FAILED;
-            return;
-        }
-        if on && self.adding.phase == ADD_CLOSED {
-            self.adding.phase = ADD_OPEN;
-            self.adding.listed_us = 0;
-            self.adding.words.clear();
-            self.adding.note.clear();
-            self.adding.picked = None;
-            self.adding.bound = None;
-            self.adding.confirm = false;
-            self.rebuild_candidates();
-            self.log.put(b"fgtw: the add flow is open: listing devices asking to join");
-            self.log.line();
-        } else if !on && self.adding.phase != ADD_CLOSED {
-            // A bind or a grow under way finishes in the loop; only the screen closes.
-            if matches!(self.adding.phase, ADD_OPEN | ADD_DONE | ADD_FAILED | ADD_SELECTED) {
-                self.adding.phase = ADD_CLOSED;
-            }
-            self.adding.registry.clear();
-        }
-    }
-
-    /// Op 10: a candidate heard nearby, picked by the first 8 bytes of its key: selected, nothing bound (`select`); Add (op 12) binds it. Returns 0 selected, 1 no such nearby candidate, 2 busy.
-    fn pick_nearby(&mut self, key8: &[u8]) -> u8 {
-        if self.adding.phase != ADD_OPEN {
-            return 2;
-        }
-        let Some(c) = self.adding.cands.iter().find(|c| c.nearby() && c.req.device_pubkey[..8] == *key8) else { return 1 };
-        let req = c.req.clone();
-        self.select(req, "its row on the Fleet page");
-        0
-    }
-
-    /// Op 11: the words typed so far, matched live (fgtw::sponsor::match_words). A full match picks the candidate, and its key follows at once (the typed 256-bit match is the confirmation). Returns [kind][count], then the word to flag or the matched name: kind 0 no candidates yet, 1 nothing typed, 2 matched, 3 no device has this word, 4 one device still matches, 5 several do, 6 the add flow is not open for words.
-    fn type_words(&mut self, text: &str) -> Vec<u8> {
-        use fgtw::sponsor::WordMatch;
-        self.adding.words.clear();
-        self.adding.words.push_str(text);
-        let mut r = Vec::with_capacity(48);
-        if self.adding.phase != ADD_OPEN {
-            r.extend_from_slice(&[6, 0]);
-            return r;
-        }
-        match fgtw::sponsor::match_words(text, &self.adding.cands) {
-            WordMatch::NoCandidates { typo } => {
-                r.extend_from_slice(&[0, 0]);
-                if let Some(w) = typo {
-                    r.extend_from_slice(w.as_bytes());
-                }
-            }
-            // WHY the cap: a byte on the wire; past 255 devices asking the page has nothing different to say.
-            WordMatch::Nothing { asking } => r.extend_from_slice(&[1, asking.min(255) as u8]),
-            WordMatch::Full(i) => {
-                let c = &self.adding.cands[i];
-                r.extend_from_slice(&[2, 1]);
-                r.extend_from_slice(c.name.as_bytes());
-                self.adding.picked = Some((c.req.clone(), "its words matched"));
-                self.adding.phase = ADD_BINDING;
-            }
-            WordMatch::NoMatch(w) => {
-                r.extend_from_slice(&[3, 0]);
-                r.extend_from_slice(w.as_bytes());
-            }
-            WordMatch::One(i) => {
-                r.extend_from_slice(&[4, 1]);
-                r.extend_from_slice(self.adding.cands[i].name.as_bytes());
-            }
-            // WHY the cap: as above.
-            WordMatch::Many(k) => r.extend_from_slice(&[5, k.min(255) as u8]),
-        }
-        r
-    }
-
-    /// Op 12: Add, on a selected device the person saw turn green: the bind and the fan-out grow as one act (`bind_picked`, then `grow_for_newcomer`), the chain and the fan-out pushed to it. Returns 0 taken, 1 nothing selected.
-    fn confirm_add(&mut self) -> u8 {
-        if self.adding.phase != ADD_SELECTED {
-            return 1;
-        }
-        let Some(req) = self.adding.selected.take() else { return 1 };
-        self.adding.picked = Some((req, "Add pressed on the selected device"));
-        self.adding.phase = ADD_BINDING;
-        0
-    }
-
     /// Op 16: the words wanted from the person now, dropped once nothing is left to type them for (the add flow past picking). A departure takes no words (op 15 sets 0 or 1 only).
     fn entry_wanted(&mut self) -> u8 {
-        if self.entry == 1 && self.adding.phase != ADD_OPEN {
+        if self.entry == 1 && self.add_phase() != fgtw::flow::add::Phase::Open {
             self.entry = 0;
         }
         self.entry
     }
 
-    /// Op 9, the add flow for the Fleet page: [phase][rows], each row [the key's first 8 bytes][flags: bit 0 its beacon heard, bit 1 its request heard on the LAN, bit 2 the device just bound][name length][name], then [note length][note].
-    fn adding_reply(&self) -> Vec<u8> {
-        let mut r = Vec::with_capacity(256);
-        r.push(self.adding.phase);
-        // WHY the cap: the Fleet page lays out at most 8 candidates, and the count is one byte.
-        let n = self.adding.cands.len().min(8);
-        r.push(n as u8);
-        for c in &self.adding.cands[..n] {
-            r.extend_from_slice(&c.req.device_pubkey[..8]);
-            r.push(c.heard_ble as u8 | (c.heard_lan as u8) << 1 | ((self.adding.bound == Some(c.req.device_pubkey)) as u8) << 2);
-            r.push(c.name.len() as u8);
-            r.extend_from_slice(c.name.as_bytes());
-        }
-        // WHY the cap: a length byte; every note written here is a short sentence.
-        let note = &self.adding.note.as_bytes()[..self.adding.note.len().min(255)];
-        r.push(note.len() as u8);
-        r.extend_from_slice(note);
-        // The selected device (phase ADD_SELECTED): [its name, length first][its masked words, the same the device shows, length u16 LE], both empty otherwise.
-        let (name, words) = match (&self.adding.selected, self.identity_seed) {
-            (Some(req), Some(seed)) => (fgtw::pair::device_name_default(&req.device_pubkey, &seed), fgtw::pair::masked_device_words(&req.device_pubkey, &seed)),
-            _ => (alloc::string::String::new(), alloc::string::String::new()),
-        };
-        // WHY the caps: a length byte, and two for the words; a device name is two words and the masked words a few hundred bytes.
-        let name = &name.as_bytes()[..name.len().min(255)];
-        r.push(name.len() as u8);
-        r.extend_from_slice(name);
-        let words = &words.as_bytes()[..words.len().min(0xFFFF)];
-        r.extend_from_slice(&(words.len() as u16).to_le_bytes());
-        r.extend_from_slice(words);
-        r
-    }
-
-    /// A frame to every fleet device heard in the last two minutes (as the pings go), and to `extra` (a newcomer's address) once.
-    fn push_to_fleet(&mut self, frame: Vec<u8>, extra: Option<Addr>) {
-        let t = now_us();
-        let mut to: Vec<Addr> = self.sponsors.iter().filter(|s| t - s.heard_us < 120_000_000).map(|s| s.addr).collect();
-        if let Some(a) = extra {
-            if !to.iter().any(|x| x.fam == a.fam && x.ip == a.ip && x.port == a.port) {
-                to.push(a);
-            }
-        }
-        for a in to {
-            let out = self.pt.send(a, frame.clone(), now_us(), eagle());
-            self.send_all(out);
-        }
-    }
-
-    /// The newcomer's address on this network, if its request came over the LAN.
-    fn newcomer_addr(&self, key: &[u8; 32]) -> Option<Addr> {
-        self.lan_from.iter().find(|(k, _, _)| k == key).map(|(_, a, _)| *a)
-    }
-
-    fn add_failed(&mut self, why: &str) {
-        self.log.put(b"fgtw: adding a device failed: ");
-        self.log.put(why.as_bytes());
-        self.log.line();
-        self.adding.note.clear();
-        self.adding.note.push_str(why);
-        self.adding.phase = ADD_FAILED;
-    }
-
-    /// The Add for the picked request (fgtw::sponsor::bind_device_held), signed here on the X3: appended to the chain held (refreshed from the seed when it answers), held, mirrored to the seed, kept, and handed to the fleet and the newcomer. A words or tap pick grows the fan-out next; a nearby pick waits for the confirm.
-    fn bind_picked(&mut self) {
-        let Some((req, how)) = self.adding.picked.take() else { return };
-        let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
-        // Nothing is written without the key to hand over after it (`open_add` refuses the flow; this holds for any path into a bind).
-        if self.fleet_key.is_none() {
-            self.add_failed("this device does not hold the fleet key, so it cannot add devices");
-            return;
-        }
-        let key = req.device_pubkey;
-        if fgtw::sponsor::plate_locked(&self.held, &hp, &req) {
-            self.add_failed("this is a device you locked out");
-            return;
-        }
-        self.log.put(b"fgtw: adding ");
-        self.log.put(fgtw::pair::device_name_default(&key, &seed).as_bytes());
-        self.log.put(b" (");
-        self.log.fp(&key);
-        self.log.put(b") to the fleet: ");
-        self.log.put(how.as_bytes());
-        self.log.line();
-        let t0 = now();
-        ferros_sys::pin(ferros_sys::CORES_BIG);
-        ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000);
-        fgtw::set_clock(eagle());
-        let r = {
-            let s = self.seed();
-            let r = fgtw::sponsor::bind_device_held(&s, &self.held, &self.keys, &hp, &req);
-            self.seed_ip = s.ip.get();
-            r
-        };
-        ferros_sys::pin(0);
-        let blob = match r {
-            Ok(b) => b,
-            Err(e) => {
-                self.add_failed(&e);
-                return;
-            }
-        };
-        let Ok(bytes) = blob.to_vsf_bytes() else {
-            self.add_failed("the extended chain did not encode");
-            return;
-        };
-        self.log.put(b"fgtw: the Add is in the chain (");
-        self.log.dec(blob.ops.len() as u64);
-        self.log.put(b" ops) in ");
-        self.log.dec(ferros_sys::us_since(t0) / 1000);
-        self.log.put(b" ms: handing it to the fleet and the newcomer");
-        self.log.line();
-        self.note_members(&blob);
-        self.persist_set(b"chain", &bytes);
-        self.adding.bound = Some(key);
-        match fgtw::protocol::fleet_resp(&hp, &bytes, &self.keys, eagle()) {
-            Ok(frame) => {
-                let to = self.newcomer_addr(&key);
-                self.push_to_fleet(frame, to);
-            }
-            Err(e) => {
-                self.log.put(b"fgtw: the chain frame did not build: ");
-                self.log.put(e.as_bytes());
-                self.log.line();
-            }
-        }
-        // The key follows at once: the words matched, or the person pressed Add on a selected device (one act since 2026-11-10; a pick no longer binds).
-        self.adding.note.clear();
-        self.adding.confirm = true;
-        self.adding.phase = ADD_GROWING;
-    }
-
-    /// A device selected (the Fleet page's button on a nearby row; an NFC tap adds at once instead): nothing is written to the chain. The fleet's chain and a `bind_select` go to it over this network (it turns green on the select, checking our key against the chain), and the page shows Add, which binds and grows as one act. With no address for it on this network it is told nothing (ferros has no relay): it stays dark, and the person presses Back and types its words.
-    fn select(&mut self, req: fgtw::fleet::BindRequest, by: &str) {
-        let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
-        let key = req.device_pubkey;
-        if fgtw::sponsor::plate_locked(&self.held, &hp, &req) {
-            self.add_failed("this is a device you locked out");
-            return;
-        }
-        self.log.put(b"fgtw: selected ");
-        self.log.put(fgtw::pair::device_name_default(&key, &seed).as_bytes());
-        self.log.put(b" (");
-        self.log.fp(&key);
-        self.log.put(b") by ");
-        self.log.put(by.as_bytes());
-        self.log.put(b": nothing bound, Add binds it");
-        self.log.line();
-        self.adding.selected = Some(req);
-        self.adding.note.clear();
-        self.adding.phase = ADD_SELECTED;
-        let Some(to) = self.newcomer_addr(&key) else {
-            self.log.put(b"fgtw: the selected device has no address on this network: it is not told (no relay here)");
-            self.log.line();
-            return;
-        };
-        let t = eagle();
-        // The chain first, so the select's sender is a member of a chain the newcomer already has (it holds a select that comes first until a chain arrives).
-        if let Some(chain) = self.store_get_whole(b"chain") {
-            if let Ok(frame) = fgtw::protocol::fleet_resp(&hp, &chain, &self.keys, t) {
-                let out = self.pt.send(to, frame, now_us(), t);
-                self.send_all(out);
-            }
-        }
-        match fgtw::protocol::bind_select(&hp, &key, &self.keys, t) {
-            Ok(frame) => {
-                let out = self.pt.send(to, frame, now_us(), t);
-                self.send_all(out);
-            }
-            Err(e) => {
-                self.log.put(b"fgtw: the select did not build: ");
-                self.log.put(e.as_bytes());
-                self.log.line();
-            }
-        }
-    }
-
-    /// The newcomer's key: the fan-out grown to the chain's members under the SAME fleet key (fgtw::held::fanout_grow_held), held, mirrored to the seed, and handed to the newcomer and the fleet.
-    fn grow_for_newcomer(&mut self) {
-        self.adding.confirm = false;
-        let (Some(hp), Some(seed), Some(key)) = (self.hp, self.identity_seed, self.fleet_key) else {
-            self.add_failed("this device does not hold the fleet key");
-            return;
-        };
-        let members = self.members.clone();
-        ferros_sys::pin(ferros_sys::CORES_BIG);
-        ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000);
-        fgtw::set_clock(eagle());
-        let r = {
-            let s = self.seed();
-            let r = fgtw::held::fanout_grow_held(&s, &self.held_fan, &hp, &self.keys, &key, &members, &seed);
-            self.seed_ip = s.ip.get();
-            r
-        };
-        ferros_sys::pin(0);
-        let (revision, blob) = match r {
-            Ok(x) => x,
-            Err(e) => {
-                self.add_failed(&e);
-                return;
-            }
-        };
-        self.log.put(b"fgtw: the fan-out grown to revision ");
-        self.log.dec(revision);
-        self.log.put(b" for ");
-        self.log.dec(members.len() as u64);
-        self.log.put(b" devices: handing it to the newcomer and the fleet");
-        self.log.line();
-        match fgtw::protocol::fanout_resp(&hp, &blob, &self.keys, eagle()) {
-            Ok(frame) => {
-                let to = self.adding.bound.and_then(|k| self.newcomer_addr(&k));
-                self.push_to_fleet(frame, to);
-            }
-            Err(e) => {
-                self.log.put(b"fgtw: the fan-out frame did not build: ");
-                self.log.put(e.as_bytes());
-                self.log.line();
-            }
-        }
-        // The newcomer is a member now: its request is done with.
-        if let Some(k) = self.adding.bound {
-            self.lan_reqs.retain(|r| r.device_pubkey != k);
-            self.adding.registry.retain(|r| r.device_pubkey != k);
-            self.rebuild_candidates();
-        }
-        self.adding.note.clear();
-        self.adding.note.push_str("added");
-        self.adding.phase = ADD_DONE;
-    }
-
-    /// The radios listening: the NFC driver reading a tapped device's tag (op 4 on, op 5 off) while the add flow is open or a fleet device's departure waits here, the Bluetooth driver scanning for pairing beacons (op 3 on, op 4 off) while the add flow is open. CALL_LIVE: a driver that is down fails at once.
+    /// The radios listening: the NFC driver reading a tapped device's tag (op 4 on, op 5 off) while the add machine wants it or a fleet device's departure waits here, the Bluetooth driver scanning for pairing beacons (op 3 on, op 4 off) while the add machine wants it. CALL_LIVE: a driver that is down fails at once.
     fn sponsor_radios(&mut self, on: (bool, bool)) {
         let (nfc, bt) = (cap(unsafe { GRANTS }, S_NFC), cap(unsafe { GRANTS }, S_BT));
         let (mut ra, mut rb) = ([0u8; 4], [0u8; 4]);
@@ -2275,28 +1859,23 @@ impl Client {
         self.log.line();
     }
 
-    /// What the radios heard: the Bluetooth driver's pairing beacons (op 5: [count][count × 16 bytes]) and the NFC driver's last tag read (op 6: [32 bytes] once, then nothing). A tag whose secret opens a candidate's commitment picks it, its key following at once (Photon's tap).
-    /// A tag whose secret is the salt of the departure asked about here approves it (fgtw's machine, `NfcRead`). `on` is what listens: (the NFC reader, the BLE scan).
+
+    /// What the radios heard: the Bluetooth driver's pairing beacons (op 5: [count][count × 16 bytes], every id heard in its last 30 s) and the NFC driver's last tag read (op 6: [32 bytes] once, then nothing). `on` is what listens: (the NFC reader, the BLE scan).
+    /// A tag whose secret is the salt of the departure asked about here approves it (the departure machine's `NfcRead`); any other tag read while the add machine listens goes to it, which adds the device whose request it opens.
     fn sponsor_hear(&mut self, on: (bool, bool)) {
         let (nfc, bt) = (cap(unsafe { GRANTS }, S_NFC), cap(unsafe { GRANTS }, S_BT));
         let mut r = [0u8; 1 + 16 * fgtw::pair::BEACON_UUID_LEN];
         let n = if on.1 { ferros_sys::call_live(bt, &[5], &mut r) } else { ERR };
-        let mut changed = false;
         if n != ERR && n >= 1 {
             // WHY: the count is the driver's word, and the reply's length may run past this buffer (it says what was sent): only the ids both hold are read.
             let k = (r[0] as usize).min((n as usize - 1) / fgtw::pair::BEACON_UUID_LEN).min(16);
-            let t = now_us();
+            let mut ids = Vec::with_capacity(k);
             for i in 0..k {
                 let mut u = [0u8; fgtw::pair::BEACON_UUID_LEN];
                 u.copy_from_slice(&r[1 + i * fgtw::pair::BEACON_UUID_LEN..1 + (i + 1) * fgtw::pair::BEACON_UUID_LEN]);
-                match self.ble_heard.iter_mut().find(|(x, _)| *x == u) {
-                    Some(e) => e.1 = t,
-                    None => {
-                        self.ble_heard.push((u, t));
-                        changed = true;
-                    }
-                }
+                ids.push(u);
             }
+            self.add_ble(ids);
         }
         let mut s = [0u8; 32];
         if on.0 && ferros_sys::call_live(nfc, &[6], &mut s) == 32 {
@@ -2305,42 +1884,17 @@ impl Client {
                 self.log.put(b"fgtw: a tapped device's tag is the departure asked about here: approving it");
                 self.log.line();
                 self.depart_event(fgtw::flow::Event::NfcRead { secret: s });
-            } else if on.1 {
-                self.nfc_newcomer(&s);
-            }
-        }
-        if changed {
-            self.rebuild_candidates();
-        }
-    }
-
-    /// A tag read while the add flow is open: a secret that opens a candidate's commitment picks it, its key following at once (Photon's tap).
-    fn nfc_newcomer(&mut self, s: &[u8; 32]) {
-        match fgtw::sponsor::nfc_match(s, &self.adding.cands) {
-            // NFC adds at once (owner, 2026-11-10: "Touch on screen ... required for BLE OR no touch on screen, just physical proximity (NFC). Both of which need the fleet page open"): the device held within a few centimetres, its tag's secret opening its request's commitment, the Fleet page open here and the newcomer attested is the whole consent. Bound and grown as one act, as Add does. A device picked on the screen still selects, turns green, and waits for Add.
-            Some(i) if matches!(self.adding.phase, ADD_OPEN | ADD_SELECTED) => {
-                self.log.put(b"fgtw: a tapped device's tag matches ");
-                self.log.put(self.adding.cands[i].name.as_bytes());
-                self.log.put(b": adding it");
-                self.log.line();
-                self.adding.selected = None;
-                self.adding.picked = Some((self.adding.cands[i].req.clone(), "an NFC tap"));
-                self.adding.phase = ADD_BINDING;
-            }
-            Some(_) => {}
-            None => {
-                self.log.put(b"fgtw: a tapped tag's secret matches no device asking to join (a stale request, or not a newcomer's)");
-                self.log.line();
+            } else if self.add.radios.0 {
+                self.add_nfc(s);
             }
         }
     }
 
-    /// The sponsor's work, once a pass of the loop: the registry listed every 8 s while the add flow is open, the radios listening while it is (the NFC reader also while a fleet device's departure waits here), a pick bound, a confirm grown.
-    fn sponsor_step(&mut self, t: u64) {
-        // Listening (NFC reader, BLE scan, the registry's list) only while the add flow is open for a member holding the fleet key: never on a failed or finished flow. The NFC reader also while a departure is asked about here, so a tap of the leaving device (its tag serves the request's salt) approves it.
-        let open = matches!(self.adding.phase, ADD_OPEN | ADD_SELECTED | ADD_BINDING | ADD_GROWING) && self.bound && self.fleet_key.is_some();
+    /// The sponsor's turn, once a pass of the loop: the radios as the add machine and a departure asked about here want them, what they heard, the add machine's deadline, and its slow work.
+    fn sponsor_step(&mut self) {
+        // The NFC reader also while a departure is asked about here, so a tap of the leaving device (its tag serves the request's salt) approves it.
         let asked = self.bound && self.depart_asked().is_some();
-        let on = (open || asked, open);
+        let on = (self.add.radios.0 || asked, self.add.radios.1);
         self.listen_pass += 1;
         if on != self.listening || (on != (false, false) && self.listen_pass >= 64) {
             self.sponsor_radios(on);
@@ -2348,42 +1902,8 @@ impl Client {
         if on != (false, false) {
             self.sponsor_hear(on);
         }
-        if self.adding.phase == ADD_OPEN && self.net_up && t - self.adding.listed_us >= 8_000_000 {
-            self.adding.listed_us = t;
-            if let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) {
-                fgtw::set_clock(eagle());
-                let r = {
-                    let s = self.seed();
-                    let r = fgtw::client::bindreq_list(&s, &self.keys, &hp, &seed);
-                    self.seed_ip = s.ip.get();
-                    r
-                };
-                match r {
-                    Ok(reqs) => {
-                        self.seed_heard_us = now_us();
-                        if reqs.len() != self.adding.registry.len() {
-                            self.log.put(b"fgtw: fgtw.org's registry lists ");
-                            self.log.dec(reqs.len() as u64);
-                            self.log.put(b" device(s) asking to join");
-                            self.log.line();
-                        }
-                        self.adding.registry = reqs;
-                        self.rebuild_candidates();
-                    }
-                    Err(e) => {
-                        self.log.put(b"fgtw: the registry's list failed: ");
-                        self.log.put(e.as_bytes());
-                        self.log.line();
-                    }
-                }
-            }
-        }
-        if self.adding.phase == ADD_BINDING && self.adding.picked.is_some() {
-            self.bind_picked();
-        }
-        if self.adding.phase == ADD_GROWING && self.adding.confirm {
-            self.grow_for_newcomer();
-        }
+        self.add_wake_check();
+        self.add_work();
     }
 }
 
@@ -2424,7 +1944,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), adding: Adding::new(), lan_reqs: Vec::new(), lan_from: Vec::new(), ble_heard: Vec::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), ble_said: (0, 0), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0 };
     c.run()
 }
 
