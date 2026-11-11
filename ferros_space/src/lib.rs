@@ -25,7 +25,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use ferros_kist::{Kist, Kists, Want, RIGHTS};
+use ferros_kist::{Kist, Kists, RIGHTS};
 use fgtw::space::{reconcile, Baseline, Entry, Fact, Space, Write};
 use vsf::VsfType;
 
@@ -322,14 +322,25 @@ fn ints_of<const N: usize>(v: &[VsfType]) -> Option<[i64; N]> {
 
 // ── The device's copy as facts, and back ──
 
-/// A kist's fact value: its capsule, name, and wants in slot order (each right and the developer's reason).
+/// A kist's fact value: its capsule, name, and wants in slot order (each right and the developer's reason), then where its capsule was fetched from when the installer fetched it (`nu`, last: a reader from before 2026-11-10 takes no URL for a name or a reason and skips it).
 fn kist_value(k: &Kist) -> Vec<VsfType> {
     let mut v = vec![VsfType::hb(k.capsule.to_vec()), VsfType::a(vsf::Ascii::checked("name", k.name.clone()))];
     for w in &k.wants {
         v.push(VsfType::u(w.right as usize, false));
         v.push(VsfType::a(vsf::Ascii::checked("reason", w.reason.clone())));
     }
+    if let Some(u) = &k.source {
+        v.push(VsfType::nu(u.clone()));
+    }
     v
+}
+
+/// Where a kist fact's capsule was fetched from, if it says.
+fn source_of(v: &[VsfType]) -> Option<String> {
+    v.iter().find_map(|x| match x {
+        VsfType::nu(u) => Some(u.clone()),
+        _ => None,
+    })
 }
 
 /// A kist fact's value read back: (capsule, name, wants), each value by its type marker and the wants as (right, reason) pairs in order.
@@ -367,7 +378,8 @@ fn label_of<'a>(list: &'a Kists, c: &Circle) -> Option<&'a str> {
 fn snapshot(list: &Kists, store: &mut impl Store, scope: &[u8; 32]) -> Result<Vec<Fact>, ()> {
     let mut facts = Vec::new();
     for k in &list.kists {
-        facts.push(Fact { kind: kind::KIST, id: kist_id(&k.developer, &k.option), value: kist_value(k), stamp: None });
+        // Stamped with when it was installed: an install after an uninstall (here or on another device) is newer than the uninstall's tombstone and wins it; with no stamp the tombstone took it straight back out.
+        facts.push(Fact { kind: kind::KIST, id: kist_id(&k.developer, &k.option), value: kist_value(k), stamp: (k.installed != 0).then_some(k.installed) });
         for w in &k.wants {
             if let Some((granted, when)) = w.answer {
                 facts.push(Fact { kind: kind::ANSWER, id: answer_id(&k.developer, &k.option, w.right), value: vec![VsfType::u(granted as usize, false)], stamp: Some(when) });
@@ -422,29 +434,26 @@ fn apply(w: Write, list: &mut Kists, list_changed: &mut bool, store: &mut impl S
         Write::Set { kind: kind::KIST, id, value, .. } => {
             let (Some(d), Some(o), Some((capsule, name, wants))) = (id.first().and_then(k32), id.get(1).and_then(k32), kist_of(&value)) else { return true };
             let old = list.kists.iter().position(|k| k.developer == d && k.option == o);
-            let answers = |r: u8| old.and_then(|i| list.kists[i].wants.iter().find(|w| w.right == r)).and_then(|w| w.answer);
-            let wants: Vec<Want> = wants.into_iter().map(|(right, reason)| Want { right, reason, answer: answers(right) }).collect();
-            match old {
-                Some(i) => {
-                    // A kist renamed on another device: its circle's kept place moves with its label.
-                    if list.kists[i].name != name {
-                        let (from, to) = (place_key(&list.kists[i].name), place_key(&name));
-                        if let Ok(Some(p)) = store.get(Scope::Map, &from) {
-                            if !store.set(Scope::Map, &to, &p) || !store.remove(Scope::Map, &from) {
-                                return false;
-                            }
-                        }
+            // A kist renamed on another device: its circle's kept place moves with its label.
+            if let Some(i) = old.filter(|&i| list.kists[i].name != name) {
+                let (from, to) = (place_key(&list.kists[i].name), place_key(&name));
+                if let Ok(Some(p)) = store.get(Scope::Map, &from) {
+                    if !store.set(Scope::Map, &to, &p) || !store.remove(Scope::Map, &from) {
+                        return false;
                     }
-                    list.kists[i] = Kist { capsule, developer: d, option: o, name, wants };
                 }
-                None => list.kists.push(Kist { capsule, developer: d, option: o, name, wants }),
             }
+            // The answers it had here, or kept from an uninstall here (Kists::install); its source the space's. Its install time stays this device's own (none for a kist that only arrived): the stamp matters only to an install made here, which sets it.
+            let decl = ferros_kist::Decl { name, wants };
+            let i = list.install(capsule, d, o, &decl);
+            list.kists[i].source = source_of(&value);
             *list_changed = true;
             true
         }
         Write::Remove { kind: kind::KIST, id } => {
             let (Some(d), Some(o)) = (id.first().and_then(k32), id.get(1).and_then(k32)) else { return true };
-            list.kists.retain(|k| !(k.developer == d && k.option == o));
+            // Uninstalled on another device: gone from this list too, its answers kept here for an install again (Kists::remove).
+            list.remove(&d, &o);
             *list_changed = true;
             true
         }
@@ -689,6 +698,55 @@ mod tests {
         let (mut sr, mut br) = (hand_over(&sb), Baseline::default());
         sync(&mut sr, &mut br, &mut reset, &OTHER, 2800).unwrap();
         assert_eq!(reset.map, b.map);
+    }
+
+    /// Uninstalled on one device: gone from the other too, the answers kept on both and in the space; installed again later (the installer stamps when), it wins over the uninstall's tombstone and asks nothing anywhere. Its source travels with it.
+    #[test]
+    fn an_uninstall_travels_and_an_install_again_asks_nothing() {
+        let mut a = arranged_pro();
+        let (mut sa, mut ba) = (Space::new(), Baseline::default());
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2000).unwrap();
+        let mut b = Vault::default();
+        let (mut sb, mut bb) = (sa.clone(), Baseline::default());
+        sync(&mut sb, &mut bb, &mut b, &OTHER, 2100).unwrap();
+        // The Pro uninstalls Photon.
+        let mut la = read_list(&mut a).unwrap();
+        assert!(la.remove(&PHOTON.0, &PHOTON.1).is_some());
+        a.set(Scope::Kists, ferros_kist::LIST, &la.build(2200).unwrap());
+        assert!(sync(&mut sa, &mut ba, &mut a, &PRO, 2201).unwrap().space_changed);
+        sb.merge(hand_over(&sa));
+        sync(&mut sb, &mut bb, &mut b, &OTHER, 2300).unwrap();
+        let lb = read_list(&mut b).unwrap();
+        assert!(lb.by_identity(&PHOTON.0, &PHOTON.1).is_none(), "gone on the other device");
+        assert_eq!(lb.kept.len(), 1, "its answers kept there");
+        assert!(sa.live(kind::ANSWER).any(|e| e.id.first().and_then(k32) == Some(PHOTON.0)), "and in the space");
+        // Installed again on the Pro from the directory, after the uninstall: a newer capsule, its source, its install time.
+        let mut la = read_list(&mut a).unwrap();
+        let p = la.install([0xB2; 32], PHOTON.0, PHOTON.1, &decl("Photon", &[(0, "to draw"), (7, "to reach your friends")]));
+        assert!(!la.kists[p].unanswered(), "its answers back from the kept ones");
+        la.kists[p].source = Some(String::from("http://kists.fgtw.org/capsules/b2.vsf"));
+        la.kists[p].installed = 2400;
+        a.set(Scope::Kists, ferros_kist::LIST, &la.build(2400).unwrap());
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2401).unwrap();
+        assert!(read_list(&mut a).unwrap().by_identity(&PHOTON.0, &PHOTON.1).is_some(), "not taken back out by the tombstone");
+        sb.merge(hand_over(&sa));
+        sync(&mut sb, &mut bb, &mut b, &OTHER, 2500).unwrap();
+        let lb = read_list(&mut b).unwrap();
+        let k = lb.by_identity(&PHOTON.0, &PHOTON.1).expect("back on the other device");
+        assert_eq!(k.capsule, [0xB2; 32]);
+        assert_eq!(k.source.as_deref(), Some("http://kists.fgtw.org/capsules/b2.vsf"));
+        assert!(!k.unanswered(), "nothing asked on the other device either");
+        assert!(lb.kept.is_empty());
+        // A fresh device restored from the space: the source comes with the list, for its restore to fetch from.
+        let mut fresh = Vault::default();
+        let (mut sf, mut bf) = (hand_over(&sa), Baseline::default());
+        sync(&mut sf, &mut bf, &mut fresh, &FRESH, 2600).unwrap();
+        let lf = read_list(&mut fresh).unwrap();
+        assert_eq!(lf.by_identity(&PHOTON.0, &PHOTON.1).and_then(|k| k.source.clone()).as_deref(), Some("http://kists.fgtw.org/capsules/b2.vsf"));
+        assert_eq!(missing_capsules(&lf, |c| *c == [0xA1; 32]), vec![[0xB2; 32]]);
+        // Settled on every device.
+        assert_eq!(sync(&mut sa, &mut ba, &mut a, &PRO, 2700).unwrap().wrote, 0);
+        assert_eq!(sync(&mut sb, &mut bb, &mut b, &OTHER, 2700).unwrap().wrote, 0);
     }
 
     /// A vault that will not read (nobody present) syncs nothing and removes nothing.

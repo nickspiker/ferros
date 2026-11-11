@@ -12,6 +12,7 @@
 //!   51 the vault scope `ahau.`, 52 use rmnet (the cellular link, the IP process's second), 53 serve rmnet, 54-68 the modem's hardware, 69-71 its shared memory, 72-76 its partitions (payloads/modem).
 //!   77-79 the NFC driver's, 80 use nfc, 81-83 the Bluetooth driver's, 84 use bt, 85 the identity unlock right, 86-90 the USB driver's (registers, DMA, interrupt, PT commands, power). 91 the touch controller's power. 92-96 the sensors process's (the AoC's IPC block and mailboxes, the vault scope `aoc.`, the Sensors right, its switch).
 //!   104 the Kists right (launching a kist with exactly its granted rights, KISTS.md), 105 serve launch, 106 use launch (the map's), 107 the vault scope `kists.` (the person's list); 104-108 were the GPU service's, which the kernel starts itself since 2026-11-08.
+//!   108 use kists (the map's: the installer, payloads/kists, which the kernel starts itself with its own grants once a person has attested, as it does GPS).
 #![no_std]
 #![no_main]
 
@@ -64,7 +65,7 @@ const SHELL: [(&[u8], &[u8], &[u64]); 12] = [
     (b"modem", b"modem", &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 40, 69, 70, 71, 72, 73, 74, 75, 76]),
     // What reads the person's space (the identity class), each when it may (`wait_person`). fgtw, the identity service, once an identity is unlocked: it is part of attest, looking the identity up and joining its fleet (its chain and key; not the Photon app, which a person installs): 1 use udp, 2 the vault scope `fgtw.`, 3 the ira key, 4 serve fgtw, 5 entropy (the fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right, 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space, joined to their fleet's: payloads/fgtw space.rs). The map only once the device is also bound to that identity (owner, 2026-11-04: "if it's not attached to an identity, not usable"): its arrangement, 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page).
     (b"fgtw", b"fgtw", &[50, 48, 49, 46, 41, 80, 84, 85, 20, 107]),
-    (b"map", b"map", &[17, 18, 19, 20, 47, 107, 106]),
+    (b"map", b"map", &[17, 18, 19, 20, 47, 107, 106, 108]),
 ];
 
 #[unsafe(no_mangle)]

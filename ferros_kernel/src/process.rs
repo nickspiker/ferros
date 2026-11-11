@@ -388,6 +388,8 @@ pub enum Object {
     Domain,
     /// Served by the kernel: the right to launch a kist (KISTS.md): `SYS_SPAWN` in kist mode, naming a capsule by its vault address and handing each declared want its right or an empty slot. The kernel makes each right's object itself (`kist_object`), so the holder needs no other grant to hand out; it holds every right a kist may be handed, and is init's alone.
     Kists,
+    /// Served by the kernel: the right to install a kist (SANDBOX.md "Lifecycle"): `SYS_SPAWN` in install mode names a capsule the holder stored in `capsules.`, and the kernel reads it from the vault, gates it, runs the sandbox checker over its masked code and seals it into the `sealed` list, telling the holder each stage on a word in its own arc (`install_request`). The installer's (payloads/kists), never a kist's.
+    Install,
     /// A slot left empty: a want the person said no to (owner, 2026-11-08: "a denied right is an empty slot, never a fake"). Its token is zeros and nothing looks it up.
     Empty,
 }
@@ -436,6 +438,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Domain => (19, 0),
         Object::Kists => (20, 0),
         Object::Empty => (21, 0),
+        Object::Install => (22, 0),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -2873,6 +2876,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
+        // Install mode (x2 bit 3): a kist the installer stored, read, checked and sealed by the service loop (`install_request`).
+        SYS_SPAWN if f.x[2] & 8 != 0 => {
+            f.x[0] = install_request(p, pi, &p.read(f.x[0], (f.x[1] as usize).min(4096)));
+            0
+        }
         SYS_SPAWN if f.x[2] & 2 != 0 => {
             f.x[0] = kist_request(p, &p.read(f.x[0], (f.x[1] as usize).min(4096)), f.x[2] & 4 != 0);
             0
@@ -3622,6 +3630,8 @@ pub enum Grant<'a> {
     Domain,
     /// The right to launch kists (`Object::Kists`): init's.
     Kists,
+    /// The right to install kists (`Object::Install`): the installer's (payloads/kists).
+    Install,
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -3809,10 +3819,11 @@ pub fn kist_done() {
     with_lock(|| unsafe { (*(&raw mut KIST_STARTING)).clear() });
 }
 
-/// Where a native capsule's code lies inside it, from its `aarch64` section's table entry: the byte vector's offset and length, which must end within the capsule's `whole` length (the gate checks the framing again over the signed bytes). Needs only the header and the section's first bytes.
-pub fn locate_code(capsule: &[u8], whole: usize) -> Result<(usize, usize), &'static str> {
+/// Where a capsule's code lies inside it, from its `masked` section's table entry (sandboxed code, SANDBOX.md) or else its `aarch64` one (native, development only): the byte vector's offset and length, which must end within the capsule's `whole` length (the gate checks the framing again over the signed bytes), and whether it is masked. Needs only the header and the section's first bytes.
+pub fn locate_code(capsule: &[u8], whole: usize) -> Result<(usize, usize, bool), &'static str> {
     let (header, _) = vsf::file_format::VsfHeader::decode(capsule).map_err(|_| "kist: the capsule's header does not decode")?;
-    let entry = header.fields.iter().find(|f| f.name == "aarch64").ok_or("kist: no native code section (a masked kist is not launched from the vault yet)")?;
+    let masked = header.fields.iter().any(|f| f.name == "masked");
+    let entry = header.fields.iter().find(|f| f.name == if masked { "masked" } else { "aarch64" }).ok_or("kist: no code section")?;
     let from = entry.offset_bytes;
     // WHY the window: the code's `vb` marker sits within the section's first bytes (its bracket, the field's name and colon); the bound keeps a capsule whose table points past its end from reading past it.
     for p in from..(from + 64).min(capsule.len().saturating_sub(2)) {
@@ -3821,7 +3832,7 @@ pub fn locate_code(capsule: &[u8], whole: usize) -> Result<(usize, usize), &'sta
             if let Ok(bits) = vsf::ewe::read_uint::<u64>(capsule, &mut q) {
                 let len = (bits >> 3) as usize;
                 if bits & 7 == 0 && len > 0 && q + len <= whole {
-                    return Ok((q, len));
+                    return Ok((q, len, masked));
                 }
             }
         }
@@ -3831,7 +3842,7 @@ pub fn locate_code(capsule: &[u8], whole: usize) -> Result<(usize, usize), &'sta
 
 /// The arc a kist's capsule needs, from its first bytes (`head`: the header, the declaration and the start of its code) and its whole length: the capsule staged at the code offset, or the code with its zeroed tail (`image_tail`), whichever is more, the entry stack and the room a streamed spawn leaves (the bridge's 64 KiB).
 pub fn kist_need(head: &[u8], total: usize) -> Result<usize, &'static str> {
-    let (co, cl) = locate_code(head, total)?;
+    let (co, cl, _) = locate_code(head, total)?;
     if co + 56 > head.len() {
         return Err("kist: the code's header is past the first bytes read");
     }
@@ -3842,12 +3853,26 @@ pub fn kist_need(head: &[u8], total: usize) -> Result<usize, &'static str> {
     Ok(CODE + total.max(cl + tail) + STACK + (1 << 16))
 }
 
-/// A kist whose capsule the service loop streamed from the vault into `arc` at the code offset (`total` bytes): it must be the capsule named (its blake3 is its vault address), pass the gate where it lies, and declare every right handed to it in the slot it is handed in (`ferros_kist::want_codes`: nothing undeclared can be granted). Then the code moves down, the rest is zeroed, and the process is built with exactly the launch's objects, queued to run. On any refusal the arc goes back to the pool.
-pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize) -> Result<(), &'static str> {
+/// Whether a kist's capsule carries masked code, from its first bytes (its header's table names the section): its arc is then taken masked, with the guard above it (SANDBOX.md "Placement and guards").
+pub fn kist_masked(head: &[u8], total: usize) -> bool {
+    locate_code(head, total).is_ok_and(|c| c.2)
+}
+
+/// A masked kist's code where it lies in its staged capsule, gated, its modes read and its seal found in `sealed` (32-byte entries): SANDBOX.md's "spawn runs only sealed images", one BLAKE3 over the image and no checker. Returns the developer's key and identity for the ihi, and the modes.
+fn kist_sealed(capsule: &mut [u8], co: usize, cl: usize, sealed: &[u8]) -> Result<(crate::oracle::Located, crate::oracle::Modes), &'static str> {
+    let g = crate::oracle::gate_located(capsule, co, cl)?;
+    let m = crate::oracle::masked_modes(capsule, co, cl)?;
+    let s = crate::oracle::seal_parts(&g.developer_pubkey, &g.hp, true, &m, &capsule[co..co + cl]).ok_or("no system secret: cannot check a seal")?;
+    if !sealed.chunks_exact(32).any(|e| e == s) {
+        return Err("gate: masked kist not installed on this device (no seal)");
+    }
+    Ok((g, m))
+}
+
+/// A kist whose capsule the service loop streamed from the vault into `arc` at the code offset (`total` bytes): it must be the capsule named (its blake3 is its vault address), pass the gate where it lies, and declare every right handed to it in the slot it is handed in (`ferros_kist::want_codes`: nothing undeclared can be granted). Masked code runs only with its seal in `sealed` (the installer's, `install_kist`), the checker never run again; native code only in a development build (the bridge's `kist install`). Then the code moves down, the rest is zeroed, and the process is built with exactly the launch's objects, queued to run. On any refusal the arc goes back to the pool.
+pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Result<(), &'static str> {
+    let mut arc = arc;
     let r = (|| {
-        if cfg!(ferros_production) {
-            return Err("gate: production refuses unmasked native code");
-        }
         if CODE + total + STACK > arc.size {
             return Err("kist: the capsule does not fit its arc");
         }
@@ -3859,21 +3884,45 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize) -> Result<(), &'static
         if wants.len() != l.codes.len() || wants.iter().zip(&l.codes).any(|(&w, &c)| c != ferros_kist::EMPTY && c != w) {
             return Err("kist: a right the capsule does not declare in that slot");
         }
-        let (co, cl) = locate_code(capsule, total)?;
-        let g = crate::oracle::gate_located(capsule, co, cl)?;
+        let (co, cl, masked) = locate_code(capsule, total)?;
+        let (g, modes) = if masked {
+            let (g, m) = kist_sealed(capsule, co, cl, sealed)?;
+            (g, Some(m))
+        } else {
+            if cfg!(ferros_production) {
+                return Err("gate: production refuses unmasked native code");
+            }
+            (crate::oracle::gate_located(capsule, co, cl)?, None)
+        };
+        // A masked arc is the one its code was checked for: fixed mode's exactly 2^K, which a staged capsule's arc is not (it holds the whole capsule first).
+        if modes.as_ref().is_some_and(|m| m.fixed != 0 && arc.size != 1 << m.fixed) {
+            return Err("kist: a fixed-mode kist is not launched from the vault yet (its arc must be exactly the sealed size)");
+        }
+        if masked != (arc.guard != 0) {
+            return Err("kist: the staged arc's kind is not the code's (masked or native)");
+        }
         let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
         unsafe {
             core::ptr::copy((arc.base + CODE + co) as *const u8, (arc.base + CODE) as *mut u8, cl);
             core::ptr::write_bytes((arc.base + CODE + cl) as *mut u8, 0, total - cl);
         }
-        Ok((ihi, cl))
+        Ok((ihi, cl, modes))
     })();
-    let (ihi, cl) = match r {
+    let (ihi, cl, modes) = match r {
         Ok(x) => x,
         Err(e) => {
             with_lock(|| arc_free(arc));
             return Err(e);
         }
+    };
+    // Exact mode: the limit is what the image needs, as `build` sets it (the staged capsule's rest, past it, was zeroed above).
+    if modes.as_ref().is_some_and(|m| m.exact) {
+        let tail = image_tail(unsafe { core::slice::from_raw_parts((arc.base + CODE) as *const u8, cl) });
+        arc.limit = (CODE + cl + tail + STACK_GUARD + STACK + 15) & !15;
+    }
+    let (masked, exec_len, bti) = match &modes {
+        Some(m) => (true, m.text_len, m.bti),
+        None => (false, cl, false),
     };
     with_lock(|| {
         let kk = k();
@@ -3883,7 +3932,7 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize) -> Result<(), &'static
         }
         // Every slot's object made here (`kist_object`), the codes checked at the request.
         let objects: Vec<(Object, u32)> = l.codes.iter().filter_map(|&c| kist_object(c)).collect();
-        match build_from(&l.name, arc, cl, b"", &objects, Some(ihi), false, cl, false) {
+        match build_from(&l.name, arc, cl, b"", &objects, Some(ihi), masked, exec_len, bti) {
             Ok((me, _, _)) => {
                 if let Some(q) = th(me).map(|t| t.proc).and_then(|pi| kk.procs.get_mut(pi)).and_then(|q| q.as_mut()) {
                     q.kist = true;
@@ -3896,6 +3945,126 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize) -> Result<(), &'static
                 Err(e)
             }
         }
+    })
+}
+
+/// An install the installer asked for (`install_request`): the capsule by its vault address, and where to tell it each stage: the process (its slot and epoch, so a word is never written into a successor's arc) and the word's address in its arc.
+pub struct KistInstall {
+    pub capsule: [u8; 32],
+    proc: usize,
+    epoch: u64,
+    word: usize,
+}
+/// One install at a time, beside one launch: the service loop streams one capsule through the kernel's channel at once (launches first). Under the kernel lock.
+static mut KIST_INSTALL: Option<KistInstall> = None;
+
+/// The stages an install is told in (bits 56-63 of the word; ferros_sys `install` mirrors them): reading the capsule from the vault (the bytes read so far below), checking its code, sealing it, done (the word's low bits 0), refused (the low byte the reason, `INSTALL_WHY_*`, said on the console too).
+pub const INSTALL_READING: u64 = 0;
+pub const INSTALL_CHECKING: u64 = 1;
+pub const INSTALL_SEALING: u64 = 2;
+pub const INSTALL_DONE: u64 = 3;
+pub const INSTALL_REFUSED: u64 = 4;
+/// Why an install was refused: the vault's capsule is not the one named, its sections do not read, it is native code (a development build: never installed from the network, owner 2026-11-10), its signature does not verify, its masked fields do not read, the checker refused its code, no system secret to seal with, the vault would not keep the seal, the vault could not read it, no arc for it.
+pub const INSTALL_WHY_NOT_NAMED: u64 = 1;
+pub const INSTALL_WHY_SECTIONS: u64 = 2;
+pub const INSTALL_WHY_NATIVE: u64 = 3;
+pub const INSTALL_WHY_SIGNATURE: u64 = 4;
+pub const INSTALL_WHY_MODES: u64 = 5;
+pub const INSTALL_WHY_CHECKER: u64 = 6;
+pub const INSTALL_WHY_SECRET: u64 = 7;
+pub const INSTALL_WHY_KEPT: u64 = 8;
+pub const INSTALL_WHY_READ: u64 = 9;
+pub const INSTALL_WHY_ROOM: u64 = 10;
+
+/// `SYS_SPAWN` in install mode (x2 bit 3): [the capsule's 32-byte address in `capsules.`][the caller's Install token, 32 bytes][the word's offset in its arc, u64 LE]. Queued for the service loop (`install_take`), which reads the capsule from the vault and tells the word each stage, waking whoever waits on it (`install_tell`). 0 queued, ERR refused (the reason on the console): no Install right, a malformed request, another install still under way.
+fn install_request(p: &Process, pi: usize, req: &[u8]) -> u64 {
+    let refuse = |why: &str| {
+        let kk = k();
+        kk.console.extend_from_slice(b"kist install refused: ");
+        kk.console.extend_from_slice(why.as_bytes());
+        kk.console.push(b'\n');
+        ERR
+    };
+    if req.len() < 72 {
+        return refuse("a malformed request");
+    }
+    if !matches!(p.lookup(&req[32..64]).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Install, r)) if r & RIGHT_SEND != 0) {
+        return refuse("the caller holds no Install right");
+    }
+    let slot = unsafe { &mut *(&raw mut KIST_INSTALL) };
+    if slot.is_some() {
+        return refuse("another install is still under way");
+    }
+    let off = u64::from_le_bytes(req[64..72].try_into().unwrap()) as usize;
+    // The word inside the caller's own arc, as `SYS_WAIT` finds it: masked into it and aligned.
+    let word = p.arc.base + (off & p.arc.mask() & !7);
+    *slot = Some(KistInstall { capsule: req[..32].try_into().unwrap(), proc: pi, epoch: p.epoch, word });
+    unsafe { core::arch::asm!("sev") };
+    0
+}
+
+/// The service loop takes the waiting install (after any launch).
+pub fn install_take() -> Option<KistInstall> {
+    with_lock(|| unsafe { (*(&raw mut KIST_INSTALL)).take() })
+}
+
+/// The installer told a stage: `stage` in bits 56-63, `value` below (the bytes read, or the reason), written into its word and every thread of it waiting there woken. Nothing when the process has ended (its slot empty or a successor's).
+pub fn install_tell(i: &KistInstall, stage: u64, value: u64) {
+    with_lock(|| {
+        let kk = k();
+        if !kk.procs.get(i.proc).and_then(|q| q.as_ref()).is_some_and(|q| q.epoch == i.epoch && !q.dying) {
+            return;
+        }
+        unsafe { core::ptr::write_volatile(i.word as *mut u64, stage << 56 | value & ((1 << 56) - 1)) };
+        for (t, x) in kk.threads.iter_mut().enumerate() {
+            if let Some(x) = x {
+                if x.proc == i.proc && matches!(x.state, State::Waiting(a, _) if a == i.word) {
+                    x.state = State::Runnable;
+                    enqueue_back(t);
+                }
+            }
+        }
+    });
+}
+
+/// An install's capsule, read from the vault into `arc` at the code offset (`total` bytes), checked as SANDBOX.md's lifecycle says, once: it is the capsule named (its blake3), its code is masked (native code is a development build, never installed from the network), its signature verifies where it lies (`gate_located`, the Ed25519 egg; the installer checked every egg before it stored it), and the sandbox checker passes its instruction span in its mode. Returns the code's span in the arc, for `install_seal`. The arc is the caller's to free.
+pub fn install_check(arc: &Arc, total: usize, addr: &[u8; 32]) -> Result<(crate::oracle::Located, crate::oracle::Modes, usize, usize), u64> {
+    let capsule = unsafe { core::slice::from_raw_parts_mut((arc.base + CODE) as *mut u8, total) };
+    let say = |why: &str| push_console(alloc::format!("kist install: {why}\n").as_bytes());
+    if blake3::hash(capsule).as_bytes() != addr {
+        say("the vault's capsule is not the one named (its blake3)");
+        return Err(INSTALL_WHY_NOT_NAMED);
+    }
+    let (co, cl, masked) = locate_code(capsule, total).map_err(|e| {
+        say(e);
+        INSTALL_WHY_SECTIONS
+    })?;
+    if !masked {
+        say("native code: a development build is not installed from the network");
+        return Err(INSTALL_WHY_NATIVE);
+    }
+    let g = crate::oracle::gate_located(capsule, co, cl).map_err(|e| {
+        say(e);
+        INSTALL_WHY_SIGNATURE
+    })?;
+    let m = crate::oracle::masked_modes(capsule, co, cl).map_err(|e| {
+        say(e);
+        INSTALL_WHY_MODES
+    })?;
+    let mode = if m.exact { ferros_sandbox::Mode::Exact } else if m.fixed != 0 { ferros_sandbox::Mode::Fixed(m.fixed) } else { ferros_sandbox::Mode::Ring };
+    if let Err(v) = ferros_sandbox::check_image_with(&capsule[co..co + m.text_len], mode, m.bti) {
+        say(&alloc::format!("the checker refused its code at +G#{:X} (instruction G#{:08X})", v.offset, v.insn));
+        return Err(INSTALL_WHY_CHECKER);
+    }
+    Ok((g, m, co, cl))
+}
+
+/// The seal of an install that passed `install_check`: keyed by this device's system secret, so it is good on this device alone.
+pub fn install_seal(arc: &Arc, g: &crate::oracle::Located, m: &crate::oracle::Modes, co: usize, cl: usize) -> Result<[u8; 32], u64> {
+    let code = unsafe { core::slice::from_raw_parts((arc.base + CODE + co) as *const u8, cl) };
+    crate::oracle::seal_parts(&g.developer_pubkey, &g.hp, true, m, code).ok_or_else(|| {
+        push_console(b"kist install: no system secret: cannot seal\n");
+        INSTALL_WHY_SECRET
     })
 }
 
@@ -3945,6 +4114,7 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
             Grant::Vault => (Object::Vault, RIGHT_SEND),
             Grant::Domain => (Object::Domain, RIGHT_SEND),
             Grant::Kists => (Object::Kists, RIGHT_SEND),
+            Grant::Install => (Object::Install, RIGHT_SEND),
             Grant::Hardware(n) => match HARDWARE.iter().position(|h| h.name.as_bytes() == *n) {
                 Some(i) => (Object::Hardware(i), RIGHT_SEND | RIGHT_RECV),
                 None => return Err("no such hardware block"),

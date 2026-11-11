@@ -2,12 +2,15 @@
 //!
 //! - **A right** is one thing a kist can be handed at spawn: a grant (owner, 2026-11-08: "a grant is the permission"). The vocabulary is fixed here, a right named and numbered by its place in `RIGHTS`; the kernel hands each one out as its own object (process.rs `kist_object`).
 //! - **The declaration** is in the signed capsule: a section `kist` (`name`, the app's own name, text) and a section `wants`, one field per right the kist asks for, named by the right, its value one line of the developer's reason (text, a human's words). The fields' order is the kist's grant slot order: slot 1 is the first want, and a right the person said no to is an empty slot, never a fake. Nothing undeclared can be granted: the kernel checks every launch against the capsule it runs.
-//! - **The list** is the person's (`kists.list`, identity class, so it follows them to every device of their fleet): one VSF document, a section `defaults` (a field per right, 1 on or 0 off: what the first-launch question starts each switch at; out of the box every one is off) and a section `kist` per installed kist: `capsule` (hb, the blake3 of the signed capsule, its vault address), `developer` (ke) and `option` (hp; in the capsule it is the `kist` section's `option`, hR), together the kist's identity as the gate sees it, `name` (text), and a field per want named by its right: the reason (ASCII text, `a`: vsf encodes UTF-8 text, `x`, only with std, and the map and init are no_std), and once the person answered, the answer (unsigned, 1 granted or 0 not) and when (Eagle time). A want never answered has no answer and is asked at the next launch, once (owner, 2026-11-08: "asked once, ever, per person, per kist, per permission").
+//! - **The list** is the person's (`kists.list`, identity class, so it follows them to every device of their fleet): one VSF document, a section `defaults` (a field per right, 1 on or 0 off: what the first-launch question starts each switch at; out of the box every one is off) and a section `kist` per installed kist: `capsule` (hb, the blake3 of the signed capsule, its vault address), `developer` (ke) and `option` (hp; in the capsule it is the `kist` section's `option`, hR), together the kist's identity as the gate sees it, `name` (text), and a field per want named by its right: the reason (ASCII text, `a`: vsf encodes UTF-8 text, `x`, only with std, and the map and init are no_std), and once the person answered, the answer (unsigned, 1 granted or 0 not) and when (Eagle time). A want never answered has no answer and is asked at the next launch, once (owner, 2026-11-08: "asked once, ever, per person, per kist, per permission"). Since 2026-11-10 a kist may carry `source` (`nu`, the URL its capsule was fetched from, for a restore) and `installed` (Eagle time), and a section `kept` per uninstalled kist holds its answers (`developer`, `option`, a field per right: the answer and when) for the day it is installed again; readers from before skip all three.
+//! - **Fetching** a capsule (the installer, payloads/kists) is `fetch`: a plain HTTP GET's response decoded as it arrives, and the capsule hashed and its header read as it streams into the vault, never held whole.
 #![no_std]
 
 extern crate alloc;
 
 pub use vsf;
+
+pub mod fetch;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -71,13 +74,27 @@ pub struct Kist {
     pub option: [u8; 32],
     pub name: String,
     pub wants: Vec<Want>,
+    /// Where the capsule was fetched from (`source`, a VSF URL `nu`): a restore on another device, or after a reset, fetches it there again (payloads/kists). None for a capsule that came another way (the bridge).
+    pub source: Option<String>,
+    /// When this kist was installed or updated (`installed`, Eagle oscillations; 0 unknown, as a list from before 2026-11-10): the stamp of its fact in the person's space (ferros_space), so an install after an uninstall wins over the uninstall's tombstone.
+    pub installed: i64,
 }
 
-/// The person's list: their defaults (bit k: right k starts on at the first-launch question) and their kists.
+/// The answers of a kist the person uninstalled, kept in their list (a section `kept`: `developer`, `option`, then a field per right answered, the answer and when), so installing the same kist again finds them and asks nothing (owner, 2026-11-07: "asked once, ever").
+#[derive(Clone, PartialEq, Debug)]
+pub struct Kept {
+    pub developer: [u8; 32],
+    pub option: [u8; 32],
+    /// Each answer: (right, granted, when).
+    pub answers: Vec<(u8, bool, i64)>,
+}
+
+/// The person's list: their defaults (bit k: right k starts on at the first-launch question), their kists, and the answers of the kists they uninstalled.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Kists {
     pub defaults: u32,
     pub kists: Vec<Kist>,
+    pub kept: Vec<Kept>,
 }
 
 /// A section of a VSF file by its table of contents, parsed alone: a capsule's code (tens of megabytes) is never read to find its declaration.
@@ -188,6 +205,12 @@ impl Kists {
                         return Err("a kist without its capsule or identity");
                     };
                     let name = String::from(s.text("name").unwrap_or("kist"));
+                    // Each by its type marker: the source a URL (`nu`), when it was installed an Eagle time.
+                    let source = s.get_field("source").and_then(|f| f.values.first()).and_then(|v| match v {
+                        VsfType::nu(u) => Some(u.clone()),
+                        _ => None,
+                    });
+                    let installed = s.get_field("installed").and_then(|f| f.values.first()).and_then(|v| v.as_eagle()).unwrap_or(0);
                     let mut wants = Vec::new();
                     for f in &s.fields {
                         let Some(right) = code(&f.name) else { continue };
@@ -205,7 +228,28 @@ impl Kists {
                         }
                         wants.push(Want { right, reason, answer: answer.map(|a| (a, when)) });
                     }
-                    out.kists.push(Kist { capsule, developer, option, name, wants });
+                    out.kists.push(Kist { capsule, developer, option, name, wants, source, installed });
+                }
+                "kept" => {
+                    let (Some(developer), Some(option)) = (s.bytes32("developer"), s.bytes32("option")) else {
+                        return Err("kept answers without their kist's identity");
+                    };
+                    let mut answers = Vec::new();
+                    for f in &s.fields {
+                        let Some(right) = code(&f.name) else { continue };
+                        let (mut answer, mut when) = (None, 0i64);
+                        for v in &f.values {
+                            if let VsfType::e(_) = v {
+                                when = v.as_eagle().unwrap_or(0);
+                            } else if let Some(n) = v.as_u64() {
+                                answer = Some(n == 1);
+                            }
+                        }
+                        if let Some(a) = answer {
+                            answers.push((right, a, when));
+                        }
+                    }
+                    out.kept.push(Kept { developer, option, answers });
                 }
                 _ => {}
             }
@@ -226,6 +270,12 @@ impl Kists {
             s.add_field("developer", VsfType::ke(k.developer.to_vec()));
             s.add_field("option", VsfType::hp(k.option.to_vec()));
             s.add_field("name", VsfType::a(vsf::Ascii::checked("name", k.name.clone())));
+            if let Some(u) = &k.source {
+                s.add_field("source", VsfType::nu(u.clone()));
+            }
+            if k.installed != 0 {
+                s.add_field("installed", VsfType::e(EtType::e6(k.installed)));
+            }
             for w in &k.wants {
                 let mut values = alloc::vec![VsfType::a(vsf::Ascii::checked("reason", w.reason.clone()))];
                 if let Some((granted, when)) = w.answer {
@@ -233,6 +283,15 @@ impl Kists {
                     values.push(VsfType::e(EtType::e6(when)));
                 }
                 s.add_field_multi(RIGHTS[w.right as usize], values);
+            }
+            b = b.add_section_direct(s);
+        }
+        for k in &self.kept {
+            let mut s = VsfSection::new("kept");
+            s.add_field("developer", VsfType::ke(k.developer.to_vec()));
+            s.add_field("option", VsfType::hp(k.option.to_vec()));
+            for (right, granted, when) in &k.answers {
+                s.add_field_multi(RIGHTS[*right as usize], alloc::vec![VsfType::u(*granted as usize, false), VsfType::e(EtType::e6(*when))]);
             }
             b = b.add_section_direct(s);
         }
@@ -244,18 +303,25 @@ impl Kists {
         self.kists.iter().find(|k| k.capsule == *capsule)
     }
 
-    /// An install (or an update) of a capsule with this identity and declaration: the same kist (developer and option) keeps every answer it had for a right it still wants; a want that is new to it is unanswered, off until the person answers (owner, 2026-11-08). Returns the kist's index.
+    /// An install (or an update) of a capsule with this identity and declaration: the same kist (developer and option) keeps every answer it had for a right it still wants, and a kist installed again after an uninstall gets back the answers kept for it (`kept`); a want that is new to it is unanswered, off until the person answers (owner, 2026-11-08). Its source and install time stay as they were (an installer that fetched it sets them). Returns the kist's index.
     pub fn install(&mut self, capsule: [u8; 32], developer: [u8; 32], option: [u8; 32], d: &Decl) -> usize {
         let old = self.kists.iter().position(|k| k.developer == developer && k.option == option);
+        let kept = self.kept.iter().position(|k| k.developer == developer && k.option == option);
         let wants = d
             .wants
             .iter()
             .map(|(right, reason)| {
-                let answer = old.and_then(|i| self.kists[i].wants.iter().find(|w| w.right == *right)).and_then(|w| w.answer);
+                let had = old.and_then(|i| self.kists[i].wants.iter().find(|w| w.right == *right)).and_then(|w| w.answer);
+                let answer = had.or_else(|| kept.and_then(|i| self.kept[i].answers.iter().find(|a| a.0 == *right)).map(|a| (a.1, a.2)));
                 Want { right: *right, reason: reason.clone(), answer }
             })
             .collect();
-        let k = Kist { capsule, developer, option, name: d.name.clone(), wants };
+        // Back in the list, the kept answers are its own again.
+        if let Some(i) = kept {
+            self.kept.swap_remove(i);
+        }
+        let (source, installed) = old.map_or((None, 0), |i| (self.kists[i].source.clone(), self.kists[i].installed));
+        let k = Kist { capsule, developer, option, name: d.name.clone(), wants, source, installed };
         match old {
             Some(i) => {
                 self.kists[i] = k;
@@ -266,6 +332,38 @@ impl Kists {
                 self.kists.len() - 1
             }
         }
+    }
+}
+
+impl Kists {
+    /// An uninstall: the kist with this identity out of the list, every answer the person gave it kept (`kept`), so installing it again asks nothing (owner, 2026-11-07: "1 means 1"). The space keeps them as well (ferros_space leaves alone an answer whose kist is not in the list). The kist removed, or None when it was not in the list.
+    pub fn remove(&mut self, developer: &[u8; 32], option: &[u8; 32]) -> Option<Kist> {
+        let i = self.kists.iter().position(|k| k.developer == *developer && k.option == *option)?;
+        let k = self.kists.remove(i);
+        let at = match self.kept.iter().position(|e| e.developer == *developer && e.option == *option) {
+            Some(j) => j,
+            None => {
+                self.kept.push(Kept { developer: *developer, option: *option, answers: Vec::new() });
+                self.kept.len() - 1
+            }
+        };
+        // This version's answers win; an answer kept from before stays for a right this version no longer wanted.
+        for w in &k.wants {
+            let Some((granted, when)) = w.answer else { continue };
+            match self.kept[at].answers.iter_mut().find(|e| e.0 == w.right) {
+                Some(e) => *e = (w.right, granted, when),
+                None => self.kept[at].answers.push((w.right, granted, when)),
+            }
+        }
+        if self.kept[at].answers.is_empty() {
+            self.kept.swap_remove(at);
+        }
+        Some(k)
+    }
+
+    /// The kist with this identity (developer and option).
+    pub fn by_identity(&self, developer: &[u8; 32], option: &[u8; 32]) -> Option<&Kist> {
+        self.kists.iter().find(|k| k.developer == *developer && k.option == *option)
     }
 }
 
@@ -316,6 +414,41 @@ mod tests {
         // Another developer's app of the same name is a kist of its own.
         let o = k2.install([8; 32], [4; 32], [3; 32], &decl());
         assert_ne!(o, j);
+    }
+
+    #[test]
+    fn uninstall_keeps_the_answers_and_a_reinstall_asks_nothing() {
+        let mut k = Kists::default();
+        let i = k.install([1; 32], [2; 32], [3; 32], &decl());
+        k.kists[i].wants[0].answer = Some((true, 5));
+        k.kists[i].source = Some(String::from("http://kists.fgtw.org/mahere.vsf"));
+        k.kists[i].installed = 9;
+        // The source and the install time round trip.
+        let back = Kists::parse(&k.build(10).unwrap()).unwrap();
+        assert_eq!(back, k);
+        let gone = k.remove(&[2; 32], &[3; 32]).unwrap();
+        assert_eq!(gone.capsule, [1; 32]);
+        assert!(k.kists.is_empty());
+        assert!(k.remove(&[2; 32], &[3; 32]).is_none());
+        // Only the answered want is kept, and the kept answers round trip.
+        assert_eq!(k.kept, alloc::vec![Kept { developer: [2; 32], option: [3; 32], answers: alloc::vec![(0, true, 5)] }]);
+        let back = Kists::parse(&k.build(11).unwrap()).unwrap();
+        assert_eq!(back, k);
+        // Installed again (a newer capsule): the kept answer is back, the unanswered want still unanswered, nothing kept any more.
+        let j = k.install([7; 32], [2; 32], [3; 32], &decl());
+        assert_eq!(k.kists[j].wants[0].answer, Some((true, 5)));
+        assert_eq!(k.kists[j].wants[1].answer, None);
+        assert!(k.kept.is_empty());
+        // An update keeps the source and install time it had (the installer sets new ones itself).
+        k.kists[j].source = Some(String::from("http://a/b"));
+        k.kists[j].installed = 12;
+        let j = k.install([8; 32], [2; 32], [3; 32], &decl());
+        assert_eq!((k.kists[j].source.as_deref(), k.kists[j].installed), (Some("http://a/b"), 12));
+        // Another kist's uninstall keeps nothing of one that was never answered.
+        let o = k.install([6; 32], [4; 32], [3; 32], &decl());
+        let (d, op) = (k.kists[o].developer, k.kists[o].option);
+        k.remove(&d, &op);
+        assert!(k.kept.is_empty());
     }
 
     #[test]

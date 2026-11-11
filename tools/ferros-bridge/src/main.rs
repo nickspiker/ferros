@@ -1247,6 +1247,8 @@ async fn cmd_kist_install(path: &str) {
         }
     };
     let i = list.install(addr, developer, option, &decl);
+    // When it was installed: its fact's stamp in the person's space, so an install after an uninstall wins over the uninstall (ferros_space). Its source stays as it was: a capsule from the bridge has no URL to fetch again.
+    list.kists[i].installed = vsf::eagle_time_oscillations();
     let doc = list.build(vsf::eagle_time_oscillations()).unwrap_or_else(|e| {
         eprintln!("the list does not build: {e}");
         std::process::exit(1);

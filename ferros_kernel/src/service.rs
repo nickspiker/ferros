@@ -407,9 +407,12 @@ fn vault_job_step(job: &mut VaultJob, params: &[u8], store: &mut Option<ShimStor
     vault_job_call(job, params).err()
 }
 
-/// A kist launch init asked for (process.rs `kist_request`), its capsule streamed from the vault process through the kernel's channel a transfer a call: the first transfers into `head` until the code's header is in (`kist_need` sizes the arc from it), then straight into the arc at the code offset, as the bridge's streamed spawn lands its pieces. Done, `spawn_kist` checks it and builds the process.
+/// A kist's capsule streamed from the vault process through the kernel's channel a transfer a call: the first transfers into `head` until the code's header is in (`kist_need` sizes the arc from it, masked or native as its code is), then straight into the arc at the code offset, as the bridge's streamed spawn lands its pieces. For a launch init asked for (process.rs `kist_request`), `spawn_kist` then checks it (a masked kist against its seal in `sealed`) and builds the process. For an install the installer asked for (`install_request`), the checker and the seal follow, a stage a pass, each told to the installer (`install_tell`).
 struct KistJob {
-    l: crate::process::KistLaunch,
+    why: KistWhy,
+    capsule: [u8; 32],
+    /// The `sealed` list as the job began (32-byte seals): what a masked kist's launch is checked against.
+    sealed: alloc::vec::Vec<u8>,
     total: usize,
     head: alloc::vec::Vec<u8>,
     arc: Option<crate::process::Arc>,
@@ -417,6 +420,23 @@ struct KistJob {
     t0: u64,
     /// Its first bytes are in and its arc waits for one that is coming back (`kist_arc`).
     waiting: bool,
+    /// An install read whole and checked, waiting for its seal on the next pass: the gate's word on it, its modes and its code's span.
+    checked: Option<(crate::oracle::Located, crate::oracle::Modes, usize, usize)>,
+    /// An install read whole, waiting for the checker on the next pass.
+    read: bool,
+    /// An install refused and already told why.
+    told: bool,
+}
+
+enum KistWhy {
+    Launch(crate::process::KistLaunch),
+    Install(crate::process::KistInstall),
+}
+
+/// What a kist job came to: a launch built, or an install's seal for the `sealed` list.
+enum KistDone {
+    Launched,
+    Sealed([u8; 32]),
 }
 
 /// The kist job's next read (from `got`); false when the channel would not take it.
@@ -424,16 +444,17 @@ fn kist_call(job: &KistJob) -> bool {
     let mut rest = [0u8; 12];
     rest[..8].copy_from_slice(&(job.got as u64).to_le_bytes());
     rest[8..].copy_from_slice(&(crate::process::STORE_MAX as u32).to_le_bytes());
-    match crate::process::vault_stamp_addr(crate::process::VOP_GET, "capsules", &job.l.capsule, &rest) {
+    match crate::process::vault_stamp_addr(crate::process::VOP_GET, "capsules", &job.capsule, &rest) {
         Some(msg) => crate::process::vault_call(msg),
         None => false,
     }
 }
 
-/// The kist's arc, sized from its first bytes (`kist_need`), with those bytes copied in. Ok(false): the pool has no room yet while a process ends (a relaunch's own predecessor still leaving a core, its arc coming back at its next trap), so the job waits for that, not for a time; Err when there is no room and nothing is coming back.
+/// The kist's arc, sized from its first bytes (`kist_need`), masked when its code is (the guard above it), with those bytes copied in. Ok(false): the pool has no room yet while a process ends (a relaunch's own predecessor still leaving a core, its arc coming back at its next trap), so the job waits for that, not for a time; Err when there is no room and nothing is coming back.
 fn kist_arc(job: &mut KistJob) -> Result<bool, &'static str> {
     let need = crate::process::kist_need(&job.head, job.total)?;
-    let Some(arc) = crate::process::with_lock(|| crate::process::arc_alloc(need, false)) else {
+    let masked = crate::process::kist_masked(&job.head, job.total);
+    let Some(arc) = crate::process::with_lock(|| crate::process::arc_alloc(need, masked)) else {
         return if crate::process::any_dying() { Ok(false) } else { Err("the arc pool has no room for the kist") };
     };
     if crate::process::CODE + job.total > arc.size {
@@ -446,13 +467,28 @@ fn kist_arc(job: &mut KistJob) -> Result<bool, &'static str> {
     Ok(true)
 }
 
-/// The kist job after its last bytes or its arc: the process built once the capsule is whole, else the next read.
-fn kist_next(job: &mut KistJob) -> Option<Result<(), &'static str>> {
+/// An install told a stage, if it is one.
+fn kist_tell(job: &KistJob, stage: u64, value: u64) {
+    if let KistWhy::Install(i) = &job.why {
+        crate::process::install_tell(i, stage, value);
+    }
+}
+
+/// The kist job after its last bytes or its arc: a launch's process built once the capsule is whole; an install told it is read and its checker due on the next pass; else the next read.
+fn kist_next(job: &mut KistJob) -> Option<Result<KistDone, &'static str>> {
     if job.got >= job.total {
-        return Some(match job.arc.take() {
-            Some(arc) => crate::process::spawn_kist(&job.l, arc, job.total),
-            None => Err("the capsule ended before its code"),
-        });
+        let Some(arc) = job.arc.take() else { return Some(Err("the capsule ended before its code")) };
+        return match &job.why {
+            KistWhy::Launch(l) => Some(crate::process::spawn_kist(l, arc, job.total, &job.sealed).map(|()| KistDone::Launched)),
+            KistWhy::Install(_) => {
+                job.arc = Some(arc);
+                job.read = true;
+                kist_tell(job, crate::process::INSTALL_CHECKING, 0);
+                // The checker on the next pass, so the installer shows the stage before the work: the loop goes round at once (no wait for an event).
+                unsafe { core::arch::asm!("sev") };
+                None
+            }
+        };
     }
     if !kist_call(job) {
         return Some(Err("the kernel's channel to the vault process would not take the next read"));
@@ -460,10 +496,40 @@ fn kist_next(job: &mut KistJob) -> Option<Result<(), &'static str>> {
     None
 }
 
-/// One step of the kist job: waiting for its arc, or the answer to its last read if it has come, then its next read. Some(the outcome) once it is done; the arc is the process's or back in the pool by then.
-fn kist_step(job: &mut KistJob) -> Option<Result<(), &'static str>> {
+/// An install's stage after its reading, one a pass: the checker (SANDBOX.md: once, at install), then the seal. Done: its seal, for the service loop to keep in `sealed`.
+fn install_step(job: &mut KistJob) -> Option<Result<KistDone, &'static str>> {
+    let arc = job.arc?;
+    let why = match job.checked.take() {
+        None => match crate::process::install_check(&arc, job.total, &job.capsule) {
+            Ok(c) => {
+                job.checked = Some(c);
+                kist_tell(job, crate::process::INSTALL_SEALING, 0);
+                unsafe { core::arch::asm!("sev") };
+                return None;
+            }
+            Err(why) => why,
+        },
+        Some((g, m, co, cl)) => match crate::process::install_seal(&arc, &g, &m, co, cl) {
+            Ok(seal) => {
+                job.arc = None;
+                crate::process::with_lock(|| crate::process::arc_free(arc));
+                return Some(Ok(KistDone::Sealed(seal)));
+            }
+            Err(why) => why,
+        },
+    };
+    kist_tell(job, crate::process::INSTALL_REFUSED, why);
+    job.told = true;
+    Some(Err("refused (the reason is on the console)"))
+}
+
+/// One step of the kist job: waiting for its arc, an install's next stage once it is read, or the answer to its last read if it has come, then its next read. Some(the outcome) once it is done; the arc is the process's or back in the pool by then.
+fn kist_step(job: &mut KistJob) -> Option<Result<KistDone, &'static str>> {
     use crate::process::{ERR, NOTHING};
     let r = (|| {
+        if job.read {
+            return install_step(job);
+        }
         if job.waiting {
             return match kist_arc(job) {
                 Ok(true) => {
@@ -492,6 +558,7 @@ fn kist_step(job: &mut KistJob) -> Option<Result<(), &'static str>> {
         if job.got + bytes.len() > job.total || (bytes.is_empty() && job.got < job.total) {
             return Some(Err("the vault process answered past the capsule's end, or nothing"));
         }
+        let before = job.got;
         match job.arc {
             None => {
                 job.head.extend_from_slice(&bytes);
@@ -511,6 +578,10 @@ fn kist_step(job: &mut KistJob) -> Option<Result<(), &'static str>> {
                 unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), (arc.base + crate::process::CODE + job.got) as *mut u8, bytes.len()) };
                 job.got += bytes.len();
             }
+        }
+        // The installer's progress bar: told at each mebibyte read, not each transfer.
+        if before >> 20 != job.got >> 20 {
+            kist_tell(job, crate::process::INSTALL_READING, job.got as u64);
         }
         kist_next(job)
     })();
@@ -843,6 +914,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Power(b"panel"), Power(b"panel-vddd"),
         // Kists (KISTS.md, 2026-11-08): 104 the right to launch them (each right a kist is granted is made by the kernel from it: init holds no other grant for them), 105 serve `launch` (the map asks init to launch one), 106 use `launch` (the map's), 107 the vault scope `kists.` (the person's list and answers: init reads it, the map shows it and writes the answers). These were the GPU service's until it got its own list (`gpu_grants`), started by the kernel as the vault and GPS are: the page holds 108 slots.
         Kists, Serve(b"launch"), Use(b"launch"), Store(b"kists"),
+        // 108 use `kists`, the installer's endpoint (payloads/kists, which the kernel starts with its own list, `kists_grants`): the map's Kists page installs, updates and uninstalls through it. The last slot the page holds (0 the console, 1 to 108).
+        Use(b"kists"),
         // The `android` switch (android_request) is in no one's list: the base OS has no Android launcher (owner, 2026-11-04: nothing built in but system settings). It goes to a launcher a person installs, once installing exists.
     ]
 }
@@ -896,10 +969,19 @@ fn gpu_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![Dma(b"gpu-regs"), Dma(b"gpu-mem"), Store(b"gpu"), Irq(b"gpu-job"), Dma(b"layers"), Serve(b"gpu")]
 }
 
+/// The installer's grants in its slot order (payloads/kists; docs/KISTS.md "Install"): 1 use udp (the network, plain HTTP), 2 the vault scope `capsules.` (it stores what it fetched, by content address), 3 the vault scope `kists.` (the person's list), 4 serve `kists` (the map's Kists page), 5 use fgtw (the identity service's doorbell: a restore follows the person's space), 6 the Install right (the kernel checks and seals what it stored). Its own list, as the GPS driver's: init's page is full, and the kernel starts it once a person has attested (the list is theirs).
+fn kists_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
+    use crate::process::Grant::*;
+    alloc::vec![Use(b"udp"), Store(b"capsules"), Store(b"kists"), Serve(b"kists"), Use(b"fgtw"), Install]
+}
+
 /// Each shell process's capabilities, as init hands them out (payloads/init: the slots of `home_grants`, 1-based), for restarting one from the vault without a reboot.
 fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'static>>> {
     if name == b"vault" {
         return Some(vault_grants());
+    }
+    if name == b"kists" {
+        return Some(kists_grants());
     }
     if name == b"gps" {
         return Some(gps_grants());
@@ -911,8 +993,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
         b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103, 20],
         b"touch" => &[14, 15, 16, 23, 91],
-        // 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page), 6 the vault scope `kists.` (the person's kists and answers), 7 use launch (payloads/map).
-        b"map" => &[17, 18, 19, 20, 47, 107, 106],
+        // 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page), 6 the vault scope `kists.` (the person's kists and answers), 7 use launch, 8 use kists (the installer: the Kists page) (payloads/map).
+        b"map" => &[17, 18, 19, 20, 47, 107, 106, 108],
         b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83],
         b"ip" => &[44, 45, 41, 52],
         // The modem driver: serve rmnet, its hardware, windows and partitions (payloads/modem's slot order).
@@ -958,6 +1040,7 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
         let refused: Option<&[u8]> = match name {
             b"fgtw" if !person => Some(b"not started, nobody has attested: "),
             b"gps" if !person => Some(b"not started, GPS is locked until a person attests: "),
+            b"kists" if !person => Some(b"not started, nobody has attested (the installer keeps a person's list): "),
             b"map" if !attached => Some(b"not started, this device is not bound to an attested identity: "),
             _ => None,
         };
@@ -1667,6 +1750,8 @@ pub fn run(mut b: Boot) -> ! {
     // The radios switched off (preference 15) as the loop last applied them: init started only the ones left on.
     let mut radios_applied = crate::process::pref(crate::process::PREF_RADIOS_OFF) & 0x1F;
     let mut gps_started = false;
+    // The installer (payloads/kists) started for the person present, as GPS is.
+    let mut kists_started = false;
     // The panel's VCI as ABL or Android left it (SYS_FACTS 81): the display server reads it to know a panel it must power up (state B).
     crate::panel_power::read_state();
     // The display engine fenced to its own regions when the DPU is up already (ABL's splash, or a jump from a lit Android); a DPU that is down is fenced by the `dpu` switch as it powers it (s2mpu::fence_dpu). Before init starts the display server, so it never runs unfenced.
@@ -1729,6 +1814,18 @@ pub fn run(mut b: Boot) -> ! {
         }
         // GPS switched on, a person attested, and no driver running: started once each time a person is in (no one in, the next attest may start it again). Nothing else started it: init's page has no room for its grants, and the switch above only acts on a change, so a GPS left on was never driven (2026-11-08).
         let person = store.as_ref().is_some_and(|s| s.unlocked());
+        // The installer (payloads/kists), once each time a person is in, as GPS below: it serves the map's Kists page and fetches back the capsules a restored list names. Its grants are its own (`kists_grants`), init's page being full.
+        if !person {
+            kists_started = false;
+        } else if !kists_started {
+            kists_started = true;
+            let running = crate::process::with_lock(|| crate::process::named_alive_locked(&[b"kists"])) != 0;
+            if !running {
+                let mut rep = alloc::vec::Vec::new();
+                restart(&mut store, b"kists", &mut rep);
+                crate::flashlog::line(&alloc::format!("kists after attest: {}", core::str::from_utf8(&rep).unwrap_or("").trim_end()));
+            }
+        }
         if !person {
             gps_started = false;
         } else if !gps_started && radios_off & 1 << 4 == 0 {
@@ -1817,27 +1914,71 @@ pub fn run(mut b: Boot) -> ! {
         #[cfg(ferros_production)]
         let bridge_holds_channel = false;
         if kist_job.is_none() && !bridge_holds_channel && !RELEASE_RESET.load(core::sync::atomic::Ordering::Acquire) {
-            if let Some(l) = crate::process::kist_take() {
-                let job = KistJob { l, total: 0, head: alloc::vec::Vec::new(), arc: None, got: 0, t0: cntpct(), waiting: false };
+            // A launch first (a person waiting at a circle), then an install (the installer waits on its word).
+            let why = crate::process::kist_take().map(KistWhy::Launch).or_else(|| crate::process::install_take().map(KistWhy::Install));
+            if let Some(why) = why {
+                let capsule = match &why {
+                    KistWhy::Launch(l) => l.capsule,
+                    KistWhy::Install(i) => i.capsule,
+                };
+                // The seals a masked kist's launch is checked against, read once for the job under the kernel lock, as every UFS command.
+                let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
+                let job = KistJob { why, capsule, sealed, total: 0, head: alloc::vec::Vec::new(), arc: None, got: 0, t0: cntpct(), waiting: false, checked: None, read: false, told: false };
                 if kist_call(&job) {
+                    kist_tell(&job, crate::process::INSTALL_READING, 0);
                     kist_job = Some(job);
                 } else {
-                    crate::process::push_console(alloc::format!("kist {}: not started: no vault process, or the kernel's channel to it is busy\n", core::str::from_utf8(&job.l.name).unwrap_or("?")).as_bytes());
-                    crate::process::kist_done();
+                    match &job.why {
+                        KistWhy::Launch(l) => {
+                            crate::process::push_console(alloc::format!("kist {}: not started: no vault process, or the kernel's channel to it is busy\n", core::str::from_utf8(&l.name).unwrap_or("?")).as_bytes());
+                            crate::process::kist_done();
+                        }
+                        KistWhy::Install(i) => {
+                            crate::process::push_console(b"kist install: not started: no vault process, or the kernel's channel to it is busy\n");
+                            crate::process::install_tell(i, crate::process::INSTALL_REFUSED, crate::process::INSTALL_WHY_READ);
+                        }
+                    }
                 }
             }
         }
         if let Some(job) = kist_job.as_mut() {
             if let Some(r) = kist_step(job) {
-                let nm = core::str::from_utf8(&job.l.name).unwrap_or("?");
                 let ms = (cntpct() - job.t0) * 1000 / cntfrq();
-                let line = match r {
-                    Ok(()) => alloc::format!("kist {nm}: started from the vault ({} bytes read in {ms} ms)\n", job.total),
-                    Err(e) => alloc::format!("kist {nm}: not started: {e}\n"),
+                let line = match (&job.why, r) {
+                    (KistWhy::Launch(l), Ok(_)) => alloc::format!("kist {}: started from the vault ({} bytes read in {ms} ms)\n", core::str::from_utf8(&l.name).unwrap_or("?"), job.total),
+                    (KistWhy::Launch(l), Err(e)) => alloc::format!("kist {}: not started: {e}\n", core::str::from_utf8(&l.name).unwrap_or("?")),
+                    // Checked and sealed (SANDBOX.md "Lifecycle"): the seal joins the vault's `sealed` list, which every masked spawn reads; the installer is told once it is kept.
+                    (KistWhy::Install(i), Ok(KistDone::Sealed(seal))) => {
+                        let kept = crate::process::with_lock(|| {
+                            let Some(s) = store.as_mut() else { return false };
+                            let mut list = s.get_by_key("sealed").ok().flatten().unwrap_or_default();
+                            if !list.chunks_exact(32).any(|e| e == seal) {
+                                list.extend_from_slice(&seal);
+                            }
+                            s.set("sealed", &list).is_ok()
+                        });
+                        crate::process::install_tell(i, if kept { crate::process::INSTALL_DONE } else { crate::process::INSTALL_REFUSED }, if kept { 0 } else { crate::process::INSTALL_WHY_KEPT });
+                        if kept {
+                            alloc::format!("kist install: checked and sealed to this device ({} bytes, {ms} ms)\n", job.total)
+                        } else {
+                            alloc::format!("kist install: checked, but the vault did not keep its seal\n")
+                        }
+                    }
+                    (KistWhy::Install(_), Ok(KistDone::Launched)) => alloc::string::String::new(),
+                    (KistWhy::Install(i), Err(e)) => {
+                        // A refusal the checker or the seal told already; anything else (the vault, the arc pool) is told here.
+                        if !job.told {
+                            let why = if e.contains("arc") { crate::process::INSTALL_WHY_ROOM } else { crate::process::INSTALL_WHY_READ };
+                            crate::process::install_tell(i, crate::process::INSTALL_REFUSED, why);
+                        }
+                        alloc::format!("kist install: not installed: {e}\n")
+                    }
                 };
                 crate::flashlog::line(line.trim_end());
                 crate::process::push_console(line.as_bytes());
-                crate::process::kist_done();
+                if matches!(job.why, KistWhy::Launch(_)) {
+                    crate::process::kist_done();
+                }
                 kist_job = None;
             }
         }

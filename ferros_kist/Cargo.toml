@@ -18,7 +18,7 @@ ferros_sys = { path = "../ferros_sys", optional = true }
 fgtw = { path = "../../fgtw", default-features = false, optional = true }
 
 [dev-dependencies]
-# The directory's tests sign with a test key, as kistcat signs with the project's.
+# The directory's tests sign with a test key, as kistcat signs with the project's; the fetch's test signs a capsule with every egg of a test release bundle and checks the streamed hashes against fgtw's own verifier.
 fgtw = { path = "../../fgtw", default-features = false, features = ["sign"] }
 
 [features]

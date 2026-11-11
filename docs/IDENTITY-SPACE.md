@@ -50,7 +50,7 @@ Next to add when they exist: the WiFi networks (`wifi.cred`; a credential carrie
 
 The Fleet page has the switch: "home screen: the same on all your devices" / "this device's own" (fgtw op 18), shown once the first pull is done.
 
-## Capsules (designed, not built)
+## Capsules (built 2026-11-10 but the fleet source; docs/KISTS.md "The installer")
 
 A kist in the person's list whose capsule this device lacks is fetched by its blake3, checked by the gate, and kept in `capsules.`; its answers came with the list, so nothing is asked again. The fetch takes sources in order, each a small trait (`fetch(blake3, offset, buf)`, `size(blake3)`), so a source is added without touching the rest:
 
@@ -59,7 +59,7 @@ A kist in the person's list whose capsule this device lacks is fetched by its bl
 3. fgtw.org, once it serves capsules: its blob slots cap at 1 MiB and Photon's capsule is 106 MB, so that is an owner decision (R2 by blake3, public, the gate's signature is the trust);
 4. development: the bridge (`ferros-bridge kist install`, which keeps the answers of the same developer and option).
 
-Whatever arrives is checked twice: its blake3 against the address the list names, and the gate's signature at launch. The installer holds `capsules.` (write); the map and the identity service never do. Until it exists a restored kist's circle is on the map and a tap is refused by the kernel (no capsule); `ferros-bridge kist install <capsule>` restores it with its answers.
+Whatever arrives goes through the installer's stages (payloads/kists): its blake3 and size, every egg against its developer's pinned bundle, then the kernel's checker over its masked code and the seal, which is all a launch checks. The installer holds `capsules.` (write); the map and the identity service never do. It follows the identity service's doorbell: when the space's generation moves, it fetches what the list names and this device lacks, from the kist's recorded source (`source`, carried in its KIST fact) then the directory by blake3; the fleet source (2) is a seam, not built. Until a capsule is back its circle is on the map and a tap is refused by the kernel (no capsule); `ferros-bridge kist install <capsule>` still restores a development capsule with its answers.
 
 ## Device firmware (designed, not built)
 
