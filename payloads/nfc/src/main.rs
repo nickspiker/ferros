@@ -76,6 +76,8 @@ const TRANS_MASTER_BUSY: u32 = 1 << 17;
 const ADDR_MASTER_ID_7: u32 = 7 << 24;
 /// Polls per wait, a syscall each: thousands of microseconds, far past a 400 kHz byte.
 const WAIT_POLLS: u32 = 1 << 12;
+/// The receive FIFO's depth.
+const FIFO_DEPTH: u32 = 1 << 6;
 
 const E_BUSY: u32 = 2;
 const E_NODEV: u32 = 4;
@@ -203,6 +205,11 @@ impl Nfc {
         if !idle {
             return Err(E_BUSY);
         }
+        // Every transfer starts from an empty receive FIFO. The read below takes the first bytes the FIFO holds, so bytes left by an earlier transfer would be its answer and its own bytes the next read's: on the Pro (2026-11-10) every motor read returned the read three before's value, twelve bytes behind. Said when it happens, so where they come from is seen.
+        let stale = self.drain_rx();
+        if stale != 0 {
+            say!(self.grants, "nfc: A#{stale} bytes were waiting in the receive FIFO before a transfer to G#{target:02X}: dropped\n");
+        }
         let read = !rx.is_empty();
         let len = if read { rx.len() } else { tx.len() } as u32;
         self.wr(FIFO_CTL, if read { 0x0002_0023 } else { 0x0001_0013 });
@@ -214,24 +221,20 @@ impl Nfc {
         self.wr(AUTO_CONF, auto);
         self.wr(AUTO_CONF, auto | AUTO_MASTER_RUN);
         if read {
-            let mut got = 0;
-            let mut polls = 0;
-            while got < rx.len() {
-                if self.rd(FIFO_STATUS) & FIFO_RX_EMPTY == 0 {
-                    rx[got] = self.rd(RX_DATA) as u8;
-                    got += 1;
-                    polls = 0;
-                    continue;
+            let r = self.read_run(rx);
+            // A read that failed once it was running may still be clocking its bytes in: let it finish, then drop what came, so none of it answers the next read.
+            if let Err(e) = r {
+                for _ in 0..WAIT_POLLS {
+                    if self.rd(TRANS_STATUS) & TRANS_MASTER_BUSY == 0 {
+                        break;
+                    }
                 }
-                if let Some(e) = self.fail(self.rd(INT_STATUS)) {
-                    return Err(e);
-                }
-                polls += 1;
-                if polls > WAIT_POLLS {
-                    return Err(E_TIMEOUT);
+                let late = self.drain_rx();
+                if late != 0 {
+                    say!(self.grants, "nfc: a read from G#{target:02X} failed (G#{e:X}); A#{late} bytes came after it: dropped\n");
                 }
             }
-            self.wait_done()
+            r
         } else {
             for &b in tx {
                 let mut room = false;
@@ -257,6 +260,39 @@ impl Nfc {
             }
             Ok(())
         }
+    }
+
+    /// A running read's bytes into `rx` as they come, then its TRANSFER_DONE.
+    fn read_run(&self, rx: &mut [u8]) -> Result<(), u32> {
+        let mut got = 0;
+        let mut polls = 0;
+        while got < rx.len() {
+            if self.rd(FIFO_STATUS) & FIFO_RX_EMPTY == 0 {
+                rx[got] = self.rd(RX_DATA) as u8;
+                got += 1;
+                polls = 0;
+                continue;
+            }
+            if let Some(e) = self.fail(self.rd(INT_STATUS)) {
+                return Err(e);
+            }
+            polls += 1;
+            if polls > WAIT_POLLS {
+                return Err(E_TIMEOUT);
+            }
+        }
+        self.wait_done()
+    }
+
+    /// Whatever the receive FIFO holds, read and dropped; how many bytes. WHY the bound: the FIFO is 64 deep, so a status still saying "not empty" after 64 reads is the controller misreporting, and this stops rather than spins.
+    fn drain_rx(&self) -> u32 {
+        for n in 0..FIFO_DEPTH {
+            if self.rd(FIFO_STATUS) & FIFO_RX_EMPTY != 0 {
+                return n;
+            }
+            self.rd(RX_DATA);
+        }
+        FIFO_DEPTH
     }
 
     /// One NCI packet out: the whole packet in one write. The chip NACKs while it is busy waking; the HAL retries, and so does this, every millisecond for 16.
@@ -640,15 +676,31 @@ impl Nfc {
     /// One of the motor's registers: its address written without STOP, then the value read.
     fn motor_read(&self, reg: u32) -> Result<u32, u32> {
         let mut b = [0u8; 4];
-        self.xfer(MOTOR, &reg.to_be_bytes(), &mut [], true)?;
-        self.xfer(MOTOR, &[], &mut b, false)?;
+        self.motor_retry(|| {
+            self.xfer(MOTOR, &reg.to_be_bytes(), &mut [], true)?;
+            self.xfer(MOTOR, &[], &mut b, false)
+        })?;
         Ok(u32::from_be_bytes(b))
     }
     fn motor_write(&self, reg: u32, v: u32) -> Result<(), u32> {
         let mut w = [0u8; 8];
         w[..4].copy_from_slice(&reg.to_be_bytes());
         w[4..].copy_from_slice(&v.to_be_bytes());
-        self.xfer(MOTOR, &w, &mut [], false)
+        self.motor_retry(|| self.xfer(MOTOR, &w, &mut [], false))
+    }
+    /// The ROM firmware hibernates when idle, and a hibernating CS40L26 may NACK the transaction that wakes it (the first op 7 on the Pro, 2026-11-10, read nothing): a NACK is tried again every millisecond for 16, as the NFC chip's writes are, and a retry that was needed is said.
+    fn motor_retry(&self, mut f: impl FnMut() -> Result<(), u32>) -> Result<(), u32> {
+        let mut r = f();
+        let mut tries = 1;
+        while r == Err(E_NODEV) && tries < 16 {
+            sleep_ms(1);
+            r = f();
+            tries += 1;
+        }
+        if tries > 1 {
+            say!(self.grants, "nfc: the motor NACKed A#{} times before {}\n", tries - 1, if r.is_ok() { "answering" } else { "giving up" });
+        }
+        r
     }
 
     /// The motor's IDs and state on the console (what the kernel's `diag haptic` printed): DEVID, REVID, IRQ1 status and EINT1, the mailbox, the ROM's power state. DEVID and REVID returned (0 for a read that failed).
