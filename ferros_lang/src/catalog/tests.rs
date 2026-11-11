@@ -25,6 +25,7 @@ fn every_say() -> Vec<(Say<'static>, usize)> {
         (Say::Throttled(H), 1),
         (Say::NotAskedYet(H), 1),
         (Say::UsingNow(H), 1),
+        (Say::CouldNotStart(H), 1),
         (Say::Signal(H), 1),
         (Say::JoiningNet(H), 1),
         (Say::PassphraseFor(H), 1),
