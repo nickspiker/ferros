@@ -29,21 +29,22 @@ const S_IRQ: u64 = 4;
 /// The `touch` power switch: clocks, rails and reset (the kernel's touch.rs `power`).
 const S_POWER: u64 = 5;
 
-// The s3c64xx SPI registers, offsets from the port's base (ferros_kernel/src/spi.rs).
-const CH_CFG: u64 = 0x00;
-const MODE_CFG: u64 = 0x08;
-const SLAVE_SEL: u64 = 0x0C;
-const STATUS: u64 = 0x14;
-const TX_DATA: u64 = 0x18;
-const RX_DATA: u64 = 0x1C;
-const PACKET_CNT: u64 = 0x20;
-const FB_CLK: u64 = 0x2C;
-const CH_TX_ON: u32 = 1 << 0;
-const CH_RX_ON: u32 = 1 << 1;
-const CH_SW_RST: u32 = 1 << 5;
-const PACKET_CNT_EN: u32 = 1 << 16;
-/// Byte transfers, every channel's threshold at its maximum: one transfer per command, no DMA.
-const MODE_BYTE: u32 = 0x1FF8_0000;
+/// The SPI port through its hardware grant, for ferros_spi (the kernel's `touch` switch sets it up with the same code): mode 0, no feedback delay, byte transfers inside the 64-byte FIFO, no DMA.
+struct Spi(u64);
+impl ferros_spi::Regs for Spi {
+    fn rd(&self, off: usize) -> u32 {
+        mmio_read(self.0, off as u64) as u32
+    }
+    fn wr(&self, off: usize, v: u32) {
+        mmio_write(self.0, off as u64, v);
+    }
+    fn now(&self) -> u64 {
+        now()
+    }
+    fn freq(&self) -> u64 {
+        freq()
+    }
+}
 /// The interrupt line is gpn0 pin 0; a GPIO bank's data register is at +4, and the line is active low.
 const GPIO_DAT: u64 = 0x04;
 const GPIO_CON: u64 = 0x00;
@@ -76,14 +77,12 @@ const INJECT_FINGERS: usize = 1 << 3;
 
 struct Port {
     grants: u64,
+    spi: ferros_spi::Spi<Spi>,
 }
 
 impl Port {
-    fn rd(&self, off: u64) -> u32 {
-        mmio_read(cap(self.grants, S_SPI), off) as u32
-    }
-    fn wr(&self, off: u64, v: u32) {
-        mmio_write(cap(self.grants, S_SPI), off, v);
+    fn new(grants: u64) -> Port {
+        Port { grants, spi: ferros_spi::Spi { regs: Spi(cap(grants, S_SPI)), mode: 0, fb: 0 } }
     }
     /// True while the controller is asserting its interrupt line.
     fn irq(&self) -> bool {
@@ -102,64 +101,9 @@ impl Port {
         mmio_write(cap(self.grants, S_GPIO), EINT_PEND, 1);
         ferros_sys::irq_ack(cap(self.grants, S_IRQ));
     }
-    fn flush(&self) {
-        self.wr(CH_CFG, self.rd(CH_CFG) & !(CH_TX_ON | CH_RX_ON));
-        self.wr(PACKET_CNT, 0);
-        self.wr(CH_CFG, self.rd(CH_CFG) | CH_SW_RST);
-        let t = now() + freq() / 1000;
-        while (self.rd(STATUS) >> 6) & 0x1FF != 0 || (self.rd(STATUS) >> 15) & 0x1FF != 0 {
-            if now() > t {
-                break;
-            }
-        }
-        self.wr(CH_CFG, self.rd(CH_CFG) & !CH_SW_RST);
-    }
-    /// One direction of one transfer. Never longer than the 64-byte FIFO, which is what keeps this DMA-free.
-    fn segment(&self, tx: Option<&[u8]>, rx: Option<&mut [u8]>, len: usize) -> bool {
-        if len == 0 || len > 64 {
-            return false;
-        }
-        self.wr(PACKET_CNT, 0);
-        self.wr(PACKET_CNT, len as u32);
-        self.wr(PACKET_CNT, len as u32 | PACKET_CNT_EN);
-        self.wr(MODE_CFG, MODE_BYTE);
-        let ch = self.rd(CH_CFG) & !(CH_TX_ON | CH_RX_ON | 0xC);
-        if let Some(t) = tx {
-            self.wr(CH_CFG, ch | CH_RX_ON | CH_TX_ON);
-            for &x in t {
-                self.wr(TX_DATA, x as u32);
-            }
-        } else {
-            self.wr(CH_CFG, ch | CH_RX_ON);
-        }
-        let t = now() + freq() / 100;
-        while ((self.rd(STATUS) >> 15) & 0x1FF) < len as u32 {
-            if now() > t {
-                self.flush();
-                return false;
-            }
-        }
-        if let Some(out) = rx {
-            for o in out.iter_mut().take(len) {
-                *o = self.rd(RX_DATA) as u8;
-            }
-        }
-        self.flush();
-        true
-    }
-    /// A command, then its reply. The controller's select is the controller's own (`Cs::Native`), so no GPIO is touched here.
+    /// A command, then its reply, each inside the 64-byte FIFO, which is what keeps this DMA-free (ferros_spi `transact`). The controller's select is the controller's own, so no GPIO is touched here.
     fn transact(&self, cmd: &[u8], out: &mut [u8]) -> bool {
-        self.wr(FB_CLK, 0);
-        self.wr(SLAVE_SEL, 0);
-        let n = cmd.len();
-        let mut ok = self.segment(Some(cmd), None, n);
-        if ok && !out.is_empty() {
-            let n = out.len();
-            ok = self.segment(None, Some(out), n);
-        }
-        delay_us(10);
-        self.wr(SLAVE_SEL, 1);
-        ok
+        self.spi.transact(ferros_spi::Cs::Native, cmd, out).is_ok()
     }
     /// Drain the event queue as the vendor interrupt handler does: one read for the first event, whose byte seven carries in its low five bits how many are still queued, then bursts of up to seven more (seven events and the dummy byte fill one 64-byte segment).
     /// Reading one event at a time races the queue cursor — the same event returns with its tail zeroed, which decodes as a contact at the top of the screen at zero pressure.
@@ -376,7 +320,7 @@ fn bring_up(p: &Port, grants: u64) -> bool {
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The bring-up's console lines format through tables of absolute addresses: apply the payload's relocations first.
     unsafe { ferros_sys::relocate() };
-    let p = Port { grants };
+    let p = Port::new(grants);
     // akita carries a Goodix where husky has the FTM5 (fact 84; goodix.rs): the same port, reset and rails, its own protocol.
     let akita = ferros_sys::facts().board() == Some(2);
     let mut gdx = None;
