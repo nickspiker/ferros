@@ -61,10 +61,10 @@ const ARENA_VA: u64 = 0x8000_0000;
 const REGION: usize = 32 << 20;
 /// The frame at the region's start (working values, `wallpaper::pack`'s, w × h of them, then room for the 15 a last workgroup writes past them); the survey's counts and distances there too, before the frame is drawn.
 const FRAME: usize = 0;
-/// Pixels a first-pass run draws: 2^20, a quarter of the Pro's screen, two orbits each.
-const BAND_PX: usize = 1 << 20;
-/// Pixels a refine run takes from the list: 2^17, each sixteen orbits and an orbit for the far layer.
-const CHUNK: usize = 1 << 17;
+/// Pixels a first-pass run draws: 2^19, an eighth of the Pro's screen, two orbits each. Not measured yet: by the attest mark's rate (626k pixels of up to 1024 steps in 3.6 ms) a run should take tens of ms, and the service gives up on one at a second (a job that runs on past it wedges the queue until `diag "restart gpu"`), so a run is kept far below that; wallgen's line says the longest.
+const BAND_PX: usize = 1 << 19;
+/// Pixels a refine run takes from the list: 2^16, each sixteen orbits and an orbit for the far layer, about a first-pass run's work.
+const CHUNK: usize = 1 << 16;
 /// The most words a kernel may have: the service's code region (payloads/gpu CODE_PAGES, 32 pages) less its 16 words of padding.
 const CODE_WORDS: usize = (32 << 12) / 8 - 16;
 
@@ -100,9 +100,10 @@ struct Gpu {
     cap: u64,
     arena: usize,
     code: usize,
-    /// The GPU's own time over every run so far (µs, as the service measures each).
+    /// The GPU's own time over every run so far (µs, as the service measures each), the runs, and the longest (against the service's one-second guard).
     us: u64,
     runs: u32,
+    longest: u64,
 }
 
 impl Gpu {
@@ -138,8 +139,10 @@ impl Gpu {
             say!("wallgen: the GPU service answered {} to the {} run; no wallpaper", reply[0], what);
             ferros_sys::exit(1);
         }
-        self.us += u32::from_le_bytes([reply[1], reply[2], reply[3], reply[4]]) as u64;
+        let us = u32::from_le_bytes([reply[1], reply[2], reply[3], reply[4]]) as u64;
+        self.us += us;
         self.runs += 1;
+        self.longest = self.longest.max(us);
     }
 }
 
@@ -187,7 +190,7 @@ pub extern "C" fn wall_main(g: u64, input: u64, input_len: u64) -> ! {
         say!("wallgen: a {}x{} frame does not fit wallgen's {} MiB of the layer arena; no wallpaper", w, h, REGION >> 20);
         ferros_sys::exit(1);
     }
-    let mut gpu = Gpu { cap: cap(g, S_GPU), arena, code, us: 0, runs: 0 };
+    let mut gpu = Gpu { cap: cap(g, S_GPU), arena, code, us: 0, runs: 0, longest: 0 };
     let t_all = now();
     // The survey, each candidate's preview on the GPU and tallied here.
     let t = now();
@@ -264,7 +267,9 @@ pub extern "C" fn wall_main(g: u64, input: u64, input_len: u64) -> ! {
     let fine_words = fine.words.len();
     drop(fine);
     let (t_refine, refine_gpu) = (ms(t), gpu.us - survey_gpu - draw_gpu);
-    say!("wallgen: drawn on the GPU in {} ms: survey {} candidates {} ms (GPU {} us, compiles {} us); first pass {} ms (GPU {} us, {} words compiled in {} us); marks {} ms, {} of {} pixels; refined {} ms (GPU {} us, {} words compiled in {} us); {} runs", ms(t_all), attempts, t_survey, survey_gpu, compile_us, t_draw, draw_gpu, first_words, first_us, t_mark, marked.len(), n, t_refine, refine_gpu, fine_words, fine_us, gpu.runs);
+    // Two lines: one holds 256 bytes.
+    say!("wallgen: drawn on the GPU in {} ms: survey {} candidates {} ms (GPU {} us, compiles {} us); first pass {} ms (GPU {} us, {} words compiled in {} us)", ms(t_all), attempts, t_survey, survey_gpu, compile_us, t_draw, draw_gpu, first_words, first_us);
+    say!("wallgen: marks {} ms, {} of {} pixels; refined {} ms (GPU {} us, {} words compiled in {} us); {} runs, the longest {} us", t_mark, marked.len(), n, t_refine, refine_gpu, fine_words, fine_us, gpu.runs, gpu.longest);
     drop(marked);
     // The working values (gamma-2 codes, white at 16384) as gamma2tanh samples of their light, one plane a channel.
     let t = now();
