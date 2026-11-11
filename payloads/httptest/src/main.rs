@@ -193,7 +193,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let (host, path) = (&spec[..slash], if slash < spec.len() { &spec[slash..] } else { &b"/"[..] });
 
     // An address of either family and a DNS server (INFO), waiting up to 16 s for DHCP, SLAAC or the cellular call. IPv6 first: AAAA over the IPv6 DNS server when there is one (else the IPv4 one), then A.
-    let mut out = [0u8; 4096];
+    let mut out = [0u8; 1 << 14];
     let t0 = now();
     let (flags, dns4, dns6) = loop {
         let n = a.udp(&[3], &mut out);
@@ -281,8 +281,11 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let mut tail = 0u32;
     let mut head_total = 0u64;
     let mut connected = None;
+    // TCP RECV: held a second at most for data or a change of state once the request is all in ip's send buffer (never a poll), the most data the buffer takes after the state byte.
+    let mut q = [6, h, 0, 0, 0, 0, 0];
+    q[3..7].copy_from_slice(&(out.len() as u32 - 1).to_be_bytes());
     loop {
-        if sent < body && connected.is_some() {
+        if sent < body {
             let mut s = [0u8; 600];
             s[0] = 5;
             s[1] = h;
@@ -293,7 +296,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                 sent += u16::from_be_bytes([r[1], r[2]]) as usize;
             }
         }
-        let n = a.udp(&[6, h], &mut out);
+        q[2] = if sent < body { 0 } else { 1 };
+        let n = a.udp(&q, &mut out);
         if n == 0 || n == ERR {
             a.done(b"httptest: recv failed");
         }
@@ -339,7 +343,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
             a.put(if state == 4 { b" (connection failed)" } else { b"" });
             a.done(b"");
         }
-        if n == 1 {
+        // The send buffer took none of the request yet: a millisecond before more of it.
+        if n == 1 && q[2] == 0 {
             sleep_ms(1);
         }
     }

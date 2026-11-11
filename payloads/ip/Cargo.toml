@@ -10,3 +10,5 @@ path = "src/main.rs"
 
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
+# The pure parts of the client TCP (sequence arithmetic, out-of-order ranges, options, window, RTT, congestion control), tested on the host.
+ferros_tcp = { path = "../../ferros_tcp" }

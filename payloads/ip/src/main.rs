@@ -8,17 +8,28 @@
 //! `udp` requests (first byte):
 //! - 1 SEND: family (4 or 6), address (16 bytes; IPv4 in the first 4), destination port (u16 BE), source port (u16 BE), payload → [0] sent, [1] resolving the next hop (retry), [2] no address yet, [3] bad request.
 //! - 2 RECV: port (u16 BE) → family, address (16), source port, destination port, payload, or nothing (length 0). A RECV on a port, or a SEND from it, opens it: datagrams are kept only for the last eight ports asked for (a broadcast to a port nobody reads once filled the queue for good), the oldest giving way when the queue is full. IPv4 multicast and IPv6 link-scope multicast (ff02::; Photon's LAN beacons go to 239.104.199.144 and ff02::68c7:9014, port 4384) are delivered like unicast. A fourth byte, a wait in seconds (1 to 255), holds the call while the port has nothing: answered as a datagram for it lands, else with nothing when the wait runs out (a doorbell for a blocking reader, never a poll: owner, 2026-11-10, "No polling!"; 2026-11-11, Mahere fetching its map cells, "we have tcp and http so let's get the full meal deal wired up with mahere"). Without it, or 0, the answer is at once, as before.
-//! - 3 INFO: → MAC (6), IPv4 address, mask, router (4 each), IPv6 link-local (16), IPv6 global (16), flags (bit 0 IPv4 bound, bit 1 IPv6 global, bit 2 the cellular call is up), the DNS server (4), then the cellular call's IPv6 DNS server (16), then what this ip does beyond that (bit 0: the held receives, the wait byte of ops 2 and 6): 72 bytes, where an ip from before answers 71. The addresses and DNS are the ones traffic of each family leaves with: WiFi's when it has them, else the call's.
-//! - 4 TCP CONNECT: family, address (16), port (u16 BE) → [0, handle] connecting, [2] no address yet, [4] no free connection.
-//! - 5 TCP SEND: handle, data → [0, accepted u16 BE] (what the send buffer took; send the rest later), [5] not a connection.
-//! - 6 TCP RECV: handle → [state, data…]: state 1 connecting, 2 open, 3 the peer closed (no more data once this is empty), 4 failed (reset or timed out), 5 not a connection. A third byte, a wait in seconds (1 to 255), holds the call while the connection is connecting or open with nothing taken in: answered as data lands, the peer closes, the connection fails, or when the wait runs out (then state 1 or 2 and no data). A held receive is its app asking (no idle reaping while it waits); a second held receive on the same connection answers the first as things stand. The reply carries up to 2047 bytes of data: a caller's buffer under 2 KiB loses the rest (the kernel cuts a reply at the caller's length).
+//! - 3 INFO: → MAC (6), IPv4 address, mask, router (4 each), IPv6 link-local (16), IPv6 global (16), flags (bit 0 IPv4 bound, bit 1 IPv6 global, bit 2 the cellular call is up), the DNS server (4), then the cellular call's IPv6 DNS server (16): 71 bytes. The addresses and DNS are the ones traffic of each family leaves with: WiFi's when it has them, else the call's.
+//! - 4 TCP CONNECT: family, address (16), port (u16 BE) → [0, handle] connecting, [2] no address yet, [4] no free connection, [6] no memory for its buffers (the arc could not grow).
+//! - 5 TCP SEND: handle, data (up to 4094 bytes: a call carries 4096, process.rs SYS_CALL) → [0, accepted u16 BE] (what the send buffer took; send the rest later), [5] not a connection.
+//! - 6 TCP RECV: handle, wait, most (u32 BE) → [state, data…]: state 1 connecting, 2 open, 3 the peer closed (no more data once this is empty), 4 failed (reset or timed out), 5 not a connection (or a request shorter than its 7 bytes). The data is what the connection has taken in, up to `most` and at most 2^18 bytes (`RECV_MAX`, the kernel's largest reply), so the caller's reply buffer holds 1 + most (the kernel cuts a reply at the caller's length). With `wait` 1 to 255 (seconds) the call is held while the connection has nothing new: answered as data lands, as its state changes (it opens, the peer closes, it fails), or when the wait runs out (then its state and no data); 0 answers at once. A held receive is its app asking (no idle reaping while it waits); a second held receive on the same connection answers the first as things stand.
 //!
-//! Held receives: up to eight at once (`HELDN`), the oldest answered as things stand when a ninth comes. While nobody is present each is answered with nothing, as any request would be.
+//! Held receives: up to sixteen at once (`HELDN`), the oldest answered as things stand when a ninth comes. While nobody is present each is answered with nothing, as any request would be.
 //! - 7 TCP CLOSE: handle → [0]: a FIN after the data already sent; the connection is freed once both sides have closed (or 16 s on). A connection its app has not asked about (send, receive, close) for 32 s is reset and freed: an app that dies leaves no slot behind.
+//!
+//! No op carries a version: every caller is in this repo or Mahere's and changes with it (owner, 2026-11-11: "No existing callers yet, so no need to version it").
 //! - 8 JOIN: family, group address (16) → [0]: join a multicast group — an IGMPv2 membership report (IPv4) or an MLDv1 listener report (IPv6) now and every 60 s, so a snooping access point forwards the group to us (2026-10-26: the desktop's Photon beacons to 239.104.199.144 never reached the device until it reported itself a member; broadcast did). The firmware already passes all multicast; the switch was the filter. Up to eight groups.
 //! - 9 LINK: mode → [0]: 0 both links, WiFi preferred (the default); 1 cellular only; 2 WiFi only. A test can take the cellular path with WiFi up; existing connections keep their link.
 //!
-//! TCP here: two connections, a 4 KiB receive window each (what the client has not yet taken; the window is the flow control), a 2 KiB send buffer, MSS 1200, go-back retransmission from the oldest unacknowledged byte (1 s, doubling to 8 s, six tries), no options but MSS on the SYN.
+//! TCP here, client only, re-engineered for throughput on 2026-11-11 (owner: "sounds like it needs re-engineered", after Mahere's 1.6 MB base cells crawled thru two connections of a 4 KiB window, about 80 KB/s at a 50 ms round trip). The protocol's pure parts are ferros_tcp, tested on the host.
+//! - Sixteen connections (`TCPN`). An idle one costs its control state alone (`Tcb`, a static table); an open one holds a block of the arc (`Blocks`): a 1 MiB receive buffer and a 256 KiB send buffer. The kernel maps 4 MiB of heap at spawn (three blocks); the arc grows for more as connections open (SYS_ARC, docs/ARCS.md) and shrinks again when the highest blocks are free.
+//! - The receive window is the free room of the 1 MiB buffer, said with window scaling (RFC 7323, shift 5); a peer that offers no scaling gets 64 KiB of it. Its right edge moves by a segment, or half the buffer, at least (silly-window avoidance), and a read that reopens a window shrunk under half says so at once.
+//! - Segments past a hole are kept in place in the buffer (eight ranges, `ferros_tcp::Ooo`) and delivered when the hole fills; each is ACKed at once with SACK blocks (RFC 2018), so the peer resends only what is missing.
+//! - ACKs: every second in-order segment, at once for PSH, FIN, out-of-order data, a filled hole or a duplicate, and whatever is still owed at the end of each pass over the links (`tcp_acks`). No delayed-ACK timer: while data flows a pass takes a millisecond at most.
+//! - Sending within the peer's window and a congestion window: slow start, congestion avoidance, fast retransmit on three duplicate ACKs and NewReno recovery (RFC 5681, RFC 6582). SACK blocks the peer sends are read but not used yet: NewReno resends one hole a round trip. The retransmission timeout comes from measured round trips (RFC 6298, Karn's rule), 250 ms to 8 s, doubling at each expiry; the eighth expiry fails the connection. That timer is the one timer here, and it must be: a segment lost with nothing after it brings no ACK to say so. A closed peer window is probed on the same timer.
+//! - The MSS from the link the connection leaves on: WiFi's 1500-byte MTU, the cellular call's MTU, less the headers of its family; 1200 when the call reports nothing believable.
+//! - Each connection's measures go to the console when it is freed (`report`): bytes each way, round trip, retransmissions, out-of-order holding, the buffer's use, the peak rate.
+//!   The line: `tcp A#<handle> port A#<port> <how it ended>: in A#<bytes> bytes, out A#<bytes>, open A#<ms> ms, peak A#<x.y> MiB/s, average A#<x.y> MiB/s, round trip A#<x.y> ms (variation A#<x.y>, timeout A#<x.y>), resent A#<n> segments (fast retransmits A#<n>, expiries A#<n>), out of order A#<n> segments (most held A#<bytes> bytes), waiting for the app most A#<bytes> of A#<window>, MSS A#<out> out A#<in> in, scale A#<out> out A#<in> in, SACK, congestion window A#<bytes>`.
+//! - No listening, no TIME-WAIT (a client's ports are random), no timestamps, no keep-alives. Every incoming segment's checksum is checked; a reset counts only at the next expected byte, and one elsewhere in the window, or a SYN on an open connection, gets a challenge ACK (RFC 5961).
 //!
 //! Checksums are ones'-complement sums (RFC 1071: wide adds, one fold at the end). IPv4 UDP goes out with checksum 0 (allowed); IPv6 UDP and every ICMP carry one. The IPv6 interface identifier is random per session (from the entropy right) until a persistent device secret is granted (then RFC 7217 stable-privacy). No duplicate address detection yet.
 //!
@@ -87,7 +98,9 @@ struct Ip {
     ports: [u16; 8],
     ports_at: usize,
     qseq: u32,
-    tcp: [Tcp; TCPN],
+    /// The connections' control state (a static table) and their buffers' blocks of the arc.
+    tcb: &'static mut [Tcb; TCPN],
+    blocks: Blocks,
     eph: u16,
     seed: u32,
     groups: [(u8, [u8; 16]); 8],
@@ -114,23 +127,27 @@ struct Ip {
     held_seq: u32,
 }
 
-/// Held receives at once: eight, as many as the ports kept for UDP readers; a connection's reader takes one too.
-const HELDN: usize = 1 << 3;
-/// INFO's last byte: bit 0, this ip holds receives (the wait byte of ops 2 and 6).
-const DOES_HOLD: u8 = 1;
+/// Frames taken from each link a pass, and application requests: 64 frames (a 1 MiB window in flight is about 700 segments; at 16 a pass a busy link waited on its own queue), eight requests.
+const FRAMES_PASS: usize = 1 << 6;
+const REQS_PASS: usize = 1 << 3;
 
-/// One held receive: its reply token, when its wait runs out, and what it waits on (a UDP port, or a TCP connection's handle when `tcp`).
+/// Held receives at once: sixteen, a reader on each of the connections, or eight UDP readers (as many as the ports kept for them) and eight connections.
+const HELDN: usize = 1 << 4;
+
+/// One held receive: its reply token, when its wait runs out, and what it waits on (a UDP port, or a TCP connection's handle when `tcp`, with the connection's state when it was held and the most data its reader takes).
 #[derive(Clone, Copy)]
 struct Held {
     used: bool,
     tcp: bool,
     port: u16,
     handle: u8,
+    state: u8,
+    most: u32,
     seq: u32,
     until: u64,
     tok: [u8; 32],
 }
-const HELD_FREE: Held = Held { used: false, tcp: false, port: 0, handle: 0, seq: 0, until: 0, tok: [0; 32] };
+const HELD_FREE: Held = Held { used: false, tcp: false, port: 0, handle: 0, state: 0, most: 0, seq: 0, until: 0, tok: [0; 32] };
 
 /// The cellular data call, as `rmnet` INFO gives it (modem.rs `rmnet_call`): flags (bit 0 up, bit 1 IPv4, bit 2 IPv6), MTU, addresses, the first DNS server of each family. The addresses are the line's: never printed.
 #[derive(Clone, Copy)]
@@ -144,15 +161,49 @@ struct Cell {
 }
 const CELL_DOWN: Cell = Cell { flags: 0, mtu: 0, v4: [0; 4], v6: [0; 16], dns4: [0; 4], dns6: [0; 16] };
 
+/// Connections at once: sixteen (owner, 2026-11-11, the re-engineering's plan; two until then, and Mahere held one of them at a time). An idle one costs its `Tcb` alone.
+const TCPN: usize = 1 << 4;
+/// A connection's receive buffer: 1 MiB, the most its window says with scaling (2^20 >> `RCV_WS` fits the 16-bit field). At a 50 ms round trip that is 20 MB/s from one connection before the window, not the link, is what holds it back.
+const RXB: usize = 1 << 20;
+/// A connection's send buffer: 256 KiB (an upload's window in flight; the requests Mahere and the installer send are a few hundred bytes).
+const TXB: usize = 1 << 18;
+/// A connection's buffers together, one block of the arc: the receive buffer, then the send buffer.
+const BLOCK: usize = RXB + TXB;
+/// Our window scale shift: 5, the least that says 1 MiB in 16 bits.
+const RCV_WS: u8 = 5;
+/// The window a peer that offers no scaling is given: 65535 bytes of the buffer, the most an unscaled field says.
+const NO_WS_WIN: u32 = 65535;
+/// The largest payload a segment carries here: 1460, an Ethernet MTU of 1500 less IPv4's and TCP's headers (the packet buffers are 1500 bytes).
+const MSS_MAX: usize = 1460;
+/// The data a TCP RECV reply carries at most: 2^18, the kernel's largest reply (process.rs SYS_REPLY: `STORE_MAX`, 256 KiB, plus 8 for a store's value), the state byte in front.
+const RECV_MAX: usize = 1 << 18;
+/// The largest request: 4096 bytes, all a call carries (process.rs SYS_CALL reads at most 4096).
+const MSG_MAX: usize = 1 << 12;
+/// The heap's ceiling in the image header (`ferros_sys::entry!(…, grows HEAP_CEILING)`): 32 MiB, room for every connection's block above what the kernel maps at spawn, in either mode (masked arcs grow by doubling).
+const HEAP_CEILING: usize = 1 << 25;
+/// The heap the kernel maps after .bss at spawn for an image whose heap grows (process.rs `HEAP_START`): 4 MiB, three blocks.
+const HEAP_START: usize = 4 << 20;
+/// Retransmission expiries a connection survives: the eighth fails it (from 250 ms, doubling to the 8 s ceiling: about 30 s in all).
+const TRIES: u32 = 1 << 3;
+/// `blk` while a connection holds no block.
+const NO_BLOCK: u8 = u8::MAX;
+/// Segment flags.
+const FIN: u8 = 1;
+const SYN: u8 = 2;
+const RST: u8 = 4;
+const PSH: u8 = 8;
+const ACK: u8 = 16;
+/// Why a connection ended, for its report.
+const WHY_CLOSED: u8 = 0;
+const WHY_RESET: u8 = 1;
+const WHY_TIMEOUT: u8 = 2;
+const WHY_IDLE: u8 = 3;
+const WHY_LINGER: u8 = 4;
 
-const TCPN: usize = 2;
-const RXW: usize = 4096;
-const TXB: usize = 2048;
-const MSS: usize = 1200;
-
-/// One client connection (see the header): state 0 free, 1 SYN sent, 2 open, 3 the peer closed, 4 failed. It keeps the link and source address it opened with (`cell`, `src`).
+/// One client connection (see the header): state 0 free, 1 SYN sent, 2 open, 3 the peer closed, 4 failed. It keeps the link and source address it opened with (`cell`, `src`), and its buffers' block while it is not free (`blk`).
+/// The receive buffer is a ring: the `rx_len` bytes from `rx_head` are in order for the app, and the byte at sequence number s past `rcv_nxt` lives `s - rcv_nxt` past them (`Ooo` says which such ranges are there). The send buffer is a ring too: `tx_len` bytes from `tx_head`, the first of them at `snd_una`.
 #[derive(Clone, Copy)]
-struct Tcp {
+struct Tcb {
     state: u8,
     fam: u8,
     cell: bool,
@@ -160,30 +211,208 @@ struct Tcp {
     addr: [u8; 16],
     rport: u16,
     lport: u16,
+    blk: u8,
     iss: u32,
     snd_una: u32,
     snd_nxt: u32,
     snd_max: u32,
+    /// The peer's window in bytes (its field shifted by its scale), and the segment that last set it (RFC 9293 3.10.7.4, SND.WL1 and SND.WL2).
+    snd_wnd: u32,
+    wl1: u32,
+    wl2: u32,
+    /// The peer's scale shift and ours (both 0 unless both SYNs carried one), and whether the peer permits SACK.
+    snd_ws: u8,
+    rcv_ws: u8,
+    sack_ok: bool,
+    /// The segment size we send (the peer's MSS and our link's, the smaller) and the one we said we take.
+    smss: u32,
+    rmss: u32,
     rcv_nxt: u32,
-    peer_win: u32,
-    rx: [u8; RXW],
-    rx_head: usize,
-    rx_len: usize,
-    tx: [u8; TXB],
-    tx_len: usize,
+    /// The right edge last advertised (`rcv_nxt` plus the window then), and the most the window may be (`RXB`, or `NO_WS_WIN` without scaling).
+    rcv_adv: u32,
+    rcv_total: u32,
+    rx_head: u32,
+    rx_len: u32,
+    tx_head: u32,
+    tx_len: u32,
+    ooo: ferros_tcp::Ooo,
+    /// In-order segments taken since our last ACK; an ACK owed at the end of the pass.
+    unacked: u32,
+    owed: bool,
     fin_queued: bool,
     fin_sent: bool,
     fin_ever: bool,
     fin_acked: bool,
+    /// The peer's FIN: taken (`peer_fin`), or seen past a hole at `fin_seq` (`fin_in`) and taken once the data before it is.
     peer_fin: bool,
-    rto: u64,
+    fin_in: bool,
+    fin_seq: u32,
+    rtt: ferros_tcp::Rtt,
+    /// When the retransmission timer fires (0: not running) and the expiries in a row.
     rto_t: u64,
     tries: u32,
+    /// The segment being timed for a round trip (Karn: never a retransmitted one): the byte whose ACK ends it, and when it left.
+    timing: bool,
+    rtt_seq: u32,
+    rtt_t: u64,
+    cc: ferros_tcp::Cc,
     closed_t: u64,
     /// When its app last asked anything of it (connect, send, receive, close): an app that died or stopped asking leaves it to `tcp_tick`, which frees it 32 s on (2026-10-31: two stalled downloads, their apps killed, held both slots and every connect after was refused).
     touched: u64,
+    /// Measures for the report (`report`): when it was asked for, when it opened, when data last came; bytes in (delivered in order) and out (acknowledged); segments resent (fast retransmits among them) and timer expiries; segments kept out of order and the most bytes so held; the most bytes waiting for the app; the peak rate over quarter seconds (bytes a second) and where its current quarter began.
+    asked_t: u64,
+    up_t: u64,
+    last_in_t: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    resent: u32,
+    fast: u32,
+    expiries: u32,
+    ooo_segs: u32,
+    ooo_most: u32,
+    rx_most: u32,
+    peak: u64,
+    rate_t: u64,
+    rate_b: u64,
+    why: u8,
 }
-const TCP_FREE: Tcp = Tcp { state: 0, fam: 0, cell: false, src: [0; 16], addr: [0; 16], rport: 0, lport: 0, iss: 0, snd_una: 0, snd_nxt: 0, snd_max: 0, rcv_nxt: 0, peer_win: 0, rx: [0; RXW], rx_head: 0, rx_len: 0, tx: [0; TXB], tx_len: 0, fin_queued: false, fin_sent: false, fin_ever: false, fin_acked: false, peer_fin: false, rto: 0, rto_t: 0, tries: 0, closed_t: 0, touched: 0 };
+const TCB_FREE: Tcb = Tcb {
+    state: 0,
+    fam: 0,
+    cell: false,
+    src: [0; 16],
+    addr: [0; 16],
+    rport: 0,
+    lport: 0,
+    blk: NO_BLOCK,
+    iss: 0,
+    snd_una: 0,
+    snd_nxt: 0,
+    snd_max: 0,
+    snd_wnd: 0,
+    wl1: 0,
+    wl2: 0,
+    snd_ws: 0,
+    rcv_ws: 0,
+    sack_ok: false,
+    smss: 0,
+    rmss: 0,
+    rcv_nxt: 0,
+    rcv_adv: 0,
+    rcv_total: 0,
+    rx_head: 0,
+    rx_len: 0,
+    tx_head: 0,
+    tx_len: 0,
+    ooo: ferros_tcp::Ooo::EMPTY,
+    unacked: 0,
+    owed: false,
+    fin_queued: false,
+    fin_sent: false,
+    fin_ever: false,
+    fin_acked: false,
+    peer_fin: false,
+    fin_in: false,
+    fin_seq: 0,
+    rtt: ferros_tcp::Rtt::new(0),
+    rto_t: 0,
+    tries: 0,
+    timing: false,
+    rtt_seq: 0,
+    rtt_t: 0,
+    cc: ferros_tcp::Cc { cwnd: 0, ssthresh: 0, dup: 0, recover: 0, recovering: false },
+    closed_t: 0,
+    touched: 0,
+    asked_t: 0,
+    up_t: 0,
+    last_in_t: 0,
+    bytes_in: 0,
+    bytes_out: 0,
+    resent: 0,
+    fast: 0,
+    expiries: 0,
+    ooo_segs: 0,
+    ooo_most: 0,
+    rx_most: 0,
+    peak: 0,
+    rate_t: 0,
+    rate_b: 0,
+    why: 0,
+};
+
+/// The connections' buffers, a block (`BLOCK`) each, from the arc (owner, 2026-11-11: taken when a connection opens, given back when it closes, from the arc grown on demand). Block k lives in the heap the kernel maps at spawn while k < `start`, else `k - start` blocks above the arc's top at spawn (`top0`, an arc offset), which the arc grows to reach (SYS_ARC, `ferros_sys::arc`). A connection takes the lowest free block, so the arc stays as low as it can, and when the highest blocks are free it shrinks back (the kernel rounds as the arc's mode needs: a masked arc keeps its power of two until it can halve).
+/// A kernel without SYS_ARC maps the whole declared heap at spawn: every block is then in it, and nothing grows (`grows` false).
+struct Blocks {
+    heap: usize,
+    start: usize,
+    top0: usize,
+    top: usize,
+    grows: bool,
+    /// Bit k: block k is a connection's.
+    used: u32,
+}
+
+impl Blocks {
+    /// Block k's address.
+    fn addr(&self, k: u8) -> usize {
+        let k = k as usize;
+        if k < self.start { self.heap + k * BLOCK } else { ferros_sys::arc_base() as usize + self.top0 + (k - self.start) * BLOCK }
+    }
+
+    /// The arc's top that holds blocks `0..n`.
+    fn need(&self, n: usize) -> usize {
+        if n <= self.start { self.top0 } else { self.top0 + (n - self.start) * BLOCK }
+    }
+
+    /// The lowest free block, the arc grown to hold it when it lies above the top; None when every connection holds one or the kernel refuses the growth (its ceiling, or too few free frames).
+    fn take(&mut self) -> Option<u8> {
+        let k = (!self.used).trailing_zeros() as usize;
+        if k >= TCPN {
+            return None;
+        }
+        let need = self.need(k + 1);
+        if need > self.top {
+            if !self.grows {
+                return None;
+            }
+            let (top, _) = ferros_sys::arc::grow(need - self.top).ok()?;
+            self.top = top;
+        }
+        self.used |= 1 << k;
+        Some(k as u8)
+    }
+
+    /// Block k given back, and the arc shrunk to the highest block still taken.
+    fn give(&mut self, k: u8) {
+        self.used &= !(1u32 << k);
+        if !self.grows {
+            return;
+        }
+        let want = self.need(32 - self.used.leading_zeros() as usize);
+        if want < self.top {
+            if let Ok((top, _)) = ferros_sys::arc::shrink(want) {
+                self.top = top;
+            }
+        }
+    }
+}
+
+/// `data` into the ring `buf` (a power of two long) from position `at`, wrapping at its end.
+fn ring_put(buf: &mut [u8], at: usize, data: &[u8]) {
+    let at = at & (buf.len() - 1);
+    let first = data.len().min(buf.len() - at);
+    buf[at..at + first].copy_from_slice(&data[..first]);
+    buf[..data.len() - first].copy_from_slice(&data[first..]);
+}
+
+/// `out.len()` bytes of the ring `buf` (a power of two long) from position `at`, wrapping at its end.
+fn ring_get(buf: &[u8], at: usize, out: &mut [u8]) {
+    let at = at & (buf.len() - 1);
+    let first = out.len().min(buf.len() - at);
+    out[..first].copy_from_slice(&buf[at..at + first]);
+    let rest = out.len() - first;
+    out[first..].copy_from_slice(&buf[..rest]);
+}
 
 impl Ip {
     fn cap(&self, slot: u64) -> u64 {
@@ -213,11 +442,11 @@ impl Ip {
             if k > 0 {
                 self.put(b".");
             }
-            self.dec_raw(*b as u32);
+            self.dec(*b as u64);
         }
     }
-    fn dec_raw(&mut self, mut v: u32) {
-        let mut b = [0u8; 10];
+    fn dec(&mut self, mut v: u64) {
+        let mut b = [0u8; 20];
         let mut i = b.len();
         loop {
             i -= 1;
@@ -337,7 +566,7 @@ impl Ip {
                 self.put(b", IPv6 ");
                 self.put(if c.flags & 4 != 0 { b"yes" } else { b"no" });
                 self.put(b", MTU A#");
-                self.dec_raw(c.mtu as u32);
+                self.dec(c.mtu as u64);
                 self.put(b"\n");
             }
         }
@@ -462,7 +691,8 @@ impl Ip {
         }
         let ihl = (p[0] & 15) as usize * 4;
         let total = (u16::from_be_bytes([p[2], p[3]]) as usize).min(p.len());
-        if total < ihl {
+        // WHY: the header length is the sender's; under 20 the body would start inside the header, past the total it would be no packet.
+        if ihl < 20 || total < ihl {
             return;
         }
         let src: [u8; 4] = p[12..16].try_into().unwrap();
@@ -502,9 +732,10 @@ impl Ip {
                 self.put(b"\n");
             }
             6 if mine && body.len() >= 20 => {
-                let mut a = [0u8; 16];
+                let (mut a, mut d) = ([0u8; 16], [0u8; 16]);
                 a[..4].copy_from_slice(&src);
-                self.tcp_in(4, a, body);
+                d[..4].copy_from_slice(&dst);
+                self.tcp_in(4, a, d, body);
             }
             17 if body.len() >= 8 => {
                 let sport = u16::from_be_bytes([body[0], body[1]]);
@@ -765,7 +996,7 @@ impl Ip {
                 r[2..4].copy_from_slice(&c.to_be_bytes());
                 self.out6(true, dst, src, 58, &r[..n], HOP);
             } else if nh == 6 && body.len() >= 20 {
-                self.tcp_in(6, src, body);
+                self.tcp_in(6, src, dst, body);
             } else if nh == 17 && body.len() >= 8 {
                 let sport = u16::from_be_bytes([body[0], body[1]]);
                 let dport = u16::from_be_bytes([body[2], body[3]]);
@@ -827,7 +1058,7 @@ impl Ip {
                 self.nd_learn(target, mac);
             }
         } else if nh == 6 && body.len() >= 20 && !multicast {
-            self.tcp_in(6, src, body);
+            self.tcp_in(6, src, dst, body);
         } else if nh == 17 && body.len() >= 8 && (!multicast || dst[1] & 15 == 2) {
             let sport = u16::from_be_bytes([body[0], body[1]]);
             let dport = u16::from_be_bytes([body[2], body[3]]);
@@ -944,27 +1175,76 @@ impl Ip {
 
     // ---- TCP (client only) ----
 
-    /// A segment of connection `i`: `flags` (FIN 1, SYN 2, RST 4, PSH 8, ACK 16), sequence `seq`, `payload`; the window is the receive buffer's room. Returns whether it went out (false: the next hop is not resolved yet).
+    /// Connection `i`'s receive buffer.
+    /// SAFETY: the block is this connection's alone while it holds it (`Blocks::take`), the arc holds its bytes (grown before the block is taken, shrunk only past the highest block still taken), and this process has one thread, so nothing else reaches these bytes while the slice is used.
+    fn rx(&self, i: usize) -> &'static mut [u8] {
+        let a = self.blocks.addr(self.tcb[i].blk);
+        unsafe { core::slice::from_raw_parts_mut(a as *mut u8, RXB) }
+    }
+
+    /// Connection `i`'s send buffer, right after its receive buffer (SAFETY as `rx`).
+    fn tx(&self, i: usize) -> &'static mut [u8] {
+        let a = self.blocks.addr(self.tcb[i].blk) + RXB;
+        unsafe { core::slice::from_raw_parts_mut(a as *mut u8, TXB) }
+    }
+
+    /// The retransmission timeout's granularity, floor and ceiling in ticks: the main loop's millisecond, 250 ms (Linux's 200 ms, to a power of two; RFC 6298's one second would hold every loss the fast retransmit misses for a second), 8 s (the ceiling this stack always had, so eight expiries fail a connection in about 30 s, as six did before).
+    fn rto_bounds(&self) -> (u64, u64, u64) {
+        (self.freq >> 10, self.freq >> 2, self.freq << 3)
+    }
+
+    /// The SACK option's length on connection `i`'s next segment: blocks while ranges are held out of order and the peer permits them, else none.
+    fn opt_len(&self, i: usize) -> usize {
+        let c = &self.tcb[i];
+        if !c.sack_ok || c.ooo.n == 0 {
+            return 0;
+        }
+        // WHY the min: an ACK carries `SACK_N` blocks at most (`Ooo::sack_blocks`).
+        4 + 8 * c.ooo.n.min(ferros_tcp::SACK_N)
+    }
+
+    /// A segment of connection `i`: `flags` (FIN, SYN, RST, PSH, ACK), sequence `seq`, `payload` (at most the connection's segment size less `opt_len`). The SYN carries our options (MSS, window scale, SACK permitted) and an unscaled window; every other segment carries the ACK, the receive window (`ferros_tcp::window`, its right edge kept in `rcv_adv`) and, while ranges are held out of order and the peer permits it, their SACK blocks; it pays any ACK owed. Returns whether it went out (false: the next hop is not resolved yet).
     fn tcp_out(&mut self, i: usize, flags: u8, seq: u32, payload: &[u8]) -> bool {
-        let c = self.tcp[i];
-        let mut seg = [0u8; 20 + 4 + MSS];
-        let hl = if flags & 2 != 0 { 24 } else { 20 };
+        let mut seg = [0u8; 20 + 40 + MSS_MAX];
+        let mut hl = 20;
+        let c = &mut self.tcb[i];
+        let field;
+        if flags & SYN != 0 {
+            seg[20..32].copy_from_slice(&ferros_tcp::syn_options(c.rmss as u16, RCV_WS));
+            hl = 32;
+            // The SYN's window is never scaled (RFC 7323 2.2).
+            field = NO_WS_WIN as u16;
+        } else {
+            if c.sack_ok && c.ooo.n > 0 {
+                let mut b = [(0, 0); ferros_tcp::SACK_N];
+                let k = c.ooo.sack_blocks(&mut b);
+                let mut o = [0u8; 4 + 8 * ferros_tcp::SACK_N];
+                let l = ferros_tcp::sack_option(&b[..k], &mut o);
+                seg[20..20 + l].copy_from_slice(&o[..l]);
+                hl += l;
+            }
+            let free = c.rcv_total - c.rx_len;
+            let left = if ferros_tcp::lt(c.rcv_adv, c.rcv_nxt) { 0 } else { c.rcv_adv.wrapping_sub(c.rcv_nxt) };
+            let (f, said) = ferros_tcp::scaled(ferros_tcp::window(free, left, c.rcv_total, c.rmss), left, c.rcv_ws);
+            field = f;
+            c.rcv_adv = c.rcv_nxt.wrapping_add(said);
+            c.owed = false;
+            c.unacked = 0;
+        }
         let n = hl + payload.len();
         seg[0..2].copy_from_slice(&c.lport.to_be_bytes());
         seg[2..4].copy_from_slice(&c.rport.to_be_bytes());
         seg[4..8].copy_from_slice(&seq.to_be_bytes());
-        seg[8..12].copy_from_slice(&(if flags & 16 != 0 { c.rcv_nxt } else { 0 }).to_be_bytes());
+        seg[8..12].copy_from_slice(&(if flags & ACK != 0 { c.rcv_nxt } else { 0 }).to_be_bytes());
         seg[12] = ((hl / 4) as u8) << 4;
         seg[13] = flags;
-        seg[14..16].copy_from_slice(&((RXW - c.rx_len) as u16).to_be_bytes());
-        if hl == 24 {
-            seg[20..24].copy_from_slice(&[2, 4, (MSS >> 8) as u8, MSS as u8]);
-        }
+        seg[14..16].copy_from_slice(&field.to_be_bytes());
         seg[hl..n].copy_from_slice(payload);
+        let (fam, cell, src, addr) = (c.fam, c.cell, c.src, c.addr);
         // On the link and from the address the connection opened with.
-        if c.fam == 4 {
-            let dst: [u8; 4] = c.addr[..4].try_into().unwrap();
-            let me: [u8; 4] = c.src[..4].try_into().unwrap();
+        if fam == 4 {
+            let dst: [u8; 4] = addr[..4].try_into().unwrap();
+            let me: [u8; 4] = src[..4].try_into().unwrap();
             let mut ph = [0u8; 12];
             ph[..4].copy_from_slice(&me);
             ph[4..8].copy_from_slice(&dst);
@@ -972,11 +1252,26 @@ impl Ip {
             ph[10..12].copy_from_slice(&(n as u16).to_be_bytes());
             let ck = csum(&seg[..n], sum(&ph));
             seg[16..18].copy_from_slice(&ck.to_be_bytes());
-            self.out4(c.cell, me, dst, 6, &seg[..n])
+            self.out4(cell, me, dst, 6, &seg[..n])
         } else {
-            let ck = Self::sum6(&c.src, &c.addr, 6, &seg[..n]);
+            let ck = Self::sum6(&src, &addr, 6, &seg[..n]);
             seg[16..18].copy_from_slice(&ck.to_be_bytes());
-            self.out6(c.cell, c.src, c.addr, 6, &seg[..n], HOP)
+            self.out6(cell, src, addr, 6, &seg[..n], HOP)
+        }
+    }
+
+    /// An ACK alone on connection `i` (the window and any SACK blocks with it).
+    fn tcp_ack(&mut self, i: usize) {
+        let s = self.tcb[i].snd_nxt;
+        self.tcp_out(i, ACK, s, &[]);
+    }
+
+    /// The ACKs still owed at the end of a pass over the links (an odd in-order segment's): no delayed-ACK timer, the pass is the batch.
+    fn tcp_acks(&mut self) {
+        for i in 0..TCPN {
+            if self.tcb[i].state != 0 && self.tcb[i].owed {
+                self.tcp_ack(i);
+            }
         }
     }
 
@@ -995,8 +1290,12 @@ impl Ip {
             out[0] = 2;
             return 1;
         };
-        let Some(i) = self.tcp.iter().position(|c| c.state == 0) else {
+        let Some(i) = self.tcb.iter().position(|c| c.state == 0) else {
             out[0] = 4;
+            return 1;
+        };
+        let Some(blk) = self.blocks.take() else {
+            out[0] = 6;
             return 1;
         };
         // A fresh initial sequence number and an ephemeral port from the session's randomness (an LCG stepped off the entropy-seeded value).
@@ -1004,172 +1303,531 @@ impl Ip {
         self.eph = 49152 + (self.eph.wrapping_add(1 + (self.seed >> 20) as u16 % 97) % 16384);
         let iss = self.seed;
         let t = now();
-        self.tcp[i] = Tcp { state: 1, fam, cell, src, addr, rport: port, lport: self.eph, iss, snd_una: iss, snd_nxt: iss.wrapping_add(1), snd_max: iss.wrapping_add(1), rto: self.freq, rto_t: t + self.freq, touched: t, ..TCP_FREE };
-        self.tcp_out(i, 2, iss, &[]);
+        // Our MSS: what the link it leaves on carries for its family (WiFi's Ethernet MTU, the call's own), less the headers.
+        let mtu = if cell { self.cell.mtu } else { 1500 };
+        let rmss = ferros_tcp::mss_for(mtu, fam) as u32;
+        let one = iss.wrapping_add(1);
+        self.tcb[i] = Tcb { state: 1, fam, cell, src, addr, rport: port, lport: self.eph, blk, iss, snd_una: iss, snd_nxt: one, snd_max: one, rmss, smss: rmss, rcv_total: NO_WS_WIN, rtt: ferros_tcp::Rtt::new(self.freq), rto_t: t + self.freq, timing: true, rtt_seq: one, rtt_t: t, touched: t, asked_t: t, ..TCB_FREE };
+        self.tcp_out(i, SYN, iss, &[]);
         out[0] = 0;
         out[1] = i as u8;
         2
     }
 
-    fn tcp_in(&mut self, fam: u8, src: [u8; 16], seg: &[u8]) {
+    /// Connection `i` failed (`why`: reset, or unanswered): its data still unread stays for its app, nothing more is sent.
+    fn tcp_fail(&mut self, i: usize, why: u8) {
+        let c = &mut self.tcb[i];
+        c.state = 4;
+        c.why = why;
+        c.rto_t = 0;
+    }
+
+    /// Connection `i` freed: its report on the console, its block given back.
+    fn tcp_free(&mut self, i: usize, why: u8) {
+        self.report(i, why);
+        let blk = self.tcb[i].blk;
+        if blk != NO_BLOCK {
+            self.blocks.give(blk);
+        }
+        self.tcb[i] = TCB_FREE;
+    }
+
+    /// A segment in for us: `src` the peer, `dst` our address it came to, `seg` the TCP header and data (20 bytes at least, the callers' check).
+    fn tcp_in(&mut self, fam: u8, src: [u8; 16], dst: [u8; 16], seg: &[u8]) {
+        // The checksum over the pseudo-header and the whole segment folds to zero when nothing changed on the way (RFC 9293 3.1): a bad one is dropped, as if lost (a corrupted byte would otherwise land in a map cell).
+        let ok = if fam == 4 {
+            let mut ph = [0u8; 12];
+            ph[..4].copy_from_slice(&src[..4]);
+            ph[4..8].copy_from_slice(&dst[..4]);
+            ph[9] = 6;
+            ph[10..12].copy_from_slice(&(seg.len() as u16).to_be_bytes());
+            csum(seg, sum(&ph)) == 0
+        } else {
+            Self::sum6(&src, &dst, 6, seg) == 0
+        };
+        if !ok {
+            return;
+        }
         let sport = u16::from_be_bytes([seg[0], seg[1]]);
         let dport = u16::from_be_bytes([seg[2], seg[3]]);
-        let Some(i) = self.tcp.iter().position(|c| c.state != 0 && c.fam == fam && c.addr == src && c.rport == sport && c.lport == dport) else { return };
+        let Some(i) = self.tcb.iter().position(|c| c.state != 0 && c.fam == fam && c.addr == src && c.rport == sport && c.lport == dport) else { return };
         let seq = u32::from_be_bytes([seg[4], seg[5], seg[6], seg[7]]);
         let ack = u32::from_be_bytes([seg[8], seg[9], seg[10], seg[11]]);
-        let off = ((seg[12] >> 4) as usize * 4).clamp(20, seg.len());
+        // WHY the checks: the data offset is the peer's; under 20 it would read the header as options, past the segment it would read what is not there.
+        let off = (seg[12] >> 4) as usize * 4;
+        if off < 20 || off > seg.len() {
+            return;
+        }
         let flags = seg[13];
         let win = u16::from_be_bytes([seg[14], seg[15]]) as u32;
+        let opts = ferros_tcp::parse(&seg[20..off]);
         let data = &seg[off..];
-        let c = &mut self.tcp[i];
-        if flags & 4 != 0 {
-            c.state = 4;
+        let t = now();
+        if self.tcb[i].state == 1 {
+            self.tcp_synack(i, flags, seq, ack, win, &opts, t);
             return;
         }
-        if c.state == 1 {
-            if flags & 18 == 18 && ack == c.iss.wrapping_add(1) {
-                c.rcv_nxt = seq.wrapping_add(1);
-                c.snd_una = ack;
-                c.peer_win = win;
-                c.state = 2;
-                c.tries = 0;
-                self.tcp_out(i, 16, ack, &[]);
-            }
+        // Failed: nothing more is answered (its app reads what came before).
+        if self.tcb[i].state == 4 {
             return;
         }
-        c.peer_win = win;
-        if flags & 16 != 0 {
-            // What the ack covers: data from the send buffer's front, then our FIN. Up to the most ever sent: after a go-back the ack can run ahead of what has been resent.
-            let acked = ack.wrapping_sub(c.snd_una);
-            let in_flight = c.snd_max.wrapping_sub(c.snd_una);
-            if acked > 0 && acked <= in_flight {
-                let data_acked = (acked as usize).min(c.tx_len);
-                c.tx.copy_within(data_acked..c.tx_len, 0);
-                c.tx_len -= data_acked;
-                if c.fin_ever && ack == c.snd_max {
-                    c.fin_acked = true;
-                }
-                c.snd_una = ack;
-                if ack.wrapping_sub(c.snd_nxt) as i32 > 0 {
-                    c.snd_nxt = ack;
-                }
-                c.tries = 0;
-                c.rto = self.freq;
-                c.rto_t = now() + c.rto;
-            }
-        }
-        let mut reply = false;
-        if !data.is_empty() {
+        let c = &self.tcb[i];
+        let free = c.rcv_total - c.rx_len;
+        // A reset (RFC 5961 3.2): at exactly the next expected byte it ends the connection; elsewhere in the window it gets a challenge ACK (a blind attacker's guess is answered, not obeyed); outside it, nothing.
+        if flags & RST != 0 {
             if seq == c.rcv_nxt {
-                let take = data.len().min(RXW - c.rx_len);
-                for (k, &b) in data[..take].iter().enumerate() {
-                    c.rx[(c.rx_head + c.rx_len + k) % RXW] = b;
+                self.tcp_fail(i, WHY_RESET);
+            } else if seq.wrapping_sub(c.rcv_nxt) < free {
+                self.tcp_ack(i);
+            }
+            return;
+        }
+        // A SYN on an open connection: a challenge ACK, nothing else (RFC 5961 4.2).
+        if flags & SYN != 0 {
+            self.tcp_ack(i);
+            return;
+        }
+        if flags & ACK == 0 {
+            return;
+        }
+        // An ACK of what was never sent: answered with ours and dropped (RFC 9293 3.10.7.4).
+        if ferros_tcp::lt(c.snd_max, ack) {
+            self.tcp_ack(i);
+            return;
+        }
+        let (g, rto_min, rto_max) = self.rto_bounds();
+        let c = &mut self.tcb[i];
+        // WHY no bound: the field is 16 bits and the shift at most 14 (ferros_tcp::parse), so the window fits 30 bits.
+        let wnd = win << c.snd_ws;
+        let smss = c.smss;
+        let mut resend = false;
+        if ferros_tcp::lt(c.snd_una, ack) {
+            // New data acknowledged: off the send buffer's front, then our FIN.
+            let acked = ack.wrapping_sub(c.snd_una);
+            let sent_before = c.snd_nxt.wrapping_sub(c.snd_una);
+            // WHY the min: the ACK covers our FIN too once it is out, and the FIN is no byte of the buffer.
+            let data_acked = acked.min(c.tx_len);
+            c.tx_head = (c.tx_head + data_acked) & (TXB as u32 - 1);
+            c.tx_len -= data_acked;
+            c.bytes_out += data_acked as u64;
+            if c.fin_ever && ack == c.snd_max {
+                c.fin_acked = true;
+            }
+            c.snd_una = ack;
+            if ferros_tcp::lt(c.snd_nxt, ack) {
+                c.snd_nxt = ack;
+            }
+            if c.timing && ferros_tcp::le(c.rtt_seq, ack) {
+                c.rtt.sample(t.wrapping_sub(c.rtt_t), g, rto_min, rto_max);
+                c.timing = false;
+            }
+            c.tries = 0;
+            c.rtt.reset();
+            c.rto_t = if c.snd_max == c.snd_una { 0 } else { t + c.rtt.cur };
+            let limited = sent_before + smss >= c.cc.cwnd;
+            resend = c.cc.on_ack(ack, acked, c.snd_max.wrapping_sub(ack), limited, smss) == ferros_tcp::Act::Resend;
+        } else if ack == c.snd_una && data.is_empty() && flags & FIN == 0 && wnd == c.snd_wnd && c.snd_max != c.snd_una {
+            // A duplicate ACK (RFC 5681 2): a segment arrived past a hole at the peer.
+            let flight = c.snd_max.wrapping_sub(c.snd_una);
+            resend = c.cc.on_dup(c.snd_una, c.snd_max, flight, smss) == ferros_tcp::Act::Resend;
+            if resend && c.cc.dup == 3 {
+                c.fast += 1;
+            }
+        }
+        // The peer's window, from the newest segment only (RFC 9293 3.10.7.4).
+        if ferros_tcp::lt(c.wl1, seq) || (c.wl1 == seq && ferros_tcp::le(c.wl2, ack)) {
+            c.snd_wnd = wnd;
+            c.wl1 = seq;
+            c.wl2 = ack;
+        }
+        // A closed window answered: the peer lives, so its probes going unanswered by data are no failure.
+        if c.snd_wnd == 0 {
+            c.tries = 0;
+        }
+        if resend {
+            self.tcp_resend(i);
+        }
+        let rx = self.rx(i);
+        let freq = self.freq;
+        let c = &mut self.tcb[i];
+        let fin = flags & FIN != 0;
+        let mut now_ack = false;
+        let mut delivered = 0u32;
+        if c.state == 2 && (!data.is_empty() || fin) {
+            let nxt0 = c.rcv_nxt;
+            let free0 = c.rcv_total - c.rx_len;
+            let (mut s, mut d) = (seq, data);
+            // What came before the next expected byte came before: only its new part is taken. WHY the test: the overlap is the peer's numbers; a skip past the data leaves none.
+            if ferros_tcp::lt(s, nxt0) {
+                let skip = nxt0.wrapping_sub(s) as usize;
+                d = if skip < d.len() { &d[skip..] } else { &[] };
+                s = nxt0;
+            }
+            let at = s.wrapping_sub(nxt0);
+            if d.is_empty() {
+                // All of it came before (a retransmission: our ACK was lost), or a FIN alone.
+                now_ack |= !data.is_empty();
+            } else if at >= free0 {
+                // Past the window (a probe of a closed one, or a peer that overran it): not kept, ACKed so the peer hears the window.
+                now_ack = true;
+            } else {
+                // WHY the min: the room past `at` is all the window gave; past it the bytes have nowhere to go.
+                let take = (d.len() as u32).min(free0 - at);
+                ring_put(rx, (c.rx_head + c.rx_len + at) as usize, &d[..take as usize]);
+                if at == 0 {
+                    c.rx_len += take;
+                    c.rcv_nxt = c.rcv_nxt.wrapping_add(take);
+                    delivered = take;
+                    // The hole before held ranges filled: they join, and the peer hears at once.
+                    let filled = c.ooo.advance(c.rcv_nxt);
+                    if filled != c.rcv_nxt {
+                        let more = filled.wrapping_sub(c.rcv_nxt);
+                        c.rx_len += more;
+                        c.rcv_nxt = filled;
+                        delivered += more;
+                        now_ack = true;
+                    }
+                    // Every second in-order segment ACKed at once (RFC 5681 4.2), one with PSH too; an odd one at the pass's end (`tcp_acks`).
+                    c.unacked += 1;
+                    if c.unacked >= 2 || flags & PSH != 0 {
+                        now_ack = true;
+                    } else {
+                        c.owed = true;
+                    }
+                } else {
+                    // Past a hole: kept in place, and a duplicate ACK at once with the SACK blocks, so the peer's fast retransmit fills the hole.
+                    c.ooo.latest = s;
+                    if c.ooo.insert(s, s.wrapping_add(take)) {
+                        c.ooo_segs += 1;
+                        let held = c.ooo.bytes();
+                        // WHY the max: the high water, for the report.
+                        c.ooo_most = c.ooo_most.max(held);
+                    }
+                    now_ack = true;
                 }
-                c.rx_len += take;
-                c.rcv_nxt = c.rcv_nxt.wrapping_add(take as u32);
             }
-            reply = true;
-        }
-        if flags & 1 != 0 && seq.wrapping_add(data.len() as u32) == c.rcv_nxt && !c.peer_fin {
-            c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
-            c.peer_fin = true;
-            if c.state == 2 {
+            // The peer's FIN at the end of this segment, kept once every byte before it fits the window, and taken when they are all in.
+            let fin_at = seq.wrapping_add(data.len() as u32);
+            if fin && ferros_tcp::le(nxt0, fin_at) && fin_at.wrapping_sub(nxt0) <= free0 {
+                c.fin_in = true;
+                c.fin_seq = fin_at;
+            }
+            // A FIN is ACKed at once, in order or not (RFC 5681 4.2).
+            now_ack |= fin;
+            if c.fin_in && c.rcv_nxt == c.fin_seq {
+                c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
+                c.peer_fin = true;
                 c.state = 3;
+                now_ack = true;
             }
-            reply = true;
+        } else if c.state == 3 && (!data.is_empty() || fin) {
+            // After the peer's FIN: a retransmission (our ACK of it was lost).
+            now_ack = true;
         }
-        if reply {
-            let s = c.snd_nxt;
-            self.tcp_out(i, 16, s, &[]);
+        if delivered > 0 {
+            c.bytes_in += delivered as u64;
+            c.last_in_t = t;
+            // WHY the max: the high water, for the report.
+            c.rx_most = c.rx_most.max(c.rx_len);
+            // The rate over quarter seconds, its peak kept.
+            let dt = t.wrapping_sub(c.rate_t);
+            if dt >= freq >> 2 {
+                let r = (c.bytes_in - c.rate_b) * freq / dt;
+                if r > c.peak {
+                    c.peak = r;
+                }
+                c.rate_t = t;
+                c.rate_b = c.bytes_in;
+            }
+        }
+        if now_ack {
+            self.tcp_ack(i);
         }
     }
 
-    /// Each pass: new data out (within the peer's window), our FIN once the data is out, retransmission from the oldest unacknowledged byte on timeout, and freeing finished connections.
+    /// The answer to our SYN (connection `i` in state 1): a SYN-ACK of it opens the connection with what its options say; a reset of it fails the connection; anything else is not for it.
+    fn tcp_synack(&mut self, i: usize, flags: u8, seq: u32, ack: u32, win: u32, opts: &ferros_tcp::Opts, t: u64) {
+        let (g, rto_min, rto_max) = self.rto_bounds();
+        let c = &mut self.tcb[i];
+        let mine = ack == c.iss.wrapping_add(1);
+        if flags & RST != 0 {
+            // A refusal: only one that acknowledges our SYN counts (RFC 9293 3.10.7.3).
+            if flags & ACK != 0 && mine {
+                self.tcp_fail(i, WHY_RESET);
+            }
+            return;
+        }
+        if flags & (SYN | ACK) != SYN | ACK || !mine {
+            return;
+        }
+        c.rcv_nxt = seq.wrapping_add(1);
+        c.rcv_adv = c.rcv_nxt;
+        c.snd_una = ack;
+        // Window scaling only when both SYNs carry it (RFC 7323 2.2); without it the window is 64 KiB of the buffer.
+        if let Some(ws) = opts.ws {
+            c.snd_ws = ws;
+            c.rcv_ws = RCV_WS;
+            c.rcv_total = RXB as u32;
+        } else {
+            c.snd_ws = 0;
+            c.rcv_ws = 0;
+            c.rcv_total = NO_WS_WIN;
+        }
+        c.sack_ok = opts.sack_ok;
+        let peer = if opts.mss != 0 { opts.mss } else { ferros_tcp::mss_default(c.fam) } as u32;
+        // WHY the floor: the MSS is the peer's; 0 would leave the send loop unable to move a byte and a few bytes a segment is a flood of headers (Linux refuses under 88, TCP_MIN_MSS). The smaller of its MSS and ours, as our link carries no more.
+        let peer = peer.max(1 << 6);
+        c.smss = peer.min(c.rmss);
+        // The SYN-ACK's window is never scaled (RFC 7323 2.2).
+        c.snd_wnd = win;
+        c.wl1 = seq;
+        c.wl2 = ack;
+        c.cc = ferros_tcp::Cc::new(c.smss, c.iss);
+        // Karn's rule: a SYN sent again is not timed.
+        if c.timing && c.tries == 0 {
+            c.rtt.sample(t.wrapping_sub(c.rtt_t), g, rto_min, rto_max);
+        }
+        c.timing = false;
+        c.tries = 0;
+        c.rtt.reset();
+        c.rto_t = 0;
+        c.state = 2;
+        c.up_t = t;
+        c.rate_t = t;
+        c.last_in_t = t;
+        self.tcp_ack(i);
+    }
+
+    /// The first unacknowledged segment of connection `i` sent again (a fast retransmit, or the next hole in NewReno's recovery): from the send buffer's front, or our FIN when only it is outstanding.
+    fn tcp_resend(&mut self, i: usize) {
+        let room = self.tcb[i].smss as usize - self.opt_len(i);
+        let c = self.tcb[i];
+        // WHY the min: a segment's worth, or what the buffer holds.
+        let n = (c.tx_len as usize).min(room);
+        let mut p = [0u8; MSS_MAX];
+        if n > 0 {
+            ring_get(self.tx(i), c.tx_head as usize, &mut p[..n]);
+            self.tcp_out(i, ACK, c.snd_una, &p[..n]);
+        } else if c.fin_ever && !c.fin_acked {
+            self.tcp_out(i, ACK | FIN, c.snd_una, &[]);
+        } else {
+            return;
+        }
+        let c = &mut self.tcb[i];
+        c.resent += 1;
+        c.timing = false;
+        let end = c.snd_una.wrapping_add(if n > 0 { n as u32 } else { 1 });
+        if ferros_tcp::lt(c.snd_nxt, end) {
+            c.snd_nxt = end;
+        }
+    }
+
+    /// Each pass: finished connections freed, retransmission on expiry (back to the oldest unacknowledged byte, the congestion window to one segment), then new data out (`tcp_push`).
     fn tcp_tick(&mut self) {
         let t = now();
+        let (_, _, rto_max) = self.rto_bounds();
         for i in 0..TCPN {
-            let c = self.tcp[i];
+            let c = self.tcb[i];
             if c.state == 0 {
                 continue;
             }
-            if (c.fin_acked && c.peer_fin) || (c.closed_t != 0 && t.wrapping_sub(c.closed_t) > 16 * self.freq) {
-                self.tcp[i] = TCP_FREE;
+            if c.fin_acked && c.peer_fin {
+                self.tcp_free(i, WHY_CLOSED);
+                continue;
+            }
+            if c.closed_t != 0 && t.wrapping_sub(c.closed_t) > 16 * self.freq {
+                self.tcp_free(i, WHY_LINGER);
                 continue;
             }
             // Abandoned: a reset to the peer if it was open (it stops sending), then the slot is free.
             if t.wrapping_sub(c.touched) > 32 * self.freq {
                 if c.state == 2 || c.state == 3 {
-                    let s = c.snd_nxt;
-                    self.tcp_out(i, 4 | 16, s, &[]);
+                    self.tcp_out(i, RST | ACK, c.snd_nxt, &[]);
                 }
-                self.tcp[i] = TCP_FREE;
+                self.tcp_free(i, WHY_IDLE);
                 continue;
             }
             if c.state == 4 {
                 continue;
             }
-            let in_flight = c.snd_max.wrapping_sub(c.snd_una);
-            if in_flight > 0 && t > c.rto_t {
-                if c.tries >= 6 {
-                    self.tcp[i].state = 4;
+            // The retransmission timer: the one timer TCP needs (a segment lost with nothing after it brings no ACK to say so).
+            let flight = c.snd_max.wrapping_sub(c.snd_una);
+            let mut expired = false;
+            if c.rto_t != 0 && t > c.rto_t && (flight > 0 || c.state == 1) {
+                if c.tries + 1 >= TRIES {
+                    self.tcp_fail(i, WHY_TIMEOUT);
                     continue;
                 }
-                let c = &mut self.tcp[i];
+                let c = &mut self.tcb[i];
                 c.tries += 1;
-                c.rto = (c.rto * 2).min(8 * self.freq);
-                c.rto_t = t + c.rto;
+                c.expiries += 1;
+                c.rtt.backoff(rto_max);
+                c.rto_t = t + c.rtt.cur;
+                c.timing = false;
                 if c.state == 1 {
                     let iss = c.iss;
-                    self.tcp_out(i, 2, iss, &[]);
+                    self.tcp_out(i, SYN, iss, &[]);
                     continue;
                 }
+                c.cc.on_timeout(flight, c.snd_max, c.smss);
                 // Go back to the oldest unacknowledged byte.
                 c.snd_nxt = c.snd_una;
                 c.fin_sent = false;
+                expired = true;
             }
-            if self.tcp[i].state < 2 {
-                continue;
-            }
-            // New data, MSS at a time, within the peer's window.
-            loop {
-                let c = self.tcp[i];
-                let sent = c.snd_nxt.wrapping_sub(c.snd_una) as usize;
-                let unsent = c.tx_len.saturating_sub(sent);
-                let room = (c.peer_win as usize).saturating_sub(sent);
-                let n = unsent.min(room).min(MSS);
-                if n == 0 {
-                    break;
-                }
-                let mut p = [0u8; MSS];
-                p[..n].copy_from_slice(&c.tx[sent..sent + n]);
-                if !self.tcp_out(i, 16 | 8, c.snd_nxt, &p[..n]) {
-                    break;
-                }
-                let c = &mut self.tcp[i];
-                if c.snd_una == c.snd_nxt {
-                    c.rto_t = t + c.rto.max(self.freq);
-                }
-                c.snd_nxt = c.snd_nxt.wrapping_add(n as u32);
-                if c.snd_nxt.wrapping_sub(c.snd_max) as i32 > 0 {
-                    c.snd_max = c.snd_nxt;
-                }
-            }
-            let c = self.tcp[i];
-            if c.fin_queued && !c.fin_sent && c.snd_nxt.wrapping_sub(c.snd_una) as usize >= c.tx_len {
-                if self.tcp_out(i, 16 | 1, c.snd_nxt, &[]) {
-                    let c = &mut self.tcp[i];
-                    if c.snd_una == c.snd_nxt {
-                        c.rto_t = t + c.rto.max(self.freq);
-                    }
-                    c.snd_nxt = c.snd_nxt.wrapping_add(1);
-                    if c.snd_nxt.wrapping_sub(c.snd_max) as i32 > 0 {
-                        c.snd_max = c.snd_nxt;
-                    }
-                    c.fin_sent = true;
-                    c.fin_ever = true;
-                }
+            if self.tcb[i].state >= 2 {
+                self.tcp_push(i, t, expired);
             }
         }
+    }
+
+    /// Connection `i`'s data out, a segment at a time, within the peer's window and the congestion window; its FIN after the last byte once its app closed. A closed peer window is probed with one byte on the retransmission timer (RFC 9293 3.8.6.1; `expired` this pass's expiry).
+    fn tcp_push(&mut self, i: usize, t: u64, expired: bool) {
+        loop {
+            let room = self.tcb[i].smss - self.opt_len(i) as u32;
+            let c = &mut self.tcb[i];
+            let out = c.snd_nxt.wrapping_sub(c.snd_una);
+            // WHY the min: once our FIN is out it counts in `out` and is no byte of the buffer.
+            let sent = out.min(c.tx_len);
+            let unsent = c.tx_len - sent;
+            // What may be outstanding: the smaller of the two windows (RFC 5681 3), less what is. WHY the test: the peer may shrink its window under what is already in flight.
+            let wnd = c.cc.cwnd.min(c.snd_wnd);
+            let usable = if wnd > out { wnd - out } else { 0 };
+            let full = unsent.min(room);
+            let mut n = full.min(usable);
+            if n == 0 && unsent > 0 && out == 0 && c.snd_wnd == 0 {
+                if c.rto_t == 0 {
+                    c.rto_t = t + c.rtt.cur;
+                    break;
+                }
+                if !(expired || t > c.rto_t) {
+                    break;
+                }
+                n = 1;
+            }
+            if n == 0 {
+                break;
+            }
+            // Sender silly-window avoidance: a segment smaller than a full one and than what is left waits while anything is in flight (its ACK opens the window).
+            if n < full && out > 0 {
+                break;
+            }
+            let (seq, at) = (c.snd_nxt, c.tx_head + sent);
+            let flags = if n == unsent { ACK | PSH } else { ACK };
+            let mut p = [0u8; MSS_MAX];
+            ring_get(self.tx(i), at as usize, &mut p[..n as usize]);
+            if !self.tcp_out(i, flags, seq, &p[..n as usize]) {
+                break;
+            }
+            let c = &mut self.tcb[i];
+            if c.snd_una == c.snd_nxt {
+                c.rto_t = t + c.rtt.cur;
+            }
+            if ferros_tcp::lt(c.snd_nxt, c.snd_max) {
+                c.resent += 1;
+            } else if !c.timing {
+                c.timing = true;
+                c.rtt_seq = c.snd_nxt.wrapping_add(n);
+                c.rtt_t = t;
+            }
+            c.snd_nxt = c.snd_nxt.wrapping_add(n);
+            if ferros_tcp::lt(c.snd_max, c.snd_nxt) {
+                c.snd_max = c.snd_nxt;
+            }
+        }
+        let c = self.tcb[i];
+        if c.fin_queued && !c.fin_sent && c.snd_nxt.wrapping_sub(c.snd_una) >= c.tx_len && self.tcp_out(i, ACK | FIN, c.snd_nxt, &[]) {
+            let c = &mut self.tcb[i];
+            if c.snd_una == c.snd_nxt {
+                c.rto_t = t + c.rtt.cur;
+            }
+            c.snd_nxt = c.snd_nxt.wrapping_add(1);
+            if ferros_tcp::lt(c.snd_max, c.snd_nxt) {
+                c.snd_max = c.snd_nxt;
+            }
+            c.fin_sent = true;
+            c.fin_ever = true;
+        }
+    }
+
+    /// `v` tenths as A#whole.tenth.
+    fn tenths(&mut self, v: u64) {
+        self.put(b"A#");
+        self.dec(v / 10);
+        self.put(b".");
+        self.dec(v % 10);
+    }
+
+    /// Connection `i`'s measures on the console as it is freed, one line (owner, 2026-11-11: what he reads on the device after a Mahere base cell fetch): how it ended, bytes each way, how long it was open, the peak rate over quarter seconds and the average, the smoothed round trip and its variation and the timeout, segments resent (fast retransmits, timer expiries), segments kept out of order and the most bytes so held, the most bytes waiting for the app of the window's most, the segment sizes, the scales, SACK, and the congestion window at the end.
+    fn report(&mut self, i: usize, why: u8) {
+        let c = self.tcb[i];
+        let f = self.freq;
+        // A report is up to about 500 bytes: the log goes out first, so the line fits whole (`put` drops what overflows).
+        self.flush();
+        self.put(b"tcp A#");
+        self.dec(i as u64);
+        self.put(b" port A#");
+        self.dec(c.rport as u64);
+        if why == WHY_CLOSED {
+            self.put(b" closed both ways");
+        } else if why == WHY_RESET {
+            self.put(b" reset by the peer");
+        } else if why == WHY_TIMEOUT {
+            self.put(b" failed, unanswered");
+        } else if why == WHY_IDLE {
+            self.put(b" abandoned by its app");
+        } else {
+            self.put(b" closed by its app, no FIN from the peer");
+        }
+        self.put(b": in A#");
+        self.dec(c.bytes_in);
+        self.put(b" bytes, out A#");
+        self.dec(c.bytes_out);
+        if c.up_t == 0 {
+            self.put(b", never opened (asked A#");
+            self.dec(now().wrapping_sub(c.asked_t) * 1000 / f);
+            self.put(b" ms ago)\n");
+            return;
+        }
+        self.put(b", open A#");
+        self.dec(now().wrapping_sub(c.up_t) * 1000 / f);
+        self.put(b" ms, peak ");
+        self.tenths((c.peak * 10) >> 20);
+        self.put(b" MiB/s, average ");
+        let span = c.last_in_t.wrapping_sub(c.up_t);
+        self.tenths(if span == 0 { 0 } else { ((c.bytes_in * f / span) * 10) >> 20 });
+        self.put(b" MiB/s, round trip ");
+        self.tenths(c.rtt.srtt * 10_000 / f);
+        self.put(b" ms (variation ");
+        self.tenths(c.rtt.var * 10_000 / f);
+        self.put(b", timeout ");
+        self.tenths(c.rtt.rto * 10_000 / f);
+        self.put(b"), resent A#");
+        self.dec(c.resent as u64);
+        self.put(b" segments (fast retransmits A#");
+        self.dec(c.fast as u64);
+        self.put(b", expiries A#");
+        self.dec(c.expiries as u64);
+        self.put(b"), out of order A#");
+        self.dec(c.ooo_segs as u64);
+        self.put(b" segments (most held A#");
+        self.dec(c.ooo_most as u64);
+        self.put(b" bytes), waiting for the app most A#");
+        self.dec(c.rx_most as u64);
+        self.put(b" of A#");
+        self.dec(c.rcv_total as u64);
+        self.put(b", MSS A#");
+        self.dec(c.smss as u64);
+        self.put(b" out A#");
+        self.dec(c.rmss as u64);
+        self.put(b" in, scale A#");
+        self.dec(c.snd_ws as u64);
+        self.put(b" out A#");
+        self.dec(c.rcv_ws as u64);
+        self.put(if c.sack_ok { b" in, SACK" } else { b" in, no SACK" });
+        self.put(b", congestion window A#");
+        self.dec(c.cc.cwnd as u64);
+        self.put(b"\n");
     }
 
     /// The port's oldest datagram into `out` (family, address, source port, destination port, payload); 0 when it has none.
@@ -1186,32 +1844,36 @@ impl Ip {
         21 + n
     }
 
-    /// Connection `i`'s state and what it has taken in, into `out` (op 6's answer); the window reopened when it had shrunk below half.
-    fn tcp_take(&mut self, i: usize, out: &mut [u8]) -> usize {
-        let was_low = RXW - self.tcp[i].rx_len < RXW / 2;
-        let c = &mut self.tcp[i];
+    /// Connection `i`'s state and what it has taken in, `most` bytes at most, into `out` (op 6's answer). A read that reopens a window shrunk under half says so at once (`ferros_tcp::window_update_due`), or a sender held back by it would wait for its persist timer.
+    fn tcp_take(&mut self, i: usize, out: &mut [u8], most: u32) -> usize {
+        let c = &self.tcb[i];
         out[0] = match c.state {
             1 => 1,
             2 => 2,
             3 => 3,
             _ => 4,
         };
-        let n = c.rx_len.min(out.len() - 1);
-        for k in 0..n {
-            out[1 + k] = c.rx[(c.rx_head + k) % RXW];
+        // WHY the mins: only what is in order is the app's, `most` is what it asked for, and `out` holds `RECV_MAX` after the state byte.
+        let n = (c.rx_len as usize).min(most as usize).min(out.len() - 1);
+        if n == 0 {
+            return 1;
         }
-        c.rx_head = (c.rx_head + n) % RXW;
-        c.rx_len -= n;
-        // A window that had shrunk below half has grown: say so (a window update), or a sender avoiding silly windows waits for its persist timer.
-        if was_low && n > 0 && c.state >= 2 {
-            let s = c.snd_nxt;
-            self.tcp_out(i, 16, s, &[]);
+        ring_get(self.rx(i), c.rx_head as usize, &mut out[1..1 + n]);
+        let c = &mut self.tcb[i];
+        c.rx_head = (c.rx_head + n as u32) & (RXB as u32 - 1);
+        c.rx_len -= n as u32;
+        if c.state == 2 {
+            let free = c.rcv_total - c.rx_len;
+            let left = if ferros_tcp::lt(c.rcv_adv, c.rcv_nxt) { 0 } else { c.rcv_adv.wrapping_sub(c.rcv_nxt) };
+            if ferros_tcp::window_update_due(free, left, c.rcv_total) {
+                self.tcp_ack(i);
+            }
         }
         1 + n
     }
 
-    /// Hold a receive (`tok` its reply token) for `wait` seconds: on UDP `port`, or on connection `handle` when `tcp`. A held receive on the same connection is answered first as things stand (one reader a connection), and with every slot taken the oldest is.
-    fn hold(&mut self, tcp: bool, port: u16, handle: u8, wait: u8, tok: &[u8; 32], out: &mut [u8]) {
+    /// Hold a receive (`tok` its reply token) for `wait` seconds: on UDP `port`, or on connection `handle` when `tcp` (`most` the data its reader takes). A held receive on the same connection is answered first as things stand (one reader a connection), and with every slot taken the oldest is.
+    fn hold(&mut self, tcp: bool, port: u16, handle: u8, wait: u8, most: u32, tok: &[u8; 32], out: &mut [u8]) {
         let same = if tcp { (0..HELDN).find(|&k| self.held[k].used && self.held[k].tcp && self.held[k].handle == handle) } else { None };
         let k = match same.or_else(|| (0..HELDN).find(|&k| !self.held[k].used)) {
             Some(k) => k,
@@ -1221,7 +1883,8 @@ impl Ip {
             self.answer(k, out);
         }
         self.held_seq = self.held_seq.wrapping_add(1);
-        self.held[k] = Held { used: true, tcp, port, handle, seq: self.held_seq, until: now() + wait as u64 * self.freq, tok: *tok };
+        let state = if tcp { self.tcb[handle as usize].state } else { 0 };
+        self.held[k] = Held { used: true, tcp, port, handle, state, most, seq: self.held_seq, until: now() + wait as u64 * self.freq, tok: *tok };
     }
 
     /// Answer hold `k` as things stand (a connection's state and data, or the port's next datagram or nothing), and free it.
@@ -1232,12 +1895,12 @@ impl Ip {
             0
         } else if h.tcp {
             let i = h.handle as usize;
-            if self.tcp[i].state == 0 {
+            if self.tcb[i].state == 0 {
                 out[0] = 5;
                 1
             } else {
-                self.tcp[i].touched = now();
-                self.tcp_take(i, out)
+                self.tcb[i].touched = now();
+                self.tcp_take(i, out, h.most)
             }
         } else {
             self.udp_take(h.port, out)
@@ -1245,7 +1908,7 @@ impl Ip {
         svc(REPLY, self.off(h.tok.as_ptr()), self.off(out.as_ptr()), l as u64, 0, 0);
     }
 
-    /// Each pass: every held receive that has something now (a datagram for its port; data, a close or a failure on its connection, or the connection gone), or whose wait ran out, or all of them while nobody is present, answered. A connection waited on counts as asked about. Returns whether any was.
+    /// Each pass: every held receive that has something now (a datagram for its port; data on its connection, or its state changed since the hold: opened, closed by the peer, failed, gone), or whose wait ran out, or all of them while nobody is present, answered. A connection waited on counts as asked about. Returns whether any was.
     fn answer_held(&mut self, out: &mut [u8]) -> bool {
         let t = now();
         let mut any = false;
@@ -1257,8 +1920,8 @@ impl Ip {
             let ready = !self.person
                 || t > h.until
                 || if h.tcp {
-                    let c = &self.tcp[h.handle as usize];
-                    c.state == 0 || c.state >= 3 || c.rx_len > 0
+                    let c = &self.tcb[h.handle as usize];
+                    c.state != h.state || c.state >= 3 || c.rx_len > 0
                 } else {
                     (0..QN).any(|i| self.q[i].used && self.q[i].dport == h.port)
                 };
@@ -1266,7 +1929,7 @@ impl Ip {
                 self.answer(k, out);
                 any = true;
             } else if h.tcp {
-                self.tcp[h.handle as usize].touched = t;
+                self.tcb[h.handle as usize].touched = t;
             }
         }
         any
@@ -1285,26 +1948,27 @@ impl Ip {
                 self.open_port(port);
                 let n = self.udp_take(port, out);
                 if n == 0 && m.len() >= 4 && m[3] > 0 {
-                    self.hold(false, port, 0, m[3], tok, out);
+                    self.hold(false, port, 0, m[3], 0, tok, out);
                     return None;
                 }
                 return Some(n);
             }
-            Some(6) if m.len() >= 2 => {
-                let i = m[1] as usize;
-                if i < TCPN {
-                    self.tcp[i].touched = now();
-                }
-                if i >= TCPN || self.tcp[i].state == 0 {
+            Some(6) => {
+                // WHY the checks: the request is the caller's; shorter than its 7 bytes, or a handle past the table, is no connection.
+                let i = if m.len() >= 7 { m[1] as usize } else { TCPN };
+                if i >= TCPN || self.tcb[i].state == 0 {
                     out[0] = 5;
                     return Some(1);
                 }
-                let c = &self.tcp[i];
-                if c.rx_len == 0 && (c.state == 1 || c.state == 2) && m.len() >= 3 && m[2] > 0 {
-                    self.hold(true, 0, i as u8, m[2], tok, out);
+                self.tcb[i].touched = now();
+                // WHY the min: the caller's most, held to what one reply carries.
+                let most = u32::from_be_bytes([m[3], m[4], m[5], m[6]]).min(RECV_MAX as u32);
+                let c = &self.tcb[i];
+                if c.rx_len == 0 && (c.state == 1 || c.state == 2) && m[2] > 0 {
+                    self.hold(true, 0, i as u8, m[2], most, tok, out);
                     return None;
                 }
-                return Some(self.tcp_take(i, out));
+                return Some(self.tcp_take(i, out, most));
             }
             _ => {}
         }
@@ -1335,8 +1999,7 @@ impl Ip {
                 out[50] = a4.is_some() as u8 | (a6.is_some() as u8) << 1 | (self.cell.flags & 1) << 2;
                 out[51..55].copy_from_slice(if matches!(a4, Some((true, _))) { &self.cell.dns4 } else { &self.dns });
                 out[55..71].copy_from_slice(&self.cell.dns6);
-                out[71] = DOES_HOLD;
-                72
+                71
             }
             Some(9) if m.len() >= 2 && m[1] <= 2 => {
                 self.mode = m[1];
@@ -1350,18 +2013,17 @@ impl Ip {
             }
             Some(5) if m.len() >= 2 => {
                 let i = m[1] as usize;
-                if i < TCPN {
-                    self.tcp[i].touched = now();
-                }
-                if i >= TCPN || self.tcp[i].state == 0 || self.tcp[i].state == 4 || self.tcp[i].fin_queued {
+                // WHY: the handle is the caller's; one past the table is no connection.
+                if i >= TCPN || self.tcb[i].state == 0 || self.tcb[i].state == 4 || self.tcb[i].fin_queued {
                     out[0] = 5;
                     return 1;
                 }
-                let c = &mut self.tcp[i];
-                let n = (m.len() - 2).min(TXB - c.tx_len);
-                let at = c.tx_len;
-                c.tx[at..at + n].copy_from_slice(&m[2..2 + n]);
-                c.tx_len += n;
+                self.tcb[i].touched = now();
+                let c = &self.tcb[i];
+                // WHY the min: what the send buffer has room for; the rest is the caller's to send again.
+                let n = (m.len() - 2).min(TXB - c.tx_len as usize);
+                ring_put(self.tx(i), (c.tx_head + c.tx_len) as usize, &m[2..2 + n]);
+                self.tcb[i].tx_len += n as u32;
                 out[0] = 0;
                 out[1..3].copy_from_slice(&(n as u16).to_be_bytes());
                 self.tcp_tick();
@@ -1379,15 +2041,15 @@ impl Ip {
             }
             Some(7) if m.len() >= 2 => {
                 let i = m[1] as usize;
-                if i < TCPN {
-                    self.tcp[i].touched = now();
-                }
-                if i < TCPN && self.tcp[i].state != 0 {
-                    let c = &mut self.tcp[i];
+                // WHY: the handle is the caller's; one past the table is no connection (answered as closed).
+                if i < TCPN && self.tcb[i].state != 0 {
+                    let c = &mut self.tcb[i];
+                    c.touched = now();
                     c.fin_queued = true;
                     c.closed_t = now();
                     if c.state == 4 {
-                        self.tcp[i] = TCP_FREE;
+                        let why = c.why;
+                        self.tcp_free(i, why);
                     }
                 }
                 out[0] = 0;
@@ -1467,6 +2129,21 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     const EMPTY: Datagram = Datagram { used: false, fam: 0, addr: [0; 16], sport: 0, dport: 0, len: 0, seq: 0, data: [1; 1472] };
     #[unsafe(link_section = ".data.queue")]
     static mut QUEUE: [Datagram; QN] = [EMPTY; QN];
+    // The connections' control state, and the request and reply buffers (a reply up to `RECV_MAX` bytes of data): statics, not the 64 KiB stack (the kernel maps .bss from the image header's tail).
+    static mut TCBS: [Tcb; TCPN] = [TCB_FREE; TCPN];
+    static mut MSG: [u8; MSG_MAX] = [0; MSG_MAX];
+    static mut OUT: [u8; 1 + RECV_MAX] = [0; 1 + RECV_MAX];
+    // The heap the kernel maps past .bss (`HEAP_START` of it, or the whole `HEAP_CEILING` on a kernel without SYS_ARC): the first blocks, on a cache line.
+    unsafe extern "C" {
+        static __image_end: u8;
+    }
+    let heap = ((&raw const __image_end) as usize + 16 + 63) & !63;
+    let (top, _) = ferros_sys::arc::size();
+    let blocks = if top as u64 == ERR {
+        Blocks { heap, start: (HEAP_CEILING - 64) / BLOCK, top0: 0, top: 0, grows: false, used: 0 }
+    } else {
+        Blocks { heap, start: (HEAP_START - 64) / BLOCK, top0: top, top, grows: true, used: 0 }
+    };
     let mut ip = Ip {
         grants,
         base,
@@ -1502,7 +2179,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         ports: [0; 8],
         ports_at: 0,
         qseq: 0,
-        tcp: [TCP_FREE; TCPN],
+        tcb: unsafe { &mut *(&raw mut TCBS) },
+        blocks,
         eph: 0,
         seed: 0,
         groups: [(0, [0; 16]); 8],
@@ -1538,19 +2216,33 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let ll = ip.ll;
     ip.v6_put(ll);
     ip.put(b"\n");
+    // Where the connections' buffers come from (`Blocks`).
+    ip.put(b"TCP: A#");
+    ip.dec(TCPN as u64);
+    ip.put(b" connections, each a block of A#");
+    ip.dec((BLOCK >> 10) as u64);
+    ip.put(b" KiB (receive window A#");
+    ip.dec((RXB >> 10) as u64);
+    ip.put(b" KiB); A#");
+    ip.dec(ip.blocks.start as u64);
+    if ip.blocks.grows {
+        ip.put(b" in the heap mapped at spawn, the arc grown for more as they open\n");
+    } else {
+        ip.put(b" in the heap mapped at spawn, no SYS_ARC on this kernel, so no more\n");
+    }
     ip.flush();
     // WiFi: the driver's MAC, then DHCP and a router solicitation (`wifi_up`). No `wlan` grant or no driver serving it: cellular only for now, the driver asked again every 4 s (an error at once while it is not serving: CALL_LIVE).
     ip.wifi_up();
     let mut frame = [0u8; 2048];
-    let mut msg = [0u8; 2048];
-    let mut out = [0u8; 2048];
+    let msg = unsafe { &mut *(&raw mut MSG) };
+    let out = unsafe { &mut *(&raw mut OUT) };
     let mut tok = [0u8; 32];
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
         let mut busy = false;
         // Frames from the driver: [2] → the oldest frame, or nothing.
-        for _ in 0..if ip.wifi { 16 } else { 0 } {
+        for _ in 0..if ip.wifi { FRAMES_PASS } else { 0 } {
             let req = [2u8];
             let n = svc(CALL, ip.cap(S_WLAN), ip.off(req.as_ptr()), 1, ip.off(frame.as_mut_ptr()), frame.len() as u64 | CALL_LIVE);
             if n == ERR {
@@ -1575,7 +2267,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
         }
         // Packets from the cellular call: [2] → the oldest, or nothing.
-        for _ in 0..if ip.cell.flags & 1 != 0 { 16 } else { 0 } {
+        for _ in 0..if ip.cell.flags & 1 != 0 { FRAMES_PASS } else { 0 } {
             let req = [2u8];
             let n = svc(CALL, ip.cap(S_RMNET), ip.off(req.as_ptr()), 1, ip.off(frame.as_mut_ptr()), frame.len() as u64 | CALL_LIVE);
             if n == 0 || n == ERR {
@@ -1590,6 +2282,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 ip.ipv6_in(true, [0; 6], p);
             }
         }
+        // The ACKs the pass's segments still owe (an odd in-order one's), now that the batch is in.
+        ip.tcp_acks();
         // The call's state from `rmnet` INFO: every second until it is up, then every 16 s (a call that drops and comes back may come back with new addresses).
         let t = now();
         if t.wrapping_sub(ip.cell_t) > if ip.cell.flags & 1 != 0 { 16 } else { 1 } * ip.freq {
@@ -1601,18 +2295,22 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             ip.person = ferros_sys::facts().0[83] == 2;
             ip.dark = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
         }
-        // Applications: a polling recv on `udp`.
-        let n = svc(RECV, ip.cap(S_UDP), ip.off(msg.as_mut_ptr()), msg.len() as u64, ip.off(tok.as_mut_ptr()), 1);
-        if n != NOTHING && n != ERR {
-            let m = &msg;
-            if let Some(l) = ip.serve(&m[..(n as usize).min(m.len())], &tok, &mut out) {
+        // Applications: a polling recv on `udp`, the requests waiting taken a few to a pass (sixteen connections' readers and writers share it).
+        for _ in 0..REQS_PASS {
+            let n = svc(RECV, ip.cap(S_UDP), ip.off(msg.as_mut_ptr()), msg.len() as u64, ip.off(tok.as_mut_ptr()), 1);
+            if n == NOTHING || n == ERR {
+                break;
+            }
+            // WHY the min: the length is the kernel's, the request it cut at the buffer.
+            let m = &msg[..(n as usize).min(msg.len())];
+            if let Some(l) = ip.serve(m, &tok, out) {
                 svc(REPLY, ip.off(tok.as_ptr()), ip.off(out.as_ptr()), l as u64, 0, 0);
             }
             busy = true;
         }
         ip.tcp_tick();
         // The held receives that have their answer now (after what came in and what the connections did this pass).
-        if ip.answer_held(&mut out) {
+        if ip.answer_held(out) {
             busy = true;
         }
         // Membership refreshed every 60 s (a querier's interval is 125 s; an unsolicited report keeps the snooper's entry alive without one).
@@ -1652,5 +2350,5 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
 }
 
-// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss).
-ferros_sys::entry!(payload_main);
+// The entry and its image header (ferros_sys::entry!: the kernel sizes the arc from the image and its .bss), its heap growing on demand up to `HEAP_CEILING` for the connections' blocks (`Blocks`).
+ferros_sys::entry!(payload_main, grows HEAP_CEILING);

@@ -1,14 +1,17 @@
 //! A plain HTTP GET through the `ip` process (payloads/ip, its `udp` endpoint): the host's A record from the DNS server ip reports, a client TCP connection, the request, and the response decoded as it arrives (ferros_kist::fetch::Response), its body handed on a piece at a time and never held whole.
 //!
-//! ip answers every request at once with what it has: its UDP RECV and TCP RECV have no held form, and nothing rings when a datagram or a segment comes in. So this side asks again after a millisecond when nothing came (the one timer here, and why: no doorbell exists on ip yet; one would replace it). Each wait is a real deadline besides: DNS's second per try, and the stall below.
+//! Every wait is a receive ip holds until something comes (the wait byte of its ops 2 and 6), never a poll (owner, 2026-11-10: "No polling!"): the worker blocks in the call. The deadlines are real ones: DNS's second per try, and the stall below.
+//! Two retries remain, each with its reason: a question ip could not send yet because it is resolving the next hop (its answer 1, nothing rings when the neighbour answers) is asked again a millisecond on, a few dozen times; a connection refused for want of a free one (ip holds sixteen) is asked again each second, a few times.
 
 use ferros_kist::fetch::{split_url, Response};
 use ferros_sys::{call, freq, now, sleep_until, ERR};
 
 /// The port this side's DNS questions leave from and their answers come to (httptest uses 53053).
 const DNS_PORT: u16 = 53054;
-/// How long a connection may bring nothing before it is given up (WHY a deadline: ip fails a connection only when what it sent goes unanswered, and a GET's long body is all receiving; a server that falls silent would hold the installer's one worker for ever). 32 s, ip's own idle reaping time.
-const STALL_S: u64 = 1 << 5;
+/// How long a connection may bring nothing before it is given up (WHY a deadline: ip fails a connection only when what it sent goes unanswered, and a GET's long body is all receiving; a server that falls silent would hold the installer's one worker for ever). 32 s, ip's own idle reaping time: the wait of each held receive.
+const STALL_S: u8 = 1 << 5;
+/// The most data one receive brings: 64 KiB, on the worker's 512 KiB stack (ip answers up to 256 KiB; a bigger reply means fewer round trips while a capsule streams in).
+const RECV_MOST: usize = 1 << 16;
 
 /// Why a GET did not bring its body.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -25,7 +28,7 @@ fn ask(cap: u64, req: &[u8], out: &mut [u8]) -> u64 {
     call(cap, req, out)
 }
 
-/// A millisecond's wait for ip to have something (the module's WHY).
+/// A millisecond's wait before asking ip to send again while it resolves the next hop (the module's WHY).
 fn pause() {
     sleep_until(now() + (freq() >> 10));
 }
@@ -83,11 +86,14 @@ fn resolve(cap: u64, dns: [u8; 4], host: &[u8]) -> Option<[u8; 4]> {
             }
             pause();
         }
+        // Answers held for up to a second (the wait byte), until ours; another's answer on the port (an old try's) is passed over.
         let t = now();
         while now() - t < freq() {
-            let n = ask(cap, &[2, (DNS_PORT >> 8) as u8, DNS_PORT as u8], &mut out);
-            if n == 0 || n == ERR || n < 21 + 12 {
-                pause();
+            let n = ask(cap, &[2, (DNS_PORT >> 8) as u8, DNS_PORT as u8, 1], &mut out);
+            if n == 0 || n == ERR {
+                break;
+            }
+            if n < 21 + 12 {
                 continue;
             }
             // WHY: the length is ip's, at most what the buffer took.
@@ -152,7 +158,7 @@ fn address(cap: u64, host: &str) -> Option<[u8; 4]> {
     Some(ip)
 }
 
-/// A TCP connection to `ip`:`port`. ip holds two; one taken (the identity service's post to fgtw.org) frees within its reply, so a full table is asked again each second a few times.
+/// A TCP connection to `ip`:`port`. ip holds sixteen; a full table frees as others finish, so it is asked again each second a few times.
 fn connect(cap: u64, ip: [u8; 4], port: u16) -> Option<u8> {
     let mut c = [0u8; 20];
     c[0] = 4;
@@ -203,8 +209,11 @@ fn transfer(cap: u64, h: u8, host: &str, path: &str, head: &mut impl FnMut(&Resp
     let mut sent = 0;
     let mut resp = Response::new();
     let mut headed = false;
-    let mut out = [0u8; 4096];
-    let mut last = now();
+    let mut out = [0u8; 1 + RECV_MOST];
+    let mut hold = [6, h, STALL_S, 0, 0, 0, 0];
+    hold[3..7].copy_from_slice(&(RECV_MOST as u32).to_be_bytes());
+    // The state ip answered last: a held receive is also answered when it changes (the connection opened).
+    let mut was = 1u8;
     loop {
         // What the send buffer has not taken yet, each pass until it is all out.
         if sent < total {
@@ -218,7 +227,9 @@ fn transfer(cap: u64, h: u8, host: &str, path: &str, head: &mut impl FnMut(&Resp
                 sent += u16::from_be_bytes([r[1], r[2]]) as usize;
             }
         }
-        let n = ask(cap, &[6, h], &mut out);
+        // Held until data comes, the connection's state changes, or STALL_S with nothing; at once while the request is still going out.
+        hold[2] = if sent < total { 0 } else { STALL_S };
+        let n = ask(cap, &hold, &mut out);
         if n == 0 || n == ERR {
             return Err(Fail::Broken("the connection was lost"));
         }
@@ -226,7 +237,6 @@ fn transfer(cap: u64, h: u8, host: &str, path: &str, head: &mut impl FnMut(&Resp
         let n = (n as usize).min(out.len());
         let state = out[0];
         if n > 1 {
-            last = now();
             resp.feed(&out[1..n], body).map_err(|e| if resp.status != 0 && resp.status != 200 { Fail::Missing(resp.status) } else { Fail::Broken(e) })?;
             if !headed && resp.body.is_some() {
                 headed = true;
@@ -244,7 +254,12 @@ fn transfer(cap: u64, h: u8, host: &str, path: &str, head: &mut impl FnMut(&Resp
             5 => return Err(Fail::Broken("the connection is gone")),
             _ => {}
         }
-        if now() - last > STALL_S * freq() {
+        if state != was {
+            was = state;
+            continue;
+        }
+        // Nothing came for the whole wait: the server stopped sending. With the request still going out (ip's send buffer full), a moment before more of it.
+        if hold[2] != 0 {
             return Err(Fail::Broken("the server stopped sending"));
         }
         pause();
