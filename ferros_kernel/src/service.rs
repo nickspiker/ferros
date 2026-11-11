@@ -455,9 +455,9 @@ fn kist_call(job: &KistJob) -> bool {
 
 /// The kist's arc, sized from its first bytes (`kist_need`), masked when its code is (the guard above it), with those bytes copied in. Ok(false): the pool has no room yet while a process ends (a relaunch's own predecessor still leaving a core, its arc coming back at its next trap), so the job waits for that, not for a time; Err when there is no room and nothing is coming back.
 fn kist_arc(job: &mut KistJob) -> Result<bool, KistFault> {
-    let need = crate::process::kist_need(&job.head, job.total).map_err(|e| (why::READ, e))?;
+    let (need, ceiling) = crate::process::kist_need(&job.head, job.total).map_err(|e| (why::READ, e))?;
     let masked = crate::process::kist_masked(&job.head, job.total);
-    let Some(arc) = crate::process::with_lock(|| crate::process::arc_alloc(need, masked)) else {
+    let Some(arc) = crate::process::with_lock(|| crate::process::arc_alloc_room(need, ceiling, masked)) else {
         return if crate::process::any_dying() { Ok(false) } else { Err((why::ROOM, "the arc pool has no room for the kist")) };
     };
     if crate::process::CODE + job.total > arc.size {

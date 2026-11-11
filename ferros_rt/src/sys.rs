@@ -22,6 +22,7 @@ pub mod nr {
     pub const WAIT: u64 = 16;
     pub const WAKE: u64 = 17;
     pub const PIN: u64 = 20;
+    pub const ARC: u64 = 40;
 }
 
 /// The trap: number in x8, arguments in x0..x4, result in x0. The kernel may write into any buffer the arguments name, so nothing is assumed cached across it.
@@ -32,6 +33,16 @@ pub fn svc(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     unsafe { asm!("svc #0", inlateout("x0") a0 => r, in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4, in("x8") n, options(nostack)) };
     compiler_fence(Ordering::SeqCst);
     r
+}
+
+/// The trap with both result registers, (x0, x1): SYS_ARC answers in two.
+#[inline(always)]
+pub fn svc2(n: u64, a0: u64, a1: u64) -> (u64, u64) {
+    let (r0, r1): (u64, u64);
+    compiler_fence(Ordering::SeqCst);
+    unsafe { asm!("svc #0", inlateout("x0") a0 => r0, inlateout("x1") a1 => r1, in("x8") n, options(nostack)) };
+    compiler_fence(Ordering::SeqCst);
+    (r0, r1)
 }
 
 /// The process's arc base (x28, set by the kernel at entry and never written by compiled code: the target reserves it).

@@ -58,6 +58,53 @@ pub mod nr {
     pub const CLAIM: u64 = 37;
     pub const BELL: u64 = 38;
     pub const NOT_STARTED: u64 = 39;
+    pub const ARC: u64 = 40;
+}
+
+/// The caller's own arc, grown or shrunk on demand (kernel SYS_ARC, docs/ARCS.md step 2; owner, 2026-11-11: "why we cannot scale on demand, that was the whole point of ring memory"). No capability: a process reaches only its own arc, and only up to its ceiling (the heap its build declared, counted whole; fixed mode's size). A top is an arc offset: the arc's size, or exact mode's limit.
+pub mod arc {
+    use super::{nr, ERR};
+    use core::arch::asm;
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    /// Why the kernel refused (process.rs `ARC_WHY_*`): past the ceiling, too few free frames, a masked arc with another of its threads running on another core, under what the process was spawned with, over a word the kernel holds, no such op.
+    pub const WHY_CEILING: u64 = 1;
+    pub const WHY_MEMORY: u64 = 2;
+    pub const WHY_BUSY: u64 = 3;
+    pub const WHY_FLOOR: u64 = 4;
+    pub const WHY_HELD: u64 = 5;
+    pub const WHY_OP: u64 = 6;
+
+    /// The trap with both result registers: (x0, x1).
+    fn call(op: u64, n: u64) -> (u64, u64) {
+        let (a, b): (u64, u64);
+        compiler_fence(Ordering::SeqCst);
+        unsafe { asm!("svc #0", inlateout("x0") op => a, inlateout("x1") n => b, in("x8") nr::ARC, options(nostack)) };
+        compiler_fence(Ordering::SeqCst);
+        (a, b)
+    }
+
+    /// At least `bytes` more: Ok((the new top, the old top)); the bytes between are new, zeroed and the caller's. Err(the reason).
+    pub fn grow(bytes: usize) -> Result<(usize, usize), u64> {
+        match call(0, bytes as u64) {
+            (ERR, why) => Err(why),
+            (top, was) => Ok((top as usize, was as usize)),
+        }
+    }
+
+    /// Keep the first `bytes` of the arc (rounded up as its mode needs, never under what it was spawned with) and give the rest back: Ok((the new top, the old top)). Nothing past the new top may be touched again.
+    pub fn shrink(bytes: usize) -> Result<(usize, usize), u64> {
+        match call(1, bytes as u64) {
+            (ERR, why) => Err(why),
+            (top, was) => Ok((top as usize, was as usize)),
+        }
+    }
+
+    /// (the top now, the ceiling).
+    pub fn size() -> (usize, usize) {
+        let (a, b) = call(2, 0);
+        (a as usize, b as usize)
+    }
 }
 
 /// The clock's zone (kernel zone.rs, SYS_ZONE; docs/TIME.md; owner, 2026-11-10): the identity's choice and this device's own, each automatic (the zone found from the cellular network, then GPS) or by hand (an IANA id), and the switch that says which rules.

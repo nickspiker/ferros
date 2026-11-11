@@ -2,7 +2,7 @@
 //!
 //! The kernel enters offset 0 at EL0 with x0 = the grants page's offset, x1 = the input's offset, x2 = its length, x28 = the arc base, x27 = its mask, SP at the arc's top (KERNEL.md, process ABI). `_entry` branches to `__ferros_start`, which relocates the image, builds the heap from the zeroed tail and the arc's slack, finds the entropy grant, gives the main thread its TLS block and a stack from the heap, and calls the C `main` rustc generated — `std::rt::lang_start` — whose return is the exit code.
 //!
-//! The header at offset 8 is what the kernel reads before the process runs (process.rs `image_tail`) and what the runtime reads after: `ferrosRT`, then five words — the zeroed tail (.bss + 16 + heap), the TLS image size, the TLS block size, the TLS alignment, the heap size — every one an absolute number the linker script computed (ferros.ld).
+//! The word at offset 4 is the image's flags: bit 0, its heap grows on demand (SYS_ARC, docs/ARCS.md step 2), so the kernel maps a small heap at spawn and the declared one is a ceiling (since 2026-11-11; 0 before, a reservation). The header at offset 8 is what the kernel reads before the process runs (process.rs `image_tail`) and what the runtime reads after: `ferrosRT`, then five words — the zeroed tail (.bss + 16 + heap), the TLS image size, the TLS block size, the TLS alignment, the heap size — every one an absolute number the linker script computed (ferros.ld).
 
 use core::alloc::Layout;
 use core::arch::{asm, global_asm};
@@ -17,7 +17,7 @@ global_asm!(
     .type _entry, %function
 _entry:
     b {start}
-    .4byte 0
+    .4byte 1
     .ascii "ferrosRT"
     .quad __ferros_tail
     .quad __ferros_tdata_size

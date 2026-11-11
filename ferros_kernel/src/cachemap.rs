@@ -531,6 +531,22 @@ pub fn guard_pages(base: usize, len: usize) {
     }
 }
 
+/// `len` bytes of an arc from `va` handed to the process as data (`open`: writable, never executable) or taken back to kernel-only, each page keeping its frame: the pages of a masked arc's last frame between its old size and its new one (process.rs `arc_resize`).
+pub fn pages_open(va: usize, len: usize, open: bool) {
+    if !vhe() {
+        return;
+    }
+    let mut a = va;
+    while a < va + len {
+        if let Some(e) = page_entry(a) {
+            let pa = (*e & OA) as usize;
+            *e = if open { pool_page(true, pa, true, false) } else { kernel_page(pa) };
+        }
+        a += PAGE;
+    }
+    unmapped(va, len);
+}
+
 /// Map frame `pa` at the window slot `va` (2 MiB aligned, inside ARC_VA) through the frame's own level-3 table at `table` (frames.rs): its first `usable` bytes as the process's data (writable, never executable; `set_arc_wx` makes code of them), the rest kernel-only (the slack of an arc smaller than its frames, which is a masked arc's guard). The slot must be unmapped. Call `mapped` once the arc's slots are in.
 pub fn map_slot(va: usize, pa: usize, table: usize, usable: usize) {
     let t = unsafe { &mut *(table as *mut [u64; 512]) };
