@@ -116,6 +116,7 @@ struct Line {
 }
 impl Write for Line {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        // WHY the min: a formatted line longer than the 256-byte buffer would index past it and panic the process; the console gets the line cut instead.
         let k = s.len().min(self.b.len() - self.n);
         self.b[self.n..self.n + k].copy_from_slice(&s.as_bytes()[..k]);
         self.n += k;
