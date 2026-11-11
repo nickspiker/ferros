@@ -1,10 +1,10 @@
-//! The attest screen's encoder table, generated: vsf's `x` Huffman code for every character the honeycomb keyboard can type (`honeycomb::typeable`), read from the frozen codebook ihi's identity seed is pinned to (vsf 0.6.42's `huffman_codes.bin`, the sibling vsf checkout carries the same file). A key added to the keyboard gets its exact code here; a key whose character is not its own NFC form, or is a combining mark, fails the build, because vsf normalizes before it encodes and this encoder does not: the seed would name someone else.
+//! The attest screen's encoder table, generated: vsf's `x` Huffman code for every character the honeycomb keyboard can type (`honeycomb::typeable`), read from vsf's codebook, the one ihi's identity seed is computed with (vsf 0.11's fixed-order reissue since 2026-11-10; ihi moved to it with Photon, so ferros and Photon hash a handle alike). A key added to the keyboard gets its exact code here; a key whose character is not its own NFC form, or is a combining mark, fails the build, because vsf normalizes before it encodes and this encoder does not: the seed would name someone else.
 use std::collections::BTreeMap;
 use unicode_normalization::char::canonical_combining_class;
 use unicode_normalization::UnicodeNormalization;
 
-/// BLAKE3 of the frozen codebook (ihi's encoder lane). Any other file names other identities.
-const CODEBOOK_BLAKE3: &str = "523769a934a407aa87d9ddef37ad186c546e205cb1280b0e9300d6e98c6dad0e";
+/// BLAKE3 of the codebook ihi hashes handles with (vsf 0.11, 2026-11-10). Any other file names other identities.
+const CODEBOOK_BLAKE3: &str = "51b6e8eb748c56c4991ce8fe556422ec95f2bcfff78927a7778b1a892d5806f9";
 const CODEBOOK: &str = "../../vsf/huffman_codes.bin";
 
 fn main() {
