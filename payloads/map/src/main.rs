@@ -14,7 +14,7 @@
 //!
 //! Positions are deterministic until the person arranges by hand; then each moved circle is kept in the vault (`map.place.<name>`) and wins over the seeded place from then on.
 //!
-//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page, and the identity space: the arrangement and kists written from the person's fleet are read again when its generation moves, docs/IDENTITY-SPACE.md), 6 the vault scope `kists.`, 7 use launch (init), 8 use kists (the installer, payloads/kists: the Kists page installs, updates and uninstalls through it, installer.rs), 9 use nfc (attest with a tag: the NFC page adds a tag, AUTH.md), 10 use torch (the kernel's, not init's, the slot after the last: the quick row, quick.rs).
+//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page, and the identity space: the arrangement and kists written from the person's fleet are read again when its generation moves, docs/IDENTITY-SPACE.md), 6 the vault scope `kists.`, 7 use launch (init), 8 use kists (the installer, payloads/kists: the Items page stows, updates and unstows through it, installer.rs), 9 use nfc (attest with a tag: the NFC page adds a tag, AUTH.md), 10 use torch (the kernel's, not init's, the slot after the last: the quick row, quick.rs).
 
 #![no_std]
 #![no_main]
@@ -69,9 +69,9 @@ const S_STORE: u64 = 4;
 const S_FGTW: u64 = 5;
 /// The vault scope `kists.`: the person's kists and their answers (ferros_kist), read for the kist circles and the settings, written with the person's answers.
 const S_KIST_LIST: u64 = 6;
-/// Init's `launch` endpoint: a kist circle tapped asks init to launch it (the map holds none of a kist's rights).
+/// Init's `launch` endpoint: a kist circle tapped asks init to launch it, and a kist's card stops it (the map holds none of a kist's rights).
 const S_LAUNCH: u64 = 7;
-/// The installer's `kists` endpoint (payloads/kists): the Kists page installs, updates and uninstalls through it, and reads the directory and the jobs under way.
+/// The installer's `kists` endpoint (payloads/kists): the Items page stows, updates and unstows through it, and reads the pandok (the directory) and the jobs under way.
 const S_INSTALLER: u64 = 8;
 /// The NFC driver (payloads/nfc): its TAG (op 9) held while the NFC page adds a tag (attest with a tag, AUTH.md; owner, 2026-11-11: "ideally something in settings to add a tag").
 const S_NFC: u64 = 9;
@@ -834,12 +834,17 @@ enum Choice {
     Picker,
     /// A page's title in the picker: that page.
     Pick(u8),
-    /// A kist's want on the Kists or Permissions page: (the kist in the person's list, the want), its answer turned over.
+    /// A kist's want on its card or the Permissions page: (the kist in the person's list, the want), its answer turned over.
     Answer(u8, u8),
-    /// The Kists page: a kist's uninstall (its place in the person's list; two taps), and the directory's install or update (its row).
-    Uninstall(u8),
+    /// The Items page: a thing's unstow (its place in the person's list; two taps; a puck's "remove from the home screen"), and the pandok's stow or update (its row in the directory).
+    Unstow(u8),
     Install(u8),
-    /// A kist offered over USB, on the Kists page: Stow (true) or Cancel (false), the person's answer to the installer (docs/KISTS.md "Stowing").
+    /// The Items page: a row's card opened (its place in the person's list), and back to the list.
+    Card(u8),
+    CardBack,
+    /// A kist's card: its running process stopped (init's `OP_STOP`).
+    Stop(u8),
+    /// A kist offered over USB, on the Items page: Stow (true) or Cancel (false), the person's answer to the installer (docs/KISTS.md "Stowing").
     Stow(bool),
     /// A right's default for new kists (Permissions).
     Default(u8),
@@ -852,8 +857,8 @@ enum Choice {
     TagRemove(u8),
 }
 
-/// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The torch after the battery (owner, 2026-11-11: its brightness, strobe, lit share and timeout; QUICK.md "Quick pages"), opened from its quick circle by a pull down as well. The clock after them (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
-const PAGES: [&str; 21] = ["appearance", "units", "keyboard", "security", "kists", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "torch", "clock", "language", "about", "developer"];
+/// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The torch after the battery (owner, 2026-11-11: its brightness, strobe, lit share and timeout; QUICK.md "Quick pages"), opened from its quick circle by a pull down as well. The clock after them (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). Items (owner, 2026-11-12: "make sure it says items in settings, not kists"): everything on the home screen as a circle, by kind, each row opening its card. These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
+const PAGES: [&str; 21] = ["appearance", "units", "keyboard", "security", "items", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "torch", "clock", "language", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Whether it starts looking like one (the orange hairlines, as the display's): FERROS_RELEASE_LOOK set gives a development build the release look for screen captures (owner, 2026-11-10), its tools kept.
@@ -883,7 +888,7 @@ fn page_title(key: &'static str) -> &'static str {
         "units" => Msg::PageUnits,
         "keyboard" => Msg::PageKeyboard,
         "security" => Msg::PageSecurity,
-        "kists" => Msg::PageKists,
+        "items" => Msg::PageItems,
         "permissions" => Msg::PagePermissions,
         "fleet" => Msg::PageFleet,
         "power" => Msg::PagePower,
@@ -1047,7 +1052,38 @@ fn group_of(kind: u16) -> usize {
 
 /// A kist the display draws itself in its circle (a widget: its scene icon at G#80 and up, display WIDGET_*), by the kist's name: the clock (owner, 2026-11-10: "my clock widget kist on the homescreen again"). Installed like any app (payloads/clock, tools/clock-kist.sh), never launched.
 fn widget(name: &str) -> Option<u8> {
-    name.eq_ignore_ascii_case("Clock").then_some(0x80)
+    name.eq_ignore_ascii_case("Clock").then_some(CLOCK_FACE)
+}
+
+/// The display's clock face as a scene icon (display `WIDGET_CLOCK`, G#80).
+const CLOCK_FACE: u8 = 1 << 7;
+
+/// What a puck's circle shows, by the display's icon for it (`widget`), for its card on Items.
+fn puck_shows(icon: u8) -> Msg {
+    match icon {
+        CLOCK_FACE => Msg::TheTime,
+        _ => Msg::Unknown,
+    }
+}
+
+/// Why a kist did not start, or stopped after it started (ferros_kist::launch::why), in the person's words: under its open circle (`ask_page`) and on its card.
+fn why_words(why: u8) -> Msg {
+    use ferros_kist::launch::why as w;
+    match why {
+        w::ROOM => Msg::NotEnoughMemory,
+        w::NOT_HERE => Msg::NotInstalledHere,
+        w::CHECKS => Msg::FailedItsChecks,
+        w::READ => Msg::CouldNotBeRead,
+        // Started, then stopped (a fault or a panic: the kind is on the console; a kill from outside).
+        w::FAULT | w::PANIC => Msg::ItCrashed,
+        w::KILLED => Msg::ClosedFromOutside,
+        _ => Msg::SomethingWentWrong,
+    }
+}
+
+/// A key's first four bytes, as a card shortens a developer's key or a kist's option.
+fn short_key(l: &mut Line, k: &[u8; 32]) {
+    let _ = write!(l, "G#{:02X}{:02X}{:02X}{:02X}", k[0], k[1], k[2], k[3]);
 }
 
 /// The identity service as `fgtw_poller` last read it, under a sequence count (odd while it is written; it moves only when the service rang).
@@ -1310,8 +1346,10 @@ struct Map {
     zone_note: Option<Msg>,
     /// The installer as last read (installer.rs): the directory's kists and each job under way.
     installer: installer::Installer,
-    /// The Kists page's uninstall armed on a kist (the first tap of two, as "remove this device").
-    uninstall_armed: Option<u8>,
+    /// The Items page's unstow armed on a kist or a puck, by its place in the person's list (the first tap of two, as "remove this device").
+    unstow_armed: Option<u8>,
+    /// The Items page's card open, by the capsule of the kist or puck it is for (owner, 2026-11-12: a row opens its card, the one way to see a kist's info); None on the list. Gone with it when that thing is unstowed.
+    card: Option<[u8; 32]>,
     /// The GPS page's claim (owner, 2026-11-10: "open the GPS screen (which should turn it on whilist GPS screen is open)"; ferros_sys::claim): held while the page shows, the screen is on and GPS is switched on.
     gps_claimed: bool,
     /// The driver as `gps_watch` last read it while the page holds its claim, at each ring of its doorbell: None not answering yet (starting, its session replaying), Some(None) no fix yet, Some(Some(fix)) the fix. On the page only, never logged, dropped as the page goes.
@@ -1332,8 +1370,8 @@ struct Map {
     kists_read: u64,
     /// The kists alive as the kernel last said (ferros_sys::not_started::live, at each ring of the kists' bell), by capsule; None until it has (a kernel without op 2), when kist circles show no state.
     live: Option<alloc::vec::Vec<[u8; 32]>>,
-    /// The kists the kernel keeps a record for (ferros_sys::not_started::list: a start that did not happen, or a stop by a fault, a panic or a kill from outside), by capsule: stopped on their circles until they start again.
-    ended: alloc::vec::Vec<[u8; 32]>,
+    /// The kists the kernel keeps a record for (ferros_sys::not_started::list: a start that did not happen, or a stop by a fault, a panic or a kill from outside), by capsule: stopped on their circles until they start again, each with its reason (ferros_kist::launch::why) for its card on Items.
+    ended: alloc::vec::Vec<([u8; 32], u8)>,
     /// Things waiting on the person, by kist capsule, with how many: a for-you glow, its reach growing with the count. Nothing adds to it yet: ferros has no notifications (owner, 2026-11-11: for you is "anything waiting on the person"), and whatever brings them sets the count here and calls `send_states`.
     waiting: alloc::vec::Vec<([u8; 32], u16)>,
     /// Each circle's state as last sent to the display (op 57: the glow's byte and the count), so a ring of the kists' bell sends only what changed.
@@ -1846,7 +1884,7 @@ impl Map {
         let Some(n) = ferros_sys::not_started::list(cap(self.grants, S_SETTINGS), &mut buf) else { return };
         let records = || buf.chunks_exact(ferros_sys::not_started::REC).take(n);
         // Every kist the kernel keeps a record for is stopped on its circle (`state`), whatever the reason, until it starts again.
-        self.ended = records().map(|r| r[1..33].try_into().unwrap()).collect();
+        self.ended = records().map(|r| (r[1..33].try_into().unwrap(), r[0])).collect();
         self.stopped.retain(|s| records().any(|r| r[1..33] == s.0 && ferros_kist::launch::why::stopped(r[0])));
         let read = self.kists_read;
         for r in records() {
@@ -2255,11 +2293,23 @@ impl Map {
         let Some(live) = self.live.as_ref() else { return (Glow::None, 0) };
         if live.contains(&k.capsule) {
             (Glow::Running, 0)
-        } else if self.ended.contains(&k.capsule) {
+        } else if self.ended.iter().any(|e| e.0 == k.capsule) {
             (Glow::Stopped, 0)
         } else {
             (Glow::NotRunning, 0)
         }
+    }
+
+    /// A kist's state in words, for its row and its card on Items, as its glow says it (`state`): running, stopped (with the kernel's reason), or not running; None before the kernel has said which kists are alive (a kernel without op 2). Not for a puck: never a process, it has no state to say.
+    fn kist_state(&self, capsule: &[u8; 32]) -> Option<(Msg, Option<u8>)> {
+        let live = self.live.as_ref()?;
+        Some(if live.contains(capsule) {
+            (Msg::Running, None)
+        } else if let Some(e) = self.ended.iter().find(|e| &e.0 == capsule) {
+            (Msg::Stopped, Some(e.1))
+        } else {
+            (Msg::NotRunning, None)
+        })
     }
 
     /// The circles' states to the display (op 57): every circle's after a fresh scene (`all`), else only those changed since last sent. Whether any was sent.
@@ -2767,19 +2817,9 @@ impl Map {
         b.text(cx, title_y, uu(2, 1) as u16, white(), 1, &k.name);
         // Opened on why its launch did not start (`show_fault`): that, in the person's language, and nothing to tap; a tap outside closes it, and a tap on the circle again asks again.
         if let Some((_, why, true)) = self.fault.filter(|f| f.0 == k.capsule) {
-            use ferros_kist::launch::why as w;
-            let reason = match why {
-                w::ROOM => Msg::NotEnoughMemory,
-                w::NOT_HERE => Msg::NotInstalledHere,
-                w::CHECKS => Msg::FailedItsChecks,
-                w::READ => Msg::CouldNotBeRead,
-                // Started, then stopped (a fault or a panic: the kind is on the console; a kill from outside).
-                w::FAULT | w::PANIC => Msg::ItCrashed,
-                w::KILLED => Msg::ClosedFromOutside,
-                _ => Msg::SomethingWentWrong,
-            };
+            let reason = why_words(why);
             let y = (top + bottom) / 2;
-            let head = if w::stopped(why) { say(Say::Stopped(&k.name)) } else { say(Say::CouldNotStart(&k.name)) };
+            let head = if ferros_kist::launch::why::stopped(why) { say(Say::Stopped(&k.name)) } else { say(Say::CouldNotStart(&k.name)) };
             b.text(cx, y - uu(1, 1), uu(5, 4) as u16, white(), 1, head.as_str());
             b.text(cx, y + uu(1, 1), uu(1, 1) as u16, grey(), 1, tr(reason));
             if !region {
@@ -3828,8 +3868,8 @@ impl Map {
                 }
                 fact(b, &mut y, tr(Msg::Chip), v.as_str());
             }
-            "kists" => {
-                // Each installed kist and what it asked for (owner, 2026-11-08: per kist, its rights, switches), the developer's reason under each (the developer's words, as written); a tap changes the answer for every device of the person's (the list is theirs), and a kist running is killed and started again with the answers as they now stand.
+            "items" => {
+                // Everything on the home screen, each row opening its card (`card`): what it is, who made it, its rights as switches (owner, 2026-11-08: per kist, its rights; a tap changes the answer for every device of the person's, and a kist running is killed and started again with the answers as they now stand), stop, update and unstow.
                 let ks = self.kists.kists.clone();
                 // The installer's (installer.rs): the directory and the jobs under way. Sizes in the person's number base.
                 let inst = self.installer.clone();
@@ -3890,19 +3930,82 @@ impl Map {
                     }
                     y += uu(1, 1);
                 }
-                if ks.is_empty() {
-                    row(self, b, &mut y, small, grey(), tr(Msg::NoKistsInstalled), None);
+                // A thing's card (owner, 2026-11-12, of four ways to see a kist's info: "just 4", Items' row opening its card): the only place its info shows, in place of the list while it is open, Back above it. One gone meanwhile (unstowed, here or on another device of theirs) closes it.
+                let open = self.card.and_then(|c| ks.iter().position(|k| k.capsule == c));
+                if open.is_none() {
+                    self.card = None;
                 }
-                for (ki, k) in ks.iter().enumerate() {
+                if let Some(ki) = open {
+                    let k = &ks[ki];
+                    let puck = widget(&k.name);
+                    button(self, b, &mut y, tr(Msg::Back), false, Some(Choice::CardBack));
                     row(self, b, &mut y, uu(3, 2), white(), &k.name, None);
+                    y -= uu(3, 4);
+                    row(self, b, &mut y, note, grey(), tr(if puck.is_some() { Msg::KindPuck } else { Msg::KindKist }), None);
+                    let st = self.kist_state(&k.capsule);
+                    if let Some(icon) = puck {
+                        // A puck: what its circle shows (the clock: the time), then its rights and its remove. It is never opened, so it has no state to stop.
+                        fact(b, &mut y, tr(Msg::Shows), tr(puck_shows(icon)));
+                    } else {
+                        // Who made it: the developer's name as their first kist here gave it (the person's pin), and always their key's first bytes, which is who they are.
+                        let mut d = Line::new();
+                        if let Some(n) = self.kists.pins.iter().find(|q| q.developer == k.developer).and_then(|q| q.name.as_ref()) {
+                            let _ = write!(d, "{n} ");
+                        }
+                        short_key(&mut d, &k.developer);
+                        fact_wrap(b, &mut y, tr(Msg::MadeBy), d.as_str());
+                        // Its version as its signed declaration writes it, in the person's base, leading zero parts left out.
+                        let mut v = Line::new();
+                        match k.version.as_ref() {
+                            Some(ver) => {
+                                let _ = ferros_kist::write_version(&mut v, f, &ver.0);
+                            }
+                            None => {
+                                v.s("-");
+                            }
+                        }
+                        fact(b, &mut y, tr(Msg::FactVersion), v.as_str());
+                        // Its capsule's size where it is known: the pandok listing this very capsule, else the job that brought it while the installer still holds it. The person's list keeps no size, and the map holds no right to `capsules.`.
+                        let size = inst.dir.iter().find(|e| e.capsule == k.capsule).map(|e| e.size).or_else(|| inst.job_for(&k.capsule).map(|j| j.total).filter(|&t| t != 0));
+                        let mut s = Line::new();
+                        match size {
+                            Some(z) => {
+                                let _ = tatau::size_bits(&mut s, f, z << 3, 1);
+                            }
+                            None => {
+                                s.s("-");
+                            }
+                        }
+                        fact(b, &mut y, tr(Msg::Size), s.as_str());
+                        // Its identity (KISTS.md: its developer and option, what its answers and its domain are kept by, unchanged by an update), each shortened to its first bytes.
+                        let mut id = Line::new();
+                        short_key(&mut id, &k.developer);
+                        id.s(" ");
+                        short_key(&mut id, &k.option);
+                        fact_wrap(b, &mut y, tr(Msg::Identity), id.as_str());
+                        // Its state as its glow says it, a stop's reason under it; "-" before the kernel has said which kists are alive.
+                        fact(b, &mut y, tr(Msg::State), st.map_or("-", |s| tr(s.0)));
+                        if let Some((_, Some(why))) = st {
+                            row(self, b, &mut y, note, dim(), tr(why_words(why)), None);
+                        }
+                        // What it keeps: its own domain (the vault under the person's key and its identity). Its size is not told to the map yet; the hold (STORE.md) is later.
+                        fact(b, &mut y, tr(Msg::Keeps), tr(Msg::OwnDomain));
+                    }
+                    // Its rights, each a switch (asked once, ever, per person, per kist, per right: the person's answer, kept for all their devices; switched off, the right is taken back, the kist killed and started again without it), the developer's reason under each, "using now" while it holds a claim on it (only GPS is claimed today).
+                    y += uu(1, 2);
+                    b.text(cx, y, note as u16, dim(), 1, tr(Msg::PagePermissions));
+                    y += uu(2, 1);
                     if k.wants.is_empty() {
                         row(self, b, &mut y, note, dim(), tr(Msg::AsksForNothing), None);
                     }
+                    let gps = ferros_sys::claim::GPS;
+                    let using = if k.wants.iter().any(|w| w.right as u64 == gps) { self.users(gps) } else { Vec::new() };
                     for (j, w) in k.wants.iter().enumerate() {
-                        // A checkbox: on or off, a want never asked saying so.
                         let right = right_name(w.right as usize);
                         let l = if w.answer.is_none() {
                             say(Say::NotAskedYet(right))
+                        } else if w.right as u64 == gps && using.iter().any(|u| u.as_ref() == Some(&k.capsule)) {
+                            say(Say::UsingNow(right))
                         } else {
                             let mut l = Line::new();
                             l.s(right);
@@ -3912,22 +4015,77 @@ impl Map {
                         y -= uu(3, 4);
                         row(self, b, &mut y, note, dim(), &w.reason, None);
                     }
-                    // A restore or an uninstall of this kist under way, or one that failed.
-                    if let Some(j) = inst.job_for(&k.capsule).filter(|j| j.stage != installer::DONE) {
+                    y += uu(1, 2);
+                    // Its actions. A restore or an unstow of it under way, or one that failed, first; while one is under way, no unstow.
+                    let job = inst.job_for(&k.capsule).filter(|j| j.stage != installer::DONE);
+                    if let Some(j) = job {
                         progress(self, b, &mut y, j);
                     }
-                    if inst.here {
-                        let armed = self.uninstall_armed == Some(ki as u8);
-                        button(self, b, &mut y, if armed { "tap again: uninstall" } else { "uninstall" }, armed, Some(Choice::Uninstall(ki as u8)));
-                        if armed {
-                            row(self, b, &mut y, note, dim(), "its answers are kept for when you install it again", None);
+                    let busy = job.is_some_and(|j| j.stage < installer::DONE);
+                    // Stop, while it runs: one shot dead (init's OP_STOP), no record kept (the person's own act), so it goes to not running.
+                    if st.is_some_and(|s| s.0 == Msg::Running) && puck.is_none() {
+                        button(self, b, &mut y, tr(Msg::Stop), false, Some(Choice::Stop(ki as u8)));
+                    }
+                    // Update, when the pandok lists a newer version of the same kist (its identity; the pandok's own rule, `Version`'s order; one stowed before versions takes any listed one), its update's bar while it runs.
+                    let newer = inst.dir.iter().position(|e| e.developer == k.developer && e.option == k.option && e.capsule != k.capsule && k.version.as_ref().is_none_or(|v| e.version > *v));
+                    if let Some(di) = newer {
+                        let e = &inst.dir[di];
+                        let up = inst.job_for(&e.capsule).filter(|j| j.stage != installer::DONE);
+                        if let Some(j) = up {
+                            progress(self, b, &mut y, j);
+                        }
+                        if !up.is_some_and(|j| j.stage < installer::DONE) {
+                            let mut l = Line::new();
+                            let _ = write!(l, "{}, ", tr(Msg::Update));
+                            let _ = tatau::size_bits(&mut l, f, e.size << 3, 1);
+                            button(self, b, &mut y, l.as_str(), false, Some(Choice::Install(di as u8)));
                         }
                     }
-                    y += uu(1, 1);
+                    // Unstow in two taps (as "remove this device"): out of the person's list, its answers kept; a puck's says what a person sees, off the home screen.
+                    if inst.here && !busy {
+                        let armed = self.unstow_armed == Some(ki as u8);
+                        let words = match (puck.is_some(), armed) {
+                            (true, false) => Msg::RemoveFromHome,
+                            (true, true) => Msg::TapAgainRemove,
+                            (false, false) => Msg::Unstow,
+                            (false, true) => Msg::TapAgainUnstow,
+                        };
+                        button(self, b, &mut y, tr(words), armed, Some(Choice::Unstow(ki as u8)));
+                        if armed {
+                            row(self, b, &mut y, note, dim(), tr(Msg::AnswersKept), None);
+                        }
+                    }
+                    // The rest of the page is the list's; the card is all of it while open.
+                    self.page_h[p] = y - y0;
+                    return;
                 }
-                // The directory (kists.fgtw.org): every kist listed, to install, or to update when a newer one is listed than the one installed.
+                // Everything on the home screen as a circle, by kind (owner, 2026-11-12: "make sure the settings/items page lists kists and pucks. we may add more stuff to the home screen like contacts"): the kists first, then the pucks (a puck: a live circle never opened, docs/PUCKS.md), each kind a group, room for more kinds (contacts) as more groups. A row is its name, and under it its kind and a kist's state (as its glow says it); the whole of it opens its card.
+                if ks.is_empty() {
+                    row(self, b, &mut y, small, grey(), tr(Msg::NothingStowed), None);
+                }
+                for puck in [false, true] {
+                    for (ki, k) in ks.iter().enumerate().filter(|(_, k)| widget(&k.name).is_some() == puck) {
+                        let what = Some(Choice::Card(ki as u8));
+                        row(self, b, &mut y, uu(3, 2), white(), &k.name, what);
+                        y -= uu(3, 4);
+                        let mut l = Line::new();
+                        l.s(tr(if puck { Msg::KindPuck } else { Msg::KindKist }));
+                        if let Some((s, _)) = self.kist_state(&k.capsule).filter(|_| !puck) {
+                            l.s(", ");
+                            l.s(tr(s));
+                        }
+                        row(self, b, &mut y, note, grey(), l.as_str(), what);
+                        // A restore or an unstow of it under way, or one that failed.
+                        if let Some(j) = inst.job_for(&k.capsule).filter(|j| j.stage != installer::DONE) {
+                            progress(self, b, &mut y, j);
+                        }
+                        y += uu(1, 2);
+                    }
+                }
+                // The pandok (the directory, kists.fgtw.org; owner, 2026-11-11: "pandok is the place with the things"), under the list as it was on the Kists page before Items: every kist listed, to stow, or to update when a newer one is listed than the one stowed.
                 if inst.here {
-                    row(self, b, &mut y, uu(3, 2), white(), "available", None);
+                    y += uu(1, 2);
+                    row(self, b, &mut y, uu(3, 2), white(), tr(Msg::Pandok), None);
                     match inst.dir_state {
                         0 | 1 => row(self, b, &mut y, small, grey(), "reading the list of kists", None),
                         3 => row(self, b, &mut y, small, grey(), "the list of kists could not be reached", None),
@@ -3954,16 +4112,16 @@ impl Map {
                         let busy = job.is_some_and(|j| j.stage < installer::DONE);
                         if busy {
                         } else if mine.is_some_and(|k| k.capsule == e.capsule) {
-                            row(self, b, &mut y, note, grey(), "installed", None);
+                            row(self, b, &mut y, note, grey(), tr(Msg::Stowed), None);
                         } else if let Some(v) = mine.and_then(|k| k.version.as_ref()).filter(|v| e.version <= **v) {
-                            // An update only when the listed version is newer than the one installed (ferros_kist `Version`'s order: more parts is a later stage, leading zeros mean nothing); one installed before versions (None) takes any listed one.
+                            // An update only when the listed version is newer than the one stowed (ferros_kist `Version`'s order: more parts is a later stage, leading zeros mean nothing); one stowed before versions (None) takes any listed one.
                             let mut l = Line::new();
-                            l.s("installed ");
+                            let _ = write!(l, "{} ", tr(Msg::Stowed));
                             let _ = ferros_kist::write_version(&mut l, f, &v.0);
                             row(self, b, &mut y, note, grey(), l.as_str(), None);
                         } else {
                             let mut l = Line::new();
-                            l.s(if mine.is_some() { "update, " } else { "install, " });
+                            let _ = write!(l, "{}, ", tr(if mine.is_some() { Msg::Update } else { Msg::Stow }));
                             let _ = tatau::size_bits(&mut l, f, e.size << 3, 1);
                             button(self, b, &mut y, l.as_str(), false, Some(Choice::Install(di as u8)));
                         }
@@ -4519,8 +4677,8 @@ impl Map {
                 if row != Some(Choice::FleetRemove) {
                     self.fleet.confirm = false;
                 }
-                if !matches!(row, Some(Choice::Uninstall(_))) {
-                    self.uninstall_armed = None;
+                if !matches!(row, Some(Choice::Unstow(_))) {
+                    self.unstow_armed = None;
                 }
                 // The clock's (or the language's) word on a choice that did not take stays until the next tap.
                 self.zone_note = None;
@@ -4738,7 +4896,7 @@ impl Map {
                             self.pick_scroll = (self.page as i64 * pitch - (bottom - top - pitch) / 2).clamp(0, max);
                         }
                     }
-                    // An answer turned over on the Kists or Permissions page (never answered reads as off: one tap turns it on): kept in the person's list, and the kist, if running, killed and launched again with it.
+                    // An answer turned over on a kist's card or the Permissions page (never answered reads as off: one tap turns it on): kept in the person's list, and the kist, if running, killed and launched again with it.
                     Some(Choice::Answer(ki, j)) => {
                         self.reload_kists();
                         if let Some(w) = self.kists.kists.get_mut(ki as usize).and_then(|k| k.wants.get_mut(j as usize)) {
@@ -4749,21 +4907,43 @@ impl Map {
                             }
                         }
                     }
-                    // Uninstall in two taps (as "remove this device"): the first arms it, the second asks the installer, which keeps the kist's answers.
-                    Some(Choice::Uninstall(k)) => {
-                        if self.uninstall_armed == Some(k) {
-                            self.uninstall_armed = None;
+                    // Unstow in two taps (as "remove this device"; a puck's "remove from the home screen" the same): the first arms it, the second asks the installer (op 4), which takes it out of the person's list, keeps its answers and drops its capsule; its circle goes when the job is done, and the card with it.
+                    Some(Choice::Unstow(k)) => {
+                        if self.unstow_armed == Some(k) {
+                            self.unstow_armed = None;
                             if let Some(kist) = self.kists.kists.get(k as usize) {
                                 let mut m = [0u8; 65];
                                 m[0] = 4;
                                 m[1..33].copy_from_slice(&kist.developer);
                                 m[33..].copy_from_slice(&kist.option);
                                 if installer::ask(self.grants, &m) != Some(0) {
-                                    console(self.grants, b"map: the installer did not take the uninstall\n");
+                                    console(self.grants, b"map: the installer did not take the unstow\n");
                                 }
                             }
                         } else {
-                            self.uninstall_armed = Some(k);
+                            self.unstow_armed = Some(k);
+                        }
+                    }
+                    // A row on Items: its card, at its top; Back: the list, at its top.
+                    Some(Choice::Card(k)) => {
+                        self.card = self.kists.kists.get(k as usize).map(|kist| kist.capsule);
+                        self.scroll = 0;
+                    }
+                    Some(Choice::CardBack) => {
+                        self.card = None;
+                        self.scroll = 0;
+                    }
+                    // A kist's Stop: init ends its running process (OP_STOP), one shot dead; the kists' bell rings as it ends, and its state follows on the card and its circle (`kists_rang`).
+                    Some(Choice::Stop(k)) => {
+                        if let Some(kist) = self.kists.kists.get(k as usize) {
+                            let mut m = [0u8; 33];
+                            m[0] = ferros_kist::launch::OP_STOP;
+                            m[1..].copy_from_slice(&kist.capsule);
+                            let mut r = [0u8; 1];
+                            let n = call(cap(self.grants, S_LAUNCH), &m, &mut r);
+                            if n == ferros_sys::ERR || n < 1 || (r[0] != ferros_kist::launch::STOPPED && r[0] != ferros_kist::launch::NOT_RUNNING) {
+                                console(self.grants, b"map: init did not take the stop\n");
+                            }
                         }
                     }
                     // Install or update the directory's kist: the installer fetches, checks and seals it, and the page shows each stage as its doorbell rings.
@@ -4875,7 +5055,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
 
     // The circles: settings, then a kist circle for each kist the person installed (their list, `kists.list`; none readable, none shown), sized by share and placed once.
     let kists = ferros_kist::store::read(cap(grants, S_KIST_LIST)).unwrap_or_default();
-    // WHY: the scene and the arrays hold MAX circles; kists past it get no circle until there is room (the settings' Kists page still lists them).
+    // WHY: the scene and the arrays hold MAX circles; kists past it get no circle until there is room (the settings' Items page still lists them).
     let n = (1 + kists.kists.len()).min(MAX);
     let rs: [i64; MAX] = core::array::from_fn(|i| if i == 0 { radius_of(CIRCLES[0].share) } else if i < n { radius_of(KIST_SHARE) } else { 0 });
     let mut xs = [0i64; MAX];
@@ -4949,7 +5129,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         ntags: 0,
         tag_said: 0,
         tag_adds: 0,
-        uninstall_armed: None,
+        unstow_armed: None,
+        card: None,
         asked: None,
         fault: None,
         stopped: alloc::vec::Vec::new(),
@@ -5139,13 +5320,13 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut space_seen = 0u32;
     // The departure waiting here last seen (its intent and the asking device's name), so the Fleet page opens once for each: a request answered clears it, so the same device asking again opens the page again.
     let mut ask_seen: Option<(u8, [u8; NAME_BYTES], usize)> = None;
-    // The kist offered over USB last opened the Kists page on (docs/KISTS.md "Stowing").
+    // The kist offered over USB last opened the Items page on (docs/KISTS.md "Stowing").
     let mut offer_seen: Option<[u8; 32]> = None;
     // The copy of the identity service last taken (`fgtw_poller`'s sequence count).
     let mut fleet_seen = 0u32;
     // Whether the Fleet page showed at the last pass (`FLEET_PAGE`).
     let mut fleet_shown = false;
-    // The installer's copy last taken, the finished jobs in it (a kist installed or uninstalled: the circles follow), and whether the Kists page showed at the last pass (opening it reads the directory again).
+    // The installer's copy last taken, the finished jobs in it (a kist stowed or unstowed: the circles follow), and whether the Items page showed at the last pass (opening it reads the directory again).
     let (mut installer_seen, mut installer_done, mut kists_shown) = (0u32, 0u64, false);
     // GPS's claims as the permissions and GPS pages were last drawn with them (CLAIMS_WORD, the kernel's doorbell): a change draws them again.
     let mut claims_seen = 0u64;
@@ -5167,7 +5348,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The add flow following the Fleet page (`fleet_page_thread`).
     static mut PAGE_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(fleet_page_thread, unsafe { &mut *(&raw mut PAGE_STACK) }, grants);
-    // The installer's doorbell (payloads/kists), for the Kists page: on a thread of its own, never on a timer.
+    // The installer's doorbell (payloads/kists), for the Items page: on a thread of its own, never on a timer.
     static mut INSTALLER_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(installer::watch, unsafe { &mut *(&raw mut INSTALLER_STACK) }, grants);
     // The GPS driver's doorbell, for the GPS page (`gps_watch`): on a thread of its own, asleep while the page is not open.
@@ -5253,7 +5434,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             FLEET_PAGE.store(((v >> 1) + 1) << 1 | shown as u64, core::sync::atomic::Ordering::Release);
             ferros_sys::wake(&FLEET_PAGE, 1);
         }
-        // The installer's copy, when its doorbell has rung (installer.rs): taken in, the Kists page drawn again while it shows, and the person's list and circles read again when a job has finished (a kist installed, updated, uninstalled or restored).
+        // The installer's copy, when its doorbell has rung (installer.rs): taken in, the Items page drawn again while it shows, and the person's list and circles read again when a job has finished (a kist stowed, updated, unstowed or restored).
         if let Some((seq, s)) = installer::take(installer_seen) {
             installer_seen = seq;
             let done = s.finished();
@@ -5262,12 +5443,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 installer_done = done;
                 map.refresh_circles();
             }
-            if matches!(map.view, View::Open(_)) && PAGES[map.page] == "kists" && !map.settling {
+            if matches!(map.view, View::Open(_)) && PAGES[map.page] == "items" && !map.settling {
                 map.draw();
             }
         }
-        // The Kists page opened: the installer reads the directory again (owner: on opening the page, never on a timer).
-        let shown = matches!(map.view, View::Open(_)) && PAGES[map.page] == "kists";
+        // The Items page opened: the installer reads the pandok (the directory) again (owner: on opening the page, never on a timer).
+        let shown = matches!(map.view, View::Open(_)) && PAGES[map.page] == "items";
         if shown != kists_shown {
             kists_shown = shown;
             if shown {
@@ -5414,11 +5595,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             ask_seen = ask;
         }
-        // A kist offered over USB, checked and waiting on this person: a new one opens the Kists page on it, Stow and Cancel ready, as a departure opens the Fleet page. Not over an app in front, nor under a finger or while the map settles: it opens once the fingers lift, or once the person is back on the map.
+        // A kist offered over USB, checked and waiting on this person: a new one opens the Items page on it, Stow and Cancel ready (above the list, or above a card left open), as a departure opens the Fleet page. Not over an app in front, nor under a finger or while the map settles: it opens once the fingers lift, or once the person is back on the map.
         if !map.app_front && !down && !map.settling {
             let offer = map.installer.offer.as_ref().map(|o| o.capsule);
             if offer.is_some() && offer != offer_seen {
-                map.show_page("kists");
+                map.show_page("items");
                 map.draw();
             }
             offer_seen = offer;

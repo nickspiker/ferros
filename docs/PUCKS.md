@@ -9,6 +9,14 @@ Status: proposed 2026-11-11 for the owner's review; nothing on the display, the 
 - **It is live**: what its circle shows follows the world (the time, the tide) with no tap. A kist circle that shows only an icon until tapped is not a puck.
 - **Android's word is widget**, and the code says widget today (display `WIDGET_CLOCK`, the map's `widget()`). Widget also names fluor's controls (button, slider: COMPOSITOR.md "Controls"), so puck keeps the two apart. If the owner takes the word: GLOSSARY.md gets it, and `widget` in the map and the display is renamed where it means a puck.
 
+## Listed in Items (2026-11-12)
+
+The owner, 2026-11-12: "make sure the settings/items page lists kists and pucks ... and I think pucks distinct from kists being that you can't open a puck and it's basically a widget." So the word is taken (question 0 below), and a puck is its own kind on the home screen beside kists, not a kind of app.
+
+- **Settings → Items** lists everything on the home screen as a circle by kind: the kists, then the pucks, each row its name with "puck" or "kist" under it (KISTS.md "Items and the card"). Contacts are to come as another kind.
+- **A puck's card** (its row tapped): its name, "puck", what it shows (the clock: the time), its permissions (each a switch, as a kist's: the clock asks for none), and **remove from the home screen** in two taps. Underneath that is an unstow: the installer takes it out of the person's list, its answers kept, and its circle goes. No state and no stop: a puck is never opened and, today, never a process.
+- **How the map tells a puck** is still the clock's name (`widget`, "Clock"); the signed `puck` flag (question 5) replaces it when decided. The code's `widget` is not renamed yet: it and the display's `WIDGET_CLOCK` move to puck with that flag.
+
 ## How the clock fits today
 
 - The clock kist's capsule (payloads/clock) has nothing to run. The display draws the face itself (`WIDGET_CLOCK`, scene icon G#80), from its own clock and the person's base, in whatever circle the map gives that icon.
@@ -103,7 +111,7 @@ The map already treats a tap on the clock as 1 (it never launches it); 1 keeps a
 
 ## Open questions (owner)
 
-0. **The word.** Puck for a live, never-opened kist circle? And rename the code's `widget` where it means a puck.
+0. **The word.** Puck for a live, never-opened kist circle? And rename the code's `widget` where it means a puck. Answered 2026-11-12: puck, a kind of its own beside kists ("Listed in Items" above); the code's rename rides with the `puck` flag (5).
 1. **The drawing path.** (c) as recommended, with time-anchored ops and display-formatted moments and numbers? Then the clock moves to it too (its capsule a list of ops, no display code of its own).
 2. **The op set.** Which of the sketched ops, and their bounds (2^6 ops, one 4 KiB call)?
 3. **A tap.** Nothing, focus (as the clock), a cycle of views, or a page?

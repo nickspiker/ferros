@@ -51,7 +51,7 @@ At attest the map reads `kists` (it already holds the person's arrangement) and 
 5. **No lying**: a right said no to is an empty slot, never a fake, and a kist runs without it (Mahere without GPS; Lumis without the camera has no cameras to pick).
 6. **Kists can never ask.** No call makes a prompt. The system asks once, at first launch: every unanswered want on one screen, each a switch.
 7. **Revoke = kill and respawn** without the right. Every kill and every end, of any process, is one shot dead: no end hooks, no signals, no graceful shutdown, no teardown code; the kernel reclaims by dropping (and wipes the arc as it does).
-8. **Settings pages**: per kist (Kists), per right (Permissions: who has the GPS, who has the network), and the defaults, in the system settings circle.
+8. **Settings pages**: per kist (its card on Items since 2026-11-12, "Items and the card" below; the Kists page before), per right (Permissions: who has the GPS, who has the network), and the defaults, in the system settings circle.
 9. **Kist circles** on the map, round, one per kist; a tap asks init to launch it (init holds every grant; the map holds none of the kist's), the first launch showing the question first.
 
 Later, not now: a system picker that hands a kist just the file the person chose (no permission needed: the choice is the grant); the console showing live use of a right.
@@ -75,7 +75,7 @@ Later, not now: a system picker that hands a kist just the file the person chose
   - A tap launches through init. If any want is unanswered, the circle first opens on the question: each unanswered want a switch set from the person's default, its reason under it, then "start", which keeps the answers and launches.
   - A launch init answered "started" that the kernel did not start (2026-11-11): the map holds the kists' bell (`SYS_NOT_STARTED` op 1) and, when it rings, looks among the records for the kist it asked last with a bell count later than the one it saw before asking. Found, that circle opens on why, once the plane is at rest and no finger is down: "Mahere could not start", the reason under it (not enough memory; not installed on this device; it did not pass its checks; it could not be read; something went wrong), in the person's language (ferros_lang `Say::CouldNotStart`, `Msg::NotEnoughMemory` and its neighbours). Nothing to tap: a tap outside closes it, a tap on the circle again asks again. While the job is under way nothing new shows (it is quick).
   - A kist that started and then stopped (reasons 5-7): the kist asked last opens its circle the same way, "Mahere stopped", "it crashed" (a fault or a panic, the kind on the console) or "it was closed from outside" (ferros_lang `Say::Stopped`, `Msg::ItCrashed`, `Msg::ClosedFromOutside`). Any other kist that stopped (the person elsewhere meanwhile) is said once, at its circle's next tap, before any launch; the tap after launches. A stop the kernel no longer keeps (that kist started again since) is dropped unsaid. The map takes each record once, by its bell count (`kists_read`).
-  - Settings pages Kists (each kist, each want a switch) and Permissions (each right: the default for new kists, then every kist that wants it). A changed answer is written to the list, and a running kist is relaunched.
+  - Settings pages Kists (each kist, each want a switch; Items and a card per thing since 2026-11-12) and Permissions (each right: the default for new kists, then every kist that wants it). A changed answer is written to the list, and a running kist is relaunched.
 - **The installer, for development**:
   - `ferros-bridge capsule … --kist NAME --option HEX --want RIGHT REASON …` signs a declaration in, with the option as the capsule's `hp`, so an update keeps the kist's identity.
   - `ferros-bridge kist install <capsule>` (since 2026-11-11 the development fallback alone, "Stowing") checks the signature, stores the capsule in parts of 4 MiB (a `store` command's part form: offset and more, by address), and adds the kist to the attested person's list. `kist answer` and `kist list` are for testing.
@@ -98,7 +98,7 @@ The owner judged four dummy circles on the Pro and kept their glows (2026-11-11:
 |---|---|---|
 | running | 500 nm, thin | a live process of the kist, in front or behind (home's tap leaves it alive behind); a widget the display draws itself (the clock) too, as it is live on the glass and never a process |
 | stopped | 600 nm, thin | the kernel keeps a record for it: its last process ended by a fault, a panic or a kill from outside, or its last launch did not start (no room, not here, its checks, its capsule unreadable); dropped when it next starts |
-| not running | a ring of darkness | installed and neither: not launched since boot, or ended by its own exit or the person's relaunch |
+| not running | a ring of darkness | installed and neither: not launched since boot, or ended by its own exit, the person's relaunch or the person's Stop on its card |
 | for you | 400 nm, heavy, reach by count | something waiting on the person for that kist; nothing sets it yet (no notifications exist): the map's `waiting` list by capsule takes a count when something does |
 | system | 703 nm, thin | the settings circle alone (built in, never a kist): VSF's red primary, so its light has no negative channel and no multiply |
 
@@ -108,6 +108,35 @@ For you is checked first, then running, then stopped. A kernel without op 2 belo
 - **ferros_sys** `not_started::live`.
 - **The map** (`state`, `send_states`): at each ring of the kists' bell (`kists_rang`) it reads the records (stopped) and the kists alive (op 2), sends display op 57 for every circle whose state changed, and draws when the map is on the glass. Every `send_scene` (a fresh scene has no states) sends them all, and at start the map reads them once, so a map started again finds a running kist running.
 - **The display** takes state 5 (system) on op 57; an older display draws an unknown byte as no state.
+
+## Items and the card (2026-11-12)
+
+The owner, 2026-11-12, of four ways to see a kist's info (twist a circle to flip it, drag it to the centre, an info circle in the quick row, Settings → Kists where each row opens the kist's card): "just 4." Then: "make sure the settings/items page lists kists and pucks. we may add more stuff to the home screen like contacts and shit so I want to make sure it says items in settings, not kists. and I think pucks distinct from kists being that you can't open a puck and it's basically a widget."
+
+So the settings circle's Kists page is **Items** (ferros_lang `Msg::PageItems`, all sixteen languages; the map's page key `items`), and a thing's **card** is the one place its info shows: no flip, no info circle. Wherever this document says "the Kists page", it is Items now.
+
+**The list.** Everything on the home screen as a circle, by kind: the kists first (opened: apps), then the pucks (live circles never opened, PUCKS.md: today the clock, known by its name, `widget`), each kind a group, so contacts can come as one more. Each row is the thing's name, and under it its kind ("kist", "puck") and a kist's state as its glow says it (running, stopped, not running; nothing before the kernel has said which kists are alive). The whole row opens its card. A restore or an unstow under way shows its bar under its row. Under the list, the **pandok** (the directory, kists.fgtw.org; "available" before): each listed kist, "stowed", or "stow" or "update" with its size. A kist offered over USB stays above everything, the list or a card alike ("Stowing" below), and opens Items on it as it opened the Kists page.
+
+**A kist's card** (Back above it, which returns to the list; one unstowed meanwhile, here or on another device of theirs, closes it):
+- its name and kind;
+- **made by**: the developer's name as their first kist here gave it (the person's pin), then always their key's first four bytes (`G#…`);
+- **version**: as its signed declaration writes it, in the person's base, leading zero parts left out (`write_version`); "-" for one stowed before versions;
+- **size**: its capsule's, where known: the pandok listing that very capsule, else the job that brought it while the installer still holds it; else "-" (the person's list keeps no size and the map holds no right to `capsules.`; an installer op that sizes a stowed capsule without reading it is not built);
+- **identity**: its developer key and its option, each shortened to its first four bytes (what its answers and its domain are kept by, unchanged by an update);
+- **state**: running, stopped (the kernel's reason under it: not enough memory, not on this device, its checks, unreadable, it crashed, closed from outside; the map now keeps each record's reason, `ended`), or not running;
+- **keeps**: "in its own domain" (its vault domain). Its size is not told to the map yet; the hold (STORE.md) is later;
+- **permissions**: each want a switch with the developer's reason under it, "not asked yet" while unanswered, "using now" while it holds a claim (GPS only, today). The answers are the person's, asked once, ever, for all their devices; a switch turned off takes the right back (the list written, the kist killed and started again without it: `Choice::Answer`, unchanged);
+- its actions: **stop**, while it runs; **update**, when the pandok lists a newer version of the same identity (the pandok's own rule: `Version`'s order, any listed version for one stowed before versions), its bar while it runs; **unstow**, two taps ("tap again: unstow", "its answers are kept for when you stow it again"), not while a job of its own is under way.
+
+**A puck's card**: its name and kind, **shows** (what its circle shows: the clock, the time), its permissions as above (the clock asks for none), and **remove from the home screen** in two taps. A puck is never a process, so it has no state and no stop.
+
+**Underneath:**
+- **Unstow** (and a puck's remove) is the installer's op 4 as uninstall was (`Choice::Unstow`, renamed from `Uninstall`): out of the person's list, its answers kept (`kept`), its capsule dropped, the removal carried to their other devices by the identity space. Its circle goes when the job is done, and the card with it.
+- **Stop** is new: the map asks init's `launch` endpoint `[OP_STOP 2][capsule]` (ferros_kist::launch). Init finds the kist in the person's list by its capsule (never the map's word) and calls `ferros_sys::stop_kist`: `SYS_SPAWN` kist mode with x2 bit 5. The kernel kills the live process of that name only if it is that kist (a kist process with that capsule; a kist named as a system process stops nothing), one shot dead (`kill_locked`), launches nothing, and keeps no record, as for the person's relaunch, so the circle goes to not running, not stopped. Init answers STOPPED (6), NOT_RUNNING (7, nothing done), or NOT_INSTALLED, UNREADABLE, REFUSED. The kill rings the kists' bell, so the card and the circle's glow follow with nothing asked on a timer.
+- **A permission switch** is the Kists page's (`Choice::Answer`): the answer written to the person's list (`kists.list`, identity class), then init's OP_RELAUNCH, which kills a running kist and starts it with the answers as they now stand (nothing for one not running).
+- **Words**: ferros_lang `PageItems`, `KindKist`, `KindPuck`, `Pandok`, `NothingStowed`, `MadeBy`, `FactVersion`, `Size`, `Identity`, `Running`, `Stopped`, `NotRunning`, `Keeps`, `OwnDomain`, `Stop`, `Update`, `Unstow`, `TapAgainUnstow`, `AnswersKept`, `RemoveFromHome`, `TapAgainRemove`, `Shows`, `TheTime`, in all sixteen languages. The pandok's "stowed", "stow" and "update" now come from them too; its other lines ("reading the list of kists" and its neighbours) and the installer's stage words are still English outside ferros_lang.
+
+**Not yet:** run on a device; a kist's own domain size; a capsule's size for one the pandok does not list once its job is gone; contacts as a kind; the map's `widget` (a puck by its name) renamed and replaced by the signed `puck` flag (PUCKS.md).
 
 ## Built before
 

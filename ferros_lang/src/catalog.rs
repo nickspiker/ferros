@@ -47,8 +47,8 @@ messages! {
     PageUnits,
     PageKeyboard,
     PageSecurity,
-    /// The installed kists' page (kist: the capsule as the device checked, compiled and sealed it; a ferros word, kept as "kist" unless a language has a reason).
-    PageKists,
+    /// The page listing everything on the home screen as a circle, by kind (owner, 2026-11-12: "I want to make sure it says items in settings, not kists"): kists, pucks, later contacts; each row opens its card.
+    PageItems,
     PagePermissions,
     PageFleet,
     PagePower,
@@ -421,6 +421,50 @@ messages! {
     UncheckedDevOnly,
     /// Over an offer's wants: each is asked once, at its first start.
     AsksAtFirstStart,
+
+    // ---- Items: what is on the home screen, and each thing's card (owner, 2026-11-12) ----
+    /// A row's kind: a kist (opened, an app; a ferros word, kept unless a language has a reason).
+    KindKist,
+    /// A row's kind: a puck (a live circle never opened, docs/PUCKS.md; a ferros word, never "widget").
+    KindPuck,
+    /// The heading over the pandok's kists on Items (the pandok: the place with the things, the kist catalog; a ferros name, kept).
+    Pandok,
+    /// Items with nothing on the home screen but settings.
+    NothingStowed,
+    /// A card's fact: who made it (the developer's name, else their key's first bytes).
+    MadeBy,
+    /// A card's fact: its version (`Version` is About's line).
+    FactVersion,
+    /// A card's fact: its capsule's size.
+    Size,
+    /// A card's fact: its identity, the developer's key and its option, shortened.
+    Identity,
+    /// A kist's state on its row and card: a process of it alive.
+    Running,
+    /// Its last process ended by a fault, a panic or a kill from outside, or its last launch did not start (the reason under it).
+    Stopped,
+    /// Stowed and neither: not launched since boot, or ended by its own exit or the person's stop.
+    NotRunning,
+    /// A card's fact: where it keeps its data.
+    Keeps,
+    /// Its value: the kist's own vault domain.
+    OwnDomain,
+    /// A card's button: a running kist ended, one shot dead.
+    Stop,
+    /// A card's and the pandok's button: a newer version from the pandok.
+    Update,
+    /// A kist's card: out of the person's list (two taps), the opposite of stow.
+    Unstow,
+    TapAgainUnstow,
+    /// Under an armed unstow: the answers stay in the person's list.
+    AnswersKept,
+    /// A puck's card: off the home screen (two taps; an unstow underneath).
+    RemoveFromHome,
+    TapAgainRemove,
+    /// A puck's card: the fact naming what its circle shows.
+    Shows,
+    /// The clock puck's: the time.
+    TheTime,
 
     // ---- Developer ----
     TemporalDither,

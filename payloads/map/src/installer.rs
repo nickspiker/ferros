@@ -1,4 +1,4 @@
-//! The installer as the map's Kists page knows it (payloads/kists, its `kists` endpoint; docs/KISTS.md "Install"): the directory's kists, and each install, update, uninstall and restore under way with its stage and bytes. Read on a thread of its own each time the installer's doorbell rings (op 0), never on a timer; the main loop takes a copy (`take`).
+//! The installer as the map's Items page knows it (payloads/kists, its `kists` endpoint; docs/KISTS.md "Install"): the directory's kists, and each install, update, uninstall and restore under way with its stage and bytes. Read on a thread of its own each time the installer's doorbell rings (op 0), never on a timer; the main loop takes a copy (`take`).
 
 use alloc::string::String;
 use alloc::vec::Vec;
