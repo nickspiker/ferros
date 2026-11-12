@@ -9,12 +9,14 @@ use alloc::vec::Vec;
 const PARTS: [&str; 5] = ["modem", "efs", "persist", "modem_userdata", "vendor"];
 
 /// A partition by its grant.
+#[derive(Clone)]
 pub struct Mount {
     slot: u64,
     name: &'static str,
 }
 
 /// A file found on it: its path and size.
+#[derive(Clone)]
 pub struct Inode {
     path: String,
     pub size: u64,

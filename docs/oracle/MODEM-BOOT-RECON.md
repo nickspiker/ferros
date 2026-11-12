@@ -570,3 +570,31 @@ What changed:
 
 Expected, not yet measured: MAIN in about 1.5-2 s (1998 frames at the longer of the CP's ≤ 0.7 ms and the AP's ~0.2 ms read plus ~0.7 ms of word stores), the download about 2.5 s with its 500 ms opening pause, INIT_END about 3.5 s from power-on instead of about 21.
 After INIT_END the service's RIL steps run on fixed times (radio on at 3 s, UICC 6.2, profiles 6.5, allowed networks 6.8, the radio cycle at 9 and 9.5 s), so registration lands about 10-11 s after INIT_END and the data call about 5 s after that (the CP and Verizon's PDN setup). The fixed times are the next thing to make event-driven, once a console log shows when the manifest handshake and the first registration actually come.
+
+## 2026-11-12: the ring write-combined, the read beside it, no pin watch, the radio set up on the CP's answers
+
+Measured on the Pro after the change above: MAIN in 3683 ms (reading 1161, into the ring 1857, waiting for the CP 12), 26 MB/s; the whole download 3911 ms; the bring-up's timeline link up 3533 ms, CP ROM done 3584, link cycled 3770, firmware and NV loaded 8212, INIT_END 8595.
+The data stack registered 7982 ms after INIT_END (home, NR), the data call was up at 8623 (17218 ms from power-on), and then the radio cycle at 9032 threw both away: registration 00 00 00 14, then 00 00 00 0E, the call lost, home again at 11786 and the call back at 12553 (21149 from power-on).
+So the CP waited 12 ms in 3.7 s: every millisecond of MAIN was the AP's.
+
+What changed, and why:
+- **The TX ring is Normal non-cacheable** (kernel cachemap.rs `MODEM_TX_NC`, a level-3 table for the IPC window's first 2 MiB): IPC + G#3000 to IPC + G#20_0000, which only the AP writes and the CP only reads. A run of word stores now gathers into bursts; Device-nGnRnE sent each 8-byte store alone and waited for its write response, about 150 ns each. The cursors, message words and handover block (the first G#3000) and the RX ring stay Device, so every read of what the CP wrote is still fresh and ordered. The ring's stores reach memory before the head moves by the `dsb sy` that `publish` and `ring_frame` already had, and the ROM image (inside the same span) before its doorbell by `rom_boot`'s. Android maps all of IPC Normal cacheable with PCIe IO coherency (`region,cached = <1>`, `cp_shmem_get_region`), and `txq_write` is a memcpy with a barrier only before the head; write-combining is what cpif gives every region it maps uncached (`cp_shmem_get_nc_region`, `pgprot_writecombine`).
+- **The read runs beside the frames** (modem.rs `Feed`): a reader thread reads `modem.bin` from MAIN's start to APM's end (they lie back to back in TOC order) in 1 MiB calls, each one UFS run (the kernel's largest, `PART_CHUNK_RUNS` = ferros_hal `RUN_MAX` blocks), into four 1 MiB buffers in turn, starting during the download's 500 ms opening pause. The frame loop copies each frame's bytes out of them and waits only if it catches the reader up; one line after APM gives the reader's own time and call count. 98 calls replace 1998, and none of them is on the frame loop's time.
+- **No pin watch after power-on.** PS_HOLD reads 0 on husky at every look (before the ROM stage, after it, after INIT_END), so the watch "until PS_HOLD rises" always ran its full 3 s. Linux reads PS_HOLD only to print it (`print_mc_state`): power_on_cp returns 57 ms after it starts and the endpoint is enumerated 250 ms later (Linux log: power_on_cp 6.364 s, CP_WRST_N high 6.421 s, s51xx probe 6.671 s). The bring-up keeps Linux's 200 ms before the PHY; stage 1 alone still watches 3 s.
+- **The radio's setup runs on the CP's answers** (modem.rs `ril_step`), in the order the timers sent it: SIT_GET_RADIO_POWER at INIT_END (Android's RIL writes within 3 ms of INIT_END, Linux log 8.824 / 8.827 s; asked once more at the CP's first modem-service message, 1.2-1.6 s after INIT_END, if unanswered), its answer → the radios on (both stacks) and the SIM status, the data stack's G#4602 → the manifest (as before), the manifest's answer → UICC subscription, its answer → the six data profiles, the last one's answer → the allowed networks, its answer → preferred data modem and PS service. The stage logs show each answered in milliseconds (GET_RADIO_POWER 2 ms, SET_RADIO_POWER under 200, manifest, UICC and allowed networks within 3), and G#4602 came right after the radio-on answer on every run, so the radio on is what brings it.
+- **No radio cycle.** It went in on the theory that the first power-on predated the carrier pack; the run above registered and had its call before the cycle, which then cost 3.9 s and the flapping. The read-only queries of stage G#10 stay in the stage diagnostics only (the service never read their answers).
+
+Expected, not yet measured (ms from power-on):
+
+| Step | Before | Expected | What sets it |
+|---|---|---|---|
+| link up | 3533 | about 350 | Linux's delays: the power sequence 120, then 200, PHY and link about 30 |
+| CP ROM done | 3584 | about 400 | the CP (44 ms) |
+| link cycled | 3770 | about 590 | the CP raising CP2AP_WAKEUP (about 100 ms) |
+| firmware and NV loaded | 8212 | about 1600-2500 | 500 ms opening pause (ours, unproven either way), then MAIN at the CP's pace: under 0.7 ms a frame by Android's 1.5 s download, so at most 1.4 s, perhaps much less; the ring copy about 25-100 µs a frame and the read hidden |
+| INIT_END | 8595 | about 2000-2900 | the CP: START to INIT_START 374 ms |
+| allowed networks sent | INIT_END + 6801 | INIT_END + about 200 (up to 1800 if the first question is lost) | the CP's answers; the manifest about 130-190 ms after the radio-on |
+| registered | INIT_END + 7982 | allowed + 1.2-3 s | Verizon and the CP's cell search (1.2 s measured, with the radio on for 3.8 s already; from a radio just on it may take longer) |
+| data call up | 17218, lost, 21149 | about 4500-7500 | Verizon's PDN setup, 640 ms measured |
+
+What is left that is not Verizon's: the 500 ms opening pause (no event from the CP's bootloader is known to replace it), Linux's 200 ms after power-on, and the CP's own turns.
