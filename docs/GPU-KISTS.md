@@ -235,6 +235,29 @@ Each step is measured on the Pro before the next; sizes are estimates.
      - The A715s' active clock (1065 MHz, the boot's) and the heat it costs.
      - Lettering in GPU mode: a CPU layer in front means the labeller's box-filtered glyphs every frame of a pan on cores the publish already fills; in the kernel it means the glyph atlas in the arena and each 32 px tile's list of glyphs, a loop a pixel. Not built.
      - The plan into the kernel (the globe's 15.7 ms) is the next step on Mahere's side either way.
+   - **Third pass (2026-11-12): the plan in the kernel** (Mahere ferros-plan 19164a8, built on the 8a):
+     - Each pixel finds its own place on the ball: its direction in view coordinates from three uniforms (the camera's centre and the globe's radius), its face the nearest centroid among the frame's faces in view (the encoder's choice, mahere-coord `face_map`), its depth-30 (u, v) as a ratio of two linear forms of the direction (the gnomonic projection and the barycentric solve in one, a reciprocal a pixel). When every face in view is within 50 degrees of the camera point the forms are measured from it (z − 1 as −q / (1 + z)), so f32 keeps a unit (6.6 mm) of precision at any zoom; at the globe from the origin.
+     - Its cell from a page table in its own block: for each role (the terrain, the vector planes) and each diamond in view, a box of cell-grid squares at the role's depth, each square one word, the texel base of the cell standing in for it and its texel shift. Two loads where the blocks' candidates took a dozen.
+     - One face in view: every coefficient is a constant of the recording. More (a seam, a corner of the icosahedron, the globe): an argmax over the faces (three FMAs and two selects each), then the face's row of 24 words from the arena.
+     - The CPU's part (mahere-engine `viewplan`): the faces in view, about 3500 points projected without trigonometry (the 32 px lattice, every 8 px along the edges, the faces' corners on the screen) for the desired set, the boxes and the elevation range, and each square's stand-in. No lattice of blocks, no 4 px seam sub-blocks.
+     - Checked on the host in valhall's emulator: every pixel's (u, v) within a unit of the plan's f64 at a town, a seam, the north pole, 2^20 pixels a degree on an icosahedron corner, and the globe; every square and texel address as the host's table names it; the frame against the CPU raster as before (7505 of 7680 pixels the same code), across a seam and at the pole too outside the CPU's own straddling tiles (it samples those at the pixel's centre, every other tile at the corner, as the kernel does everywhere).
+     - Measured on the 8a (1080 × 2400, its 60 Hz panel; DNS gave no address, so no cells and the loading mesh everywhere; built with a 128 MiB heap for both, since akita's frame pool is 336 MiB with about 206 free and the 640 MiB ceiling is not grantable there):
+
+       | | Before | After |
+       |---|---|---|
+       | Town: the plan | 3.83 ms (corners 1.44, candidates 1.74) | 0.93 ms |
+       | Town: the kernel on the GPU | 5.34 ms, 666 words | 4.64 ms, 612 words (14 loads, 31 before) |
+       | Town: Mahere's CPU work a frame | about 5 ms | about 1.4 ms (then 3.6 ms waiting on the GPU) |
+       | Town: on the glass | 60 a second | 60 a second |
+       | Globe: the plan | 11.6 ms (seam blocks 8.1) | 1.08 ms |
+       | Globe: the kernel on the GPU | 5.34 ms, 680 words | 6.17 ms, 891 words (15 faces searched) |
+       | Globe: Mahere's draw a frame | 18.4 ms | 9.3 ms (7.3 of it the overlay: the loading ring repainted every frame while no cell loads) |
+       | Globe: on the glass | 54 a second | 60 a second |
+   - **What 120 on the Pro still needs, after the third pass:**
+     - The display's publish of a whole-screen app frame (10.5 to 13 ms of wall on the Pro), and with it the panel stage's owner's call above: the slowest stage now by far.
+     - The overlay: the loading ring's marks painted every frame (1.3 ms) and summed into the arena every frame (2.5 to 6 ms); paint the ring's marks on the GPU, or only when it changes.
+     - The kernel at the globe: the argmax over up to 15 faces; a face found from the octant and a few planes, or the faces culled to those whose diamond holds a point, would bring it back toward the town's 4.6 ms. Then f16 for the light and the colours.
+     - Measured on the Pro with cells, the network up and the full heap: not yet (the 8a ran without cells).
 5. **Lumis's preview, zero copies:** camera DMA into pinned frames inside both the ISPFE and G3D fences, a kernel from the CFA to a layer; Lumis must first build for ferros.
    - Proof: no CPU copy, CPU time a frame near zero, the sensor's frame end to the layer measured.
    - Size: 200 lines of kernel, 500 in the camera path.
