@@ -48,7 +48,7 @@ static FASTBOOT_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 
 /// Largest RELOAD/RUN image the staging slot takes.
 const STAGE_MAX: usize = 4 << 20;
-/// The largest value the vault takes (3 MiB): sealing a value and reading it back each need about twice its size in one piece of the kernel heap. The largest capsule today is the display server's, 2.8 MB. Larger things (std images) go through the streamed spawn, not the vault, until the vault stores in pieces.
+/// The largest value the vault takes (3 MiB). Until 2026-11-12 sealing a value and reading it back each needed about twice its size in one block of the kernel heap; since then a value over `ferros_pieces::PIECE` is sealed and stored a piece at a time and a restart streams it into a staging arc (`spawn_from_pieces`), but the readers that take a capsule whole (init's spawn through `read_capsule`, `store get`) still hold it in one block, and the gate's parse a second, so the bound stays. The largest capsule today is the display server's, 2.8 MB. Larger things (std images) go through the streamed spawn, not the vault.
 pub const STORE_VALUE_MAX: usize = 3 << 20;
 
 /// Exit reasons (crumb byte in the ramoops report, kernel prints it as the low byte of `mbr_sig`).
@@ -144,7 +144,7 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                 _ => return alloc::vec![3],
             };
             let len = params.len() - 2 - klen;
-            // A value larger than STORE_VALUE_MAX is refused (status 5): sealing it, and reading it back, each take about twice its size in one piece of the 22 MiB kernel heap, and 4 and 5 MiB values ran it out and panicked the kernel (2026-10-31).
+            // A value larger than STORE_VALUE_MAX is refused (status 5): 4 and 5 MiB values ran the 22 MiB kernel heap out and panicked the kernel (2026-10-31), when a value was sealed and read whole (`STORE_VALUE_MAX` says what still holds it whole).
             if len > STORE_VALUE_MAX {
                 crate::flashlog::line(&alloc::format!("store set {key:?} {len} bytes refused: over {STORE_VALUE_MAX}"));
                 return alloc::vec![5];
@@ -193,13 +193,11 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                     Err(_) => alloc::vec![2],
                 };
             }
-            match store.get_by_key(&key) {
-                Ok(Some(v)) => {
-                    let mut r = alloc::vec![0u8];
-                    r.extend_from_slice(&v);
-                    r
-                }
-                Ok(None) => alloc::vec![1],
+            // The value read straight into the reply after its status byte: a value in pieces goes in a piece at a time, never whole in the heap twice.
+            let mut r = alloc::vec![0u8];
+            match store.get_into(&key, &mut r) {
+                Ok(true) => r,
+                Ok(false) => alloc::vec![1],
                 Err(e) => {
                     crate::flashlog::line(&alloc::format!("store get {key:?} FAILED: {e:?}"));
                     let mut r = alloc::vec![2u8];
@@ -1114,6 +1112,41 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
     }).collect())
 }
 
+/// A capsule the vault keeps in pieces (kvault.rs `set`, over `ferros_pieces::PIECE`), spawned without its bytes ever whole in the kernel heap: under the kernel lock, its length read, a staging arc taken from the frame pool and the pieces read straight into it one at a time (the heap holds one piece), then the gate where it lies and the process built from its code (`spawn_capsule_in_place`), and the staging arc given back. None when the capsule is not kept in pieces (stored before 2026-11-12, or under `PIECE`): the caller reads it whole as before.
+/// Why (2026-11-12, twice on the Pro, PREV_EXIT G#EE91): read whole, the display's 2.8 MB capsule was one 3 MB block of the heap and the gate's parse and clone two more, while a store put of it had needed the sealed copy and its staging, two more; with Mahere running, the 22 MiB heap had the bytes and no such holes.
+fn spawn_from_pieces(store: &mut Option<ShimStore>, name: &[u8], grants: &[crate::process::Grant], sealed: &[u8]) -> Option<Result<crate::process::Outcome, &'static str>> {
+    let key = core::str::from_utf8(name).ok()?;
+    // One hold of the lock from the length to the last piece, so the value read is the one the arc was sized for.
+    let staged = crate::process::with_lock(|| -> Option<Result<(crate::process::Arc, usize), &'static str>> {
+        let s = store.as_mut()?;
+        let total = s.pieces_len(key).ok().flatten()?;
+        let need = crate::process::CODE + total;
+        let Some(arc) = crate::process::arc_alloc_room(need, need, false) else {
+            return Some(Err("the arc pool has no room to stage the capsule"));
+        };
+        let at = arc.base + crate::process::CODE;
+        // SAFETY: the sink writes [at + offset, at + offset + len) for pieces whose lengths sum to `total` (ferros_pieces::read holds each piece to its length from the manifest read under this same lock hold), inside the arc just taken, which is the kernel's alone until it is freed.
+        match s.read_pieces(key, |off, bytes| unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), (at + off) as *mut u8, bytes.len()) }) {
+            Ok(Some(_)) => Some(Ok((arc, total))),
+            r => {
+                crate::flashlog::line(&alloc::format!("restart {key}: reading its pieces failed: {r:?}"));
+                crate::process::arc_free(arc);
+                Some(Err("the capsule's pieces did not read"))
+            }
+        }
+    })?;
+    let (arc, total) = match staged {
+        Ok(x) => x,
+        Err(e) => return Some(Err(e)),
+    };
+    crate::flashlog::line(&alloc::format!("restart {key}: capsule {total} bytes from its pieces; spawning"));
+    // SAFETY: the staging arc's [CODE, CODE + total) holds the capsule just read; nothing else holds the arc until it is freed below.
+    let capsule = unsafe { core::slice::from_raw_parts_mut((arc.base + crate::process::CODE) as *mut u8, total) };
+    let r = crate::process::spawn_capsule_in_place(name, capsule, b"", grants, sealed);
+    crate::process::with_lock(|| crate::process::arc_free(arc));
+    Some(r)
+}
+
 /// `diag restart <name>…`: each named shell process killed and started again from its capsule in the vault, in the order given (display before map: the map hands a fresh display server its scene at start). The development loop for the shell — build, `store put`, restart — without a reboot.
 fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Vec<u8>) {
     // Vault reads under the kernel lock (the vault's one owner at a time); the spawns below take it themselves.
@@ -1151,6 +1184,23 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
         crate::process::power_offs_apply();
         crate::flashlog::line(&alloc::format!("restart {nm}: {} ; reading the capsule", if killed { "killed" } else { "was not running" }));
         platform::crumb(0x52);
+        // A capsule kept in pieces never enters the heap whole (`spawn_from_pieces`).
+        if let Some(r) = spawn_from_pieces(store, name, &grants, &sealed) {
+            platform::crumb(0x53);
+            match r {
+                Ok(o) => {
+                    crate::process::push_console(&o.console);
+                    rep.extend_from_slice(alloc::format!("{nm} {}\n", if killed { "restarted" } else { "started" }).as_bytes());
+                    crate::flashlog::line(&alloc::format!("restart {nm}: started from its pieces"));
+                }
+                Err(e) => {
+                    rep.extend_from_slice(alloc::format!("{nm}: {e}\n").as_bytes());
+                    crate::flashlog::line(&alloc::format!("restart {nm}: {e}"));
+                }
+            }
+            platform::crumb(0x54);
+            continue;
+        }
         // The vault restarts from the stored capsule (the development loop pushes one), else from the one the kernel image carries.
         let stored = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key(core::str::from_utf8(name).unwrap_or("")).ok().flatten()));
         let Some(capsule) = stored.or_else(|| (name == b"vault" && !VAULT_CARRIED.is_empty()).then(|| VAULT_CARRIED.to_vec())) else {
@@ -1755,6 +1805,10 @@ pub fn run(mut b: Boot) -> ! {
             if w.iter().any(|&v| v != 0) {
                 let text: alloc::string::String = w[4].to_le_bytes().iter().chain(w[5].to_le_bytes().iter()).map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '.' }).collect();
                 crate::flashlog::line(&alloc::format!("previous boot ended: panic-num {} heap G#{:X} esr G#{:X} faults {} elr G#{:X} far G#{:X} text {:?}", w[0], w[1], w[2], w[3], w[4], w[5], text));
+                // The kernel heap's last refused allocation (platform.rs `report_panic`, r[6..8]).
+                if w[6] != 0 {
+                    crate::flashlog::line(&alloc::format!("previous boot's kernel heap refused A#{} bytes at alignment A#{} on core A#{}, for G#{:X}, the largest free block then A#{}", w[6] & 0xFF_FFFF_FFFF_FFFF, 1u64 << (w[8] >> 56), w[6] >> 56, w[7], w[8] & 0xFF_FFFF_FFFF_FFFF));
+                }
             }
         }
         crate::process::STORE_REMOVE = Some(store_remove);
@@ -2716,6 +2770,12 @@ pub fn run(mut b: Boot) -> ! {
                     let (text, tri) = crate::ready::show();
                     append_hex(&mut resp, b"READY_TEXT_PX=", text);
                     append_hex(&mut resp, b"READY_TRIANGLE_PX=", tri);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"heap" {
+                    // `diag heap`: the kernel heap in full (main.rs `heap_text`): its regions, in use and peak, free bytes and blocks and the largest, the free blocks by size, and the last refused allocation (its size, alignment, caller and the heap then).
+                    resp.extend_from_slice(crate::heap_text().as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
@@ -3825,11 +3885,13 @@ pub fn run(mut b: Boot) -> ! {
                 append_hex(&mut resp, b"BOOT_EL=", crate::boot_el() as u32);
                 append_hex(&mut resp, b"BOOT_SCTLR=", crate::boot_sctlr() as u32);
                 append_hex(&mut resp, b"HEAP_END=", heap_end as u32);
-                // The kernel heap now: free bytes, free blocks, the largest (what a big vault value needs in one piece).
-                if let Some((free, blocks, largest)) = crate::heap_stats() {
-                    append_hex(&mut resp, b"HEAP_FREE=", free as u32);
-                    append_hex(&mut resp, b"HEAP_FREE_BLOCKS=", blocks as u32);
-                    append_hex(&mut resp, b"HEAP_LARGEST_FREE=", largest as u32);
+                // The kernel heap now (`diag heap` has it in full): its size, free bytes and blocks, the largest (what one allocation can get), in use and its peak, refusals since boot.
+                if let Some(h) = crate::heap_report() {
+                    append_hex(&mut resp, b"HEAP_SIZE=", h.size as u32);
+                    append_hex(&mut resp, b"HEAP_FREE=", h.free as u32);
+                    append_hex(&mut resp, b"HEAP_FREE_BLOCKS=", h.free_blocks as u32);
+                    append_hex(&mut resp, b"HEAP_LARGEST_FREE=", h.largest as u32);
+                    append_hex(&mut resp, b"HEAP_REFUSED=", h.fails as u32);
                 }
                 append_hex(&mut resp, b"HEAP_IN_USE=", ferros_heap::IN_USE.load(core::sync::atomic::Ordering::Relaxed) as u32);
                 append_hex(&mut resp, b"HEAP_PEAK=", ferros_heap::PEAK.load(core::sync::atomic::Ordering::Relaxed) as u32);

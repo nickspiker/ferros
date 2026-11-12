@@ -131,21 +131,23 @@ pub fn gate(capsule: &[u8]) -> Result<Gated, &'static str> {
         _ => return Err("gate: no Ed25519 developer key"),
     };
     let hp = identity_hash(capsule, &header.provenance_hash)?;
-    let sections = header.sections(capsule, header_end).map_err(|_| "gate: bad sections")?;
-    let find = |name: &str| {
+    let mut sections = header.sections(capsule, header_end).map_err(|_| "gate: bad sections")?;
+    // The code moved out of the parsed section, not cloned: the parse already copied it out of the capsule, and a clone was a third copy of it in the kernel heap (2026-11-12, the display's 2.8 MB).
+    let mut take = |name: &str| {
         sections
-            .iter()
+            .iter_mut()
             .find(|s| s.name == name)
-            .and_then(|s| s.get_field("code"))
-            .and_then(|f| f.values.first())
+            .and_then(|s| s.fields.iter_mut().find(|f| f.name == "code"))
+            .and_then(|f| f.values.first_mut())
             .and_then(|v| match v {
-                VsfType::v(b'b', bytes) => Some(bytes.clone()),
+                VsfType::v(b'b', bytes) => Some(core::mem::take(bytes)),
                 _ => None,
             })
     };
-    let (code, masked) = match find("masked") {
+    let found = take("masked");
+    let (code, masked) = match found {
         Some(c) => (c, true),
-        None => (find("aarch64").ok_or("gate: no code section")?, false),
+        None => (take("aarch64").ok_or("gate: no code section")?, false),
     };
     let text_len = if masked {
         let t = sections

@@ -14,18 +14,10 @@ pub const RESULT_MAGIC: u64 = 0x3153_6655_6F52_6546;
 pub static LAST_CRUMB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Panic → ramoops report + PSCI warm reset (the pixel8 `#[panic_handler]`, both boot paths).
-/// Slots (kernel print names): r[3]/0x18 `mbr_sig` := G#EE00 | last crumb; r[1]/0x08 `link_up` := first decimal number in the panic message (e.g. the failed allocation size), 0 if none; r[2]/0x10 bytes := heap free bytes (3 bytes LE) + free block count (`scsi_status`), all FF if the heap lock was held; r[4]/0x20 `read..verify` := line (u32 LE) + column byte; r[5]/0x28 `wrote_ok` := sync exception count; 0xA0 `pattern-readback` := last 8 bytes of the panicking file's path + first 8 bytes of the message.
+/// Slots (kernel print names): r[3]/0x18 `mbr_sig` := G#EE00 | last crumb; r[1]/0x08 `link_up` := first decimal number in the panic message (e.g. the failed allocation size), 0 if none; r[2]/0x10 := the heap (`heap_word`), all FF if its lock was held; r[4]/0x20 `read..verify` := line (u32 LE) + column byte; r[5]/0x28 `wrote_ok` := sync exception count; 0xA0 `pattern-readback` := last 8 bytes of the panicking file's path + first 8 bytes of the message.
+/// The kernel heap's last refused allocation since boot, if any (ferros_heap kernel.rs `Fail`), in r[6..8]: 0x30 its size | the core it was asked on << 56, 0x38 the return address into whoever asked (`aarch64-linux-gnu-addr2line -e ferros_kernel`), 0x40 the largest free block then | log2 of the alignment << 56. The same, in words, goes to the RAM log (`pstore`) before the reset, and the next boot's flash log names it (`previous_end`).
 pub fn report_panic(info: &core::panic::PanicInfo) -> ! {
-    struct Head { buf: [u8; 64], n: usize }
-    impl core::fmt::Write for Head {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            for &b in s.as_bytes() {
-                if self.n < 64 { self.buf[self.n] = b; self.n += 1; }
-            }
-            Ok(())
-        }
-    }
-    let mut head = Head { buf: [0u8; 64], n: 0 };
+    let mut head = Buf::<64>::new();
     let _ = core::fmt::write(&mut head, format_args!("{}", info.message()));
     // First decimal run in the message.
     let mut num = 0u64;
@@ -38,10 +30,22 @@ pub fn report_panic(info: &core::panic::PanicInfo) -> ! {
             break;
         }
     }
-    let heap = match crate::KERNEL_HEAP.try_lock() {
-        Some(h) => ((h.free_bytes() as u64) & 0xFF_FFFF) | (((h.free_blocks() as u64) & 0xFF) << 24),
-        None => 0xFFFF_FFFF,
+    let heap = match crate::KERNEL_HEAP.report() {
+        Some(r) => heap_word(r.free, r.free_blocks, r.largest),
+        None => u64::MAX,
     };
+    // The heap's last refusal: what was asked, on which core, for whom, and the largest free block then, which tells fragmentation (the largest under the size with the free bytes over it) from exhaustion. A panic from a refused allocation names it; any other panic carries the last refusal since boot, if there was one.
+    let fail = ferros_heap::kernel::LockedTlsf::last_fail();
+    let core = {
+        let mpidr: u64;
+        unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
+        (mpidr >> 8) & 0xF
+    };
+    if fail.size != 0 {
+        let mut text = Buf::<{ 1 << 8 }>::new();
+        let _ = core::fmt::write(&mut text, format_args!("kernel heap refused A#{} bytes at alignment A#{} on core A#{}, for G#{:X}; then A#{} in use, A#{} free in A#{} blocks, the largest A#{}; panic: {}\n", fail.size, fail.align, core, fail.caller, fail.in_use, fail.free, fail.free_blocks, fail.largest, info.message()));
+        pstore(&text.buf[..text.n]);
+    }
     let (line, col, file) = match info.location() {
         Some(l) => (l.line(), l.column(), l.file()),
         None => (0, 0, ""),
@@ -59,6 +63,11 @@ pub fn report_panic(info: &core::panic::PanicInfo) -> ! {
         w(0x18, 0xEE00 | (LAST_CRUMB.load(core::sync::atomic::Ordering::Relaxed) & 0xFF));
         w(0x20, (line as u64) | (((col as u64) & 0xFF) << 32));
         w(0x28, crate::exception_count());
+        if fail.size != 0 {
+            w(0x30, fail.size as u64 | core << 56);
+            w(0x38, fail.caller as u64);
+            w(0x40, fail.largest as u64 | (fail.align.trailing_zeros() as u64) << 56);
+        }
         core::ptr::copy_nonoverlapping(t.as_ptr(), (RAMOOPS_RESULT + 0xA0) as *mut u8, 16);
         ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x180);
         core::arch::asm!("dsb sy");
@@ -71,6 +80,34 @@ pub fn report_panic(info: &core::panic::PanicInfo) -> ! {
     }
 }
 
+/// Text into a fixed buffer, the rest dropped: the panic report formats without the heap, which may be what failed.
+struct Buf<const N: usize> {
+    buf: [u8; N],
+    n: usize,
+}
+impl<const N: usize> Buf<N> {
+    fn new() -> Self {
+        Buf { buf: [0u8; N], n: 0 }
+    }
+}
+impl<const N: usize> core::fmt::Write for Buf<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.n < N {
+                self.buf[self.n] = b;
+                self.n += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The heap in one word for the report block (r[2]): bits 0-31 the free bytes in KiB, 32-47 the free blocks, 48-63 the largest free block in 64 KiB units. Until 2026-11-12 it was the free bytes in 24 bits (22 MiB free read as 6) and the free blocks in 8.
+fn heap_word(free: usize, blocks: usize, largest: usize) -> u64 {
+    // WHY the masks: each field is cut to its own bits so none spills into the next (only past 4 TiB free, 65535 free blocks or 4 GiB in one block would a field wrap, and then only itself).
+    ((free as u64 >> 10) & 0xFFFF_FFFF) | ((blocks as u64 & 0xFFFF) << 32) | ((largest as u64 >> 16) << 48)
+}
+
 /// Cluster watchdogs (s3c2410 block: WTCON +0, WTDAT +4, WTCNT +8; RSTEN b0, EN b5, DIV128 3<<3, PRESCALE 0xFF<<8). Armed at WDT_COUNT (1 s; the longest window, ~87 s, until 2026-11-05); a pure spin with no pets resets warm instead of hanging forever.
 const WATCHDOGS: [usize; 2] = [0x1006_0000, 0x1007_0000];
 /// The watchdog window (owner, 2026-11-05: "1s?"): 750 ticks of prescaler 256 and divider 128 from the 24.576 MHz oscillator, 1.333 ms a tick, is 1 s; written at the arm and reloaded by every pet. Measured before choosing it: the longest stretch without a pet is 213 ms on a cold boot, 80 ms across a reload's hand-over, 316 ms in a reloaded kernel's start (DIAG WDT_GAP_MAX_US, WDT_HANDOVER_US); the hv's re-arm at the jump keeps the longest window until the jump's stretch is measured. `diag wdt rate` checks the tick against the counter.
@@ -79,21 +116,21 @@ pub const WDT_COUNT: u32 = 750;
 /// Make a hang self-reporting and self-recovering (no button reset, which cold-resets and wipes pmsg).
 /// 1. Fault sink: the sync exception handler records the first fault (ELR/FAR/ESR/count) into the result block and warm-resets, so the next Linux boot prints it. The pmsg zone can come up filled with FF (seen on hardware), which would defeat the sink's "already recorded" guard on 0xA0 and pollute every unwritten slot, so the report slots are zeroed first.
 /// 2. Cluster watchdogs armed.
-/// What the result block held when this boot armed the sink: the last boot's end, if it ended in a fault or a panic — panic number, heap word, ESR, fault count, ELR (or the panic text's first 8 bytes), FAR (or the next 8). The service writes it to the flash log once that is up (`previous_end`), since the block is cleared here and a reboot is otherwise silent.
+/// What the result block held when this boot armed the sink: the last boot's end, if it ended in a fault or a panic — panic number, heap word, ESR, fault count, ELR (or the panic text's first 8 bytes), FAR (or the next 8), and the heap's last refused allocation (size and core, caller, largest free and alignment: `report_panic`). The service writes it to the flash log once that is up (`previous_end`), since the block is cleared here and a reboot is otherwise silent.
 pub static PREV_END: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static mut PREV_WORDS: [u64; 6] = [0; 6];
+static mut PREV_WORDS: [u64; 9] = [0; 9];
 
 /// The last boot's end words (see `PREV_END`), zero when it ended cleanly or nothing was recorded.
-pub fn previous_end() -> [u64; 6] {
+pub fn previous_end() -> [u64; 9] {
     unsafe { *(&raw const PREV_WORDS) }
 }
 
 pub fn arm_safety() {
     unsafe {
         let r = |off: usize| read_volatile((RAMOOPS_RESULT + off) as *const u64);
-        *(&raw mut PREV_WORDS) = [r(0x08), r(0x10), r(0x20), r(0x28), r(0xA0), r(0xA8)];
+        *(&raw mut PREV_WORDS) = [r(0x08), r(0x10), r(0x20), r(0x28), r(0xA0), r(0xA8), r(0x30), r(0x38), r(0x40)];
         PREV_END.store(r(0x20) | r(0x28) | r(0x08), core::sync::atomic::Ordering::Relaxed);
-        for off in [0x08usize, 0x10, 0x20, 0x28, 0xA0, 0xA8] {
+        for off in [0x08usize, 0x10, 0x20, 0x28, 0xA0, 0xA8, 0x30, 0x38, 0x40] {
             write_volatile((RAMOOPS_RESULT + off) as *mut u64, 0);
         }
         ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x180);

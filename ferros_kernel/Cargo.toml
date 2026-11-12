@@ -31,6 +31,8 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 ferros_ledger = { path = "../ferros_ledger" }
 ferros_pt = { path = "../ferros_pt", features = ["alloc"] }
 ferros_heap = { path = "../ferros_heap" }
+# The vault's large values in sealed pieces under a manifest (kvault.rs): none of them, nor twice it, in one block of the kernel heap.
+ferros_pieces = { path = "../ferros_pieces" }
 ihi = { path = "../../ihi", default-features = false }
 vsf = { path = "../../vsf", default-features = false, features = ["crypto-verify"] }
 # A kist's declared wants (KISTS.md), checked at every launch from the vault.

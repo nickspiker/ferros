@@ -214,10 +214,10 @@ unsafe impl GlobalAlloc for BumpAlloc {
 #[global_allocator]
 static ALLOC: BumpAlloc = BumpAlloc;
 
-// Both Pixel boot paths run the long-lived PT service (and the handoff the vault, whose commits do many alloc/free cycles); a leak-forever bump would exhaust the 4 MiB heap, so they get the freeing free-list allocator.
+// Both Pixel boot paths run the long-lived PT service (and the handoff the vault, whose commits do many alloc/free cycles); a leak-forever bump would exhaust the 4 MiB heap, so they get a freeing allocator: TLSF since 2026-11-12 (ferros_heap kernel.rs, ferros_rt's tlsf.rs), the first-fit free list before. The free list walked every free block under the lock at each alloc, and grew a Vec only by a new block and a copy; TLSF is a few bit operations whatever the free blocks, grows in place, and records a refused allocation for the panic report (`diag heap`).
 #[cfg(feature = "pixel8")]
 #[global_allocator]
-static KERNEL_HEAP: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+static KERNEL_HEAP: ferros_heap::kernel::LockedTlsf = ferros_heap::kernel::LockedTlsf::empty();
 /// Whether the cache map is on, so the heap's second region can join (it must be normal memory: an allocation's unaligned copies fault on Device memory).
 static HEAP2_CACHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static HEAP2_JOINED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -229,12 +229,44 @@ pub fn heap2_join() {
         return;
     }
     cachemap::heap2_prepare();
-    unsafe { KERNEL_HEAP.extend(cachemap::HEAP2.0, cachemap::HEAP2.1 - cachemap::HEAP2.0) };
+    unsafe { KERNEL_HEAP.add(cachemap::HEAP2.0, cachemap::HEAP2.1 - cachemap::HEAP2.0) };
 }
 
-/// The kernel heap's (free bytes, free blocks, largest free block), for DIAG; None if the heap is busy.
-pub fn heap_stats() -> Option<(usize, usize, usize)> {
-    KERNEL_HEAP.try_lock().map(|h| (h.free_bytes(), h.free_blocks(), h.largest_free()))
+/// The kernel heap now (its regions, in use and peak, free bytes and blocks, the largest free block, refusals), for DIAG; None if the heap is busy.
+pub fn heap_report() -> Option<ferros_heap::kernel::Report> {
+    KERNEL_HEAP.report()
+}
+
+/// `diag heap`: the kernel heap as text, its free space by size included (a walk of every free block, under the heap's lock).
+pub fn heap_text() -> alloc::string::String {
+    let Some(r) = KERNEL_HEAP.report() else {
+        return alloc::string::String::from("kernel heap: busy, ask again\n");
+    };
+    let mut s = alloc::format!("kernel heap: A#{} bytes in A#{} regions:", r.size, r.regions);
+    for &(a, b) in &r.region[..r.regions] {
+        s.push_str(&alloc::format!(" G#{a:X}-G#{b:X} (A#{} KiB)", (b - a) >> 10));
+    }
+    s.push_str(&alloc::format!("\nin use A#{} bytes, peak A#{} since boot or `diag heap peak reset`\nfree A#{} bytes in A#{} blocks, the largest A#{}\n", r.in_use, r.peak, r.free, r.free_blocks, r.largest));
+    // Gathered on the stack under the heap's lock, written out after it: text allocates, and the lock is the allocator's own. One entry a first level of the lists (tlsf.rs: 28 of them).
+    let mut levels = [(0usize, 0usize, 0usize); 1 << 5];
+    let mut n = 0;
+    if let Some(h) = KERNEL_HEAP.try_lock() {
+        h.levels(|floor, blocks, bytes| {
+            levels[n] = (floor, blocks, bytes);
+            n += 1;
+        });
+    }
+    s.push_str("free blocks by size (from, blocks, bytes):\n");
+    for &(floor, blocks, bytes) in &levels[..n] {
+        s.push_str(&alloc::format!("  A#{floor}: A#{blocks}, A#{bytes}\n"));
+    }
+    let f = r.last_fail;
+    if r.fails == 0 {
+        s.push_str("refused: none since boot\n");
+    } else {
+        s.push_str(&alloc::format!("refused: A#{} since boot; the last A#{} bytes at alignment A#{}, for G#{:X}, when A#{} were in use and A#{} free in A#{} blocks, the largest A#{}\n", r.fails, f.size, f.align, f.caller, f.in_use, f.free, f.free_blocks, f.largest));
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -1855,7 +1887,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     unsafe extern "C" { static __stack_top: u8; }
     let stack_top = unsafe { &__stack_top as *const u8 as usize };
     let heap_base = (stack_top + 0xFFF) & !0xFFF;
-    unsafe { KERNEL_HEAP.init(heap_base, HEAP_SIZE) };
+    unsafe { KERNEL_HEAP.add(heap_base, HEAP_SIZE) };
     platform::enable_icache();
 
     // Default: the USB service (PT over the inherited controller, disk live). FERROS_SHIM_ENTRY=vault builds the one-shot vault probe that reports and resets.
@@ -1903,7 +1935,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     unsafe extern "C" { static __stack_top: u8; static _start: u8; }
     let stack_top = unsafe { &__stack_top as *const u8 as usize };
     let heap_base = (stack_top + 0xFFF) & !0xFFF;
-    unsafe { KERNEL_HEAP.init(heap_base, HEAP_SIZE) };
+    unsafe { KERNEL_HEAP.add(heap_base, HEAP_SIZE) };
     // The heap's second region joins later, from the service loop (`heap2_join`): its stale lines must be discarded first, and that takes ~235 ms the boot should not wait for.
     HEAP2_CACHED.store(cached, Ordering::Relaxed);
     platform::canary_init();

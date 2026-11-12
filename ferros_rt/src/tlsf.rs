@@ -417,6 +417,27 @@ impl Tlsf {
         best
     }
 
+    /// How the free space is cut up (diagnostics: the kernel's `diag heap`): `each(floor, blocks, bytes)` for every first level that holds a free block, from the least, where `floor` is the least size the level holds (0 for level 0, every block under 512 bytes). Walks every free block.
+    pub fn levels(&self, mut each: impl FnMut(usize, usize, usize)) {
+        for f in 0..FL {
+            if self.fl_map & (1 << f) == 0 {
+                continue;
+            }
+            let (mut blocks, mut bytes) = (0, 0);
+            for s in 0..SL {
+                let mut b = self.heads[f][s];
+                while !b.is_null() {
+                    unsafe {
+                        blocks += 1;
+                        bytes += size(b);
+                        b = (*b).next_free;
+                    }
+                }
+            }
+            each(if f == 0 { 0 } else { 1 << (f as u32 - 1 + FL_SHIFT) }, blocks, bytes);
+        }
+    }
+
     /// The host tests' check of every list: each block free, on the list its size says, its links both ways; the counts as the counters say. Returns (blocks, bytes).
     pub fn verify_lists(&self) -> (usize, usize) {
         let (mut blocks, mut bytes) = (0, 0);

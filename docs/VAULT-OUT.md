@@ -8,6 +8,7 @@ Today the vault is the kernel's (`kvault.rs`, `vault_boot`, `ufs_device`).
 Every stored byte any process keeps goes through the kernel's `STORE` call, and the kernel assembles each value whole in its heap to seal it.
 That caps a value at 3 MiB (`service.rs` `STORE_VALUE_MAX`): a 24 MB wallpaper is refused, and the display server's own capsule (2.8 MB) is already near the line.
 It also means the kernel parses and holds everyone's data.
+(Since 2026-11-12 the kernel's own vault keeps a value over 512 KiB as sealed pieces under a manifest, `ferros_pieces`: storing one never holds it whole in the kernel heap, and a restart streams a capsule's pieces into a staging arc. The 3 MiB cap stays for the readers that still take a value whole: init's spawn and `store get`.)
 Owner, 2026-11-07: "the vault needs to be moved out ... a 3MB cap on files and having the kernel involved makes me nervous."
 
 ## The rule (owner, 2026-11-07)

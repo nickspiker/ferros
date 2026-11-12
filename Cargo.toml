@@ -16,6 +16,7 @@ members = [
     "ferros_ledger",
     "ferros_pt",
     "ferros_heap",
+    "ferros_pieces",
     "ferros_seed",
     "tools/mkimg",
     "tools/ferros-bridge",

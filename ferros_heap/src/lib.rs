@@ -9,12 +9,24 @@
 //   struct SpinLock<T> — tiny AtomicBool spinlock, no spin-crate dependency ::new(T), ::lock() → Guard, Guard derefs to T
 //
 //   struct LockedHeap(SpinLock<Heap>) — GlobalAlloc wrapper ::empty() → LockedHeap  (const) ::init(start, size) via &self ::lock() → guard  impl GlobalAlloc (alloc returns null on OOM, never panics)
+//
+// tlsf.rs ── ferros_rt/src/tlsf.rs by path (one source, not a copy): TLSF, two-level segregated fit
+//
+// kernel.rs ── the kernel's heap: struct LockedTlsf(SpinLock<State>) ::empty() (const) ::add(start, size) per region ::report() → Option<Report> ::last_fail() → Fail ::try_lock()/lock() → guard  impl GlobalAlloc (realloc in place first; a refused allocation recorded as a Fail, then null)
+//   struct State ::levels(each(floor, blocks, bytes)) free space by size ::verify() the host tests' walk
+//   struct Report { region, regions, size, in_use, peak, free, free_blocks, largest, fails, last_fail }  struct Fail { size, align, caller, in_use, free, free_blocks, largest }
 
 //! # ferros heap
 //!
-//! Classic linked-list (free-list) allocator for the ferros kernel, replacing the leak-forever bump allocator. Every freed block is returned to an address-sorted free list and merged with physically-adjacent free neighbors, so reclaimed memory is reusable and fragmentation is bounded. `no_std`, and does not depend on `alloc`.
+//! Two allocators, `no_std`, neither depending on `alloc`.
+//! The kernel's (kernel.rs, `LockedTlsf`, since 2026-11-12): TLSF, the same source std processes run (ferros_rt/src/tlsf.rs, included by path).
+//! The no_std processes' (this file, `LockedHeap`): the classic linked-list (free-list) allocator that replaced the kernel's leak-forever bump allocator. Every freed block is returned to an address-sorted free list and merged with physically-adjacent free neighbors, so reclaimed memory is reusable. It costs no header per allocation (the layout gives the size back), which a small process heap feels; its first fit walks every free block, which the kernel's long-lived heap with many callers felt (kernel.rs).
 
 #![cfg_attr(not(test), no_std)]
+
+#[path = "../../ferros_rt/src/tlsf.rs"]
+pub mod tlsf;
+pub mod kernel;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::{align_of, size_of};

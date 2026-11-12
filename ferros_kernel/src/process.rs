@@ -5234,6 +5234,27 @@ pub fn spawn_capsule(name: &[u8], capsule: &[u8], input: &[u8], grants: &[Grant]
     spawn(name, &g.code, input, grants, Some(ihi), g.masked, g.text_len, g.fixed | (g.bti as u32) << 8 | (g.exact as u32) << 9)
 }
 
+/// `spawn_capsule` over a capsule held outside the kernel heap (service.rs `restart`: a staging arc the vault's pieces were read into), its code never copied into the heap: the gate where it lies (`gate_located`: the signature over the whole file, the code found by its section's entry, `locate_code`, and held to be framed exactly so), masked code's modes read in place (`masked_modes`) and its seal found in `sealed`, then the process built from the code where it lies (`spawn` copies it into the process's own arc). The same checks as `spawn_capsule`'s gate, whose parse copied the code out of the capsule and then copied it again (2026-11-12: with the capsule itself, three blocks of 3 MB in the heap at once for the display's).
+pub fn spawn_capsule_in_place(name: &[u8], capsule: &mut [u8], input: &[u8], grants: &[Grant], sealed: &[u8]) -> Result<Outcome, &'static str> {
+    let (co, cl, masked) = locate_code(capsule, capsule.len())?;
+    let g = crate::oracle::gate_located(capsule, co, cl)?;
+    let (exec_len, mode) = if masked {
+        let m = crate::oracle::masked_modes(capsule, co, cl)?;
+        let s = crate::oracle::seal_parts(&g.developer_pubkey, &g.hp, true, &m, &capsule[co..co + cl]).ok_or("no system secret: cannot check a seal")?;
+        if !sealed.chunks_exact(32).any(|e| e == s) {
+            return Err("gate: masked capsule not installed (no seal)");
+        }
+        (m.text_len, m.fixed | (m.bti as u32) << 8 | (m.exact as u32) << 9)
+    } else {
+        if cfg!(ferros_production) {
+            return Err("gate: production refuses unmasked native code");
+        }
+        (cl, 0)
+    };
+    let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
+    spawn(name, &capsule[co..co + cl], input, grants, Some(ihi), masked, exec_len, mode)
+}
+
 /// Install a masked capsule: the gate (signature), the sandbox checker over its instruction span — once — then its seal. Returns the seal for the caller to add to the vault's `sealed` list.
 pub fn install_capsule(capsule: &[u8]) -> Result<[u8; 32], &'static str> {
     let g = crate::oracle::gate(capsule)?;
