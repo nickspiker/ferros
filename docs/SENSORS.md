@@ -154,7 +154,7 @@ The TMU and its trim fuses belong to the ACPM firmware; the AP asks on IPC chann
 
 At idle with the X3 spinning at 2.91 GHz every zone reads 48-52 °C.
 
-ferros (`acpm::tmu_read`, the service loop's `thermal_poll`) reads every zone once a second on the kernel's core and keeps them for `diag thermal`, DIAG `SOC_C` and fact 10 (the device circle's "chip" row). The throttle: the hottest CPU zone at 95 °C (Linux's control temperature for the big cluster; its "hot" trip is 115) takes the X3 to 1.4 GHz, and below 85 gives its rate back; fact 11 and DIAG `THROTTLED_MHZ` say when it holds. `diag thermal at <C>` moves the trip to test it on a cool phone (tested both ways at 50 and back at 95). Linux's own governor (PI control, MPMM, the GPU/TPU zones) is not reproduced: the mid and little clusters already run at 1.065 and 1.425 GHz, the GPU at 150 MHz.
+ferros (`acpm::tmu_read`, kernel thermal.rs) reads every zone once a second on the kernel's core and keeps them for `diag thermal`, DIAG `SOC_C` and `SOC_ZONE`, and facts 10 and 86 (the device circle's "chip" row). The throttle: the hottest CPU zone at 95 °C takes the X3 to 1.4 GHz, and below 85 gives its rate back; fact 11 and DIAG `THROTTLED_MHZ` say when it holds. `diag thermal at <C>` moves the trip to test it on a cool phone (tested both ways at 50 and back at 95). Since 2026-11-12 the throttle is a cap the clock policy honours, the reply's zone is checked, the kernel's core's clock and the hardware clock dividers are watched beside the zones, and a smooth per-domain policy waits behind a switch: THERMAL.md.
 
 ## Fingerprint: never (owner decision, 2026-10-24)
 
