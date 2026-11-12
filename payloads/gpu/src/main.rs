@@ -1285,17 +1285,25 @@ fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], cores: u
         Slot { mem: slot_mem[k], ring, desc, flag, code, pool, root: 0, insert: core::cell::Cell::new(0), client: None, used: 0, running: false }
     });
     let mut slots = slots;
-    // Page and bus faults in every client's space, on their own line and thread; without the line (a kernel from before) a fault is found when its job's guard ends.
+    // Page faults in every client's space, on their own line and thread.
     let mmu = cap(grants, S_MMU);
-    // The grants page's count (G#200, ferros_sys::cap) says whether slot 8 was given.
-    let mmu_ok = unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + grants + 0x200) as *const u32) } as u64 > S_MMU;
+    // The grants page's count (G#200, ferros_sys::cap) says whether slot 8 was given: the kernel that gives it is the one that stamps every call on `gpu` (2026-11-12). A kernel from before stamps nothing, so a request's first bytes would be the client's own, naming any memory: the service then serves nothing, each request answered 1 at once (its clients draw on the CPU, as with no GPU service), until the kernel is the stamping one.
+    let stamped = unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + grants + 0x200) as *const u32) } as u64 > S_MMU;
+    if !stamped {
+        say!(grants, "gpu: this kernel does not stamp calls on `gpu` (no slot 8): serving nothing\n");
+        let mut msg = [0u8; 64];
+        let mut token = [0u8; 32];
+        loop {
+            if ferros_sys::recv(cap(grants, S_GPU), &mut msg, &mut token, false) != ferros_sys::NOTHING {
+                ferros_sys::reply(&token, &[1, 0, 0, 0, 0]);
+            }
+        }
+    }
     g.wr(MMU_IRQ_CLEAR, 0xFFFF_FFFF);
     g.wr(MMU_IRQ_MASK, 0xFFFF);
-    if mmu_ok {
-        MMU_REGS.store(g.regs, core::sync::atomic::Ordering::Release);
-        ferros_sys::thread_spawn(mmu_watch, unsafe { &mut *(&raw mut MMU_STACK) }, mmu);
-    }
-    say!(grants, "gpu: serving `gpu`, a group and an address space a client ({} at once): the arena {} ({} MiB), the surfaces {}, MMU faults {}\n", SLOTS, if arena_ok { "granted" } else { "not granted" }, arena_bytes >> 20, if surfaces_ok { "fenced in" } else { "not granted" }, if mmu_ok { "on their line" } else { "at the guard" });
+    MMU_REGS.store(g.regs, core::sync::atomic::Ordering::Release);
+    ferros_sys::thread_spawn(mmu_watch, unsafe { &mut *(&raw mut MMU_STACK) }, mmu);
+    say!(grants, "gpu: serving `gpu`, a group and an address space a client ({} at once): the arena {} ({} MiB), the surfaces {}\n", SLOTS, if arena_ok { "granted" } else { "not granted" }, arena_bytes >> 20, if surfaces_ok { "fenced in" } else { "not granted" });
     let irq = cap(grants, S_IRQ);
     let max_threads = g.rd(THREAD_MAX_THREADS);
     let mut jobs = 0u64;
@@ -1424,11 +1432,6 @@ fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], cores: u
                 }
                 ferros_sys::irq_ack(irq);
             }
-        }
-        // Without the MMU line a stalled fault shows only now, in the raw status.
-        if !mmu_ok && g.rd(MMU_IRQ_RAWSTAT) & 1 << n_as != 0 {
-            space_fault(g.regs, n_as);
-            g.wr(MMU_IRQ_CLEAR, 1 << n_as);
         }
         let us = ferros_sys::us_since(t0) as u32;
         let fault = MMU_FAULTS[n_as].swap(0, core::sync::atomic::Ordering::AcqRel);
