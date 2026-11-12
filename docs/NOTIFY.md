@@ -1,6 +1,6 @@
 # Notifications
 
-Status: decided by the owner 2026-11-12; the first cut built the same day (branch `notify`): the kernel's notes (SYS_NOTIFY, process notify.rs), the note's VSF (ferros_kist::note), the deck's side (payloads/map notes.rs), the Deck button (display op 66) and the open-at event (display op 65, `EV_OPEN_AT`).
+Status: decided by the owner 2026-11-12; the first cut built the same day (branch `notify`): the kernel's notes (SYS_NOTIFY, process notify.rs), the note's VSF (ferros_kist::note), the deck's side (payloads/map notes.rs), the Deck button (display op 66) and the open-at event (display op 67, `EV_OPEN_AT`).
 Each part says **Decided** (with the owner's words), **Built**, or **Proposed** (mine, not yet answered).
 
 The owner, rejecting sliders and permission lists: "we have a brand new UI so we have an opportunity to do notification proper."
@@ -138,7 +138,7 @@ The page shows the kist's name, the note's words (or "for you, now"), Answer and
 
 **Decided** (owner, 2026-11-12): opening a kist, by tapping its circle or it coming to the front any way, clears that kist's for-you notes, and its glow goes back to its state (500 nm running, 600 nm stopped, the dark ring not running).
 **Built:**
-- A tap on a glowing circle opens the kist at its latest note: the map tells the kernel which note was opened (op 5 with `opened`), which keeps that note's document for its kist, clears the rest, and the kist's window gets `EV_OPEN_AT` with the note's number (display op 65) once it is in front.
+- A tap on a glowing circle opens the kist at its latest note: the map tells the kernel which note was opened (op 5 with `opened`), which keeps that note's document for its kist, clears the rest, and the kist's window gets `EV_OPEN_AT` with the note's number (display op 67) once it is in front.
 - The kist reads where to land with `ferros_sys::notify::opened(number, buf)`: the note as the kernel kept it, its `target` among it.
 - A kist brought to the front any other way (a flip, Answer, a launch after its question) has its notes cleared the same way, with nothing opened.
 - Unstowing a kist clears its notes.
@@ -177,7 +177,7 @@ The deck's rest ends at the earliest deadline among the notes (as an alarm's sle
 | 5 seen | the deck | a source's note or all of them, `opened` keeping one for its kist |
 | 6 read | the deck | one note's document |
 
-Display: op 65 `open at [note u8]` to the app window in front (`EV_OPEN_AT` = 4, the low byte the number); op 66 `helm note [icon u8][count u16]`, the system's alone.
+Display: op 67 `open at [note u8]` to the app window in front (`EV_OPEN_AT` = 5, the low byte the number; op 65 and event 4 are the bake's, COMPOSITOR.md "Baked"); op 66 `helm note [icon u8][count u16]`, the system's alone.
 
 ## Seeing it on a device
 

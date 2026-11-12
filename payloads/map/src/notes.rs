@@ -6,7 +6,7 @@
 //! - **Personal**, in view: one tap of the motor as it arrives (`quick::buzz`), by the sound mode (preference 39: not in silent) and not under do not disturb; one a kist until the person has looked at it (`tapped`).
 //! - **The Deck button** (display op 66; owner, 2026-11-12: "if anything on the deck has changed state, specifically 400nm notifications, we change the deck circle in the helm", "the deck circle shows the latest item icon preview and shows the violet ring"): while anything in view waits, the latest one's source's icon and the count in view.
 //! - **Live** takes the screen (`take_over`): the app in front behind, the source's circle open on Answer and Decline, until the person answers or declines or the kist withdraws it (the caller ended).
-//! - **Seen:** a kist brought to the front (its circle tapped, a flip, an answer) has its notes cleared (owner, 2026-11-12: "when tapping on Photon it clears it and resumes regular 500nm"); a tap that opened it at a note tells it which (display op 65, `EV_OPEN_AT`).
+//! - **Seen:** a kist brought to the front (its circle tapped, a flip, an answer) has its notes cleared (owner, 2026-11-12: "when tapping on Photon it clears it and resumes regular 500nm"); a tap that opened it at a note tells it which (display op 67, `EV_OPEN_AT`).
 use super::*;
 use core::sync::atomic::AtomicU64;
 
@@ -155,7 +155,7 @@ impl Map {
         self.notes.iter().filter(|n| n.source == *capsule).max_by_key(|n| n.seq).map(|n| n.number)
     }
 
-    /// `capsule`'s kist came to the front (`launch`): the person has looked, so its notes are cleared (`opening`: the note the tap opened it at, kept for the kist to read where to land). Its window already in front (`raised`): told at once (display op 65); else when it shows (`open_pending`).
+    /// `capsule`'s kist came to the front (`launch`): the person has looked, so its notes are cleared (`opening`: the note the tap opened it at, kept for the kist to read where to land). Its window already in front (`raised`): told at once (display op 67); else when it shows (`open_pending`).
     pub fn notes_front(&mut self, capsule: [u8; 32], raised: bool) {
         let settings = cap(self.grants, S_SETTINGS);
         let opening = self.opening.take();
@@ -175,7 +175,7 @@ impl Map {
         }
     }
 
-    /// The kist in front told which note the person opened (display op 65, `EV_OPEN_AT`), if it is still `capsule`'s.
+    /// The kist in front told which note the person opened (display op 67, `EV_OPEN_AT`), if it is still `capsule`'s.
     pub fn open_at(&mut self, capsule: [u8; 32], n: u8) {
         if self.front_kist != Some(capsule) {
             return;

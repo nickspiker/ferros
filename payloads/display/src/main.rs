@@ -3282,7 +3282,7 @@ static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight): their caller's holdings are asked of the kernel as they arrive.
 fn names_surface(op: u8) -> bool {
-    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 65 | 66)
+    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67)
 }
 
 /// What the process behind the call holds (kernel SYS_CALLER: bit k surface k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
@@ -6822,7 +6822,7 @@ static mut RECV_STACK: [u8; 32768] = [0; 32768];
 
 /// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved, full screen's new state, the glass's columns): the receive thread waits for them. An op left out is answered 0 at once and its reply dropped (2026-11-08: op 43's state and op 53's columns never reached the map and the keyboard).
 fn op_is_sync(op: u8) -> bool {
-    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 43 | 45 | 53 | 59 | 60 | 61 | 65)
+    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 43 | 45 | 53 | 59 | 60 | 61 | 67)
 }
 
 extern "C" fn receive(grants: u64) -> ! {
@@ -8680,10 +8680,10 @@ fn server(grants: u64) -> ! {
                         None => out[0] = 3,
                     }
                 }
-                Some(65) if m.len() >= 2 => {
+                Some(67) if m.len() >= 2 => {
                     // Open at (docs/NOTIFY.md "A tap"; owner, 2026-11-12: a tap on a glowing circle opens the kist where the note points): [note u8], the note's number among the kist's own, to the app window in front (`EV_OPEN_AT`; the kist reads the note it names from the kernel, ferros_sys::notify::opened). → [0][surface][generation], or [3] with no app window in front, [4] (`NOT_YOURS`) when that window is neither the caller's nor the caller the system's.
                     match front_app() {
-                        Some(sk) if !manages(unsafe { HOLDS }, sk) => out[0] = not_yours(65, sk),
+                        Some(sk) if !manages(unsafe { HOLDS }, sk) => out[0] = not_yours(67, sk),
                         Some(sk) => {
                             let g = unsafe { WINS[sk] }.map_or(0, |w| w.generation);
                             events::post(sk, g, (ferros_sys::window::EV_OPEN_AT as u16) << 8 | m[1] as u16);

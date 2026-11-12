@@ -2072,7 +2072,7 @@ pub mod window {
     /// A key pressed for this window (back's tap: `KEY_ESCAPE`).
     pub const EV_KEY: u8 = 3;
     /// The person opened a note of this kist's (docs/NOTIFY.md "A tap"): the low byte its number; the note's document, with where to land (`target`), from `notify::opened`.
-    pub const EV_OPEN_AT: u8 = 4;
+    pub const EV_OPEN_AT: u8 = 5;
     /// Escape, by its USB HID usage: what back's tap sends the app in front (up one page; nothing at its main page).
     pub const KEY_ESCAPE: u8 = 0x29;
     /// How many events op 62 holds a window: the newest, a ring (a window that missed more still learns whether it is behind, the reply's state byte).
@@ -2096,10 +2096,10 @@ pub mod window {
         (call(display, &[61, usage], &mut r) >= 3 && r[0] == 0).then_some((r[1], r[2]))
     }
 
-    /// The person opened note `number` of the kist in front (display op 65, `EV_OPEN_AT`; the deck alone, docs/NOTIFY.md "A tap"): its surface and generation, None when no app window was in front (or the caller is not the system's window management).
+    /// The person opened note `number` of the kist in front (display op 67, `EV_OPEN_AT`; the deck alone, docs/NOTIFY.md "A tap"): its surface and generation, None when no app window was in front (or the caller is not the system's window management).
     pub fn open_at(display: u64, number: u8) -> Option<(u8, u8)> {
         let mut r = [0u8; 4];
-        (call(display, &[65, number], &mut r) >= 3 && r[0] == 0).then_some((r[1], r[2]))
+        (call(display, &[67, number], &mut r) >= 3 && r[0] == 0).then_some((r[1], r[2]))
     }
 
     /// The helm's Deck button as the deck's summary (display op 66; owner, 2026-11-12: "if anything on the deck has changed state, specifically 400nm notifications, we change the deck circle in the helm", then "So ideally the deck circle shows the latest item icon preview and shows the violet ring?"): `icon` the latest note's source's icon in the display's bundle (0: none, the ring alone), `count` how many wait in the deck's resting view (0: the plain Deck mark). True when the display took it.

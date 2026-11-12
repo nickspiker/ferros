@@ -5696,7 +5696,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 map.app_front = true;
             }
         }
-        // A kist started from a tap on a note: told which note once its window is in front (display op 65).
+        // A kist started from a tap on a note: told which note once its window is in front (display op 67).
         if map.app_front {
             if let Some((c, n)) = map.open_pending.take() {
                 map.open_at(c, n);
