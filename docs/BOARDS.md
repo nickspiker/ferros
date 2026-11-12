@@ -29,12 +29,14 @@ A range goes in only with memblock's proof that nothing else owns it, never a de
 |---|---|---|---|---|
 | G#8300_0000-G#8400_0000 | 16 MiB | yes | yes | The page pool since 2026-10-26; husky's memblock: plain memory |
 | G#A000_0000-G#B400_0000 | 320 MiB | yes | yes | The big pool since 2026-10-27; husky's memblock: plain memory (G#9740_0000-G#B61F_FFFF), sec_dram from G#B620_0000 |
-| G#8_8000_0000-G#9_BE40_0000 | 5092 MiB | yes | needs a capture | husky's memblock: the high bank's memory, no reservation below the camera and video pools |
+| G#8_8000_0000-G#9_BE40_0000 | 5092 MiB | yes | | husky's memblock: the high bank's memory, no reservation below the camera and video pools |
 | G#A_0000_0000-G#A_FA00_0000 | 4000 MiB | yes | not DRAM | husky's memblock: memory past those pools; the frame under the hv left out (the hv copies Linux's device tree to G#A_FBF0_0000) |
+| G#8_8000_0000-G#8_FFE0_0000 | 2046 MiB | | yes | akita's memblock (2026-11-12): plain memory up to the frame holding the hv's copy of the device tree (G#8_FFF0_0000) |
+| G#9_0400_0000-G#9_BC00_0000 | 2944 MiB | | yes | akita's memblock: plain memory past the hv's 64 MiB, up to Linux's own early allocations (G#9_BC04_0000) and the camera and video pools above them |
 
 husky's proof is Android's own boot log, captured 2026-08-17 (`/mnt/Harbor/tmp/linux_full_dmesg.txt`, stock 6.1.124): memblock's memory ("Early memory node ranges": G#8000_0000-G#FFFF_FFFF and G#8_8000_0000-G#A_FFFF_FFFF) and every reservation it made from the device tree, each with the size memblock took ("OF: reserved mem").
 In the high bank they are one run, G#9_BE40_0000-G#9_FFFF_FFFF (vscaler, farawimg, famodel, faceauth, vstream, faprev, vframe, gcma_camera); the hv's 64 MiB at the top has read `reserved` in /proc/iomem since 2026-10-19.
-That log is from before the hv, and it lists the device tree's reservations, not the bootloader's `/memreserve/` entries, so a fresh capture under today's Android is the stronger proof; the same commands prove akita's high bank (G#8_8000_0000-G#A_0000_0000 less its carve-outs and the hv at G#9_0000_0000), which stays out of the pool until they are run:
+That log is from before the hv, and it lists the device tree's reservations, not the bootloader's `/memreserve/` entries, so a fresh capture under today's Android is the stronger proof. These commands give one (`adb root` works only on a debug build; on the 8a's user build they ran as root thru Magisk's `su -c`, as one script pushed to /data/local/tmp):
 
 ```bash
 adb root
@@ -45,9 +47,15 @@ adb shell dmesg | grep -E "OF: reserved mem|node   0: \[mem|Memory:" > dmesg-mem
 ```
 
 A range is free when it lies in `memory`, in no line of `reserved` and under `System RAM` in iomem with no `reserved` inside; the dmesg lines are the fallback when debugfs is closed (they hold only while the boot's first lines are still in the log).
+
+akita's capture, 2026-11-12 (Android CP2A.260805.005 under the hv on slot b, reached by `diag "android here"`; saved in `/mnt/Harbor/tmp/akita-memblock-2026-11-12/`): memory G#8000_0000-G#FFFF_FFFF and G#8_8000_0000-G#9_FFFF_FFFF, 8 GiB.
+In the high bank memblock reserves the hv's device tree copy (G#8_FFF0_0000-G#8_FFF7_1604), the hv's 64 MiB (`hv@900000000`, nomap; iomem `900000000-903ffffff : reserved`), and everything from G#9_BC04_0000 up: Linux's own early allocations, then the pools the device tree places at run time (vframe G#9_C540_0000 512 MiB, farawimg, famodel, faprev, faceauth_dsp, gcma_camera, faceauth_tpu, vstream, vscaler to the top).
+The two ranges stop a frame short of the first and at the 2 MiB frame under the last, as husky's stop under its pools; the top of the bank is the part the August chain will not let the hv touch at the handoff anyway.
+Below them the capture proves the old pools too (G#8300_0000-G#8400_0000 and G#A000_0000-G#B400_0000 lie in G#8000_0000-G#901F_FFFF and G#9740_0000-G#B61F_FFFF, plain memory with nothing reserved), and the layer arena's lower half (G#9800_0000-G#9C00_0000), so akita's arena is husky's 128 MiB since (below).
+On ferros, `diag frames test` wrote all 5058 MiB of free frames with their own addresses, read them back and wiped them: no word wrong, and the 8a ran on.
 Not in the pool on either board: the kernel's window, the DMA regions (display, USB, gpu-mem, layers, the modem's windows), the surfaces and canvas, the low bank's firmware carve-outs, and the hv.
 
-The layer arena (cachemap `layers`, 2026-11-12) is husky's G#9800_0000-G#A000_0000 (memblock: plain memory) and akita's G#9C00_0000-G#A000_0000 only, the 64 MiB it has run GPU jobs in since 2026-11-09: G#9800_0000-G#9C00_0000 is unproven on akita until the capture above, so it is never mapped for EL0, fenced in for the GPU, scrubbed or handed out there.
+The layer arena (cachemap `layers`) is G#9800_0000-G#A000_0000 on both boards (memblock: plain memory on each). On akita it was the upper 64 MiB alone until the capture above (2026-11-12): with the attest screen's 32 MiB block taken, Mahere's GPU map got a 32 MiB block, too small for its frame's two regions and four cells, stopped, and left its circle black; with the whole arena it gets 64 MiB and draws.
 
 
 ## Every new model, profiled on the unit before release (owner, 2026-11-08)
