@@ -48,7 +48,7 @@ messages! {
     PageKeyboard,
     PageSecurity,
     /// The page listing everything on the home screen as a circle, by kind (owner, 2026-11-12: "I want to make sure it says items in settings, not kists"): kists, pucks, later contacts; each row opens its card.
-    PageItems,
+    PageDeck,
     PagePermissions,
     PageFleet,
     PagePower,

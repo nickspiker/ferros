@@ -11,7 +11,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PageUnits => "waeine",
         Msg::PageKeyboard => "papapātuhi",
         Msg::PageSecurity => "haumaru",
-        Msg::PageItems => "ngā taonga",
+        Msg::PageDeck => "papa",
         Msg::PagePermissions => "whakaaetanga",
         Msg::PageFleet => "kāhui",
         Msg::PagePower => "hiko",

@@ -101,7 +101,7 @@ Zoom is already semantic: closest, a circle opens into its content where it stan
 
 The front is what the thing is: the thread, the viewfinder, the map. The back is the facts about it, the same for every circle: who signed it and its ihi; which capabilities it holds, hardware by name; how much time it takes (its area, as a number in the device base); when it last changed and why. Turning a circle over is one gesture everywhere (proposed: a two-finger twist, the one motion that pan and pinch never make). This is where an app's permissions live: not in a settings menu far away, but on the back of the thing they govern. A circle's back is read-only facts plus the few choices that belong to it. Revoking a capability is one of them, and it takes effect at the app's next start.
 
-**Decided 2026-11-12: no back; a card on Items.** Of four ways to see a kist's info (twist a circle to flip it, drag it to the centre, an info circle in the quick row, Settings → Items where each row opens the thing's card), the owner chose the last: "just 4." So no circle turns over, and a circle's facts and choices are on its card in the settings circle's Items page (owner, same day: "make sure the settings/items page lists kists and pucks. we may add more stuff to the home screen like contacts and shit so I want to make sure it says items in settings, not kists"). What the card shows is KISTS.md "Items and the card".
+**Decided 2026-11-12: no back; a card on the Deck.** Of four ways to see a kist's info (twist a circle to flip it, drag it to the centre, an info circle in the quick row, Settings → Deck where each row opens the thing's card), the owner chose the last: "just 4." So no circle turns over, and a circle's facts and choices are on its card in the settings circle's Deck page (owner, same day: "make sure the settings/items page lists kists and pucks. we may add more stuff to the home screen like contacts and shit so I want to make sure it says items in settings, not kists"). What the card shows is KISTS.md "The deck and the card".
 
 ### The device is a circle too, and it is the settings
 
@@ -115,7 +115,7 @@ Its pages are Photon's split (photon docs/settings-panel.md), a ring a swipe goe
 | Numbers | the base: four rows, each two seconds and a mebibyte written in it, so the choice is made by seeing | |
 | Keyboard | layout: Dvorak or QWERTY | shape writing |
 | Security | unlock at boot, two taps to turn on, the theft warning under it | lock, wipe |
-| Items | everything on the home screen as a circle, by kind: the kists (opened, apps), then the pucks (live circles never opened: the clock), each row its name with its kind and a kist's state under it; a row opens that thing's card (KISTS.md "Items and the card"); the pandok under the list, to stow from and update; a kist offered over USB above everything, with Stow and Cancel | contacts as a kind |
+| Deck | everything on the home screen as a circle, by kind: the kists (opened, apps), then the pucks (live circles never opened: the clock), each row its name with its kind and a kist's state under it; a row opens that thing's card (KISTS.md "The deck and the card"); the pandok under the list, to stow from and update; a kist offered over USB above everything, with Stow and Cancel | contacts as a kind |
 | Power | proximity wake | |
 | Connections | the links' states, each a door to its link's page; the NFC page holds the tags kept to attest with (add a tag, each kept one listed with when and a remove, the warning under them; AUTH.md "Attest with a tag") | choosing a WiFi network, Bluetooth accessories |
 | About | version, press to ready, since power on, battery, processes, the vault, the chip | validate-on-demand for the firmware |
@@ -129,7 +129,7 @@ Developer is a page on development builds. On release builds twelve taps in a ro
 
 On development builds the page also has the display's own views (owner, 2026-11-11: "a channel picker in debug that enables/disables red/green/blue of the panel output so I can look at channels. Prolly same dev spot as the hitmap and I think that's a good spot for the release look, we can have it always be off and show orange, upon tap in UI it goes black and stays until a reboot"): under "hit map", "panel channels" with a checkbox each for red, green and blue (all on; an off channel is code 0 on every pixel the panel gets), then "release look", unchecked with its box and label in the development orange while the orange shows; one tap and the glass takes the release look, the box checked and taking no more taps; "until a reboot" under them, since none of it is stored. COMPOSITOR.md, "The panel's channels and the release look", has how.
 
-That is the whole of settings: the device's own choices on the device's own circle, and each app's choices on its card under Items (2026-11-12, above; not on the app's circle). Nothing is deeper than a card.
+That is the whole of settings: the device's own choices on the device's own circle, and each app's choices on its card under the Deck (2026-11-12, above; not on the app's circle). Nothing is deeper than a card.
 
 The device circle never lights. Lit means a person sent you something, and the device is not a person. Low battery is the one fact that matters without being looked for, and it is not a circle's business: it belongs to the wake, the one moment a glance is certain.
 

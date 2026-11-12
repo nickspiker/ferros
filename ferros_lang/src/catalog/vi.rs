@@ -11,7 +11,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PageUnits => "đơn vị",
         Msg::PageKeyboard => "bàn phím",
         Msg::PageSecurity => "bảo mật",
-        Msg::PageItems => "mục",
+        Msg::PageDeck => "boong",
         Msg::PagePermissions => "quyền",
         Msg::PageFleet => "đội",
         Msg::PagePower => "nguồn",

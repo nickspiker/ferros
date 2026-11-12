@@ -14,7 +14,7 @@
 //!
 //! Positions are deterministic until the person arranges by hand; then each moved circle is kept in the vault (`map.place.<name>`) and wins over the seeded place from then on.
 //!
-//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page, and the identity space: the arrangement and kists written from the person's fleet are read again when its generation moves, docs/IDENTITY-SPACE.md), 6 the vault scope `kists.`, 7 use launch (init), 8 use kists (the installer, payloads/kists: the Items page stows, updates and unstows through it, installer.rs), 9 use nfc (attest with a tag: the NFC page adds a tag, AUTH.md), 10 use torch (the kernel's, not init's, the slot after the last: the quick row, quick.rs).
+//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page, and the identity space: the arrangement and kists written from the person's fleet are read again when its generation moves, docs/IDENTITY-SPACE.md), 6 the vault scope `kists.`, 7 use launch (init), 8 use kists (the installer, payloads/kists: the Deck page stows, updates and unstows through it, installer.rs), 9 use nfc (attest with a tag: the NFC page adds a tag, AUTH.md), 10 use torch (the kernel's, not init's, the slot after the last: the quick row, quick.rs).
 
 #![no_std]
 #![no_main]
@@ -71,7 +71,7 @@ const S_FGTW: u64 = 5;
 const S_KIST_LIST: u64 = 6;
 /// Init's `launch` endpoint: a kist circle tapped asks init to launch it, and a kist's card stops it (the map holds none of a kist's rights).
 const S_LAUNCH: u64 = 7;
-/// The installer's `kists` endpoint (payloads/kists): the Items page stows, updates and unstows through it, and reads the pandok (the directory) and the jobs under way.
+/// The installer's `kists` endpoint (payloads/kists): the Deck page stows, updates and unstows through it, and reads the pandok (the directory) and the jobs under way.
 const S_INSTALLER: u64 = 8;
 /// The NFC driver (payloads/nfc): its TAG (op 9) held while the NFC page adds a tag (attest with a tag, AUTH.md; owner, 2026-11-11: "ideally something in settings to add a tag").
 const S_NFC: u64 = 9;
@@ -836,15 +836,15 @@ enum Choice {
     Pick(u8),
     /// A kist's want on its card or the Permissions page: (the kist in the person's list, the want), its answer turned over.
     Answer(u8, u8),
-    /// The Items page: a thing's unstow (its place in the person's list; two taps; a puck's "remove from the home screen"), and the pandok's stow or update (its row in the directory).
+    /// The Deck page: a thing's unstow (its place in the person's list; two taps; a puck's "remove from the home screen"), and the pandok's stow or update (its row in the directory).
     Unstow(u8),
     Install(u8),
-    /// The Items page: a row's card opened (its place in the person's list), and back to the list.
+    /// The Deck page: a row's card opened (its place in the person's list), and back to the list.
     Card(u8),
     CardBack,
     /// A kist's card: its running process stopped (init's `OP_STOP`).
     Stop(u8),
-    /// A kist offered over USB, on the Items page: Stow (true) or Cancel (false), the person's answer to the installer (docs/KISTS.md "Stowing").
+    /// A kist offered over USB, on the Deck page: Stow (true) or Cancel (false), the person's answer to the installer (docs/KISTS.md "Stowing").
     Stow(bool),
     /// A right's default for new kists (Permissions).
     Default(u8),
@@ -857,8 +857,8 @@ enum Choice {
     TagRemove(u8),
 }
 
-/// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The torch after the battery (owner, 2026-11-11: its brightness, strobe, lit share and timeout; QUICK.md "Quick pages"), opened from its quick circle by a pull down as well. The clock after them (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). Items (owner, 2026-11-12: "make sure it says items in settings, not kists"): everything on the home screen as a circle, by kind, each row opening its card. These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
-const PAGES: [&str; 21] = ["appearance", "units", "keyboard", "security", "items", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "torch", "clock", "language", "about", "developer"];
+/// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The torch after the battery (owner, 2026-11-11: its brightness, strobe, lit share and timeout; QUICK.md "Quick pages"), opened from its quick circle by a pull down as well. The clock after them (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). The Deck, first named Items (owner, 2026-11-12: "make sure it says items in settings, not kists"): everything on the home screen as a circle, by kind, each row opening its card. These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
+const PAGES: [&str; 21] = ["appearance", "units", "keyboard", "security", "deck", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "torch", "clock", "language", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Whether it starts looking like one (the orange hairlines, as the display's): FERROS_RELEASE_LOOK set gives a development build the release look for screen captures (owner, 2026-11-10), its tools kept.
@@ -888,7 +888,7 @@ fn page_title(key: &'static str) -> &'static str {
         "units" => Msg::PageUnits,
         "keyboard" => Msg::PageKeyboard,
         "security" => Msg::PageSecurity,
-        "items" => Msg::PageItems,
+        "deck" => Msg::PageDeck,
         "permissions" => Msg::PagePermissions,
         "fleet" => Msg::PageFleet,
         "power" => Msg::PagePower,
@@ -1058,7 +1058,7 @@ fn widget(name: &str) -> Option<u8> {
 /// The display's clock face as a scene icon (display `WIDGET_CLOCK`, G#80).
 const CLOCK_FACE: u8 = 1 << 7;
 
-/// What a puck's circle shows, by the display's icon for it (`widget`), for its card on Items.
+/// What a puck's circle shows, by the display's icon for it (`widget`), for its card on the Deck.
 fn puck_shows(icon: u8) -> Msg {
     match icon {
         CLOCK_FACE => Msg::TheTime,
@@ -1346,9 +1346,9 @@ struct Map {
     zone_note: Option<Msg>,
     /// The installer as last read (installer.rs): the directory's kists and each job under way.
     installer: installer::Installer,
-    /// The Items page's unstow armed on a kist or a puck, by its place in the person's list (the first tap of two, as "remove this device").
+    /// The Deck page's unstow armed on a kist or a puck, by its place in the person's list (the first tap of two, as "remove this device").
     unstow_armed: Option<u8>,
-    /// The Items page's card open, by the capsule of the kist or puck it is for (owner, 2026-11-12: a row opens its card, the one way to see a kist's info); None on the list. Gone with it when that thing is unstowed.
+    /// The Deck page's card open, by the capsule of the kist or puck it is for (owner, 2026-11-12: a row opens its card, the one way to see a kist's info); None on the list. Gone with it when that thing is unstowed.
     card: Option<[u8; 32]>,
     /// The GPS page's claim (owner, 2026-11-10: "open the GPS screen (which should turn it on whilist GPS screen is open)"; ferros_sys::claim): held while the page shows, the screen is on and GPS is switched on.
     gps_claimed: bool,
@@ -1370,7 +1370,7 @@ struct Map {
     kists_read: u64,
     /// The kists alive as the kernel last said (ferros_sys::not_started::live, at each ring of the kists' bell), by capsule; None until it has (a kernel without op 2), when kist circles show no state.
     live: Option<alloc::vec::Vec<[u8; 32]>>,
-    /// The kists the kernel keeps a record for (ferros_sys::not_started::list: a start that did not happen, or a stop by a fault, a panic or a kill from outside), by capsule: stopped on their circles until they start again, each with its reason (ferros_kist::launch::why) for its card on Items.
+    /// The kists the kernel keeps a record for (ferros_sys::not_started::list: a start that did not happen, or a stop by a fault, a panic or a kill from outside), by capsule: stopped on their circles until they start again, each with its reason (ferros_kist::launch::why) for its card on the Deck.
     ended: alloc::vec::Vec<([u8; 32], u8)>,
     /// Things waiting on the person, by kist capsule, with how many: a for-you glow, its reach growing with the count. Nothing adds to it yet: ferros has no notifications (owner, 2026-11-11: for you is "anything waiting on the person"), and whatever brings them sets the count here and calls `send_states`.
     waiting: alloc::vec::Vec<([u8; 32], u16)>,
@@ -2300,7 +2300,7 @@ impl Map {
         }
     }
 
-    /// A kist's state in words, for its row and its card on Items, as its glow says it (`state`): running, stopped (with the kernel's reason), or not running; None before the kernel has said which kists are alive (a kernel without op 2). Not for a puck: never a process, it has no state to say.
+    /// A kist's state in words, for its row and its card on the Deck, as its glow says it (`state`): running, stopped (with the kernel's reason), or not running; None before the kernel has said which kists are alive (a kernel without op 2). Not for a puck: never a process, it has no state to say.
     fn kist_state(&self, capsule: &[u8; 32]) -> Option<(Msg, Option<u8>)> {
         let live = self.live.as_ref()?;
         Some(if live.contains(capsule) {
@@ -3868,7 +3868,7 @@ impl Map {
                 }
                 fact(b, &mut y, tr(Msg::Chip), v.as_str());
             }
-            "items" => {
+            "deck" => {
                 // Everything on the home screen, each row opening its card (`card`): what it is, who made it, its rights as switches (owner, 2026-11-08: per kist, its rights; a tap changes the answer for every device of the person's, and a kist running is killed and started again with the answers as they now stand), stop, update and unstow.
                 let ks = self.kists.kists.clone();
                 // The installer's (installer.rs): the directory and the jobs under way. Sizes in the person's number base.
@@ -3930,7 +3930,7 @@ impl Map {
                     }
                     y += uu(1, 1);
                 }
-                // A thing's card (owner, 2026-11-12, of four ways to see a kist's info: "just 4", Items' row opening its card): the only place its info shows, in place of the list while it is open, Back above it. One gone meanwhile (unstowed, here or on another device of theirs) closes it.
+                // A thing's card (owner, 2026-11-12, of four ways to see a kist's info: "just 4", the Deck's row opening its card): the only place its info shows, in place of the list while it is open, Back above it. One gone meanwhile (unstowed, here or on another device of theirs) closes it.
                 let open = self.card.and_then(|c| ks.iter().position(|k| k.capsule == c));
                 if open.is_none() {
                     self.card = None;
@@ -4082,7 +4082,7 @@ impl Map {
                         y += uu(1, 2);
                     }
                 }
-                // The pandok (the directory, kists.fgtw.org; owner, 2026-11-11: "pandok is the place with the things"), under the list as it was on the Kists page before Items: every kist listed, to stow, or to update when a newer one is listed than the one stowed.
+                // The pandok (the directory, kists.fgtw.org; owner, 2026-11-11: "pandok is the place with the things"), under the list as it was on the Kists page before the Deck: every kist listed, to stow, or to update when a newer one is listed than the one stowed.
                 if inst.here {
                     y += uu(1, 2);
                     row(self, b, &mut y, uu(3, 2), white(), tr(Msg::Pandok), None);
@@ -4924,7 +4924,7 @@ impl Map {
                             self.unstow_armed = Some(k);
                         }
                     }
-                    // A row on Items: its card, at its top; Back: the list, at its top.
+                    // A row on the Deck: its card, at its top; Back: the list, at its top.
                     Some(Choice::Card(k)) => {
                         self.card = self.kists.kists.get(k as usize).map(|kist| kist.capsule);
                         self.scroll = 0;
@@ -5055,7 +5055,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
 
     // The circles: settings, then a kist circle for each kist the person installed (their list, `kists.list`; none readable, none shown), sized by share and placed once.
     let kists = ferros_kist::store::read(cap(grants, S_KIST_LIST)).unwrap_or_default();
-    // WHY: the scene and the arrays hold MAX circles; kists past it get no circle until there is room (the settings' Items page still lists them).
+    // WHY: the scene and the arrays hold MAX circles; kists past it get no circle until there is room (the settings' Deck page still lists them).
     let n = (1 + kists.kists.len()).min(MAX);
     let rs: [i64; MAX] = core::array::from_fn(|i| if i == 0 { radius_of(CIRCLES[0].share) } else if i < n { radius_of(KIST_SHARE) } else { 0 });
     let mut xs = [0i64; MAX];
@@ -5320,13 +5320,13 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut space_seen = 0u32;
     // The departure waiting here last seen (its intent and the asking device's name), so the Fleet page opens once for each: a request answered clears it, so the same device asking again opens the page again.
     let mut ask_seen: Option<(u8, [u8; NAME_BYTES], usize)> = None;
-    // The kist offered over USB last opened the Items page on (docs/KISTS.md "Stowing").
+    // The kist offered over USB last opened the Deck page on (docs/KISTS.md "Stowing").
     let mut offer_seen: Option<[u8; 32]> = None;
     // The copy of the identity service last taken (`fgtw_poller`'s sequence count).
     let mut fleet_seen = 0u32;
     // Whether the Fleet page showed at the last pass (`FLEET_PAGE`).
     let mut fleet_shown = false;
-    // The installer's copy last taken, the finished jobs in it (a kist stowed or unstowed: the circles follow), and whether the Items page showed at the last pass (opening it reads the directory again).
+    // The installer's copy last taken, the finished jobs in it (a kist stowed or unstowed: the circles follow), and whether the Deck page showed at the last pass (opening it reads the directory again).
     let (mut installer_seen, mut installer_done, mut kists_shown) = (0u32, 0u64, false);
     // GPS's claims as the permissions and GPS pages were last drawn with them (CLAIMS_WORD, the kernel's doorbell): a change draws them again.
     let mut claims_seen = 0u64;
@@ -5348,7 +5348,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The add flow following the Fleet page (`fleet_page_thread`).
     static mut PAGE_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(fleet_page_thread, unsafe { &mut *(&raw mut PAGE_STACK) }, grants);
-    // The installer's doorbell (payloads/kists), for the Items page: on a thread of its own, never on a timer.
+    // The installer's doorbell (payloads/kists), for the Deck page: on a thread of its own, never on a timer.
     static mut INSTALLER_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(installer::watch, unsafe { &mut *(&raw mut INSTALLER_STACK) }, grants);
     // The GPS driver's doorbell, for the GPS page (`gps_watch`): on a thread of its own, asleep while the page is not open.
@@ -5434,7 +5434,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             FLEET_PAGE.store(((v >> 1) + 1) << 1 | shown as u64, core::sync::atomic::Ordering::Release);
             ferros_sys::wake(&FLEET_PAGE, 1);
         }
-        // The installer's copy, when its doorbell has rung (installer.rs): taken in, the Items page drawn again while it shows, and the person's list and circles read again when a job has finished (a kist stowed, updated, unstowed or restored).
+        // The installer's copy, when its doorbell has rung (installer.rs): taken in, the Deck page drawn again while it shows, and the person's list and circles read again when a job has finished (a kist stowed, updated, unstowed or restored).
         if let Some((seq, s)) = installer::take(installer_seen) {
             installer_seen = seq;
             let done = s.finished();
@@ -5443,12 +5443,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 installer_done = done;
                 map.refresh_circles();
             }
-            if matches!(map.view, View::Open(_)) && PAGES[map.page] == "items" && !map.settling {
+            if matches!(map.view, View::Open(_)) && PAGES[map.page] == "deck" && !map.settling {
                 map.draw();
             }
         }
-        // The Items page opened: the installer reads the pandok (the directory) again (owner: on opening the page, never on a timer).
-        let shown = matches!(map.view, View::Open(_)) && PAGES[map.page] == "items";
+        // The Deck page opened: the installer reads the pandok (the directory) again (owner: on opening the page, never on a timer).
+        let shown = matches!(map.view, View::Open(_)) && PAGES[map.page] == "deck";
         if shown != kists_shown {
             kists_shown = shown;
             if shown {
@@ -5595,11 +5595,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             ask_seen = ask;
         }
-        // A kist offered over USB, checked and waiting on this person: a new one opens the Items page on it, Stow and Cancel ready (above the list, or above a card left open), as a departure opens the Fleet page. Not over an app in front, nor under a finger or while the map settles: it opens once the fingers lift, or once the person is back on the map.
+        // A kist offered over USB, checked and waiting on this person: a new one opens the Deck page on it, Stow and Cancel ready (above the list, or above a card left open), as a departure opens the Fleet page. Not over an app in front, nor under a finger or while the map settles: it opens once the fingers lift, or once the person is back on the map.
         if !map.app_front && !down && !map.settling {
             let offer = map.installer.offer.as_ref().map(|o| o.capsule);
             if offer.is_some() && offer != offer_seen {
-                map.show_page("items");
+                map.show_page("deck");
                 map.draw();
             }
             offer_seen = offer;

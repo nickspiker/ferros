@@ -11,7 +11,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PageUnits => "unidades",
         Msg::PageKeyboard => "teclado",
         Msg::PageSecurity => "segurança",
-        Msg::PageItems => "itens",
+        Msg::PageDeck => "convés",
         Msg::PagePermissions => "permissões",
         Msg::PageFleet => "frota",
         Msg::PagePower => "energia",

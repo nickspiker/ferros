@@ -11,7 +11,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PageUnits => "इकाइयाँ",
         Msg::PageKeyboard => "कीबोर्ड",
         Msg::PageSecurity => "सुरक्षा",
-        Msg::PageItems => "आइटम",
+        Msg::PageDeck => "डेक",
         Msg::PagePermissions => "अनुमतियाँ",
         Msg::PageFleet => "बेड़ा",
         Msg::PagePower => "पावर",
