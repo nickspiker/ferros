@@ -111,7 +111,7 @@ Its pages are Photon's split (photon docs/settings-panel.md), a ring a swipe goe
 
 | Page | What it holds now | Later |
 |---|---|---|
-| Appearance | theme (four swatches), brightness, names under circles | |
+| Appearance | the look's one page (owner, 2026-11-12: "the more granular screen settings page, which I wanted to combine a few things, brightness, theme, other look related items"): theme (four swatches), brightness (a typed setting, QUICK.md "Quick pages"), the UI scale, names under circles, the temporal dither (from Developer, 2026-11-12); a tap on the quick row's brightness ring opens it | |
 | Numbers | the base: four rows, each two seconds and a mebibyte written in it, so the choice is made by seeing | |
 | Keyboard | layout: Dvorak or QWERTY | shape writing |
 | Security | unlock at boot, two taps to turn on, the theft warning under it | lock, wipe |
@@ -119,7 +119,7 @@ Its pages are Photon's split (photon docs/settings-panel.md), a ring a swipe goe
 | Power | proximity wake | |
 | Connections | the links' states, each a door to its link's page; the NFC page holds the tags kept to attest with (add a tag, each kept one listed with when and a remove, the warning under them; AUTH.md "Attest with a tag") | choosing a WiFi network, Bluetooth accessories |
 | About | version, press to ready, since power on, battery, processes, the vault, the chip | validate-on-demand for the firmware |
-| Developer | dither, hit map, panel channels (red, green, blue), release look, light scope; the hit map, the channels and the release look on development builds only, none of them kept past a reboot | |
+| Developer | hit map, panel channels (red, green, blue), release look, light scope (the dither went to Appearance, 2026-11-12); the hit map, the channels and the release look on development builds only, none of them kept past a reboot | |
 
 The page's title is large at the top, its neighbours' small and dim either side; a swipe across goes round the ring, a tap on a neighbour's title goes there. Under a lifted finger the strip snaps to a page, its offset halving each frame (floored, so it lands), and a fling scrolls a page longer than its band by the largest of the last three frames' movements, losing a pixel a frame; both counted in the panel's frames, not in frames drawn (owner, 2026-11-05).
 
