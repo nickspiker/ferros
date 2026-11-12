@@ -5410,6 +5410,7 @@ fn helm_note_draw(bar: &mut [u64], width: usize, height: usize, bot: usize, (x, 
                     let k = *size as f32 / (2.0 * ri);
                     let (u, v) = ((fx - (x - ri)) * k, (fy - (y - ri)) * k);
                     let (u0, v0) = (u - 0.5 * k, v - 0.5 * k);
+                    // WHY the floor: an icon smaller than the disc (k under 1 texel a pixel) would average no texel at all; one sample (the nearest) is the footprint then.
                     let n = (k as usize).max(1);
                     let (mut sr, mut sg, mut sb, mut sa) = (0f32, 0f32, 0f32, 0f32);
                     for ty in 0..n {
