@@ -2,8 +2,8 @@
 //!
 //! - **The slide** (owner, 2026-11-11, on the Pro, after the first cut's grow-and-fan: "the top console pulldown is stupidly slow and jerky", then "track the finger down from top tho and slide it in so it doesn't need a re-render, just a move and composite, then do the iterate/2 each frame, like we do for the settings page until it snaps in or out of place"). The row's offset `off`, whole pixels: 0 hidden, `slide` open (the display's length, op 56's reply). A finger that lands in the doorway by the camera (op 41: 10) and goes down moves it one to one (owner, 2026-11-11: "the second console row should only show if drug down from the area in the invisible camera circle"); from open a push up brings it back the same way. The display draws the row once and only moves it.
 //! - **The lift.** The row goes open when it was pulled past a third of the way (or, pushed from open, not back past a third), else hidden: each frame the panel showed, what is left to go halves (a right shift), so it lands in a few frames and holds still (`step`). No timer: the steps are the shown frames (owner, 2026-11-08: "we follow shown frames, not composited").
-//! - **Tap acts, drag opens** (owner, 2026-11-11: "I like the tap to toggle on/off but the slide down to open the details. ideas?", and to the proposal "Please."; QUICK.md "Quick pages"). In the doorway a tap opens or shuts the row. On a quick circle a tap is its action (`tap`): the torch on at what was set last or off, sound round its modes, and so on; a circle with nothing to switch (brightness) opens its page. Behind the row while it shows (op 41: 12): it shuts.
-//! - **The pull.** A finger dragged down from a circle that has a page is a control on the way there (`pull_to`): on the two rings (brightness, the torch) the pull is the level, one to one, a quarter of the screen's harmonic span the whole range, down brighter and up dimmer, eased at both ends (`ease`) so it slows into each end rather than stopping dead; past the bright end by a twelfth of the span (the helm's swipe) the page opens, the level kept where the pull left it. On a circle with a page and no level (radios off) the pull opens its page at that twelfth. Let go partway, a ring keeps the level. No long press anywhere (it would need a timer). The rings' turn by angle (2026-11-11, the first cut) went with this.
+//! - **Two kinds of circle** (QUICK.md "Quick pages"). A switch acts on a tap (`tap`): radios off and back, sound round its modes, do not disturb, full screen, screencap. A level (the two rings, brightness and the torch) opens its page on a tap and is set by a drag down (owner, 2026-11-12: "tap on torch brings up the torch config screen, when dragging, once your finger goes below the torch circle it goes from 0% to 100% at the screen midpoint"; and "Same for brightness"). In the doorway a tap opens or shuts the row. Behind the row while it shows (op 41: 12): it shuts.
+//! - **The drag down from a ring** (`pull_to`): nothing while the finger is still above the circle's bottom edge; once below it, the level is where the finger is, not how far it went: 0 at the circle's bottom edge (the torch off, brightness the dimmest the panel goes) to the whole level at the screen's vertical middle, back down as the finger goes back up, eased into both ends (`level_at`, the ring's own C∞ ease pinned to those two rows). Let go, the level is kept. No page opens from a drag (the span/12 open distance of 2026-11-11 went with this), and no long press anywhere (it would need a timer).
 //! - **Full screen** (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"): the display neither draws the row nor gives it, the doorway or the console any pixel of the hit map, so nothing here starts; turned on by the map (the middle circle, home's swipe), the row shuts at once (`shut`).
 //! - **The console's circles** (main.rs): every pixel of the dash is a circle's zone (the display's, nearest rim). Dragged toward the centre a circle opens its page; tapped still a radio switches and any other circle opens its page. No long press (it went 2026-11-11, with drag-to-centre back). Only the doorway pulls or taps the row open.
 
@@ -28,17 +28,16 @@ pub const SCREENCAP: usize = 6;
 /// How many circles the row has, and the hit map's id of the first (op 41: 32 + k).
 pub const N: u8 = 7;
 
-/// Whether quick circle k is a level a pull sets (the two rings).
+/// Whether quick circle k is a level (the two rings): a tap opens its page, a drag down sets it. Every other circle is a switch: a tap acts, a drag moves the row.
 pub fn level(k: usize) -> bool {
     k == BRIGHTNESS || k == TORCH
 }
 
-/// Quick circle k's page, the settings page a pull down opens (QUICK.md "Quick pages": a quick circle's page is the settings page that holds what it switches, opened a second way): brightness Appearance, where its slider is (owner, 2026-11-11: "brightness not sure if we'll have much more on that screen"); the torch its own; radios off Connections. Sound, do not disturb, full screen and screencap have none yet: a drag on them moves the row, as before.
+/// A level circle's page, the settings page its tap opens (QUICK.md "Quick pages": a quick circle's page is the settings page that holds what it sets, opened a second way): brightness Appearance, the one page for the look (owner, 2026-11-12: "tap brings you to the more granular screen settings page, which I wanted to combine a few things, brightness, theme, other look related items"); the torch its own (owner, same day: "tap on torch brings up the torch config screen"). The switches have none here: a tap is their action.
 pub fn page(k: usize) -> Option<&'static str> {
     match k {
         BRIGHTNESS => Some("appearance"),
         TORCH => Some("torch"),
-        RADIOS_OFF => Some("connections"),
         _ => None,
     }
 }
@@ -46,12 +45,31 @@ pub fn page(k: usize) -> Option<&'static str> {
 /// Half the width of `ease`'s ends (a ring's share eased at both ends).
 const EASE_HALF: f32 = 1. / (1 << 3) as f32;
 
-/// A ring's share eased at its ends: the value itself thru the middle, exactly 0 below and 1 above, C∞ (the ramp's two corners smoothed by a bump step of half-width EASE_HALF), so a turned ring slows into each end rather than stopping dead.
+/// A ring's share eased at its ends: the value itself thru the middle, exactly 0 from −EASE_HALF down and exactly 1 from 1 + EASE_HALF up, C∞, so the level slows into each end rather than stopping dead. Each corner of the ramp is smoothed by the bump step integrated (`bump_ramp`): its slope is the bump step itself, rising from 0 to 1 across the corner and never past, so the share never leaves [0, 1] and never turns back. Until 2026-11-12 a corner was p times the bump step, whose slope rose to about twice the middle's and which dipped 0.65 % below 0 and rose 0.6 % past 1 (a pull counted from where it took hold never showed it; a level at the finger's place would have, as a dead tenth of the run at the circle's edge where the byte held at 0).
 pub fn ease(p: f32) -> f32 {
-    let s = |t: f32| bump_step((t + EASE_HALF) * (1. / (2. * EASE_HALF)));
-    let q = p * s(p);
-    1. - (1. - q) * s(1. - q)
+    let corner = |x: f32| 2. * EASE_HALF * bump_ramp(x * (1. / (2. * EASE_HALF)) + 0.5);
+    1. - corner(1. - corner(p))
 }
+
+/// The bump step integrated from 0 to t (`bump_step`'s ramp): 0 at t ≤ 0, t − ½ at t ≥ 1 (the step is antisymmetric about ½, so its whole integral is a half), and between them by Simpson's rule over SLICES slices (C∞ in t, the integrand is; its slope in t is a sum of the step and its rise, both never negative, so it never turns back). The tests are its definition, as the step's are.
+fn bump_ramp(t: f32) -> f32 {
+    if t <= 0. {
+        return 0.;
+    }
+    if t >= 1. {
+        return t - 0.5;
+    }
+    let h = t * (1. / SLICES as f32);
+    // Simpson's weights, the rule's own: 1 at the ends (the step is 0 at t = 0), 4 at the odd slices, 2 at the even.
+    let mut sum = bump_step(t);
+    for k in 1..SLICES {
+        sum += bump_step(k as f32 * h) * if k & 1 == 1 { 4. } else { 2. };
+    }
+    sum * h * (1. / 3.)
+}
+
+/// Simpson's slices for `bump_ramp`: the ramp at t = 1 lands on ½ to float precision and its slope on 1 to under a thousandth (measured on the host), far under a step of a byte level.
+const SLICES: u32 = 1 << 4;
 
 /// The C∞ step (the display's draw.rs `bump_step`): 0 at t ≤ 0, 1 at t ≥ 1, the bump exp(−1/t) against its mirror between (the two tests are its definition, not a clamp).
 fn bump_step(t: f32) -> f32 {
@@ -65,25 +83,19 @@ fn bump_step(t: f32) -> f32 {
     a / (a + b)
 }
 
-/// The pull a ring's share comes from: `ease`'s root, bisected over its whole span (it is 0 at −EASE_HALF and 1 at 1 + EASE_HALF).
-fn unease(share: f32) -> f32 {
-    let (mut lo, mut hi) = (-EASE_HALF, 1. + EASE_HALF);
-    for _ in 0..24 {
-        let mid = (lo + hi) * 0.5;
-        if ease(mid) < share { lo = mid } else { hi = mid }
-    }
-    (lo + hi) * 0.5
+/// A ring's share with the finger at row `y` (owner, 2026-11-12: "once your finger goes below the torch circle it goes from 0% to 100% at the screen midpoint"): exactly 0 at and above `bottom` (the circle's bottom edge), exactly 1 at and below `mid` (the screen's vertical middle), and between them `ease` stretched so its exact ends land on those two rows: its C∞ corners inside the run (each a fifth of it), so the level leaves 0 and reaches 1 with no kink, and the three fifths between are linear in the finger's place. Absolute: where the finger is, never how far it went.
+pub fn level_at(y: f32, bottom: f32, mid: f32) -> f32 {
+    ease(-EASE_HALF + (y - bottom) / (mid - bottom) * (1. + 2. * EASE_HALF))
 }
 
-/// A finger pulling down from a quick circle (`pull_to`): which circle; the row the pull counts from (taken where the drag took hold, past the slop, so the level does not jump by the slop at its first step); the level's pull when it took hold and now (`ease(acc)` the share lit; a circle with no level keeps 0); whether it took hold, and whether it opened the page (once a touch).
+/// A finger dragging down from a ring (`pull_to`): which ring; its bottom edge on the glass and the screen's middle (`level_at`'s two rows); whether the drag took hold (from then the finger's every move is the ring's), and whether the finger has gone below the bottom edge yet (until then nothing changes).
 #[derive(Clone, Copy)]
 struct Pull {
     k: usize,
-    y0: i64,
-    acc0: f32,
-    acc: f32,
+    bottom: f32,
+    mid: f32,
     started: bool,
-    opened: bool,
+    below: bool,
 }
 
 pub struct Quick {
@@ -100,18 +112,17 @@ pub struct Quick {
     from_open: bool,
     /// The shown frame the stepping last took.
     last: u32,
-    /// The quick circle a finger holds, and its pull.
+    /// The quick circle a finger holds, and a ring's drag down.
     held: Option<usize>,
     pull: Option<Pull>,
-    /// The pull's lengths, from the screen's harmonic span 2wh/(w + h): the level's whole range (a quarter of it), and how far past the bright end (or, with no level, down from where it took hold) the page opens (a twelfth, the helm's swipe).
-    range: f32,
-    open: f32,
-    /// The shares a pull shows (op 56), None while no finger pulls that ring.
+    /// The screen's vertical middle, where a ring dragged down reaches its whole level.
+    mid: f32,
+    /// The shares a drag shows (op 56), None while no finger drags that ring below its bottom edge.
     bright_arc: Option<f32>,
     torch_arc: Option<f32>,
     /// A screencap wanted once the row is hidden.
     capture: bool,
-    /// The torch's level asked of it last, so a pull sends each new level once.
+    /// The torch's level asked of it last, so a drag sends each new level once.
     torch_sent: u8,
     /// Whether the torch was asked its level since the row last started to show.
     torch_asked: bool,
@@ -122,7 +133,7 @@ pub struct Quick {
 impl Quick {
     pub fn new(display: u64, grants: u64, w: i64, h: i64) -> Quick {
         let span = 2 * w * h / (w + h);
-        Quick { display, grants, off: 0, slide: span >> 3, target: 0, settling: false, grab: None, from_open: false, last: 0, held: None, pull: None, range: (span >> 2) as f32, open: span as f32 / 12., bright_arc: None, torch_arc: None, capture: false, torch_sent: 0, torch_asked: false, sent: [0xEE; 15] }
+        Quick { display, grants, off: 0, slide: span >> 3, target: 0, settling: false, grab: None, from_open: false, last: 0, held: None, pull: None, mid: h as f32 * 0.5, bright_arc: None, torch_arc: None, capture: false, torch_sent: 0, torch_asked: false, sent: [0xEE; 15] }
     }
 
     /// A finger took hold of the row at screen row `y` (a drag that began in the doorway, on the top's ground, on a radio circle or on a quick circle): the stepping lets go of it, and it follows the finger from where it is.
@@ -190,72 +201,56 @@ impl Quick {
         self.settling
     }
 
-    /// A finger landed on quick circle `k`: held (lighter), and on a circle with a page its pull readied, a ring's at the share it shows now. A torch that does not answer has no level to pull, nor a page (its page is no use with no torch).
-    pub fn hold(&mut self, k: usize) {
+    /// A finger landed on quick circle `k`, whose disc on the glass is (x, y, r) as op 41 gave it: held (lighter), and on a ring its drag readied, its bottom edge y + r. A torch that does not answer has no level to set (the circle is drawn dimmed).
+    pub fn hold(&mut self, k: usize, disc: Option<(f32, f32, f32)>) {
         self.held = Some(k);
-        if page(k).is_none() || k == TORCH && torch_now().is_none() {
+        let Some((_, y, r)) = disc else { return };
+        if !level(k) || k == TORCH && torch_now().is_none() {
             return;
         }
-        let share = match k {
-            BRIGHTNESS => 1. - ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS) as f32 * (1. / 255.),
-            TORCH => torch_now().map_or(0., |l| l as f32 * (1. / 255.)),
-            _ => 0.,
-        };
-        let acc = if level(k) { unease(share) } else { 0. };
-        self.pull = Some(Pull { k, y0: 0, acc0: acc, acc, started: false, opened: false });
+        self.pull = Some(Pull { k, bottom: y + r, mid: self.mid, started: false, below: false });
     }
 
-    /// Whether a pull took hold this touch: from then on the finger's every move is the pull's, whichever way it goes.
+    /// Whether a ring's drag took hold this touch: from then on the finger's every move is the ring's, whichever way it goes.
     pub fn pulling(&self) -> bool {
         self.pull.is_some_and(|p| p.started)
     }
 
-    /// The finger pulling from its circle is at row `y` (QUICK.md "Quick pages"). The pull counts from where it took hold (the first call). On a ring the level follows it one to one: down brighter, up dimmer, `range` pixels the whole of it, eased at both ends (`ease`, C∞, so it slows into each end and the lit arc never stops dead); brightness applied live (kept at the lift, `let_go`), the torch asked for each new level. Past the bright end by `open` pixels, or with no level `open` pixels down, the page: its key, once a touch (the caller opens it). The level stays where the pull left it (full: the person pulled it there).
-    pub fn pull_to(&mut self, y: i64) -> Option<&'static str> {
-        let mut p = self.pull?;
-        if !p.started {
-            p.started = true;
-            p.y0 = y;
-        }
-        let depth = (y - p.y0) as f32;
-        let k = p.k;
-        let far = if level(k) {
-            p.acc = p.acc0 + depth / self.range;
-            let share = ease(p.acc);
-            // The share as a byte: the cast holds a share the ease puts a hair past either end at 0 or 255.
-            if k == BRIGHTNESS {
-                self.bright_arc = Some(share);
-                let v = (255. * (1. - share) + 0.5) as u8;
-                if v != ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS) {
-                    ferros_sys::set_pref_live(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BRIGHTNESS, v);
-                }
-            } else {
-                self.torch_arc = Some(share);
-                let v = (255. * share + 0.5) as u8;
-                if v != self.torch_sent {
-                    self.torch_sent = v;
-                    torch_ask(Some(v));
-                }
-            }
-            // `ease` is exactly 1 from 1 + EASE_HALF on: the page lies that far and `open` more.
-            p.acc >= 1. + EASE_HALF + self.open / self.range
-        } else {
-            depth >= self.open
-        };
-        let opens = far && !p.opened;
-        p.opened |= far;
+    /// The finger dragging down from a ring is at row `y` (QUICK.md "Quick pages"; owner, 2026-11-12: "once your finger goes below the torch circle it goes from 0% to 100% at the screen midpoint"). Nothing until the finger first goes below the circle's bottom edge; from then the level is where the finger is (`level_at`): 0 at the bottom edge (the torch off, brightness the dimmest), the whole level at the screen's middle, following it back up too. Brightness applied live (kept at the lift, `let_go`), the torch asked for each new level (it lights with its own strobe, lit share and timeout, which it reads for itself).
+    pub fn pull_to(&mut self, y: i64) {
+        let Some(mut p) = self.pull else { return };
+        p.started = true;
+        p.below |= y as f32 > p.bottom;
         self.pull = Some(p);
-        if opens { page(k) } else { None }
+        if !p.below {
+            return;
+        }
+        let share = level_at(y as f32, p.bottom, p.mid);
+        // The share as a byte, rounded: `level_at` is exactly 0 and 1 at its ends, so the byte runs 0 to 255.
+        if p.k == BRIGHTNESS {
+            self.bright_arc = Some(share);
+            let v = (255. * (1. - share) + 0.5) as u8;
+            if v != ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS) {
+                ferros_sys::set_pref_live(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BRIGHTNESS, v);
+            }
+        } else {
+            self.torch_arc = Some(share);
+            let v = (255. * share + 0.5) as u8;
+            if v != self.torch_sent {
+                self.torch_sent = v;
+                torch_ask(Some(v));
+            }
+        }
     }
 
-    /// The finger left a quick circle it held: a pull ends (its level kept in the vault now, once: brightness as preference 3, the torch's as the level a tap lights it at, preference 42), or a still finger acts (`tap`). Returns the page to open, if the tap opens one.
+    /// The finger left a quick circle it held: a ring's drag ends (its level kept in the vault now, once: brightness as preference 3, the torch's as the level its page's on lights it at, preference 42), or a still finger taps (`tap`). Returns the page to open, if the tap opens one.
     pub fn let_go(&mut self, moved: bool, frame: u32) -> Option<&'static str> {
         let settings = cap(self.grants, S_SETTINGS);
-        if self.pull.take().is_some_and(|p| p.started) {
+        if self.pull.take().is_some_and(|p| p.below) {
             if self.bright_arc.is_some() {
                 ferros_sys::set_pref(settings, ferros_sys::PREF_BRIGHTNESS, ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS));
             }
-            // Pulled to dark, the level a tap lights it at stays what it was.
+            // Dragged to off, the level its page lights it at stays what it was.
             if self.torch_arc.is_some() && self.torch_sent > 0 {
                 ferros_sys::set_pref(settings, ferros_sys::PREF_TORCH_LEVEL, self.torch_sent);
             }
@@ -268,7 +263,7 @@ impl Quick {
         }
     }
 
-    /// A tap on quick circle k: its action; the page to open for a circle with nothing to switch.
+    /// A tap on quick circle k: a switch acts; a level returns its page to open.
     fn tap(&mut self, k: usize, frame: u32) -> Option<&'static str> {
         let settings = cap(self.grants, S_SETTINGS);
         let mut l = Line::new();
@@ -294,8 +289,13 @@ impl Quick {
                 ferros_sys::set_pref(settings, ferros_sys::PREF_SOUND, next);
                 let _ = write!(l, "map: quick: sound mode {next}\n");
             }
-            // Nothing to switch: its page (Appearance, its slider), as a console circle with nothing to switch opens its page.
+            // A level's tap opens its page (owner, 2026-11-12: "tap on torch brings up the torch config screen", and of brightness "tap brings you to the more granular screen settings page"): Appearance, the torch its own, whose on lights it at what was set last (preference 42, and the strobe, lit share and timeout it reads for itself; the tap did that until 2026-11-12). A torch that does not answer: nothing (the circle is drawn dimmed, and its page would set nothing).
             BRIGHTNESS => opens = page(k),
+            TORCH => {
+                if torch_now().is_some() {
+                    opens = page(k);
+                }
+            }
             FULL_SCREEN => {
                 // The display switches the app in front's full screen and says how it stands; with no app in front it refuses (status 3) and nothing changes. Turned on, the row is gone with the console (`shut`).
                 let mut r = [0u8; 4];
@@ -309,20 +309,6 @@ impl Quick {
                     _ => "full screen: no app in front",
                 });
             }
-            // On at what was set last, its level (preference 42) and with it the strobe and the timeout the torch reads for itself (owner, 2026-11-11: the tap replays whatever was set last); or off.
-            TORCH => match torch_now() {
-                Some(0) => {
-                    let lit = ferros_sys::torch::level();
-                    self.torch_sent = lit;
-                    torch_ask(Some(lit));
-                }
-                Some(_) => {
-                    self.torch_sent = 0;
-                    torch_ask(Some(0));
-                }
-                // No torch answers: nothing (the circle is drawn dimmed).
-                None => {}
-            },
             DND => {
                 let on = !ferros_sys::dnd::on();
                 dnd_ask(on);

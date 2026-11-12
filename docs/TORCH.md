@@ -90,7 +90,7 @@ Owner, 2026-11-11: "like flashlight we may want to control the brightness and st
 
 | Setting | Kept as | Range |
 |---|---|---|
-| Level a tap lights it at | `torch_level`, 1-255 (0: never set, the whole dimmer) | the dimmer above |
+| Level its page's on lights it at | `torch_level`, 1-255 (0: never set, the whole dimmer) | the dimmer above |
 | Strobe | `torch_strobe`, 0 steady, else 32nds of an octave up from a flash every 4 s | 1/4 to 16 flashes a second (codes 1-193) |
 | Lit share of each flash | `torch_duty`, a signed byte, 256ths either side of a half | 8/256 to 248/256 |
 | Turns off after | `torch_timeout`, 0 never, else 16ths of an octave up from 16 s | 16 s to 2^14 s, about 4 h 33 min (codes 1-161) |

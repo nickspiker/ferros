@@ -32,7 +32,7 @@ One spec VSF document in the vault under the key `device` (ferros_kernel `settin
 | `radios_before` | unsigned | the radios that were off when the quick row's "radios off" switched them all off (`radios_off`'s bits), put back by its next tap (QUICK.md) | 0 |
 | `sound` | unsigned | the sound mode, preference 39: 0 sound, 1 vibrate, 2 silent (the quick row) | 0 |
 | `dnd_identity` | unsigned | do not disturb, preference 40, as the identity's service last wrote it: 0 off, 1 on; never read back into the identity (below) | 0 |
-| `torch_level` | unsigned | the level the torch's tap lights it at, preference 42: 1-255 on its perceptual dimmer, set by a pull from its quick circle or its page (TORCH.md "Settings") | 0: the whole dimmer |
+| `torch_level` | unsigned | the level the torch page's on lights it at (its quick circle's tap until 2026-11-12), preference 42: 1-255 on its perceptual dimmer, set by a drag down from its quick circle (left lit) or its page (TORCH.md "Settings") | 0: the whole dimmer |
 | `torch_strobe` | unsigned | the torch's strobe, preference 43: 0 steady, 1-193 32nds of an octave up from a flash every 4 s (16 a second at 193) | 0 |
 | `torch_duty` | unsigned (a signed byte) | the lit share of each strobe flash, preference 44: 256ths either side of a half, within 120 | 0: a half |
 | `torch_timeout` | unsigned | when the torch turns itself off, preference 45: 0 never, 1-161 16ths of an octave up from 16 s (2^14 s at 161), counted again from every touch of it | 0 |

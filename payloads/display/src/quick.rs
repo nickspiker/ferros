@@ -387,7 +387,7 @@ fn render(k: usize, grey: f32, on: bool, ring_share: Option<f32>, width: usize, 
     }
 }
 
-/// The worker's pass over the row (`console_worker`): any circle whose look changed drawn again into its sprite (a tap, a ring turned, a language), and the offset taken. Returns the bars' rows owed a compose: those a changed sprite covers where it stands now, and the band where the row was and is when it moved. What it took is the next `compose`'s.
+/// The worker's pass over the row (`console_worker`): any circle whose look changed drawn again into its sprite (a tap, a ring dragged, a language), and the offset taken. Returns the bars' rows owed a compose: those a changed sprite covers where it stands now, and the band where the row was and is when it moved. What it took is the next `compose`'s.
 pub fn update(width: usize, height: usize) -> Option<(usize, usize)> {
     let s = state();
     let slide = SLIDE.load(Ordering::Acquire) as i64;
