@@ -560,6 +560,8 @@ messages! {
     KeyPage,
     /// The attest screen's left key: clears what is typed.
     KeyClear,
+    /// The system keyboard's left key (over an app): puts the keyboard away.
+    KeyHide,
     /// The hive's own line over its keyboard (payloads/hive).
     HiveHint,
 }

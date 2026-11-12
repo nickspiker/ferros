@@ -344,6 +344,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::KeyEnter => "ввод",
         Msg::KeyPage => "стр",
         Msg::KeyClear => "сброс",
+        Msg::KeyHide => "скрыть",
         Msg::HiveHint => "клавиатура-соты: два пальца прокручивают; «стр» в ряду символов",
     }
 }

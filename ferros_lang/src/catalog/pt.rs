@@ -344,6 +344,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::KeyEnter => "enter",
         Msg::KeyPage => "pág",
         Msg::KeyClear => "limpar",
+        Msg::KeyHide => "ocultar",
         Msg::HiveHint => "o teclado colmeia: role com dois dedos; pág fica na fileira de símbolos",
     }
 }

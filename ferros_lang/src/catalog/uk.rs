@@ -344,6 +344,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::KeyEnter => "ввід",
         Msg::KeyPage => "стор",
         Msg::KeyClear => "очист",
+        Msg::KeyHide => "сховати",
         Msg::HiveHint => "клавіатура-стільники: два пальці прокручують; «стор» у ряду символів",
     }
 }

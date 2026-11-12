@@ -344,6 +344,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::KeyEnter => "invio",
         Msg::KeyPage => "pag",
         Msg::KeyClear => "svuota",
+        Msg::KeyHide => "nascondi",
         Msg::HiveHint => "la tastiera a nido d’ape: scorri con due dita; pag è sulla riga dei simboli",
     }
 }

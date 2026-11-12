@@ -344,6 +344,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::KeyEnter => "एंटर",
         Msg::KeyPage => "पेज",
         Msg::KeyClear => "साफ़",
+        Msg::KeyHide => "छिपाएँ",
         Msg::HiveHint => "छत्ते वाला कीबोर्ड: दो उँगलियों से स्क्रॉल करो; पेज चिह्नों वाली पंक्ति में है",
     }
 }

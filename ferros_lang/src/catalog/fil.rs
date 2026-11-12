@@ -344,6 +344,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::KeyEnter => "enter",
         Msg::KeyPage => "pahina",
         Msg::KeyClear => "bura",
+        Msg::KeyHide => "itago",
         Msg::HiveHint => "ang honeycomb na keyboard: dalawang daliri para mag-scroll; nasa hanay ng simbolo ang pahina",
     }
 }

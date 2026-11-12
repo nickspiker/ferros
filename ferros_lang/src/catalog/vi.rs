@@ -344,6 +344,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::KeyEnter => "enter",
         Msg::KeyPage => "trang",
         Msg::KeyClear => "xóa hết",
+        Msg::KeyHide => "ẩn",
         Msg::HiveHint => "bàn phím tổ ong: cuộn bằng hai ngón; trang nằm ở hàng ký hiệu",
     }
 }

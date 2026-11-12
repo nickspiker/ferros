@@ -344,6 +344,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::KeyEnter => "enter",
         Msg::KeyPage => "laman",
         Msg::KeyClear => "bersih",
+        Msg::KeyHide => "sembunyi",
         Msg::HiveHint => "keyboard sarang lebah: geser dengan dua jari; laman ada di baris simbol",
     }
 }

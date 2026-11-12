@@ -344,6 +344,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::KeyEnter => "tāuru",
         Msg::KeyPage => "whārangi",
         Msg::KeyClear => "ūkui",
+        Msg::KeyHide => "huna",
         Msg::HiveHint => "te papapātuhi honikoma: ka panuku mā ngā matimati e rua; kei te rārangi tohu te whārangi",
     }
 }

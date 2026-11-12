@@ -344,6 +344,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::KeyEnter => "enter",
         Msg::KeyPage => "strona",
         Msg::KeyClear => "czyść",
+        Msg::KeyHide => "ukryj",
         Msg::HiveHint => "klawiatura w plaster miodu: dwa palce przewijają; strona jest w rzędzie symboli",
     }
 }

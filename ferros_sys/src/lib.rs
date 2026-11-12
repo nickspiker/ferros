@@ -2073,10 +2073,65 @@ pub mod window {
     pub const EV_KEY: u8 = 3;
     /// The person opened a note of this kist's (docs/NOTIFY.md "A tap"): the low byte its number; the note's document, with where to land (`target`), from `notify::opened`.
     pub const EV_OPEN_AT: u8 = 5;
+    /// Text the system keyboard typed for this window (display op 70; WINDOWS.md "The keyboard"): UTF-8, its length in the low byte, the bytes in the reply's payloads (`PAYLOAD_KINDS`).
+    pub const EV_TEXT: u8 = 6;
+    /// The keyboard's place changed: its payload two bytes, little-endian, the screen rows it covers from the bottom up (0: gone). The window keeps what it is typing into above them.
+    pub const EV_INSET: u8 = 7;
+    /// Kinds from this one up carry a payload: the low byte is its length, and the payloads follow the reply's events, in the events' order. A kind a reader does not know is stepped over by its length.
+    pub const PAYLOAD_KINDS: u8 = 6;
+    /// The most bytes one event's payload holds (a typed word, a key's text); longer text is sent in pieces.
+    pub const PIECE: usize = 1 << 6;
     /// Escape, by its USB HID usage: what back's tap sends the app in front (up one page; nothing at its main page).
     pub const KEY_ESCAPE: u8 = 0x29;
+    /// Enter and backspace, by their USB HID usages: the keyboard's enter and delete keys.
+    pub const KEY_ENTER: u8 = 0x28;
+    pub const KEY_BACKSPACE: u8 = 0x2A;
     /// How many events op 62 holds a window: the newest, a ring (a window that missed more still learns whether it is behind, the reply's state byte).
     pub const EVENTS: usize = 1 << 4;
+    /// The longest op 62 reply: the head, the events, and every event's payload at its longest.
+    pub const EVENTS_REPLY: usize = 7 + 2 * EVENTS + EVENTS * PIECE;
+
+    // ---- the keyboard (WINDOWS.md "The keyboard", 2026-11-12): an app asks for it, the system keyboard (the attest screen's process after attest) shows it at the input level and types into the app in front, the display carrying both ways ----
+
+    /// This window wants the keyboard (`on`) or no longer does (display op 68), as a text field gains or loses focus. True when the display took it; false with the window not the app in front (the keyboard is the front app's alone) or a display without the op.
+    pub fn text_wanted(display: u64, base: u64, on: bool) -> bool {
+        let mut m = [0u8; 10];
+        m[0] = 68;
+        m[1..9].copy_from_slice(&base.to_le_bytes());
+        m[9] = on as u8;
+        let mut r = [0u8; 4];
+        call(display, &m, &mut r) >= 1 && r[0] == 0
+    }
+
+    /// The keyboard's doorbell (display op 69, the system's alone): held by the display until whether an app wants the keyboard changed from what `seen` counted. (the count now, wanted), None from a display without the op or a caller that is not the system's. Call it from a thread of its own: the call waits.
+    pub fn keyboard_watch(display: u64, seen: u32) -> Option<(u32, bool)> {
+        let mut m = [0u8; 5];
+        m[0] = 69;
+        m[1..5].copy_from_slice(&seen.to_le_bytes());
+        let mut r = [0u8; 8];
+        (call(display, &m, &mut r) >= 6 && r[0] == 0).then(|| (u32::from_le_bytes([r[1], r[2], r[3], r[4]]), r[5] == 1))
+    }
+
+    /// Text typed into the window that wants the keyboard while it is the app in front (display op 70, the system's alone; `EV_TEXT`): at most `PIECE` bytes (more is the caller's bug, and panics). True when it went.
+    pub fn type_text(display: u64, text: &[u8]) -> bool {
+        let mut m = [0u8; 2 + PIECE];
+        m[0] = 70;
+        m[2..2 + text.len()].copy_from_slice(text);
+        let mut r = [0u8; 4];
+        call(display, &m[..2 + text.len()], &mut r) >= 1 && r[0] == 0
+    }
+
+    /// A key, by its USB HID usage, to the window that wants the keyboard while it is the app in front (display op 70, `EV_KEY`): enter, backspace. True when it went.
+    pub fn type_key(display: u64, usage: u8) -> bool {
+        let mut r = [0u8; 4];
+        call(display, &[70, usage], &mut r) >= 1 && r[0] == 0
+    }
+
+    /// The keyboard put away (display op 71, the system's alone): no app wants it until one asks again, and the one that did is told the keyboard's place is gone (`EV_INSET` 0).
+    pub fn keyboard_away(display: u64) {
+        let mut r = [0u8; 4];
+        call(display, &[71], &mut r);
+    }
 
     /// The window shown on `surface` under `generation` to the front of its level (display op 59), and told so (`EV_FRONT`). True when there was such a window.
     pub fn front(display: u64, surface: u8, generation: u8) -> bool {
