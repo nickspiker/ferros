@@ -131,6 +131,58 @@ pub const LUT: [u32; 32] = [
     0x2E66_0000, 0x3400_0000, 0x3800_0000, 0x3C00_0000, 0x4000_0000, 0x4400_0000, 0x4800_0000, 0x4248_0000,
 ];
 
+/// An f32 to f16 bits, rounded to nearest even as the GPU's FADD into a half register rounds it (Rust's f16 is unstable): past f16's range to infinity, below it to subnormals and zero, NaN kept quiet.
+pub const fn f32_to_f16(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xFF) as i32;
+    let man = b & 0x7F_FFFF;
+    if exp == 0xFF {
+        return sign | 0x7C00 | if man != 0 { 0x200 } else { 0 };
+    }
+    // f16's biased exponent.
+    let e = exp - 112;
+    if e >= 0x1F {
+        return sign | 0x7C00;
+    }
+    if e <= 0 {
+        // A subnormal f16 (or zero): the 24-bit significand in units of 2^-24, rounded.
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = 1u32 << (shift - 1);
+        let rem = m & ((1 << shift) - 1);
+        let mut h = m >> shift;
+        if rem > half || (rem == half && h & 1 == 1) {
+            h += 1;
+        }
+        return sign | h as u16;
+    }
+    let mut h = (e as u32) << 10 | man >> 13;
+    let rem = man & 0x1FFF;
+    // A carry out of the mantissa steps the exponent, to infinity at the top: the rounding of the binary form itself.
+    if rem > 0x1000 || (rem == 0x1000 && h & 1 == 1) {
+        h += 1;
+    }
+    sign | h as u16
+}
+
+/// f16 bits to the f32 they are, exactly.
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h as u32 & 0x8000) << 16;
+    let exp = (h >> 10) as u32 & 0x1F;
+    let man = h as u32 & 0x3FF;
+    if exp == 0 {
+        // Zero or a subnormal: the mantissa in units of 2^-24, exact in f32.
+        let v = man as f32 * (1. / (1u32 << 24) as f32);
+        return f32::from_bits(v.to_bits() | sign);
+    }
+    let bits = if exp == 0x1F { sign | 0x7F80_0000 | man << 13 } else { sign | (exp + 112) << 23 | man << 13 };
+    f32::from_bits(bits)
+}
+
 /// An entry of the immediate lookup table, by index.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Lut(u8);
@@ -251,12 +303,21 @@ pub enum Swz16 {
     H11 = 3,
 }
 
-/// An f32 operand: a source with optional negate and absolute value (applied as -|x| when both are set).
+/// Which part of a register an f32 operand reads (the `Widen` enum, ISA.xml:410-419): all 32 bits, or one f16 half widened to f32 on the way in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Widen {
+    None = 0,
+    H0 = 1,
+    H1 = 2,
+}
+
+/// An f32 operand: a source with optional negate and absolute value (applied as -|x| when both are set), and a widen from one of its f16 halves.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Float {
     pub src: Src,
     pub neg: bool,
     pub abs: bool,
+    pub widen: Widen,
 }
 
 impl Float {
@@ -267,6 +328,14 @@ impl Float {
     /// Absolute value (clears a negate taken before it, since |-x| = |x|).
     pub const fn abs(self) -> Float {
         Float { abs: true, neg: false, ..self }
+    }
+    /// The low f16 half of the source, widened to f32 (Mesa's test vector `FADD.f32 r0, r1, r0.h0`, `01 00 00 04 00 c0 a4 00`).
+    pub const fn lo16(self) -> Float {
+        Float { widen: Widen::H0, ..self }
+    }
+    /// The high f16 half, widened (`FADD.f32 r0, r1, r0.h1`, `01 00 00 08 00 c0 a4 00`).
+    pub const fn hi16(self) -> Float {
+        Float { widen: Widen::H1, ..self }
     }
     /// As a v2f16 operand with both lanes from the low half.
     pub const fn h00(self) -> Half2 {
@@ -316,11 +385,11 @@ impl From<Float> for Half2 {
 pub trait Operand: Copy + Into<Src> {
     /// As an f32 operand, negated.
     fn neg(self) -> Float {
-        Float { src: self.into(), neg: true, abs: false }
+        Float { src: self.into(), neg: true, abs: false, widen: Widen::None }
     }
     /// As an f32 operand, absolute value.
     fn abs(self) -> Float {
-        Float { src: self.into(), neg: false, abs: true }
+        Float { src: self.into(), neg: false, abs: true, widen: Widen::None }
     }
     /// As a v2f16 operand with both lanes from the low half.
     fn h00(self) -> Half2 {
@@ -345,7 +414,7 @@ macro_rules! operand {
         impl Operand for $t {}
         impl From<$t> for Float {
             fn from(x: $t) -> Float {
-                Float { src: x.into(), neg: false, abs: false }
+                Float { src: x.into(), neg: false, abs: false, widen: Widen::None }
             }
         }
         impl From<$t> for Half2 {
@@ -407,7 +476,7 @@ pub enum Byte {
 }
 
 /// A compare condition (ISA.xml:461-476).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Cond {
     Eq = 0,
     Gt = 1,
@@ -456,6 +525,18 @@ pub enum Round {
     Rtn = 2,
     /// Towards zero (truncate).
     Rtz = 3,
+}
+
+/// A float instruction's destination clamp (ISA.xml:421-460): min/max with NaN taken as the other operand, so a NaN result clamps to the low end.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Clamp {
+    None = 0,
+    /// max(x, 0).
+    ZeroInf = 1,
+    /// clamp(x, -1, 1).
+    MinusOneOne = 2,
+    /// clamp(x, 0, 1).
+    ZeroOne = 3,
 }
 
 /// A branch target, bound to an instruction index by [`Kernel::bind`].
@@ -553,10 +634,11 @@ impl Ins {
         self.bits(byte, at);
     }
 
-    /// An f32 source in ALU position `i`: byte 8i, negate at 38 - 2i, abs at 39 - 2i (va_pack.c `va_pack_alu`); the f32 widen field stays 0 (none).
+    /// An f32 source in ALU position `i`: byte 8i, negate at 38 - 2i, abs at 39 - 2i, the widen at 28 - 2i (va_pack.c `va_pack_alu`: the swizzle field of a 32-bit source, `va_pack_widen_f32`).
     fn float(&mut self, f: impl Into<Float>, i: u32) {
         let f = f.into();
         self.src(f.src, 8 * i);
+        self.bits(f.widen as u64, 28 - 2 * i);
         self.bits(f.neg as u64, 38 - 2 * i);
         self.bits(f.abs as u64, 39 - 2 * i);
     }
@@ -634,6 +716,14 @@ impl Placed<'_> {
         self.flow(Flow::End)
     }
 
+    /// The destination clamp of a float instruction that has one (FADD, FMA, FMIN, FMAX, f32 and v2f16; ISA.xml's `Clamp`, bits 33:32, va_pack.c:699-700): free where a max with 0 or a clamp to [0, 1] would be an instruction.
+    pub fn clamp(self, c: Clamp) -> Self {
+        // WHY: two clamps on one instruction would OR into a third (0_inf | m1_1 is 0_1); the caller means one.
+        assert!((*self.word >> 32) & 3 == 0, "valhall: this instruction already carries a clamp");
+        *self.word |= (c as u64) << 32;
+        self
+    }
+
     /// Sets any flow value.
     pub fn flow(self, f: Flow) -> Self {
         // WHY: the flow field holds one value; overwriting a wait with end (or the reverse) would silently drop the first.
@@ -703,6 +793,11 @@ impl<const N: usize> Kernel<N> {
         Placed { word: &mut self.words[at] }
     }
 
+    /// The flow field of the last instruction emitted (0 none, else a [`Flow`] value): whether a reconverge can still go on it.
+    pub fn last_flow(&self) -> u64 {
+        (self.words[self.len - 1] >> FLOW) & 15
+    }
+
     /// Resolves every branch and returns the words.
     pub fn finish(&mut self) -> &[u64] {
         for &(at, l) in &self.branches[..self.nbranches] {
@@ -713,6 +808,14 @@ impl<const N: usize> Kernel<N> {
         }
         self.nbranches = 0;
         &self.words[..self.len]
+    }
+
+    /// `NOP` (ISA.xml:793-802): nothing, a place for a flow (a reconverge where the last instruction of a block already waits on a load).
+    pub fn nop(&mut self) -> Placed<'_> {
+        let mut i = Ins::new(0x000);
+        // No destination: Mesa's placeholder (`NOP.end`, `00 00 00 00 00 c0 00 78`).
+        i.bits(0xC0, DEST);
+        self.push(i)
     }
 
     // --- Integer ALU -------------------------------------------------------
@@ -1000,6 +1103,26 @@ impl<const N: usize> Kernel<N> {
         i.bits(0x3, 16);
         i.float(a, 0);
         i.float(b, 1);
+        i.dst(dst);
+        self.push(i)
+    }
+
+    /// `FMIN.v2f16 dst, a, b`, per lane (ISA.xml:2388-2393, opcode G#A5 with opcode2 2).
+    pub fn fmin_v2f16(&mut self, dst: impl Into<Dst>, a: impl Into<Half2>, b: impl Into<Half2>) -> Placed<'_> {
+        let mut i = Ins::new(0x0A5);
+        i.bits(0x2, 16);
+        i.half2(a, 0);
+        i.half2(b, 1);
+        i.dst(dst);
+        self.push(i)
+    }
+
+    /// `FMAX.v2f16 dst, a, b`, per lane (ISA.xml:2407-2412, opcode2 3).
+    pub fn fmax_v2f16(&mut self, dst: impl Into<Dst>, a: impl Into<Half2>, b: impl Into<Half2>) -> Placed<'_> {
+        let mut i = Ins::new(0x0A5);
+        i.bits(0x3, 16);
+        i.half2(a, 0);
+        i.half2(b, 1);
         i.dst(dst);
         self.push(i)
     }

@@ -218,3 +218,20 @@ fn uniform_page() {
     k.mov_i32(r(0), u(37).w1());
     assert_eq!(k.finish(), &[0x0291_C000_0000_008B]);
 }
+
+/// The forms the f16 path, the clamps and the blocks emit, against Mesa's assembler test vectors (assembler-cases.txt; not yet run on the device): an f32 operand widened from either f16 half, a v2f16 add with broadcast halves, an f32 add with a destination clamp and a negated absolute operand, and a NOP carrying a flow.
+#[test]
+fn mesa_vectors_f16_clamp_nop() {
+    let mut k = Kernel::<8>::new();
+    // 01 00 00 08 00 c0 a4 00: FADD.f32 r0, r1, r0.h1
+    k.fadd_f32(r(0), r(1), Float::from(r(0)).hi16());
+    // 01 00 00 04 00 c0 a4 00: FADD.f32 r0, r1, r0.h0
+    k.fadd_f32(r(0), r(1), Float::from(r(0)).lo16());
+    // 01 00 00 0c 00 c0 a5 00: FADD.v2f16 r0, r1.h00, r0.h11
+    k.fadd_v2f16(r(0), r(1).h00(), r(0).h11());
+    // 01 02 00 00 32 c0 a4 00: FADD.f32.clamp_m1_1 r0, r1, r2.neg.abs
+    k.fadd_f32(r(0), r(1), Operand::abs(r(2)).neg()).clamp(Clamp::MinusOneOne);
+    // 00 00 00 00 00 c0 00 78: NOP.end
+    k.nop().end();
+    same(k.finish(), &[0x00A4_C000_0800_0001, 0x00A4_C000_0400_0001, 0x00A5_C000_0C00_0001, 0x00A4_C032_0000_0201, 0x7800_C000_0000_0000]);
+}
