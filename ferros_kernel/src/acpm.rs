@@ -218,13 +218,34 @@ pub fn tmu_init() -> Result<u8, u32> {
     Ok((r[1] >> 8) as u8)
 }
 
+/// A TMU reply that names another zone than the one asked (`tmu_read`).
+pub const E_ZONE: u32 = 5;
+const TMU_IPC_GET_TARGET_FREQ: u32 = 0x18;
+const TMU_IPC_GET_TRIP_CNT: u32 = 0x21;
+
 /// One zone's temperature (`exynos_acpm_tmu_set_read_temp`): request word 1 = type | tzid << 16; reply word 1 = type | ret << 8 | tzid << 16 | temp << 24 (whole °C, the zone's hottest probe), word 2 byte 0 the zone's status and bytes 1-3 + word 3 the zone's probes one by one (zero past the last). Returns (temp, stat, probes).
+/// The reply's zone must be the one asked (E_ZONE otherwise): the reply is the firmware's word, and a reply matched to the wrong request (sequence numbers wrap at 63 across every channel) would put one zone's temperature under another's name, which nothing downstream could see.
 pub fn tmu_read(zone: u32) -> Result<(u8, u8, [u8; 7]), u32> {
     let r = call(TMU_CHANNEL, [0, TMU_IPC_READ_TEMP | (zone & 0xFF) << 16, 0, 0], true)?;
     let ret = (r[1] >> 8) as u8 as i8;
     if ret < 0 {
         return Err(E_FW | (ret as u8 as u32) << 8);
     }
+    if (r[1] >> 16) & 0xFF != zone & 0xFF {
+        return Err(E_ZONE | ((r[1] >> 16) & 0xFF) << 8);
+    }
     let p = [(r[2] >> 8) as u8, (r[2] >> 16) as u8, (r[2] >> 24) as u8, r[3] as u8, (r[3] >> 8) as u8, (r[3] >> 16) as u8, (r[3] >> 24) as u8];
     Ok(((r[1] >> 24) as u8, r[2] as u8, p))
+}
+
+/// The firmware thermal governor's target rate for a zone's cooled domain (`exynos_acpm_tmu_ipc_get_target_freq`, Linux's `fvp_get_target_freq`): reply word 2 bytes 1-3 and word 3 byte 0, little-endian. Read only.
+pub fn tmu_target_freq(zone: u32) -> Result<u32, u32> {
+    let r = call(TMU_CHANNEL, [0, TMU_IPC_GET_TARGET_FREQ | (zone & 0xFF) << 16, 0, 0], true)?;
+    Ok(r[2] >> 8 | (r[3] & 0xFF) << 24)
+}
+
+/// How often the firmware has seen a zone cross one of its eight trips (`exynos_acpm_tmu_ipc_get_trip_counter`, Linux's `trip_counter`): the trip's index in request word 2 byte 0, the count as reply words 2 and 3. Read only.
+pub fn tmu_trip_count(zone: u32, trip: u32) -> Result<u64, u32> {
+    let r = call(TMU_CHANNEL, [0, TMU_IPC_GET_TRIP_CNT | (zone & 0xFF) << 16, trip & 0xFF, 0], true)?;
+    Ok(r[2] as u64 | (r[3] as u64) << 32)
 }

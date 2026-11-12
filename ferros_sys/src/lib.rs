@@ -1056,9 +1056,13 @@ impl Facts {
     pub fn soc_temp_c(&self) -> Option<u64> {
         self.get(10)
     }
-    /// Whether the kernel has the big core's clock down for heat.
+    /// Whether the kernel's thermal policy holds a clock (the X3's, the A715s', the A510s' or the GPU's) under the rate the clock policy wants.
     pub fn throttled(&self) -> Option<bool> {
         self.get(11).map(|v| v != 0)
+    }
+    /// Which thermal zone is the hottest (fact 86, the one `soc_temp_c` reads): 0 the X3, 1 the A715s, 2 the A510s, 3 the GPU, 4 the camera ISP, 5 the TPU, 6 the AUR (the AoC's audio core).
+    pub fn soc_hottest_zone(&self) -> Option<u64> {
+        self.get(86)
     }
     /// The gravity vector the AoC last reported, m/s², in the panel's frame: x right, y up, z out of the glass (a device held upright reads y ≈ +9.8, one lying face up z ≈ +9.8). None until the sensors are up.
     pub fn gravity(&self) -> Option<[f32; 3]> {

@@ -51,6 +51,9 @@ mod panel_power;
 mod hsi2c;
 #[cfg(feature = "pixel8")]
 mod acpm;
+// The SoC's heat: the TMU zones, the clock dividers, the thermal policy's caps (docs/THERMAL.md).
+#[cfg(feature = "pixel8")]
+mod thermal;
 mod odpm;
 mod pd;
 #[cfg(feature = "pixel8")]
