@@ -306,7 +306,17 @@ pub extern "C" fn watch(grants: u64) -> ! {
         let asking = snap.jobs.iter().find(|j| j.kind == KIND_OFFER && j.stage == ASKING).map(|j| j.capsule);
         snap.offer = match asking {
             Some(c) if snap.offer.as_ref().is_some_and(|o| o.capsule == c) => snap.offer.take(),
-            Some(c) => read_offer(svc, &c),
+            Some(c) => {
+                let o = read_offer(svc, &c);
+                // One line as each offer reaches the map (or does not), so a run shows whether the page was ever told.
+                let mut l = Line::new();
+                let _ = match o.as_ref() {
+                    Some(o) => write!(l, "map: a kist offered over USB waits on the person: {}\n", o.name),
+                    None => write!(l, "map: the installer has a kist offered over USB waiting, but its offer did not read\n"),
+                };
+                ferros_sys::console(grants, l.as_str().as_bytes());
+                o
+            }
             None => None,
         };
         with(|x| *x = Some(snap.clone()));

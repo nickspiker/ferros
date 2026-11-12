@@ -2651,8 +2651,13 @@ impl Map {
         self.scroll = 0;
         self.fling = 0.;
         self.spring = None;
-        if !matches!(self.view, View::Open(_)) {
-            self.back = Some(self.cam);
+        // The page itself, not the page picker over it.
+        self.picker = false;
+        // The settings circle open and staying: the page is enough. Otherwise it opens: from the map (the way back kept), from a kist's circle (how its launch stopped, or its first-launch question; the way back to the map it kept stays), or from its own flight out (`leaving`). Until 2026-11-12 the page was set and a kist's circle stayed open, drawing its own page: Mahere's "it crashed" circle swallowed the first kist offered over USB, which then counted as shown and never opened again.
+        if self.view != View::Open(0) || self.leaving {
+            if !matches!(self.view, View::Open(_)) {
+                self.back = Some(self.cam);
+            }
             let to = self.at(0);
             self.view = View::Open(0);
             self.leaving = false;
@@ -5141,6 +5146,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut ask_seen: Option<(u8, [u8; NAME_BYTES], usize)> = None;
     // The kist offered over USB last opened the Kists page on (docs/KISTS.md "Stowing").
     let mut offer_seen: Option<[u8; 32]> = None;
+    // Whether the console was told that offer waits on an app in front (once an offer).
+    let mut offer_held_said = false;
     // The copy of the identity service last taken (`fgtw_poller`'s sequence count).
     let mut fleet_seen = 0u32;
     // Whether the Fleet page showed at the last pass (`FLEET_PAGE`).
@@ -5420,8 +5427,16 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             if offer.is_some() && offer != offer_seen {
                 map.show_page("kists");
                 map.draw();
+                console(grants, b"map: the Kists page opened on the kist offered over USB, Stow and Cancel ready\n");
             }
             offer_seen = offer;
+        } else if map.app_front && !offer_held_said && map.installer.offer.as_ref().is_some_and(|o| Some(o.capsule) != offer_seen) {
+            // Said once an offer: the page waits for the app in front to go behind (Home), as KISTS.md "Stowing" has it.
+            offer_held_said = true;
+            console(grants, b"map: a kist offered over USB waits for the app in front to go behind; the Kists page opens then\n");
+        }
+        if map.installer.offer.is_none() {
+            offer_held_said = false;
         }
 
         // The person's identity space (fgtw op 17's generation, in the copy), on the plane with nothing held: a new generation means the identity service wrote this device's kists or home screen from the person's fleet (a reset device getting its arrangement back, a move made on another of their devices), and the circles are read again. Generation 0 is nothing written yet; a map started after a write reads it once more, which changes nothing.
