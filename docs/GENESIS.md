@@ -8,7 +8,7 @@ Scoped and shelved for night work on 2026-11-11 (memory `genesis_kist_shelved`);
 - **Step A runs** (2026-11-11, the 8a): Sonic 2 (the owner's own ROM, loaded at run time) on the panel at three times the Genesis's pixels, square, picture up top; the pad below it; every button and the D-pad's eight directions read from the touch server's held contacts; one emulated frame a panel frame from the display's frame wait.
   Played by injected touches: Start out of the demo, the title, a game in Emerald Hill, Sonic run right on a held D-pad (its right nub lit while held).
 - **The pause page** (built the night of 2026-11-11, host-tested; not yet run on the 8a, which was off the USB bus all that night): back's Escape opens it over the game, which stops; Resume, Save state, Load state, Reset; Escape again resumes (below, "The pause page").
-- **Save states** (built, host-tested): VSF all the way, the emulator's every field by name thru a `vsf` feature on jgenesis (below, "Saves"); about 1.1 MB for Sonic 2; a state saved, the game moved on and the state loaded gives the same frames again.
+- **Save states** (built, host-tested): VSF all the way, the emulator's every field by name thru a `vsf` feature on jgenesis (below, "Saves"); about 340 KB for Sonic 2 (the VDP's frame buffer left out, redrawn by the next frame); a state saved, the game moved on and the state loaded gives the same frames again.
   Kept in the kist's memory until it ends: the store they belong in (STORE.md, a draft) does not exist yet, and the page says so.
 - **H32 columns** area-weighted (below, "The picture"); **the icon** made from the owner's picture (below, "The icon").
 - **No sound** (below, "Audio").
@@ -68,7 +68,7 @@ Scoped and shelved for night work on 2026-11-11 (memory `genesis_kist_shelved`);
   A pill fires on release: the finger that came down on it lifts while still over it (held, it is lit); a finger already down as the page opens is never the page's.
   - **Resume**: the game again (as Escape).
   - **Save state**: the state written (below, "Saves") and kept; the page stays, saying so, and Load is live from then on.
-  - **Load state**: the kept state of this game read back (whole and of this ROM, or refused, said on the page) and the game again, from there.
+  - **Load state**: the kept state of this game read back (whole and of this ROM, or refused, said on the page) and the game again, from there: the page closes and a frame is emulated before one is shown, so the first picture is the loaded game's next frame (whole: a state holds no frame buffer, below), never the frozen one.
   - **Reset**: the console's Reset button (jgenesis's soft reset: the 68000 and Z80 reset, RAM kept), and the game again.
   - **No Quit**: the house has none (home backgrounds a kist, back bottoms out at its main page; WINDOWS.md "The helm"), and quitting would drop a state kept in memory.
   Each action's time is said on the console (`diag console`).
@@ -138,7 +138,7 @@ The document carries its own rolling hash; reading it back checks it (`parse_doc
 The core writes the RAM when the game changes it; the shell makes the document, reads it back, keeps it in the store (below) and says so on the console.
 Sonic 2 has no battery RAM, so this path did not run on the device.
 
-**Save states** (built, jgenesis 04362e7 and d6f7413, the kist's `save.rs`): one complete VSF file per state, two sections, every value typed and named, no positions and no blob of another format:
+**Save states** (built, jgenesis 04362e7, d6f7413 and 329b3b0, the kist's `save.rs`): one complete VSF file per state, two sections, every value typed and named, no positions and no blob of another format:
 
 - `genesis_state`, the kist's: `rom` (`hp`, the ROM's BLAKE3), `title` (`a`), `saved` (`e`, Eagle Time).
 - `genesis_core`, the core's (`GenesisEmulator::save_vsf`, `load_vsf`): first `core` (`a`, "jgenesis 0.14.1 ferros": a state from another core is refused, never guessed at), then the emulator, every field by its own name, dots for nesting: `m68k.registers.data` (`t_u5` of 8), `m68k.registers.ccr.carry` (`u0`), `z80.registers.a` (`u3`), `bus.memory.main_ram` (`t_u3`, 64 KiB), `bus.vdp.vram`, `bus.ym2612.channels.operators.phase.f_number` (`t_u4`, 6 by 4: each channel's four operators), `bus.psg.noise_channel.lfsr` (`u4`), `bus.input.inputs.p1` (`d`, "six_button") and its buttons under it, and so on, 1346 fields under 600 names for Sonic 2.
@@ -148,15 +148,21 @@ The mapping is generic, so it is the core's structure exactly, nothing hand-pick
 - `#[derive(VsfState)]` (jgenesis-proc-macros) sits beside every bincode derive in the crates a Genesis state reaches, behind a `vsf` feature in each (off by default, so jgenesis's own frontends are unchanged); the runtime half is `jgenesis_common::vsf_state`.
 - A number is its sized VSF integer (`u3` for a `u8`, `i5` for an `i32`), a bool `u0`, a float `f5` or `f6`, a `usize` `u6`.
 - A run of numbers (an array, a vector, an array of arrays) is one tensor of their type shaped as the run is: VRAM is a `t_u3` of 65536, a 16 by 4 array a 16 by 4 tensor.
-- A run of structs is columns, one run a field, nested runs shaped by both: the VDP's frame buffer is four `t_u3` (`frame_buffer.r`, `.g`, `.b`, `.a`), not four fields a pixel (that first cut was 26 MB), and the YM2612's six channels of four operators are 6 by 4 tensors a field.
+- A run of structs is columns, one run a field, nested runs shaped by both: the VDP's 80 cached sprites are a `t_u4` and three `t_u3` (`bus.vdp.cached_sprite_attributes.v_position` and the rest), not four fields a sprite (a first cut did that to the frame buffer: 26 MB), and the YM2612's six channels of four operators are 6 by 4 tensors a field.
 - A run of anything else (an enum, an option) repeats its fields in order: the k-th `bus.ym2612.channels.operators.envelope.phase` (`d`, "attack" and the rest) is the k-th operator's, channel by channel; never a decimal index in a name. A vector of such elements says its length first, in a field of its own name.
 - An enum is a field of its own name holding its variant's name (`d`, snake case), its variant's fields under it; `None` a field of its own name with no value (a flag), `Some(x)` just `x`.
 - Text is ASCII (`a`): the core's strings are a CPU's label and cheat codes, and VSF's `x` encoder would carry its codebook (about 9 MB) into the image.
-- Left out: the ROM (`#[vsf(skip)]`: the game is not its state; the loaded emulator keeps its own, as jgenesis's `load_state` does), and the cheat overrides' 256 KiB address bitset (an index of the overrides, rebuilt on load). The Sega CD and 32X are not carried yet, so the feature refuses to build with them on.
+- Left out: the ROM (`#[vsf(skip)]`: the game is not its state; the loaded emulator keeps its own, as jgenesis's `load_state` does), and the cheat overrides' 256 KiB address bitset (an index of the overrides, rebuilt on load).
+  The VDP's frame buffer (owner, 2026-11-11, of its 816 KB in a 1.1 MB state: "Drop it to 340") is left out too: a state is taken between frames and the next frame writes every pixel it shows before anything reads one, so it loads cleared (black, as a new VDP's) and the first frame after a load is whole.
+  Only interlace without jgenesis's `deinterlace` (on in the kist) draws one field a frame, so there the first frame shows the other field black and the second is whole.
+  A state written with the frame buffer is refused by its fields (`bus.vdp.frame_buffer.r` where the next VDP field is expected); the core's name stays "jgenesis 0.14.1 ferros", since no such state outlived the run that saved it.
+  Not dropped: the line buffers (about 3 KB; the sprites scanned and the CRAM dots carry across a line), and the audio resamplers' input rings (about 140 KB, mostly dead space past each live window, whose live samples feed the first outputs after a load; saving the live windows alone would take a state near 200 KB, not done).
+  The Sega CD and 32X are not carried yet, so the feature refuses to build with them on.
 - The reader walks the same structure in the same order and refuses any field whose name or type is not the one expected there, and any left over.
 
-Tested on the host: a state thru a complete VSF file (read back verified) into another emulator is bincode-identical to the original (bincode the test oracle only, never stored) and runs on to the same frames; Sonic 2 after 128 frames is 1155714 bytes of VSF against 1134597 of bincode (the frame buffer is 816 KB of it).
-In the kist (`emu.rs` test `save_move_load`): saved, 40 frames on, loaded, the same 8 frames again; a state of another game refused.
+Tested on the host: a state thru a complete VSF file (read back verified) into another emulator saves the same fields again, bit for bit; it is bincode-identical to the original with that one's frame buffer cleared (bincode the test oracle only, never stored); both give the same frames from the first one after the load on, and after 64 frames are bincode-identical, frame buffers too.
+Sonic 2 after 128 frames is 339422 bytes of VSF (1155714 with the frame buffer, 1134597 of bincode with it).
+In the kist (`emu.rs` test `save_move_load`): saved, 41 frames on, loaded, the same first frame and the same 8 after it; a state of another game refused.
 
 **Where saves are kept** (owner, 2026-11-11: "Two permissions, saving under the kist key and saving under the user key. We'll have to work out the filesystem since it won't have a directory structure. Find items by content, date, who created, whatever but never in a directory tree").
 STORE.md (a draft for the owner's review) is that store, and Genesis its stage 0: items kept for the person, kinds "Sega Genesis save state" and "Sega Genesis battery RAM", found by `rom`.
