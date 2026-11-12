@@ -143,7 +143,7 @@ The MMU, not the compiler, keeps a kernel inside its memory, so the compiler is 
 ### 1.6 No right: every kist is handed the GPU (owner, 2026-11-11 and 2026-11-12)
 
 - No `gpu` in RIGHTS, no want, no question, no settings row: a kist computes on the GPU as it does on the CPU.
-- At launch the kernel gives every kist three slots after its wants (process.rs `kist_gpu`; ferros_sys::gpu `kist_slots`): `use gpu`, a block of the layer arena of its own (the largest free), and a second surface for a mailbox while another stays free for the next app's window. Any of them is an empty slot when there is none to give.
+- At launch the kernel gives every kist three slots after its wants (process.rs `kist_gpu`; ferros_sys::gpu `kist_slots`; after the leading implicit rights and its asked wants since 2026-11-12, KISTS.md "The implicit set"): `use gpu`, a block of the layer arena of its own (the largest free), and a second surface for a mailbox while another stays free for the next app's window. Any of them is an empty slot when there is none to give.
 - A production build gives three empty slots: a kist's GPU code is unchecked until the VSF kernel form and its checker exist, so it runs on development builds only, as its native code does; the GPU service also refuses a kist's job on a production build (status 5).
 
 ### 1.7 Failure modes

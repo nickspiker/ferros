@@ -448,7 +448,7 @@ fn fixed_arg() -> Option<u32> {
     args.iter().position(|a| a == "--fixed").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok())
 }
 
-/// A kist's declaration from the command line (KISTS.md): `--kist NAME` and each `--want RIGHT REASON` in slot order; None without `--kist`. A right outside the vocabulary, or a reason or name that is not printable ASCII (the list keeps them as `a`), stops here.
+/// A kist's declaration from the command line (KISTS.md): `--kist NAME` and each `--want RIGHT REASON` in slot order; None without `--kist`. A kist declares only the rights it is asked for; the implicit set (ferros_kist::IMPLICIT) it is handed without declaring it, and a `--want` for one of those is a placement, the right put in that slot and never asked (KISTS.md "The implicit set"). A right outside the vocabulary, or a reason or name that is not printable ASCII (the list keeps them as `a`), stops here.
 fn kist_arg() -> Option<ferros_kist::Decl> {
     let args: Vec<String> = std::env::args().collect();
     let name = args.iter().position(|a| a == "--kist").and_then(|i| args.get(i + 1)).cloned()?;
@@ -1107,6 +1107,7 @@ async fn cmd_kist_stow(path: &str) {
     println!("stowed {} ({} bytes, capsule {}), {} kist(s) in the person's list", k.name, capsule.len(), addr.iter().map(|b| format!("{b:02X}")).collect::<String>(), list.kists.len());
     for w in &k.wants {
         let a = match w.answer {
+            _ if !w.asked() => "always (the implicit set, never asked)",
             None => "unanswered (asked at its first launch)",
             Some((true, _)) => "granted",
             Some((false, _)) => "not granted",
@@ -1155,7 +1156,7 @@ async fn cmd_kist_answer(args: &[String]) {
     for k in &list.kists {
         println!("{} (capsule {})", k.name, k.capsule.iter().map(|b| format!("{b:02X}")).collect::<String>());
         for w in &k.wants {
-            println!("  {}: {}", ferros_kist::RIGHTS[w.right as usize], match w.answer { None => "unanswered", Some((true, _)) => "granted", Some((false, _)) => "not granted" });
+            println!("  {}: {}", ferros_kist::RIGHTS[w.right as usize], match w.answer { _ if !w.asked() => "always", None => "unanswered", Some((true, _)) => "granted", Some((false, _)) => "not granted" });
         }
     }
     println!("defaults: {}", ferros_kist::RIGHTS.iter().enumerate().filter(|(c, _)| list.defaults >> c & 1 == 1).map(|(_, r)| *r).collect::<Vec<_>>().join(", "));

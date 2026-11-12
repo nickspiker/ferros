@@ -164,7 +164,7 @@ extern "C" fn launcher(grants: u64) -> ! {
     }
 }
 
-/// One launch (or, `relaunch`, a running kist killed and launched again after the person changed an answer): the kist found in the person's list by its capsule, its slots from their answers (a right granted, or an empty slot), handed to the kernel, which checks them against the capsule itself. The reply's bytes and, last, how many of them go: the answer alone, or RUNNING with the surface and generation the running kist shows on (ferros_kist::launch::RUNNING).
+/// One launch (or, `relaunch`, a running kist killed and launched again after the person changed an answer): the kist found in the person's list by its capsule, a code per declared want from their answers (a right granted, or an empty slot; an implicit right always, ferros_kist `launch_codes`), handed to the kernel, which checks them against the capsule itself and lays the slots out (ferros_kist `slots`). The reply's bytes and, last, how many of them go: the answer alone, or RUNNING with the surface and generation the running kist shows on (ferros_kist::launch::RUNNING).
 fn launch(grants: u64, capsule: [u8; 32], relaunch: bool) -> [u8; 4] {
     use ferros_kist::launch::*;
     let one = |a: u8| [a, 0, 0, 1];

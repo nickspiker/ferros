@@ -559,7 +559,7 @@ pub enum Object {
     Vault,
     /// Served by the kernel, through the vault process: the holder's own vault domain (VAULT-OUT.md, "Kist, per person"), keyed by the kernel from the holder's ihi (the oracle over its developer key and option) under the person's key, so no kist opens another's data and none opens its own while no one is present. A process passes it on only as the same right: the child's is the child's own domain (`SYS_STORE` resolves it against the caller).
     Domain,
-    /// Served by the kernel: the right to launch a kist (KISTS.md): `SYS_SPAWN` in kist mode, naming a capsule by its vault address and handing each declared want its right or an empty slot. The kernel makes each right's object itself (`kist_object`), so the holder needs no other grant to hand out; it holds every right a kist may be handed, and is init's alone.
+    /// Served by the kernel: the right to launch a kist (KISTS.md): `SYS_SPAWN` in kist mode, naming a capsule by its vault address and handing each declared want its right or an empty slot; the implicit set (ferros_kist::IMPLICIT) the kernel hands every kist itself. The kernel makes each right's object itself (`kist_object`), so the holder needs no other grant to hand out; it holds every right a kist may be handed, and is init's alone.
     Kists,
     /// Served by the kernel: the right to stow a kist (SANDBOX.md "Lifecycle"): `SYS_SPAWN` in stow mode names a capsule the holder stored in `capsules.`, and the kernel reads it from the vault, gates it, runs the sandbox checker over its masked code and seals it into the `sealed` list, telling the holder each stage on a word in its own arc (`stow_request`). The stower's (payloads/kists), never a kist's.
     Stow,
@@ -5403,7 +5403,7 @@ fn kist_object(code: u8) -> Option<(Object, u32)> {
     })
 }
 
-/// The GPU, as every kist is handed it (owner, 2026-11-12: "I feel like GPU should be implicit. If I'm running it on my machine..."; GPU-KISTS.md 1.6): asked of no one, like its CPU time, three slots right after its wants (ferros_sys::gpu `kist_slots`): the GPU service (`use gpu`, every call stamped with the kist's own memory, `gpu_stamp`), a block of the layer arena of its own (the largest free, `NewRegion`), and a second surface for a mailbox (`SpareSurface`). Each an empty slot when there is none to give. A production build gives three empty slots: a kist's GPU programs run unchecked, so they run on development builds only until the checked kernel form exists (GPU-KISTS.md plan steps 3-6), as its native code does; the kist then draws on the CPU, and its slots keep their places.
+/// The GPU, as every kist is handed it (owner, 2026-11-12: "I feel like GPU should be implicit. If I'm running it on my machine..."; GPU-KISTS.md 1.6): asked of no one, like its CPU time, three slots right after its wants (ferros_sys::gpu `kist_slots`; `ferros_kist::slots` lays them out: after the leading implicit rights and the asked wants, or after a capsule's declared wants): the GPU service (`use gpu`, every call stamped with the kist's own memory, `gpu_stamp`), a block of the layer arena of its own (the largest free, `NewRegion`), and a second surface for a mailbox (`SpareSurface`). Each an empty slot when there is none to give. A production build gives three empty slots: a kist's GPU programs run unchecked, so they run on development builds only until the checked kernel form exists (GPU-KISTS.md plan steps 3-6), as its native code does; the kist then draws on the CPU, and its slots keep their places.
 fn kist_gpu() -> [(Object, u32); 3] {
     if cfg!(ferros_production) {
         return [(Object::Empty, 0); 3];
@@ -5411,7 +5411,7 @@ fn kist_gpu() -> [(Object, u32); 3] {
     [(Object::Endpoint(endpoint(b"gpu")), RIGHT_SEND), (Object::NewRegion(27), RIGHT_SEND | RIGHT_RECV), (Object::SpareSurface, RIGHT_SEND | RIGHT_RECV)]
 }
 
-/// `SYS_SPAWN` in kist mode (x2 bit 1; bit 2, a relaunch: a live process of that name killed first, NOTHING with none alive; bit 5, a stop: a live process of that name killed and nothing launched, 0 or NOTHING with none alive): [name length][name][the capsule's 32-byte vault address][the caller's Kists token, 32 bytes][n][n right codes, `EMPTY` for a slot said no to]. Queued for the service loop, which streams the capsule from the vault and checks every slot against the capsule's own declaration before anything runs (`spawn_kist`). 0 queued, NOTHING already running or starting, ERR refused (the reason on the console): no Kists right, a code outside the vocabulary, nobody present (a kist's data and rights are the person's), or another launch still streaming.
+/// `SYS_SPAWN` in kist mode (x2 bit 1; bit 2, a relaunch: a live process of that name killed first, NOTHING with none alive; bit 5, a stop: a live process of that name killed and nothing launched, 0 or NOTHING with none alive): [name length][name][the capsule's 32-byte vault address][the caller's Kists token, 32 bytes][n][n right codes, one a declared want in its order: the right, or `EMPTY` for an asked want said no to; for an implicit want what is sent does not matter, the kernel hands it anyway]. Queued for the service loop, which streams the capsule from the vault and checks every slot against the capsule's own declaration before anything runs (`spawn_kist`). 0 queued, NOTHING already running or starting, ERR refused (the reason on the console): no Kists right, a code outside the vocabulary, nobody present (a kist's data and rights are the person's), or another launch still streaming.
 fn kist_request(p: &Process, req: &[u8], replace: bool, stop: bool) -> u64 {
     let mut at = 0usize;
     let mut take = |n: usize| -> Vec<u8> { let s = req[at.min(req.len())..(at + n).min(req.len())].to_vec(); at += n; s };
@@ -5566,7 +5566,7 @@ pub type KistFault = (u8, &'static str);
 /// Not a fault: a process of the kist's name started while its capsule was read, so it runs and nothing is kept for the map.
 pub const KIST_ALREADY: u8 = u8::MAX;
 
-/// A kist whose capsule the service loop streamed from the vault into `arc` at the code offset (`total` bytes): it must be the capsule named (its blake3 is its vault address), pass the gate where it lies, and declare every right handed to it in the slot it is handed in (`ferros_kist::want_codes`: nothing undeclared can be granted). Masked code runs only with its seal in `sealed` (the stower's, `stow_kist`), the checker never run again; native code only in a development build (the bridge's `kist stow`). Then the code moves down, the rest is zeroed, and the process is built with exactly the launch's objects, queued to run, and what was kept of its last launch not starting dropped (`kist_started`). On any refusal the arc goes back to the pool, and the reason comes back as the map shows it (`ferros_kist::launch::why`).
+/// A kist whose capsule the service loop streamed from the vault into `arc` at the code offset (`total` bytes): it must be the capsule named (its blake3 is its vault address), pass the gate where it lies, and declare every asked right handed to it in the slot it is handed in (`ferros_kist::want_codes`: nothing undeclared can be asked for), the implicit set handed to it without a question in the slots `ferros_kist::slots` gives them. Masked code runs only with its seal in `sealed` (the stower's, `stow_kist`), the checker never run again; native code only in a development build (the bridge's `kist stow`). Then the code moves down, the rest is zeroed, and the process is built with exactly the layout's objects, queued to run, and what was kept of its last launch not starting dropped (`kist_started`). On any refusal the arc goes back to the pool, and the reason comes back as the map shows it (`ferros_kist::launch::why`).
 pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Result<(), KistFault> {
     use ferros_kist::launch::why;
     let mut arc = arc;
@@ -5604,9 +5604,9 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Resu
             core::ptr::copy((arc.base + CODE + co) as *const u8, (arc.base + CODE) as *mut u8, cl);
             core::ptr::write_bytes((arc.base + CODE + cl) as *mut u8, 0, total - cl);
         }
-        Ok((ihi, cl, modes))
+        Ok((ihi, cl, modes, wants))
     })();
-    let (ihi, cl, modes) = match r {
+    let (ihi, cl, modes, wants) = match r {
         Ok(x) => x,
         Err(e) => {
             with_lock(|| arc_free(arc));
@@ -5628,9 +5628,16 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Resu
             arc_free(arc);
             return Err((KIST_ALREADY, "kist: a process of that name started meanwhile"));
         }
-        // Every slot's object made here (`kist_object`), the codes checked at the request; then the GPU's (`kist_gpu`).
-        let mut objects: Vec<(Object, u32)> = l.codes.iter().filter_map(|&c| kist_object(c)).collect();
-        objects.extend_from_slice(&kist_gpu());
+        // Every slot's object made here, laid out from the capsule's own wants (`ferros_kist::slots`; KISTS.md "The implicit set"): an implicit right's object always, whatever init sent for it (owner, 2026-11-12: "Yes on the implicit set"), an asked want's as init sent it (its right or an empty slot, checked against the declaration above), the GPU's (`kist_gpu`). Every code is in the vocabulary (checked at the request), so `kist_object` makes each.
+        let gpu = kist_gpu();
+        let objects: Vec<(Object, u32)> = ferros_kist::slots(&wants)
+            .iter()
+            .filter_map(|s| match *s {
+                ferros_kist::Slot::Implicit(c) => kist_object(c),
+                ferros_kist::Slot::Asked(i) => kist_object(l.codes[i]),
+                ferros_kist::Slot::Gpu(g) => Some(gpu[g as usize]),
+            })
+            .collect();
         match build_from(&l.name, arc, cl, b"", &objects, Some(ihi), masked, exec_len, bti) {
             Ok((me, _, _)) => {
                 if let Some(q) = th(me).map(|t| t.proc).and_then(|pi| kk.procs.get_mut(pi)).and_then(|q| q.as_mut()) {
