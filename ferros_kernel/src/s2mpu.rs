@@ -149,9 +149,10 @@ static mut GPU_TABLE_SURFACES: Smpt = Smpt([0; 32768]);
 static GPU_RESULT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// The GPU's fence: read and write to `gpu-mem` (cachemap GPU_MEM) and the layer arena (LAYERS, both in one GiB), and the apps' surfaces (SURFACES, in the GiB above), nothing else, for every VID (only the GPU sits behind it; which VID its traffic arrives as is not measured yet). G#E4: pd_g3d not powered (left alone).
-/// The surfaces since 2026-11-11: an app whose frame is a GPU kernel's output (Mahere's map) has the GPU write its surface, the buffer the display composes, with no copy on the CPU (GPU-KISTS.md 1.4: a GPU layer is a buffer granted to its owner and the display). Every GPU client could write every app's surface, as every one shares the layer arena: the isolation is plan step 1's (each client its own address space).
+/// The surfaces since 2026-11-11: an app whose frame is a GPU kernel's output (Mahere's map) has the GPU write its surface, the buffer the display composes, with no copy on the CPU (GPU-KISTS.md 1.4: a GPU layer is a buffer granted to its owner and the display).
+/// This fence is the wall around every GPU client together (one bus master, every VID); the walls between clients are the GPU's own address spaces (GPU-KISTS.md plan step 1, 2026-11-12): the GPU service gives each client a space of its own that maps only the block of the arena and the surfaces it holds, as the kernel stamps every call on `gpu` (process.rs `gpu_stamp`). The arena is this board's (`cachemap::layers`: akita's upper half only).
 pub fn fence_gpu() -> u32 {
-    let (m, l, s) = (crate::cachemap::GPU_MEM, crate::cachemap::LAYERS, crate::cachemap::SURFACES);
+    let (m, l, s) = (crate::cachemap::GPU_MEM, crate::cachemap::layers(), crate::cachemap::SURFACES);
     let gb = m.0 >> 30;
     let sgb = s.0 >> 30;
     let r = if m.0 == m.1 {

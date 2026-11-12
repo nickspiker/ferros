@@ -100,10 +100,21 @@ pub const GPU_SNOOP: usize = GPU_MEM.1 - (2 << 20);
 pub const GPU_SNOOP: usize = 0;
 /// The layer arena (cold only; GPU.md "Layers", owner 2026-11-05): 128 MiB of Normal write-back, EL0 read/write, never executable memory where the GPU writes compute-dense layers (the Mandelbrot, glows) and the CPU composes them, or the CPU writes and the GPU reads, with no clean and no copy: the GPU maps it coherent and snoops the CPU's caches (GPU.md "Coherency"). In the GPU's fence beside gpu-mem. Free DRAM: the device tree reserves nothing in G#9800_0000-G#A000_0000 (USB's 4 MiB end at G#9740_0000), and memblock holds it plain memory (frames.rs: G#9740_0000-G#B61F_FFFF, no reservation). Granted as `layers`.
 /// 64 MiB at G#9C00_0000 until 2026-11-11, when Mahere's map moved to the GPU (GPU-KISTS.md): its cells' planes are a MiB each, and a screen at the Pro's texel density draws from up to fifty or so; the whole free range now, until kists have GPU memory of their own (plan step 1).
+/// husky's: memblock proves the whole 128 MiB. akita's is `LAYERS_AKITA` (`layers`).
 #[cfg(not(shim_handoff))]
 pub const LAYERS: (usize, usize) = (0x9800_0000, 0xA000_0000);
 #[cfg(shim_handoff)]
 pub const LAYERS: (usize, usize) = (0, 0);
+/// akita's arena (2026-11-12): the upper 64 MiB alone, G#9C00_0000-G#A000_0000, the range the 8a has run its GPU jobs in since 2026-11-09 (BOARDS.md: gputest's Mandelbrot there). Its memblock has not been captured (BOARDS.md "Memory map"), so G#9800_0000-G#9C00_0000 is unproven on it: never mapped for EL0, never fenced in for the GPU, never scrubbed, never handed out, until a capture proves it.
+#[cfg(not(shim_handoff))]
+pub const LAYERS_AKITA: (usize, usize) = (0x9C00_0000, 0xA000_0000);
+#[cfg(shim_handoff)]
+pub const LAYERS_AKITA: (usize, usize) = (0, 0);
+
+/// This board's layer arena: `LAYERS` on husky, `LAYERS_AKITA` on akita. The board is read at entry, before the table is built (board.rs).
+pub fn layers() -> (usize, usize) {
+    if crate::board::akita() { LAYERS_AKITA } else { LAYERS }
+}
 #[cfg(shim_handoff)]
 pub const GPU_MEM: (usize, usize) = (0, 0);
 
@@ -255,6 +266,7 @@ pub fn enable() -> bool {
     let (f0, f1) = DISPLAY_FB;
     let (h0, h1) = DISPLAY_HEAP;
     let (t0, t1) = DISPLAY_PHASES;
+    let lay = layers();
     let dma_ok = q0 == q1 || (q0 % MIB2 == 0 && q1 % MIB2 == 0 && q0 >= w0 && q1 <= w1 && (q1 <= p0 || q0 >= p1) && (q1 <= d0 || q0 >= d1));
     // The framebuffers and the display heap sit outside the window but in its GiB (so the level-2 table covers them), 2 MiB aligned, apart from each other.
     let outside = |a: usize, b: usize| a == b || (a % MIB2 == 0 && b % MIB2 == 0 && a / GIB == w0 / GIB && (b - 1) / GIB == w0 / GIB && (b <= w0 || a >= w1));
@@ -286,7 +298,7 @@ pub fn enable() -> bool {
                 dma_pool(vhe, a, BLOCK)
             } else if a >= AOC_IPC.0 && a + MIB2 <= AOC_IPC.1 {
                 device_el0(vhe, a, BLOCK)
-            } else if (h0 != h1 && a >= h0 && a + MIB2 <= h1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 + USB_DMA_NC && a + MIB2 <= USB_DMA.1) || (GPU_MEM.0 != GPU_MEM.1 && a == GPU_SNOOP) || (LAYERS.0 != LAYERS.1 && a >= LAYERS.0 && a + MIB2 <= LAYERS.1) {
+            } else if (h0 != h1 && a >= h0 && a + MIB2 <= h1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 + USB_DMA_NC && a + MIB2 <= USB_DMA.1) || (GPU_MEM.0 != GPU_MEM.1 && a == GPU_SNOOP) || (lay.0 != lay.1 && a >= lay.0 && a + MIB2 <= lay.1) {
                 pool(vhe, a, BLOCK) | UXN
             } else if in_frames(a) {
                 // A frame of the pool (the page pool's and the big pool's ranges until 2026-11-11): the kernel's, by its own address; a process reaches it only through its window.

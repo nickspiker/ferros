@@ -565,6 +565,10 @@ pub enum Object {
     Install,
     /// A slot left empty: a want the person said no to (owner, 2026-11-08: "a denied right is an empty slot, never a fake"). Its token is zeros and nothing looks it up.
     Empty,
+    /// A region of the layer arena to be (GPU-KISTS.md plan step 1, 2026-11-12): a spawn turns it into the largest free block of the arena no larger than 2^n bytes, the child's own (`Dma` of a `layers-block`), wiped as it is given (`region_take`); an empty slot when none is free. Never held, as `NewSurface` is not: a parent that passes the whole arena passes a 32 MiB one of these instead (SYS_SPAWN).
+    NewRegion(u8),
+    /// A second surface to be, for a kist's GPU mailbox (GPU-KISTS.md 1.4): a spawn turns it into a free surface when the child already got its window's and another stays free for the next app's window; an empty slot otherwise.
+    SpareSurface,
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -612,6 +616,8 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Kists => (20, 0),
         Object::Empty => (21, 0),
         Object::Install => (22, 0),
+        Object::NewRegion(n) => (23, n as u64),
+        Object::SpareSurface => (24, 0),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -1073,7 +1079,7 @@ impl Process {
         // The address and length are the process's: an end that wraps would pass the comparison below.
         let end = a.checked_add(len)?;
         self.cspace.iter().find_map(|c| match c.object {
-            Object::Dma(i) if DMA[i].size > 0 && a >= DMA[i].base && end <= DMA[i].base + DMA[i].size => Some(a),
+            Object::Dma(i) if region(i).1 > 0 && a >= region(i).0 && end <= region(i).0 + region(i).1 => Some(a),
             _ => None,
         })
     }
@@ -1663,8 +1669,16 @@ pub static DMA: &[Dma] = &[
     // The GPU driver process (GPU.md): the GPU's registers and doorbells, mapped for EL0 (Device), and the memory it and the GPU share (Normal non-cacheable; the GPU's S2MPU holds it to this).
     Dma { name: "gpu-regs", base: crate::cachemap::GPU_REGS.0, size: crate::cachemap::GPU_REGS.1 - crate::cachemap::GPU_REGS.0 },
     Dma { name: "gpu-mem", base: crate::cachemap::GPU_MEM.0, size: crate::cachemap::GPU_MEM.1 - crate::cachemap::GPU_MEM.0 },
-    // The layer arena (cachemap LAYERS): CPU write-back, the GPU coherent; the GPU driver and the display server share it.
-    Dma { name: "layers", base: crate::cachemap::LAYERS.0, size: crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0 },
+    // The layer arena whole (cachemap LAYERS; on akita its upper half, `cachemap::layers`, answered by `region`): CPU write-back, the GPU coherent. The GPU service's (it reads a client's kernel from the client's own block) and init's to pass on, which passes a block of it (SYS_SPAWN); no client holds it whole (GPU-KISTS.md plan step 1, 2026-11-12).
+    Dma { name: "arena", base: crate::cachemap::LAYERS.0, size: crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0 },
+    // The arena's blocks, each a GPU client's own region when given (`NewRegion`, `region_take`): the whole, its halves, its quarters, largest first, each a power of two at a base aligned to it so a masked client reaches it thru a handle. Must stay consecutive and in this order: `block0() + j` is block j (`LAYER_BLOCKS`). Never granted by name (`resolve`).
+    Dma { name: "layers-block", base: crate::cachemap::LAYERS.0, size: crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0 },
+    Dma { name: "layers-block", base: crate::cachemap::LAYERS.0, size: (crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 1 },
+    Dma { name: "layers-block", base: crate::cachemap::LAYERS.0 + ((crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 1), size: (crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 1 },
+    Dma { name: "layers-block", base: crate::cachemap::LAYERS.0, size: (crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 2 },
+    Dma { name: "layers-block", base: crate::cachemap::LAYERS.0 + ((crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 2), size: (crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 2 },
+    Dma { name: "layers-block", base: crate::cachemap::LAYERS.0 + 2 * ((crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 2), size: (crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 2 },
+    Dma { name: "layers-block", base: crate::cachemap::LAYERS.0 + 3 * ((crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 2), size: (crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 2 },
     // The AoC's IPC control block and its services' rings (aoc.rs IPC, cachemap.rs AOC_IPC), EL0 Device memory for the sensors process: com.google.usf's rings lie in its first G#85000 bytes.
     Dma { name: "aoc-ipc", base: crate::cachemap::AOC_IPC.0, size: crate::cachemap::AOC_IPC.1 - crate::cachemap::AOC_IPC.0 },
     Dma { name: "display-fb", base: crate::cachemap::DISPLAY_FB.0, size: crate::cachemap::DISPLAY_FB.1 - crate::cachemap::DISPLAY_FB.0 },
@@ -1699,8 +1713,11 @@ static mut SURFACE_GEN: u8 = 0;
 /// Give surface k to the process with `epoch`: the first free one, its generation byte to every process. Under the lock.
 fn surface_take(epoch: u64) -> Option<usize> {
     let owners = unsafe { &mut *(&raw mut SURFACE_OWNER) };
-    let k = owners.iter().position(|&o| o == 0)?;
+    let draining = unsafe { GPU_DRAINING } >> 8;
+    let k = (0..SURFACE_COUNT).find(|&k| owners[k] == 0 && draining >> k & 1 == 0)?;
     owners[k] = epoch;
+    // Wiped as it is given (2026-11-12): the GPU writes a surface its owner holds (GPU-KISTS.md plan step 1), and neither its kernels nor its CPU read the last owner's pixels.
+    wipe(crate::cachemap::SURFACES.0 + k * crate::cachemap::SURFACE_SIZE, crate::cachemap::SURFACE_SIZE);
     // The generation cycles 1-255: 0 means free.
     let g = unsafe { SURFACE_GEN = SURFACE_GEN % 255 + 1; SURFACE_GEN };
     unsafe { (*(&raw mut PREFS_NOW))[PREF_SURFACES + k] = g };
@@ -1743,6 +1760,120 @@ fn surfaces_ring() {
     let v = ((was >> 32) + 1) << 32 | live;
     SURFACES_LIVE.store(v, core::sync::atomic::Ordering::Release);
     bell_ring(BELL_SURFACES, v);
+}
+
+/// The layer arena's blocks in `DMA` (`layers-block`): the whole, its halves, its quarters.
+pub const LAYER_BLOCKS: usize = 7;
+fn block0() -> usize {
+    DMA.iter().position(|r| r.name == "layers-block").unwrap()
+}
+/// Each block's owner, by process epoch (0: free). Under the kernel lock.
+static mut BLOCK_OWNER: [u64; LAYER_BLOCKS] = [0; LAYER_BLOCKS];
+/// Blocks (bit j) and surfaces (bit 8 + k) whose owner ended while a job of its was on the GPU: not given out again until the GPU service has taken its next request, so that job, still running, writes nothing a new owner holds (`gpu_drain`). Under the kernel lock.
+static mut GPU_DRAINING: u16 = 0;
+
+/// DMA region `i`'s base and size as this board has it: the whole arena is akita's upper half there (`cachemap::layers`); every other region as `DMA` lists it.
+fn region(i: usize) -> (usize, usize) {
+    if DMA[i].name == "arena" {
+        let (a, b) = crate::cachemap::layers();
+        return (a, b - a);
+    }
+    (DMA[i].base, DMA[i].size)
+}
+
+/// Give the process with `epoch` the largest free block of the arena no larger than `most` bytes, wiped: its own region for the GPU (GPU-KISTS.md plan step 1, 2026-11-12). Blocks outside this board's arena (akita's lower half) are never given. A block is free when no block over the same memory is held or draining. Returns its index among the blocks. Under the lock.
+fn region_take(epoch: u64, most: usize) -> Option<usize> {
+    let (l0, l1) = crate::cachemap::layers();
+    let b0 = block0();
+    let owners = unsafe { &mut *(&raw mut BLOCK_OWNER) };
+    let draining = unsafe { GPU_DRAINING };
+    let busy = |i: usize| owners[i] != 0 || draining >> i & 1 == 1;
+    let meets = |i: usize, j: usize| DMA[b0 + i].base < DMA[b0 + j].base + DMA[b0 + j].size && DMA[b0 + j].base < DMA[b0 + i].base + DMA[b0 + i].size;
+    // The table lists the blocks largest first, so the first that fits is the largest free.
+    let j = (0..LAYER_BLOCKS).find(|&j| {
+        let r = &DMA[b0 + j];
+        r.size > 0 && r.size <= most && r.base >= l0 && r.base + r.size <= l1 && !(0..LAYER_BLOCKS).any(|i| busy(i) && meets(i, j))
+    })?;
+    owners[j] = epoch;
+    // Wiped as it is given: the last owner's bytes (another kist's map, another's mark) are never the next one's to read, on the CPU or the GPU.
+    wipe(DMA[b0 + j].base, DMA[b0 + j].size);
+    Some(j)
+}
+
+/// Zero `size` bytes of DRAM at `base` (64-byte aligned, Normal memory the kernel maps), by `dc zva`, as the scrub before a reset does: about 1.5 ms for 32 MiB on the X3 (not measured on this path yet), under the lock; a spawn is rare.
+fn wipe(base: usize, size: usize) {
+    let mut a = base;
+    while a < base + size {
+        unsafe { core::arch::asm!("dc zva, {a}", a = in(reg) a) };
+        a += 64;
+    }
+    unsafe { core::arch::asm!("dsb ish") };
+}
+
+/// The blocks of the process with `epoch` back to free (or to draining, `gpu_drain`). Under the lock.
+fn regions_free(epoch: u64) {
+    let owners = unsafe { &mut *(&raw mut BLOCK_OWNER) };
+    for o in owners.iter_mut().filter(|o| **o == epoch) {
+        *o = 0;
+    }
+}
+
+/// Whether a thread of process `pi` has a call on the `gpu` endpoint that its server has taken and not answered: a job of its may be on the GPU now. Looked at before the process's reply tokens are dropped (`end_process`, `kill_locked`). Under the lock.
+fn gpu_job_in_flight(pi: usize) -> bool {
+    let kk = k();
+    let ep = endpoint(b"gpu");
+    let mine = |t: usize| kk.threads.get(t).and_then(|x| x.as_ref()).is_some_and(|x| x.proc == pi);
+    kk.procs.iter().flatten().any(|q| q.cspace.iter().any(|c| matches!(c.object, Object::Endpoint(e) if e == ep) && c.rights & RIGHT_RECV != 0) && q.cspace.iter().any(|c| matches!(c.object, Object::Reply(t) if mine(t))))
+}
+
+/// A process ending with a GPU job in flight (`gpu_job_in_flight`): its blocks and surfaces held back from the next owner until the GPU service takes its next request (`gpu_drained`). The service runs one job at a time and ends a job it gives up on (its group terminated) before it takes the next request, so by then nothing of the ended process's runs on the GPU. Called before its blocks and surfaces are freed. Under the lock.
+fn gpu_drain(epoch: u64) {
+    let owners = unsafe { &*(&raw const BLOCK_OWNER) };
+    let surf = unsafe { &*(&raw const SURFACE_OWNER) };
+    let mut d = unsafe { GPU_DRAINING };
+    for (j, &o) in owners.iter().enumerate() {
+        if o == epoch {
+            d |= 1 << j;
+        }
+    }
+    for (k, &o) in surf.iter().enumerate() {
+        if o == epoch {
+            d |= 1 << (8 + k);
+        }
+    }
+    unsafe { GPU_DRAINING = d };
+}
+
+/// The kernel's stamp ahead of every call on the `gpu` endpoint (GPU-KISTS.md plan step 1, 2026-11-12; ferros_sys::gpu `Stamp` reads it): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build][n u8][n × (base u64, size u64)], the regions every GPU-reachable DMA grant it holds (inside this board's layer arena or the apps' surfaces: its block, its surfaces). Written here, in front of the caller's bytes, for every call, so no caller can write one: the service maps a client's address space from these regions and from nothing a client says. Under the lock.
+fn gpu_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
+    let (l0, l1) = crate::cachemap::layers();
+    let (s0, s1) = crate::cachemap::SURFACES;
+    let inside = |b: usize, n: usize, lo: usize, hi: usize| lo != hi && b >= lo && b + n <= hi;
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+    for c in &p.cspace {
+        if let Object::Dma(i) = c.object {
+            let (b, n) = region(i);
+            if n > 0 && (inside(b, n, l0, l1) || inside(b, n, s0, s1)) && !regions.contains(&(b, n)) {
+                regions.push((b, n));
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(10 + 16 * regions.len() + msg.len());
+    out.extend_from_slice(&p.epoch.to_le_bytes());
+    out.push(p.kist as u8 | (cfg!(ferros_production) as u8) << 1);
+    // WHY no check: a process holds a handful of DMA grants (init, the most, about a dozen), far under the byte's 255.
+    out.push(regions.len() as u8);
+    for (b, n) in regions {
+        out.extend_from_slice(&(b as u64).to_le_bytes());
+        out.extend_from_slice(&(n as u64).to_le_bytes());
+    }
+    out.extend_from_slice(&msg);
+    out
+}
+
+/// The GPU service took a request: whatever waited for its last job to end may be given out again. Under the lock.
+fn gpu_drained() {
+    unsafe { GPU_DRAINING = 0 };
 }
 
 /// Whether process `p` holds the `surfaces` region (the display server: it composes every app's surface, so it alone may watch their owners).
@@ -1910,6 +2041,8 @@ fn call_endpoint(f: &mut Frame, cur: usize, ep: usize, msg: Vec<u8>, roff: u64, 
     t.state = State::Calling(roff, rcap);
     t.frame = *f;
     tr(TR_CALL, cur, ep as u64);
+    // A call on the GPU service goes in behind the kernel's stamp of who calls and what GPU memory it holds (`gpu_stamp`): the service maps the job's address space from it alone, never from the caller's word.
+    let msg = if kk.endpoints[ep].name == b"gpu" { gpu_stamp(p, msg) } else { msg };
     kk.endpoints[ep].queue.push_back((cur, msg));
     wake_server(ep, true);
     if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
@@ -2439,8 +2572,9 @@ fn nearest_region(p: &Process, addr: usize) -> alloc::string::String {
     };
     consider(p.arc.base, p.arc.size, "its arc", true);
     for (i, r) in DMA.iter().enumerate() {
-        if r.size > 0 {
-            consider(r.base, r.size, r.name, p.cspace.iter().any(|c| c.object == Object::Dma(i)));
+        let (base, size) = region(i);
+        if size > 0 {
+            consider(base, size, r.name, p.cspace.iter().any(|c| c.object == Object::Dma(i)));
         }
     }
     best.map(|b| b.1).unwrap_or_default()
@@ -3794,6 +3928,13 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     }
                     // The whole surfaces region passes as one surface of it, the child's own.
                     Some((Object::Dma(i), r)) if DMA[i].name == "surfaces" => objects.push((Object::NewSurface, r)),
+                    // The whole layer arena passes as a 32 MiB block of it, the child's own (GPU-KISTS.md plan step 1, 2026-11-12): init hands the attest screen its region this way.
+                    Some((Object::Dma(i), r)) if DMA[i].name == "arena" => objects.push((Object::NewRegion(25), r)),
+                    // A block of the arena is its owner's alone: freed when that owner ends (`regions_free`), it could not stay a child's.
+                    Some((Object::Dma(i), _)) if DMA[i].name == "layers-block" => {
+                        bad = true;
+                        bad_at = bad_at.min(j);
+                    }
                     Some(o) => objects.push(o),
                 }
             }
@@ -3909,6 +4050,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
             if let Some((Object::Endpoint(ep), r)) = p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                 if r & RIGHT_RECV != 0 {
                     kk.endpoints[ep].server = p.epoch;
+                    // The GPU service asks for its next request only once its last job is over (done, or its group ended): what an ended client's job could still have written is free to give out again.
+                    if kk.endpoints[ep].name == b"gpu" {
+                        gpu_drained();
+                    }
                 }
             }
             match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
@@ -3978,9 +4123,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let token = p.read(f.x[0], 32);
             f.x[0] = match p.lookup(&token).map(|i| p.cspace[i].object) {
                 // x1 = 1: the region's size in bytes instead (2026-11-11: the GPU service maps the layer arena by it, which grew from 64 to 128 MiB; a kernel from before answers the base to every call, which a caller tells by its being far past any size).
-                Some(Object::Dma(i)) if DMA[i].size > 0 && f.x[1] == 1 => DMA[i].size as u64,
+                Some(Object::Dma(i)) if region(i).1 > 0 && f.x[1] == 1 => region(i).1 as u64,
                 // A surface is answered past its porch (cachemap SURFACE_PORCH); every other region at its base.
-                Some(Object::Dma(i)) if DMA[i].size > 0 => (DMA[i].base + if DMA[i].name.starts_with("surface-") { crate::cachemap::SURFACE_PORCH } else { 0 }) as u64,
+                Some(Object::Dma(i)) if region(i).1 > 0 => (region(i).0 + if DMA[i].name.starts_with("surface-") { crate::cachemap::SURFACE_PORCH } else { 0 }) as u64,
                 _ => ERR,
             };
             0
@@ -4653,6 +4798,8 @@ fn end_process(pi: usize, cur: usize, value: u64) {
     // akita bring-up: a process ending (the usb process is the only one there) resets plainly in a FERROS_PROBE=8 build, so it reads apart from the power-up probes 81-85 (board.rs).
     crate::board::probe_log(86);
     let kk = k();
+    // Looked at before its threads' calls are dropped below: a job of its on the GPU keeps its blocks and surfaces from the next owner until it is over (`gpu_drain`).
+    let gpu_busy = gpu_job_in_flight(pi);
     let mine: Vec<usize> = kk.threads.iter().enumerate().filter(|(_, x)| matches!(x, Some(x) if x.proc == pi)).map(|(i, _)| i).collect();
     // A thread running on another core right now is left to leave at its own next trap (`drain_dying`): its arc must stay until then.
     let elsewhere = mine.iter().any(|&i| i != cur && on_a_core(i));
@@ -4682,7 +4829,11 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         let name = p.name.clone();
         // A kist ended by a fault or a panic: kept for the map's circle (`kist_stopped`).
         kist_stopped(p, value);
+        if gpu_busy {
+            gpu_drain(p.epoch);
+        }
         surfaces_free(p.epoch);
+        regions_free(p.epoch);
         crate::sensorlink::ended(p.epoch);
         power_orphaned(p.epoch);
         claims_orphaned(p.epoch);
@@ -4909,7 +5060,11 @@ fn kill_locked(name: &[u8]) -> bool {
     if kk.procs[i].as_ref().unwrap().kist {
         bell_count(BELL_KISTS);
     }
+    if gpu_job_in_flight(i) {
+        gpu_drain(kk.procs[i].as_ref().unwrap().epoch);
+    }
     surfaces_free(kk.procs[i].as_ref().unwrap().epoch);
+    regions_free(kk.procs[i].as_ref().unwrap().epoch);
     crate::sensorlink::ended(kk.procs[i].as_ref().unwrap().epoch);
     power_orphaned(kk.procs[i].as_ref().unwrap().epoch);
     claims_orphaned(kk.procs[i].as_ref().unwrap().epoch);
@@ -5181,6 +5336,14 @@ fn kist_object(code: u8) -> Option<(Object, u32)> {
     })
 }
 
+/// The GPU, as every kist is handed it (owner, 2026-11-12: "I feel like GPU should be implicit. If I'm running it on my machine..."; GPU-KISTS.md 1.6): asked of no one, like its CPU time, three slots right after its wants (ferros_sys::gpu `kist_slots`): the GPU service (`use gpu`, every call stamped with the kist's own memory, `gpu_stamp`), a block of the layer arena of its own (the largest free, `NewRegion`), and a second surface for a mailbox (`SpareSurface`). Each an empty slot when there is none to give. A production build gives three empty slots: a kist's GPU programs run unchecked, so they run on development builds only until the checked kernel form exists (GPU-KISTS.md plan steps 3-6), as its native code does; the kist then draws on the CPU, and its slots keep their places.
+fn kist_gpu() -> [(Object, u32); 3] {
+    if cfg!(ferros_production) {
+        return [(Object::Empty, 0); 3];
+    }
+    [(Object::Endpoint(endpoint(b"gpu")), RIGHT_SEND), (Object::NewRegion(27), RIGHT_SEND | RIGHT_RECV), (Object::SpareSurface, RIGHT_SEND | RIGHT_RECV)]
+}
+
 /// `SYS_SPAWN` in kist mode (x2 bit 1; bit 2, a relaunch: a live process of that name killed first, NOTHING with none alive; bit 5, a stop: a live process of that name killed and nothing launched, 0 or NOTHING with none alive): [name length][name][the capsule's 32-byte vault address][the caller's Kists token, 32 bytes][n][n right codes, `EMPTY` for a slot said no to]. Queued for the service loop, which streams the capsule from the vault and checks every slot against the capsule's own declaration before anything runs (`spawn_kist`). 0 queued, NOTHING already running or starting, ERR refused (the reason on the console): no Kists right, a code outside the vocabulary, nobody present (a kist's data and rights are the person's), or another launch still streaming.
 fn kist_request(p: &Process, req: &[u8], replace: bool, stop: bool) -> u64 {
     let mut at = 0usize;
@@ -5385,8 +5548,9 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Resu
             arc_free(arc);
             return Err((KIST_ALREADY, "kist: a process of that name started meanwhile"));
         }
-        // Every slot's object made here (`kist_object`), the codes checked at the request.
-        let objects: Vec<(Object, u32)> = l.codes.iter().filter_map(|&c| kist_object(c)).collect();
+        // Every slot's object made here (`kist_object`), the codes checked at the request; then the GPU's (`kist_gpu`).
+        let mut objects: Vec<(Object, u32)> = l.codes.iter().filter_map(|&c| kist_object(c)).collect();
+        objects.extend_from_slice(&kist_gpu());
         match build_from(&l.name, arc, cl, b"", &objects, Some(ihi), masked, exec_len, bti) {
             Ok((me, _, _)) => {
                 if let Some(q) = th(me).map(|t| t.proc).and_then(|pi| kk.procs.get_mut(pi)).and_then(|q| q.as_mut()) {
@@ -5675,6 +5839,10 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
             },
             Grant::Entropy => (Object::Entropy, RIGHT_SEND),
             Grant::Dma(b"surface") => (Object::NewSurface, RIGHT_SEND | RIGHT_RECV),
+            // A region of the layer arena of its own (GPU-KISTS.md plan step 1, 2026-11-12): `layers` the largest block free (a kist's ask, and Mahere's development spawn), `layers-32` a 32 MiB one (wallgen's, gputest's); a block is never granted by name, only given.
+            Grant::Dma(b"layers") => (Object::NewRegion(27), RIGHT_SEND | RIGHT_RECV),
+            Grant::Dma(b"layers-32") => (Object::NewRegion(25), RIGHT_SEND | RIGHT_RECV),
+            Grant::Dma(b"layers-block") => return Err("an arena block is given (`layers`, `layers-32`), never named"),
             Grant::Dma(n) => match DMA.iter().position(|r| r.name.as_bytes() == *n) {
                 Some(i) => (Object::Dma(i), RIGHT_SEND | RIGHT_RECV),
                 None => return Err("no such DMA region"),
@@ -5798,9 +5966,28 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
                 // A spawn refused after a surface was given (a second surface, or the grants page full below) gives it back: no process of that epoch will ever end to free it, and a surface held by nobody is lost until a reboot.
                 None => {
                     surfaces_free(epoch);
+                    regions_free(epoch);
                     return Err("no free surface (four are in use)");
                 }
             },
+            // A region of the arena: the largest free block up to 2^n, or an empty slot (the client then has no GPU memory and draws on the CPU, as without the GPU service).
+            Object::NewRegion(n) => match region_take(epoch, 1 << n) {
+                Some(j) => Object::Dma(block0() + j),
+                None => {
+                    k().console.extend_from_slice(b"spawn: no block of the layer arena is free: an empty slot for the region\n");
+                    Object::Empty
+                }
+            },
+            // The GPU mailbox's second surface: only beside a surface of its own already given, and only while another stays free for the next app's window.
+            Object::SpareSurface => {
+                let owners = unsafe { &*(&raw const SURFACE_OWNER) };
+                let free = owners.iter().filter(|&&o| o == 0).count();
+                let has = cspace.iter().any(|c| matches!(c.object, Object::Dma(i) if DMA[i].name.starts_with("surface-")));
+                match (has && free >= 2).then(|| surface_take(epoch)).flatten() {
+                    Some(s) => Object::Dma(surface0() + s),
+                    None => Object::Empty,
+                }
+            }
             o => o,
         };
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
@@ -5815,6 +6002,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // The tokens end at PREFS_HI (G#FB0, the second preferences block, then the first at G#FC0 and the ihi at G#FE0): a 109th slot's token was once written over the preferences and overwritten by the next preferences write, so init's spawn of the GPU service was refused for a token it held (2026-11-05). Refused here, with the reason, rather than corrupted.
     if TOKENS + 4 + 32 * cspace.len() > PREFS_HI {
         surfaces_free(epoch);
+        regions_free(epoch);
         return Err("spawn: more grants than the grants page holds (108 slots and the console)");
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };
@@ -5909,7 +6097,7 @@ fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<us
 /// A granted region as a handle (SANDBOX.md, "Handles"): its base and its mask, for masked code to reach it as `base + (offset & mask)`. A region is maskable when it is a power of two in size and aligned to it; an MMIO block of any other size (20 KiB, 52 KiB, 3.5 MiB) gets no handle and is reached through the kernel's mmio calls instead, never rounded up over its neighbours. A grant that is not a region, or a region that cannot be masked, is (0, 0): native code reaches it as it always has, masked code cannot.
 fn handle_of(object: Object) -> (u64, u64) {
     let (base, size) = match object {
-        Object::Dma(i) => (DMA[i].base, DMA[i].size),
+        Object::Dma(i) => region(i),
         Object::Hardware(h) if !HARDWARE[h].via_el3 => (HARDWARE[h].base, HARDWARE[h].size),
         _ => return (0, 0),
     };

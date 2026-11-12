@@ -56,8 +56,8 @@ const S_GPU: u64 = 3;
 const S_LAYERS: u64 = 4;
 static mut GRANTS: u64 = 0;
 
-/// The GPU's view of the layer arena (payloads/gpu ARENA_VA), and wallgen's region of it: the first 32 MiB, which gputest's bench also uses (never at once: gputest is a development tool the bridge spawns); ahau's is above (payloads/ahau GPU_CODE, 32 MiB on).
-const ARENA_VA: u64 = 0x8000_0000;
+/// The GPU's view of wallgen's own block of the layer arena (32 MiB, the kernel's to give, `layers-32`: GPU-KISTS.md plan step 1, 2026-11-12; ferros_sys::gpu ARENA_VA), offsets into the block.
+const ARENA_VA: u64 = ferros_sys::gpu::ARENA_VA;
 const REGION: usize = 32 << 20;
 /// The frame at the region's start (working values, `wallpaper::pack`'s, w × h of them, then room for the 15 a last workgroup writes past them); the survey's counts and distances there too, before the frame is drawn.
 const FRAME: usize = 0;
@@ -188,7 +188,7 @@ pub extern "C" fn wall_main(g: u64, input: u64, input_len: u64) -> ! {
         say!("wallgen: no layer arena granted; no wallpaper");
         ferros_sys::exit(1);
     }
-    // The region: the frame and the 15 pixels a last workgroup writes past it, the list, then the code. WHY the check: the screen's size comes from the display, and a frame past the region would run into ahau's part of the arena.
+    // The region: the frame and the 15 pixels a last workgroup writes past it, the list, then the code. WHY the check: the screen's size comes from the display, and a frame past the block would fault on the GPU (nothing past it is mapped for wallgen) and wrap on the CPU.
     let n = w * h;
     let list = (FRAME + 8 * (n + 16)).next_multiple_of(1 << 12);
     let code = list + 4 * CHUNK;

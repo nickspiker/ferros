@@ -14,7 +14,7 @@
 //!
 //! A first entry is not a claim (2026-10-28, after it let a person in under a handle that already had a fleet): the handle's roots go into the vault and the identity service (fgtw) looks the identity up, its fleet's devices nearby first and fgtw.org last (photon docs/pairing-v2.md, peers-are-fgtw.md). A fleet: this device joins it, its pairing words shown for one of the fleet's devices to add it. No fleet anywhere: the permanence warning, the handle again, and the client mints the genesis. Nothing answering: nothing is decided, and the screen waits while the client keeps looking. There is no way past the screen but a bind or a mint (owner, 2026-11-04, of the "go on" that let a person in mid-join: "I do not see a point. seems like another security nightmare"); `back` returns to the entry.
 //!
-//! Grant slots: 0 console, 1 display (use), 2 touch (use), 3 its surface, 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings, 8 the identity service, fgtw (use), 9 the identity unlock right, 10 a second surface (the keyboard's back buffer), 11 the GPU service (use), 12 the layer arena, 13 use wlan, 14 use nfc (attest with a tag).
+//! Grant slots: 0 console, 1 display (use), 2 touch (use), 3 its surface, 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings, 8 the identity service, fgtw (use), 9 the identity unlock right, 10 a second surface (the keyboard's back buffer), 11 the GPU service (use), 12 its block of the layer arena (32 MiB, its own), 13 use wlan, 14 use nfc (attest with a tag).
 #![no_std]
 #![no_main]
 
@@ -396,12 +396,12 @@ const S_LAYERS: u64 = 12;
 type Arena = ferros_sys::Handle<S_LAYERS>;
 /// The WiFi driver's `wlan` (init's slot 44): the network page's SCAN, JOIN and STATUS (pcie1, ATTEST-UI.md "WiFi connect").
 const S_WLAN: u64 = 13;
-/// The GPU's view of the layer arena (payloads/gpu ARENA_VA), and ahau's own region of it: the kernel's words at 32 MiB, the quick pass's pixels from 33 MiB (gputest uses the first 32).
-const ARENA_VA: u64 = 0x8000_0000;
-const GPU_CODE: usize = 32 << 20;
-const GPU_OUT: usize = 33 << 20;
-/// The GPU's second output, past the fine passes' sums (43 MiB, 16 bytes a staged pixel): the passes alternate between the two, so the screen shows one while the GPU writes the other.
-const GPU_OUT2: usize = 54 << 20;
+/// The GPU's view of ahau's own block of the layer arena (32 MiB, the kernel's to give: GPU-KISTS.md plan step 1, 2026-11-12; ferros_sys::gpu ARENA_VA): the kernel's words at its start, the quick pass's pixels from 1 MiB. Offsets are into the block (until 2026-11-12 into the whole arena, ahau's part from 32 MiB).
+const ARENA_VA: u64 = ferros_sys::gpu::ARENA_VA;
+const GPU_CODE: usize = 0;
+const GPU_OUT: usize = 1 << 20;
+/// The GPU's second output, past the fine passes' sums (11 MiB, 16 bytes a staged pixel): the passes alternate between the two, so the screen shows one while the GPU writes the other.
+const GPU_OUT2: usize = 22 << 20;
 /// Where the mark is drawn from (`draw_mark`): 0 for FRESH (the CPU drew it), else the arena offset of the GPU output the last pass landed in (GPU_OUT or GPU_OUT2, never 0). No copy out of the arena (1.3 ms a pass for a 900 px mark, 2026-11-05), and no frame showing a pass half written.
 static MARK_FRONT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
@@ -500,8 +500,8 @@ fn heap_reset(m: usize) {
 }
 
 /// ahau's region of the layer arena, past the quick pass's pixels (GPU_OUT, 6.5 MB): the circle's staged coordinates and the fine passes' sums.
-const GPU_STAGE: usize = 40 << 20;
-const GPU_SUMS: usize = 43 << 20;
+const GPU_STAGE: usize = 8 << 20;
+const GPU_SUMS: usize = 11 << 20;
 /// How many pixels the stage holds for the size it was staged at (0: not staged yet), and that size.
 static mut STAGED: (usize, usize) = (0, 0);
 
@@ -569,9 +569,9 @@ fn ensure_stage(r: usize) -> usize {
     unsafe { STAGED.0 }
 }
 
-/// Whether the layer arena is granted: its handle names a region (the pair is zero when not, SANDBOX.md "Handles"). WHY the size: the handle masks every offset by the region's size, so in a region smaller than the 64 MiB ahau's offsets assume (GPU_OUT2's frame ends past 60 MiB) they would wrap onto one another without a fault.
+/// Whether a block of the layer arena is granted: its handle names a region (the pair is zero when not, SANDBOX.md "Handles"). WHY the size: the handle masks every offset by the region's size, so in a region smaller than the 32 MiB ahau's offsets assume (GPU_OUT2's frame ends past 28 MiB) they would wrap onto one another without a fault.
 fn arena_granted() -> bool {
-    Arena::len() >= 64 << 20
+    Arena::len() >= 32 << 20
 }
 
 /// The bonded button's quick pass on the GPU: tapuwae's own shading recorded through valhall (tapuwae::gpu), run by the GPU service into the output of ahau's region of the layer arena the screen is not showing (side x side pack16 words, as render_button_pack16 writes them), which it shows from then (MARK_FRONT). False when the GPU did not draw it: the CPU draws it then.
