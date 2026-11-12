@@ -74,6 +74,61 @@ Removal is bilateral (photon docs/pairing-v2.md "Chain changes"), the same as in
 
 Verified on the host: photon-interop shows the app parsing the device's `depart_req` and its consent verifying under every scheme the device holds. Not yet run against a live approver.
 
+## Photon's device key on ferros (2026-11-12)
+
+Photon, the stowed kist, took its device key from the machine fingerprint (photon `get_machine_fingerprint`), and on ferros, with no files, that fell to tohu's last resort: the bytes `unknown`.
+So every ferros device's Photon had one device key (the same Ed25519, Falcon and SPHINCS+ keys), and anyone could derive it.
+A ferros Photon in a fleet would have been a member anyone could sign as, and the fleet key wrapped to it anyone could open.
+Its capsule declared the ira "to tie its keys to this device", and nothing read it.
+
+Now std/photon's main derives the key from its ira grant (`ira_key("photon device")`, slot 6) and hands it to Photon before it starts (`set_device_keypair`, `set_signing_bundle`), as Android's shell hands in its own.
+The kernel binds a kist's ira keys to the kist's gate identity (KISTS.md, "A kist's ira keys are its own"), so the key is Photon's on this device: no other kist and no system service derives it, and it is not fgtw's device key (`fgtw device`).
+A person who says no to the ira gets no Photon: it says so on the console and ends, as it did before with every want off.
+Whatever Photon kept on a ferros device before is under the old key and is not read again (development data only).
+
+## Photon and the person's identity (proposal, 2026-11-12: the owner's decision)
+
+**Today.** The person attests at boot, and fgtw holds their roots in RAM (op 4).
+Photon, launched from its circle, is told none of it and opens on its own handle screen: the person types the handle a second time, Photon computes the proof again (4.7 s on the X3), and nothing on ferros stops Photon attesting an identity other than the device's.
+
+**What Photon needs to open on its contacts** is exactly what fgtw holds:
+- `identity_seed`, which Photon also uses as its `vault_seed` (tohu's `SessionIdentity`; photon handle_query's derivation). ahau's seed is the same bytes (`ahau_core::identity_seed` is tested byte-exact against `ihi::handle_to_hash`).
+- `handle_proof`, which is public.
+
+It needs no handle: Photon never shows it and drops the string after the proof.
+It needs neither the ira nor the wairua, and no fleet key (it recovers that from the fan-out with its own device key, above).
+On Photon's side the change is one place: on ferros `tohu::session()` answers with the system's roots, and Photon's resume (photon driver.rs, "Auto-resume from the remembered session roots") paints its contacts from them, with no handle screen.
+
+**Why it is the owner's call.** The identity seed is not a key derived for an app; it is the identity's root.
+0. The identity's signing key is `Keypair::from_seed(identity_seed)` (fgtw `genesis_identity_pubkey`). Whoever holds the seed signs chain changes as the person: adding a device to their fleet, for good.
+1. PORTAL.md, section 8: "An app never signs as the person."
+2. A seed gives up its handle to an offline guess in seconds ("Nothing on disk by default", above: 45 M guesses/s), so the handle goes with it.
+3. Photon is the most exposed process on the device: it parses what strangers send (pictures thru `image` and rav1d, PDFs thru hayro, sound thru symphonia, VSF off the network).
+4. An answer is kept per kist (developer key and option), so it survives updates: whoever holds Photon's release key (a commons key, KISTS.md "Whose key signs a kist") can ship a build that inherits the right on every ferros device whose person said yes.
+
+Against that: Photon holds these roots on every other platform (tohu's session, the same 96 bytes), and the owner's scheme has attest unlock "Photon's keys" (STD-TARGET.md, "Encryption, as the owner laid it out").
+
+**The options.**
+- **A. Hand Photon the roots.**
+  - A right `identity` appended to ferros_kist's `RIGHTS` (code 9), its words "to be you" in the 16 languages (ferros_lang).
+  - The kernel's `kist_object` makes it a use of a new endpoint `identity` served by fgtw. Never the `fgtw` endpoint itself: its holders can mint, replace the roots and leave the fleet.
+  - Op 0 → `[state][identity_seed 32][handle_proof 32]` while fgtw holds roots, else `[state]` alone (the state as op 1 gives it).
+  - std/photon's main asks once at start and puts the roots in tohu's session, given a ferros arm that keeps them in the process's own memory (gone with the process). Never written to Photon's vault.
+  - Photon's capsule wants it: "to be you, so your contacts open without your handle typed again".
+  - Risks 0 to 4 above, taken as on every other platform.
+- **A′. A, with the answer to `identity` kept per capsule** (its blake3), not per kist, so each update of Photon asks this one right again. A question per update; closes risk 4.
+- **B. fgtw signs for Photon.** Photon would hold what is derived from the seed but not the signing key, and ask fgtw to sign as the person. Not possible as Photon is built: about 600 places derive straight from the seed (contacts' vault keys, avatar and blob names, word masks, cloud keys), and each must match the person's Photon on their other devices, so ferros alone cannot hand Photon a sub-key instead. It needs the derivation split on every platform: a Photon project, not a ferros one.
+- **C. Keep Photon's own prompt** (today). Read-only, fgtw could serve the public proof under a right of its own, so Photon refuses a handle that is not the device's person. A second typing of the handle stays.
+
+**The device key, under A.** Photon's device key is its own (above), not fgtw's.
+So Photon is a second member of the person's fleet on the same device: resumed with the roots, it finds its key outside the chain and asks to join (its KnownHandle screen), once, approved on a fleet device.
+The other ways, also the owner's: Photon signs device envelopes thru fgtw (one member per device, a new device signer in Photon), or the Fleet page shows Photon's key under its device (people_not_devices: a device is named from its key).
+
+**Recommendation:** A′, Photon a member of its own, approved once.
+The build is the pieces in A plus init's grant of the new endpoint to fgtw; tohu gains its ferros arm, and Photon's library is not touched.
+
+**Built:** the device key alone (above). No kist is handed anything of the identity.
+
 ## Findings
 
 - **Multicast needs a join.** The device heard another LAN device's beacons but never the dev box's; broadcast arrived, IPv4 multicast did not. The WiFi firmware passes all multicast; the access point's IGMP snooping was the filter. `ip` op 8 JOIN sends an IGMPv2 membership report (IPv4) or an MLDv1 listener report with the Router Alert option (IPv6) now and every 60 s; the client joins both beacon groups at start.
