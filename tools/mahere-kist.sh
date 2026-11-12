@@ -5,7 +5,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 cd "$here"
 [ "${1:-}" = "--no-build" ] || tools/mahere-build.sh
-bin=/mnt/Harbor/Code/mahere/target/ferros/aarch64-unknown-ferros/${MAHERE_PROFILE:-release}/mahere.bin
+bin=${MAHERE:-/mnt/Harbor/Code/mahere}/target/ferros/aarch64-unknown-ferros/${MAHERE_PROFILE:-release}/mahere.bin
 out=target/mahere.capsule.vsf
 B=target/debug/ferros-bridge
 "$B" capsule "$bin" "$out" --kist Mahere --option 4d725960dc438254d7f9cdc981d34b521840db34957187cdb1d4ce06e60621de \
