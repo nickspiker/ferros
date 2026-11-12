@@ -24,9 +24,10 @@ const S_REGS: u64 = 1;
 const S_MEM: u64 = 2;
 const S_STORE: u64 = 3;
 const S_IRQ: u64 = 4;
-/// The layer arena (slot 5) and the `gpu` endpoint this process serves (slot 6, init's grants at boot).
+/// The layer arena (slot 5) and the `gpu` endpoint this process serves (slot 6, init's grants at boot); the apps' surfaces (slot 7, since 2026-11-11: a client's kernel writes its own app surface).
 const S_ARENA: u64 = 5;
 const S_GPU: u64 = 6;
+const S_SURFACES: u64 = 7;
 
 /// A console line in a fixed buffer.
 pub struct Line([u8; 200], usize);
@@ -138,12 +139,18 @@ const TAB_BYTES: usize = 131072 + 5 * 1024;
 const CANV_VA: u64 = 0x7000_0000;
 const WORDS_VA: u64 = 0x7100_0000;
 const TAB_VA: u64 = 0x7200_0000;
-/// The layer arena in the group's address space (kernel cachemap LAYERS, 64 MiB).
+/// The layer arena in the group's address space (kernel cachemap LAYERS): 128 MiB since 2026-11-11, its size from the kernel (`dma_size`); 64 MiB from a kernel before that, which cannot say.
 const ARENA_VA: u64 = 0x8000_0000;
-const ARENA_BYTES: usize = 64 << 20;
+const ARENA_MOST: usize = 128 << 20;
+const ARENA_BEFORE: usize = 64 << 20;
+/// The apps' surfaces in the group's address space (kernel cachemap SURFACES, four of 32 MiB, coherent as the arena is): a client names its own by its offset from SURFACES_VA, the physical base the kernel told it less G#CA00_0000 (cachemap SURFACES).
+const SURFACES_VA: u64 = 0xC000_0000;
+const SURFACES_BYTES: usize = 128 << 20;
 /// The service's shader code: 32 pages, 16384 words.
 const CODE_BIG_VA: u64 = 0x3400_0000;
 const CODE_PAGES: usize = 32;
+/// The most uniform slots a run passes: 64 (16 until 2026-11-11), from G#80 in the descriptor page to G#280. A kernel reads a constant in a uniform with no move before it; Mahere's map kernel carries over a hundred of the frame's (its light, inks, sun, disk), each a move per pixel before (206 of its 836 words).
+const UNIFORMS: usize = 64;
 
 struct Gpu {
     regs: usize,
@@ -418,8 +425,15 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     // The service's code region: up to CODE_PAGES of shader words, copied in from the arena for each run (executable, read-only to the GPU).
     let code_big = m.alloc(CODE_PAGES);
     as1.map(&mut m, CODE_BIG_VA, code_big, CODE_PAGES, PAGE_RO | NC, TABLE);
+    let arena_bytes = ferros_sys::dma_size(cap(grants, S_ARENA), ARENA_MOST as u64).map_or(ARENA_BEFORE, |n| n as usize);
     if arena_ok {
-        as1.map(&mut m, ARENA_VA, arena, ARENA_BYTES / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
+        as1.map(&mut m, ARENA_VA, arena, arena_bytes / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
+    }
+    // The apps' surfaces (slot 7), coherent as the arena: a kernel that draws an app's frame writes it where the display composes it, no copy (Mahere's map, 2026-11-11). Only when the kernel fences them in too (s2mpu::fence_gpu); granted, the surfaces' whole region, every app's.
+    let surfaces = ferros_sys::dma(cap(grants, S_SURFACES)) as usize;
+    let surfaces_ok = serving && surfaces != 0 && surfaces != usize::MAX && ferros_sys::dma_size(cap(grants, S_SURFACES), SURFACES_BYTES as u64) == Some(SURFACES_BYTES as u64);
+    if surfaces_ok {
+        as1.map(&mut m, SURFACES_VA, surfaces, SURFACES_BYTES / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
     }
     if !g.install(1, as1.root) {
         g.fail("AS1 never went idle");
@@ -524,15 +538,18 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         }
         faulted |= fault_ack();
         let ok = check() && !faulted;
-        say!(grants, "gpu: job {name}: {} in {} us after {wakes} interrupts; CS_FAULT G#{:X}, CS_FATAL G#{:X}; CSG_REQ G#{:X} CSG_ACK G#{:X}\n", if ok { "done" } else if faulted { "faulted" } else { "did not finish" }, ferros_sys::us_since(t0), sh.rd(sout + 0x80), sh.rd(sout + 0x84), sh.rd(cin), sh.rd(cout));
+        // A served job that ran is the client's to say (its own line has its µs); a line for each would be 120 a second from a client drawing every frame (Mahere's map, 2026-11-11). The test suite's jobs and every failure are said.
+        if !ok || name != "serve" {
+            say!(grants, "gpu: job {name}: {} in {} us after {wakes} interrupts; CS_FAULT G#{:X}, CS_FATAL G#{:X}; CSG_REQ G#{:X} CSG_ACK G#{:X}\n", if ok { "done" } else if faulted { "faulted" } else { "did not finish" }, ferros_sys::us_since(t0), sh.rd(sout + 0x80), sh.rd(sout + 0x84), sh.rd(cin), sh.rd(cout));
+        }
         ok
     };
     let run = |name: &str, words: &[u64], check: &dyn Fn() -> bool| run_for(name, words, check, 100);
-    // The resident service (GPU.md "Layers", owner 2026-11-05): kernels for the clients' layers, one at a time, until the device goes down. A run: [1][preload u16, bit 15 = 64 registers a thread][code at an arena offset u32][code words u16][groups x u32][groups y u32][uniforms n u8][n × u64], then optionally who asks and for what, [n u8][the client's name][n u8][the kernel's name] (`label`; since 2026-11-11, so a failure says whose job it was); the code is copied from the arena into the service's own executable region, the job runs on the queue, and the reply is [status][µs u32]: 0 done, 1 a request it cannot take, 2 the job faulted or never finished (a guard, not a wait: the process watchdog will own hangs, RELEASE.md), 3 its code starts with a zero word (its words never reached the arena), refused before the queue sees it.
+    // The resident service (GPU.md "Layers", owner 2026-11-05): kernels for the clients' layers, one at a time, until the device goes down. A run: [1][preload u16, bit 15 = 64 registers a thread][code at an arena offset u32][code words u16][groups x u32][groups y u32][uniforms n u8, at most 64][n × u64], then optionally who asks and for what, [n u8][the client's name][n u8][the kernel's name] (`label`; since 2026-11-11, so a failure says whose job it was); the code is copied from the arena into the service's own executable region, the job runs on the queue, and the reply is [status][µs u32]: 0 done, 1 a request it cannot take, 2 the job faulted or never finished (a guard, not a wait: the process watchdog will own hangs, RELEASE.md), 3 its code starts with a zero word (its words never reached the arena), refused before the queue sees it.
     if serving {
         let big = Compute { code: code_big, desc, code_va: CODE_BIG_VA, desc_va: DESC_VA, max_threads: g.rd(THREAD_MAX_THREADS) };
         let flag = OUT_VA + 0x200;
-        say!(grants, "gpu: serving `gpu` (arena {})\n", if arena_ok { "mapped" } else { "not granted" });
+        say!(grants, "gpu: serving `gpu` (the arena {}, {} MiB; the apps' surfaces {})\n", if arena_ok { "mapped" } else { "not granted" }, arena_bytes >> 20, if surfaces_ok { "mapped" } else { "not granted" });
         let mut msg = [0u8; 4096];
         let mut token = [0u8; 32];
         loop {
@@ -549,7 +566,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                 let (preload, code_off, words) = (u16_at(1) as u32, u32_at(3) as usize, u16_at(7) as usize);
                 let groups = (u32_at(9), u32_at(13));
                 let nu = m[17] as usize;
-                let fits = m.len() >= 18 + 8 * nu && nu <= 16 && words > 0 && words + 16 <= CODE_PAGES * PAGE / 8 && code_off % 8 == 0 && code_off + 8 * words <= ARENA_BYTES && groups.0 > 0 && groups.1 > 0;
+                let fits = m.len() >= 18 + 8 * nu && nu <= UNIFORMS && words > 0 && words + 16 <= CODE_PAGES * PAGE / 8 && code_off % 8 == 0 && code_off + 8 * words <= arena_bytes && groups.0 > 0 && groups.1 > 0;
                 if fits {
                     let code = unsafe { core::slice::from_raw_parts((arena + code_off) as *const u64, words) };
                     // Who asked, and for which kernel: the request's tail past its uniforms, as the client names itself (`label`). Words for the lines below, never acted on.
@@ -562,7 +579,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                         ferros_sys::reply(&token, &reply);
                         continue;
                     }
-                    let mut uniforms = [0u64; 16];
+                    let mut uniforms = [0u64; UNIFORMS];
                     for (k, u) in uniforms[..nu].iter_mut().enumerate() {
                         *u = u64::from_le_bytes(m[18 + 8 * k..26 + 8 * k].try_into().unwrap());
                     }

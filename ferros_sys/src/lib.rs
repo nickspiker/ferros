@@ -1463,6 +1463,12 @@ pub fn dma(cap: u64) -> u64 {
     svc(nr::DMA, cap, 0, 0, 0, 0)
 }
 
+/// A DMA region grant's size in bytes (since 2026-11-11), or None from a kernel before it, which answers the region's base instead (told by its being past `most`, the largest size the caller could expect).
+pub fn dma_size(cap: u64, most: u64) -> Option<u64> {
+    let n = svc(nr::DMA, cap, 1, 0, 0, 0);
+    (n != ERR && n <= most).then_some(n)
+}
+
 /// Copy spawn input into `buf`, starting at byte `off`; returns how many bytes (0 at the end). Large one-shot input (firmware) is streamed this way so the arc stays small.
 pub fn input(start: u64, buf: &mut [u8]) -> usize {
     svc(nr::INPUT, start, off(buf.as_mut_ptr() as *const u8), buf.len() as u64, 0, 0) as usize
