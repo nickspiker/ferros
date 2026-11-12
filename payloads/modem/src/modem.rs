@@ -105,6 +105,7 @@ static DOORBELL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsi
 const GPIO_ALIVE: usize = 0x154D_0000;
 /// Shared memory (zuma-rmem.dtsi): the IPC region and the MSI / boot-register page.
 pub const IPC: usize = 0xEA40_0000;
+/// Inside the TX ring's span, so Normal non-cacheable (kernel cachemap.rs `MODEM_TX_NC`): written before the ring is in use, and ordered before the doorbell by `rom_boot`'s `dsb sy`.
 const ROM_IMG: usize = IPC + 0x1_0000;
 const MSI_PAGE: usize = 0xF620_0000;
 const BOOT_STAGE: usize = MSI_PAGE + 0x10;
@@ -245,8 +246,9 @@ fn survey(rep: &mut Vec<u8>) -> bool {
     true
 }
 
-/// Stage 1: power the CP from off (modem_ctrl_s5100.c power_on_cp: clear boot_stage, AP_ACTIVE 1, DUMP_NOTI 0, zero the message words, then gpio_power_off_cp and gpio_power_offon_cp with their delays), then watch the CP's pins: for 3 s when `watch` (stage 1 run alone, to see every change), else until PS_HOLD is up (the CP runs its ROM), 3 s at most.
-/// Linux waits for nothing here (power_on_cp returns 57 ms after it starts, then register_pcie sleeps its 200 ms, which `up` keeps): the full 3 s watch in every bring-up was 3 s of nothing (2026-11-11).
+/// Stage 1: power the CP from off (modem_ctrl_s5100.c power_on_cp: clear boot_stage, AP_ACTIVE 1, DUMP_NOTI 0, zero the message words, then gpio_power_off_cp and gpio_power_offon_cp with their delays), then, when `watch` (stage 1 run alone), 3 s of the CP's pins, every change logged.
+/// A bring-up waits for nothing here, as Linux does: power_on_cp reads PS_HOLD only to print it (print_mc_state), returns 57 ms after it starts, and register_pcie's link is up 250 ms later (the Linux log: power_on_cp 6.364 s, CP_WRST_N high 6.421 s, the endpoint enumerated 6.671 s); `up` keeps its 200 ms sleep.
+/// PS_HOLD never reads high on husky, before the ROM stage or after INIT_END (the Pro, 2026-11-12: `+A#0 ms: PS_HOLD 0`, and 0 at every later look), so the bring-up's watch "until PS_HOLD rises" (2026-11-11) always ran its full 3 s: the link came up 3533 ms after power-on where Linux takes about 310.
 fn power_on(rep: &mut Vec<u8>, watch: bool) {
     wr(BOOT_STAGE, 0);
     for p in [CP2AP_WRST_N, PS_HOLD, CP2AP_WAKEUP, PHONE_ACTIVE] {
@@ -278,17 +280,16 @@ fn power_on(rep: &mut Vec<u8>, watch: bool) {
     CP_WRST_N.out(true);
     line(rep, alloc::format!("after the sequence: gph0 CON G#{:X} DAT G#{:X} | gph1 CON G#{:X} DAT G#{:X} | gpa0 CON G#{:X} DAT G#{:X}\n", rd(GPH0), rd(GPH0 + 4), rd(GPH1), rd(GPH1 + 4), rd(GPA0), rd(GPA0 + 4)));
     line(rep, alloc::format!("AP2CP now: CP_PWR {} NRESET {} CP_WRST_N {} AP_ACTIVE {} PM_WRST_N {} WAKEUP {} DUMP_NOTI {}\n", CP_PWR.get() as u8, NRESET.get() as u8, CP_WRST_N.get() as u8, AP_ACTIVE.get() as u8, PM_WRST_N.get() as u8, AP2CP_WAKEUP.get() as u8, DUMP_NOTI.get() as u8));
+    if !watch {
+        return cp2ap(rep, "after power-on");
+    }
     let t0 = now();
     let mut last = 0xFFu8;
     while since_us(t0) < 3_000_000 {
-        
         let s = PS_HOLD.get() as u8 | (CP2AP_WRST_N.get() as u8) << 1 | (CP2AP_WAKEUP.get() as u8) << 2 | (PHONE_ACTIVE.get() as u8) << 3;
         if s != last {
             line(rep, alloc::format!("+A#{} ms: PS_HOLD {} CP_WRST_N {} WAKEUP {} PHONE_ACTIVE {}\n", since_us(t0) / 1000, s & 1, (s >> 1) & 1, (s >> 2) & 1, (s >> 3) & 1));
             last = s;
-        }
-        if !watch && s & 1 != 0 {
-            break;
         }
         us(1000);
     }
@@ -667,6 +668,7 @@ const TXQ_HEAD: usize = IPC + 0x18;
 const TXQ_TAIL: usize = IPC + 0x1C;
 const RXQ_HEAD: usize = IPC + 0x20;
 const RXQ_TAIL: usize = IPC + 0x24;
+/// The TX ring is the one part of the windows mapped Normal non-cacheable (kernel cachemap.rs `MODEM_TX_NC`): what goes into it must be ordered before the head's write by a `dsb sy` (`publish`, `ring_frame`, and the ROM image before its doorbell in `rom_boot`).
 const TX_RING: usize = IPC + 0x3000;
 const TX_RING_LEN: u32 = 0x1F_D000;
 const RX_RING: usize = IPC + 0x20_0000;
@@ -910,7 +912,7 @@ fn command(seq: &mut u16, cmd: u16, body: &[u8], ms_wait: u64) -> Result<(), all
     Ok(())
 }
 
-/// Where a section's time went, in timer ticks: reading its bytes from the partition, writing its frames into the ring, and waiting for the CP's answers. The first two run while the CP takes the frame before (`send_data`), so the wait is what is left of the CP's turn after them: a section whose wait is near zero is the AP's to speed up, one whose wait is most of it is the CP's.
+/// Where a section's time went, in timer ticks: getting its bytes (for MAIN, VSS and APM out of the reader's buffers, `Feed`: the copy and any wait for the reader), writing its frames into the ring, and waiting for the CP's answers. The first two run while the CP takes the frame before (`send_data`), so the wait is what is left of the CP's turn after them: a section whose wait is near zero is the AP's to speed up, one whose wait is most of it is the CP's.
 #[derive(Default)]
 struct Spent {
     read: u64,
@@ -934,7 +936,7 @@ fn send_section<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(r
 }
 
 /// A section's data frames (G#A1nB {u16 chunk + 8, u32 total, u32 offset, data}), each acked by G#C1nB; how many.
-/// Stop and wait, as cbd runs it (`std_udl_req_resp`: one frame out, then its answer), but the AP's own work for a frame runs while the CP takes the one before: frame k+1 is read from the partition and written into the ring past the head right after frame k is published, and is published the moment k's answer comes. A frame then costs the longer of the CP's turn and the AP's, not their sum.
+/// Stop and wait, as cbd runs it (`std_udl_req_resp`: one frame out, then its answer), but the AP's own work for a frame runs while the CP takes the one before: frame k+1 is filled (from the reader's buffers or memory) and written into the ring past the head right after frame k is published, and is published the moment k's answer comes. A frame then costs the longer of the CP's turn and the AP's, not their sum.
 fn send_data<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(seq: &mut u16, id: u32, size: u32, read: &mut F, s: &mut Spent) -> Result<u32, alloc::string::String> {
     let ack = 0xC10B | ((id & 0xF) << 4) as u16;
     if size == 0 {
@@ -965,7 +967,7 @@ fn send_data<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(seq:
     }
 }
 
-/// The section's next data frame (counter `seq` + 1) from byte `off`: its data read from the partition straight into its place in `f`, then the frame written into the ring at `pos`, not published. The ring position after it and the data bytes it carries.
+/// The section's next data frame (counter `seq` + 1) from byte `off`: its data filled by `read` straight into its place in `f`, then the frame written into the ring at `pos`, not published. The ring position after it and the data bytes it carries.
 fn stage_data<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(f: &mut Frame, seq: &mut u16, id: u32, size: u32, off: u32, pos: u32, read: &mut F, s: &mut Spent) -> Result<(u32, u32), alloc::string::String> {
     let want = (size - off).min(CHUNK as u32);
     let mut body = [0u8; 10];
@@ -981,6 +983,152 @@ fn stage_data<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(f: 
     s.read += t1 - t;
     s.copy += now() - t1;
     Ok((end, want))
+}
+
+/// The firmware's bytes read beside the boot channel (2026-11-12: the read was 1161 ms of MAIN's 3683 on the Pro, one 48 KiB partition read a frame on the frame loop's own time). A reader thread reads `modem.bin` from MAIN's start to APM's end in calls of `FEED_CHUNK`, each one UFS run (the kernel's largest: kernel partfs.rs `PART_CHUNK_RUNS`, ferros_hal `RUN_MAX`, 256 blocks), into `FEED_BUFS` buffers in turn; the frame loop copies each frame's bytes out of them and waits only when it catches the reader up.
+/// MAIN, VSS and APM lie back to back in the file in the order they are sent (the TOC: G#1_6C10, G#5DB_7810, G#623_441C), so the reader runs on across the section boundaries and MAIN's CRC exchange, and starts during the download's opening pause.
+const FEED_CHUNK: usize = 1 << 20;
+const FEED_BUFS: u64 = 1 << 2;
+/// Chunks read (the reader's count), `u64::MAX` once a read failed.
+static FEED_FILLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Chunks the frame loop is done with: their buffers are the reader's again.
+static FEED_FREED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// 1 while the reader waits for a buffer: only then does the frame loop's release wake it (a wake is a syscall, and a syscall waits on the kernel lock while a partition read holds it).
+static FEED_WAITING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// 1: the frame loop is done (or gave up) and the reader is to leave.
+static FEED_STOP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// 1 from the reader's start until it has left.
+static FEED_RUNNING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The reader's time inside its partition reads (timer ticks) and their count.
+static FEED_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FEED_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The reader's job: the partition, the file, the range of the file (from a 4 KiB boundary) and the buffers' address. Written before the reader is spawned, read by it once, not written again until it has left.
+static mut FEED_JOB: Option<(crate::partfs::Mount, crate::partfs::Inode, u64, u64, usize)> = None;
+static mut FEED_STACK: [u8; 1 << 16] = [0; 1 << 16];
+
+/// The frame loop's side of the reader: the buffers it owns, the range's start, and the chunk it has reached (every chunk below it released).
+struct Feed {
+    _bufs: Vec<u8>,
+    at: *mut u8,
+    from: u64,
+    reached: u64,
+}
+
+impl Feed {
+    /// The reader started on bytes `lo..hi` of `ino`.
+    fn start(m: &crate::partfs::Mount, ino: &crate::partfs::Inode, lo: u64, hi: u64) -> Result<Feed, alloc::string::String> {
+        use core::sync::atomic::Ordering::SeqCst;
+        let from = lo & !0xFFF;
+        let mut bufs = alloc::vec![0u8; FEED_CHUNK * FEED_BUFS as usize];
+        let at = bufs.as_mut_ptr();
+        unsafe { *(&raw mut FEED_JOB) = Some((m.clone(), ino.clone(), from, hi, at as usize)) };
+        for w in [&FEED_FILLED, &FEED_FREED, &FEED_WAITING, &FEED_STOP, &FEED_TICKS, &FEED_CALLS] {
+            w.store(0, SeqCst);
+        }
+        FEED_RUNNING.store(1, SeqCst);
+        if ferros_sys::thread_spawn(feed_reader, unsafe { &mut *(&raw mut FEED_STACK) }, 0) == ferros_sys::ERR {
+            FEED_RUNNING.store(0, SeqCst);
+            return Err(alloc::format!("the firmware's reader thread did not start"));
+        }
+        Ok(Feed { _bufs: bufs, at, from, reached: 0 })
+    }
+
+    /// `out.len()` bytes of the file from `pos`. Calls go forward thru the file (the sections in file order), never back below the chunk the last one reached.
+    fn read(&mut self, pos: u64, out: &mut [u8]) -> Result<(), alloc::string::String> {
+        use core::sync::atomic::Ordering::{Acquire, SeqCst};
+        let mut done = 0;
+        while done < out.len() {
+            let p = pos + done as u64 - self.from;
+            let c = p / FEED_CHUNK as u64;
+            // WHY: a released chunk's buffer is the reader's again; a read below it is a section out of file order, which the TOC this was written for does not have. Fail loud rather than send the CP bytes that are not there.
+            if c < self.reached {
+                return Err(alloc::format!("{MODEM_BIN}: G#{:X} is behind the reader (chunk A#{c}, released below A#{})", pos + done as u64, self.reached));
+            }
+            if c > self.reached {
+                self.reached = c;
+                FEED_FREED.store(c, SeqCst);
+                if FEED_WAITING.load(SeqCst) != 0 {
+                    ferros_sys::wake(&FEED_FREED, 1);
+                }
+            }
+            loop {
+                let f = FEED_FILLED.load(Acquire);
+                if f == u64::MAX {
+                    return Err(alloc::format!("{MODEM_BIN}: the reader's partition read failed"));
+                }
+                if f > c {
+                    break;
+                }
+                ferros_sys::wait(&FEED_FILLED, f, 0);
+            }
+            let o = (p % FEED_CHUNK as u64) as usize;
+            // The piece of this read in chunk c: where the chunk ends or the read does (the split point, not a limit).
+            let n = (FEED_CHUNK - o).min(out.len() - done);
+            // SAFETY: chunk c is filled (FEED_FILLED > c, acquired) and not released, so the reader writes only the other buffers; `o + n` stays inside this chunk's buffer.
+            unsafe { core::ptr::copy_nonoverlapping(self.at.add((c % FEED_BUFS) as usize * FEED_CHUNK + o), out[done..].as_mut_ptr(), n) };
+            done += n;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Feed {
+    /// The reader stopped and gone before the buffers go: the word it may sleep on is moved, so its wait returns.
+    fn drop(&mut self) {
+        use core::sync::atomic::Ordering::{Acquire, SeqCst};
+        FEED_STOP.store(1, SeqCst);
+        FEED_FREED.store(u64::MAX >> 1, SeqCst);
+        ferros_sys::wake(&FEED_FREED, 1);
+        loop {
+            let r = FEED_RUNNING.load(Acquire);
+            if r == 0 {
+                break;
+            }
+            ferros_sys::wait(&FEED_RUNNING, r, 0);
+        }
+    }
+}
+
+/// The reader thread (`Feed`): each chunk into the next buffer once the frame loop has released the chunk a lap behind it, then said filled.
+extern "C" fn feed_reader(_: u64) -> ! {
+    use core::sync::atomic::Ordering::{Relaxed, Release, SeqCst};
+    // SAFETY: written by `Feed::start` before this thread was spawned; not written again until FEED_RUNNING says this thread has left.
+    let (mut m, ino, from, to, bufs) = unsafe { (*(&raw const FEED_JOB)).clone().unwrap() };
+    let mut c = 0u64;
+    while from + c * (FEED_CHUNK as u64) < to {
+        FEED_WAITING.store(1, SeqCst);
+        loop {
+            let fr = FEED_FREED.load(SeqCst);
+            if c < fr + FEED_BUFS {
+                break;
+            }
+            ferros_sys::wait(&FEED_FREED, fr, 0);
+        }
+        FEED_WAITING.store(0, SeqCst);
+        if FEED_STOP.load(SeqCst) != 0 {
+            break;
+        }
+        let at = from + c * FEED_CHUNK as u64;
+        // The last chunk ends with APM: its length, not a limit.
+        let n = (to - at).min(FEED_CHUNK as u64) as usize;
+        // SAFETY: chunk c's buffer, which the frame loop has released (FEED_FREED + FEED_BUFS > c) and reads again only once FEED_FILLED passes c.
+        let out = unsafe { core::slice::from_raw_parts_mut((bufs + (c % FEED_BUFS) as usize * FEED_CHUNK) as *mut u8, n) };
+        let t = now();
+        let ok = matches!(m.read(&ino, at, out), Ok(k) if k == n);
+        FEED_TICKS.fetch_add(now() - t, Relaxed);
+        FEED_CALLS.fetch_add(1, Relaxed);
+        if !ok {
+            FEED_FILLED.store(u64::MAX, Release);
+            ferros_sys::wake(&FEED_FILLED, 1);
+            break;
+        }
+        c += 1;
+        FEED_FILLED.store(c, Release);
+        ferros_sys::wake(&FEED_FILLED, 1);
+    }
+    FEED_RUNNING.store(0, Release);
+    ferros_sys::wake(&FEED_RUNNING, 1);
+    ferros_sys::thread_exit(0)
 }
 
 /// Stage 7: the boot-channel download. MAIN, VSS and APM come out of `modem.bin`, the three NV sections out of the per-unit files on f2fs (efs, modem_userdata); START is not sent.
@@ -1007,6 +1155,20 @@ fn download(rep: &mut Vec<u8>, seq_out: &mut Option<u16>) {
             Err(e) => return line(rep, alloc::format!("{e}\n")),
         }
     }
+    // MAIN, VSS and APM from the TOC, and the reader started on their bytes (`Feed`): it reads ahead thru the opening pause.
+    let mut secs = Vec::new();
+    for name in ["MAIN", "VSS", "APM"] {
+        match toc.iter().find(|s| s.name() == name) {
+            Some(s) => secs.push((name, s)),
+            None => return line(rep, alloc::format!("{name}: not in the TOC\n")),
+        }
+    }
+    let lo = secs.iter().map(|(_, s)| s.offset as u64).min().unwrap();
+    let hi = secs.iter().map(|(_, s)| s.offset as u64 + s.size as u64).max().unwrap();
+    let mut feed = match Feed::start(&m, &ino, lo, hi) {
+        Ok(f) => f,
+        Err(e) => return line(rep, alloc::format!("{e}\n")),
+    };
     // The daemon's first boot-channel write comes well after the link acknowledgement; give the CP's bootloader the same breathing room.
     ms(500);
     let t_dl = now();
@@ -1037,20 +1199,10 @@ fn download(rep: &mut Vec<u8>, seq_out: &mut Option<u16>) {
         return;
     }
     line(rep, alloc::format!("stage 1 (TOC) complete (G#C11D)\n"));
-    for name in ["MAIN", "VSS", "APM"] {
-        let Some(s) = toc.iter().find(|s| s.name() == name) else {
-            line(rep, alloc::format!("{name}: not in the TOC\n"));
-            return;
-        };
+    for &(name, s) in &secs {
         let base = s.offset as u64;
-        let r = send_section(rep, &mut seq, s.id, s.size, |off, out| {
-            // Straight into the frame: the kernel's partition read starts at any offset (partfs.rs `part_call` reads from the block holding it), so a section that starts mid-block needs no bounce here. One call, one UFS command, for a frame's 48 KiB.
-            // A short read is a modem.bin cut off inside a section the TOC says is whole: fail loud rather than send the CP stale bytes.
-            match m.read(&ino, base + off, out)? {
-                n if n == out.len() => Ok(()),
-                n => Err(alloc::format!("{MODEM_BIN}: A#{n} of A#{} bytes at G#{:X}", out.len(), base + off)),
-            }
-        });
+        // Each frame's bytes out of the reader's buffers (a modem.bin cut off inside a section the TOC says is whole fails the reader's read, and the section with it: never stale bytes to the CP).
+        let r = send_section(rep, &mut seq, s.id, s.size, |off, out| feed.read(base + off, out));
         if !step(rep, name, r) {
             return;
         }
@@ -1070,6 +1222,8 @@ fn download(rep: &mut Vec<u8>, seq_out: &mut Option<u16>) {
             }
         }
     }
+    drop(feed);
+    line(rep, alloc::format!("read beside the frames: G#{:X} bytes in A#{} partition reads of up to G#{FEED_CHUNK:X}, A#{} ms of the reader's time\n", hi - (lo & !0xFFF), FEED_CALLS.load(core::sync::atomic::Ordering::Relaxed), FEED_TICKS.load(core::sync::atomic::Ordering::Relaxed) * 1000 / crate::hw::freq()));
     // The three NV sections in the captured order (NV_NORM 5, NV_PROT 6, REPLAY sent as section 7), straight from the f2fs files; their contents are never logged.
     for (path, id, v) in &nv {
         let r = send_section(rep, &mut seq, *id, v.len() as u32, |off, out| {
@@ -2160,6 +2314,14 @@ fn rfs(rep: &mut Vec<u8>, t_ms: u64, b: &[u8], link: &mut SitLink, st: &mut Rfs)
 
 /// The service's probe level: everything stage G#12 does except its tests (the router solicitation, the echo request, the queue reports), quiet, its DL packets queued for `rmnet`.
 const SERVICE: u8 = 9;
+/// How far the radio's setup has come (`Online::ril_step`), each step sent on the answer to the one before: the opening question out (or about to go), the radios on, the data stack's carrier manifest answered, the SIM's applications enabled, the data profiles sent, the allowed networks sent, done.
+const RIL_ASKED: u8 = 0;
+const RIL_POWERED: u8 = 1;
+const RIL_MANIFEST: u8 = 2;
+const RIL_UICC: u8 = 3;
+const RIL_PROFILES: u8 = 4;
+const RIL_ALLOWED: u8 = 5;
+const RIL_DONE: u8 = 6;
 /// DL packets the service holds for `rmnet` before the oldest gives way: a burst the IP process has not read yet (an IP stack drops on overflow anyway; TCP retransmits).
 const DL_QUEUE: usize = 1 << 8;
 
@@ -2184,13 +2346,13 @@ struct Online {
     probed: bool,
     powered: bool,
     next_reg: u64,
-    sim_asked: bool,
-    data_on: bool,
-    ia_set: bool,
-    queried: bool,
-    uicc_on: bool,
-    cycled: u8,
-    allow_set: bool,
+    /// The radio's setup, each step sent on the answer to the one before (`ril_step`): how far it has come (`RIL_*`), the answer that moves it on (channel, message id, token), and whether the opening question went out a second time.
+    ril: u8,
+    ril_next: Option<(u8, u16, u32)>,
+    ril_reasked: bool,
+    /// The data stack's carrier manifest: the token of the one sent last, until it is answered, and whether one has been (the setup's step after the radios).
+    manifest: Option<u32>,
+    manifest_in: bool,
     reg_last: [Option<[u8; 4]>; 2],
     /// The last IND_SIGNAL_STRENGTH's parameters (G#0906, no identity, up to 256 bytes) and their length: logged whole at each change, past the frame cap, to be decoded against Android's readings of the same moment.
     sig_last: [u8; 256],
@@ -2431,6 +2593,7 @@ impl Online {
         status(5, s.snr.map_or(MEASURE_NONE, |v| w(k::SNR, v * 100)));
     }
     /// The service's own part of a pass (docs/RADIO-CONTROLS.md): the tracks every two seconds, the detail when the call comes or goes, and the control block four times a second.
+    #[inline(never)]
     fn service_extras(&mut self, rep: &mut Vec<u8>) {
         let t = since_us(self.t0);
         if t.wrapping_sub(self.tracks_at) >= 2_000_000 {
@@ -2502,6 +2665,194 @@ impl Online {
         ferros_detail::publish(ferros_sys::control::CELLULAR, f);
     }
 
+    /// A RIL indication on channel `ch` (`at`: the frame's bytes, the RCM message from 12): the first physical-channel-config, NITZ and call-list indications (the stack camped on a cell) logged past the cap too, header only; NITZ every time, whole, and the zone from it; the network's MCC.
+    #[inline(never)]
+    fn ind_frame(&mut self, rep: &mut Vec<u8>, ch: u8, flen: u32, at: &dyn Fn(u32) -> u8) {
+        let t0 = self.t0;
+        let id = at(14) as u16 | (at(15) as u16) << 8;
+        let k = (ch - CH_FMT0) as usize;
+        let bit = match id { 0x0742 => 1u8, 0x0905 => 2, 0x0604 => 4, _ => 0 };
+        if bit != 0 && self.camp_seen[k] & bit == 0 {
+            self.camp_seen[k] |= bit;
+            line(rep, alloc::format!("t={} ms: ch A#{ch} first indication G#{id:04X} {}\n", since_us(t0) / 1000, sit_name(id)));
+        }
+        // NITZ, every time, whole: the network's time, its zone and daylight-saving offset, for the clock (layout read from these dumps; SIT is closed).
+        if id == 0x0905 {
+            let mut l = alloc::string::String::new();
+            for i in 12..flen.min(12 + 96) {
+                let _ = core::fmt::Write::write_fmt(&mut l, format_args!("{:02X}", at(i)));
+            }
+            line(rep, alloc::format!("t={} ms: NITZ ({flen} bytes) {l}\n", since_us(t0) / 1000));
+            // The zone (kernel zone.rs; owner, 2026-11-10: "cellular, then GPS"), handed to the kernel on every NITZ. The parameters after the 8-byte indication header, as the vendor's ProtocolNitzData reads them (vendor.radio.protocol.sit.stream.so, its accessors need 17 bytes): 0 the daylight flag valid, 1-6 the time (UTC), 7 the zone in signed quarter hours (the whole legal offset, daylight time in it), 8 the daylight adjustment in hours, 9 the weekday, 10 MM info, 11-16 the network (MCC then MNC, ASCII).
+            if flen >= 20 + 17 {
+                let p = |i: u32| at(20 + i);
+                let offset = p(7) as i8 as i32 * 900;
+                let dst = (p(0) != 0).then_some(p(8) != 0);
+                let mcc = mcc_of([p(11), p(12), p(13)]);
+                let ok = ferros_sys::zone::network(mcc, Some((offset, dst)));
+                line(rep, alloc::format!("t={} ms: NITZ: MCC A#{mcc}, UTC {}{} min{}, to the clock{}\n", since_us(t0) / 1000, if offset < 0 { "-" } else { "+" }, offset.unsigned_abs() / 60, match dst {
+                    Some(true) => ", daylight time",
+                    Some(false) => ", standard time",
+                    None => "",
+                }, if ok { "" } else { ": REFUSED" }));
+            }
+        }
+        // The network's country alone (SIT IND_MCC, G#072D): its MCC as three ASCII digits after the header's first parameter byte (the vendor's ProtocolNetMccAdapter copies them from there), for the zone when NITZ has not come.
+        if id == 0x072D && flen >= 20 + 4 {
+            let mcc = mcc_of([at(21), at(22), at(23)]);
+            if mcc != 0 && mcc != self.mcc_said {
+                self.mcc_said = mcc;
+                let ok = ferros_sys::zone::network(mcc, None);
+                line(rep, alloc::format!("t={} ms: the network's MCC A#{mcc}, to the clock{}\n", since_us(t0) / 1000, if ok { "" } else { ": REFUSED" }));
+            }
+        }
+    }
+
+    /// The radio setup's opening question, SIT_GET_RADIO_POWER on the first stack's channel: its answer says the CP's RIL is taking requests, and turns the radios on (`ril_step`).
+    #[inline(never)]
+    fn ril_ask(&mut self, rep: &mut Vec<u8>) {
+        let t = since_us(self.t0) / 1000;
+        match sit_request(&mut self.link, CH_FMT0, SIT_GET_RADIO_POWER, &[]) {
+            Ok(tok) => {
+                self.ril_next = Some((CH_FMT0, SIT_GET_RADIO_POWER, tok));
+                line(rep, alloc::format!("t={t} ms: -> SIT_GET_RADIO_POWER (G#{SIT_GET_RADIO_POWER:X}) token A#{tok} on ch A#{CH_FMT0}\n"));
+            }
+            Err(e) => line(rep, alloc::format!("t={t} ms: SIT_GET_RADIO_POWER not sent: {e}\n")),
+        }
+    }
+
+    /// The CP's first message on the modem service (its platform services up, 1.2 to 1.6 s after INIT_END on every run so far) with the opening question still unanswered: asked once more, in case the first went before the CP's RIL took requests.
+    #[inline(never)]
+    fn ril_svc_seen(&mut self, rep: &mut Vec<u8>) {
+        if self.probed && self.ril == RIL_ASKED && !self.ril_reasked {
+            self.ril_reasked = true;
+            self.ril_ask(rep);
+        }
+    }
+
+    /// A RIL message on channel `ch` (`h`: the first 12 bytes of its RCM message, zeros past its `len`): the CP's G#4602 indication (the SIM's identity for the carrier lookup) is answered with SIT_OEM_SET_CARRIER_CONFIG_MANIFEST on the same stack (stage G#10 on), and the answer the radio's setup waits for moves it on.
+    #[inline(never)]
+    fn ril_frame(&mut self, rep: &mut Vec<u8>, ch: u8, len: u32, h: &[u8; 12]) {
+        let id = u16::from_le_bytes([h[2], h[3]]);
+        if h[0] == 2 && id == 0x4602 && self.probe >= 6 {
+            let t = since_us(self.t0) / 1000;
+            match sit_request(&mut self.link, ch, SIT_OEM_SET_CARRIER_CONFIG_MANIFEST, &carrier_manifest_params()) {
+                Ok(tok) => {
+                    // The data stack's manifest is the one the setup waits for (the carrier pack in on the stack that registers); the other stack's is answered and moves nothing.
+                    if ch == CH_FMT0 + 1 {
+                        self.manifest = Some(tok);
+                    }
+                    line(rep, alloc::format!("t={t} ms: -> SIT_OEM_SET_CARRIER_CONFIG_MANIFEST {} manifest {} ch A#{ch} token A#{tok}\n", CARRIER_CONFIG_ROOT, VZW_MANIFEST));
+                }
+                Err(e) => line(rep, alloc::format!("t={t} ms: carrier manifest not sent: {e}\n")),
+            }
+        }
+        // A response: its token at 6 (its 12-byte header whole). The data stack's manifest answered moves the setup on once the radios are on (or as soon as they are, `ril_step`); any other answer only when it is the one awaited.
+        if h[0] == 1 && len >= 12 {
+            let tok = u32::from_le_bytes([h[6], h[7], h[8], h[9]]);
+            if id == SIT_OEM_SET_CARRIER_CONFIG_MANIFEST && ch == CH_FMT0 + 1 && self.manifest == Some(tok) {
+                self.manifest = None;
+                if !self.manifest_in {
+                    self.manifest_in = true;
+                    if self.ril == RIL_POWERED && self.probe >= 6 {
+                        self.ril = RIL_MANIFEST;
+                        self.ril_step(rep);
+                    }
+                }
+            } else if self.ril_next == Some((ch, id, tok)) {
+                self.ril_next = None;
+                self.ril_step(rep);
+            }
+        }
+    }
+
+    /// The radio's setup, each step on the answer the step before waits for, in the order the timers sent them until 2026-11-12 (radio on 3 s, UICC 6.2, profiles 6.5, allowed networks 6.8, data allowed 7 s after INIT_END), which the CP answered in milliseconds every time (stage logs: GET_RADIO_POWER in 2 ms, SET_RADIO_POWER in under 200, the manifest, UICC and allowed networks within 3). The CP's errors do not stop it: the two data profiles with id -1 get error 2 on Android as well.
+    /// - The opening question answered: the radios on, both stacks, as each Android RIL instance powers its own (state 2 = on; the two option bytes are forEmergencyCall and preferredForEmergencyCall, NetworkService::DoRadioPower and ProtocolNetworkBuilder::BuildRadioPower: both 0, a plain power-on for data), and each stack's SIM status. The CP's G#4602 came right after the radio-on answer on every run, and the manifest's answer moves the setup on.
+    /// - The manifest answered: the SIM's applications enabled (SIT_SET_UICC_SUBSCRIPTION 1: ProtocolSimBuilder::BuildSetUicc, what Android's enableUiccApplications(true) sends for each SIM at boot).
+    /// - That answered: the data profiles (Android's RIL never sends SIT_SET_INITIAL_ATTACH_APN on this build; the attach APN rides in the profile table, the IMS profile's types carrying IA).
+    /// - The last profile answered: the allowed networks (SIT_SET_ALLOW_NETWORK, a u32 RAT bitmap in the CP's numbering: ProtocolNetworkBuilder::BuildSetAllowedNetworkTypeBitmap; the mask the CP itself reports, GET_ALLOW_NETWORK G#4_03FE). The data stack sits not searching until this one (Android's boot trace, 2026-10-29) and registered 1.2 s after it on the Pro (2026-11-12: 6801 to 7982 ms).
+    /// - That answered: data on the data stack (the preferred data modem, one byte, the stack's index: ProtocolPsBuilder::BuildSetPreferredDataModem; SIT_SET_PS_SERVICE 1: ProtocolNetworkBuilder::BuildAllowData), and in the stage diagnostics the read-only queries (the stack's enabled state, the carrier-restriction policy, voice registration, network-selection mode, preferred network type, packet service, allowed networks), whose answers only a stage logs.
+    /// Stages c to f stop short of the manifest: there the data stack's radio-on answer sends stage f's initial-attach APN and stage e's data requests.
+    /// No radio cycle: until 2026-11-12 the data stack's radio went off and on again 9 and 9.5 s after INIT_END, on the theory that its first power-on predated the carrier pack. The Pro's run that day registered (01 00 00 14 at 7982 ms) and had its data call up (8623 ms) before the cycle, which then threw both away: registration 00 00 00 14, then 00 00 00 0E, the call lost, home again only at 11786 ms and the call back at 12553 ms.
+    #[inline(never)]
+    fn ril_step(&mut self, rep: &mut Vec<u8>) {
+        let t = since_us(self.t0) / 1000;
+        let probe = self.probe;
+        let data = CH_FMT0 + 1;
+        let link = &mut self.link;
+        let mut send = |rep: &mut Vec<u8>, ch: u8, id: u16, p: &[u8], what: &str| -> Option<u32> {
+            match sit_request(link, ch, id, p) {
+                Ok(tok) => {
+                    if !what.is_empty() {
+                        line(rep, alloc::format!("t={t} ms: -> {what} ch A#{ch} token A#{tok}\n"));
+                    }
+                    Some(tok)
+                }
+                Err(e) => {
+                    line(rep, alloc::format!("t={t} ms: G#{id:04X} {} not sent on ch A#{ch}: {e}\n", sit_name(id)));
+                    None
+                }
+            }
+        };
+        match self.ril {
+            RIL_ASKED if probe >= 2 => {
+                self.powered = true;
+                send(rep, CH_FMT0, SIT_SET_RADIO_POWER, &[2, 0, 0, 0, 0, 0], "SIT_SET_RADIO_POWER on (G#800)");
+                let on = send(rep, data, SIT_SET_RADIO_POWER, &[2, 0, 0, 0, 0, 0], "SIT_SET_RADIO_POWER on (G#800)");
+                if probe >= 3 {
+                    for ch in [CH_FMT0, data] {
+                        send(rep, ch, SIT_GET_SIM_STATUS, &[], "");
+                    }
+                }
+                self.ril = RIL_POWERED;
+                // From stage G#10 on the data stack's manifest answered moves it on (`ril_frame`), at once if it already was; before G#10, the data stack's radio-on answer.
+                self.ril_next = if probe < 6 { on.map(|tok| (data, SIT_SET_RADIO_POWER, tok)) } else { None };
+                if probe >= 6 && self.manifest_in {
+                    self.ril = RIL_MANIFEST;
+                    self.ril_step(rep);
+                }
+            }
+            RIL_POWERED => {
+                if probe == 5 {
+                    send(rep, data, SIT_SET_INITIAL_ATTACH_APN, &initial_attach_params(ATTACH_APN), "SIT_SET_INITIAL_ATTACH_APN IMS IPV4V6 (roaming IPV6)");
+                }
+                if probe >= 4 {
+                    send(rep, data, SIT_SET_PREFERRED_DATA_MODEM, &[1], "SIT_SET_PREFERRED_DATA_MODEM 1");
+                    send(rep, data, SIT_SET_PS_SERVICE, &[1], "SIT_SET_PS_SERVICE on");
+                }
+                self.ril = RIL_DONE;
+            }
+            RIL_MANIFEST => {
+                self.ril_next = send(rep, data, SIT_SET_UICC_SUBSCRIPTION, &[1], "SIT_SET_UICC_SUBSCRIPTION 1").map(|tok| (data, SIT_SET_UICC_SUBSCRIPTION, tok));
+                self.ril = RIL_UICC;
+            }
+            RIL_UICC => {
+                let mut last = None;
+                for p in VZW_PROFILES.iter() {
+                    last = send(rep, data, SIT_SET_DATA_PROFILE, &data_profile_params(p), "");
+                }
+                line(rep, alloc::format!("t={t} ms: -> SIT_SET_DATA_PROFILE x A#{} on ch A#{data}\n", VZW_PROFILES.len()));
+                self.ril_next = last.map(|tok| (data, SIT_SET_DATA_PROFILE, tok));
+                self.ril = RIL_PROFILES;
+            }
+            RIL_PROFILES => {
+                self.ril_next = send(rep, data, SIT_SET_ALLOW_NETWORK, &ALLOWED_RATS.to_le_bytes(), "SIT_SET_ALLOW_NETWORK G#403FE").map(|tok| (data, SIT_SET_ALLOW_NETWORK, tok));
+                self.ril = RIL_ALLOWED;
+            }
+            RIL_ALLOWED => {
+                send(rep, data, SIT_SET_PREFERRED_DATA_MODEM, &[1], "SIT_SET_PREFERRED_DATA_MODEM 1");
+                send(rep, data, SIT_SET_PS_SERVICE, &[1], "SIT_SET_PS_SERVICE on");
+                if probe != SERVICE {
+                    for id in [SIT_GET_STACK_STATUS, SIT_GET_CARRIER_RESTRICTIONS_V2, 0x0700, 0x0703, 0x070B, 0x0711, 0x0750] {
+                        send(rep, data, id, &[], "");
+                    }
+                }
+                self.ril = RIL_DONE;
+            }
+            _ => self.ril = RIL_DONE,
+        }
+    }
+
     /// One RCM message on the data stack's channel that bears on the serving cell (`m` from its type byte: type, 0, id u16, length u16, then a response's token u32 and error byte, its parameters at 12; an indication's at 8). Location data: kept for `cell`, never logged.
     /// - The registration reply (G#0701) without error: the serving cell (`Serving::parse` reads only what the parameters hold: they are the CP's input). As the stack becomes registered, its network is asked for (SIT_GET_OPERATOR).
     /// - The operator reply (G#0702) without error, as the vendor's ProtocolNetOperatorAdapter reads it: six ASCII digits at the parameters' start, MCC then MNC, a `#` in the sixth for a two-digit MNC (then the short and long names, not read).
@@ -2556,13 +2907,11 @@ impl Online {
             probed: false,
             powered: false,
             next_reg: 5_000_000,
-            sim_asked: false,
-            data_on: false,
-            ia_set: false,
-            queried: false,
-            uicc_on: false,
-            cycled: 0,
-            allow_set: false,
+            ril: RIL_ASKED,
+            ril_next: None,
+            ril_reasked: false,
+            manifest: None,
+            manifest_in: false,
             reg_last: [None, None],
             sig_last: [0; 256],
             sig_len: 0,
@@ -2676,70 +3025,12 @@ impl Online {
         if probe == SERVICE {
             self.service_extras(rep);
         }
-        let link = &mut self.link;
-        if probe >= 1 && !self.probed && since_us(t0) > 2_000_000 {
+        // The radio's setup opens at once, the rest of it on the CP's answers (`ril_step`): Android's RIL writes its first requests within milliseconds of INIT_END (the Linux log: INIT_END 8.824 s, the RIL's ipc_write on umts_ipc0 8.827 s).
+        if probe >= 1 && !self.probed {
             self.probed = true;
-            match sit_request(link, CH_FMT0, SIT_GET_RADIO_POWER, &[]) {
-                Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_GET_RADIO_POWER (G#{SIT_GET_RADIO_POWER:X}) token A#{tok} on ch A#{CH_FMT0}\n", since_us(t0) / 1000)),
-                Err(e) => line(rep, alloc::format!("t={} ms: SIT_GET_RADIO_POWER not sent: {e}\n", since_us(t0) / 1000)),
-            }
+            self.ril_ask(rep);
         }
-        // Stage e: what Android's telephony does for its data SIM once the SIM is ready — the preferred data modem (one byte, the stack's index: ProtocolPsBuilder::BuildSetPreferredDataModem), then allow data (SIT_SET_PS_SERVICE, one byte 1: ProtocolNetworkBuilder::BuildAllowData), both on that stack's channel. The SIM sits on stack 1 here (its confpack is us_vzw).
-        // Stage f: the initial-attach APN on the data SIM's stack before data is allowed, as Android's telephony sets it once the SIM is ready.
-        // Stage G#10: read-only queries for what else keeps the data SIM off the network: the stack's enabled state, the carrier-restriction (SIM lock) policy, the voice registration, the network-selection mode, the preferred network type, packet service and the allowed networks.
-        if probe >= 6 && !self.queried && since_us(t0) > 8_000_000 {
-            self.queried = true;
-            for id in [SIT_GET_STACK_STATUS, SIT_GET_CARRIER_RESTRICTIONS_V2, 0x0700, 0x0703, 0x070B, 0x0711, 0x0750] {
-                if let Err(e) = sit_request(link, CH_FMT0 + 1, id, &[]) {
-                    line(rep, alloc::format!("t={} ms: G#{id:X} not sent: {e}\n", since_us(t0) / 1000));
-                }
-            }
-        }
-        // Stage G#10: the data stack's radio cycled once the carrier pack is in (off at 9 s, on at 9.5 s): the first power-on went out before the manifest swapped the pack.
-        if probe >= 6 && self.cycled < 2 && since_us(t0) > 9_000_000 + 500_000 * self.cycled as u64 {
-            let v = if self.cycled == 0 { 1u8 } else { 2 };
-            self.cycled += 1;
-            match sit_request(link, CH_FMT0 + 1, SIT_SET_RADIO_POWER, &[v, 0, 0, 0, 0, 0]) {
-                Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_RADIO_POWER {} ch A#{} token A#{tok}\n", since_us(t0) / 1000, if v == 1 { "off" } else { "on" }, CH_FMT0 + 1)),
-                Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_RADIO_POWER not sent: {e}\n", since_us(t0) / 1000)),
-            }
-        }
-        // Stage G#10: the SIM's applications enabled (SIT_SET_UICC_SUBSCRIPTION, one byte 1: ProtocolSimBuilder::BuildSetUicc), what Android's enableUiccApplications(true) sends for each SIM at boot.
-        if probe >= 6 && !self.uicc_on && since_us(t0) > 6_200_000 {
-            self.uicc_on = true;
-            match sit_request(link, CH_FMT0 + 1, SIT_SET_UICC_SUBSCRIPTION, &[1]) {
-                Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_UICC_SUBSCRIPTION 1 ch A#{} token A#{tok}\n", since_us(t0) / 1000, CH_FMT0 + 1)),
-                Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_UICC_SUBSCRIPTION not sent: {e}\n", since_us(t0) / 1000)),
-            }
-        }
-        // Stage G#10: the data profiles instead — Android's RIL never sends SIT_SET_INITIAL_ATTACH_APN on this build; the attach APN rides in the profile table (the IMS profile's types carry IA).
-        if probe >= 6 && !self.ia_set && since_us(t0) > 6_500_000 {
-            self.ia_set = true;
-            let ch = CH_FMT0 + 1;
-            for p in VZW_PROFILES.iter() {
-                match sit_request(link, ch, SIT_SET_DATA_PROFILE, &data_profile_params(p)) {
-                    Ok(_) => {}
-                    Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_DATA_PROFILE not sent: {e}\n", since_us(t0) / 1000)),
-                }
-            }
-            line(rep, alloc::format!("t={} ms: -> SIT_SET_DATA_PROFILE x A#{} on ch A#{ch}\n", since_us(t0) / 1000, VZW_PROFILES.len()));
-        }
-        if probe == 5 && !self.ia_set && since_us(t0) > 6_500_000 {
-            self.ia_set = true;
-            let ch = CH_FMT0 + 1;
-            match sit_request(link, ch, SIT_SET_INITIAL_ATTACH_APN, &initial_attach_params(ATTACH_APN)) {
-                Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_INITIAL_ATTACH_APN {} IPV4V6 (roaming IPV6) ch A#{ch} token A#{tok}\n", since_us(t0) / 1000, alloc::string::String::from_utf8_lossy(ATTACH_APN))),
-                Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_INITIAL_ATTACH_APN not sent: {e}\n", since_us(t0) / 1000)),
-            }
-        }
-        // Stage G#10: the allowed networks set (SIT_SET_ALLOW_NETWORK, a u32 RAT bitmap in the CP's numbering: ProtocolNetworkBuilder::BuildSetAllowedNetworkTypeBitmap). Android's boot trace (2026-10-29, the radio log): the data stack sits not searching until SET_DATA_PROFILE, SET_INITIAL_ATTACH_APN and then SET_ALLOWED_NETWORK_TYPES_BITMAP, and is home on LTE 12 s after the last. The mask written is the one the CP itself reports (GET_ALLOW_NETWORK, G#4_03FE).
-        if probe >= 6 && !self.allow_set && since_us(t0) > 6_800_000 {
-            self.allow_set = true;
-            match sit_request(link, CH_FMT0 + 1, SIT_SET_ALLOW_NETWORK, &ALLOWED_RATS.to_le_bytes()) {
-                Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_ALLOW_NETWORK G#{ALLOWED_RATS:X} ch A#{} token A#{tok}\n", since_us(t0) / 1000, CH_FMT0 + 1)),
-                Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_ALLOW_NETWORK not sent: {e}\n", since_us(t0) / 1000)),
-            }
-        }
+        let link = &mut self.link;
         // Stage G#12: the internet data call once the data stack is home (registration state 1) or roaming (5): one SIT_SETUP_DATA_CALL on VZWINTERNET, as Android's RIL sends it after registering.
         if probe >= 8 && !self.call_sent && since_us(t0) > self.call_retry && matches!(self.reg_last[1], Some([1 | 5, ..])) {
             self.call_sent = true;
@@ -2779,24 +3070,6 @@ impl Online {
                 line(rep, alloc::format!("t={} ms: queues (fore/rear):{s}; ap2cp G#{:X} cp2ap G#{:X}\n", since_us(t0) / 1000, rd(AP2CP_MSG), rd(CP2AP_MSG)));
             }
         }
-        if probe >= 4 && !self.data_on && since_us(t0) > 7_000_000 {
-            self.data_on = true;
-            let ch = CH_FMT0 + 1;
-            for (id, v, name) in [(SIT_SET_PREFERRED_DATA_MODEM, 1u8, "SIT_SET_PREFERRED_DATA_MODEM 1"), (SIT_SET_PS_SERVICE, 1, "SIT_SET_PS_SERVICE on")] {
-                match sit_request(link, ch, id, &[v]) {
-                    Ok(tok) => line(rep, alloc::format!("t={} ms: -> {name} ch A#{ch} token A#{tok}\n", since_us(t0) / 1000)),
-                    Err(e) => line(rep, alloc::format!("t={} ms: {name} not sent: {e}\n", since_us(t0) / 1000)),
-                }
-            }
-        }
-        if probe >= 3 && !self.sim_asked && since_us(t0) > 6_000_000 {
-            self.sim_asked = true;
-            for ch in [CH_FMT0, CH_FMT0 + 1] {
-                if let Err(e) = sit_request(link, ch, SIT_GET_SIM_STATUS, &[]) {
-                    line(rep, alloc::format!("t={} ms: SIT_GET_SIM_STATUS not sent on ch A#{ch}: {e}\n", since_us(t0) / 1000));
-                }
-            }
-        }
         // The data registration polled every 5 s (the stage watch), or every 64 s once the service has its call (the CP's indications carry the changes; the poll is the backstop).
         if probe >= 3 && since_us(t0) > self.next_reg {
             self.next_reg += if probe == SERVICE && self.call.is_some() { 64_000_000 } else { 5_000_000 };
@@ -2807,7 +3080,7 @@ impl Online {
             }
         }
         // The screen's state, once the radio is on and at every change after (read every quarter second): Android's RIL says so at each screen change, and the CP holds its signal reports and stretches its own wakeups while it takes the screen for off. Then the signal asked for on the data stack's channel every 2 s while it is registered and the screen is on.
-        if probe >= 3 && self.powered && since_us(t0) > 4_000_000 && since_us(t0) > self.screen_check {
+        if probe >= 3 && self.powered && since_us(t0) > self.screen_check {
             self.screen_check = since_us(t0) + 250_000;
             let want = if ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1 { 2 } else { 1 };
             if want != self.screen_sent {
@@ -2824,16 +3097,6 @@ impl Online {
             self.sig_ask = since_us(t0) + 2_000_000;
             if let Err(e) = sit_request(link, CH_FMT0 + 1, SIT_GET_SIGNAL_STRENGTH, &[]) {
                 line(rep, alloc::format!("t={} ms: SIT_GET_SIGNAL_STRENGTH not sent: {e}\n", since_us(t0) / 1000));
-            }
-        }
-        if probe >= 2 && !self.powered && since_us(t0) > 3_000_000 {
-            self.powered = true;
-            // state 2 = on; the two option bytes are Android's forEmergencyCall and preferredForEmergencyCall (NetworkService::DoRadioPower → ProtocolNetworkBuilder::BuildRadioPower): both 0, a plain power-on for data. Each stack has its own RIL channel (245 the first SIM slot, 246 the second) and is powered on its own, as each Android RIL instance does.
-            for ch in [CH_FMT0, CH_FMT0 + 1] {
-                match sit_request(link, ch, SIT_SET_RADIO_POWER, &[2, 0, 0, 0, 0, 0]) {
-                    Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_RADIO_POWER on (G#{SIT_SET_RADIO_POWER:X}) ch A#{ch} token A#{tok}\n", since_us(t0) / 1000)),
-                    Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_RADIO_POWER not sent on ch A#{ch}: {e}\n", since_us(t0) / 1000)),
-                }
             }
         }
         for (name, base, len_max, headr, tailr) in [("raw", RX_RING, RX_RING_LEN, RXQ_HEAD, RXQ_TAIL), ("fmt", FMT_RX_RING, FMT_RX_RING_LEN, FMT_RXQ_HEAD, FMT_RXQ_TAIL)] {
@@ -2871,6 +3134,7 @@ impl Online {
                 }
             }
             if probe >= 1 && name == "fmt" && ch == CH_MODEM_SVC {
+                self.ril_svc_seen(rep);
                 let body: Vec<u8> = (0..flen - 12).map(|i| at(12 + i)).collect();
                 if let Some(replies) = modem_svc(rep, since_us(t0) / 1000, &body, &mut self.props) {
                     for reply in replies {
@@ -2919,12 +3183,13 @@ impl Online {
             }
             // A RIL message: the RCM header (type, id, length, then token and error for a response) decoded; the parameters as their first 16 bytes at most. The frame length is the CP's: a frame too short for the header it claims is logged raw below instead of read past its end.
             let ril = ch == CH_FMT0 || ch == CH_FMT0 + 1;
-            // The carrier-config handshake (stage G#10 on): the CP's G#4602 indication (the SIM's identity for the carrier lookup) is answered with SIT_OEM_SET_CARRIER_CONFIG_MANIFEST on the same stack.
-            if probe >= 6 && ril && flen >= 12 + 8 && at(12) == 2 && (at(14) as u16 | (at(15) as u16) << 8) == 0x4602 {
-                match sit_request(&mut self.link, ch, SIT_OEM_SET_CARRIER_CONFIG_MANIFEST, &carrier_manifest_params()) {
-                    Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_OEM_SET_CARRIER_CONFIG_MANIFEST {} manifest {} ch A#{ch} token A#{tok}\n", since_us(t0) / 1000, CARRIER_CONFIG_ROOT, VZW_MANIFEST)),
-                    Err(e) => line(rep, alloc::format!("t={} ms: carrier manifest not sent: {e}\n", since_us(t0) / 1000)),
+            // The carrier-config handshake and the radio's setup (`ril_frame`): the RCM header, a response's token and error included (12 bytes; an indication needs only its 8).
+            if ril && flen >= 12 + 8 {
+                let mut h = [0u8; 12];
+                for (i, b) in h.iter_mut().enumerate().take((flen - 12).min(12) as usize) {
+                    *b = at(12 + i as u32);
                 }
+                self.ril_frame(rep, ch, flen - 12, &h);
             }
             let rcm_hdr = if at(12) == 2 { 8 } else { 12 };
             // The SIM's file-data and status chatter (G#210, G#246, G#248, G#24F) is counted, not logged: it is long, frequent and identity.
@@ -3003,45 +3268,9 @@ impl Online {
                     self.call_retry = since_us(t0) + 2_000_000;
                 }
             }
-            // The first physical-channel-config and NITZ indications (the stack camped on a cell) are logged past the cap too, header only.
+            // The camp, NITZ and MCC indications (`ind_frame`: out of line, this loop outgrew the masked build's branch reach).
             if ril && at(12) == 2 && flen >= 12 + 8 {
-                let id = at(14) as u16 | (at(15) as u16) << 8;
-                let k = (ch - CH_FMT0) as usize;
-                let bit = match id { 0x0742 => 1u8, 0x0905 => 2, 0x0604 => 4, _ => 0 };
-                if bit != 0 && self.camp_seen[k] & bit == 0 {
-                    self.camp_seen[k] |= bit;
-                    line(rep, alloc::format!("t={} ms: ch A#{ch} first indication G#{id:04X} {}\n", since_us(t0) / 1000, sit_name(id)));
-                }
-                // NITZ, every time, whole: the network's time, its zone and daylight-saving offset, for the clock (layout read from these dumps; SIT is closed).
-                if id == 0x0905 {
-                    let mut l = alloc::string::String::new();
-                    for i in 12..flen.min(12 + 96) {
-                        let _ = core::fmt::Write::write_fmt(&mut l, format_args!("{:02X}", at(i)));
-                    }
-                    line(rep, alloc::format!("t={} ms: NITZ ({flen} bytes) {l}\n", since_us(t0) / 1000));
-                    // The zone (kernel zone.rs; owner, 2026-11-10: "cellular, then GPS"), handed to the kernel on every NITZ. The parameters after the 8-byte indication header, as the vendor's ProtocolNitzData reads them (vendor.radio.protocol.sit.stream.so, its accessors need 17 bytes): 0 the daylight flag valid, 1-6 the time (UTC), 7 the zone in signed quarter hours (the whole legal offset, daylight time in it), 8 the daylight adjustment in hours, 9 the weekday, 10 MM info, 11-16 the network (MCC then MNC, ASCII).
-                    if flen >= 20 + 17 {
-                        let p = |i: u32| at(20 + i);
-                        let offset = p(7) as i8 as i32 * 900;
-                        let dst = (p(0) != 0).then_some(p(8) != 0);
-                        let mcc = mcc_of([p(11), p(12), p(13)]);
-                        let ok = ferros_sys::zone::network(mcc, Some((offset, dst)));
-                        line(rep, alloc::format!("t={} ms: NITZ: MCC A#{mcc}, UTC {}{} min{}, to the clock{}\n", since_us(t0) / 1000, if offset < 0 { "-" } else { "+" }, offset.unsigned_abs() / 60, match dst {
-                            Some(true) => ", daylight time",
-                            Some(false) => ", standard time",
-                            None => "",
-                        }, if ok { "" } else { ": REFUSED" }));
-                    }
-                }
-                // The network's country alone (SIT IND_MCC, G#072D): its MCC as three ASCII digits after the header's first parameter byte (the vendor's ProtocolNetMccAdapter copies them from there), for the zone when NITZ has not come.
-                if id == 0x072D && flen >= 20 + 4 {
-                    let mcc = mcc_of([at(21), at(22), at(23)]);
-                    if mcc != 0 && mcc != self.mcc_said {
-                        self.mcc_said = mcc;
-                        let ok = ferros_sys::zone::network(mcc, None);
-                        line(rep, alloc::format!("t={} ms: the network's MCC A#{mcc}, to the clock{}\n", since_us(t0) / 1000, if ok { "" } else { ": REFUSED" }));
-                    }
-                }
+                self.ind_frame(rep, ch, flen, &at);
             }
             if quiet {
                 // Counted in per_ch only.

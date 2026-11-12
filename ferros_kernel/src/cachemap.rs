@@ -25,6 +25,8 @@ static mut L2_HI: Table = Table([0; 512]);
 /// Level 2 for the first GiB (the MMIO below the window): Device blocks, EL2-only, except the USB controller's block, which EL0 may reach (`USB_REGS`).
 static mut L2_LO: Table = Table([0; 512]);
 static mut L3: [Table; 2] = [Table([0; 512]), Table([0; 512])];
+/// Level 3 for the IPC window's first 2 MiB: its pages Device, as the block was, except the TX ring's (`MODEM_TX_NC`), Normal non-cacheable.
+static mut L3_MODEM: Table = Table([0; 512]);
 
 /// The arcs' virtual windows (ARCS.md, 2026-11-11): every process's arc is a window of addresses here, its 2 MiB slots mapped to frames of the pool wherever they lie (frames.rs), so an arc grows by mapping more and moves by remapping, and no process ever sees an address change. 64 GiB from G#40_0000_0000: above every address the SoC decodes on either board (DRAM ends at G#B_0000_0000), inside the 39-bit space TTBR0 walks. Until 2026-11-11 arcs were the physical pools themselves, identity-mapped (POOL's and POOL_BIG's own level-3 tables, which this replaces).
 /// Why windows and not a base register for every mode (ARCS.md proposed fixed and ring move by x28 alone): masked code keeps only the low bits of a data pointer, but its code pointers are whole addresses (return addresses on its stack, the vtables its relocations filled, function pointers), and a branch is not masked, so after a copy to a new base the first `ret` would jump into the old frames.
@@ -73,7 +75,13 @@ pub const POOL: (usize, usize) = (0x92C0_0000, 0x92E0_0000);
 pub const POOL_BIG: (usize, usize) = (0xA000_0000, 0xB400_0000);
 
 /// The cellular modem's shared memory, EL0-accessible Device memory for its driver process (process.rs DMA `modem-pktproc`, `modem-ipc`, `modem-msi`; zuma-rmem.dtsi carveouts): pktproc's rings and packet buffers (32 MiB), the IPC region (legacy rings, handover block, ROM image; 4 MiB), the MSI and boot-register page. Device, as the kernel's own view of them: the CP writes them over PCIe and no cache line may hide that. 2 MiB aligned, in the GiB above the window.
+/// One part of it is not Device: `MODEM_TX_NC`.
 pub const MODEM_WINDOWS: [(usize, usize); 3] = [(0xE800_0000, 0xEA00_0000), (0xEA40_0000, 0xEA80_0000), (0xF620_0000, 0xF640_0000)];
+/// The legacy RAW TX ring (IPC + G#3000 to IPC + G#20_0000: payloads/modem `TX_RING`, cpif `legacy_raw_buffer_offset` and `legacy_raw_txq_size`), Normal non-cacheable for the modem's driver, the rest of the IPC window's first 2 MiB staying Device (`L3_MODEM`).
+/// Only the AP writes it and the CP only reads it (the boot channel's 98 MB of firmware, then the remote-file service's frames), so no cache line could hide anything even cached; non-cacheable lets the core gather a run of stores into whole bursts where Device-nGnRnE sent each 8-byte store alone and waited for its write response (the Pro, 2026-11-12: MAIN's 98 MB took 1857 ms "into the ring", 26 MB/s for the whole section).
+/// Android maps all of IPC Normal cacheable with PCIe IO coherency (zuma-cp-s5300-sit.dtsi `region,cached = <1>`, cpif shm_ipc.c `cp_shmem_get_region`; `txq_write` copies with memcpy and no barrier but the head's); write-combining is what cpif gives every region it maps uncached (`cp_shmem_get_nc_region`: `pgprot_writecombine`).
+/// The cursors, message words and handover block (the first G#3000) and the RX ring the CP writes stay Device, so every read of what the CP wrote is still a fresh, ordered read; the driver orders the ring's stores before the head's write with `dsb sy` (payloads/modem `publish`, `ring_frame`).
+pub const MODEM_TX_NC: (usize, usize) = (0xEA40_3000, 0xEA60_0000);
 /// The USB controller's registers (DWC3, G#1121_0000, 64 KiB), EL0 Device memory for the USB driver process (USB.md: USB out of the kernel), its 2 MiB block mapped as the modem's windows are: nothing else lives in G#1120_0000-G#1140_0000 (zuma device tree). Granted as `usb-regs`.
 pub const USB_REGS: (usize, usize) = (0x1120_0000, 0x1140_0000);
 /// The USB driver's DMA memory (cold only): 8 MiB of EL0 read/write memory, 8 MiB aligned: the controller's event ring, TRBs and buffers (ferros_hal::usb::UsbMem, the run buffer) in the first 2 MiB, Normal non-cacheable (`USB_DMA_NC`); a PT command assembled in the 6 MiB after (payloads/usb), cacheable. No reserved-memory node of the device tree lies below G#9000_0000, so this is ferros's own: above the camera's diagnostic buffers (which end at G#8B10_0000), up to the display's dither phases (G#8C00_0000). Granted as `usb-dma`.
@@ -333,7 +341,20 @@ pub fn enable() -> bool {
                 let a = base + j * MIB2;
                 let normal_here = (a >= s0 && a + MIB2 <= s1) || (p0 != p1 && a >= p0 && a + MIB2 <= p1) || (q0 != q1 && a >= q0 && a + MIB2 <= q1);
                 let modem_here = MODEM_WINDOWS.iter().any(|w| a >= w.0 && a + MIB2 <= w.1);
-                *e = if normal_here { pool(vhe, a, BLOCK) | UXN } else if modem_here { device_el0(vhe, a, BLOCK) } else { device(vhe, a, BLOCK) };
+                *e = if normal_here {
+                    pool(vhe, a, BLOCK) | UXN
+                } else if modem_here && a == MODEM_TX_NC.0 & !(MIB2 - 1) {
+                    let t = &mut *(&raw mut L3_MODEM);
+                    for (k, p) in t.0.iter_mut().enumerate() {
+                        let pa = a + k * PAGE;
+                        *p = if pa >= MODEM_TX_NC.0 && pa < MODEM_TX_NC.1 { dma_pool(vhe, pa, TABLE_OR_PAGE) } else { device_el0(vhe, pa, TABLE_OR_PAGE) };
+                    }
+                    &raw const t.0 as u64 | TABLE_OR_PAGE
+                } else if modem_here {
+                    device_el0(vhe, a, BLOCK)
+                } else {
+                    device(vhe, a, BLOCK)
+                };
             }
             l1.0[s0 / GIB] = &raw const L2_HI as u64 | TABLE_OR_PAGE;
         }

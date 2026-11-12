@@ -1,4 +1,4 @@
-//! What modem.rs reaches the hardware through, as a process: the modem's shared memory directly (EL0 Device windows, kernel cachemap.rs `MODEM_WINDOWS`), every register through its hardware grant (a syscall per access), the PMU through the kernel's EL3 path, time from the generic timer.
+//! What modem.rs reaches the hardware thru, as a process: the modem's shared memory directly (EL0 windows, kernel cachemap.rs `MODEM_WINDOWS`: Device, but for the RAW TX ring, Normal non-cacheable, `MODEM_TX_NC`), every register thru its hardware grant (a syscall per access), the PMU thru the kernel's EL3 path, time from the generic timer.
 
 use crate::{S_DMA, S_HW};
 
@@ -69,7 +69,7 @@ pub fn win_wr32(a: usize, v: u32) {
     match window(a) { (0, o) => Pktproc::write32(o, v), (1, o) => Ipc::write32(o, v), (_, o) => Msi::write32(o, v) }
 }
 /// `words` into a window from `a`, the window found once and one 8-byte store a word (`Handle::write_words`).
-/// The windows are Device-nGnRnE (kernel cachemap.rs `device_el0`): no store is gathered with another, so a byte at a time is eight times the bus transactions of a word at a time (the boot channel's 98 MB went a byte a store until 2026-11-11).
+/// The RAW TX ring is Normal non-cacheable (kernel cachemap.rs `MODEM_TX_NC`, since 2026-11-12): a run of word stores is gathered into whole bursts, and the caller orders them before the head's write with `dsb sy`. The rest of the windows are Device-nGnRnE, where no store is gathered with another and each waits for its write response (the boot channel's 98 MB went a byte a store until 2026-11-11, then a word a store at 26 MB/s for the whole section).
 pub fn win_write_words(a: usize, words: &[u64]) {
     match window(a) { (0, o) => Pktproc::write_words(o, words), (1, o) => Ipc::write_words(o, words), (_, o) => Msi::write_words(o, words) }
 }
