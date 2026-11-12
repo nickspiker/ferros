@@ -8,6 +8,8 @@
 //!
 //! The handle shows as it is typed: it is a name the person proves, not a password (owner, 2026-10-27: "this is NOT a password"). A wrong one stays on screen to be corrected; the bar's left key clears it. Minting a new identity asks for the handle a second time, shown as typed like the first, the first cleared so a typo is not simply copied (owner, 2026-10-27: "you only do that once"); clear during the second goes back to the first. The buffer is wiped once attest succeeds.
 //!
+//! After attest this process stays, its window gone, as the device's keyboard (WINDOWS.md "The keyboard"): for words the identity service wants typed (the Fleet page), and as the system keyboard for the app in front, which asks the display for it as a text field gains focus. Then the same keys, docked at the screen's bottom at the input level, each stroke typed into that app thru the display (ops 69 to 71), nothing typed kept here.
+//!
 //! The scratch is this process's own .bss (25 MiB): the entry's header (`ferrosRT`, ferros_rt's) tells the kernel how much zeroed memory follows the code, so the arc holds it (payload.ld).
 //!
 //! The keyboard is the device's layout (`device.layout`, ferros_sys::PREF_LAYOUT: Dvorak unless set), which the last identity to attest leaves on the device (SETTINGS.md). There is no switch on this screen (owner, 2026-10-29: the room went to the mark); the layout is set from the identity's settings or `diag pref`, and the keyboard follows it.
@@ -387,6 +389,34 @@ fn tag_take(seen: u32) -> Option<(u32, ([u8; 10], usize))> {
         }
     }
 }
+/// The keyboard's doorbell as `keyboard_thread` last heard it (display op 69, WINDOWS.md "The keyboard"): the display's count shifted up one, bit 0 whether an app wants the keyboard. The hosting loop waits on it; nothing asks on a timer.
+static KEYS_WANT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static mut KEYS_STACK: [u8; 1 << 14] = [0; 1 << 14];
+
+/// Holds the display's keyboard watch (op 69) from attest on, publishing each answer into KEYS_WANT and waking the hosting loop. A display that ended holding the call fails it once, and the next call waits for the display after it; a display without the op, or one that refuses (this process not the system's), fails every call: two failures in a row end the watch, and the keyboard is never shown.
+extern "C" fn keyboard_thread(grants: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    let display = cap(grants, S_DISPLAY);
+    // u32::MAX is never a count the display has given, so the first watch is answered at once with how things stand.
+    let mut seen = u32::MAX;
+    let mut failed = false;
+    loop {
+        let Some((count, wanted)) = window::keyboard_watch(display, seen) else {
+            if failed {
+                console(grants, b"ahau: the display has no keyboard watch for this process; no system keyboard\n");
+                ferros_sys::thread_exit(0);
+            }
+            failed = true;
+            seen = u32::MAX;
+            continue;
+        };
+        failed = false;
+        seen = count;
+        KEYS_WANT.store((count as u64) << 1 | wanted as u64, Ordering::Release);
+        ferros_sys::wake(&KEYS_WANT, 1);
+    }
+}
+
 /// Slot 10: a second surface, the keyboard's back buffer: a board that a key's tap will redraw (shift, a page, a layout) is drawn there whole while the finger is down and copied in at the lift (`prepare`), as the mark's frame is rendered ahead by its thread. Without it the lift redrew the board in place, 59 ms (2026-11-01: draw 14, the key map 37, the tint 8), and the shift showed a few frames late.
 const S_BACK: u64 = 10;
 /// Slots 11 and 12: the GPU service (`use gpu`) and the layer arena, where the mark's quick pass is drawn on the GPU (GPU.md, "The resident service, and the attest mark's path"). Without them (after a jump, no GPU service) the quick pass stays on the CPU.
@@ -680,6 +710,8 @@ enum Mode {
     Words(u8),
     /// After attest, waiting for words to be wanted, the window gone.
     Hosting,
+    /// After attest, the system keyboard for the app in front (WINDOWS.md "The keyboard"): the keys alone, docked at the screen's bottom at the input level, each stroke typed into that app thru the display (op 70), never kept here.
+    Keys,
     /// The network page over the attest screen (ATTEST-UI.md "First use", 2: pulled down from the mark): the networks the WiFi chip sees; the mode under it waits in `under`.
     Networks,
     /// The network page: the passphrase for the network picked, typed on the keyboard (it never feeds the mark or the keys' rainbow).
@@ -771,7 +803,14 @@ impl Ahau {
 
     /// Rows y0..y1 of the buffer onto the shown surface.
     fn present(&self, y0: usize, y1: usize) {
-        Front::write_words(window::PORCH + (y0 * self.w * 8) as u64, &self.surf()[y0 * self.w..y1 * self.w]);
+        let rows = &mut self.surf()[y0 * self.w..y1 * self.w];
+        // The system keyboard is opaque over the app (WINDOWS.md "The keyboard"): the see-through gaps and edges the attest screen's words show thru would hand a finger between two keys to the app under them (the hit map gives a see-through pixel to what is behind it). The bits dropped, every pixel stands over black: the premultiplied channels are its light over black already, and a clear one's are nothing.
+        if self.mode == Mode::Keys {
+            for p in rows.iter_mut() {
+                *p &= (1 << 49) - 1;
+            }
+        }
+        Front::write_words(window::PORCH + (y0 * self.w * 8) as u64, rows);
     }
 
     /// Rows y0..y1 of the buffer onto surface `tb` (the second surface or the shown one), for the display to draw text into.
@@ -931,7 +970,7 @@ impl Ahau {
             // Only a network this device can join (WPA2-PSK outside 6 GHz) gets a join.
             Mode::Pass if self.net_found().is_some_and(|f| f.1 & 1 != 0) => Some(t(Msg::Join)),
             Mode::Pass => None,
-            Mode::Looking(_) | Mode::Join(_) | Mode::Bound(_) | Mode::Grey(_) | Mode::Hosting | Mode::Networks => None,
+            Mode::Looking(_) | Mode::Join(_) | Mode::Bound(_) | Mode::Grey(_) | Mode::Hosting | Mode::Keys | Mode::Networks => None,
         }
     }
 
@@ -2172,13 +2211,20 @@ impl Ahau {
             Mode::Wrong => tx(Msg::RecordMismatch),
             Mode::Owned => fl(Fleet::OwnedByOther),
             Mode::Words(_) => fl(Fleet::TypeWords),
-            Mode::Hosting => Line::new(),
+            Mode::Hosting | Mode::Keys => Line::new(),
             // The network page writes its own lines (`net_status`).
             Mode::Networks | Mode::Pass => Line::new(),
         }
     }
 
     fn show(&self) {
+        // The system keyboard: its rows alone, from the keys' top to the screen's bottom, at the input level over the app in front; only they changed.
+        if self.mode == Mode::Keys {
+            let top = self.kb.top as u16;
+            let rows = (self.h - self.kb.top) as u16;
+            window::show_changed(self.display, self.base, 0, top, self.w as u16, rows, window::INPUT, window::WORKING, (0, top, self.w as u16, rows));
+            return;
+        }
         window::show(self.display, self.base, 0, 0, self.w as u16, self.h as u16, window::SYSTEM);
     }
 
@@ -2211,7 +2257,7 @@ impl Ahau {
                 self.end_words(true);
                 return;
             }
-            Mode::Hosting => return,
+            Mode::Hosting | Mode::Keys => return,
             Mode::Join(_) | Mode::Grey(_) => return,
             Mode::Wrong | Mode::Owned => {
                 self.mode = Mode::Fresh;
@@ -2420,7 +2466,9 @@ impl Ahau {
         // Attest is over: no tag is wanted here any more, and the NFC driver lets the held call go (the settings page's too, if one is held; it asks again).
         TAG_WANT.store(0, core::sync::atomic::Ordering::Release);
         ferros_sys::nfc::tag_let_go(cap(self.grants, S_NFC));
-        console(self.grants, b"ahau: staying as the keyboard for words the identity service asks for (the Fleet page)\n");
+        console(self.grants, b"ahau: staying as the keyboard for words the identity service asks for (the Fleet page), and as the system keyboard for the app in front\n");
+        // The system keyboard's doorbell (`keyboard_thread`): the display rings it as an app in front wants the keyboard or lets it go.
+        ferros_sys::thread_spawn(keyboard_thread, unsafe { &mut *(&raw mut KEYS_STACK) }, self.grants);
         let touch = cap(self.grants, S_TOUCH);
         let mut touches = Touches::new(self.w);
         touches.trace_words = false;
@@ -2429,21 +2477,35 @@ impl Ahau {
         let mut pressed: Option<Key> = None;
         loop {
             ferros_sys::pet();
-            let kind = self.words_wanted();
-            if kind == 0 {
-                sleep_until(now() + freq() / 4);
-                continue;
+            let keys = KEYS_WANT.load(core::sync::atomic::Ordering::Acquire);
+            // The words wanted (0 while the system keyboard is up).
+            let mut kind = 0;
+            if keys & 1 == 1 {
+                self.keys_up();
+            } else {
+                kind = self.words_wanted();
+                if kind == 0 {
+                    // Asleep until the keyboard is wanted (its doorbell) or the identity service is asked again (four times a second, as before the keyboard).
+                    ferros_sys::wait_world(&KEYS_WANT, keys, now() + freq() / 4);
+                    continue;
+                }
+                self.mode = Mode::Words(kind);
+                self.wipe();
+                self.retint();
+                self.all();
+                self.show();
+                console(self.grants, b"ahau: words wanted: a new device's\n");
             }
-            self.mode = Mode::Words(kind);
-            self.wipe();
-            self.retint();
-            self.all();
-            self.show();
-            console(self.grants, b"ahau: words wanted: a new device's\n");
             let mut polls = 0u32;
-            while matches!(self.mode, Mode::Words(_)) {
+            while matches!(self.mode, Mode::Words(_) | Mode::Keys) {
                 ferros_sys::pet();
-                if self.blink() {
+                // The app in front let the keyboard go (its field lost focus, it went behind, back's tap, the keyboard's own key): down.
+                if self.mode == Mode::Keys && KEYS_WANT.load(core::sync::atomic::Ordering::Acquire) & 1 == 0 {
+                    self.keys_down();
+                    break;
+                }
+                // The blinkey is the words' entry line's: the system keyboard has none.
+                if matches!(self.mode, Mode::Words(_)) && self.blink() {
                     self.show_entry();
                 }
                 let n = call(touch, &[1], &mut r) as usize;
@@ -2461,29 +2523,27 @@ impl Ahau {
                     outs[no] = t;
                     no += 1;
                 });
+                // A key let go without its tap (the finger slid off), decided after the whole poll as the attest screen's loop does: a lift reports the key's Unlight just before its Tap, and taken at once the Unlight forgot the press, so the Tap typed the key a second time (every stroke twice on the system keyboard, 2026-11-12, "hhii" for "hi" in Photon's handle field; the words had the same).
+                let mut slid = None;
                 for &t in &outs[..no] {
-                    if !matches!(self.mode, Mode::Words(_)) {
+                    if !matches!(self.mode, Mode::Words(_) | Mode::Keys) {
                         break;
                     }
                     match t {
-                        // Typed at the press, as the handle is (COMMIT_AT_PRESS): the lift only lets the key go.
+                        // Typed at the press, as the handle is (COMMIT_AT_PRESS): the lift only lets the key go. The system keyboard types the same way, its keys the attest screen's.
                         Touch::Light(key) => {
                             self.light(key, true);
                             self.prepare(key);
                             self.tap(key);
-                            if matches!(self.mode, Mode::Words(_)) {
+                            if matches!(self.mode, Mode::Words(_) | Mode::Keys) {
                                 self.light(key, true);
                             }
                             pressed = Some(key);
                         }
-                        Touch::Unlight(key) => {
-                            if pressed == Some(key) {
-                                pressed = None;
-                            }
-                            self.light(key, false);
-                        }
+                        Touch::Unlight(key) => slid = Some(key),
                         Touch::Scrolled => self.show_board(),
                         Touch::Tap(key) => {
+                            slid = None;
                             if pressed == Some(key) {
                                 pressed = None;
                                 self.light(key, false);
@@ -2491,11 +2551,20 @@ impl Ahau {
                                 self.tap(key);
                             }
                         }
-                        Touch::TapAt(x, y) => self.tap_at(x, y),
-                        Touch::Drag(x0, y0, x, _) => {
+                        // The entry line's (the words'): the system keyboard has no line of its own, the app's field is the app's.
+                        Touch::TapAt(x, y) if self.mode != Mode::Keys => self.tap_at(x, y),
+                        Touch::Drag(x0, y0, x, _) if self.mode != Mode::Keys => {
                             self.drag_text(x0, y0, x);
                         }
-                        Touch::Trail(..) | Touch::Traced => {}
+                        Touch::TapAt(..) | Touch::Drag(..) | Touch::Trail(..) | Touch::Traced => {}
+                    }
+                }
+                if let Some(key) = slid {
+                    if pressed == Some(key) {
+                        pressed = None;
+                    }
+                    if matches!(self.mode, Mode::Words(_) | Mode::Keys) {
+                        self.light(key, false);
                     }
                 }
                 // The identity service no longer wants them (matched on its side, the Fleet page closed the flow, the departure gone): the screen goes.
@@ -2503,7 +2572,7 @@ impl Ahau {
                 if polls % 64 == 0 && matches!(self.mode, Mode::Words(_)) && self.words_wanted() != kind {
                     self.end_words(false);
                 }
-                if matches!(self.mode, Mode::Words(_)) && (no > 0 || self.follow_layout()) {
+                if matches!(self.mode, Mode::Words(_) | Mode::Keys) && (no > 0 || self.follow_layout()) {
                     self.show();
                 }
                 sleep_until(now() + freq() / 240);
@@ -2570,6 +2639,62 @@ impl Ahau {
         window::done(self.display, self.base);
     }
 
+    /// The system keyboard up for the app in front (WINDOWS.md "The keyboard"): the attest screen's own keys and their drawing (the boards, the back buffer, a key lit at its press), docked at the screen's bottom at the input level. The bar's left key puts it away; the keys untinted, the rainbow staying the attest screen's own; opaque (`present`).
+    fn keys_up(&mut self) {
+        use ferros_lang::{t, Msg};
+        self.mode = Mode::Keys;
+        self.kb.left = t(Msg::KeyHide);
+        self.kb.bar[0] = t(Msg::KeyHide);
+        self.kb.shift = honeycomb::Shift::Off;
+        self.kb.tint = None;
+        // Below the bar's foot, if the circle's bottom is above the screen's: nothing of the keyboard's, black.
+        let (bottom, w) = (self.kb.bottom, self.w);
+        self.surf()[bottom * w..self.h * w].fill(0);
+        self.present(bottom, self.h);
+        self.show_board();
+        self.show();
+        console(self.grants, b"ahau: the keyboard up for the app in front\n");
+    }
+
+    /// The system keyboard down: its window gone, the bar's left key the attest screen's clear again for the words.
+    fn keys_down(&mut self) {
+        use ferros_lang::{t, Msg};
+        self.mode = Mode::Hosting;
+        window::done(self.display, self.base);
+        self.kb.left = t(Msg::KeyClear);
+        self.kb.bar[0] = t(Msg::KeyClear);
+        console(self.grants, b"ahau: the keyboard down\n");
+    }
+
+    /// A stroke on the system keyboard: a character typed into the app in front (display op 70, which takes it to the window that asked for the keyboard while it is in front, and nowhere else), enter and delete as their keys, the left key puts the keyboard away (op 71). A shift or a page, or a letter that ended a one-letter shift, brings its board, drawn at the press (`prepare`). Nothing typed is kept here.
+    fn keys_tap(&mut self, key: Key) {
+        let was = board_key(&self.kb);
+        match self.kb.tap(key) {
+            Some(Event::Char(c)) => {
+                let mut b = [0u8; 4];
+                window::type_text(self.display, c.encode_utf8(&mut b).as_bytes());
+            }
+            Some(Event::Back) => {
+                window::type_key(self.display, window::KEY_BACKSPACE);
+            }
+            Some(Event::Enter) => {
+                window::type_key(self.display, window::KEY_ENTER);
+            }
+            Some(Event::Leave) => {
+                window::keyboard_away(self.display);
+                return;
+            }
+            Some(Event::Redraw) => {
+                self.show_board();
+                return;
+            }
+            None => return,
+        }
+        if board_key(&self.kb) != was {
+            self.show_board();
+        }
+    }
+
     /// A finger is down on `key`: the handle as that key would make it goes to the mark's thread now, so its frame is ready by the lift; the text itself changes only at the lift (`tap`). The key's effect is found on a copy of the keyboard (its shift and page are the real one's), so nothing here changes until the tap.
     fn preview(&self, key: Key) {
         if !self.typing() || matches!(self.mode, Mode::Words(_) | Mode::Networks | Mode::Pass) {
@@ -2611,6 +2736,10 @@ impl Ahau {
     }
 
     fn tap(&mut self, key: Key) {
+        if self.mode == Mode::Keys {
+            self.keys_tap(key);
+            return;
+        }
         let typing = self.typing();
         match self.kb.tap(key) {
             Some(Event::Char(_) | Event::Back | Event::Enter | Event::Leave) if !typing => return,
@@ -3047,15 +3176,15 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         console(grants, b"ahau: no surface\n");
         exit(2);
     }
-    // Unlocked and bound already (unlock at boot, `device.unlock_at_boot`, AUTH.md: the kernel unlocked the device's own identity from the seed it kept, before init started anything): no attest screen; the identity service (fgtw) loads its own from that space. Unlocked but not bound is a join in progress (this screen restarted mid-way): the screen comes back, and the handle typed again is recognized at once.
-    if ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true) && ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true) {
+    // Unlocked and bound already (unlock at boot, `device.unlock_at_boot`, AUTH.md: the kernel unlocked the device's own identity from the seed it kept, before init started anything; or this process started again after attest): no attest screen; the identity service (fgtw) loads its own from that space. The process stays all the same, as the device's keyboard (`host_words`, below, once the keyboard is built; until 2026-11-12 it ended here, and a device unlocked at boot had no keyboard for its kists). Unlocked but not bound is a join in progress (this screen restarted mid-way): the screen comes back, and the handle typed again is recognized at once.
+    let at_boot = ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true) && ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true);
+    if at_boot {
         console(grants, b"ahau: the identity was unlocked at boot; no attest screen\n");
         // The person's wallpaper from the seed kept when they last typed their handle (`wallpaper`).
         let mut ws = [0u8; 32];
         if ferros_sys::store_get(cap(grants, S_AHAU), b"wallpaper", &mut ws) == Some(32) {
             send_wallpaper(cap(grants, S_DISPLAY), &ws);
         }
-        exit(0);
     }
     let mode = Mode::Fresh;
     let mut kb = Keyboard::new(w, ferros_sys::active_circle(w, h));
@@ -3079,6 +3208,10 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     };
     let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, roots_gen: 0, client_seen: 0, marked: false, handle: [0; TEXT_BYTES], len: 0, chars: 0, caret: 0, scale: core::cell::Cell::new(ferros_sys::ui_scale() as f32), text_to: core::cell::Cell::new(base), status_text: core::cell::Cell::new(([0; 256], 0)), denied: core::cell::Cell::new(false), word_buf: [0; 512], word_len: 0, nets_seen: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None), under: Mode::Fresh, stash: ([0; TEXT_BYTES], 0, 0, 0), nets: [0; 1 << 11], nets_len: 0, pick: ([0; 32], 0), filter: ([0; 128], 0, 0), joining: false, pressed: core::cell::Cell::new(None), status_lines: core::cell::Cell::new(0), words_shown: core::cell::Cell::new(false), words_scroll: core::cell::Cell::new(0), words_grab: core::cell::Cell::new(None), words_dys: core::cell::Cell::new([0; 3]), words_fling: core::cell::Cell::new(0.), words_fling_res: core::cell::Cell::new(0.), words_max: core::cell::Cell::new(0), words_frame: core::cell::Cell::new(None), dev_name: ([0; 48], 0) };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
+    // Unlocked at boot (above): straight to the keyboard, the attest screen never shown.
+    if at_boot {
+        a.host_words();
+    }
     // The identity service's two threads (`roots_thread`, `client_thread`): both sleep until a handle is typed.
     ferros_sys::thread_spawn(roots_thread, unsafe { &mut *(&raw mut ROOTS_STACK) }, grants);
     ferros_sys::thread_spawn(client_thread, unsafe { &mut *(&raw mut CLIENT_STACK) }, grants);

@@ -47,6 +47,7 @@ mod draw;
 mod events;
 mod glyphs;
 mod hit;
+mod keyboard;
 mod modeset;
 mod neon;
 mod odt;
@@ -3282,7 +3283,7 @@ static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight): their caller's holdings are asked of the kernel as they arrive.
 fn names_surface(op: u8) -> bool {
-    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67)
+    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71)
 }
 
 /// What the process behind the call holds (kernel SYS_CALLER: bit k surface k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
@@ -3302,7 +3303,7 @@ fn manages(h: u64, k: usize) -> bool {
     holds(h, k) || h & ferros_sys::CALLER_SETTINGS != 0
 }
 
-/// The surface op `m` names that holdings `h` do not reach, if any: a show's surface or its mailbox's buffer (22), a done (23), text drawn into it (26, 29), a window to the front (59, its holder's or the system's). The ops on the app window in front (43, 60, 61) are checked where the front is known, as they run.
+/// The surface op `m` names that holdings `h` do not reach, if any: a show's surface or its mailbox's buffer (22), a done (23), text drawn into it (26, 29), the keyboard wanted for it (68), a window to the front (59, its holder's or the system's). The ops on the app window in front (43, 60, 61) are checked where the front is known, as they run.
 fn not_theirs(m: &[u8], h: u64) -> Option<usize> {
     let at = |i: usize| surface_of(u64::from_le_bytes(m[i..i + 8].try_into().unwrap())).filter(|&k| !holds(h, k));
     match m.first() {
@@ -3310,6 +3311,8 @@ fn not_theirs(m: &[u8], h: u64) -> Option<usize> {
         Some(22) if m.len() >= 18 => at(9),
         Some(23) if m.len() >= 9 => at(1),
         Some(26 | 29) if m.len() >= 17 => at(1),
+        // The keyboard wanted for a window: its holder's alone (WINDOWS.md "The keyboard").
+        Some(68) if m.len() >= 10 => at(1),
         Some(59) if m.len() >= 3 => Some(m[1] as usize).filter(|&k| k < SURFACES && !manages(h, k)),
         _ => None,
     }
@@ -4358,6 +4361,7 @@ static mut HITS_STALE: bool = true;
 /// After a window left: every phase owes the whole screen; with none left, the map has the screen again and its next frame repaints all of it.
 fn windows_changed(width: usize, height: usize) {
     let full = draw::Rect::full(width, height);
+    keys_follow(width, height);
     layout_build(width, height);
     wins_mirror();
     full_follow();
@@ -4372,6 +4376,43 @@ fn windows_changed(width: usize, height: usize) {
             APP = Some(full);
         }
     }
+}
+
+/// The keyboard follows the windows (WINDOWS.md "The keyboard"), after any change to them and to who wants it: the window that wants it must still be the app in front under the same owner, or nobody does; the input level shows only while one does (its windows kept behind otherwise, so the keyboard never stands over the map or another app); and the window that wants it is told the rows the keyboard covers from the screen's bottom as they change (`EV_INSET`), the one that wanted it before told they are none. True when an input window went behind or came back: the caller rebuilds the layout (`windows_changed`, or the show's own).
+fn keys_follow(width: usize, height: usize) -> bool {
+    use ferros_sys::window::{EV_INSET, INPUT};
+    let wins = unsafe { &mut *(&raw mut WINS) };
+    if let Some((k, g)) = keyboard::want() {
+        if front_app() != Some(k) || wins[k].is_none_or(|w| w.generation != g) || live_gen(k) != g {
+            keyboard::set(None);
+        }
+    }
+    let want = keyboard::want();
+    let mut changed = false;
+    for w in wins.iter_mut().flatten().filter(|w| w.level == INPUT) {
+        if w.back != want.is_none() {
+            w.back = want.is_none();
+            changed = true;
+        }
+    }
+    // The rows from the input windows' highest top to the screen's bottom.
+    let top = wins.iter().flatten().filter(|w| w.level == INPUT && !w.back).map(|w| w.rect.clip(width, height)).filter(|r| !r.is_empty()).map(|r| r.y0 as usize).min().unwrap_or(height);
+    let now = want.map(|(k, g)| (k, g, (height - top) as u16));
+    let was = keyboard::told(now);
+    let inset = |k: usize, g: u8, rows: u16| events::post_with(k, g, (EV_INSET as u16) << 8, &rows.to_le_bytes());
+    // The window told before, when it is no longer the one: its keyboard gone. Only while its owner lives: an event under a generation the surface no longer has would start the next owner's events over (events.rs `own`).
+    if let Some((k, g, rows)) = was {
+        if rows != 0 && now.is_none_or(|(k2, g2, _)| (k2, g2) != (k, g)) && live_gen(k) == g {
+            inset(k, g, 0);
+        }
+    }
+    if let Some((k, g, rows)) = now {
+        let before = was.filter(|w| (w.0, w.1) == (k, g)).map_or(0, |w| w.2);
+        if rows != before {
+            inset(k, g, rows);
+        }
+    }
+    changed
 }
 
 /// The app window in front (WINDOWS.md "The helm"): the last shown of level 0 (an app) that is not behind. What deck sends behind (op 60), what back's Escape goes to (op 61), whose full screen op 43 switches.
@@ -6823,7 +6864,7 @@ static mut RECV_STACK: [u8; 32768] = [0; 32768];
 
 /// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved, full screen's new state, the glass's columns): the receive thread waits for them. An op left out is answered 0 at once and its reply dropped (2026-11-08: op 43's state and op 53's columns never reached the map and the keyboard).
 fn op_is_sync(op: u8) -> bool {
-    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 43 | 45 | 53 | 59 | 60 | 61 | 67)
+    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 43 | 45 | 53 | 59 | 60 | 61 | 67 | 68 | 70 | 71)
 }
 
 extern "C" fn receive(grants: u64) -> ! {
@@ -6914,6 +6955,15 @@ extern "C" fn receive(grants: u64) -> ! {
                 None => {
                     ferros_sys::reply(&tok, &[3]);
                 }
+            }
+            continue;
+        }
+        // 69 `keyboard watch [seen u32]`: the system keyboard's doorbell (keyboard.rs; WINDOWS.md "The keyboard"), held until whether an app wants the keyboard changed past `seen` → [0][count u32][wanted u8]. The system's alone: [4] (`NOT_YOURS`) from another caller.
+        if op == 69 && n >= 5 {
+            if system(h) {
+                keyboard::watch(u32::from_le_bytes(msg[1..5].try_into().unwrap()), &tok);
+            } else {
+                ferros_sys::reply(&tok, &[NOT_YOURS]);
             }
             continue;
         }
@@ -8435,6 +8485,8 @@ fn server(grants: u64) -> ! {
                                 w.mode = if m.len() > 27 { m[27] } else { 0 };
                             }
                         },
+                        // The input level while no app wants the keyboard (WINDOWS.md "The keyboard"): refused, nothing kept or published, so the keyboard never stands over the map or an app that did not ask (the system keyboard shows again when one does).
+                        Some(_) if m[17] == ferros_sys::window::INPUT && keyboard::want().is_none() => out[0] = 3,
                         Some((sk, generation)) if ten && unsafe { TEMPORAL } && generation != 0 => {
                             let full = draw::Rect::full(width, height);
                             // What changed (ferros_sys `show_changed`: [x u16][y u16][w u16][h u16] after the format byte): only that part is published and owed by the other phases — when the window is already up as it was (same generation, place and level) and the screen composed. Otherwise, and for a plain show, the whole screen.
@@ -8452,6 +8504,8 @@ fn server(grants: u64) -> ! {
                                     // Its full screen kept across shows (op 43), a new owner's window starting without.
                                     let full_was = WINS[sk].is_some_and(|w| w.generation == generation && w.full);
                                     WINS[sk] = Some(Win { generation, level: m[17], order: RAISES, rect, format: if m.len() > 18 { m[18] } else { 0 }, mode, back: false, full: full_was });
+                                    // The keyboard follows: another app in front takes it from the one that wanted it, an input window shows only while one does, and the keyboard's own show tells that app its place.
+                                    keys_follow(width, height);
                                     layout_build(width, height);
                                     wins_mirror();
                                     // A new window in front may be full screen, or the one it covers was: the circle and the bars follow, every phase owing the whole screen (`changed` is already all of it).
@@ -8669,8 +8723,18 @@ fn server(grants: u64) -> ! {
                 }
                 Some(61) if m.len() >= 2 => {
                     // A key (WINDOWS.md "The helm"; owner, 2026-11-11: "back should signal escape to the app and go up one page"): [usage u8], by its USB HID usage, to the app window in front (`EV_KEY`). → [0][surface][generation], or [3] with no app window in front, [4] (`NOT_YOURS`) when that window is neither the caller's nor the caller the system's.
+                    // Escape while that window has the keyboard up puts the keyboard away and goes no further (WINDOWS.md "The keyboard"): back's first tap is the keyboard's, the next the app's, as on Android.
                     match front_app() {
                         Some(sk) if !manages(unsafe { HOLDS }, sk) => out[0] = not_yours(61, sk),
+                        Some(sk) if m[1] == ferros_sys::window::KEY_ESCAPE && keyboard::want().is_some_and(|(k, _)| k == sk) => {
+                            keyboard::set(None);
+                            if keys_follow(width, height) {
+                                windows_changed(width, height);
+                            }
+                            out[1] = sk as u8;
+                            out[2] = unsafe { WINS[sk] }.map_or(0, |w| w.generation);
+                            len = 3;
+                        }
                         Some(sk) => {
                             let g = unsafe { WINS[sk] }.map_or(0, |w| w.generation);
                             events::post(sk, g, (ferros_sys::window::EV_KEY as u16) << 8 | m[1] as u16);
@@ -8693,6 +8757,58 @@ fn server(grants: u64) -> ! {
                             len = 3;
                         }
                         None => out[0] = 3,
+                    }
+                }
+                Some(68) if m.len() >= 10 => {
+                    // Text wanted (WINDOWS.md "The keyboard"): [base u64][on u8] from the window's own process (the receive thread checked it holds the surface): on, the keyboard is this window's while it is the app in front, the system keyboard rung (keyboard.rs); off, no longer, when it was. → [0], or [3] for an on from a window that is not the app in front (the keyboard is the front app's alone) or a base that names no surface.
+                    match surface_of(u64::from_le_bytes(m[1..9].try_into().unwrap())) {
+                        Some(sk) => {
+                            let g = unsafe { WINS[sk] }.map_or(0, |w| w.generation);
+                            if m[9] != 0 {
+                                if front_app() == Some(sk) && g != 0 && live_gen(sk) == g {
+                                    keyboard::set(Some((sk, g)));
+                                } else {
+                                    out[0] = 3;
+                                }
+                            } else if keyboard::want().is_some_and(|(k, _)| k == sk) {
+                                keyboard::set(None);
+                            }
+                            if keys_follow(width, height) {
+                                windows_changed(width, height);
+                            }
+                        }
+                        None => out[0] = 3,
+                    }
+                }
+                Some(70) if m.len() >= 2 => {
+                    // Typed (WINDOWS.md "The keyboard"): [usage u8][utf8…] from the system keyboard: usage 0 and the text (at most `PIECE` bytes, `EV_TEXT`), or a key's USB HID usage alone (`EV_KEY`: enter, backspace), to the window that wants the keyboard while it is the app in front, never another. → [0][surface][generation], [3] with no such window, [1] for text past `PIECE`, [4] (`NOT_YOURS`) from a caller that is not the system's.
+                    // WHY the length check: the message is another process's word, and a payload past PIECE would break the events' ring's proof (every payload the ring of events holds is still whole in the bytes' ring), which `post_with` asserts: refused here, never a panic in the display.
+                    let piece = m.len() - 2 <= ferros_sys::window::PIECE;
+                    match keyboard::want() {
+                        _ if !system(unsafe { HOLDS }) => out[0] = NOT_YOURS,
+                        _ if !piece => out[0] = 1,
+                        Some((sk, g)) if front_app() == Some(sk) && live_gen(sk) == g => {
+                            if m[1] == 0 {
+                                events::post_with(sk, g, (ferros_sys::window::EV_TEXT as u16) << 8, &m[2..]);
+                            } else {
+                                events::post(sk, g, (ferros_sys::window::EV_KEY as u16) << 8 | m[1] as u16);
+                            }
+                            out[1] = sk as u8;
+                            out[2] = g;
+                            len = 3;
+                        }
+                        _ => out[0] = 3,
+                    }
+                }
+                Some(71) => {
+                    // The keyboard put away by the system keyboard itself (its own key for it; WINDOWS.md "The keyboard"): no window wants it until one asks again, and the one that did is told it is gone (`keys_follow`). → [0], [4] (`NOT_YOURS`) from a caller that is not the system's.
+                    if system(unsafe { HOLDS }) {
+                        keyboard::set(None);
+                        if keys_follow(width, height) {
+                            windows_changed(width, height);
+                        }
+                    } else {
+                        out[0] = NOT_YOURS;
                     }
                 }
                 Some(17) if m.len() >= 12 => {

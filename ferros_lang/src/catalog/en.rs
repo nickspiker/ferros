@@ -344,6 +344,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::KeyEnter => "enter",
         Msg::KeyPage => "page",
         Msg::KeyClear => "clear",
+        Msg::KeyHide => "hide",
         Msg::HiveHint => "the honeycomb keyboard: two fingers scroll; page is on the symbol row",
     }
 }

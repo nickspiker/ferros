@@ -344,6 +344,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::KeyEnter => "Enter",
         Msg::KeyPage => "Seite",
         Msg::KeyClear => "Leeren",
+        Msg::KeyHide => "weg",
         Msg::HiveHint => "die Wabentastatur: zwei Finger scrollen; Seite liegt in der Symbolreihe",
     }
 }

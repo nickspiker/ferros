@@ -344,6 +344,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::KeyEnter => "giriş",
         Msg::KeyPage => "sayfa",
         Msg::KeyClear => "temizle",
+        Msg::KeyHide => "gizle",
         Msg::HiveHint => "bal peteği klavyesi: iki parmakla kaydır; sayfa tuşu simge satırında",
     }
 }

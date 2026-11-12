@@ -344,6 +344,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::KeyEnter => "ingiza",
         Msg::KeyPage => "ukurasa",
         Msg::KeyClear => "safisha",
+        Msg::KeyHide => "ficha",
         Msg::HiveHint => "kibodi ya sega la asali: vidole viwili husogeza; ukurasa uko kwenye safu ya alama",
     }
 }

@@ -344,6 +344,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::KeyEnter => "entrée",
         Msg::KeyPage => "page",
         Msg::KeyClear => "vider",
+        Msg::KeyHide => "masquer",
         Msg::HiveHint => "le clavier en nid d’abeilles : deux doigts font défiler ; page est sur la rangée des symboles",
     }
 }
