@@ -3282,7 +3282,7 @@ static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight): their caller's holdings are asked of the kernel as they arrive.
 fn names_surface(op: u8) -> bool {
-    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62)
+    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 65 | 66)
 }
 
 /// What the process behind the call holds (kernel SYS_CALLER: bit k surface k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
@@ -5367,6 +5367,81 @@ static mut HELM_DRAWN: bool = false;
 /// The helm's light (the bottom corners' two buttons; owner, 2026-11-09: light them up), deck [0] and back [1]: the level a client last reported (op 54, Q16: a finger landed, how far its swipe has come, acted), and the level drawn, which follows a rise at once and halves what is left of a fall each render pass, so a release fades out by frames and never by a timer.
 static HELM_TARGET: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static mut HELM_LEVEL: [f32; 2] = [0.0; 2];
+/// The Deck button as the deck's summary (op 66, docs/NOTIFY.md "The Deck button"; owner, 2026-11-12: "if anything on the deck has changed state, specifically 400nm notifications, we change the deck circle in the helm and then the user knows to go to the deck", then "So ideally the deck circle shows the latest item icon preview and shows the violet ring?"): the latest note's source's icon in bits 16-23 (0 none), how many wait in the deck's resting view below (0: the plain Deck mark). As the map last sent it, and as last drawn.
+static HELM_NOTE: AtomicU32 = AtomicU32::new(0);
+static mut HELM_NOTE_DRAWN: u32 = 0;
+
+/// The for-you colour as the helm draws it (fluor's darkness, straight), its glow's peak (0 to 1) and its reach divisor, for `count` waiting: a for-you circle's on the deck (`state_glow`: ferros_glow 400 nm at the theme's ring light). None for a theme with no glow.
+fn for_you_ink(count: u16) -> Option<(u64, f32, i64)> {
+    let cir = Circle { glow: ferros_glow::Glow::ForYou as u8, count, ..NO_CIRCLE };
+    let (colour, peak, frac, _) = state_glow(&cir, ferros_sys::theme::current())?;
+    // The colour's 8-bit gamma 2 codes as working values (white at Q14).
+    let w8 = |c: u32| (c & 0xFF) as f32 * (16384.0 / 255.0);
+    Some((g2t_colour((w8(colour >> 16), w8(colour >> 8), w8(colour))), peak as f32 * (1.0 / 255.0), frac))
+}
+
+/// The Deck button's note (`HELM_NOTE`) into the bars' bottom rows (`bar`, `bot` rows of `width` from screen row `height - bot`), front to back after the marks: the source's icon inside the button's circle (centre (x, y), radius `r`, inside its 2-pixel stroke), then the for-you glow around it (ferros_glow 400 nm at the theme's ring light, as a for-you circle's on the deck, `state_glow`), reaching farther with the count. No content, ever: the source's icon alone (owner: "shows the latest item icon preview"). Every edge a C∞ step (`draw::bump_step`), every layer by fluor's `under`.
+fn helm_note_draw(bar: &mut [u64], width: usize, height: usize, bot: usize, (x, y, r): (f32, f32, f32), icon_n: u8, count: u16) {
+    use fluor::pixel::{Blend, BlendMode};
+    let Some((violet, peak, frac)) = for_you_ink(count) else { return };
+    // The glow's reach past the circle: the circle glows' own, a `frac`th of the radius (frac already shrunk by the count, ferros_glow `reach`).
+    let reach = r / frac as f32;
+    // The icon's disc inside the stroke (2 pixels wide on the radius's inside).
+    let ri = r - 2.0;
+    let art = icon(icon_n).map(|(px, _, size)| (px, size, icon_decode()));
+    let (x0, x1, y0, y1) = ((x - r - reach - 2.0) as i64, (x + r + reach + 2.0) as i64, (y - r - reach - 2.0) as i64, (y + r + reach + 2.0) as i64);
+    for py in y0..=y1 {
+        // WHY the test: the glow's box comes from the layout's float geometry and can reach past the screen's sides or bottom; an index from there would land in another row or past the buffer.
+        if px_out(py, height) {
+            continue;
+        }
+        let row = py as usize - (height - bot);
+        for px in x0..=x1 {
+            if px < 0 || px >= width as i64 {
+                continue;
+            }
+            let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
+            let d = libm::sqrtf((fx - x) * (fx - x) + (fy - y) * (fy - y));
+            let i = row * width + px as usize;
+            // The icon: the texels under this pixel's footprint averaged (a box as wide as one pixel of the disc in texels), straight colour from their premultiplied sum, at the disc's coverage.
+            if let Some((rgba, size, dec)) = &art {
+                let cov = draw::bump_step((ri - d) * 0.5 + 0.5);
+                if cov > 0.0 {
+                    let k = *size as f32 / (2.0 * ri);
+                    let (u, v) = ((fx - (x - ri)) * k, (fy - (y - ri)) * k);
+                    let (u0, v0) = (u - 0.5 * k, v - 0.5 * k);
+                    let n = (k as usize).max(1);
+                    let (mut sr, mut sg, mut sb, mut sa) = (0f32, 0f32, 0f32, 0f32);
+                    for ty in 0..n {
+                        for tx in 0..n {
+                            let (tu, tv) = ((u0 + (tx as f32 + 0.5) * k / n as f32) as i64, (v0 + (ty as f32 + 0.5) * k / n as f32) as i64);
+                            // WHY the test: a footprint at the disc's rim reaches past the art's square by up to half a pixel's texels; outside it there is no art (the bundle's circle cut is transparent there anyway).
+                            if tu < 0 || tv < 0 || tu >= *size as i64 || tv >= *size as i64 {
+                                continue;
+                            }
+                            let t = (tv as usize * size + tu as usize) * 4;
+                            let a = rgba[t + 3] as f32;
+                            sr += dec[rgba[t] as usize] as f32 * a;
+                            sg += dec[rgba[t + 1] as usize] as f32 * a;
+                            sb += dec[rgba[t + 2] as usize] as f32 * a;
+                            sa += a;
+                        }
+                    }
+                    if sa > 0.0 {
+                        let alpha = sa / (255.0 * (n * n) as f32) * cov;
+                        let c = g2t_colour((sr / sa, sg / sa, sb / sa));
+                        bar[i] = bar[i].under(c | ((alpha * 65535.0) as u64) << 48, BlendMode::Normal);
+                    }
+                }
+            }
+            // The glow: full at the rim and inside it (under the icon, showing only where the art leaves room), down to nothing at its reach on the C∞ step.
+            let a = peak * draw::bump_step(1.0 - (d - r) / reach);
+            if a > 0.0 {
+                bar[i] = bar[i].under(violet | ((a * 65535.0) as u64) << 48, BlendMode::Normal);
+            }
+        }
+    }
+}
 
 /// The helm (owner, 2026-11-07): the bottom corners' marks into the bars' bottom rows, front to back from empty in fluor's α + darkness, then decoded. Deck, at the bottom right: a 2-pixel stroked circle tangent to the glass's edge and the app's circle (the corner's middle circle, which `corner_layout` solved tangent to both), the stroke inside it. Back, at the bottom left: a left arrow, 2-pixel strokes, on that corner's middle circle. A stroke's coverage is the C∞ step across two pixels on each side (`bump_step`, slope 1 at its edge as area coverage), from the distance to its centre line. Returns whether it drew.
 fn helm_draw(width: usize, height: usize) -> bool {
@@ -5385,6 +5460,17 @@ fn helm_draw(width: usize, height: usize) -> bool {
             unsafe { HELM_DRAWN = false };
         }
     }
+    // The Deck button's note changed (op 66): the helm drawn again.
+    let note = HELM_NOTE.load(Ordering::Acquire);
+    if note != unsafe { HELM_NOTE_DRAWN } {
+        unsafe {
+            HELM_NOTE_DRAWN = note;
+            HELM_DRAWN = false;
+        }
+    }
+    let (note_icon, note_count) = ((note >> 16) as u8, note as u16);
+    // While something waits in the deck's resting view, the Deck button's ring is the for-you colour (owner, 2026-11-12: "shows the violet ring").
+    let note_ink = if note_count > 0 { for_you_ink(note_count).map(|v| v.0) } else { None };
     if unsafe { HELM_DRAWN } {
         return false;
     }
@@ -5411,6 +5497,11 @@ fn helm_draw(width: usize, height: usize) -> bool {
         // Lit: the stroke brightens toward white by the button's level (its wedge's light, below).
         let lvl = unsafe { HELM_LEVEL[back as usize] };
         let lit_ink = g2t_colour((9000.0 + 7000.0 * lvl, 9000.0 + 7000.0 * lvl, 9000.0 + 7000.0 * lvl));
+        // The Deck button with a note: its ring violet, the icon and the glow under it (`helm_note_draw`), all front to back before the wedge.
+        let ring_ink = match note_ink {
+            Some(v) if !back => v,
+            _ => if lvl > 0.0 { lit_ink } else { ink },
+        };
         // The distance from a point to the mark's centre line.
         let dist = |px: f32, py: f32| -> f32 {
             if !back {
@@ -5444,9 +5535,12 @@ fn helm_draw(width: usize, height: usize) -> bool {
                 let cov = stroke(dist(fx, fy));
                 let i = row * width + px as usize;
                 if cov > 0.0 {
-                    bar[i] = bar[i].under(if lvl > 0.0 { lit_ink } else { ink } | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
+                    bar[i] = bar[i].under(ring_ink | ((cov * 65535.0) as u64) << 48, BlendMode::Normal);
                 }
             }
+        }
+        if !back && note_ink.is_some() {
+            helm_note_draw(bar, width, height, bot, (x, y, r), note_icon, note_count);
         }
     }
     // Each button's whole wedge (owner, 2026-11-09: "everything in that wedge should light up", "1/8 opacity black when the helm is showing, that turns white at same said opacity when tapped"): the bars' rows outside the app's circle, the left half back's and the right half deck's (op 41's regions), a layer behind the marks (front to back) at an eighth of opacity, its colour black at rest and white by the button's level; its edge along the circle a pixel wide.
@@ -6728,7 +6822,7 @@ static mut RECV_STACK: [u8; 32768] = [0; 32768];
 
 /// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved, full screen's new state, the glass's columns): the receive thread waits for them. An op left out is answered 0 at once and its reply dropped (2026-11-08: op 43's state and op 53's columns never reached the map and the keyboard).
 fn op_is_sync(op: u8) -> bool {
-    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 43 | 45 | 53 | 59 | 60 | 61)
+    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 43 | 45 | 53 | 59 | 60 | 61 | 65)
 }
 
 extern "C" fn receive(grants: u64) -> ! {
@@ -6772,6 +6866,16 @@ extern "C" fn receive(grants: u64) -> ! {
                 9 => HELM_TARGET[1].store(level, Ordering::Release),
                 _ => {}
             }
+            ferros_sys::reply(&tok, &[0]);
+            continue;
+        }
+        // 66 `helm note [icon u8][count u16]`: the Deck button as the deck's summary (docs/NOTIFY.md "The Deck button"), the system's alone: the latest note's source's icon and how many wait in the deck's resting view, drawn by the helm (`helm_draw`). → [0], or [4] (`NOT_YOURS`) from a caller that is not the system's.
+        if op == 66 && n >= 4 {
+            if !system(h) {
+                ferros_sys::reply(&tok, &[NOT_YOURS]);
+                continue;
+            }
+            HELM_NOTE.store((msg[1] as u32) << 16 | u16::from_le_bytes([msg[2], msg[3]]) as u32, Ordering::Release);
             ferros_sys::reply(&tok, &[0]);
             continue;
         }
@@ -8569,6 +8673,20 @@ fn server(grants: u64) -> ! {
                         Some(sk) => {
                             let g = unsafe { WINS[sk] }.map_or(0, |w| w.generation);
                             events::post(sk, g, (ferros_sys::window::EV_KEY as u16) << 8 | m[1] as u16);
+                            out[1] = sk as u8;
+                            out[2] = g;
+                            len = 3;
+                        }
+                        None => out[0] = 3,
+                    }
+                }
+                Some(65) if m.len() >= 2 => {
+                    // Open at (docs/NOTIFY.md "A tap"; owner, 2026-11-12: a tap on a glowing circle opens the kist where the note points): [note u8], the note's number among the kist's own, to the app window in front (`EV_OPEN_AT`; the kist reads the note it names from the kernel, ferros_sys::notify::opened). → [0][surface][generation], or [3] with no app window in front, [4] (`NOT_YOURS`) when that window is neither the caller's nor the caller the system's.
+                    match front_app() {
+                        Some(sk) if !manages(unsafe { HOLDS }, sk) => out[0] = not_yours(65, sk),
+                        Some(sk) => {
+                            let g = unsafe { WINS[sk] }.map_or(0, |w| w.generation);
+                            events::post(sk, g, (ferros_sys::window::EV_OPEN_AT as u16) << 8 | m[1] as u16);
                             out[1] = sk as u8;
                             out[2] = g;
                             len = 3;
