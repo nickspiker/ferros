@@ -116,6 +116,7 @@ The core writes the RAM when the game changes it; the shell makes the document, 
 Sonic 2 has no battery RAM, so this path did not run on the device.
 
 **Where it will be kept:** the person's common area, a name of the kist's choosing (`genesis`), each game's RAM by its `rom` hash.
+Proposed instead (STORE.md, 2026-11-11, a draft): items kept for the person, kinds "Sega Genesis battery RAM" and "Sega Genesis save state", found by `rom`; they are that spec's first build stage.
 That needs a right the kist asks for (KISTS.md's wants already name "a common-area name") and a person attested; until then the store is a stub.
 
 **Save states** (designed, not built): one complete VSF file per state, named sections, every value typed, no positions and no blobs of another format:
