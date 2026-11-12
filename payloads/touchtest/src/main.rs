@@ -2,6 +2,7 @@
 //!
 //! Spawn after `touch`: ferros-bridge spawn touchtest.bin 00 --name touchtest --use touch
 //! Grant slots: 0 console, 1 touch (use).
+//! The input byte, when not zero, is a slow reader: CHANGES read only every that many eighths of a second (the first read one gap after the start), for 32 s, each read said as a line of its counts (downs, moves, ups) and only the downs and ups as lines of their own. That is an app whose frames take that long (Mahere drawing on the CPU, 2026-11-12: 0.6 to 2 s a frame), and what the touch server keeps for it.
 
 #![no_std]
 #![no_main]
@@ -69,19 +70,41 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     console(grants, &line[..at]);
 
     let (mut events, mut lines, mut pmax) = (0u64, 0u32, 0u64);
-    let tick = freq() / 64;
-    let end = now() + freq() * 8;
+    let mut gap = [0u8; 1];
+    let slow = if ferros_sys::input(0, &mut gap) == 1 { gap[0] as u64 } else { 0 };
+    let tick = if slow == 0 { freq() / 64 } else { freq() / 8 * slow };
+    let end = now() + freq() * if slow == 0 { 8 } else { 32 };
+    if slow != 0 {
+        sleep_until(now() + tick);
+    }
     while now() < end {
         let n = call(ep, &[0], &mut r);
         if n >= 1 {
             let k = r[0] as usize;
+            if slow != 0 {
+                let mut by = [0u64; 3];
+                for i in 0..k {
+                    by[r[1 + i * REC + 1] as usize] += 1;
+                }
+                let mut at = 0;
+                text(&mut line, &mut at, b"touchtest: a read of ");
+                num(&mut line, &mut at, k as u64);
+                text(&mut line, &mut at, b": downs ");
+                num(&mut line, &mut at, by[0]);
+                text(&mut line, &mut at, b", moves ");
+                num(&mut line, &mut at, by[1]);
+                text(&mut line, &mut at, b", ups ");
+                num(&mut line, &mut at, by[2]);
+                text(&mut line, &mut at, b"\n");
+                console(grants, &line[..at]);
+            }
             for i in 0..k {
                 let c = &r[1 + i * REC..1 + (i + 1) * REC];
                 events += 1;
                 if c[3] as u64 > pmax {
                     pmax = c[3] as u64;
                 }
-                if lines < 32 {
+                if lines < 32 && (slow == 0 || c[1] != 1) {
                     let mut at = 0;
                     text(&mut line, &mut at, b"  finger ");
                     num(&mut line, &mut at, c[0] as u64);
@@ -112,7 +135,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut at = 0;
     text(&mut line, &mut at, b"touchtest: ");
     num(&mut line, &mut at, events);
-    text(&mut line, &mut at, b" contact events in 8 s, hardest press ");
+    text(&mut line, &mut at, b" contact events, hardest press ");
     num(&mut line, &mut at, pmax);
     text(&mut line, &mut at, b" of A#255\n");
     console(grants, &line[..at]);

@@ -18,7 +18,8 @@ const S_TOUCH: u64 = 1;
 const S_DISPLAY: u64 = 2;
 
 /// The heap the script is parsed in. The linker script lays the zeroed data into the file (payload.ld), so the heap and the allocator lie inside the arc the kernel sizes for the file, never under the spawn input, and syscalls may land in it.
-const HEAP_SIZE: usize = 1 << 17;
+/// 2^19: at 2^17 a pinch of 32 frames (74 events, 6 KB of script) died in the parse (exit G#DEAD on the Pro and the 8a, 2026-11-12; 16 frames passed); 96 frames (196 events, 17.5 KB) pass at 2^19.
+const HEAP_SIZE: usize = 1 << 19;
 #[repr(C, align(64))]
 struct Heap([u8; HEAP_SIZE]);
 static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
