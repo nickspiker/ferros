@@ -1888,6 +1888,9 @@ fn pub_take(job: u64) {
         } else if unsafe { PUB_KIND } == 3 {
             // The hit map's development view painted into its phase (`hit::on_layer`): this stripe's rows.
             hit::paint_stripe(w, stripe);
+        } else if unsafe { PUB_KIND } == 4 {
+            // An app's publish (`publish_app_mask`): this stripe's rows into the phases.
+            publish_app_rows(stripe, unsafe { &*(&raw const PUB_TABS) }, mask, w, h, unsafe { PUB_APP_HITS });
         } else {
             let back = unsafe { core::slice::from_raw_parts(base as *const Px, w * h) };
             publish_band(back, w, h, unsafe { &*(&raw const PUB_TABS) }, mask, stripe);
@@ -2638,7 +2641,7 @@ enum Item {
 const ITEMS: usize = 1024;
 static mut SCENE_ITEMS: [Item; ITEMS] = [Item::Disc(0, 0, 0, 0, false); ITEMS];
 static mut SCENE_NI: usize = 0;
-/// The publish workers' job: 0 a publish, 1 the scene's list (`scene_stripe`).
+/// The publish workers' job: 0 a publish, 1 the scene's list (`scene_stripe`), 2 and 3 the hit map (`stripes`), 4 an app's publish (`publish_app_mask`).
 static mut PUB_KIND: u8 = 0;
 
 impl Item {
@@ -3298,6 +3301,7 @@ static mut ORDER: [(u8, u8, u8); SURFACES] = [(0, 0, 0); SURFACES];
 const MODE_MASK: u8 = 7;
 const OPAQUE: u8 = 8;
 fn layout_build(width: usize, height: usize) {
+    unsafe { HITS_STALE = true };
     let (ord, n) = front_order();
     let mut layers = [fluor::layout::Layer { x0: 0, y0: 0, x1: 0, y1: 0, opaque: false }; SURFACES];
     for (i, &(k, w)) in ord[..n].iter().enumerate() {
@@ -3858,13 +3862,52 @@ fn publish_app_mask(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
     if r.is_empty() || RAW_HOLD.load(Ordering::Acquire) == 1 {
         return;
     }
-    // The development view's phase is painted whole from the hit map as it comes round (`hit::on_layer`), never here: the phases written are the others.
-    let write = if hit::view() && unsafe { CAPTURE } == 0 { mask & !(1 << hit::PHASE) } else { mask };
     for k in 0..PHASES {
         if mask >> k & 1 == 1 {
             unsafe { PHASE_CLOCK[k] = None };
         }
     }
+    // The rows by stripes across the publish workers and this thread, as `publish10x4` splits the home screen's (2026-11-11: an app's whole-screen frame, Mahere's map from the GPU every frame, took 28 ms of one thread a show on the Pro). Each row is its own: its composition, its codes (`codes_row`, a scratch a thread), its hit map row and its phases' words. A capture (op 30) stays on this thread.
+    let workers = PUB_UP.load(Ordering::Acquire) as usize;
+    if r.y1 - r.y0 < PUB_SPLIT_ROWS || workers == 0 || unsafe { CAPTURE } != 0 {
+        publish_app_rows(r, tabs, mask, width, height, hits);
+    } else {
+        let n = ((r.y1 - r.y0 + PUB_STRIPE - 1) / PUB_STRIPE) as usize;
+        let job = PUB_JOB.load(Ordering::Acquire) + 1;
+        unsafe {
+            PUB_TABS = *tabs;
+            PUB_KIND = 4;
+            PUB_APP_HITS = hits;
+            PUB_PARAMS = (0, width, height, mask, r, n);
+        }
+        PUB_FINISHED.store((job & 0xFFFF_FFFF) << 32, Ordering::Release);
+        PUB_CLAIM.store((job & 0xFFFF_FFFF) << 32, Ordering::Release);
+        PUB_JOB.store(job, Ordering::Release);
+        ferros_sys::wake(&PUB_JOB, PUB_WORKERS as u64);
+        pub_take(job);
+        // Every stripe taken, finished: no deadline, as `publish10x4` (a stripe in a worker's hands is being written).
+        loop {
+            let f = PUB_FINISHED.load(Ordering::Acquire);
+            if (f & 0xFFFF_FFFF) as usize >= n {
+                break;
+            }
+            ferros_sys::wait(&PUB_FINISHED, f, now() + freq() / 1000);
+        }
+        unsafe { PUB_KIND = 0 };
+    }
+    if unsafe { CAPTURE } != 0 {
+        return;
+    }
+    fps_dot(mask, width, height);
+}
+
+/// Whether the app publish the workers are running writes the hit map's rows too (`publish_app_mask`'s `hits`).
+static mut PUB_APP_HITS: bool = false;
+
+/// `publish_app_mask`'s rows `r` (one stripe of them, or all), into the phases `mask` names.
+fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, height: usize, hits: bool) {
+    // The development view's phase is painted whole from the hit map as it comes round (`hit::on_layer`), never here: the phases written are the others.
+    let write = if hit::view() && unsafe { CAPTURE } == 0 { mask & !(1 << hit::PHASE) } else { mask };
     // The app circle's ring hairline (the edge's is the mask's own colour, `glass_front`).
     let line = hairline();
     let mut row = [3u32; 1344];
@@ -4026,14 +4069,13 @@ fn publish_app_mask(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
             dst[y * width + xa..y * width + xb].copy_from_slice(&row[xa..xb]);
         }
     }
-    if unsafe { CAPTURE } != 0 {
-        return;
-    }
-    fps_dot(mask, width, height);
 }
 
 /// Where op 30 has the finished frame written instead of a phase (a free surface's pixels), 0 when not capturing.
 static mut CAPTURE: usize = 0;
+
+/// The hit map's rows no longer match the windows' layout (`layout_build` sets it, an app publish of the whole screen with the hit map's rows clears it): an app's show writes them only then.
+static mut HITS_STALE: bool = true;
 
 /// After a window left: every phase owes the whole screen; with none left, the map has the screen again and its next frame repaints all of it.
 fn windows_changed(width: usize, height: usize) {
@@ -4066,6 +4108,7 @@ fn full_follow() -> bool {
     unsafe {
         let was = FULL;
         FULL = f;
+        HITS_STALE |= was != f;
         was != f
     }
 }
@@ -7991,14 +8034,23 @@ fn server(grants: u64) -> ! {
                                     PHASE_DIRTY[k] = PHASE_DIRTY[k].union(changed);
                                 }
                             }
-                            let t_settle = now();
-                            pipe.settle(&mut armed, true);
+                            // Phase k is neither the frame on the glass (CUR_PHASE - 1, whose start the last show waited for) nor the one armed after it (CUR_PHASE): it is published first, while that armed frame comes round, and only then is its start waited for (2026-11-11: the wait came first, up to a panel frame of nothing before a publish of a whole screen, Mahere's map every frame).
                             let k = unsafe { (CUR_PHASE + 1) % PHASES };
+                            let t_settle = now();
                             let t_pub = now();
                             // Everything phase k owes, which now holds `changed`: it is about to be shown, and its dirty region is cleared below. Publishing `changed` alone dropped what it still owed from earlier shows, and stale strips of older frames flashed as the phases rotated (2026-11-01).
-                            publish_app(unsafe { PHASE_DIRTY[k] }, &tabs, k, width, height, true);
+                            // The hit map's rows with it only when the windows' layout changed since they were last written whole (`HITS_STALE`): a window shown again where it was owns the same pixels, and its rows were 1.5 us each of every frame, 4.4 ms of a full screen's (2026-11-11, Mahere's map from the GPU every frame).
+                            let dirty = unsafe { PHASE_DIRTY[k] };
+                            let hits = unsafe { HITS_STALE };
+                            publish_app(dirty, &tabs, k, width, height, hits);
                             unsafe {
+                                if hits && dirty.clip(width, height) == full {
+                                    HITS_STALE = false;
+                                }
                                 PHASE_DIRTY[k] = draw::Rect::EMPTY;
+                            }
+                            pipe.settle(&mut armed, true);
+                            unsafe {
                                 CUR_PHASE = k;
                                 // When the windows are gone, the map's next frame starts from a clear screen.
                                 PREV_DMG = full;
