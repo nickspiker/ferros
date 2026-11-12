@@ -266,6 +266,14 @@ pub fn take_gate_request() -> u8 {
     GATE_REQUEST.swap(0, core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Vendor session request (bmRequestType G#40, host-to-device, no data): a host tool starting a session (tools/ferros-link `UsbLink::open`). Whatever an earlier session left half done (a command half sent, a reply half read, a command still with the kernel) belongs to a host that is gone, and the driver drops it (payloads/usb): before it a killed `ferros send` left a reply in the IN endpoint that the next session read as its own, and the port had to be kicked (2026-11-12). A device without it stalls the request, which the host passes over.
+pub const VENDOR_REQ_SESSION: u8 = 0x5D;
+static SESSION_REQUEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Whether a host started a session since the last ask, once.
+pub fn take_session_request() -> bool {
+    SESSION_REQUEST.swap(false, core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Vendor debug readout request (bmRequestType G#C0, device-to-host vendor).
 /// Returns 16 LE u32 counters — a live window into the PT dispatch loop that works even when the bulk path is wedged, since EP0 keeps running.
 pub const VENDOR_REQ_DBG: u8 = 0x5A;
@@ -1701,6 +1709,25 @@ impl Dwc3Dev {
         self.bulk_in_idle = true;
     }
 
+    /// End the bulk IN transfer in flight, if one is, and leave the endpoint idle for the next: a reply the host stopped reading (a new session began, or the host sent a new command over it). No CLEARSTALL, unlike `cancel_bulk_in`: that resets the endpoint's data toggle to DATA0 while the host's stays where it was, and the next packet would be taken by the host as a repeat and dropped.
+    pub fn end_bulk_in(&mut self) {
+        if self.bulk_in_resource_idx != 0 {
+            self.end_transfer_raw(3, self.bulk_in_resource_idx as u32);
+        } else if !self.bulk_in_idle {
+            self.force_end_transfer_unconditional(3);
+        }
+        self.bulk_in_idle = true;
+    }
+
+    /// End the bulk OUT transfer in flight by its own resource index, as `handle_disconnect` does, before the endpoint is armed again: a run armed for a transfer the host gave up on (a new session began, or the run stopped filling). `bulk_out_arm` ends one with resource index 1 instead (`force_end_transfer_unconditional`), which the controller refused for a run with packets in it: its STARTTRANSFER then failed with "no resource" (DEPCMD G#00021006), the run stayed live, the next session's SPEC went into it, and the link hung until the port was kicked (2026-11-12, the 8a, a put killed mid-DATA). No CLEARSTALL: the data toggle stays where the host's is.
+    pub fn end_bulk_out(&mut self) {
+        if self.bulk_out_resource_idx != 0 {
+            self.end_transfer_raw(2, self.bulk_out_resource_idx as u32);
+        }
+        self.bulk_out_armed = false;
+        self.bulk_out_ready = false;
+    }
+
     /// Recover a stale endpoint: ENDTRANSFER + CLEARSTALL + re-arm. Call this when bulk_in_send() or bulk_out_arm() fails persistently.
     pub fn recover_endpoint(&mut self, ep_phys: u8) {
         self.force_end_transfer_unconditional(ep_phys);
@@ -1916,6 +1943,11 @@ impl Dwc3Dev {
             }
             VENDOR_REQ_GATE if bm_request_type == 0x40 => {
                 GATE_REQUEST.store(w_value as u8, core::sync::atomic::Ordering::Relaxed);
+                self.ep0_state = Ep0State::StatusInWait;
+                true
+            }
+            VENDOR_REQ_SESSION if bm_request_type == 0x40 => {
+                SESSION_REQUEST.store(true, core::sync::atomic::Ordering::Relaxed);
                 self.ep0_state = Ep0State::StatusInWait;
                 true
             }

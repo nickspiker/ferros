@@ -191,6 +191,9 @@ fn serve(grants: u64) -> ! {
     // A command with the kernel, its reply not yet taken.
     let mut waiting = false;
     let mut t_submit = 0u64;
+    // That command's host is gone (a new session began, or a new command came over it): its reply is dropped when the kernel gives it, never sent to the host now talking. The kernel takes one command at a time, so a new session's SPEC that came meanwhile is held (`held_spec`) and acknowledged once the kernel is free.
+    let mut stale = false;
+    let mut held_spec: Option<Packet> = None;
     // A command that acts once everything before it is out (reload, reboot, `diag android`): a copy of it, to hand over again.
     let mut act: Option<([u8; 256], usize)> = None;
     let mut held = ([0u8; 256], 0usize);
@@ -215,6 +218,9 @@ fn serve(grants: u64) -> ! {
                 inbound = None;
                 out = None;
                 armed_run = 0;
+                // The host that sent the command still with the kernel is gone with the bus: its reply is dropped.
+                stale |= waiting;
+                held_spec = None;
             }
             UsbEvent::ConnectDone { .. } => {
                 usb.handle_connect_done();
@@ -226,10 +232,35 @@ fn serve(grants: u64) -> ! {
                 inbound = None;
                 out = None;
                 armed_run = 0;
+                stale |= waiting;
+                held_spec = None;
             }
             UsbEvent::Ep0Setup { request } => {
                 if !usb.handle_setup(&request) {
                     usb.ep0_stall();
+                }
+                // A host tool starting a session (ferros_hal VENDOR_REQ_SESSION, tools/ferros-link): what the last one left half done is dropped before its first packet, so a killed `ferros send` never needs the port kicked (2026-11-12: its held read's reply sat in the IN endpoint and the next session read it as its SPEC ACK).
+                if ferros_hal::usb::take_session_request() {
+                    let half_in = inbound.is_some();
+                    let half_out = out.is_some() || !usb.bulk_in_is_idle();
+                    if !usb.bulk_in_is_idle() {
+                        usb.end_bulk_in();
+                    }
+                    // A run armed for the last session's DATA: ended, back to single packets, or this session's SPEC would land inside it and wait for packets that never come. Armed for a single packet, the endpoint is left as it is.
+                    if armed_run > 0 {
+                        usb.end_bulk_out();
+                        usb.bulk_out_arm();
+                    }
+                    inbound = None;
+                    out = None;
+                    to_arm = 0;
+                    armed_run = 0;
+                    held_spec = None;
+                    act = None;
+                    stale |= waiting;
+                    if half_in || half_out || waiting {
+                        say!(grants, "usb: a new host session: dropped what the last left (a command half in {half_in}, a reply half out {half_out}, a command still with the kernel {waiting})\n");
+                    }
                 }
             }
             UsbEvent::TransferComplete { ep: 2 } => {
@@ -254,6 +285,11 @@ fn serve(grants: u64) -> ! {
                 }
             }
             UsbEvent::TransferComplete { .. } => {}
+        }
+        // A SPEC held while the kernel finished a gone host's command: taken now that the kernel is free, as if it had just come.
+        let resumed = if packets.is_empty() && !waiting { held_spec.take() } else { None };
+        if let Some(r) = resumed.as_ref() {
+            packets = &r.0[..];
         }
 
         let t_cpu = ferros_sys::now();
@@ -292,8 +328,20 @@ fn serve(grants: u64) -> ! {
                 }
             } else if ferros_pt::is_control_packet(pkt[0]) {
                 let Some(spec) = packet::Spec::decode(pkt) else { continue };
+                // A new command while the kernel still has the last: the host gave up on that one (one command at a time is the protocol), so its reply is dropped when it comes, and this SPEC waits for it.
+                if waiting {
+                    stale = true;
+                    let mut h = Packet([0; PACKET]);
+                    h.0.copy_from_slice(pkt);
+                    held_spec = Some(h);
+                    continue;
+                }
                 inbound = None;
                 out = None;
+                // A reply still going out that the host stopped reading: ended, or the SPEC ACK could not go (the endpoint takes one transfer at a time) and the host would read the old reply's next packet as its answer.
+                if !usb.bulk_in_is_idle() {
+                    usb.end_bulk_in();
+                }
                 seq_width = ferros_ledger::ewe::seq_width(spec.count);
                 let total = spec.total as usize;
                 let words = ferros_pt::transfer::bitmap_words(spec.count);
@@ -337,6 +385,7 @@ fn serve(grants: u64) -> ! {
             armed_run = 0;
             inbound = None;
             to_arm = 0;
+            usb.end_bulk_out();
             usb.bulk_out_arm();
         }
 
@@ -346,7 +395,16 @@ fn serve(grants: u64) -> ! {
                 // A command the kernel never answers: this driver gives up, and init's keeper starts a fresh one.
                 ferros_sys::PtReply::Running if ferros_sys::now().wrapping_sub(t_submit) > 16 * freq => give_up(grants, power, "no reply from the kernel in 16 s"),
                 ferros_sys::PtReply::Running => ferros_sys::sleep_until(ferros_sys::now() + freq / 16384),
-                ferros_sys::PtReply::None => waiting = false,
+                ferros_sys::PtReply::None => {
+                    waiting = false;
+                    stale = false;
+                }
+                // A gone host's reply: taken (the kernel then takes the next command), never sent, and nothing acted on.
+                ferros_sys::PtReply::Done(total, _, _) if stale => {
+                    waiting = false;
+                    stale = false;
+                    say!(grants, "usb: the reply to a gone host's command dropped (A#{total} bytes, A#{} ms after it came)\n", ferros_sys::now().wrapping_sub(t_submit) * 1000 / freq);
+                }
                 ferros_sys::PtReply::Done(total, replied, wants_act) => {
                     waiting = false;
                     t_reply = ferros_sys::now();
@@ -458,7 +516,7 @@ fn serve(grants: u64) -> ! {
         }
 
         // No event this pass and no reply awaited: sleep until the controller interrupts (a packet, a finished run, a reply sent, the host) or a quarter second passes for the checks above. The events just drained have lowered the line (the HAL writes their count back), so it is unmasked first; one that came since raises it again at once.
-        if idle && !waiting {
+        if idle && !waiting && held_spec.is_none() {
             ferros_sys::irq_ack(irq);
             if ferros_sys::irq_wait(irq, ferros_sys::now() + freq / 4) == 0 {
                 irq_wakes += 1;

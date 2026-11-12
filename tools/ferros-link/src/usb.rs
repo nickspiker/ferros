@@ -6,6 +6,8 @@ use nusb::transfer::{RequestBuffer, TransferError};
 const FERROS_VID: u16 = 0x1209;
 const FERROS_PID: u16 = 0x4665;
 const INTERFACE: u8 = 0;
+/// The device's vendor session request (ferros_hal usb.rs `VENDOR_REQ_SESSION`, bmRequestType G#40, no data).
+const VENDOR_REQ_SESSION: u8 = 0x5D;
 
 /// Bulk transfers kept in flight by the queued send and receive, and each one's size (a multiple of 512).
 const QUEUE_DEPTH: usize = 4;
@@ -18,9 +20,24 @@ pub struct UsbLink {
 }
 
 impl UsbLink {
-    /// Find and open the ferros device. Returns None if not found.
+    /// Find and open the ferros device, and start a session on it (`session`). Returns None if not found.
     /// With two ferros devices on the host (the Pro and the 8a, 2026-11-10) the first found was taken, whichever it was: `FERROS_BUS=<bus number>` (lsusb's) picks one.
-    pub fn open() -> Result<Self, String> {
+    pub async fn open() -> Result<Self, String> {
+        let link = Self::find()?;
+        link.session().await;
+        Ok(link)
+    }
+
+    /// A new session (the device's VENDOR_REQ_SESSION, ferros_hal usb.rs): whatever an earlier host process left half done is dropped on the device before this one sends anything (a command half sent, a reply half read, a command still with the kernel, whose reply the device then drops). One host process holds the interface at a time (the claim is exclusive), so nothing live is cut. Until 2026-11-12 a `ferros send` killed in a held read left its reply in the device's IN endpoint, the next session read it as its SPEC ACK, and the port had to be kicked. A device from before stalls the request: passed over.
+    async fn session(&self) {
+        use nusb::transfer::{ControlOut, ControlType, Recipient};
+        let c = self.interface.control_out(ControlOut { control_type: ControlType::Vendor, recipient: Recipient::Device, request: VENDOR_REQ_SESSION, value: 0, index: 0, data: &[] }).await;
+        if crate::traced() {
+            eprintln!("session: {}", if c.status.is_ok() { "started (the device dropped what an earlier session left)" } else { "not known to this device (a driver from before)" });
+        }
+    }
+
+    fn find() -> Result<Self, String> {
         let bus: Option<u8> = std::env::var("FERROS_BUS").ok().and_then(|v| v.parse().ok());
         let device = nusb::list_devices()
             .map_err(|e| format!("USB enumeration failed: {e}"))?

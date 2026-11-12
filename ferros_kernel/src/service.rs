@@ -2235,7 +2235,8 @@ pub fn run(mut b: Boot) -> ! {
         }
         let now = cntpct();
         // A command from the USB process waiting: no sleep and no time slice before it runs.
-        let inbox_full = crate::ptlink::INBOX_FULL.load(core::sync::atomic::Ordering::Relaxed);
+        // Not while the last command is still being answered (`proc_restore`: a vault put, a held read of an offer): its USB process ended and a new one sent this one (ptlink.rs `reset`). It waits in the inbox until the last is done, its reply dropped (`ptlink::reply`), so a job never meets another on the kernel's one channel to the vault, and the processes keep their slices meanwhile (the vault process answers the put).
+        let inbox_full = crate::ptlink::INBOX_FULL.load(core::sync::atomic::Ordering::Relaxed) && proc_restore.is_none();
         // Home: start init (and with it the shell and the USB process) on the service loop's first pass, the moment the boot path is done. Until 2026-11-05 it waited for a second after the press (the boot ring's budget, 2026-10-22), which made every boot take at least a second whatever the work took (owner: "I CANNOT PUT BOOTS IN UNDER A SECOND IF WHEN I PRESS POWER IT TAKES EXACTLY 1S"). init's first spawn derives the wairua, which waits for KOHI's words from worker 3: that, not a timer, is what home waits on.
         // The wall clock, re-read hourly (rtc.rs), and the battery gauge every two seconds: both on this core, never inside a syscall.
         platform::crumb(0xD6);
@@ -2374,6 +2375,9 @@ pub fn run(mut b: Boot) -> ! {
             platform::reboot();
         }
         // A command the USB process handed over (ptlink.rs, USB.md): the one dispatch below. Its handlers end with `continue`, so what follows — the raw reply handed back — runs at the top of the next pass (`proc_restore`).
+        if proc_restore.is_some() {
+            continue;
+        }
         let Some(proc_cmd) = crate::process::with_lock(crate::ptlink::take_inbox) else { continue };
         platform::crumb(0xD4);
         // Every command comes from the process now (the kernel's own USB went 2026-11-01); the name stays for the handlers that answer first and act later.
