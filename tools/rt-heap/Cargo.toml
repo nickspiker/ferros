@@ -1,0 +1,16 @@
+[package]
+name = "rt-heap"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "ferros_rt's heap on the host: its own tlsf.rs, lock.rs, layout.rs and alloc.rs, over a Linux futex and a fake arc, tested and measured against the free list it replaced (ferros_heap)."
+
+# Standalone: x86_64 Linux only (raw syscalls), outside the ferros workspace's lock.
+[workspace]
+
+[dependencies]
+# The first-fit free list ferros_rt carried until 2026-11-11 (the kernel's copy, unchanged), for the benchmark.
+ferros_heap = { path = "../../ferros_heap" }
+
+[profile.release]
+debug = true
