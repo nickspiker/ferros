@@ -1148,6 +1148,26 @@ pub fn ufs_run_range() -> (usize, usize) {
     let a = (&raw const UFS_RUN) as usize;
     (a, a + (ferros_hal::ufs::RUN_MAX << 12))
 }
+/// `out.len() / 4096` consecutive blocks (1 to RUN_MAX) of `lun` from `lba` into `out` thru the run bounce: one UFS command once the PRDT stride is known (learned here at the first run, as SYS_BLOCK learns it), else a block a command. Whether every command completed. The caller holds the kernel lock, as every UFS command must (a syscall holds it): partfs.rs reads Android's partitions with it (the modem's 98 MB firmware went a block a command until 2026-11-11).
+pub fn ufs_read_run(lun: u8, lba: u32, out: &mut [u8]) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let n = out.len() >> 12;
+    let u = ferros_hal::ufs::UfsController::new(0x1320_0000);
+    let run = (&raw mut UFS_RUN) as usize;
+    if n > 1 && ferros_hal::ufs::PRDT_STRIDE.load(Relaxed) == 0 {
+        u.probe_prdt_stride(lun, lba, run);
+    }
+    let ok = u.read_run_lun(lun, lba, n, run);
+    if ok {
+        out.copy_from_slice(unsafe { core::slice::from_raw_parts(run as *const u8, n << 12) });
+    }
+    ok
+}
+/// Whether a run moves as one UFS command (the stride known, runs not turned off by `diag "ufs runs off"`): partfs.rs sizes its reads by it.
+pub fn ufs_runs_on() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    ferros_hal::ufs::RUNS_ON.load(Relaxed) && matches!(ferros_hal::ufs::PRDT_STRIDE.load(Relaxed), 16 | 128)
+}
 /// SYS_BLOCK's measure (`diag "ufs runs"`, owner 2026-11-08: "24MB from the vault should be imperceptibly fast"): calls, blocks and timer ticks inside the call (the command or commands and the copy), reads then writes; then the reads' ticks in the UFS command alone, and the reads' commands of at least MOVING_BLOCKS blocks.
 pub static BLOCK_STATS: [core::sync::atomic::AtomicU64; 8] = [const { core::sync::atomic::AtomicU64::new(0) }; 8];
 /// vault(cap, op, x2, x3, buf): the vault process's own call (`Object::Vault`), moving the kernel's vault's old entries into its domains (VAULT-OUT.md, migration); x1 bits 0-7 the op, 8-31 the buffer's length, 32-63 an offset. Op 0: the x2-th entry still to move (a skip past ones that would not move) into `buf` as [class: 1 the person's][the domain's address and sealing keys][the scope prefix's length][the full name] → its length, NOTHING when none is left. Op 1: the value of the entry named at x2/x3, from the offset → its whole length. Op 2: that entry moved, removed from the kernel's vault → 0, NOTHING if it was not there. ERR otherwise.

@@ -1,7 +1,7 @@
 //! Files on Android's partitions, read-only: GPT lookup by partition name on any UFS LU, and an ext4 (ferros_ext4) or f2fs (ferros_f2fs) mount of it.
 //!
 //! The modem needs this (docs/oracle/MODEM-BOOT-RECON.md): its firmware is `images/default/modem.bin` in the `modem_a` partition (ext4) and its per-unit NV images are `nv_normal.bin` / `nv_protected.bin` in `efs` and `replay_region.bin` in `modem_userdata` (both f2fs).
-//! Reads are single 4 KiB UFS blocks through the HAL's bounce buffer, so throughput is one command per block.
+//! An ext4 file's blocks go in UFS runs, up to 1 MiB a command thru the vault's run bounce (`process::ufs_read_run`, since 2026-11-11); the GPT and LP lookups and the f2fs reader still read a block a command thru the HAL's one-block buffer.
 
 use alloc::string::String;
 use alloc::vec;
@@ -212,11 +212,15 @@ impl PartDisk {
         PartDisk { ufs: UfsController::new(UFS_BASE), parts }
     }
     /// Block n's LU and LBA, or None past the last extent (the filesystem's numbers are read from the disk itself: past the end is corrupt metadata).
-    fn lba(&self, mut n: u64) -> Option<(u8, u64)> {
+    fn lba(&self, n: u64) -> Option<(u8, u64)> {
+        self.lba_run(n).map(|(lun, lba, _)| (lun, lba))
+    }
+    /// Block n's LU and LBA and how many blocks from it lie on in the same extent, or None past the last extent. An extent must end within READ(10)'s 32-bit LBA (one past it would wrap to other blocks), as each block's LBA had to before runs; a 4 KiB-block UFS under 16 TiB never comes near.
+    fn lba_run(&self, mut n: u64) -> Option<(u8, u64, u64)> {
         for p in &self.parts {
             let len = p.last - p.first + 1;
             if n < len {
-                return Some((p.lun, p.first + n)).filter(|x| x.1 <= u32::MAX as u64);
+                return Some((p.lun, p.first + n, len - n)).filter(|_| p.last <= u32::MAX as u64);
             }
             n -= len;
         }
@@ -225,16 +229,29 @@ impl PartDisk {
 }
 
 impl ferros_ext4::Disk for PartDisk {
+    /// The blocks in UFS runs (`process::ufs_read_run`, up to 1 MiB a command), split only where an extent of the partition ends; a tail shorter than a block thru the one-block buffer. A command a block, as this was until 2026-11-11, held a 98 MB read to about 33 MB/s.
     fn read_blocks(&mut self, block: u64, buf: &mut [u8]) -> Result<(), ferros_ext4::Error> {
-        for (i, chunk) in buf.chunks_mut(4096).enumerate() {
-            let Some((lun, lba)) = self.lba(block + i as u64) else { return Err(ferros_ext4::Error::Corrupt) };
-            // One UFS command under the kernel lock, as the vault's are (a syscall holds it): the modem service reads files here while processes use the vault.
+        let whole = buf.len() >> 12;
+        let mut k = 0usize;
+        while k < whole {
+            let Some((lun, lba, left)) = self.lba_run(block + k as u64) else { return Err(ferros_ext4::Error::Corrupt) };
+            let m = ((whole - k) as u64).min(left).min(ferros_hal::ufs::RUN_MAX as u64) as usize;
+            let chunk = &mut buf[k << 12..(k + m) << 12];
+            // Under the kernel lock, as the vault's commands are (a syscall holds it): the modem service reads files here while processes use the vault.
+            if !crate::process::with_lock_held_or(|| crate::process::ufs_read_run(lun, lba as u32, chunk)) {
+                return Err(ferros_ext4::Error::Io);
+            }
+            k += m;
+        }
+        if buf.len() & 4095 != 0 {
+            let Some((lun, lba)) = self.lba(block + whole as u64) else { return Err(ferros_ext4::Error::Corrupt) };
             let ufs = &mut self.ufs;
-            let n = chunk.len();
+            let tail = &mut buf[whole << 12..];
+            let n = tail.len();
             let ok = crate::process::with_lock_held_or(|| {
                 let ok = ufs.read_block_lun(lun, lba as u32) == 0 && ufs.last_response_status() == 0;
                 if ok {
-                    chunk.copy_from_slice(&ufs.data_buffer()[..n]);
+                    tail.copy_from_slice(&ufs.data_buffer()[..n]);
                 }
                 ok
             });
@@ -371,8 +388,10 @@ enum Open {
 }
 static mut PART_OPEN: Option<(&'static str, Vec<u8>, Open)> = None;
 
-/// The largest chunk one read returns: 64 KiB keeps each call's hold on the kernel lock to a couple of milliseconds (a 1 MiB chunk held it ~30 ms, a stall for every other process while the modem driver read its 98 MB image).
+/// The largest chunk one read returns while reads go a block a command: 64 KiB keeps each call's hold on the kernel lock to a couple of milliseconds (a 1 MiB chunk held it ~30 ms, a stall for every other process while the modem driver read its 98 MB image).
 const PART_CHUNK: usize = 1 << 16;
+/// The largest chunk once reads go in runs (`process::ufs_runs_on`): 1 MiB, one UFS command (RUN_MAX blocks), about the lock hold 64 KiB a block a command had.
+const PART_CHUNK_RUNS: usize = ferros_hal::ufs::RUN_MAX << 12;
 
 /// One request on partition `part` (the caller holds the kernel lock, as a syscall does): [1] + path → the file's size (u64 LE), or nothing when it is not there; [2] + offset (u64 LE) + path → the bytes from there, as many as `cap` and `PART_CHUNK` allow (fewer at the end, none past it). Paths are absolute in the partition's filesystem; `..` is refused.
 pub fn part_call(part: &'static str, req: &[u8], cap: usize) -> Vec<u8> {
@@ -413,7 +432,7 @@ pub fn part_call(part: &'static str, req: &[u8], cap: usize) -> Vec<u8> {
     if off >= size {
         return Vec::new();
     }
-    let n = ((size - off) as usize).min(cap).min(PART_CHUNK);
+    let n = ((size - off) as usize).min(cap).min(if crate::process::ufs_runs_on() { PART_CHUNK_RUNS } else { PART_CHUNK });
     match open {
         Open::F2fs(v) => v[off as usize..off as usize + n].to_vec(),
         Open::Ext4(m, ino) => {
