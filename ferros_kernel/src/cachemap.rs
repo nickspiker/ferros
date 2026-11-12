@@ -108,14 +108,14 @@ pub const GPU_SNOOP: usize = GPU_MEM.1 - (2 << 20);
 pub const GPU_SNOOP: usize = 0;
 /// The layer arena (cold only; GPU.md "Layers", owner 2026-11-05): 128 MiB of Normal write-back, EL0 read/write, never executable memory where the GPU writes compute-dense layers (the Mandelbrot, glows) and the CPU composes them, or the CPU writes and the GPU reads, with no clean and no copy: the GPU maps it coherent and snoops the CPU's caches (GPU.md "Coherency"). In the GPU's fence beside gpu-mem. Free DRAM: the device tree reserves nothing in G#9800_0000-G#A000_0000 (USB's 4 MiB end at G#9740_0000), and memblock holds it plain memory (frames.rs: G#9740_0000-G#B61F_FFFF, no reservation). Granted as `layers`.
 /// 64 MiB at G#9C00_0000 until 2026-11-11, when Mahere's map moved to the GPU (GPU-KISTS.md): its cells' planes are a MiB each, and a screen at the Pro's texel density draws from up to fifty or so; the whole free range now, until kists have GPU memory of their own (plan step 1).
-/// husky's: memblock proves the whole 128 MiB. akita's is `LAYERS_AKITA` (`layers`).
+/// husky's: memblock proves the whole 128 MiB, and akita's the same (`LAYERS_AKITA`, `layers`).
 #[cfg(not(shim_handoff))]
 pub const LAYERS: (usize, usize) = (0x9800_0000, 0xA000_0000);
 #[cfg(shim_handoff)]
 pub const LAYERS: (usize, usize) = (0, 0);
-/// akita's arena (2026-11-12): the upper 64 MiB alone, G#9C00_0000-G#A000_0000, the range the 8a has run its GPU jobs in since 2026-11-09 (BOARDS.md: gputest's Mandelbrot there). Its memblock has not been captured (BOARDS.md "Memory map"), so G#9800_0000-G#9C00_0000 is unproven on it: never mapped for EL0, never fenced in for the GPU, never scrubbed, never handed out, until a capture proves it.
+/// akita's arena: husky's 128 MiB since 2026-11-12, when its own memblock was captured (BOARDS.md "Memory map": G#9740_0000-G#B61F_FFFF plain memory there too). Until then the upper 64 MiB alone, G#9C00_0000-G#A000_0000, where the 8a had run its GPU jobs since 2026-11-09; with the attest screen's 32 MiB block taken, that left Mahere a 32 MiB block, too small for its frame's two regions and four cells ("the GPU map stopped", and the map stayed black).
 #[cfg(not(shim_handoff))]
-pub const LAYERS_AKITA: (usize, usize) = (0x9C00_0000, 0xA000_0000);
+pub const LAYERS_AKITA: (usize, usize) = LAYERS;
 #[cfg(shim_handoff)]
 pub const LAYERS_AKITA: (usize, usize) = (0, 0);
 

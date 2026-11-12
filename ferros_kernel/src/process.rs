@@ -1673,7 +1673,7 @@ pub static DMA: &[Dma] = &[
     // The GPU driver process (GPU.md): the GPU's registers and doorbells, mapped for EL0 (Device), and the memory it and the GPU share (Normal non-cacheable; the GPU's S2MPU holds it to this).
     Dma { name: "gpu-regs", base: crate::cachemap::GPU_REGS.0, size: crate::cachemap::GPU_REGS.1 - crate::cachemap::GPU_REGS.0 },
     Dma { name: "gpu-mem", base: crate::cachemap::GPU_MEM.0, size: crate::cachemap::GPU_MEM.1 - crate::cachemap::GPU_MEM.0 },
-    // The layer arena whole (cachemap LAYERS; on akita its upper half, `cachemap::layers`, answered by `region`): CPU write-back, the GPU coherent. The GPU service's (it reads a client's kernel from the client's own block) and init's to pass on, which passes a block of it (SYS_SPAWN); no client holds it whole (GPU-KISTS.md plan step 1, 2026-11-12).
+    // The layer arena whole (cachemap LAYERS; this board's as `cachemap::layers` says, answered by `region`: akita's upper half until its memblock was captured, 2026-11-12): CPU write-back, the GPU coherent. The GPU service's (it reads a client's kernel from the client's own block) and init's to pass on, which passes a block of it (SYS_SPAWN); no client holds it whole (GPU-KISTS.md plan step 1, 2026-11-12).
     Dma { name: "arena", base: crate::cachemap::LAYERS.0, size: crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0 },
     // The arena's blocks, each a GPU client's own region when given (`NewRegion`, `region_take`): the whole, its halves, its quarters, largest first, each a power of two at a base aligned to it so a masked client reaches it thru a handle. Must stay consecutive and in this order: `block0() + j` is block j (`LAYER_BLOCKS`). Never granted by name (`resolve`).
     Dma { name: "layers-block", base: crate::cachemap::LAYERS.0, size: crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0 },
@@ -1776,7 +1776,7 @@ static mut BLOCK_OWNER: [u64; LAYER_BLOCKS] = [0; LAYER_BLOCKS];
 /// Blocks (bit j) and surfaces (bit 8 + k) whose owner ended while a job of its was on the GPU: not given out again until the GPU service has taken its next request, so that job, still running, writes nothing a new owner holds (`gpu_drain`). Under the kernel lock.
 static mut GPU_DRAINING: u16 = 0;
 
-/// DMA region `i`'s base and size as this board has it: the whole arena is akita's upper half there (`cachemap::layers`); every other region as `DMA` lists it.
+/// DMA region `i`'s base and size as this board has it: the whole arena as `cachemap::layers` gives it (akita's upper half alone until 2026-11-12); every other region as `DMA` lists it.
 fn region(i: usize) -> (usize, usize) {
     if DMA[i].name == "arena" {
         let (a, b) = crate::cachemap::layers();
@@ -1785,7 +1785,7 @@ fn region(i: usize) -> (usize, usize) {
     (DMA[i].base, DMA[i].size)
 }
 
-/// Give the process with `epoch` the largest free block of the arena no larger than `most` bytes, wiped: its own region for the GPU (GPU-KISTS.md plan step 1, 2026-11-12). Blocks outside this board's arena (akita's lower half) are never given. A block is free when no block over the same memory is held or draining. Returns its index among the blocks. Under the lock.
+/// Give the process with `epoch` the largest free block of the arena no larger than `most` bytes, wiped: its own region for the GPU (GPU-KISTS.md plan step 1, 2026-11-12). Blocks outside this board's arena (`cachemap::layers`; akita's lower half until 2026-11-12) are never given. A block is free when no block over the same memory is held or draining. Returns its index among the blocks. Under the lock.
 fn region_take(epoch: u64, most: usize) -> Option<usize> {
     let (l0, l1) = crate::cachemap::layers();
     let b0 = block0();
@@ -5518,6 +5518,19 @@ pub fn kist_need(head: &[u8], total: usize) -> Result<(usize, usize), &'static s
     // And the most it may grow to (SYS_ARC): the code with its whole declared heap.
     let ceiling = image_tail_ceiling(&head[co..co + 56]);
     Ok((CODE + total.max(cl + tail) + STACK + (1 << 16), CODE + total.max(cl + ceiling) + STACK + (1 << 16)))
+}
+
+/// A streamed spawn's arc (service.rs, the bridge's spawn Write pieces: `bridge spawn` of a capsule past 1 MiB) as (its size at spawn, its ceiling), from the bytes the host asked for and the image's first 56 bytes. The host counts the image's whole declared heap; a growing image starts with `image_tail` and keeps the rest as its ceiling (SYS_ARC), as a kist's arc does (`kist_need`). Until 2026-11-12 the arc was the host's sum, never growing: Mahere's 640 MiB heap asked for 640 MiB at spawn, which akita's 336 MiB pool refused outright ("Piece at 0 not taken").
+pub fn stream_room(need: usize, code: &[u8]) -> (usize, usize) {
+    if !has_image_header(code) {
+        return (need, need);
+    }
+    let grow = image_tail_ceiling(code) - image_tail(code);
+    // WHY the check: `need` is the host's; one that leaves the heap out (a bridge from before the header) has nothing to give back, and keeps its sum as it is.
+    match need.checked_sub(grow) {
+        Some(size) => (size, need),
+        None => (need, need),
+    }
 }
 
 /// Whether a kist's capsule carries masked code, from its first bytes (its header's table names the section): its arc is then taken masked, with the guard above it (SANDBOX.md "Placement and guards").

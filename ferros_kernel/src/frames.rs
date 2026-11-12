@@ -6,7 +6,9 @@
 //! husky's proof is Android's own boot log of 2026-08-17 (/mnt/Harbor/tmp/linux_full_dmesg.txt, stock 6.1.124, "Machine model: ZUMA HUSKY MP"): memblock's memory ("Early memory node ranges": G#8000_0000-G#FFFF_FFFF and G#8_8000_0000-G#A_FFFF_FFFF, 12 GiB) and every reservation it made from the device tree ("OF: reserved mem", each with the size memblock was given, so a size-0 node like the hv's of 2026-10-17 would show).
 //! In the high bank those reservations are one run, G#9_BE40_0000-G#9_FFFF_FFFF (vscaler, farawimg, famodel, faceauth_dsp, faceauth_tpu, vstream, faprev, vframe, gcma_camera), and the hv's 64 MiB at the top (G#A_FC00_0000, /proc/iomem "reserved" since 2026-10-19, HV.md).
 //! The 2 MiB frame under the hv is left out too: the hv copies the device tree it hands Linux to G#A_FBF0_0000 (ferros_hv DTB_COPY).
-//! akita has no memblock capture in the repo yet: only the two pools it has run processes from (BOARDS.md "Memory map" has the capture that would prove its high bank).
+//! akita's proof is its own memblock under today's Android, under the hv, captured 2026-11-12 (/mnt/Harbor/tmp/akita-memblock-2026-11-12: debugfs memblock/memory and memblock/reserved, /proc/iomem, the boot log; Android CP2A.260805.005 on slot b): memory G#8000_0000-G#FFFF_FFFF and G#8_8000_0000-G#9_FFFF_FFFF, 8 GiB.
+//! In its high bank memblock reserves the device tree copy the hv hands Linux (G#8_FFF0_0000, ferros_hv DTB_COPY), the hv's 64 MiB (G#9_0000_0000, nomap), and everything from G#9_BC04_0000 up: Linux's own early allocations under the pools, then the camera and video pools (vframe from G#9_C540_0000, farawimg, famodel, faprev, faceauth_dsp, gcma_camera, faceauth_tpu, vstream, vscaler to the top), the top being out of reach at the handoff anyway (ferros_hv build.rs).
+//! So its two ranges stop at the 2 MiB frame under the device tree copy and at the frame under G#9_BC04_0000, as husky's stop under its pools and its hv.
 
 /// A frame: 2 MiB, the unit every arc is made of (ARCS.md).
 pub const FRAME: usize = 1 << 21;
@@ -24,20 +26,38 @@ const HUSKY: [(usize, usize); 4] = [
     (0xA_0000_0000, 0xA_FA00_0000),
 ];
 
-/// akita's frame ranges: the two pools ferros has run its processes from (BOARDS.md "Memory map": its high bank waits for a memblock capture).
+/// akita's frame ranges: the two pools ferros has run its processes from, then its high bank where memblock reserves nothing (2026-11-12; memblock: plain memory under both pools too).
 #[cfg(not(shim_handoff))]
-const AKITA: [(usize, usize); 2] = [crate::cachemap::POOL, crate::cachemap::POOL_BIG];
+const AKITA: [(usize, usize); 4] = [
+    crate::cachemap::POOL,
+    crate::cachemap::POOL_BIG,
+    // The high bank up to the frame that holds the hv's copy of the device tree (G#8_FFF0_0000).
+    (0x8_8000_0000, 0x8_FFE0_0000),
+    // Past the hv's 64 MiB, up to Linux's own allocations and the camera and video pools (G#9_BC04_0000).
+    (0x9_0400_0000, 0x9_BC00_0000),
+];
+/// Either board kept to the two old pools (`map`: after a jump, or a `FERROS_FRAMES_HIGH=0` build).
+#[cfg(not(shim_handoff))]
+const LOW: [(usize, usize); 2] = [crate::cachemap::POOL, crate::cachemap::POOL_BIG];
 
 /// The handoff path (oracle only): its 2 MiB pool.
 #[cfg(shim_handoff)]
 const HUSKY: [(usize, usize); 1] = [crate::cachemap::POOL];
 #[cfg(shim_handoff)]
 const AKITA: [(usize, usize); 1] = [crate::cachemap::POOL];
+#[cfg(shim_handoff)]
+const LOW: [(usize, usize); 1] = [crate::cachemap::POOL];
 
-/// This board's frame ranges. A `FERROS_FRAMES_HIGH=0` build keeps husky to the two old pools as well: the escape if its high bank ever misbehaves, as `FERROS_X3=0` is the X3's.
+/// This board's frame ranges. A `FERROS_FRAMES_HIGH=0` build keeps either board to the two old pools: the escape if its high bank ever misbehaves, as `FERROS_X3=0` is the X3's.
 /// After a jump from Android (or a ferros restart, jump style) the high bank stays out of the pool too (2026-11-11, the Pro: a boot that came from a jump ran about a minute after attest and reset with no panic recorded): Android can leave a DMA master running, and a device still writing into high-bank frames would land in a process's memory. The two old pools are what ferros ran from after jumps before ARCS. The high bank comes back after jumps once every master Android left running is fenced or reset (the jump is a killswitch: memory feedback_jump_is_killswitch).
 pub fn map() -> &'static [(usize, usize)] {
-    if crate::board::akita() || option_env!("FERROS_FRAMES_HIGH") == Some("0") || crate::platform::jumped() { &AKITA } else { &HUSKY }
+    if option_env!("FERROS_FRAMES_HIGH") == Some("0") || crate::platform::jumped() {
+        &LOW
+    } else if crate::board::akita() {
+        &AKITA
+    } else {
+        &HUSKY
+    }
 }
 
 /// The ranges as `diag frames` reads them: start, end, and size in MiB.
@@ -206,6 +226,38 @@ pub fn scrub() -> usize {
         }
     }
     n
+}
+
+/// `diag frames test`, one frame: frame `f` written with its own addresses (each word its address, inverted in odd frames), read back, then wiped and marked clean, if it is free; None for a frame an arc or the tables hold, or past the pool. Some(how many words were wrong, the first wrong word's address). Under the kernel lock, a frame a hold (service.rs `diag frames test` takes 256 frames a call).
+/// The proof a new range is memory ferros reaches end to end (akita's high bank: memblock says nobody owns it, this says the kernel's stores land and read back).
+pub fn test_frame(f: usize) -> Option<(usize, usize)> {
+    let p = pool();
+    if f < p.table_frames || f >= p.total || p.used[f / 64] & 1 << (f % 64) != 0 {
+        return None;
+    }
+    let a = pa(f);
+    let flip = if f & 1 == 1 { u64::MAX } else { 0 };
+    let words = unsafe { core::slice::from_raw_parts_mut(a as *mut u64, FRAME / 8) };
+    for (k, w) in words.iter_mut().enumerate() {
+        unsafe { core::ptr::write_volatile(w, (a + k * 8) as u64 ^ flip) };
+    }
+    let (mut wrong, mut first) = (0, 0);
+    for (k, w) in words.iter().enumerate() {
+        if unsafe { core::ptr::read_volatile(w) } != (a + k * 8) as u64 ^ flip {
+            if wrong == 0 {
+                first = a + k * 8;
+            }
+            wrong += 1;
+        }
+    }
+    zero(a);
+    p.clean[f / 64] |= 1 << (f % 64);
+    Some((wrong, first))
+}
+
+/// Every frame the map holds, the tables' too (`test_frame`'s range).
+pub fn total() -> usize {
+    pool().total
 }
 
 /// `diag frames`'s second half: how the pool stands.

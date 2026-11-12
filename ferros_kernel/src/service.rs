@@ -1884,6 +1884,8 @@ pub fn run(mut b: Boot) -> ! {
     let mut run_size = 0usize;
     // A capsule streamed straight into its arc (the spawn Write pieces): the arc, the capsule's length, the bytes received, the code's offset and length inside it.
     let mut spawn_stage: Option<(crate::process::Arc, usize, usize, usize, usize)> = None;
+    // `diag frames test`'s run so far: the next frame, frames tested, words wrong, frames with one wrong, the first wrong word's address.
+    let mut frames_test = (0usize, 0usize, 0usize, 0usize, 0usize);
 
     unsafe extern "C" {
         static __stack_top: u8;
@@ -3267,6 +3269,33 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                // `diag frames test`: the free frames written, read back and wiped (frames.rs `test_frame`), a hold of the kernel lock a frame and 256 frames (512 MiB) a call, the next call going on from there until the pool is done; then the whole run's count. Never the whole pool in one call: the service loop busy for akita's 5 GiB (1.2 s, 2026-11-12) reset the 8a about 25 s later, every time, with nothing on the console, where calls of up to 0.7 s did not.
+                if cmd.params == b"frames test" {
+                    let total = crate::process::with_lock(crate::frames::total);
+                    let (at, n, bad, bad_frames, first) = &mut frames_test;
+                    let mut tested = 0;
+                    while *at < total && tested < 1 << 8 {
+                        if let Some((wrong, w)) = crate::process::with_lock(|| crate::frames::test_frame(*at)) {
+                            if *bad == 0 && wrong != 0 {
+                                *first = w;
+                            }
+                            tested += 1;
+                            *n += 1;
+                            *bad += wrong;
+                            *bad_frames += (wrong != 0) as usize;
+                        }
+                        *at += 1;
+                    }
+                    let tail = if *bad == 0 { alloc::string::String::new() } else { alloc::format!(", the first at G#{first:X}") };
+                    if *at < total {
+                        resp.extend_from_slice(alloc::format!("frames test: A#{at} of A#{total} frames so far, A#{n} free ones written and read back, A#{bad} words wrong in A#{bad_frames} frames{tail}; again for the next\n").as_bytes());
+                    } else {
+                        resp.extend_from_slice(alloc::format!("frames test done: A#{n} free frames written and read back, A#{bad} words wrong in A#{bad_frames} frames{tail}\n").as_bytes());
+                        frames_test = (0, 0, 0, 0, 0);
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if let Some(names) = cmd.params.strip_prefix(b"restart ") {
                     restart(&mut store, names, &mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
@@ -4310,7 +4339,10 @@ pub fn run(mut b: Boot) -> ! {
                         if let Some((a, ..)) = spawn_stage.take() {
                             crate::process::with_lock(|| crate::process::arc_free(a));
                         }
-                        if let Some(arc) = crate::process::with_lock(|| crate::process::arc_alloc(need, false)) {
+                        // The arc starts with the image's first heap and grows to the rest (`stream_room`), and holds the whole capsule while it is staged. WHY the bound: the code offset is the host's; an image header past the first piece is not read (the arc is then the host's sum).
+                        let (size, ceiling) = if co <= piece.len() && piece.len() - co >= 56 { crate::process::stream_room(need, &piece[co..co + 56]) } else { (need, need) };
+                        let size = size.max(crate::process::CODE + total + crate::process::STACK);
+                        if let Some(arc) = crate::process::with_lock(|| crate::process::arc_alloc_room(size, ceiling, false)) {
                             spawn_stage = Some((arc, total, 0, co, cl));
                         }
                     }
