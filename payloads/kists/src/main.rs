@@ -8,18 +8,22 @@
 //! 4. **storing**: the kist in the person's list (`kists.list`), with where it came from (`source`) and when (`installed`), the answers it had (or kept from an uninstall) standing, and its developer's bundle pinned there at their first kist (`Kists::trust`; an uninstall keeps the pin);
 //! 5. **done**, or the failure and why (the capsule's bytes dropped from the vault on any failure).
 //!
+//! **Stowing** a kist offered over USB (docs/KISTS.md "Stowing"; owner, 2026-11-11: "Just seems to me that we should just make a proper checked path and start using it", "the proper term for installing a kist is stow"): the host (tools/ferros-send) carries the capsule into `capsules.` thru the kernel (PT `ferros.kist.offer`) and offers it; the offers' watcher takes it (SYS_OFFER) as a job, which runs stages 1 to 3 exactly as above (the capsule read back from the vault and hashed as it passes, in place of the fetch; native code taken unchecked on a development build only, `ferros_sys::stow_check`), then waits at `STAGE_ASKING` for the person: the map shows the offer (op 6) with Stow and Cancel (op 5). Stow is stage 4; Cancel drops its bytes. Each state goes to the kernel, which answers the host's held read. Nothing is in the person's list before Stow.
+//!
 //! An uninstall takes the kist out of the person's list, its answers kept (ferros_kist `Kists::remove`: asked once, ever), and drops its capsule; the identity service carries the removal to the person's other devices. A restore (the person's list came back from their fleet after a reset, payloads/fgtw space.rs) fetches each capsule the list names that this device lacks, from its recorded source then the directory, through the same stages; the fleet's own devices first is the owner's order, and a seam (`fleet_fetch`) until that protocol exists.
 //!
 //! Nothing here asks on a timer (owner, 2026-11-10: "No polling!"): the page holds a doorbell (op 0) answered when anything it shows changes; the worker sleeps on a word until a job comes; a restore follows the identity service's own doorbell (fgtw op 21); the kernel tells each stage of its check on a word (`wait_world`). The one timer is net.rs's: ip has no held receive yet.
 //!
-//! Started by the kernel once a person has attested, with its own grants (service.rs `kists_grants`; init's page is full): 0 console, 1 use udp, 2 the vault scope `capsules.`, 3 the vault scope `kists.`, 4 serve `kists`, 5 use fgtw, 6 the Install right.
+//! Started by the kernel once a person has attested, with its own grants (service.rs `kists_grants`; init's page is full): 0 console, 1 use udp, 2 the vault scope `capsules.`, 3 the vault scope `kists.`, 4 serve `kists`, 5 use fgtw, 6 the Install right (also SYS_OFFER's: the offers over USB).
 //!
 //! `kists` ops (the map's, first byte):
-//! - 0 [count u32 LE]: the doorbell. Answered at once with the status when its count is not the caller's, else held until it changes: [count u32 LE][directory: 0 not read, 1 fetching, 2 read, 3 not reachable][1 the directory's signature checked, 0 not (the project key not pinned yet)][jobs n][per job: kind (0 install, 1 uninstall, 2 restore), stage (`STAGE_*`), why (`WHY_*`), the capsule 32, bytes so far u64 LE, bytes in all u64 LE, name length, name], then per job again: [who length, who] (the developer whose other kists a refused key differs from, `WHY_OTHER_KEY`; empty for any other job), then the directory's generation u32 LE (moved each time a directory is read: the page reads the rows again).
+//! - 0 [count u32 LE]: the doorbell. Answered at once with the status when its count is not the caller's, else held until it changes: [count u32 LE][directory: 0 not read, 1 fetching, 2 read, 3 not reachable][1 the directory's signature checked, 0 not (the project key not pinned yet)][jobs n][per job: kind (0 install, 1 uninstall, 2 restore, 3 an offer to stow), stage (`STAGE_*`; 8 an offer waiting on the person), why (`WHY_*`), the capsule 32, bytes so far u64 LE, bytes in all u64 LE, name length, name], then per job again: [who length, who] (the developer whose other kists a refused key differs from, `WHY_OTHER_KEY`; empty for any other job), then the directory's generation u32 LE (moved each time a directory is read: the page reads the rows again).
 //! - 1: fetch the directory again and look for missing capsules again (the page opened) → [0].
 //! - 2 [from]: the directory's entries from `from` → [entries in all][n][per entry: capsule 32, developer 32, option 32, size u64 LE, the version's part count u8 then each part u64 LE (as its capsule's signed declaration writes it, leading zeros and all; at most 255 parts), name length, name, about length, about], as many as fit one reply (4000 bytes: an entry is at most A#2275, so one always fits). Until 2026-11-10 the version was three u16 (major, minor, patch).
 //! - 3 [capsule 32]: install (or update to) the directory's entry with that capsule → [0 queued, 1 not in the directory, 2 already under way, 3 too many under way].
 //! - 4 [developer 32][option 32]: uninstall that kist → [0 queued, 1 not installed, 3 too many under way].
+//! - 5 [capsule 32][1 Stow, 0 Cancel]: the person's answer to the offer on the glass → [0 taken, 1 no such offer waiting on them].
+//! - 6 [capsule 32]: the offer as the page shows it (`offer_reply`) → [0][length u64 LE][flags, bit 0 native][developer 32][version parts u8, each u64 LE][name length, name][developer's name length, name][wants n][per want: right, reason length, reason], or [1] when that capsule is no offer waiting on the person.
 
 #![no_std]
 #![no_main]
@@ -58,6 +62,8 @@ unsafe impl<const N: usize> Sync for Region<N> {}
 static HEAP: Region<HEAP_SIZE> = Region(UnsafeCell::new([0; HEAP_SIZE]));
 static WORKER_STACK: Region<WORK_STACK> = Region(UnsafeCell::new([0; WORK_STACK]));
 static WATCHER_STACK: Region<WATCH_STACK> = Region(UnsafeCell::new([0; WATCH_STACK]));
+/// The offers' watcher's stack: two small calls and a job pushed.
+static OFFER_STACK: Region<WATCH_STACK> = Region(UnsafeCell::new([0; WATCH_STACK]));
 /// The piece being filled: in the arc (.bss), where a syscall's bytes land (never the heap's start, a DMA region in some processes; here the heap is in the arc too).
 static PIECE_BUF: Region<PIECE> = Region(UnsafeCell::new([0; PIECE]));
 
@@ -72,6 +78,8 @@ const PROJECT_BUNDLE: &[u8] = &[];
 const KIND_INSTALL: u8 = 0;
 const KIND_UNINSTALL: u8 = 1;
 const KIND_RESTORE: u8 = 2;
+/// A kist offered over USB to stow (docs/KISTS.md "Stowing"): checked as an install is, then held at `STAGE_ASKING` until the person says Stow or Cancel on the glass (op 5).
+const KIND_OFFER: u8 = 3;
 
 /// A job's stages, as the page shows them.
 const STAGE_QUEUED: u8 = 0;
@@ -82,29 +90,16 @@ const STAGE_SEALING: u8 = 4;
 const STAGE_STORING: u8 = 5;
 const STAGE_DONE: u8 = 6;
 const STAGE_FAILED: u8 = 7;
+/// An offer checked and on the glass, waiting for the person's Stow or Cancel: neither under way nor finished (`finished`), so it never gives way to another job and holds no worker.
+const STAGE_ASKING: u8 = 8;
 
-/// Why a job failed (the page words each).
-const WHY_NETWORK: u8 = 1;
-const WHY_MISSING: u8 = 2;
-const WHY_SIZE: u8 = 3;
-const WHY_NOT_NAMED: u8 = 4;
-const WHY_EGGS: u8 = 5;
-/// It carries no bundle of its developer's keys (a capsule from before 2026-11-10).
-const WHY_NO_BUNDLE: u8 = 6;
-const WHY_NATIVE: u8 = 7;
-const WHY_CHECKER: u8 = 8;
-const WHY_SEAL: u8 = 9;
-const WHY_VAULT: u8 = 10;
-const WHY_BROKEN: u8 = 11;
-const WHY_MANIFEST: u8 = 12;
-const WHY_NOT_LISTED: u8 = 13;
-const WHY_NOBODY: u8 = 14;
-const WHY_ROOM: u8 = 15;
-const WHY_NOT_KIST: u8 = 16;
-/// The person trusted another bundle for this developer key at its first kist (the job's `who` names the developer).
-const WHY_OTHER_KEY: u8 = 17;
-/// The bundle it carries is not its developer's (its Ed25519 key is not the kist's).
-const WHY_NOT_ITS_KEYS: u8 = 18;
+/// Whether a job has ended (done or failed): it may give way to a new one, and another job for its capsule may start.
+fn finished(stage: u8) -> bool {
+    stage == STAGE_DONE || stage == STAGE_FAILED
+}
+
+/// Why a job failed (the page words each): ferros_kist::offer::why, shared with the map and `ferros send`.
+use ferros_kist::offer::why::{BROKEN as WHY_BROKEN, CHECKER as WHY_CHECKER, EGGS as WHY_EGGS, MANIFEST as WHY_MANIFEST, MISSING as WHY_MISSING, NATIVE as WHY_NATIVE, NATIVE_HERE as WHY_NATIVE_HERE, NETWORK as WHY_NETWORK, NOBODY as WHY_NOBODY, NOT_ITS_KEYS as WHY_NOT_ITS_KEYS, NOT_KIST as WHY_NOT_KIST, NOT_LISTED as WHY_NOT_LISTED, NOT_NAMED as WHY_NOT_NAMED, NO_BUNDLE as WHY_NO_BUNDLE, OTHER_KEY as WHY_OTHER_KEY, ROOM as WHY_ROOM, SEAL as WHY_SEAL, SIZE as WHY_SIZE, VAULT as WHY_VAULT};
 
 /// The most jobs the page lists (finished ones give way first): one reply holds them, and the map holds sixteen circles.
 const JOBS_MAX: usize = 1 << 4;
@@ -124,6 +119,19 @@ struct Job {
     total: u64,
     /// For `WHY_OTHER_KEY`: the developer the person trusted, as their pin names them (ferros_kist `capsule::pin_name`); empty otherwise.
     who: String,
+    /// An offer's: what its checks found, kept for the page (op 6) and for the stow; and the person's answer once given (op 5), true Stow, false Cancel.
+    offered: Option<Offered>,
+    answer: Option<bool>,
+}
+
+/// A checked offer, as the person sees it on the glass and as it goes into their list at Stow.
+#[derive(Clone)]
+struct Offered {
+    decl: ferros_kist::Decl,
+    version: ferros_kist::Version,
+    admitted: ferros_kist::capsule::Admitted,
+    /// Native, unchecked machine code, taken on a development build only (the kernel's `install::NATIVE`).
+    native: bool,
 }
 
 struct State {
@@ -159,6 +167,8 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
 static WORK: AtomicU64 = AtomicU64::new(0);
 /// The kernel's word for the install it is checking (`ferros_sys::install_kist`).
 static KERNEL_WORD: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The offers' doorbell (`ferros_sys::offer::doorbell`): the kernel moves it whenever a host offers a kist over USB.
+static OFFER_WORD: AtomicU64 = AtomicU64::new(0);
 /// The grants page, for the threads.
 static GRANTS: AtomicU64 = AtomicU64::new(0);
 
@@ -274,7 +284,7 @@ fn make_room(s: &mut State) -> bool {
     if s.jobs.len() < JOBS_MAX {
         return true;
     }
-    match s.jobs.iter().position(|j| j.stage >= STAGE_DONE) {
+    match s.jobs.iter().position(|j| finished(j.stage)) {
         Some(i) => {
             s.jobs.remove(i);
             true
@@ -292,6 +302,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { *STATE.0.get() = Some(State { count: 0, watchers: Vec::new(), dir_state: 0, dir_checked: false, dir: None, dir_gen: 0, dir_wanted: false, restore_wanted: true, jobs: Vec::new() }) };
     ferros_sys::thread_spawn(worker, unsafe { &mut *WORKER_STACK.0.get() }, grants);
     ferros_sys::thread_spawn(space_watch, unsafe { &mut *WATCHER_STACK.0.get() }, grants);
+    ferros_sys::thread_spawn(offer_watch, unsafe { &mut *OFFER_STACK.0.get() }, grants);
     say(b"kists: serving the installer (kists); a restore follows the identity service\n");
     serve(grants)
 }
@@ -340,13 +351,13 @@ fn serve(grants: u64) -> ! {
                 let capsule: [u8; 32] = m[1..33].try_into().unwrap();
                 let r = with(|s| {
                     let Some(e) = s.dir.as_ref().and_then(|d| d.kists.iter().find(|e| e.capsule == capsule)).cloned() else { return 1 };
-                    if s.jobs.iter().any(|j| j.capsule == capsule && j.stage < STAGE_DONE) {
+                    if s.jobs.iter().any(|j| j.capsule == capsule && !finished(j.stage)) {
                         return 2;
                     }
                     if !make_room(s) {
                         return 3;
                     }
-                    s.jobs.push(Job { kind: KIND_INSTALL, capsule, developer: e.developer, option: e.option, name: e.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: e.size, who: String::new() });
+                    s.jobs.push(Job { kind: KIND_INSTALL, capsule, developer: e.developer, option: e.option, name: e.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: e.size, who: String::new(), offered: None, answer: None });
                     0
                 });
                 reply(&tok, &[r]);
@@ -365,7 +376,7 @@ fn serve(grants: u64) -> ! {
                         if !make_room(s) {
                             return 3;
                         }
-                        s.jobs.push(Job { kind: KIND_UNINSTALL, capsule: k.capsule, developer, option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new() });
+                        s.jobs.push(Job { kind: KIND_UNINSTALL, capsule: k.capsule, developer, option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new(), offered: None, answer: None });
                         0
                     }),
                 };
@@ -374,6 +385,29 @@ fn serve(grants: u64) -> ! {
                     kick();
                     ring();
                 }
+            }
+            // The person's answer to an offer on the glass: Stow (1) or Cancel (0); the worker does it.
+            5 if got >= 34 => {
+                let capsule: [u8; 32] = m[1..33].try_into().unwrap();
+                let stow = m[33] == 1;
+                let r = with(|s| match s.jobs.iter_mut().find(|j| j.kind == KIND_OFFER && j.capsule == capsule && j.stage == STAGE_ASKING) {
+                    Some(j) => {
+                        j.answer = Some(stow);
+                        j.stage = STAGE_QUEUED;
+                        0
+                    }
+                    None => 1,
+                });
+                reply(&tok, &[r]);
+                if r == 0 {
+                    kick();
+                    ring();
+                }
+            }
+            6 if got >= 33 => {
+                let capsule: [u8; 32] = m[1..33].try_into().unwrap();
+                let r = with(|s| offer_reply(s, &capsule));
+                reply(&tok, &r);
             }
             _ => reply(&tok, &[]),
         }
@@ -544,6 +578,8 @@ fn run(grants: u64, i: usize) {
     let job = with(|s| s.jobs[i].clone());
     let r = match job.kind {
         KIND_INSTALL => install(grants, i, &job),
+        // An offer stages and ends itself: checked, it waits on the person (`STAGE_ASKING`), and the answer makes it a job again.
+        KIND_OFFER => return offer(grants, i, &job),
         KIND_UNINSTALL => uninstall(grants, &job),
         _ => restore(grants, i, &job),
     };
@@ -642,14 +678,14 @@ fn restore_pass(grants: u64) {
     let mut added = false;
     with(|s| {
         for c in &missing {
-            if s.jobs.iter().any(|j| j.capsule == *c && j.stage < STAGE_DONE) {
+            if s.jobs.iter().any(|j| j.capsule == *c && !finished(j.stage)) {
                 continue;
             }
             let Some(k) = list.by_capsule(c) else { continue };
             if !make_room(s) {
                 break;
             }
-            s.jobs.push(Job { kind: KIND_RESTORE, capsule: *c, developer: k.developer, option: k.option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new() });
+            s.jobs.push(Job { kind: KIND_RESTORE, capsule: *c, developer: k.developer, option: k.option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new(), offered: None, answer: None });
             added = true;
         }
     });
@@ -739,6 +775,209 @@ fn restore(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
 /// The fleet's own devices first (owner, 2026-11-10: "BLE, then LAN, then WAN, then hopefully we shouldn't need to but fgtw.org"; docs/IDENTITY-SPACE.md "Capsules", source 2): a `capsule_want` over Photon Transport to the person's devices heard, answered in pieces from their `capsules.`, each piece into this device's vault as the HTTP path does, then the same checks. Not built: it is new protocol (the frame, fgtw's routing to a sibling that holds the capsule, the sibling's answer). TODO(fleet capsules): build it in payloads/fgtw beside `space_want`, and return true here once the capsule is stored and checked.
 fn fleet_fetch(_capsule: &[u8; 32]) -> bool {
     false
+}
+
+/// The offers' watcher (docs/KISTS.md "Stowing"): the kernel's offers' doorbell held on this thread; each time it rings, the offer not yet ended taken (SYS_OFFER op 1) and queued as a job for the worker. Taken again at start, so an installer that started again takes up an offer its predecessor left.
+extern "C" fn offer_watch(grants: u64) -> ! {
+    let install = cap(grants, S_INSTALL);
+    if !ferros_sys::offer::doorbell(install, &OFFER_WORD) {
+        say(b"kists: no offers' doorbell (a kernel without SYS_OFFER): no kist is stowed over USB\n");
+        loop {
+            ferros_sys::wait_world(&OFFER_WORD, OFFER_WORD.load(Ordering::Acquire), 0);
+        }
+    }
+    loop {
+        let seen = OFFER_WORD.load(Ordering::Acquire);
+        if let Some((capsule, len)) = ferros_sys::offer::take(install) {
+            let added = with(|s| {
+                if s.jobs.iter().any(|j| j.kind == KIND_OFFER && j.capsule == capsule && !finished(j.stage)) {
+                    return None;
+                }
+                if !make_room(s) {
+                    return Some(false);
+                }
+                s.jobs.push(Job { kind: KIND_OFFER, capsule, developer: [0; 32], option: [0; 32], name: String::new(), stage: STAGE_QUEUED, why: 0, got: 0, total: len, who: String::new(), offered: None, answer: None });
+                Some(true)
+            });
+            match added {
+                Some(true) => {
+                    say(b"kists: a kist offered over USB, checking it to stow\n");
+                    kick();
+                    ring();
+                }
+                // Every job slot under way: refused for room, its bytes dropped.
+                Some(false) => {
+                    ferros_sys::offer::tell(install, &capsule, ferros_kist::offer::REFUSED, WHY_ROOM, 0);
+                    drop_offered(grants, &capsule);
+                }
+                None => {}
+            }
+        }
+        ferros_sys::wait_world(&OFFER_WORD, seen, 0);
+    }
+}
+
+/// A kist offered over USB (KIND_OFFER), on the worker: before the person's answer, every check the directory's path makes (`offer_check`), then the glass (`STAGE_ASKING`); after it, Stow into their list or Cancel (`offer_answer`). Each state told to the kernel, which answers the host's held read.
+fn offer(grants: u64, i: usize, job: &Job) {
+    let install = cap(grants, S_INSTALL);
+    let r = match job.answer {
+        None => offer_check(grants, i, job),
+        Some(stow) => offer_answer(grants, i, job, stow),
+    };
+    match r {
+        Ok((state, flags)) => {
+            ferros_sys::offer::tell(install, &job.capsule, state, 0, flags);
+        }
+        Err(why) => {
+            drop_offered(grants, &job.capsule);
+            fail(i, why);
+            ferros_sys::offer::tell(install, &job.capsule, ferros_kist::offer::REFUSED, why, 0);
+        }
+    }
+}
+
+/// An offer's checks, as `bring` makes them for a capsule from the directory (SANDBOX.md's lifecycle, nothing skipped): the capsule read back from `capsules.` where the host put it and hashed as it passes (its blake3 must be the address offered, its length the one offered), its declaration, its version, every egg against the bundle it carries and the person's pin for its developer (`capsule::admit`), then the kernel's gate, checker and seal (`stow_check`; native code taken unchecked on a development build only). Ok(ASKING): on the glass, its job at `STAGE_ASKING` with what the page shows.
+fn offer_check(grants: u64, i: usize, job: &Job) -> Result<(u8, u8), u8> {
+    ferros_sys::offer::tell(cap(grants, S_INSTALL), &job.capsule, ferros_kist::offer::CHECKING, 0, 0);
+    stage(i, STAGE_SIGNATURE, 0, job.total);
+    let capsules = cap(grants, S_CAPSULES);
+    let piece = unsafe { &mut *PIECE_BUF.0.get() };
+    let mut intake = Intake::new();
+    let mut at = 0usize;
+    loop {
+        let Some(whole) = ferros_sys::store_get_addr_at(capsules, &job.capsule, at, piece) else { return Err(WHY_VAULT) };
+        if whole as u64 != job.total {
+            return Err(WHY_SIZE);
+        }
+        // WHY: the value's length is the vault's; the last read is shorter than the piece.
+        let n = (whole - at).min(piece.len());
+        if n == 0 {
+            return Err(WHY_VAULT);
+        }
+        intake.update(&piece[..n]).map_err(|_| WHY_EGGS)?;
+        // The page's bar moves at each mebibyte.
+        if (at + n) >> 20 != at >> 20 {
+            stage(i, STAGE_SIGNATURE, (at + n) as u64, job.total);
+        }
+        at += n;
+        if at >= whole {
+            break;
+        }
+    }
+    let taken = intake.finish().map_err(|_| WHY_EGGS)?;
+    if taken.address != job.capsule {
+        return Err(WHY_NOT_NAMED);
+    }
+    let (developer, option) = ferros_kist::identity(&taken.first).map_err(|_| WHY_NOT_KIST)?;
+    let decl = ferros_kist::declaration(&taken.first).map_err(|_| WHY_NOT_KIST)?;
+    // Its version as its signed declaration gives it; one without (a capsule from before versions) is shown as 0.
+    let version = ferros_kist::version_of(&taken.first).map_err(|_| WHY_NOT_KIST)?.unwrap_or_default();
+    with(|s| {
+        if let Some(j) = s.jobs.iter_mut().find(|j| j.kind == KIND_OFFER && j.capsule == job.capsule) {
+            j.developer = developer;
+            j.option = option;
+            j.name = decl.name.clone();
+        }
+    });
+    let list = ferros_kist::store::read(cap(grants, S_KISTS)).ok_or(WHY_NOBODY)?;
+    let admitted = ferros_kist::capsule::admit(&taken.first, &taken.head.signer, &taken.head.eggs, &taken.file_hash, &list).map_err(|r| refused(i, &r))?;
+    stage(i, STAGE_CODE, 0, job.total);
+    let native = kernel_check(grants, i, &job.capsule, job.total, true)?;
+    let mut l = Vec::new();
+    l.extend_from_slice(b"kists: ");
+    l.extend_from_slice(decl.name.as_bytes());
+    l.extend_from_slice(if native { b" offered: native code, taken unchecked (a development build); waiting on the person\n".as_slice() } else { b" offered: checked and sealed; waiting on the person\n" });
+    say(&l);
+    with(|s| {
+        if let Some(j) = s.jobs.iter_mut().find(|j| j.kind == KIND_OFFER && j.capsule == job.capsule) {
+            j.offered = Some(Offered { decl, version, admitted, native });
+            j.stage = STAGE_ASKING;
+            j.got = j.total;
+        }
+    });
+    ring();
+    Ok((ferros_kist::offer::ASKING, if native { ferros_kist::offer::NATIVE } else { 0 }))
+}
+
+/// The person's answer to an offer: Stow puts it in their list (its developer's bundle pinned there at their first kist, as an install from the directory does; an update keeps every answer for a right it still wants), Cancel drops its bytes and its job. Ok(STOWED or CANCELLED).
+fn offer_answer(grants: u64, i: usize, job: &Job, stow: bool) -> Result<(u8, u8), u8> {
+    if !stow {
+        drop_offered(grants, &job.capsule);
+        // By its capsule, not its place: another thread may have made room meanwhile.
+        with(|s| s.jobs.retain(|j| !(j.kind == KIND_OFFER && j.capsule == job.capsule)));
+        ring();
+        let mut l = Vec::new();
+        l.extend_from_slice(b"kists: ");
+        l.extend_from_slice(job.name.as_bytes());
+        l.extend_from_slice(b" not stowed: the person said Cancel\n");
+        say(&l);
+        return Ok((ferros_kist::offer::CANCELLED, 0));
+    }
+    let o = job.offered.clone().ok_or(WHY_NOT_KIST)?;
+    stage(i, STAGE_STORING, job.total, job.total);
+    let list_cap = cap(grants, S_KISTS);
+    let mut list = ferros_kist::store::read(list_cap).ok_or(WHY_NOBODY)?;
+    let at = ferros_detail::eagle_now();
+    pin(i, &mut list, &job.developer, &o.admitted, at)?;
+    let old = list.by_identity(&job.developer, &job.option).map(|k| k.capsule);
+    let k = list.install(job.capsule, job.developer, job.option, &o.decl);
+    // Carried in over USB: no URL to fetch it again from (a restore finds it on the person's other devices or in the directory by its blake3); an update's old source names the old capsule.
+    list.kists[k].source = None;
+    list.kists[k].installed = at;
+    list.kists[k].version = Some(o.version);
+    if !ferros_kist::store::write(list_cap, &list, at) {
+        return Err(WHY_VAULT);
+    }
+    if let Some(old) = old.filter(|c| *c != job.capsule && list.by_capsule(c).is_none()) {
+        drop_capsule(grants, &old);
+    }
+    stage(i, STAGE_DONE, job.total, job.total);
+    let mut l = Vec::new();
+    l.extend_from_slice(b"kists: stowed ");
+    l.extend_from_slice(job.name.as_bytes());
+    l.extend_from_slice(b", the person said Stow\n");
+    say(&l);
+    Ok((ferros_kist::offer::STOWED, o.native as u8))
+}
+
+/// An offered capsule's bytes dropped (refused or cancelled), unless the person's list names it already (the same capsule offered again: their kist stays).
+fn drop_offered(grants: u64, capsule: &[u8; 32]) {
+    if ferros_kist::store::read(cap(grants, S_KISTS)).is_some_and(|l| l.by_capsule(capsule).is_some()) {
+        return;
+    }
+    drop_capsule(grants, capsule);
+}
+
+/// Op 6: a checked offer as the page shows it, or [1] when that capsule is no offer waiting on the person. [0][length u64 LE][flags: bit 0 native][developer 32][the version's part count u8, each part u64 LE (at most 16)][name length, name][developer's name length, name][wants n][per want: right u8, reason length u8, reason (at most 128 bytes)].
+fn offer_reply(s: &State, capsule: &[u8; 32]) -> Vec<u8> {
+    let Some((j, o)) = s.jobs.iter().filter(|j| j.kind == KIND_OFFER && j.capsule == *capsule && j.stage == STAGE_ASKING).find_map(|j| j.offered.as_ref().map(|o| (j, o))) else { return alloc::vec![1] };
+    let mut r = Vec::with_capacity(512);
+    r.push(0);
+    r.extend_from_slice(&j.total.to_le_bytes());
+    r.push(o.native as u8);
+    r.extend_from_slice(&j.developer);
+    // WHY each cut: one reply (4 KiB) holds it all: 16 parts, 32-byte names, eight wants of 128-byte reasons are under 1.5 KiB.
+    let parts = &o.version.0[..o.version.0.len().min(16)];
+    r.push(parts.len() as u8);
+    for p in parts {
+        r.extend_from_slice(&p.to_le_bytes());
+    }
+    let name = &o.decl.name.as_bytes()[..o.decl.name.len().min(32)];
+    r.push(name.len() as u8);
+    r.extend_from_slice(name);
+    let dev = o.admitted.name.as_deref().unwrap_or("");
+    let dev = &dev.as_bytes()[..dev.len().min(32)];
+    r.push(dev.len() as u8);
+    r.extend_from_slice(dev);
+    let wants = &o.decl.wants[..o.decl.wants.len().min(16)];
+    r.push(wants.len() as u8);
+    for (right, reason) in wants {
+        let reason = &reason.as_bytes()[..reason.len().min(128)];
+        r.push(*right);
+        r.push(reason.len() as u8);
+        r.extend_from_slice(reason);
+    }
+    r
 }
 
 /// The capsule's bytes in the vault dropped (a failed install, an uninstall, an update's old version).
@@ -835,17 +1074,18 @@ fn bring(grants: u64, i: usize, url: &str, expect: &[u8; 32], size: Option<u64>,
     }
     // 2 and 3: the kernel reads it back, checks its code and seals it (SANDBOX.md: once, at install).
     stage(i, STAGE_CODE, 0, len);
-    if let Err(why) = kernel_check(grants, i, expect, len) {
+    if let Err(why) = kernel_check(grants, i, expect, len, false) {
         return failed(why);
     }
     Ok((taken, admitted))
 }
 
-/// The kernel's check and seal of a stored capsule, each stage it tells shown: its reading of the capsule is the code stage's bar, then the checker, then the seal.
-fn kernel_check(grants: u64, i: usize, capsule: &[u8; 32], len: u64) -> Result<(), u8> {
+/// The kernel's check and seal of a stored capsule, each stage it tells shown: its reading of the capsule is the code stage's bar, then the checker, then the seal. For a stow (`stow`, ferros_sys `stow_check`), native code on a development build is taken unchecked: Ok(true); a production build refuses it (`WHY_NATIVE_HERE`). Ok(false): checked and sealed.
+fn kernel_check(grants: u64, i: usize, capsule: &[u8; 32], len: u64, stow: bool) -> Result<bool, u8> {
     use ferros_sys::install as k;
     KERNEL_WORD.store(u64::MAX, Ordering::Release);
-    if ferros_sys::install_kist(grants, S_INSTALL, capsule, &KERNEL_WORD) != 0 {
+    let asked = if stow { ferros_sys::stow_check(grants, S_INSTALL, capsule, &KERNEL_WORD) } else { ferros_sys::install_kist(grants, S_INSTALL, capsule, &KERNEL_WORD) };
+    if asked != 0 {
         return Err(WHY_ROOM);
     }
     let mut last = u64::MAX;
@@ -858,9 +1098,10 @@ fn kernel_check(grants: u64, i: usize, capsule: &[u8; 32], len: u64) -> Result<(
                 k::READING => stage(i, STAGE_CODE, v, len),
                 k::CHECKING => stage(i, STAGE_CODE, len, len),
                 k::SEALING => stage(i, STAGE_SEALING, len, len),
-                k::DONE => return Ok(()),
+                k::DONE => return Ok(v == k::NATIVE),
                 k::REFUSED => {
                     return Err(match v {
+                        k::WHY_NATIVE if stow => WHY_NATIVE_HERE,
                         k::WHY_NATIVE => WHY_NATIVE,
                         k::WHY_CHECKER | k::WHY_MODES => WHY_CHECKER,
                         k::WHY_SIGNATURE | k::WHY_SECTIONS => WHY_EGGS,

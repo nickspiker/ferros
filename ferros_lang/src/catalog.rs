@@ -408,6 +408,18 @@ messages! {
     ItCrashed,
     /// Ended from outside (the bridge's `diag kill`), not by the person's own relaunch.
     ClosedFromOutside,
+    /// Stowing a kist (owner, 2026-11-11: "the proper term for installing a kist is stow"; docs/KISTS.md "Stowing"): the Kists page's heading over a kist offered over USB, checked and waiting on the person.
+    OfferedOverUsb,
+    /// Its button that puts it in the person's list (a verb: put away, store aboard).
+    Stow,
+    /// Its end: in the person's list.
+    Stowed,
+    /// Its end refused (the reason after it).
+    NotStowed,
+    /// An offer of native, unchecked machine code, which only a development build stows (SANDBOX.md), said plainly on the page.
+    UncheckedDevOnly,
+    /// Over an offer's wants: each is asked once, at its first start.
+    AsksAtFirstStart,
 
     // ---- Developer ----
     TemporalDither,
@@ -517,6 +529,8 @@ pub enum Say<'a> {
     CouldNotStart(&'a str),
     /// A kist that started and then stopped abnormally (its name): "Mahere stopped", the reason under it (`Msg::ItCrashed`, `Msg::ClosedFromOutside`).
     Stopped(&'a str),
+    /// Who made a kist offered to stow (its developer's name as the capsule gives it): "by Nick".
+    ByDeveloper(&'a str),
     // ---- the attest screen ----
     /// A network's signal, its dBm written already in the person's base.
     Signal(&'a str),

@@ -839,6 +839,8 @@ enum Choice {
     /// The Kists page: a kist's uninstall (its place in the person's list; two taps), and the directory's install or update (its row).
     Uninstall(u8),
     Install(u8),
+    /// A kist offered over USB, on the Kists page: Stow (true) or Cancel (false), the person's answer to the installer (docs/KISTS.md "Stowing").
+    Stow(bool),
     /// A right's default for new kists (Permissions).
     Default(u8),
     /// The first-launch question: a want's switch (its index in the kist's wants).
@@ -3843,6 +3845,51 @@ impl Map {
                     let l = installer::words(j, f);
                     row(m, b, y, note, if j.stage == installer::FAILED { white() } else { grey() }, l.as_str(), None);
                 };
+                // A kist offered over USB (docs/KISTS.md "Stowing"; owner, 2026-11-11: "the proper term for installing a kist is stow"), above everything: while the installer checks it, its bar; once checked, what it is, who made it, its version and size, plainly whether its code is unchecked (a development build's native code), what it asks for and why, then Stow and Cancel; then how it ended, until the job gives way. Nothing is in the person's list before Stow. No icon yet: a capsule carries none (the circles' icons are the display's own).
+                for j in inst.jobs.iter().filter(|j| j.kind == installer::KIND_OFFER) {
+                    match (j.stage, inst.offer.as_ref().filter(|o| o.capsule == j.capsule)) {
+                        (installer::ASKING, Some(o)) => {
+                            row(self, b, &mut y, uu(3, 2), white(), tr(Msg::OfferedOverUsb), None);
+                            let mut l = Line::new();
+                            let _ = write!(l, "{} ", o.name);
+                            let _ = ferros_kist::write_version(&mut l, f, &o.version.0);
+                            row(self, b, &mut y, small, white(), l.as_str(), None);
+                            // Its developer by the name the capsule gives (the person's pin keeps the same), else its key's first bytes.
+                            let mut d = Line::new();
+                            if o.developer_name.is_empty() {
+                                let _ = write!(d, "G#{:02X}{:02X}{:02X}{:02X}", o.developer[0], o.developer[1], o.developer[2], o.developer[3]);
+                            } else {
+                                d.s(&o.developer_name);
+                            }
+                            let by = say(Say::ByDeveloper(d.as_str()));
+                            row(self, b, &mut y, note, grey(), by.as_str(), None);
+                            let mut s = Line::new();
+                            let _ = tatau::size_bits(&mut s, f, o.size << 3, 1);
+                            row(self, b, &mut y, note, grey(), s.as_str(), None);
+                            if o.native {
+                                row(self, b, &mut y, small, white(), tr(Msg::UncheckedDevOnly), None);
+                            }
+                            if o.wants.is_empty() {
+                                row(self, b, &mut y, note, dim(), tr(Msg::AsksForNothing), None);
+                            } else {
+                                row(self, b, &mut y, note, grey(), tr(Msg::AsksAtFirstStart), None);
+                                for (right, reason) in &o.wants {
+                                    row(self, b, &mut y, small, white(), right_name(*right as usize), None);
+                                    y -= uu(3, 4);
+                                    row(self, b, &mut y, note, dim(), reason, None);
+                                }
+                            }
+                            button(self, b, &mut y, tr(Msg::Stow), false, Some(Choice::Stow(true)));
+                            button(self, b, &mut y, tr(Msg::Cancel), false, Some(Choice::Stow(false)));
+                        }
+                        // Under way (its bar), or ended: its name when the check found it, the words under.
+                        _ => {
+                            row(self, b, &mut y, small, white(), if j.name.is_empty() { tr(Msg::OfferedOverUsb) } else { &j.name }, None);
+                            progress(self, b, &mut y, j);
+                        }
+                    }
+                    y += uu(1, 1);
+                }
                 if ks.is_empty() {
                     row(self, b, &mut y, small, grey(), tr(Msg::NoKistsInstalled), None);
                 }
@@ -4730,6 +4777,18 @@ impl Map {
                             }
                         }
                     }
+                    // The person's answer to a kist offered over USB: the installer stows it in their list or drops it, and the host that offered it hears which (docs/KISTS.md "Stowing").
+                    Some(Choice::Stow(stow)) => {
+                        if let Some(o) = self.installer.offer.as_ref() {
+                            let mut m = [0u8; 34];
+                            m[0] = 5;
+                            m[1..33].copy_from_slice(&o.capsule);
+                            m[33] = stow as u8;
+                            if installer::ask(self.grants, &m) != Some(0) {
+                                console(self.grants, b"map: the installer did not take the answer to the offer\n");
+                            }
+                        }
+                    }
                     Some(Choice::Default(r)) => {
                         self.reload_kists();
                         self.kists.defaults ^= 1 << r;
@@ -5080,6 +5139,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut space_seen = 0u32;
     // The departure waiting here last seen (its intent and the asking device's name), so the Fleet page opens once for each: a request answered clears it, so the same device asking again opens the page again.
     let mut ask_seen: Option<(u8, [u8; NAME_BYTES], usize)> = None;
+    // The kist offered over USB last opened the Kists page on (docs/KISTS.md "Stowing").
+    let mut offer_seen: Option<[u8; 32]> = None;
     // The copy of the identity service last taken (`fgtw_poller`'s sequence count).
     let mut fleet_seen = 0u32;
     // Whether the Fleet page showed at the last pass (`FLEET_PAGE`).
@@ -5352,6 +5413,15 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 map.draw();
             }
             ask_seen = ask;
+        }
+        // A kist offered over USB, checked and waiting on this person: a new one opens the Kists page on it, Stow and Cancel ready, as a departure opens the Fleet page. Not over an app in front, nor under a finger or while the map settles: it opens once the fingers lift, or once the person is back on the map.
+        if !map.app_front && !down && !map.settling {
+            let offer = map.installer.offer.as_ref().map(|o| o.capsule);
+            if offer.is_some() && offer != offer_seen {
+                map.show_page("kists");
+                map.draw();
+            }
+            offer_seen = offer;
         }
 
         // The person's identity space (fgtw op 17's generation, in the copy), on the plane with nothing held: a new generation means the identity service wrote this device's kists or home screen from the person's fleet (a reset device getting its arrangement back, a move made on another of their devices), and the circles are read again. Generation 0 is nothing written yet; a map started after a write reads it once more, which changes nothing.
