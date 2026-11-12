@@ -2,7 +2,7 @@
 //! Then what the device has not run yet, checked here first: two loops one after the other in one kernel (the wallpaper's far and near orbits), and a uniform word and an integer add read as values.
 #![cfg(all(feature = "sim", feature = "ssa"))]
 
-use valhall::sim::{run, Memory};
+use valhall::sim::{run, run_marked, Memory};
 use valhall::*;
 
 const SIDE_SHIFT: u32 = 6;
@@ -179,4 +179,143 @@ fn two_loops_a_uniform_and_an_add() {
     }
     // Contraction may move an escape by a step at the set's edge; most must agree.
     assert!(off <= 4, "{off} of {} counts differ", 2 * n);
+}
+
+/// f16 to the nearest even and back: what one f16 operation leaves of an exact result.
+fn h16(x: f64) -> f32 {
+    f16_to_f32(f32_to_f16(x as f32))
+}
+
+/// f16 lanes (pack, a one-instruction narrow read broadcast, broadcast halves, widened halves, fused multiply-add, multiply, max) and the destination clamps folded from max(x, 0) and min(that, 1), against the same steps on the CPU, each rounded to f16 once.
+#[test]
+fn f16_lanes_and_clamps() {
+    use valhall::ssa::{self, F, H};
+    let _turn = RECORDING.lock().unwrap();
+    ssa::begin();
+    let g = ssa::gid();
+    let x = F::from_u32(g) * (1. / 64.) - 2.;
+    let y = F::from_u32(g) * (1. / 128.) - 0.5;
+    let h = H::pack(x, y);
+    let e = h.mul_add(H::splat2(0.75, -1.25), h.hi());
+    let c = e.max(H::splat(0.)).min(H::splat(1.));
+    let p = h * h.lo();
+    let m = h.max(H::splat_f(x * 0.5));
+    for (k, v) in [c.lo_f(), c.hi_f(), p.hi_f(), m.lo_f(), m.hi_f()].into_iter().enumerate() {
+        ssa::store(0, 5, 4 * k as i16, v.to_bits());
+    }
+    let comp = ssa::compile();
+    // Both clamps folded into the FMA: no min or max of their own.
+    assert!(comp.kinds.iter().all(|k| k.0 != "hmin"), "the clamp to [0, 1] left a min: {:?}", comp.kinds);
+    let mut uniforms = vec![OUT];
+    uniforms.extend_from_slice(&comp.consts);
+    let n = 256u32;
+    let mut mem = Memory { base: OUT, bytes: vec![0; 32 * n as usize] };
+    for g in 0..n {
+        run(&comp.words, &uniforms, [g, 0], &mut mem);
+    }
+    for g in 0..n {
+        let (x, y) = (g as f32 * (1. / 64.) - 2., g as f32 * (1. / 128.) - 0.5);
+        let (hx, hy) = (h16(x as f64), h16(y as f64));
+        let e = [h16(hx as f64 * 0.75 + hy as f64), h16(hy as f64 * -1.25 + hy as f64)];
+        let want = [e[0].clamp(0., 1.), e[1].clamp(0., 1.), h16(hy as f64 * hx as f64), hx.max(h16((x * 0.5) as f64)), hy.max(h16((x * 0.5) as f64))];
+        for (k, w) in want.iter().enumerate() {
+            let got = f32::from_bits(mem.read32(OUT + 32 * g as u64 + 4 * k as u64));
+            assert_eq!(got, *w, "invocation {g}, value {k}");
+        }
+    }
+}
+
+/// A block (`ssa::when`): its values where the mask is set, the others' elsewhere, for a mask that differs within a warp and one that is the same across each; a warp whose invocations all skip it issues fewer instructions than one where any runs it (`run_marked`).
+#[test]
+fn a_block_runs_only_where_its_mask_is() {
+    use valhall::ssa::{self, F, U};
+    let _turn = RECORDING.lock().unwrap();
+    ssa::begin();
+    let g = ssa::gid();
+    // Odd invocations (within each warp), and whole warps (16 invocations) of every other one.
+    let odd = (g & U::splat(1)).ne(U::splat(0));
+    let warp = (g & U::splat(16)).ne(U::splat(0));
+    let a = ssa::when(odd, F::splat(-1.), || F::from_u32(g) * 3. + 1.);
+    let b = ssa::when(warp, (F::splat(-2.), U::splat(7)), || {
+        let t = F::from_u32(g).sqrt();
+        (t * t + 0.5, g + U::splat(100))
+    });
+    ssa::store(0, 4, 0, a.to_bits());
+    ssa::store(0, 4, 4, b.0.to_bits());
+    ssa::store(0, 4, 8, b.1);
+    let comp = ssa::compile();
+    let mut uniforms = vec![OUT];
+    uniforms.extend_from_slice(&comp.consts);
+    let n = 64u32;
+    let mut mem = Memory { base: OUT, bytes: vec![0; 16 * n as usize] };
+    let mut issued = Vec::new();
+    for w0 in (0..n).step_by(16) {
+        let mut ran = vec![false; comp.words.len()];
+        for g in w0..w0 + 16 {
+            run_marked(&comp.words, &uniforms, [g, 0], &mut mem, &mut ran);
+        }
+        issued.push(ran.iter().filter(|&&r| r).count());
+    }
+    for g in 0..n {
+        let at = OUT + 16 * g as u64;
+        let a = if g & 1 == 1 { g as f32 * 3. + 1. } else { -1. };
+        assert_eq!(f32::from_bits(mem.read32(at)), a, "invocation {g}: the divergent block");
+        let (b, c) = if g & 16 != 0 { ((g as f32).sqrt() * (g as f32).sqrt() + 0.5, g + 100) } else { (-2., 7) };
+        assert!((f32::from_bits(mem.read32(at + 4)) - b).abs() <= b.abs() * 1e-6, "invocation {g}: the warp's block, {} for {b}", f32::from_bits(mem.read32(at + 4)));
+        assert_eq!(mem.read32(at + 8), c, "invocation {g}: the block's integer");
+    }
+    // Warps 0 and 2 skip the second block, 1 and 3 run it.
+    assert!(issued[0] < issued[1] && issued[2] < issued[3], "a skipped block's instructions issued anyway: {issued:?}");
+}
+
+/// Params (`ssa::param`): the words do not depend on their values, so a kernel compiled for one run serves another bound with its values (`Compiled::bind`), more of them than the uniform slots hold (the rest patched into immediates); and loads of neighbouring words of one index read from one address.
+#[test]
+fn params_bind_into_one_kernel() {
+    use valhall::ssa::{self, U};
+    let _turn = RECORDING.lock().unwrap();
+    const TABLE: u64 = OUT + (1 << 12);
+    let record = |base: u32| {
+        ssa::begin();
+        ssa::reserve(2);
+        let g = ssa::gid();
+        // 40 params against 14 uniform slots' 28 words: some must be immediates.
+        let mut acc = g;
+        for p in 0..40u32 {
+            acc = acc + ssa::param(base + p * 3).wrapping_mul(g & U::splat(3));
+        }
+        // A row of four words of a table at index g & 7, one address for the four.
+        let row = (g & U::splat(7)) << 2;
+        let t = (0..4u32).fold(U::splat(0), |s, j| s ^ ssa::load(1, row + U::splat(j), 2, 0));
+        ssa::store(0, 3, 0, acc);
+        ssa::store(0, 3, 4, t);
+        ssa::finish()
+    };
+    let first = record(1000);
+    let key = first.key();
+    let mut k = first.compile();
+    let loads = k.words.iter().filter(|w| (*w >> 48) & 0x1FF == 0x060).count();
+    assert_eq!(loads, 4);
+    assert!(k.params.iter().any(|p| !p.words.is_empty()), "every param found a uniform word: the patching is not exercised");
+    let table: Vec<u32> = (0..32u32).map(|i| i.wrapping_mul(0x9E37_79B1)).collect();
+    for base in [1000u32, 77, 123_456] {
+        let next = record(base);
+        assert_eq!(next.key(), key);
+        k.bind(next.params());
+        let mut uniforms = vec![OUT, TABLE];
+        uniforms.extend_from_slice(&k.consts);
+        let n = 64u32;
+        let mut bytes = vec![0u8; 1 << 12];
+        bytes.extend(table.iter().flat_map(|w| w.to_le_bytes()));
+        let mut mem = Memory { base: OUT, bytes };
+        for g in 0..n {
+            run(&k.words, &uniforms, [g, 0], &mut mem);
+        }
+        for g in 0..n {
+            let want = (0..40u32).fold(g, |a, p| a.wrapping_add((base + p * 3).wrapping_mul(g & 3)));
+            assert_eq!(mem.read32(OUT + 8 * g as u64), want, "base {base}, invocation {g}");
+            let r = (g & 7) as usize * 4;
+            assert_eq!(mem.read32(OUT + 8 * g as u64 + 4), table[r] ^ table[r + 1] ^ table[r + 2] ^ table[r + 3], "base {base}, invocation {g}: the row");
+        }
+    }
+    println!("params: {} words, {loads} loads", k.words.len());
 }

@@ -1,10 +1,18 @@
 //! A recorder and compiler for whole kernels (GPU.md, "The resident service, and the attest mark's path"): code written once against a lane type runs on the CPU's lanes as it always did, and run once with this module's [`F`], [`M`] and [`U`] it records every operation into an SSA graph, which [`compile`] turns into Valhall words through the builder.
 //!
 //! The values are handles: a `u32` naming a node. The arithmetic on them records a node and returns its handle, so the code being recorded neither knows nor cares that it is not computing.
-//! A recorded program has one shape: straight-line code, at most one loop at a time (no nesting) whose carried state is a `Copy` value made only of handles, and stores at the end.
+//! A recorded program has one shape: straight-line code with blocks a mask skips ([`when`], nested as the code nests them), at most one loop at a time (no nesting) whose carried state is a `Copy` value made only of handles, and stores at the end.
 //!
 //! # The loop
 //! [`iterate`] records the loop body once. On the CPU the same hook runs `head`, leaves when no lane is still running, then runs `tail`; here both are recorded and the tail runs on the pass that stops too, leaving the state as it was for an invocation that stopped (the several-lane code's own selects), which gives the values a break would have left with no branch but the backward one (the form the device ran for the Mandelbrot).
+//!
+//! # Blocks, params, f16
+//! [`when`] records a block that runs only where its mask is set: a branch over it for the rest, so a warp none of whose invocations needs it does not run it (Mahere's map: off the globe, under the panel, the terrain's shading where no cell stands in).
+//! [`param`] records a value the run passes rather than the words: placed as a constant is, never folded, so [`Recording::key`] and the words do not depend on it and one compiled kernel serves every run of the same structure ([`Compiled::bind`] writes the values into their uniform words and immediates; a frame's camera, light and inks).
+//! [`H`] is a pair of f16 in one register, Valhall's v2f16: one instruction for two lanes; its halves are read by other v2f16 operations as swizzles and by f32 ones as widens, at no cost.
+//!
+//! # What the compiler folds
+//! Constants by value (one uniform word or LUT entry a value), negations into the operands that read them, products into fused adds, max(x, 0) and min(max(x, 0), 1) into the destination clamp of the add or multiply that made x, a constant added to a load's or store's index into its byte offset (so a row of a table reads from one address), and the wait of a load followed by another of the same address into the second.
 //!
 //! # Registers
 //! Linear scan over the program order, a value's register freed after its last use; a value defined before the loop and used in it lives to the loop's end; the loop's carried values (its phis) keep one register each for the whole loop.
@@ -28,9 +36,34 @@ pub struct M(u32);
 #[repr(transparent)]
 pub struct U(u32);
 
-#[derive(Clone, Copy, Debug)]
+/// Two f16 per invocation in one register (v2f16): lane 0 the low half, lane 1 the high. Valhall's paired half-precision forms do both lanes in one instruction, at the rate of one f32 (ferros GPU-KISTS.md, the owner on f16, 2026-11-11: "we get 2x and most of the mahere composite work can either be done in integer or f16").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct H(u32);
+
+#[derive(Clone, Copy, Debug, Hash)]
 enum Op {
     Const(u32),
+    /// A value a run of the kernel passes ([`param`]): placed as a constant is (a uniform word, or an immediate), but never folded and never a LUT entry, so the words do not depend on it and one compiled kernel serves every value ([`Compiled::bind`]). Its index in [`Rec::params`].
+    Param(u32),
+    /// The code to the matching [`Op::BlockEnd`] runs only where the mask is set ([`when`]): a branch over it for the rest.
+    BlockBegin(u32),
+    BlockEnd,
+    /// v2f16 arithmetic, per lane.
+    HAdd(u32, u32),
+    HMul(u32, u32),
+    HFma(u32, u32, u32),
+    HMin(u32, u32),
+    HMax(u32, u32),
+    HNeg(u32),
+    /// Two f32 narrowed to f16 (round to nearest even) into one register's low and high halves.
+    HPack(u32, u32),
+    /// An f32 narrowed to f16 into a register's low half alone (its high half undefined): read only thru [`Op::HBroadcast`] of its low half.
+    HNarrow(u32),
+    /// A v2f16 with both lanes its high half (true) or its low.
+    HBroadcast(u32, bool),
+    /// The high half (true) or the low of a v2f16, as an f32.
+    HWiden(u32, bool),
     Gid,
     FAdd(u32, u32),
     FMul(u32, u32),
@@ -86,9 +119,9 @@ impl Op {
     fn sources(&self, mut f: impl FnMut(u32)) {
         use Op::*;
         match *self {
-            Const(_) | Gid | LoopHead | Uniform(..) => {}
-            FNeg(a) | FRcp(a) | FRsq(a) | FFloor(a) | F2U(a) | F2I(a) | U2F(a) | S2F(a) | FrexpE(a, _, _) | FLogd(a) | Phi(a) | LoopEnd(a) | LoopBreak(a) => f(a),
-            FAddLscale(a, b) | FExp(a, b) => {
+            Const(_) | Param(_) | BlockEnd | Gid | LoopHead | Uniform(..) => {}
+            BlockBegin(a) | HNeg(a) | HNarrow(a) | HBroadcast(a, _) | HWiden(a, _) | FNeg(a) | FRcp(a) | FRsq(a) | FFloor(a) | F2U(a) | F2I(a) | U2F(a) | S2F(a) | FrexpE(a, _, _) | FLogd(a) | Phi(a) | LoopEnd(a) | LoopBreak(a) => f(a),
+            FAddLscale(a, b) | FExp(a, b) | HAdd(a, b) | HMul(a, b) | HMin(a, b) | HMax(a, b) | HPack(a, b) => {
                 f(a);
                 f(b)
             }
@@ -96,7 +129,7 @@ impl Op {
                 f(a);
                 f(b)
             }
-            FFma(a, b, c) | Sel(a, b, c) => {
+            FFma(a, b, c) | HFma(a, b, c) | Sel(a, b, c) => {
                 f(a);
                 f(b);
                 f(c)
@@ -108,11 +141,75 @@ impl Op {
             Load { index, .. } => f(index),
         }
     }
+    /// The same operation with each source mapped through `f`.
+    fn map_sources(self, f: impl Fn(u32) -> u32) -> Op {
+        use Op::*;
+        match self {
+            Const(_) | Param(_) | BlockEnd | Gid | LoopHead | Uniform(..) => self,
+            BlockBegin(a) => BlockBegin(f(a)),
+            HNeg(a) => HNeg(f(a)),
+            HNarrow(a) => HNarrow(f(a)),
+            HBroadcast(a, hi) => HBroadcast(f(a), hi),
+            HWiden(a, hi) => HWiden(f(a), hi),
+            FNeg(a) => FNeg(f(a)),
+            FRcp(a) => FRcp(f(a)),
+            FRsq(a) => FRsq(f(a)),
+            FFloor(a) => FFloor(f(a)),
+            F2U(a) => F2U(f(a)),
+            F2I(a) => F2I(f(a)),
+            U2F(a) => U2F(f(a)),
+            S2F(a) => S2F(f(a)),
+            FrexpE(a, s, l) => FrexpE(f(a), s, l),
+            FLogd(a) => FLogd(f(a)),
+            Phi(a) => Phi(f(a)),
+            LoopEnd(a) => LoopEnd(f(a)),
+            LoopBreak(a) => LoopBreak(f(a)),
+            FAddLscale(a, b) => FAddLscale(f(a), f(b)),
+            FExp(a, b) => FExp(f(a), f(b)),
+            HAdd(a, b) => HAdd(f(a), f(b)),
+            HMul(a, b) => HMul(f(a), f(b)),
+            HMin(a, b) => HMin(f(a), f(b)),
+            HMax(a, b) => HMax(f(a), f(b)),
+            HPack(a, b) => HPack(f(a), f(b)),
+            FAdd(a, b) => FAdd(f(a), f(b)),
+            FMul(a, b) => FMul(f(a), f(b)),
+            FMin(a, b) => FMin(f(a), f(b)),
+            FMax(a, b) => FMax(f(a), f(b)),
+            FCmp(c, a, b) => FCmp(c, f(a), f(b)),
+            IMul(a, b) => IMul(f(a), f(b)),
+            IAdd(a, b) => IAdd(f(a), f(b)),
+            ISub(a, b) => ISub(f(a), f(b)),
+            ICmp(c, a, b) => ICmp(c, f(a), f(b)),
+            And(a, b) => And(f(a), f(b)),
+            Or(a, b) => Or(f(a), f(b)),
+            Xor(a, b) => Xor(f(a), f(b)),
+            Shl(a, b) => Shl(f(a), f(b)),
+            Shr(a, b) => Shr(f(a), f(b)),
+            FFma(a, b, c) => FFma(f(a), f(b), f(c)),
+            HFma(a, b, c) => HFma(f(a), f(b), f(c)),
+            Sel(a, b, c) => Sel(f(a), f(b), f(c)),
+            Store { slot, shift, offset, index, value } => Store { slot, shift, offset, index: f(index), value: f(value) },
+            Load { slot, shift, offset, index } => Load { slot, shift, offset, index: f(index) },
+        }
+    }
     /// The kind's name, for `Compiled::kinds`.
     fn name(&self) -> &'static str {
         use Op::*;
         match self {
             Const(_) => "const",
+            Param(_) => "param",
+            BlockBegin(_) => "blockbegin",
+            BlockEnd => "blockend",
+            HAdd(..) => "hadd",
+            HMul(..) => "hmul",
+            HFma(..) => "hfma",
+            HMin(..) => "hmin",
+            HMax(..) => "hmax",
+            HNeg(_) => "hneg",
+            HPack(..) => "hpack",
+            HNarrow(_) => "hnarrow",
+            HBroadcast(..) => "hbroadcast",
+            HWiden(..) => "hwiden",
             Gid => "gid",
             FAdd(..) => "fadd",
             FMul(..) => "fmul",
@@ -152,7 +249,7 @@ impl Op {
         }
     }
     fn has_value(&self) -> bool {
-        !matches!(self, Op::LoopHead | Op::LoopEnd(_) | Op::LoopBreak(_) | Op::Store { .. })
+        !matches!(self, Op::LoopHead | Op::LoopEnd(_) | Op::LoopBreak(_) | Op::Store { .. } | Op::BlockBegin(_) | Op::BlockEnd)
     }
 }
 
@@ -172,6 +269,10 @@ struct Rec {
     exact: bool,
     /// The uniform slots the run passes (`uniform_slots`): the caller's reserved ones, then two constants a slot.
     slots: u8,
+    /// The values of the [`param`]s, by index.
+    params: Vec<u32>,
+    /// Blocks open now ([`when`]).
+    open: u32,
 }
 
 /// The recording in progress. Single-threaded by construction: a kernel is recorded on one core, between [`begin`] and [`compile`].
@@ -251,7 +352,54 @@ fn const_of(x: u32) -> Option<u32> {
 
 /// Start recording a kernel.
 pub fn begin() {
-    unsafe { *(&raw mut REC) = Some(Rec { nodes: Vec::new(), loops: Vec::new(), reserved: 1, exact: false, slots: 16 }) };
+    unsafe { *(&raw mut REC) = Some(Rec { nodes: Vec::new(), loops: Vec::new(), reserved: 1, exact: false, slots: 16, params: Vec::new(), open: 0 }) };
+}
+
+/// A value the kernel takes from its run rather than from its words: recorded as a constant would be, placed as one (a uniform word, or an immediate the run patches), but never folded into the code, so the kernel's words and [`Recording::key`] do not depend on it. A frame's light, camera or inks: one compiled kernel serves every frame ([`Compiled::bind`]), where a constant would make a new kernel each time it changed.
+pub fn param(bits: u32) -> U {
+    let r = rec();
+    r.params.push(bits);
+    U(push(Op::Param((r.params.len() - 1) as u32)))
+}
+
+/// `f`'s values where `m` is set and `otherwise`'s elsewhere, `f`'s code skipped by every invocation where `m` is clear: on the GPU a branch over it, so a warp none of whose invocations needs it does not run it, and one where some do runs it for those only.
+/// `S` must be made of handles only, as [`iterate`]'s state is. `f` may read anything recorded before; what it records is for its own values (read after the block only through what it returns, which this merges by `m`).
+pub fn when<S: Copy>(m: M, otherwise: S, f: impl FnOnce() -> S) -> S {
+    let words = core::mem::size_of::<S>() / 4;
+    assert!(core::mem::size_of::<S>() % 4 == 0 && core::mem::align_of::<S>() <= 4, "valhall::ssa::when: the values must be handles only");
+    let ids = |s: &S| -> Vec<u32> { (0..words).map(|i| unsafe { core::ptr::read_unaligned((s as *const S as *const u32).add(i)) }).collect() };
+    // A constant mask chooses at record time (as a select on it does).
+    if let Some(v) = const_of(m.0) {
+        return if v == 0 { otherwise } else { f() };
+    }
+    rec().open += 1;
+    push(Op::BlockBegin(m.0));
+    let inner = f();
+    push(Op::BlockEnd);
+    rec().open -= 1;
+    let (a, b) = (ids(&inner), ids(&otherwise));
+    let mut out = otherwise;
+    for (i, (&x, &y)) in a.iter().zip(&b).enumerate() {
+        let v = if x == y { x } else { push(Op::Sel(m.0, x, y)) };
+        unsafe { core::ptr::write_unaligned((&mut out as *mut S as *mut u32).add(i), v) };
+    }
+    out
+}
+
+/// A load's or a store's index with a constant added (`x + c`) as its own index and the constant in the byte offset, so loads at neighbouring words of one index share one address ([`compile`] works an address out once for them all).
+fn split_index(index: u32, shift: u8, offset: i16) -> (u32, i16) {
+    if let Op::IAdd(a, b) = rec().nodes[index as usize] {
+        for (x, c) in [(a, b), (b, a)] {
+            if let Some(c) = const_of(c) {
+                let at = ((c as i64) << shift) + offset as i64;
+                // WHY: the byte offset is the LOAD's and STORE's signed 16-bit immediate (23:8); a larger one would wrap to a different address, so it stays in the index.
+                if at <= i16::MAX as i64 {
+                    return (x, at as i16);
+                }
+            }
+        }
+    }
+    (index, offset)
 }
 
 /// The invocation's global id (X), preloaded in r60.
@@ -267,12 +415,14 @@ pub fn store(slot: u8, shift: u8, offset: i16, value: U) {
 
 /// `value` to the address in uniform `slot` plus `index << shift` plus `offset` bytes. The address is worked out in 32 bits (the slot's high word kept): the layer arena lies below 4 GiB.
 pub fn store_at(slot: u8, index: U, shift: u8, offset: i16, value: U) {
-    push(Op::Store { slot, shift, offset, index: index.0, value: value.0 });
+    let (index, offset) = split_index(index.0, shift, offset);
+    push(Op::Store { slot, shift, offset, index, value: value.0 });
 }
 
 /// 32 bits from the address in uniform `slot` plus `index << shift` plus `offset` bytes (the same address as `store_at`).
 pub fn load(slot: u8, index: U, shift: u8, offset: i16) -> U {
-    U(push(Op::Load { slot, shift, offset, index: index.0 }))
+    let (index, offset) = split_index(index.0, shift, offset);
+    U(push(Op::Load { slot, shift, offset, index }))
 }
 
 /// Word `word` (0 low, 1 high) of the caller's uniform slot `slot`, as a value: what a run passes besides addresses (where a band of a grid starts, so one kernel serves every band).
@@ -618,6 +768,86 @@ impl Shr<u32> for U {
     }
 }
 
+impl H {
+    /// Two f16 constants, `lo` in lane 0 and `hi` in lane 1, each rounded to nearest even.
+    pub fn splat2(lo: f32, hi: f32) -> H {
+        H(push(Op::Const((f32_to_f16(hi) as u32) << 16 | f32_to_f16(lo) as u32)))
+    }
+    pub fn splat(v: f32) -> H {
+        H::splat2(v, v)
+    }
+    /// Two f16 a run passes ([`param`]), `lo` in lane 0 and `hi` in lane 1.
+    pub fn param2(lo: f32, hi: f32) -> H {
+        H(param((f32_to_f16(hi) as u32) << 16 | f32_to_f16(lo) as u32).0)
+    }
+    /// Two f32 narrowed to f16 (to nearest even), `lo` in lane 0 and `hi` in lane 1: an instruction each (FADD.f32 into a half register, Mesa's f32 to f16 on Valhall).
+    pub fn pack(lo: F, hi: F) -> H {
+        H(push(Op::HPack(lo.0, hi.0)))
+    }
+    /// An f32 narrowed to f16 in both lanes: one instruction (into a low half, read broadcast).
+    pub fn splat_f(x: F) -> H {
+        H(push(Op::HNarrow(x.0))).lo()
+    }
+    /// Both lanes this half: a swizzle of the instructions that read it, no instruction of its own.
+    pub fn lo(self) -> H {
+        H(push(Op::HBroadcast(self.0, false)))
+    }
+    pub fn hi(self) -> H {
+        H(push(Op::HBroadcast(self.0, true)))
+    }
+    /// A lane as an f32: a widen of the f32 instruction that reads it (FADD, FMA, FMIN, FMAX), else one instruction.
+    pub fn lo_f(self) -> F {
+        F(push(Op::HWiden(self.0, false)))
+    }
+    pub fn hi_f(self) -> F {
+        F(push(Op::HWiden(self.0, true)))
+    }
+    /// self · b + c per lane, one rounding.
+    pub fn mul_add(self, b: H, c: H) -> H {
+        H(push(Op::HFma(self.0, b.0, c.0)))
+    }
+    pub fn min(self, o: H) -> H {
+        H(push(Op::HMin(self.0, o.0)))
+    }
+    pub fn max(self, o: H) -> H {
+        H(push(Op::HMax(self.0, o.0)))
+    }
+    /// Per invocation, `a` where the mask is set and `b` elsewhere (both lanes).
+    pub fn select(m: M, a: H, b: H) -> H {
+        H(push(Op::Sel(m.0, a.0, b.0)))
+    }
+    pub fn to_bits(self) -> U {
+        U(self.0)
+    }
+    pub fn from_bits(u: U) -> H {
+        H(u.0)
+    }
+}
+impl Add for H {
+    type Output = H;
+    fn add(self, o: H) -> H {
+        H(push(Op::HAdd(self.0, o.0)))
+    }
+}
+impl Sub for H {
+    type Output = H;
+    fn sub(self, o: H) -> H {
+        self + -o
+    }
+}
+impl Mul for H {
+    type Output = H;
+    fn mul(self, o: H) -> H {
+        H(push(Op::HMul(self.0, o.0)))
+    }
+}
+impl Neg for H {
+    type Output = H;
+    fn neg(self) -> H {
+        H(push(Op::HNeg(self.0)))
+    }
+}
+
 /// The loop hook, recorded: `head` then `tail` once each over phis for every handle in `init`; each carried value takes what `tail` left; round again while running and fewer than `max` passes. `head` and `tail` get the pass number as an f32. Returns the state the loop leaves with.
 /// `tail` must leave a stopped invocation's state unchanged (select on `running`, as code written for several lanes does with `live`): the pass that stops runs the tail too, and leaves with what it returns.
 /// `S` must be made of handles only ([`F`], [`M`], [`U`], in tuples, arrays or structs of them): it is read and written as a row of `u32`s.
@@ -673,6 +903,114 @@ pub struct Compiled {
     pub consts: Vec<u64>,
     /// The kept nodes by kind (`Op` names, for measuring the compiler's lowering), the most frequent first.
     pub kinds: Vec<(&'static str, usize)>,
+    /// Where each [`param`] went, by index: its uniform word, and the immediates that carry it.
+    pub params: Vec<ParamPlace>,
+    reserved: u8,
+}
+
+/// A [`param`]'s places in a compiled kernel: the uniform word it is read from (slot, word), if it has one, and the instructions whose 32-bit immediate is it (where the uniform port was taken, or no uniform word was left).
+#[derive(Clone, Debug, Default)]
+pub struct ParamPlace {
+    pub uniform: Option<(u8, u8)>,
+    pub words: Vec<u32>,
+}
+
+impl Compiled {
+    /// This kernel for another recording with the same key ([`Recording::key`]), from that recording's [`Recording::params`]: each value written into its uniform word and its immediates. No compile, the words otherwise the same.
+    pub fn bind(&mut self, values: &[u32]) {
+        // WHY: a recording with another number of params has another key; binding it here would leave some of this kernel's params at the last frame's values.
+        assert_eq!(values.len(), self.params.len(), "valhall::ssa::Compiled::bind: {} values for {} params", values.len(), self.params.len());
+        for (p, &v) in self.params.iter().zip(values) {
+            if let Some((slot, w)) = p.uniform {
+                let c = &mut self.consts[(slot - self.reserved) as usize];
+                *c = (*c & !(0xFFFF_FFFFu64 << (32 * w))) | (v as u64) << (32 * w);
+            }
+            for &at in &p.words {
+                let word = &mut self.words[at as usize];
+                *word = (*word & !(0xFFFF_FFFFu64 << 8)) | (v as u64) << 8;
+            }
+        }
+    }
+}
+
+/// A recording ended ([`finish`]) and not yet compiled.
+pub struct Recording {
+    rec: Rec,
+}
+
+/// FNV-1a over whole words: the recording's key.
+struct Fnv(u64);
+impl Fnv {
+    fn mix(&mut self, x: u64) {
+        self.0 = (self.0 ^ x).wrapping_mul(0x100_0000_01B3);
+    }
+}
+impl core::hash::Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.mix(b as u64);
+        }
+    }
+    fn write_u8(&mut self, x: u8) {
+        self.mix(x as u64);
+    }
+    fn write_u16(&mut self, x: u16) {
+        self.mix(x as u64);
+    }
+    fn write_u32(&mut self, x: u32) {
+        self.mix(x as u64);
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.mix(x);
+    }
+    fn write_i16(&mut self, x: i16) {
+        self.mix(x as u16 as u64);
+    }
+    fn write_isize(&mut self, x: isize) {
+        self.mix(x as u64);
+    }
+    fn write_usize(&mut self, x: usize) {
+        self.mix(x as u64);
+    }
+}
+
+/// End the recording, for its key and params ([`Recording::key`], [`Recording::params`]) before or instead of compiling it.
+pub fn finish() -> Recording {
+    let rec = unsafe { (*(&raw mut REC)).take().expect("valhall::ssa: finish without begin") };
+    // WHY: a block left open has no end for its branch to land on.
+    assert!(rec.open == 0, "valhall::ssa: a block still open at the recording's end");
+    Recording { rec }
+}
+
+impl Recording {
+    /// The recording's structure: every operation and constant, each param by its index and not its value. Two recordings with the same key compile to the same words but for their params' values, so a kernel compiled once serves both ([`Compiled::bind`]).
+    pub fn key(&self) -> u64 {
+        use core::hash::Hash;
+        let r = &self.rec;
+        let mut h = Fnv(0xCBF2_9CE4_8422_2325);
+        r.nodes.hash(&mut h);
+        for l in &r.loops {
+            l.carried.hash(&mut h);
+            l.exits.hash(&mut h);
+        }
+        (r.reserved, r.exact, r.slots, r.params.len()).hash(&mut h);
+        core::hash::Hasher::finish(&h)
+    }
+
+    /// The params' values, by index: what [`Compiled::bind`] takes.
+    pub fn params(&self) -> &[u32] {
+        &self.rec.params
+    }
+
+    /// The words, for these params' values.
+    /// Dead code goes first (the recorder runs every block `any()` guards; what reaches no store and no loop state is dropped). Constants hold no register: each use loads its constant into r54-r56 just before the instruction, so a constant made once and used everywhere costs no register across the kernel.
+    /// Panics if the program still needs more value registers than r0-r53 (no spilling yet), naming how many it needed.
+    pub fn compile(self) -> Compiled {
+        compile_rec(self.rec)
+    }
 }
 
 /// The value registers: r0-r53. r54-r56 take constants at their uses, r57 the loop head's write, r58:r59 the store address, r60:r61 the global id (preloaded).
@@ -681,91 +1019,265 @@ const CONST_REGS: [u8; 3] = [54, 55, 56];
 const SCRATCH: u8 = 57;
 const ADDR: u8 = 58;
 
+/// f16 1.0 in both lanes.
+const H_ONE: u32 = 0x3C00_3C00;
+
 /// The recording to Valhall words; the recording ends.
-/// Dead code goes first (the recorder runs every block `any()` guards; what reaches no store and no loop state is dropped). Constants hold no register: each use loads its constant into r54-r56 just before the instruction, so a constant made once and used everywhere costs no register across the kernel.
-/// Panics if the program still needs more value registers than r0-r53 (no spilling yet), naming how many it needed.
 pub fn compile() -> Compiled {
-    let rec = unsafe { (*(&raw mut REC)).take().expect("valhall::ssa: compile without begin") };
+    finish().compile()
+}
+
+/// What an operation's float sources are, for the source modifiers: f32 ones (negate, and a widen from an f16 half where `widen`), v2f16 ones (negate and a swizzle), or none.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    None,
+    F32 { widen: bool },
+    F16,
+}
+
+fn kind(op: &Op) -> (Kind, [u32; 3], usize) {
+    use Op::*;
+    match *op {
+        FAdd(a, b) | FMul(a, b) | FMin(a, b) | FMax(a, b) => (Kind::F32 { widen: true }, [a, b, 0], 2),
+        FCmp(_, a, b) => (Kind::F32 { widen: true }, [a, b, 0], 2),
+        FFma(a, b, c) => (Kind::F32 { widen: true }, [a, b, c], 3),
+        FNeg(a) => (Kind::F32 { widen: true }, [a, 0, 0], 1),
+        FRcp(a) | FRsq(a) | HNarrow(a) => (Kind::F32 { widen: true }, [a, 0, 0], 1),
+        HPack(a, b) => (Kind::F32 { widen: true }, [a, b, 0], 2),
+        HAdd(a, b) | HMul(a, b) | HMin(a, b) | HMax(a, b) => (Kind::F16, [a, b, 0], 2),
+        HFma(a, b, c) => (Kind::F16, [a, b, c], 3),
+        HNeg(a) => (Kind::F16, [a, 0, 0], 1),
+        _ => (Kind::None, [0; 3], 0),
+    }
+}
+
+/// `op` with its float sources replaced (the same kind and arity as `kind` gave).
+fn with_sources(op: Op, s: [u32; 3]) -> Op {
+    use Op::*;
+    match op {
+        FAdd(..) => FAdd(s[0], s[1]),
+        FMul(..) => FMul(s[0], s[1]),
+        FMin(..) => FMin(s[0], s[1]),
+        FMax(..) => FMax(s[0], s[1]),
+        FCmp(c, ..) => FCmp(c, s[0], s[1]),
+        FFma(..) => FFma(s[0], s[1], s[2]),
+        FNeg(_) => FNeg(s[0]),
+        FRcp(_) => FRcp(s[0]),
+        FRsq(_) => FRsq(s[0]),
+        HPack(..) => HPack(s[0], s[1]),
+        HNarrow(_) => HNarrow(s[0]),
+        HAdd(..) => HAdd(s[0], s[1]),
+        HMul(..) => HMul(s[0], s[1]),
+        HMin(..) => HMin(s[0], s[1]),
+        HMax(..) => HMax(s[0], s[1]),
+        HFma(..) => HFma(s[0], s[1], s[2]),
+        HNeg(_) => HNeg(s[0]),
+        other => other,
+    }
+}
+
+fn compile_rec(rec: Rec) -> Compiled {
     let n = rec.nodes.len();
-    // Negations folded into the operands of the float operations that read them (Valhall negates a float source for free): a source that is FNeg(x) becomes x with that operand's bit in `negmask` set, nested ones cancelling; a negation nothing else reads then goes with the dead code (509 of the attest ball's 4836 nodes were negations, each an instruction).
     let mut work = rec.nodes.clone();
-    let mut negmask = alloc::vec![0u8; n];
-    for i in 0..n {
-        let mut srcs = [0u32; 3];
-        let ns = match work[i] {
-            Op::FAdd(a, b) | Op::FMul(a, b) | Op::FMin(a, b) | Op::FMax(a, b) | Op::FCmp(_, a, b) => {
-                srcs[..2].copy_from_slice(&[a, b]);
-                2
-            }
-            Op::FFma(a, b, c) => {
-                srcs = [a, b, c];
-                3
-            }
-            Op::FRcp(a) | Op::FRsq(a) | Op::FNeg(a) => {
-                srcs[0] = a;
-                1
-            }
-            _ => 0,
-        };
-        for p in 0..ns {
-            while let Op::FNeg(x) = work[srcs[p] as usize] {
-                srcs[p] = x;
-                negmask[i] ^= 1 << p;
+    // Constants by value: every source naming a constant names the first node with its bits, so one uniform word or LUT entry serves each value however often it was made (Mahere's map made 0 and 1 dozens of times, and each took a uniform word of its own).
+    {
+        let mut first: Vec<(u32, u32)> = Vec::new();
+        let mut canon: Vec<u32> = (0..n as u32).collect();
+        for (i, op) in work.iter().enumerate() {
+            if let Op::Const(b) = *op {
+                match first.binary_search_by_key(&b, |e| e.0) {
+                    Ok(j) => canon[i] = first[j].1,
+                    Err(j) => first.insert(j, (b, i as u32)),
+                }
             }
         }
-        work[i] = match work[i] {
-            Op::FAdd(..) => Op::FAdd(srcs[0], srcs[1]),
-            Op::FMul(..) => Op::FMul(srcs[0], srcs[1]),
-            Op::FMin(..) => Op::FMin(srcs[0], srcs[1]),
-            Op::FMax(..) => Op::FMax(srcs[0], srcs[1]),
-            Op::FCmp(c, ..) => Op::FCmp(c, srcs[0], srcs[1]),
-            Op::FFma(..) => Op::FFma(srcs[0], srcs[1], srcs[2]),
-            Op::FRcp(_) => Op::FRcp(srcs[0]),
-            Op::FRsq(_) => Op::FRsq(srcs[0]),
-            Op::FNeg(_) => Op::FNeg(srcs[0]),
-            other => other,
-        };
+        for op in work.iter_mut() {
+            *op = op.map_sources(|s| canon[s as usize]);
+        }
     }
-    // Contraction (not when exact): an add of a product nothing else reads becomes one fused multiply-add, the product's negations carried into its factors and the add's into the sign of the product or of the addend; the multiply then goes with the dead code.
+    // Source modifiers, folded into the operations that read them: a negation (Valhall negates a float source for free; 509 of the attest ball's 4836 nodes were negations, each an instruction), an f16 half read by an f32 operation (its widen), a broadcast half read by a v2f16 one (its swizzle). A modifier nothing else reads then goes with the dead code.
+    let mut negmask = alloc::vec![0u8; n];
+    let mut swz = alloc::vec![[Swz16::H01; 3]; n];
+    let mut wid = alloc::vec![[Widen::None; 3]; n];
+    for i in 0..n {
+        let (kd, mut srcs, ns) = kind(&work[i]);
+        for p in 0..ns {
+            loop {
+                let s = srcs[p] as usize;
+                match (kd, work[s]) {
+                    (Kind::F32 { .. }, Op::FNeg(x)) if wid[i][p] == Widen::None => {
+                        srcs[p] = x;
+                        negmask[i] ^= 1 << p;
+                    }
+                    (Kind::F32 { widen: true }, Op::HWiden(h, hi)) if wid[i][p] == Widen::None => {
+                        srcs[p] = h;
+                        wid[i][p] = if hi { Widen::H1 } else { Widen::H0 };
+                    }
+                    // Inside a widen the source is a v2f16: its negation is the f32's, and a broadcast picks which half the widen reads.
+                    (Kind::F32 { .. }, Op::HNeg(x)) if wid[i][p] != Widen::None => {
+                        srcs[p] = x;
+                        negmask[i] ^= 1 << p;
+                    }
+                    (Kind::F32 { .. }, Op::HBroadcast(x, hi)) if wid[i][p] != Widen::None => {
+                        srcs[p] = x;
+                        wid[i][p] = if hi { Widen::H1 } else { Widen::H0 };
+                    }
+                    (Kind::F16, Op::HNeg(x)) => {
+                        srcs[p] = x;
+                        negmask[i] ^= 1 << p;
+                    }
+                    // A broadcast of a broadcast reads the inner one's half.
+                    (Kind::F16, Op::HBroadcast(x, hi)) => {
+                        srcs[p] = x;
+                        swz[i][p] = if hi { Swz16::H11 } else { Swz16::H00 };
+                    }
+                    _ => break,
+                }
+            }
+        }
+        work[i] = with_sources(work[i], srcs);
+    }
+    // Contraction (not when exact): an add of a product nothing else reads becomes one fused multiply-add, the product's negations carried into its factors and the add's into the sign of the product or of the addend; the multiply then goes with the dead code. The same for v2f16.
+    let mut users = alloc::vec![0u32; n];
     if !rec.exact {
-        let mut users = alloc::vec![0u32; n];
         for op in &work {
             op.sources(|s| users[s as usize] += 1);
         }
         for i in 0..n {
-            let Op::FAdd(a, b) = work[i] else { continue };
-            for (p, m, other) in [(0u32, a, b), (1, b, a)] {
-                let Op::FMul(x, y) = work[m as usize] else { continue };
-                if users[m as usize] != 1 {
+            let (a, b, half) = match work[i] {
+                Op::FAdd(a, b) => (a, b, false),
+                Op::HAdd(a, b) => (a, b, true),
+                _ => continue,
+            };
+            for (p, m, other) in [(0usize, a, b), (1, b, a)] {
+                let (x, y) = match (half, work[m as usize]) {
+                    (false, Op::FMul(x, y)) | (true, Op::HMul(x, y)) => (x, y),
+                    _ => continue,
+                };
+                // The product read with no modifier of the add's own (a widen or a swizzle on it reads another value than the product).
+                if users[m as usize] != 1 || wid[i][p] != Widen::None || swz[i][p] != Swz16::H01 {
                     continue;
                 }
                 let product = (negmask[m as usize] & 3) ^ (negmask[i] >> p & 1);
                 let addend = negmask[i] >> (1 - p) & 1;
-                work[i] = Op::FFma(x, y, other);
+                work[i] = if half { Op::HFma(x, y, other) } else { Op::FFma(x, y, other) };
                 negmask[i] = product | addend << 2;
+                wid[i] = [wid[m as usize][0], wid[m as usize][1], wid[i][1 - p]];
+                swz[i] = [swz[m as usize][0], swz[m as usize][1], swz[i][1 - p]];
                 users[m as usize] = 0;
                 break;
             }
         }
     }
+    // Clamps, folded into the instruction that makes the value (Valhall's destination clamp on FADD and FMA, f32 and v2f16): max(x, 0) is x clamped positive and min(that, 1) is x clamped to [0, 1], where x is an add, a multiply or a fused one read by nothing else. Two instructions of the CPU's `clamp(0, 1)` cost none.
+    let mut clamp = alloc::vec![Clamp::None; n];
+    {
+        users.iter_mut().for_each(|u| *u = 0);
+        for op in &work {
+            op.sources(|s| users[s as usize] += 1);
+        }
+        // A loop's carried values and exits read their nodes too: a clamp there would change what the loop carries.
+        for l in &rec.loops {
+            for &(phi, upd) in l.carried.iter().chain(&l.exits) {
+                users[phi as usize] += 1;
+                users[upd as usize] += 1;
+            }
+        }
+        let mut repl: Vec<u32> = (0..n as u32).collect();
+        for i in 0..n {
+            work[i] = work[i].map_sources(|s| repl[s as usize]);
+            let (a, b, half, max) = match work[i] {
+                Op::FMax(a, b) => (a, b, false, true),
+                Op::FMin(a, b) => (a, b, false, false),
+                Op::HMax(a, b) => (a, b, true, true),
+                Op::HMin(a, b) => (a, b, true, false),
+                _ => continue,
+            };
+            for (p, x, z) in [(0usize, a, b), (1, b, a)] {
+                let bound = match work[z as usize] {
+                    Op::Const(c) => c,
+                    _ => continue,
+                };
+                let plain = negmask[i] >> p & 1 == 0 && wid[i][p] == Widen::None && swz[i][p] == Swz16::H01 && negmask[i] >> (1 - p) & 1 == 0 && swz[i][1 - p] == Swz16::H01 && wid[i][1 - p] == Widen::None;
+                let maker = match (half, work[x as usize]) {
+                    (false, Op::FAdd(..) | Op::FMul(..) | Op::FFma(..)) | (true, Op::HAdd(..) | Op::HMul(..) | Op::HFma(..)) => true,
+                    _ => false,
+                };
+                if !plain || !maker || users[x as usize] != 1 {
+                    continue;
+                }
+                let one = if half { H_ONE } else { ONE };
+                let to = match (max, bound, clamp[x as usize]) {
+                    (true, 0, Clamp::None) => Clamp::ZeroInf,
+                    (false, c, Clamp::ZeroInf) if c == one => Clamp::ZeroOne,
+                    _ => continue,
+                };
+                clamp[x as usize] = to;
+                repl[i] = x;
+                users[x as usize] = users[i];
+                break;
+            }
+        }
+    }
     let nodes = &work;
-    let is_const = |i: u32| matches!(nodes[i as usize], Op::Const(_));
+    let imm_bits = |i: u32| -> Option<u32> {
+        match nodes[i as usize] {
+            Op::Const(b) => Some(b),
+            Op::Param(p) => Some(rec.params[p as usize]),
+            _ => None,
+        }
+    };
+    let is_imm = |i: u32| matches!(nodes[i as usize], Op::Const(_) | Op::Param(_));
+    let param_of = |i: u32| match nodes[i as usize] {
+        Op::Param(p) => Some(p),
+        _ => None,
+    };
     // Dead code: live from the stores, the loop ends' conditions and every loop's state, backwards.
     let mut keep = alloc::vec![false; n];
-    for (i, op) in nodes.iter().enumerate() {
-        if matches!(op, Op::Store { .. } | Op::LoopHead | Op::LoopEnd(_) | Op::LoopBreak(_)) {
-            keep[i] = true;
+    let seed = |keep: &mut Vec<bool>| {
+        for (i, op) in nodes.iter().enumerate() {
+            if matches!(op, Op::Store { .. } | Op::LoopHead | Op::LoopEnd(_) | Op::LoopBreak(_)) {
+                keep[i] = true;
+            }
         }
-    }
-    for l in &rec.loops {
-        for &(phi, upd) in l.carried.iter().chain(&l.exits) {
-            keep[phi as usize] = true;
-            keep[upd as usize] = true;
+        for l in &rec.loops {
+            for &(phi, upd) in l.carried.iter().chain(&l.exits) {
+                keep[phi as usize] = true;
+                keep[upd as usize] = true;
+            }
         }
-    }
-    for i in (0..n).rev() {
-        if keep[i] {
-            nodes[i].sources(|s| keep[s as usize] = true);
+    };
+    let flow = |keep: &mut Vec<bool>| {
+        for i in (0..n).rev() {
+            if keep[i] {
+                nodes[i].sources(|s| keep[s as usize] = true);
+            }
+        }
+    };
+    seed(&mut keep);
+    flow(&mut keep);
+    // A block stays only where something in it does (an instruction of its own), and then its mask is live too.
+    {
+        let mut open: Vec<usize> = Vec::new();
+        let mut live: Vec<(usize, usize)> = Vec::new();
+        for i in 0..n {
+            match nodes[i] {
+                Op::BlockBegin(_) => open.push(i),
+                Op::BlockEnd => {
+                    let b = open.pop().expect("valhall::ssa: a block's end without its begin");
+                    if (b + 1..i).any(|j| keep[j] && !is_imm(j as u32) && !matches!(nodes[j], Op::Gid | Op::BlockBegin(_) | Op::BlockEnd)) {
+                        live.push((b, i));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !live.is_empty() {
+            for &(b, e) in &live {
+                keep[b] = true;
+                keep[e] = true;
+            }
+            flow(&mut keep);
         }
     }
     // Each kept node's last use (constants have no register, so none); a loop stretches it.
@@ -799,7 +1311,7 @@ pub fn compile() -> Compiled {
                 let mut head_took = alloc::vec![false; rec.loops[loop_no].exits.len()];
                 for (e, &(phi, out)) in rec.loops[loop_no].exits.iter().enumerate() {
                     let o = out as usize;
-                    if out == phi || o <= h || o >= brk || is_const(out) || coalesce[o].is_some() {
+                    if out == phi || o <= h || o >= brk || is_imm(out) || coalesce[o].is_some() {
                         continue;
                     }
                     let shared = rec.loops[loop_no].exits.iter().filter(|x| x.1 == out).count() > 1 || rec.loops[loop_no].carried.iter().any(|&(p, u)| u == out && p != phi);
@@ -839,7 +1351,7 @@ pub fn compile() -> Compiled {
                     // A phi that is another field's update is read again by the loop's end copies, after every update is written: its own update may not take its register then.
                     let read_at_end = rec.loops[loop_no].carried.iter().any(|&(p, u)| u == phi && p != phi);
                     // Only an update written after the break: the break's copies write the phis' registers.
-                    if upd != phi && (upd as usize) > brk && (upd as usize) < i && !is_const(upd) && inner <= upd as usize && !read_at_end {
+                    if upd != phi && (upd as usize) > brk && (upd as usize) < i && !is_imm(upd) && inner <= upd as usize && !read_at_end {
                         coalesce[upd as usize] = Some(phi);
                     }
                     last[phi as usize] = last[phi as usize].max(i);
@@ -873,12 +1385,15 @@ pub fn compile() -> Compiled {
         }
     }
     // Registers: linear scan over the kept nodes that hold a value (constants and the global id excepted), with `hoist[l]` the constants loop l holds in registers from its head to its end. Returns the registers, the highest used, the peak, and each loop's peak.
-    let allocate = |hoist: &[Vec<u32>]| -> Result<(Vec<u8>, u8, usize, Vec<usize>), usize> {
+    // A block needs nothing of its own here: an invocation that branches over it runs none of it, so a register freed or taken inside it is the block's business; what is read after it is the select of its values and the values from before it, which live across it as any value does.
+    // Returns the registers, the highest used, the peak, each loop's peak, and each loop's hoisted constants with the register each holds (a constant is one node however many loops use it, so its register is the loop's, not the node's).
+    let allocate = |hoist: &[Vec<u32>]| -> Result<(Vec<u8>, u8, usize, Vec<usize>, Vec<Vec<(u32, u8)>>), usize> {
         let mut reg = alloc::vec![u8::MAX; n];
         let mut free: Vec<u8> = (0..POOL).rev().collect();
         let mut live: Vec<(usize, u8)> = Vec::new();
         let (mut high, mut peak) = (0u8, 0usize);
         let mut loop_peak = alloc::vec![0usize; spans.len()];
+        let mut held: Vec<Vec<(u32, u8)>> = spans.iter().map(|_| Vec::new()).collect();
         for (i, op) in nodes.iter().enumerate() {
             if !keep[i] {
                 continue;
@@ -895,7 +1410,7 @@ pub fn compile() -> Compiled {
                 for &c in &hoist[l] {
                     let r = free.pop().ok_or(i)?;
                     high = high.max(r);
-                    reg[c as usize] = r;
+                    held[l].push((c, r));
                     live.push((spans[l].1, r));
                 }
             }
@@ -904,7 +1419,7 @@ pub fn compile() -> Compiled {
             } else if let Some(phi) = coalesce[i] {
                 // The phi's register, which its own entry keeps to the loop's end: the update is written over the phi after the phi's last read.
                 reg[i] = reg[phi as usize];
-            } else if op.has_value() && !is_const(i as u32) {
+            } else if op.has_value() && !is_imm(i as u32) {
                 let r = free.pop().ok_or(i)?;
                 high = high.max(r);
                 reg[i] = r;
@@ -917,18 +1432,19 @@ pub fn compile() -> Compiled {
                 }
             }
         }
-        Ok((reg, high, peak, loop_peak))
+        Ok((reg, high, peak, loop_peak, held))
     };
     // First without hoisting, for each loop's pressure; then each loop's most-loaded constants into the registers it leaves free (owner, 2026-11-05: the mark within a 120 Hz frame; 188 of the ball loop's 625 instructions were constant loads).
     let none: Vec<Vec<u32>> = spans.iter().map(|_| Vec::new()).collect();
-    let (reg0, high0, peak0, loop_peak) = allocate(&none).unwrap_or_else(|i| panic!("valhall::ssa: out of registers at node {i} of {n} (no spilling yet)"));
+    let first = allocate(&none).unwrap_or_else(|i| panic!("valhall::ssa: out of registers at node {i} of {n} (no spilling yet)"));
+    let loop_peak = first.3.clone();
     let mut hoist: Vec<Vec<u32>> = Vec::new();
     for (l, &(h, e)) in spans.iter().enumerate() {
         let mut uses: Vec<(u32, usize)> = Vec::new();
         for j in h..e {
             if keep[j] {
                 nodes[j].sources(|s| {
-                    if is_const(s) {
+                    if is_imm(s) {
                         match uses.iter_mut().find(|u| u.0 == s) {
                             Some(u) => u.1 += 1,
                             None => uses.push((s, 1)),
@@ -942,16 +1458,14 @@ pub fn compile() -> Compiled {
         let room = POOL as usize - loop_peak[l];
         hoist.push(uses.iter().take(room).map(|u| u.0).collect());
     }
-    let (reg, high, peak, _) = allocate(&hoist).unwrap_or((reg0, high0, peak0, loop_peak));
-    // Where each hoisted constant holds its register: from its loop's head to its end, and only there (a use before or after the loop loads it as any other constant; reading the register there read whatever value had taken it: 595 black pixels on the attest ball, 2026-11-05).
-    let mut hoist_span = alloc::vec![(usize::MAX, 0usize); n];
-    for (l, cs) in hoist.iter().enumerate() {
-        for &c in cs {
-            hoist_span[c as usize] = spans[l];
-        }
-    }
-    let hoisted_at = |s: u32, at: usize| reg[s as usize] != u8::MAX && at > hoist_span[s as usize].0 && at < hoist_span[s as usize].1;
-    // Uniform words for the constants used most (a use inside a loop counting 2^6 times one outside), the slots after the caller's (`reserve`) up to `uniform_slots`: read by the instruction itself, no load. LUT values and hoisted ones need none.
+    let (reg, high, peak, _, held) = allocate(&hoist).unwrap_or(first);
+    // A hoisted constant's register, for a use at node `at`: inside its loop only (a use before or after the loop loads it as any other constant; reading the register there read whatever value had taken it: 595 black pixels on the attest ball, 2026-11-05).
+    let hoisted = |s: u32, at: usize| -> Option<u8> {
+        let l = spans.iter().position(|&(h, e)| at > h && at < e)?;
+        held[l].iter().find(|x| x.0 == s).map(|x| x.1)
+    };
+    let hoisted_at = |s: u32, at: usize| hoisted(s, at).is_some();
+    // Uniform words for the constants used most (a use inside a loop counting 2^6 times one outside), the slots after the caller's (`reserve`) up to `uniform_slots`: read by the instruction itself, no load. LUT values and hoisted ones need none; a param is never a LUT value (its value is the run's).
     let mut weight: Vec<(u32, usize)> = Vec::new();
     for (j, op) in nodes.iter().enumerate() {
         if !keep[j] {
@@ -959,9 +1473,9 @@ pub fn compile() -> Compiled {
         }
         let in_loop = spans.iter().any(|s| j > s.0 && j < s.1);
         op.sources(|s| {
-            if is_const(s) && !hoisted_at(s, j) {
-                let Op::Const(bits) = nodes[s as usize] else { unreachable!() };
-                if !LUT.contains(&bits) {
+            if is_imm(s) && !hoisted_at(s, j) {
+                let lut = matches!(nodes[s as usize], Op::Const(bits) if LUT.contains(&bits));
+                if !lut {
                     let w = if in_loop { 1 << 6 } else { 1 };
                     match weight.iter_mut().find(|x| x.0 == s) {
                         Some(x) => x.1 += w,
@@ -976,9 +1490,13 @@ pub fn compile() -> Compiled {
     let reserved = rec.reserved;
     let ufau: Vec<(u32, (u8, u8))> = weight.iter().take(2 * (rec.slots - reserved) as usize).enumerate().map(|(k, w)| (w.0, (reserved + (k / 2) as u8, (k % 2) as u8))).collect();
     let mut consts = alloc::vec![0u64; ufau.len().div_ceil(2)];
+    let mut params: Vec<ParamPlace> = alloc::vec![ParamPlace::default(); rec.params.len()];
     for &(s, (sl, w)) in &ufau {
-        let Op::Const(bits) = nodes[s as usize] else { unreachable!() };
+        let bits = imm_bits(s).unwrap();
         consts[(sl - reserved) as usize] |= (bits as u64) << (32 * w as u32);
+        if let Some(p) = param_of(s) {
+            params[p as usize].uniform = Some((sl, w));
+        }
     }
     let regs64 = high > 15;
     let kept = keep.iter().filter(|&&k| k).count();
@@ -989,8 +1507,16 @@ pub fn compile() -> Compiled {
     let mut top = None;
     let mut exit: Option<Label> = None;
     let mut loop_no = 0usize;
+    let mut blocks: Vec<Label> = Vec::new();
+    // What r58:r59 hold: the address of (slot, index, shift), and the slot whose high word r59 holds; forgotten where control flow joins (a block's end, a loop's top and its exits), since the paths into a join may have left other addresses there.
+    let mut at_addr: Option<(u8, u32, u8)> = None;
+    let mut hi_slot: Option<u8> = None;
+    // (param, word index) for every immediate that carries a param.
+    let mut patches: Vec<(u32, u32)> = Vec::new();
+    // The next instruction after node i, for a load's wait: a load of the same address next needs none (its own wait covers both, so a row of a table's words lands in one wait).
+    let next_emitted = |i: usize| (i + 1..n).find(|&j| keep[j] && !is_imm(j as u32) && !matches!(nodes[j], Op::Gid));
     for (i, op) in nodes.iter().enumerate() {
-        if !keep[i] || is_const(i as u32) {
+        if !keep[i] || is_imm(i as u32) {
             continue;
         }
         // This instruction's constant sources, each in the cheapest place the FAU rule allows: an immediate of the LUT, a uniform word (`ufau`), or else a constant register loaded just before. The rule: one 64-bit uniform slot an instruction, and at most two distinct 32-bit uniform/LUT words, the form's own LUT zero counted (va_validate.c).
@@ -1005,10 +1531,10 @@ pub fn compile() -> Compiled {
         let mut np = 0;
         let mut loads = 0;
         op.sources(|s| {
-            if !is_const(s) || hoisted_at(s, i) || place[..np].iter().any(|p| p.0 == s) {
+            if !is_imm(s) || hoisted_at(s, i) || place[..np].iter().any(|p| p.0 == s) {
                 return;
             }
-            let Op::Const(bits) = nodes[s as usize] else { unreachable!() };
+            let bits = imm_bits(s).unwrap();
             let mut take = |key: u16, sl: Option<u8>| -> bool {
                 let has = words[..nw].contains(&key);
                 let slot_ok = match (sl, slot) {
@@ -1028,7 +1554,8 @@ pub fn compile() -> Compiled {
                     false
                 }
             };
-            let src = if let Some(li) = LUT.iter().position(|&v| v == bits) {
+            let lut = if param_of(s).is_none() { LUT.iter().position(|&v| v == bits) } else { None };
+            let src = if let Some(li) = lut {
                 if take(0x100 | li as u16, None) { Some(Src::Lut(Lut::index(li as u8))) } else { None }
             } else if let Some(&(sl, w)) = ufau.iter().find(|u| u.0 == s).map(|u| &u.1) {
                 if take((sl as u16) << 1 | w as u16, Some(sl)) { Some(Src::Uniform(if w == 0 { u(sl).w0() } else { u(sl).w1() })) } else { None }
@@ -1038,6 +1565,9 @@ pub fn compile() -> Compiled {
             let src = src.unwrap_or_else(|| {
                 let cr = CONST_REGS[loads];
                 loads += 1;
+                if let Some(p) = param_of(s) {
+                    patches.push((p, k.len() as u32));
+                }
                 k.iadd_imm_i32(r(cr), Lut::ZERO, bits);
                 Src::Reg(r(cr))
             });
@@ -1050,26 +1580,29 @@ pub fn compile() -> Compiled {
         let rr = |s: u32| -> Src {
             match place[..np].iter().find(|p| p.0 == s) {
                 Some(p) => p.1,
-                None => Src::Reg(r(reg[s as usize])),
+                None => Src::Reg(r(hoisted(s, i).unwrap_or(reg[s as usize]))),
             }
         };
-        // A float operand as read, with the negation folded into it above.
-        let fl = |s: u32, p: u32| -> Float {
-            let f = Float { src: rr(s), neg: false, abs: false };
+        // A float operand as read, with the negation and the widen folded into it above.
+        let fl = |s: u32, p: usize| -> Float {
+            let f = Float { src: rr(s), neg: false, abs: false, widen: wid[i][p] };
             if negmask[i] >> p & 1 == 1 { f.neg() } else { f }
         };
+        // A v2f16 operand as read, with its negation and swizzle.
+        let hl = |s: u32, p: usize| -> Half2 { Half2 { src: rr(s), swz: swz[i][p], neg: negmask[i] >> p & 1 == 1, abs: false } };
+        let zero16 = Half2::from(Lut::ZERO).neg();
         let d = if op.has_value() { r(reg[i]) } else { r(0) };
+        let c = clamp[i];
+        let clamped = |pl: Placed<'_>| {
+            if c != Clamp::None {
+                pl.clamp(c);
+            }
+        };
         match *op {
-            Op::Const(_) | Op::Gid => {}
-            Op::FAdd(a, b) => {
-                k.fadd_f32(d, fl(a, 0), fl(b, 1));
-            }
-            Op::FMul(a, b) => {
-                k.fma_f32(d, fl(a, 0), fl(b, 1), Lut::ZERO.neg());
-            }
-            Op::FFma(a, b, c) => {
-                k.fma_f32(d, fl(a, 0), fl(b, 1), fl(c, 2));
-            }
+            Op::Const(_) | Op::Param(_) | Op::Gid => {}
+            Op::FAdd(a, b) => clamped(k.fadd_f32(d, fl(a, 0), fl(b, 1))),
+            Op::FMul(a, b) => clamped(k.fma_f32(d, fl(a, 0), fl(b, 1), Lut::ZERO.neg())),
+            Op::FFma(a, b, c) => clamped(k.fma_f32(d, fl(a, 0), fl(b, 1), fl(c, 2))),
             Op::FNeg(a) => {
                 k.fadd_f32(d, fl(a, 0).neg(), Lut::ZERO.neg());
             }
@@ -1090,6 +1623,33 @@ pub fn compile() -> Compiled {
             }
             Op::FCmp(c, a, b) => {
                 k.fcmp_or_f32(d, c, CmpResult::M1, fl(a, 0), fl(b, 1), Lut::ZERO);
+            }
+            Op::HAdd(a, b) => clamped(k.fadd_v2f16(d, hl(a, 0), hl(b, 1))),
+            Op::HMul(a, b) => clamped(k.fma_v2f16(d, hl(a, 0), hl(b, 1), zero16)),
+            Op::HFma(a, b, c) => clamped(k.fma_v2f16(d, hl(a, 0), hl(b, 1), hl(c, 2))),
+            Op::HMin(a, b) => {
+                k.fmin_v2f16(d, hl(a, 0), hl(b, 1));
+            }
+            Op::HMax(a, b) => {
+                k.fmax_v2f16(d, hl(a, 0), hl(b, 1));
+            }
+            Op::HNeg(a) => {
+                k.fadd_v2f16(d, hl(a, 0).neg(), zero16);
+            }
+            Op::HPack(a, b) => {
+                k.fadd_f32(Dst::H0(d), fl(a, 0), Lut::ZERO.neg());
+                k.fadd_f32(Dst::H1(d), fl(b, 1), Lut::ZERO.neg());
+            }
+            Op::HNarrow(a) => {
+                k.fadd_f32(Dst::H0(d), fl(a, 0), Lut::ZERO.neg());
+            }
+            // A broadcast or a widen read by an instruction that takes no swizzle or widen (a select, a store, a compare): made, x + −0 being x.
+            Op::HBroadcast(a, hi) => {
+                k.fadd_v2f16(d, Half2 { src: rr(a), swz: if hi { Swz16::H11 } else { Swz16::H00 }, neg: false, abs: false }, zero16);
+            }
+            Op::HWiden(a, hi) => {
+                let f = Float { src: rr(a), neg: false, abs: false, widen: if hi { Widen::H1 } else { Widen::H0 } };
+                k.fadd_f32(d, f, Lut::ZERO.neg());
             }
             Op::Sel(m, a, b) => {
                 k.mux_i32(d, Mux::Bit, rr(a), rr(b), rr(m));
@@ -1151,23 +1711,45 @@ pub fn compile() -> Compiled {
             Op::Phi(init) => {
                 k.mov_i32(d, rr(init));
             }
+            Op::BlockBegin(m) => {
+                // The invocations whose mask is clear go to the block's end, there to wait for the rest (reconverge: a divergent branch, va_insert_flow.c).
+                let end = k.label();
+                k.branchz_eq(rr(m), end).reconverge();
+                blocks.push(end);
+            }
+            Op::BlockEnd => {
+                // The block's last instruction falls thru to the branch's target: it carries the reconverge, or a NOP after it does where it already waits on a load.
+                let end = blocks.pop().expect("valhall::ssa: a block's end without its begin");
+                if k.last_flow() != 0 {
+                    k.nop().reconverge();
+                } else {
+                    k.last().reconverge();
+                }
+                k.bind(end);
+                at_addr = None;
+                hi_slot = None;
+            }
             Op::LoopHead => {
                 // The loop's hoisted constants, once, before its top.
-                for &c in &hoist[loop_no] {
-                    let Op::Const(bits) = nodes[c as usize] else { unreachable!() };
-                    k.iadd_imm_i32(r(reg[c as usize]), Lut::ZERO, bits);
+                for &(c, hr) in &held[loop_no] {
+                    if let Some(p) = param_of(c) {
+                        patches.push((p, k.len() as u32));
+                    }
+                    k.iadd_imm_i32(r(hr), Lut::ZERO, imm_bits(c).unwrap());
                 }
                 // The instruction before the loop's top carries reconverge (the Mandelbrot's form): a write to the scratch register.
                 k.iadd_imm_i32(r(SCRATCH), Lut::ZERO, 0).reconverge();
                 top = Some(k.here());
                 loop_start = k.len();
+                at_addr = None;
+                hi_slot = None;
             }
             Op::LoopBreak(running) => {
                 // An invocation no longer running leaves with the head's state: the phis take the head's outputs (for every invocation here: the tail reads the head's outputs, never a phi the head changed), then the stopped ones branch out, to wait at the loop's exit for the rest (reconverge: the block ends in a conditional branch, va_insert_flow.c).
                 let ex = &rec.loops[loop_no].exits;
-                let moves = ex.iter().filter(|&&(_, o)| !is_const(o)).map(|&(p, o)| (reg[p as usize], reg[o as usize])).collect();
-                let consts: Vec<(u8, u32)> = ex.iter().filter_map(|&(p, o)| if let Op::Const(bits) = nodes[o as usize] { Some((reg[p as usize], bits)) } else { None }).collect();
-                parallel_copy(&mut k, moves, &consts);
+                let moves = ex.iter().filter(|&&(_, o)| !is_imm(o)).map(|&(p, o)| (reg[p as usize], reg[o as usize])).collect();
+                let cs: Vec<(u8, u32, Option<u32>)> = ex.iter().filter(|&&(_, o)| is_imm(o)).map(|&(p, o)| (reg[p as usize], imm_bits(o).unwrap(), param_of(o))).collect();
+                parallel_copy(&mut k, moves, &cs, &mut patches);
                 let out = k.label();
                 k.branchz_eq(rr(running), out).reconverge();
                 exit = Some(out);
@@ -1175,17 +1757,23 @@ pub fn compile() -> Compiled {
             Op::LoopEnd(cont) => {
                 // The phis take their updates all at once.
                 let ca = &rec.loops[loop_no].carried;
-                let moves = ca.iter().filter(|&&(_, u)| !is_const(u)).map(|&(p, u)| (reg[p as usize], reg[u as usize])).collect();
-                let consts: Vec<(u8, u32)> = ca.iter().filter_map(|&(p, u)| if let Op::Const(bits) = nodes[u as usize] { Some((reg[p as usize], bits)) } else { None }).collect();
-                parallel_copy(&mut k, moves, &consts);
+                let moves = ca.iter().filter(|&&(_, u)| !is_imm(u)).map(|&(p, u)| (reg[p as usize], reg[u as usize])).collect();
+                let cs: Vec<(u8, u32, Option<u32>)> = ca.iter().filter(|&&(_, u)| is_imm(u)).map(|&(p, u)| (reg[p as usize], imm_bits(u).unwrap(), param_of(u))).collect();
+                parallel_copy(&mut k, moves, &cs, &mut patches);
                 k.branchz(rr(cont), top.take().expect("valhall::ssa: loop end without head")).reconverge();
                 // The stopped invocations wait here for the rest.
                 k.bind(exit.take().expect("valhall::ssa: loop end without its break"));
                 loop_words += k.len() - loop_start;
                 loop_no += 1;
+                at_addr = None;
+                hi_slot = None;
             }
             Op::Store { slot, shift, offset, index, value } => {
-                address(&mut k, slot, rr(index), shift);
+                if at_addr != Some((slot, index, shift)) {
+                    address(&mut k, slot, rr(index), shift, hi_slot == Some(slot));
+                    at_addr = Some((slot, index, shift));
+                    hi_slot = Some(slot);
+                }
                 // A store takes its value from a register only: a constant one goes through a constant register.
                 let v = match rr(value) {
                     Src::Reg(x) => x,
@@ -1197,14 +1785,25 @@ pub fn compile() -> Compiled {
                 k.store_i32(v, pair(ADDR), offset, Slot::S0);
             }
             Op::Load { slot, shift, offset, index } => {
-                address(&mut k, slot, rr(index), shift);
-                // The wait on the load itself: the flow field acts after the instruction carrying it, so the next one sees the value.
-                k.load_i32(d, pair(ADDR), offset, Slot::S0).wait(Slot::S0);
+                if at_addr != Some((slot, index, shift)) {
+                    address(&mut k, slot, rr(index), shift, hi_slot == Some(slot));
+                    at_addr = Some((slot, index, shift));
+                    hi_slot = Some(slot);
+                }
+                // The wait on the load itself, so the next instruction sees the value (the flow field acts after the instruction carrying it); none where the next is a load of the same address, whose wait covers both.
+                let batched = next_emitted(i).is_some_and(|j| matches!(nodes[j], Op::Load { slot: s2, shift: h2, index: x2, .. } if (s2, x2, h2) == (slot, index, shift)));
+                let pl = k.load_i32(d, pair(ADDR), offset, Slot::S0);
+                if !batched {
+                    pl.wait(Slot::S0);
+                }
             }
         }
     }
     k.last().end();
     let words = k.finish().to_vec();
+    for (p, at) in patches {
+        params[p as usize].words.push(at);
+    }
     let mut kinds: Vec<(&'static str, usize)> = Vec::new();
     for (i, op) in nodes.iter().enumerate() {
         if keep[i] {
@@ -1216,12 +1815,11 @@ pub fn compile() -> Compiled {
         }
     }
     kinds.sort_by(|a, b| b.1.cmp(&a.1));
-    Compiled { words, regs64, nodes: n, kept, peak, loop_words, loop_consts, consts, kinds }
+    Compiled { words, regs64, nodes: n, kept, peak, loop_words, loop_consts, consts, kinds, params, reserved }
 }
 
-
-/// Registers taking new values all at once (a parallel copy): each (destination, source) pair, then each (destination, constant). A copy waits until no other pending copy still reads its destination, and a ring of them goes through the scratch register; constants last, as nothing reads them from a register. Used where a loop's phis take their values: a value can be another field's phi (a fold handing back a node already recorded).
-fn parallel_copy(k: &mut Kernel<16384>, mut moves: Vec<(u8, u8)>, consts: &[(u8, u32)]) {
+/// Registers taking new values all at once (a parallel copy): each (destination, source) pair, then each (destination, constant, the param it is if one). A copy waits until no other pending copy still reads its destination, and a ring of them goes through the scratch register; constants last, as nothing reads them from a register. Used where a loop's phis take their values: a value can be another field's phi (a fold handing back a node already recorded).
+fn parallel_copy(k: &mut Kernel<16384>, mut moves: Vec<(u8, u8)>, consts: &[(u8, u32, Option<u32>)], patches: &mut Vec<(u32, u32)>) {
     for (j, m) in moves.iter().enumerate() {
         // Two values into one register would be an allocation bug.
         assert!(!moves[..j].iter().any(|o| o.0 == m.0), "valhall::ssa: two loop copies into r{}", m.0);
@@ -1245,17 +1843,20 @@ fn parallel_copy(k: &mut Kernel<16384>, mut moves: Vec<(u8, u8)>, consts: &[(u8,
             }
         }
     }
-    for &(d, bits) in consts {
+    for &(d, bits, param) in consts {
+        if let Some(p) = param {
+            patches.push((p, k.len() as u32));
+        }
         k.iadd_imm_i32(r(d), Lut::ZERO, bits);
     }
 }
-/// Whether an instruction form already reads the LUT's zero itself (a multiply's −0 addend, a negation's, a compare's `or`, the shift group's shift or second operand): it counts against the FAU's two words.
+/// Whether an instruction form already reads the LUT's zero itself (a multiply's −0 addend, a negation's, a compare's `or`, the shift group's shift or second operand, a narrowing's or a made broadcast's −0): it counts against the FAU's two words.
 fn fixed_zero(op: &Op) -> bool {
-    matches!(op, Op::FMul(..) | Op::FNeg(_) | Op::FCmp(..) | Op::ICmp(..) | Op::And(..) | Op::Or(..) | Op::Xor(..) | Op::Shl(..) | Op::Shr(..))
+    matches!(op, Op::FMul(..) | Op::FNeg(_) | Op::FCmp(..) | Op::ICmp(..) | Op::And(..) | Op::Or(..) | Op::Xor(..) | Op::Shl(..) | Op::Shr(..) | Op::HMul(..) | Op::HNeg(_) | Op::HPack(..) | Op::HNarrow(_) | Op::HBroadcast(..) | Op::HWiden(..))
 }
 
-/// r58:r59 = the address in uniform `slot` plus `index << shift`, in 32 bits (the slot's high word kept: the layer arena lies below 4 GiB, so the low word's add never carries). The shift amount is a byte of the LUT's byte-index entries, so it needs no register.
-fn address(k: &mut Kernel<16384>, slot: u8, index: Src, shift: u8) {
+/// r58:r59 = the address in uniform `slot` plus `index << shift`, in 32 bits (the slot's high word kept: the layer arena lies below 4 GiB, so the low word's add never carries). The shift amount is a byte of the LUT's byte-index entries, so it needs no register. `hi_set`: r59 holds the slot's high word already (the last address was this slot's, on every path here).
+fn address(k: &mut Kernel<16384>, slot: u8, index: Src, shift: u8, hi_set: bool) {
     // WHY: the byte-index entries name shifts 0 to 7; a larger one would silently shift by 7.
     assert!(shift < 8, "valhall::ssa: an address shift of {shift} (0 to 7 only)");
     let (lut, byte) = match shift {
@@ -1270,5 +1871,7 @@ fn address(k: &mut Kernel<16384>, slot: u8, index: Src, shift: u8) {
     };
     k.lshift_or_i32(r(ADDR), index, lut, byte, Lut::ZERO);
     k.iadd_u32(r(ADDR), r(ADDR), u(slot).w0());
-    k.mov_i32(r(ADDR + 1), u(slot).w1());
+    if !hi_set {
+        k.mov_i32(r(ADDR + 1), u(slot).w1());
+    }
 }

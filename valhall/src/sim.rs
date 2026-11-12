@@ -3,12 +3,13 @@
 //! It is checked itself against the words the device ran (tests: the Mandelbrot kernel, bit for bit against the CPU as on the device).
 //!
 //! What it is not: the hardware's rounding of the special function unit. FRCP and FRSQ come out correctly rounded here (within an ulp on the device, gputest 10); FLOGD, FADD_LSCALE and FREXPE's `log` form are one self-consistent split x = m · 2^e with m in [0.75, 1.5) whose sequence (`F::log2_hw`) gives log₂ x (within an ulp on the device, gputest 12); FEXP is 2 to the fixed-point power. A picture through these looks as the device's does; its bits may differ from the device's by an ulp here and there, as they may from the CPU's.
+//! The v2f16 forms (FADD, FMA, FMIN, FMAX), an f32 operand widened from an f16 half, FADD.f32 narrowing into a half register, and the destination clamps are emulated from ISA.xml and Mesa's test vectors, each lane rounded to f16 once (an FMA from its exact f64 product and sum); not yet checked against the device, whose f16 denormals and NaNs it does not claim.
 //!
 //! An invocation runs alone, so a divergent branch is a plain jump: the per-thread result is the warp's, since nothing here reads another lane.
 
 extern crate std;
 
-use crate::LUT;
+use crate::{LUT, f16_to_f32, f32_to_f16};
 
 /// The memory a kernel sees: `bytes` at GPU virtual address `base`.
 pub struct Memory {
@@ -38,6 +39,11 @@ const STEPS: u64 = 1 << 32;
 
 /// Runs `words` for one invocation: r60 the global id X and r61 Y (the service's preload), `uniforms` its FAU slots, over `mem`. Returns how many instructions it ran.
 pub fn run(words: &[u64], uniforms: &[u64], gid: [u32; 2], mem: &mut Memory) -> u64 {
+    run_marked(words, uniforms, gid, mem, &mut [])
+}
+
+/// As [`run`], marking in `ran` (one flag an instruction, or empty for none) every instruction the invocation ran: the union over a warp's sixteen invocations is what the warp issues, a branch over a block skipped only where all sixteen skip it.
+pub fn run_marked(words: &[u64], uniforms: &[u64], gid: [u32; 2], mem: &mut Memory, ran: &mut [bool]) -> u64 {
     let mut reg = [0u32; 64];
     reg[60] = gid[0];
     reg[61] = gid[1];
@@ -45,6 +51,9 @@ pub fn run(words: &[u64], uniforms: &[u64], gid: [u32; 2], mem: &mut Memory) -> 
     let mut steps = 0u64;
     loop {
         let w = words[pc];
+        if !ran.is_empty() {
+            ran[pc] = true;
+        }
         steps += 1;
         assert!(steps < STEPS, "valhall::sim: no end after 2^32 instructions");
         let page = (w >> 57) & 3;
@@ -61,10 +70,16 @@ pub fn run(words: &[u64], uniforms: &[u64], gid: [u32; 2], mem: &mut Memory) -> 
                 _ => panic!("valhall::sim: source byte G#{b:X} at {pc}"),
             }
         };
-        // A 32-bit source in ALU position i, and as an f32 with its modifiers (abs, then negate).
+        // A 32-bit source in ALU position i, and as an f32 with its modifiers (the widen from an f16 half at 28 − 2i, abs, then negate).
         let s = |reg: &[u32; 64], i: u32| src(reg, w >> (8 * i));
         let f = |reg: &[u32; 64], i: u32| {
-            let mut v = f32::from_bits(s(reg, i));
+            let raw = s(reg, i);
+            let mut v = match (w >> (28 - 2 * i)) & 3 {
+                0 => f32::from_bits(raw),
+                1 => f16_to_f32(raw as u16),
+                2 => f16_to_f32((raw >> 16) as u16),
+                _ => panic!("valhall::sim: a reserved widen at {pc}"),
+            };
             if (w >> (39 - 2 * i)) & 1 == 1 {
                 v = v.abs();
             }
@@ -73,8 +88,44 @@ pub fn run(words: &[u64], uniforms: &[u64], gid: [u32; 2], mem: &mut Memory) -> 
             }
             v
         };
+        // A v2f16 source in ALU position i: its two lanes by the swizzle at 28 − 2i (H00, H10, H01, H11), then abs and negate on both.
+        let h = |reg: &[u32; 64], i: u32| -> [f32; 2] {
+            let raw = s(reg, i);
+            let (lo, hi) = (f16_to_f32(raw as u16), f16_to_f32((raw >> 16) as u16));
+            let mut v = match (w >> (28 - 2 * i)) & 3 {
+                0 => [lo, lo],
+                1 => [hi, lo],
+                2 => [lo, hi],
+                _ => [hi, hi],
+            };
+            for x in v.iter_mut() {
+                if (w >> (39 - 2 * i)) & 1 == 1 {
+                    *x = x.abs();
+                }
+                if (w >> (38 - 2 * i)) & 1 == 1 {
+                    *x = -*x;
+                }
+            }
+            v
+        };
+        // The destination clamp (33:32) of FADD, FMA, FMIN and FMAX: a NaN clamps to the low end, and −0 to +0 at a bound of 0 (ISA.xml's `Clamp`).
+        let clamp = |v: f32| -> f32 {
+            match (w >> 32) & 3 {
+                0 => v,
+                1 => {
+                    if v > 0. { v } else { 0. }
+                }
+                2 => {
+                    if v > -1. { v.min(1.) } else { -1. }
+                }
+                _ => {
+                    if v > 0. { v.min(1.) } else { 0. }
+                }
+            }
+        };
+        let pack16 = |v: [f32; 2]| f32_to_f16(clamp(v[0])) as u32 | (f32_to_f16(clamp(v[1])) as u32) << 16;
         let dst = ((w >> 40) & 63) as usize;
-        // A full 32-bit destination (write mask 3): the f16 halves are the present stage's, not emulated.
+        // A full 32-bit destination (write mask 3); FADD.f32 alone writes a half (narrowing to f16, below).
         let full = (w >> 46) & 3 == 3;
         let op = (w >> 48) & 0x1FF;
         let op2 = (w >> 16) & 0xF;
@@ -227,13 +278,40 @@ pub fn run(words: &[u64], uniforms: &[u64], gid: [u32; 2], mem: &mut Memory) -> 
                     9 => f(&reg, 0) + split(f(&reg, 1)).0,
                     _ => panic!("valhall::sim: G#0A4 opcode2 {op2} at {pc}"),
                 };
-                put(&mut reg, v.to_bits());
+                let v = if matches!(op2, 0 | 2 | 3) { clamp(v) } else { v };
+                // FADD.f32 into a half (write mask 1 the low, 2 the high): narrowed to f16, to nearest even, the other half kept (Mesa's f32 to f16 on Valhall).
+                match (w >> 46) & 3 {
+                    3 => put(&mut reg, v.to_bits()),
+                    m => {
+                        assert!(op2 == 0, "valhall::sim: a half destination on G#0A4 opcode2 {op2} at {pc}");
+                        let half = f32_to_f16(v) as u32;
+                        reg[dst] = if m == 1 { (reg[dst] & 0xFFFF_0000) | half } else { (reg[dst] & 0xFFFF) | half << 16 };
+                    }
+                }
             }
             // FMA.f32, one rounding.
             0x0B2 => {
-                let v = f(&reg, 0).mul_add(f(&reg, 1), f(&reg, 2));
+                let v = clamp(f(&reg, 0).mul_add(f(&reg, 1), f(&reg, 2)));
                 put(&mut reg, v.to_bits());
             }
+            // The v2f16 forms, per lane, each rounded to f16 once: FADD (opcode2 0), FMIN (2), FMAX (3); FMA.v2f16 (G#B3), its product and sum exact in f64 before that one rounding.
+            0x0A5 => {
+                let (a, b) = (h(&reg, 0), h(&reg, 1));
+                let v = match op2 {
+                    0 => [a[0] + b[0], a[1] + b[1]],
+                    2 => [a[0].min(b[0]), a[1].min(b[1])],
+                    3 => [a[0].max(b[0]), a[1].max(b[1])],
+                    _ => panic!("valhall::sim: G#0A5 opcode2 {op2} at {pc}"),
+                };
+                put(&mut reg, pack16(v));
+            }
+            0x0B3 => {
+                let (a, b, c) = (h(&reg, 0), h(&reg, 1), h(&reg, 2));
+                let lane = |k: usize| (a[k] as f64 * b[k] as f64 + c[k] as f64) as f32;
+                put(&mut reg, pack16([lane(0), lane(1)]));
+            }
+            // NOP.
+            0x000 => {}
             // BRANCHZ: taken when the source is nonzero, or zero with .eq (bit 36); the offset 34:8 in instructions from the next.
             0x01F => {
                 let c = s(&reg, 0);
