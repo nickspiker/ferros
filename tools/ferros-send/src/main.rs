@@ -33,6 +33,13 @@ fn size(bytes: u64) -> String {
     s
 }
 
+/// A line said and flushed at once, whatever stdout is (a pipe, a file, a terminal): a person or a script watching it sees each stage as it happens.
+fn say(line: &str) {
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
 /// A command's plain answer: Ok for [0], else the device's words after its status.
 fn plain(r: &[u8]) -> Result<(), String> {
     match r.split_first() {
@@ -83,27 +90,30 @@ async fn main() {
     }
     let address = *blake3::hash(&capsule).as_bytes();
     let len = capsule.len() as u64;
-    let link = UsbLink::open().unwrap_or_else(|e| {
+    let link = UsbLink::open().await.unwrap_or_else(|e| {
         eprintln!("{e}");
         exit(1);
     });
-    println!("offering {what} ({}) to the device", size(len));
+    say(&format!("offering {what} ({}) to the device", size(len)));
 
-    // The parts, in order, each kept by the device before the next goes.
-    for (at, p) in parts(&address, &capsule) {
+    // The parts, in order, each kept by the device before the next goes; each said as the device keeps it (a part is a few seconds: the device writes it to its vault before it answers).
+    let ps = parts(&address, &capsule);
+    let n = ps.len();
+    for (k, (at, p)) in ps.into_iter().enumerate() {
         let part_len = p.len() as u64 - 41;
         let r = pt::call(&link, &pt::command(OFFER, Op::Write, &p)).await.unwrap_or_else(|e| {
-            eprintln!("\nthe link failed: {e}");
+            eprintln!("the link failed: {e}");
             exit(1);
         });
         if let Err(w) = plain(&r) {
-            eprintln!("\nnot sent: {w}");
+            eprintln!("not sent: {w}");
+            if r.first() == Some(&2) {
+                eprintln!("(the device shows that kist on its Kists page: Stow or Cancel it there first)");
+            }
             exit(1);
         }
-        eprint!("\r  {} of {} sent", size(at + part_len), size(len));
-        let _ = std::io::stderr().flush();
+        say(&format!("  part {} of {n} kept: {} of {}", k + 1, size(at + part_len), size(len)));
     }
-    eprintln!();
 
     let mut p = Vec::with_capacity(40);
     p.extend_from_slice(&address);
@@ -116,6 +126,7 @@ async fn main() {
         eprintln!("not offered: {w}");
         exit(1);
     }
+    say("offered");
 
     // Its state, read again each time it changes: the device holds each read until it does (or for a few seconds, then answers it unchanged), so nothing here waits on a timer of its own.
     let mut seen = u8::MAX;
@@ -137,32 +148,33 @@ async fn main() {
         if state != seen {
             seen = state;
             match state {
-                offer::OFFERED => println!("offered; waiting for the device's installer"),
-                offer::CHECKING => println!("the device is checking it: its signature, then its code"),
+                offer::OFFERED => say("waiting for the device's installer to take it"),
+                offer::CHECKING => say("the device is checking it: its signature, then its code"),
                 offer::ASKING => {
                     if flags & offer::NATIVE != 0 {
-                        println!("unchecked code, development build only");
+                        say("unchecked code, development build only");
                     }
-                    println!("on the device's screen: Stow or Cancel");
+                    say("waiting for the person to say Stow or Cancel on the device");
+                    say("(its Kists page opens on it once the person is on the map; an app in front keeps it waiting until Home)");
                 }
                 offer::STOWED => {
-                    println!("stowed");
+                    say("stowed");
                     exit(0);
                 }
                 offer::REFUSED => {
-                    println!("refused: {}", offer::words(why));
+                    say(&format!("refused: {}", offer::words(why)));
                     exit(1);
                 }
                 offer::CANCELLED => {
-                    println!("cancelled");
+                    say("cancelled");
                     exit(2);
                 }
                 offer::GONE => {
-                    println!("refused: the offer is gone (the device restarted, or the person left)");
+                    say("refused: the offer is gone (the device restarted, or the person left)");
                     exit(1);
                 }
                 _ => {
-                    println!("refused: the device answered a state this tool does not know ({state})");
+                    say(&format!("refused: the device answered a state this tool does not know ({state})"));
                     exit(1);
                 }
             }

@@ -84,7 +84,7 @@ async fn main() {
     let _clock = tokio::spawn(SessionClock::calibrate());
 
     match args[1].as_str() {
-        "status" => cmd_status(),
+        "status" => cmd_status().await,
         // `diag ufs` runs the cold boot's UFS link-startup probe (long report).
         "diag" => cmd_diag(args.get(2).map(|s| s.as_bytes()).unwrap_or(&[])).await,
         "read" => {
@@ -392,8 +392,8 @@ async fn main() {
     std::process::exit(0);
 }
 
-fn cmd_status() {
-    match usb::UsbLink::open() {
+async fn cmd_status() {
+    match usb::UsbLink::open().await {
         Ok(_link) => println!("Device connected and ready"),
         Err(e) => {
             eprintln!("{e}");
@@ -624,7 +624,7 @@ async fn cmd_run_with_tail(path: &str, hex_input: Option<&str>, exec_cap: &[u8],
         None => Vec::new(),
     };
 
-    let link = match usb::UsbLink::open() {
+    let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
@@ -768,7 +768,7 @@ async fn cmd_run_with_tail(path: &str, hex_input: Option<&str>, exec_cap: &[u8],
 }
 
 async fn cmd_gate(value: u16) {
-    let link = match usb::UsbLink::open() {
+    let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
@@ -785,7 +785,7 @@ async fn cmd_gate(value: u16) {
 }
 
 async fn cmd_dbg() {
-    let link = match usb::UsbLink::open() {
+    let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
@@ -821,7 +821,7 @@ async fn cmd_dbg() {
 }
 
 async fn cmd_dbg2() {
-    let link = match usb::UsbLink::open() {
+    let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
@@ -875,7 +875,7 @@ fn tri_state(v: u32) -> &'static str {
 }
 
 async fn cmd_diag(params: &[u8]) {
-    let link = match usb::UsbLink::open() {
+    let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
@@ -947,7 +947,7 @@ async fn cmd_store(args: &[String]) {
         Some("rm") if args.len() >= 2 => (ferros_pt::Op::Exec, args[1].as_bytes().to_vec()),
         _ => usage(),
     };
-    let link = usb::UsbLink::open().unwrap_or_else(|e| {
+    let link = usb::UsbLink::open().await.unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
@@ -1037,7 +1037,7 @@ async fn cmd_kist_install(path: &str) {
         std::process::exit(1);
     });
     let addr = *blake3::hash(&capsule).as_bytes();
-    let link = usb::UsbLink::open().unwrap_or_else(|e| {
+    let link = usb::UsbLink::open().await.unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
@@ -1112,7 +1112,7 @@ async fn cmd_kist_install(path: &str) {
 
 /// `kist answer <name> <right> on|off|unset` (development; unset puts the want back to never asked): the attested person's answer for one want of an installed kist, written into their list as the first-launch question or the settings' Kists page would write it. `kist list`: the list as it stands.
 async fn cmd_kist_answer(args: &[String]) {
-    let link = usb::UsbLink::open().unwrap_or_else(|e| {
+    let link = usb::UsbLink::open().await.unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
@@ -1158,7 +1158,7 @@ async fn cmd_kist_answer(args: &[String]) {
 
 /// Send raw DISPLAY params and print the reply.
 async fn cmd_display_raw(params: &[u8]) {
-    let link = usb::UsbLink::open().unwrap_or_else(|e| {
+    let link = usb::UsbLink::open().await.unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
@@ -1175,7 +1175,7 @@ async fn cmd_display_raw(params: &[u8]) {
 
 /// Render text on the device's panel (shim, after a --live handoff) and print the device's register report.
 async fn cmd_display(text: &str, hold: bool) {
-    let link = usb::UsbLink::open().unwrap_or_else(|e| {
+    let link = usb::UsbLink::open().await.unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
@@ -1209,7 +1209,7 @@ fn parse_addr(s: &str) -> u64 {
 }
 
 async fn cmd_poke(addr_str: &str, val_str: &str) {
-    let link = usb::UsbLink::open().unwrap_or_else(|e| {
+    let link = usb::UsbLink::open().await.unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
@@ -1238,7 +1238,7 @@ async fn cmd_poke(addr_str: &str, val_str: &str) {
 }
 
 async fn cmd_read(addr_str: &str, len: usize, out_file: Option<&str>) {
-    let link = match usb::UsbLink::open() {
+    let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
@@ -1296,7 +1296,7 @@ async fn cmd_read(addr_str: &str, len: usize, out_file: Option<&str>) {
 }
 
 async fn cmd_echo() {
-    let link = match usb::UsbLink::open() {
+    let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
@@ -1343,7 +1343,7 @@ async fn cmd_send(hex: &str) {
         }
     };
 
-    let link = match usb::UsbLink::open() {
+    let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
@@ -1364,7 +1364,7 @@ async fn cmd_send(hex: &str) {
 }
 
 async fn cmd_log() {
-    let link = match usb::UsbLink::open() {
+    let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
@@ -1437,7 +1437,7 @@ async fn cmd_reload(path: &str) {
 
     eprintln!("Kernel binary: {} bytes", bin_data.len());
 
-    let link = match usb::UsbLink::open() {
+    let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
@@ -1544,7 +1544,7 @@ async fn cmd_install(path: &str) {
     eprintln!("Kernel: {} bytes, BLAKE3 {}...verified",
         kernel_size, &computed.to_hex()[..16]);
 
-    let link = match usb::UsbLink::open() {
+    let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
@@ -1644,7 +1644,7 @@ async fn cmd_install(path: &str) {
 }
 
 async fn cmd_reboot(mode: &str) {
-    let link = match usb::UsbLink::open() {
+    let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
@@ -1686,7 +1686,7 @@ async fn cmd_reboot(mode: &str) {
 async fn cmd_beam(args: &[String]) {
     use ferros_pt::command::{ring_id, beam_mode};
 
-    let link = match usb::UsbLink::open() {
+    let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
@@ -1767,7 +1767,7 @@ async fn cmd_beam(args: &[String]) {
 }
 
 async fn cmd_terminal() {
-    let link = match usb::UsbLink::open() {
+    let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
@@ -1814,7 +1814,7 @@ async fn cmd_terminal() {
 
 /// Raw USB ping-pong — no PT framing. Sends a small probe on bulk OUT and reads bulk IN back, `count` times, measuring round-trip latency. Isolates the USB link itself from the PT layer when bringing up a board.
 async fn cmd_ping(count: u32) {
-    let link = match usb::UsbLink::open() {
+    let link = match usb::UsbLink::open().await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");

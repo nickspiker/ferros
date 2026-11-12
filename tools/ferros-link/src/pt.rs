@@ -53,11 +53,18 @@ pub async fn send(link: &UsbLink, data: &[u8]) -> Result<Complete, String> {
         .map_err(|e| format!("SPEC send failed: {e}"))?;
     trace!("  SPEC sent OK");
 
-    // Wait for SPEC ACK
-    let resp = link
-        .recv()
-        .await
-        .map_err(|e| format!("SPEC ACK recv failed: {e}"))?;
+    // Wait for SPEC ACK. A packet of a reply an earlier session left on its way out is passed over: the device ends that reply when this session starts (`UsbLink::open`) or when this SPEC comes, but a packet the controller had already taken in can still come first (2026-11-12, a killed `ferros send`'s held read: `Expected SPEC ACK, got 512 bytes: [53, 61, ...]`, a SPEC).
+    let resp = loop {
+        let r = link
+            .recv()
+            .await
+            .map_err(|e| format!("SPEC ACK recv failed: {e}"))?;
+        if r.is_empty() || Spec::decode(&r).is_some() || ferros_pt::is_data_packet(r[0]) {
+            trace!("  an earlier session's packet passed over ({} bytes)", r.len());
+            continue;
+        }
+        break r;
+    };
     if ferros_pt::packet::Complete::decode(&resp).is_some_and(|c| !c.success) {
         return Err("the kernel refused the transfer (too large for its receive region)".into());
     }

@@ -18,4 +18,5 @@ cargo run -q --release --manifest-path tools/kistcat/Cargo.toml -- kist --key "$
     --name Clock --option e6f06ca18ca2027b99ea0f0a3e5e97916ea81f57b227a8d9c51a5632aac5a35b --version 0 \
     --out "$out"
 [ "${1:-}" = --no-install ] && exit 0
-cargo run -q -p ferros-send -- send "$out"
+# Not -q: a build, or a wait on another build's lock, says so instead of looking like a silent device.
+cargo run -p ferros-send -- send "$out"

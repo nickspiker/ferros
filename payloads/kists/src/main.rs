@@ -824,15 +824,26 @@ fn offer(grants: u64, i: usize, job: &Job) {
         None => offer_check(grants, i, job),
         Some(stow) => offer_answer(grants, i, job, stow),
     };
-    match r {
-        Ok((state, flags)) => {
-            ferros_sys::offer::tell(install, &job.capsule, state, 0, flags);
-        }
+    let (state, why, flags) = match r {
+        Ok((state, flags)) => (state, 0, flags),
         Err(why) => {
             drop_offered(grants, &job.capsule);
             fail(i, why);
-            ferros_sys::offer::tell(install, &job.capsule, ferros_kist::offer::REFUSED, why, 0);
+            let mut l = Vec::new();
+            l.extend_from_slice(b"kists: an offer not stowed: ");
+            l.extend_from_slice(ferros_kist::offer::words(why).as_bytes());
+            l.push(b'\n');
+            say(&l);
+            (ferros_kist::offer::REFUSED, why, 0)
         }
+    };
+    // The kernel answers the host's held read with it; one it no longer has (the person left, the device started again) is said here, as the host then hears "gone".
+    if !ferros_sys::offer::tell(install, &job.capsule, state, why, flags) {
+        let mut l = Vec::new();
+        l.extend_from_slice(b"kists: the kernel no longer has this offer, so the host did not hear it ");
+        l.extend_from_slice(ferros_kist::offer::state_name(state).as_bytes());
+        l.push(b'\n');
+        say(&l);
     }
 }
 
@@ -870,6 +881,11 @@ fn offer_check(grants: u64, i: usize, job: &Job) -> Result<(u8, u8), u8> {
     }
     let (developer, option) = ferros_kist::identity(&taken.first).map_err(|_| WHY_NOT_KIST)?;
     let decl = ferros_kist::declaration(&taken.first).map_err(|_| WHY_NOT_KIST)?;
+    let mut l = Vec::new();
+    l.extend_from_slice(b"kists: ");
+    l.extend_from_slice(decl.name.as_bytes());
+    l.extend_from_slice(b" offered: read back from the vault whole, its blake3 the one offered; its signature next\n");
+    say(&l);
     // Its version as its signed declaration gives it; one without (a capsule from before versions) is shown as 0.
     let version = ferros_kist::version_of(&taken.first).map_err(|_| WHY_NOT_KIST)?.unwrap_or_default();
     with(|s| {
@@ -881,6 +897,11 @@ fn offer_check(grants: u64, i: usize, job: &Job) -> Result<(u8, u8), u8> {
     });
     let list = ferros_kist::store::read(cap(grants, S_KISTS)).ok_or(WHY_NOBODY)?;
     let admitted = ferros_kist::capsule::admit(&taken.first, &taken.head.signer, &taken.head.eggs, &taken.file_hash, &list).map_err(|r| refused(i, &r))?;
+    let mut l = Vec::new();
+    l.extend_from_slice(b"kists: ");
+    l.extend_from_slice(decl.name.as_bytes());
+    l.extend_from_slice(b" offered: every egg checks out against its developer's keys; the kernel's check next\n");
+    say(&l);
     stage(i, STAGE_CODE, 0, job.total);
     let native = kernel_check(grants, i, &job.capsule, job.total, true)?;
     let mut l = Vec::new();

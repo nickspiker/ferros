@@ -45,9 +45,12 @@ struct Link {
     outbox: Option<(Vec<u8>, bool, bool)>,
     /// A command is in: submitted, and its reply not yet taken in full.
     busy: bool,
+    /// The USB process's generation, moved by each `reset` (a new process), and the generation the command the service loop took came in: a reply to a command of a process that has ended is dropped, never handed to its successor as the answer to its own first command.
+    epoch: u64,
+    served: u64,
 }
 
-static mut LINK: Link = Link { inbox: None, outbox: None, busy: false };
+static mut LINK: Link = Link { inbox: None, outbox: None, busy: false, epoch: 0, served: 0 };
 
 fn link() -> &'static mut Link {
     // SAFETY: only under the kernel lock (module doc).
@@ -80,12 +83,20 @@ pub fn submit(len: usize, act: bool, fill: impl FnOnce(&mut [u8])) -> bool {
 /// The service loop's side: the command waiting, if any.
 pub fn take_inbox() -> Option<Submitted> {
     INBOX_FULL.store(false, Ordering::Relaxed);
-    link().inbox.take()
+    let l = link();
+    let c = l.inbox.take()?;
+    l.served = l.epoch;
+    Some(c)
 }
 
-/// The service loop's side: the command's reply (`replied` false: none, as after a reload or a reboot, which only act).
+/// The service loop's side: the command's reply (`replied` false: none, as after a reload or a reboot, which only act). Dropped when the process that sent the command has ended since (`epoch`): a vault put or a held read outlives a USB process that gave up on it (2026-11-12), and its reply would otherwise answer the next process's first command.
 pub fn reply(bytes: Vec<u8>, replied: bool, wants_act: bool) {
-    link().outbox = Some((bytes, replied, wants_act));
+    let l = link();
+    if l.served != l.epoch {
+        crate::flashlog::line(&alloc::format!("usb: the reply to a command of a USB process that has ended dropped (A#{} bytes)", bytes.len()));
+        return;
+    }
+    l.outbox = Some((bytes, replied, wants_act));
 }
 
 /// Op 1: the reply from `offset`, copied by `put`. None while the command is still running; Some((total length, replied, wants act)) when done. The reply is dropped once a take reaches its end.
@@ -139,6 +150,7 @@ fn reset() {
     l.inbox = None;
     l.outbox = None;
     l.busy = false;
+    l.epoch += 1;
     INBOX_FULL.store(false, Ordering::Relaxed);
 }
 
