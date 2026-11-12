@@ -255,9 +255,30 @@ Each step is measured on the Pro before the next; sizes are estimates.
        | Globe: on the glass | 54 a second | 60 a second |
    - **What 120 on the Pro still needs, after the third pass:**
      - The display's publish of a whole-screen app frame (10.5 to 13 ms of wall on the Pro), and with it the panel stage's owner's call above: the slowest stage now by far.
-     - The overlay: the loading ring's marks painted every frame (1.3 ms) and summed into the arena every frame (2.5 to 6 ms); paint the ring's marks on the GPU, or only when it changes.
-     - The kernel at the globe: the argmax over up to 15 faces; a face found from the octant and a few planes, or the faces culled to those whose diamond holds a point, would bring it back toward the town's 4.6 ms. Then f16 for the light and the colours.
+     - The overlay: the loading ring's marks painted every frame (1.3 ms) and summed into the arena every frame (2.5 to 6 ms); paint the ring's marks on the GPU, or only when it changes. Done in the fourth pass.
+     - The kernel at the globe: the argmax over up to 15 faces; a face found from the octant and a few planes, or the faces culled to those whose diamond holds a point, would bring it back toward the town's 4.6 ms. The fold done in the fourth pass; then f16 for the light and the colours.
      - Measured on the Pro with cells, the network up and the full heap: not yet (the 8a ran without cells).
+   - **Fourth pass (2026-11-12): the overlay costs nothing on a frame where it did not change** (Mahere ferros-overlay 1fc4428, built on the 8a):
+     - The overlay is a resident layer in each frame region, updated by dirty boxes: the marks clear only the box they last covered and say the box that may differ (each stroke answers the box it touched), the panel's box of shown pixels is found when it is painted again, and a region's copy is summed over the box changed since that region was last drawn, nothing else.
+     - The loading ring is the kernel's own, from a few uniforms (its centre, radius, half width and the sweep's end): under the overlay and over the map, its code premultiplied by its coverage as the marks' sum did, its edge smoothstepped. No upload, about 80 words, and it follows the globe's radius every frame of a pinch. Chosen over sending its box: the ring circles the globe, so its box is most of the screen.
+     - At the globe (far from the camera point, more than four faces) the face comes from a fold instead of the search: the icosahedron turned to the pose whose vertices are (0, ±1, ±φ) and their cyclic turns has the dodecahedron for its face centres, kept by each axis's reflection, so the direction's octant and the nearest of four centres to its absolute value name the face, a row of 32 in the arena (mahere-coord `face_fold`, checked against the encoder's search over 2^16 directions; the frame the same pixel for pixel as the search's at three globes, about 80 words fewer).
+     - Measured on the 8a as the third pass was (no cells, the loading mesh and the ring at its first sweep, a 128 MiB heap build for both):
+
+       | | Before | After |
+       |---|---|---|
+       | Globe: the overlay a frame | 7.15 to 7.3 ms (the marks 1.34, the whole screen summed 6) | 0.12 ms (the compass painted again as the bearing turns, 80 us; its box of about 4000 pixels summed, 50 us) |
+       | Globe: the kernel on the GPU | 6.1 ms, 891 words | 5.79 ms, 897 words (the ring's in them) |
+       | Globe: Mahere's draw a frame | 9.2 ms | 6.1 ms (4.4 of it waiting on the GPU) |
+       | Town: the overlay a frame | 50 to 70 us | 50 to 90 us |
+       | Town: a frame whose panel is painted again (the zoom's depth changing, 2 to 6 in 10 s) | 7.2 ms (the paint 2.2, the sum 5) | about 5 ms (the paint 2.1, its box 1, the sum of about 800000 pixels 1.9) |
+       | Town: the kernel; the draw | 4.53 ms; 4.8 ms | 4.57 ms; 4.9 ms |
+       | On the glass | 60 a second | 60 a second (the panel's rate) |
+   - **What 120 on the Pro still needs, after the fourth pass:**
+     - The display's publish of a whole-screen app frame (10.5 to 13 ms of wall on the Pro) and the panel stage's owner's call above: the slowest stage by far.
+     - The kernel: 4.6 ms at a town and 5.8 at the globe on the 8a's 2.6 Mpx; the Pro's 4 Mpx at its clock wants it near 4 ms: f16 for the light and the colours, and branches over what a warp does not need.
+     - Mahere's CPU a frame, now about 1.7 ms beside the kernel: the plan 0.9 to 1.1 ms (its 3500 points), the kernel recorded and compiled again every frame 0.33 to 0.47 ms (the same words whenever the constants are; worth a cache keyed on them).
+     - The panel painted again as the zoom's depth changes: 2.1 ms of paint and 1 ms finding its box on those frames; whether a closed panel shows anything the depth changes is to check (its key holds the depth either way).
+     - Measured on the Pro with cells, the network up and the full heap: still not (the 8a ran without cells again).
 5. **Lumis's preview, zero copies:** camera DMA into pinned frames inside both the ISPFE and G3D fences, a kernel from the CFA to a layer; Lumis must first build for ferros.
    - Proof: no CPU copy, CPU time a frame near zero, the sensor's frame end to the layer measured.
    - Size: 200 lines of kernel, 500 in the camera path.
