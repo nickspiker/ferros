@@ -11,7 +11,8 @@ Scoped and shelved for night work on 2026-11-11 (memory `genesis_kist_shelved`);
 - **Save states** (built, host-tested): VSF all the way, the emulator's every field by name thru a `vsf` feature on jgenesis (below, "Saves"); about 340 KB for Sonic 2 (the VDP's frame buffer left out, redrawn by the next frame); a state saved, the game moved on and the state loaded gives the same frames again.
   Kept in the kist's memory until it ends: the store they belong in (STORE.md, a draft) does not exist yet, and the page says so.
 - **H32 columns** area-weighted (below, "The picture"); **the icon** made from the owner's picture (below, "The icon").
-- **No sound** (below, "Audio").
+- **Sound** (built the night of 2026-11-11 behind the kist's `audio` feature, off by default, host-tested; not yet run: no device was on the bus, and the `audio` service it writes to has not run on one either): below, "Audio".
+  Without the feature the kist is silent, as in step A.
 - **Saves:** the battery RAM's VSF schema is built and host-tested and goes the same way as a state; Sonic 2 has none.
 - **Not a catalog kist:** GPL-3 shipping wants a lawyer's read first; nothing is published, no capsule is signed.
 
@@ -19,7 +20,7 @@ Scoped and shelved for night work on 2026-11-11 (memory `genesis_kist_shelved`);
 
 | what | where |
 |---|---|
-| the kist's crate | `/mnt/Harbor/Code/genesis-kist` (its own git repo, no remote; the owner decides its home) |
+| the kist's crate | `/mnt/Harbor/Code/genesis-kist` (its own git repo, no remote; the owner decides its home); the sound on its branch `audio` (worktree `/mnt/Harbor/tmp/genesis-kist-audio`) until merged |
 | the core | `/mnt/Harbor/tmp/jgenesis`, branch `ferros` (v0.14.1, 386db85, plus the Sega CD and 32X gate, 7ad42bb, and the `vsf` feature, 04362e7 and d6f7413) |
 | the build | `tools/genesis-build.sh` (this repo) |
 | the icon | `genesis-kist/assets/icon.vsf`, made by `genesis-kist/tools/icon` from the owner's picture (the picture is not in the repo) |
@@ -27,7 +28,7 @@ Scoped and shelved for night work on 2026-11-11 (memory `genesis_kist_shelved`);
 
 ## How it fits together
 
-- **The core** (`emu.rs`): `GenesisEmulator` ticked until a frame is done, the pad's buttons set on player one (a six-button pad, the core's default; the touch pad drives the three buttons and Start, and stays so: asked whether it should grow X, Y, Z and Mode, the owner, 2026-11-11: "nah on the six button"), the YM2612 and PSG switched off in its config (their samples would go nowhere; it also saves their time).
+- **The core** (`emu.rs`): `GenesisEmulator` ticked until a frame is done, the pad's buttons set on player one (a six-button pad, the core's default; the touch pad drives the three buttons and Start, and stays so: asked whether it should grow X, Y, Z and Mode, the owner, 2026-11-11: "nah on the six button"), the YM2612 and PSG muted in its mix without the `audio` feature (their samples would go nowhere; muting saves no time, below, "Audio"), mixed at 48 kHz and handed to the shell with it.
   The Sega CD and 32X are compiled out (owner: "Drop the CD and 32X"): genesis-core's new features `sega-cd` and `32x` (both default, so jgenesis's own frontends are unchanged) gate segacd-core, cdrom (with chd and its C zstd), s32x-core and sh2-emu; a facade module (`addon.rs`) stands in with uninhabited types when they are off, and asking for that hardware is a load error.
   jgenesis uses `float_algebraic` and `cfg_select`, stable after ferros-rust's nightly, so the build switches them on with `-Zcrate-attr` until the fork moves.
 - **The window** (`ferros.rs`): the process's surface is the whole panel (WINDOWS.md); it is filled black, shown at the app level as fluor's 16-bit pixels (op 22 format 1, `G2T16`, which the display decodes) and opaque (mode bit 3), the whole panel its window.
@@ -52,13 +53,13 @@ Scoped and shelved for night work on 2026-11-11 (memory `genesis_kist_shelved`);
   Start a pill above, between them.
   Drawn by fluor front to back (label, then shape, then the band's black, by `under`) into a cached copy of the band, each control redrawn and copied alone when what it shows changes; a held control is lit.
   Landscape puts the D-pad and the buttons either side of the picture (laid out and tested on the host; the 8a has no rotation yet).
-- **Touch**: the touch server's op 1 (HELD, the contacts on the glass now) read once a frame, right after the frame wait: a thumb held still sends no events, and the pad must still see it.
+- **Touch**: the touch server's op 1 (HELD, the contacts on the glass now) read once a frame, right after the frame wait (with sound, the sound's write): a thumb held still sends no events, and the pad must still see it.
   A contact that came down where another window is in front (op 27 on its first frame) is not the pad's until it lifts.
   The buttons are the union of what every finger holds: multi-touch, a thumb on the D-pad and one on the buttons.
-- **Pacing**: one emulated frame a panel frame from the display's frame wait (op 24), never a timer.
+- **Pacing**: one emulated frame a panel frame from the display's frame wait (op 24), never a timer; with sound, the sound's write instead (below, "Audio").
   Op 24 returns at a frame start or, when none started, after a 120th of a second; on the 8a about half the waits came back that way, the count unmoved, and the first build ran Sonic at 83 frames a second.
   The shell waits again until the count moves.
-  The panel's 60 Hz against the Genesis's 59.92 is a frame's drift every 12.5 s, unseen without sound (with sound, the audio clock leads; below).
+  The panel's 60 Hz against the Genesis's 59.92 is a frame's drift every 12.5 s, unseen without sound (with sound, the audio clock leads and the picture follows it; below).
 - **Behind and in front** (WINDOWS.md "The helm"): op 62 held on a thread of the shell's own, as fluor's ferros host does; behind, the loop sleeps on that thread's bell and the game is paused; in front again it is drawn whole.
   Back's Escape (G#29, a key event on that thread: the map sends op 61 when the helm's back is tapped) goes up one page: the game is the kist's main page, so from the game it opens the pause page, and from the page it goes back to the game.
 - **The pause page** (`page.rs`; owner, 2026-11-11: "Yes on the page open with save/load/reset"): over the picture, the game's last frame drawn again at the picture's size (never read back from the surface) under a black veil at three quarters, "Paused", four of fluor's house pills (`Button::draw_pill_immediate`, the canonical button look) stacked in the middle, and a line under them saying where a state is kept ("A saved state is kept until the kist ends", then "Saved, kept until the kist ends").
@@ -89,9 +90,17 @@ FERROS_BUS=1 $B diag "kill genesis"
 FERROS_BUS=1 $B diag "restart ahau"
 ```
 
+With sound (unrun): the kist built with the feature and the `audio` grant fourth, after the surface (the `audio` service up first):
+
+```bash
+tools/genesis-build.sh --features audio
+FERROS_BUS=1 $B spawn /mnt/Harbor/Code/genesis-kist/target/ferros/aarch64-unknown-ferros/release/genesis.bin 00 \
+    --name genesis --use display --use touch --dma surface --use audio --input-file <rom>
+```
+
 The byte after the image picks where the emulation runs: 0 the four A715s, 1 the X3, 3 core 7 alone (its cycle counter then tells its clock), 2 anywhere.
 The ROM is the input file (a u32 length and its bytes after that byte); it never goes into the image.
-The kist needs no right but display, touch and its surface for step A.
+The kist needs no right but display, touch and its surface for step A, and `audio` for sound.
 `ferros-bridge input hold X Y FRAMES` presses the pad; see "Found on the way" for the injector's fix this needed on the 8a.
 The pause page opens on back's Escape: a tap on the helm's back (bottom left), real or injected (`input tap`), which the map turns into the display's op 61 to the app in front; the map must be up under the kist for that (not yet tried with ahau killed).
 The console then says each step ("back: paused, the page up", "state saved: a VSF document of A#n bytes", "Save took A#n us", "state loaded", "reset").
@@ -113,7 +122,8 @@ Sonic 2 (Rev B, 1 MiB), the 8a, 2026-11-11, each line a block of 512 frames (`di
 - The X3 is shared with the kernel and the display's render thread, and they fight: with the whole picture changing every frame (the interlaced two-player demo), the display publishes more and the emulation's frames stretch (the cycle counter over the wall clock fell to 1.7 GHz: the core waiting, or its clock lowered), and a quarter of the panel's frames were missed, staying so after the demo ended.
   One-player on the X3 is 2.5 ms with a few missed frames in 512 (its longest frames are other work in front of it).
   The A715s are steady: 7.5 ms one-player, 11 ms interlaced (about 4 ms to spare, 21 frames missed in one such block), the X3 left to the display.
-  The default byte is 0 (the A715s); the owner, 2026-11-11: "middle cores is where it's at for now". Sound will add the YM2612, the costliest chip; with it the emulation wants either a faster A715 clock or the X3 with the display's render kept off it: the owner's call then.
+  The default byte is 0 (the A715s); the owner, 2026-11-11: "middle cores is where it's at for now".
+  The YM2612, the costliest chip, is already in these times: muted, jgenesis still runs it (below, "Audio"), so sound should add little to the emulation; what it changes is the deadline, a frame and its picture inside the ring's 16.7 ms, which the A715s meet and the X3's longest frames do not.
 - The cycle column for "any of four A715s" is left out: a thread moving between cores mid-frame makes the per-core counter meaningless.
 - The panel ran 59.8 frames a second; 512 frames took 8.56 to 8.61 s (59.5 to 59.8 a second).
 - The image is 5.4 MB (release, thin LTO), its heap 64 MiB, its arc 72 MiB; 6.2 MB with the page and save states (the state code is the derive's, a save and a load a type).
@@ -182,13 +192,33 @@ tools/app-icons takes such a file as an app's source (it cuts the circle with ex
 `genesis-kist/tools/icon` (a host tool, outside the kist's build) made it: the picture decoded for ingest only (nothing is encoded to JPEG or PNG anywhere), taken as sRGB and brought into VSF RGB by vsf's `SRGB2VSF_RGB` as app-icons brings an app's PNG in; the cartridge found in it (teal or gold against the slate: its box 106 to 906 by 170 to 756, centre (506, 463), its farthest pixel 400 from there); the square centred there with the inscribed circle's radius a sixteenth past that (425), so the cartridge is centred and fills the circle; scaled by the exact area mean in linear light; stored as `√L` of 255.
 The picture itself is not in any repo: whether it is the owner's own (and so may be committed with the tool) is the owner's to say.
 
-## Audio (what it needs)
+## Audio
 
-- **The core's side is ready**: jgenesis mixes the YM2612 and PSG and resamples to any output rate (`update_audio_output_frequency`); it pushes stereo `f64` samples a frame at a time (about 800 at 48 kHz).
-  Turning it on costs the YM2612's emulation (expect the frame to grow by a large part; measure on the X3 first).
-- **The system's side is not**: the speaker amplifiers answer (AUDIO.md, the CS35L41s as a process), but there is no path for samples yet: the AoC's audio service or the I2S/TDM link to the amps, a mixer process that owns the output, and an `audio` right a kist asks for, with a stream op (a ring of samples in shared memory and a doorbell, never a poll).
-- **Pacing with sound**: the audio clock leads; the emulation runs a frame when the ring wants one, and the picture is shown at the next panel frame (59.92 against 60 is one frame in 12.5 s: one shown twice now and then, never a sample dropped).
-- Latency budget: a frame of emulation plus one of the ring, about 33 ms.
+Built the night of 2026-11-11 behind the kist's `audio` cargo feature (off by default until it has run on a device), on the kist's branch `audio`; host-tested, never run: no device was on the bus, and the ferros `audio` service it writes to (AUDIO.md, ferros_sys `audio`) was written the same night and has not run on one either.
+
+- **The core's side**: jgenesis mixes the YM2612 and PSG, resamples them to 48 kHz (its own default; the kist sets it anyway, `emu::RATE`) and pushes stereo `f64` held to -1..1 as they come, about 801 pairs a frame (48000 / 59.92; a PAL frame 966).
+  No jgenesis change: the `ferros` branch is as it was.
+  The kist makes each an i16 by `x · 2^15` and the cast, which saturates (+1 lands on 32767, a step short of the top), and collects a frame's pairs.
+  The host test `sound_at_rate` checks 256 frames bring 48000 / 59.92 pairs a frame, to within 4 pairs in all.
+- **What it costs**: muting the chips (`ym2612_enabled: false`, the kist without the feature) never saved their time.
+  jgenesis runs the YM2612, the PSG, their filters and their sinc resamplers either way (genesis-core `bus.rs` `tick_components`) and only zeroes their volume in the mix, so the frames under "Measured" already carry the YM2612's emulation, the costliest chip.
+  Sound adds the mix's few multiplies a pair, the conversion and one write a frame (a 3.2 KB message); read from the code, to be measured on the device.
+  The image grows 4.7 KB (5906280 bytes against 5901480 without the feature).
+- **The stream**: the `audio` grant is the fourth slot, after the surface (`--use audio`, above).
+  At start the kist opens a MEDIA stream (op 0) and says its rate, ring and period on the console, or "no sound" when there is no grant or no stream; a stream at a rate other than 48000 is refused aloud (it would play every note off pitch).
+- **Pacing with sound**: the audio clock leads.
+  After each frame its picture is drawn and shown (op 22), then its pairs are written (op 1, one write: 801 pairs is under the message's 1021) and the service holds the reply until all of them are in the stream's ring (1024 pairs, 21.3 ms), freeing 256 at each of the AoC's playback interrupts.
+  That held reply is the game's clock, so it runs at 59.92 frames a second whatever the panel does; no panel frame is waited for, and the display puts the picture up at its next frame (one shown twice or one never shown now and then, never a sample dropped).
+  Without the feature, without the grant, or once a stream is refused or the endpoint fails (said once), op 24 paces as before, silent.
+- **Paused** (the page, or behind): no frame, so no write; the ring runs dry and the service goes quiet.
+  A write the service answers with an unknown handle (it restarted, or dropped the dry stream) opens a new stream and writes the frame to it.
+- **The deadline**: a write goes in only when the ring has room for the whole frame (801 of 1024), so as it lands at most 223 pairs (4.6 ms) are ahead of it, and its own 801 (16.7 ms) must last until the next write: the touch read, a frame's emulation, its picture and its show.
+  On the A715s (7.5 ms one-player; 11 ms plus 2 ms of picture interlaced, 12.3 ms longest) that fits; on the X3 the longest frames (22 to 35 ms, "Measured") do not, and each is a gap heard.
+  Writing in periods from inside the core's frame (256 pairs a write as they come) would keep the ring fuller while a frame runs and give a slow frame more room; not done, one write a frame first.
+- **Latency**: a touch to its sound is the loop's 16.7 ms plus at most the 4.6 ms ahead of the write, about 21 ms; the picture and its sound come out within about a frame of each other.
+- **On the console**: the 512-frame line adds "the sound paced A#n of them (its write their wait), the ring at least A#k pairs ahead of a frame's sound"; while the sound paces, "frame wait" is the write's wait and the panel frames counted stay 0.
+  A least of 0 means the ring ran dry before a frame's sound went in: a gap heard.
+- **To check on the device**: the stream's line at start; 512 frames in about 8545 ms (59.92 a second, against the panel's 8.56 to 8.61 s now); the least ahead never 0 on the A715s, the interlaced two-player demo the tightest; the emulation's time with sound against "Measured" (expected the same, the chips having run all along); the page and home and back bringing the sound back (the console's "a new stream" if the service dropped it); the picture with no panel frame waited for (a frame doubled now and then is fine, a tear is not); the loudness at the device's volume (the core's mix runs near full scale).
 
 ## Bluetooth controllers (what they need)
 
@@ -206,7 +236,7 @@ The picture itself is not in any repo: whether it is the owner's own (and so may
 
 0. The pause page on the 8a: back opens it, save, move on, load, reset; the save's and the load's times on the device (built and host-tested; the 8a was off the bus the night it was built).
 1. Saves kept past the kist's end: STORE.md's stage 0 (items for the person, the `items` right, the Genesis kinds as ideas), then `store.rs`'s `Session` swapped for it; the page's load then holds a watch.
-2. Audio once the system has an output path.
+2. Sound on the device: the `audio` service up, the kist built with `--features audio` and spawned with `--use audio`, the checks under "Audio"; then the feature on by default and the branch merged.
 3. ROMs into the person's vault (over the bridge, a Photon transfer, the clipboard), and a page to pick one; the capsule never carries a ROM.
 4. Bluetooth pads.
 5. Landscape when the device knows it is turned.

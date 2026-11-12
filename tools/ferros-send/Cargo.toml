@@ -1,0 +1,18 @@
+[package]
+name = "ferros-send"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Stow a kist on a ferros device over USB: `ferros send <kist.capsule.vsf>`. The device checks it as it checks a kist from the directory and the person says Stow or Cancel on its screen. No development command is in it."
+
+[[bin]]
+name = "ferros"
+path = "src/main.rs"
+
+[dependencies]
+ferros-link = { path = "../ferros-link" }
+ferros_pt = { path = "../../ferros_pt", features = ["std"] }
+# The offer's states and the reasons a stow is refused, in words (ferros_kist::offer), and the kist's name and version read from the capsule before it is sent.
+ferros_kist = { path = "../../ferros_kist" }
+blake3 = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

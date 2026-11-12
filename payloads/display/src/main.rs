@@ -213,14 +213,9 @@ fn dsi_unlock() {
 
 extern "C" fn panel(grants: u64) -> ! {
     let dsi = ferros_dsi::Dsim(DsiGrant { grants });
-    let mut screen_off = false;
-    let mut seen = 0u64;
     if PANEL_ON_DUE.load(Ordering::Acquire) == 1 {
         // The first frame out (the frame-start interrupt's count), or a quarter second: display on, then the brightness with TE2, as after the power key.
-        let t0 = now();
-        while FRAME_STARTS.load(Ordering::Acquire) == 0 && now().wrapping_sub(t0) < freq() / 4 {
-            ferros_sys::sleep_until(now() + freq() / 256);
-        }
+        first_frame();
         dsi_lock();
         let on = dsi.dcs(&[0x29]).is_ok();
         let (_, _, hbm, dbv) = brightness(ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS));
@@ -240,10 +235,7 @@ extern "C" fn panel(grants: u64) -> ! {
     }
     // akita: the panel's state as ABL left it, once frames run (the reference a later wake is read against).
     if ferros_sys::akita() {
-        let t0 = now();
-        while FRAME_STARTS.load(Ordering::Acquire) == 0 && now().wrapping_sub(t0) < freq() / 4 {
-            ferros_sys::sleep_until(now() + freq() / 256);
-        }
+        first_frame();
         let mut l = Log { grants, buf: [0; 256], n: 0 };
         l.s(b"display: AK3B at start");
         dsi_lock();
@@ -251,6 +243,34 @@ extern "C" fn panel(grants: u64) -> ! {
         dsi_unlock();
         l.flush();
     }
+    // The panel held to the screen wanted from the start (PANEL_SCREEN: the kernel's preference 2, the power key's, as the render thread took it before spawning this thread), not taken as awake.
+    // A restarted server (`diag restart display`) finds the panel as the last one left it, which need not be the screen wanted: a power press while no server ran (the restart's kill, vault read and spawn) changes the preference with nobody to act on it, and a server killed inside its wake leaves the panel between sleep out and display on. The panel came back asleep under a screen that should be on, until 11 and 29 were sent by hand (2026-11-11).
+    // Not showing with the screen wanted on: woken here as the power key wakes it. Showing with the screen wanted off: the loop's first pass puts it to sleep.
+    first_frame();
+    dsi_lock();
+    let pm = power_mode(&dsi);
+    // Showing: booster, sleep out, normal mode and display on (G#9C, as the modeset's check after a jump asks). Unread: taken as showing, as before this check.
+    let mut screen_off = pm.is_some_and(|p| p & 0x9C != 0x9C);
+    let wake = screen_off && PANEL_SCREEN.load(Ordering::Acquire) == 0;
+    if wake {
+        panel_wake(&dsi);
+        screen_off = false;
+    }
+    dsi_unlock();
+    if wake || pm.is_none() {
+        let mut l = Log { grants, buf: [0; 256], n: 0 };
+        match pm {
+            Some(p) => {
+                l.s(b"display: the panel was not showing at start with the screen on (power mode ");
+                l.hex(p as u32);
+                l.s(b"): woken\n");
+            }
+            None => l.s(b"display: the panel's power mode unread at start; taken as showing\n"),
+        }
+        l.flush();
+    }
+    // One pass of the loop before its first wait, so the screen wanted is compared with the panel as found.
+    let mut seen = u64::MAX;
     loop {
         let seq = PANEL_SEQ.load(Ordering::Acquire);
         if seq == seen {
@@ -278,21 +298,7 @@ extern "C" fn panel(grants: u64) -> ! {
                 let _ = dsi.dcs(&[0x28]);
                 let _ = dsi.dcs(&[0x10]);
             } else {
-                let _ = dsi.dcs(&[0x11]);
-                // The panel's sleep-out settling time before display on (DCS, 120 ms): this thread sleeps, the frames go on.
-                ferros_sys::sleep_until(now() + freq() * 120 / 1000);
-                // akita: GPO_DC again, as Google sends it after every sleep out (`ak3b_init_cmds`, then 110 ms). The sleep drops it from FF to 7F (read back 2026-11-10, before and after a screen off and on), and the panel lights its picture bright at the top and black at the bottom, flickering at half the rate; these five packets sent by hand brought FF and the power mode G#9F back.
-                if ferros_sys::akita() {
-                    for p in [&[0xF0, 0x5A, 0x5A][..], &[0xB0, 0x00, 0x1F, 0xCB], &[0xCB, 0xFF], &[0xF7, 0x0F], &[0xF0, 0xA5, 0xA5]] {
-                        let _ = dsi.dcs(p);
-                    }
-                    ferros_sys::sleep_until(now() + freq() * 110 / 1000);
-                }
-                let _ = dsi.dcs(&[0x29]);
-                // The brightness again (preference 3), with TE2: the panel woke very dark (owner, 2026-11-01), its DBV/HBM sent only when the preference changed.
-                let (_, _, hbm, dbv) = brightness(ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS));
-                set_panel(&dsi, hbm, dbv);
-                PANEL_REPRESENT.store(1, Ordering::Release);
+                panel_wake(&dsi);
             }
             let mut l = Log { grants, buf: [0; 256], n: 0 };
             l.s(if off { b"display: screen off\n" } else { b"display: screen on\n" });
@@ -305,6 +311,43 @@ extern "C" fn panel(grants: u64) -> ! {
             l.flush();
         }
     }
+}
+
+/// The first frame out (the frame-start count, which the vsync thread wakes), or a quarter second without one (a frame starts on the panel's TE, which a panel asleep or off may not send).
+fn first_frame() {
+    let end = now() + freq() / 4;
+    while FRAME_STARTS.load(Ordering::Acquire) == 0 && now() < end {
+        ferros_sys::wait(&FRAME_STARTS, 0, end);
+    }
+}
+
+/// The panel's power mode (DCS get_power_mode, G#0A: bit 7 booster, 4 sleep out, 3 normal mode, 2 display on), read as op 10 reads it (under the test key), twice and the second kept: a read can return the previous read's answer (akita, 2026-11-10, every register in turn). None when the panel did not answer. The DSI lock held by the caller.
+fn power_mode(dsi: &ferros_dsi::Dsim<DsiGrant>) -> Option<u8> {
+    let mut pm = [0u8; 1];
+    let _ = dsi.dcs(&[0xF0, 0x5A, 0x5A]);
+    let _ = dsi.read(0x0A, &mut pm);
+    let got = dsi.read(0x0A, &mut pm).is_ok();
+    let _ = dsi.dcs(&[0xF0, 0xA5, 0xA5]);
+    got.then_some(pm[0])
+}
+
+/// The panel woken from its sleep in, as the power key wakes it: sleep out, its settling, on akita GPO_DC and its own, display on, the brightness; then the frame the layer holds presented again (the render thread's). The DSI lock held by the caller.
+fn panel_wake(dsi: &ferros_dsi::Dsim<DsiGrant>) {
+    let _ = dsi.dcs(&[0x11]);
+    // The panel's sleep-out settling time before display on (DCS, 120 ms): this thread sleeps, the frames go on.
+    ferros_sys::sleep_until(now() + freq() * 120 / 1000);
+    // akita: GPO_DC again, as Google sends it after every sleep out (`ak3b_init_cmds`, then 110 ms). The sleep drops it from FF to 7F (read back 2026-11-10, before and after a screen off and on), and the panel lights its picture bright at the top and black at the bottom, flickering at half the rate; these five packets sent by hand brought FF and the power mode G#9F back.
+    if ferros_sys::akita() {
+        for p in [&[0xF0, 0x5A, 0x5A][..], &[0xB0, 0x00, 0x1F, 0xCB], &[0xCB, 0xFF], &[0xF7, 0x0F], &[0xF0, 0xA5, 0xA5]] {
+            let _ = dsi.dcs(p);
+        }
+        ferros_sys::sleep_until(now() + freq() * 110 / 1000);
+    }
+    let _ = dsi.dcs(&[0x29]);
+    // The brightness again (preference 3), with TE2: the panel woke very dark (owner, 2026-11-01), its DBV/HBM sent only when the preference changed.
+    let (_, _, hbm, dbv) = brightness(ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS));
+    set_panel(dsi, hbm, dbv);
+    PANEL_REPRESENT.store(1, Ordering::Release);
 }
 
 /// Wait for a frame to start — the interrupt, or half a millisecond, whichever first (the count register stays the truth; the fallback keeps a missed interrupt from costing more than it used to).
@@ -6873,7 +6916,9 @@ fn server(grants: u64) -> ! {
     let mut next_flip = now() + freq() / 10;
     // In focus, when the clock is next drawn (10 Hz).
     let mut clock_slow_next = 0u64;
-    let mut screen_off = false;
+    // The screen as the kernel wants it (preference 2, the power key's), taken before the panel thread is spawned: that thread holds the panel to it from its start (a restarted server finds the panel as the last one left it), and this loop passes it each change after.
+    let mut screen_off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
+    PANEL_SCREEN.store(screen_off as u64, Ordering::Release);
     // A frame armed and not yet seen to start (Pipe::arm / settle).
     // The modeset re-sent the panel its PPS, raster and rate, and the panel drops what it was showing: black from here to the first client frame (464 to 1033 ms after the press, measured 2026-11-05). The layer is still on the boot ring's surface, so one frame now puts the ring back until the attest screen replaces it. Armed, not waited for (the frame-start count is not running yet; waiting cost a quarter second): the main loop's settle masks the trigger once the frame has started. A cold or jumped panel has shown nothing yet: the same frame is its first.
     let mut armed: Option<u32> = Some(pipe.arm(win));

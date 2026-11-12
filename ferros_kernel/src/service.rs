@@ -224,7 +224,8 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
 }
 
 /// A bridge `store` command the vault process answers (VAULT-OUT.md: the names it holds), through the kernel's own channel (process.rs `vault_call`), a transfer a call. Its PT reply waits until the last call is answered: the USB process polls for a reply that is not ready yet (ptlink.rs).
-#[cfg(not(ferros_production))]
+/// Also a kist offered to stow (PT `ferros.kist.offer`, `offer_command`): its parts go in as puts into `capsules.` by address, in a production build too, so only `Put` is ever made there.
+#[cfg_attr(ferros_production, allow(dead_code))]
 enum VaultJob {
     /// A value read whole: its full name, what has come so far.
     Get { full: alloc::string::String, got: alloc::vec::Vec<u8> },
@@ -236,7 +237,6 @@ enum VaultJob {
 }
 
 /// One transfer of the kernel's channel (process.rs STORE_MAX, the vault process's one-transfer bound).
-#[cfg(not(ferros_production))]
 const VAULT_PIECE: usize = crate::process::STORE_MAX;
 
 /// A bridge `store` command for the vault process: Some(Ok(the job, its first call made)) when the vault process serves and the name is one it holds (a scope's, not one the kernel keeps), or the listing; Some(Err(the PT reply)) when the call could not be made; None: the kernel's vault answers, as before.
@@ -287,8 +287,18 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
     Some(vault_job_call(&job, params).map(|_| job))
 }
 
+/// A part of a kist offered to stow (`ferros.kist.offer` Write: [capsule 32][offset u64 LE][more u8][bytes], checked by the caller): a put into the device's `capsules.` under the capsule's address, as the bridge's part form of `store` puts one, its first call made. Err(the PT reply) when the vault process is not serving or the call could not be made.
+fn offer_part(params: &[u8]) -> Result<VaultJob, alloc::vec::Vec<u8>> {
+    if !crate::process::vault_serving() {
+        let mut r = alloc::vec![4u8];
+        r.extend_from_slice(b"the vault process is not serving");
+        return Err(r);
+    }
+    let job = VaultJob::Put { full: alloc::string::String::from("capsules"), addr: Some(params[..32].try_into().unwrap()), from: 41, at: 0, base: u64::from_le_bytes(params[32..40].try_into().unwrap()), more: params[40] != 0 };
+    vault_job_call(&job, params).map(|()| job)
+}
+
 /// The job's next call to the vault process; Err(the PT reply) when it cannot be made.
-#[cfg(not(ferros_production))]
 fn vault_job_call(job: &VaultJob, params: &[u8]) -> Result<(), alloc::vec::Vec<u8>> {
     use crate::process::{vault_stamp, VOP_DELETE, VOP_GET, VOP_SET};
     let mut rest = alloc::vec::Vec::with_capacity(16 + VAULT_PIECE);
@@ -328,7 +338,6 @@ fn vault_job_call(job: &VaultJob, params: &[u8]) -> Result<(), alloc::vec::Vec<u
 }
 
 /// One step of a job: the answer to its last call, if it has come, then its next call. Some(the PT reply) when it is done. A get or a remove the vault process does not find goes to the kernel's vault, where a name not yet moved still is.
-#[cfg(not(ferros_production))]
 fn vault_job_step(job: &mut VaultJob, params: &[u8], store: &mut Option<ShimStore>) -> Option<alloc::vec::Vec<u8>> {
     use crate::process::{ERR, NOTHING};
     let (value, bytes) = match crate::process::vault_answer()? {
@@ -433,10 +442,11 @@ enum KistWhy {
     Install(crate::process::KistInstall),
 }
 
-/// What a kist job came to: a launch built, or an install's seal for the `sealed` list.
+/// What a kist job came to: a launch built, an install's seal for the `sealed` list, or a stow's native code taken unchecked on a development build (`KistInstall::native_ok`).
 enum KistDone {
     Launched,
     Sealed([u8; 32]),
+    Native,
 }
 
 use crate::process::KistFault;
@@ -567,6 +577,18 @@ fn kist_step(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
                 job.head.extend_from_slice(&bytes);
                 job.got += bytes.len();
                 if job.head.len() >= job.total.min(1 << 16) {
+                    // An install's native code is known from its first bytes: refused there (never installed from the network, SANDBOX.md), or for a stow on a development build taken unchecked (`native_ok`), with nothing more read and no arc asked for. A production build refuses it either way.
+                    if let KistWhy::Install(i) = &job.why {
+                        if !crate::process::kist_masked(&job.head, job.total) {
+                            if i.native_ok && !cfg!(ferros_production) {
+                                return Some(Ok(KistDone::Native));
+                            }
+                            crate::process::push_console(b"kist install: native code: a development build is not installed from the network, and a production build stows none\n");
+                            kist_tell(job, crate::process::INSTALL_REFUSED, crate::process::INSTALL_WHY_NATIVE);
+                            job.told = true;
+                            return Some(Err((why::CHECKS, "native code")));
+                        }
+                    }
                     match kist_arc(job) {
                         Ok(true) => {}
                         Ok(false) => {
@@ -1030,6 +1052,12 @@ fn torch_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![Serve(b"torch"), Hardware(b"hsi2c14"), Power(b"torch")]
 }
 
+/// The audio service's grants in its slot order (payloads/audio, docs/AUDIO.md): 1 serve audio, 2 the AoC's IPC block (`aoc-ipc`: its playback ring and its control queue), 3 the AoC's mailboxes (`aoc-mbox`), 4 the mailbox block f1's interrupt (`aoc-mbox-f1`, the playback period's clock), 5 the amplifiers' SPI port (`usi1-spi`), 6 gpio-gpn0 (the right amplifier's select), 7 the `amp` switch (both resets, the rail, the port's clock), 8 entropy (the streams' handles). Its own list, as the torch's: init's page is full, and the kernel starts it when a call on `audio` finds no server (process.rs `ON_DEMAND`). It and the `amp` development tool (payloads/amp) both drive the amplifiers: never both at once.
+fn audio_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
+    use crate::process::Grant::*;
+    alloc::vec![Serve(b"audio"), Dma(b"aoc-ipc"), Hardware(b"aoc-mbox"), Irq(b"aoc-mbox-f1"), Hardware(b"usi1-spi"), Hardware(b"gpio-gpn0"), Power(b"amp"), Entropy]
+}
+
 /// Each shell process's capabilities, as init hands them out (payloads/init: the slots of `home_grants`, 1-based), for restarting one from the vault without a reboot.
 fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'static>>> {
     if name == b"vault" {
@@ -1046,6 +1074,9 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
     }
     if name == b"torch" {
         return Some(torch_grants());
+    }
+    if name == b"audio" {
+        return Some(audio_grants());
     }
     let slots: &[usize] = match name {
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
@@ -1777,11 +1808,14 @@ pub fn run(mut b: Boot) -> ! {
     let mut pt_out_data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let mut proc_restore: Option<alloc::vec::Vec<u8>> = None;
     let mut proc_act = false;
-    // A bridge `store` command the vault process is answering (`VaultJob`), and the command it came in, kept for a put's value (ptlink takes no other until its reply is taken).
-    #[cfg(not(ferros_production))]
+    // A bridge `store` command the vault process is answering (`VaultJob`), or a part of a kist offered to stow, and the command it came in, kept for a put's value (ptlink takes no other until its reply is taken).
     let mut vault_job: Option<VaultJob> = None;
-    #[cfg(not(ferros_production))]
     let mut vault_cmd: Option<crate::ptlink::Submitted> = None;
+    // A kist offered to stow (`offer_command`): the capsule being carried in, the offset its next part starts at and whether its last part came; a part that came while a kist job held the kernel's channel, started once it is free; a host's read of the offer's state held until it changes or its lease ends (the capsule, the state it last saw, the deadline).
+    let mut offer_rx: Option<([u8; 32], u64, bool)> = None;
+    let mut offer_part_waiting = false;
+    let mut vault_for_offer = false;
+    let mut offer_hold: Option<([u8; 32], u8, u64)> = None;
     // A drop of the released person's domain sent to the vault process, its answer awaited (`RELEASE_DROPS`).
     let mut release_drop_sent = false;
     // A kist's capsule being read from the vault process for its launch (`KistJob`).
@@ -1798,6 +1832,8 @@ pub fn run(mut b: Boot) -> ! {
     let cap_mem = ferros_pt::command::dev_cap(ferros_pt::command::caps::MEM);
     let cap_display = ferros_pt::command::dev_cap(ferros_pt::command::caps::DISPLAY);
     let cap_store = ferros_pt::command::dev_cap(ferros_pt::command::caps::STORE);
+    // Not a development door (docs/USB.md "Offering a kist"): a production build answers it too.
+    let cap_offer = ferros_pt::command::dev_cap(ferros_pt::command::caps::OFFER);
     // RELOAD and RUN share STAGE; at most one of these is set, so a payload can never be jumped to as a kernel or vice versa.
     let mut reload_ok = false;
     let mut reload_size = 0usize;
@@ -1911,6 +1947,10 @@ pub fn run(mut b: Boot) -> ! {
         // The installer (payloads/kists), once each time a person is in: it serves the map's Kists page and fetches back the capsules a restored list names. Its grants are its own (`kists_grants`), init's page being full.
         let frees = crate::process::ARC_FREES.load(core::sync::atomic::Ordering::Acquire);
         if !person {
+            // The person left: an offer they had not answered is gone, never shown to whoever attests next.
+            if kists_started {
+                crate::process::offer_drop();
+            }
             kists_started = false;
             kists_refused_at = None;
         } else if !kists_started && kists_refused_at != Some(frees) {
@@ -1976,10 +2016,7 @@ pub fn run(mut b: Boot) -> ! {
         }
         // Released (a completed departure): restart, so the device comes back at the attest screen with nothing of the identity left.
         // First the person's domains in the vault process are dropped, a call a pass through the kernel's channel (none while a bridge command holds it); a drop that fails, or no vault to send it to, is logged and the restart goes ahead: the renewed device-only secret already makes those entries unopenable.
-        #[cfg(not(ferros_production))]
         let channel_free = vault_job.is_none() && kist_job.is_none();
-        #[cfg(ferros_production)]
-        let channel_free = kist_job.is_none();
         if channel_free && RELEASE_RESET.load(core::sync::atomic::Ordering::Acquire) {
             if release_drop_sent {
                 match crate::process::vault_answer() {
@@ -2026,13 +2063,47 @@ pub fn run(mut b: Boot) -> ! {
                 platform::reboot();
             }
         }
-        // A bridge `store` command the vault process is answering: its next step; its reply goes out below once the last call is answered.
-        #[cfg(not(ferros_production))]
+        // A part of a kist offered to stow that came while a kist job held the kernel's channel: its put started now that the channel is free (the part's command kept in `vault_cmd`); its reply waits for the put, as a store command's does.
+        if offer_part_waiting && kist_job.is_none() && vault_job.is_none() {
+            offer_part_waiting = false;
+            let params = vault_cmd.as_ref().and_then(|c| ferros_pt::command::parse(c.payload.bytes())).map(|c| c.params).unwrap_or(&[]);
+            match offer_part(params) {
+                Ok(job) => {
+                    vault_job = Some(job);
+                    vault_for_offer = true;
+                }
+                Err(resp) => {
+                    offer_rx = None;
+                    vault_cmd = None;
+                    queue_pt_response(&mut pt_out_data, &resp);
+                }
+            }
+        }
+        // A host's read of the offer's state, held until the installer tells another state or its lease ends (ferros_kist::offer::HOLD_SECONDS, inside the USB driver's 16 s): then answered, with the state as it stands.
+        let offer_waits = match offer_hold {
+            Some((capsule, seen, until)) => {
+                let s = crate::process::offer_state(&capsule);
+                if s[0] != seen || cntpct() >= until {
+                    queue_pt_response(&mut pt_out_data, &s);
+                    offer_hold = None;
+                    false
+                } else {
+                    true
+                }
+            }
+            None => false,
+        } || offer_part_waiting;
+        // A bridge `store` command, or a part of a kist offered to stow, the vault process is answering: its next step; its reply goes out below once the last call is answered.
         let vault_waits = match vault_job.as_mut() {
             Some(job) => {
                 let params = vault_cmd.as_ref().and_then(|c| ferros_pt::command::parse(c.payload.bytes())).map(|c| c.params).unwrap_or(&[]);
                 match vault_job_step(job, params, &mut store) {
                     Some(resp) => {
+                        // An offered part the vault did not keep: the host starts the capsule again from its first part.
+                        if resp.first() != Some(&0) && core::mem::take(&mut vault_for_offer) {
+                            offer_rx = None;
+                        }
+                        vault_for_offer = false;
                         queue_pt_response(&mut pt_out_data, &resp);
                         vault_job = None;
                         vault_cmd = None;
@@ -2042,14 +2113,9 @@ pub fn run(mut b: Boot) -> ! {
                 }
             }
             None => false,
-        };
-        #[cfg(ferros_production)]
-        let vault_waits = false;
-        // A kist launch init asked for (KISTS.md): started once the kernel's channel is free (no bridge store command, no release under way), then a read a pass until the capsule is in its arc (`kist_step`).
-        #[cfg(not(ferros_production))]
+        } || offer_waits;
+        // A kist launch init asked for (KISTS.md): started once the kernel's channel is free (no bridge store command or offered part, no release under way), then a read a pass until the capsule is in its arc (`kist_step`).
         let bridge_holds_channel = vault_job.is_some();
-        #[cfg(ferros_production)]
-        let bridge_holds_channel = false;
         if kist_job.is_none() && !bridge_holds_channel && !RELEASE_RESET.load(core::sync::atomic::Ordering::Acquire) {
             // A launch first (a person waiting at a circle), then an install (the installer waits on its word).
             let why = crate::process::kist_take().map(KistWhy::Launch).or_else(|| crate::process::install_take().map(KistWhy::Install));
@@ -2109,6 +2175,11 @@ pub fn run(mut b: Boot) -> ! {
                         }
                     }
                     (KistWhy::Install(_), Ok(KistDone::Launched)) => alloc::string::String::new(),
+                    // A stow's native code on a development build: nothing to check or seal (a launch runs it on a development build only, as the bridge's development door's).
+                    (KistWhy::Install(i), Ok(KistDone::Native)) => {
+                        crate::process::install_tell(i, crate::process::INSTALL_DONE, crate::process::INSTALL_NATIVE);
+                        alloc::format!("kist stow: native code, taken unchecked on this development build ({} bytes)\n", job.total)
+                    }
                     (KistWhy::Install(i), Err((code, e))) => {
                         // A refusal the checker or the seal told already; anything else (the vault, the arc pool) is told here, by the job's reason.
                         if !job.told {
@@ -2318,9 +2389,86 @@ pub fn run(mut b: Boot) -> ! {
             st.last_cmd = u32::from_le_bytes([cmd.cap[0], cmd.cap[1], cmd.cap[2], cmd.cap[3]]) as u64 | (cmd.op as u64) << 56;
             platform::crumb(0xD5 | (st.last_cmd & 0xFFFF_FFFF) << 8 | (cmd.op as u64) << 40);
             // Production builds (FERROS_PRODUCTION=1) close the development doors over USB, for the locked bootloader (BOOT.md): a cable must not be able to reload the kernel, run code, read or write memory or the vault, read the screen, spawn, or drive a diagnostic, since ABL checks only what it boots. Open: a reboot, and DIAG with no parameters (status, no secrets). The portal will grant the rest to the owner's identity (STATUS.md 7); until then they are closed outright.
-            let open = !cfg!(ferros_production) || (cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec) || (cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read && cmd.params.is_empty());
+            // And a kist offered to stow (`ferros.kist.offer`, docs/USB.md "Offering a kist"): the person checks it on the glass, so it is no door around them.
+            let open = !cfg!(ferros_production) || (cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec) || (cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read && cmd.params.is_empty()) || cmd.cap == cap_offer;
             if !open {
-                queue_pt_response(&mut pt_out_data, b"closed: a production build answers only a reboot and a plain DIAG over USB\n");
+                queue_pt_response(&mut pt_out_data, b"closed: a production build answers only a reboot, a plain DIAG and a kist offered to stow over USB\n");
+            } else if cmd.cap == cap_offer {
+                // A kist offered to stow (docs/KISTS.md "Stowing"): its parts kept in `capsules.`, then offered to the installer, then its state read by the host, held. Every answer but a state is [status][words]: 0 done, 1 nobody present, 2 another offer is waiting, 3 a part or an offer not as the protocol says, 4 no installer.
+                let say = |status: u8, words: &str| {
+                    let mut r = alloc::vec![status];
+                    r.extend_from_slice(words.as_bytes());
+                    r
+                };
+                let person = store.as_ref().is_some_and(|s| s.unlocked());
+                // WHY each length check: the parameters are the host's (external input).
+                let capsule: Option<[u8; 32]> = cmd.params.get(..32).map(|c| c.try_into().unwrap());
+                match (cmd.op, capsule) {
+                    (_, None) => queue_pt_response(&mut pt_out_data, &say(3, "the capsule's 32-byte address comes first")),
+                    // Its state, held until it changes or the lease ends (the top of the loop answers it).
+                    (ferros_pt::Op::Read, Some(c)) => {
+                        let seen = cmd.params.get(32).copied().unwrap_or(u8::MAX);
+                        let s = crate::process::offer_state(&c);
+                        if s[0] != seen || ferros_kist::offer::finished(s[0]) {
+                            queue_pt_response(&mut pt_out_data, &s);
+                        } else {
+                            offer_hold = Some((c, seen, cntpct() + ferros_kist::offer::HOLD_SECONDS * freq));
+                        }
+                    }
+                    _ if !person => queue_pt_response(&mut pt_out_data, &say(1, "nobody is present: attest on the device first")),
+                    _ if crate::process::offer_open() => queue_pt_response(&mut pt_out_data, &say(2, "another kist is offered and waiting on the person")),
+                    (ferros_pt::Op::Write, Some(c)) => {
+                        let (offset, more) = match (cmd.params.get(32..40), cmd.params.get(40)) {
+                            (Some(o), Some(&m)) if cmd.params.len() > 41 => (u64::from_le_bytes(o.try_into().unwrap()), m != 0),
+                            _ => {
+                                queue_pt_response(&mut pt_out_data, &say(3, "a part is [capsule 32][offset u64][more u8][bytes]"));
+                                continue;
+                            }
+                        };
+                        // In order, from the first part: a part at 0 starts the capsule afresh (a host starting again).
+                        let next = match offer_rx {
+                            Some((rc, n, false)) if rc == c => n,
+                            _ => 0,
+                        };
+                        if offset != 0 && offset != next {
+                            queue_pt_response(&mut pt_out_data, &say(3, "parts come in order, from the first"));
+                        } else {
+                            offer_rx = Some((c, offset + (cmd.params.len() - 41) as u64, !more));
+                            // The kernel's channel to the vault is one call at a time: a kist job reading a capsule holds it, so the part waits for it (its reply with it).
+                            if kist_job.is_some() {
+                                offer_part_waiting = true;
+                            } else {
+                                match offer_part(cmd.params) {
+                                    Ok(job) => {
+                                        vault_job = Some(job);
+                                        vault_for_offer = true;
+                                    }
+                                    Err(resp) => {
+                                        offer_rx = None;
+                                        queue_pt_response(&mut pt_out_data, &resp);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (ferros_pt::Op::Exec, Some(c)) => {
+                        let len = cmd.params.get(32..40).map(|l| u64::from_le_bytes(l.try_into().unwrap()));
+                        if len.is_none() || offer_rx != Some((c, len.unwrap(), true)) {
+                            queue_pt_response(&mut pt_out_data, &say(3, "not carried in whole: every part first, in order, the last with more 0"));
+                        } else if !crate::process::running(b"kists") {
+                            queue_pt_response(&mut pt_out_data, &say(4, "the installer is not running"));
+                        } else {
+                            offer_rx = None;
+                            match crate::process::offer_put(c, len.unwrap()) {
+                                Ok(()) => {
+                                    crate::flashlog::line(&alloc::format!("kist offered over USB to stow: A#{} bytes", len.unwrap()));
+                                    queue_pt_response(&mut pt_out_data, &[0]);
+                                }
+                                Err(e) => queue_pt_response(&mut pt_out_data, &say(2, e)),
+                            }
+                        }
+                    }
+                }
             } else if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
                 let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
                 // Development tools: not in a production build at all (FERROS_PRODUCTION=1, build.rs), which answers only the plain DIAG below and a reboot.
@@ -2938,8 +3086,11 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                if cmd.params == b"sched" {
-                    // `diag sched`: the kernel's scheduler trace (process.rs) — who called whom, who waited, for how long.
+                if cmd.params == b"sched" || cmd.params == b"sched reset" {
+                    // `diag sched`: the scheduler's counts (wake to run per kind, the lock's wait per core, register syscalls by path) and its trace (process.rs): who called whom, who waited, for how long. `diag "sched reset"` zeroes the counts first.
+                    if cmd.params == b"sched reset" {
+                        crate::process::sched_reset();
+                    }
                     crate::process::sched_report(&mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
@@ -4242,9 +4393,8 @@ pub fn run(mut b: Boot) -> ! {
                 leave(&b, EXIT_REBOOT, &st);
             }
         }
-        // A put the vault process takes over later passes reads its value from the command: it stays with the job.
-        #[cfg(not(ferros_production))]
-        if matches!(vault_job, Some(VaultJob::Put { .. })) && vault_cmd.is_none() {
+        // A put the vault process takes over later passes reads its value from the command: it stays with the job (and with an offered part waiting for the channel).
+        if (matches!(vault_job, Some(VaultJob::Put { .. })) || offer_part_waiting) && vault_cmd.is_none() {
             vault_cmd = Some(proc_cmd);
         }
     }

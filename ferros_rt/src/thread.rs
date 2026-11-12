@@ -6,7 +6,7 @@ use core::alloc::Layout;
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::heap::SpinLock;
+use crate::lock::Lock;
 use crate::sys::{self, ERR, nr, off};
 
 const RUNNING: u64 = 0;
@@ -36,7 +36,7 @@ unsafe impl Sync for Handle {}
 struct Head(*mut Block);
 unsafe impl Send for Head {}
 
-static REGISTRY: SpinLock<Head> = SpinLock::new(Head(core::ptr::null_mut()));
+static REGISTRY: Lock<Head> = Lock::new(Head(core::ptr::null_mut()));
 
 /// Start `entry(arg)` on a fresh stack of at least `stack_bytes`. Err when the heap or the kernel refuses.
 pub fn spawn(entry: extern "C" fn(u64), stack_bytes: usize, arg: u64) -> Result<Handle, ()> {

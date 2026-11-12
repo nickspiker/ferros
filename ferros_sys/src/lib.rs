@@ -61,6 +61,7 @@ pub mod nr {
     pub const BELL: u64 = 38;
     pub const NOT_STARTED: u64 = 39;
     pub const ARC: u64 = 40;
+    pub const OFFER: u64 = 41;
 }
 
 /// The caller's own arc, grown or shrunk on demand (kernel SYS_ARC, docs/ARCS.md step 2; owner, 2026-11-11: "why we cannot scale on demand, that was the whole point of ring memory"). No capability: a process reaches only its own arc, and only up to its ceiling (the heap its build declared, counted whole; fixed mode's size). A top is an arc offset: the arc's size, or exact mode's limit.
@@ -415,6 +416,125 @@ pub mod dnd {
     /// The identity service writes the person's choice to this device (the kernel takes it from the process named fgtw alone, as SYS_LANG op 2). True when taken and kept.
     pub fn set_identity(on: bool) -> bool {
         svc(nr::SET_PREF, 0, PREF_DND, on as u64, 0, 0) == 0
+    }
+}
+
+/// Preference 46: the sound's volume (docs/AUDIO.md "Volume"), a device setting set thru the Settings capability: 0 never set (`audio::DEFAULT_LEVEL`), 1-255 dimmest to loudest, each step a 16th of an octave of amplitude (255 is full scale, 239 half, 1 almost 16 octaves down).
+pub const PREF_VOLUME: u64 = 46;
+
+/// Sound out (docs/AUDIO.md): the system's audio service, which owns the AoC's playback entry point and the speaker amplifiers and mixes every stream into one. A kist reaches it thru the `audio` right (ferros_kist::RIGHTS), a send right on the `audio` endpoint; the service is started by the kernel at the first call (process.rs `ON_DEMAND`) and ends once every stream has closed and played out, so silence holds no arc and the amplifiers sit in reset.
+///
+/// One format for every stream, the one the AoC's entry point is set up for: 48 kHz, two channels interleaved (left, then right), signed 16-bit little-endian. A stream's ring holds `RING` frames; a write is answered once all its frames are in the ring, so a writer that has more to say waits there, clocked by the hardware (the AoC's playback interrupt frees a period at a time): the reply is the doorbell, no poll and no timer on either side.
+///
+/// The endpoint's calls, first byte the op, integers little-endian:
+/// - `OPEN` + class (`MEDIA` or `ALERT`) → [0][handle, 8 bytes][rate u32][period frames u16][ring frames u32], or [1] refused (no AoC yet, every stream taken, or the amplifiers would not start).
+/// - `WRITE` + handle + frames (at most `WRITE_MAX`, 4 bytes each) → [0][room u32, the frames the ring can take now] once every frame is in; [1] for a handle the service does not know (closed, or a service started since).
+/// - `CLOSE` + handle → [0]; what the ring holds still plays.
+/// - `GAIN` + handle + gain (u16, 32768 unity) → [0]: the stream's own level, under the device's volume.
+/// - `STATE` → [AoC online u8][playing u8][streams u8][0][periods played u64][underruns u32][interrupts u32][starved u32, the AoC's ring found empty]: for the console and the verification (docs/AUDIO.md).
+/// - `TONE` + level (u8, the volume's scale) + periods (u16): a 1 kHz sine of the service's own for that many periods, mixed like any stream: the first sound's safe test.
+/// - `SIGGEN` + wave type (u8) + period (u16) + amplitude (u32): the AoC's own signal generator on the speaker's entry point, no PCM at all (AUDIO.md "The AoC side, shortest"), for the bring-up; [0] sent, [1] refused.
+pub mod audio {
+    use super::{call, pref, ERR, PREF_VOLUME};
+
+    pub const OPEN: u8 = 0;
+    pub const WRITE: u8 = 1;
+    pub const CLOSE: u8 = 2;
+    pub const GAIN: u8 = 3;
+    pub const STATE: u8 = 4;
+    pub const TONE: u8 = 5;
+    pub const SIGGEN: u8 = 6;
+
+    /// Music, games, a call's voice: plays in every sound mode, at the device's volume.
+    pub const MEDIA: u8 = 0;
+    /// A notification or a ring: plays only in the sound mode `SOUND`, and not while do not disturb is on (preferences 39 and 40).
+    pub const ALERT: u8 = 1;
+
+    /// Frames a second, channels, and bytes a frame.
+    pub const RATE: u32 = 48_000;
+    pub const CHANNELS: usize = 2;
+    pub const FRAME_BYTES: usize = 4;
+    /// The service's period, the unit the hardware frees: 256 frames, 5.3 ms.
+    pub const PERIOD: usize = 1 << 8;
+    /// A stream's ring: four periods, 21.3 ms.
+    pub const RING: usize = PERIOD << 2;
+    /// The most frames one write carries: a call's message is at most 4096 bytes (the kernel's copy), less the op and the handle.
+    pub const WRITE_MAX: usize = (4096 - 9) / FRAME_BYTES;
+
+    /// The volume's level when the preference was never set: two octaves under full scale.
+    pub const DEFAULT_LEVEL: u8 = 255 - (2 << 4);
+
+    /// round(2^15 · 2^(-k/16)), k = 0..15: the fraction of an octave below full scale, for `gain_q15`.
+    const OCTAVE_16THS: [u32; 16] = [32768, 31379, 30048, 28774, 27554, 26386, 25268, 24196, 23170, 22188, 21247, 20347, 19484, 18658, 17867, 17109];
+
+    /// A level (1-255; 0 stands for `DEFAULT_LEVEL`) as a gain, 2^15 for full scale: (255 - level) 16ths of an octave down, the whole octaves a shift and the rest from the table.
+    pub fn gain_q15(level: u8) -> u32 {
+        let l = if level == 0 { DEFAULT_LEVEL } else { level };
+        let down = (255 - l) as u32;
+        OCTAVE_16THS[(down & 15) as usize] >> (down >> 4)
+    }
+
+    /// The device's volume as set (preference 46).
+    pub fn level() -> u8 {
+        match pref(PREF_VOLUME) {
+            0 => DEFAULT_LEVEL,
+            l => l,
+        }
+    }
+
+    /// An open stream: its handle, and the shape the service gave it.
+    pub struct Stream {
+        pub handle: [u8; 8],
+        pub rate: u32,
+        pub period: u16,
+        pub ring: u32,
+    }
+
+    /// Open a stream of `class` on the `audio` endpoint `cap`; None when refused.
+    pub fn open(cap: u64, class: u8) -> Option<Stream> {
+        let mut r = [0u8; 19];
+        let n = call(cap, &[OPEN, class], &mut r);
+        if n != 19 || r[0] != 0 {
+            return None;
+        }
+        let mut handle = [0u8; 8];
+        handle.copy_from_slice(&r[1..9]);
+        Some(Stream { handle, rate: u32::from_le_bytes([r[9], r[10], r[11], r[12]]), period: u16::from_le_bytes([r[13], r[14]]), ring: u32::from_le_bytes([r[15], r[16], r[17], r[18]]) })
+    }
+
+    impl Stream {
+        /// Frames out (left, right, left, right …; at most `WRITE_MAX` frames, so `2 * WRITE_MAX` samples): returns once all are in the ring, with the room left; None for a handle the service no longer knows (open again).
+        pub fn write(&self, cap: u64, samples: &[i16]) -> Option<u32> {
+            let mut m = [0u8; 4096];
+            m[0] = WRITE;
+            m[1..9].copy_from_slice(&self.handle);
+            let n = samples.len() & !1;
+            for (k, s) in samples[..n].iter().enumerate() {
+                m[9 + 2 * k..11 + 2 * k].copy_from_slice(&s.to_le_bytes());
+            }
+            let mut r = [0u8; 5];
+            let got = call(cap, &m[..9 + 2 * n], &mut r);
+            (got == 5 && r[0] == 0).then(|| u32::from_le_bytes([r[1], r[2], r[3], r[4]]))
+        }
+
+        /// The stream's own gain (32768 unity).
+        pub fn gain(&self, cap: u64, gain: u16) -> bool {
+            let mut m = [0u8; 11];
+            m[0] = GAIN;
+            m[1..9].copy_from_slice(&self.handle);
+            m[9..11].copy_from_slice(&gain.to_le_bytes());
+            let mut r = [0u8; 1];
+            call(cap, &m, &mut r) == 1 && r[0] == 0
+        }
+
+        /// Closed: what the ring holds still plays.
+        pub fn close(self, cap: u64) -> bool {
+            let mut m = [0u8; 9];
+            m[0] = CLOSE;
+            m[1..9].copy_from_slice(&self.handle);
+            let mut r = [0u8; 1];
+            call(cap, &m, &mut r) != ERR && r[0] == 0
+        }
     }
 }
 
@@ -1350,6 +1470,8 @@ pub mod install {
     pub const WHY_KEPT: u64 = 8;
     pub const WHY_READ: u64 = 9;
     pub const WHY_ROOM: u64 = 10;
+    /// DONE's value for a stow's check (`stow_check`) that found native code on a development build: taken unchecked and unsealed, as the bridge's development door took it (a launch runs native code on a development build only). A production build refuses it (`WHY_NATIVE`).
+    pub const NATIVE: u64 = 1;
     /// A word's stage and its value.
     pub fn split(word: u64) -> (u64, u64) {
         (word >> 56, word & ((1 << 56) - 1))
@@ -1366,6 +1488,45 @@ pub fn install_kist(grants: u64, install: u64, capsule: &[u8; 32], word: &core::
     }
     req[64..].copy_from_slice(&off(word as *const _ as *const u8).to_le_bytes());
     svc(nr::SPAWN, off(req.as_ptr()), req.len() as u64, 8, 0, 0)
+}
+
+/// `install_kist` for a kist offered to stow (docs/KISTS.md "Stowing"): the same check and seal, except that native code on a development build is taken unchecked (told DONE with `install::NATIVE`), as the bridge's development door took it; a production build refuses it as the directory's path does (`install::WHY_NATIVE`). The kernel sees native code in the capsule's first bytes and reads no further.
+pub fn stow_check(grants: u64, install: u64, capsule: &[u8; 32], word: &core::sync::atomic::AtomicU64) -> u64 {
+    let mut req = [0u8; 72];
+    req[..32].copy_from_slice(capsule);
+    let tok = (arc_base() + cap(grants, install)) as *const u8;
+    for i in 0..32 {
+        req[32 + i] = unsafe { core::ptr::read_volatile(tok.add(i)) };
+    }
+    req[64..].copy_from_slice(&off(word as *const _ as *const u8).to_le_bytes());
+    svc(nr::SPAWN, off(req.as_ptr()), req.len() as u64, 8 | 16, 0, 0)
+}
+
+/// The kist offered over USB to stow (kernel SYS_OFFER; docs/KISTS.md "Stowing", ferros_kist::offer), for the installer alone: it holds the Install right (`install`, the token's offset in the grants page, as `cap` gives it).
+pub mod offer {
+    use super::{nr, off, svc, ERR, NOTHING};
+    /// The offers' doorbell: the kernel writes its change count into `word` now and whenever a host offers a kist, waking whatever waits on it (`wait_world`). False without the Install right, or a kernel without it.
+    pub fn doorbell(install: u64, word: &core::sync::atomic::AtomicU64) -> bool {
+        svc(nr::OFFER, 0, install, off(word as *const _ as *const u8), 0, 0) == 0
+    }
+    /// The offer not yet ended, if one is: its capsule's address and length. The installer checks it from there (it is in `capsules.`); taking it again (a restarted installer) gives the same offer.
+    pub fn take(install: u64) -> Option<([u8; 32], u64)> {
+        let mut b = [0u8; 40];
+        let r = svc(nr::OFFER, 1, install, off(b.as_mut_ptr()), b.len() as u64, 0);
+        if r == ERR || r == NOTHING {
+            return None;
+        }
+        Some((b[..32].try_into().unwrap(), u64::from_le_bytes(b[32..].try_into().unwrap())))
+    }
+    /// The offer's state as the installer has it (ferros_kist::offer: CHECKING, ASKING, STOWED, REFUSED with its why, CANCELLED; flags bit 0 native), which the kernel answers the host's held read with. False when `capsule` is not the offer (another replaced it).
+    pub fn tell(install: u64, capsule: &[u8; 32], state: u8, why: u8, flags: u8) -> bool {
+        let mut b = [0u8; 35];
+        b[..32].copy_from_slice(capsule);
+        b[32] = state;
+        b[33] = why;
+        b[34] = flags;
+        svc(nr::OFFER, 2, install, off(b.as_ptr()), b.len() as u64, 0) == 0
+    }
 }
 
 /// End this process; its arc and capabilities cease to exist.
@@ -1411,6 +1572,11 @@ pub fn wait(word: &core::sync::atomic::AtomicU64, expected: u64, deadline: u64) 
 /// `wait` for something the world brings (traffic, credentials, a person): the process watchdog's clock is paused while it waits (`pet`). A wait on this process's own work or its own hardware is a plain `wait`, and counts.
 pub fn wait_world(word: &core::sync::atomic::AtomicU64, expected: u64, deadline: u64) -> u64 {
     svc(nr::WAIT, off(word as *const _ as *const u8), expected, deadline, 1, 0)
+}
+
+/// `wait_world` that a call to an endpoint this thread polls (a `recv` with the poll flag) also ends, with 3; a call already waiting returns 3 at once. A server that waits on a doorbell of its own (a word another of its threads rings) and on its callers in one wait: the IP stack's idle wait (kernel ≥ 2026-11-11; an older kernel ignores the flag and the call waits for the deadline).
+pub fn wait_world_or_call(word: &core::sync::atomic::AtomicU64, expected: u64, deadline: u64) -> u64 {
+    svc(nr::WAIT, off(word as *const _ as *const u8), expected, deadline, 3, 0)
 }
 
 /// Make up to `count` threads waiting on `word` runnable; returns how many.
@@ -1474,9 +1640,14 @@ pub fn input(start: u64, buf: &mut [u8]) -> usize {
     svc(nr::INPUT, start, off(buf.as_mut_ptr() as *const u8), buf.len() as u64, 0, 0) as usize
 }
 
-/// Sleep until the generic timer count reaches `deadline` (see `now`/`freq`): the process is parked, not scheduled, until then.
+/// Sleep until the generic timer count reaches `deadline` (see `now`/`freq`): the process is parked, not scheduled, until then. A call to an endpoint this thread polls ends it early (`sleep_until_or_call` says which).
 pub fn sleep_until(deadline: u64) {
     svc(nr::SLEEP, deadline, 0, 0, 0, 0);
+}
+
+/// `sleep_until`, saying why it ended: true when a call to an endpoint this thread polls ended it (or was already waiting), false at the deadline (kernel ≥ 2026-11-11; an older one always says false).
+pub fn sleep_until_or_call(deadline: u64) -> bool {
+    svc(nr::SLEEP, deadline, 0, 0, 0, 0) == 1
 }
 
 /// Say something on the console (grant slot 0).

@@ -171,12 +171,20 @@ EP0 vendor-request readouts (`G#5A` / `G#5B`) — they ride the control endpoint
 `dbg` answers "which PT stage did my command die at"; `dbg2` answers "what did the DWC3 hardware actually see".
 These found the ENDTRANSFER bug in one boot; reach for them before adding any kernel-side printf.
 
+### kist install (development fallback)
+```
+ferros-bridge kist install target/mahere.capsule.vsf
+```
+Kists are stowed with `ferros send <capsule>` (tools/ferros-send; KISTS.md "Stowing", USB.md "Offering a kist"): the device's installer checks the capsule and the person says Stow on its screen.
+`kist install` skips both, thru the development `store` capability, for unattended loops with nobody at the screen; a production build answers neither.
+Every script stows with `ferros send` (owner, 2026-11-11: "a proper checked path and start using it").
+
 ## Transport contract
 
 ferros-bridge speaks **Photon Transport (PT)** — it does not invent its own framing.
 It reuses PT layers L2–L4; see the PT stack docs for the full model.
 
-Two primitives carry every command:
+Two primitives carry every command, and both live in tools/ferros-link (with the link itself, `UsbLink`), the library ferros-send shares; the bridge keeps only its development vendor requests on EP0 (`dbg`, `dbg2`, the gate) in its own usb.rs:
 
 - **`pt_send` (host → device, blast mode):** send SPEC, wait for SPEC ACK (seq=MAX), then blast all DATA packets back-to-back with **A#1 ms pacing** between packets (no per-packet ACK — USB guarantees delivery), then wait for COMPLETE. COMPLETE carries the transfer's BLAKE3 so the host can confirm end-to-end integrity. COMPLETE timeout scales with size: ~A#32768 ms base + A#64 ms per packet.
 - **`pt_recv` (device → host, blast mode):** read SPEC, allocate, then receive the DATA blast silently. The **SPEC ACK is skipped** — the kernel auto-blasts via its idle-poll pump and an OUT ACK could deadlock against a busy ep2. Completion is detected by `all_received()` or a FIN packet; per-chunk BLAKE3 is verified on `finish()`.

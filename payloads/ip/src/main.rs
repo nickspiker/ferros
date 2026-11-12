@@ -131,6 +131,10 @@ struct Ip {
     txn: usize,
     /// The WiFi path's measures since the last connection report.
     path: Path,
+    /// The WiFi doorbell (`WIFI_RING`): in use (armed, the idle wait on it), its helper thread started, and a driver found without it (never armed again).
+    ring: bool,
+    ring_thread: bool,
+    ring_none: bool,
 }
 
 /// The WiFi path's measures between two connection reports (`report`), said after each on a line of their own (owner, 2026-11-11: measure the path before fixing it). Counter ticks where a time is kept.
@@ -150,6 +154,11 @@ struct Path {
     in_most: u32,
     frames_out: u32,
     refused: u32,
+    /// The doorbell (`WIFI_RING`): the rings taken, and the idle waits ended by a ring (or the word changed before the wait), by an application's call, by the timer.
+    rings: u32,
+    by_ring: u32,
+    by_call: u32,
+    by_timer: u32,
 }
 
 impl Path {
@@ -186,7 +195,19 @@ impl Path {
         ip.dec(self.frames_out as u64);
         ip.put(b" out (A#");
         ip.dec(self.refused as u64);
-        ip.put(b" refused)\n");
+        ip.put(b" refused)");
+        // The doorbell's own (`WIFI_RING`): its rings, and how the idle waits ended (a ring, an application's call, the timer).
+        if WIFI_RING {
+            ip.put(b"; doorbell A#");
+            ip.dec(self.rings as u64);
+            ip.put(b" rings, idle waits ended by a ring A#");
+            ip.dec(self.by_ring as u64);
+            ip.put(b", a call A#");
+            ip.dec(self.by_call as u64);
+            ip.put(b", the timer A#");
+            ip.dec(self.by_timer as u64);
+        }
+        ip.put(b"\n");
     }
 }
 
@@ -201,6 +222,39 @@ const EXCH_HEAD: usize = 5;
 const EXCH_REPLY: usize = 3;
 /// The exchanges' reply buffer (`wlan_batch`): a static, not the 64 KiB stack.
 static mut EXCH: [u8; EXCH_MAX] = [0; EXCH_MAX];
+
+/// The WiFi doorbell (`FERROS_WIFI_IRQ=1` builds, 2026-11-11; off, the stack asks the driver every idle millisecond as before): a second thread holds a call to the driver (`wlan` op 9) that the driver answers only once frames wait, and rings `RING`; the main thread's idle wait is on `RING`, ended also by an application's call (`wait_world_or_call`) and by its own next timer, so an idle stack stops asking the driver a thousand times a second and the driver can sleep until its chip rings (payloads/pcie1 `WIFI_IRQ`).
+const WIFI_RING: bool = option_env!("FERROS_WIFI_IRQ").is_some();
+/// The doorbell's word: 0 armed (the helper's call held at the driver, or about to be), 1 frames wait at the driver, 2 the driver gone (the call failed: the main thread re-arms it once `wifi_up` finds a driver again), 3 a driver without the doorbell (op 9 answered with nothing: never armed again).
+static RING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The helper's stack: it only calls and waits.
+static mut RING_STACK: [u8; 1 << 13] = [0; 1 << 13];
+/// The longest idle wait with the doorbell: 2^6 of the counter's ~1 ms (freq >> 10), when neither the cellular call (asked each idle millisecond, as before) nor a retransmit timer nor a held receive's deadline wants the stack sooner: its other timers count in seconds.
+const RING_IDLE_LOG2: u32 = 6;
+
+/// The doorbell's helper thread (`WIFI_RING`): the held call, its answer into `RING`, the main thread woken, then a wait until the main thread has taken the frames (`RING` back to 0) before asking again.
+extern "C" fn ring_thread(grants: u64) -> ! {
+    use core::sync::atomic::Ordering::{Acquire, Release};
+    let base = ferros_sys::arc_base();
+    let cap = grants + 0x204 + 32 * S_WLAN;
+    let q = [9u8];
+    let mut r = [0u8; 1];
+    loop {
+        let n = svc(CALL, cap, q.as_ptr() as u64 - base, 1, r.as_mut_ptr() as u64 - base, 1 | CALL_LIVE);
+        // A 0 in the answer: the driver let this ask go for a newer one (`pcie1` keeps one), so ask again.
+        let v = match n {
+            ERR => 2,
+            0 => 3,
+            _ if r[0] == 1 => 1,
+            _ => continue,
+        };
+        RING.store(v, Release);
+        ferros_sys::wake(&RING, 2);
+        while RING.load(Acquire) == v {
+            ferros_sys::wait_world(&RING, v, 0);
+        }
+    }
+}
 
 /// Held receives at once: sixteen, a reader on each of the connections, or eight UDP readers (as many as the ports kept for them) and eight connections.
 const HELDN: usize = 1 << 4;
@@ -625,6 +679,22 @@ impl Ip {
         n
     }
 
+    /// When the idle wait with the doorbell ends at the latest (`WIFI_RING`): the next idle millisecond (shifted by the screen-off backoff) while the cellular call is up, as it is asked each pass; else the earliest of a connection's retransmit timer, a held receive's deadline, and `RING_IDLE_LOG2` from now. A time already past ends the wait at once, and the pass handles it.
+    fn idle_until(&self, t0: u64) -> u64 {
+        if self.cell.flags & 1 != 0 {
+            return t0 + (self.freq / 1000 << self.backoff);
+        }
+        let mut t = t0 + ((self.freq >> 10) << RING_IDLE_LOG2);
+        // WHY the mins: the earliest of the deadlines, not a bound on anyone's value.
+        for c in self.tcb.iter().filter(|c| c.rto_t != 0) {
+            t = t.min(c.rto_t);
+        }
+        for h in self.held.iter().filter(|h| h.used) {
+            t = t.min(h.until);
+        }
+        t
+    }
+
     /// The frames from the WiFi driver, a batch a call, while it says more wait or ACKs wait to go (`EXCH_PASS` calls at most): each taken (`wlan_in`), then the ACKs the batch owes (`tcp_acks`), which go with the next exchange. Returns whether any frame came or went.
     fn wlan_batch(&mut self) -> bool {
         // SAFETY: EXCH is the exchanges' reply buffer, used here alone (a batch flushed mid-pass by `eth_send` takes its reply in a buffer of its own), from the one thread.
@@ -727,6 +797,19 @@ impl Ip {
         self.batch = n == EXCH_REPLY as u64;
         self.txn = EXCH_HEAD;
         self.put(if self.batch { b"WiFi driver answers, frames in batches\n".as_slice() } else { b"WiFi driver answers, one frame a call\n" });
+        // The doorbell armed (`WIFI_RING`): its helper started the first time, asked again after a driver that went away.
+        if WIFI_RING && self.batch && !self.ring_none {
+            if self.ring_thread {
+                RING.store(0, core::sync::atomic::Ordering::Release);
+                ferros_sys::wake(&RING, 2);
+            } else {
+                // SAFETY: the helper's stack, given to it alone, once.
+                let stack = unsafe { &mut *(&raw mut RING_STACK) };
+                self.ring_thread = ferros_sys::thread_spawn(ring_thread, stack, self.grants) != ERR;
+            }
+            self.ring = self.ring_thread;
+            self.put(if self.ring { b"WiFi doorbell armed: idle waits for frames, not the clock\n".as_slice() } else { b"WiFi doorbell: no thread, asking every idle millisecond\n" });
+        }
         self.dhcp_state = 1;
         self.dhcp_send(1);
         self.rs_n = 0;
@@ -744,6 +827,8 @@ impl Ip {
         self.nd_n = 0;
         // Frames batched for it go with it: nothing would send them, and a batch waiting keeps the loop from sleeping.
         self.txn = EXCH_HEAD;
+        // The doorbell's held call failed with it (the helper waits, `RING` 2, until `wifi_up` re-arms it).
+        self.ring = false;
         self.put(b"WiFi driver gone\n");
     }
 
@@ -2423,6 +2508,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         txb: unsafe { &mut *(&raw mut TXB) },
         txn: EXCH_HEAD,
         path: Path::default(),
+        ring: false,
+        ring_thread: false,
+        ring_none: false,
     };
     // Randomness: the DHCP transaction id and the IPv6 interface identifier (random per session).
     let mut r = [0u8; 16];
@@ -2469,9 +2557,24 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         let mut busy = false;
         let pass_t = now();
         ip.path.passes += 1;
-        // Frames from the WiFi driver: in batches, our own going with each call (`wlan_batch`), or from a driver without batches [2] → the oldest frame, or nothing.
+        // Frames from the WiFi driver: in batches, our own going with each call (`wlan_batch`), or from a driver without batches [2] → the oldest frame, or nothing. With the doorbell (`WIFI_RING`) only when it rang or frames wait to go, re-armed after the exchange: the driver answers a new ask at once while frames still wait (op 9 looks at its queue when asked), so nothing that came during the exchange is missed, and no empty exchange follows each ring.
         if ip.wifi && ip.batch {
-            busy |= ip.wlan_batch();
+            use core::sync::atomic::Ordering::{Acquire, Release};
+            let r = if ip.ring { RING.load(Acquire) } else { 1 };
+            if ip.ring && r >= 2 {
+                // The driver gone (its next exchange fails and `wifi_up` re-arms), or one without the doorbell: asked every pass again.
+                ip.ring = false;
+                ip.ring_none = r == 3;
+                ip.put(if r == 3 { b"WiFi driver has no doorbell: asking every idle millisecond\n".as_slice() } else { b"WiFi doorbell: the driver went away\n" });
+            }
+            if !ip.ring || r != 0 || ip.txn > EXCH_HEAD {
+                busy |= ip.wlan_batch();
+                if ip.ring && r == 1 {
+                    ip.path.rings += 1;
+                    RING.store(0, Release);
+                    ferros_sys::wake(&RING, 2);
+                }
+            }
         }
         for _ in 0..if ip.wifi && !ip.batch { FRAMES_PASS } else { 0 } {
             let req = [2u8];
@@ -2567,7 +2670,16 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             ip.backoff = 0;
         } else {
             let t0 = now();
-            ferros_sys::sleep_until(t0 + (ip.freq / 1000 << ip.backoff));
+            if ip.ring {
+                // The doorbell (`WIFI_RING`): the wait ends when it rings, when an application calls (`udp`, polled above), or at the stack's next timer (`idle_until`).
+                match ferros_sys::wait_world_or_call(&RING, 0, ip.idle_until(t0)) {
+                    0 | 1 => ip.path.by_ring += 1,
+                    3 => ip.path.by_call += 1,
+                    _ => ip.path.by_timer += 1,
+                }
+            } else {
+                ferros_sys::sleep_until(t0 + (ip.freq / 1000 << ip.backoff));
+            }
             ip.path.sleeps += 1;
             ip.path.slept_t += now().wrapping_sub(t0);
             ip.backoff = match (ip.dark, ip.backoff) {

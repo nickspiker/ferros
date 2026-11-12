@@ -67,4 +67,9 @@ impl Port {
         wr(self.usi_mode, (rd(self.usi_mode) & !7) | 2);
         ferros_spi::Spi { regs: Phys(self.base), mode: 0, fb: 0 }.init();
     }
+
+    /// The port's clock halved (the CMU divider's field holds the ratio less one): 12.288 MHz into the controller, about 3.07 MHz on the wire. The amplifiers' OTP is read at 4 MHz or less (cs35l41.h `CS35L41_SPI_MAX_FREQ_OTP`, cs35l41.c `cs35l41_otp_unpack`), and the audio service reads it at every start; their other traffic is a few hundred words, so the whole port runs slow rather than switching (docs/AUDIO.md).
+    pub fn halved(&self) {
+        wr(self.div, (rd(self.div) & !0xF) | 1);
+    }
 }

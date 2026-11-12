@@ -245,8 +245,9 @@ fn survey(rep: &mut Vec<u8>) -> bool {
     true
 }
 
-/// Stage 1: power the CP from off (modem_ctrl_s5100.c power_on_cp: clear boot_stage, AP_ACTIVE 1, DUMP_NOTI 0, zero the message words, then gpio_power_off_cp and gpio_power_offon_cp with their delays), then watch the CP's pins for a second.
-fn power_on(rep: &mut Vec<u8>) {
+/// Stage 1: power the CP from off (modem_ctrl_s5100.c power_on_cp: clear boot_stage, AP_ACTIVE 1, DUMP_NOTI 0, zero the message words, then gpio_power_off_cp and gpio_power_offon_cp with their delays), then watch the CP's pins: for 3 s when `watch` (stage 1 run alone, to see every change), else until PS_HOLD is up (the CP runs its ROM), 3 s at most.
+/// Linux waits for nothing here (power_on_cp returns 57 ms after it starts, then register_pcie sleeps its 200 ms, which `up` keeps): the full 3 s watch in every bring-up was 3 s of nothing (2026-11-11).
+fn power_on(rep: &mut Vec<u8>, watch: bool) {
     wr(BOOT_STAGE, 0);
     for p in [CP2AP_WRST_N, PS_HOLD, CP2AP_WAKEUP, PHONE_ACTIVE] {
         p.func(0);
@@ -285,6 +286,9 @@ fn power_on(rep: &mut Vec<u8>) {
         if s != last {
             line(rep, alloc::format!("+A#{} ms: PS_HOLD {} CP_WRST_N {} WAKEUP {} PHONE_ACTIVE {}\n", since_us(t0) / 1000, s & 1, (s >> 1) & 1, (s >> 2) & 1, (s >> 3) & 1));
             last = s;
+        }
+        if !watch && s & 1 != 0 {
+            break;
         }
         us(1000);
     }
@@ -616,7 +620,8 @@ pub fn stages(rep: &mut Vec<u8>, n: u8) {
     if !survey(rep) || n < 1 {
         return;
     }
-    power_on(rep);
+    UP_T0.store(now(), core::sync::atomic::Ordering::Relaxed);
+    power_on(rep, n == 1);
     if n < 2 {
         return;
     }
@@ -787,47 +792,86 @@ fn link_cycle(rep: &mut Vec<u8>) -> bool {
     true
 }
 
-/// Put one boot-channel frame in the TX ring: the 12-byte SIT header, the command word, and `body` (the rest of the payload). Then the head, the message mask and the doorbell.
-fn send_frame(seq: &mut u16, cmd: u16, body: &[u8], data: Option<&[u8]>) -> Result<(), alloc::string::String> {
-    let payload = 2 + body.len() + data.map(|d| d.len()).unwrap_or(0);
-    let total = 12 + payload;
-    // Every frame takes a multiple of 8 bytes in the ring, zero filled (cpif `exynos_calc_padding_size`: the capture's G#A321 is G#14 long and moves the head G#18).
-    let padded = (total + 7) & !7;
-    let head = rd(TXQ_HEAD);
+/// One boot-channel frame, assembled in ordinary memory as the 8-byte words it goes into the ring as: the 12-byte SIT header, the command word, `body`, the data, then zeros to a multiple of 8 bytes (every frame takes a multiple of 8 bytes in the ring: cpif `exynos_calc_padding_size`, the capture's G#A321 is G#14 long and moves the head G#18).
+/// Every boot-channel frame's header, command and body come to 24 bytes or fewer, and a data frame's to exactly 24, so a data frame's data starts on a word and is read from the partition straight into its place here.
+struct Frame {
+    w: Vec<u64>,
+    /// The frame's length in bytes, the zeros after it not counted (the header's length field).
+    len: usize,
+}
+
+impl Frame {
+    /// Room for a frame with up to `data_max` bytes of data after a body of up to 10 bytes.
+    fn new(data_max: usize) -> Self {
+        Frame { w: alloc::vec![0; (24 + data_max + 7) >> 3], len: 0 }
+    }
+    fn bytes(&mut self) -> &mut [u8] {
+        // SAFETY: the words' own memory seen as bytes: u8 needs no alignment and every bit pattern is a u8.
+        unsafe { core::slice::from_raw_parts_mut(self.w.as_mut_ptr() as *mut u8, self.w.len() << 3) }
+    }
+    /// The header (frame counter `seq`), the command and `body`, for a frame whose data after them is `data_len` bytes, and the zeros after it; the data's own place is `data`.
+    fn begin(&mut self, seq: u16, cmd: u16, body: &[u8], data_len: usize) {
+        let total = 14 + body.len() + data_len;
+        // The frame counter is a full u16 in bytes 2–3 (the capture runs past G#FF); the channel's own sequence is its low byte.
+        let hdr = [0xCD, 0xAB, seq as u8, (seq >> 8) as u8, 0x00, 0xC0, total as u8, (total >> 8) as u8, CH_BOOT, seq as u8, 0, 0];
+        let b = self.bytes();
+        b[..12].copy_from_slice(&hdr);
+        b[12..14].copy_from_slice(&cmd.to_le_bytes());
+        b[14..14 + body.len()].copy_from_slice(body);
+        b[total..(total + 7) & !7].fill(0);
+        self.len = total;
+    }
+    /// The place of the data after a body of `body_len` bytes.
+    fn data(&mut self, body_len: usize, n: usize) -> &mut [u8] {
+        &mut self.bytes()[14 + body_len..14 + body_len + n]
+    }
+}
+
+/// Copy frame `f` into the TX ring at `pos`, a word a store, wrapping at the ring's end; the position after it. Nothing is published: the CP reads only up to the head (`publish`), so a frame can be written past the head while the CP still takes the one before it.
+fn ring_put(pos: u32, f: &Frame) -> Result<u32, alloc::string::String> {
+    let padded = (f.len + 7) & !7;
     let tail = rd(TXQ_TAIL);
-    let free = (tail + TX_RING_LEN - head - 1) % TX_RING_LEN;
-    if head >= TX_RING_LEN || tail >= TX_RING_LEN || (free as usize) < padded {
-        return Err(alloc::format!("tx ring full or bad: head {head} tail {tail} need {padded}"));
+    // WHY: the tail is the CP's word in shared memory and the free space is computed from it; a cursor outside the ring, or a position off a word boundary (every frame is a multiple of 8 bytes from 0, so it is never off one unless something else wrote the cursor), would put the frame where the CP does not read it.
+    if pos >= TX_RING_LEN || tail >= TX_RING_LEN || pos & 7 != 0 {
+        return Err(alloc::format!("tx ring bad: head {pos} tail {tail}"));
     }
-    // The frame counter is a full u16 in bytes 2–3 (the capture runs past G#FF); the channel's own sequence is its low byte.
-    *seq = seq.wrapping_add(1);
-    let hdr = [0xCD, 0xAB, *seq as u8, (*seq >> 8) as u8, 0x00, 0xC0, total as u8, (total >> 8) as u8, CH_BOOT, *seq as u8, 0, 0];
-    let mut pos = head;
-    let mut put = |b: &[u8]| {
-        for &x in b {
-            wr8(TX_RING + pos as usize, x);
-            pos = (pos + 1) % TX_RING_LEN;
-        }
-    };
-    put(&hdr);
-    put(&cmd.to_le_bytes());
-    put(body);
-    if let Some(d) = data {
-        put(d);
+    let free = (tail + TX_RING_LEN - pos - 1) % TX_RING_LEN;
+    if (free as usize) < padded {
+        return Err(alloc::format!("tx ring full: head {pos} tail {tail} need {padded}"));
     }
-    put(&[0u8; 8][..padded - total]);
+    let words = &f.w[..padded >> 3];
+    // The words up to the ring's end, then the rest from its start (none when the frame does not reach the end): the split point, not a limit. The ring's length is a multiple of 8, so a frame wraps between two words.
+    let first = (((TX_RING_LEN - pos) >> 3) as usize).min(words.len());
+    crate::hw::win_write_words(TX_RING + pos as usize, &words[..first]);
+    crate::hw::win_write_words(TX_RING, &words[first..]);
+    Ok((pos + padded as u32) % TX_RING_LEN)
+}
+
+/// The head moved to `pos`: everything `ring_put` wrote before it is the CP's to take.
+fn publish(pos: u32) {
     unsafe { core::arch::asm!("dsb sy") };
     wr(TXQ_HEAD, pos);
     unsafe { core::arch::asm!("dsb sy") };
     // No mask and no doorbell: on the boot channel the CP polls the ring. In the whole Android capture the AP writes `ap2cp_msg` exactly once (zero, at `init_legacy_link`) and never again, and rings no doorbell per frame. Writing G#81 and ringing per frame got the first frame answered and every later one consumed in silence (2026-10-20).
+}
+
+/// One boot-channel frame with no data (a command, or MAIN's CRC), written and published.
+fn send_frame(seq: &mut u16, cmd: u16, body: &[u8]) -> Result<(), alloc::string::String> {
+    *seq = seq.wrapping_add(1);
+    let mut f = Frame::new(0);
+    f.begin(*seq, cmd, body, 0);
+    publish(ring_put(rd(TXQ_HEAD), &f)?);
     Ok(())
 }
+
+/// Between looks at the RX rings while a boot-channel answer is due, in µs.
+/// The CP signals each answer by MSI (Android takes it in its NAPI poll, link_device.c `bootdump_rx_work`), which this driver does not take yet (no interrupt grant; the PCIe ch0 MSI lines are SPI 416-420, zuma.h, `separated-msi`), so it looks: a look is two reads of the IPC page, and at 4 µs an answer is seen within 4 µs of its coming. At the 200 µs this was, each of MAIN's 1998 frames lost 100 µs on average.
+const ACK_SPIN_US: u64 = 1 << 2;
 
 /// Wait for a frame on the boot channel and return its command word. Frames are consumed from the RX ring whatever they are.
 fn recv_frame(ms_wait: u64) -> Result<u16, alloc::string::String> {
     let t0 = now();
     loop {
-        
         for (name, base, len_max, headr, tailr) in [("raw", RX_RING, RX_RING_LEN, RXQ_HEAD, RXQ_TAIL), ("fmt", FMT_RX_RING, FMT_RX_RING_LEN, FMT_RXQ_HEAD, FMT_RXQ_TAIL)] {
             let head = rd(headr);
             let mut tail = rd(tailr);
@@ -845,30 +889,19 @@ fn recv_frame(ms_wait: u64) -> Result<u16, alloc::string::String> {
             let cmd = at(12) as u16 | (at(13) as u16) << 8;
             tail = (tail + ((flen.max(12) + 7) & !7)) % len_max;
             wr(tailr, tail);
-            // The root complex's MSI status is write-1-to-clear (DBI G#830): left set, the CP's next interrupt is coalesced into the one already pending.
-            let msi = rd(DBI + 0x830);
-            if msi != 0 {
-                wr(DBI + 0x830, msi);
-            }
-            crate::hw::log(&alloc::format!("modem rx {name}: G#{cmd:04X} len {flen}, msi G#{msi:X}"));
+            // No line per frame and no MSI-status clear here (a register write is a syscall, and 2000 console lines a boot): the section's line says what its frames cost, and the MSI status is cleared by the handshake and every service pass after.
             return Ok(cmd);
         }
         if since_us(t0) > ms_wait * 1000 {
-            return Err(alloc::format!("no reply in A#{ms_wait} ms (raw head {} tail {}, fmt head {} tail {}, cp2ap_msg G#{:X})", rd(RXQ_HEAD), rd(RXQ_TAIL), rd(FMT_RXQ_HEAD), rd(FMT_RXQ_TAIL), rd(IPC + 0x804)));
+            return Err(alloc::format!("no reply in A#{ms_wait} ms (tx head {} tail {}, raw rx head {} tail {}, fmt rx head {} tail {}, cp2ap_msg G#{:X})", rd(TXQ_HEAD), rd(TXQ_TAIL), rd(RXQ_HEAD), rd(RXQ_TAIL), rd(FMT_RXQ_HEAD), rd(FMT_RXQ_TAIL), rd(IPC + 0x804)));
         }
-        us(200);
+        us(ACK_SPIN_US);
     }
 }
 
 /// One command and its answer: the CP answers G#Axxx with the same number in G#Cxxx.
 fn command(seq: &mut u16, cmd: u16, body: &[u8], ms_wait: u64) -> Result<(), alloc::string::String> {
-    send_frame(seq, cmd, body, None)?;
-    // Whether the CP reads what we put in the ring at all: it consumes at the tx tail.
-    let t0 = now();
-    while since_us(t0) < 500_000 && rd(TXQ_TAIL) != rd(TXQ_HEAD) {
-        us(500);
-    }
-    crate::hw::log(&alloc::format!("modem tx G#{cmd:04X}: tx head {} tail {} after A#{} us, cp2ap_msg G#{:X}", rd(TXQ_HEAD), rd(TXQ_TAIL), since_us(t0), rd(IPC + 0x804)));
+    send_frame(seq, cmd, body)?;
     let got = recv_frame(ms_wait)?;
     let want = (cmd & 0x0FFF) | 0xC000;
     if got != want {
@@ -877,40 +910,77 @@ fn command(seq: &mut u16, cmd: u16, body: &[u8], ms_wait: u64) -> Result<(), all
     Ok(())
 }
 
-/// Send one section over the boot channel: begin (G#A1n0), the data frames (G#A1nB, each acked), end (G#A1nD). `read` fills the chunk at an offset.
+/// Where a section's time went, in timer ticks: reading its bytes from the partition, writing its frames into the ring, and waiting for the CP's answers. The first two run while the CP takes the frame before (`send_data`), so the wait is what is left of the CP's turn after them: a section whose wait is near zero is the AP's to speed up, one whose wait is most of it is the CP's.
+#[derive(Default)]
+struct Spent {
+    read: u64,
+    copy: u64,
+    wait: u64,
+}
+
+/// Send one section over the boot channel: begin (G#A1n0), the data frames (G#A1nB, each acked), end (G#A1nD), and one line of where its time went. `read` fills the data at an offset.
 fn send_section<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(rep: &mut Vec<u8>, seq: &mut u16, id: u32, size: u32, mut read: F) -> Result<(), alloc::string::String> {
     let n = ((id & 0xF) << 4) as u16;
     let t0 = now();
+    let mut s = Spent::default();
     command(seq, 0xA100 | n, &[0, 0], 2000)?;
-    let frames = send_data(seq, id, size, &mut read)?;
+    let frames = send_data(seq, id, size, &mut read, &mut s)?;
     command(seq, 0xA10D | n, &[0, 0], 2000)?;
-    line(rep, alloc::format!("section A#{id}: G#{size:X} bytes in A#{frames} frames, A#{} ms\n", since_us(t0) / 1000));
+    // Never 0 µs: two of the CP's answers lie inside it.
+    let us_all = since_us(t0);
+    let ms = |t: u64| t * 1000 / crate::hw::freq();
+    line(rep, alloc::format!("section A#{id}: G#{size:X} bytes in A#{frames} frames, A#{} ms (reading A#{} ms, into the ring A#{} ms, waiting for the CP A#{} ms), A#{} MB/s\n", us_all / 1000, ms(s.read), ms(s.copy), ms(s.wait), size as u64 / us_all));
     Ok(())
 }
 
-/// A stage's data frames (G#A1nB {u16 chunk + 8, u32 total, u32 offset, data}), each acked by G#C1nB; how many.
-fn send_data<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(seq: &mut u16, id: u32, size: u32, read: &mut F) -> Result<u32, alloc::string::String> {
-    let n = ((id & 0xF) << 4) as u16;
-    let mut buf = alloc::vec![0u8; CHUNK];
+/// A section's data frames (G#A1nB {u16 chunk + 8, u32 total, u32 offset, data}), each acked by G#C1nB; how many.
+/// Stop and wait, as cbd runs it (`std_udl_req_resp`: one frame out, then its answer), but the AP's own work for a frame runs while the CP takes the one before: frame k+1 is read from the partition and written into the ring past the head right after frame k is published, and is published the moment k's answer comes. A frame then costs the longer of the CP's turn and the AP's, not their sum.
+fn send_data<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(seq: &mut u16, id: u32, size: u32, read: &mut F, s: &mut Spent) -> Result<u32, alloc::string::String> {
+    let ack = 0xC10B | ((id & 0xF) << 4) as u16;
+    if size == 0 {
+        return Ok(0);
+    }
+    let mut f = Frame::new(CHUNK);
+    let mut next = stage_data(&mut f, seq, id, size, 0, rd(TXQ_HEAD), read, s)?;
     let mut off = 0u32;
     let mut frames = 0u32;
-    while off < size {
-        
-        let want = (size - off).min(CHUNK as u32) as usize;
-        read(off as u64, &mut buf[..want])?;
-        let mut body = alloc::vec::Vec::with_capacity(10);
-        body.extend_from_slice(&((want + 8) as u16).to_le_bytes());
-        body.extend_from_slice(&size.to_le_bytes());
-        body.extend_from_slice(&off.to_le_bytes());
-        send_frame(seq, 0xA10B | n, &body, Some(&buf[..want]))?;
-        let got = recv_frame(4000)?;
-        if got != (0xC10B | n) {
-            return Err(alloc::format!("section A#{id} at G#{off:X}: expected G#{:04X}, got G#{got:04X}", 0xC10B | n));
-        }
-        off += want as u32;
+    loop {
+        let (end, want) = next;
+        publish(end);
+        let at = off;
+        off += want;
         frames += 1;
+        // The next frame, beside the CP's turn with this one.
+        let staged = if off < size { Some(stage_data(&mut f, seq, id, size, off, end, read, s)?) } else { None };
+        let t = now();
+        let got = recv_frame(4000)?;
+        s.wait += now() - t;
+        if got != ack {
+            return Err(alloc::format!("section A#{id} at G#{at:X}: expected G#{ack:04X}, got G#{got:04X}"));
+        }
+        match staged {
+            Some(x) => next = x,
+            None => return Ok(frames),
+        }
     }
-    Ok(frames)
+}
+
+/// The section's next data frame (counter `seq` + 1) from byte `off`: its data read from the partition straight into its place in `f`, then the frame written into the ring at `pos`, not published. The ring position after it and the data bytes it carries.
+fn stage_data<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(f: &mut Frame, seq: &mut u16, id: u32, size: u32, off: u32, pos: u32, read: &mut F, s: &mut Spent) -> Result<(u32, u32), alloc::string::String> {
+    let want = (size - off).min(CHUNK as u32);
+    let mut body = [0u8; 10];
+    body[..2].copy_from_slice(&((want + 8) as u16).to_le_bytes());
+    body[2..6].copy_from_slice(&size.to_le_bytes());
+    body[6..].copy_from_slice(&off.to_le_bytes());
+    *seq = seq.wrapping_add(1);
+    f.begin(*seq, 0xA10B | ((id & 0xF) << 4) as u16, &body, want as usize);
+    let t = now();
+    read(off as u64, f.data(body.len(), want as usize))?;
+    let t1 = now();
+    let end = ring_put(pos, f)?;
+    s.read += t1 - t;
+    s.copy += now() - t1;
+    Ok((end, want))
 }
 
 /// Stage 7: the boot-channel download. MAIN, VSS and APM come out of `modem.bin`, the three NV sections out of the per-unit files on f2fs (efs, modem_userdata); START is not sent.
@@ -939,6 +1009,7 @@ fn download(rep: &mut Vec<u8>, seq_out: &mut Option<u16>) {
     }
     // The daemon's first boot-channel write comes well after the link acknowledgement; give the CP's bootloader the same breathing room.
     ms(500);
+    let t_dl = now();
     let mut seq = 0u16;
     let mut step = |rep: &mut Vec<u8>, what: &str, r: Result<(), alloc::string::String>| -> bool {
         match r {
@@ -958,7 +1029,7 @@ fn download(rep: &mut Vec<u8>, seq_out: &mut Option<u16>) {
     match send_data(&mut seq, 1, toc_len as u32, &mut |off: u64, out: &mut [u8]| {
         out.copy_from_slice(&toc_bytes[off as usize..off as usize + out.len()]);
         Ok(())
-    }) {
+    }, &mut Spent::default()) {
         Ok(f) => line(rep, alloc::format!("TOC sent in A#{f} frame, acked (G#C11B)\n")),
         Err(e) => return line(rep, alloc::format!("TOC data: {e}\n")),
     }
@@ -973,15 +1044,12 @@ fn download(rep: &mut Vec<u8>, seq_out: &mut Option<u16>) {
         };
         let base = s.offset as u64;
         let r = send_section(rep, &mut seq, s.id, s.size, |off, out| {
-            // The section starts mid-block: read the whole blocks around the wanted range and copy the middle out.
-            let want = out.len();
-            let start = base + off;
-            let lo = (start & !4095) as u64;
-            let span = ((start - lo) as usize + want + 4095) & !4095;
-            let mut tmp = alloc::vec![0u8; span];
-            m.read(&ino, lo, &mut tmp).map_err(|e| alloc::format!("{e}"))?;
-            out.copy_from_slice(&tmp[(start - lo) as usize..(start - lo) as usize + want]);
-            Ok(())
+            // Straight into the frame: the kernel's partition read starts at any offset (partfs.rs `part_call` reads from the block holding it), so a section that starts mid-block needs no bounce here. One call, one UFS command, for a frame's 48 KiB.
+            // A short read is a modem.bin cut off inside a section the TOC says is whole: fail loud rather than send the CP stale bytes.
+            match m.read(&ino, base + off, out)? {
+                n if n == out.len() => Ok(()),
+                n => Err(alloc::format!("{MODEM_BIN}: A#{n} of A#{} bytes at G#{:X}", out.len(), base + off)),
+            }
         });
         if !step(rep, name, r) {
             return;
@@ -992,7 +1060,9 @@ fn download(rep: &mut Vec<u8>, seq_out: &mut Option<u16>) {
             b.extend_from_slice(&0u16.to_le_bytes());
             b.extend_from_slice(&s.crc.to_le_bytes());
             // Its answer is G#C3n0, not the G#C3n1 the generic Axxx → Cxxx rule gives (cbd waits for C320 after A321; 2026-10-24 night it came).
-            send_frame(&mut seq, 0xA321, &b, None).ok();
+            if let Err(e) = send_frame(&mut seq, 0xA321, &b) {
+                return line(rep, alloc::format!("MAIN CRC: {e}\n"));
+            }
             match recv_frame(4000) {
                 Ok(0xC320) => line(rep, alloc::format!("MAIN CRC accepted (G#C320)\n")),
                 Ok(c) => return line(rep, alloc::format!("MAIN CRC: got G#{c:04X}, expected G#C320\n")),
@@ -1012,7 +1082,7 @@ fn download(rep: &mut Vec<u8>, seq_out: &mut Option<u16>) {
     }
     // Stage 7 stops here; stage 8 sends START (G#A400, the owner's go 2026-10-26: data only) from the frame counter left here.
     *seq_out = Some(seq);
-    line(rep, alloc::format!("MAIN, VSS, APM and the three NV sections loaded\n"));
+    line(rep, alloc::format!("MAIN, VSS, APM and the three NV sections loaded in A#{} ms (TOC to the last NV answer)\n", since_us(t_dl) / 1000));
     line(rep, alloc::format!("cp2ap_msg G#{:X}, cp2ap_status G#{:X}, boot_stage G#{:X}\n", rd(IPC + 0x804), rd(IPC + 0x80C), rd(BOOT_STAGE)));
 }
 
@@ -2865,7 +2935,7 @@ impl Online {
                 let k = (ch - CH_FMT0) as usize;
                 if self.reg_last[k] != Some(st) {
                     self.reg_last[k] = Some(st);
-                    line(rep, alloc::format!("t={} ms: ch A#{ch} PS registration now {}\n", since_us(t0) / 1000, hexs(&|i| st[i as usize], 4)));
+                    line(rep, alloc::format!("t={} ms: ch A#{ch} PS registration now {} (A#{} ms from power-on)\n", since_us(t0) / 1000, hexs(&|i| st[i as usize], 4), since_up_ms()));
                     self.publish_status();
                 }
             }
@@ -2911,7 +2981,7 @@ impl Online {
                         c.v6[i] = m(0x15 + i as u32);
                         c.dns6[i] = m(0x2A + i as u32);
                     }
-                    line(rep, alloc::format!("t={} ms: data call up on rmnet ch A#{}, MTU A#{}\n", since_us(t0) / 1000, CH_PDP_0 + c.cid - 1, c.mtu));
+                    line(rep, alloc::format!("t={} ms: data call up on rmnet ch A#{}, MTU A#{} (A#{} ms from power-on)\n", since_us(t0) / 1000, CH_PDP_0 + c.cid - 1, c.mtu, since_up_ms()));
                     self.call = Some(c);
                     self.publish_status();
                 } else {
@@ -3119,25 +3189,59 @@ pub fn up(rep: &mut Vec<u8>) {
     if !survey(rep) {
         return;
     }
-    power_on(rep);
-    ms(200);
-    phy(rep);
-    if !link(rep) || !endpoint(rep) {
-        return;
+    let t0 = now();
+    UP_T0.store(t0, core::sync::atomic::Ordering::Relaxed);
+    // Each phase's end in ms from here, one line at the end however far it got: where a bring-up's time goes (owner, 2026-11-11: "20 seconds?").
+    let mut marks: Vec<(&'static str, u64)> = Vec::new();
+    let ok = up_phases(rep, &mut marks);
+    let mut s = alloc::string::String::from("bring-up (ms from power-on):");
+    for (k, (what, t)) in marks.iter().enumerate() {
+        s.push_str(&alloc::format!("{} {what} A#{}", if k == 0 { "" } else { "," }, (t - t0) * 1000 / crate::hw::freq()));
     }
-    rom_boot(rep);
-    if rd(BOOT_STAGE) != 0x3FFF || !link_cycle(rep) {
-        return;
-    }
-    let mut seq = None;
-    download(rep, &mut seq);
-    let Some(s) = seq else { return };
-    if !start_and_handshake(rep, s, true, SERVICE) {
+    line(rep, alloc::format!("{s}\n"));
+    if !ok {
         return;
     }
     let o = Online::new(now(), SERVICE);
     crate::hw::locked(|| unsafe { *(&raw mut ONLINE) = Some(o) });
     line(rep, alloc::format!("modem up: the service registers and brings up the internet call; `rmnet` serves its packets\n"));
+}
+
+/// When the last bring-up began (`up`), for the service's lines that close it: the registration and the data call (`since_up_ms`).
+static UP_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds since the last bring-up began.
+fn since_up_ms() -> u64 {
+    since_us(UP_T0.load(core::sync::atomic::Ordering::Relaxed)) / 1000
+}
+
+/// `up`'s phases from power-on to the handshake, each one's end marked as it ends; whether all of them went thru.
+fn up_phases(rep: &mut Vec<u8>, marks: &mut Vec<(&'static str, u64)>) -> bool {
+    power_on(rep, false);
+    ms(200);
+    phy(rep);
+    if !link(rep) || !endpoint(rep) {
+        return false;
+    }
+    marks.push(("link up", now()));
+    rom_boot(rep);
+    if rd(BOOT_STAGE) != 0x3FFF {
+        return false;
+    }
+    marks.push(("CP ROM done", now()));
+    if !link_cycle(rep) {
+        return false;
+    }
+    marks.push(("link cycled", now()));
+    let mut seq = None;
+    download(rep, &mut seq);
+    let Some(s) = seq else { return false };
+    marks.push(("firmware and NV loaded", now()));
+    if !start_and_handshake(rep, s, true, SERVICE) {
+        return false;
+    }
+    marks.push(("INIT_END", now()));
+    true
 }
 
 /// Whether the service is running (a bring-up got through the handshake).

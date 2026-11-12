@@ -545,3 +545,28 @@ The driver now does the same in `Online::step`:
 Measured afterwards: 209 of 210 cellular fetches good, at a median of 1.1 s and at most 2.1 s, with no stalls. The one other run completed with a different page from the server. That run saw 298 link acks and 294 suspends, and no faults.
 
 Two earlier half-steps are also kept, since both copy Android: SEND_DATA after taking downlink, and the link ack on every rise.
+
+## 2026-11-11: the bring-up at the CP's pace, not the AP's
+
+On the Pro the boot channel took MAIN (G#5DA_0C00 bytes, 1998 frames) in 15,445 ms, about 6 MB/s, and the whole bring-up to INIT_END about 21 s.
+Android does the same download in under 1.5 s: in the Linux boot log the link comes back from the cycle at 6.927 s, and cbd's IOCTL_COMPLETE_NORMAL_BOOTUP (sent after START) comes at 8.442 s, so TOC, MAIN, VSS, APM, the three NV sections and START all fit in 1.515 s, at least 65 MB/s.
+The CP's own turn per 48 KiB frame is therefore under about 0.7 ms, and the rest of ferros's 7.7 ms a frame was the AP's.
+
+Where the 7.7 ms went, derived from the code and the earlier measurements:
+- **The ring copy, about 5 ms.** Every byte went into the TX ring as its own store, and the modem's windows are Device-nGnRnE (cachemap.rs `device_el0`): no store gathers with another, each waits for its write response, and each also looked its window up and took a `%` of the ring's length. 49,152 stores at about 110 ns.
+- **The read, about 1.5 ms.** partfs read ext4 a 4 KiB block a UFS command (about 117 µs each, the "30 ms per MiB" noted above): 13 commands a frame, into a fresh bounce the driver then copied.
+- **The wait, up to 0.2 ms more than the CP needed.** The answer was looked for every 200 µs, and each answer wrote a console line and cleared the MSI status (two syscalls).
+- None of it overlapped: read, copy, publish, wait, one after the other.
+
+Besides the download, `power_on` watched the CP's pins for a fixed 3 s in every bring-up (a stage-1 diagnostic left in the service path), where Linux waits for nothing (power_on_cp returns in 57 ms; register_pcie's 200 ms sleep follows, and ferros keeps it).
+
+What changed:
+- **Words, not bytes.** A frame is assembled in ordinary memory as 8-byte words (the header, command and body of a data frame are exactly 24 bytes, so its data lands on a word) and goes into the ring a word a store (hw.rs `win_write_words`): an eighth of the bus transactions.
+- **Pipelined, still stop-and-wait.** Frame k+1 is read and written into the ring past the head right after frame k is published, and published the moment k's answer comes; the CP reads only up to the head, so it sees one frame at a time as cbd sends them. A frame costs the longer of the CP's turn and the AP's, not their sum.
+- **One read a frame, straight into the frame.** The kernel's partition read already starts at any offset, so the driver's block-aligned bounce is gone; and partfs reads an ext4 file in UFS runs (up to 1 MiB a command thru the vault's run bounce, `process::ufs_read_run`), with 1 MiB a call once runs are on.
+- **Answers seen within 4 µs**, no console line and no syscall per frame; one line per section instead: frames, ms, and the split into reading, copying into the ring and waiting for the CP, then MB/s. A section whose wait is most of its time is at the CP's pace; one whose copy is most of it wants the ring mapped Normal non-cacheable (Android maps IPC cached with IOCC, the packet regions write-combine: shm_ipc.c `cp_shmem_get_nc_region`).
+- **No fixed 3 s after power-on:** the watch ends when PS_HOLD rises (stage 1 alone still watches 3 s).
+- **A timeline line at the end of every bring-up** (ms from power-on to link up, CP ROM done, link cycled, firmware and NV loaded, INIT_END), and the registration and data-call lines carry their ms from power-on too.
+
+Expected, not yet measured: MAIN in about 1.5-2 s (1998 frames at the longer of the CP's ≤ 0.7 ms and the AP's ~0.2 ms read plus ~0.7 ms of word stores), the download about 2.5 s with its 500 ms opening pause, INIT_END about 3.5 s from power-on instead of about 21.
+After INIT_END the service's RIL steps run on fixed times (radio on at 3 s, UICC 6.2, profiles 6.5, allowed networks 6.8, the radio cycle at 9 and 9.5 s), so registration lands about 10-11 s after INIT_END and the data call about 5 s after that (the CP and Verizon's PDN setup). The fixed times are the next thing to make event-driven, once a console log shows when the manifest handshake and the first registration actually come.

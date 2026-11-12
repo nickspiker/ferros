@@ -2,9 +2,9 @@
 //
 // main.rs ── CLI entry point, PT send/recv, command dispatch Commands: status — USB VID/PID probe diag — boot log via DIAG cap read <addr> [len] — MMIO via MEM cap log — stream bulk IN echo/send — PT test transfers reboot [fastboot] — REBOOT cap reload <kernel> — hot-reload via RELOAD cap install <signed> — UFS + stem via INSTALL cap beam <ring> — pull ring blocks via BEAM cap terminal — interactive PT session. See BRIDGE.md for full reference. (ping is in usage() but unwired.)
 //
-//   pt_send(link, sid, data) — blast DATA packets with 1ms pacing pt_recv(link, sid) → Vec<u8> — receive DATA blast, no outbound ACK
+//   pt_send(link, data), pt_recv(link) → Vec<u8>: ferros-link's (tools/ferros-link, shared with ferros-send), the DATA blast each way
 //
-// usb.rs ── nusb USB link (VID G#1209, PID G#4665) struct UsbLink { interface, ep_out, ep_in } ::open() → Result<Self> ::send(data) — pads to 512 bytes (DWC3 short packet workaround) ::recv() → Vec<u8> ::recv_timeout(duration) → Result<Vec<u8>>
+// usb.rs ── UsbLink is ferros-link's (VID G#1209, PID G#4665, FERROS_BUS); here only the development vendor requests on EP0: read_dbg, read_dbg2, gate
 
 extern crate alloc;
 mod input;
@@ -13,9 +13,7 @@ mod input;
 mod network;
 mod usb;
 
-use ferros_pt::StreamId;
-use ferros_pt::packet::{self, Ack, Complete, Spec};
-use ferros_pt::transfer::{InboundTransfer, OutboundTransfer, bitmap_words};
+use ferros_pt::packet::Complete;
 use std::io::{self, Write};
 
 /// Session clock — calibrated once at startup via nunc, advanced locally via Instant.
@@ -67,6 +65,8 @@ fn usage() {
     eprintln!("  store put <key> <text|@file> | get <key> [out] | ls | rm <key>   Vault by logical key (shim)");
     eprintln!("  display [--hold] [text]  Render text on the panel (shim after a --live handoff; '\\n' = newline; --hold keeps it up until a REBOOT; both volume keys = killswitch power-off)");
     eprintln!("  input <tap|hold|swipe|drag|pinch|rotate|key|idle|shot|script> …  Fingers and keys in shown frames, as a VSF script (development builds; `input` alone for the list)");
+    eprintln!("  kist install <capsule.vsf>  Development fallback: a kist straight into the attested person's list, no check by the device's installer and no Stow on its screen (unattended loops). Stow a kist with `ferros send <capsule.vsf>` (tools/ferros-send), the checked path");
+    eprintln!("  kist answer <name> <right> on|off|unset | kist list  The attested person's answers (development)");
 }
 
 #[tokio::main]
@@ -76,6 +76,9 @@ async fn main() {
         usage();
         std::process::exit(1);
     }
+
+    // Each transfer's steps on stderr, as the bridge always said them (ferros-link is quiet for a person's tool).
+    ferros_link::trace(true);
 
     // Calibrate in the background: nothing on the device path reads the session clock yet, and a slow or failing nunc query (seconds to a minute when sources don't answer) must never delay a USB command.
     let _clock = tokio::spawn(SessionClock::calibrate());
@@ -105,7 +108,7 @@ async fn main() {
         "store" => cmd_store(&args[2..]).await,
         // input tap|hold|swipe|drag|pinch|rotate|key|idle|shot|script …: fingers and keys in shown frames (input.rs, docs/INPUT-INJECT.md).
         "input" => input::cmd(&args[2..]).await,
-        // kist install <capsule.vsf>: keep a signed kist capsule in the vault and add it to the attested person's list (KISTS.md).
+        // kist install <capsule.vsf>: the development fallback (KISTS.md "Stowing"): a signed kist capsule kept in the vault and added to the attested person's list with no check by the device's installer and no Stow on its screen, for unattended loops. `ferros send` (tools/ferros-send) is the checked path every script uses.
         "kist" if args.get(2).map(String::as_str) == Some("install") && args.len() >= 4 => cmd_kist_install(&args[3]).await,
         // kist answer <name> <right> on|off: one answer of the attested person's (development); kist list: their list.
         "kist" if matches!(args.get(2).map(String::as_str), Some("answer") | Some("list")) => cmd_kist_answer(&args[3..]).await,
@@ -400,188 +403,17 @@ fn cmd_status() {
 }
 
 // ---------------------------------------------------------------------------
-// PT send (host→device) — unchanged from before
+// PT send and receive: ferros-link's (tools/ferros-link), shared with ferros-send
 // ---------------------------------------------------------------------------
-
 
 /// Send data to the device via PT and wait for COMPLETE.
 async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
-    let sid = StreamId::FIRST;
+    ferros_link::pt::send(link, data).await
+}
 
-    // The kernel takes at most 6 MiB in one transfer (its PT_BIG receive region, service.rs) and refuses more, answering COMPLETE-failed: said here first.
-    if data.len() > 6 << 20 {
-        return Err(format!("{} bytes is more than the kernel takes in one transfer (6 MiB)", data.len()));
-    }
-    let mut spec_buf = [0u8; 512];
-    let mut bitmap_buf = vec![0u64; ferros_pt::transfer::outbound_bitmap_words(data.len())];
-
-    let (mut xfer, spec_len) = OutboundTransfer::start(sid, data, &mut bitmap_buf, &mut spec_buf)
-        .ok_or_else(|| "Failed to build SPEC".to_string())?;
-
-    eprintln!(
-        "  SPEC: sid={} count={} psize={} total={}",
-        sid.0 as char, xfer.count, xfer.psize, xfer.total
-    );
-
-    eprintln!("  SPEC sending...");
-    link.send(&spec_buf[..spec_len])
-        .await
-        .map_err(|e| format!("SPEC send failed: {e}"))?;
-    eprintln!("  SPEC sent OK");
-
-    // Wait for SPEC ACK
-    let resp = link
-        .recv()
-        .await
-        .map_err(|e| format!("SPEC ACK recv failed: {e}"))?;
-    if ferros_pt::packet::Complete::decode(&resp).is_some_and(|c| !c.success) {
-        return Err("the kernel refused the transfer (too large for its receive region)".into());
-    }
-    if let Some(ack) = Ack::decode(&resp) {
-        if ack.seq != u64::MAX {
-            return Err(format!("Expected SPEC ACK (seq=MAX), got seq={}", ack.seq));
-        }
-        eprintln!("  SPEC ACK received");
-    } else {
-        return Err(format!(
-            "Expected SPEC ACK, got {} bytes: {:02x?}",
-            resp.len(),
-            &resp[..resp.len().min(8)]
-        ));
-    }
-
-    // Small delay after SPEC ACK — let kernel finish arming ep2
-    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-
-    let pace_us: u64 = std::env::var("FERROS_PT_PACE_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    // Blast all DATA packets — no ACK wait, USB guarantees delivery. Each is padded to 512 bytes and they go out with several bulk transfers in flight (usb.rs `send_queued`), so the host never waits on this program between them (FERROS_PT_PACE_US > 0 goes back to one packet at a time, paced).
-    let mut pkt_buf = [0u8; 512];
-    let mut sent = 0u64;
-    let mut batch: Vec<u8> = Vec::with_capacity(data.len() / 477 * 512 + 1024);
-
-    while !xfer.all_sent() {
-        let pkt_len = xfer.next_data_packet(data, &mut pkt_buf);
-        if pkt_len == 0 {
-            break;
-        }
-        sent += 1;
-        if pace_us == 0 {
-            let at = batch.len();
-            batch.extend_from_slice(&pkt_buf[..pkt_len]);
-            batch.resize(at + 512, 0);
-            continue;
-        }
-
-        link.send(&pkt_buf[..pkt_len])
-            .await
-            .map_err(|e| format!("DATA send failed at pkt {sent}: {e}"))?;
-        // No pacing by default (FERROS_PT_PACE_US, microseconds, to bring it back): the kernel takes one 512-byte packet per USB transfer and re-arms, and until it does the controller NAKs and the host retries, so nothing is lost. The 1 ms tokio sleep that was here (really 1-2 ms) held PT to 215 KB/s; without it 2 MiB went over in 0.62 s, byte-exact both ways (2026-10-31).
-        if pace_us > 0 {
-            tokio::time::sleep(std::time::Duration::from_micros(pace_us)).await;
-        }
-    }
-
-    if !batch.is_empty() {
-        link.send_queued(&batch).await.map_err(|e| format!("DATA send failed: {e}"))?;
-    }
-    eprintln!("  {} DATA packets blasted", sent);
-
-    // Wait for COMPLETE. Kernel responds when all_received(). Timeout proportional to transfer size: ~1ms per packet + 2s base.
-    let wait_ms = (1u64 << 15) + (sent << 6); // 32768ms base + 64ms per packet
-
-    // Try multiple recv() calls — COMPLETE might not be the first thing back
-    for attempt in 0..16u32 {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(if attempt == 0 { wait_ms } else { 4096 }),
-            link.recv(),
-        ).await {
-            Ok(Ok(resp)) => {
-                eprintln!("  recv[{attempt}]: {} bytes first=0x{:02x}", resp.len(), resp.get(0).copied().unwrap_or(0));
-                if let Some(complete) = Complete::decode(&resp) {
-                    xfer.handle_complete(&complete);
-                    eprintln!("  COMPLETE received!");
-                    return Ok(complete);
-                }
-                continue; // try next recv
-            }
-            Ok(Err(e)) => return Err(format!("recv error: {e}")),
-            Err(_) => {
-                eprintln!("  timeout on attempt {attempt}");
-                if attempt == 0 {
-                    continue; // long timeout expired, try short ones
-                }
-                return Err(format!("Timeout waiting for COMPLETE after {}ms ({} packets)", wait_ms, sent));
-            }
-        }
-    }
-    Err(format!("No COMPLETE after 16 recv attempts ({sent} packets)"))
-} // pt_send
-
-// ---------------------------------------------------------------------------
-// PT recv (device→host) — bridge acts as InboundTransfer receiver
-// ---------------------------------------------------------------------------
-
-/// Receive a PT transfer from the device (blast mode). Device sends SPEC + DATA blast + FIN. Bridge sends SPEC ACK, then responds with COMPLETE or NAK after all data received.
+/// Receive a PT transfer from the device (blast mode): its answer to the command sent last.
 async fn pt_recv(link: &usb::UsbLink) -> Result<Vec<u8>, String> {
-    // Read SPEC from device
-    let resp = link
-        .recv()
-        .await
-        .map_err(|e| format!("SPEC recv failed: {e}"))?;
-
-    let spec = Spec::decode(&resp).ok_or_else(|| {
-        format!(
-            "Expected SPEC, got {} bytes: {:02x?}",
-            resp.len(),
-            &resp[..resp.len().min(8)]
-        )
-    })?;
-
-    eprintln!(
-        "  RECV SPEC: sid={} count={} psize={} total={}",
-        spec.sid.0 as char, spec.count, spec.psize, spec.total
-    );
-
-    // Allocate buffers
-    let mut data_buf = vec![0u8; spec.total as usize];
-    let mut bitmap_buf = vec![0u64; bitmap_words(spec.count)];
-
-    let mut xfer = InboundTransfer::new(&spec, &mut data_buf, &mut bitmap_buf)
-        .ok_or_else(|| "Failed to create InboundTransfer".to_string())?;
-
-    // Skip SPEC ACK — kernel starts blasting immediately via idle-poll pump. Sending SPEC ACK on OUT would block because the kernel's ep2 may be busy.
-    eprintln!("  SPEC ACK skipped (kernel auto-blasts)");
-
-    // Receive the DATA blast — silent, no ACKs. The device sends exactly `count` packets, each padded to 512 bytes, so they are read with several exact bulk transfers in flight (usb.rs `recv_queued`). Each ends when its last packet is in; asking for more than is coming would wait for packets that never come.
-    let mut received = 0u64;
-    let run = link
-        .recv_queued(spec.count as usize * 512)
-        .await
-        .map_err(|e| format!("DATA recv failed: {e}"))?;
-    for pkt in run.chunks(512) {
-        if !ferros_pt::is_data_packet(pkt[0]) {
-            eprintln!("  (unexpected packet during recv: {:02x})", pkt[0]);
-            continue;
-        }
-        match packet::decode_data(pkt, xfer.seq_width) {
-            Some((_sid, seq, chunk_hash, payload)) => {
-                if xfer.handle_data(seq, &chunk_hash, payload) {
-                    received += 1;
-                }
-            }
-            None => eprintln!("  DATA decode failed"),
-        }
-    }
-    let mut resp_buf = [0u8; 128];
-    xfer.finish(&mut resp_buf);
-    if !xfer.all_received() {
-        return Err(format!("reply incomplete: {} of {} packets", xfer.chunks_received, xfer.expected_count));
-    }
-
-    eprintln!("  {} DATA packets received", received);
-
-    let result = data_buf[..spec.total as usize].to_vec();
-    Ok(result)
+    ferros_link::pt::recv(link).await
 }
 
 // ---------------------------------------------------------------------------
@@ -943,7 +775,7 @@ async fn cmd_gate(value: u16) {
             std::process::exit(1);
         }
     };
-    match link.gate(value).await {
+    match usb::gate(&link, value).await {
         Ok(()) => println!("gate answered: {}", ["", "ferros", "android", "hold"][value as usize]),
         Err(e) => {
             eprintln!("{e}");
@@ -960,7 +792,7 @@ async fn cmd_dbg() {
             std::process::exit(1);
         }
     };
-    match link.read_dbg().await {
+    match usb::read_dbg(&link).await {
         Ok(d) => {
             println!("PT dispatch debug counters (EP0 vendor readout):");
             println!("  [0]  ep2 (bulk OUT) events        A#{}", d[0]);
@@ -996,7 +828,7 @@ async fn cmd_dbg2() {
             std::process::exit(1);
         }
     };
-    match link.read_dbg2().await {
+    match usb::read_dbg2(&link).await {
         Ok(d) => {
             println!("Raw DWC3 event ring (oldest first; A#{} events total):", d[12]);
             for i in 0..12 {
@@ -1183,7 +1015,7 @@ async fn store_call(link: &usb::UsbLink, op: ferros_pt::Op, params: &[u8]) -> Re
     }
 }
 
-/// `kist install <capsule.vsf>` (KISTS.md, development's installer: the capsule arrives over PT): the capsule's signature checked here as the gate will check it, its bytes kept in the vault under their blake3 (`capsules.`, the device's, in parts of 4 MiB, each a command, so a capsule of any size goes in), then the person's list (`kists.list`, theirs: they must be attested) read, the kist added or updated (an update keeps every answer for a right it still wants; a new want is unanswered, asked at the next launch) and written back. The device asks each new want at the kist's first launch, never here.
+/// `kist install <capsule.vsf>`, the development fallback (KISTS.md "Stowing"; owner, 2026-11-11: "a proper checked path"): `ferros send` (tools/ferros-send) offers a kist to the device's installer, which checks it and asks the person to Stow it; this door skips both, thru the development store capability, for unattended loops with nobody at the screen (a production build answers neither `store` nor this). As it does: the capsule's signature checked here as the gate will check it, its bytes kept in the vault under their blake3 (`capsules.`, the device's, in parts of 4 MiB, each a command, so a capsule of any size goes in), then the person's list (`kists.list`, theirs: they must be attested) read, the kist added or updated (an update keeps every answer for a right it still wants; a new want is unanswered, asked at the next launch) and written back. The device asks each new want at the kist's first launch, never here.
 async fn cmd_kist_install(path: &str) {
     let capsule = std::fs::read(path).unwrap_or_else(|e| {
         eprintln!("Failed to read {path}: {e}");

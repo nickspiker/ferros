@@ -22,10 +22,10 @@ use vsf::file_format::{VsfHeader, VsfSection};
 use vsf::types::EtType;
 use vsf::VsfType;
 
-/// The rights, by code (the index): the screen (`use display`), touch (`use touch`), a surface of its own, a key derived from the device's ira, its own vault domain, randomness, the GPS fix (`use gps`), the network (`use udp`).
-pub const RIGHTS: [&str; 8] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp"];
+/// The rights, by code (the index): the screen (`use display`), touch (`use touch`), a surface of its own, a key derived from the device's ira, its own vault domain, randomness, the GPS fix (`use gps`), the network (`use udp`), sound out (`use audio`, docs/AUDIO.md; 2026-11-11, appended so every code before it keeps its meaning).
+pub const RIGHTS: [&str; 9] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp", "audio"];
 /// What each right is, in a person's words, for the settings pages and the first-launch question.
-pub const MEANS: [&str; 8] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network"];
+pub const MEANS: [&str; 9] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound"];
 /// A want the person said no to: an empty slot in the launch (process.rs `Object::Empty`).
 pub const EMPTY: u8 = 0xFF;
 /// The person's list's name in its scope (`kists.`).
@@ -70,6 +70,86 @@ pub mod launch {
         /// Whether a reason is a stop after a start (`FAULT`, `PANIC`, `KILLED`) rather than a start that did not happen.
         pub const fn stopped(why: u8) -> bool {
             why >= FAULT
+        }
+    }
+}
+
+/// Stowing a kist (docs/KISTS.md "Stowing"; owner, 2026-11-11: "Can we make a standard method so the end user doesn't have to get them from the [catalog]", "Just seems to me that we should just make a proper checked path and start using it", and "the proper term for installing a kist is stow"). One installer (payloads/kists) for every source, one set of checks: a kist fetched from the directory, and a kist offered to the device over USB (ferros_pt `caps::OFFER`, tools/ferros-send). What the kernel keeps of an offer and answers the host with, why a stow is refused, and those reasons in a person's words, shared by the kernel, the installer, the map and `ferros send`.
+pub mod offer {
+    /// An offer's states, as the kernel keeps them and answers a host's read (`[state][why][flags]`): carried in whole and waiting for the installer to take it; the installer checking it (its signature with every egg, the person's pin, the kernel's gate, checker and seal); on the glass, waiting for the person's Stow or Cancel; then one of the three ends.
+    pub const OFFERED: u8 = 0;
+    pub const CHECKING: u8 = 1;
+    pub const ASKING: u8 = 2;
+    /// In the person's list: their kist now.
+    pub const STOWED: u8 = 3;
+    /// Refused by a check (the why says which); its bytes dropped.
+    pub const REFUSED: u8 = 4;
+    /// The person said Cancel; its bytes dropped.
+    pub const CANCELLED: u8 = 5;
+    /// No such offer: another replaced it, or the device restarted.
+    pub const GONE: u8 = 6;
+    /// Whether a state is an end (stowed, refused, cancelled, gone): the host stops asking.
+    pub const fn finished(state: u8) -> bool {
+        state >= STOWED
+    }
+    /// Flags beside the state: bit 0 its code is native, unchecked machine code, which only a development build stows (SANDBOX.md: production refuses it).
+    pub const NATIVE: u8 = 1;
+    /// The part of a capsule one command carries (the bridge's `store` part form took the same): under the kernel's 6 MiB receive region with room for the command's head.
+    pub const PART: usize = 1 << 22;
+    /// The longest the kernel holds a host's read of an offer's state before it answers with the state unchanged, in seconds: the USB driver gives up on a kernel reply after 16 (payloads/usb `give_up`), so a hold must end well inside it, and the host asks again at once (a held call with a lease, never a timer of the host's).
+    pub const HOLD_SECONDS: u64 = 1 << 3;
+
+    /// Why a stow (or an install from the directory, or a restore) was refused: the installer's reasons (payloads/kists), the map's words for them, and `ferros send`'s.
+    pub mod why {
+        pub const NETWORK: u8 = 1;
+        pub const MISSING: u8 = 2;
+        pub const SIZE: u8 = 3;
+        pub const NOT_NAMED: u8 = 4;
+        pub const EGGS: u8 = 5;
+        /// It carries no bundle of its developer's keys (a capsule from before 2026-11-10).
+        pub const NO_BUNDLE: u8 = 6;
+        /// Native code from the network: a development build, never installed from the directory.
+        pub const NATIVE: u8 = 7;
+        pub const CHECKER: u8 = 8;
+        pub const SEAL: u8 = 9;
+        pub const VAULT: u8 = 10;
+        pub const BROKEN: u8 = 11;
+        pub const MANIFEST: u8 = 12;
+        pub const NOT_LISTED: u8 = 13;
+        pub const NOBODY: u8 = 14;
+        pub const ROOM: u8 = 15;
+        pub const NOT_KIST: u8 = 16;
+        /// The person trusted another bundle for this developer key at its first kist.
+        pub const OTHER_KEY: u8 = 17;
+        /// The bundle it carries is not its developer's (its Ed25519 key is not the kist's).
+        pub const NOT_ITS_KEYS: u8 = 18;
+        /// Native code offered to a production build, which stows masked kists only.
+        pub const NATIVE_HERE: u8 = 19;
+    }
+
+    /// A reason in a person's words (English: the host tool's, and the map's Kists page until it speaks ferros_lang).
+    pub fn words(w: u8) -> &'static str {
+        match w {
+            why::NETWORK => "no network",
+            why::MISSING => "it is not where it is kept",
+            why::SIZE => "its size is not the one given",
+            why::NOT_NAMED => "it is not the capsule it was named as",
+            why::EGGS => "its signature does not check out",
+            why::NO_BUNDLE => "it does not carry its developer's keys",
+            why::NATIVE => "this kist is a development build and can't be installed from the network",
+            why::CHECKER => "its code failed the check",
+            why::SEAL => "it could not be sealed to this device",
+            why::VAULT => "the vault did not keep it",
+            why::BROKEN => "the download broke off",
+            why::MANIFEST => "it comes thru its developer's own list, which this device does not read yet",
+            why::NOT_LISTED => "it is not in the list of kists",
+            why::NOBODY => "nobody is attested",
+            why::ROOM => "there is no room to check it now",
+            why::NOT_KIST => "it is not a kist",
+            why::OTHER_KEY => "this kist is signed by a different key than its developer's other kists",
+            why::NOT_ITS_KEYS => "the keys it carries are not its developer's",
+            why::NATIVE_HERE => "it is unchecked native code, which a production build does not stow",
+            _ => "something went wrong",
         }
     }
 }
