@@ -3269,6 +3269,22 @@ fn surface_of(base: u64) -> Option<usize> {
     if off % SURFACE_BYTES == PORCH && off / SURFACE_BYTES < SURFACES { Some(off / SURFACE_BYTES) } else { None }
 }
 
+/// Where each window's pixels are, by the surface the window is on: itself, or the other buffer of a mailbox (op 22's 36-byte form, GPU-KISTS.md 1.4), a surface its owner draws its next frame into while the display reads this one.
+pub static mut PIXELS: [u8; SURFACES] = {
+    let mut p = [0u8; SURFACES];
+    let mut k = 0;
+    while k < SURFACES {
+        p[k] = k as u8;
+        k += 1;
+    }
+    p
+};
+
+/// The pixels of the window on surface k (`PIXELS`).
+fn window_pixels(k: usize, width: usize, height: usize) -> &'static mut [u64] {
+    surface(unsafe { PIXELS[k] } as usize, width, height)
+}
+
 /// The windows up, frontmost first: (surface, window), at most four.
 fn front_order() -> ([(usize, Win); SURFACES], usize) {
     let mut v = [(0usize, Win { generation: 0, level: 0, order: 0, rect: draw::Rect::EMPTY, format: 0, mode: 0, back: false, full: false }); SURFACES];
@@ -3960,7 +3976,7 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
             let layer = |i: u8| order[i as usize];
             let plain = chain.iter().all(|&i| layer(i).1 != G2T16 && layer(i).2 & MODE_MASK == 0);
             let (k0, f0, m0) = layer(chain[0]);
-            let front = &surface(k0 as usize, width, height)[y * width..(y + 1) * width];
+            let front = &window_pixels(k0 as usize, width, height)[y * width..(y + 1) * width];
             if m0 & OPAQUE != 0 && f0 != G2T16 && can_direct && a == xa && b == xb {
                 direct = Some(front);
             } else if m0 & OPAQUE != 0 && f0 != G2T16 {
@@ -3969,7 +3985,7 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
                 // Working windows in Normal: see-through is the bit alone, so the fold is a select. Branchless: an uncovered pixel takes this window's, a covered one keeps its own; black where every window is see-through.
                 px[a..b].copy_from_slice(&front[a..b]);
                 for &i in &chain[1..] {
-                    let src = &surface(layer(i).0 as usize, width, height)[y * width..(y + 1) * width];
+                    let src = &window_pixels(layer(i).0 as usize, width, height)[y * width..(y + 1) * width];
                     for x in a..b {
                         let p = px[x];
                         let m = (p >> 63).wrapping_neg();
@@ -3989,7 +4005,7 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
                             break;
                         }
                         let (k, f, m) = layer(i);
-                        let p = working(surface(k as usize, width, height)[y * width + x], f);
+                        let p = working(window_pixels(k as usize, width, height)[y * width + x], f);
                         (acc, t) = fold(acc, t, p, mode);
                         mode = m;
                     }
@@ -6739,7 +6755,15 @@ extern "C" fn receive(grants: u64) -> ! {
             RING_TAIL.store(tail, Ordering::Release);
         }
         ring_bell();
-        if op_is_sync(op) {
+        if op == 22 && n >= 36 {
+            // A mailbox show (op 22's 36-byte form): answered once the render thread has taken it, so every show before it, and the publish of the buffer shown before it, is done, and that buffer is its owner's to draw into again (GPU-KISTS.md 1.4). A wait on the ring's head, which the render thread rings as it takes each request: a doorbell, never a poll.
+            let mut h = RING_HEAD.load(Ordering::Acquire);
+            while h < tail {
+                ferros_sys::wait(&RING_HEAD, h, 0);
+                h = RING_HEAD.load(Ordering::Acquire);
+            }
+            ferros_sys::reply(&tok, &[0]);
+        } else if op_is_sync(op) {
             while RING_DONE[slot].load(Ordering::Acquire) == done {
                 ferros_sys::wait(&RING_DONE[slot], done, 0);
             }
@@ -8187,6 +8211,9 @@ fn server(grants: u64) -> ! {
                             let full = draw::Rect::full(width, height);
                             // What changed (ferros_sys `show_changed`: [x u16][y u16][w u16][h u16] after the format byte): only that part is published and owed by the other phases — when the window is already up as it was (same generation, place and level) and the screen composed. Otherwise, and for a plain show, the whole screen.
                             let mode = if m.len() > 27 { m[27] } else { 0 };
+                            // The mailbox's buffer (the 36-byte form, [buf u64] after the mode byte): a live surface the window's pixels come from from this show on, else the window's own. The receive thread answers the call once this show is taken, so the buffer shown before it is no longer read and its owner may draw there again.
+                            let pixels = if m.len() >= 36 { surface_of(u64::from_le_bytes(m[28..36].try_into().unwrap())).filter(|&b| live_gen(b) != 0).unwrap_or(sk) } else { sk };
+                            unsafe { PIXELS[sk] = pixels as u8 };
                             let same = unsafe { WINS[sk] }.is_some_and(|w| w.generation == generation && w.rect == rect && w.level == m[17] && w.mode == mode) && unsafe { APP }.is_some();
                             let changed = if m.len() >= 27 && same { draw::Rect { x0: v(19), y0: v(21), x1: v(19) + v(23), y1: v(21) + v(25) }.intersect(rect) } else { full };
                             let t22 = now();

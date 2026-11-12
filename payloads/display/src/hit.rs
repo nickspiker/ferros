@@ -289,7 +289,7 @@ fn windows(y: usize, free: &mut Free, out: &mut [u16], width: usize) {
                     out[x] = NOBODY;
                     for &i in chain {
                         let (k, f, _) = order[i as usize];
-                        let p = surface(k as usize, width, height)[y * width + x];
+                        let p = window_pixels(k as usize, width, height)[y * width + x];
                         // Not see-through: a G2T16 pixel with any α, a working one without bit 63 (`working`'s own test).
                         if if f == G2T16 { p >> 48 != 0 } else { p >> 63 == 0 } {
                             out[x] = WINDOW + k as u16;
