@@ -1988,6 +1988,18 @@ pub fn run(mut b: Boot) -> ! {
             }
             radios_applied = radios_off;
         }
+        // The vault process ended having served, or was killed with no successor (process.rs `vault_ended`, `VAULT_ON`): started again from its capsule at once, the store calls queued for it waiting meanwhile, never answered by the kernel's vault, which no longer holds what it keeps. One that will not start leaves the vault gone, its waiting calls refused.
+        if crate::process::vault_wanted() && crate::process::with_lock(|| crate::process::named_alive_locked(&[b"vault"])) == 0 {
+            let mut rep = alloc::vec::Vec::new();
+            restart(&mut store, b"vault", &mut rep);
+            let said = core::str::from_utf8(&rep).unwrap_or("").trim_end();
+            if rep.ends_with(b" started\n") {
+                crate::flashlog::line(&alloc::format!("vault process started again: {said}"));
+            } else {
+                let n = crate::process::with_lock(crate::process::vault_refuse_locked);
+                crate::flashlog::line(&alloc::format!("vault process not started again ({said}): gone, A#{n} waiting calls refused"));
+            }
+        }
         let person = store.as_ref().is_some_and(|s| s.unlocked());
         // The stower (payloads/kists), once each time a person is in: it serves the map's Kists page and fetches back the capsules a restored list names. Its grants are its own (`kists_grants`), init's page being full.
         let frees = crate::process::ARC_FREES.load(core::sync::atomic::Ordering::Acquire);

@@ -28,6 +28,8 @@ const NONCE: usize = 24;
 const TAG: usize = 16;
 /// Pieces handed to the engine in one commit while a large value is written.
 const BATCH: usize = 1 << 4;
+/// Pieces removed in one engine commit (`drop_pieces`).
+const DROP_BATCH: usize = 1 << 6;
 
 /// One domain's keys, as the kernel issues them: the key its addresses are hashed under, and the key its values are sealed under.
 pub struct Domain {
@@ -555,10 +557,13 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         self.finish(d, w)
     }
 
+    /// The value's pieces removed, DROP_BATCH to an engine commit: one commit a piece was 1,400 commits for a 91 MB kist capsule (2026-11-12, the 8a: its old Photon dropped at a re-stow), each a spine entry and a rewritten index path, the garbage of each feeding the reaps that ran inside the next.
     fn drop_pieces(&mut self, d: &Domain, h: &Head) -> Result<()> {
         let now = (self.now)();
-        for k in 0..h.pieces() {
-            self.vault.delete(&Self::piece_addr(d, &h.id, k), now)?;
+        let addrs: Vec<[u8; 32]> = (0..h.pieces()).map(|k| Self::piece_addr(d, &h.id, k)).collect();
+        for batch in addrs.chunks(DROP_BATCH) {
+            let ops: Vec<(&[u8; 32], Option<&[u8]>)> = batch.iter().map(|a| (a, None)).collect();
+            self.vault.apply_batch(&ops, now)?;
         }
         Ok(())
     }

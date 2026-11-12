@@ -724,6 +724,9 @@ fn allowed_here(mask: u16) -> bool {
     mask & here != 0 || mask & cores_up() == 0
 }
 
+/// The most of a process's last console line kept for its end's flash log line (`Process::words`).
+const WORDS_MAX: usize = 1 << 9;
+
 struct Process {
     arc: Arc,
     cspace: Vec<CapEntry>,
@@ -733,6 +736,8 @@ struct Process {
     name: Vec<u8>,
     /// The process's console output is at the start of a line (so the next byte gets the name tag).
     line_start: bool,
+    /// Its last console line (the one in progress, else the last complete one), up to `WORDS_MAX` bytes: written to the flash log when it ends (`end_process`), so a process's own account of its death (a panic's line) survives a console drain or the reset that follows.
+    words: Vec<u8>,
     /// The spawn input, kept in kernel memory and pulled in by the `input` syscall (so a driver's arc stays small while large one-shot data — firmware — streams through a chunk buffer). Inlined into the arc too only when it is small.
     input: Vec<u8>,
     /// The process watchdog (KERNEL-OUT.md, owner 2026-11-05), measuring first: when it was spawned, its pets (SYS_PET, once a pass of its main loop), the last one, and the longest stretch between two (from the spawn for the first) with when it ended. Nothing is enforced yet.
@@ -2017,6 +2022,76 @@ const STORE_REPLY: u64 = 1 << 62;
 /// The last old entry read for migration (name, value), so a large one is fetched from the kernel's vault once.
 static mut MIGRATE_CACHE: Option<(Vec<u8>, Vec<u8>)> = None;
 
+/// The vault process this boot (`VAULT_STATE`): none started yet, so the kernel's own vault answers every store call (a boot that carries no vault process, or before it is spawned); started, so every store call for it goes to its endpoint, alive or being started again; gone, it ended before it ever served (its open would end it again), so store calls for it are refused.
+/// Before 2026-11-12 a store call found no vault process once it had ended and went to the kernel's vault, which no longer holds what the vault process keeps and said "absent": on the 8a, after the vault process died during a Photon stow, the person's list read "not found", and an absent list is what the identity service's sync reads as the person removing every kist (docs/VAULT-OUT.md "Its end").
+pub const VAULT_NONE: u8 = 0;
+pub const VAULT_ON: u8 = 1;
+pub const VAULT_GONE: u8 = 2;
+static VAULT_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(VAULT_NONE);
+/// The vault process ended after it had served, or was killed: the service loop starts it again (`vault_wanted`), and the calls queued for it wait meanwhile.
+static VAULT_WANTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The vault's state (`VAULT_NONE`, `VAULT_ON`, `VAULT_GONE`).
+pub fn vault_state() -> u8 {
+    VAULT_STATE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether the vault process is to be started again (it ended having served, or was killed), cleared as read: the service loop's, once a pass.
+pub fn vault_wanted() -> bool {
+    VAULT_WANTED.swap(false, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// A process holding the right to serve the vault endpoint was built: store calls go to it from now on, and to its successor whenever it ends.
+fn vault_spawned(objects: &[(Object, u32)]) {
+    let kk = k();
+    if objects.iter().any(|&(o, r)| matches!(o, Object::Endpoint(e) if kk.endpoints[e].name == VAULT_EP) && r & RIGHT_RECV != 0) {
+        VAULT_STATE.store(VAULT_ON, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// A process ended (exit, a fault): if it served the vault, it is started again when it had served (the service loop, woken now), or the vault is gone when it ended before its first receive (an open that ends it ends the next one too: the 8a's 24 MiB heap ran out at every open, 2026-11-12). Under the kernel lock.
+fn vault_ended(p: &Process, value: u64) {
+    let kk = k();
+    let Some(ep) = kk.endpoints.iter().position(|e| e.name == VAULT_EP) else { return };
+    if !p.cspace.iter().any(|c| matches!(c.object, Object::Endpoint(e) if e == ep) && c.rights & RIGHT_RECV != 0) {
+        return;
+    }
+    if kk.endpoints[ep].server == p.epoch {
+        crate::flashlog::line(&alloc::format!("vault process ended (exit G#{value:016X}) after it served: started again, the store calls waiting for it meanwhile"));
+        VAULT_WANTED.store(true, core::sync::atomic::Ordering::Release);
+        unsafe { core::arch::asm!("sev") };
+    } else {
+        crate::flashlog::line(&alloc::format!("vault process ended (exit G#{value:016X}) before it served: not started again, its store calls refused"));
+        VAULT_STATE.store(VAULT_GONE, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The vault process could not be started again: gone for the rest of the boot (until one is started by hand), every store call waiting for it answered ERR. How many were. Under the kernel lock.
+pub fn vault_refuse_locked() -> usize {
+    VAULT_STATE.store(VAULT_GONE, core::sync::atomic::Ordering::Release);
+    // The kernel's own call too (a bridge store command), its stamp wiped, as `fail_orphaned_calls` answers it.
+    if let Some(ep) = k().endpoints.iter().position(|e| e.name == VAULT_EP) {
+        let q = &mut k().endpoints[ep].queue;
+        if q.iter().any(|c| c.0 == KERNEL_CALLER) {
+            for c in q.iter_mut().filter(|c| c.0 == KERNEL_CALLER) {
+                c.1.fill(0);
+            }
+            q.retain(|c| c.0 != KERNEL_CALLER);
+            kernel_answered(Err(()));
+        }
+    }
+    on_demand_refuse_locked(VAULT_EP)
+}
+
+/// The endpoint a store call for the vault process goes to (`store_route`, `export_route`): the vault endpoint while a vault process is alive or being started again (`VAULT_ON`), where the call waits for it; None before any was started (the kernel's own vault answers then). A vault that is gone has the call refused (`Err`).
+fn vault_route() -> Option<Result<usize, ()>> {
+    match vault_state() {
+        VAULT_NONE => vault_ep().map(Ok),
+        VAULT_ON => k().endpoints.iter().position(|e| e.name == VAULT_EP).map(Ok),
+        _ => Some(Err(())),
+    }
+}
+
 /// The vault endpoint, while a live process holds the right to serve it: from its spawn, not its first receive, so a call made while it opens waits for it (the GPU asked for `gpu.fw` 145 ms into a boot, before the vault served, and the kernel's vault, which no longer held it, said absent, 2026-11-07). Should it die first, the waiting calls get ERR (`fail_orphaned_calls`).
 fn vault_ep() -> Option<usize> {
     let kk = k();
@@ -2157,13 +2232,13 @@ enum Where {
     Domain([u8; 32]),
 }
 
-/// Where a `SYS_STORE` goes: to the vault process (its endpoint, and the caller's scope or its own domain) while it serves and the name is not one the kernel keeps; None, the kernel's own vault (which holds no kist domain: a domain call with no vault process is refused there).
-fn store_route(p: &Process, f: &Frame) -> Option<(usize, Where)> {
-    let ep = vault_ep()?;
+/// Where a `SYS_STORE` goes: to the vault process (its endpoint, and the caller's scope or its own domain) while one is started this boot (`vault_route`: alive, or being started again, the call waiting for it) and the name is not one the kernel keeps; Err, refused (the vault process is gone); None, the kernel's own vault (no vault process started yet; it holds no kist domain: a domain call then is refused there).
+fn store_route(p: &Process, f: &Frame) -> Option<Result<(usize, Where), ()>> {
+    let route = vault_route()?;
     let token = p.read(f.x[0], 32);
     let sc = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
         Some((Object::Store(i), r)) if r & RIGHT_SEND != 0 => STORES.get(i)?,
-        Some((Object::Domain, r)) if r & RIGHT_SEND != 0 => return p.domain.map(|d| (ep, Where::Domain(d))),
+        Some((Object::Domain, r)) if r & RIGHT_SEND != 0 => return p.domain.map(|d| route.map(|ep| (ep, Where::Domain(d)))),
         _ => return None,
     };
     if f.x[1] & 32 == 0 {
@@ -2173,7 +2248,7 @@ fn store_route(p: &Process, f: &Frame) -> Option<(usize, Where)> {
             return None;
         }
     }
-    Some((ep, Where::Scope(sc)))
+    Some(route.map(|ep| (ep, Where::Scope(sc))))
 }
 
 /// `SYS_STORE` while the vault process serves (VAULT-OUT.md, step 3): the request, stamped with the domain keys of the caller's scope, goes to the vault as a call from the caller, who waits for the reply as for any call. The kernel copies one transfer each way and keeps nothing; keys for the person's domain only while they are unlocked.
@@ -2250,10 +2325,10 @@ pub const VOP_DROP: u8 = 4;
 pub const VOP_EXPORT: u8 = 5;
 
 /// `SYS_UNLOCK` op 5 while the vault process serves, for a caller holding the Unlock right: its endpoint.
-fn export_route(p: &Process, f: &Frame) -> Option<usize> {
-    let ep = vault_ep()?;
+fn export_route(p: &Process, f: &Frame) -> Option<Result<usize, ()>> {
+    let route = vault_route()?;
     let token = p.read(f.x[0], 32);
-    matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Unlock, r)) if r & RIGHT_SEND != 0).then_some(ep)
+    matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Unlock, r)) if r & RIGHT_SEND != 0).then_some(route)
 }
 
 /// `SYS_UNLOCK` ops 6-9, attest with a tag (AUTH.md "Attest with a tag"):
@@ -3166,10 +3241,13 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
-        SYS_STORE if store_route(p, f).is_some() => {
-            let (ep, sc) = store_route(p, f).unwrap();
-            store_forward(f, cur, ep, sc)
-        }
+        SYS_STORE if store_route(p, f).is_some() => match store_route(p, f).unwrap() {
+            Ok((ep, sc)) => store_forward(f, cur, ep, sc),
+            Err(()) => {
+                f.x[0] = ERR;
+                0
+            }
+        },
         SYS_STORE => {
             let token = p.read(f.x[0], 32);
             let scope = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
@@ -3317,10 +3395,13 @@ fn el0_trap(f: &mut Frame) -> u64 {
             0
         }
         // The person's export while the vault process serves: it builds the document (VAULT-OUT.md).
-        SYS_UNLOCK if f.x[1] == 5 && export_route(p, f).is_some() => {
-            let ep = export_route(p, f).unwrap();
-            export_forward(f, cur, ep)
-        }
+        SYS_UNLOCK if f.x[1] == 5 && export_route(p, f).is_some() => match export_route(p, f).unwrap() {
+            Ok(ep) => export_forward(f, cur, ep),
+            Err(()) => {
+                f.x[0] = ERR;
+                0
+            }
+        },
         // Attest with a tag (ops 6-9): the Unlock right, or Settings for keeping, forgetting and listing (`tag_syscall`).
         SYS_UNLOCK if (6..=9).contains(&f.x[1]) => {
             f.x[0] = tag_syscall(p, f);
@@ -4052,8 +4133,15 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         if p.line_start {
                             kk.console.extend_from_slice(&p.name);
                             kk.console.extend_from_slice(b": ");
+                            if c != b'\n' {
+                                p.words.clear();
+                            }
                         }
                         kk.console.push(c);
+                        // WHY the bound: the line is the process's, any length; the flash log keeps its first WORDS_MAX bytes.
+                        if c != b'\n' && p.words.len() < WORDS_MAX {
+                            p.words.push(c);
+                        }
                         p.line_start = c == b'\n';
                     }
                     crate::platform::pstore(&kk.console[at..]);
@@ -4346,8 +4434,8 @@ fn has_receiver(ep: usize) -> bool {
 fn fail_orphaned_calls() {
     let kk = k();
     for ep in 0..kk.endpoints.len() {
-        // The vault, alive and still opening, has not received yet: the store calls queued for it wait.
-        if has_receiver(ep) || vault_ep() == Some(ep) {
+        // The vault, alive and still opening, has not received yet, or ended having served and is being started again (`VAULT_ON`): the store calls queued for it wait.
+        if has_receiver(ep) || vault_ep() == Some(ep) || (vault_state() == VAULT_ON && k().endpoints[ep].name == VAULT_EP) {
             continue;
         }
         // No server left: one started again must receive before CALL_LIVE counts it.
@@ -4894,6 +4982,9 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         }
         kk.console.push(b'\n');
         crate::platform::pstore(&kk.console[at..]);
+        // The end in the flash log with the process's last line (2026-11-12, the 8a: the vault process died during a stow, and its panic and its exit were on the console alone, which nobody read before it drained). Under the kernel lock, which the log's UFS commands need.
+        crate::flashlog::line(&alloc::format!("{}: ended, exit G#{value:016X}; its last line: {}", core::str::from_utf8(&name).unwrap_or("?"), core::str::from_utf8(&p.words).unwrap_or("(not text)")));
+        vault_ended(p, value);
         if elsewhere {
             kk.procs[pi].as_mut().unwrap().dying = true;
         } else if let Some(p) = kk.procs[pi].take() {
@@ -5100,6 +5191,10 @@ fn kill_locked(name: &[u8]) -> bool {
     let kk = k();
     // A live process of that name, never one already ending: a process left `dying` (a thread of it still on a core) ahead of its relaunch in the table was found first, killed again, and the live one ran on (as `kill`'s record and `kist_request` already skip one).
     let Some(i) = kk.procs.iter().position(|p| matches!(p, Some(p) if p.name == name && !p.dying)) else { return false };
+    // The vault process killed (`diag restart vault` starts its successor at once; a bare `diag kill vault` leaves that to the service loop): the store calls queued for it wait for the next one, which the loop starts if none is alive by then.
+    if name == VAULT_EP && vault_state() == VAULT_ON {
+        VAULT_WANTED.store(true, core::sync::atomic::Ordering::Release);
+    }
     // Its register accesses done before anything it drove is switched off or handed on (`mmio_quiesce`).
     mmio_quiesce(&kk.procs[i].as_ref().unwrap().fast);
     // A kist no longer running: the kists' bell rung, so the map's circle stops glowing as running (`kists_live`). Under the lock, so a reader woken by it finds the process gone or ending.
@@ -6101,8 +6196,9 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // The register grants by slot, for `mmio_fast`: HARDWARE has fewer than 255 blocks, so an index plus one fits a byte.
     let hw = cspace.iter().map(|c| match c.object { Object::Hardware(g) => g as u8 + 1, _ => 0 }).collect();
     let fast = alloc::boxed::Box::new(Grants { hw, ended: core::sync::atomic::AtomicBool::new(false) });
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), fast };
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, words: Vec::new(), input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), fast };
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
+    vault_spawned(objects);
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.
     p.write_grants(TOKENS as u64, &(p.cspace.len() as u32).to_le_bytes());
     for (i, c) in p.cspace.iter().enumerate() {

@@ -22,7 +22,7 @@ use ferros_store::{Domain, Nonces, Opener, Sealed, Store, Writer};
 use ferros_sys::{cap, console, freq, now, ERR};
 use manifestus::{Block, BlockDev, DeletePolicy, Mirror, Vault};
 
-/// The heap: manifestus's working set (its index walks, the reap's windows) and a piece being opened or sealed. 24 MiB from 2026-11-08: a write grows a buffer of manifestus's with the vault's entries (about 926 bytes an entry, doubling: 671,760 bytes writing a 47 MB kist capsule into an empty store, 1,343,504 writing it again, measured on the host, ferros_store `rewrite_peak`), and at 8 MiB the vault process died rewriting Mahere's capsule. 56 MiB since 2026-11-12 (the arc 64 MiB): on the 8a, after Mahere's cells, three Mahere capsules and an offer of Photon cut off at 64 MiB, the open itself ran 24 MiB out ("memory allocation of 69768 bytes failed" before "open in"), every boot, and the GPU, WiFi and sensors processes, which read their firmware from this vault, ended with it. The open's high water is on the console ("open in"). The growth itself is manifestus's to bound.
+/// The heap: manifestus's working set (its index walks, the reap's windows) and a piece being opened or sealed. 24 MiB from 2026-11-08: a write grows a buffer of manifestus's with the vault's entries (about 926 bytes an entry, doubling: 671,760 bytes writing a 47 MB kist capsule into an empty store, 1,343,504 writing it again, measured on the host, ferros_store `rewrite_peak`), and at 8 MiB the vault process died rewriting Mahere's capsule. 56 MiB since 2026-11-12 (the arc 64 MiB): on the 8a, after Mahere's cells, three Mahere capsules and an offer of Photon cut off at 64 MiB, the open itself ran 24 MiB out ("memory allocation of 69768 bytes failed" before "open in"), every boot, and the GPU, WiFi and sensors processes, which read their firmware from this vault, ended with it. The open's high water is on the console ("open in"). 2026-11-12, the 8a: it ran out again inside manifestus's reap while a 91 MB capsule was dropped (a reap window is a sixty-fourth of the tract, 2 GiB then 4 GiB there, and its survivors were held twice); manifestus `bounded-reap` writes them out 256 blocks at a time, and the same run of offers that ended it twice then left it alive (docs/VAULT-OUT.md "Its end").
 const HEAP_BYTES: usize = 56 << 20;
 const STACK_BYTES: usize = 1 << 18;
 
@@ -750,7 +750,8 @@ extern "C" fn work(_: u64) -> ! {
             ferros_sys::exit(2);
         }
     };
-    say!("vault: tract {} blocks from {}, the window {} a mirror", vault.tract_blocks(), vault.tract_base(), HALF);
+    let st = vault.engine_stats();
+    say!("vault: tract {} blocks from {}, the window {} a mirror; generation {}, {} live blocks, plow {} reap {}", st.tract_blocks, vault.tract_base(), HALF, st.generation, st.live_blocks, st.plow, st.reap);
     let mut store = Store::new(vault, Entropy { pool: [0; 4096], at: 4096 }, seconds);
     store.set_clock(now);
     say!("vault: open in {} ms, serving; the heap's high water {} KiB of {} KiB, {} KiB in use", (now() - t0) * 1000 / freq(), ferros_heap::PEAK.load(Relaxed) >> 10, HEAP_BYTES >> 10, ferros_heap::IN_USE.load(Relaxed) >> 10);
@@ -825,6 +826,14 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
     let name = &m[at_name + 1..at_name + 1 + m[at_name] as usize];
     let rest = &m[at_name + 1 + name.len()..];
     let u64_at = |b: &[u8]| u64::from_le_bytes(b[..8].try_into().unwrap());
+    // For the death report: a set's offset and bytes, a read's (get, list, export) offset and length; a delete or a drop has neither.
+    unsafe {
+        SERVING = match op {
+            0 => (op, u64_at(rest), (rest.len() - 9) as u64, name.len()),
+            1 | 3 | OP_EXPORT => (op, u64_at(rest), u32::from_le_bytes(rest[8..12].try_into().unwrap()) as u64, name.len()),
+            _ => (op, 0, 0, name.len()),
+        }
+    };
     let mut data = 0;
     let ret = if op == 3 {
         // A listing over every domain stamped: names one per line, or with the address flag the 32-byte addresses.
@@ -1065,6 +1074,7 @@ fn migrate(store: &mut St) {
         }
         let n = n as usize;
         let (_, mut d) = domain_at(&head, 0);
+        unsafe { SERVING = (OP_MIGRATE, 0, 0, n - 66) };
         let full = head[66..n].to_vec();
         let rel = &full[head[65] as usize..];
         head.fill(0);
@@ -1099,8 +1109,47 @@ fn migrate(store: &mut St) {
     }
 }
 
+/// The request being served, for the death report (`panic`): its op (`OP_*`, the four of `serve` below them; G#FF migrating), the value's offset and the transfer's length, the name's length; set at each request's start. The serving thread's alone (the helpers and the reader only open and read for it).
+static mut SERVING: (u8, u64, u64, usize) = (u8::MAX, 0, 0, 0);
+/// While migrating (`migrate`): no request of a process, the kernel's old entries moving.
+const OP_MIGRATE: u8 = u8::MAX;
+
+/// What the death report calls an op.
+fn op_name(op: u8) -> &'static str {
+    match op {
+        0 => "a set",
+        1 => "a get",
+        2 => "a delete",
+        3 => "a list",
+        OP_DROP => "a drop",
+        OP_EXPORT => "an export",
+        OP_MIGRATE => "the migration",
+        _ => "no request",
+    }
+}
+
+/// The vault process's own death report (2026-11-12, the 8a: it died during a Photon re-stow and nothing said why, the console lines lost): the panic (a refused allocation says "memory allocation of N bytes failed"), the request it was serving, and the heap's state (in use, its high water, free and in how many blocks, the largest of them: a first-fit heap with room left but no block large enough is fragmented, not full). One line on the console; the kernel keeps a process's last line and writes it to the flash log when the process ends (process.rs `end_process`), so it survives the reset that may follow.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    say!("vault: panic: {} (the heap's high water {} KiB of {} KiB)", info, ferros_heap::PEAK.load(Relaxed) >> 10, HEAP_BYTES >> 10);
+    let (op, offset, len, name) = unsafe { SERVING };
+    // The heap's lock is not taken while a panic says so (try_lock): the panic may have come from inside the allocator, and a spin on its lock here would hang the report.
+    let (free, blocks, largest) = match ALLOC.try_lock() {
+        Some(h) => (h.free_bytes() >> 10, h.free_blocks(), h.largest_free() >> 10),
+        None => (0, 0, 0),
+    };
+    say!(
+        "vault: panic: {} serving {} (offset {}, {} bytes, a name of {} bytes); the heap: {} KiB in use, high water {} of {} KiB, {} KiB free in {} blocks, the largest {} KiB",
+        info,
+        op_name(op),
+        offset,
+        len,
+        name,
+        ferros_heap::IN_USE.load(Relaxed) >> 10,
+        ferros_heap::PEAK.load(Relaxed) >> 10,
+        HEAP_BYTES >> 10,
+        free,
+        blocks,
+        largest
+    );
     ferros_sys::exit(1)
 }
