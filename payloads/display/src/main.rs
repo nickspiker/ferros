@@ -3885,6 +3885,7 @@ fn publish_app_mask(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
         PUB_JOB.store(job, Ordering::Release);
         ferros_sys::wake(&PUB_JOB, PUB_WORKERS as u64);
         pub_take(job);
+        let t_tail = now();
         // Every stripe taken, finished: no deadline, as `publish10x4` (a stripe in a worker's hands is being written).
         loop {
             let f = PUB_FINISHED.load(Ordering::Acquire);
@@ -3893,6 +3894,7 @@ fn publish_app_mask(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
             }
             ferros_sys::wait(&PUB_FINISHED, f, now() + freq() / 1000);
         }
+        APP_TAIL.fetch_add(now() - t_tail, Ordering::Relaxed);
         unsafe { PUB_KIND = 0 };
     }
     if unsafe { CAPTURE } != 0 {
@@ -3916,6 +3918,12 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
     let mut row = [3u32; 1344];
     let mut px = [0u64; 1344];
     let (xa, xb) = (r.x0 as usize, r.x1 as usize);
+    let mut parts = [0u64; 4];
+    let t_in = now();
+    let c_in = ferros_sys::pmu::cycles();
+    let mut codes_cyc = 0u64;
+    // A capture (op 30) takes the whole composed row from `px`; otherwise an opaque front window over the whole row is read in place (`direct`).
+    let can_direct = unsafe { CAPTURE } == 0;
     for y in r.y0 as usize..r.y1 as usize {
         if hits {
             hit::row(y, xa, xb, width, height, true);
@@ -3923,6 +3931,9 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
         if write == 0 {
             continue;
         }
+        let t0 = now();
+        // The front window's row when it is opaque, in working values and covers the whole of xa..xb: its pixels go to the codes from the surface itself, and only the 16-pixel blocks something composes over (the glass, the chrome, the bars, the hole) are copied into `px` (2026-11-12: the copy of every pixel was 1.6 cycles a pixel of a whole-screen app's publish on the X3, for the few dozen a row the glass touches).
+        let mut direct: Option<&[u64]> = None;
         // The row's spans (`layout_build`): each one's chain, frontmost first, into the row.
         let bands = unsafe { core::slice::from_raw_parts(&raw const BANDS as *const Band, NBANDS) };
         let order = unsafe { core::slice::from_raw_parts(&raw const ORDER as *const (u8, u8, u8), SURFACES) };
@@ -3950,7 +3961,9 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
             let plain = chain.iter().all(|&i| layer(i).1 != G2T16 && layer(i).2 & MODE_MASK == 0);
             let (k0, f0, m0) = layer(chain[0]);
             let front = &surface(k0 as usize, width, height)[y * width..(y + 1) * width];
-            if m0 & OPAQUE != 0 && f0 != G2T16 {
+            if m0 & OPAQUE != 0 && f0 != G2T16 && can_direct && a == xa && b == xb {
+                direct = Some(front);
+            } else if m0 & OPAQUE != 0 && f0 != G2T16 {
                 px[a..b].copy_from_slice(&front[a..b]);
             } else if plain {
                 // Working windows in Normal: see-through is the bit alone, so the fold is a select. Branchless: an uncovered pixel takes this window's, a covered one keeps its own; black where every window is see-through.
@@ -3985,6 +3998,10 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
                 }
             }
         }
+        let t1 = now();
+        parts[0] += t1 - t0;
+        // The 16-pixel blocks (from xa) the glass composes over, bit j block j: with a `direct` row they come from `px`, the rest from the surface.
+        let mut touched = 0u128;
         // The glass's shape, from the plan (`plan_glass`), front to back: outside the app's circle is black (nothing of the windows shows there); on the circle's listed pixels its hairline is in front, then the windows by the circle's coverage, then that black; then over everything so made the glass's edge and the camera hole's knockout, the bars (the console and the helm), and that pixel last (`glass_front`), on the columns any of them touches. The circle's hairline is `line`.
         {
             let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
@@ -3994,6 +4011,42 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
             if cl > 0 || cr < width || ml > 0 || mr < width || first != next {
                 // Full screen (`FULL`): no circle, the app to the glass's edge.
                 let full = unsafe { FULL };
+                let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), next) };
+                let row_px = &plan[first..next];
+                let split = front_split(row_px);
+                let edge_px = &row_px[split..];
+                let (el, er) = edge_cols(g, edge_px, width);
+                let ((bl, br), bw) = bar_line(y, width, height);
+                let (hl, hr) = (g.hole_l as usize, g.hole_r as usize);
+                if let Some(front) = direct {
+                    let mut mark = |a: usize, b: usize| {
+                        if a < b {
+                            for j in (a - xa) >> 4..=(b - 1 - xa) >> 4 {
+                                touched |= 1 << j;
+                            }
+                        }
+                    };
+                    if !full {
+                        mark(xa, xb.min(cl));
+                        mark(xa.max(cr), xb);
+                        for &(x, ..) in &row_px[..split] {
+                            let x = x as usize;
+                            if x >= xa && x < xb {
+                                mark(x, x + 1);
+                            }
+                        }
+                    }
+                    for (a, b) in glass_cols(xa, xb, [(0, el), (er, width), (bl, br), (hl, hr)]) {
+                        mark(a, b);
+                    }
+                    let mut t = touched;
+                    while t != 0 {
+                        let a = xa + ((t.trailing_zeros() as usize) << 4);
+                        let b = (a + 16).min(xb);
+                        px[a..b].copy_from_slice(&front[a..b]);
+                        t &= t - 1;
+                    }
+                }
                 if !full {
                     // WHY the test: a publish covers columns xa..xb, which since the bars' worker publishes only what changed (COMPOSITOR.md step 1) need not start at the row's left; the left chrome ends at cl, which may be left of xa, and the range would then start past its end (the display panicked here after a boot, 2026-11-07).
                     if xa < xb.min(cl) {
@@ -4003,9 +4056,6 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
                         px[xa.max(cr)..xb].fill(0);
                     }
                 }
-                let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), next) };
-                let row_px = &plan[first..next];
-                let split = front_split(row_px);
                 for &(x, _, c, h) in &row_px[..if full { 0 } else { split }] {
                     let x = x as usize;
                     if x < xa || x >= xb {
@@ -4014,14 +4064,12 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
                     let (acc, t) = under_pm(0, 16384, scale_q16(line, q16(h)), 16384 - (q16(h) >> 2));
                     px[x] = under_pm(acc, t, scale_q16(px[x] & ((1 << 48) - 1), q16(c)), 0).0;
                 }
-                let edge_px = &row_px[split..];
-                let (el, er) = edge_cols(g, edge_px, width);
-                let ((bl, br), bw) = bar_line(y, width, height);
-                for x in xa..xb {
-                    if x < el || x >= er || (x >= bl && x < br) || (x >= g.hole_l as usize && x < g.hole_r as usize) {
+                // Only the columns something is in front of: left of the edge's columns, right of them, the bars, the hole (`glass_cols`); every other pixel of the row is the scene as it came. Each pixel was tested against all four until 2026-11-12, 4 cycles a pixel of a whole-screen app's publish on the X3 for a few dozen pixels a row.
+                for (a, b) in glass_cols(xa, xb, [(0, el), (er, width), (bl, br), (hl, hr)]) {
+                    for x in a..b {
                         let c = if x >= bl && x < br { bw[x] } else { CLEAR };
                         // Between the edge's columns and off the hole, no edge pixel: the bars over the pixel without the walk (`bars_over`).
-                        px[x] = if x >= el && x < er && !(x >= g.hole_l as usize && x < g.hole_r as usize) { bars_over(c, px[x]) } else { glass_front(x, g, edge_px, c, px[x]) };
+                        px[x] = if x >= el && x < er && !(x >= hl && x < hr) { bars_over(c, px[x]) } else { glass_front(x, g, edge_px, c, px[x]) };
                     }
                 }
             }
@@ -4032,22 +4080,34 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
             cap[y * width + xa..y * width + xb].copy_from_slice(&px[xa..xb]);
             continue;
         }
+        let t2 = now();
+        parts[1] += t2 - t1;
+        let c2 = ferros_sys::pmu::cycles();
         // The row's codes, once: sixteen pixels a block from xa, the last block's tail (under 16) padded.
         let codes = codes_row();
         let tail = (xb - xa) & 15;
         unsafe {
+            // Block j from the surface itself when the row is `direct` and the glass left it alone, else from `px`.
+            let (src, keep) = match direct {
+                Some(f) => (f.as_ptr(), !touched),
+                None => (px.as_ptr(), 0),
+            };
+            let at = |x: usize, j: usize| if keep >> j & 1 == 1 { src.add(x) } else { px.as_ptr().add(x) };
             let (mut x, mut j) = (xa, 0usize);
             while x + 16 <= xb {
-                codes[j] = neon::codes_app(tabs, px.as_ptr().add(x));
+                codes[j] = neon::codes_app(tabs, at(x, j));
                 x += 16;
                 j += 1;
             }
             if tail != 0 {
                 let mut pin = [0u64; 16];
-                pin[..tail].copy_from_slice(&px[x..xb]);
+                pin[..tail].copy_from_slice(core::slice::from_raw_parts(at(x, j), tail));
                 codes[j] = neon::codes_app(tabs, pin.as_ptr());
             }
         }
+        let t3 = now();
+        parts[2] += t3 - t2;
+        codes_cyc += ferros_sys::pmu::cycles() - c2;
         // Then each phase: its dither on those codes, and the row's words out.
         for k in 0..PHASES {
             if write >> k & 1 == 0 {
@@ -4071,7 +4131,110 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
             }
             dst[y * width + xa..y * width + xb].copy_from_slice(&row[xa..xb]);
         }
+        parts[3] += now() - t3;
     }
+    let slot = draw::thread_slot();
+    for (a, p) in APP_PARTS.iter().zip(parts) {
+        a.fetch_add(p, Ordering::Relaxed);
+    }
+    APP_SLOT[slot].fetch_add(now() - t_in, Ordering::Relaxed);
+    if slot == PUB_WORKERS {
+        APP_CYC.fetch_add(ferros_sys::pmu::cycles() - c_in, Ordering::Relaxed);
+        APP_CODES_CYC.fetch_add(codes_cyc, Ordering::Relaxed);
+        APP_CODES_T.fetch_add(parts[2], Ordering::Relaxed);
+    }
+    APP_ROWS[slot].fetch_add((r.y1 - r.y0) as u64, Ordering::Relaxed);
+}
+
+/// The column ranges of `xa..xb` inside any of `r` (half-open; an empty one, start at or past its end, adds nothing), in order and merged so no column comes twice: what a row's glass, bars and hole cover.
+fn glass_cols(xa: usize, xb: usize, r: [(usize, usize); 4]) -> impl Iterator<Item = (usize, usize)> {
+    let mut v = r.map(|(a, b)| (a.max(xa), b.min(xb)));
+    v.sort_unstable_by_key(|e| e.0);
+    let mut out = [(0usize, 0usize); 4];
+    let mut n = 0;
+    for (a, b) in v {
+        if a >= b {
+            continue;
+        }
+        if n > 0 && a <= out[n - 1].1 {
+            out[n - 1].1 = out[n - 1].1.max(b);
+        } else {
+            out[n] = (a, b);
+            n += 1;
+        }
+    }
+    out.into_iter().take(n)
+}
+
+/// The app publish's parts over the publishing threads, counter ticks (measure, 2026-11-11): the composition of the windows, the glass and the bars, the codes, the dither and the store.
+static APP_PARTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Each publishing thread's (the workers, then the render thread) time in app rows and how many rows.
+static APP_SLOT: [AtomicU64; PUB_WORKERS + 1] = [const { AtomicU64::new(0) }; PUB_WORKERS + 1];
+static APP_ROWS: [AtomicU64; PUB_WORKERS + 1] = [const { AtomicU64::new(0) }; PUB_WORKERS + 1];
+/// The render thread's cycles in app rows (it is pinned to the X3, so its cycle counter is its own).
+static APP_CYC: AtomicU64 = AtomicU64::new(0);
+/// The render thread's codes alone: cycles and ticks (their ratio is the X3's clock while it computes).
+static APP_CODES_CYC: AtomicU64 = AtomicU64::new(0);
+static APP_CODES_T: AtomicU64 = AtomicU64::new(0);
+/// The render thread's wait for the workers' last stripes after its own run out, ticks.
+static APP_TAIL: AtomicU64 = AtomicU64::new(0);
+
+/// The shows counted for `show_parts`' line, and their publish and wait, ticks.
+static mut PARTS_N: [u64; 3] = [0; 3];
+
+/// Every 512 shows (counted, never timed) a line of where their publish went, mean us a show: the parts summed over the threads (composition, glass and bars, codes, dither and store), each thread's rows and time (the workers, then the render thread), the render thread's wait for the last stripes, the publish and the wait for the armed frame.
+fn show_parts(log: &mut Log, t_pub: u64, t_wait: u64) {
+    let n = unsafe {
+        PARTS_N[0] += 1;
+        PARTS_N[1] += t_wait - t_pub;
+        PARTS_N[2] += now() - t_wait;
+        PARTS_N[0]
+    };
+    if n < 1 << 9 {
+        return;
+    }
+    let us = |t: u64| t * 1_000_000 / freq() / n;
+    log.s(b"display: shows parts us: compose ");
+    for (k, name) in [b"".as_slice(), b" glass ", b" codes ", b" store "].iter().enumerate() {
+        log.s(name);
+        log.dec(us(APP_PARTS[k].swap(0, Ordering::Relaxed)));
+    }
+    log.s(b"; threads");
+    for k in 0..=PUB_WORKERS {
+        log.s(b" ");
+        log.dec(APP_ROWS[k].swap(0, Ordering::Relaxed) / n);
+        log.s(b"r ");
+        log.dec(us(APP_SLOT[k].swap(0, Ordering::Relaxed)));
+    }
+    log.s(b"; X3 kcyc ");
+    log.dec(APP_CYC.swap(0, Ordering::Relaxed) / n / 1000);
+    log.s(b" (codes kcyc ");
+    log.dec(APP_CODES_CYC.swap(0, Ordering::Relaxed) / n / 1000);
+    log.s(b" in us ");
+    log.dec(us(APP_CODES_T.swap(0, Ordering::Relaxed)));
+    log.s(b")");
+    // The X3's clock right now, under the load: a dependent chain of 2^16 adds (one a cycle), its cycles and its time (2026-11-12: the firmware held the X3 at 364 MHz for seconds at a time with the SoC near 95 C, the kernel's throttle not engaged).
+    {
+        let (c0, t0) = (ferros_sys::pmu::cycles(), now());
+        let mut v = 0u64;
+        for _ in 0..1 << 14 {
+            unsafe { core::arch::asm!("add {v}, {v}, #1", "add {v}, {v}, #1", "add {v}, {v}, #1", "add {v}, {v}, #1", v = inout(reg) v, options(nomem, nostack)) };
+        }
+        let (c1, t1) = (ferros_sys::pmu::cycles(), now());
+        log.s(b"; chain MHz by cycles ");
+        log.dec((c1 - c0) * freq() / (t1 - t0) / 1_000_000);
+        log.s(b" by count ");
+        log.dec(v * freq() / (t1 - t0) / 1_000_000);
+    }
+    log.s(b"; tail ");
+    log.dec(us(APP_TAIL.swap(0, Ordering::Relaxed)));
+    log.s(b"; publish ");
+    log.dec(us(unsafe { PARTS_N[1] }));
+    log.s(b" wait ");
+    log.dec(us(unsafe { PARTS_N[2] }));
+    log.s(b"\n");
+    log.flush();
+    unsafe { PARTS_N = [0; 3] };
 }
 
 /// Where op 30 has the finished frame written instead of a phase (a free surface's pixels), 0 when not capturing.
@@ -6780,6 +6943,18 @@ fn server(grants: u64) -> ! {
     unsafe { LUT_FOR = bright };
     // The ODT's tables for this white (neon.rs `Odt`): every pixel's path.
     let mut tabs = odt_masked(white0, peak0);
+    // The f16 app light against the f32 one, over every value, once (neon.rs `light_check`).
+    {
+        let (rel, at, steps) = neon::light_check(&tabs);
+        log.s(b"display: f16 light against f32: worst ");
+        log.dec(rel as u64);
+        log.s(b" in 2^20 of the light at value ");
+        log.dec(at as u64);
+        log.s(b", most f16 steps ");
+        log.dec(steps as u64);
+        log.s(b"\n");
+        log.flush();
+    }
     // The ops 59 and 60 changes the render loop has applied (`DEV_GEN`).
     let mut dev_seen = 0u64;
     let lut_ms = ferros_sys::us_since(t_lut) / 1000;
@@ -8059,6 +8234,7 @@ fn server(grants: u64) -> ! {
                                 SHOW_US[1] += ferros_sys::us_since(t_pub) - ferros_sys::us_since(t_wait);
                                 SHOW_US[2] += ferros_sys::us_since(t_wait);
                             }
+                            show_parts(&mut log, t_pub, t_wait);
                             unsafe {
                                 CUR_PHASE = k;
                                 // When the windows are gone, the map's next frame starts from a clear screen.

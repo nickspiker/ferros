@@ -31,11 +31,15 @@ pub struct Odt {
     pub c1: uint16x8_t,
     /// The app light's f32 constants: [k/16384, 2^14, 0, 0].
     pub k: float32x4_t,
+    /// The app light in f16 (`light16h`), f16 bits by lane: Lambert's numerator and denominator in u = x/2, each over 135135, [1, 69300, 6048, 64, 1, 249480, 50400, 1792] / 135135.
+    pub hn: uint16x8_t,
+    /// f16 bits by lane: [k/2048, 256, 0, ...].
+    pub hk: uint16x8_t,
 }
 
 /// An app's 16-bit working values (gamma 2, white = Q14, to 4.0), eight of them, to light (f16 bits): x = k·v/16384, tanh(x) by Lambert's continued fraction, x·(135135 + 17325x² + 378x⁴ + x⁶) / (135135 + 62370x² + 3150x⁴ + 28x⁶), squared, ×2^14.
 #[inline(always)]
-unsafe fn light16(o: &Odt, v: uint16x8_t) -> uint16x8_t {
+pub unsafe fn light16(o: &Odt, v: uint16x8_t) -> uint16x8_t {
     unsafe {
         let half = |w: uint32x4_t| -> float32x4_t {
             let x = vmulq_laneq_f32::<0>(vcvtq_f32_u32(w), o.k);
@@ -50,6 +54,77 @@ unsafe fn light16(o: &Odt, v: uint16x8_t) -> uint16x8_t {
         core::arch::asm!("fcvtn {o:v}.4h, {lo:v}.4s", "fcvtn2 {o:v}.8h, {hi:v}.4s", lo = in(vreg) lo, hi = in(vreg) hi, o = out(vreg) out, options(pure, nomem, nostack));
         out
     }
+}
+
+/// `light16` in f16, eight lanes an instruction and no divide (2026-11-12: the f32 form, its two halves and their divides, was most of the 12 cycles a pixel an app's whole-screen publish spent on its codes on the X3). u = x/2 = k·v/32768 from the convert's four fraction bits (v/16, so 4× white stays inside f16), tanh x = 2u·N(u²)/D(u²) with N and D Lambert's to 7th order over 135135 (every coefficient a normal f16), 1/D by the estimate and one Newton step, then (256·u·N/D)² = tanh²·2^14. Within a few f16 steps of the f32 form (`light_check`).
+#[inline(always)]
+pub unsafe fn light16h(o: &Odt, v: uint16x8_t) -> uint16x8_t {
+    unsafe {
+        let out: uint16x8_t;
+        core::arch::asm!(
+            "ucvtf {u:v}.8h, {v:v}.8h, #4",
+            "fmul {u:v}.8h, {u:v}.8h, {ck:v}.h[0]",
+            "fmul {y:v}.8h, {u:v}.8h, {u:v}.8h",
+            "dup {n:v}.8h, {cn:v}.h[2]",
+            "fmla {n:v}.8h, {y:v}.8h, {cn:v}.h[3]",
+            "dup {t:v}.8h, {cn:v}.h[1]",
+            "fmla {t:v}.8h, {y:v}.8h, {n:v}.8h",
+            "dup {n:v}.8h, {cn:v}.h[0]",
+            "fmla {n:v}.8h, {y:v}.8h, {t:v}.8h",
+            "dup {d:v}.8h, {cn:v}.h[6]",
+            "fmla {d:v}.8h, {y:v}.8h, {cn:v}.h[7]",
+            "dup {t:v}.8h, {cn:v}.h[5]",
+            "fmla {t:v}.8h, {y:v}.8h, {d:v}.8h",
+            "dup {d:v}.8h, {cn:v}.h[4]",
+            "fmla {d:v}.8h, {y:v}.8h, {t:v}.8h",
+            "frecpe {t:v}.8h, {d:v}.8h",
+            "frecps {d:v}.8h, {d:v}.8h, {t:v}.8h",
+            "fmul {t:v}.8h, {t:v}.8h, {d:v}.8h",
+            "fmul {n:v}.8h, {n:v}.8h, {u:v}.8h",
+            "fmul {n:v}.8h, {n:v}.8h, {t:v}.8h",
+            "fmul {n:v}.8h, {n:v}.8h, {ck:v}.h[1]",
+            "fmul {o:v}.8h, {n:v}.8h, {n:v}.8h",
+            v = in(vreg) v, cn = in(vreg_low16) o.hn, ck = in(vreg_low16) o.hk,
+            u = out(vreg) _, y = out(vreg) _, n = out(vreg) _, t = out(vreg) _, d = out(vreg) _,
+            o = out(vreg) out,
+            options(pure, nomem, nostack),
+        );
+        out
+    }
+}
+
+/// `light16h` against `light16` over every 16-bit value: the largest difference relative to the f32 form's light (×2^20) and the value it is at, and the largest difference in f16 steps (development: said once at start).
+pub fn light_check(o: &Odt) -> (u32, u32, u32) {
+    let (mut worst, mut at, mut steps) = (0u32, 0u32, 0u32);
+    let f = |h: u16| -> f32 {
+        let r: f32;
+        unsafe { core::arch::asm!("fmov {t:h}, {h:w}", "fcvt {r:s}, {t:h}", h = in(reg) h as u32, t = out(vreg) _, r = out(vreg) r, options(pure, nomem, nostack)) };
+        r
+    };
+    for base in (0..1u32 << 16).step_by(8) {
+        let mut vs = [0u16; 8];
+        for (i, e) in vs.iter_mut().enumerate() {
+            *e = (base + i as u32) as u16;
+        }
+        let (a, b) = unsafe {
+            let v = vld1q_u16(vs.as_ptr());
+            let (mut a, mut b) = ([0u16; 8], [0u16; 8]);
+            vst1q_u16(a.as_mut_ptr(), light16(o, v));
+            vst1q_u16(b.as_mut_ptr(), light16h(o, v));
+            (a, b)
+        };
+        for i in 0..8 {
+            let (x, y) = (f(a[i]), f(b[i]));
+            steps = steps.max((a[i] as i32 - b[i] as i32).unsigned_abs());
+            // Relative to the larger of the light and 2^-10 of white (2^4 in these units): below that both are black on the panel.
+            let rel = ((x - y).abs() / x.max(16.) * (1u32 << 20) as f32) as u32;
+            if rel > worst {
+                worst = rel;
+                at = base + i as u32;
+            }
+        }
+    }
+    (worst, at, steps)
 }
 
 /// Eight pixels' light through the ODT (f16, asm: Rust's f16 is unstable).
@@ -139,8 +214,8 @@ pub unsafe fn codes_app(o: &Odt, src: *const u64) -> Codes16 {
     unsafe {
         let p0 = vld4q_u16(src as *const u16);
         let p1 = vld4q_u16((src as *const u16).add(32));
-        let (r0, g0, b0) = matrix8(o, light16(o, p0.0), light16(o, p0.1), light16(o, p0.2));
-        let (r1, g1, b1) = matrix8(o, light16(o, p1.0), light16(o, p1.1), light16(o, p1.2));
+        let (r0, g0, b0) = matrix8(o, light16h(o, p0.0), light16h(o, p0.1), light16h(o, p0.2));
+        let (r1, g1, b1) = matrix8(o, light16h(o, p1.0), light16h(o, p1.1), light16h(o, p1.2));
         let (cr, cg, cb) = (code16(o, r0, r1), code16(o, g0, g1), code16(o, b0, b1));
         let one = vdupq_n_u16(1);
         let nd = vcombine_u8(vmovn_u16(vtstq_u16(p0.3, one)), vmovn_u16(vtstq_u16(p1.3, one)));
@@ -176,8 +251,8 @@ pub unsafe fn sixteen_canvas(o: &Odt, src: *const u64, dst: *mut u32, th: uint8x
             core::arch::asm!("stp {k:q}, {k:q}, [{p}]", "stp {k:q}, {k:q}, [{p}, #32]", p = in(reg) dst, k = in(vreg) k, options(nostack, preserves_flags));
             return;
         }
-        let (r0, g0, b0) = matrix8(o, light16(o, p0.0), light16(o, p0.1), light16(o, p0.2));
-        let (r1, g1, b1) = matrix8(o, light16(o, p1.0), light16(o, p1.1), light16(o, p1.2));
+        let (r0, g0, b0) = matrix8(o, light16h(o, p0.0), light16h(o, p0.1), light16h(o, p0.2));
+        let (r1, g1, b1) = matrix8(o, light16h(o, p1.0), light16h(o, p1.1), light16h(o, p1.2));
         let (cr, cg, cb) = (code16(o, r0, r1), code16(o, g0, g1), code16(o, b0, b1));
         dither_pack([cr.0, cr.1, cg.0, cg.1, cb.0, cb.1], th, dst);
     }

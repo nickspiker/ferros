@@ -66,6 +66,8 @@ pub fn odt_tables(white: f32, peak_e: f32) -> neon::Odt {
     let c0 = [eg[0] as f64, eg[1] as f64, eg[2] as f64, kk(0, 0), kk(0, 2), kk(1, 0), kk(1, 2), kk(2, 0)].map(h);
     let c1 = [kk(2, 2), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0].map(h);
     let kf = [(k / 16384.0) as f32, F16_SCALE as f32, 0.0, 0.0];
+    let hn = [135135.0, 69300.0, 6048.0, 64.0, 135135.0, 249480.0, 50400.0, 1792.0].map(|c: f64| h(c / 135135.0));
+    let hk = [k / 2048.0, 256.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0].map(h);
     unsafe {
         neon::Odt {
             nudge_hi: vld1q_u8_x4(nudge_hi.as_ptr()),
@@ -76,6 +78,8 @@ pub fn odt_tables(white: f32, peak_e: f32) -> neon::Odt {
             c0: vld1q_u16(c0.as_ptr()),
             c1: vld1q_u16(c1.as_ptr()),
             k: vld1q_f32(kf.as_ptr()),
+            hn: vld1q_u16(hn.as_ptr()),
+            hk: vld1q_u16(hk.as_ptr()),
         }
     }
 }
