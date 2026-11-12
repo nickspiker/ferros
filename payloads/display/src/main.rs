@@ -3901,6 +3901,9 @@ fn publish_app_mask(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
     fps_dot(mask, width, height);
 }
 
+/// The apps' shows since the last stats line: how many, their publishes' µs, their waits for the armed frame's start.
+static mut SHOW_US: [u64; 3] = [0; 3];
+
 /// Whether the app publish the workers are running writes the hit map's rows too (`publish_app_mask`'s `hits`).
 static mut PUB_APP_HITS: bool = false;
 
@@ -8049,7 +8052,13 @@ fn server(grants: u64) -> ! {
                                 }
                                 PHASE_DIRTY[k] = draw::Rect::EMPTY;
                             }
+                            let t_wait = now();
                             pipe.settle(&mut armed, true);
+                            unsafe {
+                                SHOW_US[0] += 1;
+                                SHOW_US[1] += ferros_sys::us_since(t_pub) - ferros_sys::us_since(t_wait);
+                                SHOW_US[2] += ferros_sys::us_since(t_wait);
+                            }
                             unsafe {
                                 CUR_PHASE = k;
                                 // When the windows are gone, the map's next frame starts from a clear screen.
@@ -8943,8 +8952,18 @@ fn server(grants: u64) -> ! {
                 tlog.dec(unsafe { SEC_US[3] } / 1000);
                 tlog.s(b" ms, in ");
                 tlog.dec(unsafe { SEC_US[4] });
+                // The apps' shows (op 22): how many, and each one's publish and its wait for the armed frame's start, mean ms.
+                let n = unsafe { SHOW_US[0] }.max(1);
+                tlog.s(b" camera ops; app shows ");
+                tlog.dec(unsafe { SHOW_US[0] });
+                tlog.s(b", publish ");
+                tlog.dec(unsafe { SHOW_US[1] } / n / 1000);
+                tlog.s(b" ms, waited for the armed frame ");
+                tlog.dec(unsafe { SHOW_US[2] } / n / 1000);
+                tlog.s(b" ms each");
+                unsafe { SHOW_US = [0; 3] };
                 // The hit map's rows (hit.rs) over these ten seconds: their time summed over the publishing threads, and how many.
-                tlog.s(b" camera ops; hit map ");
+                tlog.s(b"; hit map ");
                 tlog.dec(hit::TICKS.swap(0, Ordering::Relaxed) * 1_000_000 / freq());
                 tlog.s(b" us in ");
                 tlog.dec(hit::ROWS.swap(0, Ordering::Relaxed));

@@ -301,3 +301,15 @@ The first draw at a size adds the stage, 4.0 ms. Each part is on ahau's console 
 - **The parameters.** `j_extent`'s points are now split four ways. What remains is serial: the descent (`classify`) and the sprayed cycles (`cycle_point`, also independent, also splittable). Fewer points or steps would move every mark's framing (the owner's call).
 - **The compile.** Handle-dependent constants are folded at record time, so each keystroke compiles again.
 - **The shading's sin, cos and atan** are still polynomials. Valhall has FSIN_TABLE, FCOS_TABLE, FSINCOS_OFFSET and FATAN_ASSIST/TABLE.
+
+## Kists' frames on the GPU (2026-11-11)
+
+Mahere's map draws on the GPU (GPU-KISTS.md plan step 4, its first cut), and the service, the kernel and the display grew for it:
+- **The fence admits the apps' surfaces.** `s2mpu::fence_gpu` fences two GiBs now (`fence_gbs`): gpu-mem and the layer arena as before, and the apps' surfaces (cachemap SURFACES) in the GiB above. The GPU service gets them as its slot 7 and maps all four coherent at GPU VA G#C000_0000, so a client's kernel writes its own surface, the buffer the display composes, with no copy. Every GPU client can write every app's surface, as every one already shares the arena: the isolation is plan step 1's.
+- **The layer arena is 128 MiB**, G#9800_0000-G#A000_0000 (memblock: plain memory; the device tree reserves nothing there): Mahere keeps its cells' planes there, a MiB each. The service maps it by its size, which `SYS_DMA` answers with x1 = 1 (ferros_sys `dma_size`); a kernel from before answers the base, and the service then maps 64 MiB. Not checked on akita's memory map.
+- **64 uniform slots a run** (16 before; `valhall::ssa::uniform_slots`): a kernel recorded with a frame's constants reads them from uniforms with no move before each use.
+- **A served job is said only when it fails**: a client drawing every frame made a line a job.
+- **The display's app show** (op 22): the publish split across the publish workers, the hit map's rows written only when the windows' layout changed, the next phase published before waiting for the armed frame's start; each ten seconds' line says the shows and their publish and wait.
+
+Measured on the Pro: Mahere's kernel 6.6 to 7.7 ms a whole-screen frame at 890 MHz; the display's show of it about 20 ms; about 49 frames a second on the glass at a town's scale (GPU-KISTS.md step 4 has the parts and what 120 Hz still needs).
+

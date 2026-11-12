@@ -192,6 +192,25 @@ Each step is measured on the Pro before the next; sizes are estimates.
 4. **Mahere's exact-coverage compose** as a WGSL kernel over resident cells.
    - Proof: full-screen frames under 8.3 ms at rest and panning, compared by eye with Mahere's nine samples.
    - Size: 1-1.5k lines of kernel, 500 in mahere-ferros.
+   - **First cut built (2026-11-11), Rust recorded, one sample a pixel** (owner, that night: "Obviously get mahere on GPU proper and flawless at 120fps"):
+     - Mahere's mahere-ferros records its CPU raster's compose (raster.rs `compose_rgb`) as a kernel through `valhall::ssa` every frame, the frame's light, inks, sun, disk, depths and layer mask its constants (64 uniform slots: 206 of the first cut's 836 words were moves of constants before their uses), and runs it through the GPU service over every pixel: 665 to 714 words, no loop.
+     - Each pixel finds its 32 px tile, its block (the plan's lattice, 4 px sub-blocks across a diamond's seam), its (u, v) by the block's bilinear steps, and for the terrain and the vector planes the cell among the block's 2 × 2 at the wanted depth (the finest resident stand-in, from the plan's candidates), then its triangle texel as the CPU does.
+     - The cells' planes live in 1 MiB slots of the layer arena, written once when a frame first draws them and kept (a frame evicts only what it does not draw): the terrain's packed texels as they are, the vector planes two words a texel.
+     - The panel and the screen's marks go in front as an overlay (premultiplied, painted again only when what they show changed), composed front to back in the kernel.
+     - Out: the display's working values straight into the app's surface (the GPU's fence admits the apps' surfaces since that night, `s2mpu::fence_gpu`), so no CPU touches a frame's pixels; where the surfaces are not fenced in (a kernel from before), fluor's Argb8 in the arena for fluor's host to present.
+     - The light goes out as VSF light: the CPU path's BT.2020 matrix and Opsin's rail are the Android and Linux surfaces' contract, and the ferros CPU path's bytes had been read as `g2t` codes by fluor's host (a mismatch of the CPU path's, untouched).
+     - Checked on the host: the words in valhall's emulator against `render_frame` over cells of every plane, turned and spanning cells: 7504 of 7680 pixels the same code, two more than four codes apart.
+     - Not on the GPU yet (the CPU path has them): the lettering, imagery, ownership and MVUM, the user's ink and selection, slope bands, raw elevation, the selection being drawn, the measurement's line, a terrain texel with no data climbing to its parent.
+   - **Measured on the Pro** (a bench of two fingers panning and pinching every frame; 1344 × 2992):
+     - The kernel: 6.6 to 7.7 ms a frame on the GPU at 890 MHz (4 Mpx, compute-bound: about four warp instructions a cycle a core).
+     - Mahere's own frame, a town's scale: 15 to 16 ms (the plan 6.5 to 7.5 ms: corners 2.4 to 3, candidates 3.1; cells, blocks, overlay, record and compile together about 1.5; the GPU call); at globe zoom 40 ms (the plan 14 to 21 ms: hundreds of seam tiles of 81 exact sub-corners).
+     - The display's show of a whole-screen app frame (op 22): about 20 ms of its render thread (28 ms before that night's split across the publish workers).
+     - On the glass: about 49 frames a second at a town's scale, 24 to 25 at globe zoom; before, the CPU raster's frames took 1.5 to 2 s.
+   - **What 120 Hz still needs:**
+     - The display's publish of a whole-screen app frame near its NEON ideal (about 1.5 ms of wall a phase, GPU.md): it is about 20 ms; where it goes is to measure (the composition, the codes, the dither, the glass, the workers' contention with the app's own threads).
+     - A GPU layer as a mailbox (1.4): today the kernel writes the one surface the display reads, so the GPU's next job cannot overlap the display's publish of the last without tearing.
+     - The lattice and the cell lookup in the kernel, from the camera and a page table (0.2's "per frame: the camera, table changes"), so the CPU's 6.5 to 21 ms plan goes.
+     - The kernel itself to about 4 ms: f16 for the light and the colours (paired), and branches over what a warp does not need.
 5. **Lumis's preview, zero copies:** camera DMA into pinned frames inside both the ISPFE and G3D fences, a kernel from the CFA to a layer; Lumis must first build for ferros.
    - Proof: no CPU copy, CPU time a frame near zero, the sensor's frame end to the layer measured.
    - Size: 200 lines of kernel, 500 in the camera path.
