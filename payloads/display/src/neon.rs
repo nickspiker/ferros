@@ -1,12 +1,12 @@
 //! The display's pixel work in NEON, 16 pixels a step, one branchless path for every pixel: no grey test, no scalar fallback.
 //! - **The present** (owner, 2026-11-12: "a straight thru render and a sqrt to get the gamma close"): the canvas and a baked surface already hold the panel's own codes (COMPOSITOR.md "Baked"), so a phase's words are each code plus its threshold, the high byte, packed (`present16`, `present_app16`, `present_pack`). About one instruction a pixel.
-//! - **The bake** (`bake16`, `bake16_lights`): working values (VSF RGB, gamma 2, white at Q14) through the roll-off, the ODT and the panel's 1/2.19 to those codes, the ODT's tables (`Odt`) as before. What every frame paid until 2026-11-12 is now paid once per image (the wallpaper as it loads, the icons, the console's decoded rows) and per frame only for a surface that is not baked (a format 0 or 1 window).
+//! - **The bake** (`bake16`, `bake16_lights`): working values (VSF RGB, gamma 2, white at Q14) thru the roll-off, the ODT and the panel's 1/2.19 to those codes, the ODT's tables (`Odt`) as before. What every frame paid until 2026-11-12 is now paid once per image (the wallpaper as it loads, the icons, the console's decoded rows) and per frame only for a surface that is not baked (a format 0 or 1 window).
 //! - The old present (`sixteen_canvas`, `codes_app`, `dither_codes`, `thresholds`) is kept for the start-up bench that measures one against the other and for the GPU driver's check of its present kernel (payloads/gpu).
 
 use core::arch::aarch64::*;
 
 /// The present's dither (owner, 2026-11-12: "if I remember right, there's some tricks to get a nice dither for our four panes"): a 16 × 16 blue-noise threshold field, every rank 0-255 once (void and cluster on the torus, Ulichney's σ 1.5), so each phase alone carries the eight fraction bits a baked code has below the 8-bit code the link takes; and phase k turns each threshold's two low bits by `TURN[k]` (an XOR), so over the four phases a pixel visits four thresholds within 3/256 of a code of each other.
-/// Measured on the host against the dithers it could have been (each phase's error and the change from one phase to the next through an eye-like blur of 0.75, 1 and 1.5 px, every fraction of a code; COMPOSITOR.md "The dither"): at rest, where each phase is held a tenth of a second, as quiet as the old 4×4 Bayer with its temporal rank and the same as a 16 × 16 Bayer; the shimmer from phase to phase 2.5 times smaller than the old one's and the smallest of every candidate (a 2 × 2 pattern turned through the phases shimmers twice as much at arm's length, a fresh noise each phase four times).
+/// Measured on the host against the dithers it could have been (each phase's error and the change from one phase to the next thru an eye-like blur of 0.75, 1 and 1.5 px, every fraction of a code; COMPOSITOR.md "The dither"): at rest, where each phase is held a tenth of a second, as quiet as the old 4×4 Bayer with its temporal rank and the same as a 16 × 16 Bayer; the shimmer from phase to phase 2.5 times smaller than the old one's and the smallest of every candidate (a 2 × 2 pattern turned thru the phases shimmers twice as much at arm's length, a fresh noise each phase four times).
 pub const BLUE: [[u8; 16]; 16] = [
     [78, 190, 245, 170, 143, 39, 192, 90, 172, 247, 163, 138, 7, 187, 133, 236],
     [3, 152, 47, 71, 210, 120, 234, 0, 213, 114, 20, 203, 83, 55, 208, 98],
@@ -143,7 +143,7 @@ pub unsafe fn bake16(o: &Odt, src: *const u64, dst: *mut u64) {
     }
 }
 
-/// 16 pixels' lights (f16 bits, the E peak at 2^14, VSF RGB: red, green, blue, two halves each) through the ODT and the panel's code into baked pixels, `a0`, `a1` their fourth lanes.
+/// 16 pixels' lights (f16 bits, the E peak at 2^14, VSF RGB: red, green, blue, two halves each) thru the ODT and the panel's code into baked pixels, `a0`, `a1` their fourth lanes.
 #[inline(always)]
 pub unsafe fn bake16_lights(o: &Odt, l: [uint16x8_t; 6], a0: uint16x8_t, a1: uint16x8_t, dst: *mut u64) {
     unsafe {
@@ -347,7 +347,7 @@ unsafe fn code16(o: &Odt, a: uint16x8_t, b: uint16x8_t) -> (uint16x8_t, uint16x8
     }
 }
 
-/// The old present's dither and pack (`sixteen_canvas`): three channels of 16 Q4 codes, dithered by `th` (one threshold per pixel, 0-63), packed B[31:22] G[21:12] R[11:2] A[1:0] (each code's two low bits zero, for the DQE's truncation) and stored as 16 words: the word's four bytes are four planes — (R << 4) | 3, (G << 6) | (R >> 4), G >> 2, B — written by one interleaving store.
+/// The old present's dither and pack (`sixteen_canvas`): three channels of 16 Q4 codes, dithered by `th` (one threshold per pixel, 0-63), packed B[31:22] G[21:12] R[11:2] A[1:0] (each code's two low bits zero, for the DQE's truncation) and stored as 16 words: the word's four bytes are four planes: (R << 4) | 3, (G << 6) | (R >> 4), G >> 2, B, written by one interleaving store.
 #[inline(always)]
 pub unsafe fn dither_pack(q: [uint16x8_t; 6], th: uint8x16_t, dst: *mut u32) {
     unsafe {
@@ -366,7 +366,7 @@ pub unsafe fn dither_pack(q: [uint16x8_t; 6], th: uint8x16_t, dst: *mut u32) {
     }
 }
 
-/// The old present (until 2026-11-12, the bench's "before" and the GPU driver's reference): 16 working pixels (R, G, B, A in 16-bit lanes, white at Q14, to 4.0) through the ODT with this row's thresholds into 16 words: the light by Lambert's tanh, the ODT, the code, the old dither, the pack. Over black, so alpha plays no part. Sixteen black pixels are 16 black words without the ODT.
+/// The old present (until 2026-11-12, the bench's "before" and the GPU driver's reference): 16 working pixels (R, G, B, A in 16-bit lanes, white at Q14, to 4.0) thru the ODT with this row's thresholds into 16 words: the light by Lambert's tanh, the ODT, the code, the old dither, the pack. Over black, so alpha plays no part. Sixteen black pixels are 16 black words without the ODT.
 #[inline(always)]
 pub unsafe fn sixteen_canvas(o: &Odt, src: *const u64, dst: *mut u32, th: uint8x16_t) {
     unsafe {

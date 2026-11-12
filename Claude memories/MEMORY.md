@@ -105,7 +105,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: AVB key freedom](feedback_avb_key_freedom.md) — use keys/avb.vsf freely while it stays VSF in Code/keys
 - [Feedback: lock prep, never the lock](feedback_lock_prep_not_lock.md) — prepare locking freely, never run the lock before release; unattended = nothing risky
 - [tapuwae: NEON then GPU](tapuwae_neon_then_gpu.md) — attest mark renders on NEON now; owner: convert to the Mali GPU once ferros drives it
-- [fluor pixel depth](fluor_pixel_depth.md) — fluor at Argb8 or G2t16 from one source; display decodes G2t16 natively (op 22 format 1)
+- [fluor pixel depth](fluor_pixel_depth.md) - fluor at Argb8 or G2t16 from one source; display bakes it; [baked present](baked_present.md) since 2026-11-12
 - [Android boot experiments trip rescue](android_boot_experiments_rescue_party.md) — changed slot a images hit "Cannot load Android system"; ask first, never factory reset
 - [Modem: registration, IP, driver process](modem_uecap_registration.md) — Verizon LTE/NR + IP under ferros, payloads/modem; uecap per block; kprobe capture
 - [pKVM resets on wipe](pkvm_resets_on_wipe.md) — fastboot -w re-enables pKVM; `fastboot oem pkvm disable` after every wipe, check status

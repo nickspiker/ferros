@@ -1757,7 +1757,7 @@ fn brightness(v: u8) -> (f32, f32, bool, u16) {
     (white, native * e_light(), hbm, dbv)
 }
 
-/// The old present's dither, kept for the ramps (op 21) and the start-up bench's "before" (the present's own since 2026-11-12 is neon.rs `BLUE` and `TURN`: a 16 × 16 blue-noise field of every 256th of a code, its two low bits turned each phase). The ordered 4×4 dither (Bayer), in sixteenths. The table's Q4 10-bit code is a Q6 8-bit code; the threshold (×4, in 64ths) is added before the six fraction bits are dropped, so each 4×4 cell (0.2 mm at 489 ppi) carries four bits below the 8-bit code the link takes: 12 bits effective. The DQE's own dither is in shift mode (kernel `start_home`), passing these 8 bits through untouched — two ordered dithers stacked partly cancelled into visible steps (owner's eyes, 2026-10-22).
+/// The old present's dither, kept for the ramps (op 21) and the start-up bench's "before" (the present's own since 2026-11-12 is neon.rs `BLUE` and `TURN`: a 16 × 16 blue-noise field of every 256th of a code, its two low bits turned each phase). The ordered 4×4 dither (Bayer), in sixteenths. The table's Q4 10-bit code is a Q6 8-bit code; the threshold (×4, in 64ths) is added before the six fraction bits are dropped, so each 4×4 cell (0.2 mm at 489 ppi) carries four bits below the 8-bit code the link takes: 12 bits effective. The DQE's own dither is in shift mode (kernel `start_home`), passing these 8 bits thru untouched: two ordered dithers stacked partly cancelled into visible steps (owner's eyes, 2026-10-22).
 const BAYER: [[u16; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
 /// A Q4 10-bit code (= Q6 8-bit) to the 10-bit word's code: dithered to 8 bits by the threshold `th` (0-63, in 64ths of an 8-bit step), the two low bits zero for the DQE's truncation.
@@ -1901,7 +1901,7 @@ fn pub_take(job: u64) {
             publish_app_rows(stripe, unsafe { &*(&raw const PUB_TABS) }, mask, w, h, unsafe { PUB_APP_HITS });
         } else if unsafe { PUB_KIND } == 5 {
             // The wallpaper baked again (a brightness change, `rebake`): this stripe's rows.
-            wall_bake_rows(w, h, stripe.y0 as usize, stripe.y1 as usize);
+            wall_rebake_rows(w, h, stripe.y0 as usize, stripe.y1 as usize);
         } else {
             let back = unsafe { core::slice::from_raw_parts(base as *const Px, w * h) };
             publish_band(back, w, h, unsafe { &*(&raw const PUB_TABS) }, mask, stripe);
@@ -2755,7 +2755,7 @@ fn stripes(kind: u8, base: usize, width: usize, height: usize, r: draw::Rect) {
             match kind {
                 1 => scene_stripe(core::slice::from_raw_parts_mut(base as *mut Px, width * height), width, height, r),
                 2 => hit::stripe(width, height, r),
-                5 => wall_bake_rows(width, height, r.y0 as usize, r.y1 as usize),
+                5 => wall_rebake_rows(width, height, r.y0 as usize, r.y1 as usize),
                 _ => hit::paint_stripe(width, r),
             }
             return;
@@ -4099,6 +4099,8 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
             }
             let layer = |i: u8| order[i as usize];
             let plain = chain.iter().all(|&i| layer(i).1 == BAKED && layer(i).2 & MODE_MASK == 0);
+            // Working windows in Normal (format 0: the attest screen, the keyboard): opaque or see-through by the bit alone, as baked ones, so the same select once their rows are baked.
+            let select = chain.iter().all(|&i| layer(i).1 != G2T16 && layer(i).2 & MODE_MASK == 0);
             let (k0, f0, m0) = layer(chain[0]);
             let front = &window_pixels(k0 as usize, width, height)[y * width..(y + 1) * width];
             if m0 & OPAQUE != 0 && f0 == BAKED && can_direct && a == xa && b == xb {
@@ -4117,6 +4119,24 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
                         let p = px[x];
                         let m = (p >> 63).wrapping_neg();
                         px[x] = (p & !m) | (src[x] & m);
+                    }
+                }
+                for p in &mut px[a..b] {
+                    *p &= ((*p >> 63) ^ 1).wrapping_neg();
+                }
+            } else if select {
+                // The same select over the chain's rows baked first (`layer_row`).
+                let rows = layer_rows();
+                for (n, &i) in chain.iter().enumerate() {
+                    let (k, f, _) = layer(i);
+                    layer_row(k as usize, f, y, a, b, width, height, &mut rows[n]);
+                }
+                px[a..b].copy_from_slice(&rows[0][a..b]);
+                for row in &rows[1..chain.len()] {
+                    for x in a..b {
+                        let p = px[x];
+                        let m = (p >> 63).wrapping_neg();
+                        px[x] = (p & !m) | (row[x] & m);
                     }
                 }
                 for p in &mut px[a..b] {
@@ -4221,7 +4241,7 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
                 }
             }
         }
-        // A screencap (op 30): the finished row, baked, into the capture surface instead of through the dither (op 30 unbakes the surface once it is whole).
+        // A screencap (op 30): the finished row, baked, into the capture surface instead of thru the dither (op 30 unbakes the surface once it is whole).
         if unsafe { CAPTURE } != 0 {
             let cap = unsafe { core::slice::from_raw_parts_mut(CAPTURE as *mut u64, width * height) };
             cap[y * width + xa..y * width + xb].copy_from_slice(&px[xa..xb]);
@@ -5240,7 +5260,7 @@ fn wall_load(again: bool) {
     clean_reset_all();
 }
 
-/// The person's own wallpaper (`map.wallpaper` in their space: a VSF visual, one plane of VSF RGB gamma2tanh codes at 16 bits, planar [3, height, width], as tools/wallpaper and tools/screencap write one), or the one made on this device (`map.wallpaper.made`), into `WALL_BUF`; whether it did. On the loader's thread (`wall_loader`). vsf's container locates the plane over the vault (`VaultSource`); then the plane is read from its first byte to its last, a transfer at a time at the transfer's own boundaries in the value (so the vault opens each of its pieces once, sixteen at a time on a kernel from 2026-11-11), and each code kept as it arrives (`WALL_SRC`, the three planes one after another), and the whole baked once the plane is in (`wall_bake_rows`).
+/// The person's own wallpaper (`map.wallpaper` in their space: a VSF visual, one plane of VSF RGB gamma2tanh codes at 16 bits, planar [3, height, width], as tools/wallpaper and tools/screencap write one), or the one made on this device (`map.wallpaper.made`), into `WALL_BUF`; whether it did. On the loader's thread (`wall_loader`). vsf's container locates the plane over the vault (`VaultSource`); then the plane is read from its first byte to its last, a transfer at a time at the transfer's own boundaries in the value (so the vault opens each of its pieces once, sixteen at a time on a kernel from 2026-11-11), and each code put in its pixel's lane as it arrives (the three planes one after another, red setting each pixel opaque), the whole baked in place once the plane is in (`wall_bake_rows`).
 fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> bool {
     let c = cap(grants, S_MAP_SCOPE);
     let Some(len) = ferros_sys::store_get(c, key, &mut []) else { return false };
@@ -5287,8 +5307,8 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
     // The document is done with: its source's spans are the stretch buffers the plane's reads now reuse.
     drop(doc);
     let t_open = ferros_sys::us_since(t0);
-    // The codes as they come, kept (`WALL_SRC`): baked into `WALL_BUF` once the plane is whole (`wall_bake_rows`), and again from here at a brightness change.
-    let src = unsafe { core::slice::from_raw_parts_mut(WALL_SRC as *mut u16, 3 * n) };
+    // Each code into its pixel's lane as it comes (the planes one after another, red setting the pixel opaque), and the whole baked in place once the plane is in (`wall_bake_rows`).
+    let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, n) };
     // Stretches of a MiB at their own boundaries in the value (sixteen of the vault's pieces, opened as one batch; on an older kernel `vault_read` moves one in its own smaller calls, still at piece boundaries), two buffers: the reader thread fills one (`read_post`) while this thread converts the other.
     // The two stretches are statics, not the loader's arena (2026-11-11, the Pro: "memory allocation of 524288 bytes failed" at start, the 2 MiB arena already holding ~1.87 MiB of the document's reading): one load at a time uses them (`LOADING`).
     let (first, end) = (span.data_offset, span.data_offset + span.data_len);
@@ -5322,17 +5342,23 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
         let t = now();
         let mut i = 0;
         if let Some(hi) = carry.take() {
-            src[s] = u16::from_be_bytes([hi, bytes[0]]);
+            wall_sample(buf, n, s, u16::from_be_bytes([hi, bytes[0]]));
             s += 1;
             i = 1;
         }
-        // The pairs whole in this transfer, kept as the codes they are (big-endian in the value).
-        let run = ((bytes.len() - i) >> 1).min(3 * n - s);
-        for (d, b) in src[s..s + run].iter_mut().zip(bytes[i..i + 2 * run].chunks_exact(2)) {
-            *d = u16::from_be_bytes([b[0], b[1]]);
+        // The pairs whole in this transfer, run by run within one plane, each code into its pixel's lane as it is (big-endian in the value).
+        while i + 1 < bytes.len() {
+            let (plane, p0) = (s / n, s % n);
+            let run = ((bytes.len() - i) >> 1).min(n - p0);
+            let codes = bytes[i..i + 2 * run].chunks_exact(2).map(|b| u16::from_be_bytes([b[0], b[1]]) as u64);
+            let px = &mut buf[p0..p0 + run];
+            match plane {
+                0 => px.iter_mut().zip(codes).for_each(|(p, v)| *p = 0xFFFF << 48 | v),
+                _ => px.iter_mut().zip(codes).for_each(|(p, v)| *p |= v << (16 * plane)),
+            }
+            s += run;
+            i += 2 * run;
         }
-        s += run;
-        i += 2 * run;
         if i < bytes.len() {
             carry = Some(bytes[i]);
         }
@@ -5497,6 +5523,10 @@ fn rebake(mips: &[draw::Mips], width: usize, height: usize) {
             FLIGHT = None;
         }
         if WALL_ON && !LOADING {
+            // The old bake's unbake tables in this pass's scratch, read by every stripe.
+            let (to_p, to_v) = (alloc::vec![0f32; 1 << 16].leak(), alloc::vec![0u16; UNBAKE_V + 1].leak());
+            bake::before().unbake_tables(to_p, to_v);
+            WALL_UNBAKE = (to_p.as_ptr() as usize, to_v.as_ptr() as usize);
             stripes(5, 0, width, height, draw::Rect::full(width, height));
         }
     }
@@ -5509,19 +5539,39 @@ fn rebake(mips: &[draw::Mips], width: usize, height: usize) {
     }
 }
 
-/// The wallpaper's codes as the vault keeps them (three planes of 16-bit VSF RGB gamma2tanh codes, the screen's size each), kept so a brightness change bakes it again without reading the vault (`wall_bake_rows`): 6 bytes a pixel, 23 MiB on husky, 15 MiB on akita, from the heap at start. 0 with no wallpaper buffer.
-static mut WALL_SRC: usize = 0;
+/// Sample `s` of the three planes (each `n` pixels) into its pixel's lane as the code it is: the first plane sets the pixel opaque with its red, the others add theirs.
+#[inline(always)]
+fn wall_sample(buf: &mut [u64], n: usize, s: usize, code: u16) {
+    let (plane, p) = (s / n, s % n);
+    buf[p] = if plane == 0 { 0xFFFF << 48 | code as u64 } else { buf[p] | (code as u64) << (16 * plane) };
+}
 
-/// Rows `y0..y1` of the wallpaper baked from its codes (`WALL_SRC`) into `WALL_BUF`, opaque (bake.rs `codes_row`): on the loader's thread as a load finishes, and by stripes on the publish workers at a brightness change (`stripes` kind 5).
+/// Rows `y0..y1` of the wallpaper, each pixel's three g2t codes in its lanes as the loader put them, baked in place (bake.rs `codes_in_place`), on the loader's thread as a load finishes.
+/// The wallpaper keeps no copy of its codes (a copy in the display's heap, 15 MiB on akita and 23 on husky, was tried first and dropped: the arc pool is tight, and on the 8a that day wallgen was refused for room with or without it): a brightness change bakes it again from what it holds (`wall_rebake_rows`).
 fn wall_bake_rows(width: usize, height: usize, y0: usize, y1: usize) {
-    let n = width * height;
-    let (src, buf) = unsafe { (core::slice::from_raw_parts(WALL_SRC as *const u16, 3 * n), core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, n)) };
+    let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, width * height) };
     let b = bake::now();
     for y in y0..y1 {
-        let o = y * width;
-        b.codes_row(&src[o..o + width], &src[n + o..n + o + width], &src[2 * n + o..2 * n + o + width], &mut buf[o..o + width]);
+        b.codes_in_place(&mut buf[y * width..(y + 1) * width]);
     }
 }
+
+/// The tables `wall_rebake_rows` unbakes with (`Bake::unbake_tables`, the bake before this one's), made by the render thread for one brightness change in its frame scratch: (to_p, to_v).
+static mut WALL_UNBAKE: (usize, usize) = (0, 0);
+
+/// Rows `y0..y1` of the wallpaper baked again at a brightness change (`stripes` kind 5, `rebake`): each pixel unbaked with the bake before (`Bake::unbake_with`, its tables in `WALL_UNBAKE`), back to working values, and baked with the new one. A round trip thru the codes: exact but for what the old bake lost for good (a channel past the gamut, the roll-off's last stops).
+fn wall_rebake_rows(width: usize, height: usize, y0: usize, y1: usize) {
+    let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, width * height) };
+    let (to_p, to_v) = unsafe { (core::slice::from_raw_parts(WALL_UNBAKE.0 as *const f32, 1 << 16), core::slice::from_raw_parts(WALL_UNBAKE.1 as *const u16, UNBAKE_V + 1)) };
+    let (old, new) = (bake::before(), bake::now());
+    for y in y0..y1 {
+        let row = &mut buf[y * width..(y + 1) * width];
+        old.unbake_with(row, to_p, to_v);
+        new.working_row(row);
+    }
+}
+/// The unbake's root table's steps (`Bake::unbake_tables`).
+const UNBAKE_V: usize = 1 << 12;
 
 /// Whether the helm has been drawn (it shows nothing that changes; drawn once, at the first pass).
 static mut HELM_DRAWN: bool = false;
@@ -6762,7 +6812,7 @@ fn pack10(r: u32, g: u32, b: u32) -> u32 {
     (b << 22 | g << 12 | r << 2 | 3) & word_mask()
 }
 
-/// The canvas through the present with the spatial dither only (temporal off): phase 0's thresholds, 16 pixels a step (neon.rs `present16`), a row at a time through a cached buffer, then one wide copy into the non-cacheable framebuffer.
+/// The canvas thru the present with the spatial dither only (temporal off): phase 0's thresholds, 16 pixels a step (neon.rs `present16`), a row at a time thru a cached buffer, then one wide copy into the non-cacheable framebuffer.
 fn publish10(back: &[Px], screen: &mut [u32], width: usize, _tabs: &neon::Odt) {
     // The hit map with it (hit.rs): this path publishes the whole screen, with no phases to write it in.
     hit::refresh(width, back.len() / width, draw::Rect::full(width, back.len() / width));
@@ -7292,11 +7342,10 @@ fn server(grants: u64) -> ! {
     unsafe {
         let sprites = ferros_sys::dma(cap(grants, S_SPRITES));
         if sprites != 0 && sprites != ferros_sys::ERR {
-            // The region's lower 32 MiB are the sprites', its upper 32 MiB the wallpaper's (a full screen of baked pixels, 1344 × 2992 × 8 bytes, just fits); its codes as the vault keeps them in the heap, to bake it again at a brightness change (`WALL_SRC`).
+            // The region's lower 32 MiB are the sprites', its upper 32 MiB the wallpaper's (a full screen of baked pixels, 1344 × 2992 × 8 bytes, just fits).
             ARENA = sprites as usize;
             ARENA_WORDS = (32 << 20) / 8;
             WALL_BUF = sprites as usize + (32 << 20);
-            WALL_SRC = alloc::vec![0u16; 3 * width * height].leak().as_mut_ptr() as usize;
         } else {
             ARENA = alloc::vec![0u64; ARENA_WORDS].leak().as_mut_ptr() as usize;
         }
@@ -8832,8 +8881,10 @@ fn server(grants: u64) -> ! {
                     let unbake = |s: &mut [u64]| {
                         if !raw {
                             let mut to_p = alloc::vec![0f32; 1 << 16];
-                            let mut to_v = alloc::vec![0u16; (1 << 12) + 1];
-                            bake::now().unbake(s, &mut to_p, &mut to_v);
+                            let mut to_v = alloc::vec![0u16; UNBAKE_V + 1];
+                            let b = bake::now();
+                            b.unbake_tables(&mut to_p, &mut to_v);
+                            b.unbake_with(s, &to_p, &to_v);
                         }
                     };
                     let text: alloc::string::String = match (unsafe { APP }.is_some() && !mask, free) {

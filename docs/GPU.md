@@ -199,7 +199,7 @@ The cheapest speed-up the GPU allows and NEON does not: the light (the tanh rati
 
 ## Layers: the shared arena (2026-11-05)
 
-The owner's direction: the GPU produces compute-dense layers (the Mandelbrot and tapuwae, glows, edge effects). The CPU composes them front to back with `under` and presents them on NEON. Buffers are shared in RAM, never copied. The present stage stays on the CPU, where it measured faster.
+The owner's direction: the GPU produces compute-dense layers (the Mandelbrot and tapuwae, glows, edge effects). The CPU composes them front to back with `under` and presents them on NEON. Buffers are shared in RAM, never copied. The present stage stays on the CPU, where it measured faster. Since 2026-11-12 the present is the dither and the pack alone (COMPOSITOR.md "Baked"), a strict subset of the kernel above, kept on NEON; the GPU touching it last is the documented option there.
 
 **The arena** (cachemap `LAYERS`): 64 MiB at G#9C00_0000.
 - **On the CPU's side:** Normal write-back, EL0 read/write, never executable.

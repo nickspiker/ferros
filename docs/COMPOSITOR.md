@@ -35,8 +35,8 @@ Anything that draws on the render thread can stall the screen. The cure is struc
    - A kist entering splits the group it lands in, whose members stay valid on their own. A kist leaving lets its neighbours merge again.
    - An opaque full-screen layer drops everything behind it from the walk.
 7. **Compose once, dither four times.**
-   - The composed working buffer (gamma 2, white at Q14) is made once a frame.
-   - Only the present (the table, the gains, the dither, the 10-bit pack) runs per phase, and only in tiles that changed.
+   - The composed buffer is made once a frame, baked (since 2026-11-12, "Baked" below: the panel's own codes).
+   - Only the present (the dither and the 10-bit pack) runs per phase, and only in tiles that changed.
 8. **One kernel.**
    - `under` in NEON on 16-bit channels, two pixels a 128-bit register, branchless within a span.
    - The early-outs are per tile and per span, never per pixel.
@@ -192,6 +192,83 @@ The owner: "Need a channel picker in debug that enables/disables red/green/blue 
   - **The DQE's matrix, not used.** The DQE has a 3×3 gamma matrix in the path (`DQE_GAMMA_MATRIX_CON` G#0C00, its coefficients G#0C04-G#0C14 and offsets G#0C18-G#0C1C in Google's cal_9865 regs-dqe.h; `dqe_quiet` writes its control 0), which could zero a channel in hardware for free. Not used: the coefficients' unity scale, cal's version offset for the matrix block on zuma, and whether an identity matrix passes every 10-bit code thru the display dither's shift mode unchanged are all unmeasured, and the software mask costs nothing a pixel anyway.
 - **The release look.** The development look (the orange outside the glass's edge, on its hairline and the camera hole's knockout, `EDGE_ORANGE`; the app circle's hairline, `hairline()`) is a runtime switch on development builds (`LOOK`, from `DEV_LOOK`: FERROS_RELEASE_LOOK at build time still starts a build in the release look). Op 64 `[what u8: 0 ask, 1 release]` → `[0][release]` turns it off until the display starts again: no way back but a reboot, nothing stored. The map's Developer page has its row ("release look", the box and the label in the orange while the orange shows, "until a reboot" under it), and the map's own hairline follows it (`LOOK` there too, asked of the display when the map starts).
 - **Release builds** answer both ops with status 1 (every channel on, the release look) and the map shows neither row.
+
+## Baked (2026-11-12)
+
+Until then every frame's pixels went thru the present: the roll-off (tanh in root space), the ODT to the panel's primaries, the panel's 1/2.19, the four-phase dither and the 10-bit pack, about 9.5 cycles a pixel on NEON (8 the codes, 1.5 the dither and the store). At 4 Mpx and 120 frames/s that is 4.6 G cycles a second, which held a full-screen GPU app near 75 frames/s on the Pro.
+
+The owner: "it's just a block of memory so if the GPU touches it last and we precompute the tanh highlight colours for all elements then it's a straight thru render and a sqrt to get the gamma close (we'd bake the diff in the precomputed colours but that makes the last step a sqrt instead)". On blends after the roll-off and brightness inside the curve: "meh. doubt anyone will notice. also meh. I don't particularly plan on putting quick brightness changing in the UI." And: "just has to look closeish, pixel exact will not be a thing."
+
+### The baked format
+
+- **A pixel** is as before, 64 bits: R, G, B in bits 0-15, 16-31, 32-47, premultiplied, and the fourth lane the canvas's α (or a surface's flags: bit 63 see-through, bits 49-62 the transparency in Q14, bit 48 no dither).
+- **A channel** is now the panel's own code for that channel, in Q16 of its top: a working value v (VSF RGB, gamma 2, white 1) goes to l = tanh²(k·v) (k = atanh(√(white/peak)), the brightness's), the panel's light p = ODT · l (E's gains in its rows), and the code p^(1/2.19) × 65472 (the old present's Q4 top, 16368, times four), held at the field's ends. Code 255 of the 8-bit link is 65280; `b >> 8` is the code, and the low byte is the fraction the dither spends.
+- **Compositing is unchanged**: front to back, `under`, premultiplied, in these codes. The owner's root is baked in with the rest. The canvas has always held roots (gamma 2 working values; fluor composes in g2t codes, tanh in root space), so a canvas of baked codes composes where it always did, only after the roll-off instead of before it; a canvas of light with a root as the last step would have moved every edge and glow into linear light, which the glows tried on 2026-10-24 and looked worse. The present's last step is then no root at all: each code plus its threshold, the high byte, packed (payloads/display neon.rs `present16`, `present_app16`, `present_pack`): about one instruction a pixel.
+- **What it costs**: once per colour, once per image, or per frame only for a window that is not baked (bake.rs):
+  - the palette (the theme's colours, the inks, the glows, every page op's colours): `draw::opaque` bakes a colour once a draw op (a 256-entry light table for 8-bit codes, the ODT, a code table over the light's root), and a draw covers the baked colour per pixel (`draw::cover`); the ferros mark's pieces the same, a few a draw;
+  - the icons: their mip chains baked as they are built, from the bundle's straight colours (each texel baked, then premultiplied, then averaged down). Not at build time in tools/app-icons: the bake depends on the brightness, and the bundle stays VSF RGB;
+  - the wallpaper: the loader puts each code in its pixel's lane as it reads the plane and bakes the buffer in place once the plane is in. It keeps no copy of the codes: a copy in the display's heap (15 MiB on akita, 23 on husky) was tried first and dropped, the arc pool being tight already (on the 8a that day wallgen was refused for room with the old display and the new alike). wallgen is unchanged: what it keeps in the vault is VSF RGB gamma2tanh, the house format at rest, never the panel's codes;
+  - the console, the helm and the quick row: drawn in fluor's α + darkness as before, baked as their rows decode (`Bake::g2t_row`, by NEON 16 a step);
+  - the button's pill: fluor's squircle kernels draw its three colours as three channels (fill red, edge tones green and blue: fluor's blends are linear, so each pixel's channels are each colour's share), and the pixel is that mix of the three colours baked;
+  - a window: format 2 (`BAKED`, ferros_sys `window::BAKED`) is composed and presented as it is; formats 0 (working values) and 1 (fluor's G2T16) are baked by the display every frame, row by row (`layer_row`), what the old present did for them.
+- **Blend modes** other than Normal (a window's mode byte) run against the bake's own white (`Bake::white`, white's code a channel), so Multiply by white is still no change. Normal is the code, no division.
+
+### Brightness and the apps
+
+- **A brightness change bakes everything again** (`rebake`, the render thread between passes): the icons in place from the bundle; the wallpaper by stripes on the publish workers, each pixel unbaked with the bake before (its slot stays as it was until the next change) and baked with the new one; the sprites, the region's front layer and clean window made again when next asked; the console, the helm and the quick row by their worker, which sees the bake's generation move and bakes both of its buffers; the map's last frame drawn again; every phase published again.
+- **An app learns the bake** by display op 65 (`[0][generation u32][k f32][m 9 × f32][g f32]`; ferros_sys `window::bake`), answered by the receive thread at once, and **a change of it** as its window's event `EV_BAKE` (op 62, a doorbell). fluor's ferros host asks at start and at every `EV_BAKE` (redrawing the frame whole), bakes its scratch on the worker cores as its present (fluor `host/panel.rs` `Bake`, the display's NEON kernels carried there, since fluor does not depend on ferros), and shows the window `BAKED`. Mahere's GPU kernel ends with the bake (tanh² on the special function unit, the matrix, 2^(g · log₂ p)), the bake's numbers params of its recording so a brightness change compiles nothing (owner: Mahere's kernel "ends with the matrix + tanh").
+- A display without op 65 gets formats 0 and 1 as before from the new fluor, and the new display takes formats 0 and 1 from an old fluor: either can land first. Only format 2 needs both.
+
+### The capture
+
+Op 30 composes the frame as before, baked, and unbakes it into working values (`Bake::unbake`: each code to panel light by a table, the ODT inverted, the root unrolled by a table), the format tools/screencap reads; approximate only where the bake lost something for good (a channel past the panel's gamut, the roll-off's last stops). `[30, 2]` keeps the codes, for comparing looks; `[30, 1]` (the glass's mask) is composed with white in Q14 and not unbaked, its compose being linear. With no free surface there is no capture (the canvas is not unbaked in place: it is the screen's).
+
+### The dither
+
+The owner: "if I remember right, there's some tricks to get a nice dither for our four panes." The phases flip every 100 ms at rest and every frame under a finger, so each phase is seen on its own at rest, and whatever differs from phase to phase is a 2.5 Hz shimmer there.
+
+Measured on the host (a scratch evaluator: every fraction of a code in 256ths, each phase's error and the change from one phase to the next, thru a Gaussian blur of σ px standing in for the eye at arm's length, 1 px about a hundredth of a degree at 489 ppi; root mean square over a 64 × 64 torus, then the mean over the fractions):
+
+| Thresholds | rest, σ 1 | shimmer, σ 1 | rest, σ 1.5 | shimmer, σ 1.5 | rest, σ 0.75 | shimmer, σ 0.75 |
+|---|---|---|---|---|---|---|
+| until 2026-11-12: 4×4 Bayer + a temporal rank by 4×4 cell (64 levels) | 0.0366 | 0.0416 | 0.0166 | 0.0220 | 0.0682 | 0.0573 |
+| 16×16 Bayer, static | 0.0367 | 0 | 0.0161 | 0 | | |
+| 16×16 Bayer, its finest 2×2 turned thru the phases (frame-rate control) | 0.0367 | 0.0335 | 0.0161 | 0.0103 | | |
+| 16×16 Bayer, its coarsest level turned | 0.0367 | 0.0214 | 0.0161 | 0.0142 | 0.0684 | 0.0287 |
+| interleaved gradient noise, offset each phase | 0.0421 | 0.0553 | 0.0212 | 0.0242 | | |
+| blue noise, the tile shifted half a tile each phase | 0.0375 | 0.0520 | 0.0156 | 0.0221 | | |
+| **16×16 blue noise, its two low bits XOR [0, 2, 3, 1] by phase** | 0.0380 | **0.0169** | 0.0163 | **0.0111** | 0.0796 | **0.0228** |
+
+Chosen: the last (neon.rs `BLUE`, `TURN`). Each phase alone is a full 256-level dither (eight fraction bits, where the old was six), a pixel's four thresholds lie within 3/256 of a code of each other, and its shimmer is 2.5 times smaller than the old one's at σ 1 and the smallest of every candidate at σ 0.75 and 1. At σ 1.5 the 2 × 2 turned thru the phases shimmers a hair less (0.0103 against 0.0111) and twice as much at σ 1, a flicker at the panel's finest period, where the pentile's half-resolution red and blue would alias it. At rest the blue noise is as quiet as the old Bayer at σ 1 and 1.5 and a little busier at σ 0.75 (very close viewing), with no regular cross-hatch. A fresh noise each phase (the tile shifted, or offset by a quarter of a code) shimmers three to four times as much. The root's fractional bits feed the dither directly: the low byte of each code is its fraction, and the threshold is added to it. The ramps (op 21) keep the old dither, being its test screen.
+
+### The GPU, touching last
+
+The owner allows it ("if the GPU touches it last"). Kept for later: with the canvas baked, a GPU present is the dither and the pack alone, a 64-bit pixel in and a 32-bit word out with no arithmetic between but an add; the GPU driver's present kernel (GPU.md "The present stage on the GPU") did the whole ODT bit-exactly in 2026-11-05, so this one is a strict subset of it. It pays only where the CPU's present is the bottleneck, which at about one cycle a pixel it no longer is.
+
+### Measured
+
+On the 8a, 2026-11-12 (Tensor G3, the Pro's chip: its cycles a pixel are the Pro's), the display's start-up bench on the X3 at 2920 MHz (64 rows of the screen warm in the caches, the fastest of eight passes, `display: present bench …`):
+
+| What a pixel costs | Cycles |
+|---|---|
+| the present until 2026-11-12 (light, ODT, code, dither, pack) | 9.45 |
+| **the present now** (dither, pack) | **1.17** |
+| with the owner's root first, `fsqrt` (f16) | 2.36 |
+| with the root as rsqrte and one Newton step (f16) | 3.09 |
+| the bake (an image once, or a format 0 or 1 window every frame) | 10.56 |
+
+- **On the Pro** (4.02 Mpx, 120 frames/s, 482 Mpx/s): the present was 4.6 G cycles a second, about one and a half X3s; now 0.56 G, a fifth of one. A full-screen baked app (Mahere's GPU frame, `BAKED`) costs the display that much and its glass; an app still showing format 0 or 1 costs what it did (the bake per frame, 10.6 cycles a pixel, against 10.3 measured live for Mahere's format 0 frame on the 8a the same morning: 13.8 M cycles of the X3 for its 1246 rows of 1080).
+- **A brightness change** (`diag "pref brightness 100"` and back): baked again in 6.7 ms (no wallpaper up), the full publish after it 4.7 ms; the console, the canvas and the edge all at the new brightness in the next capture.
+- **The look** (the deck with the settings circle open and its 703 nm glow, the console, no wallpaper: wallgen was refused for room on the 8a that day with either display): the old present's maths on the old display's capture against the new display's baked codes, the largest channel's difference a pixel, in codes of the 8-bit link: 94.7 % of pixels within half a code, 95.0 % within one; 2.7 % between 4 and 8 codes, all in the glow's falloff (now composed after the roll-off: the owner's "meh") and in two live wedges and the console's clock, which moved between the captures; the mean 0.21 of a code. Side by side (each side's panel codes back to VSF RGB the same way) they look the same, the glow's falloff included at four times the gain. Captures: `/mnt/Harbor/tmp/sqrt-present-lookcheck/` (`deck-before-after.vsf`, before on the left).
+- **The memory**: the display's arc as before (26 frames of 2 MiB on the 8a); the tables add about 0.5 MiB.
+- **On the host**: Mahere's GPU bake against the f64 bake, every pixel of a town's view, within 8.7 of 65472 (valhall's emulator); fluor's bake against its formula.
+- **Not yet on the glass**: Mahere and fluor's apps showing `BAKED` (built against fluor's `baked`, host-tested; not stowed on the 8a, which was another agent's kist bench that day); a wallpaper re-baked at a brightness change (no wallpaper up).
+
+### Deploy order
+
+Everything that bakes lands with the display or after it; nothing breaks either way round:
+0. The display (ferros branch `sqrt-present`: payloads/display, ferros_sys). Alone, it bakes its own pixels and every window's (formats 0 and 1) as before, and answers op 65.
+1. fluor (branch `baked`) for its apps (Photon, fluordemo) and Mahere (branch `ferros-baked`, needs fluor's): rebuilt against it, they find op 65 and show `BAKED`; against an older display they show formats 0 and 1 as before.
 
 ## Build order
 
