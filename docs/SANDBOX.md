@@ -85,7 +85,7 @@ The stack area is the top of the arc. Every stack-pointer adjustment is compiled
 
 ## Components
 
-- **Checker** (`ferros_sandbox`, no_std, in the kernel's stow path): decodes each A64 instruction and enforces the rules above. Tested exhaustively against instruction tables and cross-checked with `objdump`.
+- **Checker** (`ferros_sandbox`, no_std, in the kernel's stow path): decodes each A64 instruction and enforces the rules above. Tested exhaustively against instruction tables and cross-checked with `objdump`. Two SIMD/FP decodes fixed 2026-11-12, found scanning Photon masked: the Advanced SIMD copy group ignored its op bit, so INS (element), whose imm4 is a source lane, read as SMOV or UMOV and `mov v28.b[4], v27.b[5]` (harfrust) and `mov v22.b[2], v18.b[7]` (ihi) were refused as writes of x28 and x22 (now decoded by Q, op, imm4 and the element size as the Arm ARM's table does, unallocated forms refused); and the float to fixed point conversions fell through to "vector only", so `fcvtzs x28, d0, #3` was accepted (now FCVTZS and FCVTZU are general register writes). The tests hold both groups, whole, to binutils' decode, and sweep 2^16 words of the SIMD/FP space for any general register write the checker misses.
 - **Emitter** (host tool, Rust): rewrites rustc's assembly output (`--emit asm`) into the allowed forms before assembling — rewriting before assembly keeps every label and branch correct. When toka exists, its on-device backend emits the same forms directly, and the checker stays as an assertion over its output at stow time.
 - **Kernel**: stow (check + seal + store), spawn only sealed images, arcs placed with guards, W^X page attributes per arc at spawn.
 

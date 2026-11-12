@@ -1847,6 +1847,7 @@ pub mod window {
     use super::call;
 
     /// Window levels: an app, the keyboard, the system (attest). Higher is in front.
+    /// Above `APP` is the system's alone (the Settings holder, never a kist): the display refuses another caller's show there with `NOT_YOURS` (WINDOWS.md "Whose level").
     pub const APP: u8 = 0;
     pub const INPUT: u8 = 1;
     pub const SYSTEM: u8 = 2;

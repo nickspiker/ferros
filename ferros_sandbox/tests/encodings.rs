@@ -271,3 +271,181 @@ fn exact_mode() {
     let bfi = image("bfi x26, x8, #0, #17\nbr x30\n");
     assert!(check_image_with(&bfi, Mode::Exact, true).is_err(), "the fixed writer in exact mode");
 }
+
+/// Words disassembled by GNU objdump, one string each ("mnemonic\toperands", or ".inst ... ; undefined"): the Arm ARM's decode as binutils implements it, the oracle the lane-move tests hold the checker to.
+fn disassemble(words: &[u32]) -> Vec<String> {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("ferros_sandbox_dis_{}_{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let b = dir.join("w.bin");
+    std::fs::write(&b, words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    let out = Command::new("aarch64-linux-gnu-objdump").args(["-D", "-b", "binary", "-m", "aarch64"]).arg(&b).output().unwrap();
+    assert!(out.status.success());
+    let _ = std::fs::remove_dir_all(&dir);
+    let text = String::from_utf8(out.stdout).unwrap();
+    // "   4:\t2e092f7c \t.inst\t0x2e092f7c ; undefined": an address, the word, then the instruction.
+    let lines: Vec<String> = text
+        .lines()
+        .filter(|l| l.split_once(':').is_some_and(|(a, _)| !a.trim().is_empty() && a.trim().chars().all(|c| c.is_ascii_hexdigit())) && l.contains('\t'))
+        .map(|l| l.splitn(3, '\t').nth(2).unwrap_or("").trim().to_string())
+        .collect();
+    assert_eq!(lines.len(), words.len());
+    lines
+}
+
+/// What the oracle says a word writes: a general register (its destination spelled w or x), a vector or FP register, or nothing it knows (unallocated).
+#[derive(Debug, PartialEq)]
+enum Dest {
+    General,
+    Vector,
+    Undefined,
+}
+
+fn dest(dis: &str) -> Dest {
+    if dis.contains("undefined") {
+        return Dest::Undefined;
+    }
+    let ops = dis.split_once('\t').map_or("", |(_, o)| o).trim();
+    match ops.chars().next() {
+        Some('w' | 'x') => Dest::General,
+        Some('v' | 'b' | 'h' | 's' | 'd' | 'q') => Dest::Vector,
+        _ => panic!("no destination in {dis:?}"),
+    }
+}
+
+/// Holds the checker to the oracle over `words`, each with Rd = `rd`: a vector destination accepted whatever its number, a general one refused as its register says (accepted for an ordinary one), an unallocated word refused.
+fn against_oracle(words: &[u32], rd: u32) {
+    let why = match rd {
+        27 | 28 => Some(Refusal::WritesBaseOrMask),
+        21..=26 => Some(Refusal::WritesInvariantRegister),
+        _ => None,
+    };
+    for (w, dis) in words.iter().zip(disassemble(words)) {
+        let got = check(*w);
+        match dest(&dis) {
+            Dest::Vector => assert_eq!(got, Ok(()), "{dis} ({w:08x}) writes a vector register"),
+            Dest::General => assert_eq!(got, why.map_or(Ok(()), Err), "{dis} ({w:08x}) writes x{rd}"),
+            Dest::Undefined => assert!(got.is_err(), "{dis} ({w:08x}) is unallocated and was accepted"),
+        }
+    }
+}
+
+/// The lane moves the Photon scan found refused (2026-11-12, target/masked-photon): INS (element) writes a vector register, whatever its number, and its imm4 is a lane, never SMOV's or UMOV's opcode.
+#[test]
+fn lane_moves_from_the_scan() {
+    assert_eq!(one("mov v28.b[4], v27.b[5]"), 0x6E09_2F7C);
+    assert_eq!(one("mov v22.b[2], v18.b[7]"), 0x6E05_3E56);
+    accepts("mov v28.b[4], v27.b[5]");
+    accepts("mov v22.b[2], v18.b[7]");
+}
+
+/// Every lane move, dup and insert form, by hand: vector destinations numbered as the reserved general registers are accepted; SMOV and UMOV (and `mov` spelled for UMOV) into them are refused; INS (general) and DUP (general) only read a general register.
+#[test]
+fn lane_moves_and_dups() {
+    for s in [
+        "mov v28.b[4], v27.b[5]",
+        "ins v27.h[1], v0.h[7]",
+        "mov v26.s[3], v1.s[1]",
+        "mov v25.d[1], v2.d[0]",
+        "mov v22.b[15], v18.b[7]",
+        "mov v21.h[5], v28.h[3]",
+        "mov v28.b[0], w27",
+        "ins v27.s[1], w28",
+        "mov v26.d[1], x28",
+        "mov v23.h[2], w26",
+        "dup v28.16b, v27.b[5]",
+        "dup v27.8h, v28.h[7]",
+        "dup v26.2s, v0.s[3]",
+        "dup v25.2d, v1.d[1]",
+        "dup v28.16b, w27",
+        "dup v27.4s, w28",
+        "dup v22.2d, x28",
+        "mov b28, v27.b[5]",
+        "dup h27, v28.h[7]",
+        "mov s26, v0.s[3]",
+        "mov d22, v1.d[1]",
+        "umov w0, v28.b[7]",
+        "smov x1, v27.h[5]",
+        "mov x2, v26.d[1]",
+    ] {
+        accepts(s);
+    }
+    refuses("umov w28, v0.b[5]", Refusal::WritesBaseOrMask);
+    refuses("umov w27, v0.h[7]", Refusal::WritesBaseOrMask);
+    refuses("mov w28, v1.s[3]", Refusal::WritesBaseOrMask);
+    refuses("mov x27, v1.d[1]", Refusal::WritesBaseOrMask);
+    refuses("smov w28, v2.b[5]", Refusal::WritesBaseOrMask);
+    refuses("smov x27, v2.h[7]", Refusal::WritesBaseOrMask);
+    refuses("smov x28, v2.s[1]", Refusal::WritesBaseOrMask);
+    refuses("umov w26, v3.b[7]", Refusal::WritesInvariantRegister);
+    refuses("mov x25, v3.d[0]", Refusal::WritesInvariantRegister);
+    refuses("smov x22, v3.b[5]", Refusal::WritesInvariantRegister);
+    refuses("umov w23, v3.h[2]", Refusal::WritesInvariantRegister);
+    refuses("smov w21, v3.h[3]", Refusal::WritesInvariantRegister);
+}
+
+/// The whole Advanced SIMD copy group (every Q, op, imm5 and imm4), with Rd a base register, an invariant register and an ordinary one, against binutils' decode.
+#[test]
+fn simd_copy_group_against_binutils() {
+    for rd in [28, 22, 0] {
+        let mut words = Vec::new();
+        for q in 0..2u32 {
+            for op in 0..2u32 {
+                for imm5 in 0..32u32 {
+                    for imm4 in 0..16u32 {
+                        words.push(0x0E00_0400 | q << 30 | op << 29 | imm5 << 16 | imm4 << 11 | 27 << 5 | rd);
+                    }
+                }
+            }
+        }
+        against_oracle(&words, rd);
+    }
+}
+
+/// Floating point to fixed point and back (every sf, S, type, rmode and opcode, scales at both ends of each width): FCVTZS and FCVTZU write a general register (until 2026-11-12 the checker let `fcvtzs x28, d0, #3` through as a vector write), SCVTF and UCVTF a vector one.
+#[test]
+fn fixed_point_conversions_against_binutils() {
+    refuses("fcvtzs x28, d0, #3", Refusal::WritesBaseOrMask);
+    refuses("fcvtzu w27, s1, #5", Refusal::WritesBaseOrMask);
+    refuses("fcvtzs w26, d2, #8", Refusal::WritesInvariantRegister);
+    refuses("fcvtzu x22, d3, #64", Refusal::WritesInvariantRegister);
+    accepts("fcvtzs x0, d0, #3");
+    accepts("scvtf d28, x27, #3");
+    accepts("ucvtf s27, w28, #5");
+    for rd in [28, 22] {
+        let mut words = Vec::new();
+        for sf in 0..2u32 {
+            for s in 0..2u32 {
+                for ty in 0..4u32 {
+                    for rmode in 0..4u32 {
+                        for opcode in 0..8u32 {
+                            for scale in [0u32, 31, 32, 63] {
+                                words.push(0x1E00_0000 | sf << 31 | s << 29 | ty << 22 | rmode << 19 | opcode << 16 | scale << 10 | 27 << 5 | rd);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        against_oracle(&words, rd);
+    }
+}
+
+/// A sweep of the whole SIMD and FP data processing space (op0 x111) with Rd = x28: wherever binutils decodes a general register destination, the checker refuses it. A fixed xorshift, so the words are the same every run.
+#[test]
+fn simd_fp_space_never_writes_a_reserved_register() {
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut words = Vec::new();
+    for _ in 0..1 << 16 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        words.push((x as u32 & !(0b111 << 25) & !31) | 0b111 << 25 | 28);
+    }
+    for (w, dis) in words.iter().zip(disassemble(&words)) {
+        if dest(&dis) == Dest::General {
+            assert_eq!(check(*w), Err(Refusal::WritesBaseOrMask), "{dis} ({w:08x}) writes x28");
+        }
+    }
+}

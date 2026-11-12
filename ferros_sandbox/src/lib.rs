@@ -365,13 +365,9 @@ fn dp_reg(i: u32) -> Result<(), Refusal> {
 }
 
 fn simd_fp(i: u32) -> Result<(), Refusal> {
-    // Advanced SIMD copy, SMOV/UMOV (to a general register): 0 Q op 01110000 imm5 0 imm4 1 Rn Rd with imm4 = 0101 / 0111.
+    // Advanced SIMD copy: 0 Q op 01110000 imm5 0 imm4 1 Rn Rd.
     if i & 0x9FE0_8400 == 0x0E00_0400 {
-        let imm4 = (i >> 11) & 0xF;
-        if imm4 == 0b0101 || imm4 == 0b0111 {
-            return gpr_write(rd(i));
-        }
-        return Ok(());
+        return simd_copy(i);
     }
     // Conversion between floating point and integer: sf 0 S 11110 type 1 rmode opcode 000000 Rn Rd. To-integer opcodes (FCVT*, FMOV to general, FJCVTZS) write a general register.
     if i & 0x5F20_FC00 == 0x1E20_0000 {
@@ -381,8 +377,51 @@ fn simd_fp(i: u32) -> Result<(), Refusal> {
         }
         return Ok(());
     }
+    // Conversion between floating point and fixed point: sf 0 S 11110 type 0 rmode opcode scale Rn Rd (the Arm ARM's A64 encoding index, "Conversion between floating-point and fixed-point"). FCVTZS and FCVTZU (rmode 11, opcode 000 / 001) write a general register; SCVTF and UCVTF (rmode 00, opcode 010 / 011) a vector one; S = 1 and every other rmode and opcode are unallocated. Until 2026-11-12 this group fell through to the accept below, so `fcvtzs x28, d0, #3` passed as a vector write.
+    if i & 0x5F20_0000 == 0x1E00_0000 {
+        // Also unallocated: type 10, and a 32-bit general register (sf 0) with scale under 32 (more fraction bits than the register has).
+        let (sf, ty, scale) = (i >> 31, (i >> 22) & 3, (i >> 10) & 0x3F);
+        if ty == 0b10 || (sf == 0 && scale < 32) {
+            return Err(Refusal::Unknown);
+        }
+        return match ((i >> 29) & 1, (i >> 19) & 3, (i >> 16) & 7) {
+            (0, 0b11, 0b000 | 0b001) => gpr_write(rd(i)),
+            (0, 0b00, 0b010 | 0b011) => Ok(()),
+            _ => Err(Refusal::Unknown),
+        };
+    }
     // All other SIMD/FP data processing writes vector/FP registers only.
     Ok(())
+}
+
+/// Advanced SIMD copy (the Arm ARM's A64 encoding index, "Advanced SIMD copy"): 0 Q op 01110000 imm5 0 imm4 1 Rn Rd, decoded by Q, op and imm4 as the Arm ARM's table does. Only SMOV and UMOV (`mov wN, vM.s[i]` and `mov xN, vM.d[i]` are UMOV) write a general register, Rd; DUP and both INS forms write the vector register Vd, whatever its number (INS (general) and DUP (general) read a general register, Rn, which writes nothing). Until 2026-11-12 op was ignored, so INS (element), whose imm4 is the source lane, was read as SMOV or UMOV whenever that lane's bits spelled 0101 or 0111: `mov v28.b[4], v27.b[5]` (harfrust) and `mov v22.b[2], v18.b[7]` (ihi) were refused as writes of x28 and x22.
+fn simd_copy(i: u32) -> Result<(), Refusal> {
+    let q = (i >> 30) & 1;
+    let op = (i >> 29) & 1;
+    let imm5 = (i >> 16) & 0x1F;
+    let imm4 = (i >> 11) & 0xF;
+    // imm5 x0000 names no element size: unallocated for every form.
+    if imm5 & 0xF == 0 {
+        return Err(Refusal::Unknown);
+    }
+    // The element size, by imm5's lowest set bit: 0 a byte, 1 a halfword, 2 a word, 3 a doubleword.
+    let size = imm5.trailing_zeros();
+    match (q, op, imm4) {
+        // DUP (element), DUP (general): Vd. A doubleword element in a 64-bit vector (Q 0) is reserved.
+        (0, 0, 0b0000 | 0b0001) if size == 3 => Err(Refusal::Unknown),
+        (_, 0, 0b0000 | 0b0001) => Ok(()),
+        // INS (general): Vd, Q 1 only.
+        (1, 0, 0b0011) => Ok(()),
+        // SMOV: a general register, wN (Q 0) from a byte or a halfword, xN (Q 1) from a byte, a halfword or a word; any other size is unallocated.
+        (_, 0, 0b0101) if size < 2 + q => gpr_write(rd(i)),
+        // UMOV: a general register, wN (Q 0) from a byte, a halfword or a word, xN (Q 1) from a doubleword; any other size is unallocated.
+        (0, 0, 0b0111) if size < 3 => gpr_write(rd(i)),
+        (1, 0, 0b0111) if size == 3 => gpr_write(rd(i)),
+        // INS (element): Vd, Q 1 only; imm4 is the source lane, not an opcode.
+        (1, 1, _) => Ok(()),
+        // Unallocated: imm4 0010, 0100, 0110, 1xxx with op 0, INS (general) with Q 0, op 1 with Q 0, and the sizes SMOV and UMOV have no form for.
+        _ => Err(Refusal::Unknown),
+    }
 }
 
 /// Check a whole image (little-endian A64 words). Returns the first violation, or the instruction count.

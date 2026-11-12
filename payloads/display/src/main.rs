@@ -3315,6 +3315,39 @@ fn not_theirs(m: &[u8], h: u64) -> Option<usize> {
     }
 }
 
+/// How many shows were refused a level above the app's, for the console (a line at the 1st, 2nd, 4th, 8th..., as `NOT_YOURS_COUNT`).
+static LEVEL_REFUSED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether holdings `h` are the system's: the Settings holder (the map, the attest screen), never a kist. The kernel hands a kist no Settings (`kist_object`), so the kist bit states the rule rather than catching a case: a kist is never the system, whatever it is handed later.
+#[inline]
+fn system(h: u64) -> bool {
+    h & ferros_sys::CALLER_SETTINGS != 0 && h & ferros_sys::CALLER_KIST == 0
+}
+
+/// The level a show (op 22, alone or inside a batch or a flight) asks that holdings `h` may not have, if any: above the app's (input, the system's) is the system's alone (2026-11-12: any client could pick any level, so a kist could put its window in front of the attest screen or the keyboard and pass for them). The level byte is the client's own word, so it is held to what the kernel says the caller holds.
+fn level_not_theirs(m: &[u8], h: u64) -> Option<u8> {
+    match m.first() {
+        Some(22) if m.len() >= 18 && m[17] != ferros_sys::window::APP && !system(h) => Some(m[17]),
+        _ => None,
+    }
+}
+
+/// One show refused its level: counted, and on the console at every power of two. Its status is `NOT_YOURS`: the level is not the caller's to take.
+fn level_refused(level: u8, h: u64) -> u8 {
+    let n = LEVEL_REFUSED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n & (n - 1) == 0 {
+        let mut l = Log { grants: unsafe { PANIC_GRANTS }, buf: [0; 256], n: 0 };
+        l.s(b"display: a show at level A#");
+        l.dec(level as u64);
+        l.s(if h & ferros_sys::CALLER_KIST != 0 { b" from a kist".as_slice() } else { b" from no system process".as_slice() });
+        l.s(b", above the app's: refused (A#");
+        l.dec(n);
+        l.s(b" so far)\n");
+        l.flush();
+    }
+    NOT_YOURS
+}
+
 /// One refusal as not the caller's: counted, and on the console at every power of two.
 fn not_yours(op: u8, k: usize) -> u8 {
     let n = NOT_YOURS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -6809,6 +6842,11 @@ extern "C" fn receive(grants: u64) -> ! {
             ferros_sys::reply(&tok, &[not_yours(op, k)]);
             continue;
         }
+        // A show above the app level from a caller that is not the system's: refused the same way (`level_not_theirs`; one inside a batch or a flight as it runs).
+        if let Some(level) = level_not_theirs(&msg[..n], h) {
+            ferros_sys::reply(&tok, &[level_refused(level, h)]);
+            continue;
+        }
         // Room: wait for the render thread to consume a slot.
         let mut head = RING_HEAD.load(Ordering::Acquire);
         let mut tail = RING_TAIL.load(Ordering::Relaxed);
@@ -7338,6 +7376,11 @@ fn server(grants: u64) -> ! {
             // A surface that is not the caller's (`HOLDS`, the request's): refused, whether the op came alone or inside a batch or a flight.
             if let Some(k) = not_theirs(m, unsafe { HOLDS }) {
                 out[0] = not_yours(m[0], k);
+                return len;
+            }
+            // A level above the app's from a caller that is not the system's: refused the same way.
+            if let Some(level) = level_not_theirs(m, unsafe { HOLDS }) {
+                out[0] = level_refused(level, unsafe { HOLDS });
                 return len;
             }
             match m.first() {
@@ -8269,7 +8312,7 @@ fn server(grants: u64) -> ! {
                     log.flush();
                 }
                 Some(22) if m.len() >= 18 => {
-                    // A window shown or redrawn (WINDOWS.md): [x u16][y u16][w u16][h u16] the part of the screen it covers, [base u64] its surface (the client's own `dma` of it), [level u8] 0 an app, 1 input, 2 the system, and optionally [format u8] its pixels (`Win::format`: 0, the default, the display's working values; 1 fluor's 16-bit g2t). It goes in front of its level; every phase owes the whole screen; the next one is published now, the others while idle.
+                    // A window shown or redrawn (WINDOWS.md): [x u16][y u16][w u16][h u16] the part of the screen it covers, [base u64] its surface (the client's own `dma` of it), [level u8] 0 an app, 1 input, 2 the system (above 0 the system's alone, `level_not_theirs`), and optionally [format u8] its pixels (`Win::format`: 0, the default, the display's working values; 1 fluor's 16-bit g2t). It goes in front of its level; every phase owes the whole screen; the next one is published now, the others while idle.
                     client_owned = true;
                     unsafe { CLIENT_DREW = true };
                     last_interaction = now();

@@ -957,7 +957,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
             say!(grants, "gpu: bench: {px} pixels, {fmas} FMAs a pixel: {} in {us} us ({} ns a pixel); word 0 G#{:X}\n", if finished { "done" } else { "not finished" }, us * 1000 / px as u64, rd32(bench));
         }
     }
-    // Input bit 0: show it (tools/husky-gpu.sh show). The GPU renders the Mandelbrot set at 1024 x 2048 (up to 256 iterations, real -2.2 to 0.8), the CPU turns the counts into grey on a surface (black in the set, brighter the faster a point escapes: gamma 2, the display's working values), and the display shows it at the system level, over everything, for 60 s. Grant slots for it: 5 use display, 6 a surface.
+    // Input bit 0: show it (tools/husky-gpu.sh show). The GPU renders the Mandelbrot set at 1024 x 2048 (up to 256 iterations, real -2.2 to 0.8), the CPU turns the counts into grey on a surface (black in the set, brighter the faster a point escapes: gamma 2, the display's working values), and the display shows it at the app level, in front of the map, for 60 s (the system level is the system's alone, WINDOWS.md "Whose level"). Grant slots for it: 5 use display, 6 a surface.
     let show = input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } & 1 == 1;
     if show {
         let display = cap(grants, 5);
@@ -988,7 +988,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                 wr64(px + 8 * (y * w + x), v | v << 16 | v << 32);
             }
         }
-        if !rendered || !window::show(display, surf as u64, 0, 0, w as u16, h as u16, window::SYSTEM) {
+        if !rendered || !window::show(display, surf as u64, 0, 0, w as u16, h as u16, window::APP) {
             say!(grants, "gpu: show: {}\n", if rendered { "the display refused the window" } else { "the render did not finish" });
             exit(1);
         }
