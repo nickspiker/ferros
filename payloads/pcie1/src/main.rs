@@ -1104,7 +1104,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let cons_before = d.tcm_rd(cons + 16);
     let t0 = d.now();
     let rx_off = d.tcm_rd(sh + 36);
-    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); RX_BUFS as usize], rxq_head: 0, rxq_len: 0, nets: [Net { name: [0; 32], len: 0, rssi: 0, flags: 0, seen_in: 0 }; 32], nnets: 0, scan_gen: 0, scan_ver: 1, quiet: false, outcome: 0, rx_up: false, personal: true, retry_s: 1 << 6 };
+    let mut m = Msgbuf { dma, h2d_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); RX_BUFS as usize], rxq_t: [0; RX_BUFS as usize], rxq_head: 0, rxq_len: 0, nets: [Net { name: [0; 32], len: 0, rssi: 0, flags: 0, seen_in: 0 }; 32], nnets: 0, scan_gen: 0, scan_ver: 1, quiet: false, outcome: 0, rx_up: false, personal: true, retry_s: 1 << 6 };
     // Control submit ring: 8 ioctl response buffers and 8 event buffers first (the firmware DMAs ioctl results into a posted response buffer, named by its request id in the completion).
     for b in 0..8u32 {
         m.post(d, 0x0B, 1 + b, [8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
@@ -1184,11 +1184,10 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     console_dump(d, buf, size, cons_before, (idx + size - cons_before) % size);
 }
 
-/// The control path of msgbuf (dhd_msgbuf.c): H2D control submit (ring 0, 64 × 40 B) and D2H control complete (ring 2, 64 × 24 B) in the DMA region, indices in TCM.
+/// The control path of msgbuf (dhd_msgbuf.c): H2D control submit (ring 0, 64 × 40 B) and D2H control complete (ring 2, 64 × 24 B) in the DMA region, indices in TCM: this side's (H2D write, D2H read) written there, the chip's D2H write indices never read, each completion known by its own epoch (`item_new`).
 struct Msgbuf {
     dma: u32,
     h2d_w: u32,
-    d2h_w: u32,
     d2h_r: u32,
     /// H2D control submit write index and sequence (epoch = seq % 253, seq from 254; flags = phase G#80 on the first lap).
     w: u32,
@@ -1239,6 +1238,8 @@ struct Msgbuf {
     /// Server mode (stage 14): received frames wait in their rx buffers until a client takes one (buffer index, frame offset, length); the buffer is re-posted only then — backpressure without a copy.
     serving: bool,
     rxq: [(u8, u16, u16); RX_BUFS as usize],
+    /// When each queued frame's completion was taken (the counter), for the measure of how long frames wait for the IP stack (`Path`).
+    rxq_t: [u64; RX_BUFS as usize],
     rxq_head: usize,
     rxq_len: usize,
     /// The networks the last scan found, one entry per name (its strongest BSS), for the network page (SCAN, `serve_unjoined`).
@@ -1321,62 +1322,69 @@ impl Msgbuf {
         d.tcm_wr(self.h2d_w + 4, self.rxp_w % 512);
         d.wr(MEM, 0x2140, 0xFF00_0000 | 1 << 16 | (self.rxp_w % 512));
     }
-    /// Consume rx completions (host_rxbuf_cmpl_t, type G#12: request id = buffer, data_len +14, data_offset +16): log length and EtherType, re-post the buffer.
+    /// Consume rx completions (host_rxbuf_cmpl_t, type G#12: request id = buffer, data_len +14, data_offset +16): log length and EtherType, re-post the buffer. The read index goes back to the chip once for the whole run of completions, not once each (each is a register write thru a syscall).
     fn pump_rx(&mut self, d: &mut Drv) {
-        let wi = d.tcm_rd(self.d2h_w + 8);
-        while self.rx_rd != wi {
+        let rd0 = self.rx_rd;
+        loop {
             let a = self.dma + 0xC000 + 40 * self.rx_rd;
             let words: [u32; 10] = core::array::from_fn(|k| dr(a + 4 * k as u32));
-            if words[0] >> 24 != self.rx_dseq % 253 || words.iter().fold(0, |x, v| x ^ v) != 0 {
+            if !item_new(&words, self.rx_dseq) {
                 break;
             }
             self.rx_dseq += 1;
             self.rx_rd = (self.rx_rd + 1) % 512;
+            self.rx_one(d, words);
+        }
+        if self.rx_rd != rd0 {
             d.tcm_wr(self.d2h_r + 8, self.rx_rd);
-            let i = words[1].wrapping_sub(0x1000);
-            let len = words[3] >> 16;
-            // dhd: the frame starts at data_offset if non-zero, otherwise at pcie_shared dma_rxoffset (8 here), measured from the posted buffer; it is a plain Ethernet frame.
-            let off = if words[4] & 0xFFFF != 0 { words[4] & 0xFFFF } else { self.rx_off };
-            self.rx_frames += 1;
-            if i < RX_BUFS {
-                let p = self.dma + RX_BASE + 0x800 * i + off;
-                if self.serving {
-                    // Hold the buffer for a client (re-posted when taken). The completion flags don't separate Ethernet from 802.11 frames here (an EAPOL frame came flagged G#02 too), so everything goes to the client, which ignores what it can't parse. data_len counts the frame from the offset on: subtracting the offset clipped 8 bytes off every frame (DHCP options and router advertisement prefixes lost).
-                    if self.rxq_len < self.rxq.len() && len > 0 {
-                        let at = (self.rxq_head + self.rxq_len) % self.rxq.len();
-                        self.rxq[at] = (i as u8, off as u16, len.min(0x800 - off) as u16);
-                        self.rxq_len += 1;
-                    } else {
-                        self.post_rx(i);
-                        self.ring_rx(d);
-                    }
-                    continue;
+        }
+    }
+    /// One rx completion (its ten words), taken.
+    fn rx_one(&mut self, d: &mut Drv, words: [u32; 10]) {
+        let i = words[1].wrapping_sub(0x1000);
+        let len = words[3] >> 16;
+        // dhd: the frame starts at data_offset if non-zero, otherwise at pcie_shared dma_rxoffset (8 here), measured from the posted buffer; it is a plain Ethernet frame.
+        let off = if words[4] & 0xFFFF != 0 { words[4] & 0xFFFF } else { self.rx_off };
+        self.rx_frames += 1;
+        if i < RX_BUFS {
+            let p = self.dma + RX_BASE + 0x800 * i + off;
+            if self.serving {
+                // Hold the buffer for a client (re-posted when taken). The completion flags don't separate Ethernet from 802.11 frames here (an EAPOL frame came flagged G#02 too), so everything goes to the client, which ignores what it can't parse. data_len counts the frame from the offset on: subtracting the offset clipped 8 bytes off every frame (DHCP options and router advertisement prefixes lost).
+                if self.rxq_len < self.rxq.len() && len > 0 {
+                    let at = (self.rxq_head + self.rxq_len) % self.rxq.len();
+                    self.rxq[at] = (i as u8, off as u16, len.min(0x800 - off) as u16);
+                    self.rxq_t[at] = ferros_sys::now();
+                    self.rxq_len += 1;
+                } else {
+                    self.post_rx(i);
+                    self.ring_rx(d);
                 }
-                if be16(p + 12) == 0x0800 {
-                    self.ipv4(d, p + 14, len.saturating_sub(off).saturating_sub(14));
-                }
-                d.put(b"rx frame len ");
-                d.dec(len);
-                d.put(b" ethertype ");
-                d.hex(be16(p + 12));
-                d.put(b"\n");
-                if false {
-                    d.put(b"  cmpl:");
-                    for v in words {
-                        d.put(b" ");
-                        d.hex(v);
-                    }
-                    d.put(b"\n  buf:");
-                    let b0 = self.dma + RX_BASE + 0x800 * i;
-                    for k in 0..8 {
-                        d.put(b" ");
-                        d.hex(dr(b0 + 4 * k));
-                    }
-                    d.put(b"\n");
-                }
-                self.post_rx(i);
-                self.ring_rx(d);
+                return;
             }
+            if be16(p + 12) == 0x0800 {
+                self.ipv4(d, p + 14, len.saturating_sub(off).saturating_sub(14));
+            }
+            d.put(b"rx frame len ");
+            d.dec(len);
+            d.put(b" ethertype ");
+            d.hex(be16(p + 12));
+            d.put(b"\n");
+            if false {
+                d.put(b"  cmpl:");
+                for v in words {
+                    d.put(b" ");
+                    d.hex(v);
+                }
+                d.put(b"\n  buf:");
+                let b0 = self.dma + RX_BASE + 0x800 * i;
+                for k in 0..8 {
+                    d.put(b" ");
+                    d.hex(dr(b0 + 4 * k));
+                }
+                d.put(b"\n");
+            }
+            self.post_rx(i);
+            self.ring_rx(d);
         }
     }
     /// An IPv4 packet: if it is UDP to port 68 carrying a BOOTP reply with our transaction id, take the DHCP message (options after the 240-byte BOOTP header + magic cookie): 53 type (2 OFFER, 5 ACK, 6 NAK), 54 server, 1 subnet, 3 router, 6 DNS, 51 lease.
@@ -1445,27 +1453,70 @@ impl Msgbuf {
     }
     /// Consume tx completions (host_txbuf_cmpl_t, type G#10, 24 B: request id = packet, status & G#F 0 = sent).
     fn pump_tx(&mut self, d: &mut Drv) {
-        let wi = d.tcm_rd(self.d2h_w + 4);
-        while self.tx_rd != wi {
+        let rd0 = self.tx_rd;
+        loop {
             let a = self.dma + 0x6000 + 24 * self.tx_rd;
             let words: [u32; 6] = core::array::from_fn(|k| dr(a + 4 * k as u32));
-            if words[0] >> 24 != self.tx_dseq % 253 || words.iter().fold(0, |x, v| x ^ v) != 0 {
+            if !item_new(&words, self.tx_dseq) {
                 break;
             }
             self.tx_dseq += 1;
             self.tx_rd = (self.tx_rd + 1) % 1024;
-            d.tcm_wr(self.d2h_r + 4, self.tx_rd);
             self.tx_done += 1;
             self.tx_status = words[2] & 0xF;
         }
-    }
-    /// Send one Ethernet frame on flowring 2 (msgbuf ring 5, H2D index slot 2): copy it to a tx buffer (2 KiB at +G#7_0000), then host_txbuf_post_t v1 (48 B): header (type G#0F, request id), the 14-byte Ethernet header, flags G#01 (802.3), seg_cnt 1, data address = the payload after the header, data_len = length − 14.
-    fn send(&mut self, d: &mut Drv, frame: &[u8]) {
-        let k = self.tx_w % 8;
-        let buf = self.dma + 0x7_0000 + 0x800 * k;
-        for (j, b) in frame.iter().enumerate() {
-            db(buf + j as u32, *b);
+        // The read index back once for the run, as `pump_rx` does.
+        if self.tx_rd != rd0 {
+            d.tcm_wr(self.d2h_r + 4, self.tx_rd);
         }
+    }
+    /// Send one Ethernet frame now: `tx_post`, then `tx_ring`. False: refused (`tx_post`).
+    fn send(&mut self, d: &mut Drv, frame: &[u8]) -> bool {
+        let ok = self.tx_post(d, frame);
+        if ok {
+            self.tx_ring(d);
+        }
+        ok
+    }
+    /// The oldest queued frame into `out` (its length returned), its buffer posted to the chip again, unpublished until `ring_rx` (once for a batch). The caller has checked a frame is queued and that `out` holds it.
+    fn rxq_take(&mut self, out: &mut [u8], path: &mut Path) -> usize {
+        let t0 = ferros_sys::now();
+        let (i, off, l) = self.rxq[self.rxq_head];
+        let waited = t0.wrapping_sub(self.rxq_t[self.rxq_head]);
+        self.rxq_head = (self.rxq_head + 1) % self.rxq.len();
+        self.rxq_len -= 1;
+        let l = l as usize;
+        dma_get(self.dma + RX_BASE + 0x800 * i as u32 + off as u32, &mut out[..l]);
+        self.post_rx(i as u32);
+        path.to_ip += 1;
+        path.wait_t += waited;
+        // WHY the max: the high water, for the measure.
+        path.wait_most = path.wait_most.max(waited);
+        path.copy_t += ferros_sys::now().wrapping_sub(t0);
+        l
+    }
+    /// Publish the frames `tx_post` wrote: the flowring's TCM write index, then doorbell 0 for ring 5. Once for a batch: each is a register write thru a syscall.
+    fn tx_ring(&mut self, d: &mut Drv) {
+        ferros_sys::dma_barrier();
+        d.tcm_wr(self.h2d_w + 8, self.tx_w % 512);
+        d.wr(MEM, 0x2140, 0xFF00_0000 | 5 << 16 | (self.tx_w % 512));
+    }
+    /// One Ethernet frame onto flowring 2 (msgbuf ring 5, H2D index slot 2), unpublished until `tx_ring`: copied a word at a time into a free tx buffer (`TX_BUFS` of 2 KiB from +G#7_0000), then host_txbuf_post_t v1 (48 B): header (type G#0F, request id), the 14-byte Ethernet header, flags G#01 (802.3), seg_cnt 1, data address = the payload after the header, data_len = length − 14.
+    /// A buffer is free once the chip has completed the frame it held (`tx_done`, from the tx completions): with every buffer still in flight the completions are read once more, and if none came the frame is refused (false), as a full transmit ring drops (TCP sends again). Until 2026-11-11 one frame went per request and eight buffers were reused in turn unchecked; a batch from the IP stack (`serve` op 8) would overwrite buffers the chip had not fetched yet.
+    /// WHY the length test: the frame comes from another process; its Ethernet header must be whole and it must fit a buffer.
+    fn tx_post(&mut self, d: &mut Drv, frame: &[u8]) -> bool {
+        if frame.len() <= 14 || frame.len() > 0x800 {
+            return false;
+        }
+        if self.tx_w.wrapping_sub(self.tx_done) >= TX_BUFS {
+            self.pump_tx(d);
+            if self.tx_w.wrapping_sub(self.tx_done) >= TX_BUFS {
+                return false;
+            }
+        }
+        let k = self.tx_w % TX_BUFS;
+        let buf = self.dma + 0x7_0000 + 0x800 * k;
+        dma_put(buf, frame);
         let phase = if (self.tx_w / 512) % 2 == 0 { 0x80 } else { 0 };
         let a = self.dma + 0x6_0000 + 48 * (self.tx_w % 512);
         let mut item = [0u8; 48];
@@ -1481,18 +1532,15 @@ impl Msgbuf {
             dw(a + 4 * j, u32::from_le_bytes(item[4 * j as usize..4 * j as usize + 4].try_into().unwrap()));
         }
         self.tx_w += 1;
-        ferros_sys::dma_barrier();
-        d.tcm_wr(self.h2d_w + 8, self.tx_w % 512);
-        d.wr(MEM, 0x2140, 0xFF00_0000 | 5 << 16 | (self.tx_w % 512));
+        true
     }
     /// Consume every valid D2H control completion: events are handled (and their buffers re-posted) here; an ioctl completion is returned as (status, response buffer index, length), its buffer re-posted.
     fn pump(&mut self, d: &mut Drv) -> Option<(u32, u32, u32)> {
-        let wi = d.tcm_rd(self.d2h_w);
-        while self.rd != wi {
+        loop {
             let a = self.dma + 0x5000 + 24 * self.rd;
             let words: [u32; 6] = core::array::from_fn(|k| dr(a + 4 * k as u32));
-            if words[0] >> 24 != self.dseq % 253 || words.iter().fold(0, |x, v| x ^ v) != 0 {
-                break; // the index ran ahead of the item's DMA: look again
+            if !item_new(&words, self.dseq) {
+                break;
             }
             self.dseq += 1;
             self.rd = (self.rd + 1) % 64;
@@ -1945,6 +1993,34 @@ fn db(a: u32, v: u8) {
 fn dbr(a: u32) -> u8 {
     DmaH::read8(doff(a))
 }
+/// Whether a D2H completion item (its words, read from the ring in the DMA region) is the next one, `dseq` the sequence expected there: a message type (zeroed ring memory has none), the epoch dhd's sync mode writes (seq % 253, the firmware's D2H_SYNC_SEQNUM), and a zero XOR over the item (its XORCSUM: none of the item is half written).
+/// The rings are read this way alone, never thru the chip's write index (2026-11-11). That index lives in the chip's memory behind PCIe: each read was a syscall whose register access held the kernel's one lock while the link woke from L1.2, and every pass read three (control, rx and tx completions): `diag sched` at idle, a pass took A#460 to A#550 µs; `flame` at idle (2 s), the driver's register reads were A#550 ms of it, the lock held all the while, and spinning on the lock was A#17 % of all five cores' time. The item says for itself whether it is new: one left from the ring's last lap carries an epoch 6 (rx, 512 items), 12 (tx, 1024) or 64 (control, 64) away from the expected one, never equal; a zeroed one has no type.
+fn item_new(words: &[u32], dseq: u32) -> bool {
+    words[0] & 0xFF != 0 && words[0] >> 24 == dseq % 253 && words.iter().fold(0, |x, v| x ^ v) == 0
+}
+/// `out.len()` bytes of the DMA region from `a`, read a 64-bit word at a time. The region is Normal non-cacheable: every load is its own trip to DRAM, and a frame read a byte at a time cost about half a microsecond a byte (the scheduler trace, 2026-11-11: the driver held a request A#808 µs for a full frame, A#200 µs for a short one). Eight bytes a load is an eighth of the trips.
+fn dma_get(a: u32, out: &mut [u8]) {
+    let mut w = a & !7;
+    let mut skip = (a - w) as usize;
+    let mut o = 0;
+    while o < out.len() {
+        let b = DmaH::read64(doff(w)).to_le_bytes();
+        // WHY the min: the first word may start before `a` and the last may run past the end; these are the bytes of this word that are the frame's.
+        let k = (8 - skip).min(out.len() - o);
+        out[o..o + k].copy_from_slice(&b[skip..skip + k]);
+        o += k;
+        skip = 0;
+        w += 8;
+    }
+}
+/// `data` into the DMA region at `a` (8-byte aligned), a 64-bit word at a time, the last word padded with zeros (a tx buffer is 2 KiB, the frame at most that).
+fn dma_put(a: u32, data: &[u8]) {
+    for (k, c) in data.chunks(8).enumerate() {
+        let mut b = [0u8; 8];
+        b[..c.len()].copy_from_slice(c);
+        DmaH::write64(doff(a + 8 * k as u32), u64::from_le_bytes(b));
+    }
+}
 
 /// The firmware's console ring (hnd_cons log) from `start`, `len` bytes, printable text only.
 fn console_dump(d: &mut Drv, buf: u32, size: u32, start: u32, len: u32) {
@@ -2043,11 +2119,83 @@ fn enable_l1ss(d: &mut Drv) -> bool {
 }
 
 /// A#192.168.1.1 — one base prefix for the dotted quad.
-/// The `wlan` endpoint (grant slot after the DMA region): Ethernet frames for other processes. Requests (first byte): 1 SEND frame → [0] sent / [1] too short; 2 RECV → the oldest received frame, or nothing (length 0); 3 INFO → our MAC (6 bytes) + link up (1). Between requests the driver keeps its rings moving; `recv` polls (flag 1) so it never blocks.
+/// The `wlan` endpoint (grant slot after the DMA region): Ethernet frames for other processes. Requests (first byte): 1 SEND frame → [0] sent / [1] refused (too short, or every tx buffer in flight); 2 RECV → the oldest received frame, or nothing (length 0); 3 INFO → our MAC (6 bytes) + link up (1); 8 EXCHANGE, frames both ways in one call (below). Between requests the driver keeps its rings moving; `recv` polls (flag 1) so it never blocks.
+/// 8 EXCHANGE: [8, most (u32 BE), then frames to send, each a u16 BE length and its bytes] → [flags, refused (u16 BE), then received frames, each a u16 BE length and its bytes]: every frame of the request sent (refused counts those that were not: too short, too long, or no tx buffer free), then as many received frames, oldest first, as fit in `most` bytes of reply (header included; the kernel cuts a reply at the caller's buffer, so the caller says how much it takes). Flags bit 0: more frames are waiting. A request cut short mid-frame ends there. A driver without op 8 answers with nothing (length 0), which the caller reads as "one frame a call" (ops 1 and 2).
+/// Why (2026-11-11, Mahere's map cells at about 0.2 MiB/s a connection): one frame a call cost a pass of this loop each (then about 270 µs of chip register reads thru syscalls, the PCIe link waking from L1 for each; the rings are read from host memory now, `item_new`) plus the call's own scheduling, and with every worker core busy each call waited for a 10 ms slice to end (`diag sched`: ip → pcie1 waited A#9740 µs on average, A#76 calls in A#877 ms). A call carries a batch now: the waits and the passes are paid once for many frames.
 const WLAN: u64 = 15;
 /// Receive buffers posted to the chip, 2 KiB each from RX_BASE in the DMA region (whose upper 1.5 MiB nothing else uses). 64 served the BCM4398; with 64 posted akita's BCM4383 delivered a third of its unicast and no ARP at all, so nothing on the LAN could be resolved and DNS never left (2026-11-09: Android's dhd posts 2040). With 256: every echo answered, ARP resolved, fgtw.org reached. A power of two under the rxpost ring's 512 slots; the rx queue's index fits a byte.
 const RX_BUFS: u32 = 1 << 8;
 const RX_BASE: u32 = 0x8_0000;
+/// Transmit buffers, 2 KiB each from G#7_0000 up to RX_BASE (64 KiB): a batch from the IP stack is its ACKs for a burst of segments, about 80 bytes each, up to 48 in a 4096-byte call; 32 in flight before the chip completes the first is ample.
+const TX_BUFS: u32 = 1 << 5;
+/// The largest request: 4096 bytes, all a call carries (the kernel's SYS_CALL reads at most that).
+const REQ_MAX: usize = 1 << 12;
+/// The largest reply to op 8: 128 KiB, about 88 full frames, a third of the posted buffers (the kernel carries a reply of up to 256 KiB).
+const REPLY_MAX: usize = 1 << 17;
+
+/// The receive path's measures while serving, over the 32 s the link states cover (owner, 2026-11-11: measure the path before fixing it). Counters only, said on one line with the link states when frames moved; counter ticks where a time is kept.
+#[derive(Default)]
+struct Path {
+    /// Passes of the serving loop, and the ones that ended in a sleep (no request).
+    passes: u32,
+    sleeps: u32,
+    /// Ticks spent reading the completion rings each pass (`pump`, `pump_rx`, `pump_tx`; from host memory since 2026-11-11, `item_new`, before then thru three chip register reads a pass).
+    ring_t: u64,
+    /// Requests that moved frames: exchanges (op 8), and single frames either way (ops 1 and 2).
+    exchanges: u32,
+    singles: u32,
+    /// Frames to the IP stack, the most in one exchange, and the ticks spent copying them out of the DMA region and re-posting their buffers.
+    to_ip: u32,
+    to_ip_most: u32,
+    copy_t: u64,
+    /// How long frames waited between their completion being taken and the IP stack taking them, in all and the longest, in ticks; the most frames waiting at once.
+    wait_t: u64,
+    wait_most: u64,
+    queued_most: u32,
+    /// Frames from the IP stack sent, and refused (malformed, or every tx buffer in flight).
+    from_ip: u32,
+    refused: u32,
+}
+
+impl Path {
+    /// One line: `rx path, last 32 s: A#<n> passes (A#<n> slept), rings read in A#<us> us a pass; A#<n> exchanges, A#<n> single frames; to ip A#<n> frames (most A#<n> an exchange, copied in A#<ns> ns each, waited A#<us> us on average, A#<us> us most, A#<n> most queued); from ip A#<n> frames, A#<n> refused`. Said only when frames moved, so after a request, so after a pass: `passes` is not zero.
+    fn say(&self, d: &mut Drv) {
+        let f = d.freq;
+        d.put(b"rx path, last 32 s: ");
+        d.dec(self.passes);
+        d.put(b" passes (");
+        d.dec(self.sleeps);
+        d.put(b" slept), rings read in ");
+        d.dec((self.ring_t * 1_000_000 / f / self.passes as u64) as u32);
+        d.put(b" us a pass; ");
+        d.dec(self.exchanges);
+        d.put(b" exchanges, ");
+        d.dec(self.singles);
+        d.put(b" single frames; to ip ");
+        d.dec(self.to_ip);
+        d.put(b" frames");
+        // WHY the test: the averages are per frame to the IP stack, and a window may have moved frames the other way only.
+        if self.to_ip > 0 {
+            let n = self.to_ip as u64;
+            d.put(b" (most ");
+            d.dec(self.to_ip_most);
+            d.put(b" an exchange, copied in ");
+            d.dec((self.copy_t * 1_000_000_000 / f / n) as u32);
+            d.put(b" ns each, waited ");
+            d.dec((self.wait_t * 1_000_000 / f / n) as u32);
+            d.put(b" us on average, ");
+            d.dec((self.wait_most * 1_000_000 / f) as u32);
+            d.put(b" us most, ");
+            d.dec(self.queued_most);
+            d.put(b" most queued)");
+        }
+        d.put(b"; from ip ");
+        d.dec(self.from_ip);
+        d.put(b" frames, ");
+        d.dec(self.refused);
+        d.put(b" refused\n");
+    }
+}
 
 fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     if !flowring(d, m) {
@@ -2068,8 +2216,13 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     // The link's power state as the PHY reports it (PCS G#188 bits 2:0: 0 L0, 2 L1, 5 L1.1, 6 L1.2; read without waking the link), sampled each pass and said every 32 s.
     let mut lstates = [0u32; 8];
     let mut lstates_at = d.now();
-    let mut msg = [0u8; 2048];
-    let mut out = [0u8; 2048];
+    // The receive path's measures over the same 32 s, said with the link states when frames moved.
+    let mut path = Path::default();
+    let mut msg = [0u8; REQ_MAX];
+    // The reply: up to `REPLY_MAX` bytes of frames, a static (not the 64 KiB stack).
+    static mut OUT: [u8; REPLY_MAX] = [0; REPLY_MAX];
+    // SAFETY: this loop is the only user of OUT, and the driver has one thread.
+    let out = unsafe { &mut *(&raw mut OUT) };
     let mut tok = [0u8; 32];
     // The corners' WiFi circle (SYS_STATUS): the link's own measures every two seconds, each in its unit, published only where the firmware answers (owner: many dimensions, never bars). Into the scan's request area: no scan runs while serving.
     let mut status_at = 0u64;
@@ -2114,9 +2267,15 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
                 }
             }
             d.put(b"\n");
+            if path.to_ip + path.from_ip > 0 {
+                path.say(d);
+            }
             d.flush();
             lstates = [0; 8];
+            path = Path::default();
         }
+        path.passes += 1;
+        let t_rings = d.now();
         let _ = m.pump(d);
         // The link lost while serving (the firmware's LINK down, or a deauthentication or disassociation from the access point): until 2026-11-10 the loop served on unlinked, the IP stack heard "not linked" every 4 s and the device was off the network until someone restarted this driver (the 8a, overnight). Now it ends, saying why, and init's keeper starts it again (at most every 64 s), which brings the radio up and joins afresh: the path every boot takes.
         if was_linked && (!m.linked || m.join_failed) {
@@ -2128,34 +2287,76 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
         }
         m.pump_rx(d);
         m.pump_tx(d);
+        path.ring_t += d.now().wrapping_sub(t_rings);
+        // WHY the max: the high water, for the measure.
+        path.queued_most = path.queued_most.max(m.rxq_len as u32);
         let n = svc(2, d.cap(WLAN), msg.as_mut_ptr() as u64 - d.base, msg.len() as u64, tok.as_mut_ptr() as u64 - d.base, 1);
         if n == u64::MAX - 1 || n == ERR {
-            // No request and no frame waiting: a millisecond's sleep, not a spinning core (the driver runs from boot since init starts it, 2026-10-26).
-            if m.rxq_len == 0 {
-                ferros_sys::sleep_until(ferros_sys::now() + d.freq / 1000);
-            }
+            // No request: a millisecond's sleep, not a spinning core (the driver runs from boot since init starts it, 2026-10-26), frames waiting or not. A call ends the sleep at once (the kernel wakes a polling server asleep between polls), so waiting frames lose nothing by it. Until 2026-11-11 the loop spun while frames waited, and with every worker core busy it spun thru whole 10 ms slices of poll misses while the IP stack, the one process that would take them, waited for a core (`diag sched`).
+            path.sleeps += 1;
+            ferros_sys::sleep_until(ferros_sys::now() + d.freq / 1000);
             continue;
         }
         let msg = unsafe { core::ptr::read_volatile(&msg) };
         let n = n as usize;
         let len = match msg.first() {
             Some(1) if n > 14 => {
-                m.send(d, &msg[1..n]);
-                out[0] = 0;
+                path.singles += 1;
+                let ok = m.send(d, &msg[1..n]);
+                path.from_ip += ok as u32;
+                path.refused += !ok as u32;
+                out[0] = !ok as u8;
                 1
             }
             Some(2) if m.rxq_len > 0 => {
-                let (i, off, l) = m.rxq[m.rxq_head];
-                m.rxq_head = (m.rxq_head + 1) % m.rxq.len();
-                m.rxq_len -= 1;
-                let p = m.dma + RX_BASE + 0x800 * i as u32 + off as u32;
-                let l = (l as usize).min(out.len());
-                for (k, o) in out[..l].iter_mut().enumerate() {
-                    *o = dbr(p + k as u32);
-                }
-                m.post_rx(i as u32);
+                path.singles += 1;
+                let l = m.rxq_take(out, &mut path);
                 m.ring_rx(d);
                 l
+            }
+            Some(8) if n >= 5 => {
+                path.exchanges += 1;
+                // WHY the min: `most` is the caller's word; the reply holds no more than this buffer either.
+                let most = (u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]) as usize).min(out.len());
+                // The frames to send, each a u16 BE length and its bytes; one that runs past the request ends it (refused).
+                let (mut at, mut sent, mut refused) = (5, 0u32, 0u32);
+                while at + 2 <= n {
+                    let l = u16::from_be_bytes([msg[at], msg[at + 1]]) as usize;
+                    at += 2;
+                    if at + l > n {
+                        refused += 1;
+                        break;
+                    }
+                    if m.tx_post(d, &msg[at..at + l]) {
+                        sent += 1;
+                    } else {
+                        refused += 1;
+                    }
+                    at += l;
+                }
+                if sent > 0 {
+                    m.tx_ring(d);
+                }
+                path.from_ip += sent;
+                path.refused += refused;
+                // The frames received, oldest first, as many as fit.
+                let mut o = 3;
+                let mut k = 0u32;
+                while m.rxq_len > 0 && o + 2 + m.rxq[m.rxq_head].2 as usize <= most {
+                    let l = m.rxq_take(&mut out[o + 2..], &mut path);
+                    out[o..o + 2].copy_from_slice(&(l as u16).to_be_bytes());
+                    o += 2 + l;
+                    k += 1;
+                }
+                if k > 0 {
+                    m.ring_rx(d);
+                }
+                // WHY the max: the high water, for the measure.
+                path.to_ip_most = path.to_ip_most.max(k);
+                out[0] = (m.rxq_len > 0) as u8;
+                // A request of 4096 bytes holds fewer than 2^11 frames: the count fits.
+                out[1..3].copy_from_slice(&(refused as u16).to_be_bytes());
+                o
             }
             Some(3) => {
                 out[..6].copy_from_slice(&m.mac);
@@ -2163,14 +2364,14 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
                 7
             }
             // The network page while joined: the list from before the join (no scan runs while serving), JOIN refused with 3 (joined already; another network is a later change), and the status.
-            Some(4) => m.scan_reply(false, &mut out),
+            Some(4) => m.scan_reply(false, out),
             // WATCH while joined: the list from before the join, and the last (no scan runs while serving).
-            Some(7) => watch_reply(m, false, false, &mut out),
+            Some(7) => watch_reply(m, false, false, out),
             Some(5) => {
                 out[0] = 3;
                 1
             }
-            Some(6) => m.status_reply(2, &mut out),
+            Some(6) => m.status_reply(2, out),
             Some(1) => {
                 out[0] = 1;
                 1
