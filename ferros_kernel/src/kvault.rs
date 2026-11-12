@@ -175,10 +175,51 @@ pub enum KvError {
     Belongs,
     /// No ferros partition found in the GPT, or one too small for the two mirrors.
     NoPartition,
+    /// A value kept in pieces whose manifest or pieces are not what they should be (`ferros_pieces::Error::Corrupt`).
+    Pieces(&'static str),
 }
 impl From<manifestus::Error> for KvError {
     fn from(e: manifestus::Error) -> Self {
         KvError::Engine(e)
+    }
+}
+impl From<ferros_pieces::Error<KvError>> for KvError {
+    fn from(e: ferros_pieces::Error<KvError>) -> Self {
+        match e {
+            ferros_pieces::Error::Store(e) => e,
+            ferros_pieces::Error::Corrupt(why) => KvError::Pieces(why),
+        }
+    }
+}
+
+/// The vault as `ferros_pieces` keeps a large value in it: each piece and the manifest at its own address (`ferros_pieces::Place`, under a key derived from the class's address key), sealed under the class's key with that address bound in, so a piece moved to another address does not open. An identity-class name's pieces are tracked as its whole value is (`ID_ADDRS`), so a wipe without the key takes them too.
+struct Pieces<'a> {
+    kv: &'a mut KVault,
+    class: Class,
+}
+
+impl ferros_pieces::Store for Pieces<'_> {
+    type Error = KvError;
+    fn get(&mut self, addr: &[u8; 32]) -> Result<Option<Vec<u8>>, KvError> {
+        match self.kv.vault.get(addr)? {
+            Some(s) => Ok(Some(self.kv.unseal(self.class, s, addr)?)),
+            None => Ok(None),
+        }
+    }
+    fn put(&mut self, addr: &[u8; 32], value: &[u8]) -> Result<(), KvError> {
+        let sealed = self.kv.seal(self.class, value, addr)?;
+        self.kv.vault.put(addr, &sealed, now())?;
+        if self.class == Class::Identity {
+            self.kv.track(addr, true)?;
+        }
+        Ok(())
+    }
+    fn delete(&mut self, addr: &[u8; 32]) -> Result<bool, KvError> {
+        let existed = self.kv.vault.delete(addr, now())?;
+        if existed && self.class == Class::Identity {
+            self.kv.track(addr, false)?;
+        }
+        Ok(existed)
     }
 }
 
@@ -225,20 +266,21 @@ impl KVault {
         Ok(*blake3::keyed_hash(self.addr_key_of(class)?, name.as_bytes()).as_bytes())
     }
 
-    fn seal(&mut self, class: Class, plain: &[u8]) -> Result<Vec<u8>, KvError> {
+    /// Sealed under `class`'s key with `ad` bound in (associated data: empty for a name's own value, its address for a piece, `ferros_pieces`).
+    fn seal(&mut self, class: Class, plain: &[u8], ad: &[u8]) -> Result<Vec<u8>, KvError> {
         let n = self.nonce.next_nonce();
         let cipher = self.cipher_of(class)?;
         // One allocation the size of the result: the nonce, the plaintext encrypted where it lies, then the tag — the same bytes `encrypt` gives. Sealing through `encrypt` into a growing Vec held two copies of the value at once (and a third while the Vec grew), and a 2.78 MB display capsule ran the 12 MiB heap out (2026-10-26, panic "memory allocation … failed" in the crumbs).
         let mut out = Vec::with_capacity(24 + plain.len() + 16);
         out.extend_from_slice(&n[..]);
         out.extend_from_slice(plain);
-        let tag = cipher.encrypt_in_place_detached(XNonce::from_slice(&n), b"", &mut out[24..]).map_err(|_| KvError::Seal)?;
+        let tag = cipher.encrypt_in_place_detached(XNonce::from_slice(&n), ad, &mut out[24..]).map_err(|_| KvError::Seal)?;
         out.extend_from_slice(&tag);
         Ok(out)
     }
 
     /// Opened where it lies, as `seal` closes: the nonce taken off the front, the rest decrypted in the same buffer and its tag dropped — one copy of a large value in the heap, not two.
-    fn unseal(&self, class: Class, mut sealed: Vec<u8>) -> Result<Vec<u8>, KvError> {
+    fn unseal(&self, class: Class, mut sealed: Vec<u8>, ad: &[u8]) -> Result<Vec<u8>, KvError> {
         if sealed.len() < 24 + 16 {
             return Err(KvError::Open);
         }
@@ -246,21 +288,21 @@ impl KVault {
         let mut n = [0u8; 24];
         n.copy_from_slice(&sealed[..24]);
         sealed.drain(..24);
-        cipher.decrypt_in_place(XNonce::from_slice(&n), b"", &mut sealed).map_err(|_| KvError::Open)?;
+        cipher.decrypt_in_place(XNonce::from_slice(&n), ad, &mut sealed).map_err(|_| KvError::Open)?;
         Ok(sealed)
     }
 
     fn raw_get_in(&mut self, class: Class, name: &str) -> Result<Option<Vec<u8>>, KvError> {
         let a = self.addr(class, name)?;
         match self.vault.get(&a)? {
-            Some(s) => Ok(Some(self.unseal(class, s)?)),
+            Some(s) => Ok(Some(self.unseal(class, s, b"")?)),
             None => Ok(None),
         }
     }
 
     fn raw_put_in(&mut self, class: Class, name: &str, value: &[u8]) -> Result<[u8; 32], KvError> {
         let a = self.addr(class, name)?;
-        let sealed = self.seal(class, value)?;
+        let sealed = self.seal(class, value, b"")?;
         self.vault.put(&a, &sealed, now())?;
         if class == Class::Identity {
             self.track(&a, true)?;
@@ -294,16 +336,74 @@ impl KVault {
         Ok(())
     }
 
-    /// The value stored under `name`; `Locked` for an identity-class name while no identity is unlocked.
+    /// The value stored under `name`; `Locked` for an identity-class name while no identity is unlocked. A value kept whole (at most `ferros_pieces::PIECE`, or stored before 2026-11-12) is read as it is; one in pieces is read into one buffer of its length, a piece at a time.
     pub fn get_by_key(&mut self, name: &str) -> Result<Option<Vec<u8>>, KvError> {
-        self.raw_get_in(class_of(name), name)
+        let class = class_of(name);
+        if let Some(v) = self.raw_get_in(class, name)? {
+            return Ok(Some(v));
+        }
+        let key = *self.addr_key_of(class)?;
+        let place = ferros_pieces::Place::new(&key, name.as_bytes());
+        ferros_pieces::read_whole(&mut Pieces { kv: self, class }, &place).map_err(KvError::from)
     }
 
-    /// Store `value` under `name`, durably (manifestus commits per put). Returns the value's vault address.
-    /// Store `value` under `name`. A slice, not an owned buffer: the store command's put used to copy the whole payload into a Vec just to hand it here, a third copy of a 2.7 MB capsule in the kernel heap (2026-10-23: it ran the heap out).
+    /// The value under `name` appended to `out` (a reply being built, its status byte already in it): a value in pieces goes in a piece at a time, `out` grown once to take it, so it is never in the heap twice. Whether there was one.
+    pub fn get_into(&mut self, name: &str, out: &mut Vec<u8>) -> Result<bool, KvError> {
+        let class = class_of(name);
+        if let Some(mut v) = self.raw_get_in(class, name)? {
+            out.extend_from_slice(&v);
+            v.fill(0);
+            return Ok(true);
+        }
+        let key = *self.addr_key_of(class)?;
+        let place = ferros_pieces::Place::new(&key, name.as_bytes());
+        let mut ps = Pieces { kv: self, class };
+        let Some(n) = ferros_pieces::len(&mut ps, &place)? else { return Ok(false) };
+        out.reserve_exact(n as usize);
+        let from = out.len();
+        let r = ferros_pieces::read(&mut ps, &place, |_, b| out.extend_from_slice(b));
+        if r.is_err() {
+            out[from..].fill(0);
+            out.truncate(from);
+        }
+        Ok(r?.is_some())
+    }
+
+    /// The length of the value under `name` when it is kept in pieces (None when it is kept whole, or there is none): what a reader that streams it (`read_pieces`) sizes its destination by.
+    pub fn pieces_len(&mut self, name: &str) -> Result<Option<usize>, KvError> {
+        let class = class_of(name);
+        let key = *self.addr_key_of(class)?;
+        let place = ferros_pieces::Place::new(&key, name.as_bytes());
+        Ok(ferros_pieces::len(&mut Pieces { kv: self, class }, &place)?.map(|n| n as usize))
+    }
+
+    /// The value under `name`, kept in pieces, handed to `sink(offset, bytes)` a piece at a time as each opens, and then held to the manifest's hash (`ferros_pieces::read`: on an error the sink must not trust what it was given). None when it is not kept in pieces.
+    pub fn read_pieces(&mut self, name: &str, sink: impl FnMut(usize, &[u8])) -> Result<Option<usize>, KvError> {
+        let class = class_of(name);
+        let key = *self.addr_key_of(class)?;
+        let place = ferros_pieces::Place::new(&key, name.as_bytes());
+        Ok(ferros_pieces::read(&mut Pieces { kv: self, class }, &place, sink)?.map(|n| n as usize))
+    }
+
+    /// Store `value` under `name`, durably (manifestus commits per put). Returns the value's vault address (its manifest's, for a value in pieces).
+    /// A slice, not an owned buffer: the store command's put used to copy the whole payload into a Vec just to hand it here, a third copy of a 2.7 MB capsule in the kernel heap (2026-10-23: it ran the heap out).
+    /// A value over `ferros_pieces::PIECE` is kept in sealed pieces under a manifest (2026-11-12): sealed whole, a 2.8 MB capsule held the sealed copy and manifestus's staging of it (each a 3 MB block) in the kernel heap at once, and with Mahere running the 22 MiB heap had the bytes but no such hole and the kernel panicked. A value of either kind replaces the other: the whole entry or the pieces left from before go.
     pub fn set(&mut self, name: &str, value: &[u8]) -> Result<[u8; 32], KvError> {
         let class = class_of(name);
-        let a = self.raw_put_in(class, name, value)?;
+        let key = *self.addr_key_of(class)?;
+        let place = ferros_pieces::Place::new(&key, name.as_bytes());
+        let a = if value.len() > ferros_pieces::PIECE {
+            ferros_pieces::put(&mut Pieces { kv: self, class }, &place, value, crate::settings::eagle_now())?;
+            let whole = self.addr(class, name)?;
+            if self.vault.delete(&whole, now())? && class == Class::Identity {
+                self.track(&whole, false)?;
+            }
+            place.manifest()
+        } else {
+            let a = self.raw_put_in(class, name, value)?;
+            ferros_pieces::remove(&mut Pieces { kv: self, class }, &place, crate::settings::eagle_now())?;
+            a
+        };
         if reserved(name) {
             return Ok(a);
         }
@@ -316,14 +416,17 @@ impl KVault {
         Ok(a)
     }
 
-    /// Remove `name`; true if it existed.
+    /// Remove `name`, kept whole or in pieces; true if it existed.
     pub fn remove_key(&mut self, name: &str) -> Result<bool, KvError> {
         let class = class_of(name);
         let a = self.addr(class, name)?;
-        let existed = self.vault.delete(&a, now())?;
+        let mut existed = self.vault.delete(&a, now())?;
         if class == Class::Identity {
             self.track(&a, false)?;
         }
+        let key = *self.addr_key_of(class)?;
+        let place = ferros_pieces::Place::new(&key, name.as_bytes());
+        existed |= ferros_pieces::remove(&mut Pieces { kv: self, class }, &place, crate::settings::eagle_now())?;
         let mut names = self.names_in(class)?;
         if let Some(i) = names.iter().position(|n| n == name) {
             names.remove(i);
@@ -347,7 +450,7 @@ impl KVault {
     pub fn get_addr(&mut self, prefix: &str, addr: &[u8; 32]) -> Result<Option<Vec<u8>>, KvError> {
         let a = self.addr_scoped(prefix, addr)?;
         match self.vault.get(&a)? {
-            Some(s) => Ok(Some(self.unseal(class_of(prefix), s)?)),
+            Some(s) => Ok(Some(self.unseal(class_of(prefix), s, b"")?)),
             None => Ok(None),
         }
     }
@@ -355,7 +458,7 @@ impl KVault {
     pub fn set_addr(&mut self, prefix: &str, addr: &[u8; 32], value: &[u8]) -> Result<(), KvError> {
         let class = class_of(prefix);
         let a = self.addr_scoped(prefix, addr)?;
-        let sealed = self.seal(class, value)?;
+        let sealed = self.seal(class, value, b"")?;
         self.vault.put(&a, &sealed, now())?;
         if class == Class::Identity {
             self.track(&a, true)?;

@@ -330,6 +330,13 @@ On ARM, with the MMU off every data access is Device memory: no data cache, excl
 
 Measured on husky: a 4 MiB copy 157 ms → 0.78 ms (~200×), BLAKE3 1.6 → 215 MB/s (~135×), cold vault open 84 → 10 ms. On Glyph silicon even this table goes away.
 
+### The kernel heap (TLSF since 2026-11-12)
+
+Two fixed regions in the window, never grown: 12 MiB after the kernel stack (`main.rs` `HEAP_SIZE`, 4 MiB on the handoff path) and, a couple of seconds into the service loop, 10 MiB from G#8260_0000 (`cachemap::HEAP2`). The largest block one allocation can get is therefore under 12 MiB, and what a busy kernel leaves scattered in both decides whether a large one fits.
+The allocator is TLSF, the same source std processes run (`ferros_rt/src/tlsf.rs`, included by `ferros_heap/src/kernel.rs`): an alloc or a free is a few bit operations whatever the number of free blocks, and realloc grows in place when the block behind is free. The first-fit free list before it walked every free block under the lock and grew a Vec only by a new block and a copy.
+Large things stay out of it: a PT command over 1 MiB lands in its own 6 MiB region (`ptlink.rs` `BIG`); a vault value over 512 KiB is sealed and stored a piece at a time (`ferros_pieces`, `kvault.rs`); a restart streams a capsule in pieces into a staging arc and gates it there (`service.rs` `spawn_from_pieces`). Before that, storing and restarting the display's 2.8 MB capsule held five 3 MB blocks of the heap between them, and with Mahere running the heap had the bytes but not the holes: two panics on the Pro (PREV_EXIT G#EE91, 2026-11-12).
+`diag heap` reports it: the regions, in use and its peak, the free bytes and blocks and the largest, the free blocks by size (one line a power of two), and the last refused allocation. A refused allocation is recorded before it is answered (its size, alignment, the core, the return address into whoever asked, the heap then), and a panic carries it: r[6..8] of the report block, a line in the RAM log, and the next boot's flash log.
+
 ---
 
 ## Where it runs on husky: the big core (2026-10-22)

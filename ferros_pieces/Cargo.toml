@@ -1,0 +1,10 @@
+[package]
+name = "ferros_pieces"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "A large value in the kernel's vault as sealed pieces under a manifest, so storing or reading it never needs the whole value, let alone twice it, in one block of the kernel heap"
+
+[dependencies]
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+vsf = { path = "../../vsf", default-features = false }
