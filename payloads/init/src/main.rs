@@ -12,7 +12,7 @@
 //!   51 the vault scope `ahau.`, 52 use rmnet (the cellular link, the IP process's second), 53 serve rmnet, 54-68 the modem's hardware, 69-71 its shared memory, 72-76 its partitions (payloads/modem).
 //!   77-79 the NFC driver's, 80 use nfc, 81-83 the Bluetooth driver's, 84 use bt, 85 the identity unlock right, 86-90 the USB driver's (registers, DMA, interrupt, PT commands, power). 91 the touch controller's power. 92-96 the sensors process's (the AoC's IPC block and mailboxes, the vault scope `aoc.`, the Sensors right, its switch).
 //!   104 the Kists right (launching a kist with exactly its granted rights, KISTS.md), 105 serve launch, 106 use launch (the map's), 107 the vault scope `kists.` (the person's list); 104-108 were the GPU service's, which the kernel starts itself since 2026-11-08.
-//!   108 use kists (the map's: the installer, payloads/kists, which the kernel starts itself with its own grants once a person has attested, as it does GPS).
+//!   108 use kists (the map's: the stower, payloads/kists, which the kernel starts itself with its own grants once a person has attested, as it does GPS).
 #![no_std]
 #![no_main]
 
@@ -63,7 +63,7 @@ const SHELL: [(&[u8], &[u8], &[u64]); 12] = [
     (b"bt", b"bt", &[81, 82, 76, 83, 41]),
     // The cellular modem's driver (payloads/modem): it powers the CP, registers and serves the data call on rmnet; ip takes it as its second link.
     (b"modem", b"modem", &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 40, 69, 70, 71, 72, 73, 74, 75, 76]),
-    // What reads the person's space (the identity class), each when it may (`wait_person`). fgtw, the identity service, once an identity is unlocked: it is part of attest, looking the identity up and joining its fleet (its chain and key; not the Photon app, which a person installs): 1 use udp, 2 the vault scope `fgtw.`, 3 the ira key, 4 serve fgtw, 5 entropy (the fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right, 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space, joined to their fleet's: payloads/fgtw space.rs). The map only once the device is also bound to that identity (owner, 2026-11-04: "if it's not attached to an identity, not usable"): its arrangement, 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page), 6 the vault scope `kists.`, 7 use launch, 8 use kists, 9 use nfc (the NFC page's "add a tag", AUTH.md "Attest with a tag"; the kernel puts the torch after it).
+    // What reads the person's space (the identity class), each when it may (`wait_person`). fgtw, the identity service, once an identity is unlocked: it is part of attest, looking the identity up and joining its fleet (its chain and key; not the Photon app, which a person stows): 1 use udp, 2 the vault scope `fgtw.`, 3 the ira key, 4 serve fgtw, 5 entropy (the fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right, 9 the vault scope `map.` and 10 the vault scope `kists.` (the person's identity space, joined to their fleet's: payloads/fgtw space.rs). The map only once the device is also bound to that identity (owner, 2026-11-04: "if it's not attached to an identity, not usable"): its arrangement, 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page), 6 the vault scope `kists.`, 7 use launch, 8 use kists, 9 use nfc (the NFC page's "add a tag", AUTH.md "Attest with a tag"; the kernel puts the torch after it).
     (b"fgtw", b"fgtw", &[50, 48, 49, 46, 41, 80, 84, 85, 20, 107]),
     (b"map", b"map", &[17, 18, 19, 20, 47, 107, 106, 108, 80]),
 ];
@@ -169,9 +169,9 @@ fn launch(grants: u64, capsule: [u8; 32], relaunch: bool) -> [u8; 4] {
     use ferros_kist::launch::*;
     let one = |a: u8| [a, 0, 0, 1];
     let Some(list) = ferros_kist::store::read(cap(grants, S_KIST_LIST)) else { return one(UNREADABLE) };
-    let Some(k) = list.by_capsule(&capsule) else { return one(NOT_INSTALLED) };
+    let Some(k) = list.by_capsule(&capsule) else { return one(NOT_STOWED) };
     let Some(codes) = k.launch_codes() else { return one(ASK) };
-    // WHY: the name is the installer's ASCII; a process name and a request hold 64 bytes, a slot list 64 slots (a longer one is a capsule no request can launch).
+    // WHY: the name is the stower's ASCII; a process name and a request hold 64 bytes, a slot list 64 slots (a longer one is a capsule no request can launch).
     let name = &k.name.as_bytes()[..k.name.len().min(64)];
     if codes.len() > 64 {
         return one(REFUSED);
@@ -190,12 +190,12 @@ fn launch(grants: u64, capsule: [u8; 32], relaunch: bool) -> [u8; 4] {
     }
 }
 
-/// The person's Stop on a kist's card (owner, 2026-11-12; docs/KISTS.md "The deck and the card"): the kist found in their list by its capsule, its running process killed by the kernel, one shot dead, nothing launched. Answers alone (ferros_kist::launch): STOPPED, NOT_RUNNING, NOT_INSTALLED, UNREADABLE or REFUSED.
+/// The person's Stop on a kist's card (owner, 2026-11-12; docs/KISTS.md "The deck and the card"): the kist found in their list by its capsule, its running process killed by the kernel, one shot dead, nothing launched. Answers alone (ferros_kist::launch): STOPPED, NOT_RUNNING, NOT_STOWED, UNREADABLE or REFUSED.
 fn stop(grants: u64, capsule: [u8; 32]) -> u8 {
     use ferros_kist::launch::*;
     let Some(list) = ferros_kist::store::read(cap(grants, S_KIST_LIST)) else { return UNREADABLE };
-    let Some(k) = list.by_capsule(&capsule) else { return NOT_INSTALLED };
-    // WHY: as a launch's: the name is the installer's ASCII, and a request holds 64 bytes of it.
+    let Some(k) = list.by_capsule(&capsule) else { return NOT_STOWED };
+    // WHY: as a launch's: the name is the stower's ASCII, and a request holds 64 bytes of it.
     let name = &k.name.as_bytes()[..k.name.len().min(64)];
     match ferros_sys::stop_kist(grants, S_KISTS, name, &capsule) {
         0 => {

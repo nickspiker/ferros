@@ -171,12 +171,12 @@ EP0 vendor-request readouts (`G#5A` / `G#5B`) — they ride the control endpoint
 `dbg` answers "which PT stage did my command die at"; `dbg2` answers "what did the DWC3 hardware actually see".
 These found the ENDTRANSFER bug in one boot; reach for them before adding any kernel-side printf.
 
-### kist install (development fallback)
+### kist stow (development fallback)
 ```
-ferros-bridge kist install target/mahere.capsule.vsf
+ferros-bridge kist stow target/mahere.capsule.vsf
 ```
-Kists are stowed with `ferros send <capsule>` (tools/ferros-send; KISTS.md "Stowing", USB.md "Offering a kist"): the device's installer checks the capsule and the person says Stow on its screen.
-`kist install` skips both, thru the development `store` capability, for unattended loops with nobody at the screen; a production build answers neither.
+Kists are stowed with `ferros send <capsule>` (tools/ferros-send; KISTS.md "Stowing", USB.md "Offering a kist"): the device's stower checks the capsule and the person says Stow on its screen.
+`kist stow` skips both, thru the development `store` capability, for unattended loops with nobody at the screen; a production build answers neither.
 Every script stows with `ferros send` (owner, 2026-11-11: "a proper checked path and start using it").
 
 ## Transport contract

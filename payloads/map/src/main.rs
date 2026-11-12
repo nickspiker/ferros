@@ -1,6 +1,6 @@
 //! The map (SHELL.md): the device is a map of your life. Every person, message, photo and app is a circle on one plane; the view is a camera over it, and the camera is the only thing that moves.
 //!
-//! The circles: one is built in, the system's own: the device's settings, one side only (owner, 2026-11-05: "that should only have one side, it's the OS settings page"). Nothing else is (owner, 2026-11-04: "For the baked in circles, there should be one. System settings, that's it. You want a clock? INSTALL IT YOURSELF!!!"): every other circle is a kist the person installs (docs/GLOSSARY.md: the signed capsule as this device checked, compiled and sealed it), a kist circle, and the map knows nothing about it until then. The placement below (a seeded random fit with generous air) is for when there are more.
+//! The circles: one is built in, the system's own: the device's settings, one side only (owner, 2026-11-05: "that should only have one side, it's the OS settings page"). Nothing else is (owner, 2026-11-04: "For the baked in circles, there should be one. System settings, that's it. You want a clock? INSTALL IT YOURSELF!!!"): every other circle is a kist the person stows (docs/GLOSSARY.md: the signed capsule as this device checked, compiled and sealed it), a kist circle, and the map knows nothing about it until then. The placement below (a seeded random fit with generous air) is for when there are more.
 //!
 //! The gestures (owner, 2026-10-22: "two finger scale/move for edits and back to a normal two finger vs one finger for the back"):
 //! - One finger dragged from the air moves the plane; dragged from a circle, it moves that circle.
@@ -14,14 +14,14 @@
 //!
 //! Positions are deterministic until the person arranges by hand; then each moved circle is kept in the vault (`map.place.<name>`) and wins over the seeded place from then on.
 //!
-//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page, and the identity space: the arrangement and kists written from the person's fleet are read again when its generation moves, docs/IDENTITY-SPACE.md), 6 the vault scope `kists.`, 7 use launch (init), 8 use kists (the installer, payloads/kists: the Deck page stows, updates and unstows through it, installer.rs), 9 use nfc (attest with a tag: the NFC page adds a tag, AUTH.md), 10 use torch (the kernel's, not init's, the slot after the last: the quick row, quick.rs).
+//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the identity service (use fgtw: the Fleet page, and the identity space: the arrangement and kists written from the person's fleet are read again when its generation moves, docs/IDENTITY-SPACE.md), 6 the vault scope `kists.`, 7 use launch (init), 8 use kists (the stower, payloads/kists: the Deck page stows, updates and unstows through it, stower.rs), 9 use nfc (attest with a tag: the NFC page adds a tag, AUTH.md), 10 use torch (the kernel's, not init's, the slot after the last: the quick row, quick.rs).
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
-mod installer;
+mod stower;
 mod quick;
 mod typed;
 
@@ -71,8 +71,8 @@ const S_FGTW: u64 = 5;
 const S_KIST_LIST: u64 = 6;
 /// Init's `launch` endpoint: a kist circle tapped asks init to launch it, and a kist's card stops it (the map holds none of a kist's rights).
 const S_LAUNCH: u64 = 7;
-/// The installer's `kists` endpoint (payloads/kists): the Deck page stows, updates and unstows through it, and reads the pandok (the directory) and the jobs under way.
-const S_INSTALLER: u64 = 8;
+/// The stower's `kists` endpoint (payloads/kists): the Deck page stows, updates and unstows through it, and reads the pandok (the directory) and the jobs under way.
+const S_STOWER: u64 = 8;
 /// The NFC driver (payloads/nfc): its TAG (op 9) held while the NFC page adds a tag (attest with a tag, AUTH.md; owner, 2026-11-11: "ideally something in settings to add a tag").
 const S_NFC: u64 = 9;
 /// The torch (payloads/torch, docs/TORCH.md): its send right, which the kernel hands whoever it hands Settings, as the slot after the last (init's grants page is full); the quick row's torch circle calls it. An older kernel leaves the slot empty, a call on it fails, and the circle is drawn dimmed. 9 until init granted use nfc before it (2026-11-11).
@@ -143,7 +143,7 @@ struct Spec<'a> {
 
 /// The one built-in circle: the system's own, the device's settings. It never lights (lit means a person sent you something).
 const CIRCLES: [Spec<'static>; 1] = [Spec { label: "settings", ring: 1, lit: 0, share: 250, icon: 6 }];
-/// The most circles the map holds: settings and the kists the person installed (KISTS.md), each a kist circle after it.
+/// The most circles the map holds: settings and the kists the person stowed (KISTS.md), each a kist circle after it.
 const MAX: usize = 1 << 4;
 /// A kist circle's share of the map's area until it is sized by hand (thousandths, as `Spec::share`).
 const KIST_SHARE: u32 = 125;
@@ -836,13 +836,13 @@ enum Choice {
     Answer(u8, u8),
     /// The Deck page: a thing's unstow (its place in the person's list; two taps; a puck's "remove from the deck"), and the pandok's stow or update (its row in the directory).
     Unstow(u8),
-    Install(u8),
+    StowListed(u8),
     /// The Deck page: a row's card opened (its place in the person's list), and back to the list.
     Card(u8),
     CardBack,
     /// A kist's card: its running process stopped (init's `OP_STOP`).
     Stop(u8),
-    /// A kist offered over USB, on the Deck page: Stow (true) or Cancel (false), the person's answer to the installer (docs/KISTS.md "Stowing").
+    /// A kist offered over USB, on the Deck page: Stow (true) or Cancel (false), the person's answer to the stower (docs/KISTS.md "Stowing").
     Stow(bool),
     /// A right's default for new kists (Permissions).
     Default(u8),
@@ -1048,7 +1048,7 @@ fn group_of(kind: u16) -> usize {
     }
 }
 
-/// A kist the display draws itself in its circle (a widget: its scene icon at G#80 and up, display WIDGET_*), by the kist's name: the clock (owner, 2026-11-10: "my clock widget kist on the homescreen again"). Installed like any app (payloads/clock, tools/clock-kist.sh), never launched.
+/// A kist the display draws itself in its circle (a widget: its scene icon at G#80 and up, display WIDGET_*), by the kist's name: the clock (owner, 2026-11-10: "my clock widget kist on the homescreen again"). Stowed like any app (payloads/clock, tools/clock-kist.sh), never launched.
 fn widget(name: &str) -> Option<u8> {
     name.eq_ignore_ascii_case("Clock").then_some(CLOCK_FACE)
 }
@@ -1069,7 +1069,7 @@ fn why_words(why: u8) -> Msg {
     use ferros_kist::launch::why as w;
     match why {
         w::ROOM => Msg::NotEnoughMemory,
-        w::NOT_HERE => Msg::NotInstalledHere,
+        w::NOT_HERE => Msg::NotStowedHere,
         w::CHECKS => Msg::FailedItsChecks,
         w::READ => Msg::CouldNotBeRead,
         // Started, then stopped (a fault or a panic: the kind is on the console; a kill from outside).
@@ -1342,8 +1342,8 @@ struct Map {
     /// The clock page's zone picker while it is open (`ZonePick`), and the last word on a choice that did not take (the clock's or the language's), shown until the next tap on the page, in the language in effect when it draws.
     zone_pick: Option<ZonePick>,
     zone_note: Option<Msg>,
-    /// The installer as last read (installer.rs): the directory's kists and each job under way.
-    installer: installer::Installer,
+    /// The stower as last read (stower.rs): the directory's kists and each job under way.
+    stower: stower::Stower,
     /// The Deck page's unstow armed on a kist or a puck, by its place in the person's list (the first tap of two, as "remove this device").
     unstow_armed: Option<u8>,
     /// The Deck page's card open, by the capsule of the kist or puck it is for (owner, 2026-11-12: a row opens its card, the one way to see a kist's info); None on the list. Gone with it when that thing is unstowed.
@@ -1690,7 +1690,7 @@ fn zone_words(l: &mut Line, id: &str, with_region: bool) {
 }
 
 impl Map {
-    /// Circle `i` as the scene draws it: settings first, then each installed kist, its name its label and its icon the display's bundled one for that app (tools/app-icons order), or none.
+    /// Circle `i` as the scene draws it: settings first, then each stowed kist, its name its label and its icon the display's bundled one for that app (tools/app-icons order), or none.
     fn spec(&self, i: usize) -> Spec<'_> {
         if i == 0 {
             let c = &CIRCLES[0];
@@ -1715,7 +1715,7 @@ impl Map {
         i.checked_sub(1).and_then(|k| self.kists.kists.get(k))
     }
 
-    /// The person's list read again (another device of theirs may have answered, or an install added a kist); false when it could not be read (nobody present), the copy kept as it was.
+    /// The person's list read again (another device of theirs may have answered, or a stow added a kist); false when it could not be read (nobody present), the copy kept as it was.
     fn reload_kists(&mut self) -> bool {
         match ferros_kist::store::read(cap(self.grants, S_KIST_LIST)) {
             Some(k) => {
@@ -1726,7 +1726,7 @@ impl Map {
         }
     }
 
-    /// The person's list read again, and the kist circles made to match it when a kist came or went (an install over the bridge, one on another of their devices): placed afresh by the seeded fit, each kept place winning, then the scene sent again.
+    /// The person's list read again, and the kist circles made to match it when a kist came or went (a stow over the bridge, one on another of their devices): placed afresh by the seeded fit, each kept place winning, then the scene sent again.
     fn refresh_circles(&mut self) {
         if !self.reload_kists() {
             return;
@@ -1734,7 +1734,7 @@ impl Map {
         // WHY: the arrays hold MAX circles (as at start).
         let n = (1 + self.kists.kists.len()).min(MAX);
         if n == self.n {
-            // As many circles, but a circle may hold another kist now (one uninstalled, another installed): its state follows, drawn with the next frame as a new scene is.
+            // As many circles, but a circle may hold another kist now (one unstowed, another stowed): its state follows, drawn with the next frame as a new scene is.
             let _ = self.send_states(false);
             return;
         }
@@ -1773,7 +1773,7 @@ impl Map {
         self.send_scene();
     }
 
-    /// The places kept by hand (`load_places`), then every circle still at its seeded place moved with the settings circle: the seeded fit is about the settings circle at the origin, and a kist circle installed after the person moved settings would otherwise land far from it, off the view they keep.
+    /// The places kept by hand (`load_places`), then every circle still at its seeded place moved with the settings circle: the seeded fit is about the settings circle at the origin, and a kist circle stowed after the person moved settings would otherwise land far from it, off the view they keep.
     fn load_places_near(&mut self) -> usize {
         let seeded: [(i64, i64); MAX] = core::array::from_fn(|i| (self.xs[i], self.ys[i]));
         let kept = self.load_places();
@@ -1798,7 +1798,7 @@ impl Map {
 
     /// Ask init to launch kist circle `i`'s kist (KISTS.md): the map holds none of its rights. Init's answer (ferros_kist::launch). A widget's kist is not launched: the display draws it, in its circle, from the scene (`widget`). Answered "started", the kist is remembered with the kists' bell as it stands (`asked`): the kernel may yet not start it, and then its circle says why.
     fn launch(&mut self, i: usize) -> u8 {
-        let Some(k) = self.kist(i) else { return ferros_kist::launch::NOT_INSTALLED };
+        let Some(k) = self.kist(i) else { return ferros_kist::launch::NOT_STOWED };
         if widget(&k.name).is_some() {
             return ferros_kist::launch::RUNNING;
         }
@@ -1812,7 +1812,7 @@ impl Map {
         // Running on a surface (init's RUNNING with the surface and its generation): its window to the front instead of a second copy (owner, 2026-11-11: a running kist's circle tapped "brings it to the front").
         let raised = r[0] == ferros_kist::launch::RUNNING && n == 3 && ferros_sys::window::front(self.display, r[1], r[2]);
         let mut l = Line::new();
-        let _ = write!(l, "map: launch {}: {}\n", k.name, match r[0] { 0 => "starting", 1 if raised => "running, brought to the front", 1 => "running", 2 => "asking first", 3 => "not installed", 5 => "the list is not readable", _ => "refused" });
+        let _ = write!(l, "map: launch {}: {}\n", k.name, match r[0] { 0 => "starting", 1 if raised => "running, brought to the front", 1 => "running", 2 => "asking first", 3 => "not stowed", 5 => "the list is not readable", _ => "refused" });
         console(self.grants, l.as_str().as_bytes());
         let capsule = k.capsule;
         if r[0] == ferros_kist::launch::STARTED {
@@ -1831,7 +1831,7 @@ impl Map {
         r[0]
     }
 
-    /// The kist circle holding `capsule`, if it is still installed.
+    /// The kist circle holding `capsule`, if it is still stowed.
     fn circle_of(&self, capsule: &[u8; 32]) -> Option<usize> {
         (1..self.n).find(|&i| self.kist(i).is_some_and(|k| k.capsule == *capsule))
     }
@@ -1850,7 +1850,7 @@ impl Map {
         true
     }
 
-    /// Back's swipe (owner, 2026-11-11: "flip to the previous kist (this one to the background)"): the kist before the one in front, or with the map on the glass the last kist in front, launched as a tap on its circle would (init's RUNNING brings its window to the front; one that ended since starts again). The one in front goes behind first. A kist uninstalled since is passed over.
+    /// Back's swipe (owner, 2026-11-11: "flip to the previous kist (this one to the background)"): the kist before the one in front, or with the map on the glass the last kist in front, launched as a tap on its circle would (init's RUNNING brings its window to the front; one that ended since starts again). The one in front goes behind first. A kist unstowed since is passed over.
     fn flip(&mut self) -> &'static str {
         let skip = if self.app_front { self.front_kist } else { None };
         loop {
@@ -1921,7 +1921,7 @@ impl Map {
         }
     }
 
-    /// A kist that did not start, its circle opened on why, as a tap on it opens it (`fault_page`): once the plane is at rest, nothing is held and no app is in front, so it never pulls the view from under a finger or a flight. Its circle gone meanwhile (the kist uninstalled), nothing is shown.
+    /// A kist that did not start, its circle opened on why, as a tap on it opens it (`fault_page`): once the plane is at rest, nothing is held and no app is in front, so it never pulls the view from under a finger or a flight. Its circle gone meanwhile (the kist unstowed), nothing is shown.
     fn show_fault(&mut self) {
         let Some((capsule, _, false)) = self.fault else { return };
         if self.view != View::Map || self.settling || self.touching || self.app_front {
@@ -2277,7 +2277,7 @@ impl Map {
     /// - for you (400 nm): something waits on the person for it (`waiting`; nothing adds to it yet, there are no notifications).
     /// - running (500 nm): a live process of it, in front or behind (deck leaves it alive behind). A widget the display draws itself (the clock) is running too: it is never a process, and it is live on the glass.
     /// - stopped (600 nm): the kernel keeps a record for it (ferros_sys::not_started): its last process ended by a fault, a panic or a kill from outside, or its last launch did not start; gone once it starts again.
-    /// - not running (a ring of darkness): installed and none of those (not launched since boot, or ended by its own exit or the person's relaunch).
+    /// - not running (a ring of darkness): stowed and none of those (not launched since boot, or ended by its own exit or the person's relaunch).
     /// Before the kernel has said (a kernel without op 2), a kist circle has no state: the theme's glow as before.
     fn state(&self, i: usize) -> (ferros_glow::Glow, u16) {
         use ferros_glow::Glow;
@@ -3879,24 +3879,24 @@ impl Map {
             "deck" => {
                 // Everything on the deck, each row opening its card (`card`): what it is, who made it, its rights as switches (owner, 2026-11-08: per kist, its rights; a tap changes the answer for every device of the person's, and a kist running is killed and started again with the answers as they now stand), stop, update and unstow.
                 let ks = self.kists.kists.clone();
-                // The installer's (installer.rs): the directory and the jobs under way. Sizes in the person's number base.
-                let inst = self.installer.clone();
+                // The stower's (stower.rs): the directory and the jobs under way. Sizes in the person's number base.
+                let inst = self.stower.clone();
                 let f = ferros_sys::numbers(Style::Glyphs);
                 // A job's bar (fluor's slider track, op 48, its knob no wider than the track) and its stage in words under it; a finished job's words alone.
-                let progress = |m: &mut Map, b: &mut Batch, y: &mut i64, j: &installer::Job| {
-                    if j.stage < installer::DONE {
+                let progress = |m: &mut Map, b: &mut Batch, y: &mut i64, j: &stower::Job| {
+                    if j.stage < stower::DONE {
                         let (a, z) = m.track(cx);
                         let tr = uq >> 3;
-                        b.slider(a, z, *y, tr, tr, installer::share(j), white(), dim(), white());
+                        b.slider(a, z, *y, tr, tr, stower::share(j), white(), dim(), white());
                         *y += uu(3, 2);
                     }
-                    let l = installer::words(j, f);
-                    row(m, b, y, note, if j.stage == installer::FAILED { white() } else { grey() }, l.as_str(), None);
+                    let l = stower::words(j, f);
+                    row(m, b, y, note, if j.stage == stower::FAILED { white() } else { grey() }, l.as_str(), None);
                 };
-                // A kist offered over USB (docs/KISTS.md "Stowing"; owner, 2026-11-11: "the proper term for installing a kist is stow"), above everything: while the installer checks it, its bar; once checked, what it is, who made it, its version and size, plainly whether its code is unchecked (a development build's native code), what it asks for and why, then Stow and Cancel; then how it ended, until the job gives way. Nothing is in the person's list before Stow. No icon yet: a capsule carries none (the circles' icons are the display's own).
-                for j in inst.jobs.iter().filter(|j| j.kind == installer::KIND_OFFER) {
+                // A kist offered over USB (docs/KISTS.md "Stowing"; owner, 2026-11-11: "the proper term for installing a kist is stow"), above everything: while the stower checks it, its bar; once checked, what it is, who made it, its version and size, plainly whether its code is unchecked (a development build's native code), what it asks for and why, then Stow and Cancel; then how it ended, until the job gives way. Nothing is in the person's list before Stow. No icon yet: a capsule carries none (the circles' icons are the display's own).
+                for j in inst.jobs.iter().filter(|j| j.kind == stower::KIND_OFFER) {
                     match (j.stage, inst.offer.as_ref().filter(|o| o.capsule == j.capsule)) {
-                        (installer::ASKING, Some(o)) => {
+                        (stower::ASKING, Some(o)) => {
                             row(self, b, &mut y, uu(3, 2), white(), tr(Msg::OfferedOverUsb), None);
                             let mut l = Line::new();
                             let _ = write!(l, "{} ", o.name);
@@ -3973,7 +3973,7 @@ impl Map {
                             }
                         }
                         fact(b, &mut y, tr(Msg::FactVersion), v.as_str());
-                        // Its capsule's size where it is known: the pandok listing this very capsule, else the job that brought it while the installer still holds it. The person's list keeps no size, and the map holds no right to `capsules.`.
+                        // Its capsule's size where it is known: the pandok listing this very capsule, else the job that brought it while the stower still holds it. The person's list keeps no size, and the map holds no right to `capsules.`.
                         let size = inst.dir.iter().find(|e| e.capsule == k.capsule).map(|e| e.size).or_else(|| inst.job_for(&k.capsule).map(|j| j.total).filter(|&t| t != 0));
                         let mut s = Line::new();
                         match size {
@@ -4025,11 +4025,11 @@ impl Map {
                     }
                     y += uu(1, 2);
                     // Its actions. A restore or an unstow of it under way, or one that failed, first; while one is under way, no unstow.
-                    let job = inst.job_for(&k.capsule).filter(|j| j.stage != installer::DONE);
+                    let job = inst.job_for(&k.capsule).filter(|j| j.stage != stower::DONE);
                     if let Some(j) = job {
                         progress(self, b, &mut y, j);
                     }
-                    let busy = job.is_some_and(|j| j.stage < installer::DONE);
+                    let busy = job.is_some_and(|j| j.stage < stower::DONE);
                     // Stop, while it runs: one shot dead (init's OP_STOP), no record kept (the person's own act), so it goes to not running.
                     if st.is_some_and(|s| s.0 == Msg::Running) && puck.is_none() {
                         button(self, b, &mut y, tr(Msg::Stop), false, Some(Choice::Stop(ki as u8)));
@@ -4038,15 +4038,15 @@ impl Map {
                     let newer = inst.dir.iter().position(|e| e.developer == k.developer && e.option == k.option && e.capsule != k.capsule && k.version.as_ref().is_none_or(|v| e.version > *v));
                     if let Some(di) = newer {
                         let e = &inst.dir[di];
-                        let up = inst.job_for(&e.capsule).filter(|j| j.stage != installer::DONE);
+                        let up = inst.job_for(&e.capsule).filter(|j| j.stage != stower::DONE);
                         if let Some(j) = up {
                             progress(self, b, &mut y, j);
                         }
-                        if !up.is_some_and(|j| j.stage < installer::DONE) {
+                        if !up.is_some_and(|j| j.stage < stower::DONE) {
                             let mut l = Line::new();
                             let _ = write!(l, "{}, ", tr(Msg::Update));
                             let _ = tatau::size_bits(&mut l, f, e.size << 3, 1);
-                            button(self, b, &mut y, l.as_str(), false, Some(Choice::Install(di as u8)));
+                            button(self, b, &mut y, l.as_str(), false, Some(Choice::StowListed(di as u8)));
                         }
                     }
                     // Unstow in two taps (as "remove this device"): out of the person's list, its answers kept; a puck's says what a person sees, off the deck.
@@ -4084,7 +4084,7 @@ impl Map {
                         }
                         row(self, b, &mut y, note, grey(), l.as_str(), what);
                         // A restore or an unstow of it under way, or one that failed.
-                        if let Some(j) = inst.job_for(&k.capsule).filter(|j| j.stage != installer::DONE) {
+                        if let Some(j) = inst.job_for(&k.capsule).filter(|j| j.stage != stower::DONE) {
                             progress(self, b, &mut y, j);
                         }
                         y += uu(1, 2);
@@ -4112,12 +4112,12 @@ impl Map {
                         y -= uu(3, 4);
                         row(self, b, &mut y, note, dim(), &e.about, None);
                         let mine = ks.iter().find(|k| k.developer == e.developer && k.option == e.option);
-                        let job = inst.job_for(&e.capsule).filter(|j| j.stage != installer::DONE);
+                        let job = inst.job_for(&e.capsule).filter(|j| j.stage != stower::DONE);
                         if let Some(j) = job {
                             progress(self, b, &mut y, j);
                         }
                         // Under way: no button until it is done or has failed.
-                        let busy = job.is_some_and(|j| j.stage < installer::DONE);
+                        let busy = job.is_some_and(|j| j.stage < stower::DONE);
                         if busy {
                         } else if mine.is_some_and(|k| k.capsule == e.capsule) {
                             row(self, b, &mut y, note, grey(), tr(Msg::Stowed), None);
@@ -4131,7 +4131,7 @@ impl Map {
                             let mut l = Line::new();
                             let _ = write!(l, "{}, ", tr(if mine.is_some() { Msg::Update } else { Msg::Stow }));
                             let _ = tatau::size_bits(&mut l, f, e.size << 3, 1);
-                            button(self, b, &mut y, l.as_str(), false, Some(Choice::Install(di as u8)));
+                            button(self, b, &mut y, l.as_str(), false, Some(Choice::StowListed(di as u8)));
                         }
                         y += uu(1, 2);
                     }
@@ -4617,7 +4617,7 @@ impl Map {
         };
         match (fingers, self.view) {
             (1, View::Map) => {
-                // A kist installed or removed since: its circle comes or goes before the tap is placed.
+                // A kist stowed or removed since: its circle comes or goes before the tap is placed.
                 self.refresh_circles();
                 if let Some(i) = self.hit(sx, sy) {
                     // A kist circle: launched by init with the person's answers; a want never answered first opens the circle on the question (KISTS.md). The list read again first: another of the person's devices may have answered meanwhile.
@@ -4895,7 +4895,7 @@ impl Map {
                             }
                         }
                     }
-                    // Unstow in two taps (as "remove this device"; a puck's "remove from the deck" the same): the first arms it, the second asks the installer (op 4), which takes it out of the person's list, keeps its answers and drops its capsule; its circle goes when the job is done, and the card with it.
+                    // Unstow in two taps (as "remove this device"; a puck's "remove from the deck" the same): the first arms it, the second asks the stower (op 4), which takes it out of the person's list, keeps its answers and drops its capsule; its circle goes when the job is done, and the card with it.
                     Some(Choice::Unstow(k)) => {
                         if self.unstow_armed == Some(k) {
                             self.unstow_armed = None;
@@ -4904,8 +4904,8 @@ impl Map {
                                 m[0] = 4;
                                 m[1..33].copy_from_slice(&kist.developer);
                                 m[33..].copy_from_slice(&kist.option);
-                                if installer::ask(self.grants, &m) != Some(0) {
-                                    console(self.grants, b"map: the installer did not take the unstow\n");
+                                if stower::ask(self.grants, &m) != Some(0) {
+                                    console(self.grants, b"map: the stower did not take the unstow\n");
                                 }
                             }
                         } else {
@@ -4934,26 +4934,26 @@ impl Map {
                             }
                         }
                     }
-                    // Install or update the directory's kist: the installer fetches, checks and seals it, and the page shows each stage as its doorbell rings.
-                    Some(Choice::Install(d)) => {
-                        if let Some(row) = self.installer.dir.get(d as usize) {
+                    // Stow or update the directory's kist: the stower fetches, checks and seals it, and the page shows each stage as its doorbell rings.
+                    Some(Choice::StowListed(d)) => {
+                        if let Some(row) = self.stower.dir.get(d as usize) {
                             let mut m = [0u8; 33];
                             m[0] = 3;
                             m[1..].copy_from_slice(&row.capsule);
-                            if installer::ask(self.grants, &m) != Some(0) {
-                                console(self.grants, b"map: the installer did not take the install\n");
+                            if stower::ask(self.grants, &m) != Some(0) {
+                                console(self.grants, b"map: the stower did not take the stow\n");
                             }
                         }
                     }
-                    // The person's answer to a kist offered over USB: the installer stows it in their list or drops it, and the host that offered it hears which (docs/KISTS.md "Stowing").
+                    // The person's answer to a kist offered over USB: the stower stows it in their list or drops it, and the host that offered it hears which (docs/KISTS.md "Stowing").
                     Some(Choice::Stow(stow)) => {
-                        if let Some(o) = self.installer.offer.as_ref() {
+                        if let Some(o) = self.stower.offer.as_ref() {
                             let mut m = [0u8; 34];
                             m[0] = 5;
                             m[1..33].copy_from_slice(&o.capsule);
                             m[33] = stow as u8;
-                            if installer::ask(self.grants, &m) != Some(0) {
-                                console(self.grants, b"map: the installer did not take the answer to the offer\n");
+                            if stower::ask(self.grants, &m) != Some(0) {
+                                console(self.grants, b"map: the stower did not take the answer to the offer\n");
                             }
                         }
                     }
@@ -5041,7 +5041,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     let (w, h) = (u16::from_le_bytes([r[0], r[1]]) as i64, u16::from_le_bytes([r[2], r[3]]) as i64);
 
-    // The circles: settings, then a kist circle for each kist the person installed (their list, `kists.list`; none readable, none shown), sized by share and placed once.
+    // The circles: settings, then a kist circle for each kist the person stowed (their list, `kists.list`; none readable, none shown), sized by share and placed once.
     let kists = ferros_kist::store::read(cap(grants, S_KIST_LIST)).unwrap_or_default();
     // WHY: the scene and the arrays hold MAX circles; kists past it get no circle until there is room (the settings' Deck page still lists them).
     let n = (1 + kists.kists.len()).min(MAX);
@@ -5110,7 +5110,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         ask: 0,
         zone_pick: None,
         zone_note: None,
-        installer: installer::Installer::default(),
+        stower: stower::Stower::default(),
         gps_claimed: false,
         gps_fix: None,
         tags: [ferros_sys::KeptTag::default(); 1 << 4],
@@ -5316,8 +5316,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut fleet_seen = 0u32;
     // Whether the Fleet page showed at the last pass (`FLEET_PAGE`).
     let mut fleet_shown = false;
-    // The installer's copy last taken, the finished jobs in it (a kist stowed or unstowed: the circles follow), and whether the Deck page showed at the last pass (opening it reads the directory again).
-    let (mut installer_seen, mut installer_done, mut kists_shown) = (0u32, 0u64, false);
+    // The stower's copy last taken, the finished jobs in it (a kist stowed or unstowed: the circles follow), and whether the Deck page showed at the last pass (opening it reads the directory again).
+    let (mut stower_seen, mut stower_done, mut kists_shown) = (0u32, 0u64, false);
     // GPS's claims as the permissions and GPS pages were last drawn with them (CLAIMS_WORD, the kernel's doorbell): a change draws them again.
     let mut claims_seen = 0u64;
     // `gps_watch`'s copy last taken (its sequence count).
@@ -5338,9 +5338,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The add flow following the Fleet page (`fleet_page_thread`).
     static mut PAGE_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(fleet_page_thread, unsafe { &mut *(&raw mut PAGE_STACK) }, grants);
-    // The installer's doorbell (payloads/kists), for the Deck page: on a thread of its own, never on a timer.
-    static mut INSTALLER_STACK: [u8; 1 << 14] = [0; 1 << 14];
-    ferros_sys::thread_spawn(installer::watch, unsafe { &mut *(&raw mut INSTALLER_STACK) }, grants);
+    // The stower's doorbell (payloads/kists), for the Deck page: on a thread of its own, never on a timer.
+    static mut STOWER_STACK: [u8; 1 << 14] = [0; 1 << 14];
+    ferros_sys::thread_spawn(stower::watch, unsafe { &mut *(&raw mut STOWER_STACK) }, grants);
     // The GPS driver's doorbell, for the GPS page (`gps_watch`): on a thread of its own, asleep while the page is not open.
     static mut GPS_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(gps_watch, unsafe { &mut *(&raw mut GPS_STACK) }, grants);
@@ -5424,25 +5424,25 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             FLEET_PAGE.store(((v >> 1) + 1) << 1 | shown as u64, core::sync::atomic::Ordering::Release);
             ferros_sys::wake(&FLEET_PAGE, 1);
         }
-        // The installer's copy, when its doorbell has rung (installer.rs): taken in, the Deck page drawn again while it shows, and the person's list and circles read again when a job has finished (a kist stowed, updated, unstowed or restored).
-        if let Some((seq, s)) = installer::take(installer_seen) {
-            installer_seen = seq;
+        // The stower's copy, when its doorbell has rung (stower.rs): taken in, the Deck page drawn again while it shows, and the person's list and circles read again when a job has finished (a kist stowed, updated, unstowed or restored).
+        if let Some((seq, s)) = stower::take(stower_seen) {
+            stower_seen = seq;
             let done = s.finished();
-            map.installer = s;
-            if done != installer_done {
-                installer_done = done;
+            map.stower = s;
+            if done != stower_done {
+                stower_done = done;
                 map.refresh_circles();
             }
             if matches!(map.view, View::Open(_)) && PAGES[map.page] == "deck" && !map.settling {
                 map.draw();
             }
         }
-        // The Deck page opened: the installer reads the pandok (the directory) again (owner: on opening the page, never on a timer).
+        // The Deck page opened: the stower reads the pandok (the directory) again (owner: on opening the page, never on a timer).
         let shown = matches!(map.view, View::Open(_)) && PAGES[map.page] == "deck";
         if shown != kists_shown {
             kists_shown = shown;
             if shown {
-                let _ = installer::ask(grants, &[1]);
+                let _ = stower::ask(grants, &[1]);
             }
         }
         // The GPS page holds a GPS claim while it shows (owner, 2026-11-10: "open the GPS screen (which should turn it on whilist GPS screen is open)"), GPS switched on and the screen on: the kernel starts the driver for the first claim and stops it after the last (SYS_CLAIM). Claimed as the page comes, released as it goes; the switch turned off drops the claim in the kernel, and turned on again the page claims anew.
@@ -5587,19 +5587,19 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         // A kist offered over USB, checked and waiting on this person: a new one opens the Deck page on it, Stow and Cancel ready (above the list, or above a card left open), as a departure opens the Fleet page. Not over an app in front, nor under a finger or while the map settles: it opens once the fingers lift, or once the person is back on the map.
         if !map.app_front && !down && !map.settling {
-            let offer = map.installer.offer.as_ref().map(|o| o.capsule);
+            let offer = map.stower.offer.as_ref().map(|o| o.capsule);
             if offer.is_some() && offer != offer_seen {
                 map.show_page("deck");
                 map.draw();
                 console(grants, b"map: the Kists page opened on the kist offered over USB, Stow and Cancel ready\n");
             }
             offer_seen = offer;
-        } else if map.app_front && !offer_held_said && map.installer.offer.as_ref().is_some_and(|o| Some(o.capsule) != offer_seen) {
+        } else if map.app_front && !offer_held_said && map.stower.offer.as_ref().is_some_and(|o| Some(o.capsule) != offer_seen) {
             // Said once an offer: the page waits for the app in front to go behind (Home), as KISTS.md "Stowing" has it.
             offer_held_said = true;
             console(grants, b"map: a kist offered over USB waits for the app in front to go behind; the Kists page opens then\n");
         }
-        if map.installer.offer.is_none() {
+        if map.stower.offer.is_none() {
             offer_held_said = false;
         }
 
@@ -5630,7 +5630,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         // FERROS_MAP_START=open (development, measuring the flight with no one at the panel): three seconds after start and every two seconds after, while nothing moves, a tap on the settings circle opens it and the next tap, low at the left outside the open circle, closes it; eight flights.
         // FERROS_MAP_START=outhold: one flight in, then the flight out held at its eighth frame (the camera and the fade where they are, nothing stepped), for a capture of the screen mid-flight.
-        // FERROS_MAP_START=kist (development, the first launch with no one at the panel): three seconds after start a tap on the last kist circle (the newest installed); two seconds on, if the question is up, a tap on its "start".
+        // FERROS_MAP_START=kist (development, the first launch with no one at the panel): three seconds after start a tap on the last kist circle (the newest stowed); two seconds on, if the question is up, a tap on its "start".
         if option_env!("FERROS_MAP_START") == Some("kist") && map.n > 1 && synth_open < 2 && !map.settling && !down && now().wrapping_sub(map_start) > 3 * freq() && now().wrapping_sub(synth_open_at) > 2 * freq() {
             synth_open += 1;
             synth_open_at = now();

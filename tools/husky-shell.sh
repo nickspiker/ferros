@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The shell's development loop on husky without a reboot: build the named payloads, sign them into capsules, put them in the vault, and restart those processes from it (kernel `diag restart`, service.rs). Restarting the display server restarts the map too: the map hands a fresh server its scene when it starts.
-# Usage: tools/husky-shell.sh display|map|touch|ahau|ip|kists|ramps|init ...   (ramps and init are capsules started by others: they are only stored; ahau restarted puts the attest screen up again; kists, the installer, the kernel also starts at each attest)
+# Usage: tools/husky-shell.sh display|map|touch|ahau|ip|kists|ramps|init ...   (ramps and init are capsules started by others: they are only stored; ahau restarted puts the attest screen up again; kists, the stower, the kernel also starts at each attest)
 set -euo pipefail
 REPO=/mnt/Harbor/Code/ferros
 cd "$REPO"

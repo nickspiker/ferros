@@ -3,7 +3,7 @@ name = "ferros_kist"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Kists (docs/KISTS.md): the rights a kist may want, its signed declaration in the capsule, and the person's list of installed kists with their answers, as VSF. Needs a heap; the kernel reads only the rights' names."
+description = "Kists (docs/KISTS.md): the rights a kist may want, its signed declaration in the capsule, and the person's list of stowed kists with their answers, as VSF. Needs a heap; the kernel reads only the rights' names."
 
 [lib]
 path = "src/lib.rs"
@@ -27,5 +27,5 @@ fgtw = { path = "../../fgtw", default-features = false, features = ["sign"] }
 process = ["dep:ferros_sys"]
 # A capsule's developer bundle (`kb`, every scheme's public key) read and written, and a capsule built the one way the bridge and kistcat both build it (`capsule`): fgtw's KeyBundle and egg slots.
 bundle = ["dep:fgtw"]
-# The kist directory (kists.fgtw.org/kists.vsf): its schema, built by tools/kistcat and read by the device's installer.
+# The kist directory (kists.fgtw.org/kists.vsf): its schema, built by tools/kistcat and read by the device's stower.
 directory = ["bundle"]

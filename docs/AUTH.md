@@ -25,7 +25,7 @@ The vault holds two classes of entry.
 | The attest screen's own | `ahau.*` |
 | Networks | `wifi.cred` (networks travel with the person; the per-network MAC stays the device's, from the ira) |
 | Where the device has been | `gps.last`, the GPS driver's last fix (2026-11-04). No GPS runs while nobody has attested. The replays the chip is aided from (`gps.replay`, `gps.replay.sky`) stay device class: Broadcom's firmware, gpsd's configuration and the orbits. Their position messages are zeroed (the gps driver's scrub, input G#02), so they keep no place. |
-| Next | the person's installed apps (their capsules), device pairings (car, headphones), every app's data |
+| Next | the person's stowed apps (their capsules), device pairings (car, headphones), every app's data |
 
 The rule is in `kvault.rs` `IDENTITY`: a name under one of those prefixes is identity class, and everything else is device class.
 
@@ -159,8 +159,8 @@ Not built; for the owner to approve before it is.
 
 **The rule stays one rule.** A name is identity class when it starts with a prefix in `kvault.rs` `IDENTITY`. Moving a thing to the person is adding its prefix there and moving its names under it, never a second mechanism.
 
-**Installed apps.**
-- What the person installs lives under `app.`: the capsule at `app.<name>`, the app's own data under `app.<name>.` (its store scope, one per app, the way `map.` and `fgtw.` are scoped today).
+**Stowed apps.**
+- What the person stows lives under `app.`: the capsule at `app.<name>`, the app's own data under `app.<name>.` (its store scope, one per app, the way `map.` and `fgtw.` are scoped today).
 - Drivers and the attest front end stay where they are (`display`, `touch`, `usb`, `pcie1`, `ahau`, …), device class: they run before anyone is present.
 - The map starts an app by its vault name, as it starts `ramps` today, so the change there is the name (`app.ramps`) and the moment: the map already runs only once an identity is unlocked (init's `wait_unlocked`), so an app's capsule is readable exactly when it can be started.
 - The `sealed` list (the seals of installed masked capsules) stays device class: a seal is keyed with the OS-only key, so it says nothing about the person, and the kernel needs it before anyone attests to spawn the device's own masked processes.
@@ -214,5 +214,5 @@ To check before building:
 
 - **The hypervisor net is not built yet.** Until it is, Android with root can read the ferros partition, and so the device-only secret.
 - **A hang the watchdog resets** cannot run `before_reset`, so the key can survive in DRAM into the next boot. Planned: the gate's hypervisor scrubs the kernel's heap before it boots Android.
-- **Installed apps and device pairings** are not in the identity class yet (their capsules are device class today); the plan is above.
+- **Stowed apps and device pairings** are not in the identity class yet (their capsules are device class today); the plan is above.
 - **No way back to the attest screen** without a power cycle once a person is unlocked.

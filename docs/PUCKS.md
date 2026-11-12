@@ -5,7 +5,7 @@ Status: proposed 2026-11-11 for the owner's review; nothing on the display, the 
 ## What a puck is
 
 - **A puck is a kist that lives on the map as a live circle and is never opened.** Its circle is its whole UI: no window, no page, no surface of its own on the glass. The clock is the first; tides the second.
-- **It is a kist like any other**: the person installs it, it is theirs and travels with them, its rights are asked once and default off (KISTS.md "Permissions"). Nothing about a puck is baked into the OS.
+- **It is a kist like any other**: the person stows it, it is theirs and travels with them, its rights are asked once and default off (KISTS.md "Permissions"). Nothing about a puck is baked into the OS.
 - **It is live**: what its circle shows follows the world (the time, the tide) with no tap. A kist circle that shows only an icon until tapped is not a puck.
 - **Android's word is widget**, and the code says widget today (display `WIDGET_CLOCK`, the map's `widget()`). Widget also names fluor's controls (button, slider: COMPOSITOR.md "Controls"), so puck keeps the two apart. If the owner takes the word: GLOSSARY.md gets it, and `widget` in the map and the display is renamed where it means a puck.
 
@@ -14,7 +14,7 @@ Status: proposed 2026-11-11 for the owner's review; nothing on the display, the 
 The owner, 2026-11-12: "make sure the settings/items page lists kists and pucks ... and I think pucks distinct from kists being that you can't open a puck and it's basically a widget." So the word is taken (question 0 below), and a puck is its own kind on the deck beside kists, not a kind of app.
 
 - **Settings → Deck** lists everything on the deck as a circle by kind: the kists, then the pucks, each row its name with "puck" or "kist" under it (KISTS.md "The deck and the card"). Contacts are to come as another kind.
-- **A puck's card** (its row tapped): its name, "puck", what it shows (the clock: the time), its permissions (each a switch, as a kist's: the clock asks for none), and **remove from the deck** in two taps. Underneath that is an unstow: the installer takes it out of the person's list, its answers kept, and its circle goes. No state and no stop: a puck is never opened and, today, never a process.
+- **A puck's card** (its row tapped): its name, "puck", what it shows (the clock: the time), its permissions (each a switch, as a kist's: the clock asks for none), and **remove from the deck** in two taps. Underneath that is an unstow: the stower takes it out of the person's list, its answers kept, and its circle goes. No state and no stop: a puck is never opened and, today, never a process.
 - **How the map tells a puck** is still the clock's name (`widget`, "Clock"); the signed `puck` flag (question 5) replaces it when decided. The code's `widget` is not renamed yet: it and the display's `WIDGET_CLOCK` move to puck with that flag.
 
 ## How the clock fits today
@@ -81,7 +81,7 @@ The map already treats a tap on the clock as 1 (it never launches it); 1 keeps a
 
 ## Lifecycle
 
-- Pucks are live, so init launches every installed puck once a person has attested (not at a tap), each with its granted rights, as it launches a kist today. One shot dead at lock, like every process.
+- Pucks are live, so init launches every stowed puck once a person has attested (not at a tap), each with its granted rights, as it launches a kist today. One shot dead at lock, like every process.
 - A puck that ends abnormally glows stopped (KISTS.md "Kist states"), and its circle keeps its last list, said stale (dimmed) rather than wrong.
 - Memory: a puck's arc is small (tidetest's masked image is 246 KB, its heap 1 MiB), but N pucks are N processes.
 

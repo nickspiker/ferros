@@ -14,7 +14,7 @@
 //! | `ZONE` | the fleet's scope `ke` | automatic `u` (1 or 0), then the IANA id by hand `a` when there is one | none: the identity service writes it to the kernel (SYS_ZONE op 4) on each device, which follows it unless its settings say otherwise |
 //! | `LANG` | the fleet's scope `ke` | the language `wl` (its ISO 639-3 code) | none: the identity service writes it to the kernel (SYS_LANG op 2) on each device, which follows it unless its settings say otherwise |
 //! | `DND` | the fleet's scope `ke` | on `u` (1 or 0) | none: the identity service writes it to the kernel (preference 40) on each device |
-//! | `PIN` | developer `ke` | the bundle's commitment `hp`, then the developer's name `a` when their first kist gave one; the entry's stamp is when it was pinned | a `pin` section of `kists.list` (trust on first install) |
+//! | `PIN` | developer `ke` | the bundle's commitment `hp`, then the developer's name `a` when their first kist gave one; the entry's stamp is when it was pinned | a `pin` section of `kists.list` (trust on first stow) |
 //!
 //! The scope of a place and the view is the fleet's (`FLEET`, 32 zero bytes) on every device whose deck sync is on (the default), and the device's own key on one where the person switched it off, so that device keeps an arrangement of its own, which follows it through a reset all the same.
 //!
@@ -47,7 +47,7 @@ pub mod kind {
     pub const ZONE: u8 = 7;
     /// The person's language (SETTINGS.md, as the zone: "per identity, you can uncheck and set per device"): chosen on the language page of a device that follows it, written to each device that follows it, never read back from one.
     pub const LANG: u8 = 8;
-    /// A developer the person trusted on first install (owner, 2026-11-10): the commitment of the key bundle that developer's first kist carried, so every device of theirs refuses a kist from that key with another bundle. An uninstall keeps it.
+    /// A developer the person trusted on first stow (owner, 2026-11-10): the commitment of the key bundle that developer's first kist carried, so every device of theirs refuses a kist from that key with another bundle. An unstow keeps it.
     pub const PIN: u8 = 9;
     /// Do not disturb (owner, 2026-11-11: "a fleet/identity preference so it follows the person"): the person's one switch, set from the quick row of any of their devices, written to each device (the kernel's preference 40), never read back from one.
     pub const DND: u8 = 10;
@@ -362,7 +362,7 @@ fn ints_of<const N: usize>(v: &[VsfType]) -> Option<[i64; N]> {
 
 // ── The device's copy as facts, and back ──
 
-/// A kist's fact value: its capsule, name, and wants in slot order (each right and the developer's reason), then where its capsule was fetched from when the installer fetched it (`nu`, last: a reader from before 2026-11-10 takes no URL for a name or a reason and skips it), then its version, a `z` per part as written (a reader from before takes no `z` for a right, a name or a reason and skips them).
+/// A kist's fact value: its capsule, name, and wants in slot order (each right and the developer's reason), then where its capsule was fetched from when the stower fetched it (`nu`, last: a reader from before 2026-11-10 takes no URL for a name or a reason and skips it), then its version, a `z` per part as written (a reader from before takes no `z` for a right, a name or a reason and skips them).
 fn kist_value(k: &Kist) -> Vec<VsfType> {
     let mut v = vec![VsfType::hb(k.capsule.to_vec()), VsfType::a(vsf::Ascii::checked("name", k.name.clone()))];
     for w in &k.wants {
@@ -433,8 +433,8 @@ fn label_of<'a>(list: &'a Kists, c: &Circle) -> Option<&'a str> {
 fn snapshot(list: &Kists, store: &mut impl Store, scope: &[u8; 32]) -> Result<Vec<Fact>, ()> {
     let mut facts = Vec::new();
     for k in &list.kists {
-        // Stamped with when it was installed: an install after an uninstall (here or on another device) is newer than the uninstall's tombstone and wins it; with no stamp the tombstone took it straight back out.
-        facts.push(Fact { kind: kind::KIST, id: kist_id(&k.developer, &k.option), value: kist_value(k), stamp: (k.installed != 0).then_some(k.installed) });
+        // Stamped with when it was stowed: a stow after an unstow (here or on another device) is newer than the unstow's tombstone and wins it; with no stamp the tombstone took it straight back out.
+        facts.push(Fact { kind: kind::KIST, id: kist_id(&k.developer, &k.option), value: kist_value(k), stamp: (k.stowed != 0).then_some(k.stowed) });
         for w in &k.wants {
             if let Some((granted, when)) = w.answer {
                 facts.push(Fact { kind: kind::ANSWER, id: answer_id(&k.developer, &k.option, w.right), value: vec![VsfType::u(granted as usize, false)], stamp: Some(when) });
@@ -502,9 +502,9 @@ fn apply(w: Write, list: &mut Kists, list_changed: &mut bool, store: &mut impl S
                     }
                 }
             }
-            // The answers it had here, or kept from an uninstall here (Kists::install); its source the space's. Its install time stays this device's own (none for a kist that only arrived): the stamp matters only to an install made here, which sets it.
+            // The answers it had here, or kept from an unstow here (Kists::stow); its source the space's. Its stow time stays this device's own (none for a kist that only arrived): the stamp matters only to a stow made here, which sets it.
             let decl = ferros_kist::Decl { name, wants };
-            let i = list.install(capsule, d, o, &decl);
+            let i = list.stow(capsule, d, o, &decl);
             list.kists[i].source = source_of(&value);
             list.kists[i].version = version_of_fact(&value);
             *list_changed = true;
@@ -512,7 +512,7 @@ fn apply(w: Write, list: &mut Kists, list_changed: &mut bool, store: &mut impl S
         }
         Write::Remove { kind: kind::KIST, id } => {
             let (Some(d), Some(o)) = (id.first().and_then(k32), id.get(1).and_then(k32)) else { return true };
-            // Uninstalled on another device: gone from this list too, its answers kept here for an install again (Kists::remove).
+            // Unstowed on another device: gone from this list too, its answers kept here for a stow again (Kists::remove).
             list.remove(&d, &o);
             *list_changed = true;
             true
@@ -692,14 +692,14 @@ mod tests {
         ferros_kist::Decl { name: String::from(name), wants: wants.iter().map(|(r, s)| (*r, String::from(*s))).collect() }
     }
 
-    /// The Pro as the owner had it: Mahere and Photon installed and answered, a default on, every circle moved and turned by hand, the view turned.
+    /// The Pro as the owner had it: Mahere and Photon stowed and answered, a default on, every circle moved and turned by hand, the view turned.
     fn arranged_pro() -> Vault {
         let mut l = Kists::default();
         l.defaults = 1 << 7;
-        let m = l.install([0xA1; 32], MAHERE.0, MAHERE.1, &decl("Mahere", &[(0, "to draw the map"), (6, "to show where you are")]));
+        let m = l.stow([0xA1; 32], MAHERE.0, MAHERE.1, &decl("Mahere", &[(0, "to draw the map"), (6, "to show where you are")]));
         l.kists[m].wants[0].answer = Some((true, 1000));
         l.kists[m].wants[1].answer = Some((false, 1001));
-        let p = l.install([0xA2; 32], PHOTON.0, PHOTON.1, &decl("Photon", &[(0, "to draw"), (7, "to reach your friends")]));
+        let p = l.stow([0xA2; 32], PHOTON.0, PHOTON.1, &decl("Photon", &[(0, "to draw"), (7, "to reach your friends")]));
         l.kists[p].wants[0].answer = Some((true, 1002));
         l.kists[p].wants[1].answer = Some((true, 1003));
         let mut v = Vault::default();
@@ -786,16 +786,16 @@ mod tests {
         assert_eq!(reset.map, b.map);
     }
 
-    /// Uninstalled on one device: gone from the other too, the answers kept on both and in the space; installed again later (the installer stamps when), it wins over the uninstall's tombstone and asks nothing anywhere. Its source and version travel with it.
+    /// Unstowed on one device: gone from the other too, the answers kept on both and in the space; stowed again later (the stower stamps when), it wins over the unstow's tombstone and asks nothing anywhere. Its source and version travel with it.
     #[test]
-    fn an_uninstall_travels_and_an_install_again_asks_nothing() {
+    fn an_unstow_travels_and_a_stow_again_asks_nothing() {
         let mut a = arranged_pro();
         let (mut sa, mut ba) = (Space::new(), Baseline::default());
         sync(&mut sa, &mut ba, &mut a, &PRO, 2000).unwrap();
         let mut b = Vault::default();
         let (mut sb, mut bb) = (sa.clone(), Baseline::default());
         sync(&mut sb, &mut bb, &mut b, &OTHER, 2100).unwrap();
-        // The Pro uninstalls Photon.
+        // The Pro unstows Photon.
         let mut la = read_list(&mut a).unwrap();
         assert!(la.remove(&PHOTON.0, &PHOTON.1).is_some());
         a.set(Scope::Kists, ferros_kist::LIST, &la.build(2200).unwrap());
@@ -806,12 +806,12 @@ mod tests {
         assert!(lb.by_identity(&PHOTON.0, &PHOTON.1).is_none(), "gone on the other device");
         assert_eq!(lb.kept.len(), 1, "its answers kept there");
         assert!(sa.live(kind::ANSWER).any(|e| e.id.first().and_then(k32) == Some(PHOTON.0)), "and in the space");
-        // Installed again on the Pro from the directory, after the uninstall: a newer capsule, its source, its install time.
+        // Stowed again on the Pro from the directory, after the unstow: a newer capsule, its source, its stow time.
         let mut la = read_list(&mut a).unwrap();
-        let p = la.install([0xB2; 32], PHOTON.0, PHOTON.1, &decl("Photon", &[(0, "to draw"), (7, "to reach your friends")]));
+        let p = la.stow([0xB2; 32], PHOTON.0, PHOTON.1, &decl("Photon", &[(0, "to draw"), (7, "to reach your friends")]));
         assert!(!la.kists[p].unanswered(), "its answers back from the kept ones");
         la.kists[p].source = Some(String::from("http://kists.fgtw.org/capsules/b2.vsf"));
-        la.kists[p].installed = 2400;
+        la.kists[p].stowed = 2400;
         la.kists[p].version = Some(ferros_kist::Version(vec![0, 2, 0]));
         a.set(Scope::Kists, ferros_kist::LIST, &la.build(2400).unwrap());
         sync(&mut sa, &mut ba, &mut a, &PRO, 2401).unwrap();
@@ -837,7 +837,7 @@ mod tests {
         assert_eq!(sync(&mut sb, &mut bb, &mut b, &OTHER, 2700).unwrap().wrote, 0);
     }
 
-    /// Trust on first install follows the person: a developer pinned on one device is pinned on the others and on a reset one; an uninstall keeps it; a device that pinned another bundle for that developer before it synced takes the space's, the first to reach it.
+    /// Trust on first stow follows the person: a developer pinned on one device is pinned on the others and on a reset one; an unstow keeps it; a device that pinned another bundle for that developer before it synced takes the space's, the first to reach it.
     #[test]
     fn a_pin_travels_and_the_first_one_stands() {
         let mut a = arranged_pro();
@@ -856,7 +856,7 @@ mod tests {
         let lb = read_list(&mut b).unwrap();
         assert_eq!(lb.pin_of(&MAHERE.0).map(|p| p.bundle), Some([0xC1; 32]), "the space's pin stands");
         assert_eq!(lb.pin_of(&MAHERE.0).and_then(|p| p.name.clone()).as_deref(), Some("Mahere's developer"));
-        // Uninstalled on the Pro: the pin stays there, in the space and on the other device.
+        // Unstowed on the Pro: the pin stays there, in the space and on the other device.
         let mut la = read_list(&mut a).unwrap();
         la.remove(&MAHERE.0, &MAHERE.1);
         a.set(Scope::Kists, ferros_kist::LIST, &la.build(2200).unwrap());

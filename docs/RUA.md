@@ -55,7 +55,7 @@ The address *is* the secret. To write your pit a sender must know your **handle*
 That collapses the "world-writable" worry into ordinary trust management:
 
 - A **contact** who abuses your pit is a *social* problem — block them, or rotate to a new handle.
-- An **app** that abuses it is a *removal* problem — the user uninstalls it.
+- An **app** that abuses it is a *removal* problem — the user unstows it.
 - A **broadly-leaked handle** opens the pit to whoever leaked it — but that is the handle-confidentiality problem (the fix is a new handle, which burns the old; see tohu's `docs/handle.md`), not something a per-message proof-of-work would solve.
 
 So there is deliberately no anti-flood crypto. It would guard a door the handle-secrecy already locks, at the cost of complexity and a tax on every honest sender. Capability-by-secrecy is the model.

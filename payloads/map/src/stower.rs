@@ -1,4 +1,4 @@
-//! The installer as the map's Deck page knows it (payloads/kists, its `kists` endpoint; docs/KISTS.md "Install"): the directory's kists, and each install, update, uninstall and restore under way with its stage and bytes. Read on a thread of its own each time the installer's doorbell rings (op 0), never on a timer; the main loop takes a copy (`take`).
+//! The stower as the map's Deck page knows it (payloads/kists, its `kists` endpoint; docs/KISTS.md "The stower"): the directory's kists, and each stow, update, unstow and restore under way with its stage and bytes. Read on a thread of its own each time the stower's doorbell rings (op 0), never on a timer; the main loop takes a copy (`take`).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -7,10 +7,10 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use ferros_sys::{cap, freq, now, sleep_until, ERR};
 
-use crate::{tr, Line, S_INSTALLER};
-use ferros_lang::Msg;
+use crate::{say, tr, Line, S_STOWER};
+use ferros_lang::{Msg, Say};
 
-/// A job's stages and why one failed, as the installer counts them (payloads/kists `STAGE_*`, `WHY_*`).
+/// A job's stages and why one failed, as the stower counts them (payloads/kists `STAGE_*`, `WHY_*`).
 pub const QUEUED: u8 = 0;
 pub const FETCHING: u8 = 1;
 pub const SIGNATURE: u8 = 2;
@@ -21,12 +21,12 @@ pub const DONE: u8 = 6;
 pub const FAILED: u8 = 7;
 /// An offer to stow, checked and waiting on the person's Stow or Cancel (payloads/kists `STAGE_ASKING`): neither under way nor finished.
 pub const ASKING: u8 = 8;
-pub const KIND_INSTALL: u8 = 0;
-pub const KIND_UNINSTALL: u8 = 1;
+pub const KIND_STOW: u8 = 0;
+pub const KIND_UNSTOW: u8 = 1;
 /// A kist offered over USB to stow (docs/KISTS.md "Stowing").
 pub const KIND_OFFER: u8 = 3;
 
-/// A kist offered over USB, checked and waiting on the person (the installer's op 6): what the Kists page shows above everything, with Stow and Cancel.
+/// A kist offered over USB, checked and waiting on the person (the stower's op 6): what the Kists page shows above everything, with Stow and Cancel.
 #[derive(Clone)]
 pub struct Offer {
     pub capsule: [u8; 32],
@@ -42,7 +42,7 @@ pub struct Offer {
     pub wants: Vec<(u8, String)>,
 }
 
-/// One install, update, uninstall or restore.
+/// One stow, update, unstow or restore.
 #[derive(Clone)]
 pub struct Job {
     pub kind: u8,
@@ -69,13 +69,13 @@ pub struct Row {
     pub about: String,
 }
 
-/// The installer's state: whether it answered at all, the directory (0 not read, 1 reading, 2 read, 3 not reachable; its signature checked or not), its rows and the jobs.
+/// The stower's state: whether it answered at all, the directory (0 not read, 1 reading, 2 read, 3 not reachable; its signature checked or not), its rows and the jobs.
 #[derive(Clone, Default)]
-pub struct Installer {
+pub struct Stower {
     pub here: bool,
     pub dir_state: u8,
     pub dir_checked: bool,
-    /// The installer's directory generation (op 0's last word): the rows are read again whenever it moves.
+    /// The stower's directory generation (op 0's last word): the rows are read again whenever it moves.
     pub dir_gen: u32,
     pub dir: Vec<Row>,
     pub jobs: Vec<Job>,
@@ -83,7 +83,7 @@ pub struct Installer {
     pub offer: Option<Offer>,
 }
 
-impl Installer {
+impl Stower {
     /// The latest job for a capsule.
     pub fn job_for(&self, capsule: &[u8; 32]) -> Option<&Job> {
         self.jobs.iter().rev().find(|j| j.capsule == *capsule)
@@ -95,13 +95,13 @@ impl Installer {
     }
 }
 
-struct Snap(UnsafeCell<Option<Installer>>, AtomicBool);
+struct Snap(UnsafeCell<Option<Stower>>, AtomicBool);
 unsafe impl Sync for Snap {}
 static SNAP: Snap = Snap(UnsafeCell::new(None), AtomicBool::new(false));
 /// Moved on each time the watcher publishes.
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
-fn with<R>(f: impl FnOnce(&mut Option<Installer>) -> R) -> R {
+fn with<R>(f: impl FnOnce(&mut Option<Stower>) -> R) -> R {
     while SNAP.1.swap(true, Ordering::Acquire) {
         core::hint::spin_loop();
     }
@@ -111,7 +111,7 @@ fn with<R>(f: impl FnOnce(&mut Option<Installer>) -> R) -> R {
 }
 
 /// The copy the watcher last published, when it moved from `seen`.
-pub fn take(seen: u32) -> Option<(u32, Installer)> {
+pub fn take(seen: u32) -> Option<(u32, Stower)> {
     let s = SEQ.load(Ordering::Acquire);
     if s == seen {
         return None;
@@ -119,10 +119,10 @@ pub fn take(seen: u32) -> Option<(u32, Installer)> {
     with(|x| x.clone()).map(|i| (s, i))
 }
 
-/// An op to the installer, its one-byte answer (None when it is not serving: it starts once a person has attested).
+/// An op to the stower, its one-byte answer (None when it is not serving: it starts once a person has attested).
 pub fn ask(grants: u64, msg: &[u8]) -> Option<u8> {
     let mut r = [0u8; 4];
-    let n = ferros_sys::call_live(cap(grants, S_INSTALLER), msg, &mut r);
+    let n = ferros_sys::call_live(cap(grants, S_STOWER), msg, &mut r);
     (n != ERR && n >= 1).then_some(r[0])
 }
 
@@ -131,7 +131,7 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
 }
 
 /// Op 0's status read into `into` (the directory's rows kept as they were). False when it does not parse.
-fn read_status(b: &[u8], into: &mut Installer) -> bool {
+fn read_status(b: &[u8], into: &mut Stower) -> bool {
     if b.len() < 7 {
         return false;
     }
@@ -140,7 +140,7 @@ fn read_status(b: &[u8], into: &mut Installer) -> bool {
     into.jobs.clear();
     let mut p = 7;
     for _ in 0..b[6] {
-        // WHY: the bytes are the installer's; a record cut short ends the list.
+        // WHY: the bytes are the stower's; a record cut short ends the list.
         if p + 52 > b.len() {
             return false;
         }
@@ -152,9 +152,9 @@ fn read_status(b: &[u8], into: &mut Installer) -> bool {
         into.jobs.push(Job { kind: r[0], stage: r[1], why: r[2], capsule: r[3..35].try_into().unwrap(), got: u64_at(r, 35), total: u64_at(r, 43), name: String::from(core::str::from_utf8(&r[52..52 + nl]).unwrap_or("")), who: String::new() });
         p += 52 + nl;
     }
-    // Then per job its `who` (an installer from before sends none: the names stay empty).
+    // Then per job its `who` (a stower from before sends none: the names stay empty).
     for j in into.jobs.iter_mut() {
-        // WHY: the bytes are the installer's; a record cut short ends the names.
+        // WHY: the bytes are the stower's; a record cut short ends the names.
         if p >= b.len() || p + 1 + b[p] as usize > b.len() {
             break;
         }
@@ -162,8 +162,8 @@ fn read_status(b: &[u8], into: &mut Installer) -> bool {
         j.who = String::from(core::str::from_utf8(&b[p + 1..p + 1 + n]).unwrap_or(""));
         p += 1 + n;
     }
-    // Last, the directory's generation (an installer from before sends none: it stays as it was).
-    // WHY: the bytes are the installer's; four must be there to read.
+    // Last, the directory's generation (a stower from before sends none: it stays as it was).
+    // WHY: the bytes are the stower's; four must be there to read.
     if p + 4 <= b.len() {
         into.dir_gen = u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
     }
@@ -181,12 +181,12 @@ fn read_directory(svc: u64) -> Option<Vec<Row>> {
         if n == ERR || n < 2 {
             return None;
         }
-        // WHY: the length is the installer's, at most what the buffer took.
+        // WHY: the length is the stower's, at most what the buffer took.
         let b = &out[..(n as usize).min(out.len())];
         let (all, got) = (b[0] as usize, b[1] as usize);
         let mut p = 2;
         for _ in 0..got {
-            // WHY (each length check here): the bytes are the installer's; a record cut short ends the read rather than indexing past the reply.
+            // WHY (each length check here): the bytes are the stower's; a record cut short ends the read rather than indexing past the reply.
             // The fixed head: capsule, developer, option, size, the version's part count.
             if p + 32 * 3 + 8 + 1 > b.len() {
                 return None;
@@ -224,7 +224,7 @@ fn read_directory(svc: u64) -> Option<Vec<Row>> {
     }
 }
 
-/// An offer waiting on the person, as the installer's op 6 gives it; None when that capsule is no longer one (answered meanwhile) or the reply does not parse.
+/// An offer waiting on the person, as the stower's op 6 gives it; None when that capsule is no longer one (answered meanwhile) or the reply does not parse.
 fn read_offer(svc: u64, capsule: &[u8; 32]) -> Option<Offer> {
     let mut m = [0u8; 33];
     m[0] = 6;
@@ -234,7 +234,7 @@ fn read_offer(svc: u64, capsule: &[u8; 32]) -> Option<Offer> {
     if n == ERR {
         return None;
     }
-    // WHY (each length check here): the bytes are the installer's; a reply cut short is no offer rather than an index past it.
+    // WHY (each length check here): the bytes are the stower's; a reply cut short is no offer rather than an index past it.
     let b = &out[..(n as usize).min(out.len())];
     if b.len() < 43 || b[0] != 0 {
         return None;
@@ -267,12 +267,12 @@ fn read_offer(svc: u64, capsule: &[u8; 32]) -> Option<Offer> {
     Some(Offer { capsule: *capsule, size, native, developer, version, name, developer_name, wants })
 }
 
-/// The installer's doorbell, held on a thread of its own: answered with its status whenever anything the page shows changes, the directory's rows read again each time it has been read afresh. While the installer is not serving (the kernel starts it once a person has attested) it is asked again after a wait that doubles to a second, as `fgtw_poller` asks fgtw: no doorbell exists for a server coming up.
+/// The stower's doorbell, held on a thread of its own: answered with its status whenever anything the page shows changes, the directory's rows read again each time it has been read afresh. While the stower is not serving (the kernel starts it once a person has attested) it is asked again after a wait that doubles to a second, as `fgtw_poller` asks fgtw: no doorbell exists for a server coming up.
 pub extern "C" fn watch(grants: u64) -> ! {
-    let svc = cap(grants, S_INSTALLER);
+    let svc = cap(grants, S_STOWER);
     let mut count = u32::MAX;
     let mut absent = freq() >> 6;
-    let mut snap = Installer::default();
+    let mut snap = Stower::default();
     // The directory generation the rows were last read at.
     let mut rows_gen: Option<u32> = None;
     let mut out = [0u8; 4096];
@@ -289,7 +289,7 @@ pub extern "C" fn watch(grants: u64) -> ! {
         }
         absent = freq() >> 6;
         let was = snap.dir_state;
-        // WHY: the length is the installer's, at most what the buffer took.
+        // WHY: the length is the stower's, at most what the buffer took.
         if !read_status(&out[..(n as usize).min(out.len())], &mut snap) {
             continue;
         }
@@ -312,7 +312,7 @@ pub extern "C" fn watch(grants: u64) -> ! {
                 let mut l = Line::new();
                 let _ = match o.as_ref() {
                     Some(o) => write!(l, "map: a kist offered over USB waits on the person: {}\n", o.name),
-                    None => write!(l, "map: the installer has a kist offered over USB waiting, but its offer did not read\n"),
+                    None => write!(l, "map: the stower has a kist offered over USB waiting, but its offer did not read\n"),
                 };
                 ferros_sys::console(grants, l.as_str().as_bytes());
                 o
@@ -329,54 +329,50 @@ fn why(w: u8) -> &'static str {
     ferros_kist::offer::words(w)
 }
 
-/// A job's stage in words: what it is doing now, with its bytes while it fetches (in the person's number base).
+/// A job's stage in words, in the person's language (ferros_lang; English alone until 2026-11-12): what it is doing now, with its bytes while it fetches (in the person's number base).
 pub fn words(j: &Job, f: tatau::Fmt) -> Line {
-    let mut l = Line::new();
-    let size = |l: &mut Line, bytes: u64| {
-        let _ = tatau::size_bits(l, f, bytes << 3, 1);
+    let size = |bytes: u64| {
+        let mut s = Line::new();
+        let _ = tatau::size_bits(&mut s, f, bytes << 3, 1);
+        s
     };
+    let mut l = Line::new();
     match j.stage {
         QUEUED => {
-            l.s("Waiting its turn");
+            l.s(tr(Msg::WaitingItsTurn));
         }
         FETCHING => {
-            let _ = write!(l, "Fetching {}: ", j.name);
-            size(&mut l, j.got);
-            if j.total != 0 {
-                l.s(" of ");
-                size(&mut l, j.total);
-            }
+            let got = size(j.got);
+            l = if j.total != 0 { say(Say::FetchingOf { name: &j.name, got: got.as_str(), total: size(j.total).as_str() }) } else { say(Say::Fetching { name: &j.name, got: got.as_str() }) };
         }
         SIGNATURE => {
-            l.s("Checking its signature");
+            l.s(tr(Msg::CheckingSignature));
         }
         CODE => {
-            l.s("Checking its code");
+            l.s(tr(Msg::CheckingCode));
         }
         SEALING => {
-            l.s("Sealing it to this device");
+            l.s(tr(Msg::SealingToDevice));
         }
         STORING => {
-            l.s("Storing it");
+            l.s(tr(Msg::StoringIt));
         }
         ASKING => {
             l.s(tr(Msg::OfferedOverUsb));
         }
         DONE => {
-            l.s(match j.kind {
-                KIND_INSTALL => "Installed",
-                KIND_UNINSTALL => "Uninstalled",
-                KIND_OFFER => tr(Msg::Stowed),
-                _ => "Restored",
-            });
+            l.s(tr(match j.kind {
+                KIND_STOW | KIND_OFFER => Msg::Stowed,
+                KIND_UNSTOW => Msg::Unstowed,
+                _ => Msg::Restored,
+            }));
         }
         _ => {
-            let not = match j.kind {
-                KIND_INSTALL => "Not installed",
-                KIND_UNINSTALL => "Not uninstalled",
-                KIND_OFFER => tr(Msg::NotStowed),
-                _ => "Not restored",
-            };
+            let not = tr(match j.kind {
+                KIND_STOW | KIND_OFFER => Msg::NotStowed,
+                KIND_UNSTOW => Msg::NotUnstowed,
+                _ => Msg::NotRestored,
+            });
             let _ = if j.why == 17 && !j.who.is_empty() {
                 write!(l, "{not}: this kist is signed by a different key than {}'s other kists", j.who)
             } else {

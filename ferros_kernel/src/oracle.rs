@@ -46,14 +46,14 @@ pub struct Located {
     pub hp: [u8; 32],
 }
 
-/// The gate over a capsule already in an arc, too large to copy (a std process: Photon is 100 MB of image): the signature verifies over the whole file as always; the code is the byte-vector value the caller names by offset and length, checked to be framed exactly so (`v` `b` and the EWE bit length right before it). The signature covers every byte, so a wrong location runs the developer's own bytes, nothing else. A masked kist (installed or launched from the vault) is gated here too, its modes read in place (`masked_modes`) and its checker run over the code where it lies (`process::install_kist`).
+/// The gate over a capsule already in an arc, too large to copy (a std process: Photon is 100 MB of image): the signature verifies over the whole file as always; the code is the byte-vector value the caller names by offset and length, checked to be framed exactly so (`v` `b` and the EWE bit length right before it). The signature covers every byte, so a wrong location runs the developer's own bytes, nothing else. A masked kist (stowed or launched from the vault) is gated here too, its modes read in place (`masked_modes`) and its checker run over the code where it lies (`process::stow_check`).
 pub fn gate_located(capsule: &mut [u8], code_offset: usize, code_len: usize) -> Result<Located, &'static str> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     use vsf::file_format::VsfHeader;
     use vsf::types::VsfType;
     // The signature, verified over the file with its own 64 bytes zeroed — done in place (zero, hash, verify, put them back) where vsf's verifier would copy the file first; a 100 MB copy is more than the kernel heap holds (the first Photon spawn died there, 2026-10-27).
     let (header, header_end) = VsfHeader::decode(capsule).map_err(|_| "gate: bad header")?;
-    // The signature slot as it sits in the header: a plain Ed25519 `ge`, or a list of eggs (`gm`, a kist signed with every scheme of its developer's bundle, 2026-11-10), whose Ed25519 egg is checked here at every spawn; the others were checked at install, before the capsule reached the vault (owner, 2026-11-10). Either way the signature covers the file with the whole slot zeroed.
+    // The signature slot as it sits in the header: a plain Ed25519 `ge`, or a list of eggs (`gm`, a kist signed with every scheme of its developer's bundle, 2026-11-10), whose Ed25519 egg is checked here at every spawn; the others were checked at its stow, before the capsule reached the vault (owner, 2026-11-10). Either way the signature covers the file with the whole slot zeroed.
     let (slot, sig): (alloc::vec::Vec<u8>, [u8; 64]) = match &header.signature {
         Some(VsfType::ge(s)) if s.len() == 64 => (s.clone(), s[..].try_into().unwrap()),
         Some(VsfType::gm(b)) => {
@@ -208,7 +208,7 @@ pub fn seal(g: &Gated) -> Option<[u8; 32]> {
     seal_parts(&g.developer_pubkey, &g.hp, g.masked, &Modes { text_len: g.text_len, fixed: g.fixed, bti: g.bti, exact: g.exact }, &g.code)
 }
 
-/// The seal over its parts, for a capsule gated where it lies (a kist installed from the vault, `process::install_kist`, and checked at its launch): the same bytes hashed in the same order as `seal`, so a seal is the same whichever way the capsule was gated.
+/// The seal over its parts, for a capsule gated where it lies (a kist stowed from the vault, `process::stow_check`, and checked at its launch): the same bytes hashed in the same order as `seal`, so a seal is the same whichever way the capsule was gated.
 pub fn seal_parts(developer: &[u8; 32], hp: &[u8; 32], masked: bool, m: &Modes, code: &[u8]) -> Option<[u8; 32]> {
     let mut h = blake3::Hasher::new_keyed(&seal_key()?);
     h.update(developer);

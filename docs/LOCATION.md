@@ -42,7 +42,7 @@ The owner, 2026-11-11: "Location permissions request, not sure if it looks the s
 
 ## The place service
 
-A system process (proposed `payloads/place`), started by the kernel once a person has attested and killed at lock, with its own grant list as the GPS driver and the kists installer have (init's grants page is full at 108). Its grants:
+A system process (proposed `payloads/place`), started by the kernel once a person has attested and killed at lock, with its own grant list as the GPS driver and the kists stower have (init's grants page is full at 108). Its grants:
 
 - serve `place`;
 - use `cell` (the modem's serving cell, below);
@@ -60,7 +60,7 @@ Which place wins: the newest whose error is no worse than the place it replaces,
 The owner's "maybe we at least lock once an hour". Proposed:
 
 0. **Events first, no clock.** The place moves when something happens: the serving cell changes (the modem's doorbell), or a fix arrives from anyone's claim (the driver's doorbell). With a table that holds the serving cell, most moves are caught this way with no radio of the service's own.
-1. **A need, or nothing.** Each granted passive reader declares the accuracy it needs in its capsule (a tide station within 2^14 m, about 16 km; weather within 2^12 m). The service's need is the tightest among installed kists holding `place`. No passive reader installed: no refresh at all, ever.
+1. **A need, or nothing.** Each granted passive reader declares the accuracy it needs in its capsule (a tide station within 2^14 m, about 16 km; weather within 2^12 m). The service's need is the tightest among stowed kists holding `place`. No passive reader stowed: no refresh at all, ever.
 2. **The cheapest source that meets the need.** If the serving cell's place meets it (its range under the need), that is the refresh: no GPS. Only when the cell's place is coarser than the need, or the serving cell is not in the table, does the service claim GPS.
 3. **The deadline.** The service claims GPS when, and only when: the screen is on, a need exists that the cell does not meet, and the kept place is older than `1 << 12` s (68 minutes; the owner's "an hour" as a power of two). It releases the claim at the first fix whose error meets the need, or after `1 << 7` s (128 s) without one.
 4. **Screen off: no deadline at all.** A refresh overdue while the screen was off happens at the next screen on, which is an event (a bell on the screen state: the kernel has the preference, not yet a bell for it; one is needed). So the hourly fix runs only for a screen that stays on longer than an hour, and otherwise at a screen-on.
@@ -109,7 +109,7 @@ Read from the vendor's own reader (vendor.radio.protocol.sit.stream.so, `Protoco
 - All of it out of line (`cell_frame`): inline, the service loop outgrew the masked build's branch reach (`tbnz` fixups out of range).
 - **Never logged**: the console still shows only the registration's first four bytes.
 - **Served on `cell`** (grant slot 25, served on its own thread when the driver was spawned with `--serve cell`; tools/husky-modem.sh passes it last): `0` GET → 62 bytes (valid, change count, age, state, technology, MCC, MNC and its digits, LAC, cell id, TAC, ECI, PCI, EARFCN, timing advance, NCI, NR TAC, NR PCI, NR-ARFCN; payloads/modem main.rs header). `1` WATCH `count` → the same, held until the cell, the network or the service changes (the service's end answers with no cell). Four watches held at most.
-- **init cannot grant it yet**: its page is full, and the modem is init's. Either the modem gets its own list from the kernel (as GPS, the vault, the installer have) or a slot is freed (open question 4).
+- **init cannot grant it yet**: its page is full, and the modem is init's. Either the modem gets its own list from the kernel (as GPS, the vault, the stower have) or a slot is freed (open question 4).
 
 **Not checked on a device**: the offsets are the vendor's reader's, not yet matched against a live reply (the driver prints none, by design). The check that keeps the rule: one session that prints, on the device's console only, which fields are present and whether the cell is found in a table, never the values; or, on rooted Android, the same moment's `dumpsys telephony.registry` cell identity against the driver's reply, both kept on Harbor.
 
@@ -174,7 +174,7 @@ Read from the vendor's own reader (vendor.radio.protocol.sit.stream.so, `Protoco
 1. **Two rights, asked separately**, as proposed (`place` passive, `gps` active, neither implying the other)? And the words for each.
 2. **The passive place's precision.** Always rounded to what passive readers need (a tide kist never learns the street), or the best the device has? Proposed: rounded to the tightest declared need, never finer than 2^8 m.
 3. **The refresh** as proposed: events first, a GPS claim only when the cell is coarser than a declared need, at most once per `1 << 12` s, only with the screen on, released at the first good fix or after `1 << 7` s? And the accuracy a kist declares: a field of the `place` want in the capsule?
-4. **Where `cell` comes from.** init's page is full: the modem started by the kernel with its own list (as GPS, the vault, the installer), or a slot freed in init's list? Same for the place service's own list.
+4. **Where `cell` comes from.** init's page is full: the modem started by the kernel with its own list (as GPS, the vault, the stower), or a slot freed in init's list? Same for the place service's own list.
 5. **Learning cells from the person's own fixes**: wanted (identity class, opt-in, never synced in the clear), or never?
 6. **The cell table's class.** Device class (readable before attest; its region hints where the device's person lives) or identity class (read only after attest, travels with the person)?
 7. **The LTO in the vault**: Broadcom's binary carried inside a VSF document as bytes, fetched whole from the open URL, device class: acceptable under Rule -1, or does the owner want it decoded into typed VSF first (its layout is only partly known)?

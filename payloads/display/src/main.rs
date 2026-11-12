@@ -3269,6 +3269,69 @@ fn surface_of(base: u64) -> Option<usize> {
     if off % SURFACE_BYTES == PORCH && off / SURFACE_BYTES < SURFACES { Some(off / SURFACE_BYTES) } else { None }
 }
 
+// ---- whose surface (2026-11-12, found by the GPU's isolation work: a client's op 22 named a surface by its base and the display never asked whose it was, so one app could show another's surface as its own window, draw text into it, take its events, raise it or send it behind) ----
+
+/// A reply's status: the surface the op names, or the window it acts on, is not the caller's.
+const NOT_YOURS: u8 = ferros_sys::window::NOT_YOURS;
+/// What the caller of the request being run holds (`caller_of`), for the render thread's ops: set from the ring's slot before its request runs, 0 for the display's own runs (a frame replayed, the quick row's capture), so an op that names a surface refuses there.
+static mut HOLDS: u64 = 0;
+/// Each ring slot's caller's holdings, written with the slot's message (`RING_MSG`).
+static mut RING_HOLDS: [u64; RING] = [0; RING];
+/// How many ops were refused as not the caller's, for the console (a line at the 1st, 2nd, 4th, 8th...: an app that keeps asking does not flood it, and no clock is needed).
+static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight): their caller's holdings are asked of the kernel as they arrive.
+fn names_surface(op: u8) -> bool {
+    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62)
+}
+
+/// What the process behind the call holds (kernel SYS_CALLER: bit k surface k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
+fn caller_of(tok: &[u8; 32]) -> u64 {
+    ferros_sys::caller(tok).unwrap_or(0)
+}
+
+/// Whether holdings `h` hold surface k: the caller's own window, its own pixels.
+#[inline]
+fn holds(h: u64, k: usize) -> bool {
+    h >> k & 1 == 1
+}
+
+/// Whether holdings `h` may move the window on surface k (front, behind, full screen, a key): its holder, or the system's window management (the Settings holder: the map, the attest screen).
+#[inline]
+fn manages(h: u64, k: usize) -> bool {
+    holds(h, k) || h & ferros_sys::CALLER_SETTINGS != 0
+}
+
+/// The surface op `m` names that holdings `h` do not reach, if any: a show's surface or its mailbox's buffer (22), a done (23), text drawn into it (26, 29), a window to the front (59, its holder's or the system's). The ops on the app window in front (43, 60, 61) are checked where the front is known, as they run.
+fn not_theirs(m: &[u8], h: u64) -> Option<usize> {
+    let at = |i: usize| surface_of(u64::from_le_bytes(m[i..i + 8].try_into().unwrap())).filter(|&k| !holds(h, k));
+    match m.first() {
+        Some(22) if m.len() >= 36 => at(9).or_else(|| at(28)),
+        Some(22) if m.len() >= 18 => at(9),
+        Some(23) if m.len() >= 9 => at(1),
+        Some(26 | 29) if m.len() >= 17 => at(1),
+        Some(59) if m.len() >= 3 => Some(m[1] as usize).filter(|&k| k < SURFACES && !manages(h, k)),
+        _ => None,
+    }
+}
+
+/// One refusal as not the caller's: counted, and on the console at every power of two.
+fn not_yours(op: u8, k: usize) -> u8 {
+    let n = NOT_YOURS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n & (n - 1) == 0 {
+        let mut l = Log { grants: unsafe { PANIC_GRANTS }, buf: [0; 256], n: 0 };
+        l.s(b"display: op A#");
+        l.dec(op as u64);
+        l.s(b" names surface A#");
+        l.dec(k as u64);
+        l.s(b", not the caller's: refused (A#");
+        l.dec(n);
+        l.s(b" so far)\n");
+        l.flush();
+    }
+    NOT_YOURS
+}
+
 /// Where each window's pixels are, by the surface the window is on: itself, or the other buffer of a mailbox (op 22's 36-byte form, GPU-KISTS.md 1.4), a surface its owner draws its next frame into while the display reads this one.
 pub static mut PIXELS: [u8; SURFACES] = {
     let mut p = [0u8; SURFACES];
@@ -6646,6 +6709,8 @@ extern "C" fn receive(grants: u64) -> ! {
         }
         let n = n as usize;
         let op = msg[0];
+        // Whose surfaces the caller holds, asked of the kernel while its token is live (before the reply), for the ops that need it.
+        let h = if names_surface(op) { caller_of(&tok) } else { 0 };
         if op == 5 {
             let (w, h) = unsafe { SCREEN_WH };
             let mut out = [0u8; 13];
@@ -6659,7 +6724,8 @@ extern "C" fn receive(grants: u64) -> ! {
         }
         if op == 27 && n >= 13 {
             // Whose is this point (WINDOWS.md): [base u64][x u16][y u16] → 1 if the caller's window owns it on the glass, else 0: one read of the hit map (hit.rs), where a window owns the pixels it is frontmost and not see-through at, inside the circle (in full screen to the glass's edge but the helm's two wedges, the console's rows the app's), and never one the system holds (the corners, the quick row and what is behind it while it shows). Answered here: a client asks it on every finger down.
-            let mine = surface_of(u64::from_le_bytes(msg[1..9].try_into().unwrap()));
+            // Only the caller's own surface: another app's window is never "mine" to it.
+            let mine = surface_of(u64::from_le_bytes(msg[1..9].try_into().unwrap())).filter(|&k| holds(h, k));
             let (x, y) = (u16::from_le_bytes([msg[9], msg[10]]) as i64, u16::from_le_bytes([msg[11], msg[12]]) as i64);
             let yes = mine.is_some_and(|k| hit::at(x, y) == hit::WINDOW + k as u16);
             ferros_sys::reply(&tok, &[yes as u8]);
@@ -6700,9 +6766,12 @@ extern "C" fn receive(grants: u64) -> ! {
             ferros_sys::reply(&tok, &[code]);
             continue;
         }
-        // 62 `events [base u64][seen u32]`: the caller's window's events after `seen`, held until there is one (events.rs; a doorbell, never a poll). Answered here or later by whoever posts the event; a base that names no surface, [3] at once.
+        // 62 `events [base u64][seen u32]`: the caller's window's events after `seen`, held until there is one (events.rs; a doorbell, never a poll). Answered here or later by whoever posts the event; a base that names no surface, [3] at once; another's surface, [4] (`NOT_YOURS`).
         if op == 62 && n >= 13 {
             match surface_of(u64::from_le_bytes(msg[1..9].try_into().unwrap())) {
+                Some(k) if !holds(h, k) => {
+                    ferros_sys::reply(&tok, &[not_yours(op, k)]);
+                }
                 Some(k) => events::watch(k, live_gen(k), u32::from_le_bytes(msg[9..13].try_into().unwrap()), &tok),
                 None => {
                     ferros_sys::reply(&tok, &[3]);
@@ -6735,6 +6804,11 @@ extern "C" fn receive(grants: u64) -> ! {
             ferros_sys::reply(&tok, &(FRAME_STARTS.load(Ordering::Acquire) as u32).to_le_bytes());
             continue;
         }
+        // A surface that is not the caller's, named by the op itself: refused here, with its status, never queued (a show is otherwise answered 0 before it is drawn). One inside a batch or a flight is refused as it runs (`not_theirs` in the render thread).
+        if let Some(k) = not_theirs(&msg[..n], h) {
+            ferros_sys::reply(&tok, &[not_yours(op, k)]);
+            continue;
+        }
         // Room: wait for the render thread to consume a slot.
         let mut head = RING_HEAD.load(Ordering::Acquire);
         let mut tail = RING_TAIL.load(Ordering::Relaxed);
@@ -6748,6 +6822,7 @@ extern "C" fn receive(grants: u64) -> ! {
         unsafe {
             RING_MSG[slot][..n].copy_from_slice(&msg[..n]);
             RING_LEN[slot] = n as u16;
+            RING_HOLDS[slot] = h;
         }
         let done = RING_DONE[slot].load(Ordering::Acquire);
         if append {
@@ -7260,6 +7335,11 @@ fn server(grants: u64) -> ! {
             let mut len = 1usize;
             out[0] = 0;
             unsafe { CUR_OP = m.first().copied().unwrap_or(0) };
+            // A surface that is not the caller's (`HOLDS`, the request's): refused, whether the op came alone or inside a batch or a flight.
+            if let Some(k) = not_theirs(m, unsafe { HOLDS }) {
+                out[0] = not_yours(m[0], k);
+                return len;
+            }
             match m.first() {
                 Some(1) => {
                     client_owned = true;
@@ -8369,8 +8449,9 @@ fn server(grants: u64) -> ! {
                     }
                 }
                 Some(43) => {
-                    // Full screen on or off for the app window in front (`Win::full`, `FULL`; the quick row's circle since 2026-11-11, owner: full screen "moves to a quick-row circle", where the deck swipe toggled it for the whole screen until then): every phase republished, the bars and the circle gone or back, and with the publish every row of the hit map written again (hit.rs `row`: the console's rows the app's in full screen, the helm's still the system's). Replies the new state; status 3 and the state unchanged with no app in front (the deck always has its bars).
+                    // Full screen on or off for the app window in front (`Win::full`, `FULL`; the quick row's circle since 2026-11-11, owner: full screen "moves to a quick-row circle", where the deck swipe toggled it for the whole screen until then): every phase republished, the bars and the circle gone or back, and with the publish every row of the hit map written again (hit.rs `row`: the console's rows the app's in full screen, the helm's still the system's). Replies the new state; status 3 and the state unchanged with no app in front (the deck always has its bars), 4 (`NOT_YOURS`) when the app in front is neither the caller's nor the caller the system's.
                     match front_app() {
+                        Some(k) if !manages(unsafe { HOLDS }, k) => out[0] = not_yours(43, k),
                         Some(k) => unsafe {
                             if let Some(w) = (*(&raw mut WINS))[k].as_mut() {
                                 w.full = !w.full;
@@ -8420,8 +8501,9 @@ fn server(grants: u64) -> ! {
                     }
                 }
                 Some(60) => {
-                    // Behind (WINDOWS.md "The helm"; owner, 2026-11-11: "Home backgrounds the kist ... it doesn't die but it stops rendering everything and stops playing anything except for notifications"): the app window in front leaves the glass and stays in the table, its process alive, told so (`EV_BEHIND`). → [0][surface][generation], or [3] with no app window in front. With none left on the glass the map has it again: its next frame repaints everything (`windows_changed`).
+                    // Behind (WINDOWS.md "The helm"; owner, 2026-11-11: "Home backgrounds the kist ... it doesn't die but it stops rendering everything and stops playing anything except for notifications"): the app window in front leaves the glass and stays in the table, its process alive, told so (`EV_BEHIND`). → [0][surface][generation], or [3] with no app window in front. With none left on the glass the map has it again: its next frame repaints everything (`windows_changed`). [4] (`NOT_YOURS`) when that window is neither the caller's nor the caller the system's.
                     match front_app() {
+                        Some(sk) if !manages(unsafe { HOLDS }, sk) => out[0] = not_yours(60, sk),
                         Some(sk) => {
                             let g = unsafe { (*(&raw mut WINS))[sk].as_mut() }.map_or(0, |w| {
                                 w.back = true;
@@ -8438,8 +8520,9 @@ fn server(grants: u64) -> ! {
                     }
                 }
                 Some(61) if m.len() >= 2 => {
-                    // A key (WINDOWS.md "The helm"; owner, 2026-11-11: "back should signal escape to the app and go up one page"): [usage u8], by its USB HID usage, to the app window in front (`EV_KEY`). → [0][surface][generation], or [3] with no app window in front.
+                    // A key (WINDOWS.md "The helm"; owner, 2026-11-11: "back should signal escape to the app and go up one page"): [usage u8], by its USB HID usage, to the app window in front (`EV_KEY`). → [0][surface][generation], or [3] with no app window in front, [4] (`NOT_YOURS`) when that window is neither the caller's nor the caller the system's.
                     match front_app() {
+                        Some(sk) if !manages(unsafe { HOLDS }, sk) => out[0] = not_yours(61, sk),
                         Some(sk) => {
                             let g = unsafe { WINS[sk] }.map_or(0, |w| w.generation);
                             events::post(sk, g, (ferros_sys::window::EV_KEY as u16) << 8 | m[1] as u16);
@@ -8954,6 +9037,8 @@ fn server(grants: u64) -> ! {
             let slot = (head % RING as u64) as usize;
             let n = unsafe { RING_LEN[slot] } as usize;
             msg[..n].copy_from_slice(unsafe { &RING_MSG[slot][..n] });
+            // Its caller's holdings, for the ops it runs (`not_theirs`); back to none once it has run.
+            unsafe { HOLDS = RING_HOLDS[slot] };
             RING_HEAD.store(head + 1, Ordering::Release);
             ferros_sys::wake(&RING_HEAD, 1);
             let m = &msg[..n];
@@ -9010,7 +9095,10 @@ fn server(grants: u64) -> ! {
             } else {
                 handle(m, &mut out)
             };
-            unsafe { CUR_OP = 0xEE };
+            unsafe {
+                CUR_OP = 0xEE;
+                HOLDS = 0;
+            }
             if m.first() == Some(&14) || (m.first() == Some(&15) && batch_has_camera(m)) {
                 unsafe {
                     let lf = &mut *(&raw mut LAST_FRAME);

@@ -65,7 +65,7 @@ fn usage() {
     eprintln!("  store put <key> <text|@file> | get <key> [out] | ls | rm <key>   Vault by logical key (shim)");
     eprintln!("  display [--hold] [text]  Render text on the panel (shim after a --live handoff; '\\n' = newline; --hold keeps it up until a REBOOT; both volume keys = killswitch power-off)");
     eprintln!("  input <tap|hold|swipe|drag|pinch|rotate|key|idle|shot|script> …  Fingers and keys in shown frames, as a VSF script (development builds; `input` alone for the list)");
-    eprintln!("  kist install <capsule.vsf>  Development fallback: a kist straight into the attested person's list, no check by the device's installer and no Stow on its screen (unattended loops). Stow a kist with `ferros send <capsule.vsf>` (tools/ferros-send), the checked path");
+    eprintln!("  kist stow <capsule.vsf>  Development fallback: a kist straight into the attested person's list, no check by the device's stower and no Stow on its screen (unattended loops). Stow a kist with `ferros send <capsule.vsf>` (tools/ferros-send), the checked path");
     eprintln!("  kist answer <name> <right> on|off|unset | kist list  The attested person's answers (development)");
 }
 
@@ -108,8 +108,13 @@ async fn main() {
         "store" => cmd_store(&args[2..]).await,
         // input tap|hold|swipe|drag|pinch|rotate|key|idle|shot|script …: fingers and keys in shown frames (input.rs, docs/INPUT-INJECT.md).
         "input" => input::cmd(&args[2..]).await,
-        // kist install <capsule.vsf>: the development fallback (KISTS.md "Stowing"): a signed kist capsule kept in the vault and added to the attested person's list with no check by the device's installer and no Stow on its screen, for unattended loops. `ferros send` (tools/ferros-send) is the checked path every script uses.
-        "kist" if args.get(2).map(String::as_str) == Some("install") && args.len() >= 4 => cmd_kist_install(&args[3]).await,
+        // kist stow <capsule.vsf>: the development fallback (KISTS.md "Stowing"): a signed kist capsule kept in the vault and added to the attested person's list with no check by the device's stower and no Stow on its screen, for unattended loops. `ferros send` (tools/ferros-send) is the checked path every script uses.
+        "kist" if args.get(2).map(String::as_str) == Some("stow") && args.len() >= 4 => cmd_kist_stow(&args[3]).await,
+        // kist install: the old name (owner, 2026-11-11: "the proper term for installing a kist is stow"), still taken for the scripts and hands that know it, said so each time.
+        "kist" if args.get(2).map(String::as_str) == Some("install") && args.len() >= 4 => {
+            eprintln!("`kist install` is the old name: it is `kist stow` now");
+            cmd_kist_stow(&args[3]).await
+        }
         // kist answer <name> <right> on|off: one answer of the attested person's (development); kist list: their list.
         "kist" if matches!(args.get(2).map(String::as_str), Some("answer") | Some("list")) => cmd_kist_answer(&args[3..]).await,
         "display" if args.get(2).map(String::as_str) == Some("power") => {
@@ -523,7 +528,7 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
     let (label, mut seed) = dev_key();
     // The code's section, as kistcat writes it (ferros_kist::capsule): `--bti` (the image carries BTI landing pads; the kernel maps its code on guarded pages, SANDBOX.md "BTI") and `--exact` (exact mode, the subtract and unsigned compare; needs `--bti`).
     let c = ferros_kist::capsule::Code { image: code, masked, text: text_len, fixed: fixed_arg(), bti: std::env::args().any(|a| a == "--bti"), exact: std::env::args().any(|a| a == "--exact") };
-    // A kist: its declaration before its code (the kernel and the installer read it from the capsule's first bytes), its option in it (`kist`'s `option`), its developer's whole public bundle in it (`kb`), and an egg per scheme (owner, 2026-11-10: "no single eggs"; trust on first install), built by the one builder kistcat's `kist` uses.
+    // A kist: its declaration before its code (the kernel and the stower read it from the capsule's first bytes), its option in it (`kist`'s `option`), its developer's whole public bundle in it (`kb`), and an egg per scheme (owner, 2026-11-10: "no single eggs"; trust on first stow), built by the one builder kistcat's `kist` uses.
     if let Some(d) = kist_arg() {
         let Some(option) = option_arg() else {
             eprintln!("a kist needs its --option (its identity across versions, minted once)");
@@ -1015,8 +1020,8 @@ async fn store_call(link: &usb::UsbLink, op: ferros_pt::Op, params: &[u8]) -> Re
     }
 }
 
-/// `kist install <capsule.vsf>`, the development fallback (KISTS.md "Stowing"; owner, 2026-11-11: "a proper checked path"): `ferros send` (tools/ferros-send) offers a kist to the device's installer, which checks it and asks the person to Stow it; this door skips both, thru the development store capability, for unattended loops with nobody at the screen (a production build answers neither `store` nor this). As it does: the capsule's signature checked here as the gate will check it, its bytes kept in the vault under their blake3 (`capsules.`, the device's, in parts of 4 MiB, each a command, so a capsule of any size goes in), then the person's list (`kists.list`, theirs: they must be attested) read, the kist added or updated (an update keeps every answer for a right it still wants; a new want is unanswered, asked at the next launch) and written back. The device asks each new want at the kist's first launch, never here.
-async fn cmd_kist_install(path: &str) {
+/// `kist stow <capsule.vsf>`, the development fallback (KISTS.md "Stowing"; owner, 2026-11-11: "a proper checked path"): `ferros send` (tools/ferros-send) offers a kist to the device's stower, which checks it and asks the person to Stow it; this door skips both, thru the development store capability, for unattended loops with nobody at the screen (a production build answers neither `store` nor this). As it does: the capsule's signature checked here as the gate will check it, its bytes kept in the vault under their blake3 (`capsules.`, the device's, in parts of 4 MiB, each a command, so a capsule of any size goes in), then the person's list (`kists.list`, theirs: they must be attested) read, the kist added or updated (an update keeps every answer for a right it still wants; a new want is unanswered, asked at the next launch) and written back. The device asks each new want at the kist's first launch, never here.
+async fn cmd_kist_stow(path: &str) {
     let capsule = std::fs::read(path).unwrap_or_else(|e| {
         eprintln!("Failed to read {path}: {e}");
         std::process::exit(1);
@@ -1033,7 +1038,7 @@ async fn cmd_kist_install(path: &str) {
         }
     };
     let (signer, eggs, file_hash) = vsf::verification::header_eggs(&capsule).unwrap_or_else(|e| {
-        eprintln!("{path}: {e}: not installed");
+        eprintln!("{path}: {e}: not stowed");
         std::process::exit(1);
     });
     let addr = *blake3::hash(&capsule).as_bytes();
@@ -1052,9 +1057,9 @@ async fn cmd_kist_install(path: &str) {
             std::process::exit(1);
         }
     };
-    // Every egg, here, before the capsule reaches the vault (owner, 2026-11-10: all three at install, the Ed25519 egg again at every spawn, by the kernel's gate), against the bundle the capsule carries (`kb`, its Ed25519 key the developer's), and that bundle the one the person pinned for this developer at their first kist (trust on first install): the network installer's rule, ferros_kist `capsule::admit`. A capsule from before `kb` installs only under Photon's release key, against the bundle fgtw pins, as before.
+    // Every egg, here, before the capsule reaches the vault (owner, 2026-11-10: all three at stow, the Ed25519 egg again at every spawn, by the kernel's gate), against the bundle the capsule carries (`kb`, its Ed25519 key the developer's), and that bundle the one the person pinned for this developer at their first kist (trust on first stow): the network stower's rule, ferros_kist `capsule::admit`. A capsule from before `kb` stows only under Photon's release key, against the bundle fgtw pins, as before.
     let admitted = ferros_kist::capsule::admit(&capsule, &signer, &eggs, &file_hash, &list).unwrap_or_else(|r| {
-        eprintln!("{path}: {}: not installed", ferros_kist::capsule::refusal_words(&r));
+        eprintln!("{path}: {}: not stowed", ferros_kist::capsule::refusal_words(&r));
         std::process::exit(1);
     });
     let mut key = b"capsules.".to_vec();
@@ -1083,9 +1088,9 @@ async fn cmd_kist_install(path: &str) {
             println!("first kist by this developer here: their key bundle is pinned in the person's list");
         }
     }
-    let i = list.install(addr, developer, option, &decl);
-    // When it was installed: its fact's stamp in the person's space, so an install after an uninstall wins over the uninstall (ferros_space). Its source stays as it was: a capsule from the bridge has no URL to fetch again.
-    list.kists[i].installed = vsf::eagle_time_oscillations();
+    let i = list.stow(addr, developer, option, &decl);
+    // When it was stowed: its fact's stamp in the person's space, so a stow after an unstow wins over the unstow (ferros_space). Its source stays as it was: a capsule from the bridge has no URL to fetch again.
+    list.kists[i].stowed = vsf::eagle_time_oscillations();
     let doc = list.build(vsf::eagle_time_oscillations()).unwrap_or_else(|e| {
         eprintln!("the list does not build: {e}");
         std::process::exit(1);
@@ -1099,7 +1104,7 @@ async fn cmd_kist_install(path: &str) {
         std::process::exit(1);
     }
     let k = &list.kists[i];
-    println!("installed {} ({} bytes, capsule {}), {} kist(s) in the person's list", k.name, capsule.len(), addr.iter().map(|b| format!("{b:02X}")).collect::<String>(), list.kists.len());
+    println!("stowed {} ({} bytes, capsule {}), {} kist(s) in the person's list", k.name, capsule.len(), addr.iter().map(|b| format!("{b:02X}")).collect::<String>(), list.kists.len());
     for w in &k.wants {
         let a = match w.answer {
             None => "unanswered (asked at its first launch)",
@@ -1110,7 +1115,7 @@ async fn cmd_kist_install(path: &str) {
     }
 }
 
-/// `kist answer <name> <right> on|off|unset` (development; unset puts the want back to never asked): the attested person's answer for one want of an installed kist, written into their list as the first-launch question or the settings' Kists page would write it. `kist list`: the list as it stands.
+/// `kist answer <name> <right> on|off|unset` (development; unset puts the want back to never asked): the attested person's answer for one want of a stowed kist, written into their list as the first-launch question or the settings' Kists page would write it. `kist list`: the list as it stands.
 async fn cmd_kist_answer(args: &[String]) {
     let link = usb::UsbLink::open().await.unwrap_or_else(|e| {
         eprintln!("{e}");

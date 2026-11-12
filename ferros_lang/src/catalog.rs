@@ -378,7 +378,7 @@ messages! {
     Chip,
 
     // ---- Kists, Permissions, a kist's first launch ----
-    NoKistsInstalled,
+    NoKistsStowed,
     AsksForNothing,
     NewKistsStartOn,
     /// The first-launch question's line over the wants.
@@ -397,8 +397,8 @@ messages! {
     RightAudio,
     /// Why a kist the person tapped did not start (ferros_kist::launch::why), under `Say::CouldNotStart` on its open circle: no room in the memory pool.
     NotEnoughMemory,
-    /// Not installed on this device: no capsule here, or no seal.
-    NotInstalledHere,
+    /// Not stowed on this device: no capsule here, or no seal.
+    NotStowedHere,
     /// Its checks refused it: its signature, the gate, a right it does not declare.
     FailedItsChecks,
     /// Its capsule could not be read from the vault.
@@ -421,6 +421,24 @@ messages! {
     UncheckedDevOnly,
     /// Over an offer's wants: each is asked once, at its first start.
     AsksAtFirstStart,
+    /// The stower's stages on the Deck page (payloads/kists `STAGE_*`; until 2026-11-12 English alone): a job queued behind another.
+    WaitingItsTurn,
+    /// Its signature, every egg against its developer's bundle.
+    CheckingSignature,
+    /// The kernel reading it back and running the checker over its code.
+    CheckingCode,
+    /// Its seal, keyed to this device.
+    SealingToDevice,
+    /// Into the person's list.
+    StoringIt,
+    /// An unstow's end (a stow's is `Stowed`).
+    Unstowed,
+    /// An unstow refused (the reason after it).
+    NotUnstowed,
+    /// A restore's end: a capsule the person's list names, brought back to this device.
+    Restored,
+    /// A restore refused (the reason after it).
+    NotRestored,
 
     // ---- Deck: what is on deck, and each thing's card (owner, 2026-11-12) ----
     /// A row's kind: a kist (opened, an app; a ferros word, kept unless a language has a reason).
@@ -576,6 +594,10 @@ pub enum Say<'a> {
     Stopped(&'a str),
     /// Who made a kist offered to stow (its developer's name as the capsule gives it): "by Nick".
     ByDeveloper(&'a str),
+    /// The stower fetching a kist (its name), the bytes so far written already in the person's base: "fetching Mahere: 3 MiB".
+    Fetching { name: &'a str, got: &'a str },
+    /// The same with the whole size known: "fetching Mahere: 3 MiB of 12 MiB".
+    FetchingOf { name: &'a str, got: &'a str, total: &'a str },
     // ---- the attest screen ----
     /// A network's signal, its dBm written already in the person's base.
     Signal(&'a str),

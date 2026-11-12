@@ -290,7 +290,7 @@ const CELL_DOWN: Cell = Cell { flags: 0, mtu: 0, v4: [0; 4], v6: [0; 16], dns4: 
 const TCPN: usize = 1 << 4;
 /// A connection's receive buffer: 1 MiB, the most its window says with scaling (2^20 >> `RCV_WS` fits the 16-bit field). At a 50 ms round trip that is 20 MB/s from one connection before the window, not the link, is what holds it back.
 const RXB: usize = 1 << 20;
-/// A connection's send buffer: 256 KiB (an upload's window in flight; the requests Mahere and the installer send are a few hundred bytes).
+/// A connection's send buffer: 256 KiB (an upload's window in flight; the requests Mahere and the stower send are a few hundred bytes).
 const TXB: usize = 1 << 18;
 /// A connection's buffers together, one block of the arc: the receive buffer, then the send buffer.
 const BLOCK: usize = RXB + TXB;
