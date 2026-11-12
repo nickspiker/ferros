@@ -1,0 +1,14 @@
+[package]
+name = "cell-table"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Cell tables as VSF (docs/LOCATION.md): converts a cell source's export (OpenCelliD's CSV, read on the host) to the table the place service finds the serving cell in, cut to a region's networks and, optionally, a box."
+
+# Its own workspace, as the other host tools under tools/ have: the CSV reader stays out of the device workspace.
+[workspace]
+
+[dependencies]
+# The table's schema and checks: the same code the place service runs.
+ferros_cell = { path = "../../ferros_cell", features = ["vsf"] }
+vsf = { path = "../../../vsf" }

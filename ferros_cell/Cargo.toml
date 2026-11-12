@@ -1,0 +1,19 @@
+[package]
+name = "ferros_cell"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "A rough place from the serving cell (docs/LOCATION.md): a cell table (each cell's network, area, identity, place and range) found by binary search, the serving cell's place with its error, and the timing advance as a radius where the table holds sites. no_std, host-tested with synthetic cells. With `vsf`: the table as a VSF document, written on the host by tools/cell-table."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libm = "0.2"
+# The table as a VSF document (`table`): read on the device by the place service, written on the host by tools/cell-table. no_std + alloc.
+vsf = { path = "../../vsf", default-features = false, optional = true }
+# vsf hashes with blake3: its pure-Rust build, as ferros_tide and ferros_kist take it (its C and assembly do not build for the bare target).
+blake3 = { version = "1", default-features = false, features = ["pure"], optional = true }
+
+[features]
+vsf = ["dep:vsf", "dep:blake3"]

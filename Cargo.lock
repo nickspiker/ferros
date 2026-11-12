@@ -1220,6 +1220,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros_cell"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "libm",
+ "vsf 0.11.0",
+]
+
+[[package]]
 name = "ferros_dsc"
 version = "0.1.0"
 
