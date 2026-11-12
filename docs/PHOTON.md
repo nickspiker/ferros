@@ -88,6 +88,8 @@ Whatever Photon kept on a ferros device before is under the old key and is not r
 
 ## Photon and the person's identity (proposal, 2026-11-12: the owner's decision)
 
+**Answered the same day:** the owner took the facets model (FACETS.md) over A to C below: no kist is handed the roots, and Photon signs as a key of its own, its alias, on every platform. None of A to C as written: Photon moves to a key of its own on every platform, the migration below; the plan is "Photon's own key: the migration" below.
+
 **Today.** The person attests at boot, and fgtw holds their roots in RAM (op 4).
 Photon, launched from its circle, is told none of it and opens on its own handle screen: the person types the handle a second time, Photon computes the proof again (4.7 s on the X3), and nothing on ferros stops Photon attesting an identity other than the device's.
 
@@ -128,6 +130,91 @@ The other ways, also the owner's: Photon signs device envelopes thru fgtw (one m
 The build is the pieces in A plus init's grant of the new endpoint to fgtw; tohu gains its ferros arm, and Photon's library is not touched.
 
 **Built:** the device key alone (above). No kist is handed anything of the identity.
+
+## Photon's own key: the migration (proposal, 2026-11-12)
+
+Status: a plan for the owner, nothing built.
+The decisions are gathered at the end (M0 to M7).
+
+The owner's direction (2026-11-12, FACETS.md "How this came up"): a kist acts for the person in its lane and is never them; the line is the key.
+For Photon that means: Photon gets its alias (a key for Photon alone, the same on every device of the person's), the person's public identity (be you) and their people, all or chosen; never the identity seed, the handle or the fleet.
+And because Photon is one app on every platform ("Claude memories/feedback_photon_is_the_full_app.md"), it moves onto its alias everywhere, not only on ferros: a ferros Photon on the alias and a desktop Photon on the seed would be two different people to every contact.
+
+### What Photon holds, after
+
+- **On ferros:** its alias (the kernel derives it and hands it to Photon alone, FACETS.md "The alias"), its device key (its ira key, as built above), the person's handle proof and its binding (be you), the person's people (people). No handle screen: Photon opens on its contacts.
+- **On Android and the desktop:** Photon is also the identity service there (it carries FGTW), so its FGTW part keeps the root as today (tohu's session) and does the fleet's work. Its messenger part holds exactly what ferros's Photon holds, the alias derived by Photon itself with the same function and the same constant for Photon's kist identity (M1), so the bytes are the ones ferros's kernel hands out.
+- So the messenger code is the same everywhere: it takes `PhotonKeys` (the alias, the handle proof, the binding) where it takes the session's `identity_seed` today.
+
+### What the seed does in Photon today
+
+The "about 600 places": lines in photon's `src` that name `identity_seed` or `vault_seed`, 716 in about 50 files, some 23 of them tests (photon 4bf11856, 2026-11-12).
+Photon sets `vault_seed = identity_seed` (handle_query's FirstAttest; launch.rs), so both are the one seed.
+Grouped by what they derive (the groups overlap a little; the counts are a size, not a census):
+
+| | what the seed gives today | where | lines | after | work |
+|---|---|---|---|---|---|
+| 0 | **the party id and the friendship secret**: `identity_party_id`, Ed25519 of the seed, the key friends pin and the id that sorts party slots and keys conversations; `identity_friendship_secret`, the static identity DH, the 21st CLUTCH egg; siblings' ceremony mixing the shared seed | crypto/clutch.rs; ui/photon_app status, render, molecules, sync, conversation, group_wave | 115 | the pinned party id stays as the identifier (M2); new signatures and new ceremonies' DH by the alias; siblings mix the alias (it is the same on each) | medium |
+| 1 | **the fleet** (FGTW's work, not the messenger's): the genesis identity key and the binding request's identity signature, the fan-out KEK's seed half, the pairing words, devices' default names, sponsoring, departure, root conversion | network/fgtw/fleet.rs, bootstrap.rs; ui/photon_app devices, root_conversion, ceremony, bonds | 160 | stays on the root, as the identity service's. On ferros the fgtw process does it already; elsewhere Photon's FGTW part. The change is a boundary: the messenger never calls these | small to medium |
+| 2 | **vault addresses**: `vault_key(domain, seed)` for each contact's entries, drafts, the booted record, molecules, fleet settings | storage/*.rs, network/handle_query.rs | 220 | from the alias; each device moves its entries once (root_conversion's pattern: read under the old address, write under the new, delete the old) | medium |
+| 3 | **blob names**: the keyed addresses of attachments, recordings, kept beams (`blob_name_key_of`) | storage/mod.rs, wave/* | 66 | the alias; the same one-time move | small |
+| 4 | **the person's own avatar**: its wall address, the 64-byte avatar pin every contact keeps, its encryption key | ui/avatar.rs, avatar_scoped.rs, group_avatar.rs | 130 | the alias; the new pin rides the rotation to each contact (or identity-profile.md's profile grants, stage C, replace it) | medium |
+| 5 | **the roster backup**: `contacts_storage_key` and `contacts_encryption_key`, the seed with the fleet key, for the fleet's contact copy at fgtw.org | storage/cloud.rs | 35 | a key from the alias, which every Photon of the person's holds (ferros's included, which holds no fleet key); a slot of its own, written under the alias's signature (M5) | medium to large: a worker slot |
+| 6 | **notes to self**: the self atom's era 0 root and history key | ui/photon_app/molecules.rs | 2 | from the alias, as era 1 | small |
+| 7 | **submitted logs**: their key and retrieval tag, from the handle on purpose, so a maintainer handed a handle can find and open that person's logs | lib.rs, network/fgtw/blob.rs | 5 | M6 | small |
+| 8 | **plumbing**: the session's seed passed down to all of the above | handle_query, launch, driver, input, settings, photon_app.rs and others | 120 | `PhotonKeys` in place of `SessionIdentity` in the messenger's code; the compiler walks every site | medium, mechanical |
+
+**The size of it.** About three quarters of the lines go by a type change the compiler walks (groups 2, 3, 4, 6, 8).
+The design is in three places: the rotation (group 0, below), the roster's slot (group 5) and the line between the messenger and FGTW (group 1).
+It is a Photon project, done in the photon repo with ferros's three pieces beside it ("ferros's part").
+
+### How contacts keep trusting the person
+
+**What a contact holds today** (photon docs/identity-profile.md "The pin-set"): the handle proof, the pinned identity key (the party id, Ed25519 of the seed), the pinned genesis hash, and the chain's folded member set; a photon is taken from a device in that set (molecules.rs: "the caller still holds the signer to the member's trusted devices").
+
+**The rotation** (proposed). Each of the person's Photons tells each contact, over the friendship they already have (so authenticated exactly as photons are today), "my Photon key is this alias":
+- the **binding**: "this alias speaks for this handle proof in Photon", signed by a device of the person's chain with every egg (FACETS.md "Be you"). This is the signature that carries the weight: as in photon's succession design (identity-succession.md: "Its trust anchor is a device key from the old chain"), a device the contact already trusts vouches for the new key, and nobody who only knows the handle can make it;
+- the **alias's own signature** over the same bytes (it holds the key it names);
+- the **old identity key's signature** too, for continuity with the pin; worth little alone, since anyone who knows the handle can make it.
+
+The contact checks the binding's signer against the chain it pinned and the alias's signature, and keeps the alias beside the pin.
+From then on records the person publishes (the profile, the avatar wall, their sovereign records: "the subject signs") are signed by the alias, and new ceremonies with them use the alias's DH.
+
+**Photon's devices** (proposed, M3): the alias signs a list of Photon's device keys, one per device of the person's where Photon runs, and a contact takes photons from a device in that list.
+- On the desktop and Android Photon's device key is the device's own member key, as today, so it is in both the chain and the list.
+- On ferros Photon's device key is its ira key (built, above), in the list only: never a member of the fleet.
+- Why not A′ (Photon a member of the fleet, above): a member can sponsor devices into the fleet (fgtw: adding a device takes a sponsor in the folded member set), so a Photon that is a member can make any device the person's. That is being the person, which is what facets keep from every kist.
+
+### The order: readers, then speakers, then the cutover
+
+0. **fgtw first**: the alias derivation with known answers (so the kernel and Photon on every platform derive the same bytes), the binding, the device list, their checks; host-tested. Under M0's person key, the identity service on whichever device of the person's runs it first mints the person key and seals it into the fleet's state before any alias is derived.
+1. **Readers everywhere**: every Photon, on every platform, learns to take a rotation, check it, keep the alias and take photons from a device in an alias-signed list, while still speaking only the old way. Released before anyone speaks: nothing has changed yet for any contact.
+2. **The person's fleet speaks.** Once every device in the person's fleet runs a reader (each says its Photon version in fleet presence, as siblings already trade state), the first to see it sends the rotation to each contact and publishes the device list. Each sibling, seeing itself named, moves its local entries once (groups 2, 3, 4, 6) and signs new records with the alias. The alias is the same everywhere, so no sibling waits on another's key.
+   - ferros's Photon comes up on the alias from its first launch (the kernel hands it in), so it is a speaker from the start, named in the list as soon as it or a sibling publishes it.
+   - A device that is off (one in a drawer) is not in the list until it runs and updates; until the cutover its photons the old way are still taken.
+3. **The cutover.** When every member of the person's fleet has signed into the alias's device list, the list says so, and every contact stops taking that person's photons the old way (M4).
+   - A device still on an old Photon after that is refused, and shows "update Photon on this device to keep talking" (the Deck's update, the pandok listing the newer version). No device is left speaking an old key unheard: it is told.
+   - A contact who never takes the reader release cannot hear the person after the cutover; the person's Photon shows that contact as needing an update. The network is small, and the owner knows his peers.
+4. **The seed leaves the messenger.** Groups 0 and 2 to 8 take `PhotonKeys`; the root stays only in Photon's FGTW part, on the platforms that have one. On ferros std/photon's main hands `PhotonKeys` in before Photon starts, as it hands in the device key (`set_device_keypair`), so tohu needs no ferros arm for the session.
+5. **The old way's reader** (M7): photon's own precedent keeps a reader of a signed binary record (identity-succession.md "Sunset decision": the v1 verify path stays), so taking the old way could stay behind the cutover as a reader, or go after a census.
+
+### ferros's part
+
+- **Kernel**: the alias call (FACETS.md "To build" 1).
+- **Identity service** (payloads/fgtw): the `facets` endpoint, the binding and the people (FACETS.md "To build" 2).
+- **std/photon**: its main asks the kernel for the alias and the identity service for the handle proof and the binding, and hands them in; Photon's capsule wants be you and people (its words in KISTS.md "The permission list").
+- **Nothing to move on ferros devices**: whatever Photon kept there is development data, as with the device key above.
+
+### Decisions for the owner
+
+- **M0. The root** (FACETS.md D0): the identity seed, or the person key. Either way Photon on the desktop and Android derives its alias itself: from the session's seed, or from the person key its FGTW part opens with the fleet key.
+- **M1. Photon's kist identity, fixed**: the alias derivation names Photon's developer key and option as first stowed, as a constant on every platform, and keeps it if the release key ever moves (KISTS.md "Gap: custody moving").
+- **M2. The party id**: keep the pinned identity key as Photon's identifier for a person, so friendship ids and conversation tokens stay and no friendship is made again (recommended); or move it to the alias, a flag day like identity-profile.md's stage A, every friendship re-made.
+- **M3. Photon's devices**: vouched by the alias's device list (recommended), or members of the fleet (A′).
+- **M4. The cutover**: contacts stop taking a person's photons the old way once every device of that person's fleet is in the list.
+- **M5. The roster's slot**: a new fgtw.org slot for the alias-sealed contact copy, and the fleet-key copy retired.
+- **M6. Logs**: keyed from the handle as today (a maintainer handed a handle finds that person's logs), or from the alias (nobody finds them unless the person hands over the tag).
+- **M7. The old way's reader**: kept behind the cutover (photon's precedent), or removed after a census.
 
 ## Findings
 

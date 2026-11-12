@@ -49,7 +49,7 @@ At attest the map reads `kists` (it already holds the person's arrangement) and 
 3. **Default off** for every want. An update that adds a want asks that want (off until answered); the other answers stand.
 4. **The person's defaults**: a default per right (the Permissions page) sets where the first-launch question's switch starts. Out of the box every one is off.
 5. **No lying**: a right said no to is an empty slot, never a fake, and a kist runs without it (Mahere without GPS; Lumis without the camera has no cameras to pick).
-6. **Kists can never ask.** No call makes a prompt. The system asks once, at first launch: every unanswered asked want on one screen, each a switch (never the implicit set).
+6. **Kists can never ask.** No call makes a prompt. The system asks once, at first launch: every unanswered asked want on one screen, each a switch (never the implicit set). (Replaced 2026-11-10, owner: "maybe I never share my location with anyone so there's no reason for Photon to ever ask me": what a kist needs to run at all is asked when it is stowed, everything else at the person's first action that needs it, under the gesture ticket; "The permission list" below. The first-launch screen is what is built.)
 7. **Revoke = kill and respawn** without the right. Every kill and every end, of any process, is one shot dead: no end hooks, no signals, no graceful shutdown, no teardown code; the kernel reclaims by dropping (and wipes the arc as it does).
 8. **Settings pages**: per kist (its card on the Deck since 2026-11-12, "The deck and the card" below; the Kists page before), per right (Permissions: who has the GPS, who has the network), and the defaults, in the system settings circle.
 9. **Kist circles** on the map, round, one per kist; a tap asks init to launch it (init holds every grant; the map holds none of the kist's), the first launch showing the question first.
@@ -66,6 +66,94 @@ Owner, 2026-11-12, "Yes on the implicit set", to the proposal that a kist the pe
 - **The two meet at Mahere**: it declared the six in code order and then gps and udp, so its capsule now declares only gps and udp and its slots are the same (tools/mahere-kist.sh). Photon keeps declaring its implicit rights as placements (tools/photon-capsule.sh): udp is slot 4 in the photon repo (src/platform/ferros_net.rs `UDP_SLOT`, frozen into every Photon release) and the ira 6 in std/photon, where the new layout would put udp at 7 and the ira at 4; that move waits for a Photon release that reads the new slots.
 - **What is shown**: the first-start question, the Deck card's permissions, the Permissions page (each right's default and who has it) and the stower's offer screen list only asked rights; a kist that asks for nothing says so and launches at once. The bridge's `kist list` says "always" for an implicit want. The kernel hands the implicit set whatever init sends for it, so an init from before (which asks for an unanswered implicit want) still launches a kist once the map has asked.
 - **Deploy order**: the kernel first, since a capsule that declares only asked rights (Mahere's from now on) on an older kernel would get gps in slot 1; then init and the map; then new capsules. Old capsules keep working at every step.
+
+## The permission list (2026-11-12)
+
+Every right a kist can hold, in three groups: implicit (never asked), asked, and never handed.
+The person's side of identity (alias, be you, people, places) is FACETS.md; this is the whole list, those included.
+**Decided** marks the owner's words; everything else is **Proposed** and waits for the owner, the decisions gathered at the end (P0 to P5).
+
+**What stays as decided:** a grant is the permission (rule 0); wants declared in the signed capsule with a reason (1); asked once, ever, per person, per kist, per right, kept in the person's space (2; owner, 2026-11-07: "1 means 1"); default off (3); no lying, a right said no to is an empty slot (5); revoke is kill and relaunch (7).
+**Decided 2026-11-10:** asked at first need, not at first launch (rule 6's note above); a kist can put a question only while holding the one-shot ticket the input path hands it with a fresh gesture.
+
+### Implicit: every kist, never asked
+
+**Decided** (owner, 2026-11-12: "Yes on the implicit set"; the GPU 2026-11-11 and 2026-11-12: "I feel like GPU should be implicit. If I'm running it on my machine..."; "Claude memories/rights_implicit_set.md", "gpu_implicit.md"). A kist the person chose to run gets these, and asking about them would only teach people to tap yes:
+
+| right | code | what it is |
+|---|---|---|
+| display | 0 | the screen, thru its window |
+| touch | 1 | the person's touches in its window |
+| surface | 2 | a window of its own |
+| ira | 3 | its own key sealed to this device (bound to its gate identity: "A kist's ira keys are its own") |
+| domain | 4 | its own storage, under the person's key and its own (VAULT-OUT.md) |
+| entropy | 5 | randomness |
+| audio | 8 | sound out (AUDIO.md); the microphone is asked, below |
+| the GPU | kernel slots | its own block of the layer arena and a mailbox ("A tap launches", GPU-KISTS.md) |
+
+**Proposed** with them (FACETS.md; the owner accepted the model 2026-11-12): its **alias** (a key for this kist alone, the same on every device of the person's) and the device's **language, number base and time zone**.
+
+**What changes:** the first-launch question and the Deck's cards stop showing these rows.
+Proposed (P5): capsules keep declaring the ones they use in their slot order, as today, so nothing about the capsule format or the slot order moves; the stower answers them yes when it stows, and the pages leave them out.
+
+### Asked: once, ever, at first need
+
+Each row: the right, the sentence the person reads (the developer's reason goes under it, as today), and exactly what a yes grants.
+New codes are appended after `audio` (8) in the order approved, so the codes in every list already kept keep their meaning.
+
+| right | the person reads (proposed) | a yes grants exactly | status |
+|---|---|---|---|
+| **always on** | "keep running: start when you attest and stay on behind" | init starts it at attest on every device of the person's where it is stowed, without a tap; when memory runs short the device ends kists without it first | **decided** as a permission (owner, 2026-11-12: "Run on boot should be a permission"); words and grant proposed |
+| **network: its places** | "connect to: maps.example.org, tiles.example.org" (the places it declared, by name) | ip's resolver (op 10 RESOLVE, `ferros_dns`) answers this kist only for the names its capsule declares, and ip opens connections for it only to addresses it resolved for it (or declared literal addresses); any other name is "not one of its places", never a fake address | proposed |
+| **network: anywhere** | "connect anywhere on the internet" | ip's client as `udp` grants it today: any address. For browsers and peer to peer (Photon's peers are wherever its contacts' devices are) | proposed: today's `udp` (code 7) keeps its code with this meaning |
+| **local network** | "find and talk to devices on your local network" | multicast and broadcast, and private and link-local addresses; neither network right above reaches these | proposed |
+| **sensors** | "how you hold and move the device, and the light near it" | the accelerometer, gyroscope, ambient light and proximity streams (SENSORS.md) | proposed |
+| **camera** | "the cameras" | frames from the camera driver (Lumis's ops, "Lumis" below); the console shows it while open | proposed |
+| **microphone** | "the microphone, while it listens" | sound in from the audio service; the console shows it while open | proposed |
+| **place** | "where you were last (no radio turns on for it)" | a send right on the place service's `place` endpoint (LOCATION.md) | proposed in LOCATION.md |
+| **gps** | "where you are now (turns GPS on while it looks)" | the GPS claim, as today (code 6) | built; words proposed in LOCATION.md |
+| **Bluetooth** | "Bluetooth: find and connect to things near you" | the bt driver's client ops, under the identity's address | proposed |
+| **NFC** | "NFC: read and write tags you hold to it" | tag reads and writes while its window is in front and the screen is on | proposed |
+| **USB** | "things plugged into the USB port" | a device on the port, once the person picks it | proposed |
+| **be you** | "be you in Photon: your contacts find and recognise you there" | the person's handle proof and a binding of its alias to their identity, signed by the fleet (FACETS.md "Be you") | proposed |
+| **people** | "your people: all of them, or the ones you choose" | the people served by the identity service, all or as chosen (FACETS.md "People") | proposed |
+| **places** | "your places: home, work and the spots you saved" | the saved places, all or as chosen (FACETS.md "Places"); not where you are | proposed |
+| **the hold** | "keep things for you" (making its declared kinds); "open your save states" (one question per kind it opens) | `items` and the per-kind opens of STORE.md "Two rights" | proposed in STORE.md |
+
+**What a kist needs to run at all** is marked so in its declaration ("Claude memories/permissions_asked_once.md": a declared right carries whether it is needed to run) and is asked when it is stowed, with Stow and Cancel.
+Everything else waits for the person's first action that needs it: Photon asks for the camera the first time the person beams, for place the first time they share where they are, never before.
+
+**No notification permission.** **Decided** (owner, 2026-11-12, NOTIFY.md): reach is the view (a kist whose circle is in the deck's resting view can notify; out of view it is silent) and the kind is the system's (live, personal, status, lowered from what the kist asks, never raised), so there is no per-kist switch to ask.
+
+**Picks need no right.** A kist with no facet still gets one address, one person, one place now or one item when the person picks it on the system's sheet (FACETS.md "Pick, don't share"); the pick is the grant.
+
+### Never handed
+
+**Proposed** (the owner received it 2026-11-12, not yet item by item; FACETS.md "The never list" has each with its reason): no right grants these, so nothing can be said yes to.
+
+- which other kists the person uses;
+- their fleet: devices, keys, names, how many;
+- their identity's root: the handle, the identity seed, the person key, the identity and fleet keys, the ira;
+- other kists' data;
+- device identifiers (chip IDs, the UFS serial, the IMEI, radio addresses);
+- fine device facts (the exact battery level, the model, storage left, signal measures, the serving cell): at most a coarse word (low power, a metered link).
+
+### Last used on the card
+
+**Proposed** (sent to the owner 2026-11-12 with the list): each asked right on a kist's card on the Deck shows when the kist last used it, in the person's words ("using now", "an hour ago", "never").
+- **Written at the moment of use, by whoever served it**: the place service at a read (as LOCATION.md has it), the GPS at a claim, ip at a connection, the identity service at a facet's answer, the camera and the microphone at an open. An event, never a clock: no process looks at a timer to write it.
+- **Kept per device** in the person's class (the cards read it from there), never sent to the kist.
+- "Using now" stays as the claims show it today (GPS only, `SYS_CLAIM` op 2), and grows to every right with a live open (camera, microphone, GPS).
+- Implicit rights show no row, so no time.
+
+### Decisions for the owner
+
+- **P0. The words**, row by row: the sentence the person reads for each asked right.
+- **P1. The network split**: its declared places, anywhere (today's `udp`), and the local network, three rights; the resolver enforcing the first.
+- **P2. Always on's grant**: started at attest without a tap, ended last when memory runs short; whether one that ends by itself is started again (today nothing is).
+- **P3. The never list**, item by item.
+- **P4. Last used**: written at use by the server, kept per device; or carried in the space so every device shows the latest anywhere (that would tell each device what the person did on the others).
+- **P5. Implicit rights in capsules**: still declared in slot order and answered yes at stow (proposed, nothing moves), or dropped from declarations and given at fixed slots as the GPU's are.
 
 ## Built (2026-11-08)
 
