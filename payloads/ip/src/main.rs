@@ -8,7 +8,9 @@
 //! `udp` requests (first byte):
 //! - 1 SEND: family (4 or 6), address (16 bytes; IPv4 in the first 4), destination port (u16 BE), source port (u16 BE), payload → [0] sent, [1] resolving the next hop (retry), [2] no address yet, [3] bad request.
 //! - 2 RECV: port (u16 BE) → family, address (16), source port, destination port, payload, or nothing (length 0). A RECV on a port, or a SEND from it, opens it: datagrams are kept only for the last eight ports asked for (a broadcast to a port nobody reads once filled the queue for good), the oldest giving way when the queue is full. IPv4 multicast and IPv6 link-scope multicast (ff02::; Photon's LAN beacons go to 239.104.199.144 and ff02::68c7:9014, port 4384) are delivered like unicast. A fourth byte, a wait in seconds (1 to 255), holds the call while the port has nothing: answered as a datagram for it lands, else with nothing when the wait runs out (a doorbell for a blocking reader, never a poll: owner, 2026-11-10, "No polling!"; 2026-11-11, Mahere fetching its map cells, "we have tcp and http so let's get the full meal deal wired up with mahere"). Without it, or 0, the answer is at once, as before.
-//! - 3 INFO: → MAC (6), IPv4 address, mask, router (4 each), IPv6 link-local (16), IPv6 global (16), flags (bit 0 IPv4 bound, bit 1 IPv6 global, bit 2 the cellular call is up), the DNS server (4), then the cellular call's IPv6 DNS server (16): 71 bytes. The addresses and DNS are the ones traffic of each family leaves with: WiFi's when it has them, else the call's.
+//! - 3 INFO: → MAC (6), IPv4 address, mask, router (4 each), IPv6 link-local (16), IPv6 global (16), flags (bit 0 IPv4 bound, bit 1 IPv6 global, bit 2 the cellular call is up, bit 3 a person is present, so applications are served), the IPv4 DNS server (4), then the IPv6 DNS server (16): 71 bytes. The addresses and DNS servers are the ones traffic of each family leaves with: WiFi's when it has them (DHCP's option 6; the router advertisement's RDNSS), else the call's; a server of zeros when that link named none.
+//!
+//! While nobody is present (bit 3 clear) every request but INFO is answered with nothing: a SEND sends nothing, a RECV brings nothing, a CONNECT opens nothing. An application asks INFO first and says so (2026-11-12: Mahere and httptest said "DNS gave no address" all night on a locked device, their questions never sent).
 //! - 4 TCP CONNECT: family, address (16), port (u16 BE) → [0, handle] connecting, [2] no address yet, [4] no free connection, [6] no memory for its buffers (the arc could not grow).
 //! - 5 TCP SEND: handle, data (up to 4094 bytes: a call carries 4096, process.rs SYS_CALL) → [0, accepted u16 BE] (what the send buffer took; send the rest later), [5] not a connection.
 //! - 6 TCP RECV: handle, wait, most (u32 BE) → [state, data…]: state 1 connecting, 2 open, 3 the peer closed (no more data once this is empty), 4 failed (reset or timed out), 5 not a connection (or a request shorter than its 7 bytes). The data is what the connection has taken in, up to `most` and at most 2^18 bytes (`RECV_MAX`, the kernel's largest reply), so the caller's reply buffer holds 1 + most (the kernel cuts a reply at the caller's length). With `wait` 1 to 255 (seconds) the call is held while the connection has nothing new: answered as data lands, as its state changes (it opens, the peer closes, it fails), or when the wait runs out (then its state and no data); 0 answers at once. A held receive is its app asking (no idle reaping while it waits); a second held receive on the same connection answers the first as things stand.
@@ -94,7 +96,9 @@ struct Ip {
     nd_n: usize,
     q: &'static mut [Datagram; QN],
     frames: u32,
+    /// WiFi's DNS servers: IPv4 from DHCP (option 6), IPv6 from the router's advertisement (RDNSS, RFC 8106). Zero for none; both forgotten with the network (`wifi_down`).
     dns: [u8; 4],
+    dns6: [u8; 16],
     ports: [u16; 8],
     ports_at: usize,
     qseq: u32,
@@ -823,6 +827,9 @@ impl Ip {
         self.bound = false;
         self.have_global = false;
         self.have_r6 = false;
+        // The network's DNS servers go with it: a server kept from it would be asked from the next network (or the call) and answer nothing.
+        self.dns = [0; 4];
+        self.dns6 = [0; 16];
         self.arp_n = 0;
         self.nd_n = 0;
         // Frames batched for it go with it: nothing would send them, and a batch waiting keeps the loop from sleeping.
@@ -1308,7 +1315,8 @@ impl Ip {
                 self.put(b"ping6 from ");
                 self.v6_put(src);
                 self.put(b"\n");
-            } else if ty == 134 {
+            } else if ty == 134 && p[7] == 255 && src[0] == 0xFE && src[1] & 0xC0 == 0x80 {
+                // WHY the checks (RFC 4861 6.1.2): an advertisement comes from a router's link-local address at hop limit 255, which no packet forwarded from off the link can have; it now names the DNS server too, so one from anywhere else is not believed.
                 self.router_adv(src_mac, src, body);
             } else if ty == 135 && body.len() >= 24 {
                 let target: [u8; 16] = body[8..24].try_into().unwrap();
@@ -1367,6 +1375,18 @@ impl Ip {
             }
             if t == 1 {
                 mac = body[o + 2..o + 8].try_into().unwrap();
+            } else if t == 25 && l >= 24 {
+                // RDNSS (RFC 8106): reserved (2), lifetime (4), then the servers; the first kept, a lifetime of 0 withdrawing it. Without it a network with no DHCPv4 had no DNS server at all, and IPv6 questions went to the call's server from WiFi's address.
+                let life = u32::from_be_bytes(body[o + 4..o + 8].try_into().unwrap());
+                let s: [u8; 16] = body[o + 8..o + 24].try_into().unwrap();
+                if life == 0 {
+                    if s == self.dns6 {
+                        self.dns6 = [0; 16];
+                    }
+                } else if s != self.dns6 {
+                    self.dns6 = s;
+                    self.put(b"IPv6 DNS server from the router\n");
+                }
             } else if t == 3 && l >= 32 && body[o + 2] == 64 && body[o + 3] & 0x40 != 0 {
                 let p: [u8; 8] = body[o + 16..o + 24].try_into().unwrap();
                 if p[0] & 0xE0 == 0x20 {
@@ -2292,7 +2312,7 @@ impl Ip {
                 1
             }
             Some(3) => {
-                // The addresses traffic leaves with (`pick4`, `pick6` for a global destination), and the DNS server of the link IPv4 leaves on.
+                // The addresses traffic leaves with (`pick4`, `pick6` for a global destination), and for each family the DNS server of the link it leaves on: a server is asked from that link's address (the call's IPv6 server was reported even when IPv6 left on WiFi, a carrier's server asked from an address outside its network, which it need not answer).
                 let a4 = self.pick4(&[8, 8, 8, 8]);
                 let a6 = self.pick6(&[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
                 out[0..6].copy_from_slice(&self.mac);
@@ -2301,9 +2321,19 @@ impl Ip {
                 out[14..18].copy_from_slice(&self.router);
                 out[18..34].copy_from_slice(&self.ll);
                 out[34..50].copy_from_slice(&a6.map(|a| a.1).unwrap_or([0; 16]));
-                out[50] = a4.is_some() as u8 | (a6.is_some() as u8) << 1 | (self.cell.flags & 1) << 2;
-                out[51..55].copy_from_slice(if matches!(a4, Some((true, _))) { &self.cell.dns4 } else { &self.dns });
-                out[55..71].copy_from_slice(&self.cell.dns6);
+                out[50] = a4.is_some() as u8 | (a6.is_some() as u8) << 1 | (self.cell.flags & 1) << 2 | (self.person as u8) << 3;
+                let d4 = match a4 {
+                    Some((true, _)) => self.cell.dns4,
+                    Some((false, _)) => self.dns,
+                    None => [0; 4],
+                };
+                let d6 = match a6 {
+                    Some((true, _)) => self.cell.dns6,
+                    Some((false, _)) => self.dns6,
+                    None => [0; 16],
+                };
+                out[51..55].copy_from_slice(&d4);
+                out[55..71].copy_from_slice(&d6);
                 71
             }
             Some(9) if m.len() >= 2 && m[1] <= 2 => {
@@ -2483,6 +2513,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         q: unsafe { &mut *(&raw mut QUEUE) },
         frames: 0,
         dns: [0; 4],
+        dns6: [0; 16],
         ports: [0; 8],
         ports_at: 0,
         qseq: 0,
