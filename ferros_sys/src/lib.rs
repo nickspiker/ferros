@@ -1574,6 +1574,11 @@ pub fn wait_world(word: &core::sync::atomic::AtomicU64, expected: u64, deadline:
     svc(nr::WAIT, off(word as *const _ as *const u8), expected, deadline, 1, 0)
 }
 
+/// `wait_world` that a call to an endpoint this thread polls (a `recv` with the poll flag) also ends, with 3; a call already waiting returns 3 at once. A server that waits on a doorbell of its own (a word another of its threads rings) and on its callers in one wait: the IP stack's idle wait (kernel ≥ 2026-11-11; an older kernel ignores the flag and the call waits for the deadline).
+pub fn wait_world_or_call(word: &core::sync::atomic::AtomicU64, expected: u64, deadline: u64) -> u64 {
+    svc(nr::WAIT, off(word as *const _ as *const u8), expected, deadline, 3, 0)
+}
+
 /// Make up to `count` threads waiting on `word` runnable; returns how many.
 pub fn wake(word: &core::sync::atomic::AtomicU64, count: u64) -> u64 {
     svc(nr::WAKE, off(word as *const _ as *const u8), count, 0, 0, 0)
@@ -1629,9 +1634,14 @@ pub fn input(start: u64, buf: &mut [u8]) -> usize {
     svc(nr::INPUT, start, off(buf.as_mut_ptr() as *const u8), buf.len() as u64, 0, 0) as usize
 }
 
-/// Sleep until the generic timer count reaches `deadline` (see `now`/`freq`): the process is parked, not scheduled, until then.
+/// Sleep until the generic timer count reaches `deadline` (see `now`/`freq`): the process is parked, not scheduled, until then. A call to an endpoint this thread polls ends it early (`sleep_until_or_call` says which).
 pub fn sleep_until(deadline: u64) {
     svc(nr::SLEEP, deadline, 0, 0, 0, 0);
+}
+
+/// `sleep_until`, saying why it ended: true when a call to an endpoint this thread polls ended it (or was already waiting), false at the deadline (kernel ≥ 2026-11-11; an older one always says false).
+pub fn sleep_until_or_call(deadline: u64) -> bool {
+    svc(nr::SLEEP, deadline, 0, 0, 0, 0) == 1
 }
 
 /// Say something on the console (grant slot 0).

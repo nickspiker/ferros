@@ -42,6 +42,12 @@ const STORE: u64 = 16;
 const IRA: u64 = 17;
 /// Bluetooth's power switch (`--power bt`, after the ira key; init grants it at boot): the chip's Bluetooth core is turned off before WL_REG_ON is cycled, as Android's REG_ON coordinator resets Bluetooth before a WiFi chip reset (wl_android.c, wl2wbrc_req_bt_reset). Cycling WL_REG_ON under a powered Bluetooth core wedged the chip and the device with it (2026-10-31: two watchdog resets, each within a minute of a WiFi restart). The Bluetooth driver hears its chip go silent and brings it up again once WiFi is up. A start without the grant (the bridge's) skips it.
 const BT_POWER: u64 = 18;
+/// PCIe channel 1's interrupt (kernel IRQS `pcie1`, SPI 439): the slot after the last, which the kernel adds for a process granted the controller (process.rs `build_from`), so a spawn with 19 or fewer slots has none.
+const IRQ: u64 = 19;
+/// Wait on the chip's interrupt instead of a millisecond's sleep (`FERROS_WIFI_IRQ=1` builds, 2026-11-11; off, the loop sleeps 1 ms as before). Proven from source: channel 1's MSIs reach the GIC on SPI 439 thru ELBI PCIE_IRQ2 bit 17 (pcie-exynos-rc.c). Not proven without the device: that the BCM4398 raises an MSI for its completions once its mailbox mask is set at the PCIe core's G#C34 (brcmfmac pcie.c, the register set of PCIe core rev 64 and up; this core is rev 130, docs/WIFI.md). The 32 s line's `irq` counts say: wakes by the line that found frames, and frames found with no interrupt.
+const WIFI_IRQ: bool = option_env!("FERROS_WIFI_IRQ").is_some();
+/// With the interrupt, the longest wait: 2^3 of the counter's ~1 ms (freq >> 10). A backstop while the interrupt is unproven (frames it missed wait at most this long); with it proven, the controls' quarter second is the bound that matters.
+const IRQ_BACKSTOP_LOG2: u32 = 3;
 const ERR: u64 = u64::MAX;
 /// BAR1's offset inside the pcie1-mem window (stage 6 places it above BAR0's 64 KiB), and its size: the 4 MiB slice of the dongle backplane that cfg G#84 selects.
 const BAR1: u64 = 0x40_0000;
@@ -2155,6 +2161,11 @@ struct Path {
     /// Frames from the IP stack sent, and refused (malformed, or every tx buffer in flight).
     from_ip: u32,
     refused: u32,
+    /// The chip's interrupt (`WIFI_IRQ`): waits ended by the line, the passes after one that found new frames, and passes after any other wake (the backstop, a call) that found new frames: frames no interrupt announced. And the doorbells answered (`wlan` op 9).
+    irq_wakes: u32,
+    irq_rx: u32,
+    other_rx: u32,
+    rings: u32,
 }
 
 impl Path {
@@ -2193,7 +2204,32 @@ impl Path {
         d.dec(self.from_ip);
         d.put(b" frames, ");
         d.dec(self.refused);
-        d.put(b" refused\n");
+        d.put(b" refused; doorbell ");
+        d.dec(self.rings);
+        d.put(b" rings");
+        if WIFI_IRQ {
+            d.put(b"; irq ");
+            d.dec(self.irq_wakes);
+            d.put(b" wakes, ");
+            d.dec(self.irq_rx);
+            d.put(b" with new frames; new frames with no irq ");
+            d.dec(self.other_rx);
+        }
+        d.put(b"\n");
+    }
+}
+
+/// The interrupt's latches cleared, before the rings are read (`WIFI_IRQ`): the root complex's ELBI PCIE_IRQ2 (write back what it holds, as the Exynos RC driver's handler does), its MSI status (DBI G#830, write-1-to-clear, as the modem driver does on channel 0), then the chip's mailbox interrupt (BRCMF_PCIE_64_PCIE2REG_MAILBOXINT G#C30, write back, as brcmfmac's handler does). In that order, and the rings read after: a completion before the chip's latch is cleared is in the rings this pass reads, and one after it raises a new MSI into latches already clear, so the line rises again and the next wait ends at once.
+fn irq_clear(d: &mut Drv) {
+    let s = d.rd(ELBI, 0x8);
+    d.wr(ELBI, 0x8, s);
+    let m = d.rd(DBI, 0x830);
+    if m != 0 {
+        d.wr(DBI, 0x830, m);
+    }
+    let c = d.rd(MEM, 0x2C30);
+    if c != 0 {
+        d.wr(MEM, 0x2C30, c);
     }
 }
 
@@ -2213,6 +2249,25 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     d.put(b"serving wlan\n");
     d.flush();
     enable_l1ss(d);
+    // The chip's interrupt (`WIFI_IRQ` builds with the line granted): the root complex's MSI receiver onto the controller's line, the chip's completions onto MSI.
+    let mut irq = WIFI_IRQ && unsafe { core::ptr::read_volatile((d.base + d.grants + 0x200) as *const u32) } as u64 > IRQ;
+    if irq {
+        irq_clear(d);
+        // ELBI PCIE_IRQ2_EN bit 17 (IRQ_MSI_CTRL_EN_RISING_EDG): an MSI raises SPI 439 (pcie-exynos-rc.c exynos_pcie_rc_msi_init, channel 1 having no separate MSI lines). The A1 step zeroed every enable; the MSI receiver itself (DBI G#820-G#82C) is set since the firmware's download.
+        d.set(ELBI, 0x18, 1 << 17);
+        // The chip's D2H doorbells onto its host interrupt: the mailbox mask (brcmfmac pcie.c brcmf_pcie_intr_enable, BRCMF_PCIE_64_PCIE2REG_MAILBOXMASK G#C34 = BRCMF_PCIE_64_MB_INT_D2H_DB G#FFFF), the PCIe core at BAR0 + G#2000.
+        d.wr(MEM, 0x2C34, 0xFFFF);
+        let (en, mm) = (d.rd(ELBI, 0x18), d.rd(MEM, 0x2C34));
+        d.kv(b"irq: elbi irq2_en", en);
+        d.kv(b"irq: chip mailbox mask", mm);
+        d.flush();
+    } else if WIFI_IRQ {
+        d.put(b"irq: no interrupt grant (fewer than 20 slots): sleeping a millisecond between passes\n");
+    }
+    // The doorbell (`wlan` op 9): the reply token of a call held until frames wait.
+    let mut ring: Option<[u8; 32]> = None;
+    // How the last wait ended: 0 not waited (a request was served), 1 the interrupt, 2 anything else (the backstop, a call).
+    let mut woke = 0u8;
     // The link's power state as the PHY reports it (PCS G#188 bits 2:0: 0 L0, 2 L1, 5 L1.1, 6 L1.2; read without waking the link), sampled each pass and said every 32 s.
     let mut lstates = [0u32; 8];
     let mut lstates_at = d.now();
@@ -2285,20 +2340,61 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
             d.failed = true;
             return;
         }
+        let rx0 = m.rxq_len;
         m.pump_rx(d);
         m.pump_tx(d);
         path.ring_t += d.now().wrapping_sub(t_rings);
+        // New frames after a wake: announced by the interrupt, or found without one.
+        if m.rxq_len > rx0 {
+            path.irq_rx += (woke == 1) as u32;
+            path.other_rx += (woke == 2) as u32;
+        }
+        woke = 0;
         // WHY the max: the high water, for the measure.
         path.queued_most = path.queued_most.max(m.rxq_len as u32);
+        // Frames wait: the held doorbell answered (`wlan` op 9).
+        if m.rxq_len > 0 {
+            if let Some(t) = ring.take() {
+                out[0] = 1;
+                svc(3, t.as_ptr() as u64 - d.base, out.as_ptr() as u64 - d.base, 1, 0, 0);
+                path.rings += 1;
+            }
+        }
         let n = svc(2, d.cap(WLAN), msg.as_mut_ptr() as u64 - d.base, msg.len() as u64, tok.as_mut_ptr() as u64 - d.base, 1);
         if n == u64::MAX - 1 || n == ERR {
             // No request: a millisecond's sleep, not a spinning core (the driver runs from boot since init starts it, 2026-10-26), frames waiting or not. A call ends the sleep at once (the kernel wakes a polling server asleep between polls), so waiting frames lose nothing by it. Until 2026-11-11 the loop spun while frames waited, and with every worker core busy it spun thru whole 10 ms slices of poll misses while the IP stack, the one process that would take them, waited for a core (`diag sched`).
             path.sleeps += 1;
-            ferros_sys::sleep_until(ferros_sys::now() + d.freq / 1000);
+            if irq {
+                // Or, with the interrupt, a wait on the chip: ended by its MSI (0), a call or the backstop (2). A line that fired since the last wait answers at once.
+                match ferros_sys::irq_wait_world(d.cap(IRQ), d.now() + ((d.freq >> 10) << IRQ_BACKSTOP_LOG2)) {
+                    0 => {
+                        path.irq_wakes += 1;
+                        woke = 1;
+                        irq_clear(d);
+                        ferros_sys::irq_ack(d.cap(IRQ));
+                    }
+                    ERR => {
+                        // Not an interrupt grant after all: the sleep from here on.
+                        irq = false;
+                        d.put(b"irq: the wait was refused: sleeping a millisecond between passes\n");
+                    }
+                    _ => woke = 2,
+                }
+            } else {
+                ferros_sys::sleep_until(ferros_sys::now() + d.freq / 1000);
+            }
             continue;
         }
         let msg = unsafe { core::ptr::read_volatile(&msg) };
         let n = n as usize;
+        // The doorbell asked while no frame waits: its token kept, answered once frames come (above). An older one still kept is let go with 0 (its asker asks again), so one asker never holds two.
+        if msg.first() == Some(&9) && m.rxq_len == 0 {
+            if let Some(t) = ring.replace(tok) {
+                out[0] = 0;
+                svc(3, t.as_ptr() as u64 - d.base, out.as_ptr() as u64 - d.base, 1, 0, 0);
+            }
+            continue;
+        }
         let len = match msg.first() {
             Some(1) if n > 14 => {
                 path.singles += 1;
@@ -2373,6 +2469,12 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
             }
             Some(6) => m.status_reply(2, out),
             Some(1) => {
+                out[0] = 1;
+                1
+            }
+            // The doorbell with frames already waiting: rung at once.
+            Some(9) => {
+                path.rings += 1;
                 out[0] = 1;
                 1
             }
