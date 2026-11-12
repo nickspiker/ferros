@@ -3764,7 +3764,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
             0
         }
         SYS_SPAWN if f.x[2] & 2 != 0 => {
-            f.x[0] = kist_request(p, &p.read(f.x[0], (f.x[1] as usize).min(4096)), f.x[2] & 4 != 0);
+            f.x[0] = kist_request(p, &p.read(f.x[0], (f.x[1] as usize).min(4096)), f.x[2] & 4 != 0, f.x[2] & 32 != 0);
             0
         }
         SYS_SPAWN => {
@@ -5177,8 +5177,8 @@ fn kist_object(code: u8) -> Option<(Object, u32)> {
     })
 }
 
-/// `SYS_SPAWN` in kist mode (x2 bit 1; bit 2, a relaunch: a live process of that name killed first, NOTHING with none alive): [name length][name][the capsule's 32-byte vault address][the caller's Kists token, 32 bytes][n][n right codes, `EMPTY` for a slot said no to]. Queued for the service loop, which streams the capsule from the vault and checks every slot against the capsule's own declaration before anything runs (`spawn_kist`). 0 queued, NOTHING already running or starting, ERR refused (the reason on the console): no Kists right, a code outside the vocabulary, nobody present (a kist's data and rights are the person's), or another launch still streaming.
-fn kist_request(p: &Process, req: &[u8], replace: bool) -> u64 {
+/// `SYS_SPAWN` in kist mode (x2 bit 1; bit 2, a relaunch: a live process of that name killed first, NOTHING with none alive; bit 5, a stop: a live process of that name killed and nothing launched, 0 or NOTHING with none alive): [name length][name][the capsule's 32-byte vault address][the caller's Kists token, 32 bytes][n][n right codes, `EMPTY` for a slot said no to]. Queued for the service loop, which streams the capsule from the vault and checks every slot against the capsule's own declaration before anything runs (`spawn_kist`). 0 queued, NOTHING already running or starting, ERR refused (the reason on the console): no Kists right, a code outside the vocabulary, nobody present (a kist's data and rights are the person's), or another launch still streaming.
+fn kist_request(p: &Process, req: &[u8], replace: bool, stop: bool) -> u64 {
     let mut at = 0usize;
     let mut take = |n: usize| -> Vec<u8> { let s = req[at.min(req.len())..(at + n).min(req.len())].to_vec(); at += n; s };
     let nl = take(1).first().copied().unwrap_or(0) as usize;
@@ -5203,6 +5203,16 @@ fn kist_request(p: &Process, req: &[u8], replace: bool) -> u64 {
     let kk = k();
     if unsafe { DOMAIN_BASE }.and_then(|b| b(true)).is_none() {
         return refuse("nobody is present: a kist runs only for an attested person");
+    }
+    // A stop (the person's Stop on the kist's card, owner 2026-11-12; docs/KISTS.md "Items and the card"): the running kist killed, one shot dead, and nothing launched. No record is kept, as for a relaunch's kill: the person's own act, so its circle goes to not running, not stopped. Ahead of the launch slot, so a launch still streaming never holds a stop back.
+    // Only the process `kill_locked` would find by that name, and only when it is that kist (by its capsule): a kist named as a system process stops nothing of the system's.
+    if stop {
+        let theirs = kk.procs.iter().flatten().find(|q| q.name == name && !q.dying).is_some_and(|q| q.kist && q.capsule.as_ref().map(|c| &c[..]) == Some(&capsule[..]));
+        if !theirs {
+            return NOTHING;
+        }
+        kill_locked(&name);
+        return 0;
     }
     let slot = unsafe { &mut *(&raw mut KIST_LAUNCH) };
     if slot.is_some() {

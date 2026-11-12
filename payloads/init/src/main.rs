@@ -153,7 +153,13 @@ extern "C" fn launcher(grants: u64) -> ! {
         if n == ERR {
             continue;
         }
-        let answer = if n >= 33 && (msg[0] == OP_LAUNCH || msg[0] == OP_RELAUNCH) { launch(grants, msg[1..33].try_into().unwrap(), msg[0] == OP_RELAUNCH) } else { [REFUSED, 0, 0, 1] };
+        let answer = if n >= 33 && (msg[0] == OP_LAUNCH || msg[0] == OP_RELAUNCH) {
+            launch(grants, msg[1..33].try_into().unwrap(), msg[0] == OP_RELAUNCH)
+        } else if n >= 33 && msg[0] == OP_STOP {
+            [stop(grants, msg[1..33].try_into().unwrap()), 0, 0, 1]
+        } else {
+            [REFUSED, 0, 0, 1]
+        };
         ferros_sys::reply(&token, &answer[..answer[3] as usize]);
     }
 }
@@ -181,6 +187,25 @@ fn launch(grants: u64, capsule: [u8; 32], relaunch: bool) -> [u8; 4] {
         // Running on a surface (the kernel's `RUNNING_ON`): which, so the map can bring its window to the front.
         r if r != ferros_sys::ERR && r & ferros_sys::RUNNING_ON != 0 => [RUNNING, (r >> 8) as u8, r as u8, 3],
         _ => one(REFUSED),
+    }
+}
+
+/// The person's Stop on a kist's card (owner, 2026-11-12; docs/KISTS.md "Items and the card"): the kist found in their list by its capsule, its running process killed by the kernel, one shot dead, nothing launched. Answers alone (ferros_kist::launch): STOPPED, NOT_RUNNING, NOT_INSTALLED, UNREADABLE or REFUSED.
+fn stop(grants: u64, capsule: [u8; 32]) -> u8 {
+    use ferros_kist::launch::*;
+    let Some(list) = ferros_kist::store::read(cap(grants, S_KIST_LIST)) else { return UNREADABLE };
+    let Some(k) = list.by_capsule(&capsule) else { return NOT_INSTALLED };
+    // WHY: as a launch's: the name is the installer's ASCII, and a request holds 64 bytes of it.
+    let name = &k.name.as_bytes()[..k.name.len().min(64)];
+    match ferros_sys::stop_kist(grants, S_KISTS, name, &capsule) {
+        0 => {
+            console(grants, b"init: stopped ");
+            console(grants, name);
+            console(grants, b"\n");
+            STOPPED
+        }
+        ferros_sys::NOTHING => NOT_RUNNING,
+        _ => REFUSED,
     }
 }
 

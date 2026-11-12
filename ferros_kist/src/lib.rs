@@ -36,6 +36,8 @@ pub mod launch {
     pub const OP_LAUNCH: u8 = 0;
     /// [OP_RELAUNCH][address]: a running kist killed (one shot dead) and launched again with its answers as they now stand, after the person changed one (a revoke). STARTED relaunched; RUNNING when it was not running (nothing done); ASK, NOT_INSTALLED, REFUSED as for a launch.
     pub const OP_RELAUNCH: u8 = 1;
+    /// [OP_STOP][address]: the person's Stop on the kist's card (owner, 2026-11-12; docs/KISTS.md "Items and the card"): a running kist killed (one shot dead) and nothing launched, no record kept (the person's own act, as a relaunch's kill). STOPPED when it was running; NOT_RUNNING when it was not (nothing done); NOT_INSTALLED, REFUSED, UNREADABLE as for a launch.
+    pub const OP_STOP: u8 = 2;
     /// Queued: the kernel streams the capsule from the vault and starts it.
     pub const STARTED: u8 = 0;
     /// A process of that kist is alive, or starting. Followed by [surface u8][generation u8] when it runs on a surface of its own: its window, which the map brings to the front (display op 59, ferros_sys::window::front; owner, 2026-11-11: a running kist's circle tapped raises it).
@@ -48,6 +50,10 @@ pub mod launch {
     pub const REFUSED: u8 = 4;
     /// The person's list could not be read (nobody present).
     pub const UNREADABLE: u8 = 5;
+    /// OP_STOP: it was running, and is ended.
+    pub const STOPPED: u8 = 6;
+    /// OP_STOP: it was not running; nothing done.
+    pub const NOT_RUNNING: u8 = 7;
 
     /// Why a launch init answered STARTED did not start after all (owner, 2026-11-11: Mahere's circle tapped, nothing opened, and only the console said "the arc pool has no room for the kist"). The kernel's kist job keeps the reason per capsule until that kist next starts, and rings the Settings holder's word (ferros_sys::not_started).
     pub mod why {

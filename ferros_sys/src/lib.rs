@@ -1429,6 +1429,15 @@ fn spawn_with(grants: u64, name: &[u8], key: &[u8], slots: &[u64], flags: u64) -
 
 /// Launch a kist (KISTS.md; `SYS_SPAWN` kist mode): the capsule stored in the vault under its 32-byte address `capsule` (the `capsules.` scope) as a process called `name`, with one slot per want the capsule declares, in its order: the right's code (ferros_kist::RIGHTS) where the person granted it, G#FF (an empty slot) where they did not. The kernel makes every right's object itself from the Kists capability at grant `kists`, and refuses any right the capsule does not declare in that slot once it has read it. 0 queued (the kernel streams the capsule from the vault and starts it; the outcome goes to the console), `RUNNING_ON` | surface << 8 | generation already running on that surface (its window, display op 59), NOTHING already running with no surface or still starting, ERR refused (the reason on the console). At most 64 slots. `replace`: a live process of that name is killed first (one shot dead) and the kist launched again; with none alive, NOTHING and nothing launched.
 pub fn spawn_kist(grants: u64, kists: u64, name: &[u8], capsule: &[u8; 32], codes: &[u8], replace: bool) -> u64 {
+    kist_call(grants, kists, name, capsule, codes, 2 | (replace as u64) << 2)
+}
+
+/// Stop a running kist (`SYS_SPAWN` kist mode, x2 bit 5; the person's Stop on its card, docs/KISTS.md "Items and the card"): its live process of that name killed, one shot dead, and nothing launched; no record kept, as for a relaunch's kill (the person's own act). 0 stopped, NOTHING not running (nothing done), ERR refused (no Kists right at grant `kists`).
+pub fn stop_kist(grants: u64, kists: u64, name: &[u8], capsule: &[u8; 32]) -> u64 {
+    kist_call(grants, kists, name, capsule, &[], 2 | 1 << 5)
+}
+
+fn kist_call(grants: u64, kists: u64, name: &[u8], capsule: &[u8; 32], codes: &[u8], flags: u64) -> u64 {
     let mut req = [0u8; 1 + 64 + 32 + 32 + 1 + 64];
     assert!(name.len() <= 64 && codes.len() <= 64, "spawn_kist: a name or a list of slots longer than a request holds");
     let mut at = 0;
@@ -1445,7 +1454,7 @@ pub fn spawn_kist(grants: u64, kists: u64, name: &[u8], capsule: &[u8; 32], code
     req[at] = codes.len() as u8;
     req[at + 1..at + 1 + codes.len()].copy_from_slice(codes);
     at += 1 + codes.len();
-    svc(nr::SPAWN, off(req.as_ptr()), at as u64, 2 | (replace as u64) << 2, 0, 0)
+    svc(nr::SPAWN, off(req.as_ptr()), at as u64, flags, 0, 0)
 }
 
 /// An install's stages as the kernel tells them on the caller's word (process.rs `install_tell`): the stage in bits 56-63, below it the bytes read so far, or the reason it was refused.
