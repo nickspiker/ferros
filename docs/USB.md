@@ -84,6 +84,27 @@ The USB device controller (DWC3 on HSI0) and Photon Transport, the bridge's link
    - Recovery without the bridge: the killswitch boots slot b again; volume down at the gate gives Android once.
    - Then the commands move out one at a time, the store first since it is already a clean bytes-to-bytes function.
 
+## Offering a kist (2026-11-11)
+
+The owner, 2026-11-11: "how do we install kists over USB? Can we make a standard method so the end user doesn't have to get them from the [catalog]", then "Just seems to me that we should just make a proper checked path and start using it", and "the proper term for installing a kist is stow".
+The one PT capability that is no development door: `ferros.kist.offer` (ferros_pt `caps::OFFER`; its hash is blake3 of the name, as every capability's).
+A production build answers it beside a reboot and a plain DIAG, because nothing it carries goes anywhere the person does not say Stow to on the glass (KISTS.md "Stowing").
+Its states and reasons are ferros_kist `offer`, shared by the kernel, the installer, the map and the host tool.
+
+| Op | Params | Answer |
+|---|---|---|
+| Write | [capsule's blake3 32][offset u64 LE][more u8][bytes] | [0] kept; or [status][words] |
+| Exec | [capsule 32][length u64 LE] | [0] offered; or [status][words] |
+| Read | [capsule 32][the state last seen u8] | [state][why][flags], held |
+
+- **Write** carries a part (at most `offer::PART`, 4 MiB, under the kernel's 6 MiB receive region) into the device's `capsules.` under the capsule's address, the bridge's part form of `store` underneath (a `VaultJob` put, now built into production too). Parts come in order from offset 0; a part at 0 starts the capsule afresh. A part that comes while a kist job holds the kernel's channel to the vault waits for it, its answer with it.
+- **Exec** offers the capsule once its last part (more 0) ended at that length: the kernel keeps it (process.rs `OFFER`, one at a time) and rings the installer's offers' bell.
+- **Read** answers at once when the state is not the one last seen, else holds the answer until the installer tells another state or `offer::HOLD_SECONDS` (8 s) pass, then answers it as it stands. WHY the lease: this USB driver gives up on a kernel reply after 16 s (payloads/usb `give_up`), and while it waits it asks the kernel for the reply on its own short sleep, as it does for every reply (the store's long puts too). The host asks again at once; it never waits on a timer of its own.
+- **Statuses** (Write, Exec): 1 nobody present (the identity half of the vault is closed: attest first), 2 another offer is waiting on the person, 3 not as the protocol says (a part out of order, an offer not carried in whole), 4 no installer running (or the vault process not serving), anything else the vault's own (a store reply's status).
+- **States** (Read): 0 offered, 1 checking, 2 asking (on the glass), 3 stowed, 4 refused (`why`, `offer::words`), 5 cancelled, 6 gone (another replaced it, the device restarted, or the person left: an offer not answered never outlives the person present). Flags bit 0: native code, unchecked (development builds only).
+- **The installer's side** is `SYS_OFFER` (41), for the holder of the Install right alone: op 0 the offers' doorbell, op 1 take the offer not yet ended (a restarted installer takes it again), op 2 tell its state.
+- **The host's side** is tools/ferros-send (`ferros send <capsule>`), on tools/ferros-link, the link the bridge uses too.
+
 ## Facts
 
 | What | Value |

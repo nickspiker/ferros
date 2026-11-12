@@ -78,6 +78,7 @@ A two-bit field, value = the chip's vitality on the four-pair redundancy scale (
 - **ring** — only for things that are literally circular: the vault's on-disk layout, and the two's-complement address space ISOMEM wraps (ring memory).
 - **grant** — a permission held by a process; a process's grants are its capability space.
 - **capsule** — the signed binary as the developer ships it ([ORACLE.md](ORACLE.md)); installed, it becomes a kist. What a process is recognised to be is its *ihi*, not an "identity" of its own.
+- **stow**: to install a kist (owner, 2026-11-11: "the proper term for installing a kist is stow"): the capsule checked by the device's one installer, whatever carried it (the directory, a USB offer with `ferros send`), and put in the person's list once they say Stow ([KISTS.md](KISTS.md), "Stowing"). Older text and code still say "install".
 - **levels** — numbered from 0 = most fundamental, as in PT where L0 is the medium. ARM's exception levels count the other way (EL0 least privileged), so EL names appear only where code touches the hardware.
 
 ---
