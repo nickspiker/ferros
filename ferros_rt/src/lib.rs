@@ -10,12 +10,13 @@ pub mod cabi;
 pub mod console;
 pub mod futex;
 pub mod getrandom;
-pub mod heap;
 pub mod layout;
+pub mod lock;
 pub mod random;
 pub mod start;
 pub mod sys;
 pub mod thread;
 pub mod time;
+pub mod tlsf;
 
 pub use start::{cap, exit, grants, input};
