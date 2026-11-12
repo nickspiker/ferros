@@ -2,7 +2,7 @@
 //!
 //! - `kistcat build --key <secret> --out <dir> [--web <web/index.html>] ENTRY...` writes `<dir>/kists.vsf` (signed by the project key with every egg), `<dir>/index.html` (the page for kists.fgtw.org) and, with `--web`, the list on ferros.org between its markers, then prints the wrangler commands that publish them. It uploads nothing.
 //! - `kistcat build --unsigned ...` in place of `--key`: the directory with NO signature, while the project key is not chosen (owner, 2026-11-10: it waits for the FGTW kaitiakitanga). The device reads it unchecked and its Kists page says so; the page says so too.
-//! - An ENTRY is a local capsule, `--capsule <file> --about TEXT [--icon PATH]`: read for its developer key, option, name, developer's name, version (its signed declaration's, `kistcat kist --version`), blake3 and size, with every egg verified against the developer bundle it carries (or Photon's release bundle), as the device's installer checks it; listed at `/capsules/<blake3>.vsf` on kists.fgtw.org.
+//! - An ENTRY is a local capsule, `--capsule <file> --about TEXT [--icon PATH]`: read for its developer key, option, name, developer's name, version (its signed declaration's, `kistcat kist --version`), blake3 and size, with every egg verified against the developer bundle it carries (or Photon's release bundle), as the device's stower checks it; listed at `/capsules/<blake3>.vsf` on kists.fgtw.org.
 //! - `kistcat kist ...`: a kist signed by its developer's own key (below, `fn kist`).
 //! - Or a developer's manifest, `--manifest <http URL> --name NAME --option HEX --about TEXT [--platform P] [--arch A] [--icon PATH]`: fetched over plain HTTP at build time, every egg verified against the developer's pinned bundle, and its artefact P/A (ferros/arm64 by default) read for the capsule's blake3, size and version. The entry links the manifest rather than copying the artefact's address: the device fetches the manifest and resolves the artefact itself, and the blake3 recorded here is what it must match.
 //! - An entry that cannot be listed (a capsule signed before every-egg kists, a manifest with no ferros artefact yet) is skipped with a warning; a capsule file that is not there stops the build.
@@ -147,7 +147,7 @@ fn sign(kists: &[Entry], made: i64, key: &SigningBundle) -> Result<Vec<u8>, Stri
     fgtw::release::sign_release(unsigned, key)
 }
 
-/// A local capsule as an entry: every egg verified as the device's installer verifies it (ferros_kist `capsule::admit` with a person's list that pins nothing: against the developer bundle the capsule carries, or Photon's release bundle), its identity, name and version from its own declaration. A capsule the device would refuse, or one without a version, is not listed.
+/// A local capsule as an entry: every egg verified as the device's stower verifies it (ferros_kist `capsule::admit` with a person's list that pins nothing: against the developer bundle the capsule carries, or Photon's release bundle), its identity, name and version from its own declaration. A capsule the device would refuse, or one without a version, is not listed.
 fn capsule_entry(c: &[u8], about: String, icon: Option<String>) -> Result<Entry, String> {
     let (signer, eggs, file_hash) = vsf::verification::header_eggs(c).map_err(|e| format!("not signed with eggs ({e}); a kist carries every scheme's signature since 2026-11-10, re-sign it"))?;
     if fgtw::pq::egg_mask(&eggs) != fgtw::release::RELEASE_MASK {
@@ -634,7 +634,7 @@ fn page(d: &Directory) -> String {
    <meta charset="utf-8">
    <meta name="viewport" content="width=device-width, initial-scale=1">
    <title>kists</title>
-   <meta name="description" content="Kists: apps for ferros, listed by anyone, installed with no account. The list vouches for nothing; your device checks every kist itself.">
+   <meta name="description" content="Kists: apps for ferros, listed by anyone, stowed with no account. The list vouches for nothing; your device checks every kist itself.">
    <style>
 {STYLE}{KISTS_STYLE}   </style>
 </head>
@@ -645,7 +645,7 @@ fn page(d: &Directory) -> String {
       </nav>
 
       <h1>kists<span>.fgtw.org</span></h1>
-      <p class="thesis">Apps for ferros, listed by anyone,<br>installed with no account.</p>
+      <p class="thesis">Apps for ferros, listed by anyone,<br>stowed with no account.</p>
 
       <table class="ledger">
          <tr><td>Kists listed</td><td>G#{count:X}</td></tr>
@@ -658,7 +658,7 @@ fn page(d: &Directory) -> String {
       <p>Kists run on <a href="https://ferros.org/">ferros</a> today. A kist is packed the same for every platform; Linux, Android and macOS will run them thru a host app once kists carry portable code, and none is out yet. For now, use ferros.</p>
 
       <h2>What this list is</h2>
-      <p>Anyone may list a kist, and nobody needs an account to install one. The list vouches for nothing: your device checks each kist against its hash here and against its developer's signature when it installs it, and trusts a developer's keys from their first kist on, refusing any kist under their key signed otherwise. {signed}</p>
+      <p>Anyone may list a kist, and nobody needs an account to stow one. The list vouches for nothing: your device checks each kist against its hash here and against its developer's signature when it stows it, and trusts a developer's keys from their first kist on, refusing any kist under their key signed otherwise. {signed}</p>
       <p>No fees, no ads, no stars. Measures will come, many of them, and never a single score.</p>
    </main>
 {script}</body>
@@ -828,11 +828,11 @@ mod tests {
     }
 }
 
-/// `kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf>`: a kist signed by its developer's own key (owner, 2026-11-10: trust on first install).
+/// `kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf>`: a kist signed by its developer's own key (owner, 2026-11-10: trust on first stow).
 /// - The key is the developer's secret (`devkey new`: section `developer_key` { label a, seed kge }); the bundle is derived from it under its label, used here and dropped, and nothing of it is printed or copied.
-/// - The code is a sandboxed image from tools/ferros-masked-build.sh (its flat .bin, and its text length: the .textlen file beside it), as the bridge's `capsule --masked --text-len` takes them; the network installer refuses native code.
+/// - The code is a sandboxed image from tools/ferros-masked-build.sh (its flat .bin, and its text length: the .textlen file beside it), as the bridge's `capsule --masked --text-len` takes them; the network stower refuses native code.
 /// - `--record`: the developer's public record (`devkey new --record`), checked with every egg and that it names this key; its name goes into the declaration as `developer`, which the directory lists and the person's pin keeps.
-/// - The capsule is built by ferros_kist::capsule (the bridge's builder too): the declaration, the developer's whole public bundle (`kb`), the code, an egg per scheme; then checked as the device's installer checks it before it is written.
+/// - The capsule is built by ferros_kist::capsule (the bridge's builder too): the declaration, the developer's whole public bundle (`kb`), the code, an egg per scheme; then checked as the device's stower checks it before it is written.
 fn kist(args: &[String]) {
     let mut key: Option<PathBuf> = None;
     let mut image: Option<PathBuf> = None;
@@ -875,10 +875,10 @@ fn kist(args: &[String]) {
     let (Some(key_path), Some(image_path), Some(text), Some(name), Some(option), Some(version), Some(out)) = (key, image, text, name, option, version, out) else {
         fail("kist needs --key, --masked, --text-len, --name, --option, --version and --out")
     };
-    // The text the no_std installer reads is ASCII (`a`): a name or reason it could not read stops here.
+    // The text the no_std stower reads is ASCII (`a`): a name or reason it could not read stops here.
     let ascii = |what: &str, s: &str| {
         if s.is_empty() || !s.bytes().all(|b| (0x20..0x7F).contains(&b)) {
-            fail(format!("{what} {s:?}: printable ASCII (the device's installer is no_std)"));
+            fail(format!("{what} {s:?}: printable ASCII (the device's stower is no_std)"));
         }
     };
     ascii("the name", &name);

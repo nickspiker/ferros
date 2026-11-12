@@ -229,7 +229,7 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
 enum VaultJob {
     /// A value read whole: its full name, what has come so far.
     Get { full: alloc::string::String, got: alloc::vec::Vec<u8> },
-    /// A value written in pieces from the command's parameters (the command kept beside the job: `vault_cmd` in `run`): its full name (its scope's name, when `addr` names it by a 32-byte address), where the value starts in them, the next offset into it; and for a value larger than one command carries (an installed kist's capsule), where this command's part starts in the value and whether more commands follow.
+    /// A value written in pieces from the command's parameters (the command kept beside the job: `vault_cmd` in `run`): its full name (its scope's name, when `addr` names it by a 32-byte address), where the value starts in them, the next offset into it; and for a value larger than one command carries (a stowed kist's capsule), where this command's part starts in the value and whether more commands follow.
     Put { full: alloc::string::String, addr: Option<[u8; 32]>, from: usize, at: usize, base: u64, more: bool },
     Remove { full: alloc::string::String },
     /// Every name: the kernel's own vault's first (already in `out`, after its status byte), then each scope's from the vault process in turn, `scope` the one being read, `at` into its listing, `part` its listing so far.
@@ -248,7 +248,7 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
     let name = |b: &[u8]| core::str::from_utf8(b).ok().filter(|k| crate::process::vault_name(k).is_some()).map(alloc::string::String::from);
     let job = match op {
         ferros_pt::Op::Write => {
-            // [key length u16 BE][key][value]. Bit 15 of the length: a part of a larger value, [offset u64 LE][more u8] after the key. Bit 14: the key is a scope's prefix and a 32-byte address (an installed kist's capsule, by its blake3).
+            // [key length u16 BE][key][value]. Bit 15 of the length: a part of a larger value, [offset u64 LE][more u8] after the key. Bit 14: the key is a scope's prefix and a 32-byte address (a stowed kist's capsule, by its blake3).
             let k = u16::from_be_bytes([*params.first()?, *params.get(1)?]);
             let (part, raw, klen) = (k & 1 << 15 != 0, k & 1 << 14 != 0, (k & 0x3FFF) as usize);
             let key = params.get(2..2 + klen)?;
@@ -417,7 +417,7 @@ fn vault_job_step(job: &mut VaultJob, params: &[u8], store: &mut Option<ShimStor
     vault_job_call(job, params).err()
 }
 
-/// A kist's capsule streamed from the vault process through the kernel's channel a transfer a call: the first transfers into `head` until the code's header is in (`kist_need` sizes the arc from it, masked or native as its code is), then straight into the arc at the code offset, as the bridge's streamed spawn lands its pieces. For a launch init asked for (process.rs `kist_request`), `spawn_kist` then checks it (a masked kist against its seal in `sealed`) and builds the process. For an install the installer asked for (`install_request`), the checker and the seal follow, a stage a pass, each told to the installer (`install_tell`).
+/// A kist's capsule streamed from the vault process through the kernel's channel a transfer a call: the first transfers into `head` until the code's header is in (`kist_need` sizes the arc from it, masked or native as its code is), then straight into the arc at the code offset, as the bridge's streamed spawn lands its pieces. For a launch init asked for (process.rs `kist_request`), `spawn_kist` then checks it (a masked kist against its seal in `sealed`) and builds the process. For a stow the stower asked for (`stow_request`), the checker and the seal follow, a stage a pass, each told to the stower (`stow_tell`).
 struct KistJob {
     why: KistWhy,
     capsule: [u8; 32],
@@ -430,20 +430,20 @@ struct KistJob {
     t0: u64,
     /// Its first bytes are in and its arc waits for one that is coming back (`kist_arc`).
     waiting: bool,
-    /// An install read whole and checked, waiting for its seal on the next pass: the gate's word on it, its modes and its code's span.
+    /// A stow read whole and checked, waiting for its seal on the next pass: the gate's word on it, its modes and its code's span.
     checked: Option<(crate::oracle::Located, crate::oracle::Modes, usize, usize)>,
-    /// An install read whole, waiting for the checker on the next pass.
+    /// A stow read whole, waiting for the checker on the next pass.
     read: bool,
-    /// An install refused and already told why.
+    /// A stow refused and already told why.
     told: bool,
 }
 
 enum KistWhy {
     Launch(crate::process::KistLaunch),
-    Install(crate::process::KistInstall),
+    Stow(crate::process::KistStow),
 }
 
-/// What a kist job came to: a launch built, an install's seal for the `sealed` list, or a stow's native code taken unchecked on a development build (`KistInstall::native_ok`).
+/// What a kist job came to: a launch built, a stow's seal for the `sealed` list, or a stow's native code taken unchecked on a development build (`KistStow::native_ok`).
 enum KistDone {
     Launched,
     Sealed([u8; 32]),
@@ -481,24 +481,24 @@ fn kist_arc(job: &mut KistJob) -> Result<bool, KistFault> {
     Ok(true)
 }
 
-/// An install told a stage, if it is one.
+/// A stow told a stage, if it is one.
 fn kist_tell(job: &KistJob, stage: u64, value: u64) {
-    if let KistWhy::Install(i) = &job.why {
-        crate::process::install_tell(i, stage, value);
+    if let KistWhy::Stow(i) = &job.why {
+        crate::process::stow_tell(i, stage, value);
     }
 }
 
-/// The kist job after its last bytes or its arc: a launch's process built once the capsule is whole; an install told it is read and its checker due on the next pass; else the next read.
+/// The kist job after its last bytes or its arc: a launch's process built once the capsule is whole; a stow told it is read and its checker due on the next pass; else the next read.
 fn kist_next(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
     if job.got >= job.total {
         let Some(arc) = job.arc.take() else { return Some(Err((why::READ, "the capsule ended before its code"))) };
         return match &job.why {
             KistWhy::Launch(l) => Some(crate::process::spawn_kist(l, arc, job.total, &job.sealed).map(|()| KistDone::Launched)),
-            KistWhy::Install(_) => {
+            KistWhy::Stow(_) => {
                 job.arc = Some(arc);
                 job.read = true;
-                kist_tell(job, crate::process::INSTALL_CHECKING, 0);
-                // The checker on the next pass, so the installer shows the stage before the work: the loop goes round at once (no wait for an event).
+                kist_tell(job, crate::process::STOW_CHECKING, 0);
+                // The checker on the next pass, so the stower shows the stage before the work: the loop goes round at once (no wait for an event).
                 unsafe { core::arch::asm!("sev") };
                 None
             }
@@ -510,20 +510,20 @@ fn kist_next(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
     None
 }
 
-/// An install's stage after its reading, one a pass: the checker (SANDBOX.md: once, at install), then the seal. Done: its seal, for the service loop to keep in `sealed`.
-fn install_step(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
+/// A stow's stage after its reading, one a pass: the checker (SANDBOX.md: once, at its stow), then the seal. Done: its seal, for the service loop to keep in `sealed`.
+fn stow_step(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
     let arc = job.arc?;
     let code = match job.checked.take() {
-        None => match crate::process::install_check(&arc, job.total, &job.capsule) {
+        None => match crate::process::stow_check(&arc, job.total, &job.capsule) {
             Ok(c) => {
                 job.checked = Some(c);
-                kist_tell(job, crate::process::INSTALL_SEALING, 0);
+                kist_tell(job, crate::process::STOW_SEALING, 0);
                 unsafe { core::arch::asm!("sev") };
                 return None;
             }
             Err(c) => c,
         },
-        Some((g, m, co, cl)) => match crate::process::install_seal(&arc, &g, &m, co, cl) {
+        Some((g, m, co, cl)) => match crate::process::stow_seal(&arc, &g, &m, co, cl) {
             Ok(seal) => {
                 job.arc = None;
                 crate::process::with_lock(|| crate::process::arc_free(arc));
@@ -532,17 +532,17 @@ fn install_step(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
             Err(c) => c,
         },
     };
-    kist_tell(job, crate::process::INSTALL_REFUSED, code);
+    kist_tell(job, crate::process::STOW_REFUSED, code);
     job.told = true;
     Some(Err((why::CHECKS, "refused (the reason is on the console)")))
 }
 
-/// One step of the kist job: waiting for its arc, an install's next stage once it is read, or the answer to its last read if it has come, then its next read. Some(the outcome) once it is done; the arc is the process's or back in the pool by then.
+/// One step of the kist job: waiting for its arc, a stow's next stage once it is read, or the answer to its last read if it has come, then its next read. Some(the outcome) once it is done; the arc is the process's or back in the pool by then.
 fn kist_step(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
     use crate::process::{ERR, NOTHING};
     let r = (|| {
         if job.read {
-            return install_step(job);
+            return stow_step(job);
         }
         if job.waiting {
             return match kist_arc(job) {
@@ -559,7 +559,7 @@ fn kist_step(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
             Err(()) => return Some(Err((why::READ, "the vault process ended while the capsule was read"))),
         };
         match value {
-            NOTHING => return Some(Err((why::NOT_HERE, "no such capsule in the vault (install it first)"))),
+            NOTHING => return Some(Err((why::NOT_HERE, "no such capsule in the vault (stow it first)"))),
             ERR => return Some(Err((why::READ, "the vault process could not read the capsule"))),
             _ => {}
         }
@@ -578,14 +578,14 @@ fn kist_step(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
                 job.head.extend_from_slice(&bytes);
                 job.got += bytes.len();
                 if job.head.len() >= job.total.min(1 << 16) {
-                    // An install's native code is known from its first bytes: refused there (never installed from the network, SANDBOX.md), or for a stow on a development build taken unchecked (`native_ok`), with nothing more read and no arc asked for. A production build refuses it either way.
-                    if let KistWhy::Install(i) = &job.why {
+                    // A stow's native code is known from its first bytes: refused there (never stowed from the network, SANDBOX.md), or for a stow on a development build taken unchecked (`native_ok`), with nothing more read and no arc asked for. A production build refuses it either way.
+                    if let KistWhy::Stow(i) = &job.why {
                         if !crate::process::kist_masked(&job.head, job.total) {
                             if i.native_ok && !cfg!(ferros_production) {
                                 return Some(Ok(KistDone::Native));
                             }
-                            crate::process::push_console(b"kist install: native code: a development build is not installed from the network, and a production build stows none\n");
-                            kist_tell(job, crate::process::INSTALL_REFUSED, crate::process::INSTALL_WHY_NATIVE);
+                            crate::process::push_console(b"kist stow: native code: a development build is not stowed from the network, and a production build stows none\n");
+                            kist_tell(job, crate::process::STOW_REFUSED, crate::process::STOW_WHY_NATIVE);
                             job.told = true;
                             return Some(Err((why::CHECKS, "native code")));
                         }
@@ -605,9 +605,9 @@ fn kist_step(job: &mut KistJob) -> Option<Result<KistDone, KistFault>> {
                 job.got += bytes.len();
             }
         }
-        // The installer's progress bar: told at each mebibyte read, not each transfer.
+        // The stower's progress bar: told at each mebibyte read, not each transfer.
         if before >> 20 != job.got >> 20 {
-            kist_tell(job, crate::process::INSTALL_READING, job.got as u64);
+            kist_tell(job, crate::process::STOW_READING, job.got as u64);
         }
         kist_next(job)
     })();
@@ -665,7 +665,7 @@ static RELEASE_RESET: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// The drops of the released person's domains in the vault process (process.rs `vault_stamp_drops`), each a stamp carrying that domain's keys, waiting for the service loop to send them before the restart. Under the kernel lock (filled in a syscall, taken by the loop).
 static mut RELEASE_DROPS: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
 
-/// The `android` switch (process.rs POWERS): accepted only on a device that allows Android and while a person is present (the vault's identity class unlocked: the kernel's own state, set by an attest through SYS_UNLOCK, never a process's word). Nothing in the base OS holds it (owner, 2026-11-04: nothing is built in but system settings): it is for an Android launcher a person installs, and this check is the lock whoever holds it. The service loop then does the gate's Android path: ANDROID_ONCE, slot a, the reset with its scrub (`diag android`'s sequence).
+/// The `android` switch (process.rs POWERS): accepted only on a device that allows Android and while a person is present (the vault's identity class unlocked: the kernel's own state, set by an attest through SYS_UNLOCK, never a process's word). Nothing in the base OS holds it (owner, 2026-11-04: nothing is built in but system settings): it is for an Android launcher a person stows, and this check is the lock whoever holds it. The service loop then does the gate's Android path: ANDROID_ONCE, slot a, the reset with its scrub (`diag android`'s sequence).
 pub fn android_request(on: bool) -> bool {
     let present = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).is_some_and(|s| s.unlocked());
     let ok = on && present && ANDROID_ALLOWED.load(core::sync::atomic::Ordering::Relaxed) == 2;
@@ -986,9 +986,9 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Power(b"panel"), Power(b"panel-vddd"),
         // Kists (KISTS.md, 2026-11-08): 104 the right to launch them (each right a kist is granted is made by the kernel from it: init holds no other grant for them), 105 serve `launch` (the map asks init to launch one), 106 use `launch` (the map's), 107 the vault scope `kists.` (the person's list and answers: init reads it, the map shows it and writes the answers). These were the GPU service's until it got its own list (`gpu_grants`), started by the kernel as the vault and GPS are: the page holds 108 slots.
         Kists, Serve(b"launch"), Use(b"launch"), Store(b"kists"),
-        // 108 use `kists`, the installer's endpoint (payloads/kists, which the kernel starts with its own list, `kists_grants`): the map's Kists page installs, updates and uninstalls through it. The last slot the page holds (0 the console, 1 to 108).
+        // 108 use `kists`, the stower's endpoint (payloads/kists, which the kernel starts with its own list, `kists_grants`): the map's Kists page stows, updates and unstows through it. The last slot the page holds (0 the console, 1 to 108).
         Use(b"kists"),
-        // The `android` switch (android_request) is in no one's list: the base OS has no Android launcher (owner, 2026-11-04: nothing built in but system settings). It goes to a launcher a person installs, once installing exists.
+        // The `android` switch (android_request) is in no one's list: the base OS has no Android launcher (owner, 2026-11-04: nothing built in but system settings). It goes to a launcher a person stows, once stowing exists.
     ]
 }
 
@@ -1041,10 +1041,10 @@ fn gpu_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![Dma(b"gpu-regs"), Dma(b"gpu-mem"), Store(b"gpu"), Irq(b"gpu-job"), Dma(b"arena"), Serve(b"gpu"), Dma(b"surfaces"), Irq(b"gpu-mmu")]
 }
 
-/// The installer's grants in its slot order (payloads/kists; docs/KISTS.md "Install"): 1 use udp (the network, plain HTTP), 2 the vault scope `capsules.` (it stores what it fetched, by content address), 3 the vault scope `kists.` (the person's list), 4 serve `kists` (the map's Kists page), 5 use fgtw (the identity service's doorbell: a restore follows the person's space), 6 the Install right (the kernel checks and seals what it stored). Its own list, as the GPS driver's: init's page is full, and the kernel starts it once a person has attested (the list is theirs).
+/// The stower's grants in its slot order (payloads/kists; docs/KISTS.md "The stower"): 1 use udp (the network, plain HTTP), 2 the vault scope `capsules.` (it stores what it fetched, by content address), 3 the vault scope `kists.` (the person's list), 4 serve `kists` (the map's Kists page), 5 use fgtw (the identity service's doorbell: a restore follows the person's space), 6 the Stow right (the kernel checks and seals what it stored). Its own list, as the GPS driver's: init's page is full, and the kernel starts it once a person has attested (the list is theirs).
 fn kists_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     use crate::process::Grant::*;
-    alloc::vec![Use(b"udp"), Store(b"capsules"), Store(b"kists"), Serve(b"kists"), Use(b"fgtw"), Install]
+    alloc::vec![Use(b"udp"), Store(b"capsules"), Store(b"kists"), Serve(b"kists"), Use(b"fgtw"), Stow]
 }
 
 /// The torch's grants in its slot order (payloads/torch, docs/TORCH.md): 1 serve torch, 2 hsi2c_14 (the LM3644's bus), 3 the `torch` switch. Its own list, as the GPS driver's: init's page is full, and the kernel starts it when a call on `torch` finds no server (process.rs `ON_DEMAND`).
@@ -1083,7 +1083,7 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
         b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103, 20],
         b"touch" => &[14, 15, 16, 23, 91],
-        // 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page), 6 the vault scope `kists.` (the person's kists and answers), 7 use launch, 8 use kists (the installer: the Kists page) (payloads/map).
+        // 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`, 5 use fgtw (the Fleet page), 6 the vault scope `kists.` (the person's kists and answers), 7 use launch, 8 use kists (the stower: the Kists page) (payloads/map).
         b"map" => &[17, 18, 19, 20, 47, 107, 106, 108],
         b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83],
         b"ip" => &[44, 45, 41, 52],
@@ -1132,7 +1132,7 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
         let refused: Option<&[u8]> = match name {
             b"fgtw" if !person => Some(b"not started, nobody has attested: "),
             b"gps" if !person => Some(b"not started, GPS is locked until a person attests: "),
-            b"kists" if !person => Some(b"not started, nobody has attested (the installer keeps a person's list): "),
+            b"kists" if !person => Some(b"not started, nobody has attested (the stower keeps a person's list): "),
             b"map" if !attached => Some(b"not started, this device is not bound to an attested identity: "),
             _ => None,
         };
@@ -1879,11 +1879,11 @@ pub fn run(mut b: Boot) -> ! {
     let mut radios_applied = crate::process::pref(crate::process::PREF_RADIOS_OFF) & 0x1F;
     // The GPS driver started for the claims held now (process.rs CLAIMS): set as the first claim starts it, cleared as the last one goes and stops it. A driver that ends by itself while claimed is not started again until the claims go to none and back.
     let mut gps_on = false;
-    // ARC_FREES when the driver's spawn was last refused for want of an arc, as the installer's below: tried again once an arc has come back.
+    // ARC_FREES when the driver's spawn was last refused for want of an arc, as the stower's below: tried again once an arc has come back.
     let mut gps_refused_at: Option<u64> = None;
-    // The installer (payloads/kists) started for the person present.
+    // The stower (payloads/kists) started for the person present.
     let mut kists_started = false;
-    // ARC_FREES when the installer's spawn was last refused for want of an arc (the 8a, 2026-11-10: "arc pool exhausted" at attest, beside the wallpaper's start, and no installer for the rest of the boot): tried again once an arc has come back since.
+    // ARC_FREES when the stower's spawn was last refused for want of an arc (the 8a, 2026-11-10: "arc pool exhausted" at attest, beside the wallpaper's start, and no stower for the rest of the boot): tried again once an arc has come back since.
     let mut kists_refused_at: Option<u64> = None;
     // The panel's VCI as ABL or Android left it (SYS_FACTS 81): the display server reads it to know a panel it must power up (state B).
     crate::panel_power::read_state();
@@ -1949,7 +1949,7 @@ pub fn run(mut b: Boot) -> ! {
             radios_applied = radios_off;
         }
         let person = store.as_ref().is_some_and(|s| s.unlocked());
-        // The installer (payloads/kists), once each time a person is in: it serves the map's Kists page and fetches back the capsules a restored list names. Its grants are its own (`kists_grants`), init's page being full.
+        // The stower (payloads/kists), once each time a person is in: it serves the map's Kists page and fetches back the capsules a restored list names. Its grants are its own (`kists_grants`), init's page being full.
         let frees = crate::process::ARC_FREES.load(core::sync::atomic::Ordering::Acquire);
         if !person {
             // The person left: an offer they had not answered is gone, never shown to whoever attests next.
@@ -1965,7 +1965,7 @@ pub fn run(mut b: Boot) -> ! {
                 let mut rep = alloc::vec::Vec::new();
                 restart(&mut store, b"kists", &mut rep);
                 crate::flashlog::line(&alloc::format!("kists after attest: {}", core::str::from_utf8(&rep).unwrap_or("").trim_end()));
-                // Refused for room, and only that (an installer that started and died is not tried again): the next arc back (a process ending) brings another try.
+                // Refused for room, and only that (an stower that started and died is not tried again): the next arc back (a process ending) brings another try.
                 if rep.windows(18).any(|w| w == b"arc pool exhausted") {
                     kists_started = false;
                     kists_refused_at = Some(frees);
@@ -1990,7 +1990,7 @@ pub fn run(mut b: Boot) -> ! {
                 let mut rep = alloc::vec::Vec::new();
                 restart(&mut store, b"gps", &mut rep);
                 crate::flashlog::line(&alloc::format!("gps claimed (A#{} claims): {}", crate::process::gps_claims(), core::str::from_utf8(&rep).unwrap_or("").trim_end()));
-                // Refused for room, as the installer's above: the next arc back brings another try while the claim stands.
+                // Refused for room, as the stower's above: the next arc back brings another try while the claim stands.
                 if rep.windows(18).any(|w| w == b"arc pool exhausted") {
                     gps_on = false;
                     gps_refused_at = Some(frees);
@@ -2084,7 +2084,7 @@ pub fn run(mut b: Boot) -> ! {
                 }
             }
         }
-        // A host's read of the offer's state, held until the installer tells another state or its lease ends (ferros_kist::offer::HOLD_SECONDS, inside the USB driver's 16 s): then answered, with the state as it stands.
+        // A host's read of the offer's state, held until the stower tells another state or its lease ends (ferros_kist::offer::HOLD_SECONDS, inside the USB driver's 16 s): then answered, with the state as it stands.
         let offer_waits = match offer_hold {
             Some((capsule, seen, until)) => {
                 let s = crate::process::offer_state(&capsule);
@@ -2131,18 +2131,18 @@ pub fn run(mut b: Boot) -> ! {
         // A kist launch init asked for (KISTS.md): started once the kernel's channel is free (no bridge store command or offered part, no release under way), then a read a pass until the capsule is in its arc (`kist_step`).
         let bridge_holds_channel = vault_job.is_some();
         if kist_job.is_none() && !bridge_holds_channel && !RELEASE_RESET.load(core::sync::atomic::Ordering::Acquire) {
-            // A launch first (a person waiting at a circle), then an install (the installer waits on its word).
-            let why = crate::process::kist_take().map(KistWhy::Launch).or_else(|| crate::process::install_take().map(KistWhy::Install));
+            // A launch first (a person waiting at a circle), then a stow (the stower waits on its word).
+            let why = crate::process::kist_take().map(KistWhy::Launch).or_else(|| crate::process::stow_take().map(KistWhy::Stow));
             if let Some(why) = why {
                 let capsule = match &why {
                     KistWhy::Launch(l) => l.capsule,
-                    KistWhy::Install(i) => i.capsule,
+                    KistWhy::Stow(i) => i.capsule,
                 };
                 // The seals a masked kist's launch is checked against, read once for the job under the kernel lock, as every UFS command.
                 let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
                 let job = KistJob { why, capsule, sealed, total: 0, head: alloc::vec::Vec::new(), arc: None, got: 0, t0: cntpct(), waiting: false, checked: None, read: false, told: false };
                 if kist_call(&job) {
-                    kist_tell(&job, crate::process::INSTALL_READING, 0);
+                    kist_tell(&job, crate::process::STOW_READING, 0);
                     kist_job = Some(job);
                 } else {
                     match &job.why {
@@ -2151,9 +2151,9 @@ pub fn run(mut b: Boot) -> ! {
                             crate::process::kist_not_started(&l.capsule, why::READ);
                             crate::process::kist_done();
                         }
-                        KistWhy::Install(i) => {
-                            crate::process::push_console(b"kist install: not started: no vault process, or the kernel's channel to it is busy\n");
-                            crate::process::install_tell(i, crate::process::INSTALL_REFUSED, crate::process::INSTALL_WHY_READ);
+                        KistWhy::Stow(i) => {
+                            crate::process::push_console(b"kist stow: not started: no vault process, or the kernel's channel to it is busy\n");
+                            crate::process::stow_tell(i, crate::process::STOW_REFUSED, crate::process::STOW_WHY_READ);
                         }
                     }
                 }
@@ -2171,8 +2171,8 @@ pub fn run(mut b: Boot) -> ! {
                         }
                         alloc::format!("kist {}: not started: {e}\n", core::str::from_utf8(&l.name).unwrap_or("?"))
                     }
-                    // Checked and sealed (SANDBOX.md "Lifecycle"): the seal joins the vault's `sealed` list, which every masked spawn reads; the installer is told once it is kept.
-                    (KistWhy::Install(i), Ok(KistDone::Sealed(seal))) => {
+                    // Checked and sealed (SANDBOX.md "Lifecycle"): the seal joins the vault's `sealed` list, which every masked spawn reads; the stower is told once it is kept.
+                    (KistWhy::Stow(i), Ok(KistDone::Sealed(seal))) => {
                         let kept = crate::process::with_lock(|| {
                             let Some(s) = store.as_mut() else { return false };
                             let mut list = s.get_by_key("sealed").ok().flatten().unwrap_or_default();
@@ -2181,26 +2181,26 @@ pub fn run(mut b: Boot) -> ! {
                             }
                             s.set("sealed", &list).is_ok()
                         });
-                        crate::process::install_tell(i, if kept { crate::process::INSTALL_DONE } else { crate::process::INSTALL_REFUSED }, if kept { 0 } else { crate::process::INSTALL_WHY_KEPT });
+                        crate::process::stow_tell(i, if kept { crate::process::STOW_DONE } else { crate::process::STOW_REFUSED }, if kept { 0 } else { crate::process::STOW_WHY_KEPT });
                         if kept {
-                            alloc::format!("kist install: checked and sealed to this device ({} bytes, {ms} ms)\n", job.total)
+                            alloc::format!("kist stow: checked and sealed to this device ({} bytes, {ms} ms)\n", job.total)
                         } else {
-                            alloc::format!("kist install: checked, but the vault did not keep its seal\n")
+                            alloc::format!("kist stow: checked, but the vault did not keep its seal\n")
                         }
                     }
-                    (KistWhy::Install(_), Ok(KistDone::Launched)) => alloc::string::String::new(),
+                    (KistWhy::Stow(_), Ok(KistDone::Launched)) => alloc::string::String::new(),
                     // A stow's native code on a development build: nothing to check or seal (a launch runs it on a development build only, as the bridge's development door's).
-                    (KistWhy::Install(i), Ok(KistDone::Native)) => {
-                        crate::process::install_tell(i, crate::process::INSTALL_DONE, crate::process::INSTALL_NATIVE);
+                    (KistWhy::Stow(i), Ok(KistDone::Native)) => {
+                        crate::process::stow_tell(i, crate::process::STOW_DONE, crate::process::STOW_NATIVE);
                         alloc::format!("kist stow: native code, taken unchecked on this development build ({} bytes)\n", job.total)
                     }
-                    (KistWhy::Install(i), Err((code, e))) => {
+                    (KistWhy::Stow(i), Err((code, e))) => {
                         // A refusal the checker or the seal told already; anything else (the vault, the arc pool) is told here, by the job's reason.
                         if !job.told {
-                            let told = if matches!(code, why::ROOM | why::OTHER) { crate::process::INSTALL_WHY_ROOM } else { crate::process::INSTALL_WHY_READ };
-                            crate::process::install_tell(i, crate::process::INSTALL_REFUSED, told);
+                            let told = if matches!(code, why::ROOM | why::OTHER) { crate::process::STOW_WHY_ROOM } else { crate::process::STOW_WHY_READ };
+                            crate::process::stow_tell(i, crate::process::STOW_REFUSED, told);
                         }
-                        alloc::format!("kist install: not installed: {e}\n")
+                        alloc::format!("kist stow: not stowed: {e}\n")
                     }
                 };
                 crate::flashlog::line(line.trim_end());
@@ -2412,7 +2412,7 @@ pub fn run(mut b: Boot) -> ! {
             if !open {
                 queue_pt_response(&mut pt_out_data, b"closed: a production build answers only a reboot, a plain DIAG and a kist offered to stow over USB\n");
             } else if cmd.cap == cap_offer {
-                // A kist offered to stow (docs/KISTS.md "Stowing"): its parts kept in `capsules.`, then offered to the installer, then its state read by the host, held. Every answer but a state is [status][words]: 0 done, 1 nobody present, 2 another offer is waiting, 3 a part or an offer not as the protocol says, 4 no installer.
+                // A kist offered to stow (docs/KISTS.md "Stowing"): its parts kept in `capsules.`, then offered to the stower, then its state read by the host, held. Every answer but a state is [status][words]: 0 done, 1 nobody present, 2 another offer is waiting, 3 a part or an offer not as the protocol says, 4 no stower.
                 // Each refusal on the flash log too, one line: what the host was told is where an offer stopped.
                 let say = |status: u8, words: &str| {
                     crate::flashlog::line(&alloc::format!("kist offer refused (A#{status}): {words}"));
@@ -2480,7 +2480,7 @@ pub fn run(mut b: Boot) -> ! {
                         if len.is_none() || offer_rx != Some((c, len.unwrap(), true)) {
                             queue_pt_response(&mut pt_out_data, &say(3, "not carried in whole: every part first, in order, the last with more 0"));
                         } else if !crate::process::running(b"kists") {
-                            queue_pt_response(&mut pt_out_data, &say(4, "the installer is not running"));
+                            queue_pt_response(&mut pt_out_data, &say(4, "the stower is not running"));
                         } else {
                             offer_rx = None;
                             match crate::process::offer_put(c, len.unwrap()) {

@@ -9,7 +9,7 @@ description = "The kist directory (docs/KISTS.md \"The directory\"): reads signe
 [workspace]
 
 [dependencies]
-# The directory's schema, builder, parser and verifier: the same code the device's installer runs.
+# The directory's schema, builder, parser and verifier: the same code the device's stower runs.
 ferros_kist = { path = "../../ferros_kist", features = ["directory"] }
 # text-encode: Photon's manifest writes `platform` and `arch` as `x` (Huffman text), which vsf decodes only with its tables.
 vsf = { path = "../../../vsf", features = ["crypto", "text-encode"] }

@@ -18,12 +18,12 @@ One word per thing, used the same way in the docs, the kernel, ferros_sys and th
 
 ## Lifecycle: compile once, then run and gun
 
-1. **Install** (once per capsule version). The capsule's signature passes the oracle gate (ORACLE.md). The device compiles it — the toka compiler from bytecode once it exists; until then the *checker* over native code produced by the ferros emitter. A capsule that fails is refused, in dev builds too.
-2. **Seal.** The installed native image is sealed with a keyed BLAKE3 hash under an OS-only key derived from the system persistent secret (oracle.rs), and stored in the vault. Nothing outside the OS can produce a seal.
+1. **Stow** (once per capsule version). The capsule's signature passes the oracle gate (ORACLE.md). The device compiles it — the toka compiler from bytecode once it exists; until then the *checker* over native code produced by the ferros emitter. A capsule that fails is refused, in dev builds too.
+2. **Seal.** The stowed native image is sealed with a keyed BLAKE3 hash under an OS-only key derived from the system persistent secret (oracle.rs), and stored in the vault. Nothing outside the OS can produce a seal.
 3. **Spawn** runs only sealed images. No instruction scan at spawn: one BLAKE3 over the image to check the seal, then `eret`.
 4. **Run.** Isolation costs only the masking instructions compiled in — plain `and`/`add`/`sub`, no compares, no branches, nothing for the branch predictor. Zero cost after compilation, the way Rust's checks are.
 
-For kists (2026-11-10, docs/KISTS.md "The installer"): steps 1 and 2 are `SYS_SPAWN` install mode, asked by the installer (payloads/kists) after it checked every egg against the developer bundle the capsule carries, and that bundle against the one the person trusted for that developer at their first kist (KISTS.md "Trust on first install"): the kernel reads the stored capsule back from the vault, gates it where it lies, runs the checker over its masked code and keeps the seal in `sealed`; step 3 is `spawn_kist`, which launches a masked kist only when its seal is there. Native code is never installed from the network. A kist offered over USB goes the same way (KISTS.md "Stowing", 2026-11-11), except that a development build takes its native code unchecked and unsealed, its screen saying so, and a production build refuses it (`SYS_SPAWN` install mode bit 4, `native_ok`).
+For kists (2026-11-10, docs/KISTS.md "The stower"): steps 1 and 2 are `SYS_SPAWN` stow mode, asked by the stower (payloads/kists) after it checked every egg against the developer bundle the capsule carries, and that bundle against the one the person trusted for that developer at their first kist (KISTS.md "Trust on first stow"): the kernel reads the stored capsule back from the vault, gates it where it lies, runs the checker over its masked code and keeps the seal in `sealed`; step 3 is `spawn_kist`, which launches a masked kist only when its seal is there. Native code is never stowed from the network. A kist offered over USB goes the same way (KISTS.md "Stowing", 2026-11-11), except that a development build takes its native code unchecked and unsealed, its screen saying so, and a production build refuses it (`SYS_SPAWN` stow mode bit 4, `native_ok`).
 
 ## The invariant
 
@@ -85,9 +85,9 @@ The stack area is the top of the arc. Every stack-pointer adjustment is compiled
 
 ## Components
 
-- **Checker** (`ferros_sandbox`, no_std, in the kernel's install path): decodes each A64 instruction and enforces the rules above. Tested exhaustively against instruction tables and cross-checked with `objdump`.
-- **Emitter** (host tool, Rust): rewrites rustc's assembly output (`--emit asm`) into the allowed forms before assembling — rewriting before assembly keeps every label and branch correct. When toka exists, its on-device backend emits the same forms directly, and the checker stays as an assertion over its output at install time.
-- **Kernel**: install (check + seal + store), spawn only sealed images, arcs placed with guards, W^X page attributes per arc at spawn.
+- **Checker** (`ferros_sandbox`, no_std, in the kernel's stow path): decodes each A64 instruction and enforces the rules above. Tested exhaustively against instruction tables and cross-checked with `objdump`.
+- **Emitter** (host tool, Rust): rewrites rustc's assembly output (`--emit asm`) into the allowed forms before assembling — rewriting before assembly keeps every label and branch correct. When toka exists, its on-device backend emits the same forms directly, and the checker stays as an assertion over its output at stow time.
+- **Kernel**: stow (check + seal + store), spawn only sealed images, arcs placed with guards, W^X page attributes per arc at spawn.
 
 ## Modes (decided with the owner 2026-11-03)
 
@@ -134,11 +134,11 @@ They are native today: tools/std-build.sh, tools/mahere-build.sh, tools/photon-b
 What a masked std build would take:
 
 0. **The pipeline with std in it.** tools/ferros-masked-build.sh builds `core,alloc,compiler_builtins` for `targets/aarch64-ferros.json` and masks the payload's post-LTO module plus compiler_builtins. A std app needs the same with `std,panic_abort` from the ferros-rust fork and its own target (`aarch64-unknown-ferros`, whose reserved registers must match the masked target's), and the post-LTO module of an app as large as Photon (fat LTO over std, fluor, vsf and the post-quantum crates) thru ferros-mask and llvm-mc.
-1. **No C.** The emitter rewrites the assembly rustc writes; objects the cc crate builds with gcc (blake3's NEON kernels, the PQClean suites, STD-TARGET.md) never pass thru it, so the checker would refuse them. Each takes its pure-Rust form (blake3 `pure`, as the kernel and the display take it; fgtw's pure-Rust post-quantum verification, as the installer has it) or is compiled to assembly the emitter can read.
+1. **No C.** The emitter rewrites the assembly rustc writes; objects the cc crate builds with gcc (blake3's NEON kernels, the PQClean suites, STD-TARGET.md) never pass thru it, so the checker would refuse them. Each takes its pure-Rust form (blake3 `pure`, as the kernel and the display take it; fgtw's pure-Rust post-quantum verification, as the stower has it) or is compiled to assembly the emitter can read.
 2. **Handles for every granted region.** A masked access reaches only the arc, so every pointer into a granted region becomes a `Handle<SLOT>` access ("Handles" above): fluor's ferros host writes the surface by pointer (the map's and the display's migration, still to do, is this same work), and ferros_rt and the fork's `sys` layer hand std no other region.
 3. **The mode.** Exact (big growers, "Modes"): the arc grows on demand by its limit (ARCS.md), Photon's 100 MB image and its heap included; exact needs BTI, so `-Z branch-protection=bti` for std and every crate.
 4. **What the checker must take that it has not seen:** thread-local storage (`tpidr_el0` reads in std's thread locals), std's unwinding stubs under `panic_abort`, atomics and the formatting machinery at scale; each a forms question for ferros_sandbox, answered by running the checker over a built image first and reading its refusals.
-5. **Cost at install.** The checker over tens of MB of text, once, at the stow's code stage (its bar), and the emitter's ~15% more code (+24 to 36% in exact, "Modes"): to measure on the Pro before deciding.
+5. **Cost at stow.** The checker over tens of MB of text, once, at the stow's code stage (its bar), and the emitter's ~15% more code (+24 to 36% in exact, "Modes"): to measure on the Pro before deciding.
 
 Order: Genesis or Mahere first (smaller, fewer C crates), Photon last.
 

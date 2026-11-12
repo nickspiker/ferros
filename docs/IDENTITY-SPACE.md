@@ -19,7 +19,7 @@ One set of typed facts per person (fgtw::space, ferros's vocabulary in ferros_sp
 | ZONE | the fleet | automatic, and the zone by hand (an IANA id) | none: the identity service writes it to the kernel of each device that follows it (docs/TIME.md); chosen on the clock page |
 | LANG | the fleet | the language (`wl`, its ISO 639-3 code) | none: the identity service writes it to the kernel of each device that follows it (SETTINGS.md); chosen on the language page |
 | DND | the fleet | do not disturb, on or off (`u`) | none: the identity service writes it to the kernel of every device (preference 40, SETTINGS.md); switched on the quick row (QUICK.md) |
-| PIN | developer key | the commitment of the key bundle that developer's first kist carried (`hp`), and their name when it gave one | a `pin` section of `kists.list` (KISTS.md "Trust on first install") |
+| PIN | developer key | the commitment of the key bundle that developer's first kist carried (`hp`), and their name when it gave one | a `pin` section of `kists.list` (KISTS.md "Trust on first stow") |
 
 The scope of a place and the view is the fleet's on every device whose deck sync is on (the default) and the device's own key on one switched off, so that device keeps its own arrangement, and gets it back after its own reset too. Kists, answers, defaults and pins always follow the person. A pin carries no stamp of its own into the sync, so a device that pinned another bundle for a developer the space already pins takes the space's: the first pin to reach the person's space stands (two pins made apart and merged before either device synced are settled by the space's merge, the later write).
 
@@ -31,7 +31,7 @@ Next to add when they exist: the WiFi networks (`wifi.cred`; a credential carrie
 
 - **The merge** keeps, per fact, the write greatest by (Eagle time written, writing device's key, gone over present, value bytes): a total order, so merging is commutative, associative and idempotent, and two devices that have seen the same writes hold the same space whatever order they came in. A removal is a tombstone and sticks.
 - **A change on a device** is stamped past the write it replaces (a Lamport step), so the person's latest action wins even against a sibling whose clock runs ahead. An answer keeps its own time.
-- **The device's copy carries no stamps**, so each device keeps a baseline (`fgtw.space_base`, never sent): what its copy held when it last agreed with the space. A value that moved from its baseline is the person's change here; one that did not takes the space's. A value with no baseline (a fresh device, an install before the first sync) takes the space's when the space has one, unless the fact carries a later stamp of its own.
+- **The device's copy carries no stamps**, so each device keeps a baseline (`fgtw.space_base`, never sent): what its copy held when it last agreed with the space. A value that moved from its baseline is the person's change here; one that did not takes the space's. A value with no baseline (a fresh device, a stow before the first sync) takes the space's when the space has one, unless the fact carries a later stamp of its own.
 - **A locked vault is never an empty one**: a read the vault refuses fails the sync, and nothing is written or removed.
 - **A fresh device joins nothing before its first pull** (fgtw.org answered, or a sibling's copy arrived), so its empty copy and its all-off defaults never go out as the person's choices.
 
@@ -52,16 +52,16 @@ Next to add when they exist: the WiFi networks (`wifi.cred`; a credential carrie
 
 The Fleet page has the switch: "deck: the same on all your devices" / "this device's own" (fgtw op 18), shown once the first pull is done.
 
-## Capsules (built 2026-11-10 but the fleet source; docs/KISTS.md "The installer")
+## Capsules (built 2026-11-10 but the fleet source; docs/KISTS.md "The stower")
 
 A kist in the person's list whose capsule this device lacks is fetched by its blake3, checked by the gate, and kept in `capsules.`; its answers came with the list, so nothing is asked again. The fetch takes sources in order, each a small trait (`fetch(blake3, offset, buf)`, `size(blake3)`), so a source is added without touching the rest:
 
-1. this device's own `capsules.` (an install that survived);
+1. this device's own `capsules.` (a stow that survived);
 2. a fleet device that holds it (a `capsule_want` over Photon Transport, answered in pieces from its `capsules.`);
 3. fgtw.org, once it serves capsules: its blob slots cap at 1 MiB and Photon's capsule is 106 MB, so that is an owner decision (R2 by blake3, public, the gate's signature is the trust);
-4. development: the bridge (`ferros-bridge kist install`, which keeps the answers of the same developer and option).
+4. development: the bridge (`ferros-bridge kist stow`, which keeps the answers of the same developer and option).
 
-Whatever arrives goes thru the installer's stages (payloads/kists): its blake3 and size, every egg against the developer bundle it carries and that bundle the one the person's list pins for its developer (KISTS.md "Trust on first install"), then the kernel's checker over its masked code and the seal, which is all a launch checks. The installer holds `capsules.` (write); the map and the identity service never do. It follows the identity service's doorbell: when the space's generation moves, it fetches what the list names and this device lacks, from the kist's recorded source (`source`, carried in its KIST fact) then the directory by blake3; the fleet source (2) is a seam, not built. Until a capsule is back its circle is on the map and a tap is refused by the kernel (no capsule); `ferros-bridge kist install <capsule>` still restores a development capsule with its answers.
+Whatever arrives goes thru the stower's stages (payloads/kists): its blake3 and size, every egg against the developer bundle it carries and that bundle the one the person's list pins for its developer (KISTS.md "Trust on first stow"), then the kernel's checker over its masked code and the seal, which is all a launch checks. The stower holds `capsules.` (write); the map and the identity service never do. It follows the identity service's doorbell: when the space's generation moves, it fetches what the list names and this device lacks, from the kist's recorded source (`source`, carried in its KIST fact) then the directory by blake3; the fleet source (2) is a seam, not built. Until a capsule is back its circle is on the map and a tap is refused by the kernel (no capsule); `ferros-bridge kist stow <capsule>` still restores a development capsule with its answers.
 
 ## Device firmware (designed, not built)
 
@@ -88,4 +88,4 @@ Kept in the vault after the first read, since partfs reads one 4 KiB block per U
 1. Deploy fgtw-bootstrap (its `deploy.sh`), so fgtw.org keeps the space.
 2. Store the new `fgtw`, `init` and `map` capsules (tools/husky-shell.sh), reboot, attest. The console shows `fgtw: space: …` lines; the Fleet page shows the switch.
 3. Arrange the deck (move and turn the circles), answer the kists' questions; wait for `fgtw.org holds ours`.
-4. With the owner's OK: the vault process's fresh start (payloads/vault FRESH, input 01). The network needs `wifi.fw`, `wifi.nvram`, `wifi.clm` (the device's) and `wifi.cred` (the person's) back before the pull can reach anything: by hand from Harbor until the refill exists (or cellular). Reboot, attest. The deck comes back in the same spots and turns; the kists are listed with their answers; their capsules come back with `ferros-bridge kist install` until the capsule fetch exists. Device firmware is restored by hand from Harbor until the refill exists.
+4. With the owner's OK: the vault process's fresh start (payloads/vault FRESH, input 01). The network needs `wifi.fw`, `wifi.nvram`, `wifi.clm` (the device's) and `wifi.cred` (the person's) back before the pull can reach anything: by hand from Harbor until the refill exists (or cellular). Reboot, attest. The deck comes back in the same spots and turns; the kists are listed with their answers; their capsules come back with `ferros-bridge kist stow` until the capsule fetch exists. Device firmware is restored by hand from Harbor until the refill exists.

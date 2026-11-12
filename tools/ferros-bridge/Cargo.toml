@@ -20,9 +20,9 @@ nunc-time = "0.0.0"
 # signed capsules for `spawn` (the kernel gate verifies them with vsf crypto-verify)
 vsf = { path = "../../../vsf", features = ["crypto"] }
 ed25519-dalek = "2"
-# kists (KISTS.md): a capsule's declaration when it is signed (`bundle`: built the one way kistcat builds it, with its developer's bundle), the person's list when one is installed
+# kists (KISTS.md): a capsule's declaration when it is signed (`bundle`: built the one way kistcat builds it, with its developer's bundle), the person's list when one is stowed
 ferros_kist = { path = "../../ferros_kist", features = ["bundle"] }
-# a kist capsule is signed with every scheme of its developer's bundle and checked at install (fgtw::release: Photon's release key, owner 2026-11-10: "no single eggs")
+# a kist capsule is signed with every scheme of its developer's bundle and checked at stow (fgtw::release: Photon's release key, owner 2026-11-10: "no single eggs")
 fgtw = { path = "../../../fgtw", default-features = false, features = ["std", "sign"] }
 # input injection scripts (docs/INPUT-INJECT.md): built here, played on the device by payloads/inject
 ferros_inject = { path = "../../ferros_inject" }

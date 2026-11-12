@@ -1,9 +1,9 @@
-//! Kists (docs/KISTS.md): what an installed app may be handed, how its developer declares it, and the person's answers.
+//! Kists (docs/KISTS.md): what a stowed app may be handed, how its developer declares it, and the person's answers.
 //!
 //! - **A right** is one thing a kist can be handed at spawn: a grant (owner, 2026-11-08: "a grant is the permission"). The vocabulary is fixed here, a right named and numbered by its place in `RIGHTS`; the kernel hands each one out as its own object (process.rs `kist_object`).
 //! - **The declaration** is in the signed capsule: a section `kist` (`name`, the app's own name, text) and a section `wants`, one field per right the kist asks for, named by the right, its value one line of the developer's reason (text, a human's words). The fields' order is the kist's grant slot order: slot 1 is the first want, and a right the person said no to is an empty slot, never a fake. Nothing undeclared can be granted: the kernel checks every launch against the capsule it runs. Since 2026-11-10 the `kist` section also carries the kist's `version` ([`Version`]: a `z` per part, as many parts as its developer uses), so the version is signed with everything else.
-//! - **The list** is the person's (`kists.list`, identity class, so it follows them to every device of their fleet): one VSF document, a section `defaults` (a field per right, 1 on or 0 off: what the first-launch question starts each switch at; out of the box every one is off) and a section `kist` per installed kist: `capsule` (hb, the blake3 of the signed capsule, its vault address), `developer` (ke) and `option` (hp; in the capsule it is the `kist` section's `option`, hR), together the kist's identity as the gate sees it, `name` (text), and a field per want named by its right: the reason (ASCII text, `a`: vsf encodes UTF-8 text, `x`, only with std, and the map and init are no_std), and once the person answered, the answer (unsigned, 1 granted or 0 not) and when (Eagle time). A want never answered has no answer and is asked at the next launch, once (owner, 2026-11-08: "asked once, ever, per person, per kist, per permission"). Since 2026-11-10 a kist may carry `source` (`nu`, the URL its capsule was fetched from, for a restore) and `installed` (Eagle time) and `version` (a `z` per part, the installed capsule's as its declaration gives it), and a section `kept` per uninstalled kist holds its answers (`developer`, `option`, a field per right: the answer and when) for the day it is installed again; readers from before skip them all. Since 2026-11-10 (trust on first install) a section `pin` per developer holds the commitment of the key bundle their first kist carried (`Pin`, `Kists::trust`); readers from before skip it.
-//! - **Fetching** a capsule (the installer, payloads/kists) is `fetch`: a plain HTTP GET's response decoded as it arrives, and the capsule hashed and its header read as it streams into the vault, never held whole.
+//! - **The list** is the person's (`kists.list`, identity class, so it follows them to every device of their fleet): one VSF document, a section `defaults` (a field per right, 1 on or 0 off: what the first-launch question starts each switch at; out of the box every one is off) and a section `kist` per stowed kist: `capsule` (hb, the blake3 of the signed capsule, its vault address), `developer` (ke) and `option` (hp; in the capsule it is the `kist` section's `option`, hR), together the kist's identity as the gate sees it, `name` (text), and a field per want named by its right: the reason (ASCII text, `a`: vsf encodes UTF-8 text, `x`, only with std, and the map and init are no_std), and once the person answered, the answer (unsigned, 1 granted or 0 not) and when (Eagle time). A want never answered has no answer and is asked at the next launch, once (owner, 2026-11-08: "asked once, ever, per person, per kist, per permission"). Since 2026-11-10 a kist may carry `source` (`nu`, the URL its capsule was fetched from, for a restore) and `installed` (Eagle time, when it was stowed: the stored field keeps its name from before the word was stow, so a list written then keeps its times) and `version` (a `z` per part, the stowed capsule's as its declaration gives it), and a section `kept` per unstowed kist holds its answers (`developer`, `option`, a field per right: the answer and when) for the day it is stowed again; readers from before skip them all. Since 2026-11-10 (trust on first stow) a section `pin` per developer holds the commitment of the key bundle their first kist carried (`Pin`, `Kists::trust`); readers from before skip it.
+//! - **Fetching** a capsule (the stower, payloads/kists) is `fetch`: a plain HTTP GET's response decoded as it arrives, and the capsule hashed and its header read as it streams into the vault, never held whole.
 #![no_std]
 
 extern crate alloc;
@@ -34,9 +34,9 @@ pub const LIST: &[u8] = b"list";
 /// The `launch` endpoint init serves (payloads/init) and the map calls: [OP_LAUNCH][the capsule's 32-byte address] → [one of the answers below].
 pub mod launch {
     pub const OP_LAUNCH: u8 = 0;
-    /// [OP_RELAUNCH][address]: a running kist killed (one shot dead) and launched again with its answers as they now stand, after the person changed one (a revoke). STARTED relaunched; RUNNING when it was not running (nothing done); ASK, NOT_INSTALLED, REFUSED as for a launch.
+    /// [OP_RELAUNCH][address]: a running kist killed (one shot dead) and launched again with its answers as they now stand, after the person changed one (a revoke). STARTED relaunched; RUNNING when it was not running (nothing done); ASK, NOT_STOWED, REFUSED as for a launch.
     pub const OP_RELAUNCH: u8 = 1;
-    /// [OP_STOP][address]: the person's Stop on the kist's card (owner, 2026-11-12; docs/KISTS.md "The deck and the card"): a running kist killed (one shot dead) and nothing launched, no record kept (the person's own act, as a relaunch's kill). STOPPED when it was running; NOT_RUNNING when it was not (nothing done); NOT_INSTALLED, REFUSED, UNREADABLE as for a launch.
+    /// [OP_STOP][address]: the person's Stop on the kist's card (owner, 2026-11-12; docs/KISTS.md "The deck and the card"): a running kist killed (one shot dead) and nothing launched, no record kept (the person's own act, as a relaunch's kill). STOPPED when it was running; NOT_RUNNING when it was not (nothing done); NOT_STOWED, REFUSED, UNREADABLE as for a launch.
     pub const OP_STOP: u8 = 2;
     /// Queued: the kernel streams the capsule from the vault and starts it.
     pub const STARTED: u8 = 0;
@@ -45,7 +45,7 @@ pub mod launch {
     /// A want is unanswered: the first-launch question first (init never asks; the map does).
     pub const ASK: u8 = 2;
     /// No such kist in the person's list.
-    pub const NOT_INSTALLED: u8 = 3;
+    pub const NOT_STOWED: u8 = 3;
     /// The kernel refused the launch (the reason on the console).
     pub const REFUSED: u8 = 4;
     /// The person's list could not be read (nobody present).
@@ -59,7 +59,7 @@ pub mod launch {
     pub mod why {
         /// No room in the memory pool for the kist's arc, and nothing is coming back to it.
         pub const ROOM: u8 = 0;
-        /// Not installed on this device: no capsule at its address in the vault, or a masked kist with no seal here.
+        /// Not stowed on this device: no capsule at its address in the vault, or a masked kist with no seal here.
         pub const NOT_HERE: u8 = 1;
         /// Its checks refused it: its signature or the gate, a right it does not declare, native code in a production build.
         pub const CHECKS: u8 = 2;
@@ -80,9 +80,9 @@ pub mod launch {
     }
 }
 
-/// Stowing a kist (docs/KISTS.md "Stowing"; owner, 2026-11-11: "Can we make a standard method so the end user doesn't have to get them from the [catalog]", "Just seems to me that we should just make a proper checked path and start using it", and "the proper term for installing a kist is stow"). One installer (payloads/kists) for every source, one set of checks: a kist fetched from the directory, and a kist offered to the device over USB (ferros_pt `caps::OFFER`, tools/ferros-send). What the kernel keeps of an offer and answers the host with, why a stow is refused, and those reasons in a person's words, shared by the kernel, the installer, the map and `ferros send`.
+/// Stowing a kist (docs/KISTS.md "Stowing"; owner, 2026-11-11: "Can we make a standard method so the end user doesn't have to get them from the [catalog]", "Just seems to me that we should just make a proper checked path and start using it", and "the proper term for installing a kist is stow"). One stower (payloads/kists) for every source, one set of checks: a kist fetched from the directory, and a kist offered to the device over USB (ferros_pt `caps::OFFER`, tools/ferros-send). What the kernel keeps of an offer and answers the host with, why a stow is refused, and those reasons in a person's words, shared by the kernel, the stower, the map and `ferros send`.
 pub mod offer {
-    /// An offer's states, as the kernel keeps them and answers a host's read (`[state][why][flags]`): carried in whole and waiting for the installer to take it; the installer checking it (its signature with every egg, the person's pin, the kernel's gate, checker and seal); on the glass, waiting for the person's Stow or Cancel; then one of the three ends.
+    /// An offer's states, as the kernel keeps them and answers a host's read (`[state][why][flags]`): carried in whole and waiting for the stower to take it; the stower checking it (its signature with every egg, the person's pin, the kernel's gate, checker and seal); on the glass, waiting for the person's Stow or Cancel; then one of the three ends.
     pub const OFFERED: u8 = 0;
     pub const CHECKING: u8 = 1;
     pub const ASKING: u8 = 2;
@@ -105,7 +105,7 @@ pub mod offer {
     /// The longest the kernel holds a host's read of an offer's state before it answers with the state unchanged, in seconds: the USB driver gives up on a kernel reply after 16 (payloads/usb `give_up`), so a hold must end well inside it, and the host asks again at once (a held call with a lease, never a timer of the host's).
     pub const HOLD_SECONDS: u64 = 1 << 3;
 
-    /// Why a stow (or an install from the directory, or a restore) was refused: the installer's reasons (payloads/kists), the map's words for them, and `ferros send`'s.
+    /// Why a stow (offered by a host, from the directory, or a restore) was refused: the stower's reasons (payloads/kists), the map's words for them, and `ferros send`'s.
     pub mod why {
         pub const NETWORK: u8 = 1;
         pub const MISSING: u8 = 2;
@@ -114,7 +114,7 @@ pub mod offer {
         pub const EGGS: u8 = 5;
         /// It carries no bundle of its developer's keys (a capsule from before 2026-11-10).
         pub const NO_BUNDLE: u8 = 6;
-        /// Native code from the network: a development build, never installed from the directory.
+        /// Native code from the network: a development build, never stowed from the directory.
         pub const NATIVE: u8 = 7;
         pub const CHECKER: u8 = 8;
         pub const SEAL: u8 = 9;
@@ -142,7 +142,7 @@ pub mod offer {
             why::NOT_NAMED => "it is not the capsule it was named as",
             why::EGGS => "its signature does not check out",
             why::NO_BUNDLE => "it does not carry its developer's keys",
-            why::NATIVE => "this kist is a development build and can't be installed from the network",
+            why::NATIVE => "this kist is a development build and can't be stowed from the network",
             why::CHECKER => "its code failed the check",
             why::SEAL => "it could not be sealed to this device",
             why::VAULT => "the vault did not keep it",
@@ -299,7 +299,7 @@ pub fn version_of(capsule: &[u8]) -> Result<Option<Version>, &'static str> {
     }
 }
 
-/// One installed kist in the person's list.
+/// One stowed kist in the person's list.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Kist {
     pub capsule: [u8; 32],
@@ -309,13 +309,13 @@ pub struct Kist {
     pub wants: Vec<Want>,
     /// Where the capsule was fetched from (`source`, a VSF URL `nu`): a restore on another device, or after a reset, fetches it there again (payloads/kists). None for a capsule that came another way (the bridge).
     pub source: Option<String>,
-    /// When this kist was installed or updated (`installed`, Eagle oscillations; 0 unknown, as a list from before 2026-11-10): the stamp of its fact in the person's space (ferros_space), so an install after an uninstall wins over the uninstall's tombstone.
-    pub installed: i64,
-    /// The installed capsule's version as its signed declaration gives it (`version`, a `z` per part, kept as written; since 2026-11-10): what the Kists page compares a listed version against, so it offers an update only when the listed one is newer. None for a kist installed before versions, or from a capsule without one: any listed version is newer.
+    /// When this kist was stowed or updated (the stored field `installed`, its name from before the word was stow; Eagle oscillations; 0 unknown, as a list from before 2026-11-10): the stamp of its fact in the person's space (ferros_space), so a stow after an unstow wins over the unstow's tombstone.
+    pub stowed: i64,
+    /// The stowed capsule's version as its signed declaration gives it (`version`, a `z` per part, kept as written; since 2026-11-10): what the Kists page compares a listed version against, so it offers an update only when the listed one is newer. None for a kist stowed before versions, or from a capsule without one: any listed version is newer.
     pub version: Option<Version>,
 }
 
-/// The answers of a kist the person uninstalled, kept in their list (a section `kept`: `developer`, `option`, then a field per right answered, the answer and when), so installing the same kist again finds them and asks nothing (owner, 2026-11-07: "asked once, ever").
+/// The answers of a kist the person unstowed, kept in their list (a section `kept`: `developer`, `option`, then a field per right answered, the answer and when), so stowing the same kist again finds them and asks nothing (owner, 2026-11-07: "asked once, ever").
 #[derive(Clone, PartialEq, Debug)]
 pub struct Kept {
     pub developer: [u8; 32],
@@ -324,7 +324,7 @@ pub struct Kept {
     pub answers: Vec<(u8, bool, i64)>,
 }
 
-/// A developer the person trusted on first install (owner, 2026-11-10): the commitment of the key bundle (`fgtw::pq::KeyBundle::commit`, every scheme) that developer's first kist carried, kept in their list (a section `pin`: `developer` ke, `bundle` hp, `name` a when the kist named its developer, `pinned` e), so it follows them to every device of theirs. Every later kist or update from that developer key must carry a bundle with the same commitment. An uninstall keeps it, as it keeps answers.
+/// A developer the person trusted on first stow (owner, 2026-11-10): the commitment of the key bundle (`fgtw::pq::KeyBundle::commit`, every scheme) that developer's first kist carried, kept in their list (a section `pin`: `developer` ke, `bundle` hp, `name` a when the kist named its developer, `pinned` e), so it follows them to every device of theirs. Every later kist or update from that developer key must carry a bundle with the same commitment. An unstow keeps it, as it keeps answers.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Pin {
     /// The developer's Ed25519 key, as the capsule's header and the kist's identity name it.
@@ -337,7 +337,7 @@ pub struct Pin {
     pub pinned: i64,
 }
 
-/// The person's list: their defaults (bit k: right k starts on at the first-launch question), their kists, the answers of the kists they uninstalled, and the developers they trusted on first install.
+/// The person's list: their defaults (bit k: right k starts on at the first-launch question), their kists, the answers of the kists they unstowed, and the developers they trusted on first stow.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Kists {
     pub defaults: u32,
@@ -383,7 +383,7 @@ fn wants_of(s: &VsfSection) -> Result<Vec<(u8, String)>, &'static str> {
     Ok(out)
 }
 
-/// The declaration a signed capsule carries (its `kist` and `wants` sections; a capsule without them is a kist that wants nothing, named "kist"). The signature is the gate's to check (the kernel's, or the installer's before it writes the list): this only reads.
+/// The declaration a signed capsule carries (its `kist` and `wants` sections; a capsule without them is a kist that wants nothing, named "kist"). The signature is the gate's to check (the kernel's, or the stower's before it writes the list): this only reads.
 pub fn declaration(capsule: &[u8]) -> Result<Decl, &'static str> {
     let name = section(capsule, "kist")?.and_then(|s| s.text("name").map(String::from)).unwrap_or_else(|| String::from("kist"));
     let wants = match section(capsule, "wants")? {
@@ -425,7 +425,7 @@ pub fn developer_name_of(capsule: &[u8]) -> Result<Option<String>, &'static str>
     }))))
 }
 
-/// The sections a capsule's declaration adds, for the signer (ferros-bridge `capsule --kist`): `kist` with the name, `wants` with a field per want, or no `wants` at all for a kist that wants nothing (2026-11-10: an empty section was written and did not parse back, so the clock's capsule could not be installed; a capsule without one already reads as wanting nothing).
+/// The sections a capsule's declaration adds, for the signer (ferros-bridge `capsule --kist`): `kist` with the name, `wants` with a field per want, or no `wants` at all for a kist that wants nothing (2026-11-10: an empty section was written and did not parse back, so the clock's capsule could not be stowed; a capsule without one already reads as wanting nothing).
 pub fn declaration_sections(d: &Decl, option: Option<[u8; 32]>) -> (VsfSection, Option<VsfSection>) {
     let mut k = VsfSection::new("kist");
     k.add_field("name", VsfType::a(vsf::Ascii::checked("name", d.name.clone())));
@@ -444,7 +444,7 @@ pub fn declaration_sections(d: &Decl, option: Option<[u8; 32]>) -> (VsfSection, 
 }
 
 impl Kists {
-    /// The person's list from its document; an empty list for a document that does not parse (a list never written reads as none installed).
+    /// The person's list from its document; an empty list for a document that does not parse (a list never written reads as none stowed).
     pub fn parse(doc: &[u8]) -> Result<Kists, &'static str> {
         let (header, end) = VsfHeader::decode(doc).map_err(|_| "not a VSF file")?;
         let sections = header.sections(doc, end).map_err(|_| "sections that do not parse")?;
@@ -465,12 +465,12 @@ impl Kists {
                         return Err("a kist without its capsule or identity");
                     };
                     let name = String::from(s.text("name").unwrap_or("kist"));
-                    // Each by its type marker: the source a URL (`nu`), when it was installed an Eagle time.
+                    // Each by its type marker: the source a URL (`nu`), when it was stowed an Eagle time.
                     let source = s.get_field("source").and_then(|f| f.values.first()).and_then(|v| match v {
                         VsfType::nu(u) => Some(u.clone()),
                         _ => None,
                     });
-                    let installed = s.get_field("installed").and_then(|f| f.values.first()).and_then(|v| v.as_eagle()).unwrap_or(0);
+                    let stowed = s.get_field("installed").and_then(|f| f.values.first()).and_then(|v| v.as_eagle()).unwrap_or(0);
                     let mut wants = Vec::new();
                     for f in &s.fields {
                         let Some(right) = code(&f.name) else { continue };
@@ -492,7 +492,7 @@ impl Kists {
                         Some(f) => Some(Version::from_values(&f.values)?),
                         None => None,
                     };
-                    out.kists.push(Kist { capsule, developer, option, name, wants, source, installed, version });
+                    out.kists.push(Kist { capsule, developer, option, name, wants, source, stowed, version });
                 }
                 "kept" => {
                     let (Some(developer), Some(option)) = (s.bytes32("developer"), s.bytes32("option")) else {
@@ -558,8 +558,8 @@ impl Kists {
             if let Some(u) = &k.source {
                 s.add_field("source", VsfType::nu(u.clone()));
             }
-            if k.installed != 0 {
-                s.add_field("installed", VsfType::e(EtType::e6(k.installed)));
+            if k.stowed != 0 {
+                s.add_field("installed", VsfType::e(EtType::e6(k.stowed)));
             }
             if let Some(v) = k.version.as_ref().filter(|v| !v.0.is_empty()) {
                 s.add_field_multi(VERSION, v.values());
@@ -603,7 +603,7 @@ impl Kists {
         self.pins.iter().find(|p| p.developer == *developer)
     }
 
-    /// Trust on first install (owner, 2026-11-10): the bundle a kist carries (its commitment, `fgtw::pq::KeyBundle::commit`) set against the pin for its developer key. With no pin it is pinned now, named `name` and stamped `now` (the caller writes the list); the pinned bundle passes; any other is refused, the pin left as it was. The caller has already checked every egg against that bundle and that its Ed25519 key is the developer.
+    /// Trust on first stow (owner, 2026-11-10): the bundle a kist carries (its commitment, `fgtw::pq::KeyBundle::commit`) set against the pin for its developer key. With no pin it is pinned now, named `name` and stamped `now` (the caller writes the list); the pinned bundle passes; any other is refused, the pin left as it was. The caller has already checked every egg against that bundle and that its Ed25519 key is the developer.
     pub fn trust(&mut self, developer: &[u8; 32], bundle: &[u8; 32], name: Option<&str>, now: i64) -> Trust {
         match self.pin_of(developer) {
             Some(p) if p.bundle == *bundle => Trust::Same,
@@ -629,8 +629,8 @@ impl Kists {
         self.kists.iter().find(|k| k.capsule == *capsule)
     }
 
-    /// An install (or an update) of a capsule with this identity and declaration: the same kist (developer and option) keeps every answer it had for a right it still wants, and a kist installed again after an uninstall gets back the answers kept for it (`kept`); a want that is new to it is unanswered, off until the person answers (owner, 2026-11-08). Its source and install time stay as they were (an installer that fetched it sets them). Returns the kist's index.
-    pub fn install(&mut self, capsule: [u8; 32], developer: [u8; 32], option: [u8; 32], d: &Decl) -> usize {
+    /// A stow (or an update) of a capsule with this identity and declaration: the same kist (developer and option) keeps every answer it had for a right it still wants, and a kist stowed again after an unstow gets back the answers kept for it (`kept`); a want that is new to it is unanswered, off until the person answers (owner, 2026-11-08). Its source and stow time stay as they were (a stower that fetched it sets them). Returns the kist's index.
+    pub fn stow(&mut self, capsule: [u8; 32], developer: [u8; 32], option: [u8; 32], d: &Decl) -> usize {
         let old = self.kists.iter().position(|k| k.developer == developer && k.option == option);
         let kept = self.kept.iter().position(|k| k.developer == developer && k.option == option);
         let wants = d
@@ -646,10 +646,10 @@ impl Kists {
         if let Some(i) = kept {
             self.kept.swap_remove(i);
         }
-        let (source, installed) = old.map_or((None, 0), |i| (self.kists[i].source.clone(), self.kists[i].installed));
+        let (source, stowed) = old.map_or((None, 0), |i| (self.kists[i].source.clone(), self.kists[i].stowed));
         // The version is the new capsule's, which the caller sets from its declaration (`version_of`); the one before stays only while the capsule is the same.
         let version = old.filter(|&i| self.kists[i].capsule == capsule).and_then(|i| self.kists[i].version.clone());
-        let k = Kist { capsule, developer, option, name: d.name.clone(), wants, source, installed, version };
+        let k = Kist { capsule, developer, option, name: d.name.clone(), wants, source, stowed, version };
         match old {
             Some(i) => {
                 self.kists[i] = k;
@@ -664,7 +664,7 @@ impl Kists {
 }
 
 impl Kists {
-    /// An uninstall: the kist with this identity out of the list, every answer the person gave it kept (`kept`), so installing it again asks nothing (owner, 2026-11-07: "1 means 1"). The space keeps them as well (ferros_space leaves alone an answer whose kist is not in the list). The kist removed, or None when it was not in the list.
+    /// An unstow: the kist with this identity out of the list, every answer the person gave it kept (`kept`), so stowing it again asks nothing (owner, 2026-11-07: "1 means 1"). The space keeps them as well (ferros_space leaves alone an answer whose kist is not in the list). The kist removed, or None when it was not in the list.
     pub fn remove(&mut self, developer: &[u8; 32], option: &[u8; 32]) -> Option<Kist> {
         let i = self.kists.iter().position(|k| k.developer == *developer && k.option == *option)?;
         let k = self.kists.remove(i);
@@ -720,7 +720,7 @@ mod tests {
     fn list_round_trips_and_updates_keep_answers() {
         let mut k = Kists::default();
         k.defaults = 1 << 7;
-        let i = k.install([1; 32], [2; 32], [3; 32], &decl());
+        let i = k.stow([1; 32], [2; 32], [3; 32], &decl());
         assert!(k.kists[i].unanswered());
         assert_eq!(k.kists[i].launch_codes(), None);
         k.kists[i].wants[0].answer = Some((true, 5));
@@ -731,15 +731,15 @@ mod tests {
         let back = Kists::parse(&doc).unwrap();
         assert_eq!(back, k);
         assert_eq!(back.kists[i].version.as_ref().unwrap().0, alloc::vec![0, 1, 0]);
-        // The same capsule again keeps its version; a new capsule's is its own, set by the installer.
+        // The same capsule again keeps its version; a new capsule's is its own, set by the stower.
         let mut same = back.clone();
-        same.install([1; 32], [2; 32], [3; 32], &decl());
+        same.stow([1; 32], [2; 32], [3; 32], &decl());
         assert_eq!(same.kists[i].version, Some(Version(alloc::vec![1, 0])));
         // An update that adds a want: the old answers stand, the new want is unanswered.
         let mut d2 = decl();
         d2.wants.push((4, String::from("to keep your places")));
         let mut k2 = back.clone();
-        let j = k2.install([9; 32], [2; 32], [3; 32], &d2);
+        let j = k2.stow([9; 32], [2; 32], [3; 32], &d2);
         assert_eq!(j, i);
         assert_eq!(k2.kists[j].capsule, [9; 32]);
         assert_eq!(k2.kists[j].version, None);
@@ -747,18 +747,18 @@ mod tests {
         assert_eq!(k2.kists[j].wants[1].answer, Some((false, 6)));
         assert_eq!(k2.kists[j].wants[2].answer, None);
         // Another developer's app of the same name is a kist of its own.
-        let o = k2.install([8; 32], [4; 32], [3; 32], &decl());
+        let o = k2.stow([8; 32], [4; 32], [3; 32], &decl());
         assert_ne!(o, j);
     }
 
     #[test]
-    fn uninstall_keeps_the_answers_and_a_reinstall_asks_nothing() {
+    fn unstow_keeps_the_answers_and_a_restow_asks_nothing() {
         let mut k = Kists::default();
-        let i = k.install([1; 32], [2; 32], [3; 32], &decl());
+        let i = k.stow([1; 32], [2; 32], [3; 32], &decl());
         k.kists[i].wants[0].answer = Some((true, 5));
         k.kists[i].source = Some(String::from("http://kists.fgtw.org/mahere.vsf"));
-        k.kists[i].installed = 9;
-        // The source and the install time round trip.
+        k.kists[i].stowed = 9;
+        // The source and the stow time round trip.
         let back = Kists::parse(&k.build(10).unwrap()).unwrap();
         assert_eq!(back, k);
         let gone = k.remove(&[2; 32], &[3; 32]).unwrap();
@@ -769,18 +769,18 @@ mod tests {
         assert_eq!(k.kept, alloc::vec![Kept { developer: [2; 32], option: [3; 32], answers: alloc::vec![(0, true, 5)] }]);
         let back = Kists::parse(&k.build(11).unwrap()).unwrap();
         assert_eq!(back, k);
-        // Installed again (a newer capsule): the kept answer is back, the unanswered want still unanswered, nothing kept any more.
-        let j = k.install([7; 32], [2; 32], [3; 32], &decl());
+        // Stowed again (a newer capsule): the kept answer is back, the unanswered want still unanswered, nothing kept any more.
+        let j = k.stow([7; 32], [2; 32], [3; 32], &decl());
         assert_eq!(k.kists[j].wants[0].answer, Some((true, 5)));
         assert_eq!(k.kists[j].wants[1].answer, None);
         assert!(k.kept.is_empty());
-        // An update keeps the source and install time it had (the installer sets new ones itself).
+        // An update keeps the source and stow time it had (the stower sets new ones itself).
         k.kists[j].source = Some(String::from("http://a/b"));
-        k.kists[j].installed = 12;
-        let j = k.install([8; 32], [2; 32], [3; 32], &decl());
-        assert_eq!((k.kists[j].source.as_deref(), k.kists[j].installed), (Some("http://a/b"), 12));
-        // Another kist's uninstall keeps nothing of one that was never answered.
-        let o = k.install([6; 32], [4; 32], [3; 32], &decl());
+        k.kists[j].stowed = 12;
+        let j = k.stow([8; 32], [2; 32], [3; 32], &decl());
+        assert_eq!((k.kists[j].source.as_deref(), k.kists[j].stowed), (Some("http://a/b"), 12));
+        // Another kist's unstow keeps nothing of one that was never answered.
+        let o = k.stow([6; 32], [4; 32], [3; 32], &decl());
         let (d, op) = (k.kists[o].developer, k.kists[o].option);
         k.remove(&d, &op);
         assert!(k.kept.is_empty());
@@ -962,7 +962,7 @@ mod capsule_on_disk {
 ///
 /// - **The bundle** rides in the `kist` section as one field `kb`, a value per scheme, each by its own key type: `ke` (Ed25519), `kvf` (Falcon-512), `kvs` (SPHINCS+). Read back by type marker, never by position, it is rebuilt into an `fgtw::pq::KeyBundle` whose commitment (`KeyBundle::commit`) is what the person's list pins for that developer. It is part of the file every egg signs.
 /// - **One builder** ([`unsigned`]): the bridge (`capsule --kist`) and tools/kistcat (`kist`) both build a kist thru it, then sign it with `fgtw::release::sign_release`, so the two write the same capsule.
-/// - A capsule from before 2026-11-10 carries no `kb`: it still reads (`bundle_of` gives None) and the bridge's development path still installs it as before; the network installer refuses it, as it has no bundle to check.
+/// - A capsule from before 2026-11-10 carries no `kb`: it still reads (`bundle_of` gives None) and the bridge's development path still stows it as before; the network stower refuses it, as it has no bundle to check.
 #[cfg(feature = "bundle")]
 pub mod capsule {
     use super::*;
@@ -1072,7 +1072,7 @@ pub mod capsule {
             k.add_field_multi(VERSION, v.values());
         }
         if let Some(n) = developer_name {
-            k.add_field("developer", VsfType::a(vsf::Ascii::new(n).map_err(|e| alloc::format!("the developer's name {n:?}: {e} (a kist's text is ASCII, read by a no_std installer)"))?));
+            k.add_field("developer", VsfType::a(vsf::Ascii::new(n).map_err(|e| alloc::format!("the developer's name {n:?}: {e} (a kist's text is ASCII, read by a no_std stower)"))?));
         }
         k.add_field_multi(BUNDLE, bundle_values(bundle).map_err(String::from)?);
         let mut b = vsf::VsfBuilder::new().creation_time_oscillations(made).signed_only_eggs(VsfType::ke(bundle.ed25519().to_vec()), &fgtw::release::release_slots()).add_section_direct(k);
@@ -1091,7 +1091,7 @@ pub mod capsule {
         NotItsKey,
         /// An egg is missing or does not verify against the bundle.
         Eggs,
-        /// The person trusted another bundle for this developer key on its first install: the pin, for its words ("this kist is signed by a different key than <name>'s other kists").
+        /// The person trusted another bundle for this developer key on its first stow: the pin, for its words ("this kist is signed by a different key than <name>'s other kists").
         OtherKey(Pin),
     }
 
@@ -1102,7 +1102,7 @@ pub mod capsule {
         pub name: Option<String>,
     }
 
-    /// The install-time check of a kist's signature, the one rule for the network installer (payloads/kists) and the bridge's development path (owner, 2026-11-10: trust on first install). From the capsule's first bytes (`first`, its header and declaration), its header's signer and eggs, and the hash the eggs sign (`file_hash`):
+    /// The stow-time check of a kist's signature, the one rule for the network stower (payloads/kists) and the bridge's development path (owner, 2026-11-10: trust on first stow). From the capsule's first bytes (`first`, its header and declaration), its header's signer and eggs, and the hash the eggs sign (`file_hash`):
     /// 0. the bundle is the one the capsule carries (`kb`, every scheme), its Ed25519 key the kist's developer; for Photon's release key, the bundle fgtw pins (a carried one must be that one);
     /// 1. every egg verifies against it (`fgtw::pq::verify_eggs`, the release mask: no single eggs);
     /// 2. its commitment is the one the person's list pins for that developer, or none is pinned yet (then the caller pins it with [`Kists::trust`] when it writes the list).
@@ -1178,7 +1178,7 @@ pub mod capsule {
             assert_eq!(b, key.public());
             assert_eq!(b.to_bytes(), key.public().to_bytes());
             assert_eq!(b.commit(), key.public().commit());
-            // Every egg against the carried bundle, as the installer checks it.
+            // Every egg against the carried bundle, as the stower checks it.
             fgtw::release::verify_signed_by(&c, &b.ed25519(), &b).unwrap();
             assert_eq!(declaration(&c).unwrap(), decl());
             assert_eq!(identity(&c).unwrap(), (key.keypair().public.to_bytes(), [5; 32]));
@@ -1227,8 +1227,8 @@ pub mod capsule {
             assert_eq!(version_of(&c), Ok(None));
         }
 
-        /// The installer's steps for one capsule: admit, then (as its store stage does) pin and keep the kist in the list.
-        fn install(list: &mut Kists, c: &[u8]) -> Result<Trust, Refused> {
+        /// The stower's steps for one capsule: admit, then (as its store stage does) pin and keep the kist in the list.
+        fn stow(list: &mut Kists, c: &[u8]) -> Result<Trust, Refused> {
             // vsf's reader checks the Ed25519 egg as it reads the header: a capsule changed anywhere fails here already.
             let Ok((signer, eggs, file_hash)) = vsf::verification::header_eggs(c) else { return Err(Refused::Eggs) };
             let a = admit(c, &signer, &eggs, &file_hash, list)?;
@@ -1237,24 +1237,24 @@ pub mod capsule {
                 Some(b) => list.trust(&developer, &b, a.name.as_deref(), 7),
                 None => Trust::Same,
             };
-            list.install(*blake3::hash(c).as_bytes(), developer, option, &declaration(c).unwrap());
+            list.stow(*blake3::hash(c).as_bytes(), developer, option, &declaration(c).unwrap());
             Ok(t)
         }
 
         #[test]
-        fn trust_on_first_install() {
+        fn trust_on_first_stow() {
             let key = SigningBundle::developer(&[3; 32], "TEST_DEVELOPER");
             let mut list = Kists::default();
             // The first kist by this developer pins its bundle, under the name it gives.
             let first = signed(&key, Some("Test Developer"));
-            assert_eq!(install(&mut list, &first), Ok(Trust::First));
+            assert_eq!(stow(&mut list, &first), Ok(Trust::First));
             assert_eq!(list.pins, alloc::vec![Pin { developer: key.public().ed25519(), bundle: key.public().commit(), name: Some(String::from("Test Developer")), pinned: 7 }]);
             // The pin round trips thru the list's document, and a list from before (no pin section) reads as none pinned.
             let back = Kists::parse(&list.build(8).unwrap()).unwrap();
             assert_eq!(back, list);
-            // A second kist (an update) with the same bundle installs.
+            // A second kist (an update) with the same bundle stows.
             let update = signed(&key, Some("Someone Else"));
-            assert_eq!(install(&mut list, &update), Ok(Trust::Same));
+            assert_eq!(stow(&mut list, &update), Ok(Trust::Same));
             assert_eq!(list.pins.len(), 1);
             assert_eq!(list.pins[0].name.as_deref(), Some("Test Developer"), "the first kist's name stands");
             // The same Ed25519 key with other post-quantum halves (another label: another bundle, every egg its own and valid) is refused, named by the pin.
@@ -1262,26 +1262,26 @@ pub mod capsule {
             assert_eq!(other.public().ed25519(), key.public().ed25519());
             assert_ne!(other.public().commit(), key.public().commit());
             let c = signed(&other, Some("Test Developer"));
-            let r = install(&mut list, &c).unwrap_err();
+            let r = stow(&mut list, &c).unwrap_err();
             assert_eq!(refusal_words(&r), "this kist is signed by a different key than Test Developer's other kists");
             assert_eq!(list.pins[0].bundle, key.public().commit(), "the pin stands");
-            // An uninstall keeps the pin, as it keeps answers: the other bundle is still refused.
+            // An unstow keeps the pin, as it keeps answers: the other bundle is still refused.
             let (d, o) = identity(&first).unwrap();
             list.remove(&d, &o);
             assert!(list.kists.is_empty());
-            assert!(matches!(install(&mut list, &c), Err(Refused::OtherKey(_))));
+            assert!(matches!(stow(&mut list, &c), Err(Refused::OtherKey(_))));
             // Without the bundle the eggs cannot be checked: a capsule with no kb is not admitted (not the release key's).
             let (k, w) = declaration_sections(&decl(), Some([5; 32]));
             let code = Code { image: &[1u8; 16], masked: true, text: Some(16), fixed: None, bti: false, exact: false };
             let u = vsf::VsfBuilder::new().signed_only_eggs(VsfType::ke(key.public().ed25519().to_vec()), &fgtw::release::release_slots()).add_section_direct(k).add_section_direct(w.unwrap()).add_section_direct(code_section(&code)).build().unwrap();
             let bare = fgtw::release::sign_release(u, &key).unwrap();
-            assert_eq!(install(&mut Kists::default(), &bare), Err(Refused::NoBundle));
+            assert_eq!(stow(&mut Kists::default(), &bare), Err(Refused::NoBundle));
             // A capsule whose eggs do not verify against the bundle it carries.
             let mut t = first.clone();
             let n = t.len();
             t[n - 1] ^= 1;
-            assert_eq!(install(&mut Kists::default(), &t), Err(Refused::Eggs));
-            // The installer's own path (eggs from the streamed head, the hash it computed): eggs over another hash do not verify.
+            assert_eq!(stow(&mut Kists::default(), &t), Err(Refused::Eggs));
+            // The stower's own path (eggs from the streamed head, the hash it computed): eggs over another hash do not verify.
             let (signer, eggs, mut file_hash) = vsf::verification::header_eggs(&first).unwrap();
             file_hash[0] ^= 1;
             assert_eq!(admit(&first, &signer, &eggs, &file_hash, &Kists::default()), Err(Refused::Eggs));
@@ -1303,10 +1303,10 @@ pub mod capsule {
             assert!(bundle_from_values(&[v[0].clone(), v[1].clone(), VsfType::hb(alloc::vec![0; 32])]).is_err());
         }
 
-        /// The Clock's capsule as tools/clock-kist.sh writes it (target/kists/clock.capsule.vsf), streamed thru the installer's intake in pieces and admitted as the installer admits it: `cargo test -p ferros_kist --features bundle -- --ignored`.
+        /// The Clock's capsule as tools/clock-kist.sh writes it (target/kists/clock.capsule.vsf), streamed thru the stower's intake in pieces and admitted as the stower admits it: `cargo test -p ferros_kist --features bundle -- --ignored`.
         #[test]
         #[ignore]
-        fn the_clock_capsule_admits_as_the_installer_streams_it() {
+        fn the_clock_capsule_admits_as_the_stower_streams_it() {
             let Ok(c) = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/kists/clock.capsule.vsf")) else { return };
             let mut intake = crate::fetch::Intake::new();
             for piece in c.chunks(1 << 12) {
@@ -1323,11 +1323,11 @@ pub mod capsule {
     }
 }
 
-/// The kist directory (docs/KISTS.md "The directory"; owner, 2026-11-10): the public list of kists anyone may install, at `kists.fgtw.org/kists.vsf` over plain HTTP, built by tools/kistcat and read by the device's installer.
+/// The kist directory (docs/KISTS.md "The directory"; owner, 2026-11-10): the public list of kists anyone may stow, at `kists.fgtw.org/kists.vsf` over plain HTTP, built by tools/kistcat and read by the device's stower.
 ///
-/// - **It vouches for nothing.** Anyone may list a kist and no account installs one. The device checks the capsule's blake3 against its entry and the capsule's developer signature at install; the directory's own signature (every egg of the ferros project key) only keeps a mirror, or anything on the path between, from editing the list.
+/// - **It vouches for nothing.** Anyone may list a kist and no account stows one. The device checks the capsule's blake3 against its entry and the capsule's developer signature at stow; the directory's own signature (every egg of the ferros project key) only keeps a mirror, or anything on the path between, from editing the list.
 /// - **One VSF document**, signed with every scheme ([`fgtw::release::release_slots`], the slots the bridge reserves for a kist) and stamped with its Eagle time: a section `kist` per entry and a section `metrics` per entry, each field named and typed and read by its type marker, never by position.
-/// - **Text is ASCII** (`a`): the device's installer is no_std, and vsf decodes UTF-8 text (`x`, Huffman coded) only with std, as the person's list and the capsule's declaration already have it.
+/// - **Text is ASCII** (`a`): the device's stower is no_std, and vsf decodes UTF-8 text (`x`, Huffman coded) only with std, as the person's list and the capsule's declaration already have it.
 #[cfg(feature = "directory")]
 pub mod directory {
     use super::*;
@@ -1342,7 +1342,7 @@ pub mod directory {
     pub enum Source {
         /// `path` (`a`): an exact path on [`HOST`], `/capsules/<blake3>.vsf`, the capsule's bytes kept by their own hash.
         Path(String),
-        /// `manifest` (`nu`, a plain-http URL), `platform` and `arch` (`a`): the developer's own signed manifest (Photon's `manifest-release.vsf`). The device fetches it, checks that the entry's developer signed it with every egg, and takes the artefact section whose `platform` and `arch` are these; that artefact's blake3 must be the entry's `capsule`, or the manifest has moved past the directory and nothing is installed until the directory is rebuilt.
+        /// `manifest` (`nu`, a plain-http URL), `platform` and `arch` (`a`): the developer's own signed manifest (Photon's `manifest-release.vsf`). The device fetches it, checks that the entry's developer signed it with every egg, and takes the artefact section whose `platform` and `arch` are these; that artefact's blake3 must be the entry's `capsule`, or the manifest has moved past the directory and nothing is stowed until the directory is rebuilt.
         Manifest { url: String, platform: String, arch: String },
     }
 
@@ -1385,7 +1385,7 @@ pub mod directory {
     }
 
     fn text(what: &str, s: &str) -> Result<VsfType, String> {
-        Ascii::new(s).map(VsfType::a).map_err(|e| alloc::format!("{what} {s:?}: {e} (the directory's text is ASCII, read by a no_std installer)"))
+        Ascii::new(s).map(VsfType::a).map_err(|e| alloc::format!("{what} {s:?}: {e} (the directory's text is ASCII, read by a no_std stower)"))
     }
 
     /// The `kist` section of one entry.
@@ -1435,7 +1435,7 @@ pub mod directory {
         b.build()
     }
 
-    /// The directory UNSIGNED: a complete VSF document stamped `made` with its provenance hash and no signer at all, for the time before the project key is chosen (owner, 2026-11-10: the FGTW kaitiakitanga decides it). The device reads it unchecked (`parse_directory`, `signer` None) and its page says so; [`verify_directory`] refuses it. A directory vouches for nothing either way: every capsule is checked against its own developer's bundle at install.
+    /// The directory UNSIGNED: a complete VSF document stamped `made` with its provenance hash and no signer at all, for the time before the project key is chosen (owner, 2026-11-10: the FGTW kaitiakitanga decides it). The device reads it unchecked (`parse_directory`, `signer` None) and its page says so; [`verify_directory`] refuses it. A directory vouches for nothing either way: every capsule is checked against its own developer's bundle at stow.
     pub fn build_open(kists: &[Entry], made: i64) -> Result<Vec<u8>, String> {
         let mut b = vsf::VsfBuilder::new().creation_time_oscillations(made).provenance_only();
         for e in kists {

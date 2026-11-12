@@ -97,7 +97,7 @@ In a folder world it would be `DCIM/Camera/IMG_20261111_140212.jpg` and every ot
 Sonic 2 on the Genesis kist, saved in slot 0.
 Kind "Sega Genesis save state", made by Genesis, attributes the ROM's hash (`rom`), the game's title and the slot, related to the ROM item it was played from.
 Genesis finds it by asking "save states of this ROM", and the person finds it by typing "Sonic".
-Reinstalling Genesis, a new device, or a different build of Genesis (part 1) all find the same saves, because nothing about them depends on where Genesis put them.
+Restowing Genesis, a new device, or a different build of Genesis (part 1) all find the same saves, because nothing about them depends on where Genesis put them.
 
 **A downloaded map area.**
 Mahere downloads the terrain and roads around Raglan for use offline.
@@ -162,7 +162,7 @@ A kist that keeps things for the person declares, in its signed capsule, each ki
 
 - **Making** a declared kind, and opening again what it made itself, is the `items` right.
 - **Opening** a kind made by anyone (other kists, other builds, the person's other devices) is asked per kind.
-- **Asked once, ever**, per person, per kist, per kind (owner, 2026-11-07: "1 means 1"), and at the person's first action that needs it, never at install or launch (owner, 2026-11-10, permissions_asked_once: "maybe I never share my location with anyone so there's no reason for Photon to ever ask me"): Genesis asks to open the person's save states the first time they open its load page.
+- **Asked once, ever**, per person, per kist, per kind (owner, 2026-11-07: "1 means 1"), and at the person's first action that needs it, never at stow or launch (owner, 2026-11-10, permissions_asked_once: "maybe I never share my location with anyone so there's no reason for Photon to ever ask me"): Genesis asks to open the person's save states the first time they open its load page.
 - **Read and write apart**, as VAULT-OUT.md decision 2 has the common area's names: changing an item made by someone else is its own answer (and implies opening, as write implies read there), and makes a new version (part 3), never an overwrite.
 - The kernel stamps each call with the kist's identity and its granted kinds, as it stamps domain keys today (VAULT-OUT.md "Built"), so the store never takes a kist's word for what it may open.
 

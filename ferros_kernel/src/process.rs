@@ -492,7 +492,7 @@ fn arc_resize(arc: &mut Arc, size: usize) -> Result<(), u64> {
     Ok(())
 }
 
-/// Arcs returned to the pools so far: a spawn refused for want of room is tried again only once this has moved (service.rs, the installer after attest), never on a timer.
+/// Arcs returned to the pools so far: a spawn refused for want of room is tried again only once this has moved (service.rs, the stower after attest), never on a timer.
 pub static ARC_FREES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Return an arc's frames to the pool and its window to the windows' space. Whatever the process held is gone with it: its frames are wiped as they go back (owner, 2026-11-08: every end is one shot dead, no cleanup; the arc was zeroed only when handed out again until then).
@@ -561,8 +561,8 @@ pub enum Object {
     Domain,
     /// Served by the kernel: the right to launch a kist (KISTS.md): `SYS_SPAWN` in kist mode, naming a capsule by its vault address and handing each declared want its right or an empty slot. The kernel makes each right's object itself (`kist_object`), so the holder needs no other grant to hand out; it holds every right a kist may be handed, and is init's alone.
     Kists,
-    /// Served by the kernel: the right to install a kist (SANDBOX.md "Lifecycle"): `SYS_SPAWN` in install mode names a capsule the holder stored in `capsules.`, and the kernel reads it from the vault, gates it, runs the sandbox checker over its masked code and seals it into the `sealed` list, telling the holder each stage on a word in its own arc (`install_request`). The installer's (payloads/kists), never a kist's.
-    Install,
+    /// Served by the kernel: the right to stow a kist (SANDBOX.md "Lifecycle"): `SYS_SPAWN` in stow mode names a capsule the holder stored in `capsules.`, and the kernel reads it from the vault, gates it, runs the sandbox checker over its masked code and seals it into the `sealed` list, telling the holder each stage on a word in its own arc (`stow_request`). The stower's (payloads/kists), never a kist's.
+    Stow,
     /// A slot left empty: a want the person said no to (owner, 2026-11-08: "a denied right is an empty slot, never a fake"). Its token is zeros and nothing looks it up.
     Empty,
     /// A region of the layer arena to be (GPU-KISTS.md plan step 1, 2026-11-12): a spawn turns it into the largest free block of the arena no larger than 2^n bytes, the child's own (`Dma` of a `layers-block`), wiped as it is given (`region_take`); an empty slot when none is free. Never held, as `NewSurface` is not: a parent that passes the whole arena passes a 32 MiB one of these instead (SYS_SPAWN).
@@ -615,7 +615,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Domain => (19, 0),
         Object::Kists => (20, 0),
         Object::Empty => (21, 0),
-        Object::Install => (22, 0),
+        Object::Stow => (22, 0),
         Object::NewRegion(n) => (23, n as u64),
         Object::SpareSurface => (24, 0),
     };
@@ -1284,7 +1284,7 @@ const SYS_BELL: u64 = 38;
 const SYS_NOT_STARTED: u64 = 39;
 /// arc(op, bytes): the caller's own arc grows or shrinks (ARCS.md step 2; owner, 2026-11-11: "why we cannot scale on demand, that was the whole point of ring memory"). No capability: a process reaches only its own arc, and only as far as its ceiling (`Arc::ceiling`: the most its build declared, its header's heap counted whole; fixed mode's size). Op 0 `ARC_GROW`: at least x1 more bytes (native: whole frames; ring: the mask doubles until they fit; exact: the limit moves) → x0 the new top (the arc's size, exact mode's limit), x1 the old one; the bytes between are new, zeroed, the process's. Op 1 `ARC_SHRINK`: keep the first x1 bytes (rounded up as the mode needs; never under what the process was spawned with) and give the rest back → x0 the new top, x1 the old. Op 2 `ARC_SIZE` → x0 the top, x1 the ceiling. Op 3 `ARC_RELEASE`: the frames wholly inside x2 bytes from arc offset x1 given back while the arc keeps its size (step 4; never the first frame, nor one the kernel holds a word in): a hole the process must not touch again until a grow over it → x0 the bytes given back, x1 the top. A masked arc's grow or shrink while another of its threads runs elsewhere holds the process off the cores first (`hold`, step 3): its mask or limit changes in every thread at once. Refused: x0 = ERR, x1 the reason (`ARC_WHY_*`), said on the console too.
 const SYS_ARC: u64 = 40;
-/// offer(op, install, …): the kist offered over USB to stow (`OFFER`; docs/KISTS.md "Stowing", ferros_kist::offer; owner, 2026-11-11: "Just seems to me that we should just make a proper checked path and start using it"), for the installer alone: x1 the offset of its Install token (`Object::Install`). Op 0: the offers' doorbell, x2 a word in the caller's arc: the offers' change count written there now and whenever a host offers a kist, its waiters woken (`bell_register`, `BELL_OFFERS`) → 0. Op 1: the offer not yet ended, x2/x3 a buffer and its length (40 at least) → 0 with [capsule 32][length u64 LE] written (an offer still OFFERED becomes CHECKING), NOTHING when there is none. Op 2: its state as the installer has it, x2/x3 [capsule 32][state u8][why u8][flags u8] → 0, NOTHING when that capsule is not the offer or the offer has ended; the service loop answers a host's held read (`offer_state`). ERR without the Install right, or for no such op.
+/// offer(op, stow, …): the kist offered over USB to stow (`OFFER`; docs/KISTS.md "Stowing", ferros_kist::offer; owner, 2026-11-11: "Just seems to me that we should just make a proper checked path and start using it"), for the stower alone: x1 the offset of its Stow token (`Object::Stow`). Op 0: the offers' doorbell, x2 a word in the caller's arc: the offers' change count written there now and whenever a host offers a kist, its waiters woken (`bell_register`, `BELL_OFFERS`) → 0. Op 1: the offer not yet ended, x2/x3 a buffer and its length (40 at least) → 0 with [capsule 32][length u64 LE] written (an offer still OFFERED becomes CHECKING), NOTHING when there is none. Op 2: its state as the stower has it, x2/x3 [capsule 32][state u8][why u8][flags u8] → 0, NOTHING when that capsule is not the offer or the offer has ended; the service loop answers a host's held read (`offer_state`). ERR without the Stow right, or for no such op.
 const SYS_OFFER: u64 = 41;
 /// caller(reply): what the process behind a call holds that its server decides by (2026-11-12, the display's isolation: until then any app could show, draw into, raise or read the events of another app's surface by naming it). x0 the offset of a reply token the caller holds (SYS_RECV's, not yet replied) → bits 0-3 the surfaces that process holds (surface k as its own `surface-k`, or inside a region holding it whole: the display server's and the GPU service's `surfaces`), bit 8 the Settings capability (the map, the attest screen: the system's window management), bit 9 a kist (`CALLER_*`); NOTHING for a token that is no reply this process holds, or one for the kernel's own call. No capability: the token is the proof, and only the server the call came to holds it. A kernel from before answers ERR (no such syscall), which a server takes as a refusal.
 const SYS_CALLER: u64 = 42;
@@ -1294,7 +1294,7 @@ pub const ARC_GROW: u64 = 0;
 pub const ARC_SHRINK: u64 = 1;
 pub const ARC_SIZE: u64 = 2;
 pub const ARC_RELEASE: u64 = 3;
-/// Why SYS_ARC refused: past the arc's ceiling, too few free frames in the pool, (no longer: a masked arc with another of its threads running on another core, which is held now), under what the process was spawned with, over a word the kernel holds in it (a bell, the sensors' block, the installer's word), an unknown op.
+/// Why SYS_ARC refused: past the arc's ceiling, too few free frames in the pool, (no longer: a masked arc with another of its threads running on another core, which is held now), under what the process was spawned with, over a word the kernel holds in it (a bell, the sensors' block, the stower's word), an unknown op.
 pub const ARC_WHY_CEILING: u64 = 1;
 pub const ARC_WHY_MEMORY: u64 = 2;
 /// Answered only before step 3 held the process instead (2026-11-11): kept so the number is never reused.
@@ -1939,9 +1939,9 @@ pub static STORES: &[StoreScope] = &[
     StoreScope { name: "gpu", prefix: "gpu." },
     // The vault process's proof (payloads/vaulttest): scratch, nothing kept.
     StoreScope { name: "test", prefix: "test." },
-    // Installed kists' signed capsules (KISTS.md), the device's: each under its own content address (the blake3 of the capsule, a 32-byte address name), so two people on one device who installed the same app share one copy. The kernel reads them to launch a kist; the installer writes them.
+    // Stowed kists' signed capsules (KISTS.md), the device's: each under its own content address (the blake3 of the capsule, a 32-byte address name), so two people on one device who stowed the same app share one copy. The kernel reads them to launch a kist; the stower writes them.
     StoreScope { name: "capsules", prefix: "capsules." },
-    // The person's list of installed kists and their answers (`kists.list`, ferros_kist; identity class, kvault IDENTITY): init reads it to launch a kist, the map shows it and writes the person's answers. Stands for the common area's `kists` until the common area's named grants exist (VAULT-OUT.md).
+    // The person's list of stowed kists and their answers (`kists.list`, ferros_kist; identity class, kvault IDENTITY): init reads it to launch a kist, the map shows it and writes the person's answers. Stands for the common area's `kists` until the common area's named grants exist (VAULT-OUT.md).
     StoreScope { name: "kists", prefix: "kists." },
 ];
 /// The context deriving a process's own domain name (`Process::domain`) from its ihi.
@@ -2435,7 +2435,7 @@ pub fn vault_stamp(op: u8, full: &str, rest: &[u8]) -> Option<Vec<u8>> {
     with_lock_held_or(|| stamp(op, sc.prefix.as_bytes(), &[crate::kvault::identity_class(full)], rel, rest))
 }
 
-/// A stamp for the kernel's own call on an entry of the scope named `scope` that is named by a 32-byte address (an installed kist's capsule, by its blake3): the scope's domain in its class. None for no such scope, or a locked class.
+/// A stamp for the kernel's own call on an entry of the scope named `scope` that is named by a 32-byte address (a stowed kist's capsule, by its blake3): the scope's domain in its class. None for no such scope, or a locked class.
 pub fn vault_stamp_addr(op: u8, scope: &str, addr: &[u8; 32], rest: &[u8]) -> Option<Vec<u8>> {
     let sc = STORES.iter().find(|s| s.name == scope)?;
     let mut name = Vec::with_capacity(33);
@@ -3719,19 +3719,19 @@ fn el0_trap(f: &mut Frame) -> u64 {
             0
         }
         SYS_OFFER => {
-            let install = |at: u64| {
+            let stow = |at: u64| {
                 let token = p.read(at, 32);
-                matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Install, r)) if r & RIGHT_SEND != 0)
+                matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Stow, r)) if r & RIGHT_SEND != 0)
             };
             let offer = unsafe { &mut *(&raw mut OFFER) };
             f.x[0] = match f.x[0] {
-                0 if install(f.x[1]) => bell_register(p, pi, BELL_OFFERS, f.x[2], BELL_COUNT[BELL_OFFERS].load(core::sync::atomic::Ordering::Acquire)),
+                0 if stow(f.x[1]) => bell_register(p, pi, BELL_OFFERS, f.x[2], BELL_COUNT[BELL_OFFERS].load(core::sync::atomic::Ordering::Acquire)),
                 // WHY the length: the buffer is the caller's; the answer is 40 bytes, written whole or not at all.
-                1 if install(f.x[1]) && f.x[3] >= 40 => match offer.as_mut().filter(|o| !ferros_kist::offer::finished(o.state)) {
+                1 if stow(f.x[1]) && f.x[3] >= 40 => match offer.as_mut().filter(|o| !ferros_kist::offer::finished(o.state)) {
                     Some(o) => {
                         if o.state == ferros_kist::offer::OFFERED {
                             o.state = ferros_kist::offer::CHECKING;
-                            crate::flashlog::line("kist offer: the installer took it");
+                            crate::flashlog::line("kist offer: the stower took it");
                         }
                         let mut out = [0u8; 40];
                         out[..32].copy_from_slice(&o.capsule);
@@ -3742,12 +3742,12 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     None => NOTHING,
                 },
                 // WHY the length: the buffer is the caller's; the state is 35 bytes, read whole.
-                2 if install(f.x[1]) && f.x[3] >= 35 => {
+                2 if stow(f.x[1]) && f.x[3] >= 35 => {
                     let b = p.read(f.x[2], 35);
                     match offer.as_mut().filter(|o| o.capsule[..] == b[..32] && !ferros_kist::offer::finished(o.state)) {
                         Some(o) => {
                             if (o.state, o.why, o.flags) != (b[32], b[33], b[34]) {
-                                crate::flashlog::line(&alloc::format!("kist offer: the installer says {} (why A#{}, flags A#{})", ferros_kist::offer::state_name(b[32]), b[33], b[34]));
+                                crate::flashlog::line(&alloc::format!("kist offer: the stower says {} (why A#{}, flags A#{})", ferros_kist::offer::state_name(b[32]), b[33], b[34]));
                             }
                             o.state = b[32];
                             o.why = b[33];
@@ -3931,9 +3931,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
-        // Install mode (x2 bit 3): a kist the installer stored, read, checked and sealed by the service loop (`install_request`).
+        // Stow mode (x2 bit 3): a kist the stower stored, read, checked and sealed by the service loop (`stow_request`).
         SYS_SPAWN if f.x[2] & 8 != 0 => {
-            f.x[0] = install_request(p, pi, &p.read(f.x[0], (f.x[1] as usize).min(4096)), f.x[2] & 16 != 0);
+            f.x[0] = stow_request(p, pi, &p.read(f.x[0], (f.x[1] as usize).min(4096)), f.x[2] & 16 != 0);
             0
         }
         SYS_SPAWN if f.x[2] & 2 != 0 => {
@@ -4391,7 +4391,7 @@ pub const BELL_FACTS: usize = 6;
 const BELL_CLAIMS: usize = 7;
 const BELL_KISTS: usize = 8;
 const BELL_SURFACES: usize = 9;
-/// The offers' (SYS_OFFER op 0, for the Install holder): a host offered a kist to stow.
+/// The offers' (SYS_OFFER op 0, for the Stow holder): a host offered a kist to stow.
 const BELL_OFFERS: usize = 10;
 const BELLS: usize = 11;
 /// Each source's change count (the claims' is GPS_CLAIMS'), so a word registered late starts from the count now and a reader tells a change by inequality.
@@ -4596,7 +4596,7 @@ fn hold_try(pi: usize) {
     kick(0xFFFF);
 }
 
-/// Process `pi`'s arc moved to other frames, while none of its threads is on a core: each frame copied by its own address (the kernel's: cachemap frame_block) to a frame `frames::take` gives (the first free in the map's order), the copy's level-3 table written from the old one with every page's permissions kept (W^X, the grants page, BTI's guarded pages, the guards), the window's slot pointed at it, every core's TLB told, the old frames wiped back into the pool. The window, so every address the process holds, x28, x27 and every kernel record of the arc (bells, waits, the installer's word, the sensors' block), stay as they were: nothing is rewritten. DMA regions are not in an arc and never move. `held` is how long the process waited off the cores for it; the copy and the whole pause go on the console. Under the kernel lock.
+/// Process `pi`'s arc moved to other frames, while none of its threads is on a core: each frame copied by its own address (the kernel's: cachemap frame_block) to a frame `frames::take` gives (the first free in the map's order), the copy's level-3 table written from the old one with every page's permissions kept (W^X, the grants page, BTI's guarded pages, the guards), the window's slot pointed at it, every core's TLB told, the old frames wiped back into the pool. The window, so every address the process holds, x28, x27 and every kernel record of the arc (bells, waits, the stower's word, the sensors' block), stay as they were: nothing is rewritten. DMA regions are not in an arc and never move. `held` is how long the process waited off the cores for it; the copy and the whole pause go on the console. Under the kernel lock.
 fn arc_move(pi: usize, held: u64) {
     use crate::frames::FRAME;
     let kk = k();
@@ -5246,8 +5246,8 @@ pub enum Grant<'a> {
     Domain,
     /// The right to launch kists (`Object::Kists`): init's.
     Kists,
-    /// The right to install kists (`Object::Install`): the installer's (payloads/kists).
-    Install,
+    /// The right to stow kists (`Object::Stow`): the stower's (payloads/kists).
+    Stow,
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -5511,7 +5511,7 @@ fn kist_sealed(capsule: &mut [u8], co: usize, cl: usize, sealed: &[u8]) -> Resul
     let m = crate::oracle::masked_modes(capsule, co, cl).map_err(|e| (why::CHECKS, e))?;
     let s = crate::oracle::seal_parts(&g.developer_pubkey, &g.hp, true, &m, &capsule[co..co + cl]).ok_or((why::OTHER, "no system secret: cannot check a seal"))?;
     if !sealed.chunks_exact(32).any(|e| e == s) {
-        return Err((why::NOT_HERE, "gate: masked kist not installed on this device (no seal)"));
+        return Err((why::NOT_HERE, "gate: masked kist not stowed on this device (no seal)"));
     }
     Ok((g, m))
 }
@@ -5521,7 +5521,7 @@ pub type KistFault = (u8, &'static str);
 /// Not a fault: a process of the kist's name started while its capsule was read, so it runs and nothing is kept for the map.
 pub const KIST_ALREADY: u8 = u8::MAX;
 
-/// A kist whose capsule the service loop streamed from the vault into `arc` at the code offset (`total` bytes): it must be the capsule named (its blake3 is its vault address), pass the gate where it lies, and declare every right handed to it in the slot it is handed in (`ferros_kist::want_codes`: nothing undeclared can be granted). Masked code runs only with its seal in `sealed` (the installer's, `install_kist`), the checker never run again; native code only in a development build (the bridge's `kist install`). Then the code moves down, the rest is zeroed, and the process is built with exactly the launch's objects, queued to run, and what was kept of its last launch not starting dropped (`kist_started`). On any refusal the arc goes back to the pool, and the reason comes back as the map shows it (`ferros_kist::launch::why`).
+/// A kist whose capsule the service loop streamed from the vault into `arc` at the code offset (`total` bytes): it must be the capsule named (its blake3 is its vault address), pass the gate where it lies, and declare every right handed to it in the slot it is handed in (`ferros_kist::want_codes`: nothing undeclared can be granted). Masked code runs only with its seal in `sealed` (the stower's, `stow_kist`), the checker never run again; native code only in a development build (the bridge's `kist stow`). Then the code moves down, the rest is zeroed, and the process is built with exactly the launch's objects, queued to run, and what was kept of its last launch not starting dropped (`kist_started`). On any refusal the arc goes back to the pool, and the reason comes back as the map shows it (`ferros_kist::launch::why`).
 pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Result<(), KistFault> {
     use ferros_kist::launch::why;
     let mut arc = arc;
@@ -5650,17 +5650,17 @@ fn kists_live() -> Vec<[u8; 32]> {
     k().procs.iter().flatten().filter(|q| q.kist && !q.dying).filter_map(|q| q.capsule).collect()
 }
 
-/// An install the installer asked for (`install_request`): the capsule by its vault address, and where to tell it each stage: the process (its slot and epoch, so a word is never written into a successor's arc) and the word's address in its arc.
-pub struct KistInstall {
+/// A stow the stower asked for (`stow_request`): the capsule by its vault address, and where to tell it each stage: the process (its slot and epoch, so a word is never written into a successor's arc) and the word's address in its arc.
+pub struct KistStow {
     pub capsule: [u8; 32],
-    /// A stow's check (`SYS_SPAWN` install mode with x2 bit 4, ferros_sys `stow_check`): native code on a development build is taken unchecked (`INSTALL_DONE` with `INSTALL_NATIVE`) instead of refused.
+    /// A stow's check (`SYS_SPAWN` stow mode with x2 bit 4, ferros_sys `stow_check`): native code on a development build is taken unchecked (`STOW_DONE` with `STOW_NATIVE`) instead of refused.
     pub native_ok: bool,
     proc: usize,
     epoch: u64,
     word: usize,
 }
 
-/// The kist a host offered over USB to stow (PT `ferros.kist.offer`, service.rs; docs/KISTS.md "Stowing", ferros_kist::offer): its capsule's address in `capsules.` and its length, its state as the installer last told it (SYS_OFFER op 2), why it was refused, and its flags. One at a time; kept after it ends until the next replaces it, so the host reads its end. Under the kernel lock.
+/// The kist a host offered over USB to stow (PT `ferros.kist.offer`, service.rs; docs/KISTS.md "Stowing", ferros_kist::offer): its capsule's address in `capsules.` and its length, its state as the stower last told it (SYS_OFFER op 2), why it was refused, and its flags. One at a time; kept after it ends until the next replaces it, so the host reads its end. Under the kernel lock.
 pub struct Offer {
     pub capsule: [u8; 32],
     pub len: u64,
@@ -5670,7 +5670,7 @@ pub struct Offer {
 }
 static mut OFFER: Option<Offer> = None;
 
-/// A host offers the capsule it carried in whole: kept as OFFERED and the offers' bell rung (the installer takes it). Err while another offer has not ended (the person has not answered it yet).
+/// A host offers the capsule it carried in whole: kept as OFFERED and the offers' bell rung (the stower takes it). Err while another offer has not ended (the person has not answered it yet).
 pub fn offer_put(capsule: [u8; 32], len: u64) -> Result<(), &'static str> {
     with_lock(|| {
         let o = unsafe { &mut *(&raw mut OFFER) };
@@ -5705,34 +5705,34 @@ pub fn offer_drop() {
         }
     })
 }
-/// One install at a time, beside one launch: the service loop streams one capsule through the kernel's channel at once (launches first). Under the kernel lock.
-static mut KIST_INSTALL: Option<KistInstall> = None;
+/// One stow at a time, beside one launch: the service loop streams one capsule through the kernel's channel at once (launches first). Under the kernel lock.
+static mut KIST_STOW: Option<KistStow> = None;
 
-/// The stages an install is told in (bits 56-63 of the word; ferros_sys `install` mirrors them): reading the capsule from the vault (the bytes read so far below), checking its code, sealing it, done (the word's low bits 0), refused (the low byte the reason, `INSTALL_WHY_*`, said on the console too).
-pub const INSTALL_READING: u64 = 0;
-pub const INSTALL_CHECKING: u64 = 1;
-pub const INSTALL_SEALING: u64 = 2;
-pub const INSTALL_DONE: u64 = 3;
-pub const INSTALL_REFUSED: u64 = 4;
-/// Why an install was refused: the vault's capsule is not the one named, its sections do not read, it is native code (a development build: never installed from the network, owner 2026-11-10), its signature does not verify, its masked fields do not read, the checker refused its code, no system secret to seal with, the vault would not keep the seal, the vault could not read it, no arc for it.
-pub const INSTALL_WHY_NOT_NAMED: u64 = 1;
-pub const INSTALL_WHY_SECTIONS: u64 = 2;
-pub const INSTALL_WHY_NATIVE: u64 = 3;
-pub const INSTALL_WHY_SIGNATURE: u64 = 4;
-pub const INSTALL_WHY_MODES: u64 = 5;
-pub const INSTALL_WHY_CHECKER: u64 = 6;
-pub const INSTALL_WHY_SECRET: u64 = 7;
-pub const INSTALL_WHY_KEPT: u64 = 8;
-pub const INSTALL_WHY_READ: u64 = 9;
-pub const INSTALL_WHY_ROOM: u64 = 10;
-/// `INSTALL_DONE`'s value for a stow's check that found native code on a development build (`KistInstall::native_ok`): taken unchecked, nothing sealed.
-pub const INSTALL_NATIVE: u64 = 1;
+/// The stages a stow is told in (bits 56-63 of the word; ferros_sys `stow` mirrors them): reading the capsule from the vault (the bytes read so far below), checking its code, sealing it, done (the word's low bits 0), refused (the low byte the reason, `STOW_WHY_*`, said on the console too).
+pub const STOW_READING: u64 = 0;
+pub const STOW_CHECKING: u64 = 1;
+pub const STOW_SEALING: u64 = 2;
+pub const STOW_DONE: u64 = 3;
+pub const STOW_REFUSED: u64 = 4;
+/// Why a stow was refused: the vault's capsule is not the one named, its sections do not read, it is native code (a development build: never stowed from the network, owner 2026-11-10), its signature does not verify, its masked fields do not read, the checker refused its code, no system secret to seal with, the vault would not keep the seal, the vault could not read it, no arc for it.
+pub const STOW_WHY_NOT_NAMED: u64 = 1;
+pub const STOW_WHY_SECTIONS: u64 = 2;
+pub const STOW_WHY_NATIVE: u64 = 3;
+pub const STOW_WHY_SIGNATURE: u64 = 4;
+pub const STOW_WHY_MODES: u64 = 5;
+pub const STOW_WHY_CHECKER: u64 = 6;
+pub const STOW_WHY_SECRET: u64 = 7;
+pub const STOW_WHY_KEPT: u64 = 8;
+pub const STOW_WHY_READ: u64 = 9;
+pub const STOW_WHY_ROOM: u64 = 10;
+/// `STOW_DONE`'s value for a stow's check that found native code on a development build (`KistStow::native_ok`): taken unchecked, nothing sealed.
+pub const STOW_NATIVE: u64 = 1;
 
-/// `SYS_SPAWN` in install mode (x2 bit 3; bit 4 a stow's check, `native_ok`): [the capsule's 32-byte address in `capsules.`][the caller's Install token, 32 bytes][the word's offset in its arc, u64 LE]. Queued for the service loop (`install_take`), which reads the capsule from the vault and tells the word each stage, waking whoever waits on it (`install_tell`). 0 queued, ERR refused (the reason on the console): no Install right, a malformed request, another install still under way.
-fn install_request(p: &Process, pi: usize, req: &[u8], native_ok: bool) -> u64 {
+/// `SYS_SPAWN` in stow mode (x2 bit 3; bit 4 a stow's check, `native_ok`): [the capsule's 32-byte address in `capsules.`][the caller's Stow token, 32 bytes][the word's offset in its arc, u64 LE]. Queued for the service loop (`stow_take`), which reads the capsule from the vault and tells the word each stage, waking whoever waits on it (`stow_tell`). 0 queued, ERR refused (the reason on the console): no Stow right, a malformed request, another stow still under way.
+fn stow_request(p: &Process, pi: usize, req: &[u8], native_ok: bool) -> u64 {
     let refuse = |why: &str| {
         let kk = k();
-        kk.console.extend_from_slice(b"kist install refused: ");
+        kk.console.extend_from_slice(b"kist stow refused: ");
         kk.console.extend_from_slice(why.as_bytes());
         kk.console.push(b'\n');
         ERR
@@ -5740,31 +5740,31 @@ fn install_request(p: &Process, pi: usize, req: &[u8], native_ok: bool) -> u64 {
     if req.len() < 72 {
         return refuse("a malformed request");
     }
-    if !matches!(p.lookup(&req[32..64]).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Install, r)) if r & RIGHT_SEND != 0) {
-        return refuse("the caller holds no Install right");
+    if !matches!(p.lookup(&req[32..64]).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Stow, r)) if r & RIGHT_SEND != 0) {
+        return refuse("the caller holds no Stow right");
     }
-    let slot = unsafe { &mut *(&raw mut KIST_INSTALL) };
+    let slot = unsafe { &mut *(&raw mut KIST_STOW) };
     if slot.is_some() {
-        return refuse("another install is still under way");
+        return refuse("another stow is still under way");
     }
     let off = u64::from_le_bytes(req[64..72].try_into().unwrap());
     // The word inside the caller's own arc, as `SYS_WAIT` finds it: aligned, and refused outside the arc.
     let Some(word) = p.word(off) else { return refuse("the word is outside the caller's arc") };
-    *slot = Some(KistInstall { capsule: req[..32].try_into().unwrap(), native_ok, proc: pi, epoch: p.epoch, word });
+    *slot = Some(KistStow { capsule: req[..32].try_into().unwrap(), native_ok, proc: pi, epoch: p.epoch, word });
     unsafe { core::arch::asm!("sev") };
     0
 }
 
-/// The service loop takes the waiting install (after any launch).
-pub fn install_take() -> Option<KistInstall> {
-    with_lock(|| unsafe { (*(&raw mut KIST_INSTALL)).take() })
+/// The service loop takes the waiting stow (after any launch).
+pub fn stow_take() -> Option<KistStow> {
+    with_lock(|| unsafe { (*(&raw mut KIST_STOW)).take() })
 }
 
-/// The installer told a stage: `stage` in bits 56-63, `value` below (the bytes read, or the reason), written into its word and every thread of it waiting there woken. Nothing when the process has ended (its slot empty or a successor's).
-pub fn install_tell(i: &KistInstall, stage: u64, value: u64) {
+/// The stower told a stage: `stage` in bits 56-63, `value` below (the bytes read, or the reason), written into its word and every thread of it waiting there woken. Nothing when the process has ended (its slot empty or a successor's).
+pub fn stow_tell(i: &KistStow, stage: u64, value: u64) {
     with_lock(|| {
         let kk = k();
-        // WHY the arc's end and its holes: the installer may have shrunk its arc or given frames back (SYS_ARC) since it named the word; one there is not written (it would be an unmapped slot, the kernel's own fault).
+        // WHY the arc's end and its holes: the stower may have shrunk its arc or given frames back (SYS_ARC) since it named the word; one there is not written (it would be an unmapped slot, the kernel's own fault).
         if !kk.procs.get(i.proc).and_then(|q| q.as_ref()).is_some_and(|q| q.epoch == i.epoch && !q.dying && i.word + 8 <= q.arc.base + q.arc.size && !q.in_hole(i.word - q.arc.base, 8)) {
             return;
         }
@@ -5780,44 +5780,44 @@ pub fn install_tell(i: &KistInstall, stage: u64, value: u64) {
     });
 }
 
-/// An install's capsule, read from the vault into `arc` at the code offset (`total` bytes), checked as SANDBOX.md's lifecycle says, once: it is the capsule named (its blake3), its code is masked (native code is a development build, never installed from the network), its signature verifies where it lies (`gate_located`, the Ed25519 egg; the installer checked every egg before it stored it), and the sandbox checker passes its instruction span in its mode. Returns the code's span in the arc, for `install_seal`. The arc is the caller's to free.
-pub fn install_check(arc: &Arc, total: usize, addr: &[u8; 32]) -> Result<(crate::oracle::Located, crate::oracle::Modes, usize, usize), u64> {
+/// A stow's capsule, read from the vault into `arc` at the code offset (`total` bytes), checked as SANDBOX.md's lifecycle says, once: it is the capsule named (its blake3), its code is masked (native code is a development build, never stowed from the network), its signature verifies where it lies (`gate_located`, the Ed25519 egg; the stower checked every egg before it stored it), and the sandbox checker passes its instruction span in its mode. Returns the code's span in the arc, for `stow_seal`. The arc is the caller's to free.
+pub fn stow_check(arc: &Arc, total: usize, addr: &[u8; 32]) -> Result<(crate::oracle::Located, crate::oracle::Modes, usize, usize), u64> {
     let capsule = unsafe { core::slice::from_raw_parts_mut((arc.base + CODE) as *mut u8, total) };
-    let say = |why: &str| push_console(alloc::format!("kist install: {why}\n").as_bytes());
+    let say = |why: &str| push_console(alloc::format!("kist stow: {why}\n").as_bytes());
     if blake3::hash(capsule).as_bytes() != addr {
         say("the vault's capsule is not the one named (its blake3)");
-        return Err(INSTALL_WHY_NOT_NAMED);
+        return Err(STOW_WHY_NOT_NAMED);
     }
     let (co, cl, masked) = locate_code(capsule, total).map_err(|e| {
         say(e);
-        INSTALL_WHY_SECTIONS
+        STOW_WHY_SECTIONS
     })?;
     if !masked {
-        say("native code: a development build is not installed from the network");
-        return Err(INSTALL_WHY_NATIVE);
+        say("native code: a development build is not stowed from the network");
+        return Err(STOW_WHY_NATIVE);
     }
     let g = crate::oracle::gate_located(capsule, co, cl).map_err(|e| {
         say(e);
-        INSTALL_WHY_SIGNATURE
+        STOW_WHY_SIGNATURE
     })?;
     let m = crate::oracle::masked_modes(capsule, co, cl).map_err(|e| {
         say(e);
-        INSTALL_WHY_MODES
+        STOW_WHY_MODES
     })?;
     let mode = if m.exact { ferros_sandbox::Mode::Exact } else if m.fixed != 0 { ferros_sandbox::Mode::Fixed(m.fixed) } else { ferros_sandbox::Mode::Ring };
     if let Err(v) = ferros_sandbox::check_image_with(&capsule[co..co + m.text_len], mode, m.bti) {
         say(&alloc::format!("the checker refused its code at +G#{:X} (instruction G#{:08X})", v.offset, v.insn));
-        return Err(INSTALL_WHY_CHECKER);
+        return Err(STOW_WHY_CHECKER);
     }
     Ok((g, m, co, cl))
 }
 
-/// The seal of an install that passed `install_check`: keyed by this device's system secret, so it is good on this device alone.
-pub fn install_seal(arc: &Arc, g: &crate::oracle::Located, m: &crate::oracle::Modes, co: usize, cl: usize) -> Result<[u8; 32], u64> {
+/// The seal of a stow that passed `stow_check`: keyed by this device's system secret, so it is good on this device alone.
+pub fn stow_seal(arc: &Arc, g: &crate::oracle::Located, m: &crate::oracle::Modes, co: usize, cl: usize) -> Result<[u8; 32], u64> {
     let code = unsafe { core::slice::from_raw_parts((arc.base + CODE + co) as *const u8, cl) };
     crate::oracle::seal_parts(&g.developer_pubkey, &g.hp, true, m, code).ok_or_else(|| {
-        push_console(b"kist install: no system secret: cannot seal\n");
-        INSTALL_WHY_SECRET
+        push_console(b"kist stow: no system secret: cannot seal\n");
+        STOW_WHY_SECRET
     })
 }
 
@@ -5867,7 +5867,7 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
             Grant::Vault => (Object::Vault, RIGHT_SEND),
             Grant::Domain => (Object::Domain, RIGHT_SEND),
             Grant::Kists => (Object::Kists, RIGHT_SEND),
-            Grant::Install => (Object::Install, RIGHT_SEND),
+            Grant::Stow => (Object::Stow, RIGHT_SEND),
             Grant::Hardware(n) => match HARDWARE.iter().position(|h| h.name.as_bytes() == *n) {
                 Some(i) => (Object::Hardware(i), RIGHT_SEND | RIGHT_RECV),
                 None => return Err("no such hardware block"),

@@ -30,6 +30,8 @@ fn every_say() -> Vec<(Say<'static>, usize)> {
         (Say::CouldNotStart(H), 1),
         (Say::Stopped(H), 1),
         (Say::ByDeveloper(H), 1),
+        (Say::Fetching { name: H, got: H }, 2),
+        (Say::FetchingOf { name: H, got: H, total: H }, 3),
         (Say::Signal(H), 1),
         (Say::JoiningNet(H), 1),
         (Say::PassphraseFor(H), 1),

@@ -8,7 +8,7 @@ use ferros_sys::{call, freq, now, sleep_until, ERR};
 
 /// The port this side's DNS questions leave from and their answers come to (httptest uses 53053).
 const DNS_PORT: u16 = 53054;
-/// How long a connection may bring nothing before it is given up (WHY a deadline: ip fails a connection only when what it sent goes unanswered, and a GET's long body is all receiving; a server that falls silent would hold the installer's one worker for ever). 32 s, ip's own idle reaping time: the wait of each held receive.
+/// How long a connection may bring nothing before it is given up (WHY a deadline: ip fails a connection only when what it sent goes unanswered, and a GET's long body is all receiving; a server that falls silent would hold the stower's one worker for ever). 32 s, ip's own idle reaping time: the wait of each held receive.
 const STALL_S: u8 = 1 << 5;
 /// The most data one receive brings: 64 KiB, on the worker's 512 KiB stack (ip answers up to 256 KiB; a bigger reply means fewer round trips while a capsule streams in).
 const RECV_MOST: usize = 1 << 16;

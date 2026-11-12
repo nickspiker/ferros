@@ -14,7 +14,7 @@ GPU.md is the driver as built; this is what it grows into.
 - **Mahere** (2026-11-11): "completely triangle raster all the way down. Except for place labels"; "no tilting or 3Dness"; "2-8 triangles per pixel, and each triangle of course has several layers but is one colour"; "The triangle shader shit is more for textures on things, to which we don't have rectangles, no?"; on exact coverage, "and then it'd be a 1:1 per px too, rather than our oversample now, I think 9x or so?"
 - **The order** (2026-11-11): "a proper study, design, plan and then if it looks good, we can build the GPU!"
 - **f16** (2026-11-11): "f16 is likely worth it, we get 2x and most of the mahere composite work can either be done in integer or f16." Valhall's paired half-precision ops run at twice the rate; light, colour, coverage weights and lookups are f16, coordinates stay integer (Mahere's Q30.16 texel addressing: f16's 11 bits cannot hold them).
-- **What a capsule carries** (2026-11-11): "ideally WGSL text becomes VSF compiled by the dev that gets checked and optimized by ferros." The developer's tools compile the source into a typed intermediate form stored as VSF in the capsule; the device validates it (types, buffer bounds, loop limits), optimises it, lowers it to Valhall at install and seals the result; the device never parses shader text (open question 0 closed).
+- **What a capsule carries** (2026-11-11): "ideally WGSL text becomes VSF compiled by the dev that gets checked and optimized by ferros." The developer's tools compile the source into a typed intermediate form stored as VSF in the capsule; the device validates it (types, buffer bounds, loop limits), optimises it, lowers it to Valhall at stow and seals the result; the device never parses shader text (open question 0 closed).
 - **Looks the same, never bit for bit** (2026-11-11): "if it looks roughly similar, that's totally fine. the aspect and resolution from one device to another is going to fuck it up more than anything and the human WILL NOT NOTICE. Just needs to look the same." (open question 2 closed; the wallpaper crate's own promise rewritten to match).
 - **The kept wallpaper's read first** (2026-11-11): "2.9s for a 24MB read is embarassing by the way... that def needs fixed BEFORE we decide to take the pre-rendered disk read out." (open question 3 waits on that fix).
 - **No GPU, no picture** (2026-11-11): "Black until we bring the GPU up. I did say no fallbacks." (open question 4 closed).
@@ -115,7 +115,7 @@ Lacking:
 Mesa's sizes for the same work: bifrost_compile.c 4723 lines, bi_ra.c 1373, va_pack.c 1278, the va_ passes about 1600.
 Valhall issues in order and hides latency by switching warps, so no scheduler at first.
 Ours: about 4-6k lines more in valhall, 2-3k for the naga lowering, and naga itself, a large dependency, in a std compiler process (`gpuc`) whose size is to measure.
-A kist's kernels are compiled at install and sealed with its code (trust model A, 2026-10-15: "No reason to trust pre-compiled capsules").
+A kist's kernels are compiled at stow and sealed with its code (trust model A, 2026-10-15: "No reason to trust pre-compiled capsules").
 The MMU, not the compiler, keeps a kernel inside its memory, so the compiler is outside the isolation's trusted base.
 
 ### 1.3 Buffers and memory
@@ -238,8 +238,8 @@ Each step is measured on the Pro before the next; sizes are estimates.
 5. **Lumis's preview, zero copies:** camera DMA into pinned frames inside both the ISPFE and G3D fences, a kernel from the CFA to a layer; Lumis must first build for ferros.
    - Proof: no CPU copy, CPU time a frame near zero, the sensor's frame end to the layer measured.
    - Size: 200 lines of kernel, 500 in the camera path.
-6. **The kist side:** kernels in the capsule, `gpuc` at install, sealed objects, the ops for kists; production gives kists the GPU once their kernels are checked (no `gpu` in RIGHTS, no settings rows: 1.6).
-   - Proof: a test kist installed, asked once, running; denied, an empty slot; revoked, respawned without it; Mahere launched as a kist with the right.
+6. **The kist side:** kernels in the capsule, `gpuc` at stow, sealed objects, the ops for kists; production gives kists the GPU once their kernels are checked (no `gpu` in RIGHTS, no settings rows: 1.6).
+   - Proof: a test kist stowed, asked once, running; denied, an empty slot; revoked, respawned without it; Mahere launched as a kist with the right.
 
 ## 3. Open questions for the owner
 

@@ -1,7 +1,7 @@
 //! A developer's key (owner, 2026-11-10): the secret kept as VSF in the keys directory, and the public record that names whose kists it signs.
 //! The secret is one `kge`, the Ed25519 seed, in ferros_kist::secret's form (section `developer_key` { label a, seed kge }; that module is its one reader and writer, shared with the bridge and ferros-mkimg); the Falcon-512 and SPHINCS+ halves derive from it under the developer's label (fgtw `SigningBundle::developer`), so the label is part of the key and is never changed.
 //! The record carries the three public keys, the developer's name, contact and web as `x` (the person's words; owner: "x is for text, ascii is for keys, values, labels, system stuff"), the kind, when it was made and its revision, and is signed by every egg of the key it describes: a newer revision of the same key replaces an older one, so a name or contact can change without the key changing.
-//! Later, beside it and not in it: succession to a next key, revocation, a link to the developer's FGTW identity, and the automatic fields (their other kists, download and install counts).
+//! Later, beside it and not in it: succession to a next key, revocation, a link to the developer's FGTW identity, and the automatic fields (their other kists, download and stow counts).
 
 use fgtw::fleet::scheme;
 use fgtw::pq::SigningBundle;

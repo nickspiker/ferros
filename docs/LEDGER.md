@@ -211,7 +211,7 @@ Ledger (root)
 │   ├── Ledger::RingFS::Write
 │   └── Ledger::RingFS::Repair
 ├── Ledger::VSF
-└── Ledger::App::<cap_hash>     per-app, minted at install
+└── Ledger::App::<cap_hash>     per-app, minted at stow
                                 identified by app cap hash, not name
 ```
 
@@ -308,7 +308,7 @@ Userspace Ledger:
    All events from this point: thru Ledger server
    Kernel is just another client — nothing special
 
-5. Application install
+5. Application stow
    Ledger::App::<cap_hash> category minted
    App receives Cap<Write, Ledger::App::<its_cap_hash>>
    Cannot write to any other category

@@ -1,4 +1,4 @@
-//! Fetching a kist's capsule (payloads/kists, the installer; docs/KISTS.md "Install"): the pure half, host-tested.
+//! Fetching a kist's capsule (payloads/kists, the stower; docs/KISTS.md "The stower"): the pure half, host-tested.
 //!
 //! - **The URL**: `http://host[:port]/path`, plain HTTP only (fgtw.org's kists.fgtw.org answers port 80 with no redirect; ferros speaks no TLS yet).
 //! - **The response** decoded as it arrives (`Response`): the status line and the headers, then the body by its length, in chunks, or up to the close. Anything but 200 is the capsule missing there, and nothing of the body is read.

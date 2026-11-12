@@ -148,7 +148,7 @@ async fn main() {
         if state != seen {
             seen = state;
             match state {
-                offer::OFFERED => say("waiting for the device's installer to take it"),
+                offer::OFFERED => say("waiting for the device's stower to take it"),
                 offer::CHECKING => say("the device is checking it: its signature, then its code"),
                 offer::ASKING => {
                     if flags & offer::NATIVE != 0 {

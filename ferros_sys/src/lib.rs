@@ -1515,8 +1515,8 @@ fn kist_call(grants: u64, kists: u64, name: &[u8], capsule: &[u8; 32], codes: &[
     svc(nr::SPAWN, off(req.as_ptr()), at as u64, flags, 0, 0)
 }
 
-/// An install's stages as the kernel tells them on the caller's word (process.rs `install_tell`): the stage in bits 56-63, below it the bytes read so far, or the reason it was refused.
-pub mod install {
+/// A stow's stages as the kernel tells them on the caller's word (process.rs `stow_tell`): the stage in bits 56-63, below it the bytes read so far, or the reason it was refused.
+pub mod stow {
     /// The kernel reading the stored capsule from the vault.
     pub const READING: u64 = 0;
     /// The sandbox checker over its masked code.
@@ -1545,11 +1545,11 @@ pub mod install {
     }
 }
 
-/// Ask the kernel to install a kist this process stored in `capsules.` under `capsule` (SANDBOX.md "Lifecycle": read from the vault, gated, its masked code checked once, sealed to this device): `install` the slot of the Install right, `word` where each stage is told (`install::*`; wait on it with `wait_world`, never ask on a timer). 0 queued, ERR refused (the reason on the console; one install at a time).
-pub fn install_kist(grants: u64, install: u64, capsule: &[u8; 32], word: &core::sync::atomic::AtomicU64) -> u64 {
+/// Ask the kernel to stow a kist this process stored in `capsules.` under `capsule` (SANDBOX.md "Lifecycle": read from the vault, gated, its masked code checked once, sealed to this device): `stow` the slot of the Stow right, `word` where each stage is told (`stow::*`; wait on it with `wait_world`, never ask on a timer). 0 queued, ERR refused (the reason on the console; one stow at a time).
+pub fn stow_kist(grants: u64, stow: u64, capsule: &[u8; 32], word: &core::sync::atomic::AtomicU64) -> u64 {
     let mut req = [0u8; 72];
     req[..32].copy_from_slice(capsule);
-    let tok = (arc_base() + cap(grants, install)) as *const u8;
+    let tok = (arc_base() + cap(grants, stow)) as *const u8;
     for i in 0..32 {
         req[32 + i] = unsafe { core::ptr::read_volatile(tok.add(i)) };
     }
@@ -1557,11 +1557,11 @@ pub fn install_kist(grants: u64, install: u64, capsule: &[u8; 32], word: &core::
     svc(nr::SPAWN, off(req.as_ptr()), req.len() as u64, 8, 0, 0)
 }
 
-/// `install_kist` for a kist offered to stow (docs/KISTS.md "Stowing"): the same check and seal, except that native code on a development build is taken unchecked (told DONE with `install::NATIVE`), as the bridge's development door took it; a production build refuses it as the directory's path does (`install::WHY_NATIVE`). The kernel sees native code in the capsule's first bytes and reads no further.
-pub fn stow_check(grants: u64, install: u64, capsule: &[u8; 32], word: &core::sync::atomic::AtomicU64) -> u64 {
+/// `stow_kist` for a kist offered to stow (docs/KISTS.md "Stowing"): the same check and seal, except that native code on a development build is taken unchecked (told DONE with `stow::NATIVE`), as the bridge's development door took it; a production build refuses it as the directory's path does (`stow::WHY_NATIVE`). The kernel sees native code in the capsule's first bytes and reads no further.
+pub fn stow_check(grants: u64, stow: u64, capsule: &[u8; 32], word: &core::sync::atomic::AtomicU64) -> u64 {
     let mut req = [0u8; 72];
     req[..32].copy_from_slice(capsule);
-    let tok = (arc_base() + cap(grants, install)) as *const u8;
+    let tok = (arc_base() + cap(grants, stow)) as *const u8;
     for i in 0..32 {
         req[32 + i] = unsafe { core::ptr::read_volatile(tok.add(i)) };
     }
@@ -1569,30 +1569,30 @@ pub fn stow_check(grants: u64, install: u64, capsule: &[u8; 32], word: &core::sy
     svc(nr::SPAWN, off(req.as_ptr()), req.len() as u64, 8 | 16, 0, 0)
 }
 
-/// The kist offered over USB to stow (kernel SYS_OFFER; docs/KISTS.md "Stowing", ferros_kist::offer), for the installer alone: it holds the Install right (`install`, the token's offset in the grants page, as `cap` gives it).
+/// The kist offered over USB to stow (kernel SYS_OFFER; docs/KISTS.md "Stowing", ferros_kist::offer), for the stower alone: it holds the Stow right (`stow`, the token's offset in the grants page, as `cap` gives it).
 pub mod offer {
     use super::{nr, off, svc, ERR, NOTHING};
-    /// The offers' doorbell: the kernel writes its change count into `word` now and whenever a host offers a kist, waking whatever waits on it (`wait_world`). False without the Install right, or a kernel without it.
-    pub fn doorbell(install: u64, word: &core::sync::atomic::AtomicU64) -> bool {
-        svc(nr::OFFER, 0, install, off(word as *const _ as *const u8), 0, 0) == 0
+    /// The offers' doorbell: the kernel writes its change count into `word` now and whenever a host offers a kist, waking whatever waits on it (`wait_world`). False without the Stow right, or a kernel without it.
+    pub fn doorbell(stow: u64, word: &core::sync::atomic::AtomicU64) -> bool {
+        svc(nr::OFFER, 0, stow, off(word as *const _ as *const u8), 0, 0) == 0
     }
-    /// The offer not yet ended, if one is: its capsule's address and length. The installer checks it from there (it is in `capsules.`); taking it again (a restarted installer) gives the same offer.
-    pub fn take(install: u64) -> Option<([u8; 32], u64)> {
+    /// The offer not yet ended, if one is: its capsule's address and length. The stower checks it from there (it is in `capsules.`); taking it again (a restarted stower) gives the same offer.
+    pub fn take(stow: u64) -> Option<([u8; 32], u64)> {
         let mut b = [0u8; 40];
-        let r = svc(nr::OFFER, 1, install, off(b.as_mut_ptr()), b.len() as u64, 0);
+        let r = svc(nr::OFFER, 1, stow, off(b.as_mut_ptr()), b.len() as u64, 0);
         if r == ERR || r == NOTHING {
             return None;
         }
         Some((b[..32].try_into().unwrap(), u64::from_le_bytes(b[32..].try_into().unwrap())))
     }
-    /// The offer's state as the installer has it (ferros_kist::offer: CHECKING, ASKING, STOWED, REFUSED with its why, CANCELLED; flags bit 0 native), which the kernel answers the host's held read with. False when `capsule` is not the offer (another replaced it).
-    pub fn tell(install: u64, capsule: &[u8; 32], state: u8, why: u8, flags: u8) -> bool {
+    /// The offer's state as the stower has it (ferros_kist::offer: CHECKING, ASKING, STOWED, REFUSED with its why, CANCELLED; flags bit 0 native), which the kernel answers the host's held read with. False when `capsule` is not the offer (another replaced it).
+    pub fn tell(stow: u64, capsule: &[u8; 32], state: u8, why: u8, flags: u8) -> bool {
         let mut b = [0u8; 35];
         b[..32].copy_from_slice(capsule);
         b[32] = state;
         b[33] = why;
         b[34] = flags;
-        svc(nr::OFFER, 2, install, off(b.as_ptr()), b.len() as u64, 0) == 0
+        svc(nr::OFFER, 2, stow, off(b.as_ptr()), b.len() as u64, 0) == 0
     }
 }
 

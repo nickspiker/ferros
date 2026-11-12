@@ -111,7 +111,7 @@ The order of trust and the details are **Proposed**, built as one pure function 
 **Proposed** order (the `trusted` list, best first):
 0. **Theirs**: the person's own key (open question 10: the identity's key, or each of their devices').
 1. **Their contacts'**: the keys of people in their phonebook (fgtw), in the order the person ranks them, else as listed.
-2. **The developer's**: for a kist's ideas, the bundle the person's list pins for that developer (KISTS.md "Trust on first install"); for ferros's own words, the owner's developer key.
+2. **The developer's**: for a kist's ideas, the bundle the person's list pins for that developer (KISTS.md "Trust on first stow"); for ferros's own words, the owner's developer key.
 3. **The project's**: ferros's project key once chosen (KISTS.md, "Which key signs the directory"); Photon's release key for Photon's words.
 
 Verifying a sheet needs the signer's whole bundle (`fgtw::pq::KeyBundle`), which the device already holds for each of these (the pin, the phonebook, the pinned release bundle); ranking needs only their Ed25519 keys.
@@ -133,7 +133,7 @@ A key the person does not trust contributes nothing but self-proving first phras
 **Proposed:**
 - The capsule's own `phrasing` (and `link`) sections, under its eggs: for every idea it names, at least the first phrasing, and the developer's phrasings in every language they have.
 - Kist text names ideas: a want's reason becomes an `hi` in place of today's `a` line, as may the kist's description; its name stays a name, never translated (ferros_lang's rule).
-- At install the device keeps the capsule's sheet beside the capsule: the developer's phrasings are trusted as the pin is, and every first phrasing proves itself, so a kist's reasons always have words.
+- At stow the device keeps the capsule's sheet beside the capsule: the developer's phrasings are trusted as the pin is, and every first phrasing proves itself, so a kist's reasons always have words.
 
 ## Migrating ferros_lang (plan only, nothing migrated yet)
 

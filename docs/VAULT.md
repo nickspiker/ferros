@@ -521,7 +521,7 @@ Ledger namespace:
 App namespace:
   Cap<Write, Vault::App::<app_cap_hash>>  app only
   Identified by app's capability hash, not app name
-  Minted at install, revoked at uninstall
+  Minted at stow, revoked at unstow
 
 Protected regions (NO cap ever issued):
   Seed partition: kernel denies all read/write caps

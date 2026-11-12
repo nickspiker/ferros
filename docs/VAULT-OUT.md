@@ -23,7 +23,7 @@ Owner, 2026-11-07: "the vault needs to be moved out ... a 3MB cap on files and h
 |---|---|---|---|
 | Device | from the ira (as the device class today) | from boot | what the device needs before anyone is present: drivers' state, the sealed list, the kernel's bookkeeping |
 | Person, common | the identity key (as the identity class today: bound to the ira, the device-only secret and the person's seed) | while the person is present | the person's own things across kists: the wallpaper (`wallpaper`), the arrangement, credentials that travel with them |
-| Kist, per person | oracle(identity key ‖ developer key ‖ option) | while the person is present and only to that kist | each installed kist's own data (AUTH.md's `app.<name>.` plan, separated by key and not only by name) |
+| Kist, per person | oracle(identity key ‖ developer key ‖ option) | while the person is present and only to that kist | each stowed kist's own data (AUTH.md's `app.<name>.` plan, separated by key and not only by name) |
 | Kist, device | oracle(ira key ‖ developer key ‖ option) | from boot, only to that kist | a driver's or service's own state that is not the person's |
 
 The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by the developer.
@@ -45,7 +45,7 @@ The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by t
 
 0. **The vault's capsule rides with the kernel**: in the boot image on husky and akita, in the kernel's ring entry on the seed's path, embedded at build time. Whatever verifies the kernel verifies it, and the kernel's signature gate checks it again as a capsule. The kernel keeps no disk code: the vault process owns the UFS link, so `ufs_device` and `vault_boot` leave the kernel too. Kernel and vault ship and roll back together (A/B is the recovery path). Development restarts the vault process from a capsule pushed over PT, as `husky-shell` restarts the others.
 1. **The kernel hands the vault a domain key; the vault encrypts.** The kernel stays out of the data path (no value in its heap, no size cap) and never hands out a root. A key is issued only against a live call from the kist whose domain it is (the kernel stamps every call with its caller, so the vault cannot ask for a kist that is not asking), and a person's keys only while their space is unlocked. Keys are bound to the unlock: at lock or release the kernel tells the vault to drop them and issues none until the next attest; the vault zeroes a key after the request it came with.
-2. **The common area is named, and access is a grant per name, read and write apart.** A small documented vocabulary (`wallpaper` first; `images`, `contacts`, `theme` as they come), never a kist's private data (that is its own domain). Nothing sees the common area by default. System kists get their grants from init (the display reads `wallpaper`, settings writes it). Installed kists ask for named grants at install. The vault enforces the grant on every call. A name means the same to every kist granted it: no first-writer ownership. Write implies read.
+2. **The common area is named, and access is a grant per name, read and write apart.** A small documented vocabulary (`wallpaper` first; `images`, `contacts`, `theme` as they come), never a kist's private data (that is its own domain). Nothing sees the common area by default. System kists get their grants from init (the display reads `wallpaper`, settings writes it). Stowed kists ask for named grants at stow. The vault enforces the grant on every call. A name means the same to every kist granted it: no first-writer ownership. Write implies read.
    STORE.md (2026-11-11, a draft for the owner) proposes these names become kinds of the person's items, with developers minting their own.
 
 ## Permissions are asked once, ever (owner, 2026-11-07)
@@ -54,7 +54,7 @@ The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by t
 
 - A permission is the person's answer to a kist's request (a named grant in the common area, or any other right a kist asks for). It is asked once per person, per kist, per permission.
 - The answer is stored in the person's own space (identity class), so it travels with them: every device of their fleet already knows it, a new device included, and none asks again.
-- Reinstalling the kist, installing it on another device, an update, a reset of the device: none of these asks again. Only the person changing it in settings changes it.
+- Restowing the kist, stowing it on another device, an update, a reset of the device: none of these asks again. Only the person changing it in settings changes it.
 - The answer is keyed by the kist's identity as the gate sees it (its developer key and option, ORACLE.md), so a different developer's app of the same name is a different kist and is asked on its own.
 
 ## Build order
