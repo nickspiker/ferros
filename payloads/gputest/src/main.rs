@@ -903,7 +903,7 @@ fn keeper(grants: u64, arena: usize) -> ! {
     }
 }
 
-/// The Mandelbrot through the service in the block's first 2 MiB (code at 0, pixels at `OUT`), and how many pixels differ from the CPU's.
+/// The Mandelbrot thru the service in the block's first 2 MiB (code at 0, pixels at `OUT`), and how many pixels differ from the CPU's.
 fn mandel_once(grants: u64, arena: usize) -> (u8, u32) {
     let mut k = Kernel::<32>::new();
     mandelbrot(&mut k);

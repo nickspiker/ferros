@@ -47,6 +47,8 @@ adb shell dmesg | grep -E "OF: reserved mem|node   0: \[mem|Memory:" > dmesg-mem
 A range is free when it lies in `memory`, in no line of `reserved` and under `System RAM` in iomem with no `reserved` inside; the dmesg lines are the fallback when debugfs is closed (they hold only while the boot's first lines are still in the log).
 Not in the pool on either board: the kernel's window, the DMA regions (display, USB, gpu-mem, layers, the modem's windows), the surfaces and canvas, the low bank's firmware carve-outs, and the hv.
 
+The layer arena (cachemap `layers`, 2026-11-12) is husky's G#9800_0000-G#A000_0000 (memblock: plain memory) and akita's G#9C00_0000-G#A000_0000 only, the 64 MiB it has run GPU jobs in since 2026-11-09: G#9800_0000-G#9C00_0000 is unproven on akita until the capture above, so it is never mapped for EL0, fenced in for the GPU, scrubbed or handed out there.
+
 
 ## Every new model, profiled on the unit before release (owner, 2026-11-08)
 

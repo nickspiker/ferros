@@ -1,6 +1,6 @@
 # GPU kists: one compute path for the system and for kists
 
-Status: study, design and plan, 2026-11-11; plan step 0 built the same day (below), measured on the host, not yet on the device.
+Status: study, design and plan, 2026-11-11; plan step 0 built the same day (below), measured on the host, not yet on the device; plan step 1's isolation built 2026-11-12 (below), not yet run on a device.
 Everything not quoted from the owner is a proposal.
 GPU.md is the driver as built; this is what it grows into.
 
@@ -20,6 +20,7 @@ GPU.md is the driver as built; this is what it grows into.
 - **No GPU, no picture** (2026-11-11): "Black until we bring the GPU up. I did say no fallbacks." (open question 4 closed).
 - **Spirix** (2026-11-11): "Spirix is a ways out, I wish but hardware ain't there yet."
 - **No GPU right** (2026-11-11): "No GPU prompt, that's implicit." Every kist computes on the GPU as it does on the CPU, in its own GPU address space (open question 5 closed).
+- **Still implicit, isolation first, development builds only** (2026-11-12): a `gpu` permission was proposed again and agreed ("GPU would be nice, yes"), then dropped the same day: "I feel like GPU should be implicit. If I'm running it on my machine..." So nothing is asked: the kernel hands every launched kist its GPU grants as it gives it CPU time (1.6). Isolation between GPU clients comes first, the GPU's address spaces and the kernel the only protection (plan step 1). A kist's GPU code runs unchecked on development builds only; production gives it no GPU until the checked kernel form exists (plan steps 3-6).
 - **Loops, the progress timer** (owner: "Your call on loops"): no bounded-loop rule (termination is not provable in general and the rule would refuse honest kernels); the firmware's progress timer stops a runaway, costing only that client's job (open question 6 closed).
 - **Power and clocks** (owner: "Your call on the last two"): the GPU powers up when work is queued and gates when its queue empties, as events, never a timer; its clock steps with load inside the measured floors (open question 7 closed).
 - **naga in the developer's tools only** (same): it parses WGSL on the developer's machine; the device runs ferros's own validator over the VSF form, never naga (open question 8 closed).
@@ -139,11 +140,11 @@ The MMU, not the compiler, keeps a kernel inside its memory, so the compiler is 
 - That is no theory: on 2026-10-09 a Mahere walk that never ended reset Android's GPU for every process.
 - Display work first: system groups run at a higher CSF priority than kists, and one run is in flight a layer; whether the firmware preempts a running kist group is to measure.
 
-### 1.6 The right
+### 1.6 No right: every kist is handed the GPU (owner, 2026-11-11 and 2026-11-12)
 
-- `gpu` joins RIGHTS, declared in the capsule with its reason.
-- Asked once, ever, per person and kist (2026-11-07): at the install drop when the kist cannot run without it, else at the first action that needs it (2026-11-10).
-- Denied, the slot is empty; revoked, kill and respawn without it.
+- No `gpu` in RIGHTS, no want, no question, no settings row: a kist computes on the GPU as it does on the CPU.
+- At launch the kernel gives every kist three slots after its wants (process.rs `kist_gpu`; ferros_sys::gpu `kist_slots`): `use gpu`, a block of the layer arena of its own (the largest free), and a second surface for a mailbox while another stays free for the next app's window. Any of them is an empty slot when there is none to give.
+- A production build gives three empty slots: a kist's GPU code is unchecked until the VSF kernel form and its checker exist, so it runs on development builds only, as its native code does; the GPU service also refuses a kist's job on a production build (status 5).
 
 ### 1.7 Failure modes
 
@@ -184,6 +185,16 @@ Each step is measured on the Pro before the next; sizes are estimates.
 1. **The one path's service, system clients only:** a group and address space per client, pinned buffers and layers with the fence per frame, held calls and bells by interrupt, MMU faults and the progress timer, priorities; clients wallgen, ahau, gputest.
    - Proof: gputest and ahau at once; a gputest kernel reading past its buffer faults alone while the mark lands; an endless kernel stopped with no host timer while the mark draws; the fence logs nothing.
    - Size: 2-2.5k lines in the service, 300-500 in the kernel.
+   - **Isolation built (2026-11-12), not yet run on a device** (owner: "GPU would be nice, yes", then "I feel like GPU should be implicit"):
+     - **Memory a client's own.** The layer arena is cut into blocks, the whole, its halves and its quarters (process.rs `layers-block`, powers of two aligned to their size, so a masked client reaches one thru a handle), and a spawn gives a client the largest free block up to what it asks (`NewRegion`: `layers` the largest, `layers-32` 32 MiB; a kist the largest), wiped as it is given, freed when its owner ends, never granted by name, never passed to a child. The whole arena (`arena`) is the GPU service's, and init's to pass on as a 32 MiB block (the attest screen's). Surfaces are wiped as they are given too.
+     - **Who calls, from the kernel.** Every call on `gpu` goes in behind the kernel's stamp (`gpu_stamp`): the caller's epoch, whether it is a kist and the build production, and every GPU-reachable region it holds (its block, its surfaces). The kernel writes it in front of the caller's bytes on every call, so no caller can forge one, and the service maps a client's address space from it alone (ferros_sys::gpu `Stamp`).
+     - **A group and an address space a client.** The service keeps seven slots, CSF groups 0-6 bound to address spaces 1-7 (AS0 is the MCU's), user doorbells 1-7; an eighth client takes the slot used longest ago (its group ended, its space given new tables). A client's space maps its block at `ARENA_VA` (offsets into its own block), each surface it holds at its place from `SURFACES_VA`, and the service's pages for that slot: its ring and descriptors read-only, its code region read-only and the only executable pages, its done flag. Nothing else: no other client's block or surface, none of gpu-mem's firmware, tables or interface. A slot's tables live in its own 160 pages of gpu-mem, rewritten only after its group has ended, then LOCK and FLUSH_PT over the whole space before the new root is installed.
+     - **Faults.** The service holds the MMU's line (`gpu-mmu`, slot 8) on a thread of its own: a fault in a client's space is noted, that space switched to UNMAPPED (kbase's way, so the stalled accesses end), and the job's wait ends at once; the job ends with its group and the client is told the GPU address and AS_FAULTSTATUS (status 4). Without the line the fault is found at the job's guard.
+     - **Fairness.** One job at a time, in the order the kernel queues the calls (each caller's thread holds one call). Every job is ended at its guard with its group: a system client's 2^10 ms, a kist's 2^8 ms, so one kist holds the GPU from the others a quarter second at most; the firmware's progress timer stops one that stops progressing. A system client's group runs at CSF priority 15, a kist's at 8 (it matters once jobs overlap). A group the firmware will not end ends the service: its next start soft-resets the GPU before it serves.
+     - **An ended client's job.** A process that ends with a call the GPU service has taken and not answered (`gpu_job_in_flight`) has its blocks and surfaces held back (`gpu_drain`) until the service takes its next request, which it does only once the last job is over (done, or its group ended): a job still running writes nothing the next owner holds.
+     - **The fence** (s2mpu::fence_gpu) stays the wall around every client together: gpu-mem, this board's arena and the surfaces, for every VID. On akita the arena is its upper 64 MiB only (`cachemap::layers`), the range it ran GPU jobs in since 2026-11-09: the lower 64 MiB has no memblock proof there.
+     - **The proof to run:** gputest's isolation test (input 13): a keeper fills its block and draws the Mandelbrot; an intruder's kernels store at its own block (must land), just past it, at every other 32 MiB of the arena as the shared layout of before had it, at every surface and at the service's read-only pages (each must fault as status 4, in its own space); then an endless kernel (stopped at its guard, no host timer) and its own store again; then the keeper says whether any word of its changed and draws again.
+     - **Not yet:** pinned buffers and layers from the frame pool with the fence per frame (the arena is still a fixed 128 MiB, so a kist's block is as large as what the system's clients leave free); concurrency (one job at a time; the priorities wait for it); held calls and bells; the display's op 22 still takes any live surface as a window's pixels, so one app can show another's surface (the display's isolation, not the GPU's).
 2. **The attest mark wholly on the GPU:** `render_fresh` recorded as the bonded mark is; the display's glow and edge layers measured as candidates, moved only where they win.
    - Proof: the unbound mark's time against about 0.5 s on the workers, its difference measured.
 3. **WGSL and the grown back end:** naga, the subset check, nested flow, atomics, register refusal.
@@ -225,7 +236,7 @@ Each step is measured on the Pro before the next; sizes are estimates.
 5. **Lumis's preview, zero copies:** camera DMA into pinned frames inside both the ISPFE and G3D fences, a kernel from the CFA to a layer; Lumis must first build for ferros.
    - Proof: no CPU copy, CPU time a frame near zero, the sensor's frame end to the layer measured.
    - Size: 200 lines of kernel, 500 in the camera path.
-6. **The kist side:** `gpu` in RIGHTS, kernels in the capsule, `gpuc` at install, sealed objects, the ops for kists, the settings rows.
+6. **The kist side:** kernels in the capsule, `gpuc` at install, sealed objects, the ops for kists; production gives kists the GPU once their kernels are checked (no `gpu` in RIGHTS, no settings rows: 1.6).
    - Proof: a test kist installed, asked once, running; denied, an empty slot; revoked, respawned without it; Mahere launched as a kist with the right.
 
 ## 3. Open questions for the owner
@@ -235,7 +246,7 @@ Each step is measured on the Pro before the next; sizes are estimates.
 2. **The wallpaper's promise:** wallpaper/src/lib.rs promises the same pixels bit for bit everywhere; on the GPU, "looks the same" or still bit for bit (which costs the fast forms)?
 3. **Keep `wallpaper.made`?** If the GPU makes it in well under a second, store it (24 MB, a 2.9 s read) or make it at each boot?
 4. **No GPU service after a jump:** the wallpaper and the mark then have no path; black until the GPU, or the jump brings the service up?
-5. **The `gpu` right:** a right at all (the MMU separates kists; power, heat and timing side channels remain), default off?
+5. **The `gpu` right:** a right at all (the MMU separates kists; power, heat and timing side channels remain), default off? Closed: no right (2026-11-11, again 2026-11-12).
 6. **Bounded loops** required, or any loop with the progress timer alone?
 7. **The clock:** 890 MHz whenever a `gpu` process lives (today), per job, or by queue depth; and idle gating.
 8. **naga** as a dependency, or our own WGSL front end?

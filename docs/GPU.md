@@ -302,6 +302,14 @@ The first draw at a size adds the stage, 4.0 ms. Each part is on ahau's console 
 - **The compile.** Handle-dependent constants are folded at record time, so each keystroke compiles again.
 - **The shading's sin, cos and atan** are still polynomials. Valhall has FSIN_TABLE, FCOS_TABLE, FSINCOS_OFFSET and FATAN_ASSIST/TABLE.
 
+## Clients kept apart (2026-11-12, GPU-KISTS.md plan step 1)
+
+Built, not yet run on a device (GPU-KISTS.md step 1 has the whole of it).
+- **The kernel:** the arena as blocks a client owns (`layers` the largest free, `layers-32` 32 MiB; `arena` the whole, the service's), wiped as given; every call on `gpu` stamped by the kernel with the caller and the GPU memory it holds; a client that ends with a job in flight has its memory held back until the service takes its next request; every kist handed `use gpu`, a block and a second surface after its wants on a development build, empty slots on production. akita's arena is its upper 64 MiB.
+- **The service:** a CSF group and an address space a client (groups 0-6, AS1-AS7, doorbells 1-7), each space mapping only the client's block at G#8000_0000, its surfaces from G#C000_0000, and its own ring, descriptors and code read-only and done flag; a client's code read from its own block (the request's offset is into the block). The MMU's line (`gpu-mmu`) is its slot 8, on a thread of its own: a fault lets go of that space and ends that job (status 4, with the address). Each job ends at its guard, 2^10 ms a system client's and 2^8 ms a kist's, with its group.
+- **Grants now:** 1 `gpu-regs`, 2 `gpu-mem`, 3 `gpu.`, 4 `gpu-job`, 5 `arena`, 6 serve `gpu`, 7 `surfaces`, 8 `gpu-mmu`.
+- **Clients:** ahau and wallgen each own a 32 MiB block, their offsets into it (ahau's rebased from 32 MiB to 0, so the masked ahau is sealed again on each device); gputest asks `--dma layers-32`; a development spawn of Mahere asks `--dma layers`.
+
 ## Kists' frames on the GPU (2026-11-11)
 
 Mahere's map draws on the GPU (GPU-KISTS.md plan step 4, its first cut), and the service, the kernel and the display grew for it:
