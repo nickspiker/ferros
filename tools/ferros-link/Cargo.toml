@@ -1,0 +1,15 @@
+[package]
+name = "ferros-link"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The host's USB link to a ferros device: finding it (VID G#1209, PID G#4665, FERROS_BUS), bulk transfers, and Photon Transport commands sent and answered. Shared by ferros-bridge (development) and ferros-send (the person's tool); nothing here is a development command."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Plain Rust USB on Linux, macOS and Windows: no libusb.
+nusb = "0.1"
+ferros_pt = { path = "../../ferros_pt", features = ["std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

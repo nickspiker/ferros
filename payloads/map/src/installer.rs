@@ -7,7 +7,8 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use ferros_sys::{cap, freq, now, sleep_until, ERR};
 
-use crate::{Line, S_INSTALLER};
+use crate::{tr, Line, S_INSTALLER};
+use ferros_lang::Msg;
 
 /// A job's stages and why one failed, as the installer counts them (payloads/kists `STAGE_*`, `WHY_*`).
 pub const QUEUED: u8 = 0;
@@ -18,8 +19,28 @@ pub const SEALING: u8 = 4;
 pub const STORING: u8 = 5;
 pub const DONE: u8 = 6;
 pub const FAILED: u8 = 7;
+/// An offer to stow, checked and waiting on the person's Stow or Cancel (payloads/kists `STAGE_ASKING`): neither under way nor finished.
+pub const ASKING: u8 = 8;
 pub const KIND_INSTALL: u8 = 0;
 pub const KIND_UNINSTALL: u8 = 1;
+/// A kist offered over USB to stow (docs/KISTS.md "Stowing").
+pub const KIND_OFFER: u8 = 3;
+
+/// A kist offered over USB, checked and waiting on the person (the installer's op 6): what the Kists page shows above everything, with Stow and Cancel.
+#[derive(Clone)]
+pub struct Offer {
+    pub capsule: [u8; 32],
+    pub size: u64,
+    /// Native, unchecked machine code: a development build stows it, and the page says so plainly.
+    pub native: bool,
+    pub developer: [u8; 32],
+    pub version: ferros_kist::Version,
+    pub name: String,
+    /// The developer's name as the capsule gives it (empty when it gives none: the page shows the key's first bytes).
+    pub developer_name: String,
+    /// Each right it declares and the developer's reason, in its slot order.
+    pub wants: Vec<(u8, String)>,
+}
 
 /// One install, update, uninstall or restore.
 #[derive(Clone)]
@@ -58,6 +79,8 @@ pub struct Installer {
     pub dir_gen: u32,
     pub dir: Vec<Row>,
     pub jobs: Vec<Job>,
+    /// The offer waiting on the person, if one is.
+    pub offer: Option<Offer>,
 }
 
 impl Installer {
@@ -201,6 +224,49 @@ fn read_directory(svc: u64) -> Option<Vec<Row>> {
     }
 }
 
+/// An offer waiting on the person, as the installer's op 6 gives it; None when that capsule is no longer one (answered meanwhile) or the reply does not parse.
+fn read_offer(svc: u64, capsule: &[u8; 32]) -> Option<Offer> {
+    let mut m = [0u8; 33];
+    m[0] = 6;
+    m[1..].copy_from_slice(capsule);
+    let mut out = [0u8; 4096];
+    let n = ferros_sys::call_live(svc, &m, &mut out);
+    if n == ERR {
+        return None;
+    }
+    // WHY (each length check here): the bytes are the installer's; a reply cut short is no offer rather than an index past it.
+    let b = &out[..(n as usize).min(out.len())];
+    if b.len() < 43 || b[0] != 0 {
+        return None;
+    }
+    let size = u64_at(b, 1);
+    let native = b[9] & 1 == 1;
+    let developer: [u8; 32] = b[10..42].try_into().unwrap();
+    let parts = b[42] as usize;
+    let mut p = 43 + (parts << 3);
+    if p + 1 > b.len() {
+        return None;
+    }
+    let version = ferros_kist::Version((0..parts).map(|k| u64_at(b, 43 + (k << 3))).collect());
+    let text = |p: &mut usize| -> Option<String> {
+        let l = *b.get(*p)? as usize;
+        let t = b.get(*p + 1..*p + 1 + l)?;
+        *p += 1 + l;
+        Some(String::from(core::str::from_utf8(t).unwrap_or("")))
+    };
+    let name = text(&mut p)?;
+    let developer_name = text(&mut p)?;
+    let n = *b.get(p)? as usize;
+    p += 1;
+    let mut wants = Vec::with_capacity(n);
+    for _ in 0..n {
+        let right = *b.get(p)?;
+        p += 1;
+        wants.push((right, text(&mut p)?));
+    }
+    Some(Offer { capsule: *capsule, size, native, developer, version, name, developer_name, wants })
+}
+
 /// The installer's doorbell, held on a thread of its own: answered with its status whenever anything the page shows changes, the directory's rows read again each time it has been read afresh. While the installer is not serving (the kernel starts it once a person has attested) it is asked again after a wait that doubles to a second, as `fgtw_poller` asks fgtw: no doorbell exists for a server coming up.
 pub extern "C" fn watch(grants: u64) -> ! {
     let svc = cap(grants, S_INSTALLER);
@@ -236,35 +302,21 @@ pub extern "C" fn watch(grants: u64) -> ! {
                 rows_gen = Some(snap.dir_gen);
             }
         }
+        // An offer to stow that has reached the person (checked, waiting on their answer): what it is read once, when it comes; gone from the page as soon as it is answered or ended.
+        let asking = snap.jobs.iter().find(|j| j.kind == KIND_OFFER && j.stage == ASKING).map(|j| j.capsule);
+        snap.offer = match asking {
+            Some(c) if snap.offer.as_ref().is_some_and(|o| o.capsule == c) => snap.offer.take(),
+            Some(c) => read_offer(svc, &c),
+            None => None,
+        };
         with(|x| *x = Some(snap.clone()));
         SEQ.fetch_add(1, Ordering::AcqRel);
     }
 }
 
-/// Why a job failed, in the person's words.
+/// Why a job failed, in the person's words: ferros_kist's table, which `ferros send` prints too.
 fn why(w: u8) -> &'static str {
-    match w {
-        1 => "no network",
-        2 => "it is not where it is kept",
-        3 => "its size is not the one listed",
-        4 => "it is not the capsule listed",
-        5 => "its signature does not check out",
-        6 => "it does not carry its developer's keys",
-        7 => "this kist is a development build and can't be installed from the network",
-        8 => "its code failed the check",
-        9 => "it could not be sealed to this device",
-        10 => "the vault did not keep it",
-        11 => "the download broke off",
-        12 => "it comes thru its developer's own list, which this device does not read yet",
-        13 => "it is not in the list of kists",
-        14 => "nobody is attested",
-        15 => "there is no room to check it now",
-        16 => "it is not a kist",
-        // 17 names the developer (`words`).
-        17 => "this kist is signed by a different key than its developer's other kists",
-        18 => "the keys it carries are not its developer's",
-        _ => "something went wrong",
-    }
+    ferros_kist::offer::words(w)
 }
 
 /// A job's stage in words: what it is doing now, with its bytes while it fetches (in the person's number base).
@@ -297,10 +349,14 @@ pub fn words(j: &Job, f: tatau::Fmt) -> Line {
         STORING => {
             l.s("Storing it");
         }
+        ASKING => {
+            l.s(tr(Msg::OfferedOverUsb));
+        }
         DONE => {
             l.s(match j.kind {
                 KIND_INSTALL => "Installed",
                 KIND_UNINSTALL => "Uninstalled",
+                KIND_OFFER => tr(Msg::Stowed),
                 _ => "Restored",
             });
         }
@@ -308,6 +364,7 @@ pub fn words(j: &Job, f: tatau::Fmt) -> Line {
             let not = match j.kind {
                 KIND_INSTALL => "Not installed",
                 KIND_UNINSTALL => "Not uninstalled",
+                KIND_OFFER => tr(Msg::NotStowed),
                 _ => "Not restored",
             };
             let _ = if j.why == 17 && !j.who.is_empty() {

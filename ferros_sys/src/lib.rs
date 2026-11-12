@@ -61,6 +61,7 @@ pub mod nr {
     pub const BELL: u64 = 38;
     pub const NOT_STARTED: u64 = 39;
     pub const ARC: u64 = 40;
+    pub const OFFER: u64 = 41;
 }
 
 /// The caller's own arc, grown or shrunk on demand (kernel SYS_ARC, docs/ARCS.md step 2; owner, 2026-11-11: "why we cannot scale on demand, that was the whole point of ring memory"). No capability: a process reaches only its own arc, and only up to its ceiling (the heap its build declared, counted whole; fixed mode's size). A top is an arc offset: the arc's size, or exact mode's limit.
@@ -1350,6 +1351,8 @@ pub mod install {
     pub const WHY_KEPT: u64 = 8;
     pub const WHY_READ: u64 = 9;
     pub const WHY_ROOM: u64 = 10;
+    /// DONE's value for a stow's check (`stow_check`) that found native code on a development build: taken unchecked and unsealed, as the bridge's development door took it (a launch runs native code on a development build only). A production build refuses it (`WHY_NATIVE`).
+    pub const NATIVE: u64 = 1;
     /// A word's stage and its value.
     pub fn split(word: u64) -> (u64, u64) {
         (word >> 56, word & ((1 << 56) - 1))
@@ -1366,6 +1369,45 @@ pub fn install_kist(grants: u64, install: u64, capsule: &[u8; 32], word: &core::
     }
     req[64..].copy_from_slice(&off(word as *const _ as *const u8).to_le_bytes());
     svc(nr::SPAWN, off(req.as_ptr()), req.len() as u64, 8, 0, 0)
+}
+
+/// `install_kist` for a kist offered to stow (docs/KISTS.md "Stowing"): the same check and seal, except that native code on a development build is taken unchecked (told DONE with `install::NATIVE`), as the bridge's development door took it; a production build refuses it as the directory's path does (`install::WHY_NATIVE`). The kernel sees native code in the capsule's first bytes and reads no further.
+pub fn stow_check(grants: u64, install: u64, capsule: &[u8; 32], word: &core::sync::atomic::AtomicU64) -> u64 {
+    let mut req = [0u8; 72];
+    req[..32].copy_from_slice(capsule);
+    let tok = (arc_base() + cap(grants, install)) as *const u8;
+    for i in 0..32 {
+        req[32 + i] = unsafe { core::ptr::read_volatile(tok.add(i)) };
+    }
+    req[64..].copy_from_slice(&off(word as *const _ as *const u8).to_le_bytes());
+    svc(nr::SPAWN, off(req.as_ptr()), req.len() as u64, 8 | 16, 0, 0)
+}
+
+/// The kist offered over USB to stow (kernel SYS_OFFER; docs/KISTS.md "Stowing", ferros_kist::offer), for the installer alone: it holds the Install right (`install`, the token's offset in the grants page, as `cap` gives it).
+pub mod offer {
+    use super::{nr, off, svc, ERR, NOTHING};
+    /// The offers' doorbell: the kernel writes its change count into `word` now and whenever a host offers a kist, waking whatever waits on it (`wait_world`). False without the Install right, or a kernel without it.
+    pub fn doorbell(install: u64, word: &core::sync::atomic::AtomicU64) -> bool {
+        svc(nr::OFFER, 0, install, off(word as *const _ as *const u8), 0, 0) == 0
+    }
+    /// The offer not yet ended, if one is: its capsule's address and length. The installer checks it from there (it is in `capsules.`); taking it again (a restarted installer) gives the same offer.
+    pub fn take(install: u64) -> Option<([u8; 32], u64)> {
+        let mut b = [0u8; 40];
+        let r = svc(nr::OFFER, 1, install, off(b.as_mut_ptr()), b.len() as u64, 0);
+        if r == ERR || r == NOTHING {
+            return None;
+        }
+        Some((b[..32].try_into().unwrap(), u64::from_le_bytes(b[32..].try_into().unwrap())))
+    }
+    /// The offer's state as the installer has it (ferros_kist::offer: CHECKING, ASKING, STOWED, REFUSED with its why, CANCELLED; flags bit 0 native), which the kernel answers the host's held read with. False when `capsule` is not the offer (another replaced it).
+    pub fn tell(install: u64, capsule: &[u8; 32], state: u8, why: u8, flags: u8) -> bool {
+        let mut b = [0u8; 35];
+        b[..32].copy_from_slice(capsule);
+        b[32] = state;
+        b[33] = why;
+        b[34] = flags;
+        svc(nr::OFFER, 2, install, off(b.as_ptr()), b.len() as u64, 0) == 0
+    }
 }
 
 /// End this process; its arc and capabilities cease to exist.

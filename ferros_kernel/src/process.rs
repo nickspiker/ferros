@@ -1095,6 +1095,8 @@ const SYS_BELL: u64 = 38;
 const SYS_NOT_STARTED: u64 = 39;
 /// arc(op, bytes): the caller's own arc grows or shrinks (ARCS.md step 2; owner, 2026-11-11: "why we cannot scale on demand, that was the whole point of ring memory"). No capability: a process reaches only its own arc, and only as far as its ceiling (`Arc::ceiling`: the most its build declared, its header's heap counted whole; fixed mode's size). Op 0 `ARC_GROW`: at least x1 more bytes (native: whole frames; ring: the mask doubles until they fit; exact: the limit moves) → x0 the new top (the arc's size, exact mode's limit), x1 the old one; the bytes between are new, zeroed, the process's. Op 1 `ARC_SHRINK`: keep the first x1 bytes (rounded up as the mode needs; never under what the process was spawned with) and give the rest back → x0 the new top, x1 the old. Op 2 `ARC_SIZE` → x0 the top, x1 the ceiling. Op 3 `ARC_RELEASE`: the frames wholly inside x2 bytes from arc offset x1 given back while the arc keeps its size (step 4; never the first frame, nor one the kernel holds a word in): a hole the process must not touch again until a grow over it → x0 the bytes given back, x1 the top. A masked arc's grow or shrink while another of its threads runs elsewhere holds the process off the cores first (`hold`, step 3): its mask or limit changes in every thread at once. Refused: x0 = ERR, x1 the reason (`ARC_WHY_*`), said on the console too.
 const SYS_ARC: u64 = 40;
+/// offer(op, install, …): the kist offered over USB to stow (`OFFER`; docs/KISTS.md "Stowing", ferros_kist::offer; owner, 2026-11-11: "Just seems to me that we should just make a proper checked path and start using it"), for the installer alone: x1 the offset of its Install token (`Object::Install`). Op 0: the offers' doorbell, x2 a word in the caller's arc: the offers' change count written there now and whenever a host offers a kist, its waiters woken (`bell_register`, `BELL_OFFERS`) → 0. Op 1: the offer not yet ended, x2/x3 a buffer and its length (40 at least) → 0 with [capsule 32][length u64 LE] written (an offer still OFFERED becomes CHECKING), NOTHING when there is none. Op 2: its state as the installer has it, x2/x3 [capsule 32][state u8][why u8][flags u8] → 0, NOTHING when that capsule is not the offer or the offer has ended; the service loop answers a host's held read (`offer_state`). ERR without the Install right, or for no such op.
+const SYS_OFFER: u64 = 41;
 pub const ARC_GROW: u64 = 0;
 pub const ARC_SHRINK: u64 = 1;
 pub const ARC_SIZE: u64 = 2;
@@ -3240,6 +3242,47 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
+        SYS_OFFER => {
+            let install = |at: u64| {
+                let token = p.read(at, 32);
+                matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Install, r)) if r & RIGHT_SEND != 0)
+            };
+            let offer = unsafe { &mut *(&raw mut OFFER) };
+            f.x[0] = match f.x[0] {
+                0 if install(f.x[1]) => bell_register(p, pi, BELL_OFFERS, f.x[2], BELL_COUNT[BELL_OFFERS].load(core::sync::atomic::Ordering::Acquire)),
+                // WHY the length: the buffer is the caller's; the answer is 40 bytes, written whole or not at all.
+                1 if install(f.x[1]) && f.x[3] >= 40 => match offer.as_mut().filter(|o| !ferros_kist::offer::finished(o.state)) {
+                    Some(o) => {
+                        if o.state == ferros_kist::offer::OFFERED {
+                            o.state = ferros_kist::offer::CHECKING;
+                        }
+                        let mut out = [0u8; 40];
+                        out[..32].copy_from_slice(&o.capsule);
+                        out[32..].copy_from_slice(&o.len.to_le_bytes());
+                        p.write(f.x[2], &out);
+                        0
+                    }
+                    None => NOTHING,
+                },
+                // WHY the length: the buffer is the caller's; the state is 35 bytes, read whole.
+                2 if install(f.x[1]) && f.x[3] >= 35 => {
+                    let b = p.read(f.x[2], 35);
+                    match offer.as_mut().filter(|o| o.capsule[..] == b[..32] && !ferros_kist::offer::finished(o.state)) {
+                        Some(o) => {
+                            o.state = b[32];
+                            o.why = b[33];
+                            o.flags = b[34];
+                            // The service loop answers a host's held read now, not at its next event.
+                            unsafe { core::arch::asm!("sev") };
+                            0
+                        }
+                        None => NOTHING,
+                    }
+                }
+                _ => ERR,
+            };
+            0
+        }
         SYS_LANG => {
             let settings = |at: u64| {
                 let token = p.read(at, 32);
@@ -3402,7 +3445,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
         }
         // Install mode (x2 bit 3): a kist the installer stored, read, checked and sealed by the service loop (`install_request`).
         SYS_SPAWN if f.x[2] & 8 != 0 => {
-            f.x[0] = install_request(p, pi, &p.read(f.x[0], (f.x[1] as usize).min(4096)));
+            f.x[0] = install_request(p, pi, &p.read(f.x[0], (f.x[1] as usize).min(4096)), f.x[2] & 16 != 0);
             0
         }
         SYS_SPAWN if f.x[2] & 2 != 0 => {
@@ -3841,7 +3884,9 @@ pub const BELL_FACTS: usize = 6;
 const BELL_CLAIMS: usize = 7;
 const BELL_KISTS: usize = 8;
 const BELL_SURFACES: usize = 9;
-const BELLS: usize = 10;
+/// The offers' (SYS_OFFER op 0, for the Install holder): a host offered a kist to stow.
+const BELL_OFFERS: usize = 10;
+const BELLS: usize = 11;
 /// Each source's change count (the claims' is GPS_CLAIMS'), so a word registered late starts from the count now and a reader tells a change by inequality.
 static BELL_COUNT: [core::sync::atomic::AtomicU64; BELLS] = [const { core::sync::atomic::AtomicU64::new(0) }; BELLS];
 /// The bells' words (SYS_BELL, SYS_CLAIM op 4, SYS_NOT_STARTED op 1): (the process's slot, its epoch, the word's address in its arc, the source). At most one a source a process. Under the kernel lock.
@@ -5066,9 +5111,56 @@ fn kists_live() -> Vec<[u8; 32]> {
 /// An install the installer asked for (`install_request`): the capsule by its vault address, and where to tell it each stage: the process (its slot and epoch, so a word is never written into a successor's arc) and the word's address in its arc.
 pub struct KistInstall {
     pub capsule: [u8; 32],
+    /// A stow's check (`SYS_SPAWN` install mode with x2 bit 4, ferros_sys `stow_check`): native code on a development build is taken unchecked (`INSTALL_DONE` with `INSTALL_NATIVE`) instead of refused.
+    pub native_ok: bool,
     proc: usize,
     epoch: u64,
     word: usize,
+}
+
+/// The kist a host offered over USB to stow (PT `ferros.kist.offer`, service.rs; docs/KISTS.md "Stowing", ferros_kist::offer): its capsule's address in `capsules.` and its length, its state as the installer last told it (SYS_OFFER op 2), why it was refused, and its flags. One at a time; kept after it ends until the next replaces it, so the host reads its end. Under the kernel lock.
+pub struct Offer {
+    pub capsule: [u8; 32],
+    pub len: u64,
+    pub state: u8,
+    pub why: u8,
+    pub flags: u8,
+}
+static mut OFFER: Option<Offer> = None;
+
+/// A host offers the capsule it carried in whole: kept as OFFERED and the offers' bell rung (the installer takes it). Err while another offer has not ended (the person has not answered it yet).
+pub fn offer_put(capsule: [u8; 32], len: u64) -> Result<(), &'static str> {
+    with_lock(|| {
+        let o = unsafe { &mut *(&raw mut OFFER) };
+        if o.as_ref().is_some_and(|o| !ferros_kist::offer::finished(o.state)) {
+            return Err("another kist is offered and waiting on the person");
+        }
+        *o = Some(Offer { capsule, len, state: ferros_kist::offer::OFFERED, why: 0, flags: 0 });
+        bell_count(BELL_OFFERS);
+        Ok(())
+    })
+}
+
+/// Whether an offer has not ended yet (no part of another capsule is taken meanwhile).
+pub fn offer_open() -> bool {
+    with_lock(|| unsafe { (*(&raw const OFFER)).as_ref() }.is_some_and(|o| !ferros_kist::offer::finished(o.state)))
+}
+
+/// The offer's state for a host's read of `capsule`: [state, why, flags], GONE when it is not the offer.
+pub fn offer_state(capsule: &[u8; 32]) -> [u8; 3] {
+    with_lock(|| match unsafe { (*(&raw const OFFER)).as_ref() } {
+        Some(o) if o.capsule == *capsule => [o.state, o.why, o.flags],
+        _ => [ferros_kist::offer::GONE, 0, 0],
+    })
+}
+
+/// Nobody is present (the person left, or never came): an offer not ended is gone, so it is never shown to whoever attests next. Its bytes stay in `capsules.`, named by no list (inert: a launch reads only what a person's list names).
+pub fn offer_drop() {
+    with_lock(|| {
+        if let Some(o) = unsafe { (*(&raw mut OFFER)).as_mut() }.filter(|o| !ferros_kist::offer::finished(o.state)) {
+            o.state = ferros_kist::offer::GONE;
+        }
+    })
 }
 /// One install at a time, beside one launch: the service loop streams one capsule through the kernel's channel at once (launches first). Under the kernel lock.
 static mut KIST_INSTALL: Option<KistInstall> = None;
@@ -5090,9 +5182,11 @@ pub const INSTALL_WHY_SECRET: u64 = 7;
 pub const INSTALL_WHY_KEPT: u64 = 8;
 pub const INSTALL_WHY_READ: u64 = 9;
 pub const INSTALL_WHY_ROOM: u64 = 10;
+/// `INSTALL_DONE`'s value for a stow's check that found native code on a development build (`KistInstall::native_ok`): taken unchecked, nothing sealed.
+pub const INSTALL_NATIVE: u64 = 1;
 
-/// `SYS_SPAWN` in install mode (x2 bit 3): [the capsule's 32-byte address in `capsules.`][the caller's Install token, 32 bytes][the word's offset in its arc, u64 LE]. Queued for the service loop (`install_take`), which reads the capsule from the vault and tells the word each stage, waking whoever waits on it (`install_tell`). 0 queued, ERR refused (the reason on the console): no Install right, a malformed request, another install still under way.
-fn install_request(p: &Process, pi: usize, req: &[u8]) -> u64 {
+/// `SYS_SPAWN` in install mode (x2 bit 3; bit 4 a stow's check, `native_ok`): [the capsule's 32-byte address in `capsules.`][the caller's Install token, 32 bytes][the word's offset in its arc, u64 LE]. Queued for the service loop (`install_take`), which reads the capsule from the vault and tells the word each stage, waking whoever waits on it (`install_tell`). 0 queued, ERR refused (the reason on the console): no Install right, a malformed request, another install still under way.
+fn install_request(p: &Process, pi: usize, req: &[u8], native_ok: bool) -> u64 {
     let refuse = |why: &str| {
         let kk = k();
         kk.console.extend_from_slice(b"kist install refused: ");
@@ -5113,7 +5207,7 @@ fn install_request(p: &Process, pi: usize, req: &[u8]) -> u64 {
     let off = u64::from_le_bytes(req[64..72].try_into().unwrap());
     // The word inside the caller's own arc, as `SYS_WAIT` finds it: aligned, and refused outside the arc.
     let Some(word) = p.word(off) else { return refuse("the word is outside the caller's arc") };
-    *slot = Some(KistInstall { capsule: req[..32].try_into().unwrap(), proc: pi, epoch: p.epoch, word });
+    *slot = Some(KistInstall { capsule: req[..32].try_into().unwrap(), native_ok, proc: pi, epoch: p.epoch, word });
     unsafe { core::arch::asm!("sev") };
     0
 }
