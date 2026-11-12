@@ -243,6 +243,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RightEntropy => "रैंडम संख्याएँ",
         Msg::RightGps => "तुम कहाँ हो",
         Msg::RightUdp => "नेटवर्क",
+        Msg::RightAudio => "ध्वनि",
         Msg::NotEnoughMemory => "पर्याप्त मेमोरी नहीं",
         Msg::NotInstalledHere => "इस डिवाइस पर इंस्टॉल नहीं",
         Msg::FailedItsChecks => "अपनी जाँच में सफल नहीं हुआ",

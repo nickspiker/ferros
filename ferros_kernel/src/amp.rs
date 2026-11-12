@@ -50,6 +50,7 @@ pub fn power(on: bool) -> bool {
         return false;
     }
     AMPS.up();
+    AMPS.halved();
     if !AMPS.clocked() {
         return false;
     }

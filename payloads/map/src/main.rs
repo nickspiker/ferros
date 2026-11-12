@@ -915,7 +915,7 @@ fn link_state(k: usize, state: Option<i64>) -> &'static str {
 
 /// What a right is, in the person's words and language, by its place in ferros_kist::RIGHTS (whose MEANS are the English).
 fn right_name(r: usize) -> &'static str {
-    const NAMES: [Msg; ferros_kist::RIGHTS.len()] = [Msg::RightDisplay, Msg::RightTouch, Msg::RightSurface, Msg::RightIra, Msg::RightDomain, Msg::RightEntropy, Msg::RightGps, Msg::RightUdp];
+    const NAMES: [Msg; ferros_kist::RIGHTS.len()] = [Msg::RightDisplay, Msg::RightTouch, Msg::RightSurface, Msg::RightIra, Msg::RightDomain, Msg::RightEntropy, Msg::RightGps, Msg::RightUdp, Msg::RightAudio];
     tr(NAMES[r])
 }
 

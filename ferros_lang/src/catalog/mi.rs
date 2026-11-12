@@ -243,6 +243,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RightEntropy => "matapōkere",
         Msg::RightGps => "kei hea koe",
         Msg::RightUdp => "te whatunga",
+        Msg::RightAudio => "te oro",
         Msg::NotEnoughMemory => "kāore i rawaka te pūmahara",
         Msg::NotInstalledHere => "kāore anō kia tāutaingia ki tēnei pūrere",
         Msg::FailedItsChecks => "kāore i puta i ōna arowhai",

@@ -243,6 +243,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RightEntropy => "losowość",
         Msg::RightGps => "gdzie jesteś",
         Msg::RightUdp => "sieć",
+        Msg::RightAudio => "dźwięk",
         Msg::NotEnoughMemory => "za mało pamięci",
         Msg::NotInstalledHere => "nie zainstalowano na tym urządzeniu",
         Msg::FailedItsChecks => "nie przeszedł kontroli",

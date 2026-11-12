@@ -243,6 +243,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RightEntropy => "случайность",
         Msg::RightGps => "где ты находишься",
         Msg::RightUdp => "сеть",
+        Msg::RightAudio => "звук",
         Msg::NotEnoughMemory => "недостаточно памяти",
         Msg::NotInstalledHere => "не установлен на этом устройстве",
         Msg::FailedItsChecks => "не прошёл проверки",

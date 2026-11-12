@@ -243,6 +243,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RightEntropy => "unasibu",
         Msg::RightGps => "mahali ulipo",
         Msg::RightUdp => "mtandao",
+        Msg::RightAudio => "sauti",
         Msg::NotEnoughMemory => "kumbukumbu haitoshi",
         Msg::NotInstalledHere => "haijasakinishwa kwenye kifaa hiki",
         Msg::FailedItsChecks => "haikupita ukaguzi wake",

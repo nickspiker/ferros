@@ -36,6 +36,7 @@ One spec VSF document in the vault under the key `device` (ferros_kernel `settin
 | `torch_strobe` | unsigned | the torch's strobe, preference 43: 0 steady, 1-193 32nds of an octave up from a flash every 4 s (16 a second at 193) | 0 |
 | `torch_duty` | unsigned (a signed byte) | the lit share of each strobe flash, preference 44: 256ths either side of a half, within 120 | 0: a half |
 | `torch_timeout` | unsigned | when the torch turns itself off, preference 45: 0 never, 1-161 16ths of an octave up from 16 s (2^14 s at 161), counted again from every touch of it | 0 |
+| `volume` | unsigned | the sound's volume, preference 46: 1-255 dimmest to loudest, a 16th of an octave of amplitude a step, 255 full scale (AUDIO.md "Volume") | 0: two octaves under full scale |
 | `tz` | signed | the fixed offset, seconds east of UTC: used when no zone is in effect | 0 |
 | `zone` | ASCII | this device's zone by hand, an IANA id (docs/TIME.md) | none |
 | `zone_auto` | unsigned | this device's choice: 1 automatic (the zone found from the cellular network, then GPS; `zone` stands in until one is), 0 by hand | 1 |

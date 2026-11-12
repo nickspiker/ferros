@@ -59,7 +59,7 @@ Later, not now: a system picker that hands a kist just the file the person chose
 ## Built (2026-11-08)
 
 - **The vocabulary and the documents** (`ferros_kist`, host-tested):
-  - The rights by code (`RIGHTS`: display, touch, surface, ira, domain, entropy, gps, udp), with a person's words for each (`MEANS`).
+  - The rights by code (`RIGHTS`: display, touch, surface, ira, domain, entropy, gps, udp, audio), with a person's words for each (`MEANS`). `audio` (2026-11-11, AUDIO.md) was appended, so every code before it keeps its meaning in the lists people already keep.
   - The capsule's declaration: a section `kist` (`name`) and a section `wants`, a field per want named by its right, its value the reason (`a`, ASCII text: vsf encodes `x` only with std). The fields' order is the slot order. Both sit before the code, so they are read from the capsule's first bytes.
   - The person's list, `kists.list` (scope `kists.`, identity class; it stands in for the common area's `kists`): a section `defaults` (a field per right, 1 or 0) and a section `kist` per kist (`capsule` hb, `developer` ke, `option` hp, `name`, and a field per want: the reason, then once answered the answer `u` and when `e`).
 - **The kernel** (process.rs, service.rs):
