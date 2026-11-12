@@ -243,6 +243,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RightEntropy => "keacakan",
         Msg::RightGps => "lokasimu",
         Msg::RightUdp => "jaringan",
+        Msg::RightAudio => "suara",
         Msg::NotEnoughMemory => "memori tidak cukup",
         Msg::NotInstalledHere => "tidak terpasang di perangkat ini",
         Msg::FailedItsChecks => "tidak lolos pemeriksaannya",

@@ -1052,6 +1052,12 @@ fn torch_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![Serve(b"torch"), Hardware(b"hsi2c14"), Power(b"torch")]
 }
 
+/// The audio service's grants in its slot order (payloads/audio, docs/AUDIO.md): 1 serve audio, 2 the AoC's IPC block (`aoc-ipc`: its playback ring and its control queue), 3 the AoC's mailboxes (`aoc-mbox`), 4 the mailbox block f1's interrupt (`aoc-mbox-f1`, the playback period's clock), 5 the amplifiers' SPI port (`usi1-spi`), 6 gpio-gpn0 (the right amplifier's select), 7 the `amp` switch (both resets, the rail, the port's clock), 8 entropy (the streams' handles). Its own list, as the torch's: init's page is full, and the kernel starts it when a call on `audio` finds no server (process.rs `ON_DEMAND`). It and the `amp` development tool (payloads/amp) both drive the amplifiers: never both at once.
+fn audio_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
+    use crate::process::Grant::*;
+    alloc::vec![Serve(b"audio"), Dma(b"aoc-ipc"), Hardware(b"aoc-mbox"), Irq(b"aoc-mbox-f1"), Hardware(b"usi1-spi"), Hardware(b"gpio-gpn0"), Power(b"amp"), Entropy]
+}
+
 /// Each shell process's capabilities, as init hands them out (payloads/init: the slots of `home_grants`, 1-based), for restarting one from the vault without a reboot.
 fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'static>>> {
     if name == b"vault" {
@@ -1068,6 +1074,9 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
     }
     if name == b"torch" {
         return Some(torch_grants());
+    }
+    if name == b"audio" {
+        return Some(audio_grants());
     }
     let slots: &[usize] = match name {
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).

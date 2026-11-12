@@ -979,8 +979,8 @@ fn endpoint(name: &[u8]) -> usize {
     kk.endpoints.len() - 1
 }
 
-/// Endpoints whose server the kernel starts when a call finds none (docs/TORCH.md "Who starts it"; owner, 2026-11-11: the quick settings' torch). init's grants page is full, and a server that runs only while its device is in use holds no arc the rest of the time: the torch process ends itself once the LED is dark and nothing waits. Each name is a process the service loop knows how to start (service.rs `shell_grants`); its index is its bit in `ON_DEMAND_WANT`.
-pub static ON_DEMAND: &[&[u8]] = &[b"torch"];
+/// Endpoints whose server the kernel starts when a call finds none (docs/TORCH.md "Who starts it"; owner, 2026-11-11: the quick settings' torch). init's grants page is full, and a server that runs only while its device is in use holds no arc the rest of the time: the torch process ends itself once the LED is dark and nothing waits. Each name is a process the service loop knows how to start (service.rs `shell_grants`); its index is its bit in `ON_DEMAND_WANT`. The audio service the same way (docs/AUDIO.md, 2026-11-11): started by a kist's first call on `audio`, ended by itself once every stream has played out.
+pub static ON_DEMAND: &[&[u8]] = &[b"torch", b"audio"];
 /// The on-demand servers a call found missing since the service loop last looked (`on_demand_take`).
 static ON_DEMAND_WANT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -1199,6 +1199,8 @@ pub static IRQS: &[IrqLine] = &[
     IrqLine { name: "gpu-gpu", intid: 32 + 346 },
     IrqLine { name: "gpu-job", intid: 32 + 347 },
     IrqLine { name: "gpu-mmu", intid: 32 + 348 },
+    // The AoC's mailbox block f1 (G#1522_0000), its AoC-to-AP side: zuma-aoc.dtsi `mbox_aoc_f1`, zuma.h IRQ_MAILBOX_AOCF12AP_ALIVE = SPI 78, level high. Channels 16-31 of the AoC's 48 (`mbox-channels`); the audio playback services with an interrupt sit on channel 20 (aoc_alsa.h PCM_CHANNEL), f1's bit 4: the audio service's period clock (docs/AUDIO.md).
+    IrqLine { name: "aoc-mbox-f1", intid: 32 + 78 },
 ];
 /// Set by `.Lirq` with any pending byte (and a `sev`), cleared when `wake_sleepers` has looked: an idle core looks for interrupt waiters only when this says so.
 #[unsafe(no_mangle)]
@@ -1301,6 +1303,8 @@ pub const PREF_TORCH_TIMEOUT: usize = 45;
 const TORCH_STROBE_STEPS: u8 = 6 * (1 << 5) + 1;
 const TORCH_DUTY_REACH: i8 = 120;
 const TORCH_TIMEOUT_STEPS: u8 = 10 * (1 << 4) + 1;
+/// Preference 46: the sound's volume (docs/AUDIO.md "Volume"; ferros_sys::audio is its one encoding), a device setting (the speakers are this device's): 0 never set (the audio service's default, two octaves under full scale), 1-255 dimmest to loudest, a 16th of an octave of amplitude a step. Kept in the device document as `volume`.
+pub const PREF_VOLUME: usize = 46;
 /// How many preferences there are: the first block's 32 and the second's 16.
 const PREF_COUNT: usize = 48;
 
@@ -1440,6 +1444,7 @@ fn pref_valid(index: usize, value: u8) -> bool {
         PREF_TORCH_STROBE => value <= TORCH_STROBE_STEPS,
         PREF_TORCH_DUTY => (value as i8).unsigned_abs() <= TORCH_DUTY_REACH as u8,
         PREF_TORCH_TIMEOUT => value <= TORCH_TIMEOUT_STEPS,
+        PREF_VOLUME => true,
         _ => false,
     }
 }
@@ -4864,6 +4869,7 @@ fn kist_object(code: u8) -> Option<(Object, u32)> {
         "entropy" => (Object::Entropy, RIGHT_SEND),
         "gps" => (Object::Endpoint(endpoint(b"gps")), RIGHT_SEND),
         "udp" => (Object::Endpoint(endpoint(b"udp")), RIGHT_SEND),
+        "audio" => (Object::Endpoint(endpoint(b"audio")), RIGHT_SEND),
         _ => return None,
     })
 }

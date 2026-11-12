@@ -243,6 +243,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RightEntropy => "rastgelelik",
         Msg::RightGps => "nerede olduğun",
         Msg::RightUdp => "ağ",
+        Msg::RightAudio => "ses",
         Msg::NotEnoughMemory => "yeterli bellek yok",
         Msg::NotInstalledHere => "bu cihazda kurulu değil",
         Msg::FailedItsChecks => "denetimlerinden geçemedi",

@@ -243,6 +243,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RightEntropy => "pagiging random",
         Msg::RightGps => "kung nasaan ka",
         Msg::RightUdp => "ang network",
+        Msg::RightAudio => "ang tunog",
         Msg::NotEnoughMemory => "kulang ang memorya",
         Msg::NotInstalledHere => "hindi naka-install sa device na ito",
         Msg::FailedItsChecks => "hindi pumasa sa mga pagsusuri nito",

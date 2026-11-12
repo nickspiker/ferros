@@ -385,7 +385,7 @@ messages! {
     AsksForOnce,
     /// The first-launch question's button.
     Start,
-    /// What each right is, in ferros_kist::RIGHTS order: display, touch, surface, ira, domain, entropy, gps, udp.
+    /// What each right is, in ferros_kist::RIGHTS order: display, touch, surface, ira, domain, entropy, gps, udp, audio.
     RightDisplay,
     RightTouch,
     RightSurface,
@@ -394,6 +394,7 @@ messages! {
     RightEntropy,
     RightGps,
     RightUdp,
+    RightAudio,
     /// Why a kist the person tapped did not start (ferros_kist::launch::why), under `Say::CouldNotStart` on its open circle: no room in the memory pool.
     NotEnoughMemory,
     /// Not installed on this device: no capsule here, or no seal.

@@ -243,6 +243,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RightEntropy => "tính ngẫu nhiên",
         Msg::RightGps => "vị trí của bạn",
         Msg::RightUdp => "mạng",
+        Msg::RightAudio => "âm thanh",
         Msg::NotEnoughMemory => "không đủ bộ nhớ",
         Msg::NotInstalledHere => "chưa được cài trên thiết bị này",
         Msg::FailedItsChecks => "không vượt qua được kiểm tra",
