@@ -418,6 +418,16 @@ fn dnd_ask(on: bool) {
     ferros_sys::wake(&ASK, 1);
 }
 
+/// A haptic tap wanted (bit 8 set: a request; bits 0-7 the motor's ROM waveform), taken by the worker: a note arrived in view (notes.rs, docs/NOTIFY.md "Personal"). The NFC driver serves the motor (its op 8, docs/NFC.md), a call of some 25 ms the main loop never waits on.
+static BUZZ_WANT: AtomicU64 = AtomicU64::new(0);
+
+/// One tap of the motor's ROM waveform `w`, on the worker.
+pub fn buzz(w: u8) {
+    BUZZ_WANT.store(1 << 8 | w as u64, Ordering::Release);
+    ASK.fetch_add(1, Ordering::AcqRel);
+    ferros_sys::wake(&ASK, 1);
+}
+
 /// The worker: asleep on `ASK` until the main loop wants something, then each call made waiting (a torch started on demand answers once it runs, docs/TORCH.md "Who starts it"; a live call would be refused while it starts). The torch's answer is published in `TORCH_NOW` for the main loop's next pass.
 pub extern "C" fn worker(grants: u64) -> ! {
     let mut seen = 0u64;
@@ -446,6 +456,14 @@ pub extern "C" fn worker(grants: u64) -> ! {
             let got = call(cap(grants, S_TORCH), &[3], &mut r);
             if got != ferros_sys::ERR && got >= 1 {
                 TORCH_NOW.store(1 << 8 | r[0] as u64, Ordering::Release);
+            }
+        }
+        let b = BUZZ_WANT.swap(0, Ordering::AcqRel);
+        if b & 1 << 8 != 0 {
+            let mut r = [0xFFu8; 1];
+            let got = call(cap(grants, S_NFC), &[8, b as u8], &mut r);
+            if got == ferros_sys::ERR || got == 0 || r[0] != 0 {
+                console(grants, b"map: notes: the motor did not play (NFC switched off, or its driver not up)\n");
             }
         }
         let d = DND_WANT.swap(0, Ordering::AcqRel);

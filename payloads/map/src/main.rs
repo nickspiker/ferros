@@ -23,6 +23,8 @@ extern crate alloc;
 
 mod stower;
 mod quick;
+/// Notes on the deck (docs/NOTIFY.md): the kernel's list, the glows, the resting view, the Deck button, the live takeover.
+mod notes;
 mod typed;
 
 use alloc::vec::Vec;
@@ -853,6 +855,9 @@ enum Choice {
     /// The NFC page's "add a tag" (or its cancel while it waits), and a kept tag's remove (its place in the list), attest with a tag (AUTH.md).
     TagAdd,
     TagRemove(u8),
+    /// A live note's page (notes.rs `live_page`, docs/NOTIFY.md "The live takeover"): Answer opens its kist at the note, Decline lets it go.
+    LiveAnswer,
+    LiveDecline,
 }
 
 /// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The torch after the battery (owner, 2026-11-11: its brightness, strobe, lit share and timeout; QUICK.md "Quick pages"), opened by a tap on its quick circle as well (a drag down from it, since 2026-11-12, is its level), as Appearance, the look's one page, is by a tap on the brightness ring. The clock after them (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). The Deck, first named Items (owner, 2026-11-12: "make sure it says items in settings, not kists"): everything on the deck as a circle, by kind, each row opening its card. These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
@@ -1374,6 +1379,21 @@ struct Map {
     waiting: alloc::vec::Vec<([u8; 32], u16)>,
     /// Each circle's state as last sent to the display (op 57: the glow's byte and the count), so a ring of the kists' bell sends only what changed.
     sent: [(u8, u16); MAX],
+    /// The notes waiting on the person as the kernel last listed them (notes.rs, docs/NOTIFY.md), the newest one taken (its bell count: `notes_rang` acts on each once), and when the earliest deadline among them passes (counter ticks; the main loop's rest ends there and the list is read again).
+    notes: Vec<notes::Rec>,
+    notes_read: u64,
+    notes_due: Option<u64>,
+    /// The deck's resting view (owner, 2026-11-12: the reach is the view): the camera as the person last settled the deck; a circle whose disc meets it can notify, out of it is silent. A pan that does not settle changes nothing, and an open kist leaves it as it was.
+    rest: Cam,
+    /// The kists that tapped the motor since the person last looked at them: one tap a kist until then.
+    tapped: Vec<[u8; 32]>,
+    /// The Deck button's note as last sent (display op 66): the icon and the count in view.
+    helm_sent: (u8, u16),
+    /// A live note on the screen (its source and number) and its words; the note a tap opens its kist at (`notes_front`), and one waiting for its kist's window to show.
+    live_note: Option<([u8; 32], u8)>,
+    live_words: Option<alloc::string::String>,
+    opening: Option<u8>,
+    open_pending: Option<([u8; 32], u8)>,
 }
 
 /// A fix as the GPS driver gives it (payloads/gps op 0 FIX): latitude and longitude in 2^-23 degrees. Its error estimate is the page's accuracy measure already (the driver's slot 1).
@@ -1827,6 +1847,12 @@ impl Map {
         }
         if raised {
             self.app_front = true;
+        }
+        // In front, the person is looking at it: its notes cleared, and told which one a tap opened it at (notes.rs `notes_front`; owner, 2026-11-12: "when tapping on Photon it clears it and resumes regular 500nm").
+        if r[0] == ferros_kist::launch::STARTED || raised {
+            self.notes_front(capsule, raised);
+        } else {
+            self.opening = None;
         }
         r[0]
     }
@@ -2817,6 +2843,10 @@ impl Map {
         let half = self.w / 2;
         let (title_y, top, bottom) = self.bands();
         let Some(k) = self.kist(i).cloned() else { return };
+        // A live note's page first (notes.rs): the takeover is the system's, over any question.
+        if self.live_page(b, i, region) {
+            return;
+        }
         b.text(cx, title_y, uu(2, 1) as u16, white(), 1, &k.name);
         // Opened on why its launch did not start (`show_fault`): that, in the person's language, and nothing to tap; a tap outside closes it, and a tap on the circle again asks again.
         if let Some((_, why, true)) = self.fault.filter(|f| f.0 == k.capsule) {
@@ -4632,6 +4662,8 @@ impl Map {
                         } else {
                             let Some(k) = self.kist(i) else { return };
                             if !k.unanswered() {
+                                // A circle glowing for you opens its kist at its latest note (docs/NOTIFY.md "A tap").
+                                self.opening = self.latest_note(&capsule);
                                 self.launch(i);
                                 return;
                             }
@@ -4649,6 +4681,10 @@ impl Map {
                 }
             }
             (1, View::Open(_)) => {
+                // The live takeover is modal: a tap outside does not close it (Answer, Decline, the caller's end, or Deck do).
+                if !inside && self.live_showing() {
+                    return;
+                }
                 if !inside {
                     // Back to the plane: the page shrinks with the circle as the camera flies back to the view it was opened from (a circle open since the start has none: every circle in view), and the view is the plane once it lands (`step_cam`).
                     let to = self.back.take().unwrap_or_else(|| self.deck_fit());
@@ -4695,6 +4731,14 @@ impl Map {
                     }
                     Some(Choice::ScopeSet(v)) => set(self, ferros_sys::PREF_SCOPE, v),
                     // The torch on at its level (and its strobe and timeout, which it reads itself) or off (its quick circle's tap until 2026-11-12, which opens this page now); one not heard from yet is asked to light (its first call starts it).
+                    Some(Choice::LiveAnswer) => {
+                        self.live_answer(true);
+                        return;
+                    }
+                    Some(Choice::LiveDecline) => {
+                        self.live_answer(false);
+                        return;
+                    }
                     Some(Choice::TorchOn) => quick::torch_ask(Some(if quick::torch_now().is_some_and(|l| l > 0) { 0 } else { ferros_sys::torch::level() })),
                     Some(Choice::Theme(i)) => set(self, ferros_sys::PREF_THEME, i),
                     Some(Choice::Dither) => set(self, ferros_sys::PREF_DITHER, (ferros_sys::pref(ferros_sys::PREF_DITHER) != 1) as u8),
@@ -4906,6 +4950,9 @@ impl Map {
                                 m[33..].copy_from_slice(&kist.option);
                                 if stower::ask(self.grants, &m) != Some(0) {
                                     console(self.grants, b"map: the stower did not take the unstow\n");
+                                } else {
+                                    // Its notes go with it (docs/NOTIFY.md "Seen"): nothing of a kist the person put away waits on them.
+                                    ferros_sys::notify::seen(cap(self.grants, S_SETTINGS), &kist.capsule, ferros_sys::notify::ALL, false);
                                 }
                             }
                         } else {
@@ -5127,6 +5174,16 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         ended: alloc::vec::Vec::new(),
         waiting: alloc::vec::Vec::new(),
         sent: [(0, 0); MAX],
+        notes: Vec::new(),
+        notes_read: 0,
+        notes_due: None,
+        rest: Cam { x: 0, y: 0, z: Z_ONE, c: ONE, s: 0 },
+        tapped: Vec::new(),
+        helm_sent: (0, 0),
+        live_note: None,
+        live_words: None,
+        opening: None,
+        open_pending: None,
     };
     // The display's hit map view as it stands (op 58, ask), for the Developer page's checkbox: a map started again finds it as it was left.
     if DEV {
@@ -5157,6 +5214,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut dv = [0u8; 4];
     map.dev = matches!(ferros_sys::store_get(cap(grants, S_STORE), b"dev", &mut dv), Some(n) if n >= 1 && dv[0] == 1);
     let mut saved_view = map.cam;
+    // The deck's resting view starts as the view it was left at.
+    map.rest = map.cam;
     // A development build can start arrived at a circle, its page open, without a finger: FERROS_MAP_START=o<n> (circle n).
     if let Some(v) = option_env!("FERROS_MAP_START").map(str::as_bytes) {
         if v.len() == 2 && (v[1] as usize).wrapping_sub(b'0' as usize) < map.n {
@@ -5358,6 +5417,14 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     if !ferros_sys::not_started::doorbell(cap(grants, S_SETTINGS), &KISTS_WORD) {
         console(grants, b"map: the kernel has no kists' bell\n");
     }
+    // The notes' bell (SYS_NOTIFY op 4, docs/NOTIFY.md): a note posted, withdrawn, seen or past its deadline. A kernel from before refuses it, and nothing glows for you.
+    if !ferros_sys::notify::doorbell(cap(grants, S_SETTINGS), &notes::WORD) {
+        console(grants, b"map: the kernel has no notes' bell\n");
+    }
+    let mut notes_seen = notes::WORD.load(core::sync::atomic::Ordering::Acquire);
+    // What waits already (posted before this map started, or kept from before the boot) glows at once; it taps and takes over nothing: every note's bell count is at most the bell's now, where `notes_read` starts.
+    map.notes_read = notes_seen;
+    map.notes_rang();
     let mut kists_seen = KISTS_WORD.load(core::sync::atomic::Ordering::Acquire);
     // What the kernel kept before this map started is not this map's to say.
     map.kists_read = kists_seen;
@@ -5576,6 +5643,16 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if !down {
             map.show_fault();
         }
+        // The notes' bell rang, or the earliest deadline passed (the list read again drops it in the kernel): the glows, the Deck button, a tap or a takeover (notes.rs).
+        let nw = notes::WORD.load(core::sync::atomic::Ordering::Acquire);
+        if nw != notes_seen || map.notes_due.is_some_and(|d| now() >= d) {
+            notes_seen = nw;
+            map.notes_rang();
+        }
+        // The live page left without an answer (Deck closed it): the note stays waiting, glowing; a tap on its circle opens its kist at it.
+        if map.live_note.is_some() && !map.live_showing() && map.flight.is_none() {
+            map.live_note = None;
+        }
         // A fleet device's departure waiting on this person: a new one opens the Fleet page on it, Approve or Deny ready (owner, 2026-11-10: "go right to the fleet page and have the unbind request 'Approve' or 'Deny' screen ready to go"). Not over an app in front, and not while a finger is down or the map is settling: a request waiting opens the page once the fingers lift.
         if !map.app_front && !down && !map.settling {
             let ask = map.fleet.depart.filter(|d| d.1 == 0).map(|d| (d.0, map.fleet.depart_name, map.fleet.depart_name_n));
@@ -5617,6 +5694,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             let mut q = [0u8; 16];
             if call(map.display, &[5], &mut q) >= 13 && q[12] == 1 {
                 map.app_front = true;
+            }
+        }
+        // A kist started from a tap on a note: told which note once its window is in front (display op 65).
+        if map.app_front {
+            if let Some((c, n)) = map.open_pending.take() {
+                map.open_at(c, n);
             }
         }
         // An app in front: it has the touches; the map only watches for it to hand the screen back.
@@ -6016,6 +6099,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.draw();
             map.save_arranged();
             if map.cam != saved_view {
+                // Settled on the deck: its resting view, and what is in it (notes.rs).
+                if map.view == View::Map {
+                    map.rest = map.cam;
+                    map.notes_view();
+                }
                 if map.save_view() {
                     saved_view = map.cam;
                 } else {
@@ -6201,6 +6289,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if held == 0 && !map.settling && !qr.settling {
             // WHY the min: two deadlines, the rest's and the second's turn on the clock or About (`tick_at`); the earlier ends the rest, so the second is drawn as it turns rather than up to a rest after.
             let rest = now() + freq() / 30;
+            // A note's deadline ends the rest too, as an alarm would (docs/NOTIFY.md "Deadlines").
+            let rest = map.notes_due.map_or(rest, |d| rest.min(d));
             sleep_until(tick_at.map_or(rest, |at| rest.min(at)));
         } else {
             let mut fr = [0u8; 4];
@@ -6232,8 +6322,15 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 map.draw();
             }
             // Come to rest after the lift (a fling, a flight): the view into the vault if it moved, as the lift does for what the fingers left.
-            if !moving && map.cam != saved_view && map.save_view() {
-                saved_view = map.cam;
+            if !moving && map.cam != saved_view {
+                // Settled on the deck: its resting view, and what is in it (notes.rs).
+                if map.view == View::Map {
+                    map.rest = map.cam;
+                    map.notes_view();
+                }
+                if map.save_view() {
+                    saved_view = map.cam;
+                }
             }
         }
     }

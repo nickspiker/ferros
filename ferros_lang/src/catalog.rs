@@ -385,6 +385,11 @@ messages! {
     AsksForOnce,
     /// The first-launch question's button.
     Start,
+    /// A live note's page (docs/NOTIFY.md "The live takeover"): take it (open the kist where the note points), or say no (the note goes; its kist tells the caller).
+    Answer,
+    Decline,
+    /// A live note's heading when its kist gave no words: something for the person, now.
+    ForYouNow,
     /// What each right is, in ferros_kist::RIGHTS order: display, touch, surface, ira, domain, entropy, gps, udp, audio.
     RightDisplay,
     RightTouch,
