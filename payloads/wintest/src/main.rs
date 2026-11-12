@@ -1,5 +1,5 @@
 //! A window to exercise the display's layer stack (WINDOWS.md, "The layer stack"): a fluor-format (`G2T16`) surface with a half-transparent red block in its middle and nothing elsewhere, shown at the level and with the mode byte the input names, for a minute, then done.
-//! Input: byte 0 the level (0 an app, 2 the system), byte 1 the mode byte (bits 0-2 the blend mode in fluor's order, bit 3 opaque).
+//! Input: byte 0 the level (0 an app, 2 the system; above 0 the display refuses it with status 4, since wintest holds no Settings: a test of that rule, WINDOWS.md "Whose level"), byte 1 the mode byte (bits 0-2 the blend mode in fluor's order, bit 3 opaque).
 //! Spawn: ferros-bridge spawn wintest.bin 0001 --name wintest --use display --use touch --dma surface   (level 0, Multiply)
 //! Grant slots as an app's: 0 console, 1 display (use), 2 touch (use), 3 its surface.
 #![no_std]
