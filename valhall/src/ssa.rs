@@ -46,6 +46,10 @@ enum Op {
     IMul(u32, u32),
     /// Wrapping integer add.
     IAdd(u32, u32),
+    /// Wrapping integer subtract.
+    ISub(u32, u32),
+    /// An unsigned integer compare, all ones where true (ICMP_OR.u32's `M1` result).
+    ICmp(Cond, u32, u32),
     /// A 32-bit word of one of the caller's uniform slots (`reserve`), as a value.
     Uniform(u8, u8),
     And(u32, u32),
@@ -88,7 +92,7 @@ impl Op {
                 f(a);
                 f(b)
             }
-            FAdd(a, b) | FMul(a, b) | FMin(a, b) | FMax(a, b) | FCmp(_, a, b) | IMul(a, b) | IAdd(a, b) | And(a, b) | Or(a, b) | Xor(a, b) | Shl(a, b) | Shr(a, b) => {
+            FAdd(a, b) | FMul(a, b) | FMin(a, b) | FMax(a, b) | FCmp(_, a, b) | IMul(a, b) | IAdd(a, b) | ISub(a, b) | ICmp(_, a, b) | And(a, b) | Or(a, b) | Xor(a, b) | Shl(a, b) | Shr(a, b) => {
                 f(a);
                 f(b)
             }
@@ -123,6 +127,8 @@ impl Op {
             Sel(..) => "sel",
             IMul(..) => "imul",
             IAdd(..) => "iadd",
+            ISub(..) => "isub",
+            ICmp(..) => "icmp",
             Uniform(..) => "uniform",
             And(..) => "and",
             Or(..) => "or",
@@ -164,6 +170,8 @@ struct Rec {
     reserved: u8,
     /// Divides, reciprocals and square roots refined to the CPU's correctly rounded results, and no multiply fused into an add (`exact`); otherwise the special function unit's values as they come (within an ulp) and contraction, which is faster and looks the same.
     exact: bool,
+    /// The uniform slots the run passes (`uniform_slots`): the caller's reserved ones, then two constants a slot.
+    slots: u8,
 }
 
 /// The recording in progress. Single-threaded by construction: a kernel is recorded on one core, between [`begin`] and [`compile`].
@@ -205,6 +213,16 @@ fn push(op: Op) -> u32 {
         Op::Xor(a, b) => both(a, b).map(|(x, y)| Ok(x ^ y)),
         Op::IMul(a, b) => both(a, b).map(|(x, y)| Ok(x.wrapping_mul(y))),
         Op::IAdd(a, b) => both(a, b).map(|(x, y)| Ok(x.wrapping_add(y))),
+        Op::ISub(a, b) => both(a, b).map(|(x, y)| Ok(x.wrapping_sub(y))),
+        Op::ICmp(cond, a, b) => both(a, b).and_then(|(x, y)| match cond {
+            Cond::Eq => Some(Ok(mask(x == y))),
+            Cond::Ne => Some(Ok(mask(x != y))),
+            Cond::Lt => Some(Ok(mask(x < y))),
+            Cond::Ge => Some(Ok(mask(x >= y))),
+            Cond::Gt => Some(Ok(mask(x > y))),
+            Cond::Le => Some(Ok(mask(x <= y))),
+            _ => None,
+        }),
         Op::Shl(a, s) => both(a, s).filter(|(_, y)| *y < 32).map(|(x, y)| Ok(x << y)),
         Op::Shr(a, s) => both(a, s).filter(|(_, y)| *y < 32).map(|(x, y)| Ok(x >> y)),
         Op::U2F(a) => c(a).map(|x| Ok((x as f32).to_bits())),
@@ -233,7 +251,7 @@ fn const_of(x: u32) -> Option<u32> {
 
 /// Start recording a kernel.
 pub fn begin() {
-    unsafe { *(&raw mut REC) = Some(Rec { nodes: Vec::new(), loops: Vec::new(), reserved: 1, exact: false }) };
+    unsafe { *(&raw mut REC) = Some(Rec { nodes: Vec::new(), loops: Vec::new(), reserved: 1, exact: false, slots: 16 }) };
 }
 
 /// The invocation's global id (X), preloaded in r60.
@@ -272,6 +290,13 @@ pub fn exact(on: bool) {
 /// Uniform slots 0 to n - 1 for the caller (its addresses, set before `begin`'s recording uses any constant): the kernel's constants go from slot n. One by default.
 pub fn reserve(n: u8) {
     rec().reserved = n;
+}
+
+/// How many uniform slots the run will pass in all (16 by default, what the GPU service took until 2026-11-11; up to 64 since): every constant the compiler places in one is read by its instruction with no move before it (a kernel of per-frame constants, Mahere's map: 206 of its 836 words were those moves).
+pub fn uniform_slots(n: u8) {
+    // WHY: a slot index is 7 bits (`u`), and the service's descriptor page holds 64 after its own words; more would run past what a run can pass.
+    assert!((rec().reserved..=64).contains(&n), "valhall::ssa: {n} uniform slots (the reserved {} to 64)", rec().reserved);
+    rec().slots = n;
 }
 
 impl F {
@@ -394,6 +419,10 @@ impl F {
     pub fn from_u32(u: U) -> F {
         F::op(Op::U2F(u.0))
     }
+    /// `u as i32 as f32`: the bits taken as a signed integer.
+    pub fn from_i32(u: U) -> F {
+        F::op(Op::S2F(u.0))
+    }
 }
 
 impl Add for F {
@@ -514,6 +543,40 @@ impl U {
     /// Per invocation, `a` where the mask is set and `b` elsewhere, for masks.
     pub fn select_mask(m: M, a: M, b: M) -> M {
         M(push(Op::Sel(m.0, a.0, b.0)))
+    }
+    /// self << s, the amount a value per invocation (below 32: the shift group reads its low byte).
+    pub fn shl_by(self, s: U) -> U {
+        U(push(Op::Shl(self.0, s.0)))
+    }
+    /// self >> s (logical), the amount a value per invocation (below 32).
+    pub fn shr_by(self, s: U) -> U {
+        U(push(Op::Shr(self.0, s.0)))
+    }
+    /// Unsigned compares, all ones where true.
+    pub fn eq(self, o: U) -> M {
+        M(push(Op::ICmp(Cond::Eq, self.0, o.0)))
+    }
+    pub fn ne(self, o: U) -> M {
+        M(push(Op::ICmp(Cond::Ne, self.0, o.0)))
+    }
+    pub fn lt(self, o: U) -> M {
+        M(push(Op::ICmp(Cond::Lt, self.0, o.0)))
+    }
+    pub fn ge(self, o: U) -> M {
+        M(push(Op::ICmp(Cond::Ge, self.0, o.0)))
+    }
+    /// A mask's bits as a value (all ones or zero), and a value as a mask (it must be all ones or zero: `select` takes each bit).
+    pub fn from_mask(m: M) -> U {
+        U(m.0)
+    }
+    pub fn as_mask(self) -> M {
+        M(self.0)
+    }
+}
+impl Sub for U {
+    type Output = U;
+    fn sub(self, o: U) -> U {
+        U(push(Op::ISub(self.0, o.0)))
     }
 }
 impl Add for U {
@@ -888,7 +951,7 @@ pub fn compile() -> Compiled {
         }
     }
     let hoisted_at = |s: u32, at: usize| reg[s as usize] != u8::MAX && at > hoist_span[s as usize].0 && at < hoist_span[s as usize].1;
-    // Uniform words for the constants used most (a use inside a loop counting 2^6 times one outside), slots 1 to 15 (slot 0 is the caller's output address): read by the instruction itself, no load. LUT values and hoisted ones need none.
+    // Uniform words for the constants used most (a use inside a loop counting 2^6 times one outside), the slots after the caller's (`reserve`) up to `uniform_slots`: read by the instruction itself, no load. LUT values and hoisted ones need none.
     let mut weight: Vec<(u32, usize)> = Vec::new();
     for (j, op) in nodes.iter().enumerate() {
         if !keep[j] {
@@ -909,9 +972,9 @@ pub fn compile() -> Compiled {
         });
     }
     weight.sort_by(|a, b| b.1.cmp(&a.1));
-    // The service passes 16 uniform slots: the caller's `reserved` first, then two constants a slot.
+    // The service passes `slots` uniform slots (16 unless the caller asked for more): the caller's `reserved` first, then two constants a slot.
     let reserved = rec.reserved;
-    let ufau: Vec<(u32, (u8, u8))> = weight.iter().take(2 * (16 - reserved as usize)).enumerate().map(|(k, w)| (w.0, (reserved + (k / 2) as u8, (k % 2) as u8))).collect();
+    let ufau: Vec<(u32, (u8, u8))> = weight.iter().take(2 * (rec.slots - reserved) as usize).enumerate().map(|(k, w)| (w.0, (reserved + (k / 2) as u8, (k % 2) as u8))).collect();
     let mut consts = alloc::vec![0u64; ufau.len().div_ceil(2)];
     for &(s, (sl, w)) in &ufau {
         let Op::Const(bits) = nodes[s as usize] else { unreachable!() };
@@ -1036,6 +1099,12 @@ pub fn compile() -> Compiled {
             }
             Op::IAdd(a, b) => {
                 k.iadd_u32(d, rr(a), rr(b));
+            }
+            Op::ISub(a, b) => {
+                k.isub_s32(d, rr(a), rr(b));
+            }
+            Op::ICmp(c, a, b) => {
+                k.icmp_or_u32(d, c, CmpResult::M1, rr(a), rr(b), Lut::ZERO);
             }
             Op::Uniform(slot, word) => {
                 k.mov_i32(d, if word == 0 { u(slot).w0() } else { u(slot).w1() });
@@ -1182,7 +1251,7 @@ fn parallel_copy(k: &mut Kernel<16384>, mut moves: Vec<(u8, u8)>, consts: &[(u8,
 }
 /// Whether an instruction form already reads the LUT's zero itself (a multiply's −0 addend, a negation's, a compare's `or`, the shift group's shift or second operand): it counts against the FAU's two words.
 fn fixed_zero(op: &Op) -> bool {
-    matches!(op, Op::FMul(..) | Op::FNeg(_) | Op::FCmp(..) | Op::And(..) | Op::Or(..) | Op::Xor(..) | Op::Shl(..) | Op::Shr(..))
+    matches!(op, Op::FMul(..) | Op::FNeg(_) | Op::FCmp(..) | Op::ICmp(..) | Op::And(..) | Op::Or(..) | Op::Xor(..) | Op::Shl(..) | Op::Shr(..))
 }
 
 /// r58:r59 = the address in uniform `slot` plus `index << shift`, in 32 bits (the slot's high word kept: the layer arena lies below 4 GiB, so the low word's add never carries). The shift amount is a byte of the LUT's byte-index entries, so it needs no register.
