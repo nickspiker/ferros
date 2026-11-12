@@ -8,7 +8,7 @@
 //! The `touch` endpoint. One op per call, first byte the op, and a contact record is 12 bytes:
 //! `id u8`, `phase u8` (0 enter, 1 move, 2 leave), `kind u8` (the controller's touch type — finger, glove, stylus, palm), `pressure u8` (A#0-255, the controller's own scale, passed through unscaled), `x u16 LE`, `y u16 LE`, `major u16 LE`, `minor u16 LE`. Coordinates are panel pixels, the same space the `display` endpoint takes and fluor hit-tests in, so nothing converts anywhere.
 //!
-//! - `0` CHANGES: every contact event seen since the last CHANGES call — a count byte, then that many records, oldest first. This is what an event loop wants.
+//! - `0` CHANGES: every contact event seen since the last CHANGES call — a count byte, then that many records (at most 16), oldest first. This is what an event loop wants. A reader that keeps up gets every event; one slower than the controller (more waiting than a reply carries, or than the 64 the server holds) loses moves that a later record of the same contact supersedes, oldest first, never an enter, a leave or a contact's latest move (`Table::squash`).
 //! - `1` HELD: the contacts on the glass *now* — a count byte, then that many records, phase always move. This is what "how hard is this control being pressed" wants, and it exists because the controller reports a contact entering, then only when something about it changes, then leaving: **a finger held perfectly still produces no events at all**. A delta-only endpoint would make every client rebuild this table, and get it wrong the same way the decay screen did before the owner caught it.
 //! - `2` INFO: `x_max u16 LE`, `y_max u16 LE`, `slots u8` — the panel's largest coordinates and how many contacts the table holds.
 //! - `3` INJECT, development builds only (docs/INPUT-INJECT.md, payloads/inject): `count u8`, then that many records as above with the id a finger number (below `ferros_inject::FINGERS`) → `status u8` (0 taken, 1 refused), `injected u16 LE`. The records go into the table in order exactly as the controller's events do, so CHANGES and HELD serve them to every consumer alike; finger f takes the slot 15 − f. A batch is taken whole or not at all: refused when a finger enters while its slot is held (by a real finger or itself) or moves or leaves while it is not an injected contact. A real contact landing on an injected slot takes it over, and the injector's next record for it is refused.
@@ -67,7 +67,7 @@ const EVT_MOTION: u8 = 0x2;
 const EVT_LEAVE: u8 = 0x3;
 
 const SLOTS: usize = 16;
-/// How many events are remembered between two CHANGES calls. A client polling every frame sees far fewer; a client that stops asking loses the oldest.
+/// How many events are remembered between two CHANGES calls. A client polling every frame sees far fewer; a client that stops asking loses the superseded moves first (`Table::squash`), and the oldest only when nothing else can go.
 const CHANGES: usize = 64;
 const REC: usize = 12;
 /// A development build (FERROS_PRODUCTION unset): the injection ops exist (payloads/display's `DEV`).
@@ -181,8 +181,8 @@ fn decode(e: &[u8; EVT_SIZE], phase: u8) -> Contact {
 struct Table {
     held: [Contact; SLOTS],
     down: u16,
+    /// The records waiting for CHANGES, oldest first, `count` of them.
     changes: [Contact; CHANGES],
-    head: usize,
     count: usize,
     /// Bit s: the contact in slot s came from an injector (op 3), not the controller. Diagnostics only (op 4): nothing served to a consumer carries it.
     injected: u16,
@@ -228,7 +228,7 @@ impl Table {
         self.injected = injected;
         true
     }
-    /// One contact event, whoever made it: the held table updated, the event remembered (the oldest dropped once CHANGES are waiting).
+    /// One contact event, whoever made it: the held table updated, the event remembered. With CHANGES waiting already, room is made by `squash` (a move with a later record of its contact goes first); only when every waiting record is an enter, a leave or a contact's last move does the oldest go.
     fn record(&mut self, c: Contact) {
         let id = c.id as usize;
         if c.phase == 2 {
@@ -237,11 +237,29 @@ impl Table {
             self.held[id] = c;
             self.down |= 1 << id;
         }
-        self.changes[(self.head + self.count) % CHANGES] = c;
-        if self.count < CHANGES {
-            self.count += 1;
-        } else {
-            self.head = (self.head + 1) % CHANGES;
+        if self.count == CHANGES {
+            self.squash(CHANGES - 1);
+        }
+        if self.count == CHANGES {
+            self.changes.copy_within(1..CHANGES, 0);
+            self.count -= 1;
+        }
+        self.changes[self.count] = c;
+        self.count += 1;
+    }
+    /// The waiting records cut to `keep` where they can be, oldest first: a move that a later record of the same contact supersedes (a later move, or its leave, which says where it left) is dropped. An enter, a leave and each contact's last move stay, in their order.
+    /// A reader slower than the controller then still sees every finger come and go, and where each is now (2026-11-12, the owner on the Pro: "it ONLY sees one finger": Mahere drawing 0.6 to 2 s a frame read 16 records a frame, the oldest of the last 64; a second finger's enter was pushed out by moves before it was read, and the app never knew the finger was down).
+    /// A later record of the same id is this contact's, or comes after this contact's leave (a slot is taken again only once it has left): either way the move is not the contact's last word.
+    fn squash(&mut self, keep: usize) {
+        let mut i = 0;
+        while self.count > keep && i < self.count {
+            let c = self.changes[i];
+            if c.phase == 1 && self.changes[i + 1..self.count].iter().any(|d| d.id == c.id) {
+                self.changes.copy_within(i + 1..self.count, i);
+                self.count -= 1;
+            } else {
+                i += 1;
+            }
         }
     }
     /// The contact `id` has left, where it was last seen.
@@ -342,7 +360,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     console(grants, b"touch: serving the touch endpoint\n");
-    let mut t = Table { held: [Contact::default(); SLOTS], down: 0, changes: [Contact::default(); CHANGES], head: 0, count: 0, injected: 0, taken: 0 };
+    let mut t = Table { held: [Contact::default(); SLOTS], down: 0, changes: [Contact::default(); CHANGES], count: 0, injected: 0, taken: 0 };
     // Room for an injection batch: the op, the count and a record per finger an injector may hold.
     let mut msg = [0u8; 2 + REC * INJECT_FINGERS];
     let mut out = [0u8; 1 + REC * SLOTS];
@@ -386,12 +404,14 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if n != NOTHING && n != 0 {
             let len = match msg[0] {
                 0 => {
+                    // More waiting than a reply carries: the superseded moves go first, so the reply holds every enter and leave and each contact's latest place, not the oldest moves.
+                    t.squash(SLOTS);
                     let k = t.count.min(SLOTS);
                     out[0] = k as u8;
                     for i in 0..k {
-                        t.changes[(t.head + i) % CHANGES].write(&mut out[1 + i * REC..1 + (i + 1) * REC]);
+                        t.changes[i].write(&mut out[1 + i * REC..1 + (i + 1) * REC]);
                     }
-                    t.head = (t.head + k) % CHANGES;
+                    t.changes.copy_within(k..t.count, 0);
                     t.count -= k;
                     1 + k * REC
                 }
