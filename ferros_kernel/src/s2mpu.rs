@@ -144,20 +144,25 @@ pub const GPU_S2MPU: usize = 0x1EE7_0000;
 /// pd_g3d's status in the PMU (GPU.md: a plain read, bit 0 on): the S2MPU is reachable only while it is on.
 const PD_G3D_STATUS: usize = 0x1546_1A84;
 static mut GPU_TABLE: Smpt = Smpt([0; 32768]);
+/// The second GiB's table: the apps' surfaces (cachemap SURFACES).
+static mut GPU_TABLE_SURFACES: Smpt = Smpt([0; 32768]);
 static GPU_RESULT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// The GPU's fence: read and write to `gpu-mem` (cachemap GPU_MEM) and the layer arena (LAYERS, both in one GiB), nothing else, for every VID (only the GPU sits behind it; which VID its traffic arrives as is not measured yet). G#E4: pd_g3d not powered (left alone).
+/// The GPU's fence: read and write to `gpu-mem` (cachemap GPU_MEM) and the layer arena (LAYERS, both in one GiB), and the apps' surfaces (SURFACES, in the GiB above), nothing else, for every VID (only the GPU sits behind it; which VID its traffic arrives as is not measured yet). G#E4: pd_g3d not powered (left alone).
+/// The surfaces since 2026-11-11: an app whose frame is a GPU kernel's output (Mahere's map) has the GPU write its surface, the buffer the display composes, with no copy on the CPU (GPU-KISTS.md 1.4: a GPU layer is a buffer granted to its owner and the display). Every GPU client could write every app's surface, as every one shares the layer arena: the isolation is plan step 1's (each client its own address space).
 pub fn fence_gpu() -> u32 {
-    let (m, l) = (crate::cachemap::GPU_MEM, crate::cachemap::LAYERS);
+    let (m, l, s) = (crate::cachemap::GPU_MEM, crate::cachemap::LAYERS, crate::cachemap::SURFACES);
     let gb = m.0 >> 30;
+    let sgb = s.0 >> 30;
     let r = if m.0 == m.1 {
         0xE3
     } else if unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 0 {
         0xE4
-    } else if [m.1 - 1, l.0, l.1 - 1].iter().any(|&a| a >> 30 != gb) {
+    } else if [m.1 - 1, l.0, l.1 - 1].iter().any(|&a| a >> 30 != gb) || s.0 == s.1 || (s.1 - 1) >> 30 != sgb || sgb == gb {
         0xE3
     } else {
-        fence_at(GPU_S2MPU, &raw mut GPU_TABLE, gb, 0xC, 0xFF, &|pa| (pa >= m.0 && pa < m.1) || (pa >= l.0 && pa < l.1))
+        let allowed = |pa: usize| (pa >= m.0 && pa < m.1) || (pa >= l.0 && pa < l.1) || (pa >= s.0 && pa < s.1);
+        fence_gbs(GPU_S2MPU, &[(gb, &raw mut GPU_TABLE), (sgb, &raw mut GPU_TABLE_SURFACES)], 0xC, 0xFF, &allowed)
     };
     GPU_RESULT.store(r, core::sync::atomic::Ordering::Relaxed);
     r
@@ -208,30 +213,37 @@ pub fn dpu_result() -> u32 {
 
 /// One S2MPU fenced: the VIDs in mask `vids` reach the pages of GiB `gb` that `allowed` names, with permission `perm` (SMPT nibble: G#4 read, G#8 write), through `table` (one table, shared by those VIDs); every other GiB and every other VID nothing.
 fn fence_at(base: usize, table: *mut Smpt, gb: usize, perm: u32, vids: u8, allowed: &dyn Fn(usize) -> bool) -> u32 {
+    fence_gbs(base, &[(gb, table)], perm, vids, allowed)
+}
+
+/// `fence_at` over several GiBs, each with its own table: the pages `allowed` names in each, nothing anywhere else.
+fn fence_gbs(base: usize, gbs: &[(usize, *mut Smpt)], perm: u32, vids: u8, allowed: &dyn Fn(usize) -> bool) -> u32 {
     if rd(base, VERSION) & 0xFFFF_0000 != 0x9000_0000 {
         return 0xE1;
     }
-    let gb_base = gb << 30;
-    let t = unsafe { &mut *table };
-    for (w, e) in t.0.iter_mut().enumerate() {
-        let mut v = 0u32;
-        for n in 0..8 {
-            if allowed(gb_base + ((w * 8 + n) << 12)) {
-                v |= perm << (4 * n);
+    for &(gb, table) in gbs {
+        let gb_base = gb << 30;
+        let t = unsafe { &mut *table };
+        for (w, e) in t.0.iter_mut().enumerate() {
+            let mut v = 0u32;
+            for n in 0..8 {
+                if allowed(gb_base + ((w * 8 + n) << 12)) {
+                    v |= perm << (4 * n);
+                }
             }
+            *e = v;
         }
-        *e = v;
-    }
-    // Clean the table to the point of coherency: the walker reads DRAM, not the cache.
-    let (t0, t1) = (table as usize, table as usize + core::mem::size_of::<Smpt>());
-    unsafe {
-        core::arch::asm!("dsb sy");
-        let mut a = t0;
-        while a < t1 {
-            core::arch::asm!("dc cvac, {}", in(reg) a);
-            a += 64;
+        // Clean the table to the point of coherency: the walker reads DRAM, not the cache.
+        let (t0, t1) = (table as usize, table as usize + core::mem::size_of::<Smpt>());
+        unsafe {
+            core::arch::asm!("dsb sy");
+            let mut a = t0;
+            while a < t1 {
+                core::arch::asm!("dc cvac, {}", in(reg) a);
+                a += 64;
+            }
+            core::arch::asm!("dsb sy");
         }
-        core::arch::asm!("dsb sy");
     }
     // Contexts: context i serves VID i, all valid (L1 writes for a VID without a context are ignored).
     let n = (rd(base, NUM_CONTEXT) & 0xF) as usize;
@@ -240,14 +252,14 @@ fn fence_at(base: usize, table: *mut Smpt, gb: usize, perm: u32, vids: u8, allow
         ctx |= ((i as u32) | 8) << (4 * i);
     }
     wr(base, CONTEXT_CFG_VALID_VID, ctx);
-    let tab = (table as usize >> 4) as u32;
     for vid in 0..VIDS {
         for g in (0..4).chain(34..GBS) {
-            if g == gb && vids >> vid & 1 == 1 {
-                wr(base, l1_table(vid, g), tab);
-                wr(base, l1_attr(vid, g), L2TABLE_EN);
-            } else {
-                wr(base, l1_attr(vid, g), 0);
+            match gbs.iter().find(|e| e.0 == g) {
+                Some(&(_, table)) if vids >> vid & 1 == 1 => {
+                    wr(base, l1_table(vid, g), (table as usize >> 4) as u32);
+                    wr(base, l1_attr(vid, g), L2TABLE_EN);
+                }
+                _ => wr(base, l1_attr(vid, g), 0),
             }
         }
     }

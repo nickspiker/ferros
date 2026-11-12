@@ -98,9 +98,10 @@ pub const GPU_MEM: (usize, usize) = (0xB400_0000, 0xB600_0000);
 pub const GPU_SNOOP: usize = GPU_MEM.1 - (2 << 20);
 #[cfg(shim_handoff)]
 pub const GPU_SNOOP: usize = 0;
-/// The layer arena (cold only; GPU.md "Layers", owner 2026-11-05): 64 MiB of Normal write-back, EL0 read/write, never executable memory where the GPU writes compute-dense layers (the Mandelbrot, glows) and the CPU composes them, or the CPU writes and the GPU reads, with no clean and no copy: the GPU maps it coherent and snoops the CPU's caches (GPU.md "Coherency"). In the GPU's fence beside gpu-mem. Free DRAM: the device tree reserves nothing in G#9800_0000-G#A000_0000 (USB's 4 MiB end at G#9740_0000). Granted as `layers`.
+/// The layer arena (cold only; GPU.md "Layers", owner 2026-11-05): 128 MiB of Normal write-back, EL0 read/write, never executable memory where the GPU writes compute-dense layers (the Mandelbrot, glows) and the CPU composes them, or the CPU writes and the GPU reads, with no clean and no copy: the GPU maps it coherent and snoops the CPU's caches (GPU.md "Coherency"). In the GPU's fence beside gpu-mem. Free DRAM: the device tree reserves nothing in G#9800_0000-G#A000_0000 (USB's 4 MiB end at G#9740_0000), and memblock holds it plain memory (frames.rs: G#9740_0000-G#B61F_FFFF, no reservation). Granted as `layers`.
+/// 64 MiB at G#9C00_0000 until 2026-11-11, when Mahere's map moved to the GPU (GPU-KISTS.md): its cells' planes are a MiB each, and a screen at the Pro's texel density draws from up to fifty or so; the whole free range now, until kists have GPU memory of their own (plan step 1).
 #[cfg(not(shim_handoff))]
-pub const LAYERS: (usize, usize) = (0x9C00_0000, 0xA000_0000);
+pub const LAYERS: (usize, usize) = (0x9800_0000, 0xA000_0000);
 #[cfg(shim_handoff)]
 pub const LAYERS: (usize, usize) = (0, 0);
 #[cfg(shim_handoff)]

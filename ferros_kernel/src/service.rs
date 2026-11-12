@@ -1012,10 +1012,10 @@ fn gps_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![Serve(b"gps"), Hardware(b"usi3-spi"), Hardware(b"gpio-far-alive"), Hardware(b"gpio-gpp0"), Hardware(b"gpio-hsi2"), Store(b"gps"), Power(b"gps"), Irq(b"gps-host-req")]
 }
 
-/// The GPU service's grants in its slot order (payloads/gpu): 1 its registers, 2 its memory, 3 the vault scope `gpu.` (its firmware), 4 its job interrupt, 5 the layer arena, 6 serve gpu. Its own list since 2026-11-08, as the vault's and the GPS driver's: init's page gave its five slots to kists, and the kernel starts the GPU service at home, before init (so before the attest screen, its first client).
+/// The GPU service's grants in its slot order (payloads/gpu): 1 its registers, 2 its memory, 3 the vault scope `gpu.` (its firmware), 4 its job interrupt, 5 the layer arena, 6 serve gpu, 7 the apps' surfaces (since 2026-11-11: a client's kernel writes its own surface, Mahere's map; the GPU's fence admits them, s2mpu::fence_gpu). Its own list since 2026-11-08, as the vault's and the GPS driver's: init's page gave its five slots to kists, and the kernel starts the GPU service at home, before init (so before the attest screen, its first client).
 fn gpu_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     use crate::process::Grant::*;
-    alloc::vec![Dma(b"gpu-regs"), Dma(b"gpu-mem"), Store(b"gpu"), Irq(b"gpu-job"), Dma(b"layers"), Serve(b"gpu")]
+    alloc::vec![Dma(b"gpu-regs"), Dma(b"gpu-mem"), Store(b"gpu"), Irq(b"gpu-job"), Dma(b"layers"), Serve(b"gpu"), Dma(b"surfaces")]
 }
 
 /// The installer's grants in its slot order (payloads/kists; docs/KISTS.md "Install"): 1 use udp (the network, plain HTTP), 2 the vault scope `capsules.` (it stores what it fetched, by content address), 3 the vault scope `kists.` (the person's list), 4 serve `kists` (the map's Kists page), 5 use fgtw (the identity service's doorbell: a restore follows the person's space), 6 the Install right (the kernel checks and seals what it stored). Its own list, as the GPS driver's: init's page is full, and the kernel starts it once a person has attested (the list is theirs).
