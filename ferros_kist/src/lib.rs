@@ -13,6 +13,8 @@ pub use vsf;
 pub use tatau;
 
 pub mod fetch;
+/// A note a kist has waiting on the person (docs/NOTIFY.md): its VSF, read and written the one way.
+pub mod note;
 /// A signing key kept as VSF: its one reader and writer (the host tools).
 pub mod secret;
 

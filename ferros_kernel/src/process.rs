@@ -1288,6 +1288,11 @@ const SYS_ARC: u64 = 40;
 const SYS_OFFER: u64 = 41;
 /// caller(reply): what the process behind a call holds that its server decides by (2026-11-12, the display's isolation: until then any app could show, draw into, raise or read the events of another app's surface by naming it). x0 the offset of a reply token the caller holds (SYS_RECV's, not yet replied) → bits 0-3 the surfaces that process holds (surface k as its own `surface-k`, or inside a region holding it whole: the display server's and the GPU service's `surfaces`), bit 8 the Settings capability (the map, the attest screen: the system's window management), bit 9 a kist (`CALLER_*`); NOTHING for a token that is no reply this process holds, or one for the kernel's own call. No capability: the token is the proof, and only the server the call came to holds it. A kernel from before answers ERR (no such syscall), which a server takes as a refusal.
 const SYS_CALLER: u64 = 42;
+/// notify(op, …): notes, what kists have waiting on the person (notify.rs, docs/NOTIFY.md; owner, 2026-11-12: "I think we try it with the in view, it can notify me, out of view, silent"). No capability for a kist: the kernel knows it by its capsule. Op 0 post: x1/x2 a note (ferros_kist::note, at most note::MAX bytes), a kist's own; or, from a Settings holder that is not a kist, x3 its Settings token and x4 a 32-byte source, the system's note on a kist's behalf → the note's number (0-15) | the kind the kernel decided << 8; NOTHING nobody present, or the kist at a count (WAITING waiting, or POSTS since the person last looked); ERR not a note. Op 1 withdraw: x1 the number (G#FF all) of the caller's own, or the system's with x2 a Settings token and x3 the source → how many went. Op 2, a kist: the note the person opened (x1 its number, x2/x3 a buffer) → the document's length (written whole if it fits), NOTHING when that is not the one opened. Ops 3-6 for a Settings holder that is not a kist (the deck): 3 the list (x1 the token, x2/x3 a buffer) → how many, each `notify::REC` bytes; 4 the doorbell (x1 a word, x2 the token; `BELL_NOTES`); 5 seen (x1 the token, x2 a 32-byte source, x3 a number or G#FF, x4 1 the person opened that note) → how many went; 6 one note's document (x1 the token, x2 [source 32][number u8], x3/x4 a buffer) → its length, NOTHING none. ERR for anything else.
+const SYS_NOTIFY: u64 = 43;
+#[path = "notify.rs"]
+mod notify;
+pub use notify::{clear as notes_clear, kind_name as note_kind_name, kist_named as note_kist_named, post_system as note_post_system, report as notes_report};
 pub const CALLER_SETTINGS: u64 = 1 << 8;
 pub const CALLER_KIST: u64 = 1 << 9;
 pub const ARC_GROW: u64 = 0;
@@ -3763,6 +3768,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
+        SYS_NOTIFY => {
+            notify::syscall(f, p, pi);
+            0
+        }
         SYS_CALLER => {
             let token = p.read(f.x[0], 32);
             f.x[0] = match p.lookup(&token).map(|i| p.cspace[i].object) {
@@ -4393,7 +4402,9 @@ const BELL_KISTS: usize = 8;
 const BELL_SURFACES: usize = 9;
 /// The offers' (SYS_OFFER op 0, for the Stow holder): a host offered a kist to stow.
 const BELL_OFFERS: usize = 10;
-const BELLS: usize = 11;
+/// The notes' (SYS_NOTIFY op 4, for a Settings holder): a note posted, revised, withdrawn, seen, past its deadline, or the person's loaded or gone (notify.rs).
+const BELL_NOTES: usize = 11;
+const BELLS: usize = 12;
 /// Each source's change count (the claims' is GPS_CLAIMS'), so a word registered late starts from the count now and a reader tells a change by inequality.
 static BELL_COUNT: [core::sync::atomic::AtomicU64; BELLS] = [const { core::sync::atomic::AtomicU64::new(0) }; BELLS];
 /// The bells' words (SYS_BELL, SYS_CLAIM op 4, SYS_NOT_STARTED op 1): (the process's slot, its epoch, the word's address in its arc, the source). At most one a source a process. Under the kernel lock.

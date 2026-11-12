@@ -63,6 +63,74 @@ pub mod nr {
     pub const ARC: u64 = 40;
     pub const OFFER: u64 = 41;
     pub const CALLER: u64 = 42;
+    pub const NOTIFY: u64 = 43;
+}
+
+/// Notes: what a kist has waiting on the person (kernel SYS_NOTIFY, docs/NOTIFY.md; owner, 2026-11-12: "I think we try it with the in view, it can notify me, out of view, silent"). A note is a VSF document (ferros_kist::note). A kist posts and withdraws its own, with no capability (the kernel knows it by its capsule); the deck (a Settings holder that is not a kist) lists them, rings on them and clears them as the person looks.
+pub mod notify {
+    use super::{nr, off, svc, ERR, NOTHING};
+
+    /// A record of `list`: [source 32][number u8][kind u8][asked u8][flags u8: bit 0 names a person, bit 1 has a target][count u32 LE][seq u64 LE: the notes' bell count it was posted at][deadline i64 LE: Eagle oscillations, 0 none].
+    pub const REC: usize = 56;
+    /// Every note of a source (`withdraw`, `seen`).
+    pub const ALL: u8 = 0xFF;
+
+    /// Why a post was refused.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Refused {
+        /// Nobody present, or the kist has as many notes waiting as it may, or has posted as many as it may since the person last looked at it: post again once they have.
+        Full,
+        /// Not a note (ferros_kist::note), or the caller is neither a kist nor the system.
+        NotANote,
+    }
+
+    fn answer(r: u64) -> Result<(u8, u8), Refused> {
+        match r {
+            ERR => Err(Refused::NotANote),
+            NOTHING => Err(Refused::Full),
+            r => Ok((r as u8, (r >> 8) as u8)),
+        }
+    }
+
+    /// Post this kist's note `doc`: its number (0-15) and the kind the system gave it (ferros_kist::note STATUS, PERSONAL, LIVE: never above the one asked). A note whose `key` matches one of this kist's waiting replaces it under the same number.
+    pub fn post(doc: &[u8]) -> Result<(u8, u8), Refused> {
+        answer(svc(nr::NOTIFY, 0, off(doc.as_ptr()), doc.len() as u64, 0, 0))
+    }
+    /// The system's note on `source`'s behalf, given Settings (the deck's development notes): as `post`.
+    pub fn post_for(settings: u64, source: &[u8; 32], doc: &[u8]) -> Result<(u8, u8), Refused> {
+        answer(svc(nr::NOTIFY, 0, off(doc.as_ptr()), doc.len() as u64, settings, off(source.as_ptr())))
+    }
+    /// This kist's note `number` gone (`ALL`: every one of its): no longer true, or seen in the kist itself. How many went.
+    pub fn withdraw(number: u8) -> u64 {
+        svc(nr::NOTIFY, 1, number as u64, 0, 0, 0)
+    }
+    /// The note the person opened (the display's `EV_OPEN_AT` names its number) into `buf`: its document's length (written only when it fits), None when the note opened last is not that one.
+    pub fn opened(number: u8, buf: &mut [u8]) -> Option<usize> {
+        let r = svc(nr::NOTIFY, 2, number as u64, off(buf.as_mut_ptr()), buf.len() as u64, 0);
+        (r != ERR && r != NOTHING).then_some(r as usize)
+    }
+    /// The notes waiting into `buf` (whole `REC` records, as many as fit), given Settings: how many there are.
+    pub fn list(settings: u64, buf: &mut [u8]) -> Option<usize> {
+        let r = svc(nr::NOTIFY, 3, settings, off(buf.as_mut_ptr()), buf.len() as u64, 0);
+        (r != ERR).then_some(r as usize)
+    }
+    /// The notes' doorbell, given Settings: the kernel writes its change count into `word` now and whenever a note is posted, revised, withdrawn, seen or past its deadline, waking whatever waits on it (`wait_world`).
+    pub fn doorbell(settings: u64, word: &core::sync::atomic::AtomicU64) -> bool {
+        svc(nr::NOTIFY, 4, off(word as *const _ as *const u8), settings, 0, 0) == 0
+    }
+    /// The person looked at `source`: its note `number` (`ALL`: every one) cleared; `opened`, they tapped that note, kept for its kist to read where to land. How many went.
+    pub fn seen(settings: u64, source: &[u8; 32], number: u8, opened: bool) -> Option<u64> {
+        let r = svc(nr::NOTIFY, 5, settings, off(source.as_ptr()), number as u64, opened as u64);
+        (r != ERR).then_some(r)
+    }
+    /// `source`'s note `number` as its document into `buf`, given Settings: its length (written only when it fits), None for no such note.
+    pub fn read(settings: u64, source: &[u8; 32], number: u8, buf: &mut [u8]) -> Option<usize> {
+        let mut req = [0u8; 33];
+        req[..32].copy_from_slice(source);
+        req[32] = number;
+        let r = svc(nr::NOTIFY, 6, settings, off(req.as_ptr()), off(buf.as_mut_ptr()), buf.len() as u64);
+        (r != ERR && r != NOTHING).then_some(r as usize)
+    }
 }
 
 /// The caller's own arc, grown or shrunk on demand (kernel SYS_ARC, docs/ARCS.md step 2; owner, 2026-11-11: "why we cannot scale on demand, that was the whole point of ring memory"). No capability: a process reaches only its own arc, and only up to its ceiling (the heap its build declared, counted whole; fixed mode's size). A top is an arc offset: the arc's size, or exact mode's limit.
@@ -2003,6 +2071,8 @@ pub mod window {
     pub const EV_FRONT: u8 = 2;
     /// A key pressed for this window (back's tap: `KEY_ESCAPE`).
     pub const EV_KEY: u8 = 3;
+    /// The person opened a note of this kist's (docs/NOTIFY.md "A tap"): the low byte its number; the note's document, with where to land (`target`), from `notify::opened`.
+    pub const EV_OPEN_AT: u8 = 4;
     /// Escape, by its USB HID usage: what back's tap sends the app in front (up one page; nothing at its main page).
     pub const KEY_ESCAPE: u8 = 0x29;
     /// How many events op 62 holds a window: the newest, a ring (a window that missed more still learns whether it is behind, the reply's state byte).
@@ -2024,6 +2094,19 @@ pub mod window {
     pub fn key(display: u64, usage: u8) -> Option<(u8, u8)> {
         let mut r = [0u8; 4];
         (call(display, &[61, usage], &mut r) >= 3 && r[0] == 0).then_some((r[1], r[2]))
+    }
+
+    /// The person opened note `number` of the kist in front (display op 65, `EV_OPEN_AT`; the deck alone, docs/NOTIFY.md "A tap"): its surface and generation, None when no app window was in front (or the caller is not the system's window management).
+    pub fn open_at(display: u64, number: u8) -> Option<(u8, u8)> {
+        let mut r = [0u8; 4];
+        (call(display, &[65, number], &mut r) >= 3 && r[0] == 0).then_some((r[1], r[2]))
+    }
+
+    /// The helm's Deck button as the deck's summary (display op 66; owner, 2026-11-12: "if anything on the deck has changed state, specifically 400nm notifications, we change the deck circle in the helm", then "So ideally the deck circle shows the latest item icon preview and shows the violet ring?"): `icon` the latest note's source's icon in the display's bundle (0: none, the ring alone), `count` how many wait in the deck's resting view (0: the plain Deck mark). True when the display took it.
+    pub fn helm_note(display: u64, icon: u8, count: u16) -> bool {
+        let c = count.to_le_bytes();
+        let mut r = [0u8; 4];
+        call(display, &[66, icon, c[0], c[1]], &mut r) >= 1 && r[0] == 0
     }
 
     /// This window's events after `seen` (display op 62), held by the display until there is one: (the count now, behind, the events since `seen`, oldest first, at most `EVENTS`). None when the display has no such op. Call it from a thread of its own: the call waits.

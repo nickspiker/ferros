@@ -3245,6 +3245,35 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                // `diag notify`: the notes waiting on the person and the kists alive (docs/NOTIFY.md). `diag "notify <live|personal|status> <kist> [words]"`: a note from the system on that kist's behalf, as the system decides it (a personal one names a stand-in person), so each kind can be seen on the device with no kist that posts (NOTIFY.md "Seeing it"); `<kist>` a live kist's name or its capsule's address in hex (whole, or its first bytes as `diag notify` shows them). `diag "notify clear <kist>"`: its notes gone, as if the person had looked.
+                if cmd.params == b"notify" || cmd.params.starts_with(b"notify ") {
+                    let mut words = cmd.params.split(|&b| b == b' ').filter(|w| !w.is_empty()).skip(1);
+                    let (what, who) = (words.next(), words.next());
+                    let rest: alloc::vec::Vec<u8> = words.collect::<alloc::vec::Vec<_>>().join(&b' ');
+                    let kind = match what {
+                        Some(b"status") => Some(ferros_kist::note::STATUS),
+                        Some(b"personal") => Some(ferros_kist::note::PERSONAL),
+                        Some(b"live") => Some(ferros_kist::note::LIVE),
+                        _ => None,
+                    };
+                    let source = who.and_then(crate::process::note_kist_named);
+                    match (what, kind, source) {
+                        (None, _, _) => resp.extend_from_slice(crate::process::notes_report().as_bytes()),
+                        (Some(b"clear"), _, Some(s)) => resp.extend_from_slice(alloc::format!("notify: A#{} notes cleared\n", crate::process::notes_clear(s)).as_bytes()),
+                        (_, Some(kind), Some(s)) => {
+                            let text = if rest.is_empty() { alloc::format!("a {} note", crate::process::note_kind_name(kind)) } else { alloc::string::String::from_utf8_lossy(&rest).into_owned() };
+                            let r = crate::process::note_post_system(s, kind, kind != ferros_kist::note::STATUS, &text);
+                            resp.extend_from_slice(match r {
+                                crate::process::ERR => alloc::format!("notify: refused (words not ASCII, or past A#{} bytes)\n", ferros_kist::note::WORDS_MAX),
+                                crate::process::NOTHING => alloc::string::String::from("notify: refused (nobody present, or that kist is at its count)\n"),
+                                r => alloc::format!("notify: note A#{} posted, {}\n", r & 0xFF, crate::process::note_kind_name((r >> 8) as u8)),
+                            }.as_bytes());
+                        }
+                        _ => resp.extend_from_slice(b"notify: say `notify`, `notify <live|personal|status> <kist> [words]` or `notify clear <kist>`, the kist by its name while it runs or its capsule's address in hex\n"),
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 // `diag arcs`: every process's arc (name, base, size, block).
                 if cmd.params == b"arcs" {
                     resp.extend_from_slice(crate::process::arcs_report().as_bytes());
