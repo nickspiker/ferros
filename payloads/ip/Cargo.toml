@@ -12,3 +12,5 @@ path = "src/main.rs"
 ferros_sys = { path = "../../ferros_sys" }
 # The pure parts of the client TCP (sequence arithmetic, out-of-order ranges, options, window, RTT, congestion control), tested on the host.
 ferros_tcp = { path = "../../ferros_tcp" }
+# The pure parts of the resolver (op 10: names, the question, the answer read, the cache), tested on the host.
+ferros_dns = { path = "../../ferros_dns" }

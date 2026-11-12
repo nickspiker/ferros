@@ -21,6 +21,13 @@
 //! No op carries a version: every caller is in this repo or Mahere's and changes with it (owner, 2026-11-11: "No existing callers yet, so no need to version it").
 //! - 8 JOIN: family, group address (16) → [0]: join a multicast group — an IGMPv2 membership report (IPv4) or an MLDv1 listener report (IPv6) now and every 60 s, so a snooping access point forwards the group to us (2026-10-26: the desktop's Photon beacons to 239.104.199.144 never reached the device until it reported itself a member; broadcast did). The firmware already passes all multicast; the switch was the filter. Up to eight groups.
 //! - 9 LINK: mode → [0]: 0 both links, WiFi preferred (the default); 1 cellular only; 2 WiFi only. A test can take the cellular path with WiFi up; existing connections keep their link.
+//! - 10 RESOLVE: family (0 either, 4, 6), wait (seconds), host name (dotted, up to 253 bytes) → status, family, address (16; IPv4 in the first 4), TTL left in seconds (u32 BE): 22 bytes. The device's one resolver (2026-11-12; httptest, the kist stower, fgtw and Mahere each carried a copy of their own, drifted apart), its pure parts in ferros_dns (tested on the host).
+//!   - Status: 0 found; 1 still asking (wait 0, or the wait ran out first: the lookup goes on and its answer is kept); 2 no such address (the name does not exist, or has no address of the families asked); 3 not a host name (or a family other than 0, 4, 6); 4 no way to ask (no route of the families asked, or no DNS server, or no entropy for the question's id); 5 no answer (the servers silent or failing, four tries a second apart); 6 busy (every cache record in a lookup).
+//!   - Family 0 asks for the family the route will use: AAAA where IPv6 has a route (IPv6 preferred: owner, 2026-10-29), then A where IPv4 has one. 4 or 6 asks for that type whatever the routes.
+//!   - Wait 1 to 255 holds the call until the lookup ends, that long at most; 0 answers at once from the cache (a lookup started when it holds nothing fresh, the last good address meanwhile, else "still asking"). Held RESOLVEs: sixteen (`RQN`), the oldest answered "still asking" when a seventeenth comes.
+//!   - The cache (`ferros_dns::Cache`): 32 records (a name and a type each), searched in order, the least recently asked giving way. An address holds for its TTL (the least along a chain of aliases), then is kept as the last good one: asked for, it is answered at once while a lookup for it runs, and a lookup that brings no answer keeps it for another TTL (Mahere's rules, 2026-11-11, now every client's). No such address is kept for the SOA's negative TTL (RFC 2308 5), at most 256 s (8 s without an SOA). A TCP connection that opens clears its address's failures; four failures in a row (resets, or what it sent unanswered) make the address stale, so its name is asked again.
+//!   - One lookup a name and type, however many ask: the calls hold on it. A question goes from the resolver's one port (random for the session) with a random id (the entropy grant, each question), to the DNS server of each family's link (INFO's, IPv6's first, turn about), four tries a second apart (the one timer: a lost datagram never comes back); a try ip cannot send yet for want of the next hop goes again 2^-6 s on. An answer counts only from port 53 of a server a try went to, with the id, repeating the question (`ferros_dns::read`); a SERVFAIL or REFUSED moves to the next try at once. Nothing an application sends may leave from the resolver's port (op 1 answers [3]).
+//!   - Each lookup's end is a console line: the type, found or not or no answer, its time and tries; never the name or the address (they are the person's).
 //!
 //! TCP here, client only, re-engineered for throughput on 2026-11-11 (owner: "sounds like it needs re-engineered", after Mahere's 1.6 MB base cells crawled thru two connections of a 4 KiB window, about 80 KB/s at a 50 ms round trip). The protocol's pure parts are ferros_tcp, tested on the host.
 //! - Sixteen connections (`TCPN`). An idle one costs its control state alone (`Tcb`, a static table); an open one holds a block of the arc (`Blocks`): a 1 MiB receive buffer and a 256 KiB send buffer. The kernel maps 4 MiB of heap at spawn (three blocks); the arc grows for more as connections open (SYS_ARC, docs/ARCS.md) and shrinks again when the highest blocks are free.
@@ -139,6 +146,8 @@ struct Ip {
     ring: bool,
     ring_thread: bool,
     ring_none: bool,
+    /// The resolver (op 10): a static, not the 64 KiB stack.
+    res: &'static mut Dns,
 }
 
 /// The WiFi path's measures between two connection reports (`report`), said after each on a line of their own (owner, 2026-11-11: measure the path before fixing it). Counter ticks where a time is kept.
@@ -277,6 +286,97 @@ struct Held {
     tok: [u8; 32],
 }
 const HELD_FREE: Held = Held { used: false, tcp: false, port: 0, handle: 0, state: 0, most: 0, seq: 0, until: 0, tok: [0; 32] };
+
+/// The resolver's cache (op 10, `ferros_dns::Cache`): 32 records, a name and a type each, searched in order (a device's handful of hosts; no HashMap).
+const RECN: usize = 1 << 5;
+/// RESOLVE calls held at once, as many as the held receives (`HELDN`): Mahere's four loaders, the stower, fgtw, httptest, with room.
+const RQN: usize = 1 << 4;
+/// Tries a question gets before its lookup ends with no answer: four, a second each, turn about between the two families' servers when there are two (Mahere asked four times, the others three).
+const DNS_TRIES: usize = 1 << 2;
+/// How long a try waits for its answer: a second, the one timer here, and it must be: a question or its answer lost on the way (UDP, nothing resends it) brings nothing to say so, and only a deadline asks again. A server's answer comes in tens of milliseconds (the 8a, 2026-11-12: 84 ms over IPv4, 253 ms over IPv6), so a second is a lost datagram.
+const DNS_WAIT_LOG2: u32 = 0;
+/// A question ip could not send yet because it is finding the next hop (`udp_send`'s 1: an ARP or neighbour solicitation went instead) is sent again 2^-6 s on, up to 2^6 times before the try counts as lost: nothing rings when the neighbour answers, and the old clients asked every 2 ms.
+const DNS_HOP_LOG2: u32 = 6;
+const DNS_HOPS: u8 = 1 << 6;
+/// A RESOLVE answer: status, family, address (16), TTL left in seconds (u32 BE).
+const RES_LEN: usize = 22;
+/// RESOLVE's statuses (the header, op 10).
+const RES_FOUND: u8 = 0;
+const RES_ASKING: u8 = 1;
+const RES_NO_NAME: u8 = 2;
+const RES_BAD: u8 = 3;
+const RES_NO_WAY: u8 = 4;
+const RES_NO_ANSWER: u8 = 5;
+const RES_BUSY: u8 = 6;
+
+/// A lookup in flight for cache record k (the same index): the question's id (from the entropy grant), the try it is on, whether that try waits on the next hop (and how often it has), when the try runs out, when the lookup began, and the server each try went to (an answer is taken only from one of them, from port 53).
+#[derive(Clone, Copy)]
+struct Ask {
+    id: u16,
+    tries: usize,
+    hop: bool,
+    hops: u8,
+    due: u64,
+    t0: u64,
+    asked: [(u8, [u8; 16]); DNS_TRIES],
+}
+const ASK_FREE: Ask = Ask { id: 0, tries: 0, hop: false, hops: 0, due: 0, t0: 0, asked: [(0, [0; 16]); DNS_TRIES] };
+
+/// A RESOLVE held until its lookup ends (or its wait runs out): the reply token, the name, the record types to ask in order (AAAA then A for either family) and the one it is on, the record whose lookup it waits on, the worst status so far (`res_worse`), when its wait runs out, its arrival (the oldest gives way).
+#[derive(Clone, Copy)]
+struct Rq {
+    used: bool,
+    tok: [u8; 32],
+    name: ferros_dns::Name,
+    order: [u16; 2],
+    n: usize,
+    phase: usize,
+    rec: usize,
+    worst: u8,
+    until: u64,
+    seq: u32,
+}
+const RQ_FREE: Rq = Rq { used: false, tok: [0; 32], name: ferros_dns::Name::EMPTY, order: [0; 2], n: 0, phase: 0, rec: 0, worst: RES_NO_WAY, until: 0, seq: 0 };
+
+/// The resolver (op 10): the device's one cache, the lookups in flight, the calls held on them, and the one port its questions leave from (random for the session, from the entropy grant: RFC 5452 9.2).
+struct Dns {
+    cache: ferros_dns::Cache<RECN>,
+    asks: [Ask; RECN],
+    rq: [Rq; RQN],
+    rq_seq: u32,
+    port: u16,
+}
+
+/// Of two final statuses for a RESOLVE over two families, the one to say: no answer (the servers silent: nobody knows) over no such address over no way to ask.
+fn res_worse(a: u8, b: u8) -> u8 {
+    let rank = |s: u8| match s {
+        RES_NO_ANSWER => 2,
+        RES_NO_NAME => 1,
+        _ => 0,
+    };
+    if rank(b) > rank(a) { b } else { a }
+}
+
+/// A RESOLVE answer: `status`, and for a found address its family, the address and the seconds it holds.
+fn res_answer(status: u8, fam: u8, addr: [u8; 16], ttl: u32) -> [u8; RES_LEN] {
+    let mut a = [0u8; RES_LEN];
+    a[0] = status;
+    a[1] = fam;
+    a[2..18].copy_from_slice(&addr);
+    a[18..22].copy_from_slice(&ttl.to_be_bytes());
+    a
+}
+
+/// A RESOLVE answer into `serve`'s reply buffer; its length.
+fn res_put(out: &mut [u8], a: [u8; RES_LEN]) -> usize {
+    out[..RES_LEN].copy_from_slice(&a);
+    RES_LEN
+}
+
+/// The family of a record type's addresses.
+fn fam_of(qtype: u16) -> u8 {
+    if qtype == ferros_dns::AAAA { 6 } else { 4 }
+}
 
 /// The cellular data call, as `rmnet` INFO gives it (modem.rs `rmnet_call`): flags (bit 0 up, bit 1 IPv4, bit 2 IPv6), MTU, addresses, the first DNS server of each family. The addresses are the line's: never printed.
 #[derive(Clone, Copy)]
@@ -695,6 +795,13 @@ impl Ip {
         }
         for h in self.held.iter().filter(|h| h.used) {
             t = t.min(h.until);
+        }
+        // The resolver's: a try running out, a held RESOLVE's wait.
+        for k in (0..RECN).filter(|&k| self.res.cache.r[k].asking) {
+            t = t.min(self.res.asks[k].due);
+        }
+        for r in self.res.rq.iter().filter(|r| r.used) {
+            t = t.min(r.until);
         }
         t
     }
@@ -1418,6 +1525,11 @@ impl Ip {
     // ---- UDP for applications ----
 
     fn queue(&mut self, fam: u8, addr: [u8; 16], sport: u16, dport: u16, data: &[u8]) {
+        // The resolver's port is its own: its answers are read here, never queued for an application.
+        if dport == self.res.port {
+            self.dns_in(fam, addr, sport, data);
+            return;
+        }
         if dport == 0 || !self.ports.contains(&dport) {
             return;
         }
@@ -1477,6 +1589,283 @@ impl Ip {
             if self.out6(cell, src, addr, 17, &u[..n], HOP) { 0 } else { 1 }
         } else {
             3
+        }
+    }
+
+    // ---- The resolver (op 10 RESOLVE) ----
+
+    /// For each family, the DNS server of the link it leaves on (`pick4`, `pick6` for a global destination): a server is asked from that link's address (the call's IPv6 server was reported even when IPv6 left on WiFi, a carrier's server asked from an address outside its network, which it need not answer). Zeros for a family with no link, or whose link named none. INFO says these, and the resolver asks them.
+    fn dns_servers(&self) -> ([u8; 4], [u8; 16]) {
+        let d4 = match self.pick4(&[8, 8, 8, 8]) {
+            Some((true, _)) => self.cell.dns4,
+            Some((false, _)) => self.dns,
+            None => [0; 4],
+        };
+        let d6 = match self.pick6(&[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]) {
+            Some((true, _)) => self.cell.dns6,
+            Some((false, _)) => self.dns6,
+            None => [0; 16],
+        };
+        (d4, d6)
+    }
+
+    /// Two random bytes from the entropy grant (a question's id); None without the grant.
+    fn rand16(&self) -> Option<u16> {
+        let mut b = [0u8; 2];
+        (svc(ENTROPY_SYS, self.cap(S_ENTROPY), self.off(b.as_mut_ptr()), 2, 0, 0) == 2).then_some(u16::from_le_bytes(b))
+    }
+
+    /// Op 10: [10, family, wait, name…]. The answer, or None when the call is held until the lookup ends (`res_end`) or the wait runs out (`dns_tick`).
+    fn resolve(&mut self, m: &[u8], tok: &[u8; 32], out: &mut [u8]) -> Option<usize> {
+        let now = now();
+        // WHY the checks: the request is the caller's; a family other than 0, 4 or 6, or a name that is not a host name, is a bad request.
+        let name = if m.len() >= 4 && (m[1] == 0 || m[1] == 4 || m[1] == 6) { ferros_dns::Name::from_host(&m[3..]) } else { None };
+        let Some(name) = name else { return Some(res_put(out, res_answer(RES_BAD, 0, [0; 16], 0))) };
+        let (want, wait) = (m[1], m[2]);
+        // The types to ask, in order: the family asked for; for either, IPv6 first where it has a route (owner, 2026-10-29: IPv6 preferred), then IPv4 where it has one.
+        let mut r = Rq { used: true, tok: *tok, name, until: now + wait as u64 * self.freq, ..RQ_FREE };
+        if want == 6 || (want == 0 && self.pick6(&[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).is_some()) {
+            r.order[r.n] = ferros_dns::AAAA;
+            r.n += 1;
+        }
+        if want == 4 || (want == 0 && self.pick4(&[8, 8, 8, 8]).is_some()) {
+            r.order[r.n] = ferros_dns::A;
+            r.n += 1;
+        }
+        if let Some(a) = self.res_run(&mut r, now) {
+            return Some(res_put(out, a));
+        }
+        // A lookup is under way: the caller asked for the cache alone (wait 0: the last good address when there is one, else "still asking"), or it is held.
+        if wait == 0 {
+            let a = match self.res.cache.look(r.rec, now, self.freq) {
+                ferros_dns::Look::Stale { addr } => res_answer(RES_FOUND, fam_of(r.order[r.phase]), addr, 0),
+                _ => res_answer(RES_ASKING, 0, [0; 16], 0),
+            };
+            return Some(res_put(out, a));
+        }
+        let k = match self.res.rq.iter().position(|q| !q.used) {
+            Some(k) => k,
+            None => {
+                // Every slot taken: the oldest is answered as things stand (its lookup goes on).
+                let k = (0..RQN).min_by_key(|&k| self.res.rq[k].seq).unwrap();
+                let old = self.res.rq[k].tok;
+                self.res_reply(&old, &res_answer(RES_ASKING, 0, [0; 16], 0));
+                k
+            }
+        };
+        self.res.rq_seq = self.res.rq_seq.wrapping_add(1);
+        r.seq = self.res.rq_seq;
+        self.res.rq[k] = r;
+        None
+    }
+
+    /// A held RESOLVE answered: `a` to the call whose token is `tok`.
+    fn res_reply(&self, tok: &[u8; 32], a: &[u8; RES_LEN]) {
+        svc(REPLY, self.off(tok.as_ptr()), self.off(a.as_ptr()), RES_LEN as u64, 0, 0);
+    }
+
+    /// Request `r` from its current type on: its answer, or None when it waits on a lookup (`r.rec` the record). A fresh address answers; "no such address" moves on to the next type; a stale address answers at once while its name is being asked for again (Mahere's rule, 2026-11-11: the last good address meanwhile), else its name is asked and the request waits; nothing known is asked.
+    fn res_run(&mut self, r: &mut Rq, now: u64) -> Option<[u8; RES_LEN]> {
+        while r.phase < r.n {
+            let qtype = r.order[r.phase];
+            let Some(i) = self.res.cache.slot(&r.name, qtype, now) else { return Some(res_answer(RES_BUSY, 0, [0; 16], 0)) };
+            match self.res.cache.look(i, now, self.freq) {
+                ferros_dns::Look::Fresh { addr, left } => return Some(res_answer(RES_FOUND, fam_of(qtype), addr, left)),
+                ferros_dns::Look::NoName => {
+                    r.worst = res_worse(r.worst, RES_NO_NAME);
+                    r.phase += 1;
+                }
+                ferros_dns::Look::Stale { addr } => {
+                    if self.res.cache.r[i].asking || !self.res_start(i, now) {
+                        return Some(res_answer(RES_FOUND, fam_of(qtype), addr, 0));
+                    }
+                    r.rec = i;
+                    return None;
+                }
+                ferros_dns::Look::Unknown => {
+                    if self.res.cache.r[i].asking || self.res_start(i, now) {
+                        r.rec = i;
+                        return None;
+                    }
+                    r.worst = res_worse(r.worst, RES_NO_WAY);
+                    r.phase += 1;
+                }
+            }
+        }
+        Some(res_answer(r.worst, 0, [0; 16], 0))
+    }
+
+    /// A lookup for record `i` begun: a fresh id from the entropy grant, the first try sent. False when it cannot be asked: no DNS server of either family, or no entropy (a guessable id is an answer anyone could forge).
+    fn res_start(&mut self, i: usize, now: u64) -> bool {
+        let (d4, d6) = self.dns_servers();
+        if d4 == [0; 4] && d6 == [0; 16] {
+            return false;
+        }
+        let Some(id) = self.rand16() else {
+            self.put(b"DNS: no entropy for a question id (needs --entropy)\n");
+            return false;
+        };
+        self.res.asks[i] = Ask { id, t0: now, ..ASK_FREE };
+        self.res.cache.r[i].asking = true;
+        self.res_send(i, now);
+        true
+    }
+
+    /// Record `i`'s question, its current try: to the servers of the families with a link in turn (IPv6's first), each try's server noted (`asked`), so an answer counts only from a server asked.
+    fn res_send(&mut self, i: usize, now: u64) {
+        let (d4, d6) = self.dns_servers();
+        let mut s = [(0u8, [0u8; 16]); 2];
+        let mut n = 0;
+        if d6 != [0; 16] {
+            s[n] = (6, d6);
+            n += 1;
+        }
+        if d4 != [0; 4] {
+            let mut a = [0u8; 16];
+            a[..4].copy_from_slice(&d4);
+            s[n] = (4, a);
+            n += 1;
+        }
+        let a = &mut self.res.asks[i];
+        if n == 0 {
+            // The links went: this try is lost now, and the next one looks again.
+            a.hop = false;
+            a.due = now;
+            return;
+        }
+        let (fam, srv) = s[a.tries % n];
+        a.asked[a.tries] = (fam, srv);
+        let id = a.id;
+        let mut q = [0u8; ferros_dns::QUERY_MAX];
+        let r = &self.res.cache.r[i];
+        let len = ferros_dns::query(id, &r.name, r.qtype, &mut q);
+        let port = self.res.port;
+        let sent = self.udp_send(fam, srv, 53, port, &q[..len]);
+        let a = &mut self.res.asks[i];
+        // Sent: a second for its answer (`DNS_WAIT_LOG2`). Finding the next hop: the same try again shortly (`DNS_HOP_LOG2`). No address of that family, or refused: this try is lost now.
+        a.hop = sent == 1;
+        a.due = match sent {
+            0 => now + (self.freq << DNS_WAIT_LOG2),
+            1 => now + (self.freq >> DNS_HOP_LOG2),
+            _ => now,
+        };
+    }
+
+    /// A datagram to the resolver's port: an answer only from port 53 of a server one of the lookup's tries went to, with the lookup's id, and repeating its question (`ferros_dns::read`); anything else is passed over, as if lost (anyone on the network can send to the port).
+    fn dns_in(&mut self, fam: u8, addr: [u8; 16], sport: u16, data: &[u8]) {
+        // WHY: the datagram is the network's; under the 12 bytes of a header it is no answer.
+        if sport != 53 || data.len() < 12 {
+            return;
+        }
+        let id = u16::from_be_bytes([data[0], data[1]]);
+        let now = now();
+        for i in 0..RECN {
+            let a = &self.res.asks[i];
+            if !self.res.cache.r[i].asking || a.id != id || !a.asked[..=a.tries].contains(&(fam, addr)) {
+                continue;
+            }
+            let (name, qtype) = (self.res.cache.r[i].name, self.res.cache.r[i].qtype);
+            match ferros_dns::read(data, id, &name, qtype) {
+                None => continue,
+                Some(ferros_dns::Reply::Failed) => {
+                    // The server could not say: the next try at once (to the other server when there are two).
+                    let a = &mut self.res.asks[i];
+                    a.hop = false;
+                    a.due = now;
+                }
+                Some(reply) => self.res_end(i, reply, now),
+            }
+            return;
+        }
+    }
+
+    /// Each pass: a try run out is followed by the next (a lookup whose last try ran out ends with no answer), a held RESOLVE whose wait ran out is answered "still asking" (its lookup goes on), and while nobody is present every held one is answered with nothing, as any request would be.
+    fn dns_tick(&mut self) {
+        let now = now();
+        for i in 0..RECN {
+            if !self.res.cache.r[i].asking || self.res.asks[i].due > now {
+                continue;
+            }
+            let a = &mut self.res.asks[i];
+            if a.hop && a.hops < DNS_HOPS {
+                a.hops += 1;
+            } else {
+                a.tries += 1;
+                a.hops = 0;
+                if a.tries == DNS_TRIES {
+                    self.res_end(i, ferros_dns::Reply::Failed, now);
+                    continue;
+                }
+            }
+            self.res_send(i, now);
+        }
+        for k in 0..RQN {
+            let r = self.res.rq[k];
+            if r.used && (!self.person || now > r.until) {
+                self.res.rq[k] = RQ_FREE;
+                if self.person {
+                    self.res_reply(&r.tok, &res_answer(RES_ASKING, 0, [0; 16], 0));
+                } else {
+                    let none = [0u8; 1];
+                    svc(REPLY, self.off(r.tok.as_ptr()), self.off(none.as_ptr()), 0, 0, 0);
+                }
+            }
+        }
+    }
+
+    /// Record `i`'s lookup ended with `reply` (`Failed`: no answer after its tries): the cache told, the console a line (the type, the outcome, the time; never the name or the address, the person's), and every RESOLVE held on it answered or moved on to its next type.
+    fn res_end(&mut self, i: usize, reply: ferros_dns::Reply, now: u64) {
+        self.res.cache.r[i].asking = false;
+        let qtype = self.res.cache.r[i].qtype;
+        let a = self.res.asks[i];
+        // What the held requests get: an address and its TTL, or the status their type ends with.
+        let got = match reply {
+            ferros_dns::Reply::Found { addr, ttl } => {
+                self.res.cache.found(i, addr, ttl, now, self.freq);
+                Ok((addr, ttl))
+            }
+            ferros_dns::Reply::NoName { ttl } => {
+                self.res.cache.no_name(i, ttl, now, self.freq);
+                Err(RES_NO_NAME)
+            }
+            ferros_dns::Reply::Failed => self.res.cache.lost(i, now, self.freq).ok_or(RES_NO_ANSWER),
+        };
+        // `if`s, not a `match` yielding the words (the native payload rule: no pointer tables).
+        self.put(if qtype == ferros_dns::AAAA { b"DNS: AAAA ".as_slice() } else { b"DNS: A " });
+        if matches!(reply, ferros_dns::Reply::Found { .. }) {
+            self.put(b"found");
+        } else if matches!(reply, ferros_dns::Reply::NoName { .. }) {
+            self.put(b"no such address");
+        } else if got.is_ok() {
+            self.put(b"no answer, the last good address kept");
+        } else {
+            self.put(b"no answer");
+        }
+        self.put(b" in A#");
+        self.dec(now.wrapping_sub(a.t0) * 1000 / self.freq);
+        self.put(b" ms, A#");
+        self.dec(a.tries as u64 + (a.tries < DNS_TRIES) as u64);
+        self.put(b" tries\n");
+        for k in 0..RQN {
+            let mut r = self.res.rq[k];
+            if !r.used || r.rec != i {
+                continue;
+            }
+            let ans = match got {
+                Ok((addr, ttl)) => Some(res_answer(RES_FOUND, fam_of(qtype), addr, ttl)),
+                Err(s) => {
+                    r.worst = res_worse(r.worst, s);
+                    r.phase += 1;
+                    self.res_run(&mut r, now)
+                }
+            };
+            match ans {
+                Some(ans) => {
+                    self.res.rq[k] = RQ_FREE;
+                    self.res_reply(&r.tok, &ans);
+                }
+                None => self.res.rq[k] = r,
+            }
         }
     }
 
@@ -1629,6 +2018,9 @@ impl Ip {
         c.state = 4;
         c.why = why;
         c.rto_t = 0;
+        // Counted against the address in the resolver's cache: after `ferros_dns::FAILURES` in a row its name is asked for again (Mahere's rule, now every client's).
+        let (fam, addr) = (c.fam, c.addr);
+        self.res.cache.conn(fam, &addr, false, now());
     }
 
     /// Connection `i` freed: its report on the console, its block given back.
@@ -1907,6 +2299,9 @@ impl Ip {
         c.up_t = t;
         c.rate_t = t;
         c.last_in_t = t;
+        // The address answers: its failures in the resolver's cache start again.
+        let (fam, addr) = (c.fam, c.addr);
+        self.res.cache.conn(fam, &addr, true, t);
         self.tcp_ack(i);
     }
 
@@ -2278,6 +2673,7 @@ impl Ip {
                 }
                 return Some(n);
             }
+            Some(10) => return self.resolve(m, tok, out),
             Some(6) => {
                 // WHY the checks: the request is the caller's; shorter than its 7 bytes, or a handle past the table, is no connection.
                 let i = if m.len() >= 7 { m[1] as usize } else { TCPN };
@@ -2307,12 +2703,16 @@ impl Ip {
                 let addr: [u8; 16] = m[2..18].try_into().unwrap();
                 let dport = u16::from_be_bytes([m[18], m[19]]);
                 let sport = u16::from_be_bytes([m[20], m[21]]);
+                // The resolver's port is its own: a question from it in an application's name could pass for one of ip's own.
+                if sport == self.res.port {
+                    out[0] = 3;
+                    return 1;
+                }
                 self.open_port(sport);
                 out[0] = self.udp_send(m[1], addr, dport, sport, &m[22..]);
                 1
             }
             Some(3) => {
-                // The addresses traffic leaves with (`pick4`, `pick6` for a global destination), and for each family the DNS server of the link it leaves on: a server is asked from that link's address (the call's IPv6 server was reported even when IPv6 left on WiFi, a carrier's server asked from an address outside its network, which it need not answer).
                 let a4 = self.pick4(&[8, 8, 8, 8]);
                 let a6 = self.pick6(&[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
                 out[0..6].copy_from_slice(&self.mac);
@@ -2322,16 +2722,7 @@ impl Ip {
                 out[18..34].copy_from_slice(&self.ll);
                 out[34..50].copy_from_slice(&a6.map(|a| a.1).unwrap_or([0; 16]));
                 out[50] = a4.is_some() as u8 | (a6.is_some() as u8) << 1 | (self.cell.flags & 1) << 2 | (self.person as u8) << 3;
-                let d4 = match a4 {
-                    Some((true, _)) => self.cell.dns4,
-                    Some((false, _)) => self.dns,
-                    None => [0; 4],
-                };
-                let d6 = match a6 {
-                    Some((true, _)) => self.cell.dns6,
-                    Some((false, _)) => self.dns6,
-                    None => [0; 16],
-                };
+                let (d4, d6) = self.dns_servers();
                 out[51..55].copy_from_slice(&d4);
                 out[55..71].copy_from_slice(&d6);
                 71
@@ -2470,6 +2861,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The frames batched for the WiFi driver's next exchange (`Ip::txb`): a call carries 4096 bytes.
     static mut TXB: [u8; MSG_MAX] = [0; MSG_MAX];
     static mut OUT: [u8; 1 + RECV_MAX] = [0; 1 + RECV_MAX];
+    // The resolver's cache, lookups and held calls (`Dns`).
+    static mut DNS: Dns = Dns { cache: ferros_dns::Cache::new(), asks: [ASK_FREE; RECN], rq: [RQ_FREE; RQN], rq_seq: 0, port: 0 };
     // The heap the kernel maps past .bss (`HEAP_START` of it, or the whole `HEAP_CEILING` on a kernel without SYS_ARC): the first blocks, on a cache line.
     unsafe extern "C" {
         static __image_end: u8;
@@ -2542,6 +2935,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         ring: false,
         ring_thread: false,
         ring_none: false,
+        res: unsafe { &mut *(&raw mut DNS) },
     };
     // Randomness: the DHCP transaction id and the IPv6 interface identifier (random per session).
     let mut r = [0u8; 16];
@@ -2554,6 +2948,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     ip.seed = u32::from_le_bytes([r[4], r[5], r[6], r[7]]);
     ip.eph = u16::from_le_bytes([r[6], r[7]]);
     ip.iid.copy_from_slice(&r[8..16]);
+    // The resolver's one port, random for the session in 49152 to 65535 (RFC 6335's dynamic range; RFC 5452 9.2: a forger must guess it as well as the id). Without entropy it stays 0, a port no datagram is delivered to, and every lookup says it has no way to ask (`res_start`).
+    if let Some(p) = ip.rand16() {
+        ip.res.port = 0xC000 | p;
+    }
     ip.ll[0] = 0xFE;
     ip.ll[1] = 0x80;
     ip.ll[8..].copy_from_slice(&ip.iid);
@@ -2669,6 +3067,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             busy = true;
         }
         ip.tcp_tick();
+        // The resolver's tries run out, and its held calls' waits.
+        ip.dns_tick();
         // The held receives that have their answer now (after what came in and what the connections did this pass).
         if ip.answer_held(out) {
             busy = true;

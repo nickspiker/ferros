@@ -1,4 +1,4 @@
-//! A TCP client on ferros's network stack: looks a host up (AAAA first, over the IPv6 DNS server when ip has one; then A) through the DNS server ip reports (UDP), fetches a path over plain HTTP (the `ip` process's client TCP), and prints the status line, the byte count, the time and an FNV-1a 64 of the body to compare with a fetch on the host.
+//! A TCP client on ferros's network stack: looks a host up with ip's resolver (op 10 RESOLVE: AAAA first where IPv6 has a route, then A), fetches a path over plain HTTP (the `ip` process's client TCP), and prints the status line, the byte count, the time and an FNV-1a 64 of the body to compare with a fetch on the host.
 //!
 //! Spawn after `ip`: ferros-bridge spawn httptest.bin [hex of "host/path"] --name httptest --use udp
 //! With no input it fetches Broadcom's GPS orbit file, gllto2.glpals.com/7day/v5/latest/lto2.dat (GPS.md). Grant slots: 0 console, 1 udp (use).
@@ -11,7 +11,6 @@ use ferros_sys::nr::CALL;
 use ferros_sys::{now, svc, ERR};
 
 const DEFAULT: &[u8] = b"gllto2.glpals.com/7day/v5/latest/lto2.dat";
-const DNS_PORT: u16 = 53053;
 /// A `!` run set ip to the cellular link only.
 static CELL_ONLY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -78,89 +77,40 @@ fn sleep_ms(ms: u64) {
     ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000 * ms);
 }
 
-/// The first record of type `qtype` (1 A, 28 AAAA) for `host` from the DNS server `dns` (family `fam`, IPv4 in the first 4 bytes): its address in the first 4 or 16 bytes, or None after three tries a second apart.
-fn resolve(a: &App, fam: u8, dns: [u8; 16], host: &[u8], qtype: u16) -> Option<[u8; 16]> {
-    let mut q = [0u8; 300];
-    q[0] = 1;
-    q[1] = fam;
-    q[2..18].copy_from_slice(&dns);
-    q[18..20].copy_from_slice(&53u16.to_be_bytes());
-    q[20..22].copy_from_slice(&DNS_PORT.to_be_bytes());
-    let id = (now() as u16) | 1;
-    let p = &mut q[22..];
-    p[0..2].copy_from_slice(&id.to_be_bytes());
-    p[2] = 1; // recursion desired
-    p[5] = 1; // one question
-    let mut k = 12;
-    for label in host.split(|&c| c == b'.') {
-        p[k] = label.len() as u8;
-        p[k + 1..k + 1 + label.len()].copy_from_slice(label);
-        k += 1 + label.len();
+/// `host`'s address from ip's resolver (op 10 RESOLVE): family `want` (0 either, IPv6 first where it has a route; 4 IPv4 only), the call held until the lookup ends, 16 s at most (two types of four one-second tries each take 8). Ok((family, address)), or Err(the line to print).
+fn resolve(a: &App, want: u8, host: &[u8]) -> Result<(u8, [u8; 16]), &'static [u8]> {
+    let mut q = [0u8; 3 + 256];
+    // WHY: a DNS name is at most 253 bytes (ip refuses a longer one too); the request holds this many.
+    if host.len() > 253 {
+        return Err(b"httptest: not a host name");
     }
-    p[k] = 0;
-    p[k + 1..k + 3].copy_from_slice(&qtype.to_be_bytes());
-    p[k + 3..k + 5].copy_from_slice(&[0, 1]);
-    let qlen = k + 5;
-    let mut out = [0u8; 1024];
-    for _ in 0..3 {
-        let mut r = [0u8; 16];
-        for _ in 0..50 {
-            if a.udp(&q[..22 + qlen], &mut r) == 1 && r[0] != 1 {
-                break;
-            }
-            sleep_ms(2);
-        }
-        // Answers held for up to a second (RECV's wait byte, never a poll), until ours; another's on the port (an old try's, or not from the server) is passed over.
-        let t = now();
-        while now() - t < ferros_sys::freq() {
-            let n = a.udp(&[2, (DNS_PORT >> 8) as u8, DNS_PORT as u8, 1], &mut out);
-            if n == 0 || n == ERR {
-                break;
-            }
-            if n < 21 + 12 {
-                continue;
-            }
-            let m = &out[21..(n as usize).min(out.len())];
-            // WHY the sender's check: the answer is the network's; only the server asked, from port 53, answers this question (anyone on the network can send to the port).
-            if m[0..2] != id.to_be_bytes() || out[0] != fam || out[1..17] != dns || out[17..19] != 53u16.to_be_bytes() {
-                continue;
-            }
-            let an = u16::from_be_bytes([m[6], m[7]]);
-            // Past the question, then each answer: a name (labels or a pointer), type, class, TTL, length, data.
-            let mut i = 12;
-            let skip = |m: &[u8], mut i: usize| -> usize {
-                while i < m.len() {
-                    if m[i] == 0 {
-                        return i + 1;
-                    }
-                    if m[i] & 0xC0 == 0xC0 {
-                        return i + 2;
-                    }
-                    i += 1 + m[i] as usize;
-                }
-                m.len()
-            };
-            i = skip(m, i) + 4;
-            for _ in 0..an {
-                i = skip(m, i);
-                if i + 10 > m.len() {
-                    break;
-                }
-                let ty = u16::from_be_bytes([m[i], m[i + 1]]);
-                let len = u16::from_be_bytes([m[i + 8], m[i + 9]]) as usize;
-                i += 10;
-                let want = if qtype == 28 { 16 } else { 4 };
-                if ty == qtype && len == want && i + want <= m.len() {
-                    let mut r = [0u8; 16];
-                    r[..want].copy_from_slice(&m[i..i + want]);
-                    return Some(r);
-                }
-                i += len;
-            }
-            return None;
-        }
+    q[0] = 10;
+    q[1] = want;
+    q[2] = 1 << 4;
+    q[3..3 + host.len()].copy_from_slice(host);
+    let mut r = [0u8; 22];
+    let n = a.udp(&q[..3 + host.len()], &mut r);
+    // `if`s, not a `match` yielding the words (the native payload rule: no pointer tables).
+    if n == 0 || n == ERR {
+        return Err(b"httptest: nobody present: ip serves applications once someone attests");
     }
-    None
+    if n < 22 {
+        return Err(b"httptest: ip has no resolver (op 10)");
+    }
+    if r[0] == 0 {
+        return Ok((r[1], r[2..18].try_into().unwrap()));
+    }
+    Err(if r[0] == 2 {
+        b"httptest: DNS gave no address (no such name)".as_slice()
+    } else if r[0] == 3 {
+        b"httptest: not a host name"
+    } else if r[0] == 4 {
+        b"httptest: no way to ask DNS (no route or no server)"
+    } else if r[0] == 5 {
+        b"httptest: DNS gave no answer"
+    } else {
+        b"httptest: DNS still asking"
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -196,38 +146,29 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let slash = spec.iter().position(|&c| c == b'/').unwrap_or(spec.len());
     let (host, path) = (&spec[..slash], if slash < spec.len() { &spec[slash..] } else { &b"/"[..] });
 
-    // An address of either family and a DNS server (INFO), waiting up to 16 s for DHCP, SLAAC or the cellular call. IPv6 first: AAAA over the IPv6 DNS server when there is one (else the IPv4 one), then A.
+    // An address of either family and a DNS server (INFO), waiting up to 16 s for DHCP, SLAAC or the cellular call; then the name from ip's resolver (op 10), IPv6 first where it has a route (`~`: IPv4 only).
     let mut out = [0u8; 1 << 14];
     let t0 = now();
-    let (flags, dns4, dns6) = loop {
+    loop {
         let n = a.udp(&[3], &mut out);
-        // Nobody present: ip sends nothing for an application (payloads/ip, INFO bit 3), so no question would leave.
+        // Nobody present: ip serves an application nothing (payloads/ip, INFO bit 3).
         if n >= 71 && out[50] & 8 == 0 {
             a.done(b"httptest: nobody present: ip serves applications once someone attests");
         }
         // A server of either family will do: a network may name only one (DHCP's, or the router advertisement's).
         if n >= 71 && out[50] & 3 != 0 && (out[51..55] != [0; 4] || out[55..71] != [0; 16]) {
-            let dns6: [u8; 16] = out[55..71].try_into().unwrap();
-            let dns4: [u8; 4] = out[51..55].try_into().unwrap();
-            break (out[50], dns4, dns6);
+            break;
         }
         if now() - t0 > 16 * ferros_sys::freq() {
             a.done(b"httptest: no address or DNS server");
         }
         sleep_ms(100);
-    };
-    let mut d4 = [0u8; 16];
-    d4[..4].copy_from_slice(&dns4);
+    }
     let t = now();
-    let mut found = None;
-    if flags & 2 != 0 && !v4_only && (dns6 != [0; 16] || dns4 != [0; 4]) {
-        let via = if dns6 != [0; 16] { (6, dns6) } else { (4, d4) };
-        found = resolve(&a, via.0, via.1, host, 28).map(|ip| (6u8, ip));
-    }
-    if found.is_none() && flags & 1 != 0 && dns4 != [0; 4] {
-        found = resolve(&a, 4, d4, host, 1).map(|ip| (4u8, ip));
-    }
-    let Some((fam, ip)) = found else { a.done(b"httptest: DNS gave no address") };
+    let (fam, ip) = match resolve(&a, if v4_only { 4 } else { 0 }, host) {
+        Ok(f) => f,
+        Err(why) => a.done(why),
+    };
     a.put(b"httptest: ");
     a.put(host);
     if fam == 6 {

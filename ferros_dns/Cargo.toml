@@ -1,0 +1,9 @@
+[package]
+name = "ferros_dns"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The pure parts of the ip process's resolver (payloads/ip, op 10 RESOLVE): host names in the wire's form, the question, the answer read (every length and offset checked, the question section matched, CNAME chains followed, a negative answer's TTL from its SOA), and the device's one cache. no_std, no I/O, tested on the host."
+
+[lib]
+path = "src/lib.rs"

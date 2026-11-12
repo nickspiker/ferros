@@ -976,6 +976,7 @@ dependencies = [
 name = "ferros-payload-ip"
 version = "0.1.0"
 dependencies = [
+ "ferros_dns",
  "ferros_sys",
  "ferros_tcp",
 ]
@@ -1227,6 +1228,10 @@ dependencies = [
  "libm",
  "vsf 0.11.0",
 ]
+
+[[package]]
+name = "ferros_dns"
+version = "0.1.0"
 
 [[package]]
 name = "ferros_dsc"

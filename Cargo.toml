@@ -82,6 +82,7 @@ members = [
     "valhall",
     "ferros_sandbox",
     "ferros_tcp",
+    "ferros_dns",
     "ferros_tide",
     "ferros_cell",
     "photon_core",
