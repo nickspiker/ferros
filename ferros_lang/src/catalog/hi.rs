@@ -165,9 +165,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagDenied => "मना। यह टैग इस डिवाइस को नहीं खोलता।",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "पहचान सेवा नहीं चल रही",
-        Msg::HomeFetching => "होम स्क्रीन: तुम्हारे बेड़े से तुम्हारी लाई जा रही है",
-        Msg::HomeSame => "होम स्क्रीन: तुम्हारे सभी डिवाइस पर एक जैसी",
-        Msg::HomeOwn => "होम स्क्रीन: इस डिवाइस की अपनी",
+        Msg::DeckFetching => "डेक: तुम्हारे बेड़े से तुम्हारा लाया जा रहा है",
+        Msg::DeckSame => "डेक: तुम्हारे सभी डिवाइस पर एक जैसा",
+        Msg::DeckOwn => "डेक: इस डिवाइस का अपना",
         Msg::RemoveNote => "इस डिवाइस से मिटता है: नक़्शे की सजावट,\nWiFi नेटवर्क, आख़िरी जगह; सहेजा नहीं जाता",
         // ---- Power ----
         Msg::ProximityWake => "नज़दीकी से जगाना",
@@ -257,7 +257,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::NotStowed => "नहीं रखा",
         Msg::UncheckedDevOnly => "बिना जाँचा कोड, सिर्फ़ डेवलपमेंट बिल्ड के लिए",
         Msg::AsksAtFirstStart => "पहली बार शुरू होने पर एक बार माँगेगा",
-        // ---- Items ----
+        // ---- Deck ----
         Msg::KindKist => "kist",
         Msg::KindPuck => "puck",
         Msg::Pandok => "pandok",
@@ -276,7 +276,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Unstow => "निकालो",
         Msg::TapAgainUnstow => "फिर टैप करो: निकालो",
         Msg::AnswersKept => "इसके जवाब रखे रहते हैं, जब तुम इसे फिर रखो",
-        Msg::RemoveFromHome => "होम स्क्रीन से हटाओ",
+        Msg::RemoveFromDeck => "डेक से हटाओ",
         Msg::TapAgainRemove => "फिर टैप करो: हटाओ",
         Msg::Shows => "दिखाता है",
         Msg::TheTime => "समय",

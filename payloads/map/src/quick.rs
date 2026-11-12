@@ -4,7 +4,7 @@
 //! - **The lift.** The row goes open when it was pulled past a third of the way (or, pushed from open, not back past a third), else hidden: each frame the panel showed, what is left to go halves (a right shift), so it lands in a few frames and holds still (`step`). No timer: the steps are the shown frames (owner, 2026-11-08: "we follow shown frames, not composited").
 //! - **Tap acts, drag opens** (owner, 2026-11-11: "I like the tap to toggle on/off but the slide down to open the details. ideas?", and to the proposal "Please."; QUICK.md "Quick pages"). In the doorway a tap opens or shuts the row. On a quick circle a tap is its action (`tap`): the torch on at what was set last or off, sound round its modes, and so on; a circle with nothing to switch (brightness) opens its page. Behind the row while it shows (op 41: 12): it shuts.
 //! - **The pull.** A finger dragged down from a circle that has a page is a control on the way there (`pull_to`): on the two rings (brightness, the torch) the pull is the level, one to one, a quarter of the screen's harmonic span the whole range, down brighter and up dimmer, eased at both ends (`ease`) so it slows into each end rather than stopping dead; past the bright end by a twelfth of the span (the helm's swipe) the page opens, the level kept where the pull left it. On a circle with a page and no level (radios off) the pull opens its page at that twelfth. Let go partway, a ring keeps the level. No long press anywhere (it would need a timer). The rings' turn by angle (2026-11-11, the first cut) went with this.
-//! - **Full screen** (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"): the display neither draws the row nor gives it, the doorway or the console any pixel of the hit map, so nothing here starts; turned on by the map (the middle circle, home's swipe), the row shuts at once (`shut`).
+//! - **Full screen** (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"): the display neither draws the row nor gives it, the doorway or the console any pixel of the hit map, so nothing here starts; turned on by the map (the middle circle, deck's swipe), the row shuts at once (`shut`).
 //! - **The console's circles** (main.rs): every pixel of the dash is a circle's zone (the display's, nearest rim). Dragged toward the centre a circle opens its page; tapped still a radio switches and any other circle opens its page. No long press (it went 2026-11-11, with drag-to-centre back). Only the doorway pulls or taps the row open.
 
 use super::*;
@@ -20,7 +20,7 @@ pub const ITEM: u8 = 0x80;
 pub const RADIOS_OFF: usize = 0;
 pub const SOUND: usize = 1;
 pub const BRIGHTNESS: usize = 2;
-/// The middle one (owner, 2026-11-11: full screen moves from the home swipe to "a quick-row circle"): the app in front full screen or not (display op 43); nothing with no app in front, where the display draws it dimmed.
+/// The middle one (owner, 2026-11-11: full screen moves from the deck swipe to "a quick-row circle"): the app in front full screen or not (display op 43); nothing with no app in front, where the display draws it dimmed.
 pub const FULL_SCREEN: usize = 3;
 pub const TORCH: usize = 4;
 pub const DND: usize = 5;
@@ -162,7 +162,7 @@ impl Quick {
         self.last = frame;
     }
 
-    /// Shut at once, no slide (owner, 2026-11-11, on the Pro: in full screen the console is "gone gone"): full screen turned on by the map's own hand (the middle circle, home's swipe). The display draws none of the row in full screen and gives none of it to the hit map, so a slide back would move nothing anyone sees; landed hidden here, the row is not found open when full screen goes off. A finger's grab or a held circle ends with it.
+    /// Shut at once, no slide (owner, 2026-11-11, on the Pro: in full screen the console is "gone gone"): full screen turned on by the map's own hand (the middle circle, deck's swipe). The display draws none of the row in full screen and gives none of it to the hit map, so a slide back would move nothing anyone sees; landed hidden here, the row is not found open when full screen goes off. A finger's grab or a held circle ends with it.
     pub fn shut(&mut self) {
         self.grab = None;
         self.held = None;

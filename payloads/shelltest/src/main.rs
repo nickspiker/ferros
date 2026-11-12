@@ -1,4 +1,4 @@
-//! A client of the `display` endpoint: draws SHELL.md's home screen (status line, the people, the foot) through the display server and presents it, then keeps the status clock ticking once a second so the screen reads as alive. The shell itself will do this with live rows; this proves the endpoint.
+//! A client of the `display` endpoint: draws SHELL.md's deck (status line, the people, the foot) through the display server and presents it, then keeps the status clock ticking once a second so the screen reads as alive. The shell itself will do this with live rows; this proves the endpoint.
 //!
 //! Spawn after `display`: ferros-bridge spawn shelltest.bin 00 --name shelltest --use display   (input 01: draw once and exit)
 //! Grant slots: 0 console, 1 display (use).
@@ -94,7 +94,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, input_len: u64) -> ! {
         console(grants, b"shelltest: no display server\n");
         ferros_sys::exit(1);
     }
-    // Input 02: the highlight test card instead of the home screen, then exit.
+    // Input 02: the highlight test card instead of the deck, then exit.
     if sel == 2 {
         let r = c.op(&[11]);
         console(grants, if r == 0 { b"shelltest: test card up\n" } else { b"shelltest: test card failed\n" });
@@ -134,7 +134,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, input_len: u64) -> ! {
     let status = c.present();
     if first {
         first = false;
-        let mut line = *b"shelltest: home screen drawn, bad ops 0, present status 0\n";
+        let mut line = *b"shelltest: deck drawn, bad ops 0, present status 0\n";
         let n = line.len();
         line[n - 20] = b'0' + (bad % 10) as u8;
         line[n - 2] = b'0' + status.min(9);

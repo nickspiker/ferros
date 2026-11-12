@@ -2,23 +2,23 @@
 //!
 //! - **Written by the compose, front to back.** Each publish writes the rows it composes (`row`), once (the first phase of a publish that carries several), and each pixel once: a row starts as one free run of columns, and each layer, frontmost first, claims the runs it owns, writes its id there and takes them out of the row (`Free`), so nothing behind it is looked at there. What no layer claimed is the ground's.
 //! - **The layers, front to back:**
-//!   - the system's places (`SYS` + op 41's code), as the console's worker leaves them at its own compose step (`bars_row`, from `bar_decode`): outside the app's circle every pixel (at the top the doorway by the camera 10 and else the nearest console circle's zone: the radios 0-4, USB 5, the clock 13, the battery 14, with 11 where none reaches; back 9 on the left of the bottom and home 8 on the right), and inside it the quick row's circles while the row stands open (32 + k). In full screen (`FULL`; owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone") only the helm's: back and home stay the system's, undrawn (so home's swipe over a full-screen app shows the controls again; WINDOWS.md "The helm"), and the console's rows are not read at all (`row`, one test a row), their pixels the app's;
+//!   - the system's places (`SYS` + op 41's code), as the console's worker leaves them at its own compose step (`bars_row`, from `bar_decode`): outside the app's circle every pixel (at the top the doorway by the camera 10 and else the nearest console circle's zone: the radios 0-4, USB 5, the clock 13, the battery 14, with 11 where none reaches; back 9 on the left of the bottom and deck 8 on the right), and inside it the quick row's circles while the row stands open (32 + k). In full screen (`FULL`; owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone") only the helm's: back and deck stay the system's, undrawn (so deck's swipe over a full-screen app shows the controls again; WINDOWS.md "The helm"), and the console's rows are not read at all (`row`, one test a row), their pixels the app's;
 //!   - behind the quick row while any of it shows on the glass (`SYS` + 12): everything inside the app's circle (never in full screen, where the row does not show);
 //!   - with an app in front, its windows by the layer stack (`WINDOW` + surface): a window owns every pixel where it is not see-through, as fluor tags a widget by its shape; where no window is, nobody's;
-//!   - on the home screen: the open circle's page (`REGION`), the map's circles front first (`CIRCLE` + their index in the scene, the crowd's included), each its disc; the plane under them all (`PLANE`).
+//!   - on the deck: the open circle's page (`REGION`), the map's circles front first (`CIRCLE` + their index in the scene, the crowd's included), each its disc; the plane under them all (`PLANE`).
 //! - **Read by one lookup.** Op 27 ("is this point my window's") and op 41 ("what of the system's is here") read the pixel (`at`); the geometry they kept of their own (the windows' rectangles and clear bits, the console's circles, the quick row's, the doorway, the helm's halves) went with them; it lives on only where it also draws.
-//! - **Seen in development** (owner: "a debug/devel checkbox for toggling on/off the hitmap on the fourth frame so we get three frames normal and fourth is always hitmap"; then on the Pro: "make sure that fourth frame gets updated completely so I can see the whole map proper with fresh colours per rotate"): the fourth temporal phase (`PHASE`) shows the map, a flat colour per owner, instead of the image, painted whole from the map each time it comes round to the layer, in a palette new to that showing (`on_layer`), so every owner is one flat colour across the glass and a change of ownership shows from one rotation to the next. The publishes never paint into it. Toggled by op 58 (the Developer page's checkbox, and two fingers swiped up from back and home together); never in a release build.
+//! - **Seen in development** (owner: "a debug/devel checkbox for toggling on/off the hitmap on the fourth frame so we get three frames normal and fourth is always hitmap"; then on the Pro: "make sure that fourth frame gets updated completely so I can see the whole map proper with fresh colours per rotate"): the fourth temporal phase (`PHASE`) shows the map, a flat colour per owner, instead of the image, painted whole from the map each time it comes round to the layer, in a palette new to that showing (`on_layer`), so every owner is one flat colour across the glass and a change of ownership shows from one rotation to the next. The publishes never paint into it. Toggled by op 58 (the Developer page's checkbox, and two fingers swiped up from back and deck together); never in a release build.
 
 use super::*;
 use core::sync::atomic::AtomicU32;
 
 /// Nothing that answers a touch: the black inside the app's circle where no window is.
 pub const NOBODY: u16 = 0;
-/// The home screen's plane (the map's ground, the wallpaper).
+/// The deck's plane (the map's ground, the wallpaper).
 pub const PLANE: u16 = 1;
 /// The open circle's page (the map's region, COMPOSITOR.md).
 pub const REGION: u16 = 2;
-/// The system's places: op 41's code added (0-4 a radio's console circle and 5 USB, 13 the clock and 14 the battery (each its zone of the dash), 8 home, 9 back, 10 the doorway, 11 the top's other ground, 12 behind the quick row, 32 + k a quick circle).
+/// The system's places: op 41's code added (0-4 a radio's console circle and 5 USB, 13 the clock and 14 the battery (each its zone of the dash), 8 deck, 9 back, 10 the doorway, 11 the top's other ground, 12 behind the quick row, 32 + k a quick circle).
 pub const SYS: u16 = 1 << 8;
 /// An app's window: its surface added.
 pub const WINDOW: u16 = 1 << 9;
@@ -172,7 +172,7 @@ fn chord_q8(cx: i64, cy: i64, r: i64, y: usize, width: usize) -> Option<(usize, 
     (lo < hi).then_some((lo, hi))
 }
 
-/// The bars' ids for bar row `b` (`bar_decode`, on the console's worker, as it composes that row: the console's ids at its own compose step), into the back buffer. Front to back as the bars draw: outside the app's circle at the top the dash's zones (every pixel the nearest centre's: a console circle's, or the camera's, the doorway), back and home at the bottom; inside it the quick row's circles while it stands open as composed; nobody's elsewhere.
+/// The bars' ids for bar row `b` (`bar_decode`, on the console's worker, as it composes that row: the console's ids at its own compose step), into the back buffer. Front to back as the bars draw: outside the app's circle at the top the dash's zones (every pixel the nearest centre's: a console circle's, or the camera's, the doorway), back and deck at the bottom; inside it the quick row's circles while it stands open as composed; nobody's elsewhere.
 pub fn bars_row(b: usize, width: usize, height: usize) {
     let (top, bot) = unsafe { (BAR_TOP, CHROME_BOT) };
     let y = if b < top { b } else { height - bot + (b - top) };
@@ -193,7 +193,7 @@ pub fn bars_row(b: usize, width: usize, height: usize) {
     let mut outside = Free::new(&mut outs, 0, il);
     outside.add(ir, width);
     if y as f32 + 0.5 > height as f32 * 0.5 {
-        // The helm's halves, whole (the arrow and the ring are drawn only there; nothing to aim at): home right of the middle, back left of it.
+        // The helm's halves, whole (the arrow and the ring are drawn only there; nothing to aim at): deck right of the middle, back left of it.
         outside.claim((width + 1) / 2, width, |a, z| out[a..z].fill(SYS + 8));
         outside.rest(|a, z| out[a..z].fill(SYS + 9));
         return;
@@ -233,7 +233,7 @@ pub fn region_gone() {
     unsafe { REGION_DISC = None };
 }
 
-/// Row `y`'s map over columns [xa, xb), front to back (the module's doc), from the layers as this publish composes them: `app` with an app in front (its windows), else the home screen.
+/// Row `y`'s map over columns [xa, xb), front to back (the module's doc), from the layers as this publish composes them: `app` with an app in front (its windows), else the deck.
 pub fn row(y: usize, xa: usize, xb: usize, width: usize, height: usize, app: bool) {
     let t0 = now();
     let out = unsafe { core::slice::from_raw_parts_mut((MAP as *mut u16).add(y * width), width) };
@@ -261,7 +261,7 @@ pub fn row(y: usize, xa: usize, xb: usize, width: usize, height: usize, app: boo
     } else if app {
         windows(y, &mut free, out, width);
     } else {
-        home(y, &mut free, out, width);
+        deck(y, &mut free, out, width);
     }
     TICKS.fetch_add(now() - t0, Ordering::Relaxed);
     ROWS.fetch_add(1, Ordering::Relaxed);
@@ -303,8 +303,8 @@ fn windows(y: usize, free: &mut Free, out: &mut [u16], width: usize) {
     free.rest(|a, z| out[a..z].fill(NOBODY));
 }
 
-/// The home screen's share of a row: a flight's frame is the map's plane throughout (its two images are the map's); else the open circle's page, then the map's circles front first, then the plane.
-fn home(y: usize, free: &mut Free, out: &mut [u16], width: usize) {
+/// The deck's share of a row: a flight's frame is the map's plane throughout (its two images are the map's); else the open circle's page, then the map's circles front first, then the plane.
+fn deck(y: usize, free: &mut Free, out: &mut [u16], width: usize) {
     if unsafe { (*(&raw const FLIGHT_FRAME)).is_none() } {
         if let Some((x, yc, r)) = unsafe { REGION_DISC } {
             if let Some((a, z)) = chord_q8(x, yc, r, y, width) {

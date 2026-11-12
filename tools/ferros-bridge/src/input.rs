@@ -10,7 +10,7 @@ const TAP_HOLD: u32 = 1 << 3;
 const MOVE_FRAMES: u32 = 1 << 4;
 /// A drag's still frames at each end: the hold that takes a circle at the start, and the stop before the lift that leaves no fling.
 const DRAG_HOLD: u32 = 1 << 5;
-/// Every moving gesture rests this many frames where it landed before it moves, as a finger does: the map reads touch a thirtieth of a second apart at rest (four frames), and a finger already moving when it is first seen is first seen somewhere else (the home corner's swipe was read inside the app's circle, 2026-11-08).
+/// Every moving gesture rests this many frames where it landed before it moves, as a finger does: the map reads touch a thirtieth of a second apart at rest (four frames), and a finger already moving when it is first seen is first seen somewhere else (the deck corner's swipe was read inside the app's circle, 2026-11-08).
 const LAND: u32 = 1 << 3;
 
 pub fn usage() {

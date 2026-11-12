@@ -190,7 +190,7 @@ fn launch(grants: u64, capsule: [u8; 32], relaunch: bool) -> [u8; 4] {
     }
 }
 
-/// The person's Stop on a kist's card (owner, 2026-11-12; docs/KISTS.md "Items and the card"): the kist found in their list by its capsule, its running process killed by the kernel, one shot dead, nothing launched. Answers alone (ferros_kist::launch): STOPPED, NOT_RUNNING, NOT_INSTALLED, UNREADABLE or REFUSED.
+/// The person's Stop on a kist's card (owner, 2026-11-12; docs/KISTS.md "The deck and the card"): the kist found in their list by its capsule, its running process killed by the kernel, one shot dead, nothing launched. Answers alone (ferros_kist::launch): STOPPED, NOT_RUNNING, NOT_INSTALLED, UNREADABLE or REFUSED.
 fn stop(grants: u64, capsule: [u8; 32]) -> u8 {
     use ferros_kist::launch::*;
     let Some(list) = ferros_kist::store::read(cap(grants, S_KIST_LIST)) else { return UNREADABLE };

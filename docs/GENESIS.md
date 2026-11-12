@@ -71,7 +71,7 @@ Scoped and shelved for night work on 2026-11-11 (memory `genesis_kist_shelved`);
   - **Save state**: the state written (below, "Saves") and kept; the page stays, saying so, and Load is live from then on.
   - **Load state**: the kept state of this game read back (whole and of this ROM, or refused, said on the page) and the game again, from there: the page closes and a frame is emulated before one is shown, so the first picture is the loaded game's next frame (whole: a state holds no frame buffer, below), never the frozen one.
   - **Reset**: the console's Reset button (jgenesis's soft reset: the 68000 and Z80 reset, RAM kept), and the game again.
-  - **No Quit**: the house has none (home backgrounds a kist, back bottoms out at its main page; WINDOWS.md "The helm"), and quitting would drop a state kept in memory.
+  - **No Quit**: the house has none (deck backgrounds a kist, back bottoms out at its main page; WINDOWS.md "The helm"), and quitting would drop a state kept in memory.
   Each action's time is said on the console (`diag console`).
 
 ## Running it without an attested person (development)
@@ -218,7 +218,7 @@ Built the night of 2026-11-11 behind the kist's `audio` cargo feature (off by de
 - **Latency**: a touch to its sound is the loop's 16.7 ms plus at most the 4.6 ms ahead of the write, about 21 ms; the picture and its sound come out within about a frame of each other.
 - **On the console**: the 512-frame line adds "the sound paced A#n of them (its write their wait), the ring at least A#k pairs ahead of a frame's sound"; while the sound paces, "frame wait" is the write's wait and the panel frames counted stay 0.
   A least of 0 means the ring ran dry before a frame's sound went in: a gap heard.
-- **To check on the device**: the stream's line at start; 512 frames in about 8545 ms (59.92 a second, against the panel's 8.56 to 8.61 s now); the least ahead never 0 on the A715s, the interlaced two-player demo the tightest; the emulation's time with sound against "Measured" (expected the same, the chips having run all along); the page and home and back bringing the sound back (the console's "a new stream" if the service dropped it); the picture with no panel frame waited for (a frame doubled now and then is fine, a tear is not); the loudness at the device's volume (the core's mix runs near full scale).
+- **To check on the device**: the stream's line at start; 512 frames in about 8545 ms (59.92 a second, against the panel's 8.56 to 8.61 s now); the least ahead never 0 on the A715s, the interlaced two-player demo the tightest; the emulation's time with sound against "Measured" (expected the same, the chips having run all along); the page and deck and back bringing the sound back (the console's "a new stream" if the service dropped it); the picture with no panel frame waited for (a frame doubled now and then is fine, a tear is not); the loudness at the device's volume (the core's mix runs near full scale).
 
 ## Bluetooth controllers (what they need)
 

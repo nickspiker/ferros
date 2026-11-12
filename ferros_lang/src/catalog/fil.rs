@@ -165,9 +165,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagDenied => "Tinanggihan. Hindi binubuksan ng tag na ito ang device na ito.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "hindi tumatakbo ang serbisyo ng pagkakakilanlan",
-        Msg::HomeFetching => "home screen: kinukuha ang sa iyo mula sa armada mo",
-        Msg::HomeSame => "home screen: pareho sa lahat ng device mo",
-        Msg::HomeOwn => "home screen: sarili ng device na ito",
+        Msg::DeckFetching => "kubyerta: kinukuha ang sa iyo mula sa armada mo",
+        Msg::DeckSame => "kubyerta: pareho sa lahat ng device mo",
+        Msg::DeckOwn => "kubyerta: sarili ng device na ito",
         Msg::RemoveNote => "binubura sa device na ito: ang ayos ng mapa,\nmga WiFi network, ang huling lokasyon; hindi nase-save",
         // ---- Power ----
         Msg::ProximityWake => "paggising sa lapit",
@@ -257,7 +257,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::NotStowed => "hindi naitabi",
         Msg::UncheckedDevOnly => "code na hindi nasuri, para lang sa development build",
         Msg::AsksAtFirstStart => "hihingin ito minsan, sa una nitong pagsisimula",
-        // ---- Items ----
+        // ---- Deck ----
         Msg::KindKist => "kist",
         Msg::KindPuck => "puck",
         Msg::Pandok => "pandok",
@@ -276,7 +276,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Unstow => "alisin",
         Msg::TapAgainUnstow => "pindutin ulit: alisin",
         Msg::AnswersKept => "nananatili ang mga sagot nito para sa muling pagtabi",
-        Msg::RemoveFromHome => "alisin sa home screen",
+        Msg::RemoveFromDeck => "alisin sa kubyerta",
         Msg::TapAgainRemove => "pindutin ulit: alisin",
         Msg::Shows => "ipinapakita",
         Msg::TheTime => "ang oras",

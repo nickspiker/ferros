@@ -36,7 +36,7 @@ pub mod launch {
     pub const OP_LAUNCH: u8 = 0;
     /// [OP_RELAUNCH][address]: a running kist killed (one shot dead) and launched again with its answers as they now stand, after the person changed one (a revoke). STARTED relaunched; RUNNING when it was not running (nothing done); ASK, NOT_INSTALLED, REFUSED as for a launch.
     pub const OP_RELAUNCH: u8 = 1;
-    /// [OP_STOP][address]: the person's Stop on the kist's card (owner, 2026-11-12; docs/KISTS.md "Items and the card"): a running kist killed (one shot dead) and nothing launched, no record kept (the person's own act, as a relaunch's kill). STOPPED when it was running; NOT_RUNNING when it was not (nothing done); NOT_INSTALLED, REFUSED, UNREADABLE as for a launch.
+    /// [OP_STOP][address]: the person's Stop on the kist's card (owner, 2026-11-12; docs/KISTS.md "The deck and the card"): a running kist killed (one shot dead) and nothing launched, no record kept (the person's own act, as a relaunch's kill). STOPPED when it was running; NOT_RUNNING when it was not (nothing done); NOT_INSTALLED, REFUSED, UNREADABLE as for a launch.
     pub const OP_STOP: u8 = 2;
     /// Queued: the kernel streams the capsule from the vault and starts it.
     pub const STARTED: u8 = 0;

@@ -165,9 +165,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagDenied => "Reddedildi. Bu etiket bu cihazı açmaz.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "kimlik hizmeti çalışmıyor",
-        Msg::HomeFetching => "ana ekran: seninki filondan getiriliyor",
-        Msg::HomeSame => "ana ekran: tüm cihazlarında aynı",
-        Msg::HomeOwn => "ana ekran: bu cihaza özel",
+        Msg::DeckFetching => "güverte: seninki filondan getiriliyor",
+        Msg::DeckSame => "güverte: tüm cihazlarında aynı",
+        Msg::DeckOwn => "güverte: bu cihaza özel",
         Msg::RemoveNote => "bu cihazdan silinir: haritanın düzeni,\nWiFi ağları, son konum; kaydedilmez",
         // ---- Power ----
         Msg::ProximityWake => "yakınlıkla uyanma",
@@ -257,7 +257,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::NotStowed => "yerleştirilmedi",
         Msg::UncheckedDevOnly => "denetlenmemiş kod, yalnızca geliştirme sürümü",
         Msg::AsksAtFirstStart => "bunları bir kez, ilk açılışında ister",
-        // ---- Items ----
+        // ---- Deck ----
         Msg::KindKist => "kist",
         Msg::KindPuck => "puck",
         Msg::Pandok => "pandok",
@@ -276,7 +276,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Unstow => "kaldır",
         Msg::TapAgainUnstow => "tekrar dokun: kaldır",
         Msg::AnswersKept => "yanıtları, onu yeniden yerleştirdiğinde kullanılmak üzere saklanır",
-        Msg::RemoveFromHome => "ana ekrandan kaldır",
+        Msg::RemoveFromDeck => "güverteden kaldır",
         Msg::TapAgainRemove => "tekrar dokun: kaldır",
         Msg::Shows => "gösterir",
         Msg::TheTime => "saat",

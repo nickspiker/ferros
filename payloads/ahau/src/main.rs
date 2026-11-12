@@ -2373,7 +2373,7 @@ impl Ahau {
     /// The person's wallpaper (owner, 2026-11-07: handle entry unlocks it): their wallpaper seed to the display (op 42), which makes their wallpaper from it unless they set their own. The seed is one-way from their identity seed (BLAKE3's key derivation under a context of its own), so it shows nothing of the handle, and it is the same on every device of theirs and theirs alone. It is kept in their space (`ahau.wallpaper`) for a boot that unlocks without the handle being typed (`send_wallpaper`).
     fn wallpaper(&self, seed: &[u8; 32]) {
         let ws = ahau_core::wallpaper_seed(seed);
-        // Kept only when it is not already (every attest of a device's person but the first): a write is a vault commit, and this is on the way to the home screen (owner, 2026-11-08: "should be milliseconds").
+        // Kept only when it is not already (every attest of a device's person but the first): a write is a vault commit, and this is on the way to the deck (owner, 2026-11-08: "should be milliseconds").
         let mut kept = [0u8; 32];
         let same = ferros_sys::store_get(cap(self.grants, S_AHAU), b"wallpaper", &mut kept) == Some(32) && kept == ws;
         if !same && !self.put(S_AHAU, b"wallpaper", &ws) {
@@ -2386,7 +2386,7 @@ impl Ahau {
     fn unlocked_known(&mut self, seed: [u8; 32]) -> ! {
         self.wipe();
         console(self.grants, b"ahau: unlocked (this device knows the identity); the screen goes, the proof follows\n");
-        // The screen first, then the wallpaper's seed (the display loads it on a thread of its own and answers at once): the home screen waits for neither (owner, 2026-11-08: "4 seconds from attest to showing homescreen ... should be milliseconds").
+        // The screen first, then the wallpaper's seed (the display loads it on a thread of its own and answers at once): the deck waits for neither (owner, 2026-11-08: "4 seconds from attest to showing homescreen ... should be milliseconds").
         window::done(self.display, self.base);
         self.wallpaper(&seed);
         let proof = self.proof_for(&seed, false);
@@ -3538,7 +3538,7 @@ fn clear_bits(c: u8) -> u64 {
     if c == 255 { 1 << 63 } else { ((c as u64) << 6) << 49 }
 }
 
-/// A helm button's light (display op 54): `corner` 8 home or 9 back, `level` 0 to 1.
+/// A helm button's light (display op 54): `corner` 8 deck or 9 back, `level` 0 to 1.
 fn helm_light(display: u64, corner: u8, level: f32) {
     let q = ((level * 65535.0) as u16).to_le_bytes();
     let mut r = [0u8; 4];

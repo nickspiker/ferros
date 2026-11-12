@@ -165,9 +165,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagDenied => "Denegado. Esta etiqueta no abre este dispositivo.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "el servicio de identidad no está en marcha",
-        Msg::HomeFetching => "pantalla de inicio: trayendo la tuya de tu flota",
-        Msg::HomeSame => "pantalla de inicio: la misma en todos tus dispositivos",
-        Msg::HomeOwn => "pantalla de inicio: la propia de este dispositivo",
+        Msg::DeckFetching => "cubierta: trayendo la tuya de tu flota",
+        Msg::DeckSame => "cubierta: la misma en todos tus dispositivos",
+        Msg::DeckOwn => "cubierta: la propia de este dispositivo",
         Msg::RemoveNote => "borra de este dispositivo: la disposición del mapa,\nlas redes WiFi, la última ubicación; no se guarda",
         // ---- Power ----
         Msg::ProximityWake => "despertar por proximidad",
@@ -257,7 +257,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::NotStowed => "no guardado",
         Msg::UncheckedDevOnly => "código sin comprobar, solo versión de desarrollo",
         Msg::AsksAtFirstStart => "pide esto una vez, al iniciarse por primera vez",
-        // ---- Items ----
+        // ---- Deck ----
         Msg::KindKist => "kist",
         Msg::KindPuck => "puck",
         Msg::Pandok => "pandok",
@@ -276,7 +276,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Unstow => "sacar",
         Msg::TapAgainUnstow => "toca otra vez: sacar",
         Msg::AnswersKept => "sus respuestas se conservan para cuando lo vuelvas a guardar",
-        Msg::RemoveFromHome => "quitar de la pantalla de inicio",
+        Msg::RemoveFromDeck => "quitar de la cubierta",
         Msg::TapAgainRemove => "toca otra vez: quitar",
         Msg::Shows => "muestra",
         Msg::TheTime => "la hora",

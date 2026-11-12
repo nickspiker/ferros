@@ -165,9 +165,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagDenied => "Refusé. Cette étiquette n’ouvre pas cet appareil.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "le service d’identité ne fonctionne pas",
-        Msg::HomeFetching => "écran d’accueil : récupération du tien depuis ta flotte",
-        Msg::HomeSame => "écran d’accueil : le même sur tous tes appareils",
-        Msg::HomeOwn => "écran d’accueil : propre à cet appareil",
+        Msg::DeckFetching => "pont : récupération du tien depuis ta flotte",
+        Msg::DeckSame => "pont : le même sur tous tes appareils",
+        Msg::DeckOwn => "pont : propre à cet appareil",
         Msg::RemoveNote => "efface de cet appareil : la disposition de la carte,\nles réseaux WiFi, la dernière position ; sans sauvegarde",
         // ---- Power ----
         Msg::ProximityWake => "réveil par proximité",
@@ -257,7 +257,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::NotStowed => "non rangé",
         Msg::UncheckedDevOnly => "code non vérifié, version de développement seulement",
         Msg::AsksAtFirstStart => "les demande une fois, à son premier démarrage",
-        // ---- Items ----
+        // ---- Deck ----
         Msg::KindKist => "kist",
         Msg::KindPuck => "puck",
         Msg::Pandok => "pandok",
@@ -276,7 +276,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Unstow => "retirer",
         Msg::TapAgainUnstow => "touche encore : retirer",
         Msg::AnswersKept => "ses réponses sont gardées pour quand tu le rangeras à nouveau",
-        Msg::RemoveFromHome => "retirer de l’écran d’accueil",
+        Msg::RemoveFromDeck => "retirer du pont",
         Msg::TapAgainRemove => "touche encore : retirer",
         Msg::Shows => "affiche",
         Msg::TheTime => "l’heure",

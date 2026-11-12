@@ -165,9 +165,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagDenied => "Negado. Esta etiqueta não abre este dispositivo.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "o serviço de identidade não está rodando",
-        Msg::HomeFetching => "tela inicial: buscando a sua na sua frota",
-        Msg::HomeSame => "tela inicial: a mesma em todos os seus dispositivos",
-        Msg::HomeOwn => "tela inicial: a própria deste dispositivo",
+        Msg::DeckFetching => "convés: buscando o seu na sua frota",
+        Msg::DeckSame => "convés: o mesmo em todos os seus dispositivos",
+        Msg::DeckOwn => "convés: o próprio deste dispositivo",
         Msg::RemoveNote => "apaga deste dispositivo: a arrumação do mapa,\nas redes WiFi, a última localização; não é salvo",
         // ---- Power ----
         Msg::ProximityWake => "despertar por proximidade",
@@ -257,7 +257,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::NotStowed => "não guardado",
         Msg::UncheckedDevOnly => "código não verificado, só versão de desenvolvimento",
         Msg::AsksAtFirstStart => "pede isto uma vez, ao iniciar pela primeira vez",
-        // ---- Items ----
+        // ---- Deck ----
         Msg::KindKist => "kist",
         Msg::KindPuck => "puck",
         Msg::Pandok => "pandok",
@@ -276,7 +276,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Unstow => "retirar",
         Msg::TapAgainUnstow => "toque de novo: retirar",
         Msg::AnswersKept => "as respostas ficam guardadas para quando o guardar de novo",
-        Msg::RemoveFromHome => "remover da tela inicial",
+        Msg::RemoveFromDeck => "remover do convés",
         Msg::TapAgainRemove => "toque de novo: remover",
         Msg::Shows => "mostra",
         Msg::TheTime => "a hora",

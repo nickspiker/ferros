@@ -472,7 +472,7 @@ extern "C" fn space_watch(grants: u64) -> ! {
         if ferros_sys::call_live(svc, &[17], &mut sp) < 6 {
             continue;
         }
-        // [generation u32][home sync][first pull settled]...
+        // [generation u32][deck sync][first pull settled]...
         let now_seen = (u32::from_le_bytes([sp[0], sp[1], sp[2], sp[3]]), sp[5]);
         if now_seen.1 == 1 && seen != Some(now_seen) {
             seen = Some(now_seen);

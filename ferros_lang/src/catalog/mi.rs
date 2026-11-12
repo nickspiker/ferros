@@ -165,9 +165,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagDenied => "Kua whakakāhoretia. Kāore tēnei tohu e whakatuwhera i tēnei pūrere.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "kāore te ratonga tuakiri e rere ana",
-        Msg::HomeFetching => "mata kāinga: e tiki ana i tōu mai i tō kāhui",
-        Msg::HomeSame => "mata kāinga: he ōrite i ō pūrere katoa",
-        Msg::HomeOwn => "mata kāinga: mō tēnei pūrere anake",
+        Msg::DeckFetching => "papa: e tiki ana i tōu mai i tō kāhui",
+        Msg::DeckSame => "papa: he ōrite i ō pūrere katoa",
+        Msg::DeckOwn => "papa: mō tēnei pūrere anake",
         Msg::RemoveNote => "ka ūkuia i tēnei pūrere: te takoto o te mahere,\nngā whatunga WiFi, te wāhi whakamutunga; kāore e tiakina",
         // ---- Power ----
         Msg::ProximityWake => "whakaoho ā-tata",
@@ -257,7 +257,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::NotStowed => "kāore i penapenatia",
         Msg::UncheckedDevOnly => "he waehere kāore anō kia tirohia, mō te hanga whakawhanake anake",
         Msg::AsksAtFirstStart => "ka tono kotahi te wā, i tōna tīmatanga tuatahi",
-        // ---- Items ----
+        // ---- Deck ----
         Msg::KindKist => "kist",
         Msg::KindPuck => "puck",
         Msg::Pandok => "pandok",
@@ -276,7 +276,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Unstow => "tangohia",
         Msg::TapAgainUnstow => "pāwhiri anō: tangohia",
         Msg::AnswersKept => "ka puritia ōna whakautu mō te wā ka penapena anō koe",
-        Msg::RemoveFromHome => "tangohia i te mata kāinga",
+        Msg::RemoveFromDeck => "tangohia i te papa",
         Msg::TapAgainRemove => "pāwhiri anō: tangohia",
         Msg::Shows => "ka whakaatu",
         Msg::TheTime => "te wā",

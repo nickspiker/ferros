@@ -165,9 +165,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagDenied => "Imekataliwa. Tagi hii haifungui kifaa hiki.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "huduma ya utambulisho haifanyi kazi",
-        Msg::HomeFetching => "skrini ya mwanzo: inaleta yako kutoka kundi lako",
-        Msg::HomeSame => "skrini ya mwanzo: ileile kwenye vifaa vyako vyote",
-        Msg::HomeOwn => "skrini ya mwanzo: ya kifaa hiki chenyewe",
+        Msg::DeckFetching => "sitaha: inaleta yako kutoka kundi lako",
+        Msg::DeckSame => "sitaha: ileile kwenye vifaa vyako vyote",
+        Msg::DeckOwn => "sitaha: ya kifaa hiki chenyewe",
         Msg::RemoveNote => "hufuta kwenye kifaa hiki: mpangilio wa ramani,\nmitandao ya WiFi, mahali pa mwisho; havihifadhiwi",
         // ---- Power ----
         Msg::ProximityWake => "kuamsha kwa ukaribu",
@@ -257,7 +257,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::NotStowed => "haikuhifadhiwa",
         Msg::UncheckedDevOnly => "msimbo usiokaguliwa, kwa toleo la uundaji tu",
         Msg::AsksAtFirstStart => "itaomba haya mara moja, inapoanza kwa mara ya kwanza",
-        // ---- Items ----
+        // ---- Deck ----
         Msg::KindKist => "kist",
         Msg::KindPuck => "puck",
         Msg::Pandok => "pandok",
@@ -276,7 +276,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Unstow => "ondoa",
         Msg::TapAgainUnstow => "gusa tena: ondoa",
         Msg::AnswersKept => "majibu yake yanahifadhiwa kwa utakapoihifadhi tena",
-        Msg::RemoveFromHome => "ondoa kwenye skrini ya mwanzo",
+        Msg::RemoveFromDeck => "ondoa kwenye sitaha",
         Msg::TapAgainRemove => "gusa tena: ondoa",
         Msg::Shows => "inaonyesha",
         Msg::TheTime => "saa",

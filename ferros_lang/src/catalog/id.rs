@@ -165,9 +165,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagDenied => "Ditolak. Tag ini tidak membuka perangkat ini.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "layanan identitas tidak berjalan",
-        Msg::HomeFetching => "layar utama: mengambil milikmu dari armadamu",
-        Msg::HomeSame => "layar utama: sama di semua perangkatmu",
-        Msg::HomeOwn => "layar utama: milik perangkat ini sendiri",
+        Msg::DeckFetching => "dek: mengambil milikmu dari armadamu",
+        Msg::DeckSame => "dek: sama di semua perangkatmu",
+        Msg::DeckOwn => "dek: milik perangkat ini sendiri",
         Msg::RemoveNote => "terhapus dari perangkat ini: susunan peta,\njaringan WiFi, lokasi terakhir; tidak disimpan",
         // ---- Power ----
         Msg::ProximityWake => "bangun dengan kedekatan",
@@ -257,7 +257,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::NotStowed => "tidak disimpan",
         Msg::UncheckedDevOnly => "kode tak diperiksa, khusus build pengembangan",
         Msg::AsksAtFirstStart => "memintanya sekali, saat pertama kali dimulai",
-        // ---- Items ----
+        // ---- Deck ----
         Msg::KindKist => "kist",
         Msg::KindPuck => "puck",
         Msg::Pandok => "pandok",
@@ -276,7 +276,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Unstow => "keluarkan",
         Msg::TapAgainUnstow => "ketuk lagi: keluarkan",
         Msg::AnswersKept => "jawabannya disimpan untuk saat kamu menyimpannya lagi",
-        Msg::RemoveFromHome => "hapus dari layar utama",
+        Msg::RemoveFromDeck => "hapus dari dek",
         Msg::TapAgainRemove => "ketuk lagi: hapus",
         Msg::Shows => "menampilkan",
         Msg::TheTime => "waktu",

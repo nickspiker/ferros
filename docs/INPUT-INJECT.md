@@ -40,7 +40,7 @@ Pinch and rotate ask the display for the panel's size, so the two fingers' path 
 
 Why the defaults:
 - **The tap's 8 frames:** the map reads touch a thirtieth of a second apart at rest (four frames at 120 Hz). A shorter press can come and go between two reads.
-- **The 8 frames still before a swipe moves:** a finger already moving when it is first seen is first seen somewhere else. On 2026-11-08 the home corner's swipe was read inside the app's circle.
+- **The 8 frames still before a swipe moves:** a finger already moving when it is first seen is first seen somewhere else. On 2026-11-08 the deck corner's swipe was read inside the app's circle.
 
 ## The script
 

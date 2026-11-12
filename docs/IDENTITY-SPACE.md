@@ -15,13 +15,13 @@ One set of typed facts per person (fgtw::space, ferros's vocabulary in ferros_sp
 | DEFAULT | right | on or off for new kists | `kists.list`'s `defaults` |
 | PLACE | scope, circle (settings, or a kist by developer and option) | x, y, radius, turn | `map.place.<label>` |
 | VIEW | scope | x, y, turn | `map.view` |
-| HOME_SYNC | a device key | on or off | none: set from the Fleet page |
+| DECK_SYNC | a device key | on or off | none: set from the Fleet page |
 | ZONE | the fleet | automatic, and the zone by hand (an IANA id) | none: the identity service writes it to the kernel of each device that follows it (docs/TIME.md); chosen on the clock page |
 | LANG | the fleet | the language (`wl`, its ISO 639-3 code) | none: the identity service writes it to the kernel of each device that follows it (SETTINGS.md); chosen on the language page |
 | DND | the fleet | do not disturb, on or off (`u`) | none: the identity service writes it to the kernel of every device (preference 40, SETTINGS.md); switched on the quick row (QUICK.md) |
 | PIN | developer key | the commitment of the key bundle that developer's first kist carried (`hp`), and their name when it gave one | a `pin` section of `kists.list` (KISTS.md "Trust on first install") |
 
-The scope of a place and the view is the fleet's on every device whose home-screen sync is on (the default) and the device's own key on one switched off, so that device keeps its own arrangement, and gets it back after its own reset too. Kists, answers, defaults and pins always follow the person. A pin carries no stamp of its own into the sync, so a device that pinned another bundle for a developer the space already pins takes the space's: the first pin to reach the person's space stands (two pins made apart and merged before either device synced are settled by the space's merge, the later write).
+The scope of a place and the view is the fleet's on every device whose deck sync is on (the default) and the device's own key on one switched off, so that device keeps its own arrangement, and gets it back after its own reset too. Kists, answers, defaults and pins always follow the person. A pin carries no stamp of its own into the sync, so a device that pinned another bundle for a developer the space already pins takes the space's: the first pin to reach the person's space stands (two pins made apart and merged before either device synced are settled by the space's merge, the later write).
 
 Not in it: device firmware (below), the wallpaper (made per device, VAULT-OUT.md "First use"), the identity's roots (identity_not_on_disk_default), anything of a kist's own domain (its data syncs, if ever, as the kist's own business).
 
@@ -47,10 +47,10 @@ Next to add when they exist: the WiFi networks (`wifi.cred`; a credential carrie
 1. The identity service (payloads/fgtw) has the chain and the fleet key.
 2. It loads its kept copy, asks the fleet's devices heard (`space_want`) and fgtw.org (`space_get`), and merges what comes.
 3. Once that first pull is done, every 4 s it joins the device's copy (ferros_space::sync): the person's changes here into the space (and on to the fleet and fgtw.org), the space's into `kists.list`, `map.place.*` and `map.view`. A kist that arrives in one pass has its answers and its circle's place in the next.
-4. The map asks the generation once a second (fgtw op 17) and reads its circles and the view again when it moves, so the home screen comes back in the same spots and turns, live, without a restart.
+4. The map asks the generation once a second (fgtw op 17) and reads its circles and the view again when it moves, so the deck comes back in the same spots and turns, live, without a restart.
 5. fgtw.org is asked again every 64 s for a sibling's change made out of earshot.
 
-The Fleet page has the switch: "home screen: the same on all your devices" / "this device's own" (fgtw op 18), shown once the first pull is done.
+The Fleet page has the switch: "deck: the same on all your devices" / "this device's own" (fgtw op 18), shown once the first pull is done.
 
 ## Capsules (built 2026-11-10 but the fleet source; docs/KISTS.md "The installer")
 
@@ -87,5 +87,5 @@ Kept in the vault after the first read, since partfs reads one 4 KiB block per U
 
 1. Deploy fgtw-bootstrap (its `deploy.sh`), so fgtw.org keeps the space.
 2. Store the new `fgtw`, `init` and `map` capsules (tools/husky-shell.sh), reboot, attest. The console shows `fgtw: space: …` lines; the Fleet page shows the switch.
-3. Arrange the home screen (move and turn the circles), answer the kists' questions; wait for `fgtw.org holds ours`.
-4. With the owner's OK: the vault process's fresh start (payloads/vault FRESH, input 01). The network needs `wifi.fw`, `wifi.nvram`, `wifi.clm` (the device's) and `wifi.cred` (the person's) back before the pull can reach anything: by hand from Harbor until the refill exists (or cellular). Reboot, attest. The home screen comes back in the same spots and turns; the kists are listed with their answers; their capsules come back with `ferros-bridge kist install` until the capsule fetch exists. Device firmware is restored by hand from Harbor until the refill exists.
+3. Arrange the deck (move and turn the circles), answer the kists' questions; wait for `fgtw.org holds ours`.
+4. With the owner's OK: the vault process's fresh start (payloads/vault FRESH, input 01). The network needs `wifi.fw`, `wifi.nvram`, `wifi.clm` (the device's) and `wifi.cred` (the person's) back before the pull can reach anything: by hand from Harbor until the refill exists (or cellular). Reboot, attest. The deck comes back in the same spots and turns; the kists are listed with their answers; their capsules come back with `ferros-bridge kist install` until the capsule fetch exists. Device firmware is restored by hand from Harbor until the refill exists.

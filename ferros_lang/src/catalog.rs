@@ -47,7 +47,7 @@ messages! {
     PageUnits,
     PageKeyboard,
     PageSecurity,
-    /// The page listing everything on the home screen as a circle, by kind (owner, 2026-11-12: "I want to make sure it says items in settings, not kists"): kists, pucks, later contacts; each row opens its card.
+    /// The page listing everything on the deck as a circle, by kind (owner, 2026-11-12: "I want to make sure it says items in settings, not kists"): kists, pucks, later contacts; each row opens its card.
     PageDeck,
     PagePermissions,
     PageFleet,
@@ -285,10 +285,10 @@ messages! {
 
     // ---- Fleet: ferros's own lines (the fleet's and the identity's words are fgtw's, shared with Photon: fgtw::text) ----
     FleetServiceNotRunning,
-    HomeFetching,
+    DeckFetching,
     /// Also the checkbox's label.
-    HomeSame,
-    HomeOwn,
+    DeckSame,
+    DeckOwn,
     /// Two lines: what removing this device wipes from it.
     RemoveNote,
 
@@ -422,14 +422,14 @@ messages! {
     /// Over an offer's wants: each is asked once, at its first start.
     AsksAtFirstStart,
 
-    // ---- Items: what is on the home screen, and each thing's card (owner, 2026-11-12) ----
+    // ---- Deck: what is on deck, and each thing's card (owner, 2026-11-12) ----
     /// A row's kind: a kist (opened, an app; a ferros word, kept unless a language has a reason).
     KindKist,
     /// A row's kind: a puck (a live circle never opened, docs/PUCKS.md; a ferros word, never "widget").
     KindPuck,
-    /// The heading over the pandok's kists on Items (the pandok: the place with the things, the kist catalog; a ferros name, kept).
+    /// The heading over the pandok's kists on the Deck (the pandok: the place with the things, the kist catalog; a ferros name, kept).
     Pandok,
-    /// Items with nothing on the home screen but settings.
+    /// The Deck with nothing on deck but settings.
     NothingStowed,
     /// A card's fact: who made it (the developer's name, else their key's first bytes).
     MadeBy,
@@ -458,8 +458,8 @@ messages! {
     TapAgainUnstow,
     /// Under an armed unstow: the answers stay in the person's list.
     AnswersKept,
-    /// A puck's card: off the home screen (two taps; an unstow underneath).
-    RemoveFromHome,
+    /// A puck's card: off the deck (two taps; an unstow underneath).
+    RemoveFromDeck,
     TapAgainRemove,
     /// A puck's card: the fact naming what its circle shows.
     Shows,

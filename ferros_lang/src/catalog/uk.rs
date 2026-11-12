@@ -165,9 +165,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagDenied => "Відмовлено. Ця мітка не відкриває цей пристрій.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "служба ідентичності не запущена",
-        Msg::HomeFetching => "головний екран: беру твій із флоту",
-        Msg::HomeSame => "головний екран: однаковий на всіх твоїх пристроях",
-        Msg::HomeOwn => "головний екран: власний для цього пристрою",
+        Msg::DeckFetching => "палуба: беру твою із флоту",
+        Msg::DeckSame => "палуба: однакова на всіх твоїх пристроях",
+        Msg::DeckOwn => "палуба: власна для цього пристрою",
         Msg::RemoveNote => "стирає з цього пристрою: розташування на мапі,\nмережі WiFi, останнє місце; не зберігається",
         // ---- Power ----
         Msg::ProximityWake => "пробудження за датчиком наближення",
@@ -257,7 +257,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::NotStowed => "не сховано",
         Msg::UncheckedDevOnly => "неперевірений код, лише для збірки розробки",
         Msg::AsksAtFirstStart => "попросить один раз, під час першого запуску",
-        // ---- Items ----
+        // ---- Deck ----
         Msg::KindKist => "kist",
         Msg::KindPuck => "puck",
         Msg::Pandok => "pandok",
@@ -276,7 +276,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Unstow => "вийняти",
         Msg::TapAgainUnstow => "торкнись ще раз: вийняти",
         Msg::AnswersKept => "його відповіді збережуться, коли ти сховаєш його знову",
-        Msg::RemoveFromHome => "прибрати з головного екрана",
+        Msg::RemoveFromDeck => "прибрати з палуби",
         Msg::TapAgainRemove => "торкнись ще раз: прибрати",
         Msg::Shows => "показує",
         Msg::TheTime => "час",

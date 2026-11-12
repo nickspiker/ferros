@@ -72,7 +72,7 @@ The display server flips the layer between its four dither phase frames every 10
 
 ## 2026-10-24: the clock by gravity, no dead zones
 
-The clock follows gravity at a fixed 16 ms lag with no threshold (100 Hz samples; the turn quantised only to 1/256 px at its rim). Lying flat on its back the in-glass part of gravity is ~0.47 m/s², so the sensor's ~0.001 m/s² wander moves the angle ~0.1° and the clock redraws its region 35–48 frames/s at rest. Measured as above (16 samples, charger off, home screen): tracking **3215 mW**, the same build pinned to the 10 Hz flips **3221 mW** — no measurable cost, inside the ±50 mW spread. The panel scans at a fixed 120 Hz either way; a clock-region redraw is small next to it.
+The clock follows gravity at a fixed 16 ms lag with no threshold (100 Hz samples; the turn quantised only to 1/256 px at its rim). Lying flat on its back the in-glass part of gravity is ~0.47 m/s², so the sensor's ~0.001 m/s² wander moves the angle ~0.1° and the clock redraws its region 35–48 frames/s at rest. Measured as above (16 samples, charger off, the deck): tracking **3215 mW**, the same build pinned to the 10 Hz flips **3221 mW** — no measurable cost, inside the ±50 mW spread. The panel scans at a fixed 120 Hz either way; a clock-region redraw is small next to it.
 
 ## The light scope and the sensor stream (2026-10-25)
 

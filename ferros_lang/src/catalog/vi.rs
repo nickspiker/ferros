@@ -165,9 +165,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagDenied => "Bị từ chối. Thẻ này không mở thiết bị này.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "dịch vụ danh tính không chạy",
-        Msg::HomeFetching => "màn hình chính: đang lấy của bạn từ đội",
-        Msg::HomeSame => "màn hình chính: giống nhau trên mọi thiết bị của bạn",
-        Msg::HomeOwn => "màn hình chính: riêng của thiết bị này",
+        Msg::DeckFetching => "boong: đang lấy của bạn từ đội",
+        Msg::DeckSame => "boong: giống nhau trên mọi thiết bị của bạn",
+        Msg::DeckOwn => "boong: riêng của thiết bị này",
         Msg::RemoveNote => "xóa khỏi thiết bị này: cách xếp bản đồ,\ncác mạng WiFi, vị trí cuối; không lưu lại",
         // ---- Power ----
         Msg::ProximityWake => "đánh thức theo tiệm cận",
@@ -257,7 +257,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::NotStowed => "chưa cất",
         Msg::UncheckedDevOnly => "mã chưa kiểm tra, chỉ cho bản phát triển",
         Msg::AsksAtFirstStart => "sẽ xin một lần, khi khởi động lần đầu",
-        // ---- Items ----
+        // ---- Deck ----
         Msg::KindKist => "kist",
         Msg::KindPuck => "puck",
         Msg::Pandok => "pandok",
@@ -276,7 +276,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Unstow => "gỡ",
         Msg::TapAgainUnstow => "chạm lần nữa: gỡ",
         Msg::AnswersKept => "các câu trả lời được giữ cho lần bạn cất lại",
-        Msg::RemoveFromHome => "gỡ khỏi màn hình chính",
+        Msg::RemoveFromDeck => "gỡ khỏi boong",
         Msg::TapAgainRemove => "chạm lần nữa: gỡ",
         Msg::Shows => "hiển thị",
         Msg::TheTime => "giờ",

@@ -72,7 +72,7 @@ const PEOPLE: &[Row] = &[
     Row { who: "Notes to self", last: "tanh after the sqrt", when: "Mon", unread: false },
 ];
 
-fn home(s: &mut Screen) {
+fn deck(s: &mut Screen) {
     s.status("14:07");
     let (m, top, rh) = (s.span * 0.04, s.span * 0.11, s.span * 0.082);
     let (name, small) = (s.span * 0.027, s.span * 0.0205);
@@ -130,7 +130,7 @@ fn main() {
     let vp = Viewport::new(W as u32, H as u32);
     let span = vp.span as f32;
     let mut text = TextRenderer::new();
-    let screens: [(&str, fn(&mut Screen)); 4] = [("home", home), ("apps", apps), ("first-boot", first_boot), ("resting", resting)];
+    let screens: [(&str, fn(&mut Screen)); 4] = [("deck", deck), ("apps", apps), ("first-boot", first_boot), ("resting", resting)];
     for (name, draw) in screens {
         let mut px = vec![0u32; W * H];
         let mut damage = Damage::new();

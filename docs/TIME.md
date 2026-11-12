@@ -43,10 +43,10 @@ Two choices, each **automatic** (the zone found on the device; its zone by hand 
 - **This device's own.**
 
 The device follows the identity's choice while "follow my identity" is on (the default) and the identity has made one; otherwise its own.
-Turned off, the device keeps a zone of its own, as the home screen's "this device's own" does (IDENTITY-SPACE.md).
+Turned off, the device keeps a zone of its own, as the deck's "this device's own" does (IDENTITY-SPACE.md).
 
 Settings flow identity to device only: the identity service (payloads/fgtw) writes the person's choice to the kernel at every join where it changed (SYS_ZONE op 4); nothing on the device is ever read back into the person's space.
-A choice made on the clock page while following goes to the identity service (fgtw op 22), into the space and on to the fleet and fgtw.org, then to this device's kernel; refused before the first pull, as the home screen's switch is.
+A choice made on the clock page while following goes to the identity service (fgtw op 22), into the space and on to the fleet and fgtw.org, then to this device's kernel; refused before the first pull, as the deck's switch is.
 Releasing the identity from the device forgets its zone.
 
 ## Found on the device

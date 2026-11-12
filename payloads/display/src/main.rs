@@ -1974,7 +1974,7 @@ fn bars_over(c: u64, p: u64) -> u64 {
     if c >> 63 != 0 { p } else { under_pm(c & ((1 << 48) - 1), trans(c), p & ((1 << 48) - 1), 0).0 }
 }
 
-/// The home screen's rows into the phases `mask` names, each pixel front to back (`glass_front`): the glass's edge, then the console (its rows only), then the canvas. A 16-pixel step that touches neither is the canvas straight through the NEON present; one that does is composed first and goes through the app's present, which leaves the mask's own pixels undithered.
+/// The deck's rows into the phases `mask` names, each pixel front to back (`glass_front`): the glass's edge, then the console (its rows only), then the canvas. A 16-pixel step that touches neither is the canvas straight through the NEON present; one that does is composed first and goes through the app's present, which leaves the mask's own pixels undithered.
 /// Row by row, each row into every phase `mask` names (2026-11-11, owner on the Pro: "no reason we can't hit 120fps with a sliding console row"): a block of the glass or the bars is composed and worked out to its codes by the first phase that writes the row, and the others only dither those codes with their own thresholds (`codes_row`). Until then each phase composed and coded every such block again, four times over for the bars, whose changes go into all four.
 fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask: u32, r: draw::Rect) {
     if r.is_empty() || RAW_HOLD.load(Ordering::Acquire) == 1 {
@@ -2173,7 +2173,7 @@ static mut ARENA: usize = 1;
 static mut ARENA_NEXT: usize = 1;
 /// The arena's size in words: the `display-sprites` region's 32 MiB when granted (a screen packed with circles needs ~20 MB of square sprites; 6 MiB thrashed at 200, 2026-10-24), else 6 MiB of the heap (the 16 MiB below the back buffer, where the 256-px icon mips, 4.4 MB, and the glyph cache, 2 MiB, left no room for 10, 2026-10-23).
 static mut ARENA_WORDS: usize = (6 << 20) / 8;
-/// The wallpaper (owner, 2026-11-07): under everything on the home screen, a full screen of working values (premultiplied, opaque) in the upper half of the `display-sprites` region; 0 when there is no region for it. Unlocked with the person: their own (`map.wallpaper` in their space, a VSF visual) if they set one, else the one made from their wallpaper seed (the `wallpaper` crate's Julia set, the same on every device of theirs and theirs alone), which wallgen draws on the GPU and keeps (`map.wallpaper.made`, op 44); before attest there is none. The display draws none itself (owner, 2026-11-11: "We should be using GPU path for the brot in all cases and never 'falling back' to the CPU", "Black until we bring the GPU up"): until wallgen has made it, none shows.
+/// The wallpaper (owner, 2026-11-07): under everything on the deck, a full screen of working values (premultiplied, opaque) in the upper half of the `display-sprites` region; 0 when there is no region for it. Unlocked with the person: their own (`map.wallpaper` in their space, a VSF visual) if they set one, else the one made from their wallpaper seed (the `wallpaper` crate's Julia set, the same on every device of theirs and theirs alone), which wallgen draws on the GPU and keeps (`map.wallpaper.made`, op 44); before attest there is none. The display draws none itself (owner, 2026-11-11: "We should be using GPU path for the brot in all cases and never 'falling back' to the CPU", "Black until we bring the GPU up"): until wallgen has made it, none shows.
 static mut WALL_BUF: usize = 0;
 /// Whether `WALL_BUF` holds a finished wallpaper (publishing puts it under the canvas only then).
 static mut WALL_ON: bool = false;
@@ -2971,7 +2971,7 @@ unsafe fn flight_codes(f: &FlightFrame, canvas: *const u64, width: usize, height
     }
 }
 
-/// One row of a flight frame into phase k (COMPOSITOR.md "The flight, prerendered"), at half resolution made smooth: the images are sampled and their light, ODT and code worked out once each two columns of each second row (`flight_codes`), and each row's codes are spread linearly between them (an odd column the mean of its neighbours, an odd row the mean of the rows above and below), so the half resolution shows no blocks; each row then only dithers and packs with its own thresholds. A block where neither image has anything shows only the wallpaper (or black), at full resolution: skipped where the phase already holds just that (its compose-once bit), else presented from the wallpaper itself. The glass's edge and the bars go in front per pixel, as on every home screen row. `edges` is the row's (el, er, cl, cr) as `publish_band` works them out.
+/// One row of a flight frame into phase k (COMPOSITOR.md "The flight, prerendered"), at half resolution made smooth: the images are sampled and their light, ODT and code worked out once each two columns of each second row (`flight_codes`), and each row's codes are spread linearly between them (an odd column the mean of its neighbours, an odd row the mean of the rows above and below), so the half resolution shows no blocks; each row then only dithers and packs with its own thresholds. A block where neither image has anything shows only the wallpaper (or black), at full resolution: skipped where the phase already holds just that (its compose-once bit), else presented from the wallpaper itself. The glass's edge and the bars go in front per pixel, as on every deck row. `edges` is the row's (el, er, cl, cr) as `publish_band` works them out.
 #[inline(never)]
 unsafe fn flight_publish_row(f: &FlightFrame, canvas: *const u64, width: usize, height: usize, tabs: &neon::Odt, k: usize, y: usize, x0: usize, x1: usize, wall: usize, clean: &mut [u8], clean_w: usize, row: &mut [u32; 1344], dst: &mut [u32], g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], edges: (usize, usize, usize, usize), bw: &[u64], thv: core::arch::aarch64::uint8x16_t) {
     use core::arch::aarch64::{uint16x8_t, vdupq_laneq_u16, vld1q_u16, vrhaddq_u16};
@@ -3196,10 +3196,10 @@ const CLEAR: u64 = 1 << 63;
 static mut CHROME_TOP: usize = 0;
 /// The console's rows, the bars' top band: `CHROME_TOP`, or down to the quick row's floor where that is lower (quick.rs `rows`; since 2026-11-11 the row reaches past the chrome rows to touch the glass's sides).
 static mut BAR_TOP: usize = 0;
-/// Full screen (owner, 2026-11-07, then the home swipe; 2026-11-11 the quick row's middle circle, and later that day the home swipe again with an app in front: "the swipe in on home whilist in a kist needs to show/hide controls"): the console, the helm and the app's circle hidden, only the glass's edge left (black, and orange on development builds). The app window in front's own flag (`Win::full`, switched by op 43), followed by `full_follow` whenever the windows change; off with no app in front. The helm is hidden but stays the system's on the hit map, undrawn, so home's swipe there switches it back; the console and the quick row are gone, not drawn (`bar_line`) and not on the hit map (hit.rs `row`, which reads the bars' ids on the helm's rows alone while this is on), so the app has those pixels and their touches (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"). The map shuts the quick row at once when it turns this on itself (its middle circle, home's swipe).
+/// Full screen (owner, 2026-11-07, then the deck swipe; 2026-11-11 the quick row's middle circle, and later that day the deck swipe again with an app in front: "the swipe in on home whilist in a kist needs to show/hide controls"): the console, the helm and the app's circle hidden, only the glass's edge left (black, and orange on development builds). The app window in front's own flag (`Win::full`, switched by op 43), followed by `full_follow` whenever the windows change; off with no app in front. The helm is hidden but stays the system's on the hit map, undrawn, so deck's swipe there switches it back; the console and the quick row are gone, not drawn (`bar_line`) and not on the hit map (hit.rs `row`, which reads the bars' ids on the helm's rows alone while this is on), so the app has those pixels and their touches (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"). The map shuts the quick row at once when it turns this on itself (its middle circle, deck's swipe).
 static mut FULL: bool = false;
 static mut CHROME_BOT: usize = 0;
-/// The bars (owner, 2026-11-07): the console, the circles at the top of the screen (the radios' switches and the system's indicators), over the `BAR_TOP` rows (the quick row with them), then the helm, home and back at the bottom, over the `CHROME_BOT` rows. They are the frontmost layer but the glass's edge, over the home screen and every app alike, in screen coordinates, so nothing transforms them. Drawn as fluor draws: front to back from empty, into fluor's 16-bit α + darkness (`G2T16`), by fluor's one `under`; redrawn only when what they show changes (`console_draw`, `helm_draw`).
+/// The bars (owner, 2026-11-07): the console, the circles at the top of the screen (the radios' switches and the system's indicators), over the `BAR_TOP` rows (the quick row with them), then the helm, deck and back at the bottom, over the `CHROME_BOT` rows. They are the frontmost layer but the glass's edge, over the deck and every app alike, in screen coordinates, so nothing transforms them. Drawn as fluor draws: front to back from empty, into fluor's 16-bit α + darkness (`G2T16`), by fluor's one `under`; redrawn only when what they show changes (`console_draw`, `helm_draw`).
 static mut BAR: usize = 1;
 /// The bars decoded once a redraw to working values with their transparency (`working`), so a publish folds the scene under them with no table walk; and each row's columns holding any of them, (from, to), so the rest of a row passes untouched.
 static mut BAR_W: usize = 1;
@@ -3245,7 +3245,7 @@ fn bar_row(y: usize, height: usize) -> Option<usize> {
 /// The bars at screen row `y`: the columns holding any of them (from, to) and the row's decoded pixels (`BAR_W`); an empty span and no pixels off their rows.
 #[inline]
 fn bar_line(y: usize, width: usize, height: usize) -> ((usize, usize), &'static [u64]) {
-    // Full screen: the bars hidden, the quick row with them, every publish passing their rows untouched (owner, 2026-11-11: the console "gone gone"; until then its rows showed while the bars held any of the quick row, pulled from the doorway, so the row's circle could switch full screen off; home's swipe is the way back now).
+    // Full screen: the bars hidden, the quick row with them, every publish passing their rows untouched (owner, 2026-11-11: the console "gone gone"; until then its rows showed while the bars held any of the quick row, pulled from the doorway, so the row's circle could switch full screen off; deck's swipe is the way back now).
     if unsafe { FULL } {
         return ((0, 0), &[]);
     }
@@ -3883,7 +3883,7 @@ fn publish_app_mask(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
             unsafe { PHASE_CLOCK[k] = None };
         }
     }
-    // The rows by stripes across the publish workers and this thread, as `publish10x4` splits the home screen's (2026-11-11: an app's whole-screen frame, Mahere's map from the GPU every frame, took 28 ms of one thread a show on the Pro). Each row is its own: its composition, its codes (`codes_row`, a scratch a thread), its hit map row and its phases' words. A capture (op 30) stays on this thread.
+    // The rows by stripes across the publish workers and this thread, as `publish10x4` splits the deck's (2026-11-11: an app's whole-screen frame, Mahere's map from the GPU every frame, took 28 ms of one thread a show on the Pro). Each row is its own: its composition, its codes (`codes_row`, a scratch a thread), its hit map row and its phases' words. A capture (op 30) stays on this thread.
     let workers = PUB_UP.load(Ordering::Acquire) as usize;
     if r.y1 - r.y0 < PUB_SPLIT_ROWS || workers == 0 || unsafe { CAPTURE } != 0 {
         publish_app_rows(r, tabs, mask, width, height, hits);
@@ -4278,13 +4278,13 @@ fn windows_changed(width: usize, height: usize) {
     }
 }
 
-/// The app window in front (WINDOWS.md "The helm"): the last shown of level 0 (an app) that is not behind. What home sends behind (op 60), what back's Escape goes to (op 61), whose full screen op 43 switches.
+/// The app window in front (WINDOWS.md "The helm"): the last shown of level 0 (an app) that is not behind. What deck sends behind (op 60), what back's Escape goes to (op 61), whose full screen op 43 switches.
 fn front_app() -> Option<usize> {
     let wins = unsafe { &*(&raw const WINS) };
     (0..SURFACES).filter(|&k| wins[k].is_some_and(|w| w.level == 0 && !w.back)).max_by_key(|&k| wins[k].map_or(0, |w| w.order))
 }
 
-/// `FULL` as the app window in front has it (none in front: off, so the home screen always has its bars). True when that changed.
+/// `FULL` as the app window in front has it (none in front: off, so the deck always has its bars). True when that changed.
 fn full_follow() -> bool {
     let f = front_app().is_some_and(|k| unsafe { (*(&raw const WINS))[k] }.is_some_and(|w| w.full));
     unsafe {
@@ -4307,7 +4307,7 @@ enum Corner {
     Gps,
     Usb,
     Battery,
-    Home,
+    Deck,
     Back,
     Spare,
 }
@@ -4435,7 +4435,7 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
     let (w, h) = (width as f32, height as f32);
     let app = |x: f32, y: f32| libm::sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy)) - rr;
     // The glass the eye sees ends a pixel inside its outline: the edge's hairline is the outermost glass pixel, drawn in the mask's colour (black on release; 2026-11-08, on the Pro the circles' rims lay a pixel into it, row 0 black over WiFi's top). So the circles are tangent to the hairline's inner side.
-    // And one pixel more for the circle's own antialiased rim, which reaches past its radius: tangent at the hairline, the rim fell under the edge mask in front and the bottom-right home circle came out darkened and trimmed (owner, 2026-11-09).
+    // And one pixel more for the circle's own antialiased rim, which reaches past its radius: tangent at the hairline, the rim fell under the edge mask in front and the bottom-right deck circle came out darkened and trimmed (owner, 2026-11-09).
     let glass = |x: f32, y: f32| outline.dist(x, y) - EDGE_HAIRLINE - CIRCLE_RIM;
     let clear = |x: f32, y: f32| { let (a, g) = (app(x, y), glass(x, y)); if a < g { a } else { g } };
     let mut out = [(0.0f32, 0.0f32, 0.0f32, Corner::Spare); 16];
@@ -4446,7 +4446,7 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
         (true, true, Corner::Clock, Corner::Battery, Some(Corner::Usb), &[Corner::Gps]),
         (false, true, Corner::Cellular, Corner::Wifi, Some(Corner::Nfc), &[Corner::Bluetooth]),
         (true, false, Corner::Back, Corner::Spare, Some(Corner::Spare), &[]),
-        (false, false, Corner::Home, Corner::Spare, Some(Corner::Spare), &[]),
+        (false, false, Corner::Deck, Corner::Spare, Some(Corner::Spare), &[]),
     ];
     for &(left, top, mid_what, hor_what, ver_what, next_whats) in &jobs {
         // The corner's quarter of the screen, as far as the app's circle leaves room: the strip above (below) the circle's chord at the screen's edge.
@@ -4885,7 +4885,7 @@ fn wall_step(grants: u64, width: usize, height: usize) {
                     wall_ready(width, height);
                     attest_mark(grants, 2, b"wallpaper shown");
                 }
-                // Said, not silent (the Pro, 2026-11-10: the home screen without its wallpaper mid-boot, nothing in the log to say why).
+                // Said, not silent (the Pro, 2026-11-10: the deck without its wallpaper mid-boot, nothing in the log to say why).
                 _ => console(grants, b"display: wallpaper: none kept yet; none shown until wallgen has made it on the GPU (op 44)\n"),
             }
             return;
@@ -5000,7 +5000,7 @@ impl vsf::container::ByteSource for VaultSource {
     }
 }
 
-/// The wallpaper's loader (owner, 2026-11-08: "4 seconds from attest to showing homescreen. that's real bad... should be milliseconds"): the person's wallpaper read from the vault on a thread of its own, so the home screen is drawn at once and the wallpaper appears under it in the first frame after it is whole (no fade). Until then the 24 MB read held the render thread for 2.9 s, and the attest screen's call (op 42) with it. The render loop starts a load (`LOAD_REQ`: a sequence number, then what to try in the low byte) when one is wanted, and takes its result (`LOAD_DONE`: the same number, then what was found) in `wall_step`; meanwhile nothing publishes `WALL_BUF` (`WALL_ON` is false).
+/// The wallpaper's loader (owner, 2026-11-08: "4 seconds from attest to showing homescreen. that's real bad... should be milliseconds"): the person's wallpaper read from the vault on a thread of its own, so the deck is drawn at once and the wallpaper appears under it in the first frame after it is whole (no fade). Until then the 24 MB read held the render thread for 2.9 s, and the attest screen's call (op 42) with it. The render loop starts a load (`LOAD_REQ`: a sequence number, then what to try in the low byte) when one is wanted, and takes its result (`LOAD_DONE`: the same number, then what was found) in `wall_step`; meanwhile nothing publishes `WALL_BUF` (`WALL_ON` is false).
 static LOAD_REQ: AtomicU64 = AtomicU64::new(0);
 static LOAD_DONE: AtomicU64 = AtomicU64::new(0);
 /// What a load tries (`LOAD_REQ`'s low byte): their own, then the one made on this device.
@@ -5268,11 +5268,11 @@ fn wall_sample(buf: &mut [u64], table: &[u16], n: usize, s: usize, code: u16) {
 
 /// Whether the helm has been drawn (it shows nothing that changes; drawn once, at the first pass).
 static mut HELM_DRAWN: bool = false;
-/// The helm's light (the bottom corners' two buttons; owner, 2026-11-09: light them up), home [0] and back [1]: the level a client last reported (op 54, Q16: a finger landed, how far its swipe has come, acted), and the level drawn, which follows a rise at once and halves what is left of a fall each render pass, so a release fades out by frames and never by a timer.
+/// The helm's light (the bottom corners' two buttons; owner, 2026-11-09: light them up), deck [0] and back [1]: the level a client last reported (op 54, Q16: a finger landed, how far its swipe has come, acted), and the level drawn, which follows a rise at once and halves what is left of a fall each render pass, so a release fades out by frames and never by a timer.
 static HELM_TARGET: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static mut HELM_LEVEL: [f32; 2] = [0.0; 2];
 
-/// The helm (owner, 2026-11-07): the bottom corners' marks into the bars' bottom rows, front to back from empty in fluor's α + darkness, then decoded. Home, at the bottom right: a 2-pixel stroked circle tangent to the glass's edge and the app's circle (the corner's middle circle, which `corner_layout` solved tangent to both), the stroke inside it. Back, at the bottom left: a left arrow, 2-pixel strokes, on that corner's middle circle. A stroke's coverage is the C∞ step across two pixels on each side (`bump_step`, slope 1 at its edge as area coverage), from the distance to its centre line. Returns whether it drew.
+/// The helm (owner, 2026-11-07): the bottom corners' marks into the bars' bottom rows, front to back from empty in fluor's α + darkness, then decoded. Deck, at the bottom right: a 2-pixel stroked circle tangent to the glass's edge and the app's circle (the corner's middle circle, which `corner_layout` solved tangent to both), the stroke inside it. Back, at the bottom left: a left arrow, 2-pixel strokes, on that corner's middle circle. A stroke's coverage is the C∞ step across two pixels on each side (`bump_step`, slope 1 at its edge as area coverage), from the distance to its centre line. Returns whether it drew.
 fn helm_draw(width: usize, height: usize) -> bool {
     use fluor::pixel::{Blend, BlendMode};
     // The corners' light a pass on: a change redraws the helm.
@@ -5306,9 +5306,9 @@ fn helm_draw(width: usize, height: usize) -> bool {
         if y < height as f32 * 0.5 {
             continue;
         }
-        // Home and back are the bottom corners' middle circles (both solved the same way, tangent to the glass and the app's circle); the corners' other circles show nothing.
+        // Deck and back are the bottom corners' middle circles (both solved the same way, tangent to the glass and the app's circle); the corners' other circles show nothing.
         let back = match what {
-            Corner::Home => false,
+            Corner::Deck => false,
             Corner::Back => true,
             _ => continue,
         };
@@ -5353,7 +5353,7 @@ fn helm_draw(width: usize, height: usize) -> bool {
             }
         }
     }
-    // Each button's whole wedge (owner, 2026-11-09: "everything in that wedge should light up", "1/8 opacity black when the helm is showing, that turns white at same said opacity when tapped"): the bars' rows outside the app's circle, the left half back's and the right half home's (op 41's regions), a layer behind the marks (front to back) at an eighth of opacity, its colour black at rest and white by the button's level; its edge along the circle a pixel wide.
+    // Each button's whole wedge (owner, 2026-11-09: "everything in that wedge should light up", "1/8 opacity black when the helm is showing, that turns white at same said opacity when tapped"): the bars' rows outside the app's circle, the left half back's and the right half deck's (op 41's regions), a layer behind the marks (front to back) at an eighth of opacity, its colour black at rest and white by the button's level; its edge along the circle a pixel wide.
     let lv = unsafe { HELM_LEVEL };
     {
         let shade = |l: f32| g2t_colour((16384.0 * l, 16384.0 * l, 16384.0 * l));
@@ -5956,7 +5956,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
             Corner::Usb => ferros_sys::measure_of(facts[33 + 8 * 5]) == Some((ferros_sys::measure::STATE, 2)),
             // The gauge answered (facts 1-4, the kernel's two-second poll of the MAX77759 on hsi2c_11).
             Corner::Battery => facts[1] != u64::MAX,
-            Corner::Home | Corner::Back | Corner::Spare => false,
+            Corner::Deck | Corner::Back | Corner::Spare => false,
         };
         // The radio's measures, as its driver published them (facts 33 + 8 · radio): every one shown as itself, in its unit, a line each; none folded into a level, no bars (owner, 2026-11-03).
         let radio = radio_of(what);
@@ -6136,7 +6136,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 Corner::Usb => "USB",
                 Corner::Battery if charge.n > 0 => charge.str(),
                 Corner::Battery => "batt",
-                Corner::Home | Corner::Back | Corner::Spare => "",
+                Corner::Deck | Corner::Back | Corner::Spare => "",
             };
             if what == Corner::Gps && live && !switched_off && !sats.is_empty() {
                 gps_rings(&sats, x, y, r * (1.0 - 2.0 * VESSEL_DEPTH), flav, &mut |px, py| at(px, py), console, cut);
@@ -6665,7 +6665,7 @@ extern "C" fn receive(grants: u64) -> ! {
             ferros_sys::reply(&tok, &[yes as u8]);
             continue;
         }
-        // 54 `corner light [corner u8: 8 home, 9 back][level u16 Q16]`: a client's finger on a bottom corner (owner, 2026-11-09: light up corners), the helm drawing it (`helm_draw`). → [0].
+        // 54 `corner light [corner u8: 8 deck, 9 back][level u16 Q16]`: a client's finger on a bottom corner (owner, 2026-11-09: light up corners), the helm drawing it (`helm_draw`). → [0].
         if op == 54 && n >= 4 {
             let level = u16::from_le_bytes([msg[2], msg[3]]) as u32;
             match msg[1] {
@@ -6683,7 +6683,7 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         if op == 41 && n >= 5 {
-            // What the system has at this point: [x u16][y u16] → its place, one read of the hit map (hit.rs, the system's ids as the bars' compose leaves them): in the lower half outside the app's circle, a region (owner, 2026-11-07): 9 back on the left, 8 home on the right, whole (the arrow and the ring are only drawn there, nothing to aim at); in the upper half, the doorway by the camera 10, else the console circle whose zone it is (every pixel of the dash is the nearest circle's, `dash_row`): the radios by their bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS), 5 USB, 13 the clock, 14 the battery; 11 where no zone reaches (none on these screens). The quick row (QUICK.md), in front of what is inside the app's circle: its circle under the point while it stands open as 32 + its index, with its centre and radius after (x, y, r u16 each, as `quick::layout` draws it), or 12 anywhere else inside the app's circle while any of it shows (behind the row). G#FF for nothing of the system's: inside the circle with the row shut (an app's window, the map's plane), or off the glass; and in full screen everywhere on the console's rows (the console and the doorway gone, their pixels the app's; owner, 2026-11-11: "whilist console should be gone gone"), so a touch there is no corner's and the row cannot be pulled.
+            // What the system has at this point: [x u16][y u16] → its place, one read of the hit map (hit.rs, the system's ids as the bars' compose leaves them): in the lower half outside the app's circle, a region (owner, 2026-11-07): 9 back on the left, 8 deck on the right, whole (the arrow and the ring are only drawn there, nothing to aim at); in the upper half, the doorway by the camera 10, else the console circle whose zone it is (every pixel of the dash is the nearest circle's, `dash_row`): the radios by their bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS), 5 USB, 13 the clock, 14 the battery; 11 where no zone reaches (none on these screens). The quick row (QUICK.md), in front of what is inside the app's circle: its circle under the point while it stands open as 32 + its index, with its centre and radius after (x, y, r u16 each, as `quick::layout` draws it), or 12 anywhere else inside the app's circle while any of it shows (behind the row). G#FF for nothing of the system's: inside the circle with the row shut (an app's window, the map's plane), or off the glass; and in full screen everywhere on the console's rows (the console and the doorway gone, their pixels the app's; owner, 2026-11-11: "whilist console should be gone gone"), so a touch there is no corner's and the row cannot be pulled.
             let (w, h) = unsafe { SCREEN_WH };
             let (x, y) = (u16::from_le_bytes([msg[1], msg[2]]) as i64, u16::from_le_bytes([msg[3], msg[4]]) as i64);
             let id = hit::at(x, y);
@@ -8369,7 +8369,7 @@ fn server(grants: u64) -> ! {
                     }
                 }
                 Some(43) => {
-                    // Full screen on or off for the app window in front (`Win::full`, `FULL`; the quick row's circle since 2026-11-11, owner: full screen "moves to a quick-row circle", where the home swipe toggled it for the whole screen until then): every phase republished, the bars and the circle gone or back, and with the publish every row of the hit map written again (hit.rs `row`: the console's rows the app's in full screen, the helm's still the system's). Replies the new state; status 3 and the state unchanged with no app in front (the home screen always has its bars).
+                    // Full screen on or off for the app window in front (`Win::full`, `FULL`; the quick row's circle since 2026-11-11, owner: full screen "moves to a quick-row circle", where the deck swipe toggled it for the whole screen until then): every phase republished, the bars and the circle gone or back, and with the publish every row of the hit map written again (hit.rs `row`: the console's rows the app's in full screen, the helm's still the system's). Replies the new state; status 3 and the state unchanged with no app in front (the deck always has its bars).
                     match front_app() {
                         Some(k) => unsafe {
                             if let Some(w) = (*(&raw mut WINS))[k].as_mut() {
@@ -8478,7 +8478,7 @@ fn server(grants: u64) -> ! {
                         out[0] = 1;
                     } else {
                         unsafe { ATTEST_T = (now(), 0) };
-                        // Read by the loader (`wall_loader`) and answered now: the home screen does not wait for it (owner, 2026-11-08).
+                        // Read by the loader (`wall_loader`) and answered now: the deck does not wait for it (owner, 2026-11-08).
                         wall_load(false);
                     }
                 }
@@ -8508,7 +8508,7 @@ fn server(grants: u64) -> ! {
                     // `[30, 1]`: the glass's mask alone (owner, 2026-11-10, the website's screens: "pull that screen mask for the edges/cam, de premultiply it, apply alpha"): every pixel through `glass_front` with nothing in front but the mask and only white behind it, so with the release look's black mask each pixel's working value is white times the share of the glass that shows there (the edge's and the camera hole's antialiasing exact, as the panel gets them). Whatever is on the screen, an app included.
                     let mask = m.get(1) == Some(&1);
                     let text: alloc::string::String = match (unsafe { APP }.is_some() && !mask, free) {
-                        // The home screen: each row as `publish_band` composes it for the glass (the edge, then the console, then the canvas), in working values, into the free surface.
+                        // The deck: each row as `publish_band` composes it for the glass (the edge, then the console, then the canvas), in working values, into the free surface.
                         (false, Some(k)) => {
                             let s = surface(k, width, height);
                             let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
@@ -8891,7 +8891,7 @@ fn server(grants: u64) -> ! {
             wall_step(grants, width, height);
             stage_us[1] = ferros_sys::us_since(t_w);
             let t_bars = now();
-            // The bars on every screen (in front of the home screen and of every app), drawn by their worker, never here (COMPOSITOR.md, step 1): nudged on every pass to look at what they show; when it has drawn, their buffers swap here, at a pass's top where no publish is reading, and only the rectangles that changed go into every phase.
+            // The bars on every screen (in front of the deck and of every app), drawn by their worker, never here (COMPOSITOR.md, step 1): nudged on every pass to look at what they show; when it has drawn, their buffers swap here, at a pass's top where no publish is reading, and only the rectangles that changed go into every phase.
             let changed = if CON_READY.load(Ordering::Acquire) != 0 {
                 let (w, s) = (BAR_W, BAR_SPAN);
                 BAR_W = BAR_W_BACK;
@@ -8922,7 +8922,7 @@ fn server(grants: u64) -> ! {
                     // Every phase in one pass of the rows: composed and coded once, dithered four times (`publish_app_mask`).
                     publish_app_mask(r, &tabs, (1 << PHASES) - 1, width, height, true);
                 } else {
-                    // The home screen: the canvas by its address (`pixels` is held by the request handler's closure here).
+                    // The deck: the canvas by its address (`pixels` is held by the request handler's closure here).
                     let canvas = core::slice::from_raw_parts(back as *const Px, width * height);
                     publish10x4(canvas, width, height, &tabs, (1 << PHASES) - 1, r);
                 }

@@ -1432,7 +1432,7 @@ pub fn spawn_kist(grants: u64, kists: u64, name: &[u8], capsule: &[u8; 32], code
     kist_call(grants, kists, name, capsule, codes, 2 | (replace as u64) << 2)
 }
 
-/// Stop a running kist (`SYS_SPAWN` kist mode, x2 bit 5; the person's Stop on its card, docs/KISTS.md "Items and the card"): its live process of that name killed, one shot dead, and nothing launched; no record kept, as for a relaunch's kill (the person's own act). 0 stopped, NOTHING not running (nothing done), ERR refused (no Kists right at grant `kists`).
+/// Stop a running kist (`SYS_SPAWN` kist mode, x2 bit 5; the person's Stop on its card, docs/KISTS.md "The deck and the card"): its live process of that name killed, one shot dead, and nothing launched; no record kept, as for a relaunch's kill (the person's own act). 0 stopped, NOTHING not running (nothing done), ERR refused (no Kists right at grant `kists`).
 pub fn stop_kist(grants: u64, kists: u64, name: &[u8], capsule: &[u8; 32]) -> u64 {
     kist_call(grants, kists, name, capsule, &[], 2 | 1 << 5)
 }
@@ -1919,7 +1919,7 @@ pub mod window {
     // ---- front, behind and keys (WINDOWS.md "The helm", owner 2026-11-11: "Home backgrounds the kist so depending on how it was designed, like Photon, it doesn't die but it stops rendering everything and stops playing anything except for notifications", "back should signal escape to the app and go up one page") ----
 
     /// A window's event (display op 62): its kind in the high byte, then for a key its USB HID usage (keyboard page) in the low one.
-    /// Behind: the window left the glass (home, or a flip to another kist); the process lives on, nothing it shows reaches the glass until it is in front again. Draw nothing; play nothing but notifications.
+    /// Behind: the window left the glass (deck, or a flip to another kist); the process lives on, nothing it shows reaches the glass until it is in front again. Draw nothing; play nothing but notifications.
     pub const EV_BEHIND: u8 = 1;
     /// In front again (its circle tapped, a flip back): the display composes it from its surface as it stands.
     pub const EV_FRONT: u8 = 2;

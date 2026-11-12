@@ -39,7 +39,7 @@ enum Mode {
     Bonded,
     /// A device no identity has attested on yet: `render_fresh` in `Look::fresh()`.
     Free,
-    /// The identity's default wallpaper (owner, 2026-11-07, for debugging): the typed handle's identity seed, its wallpaper seed (ahau_core::wallpaper_seed, as ahau sends the display), and the `wallpaper` crate's Julia set at the window's size, as the home screen shows it.
+    /// The identity's default wallpaper (owner, 2026-11-07, for debugging): the typed handle's identity seed, its wallpaper seed (ahau_core::wallpaper_seed, as ahau sends the display), and the `wallpaper` crate's Julia set at the window's size, as the deck shows it.
     Wallpaper,
 }
 

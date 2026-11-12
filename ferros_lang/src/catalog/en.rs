@@ -165,9 +165,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagDenied => "Denied. This tag does not open this device.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "the identity service is not running",
-        Msg::HomeFetching => "home screen: fetching yours from your fleet",
-        Msg::HomeSame => "home screen: the same on all your devices",
-        Msg::HomeOwn => "home screen: this device's own",
+        Msg::DeckFetching => "deck: fetching yours from your fleet",
+        Msg::DeckSame => "deck: the same on all your devices",
+        Msg::DeckOwn => "deck: this device's own",
         Msg::RemoveNote => "wipes from this device: the map's arrangement,\nWiFi networks, the last location; not saved",
         // ---- Power ----
         Msg::ProximityWake => "proximity wake",
@@ -257,7 +257,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::NotStowed => "not stowed",
         Msg::UncheckedDevOnly => "unchecked code, development build only",
         Msg::AsksAtFirstStart => "asks for these once, at its first start",
-        // ---- Items ----
+        // ---- Deck ----
         Msg::KindKist => "kist",
         Msg::KindPuck => "puck",
         Msg::Pandok => "pandok",
@@ -276,7 +276,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Unstow => "unstow",
         Msg::TapAgainUnstow => "tap again: unstow",
         Msg::AnswersKept => "its answers are kept for when you stow it again",
-        Msg::RemoveFromHome => "remove from the home screen",
+        Msg::RemoveFromDeck => "remove from the deck",
         Msg::TapAgainRemove => "tap again: remove",
         Msg::Shows => "shows",
         Msg::TheTime => "the time",

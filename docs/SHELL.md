@@ -4,11 +4,11 @@
 
 **Your phone is a map of your life.**
 
-Every person, message, photo and app is a circle on one plane. Zoom out and you're home: a quiet map where the only things lit are the things that changed since you last looked. Zoom in and you're reading the thread, in place. Nothing ever moves, so after a week you navigate by memory, not by search. There are no notifications, no feeds, no badges. Apps run in sealed circles and lose the right to speak unless a human is behind the message. An agent on the device, not in the cloud, is the only interface you talk to, and it keeps a log of everything it did for you. No lock screen, because the phone already knows it's you. Boots in under a second to the same map every time.
+Every person, message, photo and app is a circle on one plane. Zoom out and you're on deck: a quiet map where the only things lit are the things that changed since you last looked. Zoom in and you're reading the thread, in place. Nothing ever moves, so after a week you navigate by memory, not by search. There are no notifications, no feeds, no badges. Apps run in sealed circles and lose the right to speak unless a human is behind the message. An agent on the device, not in the cloud, is the only interface you talk to, and it keeps a log of everything it did for you. No lock screen, because the phone already knows it's you. Boots in under a second to the same map every time.
 
 One line: **a phone where nothing moves, nothing shouts, and you always know where you are.**
 
-This replaces the 2026-10-16 design, in which home was a status line over a list of people and apps were a second screen of rows. What carries over unchanged:
+This replaces the 2026-10-16 design, in which the deck (then the home screen) was a status line over a list of people and apps were a second screen of rows. What carries over unchanged:
 
 - **Design the wake, not the boot.** A wake happens a hundred times a day and is deliberate (power pressed, proximity far). The screen shows state, not a menu.
 - **The OS's own record is the only launcher.** App circles come from the vault's `sealed` list; nothing else may appear as an app.
@@ -83,11 +83,11 @@ That is the whole idea in miniature: a plane, nothing moves, fingers move the vi
 
 - **Growth against neighbours.** A circle that grows a great deal over months can outgrow the air it was placed with. Whether that is resolved by placing generously enough that it never happens, by a rare settling the owner asks for, or by letting circles overlap is open.
 - **Placement.** Who decides where a new circle lands, given it can never move afterwards: the owner, placing it once by hand, or the system, deterministically — say, beside what it relates to, a new thread next to its person?
-- **What lit looks like** at the home scale: brightness, a glow, or the only colour on an otherwise grey map. It renders through the pinned gamma2tanh profile either way.
+- **What lit looks like** at the deck's scale: brightness, a glow, or the only colour on an otherwise grey map. It renders through the pinned gamma2tanh profile either way.
 - **The clock** (eagle time, dozenal) and whether the map shows it at all, or the agent answers when asked.
 - **Capture.** The 2026-10-16 design put it on a hardware chord, never behind a list. Nothing in the spec contradicts that; Lumis would open from it.
 
-The 2026-10-16 mock is `tools/shell-mock` (fluor, headless, the panel's real geometry; `cargo run --release -- <out dir>` writes PPM frames), and the 2026-10-16 home screen still runs on the phone as `payloads/shelltest` through the display server's `display` endpoint (DISPLAY.md), in Oxanium.
+The 2026-10-16 mock is `tools/shell-mock` (fluor, headless, the panel's real geometry; `cargo run --release -- <out dir>` writes PPM frames), and the 2026-10-16 deck still runs on the phone as `payloads/shelltest` through the display server's `display` endpoint (DISPLAY.md), in Oxanium.
 
 ## Proposal: places, the device's own circle, and settings that live where they act (2026-10-22, for the owner's decision)
 
@@ -115,7 +115,7 @@ Its pages are Photon's split (photon docs/settings-panel.md), a ring a swipe goe
 | Numbers | the base: four rows, each two seconds and a mebibyte written in it, so the choice is made by seeing | |
 | Keyboard | layout: Dvorak or QWERTY | shape writing |
 | Security | unlock at boot, two taps to turn on, the theft warning under it | lock, wipe |
-| Deck | everything on the home screen as a circle, by kind: the kists (opened, apps), then the pucks (live circles never opened: the clock), each row its name with its kind and a kist's state under it; a row opens that thing's card (KISTS.md "The deck and the card"); the pandok under the list, to stow from and update; a kist offered over USB above everything, with Stow and Cancel | contacts as a kind |
+| Deck | everything on the deck as a circle, by kind: the kists (opened, apps), then the pucks (live circles never opened: the clock), each row its name with its kind and a kist's state under it; a row opens that thing's card (KISTS.md "The deck and the card"); the pandok under the list, to stow from and update; a kist offered over USB above everything, with Stow and Cancel | contacts as a kind |
 | Power | proximity wake | |
 | Connections | the links' states, each a door to its link's page; the NFC page holds the tags kept to attest with (add a tag, each kept one listed with when and a remove, the warning under them; AUTH.md "Attest with a tag") | choosing a WiFi network, Bluetooth accessories |
 | About | version, press to ready, since power on, battery, processes, the vault, the chip | validate-on-demand for the firmware |
@@ -175,7 +175,7 @@ Everything in the map is integer. The camera centre is in world units ×256 and 
 - draw circles as integer spans, blending only at the rim;
 - write the black ground outright where nothing is painted.
 
-A fourth change came later: the black pass is gone. The layer is BGRX, so the panel never sees alpha, an empty pixel already shows black, and black under an antialiased edge adds nothing to its colour. The pass cost 15–25 ms and changed no visible pixel. A home-map frame is now under 20 ms, and a dashboard frame 57 ms (38 ms of it scene work hidden under the overlay, which could be skipped).
+A fourth change came later: the black pass is gone. The layer is BGRX, so the panel never sees alpha, an empty pixel already shows black, and black under an antialiased edge adds nothing to its colour. The pass cost 15–25 ms and changed no visible pixel. A deck frame is now under 20 ms, and a dashboard frame 57 ms (38 ms of it scene work hidden under the overlay, which could be skipped).
 
 **The clock, measured properly.** The 576 MHz the display once measured was its share of the core, not the clock. `diag dvfs` asks ACPM's DVFS channel (channel 0, `acpm_dvfs.c`'s protocol) for every domain's rate:
 - the kernel and every process run on CPU0, in the little cluster (CPUCL0), at the bootloader's 1425 MHz, and an add loop measures 1426;

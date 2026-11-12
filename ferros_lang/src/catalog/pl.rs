@@ -165,9 +165,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagDenied => "Odmowa. Ten tag nie otwiera tego urządzenia.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "usługa tożsamości nie działa",
-        Msg::HomeFetching => "ekran główny: pobieranie twojego z floty",
-        Msg::HomeSame => "ekran główny: taki sam na wszystkich twoich urządzeniach",
-        Msg::HomeOwn => "ekran główny: własny tego urządzenia",
+        Msg::DeckFetching => "pokład: pobieranie twojego z floty",
+        Msg::DeckSame => "pokład: taki sam na wszystkich twoich urządzeniach",
+        Msg::DeckOwn => "pokład: własny tego urządzenia",
         Msg::RemoveNote => "wymazuje z tego urządzenia: układ mapy,\nsieci WiFi, ostatnią lokalizację; bez kopii",
         // ---- Power ----
         Msg::ProximityWake => "budzenie zbliżeniowe",
@@ -257,7 +257,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::NotStowed => "nie schowano",
         Msg::UncheckedDevOnly => "niesprawdzony kod, tylko wersja deweloperska",
         Msg::AsksAtFirstStart => "poprosi o to raz, przy pierwszym uruchomieniu",
-        // ---- Items ----
+        // ---- Deck ----
         Msg::KindKist => "kist",
         Msg::KindPuck => "puck",
         Msg::Pandok => "pandok",
@@ -276,7 +276,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Unstow => "wyjmij",
         Msg::TapAgainUnstow => "dotknij ponownie: wyjmij",
         Msg::AnswersKept => "jego odpowiedzi zostaną zachowane na wypadek ponownego schowania",
-        Msg::RemoveFromHome => "usuń z ekranu głównego",
+        Msg::RemoveFromDeck => "usuń z pokładu",
         Msg::TapAgainRemove => "dotknij ponownie: usuń",
         Msg::Shows => "pokazuje",
         Msg::TheTime => "godzinę",

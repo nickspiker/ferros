@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bring the display server up on cold ferros (slot b): build the payloads, reload the kernel, spawn the server with its grants, then the home-screen client.
+# Bring the display server up on cold ferros (slot b): build the payloads, reload the kernel, spawn the server with its grants, then the deck client.
 # Usage: tools/husky-display.sh [--no-reload] [--no-shell]
 set -uo pipefail
 # Only husky: every fastboot and adb call goes to it, and fastboot refuses a phone that is not (tools/lib/devices.sh).

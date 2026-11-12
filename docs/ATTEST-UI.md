@@ -20,7 +20,7 @@ One screen, no modes, nothing animated or timed. Top to bottom:
    - Top left: the time, as now.
    - Top right: the radios, as four dots in a row: WiFi, cellular, Bluetooth, NFC. A dot is lit (the theme's "changed" colour, the map's only colour) when its link is up, the text colour when the radio is on but not linked, faint when off. No bars, no numbers: a dot says up, on, or off, and nothing shouts. After a jump from Android the radios are off, and the dots say so.
    - Bottom left: the battery, a ring swept like the clock's rings: the fill is the charge, the ring's colour the text colour, the lit colour while charging (current positive). Below a sixteenth it is drawn in the warn colour; that is the one exception to "nothing shouts", and it is the owner's call.
-   - Bottom right: home, the one navigation control (WINDOWS.md, "The corners": the map is home, recents and search; back is the app's; a tap here from anywhere and the map is there). Proposed 2026-11-02, nothing built.
+   - Bottom right: the deck (named home until 2026-11-12), the one navigation control (WINDOWS.md, "The corners": the map is home, recents and search; back is the app's; a tap here from anywhere and the map is there). Proposed 2026-11-02, nothing built.
 2. **The mark**, as now, centred.
 3. **The handle line**, as now.
 4. **A line of words under it**, in the device's language, saying what this screen is: "Type your handle" when an identity has attested here before; the first-use words (below) when none has.

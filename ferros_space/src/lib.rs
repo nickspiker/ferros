@@ -9,14 +9,14 @@
 //! | `DEFAULT` | right `u` | on `u` | `kists.list`'s `defaults` |
 //! | `PLACE` | scope `ke`, then `d` "settings" or developer, option | x, y `i` (world ×256), radius `i`, turn cos, sin `i` (Q14) | `map.place.<label>` (EWE, the map's) |
 //! | `VIEW` | scope `ke` | x, y, cos, sin `i` | `map.view` |
-//! | `HOME_SYNC` | a device `ke` | on `u` | none: the space's own, set from settings |
+//! | `DECK_SYNC` | a device `ke` | on `u` | none: the space's own, set from settings |
 //! | `DEPART` | the leaving device `ke` | its signed departure request `v`, or once denied the signed deny | none: the identity service's own (payloads/fgtw), so a member answers it wherever it is |
 //! | `ZONE` | the fleet's scope `ke` | automatic `u` (1 or 0), then the IANA id by hand `a` when there is one | none: the identity service writes it to the kernel (SYS_ZONE op 4) on each device, which follows it unless its settings say otherwise |
 //! | `LANG` | the fleet's scope `ke` | the language `wl` (its ISO 639-3 code) | none: the identity service writes it to the kernel (SYS_LANG op 2) on each device, which follows it unless its settings say otherwise |
 //! | `DND` | the fleet's scope `ke` | on `u` (1 or 0) | none: the identity service writes it to the kernel (preference 40) on each device |
 //! | `PIN` | developer `ke` | the bundle's commitment `hp`, then the developer's name `a` when their first kist gave one; the entry's stamp is when it was pinned | a `pin` section of `kists.list` (trust on first install) |
 //!
-//! The scope of a place and the view is the fleet's (`FLEET`, 32 zero bytes) on every device whose home-screen sync is on (the default), and the device's own key on one where the person switched it off, so that device keeps an arrangement of its own, which follows it through a reset all the same.
+//! The scope of a place and the view is the fleet's (`FLEET`, 32 zero bytes) on every device whose deck sync is on (the default), and the device's own key on one where the person switched it off, so that device keeps an arrangement of its own, which follows it through a reset all the same.
 //!
 //! Device firmware is never here: it is the device's, re-read from its own partitions.
 
@@ -40,7 +40,7 @@ pub mod kind {
     pub const DEFAULT: u8 = 2;
     pub const PLACE: u8 = 3;
     pub const VIEW: u8 = 4;
-    pub const HOME_SYNC: u8 = 5;
+    pub const DECK_SYNC: u8 = 5;
     /// A member leaving the fleet: its signed departure request, carried by the space to every member wherever it is (owner, 2026-11-09: "broadcast to the devices like a regular message"), approved or denied on any of them, no words (owner, 2026-11-10); once denied, the signed deny in its place; gone once the Remove is published or the device is no longer a member.
     pub const DEPART: u8 = 6;
     /// The person's time zone (owner, 2026-11-10: "it's per identity, you can uncheck and set per device tho"): automatic (each device finds its own from its network, then GPS) or a zone by hand; written to each device that follows it, never read back from one (settings flow identity to device only).
@@ -131,7 +131,7 @@ pub fn view_id(scope: &[u8; 32]) -> Vec<VsfType> {
     vec![VsfType::ke(scope.to_vec())]
 }
 
-pub fn home_sync_id(device: &[u8; 32]) -> Vec<VsfType> {
+pub fn deck_sync_id(device: &[u8; 32]) -> Vec<VsfType> {
     vec![VsfType::ke(device.to_vec())]
 }
 
@@ -185,22 +185,22 @@ fn place_of(id: &[VsfType]) -> Option<([u8; 32], Circle)> {
     }
 }
 
-/// Whether this device's home screen follows the fleet's (on until the person switches it off for this device).
-pub fn home_sync(space: &Space, device: &[u8; 32]) -> bool {
-    match space.get(kind::HOME_SYNC, &home_sync_id(device)) {
+/// Whether this device's deck follows the fleet's (on until the person switches it off for this device).
+pub fn deck_sync(space: &Space, device: &[u8; 32]) -> bool {
+    match space.get(kind::DECK_SYNC, &deck_sync_id(device)) {
         Some(e) if !e.gone => e.value.first().and_then(|v| v.as_u64()) != Some(0),
         _ => true,
     }
 }
 
-/// The person switched this device's home-screen sync on or off (settings): written straight into the space, stamped past everything it holds. True when the space changed.
-pub fn set_home_sync(space: &mut Space, device: &[u8; 32], on: bool, now: i64) -> bool {
-    if home_sync(space, device) == on && space.get(kind::HOME_SYNC, &home_sync_id(device)).is_some() {
+/// The person switched this device's deck sync on or off (settings): written straight into the space, stamped past everything it holds. True when the space changed.
+pub fn set_deck_sync(space: &mut Space, device: &[u8; 32], on: bool, now: i64) -> bool {
+    if deck_sync(space, device) == on && space.get(kind::DECK_SYNC, &deck_sync_id(device)).is_some() {
         return false;
     }
     // Past the switch's last write, so this one wins the merge whatever the clocks say (a Lamport step: see fgtw::space::reconcile).
-    let updated = space.get(kind::HOME_SYNC, &home_sync_id(device)).map_or(now, |e| now.max(e.updated + 1));
-    space.put(Entry { kind: kind::HOME_SYNC, id: home_sync_id(device), value: vec![VsfType::u(on as usize, false)], updated, by: *device, gone: false })
+    let updated = space.get(kind::DECK_SYNC, &deck_sync_id(device)).map_or(now, |e| now.max(e.updated + 1));
+    space.put(Entry { kind: kind::DECK_SYNC, id: deck_sync_id(device), value: vec![VsfType::u(on as usize, false)], updated, by: *device, gone: false })
 }
 
 /// The zone's id: the fleet's scope, one choice for the person.
@@ -607,7 +607,7 @@ pub fn sync(space: &mut Space, base: &mut Baseline, store: &mut impl Store, me: 
     let mut kinds = 0u16;
     for _ in 0..4 {
         let mut list = read_list(store).map_err(|_| "the person's list is not readable")?;
-        let scope = if home_sync(space, me) { FLEET } else { *me };
+        let scope = if deck_sync(space, me) { FLEET } else { *me };
         let facts = snapshot(&list, store, &scope).map_err(|_| "the map's places are not readable")?;
         let before = base.clone();
         let writes = reconcile(space, base, &facts, |k, id| managed(&list, &scope, k, id), *me, now);
@@ -748,7 +748,7 @@ mod tests {
 
     /// Two devices with the sync on: a move on one reaches the other; an answer changed on the other reaches the first; one switched off keeps its own arrangement while kists and answers still follow.
     #[test]
-    fn the_fleet_shares_one_home_screen_unless_a_device_opts_out() {
+    fn the_fleet_shares_one_deck_unless_a_device_opts_out() {
         let mut a = arranged_pro();
         let (mut sa, mut ba) = (Space::new(), Baseline::default());
         sync(&mut sa, &mut ba, &mut a, &PRO, 2000).unwrap();
@@ -769,8 +769,8 @@ mod tests {
         assert_eq!(seen(&mut a), seen(&mut b));
         assert_eq!(read_list(&mut a).unwrap().kists[1].wants[1].answer, Some((false, 2200)));
         assert_eq!(decode_place(&a.map[&place_key("Mahere")]).unwrap()[0], 1 << 8);
-        // The other device switches its home-screen sync off, then the Pro moves settings: the other keeps its own.
-        set_home_sync(&mut sb, &OTHER, false, 2500);
+        // The other device switches its deck sync off, then the Pro moves settings: the other keeps its own.
+        set_deck_sync(&mut sb, &OTHER, false, 2500);
         sync(&mut sb, &mut bb, &mut b, &OTHER, 2501).unwrap();
         a.set(Scope::Map, &place_key("settings"), &encode_place(&[0, 0, 300, 0, ONE]));
         sync(&mut sa, &mut ba, &mut a, &PRO, 2600).unwrap();

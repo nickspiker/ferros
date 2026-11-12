@@ -54,7 +54,7 @@ A third hang came after those refused requests, with the DSU and BCI at their fl
 
 ## 2026-10-25: Android for comparison, and the UFS link
 
-Android on the same phone (slot a, production build, no root): the cable out, adb over WiFi, `current_now` once a second with the screen on (home screen, brightness 158/255) and the battery's charge counter over 15 minutes with it off (WiFi and the adb connection up, so a light idle, not its deepest).
+Android on the same phone (slot a, production build, no root): the cable out, adb over WiFi, `current_now` once a second with the screen on (the deck, brightness 158/255) and the battery's charge counter over 15 minutes with it off (WiFi and the adb connection up, so a light idle, not its deepest).
 
 | | Android | ferros |
 |---|---|---|

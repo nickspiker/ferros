@@ -165,9 +165,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagDenied => "Abgewiesen. Dieses Tag öffnet dieses Gerät nicht.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "der Identitätsdienst läuft nicht",
-        Msg::HomeFetching => "Startbildschirm: deiner wird von deiner Flotte geholt",
-        Msg::HomeSame => "Startbildschirm: gleich auf all deinen Geräten",
-        Msg::HomeOwn => "Startbildschirm: der eigene dieses Geräts",
+        Msg::DeckFetching => "Deck: deins wird von deiner Flotte geholt",
+        Msg::DeckSame => "Deck: gleich auf all deinen Geräten",
+        Msg::DeckOwn => "Deck: das eigene dieses Geräts",
         Msg::RemoveNote => "löscht von diesem Gerät: die Anordnung der Karte,\nWiFi-Netze, den letzten Standort; ohne Sicherung",
         // ---- Power ----
         Msg::ProximityWake => "Wecken per Annäherung",
@@ -257,7 +257,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::NotStowed => "nicht verstaut",
         Msg::UncheckedDevOnly => "ungeprüfter Code, nur für Entwicklungsversionen",
         Msg::AsksAtFirstStart => "fragt einmal danach, beim ersten Start",
-        // ---- Items ----
+        // ---- Deck ----
         Msg::KindKist => "Kist",
         Msg::KindPuck => "Puck",
         Msg::Pandok => "Pandok",
@@ -276,7 +276,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Unstow => "ausräumen",
         Msg::TapAgainUnstow => "noch einmal tippen: ausräumen",
         Msg::AnswersKept => "seine Antworten bleiben, falls du es wieder verstaust",
-        Msg::RemoveFromHome => "vom Startbildschirm entfernen",
+        Msg::RemoveFromDeck => "vom Deck entfernen",
         Msg::TapAgainRemove => "noch einmal tippen: entfernen",
         Msg::Shows => "zeigt",
         Msg::TheTime => "die Uhrzeit",

@@ -9,7 +9,7 @@ here=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$here"
 cargo run -q --release --manifest-path tools/kistcat/Cargo.toml -- build --unsigned --out target/kists --web web/index.html \
     --capsule target/kists/clock.capsule.vsf \
-        --about "The time, drawn live as rings in its own circle on the home screen"
+        --about "The time, drawn live as rings in its own circle on the deck"
 # Not yet listable (2026-11-10):
 # - Mahere (tools/mahere-kist.sh): its capsule is native and signed the old way (one Ed25519 egg, no developer bundle), so the device would refuse it. It lists once built masked and signed with `kistcat kist` and the owner's developer key (its version, 0.6.1, then in the capsule), as tools/clock-kist.sh does the Clock:
 #     --capsule target/kists/mahere.capsule.vsf --about "An offline trail map for the backcountry, drawn from its own tiles"

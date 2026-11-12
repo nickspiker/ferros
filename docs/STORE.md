@@ -403,7 +403,7 @@ In words, top to bottom:
 - A held circle shows its card: its kind, title, who made it on which device and when, its versions, which kists may open it ("Genesis can open this"), and whether it is only on this device.
   From there: open in, keep a version, add to a collection, remove.
 
-Any find can be kept with a name, and appears among the kinds as its own circle; a kept find or a collection can also be put on the home map as a circle (it opens on the find page).
+Any find can be kept with a name, and appears among the kinds as its own circle; a kept find or a collection can also be put on the deck as a circle (it opens on the find page).
 
 ### Open and save, without paths
 
@@ -495,4 +495,4 @@ What this spec would add, and what it would not:
 2. **The find page** ("your things"): search, kinds, the time strip, who made it, cards, versions, remove; kept finds and collections.
 3. **Sync**: cards across the fleet by page digests, bodies on demand by kind, "only on this device", and the departure's check.
 4. **Moves**: Mahere's tracks and drawings to the person's items and its downloads to its own with cards; Lumis's captures as photos; the wallpaper as a reference to a photo; Photon's kept attachments.
-5. **Later, if wanted**: the word index; kept finds and collections as circles on the home map; a sealed copy off the fleet.
+5. **Later, if wanted**: the word index; kept finds and collections as circles on the deck; a sealed copy off the fleet.

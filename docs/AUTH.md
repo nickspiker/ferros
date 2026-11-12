@@ -20,7 +20,7 @@ The vault holds two classes of entry.
 
 | What | Vault names |
 |---|---|
-| The home screen | `map.place.*` (where each circle sits), `map.view` (the camera), everything else under `map.` |
+| The deck | `map.place.*` (where each circle sits), `map.view` (the camera), everything else under `map.` |
 | fgtw (the identity service) | `fgtw.*`: the chain and fleet key when kept, its phonebook |
 | The attest screen's own | `ahau.*` |
 | Networks | `wifi.cred` (networks travel with the person; the per-network MAC stays the device's, from the ira) |
@@ -41,7 +41,7 @@ The rule is in `kvault.rs` `IDENTITY`: a name under one of those prefixes is ide
 
 ## No identity, no device
 
-A device not attached to an identity is not usable (owner, 2026-11-04: "if it's not attached to an identity, not usable. No way to save settings or anything, plus it completely defeats the point."). Until the attest screen ends with the device bound to an identity, by the fleet adding it (the words or the tap) or by a mint making it the identity's first device, nothing past the attest screen runs: no home screen, no settings, no apps, and no way past the screen (`go on` was removed the same day). Before that only the device's own drivers and the attest's own processes run (ahau, and fgtw once an identity is unlocked). init enforces it (`wait_person`), and the kernel's `diag restart` refuses the map the same way.
+A device not attached to an identity is not usable (owner, 2026-11-04: "if it's not attached to an identity, not usable. No way to save settings or anything, plus it completely defeats the point."). Until the attest screen ends with the device bound to an identity, by the fleet adding it (the words or the tap) or by a mint making it the identity's first device, nothing past the attest screen runs: no deck, no settings, no apps, and no way past the screen (`go on` was removed the same day). Before that only the device's own drivers and the attest's own processes run (ahau, and fgtw once an identity is unlocked). init enforces it (`wait_person`), and the kernel's `diag restart` refuses the map the same way.
 
 ## One identity per device
 
@@ -122,7 +122,7 @@ The owner keeps a plain NTAG-type tag (NFC-A, Type 2, a 7-byte UID, no crypto of
 
 | Device | Handle | Result | Time |
 |---|---|---|---|
-| Bound | recognized (its own) | Opens: the screen goes, straight to the home screen | Instant |
+| Bound | recognized (its own) | Opens: the screen goes, straight to the deck | Instant |
 | Bound | not recognized | Denied | Instant |
 | Unbound | recognized (an earlier attempt, join not finished) | Back to finding the identity and the join | Instant (the proof is kept in its space) |
 | Unbound | not recognized | The earlier attempt's space wiped; the proof computed on the X3 and kept; then: an identity exists → join; none → mint, typed twice; no answer → still looking, the screen waits | The proof once, about 5 s |

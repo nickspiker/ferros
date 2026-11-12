@@ -328,8 +328,8 @@ const NAME_BYTES: usize = 1 << 6;
 struct Fleet {
     /// None until the service answered at all (it starts only once a person has attested).
     state: Option<u8>,
-    /// The person's identity space (fgtw op 17): this device's home-screen sync, and whether the first pull from their fleet is done. None until the service answered it.
-    home: Option<(bool, bool)>,
+    /// The person's identity space (fgtw op 17): this device's deck sync, and whether the first pull from their fleet is done. None until the service answered it.
+    deck: Option<(bool, bool)>,
     /// The space's generation (op 17): a new one means the circles are read again.
     space_gen: Option<u32>,
     /// This device's departure asked for and not yet showing as under way (the second tap on remove, before the service says leaving): the page says so at once.
@@ -379,7 +379,7 @@ struct Fleet {
 
 impl Fleet {
     const fn new() -> Self {
-        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, sel_name: [0; NAME_BYTES], sel_name_n: 0, sel_words: [0; 512], sel_words_n: 0, adding_name: [0; NAME_BYTES], adding_name_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0, denied_by: [0; NAME_BYTES], denied_by_n: 0, home: None, space_gen: None, sent: false, left: [0; NAME_BYTES], left_n: 0 }
+        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, sel_name: [0; NAME_BYTES], sel_name_n: 0, sel_words: [0; 512], sel_words_n: 0, adding_name: [0; NAME_BYTES], adding_name_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0, denied_by: [0; NAME_BYTES], denied_by_n: 0, deck: None, space_gen: None, sent: false, left: [0; NAME_BYTES], left_n: 0 }
     }
 
     /// A fresh copy from `fgtw_poller` taken in, the page's own state kept: the remove row's arming, the last request's answer, a departure sent and not yet under way, and a departure approved here that has now gone (said as left).
@@ -418,7 +418,7 @@ impl Fleet {
 
         let mut s = [0u8; 8];
         let ok = ferros_sys::call_live(svc, &[17], &mut s) == 8;
-        self.home = ok.then(|| (s[4] == 1, s[5] == 1));
+        self.deck = ok.then(|| (s[4] == 1, s[5] == 1));
         self.space_gen = ok.then(|| u32::from_le_bytes([s[0], s[1], s[2], s[3]]));
         let mut m = [0u8; 1 + 16 * 9 + 16 * (1 + NAME_BYTES)];
         let k = ferros_sys::call_live(svc, &[6], &mut m);
@@ -533,7 +533,7 @@ impl Fleet {
         }
     }
 
-    /// An op to the identity service (8 open or close, 10 pick, 12 confirm, 14 approve or deny, 15 the keyboard for words, 18 home sync). The page's view comes back by the doorbell.
+    /// An op to the identity service (8 open or close, 10 pick, 12 confirm, 14 approve or deny, 15 the keyboard for words, 18 deck sync). The page's view comes back by the doorbell.
     fn add_op(&mut self, svc: u64, msg: &[u8]) {
         let mut r = [0u8; 8];
         let _ = ferros_sys::call_live(svc, msg, &mut r);
@@ -722,7 +722,7 @@ struct Cam {
 }
 /// The zoom's one fixed point: on release the world is rescaled so the camera's zoom is exactly this (one world unit = one pixel) and every position and radius absorbs the factor — the integers never walk toward an extreme (owner, 2026-10-23: "rescale upon release so we never accidentally hit infinities"). The limits are all relative (`Map::zoom_limits`, `Map::radius_limits`).
 const Z_ONE: i64 = 1 << 16;
-/// The home swipe's turn search (`Map::home_turned`): turns sampled across a half turn, then golden-section steps between the best one's neighbours (each step keeps 0.618 of the bracket: 2⁵ steps take the two samples either side of the best, under six degrees, to about a millionth of one).
+/// The deck swipe's turn search (`Map::deck_turned`): turns sampled across a half turn, then golden-section steps between the best one's neighbours (each step keeps 0.618 of the bracket: 2⁵ steps take the two samples either side of the best, under six degrees, to about a millionth of one).
 const TURN_SAMPLES: usize = 1 << 6;
 const TURN_REFINE: usize = 1 << 5;
 /// The circles together may not shrink below this fraction of the screen's area (1/256), nor the smallest circle grow past the screen; the largest and smallest circle may not differ by more than this in area (256×: 16× in radius).
@@ -809,8 +809,8 @@ enum Choice {
     /// A sibling's departure waiting here: Approve (fgtw op 14 [1]) or Deny ([0]).
     FleetApprove,
     FleetDeny,
-    /// The Fleet page's "this device's home screen": follows the person's fleet, or keeps its own (payloads/fgtw op 18; docs/IDENTITY-SPACE.md).
-    HomeSync,
+    /// The Fleet page's "this device's deck": follows the person's fleet, or keeps its own (payloads/fgtw op 18; docs/IDENTITY-SPACE.md).
+    DeckSync,
     /// A link on Connections: its own page (LINKS order).
     Link(u8),
     /// A radio's page: its switch, as its console circle's tap (preference 15).
@@ -836,7 +836,7 @@ enum Choice {
     Pick(u8),
     /// A kist's want on its card or the Permissions page: (the kist in the person's list, the want), its answer turned over.
     Answer(u8, u8),
-    /// The Deck page: a thing's unstow (its place in the person's list; two taps; a puck's "remove from the home screen"), and the pandok's stow or update (its row in the directory).
+    /// The Deck page: a thing's unstow (its place in the person's list; two taps; a puck's "remove from the deck"), and the pandok's stow or update (its row in the directory).
     Unstow(u8),
     Install(u8),
     /// The Deck page: a row's card opened (its place in the person's list), and back to the list.
@@ -857,7 +857,7 @@ enum Choice {
     TagRemove(u8),
 }
 
-/// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The torch after the battery (owner, 2026-11-11: its brightness, strobe, lit share and timeout; QUICK.md "Quick pages"), opened from its quick circle by a pull down as well. The clock after them (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). The Deck, first named Items (owner, 2026-11-12: "make sure it says items in settings, not kists"): everything on the home screen as a circle, by kind, each row opening its card. These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
+/// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The torch after the battery (owner, 2026-11-11: its brightness, strobe, lit share and timeout; QUICK.md "Quick pages"), opened from its quick circle by a pull down as well. The clock after them (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). The Deck, first named Items (owner, 2026-11-12: "make sure it says items in settings, not kists"): everything on the deck as a circle, by kind, each row opening its card. These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
 const PAGES: [&str; 21] = ["appearance", "units", "keyboard", "security", "deck", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "torch", "clock", "language", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
@@ -1295,7 +1295,7 @@ struct Map {
     armed: bool,
     /// Developer made a page by the twelve taps (the vault, `map.dev`).
     dev: bool,
-    /// Whether the display shows its hit map in every fourth frame (display op 58; development builds): the Developer page's checkbox and the two-finger swipe up from back and home together switch it, and the display's answer is kept here.
+    /// Whether the display shows its hit map in every fourth frame (display op 58; development builds): the Developer page's checkbox and the two-finger swipe up from back and deck together switch it, and the display's answer is kept here.
     hit_view: bool,
     /// The panel's channels as the display has them (display op 63; development builds): bit 0 red, 1 green, 2 blue, set = on; the Developer page's three checkboxes.
     channels: u8,
@@ -1743,7 +1743,7 @@ impl Map {
         self.place_circles(n);
     }
 
-    /// The person's kists and arrangement read again after the identity service wrote them from their fleet (payloads/fgtw space.rs: a reset device getting its home screen back, a move made on another of their devices): every circle placed afresh, each kept place winning, the view as kept, then the scene sent again.
+    /// The person's kists and arrangement read again after the identity service wrote them from their fleet (payloads/fgtw space.rs: a reset device getting its deck back, a move made on another of their devices): every circle placed afresh, each kept place winning, the view as kept, then the scene sent again.
     fn reload_arrangement(&mut self) {
         if !self.reload_kists() {
             return;
@@ -1838,11 +1838,11 @@ impl Map {
         (1..self.n).find(|&i| self.kist(i).is_some_and(|k| k.capsule == *capsule))
     }
 
-    /// Home (WINDOWS.md "The helm"; owner, 2026-11-11: "Home backgrounds the kist so depending on how it was designed, like Photon, it doesn't die but it stops rendering everything and stops playing anything except for notifications"): the app in front behind (display op 60, the app told so); the map is on the glass as it was left once it draws (`draw`, or the caller's own frame). Whether an app went behind.
+    /// Deck (WINDOWS.md "The helm"; owner, 2026-11-11: "Home backgrounds the kist so depending on how it was designed, like Photon, it doesn't die but it stops rendering everything and stops playing anything except for notifications"): the app in front behind (display op 60, the app told so); the map is on the glass as it was left once it draws (`draw`, or the caller's own frame). Whether an app went behind.
     fn send_behind(&mut self, draw: bool) -> bool {
         let Some((k, g)) = ferros_sys::window::behind(self.display) else { return false };
         let mut l = Line::new();
-        let _ = write!(l, "map: home: the window on surface {k} (generation {g}) behind\n");
+        let _ = write!(l, "map: deck: the window on surface {k} (generation {g}) behind\n");
         console(self.grants, l.as_str().as_bytes());
         self.app_front = false;
         self.front_kist = None;
@@ -2277,7 +2277,7 @@ impl Map {
 
     /// Circle `i`'s state as its glow (ferros_glow, display op 57; owner, 2026-11-11, on the Pro: "glow is good! you can nix the test circles and use those colours for realzies"), with the count of things waiting on the person. The settings circle is the system's own, 703 nm (owner: "For the ferros settings specifically, I think 703nm"). A kist circle, from what the kernel last said (`kists_rang`), first that matches:
     /// - for you (400 nm): something waits on the person for it (`waiting`; nothing adds to it yet, there are no notifications).
-    /// - running (500 nm): a live process of it, in front or behind (home leaves it alive behind). A widget the display draws itself (the clock) is running too: it is never a process, and it is live on the glass.
+    /// - running (500 nm): a live process of it, in front or behind (deck leaves it alive behind). A widget the display draws itself (the clock) is running too: it is never a process, and it is live on the glass.
     /// - stopped (600 nm): the kernel keeps a record for it (ferros_sys::not_started): its last process ended by a fault, a panic or a kill from outside, or its last launch did not start; gone once it starts again.
     /// - not running (a ring of darkness): installed and none of those (not launched since boot, or ended by its own exit or the person's relaunch).
     /// Before the kernel has said (a kernel without op 2), a kist circle has no state: the theme's glow as before.
@@ -2424,16 +2424,16 @@ impl Map {
     }
 
     /// The camera that shows every circle with air around them, never closer than one world unit to a pixel: every circle inside the screen's width and the big circle (`active_circle`) together, so none lands past an edge or under the console in a top corner (owner, 2026-11-08: "the fit doesn't fit to screen extents anded with the big circle"). The turn is kept; the circles' bounds are taken as the screen will turn them, their middle put on the big circle's centre, and the zoom is the largest at which each circle passes both tests, with no margin.
-    fn home(&self) -> Cam {
-        self.home_at(self.cam.c, self.cam.s).0
+    fn deck_fit(&self) -> Cam {
+        self.deck_fit_at(self.cam.c, self.cam.s).0
     }
 
-    /// The home swipe's camera (owner, 2026-11-11: home's swipe flies out "to fit every circle" and "let's rotate it to find the most zoom we can too so it spins into place"): every circle in view as `home` fits them, at the turn that lets them be largest. The fit's zoom is a function of the turn with period a half turn (turning by π mirrors the circles through the fit's middle, which fits alike), continuous and piecewise smooth (the fit is the least of each circle's two room ratios). A bounded search, no timer: `TURN_SAMPLES` turns across the half turn centred on the camera's own (so the answer is the nearer of each pair a half turn apart, and the flight spins the short way), then golden-section steps inside the best sample's neighbours. Where the zoom limit caps every turn alike (a few small circles), the camera keeps its own turn: nothing to gain by spinning.
-    fn home_turned(&self) -> Cam {
+    /// The deck swipe's camera (owner, 2026-11-11: deck's swipe flies out "to fit every circle" and "let's rotate it to find the most zoom we can too so it spins into place"): every circle in view as `deck_fit` fits them, at the turn that lets them be largest. The fit's zoom is a function of the turn with period a half turn (turning by π mirrors the circles through the fit's middle, which fits alike), continuous and piecewise smooth (the fit is the least of each circle's two room ratios). A bounded search, no timer: `TURN_SAMPLES` turns across the half turn centred on the camera's own (so the answer is the nearer of each pair a half turn apart, and the flight spins the short way), then golden-section steps inside the best sample's neighbours. Where the zoom limit caps every turn alike (a few small circles), the camera keeps its own turn: nothing to gain by spinning.
+    fn deck_turned(&self) -> Cam {
         let a0 = libm::atan2(self.cam.s as f64, self.cam.c as f64);
         let half = core::f64::consts::PI;
         let turn = |a: f64| (libm::round(libm::cos(a) * ONE as f64) as i64, libm::round(libm::sin(a) * ONE as f64) as i64);
-        let fit = |a: f64| { let (c, s) = turn(a); self.home_at(c, s).1 };
+        let fit = |a: f64| { let (c, s) = turn(a); self.deck_fit_at(c, s).1 };
         let step = half / TURN_SAMPLES as f64;
         let (mut best, mut best_z) = (a0, fit(a0));
         for j in 0..TURN_SAMPLES {
@@ -2469,11 +2469,11 @@ impl Map {
         let (_, hi_z) = self.zoom_limits();
         let here = fit(a0);
         let (c, s) = if here >= hi_z as f64 || best_z <= here { (self.cam.c, self.cam.s) } else { turn(best) };
-        self.home_at(c, s).0
+        self.deck_fit_at(c, s).0
     }
 
-    /// `home` at the turn (c, s), Q14: the camera, and the fit's own zoom before the zoom limits hold it (what the turn is chosen by).
-    fn home_at(&self, c: i64, s: i64) -> (Cam, f64) {
+    /// `deck_fit` at the turn (c, s), Q14: the camera, and the fit's own zoom before the zoom limits hold it (what the turn is chosen by).
+    fn deck_fit_at(&self, c: i64, s: i64) -> (Cam, f64) {
         let (cc, ss) = (c, s);
         let (c, s, one) = (c as f64, s as f64, ONE as f64);
         // A world offset (×256) turned as `Cam::screen` turns it.
@@ -3110,7 +3110,7 @@ impl Map {
                 notes(b, &mut y, tr(Msg::AttestAtBootNote));
             }
             "fleet" => {
-                // The fleet this identity's devices make (payloads/fgtw): where this device stands, the members, and removing this device. Removing wipes the identity's things from it (AUTH.md: the identity class) and it restarts at the attest screen once a device of the fleet approves. Its words are fgtw's (fgtw::text), the same Photon shows, but for the home screen's and what removing wipes here.
+                // The fleet this identity's devices make (payloads/fgtw): where this device stands, the members, and removing this device. Removing wipes the identity's things from it (AUTH.md: the identity class) and it restarts at the attest screen once a device of the fleet approves. Its words are fgtw's (fgtw::text), the same Photon shows, but for the deck's and what removing wipes here.
                 let f = self.fleet;
                 let named = |b: &[u8], n: usize, or: FleetMsg<'static>| -> Line {
                     match core::str::from_utf8(&b[..n]) {
@@ -3200,13 +3200,13 @@ impl Map {
                 }
                 // Adding a device, and approving a sibling's departure (fgtw::sponsor, through payloads/fgtw ops 8-15): a member of the fleet only.
                 if f.state == Some(3) {
-                    // The home screen across the person's devices (owner, 2026-11-08: "on all my ferros devices the homescreen layout should sync, unless of course I go into settings and uncheck that"): its kists and answers always follow them; its arrangement does unless switched off here.
-                    if let Some((on, settled)) = f.home {
+                    // The deck across the person's devices (owner, 2026-11-08: "on all my ferros devices the homescreen layout should sync, unless of course I go into settings and uncheck that"): its kists and answers always follow them; its arrangement does unless switched off here.
+                    if let Some((on, settled)) = f.deck {
                         // A checkbox once the fleet has answered: checked, the same on all your devices; unchecked, this device's own.
                         if settled {
-                            mark(self, b, &mut y, 50, tr(Msg::HomeSame), on, Some(Choice::HomeSync));
+                            mark(self, b, &mut y, 50, tr(Msg::DeckSame), on, Some(Choice::DeckSync));
                         } else {
-                            row(self, b, &mut y, small, grey(), tr(Msg::HomeFetching), None);
+                            row(self, b, &mut y, small, grey(), tr(Msg::DeckFetching), None);
                         }
                     }
                     if f.denied_by_n > 0 {
@@ -3869,7 +3869,7 @@ impl Map {
                 fact(b, &mut y, tr(Msg::Chip), v.as_str());
             }
             "deck" => {
-                // Everything on the home screen, each row opening its card (`card`): what it is, who made it, its rights as switches (owner, 2026-11-08: per kist, its rights; a tap changes the answer for every device of the person's, and a kist running is killed and started again with the answers as they now stand), stop, update and unstow.
+                // Everything on the deck, each row opening its card (`card`): what it is, who made it, its rights as switches (owner, 2026-11-08: per kist, its rights; a tap changes the answer for every device of the person's, and a kist running is killed and started again with the answers as they now stand), stop, update and unstow.
                 let ks = self.kists.kists.clone();
                 // The installer's (installer.rs): the directory and the jobs under way. Sizes in the person's number base.
                 let inst = self.installer.clone();
@@ -4041,11 +4041,11 @@ impl Map {
                             button(self, b, &mut y, l.as_str(), false, Some(Choice::Install(di as u8)));
                         }
                     }
-                    // Unstow in two taps (as "remove this device"): out of the person's list, its answers kept; a puck's says what a person sees, off the home screen.
+                    // Unstow in two taps (as "remove this device"): out of the person's list, its answers kept; a puck's says what a person sees, off the deck.
                     if inst.here && !busy {
                         let armed = self.unstow_armed == Some(ki as u8);
                         let words = match (puck.is_some(), armed) {
-                            (true, false) => Msg::RemoveFromHome,
+                            (true, false) => Msg::RemoveFromDeck,
                             (true, true) => Msg::TapAgainRemove,
                             (false, false) => Msg::Unstow,
                             (false, true) => Msg::TapAgainUnstow,
@@ -4059,7 +4059,7 @@ impl Map {
                     self.page_h[p] = y - y0;
                     return;
                 }
-                // Everything on the home screen as a circle, by kind (owner, 2026-11-12: "make sure the settings/items page lists kists and pucks. we may add more stuff to the home screen like contacts"): the kists first, then the pucks (a puck: a live circle never opened, docs/PUCKS.md), each kind a group, room for more kinds (contacts) as more groups. A row is its name, and under it its kind and a kist's state (as its glow says it); the whole of it opens its card.
+                // Everything on the deck as a circle, by kind (owner, 2026-11-12: "make sure the settings/items page lists kists and pucks. we may add more stuff to the home screen like contacts"): the kists first, then the pucks (a puck: a live circle never opened, docs/PUCKS.md), each kind a group, room for more kinds (contacts) as more groups. A row is its name, and under it its kind and a kist's state (as its glow says it); the whole of it opens its card.
                 if ks.is_empty() {
                     row(self, b, &mut y, small, grey(), tr(Msg::NothingStowed), None);
                 }
@@ -4465,7 +4465,7 @@ impl Map {
         self.page_dx != 0 || self.fling != 0. || self.spring.is_some() || self.pan.is_some() || self.knob.is_some() || flying
     }
 
-    /// The display's hit map in every fourth frame switched (display op 58, toggle; development builds), from the Developer page's checkbox or the two-finger swipe up from back and home: the display's answer kept for the checkbox, and said on the console.
+    /// The display's hit map in every fourth frame switched (display op 58, toggle; development builds), from the Developer page's checkbox or the two-finger swipe up from back and deck: the display's answer kept for the checkbox, and said on the console.
     fn hit_view_toggle(&mut self) {
         let mut r = [0u8; 4];
         if call(self.display, &[58, 2], &mut r) >= 2 && r[0] == 0 {
@@ -4491,7 +4491,7 @@ impl Map {
         }
     }
 
-    /// A helm button's light (display op 54): `corner` 8 home or 9 back, `level` 0 to 1.
+    /// A helm button's light (display op 54): `corner` 8 deck or 9 back, `level` 0 to 1.
     fn helm_light(&self, corner: u8, level: f32) {
         let q = ((level * 65535.0) as u16).to_le_bytes();
         let mut r = [0u8; 4];
@@ -4532,44 +4532,44 @@ impl Map {
             self.back = None;
             self.leaving = true;
         }
-        let to = self.home();
+        let to = self.deck_fit();
         self.fly(to);
         self.draw();
         "map: back: zoomed out to every circle"
     }
 
-    /// Home's swipe with an app in front (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls"): the app in front full screen or not (display op 43, as the quick row's middle circle switches it), the kist staying in front. Full screen hides ferros's controls (the console, the helm, the app's circle); the helm's wedges stay the system's on the hit map, undrawn, so this same swipe brings them back, and the console's rows are the app's (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"; display hit.rs `row`), the quick row shut with them. The new state, or None with no app in front (the display's refusal, status 3: its word on what is in front, not the map's).
+    /// Deck's swipe with an app in front (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls"): the app in front full screen or not (display op 43, as the quick row's middle circle switches it), the kist staying in front. Full screen hides ferros's controls (the console, the helm, the app's circle); the helm's wedges stay the system's on the hit map, undrawn, so this same swipe brings them back, and the console's rows are the app's (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"; display hit.rs `row`), the quick row shut with them. The new state, or None with no app in front (the display's refusal, status 3: its word on what is in front, not the map's).
     fn full_switch(&mut self) -> Option<bool> {
         let mut r = [0u8; 4];
         let n = call(self.display, &[43], &mut r);
         (n >= 2 && n != ferros_sys::ERR && r[0] == 0).then_some(r[1] == 1)
     }
 
-    /// Home's swipe on the home screen (owner, 2026-11-11: "on the home screen it auto-fits"): the plane flies out to every circle at the turn that fits them largest (`home_turned`), an open circle closing on the way as a tap outside it does.
-    fn home_fly(&mut self) {
+    /// Deck's swipe on the deck (owner, 2026-11-11: "on the home screen it auto-fits"): the plane flies out to every circle at the turn that fits them largest (`deck_turned`), an open circle closing on the way as a tap outside it does.
+    fn deck_fly(&mut self) {
         if matches!(self.view, View::Open(_)) {
             self.back = None;
             self.leaving = true;
         }
-        let to = self.home_turned();
+        let to = self.deck_turned();
         self.fly(to);
         self.draw();
     }
 
-    /// A still tap on the helm (WINDOWS.md "The helm"; owner, 2026-11-11). Home (8): the app in front behind, the map as it was left; with the map on the glass, an open circle closes. Back (9): Escape to the app in front ("back should signal escape to the app and go up one page"; at its main page it does nothing more, never leaving the kist); with the map on the glass, a level back (`back_step`). Never a tap on what lies under the corner.
+    /// A still tap on the helm (WINDOWS.md "The helm"; owner, 2026-11-11). Deck (8): the app in front behind, the map as it was left; with the map on the glass, an open circle closes. Back (9): Escape to the app in front ("back should signal escape to the app and go up one page"; at its main page it does nothing more, never leaving the kist); with the map on the glass, a level back (`back_step`). Never a tap on what lies under the corner.
     fn helm_tap(&mut self, corner: u8) -> &'static str {
         if corner == 8 {
             if self.send_behind(true) {
-                return "map: home: the app in front behind";
+                return "map: deck: the app in front behind";
             }
             if matches!(self.view, View::Open(_)) {
-                let to = self.back.take().unwrap_or_else(|| self.home());
+                let to = self.back.take().unwrap_or_else(|| self.deck_fit());
                 self.leaving = true;
                 self.fly(to);
                 self.draw();
-                return "map: home: the open circle closed";
+                return "map: deck: the open circle closed";
             }
-            return "map: home: the map already";
+            return "map: deck: the map already";
         }
         if self.app_front {
             if ferros_sys::window::key(self.display, ferros_sys::window::KEY_ESCAPE).is_some() {
@@ -4660,7 +4660,7 @@ impl Map {
             (1, View::Open(_)) => {
                 if !inside {
                     // Back to the plane: the page shrinks with the circle as the camera flies back to the view it was opened from (a circle open since the start has none: every circle in view), and the view is the plane once it lands (`step_cam`).
-                    let to = self.back.take().unwrap_or_else(|| self.home());
+                    let to = self.back.take().unwrap_or_else(|| self.deck_fit());
                     self.leaving = true;
                     self.fly(to);
                     self.draw();
@@ -4755,8 +4755,8 @@ impl Map {
                         self.draw();
                         self.fleet.add_op(cap(self.grants, S_FGTW), &[14, 0]);
                     }
-                    Some(Choice::HomeSync) => {
-                        let on = self.fleet.home.is_some_and(|h| h.0);
+                    Some(Choice::DeckSync) => {
+                        let on = self.fleet.deck.is_some_and(|h| h.0);
                         self.fleet.add_op(cap(self.grants, S_FGTW), &[18, !on as u8]);
                     }
                     Some(Choice::FleetRemove) => {
@@ -4907,7 +4907,7 @@ impl Map {
                             }
                         }
                     }
-                    // Unstow in two taps (as "remove this device"; a puck's "remove from the home screen" the same): the first arms it, the second asks the installer (op 4), which takes it out of the person's list, keeps its answers and drops its capsule; its circle goes when the job is done, and the card with it.
+                    // Unstow in two taps (as "remove this device"; a puck's "remove from the deck" the same): the first arms it, the second asks the installer (op 4), which takes it out of the person's list, keeps its answers and drops its capsule; its circle goes when the job is done, and the card with it.
                     Some(Choice::Unstow(k)) => {
                         if self.unstow_armed == Some(k) {
                             self.unstow_armed = None;
@@ -4988,7 +4988,7 @@ impl Map {
                                 }
                             }
                             if self.save_kists() {
-                                let to = self.back.take().unwrap_or_else(|| self.home());
+                                let to = self.back.take().unwrap_or_else(|| self.deck_fit());
                                 self.leaving = true;
                                 self.fly(to);
                                 self.launch(i);
@@ -5161,7 +5161,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         console(grants, l.as_str().as_bytes());
     }
     map.send_scene();
-    map.cam = map.home();
+    map.cam = map.deck_fit();
     if map.load_view() {
         console(grants, b"map: the view as it was left\n");
     }
@@ -5189,7 +5189,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     map.draw();
     // Nothing is in focus (display op 25, icon 0): a display that outlived an older map, one with widgets that took focus, would otherwise keep redrawing one at the panel's rate.
     call(display, &[25, 0, 0, 0, 0, 0, 0], &mut r);
-    // A development build can time the frame loop without a finger (FERROS_MAP_START=bench): 32 frames of a pinch with a twist, then 32 of a pan, each the whole round trip to the display server; the averages to the console, then the camera back home.
+    // A development build can time the frame loop without a finger (FERROS_MAP_START=bench): 32 frames of a pinch with a twist, then 32 of a pan, each the whole round trip to the display server; the averages to the console, then the camera back at rest.
     // FERROS_MAP_START=ipc: the bare cost of a round trip to each server (64 trivial calls each: display info, touch info).
     if option_env!("FERROS_MAP_START") == Some("ipc") {
         for (name, ep, op) in [("display", display, 5u8), ("touch", touch, 2u8)] {
@@ -5229,7 +5229,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         map.draw();
     }
-    // FERROS_MAP_START=zoom (development, measuring the scene while it grows): two seconds after start, 128 display frames (held four seconds at the largest, for a capture) of a pinch with a twist from the home view, the settings circle and its mark growing past the screen, each frame drawn moving and paced by the panel (op 24), then the view back home at rest; the frames the panel showed to the console.
+    // FERROS_MAP_START=zoom (development, measuring the scene while it grows): two seconds after start, 128 display frames (held four seconds at the largest, for a capture) of a pinch with a twist from the deck's view, the settings circle and its mark growing past the screen, each frame drawn moving and paced by the panel (op 24), then the view back at rest; the frames the panel showed to the console.
     if matches!(option_env!("FERROS_MAP_START"), Some("zoom") | Some("zoomcrowd")) {
         // zoomcrowd: with the crowd's 200 circles too (a busy screen drawn whole every frame).
         if option_env!("FERROS_MAP_START") == Some("zoomcrowd") {
@@ -5263,8 +5263,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         map.cam = home;
         map.draw();
     }
-    console(grants, b"map: home drawn; a tap on a circle opens it\n");
-    // FERROS_MAP_START=crowd: 200 more circles in the display's scene only (never the vault), for timing a busy home screen.
+    console(grants, b"map: deck drawn; a tap on a circle opens it\n");
+    // FERROS_MAP_START=crowd: 200 more circles in the display's scene only (never the vault), for timing a busy deck.
     if option_env!("FERROS_MAP_START") == Some("crowd") {
         let placed = map.crowd(200);
         let mut l = Line::new();
@@ -5290,13 +5290,13 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut down = false;
     let mut most = 0usize;
     let mut moved = false;
-    // A session that began on one of the helm's corner circles (the display's op 41: 8 home, 9 back; 0 none), and where its first finger is now: the system's gesture, never a pan (owner, 2026-11-07: from the home circle to the centre and let go, full screen on or off).
+    // A session that began on one of the helm's corner circles (the display's op 41: 8 deck, 9 back; 0 none), and where its first finger is now: the system's gesture, never a pan (owner, 2026-11-07: from the deck circle to the centre and let go, full screen on or off).
     let mut corner = 0u8;
     let mut corner_at = (0i64, 0i64);
     // Where that finger landed, and whether the corner has acted this touch.
     let mut corner_from = (0i64, 0i64);
     let mut corner_done = false;
-    // Two fingers on back and home together (development builds): 0 not looked at yet this touch, 1 they are, 2 they are not; and whether their swipe up has switched the hit map this touch.
+    // Two fingers on back and deck together (development builds): 0 not looked at yet this touch, 1 they are, 2 they are not; and whether their swipe up has switched the hit map this touch.
     let mut pair = 0u8;
     let mut pair_done = false;
     // The quick row (quick.rs): its pull, physics and actions; and whether the session's finger landed in its doorway by the camera (a still tap there opens or shuts it).
@@ -5605,7 +5605,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             offer_seen = offer;
         }
 
-        // The person's identity space (fgtw op 17's generation, in the copy), on the plane with nothing held: a new generation means the identity service wrote this device's kists or home screen from the person's fleet (a reset device getting its arrangement back, a move made on another of their devices), and the circles are read again. Generation 0 is nothing written yet; a map started after a write reads it once more, which changes nothing.
+        // The person's identity space (fgtw op 17's generation, in the copy), on the plane with nothing held: a new generation means the identity service wrote this device's kists or deck from the person's fleet (a reset device getting its arrangement back, a move made on another of their devices), and the circles are read again. Generation 0 is nothing written yet; a map started after a write reads it once more, which changes nothing.
         if map.view == View::Map && !down && !map.settling {
             if let Some(g) = map.fleet.space_gen.filter(|&g| g != space_seen) {
                 space_seen = g;
@@ -5750,7 +5750,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.panned = false;
             map.pan = None;
             map.settling = map.target.is_some();
-            // Where the first finger landed: on the home or back circle, the session is the corner's.
+            // Where the first finger landed: on the deck or back circle, the session is the corner's.
             let f = cur[ids[0]];
             let mut q = [0u8; 8];
             let (xb, yb) = ((f.1 as u16).to_le_bytes(), (f.2 as u16).to_le_bytes());
@@ -5854,7 +5854,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     qr.drag(fy, frame_count);
                 }
             }
-            // Two fingers swiped up from back and home together (owner, 2026-11-11: "Quick shortcut in dev only is swipe up from both back and home to toggle on/off"): the display's hit map in every fourth frame, once a touch. The second finger's landing is asked of the display as the first's was (op 41); while the two are a pair the corner's own swipe does nothing.
+            // Two fingers swiped up from back and deck together (owner, 2026-11-11: "Quick shortcut in dev only is swipe up from both back and home to toggle on/off"): the display's hit map in every fourth frame, once a touch. The second finger's landing is asked of the display as the first's was (op 41); while the two are a pair the corner's own swipe does nothing.
             if DEV && (corner == 8 || corner == 9) && held >= 2 && pair == 0 {
                 pair = 2;
                 if let Some(&id) = ids[..held].iter().find(|&&id| (start[id].1, start[id].2) != corner_from) {
@@ -5879,7 +5879,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             if (corner == 8 || corner == 9) && held >= 1 && pair != 1 {
                 corner_at = (cur[ids[0]].1, cur[ids[0]].2);
-                // The swipe inward: the finger's travel along the line from where it landed toward the screen's centre. Past a twelfth of the screen's harmonic span (2wh/(w+h); owner, 2026-11-07), the corner acts, once a touch (WINDOWS.md "The helm"): home, the app in front full screen or not, or with none out to every circle turned to fit; back, the kist before.
+                // The swipe inward: the finger's travel along the line from where it landed toward the screen's centre. Past a twelfth of the screen's harmonic span (2wh/(w+h); owner, 2026-11-07), the corner acts, once a touch (WINDOWS.md "The helm"): deck, the app in front full screen or not, or with none out to every circle turned to fit; back, the kist before.
                 let (ux, uy) = ((w / 2 - corner_from.0) as f64, (h / 2 - corner_from.1) as f64);
                 let inward = ((corner_at.0 - corner_from.0) as f64 * ux + (corner_at.1 - corner_from.1) as f64 * uy) / libm::sqrt(ux * ux + uy * uy);
                 let span = (2 * w * h) as f64 / (w + h) as f64;
@@ -5888,18 +5888,18 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 map.helm_light(corner, lvl as f32);
                 if !corner_done && inward > span / 12. {
                     corner_done = true;
-                    // The helm's swipes (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls. on the home screen it auto-fits"; "Can't hide controls on home screen"). Home's: with an app in front, its full screen on or off (`full_switch`; the kist stays in front, where until then this swipe sent it behind first); with none, the plane flies out to every circle at the turn that fits them largest ("so it spins into place"), the controls always shown there. The display's answer decides which, not `app_front`. Back's: a flip to the kist before (this one behind). The quick row's middle circle switches full screen too.
+                    // The helm's swipes (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls. on the home screen it auto-fits"; "Can't hide controls on home screen"). Deck's: with an app in front, its full screen on or off (`full_switch`; the kist stays in front, where until then this swipe sent it behind first); with none, the plane flies out to every circle at the turn that fits them largest ("so it spins into place"), the controls always shown there. The display's answer decides which, not `app_front`. Back's: a flip to the kist before (this one behind). The quick row's middle circle switches full screen too.
                     let said = if corner == 8 {
                         match map.full_switch() {
                             Some(true) => {
                                 // The quick row goes with the console (`quick::Quick::shut`).
                                 qr.shut();
-                                "map: home: full screen, the controls hidden"
+                                "map: deck: full screen, the controls hidden"
                             }
-                            Some(false) => "map: home: full screen off, the controls shown",
+                            Some(false) => "map: deck: full screen off, the controls shown",
                             None => {
-                                map.home_fly();
-                                "map: home: every circle in view, turned to fit them largest"
+                                map.deck_fly();
+                                "map: deck: every circle in view, turned to fit them largest"
                             }
                         }
                     } else {
@@ -5917,7 +5917,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             if corner == 8 || corner == 9 {
                 map.helm_light(corner, 0.0);
             }
-            // A corner's session let go: it acted while moving (above), if it went far enough inward. A still tap is each place's own (below): the helm's home and back, a console circle's, the quick row's.
+            // A corner's session let go: it acted while moving (above), if it went far enough inward. A still tap is each place's own (below): the helm's deck and back, a console circle's, the quick row's.
             let mut tap_thru = !moved;
             // The quick row's sessions end here (QUICK.md): a still tap in the doorway opens or shuts the row, any other pull settles by halving; a quick circle acts (or its turn is kept); behind the row the touch already shut it and goes no further. A console circle tapped still: a radio switches (preference 15), any other opens its page; dragged in it already opened its page; dragged elsewhere nothing.
             match corner {
@@ -5956,7 +5956,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     }
                 }
                 quick::NOTHING => tap_thru = false,
-                // The helm tapped still: home or back (`helm_tap`), with an app in front as on the map. Two fingers on back and home together are the hit map's pair (development builds), never a tap.
+                // The helm tapped still: deck or back (`helm_tap`), with an app in front as on the map. Two fingers on back and deck together are the hit map's pair (development builds), never a tap.
                 8 | 9 => {
                     tap_thru = false;
                     if !moved && pair != 1 {

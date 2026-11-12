@@ -4,7 +4,7 @@
 //! - **First, a pull.** Once the device is a member with the fleet key, the space is asked of every fleet device heard (`space_want`) and of fgtw.org (`space_get`). The device's own copy is joined to it only after fgtw.org answered (a space, none, or no slot yet) or a fleet device's copy arrived: before that, a fresh device's empty copy holds nothing of the person, and its defaults (all off) must not go out as their choice.
 //! - **Then every 4 s** the device's copy (kists.list, map.place.*, map.view) is joined to the space (ferros_space::sync): the person's changes here go into the space, the space's into the copy. A change goes to every fleet device heard (`space_push`) and to fgtw.org (pulled, merged, put back, so a sibling's copy there is never written over).
 //! - **Every 64 s** fgtw.org is asked again, for a sibling's change made where this device could not hear it.
-//! - **The map** reads the generation (op 17), bumped whenever the device's copy was written from the space, and reloads its circles; the Fleet page's switch "sync this device's home screen" is op 18.
+//! - **The map** reads the generation (op 17), bumped whenever the device's copy was written from the space, and reloads its circles; the Fleet page's switch "sync this device's deck" is op 18.
 //! - **The person's zone** (ferros_space `ZONE`; owner, 2026-11-10: "it's per identity, you can uncheck and set per device tho"): chosen on the clock page of a device that follows it (op 22), and written to the kernel (SYS_ZONE op 4) at every join where it changed, never read back from the kernel (settings flow identity to device only). Whether this device follows it is the device's own switch, kept by the kernel.
 //! - **The person's language** (ferros_space `LANG`), as the zone: chosen on the language page of a device that follows it (op 23), written to the kernel (SYS_LANG op 2) at every join where it changed, never read back.
 //! - **Do not disturb** (ferros_space `DND`; owner, 2026-11-11: "a fleet/identity preference so it follows the person"): switched on the quick row of any device (op 24), written to the kernel (preference 40) at every join where it changed, never read back. No device keeps its own.
@@ -200,7 +200,7 @@ impl Client {
             self.log.put(b" fact(s)");
             self.log.line();
             self.space_keep();
-            // Joined at once, not at the next tick: a reset device puts the person's home screen back as soon as it has it.
+            // Joined at once, not at the next tick: a reset device puts the person's deck back as soon as it has it.
             self.space.last_local_us = 0;
         }
         Some(digest)
@@ -362,7 +362,7 @@ impl Client {
         if eagle() == 0 {
             if !self.space.said_clock {
                 self.space.said_clock = true;
-                self.log.put(b"fgtw: space: no wall clock yet; the home screen syncs once there is one");
+                self.log.put(b"fgtw: space: no wall clock yet; the deck syncs once there is one");
                 self.log.line();
             }
             return;
@@ -380,8 +380,8 @@ impl Client {
                     self.space.generation = self.space.generation.wrapping_add(1);
                     self.log.put(b"fgtw: space: ");
                     self.log.dec(o.wrote as u64);
-                    self.log.put(b" write(s) to this device's kists and home screen from the fleet's:");
-                    for (k, name) in [b"kist".as_slice(), b"answer", b"default", b"place", b"view", b"home sync", b"departure"].iter().enumerate() {
+                    self.log.put(b" write(s) to this device's kists and deck from the fleet's:");
+                    for (k, name) in [b"kist".as_slice(), b"answer", b"default", b"place", b"view", b"deck sync", b"departure"].iter().enumerate() {
                         if o.kinds >> k & 1 == 1 {
                             self.log.put(b" ");
                             self.log.put(name);
@@ -511,11 +511,11 @@ impl Client {
         }
     }
 
-    /// Op 17 → [generation u32 LE][this device's home-screen sync u8][the first pull done u8][facts u16 LE].
+    /// Op 17 → [generation u32 LE][this device's deck sync u8][the first pull done u8][facts u16 LE].
     pub fn space_reply(&self) -> [u8; 8] {
         let mut r = [0u8; 8];
         r[..4].copy_from_slice(&self.space.generation.to_le_bytes());
-        r[4] = ferros_space::home_sync(&self.space.space, &self.me) as u8;
+        r[4] = ferros_space::deck_sync(&self.space.space, &self.me) as u8;
         r[5] = self.space.settled as u8;
         // WHY the cap: two bytes on the wire; a space past 65535 facts is not one this page lists.
         r[6..8].copy_from_slice(&(self.space.space.entries().len().min(u16::MAX as usize) as u16).to_le_bytes());
@@ -641,14 +641,14 @@ impl Client {
         0
     }
 
-    /// Op 18 [on]: this device's home screen follows the fleet's (1) or keeps its own (0). Refused (1) before the first pull: the switch is a fact of the person's space, and a fresh device's copy of it is not yet theirs.
+    /// Op 18 [on]: this device's deck follows the fleet's (1) or keeps its own (0). Refused (1) before the first pull: the switch is a fact of the person's space, and a fresh device's copy of it is not yet theirs.
     pub fn space_switch(&mut self, on: bool) -> u8 {
         if self.space_ready().is_none() || !self.space.settled {
             return 1;
         }
         let me = self.me;
-        if ferros_space::set_home_sync(&mut self.space.space, &me, on, eagle()) {
-            self.log.put(if on { b"fgtw: space: this device's home screen follows the fleet's".as_slice() } else { b"fgtw: space: this device keeps a home screen of its own" });
+        if ferros_space::set_deck_sync(&mut self.space.space, &me, on, eagle()) {
+            self.log.put(if on { b"fgtw: space: this device's deck follows the fleet's".as_slice() } else { b"fgtw: space: this device keeps a deck of its own" });
             self.log.line();
             self.space_keep();
             self.space_join();

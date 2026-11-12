@@ -655,7 +655,7 @@ fn status_text(kind: BootKind, generation: u64, probe: Option<&VaultProbe>) -> a
 /// The service loop's vault, lent to `SYS_SPAWN` (process.rs `CAPSULES`) for reading capsules by key: `run` never returns, so the pointer stays good for the rest of the boot.
 static mut SPAWN_STORE: *mut Option<ShimStore> = core::ptr::null_mut();
 
-/// Android from within ferros, behind an attest (owner, 2026-11-01 and 2026-11-04: "launch Android from within ferros so it's gated behind an attest", from the home screen). The device's opt-in, the vault's device-class `android.allowed` (one byte, 1), as the service loop read it at start: 2 allowed, 1 not, 0 not read yet (SYS_FACTS 82, so the map shows the Android circle only on a device that allows it). Written by the opt-in (the disclaimer, next) and for now from the host.
+/// Android from within ferros, behind an attest (owner, 2026-11-01 and 2026-11-04: "launch Android from within ferros so it's gated behind an attest", from the deck). The device's opt-in, the vault's device-class `android.allowed` (one byte, 1), as the service loop read it at start: 2 allowed, 1 not, 0 not read yet (SYS_FACTS 82, so the map shows the Android circle only on a device that allows it). Written by the opt-in (the disclaimer, next) and for now from the host.
 pub static ANDROID_ALLOWED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// A launch the `android` switch accepted, for the service loop's next pass.
 static ANDROID_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -1378,7 +1378,7 @@ enum SensorBoot {
     Done,
 }
 
-/// The AoC starts no sooner than this long after the service loop does: the home screen first.
+/// The AoC starts no sooner than this long after the service loop does: the deck first.
 const SENSORS_AFTER_S: u64 = 4;
 
 /// One step of the AoC's start; what it said goes to the flash log.
@@ -2310,7 +2310,7 @@ pub fn run(mut b: Boot) -> ! {
             ipc_marked = true;
             crate::checklist::mark(crate::checklist::Item::Ipc);
         }
-        // The AoC's start, when the `sensors` switch has asked for it and the boot's first seconds are past (the home screen first).
+        // The AoC's start, when the `sensors` switch has asked for it and the boot's first seconds are past (the deck first).
         if matches!(sensor_boot, SensorBoot::Done) && now.wrapping_sub(t_boot) > SENSORS_AFTER_S * freq && crate::sensorlink::START.swap(false, core::sync::atomic::Ordering::Relaxed) {
             // After the jump from a running Android (gate answer 6) the AoC, GSA and Trusty are still in Android's session, and this start knows only the cold path: the fourth jump's service loop stopped feeding the watchdog once sensors asked (APC watchdog, 2026-11-01). Left alone until a restart path exists; the sensors process gives up after its wait.
             if crate::platform::jumped() {

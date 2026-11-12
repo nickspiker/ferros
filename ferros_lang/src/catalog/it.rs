@@ -165,9 +165,9 @@ pub fn text(m: Msg) -> &'static str {
         Msg::TagDenied => "Negato. Questo tag non apre questo dispositivo.",
         // ---- Fleet: ferros's own lines ----
         Msg::FleetServiceNotRunning => "il servizio di identità non è in esecuzione",
-        Msg::HomeFetching => "schermata home: recupero della tua dalla flotta",
-        Msg::HomeSame => "schermata home: la stessa su tutti i tuoi dispositivi",
-        Msg::HomeOwn => "schermata home: quella propria di questo dispositivo",
+        Msg::DeckFetching => "ponte: recupero del tuo dalla flotta",
+        Msg::DeckSame => "ponte: lo stesso su tutti i tuoi dispositivi",
+        Msg::DeckOwn => "ponte: quello proprio di questo dispositivo",
         Msg::RemoveNote => "cancella da questo dispositivo: la disposizione della mappa,\nle reti WiFi, l’ultima posizione; non viene salvato",
         // ---- Power ----
         Msg::ProximityWake => "risveglio di prossimità",
@@ -257,7 +257,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::NotStowed => "non riposto",
         Msg::UncheckedDevOnly => "codice non verificato, solo build di sviluppo",
         Msg::AsksAtFirstStart => "li chiede una volta, al primo avvio",
-        // ---- Items ----
+        // ---- Deck ----
         Msg::KindKist => "kist",
         Msg::KindPuck => "puck",
         Msg::Pandok => "pandok",
@@ -276,7 +276,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Unstow => "togli",
         Msg::TapAgainUnstow => "tocca di nuovo: togli",
         Msg::AnswersKept => "le sue risposte restano per quando lo riporrai di nuovo",
-        Msg::RemoveFromHome => "togli dalla schermata home",
+        Msg::RemoveFromDeck => "togli dal ponte",
         Msg::TapAgainRemove => "tocca di nuovo: togli",
         Msg::Shows => "mostra",
         Msg::TheTime => "l’ora",
