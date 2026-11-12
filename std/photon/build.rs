@@ -1,5 +1,7 @@
 fn main() {
-    // A 128 MiB heap (ferros_rt/ferros.ld's __ferros_heap): the fonts, the frame, the chains and the vault cache; the arc lands in the kernel's big pool.
-    // At G2t16 the frames take ≈ 100 MB; the heap really has ≈ 156 MiB, since the arc rounds the ≈ 100 MiB development image plus this up to 256 MiB and ferros_rt's allocator takes the slack. Declaring more buys nothing inside that arc and only spends the image's room to grow before the arc doubles to 512 MiB (the whole big pool, cachemap POOL_BIG).
-    println!("cargo:rustc-link-arg=--defsym=__ferros_heap=0x8000000");
+    // The heap's ceiling (ferros_rt/ferros.ld's __ferros_heap; since 2026-11-11 a ceiling the arc grows to on demand, ARCS.md step 2, never a reservation: the kernel maps a few MiB at spawn and ferros_rt's allocator asks for more as it runs out).
+    // 2^29 = 512 MiB (2026-11-12). The 128 MiB before was sized when the arc was fixed, and it ended Photon's first start on the Pro: the arc grew to G#BA00000 and the next allocation, 32169984 bytes (one 1344 x 2992 frame at G2t16's 8 bytes a pixel), passed the ceiling before the first frame was shown.
+    // Measured with photon's examples/ferros_heap.rs (PhotonApp driven as fluor's ferros host drives it at the Pro's 1344 x 2992, a counting allocator under it, no identity, as a device starts): a peak of 142.6 MiB at the first screen, steady after the first frame. Of it: the host's scratch at G2t16 (30.7) and clip mask (3.8), the only frame the host keeps; the chrome's two full-screen layers at G2t16 (bg and chrome, 61.4) and its hit map (u16, 7.7); the background noise field (15.4); Photon's status queue (sync_channel of 2^14, 7.3); the text renderer's fonts (10.3). On ferros each thread's stack comes from the heap too: 79 threads of 256 KiB, about 20 MiB more, so about 163 MiB before a person is in.
+    // Past that a conversation's decoded pictures are 8 bytes a pixel (a 12 MP photo is 92 MiB), and a beam adds its codecs' frames; 2^28 would leave room for one such picture, 2^29 for several. A ceiling costs nothing it does not use.
+    println!("cargo:rustc-link-arg=--defsym=__ferros_heap={}", 1u64 << 29);
 }
