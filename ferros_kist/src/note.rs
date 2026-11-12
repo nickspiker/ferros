@@ -48,6 +48,43 @@ pub struct Note {
     pub posted: Option<i64>,
 }
 
+/// What the system sees of a note's poster, for `decide`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Poster {
+    /// The system's own note (an alarm the person set, the development command).
+    System,
+    /// A kist: whether it holds the network (`udp`: a person's words reach a kist only over a link).
+    Kist { network: bool },
+}
+
+/// The kind a note gets (docs/NOTIFY.md "Who decides the kind"): the kind asked for, lowered to what the system can see, never raised. The system's own: as asked. A kist's: never live yet (a beam is live once the system's beam path says one is open, an alarm once the person set it thru the system; neither is built), personal when it names a person and the kist holds the network, else status.
+pub fn decide(asked: u8, names_person: bool, poster: Poster) -> u8 {
+    let ceiling = match poster {
+        Poster::System => LIVE,
+        Poster::Kist { network: true } if names_person => PERSONAL,
+        Poster::Kist { .. } => STATUS,
+    };
+    asked.min(ceiling)
+}
+
+/// The lowest note number free among a kist's (bit k of `used` set: number k is taken), or None when all `WAITING` are.
+pub fn free_number(used: u16) -> Option<u8> {
+    let free = (!used).trailing_zeros();
+    // WHY the bound: `!used` of a full mask is zero, whose trailing zeros are 16, past every number.
+    (free < WAITING as u32).then_some(free as u8)
+}
+
+/// Whether a circle at (`cx`, `cy`), radius `r` (panel pixels, as the resting view showed it) is in view (docs/NOTIFY.md "The resting view"): its disc meets the screen's rectangle, `w` by `h`. The screen's nearest point to the centre is the centre held to the rectangle (the nearest point's definition, not a guard).
+pub fn in_view(cx: i64, cy: i64, r: i64, w: i64, h: i64) -> bool {
+    let (nx, ny) = (cx.clamp(0, w), cy.clamp(0, h));
+    (cx - nx) * (cx - nx) + (cy - ny) * (cy - ny) <= r * r
+}
+
+/// A kist's notes waiting at once: a note's number is a nibble.
+pub const WAITING: usize = 1 << 4;
+/// A kist's posts between two looks from the person (a revision of a waiting note counts too).
+pub const POSTS: u16 = 1 << 6;
+
 fn schema() -> SectionSchema {
     SectionSchema::new(SECTION)
         .field("kind", TypeConstraint::AnyUnsigned)
@@ -174,6 +211,45 @@ mod tests {
         let doc = build(&n, 1 << 42).unwrap();
         assert!(doc.len() <= MAX);
         assert_eq!(parse(&doc).unwrap(), n);
+    }
+
+    #[test]
+    fn a_kist_lowers_never_raises() {
+        // The system: as asked.
+        for asked in [STATUS, PERSONAL, LIVE] {
+            assert_eq!(decide(asked, false, Poster::System), asked);
+        }
+        // A kist asking live: personal at most, and only naming a person with the network.
+        assert_eq!(decide(LIVE, true, Poster::Kist { network: true }), PERSONAL);
+        assert_eq!(decide(LIVE, true, Poster::Kist { network: false }), STATUS);
+        assert_eq!(decide(LIVE, false, Poster::Kist { network: true }), STATUS);
+        assert_eq!(decide(PERSONAL, false, Poster::Kist { network: true }), STATUS);
+        // Lowering is always the kist's.
+        assert_eq!(decide(STATUS, true, Poster::Kist { network: true }), STATUS);
+    }
+
+    #[test]
+    fn in_view_is_the_disc_meeting_the_screen() {
+        let (w, h) = (1080, 2400);
+        // Inside, and straddling an edge.
+        assert!(in_view(540, 1200, 100, w, h));
+        assert!(in_view(-50, 1200, 100, w, h));
+        // Wholly off one side.
+        assert!(!in_view(-101, 1200, 100, w, h));
+        assert!(!in_view(540, 2501, 100, w, h));
+        // Near a corner: the box would meet it, the disc does not (70.7 from the corner's diagonal at 71 each way, radius 100).
+        assert!(!in_view(-71, -71, 100, w, h));
+        assert!(in_view(-70, -70, 100, w, h));
+        // A huge circle around the whole screen.
+        assert!(in_view(540, 1200, 1 << 20, w, h));
+    }
+
+    #[test]
+    fn numbers_by_count() {
+        assert_eq!(free_number(0), Some(0));
+        assert_eq!(free_number(0b1011), Some(2));
+        assert_eq!(free_number(0x7FFF), Some(15));
+        assert_eq!(free_number(0xFFFF), None);
     }
 
     #[test]

@@ -55,9 +55,7 @@ impl Map {
     pub fn in_view(&self, i: usize) -> bool {
         let (sx, sy) = self.rest.screen(self.w, self.h, self.xs[i], self.ys[i]);
         let sr = (self.rs[i] * self.rest.z) >> 16;
-        // The screen's nearest point to the circle's centre: the centre itself held to the rectangle (the nearest point's definition, not a guard).
-        let (nx, ny) = (sx.clamp(0, self.w), sy.clamp(0, self.h));
-        (sx - nx) * (sx - nx) + (sy - ny) * (sy - ny) <= sr * sr
+        ferros_kist::note::in_view(sx, sy, sr, self.w, self.h)
     }
 
     /// The notes' bell rang (or a deadline passed): the list read, the glows and the Deck button follow it, a personal note new in view taps once, a live one takes the screen.

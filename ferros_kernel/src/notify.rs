@@ -6,12 +6,7 @@
 //! - **Counts, never time:** a kist has at most `WAITING` notes waiting, and posts at most `POSTS` between two looks from the person (`seen` gives its budget back). Past either, a post is refused (NOTHING) until the person has looked.
 //! - **A deadline** is the kist's (one a note): a note past it goes as if withdrawn, at the next op. The deck waits for the earliest one as for an alarm (its watch's deadline), then lists, which drops it here and rings.
 use super::*;
-use ferros_kist::note::{self, Note, LIVE, PERSONAL, STATUS};
-
-/// A kist's notes waiting at once (a sixteenth of a byte's numbers: a note's number is 0 to 15).
-pub const WAITING: usize = 1 << 4;
-/// A kist's posts between two looks from the person (a revision of a waiting note counts too).
-pub const POSTS: u16 = 1 << 6;
+use ferros_kist::note::{self, Note, Poster, LIVE, PERSONAL, POSTS, STATUS, WAITING};
 /// A record of op 3: [source 32][number u8][kind u8][asked u8][flags u8: bit 0 names a person, bit 1 has a target][count u32 LE][seq u64 LE, the notes' bell count it was posted at][deadline i64 LE, Eagle oscillations, 0 none].
 pub const REC: usize = 56;
 /// The vault prefix (kvault `IDENTITY`): reserved (NUL first), so no process's store scope reaches it, and identity class.
@@ -132,14 +127,12 @@ fn holds_endpoint(p: &Process, name: &[u8]) -> bool {
     p.cspace.iter().any(|c| c.object == Object::Endpoint(e) && c.rights & RIGHT_SEND != 0)
 }
 
-/// The kind a note gets (docs/NOTIFY.md "Who decides the kind"): what the kist asked for, lowered to what the system sees, never raised. The system's own (`kist` None): as asked. A kist's: live never yet (a beam is live because the system's beam path says a beam is open, an alarm because the person set it thru the system; neither is built, so no kist rings), personal when it names a person and holds the network, else status.
-fn decide(asked: u8, n: &Note, kist: Option<&Process>) -> u8 {
-    let ceiling = match kist {
-        None => LIVE,
-        Some(p) if n.person.is_some() && holds_endpoint(p, b"udp") => PERSONAL,
-        Some(_) => STATUS,
-    };
-    asked.min(ceiling)
+/// What the system sees of a note's poster (ferros_kist::note `decide` lowers the kind by it): the system's own (`kist` None), or a kist and whether it holds the network.
+fn poster(kist: Option<&Process>) -> Poster {
+    match kist {
+        None => Poster::System,
+        Some(p) => Poster::Kist { network: holds_endpoint(p, b"udp") },
+    }
 }
 
 /// Post `doc` for `source`: a kist's note (`kist` its process) or the system's (None). The number | the kind decided << 8; NOTHING when nobody is present or the kist is at a count; ERR for a document that is not a note.
@@ -154,7 +147,7 @@ fn post(source: [u8; 32], doc: &[u8], kist: Option<&Process>) -> u64 {
         return NOTHING;
     }
     let asked = n.kind;
-    n.kind = decide(asked, &n, kist);
+    n.kind = note::decide(asked, n.person.is_some(), poster(kist));
     n.asked = Some(asked);
     n.source = Some(source);
     n.posted = Some(crate::settings::eagle_now());
@@ -164,16 +157,15 @@ fn post(source: [u8; 32], doc: &[u8], kist: Option<&Process>) -> u64 {
     let number = match same {
         Some(i) => list[i].note.number.unwrap(),
         None => {
-            let mut used = 0u32;
+            let mut used = 0u16;
             for k in list.iter().filter(|k| k.note.source == Some(source)) {
                 used |= 1 << k.note.number.unwrap();
             }
-            // WHY the bound: a note's number is a nibble (WAITING); a kist with every number in use has its count of notes waiting.
-            let free = (!used).trailing_zeros() as usize;
-            if free >= WAITING {
-                return NOTHING;
+            // Every number in use: the kist has its count of notes waiting.
+            match note::free_number(used) {
+                Some(n) => n,
+                None => return NOTHING,
             }
-            free as u8
         }
     };
     n.number = Some(number);
