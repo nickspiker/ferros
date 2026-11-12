@@ -198,79 +198,18 @@ impl Udp {
         let n = self.call(&[3], &mut out);
         (n >= 51 && n != ERR).then_some(out[50])
     }
-    /// The A record for `host` from the DHCP-given DNS server (payloads/httptest's resolver), or None.
+    /// `host`'s IPv4 address from ip's resolver (op 10 RESOLVE, the device's one cache; the call held until the lookup ends, 16 s at most), or None (nobody present, no route or server, no such name, no answer).
     fn resolve(&self, host: &[u8]) -> Option<[u8; 4]> {
-        let mut info = [0u8; 64];
-        let n = self.call(&[3], &mut info);
-        if n < 55 || n == ERR || info[50] & 1 == 0 || info[51..55] == [0; 4] {
+        let mut q = Vec::with_capacity(3 + host.len());
+        q.extend_from_slice(&[10, 4, 1 << 4]);
+        q.extend_from_slice(host);
+        let mut r = [0u8; 22];
+        let n = self.call(&q, &mut r);
+        // Status 0, found: the family and the address follow (an empty reply: nobody present).
+        if n == ERR || n < 22 || r[0] != 0 || r[1] != 4 {
             return None;
         }
-        let mut q = Vec::with_capacity(300);
-        q.extend_from_slice(&[1, 4]);
-        let mut dst = [0u8; 16];
-        dst[..4].copy_from_slice(&info[51..55]);
-        q.extend_from_slice(&dst);
-        q.extend_from_slice(&53u16.to_be_bytes());
-        q.extend_from_slice(&DNS_PORT.to_be_bytes());
-        let id = (now() as u16) | 1;
-        q.extend_from_slice(&id.to_be_bytes());
-        q.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
-        for label in host.split(|&c| c == b'.') {
-            q.push(label.len() as u8);
-            q.extend_from_slice(label);
-        }
-        q.extend_from_slice(&[0, 0, 1, 0, 1]);
-        let mut r = [0u8; 16];
-        let mut out = [0u8; 1024];
-        for _ in 0..3 {
-            for _ in 0..50 {
-                if self.call(&q, &mut r) == 1 && r[0] != 1 {
-                    break;
-                }
-                ferros_sys::sleep_until(now() + ferros_sys::freq() / 500);
-            }
-            let t = now();
-            while now() - t < ferros_sys::freq() {
-                let n = self.call(&[2, (DNS_PORT >> 8) as u8, DNS_PORT as u8], &mut out);
-                if n == 0 || n == ERR || n < 33 {
-                    ferros_sys::sleep_until(now() + ferros_sys::freq() / 500);
-                    continue;
-                }
-                let m = &out[21..(n as usize).min(out.len())];
-                // WHY the sender's check: the answer is the network's; only the server asked, from port 53, answers this question (anyone on the network can send to the port).
-                if m[0..2] != id.to_be_bytes() || out[0] != 4 || out[1..17] != dst || out[17..19] != 53u16.to_be_bytes() {
-                    continue;
-                }
-                let skip = |m: &[u8], mut i: usize| -> usize {
-                    while i < m.len() {
-                        if m[i] == 0 {
-                            return i + 1;
-                        }
-                        if m[i] & 0xC0 == 0xC0 {
-                            return i + 2;
-                        }
-                        i += 1 + m[i] as usize;
-                    }
-                    m.len()
-                };
-                let an = u16::from_be_bytes([m[6], m[7]]);
-                let mut i = skip(m, 12) + 4;
-                for _ in 0..an {
-                    i = skip(m, i);
-                    if i + 10 > m.len() {
-                        break;
-                    }
-                    let (ty, len) = (u16::from_be_bytes([m[i], m[i + 1]]), u16::from_be_bytes([m[i + 8], m[i + 9]]) as usize);
-                    i += 10;
-                    if ty == 1 && len == 4 && i + 4 <= m.len() {
-                        return Some([m[i], m[i + 1], m[i + 2], m[i + 3]]);
-                    }
-                    i += len;
-                }
-                return None;
-            }
-        }
-        None
+        Some([r[2], r[3], r[4], r[5]])
     }
 
     /// One HTTP POST of `body` to `/` on `ip:80` (the `ip` process's client TCP, ops 4-7), as (status, body); None when the connection or the exchange fails, or takes longer than 16 s.
@@ -386,7 +325,6 @@ const STORE_PIECE: usize = 4096;
 
 /// The seed (photon docs/peers-are-fgtw.md: peers first, the seed last). Plain HTTP on port 80, which fgtw.org serves (checked 2026-10-28; Claude memories/fgtw_plain_http_for_ferros.md): every call is one POST of a signed VSF document, and every answer is verified and folded here, so the transport carries no trust.
 const SEED_HOST: &[u8] = b"fgtw.org";
-const DNS_PORT: u16 = 53054;
 
 /// fgtw's transport on ferros: one plain-HTTP POST of a request to fgtw.org through the `ip` process (Udp::post), the address resolved once and again after a failure. fgtw (feature `protocol`) builds every request and reads every answer; this only carries bytes.
 struct SeedHttp<'a> {
