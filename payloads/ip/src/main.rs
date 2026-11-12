@@ -3,7 +3,7 @@
 //! Both links stay up; a packet leaves on WiFi when WiFi holds an address of its family, else on the cellular call (owner, 2026-10-29: both up, prefer WiFi; IPv6 preferred, which the apps choose by asking for family 6). Link-scope and multicast traffic (Photon's LAN beacons) stays on WiFi. A TCP connection keeps the link and source it opened on. Everything it originates goes out with TTL and hop limit 63, both families on both links (`HOP`; owner, 2026-10-19 and 2026-10-31).
 //!
 //! Spawn after the WiFi driver serves `wlan` (tools/husky-wifi.sh 14): ferros-bridge spawn ip.bin --name ip --use wlan --serve udp --entropy --use rmnet
-//! Grant slots: 0 console, 1 wlan (use), 2 udp (serve), 3 entropy, 4 rmnet (use; served by the modem driver, payloads/modem: its calls carry CALL_LIVE, so no driver means no cellular link, not a hang).
+//! Grant slots: 0 console, 1 wlan (use), 2 udp (serve), 3 entropy, 4 rmnet (use; served by the modem driver, payloads/modem: its calls carry CALL_LIVE, so no driver means no cellular link, not a hang). WiFi frames go both ways in batches, one call each (`wlan` op 8, payloads/pcie1 `WLAN`: up to 128 KiB of received frames a reply, the frames ip sends batched until the next call, which comes at once), or one frame a call with a driver that has no op 8 (asked in `wifi_up`).
 //!
 //! `udp` requests (first byte):
 //! - 1 SEND: family (4 or 6), address (16 bytes; IPv4 in the first 4), destination port (u16 BE), source port (u16 BE), payload → [0] sent, [1] resolving the next hop (retry), [2] no address yet, [3] bad request.
@@ -24,11 +24,11 @@
 //! - Sixteen connections (`TCPN`). An idle one costs its control state alone (`Tcb`, a static table); an open one holds a block of the arc (`Blocks`): a 1 MiB receive buffer and a 256 KiB send buffer. The kernel maps 4 MiB of heap at spawn (three blocks); the arc grows for more as connections open (SYS_ARC, docs/ARCS.md) and shrinks again when the highest blocks are free.
 //! - The receive window is the free room of the 1 MiB buffer, said with window scaling (RFC 7323, shift 5); a peer that offers no scaling gets 64 KiB of it. Its right edge moves by a segment, or half the buffer, at least (silly-window avoidance), and a read that reopens a window shrunk under half says so at once.
 //! - Segments past a hole are kept in place in the buffer (eight ranges, `ferros_tcp::Ooo`) and delivered when the hole fills; each is ACKed at once with SACK blocks (RFC 2018), so the peer resends only what is missing.
-//! - ACKs: every second in-order segment, at once for PSH, FIN, out-of-order data, a filled hole or a duplicate, and whatever is still owed at the end of each pass over the links (`tcp_acks`). No delayed-ACK timer: while data flows a pass takes a millisecond at most.
+//! - ACKs: in-order data once for each batch of frames taken in (after each exchange with the WiFi driver, and at the end of each pass over the links: `tcp_acks`), the way a receiver coalescing its segments ACKs; at once for FIN, out-of-order data, a filled hole or a duplicate. No delayed-ACK timer: the batch is microseconds. (Every second segment and PSH were ACKed at once until 2026-11-11, when frames began to come in batches of up to 88: 44 ACKs a batch, more than the driver's 32 transmit buffers.)
 //! - Sending within the peer's window and a congestion window: slow start, congestion avoidance, fast retransmit on three duplicate ACKs and NewReno recovery (RFC 5681, RFC 6582). SACK blocks the peer sends are read but not used yet: NewReno resends one hole a round trip. The retransmission timeout comes from measured round trips (RFC 6298, Karn's rule), 250 ms to 8 s, doubling at each expiry; the eighth expiry fails the connection. That timer is the one timer here, and it must be: a segment lost with nothing after it brings no ACK to say so. A closed peer window is probed on the same timer.
 //! - The MSS from the link the connection leaves on: WiFi's 1500-byte MTU, the cellular call's MTU, less the headers of its family; 1200 when the call reports nothing believable.
 //! - Each connection's measures go to the console when it is freed (`report`): bytes each way, round trip, retransmissions, out-of-order holding, the buffer's use, the peak rate.
-//!   The line: `tcp A#<handle> port A#<port> <how it ended>: in A#<bytes> bytes, out A#<bytes>, open A#<ms> ms, peak A#<x.y> MiB/s, average A#<x.y> MiB/s, round trip A#<x.y> ms (variation A#<x.y>, timeout A#<x.y>), resent A#<n> segments (fast retransmits A#<n>, expiries A#<n>), out of order A#<n> segments (most held A#<bytes> bytes), waiting for the app most A#<bytes> of A#<window>, MSS A#<out> out A#<in> in, scale A#<out> out A#<in> in, SACK, congestion window A#<bytes>`.
+//!   The line: `tcp A#<handle> port A#<port> <how it ended>: in A#<bytes> bytes, out A#<bytes>, open A#<ms> ms, peak A#<x.y> MiB/s, average A#<x.y> MiB/s, round trip A#<x.y> ms (variation A#<x.y>, timeout A#<x.y>), resent A#<n> segments (fast retransmits A#<n>, expiries A#<n>), out of order A#<n> segments (most held A#<bytes> bytes), waiting for the app most A#<bytes> of A#<window>, MSS A#<out> out A#<in> in, scale A#<out> out A#<in> in, SACK, congestion window A#<bytes>, segments in A#<n>, ACKs out A#<n> (most between two A#<bytes> bytes)`. For a WiFi connection a second line follows, the WiFi path since the last report (`Path`): `WiFi path since the last report: A#<n> passes (longest A#<us> us), A#<n> asleep for A#<ms> ms; A#<n> calls to the driver (A#<us> us on average, A#<us> us longest); A#<n> frames in (most A#<n> a call), A#<n> out (A#<n> refused)`.
 //! - No listening, no TIME-WAIT (a client's ports are random), no timestamps, no keep-alives. Every incoming segment's checksum is checked; a reset counts only at the next expected byte, and one elsewhere in the window, or a SYN on an open connection, gets a challenge ACK (RFC 5961).
 //!
 //! Checksums are ones'-complement sums (RFC 1071: wide adds, one fold at the end). IPv4 UDP goes out with checksum 0 (allowed); IPv6 UDP and every ICMP carry one. The IPv6 interface identifier is random per session (from the entropy right) until a persistent device secret is granted (then RFC 7217 stable-privacy). No duplicate address detection yet.
@@ -125,11 +125,82 @@ struct Ip {
     held: [Held; HELDN],
     /// Stamps the holds in arrival order: the oldest gives way when all are taken.
     held_seq: u32,
+    /// The WiFi driver exchanges frames in batches (`wlan` op 8; `wifi_up` asks): frames to it wait in `txb` (the op's header, then each frame's u16 BE length and bytes; `txn` bytes used) until the next exchange. False: a driver without op 8, one frame a call (ops 1 and 2).
+    batch: bool,
+    txb: &'static mut [u8; MSG_MAX],
+    txn: usize,
+    /// The WiFi path's measures since the last connection report.
+    path: Path,
+}
+
+/// The WiFi path's measures between two connection reports (`report`), said after each on a line of their own (owner, 2026-11-11: measure the path before fixing it). Counter ticks where a time is kept.
+#[derive(Default)]
+struct Path {
+    /// Passes of the main loop and the longest; the passes that ended asleep, and the ticks asleep (a sleep ends at its deadline: 1 ms, up to 8 with the screen off).
+    passes: u32,
+    pass_most: u64,
+    sleeps: u32,
+    slept_t: u64,
+    /// Calls to the WiFi driver that moved frames (exchanges, or one frame a call to a driver without op 8): how many, their ticks in all (the wait for the driver to be scheduled is in them), the longest.
+    calls: u32,
+    call_t: u64,
+    call_most: u64,
+    /// Frames in, the most in one call; frames out, and those the driver refused.
+    frames_in: u32,
+    in_most: u32,
+    frames_out: u32,
+    refused: u32,
+}
+
+impl Path {
+    /// `WiFi path since the last report: A#<n> passes (longest A#<us> us), A#<n> asleep for A#<ms> ms; A#<n> calls to the driver (A#<us> us on average, A#<us> us longest); A#<n> frames in (most A#<n> a call), A#<n> out (A#<n> refused)`.
+    fn say(&self, ip: &mut Ip) {
+        let f = ip.freq;
+        let us = |t: u64| t * 1_000_000 / f;
+        let (pass_most, slept, call_most) = (us(self.pass_most), us(self.slept_t) / 1000, us(self.call_most));
+        ip.put(b"WiFi path since the last report: A#");
+        ip.dec(self.passes as u64);
+        ip.put(b" passes (longest A#");
+        ip.dec(pass_most);
+        ip.put(b" us), A#");
+        ip.dec(self.sleeps as u64);
+        ip.put(b" asleep for A#");
+        ip.dec(slept);
+        ip.put(b" ms; A#");
+        ip.dec(self.calls as u64);
+        ip.put(b" calls to the driver");
+        // WHY the test: the average is per call, and none may have moved frames since the last report.
+        if self.calls > 0 {
+            let avg = us(self.call_t) / self.calls as u64;
+            ip.put(b" (A#");
+            ip.dec(avg);
+            ip.put(b" us on average, A#");
+            ip.dec(call_most);
+            ip.put(b" us longest)");
+        }
+        ip.put(b"; A#");
+        ip.dec(self.frames_in as u64);
+        ip.put(b" frames in (most A#");
+        ip.dec(self.in_most as u64);
+        ip.put(b" a call), A#");
+        ip.dec(self.frames_out as u64);
+        ip.put(b" out (A#");
+        ip.dec(self.refused as u64);
+        ip.put(b" refused)\n");
+    }
 }
 
 /// Frames taken from each link a pass, and application requests: 64 frames (a 1 MiB window in flight is about 700 segments; at 16 a pass a busy link waited on its own queue), eight requests.
 const FRAMES_PASS: usize = 1 << 6;
 const REQS_PASS: usize = 1 << 3;
+/// Exchanges with the WiFi driver a pass while it says more frames wait, and the most bytes of frames one takes in (128 KiB, about 88 full frames: the driver's own largest reply, pcie1 `REPLY_MAX`).
+const EXCH_PASS: usize = 1 << 2;
+const EXCH_MAX: usize = 1 << 17;
+/// An exchange's header: the op and the most bytes its reply may hold (u32 BE). Its reply's header: flags (bit 0 more frames wait) and the frames refused (u16 BE).
+const EXCH_HEAD: usize = 5;
+const EXCH_REPLY: usize = 3;
+/// The exchanges' reply buffer (`wlan_batch`): a static, not the 64 KiB stack.
+static mut EXCH: [u8; EXCH_MAX] = [0; EXCH_MAX];
 
 /// Held receives at once: sixteen, a reader on each of the connections, or eight UDP readers (as many as the ports kept for them) and eight connections.
 const HELDN: usize = 1 << 4;
@@ -275,6 +346,11 @@ struct Tcb {
     rate_t: u64,
     rate_b: u64,
     why: u8,
+    /// Segments that carried data, and our ACKs with no data; the bytes taken in since our last ACK, and the most of them (`report`).
+    segs_in: u32,
+    acks_out: u32,
+    since_ack: u32,
+    burst_most: u32,
 }
 const TCB_FREE: Tcb = Tcb {
     state: 0,
@@ -338,6 +414,10 @@ const TCB_FREE: Tcb = Tcb {
     rate_t: 0,
     rate_b: 0,
     why: 0,
+    segs_in: 0,
+    acks_out: 0,
+    since_ack: 0,
+    burst_most: 0,
 };
 
 /// The connections' buffers, a block (`BLOCK`) each, from the arc (owner, 2026-11-11: taken when a connection opens, given back when it closes, from the arc grown on demand). Block k lives in the heap the kernel maps at spawn while k < `start`, else `k - start` blocks above the arc's top at spawn (`top0`, an arc offset), which the arc grows to reach (SYS_ARC, `ferros_sys::arc`). A connection takes the lowest free block, so the arc stays as low as it can, and when the highest blocks are free it shrinks back (the kernel rounds as the arc's mode needs: a masked arc keeps its power of two until it can halve).
@@ -474,7 +554,7 @@ impl Ip {
         }
     }
 
-    /// A frame to the driver: [1][Ethernet frame].
+    /// A frame to the driver: into the batch for the next exchange (`batch`), else at once as [1][Ethernet frame].
     fn eth_send(&mut self, dst: [u8; 6], ty: u16, payload: &[u8]) {
         let mut f = [0u8; 1600];
         let n = 1 + 14 + payload.len();
@@ -486,10 +566,124 @@ impl Ip {
         f[7..13].copy_from_slice(&self.mac);
         f[13..15].copy_from_slice(&ty.to_be_bytes());
         f[15..n].copy_from_slice(payload);
-        let mut r = [0u8; 16];
         // WHY the floor: an Ethernet frame is 60 bytes at least (IEEE 802.3, without its FCS); a shorter one (an ARP, 42) is padded with zeros, as every host pads it.
         let n = n.max(1 + 60);
+        if self.batch {
+            // A full batch goes first, in an exchange that takes no frames back (they wait for the pass's own).
+            if self.txn + 2 + n - 1 > self.txb.len() {
+                let mut head = [0u8; EXCH_REPLY];
+                self.exchange(&mut head);
+            }
+            let at = self.txn;
+            self.txb[at..at + 2].copy_from_slice(&((n - 1) as u16).to_be_bytes());
+            self.txb[at + 2..at + 1 + n].copy_from_slice(&f[1..n]);
+            self.txn = at + 1 + n;
+            return;
+        }
+        let mut r = [0u8; 16];
+        let t0 = now();
         svc(CALL, self.cap(S_WLAN), self.off(f.as_ptr()), n as u64, self.off(r.as_mut_ptr()), 16 | CALL_LIVE);
+        self.path_call(t0);
+        self.path.frames_out += 1;
+    }
+
+    /// A call to the WiFi driver that started at `t0`, done: its time into the measures.
+    fn path_call(&mut self, t0: u64) {
+        let dt = now().wrapping_sub(t0);
+        self.path.calls += 1;
+        self.path.call_t += dt;
+        // WHY the max: the high water, for the measure.
+        self.path.call_most = self.path.call_most.max(dt);
+    }
+
+    /// One exchange with the WiFi driver (`wlan` op 8): the frames batched in `txb` out, and as much reply as `into` holds back (its `EXCH_REPLY`-byte header, then frames). Returns the reply's length: 0 from a driver without op 8, ERR when no driver serves `wlan` (WiFi goes down). The batch is empty after it either way.
+    fn exchange(&mut self, into: &mut [u8]) -> u64 {
+        let sent = self.txn > EXCH_HEAD;
+        self.txb[0] = 8;
+        self.txb[1..EXCH_HEAD].copy_from_slice(&(into.len() as u32).to_be_bytes());
+        let t0 = now();
+        let n = svc(CALL, self.cap(S_WLAN), self.off(self.txb.as_ptr()), self.txn as u64, self.off(into.as_mut_ptr()), into.len() as u64 | CALL_LIVE);
+        if sent || (n != ERR && n > EXCH_REPLY as u64) {
+            self.path_call(t0);
+        }
+        if sent {
+            // The frames each carried their length: counted back out of the batch for the measure.
+            let mut at = EXCH_HEAD;
+            while at + 2 <= self.txn {
+                at += 2 + u16::from_be_bytes([self.txb[at], self.txb[at + 1]]) as usize;
+                self.path.frames_out += 1;
+            }
+            // WHY the test: the reply's header is the driver's word; a reply too short to hold it says nothing of refusals.
+            if n != ERR && n >= EXCH_REPLY as u64 {
+                self.path.refused += u16::from_be_bytes([into[1], into[2]]) as u32;
+            }
+        }
+        self.txn = EXCH_HEAD;
+        if n == ERR {
+            self.wifi_down();
+        }
+        n
+    }
+
+    /// The frames from the WiFi driver, a batch a call, while it says more wait or ACKs wait to go (`EXCH_PASS` calls at most): each taken (`wlan_in`), then the ACKs the batch owes (`tcp_acks`), which go with the next exchange. Returns whether any frame came or went.
+    fn wlan_batch(&mut self) -> bool {
+        // SAFETY: EXCH is the exchanges' reply buffer, used here alone (a batch flushed mid-pass by `eth_send` takes its reply in a buffer of its own), from the one thread.
+        let r = unsafe { &mut *(&raw mut EXCH) };
+        let mut moved = self.txn > EXCH_HEAD;
+        for _ in 0..EXCH_PASS {
+            let n = self.exchange(r);
+            if n == ERR {
+                break;
+            }
+            if n < EXCH_REPLY as u64 {
+                // A driver without op 8 (replaced while this ran): one frame a call from now on.
+                self.batch = false;
+                self.put(b"WiFi driver answers one frame a call\n");
+                break;
+            }
+            let n = n as usize;
+            let more = r[0] & 1 != 0;
+            let mut at = EXCH_REPLY;
+            let mut k = 0u32;
+            // Each frame its u16 BE length and bytes; a length that runs past the reply ends it (the reply is the driver's word).
+            while at + 2 <= n {
+                let l = u16::from_be_bytes([r[at], r[at + 1]]) as usize;
+                at += 2;
+                if at + l > n {
+                    break;
+                }
+                self.wlan_in(&r[at..at + l]);
+                at += l;
+                k += 1;
+            }
+            self.path.frames_in += k;
+            // WHY the max: the high water, for the measure.
+            self.path.in_most = self.path.in_most.max(k);
+            moved |= k > 0;
+            self.tcp_acks();
+            // Again while frames wait at the driver, or while this batch's ACKs wait here: the next exchange carries them out at once (and takes in what came meanwhile).
+            if !more && self.txn == EXCH_HEAD {
+                break;
+            }
+        }
+        moved
+    }
+
+    /// One Ethernet frame from the WiFi driver: ARP, IPv4 or IPv6 by its EtherType, anything else ignored. WHY the length test: the frame is the driver's word; one without a whole Ethernet header is nothing.
+    fn wlan_in(&mut self, f: &[u8]) {
+        if f.len() < 14 {
+            return;
+        }
+        self.frames += 1;
+        let src_mac: [u8; 6] = f[6..12].try_into().unwrap();
+        let ty = u16::from_be_bytes([f[12], f[13]]);
+        if ty == 0x0806 {
+            self.arp_in(&f[14..]);
+        } else if ty == 0x0800 {
+            self.ipv4_in(false, src_mac, &f[14..]);
+        } else if ty == 0x86DD {
+            self.ipv6_in(false, src_mac, &f[14..]);
+        }
     }
 
     // ---- IPv4 ----
@@ -526,7 +720,13 @@ impl Ip {
         }
         self.mac.copy_from_slice(&info[..6]);
         self.wifi = true;
-        self.put(b"WiFi driver answers\n");
+        // Whether it exchanges frames in batches (op 8): an empty exchange taking no frames back is answered with its 3-byte header, by a driver without the op with nothing.
+        let q = [8u8, 0, 0, 0, EXCH_REPLY as u8];
+        let mut head = [0u8; EXCH_REPLY];
+        let n = svc(CALL, self.cap(S_WLAN), self.off(q.as_ptr()), q.len() as u64, self.off(head.as_mut_ptr()), EXCH_REPLY as u64 | CALL_LIVE);
+        self.batch = n == EXCH_REPLY as u64;
+        self.txn = EXCH_HEAD;
+        self.put(if self.batch { b"WiFi driver answers, frames in batches\n".as_slice() } else { b"WiFi driver answers, one frame a call\n" });
         self.dhcp_state = 1;
         self.dhcp_send(1);
         self.rs_n = 0;
@@ -542,6 +742,8 @@ impl Ip {
         self.have_r6 = false;
         self.arp_n = 0;
         self.nd_n = 0;
+        // Frames batched for it go with it: nothing would send them, and a batch waiting keeps the loop from sleeping.
+        self.txn = EXCH_HEAD;
         self.put(b"WiFi driver gone\n");
     }
 
@@ -1230,6 +1432,8 @@ impl Ip {
             c.rcv_adv = c.rcv_nxt.wrapping_add(said);
             c.owed = false;
             c.unacked = 0;
+            c.since_ack = 0;
+            c.acks_out += payload.is_empty() as u32;
         }
         let n = hl + payload.len();
         seg[0..2].copy_from_slice(&c.lport.to_be_bytes());
@@ -1487,13 +1691,9 @@ impl Ip {
                         delivered += more;
                         now_ack = true;
                     }
-                    // Every second in-order segment ACKed at once (RFC 5681 4.2), one with PSH too; an odd one at the pass's end (`tcp_acks`).
+                    // In-order data is ACKed once the batch it came in is taken (`tcp_acks`, after each exchange with the WiFi driver and each pass), one ACK for the batch's segments: the way a receiver coalescing its segments (GRO) ACKs, and the batch is microseconds, not a delayed-ACK timer. Until 2026-11-11 every second segment was ACKed at once (RFC 5681 4.2), which was one ACK a call to the driver while frames came one a call; with frames in batches of up to 88 that was 44 ACKs a batch, more than the driver's 32 transmit buffers, and as many frames for the radio to send back.
                     c.unacked += 1;
-                    if c.unacked >= 2 || flags & PSH != 0 {
-                        now_ack = true;
-                    } else {
-                        c.owed = true;
-                    }
+                    c.owed = true;
                 } else {
                     // Past a hole: kept in place, and a duplicate ACK at once with the SACK blocks, so the peer's fast retransmit fills the hole.
                     c.ooo.latest = s;
@@ -1524,8 +1724,15 @@ impl Ip {
             // After the peer's FIN: a retransmission (our ACK of it was lost).
             now_ack = true;
         }
+        if !data.is_empty() {
+            c.segs_in += 1;
+        }
         if delivered > 0 {
             c.bytes_in += delivered as u64;
+            // What the peer sent between two of our ACKs, the most of it: how much it had in flight as we see it.
+            c.since_ack += delivered;
+            // WHY the max: the high water, for the report.
+            c.burst_most = c.burst_most.max(c.since_ack);
             c.last_in_t = t;
             // WHY the max: the high water, for the report.
             c.rx_most = c.rx_most.max(c.rx_len);
@@ -1827,7 +2034,20 @@ impl Ip {
         self.put(if c.sack_ok { b" in, SACK" } else { b" in, no SACK" });
         self.put(b", congestion window A#");
         self.dec(c.cc.cwnd as u64);
-        self.put(b"\n");
+        self.put(b", segments in A#");
+        self.dec(c.segs_in as u64);
+        self.put(b", ACKs out A#");
+        self.dec(c.acks_out as u64);
+        self.put(b" (most between two A#");
+        self.dec(c.burst_most as u64);
+        self.put(b" bytes)\n");
+        // The WiFi path since the last report (`Path`), on its own line.
+        if c.cell {
+            return;
+        }
+        self.flush();
+        let p = core::mem::take(&mut self.path);
+        p.say(self);
     }
 
     /// The port's oldest datagram into `out` (family, address, source port, destination port, payload); 0 when it has none.
@@ -2132,6 +2352,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The connections' control state, and the request and reply buffers (a reply up to `RECV_MAX` bytes of data): statics, not the 64 KiB stack (the kernel maps .bss from the image header's tail).
     static mut TCBS: [Tcb; TCPN] = [TCB_FREE; TCPN];
     static mut MSG: [u8; MSG_MAX] = [0; MSG_MAX];
+    // The frames batched for the WiFi driver's next exchange (`Ip::txb`): a call carries 4096 bytes.
+    static mut TXB: [u8; MSG_MAX] = [0; MSG_MAX];
     static mut OUT: [u8; 1 + RECV_MAX] = [0; 1 + RECV_MAX];
     // The heap the kernel maps past .bss (`HEAP_START` of it, or the whole `HEAP_CEILING` on a kernel without SYS_ARC): the first blocks, on a cache line.
     unsafe extern "C" {
@@ -2197,6 +2419,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         mode: 0,
         held: [HELD_FREE; HELDN],
         held_seq: 0,
+        batch: false,
+        txb: unsafe { &mut *(&raw mut TXB) },
+        txn: EXCH_HEAD,
+        path: Path::default(),
     };
     // Randomness: the DHCP transaction id and the IPv6 interface identifier (random per session).
     let mut r = [0u8; 16];
@@ -2241,9 +2467,15 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
         let mut busy = false;
-        // Frames from the driver: [2] → the oldest frame, or nothing.
-        for _ in 0..if ip.wifi { FRAMES_PASS } else { 0 } {
+        let pass_t = now();
+        ip.path.passes += 1;
+        // Frames from the WiFi driver: in batches, our own going with each call (`wlan_batch`), or from a driver without batches [2] → the oldest frame, or nothing.
+        if ip.wifi && ip.batch {
+            busy |= ip.wlan_batch();
+        }
+        for _ in 0..if ip.wifi && !ip.batch { FRAMES_PASS } else { 0 } {
             let req = [2u8];
+            let t0 = now();
             let n = svc(CALL, ip.cap(S_WLAN), ip.off(req.as_ptr()), 1, ip.off(frame.as_mut_ptr()), frame.len() as u64 | CALL_LIVE);
             if n == ERR {
                 ip.wifi_down();
@@ -2252,19 +2484,13 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             if n == 0 || n < 14 {
                 break;
             }
-            let f = &frame;
-            let n = (n as usize).min(f.len());
-            ip.frames += 1;
+            ip.path_call(t0);
+            ip.path.frames_in += 1;
+            ip.path.in_most = 1;
             busy = true;
-            let src_mac: [u8; 6] = f[6..12].try_into().unwrap();
-            let ty = u16::from_be_bytes([f[12], f[13]]);
-            if ty == 0x0806 {
-                ip.arp_in(&f[14..n]);
-            } else if ty == 0x0800 {
-                ip.ipv4_in(false, src_mac, &f[14..n]);
-            } else if ty == 0x86DD {
-                ip.ipv6_in(false, src_mac, &f[14..n]);
-            }
+            // WHY the min: the length is the kernel's, the reply it cut at the buffer.
+            let n = (n as usize).min(frame.len());
+            ip.wlan_in(&frame[..n]);
         }
         // Packets from the cellular call: [2] → the oldest, or nothing.
         for _ in 0..if ip.cell.flags & 1 != 0 { FRAMES_PASS } else { 0 } {
@@ -2331,11 +2557,19 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             ip.router_solicit();
         }
         ip.flush();
+        // Frames batched for the WiFi driver this pass (ACKs, a request, a resend): the next pass's exchange takes them at once, no sleep first.
+        busy |= ip.wifi && ip.txn > EXCH_HEAD;
+        let dt = now().wrapping_sub(pass_t);
+        // WHY the max: the high water, for the measure.
+        ip.path.pass_most = ip.path.pass_most.max(dt);
         // Nothing came in either way: a millisecond's sleep, not a spinning core (it spun from boot once init started it, 2026-10-26). With the screen off, each idle pass in a row doubles it up to 8 ms, and anything that comes in brings it back to 1 (2026-11-10: the WiFi and cellular drivers were each asked a thousand times a second in the dark, every one a wakeup of the kernel's core).
         if busy {
             ip.backoff = 0;
         } else {
-            ferros_sys::sleep_until(now() + (ip.freq / 1000 << ip.backoff));
+            let t0 = now();
+            ferros_sys::sleep_until(t0 + (ip.freq / 1000 << ip.backoff));
+            ip.path.sleeps += 1;
+            ip.path.slept_t += now().wrapping_sub(t0);
             ip.backoff = match (ip.dark, ip.backoff) {
                 (false, _) => 0,
                 (true, 3) => 3,
