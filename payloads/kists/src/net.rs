@@ -6,8 +6,8 @@
 use ferros_kist::fetch::{split_url, Response};
 use ferros_sys::{call, freq, now, sleep_until, ERR};
 
-/// The port this side's DNS questions leave from and their answers come to (httptest uses 53053).
-const DNS_PORT: u16 = 53054;
+/// The port this side's DNS questions leave from and their answers come to, its own: ip hands a port's datagrams to whoever asks for that port, and fgtw's 53054 was this one's too until 2026-11-12, each taking the other's answers off the port when both asked at once (httptest 53053, fgtw 53054, Mahere 53055).
+const DNS_PORT: u16 = 53056;
 /// How long a connection may bring nothing before it is given up (WHY a deadline: ip fails a connection only when what it sent goes unanswered, and a GET's long body is all receiving; a server that falls silent would hold the stower's one worker for ever). 32 s, ip's own idle reaping time: the wait of each held receive.
 const STALL_S: u8 = 1 << 5;
 /// The most data one receive brings: 64 KiB, on the worker's 512 KiB stack (ip answers up to 256 KiB; a bigger reply means fewer round trips while a capsule streams in).
@@ -98,7 +98,8 @@ fn resolve(cap: u64, dns: [u8; 4], host: &[u8]) -> Option<[u8; 4]> {
             }
             // WHY: the length is ip's, at most what the buffer took.
             let m = &out[21..(n as usize).min(out.len())];
-            if m[0..2] != id.to_be_bytes() {
+            // WHY the sender's check: the answer is the network's; only the server asked, from port 53, answers this question (anyone on the network can send to the port).
+            if m[0..2] != id.to_be_bytes() || out[0] != 4 || out[1..5] != dns || out[17..19] != 53u16.to_be_bytes() {
                 continue;
             }
             return a_record(m);

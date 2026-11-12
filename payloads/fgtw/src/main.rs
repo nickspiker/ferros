@@ -237,7 +237,8 @@ impl Udp {
                     continue;
                 }
                 let m = &out[21..(n as usize).min(out.len())];
-                if m[0..2] != id.to_be_bytes() {
+                // WHY the sender's check: the answer is the network's; only the server asked, from port 53, answers this question (anyone on the network can send to the port).
+                if m[0..2] != id.to_be_bytes() || out[0] != 4 || out[1..17] != dst || out[17..19] != 53u16.to_be_bytes() {
                     continue;
                 }
                 let skip = |m: &[u8], mut i: usize| -> usize {

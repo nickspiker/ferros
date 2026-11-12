@@ -110,15 +110,19 @@ fn resolve(a: &App, fam: u8, dns: [u8; 16], host: &[u8], qtype: u16) -> Option<[
             }
             sleep_ms(2);
         }
+        // Answers held for up to a second (RECV's wait byte, never a poll), until ours; another's on the port (an old try's, or not from the server) is passed over.
         let t = now();
         while now() - t < ferros_sys::freq() {
-            let n = a.udp(&[2, (DNS_PORT >> 8) as u8, DNS_PORT as u8], &mut out);
-            if n == 0 || n == ERR || n < 21 + 12 {
-                sleep_ms(2);
+            let n = a.udp(&[2, (DNS_PORT >> 8) as u8, DNS_PORT as u8, 1], &mut out);
+            if n == 0 || n == ERR {
+                break;
+            }
+            if n < 21 + 12 {
                 continue;
             }
             let m = &out[21..(n as usize).min(out.len())];
-            if m[0..2] != id.to_be_bytes() {
+            // WHY the sender's check: the answer is the network's; only the server asked, from port 53, answers this question (anyone on the network can send to the port).
+            if m[0..2] != id.to_be_bytes() || out[0] != fam || out[1..17] != dns || out[17..19] != 53u16.to_be_bytes() {
                 continue;
             }
             let an = u16::from_be_bytes([m[6], m[7]]);
@@ -197,8 +201,13 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let t0 = now();
     let (flags, dns4, dns6) = loop {
         let n = a.udp(&[3], &mut out);
-        if n >= 55 && out[50] & 3 != 0 && out[51..55] != [0; 4] {
-            let dns6: [u8; 16] = if n >= 71 { out[55..71].try_into().unwrap() } else { [0; 16] };
+        // Nobody present: ip sends nothing for an application (payloads/ip, INFO bit 3), so no question would leave.
+        if n >= 71 && out[50] & 8 == 0 {
+            a.done(b"httptest: nobody present: ip serves applications once someone attests");
+        }
+        // A server of either family will do: a network may name only one (DHCP's, or the router advertisement's).
+        if n >= 71 && out[50] & 3 != 0 && (out[51..55] != [0; 4] || out[55..71] != [0; 16]) {
+            let dns6: [u8; 16] = out[55..71].try_into().unwrap();
             let dns4: [u8; 4] = out[51..55].try_into().unwrap();
             break (out[50], dns4, dns6);
         }
@@ -211,11 +220,11 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     d4[..4].copy_from_slice(&dns4);
     let t = now();
     let mut found = None;
-    if flags & 2 != 0 && !v4_only {
+    if flags & 2 != 0 && !v4_only && (dns6 != [0; 16] || dns4 != [0; 4]) {
         let via = if dns6 != [0; 16] { (6, dns6) } else { (4, d4) };
         found = resolve(&a, via.0, via.1, host, 28).map(|ip| (6u8, ip));
     }
-    if found.is_none() && flags & 1 != 0 {
+    if found.is_none() && flags & 1 != 0 && dns4 != [0; 4] {
         found = resolve(&a, 4, d4, host, 1).map(|ip| (4u8, ip));
     }
     let Some((fam, ip)) = found else { a.done(b"httptest: DNS gave no address") };
