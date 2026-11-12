@@ -2938,8 +2938,11 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                if cmd.params == b"sched" {
-                    // `diag sched`: the kernel's scheduler trace (process.rs) — who called whom, who waited, for how long.
+                if cmd.params == b"sched" || cmd.params == b"sched reset" {
+                    // `diag sched`: the scheduler's counts (wake to run per kind, the lock's wait per core, register syscalls by path) and its trace (process.rs): who called whom, who waited, for how long. `diag "sched reset"` zeroes the counts first.
+                    if cmd.params == b"sched reset" {
+                        crate::process::sched_reset();
+                    }
                     crate::process::sched_report(&mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;

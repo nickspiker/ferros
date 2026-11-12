@@ -52,6 +52,8 @@ static LOCK_SITE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 static LOCK_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static LOCK_HOLD_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static LOCK_HOLD_SITE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Per core: the contended takes of the kernel lock and the counter ticks spent waiting for it (`diag sched`): the cores' time lost to the one lock, where the profile of 2026-11-11 put 17 % of the workers'.
+pub static LOCK_WAIT: [[core::sync::atomic::AtomicU64; 2]; 16] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 2] }; 16];
 
 /// The core holding the kernel lock plus one, 0 when free (platform::stall_check: whom to ask where it is).
 pub fn holder() -> usize {
@@ -75,6 +77,8 @@ fn lock() {
     use core::sync::atomic::Ordering;
     if LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
         LOCK_SPINS.fetch_add(1, Ordering::Relaxed);
+        // The wait is timed only when there is one: the uncontended take reads no counter.
+        let t0 = crate::platform::cntpct();
         let mut spins = 0u32;
         while LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
@@ -84,6 +88,9 @@ fn lock() {
                 crate::platform::stall_check();
             }
         }
+        let w = &LOCK_WAIT[core()];
+        w[0].fetch_add(1, Ordering::Relaxed);
+        w[1].fetch_add(crate::platform::cntpct() - t0, Ordering::Relaxed);
     }
     let site = site_word(core::panic::Location::caller());
     HOLDER.store(core() + 1, Ordering::Relaxed);
@@ -114,9 +121,31 @@ static mut CURRENT: [Option<usize>; 16] = [None; 16];
 fn cur_get() -> Option<usize> {
     unsafe { (*(&raw const CURRENT))[core()] }
 }
+/// When each core's current thread began running there (counter ticks): what `cur_set` charges to the thread it takes off (`Thread::ran`).
+static mut RUN_AT: [u64; 16] = [0; 16];
+/// The register grants of the process each core runs (`Grants`, null for none): what its MMIO syscall reads without the kernel lock (`mmio_fast`). Written only by `cur_set` on its own core, under the lock, together with `CURRENT`; read only by that same core.
+static mut FAST: [*const Grants; 16] = [core::ptr::null(); 16];
 fn cur_set(t: Option<usize>) {
     let c = core();
-    unsafe { (*(&raw mut CURRENT))[c] = t };
+    let now = crate::platform::cntpct();
+    unsafe {
+        // The thread leaving the core is charged its run (it may be gone: ended or exited in this trap).
+        if let Some(x) = (*(&raw const CURRENT))[c].and_then(th) {
+            x.ran = credit(x, now) + (now - (*(&raw const RUN_AT))[c]);
+            x.ran_at = now;
+        }
+        (*(&raw mut RUN_AT))[c] = now;
+        (*(&raw mut CURRENT))[c] = t;
+        (*(&raw mut FAST))[c] = t.and_then(proc_of).map_or(core::ptr::null(), |p| &*p.fast as *const Grants);
+    }
+    // A thread made runnable by a call, a reply or its device now runs: how long that took (`WAKE_LAT`).
+    if let Some(x) = t.and_then(th) {
+        if x.woke != 0 {
+            // WHY saturating: the stamp may come from another core, and a counter read is not ordered by the lock (an `mrs`, not a memory access), so it can read a tick past this one; a wrap would put 2^64 ticks in the longest wait.
+            wake_count(x.wkind as usize, now.saturating_sub(x.woke));
+            x.woke = 0;
+        }
+    }
     prof_note(c, t);
 }
 /// The profiler's view of what this core runs (prof.rs): the thread, its process's epoch, its image base and its arc, which the tick reads without the lock; and, while a run is on, the thread's names, kept once for the host.
@@ -186,9 +215,17 @@ fn unpause(t: usize) {
         }
     }
 }
-/// A thread onto the run queue, and the idle cores that may run it told.
+/// A thread onto the back of the run queue, and the idle cores that may run it told. Behind everyone, its front credit is whole again (`ran` = 0, see `enqueue_woken`).
 fn enqueue_back(t: usize) {
     unpause(t);
+    if let Some(x) = th(t) {
+        x.ran = 0;
+        x.ran_at = crate::platform::cntpct();
+        // Still current here (a slice's end, a yield, a server after its reply): its run so far is counted from now, or `cur_set` would charge it to the fresh credit as it leaves.
+        if cur_get() == Some(t) {
+            unsafe { (*(&raw mut RUN_AT))[core()] = crate::platform::cntpct() };
+        }
+    }
     k().runnable.push_back(t);
     runnable_sync();
     kick(mask_of(t));
@@ -198,6 +235,90 @@ fn enqueue_front(t: usize) {
     k().runnable.push_front(t);
     runnable_sync();
     kick(mask_of(t));
+}
+
+// ---------------------------------------------------------------- who runs next after a wake
+//
+// Three ways a woken thread joins the run queue (2026-11-11, the Pro: Mahere's forty threads kept the four workers busy, and every call to the WiFi driver that found it asleep, and every continuation of the driver after a reply, went to the back of the queue and waited ~9.7 ms for a core):
+// - `handoff`: the thread that woke it blocks now on this core (a call, a recv answered at once, a reply's caller), so it runs here next, in what is left of the slice the core's timer was armed for. Nothing is taken from anyone: the slice timer is armed once per `run_slice` and not again on a switch, so a chain of hand-offs on one core spends one slice, and its end puts the thread then running at the back. Pinned elsewhere or held, it is woken as below instead.
+// - `enqueue_woken`: the waker carries on (a server after its reply, an interrupt, the kernel's own call): to the front while the thread's front credit holds (`credit`: its run since it last waited at the back of the queue, leaking an eighth of the time passing, under a slice), else to the back.
+// - `enqueue_back`: everything else (a deadline, a word, a spawn, a slice's end).
+//
+// The bound (fairness): a thread X waiting at the back is passed only by threads woken to the front, and a thread T gets there only while its spent credit is under a slice. Over X's wait W, T can run ahead of X at most a slice (its credit), plus the slice it may be in when the credit runs out, plus W/8 (the leak); once spent, T's next wake puts it behind X, and only a run from there (after X's) renews it. Hand-offs add nothing: they spend the slice of the thread that blocked, one slice per `run_slice`, and its end puts the thread then running at the back. So with N threads woken this way on C cores, W ≤ 2·N·slice / (C − N/8): bounded while those threads together could not fill the cores at an eighth each (N < 8·C, thirty-two on the four workers; ferros has about a dozen servers and drivers woken this way). The old rule (deliver and interrupt wakes always to the front) had no bound at all; the leak keeps a light thread (touch, the WiFi driver) at the front for good instead of sending it behind the queue once every slice of its work.
+
+/// A woken thread runs here next (see above): no kick, this core takes it under the same hold of the lock. Otherwise `enqueue_woken`.
+fn handoff(t: usize, kind: usize) {
+    woken(t, kind);
+    if place_here(t) {
+        HANDOFFS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        enqueue_woken(t, kind);
+    }
+}
+/// Thread `t` to the front with no kick, when this core will take it at its next pick (allowed here, its process not held); false, nothing done, otherwise.
+fn place_here(t: usize) -> bool {
+    let kk = k();
+    let here = th(t).is_some_and(|x| allowed_here(x.mask) && !kk.procs.get(x.proc).and_then(|p| p.as_ref()).is_some_and(|p| p.hold.is_some()));
+    if here {
+        unpause(t);
+        kk.runnable.push_front(t);
+        runnable_sync();
+    }
+    here
+}
+/// A woken thread to the front while it has front credit left (`ran` under a slice), else to the back (see above).
+fn enqueue_woken(t: usize, kind: usize) {
+    woken(t, kind);
+    let slice = crate::platform::cntfrq() / 1000 * SLICE_MS;
+    // A thread still current here (a server queued after its reply) has its run so far counted too: `cur_set` charges it only as it leaves.
+    let (c, now) = (core(), crate::platform::cntpct());
+    let now_run = if cur_get() == Some(t) { now - unsafe { (*(&raw const RUN_AT))[c] } } else { 0 };
+    if th(t).is_some_and(|x| credit(x, now) + now_run < slice) {
+        enqueue_front(t);
+    } else {
+        SPENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        enqueue_back(t);
+    }
+}
+/// The leak of the front credit: an eighth of the time passing (2^3). A thread that runs less than an eighth of a core over time never spends its credit, so a driver woken by its device (touch, a few % of a core) or a server woken by its callers is never sent behind the queue for its work; one that runs more spends it a slice later.
+const CREDIT_LEAK_LOG2: u32 = 3;
+/// Thread `x`'s spent credit as of `now`: `ran` less the leak since `ran_at`. WHY saturating: a leaky bucket empties to nothing, never below (a long sleep is not credit in advance); and the leak's time is taken saturating too, as `ran_at` may come from another core's counter read, which the lock does not order (`cur_set`).
+fn credit(x: &Thread, now: u64) -> u64 {
+    x.ran.saturating_sub(now.saturating_sub(x.ran_at) >> CREDIT_LEAK_LOG2)
+}
+
+/// The wake's stamp, for its wake-to-run time (`cur_set`).
+fn woken(t: usize, kind: usize) {
+    if let Some(x) = th(t) {
+        x.woke = crate::platform::cntpct();
+        x.wkind = kind as u8;
+    }
+}
+
+/// The kinds of wake `WAKE_LAT` measures: a server by a call; a caller by its reply; a server going on after its reply; an interrupt's waiter; a sleeper or a timed wait at its deadline (measured from the deadline, so the time to notice it counts); a word's waiter (`wake`).
+pub const WAKE_CALL: usize = 0;
+pub const WAKE_REPLY: usize = 1;
+pub const WAKE_AFTER_REPLY: usize = 2;
+pub const WAKE_IRQ: usize = 3;
+pub const WAKE_TIMER: usize = 4;
+pub const WAKE_WORD: usize = 5;
+pub const WAKE_KINDS: usize = 6;
+pub const WAKE_NAMES: [&str; WAKE_KINDS] = ["call", "reply", "after reply", "interrupt", "deadline", "word"];
+/// Wake to run, per kind (`diag sched`): [0] wakes, [1] ticks from the wake to the run in all, [2] the longest.
+pub static WAKE_LAT: [[core::sync::atomic::AtomicU64; 3]; WAKE_KINDS] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 3] }; WAKE_KINDS];
+/// The same as a histogram: bucket b holds waits of [2^b, 2^(b+1)) ticks (b = 0 also 0 and 1 tick).
+pub static WAKE_HIST: [[core::sync::atomic::AtomicU64; 64]; WAKE_KINDS] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 64] }; WAKE_KINDS];
+/// Hand-offs (a woken thread run next on the waker's core), and woken threads sent to the back for a spent credit (`enqueue_woken`).
+pub static HANDOFFS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static SPENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+fn wake_count(kind: usize, ticks: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let w = &WAKE_LAT[kind];
+    w[0].fetch_add(1, Relaxed);
+    w[1].fetch_add(ticks, Relaxed);
+    w[2].fetch_max(ticks, Relaxed);
+    // The bucket by the top bit, branchless: 63 - clz(ticks | 1) is 0..=63.
+    WAKE_HIST[kind][63 - (ticks | 1).leading_zeros() as usize].fetch_add(1, Relaxed);
 }
 
 
@@ -550,6 +671,14 @@ struct Thread {
     /// When its last forwarded store call went to the vault process (`store_forward`), for `STORE_GETS`, and what it was: the op (`VOP_*`) in bits 0-6, a set's `more` bit 7, the length in bits 8-31, the offset above.
     called: u64,
     what: u64,
+    /// Its front credit spent (`enqueue_woken`), in counter ticks: what it has run on any core since it last went to the back of the run queue (`cur_set` charges it), leaking an eighth of the time passing (`credit`); at a slice it is spent. And when it was last brought up to date.
+    ran: u64,
+    ran_at: u64,
+    /// When a wake that `WAKE_LAT` measures made it runnable (0: none pending), and which kind (`WAKE_*`).
+    woke: u64,
+    wkind: u8,
+    /// Its word wait (`State::Waiting` on an arc word) ends for a call to an endpoint it polls (SYS_WAIT x3 bit 1, `wake_server`).
+    wait_call: bool,
 }
 
 /// The longest forwarded store call (`STORE_GETS[3]`): its caller's name (`pin_key`), and what it was (`Thread::what`); and the calls answered while the clock policy held each of its states (0 not yet applied: the boot's own clocks, 1 rest, 2 active, 3 dark; service.rs `clock_state`), so a slow read says whether the cores were at their reading clocks (2026-11-11).
@@ -629,7 +758,22 @@ struct Process {
     moves: u32,
     /// Ranges of the arc whose frames were given back while the arc kept its size (ARCS.md step 4): arc offsets, whole frames. A masked arc's power-of-two slack between its image and its first stack at spawn, and what the process gives back (SYS_ARC `ARC_RELEASE`). Unmapped: the process faults there, and no syscall buffer may lie there (`span`, `word`).
     holes: Vec<(usize, usize)>,
+    /// Its register grants for the MMIO syscall without the kernel lock (`mmio_fast`), in a box of its own: the Process moves when the process table grows, the box does not.
+    fast: alloc::boxed::Box<Grants>,
 }
+
+/// What `mmio_fast` reads of a process without the kernel lock. Made at spawn and never changed after (a process's grants are fixed at its spawn: only reply tokens come and go in its cspace, and they are never registers), but for `ended`.
+struct Grants {
+    /// Per grant slot (the cspace index, the token at `TOKENS + 4 + 32 * slot` in its grants page): the HARDWARE index plus one, 0 for a grant that is not a register block.
+    hw: Vec<u8>,
+    /// Set (SeqCst) when the process ends, before the kernel waits for any core still in a register access of it (`mmio_quiesce`).
+    ended: core::sync::atomic::AtomicBool,
+}
+
+/// Per core: the `Grants` whose register access is in flight there (its address; 0 none). With `Grants::ended` this is the handshake that makes a process's end wait for its accesses (`mmio_fast`, `mmio_quiesce`).
+static MMIO_BUSY: [core::sync::atomic::AtomicUsize; 16] = [const { core::sync::atomic::AtomicUsize::new(0) }; 16];
+/// Register syscalls answered without the kernel lock, and those that took it (a token not presented from its grants-page slot, a write thru EL3, a process ending), for `diag sched`.
+pub static MMIO_PATHS: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
 
 struct Endpoint {
     name: Vec<u8>,
@@ -712,9 +856,48 @@ pub fn threads_report(out: &mut Vec<u8>) {
 
 /// The trace, oldest first, as text: time since the first entry in microseconds, the event, the process name and the detail. Then per call: the wait before the server took it, the server's time to the reply, and the caller's wait after the reply before it ran again — the three parts of a round trip.
 pub fn sched_report(out: &mut Vec<u8>) {
+    sched_counters(out);
     lock();
     sched_report_locked(out);
     unlock();
+}
+
+/// The scheduler's running counts since boot or the last `diag "sched reset"`, ahead of the trace: wake to run per kind of wake (how long a woken thread waited for a core: the 2026-11-11 measure was ip's calls waiting ~9.7 ms for the WiFi driver), hand-offs and spent credits, the lock's wait per core, and the register syscalls by path.
+fn sched_counters(out: &mut Vec<u8>) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let f = crate::platform::cntfrq();
+    let us = |t: u64| t * 1_000_000 / f;
+    out.extend_from_slice(b"wake to run (us):\n");
+    for (k, w) in WAKE_LAT.iter().enumerate() {
+        let n = w[0].load(Relaxed);
+        if n == 0 {
+            continue;
+        }
+        out.extend_from_slice(alloc::format!("  {:<12} A#{} wakes, mean A#{}, longest A#{};", WAKE_NAMES[k], n, us(w[1].load(Relaxed)) / n, us(w[2].load(Relaxed))).as_bytes());
+        // The histogram's buckets that hold anything, each by its floor: from 2^b ticks.
+        for (b, h) in WAKE_HIST[k].iter().enumerate() {
+            let c = h.load(Relaxed);
+            if c != 0 {
+                out.extend_from_slice(alloc::format!(" >=A#{}:A#{}", ((1u128 << b) * 1_000_000 / f as u128) as u64, c).as_bytes());
+            }
+        }
+        out.push(b'\n');
+    }
+    out.extend_from_slice(alloc::format!("hand-offs A#{}, woken to the back for a spent slice A#{}\n", HANDOFFS.load(Relaxed), SPENT.load(Relaxed)).as_bytes());
+    out.extend_from_slice(b"lock waits per core (contended takes, us waited):");
+    for (c, w) in LOCK_WAIT.iter().enumerate() {
+        let n = w[0].load(Relaxed);
+        if n != 0 {
+            out.extend_from_slice(alloc::format!(" c{c} A#{n}/A#{}", us(w[1].load(Relaxed))).as_bytes());
+        }
+    }
+    out.extend_from_slice(alloc::format!("\nregister syscalls: A#{} without the lock, A#{} with it\n", MMIO_PATHS[0].load(Relaxed), MMIO_PATHS[1].load(Relaxed)).as_bytes());
+}
+
+/// `diag "sched reset"`: the counters `sched_counters` shows, zeroed.
+pub fn sched_reset() {
+    use core::sync::atomic::Ordering::Relaxed;
+    WAKE_LAT.iter().flatten().chain(WAKE_HIST.iter().flatten()).chain(LOCK_WAIT.iter().flatten()).chain(MMIO_PATHS.iter()).chain([&HANDOFFS, &SPENT]).for_each(|a| a.store(0, Relaxed));
 }
 fn sched_report_locked(out: &mut Vec<u8>) {
     let kk = k();
@@ -1027,7 +1210,7 @@ const SYS_ENTROPY: u64 = 6;
 const SYS_DMA: u64 = 7;
 /// input(off, buf, len) → bytes of the spawn input copied into the arc at `buf`.
 const SYS_INPUT: u64 = 8;
-/// 9 `sleep(deadline)`: park until CNTPCT reaches `deadline`, so a periodic process (the display server's frame clock) costs nothing between frames instead of spinning through every slice the service loop hands out.
+/// 9 `sleep(deadline)`: park until CNTPCT reaches `deadline`, so a periodic process (the display server's frame clock) costs nothing between frames instead of spinning thru every slice the service loop hands out. Returns 0 at the deadline, 1 when a call to an endpoint the thread polls ended it early (one already waiting returns 1 at once).
 const SYS_SLEEP: u64 = 9;
 /// Start a signed capsule from the vault as a new process, handing it copies of some of the caller's own capabilities (never more rights than the caller holds; reply capabilities do not pass). x0/x1: request offset and length in the caller's arc, [name len][name][vault key len][vault key][token count][tokens, 32 bytes each]. The child is queued, not entered: the caller carries on. Returns 0, or ERR with the reason on the console.
 const SYS_SPAWN: u64 = 10;
@@ -1045,11 +1228,11 @@ const SYS_STORE: u64 = 13;
 const SYS_THREAD_SPAWN: u64 = 14;
 /// thread_exit(value): this thread ends; the last thread of a process ends the process as `exit` does.
 const SYS_THREAD_EXIT: u64 = 15;
-/// wait(word, expected, deadline): if the 8-byte word at arc offset `word` still holds `expected`, block until another thread of this process wakes it (returns 0) or CNTPCT reaches `deadline` (returns 2; 0 = no deadline); returns 1 at once if the word had already changed. A futex with a timeout: threads hand work to each other without IPC, and a server's loop waits for a request or its next deadline in one call.
+/// wait(word, expected, deadline): if the 8-byte word at arc offset `word` still holds `expected`, block until another thread of this process wakes it (returns 0) or CNTPCT reaches `deadline` (returns 2; 0 = no deadline); returns 1 at once if the word had already changed. A futex with a timeout: threads hand work to each other without IPC, and a server's loop waits for a request or its next deadline in one call. x3 bit 0: a wait on the world (the watchdog paused); bit 1: a call to an endpoint the thread polls ends it too (returns 3; one already waiting returns 3 at once).
 const SYS_WAIT: u64 = 16;
 /// wake(word, count): make up to `count` threads of this process waiting on that word runnable; returns how many.
 const SYS_WAKE: u64 = 17;
-/// irq_wait(cap, deadline): block until the line fires (0), or the deadline passes (2; 0 = none); if it fired while no one waited, return 0 at once. The line is masked at the GIC from the moment it fires until `irq_ack`.
+/// irq_wait(cap, deadline): block until the line fires (0), or the deadline passes (2; 0 = none); if it fired while no one waited, return 0 at once. The line is masked at the GIC from the moment it fires until `irq_ack`. A call to an endpoint the thread polls ends it with 2 as well.
 const SYS_IRQ_WAIT: u64 = 18;
 /// irq_ack(cap): the driver has handled its device (and cleared its own pending bit there): the line is unmasked at the GIC.
 const SYS_IRQ_ACK: u64 = 19;
@@ -1177,6 +1360,8 @@ pub static IRQS: &[IrqLine] = &[
     IrqLine { name: "gpu-gpu", intid: 32 + 346 },
     IrqLine { name: "gpu-job", intid: 32 + 347 },
     IrqLine { name: "gpu-mmu", intid: 32 + 348 },
+    // PCIe channel 1's controller (the WiFi chip's link): zuma.h IRQ_PCIE_GEN3A_1_HSI2, SPI 439, level high (zuma-pcie.dtsi pcie_1, its first `interrupts` entry). Channel 1 has no `separated-msi`, so the Exynos RC driver takes its MSIs on this one line, thru ELBI PCIE_IRQ2 bit 17 (IRQ_MSI_RISING_ASSERT, enabled by PCIE_IRQ2_EN bit 17; pcie-exynos-rc.c exynos_pcie_rc_irq_handler and msi_init). Granted to whoever drives the controller (`build_from`), for payloads/pcie1's wait on the chip (2026-11-11).
+    IrqLine { name: "pcie1", intid: 32 + 439 },
 ];
 /// Set by `.Lirq` with any pending byte (and a `sev`), cleared when `wake_sleepers` has looked: an idle core looks for interrupt waiters only when this says so.
 #[unsafe(no_mangle)]
@@ -1699,7 +1884,7 @@ fn call_endpoint(f: &mut Frame, cur: usize, ep: usize, msg: Vec<u8>, roff: u64, 
     t.frame = *f;
     tr(TR_CALL, cur, ep as u64);
     kk.endpoints[ep].queue.push_back((cur, msg));
-    wake_server(ep);
+    wake_server(ep, true);
     if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
 }
 
@@ -2026,7 +2211,7 @@ pub fn vault_call(mut msg: Vec<u8>) -> bool {
         *c = (true, None);
         tr(TR_CALL, KERNEL_CALLER, ep as u64);
         k().endpoints[ep].queue.push_back((KERNEL_CALLER, msg));
-        wake_server(ep);
+        wake_server(ep, false);
         true
     })
 }
@@ -2088,20 +2273,26 @@ pub fn vault_stamp_drops() -> Vec<Vec<u8>> {
     with_lock_held_or(|| STORES.iter().filter(|sc| crate::kvault::identity_within(sc.prefix)).filter_map(|sc| stamp(VOP_DROP, sc.prefix.as_bytes(), &[true], &[], &[])).collect())
 }
 
-/// A server receiving on `ep` takes the head of its queue now; a polling server asleep between polls is woken (its sleep returns early, which a poll loop reads as "look again").
-fn wake_server(ep: usize) {
+/// A server receiving on `ep` takes the head of its queue now; a polling server asleep between polls is woken (its sleep returns early with 1, which a poll loop reads as "look again"). `handoff`: the caller blocks right after on this core, so the server runs here next (`handoff`); the kernel's own call (`vault_call`) carries on, and the server is woken to the front (`enqueue_woken`). Until 2026-11-11 a sleeping poller woken this way went to the back of the run queue: the WiFi driver waited ~9.7 ms for a core behind Mahere's threads on each of ip's calls.
+fn wake_server(ep: usize, handoff: bool) {
     let kk = k();
     if let Some(server) = kk.threads.iter().position(|q| matches!(q, Some(q) if matches!(q.state, State::Receiving(e, ..) if e == ep))) {
-        deliver(server, ep);
+        deliver(server, ep, handoff);
     } else if let Some(s) = kk.endpoints[ep].poller {
         if let Some(q) = th(s) {
-            // Asleep, or in a timed interrupt wait (a driver that serves an endpoint and waits for its device in one loop): back with 2, as at its deadline.
-            if matches!(q.state, State::Sleeping(_)) || matches!(q.state, State::Waiting(a, _) if a < 1024) {
-                if matches!(q.state, State::Waiting(..)) {
-                    q.frame.x[0] = 2;
-                }
+            // Asleep (back with 1: a call ended the sleep), in a timed interrupt wait (a driver that serves an endpoint and waits for its device in one loop: back with 2, as at its deadline), or in a word wait that asked for it (back with 3, SYS_WAIT x3 bit 1).
+            if matches!(q.state, State::Sleeping(_)) || matches!(q.state, State::Waiting(a, _) if a < 1024) || (matches!(q.state, State::Waiting(..)) && q.wait_call) {
+                q.frame.x[0] = match q.state {
+                    State::Sleeping(_) => 1,
+                    State::Waiting(a, _) if a < 1024 => 2,
+                    _ => 3,
+                };
                 q.state = State::Runnable;
-                enqueue_back(s);
+                if handoff {
+                    self::handoff(s, WAKE_CALL);
+                } else {
+                    enqueue_woken(s, WAKE_CALL);
+                }
                 tr(TR_WAKE_POLL, s, ep as u64);
             }
         }
@@ -2344,7 +2535,7 @@ pub const FAULT: u64 = 0xFA << 56;
 pub const PARKED: u64 = 0xB10C << 48;
 
 /// Copy the head of an endpoint's queue into a server waiting in recv: message into its buffer, a fresh single-use reply token into its arc and cspace, x0 = message length. The server becomes runnable.
-fn deliver(server: usize, ep: usize) {
+fn deliver(server: usize, ep: usize, handoff: bool) {
     let kk = k();
     let Some((caller, mut msg)) = kk.endpoints[ep].queue.pop_front() else { return };
     let Some(st) = th(server) else { return };
@@ -2359,8 +2550,16 @@ fn deliver(server: usize, ep: usize) {
     sp.write(tok_off, &token);
     st.frame.x[0] = n as u64;
     st.state = State::Runnable;
-    // To the front: the caller is about to block, and the server it woke is the thread to run now (a direct hand-off, on this core).
-    enqueue_front(server);
+    // The caller is about to block, and the server it woke is the thread to run now (a direct hand-off, on this core); the kernel's own call wakes it to the front. A server taking its own queue's head in recv is already this core's: not a wake to measure.
+    if server == cur_get().unwrap_or(usize::MAX) {
+        if !place_here(server) {
+            enqueue_front(server);
+        }
+    } else if handoff {
+        self::handoff(server, WAKE_CALL);
+    } else {
+        enqueue_woken(server, WAKE_CALL);
+    }
     tr(TR_DELIVER, server, ep as u64);
 }
 
@@ -2393,11 +2592,89 @@ fn pick_runnable() -> Option<usize> {
     t
 }
 
+/// `mmio_read`/`mmio_write` without the kernel lock (2026-11-11: a PCIe read in L1.2 takes tens of µs, and with every register access holding the lock the other cores spent 17 % of their time waiting for it). Returns the syscall's value, or None for the locked path (`el0_trap`), which answers everything this does not.
+///
+/// What it reads, and why each is safe with no lock (the thread T of process P is on this core, IRQs masked as the trap entered, from the entry to the eret):
+/// - `FAST[c]`: written only by `cur_set` on this same core, set to P's `Grants` when T began running here; it changes only when this core switches, which it is not doing.
+/// - P's `Grants`: a box P owns. P is dropped only when none of its threads is on another core (`end_process` and `kill_locked` keep a process with a thread elsewhere as `dying`; `drain_dying` drops it with its last thread, and T is still in the table), and T is `CURRENT` here, so the box outlives this access. Its `hw` is written once at spawn; P's grants never change after it (only reply tokens enter or leave its cspace).
+/// - The token: not read at all. It is presented by its slot in P's grants page (the offset `ferros_sys::cap` gives), a page the kernel wrote at spawn and maps read-only at every level, so the token at slot s is the token of cspace entry s, and `hw[s]` says what the constant-time lookup would have found. A token presented from anywhere else (copied into the heap) goes the locked way, unchanged.
+/// - Revocation: P's grants are revoked only by its end. `mmio_quiesce` (under the lock, in `end_process` and `kill_locked`) sets `ended` and then waits while any core's `MMIO_BUSY` names P's grants; here `MMIO_BUSY` is set before `ended` is read, both SeqCst. In the one total order either this read of `ended` comes after the store (it sees true and takes the locked path, which drains T) or the store of `MMIO_BUSY` comes before the quiesce reads it (the quiesce waits for this access). So once a process's end returns, none of its register accesses is in flight or can start: what it switched on is turned off (`power_offs_apply`) and its device handed on only after its last access, as under the lock.
+/// - The arc, the run queue, the cspace: not touched. A hold (an arc move or a mask change) waits for T to leave the core as before: the hold's SGI stays pending while IRQs are masked here and parks T as soon as the eret lands at EL0.
+fn mmio_fast(f: &Frame) -> Option<u64> {
+    use core::sync::atomic::Ordering::{Relaxed, Release, SeqCst};
+    let c = core();
+    let g = unsafe { (*(&raw const FAST))[c] };
+    if g.is_null() {
+        return None;
+    }
+    // SAFETY: see above: P's box, alive while T is current on this core.
+    let g = unsafe { &*g };
+    // The slot the token was presented from. WHY the checks: the offset is the process's; one not on a slot of its grants page (below it, between two tokens, past its grants) is the locked path's to answer. Below the slots wraps to a huge number and fails the length test with the rest.
+    let at = f.x[0].wrapping_sub((TOKENS + 4) as u64);
+    let slot = (at >> 5) as usize;
+    if at & 31 != 0 || slot >= g.hw.len() || g.hw[slot] == 0 {
+        return None;
+    }
+    let hw = &HARDWARE[g.hw[slot] as usize - 1];
+    let write = f.x[8] == SYS_MMIO_WRITE;
+    // A write only EL3 may make (the PMU) goes thru the monitor's SMC under the lock, as before: not a hot path, and the SMC is the kernel's.
+    if write && hw.via_el3 {
+        return None;
+    }
+    let off = f.x[1] as usize;
+    // WHY: the offset is the process's; aligned and inside the grant, as the locked path requires. A DMA fence is never written by its driver (the locked path's rule).
+    if off % 4 != 0 || off >= hw.size || (write && crate::s2mpu::is_fence(hw.base)) {
+        MMIO_PATHS[0].fetch_add(1, Relaxed);
+        return Some(ERR);
+    }
+    let busy = &MMIO_BUSY[c];
+    busy.store(g as *const Grants as usize, SeqCst);
+    if g.ended.load(SeqCst) {
+        busy.store(0, Release);
+        return None;
+    }
+    let nr = f.x[8];
+    crate::platform::crumb(0x90 + nr);
+    crate::platform::note_mmio((hw.base + off) as u64 | (write as u64) << 63);
+    let v = if write {
+        unsafe { core::ptr::write_volatile((hw.base + off) as *mut u32, f.x[2] as u32) };
+        0
+    } else {
+        unsafe { core::ptr::read_volatile((hw.base + off) as *const u32) as u64 }
+    };
+    busy.store(0, Release);
+    crate::platform::crumb(0x70 + nr);
+    MMIO_PATHS[0].fetch_add(1, Relaxed);
+    Some(v)
+}
+
+/// Process P ends (under the lock, `end_process` and `kill_locked`): no register access of it starts after this, and one in flight on another core finishes before it returns (`mmio_fast` has the argument). The wait is one register access at most: the core in it holds no lock and masks its interrupts until its eret.
+fn mmio_quiesce(g: &Grants) {
+    use core::sync::atomic::Ordering::SeqCst;
+    g.ended.store(true, SeqCst);
+    let me = g as *const Grants as usize;
+    for b in &MMIO_BUSY {
+        while b.load(SeqCst) == me {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// Called from `.Lel0_sync` for every synchronous exception taken from EL0, with the running process's live frame. Returns 0 to eret through `f` (which may now be another process's frame), 1 to leave EL0 (value in f.x[0]).
 #[unsafe(no_mangle)]
 pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
     // The profiler's note of this trap (prof.rs): who called, from where, and the call (x8 for an `svc`, ESR class G#15; G#FFFF for anything else).
     crate::prof::enter(if f.esr >> 26 == 0x15 { f.x[8] } else { 0xFFFF }, f.elr, f.x[29], f.x[30]);
+    // A register access, answered without the kernel lock when it can be (`mmio_fast`): back to the same thread, nothing else changes.
+    if f.esr >> 26 == 0x15 && (f.x[8] == SYS_MMIO_READ || f.x[8] == SYS_MMIO_WRITE) {
+        if let Some(v) = mmio_fast(f) {
+            f.x[0] = v;
+            crate::prof::leave();
+            // The same check as every return to EL0 (the killswitch and the slice timer need IRQs open there). The tick re-arm below is not needed: this path never unmasks, so a tick that fires meanwhile stays pending and parks the thread as the eret lands.
+            frame_check(f);
+            return 0;
+        }
+    }
     lock();
     let r = el0_trap(f);
     unlock();
@@ -2482,7 +2759,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 frame.x[26] = p.arc.base as u64;
                 frame.x[0] = arg;
                 let mask = t.mask;
-                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask, called: 0, what: 0 });
+                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, wait_call: false });
                 enqueue_back(nt);
                 tr(TR_RUN, nt, 0xFFFF);
                 f.x[0] = 0;
@@ -2545,6 +2822,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
                             t.state = State::Waiting(intid as usize, deadline);
                             t.frame = *f;
                             t.frame.x[0] = 0;
+                            if deadline != 0 {
+                                NEXT_WAKE.fetch_min(deadline, core::sync::atomic::Ordering::AcqRel);
+                            }
                             tr(TR_SLEEP, cur, intid as u64);
                             if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
                         }
@@ -2574,14 +2854,23 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 } else if deadline != 0 && deadline <= t_now {
                     f.x[0] = 2;
                     0
+                } else if f.x[3] & 2 != 0 && kk.endpoints.iter().any(|e| e.poller == Some(cur) && !e.queue.is_empty()) {
+                    // x3 bit 1, a call ends it: one already waiting on an endpoint this thread polls answers 3 at once, as `sleep` answers 1 and `irq_wait` 2.
+                    f.x[0] = 3;
+                    0
                 } else {
                     // A wait on the world (x3 bit 0): the watchdog's clock paused while the thread that pets is in it.
                     if f.x[3] & 1 != 0 && cur == p.pet_thread {
                         p.paused_at = t_now;
                     }
+                    // x3 bit 1 (2026-11-11): a call to an endpoint this thread polls ends the wait with 3 (`wake_server`), so a server can wait on a word of its own (a doorbell its other thread rings) and on its callers at once: the IP stack's idle wait. Opt-in: a server waiting on its own work (the display's publish workers) must not be ended by every client's call.
+                    t.wait_call = f.x[3] & 2 != 0;
                     t.state = State::Waiting(addr, deadline);
                     t.frame = *f;
                     t.frame.x[0] = 0;
+                    if deadline != 0 {
+                        NEXT_WAKE.fetch_min(deadline, core::sync::atomic::Ordering::AcqRel);
+                    }
                     tr(TR_SLEEP, cur, 0xFFFF);
                     if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
                 }
@@ -2598,6 +2887,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 if let Some(x) = x {
                     if x.proc == pi && matches!(x.state, State::Waiting(a, _) if Some(a) == addr) {
                         x.state = State::Runnable;
+                        (x.woke, x.wkind) = (crate::platform::cntpct(), WAKE_WORD as u8);
                         enqueue_back(i);
                         tr(TR_WAKE, i, 0xFFFF);
                         n += 1;
@@ -3464,7 +3754,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
         SYS_SLEEP => {
             let now: u64;
             unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
-            if f.x[0] <= now {
+            if kk.endpoints.iter().any(|e| e.poller == Some(cur) && !e.queue.is_empty()) {
+                // A call already waiting on an endpoint this thread polls: back at once with 1, as `wake_server` would have woken it, and as `irq_wait` answers 2 (2026-11-11). A call that came between the server's last poll and this sleep waited out the whole sleep (up to 1 ms an exchange for the WiFi driver).
+                f.x[0] = 1;
+                0
+            } else if f.x[0] <= now {
                 // A deadline already passed is a yield: anyone runnable goes first, this process comes back round. A server whose wake time had fallen into the past spun its whole slice on sleep/recv and held every client until the slice timer (the display, 2026-10-23); now it gives the core up on each pass instead.
                 f.x[0] = 0;
                 if kk.runnable.is_empty() {
@@ -3480,6 +3774,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 t.state = State::Sleeping(f.x[0]);
                 t.frame = *f;
                 t.frame.x[0] = 0;
+                NEXT_WAKE.fetch_min(f.x[0], core::sync::atomic::Ordering::AcqRel);
                 tr(TR_SLEEP, cur, ((f.x[0] - now) * 1000 / crate::platform::cntfrq()).min(65535));
                 if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
             }
@@ -3557,7 +3852,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     t.frame = *f;
                     tr(TR_RECV_BLOCK, cur, ep as u64);
                     if !kk.endpoints[ep].queue.is_empty() {
-                        deliver(cur, ep);
+                        deliver(cur, ep, true);
                     }
                     if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
                 }
@@ -3568,7 +3863,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
             }
         }
         SYS_MMIO_READ | SYS_MMIO_WRITE => {
-            // A hardware grant: offset (x1) must be 4-byte aligned and inside the grant; the access goes straight to the register, or through the EL3 monitor for blocks only it can reach (the PMU).
+            // A hardware grant: offset (x1) must be 4-byte aligned and inside the grant; the access goes straight to the register, or thru the EL3 monitor for blocks only it can reach (the PMU). Here only when `mmio_fast` could not answer it.
+            MMIO_PATHS[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let token = p.read(f.x[0], 32);
             f.x[0] = match p.lookup(&token).map(|i| p.cspace[i].object) {
                 Some(Object::Hardware(g)) => {
@@ -3680,8 +3976,6 @@ fn el0_trap(f: &mut Frame) -> u64 {
                                 ct.frame.x[0] = n as u64;
                             }
                             ct.state = State::Runnable;
-                            // The caller runs now: it waited. The server goes to the back of the queue (KERNEL.md "Threads, interrupts and cores": direct hand-off both ways).
-                            enqueue_front(caller);
                             kk.ipc_round_trips += 1;
                             tr(TR_REPLY, caller, cur as u64);
                             handed = true;
@@ -3689,9 +3983,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     }
                     f.x[0] = 0;
                     if handed {
+                        // The caller runs now, here: it waited (KERNEL.md "Threads, interrupts and cores": direct hand-off both ways). The server goes on after it, from the front while it has front credit (`enqueue_woken`): until 2026-11-11 it went to the back, and a polling driver waited a slice-long round of the queue (~9.7 ms with Mahere's threads busy) to get back to its loop after every reply. Queued first, so the caller lands ahead of it.
                         t.state = State::Runnable;
                         t.frame = *f;
-                        enqueue_back(cur);
+                        enqueue_woken(cur, WAKE_AFTER_REPLY);
+                        handoff(caller, WAKE_REPLY);
                         if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
                     } else {
                         0
@@ -3737,7 +4033,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
     };
     // Leaving: the number, the process the trap entered from (bits 8-15), the process it returns into or FF when it leaves EL0 (bits 16-23).
     crate::platform::crumb(0x70 + nr.min(SYS_LAST) | (cur as u64) << 8 | cur_get().map(|c| c as u64).unwrap_or(0xFF) << 16);
-    deadlines_sync();
+    // No `deadlines_sync` here (2026-11-11): it walked every thread, under the lock, at the end of every syscall on every core (a hundred threads with Mahere up). A deadline is added only by `sleep`, `irq_wait` and `wait`, which lower NEXT_WAKE to it on the spot; one that goes away (a wake before it) leaves NEXT_WAKE early, which costs an idle core one look, and that look (`wake_sleepers`) makes it exact again. Never late, so no deadline is missed.
     r
 }
 
@@ -4302,6 +4598,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         }
     }
     if let Some(p) = kk.procs.get_mut(pi).and_then(|x| x.as_mut()) {
+        mmio_quiesce(&p.fast);
         // Say how it ended on the console: a process that outlives its first slice (spawn already returned) has no one else to hear its exit value — a fault or a panic would otherwise vanish.
         if !p.line_start {
             kk.console.push(b'\n');
@@ -4431,15 +4728,16 @@ fn wake_sleepers() {
             if let State::Sleeping(d) = p.state {
                 if d <= now {
                     p.state = State::Runnable;
+                    (p.woke, p.wkind) = (d, WAKE_TIMER as u8);
                     enqueue_back(i);
                     tr(TR_WAKE, i, ((now - d) * 1000 / crate::platform::cntfrq()).min(65535));
                 }
             } else if let State::Waiting(a, d) = p.state {
-                // An interrupt the thread waits on has fired: it runs first (the device is waiting on it).
+                // An interrupt the thread waits on has fired: it runs first (the device is waiting on it), while it has front credit (`enqueue_woken`: a driver whose device keeps it busy past a slice waits its turn like any other thread, where before nothing bounded it).
                 if a < 1024 && irq_pending_take(a as u32) {
                     p.state = State::Runnable;
                     p.frame.x[0] = 0;
-                    enqueue_front(i);
+                    enqueue_woken(i, WAKE_IRQ);
                     tr(TR_WAKE, i, a as u64);
                     continue;
                 }
@@ -4447,6 +4745,7 @@ fn wake_sleepers() {
                 if d != 0 && d <= now {
                     p.state = State::Runnable;
                     p.frame.x[0] = 2;
+                    (p.woke, p.wkind) = (d, WAKE_TIMER as u8);
                     enqueue_back(i);
                     tr(TR_WAKE, i, 0xFFFE);
                 }
@@ -4528,6 +4827,8 @@ fn kill_locked(name: &[u8]) -> bool {
     let kk = k();
     // A live process of that name, never one already ending: a process left `dying` (a thread of it still on a core) ahead of its relaunch in the table was found first, killed again, and the live one ran on (as `kill`'s record and `kist_request` already skip one).
     let Some(i) = kk.procs.iter().position(|p| matches!(p, Some(p) if p.name == name && !p.dying)) else { return false };
+    // Its register accesses done before anything it drove is switched off or handed on (`mmio_quiesce`).
+    mmio_quiesce(&kk.procs[i].as_ref().unwrap().fast);
     // A kist no longer running: the kists' bell rung, so the map's circle stops glowing as running (`kists_live`). Under the lock, so a reader woken by it finds the process gone or ending.
     if kk.procs[i].as_ref().unwrap().kist {
         bell_count(BELL_KISTS);
@@ -5367,6 +5668,13 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
         };
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }
+    // PCIe channel 1's interrupt goes with its controller (2026-11-11): a process granted the controller's registers (pcie1-elbi) gets the line as the slot after its last, as a child handed Settings gets the torch (SYS_SPAWN). init holds every grant to hand on and its grants page is full, so it cannot hold the line to pass on; and the keepers' restart list (service.rs `shell_grants`) must give a restarted driver what a booted one has. Only when the page has room: init, full, is skipped rather than refused.
+    if cspace.iter().any(|c| matches!(c.object, Object::Hardware(h) if HARDWARE[h].name == "pcie1-elbi")) && !cspace.iter().any(|c| matches!(c.object, Object::Irq(i) if IRQS[i].name == "pcie1")) && TOKENS + 4 + 32 * (cspace.len() + 1) <= PREFS_HI {
+        if let Some(i) = IRQS.iter().position(|l| l.name == "pcie1") {
+            let object = Object::Irq(i);
+            cspace.push(CapEntry { token: mint(object, RIGHT_SEND, epoch), object, rights: RIGHT_SEND });
+        }
+    }
     // The tokens end at PREFS_HI (G#FB0, the second preferences block, then the first at G#FC0 and the ihi at G#FE0): a 109th slot's token was once written over the preferences and overwritten by the next preferences write, so init's spawn of the GPU service was refused for a token it held (2026-11-05). Refused here, with the reason, rather than corrupted.
     if TOKENS + 4 + 32 * cspace.len() > PREFS_HI {
         surfaces_free(epoch);
@@ -5378,7 +5686,10 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
         c.token = [0; 32];
     }
     let domain = ihi.map(|i| blake3::derive_key(KIST_DOMAIN_CONTEXT, &i));
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new() };
+    // The register grants by slot, for `mmio_fast`: HARDWARE has fewer than 255 blocks, so an index plus one fits a byte.
+    let hw = cspace.iter().map(|c| match c.object { Object::Hardware(g) => g as u8 + 1, _ => 0 }).collect();
+    let fast = alloc::boxed::Box::new(Grants { hw, ended: core::sync::atomic::AtomicBool::new(false) });
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), fast };
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.
     p.write_grants(TOKENS as u64, &(p.cspace.len() as u32).to_le_bytes());
@@ -5434,7 +5745,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // A masked arc's power-of-two slack (ARCS.md step 4): the frames wholly between its image (code, zeroed tail, input) and its first stack's guard page hold nothing it was built with, and masked code reaches only what it was linked with (its statics, its static heaps, its stacks), so they go back to the pool at once (ahau: 20 MiB of its 128). Not exact mode's, whose limit may grow into it; a native arc is whole frames already.
     // Not given back at spawn (2026-11-11, the Pro's first ARCS boot: ahau's thread 7 wrote at arc offset G#760_0000, inside the 18 MiB released here, and faulted, so the device had no attest screen): a masked no_std process's allocator grows into exactly this span, so it is not slack. A process gives back what it knows it no longer needs itself (SYS_ARC op 3).
     let _ = (masked, floor);
-    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS, called: 0, what: 0 });
+    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, wait_call: false });
     Ok((me, arc, in_off))
 }
 
