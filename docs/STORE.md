@@ -466,15 +466,15 @@ What this spec would add, and what it would not:
 
 ## 7. Open questions for the owner
 
-0. **The name.** Decided (owner, 2026-11-11): the store is **the hold**. Still open: "item" for what is in it, and the find page's name.
+0. **The name.** Decided (owner, 2026-11-11): the store is **the hold**, and what is in it is an **item** ("Yes, item."). Still open: the find page's name.
 1. **Kinds replace the common area's names?** VAULT-OUT.md decision 2 made the common area a small set of named grants (`wallpaper`, `images`, `contacts`, `theme`); this spec makes them kinds (ideas), with developers minting their own. Same idea, wider, or keep names for system state and kinds for items?
 2. **May a kist open what it made itself without asking?** Proposed yes (it is the `items` right); a rebuild under another key asks per kind.
 3. **Picks remembered.** Proposed: a picked item stays openable by that kist until the person takes it back, kept with their answers. Or a pick lasts only while the kist runs?
 4. **A kist's own items.** Do their cards (title and size, never the body) show to the person, so a download can be seen and removed? When the kist is removed, are they kept until cleared, or dropped with it? Removing them needs the kist's keys: wait for its next call, or a drop the kernel stamps as at release?
-5. **How many versions.** Version 0 and the last 2^2, per item, by default; a kind may say otherwise. No expiry by time.
-6. **Words in bodies.** Index the words inside documents and messages (a word index, sealed), or titles and attributes only?
-7. **Removed means gone?** Or a bin the person empties by hand (no timer either way)?
-8. **Bodies across the fleet.** Every device holds every body (simple, many copies), or cards everywhere and bodies by kind and by the person's choice per device (the Pro holds all photos, the 8a holds the last month)?
+5. **How many versions.** Decided (owner, 2026-11-11): none. "always overwrite for same reason. No (1) versioned bullshit": keeping an item replaces it in place; rolling back is the snaps' job ("we do have snaps so you can roll back (or at least it's in the roadmap)"), not the hold's. Every part of this spec that keeps versions is withdrawn.
+6. **Words in bodies.** Owner, 2026-11-11: "Search inside, kinda? This goes under the idea thing, don't focus too much on it." Searching inside items belongs to the ideas work (IDEAS.md); the hold indexes titles and attributes and leaves room for it.
+7. **Removed means gone.** Decided (owner, 2026-11-11): "Gone at once, no bin ever." Undoing a removal is the snaps' job.
+8. **Bodies across the fleet.** Owner, 2026-11-11: "Desktop, all, phone, prolly not. depends on storage and ratios tho, up for decisions...": a desktop holds every body, a phone-sized device holds cards for all and bodies by kind and choice; the rule by storage and ratios is still open.
 9. **A copy off the person's devices.** Should fgtw.org (or R2) keep sealed bodies as the space's backup, for a person whose only device is lost? Today it keeps 1 MiB of the identity space.
 10. **The find page's home.** A page of the settings circle, its own built-in circle (no_baked_apps allows settings alone), or the picker only?
 11. **Things from other people.** A photo Ana sends thru Photon: an item only when the person keeps it (proposed), or every received photo at once?
