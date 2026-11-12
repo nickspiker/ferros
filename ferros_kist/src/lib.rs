@@ -1,7 +1,7 @@
 //! Kists (docs/KISTS.md): what a stowed app may be handed, how its developer declares it, and the person's answers.
 //!
 //! - **A right** is one thing a kist can be handed at spawn: a grant (owner, 2026-11-08: "a grant is the permission"). The vocabulary is fixed here, a right named and numbered by its place in `RIGHTS`; the kernel hands each one out as its own object (process.rs `kist_object`).
-//! - **The declaration** is in the signed capsule: a section `kist` (`name`, the app's own name, text) and a section `wants`, one field per right the kist asks for, named by the right, its value one line of the developer's reason (text, a human's words). The fields' order is the kist's grant slot order: slot 1 is the first want, and a right the person said no to is an empty slot, never a fake. Nothing undeclared can be granted: the kernel checks every launch against the capsule it runs. Since 2026-11-10 the `kist` section also carries the kist's `version` ([`Version`]: a `z` per part, as many parts as its developer uses), so the version is signed with everything else.
+//! - **The declaration** is in the signed capsule: a section `kist` (`name`, the app's own name, text) and a section `wants`, one field per right the kist asks for, named by the right, its value one line of the developer's reason (text, a human's words). The fields' order is the order of its wants in its grant slots ([`slots`]), and a right the person said no to is an empty slot, never a fake. Since 2026-11-12 a kist declares only the rights it is asked for: the implicit set ([`IMPLICIT`]: display, touch, surface, ira, domain, entropy, audio) is handed to every kist in fixed slots without a question, and a capsule that still declares them gets them where it declares them. Nothing undeclared can be granted: the kernel checks every launch against the capsule it runs. Since 2026-11-10 the `kist` section also carries the kist's `version` ([`Version`]: a `z` per part, as many parts as its developer uses), so the version is signed with everything else.
 //! - **The list** is the person's (`kists.list`, identity class, so it follows them to every device of their fleet): one VSF document, a section `defaults` (a field per right, 1 on or 0 off: what the first-launch question starts each switch at; out of the box every one is off) and a section `kist` per stowed kist: `capsule` (hb, the blake3 of the signed capsule, its vault address), `developer` (ke) and `option` (hp; in the capsule it is the `kist` section's `option`, hR), together the kist's identity as the gate sees it, `name` (text), and a field per want named by its right: the reason (ASCII text, `a`: vsf encodes UTF-8 text, `x`, only with std, and the map and init are no_std), and once the person answered, the answer (unsigned, 1 granted or 0 not) and when (Eagle time). A want never answered has no answer and is asked at the next launch, once (owner, 2026-11-08: "asked once, ever, per person, per kist, per permission"). Since 2026-11-10 a kist may carry `source` (`nu`, the URL its capsule was fetched from, for a restore) and `installed` (Eagle time, when it was stowed: the stored field keeps its name from before the word was stow, so a list written then keeps its times) and `version` (a `z` per part, the stowed capsule's as its declaration gives it), and a section `kept` per unstowed kist holds its answers (`developer`, `option`, a field per right: the answer and when) for the day it is stowed again; readers from before skip them all. Since 2026-11-10 (trust on first stow) a section `pin` per developer holds the commitment of the key bundle their first kist carried (`Pin`, `Kists::trust`); readers from before skip it.
 //! - **Fetching** a capsule (the stower, payloads/kists) is `fetch`: a plain HTTP GET's response decoded as it arrives, and the capsule hashed and its header read as it streams into the vault, never held whole.
 #![no_std]
@@ -30,6 +30,48 @@ pub const RIGHTS: [&str; 9] = ["display", "touch", "surface", "ira", "domain", "
 pub const MEANS: [&str; 9] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound"];
 /// A want the person said no to: an empty slot in the launch (process.rs `Object::Empty`).
 pub const EMPTY: u8 = 0xFF;
+
+/// The implicit set, by code: the rights every kist is handed at launch without a question (owner, 2026-11-12, "Yes on the implicit set"): the screen, touch, a surface of its own, its own key sealed to this device (ira), its own vault domain, randomness, sound out. A kist the person chose to run needs a window, their touches in it, its own storage, randomness, its own key and sound; asking about those only teaches people to tap yes. The GPU is handed to every kist as well, and is no right (the kernel's `kist_gpu`). Every other right is asked once ([`Kist::unanswered`]). The codes are the same as before, so an answer the person gave one of these before 2026-11-12 keeps its meaning; it is simply no longer read.
+pub const IMPLICIT: [u8; 7] = [0, 1, 2, 3, 4, 5, 8];
+/// The implicit rights that lead the slots of a kist whose capsule declares none of them ([`slots`]): the first six of [`IMPLICIT`], codes 0 to 5 in slots 1 to 6 (a right of code c in slot c + 1), the order every kist declared them in before they were implicit.
+pub const LEADING: usize = 6;
+/// The GPU's slots a kist is handed after its wants (the kernel's `kist_gpu`, ferros_sys::gpu `kist_slots`): the service, a block of the layer arena, a second surface.
+pub const GPU_SLOTS: u8 = 3;
+
+/// Whether a right is handed without a question ([`IMPLICIT`]).
+pub fn implicit(right: u8) -> bool {
+    IMPLICIT.contains(&right)
+}
+
+/// What one of a kist's grant slots holds, from slot 1 (slot 0 is its console).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Slot {
+    /// An implicit right, by its code: handed always, never asked.
+    Implicit(u8),
+    /// The capsule's want at this index of its declaration, an asked right: the right where the person granted it, an empty slot where they did not.
+    Asked(usize),
+    /// The GPU's slot k (0 the service, 1 a block of the layer arena, 2 a second surface; the kernel's `kist_gpu`).
+    Gpu(u8),
+}
+
+/// A kist's grant slots from its capsule's wants (their codes in declaration order), one layout for every capsule (docs/KISTS.md "The implicit set"):
+/// - A capsule that declares no implicit right (every capsule from 2026-11-12): slots 1 to 6 the leading implicit rights ([`LEADING`]: display, touch, surface, ira, domain, entropy), then its wants in order (slots 7 on), then the GPU's three, then the rest of the implicit set (audio).
+/// - A capsule that declares any implicit right (every capsule before): its wants in order, as before, each implicit one handed without a question wherever it was declared (so its code finds it where it always did), then the GPU's three, then each implicit right it did not declare, in code order.
+///
+/// The two agree wherever they meet: a capsule written the old way with the six in code order first has the slots a capsule declaring only the rest of its wants has. Mahere's do (1 display to 6 entropy, 7 gps, 8 udp, 9 to 11 the GPU, 12 audio), so its code reads the same slots either way. A right later added to the implicit set goes after audio.
+pub fn slots(wants: &[u8]) -> Vec<Slot> {
+    let lead = !wants.iter().any(|&w| implicit(w));
+    let mut out = Vec::with_capacity(LEADING + wants.len() + GPU_SLOTS as usize + IMPLICIT.len());
+    if lead {
+        out.extend(IMPLICIT[..LEADING].iter().map(|&c| Slot::Implicit(c)));
+    }
+    out.extend(wants.iter().enumerate().map(|(i, &w)| if implicit(w) { Slot::Implicit(w) } else { Slot::Asked(i) }));
+    out.extend((0..GPU_SLOTS).map(Slot::Gpu));
+    let held = |c: u8| out.iter().any(|s| *s == Slot::Implicit(c));
+    let rest: Vec<Slot> = IMPLICIT.iter().filter(|&&c| !held(c)).map(|&c| Slot::Implicit(c)).collect();
+    out.extend(rest);
+    out
+}
 /// The person's list's name in its scope (`kists.`).
 pub const LIST: &[u8] = b"list";
 
@@ -697,15 +739,22 @@ impl Kists {
     }
 }
 
+impl Want {
+    /// Whether the person is asked for it: every right but the implicit set ([`IMPLICIT`]). A capsule from before 2026-11-12 still declares implicit rights; those are never shown, never asked, and handed whatever answer the list holds for them.
+    pub fn asked(&self) -> bool {
+        !implicit(self.right)
+    }
+}
+
 impl Kist {
-    /// Whether any want is still unanswered (the first-launch question is due).
+    /// Whether any asked want is still unanswered (the first-launch question is due). An implicit want needs no answer.
     pub fn unanswered(&self) -> bool {
-        self.wants.iter().any(|w| w.answer.is_none())
+        self.wants.iter().any(|w| w.asked() && w.answer.is_none())
     }
 
-    /// The launch's slots for init: each want's right where the person granted it, `EMPTY` where they did not. None while a want is unanswered: nothing launches before its question.
+    /// The launch's codes for init, one a declared want: an implicit want's right always, an asked want's right where the person granted it, `EMPTY` where they did not. None while an asked want is unanswered: nothing launches before its question. The kernel lays the slots out from these ([`slots`]) and hands the implicit set itself whatever init sends for it.
     pub fn launch_codes(&self) -> Option<Vec<u8>> {
-        self.wants.iter().map(|w| w.answer.map(|(g, _)| if g { w.right } else { EMPTY })).collect()
+        self.wants.iter().map(|w| if w.asked() { w.answer.map(|(g, _)| if g { w.right } else { EMPTY }) } else { Some(w.right) }).collect()
     }
 }
 
@@ -751,6 +800,57 @@ mod tests {
         // Another developer's app of the same name is a kist of its own.
         let o = k2.stow([8; 32], [4; 32], [3; 32], &decl());
         assert_ne!(o, j);
+    }
+
+    #[test]
+    fn the_implicit_set_is_never_asked_and_always_handed() {
+        // A capsule from before 2026-11-12, as Photon's: implicit wants beside an asked one, none answered.
+        let photon = Decl { name: String::from("Photon"), wants: [0u8, 1, 2, 7, 4, 3, 5].iter().map(|&c| (c, String::from("why"))).collect() };
+        let mut k = Kists::default();
+        let i = k.stow([1; 32], [2; 32], [3; 32], &photon);
+        assert!(k.kists[i].unanswered());
+        assert_eq!(k.kists[i].wants.iter().filter(|w| w.asked()).count(), 1);
+        // Only udp is asked; said no to, every implicit want is still handed, even one the person said no to before they were implicit.
+        k.kists[i].wants[3].answer = Some((false, 1));
+        k.kists[i].wants[0].answer = Some((false, 1));
+        assert!(!k.kists[i].unanswered());
+        assert_eq!(k.kists[i].launch_codes(), Some(alloc::vec![0, 1, 2, EMPTY, 4, 3, 5]));
+        // A kist that asks for nothing launches at once.
+        let j = k.stow([4; 32], [5; 32], [3; 32], &Decl { name: String::from("Clock"), wants: Vec::new() });
+        assert!(!k.kists[j].unanswered());
+        assert_eq!(k.kists[j].launch_codes(), Some(Vec::new()));
+        assert!(IMPLICIT[..LEADING].iter().enumerate().all(|(i, &c)| c as usize == i));
+        assert!(IMPLICIT.iter().all(|&c| (c as usize) < RIGHTS.len()));
+    }
+
+    #[test]
+    fn slots_lead_with_the_implicit_set_or_keep_a_declared_order() {
+        use Slot::*;
+        let gpu = [Gpu(0), Gpu(1), Gpu(2)];
+        // Mahere as it declared its wants before 2026-11-12 (display, touch, surface, ira, domain, entropy, gps, udp), and as it declares them now (gps, udp): the same slots, so its code reads them where it always did.
+        let old = slots(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let mut want = alloc::vec![Implicit(0), Implicit(1), Implicit(2), Implicit(3), Implicit(4), Implicit(5), Asked(6), Asked(7)];
+        want.extend(gpu);
+        want.push(Implicit(8));
+        assert_eq!(old, want);
+        let new = slots(&[6, 7]);
+        assert_eq!(new.len(), old.len());
+        assert!(new.iter().zip(&old).all(|(n, o)| match (n, o) {
+            (Asked(a), Asked(b)) => *a + LEADING == *b,
+            _ => n == o,
+        }));
+        // Photon's declared order kept: udp fourth, the ira sixth, then the GPU and the audio it never declared.
+        let p = slots(&[0, 1, 2, 7, 4, 3, 5]);
+        assert_eq!(&p[..7], &[Implicit(0), Implicit(1), Implicit(2), Asked(3), Implicit(4), Implicit(3), Implicit(5)]);
+        assert_eq!(&p[7..], &[Gpu(0), Gpu(1), Gpu(2), Implicit(8)]);
+        // A kist that asks for nothing: the six, the GPU, audio.
+        let none = slots(&[]);
+        assert_eq!(none.len(), LEADING + GPU_SLOTS as usize + 1);
+        assert_eq!(none[9], Implicit(8));
+        // A capsule that declares audio alone keeps it where declared and gets the other six after the GPU, each right once.
+        let a = slots(&[8, 6]);
+        assert_eq!(&a[..2], &[Implicit(8), Asked(1)]);
+        assert_eq!(&a[5..], &[Implicit(0), Implicit(1), Implicit(2), Implicit(3), Implicit(4), Implicit(5)]);
     }
 
     #[test]

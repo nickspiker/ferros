@@ -4,7 +4,7 @@ use photon_messenger::network::fgtw::derive_device_keypair;
 use photon_messenger::network::fgtw::fleet::SigningBundle;
 use photon_messenger::ui::photon_app::PhotonApp;
 
-/// The ira's grant slot, in the spawn's order above (tools/photon-capsule.sh declares it sixth: "to tie its keys to this device").
+/// The ira's grant slot, in the spawn's order above (tools/photon-capsule.sh declares it sixth: "to tie its keys to this device"). The ira is one of the implicit set since 2026-11-12 (docs/KISTS.md), never asked; Photon's capsule still declares it, so it stays in this slot.
 const IRA: u64 = 6;
 
 /// The kernel, as this process reaches it (ferros KERNEL.md, the process ABI): the call for the ira key and the grants page. Inlined as Mahere's, fluor's and kete's are: ferros_sys is no_std and not a published crate.
@@ -54,7 +54,7 @@ fn main() {
         println!("PANIC at {location}: {info}");
     }));
     // The device key from this kist's ira (docs/PHOTON.md, "Photon's device key on ferros", 2026-11-12). Photon's own fallback reads the machine fingerprint, which on ferros (no files) was tohu's last resort, the bytes "unknown": every ferros device's Photon had one device key, derivable by anyone.
-    // A person who said no to the ira gets no Photon: without it Photon has no key of its own to be a device with, and the shared one is the bug above. It ends at once, as it did before with every want off (KISTS.md, "Measured on the Pro").
+    // No ira, no Photon (the ira is handed to every kist since 2026-11-12, KISTS.md "The implicit set", so this is a kernel from before, where a person could say no to it, or no ira this boot): without it Photon has no key of its own to be a device with, and the shared one is the bug above. It ends at once, as it did before with every want off (KISTS.md, "Measured on the Pro").
     let Some(root) = sys::ira_key(IRA, "photon device") else {
         println!("photon: no ira key at slot {IRA} (the ira right was not granted); Photon has no device key of its own and does not start");
         return;

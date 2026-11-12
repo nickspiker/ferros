@@ -61,7 +61,7 @@ kist ── call `audio` (the right) ──▶ audio service (payloads/audio)
 
 ### The stream: what a kist sees
 
-- **The right:** `audio`, appended to the kists' vocabulary (ferros_kist `RIGHTS`, code 8, "sound"), a want declared with a reason like any other (KISTS.md), off until the person says yes.
+- **The right:** `audio`, appended to the kists' vocabulary (ferros_kist `RIGHTS`, code 8, "sound"). Since 2026-11-12 it is one of the implicit set (KISTS.md "The implicit set"; owner, "Yes on the implicit set"): every kist is handed it without declaring it or being asked, in the slot after its GPU slots (ferros_sys::kist `audio`).
   The kernel makes it a send right on the `audio` endpoint (process.rs `kist_object`).
 - **The format:** one for everything, the one the AoC's entry point is set up for: 48 kHz, two channels interleaved, signed 16-bit little-endian.
   Integer, not float: it is what the AoC's ring carries (Android's back end for TDM0 is `S16_LE`, aoc_alsa_card.c:245), so nothing is converted twice, and a kist converts once at the edge (the Genesis core's f64 by a `1 << 15` scale and the cast).

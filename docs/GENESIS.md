@@ -204,7 +204,7 @@ Built the night of 2026-11-11 behind the kist's `audio` cargo feature (off by de
   jgenesis runs the YM2612, the PSG, their filters and their sinc resamplers either way (genesis-core `bus.rs` `tick_components`) and only zeroes their volume in the mix, so the frames under "Measured" already carry the YM2612's emulation, the costliest chip.
   Sound adds the mix's few multiplies a pair, the conversion and one write a frame (a 3.2 KB message); read from the code, to be measured on the device.
   The image grows 4.7 KB (5906280 bytes against 5901480 without the feature).
-- **The stream**: the `audio` grant is the fourth slot, after the surface (`--use audio`, above).
+- **The stream**: the `audio` grant is the fourth slot, after the surface (`--use audio`, above). As a kist (none signed yet) every right it takes is implicit (KISTS.md "The implicit set"): a capsule declaring nothing gets display, touch and surface in slots 1 to 3 and audio in slot 10, after the six and the GPU's three; one declaring display, touch, surface and audio in that order, as placements never asked, keeps these four slots.
   At start the kist opens a MEDIA stream (op 0) and says its rate, ring and period on the console, or "no sound" when there is no grant or no stream; a stream at a rate other than 48000 is refused aloud (it would play every note off pitch).
 - **Pacing with sound**: the audio clock leads.
   After each frame its picture is drawn and shown (op 22), then its pairs are written (op 1, one write: 801 pairs is under the message's 1021) and the service holds the reply until all of them are in the stream's ring (1024 pairs, 21.3 ms), freeing 256 at each of the AoC's playback interrupts.

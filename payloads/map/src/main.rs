@@ -2836,7 +2836,7 @@ impl Map {
         }
     }
 
-    /// The first-launch question (owner, 2026-11-08), inscribed in the kist's open circle: its name, then each want not yet answered, its switch as the person has it (`ask`, started from their defaults: out of the box every one off) and the developer's reason under it, then "start". Asked once for this person and this kist, on every device of theirs; a kist itself can never ask.
+    /// The first-launch question (owner, 2026-11-08), inscribed in the kist's open circle: its name, then each asked want not yet answered (never the implicit set, ferros_kist::IMPLICIT: owner, 2026-11-12, "Yes on the implicit set"), its switch as the person has it (`ask`, started from their defaults: out of the box every one off) and the developer's reason under it, then "start". Asked once for this person and this kist, on every device of theirs; a kist itself can never ask.
     fn ask_page(&mut self, b: &mut Batch, i: usize, region: bool) {
         let (cx, cy, r, uq) = self.page_frame();
         let uu = |n: i64, d: i64| n * uq / (d << 8);
@@ -2860,7 +2860,7 @@ impl Map {
             }
             return;
         }
-        let open: alloc::vec::Vec<usize> = (0..k.wants.len()).filter(|&j| k.wants[j].answer.is_none()).collect();
+        let open: alloc::vec::Vec<usize> = (0..k.wants.len()).filter(|&j| k.wants[j].asked() && k.wants[j].answer.is_none()).collect();
         // The rows' height, centred in the band: a line saying what this is, each want two lines, then start.
         let pitch = uu(7, 2);
         let h = uu(3, 1) + open.len() as i64 * pitch + uu(4, 1);
@@ -3947,11 +3947,12 @@ impl Map {
                             if o.native {
                                 row(self, b, &mut y, small, white(), tr(Msg::UncheckedDevOnly), None);
                             }
-                            if o.wants.is_empty() {
+                            // Only what its first start will ask: the implicit set (ferros_kist::IMPLICIT) is every kist's, never asked, so an older capsule's declaration of it is not shown.
+                            if !o.wants.iter().any(|w| !ferros_kist::implicit(w.0)) {
                                 row(self, b, &mut y, note, dim(), tr(Msg::AsksForNothing), None);
                             } else {
                                 row(self, b, &mut y, note, grey(), tr(Msg::AsksAtFirstStart), None);
-                                for (right, reason) in &o.wants {
+                                for (right, reason) in o.wants.iter().filter(|w| !ferros_kist::implicit(w.0)) {
                                     row(self, b, &mut y, small, white(), right_name(*right as usize), None);
                                     y -= uu(3, 4);
                                     row(self, b, &mut y, note, dim(), reason, None);
@@ -4029,16 +4030,16 @@ impl Map {
                         // What it keeps: its own domain (the vault under the person's key and its identity). Its size is not told to the map yet; the hold (STORE.md) is later.
                         fact(b, &mut y, tr(Msg::Keeps), tr(Msg::OwnDomain));
                     }
-                    // Its rights, each a switch (asked once, ever, per person, per kist, per right: the person's answer, kept for all their devices; switched off, the right is taken back, the kist killed and started again without it), the developer's reason under each, "using now" while it holds a claim on it (only GPS is claimed today).
+                    // Its rights, each a switch (asked once, ever, per person, per kist, per right: the person's answer, kept for all their devices; switched off, the right is taken back, the kist killed and started again without it), the developer's reason under each, "using now" while it holds a claim on it (only GPS is claimed today). Only the asked ones: the implicit set (ferros_kist::IMPLICIT) is every kist's and has no switch (owner, 2026-11-12, "Yes on the implicit set").
                     y += uu(1, 2);
                     b.text(cx, y, note as u16, dim(), 1, tr(Msg::PagePermissions));
                     y += uu(2, 1);
-                    if k.wants.is_empty() {
+                    if !k.wants.iter().any(|w| w.asked()) {
                         row(self, b, &mut y, note, dim(), tr(Msg::AsksForNothing), None);
                     }
                     let gps = ferros_sys::claim::GPS;
                     let using = if k.wants.iter().any(|w| w.right as u64 == gps) { self.users(gps) } else { Vec::new() };
-                    for (j, w) in k.wants.iter().enumerate() {
+                    for (j, w) in k.wants.iter().enumerate().filter(|(_, w)| w.asked()) {
                         let right = right_name(w.right as usize);
                         let l = if w.answer.is_none() {
                             say(Say::NotAskedYet(right))
@@ -4171,7 +4172,8 @@ impl Map {
                 // Each right the other way round (owner, 2026-11-08: "who has GPS", "who has the network"), with the person's default for every new kist first: what its switch starts at in a first-launch question (out of the box, off).
                 let ks = self.kists.kists.clone();
                 // And who is using each right now (owner, 2026-11-10: "we need to be able to see what kists are using each permission"): a kist holding a claim on it says so by its name (`users`). Only GPS is claimed today; a right nothing marks the use of lists no one as using it.
-                for r in 0..ferros_kist::RIGHTS.len() {
+                // Only the asked rights: the implicit set (ferros_kist::IMPLICIT) is every kist's, with no default and no answer to turn (owner, 2026-11-12, "Yes on the implicit set").
+                for r in (0..ferros_kist::RIGHTS.len()).filter(|&r| !ferros_kist::implicit(r as u8)) {
                     row(self, b, &mut y, uu(3, 2), white(), right_name(r), None);
                     let on = self.kists.defaults >> r & 1 == 1;
                     mark(self, b, &mut y, 50, tr(Msg::NewKistsStartOn), on, Some(Choice::Default(r as u8)));
@@ -5010,14 +5012,14 @@ impl Map {
                         self.save_kists();
                     }
                     Some(Choice::AskWant(j)) => self.ask ^= 1 << j,
-                    // The question answered: every want it showed gets the switch's answer, kept for the person (asked once, ever); then the circle closes and init launches the kist.
+                    // The question answered: every asked want it showed gets the switch's answer, kept for the person (asked once, ever); then the circle closes and init launches the kist.
                     Some(Choice::AskGo) => {
                         if let View::Open(i) = self.view {
                             let ask = self.ask;
                             let now = ferros_detail::eagle_now();
                             if let Some(k) = i.checked_sub(1).and_then(|k| self.kists.kists.get_mut(k)) {
                                 for (j, w) in k.wants.iter_mut().enumerate() {
-                                    if w.answer.is_none() {
+                                    if w.asked() && w.answer.is_none() {
                                         w.answer = Some((ask >> j & 1 == 1, now));
                                     }
                                 }

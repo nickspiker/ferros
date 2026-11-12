@@ -488,6 +488,32 @@ pub mod dnd {
     }
 }
 
+/// Where a kist finds its grants (docs/KISTS.md "The implicit set"; ferros_kist `slots`, the one layout, which the kernel follows), for a kist whose capsule declares only the rights it is asked for, as every capsule does from 2026-11-12: the implicit set in fixed slots, never declared, never asked (owner, 2026-11-12: "Yes on the implicit set"), its asked wants after the first six, then the GPU's three (`gpu::kist_slots(LEADING + asked)`), then sound out. A right the person said no to is an empty slot, its token zeros. A capsule that still declares implicit rights gets each where it declares it, as before.
+pub mod kist {
+    /// The display endpoint (`use display`).
+    pub const DISPLAY: u64 = 1;
+    /// The touch endpoint (`use touch`).
+    pub const TOUCH: u64 = 2;
+    /// A surface of its own: its window.
+    pub const SURFACE: u64 = 3;
+    /// Its key sealed to this device (`ira_key`).
+    pub const IRA: u64 = 4;
+    /// Its own vault domain (`--store`'s grant).
+    pub const DOMAIN: u64 = 5;
+    /// Randomness.
+    pub const ENTROPY: u64 = 6;
+    /// The slots before the asked wants.
+    pub const LEADING: u64 = 6;
+    /// The slot of its asked want `i` (from 0, in the order it declares them).
+    pub const fn asked(i: u64) -> u64 {
+        LEADING + 1 + i
+    }
+    /// Sound out (`use audio`), after the GPU's three slots, for a kist declaring `asked` asked wants.
+    pub const fn audio(asked: u64) -> u64 {
+        LEADING + asked + 4
+    }
+}
+
 /// The GPU as every client reaches it (docs/GPU-KISTS.md plan step 1, 2026-11-12): what the kernel puts ahead of each call on the `gpu` endpoint, and where a kist finds its GPU grants.
 pub mod gpu {
     /// The GPU service's view of a client's own block of the layer arena: offset 0 of the block (payloads/gpu `ARENA_VA`). A client names its memory to its kernels as `ARENA_VA` plus an offset into its own block; nothing else of the arena is mapped for it.
@@ -500,7 +526,7 @@ pub mod gpu {
     /// Status 5: a kist's job on a production build (its GPU code is unchecked: development builds only, until the checked kernel form).
     pub const UNCHECKED: u8 = 5;
 
-    /// A kist's GPU grants by slot (the kernel's `kist_gpu`): with `wants` declared wants in slots 1 to `wants`, the GPU service at `wants + 1`, its block of the layer arena at `wants + 2`, a second surface for a mailbox at `wants + 3`. Each may be an empty slot (none free, or a production build): its token reads as zeros.
+    /// A kist's GPU grants by slot (the kernel's `kist_gpu`; ferros_kist `slots`): with `wants` slots before them (1 to `wants`), the GPU service at `wants + 1`, its block of the layer arena at `wants + 2`, a second surface for a mailbox at `wants + 3`. For a kist that declares only asked rights (`super::kist`), `wants` is `kist::LEADING` plus how many it declares; for a capsule that declares implicit rights too (as every capsule did before 2026-11-12), how many it declares. Each may be an empty slot (none free, or a production build): its token reads as zeros.
     pub const fn kist_slots(wants: u64) -> (u64, u64, u64) {
         (wants + 1, wants + 2, wants + 3)
     }
@@ -1557,7 +1583,7 @@ fn spawn_with(grants: u64, name: &[u8], key: &[u8], slots: &[u64], flags: u64) -
     svc(nr::SPAWN, off(req.as_ptr()), at as u64, flags, 0, 0)
 }
 
-/// Launch a kist (KISTS.md; `SYS_SPAWN` kist mode): the capsule stored in the vault under its 32-byte address `capsule` (the `capsules.` scope) as a process called `name`, with one slot per want the capsule declares, in its order: the right's code (ferros_kist::RIGHTS) where the person granted it, G#FF (an empty slot) where they did not. The kernel makes every right's object itself from the Kists capability at grant `kists`, and refuses any right the capsule does not declare in that slot once it has read it. 0 queued (the kernel streams the capsule from the vault and starts it; the outcome goes to the console), `RUNNING_ON` | surface << 8 | generation already running on that surface (its window, display op 59), NOTHING already running with no surface or still starting, ERR refused (the reason on the console). At most 64 slots. `replace`: a live process of that name is killed first (one shot dead) and the kist launched again; with none alive, NOTHING and nothing launched.
+/// Launch a kist (KISTS.md; `SYS_SPAWN` kist mode): the capsule stored in the vault under its 32-byte address `capsule` (the `capsules.` scope) as a process called `name`, with one code per want the capsule declares, in its order: the right's code (ferros_kist::RIGHTS) where the person granted it, G#FF (an empty slot) where they did not, and an implicit right's code always (ferros_kist `launch_codes`). The kernel lays the kist's slots out itself (ferros_kist `slots`, the implicit set handed whatever is sent for it), makes every right's object itself from the Kists capability at grant `kists`, and refuses any right the capsule does not declare in that slot once it has read it. 0 queued (the kernel streams the capsule from the vault and starts it; the outcome goes to the console), `RUNNING_ON` | surface << 8 | generation already running on that surface (its window, display op 59), NOTHING already running with no surface or still starting, ERR refused (the reason on the console). At most 64 slots. `replace`: a live process of that name is killed first (one shot dead) and the kist launched again; with none alive, NOTHING and nothing launched.
 pub fn spawn_kist(grants: u64, kists: u64, name: &[u8], capsule: &[u8; 32], codes: &[u8], replace: bool) -> u64 {
     kist_call(grants, kists, name, capsule, codes, 2 | (replace as u64) << 2)
 }
