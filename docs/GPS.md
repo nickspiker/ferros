@@ -100,6 +100,7 @@ The replay carries gpsd's aiding from the capture night: the time (ferros rewrit
   - The messages themselves stay: cut or zeroed, the chip waits 5-8 minutes alike, and zeroed keeps the record sequence the chip acknowledges.
   - The driver says where the aid's place came from: "position from the last fix", "from the zone in effect, <zone>" (2026-11-11), or "from none".
 - **Not checked:** the replays' `92 81` and `8e 81` messages are not decoded, so I can't rule out that they also carry a place. The capture's own files stay on Harbor.
+- **Passive reads and the hourly fix** (proposed 2026-11-11, LOCATION.md): a `place` right that reads the last place without turning the radio on, a place service that keeps it from every fix and the serving cell, and at most one fix an hour of its own, screen on. Nothing the chip learns survives a session today (its rails go off with the driver, its firmware is reloaded each start): LOCATION.md "GPS: what a fix costs".
 - **A first fix with no last position starts cold** (about 5-8 minutes, measured with a zeroed position); since 2026-11-11 it starts from the zone in effect's principal place when there is one ("A rough start from the zone"). Every fix after it, in that person's session, starts from their own last fix.
 
 ## The satellites (2026-11-07)
