@@ -1,4 +1,6 @@
-# The store: items, not folders
+# The hold: items, not folders
+
+The hold is where a person's things are kept (owner, 2026-11-11: "the hold? Is that the right word?", then "Yes, and I'd say not worry about the snag. it's common to hold a bag and to put shit in the hold."): kists are stowed, items go in the hold. "Held call" (a doorbell wait) keeps its meaning beside it.
 
 Status: a draft for the owner to mark up, 2026-11-11.
 Nothing here is built.
@@ -464,7 +466,7 @@ What this spec would add, and what it would not:
 
 ## 7. Open questions for the owner
 
-0. **The name.** "Item" is the owner's word from the ask; the store and its page need names a person reads ("your things"?), and perhaps a Māori one for the store as kete and manifestus have (pātaka, the raised storehouse, is one candidate).
+0. **The name.** Decided (owner, 2026-11-11): the store is **the hold**. Still open: "item" for what is in it, and the find page's name.
 1. **Kinds replace the common area's names?** VAULT-OUT.md decision 2 made the common area a small set of named grants (`wallpaper`, `images`, `contacts`, `theme`); this spec makes them kinds (ideas), with developers minting their own. Same idea, wider, or keep names for system state and kinds for items?
 2. **May a kist open what it made itself without asking?** Proposed yes (it is the `items` right); a rebuild under another key asks per kind.
 3. **Picks remembered.** Proposed: a picked item stays openable by that kist until the person takes it back, kept with their answers. Or a pick lasts only while the kist runs?
