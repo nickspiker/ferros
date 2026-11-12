@@ -145,13 +145,13 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, input_len: u64) -> ! {
         refuse(grants, "the touch process did not answer INFO");
     }
     let (x_max, y_max) = (u16::from_le_bytes([info[0], info[1]]), u16::from_le_bytes([info[2], info[3]]));
-    // The frame count now, from the display's info (op 5, bytes 4-7), so the first wait counts only frames from here.
-    let mut di = [0u8; 16];
-    let n = call(display, &[5], &mut di);
-    if n == ERR || n < 8 {
-        refuse(grants, "the display did not answer INFO");
+    // The frame-start count now, from a first frame wait (op 24's own count), so the first wait of the script counts only frames from here.
+    // Until 2026-11-11 it came from op 5's frame count (bytes 4-7), which on the Pixel 8a is not the frame-start count: the first wait then spanned some A#100000 frames and swallowed every hold (a tap's finger went down and up between two frames of the app under it).
+    let mut fr = [0u8; 4];
+    if call(display, &[24], &mut fr) == ERR {
+        refuse(grants, "the display did not answer the frame wait");
     }
-    let mut clock = Clock { display, last: u32::from_le_bytes([di[4], di[5], di[6], di[7]]), starts: 0, frames: 0, widest: 0 };
+    let mut clock = Clock { display, last: u32::from_le_bytes(fr), starts: 0, frames: 0, widest: 0 };
     let mut hand = Hand { touch, down: 0, at: [(0, 0); FINGERS as usize], batch: Vec::new(), records: 0 };
     let mut owed: u64 = 0;
     let mut idles = 0u32;
