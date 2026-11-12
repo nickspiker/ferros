@@ -403,7 +403,7 @@ fn serve(grants: u64) -> ! {
                 ferros_sys::PtReply::Done(total, _, _) if stale => {
                     waiting = false;
                     stale = false;
-                    say!(grants, "usb: the reply to a gone host's command dropped (A#{total} bytes, A#{} ms after it came)\n", ferros_sys::now().wrapping_sub(t_submit) * 1000 / freq);
+                    say!(grants, "usb: the reply to a gone host's command dropped (A#{total} bytes, A#{} ms after it came)\n", (ferros_sys::now() - t_submit) * 1000 / freq);
                 }
                 ferros_sys::PtReply::Done(total, replied, wants_act) => {
                     waiting = false;

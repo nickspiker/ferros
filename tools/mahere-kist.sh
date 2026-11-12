@@ -17,4 +17,5 @@ B=target/debug/ferros-bridge
     --want entropy "to make the keys its vault is sealed with" \
     --want gps "to show where you are on the map" \
     --want udp "to fetch the map from Mahere's servers as you look around, keeping it on this device"
-cargo run -q -p ferros-send -- send "$out"
+# Not -q: a build, or a wait on another build's lock, says so instead of looking like a silent device.
+cargo run -p ferros-send -- send "$out"

@@ -290,6 +290,7 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
 /// A part of a kist offered to stow (`ferros.kist.offer` Write: [capsule 32][offset u64 LE][more u8][bytes], checked by the caller): a put into the device's `capsules.` under the capsule's address, as the bridge's part form of `store` puts one, its first call made. Err(the PT reply) when the vault process is not serving or the call could not be made.
 fn offer_part(params: &[u8]) -> Result<VaultJob, alloc::vec::Vec<u8>> {
     if !crate::process::vault_serving() {
+        crate::flashlog::line("kist offer refused (A#4): the vault process is not serving");
         let mut r = alloc::vec![4u8];
         r.extend_from_slice(b"the vault process is not serving");
         return Err(r);
@@ -1816,6 +1817,8 @@ pub fn run(mut b: Boot) -> ! {
     let mut offer_part_waiting = false;
     let mut vault_for_offer = false;
     let mut offer_hold: Option<([u8; 32], u8, u64)> = None;
+    // When the part being kept came (the console's line for each part says how long the vault took: the USB driver gives up on a reply at 16 s).
+    let mut offer_part_at = 0u64;
     // A drop of the released person's domain sent to the vault process, its answer awaited (`RELEASE_DROPS`).
     let mut release_drop_sent = false;
     // A kist's capsule being read from the vault process for its launch (`KistJob`).
@@ -2100,6 +2103,15 @@ pub fn run(mut b: Boot) -> ! {
                 match vault_job_step(job, params, &mut store) {
                     Some(resp) => {
                         // An offered part the vault did not keep: the host starts the capsule again from its first part.
+                        if vault_for_offer {
+                            let ms = (cntpct() - offer_part_at) * 1000 / freq;
+                            match (resp.first(), offer_rx) {
+                                (Some(&0), Some((_, end, true))) => crate::flashlog::line(&alloc::format!("kist offer: carried in whole, A#{end} bytes (its last part kept in A#{ms} ms)")),
+                                (Some(&0), Some((_, end, false))) => crate::process::push_console(alloc::format!("kist offer: a part kept, A#{end} bytes in, in A#{ms} ms\n").as_bytes()),
+                                (Some(&s), _) => crate::flashlog::line(&alloc::format!("kist offer: a part not kept (status A#{s}, in A#{ms} ms): the host starts again from the first")),
+                                (None, _) => crate::flashlog::line(&alloc::format!("kist offer: a part not kept (no status, in A#{ms} ms): the host starts again from the first")),
+                            }
+                        }
                         if resp.first() != Some(&0) && core::mem::take(&mut vault_for_offer) {
                             offer_rx = None;
                         }
@@ -2399,7 +2411,9 @@ pub fn run(mut b: Boot) -> ! {
                 queue_pt_response(&mut pt_out_data, b"closed: a production build answers only a reboot, a plain DIAG and a kist offered to stow over USB\n");
             } else if cmd.cap == cap_offer {
                 // A kist offered to stow (docs/KISTS.md "Stowing"): its parts kept in `capsules.`, then offered to the installer, then its state read by the host, held. Every answer but a state is [status][words]: 0 done, 1 nobody present, 2 another offer is waiting, 3 a part or an offer not as the protocol says, 4 no installer.
+                // Each refusal on the flash log too, one line: what the host was told is where an offer stopped.
                 let say = |status: u8, words: &str| {
+                    crate::flashlog::line(&alloc::format!("kist offer refused (A#{status}): {words}"));
                     let mut r = alloc::vec![status];
                     r.extend_from_slice(words.as_bytes());
                     r
@@ -2438,6 +2452,10 @@ pub fn run(mut b: Boot) -> ! {
                             queue_pt_response(&mut pt_out_data, &say(3, "parts come in order, from the first"));
                         } else {
                             offer_rx = Some((c, offset + (cmd.params.len() - 41) as u64, !more));
+                            offer_part_at = cntpct();
+                            if offset == 0 {
+                                crate::flashlog::line(&alloc::format!("kist offer: a capsule carried in over USB, its first part come (G#{:02X}{:02X}{:02X}{:02X}...)", c[0], c[1], c[2], c[3]));
+                            }
                             // The kernel's channel to the vault is one call at a time: a kist job reading a capsule holds it, so the part waits for it (its reply with it).
                             if kist_job.is_some() {
                                 offer_part_waiting = true;

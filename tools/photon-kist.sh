@@ -8,4 +8,5 @@ cd "$here"
 bin=std/photon/target/aarch64-unknown-ferros/debug/photon.bin
 out=target/photon.capsule.vsf
 tools/photon-capsule.sh "$bin" "$out"
-cargo run -q -p ferros-send -- send "$out"
+# Not -q: a build, or a wait on another build's lock, says so instead of looking like a silent device.
+cargo run -p ferros-send -- send "$out"

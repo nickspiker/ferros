@@ -152,6 +152,20 @@ pub mod offer {
             _ => "something went wrong",
         }
     }
+
+    /// A state's name, for the device's log lines (one a stage, so the next run shows where an offer stopped).
+    pub fn state_name(state: u8) -> &'static str {
+        match state {
+            OFFERED => "offered",
+            CHECKING => "checking",
+            ASKING => "asking the person",
+            STOWED => "stowed",
+            REFUSED => "refused",
+            CANCELLED => "cancelled",
+            GONE => "gone",
+            _ => "a state not known",
+        }
+    }
 }
 
 /// A right's code from its name; None for a name outside the vocabulary.

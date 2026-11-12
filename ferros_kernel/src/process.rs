@@ -3570,6 +3570,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     Some(o) => {
                         if o.state == ferros_kist::offer::OFFERED {
                             o.state = ferros_kist::offer::CHECKING;
+                            crate::flashlog::line("kist offer: the installer took it");
                         }
                         let mut out = [0u8; 40];
                         out[..32].copy_from_slice(&o.capsule);
@@ -3584,6 +3585,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     let b = p.read(f.x[2], 35);
                     match offer.as_mut().filter(|o| o.capsule[..] == b[..32] && !ferros_kist::offer::finished(o.state)) {
                         Some(o) => {
+                            if (o.state, o.why, o.flags) != (b[32], b[33], b[34]) {
+                                crate::flashlog::line(&alloc::format!("kist offer: the installer says {} (why A#{}, flags A#{})", ferros_kist::offer::state_name(b[32]), b[33], b[34]));
+                            }
                             o.state = b[32];
                             o.why = b[33];
                             o.flags = b[34];
@@ -5487,6 +5491,7 @@ pub fn offer_state(capsule: &[u8; 32]) -> [u8; 3] {
 pub fn offer_drop() {
     with_lock(|| {
         if let Some(o) = unsafe { (*(&raw mut OFFER)).as_mut() }.filter(|o| !ferros_kist::offer::finished(o.state)) {
+            crate::flashlog::line(&alloc::format!("kist offer: gone, the person left while it was {}", ferros_kist::offer::state_name(o.state)));
             o.state = ferros_kist::offer::GONE;
         }
     })
