@@ -960,12 +960,12 @@ fn intruder(grants: u64, arena: usize) -> ! {
         kept += ok as u32;
         say!(grants, "gputest intruder: store at G#{t:X} ({}): status {status} in {us} us{}{}: {}\n", if inside { "its own block" } else { "not its memory" }, if status == OUTSIDE { ", faulted at G#" } else { "" }, Hex(if status == OUTSIDE { Some((addr, st)) } else { None }), if ok { "as it must" } else { "WRONG" });
     }
-    // An endless kernel: r0 stays 0, so the loop never leaves. Stopped by the service at its guard, its group ended; nothing on the host counts time for it.
+    // An endless kernel: r0 stays 0 and `BRANCHZ.eq` branches on zero, so the loop never leaves. Stopped by the service at its guard, its group ended; nothing on the host counts time for it.
     let mut k = Kernel::<32>::new();
     k.iadd_imm_i32(r(0), Lut::ZERO, 0).reconverge();
     let top = k.here();
     k.iadd_imm_i32(r(1), r(0), 1);
-    k.branchz(r(0), top).reconverge();
+    k.branchz_eq(r(0), top).reconverge();
     k.shaddx_u64(pair(2), u(0), pair(60), 2);
     k.store_i32(r(1), pair(2), 0, Slot::S0).end();
     let words = k.finish();
@@ -984,6 +984,25 @@ fn intruder(grants: u64, arena: usize) -> ! {
     let bad = u32::from_le_bytes([r[0], r[1], r[2], r[3]]);
     say!(grants, "gputest intruder: {kept} of {n} stores went as they must; the keeper ({got} bytes): {bad} of its pattern words changed, its own Mandelbrot status {}, {} pixels wrong\n", r[8], u32::from_le_bytes([r[9], r[10], r[11], r[12]]));
     exit(if kept as usize == n && got == 13 && bad == 0 && r[8] == 0 { 0 } else { 1 });
+}
+
+/// The endless kernel alone (input [13, 2]), for killing a client while its job runs: the kernel then holds its block back from the next owner until the GPU service has ended the job and taken its next request (process.rs `gpu_drain`).
+fn spinner(grants: u64, arena: usize) -> ! {
+    let mut k = Kernel::<32>::new();
+    k.iadd_imm_i32(r(0), Lut::ZERO, 0).reconverge();
+    let top = k.here();
+    k.iadd_imm_i32(r(1), r(0), 1);
+    k.branchz_eq(r(0), top).reconverge();
+    k.shaddx_u64(pair(2), u(0), pair(60), 2);
+    k.store_i32(r(1), pair(2), 0, Slot::S0).end();
+    let words = k.finish();
+    for (i, &w) in words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+    }
+    say!(grants, "gputest spinner: block at G#{arena:X}, its endless kernel sent\n");
+    let (status, us, _, _) = run_far(grants, words.len(), 1, 0x1000, &[ARENA_VA + (1 << 20)]);
+    say!(grants, "gputest spinner: status {status} after {us} us\n");
+    exit(0);
 }
 
 /// "fault address G#…, AS_FAULTSTATUS G#…" for an intruder's line, or nothing.
@@ -1043,10 +1062,11 @@ extern "C" fn gputest_main(grants: u64, input: u64, input_len: u64) -> ! {
     }
     // Input [13, 0] and [13, 1]: the isolation test's keeper and intruder (GPU-KISTS.md plan step 1).
     if input_len > 1 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 13 {
-        if unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 1) as *const u8) } == 0 {
-            keeper(grants, arena);
+        match unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 1) as *const u8) } {
+            0 => keeper(grants, arena),
+            2 => spinner(grants, arena),
+            _ => intruder(grants, arena),
         }
-        intruder(grants, arena);
     }
     // Input byte 1: the ops test (the builder's new instructions); none: the Mandelbrot.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 1 {

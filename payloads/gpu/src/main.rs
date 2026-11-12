@@ -1146,8 +1146,8 @@ extern "C" fn mmu_watch(irq: u64) -> ! {
         }
         let raw = rd32(regs + MMU_IRQ_RAWSTAT);
         for n in 1..8 {
-            // Bit n a page fault in address space n, bit n + 16 a bus fault there.
-            if raw & (1 << n | 1 << (n + 16)) != 0 {
+            // Bit n a page fault in address space n. The bits from 16 are not bus faults on a CSF GPU (kbase's CSF handler takes bits 0-15 alone, mmu/backend/mali_kbase_mmu_csf.c `kbase_mmu_interrupt`; a bus fault comes as a GPU fault): bit 17 rose on akita with no fault in AS1 (2026-11-12) after its LOCK and FLUSH_PT, and is left masked.
+            if raw & 1 << n != 0 {
                 space_fault(regs, n);
             }
         }
@@ -1290,7 +1290,7 @@ fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], cores: u
     // The grants page's count (G#200, ferros_sys::cap) says whether slot 8 was given.
     let mmu_ok = unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + grants + 0x200) as *const u32) } as u64 > S_MMU;
     g.wr(MMU_IRQ_CLEAR, 0xFFFF_FFFF);
-    g.wr(MMU_IRQ_MASK, 0xFFFF_FFFF);
+    g.wr(MMU_IRQ_MASK, 0xFFFF);
     if mmu_ok {
         MMU_REGS.store(g.regs, core::sync::atomic::Ordering::Release);
         ferros_sys::thread_spawn(mmu_watch, unsafe { &mut *(&raw mut MMU_STACK) }, mmu);
@@ -1426,9 +1426,9 @@ fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], cores: u
             }
         }
         // Without the MMU line a stalled fault shows only now, in the raw status.
-        if !mmu_ok && g.rd(MMU_IRQ_RAWSTAT) & (1 << n_as | 1 << (n_as + 16)) != 0 {
+        if !mmu_ok && g.rd(MMU_IRQ_RAWSTAT) & 1 << n_as != 0 {
             space_fault(g.regs, n_as);
-            g.wr(MMU_IRQ_CLEAR, 1 << n_as | 1 << (n_as + 16));
+            g.wr(MMU_IRQ_CLEAR, 1 << n_as);
         }
         let us = ferros_sys::us_since(t0) as u32;
         let fault = MMU_FAULTS[n_as].swap(0, core::sync::atomic::Ordering::AcqRel);
