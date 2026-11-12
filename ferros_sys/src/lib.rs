@@ -62,6 +62,7 @@ pub mod nr {
     pub const NOT_STARTED: u64 = 39;
     pub const ARC: u64 = 40;
     pub const OFFER: u64 = 41;
+    pub const CALLER: u64 = 42;
 }
 
 /// The caller's own arc, grown or shrunk on demand (kernel SYS_ARC, docs/ARCS.md step 2; owner, 2026-11-11: "why we cannot scale on demand, that was the whole point of ring memory"). No capability: a process reaches only its own arc, and only up to its ceiling (the heap its build declared, counted whole; fixed mode's size). A top is an arc offset: the arc's size, or exact mode's limit.
@@ -1675,6 +1676,19 @@ pub fn reply(token: &[u8; 32], msg: &[u8]) -> u64 {
     svc(nr::REPLY, off(token.as_ptr()), off(msg.as_ptr()), msg.len() as u64, 0, 0)
 }
 
+/// `caller`'s answer: the caller holds the Settings capability (the map, the attest screen: the system's window management).
+pub const CALLER_SETTINGS: u64 = 1 << 8;
+/// `caller`'s answer: the caller is a kist.
+pub const CALLER_KIST: u64 = 1 << 9;
+
+/// What the process behind a call holds that its server decides by (kernel SYS_CALLER), asked with the call's reply token before replying: bits 0-3 the surfaces it holds (surface k its own, or inside a region holding it whole), `CALLER_SETTINGS`, `CALLER_KIST`. None for a token that is no call of this process's, or on a kernel from before (no such syscall): a server refuses then.
+pub fn caller(token: &[u8; 32]) -> Option<u64> {
+    match svc(nr::CALLER, off(token.as_ptr()), 0, 0, 0, 0) {
+        ERR | NOTHING => None,
+        h => Some(h),
+    }
+}
+
 /// Read a 32-bit register of a hardware grant (ERR if the offset is unaligned or outside it).
 pub fn mmio_read(cap: u64, offset: u64) -> u64 {
     svc(nr::MMIO_READ, cap, offset, 0, 0, 0)
@@ -1834,6 +1848,8 @@ pub mod window {
     pub const SYSTEM: u8 = 2;
     /// A surface pixel that shows what is behind it.
     pub const CLEAR: u64 = 1 << 63;
+    /// A reply's status for an op naming a surface the caller does not hold, or acting on a window that is neither the caller's nor the caller the system's (WINDOWS.md "Whose surface").
+    pub const NOT_YOURS: u8 = 4;
     /// The bytes before a surface's pixel 0 (the kernel's SURFACE_PORCH): `dma` answers a surface past them, and a process that reaches its surface through its handle adds them to every offset.
     pub const PORCH: u64 = 64;
 

@@ -1286,6 +1286,10 @@ const SYS_NOT_STARTED: u64 = 39;
 const SYS_ARC: u64 = 40;
 /// offer(op, install, …): the kist offered over USB to stow (`OFFER`; docs/KISTS.md "Stowing", ferros_kist::offer; owner, 2026-11-11: "Just seems to me that we should just make a proper checked path and start using it"), for the installer alone: x1 the offset of its Install token (`Object::Install`). Op 0: the offers' doorbell, x2 a word in the caller's arc: the offers' change count written there now and whenever a host offers a kist, its waiters woken (`bell_register`, `BELL_OFFERS`) → 0. Op 1: the offer not yet ended, x2/x3 a buffer and its length (40 at least) → 0 with [capsule 32][length u64 LE] written (an offer still OFFERED becomes CHECKING), NOTHING when there is none. Op 2: its state as the installer has it, x2/x3 [capsule 32][state u8][why u8][flags u8] → 0, NOTHING when that capsule is not the offer or the offer has ended; the service loop answers a host's held read (`offer_state`). ERR without the Install right, or for no such op.
 const SYS_OFFER: u64 = 41;
+/// caller(reply): what the process behind a call holds that its server decides by (2026-11-12, the display's isolation: until then any app could show, draw into, raise or read the events of another app's surface by naming it). x0 the offset of a reply token the caller holds (SYS_RECV's, not yet replied) → bits 0-3 the surfaces that process holds (surface k as its own `surface-k`, or inside a region holding it whole: the display server's and the GPU service's `surfaces`), bit 8 the Settings capability (the map, the attest screen: the system's window management), bit 9 a kist (`CALLER_*`); NOTHING for a token that is no reply this process holds, or one for the kernel's own call. No capability: the token is the proof, and only the server the call came to holds it. A kernel from before answers ERR (no such syscall), which a server takes as a refusal.
+const SYS_CALLER: u64 = 42;
+pub const CALLER_SETTINGS: u64 = 1 << 8;
+pub const CALLER_KIST: u64 = 1 << 9;
 pub const ARC_GROW: u64 = 0;
 pub const ARC_SHRINK: u64 = 1;
 pub const ARC_SIZE: u64 = 2;
@@ -1874,6 +1878,29 @@ fn gpu_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
 /// The GPU service took a request: whatever waited for its last job to end may be given out again. Under the lock.
 fn gpu_drained() {
     unsafe { GPU_DRAINING = 0 };
+}
+
+/// What process `p` holds that a server decides by (SYS_CALLER): bit k surface k, held as its own `surface-k` or inside a region that holds it whole; `CALLER_SETTINGS` for the Settings capability; `CALLER_KIST` for a kist. From its capability table, so a surface passed on at a spawn counts for both holders, and one freed at an end for neither (the table goes with the process).
+fn caller_holds(p: &Process) -> u64 {
+    let s0 = crate::cachemap::SURFACES.0;
+    let size = crate::cachemap::SURFACE_SIZE;
+    let mut bits = (p.kist as u64) * CALLER_KIST;
+    for c in &p.cspace {
+        match c.object {
+            Object::Dma(i) => {
+                let (b, n) = region(i);
+                for k in 0..SURFACE_COUNT {
+                    let at = s0 + k * size;
+                    if b <= at && at + size <= b + n {
+                        bits |= 1 << k;
+                    }
+                }
+            }
+            Object::Settings if c.rights & RIGHT_SEND != 0 => bits |= CALLER_SETTINGS,
+            _ => {}
+        }
+    }
+    bits
 }
 
 /// Whether process `p` holds the `surfaces` region (the display server: it composes every app's surface, so it alone may watch their owners).
@@ -3733,6 +3760,14 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     }
                 }
                 _ => ERR,
+            };
+            0
+        }
+        SYS_CALLER => {
+            let token = p.read(f.x[0], 32);
+            f.x[0] = match p.lookup(&token).map(|i| p.cspace[i].object) {
+                Some(Object::Reply(caller)) if caller != KERNEL_CALLER => proc_of(caller).map_or(NOTHING, |q| caller_holds(q)),
+                _ => NOTHING,
             };
             0
         }
