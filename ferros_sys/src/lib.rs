@@ -1867,8 +1867,29 @@ pub mod window {
     pub const WORKING: u8 = 0;
     /// A surface of fluor's 16-bit pixels (fluor `pixel::G2t16`: α and darkness of VSF `g2t` codes), which the display decodes itself.
     pub const G2T16: u8 = 1;
+    /// A surface already in the panel's codes (the display's COMPOSITOR.md "Baked"; owner, 2026-11-12): R, G, B in bits 0-15, 16-31, 32-47, each the panel's own code (its primaries, the roll-off and its gamma applied by the producer, `bake`) in Q16 of its top, premultiplied; bit 63 see-through, bits 49-62 the transparency (Q14), bit 48 no dither, as `WORKING`'s. The display composes and presents them as they are.
+    pub const BAKED: u8 = 2;
 
-    /// As `show`, saying what the surface's pixels are (`WORKING` or `G2T16`).
+    /// The bake a `BAKED` surface is made with (display op 65), its generation first: a working colour (VSF RGB, gamma 2, white at 1) v becomes, per channel, l = tanh²(k·v); the panel's light p = m·l (rows the panel's red, green, blue; columns VSF's); its code p^g, × 65472 (the panel's top code in Q16 less its last quarter step), held at the field's ends. A brightness change moves the generation and is told to every window as `EV_BAKE`.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Bake {
+        pub generation: u32,
+        pub k: f32,
+        pub m: [[f32; 3]; 3],
+        pub g: f32,
+    }
+
+    /// The display's bake now (op 65 → `[0][generation u32][k f32][m 9 × f32, row by row][g f32]`, little-endian), None from a display without it.
+    pub fn bake(display: u64) -> Option<Bake> {
+        let mut r = [0u8; 49];
+        if super::call(display, &[65], &mut r) != 49 || r[0] != 0 {
+            return None;
+        }
+        let f = |i: usize| f32::from_le_bytes([r[i], r[i + 1], r[i + 2], r[i + 3]]);
+        Some(Bake { generation: u32::from_le_bytes([r[1], r[2], r[3], r[4]]), k: f(5), m: core::array::from_fn(|i| core::array::from_fn(|j| f(9 + 4 * (3 * i + j)))), g: f(45) })
+    }
+
+    /// As `show`, saying what the surface's pixels are (`WORKING`, `G2T16` or `BAKED`).
     pub fn show_as(display: u64, base: u64, x: u16, y: u16, w: u16, h: u16, level: u8, format: u8) -> bool {
         let mut m = [0u8; 19];
         m[0] = 22;
@@ -2003,6 +2024,8 @@ pub mod window {
     pub const EV_FRONT: u8 = 2;
     /// A key pressed for this window (back's tap: `KEY_ESCAPE`).
     pub const EV_KEY: u8 = 3;
+    /// The display's bake changed (a brightness change): a `BAKED` surface is made again with the new one (`bake`), every pixel of it.
+    pub const EV_BAKE: u8 = 4;
     /// Escape, by its USB HID usage: what back's tap sends the app in front (up one page; nothing at its main page).
     pub const KEY_ESCAPE: u8 = 0x29;
     /// How many events op 62 holds a window: the newest, a ring (a window that missed more still learns whether it is behind, the reply's state byte).
