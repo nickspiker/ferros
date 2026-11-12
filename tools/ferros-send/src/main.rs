@@ -44,6 +44,8 @@ fn say(line: &str) {
 fn plain(r: &[u8]) -> Result<(), String> {
     match r.split_first() {
         Some((0, _)) => Ok(()),
+        // A part the device's vault did not keep comes back as its status alone (2026-11-12, Photon on the 8a: "not sent: " and nothing after it).
+        Some((s, [])) => Err(format!("the device answered status A#{s} and no words (`ferros-bridge diag log` says which step)")),
         Some((_, words)) => Err(String::from_utf8_lossy(words).into_owned()),
         None => Err("the device gave no answer".into()),
     }
@@ -213,6 +215,7 @@ mod tests {
     fn plain_answers() {
         assert_eq!(plain(&[0]), Ok(()));
         assert_eq!(plain(&[1, b'n', b'o']), Err("no".into()));
+        assert!(plain(&[4]).is_err_and(|w| w.contains("A#4")));
         assert!(plain(&[]).is_err());
     }
 

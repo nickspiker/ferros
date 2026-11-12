@@ -22,8 +22,8 @@ use ferros_store::{Domain, Nonces, Opener, Sealed, Store, Writer};
 use ferros_sys::{cap, console, freq, now, ERR};
 use manifestus::{Block, BlockDev, DeletePolicy, Mirror, Vault};
 
-/// The heap: manifestus's working set (its index walks, the reap's windows) and a piece being opened or sealed. 24 MiB since 2026-11-08: a write grows a buffer of manifestus's with the vault's entries (about 926 bytes an entry, doubling: 671,760 bytes writing a 47 MB kist capsule into an empty store, 1,343,504 writing it again, measured on the host, ferros_store `rewrite_peak`), and at 8 MiB the vault process died rewriting Mahere's capsule. The growth itself is manifestus's to bound.
-const HEAP_BYTES: usize = 24 << 20;
+/// The heap: manifestus's working set (its index walks, the reap's windows) and a piece being opened or sealed. 24 MiB from 2026-11-08: a write grows a buffer of manifestus's with the vault's entries (about 926 bytes an entry, doubling: 671,760 bytes writing a 47 MB kist capsule into an empty store, 1,343,504 writing it again, measured on the host, ferros_store `rewrite_peak`), and at 8 MiB the vault process died rewriting Mahere's capsule. 56 MiB since 2026-11-12 (the arc 64 MiB): on the 8a, after Mahere's cells, three Mahere capsules and an offer of Photon cut off at 64 MiB, the open itself ran 24 MiB out ("memory allocation of 69768 bytes failed" before "open in"), every boot, and the GPU, WiFi and sensors processes, which read their firmware from this vault, ended with it. The open's high water is on the console ("open in"). The growth itself is manifestus's to bound.
+const HEAP_BYTES: usize = 56 << 20;
 const STACK_BYTES: usize = 1 << 18;
 
 #[repr(C, align(16))]
@@ -753,7 +753,7 @@ extern "C" fn work(_: u64) -> ! {
     say!("vault: tract {} blocks from {}, the window {} a mirror", vault.tract_blocks(), vault.tract_base(), HALF);
     let mut store = Store::new(vault, Entropy { pool: [0; 4096], at: 4096 }, seconds);
     store.set_clock(now);
-    say!("vault: open in {} ms, serving", (now() - t0) * 1000 / freq());
+    say!("vault: open in {} ms, serving; the heap's high water {} KiB of {} KiB, {} KiB in use", (now() - t0) * 1000 / freq(), ferros_heap::PEAK.load(Relaxed) >> 10, HEAP_BYTES >> 10, ferros_heap::IN_USE.load(Relaxed) >> 10);
     // The pieces' helpers, idle until a read hands them a batch (`Helpers`).
     for s in HELPER_STACKS.iter() {
         if ferros_sys::thread_spawn(helper, unsafe { &mut *s.0.get() }, 0) == ERR {
@@ -1101,6 +1101,6 @@ fn migrate(store: &mut St) {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    say!("vault: panic: {}", info);
+    say!("vault: panic: {} (the heap's high water {} KiB of {} KiB)", info, ferros_heap::PEAK.load(Relaxed) >> 10, HEAP_BYTES >> 10);
     ferros_sys::exit(1)
 }
