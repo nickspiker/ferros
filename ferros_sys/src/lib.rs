@@ -419,6 +419,63 @@ pub mod dnd {
     }
 }
 
+/// The GPU as every client reaches it (docs/GPU-KISTS.md plan step 1, 2026-11-12): what the kernel puts ahead of each call on the `gpu` endpoint, and where a kist finds its GPU grants.
+pub mod gpu {
+    /// The GPU service's view of a client's own block of the layer arena: offset 0 of the block (payloads/gpu `ARENA_VA`). A client names its memory to its kernels as `ARENA_VA` plus an offset into its own block; nothing else of the arena is mapped for it.
+    pub const ARENA_VA: u64 = 0x8000_0000;
+    /// The apps' surfaces in a client's GPU view: a surface it holds at `SURFACES_VA` plus its distance from the first surface (`SURFACES_PA`, the kernel's cachemap SURFACES); a surface it does not hold is not mapped.
+    pub const SURFACES_VA: u64 = 0xC000_0000;
+    pub const SURFACES_PA: u64 = 0xCA00_0000;
+    /// The reply's status bytes past [status][µs u32] when the job reached outside the client's memory (status `OUTSIDE`): [the GPU address u64][the GPU MMU's fault status u32].
+    pub const OUTSIDE: u8 = 4;
+    /// Status 5: a kist's job on a production build (its GPU code is unchecked: development builds only, until the checked kernel form).
+    pub const UNCHECKED: u8 = 5;
+
+    /// A kist's GPU grants by slot (the kernel's `kist_gpu`): with `wants` declared wants in slots 1 to `wants`, the GPU service at `wants + 1`, its block of the layer arena at `wants + 2`, a second surface for a mailbox at `wants + 3`. Each may be an empty slot (none free, or a production build): its token reads as zeros.
+    pub const fn kist_slots(wants: u64) -> (u64, u64, u64) {
+        (wants + 1, wants + 2, wants + 3)
+    }
+
+    /// The most regions a stamp names that the service maps (a client holds a block and a surface or two).
+    pub const REGIONS: usize = 8;
+
+    /// The kernel's stamp ahead of a request on `gpu` (process.rs `gpu_stamp`): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build][n u8][n × (base u64, size u64)], every GPU-reachable region the caller holds. The kernel writes it for every call, so the service trusts it and nothing after it.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub struct Stamp {
+        pub epoch: u64,
+        pub kist: bool,
+        pub production: bool,
+        pub n: usize,
+        pub regions: [(u64, u64); REGIONS],
+    }
+
+    impl Stamp {
+        /// The stamp and the caller's own bytes after it; None when the message is shorter than its stamp (only a kernel from before the stamp sends one so) or names more than `REGIONS`: the service then refuses the request.
+        pub fn read(m: &[u8]) -> Option<(Stamp, &[u8])> {
+            if m.len() < 10 {
+                return None;
+            }
+            let n = m[9] as usize;
+            let end = 10 + 16 * n;
+            // WHY: a kernel from before the stamp delivers the client's own bytes here, which name any count; and a caller holding more GPU-reachable regions than the service maps is refused whole, never mapped in part.
+            if m.len() < end || n > REGIONS {
+                return None;
+            }
+            let mut s = Stamp { epoch: u64::from_le_bytes(m[0..8].try_into().unwrap()), kist: m[8] & 1 != 0, production: m[8] & 2 != 0, n, regions: [(0, 0); REGIONS] };
+            for k in 0..s.n {
+                let at = 10 + 16 * k;
+                s.regions[k] = (u64::from_le_bytes(m[at..at + 8].try_into().unwrap()), u64::from_le_bytes(m[at + 8..at + 16].try_into().unwrap()));
+            }
+            Some((s, &m[end..]))
+        }
+
+        /// The regions it names.
+        pub fn regions(&self) -> &[(u64, u64)] {
+            &self.regions[..self.n]
+        }
+    }
+}
+
 /// Preference 46: the sound's volume (docs/AUDIO.md "Volume"), a device setting set thru the Settings capability: 0 never set (`audio::DEFAULT_LEVEL`), 1-255 dimmest to loudest, each step a 16th of an octave of amplitude (255 is full scale, 239 half, 1 almost 16 octaves down).
 pub const PREF_VOLUME: u64 = 46;
 

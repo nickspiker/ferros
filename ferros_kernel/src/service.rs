@@ -960,8 +960,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Serve(b"rmnet"),
         Hardware(b"pcie0-elbi"), Hardware(b"pcie0-soc"), Hardware(b"pcie0-pcs"), Hardware(b"pcie0-udbg"), Hardware(b"pcie0-phy"), Hardware(b"pcie0-dbi"), Hardware(b"pcie0-cfg"), Hardware(b"pcie0-mem"),
         Hardware(b"cmu-hsi1"), Hardware(b"hsi1-sysreg"), Hardware(b"gpio-hsi1"), Hardware(b"sysmmu-hsi1"), Hardware(b"s2mpu-hsi1"), Hardware(b"gpio-alive"),
-        // 68: was the PMU a second time (the modem takes slot 40's, the same grant, since 2026-11-05); now the layer arena (GPU.md "Layers"), for the GPU service and its clients. The grants page holds 108 slots (process.rs PREFS at G#FC0), so slots are reused, never appended past 108.
-        Dma(b"layers"),
+        // 68: was the PMU a second time (the modem takes slot 40's, the same grant, since 2026-11-05); now the layer arena (GPU.md "Layers"), whole: init passes it on as a 32 MiB block of it, the child's own (process.rs SYS_SPAWN; GPU-KISTS.md plan step 1, 2026-11-12), the attest screen's. The grants page holds 108 slots (process.rs PREFS at G#FC0), so slots are reused, never appended past 108.
+        Dma(b"arena"),
         Dma(b"modem-pktproc"), Dma(b"modem-ipc"), Dma(b"modem-msi"),
         // 72 and 76, the modem and vendor partitions of the slot Android runs from: akita's is slot b (its Bluetooth patch read from there, 2026-11-09), husky's slot a.
         Part(if crate::board::akita() { b"modem_b" } else { b"modem_a" }), Part(b"efs"), Part(b"persist"), Part(b"modem_userdata"), Part(if crate::board::akita() { b"vendor_b" } else { b"vendor_a" }),
@@ -998,7 +998,7 @@ pub fn wallgen_after_unlock(seed: [u8; 32]) {
     unsafe { WALLGEN_SEED = Some(seed) };
 }
 
-/// wallgen (payloads/wallgen) with the person's wallpaper seed as its input, from its capsule in the kernel's vault: it makes their wallpaper once on this device, on the GPU, and keeps it in their space, or ends at once if it already has. 1 the vault scope `map.`, 2 use display, 3 use gpu, 4 the layer arena (GPU-KISTS.md plan step 0: the picture drawn only by the GPU service, in wallgen's region of the arena). Started from the service loop, after an unlock (an unlock is a syscall, under the kernel's lock: no spawn there).
+/// wallgen (payloads/wallgen) with the person's wallpaper seed as its input, from its capsule in the kernel's vault: it makes their wallpaper once on this device, on the GPU, and keeps it in their space, or ends at once if it already has. 1 the vault scope `map.`, 2 use display, 3 use gpu, 4 a 32 MiB block of the layer arena, its own (GPU-KISTS.md plan step 0: the picture drawn only by the GPU service; plan step 1: the block wallgen's alone). Started from the service loop, after an unlock (an unlock is a syscall, under the kernel's lock: no spawn there).
 fn spawn_wallgen(store: &mut Option<ShimStore>, seed: &[u8; 32]) {
     // Under the kernel lock, as every UFS command must be: the vault process drives the same controller from the workers (SYS_BLOCK), and a read outside the lock collided with its moves at an attest and wedged the link (2026-11-07).
     let Some(capsule) = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("wallgen").ok().flatten())) else {
@@ -1007,7 +1007,7 @@ fn spawn_wallgen(store: &mut Option<ShimStore>, seed: &[u8; 32]) {
     };
     let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
     use crate::process::Grant::*;
-    match crate::process::spawn_capsule(b"wallgen", &capsule, seed, &[Store(b"map"), Use(b"display"), Use(b"gpu"), Dma(b"layers")], &sealed) {
+    match crate::process::spawn_capsule(b"wallgen", &capsule, seed, &[Store(b"map"), Use(b"display"), Use(b"gpu"), Dma(b"layers-32")], &sealed) {
         Ok(o) => {
             mark_ran(&o);
             crate::process::push_console(&o.console);
@@ -1034,10 +1034,10 @@ fn gps_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![Serve(b"gps"), Hardware(b"usi3-spi"), Hardware(b"gpio-far-alive"), Hardware(b"gpio-gpp0"), Hardware(b"gpio-hsi2"), Store(b"gps"), Power(b"gps"), Irq(b"gps-host-req")]
 }
 
-/// The GPU service's grants in its slot order (payloads/gpu): 1 its registers, 2 its memory, 3 the vault scope `gpu.` (its firmware), 4 its job interrupt, 5 the layer arena, 6 serve gpu, 7 the apps' surfaces (since 2026-11-11: a client's kernel writes its own surface, Mahere's map; the GPU's fence admits them, s2mpu::fence_gpu). Its own list since 2026-11-08, as the vault's and the GPS driver's: init's page gave its five slots to kists, and the kernel starts the GPU service at home, before init (so before the attest screen, its first client).
+/// The GPU service's grants in its slot order (payloads/gpu): 1 its registers, 2 its memory, 3 the vault scope `gpu.` (its firmware), 4 its job interrupt, 5 the layer arena whole (it reads a client's kernel from the client's own block), 6 serve gpu, 7 the apps' surfaces (since 2026-11-11: a client's kernel writes its own surface, Mahere's map; the GPU's fence admits them, s2mpu::fence_gpu), 8 the GPU MMU's interrupt (2026-11-12: a client's job that reaches outside its own memory faults in its own address space, and the service ends that job at once). Its own list since 2026-11-08, as the vault's and the GPS driver's: init's page gave its five slots to kists, and the kernel starts the GPU service at home, before init (so before the attest screen, its first client).
 fn gpu_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     use crate::process::Grant::*;
-    alloc::vec![Dma(b"gpu-regs"), Dma(b"gpu-mem"), Store(b"gpu"), Irq(b"gpu-job"), Dma(b"layers"), Serve(b"gpu"), Dma(b"surfaces")]
+    alloc::vec![Dma(b"gpu-regs"), Dma(b"gpu-mem"), Store(b"gpu"), Irq(b"gpu-job"), Dma(b"arena"), Serve(b"gpu"), Dma(b"surfaces"), Irq(b"gpu-mmu")]
 }
 
 /// The installer's grants in its slot order (payloads/kists; docs/KISTS.md "Install"): 1 use udp (the network, plain HTTP), 2 the vault scope `capsules.` (it stores what it fetched, by content address), 3 the vault scope `kists.` (the person's list), 4 serve `kists` (the map's Kists page), 5 use fgtw (the identity service's doorbell: a restore follows the person's space), 6 the Install right (the kernel checks and seals what it stored). Its own list, as the GPS driver's: init's page is full, and the kernel starts it once a person has attested (the list is theirs).
@@ -1094,7 +1094,7 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"nfc" => &[77, 78, 67, 79],
         // 1 serve bt, 2 the APM UART, 3 vendor_a, 4 its power, 5 entropy (payloads/bt).
         b"bt" => &[81, 82, 76, 83, 41],
-        // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings (the layout switch), 8 use fgtw (the identity service's verdict and the mint), 9 the identity unlock right, 10 a second surface, the keyboard's back buffer, 11 use gpu, 12 the layer arena, 13 use wlan (the network page) (payloads/ahau; as init gives them: without 13 a restarted attest screen's network page said "The WiFi is starting." forever, 2026-11-10).
+        // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings (the layout switch), 8 use fgtw (the identity service's verdict and the mint), 9 the identity unlock right, 10 a second surface, the keyboard's back buffer, 11 use gpu, 12 a 32 MiB block of the layer arena, its own, 13 use wlan (the network page) (payloads/ahau; as init gives them: without 13 a restarted attest screen's network page said "The WiFi is starting." forever, 2026-11-10).
         b"ahau" => &[17, 18, 22, 51, 48, 49, 19, 47, 85, 22, 24, 68, 44],
         // 1 the controller's registers, 2 its DMA memory, 3 its interrupt, 4 the kernel's PT commands, 5 the `usb` power switch (payloads/usb).
         b"usb" => &[86, 87, 88, 89, 90],
@@ -1107,6 +1107,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
     let own = name == b"ahau";
     Some(slots.iter().filter_map(|&s| all.get(s - 1).copied()).map(|g| match g {
         crate::process::Grant::Dma(b"surfaces") if own => crate::process::Grant::Dma(b"surface"),
+        // The arena as init's spawn passes it (SYS_SPAWN): a 32 MiB block, the attest screen's own (GPU-KISTS.md plan step 1).
+        crate::process::Grant::Dma(b"arena") => crate::process::Grant::Dma(b"layers-32"),
         g => g,
     }).collect())
 }

@@ -556,7 +556,7 @@ pub fn scrub_memory() {
         crate::cachemap::DISPLAY_CANVAS,
         crate::cachemap::SURFACES,
         crate::cachemap::GPU_MEM,
-        crate::cachemap::LAYERS,
+        crate::cachemap::layers(),
     ];
     // The processes' memory: every frame an arc holds (frames.rs; until 2026-11-11 the two arc pools whole). Free frames were wiped as they came back.
     let total: usize = regions.iter().map(|&(lo, hi)| if hi > lo { hi - lo } else { 0 }).sum::<usize>() + crate::frames::taken_bytes();

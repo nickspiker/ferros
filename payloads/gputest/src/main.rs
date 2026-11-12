@@ -1,6 +1,6 @@
 //! A client of the GPU service (payloads/gpu, GPU.md "Layers"): the Mandelbrot kernel built through the valhall builder, its words put in the layer arena, run through `gpu`, and every pixel compared with the CPU's own iteration.
-//! Spawn: ferros-bridge spawn gputest.bin --name gputest --use gpu --dma layers
-//! Grant slots: 0 console, 1 gpu (use), 2 the layer arena.
+//! Spawn: ferros-bridge spawn gputest.bin --name gputest --use gpu --dma layers-32
+//! Grant slots: 0 console, 1 gpu (use), 2 its block of the layer arena (32 MiB, its own: GPU-KISTS.md plan step 1), and for the isolation test (input 13) 3 `gputest` (the keeper serves it, the intruder uses it).
 #![no_std]
 #![no_main]
 
@@ -10,8 +10,8 @@ use valhall::*;
 
 const S_GPU: u64 = 1;
 const S_ARENA: u64 = 2;
-/// The arena at the GPU's VA (payloads/gpu ARENA_VA): the code at offset 0, the output 1 MiB in.
-const ARENA_VA: u64 = 0x8000_0000;
+/// Its block of the arena at the GPU's VA (ferros_sys::gpu ARENA_VA): the code at offset 0, the output 1 MiB in.
+const ARENA_VA: u64 = ferros_sys::gpu::ARENA_VA;
 const OUT: usize = 1 << 20;
 const SIDE_SHIFT: u32 = 6;
 const PIXELS: usize = 1 << (2 * SIDE_SHIFT);
@@ -866,6 +866,154 @@ fn run_with(grants: u64, words: usize, groups: u32, preload: u16, uniforms: &[u6
     call(cap(grants, S_GPU), &msg[..18 + 8 * uniforms.len()], &mut reply);
     (reply[0], u32::from_le_bytes([reply[1], reply[2], reply[3], reply[4]]))
 }
+/// The isolation test (GPU-KISTS.md plan step 1, 2026-11-12): two gputests, each a GPU client with a block of the layer arena of its own, the keeper (input [13, 0]) and the intruder ([13, 1]), the intruder's kernels storing at every GPU address where another client's memory could be. The keeper: `--use gpu --dma layers-32 --serve gputest`; the intruder: `--use gpu --dma layers-32 --use gputest`, spawned after it.
+///
+/// The keeper fills its block past its first 2 MiB with a pattern, draws the Mandelbrot on the GPU in its first 2 MiB, and answers every call on `gputest` with whether its pattern still stands, word for word, and whether its own GPU job still runs: [pattern words wrong u32][the first wrong offset u32][its Mandelbrot's status u8][its pixels wrong u32].
+fn keeper(grants: u64, arena: usize) -> ! {
+    let size = ferros_sys::dma_size(cap(grants, S_ARENA), 1 << 30).unwrap_or(0) as usize;
+    let pattern = |i: usize| 0xA5A5_0000u32 ^ i as u32;
+    for i in (2 << 20) / 4..size / 4 {
+        unsafe { core::ptr::write_volatile((arena + 4 * i) as *mut u32, pattern(i)) };
+    }
+    let (status, wrong) = mandel_once(grants, arena);
+    say!(grants, "gputest keeper: block of {} MiB at G#{arena:X}, its pattern written; its Mandelbrot: status {status}, {wrong} pixels wrong\n", size >> 20);
+    let mut msg = [0u8; 64];
+    let mut token = [0u8; 32];
+    loop {
+        if ferros_sys::recv(cap(grants, 3), &mut msg, &mut token, false) == ferros_sys::ERR {
+            say!(grants, "gputest keeper: no `gputest` to serve (slot 3)\n");
+            exit(1);
+        }
+        let mut bad = 0u32;
+        let mut first = u32::MAX;
+        for i in (2 << 20) / 4..size / 4 {
+            if unsafe { core::ptr::read_volatile((arena + 4 * i) as *const u32) } != pattern(i) {
+                bad += 1;
+                first = first.min(4 * i as u32);
+            }
+        }
+        let (status, wrong) = mandel_once(grants, arena);
+        say!(grants, "gputest keeper: {bad} of {} pattern words changed (the first at G#{first:X}); its own Mandelbrot after: status {status}, {wrong} pixels wrong\n", (size - (2 << 20)) / 4);
+        let mut r = [0u8; 13];
+        r[0..4].copy_from_slice(&bad.to_le_bytes());
+        r[4..8].copy_from_slice(&first.to_le_bytes());
+        r[8] = status;
+        r[9..13].copy_from_slice(&wrong.to_le_bytes());
+        ferros_sys::reply(&token, &r);
+    }
+}
+
+/// The Mandelbrot through the service in the block's first 2 MiB (code at 0, pixels at `OUT`), and how many pixels differ from the CPU's.
+fn mandel_once(grants: u64, arena: usize) -> (u8, u32) {
+    let mut k = Kernel::<32>::new();
+    mandelbrot(&mut k);
+    let words = k.finish();
+    for (i, &w) in words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+    }
+    for i in 0..PIXELS {
+        unsafe { core::ptr::write_volatile((arena + OUT + 4 * i) as *mut u32, u32::MAX) };
+    }
+    let (x0, y0, step) = (-2.0f32, -1.25f32, 0.0390625f32);
+    let (status, _) = run(grants, words.len(), (PIXELS / 16) as u32, &[ARENA_VA + OUT as u64, SIDE_SHIFT as u64 | (MAX_ITER as u64) << 32, x0.to_bits() as u64 | (y0.to_bits() as u64) << 32, step.to_bits() as u64]);
+    let wrong = (0..PIXELS as u32).filter(|&gid| unsafe { core::ptr::read_volatile((arena + OUT + 4 * gid as usize) as *const u32) } != reference(gid, x0, y0, step)).count() as u32;
+    (status, wrong)
+}
+
+/// The intruder: one workgroup of 16 stores (G#C0FF_EE00 + the invocation's id, to u0 + 4 × id: the service's first compute shader, GPU.md "Compute") aimed at each address in turn, its own block's first (the control: must land) and then every place another client's memory could be: past its own block, each other 32 MiB of the arena in the shared layout of before, every surface (it holds none), and the service's own pages it is shown read-only (its ring, its descriptors, its code). Each reply said, then an endless kernel (stopped at its guard, no host timer), then the control again, then the keeper asked whether anything of its changed.
+fn intruder(grants: u64, arena: usize) -> ! {
+    use ferros_sys::gpu::{OUTSIDE, SURFACES_VA};
+    let size = ferros_sys::dma_size(cap(grants, S_ARENA), 1 << 30).unwrap_or(0) as u64;
+    const STORE: [u64; 3] = [0x0110_C0C0_FFEE_003C, 0x01A3_C200_2027_3C80, 0x7861_4002_1800_0002];
+    let control = 1u64 << 20;
+    let mut targets = [0u64; 16];
+    let mut n = 0;
+    let mut push = |a: u64| {
+        targets[n] = a;
+        n += 1;
+    };
+    push(ARENA_VA + control);
+    push(ARENA_VA + size);
+    for j in 1..4u64 {
+        push(ARENA_VA + (32 << 20) * j + control);
+    }
+    for j in 0..4u64 {
+        push(SURFACES_VA + (32 << 20) * j + 64);
+    }
+    // The service's pages in the client's space (payloads/gpu RING_VA, DESC_VA, CODE_BIG_VA): mapped read-only for it.
+    push(0x1000_0000);
+    push(0x3100_0000);
+    push(0x3400_0000);
+    push(ARENA_VA + control);
+    let mut kept = 0u32;
+    for &t in &targets[..n] {
+        for (i, &w) in STORE.iter().enumerate() {
+            unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+        }
+        for i in 0..16 {
+            unsafe { core::ptr::write_volatile((arena + control as usize + 4 * i) as *mut u32, 0) };
+        }
+        let (status, us, addr, st) = run_far(grants, STORE.len(), 1, 0x1000, &[t]);
+        let inside = t >= ARENA_VA && t < ARENA_VA + size;
+        let landed = (0..16u32).all(|i| unsafe { core::ptr::read_volatile((arena + control as usize + 4 * i as usize) as *const u32) } == 0xC0FF_EE00 + i);
+        let ok = if inside { status == 0 && landed } else { status == OUTSIDE };
+        kept += ok as u32;
+        say!(grants, "gputest intruder: store at G#{t:X} ({}): status {status} in {us} us{}{}: {}\n", if inside { "its own block" } else { "not its memory" }, if status == OUTSIDE { ", faulted at G#" } else { "" }, Hex(if status == OUTSIDE { Some((addr, st)) } else { None }), if ok { "as it must" } else { "WRONG" });
+    }
+    // An endless kernel: r0 stays 0, so the loop never leaves. Stopped by the service at its guard, its group ended; nothing on the host counts time for it.
+    let mut k = Kernel::<32>::new();
+    k.iadd_imm_i32(r(0), Lut::ZERO, 0).reconverge();
+    let top = k.here();
+    k.iadd_imm_i32(r(1), r(0), 1);
+    k.branchz(r(0), top).reconverge();
+    k.shaddx_u64(pair(2), u(0), pair(60), 2);
+    k.store_i32(r(1), pair(2), 0, Slot::S0).end();
+    let words = k.finish();
+    for (i, &w) in words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+    }
+    let (status, us, _, _) = run_far(grants, words.len(), 1, 0x1000, &[ARENA_VA + control]);
+    say!(grants, "gputest intruder: an endless kernel: status {status} after {us} us (its guard ended it)\n");
+    for (i, &w) in STORE.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+    }
+    let (status, us, _, _) = run_far(grants, STORE.len(), 1, 0x1000, &[ARENA_VA + control]);
+    say!(grants, "gputest intruder: its own store after the endless one: status {status} in {us} us\n");
+    let mut r = [0u8; 13];
+    let got = call(cap(grants, 3), &[0], &mut r);
+    let bad = u32::from_le_bytes([r[0], r[1], r[2], r[3]]);
+    say!(grants, "gputest intruder: {kept} of {n} stores went as they must; the keeper ({got} bytes): {bad} of its pattern words changed, its own Mandelbrot status {}, {} pixels wrong\n", r[8], u32::from_le_bytes([r[9], r[10], r[11], r[12]]));
+    exit(if kept as usize == n && got == 13 && bad == 0 && r[8] == 0 { 0 } else { 1 });
+}
+
+/// "fault address G#…, AS_FAULTSTATUS G#…" for an intruder's line, or nothing.
+struct Hex(Option<(u64, u32)>);
+impl core::fmt::Display for Hex {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self.0 {
+            Some((a, s)) => write!(f, "{a:X}, AS_FAULTSTATUS G#{s:X}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// `run_with`, its reply whole: [status][µs u32] and, for a job that reached outside its memory (ferros_sys::gpu::OUTSIDE), [the GPU address u64][AS_FAULTSTATUS u32].
+fn run_far(grants: u64, words: usize, groups: u32, preload: u16, uniforms: &[u64]) -> (u8, u32, u64, u32) {
+    let mut msg = [0u8; 18 + 8 * 16];
+    msg[0] = 1;
+    msg[1..3].copy_from_slice(&preload.to_le_bytes());
+    msg[7..9].copy_from_slice(&(words as u16).to_le_bytes());
+    msg[9..13].copy_from_slice(&groups.to_le_bytes());
+    msg[13..17].copy_from_slice(&1u32.to_le_bytes());
+    msg[17] = uniforms.len() as u8;
+    for (i, u) in uniforms.iter().enumerate() {
+        msg[18 + 8 * i..26 + 8 * i].copy_from_slice(&u.to_le_bytes());
+    }
+    let mut reply = [0u8; 17];
+    call(cap(grants, S_GPU), &msg[..18 + 8 * uniforms.len()], &mut reply);
+    (reply[0], u32::from_le_bytes(reply[1..5].try_into().unwrap()), u64::from_le_bytes(reply[5..13].try_into().unwrap()), u32::from_le_bytes(reply[13..17].try_into().unwrap()))
+}
+
 // The entry with the image header (as wintest and ahau carry it): the kernel grows the arc by the .bss the header names, so the zeroed statics below (the recorder's heap) are inside it.
 core::arch::global_asm!(
     r#"
@@ -892,6 +1040,13 @@ extern "C" fn gputest_main(grants: u64, input: u64, input_len: u64) -> ! {
     if arena == 0 || arena == usize::MAX {
         say!(grants, "gputest: no layer arena\n");
         exit(1);
+    }
+    // Input [13, 0] and [13, 1]: the isolation test's keeper and intruder (GPU-KISTS.md plan step 1).
+    if input_len > 1 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 13 {
+        if unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 1) as *const u8) } == 0 {
+            keeper(grants, arena);
+        }
+        intruder(grants, arena);
     }
     // Input byte 1: the ops test (the builder's new instructions); none: the Mandelbrot.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 1 {
