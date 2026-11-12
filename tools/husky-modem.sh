@@ -16,7 +16,7 @@ PARTS=""
 SLOT=${SLOT:-a}
 for p in modem_$SLOT efs persist modem_userdata vendor_$SLOT; do PARTS="$PARTS --part $p"; done
 HEX=$(printf '%s' "$IN" | xxd -p | tr -d '\n')
-timeout 60 "$B" spawn "$R/modem.bin" $HEX --name modem --serve rmnet $HW --dma modem-pktproc --dma modem-ipc --dma modem-msi $PARTS >/dev/null 2>&1
+timeout 60 "$B" spawn "$R/modem.bin" $HEX --name modem --serve rmnet $HW --dma modem-pktproc --dma modem-ipc --dma modem-msi $PARTS --serve cell >/dev/null 2>&1
 end=$(( $(date +%s) + KEEP ))
 while [ "$(date +%s)" -lt "$end" ]; do
     timeout 20 "$B" diag console 2>/dev/null | grep -a "^modem: \|^ip: " || true

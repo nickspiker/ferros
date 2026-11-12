@@ -1409,6 +1409,8 @@ const INT_SEND_FMT: u32 = 0x82;
 const SIT_GET_RADIO_POWER: u16 = 0x0801;
 const SIT_SET_RADIO_POWER: u16 = 0x0800;
 const SIT_GET_PS_REG_STATE: u16 = 0x0701;
+/// The network the stack is on (ProtocolNetworkBuilder::BuildOperator: no parameters; the reply read in the service for `cell`).
+const SIT_GET_OPERATOR: u16 = 0x0702;
 const SIT_GET_SIM_STATUS: u16 = 0x0200;
 const SIT_SET_PS_SERVICE: u16 = 0x0710;
 const SIT_SET_INITIAL_ATTACH_APN: u16 = 0x0603;
@@ -1555,6 +1557,7 @@ fn sit_name(id: u16) -> &'static str {
         0x074A => "IND_REG_FAILED",
         0x0700 => "GET_CS_REG_STATE",
         0x0701 => "GET_PS_REG_STATE",
+        0x0702 => "GET_OPERATOR",
         0x0703 => "GET_NTW_MODE",
         0x0704 => "SET_NTW_MODE_AUTO",
         0x070B => "GET_PREFERRED_NTW_TYPE",
@@ -2171,6 +2174,143 @@ struct Online {
     /// The tracks last published (µs since online), and the call the detail was last published for (None: never; Some(None): no call).
     tracks_at: u64,
     detail_for: Option<Option<u8>>,
+    /// The data stack's serving cell from its last registration reply, and when it came (µs since online): docs/LOCATION.md. Location data: served on `cell` only, never logged.
+    serving: Option<Serving>,
+    serving_at: u64,
+    /// The data stack's network from SIT_GET_OPERATOR (MCC, MNC, the MNC's digits): asked as the stack registers.
+    plmn: Option<(u16, u16, u8)>,
+}
+
+/// The serving cell as SIT_GET_PS_REG_STATE's reply gives it, by the vendor's own reader (vendor.radio.protocol.sit.stream.so, ProtocolNetDataRegStateAdapter's accessors, read 2026-11-11), offsets into the parameters after the 12-byte response header, little-endian, unaligned:
+/// 0 state, 1 reject cause, 2 the most data calls at once, 3 the radio technology (the CP's code), 4 LAC u16, 8 cell id u32 (GSM, UMTS), 12 PSC u8, 13 TAC u32, 17 PCI u32, 21 ECI u32, 25 CSG id u32, 29 timing advance u32, 33 IMS voice over PS, 34 emergency service; with 39 bytes or more 35 the channel (EARFCN) u32; with 42 or more 39 EN-DC available, 40 DCNR restricted, 41 NR available; with 62 or more 42 the NR cell (NCI) u64, and when the technology byte is 21 (G#15) the NR PCI at 50, TAC at 54 and NR-ARFCN at 58, which the reader then returns in place of 17, 13 and 35.
+/// Absent fields are all ones (the reader's own "unknown" for the ECI, CSG and timing advance), and the NCI 0.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Serving {
+    state: u8,
+    rat: u8,
+    lac: u16,
+    cid: u32,
+    tac: u32,
+    eci: u32,
+    pci: u32,
+    earfcn: u32,
+    ta: u32,
+    nci: u64,
+    nr_tac: u32,
+    nr_pci: u32,
+    nr_arfcn: u32,
+}
+
+/// The vendor reader's technology byte for NR (its NR fields are taken only at this value).
+const SIT_RAT_NR: u8 = 21;
+
+impl Serving {
+    fn parse(p: &[u8]) -> Option<Serving> {
+        // The parameters are the CP's: each group is read only when the reply is long enough to hold it (the reader's own length tests, 39, 42 and 62), and a reply too short for the base fields (to the timing advance's end, 33) is no cell. Without these a short reply from the CP would index past the parameters and panic the driver (and the data call with it).
+        let n = p.len();
+        if n < 33 {
+            return None;
+        }
+        let u32_at = |o: usize| u32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
+        let mut s = Serving {
+            state: p[0],
+            rat: p[3],
+            lac: u16::from_le_bytes([p[4], p[5]]),
+            cid: u32_at(8),
+            tac: u32_at(13),
+            eci: u32_at(21),
+            pci: u32_at(17),
+            earfcn: !0,
+            ta: u32_at(29),
+            nci: 0,
+            nr_tac: !0,
+            nr_pci: !0,
+            nr_arfcn: !0,
+        };
+        if n >= 39 {
+            s.earfcn = u32_at(35);
+        }
+        if n >= 62 {
+            s.nci = u64::from_le_bytes([p[42], p[43], p[44], p[45], p[46], p[47], p[48], p[49]]);
+            if s.rat == SIT_RAT_NR {
+                s.nr_pci = u32_at(50);
+                s.nr_tac = u32_at(54);
+                s.nr_arfcn = u32_at(58);
+            }
+        }
+        Some(s)
+    }
+}
+
+/// `cell`'s reply (docs/LOCATION.md), little-endian, 62 bytes: 0 valid u8 (0: no serving cell known), 1 the change count u32, 5 its age in ms u32, 9 the registration state u8, 10 the technology u8 (the CP's code), 11 MCC u16, 13 MNC u16, 15 the MNC's digits u8 (0 not known), 16 LAC u16, 18 cell id u32, 22 TAC u32, 26 ECI u32, 30 PCI u32, 34 EARFCN u32, 38 timing advance u32, 42 NCI u64, 50 NR TAC u32, 54 NR PCI u32, 58 NR-ARFCN u32. Unknown values all ones (NCI 0).
+pub const CELL_LEN: usize = 62;
+
+/// The serving cell's change count, under the lock: it moves at every change of the cell, the network, or the service (a service that ends has no cell).
+static mut CELL_GEN: u32 = 0;
+/// The WATCH calls held on `cell`, under the lock: each its reply token and the count its caller last saw. Four at most (the place service is the one reader meant).
+static mut CELL_WATCHES: [Option<([u8; 32], u32)>; 1 << 2] = [None; 1 << 2];
+
+/// The reply as it stands, under the lock, from the service (None: not running, no cell).
+fn cell_reply(o: Option<&Online>) -> [u8; CELL_LEN] {
+    let mut r = [0u8; CELL_LEN];
+    let count = unsafe { *(&raw const CELL_GEN) };
+    r[1..5].copy_from_slice(&count.to_le_bytes());
+    let Some((o, s)) = o.and_then(|o| o.serving.map(|s| (o, s))) else { return r };
+    r[0] = 1;
+    r[5..9].copy_from_slice(&((since_us(o.t0).wrapping_sub(o.serving_at) / 1000) as u32).to_le_bytes());
+    r[9] = s.state;
+    r[10] = s.rat;
+    let (mcc, mnc, digits) = o.plmn.unwrap_or((!0, !0, 0));
+    r[11..13].copy_from_slice(&mcc.to_le_bytes());
+    r[13..15].copy_from_slice(&mnc.to_le_bytes());
+    r[15] = digits;
+    r[16..18].copy_from_slice(&s.lac.to_le_bytes());
+    for (at, v) in [(18, s.cid), (22, s.tac), (26, s.eci), (30, s.pci), (34, s.earfcn), (38, s.ta)] {
+        r[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    r[42..50].copy_from_slice(&s.nci.to_le_bytes());
+    for (at, v) in [(50, s.nr_tac), (54, s.nr_pci), (58, s.nr_arfcn)] {
+        r[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    r
+}
+
+/// The serving cell changed (or the service ended: None), under the lock: the count moves and every held WATCH is answered with the reply as it now stands. The service passes itself (it is ONLINE's content, borrowed mutably where it calls this).
+fn cell_changed(o: Option<&Online>) {
+    unsafe { *(&raw mut CELL_GEN) = (*(&raw const CELL_GEN)).wrapping_add(1) };
+    let r = cell_reply(o);
+    for w in unsafe { (*(&raw mut CELL_WATCHES)).iter_mut() } {
+        if let Some((t, _)) = w.take() {
+            ferros_sys::reply(&t, &r);
+        }
+    }
+}
+
+/// A call on `cell` (main.rs `cell_thread`): `[0]` GET → the reply now; `[1, count u32]` WATCH → the reply at once when the count differs from the caller's, else held until the serving cell next changes (a fifth WATCH while four are held answers the oldest as it stands, which asks again). Returns the reply to send now, or None when the call is held.
+pub fn cell_call(req: &[u8], token: &[u8; 32]) -> Option<[u8; CELL_LEN]> {
+    crate::hw::locked(|| {
+        let now = cell_reply(unsafe { (*(&raw const ONLINE)).as_ref() });
+        match req {
+            [1, a, b, c, d, ..] => {
+                let seen = u32::from_le_bytes([*a, *b, *c, *d]);
+                if seen != unsafe { *(&raw const CELL_GEN) } {
+                    return Some(now);
+                }
+                let ws = unsafe { &mut *(&raw mut CELL_WATCHES) };
+                if ws.iter().all(|w| w.is_some()) {
+                    if let Some((t, _)) = ws[0].take() {
+                        ferros_sys::reply(&t, &now);
+                    }
+                    ws.rotate_left(1);
+                }
+                if let Some(w) = ws.iter_mut().find(|w| w.is_none()) {
+                    *w = Some((*token, seen));
+                }
+                None
+            }
+            _ => Some(now),
+        }
+    })
 }
 
 /// Bytes as hex, `n` of them from `at`.
@@ -2292,6 +2432,51 @@ impl Online {
         ferros_detail::publish(ferros_sys::control::CELLULAR, f);
     }
 
+    /// One RCM message on the data stack's channel that bears on the serving cell (`m` from its type byte: type, 0, id u16, length u16, then a response's token u32 and error byte, its parameters at 12; an indication's at 8). Location data: kept for `cell`, never logged.
+    /// - The registration reply (G#0701) without error: the serving cell (`Serving::parse` reads only what the parameters hold: they are the CP's input). As the stack becomes registered, its network is asked for (SIT_GET_OPERATOR).
+    /// - The operator reply (G#0702) without error, as the vendor's ProtocolNetOperatorAdapter reads it: six ASCII digits at the parameters' start, MCC then MNC, a `#` in the sixth for a two-digit MNC (then the short and long names, not read).
+    /// - IND_NTW_STATE_CHANGED (G#070E): the registration asked again at once, as Android's RIL does, so a new serving cell is known without waiting for the backstop poll.
+    #[inline(never)]
+    fn cell_frame(&mut self, rep: &mut Vec<u8>, ch: u8, m: &[u8]) {
+        let t = since_us(self.t0);
+        match (m[0], u16::from_le_bytes([m[2], m[3]])) {
+            (1, SIT_GET_PS_REG_STATE) if m.len() >= 12 && m[10] == 0 => {
+                let s = Serving::parse(&m[12..]);
+                if s.is_some() {
+                    self.serving_at = t;
+                }
+                let was = self.serving.is_some_and(|o| matches!(o.state, 1 | 5));
+                if s.is_some_and(|n| matches!(n.state, 1 | 5)) && !was {
+                    if let Err(e) = sit_request(&mut self.link, ch, SIT_GET_OPERATOR, &[]) {
+                        line(rep, alloc::format!("t={} ms: SIT_GET_OPERATOR not sent: {e}\n", t / 1000));
+                    }
+                }
+                if s != self.serving {
+                    self.serving = s;
+                    cell_changed(Some(self));
+                }
+            }
+            (1, SIT_GET_OPERATOR) if m.len() >= 12 + 6 && m[10] == 0 => {
+                let d = &m[12..18];
+                let digits = if d[5] == b'#' { 2 } else { 3 };
+                if d[..3 + digits].iter().all(|c| c.is_ascii_digit()) {
+                    let num = |s: &[u8]| s.iter().fold(0u16, |v, &c| v * 10 + (c - b'0') as u16);
+                    let p = Some((num(&d[..3]), num(&d[3..3 + digits]), digits as u8));
+                    if p != self.plmn {
+                        self.plmn = p;
+                        cell_changed(Some(self));
+                    }
+                }
+            }
+            (2, 0x070E) => {
+                if let Err(e) = sit_request(&mut self.link, ch, SIT_GET_PS_REG_STATE, &[]) {
+                    line(rep, alloc::format!("t={} ms: SIT_GET_PS_REG_STATE not sent on ch A#{ch}: {e}\n", t / 1000));
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn new(t0: u64, probe: u8) -> Self {
         Online {
             t0,
@@ -2346,6 +2531,9 @@ impl Online {
             rereg_on: None,
             tracks_at: 0,
             detail_for: None,
+            serving: None,
+            serving_at: 0,
+            plmn: None,
         }
     }
 
@@ -2681,6 +2869,11 @@ impl Online {
                     self.publish_status();
                 }
             }
+            // The serving cell for `cell` (docs/LOCATION.md): the data stack's registration and operator replies and its network-state indication, the RCM message copied out and read out of line (`cell_frame`: written inline, this loop outgrew the masked build's branch reach).
+            if ril && ch == CH_FMT0 + 1 && flen >= 12 + 8 && matches!((at(12), at(14) as u16 | (at(15) as u16) << 8), (1, SIT_GET_PS_REG_STATE) | (1, SIT_GET_OPERATOR) | (2, 0x070E)) {
+                let m: Vec<u8> = (12..flen).map(|i| at(i)).collect();
+                self.cell_frame(rep, ch, &m);
+            }
             // The signal, whole (up to 256 bytes), past the cap too: the indication (G#0906, parameters after its 8-byte header) or the reply to SIT_GET_SIGNAL_STRENGTH (G#0900, after its 12, error 0), the same parameters (ProtocolSignalStrengthAdapter reads the reply's from G#C as the indication's). Kept at each change, logged at a change of length or once a 16 s.
             let sig_at = match (at(12), at(14) as u16 | (at(15) as u16) << 8) {
                 (2, 0x0906) => 12 + 8,
@@ -2954,7 +3147,11 @@ pub fn online() -> bool {
 
 /// `diag modem down`: the service stopped and the CP powered down.
 pub fn down(rep: &mut Vec<u8>) {
-    crate::hw::locked(|| unsafe { *(&raw mut ONLINE) = None });
+    // A service that ends has no serving cell: `cell`'s watchers are told.
+    crate::hw::locked(|| unsafe {
+        *(&raw mut ONLINE) = None;
+        cell_changed(None);
+    });
     off(rep);
 }
 
@@ -2963,7 +3160,10 @@ pub fn service_poll() {
     let mut rep = Vec::new();
     let alive = crate::hw::locked(|| unsafe { (*(&raw mut ONLINE)).as_mut().map(|o| o.step(&mut rep)) });
     if alive == Some(false) {
-        crate::hw::locked(|| unsafe { *(&raw mut ONLINE) = None });
+        crate::hw::locked(|| unsafe {
+            *(&raw mut ONLINE) = None;
+            cell_changed(None);
+        });
         rep.extend_from_slice(b"modem service ended\n");
     }
     for l in rep.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {

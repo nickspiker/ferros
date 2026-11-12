@@ -12,8 +12,12 @@
 //!
 //! Input: empty or `up` brings the modem up and serves until killed; `off` powers the CP down and exits; `sN` runs the staged diagnostic, stages 0..=N, N one or two hex digits (modem.rs `stages`), and exits. The stages (from the kernel, where they were built): 0 survey, 1 power-on, 2 PHY, 3 link, 4 endpoint, 5 ROM boot, 6 link cycle, 7 the boot-channel download, 8 START and a ten-second watch, 9 START and the bare IPC handshake (PIF_INIT_DONE -> PHONE_START -> INIT_END), a the handshake with the pktproc DL rings and the legacy link, then 90 s watching what the online CP sends, b the same with one RIL probe (SIT_GET_RADIO_POWER on channel 245), c also the radio on (SIT_SET_RADIO_POWER, not for emergency), d also the data registration polled every 5 s (SIT_GET_PS_REG_STATE) and the SIM status read once, e also the preferred data modem and allow-data on stack 1, f also the initial-attach APN, 10 instead of the attach APN the carrier-config manifest handshake, the UICC subscription, a radio cycle, the data profiles, the allowed networks (the data stack registers: 2026-10-29) and the stack-status and carrier-restriction queries, 11 also the AP capabilities G#3 with the UL packet rings and the gipc service on channel 132, 12 also the internet data call once registered (VZWINTERNET), then one IPv6 router solicitation and one ICMPv6 echo request to a public resolver up its rmnet channel, the queues' pointers every 4 s and every DL packet by IP version and protocol only; from b on, the modem service on channel 130 (properties, UE-capability files from the modem image) and the remote-file service on channel 41 (writes pulled and dropped) are answered (the whole radio is open during experimentation: owner, 2026-10-29).
 //!
-//! Spawn (tools/husky-modem.sh): ferros-bridge spawn modem.bin --name modem --serve rmnet --hw pcie0-elbi --hw pcie0-soc --hw pcie0-pcs --hw pcie0-udbg --hw pcie0-phy --hw pcie0-dbi --hw pcie0-cfg --hw pcie0-mem --hw cmu-hsi1 --hw hsi1-sysreg --hw gpio-hsi1 --hw sysmmu-hsi1 --hw s2mpu-hsi1 --hw gpio-alive --hw pmu --dma modem-pktproc --dma modem-ipc --dma modem-msi --part modem_a --part efs --part persist --part modem_userdata --part vendor_a
-//! Grant slots: 0 console, 1 serve rmnet, 2-16 the hardware blocks (hw.rs `BLOCKS`), 17-19 the shared-memory windows, 20-24 the partitions (partfs.rs `PARTS`).
+//! Spawn (tools/husky-modem.sh): ferros-bridge spawn modem.bin --name modem --serve rmnet --hw pcie0-elbi --hw pcie0-soc --hw pcie0-pcs --hw pcie0-udbg --hw pcie0-phy --hw pcie0-dbi --hw pcie0-cfg --hw pcie0-mem --hw cmu-hsi1 --hw hsi1-sysreg --hw gpio-hsi1 --hw sysmmu-hsi1 --hw s2mpu-hsi1 --hw gpio-alive --hw pmu --dma modem-pktproc --dma modem-ipc --dma modem-msi --part modem_a --part efs --part persist --part modem_userdata --part vendor_a --serve cell
+//! Grant slots: 0 console, 1 serve rmnet, 2-16 the hardware blocks (hw.rs `BLOCKS`), 17-19 the shared-memory windows, 20-24 the partitions (partfs.rs `PARTS`), and 25 serve cell when spawned with `--serve cell` last (tools/husky-modem.sh; init has no slot for it yet).
+//!
+//! `cell` (2026-11-11, docs/LOCATION.md "Cellular"): the data stack's serving cell for the place service, from its registration reply (SIT_GET_PS_REG_STATE, decoded by the vendor's own reader's offsets) and its network (SIT_GET_OPERATOR, asked as the stack registers); the registration asked again at each IND_NTW_STATE_CHANGED, besides the backstop poll. Location data: served only here, never logged. Requests:
+//! - 0 GET → the 62-byte reply (modem.rs `CELL_LEN`): valid, change count, age, state, technology, MCC, MNC and its digits, LAC, cell id, TAC, ECI, PCI, EARFCN, timing advance, NCI, NR TAC, NR PCI, NR-ARFCN.
+//! - 1 WATCH `count u32` (the change count the caller last saw) → the same reply, at once when the count differs, else held until the cell, the network or the service changes: the doorbell, no polling.
 
 #![no_std]
 #![no_main]
@@ -30,6 +34,8 @@ pub const S_RMNET: u64 = 1;
 pub const S_HW: u64 = 2;
 pub const S_DMA: u64 = 17;
 pub const S_PART: u64 = 20;
+/// Serve `cell` (docs/LOCATION.md): present only when spawned with it.
+pub const S_CELL: u64 = 25;
 
 global_asm!(
     r#"
@@ -89,6 +95,11 @@ pub extern "C" fn modem_main(grants: u64, input: u64, input_len: u64) -> ! {
     // `rmnet` on its own thread, from the start: it answers at once from the service's state ("no call" while the CP comes up), so a caller is never held by a bring-up that takes 20 s.
     static mut RMNET_STACK: [u8; 1 << 16] = [0; 1 << 16];
     ferros_sys::thread_spawn(rmnet_thread, unsafe { &mut *(&raw mut RMNET_STACK) }, 0);
+    // `cell` on its own thread when it was granted (slot 25, after the partitions): the place service's serving cell (docs/LOCATION.md). init's list has no slot for it yet (its grants page is full), so under init the driver serves only `rmnet`.
+    if grant_count(grants) > S_CELL {
+        static mut CELL_STACK: [u8; 1 << 14] = [0; 1 << 14];
+        ferros_sys::thread_spawn(cell_thread, unsafe { &mut *(&raw mut CELL_STACK) }, 0);
+    }
     // Up, and up again whenever the service ends (the CP crashed, a ring went bad) or RESTART asks: the CP powered down first. The boot-channel download fails now and then on its first try (MAIN unanswered) and works the next; a CP that keeps failing is tried 16 s after, the wait doubling to 1024 s (the policy's cap: a broken modem is retried every 17 minutes), and back to 16 s once it comes up.
     let mut wait_s = 16u64;
     let mut first = true;
@@ -136,6 +147,27 @@ extern "C" fn rmnet_thread(_: u64) -> ! {
         }
         let r = modem::rmnet_call(&msg[..(n as usize).min(msg.len())]);
         ferros_sys::reply(&tok, &r);
+    }
+}
+
+/// How many grants the process holds, the console's included (the grants page's u32 at G#200, kernel process.rs `TOKENS`).
+fn grant_count(grants: u64) -> u64 {
+    unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + grants + 0x200) as *const u32) as u64 }
+}
+
+/// The `cell` endpoint's server (modem.rs `cell_call`): GET answered at once, WATCH answered at once or held until the serving cell changes, the service answering it then. A receive that fails ends the thread: the slot is not an endpoint this driver serves.
+extern "C" fn cell_thread(_: u64) -> ! {
+    let mut msg = [0u8; 1 << 4];
+    let mut tok = [0u8; 32];
+    loop {
+        let n = ferros_sys::recv(hw::cap(S_CELL), &mut msg, &mut tok, false);
+        if n == ferros_sys::ERR {
+            hw::log("modem: `cell` refused a receive; not serving it");
+            ferros_sys::thread_exit(0);
+        }
+        if let Some(r) = modem::cell_call(&msg[..(n as usize).min(msg.len())], &tok) {
+            ferros_sys::reply(&tok, &r);
+        }
     }
 }
 

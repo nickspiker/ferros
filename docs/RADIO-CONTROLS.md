@@ -34,7 +34,7 @@ What each driver reports and what can be turned, as of 2026-11-07. "Next" is wha
 - **Next:**
   - *Technology* (LTE only, NR only, both): SIT_SET_ALLOW_NETWORK takes a u32 bitmap in the CP's own numbering (the boot mask G#4_03FE is the CP's report, not Android's RadioAccessFamily); which bit is which needs Android's SET_ALLOWED_NETWORK_TYPES_BITMAP captured for each choice.
   - *Band and frequency lock*: no SIT message for it is known; Android sets it through an OEM path to capture.
-  - *Cell identity, band, EARFCN, PCI, neighbours*: IND_CELL_INFO_LIST (G#070F) and IND_PHYSICAL_CHANNEL_CONFIG (G#0742) arrive and are not decoded; the registration reply's area and cell ids sit after its first 4 bytes, layout unchecked. Location-bearing: they go in the detail, not tracks.
+  - *Cell identity, band, EARFCN, PCI, neighbours*: IND_CELL_INFO_LIST (G#070F) and IND_PHYSICAL_CHANNEL_CONFIG (G#0742) arrive and are not decoded. The registration reply's area, cell ids, PCI, EARFCN, timing advance and NR cell are read since 2026-11-11 by the vendor reader's offsets (LOCATION.md "What the modem knows") and served only on `cell`, to the place service, never logged; not yet matched against a live reading. Location-bearing: if the page ever shows them, they go in the detail, not tracks.
   - *Operator name, MNC*: the network's name, not decoded. Its MCC is (IND_MCC, G#072D, and NITZ's network field), for the zone only (docs/TIME.md).
   - *Network time*: NITZ (G#0905) is decoded for the zone (its offset, daylight flag and MCC go to the kernel, docs/TIME.md); its time is logged, not used.
   - *APN choice, roaming on/off, data on/off*: the profiles are Verizon's table today.
