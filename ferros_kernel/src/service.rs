@@ -1771,6 +1771,10 @@ pub fn run(mut b: Boot) -> ! {
             if w.iter().any(|&v| v != 0) {
                 let text: alloc::string::String = w[4].to_le_bytes().iter().chain(w[5].to_le_bytes().iter()).map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '.' }).collect();
                 crate::flashlog::line(&alloc::format!("previous boot ended: panic-num {} heap G#{:X} esr G#{:X} faults {} elr G#{:X} far G#{:X} text {:?}", w[0], w[1], w[2], w[3], w[4], w[5], text));
+                // The kernel heap's last refused allocation (platform.rs `report_panic`, r[6..8]).
+                if w[6] != 0 {
+                    crate::flashlog::line(&alloc::format!("previous boot's kernel heap refused A#{} bytes at alignment A#{} on core A#{}, for G#{:X}, the largest free block then A#{}", w[6] & 0xFF_FFFF_FFFF_FFFF, 1u64 << (w[8] >> 56), w[6] >> 56, w[7], w[8] & 0xFF_FFFF_FFFF_FFFF));
+                }
             }
         }
         crate::process::STORE_REMOVE = Some(store_remove);
@@ -2729,6 +2733,12 @@ pub fn run(mut b: Boot) -> ! {
                     let (text, tri) = crate::ready::show();
                     append_hex(&mut resp, b"READY_TEXT_PX=", text);
                     append_hex(&mut resp, b"READY_TRIANGLE_PX=", tri);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"heap" {
+                    // `diag heap`: the kernel heap in full (main.rs `heap_text`): its regions, in use and peak, free bytes and blocks and the largest, the free blocks by size, and the last refused allocation (its size, alignment, caller and the heap then).
+                    resp.extend_from_slice(crate::heap_text().as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
@@ -3838,11 +3848,13 @@ pub fn run(mut b: Boot) -> ! {
                 append_hex(&mut resp, b"BOOT_EL=", crate::boot_el() as u32);
                 append_hex(&mut resp, b"BOOT_SCTLR=", crate::boot_sctlr() as u32);
                 append_hex(&mut resp, b"HEAP_END=", heap_end as u32);
-                // The kernel heap now: free bytes, free blocks, the largest (what a big vault value needs in one piece).
-                if let Some((free, blocks, largest)) = crate::heap_stats() {
-                    append_hex(&mut resp, b"HEAP_FREE=", free as u32);
-                    append_hex(&mut resp, b"HEAP_FREE_BLOCKS=", blocks as u32);
-                    append_hex(&mut resp, b"HEAP_LARGEST_FREE=", largest as u32);
+                // The kernel heap now (`diag heap` has it in full): its size, free bytes and blocks, the largest (what one allocation can get), in use and its peak, refusals since boot.
+                if let Some(h) = crate::heap_report() {
+                    append_hex(&mut resp, b"HEAP_SIZE=", h.size as u32);
+                    append_hex(&mut resp, b"HEAP_FREE=", h.free as u32);
+                    append_hex(&mut resp, b"HEAP_FREE_BLOCKS=", h.free_blocks as u32);
+                    append_hex(&mut resp, b"HEAP_LARGEST_FREE=", h.largest as u32);
+                    append_hex(&mut resp, b"HEAP_REFUSED=", h.fails as u32);
                 }
                 append_hex(&mut resp, b"HEAP_IN_USE=", ferros_heap::IN_USE.load(core::sync::atomic::Ordering::Relaxed) as u32);
                 append_hex(&mut resp, b"HEAP_PEAK=", ferros_heap::PEAK.load(core::sync::atomic::Ordering::Relaxed) as u32);
