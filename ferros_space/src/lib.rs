@@ -15,6 +15,7 @@
 //! | `LANG` | the fleet's scope `ke` | the language `wl` (its ISO 639-3 code) | none: the identity service writes it to the kernel (SYS_LANG op 2) on each device, which follows it unless its settings say otherwise |
 //! | `DND` | the fleet's scope `ke` | on `u` (1 or 0) | none: the identity service writes it to the kernel (preference 40) on each device |
 //! | `PIN` | developer `ke` | the bundle's commitment `hp`, then the developer's name `a` when their first kist gave one; the entry's stamp is when it was pinned | a `pin` section of `kists.list` (trust on first stow) |
+//! | fgtw's own kind 255 (`fgtw::person::KIND`) | the person key's id `hb` | when it was minted `e`, the fleet key's fingerprint `hb`, the key sealed under the fleet key `v'X'` | none: the identity service's own (payloads/fgtw), opened at attest and handed to the kernel (docs/FACETS.md D0) |
 //!
 //! The scope of a place and the view is the fleet's (`FLEET`, 32 zero bytes) on every device whose deck sync is on (the default), and the device's own key on one where the person switched it off, so that device keeps an arrangement of its own, which follows it through a reset all the same.
 //!

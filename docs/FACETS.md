@@ -1,7 +1,7 @@
 # Facets: what a kist may know about the person
 
 Status: a proposal for the owner to mark up, 2026-11-12.
-Nothing here is built.
+Built 2026-11-12: "To build" steps 0 to 2 (the alias derivation and the person key in fgtw, the kernel's alias call and its hand-over op, the identity service opening or minting the person key); see "Built" under "To build". Nothing past step 2 is built.
 Each part says **Decided** (with the owner's words), or **Proposed** (mine, not yet answered); the decisions the owner must make are gathered at the end ("Decisions for the owner", D0 to D9).
 The permission list this rests on is KISTS.md's "The permission list"; Photon's move onto its own key is PHOTON.md's "Photon's own key: the migration".
 
@@ -238,6 +238,14 @@ The facets are a wall on ferros and a convention elsewhere; Photon keeping to it
 3. **The space** (ferros_space, fgtw::space): `PERSON`, `SPOT` and the per-kist choices.
 4. **The map**: the sheets (address, person, where I am), the people and places pages, and each kist's card rows (KISTS.md).
 5. **Photon**: PHOTON.md's migration.
+
+### Built (2026-11-12, steps 0 to 2)
+
+- **fgtw `alias`**: `seed(person key, developer, option)` is BLAKE3 `derive_key("ferros 2026-11-12 kist alias v0", …)` over three fixed 32-byte fields (96 bytes, no lengths: the types fix the widths, so no two triples hash alike); its known answer computed apart with `b3sum --derive-key`. `bundle(seed)`: the Ed25519 half is the seed itself, Falcon-512 and SPHINCS+ under `FERROS_KIST_ALIAS` (`SigningBundle::developer`'s domains). `agreement_secret(seed)`: X25519, one way from the seed.
+- **fgtw `person`**: `mint(eggs)` takes at least two non-empty eggs, each framed by its length, under `"ferros 2026-11-12 person key mint v0"`. The key is kept as a fact of the person's space of fgtw's own kind (255, counted down from the top so it never meets ferros_space's kinds), its id one way from the key, its value the mint stamp (`e`), the fleet key's fingerprint (`hb`) and the key sealed XChaCha20-Poly1305 under a key derived from the fleet key (`v'X'`; the handle proof, the fingerprint and the id bound in). So the space a device keeps in its vault (`fgtw.space`, kept whatever unlock at boot says) holds the person key only sealed under the fleet key, which is in RAM only. `find` takes the first minted (the mint stamp, then the id), and never a later one while that one does not open here; `put` with the same mint stamp re-seals it under a new fleet key. Two devices minting at once settle on the first minted.
+- **Kernel**: `SYS_UNLOCK` op 10 (Unlock right) takes the person key into the identity's keys (kvault `IdKeys.person`), wiped with them at lock; op 0's bit 2 says it is held. `SYS_IRA` with x4 bit 1 answers a kist with its alias: `spawn_kist` keeps the gate's developer key and option on the process (`Process.gate`, public values), and the kernel derives from those and the person key, never from anything the caller names; refused to a process the kist job did not launch, while nobody is present, and before the person key is handed in. `diag identity` says whether the person key is held, checks the kernel's derivation against fgtw's known answer, and counts aliases given; the flash log names each kist given or refused one, never a byte of it. `ferros_sys::alias`, `give_person_key`, `person_key_held`.
+- **Identity service** (payloads/fgtw space.rs `space_person`): at each join once the first pull is done, opens the person key from the space with the fleet key, re-seals it when the space has it under an earlier fleet key and this service holds it, mints it when the identity has none (eggs: the kernel's entropy, this process's own timing jitter, the fleet key) and writes it into the space (to the fleet and fgtw.org's existing space slot, sealed), then hands it to the kernel whenever the kernel does not hold it (the kernel wipes it at every lock). It derives no alias.
+- **Test kist**: payloads/aliastest, two capsules from tools/aliastest-kist.sh ("Alias A", "Alias B").
 
 ## Decisions
 

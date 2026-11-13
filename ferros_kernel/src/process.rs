@@ -756,6 +756,8 @@ struct Process {
     domain: Option<[u8; 32]>,
     /// Launched as a kist (`spawn_kist`): its ira-derived keys are its own (`SYS_IRA`), never a system service's.
     kist: bool,
+    /// A kist's gate identity as the gate found it at launch (`spawn_kist`): its developer's Ed25519 key and its option (`hp`), both public, what its alias is derived from (SYS_IRA's alias bit, FACETS.md). None for anything not launched by the kist job, so nothing else has an alias and no kist can name another's identity.
+    gate: Option<([u8; 32], [u8; 32])>,
     /// A kist's capsule address (its vault address, the blake3 of the signed capsule), as launched: what names it in the person's list, for the rights it is using (`CLAIMS`). None for a system process.
     capsule: Option<[u8; 32]>,
     /// The arc's top at spawn (its size, exact mode's limit): a shrink (SYS_ARC) never goes under it, so the grants page, the code, the input and the first stack stay.
@@ -2017,6 +2019,8 @@ const DOMAIN_SEAL_CONTEXT: &str = "ferros 2026-11-07 vault domain seal";
 pub static MIGRATE_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 /// Moved at every identity lock (kvault `lock`): the stamp carries it, and the vault process drops what it holds of the person's (its cache's plaintext) when it changes.
 pub static LOCK_EPOCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Kists' aliases handed out this boot (SYS_IRA's alias bit), for `diag identity`.
+pub static ALIASES_GIVEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Bit 62 of a `Calling` state's reply length: the call is a forwarded `SYS_STORE`, whose reply is [the syscall's value u64 LE][the bytes for the caller's buffer].
 const STORE_REPLY: u64 = 1 << 62;
 /// The last old entry read for migration (name, value), so a large one is fetched from the kernel's vault once.
@@ -3471,6 +3475,14 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         r.unwrap_or(ERR)
                     }
                     2..=4 => unlock(op as u8, None).unwrap_or(ERR),
+                    // Op 10: the person key from the identity service (FACETS.md D1), 32 bytes at x2, held beside the identity's keys until lock; ERR while nobody is present. This copy wiped at once.
+                    10 => {
+                        let mut key = [0u8; 32];
+                        p.read_into(f.x[2], &mut key);
+                        let r = unlock(10, Some(&key));
+                        key.fill(0);
+                        r.unwrap_or(ERR)
+                    }
                     // Op 5: the identity's own entries as one VSF document into the caller's buffer (x2, x3 its length) from offset x4, for saving them to the fleet before a departure; the document's whole length, or ERR while locked. With a vault process serving, it answers instead (`export_forward`).
                     5 => {
                         // Built at offset 0 and kept until read to its end, so the pieces of one read are one document (each build stamps its own time and provenance); one transfer a call, as the vault process answers.
@@ -3991,6 +4003,28 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let token = p.read(f.x[0], 32);
             let len = f.x[2] as usize;
             f.x[0] = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+                // Bit 1 of x4: the kist's alias (FACETS.md "The alias"; D1, 2026-11-12: the kernel derives): a seed for this kist alone, the same on every device of the person's, derived from the person key and the gate identity the kernel stamped at launch (the developer key and option), never from anything the caller names. Only to a kist the kist job launched, only while the person is present and their identity service has handed in the person key; else ERR. x1 and x2 are not read.
+                Some((Object::Ira, r)) if r & RIGHT_SEND != 0 && f.x[4] & 2 != 0 => {
+                    let alias = match p.gate {
+                        Some((d, o)) if p.kist => crate::service::alias(&d, &o),
+                        _ => None,
+                    };
+                    // The log names the kist and the outcome, never a byte of the alias.
+                    let who = alloc::string::String::from_utf8_lossy(&p.name).into_owned();
+                    match alias {
+                        Some(mut a) => {
+                            p.write(f.x[3], &a);
+                            a.fill(0);
+                            ALIASES_GIVEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            crate::flashlog::line(&alloc::format!("alias given to the kist {who}"));
+                            32
+                        }
+                        None => {
+                            crate::flashlog::line(&alloc::format!("alias refused to {who}: {}", if p.gate.is_none() || !p.kist { "not a kist launched by the kist job" } else { "nobody present, or no person key handed in yet" }));
+                            ERR
+                        }
+                    }
+                }
                 Some((Object::Ira, r)) if r & RIGHT_SEND != 0 && (1..=64).contains(&len) => {
                     // A kist's keys are its own (owner, 2026-11-08): derived under a context no system process's name reaches, then bound to the kist's gate identity (its domain name, one way from its ihi: the oracle over its developer key and option), so no kist can ask for a system service's key, nor another kist's. A system process's keys are derived as they always were, byte for byte.
                     let mut context = alloc::vec::Vec::with_capacity(32 + len);
@@ -5749,9 +5783,9 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Resu
             core::ptr::copy((arc.base + CODE + co) as *const u8, (arc.base + CODE) as *mut u8, cl);
             core::ptr::write_bytes((arc.base + CODE + cl) as *mut u8, 0, total - cl);
         }
-        Ok((ihi, cl, modes, wants))
+        Ok((ihi, cl, modes, wants, (g.developer_pubkey, g.hp)))
     })();
-    let (ihi, cl, modes, wants) = match r {
+    let (ihi, cl, modes, wants, gate) = match r {
         Ok(x) => x,
         Err(e) => {
             with_lock(|| arc_free(arc));
@@ -5788,6 +5822,7 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Resu
                 if let Some(q) = th(me).map(|t| t.proc).and_then(|pi| kk.procs.get_mut(pi)).and_then(|q| q.as_mut()) {
                     q.kist = true;
                     q.capsule = Some(l.capsule);
+                    q.gate = Some(gate);
                 }
                 enqueue_back(me);
                 kist_started(&l.capsule);
@@ -6246,7 +6281,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // The register grants by slot, for `mmio_fast`: HARDWARE has fewer than 255 blocks, so an index plus one fits a byte.
     let hw = cspace.iter().map(|c| match c.object { Object::Hardware(g) => g as u8 + 1, _ => 0 }).collect();
     let fast = alloc::boxed::Box::new(Grants { hw, ended: core::sync::atomic::AtomicBool::new(false) });
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, words: Vec::new(), input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), fast };
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, words: Vec::new(), input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, gate: None, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), fast };
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     vault_spawned(objects);
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.

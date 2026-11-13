@@ -85,7 +85,7 @@ Not built yet (2026-11-10): ferros's fgtw reaches siblings on the LAN and fgtw.o
 
 | Op | Does | Returns |
 |---|---|---|
-| 0 | state | bit 0 unlocked, bit 1 bound |
+| 0 | state | bit 0 unlocked, bit 1 bound, bit 2 the person key held (FACETS.md) |
 | 1 | unlock with a seed | the entry count, NOTHING (belongs to another identity) or ERR |
 | 2 | lock | |
 | 3 | bind | |
@@ -95,6 +95,7 @@ Not built yet (2026-11-10): ferros's fgtw reaches siblings on the LAN and fgtw.o
 | 7 | keep a tag for the identity present (its UID) | 0 kept, 1 kept already, ERR |
 | 8 | forget a tag (the start of its id), or every tag | how many |
 | 9 | list the kept tags | how many; each the start of its id and when it was kept |
+| 10 | the person key from the identity service (Unlock right only; FACETS.md D1): 32 bytes, held beside the identity key and wiped with it at lock; the kernel derives each kist's alias from it | 0, or ERR while nobody is present |
 
 ## Attest with a tag (owner, 2026-11-05 and 2026-11-11)
 

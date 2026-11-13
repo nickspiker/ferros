@@ -1413,6 +1413,13 @@ pub fn ira_person_key(cap: u64, domain: &str) -> Option<[u8; 32]> {
     (r == 32).then_some(out)
 }
 
+/// A kist's alias (docs/FACETS.md "The alias"), through its Ira capability (`kist::IRA`): a 32-byte seed for this kist alone, the same on every device of the person's, derived by the kernel from the person key and this kist's gate identity. The kist makes its keys from it (fgtw::alias::bundle, agreement_secret) and never shows it. None for a process not launched as a kist, before attest, or before the identity service has handed the kernel the person key; a kernel before 2026-11-12 answers as `ira_key` with no domain, which is refused (ERR), so None too.
+pub fn alias(cap: u64) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    let r = svc(nr::IRA, cap, 0, 0, off(out.as_mut_ptr()), 2);
+    (r == 32).then_some(out)
+}
+
 /// UTC wall time: (seconds since 1970, the counter ticks into the current second, the counter's rate), or None until the kernel has read the PMIC's clock. `local_time` with the zone taken back out — for stamps that cross the network (Photon's eagle time).
 pub fn utc_time() -> Option<(i64, u64, u64)> {
     let at = arc_base() + PREFS + 16;
@@ -2299,6 +2306,17 @@ pub fn bind_identity(cap: u64) -> bool {
 /// Release the device (a completed departure): every identity entry deleted, the binding gone. True when done.
 pub fn release_identity(cap: u64) -> bool {
     svc(nr::UNLOCK, cap, 4, 0, 0, 0) == 0
+}
+
+/// Whether the kernel holds the person key (docs/FACETS.md D1): handed in by the identity service, wiped at lock. None without the capability; false from a kernel before 2026-11-12.
+pub fn person_key_held(cap: u64) -> Option<bool> {
+    let r = svc(nr::UNLOCK, cap, 0, 0, 0, 0);
+    (r != ERR).then_some(r & 4 == 4)
+}
+
+/// Hand the person key to the kernel (SYS_UNLOCK op 10, the Unlock right; docs/FACETS.md D1): it derives each kist's alias from it and wipes it at lock. True when held; false while nobody is present, without the right, or from a kernel before 2026-11-12.
+pub fn give_person_key(cap: u64, key: &[u8; 32]) -> bool {
+    svc(nr::UNLOCK, cap, 10, off(key.as_ptr()), 0, 0) == 0
 }
 
 /// The unlocked identity's own entries on this device as one VSF document (section `identity_export`, an `entry` field per vault name: the name and its stored bytes), written into `buf`, for saving them to the fleet before a departure. The document's length, or None while locked or when it does not fit. Read a transfer at a time from offsets (op 5's x4): the document is built at offset 0 and kept until read to its end, and each call answers one transfer (4096 bytes) at most.

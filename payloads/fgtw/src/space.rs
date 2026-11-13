@@ -9,6 +9,8 @@
 //! - **The person's language** (ferros_space `LANG`), as the zone: chosen on the language page of a device that follows it (op 23), written to the kernel (SYS_LANG op 2) at every join where it changed, never read back.
 //! - **Do not disturb** (ferros_space `DND`; owner, 2026-11-11: "a fleet/identity preference so it follows the person"): switched on the quick row of any device (op 24), written to the kernel (preference 40) at every join where it changed, never read back. No device keeps its own.
 
+//! - **The person key** (docs/FACETS.md D0, D1; fgtw::person): opened from the space with the fleet key at each join once the first pull is done, minted here when the identity has none (its first device to run this), sealed again under a new fleet key after a shrink, and handed to the kernel (SYS_UNLOCK op 10), which derives each kist's alias from it. Held in RAM only; in the space it is only ever sealed under the fleet key.
+
 use super::*;
 use ferros_space::space::{Baseline, Sealed, Space};
 use ferros_space::Scope;
@@ -22,6 +24,15 @@ const BASE_KEY: &[u8] = b"space_base";
 /// How often the device's copy is joined to the space, and fgtw.org asked again (µs).
 const LOCAL_US: u64 = 4_000_000;
 const SEED_US: u64 = 64_000_000;
+
+/// What was last said of the person key: nothing yet, opened (or minted) and held, sealed under a fleet key this device does not hold, a mint refused for want of an egg, the kernel refused it.
+const P_NONE: u8 = 0;
+const P_HELD: u8 = 1;
+const P_ELSEWHERE: u8 = 2;
+const P_NO_EGG: u8 = 3;
+const P_KERNEL: u8 = 4;
+/// How many timing samples the payload's own jitter egg takes (`jitter_egg`).
+const JITTER_SAMPLES: usize = 1 << 10;
 
 /// The sync's state, in the client.
 pub struct SpaceSync {
@@ -52,11 +63,17 @@ pub struct SpaceSync {
     /// Do not disturb as last written to the kernel (preference 40): None not yet, Some(None) the person has never switched it.
     dnd_told: Option<Option<bool>>,
     said_dnd: bool,
+    /// The person key (docs/FACETS.md D0), opened from the space or minted here, with its mint stamp: in RAM only, as the roots, wiped with the identity (`forget_identity`). Never handed to any kist; the kernel gets it (SYS_UNLOCK op 10) and derives the aliases.
+    pub person: Option<([u8; 32], i64)>,
+    /// The id of the person key last handed to the kernel; None not yet (or since the kernel locked).
+    person_told: Option<[u8; 32]>,
+    /// What was last said of the person key (`P_*`), so each state is said once.
+    person_said: u8,
 }
 
 impl SpaceSync {
     pub fn new() -> SpaceSync {
-        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, zone_told: None, said_zone: false, lang_told: None, said_lang: false, dnd_told: None, said_dnd: false }
+        SpaceSync { space: Space::new(), base: Baseline::default(), loaded: false, settled: false, seed_digest: [0; 32], fleet_digest: [0; 32], last_local_us: 0, last_seed_us: 0, generation: 0, said_clock: false, said_slot: false, said_join: false, zone_told: None, said_zone: false, lang_told: None, said_lang: false, dnd_told: None, said_dnd: false, person: None, person_told: None, person_said: P_NONE }
     }
 }
 
@@ -503,11 +520,124 @@ impl Client {
             self.space.last_local_us = t;
             self.space_join();
             self.space_departures();
+            self.space_person();
         }
         if t - self.space.last_seed_us >= SEED_US {
             self.space.last_seed_us = t;
             self.space_seed(true);
             self.space_to_fleet();
+        }
+    }
+
+    /// The person key (docs/FACETS.md D0, D1), at each join once the first pull is done: opened from the space with the fleet key; sealed again under the current fleet key when this device holds it and the space has it under an earlier one (a shrink re-seals, never rotates); minted here when the identity has none yet (its first device to run this) and written into the space, so the person's other devices open the same one. Then handed to the kernel, which derives every kist's alias from it; this service derives no alias and holds none.
+    fn space_person(&mut self) {
+        let Some((hp, fk)) = self.space_ready() else { return };
+        match fgtw::person::find(&self.space.space, &hp, &fk) {
+            fgtw::person::Found::Key { key, id, minted } => {
+                if self.space.person.map(|(k, _)| k) != Some(key) {
+                    self.log.put(b"fgtw: person key opened from the fleet's space (id ");
+                    self.log.fp(&id);
+                    self.log.put(b")");
+                    self.log.line();
+                    self.person_hold(key, minted);
+                }
+                self.space.person_said = P_HELD;
+            }
+            fgtw::person::Found::Elsewhere { id, minted } => match self.space.person {
+                // Ours, from before the fleet key changed: sealed again under the current one, the same mint stamp.
+                Some((k, m)) if fgtw::person::id(&k) == id && m == minted => self.person_write(&k, m, b"sealed again under the fleet's current key"),
+                _ => {
+                    if self.space.person_said != P_ELSEWHERE {
+                        self.space.person_said = P_ELSEWHERE;
+                        self.log.put(b"fgtw: the person key (id ");
+                        self.log.fp(&id);
+                        self.log.put(b") is sealed under a fleet key this device does not hold: waiting for a device that holds it to seal it again; none is minted over it");
+                        self.log.line();
+                    }
+                }
+            },
+            fgtw::person::Found::None => {
+                // The identity has none yet: this device mints it, from several eggs (the single egg rule).
+                let Some(key) = self.person_mint(&fk) else {
+                    if self.space.person_said != P_NO_EGG {
+                        self.space.person_said = P_NO_EGG;
+                        self.log.put(b"fgtw: the person key not minted: an egg was missing (no kernel entropy)");
+                        self.log.line();
+                    }
+                    return;
+                };
+                let minted = eagle();
+                self.person_write(&key, minted, b"minted for this identity (its first device to run this)");
+                self.person_hold(key, minted);
+            }
+        }
+        self.person_to_kernel();
+    }
+
+    /// The person key held here (its old bytes overwritten first), and told to the kernel again.
+    fn person_hold(&mut self, key: [u8; 32], minted: i64) {
+        if let Some((k, _)) = self.space.person.as_mut() {
+            k.fill(0);
+        }
+        self.space.person = Some((key, minted));
+        self.space.person_told = None;
+    }
+
+    /// The person key's fact written into the space under the current fleet key, kept, and handed to the fleet and fgtw.org (the existing space slot, sealed: fgtw.org never sees the key).
+    fn person_write(&mut self, key: &[u8; 32], minted: i64, what: &[u8]) {
+        let Some((hp, fk)) = self.space_ready() else { return };
+        let me = self.me;
+        match fgtw::person::put(&mut self.space.space, key, minted, &hp, &fk, &me, eagle()) {
+            Ok(true) => {
+                self.log.put(b"fgtw: the person key (id ");
+                self.log.fp(&fgtw::person::id(key));
+                self.log.put(b") ");
+                self.log.put(what);
+                self.log.line();
+                self.space_keep();
+                self.space_to_fleet();
+                self.space_seed(true);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                self.log.put(b"fgtw: the person key not written: ");
+                self.log.put(e.as_bytes());
+                self.log.line();
+            }
+        }
+    }
+
+    /// A new person key from three eggs, each its own source: the kernel's entropy (KOHI's: the firmware TRNG, RNDR and the kernel's timing jitter under a health test), this process's own timing jitter, and the fleet key (minted by whichever device founded this epoch's key, often another device). None when the kernel gives no entropy: never minted from fewer.
+    fn person_mint(&mut self, fleet_key: &[u8; 32]) -> Option<[u8; 32]> {
+        let mut kernel = [0u8; 64];
+        if ferros_sys::entropy(cap(self.log.grants, crate::S_ENTROPY), &mut kernel) != kernel.len() as u64 {
+            return None;
+        }
+        let mut jitter = jitter_egg();
+        let key = fgtw::person::mint(&[&kernel, &jitter, fleet_key]);
+        kernel.fill(0);
+        jitter.fill(0);
+        key
+    }
+
+    /// The person key to the kernel (SYS_UNLOCK op 10) when it does not hold this one: at first, after another was settled on, and after the kernel locked and unlocked again (it wipes the key at lock).
+    fn person_to_kernel(&mut self) {
+        let Some((key, _)) = self.space.person else { return };
+        let unlock = cap(self.log.grants, crate::S_UNLOCK);
+        let id = fgtw::person::id(&key);
+        if self.space.person_told == Some(id) && ferros_sys::person_key_held(unlock) == Some(true) {
+            return;
+        }
+        if ferros_sys::give_person_key(unlock, &key) {
+            self.space.person_told = Some(id);
+            self.log.put(b"fgtw: the person key (id ");
+            self.log.fp(&id);
+            self.log.put(b") handed to the kernel: kists' aliases can be derived");
+            self.log.line();
+        } else if self.space.person_said != P_KERNEL {
+            self.space.person_said = P_KERNEL;
+            self.log.put(b"fgtw: the kernel did not take the person key (nobody present, or a kernel from before 2026-11-12)");
+            self.log.line();
         }
     }
 
@@ -657,4 +787,19 @@ impl Client {
         }
         0
     }
+}
+
+/// This process's own timing jitter, one egg of the person key's mint: the counter read around a little hashing whose input is the readings so far, so each run's timing feeds the next. Its low byte per sample, taken whole; the mint hashes it. Measured here, in EL0, apart from the kernel's own jitter source.
+fn jitter_egg() -> Vec<u8> {
+    let mut out = Vec::with_capacity(JITTER_SAMPLES);
+    let mut h = blake3::Hasher::new();
+    let mut last = now();
+    for _ in 0..JITTER_SAMPLES {
+        h.update(&last.to_le_bytes());
+        let _ = h.finalize();
+        let t = now();
+        out.push((t - last) as u8);
+        last = t;
+    }
+    out
 }
