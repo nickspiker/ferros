@@ -354,6 +354,10 @@ pub fn words(j: &Job, f: tatau::Fmt) -> Line {
         SEALING => {
             l.s(tr(Msg::SealingToDevice));
         }
+        // An unstow's one long stage: what it kept for itself being erased (docs/KISTS.md "The unstow sheet").
+        STORING if j.kind == KIND_UNSTOW => {
+            l.s(tr(Msg::ClearingWhatItKept));
+        }
         STORING => {
             l.s(tr(Msg::StoringIt));
         }
@@ -389,5 +393,66 @@ pub fn share(j: &Job) -> f64 {
         FETCHING | CODE if j.total != 0 => j.got as f64 / j.total as f64,
         QUEUED | FETCHING => 0.,
         _ => 1.,
+    }
+}
+
+/// The unstow sheet's size of what a kist kept for itself (docs/KISTS.md "The unstow sheet"; the stower's op 7, which waits on the vault process summing the domain's heads), asked on a thread of its own so the page never waits on it: the kist asked last (its capsule and identity) and the stower's answer, published with a count the main loop takes (`size_take`).
+struct SizeSlot(UnsafeCell<([u8; 32], [u8; 32], [u8; 32], Option<(u64, u64)>)>, AtomicBool);
+unsafe impl Sync for SizeSlot {}
+static SIZE: SizeSlot = SizeSlot(UnsafeCell::new(([0; 32], [0; 32], [0; 32], None)), AtomicBool::new(false));
+/// Moved on each ask (the sizer wakes on it) and each answer (the main loop takes it).
+static SIZE_ASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SIZE_GOT: AtomicU32 = AtomicU32::new(0);
+
+fn with_size<R>(f: impl FnOnce(&mut ([u8; 32], [u8; 32], [u8; 32], Option<(u64, u64)>)) -> R) -> R {
+    while SIZE.1.swap(true, Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    let r = f(unsafe { &mut *SIZE.0.get() });
+    SIZE.1.store(false, Ordering::Release);
+    r
+}
+
+/// Ask what this kist kept for itself.
+pub fn size_ask(capsule: &[u8; 32], developer: &[u8; 32], option: &[u8; 32]) {
+    with_size(|s| *s = (*capsule, *developer, *option, None));
+    SIZE_ASK.fetch_add(1, Ordering::AcqRel);
+    ferros_sys::wake(&SIZE_ASK, 1);
+}
+
+/// The last answer, when it moved from `seen`: (its count, the kist's capsule, its bytes and values or None when the stower or the vault did not say).
+pub fn size_take(seen: u32) -> Option<(u32, [u8; 32], Option<(u64, u64)>)> {
+    let n = SIZE_GOT.load(Ordering::Acquire);
+    if n == seen {
+        return None;
+    }
+    with_size(|s| Some((n, s.0, s.3)))
+}
+
+/// The sizer: asleep on `SIZE_ASK` until the sheet opens, then the stower's op 7 for the kist asked last.
+pub extern "C" fn sizer(grants: u64) -> ! {
+    let mut seen = 0u64;
+    loop {
+        let n = SIZE_ASK.load(Ordering::Acquire);
+        if n == seen {
+            ferros_sys::wait_world(&SIZE_ASK, n, 0);
+            continue;
+        }
+        seen = n;
+        let (capsule, developer, option) = with_size(|s| (s.0, s.1, s.2));
+        let mut m = [0u8; 65];
+        m[0] = 7;
+        m[1..33].copy_from_slice(&developer);
+        m[33..].copy_from_slice(&option);
+        let mut r = [0u8; 17];
+        let got = ferros_sys::call_live(cap(grants, S_STOWER), &m, &mut r);
+        let size = (got == 17 && r[0] == 0).then(|| (u64::from_le_bytes(r[1..9].try_into().unwrap()), u64::from_le_bytes(r[9..17].try_into().unwrap())));
+        // An answer for a kist asked before the last is dropped: the next pass asks for the one on the sheet.
+        with_size(|s| {
+            if s.0 == capsule {
+                s.3 = size;
+            }
+        });
+        SIZE_GOT.fetch_add(1, Ordering::AcqRel);
     }
 }

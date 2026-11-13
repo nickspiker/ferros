@@ -1667,6 +1667,25 @@ pub fn stow_check(grants: u64, stow: u64, capsule: &[u8; 32], word: &core::sync:
     svc(nr::SPAWN, off(req.as_ptr()), req.len() as u64, 8 | 16, 0, 0)
 }
 
+/// A kist's own vault domain sized, for the stower (`stow` the Stow right's token, as `cap` gives it; docs/KISTS.md "The unstow sheet"): the kist named by its identity, the domain the kernel derives for a process of it (the oracle over the developer and the option), so the stower never holds its keys. `SYS_STORE` with the Stow token, x1 bit 4, x2/x3 the identity. Some((how many values, their bytes in all)), None refused (nobody present, no vault process, no Stow right, a kernel from before).
+pub fn kist_domain_size(stow: u64, developer: &[u8; 32], option: &[u8; 32]) -> Option<(u64, u64)> {
+    let mut id = [0u8; 64];
+    id[..32].copy_from_slice(developer);
+    id[32..].copy_from_slice(option);
+    let mut n = [0u8; 8];
+    let r = svc(nr::STORE, stow, 16, off(id.as_ptr()), 64, off(n.as_mut_ptr()));
+    (r != ERR).then(|| (u64::from_le_bytes(n), r))
+}
+
+/// A kist's own vault domain dropped whole, for the stower (as `kist_domain_size`, x1 bit 3): every value it kept for itself, erased at once (the person cleared it on the unstow sheet; nothing comes back). Some(how many values went), None refused.
+pub fn kist_domain_drop(stow: u64, developer: &[u8; 32], option: &[u8; 32]) -> Option<u64> {
+    let mut id = [0u8; 64];
+    id[..32].copy_from_slice(developer);
+    id[32..].copy_from_slice(option);
+    let r = svc(nr::STORE, stow, 8, off(id.as_ptr()), 64, 0);
+    (r != ERR).then_some(r)
+}
+
 /// The kist offered over USB to stow (kernel SYS_OFFER; docs/KISTS.md "Stowing", ferros_kist::offer), for the stower alone: it holds the Stow right (`stow`, the token's offset in the grants page, as `cap` gives it).
 pub mod offer {
     use super::{nr, off, svc, ERR, NOTHING};

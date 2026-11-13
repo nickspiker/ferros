@@ -2232,6 +2232,25 @@ enum Where {
     Domain([u8; 32]),
 }
 
+/// Whether a `SYS_STORE` names the Stow right: the stower's call on a kist's own domain (`kist_store_route`).
+fn names_stow(p: &Process, f: &Frame) -> bool {
+    let token = p.read(f.x[0], 32);
+    matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Stow, r)) if r & RIGHT_SEND != 0)
+}
+
+/// The stower's `SYS_STORE` on a kist's own domain (docs/KISTS.md "The unstow sheet"): the kist named by its identity (x2 [developer 32][option 32], x3 64), its domain the one a process of that kist gets at spawn (the oracle over the two, then `KIST_DOMAIN_CONTEXT`), so nothing but the kernel computes it and the stower never holds its keys. The vault process's endpoint and the domain; Err with no vault process (the kernel's own vault holds no kist domain), no system secret, or an identity of another length.
+fn kist_store_route(p: &Process, f: &Frame) -> Result<(usize, [u8; 32]), ()> {
+    let ep = vault_route().ok_or(())??;
+    // WHY: the length is the caller's; an identity is exactly two keys.
+    if f.x[3] != 64 {
+        return Err(());
+    }
+    let id = p.read(f.x[2], 64);
+    let developer: [u8; 32] = id[..32].try_into().unwrap();
+    let ihi = crate::oracle::ihi(&developer, &id[32..]).ok_or(())?;
+    Ok((ep, blake3::derive_key(KIST_DOMAIN_CONTEXT, &ihi)))
+}
+
 /// Where a `SYS_STORE` goes: to the vault process (its endpoint, and the caller's scope or its own domain) while one is started this boot (`vault_route`: alive, or being started again, the call waiting for it) and the name is not one the kernel keeps; Err, refused (the vault process is gone); None, the kernel's own vault (no vault process started yet; it holds no kist domain: a domain call then is refused there).
 fn store_route(p: &Process, f: &Frame) -> Option<Result<(usize, Where), ()>> {
     let route = vault_route()?;
@@ -2314,6 +2333,28 @@ fn store_forward(f: &mut Frame, cur: usize, ep: usize, wh: Where) -> u64 {
     call_endpoint(f, cur, ep, msg, f.x[4], rcap | STORE_REPLY)
 }
 
+/// The stower's call on a kist's own domain (`kist_store_route`; docs/KISTS.md "The unstow sheet"): x1 bit 3 drops it whole (`VOP_DROP`, the value how many values went: the person cleared what it kept for itself), x1 bit 4 sizes it (`VOP_SIZE`, the value its bytes, and its count of values written at x4, 8 bytes). The person's class always (a kist's data is theirs), so only while they are present; anything else is refused.
+fn kist_domain_forward(f: &mut Frame, cur: usize, ep: usize, d: &[u8; 32]) -> u64 {
+    let op = match (f.x[1] & 8 != 0, f.x[1] & 16 != 0) {
+        (true, false) => VOP_DROP,
+        (false, true) => VOP_SIZE,
+        _ => {
+            f.x[0] = ERR;
+            return 0;
+        }
+    };
+    let Some(msg) = stamp(op, &[KIST_DOMAIN_PREFIX, &d[..]].concat(), &[true], &[], &[]) else {
+        f.x[0] = ERR;
+        return 0;
+    };
+    if let Some(t) = th(cur) {
+        t.called = crate::platform::cntpct();
+        t.what = op as u64;
+    }
+    let rcap = if op == VOP_SIZE { 8 } else { 0 };
+    call_endpoint(f, cur, ep, msg, f.x[4], rcap | STORE_REPLY)
+}
+
 /// The vault process's operations (payloads/vault): the four a `SYS_STORE` call makes, then the kernel's own.
 pub const VOP_SET: u8 = 0;
 pub const VOP_GET: u8 = 1;
@@ -2323,6 +2364,8 @@ pub const VOP_LIST: u8 = 3;
 pub const VOP_DROP: u8 = 4;
 /// The person's own entries as one VSF document (`SYS_UNLOCK` op 5, the departure's "save first"): name empty; rest [offset u64][length u32][per domain, in the stamp's order: its scope's prefix length u8, the prefix]. The value: the document's whole length, or ERR; the bytes from the offset, at most the length.
 pub const VOP_EXPORT: u8 = 5;
+/// How many values each stamped domain holds and their bytes in all (a kist's own domain, sized for its unstow sheet: `kist_domain_forward`): name and rest empty. The value: the bytes, or ERR; the reply's bytes: the count of values, u64 LE.
+pub const VOP_SIZE: u8 = 6;
 
 /// `SYS_UNLOCK` op 5 while the vault process serves, for a caller holding the Unlock right: its endpoint.
 fn export_route(p: &Process, f: &Frame) -> Option<Result<usize, ()>> {
@@ -3241,6 +3284,13 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
+        SYS_STORE if names_stow(p, f) => match kist_store_route(p, f) {
+            Ok((ep, d)) => kist_domain_forward(f, cur, ep, &d),
+            Err(()) => {
+                f.x[0] = ERR;
+                0
+            }
+        },
         SYS_STORE if store_route(p, f).is_some() => match store_route(p, f).unwrap() {
             Ok((ep, sc)) => store_forward(f, cur, ep, sc),
             Err(()) => {

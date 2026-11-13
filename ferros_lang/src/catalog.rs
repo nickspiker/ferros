@@ -478,9 +478,39 @@ messages! {
     Update,
     /// A kist's card: out of the person's list (two taps), the opposite of stow.
     Unstow,
-    TapAgainUnstow,
-    /// Under an armed unstow: the answers stay in the person's list.
+    /// Under a puck's armed remove: its answers stay in the person's list.
     AnswersKept,
+    // The unstow sheet, in a kist's card's place (docs/KISTS.md "The unstow sheet"): a tick keeps a kind of thing, unticked it is erased at once.
+    /// Its heading over the ticks.
+    UnstowWhatToKeep,
+    /// A tick: the kist's own vault domain (caches, downloaded areas, its settings).
+    KeptForItself,
+    /// Under it while its size is not known.
+    UselessWithoutIt,
+    /// Its size when it kept nothing (a `Say::KeptForItself` hole).
+    NothingYet,
+    /// A tick: the kist's items in the person's hold (docs/STORE.md).
+    ThingsMadeForYou,
+    /// Under it.
+    ThingsMadeYours,
+    /// A tick: the person's answers to its rights.
+    YourAnswers,
+    /// Under it, ticked.
+    AnswersAskNothing,
+    /// Under it, unticked.
+    AnswersAskAgain,
+    /// Under it, fixed, when it goes from this device only.
+    AnswersOtherDevices,
+    /// Its notes, always cleared.
+    NotesGoWithIt,
+    /// The heading over where it goes from.
+    UnstowFrom,
+    AllYourDevices,
+    ThisDeviceOnly,
+    /// Over the sheet's Unstow: nothing unticked comes back.
+    GoneMeansGone,
+    /// An unstow's stage while its own data is erased.
+    ClearingWhatItKept,
     /// A puck's card: off the deck (two taps; an unstow underneath).
     RemoveFromDeck,
     TapAgainRemove,
@@ -601,6 +631,8 @@ pub enum Say<'a> {
     Stopped(&'a str),
     /// Who made a kist offered to stow (its developer's name as the capsule gives it): "by Nick".
     ByDeveloper(&'a str),
+    /// The unstow sheet: what a kist kept for itself, its size written already in the person's base (or `Msg::NothingYet`): "12 MiB, of no use without it".
+    KeptForItself(&'a str),
     /// The stower fetching a kist (its name), the bytes so far written already in the person's base: "fetching Mahere: 3 MiB".
     Fetching { name: &'a str, got: &'a str },
     /// The same with the whole size known: "fetching Mahere: 3 MiB of 12 MiB".

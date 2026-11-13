@@ -766,6 +766,26 @@ enum View {
     Open(usize),
 }
 
+/// The unstow sheet (docs/KISTS.md "The unstow sheet"; owner, 2026-11-12: "upon kist removal, I suspect it may be good to ask if the user wants to clear data? and if so, what categories?", then "Please." to the design): each kind of thing a kist leaves, kept or cleared, and where it goes from. Its defaults are the design's: what it kept for itself cleared (useless without it, and the bulk), what it made for you kept (yours), your answers kept (a stow again asks nothing), its notes always cleared, from all your devices.
+#[derive(Clone, Copy)]
+struct Sheet {
+    capsule: [u8; 32],
+    keep_data: bool,
+    keep_made: bool,
+    keep_answers: bool,
+    here_only: bool,
+}
+
+/// The sheet's rows a tap turns over (`Choice::UnstowKeep`).
+const SHEET_DATA: u8 = 0;
+const SHEET_MADE: u8 = 1;
+const SHEET_ANSWERS: u8 = 2;
+
+/// What a kist made for the person: its items in the hold (docs/STORE.md). The hold is not built yet, so nothing is; the sheet shows its row only when this says there is something, kept by default (they are the person's; a stow again, or another kist, finds them).
+fn hold_items(_developer: &[u8; 32], _option: &[u8; 32]) -> u64 {
+    0
+}
+
 /// What a tap on the settings does: each row's own, kept with its rectangle as the last frame laid it out.
 #[derive(Clone, Copy, PartialEq)]
 enum Choice {
@@ -836,9 +856,14 @@ enum Choice {
     Pick(u8),
     /// A kist's want on its card or the Permissions page: (the kist in the person's list, the want), its answer turned over.
     Answer(u8, u8),
-    /// The Deck page: a thing's unstow (its place in the person's list; two taps; a puck's "remove from the deck"), and the pandok's stow or update (its row in the directory).
+    /// The Deck page: a thing's unstow (its place in the person's list: a kist's opens its unstow sheet, a puck's "remove from the deck" is two taps), and the pandok's stow or update (its row in the directory).
     Unstow(u8),
     StowListed(u8),
+    /// The unstow sheet (docs/KISTS.md "The unstow sheet"): a kind of thing kept or not (`SHEET_*`), where it goes from (true: this device only), and the sheet's Unstow or Cancel.
+    UnstowKeep(u8),
+    UnstowFrom(bool),
+    UnstowGo,
+    UnstowCancel,
     /// The Deck page: a row's card opened (its place in the person's list), and back to the list.
     Card(u8),
     CardBack,
@@ -1353,6 +1378,10 @@ struct Map {
     unstow_armed: Option<u8>,
     /// The Deck page's card open, by the capsule of the kist or puck it is for (owner, 2026-11-12: a row opens its card, the one way to see a kist's info); None on the list. Gone with it when that thing is unstowed.
     card: Option<[u8; 32]>,
+    /// The unstow sheet open on a kist's card, in the card's place (docs/KISTS.md "The unstow sheet"): what is kept and from where, as the person has it so far. Gone with the card.
+    sheet: Option<Sheet>,
+    /// What the sheet's kist kept for itself, as the stower last told it (stower.rs `size_take`): its capsule, and its bytes and values, None when the vault did not say.
+    sheet_size: Option<([u8; 32], Option<(u64, u64)>)>,
     /// The GPS page's claim (owner, 2026-11-10: "open the GPS screen (which should turn it on whilist GPS screen is open)"; ferros_sys::claim): held while the page shows, the screen is on and GPS is switched on.
     gps_claimed: bool,
     /// The driver as `gps_watch` last read it while the page holds its claim, at each ring of its doorbell: None not answering yet (starting, its session replaying), Some(None) no fix yet, Some(Some(fix)) the fix. On the page only, never logged, dropped as the page goes.
@@ -1735,9 +1764,9 @@ impl Map {
         i.checked_sub(1).and_then(|k| self.kists.kists.get(k))
     }
 
-    /// The person's list read again (another device of theirs may have answered, or a stow added a kist); false when it could not be read (nobody present), the copy kept as it was.
+    /// The person's list read again (another device of theirs may have answered, or a stow added a kist), less what this device leaves off its deck (an unstow "this device only", `ferros_kist::Hidden`); false when it could not be read (nobody present), the copy kept as it was.
     fn reload_kists(&mut self) -> bool {
-        match ferros_kist::store::read(cap(self.grants, S_KIST_LIST)) {
+        match ferros_kist::store::read_here(cap(self.grants, S_KIST_LIST)) {
             Some(k) => {
                 self.kists = k;
                 true
@@ -1807,9 +1836,21 @@ impl Map {
         kept
     }
 
-    /// The person's list written whole, after a change of theirs (an answer, a default); the console says when the vault did not take it.
+    /// The person's list written whole, after a change of theirs (an answer, a default); the console says when the vault did not take it. The map's copy lacks what this device leaves off its deck, so the change goes into the list as the vault holds it: the defaults, and each answer of every kist the map shows; a kist left off here keeps its own.
     fn save_kists(&self) -> bool {
-        let ok = ferros_kist::store::write(cap(self.grants, S_KIST_LIST), &self.kists, ferros_detail::eagle_now());
+        let c = cap(self.grants, S_KIST_LIST);
+        let ok = match ferros_kist::store::read(c) {
+            Some(mut whole) => {
+                whole.defaults = self.kists.defaults;
+                for k in &self.kists.kists {
+                    if let Some(w) = whole.kists.iter_mut().find(|w| w.developer == k.developer && w.option == k.option) {
+                        w.wants = k.wants.clone();
+                    }
+                }
+                ferros_kist::store::write(c, &whole, ferros_detail::eagle_now())
+            }
+            None => false,
+        };
         if !ok {
             console(self.grants, b"map: the vault did not take the person's kists\n");
         }
@@ -3974,6 +4015,61 @@ impl Map {
                 if open.is_none() {
                     self.card = None;
                 }
+                if self.sheet.is_some_and(|s| Some(s.capsule) != self.card) {
+                    self.sheet = None;
+                }
+                // The unstow sheet, in the card's place (docs/KISTS.md "The unstow sheet"; owner, 2026-11-12: "ask if the user wants to clear data? and if so, what categories?"): each kind of thing the kist leaves, a tick to keep it, what it comes to; where it goes from; then Unstow, the second of the two taps. What is not kept is erased at once: no bin.
+                if let (Some(ki), Some(sh)) = (open, self.sheet) {
+                    let k = &ks[ki];
+                    button(self, b, &mut y, tr(Msg::Back), false, Some(Choice::UnstowCancel));
+                    row(self, b, &mut y, uu(3, 2), white(), &k.name, None);
+                    y -= uu(3, 4);
+                    row(self, b, &mut y, note, grey(), tr(Msg::UnstowWhatToKeep), None);
+                    // What it kept for itself: its own domain (caches, downloaded areas, its settings), with its size as the vault counts it; cleared by default (useless without it, and the bulk).
+                    mark(self, b, &mut y, 50, tr(Msg::KeptForItself), sh.keep_data, Some(Choice::UnstowKeep(SHEET_DATA)));
+                    y -= uu(3, 4);
+                    let l = match self.sheet_size.filter(|s| s.0 == sh.capsule).and_then(|s| s.1) {
+                        Some((_, 0)) => say(Say::KeptForItself(tr(Msg::NothingYet))),
+                        Some((bytes, _)) => {
+                            let mut s = Line::new();
+                            let _ = tatau::size_bits(&mut s, f, bytes << 3, 1);
+                            say(Say::KeptForItself(s.as_str()))
+                        }
+                        // Not counted yet, or the vault did not say: its size is left out.
+                        None => {
+                            let mut l = Line::new();
+                            l.s(tr(Msg::UselessWithoutIt));
+                            l
+                        }
+                    };
+                    row(self, b, &mut y, note, dim(), l.as_str(), None);
+                    // What it made for the person (items in the hold, docs/STORE.md): kept by default, theirs. The hold is not built, so the row shows only when there is something (`hold_items`).
+                    if hold_items(&k.developer, &k.option) > 0 {
+                        mark(self, b, &mut y, 50, tr(Msg::ThingsMadeForYou), sh.keep_made, Some(Choice::UnstowKeep(SHEET_MADE)));
+                        y -= uu(3, 4);
+                        row(self, b, &mut y, note, dim(), tr(Msg::ThingsMadeYours), None);
+                    }
+                    // The person's answers: kept by default, so a stow again asks nothing. They are the person's on every device, so from this device only they stay, ticked and fixed.
+                    if sh.here_only {
+                        mark(self, b, &mut y, 50, tr(Msg::YourAnswers), true, None);
+                        y -= uu(3, 4);
+                        row(self, b, &mut y, note, dim(), tr(Msg::AnswersOtherDevices), None);
+                    } else {
+                        mark(self, b, &mut y, 50, tr(Msg::YourAnswers), sh.keep_answers, Some(Choice::UnstowKeep(SHEET_ANSWERS)));
+                        y -= uu(3, 4);
+                        row(self, b, &mut y, note, dim(), tr(if sh.keep_answers { Msg::AnswersAskNothing } else { Msg::AnswersAskAgain }), None);
+                    }
+                    // Its notes, always: nothing would be left to open them.
+                    row(self, b, &mut y, note, dim(), tr(Msg::NotesGoWithIt), None);
+                    y += uu(1, 2);
+                    row(self, b, &mut y, note, grey(), tr(Msg::UnstowFrom), None);
+                    radios(self, b, &mut y, &[tr(Msg::AllYourDevices), tr(Msg::ThisDeviceOnly)], sh.here_only as usize, &|v| Choice::UnstowFrom(v == 1));
+                    row(self, b, &mut y, note, dim(), tr(Msg::GoneMeansGone), None);
+                    button(self, b, &mut y, tr(Msg::Unstow), false, Some(Choice::UnstowGo));
+                    button(self, b, &mut y, tr(Msg::Cancel), false, Some(Choice::UnstowCancel));
+                    self.page_h[p] = y - y0;
+                    return;
+                }
                 if let Some(ki) = open {
                     let k = &ks[ki];
                     let puck = widget(&k.name);
@@ -4080,14 +4176,13 @@ impl Map {
                             button(self, b, &mut y, l.as_str(), false, Some(Choice::StowListed(di as u8)));
                         }
                     }
-                    // Unstow in two taps (as "remove this device"): out of the person's list, its answers kept; a puck's says what a person sees, off the deck.
+                    // Unstow in two taps: a kist's opens its unstow sheet (what is kept, from where), whose Unstow is the second; a puck's says what a person sees, off the deck, armed by the first tap (it keeps nothing of its own).
                     if inst.here && !busy {
-                        let armed = self.unstow_armed == Some(ki as u8);
+                        let armed = puck.is_some() && self.unstow_armed == Some(ki as u8);
                         let words = match (puck.is_some(), armed) {
                             (true, false) => Msg::RemoveFromDeck,
                             (true, true) => Msg::TapAgainRemove,
-                            (false, false) => Msg::Unstow,
-                            (false, true) => Msg::TapAgainUnstow,
+                            (false, _) => Msg::Unstow,
                         };
                         button(self, b, &mut y, tr(words), armed, Some(Choice::Unstow(ki as u8)));
                         if armed {
@@ -4942,6 +5037,61 @@ impl Map {
                         }
                     }
                     // Unstow in two taps (as "remove this device"; a puck's "remove from the deck" the same): the first arms it, the second asks the stower (op 4), which takes it out of the person's list, keeps its answers and drops its capsule; its circle goes when the job is done, and the card with it.
+                    // A kist's Unstow: its sheet, in the card's place, at its top, at the design's defaults; what it kept for itself counted by the stower meanwhile (stower.rs `size_ask`, drawn when it comes).
+                    Some(Choice::Unstow(k)) if self.kists.kists.get(k as usize).is_some_and(|kist| widget(&kist.name).is_none()) => {
+                        let kist = &self.kists.kists[k as usize];
+                        self.sheet = Some(Sheet { capsule: kist.capsule, keep_data: false, keep_made: true, keep_answers: true, here_only: false });
+                        if self.sheet_size.is_none_or(|s| s.0 != kist.capsule) {
+                            self.sheet_size = None;
+                        }
+                        stower::size_ask(&kist.capsule, &kist.developer, &kist.option);
+                        self.scroll = 0;
+                    }
+                    Some(Choice::UnstowKeep(r)) => {
+                        if let Some(s) = self.sheet.as_mut() {
+                            match r {
+                                SHEET_DATA => s.keep_data = !s.keep_data,
+                                SHEET_MADE => s.keep_made = !s.keep_made,
+                                _ => s.keep_answers = !s.keep_answers,
+                            }
+                        }
+                    }
+                    Some(Choice::UnstowFrom(here)) => {
+                        if let Some(s) = self.sheet.as_mut() {
+                            s.here_only = here;
+                        }
+                    }
+                    Some(Choice::UnstowCancel) => {
+                        self.sheet = None;
+                        self.scroll = 0;
+                    }
+                    // The sheet's Unstow, the second tap: a running kist stopped first (init's OP_STOP, one shot dead), so nothing writes its domain while it goes; then the stower's op 4 with the person's choices; its notes cleared here (docs/NOTIFY.md "Seen": nothing is left to open them). The card goes when the job is done (here only: when the list read again leaves it off this device), and the sheet with it.
+                    Some(Choice::UnstowGo) => {
+                        let sh = self.sheet.take();
+                        if let Some((sh, kist)) = sh.and_then(|sh| self.kists.kists.iter().find(|k| k.capsule == sh.capsule).cloned().map(|k| (sh, k))) {
+                            if self.kist_state(&kist.capsule).is_some_and(|s| s.0 == Msg::Running) {
+                                let mut m = [0u8; 33];
+                                m[0] = ferros_kist::launch::OP_STOP;
+                                m[1..].copy_from_slice(&kist.capsule);
+                                let mut r = [0u8; 1];
+                                let n = call(cap(self.grants, S_LAUNCH), &m, &mut r);
+                                if n == ferros_sys::ERR || n < 1 || (r[0] != ferros_kist::launch::STOPPED && r[0] != ferros_kist::launch::NOT_RUNNING) {
+                                    console(self.grants, b"map: init did not stop the kist before its unstow\n");
+                                }
+                            }
+                            let mut m = [0u8; 66];
+                            m[0] = 4;
+                            m[1..33].copy_from_slice(&kist.developer);
+                            m[33..65].copy_from_slice(&kist.option);
+                            m[65] = !sh.keep_data as u8 | ((!sh.keep_answers && !sh.here_only) as u8) << 1 | (sh.here_only as u8) << 2;
+                            if stower::ask(self.grants, &m) != Some(0) {
+                                console(self.grants, b"map: the stower did not take the unstow\n");
+                            } else {
+                                ferros_sys::notify::seen(cap(self.grants, S_SETTINGS), &kist.capsule, ferros_sys::notify::ALL, false);
+                            }
+                        }
+                        self.scroll = 0;
+                    }
                     Some(Choice::Unstow(k)) => {
                         if self.unstow_armed == Some(k) {
                             self.unstow_armed = None;
@@ -5091,7 +5241,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let (w, h) = (u16::from_le_bytes([r[0], r[1]]) as i64, u16::from_le_bytes([r[2], r[3]]) as i64);
 
     // The circles: settings, then a kist circle for each kist the person stowed (their list, `kists.list`; none readable, none shown), sized by share and placed once.
-    let kists = ferros_kist::store::read(cap(grants, S_KIST_LIST)).unwrap_or_default();
+    let kists = ferros_kist::store::read_here(cap(grants, S_KIST_LIST)).unwrap_or_default();
     // WHY: the scene and the arrays hold MAX circles; kists past it get no circle until there is room (the settings' Deck page still lists them).
     let n = (1 + kists.kists.len()).min(MAX);
     let rs: [i64; MAX] = core::array::from_fn(|i| if i == 0 { radius_of(CIRCLES[0].share) } else if i < n { radius_of(KIST_SHARE) } else { 0 });
@@ -5168,6 +5318,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         tag_adds: 0,
         unstow_armed: None,
         card: None,
+        sheet: None,
+        sheet_size: None,
         asked: None,
         fault: None,
         stopped: alloc::vec::Vec::new(),
@@ -5379,6 +5531,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut fleet_shown = false;
     // The stower's copy last taken, the finished jobs in it (a kist stowed or unstowed: the circles follow), and whether the Deck page showed at the last pass (opening it reads the directory again).
     let (mut stower_seen, mut stower_done, mut kists_shown) = (0u32, 0u64, false);
+    // The sizer's answer last taken (stower.rs `size_take`).
+    let mut size_seen = 0u32;
     // GPS's claims as the permissions and GPS pages were last drawn with them (CLAIMS_WORD, the kernel's doorbell): a change draws them again.
     let mut claims_seen = 0u64;
     // `gps_watch`'s copy last taken (its sequence count).
@@ -5402,6 +5556,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The stower's doorbell (payloads/kists), for the Deck page: on a thread of its own, never on a timer.
     static mut STOWER_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(stower::watch, unsafe { &mut *(&raw mut STOWER_STACK) }, grants);
+    // The unstow sheet's size of what a kist kept for itself (stower.rs `sizer`): asleep until a sheet opens.
+    static mut SIZER_STACK: [u8; 1 << 14] = [0; 1 << 14];
+    ferros_sys::thread_spawn(stower::sizer, unsafe { &mut *(&raw mut SIZER_STACK) }, grants);
     // The GPS driver's doorbell, for the GPS page (`gps_watch`): on a thread of its own, asleep while the page is not open.
     static mut GPS_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(gps_watch, unsafe { &mut *(&raw mut GPS_STACK) }, grants);
@@ -5503,6 +5660,14 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 map.refresh_circles();
             }
             if matches!(map.view, View::Open(_)) && PAGES[map.page] == "deck" && !map.settling {
+                map.draw();
+            }
+        }
+        // What the sheet's kist kept for itself, once the stower has counted it: drawn while the sheet shows.
+        if let Some((seq, capsule, size)) = stower::size_take(size_seen) {
+            size_seen = seq;
+            map.sheet_size = Some((capsule, size));
+            if map.sheet.is_some_and(|s| s.capsule == capsule) && matches!(map.view, View::Open(_)) && PAGES[map.page] == "deck" && !map.settling {
                 map.draw();
             }
         }

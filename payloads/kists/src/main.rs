@@ -21,7 +21,8 @@
 //! - 1: fetch the directory again and look for missing capsules again (the page opened) → [0].
 //! - 2 [from]: the directory's entries from `from` → [entries in all][n][per entry: capsule 32, developer 32, option 32, size u64 LE, the version's part count u8 then each part u64 LE (as its capsule's signed declaration writes it, leading zeros and all; at most 255 parts), name length, name, about length, about], as many as fit one reply (4000 bytes: an entry is at most A#2275, so one always fits). Until 2026-11-10 the version was three u16 (major, minor, patch).
 //! - 3 [capsule 32]: stow (or update to) the directory's entry with that capsule → [0 queued, 1 not in the directory, 2 already under way, 3 too many under way].
-//! - 4 [developer 32][option 32]: unstow that kist → [0 queued, 1 not stowed, 3 too many under way].
+//! - 4 [developer 32][option 32][flags, optional]: unstow that kist, with its sheet's choices (`UNSTOW_*`: bit 0 clear what it kept for itself, bit 1 forget its answers, bit 2 this device only; none sent is none of them) → [0 queued, 1 not stowed, 2 already under way, 3 too many under way].
+//! - 7 [developer 32][option 32]: what that kist kept for itself, its own vault domain (`ferros_sys::kist_domain_size`) → [0][bytes u64 LE][values u64 LE], or [1] refused (nobody present, no vault process).
 //! - 5 [capsule 32][1 Stow, 0 Cancel]: the person's answer to the offer on the glass → [0 taken, 1 no such offer waiting on them].
 //! - 6 [capsule 32]: the offer as the page shows it (`offer_reply`) → [0][length u64 LE][flags, bit 0 native][developer 32][version parts u8, each u64 LE][name length, name][developer's name length, name][wants n][per want: right, reason length, reason], or [1] when that capsule is no offer waiting on the person.
 
@@ -99,7 +100,7 @@ fn finished(stage: u8) -> bool {
 }
 
 /// Why a job failed (the page words each): ferros_kist::offer::why, shared with the map and `ferros send`.
-use ferros_kist::offer::why::{BROKEN as WHY_BROKEN, CHECKER as WHY_CHECKER, EGGS as WHY_EGGS, MANIFEST as WHY_MANIFEST, MISSING as WHY_MISSING, NATIVE as WHY_NATIVE, NATIVE_HERE as WHY_NATIVE_HERE, NETWORK as WHY_NETWORK, NOBODY as WHY_NOBODY, NOT_ITS_KEYS as WHY_NOT_ITS_KEYS, NOT_KIST as WHY_NOT_KIST, NOT_LISTED as WHY_NOT_LISTED, NOT_NAMED as WHY_NOT_NAMED, NO_BUNDLE as WHY_NO_BUNDLE, OTHER_KEY as WHY_OTHER_KEY, ROOM as WHY_ROOM, SEAL as WHY_SEAL, SIZE as WHY_SIZE, VAULT as WHY_VAULT};
+use ferros_kist::offer::why::{BROKEN as WHY_BROKEN, CHECKER as WHY_CHECKER, EGGS as WHY_EGGS, MANIFEST as WHY_MANIFEST, MISSING as WHY_MISSING, NATIVE as WHY_NATIVE, NATIVE_HERE as WHY_NATIVE_HERE, NETWORK as WHY_NETWORK, NOT_CLEARED as WHY_NOT_CLEARED, NOBODY as WHY_NOBODY, NOT_ITS_KEYS as WHY_NOT_ITS_KEYS, NOT_KIST as WHY_NOT_KIST, NOT_LISTED as WHY_NOT_LISTED, NOT_NAMED as WHY_NOT_NAMED, NO_BUNDLE as WHY_NO_BUNDLE, OTHER_KEY as WHY_OTHER_KEY, ROOM as WHY_ROOM, SEAL as WHY_SEAL, SIZE as WHY_SIZE, VAULT as WHY_VAULT};
 
 /// The most jobs the page lists (finished ones give way first): one reply holds them, and the map holds sixteen circles.
 const JOBS_MAX: usize = 1 << 4;
@@ -122,7 +123,14 @@ struct Job {
     /// An offer's: what its checks found, kept for the page (op 6) and for the stow; and the person's answer once given (op 5), true Stow, false Cancel.
     offered: Option<Offered>,
     answer: Option<bool>,
+    /// An unstow's choices from its sheet (`UNSTOW_*`; op 4's flags).
+    unstow: u8,
 }
+
+/// An unstow's choices (op 4's flags byte; docs/KISTS.md "The unstow sheet"; owner, 2026-11-12: "ask if the user wants to clear data? and if so, what categories?"): what it kept for itself cleared (its own vault domain, dropped whole at once: gone means gone); the person's answers forgotten (everywhere only: they are the person's on every device); this device only (the kist left in the person's list and off this device's deck, `ferros_kist::Hidden`). No flags byte (a map from before) is none of them: today's unstow, everything kept, everywhere.
+const UNSTOW_CLEAR_DATA: u8 = 1;
+const UNSTOW_FORGET_ANSWERS: u8 = 1 << 1;
+const UNSTOW_HERE_ONLY: u8 = 1 << 2;
 
 /// A checked offer, as the person sees it on the glass and as it goes into their list at Stow.
 #[derive(Clone)]
@@ -357,7 +365,7 @@ fn serve(grants: u64) -> ! {
                     if !make_room(s) {
                         return 3;
                     }
-                    s.jobs.push(Job { kind: KIND_STOW, capsule, developer: e.developer, option: e.option, name: e.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: e.size, who: String::new(), offered: None, answer: None });
+                    s.jobs.push(Job { kind: KIND_STOW, capsule, developer: e.developer, option: e.option, name: e.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: e.size, who: String::new(), offered: None, answer: None, unstow: 0 });
                     0
                 });
                 reply(&tok, &[r]);
@@ -368,15 +376,19 @@ fn serve(grants: u64) -> ! {
             }
             4 if got >= 65 => {
                 let (developer, option): ([u8; 32], [u8; 32]) = (m[1..33].try_into().unwrap(), m[33..65].try_into().unwrap());
+                let flags = if got > 65 { m[65] } else { 0 };
                 // The list read here, not under the lock: a vault call waits.
                 let k = ferros_kist::store::read(cap(grants, S_KISTS)).and_then(|l| l.by_identity(&developer, &option).cloned());
                 let r = match k {
                     None => 1,
                     Some(k) => with(|s| {
+                        if s.jobs.iter().any(|j| j.capsule == k.capsule && !finished(j.stage)) {
+                            return 2;
+                        }
                         if !make_room(s) {
                             return 3;
                         }
-                        s.jobs.push(Job { kind: KIND_UNSTOW, capsule: k.capsule, developer, option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new(), offered: None, answer: None });
+                        s.jobs.push(Job { kind: KIND_UNSTOW, capsule: k.capsule, developer, option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new(), offered: None, answer: None, unstow: flags });
                         0
                     }),
                 };
@@ -407,6 +419,20 @@ fn serve(grants: u64) -> ! {
             6 if got >= 33 => {
                 let capsule: [u8; 32] = m[1..33].try_into().unwrap();
                 let r = with(|s| offer_reply(s, &capsule));
+                reply(&tok, &r);
+            }
+            // What a stowed kist kept for itself, for its unstow sheet: its own domain sized by the vault process, which the kernel stamps for the Stow right (the stower never holds its keys). Answered here: the vault sums the heads, no value is read.
+            7 if got >= 65 => {
+                let (developer, option): ([u8; 32], [u8; 32]) = (m[1..33].try_into().unwrap(), m[33..65].try_into().unwrap());
+                let r = match ferros_sys::kist_domain_size(cap(grants, S_STOW), &developer, &option) {
+                    Some((values, bytes)) => {
+                        let mut r = alloc::vec![0u8];
+                        r.extend_from_slice(&bytes.to_le_bytes());
+                        r.extend_from_slice(&values.to_le_bytes());
+                        r
+                    }
+                    None => alloc::vec![1],
+                };
                 reply(&tok, &r);
             }
             _ => reply(&tok, &[]),
@@ -580,7 +606,7 @@ fn run(grants: u64, i: usize) {
         KIND_STOW => stow(grants, i, &job),
         // An offer stages and ends itself: checked, it waits on the person (`STAGE_ASKING`), and the answer makes it a job again.
         KIND_OFFER => return offer(grants, i, &job),
-        KIND_UNSTOW => unstow(grants, &job),
+        KIND_UNSTOW => unstow(grants, i, &job),
         _ => restore(grants, i, &job),
     };
     match r {
@@ -636,6 +662,7 @@ fn stow(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
         drop_capsule(grants, &e.capsule);
         return Err(WHY_VAULT);
     }
+    unhide(grants, &e.developer, &e.option);
     // An update: the version it replaced is named by no kist of the person's any more.
     if let Some(o) = old.filter(|o| *o != e.capsule && list.by_capsule(o).is_none()) {
         drop_capsule(grants, &o);
@@ -648,28 +675,65 @@ fn stow(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
     Ok(())
 }
 
-/// An unstow: out of the person's list, its answers kept, its capsule dropped when no kist of theirs names it.
-fn unstow(grants: u64, job: &Job) -> Result<(), u8> {
+/// An unstow, as its sheet chose (docs/KISTS.md "The unstow sheet"; `UNSTOW_*`). Everywhere: out of the person's list (the identity space carries the removal to their other devices), its answers kept (`kept`) unless the person unticked them (`Kists::forget`: forgotten everywhere, ferros_space), its capsule dropped when no kist of theirs names it. This device only: the kist stays in the person's list, left off this device's deck (`ferros_kist::Hidden`, never synced), its capsule dropped here. Then what it kept for itself, when the person cleared it: its own vault domain dropped whole, at once (owner, 2026-11-12: gone means gone; no bin). The kist is off the deck first, so nothing launches it while its domain goes; the map stopped it if it ran. Its key is no data: derived from the ira and its identity, never stored, so there is nothing of it to clear, and a stow again gets the same key and finds whatever was kept.
+fn unstow(grants: u64, i: usize, job: &Job) -> Result<(), u8> {
     let list_cap = cap(grants, S_KISTS);
+    let now = ferros_detail::eagle_now();
     let mut list = ferros_kist::store::read(list_cap).ok_or(WHY_NOBODY)?;
-    let Some(k) = list.remove(&job.developer, &job.option) else { return Ok(()) };
-    if !ferros_kist::store::write(list_cap, &list, ferros_detail::eagle_now()) {
-        return Err(WHY_VAULT);
-    }
-    if list.by_capsule(&k.capsule).is_none() {
+    let here_only = job.unstow & UNSTOW_HERE_ONLY != 0;
+    let Some(k) = list.by_identity(&job.developer, &job.option).cloned() else { return Ok(()) };
+    if here_only {
+        let mut hidden = ferros_kist::store::read_hidden(list_cap).ok_or(WHY_NOBODY)?;
+        hidden.hide(&job.developer, &job.option, now);
+        if !ferros_kist::store::write_hidden(list_cap, &hidden, now) {
+            return Err(WHY_VAULT);
+        }
+        // This device's copy: the person's other devices keep theirs.
         drop_capsule(grants, &k.capsule);
+    } else {
+        list.remove(&job.developer, &job.option);
+        if job.unstow & UNSTOW_FORGET_ANSWERS != 0 {
+            list.forget(&job.developer, &job.option);
+        }
+        if !ferros_kist::store::write(list_cap, &list, now) {
+            return Err(WHY_VAULT);
+        }
+        if list.by_capsule(&k.capsule).is_none() {
+            drop_capsule(grants, &k.capsule);
+        }
     }
-    let mut l = Vec::new();
-    l.extend_from_slice(b"kists: unstowed ");
-    l.extend_from_slice(k.name.as_bytes());
-    l.extend_from_slice(b"; its answers kept\n");
-    say(&l);
+    let mut cleared = None;
+    if job.unstow & UNSTOW_CLEAR_DATA != 0 {
+        stage(i, STAGE_STORING, 0, 0);
+        cleared = Some(ferros_sys::kist_domain_drop(cap(grants, S_STOW), &job.developer, &job.option).ok_or(WHY_NOT_CLEARED)?);
+    }
+    let l = alloc::format!(
+        "kists: unstowed {}{}; its answers {}; {}\n",
+        k.name,
+        if here_only { " from this device only" } else { "" },
+        if here_only || job.unstow & UNSTOW_FORGET_ANSWERS == 0 { "kept" } else { "forgotten" },
+        match cleared {
+            Some(n) => alloc::format!("what it kept for itself cleared (A#{n} values)"),
+            None => String::from("what it kept for itself kept"),
+        }
+    );
+    say(l.as_bytes());
     Ok(())
+}
+
+/// A kist stowed on this device again: back on its deck if it was left off (an unstow "this device only"). The list's write is the stow; this one only shows it here.
+fn unhide(grants: u64, developer: &[u8; 32], option: &[u8; 32]) {
+    let c = cap(grants, S_KISTS);
+    let Some(mut hidden) = ferros_kist::store::read_hidden(c) else { return };
+    if hidden.show(developer, option) && !ferros_kist::store::write_hidden(c, &hidden, ferros_detail::eagle_now()) {
+        say(b"kists: the vault did not take this device's deck: a kist stowed again stays off it\n");
+    }
 }
 
 /// A restore pass: a job for each capsule the person's list names that this device lacks (the list came back from their fleet after a reset, or a kist was stowed on another of their devices).
 fn restore_pass(grants: u64) {
-    let Some(list) = ferros_kist::store::read(cap(grants, S_KISTS)) else { return };
+    // What this device leaves off its deck (an unstow "this device only") is not brought back.
+    let Some(list) = ferros_kist::store::read_here(cap(grants, S_KISTS)) else { return };
     let Some(have) = capsules_here(grants) else { return };
     let missing = ferros_space_missing(&list, &have);
     if missing.is_empty() {
@@ -685,7 +749,7 @@ fn restore_pass(grants: u64) {
             if !make_room(s) {
                 break;
             }
-            s.jobs.push(Job { kind: KIND_RESTORE, capsule: *c, developer: k.developer, option: k.option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new(), offered: None, answer: None });
+            s.jobs.push(Job { kind: KIND_RESTORE, capsule: *c, developer: k.developer, option: k.option, name: k.name.clone(), stage: STAGE_QUEUED, why: 0, got: 0, total: 0, who: String::new(), offered: None, answer: None, unstow: 0 });
             added = true;
         }
     });
@@ -796,7 +860,7 @@ extern "C" fn offer_watch(grants: u64) -> ! {
                 if !make_room(s) {
                     return Some(false);
                 }
-                s.jobs.push(Job { kind: KIND_OFFER, capsule, developer: [0; 32], option: [0; 32], name: String::new(), stage: STAGE_QUEUED, why: 0, got: 0, total: len, who: String::new(), offered: None, answer: None });
+                s.jobs.push(Job { kind: KIND_OFFER, capsule, developer: [0; 32], option: [0; 32], name: String::new(), stage: STAGE_QUEUED, why: 0, got: 0, total: len, who: String::new(), offered: None, answer: None, unstow: 0 });
                 Some(true)
             });
             match added {
@@ -949,6 +1013,7 @@ fn offer_answer(grants: u64, i: usize, job: &Job, stow: bool) -> Result<(u8, u8)
     if !ferros_kist::store::write(list_cap, &list, at) {
         return Err(WHY_VAULT);
     }
+    unhide(grants, &job.developer, &job.option);
     if let Some(old) = old.filter(|c| *c != job.capsule && list.by_capsule(c).is_none()) {
         drop_capsule(grants, &old);
     }

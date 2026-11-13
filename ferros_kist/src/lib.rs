@@ -175,6 +175,8 @@ pub mod offer {
         pub const NOT_ITS_KEYS: u8 = 18;
         /// Native code offered to a production build, which stows masked kists only.
         pub const NATIVE_HERE: u8 = 19;
+        /// An unstow whose kist left the deck but whose own data the vault did not clear (docs/KISTS.md "The unstow sheet").
+        pub const NOT_CLEARED: u8 = 20;
     }
 
     /// A reason in a person's words (English: the host tool's, and the map's Kists page until it speaks ferros_lang).
@@ -199,6 +201,7 @@ pub mod offer {
             why::OTHER_KEY => "this kist is signed by a different key than its developer's other kists",
             why::NOT_ITS_KEYS => "the keys it carries are not its developer's",
             why::NATIVE_HERE => "it is unchecked native code, which a production build does not stow",
+            why::NOT_CLEARED => "it is off the deck, but what it kept for itself could not be cleared",
             _ => "something went wrong",
         }
     }
@@ -737,6 +740,88 @@ impl Kists {
     pub fn by_identity(&self, developer: &[u8; 32], option: &[u8; 32]) -> Option<&Kist> {
         self.kists.iter().find(|k| k.developer == *developer && k.option == *option)
     }
+
+    /// The answers kept for an unstowed kist forgotten: the person unticked "your answers" on its unstow sheet (docs/KISTS.md "The unstow sheet"), so a stow again asks every right afresh. The space follows (ferros_space takes an answer the list no longer holds, for a kist no longer stowed anywhere, as the person's removal). Whether any were kept.
+    pub fn forget(&mut self, developer: &[u8; 32], option: &[u8; 32]) -> bool {
+        let before = self.kept.len();
+        self.kept.retain(|k| !(k.developer == *developer && k.option == *option));
+        self.kept.len() != before
+    }
+
+    /// The list as this device shows it: every kist but those it leaves off its deck (`Hidden`, an unstow "this device only"). The person's list itself keeps them; never write this one back whole.
+    pub fn here(&self, hidden: &Hidden) -> Kists {
+        let mut out = self.clone();
+        out.kists.retain(|k| !hidden.has(&k.developer, &k.option));
+        out
+    }
+}
+
+/// The kists this device leaves off its deck (docs/KISTS.md "The unstow sheet": an unstow "this device only"), in the person's class but in a value of its own (`HIDDEN` in scope `kists.`), which the identity space never reads, so it stays on this device: the person's list keeps the kist and every other device of theirs keeps it on its deck. A section `hidden` per kist: `developer` ke, `option` hp, `unstowed` e (when). A stow of it on this device again (the pandok, an offer, `Kists::stow` thru the stower) takes it off this list.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct Hidden {
+    /// Each kist left off: (developer, option, when).
+    pub kists: Vec<([u8; 32], [u8; 32], i64)>,
+}
+
+/// The vault name (scope `kists.`) of this device's `Hidden`.
+pub const HIDDEN: &[u8] = b"hidden";
+
+impl Hidden {
+    pub fn has(&self, developer: &[u8; 32], option: &[u8; 32]) -> bool {
+        self.kists.iter().any(|k| k.0 == *developer && k.1 == *option)
+    }
+
+    /// Left off this device's deck from `now`. False when it already was.
+    pub fn hide(&mut self, developer: &[u8; 32], option: &[u8; 32], now: i64) -> bool {
+        if self.has(developer, option) {
+            return false;
+        }
+        self.kists.push((*developer, *option, now));
+        true
+    }
+
+    /// Back on this device's deck (stowed here again). Whether it was off.
+    pub fn show(&mut self, developer: &[u8; 32], option: &[u8; 32]) -> bool {
+        let before = self.kists.len();
+        self.kists.retain(|k| !(k.0 == *developer && k.1 == *option));
+        self.kists.len() != before
+    }
+
+    pub fn parse(doc: &[u8]) -> Result<Hidden, &'static str> {
+        let (header, end) = VsfHeader::decode(doc).map_err(|_| "not a VSF file")?;
+        let sections = header.sections(doc, end).map_err(|_| "sections that do not parse")?;
+        let mut out = Hidden::default();
+        for s in sections.iter().filter(|s| s.name == "hidden") {
+            // Each by its type marker: the developer's key `ke`, the option `hp`. WHY `try_from`: the lengths are the document's; it refuses any but 32 bytes.
+            let developer = s.get_field("developer").and_then(|f| f.values.iter().find_map(|v| match v {
+                VsfType::ke(k) => <[u8; 32]>::try_from(k.as_slice()).ok(),
+                _ => None,
+            }));
+            let option = s.get_field("option").and_then(|f| f.values.iter().find_map(|v| match v {
+                VsfType::hp(h) => <[u8; 32]>::try_from(h.as_slice()).ok(),
+                _ => None,
+            }));
+            let (Some(developer), Some(option)) = (developer, option) else { return Err("a hidden kist without its identity") };
+            let when = s.get_field("unstowed").and_then(|f| f.values.first()).and_then(|v| v.as_eagle()).unwrap_or(0);
+            out.kists.push((developer, option, when));
+        }
+        Ok(out)
+    }
+
+    /// As a complete VSF document stamped `now`, with its provenance hash.
+    pub fn build(&self, now: i64) -> Result<Vec<u8>, String> {
+        let mut b = vsf::VsfBuilder::new().creation_time_oscillations(now).provenance_only();
+        for (developer, option, when) in &self.kists {
+            let mut s = VsfSection::new("hidden");
+            s.add_field("developer", VsfType::ke(developer.to_vec()));
+            s.add_field("option", VsfType::hp(option.to_vec()));
+            if *when != 0 {
+                s.add_field("unstowed", VsfType::e(EtType::e6(*when)));
+            }
+            b = b.add_section_direct(s);
+        }
+        b.build()
+    }
 }
 
 impl Want {
@@ -888,6 +973,32 @@ mod tests {
         assert!(k.kept.is_empty());
     }
 
+    /// The unstow sheet (docs/KISTS.md "The unstow sheet"): answers unticked are forgotten, so a stow again asks afresh; "this device only" leaves the kist in the person's list and off this device's deck.
+    #[test]
+    fn the_unstow_sheet_forgets_answers_and_hides_here() {
+        let mut k = Kists::default();
+        let i = k.stow([1; 32], [2; 32], [3; 32], &decl());
+        k.kists[i].wants[0].answer = Some((true, 5));
+        k.remove(&[2; 32], &[3; 32]);
+        assert!(k.forget(&[2; 32], &[3; 32]));
+        assert!(!k.forget(&[2; 32], &[3; 32]));
+        let j = k.stow([1; 32], [2; 32], [3; 32], &decl());
+        assert_eq!(k.kists[j].wants[0].answer, None);
+        // Here only: the list keeps it, the device's view does not.
+        let other = k.stow([9; 32], [4; 32], [5; 32], &decl());
+        let mut h = Hidden::default();
+        assert!(h.hide(&[2; 32], &[3; 32], 7));
+        assert!(!h.hide(&[2; 32], &[3; 32], 8));
+        let here = k.here(&h);
+        assert_eq!(here.kists.len(), 1);
+        assert_eq!(here.kists[0].capsule, k.kists[other].capsule);
+        assert_eq!(k.kists.len(), 2);
+        let back = Hidden::parse(&h.build(9).unwrap()).unwrap();
+        assert_eq!(back, h);
+        assert!(h.show(&[2; 32], &[3; 32]));
+        assert!(!h.has(&[2; 32], &[3; 32]));
+    }
+
     #[test]
     fn declaration_reads_from_a_capsule_without_its_code() {
         let (kist, wants) = declaration_sections(&decl(), Some([5; 32]));
@@ -998,13 +1109,12 @@ mod tests {
 pub mod store {
     use super::*;
 
-    /// The list as the vault holds it now: an empty list when none was ever written; None when the grant is refused (nobody present) or the document does not parse.
-    pub fn read(cap: u64) -> Option<Kists> {
+    /// A document of the `kists.` scope whole: Some(None) absent, None refused (nobody present, no grant).
+    fn read_doc(cap: u64, name: &[u8]) -> Option<Option<Vec<u8>>> {
         let mut buf = [0u8; 4096];
         let mut doc = Vec::new();
-        // Absent is an empty list; refused (nobody present, no grant) is None, so nothing is ever written over a list that could not be read.
-        let whole = match ferros_sys::store_read_at(cap, LIST, 0, &mut buf) {
-            ferros_sys::NOTHING => return Some(Kists::default()),
+        let whole = match ferros_sys::store_read_at(cap, name, 0, &mut buf) {
+            ferros_sys::NOTHING => return Some(None),
             ferros_sys::ERR => return None,
             n => n as usize,
         };
@@ -1016,25 +1126,61 @@ pub mod store {
             if doc.len() >= whole {
                 break;
             }
-            ferros_sys::store_get_at(cap, LIST, doc.len(), &mut buf)?;
+            ferros_sys::store_get_at(cap, name, doc.len(), &mut buf)?;
         }
-        Kists::parse(&doc).ok()
+        Some(Some(doc))
     }
 
-    /// The list written whole, stamped `now` (Eagle oscillations); false when the vault did not take it.
-    pub fn write(cap: u64, list: &Kists, now: i64) -> bool {
-        let Ok(doc) = list.build(now) else { return false };
+    /// A document written whole; false when the vault did not take it.
+    fn write_doc(cap: u64, name: &[u8], doc: &[u8]) -> bool {
         let mut buf = [0u8; 4096];
         let mut at = 0;
         while at < doc.len() {
             let n = (doc.len() - at).min(buf.len());
             buf[..n].copy_from_slice(&doc[at..at + n]);
-            if !ferros_sys::store_set_at(cap, LIST, at, &buf[..n], at + n < doc.len()) {
+            if !ferros_sys::store_set_at(cap, name, at, &buf[..n], at + n < doc.len()) {
                 return false;
             }
             at += n;
         }
         true
+    }
+
+    /// The list as the vault holds it now: an empty list when none was ever written; None when the grant is refused (nobody present) or the document does not parse.
+    pub fn read(cap: u64) -> Option<Kists> {
+        // Absent is an empty list; refused (nobody present, no grant) is None, so nothing is ever written over a list that could not be read.
+        match read_doc(cap, LIST)? {
+            None => Some(Kists::default()),
+            Some(doc) => Kists::parse(&doc).ok(),
+        }
+    }
+
+    /// The list written whole, stamped `now` (Eagle oscillations); false when the vault did not take it.
+    pub fn write(cap: u64, list: &Kists, now: i64) -> bool {
+        let Ok(doc) = list.build(now) else { return false };
+        write_doc(cap, LIST, &doc)
+    }
+
+    /// The kists this device leaves off its deck (`Hidden`): none when none was ever written; None when refused or unreadable.
+    pub fn read_hidden(cap: u64) -> Option<Hidden> {
+        match read_doc(cap, HIDDEN)? {
+            None => Some(Hidden::default()),
+            Some(doc) => Hidden::parse(&doc).ok(),
+        }
+    }
+
+    /// This device's `Hidden` written whole (removed when it leaves nothing off); false when the vault did not take it.
+    pub fn write_hidden(cap: u64, hidden: &Hidden, now: i64) -> bool {
+        if hidden.kists.is_empty() {
+            return ferros_sys::store_delete(cap, HIDDEN).is_some();
+        }
+        let Ok(doc) = hidden.build(now) else { return false };
+        write_doc(cap, HIDDEN, &doc)
+    }
+
+    /// The list as this device shows it (`Kists::here`): the person's list less what this device leaves off its deck. None when either is refused. Never write it back whole: the list itself keeps the hidden kists for the person's other devices.
+    pub fn read_here(cap: u64) -> Option<Kists> {
+        Some(read(cap)?.here(&read_hidden(cap)?))
     }
 }
 
