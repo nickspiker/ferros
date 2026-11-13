@@ -972,6 +972,10 @@ impl Client {
         self.request_t = 0;
         self.request_frame.clear();
         self.verdict = V_NONE;
+        // The person key's bytes overwritten before the space state goes (docs/FACETS.md D0: RAM only, as the roots).
+        if let Some((k, _)) = self.space.person.as_mut() {
+            k.fill(0);
+        }
         self.space = space::SpaceSync::new();
     }
 

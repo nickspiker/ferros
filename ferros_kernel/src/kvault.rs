@@ -98,6 +98,32 @@ struct IdKeys {
     domain: [u8; 32],
     /// The identity seed itself, held only while the person is present so a tag can be kept from the settings page (`tag_keep`), which never sees the seed. The identity service holds it in RAM for as long anyway (its roots); wiped with the keys at `lock`.
     seed: [u8; 32],
+    /// The person key (FACETS.md D0, D1): handed in by the identity service once it opens it from the fleet's space (SYS_UNLOCK op 10), the root every kist's alias is derived from here (`alias`). None until then; wiped with the keys at `lock`.
+    person: Option<[u8; 32]>,
+}
+
+/// A kist's alias (FACETS.md "The alias"): BLAKE3 derive_key under this context over the person key, the kist's developer key and its option, each 32 bytes. The same bytes as `fgtw::alias::seed`, whose known answer `alias_known_answer` checks here.
+const ALIAS_CONTEXT: &str = "ferros 2026-11-12 kist alias v0";
+
+/// The alias seed of the kist (`developer`, `option`) under `person`.
+fn alias_seed(person: &[u8; 32], developer: &[u8; 32], option: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key(ALIAS_CONTEXT);
+    h.update(person);
+    h.update(developer);
+    h.update(option);
+    *h.finalize().as_bytes()
+}
+
+/// Whether this kernel's derivation gives fgtw's known answer (fgtw src/alias.rs `seed_known_answer`: the 96 bytes 0 to 95), for `diag identity`.
+pub fn alias_known_answer() -> bool {
+    let mut f = [[0u8; 32]; 3];
+    for (k, b) in f.iter_mut().flatten().enumerate() {
+        *b = k as u8;
+    }
+    let want = [
+        0xaa, 0x02, 0xea, 0x59, 0x45, 0xdb, 0x02, 0x07, 0x81, 0x6b, 0xc2, 0xd1, 0x9e, 0xf5, 0x80, 0x8d, 0x2a, 0x70, 0x00, 0xbe, 0x7c, 0xe0, 0xa4, 0xdb, 0x91, 0x13, 0xbc, 0xe8, 0x14, 0x8c, 0x37, 0x7f,
+    ];
+    alias_seed(&f[0], &f[1], &f[2]) == want
 }
 
 /// Block I/O counters for `selftest`.
@@ -522,7 +548,7 @@ impl KVault {
         let addr_key = blake3::derive_key(ID_ADDR_CONTEXT, &k);
         let payload_key = blake3::derive_key(ID_PAYLOAD_CONTEXT, &k);
         let domain = blake3::derive_key(ID_DOMAIN_CONTEXT, &k);
-        self.id = Some(IdKeys { addr_key, payload_key, domain, seed: *seed });
+        self.id = Some(IdKeys { addr_key, payload_key, domain, seed: *seed, person: None });
         // What the person had in the kernel's vault may now move to the vault process.
         crate::process::MIGRATE_PENDING.store(true, core::sync::atomic::Ordering::Release);
         PERSON.store(true, core::sync::atomic::Ordering::Release);
@@ -557,12 +583,38 @@ impl KVault {
             k.payload_key.fill(0);
             k.domain.fill(0);
             k.seed.fill(0);
+            if let Some(p) = k.person.as_mut() {
+                p.fill(0);
+            }
             core::hint::black_box(&k);
         }
     }
 
     pub fn unlocked(&self) -> bool {
         self.id.is_some()
+    }
+
+    /// The person key handed in by the identity service (SYS_UNLOCK op 10), held beside the identity's keys until `lock`: Ok(true) taken, Ok(false) the same key was held already. Refused while nobody is present. A different key replaces the one held (the fleet settled on the first minted after this device minted its own: fgtw::person), its bytes overwritten first.
+    pub fn set_person(&mut self, key: &[u8; 32]) -> Result<bool, KvError> {
+        let id = self.id.as_mut().ok_or(KvError::Locked)?;
+        if id.person.as_ref() == Some(key) {
+            return Ok(false);
+        }
+        if let Some(p) = id.person.as_mut() {
+            p.fill(0);
+        }
+        id.person = Some(*key);
+        Ok(true)
+    }
+
+    /// Whether the person key is held (a person present and their identity service has handed it in).
+    pub fn person_held(&self) -> bool {
+        self.id.as_ref().is_some_and(|k| k.person.is_some())
+    }
+
+    /// The alias seed of the kist (`developer`, `option`) for the person present; None while locked or before the person key is handed in.
+    pub fn alias(&self, developer: &[u8; 32], option: &[u8; 32]) -> Option<[u8; 32]> {
+        self.id.as_ref()?.person.as_ref().map(|p| alias_seed(p, developer, option))
     }
 
     /// The base of the unlocked person's vault domains; None while locked.

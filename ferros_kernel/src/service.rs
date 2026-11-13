@@ -747,6 +747,15 @@ fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
             crate::flashlog::line("identity locked");
             Ok(0)
         }
+        // The person key from the identity service (FACETS.md D1): held beside the identity's keys, wiped at lock. The log says that it came, never a byte of it.
+        (10, Some(k)) => match st.set_person(k) {
+            Ok(true) => {
+                crate::flashlog::line("person key held: kists' aliases can be derived");
+                Ok(0)
+            }
+            Ok(false) => Ok(0),
+            Err(_) => Err(()),
+        },
         (3, _) => {
             st.bind().map_err(|_| ())?;
             crate::flashlog::line("identity bound: this device now opens only for it");
@@ -771,8 +780,13 @@ fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
             RELEASE_RESET.store(true, core::sync::atomic::Ordering::Release);
             Ok(0)
         }
-        _ => Ok(st.unlocked() as u64 | (st.bound().unwrap_or(false) as u64) << 1),
+        _ => Ok(st.unlocked() as u64 | (st.bound().unwrap_or(false) as u64) << 1 | (st.person_held() as u64) << 2),
     }
+}
+
+/// A kist's alias seed (FACETS.md "The alias"; process.rs SYS_IRA's alias bit) for its gate identity as the kernel stamped it at launch: None while nobody is present or before the identity service has handed in the person key.
+pub(crate) fn alias(developer: &[u8; 32], option: &[u8; 32]) -> Option<[u8; 32]> {
+    unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut())?.alias(developer, option)
 }
 
 /// Attest with a tag (AUTH.md; SYS_UNLOCK ops 6-9, process.rs `tag_syscall`). The flash log names a tag only by the start of its id (a keyed hash of its UID, kvault `TAG_ID_CONTEXT`), never by its UID.
@@ -3791,7 +3805,8 @@ pub fn run(mut b: Boot) -> ! {
                     // Under the kernel lock, as every UFS command (release writes the vault; the state reads it).
                     let s = if cmd.params == b"identity release" { crate::process::with_lock(|| store_unlock(4, None)).map(|_| "released") } else { Ok("") };
                     let st = crate::process::with_lock(|| store_unlock(0, None)).unwrap_or(0);
-                    resp.extend_from_slice(alloc::format!("identity: {} unlocked {}, bound {}\n", s.unwrap_or("release failed"), st & 1 == 1, st & 2 == 2).as_bytes());
+                    // The person key only as held or not, and the alias derivation against fgtw's known answer (FACETS.md): never a byte of either.
+                    resp.extend_from_slice(alloc::format!("identity: {} unlocked {}, bound {}, person key held {}, alias known answer {}, aliases given A#{}\n", s.unwrap_or("release failed"), st & 1 == 1, st & 2 == 2, st & 4 == 4, if crate::kvault::alias_known_answer() { "ok" } else { "WRONG" }, crate::process::ALIASES_GIVEN.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
