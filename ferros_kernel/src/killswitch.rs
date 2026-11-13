@@ -173,7 +173,8 @@ pub fn arm_core() -> bool {
     true
 }
 
-/// Enable one shared interrupt (SPI, INTID 32..1020) for a process's interrupt grant: level-triggered, middle priority, routed to this core (the kernel's), enabled. `.Lirq` masks it when it fires; `unmask_spi` is the driver's ack.
+/// Enable one shared interrupt (SPI, INTID 32..1020) for a process's interrupt grant: level-triggered, middle priority, routed to the kernel's core, enabled. `.Lirq` masks it when it fires; `unmask_spi` is the driver's ack.
+/// The kernel's core, not the core the waiting thread's syscall ran on (2026-11-13): that is a worker under SMP, and the workers are switched off while dark (CPU_OFF, service.rs), where a line routed to one is never delivered. The WiFi driver's MSI waited out whole dark spells that way on the 8a (pings 785 ms on average, 61 ms with the workers kept on). The kernel's core stays on, and a PSCI-suspended one is still woken for its SPIs.
 pub fn enable_spi(intid: u32) {
     if !(32..1020).contains(&intid) {
         return;
@@ -181,7 +182,10 @@ pub fn enable_spi(intid: u32) {
     let n = intid as usize;
     let mpidr: u64;
     unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
-    unsafe { write_volatile((GICD + 0x6000 + n * 8) as *mut u64, (mpidr & 0xFF_FFFF) | (mpidr & 0xFF_0000_0000)) };
+    // This core's affinity with Aff1, the core number on this SoC (process.rs `core`), set to the kernel's.
+    let k = crate::process::kernel_mask().trailing_zeros() as u64;
+    let aff = (mpidr & 0xFF_00FF) | (k << 8) | (mpidr & 0xFF_0000_0000);
+    unsafe { write_volatile((GICD + 0x6000 + n * 8) as *mut u64, aff) };
     let pr = GICD + 0x400 + (n & !3);
     wr(pr, (rd(pr) & !(0xFF << ((n & 3) * 8))) | (0x80 << ((n & 3) * 8)));
     let cfg = GICD + 0xC00 + (n / 16) * 4;
