@@ -642,7 +642,15 @@ pub fn sync(space: &mut Space, base: &mut Baseline, store: &mut impl Store, me: 
     for _ in 0..4 {
         let mut list = read_list(store).map_err(|_| "the person's list is not readable")?;
         let scope = if deck_sync(space, me) { FLEET } else { *me };
-        let facts = snapshot(&list, store, &scope).map_err(|_| "the map's places are not readable")?;
+        let mut facts = snapshot(&list, store, &scope).map_err(|_| "the map's places are not readable")?;
+        // A place or the view this device holds where the space holds a removal: the device's, stamped past the removal (owner, 2026-11-12, on the 8a: "sometimes that ferros logo just BOOP!").
+        // A circle's place goes with its circle: an unstowed kist's is left alone by every device (`managed`), so a place's tombstone only ever came from a copy that lost its place while the circle stood, and it must not stick.
+        // Until this a place has no stamp of its own, so a removal stuck: the settings circle's (in the space since a copy lost it) took map.place.settings back out of the 8a's vault within 4 s of every save, the generation moved, and the map placed every circle again with settings at its seed, far off the deck and at whatever size it last had.
+        for f in facts.iter_mut().filter(|f| f.kind == kind::PLACE || f.kind == kind::VIEW) {
+            if let Some(e) = space.get(f.kind, &f.id).filter(|e| e.gone) {
+                f.stamp = Some(e.updated + 1);
+            }
+        }
         let before = base.clone();
         let live: Vec<([u8; 32], [u8; 32])> = space.entries().iter().filter(|e| e.kind == kind::KIST && !e.gone).filter_map(|e| Some((e.id.first().and_then(k32)?, e.id.get(1).and_then(k32)?))).collect();
         let writes = reconcile(space, base, &facts, |k, id| managed(&list, &live, &scope, k, id), *me, now);
@@ -819,6 +827,31 @@ mod tests {
         let (mut sr, mut br) = (hand_over(&sb), Baseline::default());
         sync(&mut sr, &mut br, &mut reset, &OTHER, 2800).unwrap();
         assert_eq!(reset.map, b.map);
+    }
+
+    /// The 8a, 2026-11-12: the space held a removal of the settings circle's place (a copy had lost it while the circle stood), and the 8a's place for it was taken back out within one sync of every save. A place the device holds wins over a removal now: back in the space, kept on the device, and handed to a sibling.
+    #[test]
+    fn a_place_removal_does_not_stick() {
+        let mut a = arranged_pro();
+        let (mut sa, mut ba) = (Space::new(), Baseline::default());
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2000).unwrap();
+        // A copy that lost settings' place: the removal goes into the space.
+        a.remove(Scope::Map, &place_key("settings"));
+        assert!(sync(&mut sa, &mut ba, &mut a, &PRO, 2100).unwrap().space_changed);
+        assert!(sa.get(kind::PLACE, &place_id(&FLEET, &Circle::Settings)).is_some_and(|e| e.gone));
+        // The map keeps settings' place again (a move, the release's rescale).
+        let kept = encode_place(&[3 << 8, 4 << 8, 120, 0, ONE]);
+        a.set(Scope::Map, &place_key("settings"), &kept);
+        let o = sync(&mut sa, &mut ba, &mut a, &PRO, 2200).unwrap();
+        assert!(o.space_changed, "the place goes back into the space");
+        assert_eq!(o.wrote, 0, "and is not taken back out");
+        assert_eq!(a.map[&place_key("settings")], kept);
+        assert_eq!(sync(&mut sa, &mut ba, &mut a, &PRO, 2300).unwrap(), Outcome::default(), "settled");
+        // A sibling that had taken the removal gets the place.
+        let mut b = Vault::default();
+        let (mut sb, mut bb) = (hand_over(&sa), Baseline::default());
+        sync(&mut sb, &mut bb, &mut b, &OTHER, 2400).unwrap();
+        assert_eq!(b.map[&place_key("settings")], kept);
     }
 
     /// Unstowed on one device: gone from the other too, the answers kept on both and in the space; stowed again later (the stower stamps when), it wins over the unstow's tombstone and asks nothing anywhere. Its source and version travel with it.
