@@ -28,6 +28,18 @@ pub async fn call(link: &UsbLink, cmd: &[u8]) -> Result<Vec<u8>, String> {
     recv(link).await
 }
 
+/// A command whose work may outlive one answer (a store command, a kist offer's part: ferros_pt::command::held) sent and its answer received: while the device says STILL, its end is read with `caps::HELD`, a read the device holds until the work ends or its lease does. No timer here: every wait is the device's held answer.
+pub async fn call_held(link: &UsbLink, cmd: &[u8]) -> Result<Vec<u8>, String> {
+    let mut r = call(link, cmd).await?;
+    let mut waits = 0u32;
+    while r.first() == Some(&ferros_pt::command::held::STILL) {
+        waits += 1;
+        trace!("  still at work on the device ({waits} leases): reading its end, held");
+        r = call(link, &command(ferros_pt::command::caps::HELD, ferros_pt::Op::Read, &[])).await?;
+    }
+    Ok(r)
+}
+
 /// Send data to the device via PT and wait for COMPLETE.
 pub async fn send(link: &UsbLink, data: &[u8]) -> Result<Complete, String> {
     let sid = StreamId::FIRST;

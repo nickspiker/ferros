@@ -201,7 +201,7 @@ async fn main() {
     let n = ps.len();
     for (k, (at, p)) in ps.into_iter().enumerate() {
         let part_len = p.len() as u64 - 41;
-        let r = pt::call(&link, &pt::command(OFFER, Op::Write, &p)).await.unwrap_or_else(|e| {
+        let r = pt::call_held(&link, &pt::command(OFFER, Op::Write, &p)).await.unwrap_or_else(|e| {
             eprintln!("the link failed: {e}");
             exit(FAILED);
         });

@@ -957,12 +957,9 @@ async fn cmd_store(args: &[String]) {
         std::process::exit(1);
     });
     let cmd = build_cmd(ferros_pt::command::caps::STORE, op, &params);
-    if let Err(e) = pt_send(&link, &cmd).await {
-        eprintln!("Command send failed: {e}");
-        std::process::exit(1);
-    }
-    let r = pt_recv(&link).await.unwrap_or_else(|e| {
-        eprintln!("Response receive failed: {e}");
+    // A put that commits a large value may outlive one answer: its end read held (ferros_pt::command::held).
+    let r = ferros_link::pt::call_held(&link, &cmd).await.unwrap_or_else(|e| {
+        eprintln!("Command failed: {e}");
         std::process::exit(1);
     });
     match r.first().copied() {
@@ -1010,8 +1007,8 @@ async fn cmd_store(args: &[String]) {
 /// One STORE command and its reply: the status byte's meaning on failure, the rest on success.
 async fn store_call(link: &usb::UsbLink, op: ferros_pt::Op, params: &[u8]) -> Result<Vec<u8>, String> {
     let cmd = build_cmd(ferros_pt::command::caps::STORE, op, params);
-    pt_send(link, &cmd).await?;
-    let r = pt_recv(link).await?;
+    // A put that commits a large value may outlive one answer: its end read held (ferros_pt::command::held).
+    let r = ferros_link::pt::call_held(link, &cmd).await?;
     match r.first().copied() {
         Some(0) => Ok(r[1..].to_vec()),
         Some(1) => Err("not found".into()),
@@ -1066,7 +1063,8 @@ async fn cmd_kist_stow(path: &str) {
     key.extend_from_slice(&addr);
     let t0 = std::time::Instant::now();
     const PART: usize = 4 << 20;
-    // `--stored`: the capsule is in this device's vault already (the same address: an earlier stow whose list entry was lost), so only the list entry is written. Its parts are not sent again: a big capsule's last part commits the whole value, which on a busy vault ran past the USB driver's 16 s (the 8a, 2026-11-13).
+    // `--stored`: the capsule is in this device's vault already (the same address: an earlier stow whose list entry was lost), so only the list entry is written and its parts are not sent again.
+    // A big capsule's last part commits the whole value, which on a busy vault ran past the USB driver's 16 s (the 8a, 2026-11-13); since then the device answers such a part STILL at its lease and the end is read held (`store_call`), so a normal stow needs no `--stored`.
     let stored = std::env::args().any(|a| a == "--stored");
     for (k, part) in capsule.chunks(PART).enumerate().filter(|_| !stored) {
         let off = k * PART;
