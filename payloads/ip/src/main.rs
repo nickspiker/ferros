@@ -193,6 +193,8 @@ struct Path {
     by_ring: u32,
     by_call: u32,
     by_timer: u32,
+    /// When this window began (0: not yet), for the idle report every 64 s or more (`main`): with no timer bringing passes, the window's passes and waits are the stack's wakes at rest.
+    t0: u64,
 }
 
 impl Path {
@@ -201,7 +203,13 @@ impl Path {
         let f = ip.freq;
         let us = |t: u64| t * 1_000_000 / f;
         let (pass_most, slept, call_most) = (us(self.pass_most), us(self.slept_t) / 1000, us(self.call_most));
-        ip.put(b"WiFi path since the last report: A#");
+        ip.put(b"WiFi path since the last report");
+        if self.t0 != 0 {
+            ip.put(b" (A#");
+            ip.dec(us(now().wrapping_sub(self.t0)) / 1000);
+            ip.put(b" ms)");
+        }
+        ip.put(b": A#");
         ip.dec(self.passes as u64);
         ip.put(b" passes (longest A#");
         ip.dec(pass_most);
@@ -257,14 +265,15 @@ const EXCH_REPLY: usize = 3;
 /// The exchanges' reply buffer (`wlan_batch`): a static, not the 64 KiB stack.
 static mut EXCH: [u8; EXCH_MAX] = [0; EXCH_MAX];
 
-/// The WiFi doorbell (`FERROS_WIFI_IRQ=1` builds, 2026-11-11; off, the stack asks the driver every idle millisecond as before): a second thread holds a call to the driver (`wlan` op 9) that the driver answers only once frames wait, and rings `RING`; the main thread's idle wait is on `RING`, ended also by an application's call (`wait_world_or_call`) and by its own next timer, so an idle stack stops asking the driver a thousand times a second and the driver can sleep until its chip rings (payloads/pcie1 `WIFI_IRQ`).
-const WIFI_RING: bool = option_env!("FERROS_WIFI_IRQ").is_some();
+/// The WiFi doorbell (the default since 2026-11-13; `FERROS_WIFI_IRQ=0` builds ask the driver every idle millisecond as before): a second thread holds a call to the driver (`wlan` op 9) that the driver answers only once frames wait, and rings `RING`; the main thread's idle wait is on `RING`, ended also by an application's call (`wait_world_or_call`) and by its own next timer, so an idle stack stops asking the driver a thousand times a second and the driver can sleep until its chip rings (payloads/pcie1 `WIFI_IRQ`). A driver without op 9 answers it with nothing, and the stack asks it every idle millisecond then.
+const WIFI_RING: bool = match option_env!("FERROS_WIFI_IRQ") {
+    Some(v) => !(v.len() == 1 && v.as_bytes()[0] == b'0'),
+    None => true,
+};
 /// The doorbell's word: 0 armed (the helper's call held at the driver, or about to be), 1 frames wait at the driver, 2 the driver gone (the call failed: the main thread re-arms it once `wifi_up` finds a driver again), 3 a driver without the doorbell (op 9 answered with nothing: never armed again).
 static RING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The helper's stack: it only calls and waits.
 static mut RING_STACK: [u8; 1 << 13] = [0; 1 << 13];
-/// The longest idle wait with the doorbell: 2^6 of the counter's ~1 ms (freq >> 10), when neither the cellular call (asked each idle millisecond, as before) nor a retransmit timer nor a held receive's deadline wants the stack sooner: its other timers count in seconds.
-const RING_IDLE_LOG2: u32 = 6;
 
 /// The doorbell's helper thread (`WIFI_RING`): the held call, its answer into `RING`, the main thread woken, then a wait until the main thread has taken the frames (`RING` back to 0) before asking again.
 extern "C" fn ring_thread(grants: u64) -> ! {
@@ -804,12 +813,14 @@ impl Ip {
         n
     }
 
-    /// When the idle wait with the doorbell ends at the latest (`WIFI_RING`): the next idle millisecond (shifted by the screen-off backoff) while the cellular call is up, as it is asked each pass; else the earliest of a connection's retransmit timer, a held receive's deadline, and `RING_IDLE_LOG2` from now. A time already past ends the wait at once, and the pass handles it.
+    /// When the idle wait ends at the latest (it ends sooner on the WiFi doorbell, an application's call or a preference changing): the next idle millisecond (shifted by the screen-off backoff) while the cellular call is up, as `rmnet` is asked each pass until the modem rings a doorbell of its own; else the earliest of the protocol timers that are running: a connection's retransmit timer, a held receive's deadline, the resolver's tries and held lookups, DHCPv4's 2 s retransmit while unbound, the router solicitation's 4 s while IPv6 has no global address, the membership reports' 60 s while a group is joined, the WiFi driver looked for every 4 s while there is none, and the cellular call's INFO every second until it is up (both asks of a driver that has no doorbell for them yet). A time already past ends the wait at once, and the pass handles it. No backstop: until 2026-11-13 the wait also ended every 2^6 ms whatever was running, some 16 wakes a second for nothing.
     fn idle_until(&self, t0: u64) -> u64 {
         if self.cell.flags & 1 != 0 {
             return t0 + (self.freq / 1000 << self.backoff);
         }
-        let mut t = t0 + ((self.freq >> 10) << RING_IDLE_LOG2);
+        let f = self.freq;
+        // The cellular call's INFO, every second until it is up.
+        let mut t = self.cell_t + f;
         // WHY the mins: the earliest of the deadlines, not a bound on anyone's value.
         for c in self.tcb.iter().filter(|c| c.rto_t != 0) {
             t = t.min(c.rto_t);
@@ -823,6 +834,18 @@ impl Ip {
         }
         for r in self.res.rq.iter().filter(|r| r.used) {
             t = t.min(r.until);
+        }
+        if self.wifi && !self.bound {
+            t = t.min(self.dhcp_t + 2 * f);
+        }
+        if self.wifi && !self.have_global && self.rs_n < 3 {
+            t = t.min(self.rs_t + 4 * f);
+        }
+        if self.groups_n > 0 {
+            t = t.min(self.groups_t + 60 * f);
+        }
+        if !self.wifi {
+            t = t.min(self.wifi_t + 4 * f);
         }
         t
     }
@@ -3147,6 +3170,15 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         ip.tcp_acks();
         // The call's state from `rmnet` INFO: every second until it is up, then every 16 s (a call that drops and comes back may come back with new addresses).
         let t = now();
+        // The WiFi path said at the first pass 64 s or more after its window began, when no connection's report said it sooner: at rest its passes and waits are the stack's wakes (2026-11-13, the deep-sleep measure: ip woke ~260 times a second in the dark).
+        if t.wrapping_sub(ip.path.t0) >= 64 * ip.freq {
+            if ip.path.t0 != 0 {
+                ip.flush();
+                let p = core::mem::take(&mut ip.path);
+                p.say(&mut ip);
+            }
+            ip.path.t0 = t;
+        }
         if t.wrapping_sub(ip.cell_t) > if ip.cell.flags & 1 != 0 { 16 } else { 1 } * ip.freq {
             ip.cell_t = t;
             ip.cell_info();
@@ -3203,9 +3235,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             ip.backoff = 0;
         } else {
             let t0 = now();
-            if ip.ring {
-                // The doorbell (`WIFI_RING`): the wait ends when it rings, when an application calls (`udp`, polled above), or at the stack's next timer (`idle_until`).
-                match ferros_sys::wait_world_or_call(&RING, 0, ip.idle_until(t0)) {
+            if ip.ring || !ip.wifi {
+                // The doorbell (`WIFI_RING`), or no WiFi link to ask at all: the wait ends when the doorbell rings, when an application calls (`udp`, polled above), when a preference changes, or at the stack's next timer (`idle_until`). Only a WiFi driver without the doorbell is still asked every idle millisecond (below). With no link, the word is whatever the helper left (2, the driver gone), so it is waited on as it is.
+                let expect = if ip.ring { 0 } else { RING.load(core::sync::atomic::Ordering::Acquire) };
+                match ferros_sys::wait_world_or_call(&RING, expect, ip.idle_until(t0)) {
                     0 | 1 => ip.path.by_ring += 1,
                     3 => ip.path.by_call += 1,
                     _ => ip.path.by_timer += 1,
