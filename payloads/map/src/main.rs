@@ -214,6 +214,9 @@ fn mark_look(px: i64) -> (i64, [u32; 4], bool) {
 
 /// Movement under this many panel pixels is a finger resting, not a drag: a tap may wobble this much.
 const SLOP: i64 = 24;
+/// The helm's swipe inward acts past this fraction of the screen's harmonic span (a sixth: 248 px on the 8a's 1080x2400, 309 on the Pro's 1344x2992), and only mostly inward; a finger that stays within the roll's fraction (a twelfth) and never swiped lifts as a tap (owner, 2026-11-12, on the 8a).
+const HELM_SWIPE: f64 = 6.;
+const HELM_ROLL: f64 = 12.;
 /// One, in the rotation's Q14.
 const ONE: i64 = 1 << 14;
 
@@ -727,6 +730,8 @@ const Z_ONE: i64 = 1 << 16;
 /// The deck swipe's turn search (`Map::deck_turned`): turns sampled across a half turn, then golden-section steps between the best one's neighbours (each step keeps 0.618 of the bracket: 2⁵ steps take the two samples either side of the best, under six degrees, to about a millionth of one).
 const TURN_SAMPLES: usize = 1 << 6;
 const TURN_REFINE: usize = 1 << 5;
+/// The zoom gain (natural logarithm) at which deck's fit turns half of the way to its best turn: an eighth, about 13% larger; under half of it (6%) the turn is a sixteenth of the way or less, past twice it nearly all (`Map::deck_turned`).
+const TURN_GAIN: f64 = 1. / ((1 << 3) as f64);
 /// The circles together may not shrink below this fraction of the screen's area (1/256), nor the smallest circle grow past the screen; the largest and smallest circle may not differ by more than this in area (256×: 16× in radius).
 const AREA_FRACTION: i64 = 256;
 const RADIUS_RATIO: i64 = 16;
@@ -2493,8 +2498,8 @@ impl Map {
         self.deck_fit_at(self.cam.c, self.cam.s).0
     }
 
-    /// The deck swipe's camera (owner, 2026-11-11: deck's swipe flies out "to fit every circle" and "let's rotate it to find the most zoom we can too so it spins into place"): every circle in view as `deck_fit` fits them, at the turn that lets them be largest. The fit's zoom is a function of the turn with period a half turn (turning by π mirrors the circles through the fit's middle, which fits alike), continuous and piecewise smooth (the fit is the least of each circle's two room ratios). A bounded search, no timer: `TURN_SAMPLES` turns across the half turn centred on the camera's own (so the answer is the nearer of each pair a half turn apart, and the flight spins the short way), then golden-section steps inside the best sample's neighbours. Where the zoom limit caps every turn alike (a few small circles), the camera keeps its own turn: nothing to gain by spinning.
-    fn deck_turned(&self) -> Cam {
+    /// The deck swipe's camera (owner, 2026-11-11: deck's swipe flies out "to fit every circle" and "let's rotate it to find the most zoom we can too so it spins into place"): every circle in view as `deck_fit` fits them, at the turn that lets them be largest. The fit's zoom is a function of the turn with period a half turn (turning by π mirrors the circles through the fit's middle, which fits alike), continuous and piecewise smooth (the fit is the least of each circle's two room ratios). A bounded search, no timer: `TURN_SAMPLES` turns across the half turn centred on the camera's own (so the answer is the nearer of each pair a half turn apart, and the flight spins the short way), then golden-section steps inside the best sample's neighbours. Where the zoom limit caps every turn alike (a few small circles), the camera keeps its own turn: nothing to gain by spinning; and where the best turn gains little, it turns little (owner, 2026-11-12), the part of the way smooth in the gain (`TURN_GAIN`). Also the gain (the natural logarithm of the zoom gained) and the turn taken, in radians, for the console.
+    fn deck_turned(&self) -> (Cam, f64, f64) {
         let a0 = libm::atan2(self.cam.s as f64, self.cam.c as f64);
         let half = core::f64::consts::PI;
         let turn = |a: f64| (libm::round(libm::cos(a) * ONE as f64) as i64, libm::round(libm::sin(a) * ONE as f64) as i64);
@@ -2530,11 +2535,18 @@ impl Map {
         }
         let (a, z) = if zp > zq { (p, zp) } else { (q, zq) };
         let (best, best_z) = if z > best_z { (a, z) } else { (best, best_z) };
-        // The zoom limit: a turn that only gains past what the camera may reach gains nothing.
+        // What the turn gains: the zoom the camera may reach at the best turn against at its own, as a natural logarithm (a turn that only gains past the zoom limit gains nothing). The limit as a soft minimum, z / (1 + (z / limit)⁸)^(1/8): the fit's zoom below the limit, the limit above it, C∞ between, so the gain is smooth in the circles' places as the turn it sets is drawn. Never below zero: the camera's own turn is the search's first candidate.
         let (_, hi_z) = self.zoom_limits();
-        let here = fit(a0);
-        let (c, s) = if here >= hi_z as f64 || best_z <= here { (self.cam.c, self.cam.s) } else { turn(best) };
-        self.deck_fit_at(c, s).0
+        let hi = hi_z as f64;
+        let reach = |z: f64| { let a = z / hi; let a2 = a * a; let a4 = a2 * a2; z / libm::pow(1. + a4 * a4, 1. / ((1 << 3) as f64)) };
+        let gain = libm::log(reach(best_z) / reach(fit(a0)));
+        // How much of the way the camera turns (owner, 2026-11-12, on the 8a: a 32 degree spin for a fit that gained little; "it changes orientation instantly on occasion"): x⁴ / (1 + x⁴) of the gain against `TURN_GAIN`, C∞, nothing for a gain far under it, half at it, nearly all of the way past twice it. A partial turn still fits every circle (`deck_fit_at` at that turn), only not as large.
+        let x = gain / TURN_GAIN;
+        let x4 = x * x * x * x;
+        let part = x4 / (1. + x4);
+        let a = a0 + part * (best - a0);
+        let (c, s) = turn(a);
+        (self.deck_fit_at(c, s).0, gain, a - a0)
     }
 
     /// `deck_fit` at the turn (c, s), Q14: the camera, and the fit's own zoom before the zoom limits hold it (what the turn is chosen by).
@@ -4674,7 +4686,10 @@ impl Map {
             self.back = None;
             self.leaving = true;
         }
-        let to = self.deck_turned();
+        let (to, gain, turned) = self.deck_turned();
+        let mut l = Line::new();
+        let _ = write!(l, "map: deck: the best turn gains A#{} per mille of zoom; turned A#{} mrad\n", libm::round((libm::exp(gain) - 1.) * 1000.) as i64, libm::round(turned * 1000.) as i64);
+        console(self.grants, l.as_str().as_bytes());
         self.fly(to);
         self.draw();
     }
@@ -5502,6 +5517,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // Where that finger landed, and whether the corner has acted this touch.
     let mut corner_from = (0i64, 0i64);
     let mut corner_done = false;
+    // Whether the helm's finger went further than a roll from where it landed (`HELM_ROLL`): then its lift is no tap.
+    let mut corner_far = false;
     // Two fingers on back and deck together (development builds): 0 not looked at yet this touch, 1 they are, 2 they are not; and whether their swipe up has switched the hit map this touch.
     let mut pair = 0u8;
     let mut pair_done = false;
@@ -6045,6 +6062,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             corner_at = (f.1, f.2);
             corner_from = (f.1, f.2);
             corner_done = false;
+            corner_far = false;
             pair = 0;
             pair_done = false;
             // Measuring (the first cut did not fire for the owner): a touch in the bottom sixth, what the display said is under it.
@@ -6078,7 +6096,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 let (fx, fy) = (cur[ids[0]].1, cur[ids[0]].2);
                 let (dx, dy) = (fx - corner_from.0, fy - corner_from.1);
                 if corner & 16 != 0 && corner < 32 && !corner_done {
-                    // A console circle's swipe inward, as the helm's (below): the finger's travel toward the screen's centre past a twelfth of the harmonic span opens its page, once a touch (with an app in front the settings circle is not on the screen: nothing).
+                    // A console circle's swipe inward, as the helm's was until 2026-11-12 (below): the finger's travel toward the screen's centre past a twelfth of the harmonic span opens its page, once a touch (with an app in front the settings circle is not on the screen: nothing).
                     let (ux, uy) = ((w / 2 - corner_from.0) as f64, (h / 2 - corner_from.1) as f64);
                     let inward = (dx as f64 * ux + dy as f64 * uy) / libm::sqrt(ux * ux + uy * uy);
                     let span = (2 * w * h) as f64 / (w + h) as f64;
@@ -6116,7 +6134,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
             }
             if pair == 1 && !pair_done && held >= 2 {
-                // Up past the corner's own threshold (a twelfth of the screen's harmonic span), both of them.
+                // Up past a twelfth of the screen's harmonic span (the corner's own threshold until 2026-11-12), both of them.
                 let span = (2 * w * h) as f64 / (w + h) as f64;
                 if ids[..held].iter().filter(|&&id| (start[id].2 - cur[id].2) as f64 > span / 12.).count() >= 2 {
                     pair_done = true;
@@ -6129,14 +6147,22 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             if (corner == 8 || corner == 9) && held >= 1 && pair != 1 {
                 corner_at = (cur[ids[0]].1, cur[ids[0]].2);
-                // The swipe inward: the finger's travel along the line from where it landed toward the screen's centre. Past a twelfth of the screen's harmonic span (2wh/(w+h); owner, 2026-11-07), the corner acts, once a touch (WINDOWS.md "The helm"): deck, the app in front full screen or not, or with none out to every circle turned to fit; back, the kist before.
+                // The swipe inward: the finger's travel along the line from where it landed toward the screen's centre, and across it. Past a sixth of the screen's harmonic span (2wh/(w+h)) and mostly inward (within 45 degrees of that line: more along it than across), the corner acts, once a touch (WINDOWS.md "The helm"): deck, the app in front full screen or not, or with none out to every circle turned to fit; back, the kist before. Until 2026-11-12 a twelfth and any direction (owner, 2026-11-07), and on the 8a a tap with a little roll crossed it (owner: "it changes orientation instantly on occasion"): deck's fit and turn fired on a tap.
                 let (ux, uy) = ((w / 2 - corner_from.0) as f64, (h / 2 - corner_from.1) as f64);
-                let inward = ((corner_at.0 - corner_from.0) as f64 * ux + (corner_at.1 - corner_from.1) as f64 * uy) / libm::sqrt(ux * ux + uy * uy);
+                let (dx, dy) = ((corner_at.0 - corner_from.0) as f64, (corner_at.1 - corner_from.1) as f64);
+                let ul = libm::sqrt(ux * ux + uy * uy);
+                let inward = (dx * ux + dy * uy) / ul;
+                let across = (dx * uy - dy * ux) / ul;
                 let span = (2 * w * h) as f64 / (w + h) as f64;
+                let reach = span / HELM_SWIPE;
+                // Gone further than a roll (a twelfth of the span) any way: no longer a tap, whatever it does next.
+                if dx * dx + dy * dy > (span / HELM_ROLL) * (span / HELM_ROLL) {
+                    corner_far = true;
+                }
                 // The helm button's light follows the swipe: half at the landing, toward full as the finger comes in (½(1 + tanh(inward / threshold)), C∞, lower again if it pulls away), full once it acted.
-                let lvl = if corner_done { 1.0 } else { 0.5 * (1.0 + libm::tanh(inward / (span / 12.))) };
+                let lvl = if corner_done { 1.0 } else { 0.5 * (1.0 + libm::tanh(inward / reach)) };
                 map.helm_light(corner, lvl as f32);
-                if !corner_done && inward > span / 12. {
+                if !corner_done && inward > reach && inward > across.abs() {
                     corner_done = true;
                     // The helm's swipes (owner, 2026-11-11, on the Pro: "the swipe in on home whilist in a kist needs to show/hide controls. on the home screen it auto-fits"; "Can't hide controls on home screen"). Deck's: with an app in front, its full screen on or off (`full_switch`; the kist stays in front, where until then this swipe sent it behind first); with none, the plane flies out to every circle at the turn that fits them largest ("so it spins into place"), the controls always shown there. The display's answer decides which, not `app_front`. Back's: a flip to the kist before (this one behind). The quick row's middle circle switches full screen too.
                     let said = if corner == 8 {
@@ -6209,7 +6235,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 // The helm tapped still: deck or back (`helm_tap`), with an app in front as on the map. Two fingers on back and deck together are the hit map's pair (development builds), never a tap.
                 8 | 9 => {
                     tap_thru = false;
-                    if !moved && pair != 1 {
+                    // Still, or rolled less than a twelfth of the span and never swiped (owner, 2026-11-12: a tap with a roll is a tap): the general slop is a few pixels, a fingertip's roll on the glass more.
+                    if !corner_done && !corner_far && pair != 1 {
                         let said = map.helm_tap(corner);
                         console(grants, said.as_bytes());
                         console(grants, b"\n");

@@ -6,6 +6,7 @@
 //!   - behind the quick row while any of it shows on the glass (`SYS` + 12): everything inside the app's circle (never in full screen, where the row does not show);
 //!   - with an app in front, its windows by the layer stack (`WINDOW` + surface): a window owns every pixel where it is not see-through, as fluor tags a widget by its shape; where no window is, nobody's;
 //!   - on the deck: the open circle's page (`REGION`), the map's circles front first (`CIRCLE` + their index in the scene, the crowd's included), each its disc; the plane under them all (`PLANE`).
+//!   - the helm's wedges on the deck (owner, 2026-11-12, on the 8a: a tap on the settings circle in the bottom right corner was taken as deck's and closed it): with no app in front and nothing behind the quick row, back 9 and deck 8 are claimed behind the map's circles and in front of the plane, so a touch that starts on a circle lying in a corner is the circle's. A circle that covers the whole glass is the plane to a touch (map `grasp`), so it goes behind the wedges too. Over an app the wedges stay frontmost, the system's (WINDOWS.md "The helm").
 //! - **Read by one lookup.** Op 27 ("is this point my window's") and op 41 ("what of the system's is here") read the pixel (`at`); the geometry they kept of their own (the windows' rectangles and clear bits, the console's circles, the quick row's, the doorway, the helm's halves) went with them; it lives on only where it also draws.
 //! - **Seen in development** (owner: "a debug/devel checkbox for toggling on/off the hitmap on the fourth frame so we get three frames normal and fourth is always hitmap"; then on the Pro: "make sure that fourth frame gets updated completely so I can see the whole map proper with fresh colours per rotate"): the fourth temporal phase (`PHASE`) shows the map, a flat colour per owner, instead of the image, painted whole from the map each time it comes round to the layer, in a palette new to that showing (`on_layer`), so every owner is one flat colour across the glass and a change of ownership shows from one rotation to the next. The publishes never paint into it. Toggled by op 58 (the Developer page's checkbox, and two fingers swiped up from back and deck together); never in a release build.
 
@@ -33,6 +34,8 @@ static mut BARS_BACK: usize = 1;
 /// The map's circles on the glass this frame, front first: (index in the scene, x, y, r, Q8 pixels), as the camera op draws them (`scene`).
 static mut DISCS: [(u16, i64, i64, i64); 256] = [(0, 0, 0, 0); 256];
 static mut NDISCS: usize = 0;
+/// Which of those cover the whole glass, all four corners inside (`scene`): the map's plane to a touch (map main.rs `grasp`, `covers_screen`: "A circle is the plane only when it covers the whole screen"), so behind the helm's wedges, never in front of them.
+static mut WHOLE: [bool; 256] = [false; 256];
 /// The open circle's ground (x, y, r, Q8 pixels) while a region is up.
 static mut REGION_DISC: Option<(i64, i64, i64)> = None;
 /// Whether any of the quick row shows on the glass (the bars on the screen hold some of it): everything inside the app's circle is behind it.
@@ -222,7 +225,17 @@ pub fn discs() -> &'static mut [(u16, i64, i64, i64); 256] {
     unsafe { &mut *(&raw mut DISCS) }
 }
 pub fn scene(n: usize, region: Option<(i64, i64, i64)>) {
+    let (w, h) = unsafe { SCREEN_WH };
+    let (w, h) = (((w as i64) << 8) as f64, ((h as i64) << 8) as f64);
     unsafe {
+        let discs = &(&*(&raw const DISCS))[..n];
+        for (k, &(_, x, y, r)) in discs.iter().enumerate() {
+            // f64, as `chord_q8`: a zoomed circle's radius squared passes what an i64 keeps in Q8.
+            let (x, y, r) = (x as f64, y as f64, r as f64);
+            let far_x = if x + x < w { w - x } else { x };
+            let far_y = if y + y < h { h - y } else { y };
+            (*(&raw mut WHOLE))[k] = far_x * far_x + far_y * far_y <= r * r;
+        }
         NDISCS = n;
         REGION_DISC = region;
     }
@@ -240,31 +253,43 @@ pub fn row(y: usize, xa: usize, xb: usize, width: usize, height: usize, app: boo
     let mut free = Free::new(slot_runs(), xa, xb);
     // Full screen (`FULL`; owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"): the console's rows hold nothing of the system's, so the bars' ids are read on the helm's rows alone and the top falls to the windows, and nothing is behind the quick row, which does not show (`bar_line`). One test a row, never a pixel; every phase is published whole when `FULL` changes (op 43, `full_follow`), and with it every row of the map.
     let full = unsafe { FULL };
+    let behind = unsafe { BEHIND } && !full;
     // The system's, frontmost: runs of the bars' ids (every pixel outside the app's circle is one of them, but the console's in full screen).
+    // On the deck the helm's wedges go behind the map's circles (owner, 2026-11-12, on the 8a: "the settings kist dissapears when I tap"): a touch on a circle lying in a bottom corner is the circle's, the wedge's pixels round it still deck's and back's (`deck`). Over an app, in full screen or not, and behind the quick row, the helm stays frontmost, the system's as decided (WINDOWS.md "The helm").
+    let mut helm: &[u16] = &[];
     if let Some(b) = bar_row(y, height).filter(|&b| !full || b >= unsafe { BAR_TOP }) {
         let ids = unsafe { core::slice::from_raw_parts((BARS as *const u16).add(b * width), width) };
-        let mut x = xa;
-        while x < xb {
-            let sys = ids[x] != NOBODY;
-            let mut e = x + 1;
-            while e < xb && (ids[e] != NOBODY) == sys {
-                e += 1;
-            }
-            if sys {
-                free.claim(x, e, |a, z| out[a..z].copy_from_slice(&ids[a..z]));
-            }
-            x = e;
+        let later = !app && !behind && b >= unsafe { BAR_TOP };
+        if later {
+            helm = ids;
         }
+        claim_ids(&mut free, out, ids, xa, xb, |id| id != NOBODY && !(later && (id == SYS + 8 || id == SYS + 9)));
     }
-    if unsafe { BEHIND } && !full {
+    if behind {
         free.rest(|a, z| out[a..z].fill(SYS + 12));
     } else if app {
         windows(y, &mut free, out, width);
     } else {
-        deck(y, &mut free, out, width);
+        deck(y, &mut free, out, width, helm, xa, xb);
     }
     TICKS.fetch_add(now() - t0, Ordering::Relaxed);
     ROWS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The runs of `ids` over [xa, xb) whose ids pass `take`, claimed with those ids.
+fn claim_ids(free: &mut Free, out: &mut [u16], ids: &[u16], xa: usize, xb: usize, take: impl Fn(u16) -> bool) {
+    let mut x = xa;
+    while x < xb {
+        let t = take(ids[x]);
+        let mut e = x + 1;
+        while e < xb && take(ids[e]) == t {
+            e += 1;
+        }
+        if t {
+            free.claim(x, e, |a, z| out[a..z].copy_from_slice(&ids[a..z]));
+        }
+        x = e;
+    }
 }
 
 /// The windows' share of a row: the layer stack's spans (`layout_build`), each chain frontmost first; a pixel is the first window's that is not see-through there.
@@ -303,27 +328,44 @@ fn windows(y: usize, free: &mut Free, out: &mut [u16], width: usize) {
     free.rest(|a, z| out[a..z].fill(NOBODY));
 }
 
-/// The deck's share of a row: a flight's frame is the map's plane throughout (its two images are the map's); else the open circle's page, then the map's circles front first, then the plane.
-fn deck(y: usize, free: &mut Free, out: &mut [u16], width: usize) {
-    if unsafe { (*(&raw const FLIGHT_FRAME)).is_none() } {
-        if let Some((x, yc, r)) = unsafe { REGION_DISC } {
-            if let Some((a, z)) = chord_q8(x, yc, r, y, width) {
-                free.claim(a, z, |a, z| out[a..z].fill(REGION));
-            }
+/// The deck's share of a row: a flight's frame is the map's plane throughout (its two images are the map's); else the open circle's page, then the map's circles front first, then the plane. On the helm's rows `helm` is the bars' ids, its wedges (8 deck, 9 back) claimed behind the circles but in front of the plane (`row`); a circle that covers the whole glass is the plane to a touch (`WHOLE`), so it goes behind the wedges too.
+fn deck(y: usize, free: &mut Free, out: &mut [u16], width: usize, helm: &[u16], xa: usize, xb: usize) {
+    let is_helm = |id: u16| id == SYS + 8 || id == SYS + 9;
+    if unsafe { (*(&raw const FLIGHT_FRAME)).is_some() } {
+        if !helm.is_empty() {
+            claim_ids(free, out, helm, xa, xb, is_helm);
         }
-        let discs = unsafe { &(&*(&raw const DISCS))[..NDISCS] };
-        let py = ((y as i64) << 8) + 128;
-        for &(i, x, yc, r) in discs {
+        free.rest(|a, z| out[a..z].fill(PLANE));
+        return;
+    }
+    if let Some((x, yc, r)) = unsafe { REGION_DISC } {
+        if let Some((a, z)) = chord_q8(x, yc, r, y, width) {
+            free.claim(a, z, |a, z| out[a..z].fill(REGION));
+        }
+    }
+    let n = unsafe { NDISCS };
+    let (discs, whole) = unsafe { (&(&*(&raw const DISCS))[..n], &(&*(&raw const WHOLE))[..n]) };
+    let py = ((y as i64) << 8) + 128;
+    // The circles front first, those that pass `take` (by whether each covers the glass).
+    let circles = |free: &mut Free, out: &mut [u16], take: &dyn Fn(bool) -> bool| {
+        for (k, &(i, x, yc, r)) in discs.iter().enumerate() {
             if free.is_empty() {
                 break;
             }
-            if (py - yc).abs() > r {
+            if !take(whole[k]) || (py - yc).abs() > r {
                 continue;
             }
             if let Some((a, z)) = chord_q8(x, yc, r, y, width) {
                 free.claim(a, z, |a, z| out[a..z].fill(CIRCLE + i));
             }
         }
+    };
+    if helm.is_empty() {
+        circles(free, out, &|_| true);
+    } else {
+        circles(free, out, &|w| !w);
+        claim_ids(free, out, helm, xa, xb, is_helm);
+        circles(free, out, &|w| w);
     }
     free.rest(|a, z| out[a..z].fill(PLANE));
 }
