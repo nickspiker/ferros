@@ -31,6 +31,8 @@ static mut STACKS: [Stack; 4] = [const { Stack([0; 128 << 10]) }; 4];
 
 /// Times each worker left `wfi` (DIAG IDLE_WAKES_Ck): the measure of how often an idle core is disturbed.
 pub static IDLE_WAKES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Counter ticks each worker has spent asleep in its idle `wfe` (or `wfi`), added as each sleep ends: the adaptive clock's measure of how busy the A715s are (service.rs `governor`).
+pub static IDLE_TICKS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// Bit k: worker k is up (its idle loop running). `ON_RESULT[k]`: what CPU_ON returned.
 pub static UP: AtomicU32 = AtomicU32::new(0);
 pub static ON_RESULT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
@@ -280,10 +282,12 @@ extern "C" fn ferros_core_main(block: usize) -> ! {
                 core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", "wfi", "msr cnthp_ctl_el2, xzr", "isb", "msr daifclr, #2", t = in(reg) wait, c = out(reg) _);
             }
             IDLE_WAKES[k].fetch_add(1, Ordering::Relaxed);
+            IDLE_TICKS[k].fetch_add(crate::platform::cntpct().wrapping_sub(now), Ordering::Relaxed);
         } else {
             unsafe { core::arch::asm!("msr daifclr, #2") };
             unsafe { core::arch::asm!("wfe") };
             IDLE_WAKES[k].fetch_add(1, Ordering::Relaxed);
+            IDLE_TICKS[k].fetch_add(crate::platform::cntpct().wrapping_sub(now), Ordering::Relaxed);
         }
         let _ = last_look;
     }
