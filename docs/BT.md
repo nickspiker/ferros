@@ -23,7 +23,8 @@ The BCM4398's Bluetooth core is on the APM's USI1 UART: serial_18, G#155D_0000, 
 - **Clocks:** running from boot. CMU_APM mux 1, divider 2, gates automatic (G#1540_1000, G#1540_1818, G#1540_20F4/20F8/2148). The clock is 200 MHz (Google's tables). The divisor is clock/baud: UBRDIV = div/16 − 1, UFRACVAL the remaining sixteenths.
 - **Pads:** no pin modes to set.
 - **USI init:** USI_CON 1 then 0, USI_OPTION CLKREQ_ON.
-- **Port:** UMCON RTS trigger 1 with automatic flow control, interrupts masked (polled), FIFOs reset then on, UCON G#3C5, 8N1.
+- **Port:** UMCON RTS trigger 1 with automatic flow control, interrupts masked at bring-up, FIFOs reset then on, UCON G#3C5 (receive timeout on), 8N1.
+- **Interrupt (2026-11-13):** with the kernel's `bt-uart` line (SPI 71, granted with the UART) the serving loop opens the receive and error interrupts (UINTM G#C), clears UINTP and reads the FIFO once more before each wait, and waits on the line, a call, or the 8 s look at the chip (its one deadline). Without the line it waits on a call or the look, reading the UART every 4 ms only while scanning. Until then the loop read the UART every 4 ms whatever it did (~250 wakes a second on the 8a).
 
 ## Bring-up
 
