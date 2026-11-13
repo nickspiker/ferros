@@ -22,6 +22,8 @@ use photon_core::wire::{self, Frame};
 mod add;
 mod addview;
 mod depart;
+/// The facets (docs/FACETS.md): be you and the people on the `facets` endpoint, and the person's people added and listed.
+mod facets;
 mod kept;
 mod route;
 mod space;
@@ -453,6 +455,8 @@ struct Client {
     watch_seen: Vec<u8>,
     /// When this lookup asked FGTW (the person's devices on this network and the fleet peers known) before fgtw.org (`ask_fgtw`); 0 not yet. The owner, 2026-11-10: "are we consulting the FGTW first or fgtw.org?"
     fgtw_asked_us: u64,
+    /// The facets served to kists and the person's people (facets.rs).
+    facets: facets::Facets,
 }
 
 impl Client {
@@ -956,6 +960,8 @@ impl Client {
     /// Everything held for the identity whose roots were in the vault: its roots, chain standing, key, sponsors and request.
     fn forget_identity(&mut self) {
         self.dep = depart::Departing::new();
+        // The bindings made for this identity and any add under way go with it.
+        self.facets = facets::Facets::new();
         self.add.reset();
         if self.radios_on {
             self.radios(None);
@@ -1542,6 +1548,32 @@ impl Client {
                     svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
                     continue;
                 }
+                // The person's people (facets.rs; docs/FACETS.md "People"): 25 → the People page; 26 [hp] remove; 27 [developer][option] → a kist's card's people; 28 [developer][option][all] all or chosen; 29 [developer][option][hp][on] pick; 30 [seed][proof] the handle typed on the keyboard (kind 2), the seed wiped here; 31 [name] the name typed (kind 3).
+                if n >= 1 && (25..=31).contains(&req[0]) {
+                    let k32 = |at: usize| -> [u8; 32] {
+                        let mut o = [0u8; 32];
+                        o.copy_from_slice(&req[at..at + 32]);
+                        o
+                    };
+                    // WHY the lengths: another process's message, sliced below by fixed offsets.
+                    let r: Vec<u8> = match req[0] {
+                        25 => self.people_reply(),
+                        26 if got >= 33 => alloc::vec![self.person_remove(&k32(1))],
+                        27 if got >= 65 => self.kist_people_reply(&k32(1), &k32(33)),
+                        28 if got >= 66 => alloc::vec![self.kist_people_set(&k32(1), &k32(33), Some(req[65] != 0), None)],
+                        29 if got >= 98 => alloc::vec![self.kist_people_set(&k32(1), &k32(33), None, Some((k32(65), req[97] != 0)))],
+                        30 if got >= 65 => {
+                            let (mut seed, hp) = (k32(1), k32(33));
+                            let r = self.person_roots(&mut seed, &hp);
+                            req[1..33].fill(0);
+                            alloc::vec![r]
+                        }
+                        31 => alloc::vec![self.person_name(&req[1..got])],
+                        _ => alloc::vec![ERR as u8],
+                    };
+                    svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
+                    continue;
+                }
                 if n >= 1 && (8..=16).contains(&req[0]) {
                     let text = core::str::from_utf8(&req[1..got]).unwrap_or("");
                     let r: Vec<u8> = match req[0] {
@@ -1552,6 +1584,16 @@ impl Client {
                         12 => alloc::vec![self.add_yes()],
                         13 => self.depart_ask_reply(),
                         14 if n >= 2 => alloc::vec![self.answer_depart(req[1] != 0)],
+                        // 2: a person's handle (the People page's add, facets.rs); 0 while their name is asked (3) ends it, the person added with no name.
+                        15 if n >= 2 && req[1] == 2 => {
+                            self.entry = 2;
+                            alloc::vec![0]
+                        }
+                        15 if n >= 2 && req[1] == 0 && self.entry == 3 => {
+                            self.entry = 0;
+                            self.person_no_name();
+                            alloc::vec![0]
+                        }
                         15 if n >= 2 && req[1] <= 1 => {
                             self.entry = req[1];
                             // "Type its words": the person's edge that reads fgtw.org's registry (owner, 2026-11-10: never on a timer).
@@ -1664,6 +1706,10 @@ impl Client {
             self.sponsor_step();
             // The person's identity space: the first pull, then this device's copy joined to it and handed on (space.rs).
             self.space_step(t);
+            // The facets (facets.rs): calls on `facets` taken in, one held binding signed, an add's chain looked up.
+            busy |= self.facets_recv();
+            self.facets_work();
+            self.person_step();
             // The verdict: looked up once the network is up, and again every 30 s while GREY or while a fresh handle waits (someone else may mint it meanwhile).
             // The client serves from the start, network or not (the attest screen waits on it); the network coming up is a reason to look up at once, not 30 s later.
             let up = self.udp.flags().is_some_and(|f| f & 1 != 0);
@@ -1752,6 +1798,8 @@ impl Client {
         v.extend_from_slice(&self.add_reply());
         v.extend_from_slice(self.dep.denied_by.as_ref().map_or(&[0u8; 32][..], |d| &d[..]));
         v.extend_from_slice(&self.space_reply());
+        // The People page: an add's outcome.
+        v.push(self.facets.state);
         v
     }
 
@@ -1901,7 +1949,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, members: Vec::new(), chain_seen: 0, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, dep: depart::Departing::new(), net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_heard_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0, held: core::cell::RefCell::new(fgtw::held::HeldChains::new()), held_fan: core::cell::RefCell::new(fgtw::held::HeldFanouts::new()), add: add::Sponsoring::new(), listening: (false, false), listen_pass: 0, listen_said: (255, 255), offered: Vec::new(), select_waiting: None, selected_by: None, entry: 0, space: space::SpaceSync::new(), watchers: Vec::new(), watch_gen: 0, watch_seen: Vec::new(), fgtw_asked_us: 0, facets: facets::Facets::new() };
     c.run()
 }
 

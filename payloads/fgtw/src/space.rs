@@ -36,12 +36,12 @@ const JITTER_SAMPLES: usize = 1 << 10;
 
 /// The sync's state, in the client.
 pub struct SpaceSync {
-    space: Space,
+    pub space: Space,
     base: Baseline,
     /// Loaded from the vault (once the person is present).
     loaded: bool,
     /// The first pull is done: fgtw.org answered, or a fleet device's copy arrived. Until then the device's copy is not joined.
-    settled: bool,
+    pub settled: bool,
     /// The digest fgtw.org was last seen or made to hold, and the one last handed to the fleet.
     seed_digest: [u8; 32],
     fleet_digest: [u8; 32],
@@ -139,7 +139,7 @@ impl Client {
     }
 
     /// The fleet's facts in hand: a member with the key.
-    fn space_ready(&self) -> Option<([u8; 32], [u8; 32])> {
+    pub(crate) fn space_ready(&self) -> Option<([u8; 32], [u8; 32])> {
         match (self.hp, self.bound, self.fleet_key) {
             (Some(hp), true, Some(k)) => Some((hp, k)),
             _ => None,
@@ -174,7 +174,7 @@ impl Client {
         self.log.line();
     }
 
-    fn space_keep(&mut self) {
+    pub(crate) fn space_keep(&mut self) {
         let t = eagle();
         let (Ok(s), Ok(b)) = (self.space.space.to_doc(t), self.space.base.to_doc(t)) else { return };
         if !self.store_set_whole(SPACE_KEY, &s) || !self.store_set_whole(BASE_KEY, &b) {
@@ -230,7 +230,7 @@ impl Client {
     }
 
     /// fgtw.org's copy pulled and merged; with `put`, ours put back when it holds what the seed's lacks. Settles the first pull on any answer the seed gives (a copy, none, no slot yet); a seed that does not answer leaves it unsettled.
-    fn space_seed(&mut self, put: bool) {
+    pub(crate) fn space_seed(&mut self, put: bool) {
         let Some((hp, _)) = self.space_ready() else { return };
         if !self.net_up {
             return;
@@ -307,7 +307,7 @@ impl Client {
     }
 
     /// Ours to every fleet device heard, when it moved since they last had it.
-    fn space_to_fleet(&mut self) {
+    pub(crate) fn space_to_fleet(&mut self) {
         let digest = self.space.space.digest();
         if digest == self.space.fleet_digest {
             return;

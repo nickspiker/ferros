@@ -12,7 +12,7 @@ path = "src/main.rs"
 ferros_sys = { path = "../../ferros_sys" }
 ferros_heap = { path = "../../ferros_heap" }
 photon_core = { path = "../../photon_core" }
-fgtw = { path = "../../../fgtw", default-features = false, features = ["fanout", "protocol", "flow"] }
+fgtw = { path = "../../../fgtw", default-features = false, features = ["fanout", "protocol", "flow", "profile"] }
 # Photon Transport names a frame by its BLAKE3 when it answers a send (depart.rs, route.rs): the same pure build photon_core takes.
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 ed25519-dalek = { version = "2", default-features = false }
