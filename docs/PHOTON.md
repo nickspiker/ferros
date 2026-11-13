@@ -229,7 +229,7 @@ From then on records the person publishes (the profile, the avatar wall, their s
 - **M3. Vouched by the alias's device list**, not members of the fleet.
 - **M4. As proposed**: contacts stop taking a person's photons the old way once every device of that person's fleet is in the list.
 - **M5. A new fgtw.org slot** for the alias-sealed copy, the fleet-key copy retired at the cutover. Nothing is deployed to fgtw.org without the owner.
-- **M6. Logs keyed from the handle, as today**: a maintainer handed a handle finds that person's logs. Under the owner's threat model being found is not the harm, and support that works is worth more.
+- **M6. Logs keyed from the person key** (owner, 2026-11-13: "Flip M6, yes"; first decided the other way the night before): a key anyone who knows the handle can compute is no key, and every friend who added the person computed it; logs can hold what helps someone harm the person (device names, networks, timing). The person hands a maintainer a one-time tag when they want help; nobody finds them otherwise.
 - **M7. Removed after a census**, as the rule for text encodings has it (AGENT.md: "never keep a compatibility reader"): the old way's reader goes once the census shows nobody speaks it.
 
 **Order of work**: the person key and the kernel's alias call on ferros first (FACETS.md "To build" 0 to 2); Photon's migration is a Photon project done on every platform at once, after.
