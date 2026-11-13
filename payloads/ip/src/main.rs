@@ -34,7 +34,8 @@
 //!   - Nothing is taken from the queue: the caller RECVs the ports named and passes the number back as seen next time, so a datagram it was told of and has not yet read never answers again (no spin while it is busy). The number is the last datagram queued for anyone while a person is present; a caller's first watch asks in level mode, its seen number meaning nothing yet.
 //!   - The ports' datagrams are kept while a watch names them and 64 s after (`pins`, sixteen apart from the eight ports the receives open), so a watcher between two watches loses nothing to other applications opening ports. While nobody is present the ports say nothing and the watch holds; the person bit is in the flags, so the person's return answers it. WATCH and KICK are served then, as INFO is.
 //!   - Eight held at once (`WATCHN`), a table of their own: a second watch with the same id answers the first as things stand, a ninth the oldest.
-//! - 12 KICK: id (u32 BE) → [0]: the watch held with that id answered at once as things stand, or, with none held, the next WATCH with that id (a process whose watcher thread sits in a WATCH tells it of a port added since; the KICK may arrive first).
+//! - 12 KICK: id (u32 BE) → [0]: the watch held with that id answered at once as things stand, or, with none held, the next WATCH with that id (a process whose watcher thread sits in a WATCH tells it of a port added since; the KICK may arrive first: it is latched for the id).
+//! - 13 UNWATCH: id (u32 BE) → [0]: the reader is gone (a socket dropped): its watch answered as things stand, its KICKs dropped, its reader entries retired, so no datagram waits for it. A reader no watch of its id has named for 64 s is retired the same way at the next datagram (a process that ended).
 //!
 //! DHCPv4 (`dhcp_in`, `dhcp_retry`): DISCOVER, OFFER, REQUEST, ACK, retransmitted every 2 s until bound; four REQUESTs unanswered give the offer up for a fresh DISCOVER (RFC 2131 4.4.1). What it sent and heard since WiFi came up is a console line every 16th retransmit while unbound and once at the bind: `DHCP <no lease yet|bound>: A#<n> DISCOVERs and A#<n> REQUESTs out; A#<n> OFFERs, A#<n> ACKs, A#<n> NAKs in, A#<n> replies to other transactions; WiFi frames in A#<n> broadcast, A#<n> multicast, A#<n> unicast (A#<n> ARP, A#<n> IPv4); state A#<1 discovering, 2 requesting, 3 bound>[, lease A#<s> s]`. The DISCOVER asks for unicast replies (broadcast flag clear). No renewal yet: the lease is said, not kept to.
 //!
@@ -1779,6 +1780,12 @@ impl Ip {
             self.dns_in(fam, addr, sport, data);
             return;
         }
+        // Readers gone stale (no watch of theirs for 64 s: a process that ended, a socket dropped without UNWATCH) retired first, so no datagram waits for them.
+        for k in 0..READERN {
+            if self.pins[k].2 != 0 && !self.fresh(k) {
+                self.retire(k);
+            }
+        }
         let readers = self.readers_of(dport);
         if dport == 0 || !(self.ports.contains(&dport) || readers != 0) {
             return;
@@ -1834,15 +1841,21 @@ impl Ip {
                 Some(k) => k,
                 None => {
                     let k = (0..READERN).min_by_key(|&k| self.pins[k].2).unwrap();
-                    for d in self.q.iter_mut().filter(|d| d.used && d.readers & 1 << k != 0) {
-                        d.readers &= !(1 << k);
-                        d.used = d.readers != 0;
-                    }
+                    self.retire(k);
                     k
                 }
             };
             self.pins[k] = (w.id, p, t);
         }
+    }
+
+    /// Reader entry `k` (`pins`) forgotten: its bit cleared from every datagram (one left with no reader freed), the entry free.
+    fn retire(&mut self, k: usize) {
+        for d in self.q.iter_mut().filter(|d| d.used && d.readers & 1 << k != 0) {
+            d.readers &= !(1 << k);
+            d.used = d.readers != 0;
+        }
+        self.pins[k] = (0, 0, 0);
     }
 
     /// Watch `w` answered as things stand (its ports pinned again: its caller is about to watch them anew).
@@ -3109,7 +3122,7 @@ impl Ip {
     fn serve(&mut self, m: &[u8], tok: &[u8; 32], out: &mut [u8]) -> Option<usize> {
         // While nobody has attested no application sends, receives, connects or joins: nothing may act on what the radios bring until a person is present (the addresses, op 3, stay readable). The locate responder will be the one exception (AUTH.md "Locate").
         // WATCH and KICK too: a watch says nothing of what came while nobody is present, and holding through the absence is what keeps its caller from asking again and again (it is answered when the person bit of the flags changes).
-        if !self.person && !matches!(m.first(), Some(&3) | Some(&11) | Some(&12)) {
+        if !self.person && !matches!(m.first(), Some(&3) | Some(&11) | Some(&12) | Some(&13)) {
             return Some(0);
         }
         // The receives that may be held (the wait byte, or op 2's deadline), and the watch; every other request is answered at once.
@@ -3138,6 +3151,19 @@ impl Ip {
             Some(11) => return self.watch(m, tok, out),
             Some(12) if m.len() >= 5 => {
                 self.kick(u32::from_be_bytes([m[1], m[2], m[3], m[4]]), out);
+                out[0] = 0;
+                return Some(1);
+            }
+            Some(13) if m.len() >= 5 => {
+                let id = u32::from_be_bytes([m[1], m[2], m[3], m[4]]);
+                // Its held watch answered as things stand, then every reader entry of the id retired.
+                self.kick(id, out);
+                self.kicks.iter_mut().filter(|k| **k == Some(id)).for_each(|k| *k = None);
+                for k in 0..READERN {
+                    if self.pins[k].2 != 0 && self.pins[k].0 == id {
+                        self.retire(k);
+                    }
+                }
                 out[0] = 0;
                 return Some(1);
             }
