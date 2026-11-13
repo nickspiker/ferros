@@ -1,0 +1,28 @@
+[package]
+name = "camreplay"
+version = "0.1.0"
+edition = "2024"
+description = "A development stand-in for the camera driver (docs/CAMERA.md): serves the `camera` endpoint with one recorded ferros frame from the Pro's main camera, named as a recording in the list, so Lumis's preview, its controls and the endpoint can be checked on a device before the driver exists. Never stowed, never started by anything but a hand: the frame is a local file, never in the repository."
+
+[[bin]]
+name = "camreplay"
+path = "src/main.rs"
+
+[dependencies]
+vsf = { path = "../../../vsf" }
+
+[build-dependencies]
+vsf = { path = "../../../vsf" }
+
+[profile.release]
+opt-level = 2
+debug = false
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
+
+[patch.crates-io]
+libc = { path = "/mnt/Harbor/Code/ferros-libc" }

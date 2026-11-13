@@ -95,6 +95,15 @@ On akita (nothing to decide, nothing at risk): Lumis's front, spawned by hand wi
 LUMIS=/mnt/Harbor/Code/lumis-ferros tools/lumis-build.sh
 FERROS_PORT=1-2.4 target/debug/ferros-bridge spawn /mnt/Harbor/Code/lumis-ferros/rust/lumis-ferros/target/ferros/aarch64-unknown-ferros/release/lumis.bin --name lumis --use display --use touch --dma surface --ira --domain --entropy --use camera
 ```
+Lumis's preview and controls on a device before the driver exists: `std/camreplay`, a development stand-in that serves the endpoint with one recorded ferros frame of the Pro's main camera (binned at build time from a local file, never in the repository; the list names it a recording, the controls change nothing).
+It is built (6654640 bytes) and has not run: the 8a went silent on USB during another session's kernel flash at 22:25 that night, before the test could take the screen.
+```
+cd std/camreplay && CAMREPLAY_FRAME=/mnt/Harbor/Code/ferros/target/cam/img.bin ../../tools/std-build.sh . && cd ../..
+FERROS_PORT=1-2.4 target/debug/ferros-bridge spawn std/camreplay/target/aarch64-unknown-ferros/release/camreplay.bin --name camreplay --serve camera
+```
+then Lumis as above, and tap the camera's row: the recording, developed through the main camera's Absolute IDT, rotated upright, should fill the width; the display gain row brightens it.
+Unchecked until then: a 6 MiB reply between two processes, and how many frames a second Lumis develops.
+
 As a kist (after a kernel, stower and map with the camera right are on the device): `LUMIS=/mnt/Harbor/Code/lumis-ferros tools/lumis-kist.sh`, then Stow on its screen.
 
 On the Pro: nothing camera runs beside the shell today (above), and the endpoint has no server.
