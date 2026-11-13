@@ -229,6 +229,11 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Processes => "süreçler",
         Msg::InTheVault => "kasada",
         Msg::Chip => "çip",
+        Msg::BootloaderUnlocked => "bootloader kilidi açık: bu cihazı tutan herkes kendi sistemini başlatıp ayarlarını, yerleştirilmiş kist'lerini ve önbellekteki duvar kâğıdını okuyabilir; kimliğin ve insanların kapalı kalır",
+        Msg::BootloaderUnlockedAttest => "bootloader kilidi açık: bu cihazı tutan herkes kendi sistemini başlatıp ayarlarını, yerleştirilmiş kist'lerini, önbellekteki duvar kâğıdını ve, açılışta tasdikle açık olduğundan, kimliğini okuyabilir",
+        Msg::BootloaderLockedFerros => "bootloader ferros anahtarına kilitli",
+        Msg::BootloaderLockedMaker => "bootloader üreticisinin anahtarına kilitli",
+        Msg::BootloaderNotRead => "bootloader'ın kilit durumu bu açılışta okunmadı",
         // ---- Kists, Permissions ----
         Msg::NoKistsStowed => "yerleştirilmiş kist yok",
         Msg::AsksForNothing => "hiçbir şey istemiyor",

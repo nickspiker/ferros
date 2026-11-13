@@ -229,6 +229,11 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Processes => "processus",
         Msg::InTheVault => "dans le coffre",
         Msg::Chip => "puce",
+        Msg::BootloaderUnlocked => "bootloader déverrouillé : qui tient cet appareil peut démarrer son propre système et lire ses réglages, ses kists rangés et son fond d’écran en cache ; ton identité et tes proches restent fermés",
+        Msg::BootloaderUnlockedAttest => "bootloader déverrouillé : qui tient cet appareil peut démarrer son propre système et lire ses réglages, ses kists rangés, son fond d’écran en cache et, comme attester au démarrage est activé, ton identité",
+        Msg::BootloaderLockedFerros => "bootloader verrouillé sur la clé de ferros",
+        Msg::BootloaderLockedMaker => "bootloader verrouillé sur la clé de son fabricant",
+        Msg::BootloaderNotRead => "état du bootloader non lu à ce démarrage",
         // ---- Kists, Permissions ----
         Msg::NoKistsStowed => "aucun kist rangé",
         Msg::AsksForNothing => "ne demande rien",

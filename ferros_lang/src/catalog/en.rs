@@ -229,6 +229,11 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Processes => "processes",
         Msg::InTheVault => "in the vault",
         Msg::Chip => "chip",
+        Msg::BootloaderUnlocked => "bootloader unlocked: anyone holding this device can boot their own system and read its settings, stowed kists and cached wallpaper; your identity and your people stay closed",
+        Msg::BootloaderUnlockedAttest => "bootloader unlocked: anyone holding this device can boot their own system and read its settings, stowed kists, cached wallpaper and, as attest at boot is on, your identity",
+        Msg::BootloaderLockedFerros => "bootloader locked to the ferros key",
+        Msg::BootloaderLockedMaker => "bootloader locked to its maker's key",
+        Msg::BootloaderNotRead => "bootloader lock state not read this boot",
         // ---- Kists, Permissions ----
         Msg::NoKistsStowed => "no kists stowed",
         Msg::AsksForNothing => "asks for nothing",

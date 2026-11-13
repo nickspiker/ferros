@@ -3992,6 +3992,16 @@ impl Map {
                     }
                 }
                 fact(b, &mut y, tr(Msg::Chip), v.as_str());
+                // The bootloader's lock state as ABL told this boot (fact 87; FLASHER.md step 7; owner, 2026-11-13: leaving it unlocked is a known choice, shown, never a nag). Unlocked, the device class is anyone's who holds the device (its ira has no papers), and with attest at boot on that includes the kept seed, so the sentence says so.
+                y += uu(1, 1);
+                let lock = match facts.boot_lock() {
+                    Some(ferros_sys::BootLock::Unlocked) if ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1 => Msg::BootloaderUnlockedAttest,
+                    Some(ferros_sys::BootLock::Unlocked) => Msg::BootloaderUnlocked,
+                    Some(ferros_sys::BootLock::LockedOwnKey) => Msg::BootloaderLockedFerros,
+                    Some(ferros_sys::BootLock::LockedMakersKey) => Msg::BootloaderLockedMaker,
+                    None => Msg::BootloaderNotRead,
+                };
+                row(self, b, &mut y, note, grey(), tr(lock), None);
             }
             "deck" => {
                 // Everything on the deck, each row opening its card (`card`): what it is, who made it, its rights as switches (owner, 2026-11-08: per kist, its rights; a tap changes the answer for every device of the person's, and a kist running is killed and started again with the answers as they now stand), stop, update and unstow.

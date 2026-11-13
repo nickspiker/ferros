@@ -376,6 +376,16 @@ messages! {
     InTheVault,
     /// The chip's temperature.
     Chip,
+    /// The bootloader's lock state (ferros_sys::BootLock; FLASHER.md step 7; owner, 2026-11-13: shown, never a nag). One sentence the page wraps: unlocked, what it exposes and what it does not.
+    BootloaderUnlocked,
+    /// One sentence the page wraps: unlocked while attest at boot is on, so the kept seed (the device class) is exposed too.
+    BootloaderUnlockedAttest,
+    /// Locked to the custom key, the one this ferros is signed with (verified boot yellow).
+    BootloaderLockedFerros,
+    /// Locked to the maker's key (verified boot green).
+    BootloaderLockedMaker,
+    /// No word from the bootloader this boot (a reload).
+    BootloaderNotRead,
 
     // ---- Kists, Permissions, a kist's first launch ----
     NoKistsStowed,

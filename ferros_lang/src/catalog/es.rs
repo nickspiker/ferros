@@ -229,6 +229,11 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Processes => "procesos",
         Msg::InTheVault => "en la bóveda",
         Msg::Chip => "chip",
+        Msg::BootloaderUnlocked => "bootloader desbloqueado: quien tenga este dispositivo puede arrancar su propio sistema y leer sus ajustes, kists guardados y fondo de pantalla en caché; tu identidad y tu gente siguen cerradas",
+        Msg::BootloaderUnlockedAttest => "bootloader desbloqueado: quien tenga este dispositivo puede arrancar su propio sistema y leer sus ajustes, kists guardados, fondo de pantalla en caché y, como atestar al arrancar está activado, tu identidad",
+        Msg::BootloaderLockedFerros => "bootloader bloqueado con la clave de ferros",
+        Msg::BootloaderLockedMaker => "bootloader bloqueado con la clave del fabricante",
+        Msg::BootloaderNotRead => "estado del bootloader sin leer en este arranque",
         // ---- Kists, Permissions ----
         Msg::NoKistsStowed => "no hay kists guardados",
         Msg::AsksForNothing => "no pide nada",

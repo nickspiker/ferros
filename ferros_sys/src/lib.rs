@@ -1164,6 +1164,17 @@ pub fn pet() {
 /// The device's plain facts, for its dashboard (kernel SYS_FACTS); `None` where a fact is not known.
 pub struct Facts(pub [u64; 88]);
 
+/// The bootloader's lock state (`Facts::boot_lock`; FLASHER.md step 7: re-locking ends setup, leaving it unlocked is the person's known choice).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BootLock {
+    /// Anyone holding the device can boot their own system and derive its ira, so read the device class (settings, stowed kists, cached wallpaper).
+    Unlocked,
+    /// Locked to the custom key (verified boot yellow): the key this ferros is signed with.
+    LockedOwnKey,
+    /// Locked to the maker's key (verified boot green).
+    LockedMakersKey,
+}
+
 /// Local wall time: (seconds since 1970 in local time — UTC plus the zone, `device.tz` — and the counter ticks into the current second), or None until the kernel has read the PMIC's clock. From the kernel's base (facts 8, 9) and this process's own counter.
 /// The zone's two offsets as the kernel last handed them (preferences bytes 24-31, kernel rtc.rs `packed`): (standard, legal), seconds east of UTC. Legal is daylight time while it is in effect; without a zone's rule (a manual offset) the two are the same.
 pub fn zone_offsets() -> (i64, i64) {
@@ -1196,6 +1207,17 @@ impl Facts {
     /// Which board (fact 84): 1 husky (Pixel 8 Pro), 2 akita (Pixel 8a). For a driver whose part differs between them.
     pub fn board(&self) -> Option<u64> {
         self.get(84)
+    }
+    /// The bootloader's lock state as ABL told this boot (fact 87, kernel bootlock.rs), None when not known (a reload, or ABL said neither). Unlocked when either of ABL's two words says so (the device state `unlocked`, or verified boot `orange`), so a disagreement shows the exposure rather than hiding it.
+    pub fn boot_lock(&self) -> Option<BootLock> {
+        let v = self.get(87)?;
+        let (device, vbs) = (v & 0xFF, v >> 8 & 0xFF);
+        match (device, vbs) {
+            (2, _) | (_, 3) => Some(BootLock::Unlocked),
+            (1, 2) => Some(BootLock::LockedOwnKey),
+            (1, 1) => Some(BootLock::LockedMakersKey),
+            _ => None,
+        }
     }
     /// From the press at "Ready?" to the shell starting, microseconds.
     pub fn boot_us(&self) -> Option<u64> {

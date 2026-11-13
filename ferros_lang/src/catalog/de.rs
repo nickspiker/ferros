@@ -229,6 +229,11 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Processes => "Prozesse",
         Msg::InTheVault => "im Tresor",
         Msg::Chip => "Chip",
+        Msg::BootloaderUnlocked => "Bootloader entsperrt: wer dieses Gerät hält, kann sein eigenes System starten und Einstellungen, verstaute Kists und das gespeicherte Hintergrundbild lesen; deine Identität und deine Leute bleiben verschlossen",
+        Msg::BootloaderUnlockedAttest => "Bootloader entsperrt: wer dieses Gerät hält, kann sein eigenes System starten und Einstellungen, verstaute Kists, das gespeicherte Hintergrundbild und, da beim Start bezeugen an ist, deine Identität lesen",
+        Msg::BootloaderLockedFerros => "Bootloader auf den ferros-Schlüssel gesperrt",
+        Msg::BootloaderLockedMaker => "Bootloader auf den Schlüssel seines Herstellers gesperrt",
+        Msg::BootloaderNotRead => "Sperrzustand des Bootloaders bei diesem Start nicht gelesen",
         // ---- Kists, Permissions ----
         Msg::NoKistsStowed => "keine Kists verstaut",
         Msg::AsksForNothing => "verlangt nichts",
