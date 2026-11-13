@@ -47,6 +47,63 @@ unsafe impl<const N: usize> Sync for Region<N> {}
 /// Both zero-initialised, so in `.bss`: the kernel zeroes the tail the header names.
 static HEAP: Region<HEAP_BYTES> = Region(UnsafeCell::new([0; HEAP_BYTES]));
 static STACK: Region<STACK_BYTES> = Region(UnsafeCell::new([0; STACK_BYTES]));
+/// The network watcher's stack (`net_watch`): it only calls and stores, nothing allocated.
+static WATCH_STACK: Region<{ 1 << 14 }> = Region(UnsafeCell::new([0; 1 << 14]));
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// The loop's doorbell for the network (`net_watch`): counted up at each answer of ip's WATCH, the idle wait on it (owner, 2026-11-10: "No polling!"). Until 2026-11-13 the loop asked ip RECV on both ports and INFO every 20 ms, 150 calls a second at rest.
+static NET_BELL: AtomicU64 = AtomicU64::new(0);
+/// The ports with news since the loop last looked: bit 0 `join::PORT`, bit 1 `join::BEACON_PORT` (the loop takes them with a swap).
+static NET_PORTS: AtomicU64 = AtomicU64::new(0);
+/// INFO's flags byte as the watch last said it, with bit 8 set once said; `NO_WATCH` while ip answers no WATCH (an ip from before op 11), and the loop asks every pass as before.
+static NET_FLAGS: AtomicU64 = AtomicU64::new(0);
+const NO_WATCH: u64 = u64::MAX;
+/// The watch's id at ip (op 11; op 12 KICK would name it): "fgtw" in ASCII, one watcher in this process.
+const WATCH_ID: [u8; 4] = *b"fgtw";
+
+/// The network watcher thread: one WATCH held at ip on both ports and the flags, answered when a datagram comes for either or the flags change (a route, the call, the person), never on a clock; the news into `NET_PORTS` and `NET_FLAGS`, the loop rung on `NET_BELL`. The datagram it was told of goes back as seen, so a datagram the loop has not read yet never answers again.
+extern "C" fn net_watch(grants: u64) -> ! {
+    let ports = [join::PORT, join::BEACON_PORT];
+    // 0xFF: no flags seen yet, so the first watch is answered at once with them.
+    let (mut flags, mut seen) = (0xFFu8, 0u32);
+    let mut req = [0u8; 23];
+    let mut r = [0u8; 64];
+    loop {
+        req[0] = 11;
+        // Level mode on the first watch (no flags seen yet): every datagram waiting counts, the seen number meaning nothing yet.
+        req[1] = (flags == 0xFF) as u8;
+        req[2] = flags;
+        req[3..7].copy_from_slice(&WATCH_ID);
+        req[7..11].copy_from_slice(&seen.to_be_bytes());
+        // Deadline 0: none; the loop keeps its own timers.
+        req[19..21].copy_from_slice(&ports[0].to_be_bytes());
+        req[21..23].copy_from_slice(&ports[1].to_be_bytes());
+        let n = ferros_sys::call(cap(grants, S_UDP), &req, &mut r);
+        // An answer is 6 bytes and two for each port named. Anything else is an ip without WATCH (its [3]) or one going away: the loop asks every pass as before, and the watch is tried again 4 s on (WHY a timer: only a restarted ip can answer it, and nothing rings for that).
+        if n == ERR || n < 6 {
+            NET_FLAGS.store(NO_WATCH, Ordering::Release);
+            NET_BELL.fetch_add(1, Ordering::AcqRel);
+            ferros_sys::wake(&NET_BELL, 1);
+            flags = 0xFF;
+            ferros_sys::sleep_until(now() + 4 * ferros_sys::freq());
+            continue;
+        }
+        flags = r[0];
+        seen = u32::from_be_bytes([r[1], r[2], r[3], r[4]]);
+        // WHY the min: the count is ip's word; only the ports the reply holds are read.
+        let k = (r[5] as usize).min((n as usize - 6) >> 1).min(ports.len());
+        let mut news = 0u64;
+        for i in 0..k {
+            let p = u16::from_be_bytes([r[6 + 2 * i], r[7 + 2 * i]]);
+            news |= (p == ports[0]) as u64 | ((p == ports[1]) as u64) << 1;
+        }
+        NET_PORTS.fetch_or(news, Ordering::AcqRel);
+        NET_FLAGS.store(1 << 8 | flags as u64, Ordering::Release);
+        NET_BELL.fetch_add(1, Ordering::AcqRel);
+        ferros_sys::wake(&NET_BELL, 1);
+    }
+}
 
 core::arch::global_asm!(
     r#"
@@ -1462,10 +1519,18 @@ impl Client {
             self.verdict = V_LOOKING;
         }
         self.show_words();
+        // The network watcher (`net_watch`): the ports and the flags rung on `NET_BELL`, not asked every pass.
+        // SAFETY: the watcher's stack, given to it alone, once.
+        ferros_sys::thread_spawn(net_watch, unsafe { &mut *WATCH_STACK.0.get() }, self.log.grants);
         loop {
             let t = now_us();
             let mut busy = false;
-            while let Some((from, n)) = self.udp.recv(join::PORT, &mut buf) {
+            // The bell's count before this pass looks: a ring while it runs ends the idle wait at once.
+            let bell_seen = NET_BELL.load(Ordering::Acquire);
+            let watch = NET_FLAGS.load(Ordering::Acquire);
+            // The ports to read: those the watch named since the last pass, or both every pass without a watch.
+            let news = if watch == NO_WATCH { 3 } else { NET_PORTS.swap(0, Ordering::AcqRel) };
+            while let Some((from, n)) = if news & 1 != 0 { self.udp.recv(join::PORT, &mut buf) } else { None } {
                 busy = true;
                 let datagram = buf[..n].to_vec();
                 let out = self.pt.receive(from, &datagram, t, eagle());
@@ -1488,7 +1553,7 @@ impl Client {
                     }
                 }
             }
-            while let Some((from, n)) = self.udp.recv(join::BEACON_PORT, &mut buf) {
+            while let Some((from, n)) = if news & 2 != 0 { self.udp.recv(join::BEACON_PORT, &mut buf) } else { None } {
                 busy = true;
                 let datagram = buf[..n].to_vec();
                 self.on_beacon(from, &datagram);
@@ -1723,7 +1788,8 @@ impl Client {
             // The verdict: looked up once the network is up, and again every 30 s while GREY or while a fresh handle waits (someone else may mint it meanwhile).
             // The client serves from the start, network or not (the attest screen waits on it); the network coming up is a reason to look up at once, not 30 s later.
             // Either family will do (INFO bit 0 an IPv4 route, bit 1 an IPv6 one): fgtw.org answers on both, and the resolver picks the family the route will use. Until 2026-11-13 only IPv4 counted, and the 8a with no DHCPv4 lease but a working IPv6 stayed grey.
-            let fl = self.udp.flags().unwrap_or(0);
+            // The flags as the watch last said them (0 until it has), or INFO every pass without a watch.
+            let fl = if watch == NO_WATCH { self.udp.flags().unwrap_or(0) } else { watch as u8 };
             let up = fl & 3 != 0;
             if up && !self.net_up {
                 self.net_up = true;
@@ -1796,12 +1862,80 @@ impl Client {
             if !self.watchers.is_empty() {
                 self.watch_ring();
             }
-            if !busy && !self.pt.busy() {
-                ferros_sys::sleep_until(now() + ferros_sys::freq() / 50);
+            // Work in hand, or PT moving a frame (its acks and resends are paced by its own clock): the next pass a millisecond on, as before.
+            // The person at the Fleet page (the add machine open, the radios listening for a tap or a beacon, a departure under way): every 20 ms as before, since the radios are asked for what they heard (sponsor_hear) and the machines' deadlines are theirs.
+            // Otherwise nothing is asked on a clock: the wait ends when the network watch rings (`NET_BELL`), when a call comes on an endpoint this thread polls (`fgtw`, `facets`), or at the loop's next deadline (`idle_until`). Without a watch (an ip from before op 11), every 20 ms as before.
+            let f = ferros_sys::freq();
+            let until = if busy || self.pt.busy() {
+                now() + f / 1000
+            } else if watch == NO_WATCH || self.attending() {
+                now() + f / 50
             } else {
-                ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000);
-            }
+                self.idle_until(t)
+            };
+            ferros_sys::wait_world_or_call(&NET_BELL, bell_seen, until);
         }
+    }
+
+    /// The person at work with the fleet: the add machine open (the Fleet page), the radios listening for a tap or a beacon (they are asked each pass for what they heard, `sponsor_hear`), or a departure under way. The loop keeps its 20 ms cadence then.
+    fn attending(&self) -> bool {
+        self.listening != (false, false) || self.add_phase() != fgtw::flow::add::Phase::Closed || self.depart_asking() || self.depart_asked().is_some()
+    }
+
+    /// When the loop's idle wait ends at the latest (counter ticks, 0 for none), from the pass's time `t` (microseconds): the earliest of the timers its steps keep. Each is the step's own rule, read here as it reads it: the beacon every 3 s and the pings every 10 s, the look-up (2 s while looking, 30 s while grey or fresh, FGTW's quarter-second answer window), joining's chain read every 16 s and the request re-minted at 210 s, the words every 60 s, a radio handover tried again at 16 s, a departure's seed read every 16 s, the space's join and seed (`space_due`), the add machine's deadline. Work in hand (a binding to sign, an add's look-up) is at once. None of them: no deadline, the wait ends at a ring or a call.
+    fn idle_until(&self, t: u64) -> u64 {
+        let mut due = u64::MAX;
+        // WHY the mins: the earliest of the deadlines, not a bound on anyone's value.
+        let mut at = |d: u64| due = due.min(d);
+        if self.facets_pending() {
+            at(t);
+        }
+        if self.hp.is_some() {
+            at(self.last_beacon_us + 3_000_000);
+        }
+        if self.bound {
+            at(self.last_ping_us + 10_000_000);
+        }
+        if !self.bound && !self.depart_asking() && self.verdict == V_JOIN {
+            at(self.join_checked_us + 16_000_000);
+        }
+        if self.depart_asking() {
+            at(self.dep.checked_us + 16_000_000);
+        }
+        if self.hp.is_some() && !self.bound && matches!(self.verdict, V_LOOKING | V_UNREACHABLE | V_FRESH) {
+            if self.fgtw_asked_us != 0 {
+                at(self.fgtw_asked_us + (1 << 18));
+            }
+            at(self.last_lookup_us + if self.verdict == V_LOOKING { 2_000_000 } else { 30_000_000 });
+        }
+        if !self.bound && self.hp.is_some() {
+            at(self.last_words_us + 60_000_000);
+        }
+        if let Some(d) = self.space_due() {
+            at(d);
+        }
+        // The Eagle-time deadlines (the add machine's, the request's 210 s), as microseconds from now.
+        let osc = vsf::OSCILLATIONS_PER_SECOND as i128;
+        let e = eagle() as i128;
+        let mut eagle_at = |when: i64| {
+            let us = (when as i128 - e) * 1_000_000 / osc;
+            at(if us <= 0 { t } else { t + us as u64 });
+        };
+        if let Some(w) = self.add_wake_at() {
+            eagle_at(w);
+        }
+        if !self.bound && self.hp.is_some() && self.verdict == V_JOIN && self.request_t != 0 {
+            eagle_at(self.request_t + 210 * vsf::OSCILLATIONS_PER_SECOND as i64 + 1);
+        }
+        let f = ferros_sys::freq();
+        let mut ticks = if due == u64::MAX { 0 } else { due * (f / 1_000_000).max(1) };
+        // The radio handover's retry is on the counter already.
+        if !self.bound && self.radios_missed {
+            let r = self.radios_at + 16 * f + 1;
+            ticks = if ticks == 0 { r } else { ticks.min(r) };
+        }
+        // A deadline already past ends the wait at once (0 would mean none).
+        if ticks == 0 && due != u64::MAX { 1 } else { ticks }
     }
 
     /// What the Fleet page and the map read, in one piece: the state (op 1's), the members (op 6), a departure waiting (op 13), the add flow (op 9), this device's own departure denied, and the space (op 17).

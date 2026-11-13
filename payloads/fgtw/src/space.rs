@@ -496,6 +496,19 @@ impl Client {
         }
     }
 
+    /// When `space_step` next has something to do (`now_us` microseconds), None while the space is not ready (the roots or the fleet key not yet in hand: a change that brings them comes with a pass of its own).
+    pub fn space_due(&self) -> Option<u64> {
+        self.space_ready()?;
+        if !self.space.loaded {
+            return Some(0);
+        }
+        if !self.space.settled {
+            return Some(self.space.last_seed_us + LOCAL_US * 4);
+        }
+        // WHY the min: the earlier of its two timers, not a bound on a value.
+        Some((self.space.last_local_us + LOCAL_US).min(self.space.last_seed_us + SEED_US))
+    }
+
     /// The loop's step: the first pull, then the join every 4 s and fgtw.org every 64 s. The clock only moves forward, so `t` is never behind a time taken from it.
     pub fn space_step(&mut self, t: u64) {
         if self.space_ready().is_none() {

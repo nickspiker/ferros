@@ -223,6 +223,11 @@ impl Client {
     }
 
     /// The machine's deadline, checked once a pass of the loop: told to it as come (`Wake`, it rebuilds its rows on what lapsed), after every beacon id the driver still lists, which is a measurement and no stand-in: the driver lists an id each read while it hears it, this file tells an id only when it first appears, so without these a device heard all along would lapse from nearby.
+    /// The add machine's one deadline (Eagle oscillations), when it has one (`add_wake_check`).
+    pub fn add_wake_at(&self) -> Option<i64> {
+        self.add.wake.map(|w| w.0)
+    }
+
     pub fn add_wake_check(&mut self) {
         let Some((at, reason)) = self.add.wake else { return };
         if eagle() < at {
