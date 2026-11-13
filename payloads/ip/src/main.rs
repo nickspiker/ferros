@@ -33,11 +33,11 @@
 //! - Sixteen connections (`TCPN`). An idle one costs its control state alone (`Tcb`, a static table); an open one holds a block of the arc (`Blocks`): a 1 MiB receive buffer and a 256 KiB send buffer. The kernel maps 4 MiB of heap at spawn (three blocks); the arc grows for more as connections open (SYS_ARC, docs/ARCS.md) and shrinks again when the highest blocks are free.
 //! - The receive window is the free room of the 1 MiB buffer, said with window scaling (RFC 7323, shift 5); a peer that offers no scaling gets 64 KiB of it. Its right edge moves by a segment, or half the buffer, at least (silly-window avoidance), and a read that reopens a window shrunk under half says so at once.
 //! - Segments past a hole are kept in place in the buffer (eight ranges, `ferros_tcp::Ooo`) and delivered when the hole fills; each is ACKed at once with SACK blocks (RFC 2018), so the peer resends only what is missing.
-//! - ACKs: in-order data once for each batch of frames taken in (after each exchange with the WiFi driver, and at the end of each pass over the links: `tcp_acks`), the way a receiver coalescing its segments ACKs; at once for FIN, out-of-order data, a filled hole or a duplicate. No delayed-ACK timer: the batch is microseconds. (Every second segment and PSH were ACKed at once until 2026-11-11, when frames began to come in batches of up to 88: 44 ACKs a batch, more than the driver's 32 transmit buffers.)
+//! - ACKs: every second in-order segment and one with PSH at once (RFC 5681 4.2, RFC 1122 4.2.3.2), an odd one at the end of the batch of frames it came in (after each exchange with the WiFi driver, and at the end of each pass over the links: `tcp_acks`); at once for FIN, out-of-order data, a filled hole or a duplicate. No delayed-ACK timer: the batch is microseconds, and the loop does not sleep while an ACK waits to go. The ACKs of a batch go out together in the next exchange. (From 2026-11-11 to 2026-11-12 a batch of up to 88 segments was ACKed once, and senders starved: docs/WIFI.md, "ACKs".)
 //! - Sending within the peer's window and a congestion window: slow start, congestion avoidance, fast retransmit on three duplicate ACKs and NewReno recovery (RFC 5681, RFC 6582). SACK blocks the peer sends are read but not used yet: NewReno resends one hole a round trip. The retransmission timeout comes from measured round trips (RFC 6298, Karn's rule), 250 ms to 8 s, doubling at each expiry; the eighth expiry fails the connection. That timer is the one timer here, and it must be: a segment lost with nothing after it brings no ACK to say so. A closed peer window is probed on the same timer.
 //! - The MSS from the link the connection leaves on: WiFi's 1500-byte MTU, the cellular call's MTU, less the headers of its family; 1200 when the call reports nothing believable.
 //! - Each connection's measures go to the console when it is freed (`report`): bytes each way, round trip, retransmissions, out-of-order holding, the buffer's use, the peak rate.
-//!   The line: `tcp A#<handle> port A#<port> <how it ended>: in A#<bytes> bytes, out A#<bytes>, open A#<ms> ms, peak A#<x.y> MiB/s, average A#<x.y> MiB/s, round trip A#<x.y> ms (variation A#<x.y>, timeout A#<x.y>), resent A#<n> segments (fast retransmits A#<n>, expiries A#<n>), out of order A#<n> segments (most held A#<bytes> bytes), waiting for the app most A#<bytes> of A#<window>, MSS A#<out> out A#<in> in, scale A#<out> out A#<in> in, SACK, congestion window A#<bytes>, segments in A#<n>, ACKs out A#<n> (most between two A#<bytes> bytes)`. For a WiFi connection a second line follows, the WiFi path since the last report (`Path`): `WiFi path since the last report: A#<n> passes (longest A#<us> us), A#<n> asleep for A#<ms> ms; A#<n> calls to the driver (A#<us> us on average, A#<us> us longest); A#<n> frames in (most A#<n> a call), A#<n> out (A#<n> refused)`.
+//!   The line: `tcp A#<handle> port A#<port> <how it ended>: in A#<bytes> bytes, out A#<bytes>, open A#<ms> ms, peak A#<x.y> MiB/s, average A#<x.y> MiB/s, round trip A#<x.y> ms (variation A#<x.y>, timeout A#<x.y>), resent A#<n> segments (fast retransmits A#<n>, expiries A#<n>), out of order A#<n> segments (most held A#<bytes> bytes), waiting for the app most A#<bytes> of A#<window>, MSS A#<out> out A#<in> in, scale A#<out> out A#<in> in, SACK, congestion window A#<bytes>, segments in A#<n>, ACKs out A#<n>, A#<x.yy> a segment (most between two A#<bytes> bytes)`. For a WiFi connection a second line follows, the WiFi path since the last report (`Path`): `WiFi path since the last report: A#<n> passes (longest A#<us> us), A#<n> asleep for A#<ms> ms; A#<n> calls to the driver (A#<us> us on average, A#<us> us longest); A#<n> frames in (most A#<n> a call), A#<n> out (A#<n> refused)`.
 //! - No listening, no TIME-WAIT (a client's ports are random), no timestamps, no keep-alives. Every incoming segment's checksum is checked; a reset counts only at the next expected byte, and one elsewhere in the window, or a SYN on an open connection, gets a challenge ACK (RFC 5961).
 //!
 //! Checksums are ones'-complement sums (RFC 1071: wide adds, one fold at the end). IPv4 UDP goes out with checksum 0 (allowed); IPv6 UDP and every ICMP carry one. The IPv6 interface identifier is random per session (from the entropy right) until a persistent device secret is granted (then RFC 7217 stable-privacy). No duplicate address detection yet.
@@ -465,7 +465,7 @@ struct Tcb {
     tx_head: u32,
     tx_len: u32,
     ooo: ferros_tcp::Ooo,
-    /// In-order segments taken since our last ACK; an ACK owed at the end of the pass.
+    /// In-order segments taken since our last ACK (the second is ACKed at once); an ACK owed at the end of the batch.
     unacked: u32,
     owed: bool,
     fin_queued: bool,
@@ -1964,7 +1964,7 @@ impl Ip {
         self.tcp_out(i, ACK, s, &[]);
     }
 
-    /// The ACKs still owed at the end of a pass over the links (an odd in-order segment's): no delayed-ACK timer, the pass is the batch.
+    /// The ACKs still owed at the end of a batch of frames (an odd in-order segment's): no delayed-ACK timer, the batch is microseconds, and the loop never sleeps while an ACK waits to go (`busy`).
     fn tcp_acks(&mut self) {
         for i in 0..TCPN {
             if self.tcb[i].state != 0 && self.tcb[i].owed {
@@ -2188,9 +2188,14 @@ impl Ip {
                         delivered += more;
                         now_ack = true;
                     }
-                    // In-order data is ACKed once the batch it came in is taken (`tcp_acks`, after each exchange with the WiFi driver and each pass), one ACK for the batch's segments: the way a receiver coalescing its segments (GRO) ACKs, and the batch is microseconds, not a delayed-ACK timer. Until 2026-11-11 every second segment was ACKed at once (RFC 5681 4.2), which was one ACK a call to the driver while frames came one a call; with frames in batches of up to 88 that was 44 ACKs a batch, more than the driver's 32 transmit buffers, and as many frames for the radio to send back.
+                    // Every second in-order segment ACKed at once (RFC 5681 4.2, RFC 1122 4.2.3.2), one with PSH too; an odd one at the end of its batch (`tcp_acks`, after each exchange with the WiFi driver and each pass), never left owed into a sleep.
+                    // From 2026-11-11 to 2026-11-12 the batch was ACKed once (a receiver coalescing its segments), one ACK for up to 88 segments: the Pro's close reports said 143 segments in and 17 ACKs out, a sender starved of ACKs grows its window by them and paces by them (`docs/WIFI.md`, "ACKs").
                     c.unacked += 1;
-                    c.owed = true;
+                    if c.unacked >= 2 || flags & PSH != 0 {
+                        now_ack = true;
+                    } else {
+                        c.owed = true;
+                    }
                 } else {
                     // Past a hole: kept in place, and a duplicate ACK at once with the SACK blocks, so the peer's fast retransmit fills the hole.
                     c.ooo.latest = s;
@@ -2465,6 +2470,14 @@ impl Ip {
         self.dec(v % 10);
     }
 
+    /// `v` hundredths as A#whole.hundredths.
+    fn hundredths(&mut self, v: u64) {
+        self.put(b"A#");
+        self.dec(v / 100);
+        self.put(if v % 100 < 10 { b".0".as_slice() } else { b"." });
+        self.dec(v % 100);
+    }
+
     /// Connection `i`'s measures on the console as it is freed, one line (owner, 2026-11-11: what he reads on the device after a Mahere base cell fetch): how it ended, bytes each way, how long it was open, the peak rate over quarter seconds and the average, the smoothed round trip and its variation and the timeout, segments resent (fast retransmits, timer expiries), segments kept out of order and the most bytes so held, the most bytes waiting for the app of the window's most, the segment sizes, the scales, SACK, and the congestion window at the end.
     fn report(&mut self, i: usize, why: u8) {
         let c = self.tcb[i];
@@ -2538,6 +2551,12 @@ impl Ip {
         self.dec(c.segs_in as u64);
         self.put(b", ACKs out A#");
         self.dec(c.acks_out as u64);
+        // WHY the test: a connection that took no data in has no ratio.
+        if c.segs_in > 0 {
+            self.put(b", ");
+            self.hundredths(c.acks_out as u64 * 100 / c.segs_in as u64);
+            self.put(b" a segment");
+        }
         self.put(b" (most between two A#");
         self.dec(c.burst_most as u64);
         self.put(b" bytes)\n");
