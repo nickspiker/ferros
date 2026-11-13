@@ -2023,8 +2023,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, _tabs: &neon::Odt, mas
         // The row's edge: its masked columns and its listed edge pixels, as the columns from the left and from the right that need it.
         let g = &rows[y];
         let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), rows[y + 1].first as usize) };
-        let row_px = &plan[g.first as usize..];
-        let edge_px = &row_px[front_split(row_px)..];
+        let edge_px = &plan[g.first as usize..];
         let (el, er) = edge_cols(g, edge_px, width);
         let (hl, hr) = (g.hole_l as usize, g.hole_r as usize);
         let ((cl, cr), bw) = bar_line(y, width, height);
@@ -3140,7 +3139,7 @@ struct Win {
     mode: u8,
     /// Behind (op 60; owner, 2026-11-11: "Home backgrounds the kist so depending on how it was designed, like Photon, it doesn't die but it stops rendering everything"): kept in the table with its surface and its process, never composed, never an owner in the hit map, its shows taken (place and format) but published nowhere, until op 59 brings it to the front.
     back: bool,
-    /// Full screen for this window (op 43, the quick row's circle): no circle and no bars while it is the app in front (`FULL` follows the front app window's).
+    /// Full screen for this window (op 43, the quick row's circle, deck's swipe): no bars while it is the app in front (`FULL` follows the front app window's).
     full: bool,
 }
 /// A surface of fluor's 16-bit pixels (fluor `pixel::G2t16`): α in bits 48-63, then each channel's darkness (the top code less the channel's VSF `g2t` code, scaled by α) in bits 32-47 (R), 16-31 (G) and 0-15 (B); α 0 is see-through.
@@ -3206,7 +3205,7 @@ const CLEAR: u64 = 1 << 63;
 static mut CHROME_TOP: usize = 0;
 /// The console's rows, the bars' top band: `CHROME_TOP`, or down to the quick row's floor where that is lower (quick.rs `rows`; since 2026-11-11 the row reaches past the chrome rows to touch the glass's sides).
 static mut BAR_TOP: usize = 0;
-/// Full screen (owner, 2026-11-07, then the deck swipe; 2026-11-11 the quick row's middle circle, and later that day the deck swipe again with an app in front: "the swipe in on home whilist in a kist needs to show/hide controls"): the console, the helm and the app's circle hidden, only the glass's edge left (black, and orange on development builds). The app window in front's own flag (`Win::full`, switched by op 43), followed by `full_follow` whenever the windows change; off with no app in front. The helm is hidden but stays the system's on the hit map, undrawn, so deck's swipe there switches it back; the console and the quick row are gone, not drawn (`bar_line`) and not on the hit map (hit.rs `row`, which reads the bars' ids on the helm's rows alone while this is on), so the app has those pixels and their touches (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"). The map shuts the quick row at once when it turns this on itself (its middle circle, deck's swipe).
+/// Full screen (owner, 2026-11-07, then the deck swipe; 2026-11-11 the quick row's middle circle, and later that day the deck swipe again with an app in front: "the swipe in on home whilist in a kist needs to show/hide controls"): the console and the helm hidden (the app's circle no longer clips anything since 2026-11-12, "Drawn under the controls", so full screen is only the controls hidden), only the glass's edge left (black, and orange on development builds). The app window in front's own flag (`Win::full`, switched by op 43), followed by `full_follow` whenever the windows change; off with no app in front. The helm is hidden but stays the system's on the hit map, undrawn, so deck's swipe there switches it back; the console and the quick row are gone, not drawn (`bar_line`) and not on the hit map (hit.rs `row`, which reads the bars' ids on the helm's rows alone while this is on), so the app has those pixels and their touches (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"). The map shuts the quick row at once when it turns this on itself (its middle circle, deck's swipe).
 static mut FULL: bool = false;
 static mut CHROME_BOT: usize = 0;
 /// The bars (owner, 2026-11-07): the console, the circles at the top of the screen (the radios' switches and the system's indicators), over the `BAR_TOP` rows (the quick row with them), then the helm, deck and back at the bottom, over the `CHROME_BOT` rows. They are the frontmost layer but the glass's edge, over the deck and every app alike, in screen coordinates, so nothing transforms them. Drawn as fluor draws: front to back from empty, into fluor's 16-bit α + darkness (`G2T16`), by fluor's one `under`; redrawn only when what they show changes (`console_draw`, `helm_draw`).
@@ -3682,31 +3681,24 @@ fn look_op(what: u8) -> [u8; 2] {
     [0, !dev_look() as u8]
 }
 
-/// The glass's shape, planned once per screen size (owner, 2026-11-02: "maintain a global compressed mask since most will be opaque for the OS in general"): the circle an app lives in (the corners outside it are the system's chrome) and the screen's own edge, as Photon draws its window on Android glass (fluor paint/edge.rs `glass_corner_params`, Nick 2026-09-17: a superellipse corner inside the glass's circular arc, cutting one and a half glass insets deeper at the diagonal, exponent 6 or the first lower one whose corners fit, nine tenths of the fitted size; the top-left and bottom-right corners twice the top-right and bottom-left, the 2:1 asymmetry).
-/// Per row: the columns of chrome from the left and from the right (the circle's outside), the columns masked from the left and from the right (the edge's outside, over the chrome), then the row's antialiased pixels in the order they apply (column, shape, coverage Q16, hairline alpha Q16): the circle's first, in column order, then the edge's, then the camera hole's knockout (every column of its range). `GLASS_ROWS` has height + 1 entries; a row's pixels run from its `first` to the next row's. Everything else on a row is glass, untouched: the publish path does no geometry at all, it copies runs and blends the listed pixels.
-/// The edge comes from fluor's walk of the corners' crossings (`walk_window_edges`, the one walk Photon's chrome draws with: a four-corner mirror and a single-pixel alias per axis), the circle from its distance field, both at plan time only.
+/// The glass's shape, planned once per screen size (owner, 2026-11-02: "maintain a global compressed mask since most will be opaque for the OS in general"): the screen's own edge, as Photon draws its window on Android glass (fluor paint/edge.rs `glass_corner_params`, Nick 2026-09-17: a superellipse corner inside the glass's circular arc, cutting one and a half glass insets deeper at the diagonal, exponent 6 or the first lower one whose corners fit, nine tenths of the fitted size; the top-left and bottom-right corners twice the top-right and bottom-left, the 2:1 asymmetry), and the camera hole's knockout.
+/// Per row: the columns masked from the left and from the right (the edge's outside), then the row's antialiased pixels in the order they apply (column, shape, coverage Q16, hairline alpha Q16): the edge's, then the camera hole's knockout (every column of its range). `GLASS_ROWS` has height + 1 entries; a row's pixels run from its `first` to the next row's. Everything else on a row is glass, untouched: the publish path does no geometry at all, it copies runs and blends the listed pixels.
+/// The edge comes from fluor's walk of the corners' crossings (`walk_window_edges`, the one walk Photon's chrome draws with: a four-corner mirror and a single-pixel alias per axis), at plan time only.
+/// Until 2026-11-12 the plan held the app's circle too (the columns outside it on the chrome rows, and its antialiased pixels), and a kist's window was cut to it; a window fills the glass now, the controls in front of it (WINDOWS.md "Drawn under the controls").
 struct GlassRow {
     first: u32,
-    chrome_l: u16,
-    chrome_r: u16,
     mask_l: u16,
     mask_r: u16,
     /// The camera hole's knockout on this row: columns hole_l..hole_r, every one of them listed (`SHAPE_HOLE`, the row's last pixels, in column order); empty (0, 0) on rows without it.
     hole_l: u16,
     hole_r: u16,
 }
-/// A listed pixel's shape: the circle (its base is the chrome under it, its hairline the ring's) or the edge (its base the mask colour, its hairline the edge's).
-const SHAPE_CIRCLE: u16 = 0;
+/// A listed pixel's shape: the edge (its base the mask colour, its hairline the edge's).
 const SHAPE_EDGE: u16 = 1;
 /// The camera hole's knockout (owner, 2026-11-08: "an anti-aliased orange knockout that is as small as possible without touching the dead px", on "the same front/first layer mask with the asymmetric squircle edges"): its base the mask colour, no hairline; listed after the edge's pixels, every column of the row's hole range, so `glass_front` finds one by its column less `hole_l`.
 const SHAPE_HOLE: u16 = 2;
 /// husky's knockout: on since its hole was measured on its glass (owner, 2026-11-08, tools/cutout-scan, as akita's was; `ferros_sys::CUTOUT_HOLE`).
 const HOLE_HUSKY: bool = true;
-/// Where the row's pixels in front of the scene begin (the edge's, then the hole's): past the circle's.
-#[inline]
-fn front_split(row_px: &[(u16, u16, u16, u16)]) -> usize {
-    row_px.iter().position(|e| e.1 != SHAPE_CIRCLE).unwrap_or(row_px.len())
-}
 /// Whether the sixteen columns from x reach the row's hole knockout (an empty range never does).
 #[inline]
 fn hole_in(g: &GlassRow, x: usize) -> bool {
@@ -3755,10 +3747,6 @@ fn plan_glass(width: usize, height: usize) {
     walk_window_edges(width as u32, height as u32, sb, &cb, ss, &cs, &mut on_clip, &mut on_hair);
     mid.extend_from_slice(&mid_h);
     mid.sort_unstable_by_key(|e| (e.0, e.1));
-    // The circle: its centre and radius, the band its edge and hairline touch (a pixel and a half either side of the radius), and the rows that reach outside it (the chrome rows, the only rows the circle's runs and pixels may land on: the chrome buffer holds those rows alone, and a plan that put the circle elsewhere would index past it, loudly).
-    let (cx, cy, rad) = circle(width, height);
-    let (rin, rout) = ((rad - 1.5) * (rad - 1.5), (rad + 1.5) * (rad + 1.5));
-    let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
     let mut rows: alloc::vec::Vec<GlassRow> = alloc::vec::Vec::with_capacity(height + 1);
     let mut px: alloc::vec::Vec<(u16, u16, u16, u16)> = alloc::vec::Vec::new();
     // The camera hole, where its knockout is on (`HOLE_HUSKY`).
@@ -3766,68 +3754,6 @@ fn plan_glass(width: usize, height: usize) {
     let mut mi = 0;
     for y in 0..height {
         let first = px.len() as u32;
-        let (mut cl, mut cr) = (0usize, width);
-        if y < top || y >= height - bot {
-            let dy = y as f32 + 0.5 - cy;
-            let dy2 = dy * dy;
-            // A pixel's coverage by the disc and the hairline's weight at it, from its centre's distance to the edge: coverage 1 with the centre half a pixel or more inside the edge, 0 half a pixel or more outside, the ramp between (by the definition of coverage; the band is wider than that pixel, it holds the hairline too, so the limits are the geometry's, not a guard); the hairline one pixel wide, centred on the radius, its profile (1 - t²)² across it, C¹ at its edges and its centre.
-            let pixel = |x: usize| -> (u32, u32) {
-                let dx = x as f32 + 0.5 - cx;
-                let d2 = dx * dx + dy2;
-                if d2 >= rout {
-                    (0, 0)
-                } else if d2 > rin {
-                    let d = libm::sqrtf(d2);
-                    let cov = rad + 0.5 - d;
-                    let cov = if cov > 1.0 { 1.0 } else if cov < 0.0 { 0.0 } else { cov };
-                    // No hairline (owner, 2026-11-09: "We can remove the big circle from the draw stack, it was just a visual guide ... Circle idea and alignment stays, just needs to be invisible"): the circle still clips the windows and lays out the corners and the keyboard, with nothing drawn on its edge.
-                    ((cov * 65536.0) as u32, 0)
-                } else {
-                    (65536, 0)
-                }
-            };
-            // One crossing per row (owner, 2026-11-02: "count the crossings vertically"): the circle's chord at this row, where its edge band begins and ends; only the band's pixels are looked at. Past the outer crossing is chrome, inside the inner one is glass; where the inner crossing does not exist (the rows at the circle's top and bottom) the band is the whole chord.
-            if dy2 >= rout {
-                cl = width;
-                cr = width;
-            } else {
-                let half_out = libm::sqrtf(rout - dy2);
-                // WHY the screen's bounds: the circle is wider than the screen (its radius exceeds half the width), so on most rows its crossings lie off the glass; the band is cut to the row.
-                let (x0, x1) = ((cx - half_out) as i64 - 2, (cx + half_out) as i64 + 2);
-                cl = if x0 < 0 { 0 } else { x0 as usize };
-                cr = if x1 > width as i64 { width } else { x1 as usize };
-                while cl < width && pixel(cl) == (0, 0) {
-                    cl += 1;
-                }
-                while cr > cl && pixel(cr - 1) == (0, 0) {
-                    cr -= 1;
-                }
-                let (li, ri) = if dy2 < rin {
-                    let half_in = libm::sqrtf(rin - dy2);
-                    let (li, ri) = ((cx - half_in) as i64 + 2, (cx + half_in) as i64 - 2);
-                    (if li < cl as i64 { cl } else { li as usize }, if ri > cr as i64 { cr } else { ri as usize })
-                } else {
-                    (cr, cr)
-                };
-                let mut band = |x: usize| {
-                    let (c, h) = pixel(x);
-                    if c != 65536 || h != 0 {
-                        px.push((x as u16, SHAPE_CIRCLE, c.min(0xFFFF) as u16, h.min(0xFFFF) as u16));
-                    }
-                };
-                for x in cl..li.min(cr) {
-                    band(x);
-                }
-                for x in li.max(ri)..cr {
-                    band(x);
-                }
-            }
-        } else if y == top {
-            // The first glass row: the circle's chord is wider than the screen here, by `chrome_rows`'s construction, so no chrome and no circle pixel lies on it or on any row until the bottom's.
-            let dx = 0.5 - cx;
-            let dy = y as f32 + 0.5 - cy;
-            assert!(dx * dx + dy * dy <= rin, "glass plan: the circle reaches a row the chrome does not hold");
-        }
         let (mut ml, mut mr) = (0usize, width);
         let d = if y < band { Some(y) } else if y >= height - band { Some(band + y - (height - band)) } else { None };
         if let Some(d) = d {
@@ -3859,7 +3785,7 @@ fn plan_glass(width: usize, height: usize) {
                 mi += 1;
             }
         }
-        // The camera hole's knockout: every column whose pixel the disc touches at all, contiguous on a row (a disc's chord), each with the glass's coverage left by it. The disc's coverage of a pixel is R + 0.5 − d with d its centre's distance to the hole's centre, 1 half a pixel or more inside the radius, 0 half a pixel or more outside, the ramp between (the same rule as the circle's: by the definition of coverage, not a guard), so the radius measured on the glass (`ferros_sys::cutout_hole`, the smallest covering every dead pixel whole) puts the ramp on live pixels only.
+        // The camera hole's knockout: every column whose pixel the disc touches at all, contiguous on a row (a disc's chord), each with the glass's coverage left by it. The disc's coverage of a pixel is R + 0.5 − d with d its centre's distance to the hole's centre, 1 half a pixel or more inside the radius, 0 half a pixel or more outside, the ramp between (by the definition of coverage, not a guard), so the radius measured on the glass (`ferros_sys::cutout_hole`, the smallest covering every dead pixel whole) puts the ramp on live pixels only.
         let (mut hl, mut hr) = (0usize, 0usize);
         if let Some((hx, hy, hrad)) = hole {
             let dy = y as f32 + 0.5 - hy;
@@ -3885,9 +3811,9 @@ fn plan_glass(width: usize, height: usize) {
                 }
             }
         }
-        rows.push(GlassRow { first, chrome_l: cl as u16, chrome_r: cr as u16, mask_l: ml as u16, mask_r: mr as u16, hole_l: hl as u16, hole_r: hr as u16 });
+        rows.push(GlassRow { first, mask_l: ml as u16, mask_r: mr as u16, hole_l: hl as u16, hole_r: hr as u16 });
     }
-    rows.push(GlassRow { first: px.len() as u32, chrome_l: 0, chrome_r: width as u16, mask_l: 0, mask_r: width as u16, hole_l: 0, hole_r: 0 });
+    rows.push(GlassRow { first: px.len() as u32, mask_l: 0, mask_r: width as u16, hole_l: 0, hole_r: 0 });
     unsafe {
         GLASS_ROWS = rows.leak().as_ptr() as usize;
         GLASS_PX = px.leak().as_ptr() as usize;
@@ -3904,21 +3830,6 @@ fn chrome_rows(width: usize, height: usize) -> (usize, usize) {
     let (cx, cy, r) = circle(width, height);
     let half = libm::sqrtf(r * r - cx * cx);
     ((cy - half) as usize + 3, (height as f32 - (cy + half)) as usize + 3)
-}
-
-/// The hairline's colour (owner, 2026-11-02). Release builds: standard-illuminant-E grey (equal VSF RGB codes) one stop darker than the theme's ring: the ring's photopic light (VSF RGB's weights, as vsf::colour::convert::vsf_rgb_to_photopic_f32 has them: R 0.2584, G 0.6346, B 0.1070, on gamma-2 codes) halved, back to a code. Development builds: bright orange in VSF RGB, full red, half-light green, no blue, so a dev image is told at a glance.
-/// Baked (bake.rs) from its working values, once per publish.
-fn hairline() -> u64 {
-    let v = if !dev_look() {
-        let ring = ferros_sys::theme::current().ring;
-        let lin = |sh: u32| { let c = (ring >> sh & 0xFF) as f32 * (1.0 / 255.0); c * c };
-        let light = 0.2584 * lin(16) + 0.6346 * lin(8) + 0.1070 * lin(0);
-        let code = libm::sqrtf(light * 0.5);
-        [code; 3]
-    } else {
-        [1., libm::sqrtf(0.5), 0.]
-    };
-    1 << 63 | bake::now().px(v)
 }
 
 /// A plan weight as Q16 with 65536 whole (the plan keeps full as G#FFFF in its u16).
@@ -3992,7 +3903,7 @@ fn glass_front(x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], c: u64,
     }
     under_pm(acc, t, p & ((1 << 48) - 1), 0).0
 }
-/// The windows into phase `k` over `r` (screen coordinates): each row composed frontmost first (a pixel comes from the first window that covers it; nothing behind the windows but black), cut to the circle with its edge antialiased, the corners from the chrome; each window's pixels baked first unless its surface already is (`layer_row`), so the compose is in the panel's codes; then each pixel presented, the dither and the pack (neon.rs `present_app16`), bit 48 set = no dither for that pixel.
+/// The windows into phase `k` over `r` (screen coordinates): each row composed frontmost first (a pixel comes from the first window that covers it; nothing behind the windows but black), to the glass's edge (since 2026-11-12, "Drawn under the controls": no longer cut to the app's circle), the bars in front of it; each window's pixels baked first unless its surface already is (`layer_row`), so the compose is in the panel's codes; then each pixel presented, the dither and the pack (neon.rs `present_app16`), bit 48 set = no dither for that pixel.
 /// `hits`: this call writes the hit map's rows too (hit.rs; the first of several phases published together, never a capture), and in development shows the map instead of the image when `k` is its phase.
 fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: usize, hits: bool) {
     publish_app_mask(r, tabs, 1 << k, width, height, hits);
@@ -4056,8 +3967,6 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
     // The development view's phase is painted whole from the hit map as it comes round (`hit::on_layer`), never here: the phases written are the others.
     let write = if hit::view() && unsafe { CAPTURE } == 0 { mask & !(1 << hit::PHASE) } else { mask };
     let cm = neon::Chans::new(CHANNELS.load(Ordering::Relaxed));
-    // The app circle's ring hairline (the edge's is the mask's own colour, `glass_front`).
-    let line = hairline();
     let mut row = [3u32; 1344];
     let mut px = [0u64; 1344];
     let (xa, xb) = (r.x0 as usize, r.x1 as usize);
@@ -4172,21 +4081,17 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
         parts[0] += t1 - t0;
         // The 16-pixel blocks (from xa) the glass composes over, bit j block j: with a `direct` row they come from `px`, the rest from the surface.
         let mut touched = 0u128;
-        // The glass's shape, from the plan (`plan_glass`), front to back: outside the app's circle is black (nothing of the windows shows there); on the circle's listed pixels its hairline is in front, then the windows by the circle's coverage, then that black; then over everything so made the glass's edge and the camera hole's knockout, the bars (the console and the helm), and that pixel last (`glass_front`), on the columns any of them touches. The circle's hairline is `line`.
+        // The glass's shape, from the plan (`plan_glass`), front to back over the windows: the glass's edge and the camera hole's knockout, the bars (the console and the helm), and that pixel last (`glass_front`), on the columns any of them touches. Nothing cuts the windows to the app's circle (owner, 2026-11-12, "Should we draw under the controls?", then "Agreed. Build it!"): a window reaches the glass's edge, and the console's circles and the helm's wedges float in front of its corners, the circle its safe area (`safe_follow`, WINDOWS.md "Drawn under the controls"). Until then everything outside the circle was black under the bars, and the circle's coverage was taken on its edge.
         {
             let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
             let g = &rows[y];
             let (first, next) = (g.first as usize, rows[y + 1].first as usize);
-            let (cl, cr, ml, mr) = (g.chrome_l as usize, g.chrome_r as usize, g.mask_l as usize, g.mask_r as usize);
-            if cl > 0 || cr < width || ml > 0 || mr < width || first != next {
-                // Full screen (`FULL`): no circle, the app to the glass's edge.
-                let full = unsafe { FULL };
+            let (ml, mr) = (g.mask_l as usize, g.mask_r as usize);
+            let ((bl, br), bw) = bar_line(y, width, height);
+            if ml > 0 || mr < width || first != next || bl < br {
                 let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), next) };
-                let row_px = &plan[first..next];
-                let split = front_split(row_px);
-                let edge_px = &row_px[split..];
+                let edge_px = &plan[first..next];
                 let (el, er) = edge_cols(g, edge_px, width);
-                let ((bl, br), bw) = bar_line(y, width, height);
                 let (hl, hr) = (g.hole_l as usize, g.hole_r as usize);
                 if let Some(front) = direct {
                     let mut mark = |a: usize, b: usize| {
@@ -4196,16 +4101,6 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
                             }
                         }
                     };
-                    if !full {
-                        mark(xa, xb.min(cl));
-                        mark(xa.max(cr), xb);
-                        for &(x, ..) in &row_px[..split] {
-                            let x = x as usize;
-                            if x >= xa && x < xb {
-                                mark(x, x + 1);
-                            }
-                        }
-                    }
                     for (a, b) in glass_cols(xa, xb, [(0, el), (er, width), (bl, br), (hl, hr)]) {
                         mark(a, b);
                     }
@@ -4216,23 +4111,6 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
                         px[a..b].copy_from_slice(&front[a..b]);
                         t &= t - 1;
                     }
-                }
-                if !full {
-                    // WHY the test: a publish covers columns xa..xb, which since the bars' worker publishes only what changed (COMPOSITOR.md step 1) need not start at the row's left; the left chrome ends at cl, which may be left of xa, and the range would then start past its end (the display panicked here after a boot, 2026-11-07).
-                    if xa < xb.min(cl) {
-                        px[xa..xb.min(cl)].fill(0);
-                    }
-                    if xa.max(cr) < xb {
-                        px[xa.max(cr)..xb].fill(0);
-                    }
-                }
-                for &(x, _, c, h) in &row_px[..if full { 0 } else { split }] {
-                    let x = x as usize;
-                    if x < xa || x >= xb {
-                        continue;
-                    }
-                    let (acc, t) = under_pm(0, 16384, scale_q16(line, q16(h)), 16384 - (q16(h) >> 2));
-                    px[x] = under_pm(acc, t, scale_q16(px[x] & ((1 << 48) - 1), q16(c)), 0).0;
                 }
                 // Only the columns something is in front of: left of the edge's columns, right of them, the bars, the hole (`glass_cols`); every other pixel of the row is the scene as it came. Each pixel was tested against all four until 2026-11-12, 4 cycles a pixel of a whole-screen app's publish on the X3 for a few dozen pixels a row.
                 for (a, b) in glass_cols(xa, xb, [(0, el), (er, width), (bl, br), (hl, hr)]) {
@@ -4410,6 +4288,7 @@ fn windows_changed(width: usize, height: usize) {
     layout_build(width, height);
     wins_mirror();
     full_follow();
+    safe_follow(width, height);
     unsafe {
         PHASE_DIRTY = [full; PHASES];
         clean_reset_all();
@@ -4474,6 +4353,36 @@ fn full_follow() -> bool {
         FULL = f;
         HITS_STALE |= was != f;
         was != f
+    }
+}
+
+/// What each surface's window was last told of its safe area (`EV_SAFE`): the generation it was told under (0 never) and the payload.
+static mut SAFE_TOLD: [(u8, [u8; ferros_sys::window::SAFE_BYTES]); SURFACES] = [(0, [0; ferros_sys::window::SAFE_BYTES]); SURFACES];
+
+/// Each app window's safe area (WINDOWS.md "Drawn under the controls"; owner, 2026-11-12, "Should we draw under the controls?", then "Agreed. Build it!"): the window fills the glass and the system's controls float in front of its corners, so it is told where they are not, `EV_SAFE`: the app's circle in the window's own pixels and which halves of the glass outside it the system holds.
+/// The top's outside is the console's (its circles drawn and touched there) unless the window is full screen, where the console is gone and its rows are the window's (hit.rs `row`); the bottom's is the helm's always, drawn or not (its wedges stay the system's on the hit map in full screen).
+/// Told when it differs from what the window was last told under its generation: at its first show, and as its full screen turns; only while its owner lives (an event under a generation the surface no longer has would start the next owner's events over, events.rs `own`). Apps alone (level 0): the levels above are the system's own windows, which lay themselves out in the circle.
+fn safe_follow(width: usize, height: usize) {
+    use ferros_sys::window::{EV_SAFE, SAFE_BOTTOM, SAFE_BYTES, SAFE_TOP};
+    let (cx, cy, r) = circle(width, height);
+    let wins = unsafe { &*(&raw const WINS) };
+    let told = unsafe { &mut *(&raw mut SAFE_TOLD) };
+    for k in 0..SURFACES {
+        let Some(w) = wins[k] else { continue };
+        if w.level != 0 || live_gen(k) != w.generation {
+            continue;
+        }
+        // 256ths of a pixel, from the window's own top-left corner.
+        let q8 = |v: f32| libm::roundf(v * (1 << 8) as f32) as i32;
+        let mut p = [0u8; SAFE_BYTES];
+        p[0..4].copy_from_slice(&q8(cx - w.rect.x0 as f32).to_le_bytes());
+        p[4..8].copy_from_slice(&q8(cy - w.rect.y0 as f32).to_le_bytes());
+        p[8..12].copy_from_slice(&(q8(r) as u32).to_le_bytes());
+        p[12] = if w.full { SAFE_BOTTOM } else { SAFE_TOP | SAFE_BOTTOM };
+        if told[k] != (w.generation, p) {
+            told[k] = (w.generation, p);
+            events::post_with(k, w.generation, (EV_SAFE as u16) << 8, &p);
+        }
     }
 }
 
@@ -5794,6 +5703,30 @@ fn helm_draw(width: usize, height: usize) -> bool {
         }
         if !back && note_ink.is_some() {
             helm_note_draw(bar, width, height, bot, (x, y, r), note_icon, note_count);
+        }
+        // The mark's dark glow (2026-11-12, "Drawn under the controls": a kist's own pixels show under the helm now, and over bright ones a grey mark on a wedge an eighth black is hard to read): a layer of black at its own α, under the mark and the note, `peak` hugging the stroke and nothing `reach` past it, falling off in log distance as the theme's glows do (draw::glow_log: down by the same step every octave), each octave of (d / d0)² counted from the stroke's outer edge d0. On the C∞ step (`bump_step`): no kink at the stroke, none where it ends. Over black (the deck with no wallpaper) it is black on black.
+        let reach = r * (1. / (1 << 2) as f32);
+        let (d0, peak) = (HALF + 1.0, 1. - 1. / (1 << 2) as f32);
+        let octaves = libm::log2f(1. + (reach / d0) * (reach / d0));
+        let black = g2t_colour((0., 0., 0.));
+        let (x0, x1, y0, y1) = ((x - r - reach - 2.0) as i64, (x + r + reach + 2.0) as i64, (y - r - reach - 2.0) as i64, (y + r + reach + 2.0) as i64);
+        for py in y0..=y1 {
+            // WHY the test: the glow's box comes from the layout's float geometry and can reach past the screen's sides or bottom; an index from there would land in another row or past the buffer.
+            if px_out(py, height) {
+                continue;
+            }
+            let row = py as usize - (height - bot);
+            for px in x0..=x1 {
+                if px < 0 || px >= width as i64 {
+                    continue;
+                }
+                let q = dist(px as f32 + 0.5, py as f32 + 0.5) / d0;
+                let a = peak * draw::bump_step(1. - libm::log2f(1. + q * q) / octaves);
+                if a > 0.0 {
+                    let i = row * width + px as usize;
+                    bar[i] = bar[i].under(black | ((a * 65535.0) as u64) << 48, BlendMode::Normal);
+                }
+            }
         }
     }
     // Each button's whole wedge (owner, 2026-11-09: "everything in that wedge should light up", "1/8 opacity black when the helm is showing, that turns white at same said opacity when tapped"): the bars' rows outside the app's circle, the left half back's and the right half deck's (op 41's regions), a layer behind the marks (front to back) at an eighth of opacity, its colour black at rest and white by the button's level; its edge along the circle a pixel wide.
@@ -8755,6 +8688,8 @@ fn server(grants: u64) -> ! {
                                     if full_follow() {
                                         clean_reset_all();
                                     }
+                                    // A window shown for the first time (or at a new place) is told its safe area.
+                                    safe_follow(width, height);
                                 }
                                 if OP22_US[4] == 0 {
                                     OP22_US[0] = t_chrome - t22;
@@ -8896,7 +8831,7 @@ fn server(grants: u64) -> ! {
                     }
                 }
                 Some(43) => {
-                    // Full screen on or off for the app window in front (`Win::full`, `FULL`; the quick row's circle since 2026-11-11, owner: full screen "moves to a quick-row circle", where the deck swipe toggled it for the whole screen until then): every phase republished, the bars and the circle gone or back, and with the publish every row of the hit map written again (hit.rs `row`: the console's rows the app's in full screen, the helm's still the system's). Replies the new state; status 3 and the state unchanged with no app in front (the deck always has its bars), 4 (`NOT_YOURS`) when the app in front is neither the caller's nor the caller the system's.
+                    // Full screen on or off for the app window in front (`Win::full`, `FULL`; the quick row's circle since 2026-11-11, owner: full screen "moves to a quick-row circle", where the deck swipe toggled it for the whole screen until then): every phase republished, the bars gone or back, the window told its safe area (`safe_follow`), and with the publish every row of the hit map written again (hit.rs `row`: the console's rows the app's in full screen, the helm's still the system's). Replies the new state; status 3 and the state unchanged with no app in front (the deck always has its bars), 4 (`NOT_YOURS`) when the app in front is neither the caller's nor the caller the system's.
                     match front_app() {
                         Some(k) if !manages(unsafe { HOLDS }, k) => out[0] = not_yours(43, k),
                         Some(k) => unsafe {
@@ -8904,6 +8839,7 @@ fn server(grants: u64) -> ! {
                                 w.full = !w.full;
                             }
                             full_follow();
+                            safe_follow(width, height);
                             PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
                             clean_reset_all();
                         },
@@ -9132,8 +9068,7 @@ fn server(grants: u64) -> ! {
                             for y in 0..height {
                                 let g = &rows[y];
                                 let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), rows[y + 1].first as usize) };
-                                let row_px = &plan[g.first as usize..];
-                                let edge_px = &row_px[front_split(row_px)..];
+                                let edge_px = &plan[g.first as usize..];
                                 if mask {
                                     // White at Q14 in each of R, G and B: the mask's compose is linear (`glass_front`, `under_pm`), so this is the glass's share of white exactly, and it is not unbaked (the release look's mask is black, nothing baked in it).
                                     const WHITE: u64 = 16384 | 16384 << 16 | 16384 << 32;
