@@ -811,8 +811,8 @@ extern "C" fn work(_: u64) -> ! {
                         walking = false;
                         let st = store.engine().engine_stats();
                         live_note(store.engine());
-                        let (hashed, tree) = unsafe { LIVE };
-                        say!("vault: settled {} ms after serving began: {} live blocks ({} hashed, {} by position), plow {} reap {}; the heap {} KiB in use, high water {} KiB", (now() - t_walk) * 1000 / freq(), st.live_blocks, hashed, tree, st.plow, st.reap, ferros_heap::IN_USE.load(Relaxed) >> 10, ferros_heap::PEAK.load(Relaxed) >> 10);
+                        let (hashed, tree, bytes) = unsafe { LIVE };
+                        say!("vault: settled {} ms after serving began: {} live blocks ({} hashed, {} by position, the live set {} KiB), plow {} reap {}; the heap {} KiB in use, high water {} KiB", (now() - t_walk) * 1000 / freq(), st.live_blocks, hashed, tree, bytes >> 10, st.plow, st.reap, ferros_heap::IN_USE.load(Relaxed) >> 10, ferros_heap::PEAK.load(Relaxed) >> 10);
                     }
                     Err(e) => {
                         walking = false;
@@ -1185,13 +1185,14 @@ static mut SERVING: (u8, u64, u64, usize) = (u8::MAX, 0, 0, 0);
 /// While migrating (`migrate`): no request of a process, the kernel's old entries moving.
 const OP_MIGRATE: u8 = u8::MAX;
 
-/// The engine's live set as it stood after the last request (`live_note`), for the death report: blocks with a recorded hash (41 bytes of table each) and blocks live by position alone (9 bytes each).
-/// 2026-11-13, the 8a: "memory allocation of 21495816 bytes failed serving a set" was this set's one table doubling to 2^19 buckets (2^19 × 41 + 8 bytes), and 2026-11-12's 10,747,912 "serving a delete" the doubling before it; manifestus `live-shards` splits it into 256 tables, so no doubling asks for more than a 256th of it at once.
-static mut LIVE: (usize, usize) = (0, 0);
+/// The engine's live set as it stood after the last request (`live_note`), for the death report: blocks with a recorded hash, blocks live by position alone, and the bytes it holds.
+/// 2026-11-13, the 8a: "memory allocation of 21495816 bytes failed serving a set" was this set's hashbrown table doubling to 2^19 buckets (2^19 × 41 + 8 bytes), and 2026-11-12's 10,747,912 "serving a delete" the doubling before it; manifestus `live-shards` makes it a direct index by position in pages, whose largest allocation is 32 KiB.
+static mut LIVE: (usize, usize, usize) = (0, 0, 0);
 
-/// The live set's counts noted (`LIVE`). The serving thread's alone.
+/// The live set's counts and bytes noted (`LIVE`). The serving thread's alone.
 fn live_note(v: &Vault<Half, Half>) {
-    unsafe { LIVE = v.live_counts() };
+    let (hashed, tree) = v.live_counts();
+    unsafe { LIVE = (hashed, tree, v.live_bytes()) };
 }
 
 /// What the death report calls an op.
@@ -1218,9 +1219,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         Some(h) => (h.free_bytes() >> 10, h.free_blocks(), h.largest_free() >> 10),
         None => (0, 0, 0),
     };
-    let (hashed, tree) = unsafe { LIVE };
+    let (hashed, tree, live_bytes) = unsafe { LIVE };
     say!(
-        "vault: panic: {} serving {} (offset {}, {} bytes, a name of {} bytes); the live set {} hashed, {} by position; the heap: {} KiB in use, high water {} of {} KiB, {} KiB free in {} blocks, the largest {} KiB",
+        "vault: panic: {} serving {} (offset {}, {} bytes, a name of {} bytes); the live set {} hashed, {} by position, {} KiB; the heap: {} KiB in use, high water {} of {} KiB, {} KiB free in {} blocks, the largest {} KiB",
         info,
         op_name(op),
         offset,
@@ -1228,6 +1229,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         name,
         hashed,
         tree,
+        live_bytes >> 10,
         ferros_heap::IN_USE.load(Relaxed) >> 10,
         ferros_heap::PEAK.load(Relaxed) >> 10,
         HEAP_BYTES >> 10,
