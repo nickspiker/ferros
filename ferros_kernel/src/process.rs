@@ -543,7 +543,7 @@ pub enum Object {
     Irq(usize),
     /// Served by the kernel: a device's power (index into `POWERS`): rails, clocks and pin modes the driver cannot set itself (`SYS_POWER`).
     Power(usize),
-    /// A surface to be: a spawn turns it into one free surface of `surfaces`, the child's own (`Dma` of `surface-k`), at build. Never held: a parent that passes the whole `surfaces` region passes this instead (SYS_SPAWN), and `bridge spawn --dma surface` asks for it by name.
+    /// A surface to be: a spawn turns it into one free slot of `surfaces` with frames of its own behind it, the child's (`Dma` of a `surface`), at build. Never held: a parent that passes the whole `surfaces` region passes this instead (SYS_SPAWN), and `bridge spawn --dma surface` asks for it by name.
     NewSurface,
     /// Served by the kernel: read-only files on a partition (index into `PARTS`), answered by partfs.rs `part_call`.
     Part(usize),
@@ -1283,7 +1283,7 @@ const SYS_ZONE: u64 = 35;
 const SYS_LANG: u64 = 36;
 /// claim(op, …): the rights in use (`CLAIMS`; owner, 2026-11-10: GPS "stays green but no visuals for satellites since we're not rx'ing ... until something like mahere calls it or I open the GPS screen ... or Photon a friend pings for my location", and "we need to be able to see what kists are using each permission"). A right by its code (ferros_kist::RIGHTS); only GPS is claimed today. Op 0: claim x1 the right, x2 the token offset of what proves the caller may use it (for GPS: Settings, the settings page's, or the `gps` endpoint's send right, a kist's granted want) → 0 (also when it held one already), ERR refused (no such right or proof, nobody present, GPS switched off). Op 1: release x1 the right → 0. Op 2: who claims x1 the right, x2 the Settings token, x3/x4 a buffer and its length → how many claims (all of them; records past the buffer are not written), each `CLAIM_REC` bytes: 0 a system process or 1 a kist, then the kist's capsule address (32 bytes, zeros for a system process); ERR without Settings. Op 3: the GPS driver asked thru the kernel for a Settings holder that holds a GPS claim (the map's page: init's grants page has no slot left for its own `use gps`): x1 the driver's op (0 FIX, 2 SATS, payloads/gps), x2 the Settings token, x3/x4 the reply's buffer and its length with CALL_LIVE set, the call the caller's own as SYS_CALL makes it → the reply's length, ERR at once when no driver is receiving yet; or x1 = 3 | the change count last seen << 8, the driver's WATCH, its length bare (no CALL_LIVE): held until the driver's fixes or fix messages move, taken by a driver that starts later, → 4 bytes, the count now. The position passes thru, never kept. Op 4: the claims' doorbell, x1 a word in the caller's arc, x2 the Settings token: GPS_CLAIMS written there now and at every change, its waiters woken → 0.
 const SYS_CLAIM: u64 = 37;
-/// bell(source, word): a doorbell on what the settings pages show (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure. 1s poll can desync too, that needs fixd."). x0 the source: 0-5 a link in the facts' order (its eight measures, its tracks and its detail document: counted when its driver sets one to a value other than the one it held, and when the driver ends and they empty), `BELL_FACTS` the device's facts a settings page shows (`bell_facts`). `BELL_SURFACES` (9), for the holder of the `surfaces` region alone (the display server): the windows' owners, the word not a count but the four surfaces' live generations, byte k surface k's (its preference byte 8 + k while the process it was given to is alive, 0 otherwise) and a change count above bit 32 (`surfaces_ring`; 2026-11-11, Mahere killed from outside and its window kept the glass). x1 a word in the caller's arc, 8-aligned as SYS_WAIT takes one: the kernel writes the source's change count there now and at every change, waking whatever of the process waits on it (`bell_ring`). One word a source a process; a second registration moves it. No capability: the measures, tracks and facts are what SYS_FACTS and SYS_TRACKS give anyone, and a detail's count says when it changed, never what it says. → 0, ERR for no such source (or the surfaces' without the region).
+/// bell(source, word): a doorbell on what the settings pages show (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure. 1s poll can desync too, that needs fixd."). x0 the source: 0-5 a link in the facts' order (its eight measures, its tracks and its detail document: counted when its driver sets one to a value other than the one it held, and when the driver ends and they empty), `BELL_FACTS` the device's facts a settings page shows (`bell_facts`). `BELL_SURFACES` (9), for the holder of the `surfaces` region alone (the display server): the windows' owners in their old form, the word not a count but slots 0 to 3's live generations, byte k slot k's (its preference byte 8 + k while the process it was given to is alive, 0 otherwise) and a change count above bit 32 (`surfaces_ring`; 2026-11-11, Mahere killed from outside and its window kept the glass); kept for a display from before 2026-11-12. `BELL_SLOTS` (12), for the same holder: every slot's, bits 4k to 4k + 3 slot k's generation (1 to 15) while its owner lives, no count. x1 a word in the caller's arc, 8-aligned as SYS_WAIT takes one: the kernel writes the source's change count there now and at every change, waking whatever of the process waits on it (`bell_ring`). One word a source a process; a second registration moves it. No capability: the measures, tracks and facts are what SYS_FACTS and SYS_TRACKS give anyone, and a detail's count says when it changed, never what it says. → 0, ERR for no such source (or the surfaces' or the slots' without the region).
 const SYS_BELL: u64 = 38;
 /// not_started(op, …): the kist launches init answered "started" for that the kernel's kist job did not start after all, and the kists that started and then ended by a fault, a panic or a kill from outside (`NOT_STARTED`; owner, 2026-11-11: Mahere tapped, nothing opened, "it looked stuck"; then Mahere faulting at once, "no toast or anything"), for the Settings holder alone (the map), as the claims' users list. Op 0: x1 the Settings token, x2/x3 a buffer and its length → how many records (all of them; whole records past the buffer are not written), each `NOT_STARTED_REC` bytes: the reason (ferros_kist::launch::why), the capsule's address (32 bytes), the kists' bell count it rang (u64 LE). Op 1: the kists' doorbell, x1 a word in the caller's arc, x2 the Settings token: the bell's change count written there now and whenever a launch does not start, a kist starts, or a kist ends any way, its waiters woken → 0. Op 2: the kists alive (owner, 2026-11-11: their circles glow running, stopped or not running), x1 the Settings token, x2/x3 a buffer and its length → how many (all of them; whole ones past the buffer are not written), each a capsule's address (32 bytes) of a process the kist job started that is not ending (`kists_live`). ERR without Settings, or for no such op.
 const SYS_NOT_STARTED: u64 = 39;
@@ -1291,7 +1291,7 @@ const SYS_NOT_STARTED: u64 = 39;
 const SYS_ARC: u64 = 40;
 /// offer(op, stow, …): the kist offered over USB to stow (`OFFER`; docs/KISTS.md "Stowing", ferros_kist::offer; owner, 2026-11-11: "Just seems to me that we should just make a proper checked path and start using it"), for the stower alone: x1 the offset of its Stow token (`Object::Stow`). Op 0: the offers' doorbell, x2 a word in the caller's arc: the offers' change count written there now and whenever a host offers a kist, its waiters woken (`bell_register`, `BELL_OFFERS`) → 0. Op 1: the offer not yet ended, x2/x3 a buffer and its length (40 at least) → 0 with [capsule 32][length u64 LE] written (an offer still OFFERED becomes CHECKING), NOTHING when there is none. Op 2: its state as the stower has it, x2/x3 [capsule 32][state u8][why u8][flags u8] → 0, NOTHING when that capsule is not the offer or the offer has ended; the service loop answers a host's held read (`offer_state`). ERR without the Stow right, or for no such op.
 const SYS_OFFER: u64 = 41;
-/// caller(reply): what the process behind a call holds that its server decides by (2026-11-12, the display's isolation: until then any app could show, draw into, raise or read the events of another app's surface by naming it). x0 the offset of a reply token the caller holds (SYS_RECV's, not yet replied) → bits 0-3 the surfaces that process holds (surface k as its own `surface-k`, or inside a region holding it whole: the display server's and the GPU service's `surfaces`), bit 8 the Settings capability (the map, the attest screen: the system's window management), bit 9 a kist (`CALLER_*`); NOTHING for a token that is no reply this process holds, or one for the kernel's own call. No capability: the token is the proof, and only the server the call came to holds it. A kernel from before answers ERR (no such syscall), which a server takes as a refusal.
+/// caller(reply): what the process behind a call holds that its server decides by (2026-11-12, the display's isolation: until then any app could show, draw into, raise or read the events of another app's surface by naming it). x0 the offset of a reply token the caller holds (SYS_RECV's, not yet replied) → bits 32 to 47 the surface slots that process holds (slot k as its own, or inside a region holding it whole: the display server's and the GPU service's `surfaces`; bits 0 to 3 for four surfaces until 2026-11-12), bit 8 the Settings capability (the map, the attest screen: the system's window management), bit 9 a kist (`CALLER_*`); NOTHING for a token that is no reply this process holds, or one for the kernel's own call. No capability: the token is the proof, and only the server the call came to holds it. A kernel from before answers ERR (no such syscall), which a server takes as a refusal.
 const SYS_CALLER: u64 = 42;
 /// notify(op, …): notes, what kists have waiting on the person (notify.rs, docs/NOTIFY.md; owner, 2026-11-12: "I think we try it with the in view, it can notify me, out of view, silent"). No capability for a kist: the kernel knows it by its capsule. Op 0 post: x1/x2 a note (ferros_kist::note, at most note::MAX bytes), a kist's own; or, from a Settings holder that is not a kist, x3 its Settings token and x4 a 32-byte source, the system's note on a kist's behalf → the note's number (0-15) | the kind the kernel decided << 8; NOTHING nobody present, or the kist at a count (WAITING waiting, or POSTS since the person last looked); ERR not a note. Op 1 withdraw: x1 the number (G#FF all) of the caller's own, or the system's with x2 a Settings token and x3 the source → how many went. Op 2, a kist: the note the person opened (x1 its number, x2/x3 a buffer) → the document's length (written whole if it fits), NOTHING when that is not the one opened. Ops 3-6 for a Settings holder that is not a kist (the deck): 3 the list (x1 the token, x2/x3 a buffer) → how many, each `notify::REC` bytes; 4 the doorbell (x1 a word, x2 the token; `BELL_NOTES`); 5 seen (x1 the token, x2 a 32-byte source, x3 a number or G#FF, x4 1 the person opened that note) → how many went; 6 one note's document (x1 the token, x2 [source 32][number u8], x3/x4 a buffer) → its length, NOTHING none. ERR for anything else.
 const SYS_NOTIFY: u64 = 43;
@@ -1470,7 +1470,7 @@ pub const PREF_THEME: usize = 5;
 pub const PREF_PROX_WAKE: usize = 6;
 /// Preference 7: the light scope, 0 off or 1–6 the VD6282 channel its 16 kHz trace follows (in the sensor's register order, VD6283 datasheet: 1 red, 2 visible, 3 blue, 4 green, 5 IR, 6 clear — provisional for the VD6282) (usf.rs, the display's scope widget).
 pub const PREF_SCOPE: usize = 7;
-/// Preference 12: the keyboard layout on the honeycomb (honeycomb::Layout), 0 Dvorak (the default, owner 2026-10-27) or 1 QWERTY with Q on the bottom row. Bytes 8-11 are the surfaces' generations, 16-31 the wall clock; the language is in the second block (PREF_LANG).
+/// Preference 12: the keyboard layout on the honeycomb (honeycomb::Layout), 0 Dvorak (the default, owner 2026-10-27) or 1 QWERTY with Q on the bottom row. Bytes 8-11 were the surfaces' generations until 2026-11-12 (the windows' bell carries them since, and the kernel leaves them zero), 16-31 the wall clock; the language is in the second block (PREF_LANG).
 pub const PREF_LAYOUT: usize = 12;
 /// How many layouts the honeycomb carries: the valid range of PREF_LAYOUT.
 pub const LAYOUTS: u8 = 2;
@@ -1484,7 +1484,7 @@ pub const PREF_RADIOS_OFF: usize = 15;
 pub const SCALE_REACH: i8 = 64;
 /// How many themes ferros_sys carries (ferros_sys::theme::THEMES): the valid range of PREF_THEME.
 pub const THEMES: u8 = 4;
-/// The second preferences block in the grants page: preferences 32-47 at G#FB0, the 16 bytes under the first block that no token reaches (the tokens, 32 bytes each from G#204, end at G#FA4 with the 109th, the most the page has ever held), so the page holds as many grants as before. The first block is full (bytes 8-11 the surfaces, 16-31 the wall clock). A kernel older than it leaves these bytes zero, which reads as each one's default.
+/// The second preferences block in the grants page: preferences 32-47 at G#FB0, the 16 bytes under the first block that no token reaches (the tokens, 32 bytes each from G#204, end at G#FA4 with the 109th, the most the page has ever held), so the page holds as many grants as before. The first block is full (bytes 8-11 the surfaces' until 2026-11-12, zero since, 16-31 the wall clock). A kernel older than it leaves these bytes zero, which reads as each one's default.
 pub const PREFS_HI: usize = 0xFB0;
 /// Preferences 32-38, the language (lang.rs; written by the kernel only, never thru SYS_SET_PREF): 32-33 the language in effect, 34-35 this device's own, 36-37 the identity's as its service last wrote it, each a packed ISO 639-3 code (vsf `wl`'s letters, little-endian; 0 none, English); 38 whether the device keeps its own (1) or follows the identity's (0, the default).
 pub const PREF_LANG: usize = 32;
@@ -1700,80 +1700,192 @@ pub static DMA: &[Dma] = &[
     Dma { name: "display-heap", base: crate::cachemap::DISPLAY_HEAP.0, size: crate::cachemap::DISPLAY_HEAP.1 - crate::cachemap::DISPLAY_HEAP.0 },
     // The display's four temporal dither phases (cachemap DISPLAY_PHASES), non-cacheable like the framebuffer.
     Dma { name: "display-phases", base: crate::cachemap::DISPLAY_PHASES.0, size: crate::cachemap::DISPLAY_PHASES.1 - crate::cachemap::DISPLAY_PHASES.0 },
-    // The apps' surfaces (cachemap SURFACES): all four, the display server's (it composes them) and the map's (it passes one to each app it starts).
-    Dma { name: "surfaces", base: crate::cachemap::SURFACES.0, size: crate::cachemap::SURFACES.1 - crate::cachemap::SURFACES.0 },
-    // Each surface alone: what an app holds. Given out by `NewSurface`, freed when its process ends (`SURFACE_OWNER`). Must stay consecutive and in order: `SURFACE0 + k` is surface k.
-    Dma { name: "surface-0", base: crate::cachemap::SURFACES.0, size: crate::cachemap::SURFACE_SIZE },
-    Dma { name: "surface-1", base: crate::cachemap::SURFACES.0 + crate::cachemap::SURFACE_SIZE, size: crate::cachemap::SURFACE_SIZE },
-    Dma { name: "surface-2", base: crate::cachemap::SURFACES.0 + 2 * crate::cachemap::SURFACE_SIZE, size: crate::cachemap::SURFACE_SIZE },
-    Dma { name: "surface-3", base: crate::cachemap::SURFACES.0 + 3 * crate::cachemap::SURFACE_SIZE, size: crate::cachemap::SURFACE_SIZE },
+    // The apps' surfaces (cachemap SURF_VA): the whole window, every slot, the display server's (it composes them), the GPU service's (it maps a client's into its view) and init's (it passes one to each app it starts).
+    Dma { name: "surfaces", base: crate::cachemap::SURF_VA.0, size: crate::cachemap::SURF_VA.1 - crate::cachemap::SURF_VA.0 },
+    // Each slot alone: what an app holds. Given out by `NewSurface`, its frames taken then from the pool and given back when its process ends (`surface_take`, `surfaces_free`). Must stay consecutive and in order: `surface0() + k` is slot k. Never granted by name (`resolve`), only given.
+    surface_slot(0), surface_slot(1), surface_slot(2), surface_slot(3), surface_slot(4), surface_slot(5), surface_slot(6), surface_slot(7),
+    surface_slot(8), surface_slot(9), surface_slot(10), surface_slot(11), surface_slot(12), surface_slot(13), surface_slot(14), surface_slot(15),
     // The display's sprite cache (cachemap DISPLAY_SPRITES): cacheable, the display server's alone.
     Dma { name: "display-sprites", base: crate::cachemap::DISPLAY_SPRITES.0, size: crate::cachemap::DISPLAY_SPRITES.1 - crate::cachemap::DISPLAY_SPRITES.0 },
     // The display's 16-bit canvas (cachemap DISPLAY_CANVAS): its back buffer.
     Dma { name: "display-canvas", base: crate::cachemap::DISPLAY_CANVAS.0, size: crate::cachemap::DISPLAY_CANVAS.1 - crate::cachemap::DISPLAY_CANVAS.0 },
 ];
 
-/// The surfaces a spawn can give out, and where the first is in `DMA`.
-pub const SURFACE_COUNT: usize = 4;
+/// Slot k of the surfaces' window as a DMA region (`DMA`): its addresses, whatever frames are behind them.
+const fn surface_slot(k: usize) -> Dma {
+    Dma { name: "surface", base: crate::cachemap::SURF_VA.0 + k * crate::cachemap::SURFACE_SIZE, size: crate::cachemap::SURFACE_SIZE }
+}
+
+/// The surfaces a spawn can give out at once (cachemap SURFACE_SLOTS), and where the first slot is in `DMA`.
+pub const SURFACE_SLOTS: usize = crate::cachemap::SURFACE_SLOTS;
+const _: () = assert!(SURFACE_SLOTS == 16, "the DMA table lists sixteen surface slots");
 fn surface0() -> usize {
-    DMA.iter().position(|r| r.name == "surface-0").unwrap()
+    DMA.iter().position(|r| r.name == "surface").unwrap()
 }
-/// Each surface's owner, by process epoch (0: free). Under the kernel lock.
-static mut SURFACE_OWNER: [u64; SURFACE_COUNT] = [0; SURFACE_COUNT];
-/// Bytes 8-11 of the preferences block: each surface's generation, 0 while it is free and a new nonzero value each time it is given out. The display server reads them on every pass: a window whose surface's byte changed or went to 0 belongs to a process that has ended (WINDOWS.md: the death notice, with no message to send).
-pub const PREF_SURFACES: usize = 8;
-static mut SURFACE_GEN: u8 = 0;
+/// The frames behind one surface.
+const SURFACE_FRAMES: usize = crate::cachemap::SURFACE_SIZE / crate::frames::FRAME;
 
-/// Give surface k to the process with `epoch`: the first free one, its generation byte to every process. Under the lock.
-fn surface_take(epoch: u64) -> Option<usize> {
-    let owners = unsafe { &mut *(&raw mut SURFACE_OWNER) };
-    let draining = unsafe { GPU_DRAINING } >> 8;
-    let k = (0..SURFACE_COUNT).find(|&k| owners[k] == 0 && draining >> k & 1 == 0)?;
-    owners[k] = epoch;
-    // Wiped as it is given (2026-11-12): the GPU writes a surface its owner holds (GPU-KISTS.md plan step 1), and neither its kernels nor its CPU read the last owner's pixels.
-    wipe(crate::cachemap::SURFACES.0 + k * crate::cachemap::SURFACE_SIZE, crate::cachemap::SURFACE_SIZE);
-    // The generation cycles 1-255: 0 means free.
-    let g = unsafe { SURFACE_GEN = SURFACE_GEN % 255 + 1; SURFACE_GEN };
-    unsafe { (*(&raw mut PREFS_NOW))[PREF_SURFACES + k] = g };
-    write_pref_all(PREF_SURFACES + k, g);
-    Some(k)
+/// A slot of the surfaces' window (2026-11-12, owner: replace the fixed four with surfaces taken on demand): whose it is (a process epoch, 0 free), its generation (1 to 15, a new one each time the slot is given out, so a window shown under the last owner's never passes for the new owner's), and the frames behind it while `held` (given out, or given back but still draining a GPU job: `surface_release` returns them).
+#[derive(Clone, Copy)]
+struct Slot {
+    owner: u64,
+    generation: u8,
+    held: bool,
+    frames: [u32; SURFACE_FRAMES],
+}
+/// Every slot. Under the kernel lock.
+static mut SLOTS: [Slot; SURFACE_SLOTS] = [Slot { owner: 0, generation: 0, held: false, frames: [0; SURFACE_FRAMES] }; SURFACE_SLOTS];
+/// The blank frame every slot not held maps in each of its blocks (cachemap SURF_VA), taken from the pool with the first surface given out (frames.rs index; None until then, every slot unmapped). Zeroed then and never anyone's: the display may write a glyph into it, racing a window whose owner just ended, and read it back, and no process's pixels are ever there.
+static mut SURFACE_BLANK: Option<usize> = None;
+/// Slots (bit k) whose owner ended while a job of its was on the GPU: their frames kept and the slot not given out again until the GPU service has taken its next request, so that job, still running, writes nothing a new owner holds (`gpu_drain`, `gpu_drained`). Under the kernel lock.
+static mut SURF_DRAINING: u32 = 0;
+
+/// Give the process with `epoch` a surface: the first free slot, 16 frames from the top of the pool (frames.rs `take_top`, zeroed as they are taken: the last owner's pixels are never the next one's, on the CPU or the GPU), mapped in the slot (cachemap `surface_map`) and admitted thru the GPU's fence (s2mpu `gpu_admit`), its generation new. The slot's index, or why none was given. Under the lock.
+fn surface_take(epoch: u64) -> Result<usize, &'static str> {
+    let slots = unsafe { &mut *(&raw mut SLOTS) };
+    let k = slots.iter().position(|s| s.owner == 0 && !s.held).ok_or("no free surface (all sixteen are in use)")?;
+    // The first surface: the blank frame for every slot not held, so a slot given back always maps something.
+    if unsafe { SURFACE_BLANK }.is_none() {
+        let b = crate::frames::take_top().ok_or("the frame pool has too few free frames for a surface")?;
+        unsafe { SURFACE_BLANK = Some(b) };
+        for s in 0..SURFACE_SLOTS {
+            surface_map_slot(s, &[b as u32; SURFACE_FRAMES]);
+        }
+    }
+    let mut frames = [0u32; SURFACE_FRAMES];
+    for j in 0..SURFACE_FRAMES {
+        match crate::frames::take_top() {
+            Some(f) => frames[j] = f as u32,
+            None => {
+                for &f in &frames[..j] {
+                    crate::frames::give(f as usize);
+                }
+                return Err("the frame pool has too few free frames for a surface");
+            }
+        }
+    }
+    surface_map_slot(k, &frames);
+    for &f in &frames {
+        crate::s2mpu::gpu_admit(crate::frames::pa(f as usize), true);
+    }
+    crate::s2mpu::gpu_sync();
+    let s = &mut slots[k];
+    // The step: 1 to 15 in turn, 0 being free (the windows' bell holds four bits a slot).
+    s.generation = s.generation % 15 + 1;
+    s.owner = epoch;
+    s.held = true;
+    s.frames = frames;
+    surface_pref(k, s.generation);
+    Ok(k)
 }
 
-/// The surfaces of the process with `epoch` back to free, and the windows' owners rung (`surfaces_ring`). Under the lock.
+/// Slot k's blocks pointed at `frames` (each 2 MiB block one frame) and every core's TLB told.
+fn surface_map_slot(k: usize, frames: &[u32; SURFACE_FRAMES]) {
+    let va = crate::cachemap::SURF_VA.0 + k * crate::cachemap::SURFACE_SIZE;
+    for (j, &f) in frames.iter().enumerate() {
+        crate::cachemap::surface_map(va + j * crate::frames::FRAME, crate::frames::pa(f as usize));
+    }
+    crate::cachemap::surface_unmapped(va, crate::cachemap::SURFACE_SIZE);
+}
+
+/// Slot k's frames back to the pool: the slot mapping the blank frame first and every TLB told, the frames shut out of the GPU's fence, then each wiped as it goes back (frames.rs `give`). Only once nothing of its owner's can still write them: its process ended and no GPU job of it running (`surfaces_free`, `gpu_drained`). Under the lock.
+fn surface_release(k: usize) {
+    let slots = unsafe { &mut *(&raw mut SLOTS) };
+    let frames = slots[k].frames;
+    // A slot held means a surface was given out, and the first one given made the blank.
+    let b = unsafe { SURFACE_BLANK }.unwrap() as u32;
+    surface_map_slot(k, &[b; SURFACE_FRAMES]);
+    for &f in &frames {
+        crate::s2mpu::gpu_admit(crate::frames::pa(f as usize), false);
+    }
+    crate::s2mpu::gpu_sync();
+    for &f in &frames {
+        crate::frames::give(f as usize);
+    }
+    slots[k].held = false;
+}
+
+/// The surfaces of the process with `epoch` back to free, their frames to the pool (or held back while a GPU job of its runs, `gpu_drain`), and the windows' owners rung (`surfaces_ring`). Under the lock.
 fn surfaces_free(epoch: u64) {
-    let owners = unsafe { &mut *(&raw mut SURFACE_OWNER) };
-    for k in 0..SURFACE_COUNT {
-        if owners[k] == epoch {
-            owners[k] = 0;
-            unsafe { (*(&raw mut PREFS_NOW))[PREF_SURFACES + k] = 0 };
-            write_pref_all(PREF_SURFACES + k, 0);
+    let slots = unsafe { &mut *(&raw mut SLOTS) };
+    let draining = unsafe { SURF_DRAINING };
+    for k in 0..SURFACE_SLOTS {
+        if slots[k].owner == epoch {
+            slots[k].owner = 0;
+            surface_pref(k, 0);
+            if draining >> k & 1 == 0 {
+                surface_release(k);
+            }
         }
     }
     surfaces_ring();
 }
 
-/// The surfaces' bell word as last rung (`BELL_SURFACES`): byte k surface k's live generation, the change count above bit 32.
-static SURFACES_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// The windows' owners, from the kernel's own table (owner, 2026-11-11, on the Pro: Mahere killed with `diag kill`, its window stayed in the display's table, op 5 still said an app was in front, and the map ignored every gesture but the corners until the display was restarted): each surface's generation while the process it was given to is alive and not ending, 0 otherwise, rung into the display's bell word when that differs from what was rung last, waking its thread there. Not a copy in each process's preferences page, read on the display's next pass: the kernel's answer to "is this window's owner alive", pushed as it changes. Called where a surface changes hands: freed (every end, `end_process` and `kill_locked` alike, thru `surfaces_free`) and given (once its process is in the table, `build_from`). Under the lock.
-fn surfaces_ring() {
-    let kk = k();
-    let owners = unsafe { &*(&raw const SURFACE_OWNER) };
-    let prefs = unsafe { &*(&raw const PREFS_NOW) };
-    let mut live = 0u64;
-    for s in 0..SURFACE_COUNT {
-        let o = owners[s];
-        if o != 0 && kk.procs.iter().flatten().any(|p| p.epoch == o && !p.dying) {
-            live |= (prefs[PREF_SURFACES + s] as u64) << (8 * s);
+/// The GPU fence's tables made again (s2mpu `fence_gpu`): every held slot's frames admitted, as they were. Under the lock.
+pub fn surfaces_refence() {
+    let slots = unsafe { &*(&raw const SLOTS) };
+    for s in slots.iter().filter(|s| s.held) {
+        for &f in &s.frames {
+            crate::s2mpu::gpu_admit(crate::frames::pa(f as usize), true);
         }
     }
-    let was = SURFACES_LIVE.load(core::sync::atomic::Ordering::Acquire);
-    if was & 0xFFFF_FFFF == live {
+}
+
+/// `diag arcs`'s surfaces: each slot held, its owner, generation and frames' first address.
+fn surfaces_report(s: &mut alloc::string::String) {
+    let kk = k();
+    let slots = unsafe { &*(&raw const SLOTS) };
+    let mut n = 0;
+    for (k, slot) in slots.iter().enumerate().filter(|(_, x)| x.held) {
+        n += 1;
+        let name = kk.procs.iter().flatten().find(|p| p.epoch == slot.owner).map(|p| core::str::from_utf8(&p.name).unwrap_or("?")).unwrap_or(if slot.owner == 0 { "(draining)" } else { "(ended)" });
+        let _ = core::fmt::Write::write_fmt(s, format_args!("surface A#{k} {name} generation A#{} at G#{:X} frames from G#{:X}\n", slot.generation, crate::cachemap::SURF_VA.0 + k * crate::cachemap::SURFACE_SIZE, crate::frames::pa(slot.frames[0] as usize)));
+    }
+    let _ = core::fmt::Write::write_fmt(s, format_args!("surfaces: A#{n} of A#{SURFACE_SLOTS} held, A#{} MiB\n", n * (crate::cachemap::SURFACE_SIZE >> 20)));
+}
+
+/// The surface slots' bell word as last rung (`BELL_SLOTS`): bits 4k to 4k + 3 slot k's live generation, 0 for a slot whose owner has ended or that nobody holds.
+static SLOTS_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The old surfaces' bell word as last rung (`BELL_SURFACES`, for a display from before 2026-11-12, which knows four surfaces): byte k slot k's live generation for slots 0 to 3, the change count above bit 32.
+static SURFACES_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Bytes 8-11 of the preferences block: slots 0 to 3's generations, 0 while free, for a display from before 2026-11-12 (it reads them beside `BELL_SURFACES`); the slots' bell alone carries them all.
+const PREF_SURFACES: usize = 8;
+/// How many slots a display from before knows.
+const SURFACES_OLD: usize = 4;
+
+/// Slot k's preference byte, for a display from before (`PREF_SURFACES`): its generation, or 0. Under the lock.
+fn surface_pref(k: usize, g: u8) {
+    if k < SURFACES_OLD {
+        unsafe { (*(&raw mut PREFS_NOW))[PREF_SURFACES + k] = g };
+        write_pref_all(PREF_SURFACES + k, g);
+    }
+}
+
+/// The windows' owners, from the kernel's own table (owner, 2026-11-11, on the Pro: Mahere killed with `diag kill`, its window stayed in the display's table, op 5 still said an app was in front, and the map ignored every gesture but the corners until the display was restarted): each slot's generation while the process it was given to is alive and not ending, 0 otherwise, rung into the display's bell word when that differs from what was rung last, waking its thread there; and the first four in the old form (`BELL_SURFACES`). Called where a surface changes hands: freed (every end, `end_process` and `kill_locked` alike, thru `surfaces_free`) and given (once its process is in the table, `build_from`). A slot's generation changes each time it is given, so the word comes back to a value it held while a slot changed hands in between only after fifteen hand-outs of that slot between two of the display's looks. Under the lock.
+fn surfaces_ring() {
+    let kk = k();
+    let slots = unsafe { &*(&raw const SLOTS) };
+    let mut live = 0u64;
+    for (s, slot) in slots.iter().enumerate() {
+        if slot.owner != 0 && kk.procs.iter().flatten().any(|p| p.epoch == slot.owner && !p.dying) {
+            live |= (slot.generation as u64) << (4 * s);
+        }
+    }
+    if SLOTS_LIVE.load(core::sync::atomic::Ordering::Acquire) == live {
         return;
     }
-    let v = ((was >> 32) + 1) << 32 | live;
-    SURFACES_LIVE.store(v, core::sync::atomic::Ordering::Release);
-    bell_ring(BELL_SURFACES, v);
+    SLOTS_LIVE.store(live, core::sync::atomic::Ordering::Release);
+    bell_ring(BELL_SLOTS, live);
+    let mut old = 0u64;
+    for s in 0..SURFACES_OLD {
+        old |= ((live >> (4 * s)) & 15) << (8 * s);
+    }
+    let was = SURFACES_LIVE.load(core::sync::atomic::Ordering::Acquire);
+    if was & 0xFFFF_FFFF != old {
+        let v = ((was >> 32) + 1) << 32 | old;
+        SURFACES_LIVE.store(v, core::sync::atomic::Ordering::Release);
+        bell_ring(BELL_SURFACES, v);
+    }
 }
 
 /// The layer arena's blocks in `DMA` (`layers-block`): the whole, its halves, its quarters.
@@ -1783,7 +1895,7 @@ fn block0() -> usize {
 }
 /// Each block's owner, by process epoch (0: free). Under the kernel lock.
 static mut BLOCK_OWNER: [u64; LAYER_BLOCKS] = [0; LAYER_BLOCKS];
-/// Blocks (bit j) and surfaces (bit 8 + k) whose owner ended while a job of its was on the GPU: not given out again until the GPU service has taken its next request, so that job, still running, writes nothing a new owner holds (`gpu_drain`). Under the kernel lock.
+/// Blocks (bit j) whose owner ended while a job of its was on the GPU: not given out again until the GPU service has taken its next request, so that job, still running, writes nothing a new owner holds (`gpu_drain`; the surfaces' own are `SURF_DRAINING`). Under the kernel lock.
 static mut GPU_DRAINING: u16 = 0;
 
 /// DMA region `i`'s base and size as this board has it: the whole arena as `cachemap::layers` gives it (akita's upper half alone until 2026-11-12); every other region as `DMA` lists it.
@@ -1840,69 +1952,90 @@ fn gpu_job_in_flight(pi: usize) -> bool {
     kk.procs.iter().flatten().any(|q| q.cspace.iter().any(|c| matches!(c.object, Object::Endpoint(e) if e == ep) && c.rights & RIGHT_RECV != 0) && q.cspace.iter().any(|c| matches!(c.object, Object::Reply(t) if mine(t))))
 }
 
-/// A process ending with a GPU job in flight (`gpu_job_in_flight`): its blocks and surfaces held back from the next owner until the GPU service takes its next request (`gpu_drained`). The service runs one job at a time and ends a job it gives up on (its group terminated) before it takes the next request, so by then nothing of the ended process's runs on the GPU. Called before its blocks and surfaces are freed. Under the lock.
+/// A process ending with a GPU job in flight (`gpu_job_in_flight`): its blocks and surfaces held back from the next owner until the GPU service takes its next request (`gpu_drained`), a surface's frames kept in the pool's stead. The service runs one job at a time and ends a job it gives up on (its group terminated) before it takes the next request, so by then nothing of the ended process's runs on the GPU. Called before its blocks and surfaces are freed. Under the lock.
 fn gpu_drain(epoch: u64) {
     let owners = unsafe { &*(&raw const BLOCK_OWNER) };
-    let surf = unsafe { &*(&raw const SURFACE_OWNER) };
-    let mut d = unsafe { GPU_DRAINING };
+    let slots = unsafe { &*(&raw const SLOTS) };
     for (j, &o) in owners.iter().enumerate() {
         if o == epoch {
-            d |= 1 << j;
+            unsafe { GPU_DRAINING |= 1 << j };
         }
     }
-    for (k, &o) in surf.iter().enumerate() {
-        if o == epoch {
-            d |= 1 << (8 + k);
+    for (k, s) in slots.iter().enumerate() {
+        if s.owner == epoch {
+            unsafe { SURF_DRAINING |= 1 << k };
         }
     }
-    unsafe { GPU_DRAINING = d };
 }
 
-/// The kernel's stamp ahead of every call on the `gpu` endpoint (GPU-KISTS.md plan step 1, 2026-11-12; ferros_sys::gpu `Stamp` reads it): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build][n u8][n × (base u64, size u64)], the regions every GPU-reachable DMA grant it holds (inside this board's layer arena or the apps' surfaces: its block, its surfaces). Written here, in front of the caller's bytes, for every call, so no caller can write one: the service maps a client's address space from these regions and from nothing a client says. Under the lock.
+/// The kernel's stamp ahead of every call on the `gpu` endpoint (GPU-KISTS.md plan step 1, 2026-11-12; ferros_sys::gpu `Stamp` reads it): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build, bit 2 frames follow][n u8][n × (base u64, size u64)][then, for each region in the surfaces' window in the order listed, its 16 frames' physical addresses, u64 each], the regions of every GPU-reachable DMA grant it holds: its block of this board's layer arena, each surface it holds (one slot, at its address in the window). Written here, in front of the caller's bytes, for every call, so no caller can write one: the service maps a client's address space from these regions and frames and from nothing a client says. A holder of the whole window (the display, init) is stamped with none of it: no client's surface is its to have the GPU write. Under the lock.
 fn gpu_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
     let (l0, l1) = crate::cachemap::layers();
-    let (s0, s1) = crate::cachemap::SURFACES;
     let inside = |b: usize, n: usize, lo: usize, hi: usize| lo != hi && b >= lo && b + n <= hi;
+    let slots = unsafe { &*(&raw const SLOTS) };
+    let s0 = surface0();
     let mut regions: Vec<(usize, usize)> = Vec::new();
+    let mut frames: Vec<u64> = Vec::new();
     for c in &p.cspace {
         if let Object::Dma(i) = c.object {
             let (b, n) = region(i);
-            if n > 0 && (inside(b, n, l0, l1) || inside(b, n, s0, s1)) && !regions.contains(&(b, n)) {
+            if regions.contains(&(b, n)) {
+                continue;
+            }
+            if n > 0 && inside(b, n, l0, l1) {
                 regions.push((b, n));
+            } else if DMA[i].name == "surface" && slots[i - s0].held {
+                regions.push((b, n));
+                frames.extend(slots[i - s0].frames.iter().map(|&f| crate::frames::pa(f as usize) as u64));
             }
         }
     }
-    let mut out = Vec::with_capacity(10 + 16 * regions.len() + msg.len());
+    let mut out = Vec::with_capacity(10 + 16 * regions.len() + 8 * frames.len() + msg.len());
     out.extend_from_slice(&p.epoch.to_le_bytes());
-    out.push(p.kist as u8 | (cfg!(ferros_production) as u8) << 1);
+    out.push(p.kist as u8 | (cfg!(ferros_production) as u8) << 1 | 1 << 2);
     // WHY no check: a process holds a handful of DMA grants (init, the most, about a dozen), far under the byte's 255.
     out.push(regions.len() as u8);
     for (b, n) in regions {
         out.extend_from_slice(&(b as u64).to_le_bytes());
         out.extend_from_slice(&(n as u64).to_le_bytes());
     }
+    for f in frames {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
     out.extend_from_slice(&msg);
     out
 }
 
-/// The GPU service took a request: whatever waited for its last job to end may be given out again. Under the lock.
+/// The GPU service took a request: whatever waited for its last job to end may be given out again, a drained surface's frames back to the pool. Under the lock.
 fn gpu_drained() {
     unsafe { GPU_DRAINING = 0 };
+    let slots = unsafe { &*(&raw const SLOTS) };
+    let d = unsafe { SURF_DRAINING };
+    unsafe { SURF_DRAINING = 0 };
+    for k in 0..SURFACE_SLOTS {
+        if d >> k & 1 == 1 && slots[k].owner == 0 && slots[k].held {
+            surface_release(k);
+        }
+    }
 }
 
-/// What process `p` holds that a server decides by (SYS_CALLER): bit k surface k, held as its own `surface-k` or inside a region that holds it whole; `CALLER_SETTINGS` for the Settings capability; `CALLER_KIST` for a kist. From its capability table, so a surface passed on at a spawn counts for both holders, and one freed at an end for neither (the table goes with the process).
+/// SYS_CALLER's bit for surface slot k: bit `CALLER_SURFACE0 + k` (bits 32 to 47 since 2026-11-12, sixteen slots; until then bits 0 to 3).
+pub const CALLER_SURFACE0: u32 = 32;
+
+/// What process `p` holds that a server decides by (SYS_CALLER): bit `CALLER_SURFACE0 + k` for surface slot k (and bit k for slots 0 to 3, the old layout), held as its own or inside a region that holds it whole (the display's and the GPU service's whole window); `CALLER_SETTINGS` for the Settings capability; `CALLER_KIST` for a kist. From its capability table, so a surface passed on at a spawn counts for both holders, and one freed at an end for neither (the table goes with the process).
 fn caller_holds(p: &Process) -> u64 {
-    let s0 = crate::cachemap::SURFACES.0;
+    let s0 = crate::cachemap::SURF_VA.0;
     let size = crate::cachemap::SURFACE_SIZE;
     let mut bits = (p.kist as u64) * CALLER_KIST;
     for c in &p.cspace {
         match c.object {
             Object::Dma(i) => {
                 let (b, n) = region(i);
-                for k in 0..SURFACE_COUNT {
+                for k in 0..SURFACE_SLOTS {
                     let at = s0 + k * size;
                     if b <= at && at + size <= b + n {
-                        bits |= 1 << k;
+                        // Slots 0 to 3 at bits 0 to 3 as well, for a display from before (four surfaces), which reads them there.
+                        bits |= 1 << (CALLER_SURFACE0 as usize + k) | if k < SURFACES_OLD { 1 << k } else { 0 };
                     }
                 }
             }
@@ -3816,6 +3949,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 bell_register(p, pi, source, f.x[1], BELL_COUNT[source].load(core::sync::atomic::Ordering::Acquire))
             } else if source == BELL_SURFACES && holds_surfaces(p) {
                 bell_register(p, pi, source, f.x[1], SURFACES_LIVE.load(core::sync::atomic::Ordering::Acquire))
+            } else if source == BELL_SLOTS && holds_surfaces(p) {
+                bell_register(p, pi, source, f.x[1], SLOTS_LIVE.load(core::sync::atomic::Ordering::Acquire))
             } else {
                 ERR
             };
@@ -4091,6 +4226,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let key = take(kl);
             let n = take(1).first().copied().unwrap_or(0) as usize;
             let mut objects = Vec::new();
+            // Where the whole surfaces region was passed: (place in `objects`, its index in `DMA`).
+            let mut whole: Vec<(usize, usize)> = Vec::new();
             let mut bad = false;
             // Which of the request's tokens was refused first, for the console line (2026-11-05: init's 104th slot onward).
             let mut bad_at = usize::MAX;
@@ -4101,8 +4238,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         bad = true;
                         bad_at = bad_at.min(j);
                     }
-                    // The whole surfaces region passes as one surface of it, the child's own.
-                    Some((Object::Dma(i), r)) if DMA[i].name == "surfaces" => objects.push((Object::NewSurface, r)),
+                    // The whole surfaces region passes as one surface of it, the child's own (but to the display server, below).
+                    Some((Object::Dma(i), r)) if DMA[i].name == "surfaces" => {
+                        whole.push((objects.len(), i));
+                        objects.push((Object::NewSurface, r))
+                    }
                     // The whole layer arena passes as a 32 MiB block of it, the child's own (GPU-KISTS.md plan step 1, 2026-11-12): init hands the attest screen its region this way.
                     Some((Object::Dma(i), r)) if DMA[i].name == "arena" => objects.push((Object::NewRegion(25), r)),
                     // A block of the arena is its owner's alone: freed when that owner ends (`regions_free`), it could not stay a child's.
@@ -4111,6 +4251,12 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         bad_at = bad_at.min(j);
                     }
                     Some(o) => objects.push(o),
+                }
+            }
+            // The display server keeps the whole window (2026-11-12): it composes every surface and watches their owners (`BELL_SURFACES`), and a slot of its own was a surface it never drew in that counted against everyone else's (with four, the attest screen's two and one app's left Photon none on the Pro). The server of `display` is that process, whatever its name.
+            if objects.iter().any(|o| matches!(o, (Object::Endpoint(e), r) if *e == endpoint(b"display") && r & RIGHT_RECV != 0)) {
+                for &(at, i) in &whole {
+                    objects[at].0 = Object::Dma(i);
                 }
             }
             // A child handed the Settings capability (the map: the quick row's torch, QUICK.md) gets the torch's send right too, as the slot after its last: init's grants page is full (108 slots), so init cannot hold one to pass on, and the torch's server is the kernel's to start anyway (`ON_DEMAND`, docs/TORCH.md). Who may set the device's settings may light its torch.
@@ -4307,7 +4453,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 // x1 = 1: the region's size in bytes instead (2026-11-11: the GPU service maps the layer arena by it, which grew from 64 to 128 MiB; a kernel from before answers the base to every call, which a caller tells by its being far past any size).
                 Some(Object::Dma(i)) if region(i).1 > 0 && f.x[1] == 1 => region(i).1 as u64,
                 // A surface is answered past its porch (cachemap SURFACE_PORCH); every other region at its base.
-                Some(Object::Dma(i)) if region(i).1 > 0 => (region(i).0 + if DMA[i].name.starts_with("surface-") { crate::cachemap::SURFACE_PORCH } else { 0 }) as u64,
+                Some(Object::Dma(i)) if region(i).1 > 0 => (region(i).0 + if DMA[i].name == "surface" { crate::cachemap::SURFACE_PORCH } else { 0 }) as u64,
                 _ => ERR,
             };
             0
@@ -4542,7 +4688,9 @@ const BELL_SURFACES: usize = 9;
 const BELL_OFFERS: usize = 10;
 /// The notes' (SYS_NOTIFY op 4, for a Settings holder): a note posted, revised, withdrawn, seen, past its deadline, or the person's loaded or gone (notify.rs).
 const BELL_NOTES: usize = 11;
-const BELLS: usize = 12;
+/// The surface slots' (2026-11-12), for the holder of the `surfaces` region: its word is `SLOTS_LIVE`, four bits a slot, no count. `BELL_SURFACES` stays in its old form (slots 0 to 3) for a display from before.
+const BELL_SLOTS: usize = 12;
+const BELLS: usize = 13;
 /// Each source's change count (the claims' is GPS_CLAIMS'), so a word registered late starts from the count now and a reader tells a change by inequality.
 static BELL_COUNT: [core::sync::atomic::AtomicU64; BELLS] = [const { core::sync::atomic::AtomicU64::new(0) }; BELLS];
 /// The bells' words (SYS_BELL, SYS_CLAIM op 4, SYS_NOT_STARTED op 1): (the process's slot, its epoch, the word's address in its arc, the source). At most one a source a process. Under the kernel lock.
@@ -5606,11 +5754,10 @@ fn kist_request(p: &Process, req: &[u8], replace: bool, stop: bool) -> u64 {
         kill_locked(&name);
     } else if alive {
         // Running: the surface it was given and that surface's generation, so the launcher can bring its window to the front (display op 59; owner, 2026-11-11: a running kist's circle tapped raises it, never a second copy). A kist with no surface (none was free, or it asked for none): NOTHING, as before.
-        let owners = unsafe { &*(&raw const SURFACE_OWNER) };
-        let prefs = unsafe { &*(&raw const PREFS_NOW) };
-        let surface = kk.procs.iter().flatten().find(|q| q.name == name && !q.dying).and_then(|q| owners.iter().position(|&o| o == q.epoch));
+        let slots = unsafe { &*(&raw const SLOTS) };
+        let surface = kk.procs.iter().flatten().find(|q| q.name == name && !q.dying).and_then(|q| slots.iter().position(|s| s.owner == q.epoch));
         return match surface {
-            Some(s) => RUNNING_ON | (s as u64) << 8 | prefs[PREF_SURFACES + s] as u64,
+            Some(s) => RUNNING_ON | (s as u64) << 8 | slots[s].generation as u64,
             None => NOTHING,
         };
     } else if unsafe { &*(&raw const KIST_STARTING) }.as_slice() == name.as_slice() {
@@ -6194,12 +6341,12 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     for &(object, rights) in objects {
         let object = match object {
             Object::NewSurface => match surface_take(epoch) {
-                Some(s) => Object::Dma(surface0() + s),
+                Ok(s) => Object::Dma(surface0() + s),
                 // A spawn refused after a surface was given (a second surface, or the grants page full below) gives it back: no process of that epoch will ever end to free it, and a surface held by nobody is lost until a reboot.
-                None => {
+                Err(why) => {
                     surfaces_free(epoch);
                     regions_free(epoch);
-                    return Err("no free surface (four are in use)");
+                    return Err(why);
                 }
             },
             // A region of the arena: the largest free block up to 2^n, or an empty slot (the client then has no GPU memory and draws on the CPU, as without the GPU service).
@@ -6210,12 +6357,12 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
                     Object::Empty
                 }
             },
-            // The GPU mailbox's second surface: only beside a surface of its own already given, and only while another stays free for the next app's window.
+            // The GPU mailbox's second surface: only beside a surface of its own already given, and only while a slot and the frames for another stay free for the next app's window.
             Object::SpareSurface => {
-                let owners = unsafe { &*(&raw const SURFACE_OWNER) };
-                let free = owners.iter().filter(|&&o| o == 0).count();
-                let has = cspace.iter().any(|c| matches!(c.object, Object::Dma(i) if DMA[i].name.starts_with("surface-")));
-                match (has && free >= 2).then(|| surface_take(epoch)).flatten() {
+                let slots = unsafe { &*(&raw const SLOTS) };
+                let free = slots.iter().filter(|s| s.owner == 0 && !s.held).count();
+                let has = cspace.iter().any(|c| matches!(c.object, Object::Dma(i) if DMA[i].name == "surface"));
+                match (has && free >= 2 && crate::frames::free() >= 2 * SURFACE_FRAMES).then(|| surface_take(epoch).ok()).flatten() {
                     Some(s) => Object::Dma(surface0() + s),
                     None => Object::Empty,
                 }
@@ -6341,13 +6488,14 @@ fn handle_of(object: Object) -> (u64, u64) {
     (base as u64, (size - 1) as u64)
 }
 
-/// `diag arcs`: every process's arc, under the lock: name, base (its window's address), size, frames mapped, window, and the frame pool's state after them.
+/// `diag arcs`: every process's arc, under the lock: name, base (its window's address), size, frames mapped, window; then every surface held; and the frame pool's state after them.
 pub fn arcs_report() -> alloc::string::String {
     lock();
     let mut s = alloc::string::String::new();
     for p in k().procs.iter().flatten() {
         let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{} base G#{:X} size G#{:X} frames A#{} ceiling G#{:X} window G#{:X} {} grew A#{} shrank A#{} moved A#{} gave back A#{} MiB inside\n", core::str::from_utf8(&p.name).unwrap_or("?"), p.arc.base, p.arc.size, p.arc.mapped / crate::frames::FRAME, p.arc.ceiling, p.arc.window, if p.arc.guard != 0 { "masked" } else { "native" }, p.grows, p.shrinks, p.moves, p.holes.iter().map(|h| h.1 - h.0).sum::<usize>() >> 20));
     }
+    surfaces_report(&mut s);
     s.push_str(&crate::frames::pool_report());
     unlock();
     s

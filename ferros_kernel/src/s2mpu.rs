@@ -144,29 +144,123 @@ pub const GPU_S2MPU: usize = 0x1EE7_0000;
 /// pd_g3d's status in the PMU (GPU.md: a plain read, bit 0 on): the S2MPU is reachable only while it is on.
 const PD_G3D_STATUS: usize = 0x1546_1A84;
 static mut GPU_TABLE: Smpt = Smpt([0; 32768]);
-/// The second GiB's table: the apps' surfaces (cachemap SURFACES).
-static mut GPU_TABLE_SURFACES: Smpt = Smpt([0; 32768]);
 static GPU_RESULT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// How many of `gpu_sync`'s invalidations never completed (DIAG S2MPU_GPU_SYNC_LATE): none is expected.
+static GPU_SYNC_LATE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The GPU fence's other GiBs (2026-11-12, surfaces from the frame pool): (GiB, its table's address) for each GiB but gpu-mem's that a surface's frames have lain in, each table made as the first surface lands there (`gpu_table`) and kept (a table with no surface left in it admits nothing). Under the kernel lock.
+static mut GPU_GBS: [(usize, usize); GPU_GBS_MOST] = [(0, 0); GPU_GBS_MOST];
+static mut GPU_GBS_N: usize = 0;
+/// Where those tables live: one frame of the pool (frames.rs), taken at the first, sixteen tables of 128 KiB in its 2 MiB, each aligned to its size as the walker needs. The kernel's alone (cachemap `frame_block`) and inside no fence, so no device can rewrite the GPU's walls.
+static mut GPU_TABLES_FRAME: usize = 0;
+/// The most GiBs besides gpu-mem's a surface can lie in: the tables one frame holds, more than either board's map spans (husky's eleven: GiB 3 and the high bank's ten).
+const GPU_GBS_MOST: usize = 16;
 
-/// The GPU's fence: read and write to `gpu-mem` (cachemap GPU_MEM) and the layer arena (LAYERS, both in one GiB), and the apps' surfaces (SURFACES, in the GiB above), nothing else, for every VID (only the GPU sits behind it; which VID its traffic arrives as is not measured yet). G#E4: pd_g3d not powered (left alone).
+/// The GPU's fence: read and write to `gpu-mem` (cachemap GPU_MEM) and the layer arena (LAYERS, both in one GiB), and the frames of every surface given out (`gpu_admit`, as each is given and given back), nothing else, for every VID (only the GPU sits behind it; which VID its traffic arrives as is not measured yet). G#E4: pd_g3d not powered (left alone).
 /// The surfaces since 2026-11-11: an app whose frame is a GPU kernel's output (Mahere's map) has the GPU write its surface, the buffer the display composes, with no copy on the CPU (GPU-KISTS.md 1.4: a GPU layer is a buffer granted to its owner and the display).
+/// Until 2026-11-12 the four surfaces were one fixed region the fence admitted whole; since then a surface is 16 frames from anywhere in the pool, admitted while it is held and shut out as it is given back, so the fence admits exactly the frames that are surfaces now and never a frame an arc holds.
 /// This fence is the wall around every GPU client together (one bus master, every VID); the walls between clients are the GPU's own address spaces (GPU-KISTS.md plan step 1, 2026-11-12): the GPU service gives each client a space of its own that maps only the block of the arena and the surfaces it holds, as the kernel stamps every call on `gpu` (process.rs `gpu_stamp`). The arena is this board's (`cachemap::layers`: akita's upper half only).
 pub fn fence_gpu() -> u32 {
-    let (m, l, s) = (crate::cachemap::GPU_MEM, crate::cachemap::layers(), crate::cachemap::SURFACES);
+    let (m, l) = (crate::cachemap::GPU_MEM, crate::cachemap::layers());
     let gb = m.0 >> 30;
-    let sgb = s.0 >> 30;
     let r = if m.0 == m.1 {
         0xE3
     } else if unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 0 {
         0xE4
-    } else if [m.1 - 1, l.0, l.1 - 1].iter().any(|&a| a >> 30 != gb) || s.0 == s.1 || (s.1 - 1) >> 30 != sgb || sgb == gb {
+    } else if [m.1 - 1, l.0, l.1 - 1].iter().any(|&a| a >> 30 != gb) {
         0xE3
+    } else if rd(GPU_S2MPU, VERSION) & 0xFFFF_0000 != 0x9000_0000 {
+        0xE1
     } else {
-        let allowed = |pa: usize| (pa >= m.0 && pa < m.1) || (pa >= l.0 && pa < l.1) || (pa >= s.0 && pa < s.1);
-        fence_gbs(GPU_S2MPU, &[(gb, &raw mut GPU_TABLE), (sgb, &raw mut GPU_TABLE_SURFACES)], 0xC, 0xFF, &allowed)
+        let allowed = |pa: usize| (pa >= m.0 && pa < m.1) || (pa >= l.0 && pa < l.1);
+        fill(gb, &raw mut GPU_TABLE, 0xC, &allowed);
+        // The surfaces given out already (none at boot, where this runs before init starts): their frames in gpu-mem's GiB put back in its table, just filled afresh; the other GiBs' tables are never refilled.
+        crate::process::with_lock(crate::process::surfaces_refence);
+        let mut gbs: alloc::vec::Vec<(usize, *mut Smpt)> = alloc::vec![(gb, &raw mut GPU_TABLE)];
+        for &(g, t) in unsafe { &(&*(&raw const GPU_GBS))[..GPU_GBS_N] } {
+            gbs.push((g, t as *mut Smpt));
+        }
+        install(GPU_S2MPU, &gbs, 0xFF)
     };
     GPU_RESULT.store(r, core::sync::atomic::Ordering::Relaxed);
     r
+}
+
+/// The GPU fence's table for GiB `g`, made (all no access) when it has none: gpu-mem's own, or one of `GPU_GBS`; and whether it was made now (its L1 entries not yet written). Under the kernel lock.
+fn gpu_table(g: usize) -> (*mut Smpt, bool) {
+    if g == crate::cachemap::GPU_MEM.0 >> 30 {
+        return (&raw mut GPU_TABLE, false);
+    }
+    let gbs = unsafe { &mut *(&raw mut GPU_GBS) };
+    let n = unsafe { GPU_GBS_N };
+    if let Some(&(_, t)) = gbs[..n].iter().find(|e| e.0 == g) {
+        return (t as *mut Smpt, false);
+    }
+    if unsafe { GPU_TABLES_FRAME } == 0 {
+        // A frame of the pool, zeroed (every table in it no access), the kernel's for good. None free means a pool too full to have given the surface that asks: a bug, loud.
+        let f = crate::frames::take().expect("s2mpu: no frame for the GPU fence's tables");
+        unsafe { GPU_TABLES_FRAME = crate::frames::pa(f) };
+    }
+    // More GiBs than one frame holds tables for is a frame map past either board's (frames.rs): a bug, loud.
+    assert!(n < GPU_GBS_MOST, "s2mpu: the GPU fence has no table left for GiB {g}");
+    let t = unsafe { GPU_TABLES_FRAME } + n * core::mem::size_of::<Smpt>();
+    // Zeroed with its frame and written by nothing since: cleaned so the walker reads its zeros, not what DRAM held before.
+    clean(t, core::mem::size_of::<Smpt>());
+    gbs[n] = (g, t);
+    unsafe { GPU_GBS_N = n + 1 };
+    (t as *mut Smpt, true)
+}
+
+/// The GPU's fence over a frame at `pa` (2 MiB, so in one GiB): read and write when `on`, no access when not, 64 words of a table and four lines cleaned; and, when the fence is up and pd_g3d powered, a table made for a new GiB put in the L1 for every VID. Each frame of a surface as it is given out and as it is given back (process.rs `surface_take`, `surface_release`), then `gpu_sync` once. Under the kernel lock.
+pub fn gpu_admit(pa: usize, on: bool) {
+    let len = crate::frames::FRAME;
+    let g = pa >> 30;
+    let (t, new) = gpu_table(g);
+    // A word of the table holds eight pages' nibbles: every nibble G#C (read and write) or 0.
+    let w0 = (pa - (g << 30)) >> 15;
+    let words = unsafe { &mut (&mut *t).0[w0..w0 + (len >> 15)] };
+    words.fill(if on { 0xCCCC_CCCC } else { 0 });
+    clean(words.as_ptr() as usize, len >> 13);
+    if GPU_RESULT.load(core::sync::atomic::Ordering::Relaxed) != 1 || unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 0 {
+        return;
+    }
+    if new {
+        for vid in 0..VIDS {
+            wr(GPU_S2MPU, l1_table(vid, g), (t as usize >> 4) as u32);
+            wr(GPU_S2MPU, l1_attr(vid, g), L2TABLE_EN);
+        }
+    }
+}
+
+/// After `gpu_admit` over a surface's frames: the S2MPU's cached entries invalidated and synced, when the fence is up and pd_g3d powered (else the tables are read afresh when it is fenced). Under the kernel lock.
+pub fn gpu_sync() {
+    if GPU_RESULT.load(core::sync::atomic::Ordering::Relaxed) != 1 || unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 0 {
+        return;
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    wr(GPU_S2MPU, ALL_INVALIDATION, 1);
+    wr(GPU_S2MPU, SYNC_CMD, 1);
+    // The S2MPU's own completion, microseconds; bounded as every fence's is (`install`), one that never completed counted for DIAG.
+    let freq = crate::platform::cntfrq();
+    let t0 = crate::platform::cntpct();
+    while rd(GPU_S2MPU, SYNC_COMP) & 1 == 0 || rd(GPU_S2MPU, STATUS) & 3 == 3 {
+        if crate::platform::cntpct().wrapping_sub(t0) > freq / 100 {
+            GPU_SYNC_LATE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// `len` bytes of a table at `a` cleaned to the point of coherency: the walker reads DRAM, not the cache.
+fn clean(a: usize, len: usize) {
+    unsafe {
+        core::arch::asm!("dsb sy");
+        let mut x = a & !63;
+        while x < a + len {
+            core::arch::asm!("dc cvac, {}", in(reg) x);
+            x += 64;
+        }
+        core::arch::asm!("dsb sy");
+    }
 }
 
 /// Whether `base` is one of the DMA fences: no process writes one (process.rs SYS_MMIO_WRITE refuses it), whatever its grants; the fences are the kernel's (KERNEL-OUT.md "What stays").
@@ -223,29 +317,29 @@ fn fence_gbs(base: usize, gbs: &[(usize, *mut Smpt)], perm: u32, vids: u8, allow
         return 0xE1;
     }
     for &(gb, table) in gbs {
-        let gb_base = gb << 30;
-        let t = unsafe { &mut *table };
-        for (w, e) in t.0.iter_mut().enumerate() {
-            let mut v = 0u32;
-            for n in 0..8 {
-                if allowed(gb_base + ((w * 8 + n) << 12)) {
-                    v |= perm << (4 * n);
-                }
-            }
-            *e = v;
-        }
-        // Clean the table to the point of coherency: the walker reads DRAM, not the cache.
-        let (t0, t1) = (table as usize, table as usize + core::mem::size_of::<Smpt>());
-        unsafe {
-            core::arch::asm!("dsb sy");
-            let mut a = t0;
-            while a < t1 {
-                core::arch::asm!("dc cvac, {}", in(reg) a);
-                a += 64;
-            }
-            core::arch::asm!("dsb sy");
-        }
+        fill(gb, table, perm, allowed);
     }
+    install(base, gbs, vids)
+}
+
+/// GiB `gb`'s table written whole: permission `perm` on the pages `allowed` names, nothing on the rest, then cleaned to the point of coherency.
+fn fill(gb: usize, table: *mut Smpt, perm: u32, allowed: &dyn Fn(usize) -> bool) {
+    let gb_base = gb << 30;
+    let t = unsafe { &mut *table };
+    for (w, e) in t.0.iter_mut().enumerate() {
+        let mut v = 0u32;
+        for n in 0..8 {
+            if allowed(gb_base + ((w * 8 + n) << 12)) {
+                v |= perm << (4 * n);
+            }
+        }
+        *e = v;
+    }
+    clean(table as usize, core::mem::size_of::<Smpt>());
+}
+
+/// One S2MPU pointed at its tables, as they stand: the VIDs in mask `vids` reach each GiB of `gbs` thru its table, every other GiB and every other VID nothing; invalidated, synced, protection on with error responses. 1 done, G#E2 the sync never completed.
+fn install(base: usize, gbs: &[(usize, *mut Smpt)], vids: u8) -> u32 {
     // Contexts: context i serves VID i, all valid (L1 writes for a VID without a context are ignored).
     let n = (rd(base, NUM_CONTEXT) & 0xF) as usize;
     let mut ctx = 0u32;
@@ -296,6 +390,8 @@ pub fn report(out: &mut alloc::vec::Vec<u8>) {
     append_hex(out, b"S2MPU_MISC_PROT=", rd(MISC_S2MPU, 0x58));
     faults(out, MISC_S2MPU);
     append_hex(out, b"S2MPU_GPU_FENCE=", GPU_RESULT.load(core::sync::atomic::Ordering::Relaxed));
+    append_hex(out, b"S2MPU_GPU_GIBS=", 1 + unsafe { GPU_GBS_N } as u32);
+    append_hex(out, b"S2MPU_GPU_SYNC_LATE=", GPU_SYNC_LATE.load(core::sync::atomic::Ordering::Relaxed));
     if unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 1 {
         faults(out, GPU_S2MPU);
     }

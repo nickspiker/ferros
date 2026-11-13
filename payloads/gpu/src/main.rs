@@ -145,9 +145,10 @@ const TAB_VA: u64 = 0x7200_0000;
 const ARENA_VA: u64 = 0x8000_0000;
 const ARENA_MOST: usize = 128 << 20;
 const ARENA_BEFORE: usize = 64 << 20;
-/// The apps' surfaces in the group's address space (kernel cachemap SURFACES, four of 32 MiB, coherent as the arena is): a client names its own by its offset from SURFACES_VA, the physical base the kernel told it less G#CA00_0000 (cachemap SURFACES).
+/// The apps' surfaces in the group's address space (coherent as the arena is): a client names its own as SURFACES_VA plus its address less G#CA00_0000 (ferros_sys::gpu `SURFACES_PA`, the four surfaces' physical base until 2026-11-12, the point the view is reckoned from since), its address being its slot's in the surfaces' window (kernel cachemap SURF_VA), so slot k lies at G#50_0000_0000 plus k times 32 MiB here; each of its 16 frames mapped where the kernel's stamp says it is.
 const SURFACES_VA: u64 = 0xC000_0000;
-const SURFACES_BYTES: usize = 128 << 20;
+/// The whole surfaces' window, as the kernel grants it (slot 7).
+const SURFACES_BYTES: usize = ferros_sys::SURFACE_SLOTS * ferros_sys::SURFACE_BYTES;
 /// The service's shader code: 32 pages, 16384 words.
 const CODE_BIG_VA: u64 = 0x3400_0000;
 const CODE_PAGES: usize = 32;
@@ -161,7 +162,7 @@ const SLOTS: usize = 7;
 /// Each slot's suspend buffer and user-IO pages in the MCU's address space (its shared zone, G#0400_0000 to G#0800_0000, kbase's), mapped before the MCU starts.
 const SLOT_UIO_VA: u64 = 0x0430_0000;
 const SLOT_SUSPEND_VA: u64 = 0x0440_0000;
-/// Each slot's own page-table pages, for its client's address space: a block of the arena of up to 128 MiB is 64 level-3 tables, the four surfaces 64 more, and the service's own pages and the levels above about a dozen.
+/// Each slot's own page-table pages, for its client's address space: a block of the arena of up to 128 MiB is 64 level-3 tables, the most surfaces a stamp carries (four, ferros_sys::gpu `FRAMES`) 64 more and one level-2 table (the view's slots all lie in one GiB), and the service's own pages and the levels above about a dozen.
 const TABLE_PAGES: usize = 160;
 /// How long a client's job may run before the service ends it (its group terminated): a system process's (wallgen's bands, the mark's fine passes) 2^10 ms, a kist's 2^8 ms, so one kist's job holds the GPU from every other client a quarter second at most. The firmware's progress timer (2.6 G GPU cycles, global init) stops a job that stops progressing on its own.
 const GUARD_SYSTEM_MS: u64 = 1 << 10;
@@ -1275,7 +1276,7 @@ fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], cores: u
     let arena_ok = arena != 0 && arena != usize::MAX;
     // A client's surfaces are mapped for it only when the kernel fences them in for the GPU (granted here, the whole region, s2mpu::fence_gpu).
     let surfaces = ferros_sys::dma(cap(grants, S_SURFACES));
-    let surfaces_ok = surfaces == SURFACES_PA && ferros_sys::dma_size(cap(grants, S_SURFACES), SURFACES_BYTES as u64) == Some(SURFACES_BYTES as u64);
+    let surfaces_ok = surfaces == ferros_sys::SURFACES_WINDOW && ferros_sys::dma_size(cap(grants, S_SURFACES), SURFACES_BYTES as u64) == Some(SURFACES_BYTES as u64);
     let slots: [Slot; SLOTS] = core::array::from_fn(|k| {
         let ring = m.alloc(1);
         let desc = m.alloc(1);
@@ -1377,9 +1378,12 @@ fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], cores: u
                 t.map(&mut tm, OUT_VA, sl.flag, 1, PAGE_RW | NC | NX, TABLE);
                 t.map(&mut tm, CODE_BIG_VA, sl.code, CODE_PAGES, PAGE_RO | NC, TABLE);
                 t.map(&mut tm, ARENA_VA, bbase as usize, bsize as usize / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
-                for &(b, sz) in stamp.regions() {
-                    if surfaces_ok && b >= SURFACES_PA && b + sz <= SURFACES_PA + SURFACES_BYTES as u64 {
-                        t.map(&mut tm, SURFACES_VA + (b - SURFACES_PA), b as usize, sz as usize / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
+                // Each surface frame by frame (the stamp's frames: wherever the pool had them), at its place in the view; a stamp without frames (a kernel from before) maps none.
+                for (i, &(b, _)) in stamp.regions().iter().enumerate() {
+                    for (j, &pa) in stamp.frames_of(i).iter().enumerate() {
+                        if surfaces_ok {
+                            t.map(&mut tm, SURFACES_VA + (b - SURFACES_PA) + j as u64 * ferros_sys::gpu::FRAME, pa as usize, ferros_sys::gpu::FRAME as usize / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
+                        }
                     }
                 }
                 // The pool's size is the bound on any stamp the kernel writes (a block of at most the arena, at most the four surfaces): past it is a bug here, loud.
