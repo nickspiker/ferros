@@ -9,7 +9,8 @@ description = "The person's identity space on ferros (docs/IDENTITY-SPACE.md): w
 path = "src/lib.rs"
 
 [dependencies]
-fgtw = { path = "../../fgtw", default-features = false }
+# `profile`: the people (fgtw::people), whose names are VSF text, with the text codec it brings without std.
+fgtw = { path = "../../fgtw", default-features = false, features = ["profile"] }
 vsf = { path = "../../vsf", default-features = false }
 ferros_kist = { path = "../ferros_kist" }
 ferros_ledger = { path = "../ferros_ledger" }

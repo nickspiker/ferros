@@ -15,6 +15,9 @@
 //! | `LANG` | the fleet's scope `ke` | the language `wl` (its ISO 639-3 code) | none: the identity service writes it to the kernel (SYS_LANG op 2) on each device, which follows it unless its settings say otherwise |
 //! | `DND` | the fleet's scope `ke` | on `u` (1 or 0) | none: the identity service writes it to the kernel (preference 40) on each device |
 //! | `PIN` | developer `ke` | the bundle's commitment `hp`, then the developer's name `a` when their first kist gave one; the entry's stamp is when it was pinned | a `pin` section of `kists.list` (trust on first stow) |
+//! | `PERSON` | the handle proof `hP` | the person (fgtw::people::Person) wrapped `v'W'`: the pinned identity key, the genesis, the fleet it folded to, the name the person gave them | none: the identity service's own (payloads/fgtw), written by the system's add-a-person sheet, served to a kist granted `people` (docs/FACETS.md "People") |
+//! | `PEOPLE` | developer `ke`, option `hp` | all `u` (1) or chosen (0); all while unset | none: the kist's card |
+//! | `CHOSEN` | developer, option, the person's handle proof `hP` | `u` 1 while picked, a tombstone once unpicked | none: the kist's card's chooser |
 //! | fgtw's own kind 255 (`fgtw::person::KIND`) | the person key's id `hb` | when it was minted `e`, the fleet key's fingerprint `hb`, the key sealed under the fleet key `v'X'` | none: the identity service's own (payloads/fgtw), opened at attest and handed to the kernel (docs/FACETS.md D0) |
 //!
 //! The scope of a place and the view is the fleet's (`FLEET`, 32 zero bytes) on every device whose deck sync is on (the default), and the device's own key on one where the person switched it off, so that device keeps an arrangement of its own, which follows it through a reset all the same.
@@ -29,6 +32,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use ferros_kist::{Kist, Kists, RIGHTS};
+use fgtw::people::Person;
 use fgtw::space::{reconcile, Baseline, Entry, Fact, Space, Write};
 use vsf::VsfType;
 
@@ -52,6 +56,12 @@ pub mod kind {
     pub const PIN: u8 = 9;
     /// Do not disturb (owner, 2026-11-11: "a fleet/identity preference so it follows the person"): the person's one switch, set from the quick row of any of their devices, written to each device (the kernel's preference 40), never read back from one.
     pub const DND: u8 = 10;
+    /// One of the person's people (docs/FACETS.md "People", D5): the pin-set Photon keeps of a contact (handle proof, pinned identity key, genesis, the fleet it folded to) and the name the person gave them (fgtw::people::Person). Added only on the system's add-a-person sheet, never by a kist; synced to every device of theirs; served to a kist granted `people` by the identity service.
+    pub const PERSON: u8 = 11;
+    /// A kist's people, all or chosen (FACETS.md "People": "all, or the ones you choose"), by kist identity, beside its answers.
+    pub const PEOPLE: u8 = 12;
+    /// A person the person picked for a kist whose people are the chosen ones, by kist identity and the person's handle proof; a tombstone once unpicked.
+    pub const CHOSEN: u8 = 13;
 }
 
 /// The scope of the fleet's shared arrangement.
@@ -272,6 +282,100 @@ pub fn set_dnd(space: &mut Space, by: &[u8; 32], on: bool, now: i64) -> bool {
     }
     let updated = space.get(kind::DND, &dnd_id()).map_or(now, |e| now.max(e.updated + 1));
     space.put(Entry { kind: kind::DND, id: dnd_id(), value: vec![VsfType::u(on as usize, false)], updated, by: *by, gone: false })
+}
+
+// ── The person's people (docs/FACETS.md "People"; D5) ──
+
+/// A person's id: their handle proof.
+pub fn person_id(handle_proof: &[u8; 32]) -> Vec<VsfType> {
+    vec![VsfType::hP(handle_proof.to_vec())]
+}
+
+/// A person added on one of the person's devices (the system's add-a-person sheet, the only writer: no kist adds a person), or their name changed: written straight into the space, stamped past its last write. Whether the space changed.
+pub fn put_person(space: &mut Space, by: &[u8; 32], p: &Person, now: i64) -> bool {
+    let id = person_id(&p.handle_proof);
+    let value = vec![p.to_value()];
+    if space.get(kind::PERSON, &id).is_some_and(|e| !e.gone && e.value == value) {
+        return false;
+    }
+    let updated = space.get(kind::PERSON, &id).map_or(now, |e| now.max(e.updated + 1));
+    space.put(Entry { kind: kind::PERSON, id, value, updated, by: *by, gone: false })
+}
+
+/// A person removed from the person's people (the People page): a tombstone, so the removal reaches every device and sticks. Whether the space changed.
+pub fn drop_person(space: &mut Space, by: &[u8; 32], handle_proof: &[u8; 32], now: i64) -> bool {
+    let id = person_id(handle_proof);
+    let Some(e) = space.get(kind::PERSON, &id) else { return false };
+    if e.gone {
+        return false;
+    }
+    let updated = now.max(e.updated + 1);
+    space.put(Entry { kind: kind::PERSON, id, value: Vec::new(), updated, by: *by, gone: true })
+}
+
+/// The person's people, in the space's order (by handle proof). A fact this build cannot read (a newer form) is skipped.
+pub fn people(space: &Space) -> Vec<Person> {
+    space.live(kind::PERSON).filter_map(|e| Person::from_value(e.value.first()?).ok()).collect()
+}
+
+/// One of the person's people, by handle proof.
+pub fn person(space: &Space, handle_proof: &[u8; 32]) -> Option<Person> {
+    let e = space.get(kind::PERSON, &person_id(handle_proof)).filter(|e| !e.gone)?;
+    Person::from_value(e.value.first()?).ok()
+}
+
+/// Whether the kist (`developer`, `option`) granted `people` knows all of them (true) or only the chosen ones. All until the person says otherwise on its card: the question they answered yes to reads "all of them, or the ones you choose", all first.
+pub fn people_all(space: &Space, developer: &[u8; 32], option: &[u8; 32]) -> bool {
+    match space.get(kind::PEOPLE, &kist_id(developer, option)) {
+        Some(e) if !e.gone => e.value.first().and_then(|v| v.as_u64()) != Some(0),
+        _ => true,
+    }
+}
+
+/// The person set a kist's people to all or chosen (its card). Whether the space changed.
+pub fn set_people_all(space: &mut Space, by: &[u8; 32], developer: &[u8; 32], option: &[u8; 32], all: bool, now: i64) -> bool {
+    let id = kist_id(developer, option);
+    if people_all(space, developer, option) == all && space.get(kind::PEOPLE, &id).is_some_and(|e| !e.gone) {
+        return false;
+    }
+    let updated = space.get(kind::PEOPLE, &id).map_or(now, |e| now.max(e.updated + 1));
+    space.put(Entry { kind: kind::PEOPLE, id, value: vec![VsfType::u(all as usize, false)], updated, by: *by, gone: false })
+}
+
+/// A chosen person's id: the kist (developer `ke`, option `hp`) and the person's handle proof (`hP`).
+pub fn chosen_id(developer: &[u8; 32], option: &[u8; 32], handle_proof: &[u8; 32]) -> Vec<VsfType> {
+    vec![VsfType::ke(developer.to_vec()), VsfType::hp(option.to_vec()), VsfType::hP(handle_proof.to_vec())]
+}
+
+/// The person picked (`on`) or unpicked a person for a kist (its card's chooser): a fact while picked, a tombstone once unpicked. Whether the space changed.
+pub fn set_chosen(space: &mut Space, by: &[u8; 32], developer: &[u8; 32], option: &[u8; 32], handle_proof: &[u8; 32], on: bool, now: i64) -> bool {
+    let id = chosen_id(developer, option, handle_proof);
+    let held = space.get(kind::CHOSEN, &id).is_some_and(|e| !e.gone);
+    if held == on {
+        return false;
+    }
+    let updated = space.get(kind::CHOSEN, &id).map_or(now, |e| now.max(e.updated + 1));
+    let value = if on { vec![VsfType::u(1, false)] } else { Vec::new() };
+    space.put(Entry { kind: kind::CHOSEN, id, value, updated, by: *by, gone: !on })
+}
+
+/// The handle proofs the person picked for a kist.
+pub fn chosen(space: &Space, developer: &[u8; 32], option: &[u8; 32]) -> Vec<[u8; 32]> {
+    space
+        .live(kind::CHOSEN)
+        .filter(|e| e.id.first().and_then(k32) == Some(*developer) && e.id.get(1).and_then(k32) == Some(*option))
+        .filter_map(|e| e.id.get(2).and_then(k32))
+        .collect()
+}
+
+/// The people a kist granted `people` is handed: all of them, or the chosen ones that are still the person's people (a removed person leaves every kist's list with them).
+pub fn people_for(space: &Space, developer: &[u8; 32], option: &[u8; 32]) -> Vec<Person> {
+    let all = people(space);
+    if people_all(space, developer, option) {
+        return all;
+    }
+    let picked = chosen(space, developer, option);
+    all.into_iter().filter(|p| picked.contains(&p.handle_proof)).collect()
 }
 
 // ── The map's own forms (payloads/map: `place_key`, `save_place`, `save_view`) ──
@@ -1089,6 +1193,69 @@ mod tests {
         let o = sync(&mut sa, &mut b, &mut v, &PRO, 3000).unwrap();
         assert_eq!(o.kinds >> kind::DND & 1, 0);
         assert_eq!(dnd(&sa), Some(false));
+    }
+
+    fn ana() -> Person {
+        Person { handle_proof: [0xA0; 32], identity: [0xA1; 32], genesis: [0xA2; 32], members: vec![[0xA3; 32]], name: String::from("Ana") }
+    }
+
+    fn ben() -> Person {
+        Person { handle_proof: [0xB0; 32], identity: [0xB1; 32], genesis: [0xB2; 32], members: vec![[0xB3; 32], [0xB4; 32]], name: String::new() }
+    }
+
+    /// The person's people follow them: added on one device, they cross the fleet sealed with every field; a name changed later wins; a removal sticks against an older copy; the sync with the device's own copy never touches them.
+    #[test]
+    fn the_persons_people_follow_them() {
+        let mut sa = Space::new();
+        assert!(people(&sa).is_empty());
+        assert!(put_person(&mut sa, &PRO, &ana(), 2000));
+        assert!(!put_person(&mut sa, &PRO, &ana(), 2001), "the same person changes nothing");
+        assert!(put_person(&mut sa, &PRO, &ben(), 2002));
+        let mut sb = hand_over(&sa);
+        assert_eq!(people(&sb), vec![ana(), ben()]);
+        assert_eq!(person(&sb, &[0xA0; 32]), Some(ana()));
+        // Renamed on the other device, whose clock runs behind: still the person's latest act.
+        let renamed = Person { name: String::from("Ana M"), ..ana() };
+        assert!(put_person(&mut sb, &OTHER, &renamed, 1000));
+        sa.merge(hand_over(&sb));
+        assert_eq!(person(&sa, &[0xA0; 32]).map(|p| p.name), Some(String::from("Ana M")));
+        // Removed on one device: gone everywhere, and an older copy merged in later does not bring them back.
+        let old = hand_over(&sa);
+        assert!(drop_person(&mut sa, &PRO, &[0xB0; 32], 3000));
+        assert!(!drop_person(&mut sa, &PRO, &[0xB0; 32], 3001));
+        sa.merge(old);
+        assert_eq!(people(&sa), vec![renamed]);
+        let mut v = arranged_pro();
+        let mut b = Baseline::default();
+        let o = sync(&mut sa, &mut b, &mut v, &PRO, 4000).unwrap();
+        assert_eq!(o.kinds >> kind::PERSON & 1, 0);
+    }
+
+    /// A kist's people: all until the person chooses; chosen, only those picked and still the person's; the choice crosses the fleet; a removed person leaves every kist's list.
+    #[test]
+    fn a_kists_people_are_all_or_the_chosen() {
+        let mut s = Space::new();
+        put_person(&mut s, &PRO, &ana(), 2000);
+        put_person(&mut s, &PRO, &ben(), 2001);
+        let (d, o) = PHOTON;
+        assert!(people_all(&s, &d, &o));
+        assert_eq!(people_for(&s, &d, &o), vec![ana(), ben()]);
+        assert!(set_people_all(&mut s, &PRO, &d, &o, false, 2002));
+        assert!(!set_people_all(&mut s, &PRO, &d, &o, false, 2003));
+        assert!(people_for(&s, &d, &o).is_empty(), "chosen with nobody picked is nobody");
+        assert!(set_chosen(&mut s, &PRO, &d, &o, &[0xB0; 32], true, 2004));
+        assert!(!set_chosen(&mut s, &PRO, &d, &o, &[0xB0; 32], true, 2005));
+        let mut t = hand_over(&s);
+        assert_eq!(people_for(&t, &d, &o), vec![ben()]);
+        // Another kist knows nothing of this choice: all, its own default.
+        assert_eq!(people_for(&t, &MAHERE.0, &MAHERE.1), vec![ana(), ben()]);
+        assert!(set_chosen(&mut t, &OTHER, &d, &o, &[0xB0; 32], false, 2006));
+        s.merge(hand_over(&t));
+        assert!(people_for(&s, &d, &o).is_empty());
+        set_chosen(&mut s, &PRO, &d, &o, &[0xA0; 32], true, 2007);
+        drop_person(&mut s, &PRO, &[0xA0; 32], 2008);
+        assert!(people_for(&s, &d, &o).is_empty(), "a removed person leaves the chosen list too");
+        assert_eq!(chosen(&s, &d, &o), vec![[0xA0; 32]], "the pick itself stays, harmless, until unpicked");
     }
 }
 
