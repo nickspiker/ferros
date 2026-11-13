@@ -106,7 +106,7 @@ The corners outside the circle are the system's by construction: no app surface 
 - Top left, the clock: time, alarms, the zone.
 - Top right, the radios: connections, WiFi join, airplane.
 - Bottom left, the battery: power, brightness.
-- Bottom right: the deck (named home until 2026-11-12). A tap from anywhere and the map is there. The only navigation control, and enough, because the map is home, recents and search at once.
+- Bottom right: the deck (named home until 2026-11-12). A tap from anywhere and the map is there. The only navigation control, and enough, because the map is home, recents and search at once. While the system waits on the person's answer (a kist offered to stow, the unstow sheet, a first start's permissions, a device asking to join or leave) the button is red and its tap goes straight to that question (NOTIFY.md "System questions", 2026-11-12).
 
 Four corners, four things, nothing to learn. Hardware stays what it is: power wakes under the proximity gate, the volume pair is the killswitch chord and volume.
 

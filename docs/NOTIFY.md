@@ -1,6 +1,7 @@
 # Notifications
 
 Status: decided by the owner 2026-11-12; the first cut built the same day (branch `notify`): the kernel's notes (SYS_NOTIFY, process notify.rs), the note's VSF (ferros_kist::note), the deck's side (payloads/map notes.rs), the Deck button (display op 66) and the open-at event (display op 67, `EV_OPEN_AT`).
+System questions (the Deck button red while the system waits on the person) decided and built the same evening ("System questions" below).
 Each part says **Decided** (with the owner's words), **Built**, or **Proposed** (mine, not yet answered).
 
 The owner, rejecting sliders and permission lists: "we have a brand new UI so we have an opportunity to do notification proper."
@@ -56,6 +57,7 @@ The system shows a note's idea in the person's language once the ideas directory
 | the system sees | the ceiling |
 |---|---|
 | the system's own note (an alarm the person set, the development command) | live |
+| the system's question (source `ferros_kist::note::SYSTEM`, "System questions" below) | personal |
 | a kist's note naming a `person`, from a kist holding the network (`udp`: a person's words reach a kist only over a link) | personal |
 | any other kist's note | status |
 
@@ -111,9 +113,49 @@ So the helm's Deck button (bottom right) is the deck's one summary signal, in pl
 - When the latest is cleared, it shows the next latest; with none left, the plain Deck mark.
 - A note from a person will later show the person's own mark (Photon's default avatars are tapuwae marks): op 66's icon byte is the bundle's today, and a person's image is a second source for it to grow.
 
-**Built:** the map sends op 66 `helm note [icon u8][count u16]` whenever what is in view changes (a note, a settle), the system's alone (a kist cannot light it: `NOT_YOURS`).
+**Built:** the map sends op 66 `helm note [icon u8][count u16][glow u8]` whenever what is in view changes (a note, a settle), the system's alone (a kist cannot light it: `NOT_YOURS`); its glow is ferros_glow's for you (4), or a question's (6, "System questions" below). The display rings its render bell as it takes it, so the helm shows it at once on an idle screen (until 2026-11-12 it waited for the next pass, the minute's at worst).
 The display's helm draws it front to back with `under`: the violet stroke, the icon inside it (each pixel the average of the texels under it), the glow outside on a C∞ step (`draw::bump_step`), then the wedge behind; every edge smooth.
 A source whose circle has no bundled icon (a puck the display draws, the system) shows the ring alone.
+
+## System questions
+
+The problem (2026-11-12): a `ferros send` stow left the Stow sheet waiting on the Pro while the owner was in Mahere.
+Nothing showed it was waiting (the Deck page opens on an offer only once the person is back on the map), and meanwhile `ferros send` held the device's USB interface, shutting out every other host tool.
+
+**Decided** (owner, 2026-11-12, to this design: "Yes. Good. So only difference is it would be 700nm red, rather than the regular 400nm notification glow"):
+- **A system question** is anything the system is waiting on the person to answer: Stow or Cancel on a kist offered, a permission ask, the unstow sheet, a pairing, and any later one.
+  It is a note from the system (source Settings), kind **personal**: it never takes the screen and never rings (an alarm the person set stays live, as it is).
+- **It always lights the Deck button**, whatever the view rule (in view or out of view): the settings icon (the ring alone while the bundle has no raster of it) inside a **red ring at the system's 703 nm** (ferros_glow), in place of the regular 400 nm violet.
+- **One tap on Deck goes straight to the waiting question**, not just to the deck.
+- **It stays lit until answered**: any answer, Cancel included, clears it. No timeout.
+- **No popups or banners** beyond that.
+
+**Mine, the owner can change it:** with a question and kists' notes both waiting, the question wins the Deck button: it blocks something until answered (a host waiting on Stow, a device waiting on its departure), where a kist's note waits as well later as now.
+Its notes show again as soon as the last question is answered.
+
+**Built** (2026-11-12):
+- **The questions** (map notes.rs `Question`), each read from what the map holds on every pass of its main loop (`questions_now`):
+
+  | question | waits while | answered on | answered by |
+  |---|---|---|---|
+  | a kist offered over USB (KISTS.md "Stowing") | the stower's offer is asking (`STAGE_ASKING`) | the Deck page | Stow or Cancel (or the offer refused, or gone) |
+  | the unstow sheet (KISTS.md "The unstow sheet") | the sheet is open on a kist's card, the circle shut or not | the Deck page, on the card | Unstow, Cancel or Back |
+  | a first start's permissions (KISTS.md, the first-launch question) | the kist's circle is open on them | the circle | Start, or a tap outside it |
+  | a device asking to leave the fleet | fgtw's departure asking here (status 0) | the Fleet page | Approve or Deny |
+  | a device asking to join | the add flow's phase 3 (selected, Yes waiting) | the Fleet page | Yes or No |
+
+  A kist's own ask at first need (KISTS.md: "a kist can put a question only while holding the one-shot ticket") is not built; it joins the list when it is.
+- **The note:** a new question is posted (SYS_NOTIFY op 0, Settings, source `ferros_kist::note::SYSTEM`, all zeros: no capsule hashes to it), kind personal, its `key` naming it (the question's kind, then what it is about), its words a line in ASCII ("a kist offered over USB: Stow or Cancel"), never what it names.
+  An answered or ended one is cleared (op 5, seen: the person answered it); a set unchanged calls nothing (`questions_sync`).
+  The map clears every system question as it starts and posts again whatever still waits, so a question never outlives the map that asked it.
+- **The kernel** (notify.rs `poster`, ferros_kist::note `decide`, `Poster::Question`): a note from the system's source is personal at most, whatever is asked, so a question can never take the screen.
+  It is never written to the vault: it lasts as long as what asks it (an offer, an open sheet, a device asking), none of which outlives a restart; one a kernel from before kept is removed as the person's notes load.
+  The map asks for personal itself, so a kernel from before shows the same.
+- **One tap of the motor** as a question arrives unasked (an offer from a host, a device asking to leave), by the sound mode and not under do not disturb, as a personal note; the ones the person opened themselves (the sheet, a first start, the add flow) are silent: they are looking at them.
+- **The Deck button** (map `notes_view`, display op 66 with its new glow byte): with any of the system's notes in the kernel's list, the settings circle's icon (the ferros mark, which the display draws from its geometry and the bundle has no raster of, so the ring alone), the questions' count, and glow 6, ferros_glow `Question`: for you's glow (the heavy peak at `FOR_YOU_LIGHT`, reaching as far by the count) at 703 nm, the red primary itself, so no multiply. The display's helm draws its ring, its glow and its icon in that colour, front to back with `under` as before.
+- **Deck's tap** (map `helm_tap`, `question_open`): with a question waiting that is not already on the glass, the newest one opens: the app in front sent behind, then its page (the unstow sheet's card opened again), or the first start's circle, still open behind the app.
+  With the question already showing, Deck does what it always does (closes the circle; the question still waits, the button still red).
+- **`ferros send` lets the link go** (KISTS.md "Stowing", USB.md "Offering a kist"): it ends at "waiting on the person" (exit 3) and `ferros sent <capsule>` asks how it ended.
 
 ## Personal: one tap
 
@@ -177,7 +219,7 @@ The deck's rest ends at the earliest deadline among the notes (as an alarm's sle
 | 5 seen | the deck | a source's note or all of them, `opened` keeping one for its kist |
 | 6 read | the deck | one note's document |
 
-Display: op 67 `open at [note u8]` to the app window in front (`EV_OPEN_AT` = 5, the low byte the number; op 65 and event 4 are the bake's, COMPOSITOR.md "Baked"); op 66 `helm note [icon u8][count u16]`, the system's alone.
+Display: op 67 `open at [note u8]` to the app window in front (`EV_OPEN_AT` = 5, the low byte the number; op 65 and event 4 are the bake's, COMPOSITOR.md "Baked"); op 66 `helm note [icon u8][count u16][glow u8]`, the system's alone (no glow byte, from a map before it: for you).
 
 ## Seeing it on a device
 
@@ -202,3 +244,6 @@ ferros-bridge diag "notify clear <kist>"                     # as if the person 
 4. **Words in any script**: the kernel's VSF reading `x` (x-lang16, 140 KB), or the words left out of the kernel's parse.
 5. **Fleet clearing** as above: its message and the kernel's seen by key.
 6. **A person's mark** on the Deck button for a note from a person.
+7. **The ferros mark in the red Deck button**: a question shows the ring alone today (the bundle has no raster of the settings icon; the display draws the mark from its geometry into the scene, in panel codes, where the helm's bars are darkness space). Proposed: `draw::logo` taught the bars' format, so the mark sits inside the red ring.
+8. **The settings circle while a question waits**: it keeps its own thin 703 nm glow today. Proposed: the question's heavy red glow on it too, as a kist's circle glows for you with its notes, so the deck shows where the question lives.
+9. **Which question first**: Deck opens the newest waiting today. Proposed as is; the oldest would answer a blocked host first.

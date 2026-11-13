@@ -5619,23 +5619,23 @@ static mut HELM_DRAWN: bool = false;
 /// The helm's light (the bottom corners' two buttons; owner, 2026-11-09: light them up), deck [0] and back [1]: the level a client last reported (op 54, Q16: a finger landed, how far its swipe has come, acted), and the level drawn, which follows a rise at once and halves what is left of a fall each render pass, so a release fades out by frames and never by a timer.
 static HELM_TARGET: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static mut HELM_LEVEL: [f32; 2] = [0.0; 2];
-/// The Deck button as the deck's summary (op 66, docs/NOTIFY.md "The Deck button"; owner, 2026-11-12: "if anything on the deck has changed state, specifically 400nm notifications, we change the deck circle in the helm and then the user knows to go to the deck", then "So ideally the deck circle shows the latest item icon preview and shows the violet ring?"): the latest note's source's icon in bits 16-23 (0 none), how many wait in the deck's resting view below (0: the plain Deck mark). As the map last sent it, and as last drawn.
+/// The Deck button as the deck's summary (op 66, docs/NOTIFY.md "The Deck button"; owner, 2026-11-12: "if anything on the deck has changed state, specifically 400nm notifications, we change the deck circle in the helm and then the user knows to go to the deck", then "So ideally the deck circle shows the latest item icon preview and shows the violet ring?"): the latest note's source's icon in bits 16-23 (0 none), how many wait in the deck's resting view below (0: the plain Deck mark), and the ring's glow in bits 24-31 (ferros_glow's state byte: 4 for you, 400 nm; 6 a question, 703 nm, the system waiting on the person, docs/NOTIFY.md "System questions"; 0 from a map before it: for you). As the map last sent it, and as last drawn.
 static HELM_NOTE: AtomicU32 = AtomicU32::new(0);
 static mut HELM_NOTE_DRAWN: u32 = 0;
 
-/// The for-you colour as the helm draws it (fluor's darkness, straight), its glow's peak (0 to 1) and its reach divisor, for `count` waiting: a for-you circle's on the deck (`state_glow`: ferros_glow 400 nm at the theme's ring light). None for a theme with no glow.
-fn for_you_ink(count: u16) -> Option<(u64, f32, i64)> {
-    let cir = Circle { glow: ferros_glow::Glow::ForYou as u8, count, ..NO_CIRCLE };
+/// The note's colour as the helm draws it (fluor's darkness, straight), its glow's peak (0 to 1) and its reach divisor, for `count` waiting: a for-you circle's on the deck (`state_glow`: ferros_glow 400 nm at the theme's ring light), or a question's, the same glow at 703 nm (`glow`, ferros_glow's state byte). None for a theme with no glow.
+fn note_ink(glow: u8, count: u16) -> Option<(u64, f32, i64)> {
+    let cir = Circle { glow, count, ..NO_CIRCLE };
     let (colour, peak, frac, _) = state_glow(&cir, ferros_sys::theme::current())?;
     // The colour's 8-bit gamma 2 codes as working values (white at Q14).
     let w8 = |c: u32| (c & 0xFF) as f32 * (16384.0 / 255.0);
     Some((g2t_colour((w8(colour >> 16), w8(colour >> 8), w8(colour))), peak as f32 * (1.0 / 255.0), frac))
 }
 
-/// The Deck button's note (`HELM_NOTE`) into the bars' bottom rows (`bar`, `bot` rows of `width` from screen row `height - bot`), front to back after the marks: the source's icon inside the button's circle (centre (x, y), radius `r`, inside its 2-pixel stroke), then the for-you glow around it (ferros_glow 400 nm at the theme's ring light, as a for-you circle's on the deck, `state_glow`), reaching farther with the count. No content, ever: the source's icon alone (owner: "shows the latest item icon preview"). Every edge a C∞ step (`draw::bump_step`), every layer by fluor's `under`.
-fn helm_note_draw(bar: &mut [u64], width: usize, height: usize, bot: usize, (x, y, r): (f32, f32, f32), icon_n: u8, count: u16) {
+/// The Deck button's note (`HELM_NOTE`) into the bars' bottom rows (`bar`, `bot` rows of `width` from screen row `height - bot`), front to back after the marks: the source's icon inside the button's circle (centre (x, y), radius `r`, inside its 2-pixel stroke), then the for-you glow around it (ferros_glow 400 nm at the theme's ring light, as a for-you circle's on the deck, `state_glow`; a question's at 703 nm, `glow`), reaching farther with the count. No content, ever: the source's icon alone (owner: "shows the latest item icon preview"). Every edge a C∞ step (`draw::bump_step`), every layer by fluor's `under`.
+fn helm_note_draw(bar: &mut [u64], width: usize, height: usize, bot: usize, (x, y, r): (f32, f32, f32), icon_n: u8, count: u16, glow: u8) {
     use fluor::pixel::{Blend, BlendMode};
-    let Some((violet, peak, frac)) = for_you_ink(count) else { return };
+    let Some((ink, peak, frac)) = note_ink(glow, count) else { return };
     // The glow's reach past the circle: the circle glows' own, a `frac`th of the radius (frac already shrunk by the count, ferros_glow `reach`).
     let reach = r / frac as f32;
     // The icon's disc inside the stroke (2 pixels wide on the radius's inside).
@@ -5690,7 +5690,7 @@ fn helm_note_draw(bar: &mut [u64], width: usize, height: usize, bot: usize, (x, 
             // The glow: full at the rim and inside it (under the icon, showing only where the art leaves room), down to nothing at its reach on the C∞ step.
             let a = peak * draw::bump_step(1.0 - (d - r) / reach);
             if a > 0.0 {
-                bar[i] = bar[i].under(violet | ((a * 65535.0) as u64) << 48, BlendMode::Normal);
+                bar[i] = bar[i].under(ink | ((a * 65535.0) as u64) << 48, BlendMode::Normal);
             }
         }
     }
@@ -5722,8 +5722,13 @@ fn helm_draw(width: usize, height: usize) -> bool {
         }
     }
     let (note_icon, note_count) = ((note >> 16) as u8, note as u16);
-    // While something waits in the deck's resting view, the Deck button's ring is the for-you colour (owner, 2026-11-12: "shows the violet ring").
-    let note_ink = if note_count > 0 { for_you_ink(note_count).map(|v| v.0) } else { None };
+    // The ring's glow: a map from before op 66 carried it sends none (0), which is for you.
+    let note_glow = match (note >> 24) as u8 {
+        0 => ferros_glow::Glow::ForYou as u8,
+        g => g,
+    };
+    // While something waits in the deck's resting view, the Deck button's ring is the for-you colour (owner, 2026-11-12: "shows the violet ring"); while the system waits on the person's answer, the system's red (owner, 2026-11-12: "only difference is it would be 700nm red, rather than the regular 400nm notification glow").
+    let note_ring = if note_count > 0 { note_ink(note_glow, note_count).map(|v| v.0) } else { None };
     if unsafe { HELM_DRAWN } {
         return false;
     }
@@ -5750,8 +5755,8 @@ fn helm_draw(width: usize, height: usize) -> bool {
         // Lit: the stroke brightens toward white by the button's level (its wedge's light, below).
         let lvl = unsafe { HELM_LEVEL[back as usize] };
         let lit_ink = g2t_colour((9000.0 + 7000.0 * lvl, 9000.0 + 7000.0 * lvl, 9000.0 + 7000.0 * lvl));
-        // The Deck button with a note: its ring violet, the icon and the glow under it (`helm_note_draw`), all front to back before the wedge.
-        let ring_ink = match note_ink {
+        // The Deck button with a note: its ring the note's colour (violet, or a question's red), the icon and the glow under it (`helm_note_draw`), all front to back before the wedge.
+        let ring_ink = match note_ring {
             Some(v) if !back => v,
             _ => if lvl > 0.0 { lit_ink } else { ink },
         };
@@ -5792,8 +5797,8 @@ fn helm_draw(width: usize, height: usize) -> bool {
                 }
             }
         }
-        if !back && note_ink.is_some() {
-            helm_note_draw(bar, width, height, bot, (x, y, r), note_icon, note_count);
+        if !back && note_ring.is_some() {
+            helm_note_draw(bar, width, height, bot, (x, y, r), note_icon, note_count, note_glow);
         }
     }
     // Each button's whole wedge (owner, 2026-11-09: "everything in that wedge should light up", "1/8 opacity black when the helm is showing, that turns white at same said opacity when tapped"): the bars' rows outside the app's circle, the left half back's and the right half deck's (op 41's regions), a layer behind the marks (front to back) at an eighth of opacity, its colour black at rest and white by the button's level; its edge along the circle a pixel wide.
@@ -7131,13 +7136,16 @@ extern "C" fn receive(grants: u64) -> ! {
             ferros_sys::reply(&tok, &[0]);
             continue;
         }
-        // 66 `helm note [icon u8][count u16]`: the Deck button as the deck's summary (docs/NOTIFY.md "The Deck button"), the system's alone: the latest note's source's icon and how many wait in the deck's resting view, drawn by the helm (`helm_draw`). → [0], or [4] (`NOT_YOURS`) from a caller that is not the system's.
+        // 66 `helm note [icon u8][count u16][glow u8]`: the Deck button as the deck's summary (docs/NOTIFY.md "The Deck button"), the system's alone: the latest note's source's icon and how many wait in the deck's resting view, or the system's question waiting (`glow` 6, ferros_glow `Question`: the ring red, docs/NOTIFY.md "System questions"), drawn by the helm (`helm_draw`). A map from before sends no glow byte: for you. → [0], or [4] (`NOT_YOURS`) from a caller that is not the system's.
         if op == 66 && n >= 4 {
             if !system(h) {
                 ferros_sys::reply(&tok, &[NOT_YOURS]);
                 continue;
             }
-            HELM_NOTE.store((msg[1] as u32) << 16 | u16::from_le_bytes([msg[2], msg[3]]) as u32, Ordering::Release);
+            let glow = if n >= 5 { msg[4] as u32 } else { 0 };
+            HELM_NOTE.store(glow << 24 | (msg[1] as u32) << 16 | u16::from_le_bytes([msg[2], msg[3]]) as u32, Ordering::Release);
+            // A pass now, so the bars' worker (nudged on every pass) draws the helm with it: an idle screen (a kist in front drawing nothing new) had no pass to show it until the next minute (2026-11-12, on the 8a: a question waited with the Deck button still grey).
+            ring_bell();
             ferros_sys::reply(&tok, &[0]);
             continue;
         }

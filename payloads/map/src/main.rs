@@ -1421,8 +1421,10 @@ struct Map {
     rest: Cam,
     /// The kists that tapped the motor since the person last looked at them: one tap a kist until then.
     tapped: Vec<[u8; 32]>,
-    /// The Deck button's note as last sent (display op 66): the icon and the count in view.
-    helm_sent: (u8, u16),
+    /// The Deck button's note as last sent (display op 66): the icon, the count in view (or the questions waiting), and its glow (ferros_glow: for you, or a question).
+    helm_sent: (u8, u16, u8),
+    /// The system's questions waiting on the person, oldest first, each with its note's number when the kernel took it (notes.rs `questions_sync`, docs/NOTIFY.md "System questions").
+    questions: Vec<(notes::Question, Option<u8>)>,
     /// A live note on the screen (its source and number) and its words; the note a tap opens its kist at (`notes_front`), and one waiting for its kist's window to show.
     live_note: Option<([u8; 32], u8)>,
     live_words: Option<alloc::string::String>,
@@ -4708,6 +4710,10 @@ impl Map {
     /// A still tap on the helm (WINDOWS.md "The helm"; owner, 2026-11-11). Deck (8): the app in front behind, the map as it was left; with the map on the glass, an open circle closes. Back (9): Escape to the app in front ("back should signal escape to the app and go up one page"; at its main page it does nothing more, never leaving the kist); with the map on the glass, a level back (`back_step`). Never a tap on what lies under the corner.
     fn helm_tap(&mut self, corner: u8) -> &'static str {
         if corner == 8 {
+            // A system question waiting (its ring red): straight to it (docs/NOTIFY.md "System questions"), unless it is what the glass shows already.
+            if self.question_open() {
+                return "map: deck: the question waiting opened";
+            }
             if self.send_behind(true) {
                 return "map: deck: the app in front behind";
             }
@@ -5364,7 +5370,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         notes_due: None,
         rest: Cam { x: 0, y: 0, z: Z_ONE, c: ONE, s: 0 },
         tapped: Vec::new(),
-        helm_sent: (0, 0),
+        helm_sent: (0, 0, 0),
+        questions: Vec::new(),
         live_note: None,
         live_words: None,
         opening: None,
@@ -5613,6 +5620,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     if !ferros_sys::notify::doorbell(cap(grants, S_SETTINGS), &notes::WORD) {
         console(grants, b"map: the kernel has no notes' bell\n");
     }
+    // The system's questions are this map's (notes.rs `questions_sync`): any a map before this one posted (it ended, or restarted) go, and whatever still waits is posted again from what this map holds.
+    ferros_sys::notify::seen(cap(grants, S_SETTINGS), &ferros_kist::note::SYSTEM, ferros_sys::notify::ALL, false);
     let mut notes_seen = notes::WORD.load(core::sync::atomic::Ordering::Acquire);
     // What waits already (posted before this map started, or kept from before the boot) glows at once; it taps and takes over nothing: every note's bell count is at most the bell's now, where `notes_read` starts.
     map.notes_read = notes_seen;
@@ -5843,6 +5852,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if !down {
             map.show_fault();
         }
+        // The system's questions (docs/NOTIFY.md "System questions"): one that started waiting on the person posted as a note, one answered or ended cleared, from what this pass holds (the stower's offer, the sheet, the fleet, the open circle); the kernel's bell then lights the Deck button below.
+        map.questions_sync();
         // The notes' bell rang, or the earliest deadline passed (the list read again drops it in the kernel): the glows, the Deck button, a tap or a takeover (notes.rs).
         let nw = notes::WORD.load(core::sync::atomic::Ordering::Acquire);
         if nw != notes_seen || map.notes_due.is_some_and(|d| now() >= d) {

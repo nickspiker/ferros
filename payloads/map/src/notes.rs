@@ -88,6 +88,7 @@ impl Map {
             let circle = self.circle_of(&n.source);
             let mut l = Line::new();
             let _ = write!(l, "map: notes: a {} note from G#{:02X}{:02X}{:02X}{:02X} (note {}, count {}), {}\n", kind_word(n.kind), n.source[0], n.source[1], n.source[2], n.source[3], n.number, n.count, match circle {
+                None if n.source == ferros_kist::note::SYSTEM => "the system's question: the Deck button red",
                 None => "no circle on the deck",
                 Some(i) if self.in_view(i) => "in view",
                 Some(_) => "out of view: silent",
@@ -121,8 +122,16 @@ impl Map {
         }
     }
 
-    /// The Deck button as the deck's summary (display op 66): the latest note in view's source's icon (a bundled icon only; the ring alone otherwise) and how many wait in view. Sent when it changed; called as the list or the resting view changes.
+    /// The Deck button as the deck's summary (display op 66): the latest note in view's source's icon (a bundled icon only; the ring alone otherwise) and how many wait in view, in for you's violet. Sent when it changed; called as the list or the resting view changes.
+    /// A system question waiting wins it (docs/NOTIFY.md "System questions"), whatever the view: the settings circle's icon (the ferros mark, which the bundle has not: the ring alone) in the system's red, its count the questions waiting. WHY it wins over the kists' notes: a question blocks something until it is answered (a host waiting on Stow, a device on its departure); a kist's note waits as well later as now. Mine, 2026-11-12: the owner can turn it round.
     pub fn notes_view(&mut self) {
+        let questions = self.notes.iter().filter(|n| n.source == ferros_kist::note::SYSTEM).count();
+        if questions > 0 {
+            // WHY the cap: the op's field is 16 bits; sixteen at most wait (a source's notes are numbered by a nibble).
+            let s = (self.spec(0).icon, questions.min(u16::MAX as usize) as u16, ferros_glow::Glow::Question as u8);
+            self.helm_send(s);
+            return;
+        }
         let mut count = 0u64;
         let mut latest: Option<(u64, usize)> = None;
         for n in &self.notes {
@@ -139,10 +148,15 @@ impl Map {
         let icon = latest.map_or(0, |(_, i)| self.spec(i).icon);
         let icon = if icon >= 0x80 { 0 } else { icon };
         // WHY the cap: as the circles' counts (`notes_rang`), the op's field is 16 bits.
-        let s = (icon, count.min(u16::MAX as u64) as u16);
+        let s = (icon, count.min(u16::MAX as u64) as u16, ferros_glow::Glow::ForYou as u8);
+        self.helm_send(s);
+    }
+
+    /// The Deck button's note (display op 66: icon, count, glow) sent when it changed.
+    fn helm_send(&mut self, s: (u8, u16, u8)) {
         if s != self.helm_sent {
             self.helm_sent = s;
-            if !ferros_sys::window::helm_note(self.display, s.0, s.1) {
+            if !ferros_sys::window::helm_note(self.display, s.0, s.1, s.2) {
                 console(self.grants, b"map: notes: the display did not take the Deck button's note\n");
             }
         }
@@ -294,5 +308,167 @@ fn kind_word(kind: u8) -> &'static str {
         ferros_kist::note::PERSONAL => "personal",
         ferros_kist::note::LIVE => "live",
         _ => "?",
+    }
+}
+
+/// A system question (docs/NOTIFY.md "System questions"; owner, 2026-11-12: "Yes. Good. So only difference is it would be 700nm red, rather than the regular 400nm notification glow"): something the system waits on the person to answer.
+/// Each is a note from the system (source `ferros_kist::note::SYSTEM`, kind personal: it never takes the screen or rings), posted when it starts waiting and cleared when it is answered (any answer, Cancel too) or ends, never on a timer.
+/// While one waits, the helm's Deck button is red (703 nm, ferros_glow `Question`) whatever the view, and a tap on Deck opens it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Question {
+    /// A kist offered over USB, checked and waiting on Stow or Cancel (the Deck page; docs/KISTS.md "Stowing").
+    Offer([u8; 32]),
+    /// The unstow sheet open on a kist's card: Unstow or Cancel (the Deck page; docs/KISTS.md "The unstow sheet").
+    Unstow([u8; 32]),
+    /// A kist's first start, its circle open on the rights it asks for: Start, or a tap outside (docs/KISTS.md, the first-launch question).
+    FirstStart([u8; 32]),
+    /// A device of the fleet asking to leave it: Approve or Deny (the Fleet page), by its intent.
+    Departure(u8),
+    /// A device being added to the fleet, selected and asking Yes or No (the Fleet page, the add flow's phase 3).
+    Pairing,
+}
+
+impl Question {
+    /// The note's `key`, its name while it waits: the kind of question in the first byte, what it is about after it.
+    fn key(&self) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        let (tag, about) = match self {
+            Question::Offer(c) => (0, Some(c)),
+            Question::Unstow(c) => (1, Some(c)),
+            Question::FirstStart(c) => (2, Some(c)),
+            Question::Departure(intent) => {
+                k[1] = *intent;
+                (3, None)
+            }
+            Question::Pairing => (4, None),
+        };
+        k[0] = tag;
+        if let Some(c) = about {
+            k[1..].copy_from_slice(&c[..31]);
+        }
+        k
+    }
+
+    /// Its words, for `diag notify` and a note's reader: ASCII, the kernel's first cut (NOTIFY.md "Words in one script"), the question alone and never what it names.
+    fn words(&self) -> &'static str {
+        match self {
+            Question::Offer(_) => "a kist offered over USB: Stow or Cancel",
+            Question::Unstow(_) => "unstow: what to keep",
+            Question::FirstStart(_) => "a first start: its permissions",
+            Question::Departure(_) => "a device asks to leave the fleet: Approve or Deny",
+            Question::Pairing => "a device asks to join the fleet: Yes or No",
+        }
+    }
+
+    /// Whether it comes unasked (from a host, from another device), so it taps the motor once as it arrives, as a personal note does; the rest the person opened themselves, looking at it.
+    fn unasked(&self) -> bool {
+        matches!(self, Question::Offer(_) | Question::Departure(_))
+    }
+
+    /// The settings page it is answered on, if it is on one.
+    fn page(&self) -> Option<&'static str> {
+        match self {
+            Question::Offer(_) | Question::Unstow(_) => Some("deck"),
+            Question::Departure(_) | Question::Pairing => Some("fleet"),
+            Question::FirstStart(_) => None,
+        }
+    }
+}
+
+impl Map {
+    /// The questions waiting on the person now, read from what the map holds: the stower's offer, the unstow sheet, an open first-start question, the fleet's departure asking and its add flow's Yes.
+    fn questions_now(&self) -> Vec<Question> {
+        let mut q = Vec::new();
+        if let Some(o) = self.stower.offer.as_ref() {
+            q.push(Question::Offer(o.capsule));
+        }
+        if let Some(s) = self.sheet {
+            q.push(Question::Unstow(s.capsule));
+        }
+        if let View::Open(i) = self.view {
+            if !self.leaving && !self.live_showing() {
+                if let Some(k) = self.kist(i).filter(|k| k.unanswered() && !self.fault.is_some_and(|f| f.0 == k.capsule && f.2)) {
+                    q.push(Question::FirstStart(k.capsule));
+                }
+            }
+        }
+        if let Some((intent, 0)) = self.fleet.depart {
+            q.push(Question::Departure(intent));
+        }
+        if self.fleet.add == 3 {
+            q.push(Question::Pairing);
+        }
+        q
+    }
+
+    /// The system's questions as notes (docs/NOTIFY.md "System questions"): each new one posted (one tap of the motor for one that came unasked), each answered or ended cleared, so the kernel's list (and with it the Deck button, `notes_view`) follows what waits. Called on every pass of the main loop; it calls the kernel only when the set changed.
+    pub fn questions_sync(&mut self) {
+        let now = self.questions_now();
+        if now.len() == self.questions.len() && now.iter().all(|q| self.questions.iter().any(|p| p.0 == *q)) {
+            return;
+        }
+        let settings = cap(self.grants, S_SETTINGS);
+        let mut i = 0;
+        while i < self.questions.len() {
+            if now.contains(&self.questions[i].0) {
+                i += 1;
+                continue;
+            }
+            let (q, number) = self.questions.remove(i);
+            if let Some(n) = number {
+                ferros_sys::notify::seen(settings, &ferros_kist::note::SYSTEM, n, false);
+            }
+            let mut l = Line::new();
+            let _ = write!(l, "map: question answered or ended: {}\n", q.words());
+            console(self.grants, l.as_str().as_bytes());
+        }
+        for q in now {
+            if self.questions.iter().any(|p| p.0 == q) {
+                continue;
+            }
+            let note = ferros_kist::note::Note { kind: ferros_kist::note::PERSONAL, words: Some(alloc::string::String::from(q.words())), count: 1, key: Some(q.key()), ..Default::default() };
+            let posted = ferros_kist::note::build(&note, ferros_detail::eagle_now()).and_then(|doc| ferros_sys::notify::post_for(settings, &ferros_kist::note::SYSTEM, &doc).ok());
+            let mut l = Line::new();
+            let _ = match posted {
+                Some((n, kind)) => write!(l, "map: question waiting on the person: {} (note {n}, {})\n", q.words(), kind_word(kind)),
+                // Not taken (a kernel without notes, or nobody present): the Deck button stays as it is, and a tap on Deck still opens the question.
+                None => write!(l, "map: question waiting on the person: {} (the kernel did not take its note)\n", q.words()),
+            };
+            console(self.grants, l.as_str().as_bytes());
+            if q.unasked() && posted.is_some_and(|p| p.1 == ferros_kist::note::PERSONAL) && ferros_sys::pref(ferros_sys::PREF_SOUND) != ferros_sys::SILENT && !ferros_sys::dnd::on() {
+                quick::buzz(TAP);
+            }
+            self.questions.push((q, posted.map(|p| p.0)));
+        }
+    }
+
+    /// Whether `q` is on the glass now (no app in front, and the map showing its page or its circle): Deck then does what it always does.
+    fn question_showing(&self, q: Question) -> bool {
+        if self.app_front {
+            return false;
+        }
+        match q.page() {
+            None => true,
+            Some(p) => self.view == View::Open(0) && !self.leaving && !self.picker && PAGES[self.page] == p && !matches!(q, Question::Unstow(c) if self.card != Some(c)),
+        }
+    }
+
+    /// Deck tapped with a question waiting (owner, 2026-11-12: one tap goes straight to it): the newest one's page (or its circle, still open behind the app), the app in front sent behind first. False when none waits or it is already on the glass, for Deck's own tap.
+    pub fn question_open(&mut self) -> bool {
+        let Some(q) = self.questions.last().map(|q| q.0) else { return false };
+        if self.question_showing(q) {
+            return false;
+        }
+        if self.app_front {
+            self.send_behind(false);
+        }
+        if let Question::Unstow(c) = q {
+            self.card = Some(c);
+        }
+        match q.page() {
+            Some(p) => self.show_page(p),
+            None => self.draw(),
+        }
+        true
     }
 }
