@@ -1474,6 +1474,70 @@ fn irq_pending_take(intid: u32) -> bool {
         v != 0
     }
 }
+/// The storm guard's per-line state, by `IRQS` index (2026-11-13): a modem build that acked its MSI line without clearing the CP's MSI status watchdog-reset the 8a (PREV_EXIT G#A3, inside SYS_IRQ_ACK).
+/// A level line its device still asserts fires again the moment it is unmasked: each ack then costs an interrupt, a wake SGI to every core and a preemption, as fast as the driver can ack, and nothing the driver does ends it.
+/// Room for `1 << 5` lines: `IRQS` holds fewer, and an index past it panics (a table grown past this wants this grown with it).
+const IRQ_GUARDED: usize = 1 << 5;
+/// Unmasks in a row (an `irq_ack`, or an `irq_wait` with nothing pending, which unmasks too) that found their line still asserted at the distributor (GICD_ISPENDR, read before the unmask): the driver did not clear its source, so the unmask fires it again at once.
+/// An unmask that finds the line quiet starts it from zero.
+static IRQ_RUN: [core::sync::atomic::AtomicU32; IRQ_GUARDED] = [const { core::sync::atomic::AtomicU32::new(0) }; IRQ_GUARDED];
+/// For `diag irqs`, the measure the threshold was set by: unmasks, unmasks that found the line asserted, and the longest run of those.
+static IRQ_UNMASKS: [core::sync::atomic::AtomicU32; IRQ_GUARDED] = [const { core::sync::atomic::AtomicU32::new(0) }; IRQ_GUARDED];
+static IRQ_ASSERTED: [core::sync::atomic::AtomicU32; IRQ_GUARDED] = [const { core::sync::atomic::AtomicU32::new(0) }; IRQ_GUARDED];
+static IRQ_LONGEST: [core::sync::atomic::AtomicU32; IRQ_GUARDED] = [const { core::sync::atomic::AtomicU32::new(0) }; IRQ_GUARDED];
+/// 1 once a line stormed: left masked, every ack and wait on it answered ERR, until a process is next built holding it (`build_from`).
+static IRQ_STORMED: [core::sync::atomic::AtomicU32; IRQ_GUARDED] = [const { core::sync::atomic::AtomicU32::new(0) }; IRQ_GUARDED];
+/// More asserted unmasks in a row than this is a storm: the line is masked for good.
+/// Set against normal traffic on the 8a (`diag irqs`, docs/KERNEL.md "Interrupt storms"); `diag "irqs storm N"` changes it until the next boot.
+pub static IRQ_STORM_RUN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1 << 10);
+
+/// The storm guard, before line `i` (INTID `intid`) is unmasked for `who`: 1 when it has stormed (it must stay masked), else 0.
+/// No branch on the line's state: the run and the counts are arithmetic on the asserted bit; the one branch is a storm's first unmask, which reports it.
+/// The killswitch's lines (INTID 60, 61, 64) are the kernel's own and in no grant (`IRQS`); they are left out of the storm test here as well, so no grant could ever mask them.
+fn irq_storm_check(i: usize, intid: u32, who: &[u8]) -> u32 {
+    use core::sync::atomic::Ordering::Relaxed;
+    let asserted = crate::killswitch::spi_pending(intid) as u32;
+    let run = (IRQ_RUN[i].load(Relaxed) + 1) * asserted;
+    IRQ_RUN[i].store(run, Relaxed);
+    IRQ_UNMASKS[i].fetch_add(1, Relaxed);
+    IRQ_ASSERTED[i].fetch_add(asserted, Relaxed);
+    IRQ_LONGEST[i].fetch_max(run, Relaxed);
+    let killswitch = (intid == 60) as u32 | (intid == 61) as u32 | (intid == 64) as u32;
+    let storm = (run > IRQ_STORM_RUN.load(Relaxed)) as u32 & (killswitch ^ 1);
+    let was = IRQ_STORMED[i].fetch_or(storm, Relaxed);
+    if storm & (was ^ 1) != 0 {
+        crate::flashlog::line(&alloc::format!("line {} (INTID A#{intid}) storms: masked; the process must clear its source ({} unmasked it A#{run} times in a row with the line still asserted)", IRQS[i].name, alloc::string::String::from_utf8_lossy(who)));
+    }
+    was | storm
+}
+
+/// `irq_ack` for line `i`, guarded: unmasked unless it has stormed (the unmask of a stormed line writes 0 to GICD_ISENABLER, which changes nothing: no branch), 0, or ERR once it has.
+fn irq_ack_guarded(i: usize, intid: u32, who: &[u8]) -> u64 {
+    let stormed = irq_storm_check(i, intid, who);
+    crate::killswitch::unmask_spi_if(intid, stormed ^ 1);
+    (stormed as u64).wrapping_neg()
+}
+
+/// A process built holding line `i`: a storm of the process before it is forgotten, the line this one's to arm again.
+fn irq_guard_reset(i: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    IRQ_STORMED[i].store(0, Relaxed);
+    IRQ_RUN[i].store(0, Relaxed);
+}
+
+/// `diag irqs`: each granted line that has been unmasked: its unmasks, those that found it still asserted, the longest run of those in a row, and whether it stormed.
+pub fn irqs_report(out: &mut Vec<u8>) {
+    use core::sync::atomic::Ordering::Relaxed;
+    out.extend_from_slice(alloc::format!("storm guard: more than A#{} unmasks in a row with the line still asserted masks it\n", IRQ_STORM_RUN.load(Relaxed)).as_bytes());
+    for (i, l) in IRQS.iter().enumerate() {
+        let acks = IRQ_UNMASKS[i].load(Relaxed);
+        if acks == 0 {
+            continue;
+        }
+        out.extend_from_slice(alloc::format!("{} (INTID A#{}): A#{acks} unmasks, A#{} still asserted, longest run A#{}{}\n", l.name, l.intid, IRQ_ASSERTED[i].load(Relaxed), IRQ_LONGEST[i].load(Relaxed), if IRQ_STORMED[i].load(Relaxed) != 0 { ", STORMED: masked" } else { "" }).as_bytes());
+    }
+}
+
 /// When a touch interrupt was last taken by the touch driver, or an injected batch handed to it (counter ticks; 0 never): the adaptive clock raises the clusters at once on a change (service.rs `governor`).
 pub static INPUT_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The first input not yet followed by a frame (counter ticks; 0 none), for the touch-to-frame measure (`present_seen`).
@@ -3482,8 +3546,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 Some(Object::Irq(i)) => {
                     let intid = IRQS[i].intid;
                     if nr == SYS_IRQ_ACK {
-                        crate::killswitch::unmask_spi(intid);
-                        f.x[0] = 0;
+                        f.x[0] = irq_ack_guarded(i, intid, &p.name);
+                        0
+                    } else if IRQ_STORMED[i].load(core::sync::atomic::Ordering::Relaxed) != 0 {
+                        // A line that stormed (`irq_storm_check`): masked for good, and its holder told so on every wait.
+                        f.x[0] = ERR;
                         0
                     } else if irq_pending_take(intid) {
                         f.x[0] = 0;
@@ -3491,6 +3558,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     } else if kk.endpoints.iter().any(|e| e.poller == Some(cur) && !e.queue.is_empty()) {
                         // A call already waiting on an endpoint this thread polls: back at once with 2, as `wake_server` would have woken it (2026-11-10). A driver that waits on its device and its endpoint in one wait (the GPS driver, with no deadline since then) could otherwise miss a call that came between its last poll and this wait, and answer it only at its device's next interrupt.
                         f.x[0] = 2;
+                        0
+                    } else if irq_storm_check(i, intid, &p.name) != 0 {
+                        // The wait unmasks the line as an ack does, so it is guarded the same: a driver that waits again and again without clearing its source storms as one that acks.
+                        f.x[0] = ERR;
                         0
                     } else {
                         crate::killswitch::enable_spi(intid);
@@ -6729,6 +6800,12 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
         surfaces_free(epoch);
         regions_free(epoch);
         return Err("spawn: more grants than the grants page holds (108 slots and the console)");
+    }
+    // A line that stormed under the process before is this one's to arm again (`irq_ack_guarded`).
+    for c in cspace.iter() {
+        if let Object::Irq(i) = c.object {
+            irq_guard_reset(i);
+        }
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };
     // An empty slot's token is zeros: a want said no to reads as no grant at all.

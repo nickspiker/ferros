@@ -193,12 +193,17 @@ pub fn enable_spi(intid: u32) {
     wr(GICD + 0x100 + (n / 32) * 4, 1 << (n % 32));
 }
 
-/// Unmask a shared interrupt `.Lirq` masked when it fired.
-pub fn unmask_spi(intid: u32) {
-    if (32..1020).contains(&intid) {
-        let n = intid as usize;
-        wr(GICD + 0x100 + (n / 32) * 4, 1 << (n % 32));
-    }
+/// Unmask a shared interrupt `.Lirq` masked when it fired, when `on` is 1; when 0 the write is of no bit, which GICD_ISENABLER ignores: the storm guard's unmask without a branch (process.rs `irq_ack_guarded`).
+/// Called only for a granted line (process.rs `IRQS`, all SPIs), so the INTID needs no range test.
+pub fn unmask_spi_if(intid: u32, on: u32) {
+    let n = intid as usize;
+    wr(GICD + 0x100 + (n / 32) * 4, on << (n % 32));
+}
+
+/// Whether a shared interrupt is pending at the distributor (GICD_ISPENDR): for a level line, masked or not, whether its device still asserts it.
+pub fn spi_pending(intid: u32) -> bool {
+    let n = intid as usize;
+    rd(GICD + 0x200 + (n / 32) * 4) >> (n % 32) & 1 != 0
 }
 
 /// Enable one private interrupt (PPI, INTID 16..31) on this CPU's redistributor at middle priority — e.g. the EL2 timer (26) that ends a process's time slice. No-op if `arm` found no redistributor.

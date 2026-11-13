@@ -3648,6 +3648,16 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params == b"irqs" || cmd.params.starts_with(b"irqs storm ") {
+                    // `diag irqs`: the interrupt storm guard's measure (process.rs `irqs_report`): each granted line's unmasks, those that found it still asserted, the longest run of those, whether it stormed.
+                    // `diag "irqs storm N"`: the run that counts as a storm, until the next boot (for measuring traffic with the guard out of the way, and for testing it).
+                    if let Some(n) = cmd.params.strip_prefix(b"irqs storm ").and_then(|d| core::str::from_utf8(d).ok()).and_then(|d| d.trim().parse::<u32>().ok()) {
+                        crate::process::IRQ_STORM_RUN.store(n, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    crate::process::irqs_report(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params == b"pets" {
                     // `diag pets`: the process watchdog's measurements (process.rs pets_report): each process's longest stretch between pets.
                     crate::process::pets_report(&mut resp);
