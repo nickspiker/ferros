@@ -1110,7 +1110,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let cons_before = d.tcm_rd(cons + 16);
     let t0 = d.now();
     let rx_off = d.tcm_rd(sh + 36);
-    let mut m = Msgbuf { dma, h2d_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); RX_BUFS as usize], rxq_t: [0; RX_BUFS as usize], rxq_head: 0, rxq_len: 0, nets: [Net { name: [0; 32], len: 0, rssi: 0, flags: 0, seen_in: 0 }; 32], nnets: 0, scan_gen: 0, scan_ver: 1, quiet: false, outcome: 0, rx_up: false, personal: true, retry_s: 1 << 6 };
+    let mut m = Msgbuf { dma, h2d_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, silent: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); RX_BUFS as usize], rxq_t: [0; RX_BUFS as usize], rxq_head: 0, rxq_len: 0, nets: [Net { name: [0; 32], len: 0, rssi: 0, flags: 0, seen_in: 0 }; 32], nnets: 0, scan_gen: 0, scan_ver: 1, quiet: false, outcome: 0, rx_up: false, personal: true, retry_s: 1 << 6 };
     // Control submit ring: 8 ioctl response buffers and 8 event buffers first (the firmware DMAs ioctl results into a posted response buffer, named by its request id in the completion).
     for b in 0..8u32 {
         m.post(d, 0x0B, 1 + b, [8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
@@ -1202,6 +1202,8 @@ struct Msgbuf {
     rd: u32,
     dseq: u32,
     trans: u32,
+    /// Ioctls in a row the firmware never completed (`ioctl`): `SILENT_MAX` of them while serving ends the driver (`serve`).
+    silent: u32,
     /// Print every completion item (bring-up stages) or only what matters (the scan).
     verbose: bool,
     t0: u64,
@@ -1793,11 +1795,13 @@ impl Msgbuf {
         let ts = d.now();
         while d.now().wrapping_sub(ts) < 3 * d.freq {
             if let Some(r) = self.pump(d) {
+                self.silent = 0;
                 return Some(r);
             }
             d.us(1000);
         }
         d.put(b"no ioctl completion\n");
+        self.silent += 1;
         None
     }
     /// WLC_GET_VAR (262): the iovar name and its NUL (then `arg`) at the request buffer; dhd passes the whole buffer length both ways. The value comes back at offset 0 of the response buffer.
@@ -2133,8 +2137,10 @@ const WLAN: u64 = 15;
 const RX_BUFS: u32 = 1 << 8;
 const RX_BASE: u32 = 0x8_0000;
 /// Transmit buffers, 2 KiB each from TX_BASE, above the receive buffers in the DMA region's upper MiB (256 KiB; nothing else is there since the vault's files moved into the arc, `vault_file`).
-/// A batch from the IP stack is mostly its ACKs, one every second segment (RFC 5681): up to 44 for a reply of 88 full frames, and a 4096-byte request holds up to 66 frames of the 60-byte minimum. 32 buffers (2026-11-11 to 2026-11-12, at G#7_0000) could refuse a batch's last ACKs while the chip had not completed its first, and a batch's last ACK refused leaves its sender waiting for its timeout; 128 hold two full requests before any completion.
+/// A batch from the IP stack is mostly its ACKs, one every second segment (RFC 5681): up to 44 for a reply of 88 full frames, and a 4096-byte request holds up to 66 frames of the 60-byte minimum. 32 buffers (2026-11-11 to 2026-11-12, at G#7_0000) could refuse a batch's last ACKs while the chip had not completed its first, and a batch's last ACK refused leaves its sender waiting for its timeout; 128 hold two full requests before any completion. Measured on the 8a with 128: a 421 KB fetch and a 17 MB one alone none refused; three font packs (9 to 17 MB) fetched at once 225 of 12864 refused, no segment resent; 256 (512 KiB, to G#18_0000) would fit, not tried yet.
 const TX_BUFS: u32 = 1 << 7;
+/// Ioctls in a row with no completion that end serving (`serve`): four, 12 s of waiting (the measures ask five every two seconds, each waiting 3 s), where one late completion is a slow firmware and four in a row a stopped one.
+const SILENT_MAX: u32 = 1 << 2;
 const TX_BASE: u32 = 0x10_0000;
 /// The largest request: 4096 bytes, all a call carries (the kernel's SYS_CALL reads at most that).
 const REQ_MAX: usize = 1 << 12;
@@ -2337,6 +2343,14 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
         // The link lost while serving (the firmware's LINK down, or a deauthentication or disassociation from the access point): until 2026-11-10 the loop served on unlinked, the IP stack heard "not linked" every 4 s and the device was off the network until someone restarted this driver (the 8a, overnight). Now it ends, saying why, and init's keeper starts it again (at most every 64 s), which brings the radio up and joins afresh: the path every boot takes.
         if was_linked && (!m.linked || m.join_failed) {
             d.put(if m.linked { b"the access point dropped this device while serving: ending; init's keeper starts this driver again\n".as_slice() } else { b"the link went down while serving: ending; init's keeper starts this driver again\n" });
+            d.flush();
+            m.serving = false;
+            d.failed = true;
+            return;
+        }
+        // The firmware silent (2026-11-12, the owner's Pro: hundreds of "no ioctl completion" over minutes, no transmit completions, every frame refused, each measure's ioctl waiting out its 3 s so one exchange with ip took A#21 s, and Mahere's tiles never loaded): it ends the same way, the firmware's shared flags and console said after it (`run`), and init's keeper starts it again, the chip brought up afresh.
+        if m.silent >= SILENT_MAX {
+            d.put(b"the firmware completes no ioctl while serving: ending; init's keeper starts this driver again\n");
             d.flush();
             m.serving = false;
             d.failed = true;
