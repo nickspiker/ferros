@@ -11,6 +11,7 @@ Started 2026-11-12 (the owner: "would be nice to have ... lumis fully working in
 - It asks the `camera` endpoint for the list, opens a camera, takes frames, develops each into the panel's pixels through the sensor's own Absolute IDT (linear VSF RGB, then fluor's 16-bit g2t pixel; no sRGB, no white balance, no auto exposure), and sends the manual controls (shutter, gain, focus; display gain is its own).
 - Each way there is no camera is its own sentence: the right not given, no driver serving the endpoint, a list that does not read, an empty list.
 - Host tests: the list, the frame header, the development (white lands at diffuse white, below black is black, the mosaic goes to its channels, a quarter turn) and a real 4080 x 3072 RAW10 frame from the Pro (target/cam/img.bin) developing to a lit picture.
+- **Run on the 8a** (2026-11-12, spawned by hand with a kist's slots, the endpoint unserved): Lumis's page, "No camera driver runs on this device yet.", seen in a screen capture; a tap asks again and it keeps running. The preview and the controls have run on no device: there are no frames to give them.
 - tools/lumis-kist.sh signs it with the owner's developer key, declaring the camera; the capsule signs (3898347 bytes).
 
 **The camera right is built** (code 9, asked; KISTS.md "The permission list").
