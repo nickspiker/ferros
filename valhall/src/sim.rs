@@ -272,8 +272,8 @@ pub fn run_marked(words: &[u64], uniforms: &[u64], gid: [u32; 2], mem: &mut Memo
             0x0A4 => {
                 let v = match op2 {
                     0 => f(&reg, 0) + f(&reg, 1),
-                    2 => f(&reg, 0).min(f(&reg, 1)),
-                    3 => f(&reg, 0).max(f(&reg, 1)),
+                    2 => fmin(f(&reg, 0), f(&reg, 1)),
+                    3 => fmax(f(&reg, 0), f(&reg, 1)),
                     8 => ((s(&reg, 0) as i32 as f64) / (1u32 << 24) as f64).exp2() as f32,
                     9 => f(&reg, 0) + split(f(&reg, 1)).0,
                     _ => panic!("valhall::sim: G#0A4 opcode2 {op2} at {pc}"),
@@ -299,8 +299,8 @@ pub fn run_marked(words: &[u64], uniforms: &[u64], gid: [u32; 2], mem: &mut Memo
                 let (a, b) = (h(&reg, 0), h(&reg, 1));
                 let v = match op2 {
                     0 => [a[0] + b[0], a[1] + b[1]],
-                    2 => [a[0].min(b[0]), a[1].min(b[1])],
-                    3 => [a[0].max(b[0]), a[1].max(b[1])],
+                    2 => [fmin(a[0], b[0]), fmin(a[1], b[1])],
+                    3 => [fmax(a[0], b[0]), fmax(a[1], b[1])],
                     _ => panic!("valhall::sim: G#0A5 opcode2 {op2} at {pc}"),
                 };
                 put(&mut reg, pack16(v));
@@ -361,4 +361,13 @@ fn split(x: f32) -> (f32, i32) {
         e += 1;
     }
     (m, e)
+}
+
+/// FMAX's and FMIN's order (ISA.xml's `Clamp`): a NaN operand gives the other, and −0 < +0, so max(−0, +0) is +0 and min(+0, −0) is −0 whichever comes first.
+/// Rust's f32::max leaves the sign of a zero to the platform, and |−0| as max(−0, +0) came out −0 here (2026-11-13).
+fn fmax(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b > a || (b == a && a.is_sign_negative()) { b } else { a }
+}
+fn fmin(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b < a || (b == a && a.is_sign_positive()) { b } else { a }
 }
