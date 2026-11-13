@@ -231,7 +231,12 @@ impl Udp {
     }
     /// One datagram waiting on `port`, as (from, payload).
     fn recv(&self, port: u16, out: &mut [u8]) -> Option<(Addr, usize)> {
-        let n = self.call(&[2, (port >> 8) as u8, port as u8], out);
+        // [2, port, wait 0, deadline 0 (at once), the watcher's id]: the datagrams this process has yet to take, Photon keeping its own copy of each (ip `pins`).
+        let mut q = [0u8; 16];
+        q[0] = 2;
+        q[1..3].copy_from_slice(&port.to_be_bytes());
+        q[12..16].copy_from_slice(&WATCH_ID);
+        let n = self.call(&q, out);
         if n == 0 || n == ERR || n < 21 {
             return None;
         }
