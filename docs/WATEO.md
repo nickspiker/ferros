@@ -19,11 +19,11 @@ Under Android the modem is Android's, and its eSIM manager can enable any profil
 So the lock is on the network side, where nothing on the device can lift it:
 
 - **A Wāteo profile reaches one place only.** The sponsor carrier's APN for Wāteo profiles is private: it routes to Wāteo's gateway and nowhere else, with no internet, no DNS, no carrier services. Attaching with the profile gets a device an address that can reach the gateway, and nothing else.
-- **Data flows only in a tunnel to the gateway.** ferros opens it after attest. The tunnel authenticates with two keys:
-  - **the person's Wāteo key**: derived by the kernel from the person key (FACETS.md "The alias"), as a kist's alias is but for the system's own use, so no kist ever holds it: `derive_key("ferros 2026-11-13 wateo v0", person key)`;
-  - **the device's key**: its ira key, so the gateway knows which device and the person's membership names which devices may use it (below).
-- **What Android sees**: it can enable the profile and attach; the gateway refuses every tunnel it cannot open; no data passes and nothing is billed.
-- **What a moved SIM sees**: the same. A Wāteo profile in any device without the person's keys is a dead line.
+- **Data flows only in a tunnel to the gateway.** ferros opens it after attest. The tunnel's one credential is **the person's Wāteo key**: derived by the kernel from the person key (FACETS.md "The alias"), as a kist's alias is but for the system's own use, so no kist ever holds it: `derive_key("ferros 2026-11-13 wateo v0", person key)`.
+- **The device's key names the device; it proves nothing.** The tunnel also carries the device's ira key, for accounting (which device used what). The ira is a public brand ("Claude memories/ira_is_brand_not_credential.md"): on the Pixels it derives from chip identifiers root Android can read, so a tool can regenerate it (accepted for the Pixels, owner 2026-10-19; PIPE's unforgeable ira closes it). Nothing at the gateway rests on it.
+- **What Android sees**: it can enable the profile and attach; without the person's Wāteo key the gateway refuses the tunnel; no data passes and nothing is billed.
+- **What a moved SIM sees**: the same. A Wāteo profile in any device without the person's Wāteo key is a dead line.
+- **What the person can do, deliberately** (owner, 2026-11-13: "I don't think we should restrict. If they want to hackjob android to get access to their own service, plus we can't really stop them without fucking up our open model"): a rooted Android of theirs that joins their fleet (approved on a fleet device) can open the person key and derive the Wāteo key, and use their service. That is the person's choice, paid by them; Wāteo does not try to tell ferros from anything else, which would need a vendor's hardware attestation.
 
 The gateway sees the Wāteo key and the device key, never the handle, the identity key, or any kist's alias.
 
@@ -50,7 +50,10 @@ The gateway sees the Wāteo key and the device key, never the handle, the identi
 **Decided** (2026-11-04, "Claude memories/radios_at_attest_gps_locked.md"): radios come up at attest; while locked only the signed locate may act on radio input, and LTE carries the locate's answer.
 
 **Destination.** A locked device has no person key in the kernel, so it cannot open a person's tunnel.
-The gateway takes a second, narrow kind: a **device tunnel**, opened with the device's ira key alone, which reaches only fgtw.org's locate responder and nothing else, metered to the membership that names that device.
+The gateway takes a second, narrow kind: a **device tunnel**, which reaches only fgtw.org's locate responder and nothing else, metered to the membership that names that device.
+It cannot be opened with the ira key: anything that regenerates the ira could then open it and answer a locate with a false place.
+Instead, at each attest ferros derives a **locate key** from the wairua (fresh each power-on, in registers only) and has the person's Wāteo key sign it, valid until the device next loses power; while locked, the device tunnel opens with that key alone.
+The trade: a device power-cycled while locked cannot answer a locate until its person attests again; a false place is worse than none.
 That keeps locate working on Wāteo without letting a locked device, or Android, use the line.
 
 ## Getting the community onto ferros
