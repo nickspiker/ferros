@@ -8034,6 +8034,7 @@ fn server(grants: u64) -> ! {
                     unsafe { CLIENT_DREW = true };
                     let clip_k = unsafe { CLIP_PHASE };
                     if clip_k.is_none() {
+                        attest_mark(grants, 8, b"the map's first camera frame");
                         last_interaction = now();
                         // Gravity for this frame: under a finger the map's frames come back to back and the loop's top (where gravity is read at rest) is not reached between them, so the clock kept the turn it had when the touch began (owner, 2026-10-24).
                         gravity_poll();
@@ -9193,12 +9194,16 @@ fn server(grants: u64) -> ! {
                         unsafe { ATTEST_T = (now(), 0) };
                         // Read by the loader (`wall_loader`) and answered now: the deck does not wait for it (owner, 2026-11-08).
                         wall_load(false);
+                        // The load starts at the next pass's top (`wall_step`), which the bell brings at once: without it the loop slept until its next deadline, and the read began 161 ms after the attest (2026-11-12, the 8a).
+                        ring_bell();
                     }
                 }
                 // 44 `wallpaper kept`: wallgen has made the person's wallpaper on the GPU and kept it on this device (`map.wallpaper.made`): read by the loader and shown, unless their own is up. A read already under way (op 42's, which may have found nothing yet) gives way to this one.
                 Some(44) => {
                     if unsafe { WALL_BUF != 0 && !(WALL_ON && WALL_OWN) } {
                         wall_load(true);
+                        // Started at the next pass's top, at once (as op 42's).
+                        ring_bell();
                     }
                 }
                 // 32 `wallpaper state` (2026-11-10, the Pro's wallpaper gone with no line to say why): out[1] bits, 0 a buffer, 1 shown, 2 a load under way, 3 the person's own shown, 5 a load wanted; logged the same. (Bits 3 and 4 were the display's own drawing job and its waiting seed until 2026-11-11, when the wallpaper went to the GPU.)
@@ -9450,6 +9455,9 @@ fn server(grants: u64) -> ! {
         // Where a long pass went (measuring, owner 2026-11-07: "why is the UI stupidly slow"): everything before the wallpaper's step (the clock and scope between frames, gravity, windows), the wallpaper's step, the bars drawn and published.
         let mut stage_us = [0u64; 3];
         let mut ncalls = 0u32;
+        // Which ops the pass ran (a batch by its first), and the surfaces its shows (op 22) were on, bit k surface k (`diag arcs` names their owners): who a long pass waited on (2026-11-12, "long pass 4747 ms: 285 calls" with no caller named).
+        let mut pass_ops = [0u16; 1 << 7];
+        let mut shows_on = 0u32;
         // A clock on the screen, spatial dither only (no flips): a new second, the last plain frame drawn again, as if the map had sent it (the clock reads the time as it draws).
         // The last frame again: a camera op, or each op of a batch in order.
         let mut replay = |handle: &mut dyn FnMut(&[u8], &mut [u8; 16]) -> usize| {
@@ -9693,6 +9701,15 @@ fn server(grants: u64) -> ! {
             let mut out = [0u8; 16];
             let t_call = now();
             ncalls += 1;
+            if let Some(&op) = m.first() {
+                // WHY the mask: the op byte is the client's; the table covers every op there is (under 128).
+                pass_ops[(op & 127) as usize] += 1;
+                if op == 22 && m.len() >= 17 {
+                    if let Some(sk) = surface_of(u64::from_le_bytes(m[9..17].try_into().unwrap())) {
+                        shows_on |= 1 << sk;
+                    }
+                }
+            }
             // The time since the last reply: what the client spent between calls (its own work, the scheduler, this loop's own sleep).
             let gap_us = (t_call.wrapping_sub(last_reply) * 1_000_000 / freq()).min(999_999);
             let mut op_us = [0u64; 32];
@@ -10099,6 +10116,21 @@ fn server(grants: u64) -> ! {
             tlog.dec(stage_us[2] / 1000);
             tlog.s(b" ms\n");
             tlog.flush();
+            if ncalls > 0 {
+                tlog.s(b"display: that pass's calls by op:");
+                for (op, &c) in pass_ops.iter().enumerate().filter(|(_, c)| **c > 0) {
+                    tlog.s(b" ");
+                    tlog.dec(op as u64);
+                    tlog.s(b" x");
+                    tlog.dec(c as u64);
+                }
+                if shows_on != 0 {
+                    tlog.s(b"; shows on surfaces (bits) ");
+                    tlog.hex(shows_on);
+                }
+                tlog.s(b"\n");
+                tlog.flush();
+            }
         }
         // Until the doorbell rings (`BELL`: a request, the bars, a window's end) or the next deadline: the second's tick; the flip, only while a flip can happen (while a finger moves the next phase stays dirty and `next_flip` falls into the past — a wake set from it made the old sleep return at once and this loop spin its slice, 2026-10-23); and a stale phase to refill once the frames have stopped coming.
         let flip_possible = unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean;

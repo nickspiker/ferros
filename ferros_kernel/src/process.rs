@@ -52,6 +52,10 @@ static LOCK_SITE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 static LOCK_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static LOCK_HOLD_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static LOCK_HOLD_SITE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The last holds of the kernel lock longer than 1/128 s, each [taken at (counter), held (ticks), site]: what stopped every other core, on a timeline (2026-11-12, measuring attest to the deck). `LONG_HOLD_N` counts them all.
+pub const LONG_HOLDS: usize = 1 << 5;
+pub static LONG_HOLD: [[core::sync::atomic::AtomicU64; 3]; LONG_HOLDS] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 3] }; LONG_HOLDS];
+pub static LONG_HOLD_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Per core: the contended takes of the kernel lock and the counter ticks spent waiting for it (`diag sched`): the cores' time lost to the one lock, where the profile of 2026-11-11 put 17 % of the workers'.
 pub static LOCK_WAIT: [[core::sync::atomic::AtomicU64; 2]; 16] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 2] }; 16];
 
@@ -105,6 +109,13 @@ fn unlock() {
     if held > LOCK_HOLD_MAX.load(Relaxed) {
         LOCK_HOLD_MAX.store(held, Relaxed);
         LOCK_HOLD_SITE.store(LOCK_SITE.load(Relaxed), Relaxed);
+    }
+    // Every hold past 1/128 s, the last LONG_HOLDS of them: when (the counter at the take), how long, from where (`diag`'s lock lines).
+    if held > crate::platform::cntfrq() >> 7 {
+        let i = LONG_HOLD_N.fetch_add(1, Relaxed) as usize % LONG_HOLDS;
+        LONG_HOLD[i][0].store(LOCK_AT.load(Relaxed), Relaxed);
+        LONG_HOLD[i][1].store(held, Relaxed);
+        LONG_HOLD[i][2].store(LOCK_SITE.load(Relaxed), Relaxed);
     }
     HOLDER.store(0, Relaxed);
     crate::platform::note(0, 0);
@@ -4325,8 +4336,13 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 Some((Object::Console, r)) if r & RIGHT_SEND != 0 => {
                     let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
                     let at = kk.console.len();
+                    // Each line stamped with the kernel's clock in ms, as the flash log's lines are ("t<ms> "), so a timeline across processes reads straight off the console (2026-11-12, measuring attest to the deck).
+                    let ms = crate::platform::cntpct() / (crate::platform::cntfrq() / 1000);
                     for &c in &msg {
                         if p.line_start {
+                            kk.console.push(b't');
+                            push_dec(&mut kk.console, ms);
+                            kk.console.push(b' ');
                             kk.console.extend_from_slice(&p.name);
                             kk.console.extend_from_slice(b": ");
                             if c != b'\n' {
@@ -5369,6 +5385,31 @@ pub fn push_console(bytes: &[u8]) {
 pub fn take_console() -> Vec<u8> {
     lock();
     let v = core::mem::take(&mut k().console);
+    // What was drained is kept too, its last CONSOLE_KEPT bytes, for `diag "console kept"`: a reader that drains takes the lines from everyone else (2026-11-12: several tools on one device, and a timeline read off the console lost its middle to another's drain).
+    let kept = unsafe { &mut *(&raw mut KEPT) };
+    kept.extend_from_slice(&v);
+    if kept.len() > CONSOLE_KEPT {
+        let cut = kept.len() - CONSOLE_KEPT / 2;
+        kept.drain(..cut);
+    }
+    unlock();
+    v
+}
+
+/// How much drained console `take_console` keeps (`KEPT`): it is trimmed to half of this when it passes it.
+const CONSOLE_KEPT: usize = 1 << 20;
+static mut KEPT: Vec<u8> = Vec::new();
+
+/// The console as kept, without draining it: the last `max` bytes of what was drained and what waits to be (`diag "console kept [KiB]"`).
+pub fn console_kept(max: usize) -> Vec<u8> {
+    lock();
+    let kept = unsafe { &*(&raw const KEPT) };
+    let pending = &k().console;
+    let mut v = Vec::with_capacity(max);
+    let from_pending = pending.len().min(max);
+    let from_kept = (max - from_pending).min(kept.len());
+    v.extend_from_slice(&kept[kept.len() - from_kept..]);
+    v.extend_from_slice(&pending[pending.len() - from_pending..]);
     unlock();
     v
 }
@@ -6457,11 +6498,54 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
 /// `SYS_SPAWN`'s work: the capsule by vault key through the gate (and, masked, its seal), then a process holding `objects`, queued to run.
 fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<usize, &'static str> {
     let read = unsafe { CAPSULES }.ok_or("spawn: no vault to read capsules from")?;
+    let t0 = crate::platform::cntpct();
     let capsule = read(key).ok_or("spawn: no such capsule in the vault")?;
     let sealed = read(b"sealed").unwrap_or_default();
+    let t_read = crate::platform::cntpct();
     let g = crate::oracle::gate(&capsule)?;
+    // What a spawn costs, by part, on the console (2026-11-12, measuring attest to the deck: every spawn holds the kernel lock while it reads and checks its capsule).
+    let r = spawn_checked(name, &g, &sealed, objects);
+    let us = |a: u64, b: u64| b.wrapping_sub(a) * 1_000_000 / crate::platform::cntfrq();
+    let t_end = crate::platform::cntpct();
+    let kk = k();
+    // On a line of its own: a process's line still open (no newline yet) is broken here rather than run into.
+    if kk.console.last().is_some_and(|&c| c != b'\n') {
+        kk.console.push(b'\n');
+    }
+    kk.console.extend_from_slice(b"t");
+    push_dec(&mut kk.console, t_end / (crate::platform::cntfrq() / 1000));
+    kk.console.extend_from_slice(b" kernel: spawned ");
+    kk.console.extend_from_slice(name);
+    kk.console.extend_from_slice(b": capsule A#");
+    push_dec(&mut kk.console, capsule.len() as u64);
+    kk.console.extend_from_slice(b" bytes read in A#");
+    push_dec(&mut kk.console, us(t0, t_read));
+    kk.console.extend_from_slice(b" us, gate and build A#");
+    push_dec(&mut kk.console, us(t_read, t_end));
+    kk.console.extend_from_slice(if r.is_ok() { b" us\n".as_slice() } else { b" us (refused)\n" });
+    r
+}
+
+/// The decimal digits of `v` onto `out`, for console lines built under the lock without the formatter.
+fn push_dec(out: &mut Vec<u8>, v: u64) {
+    let mut d = [0u8; 20];
+    let mut n = 0;
+    let mut v = v;
+    loop {
+        d[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    out.extend(d[..n].iter().rev());
+}
+
+/// `spawn_queued` past the gate: the seal of a masked capsule, the ihi, the process built and queued.
+fn spawn_checked(name: &[u8], g: &crate::oracle::Gated, sealed: &[u8], objects: &[(Object, u32)]) -> Result<usize, &'static str> {
     if g.masked {
-        let s = crate::oracle::seal(&g).ok_or("no system secret: cannot check a seal")?;
+        let s = crate::oracle::seal(g).ok_or("no system secret: cannot check a seal")?;
         if !sealed.chunks_exact(32).any(|e| e == s) {
             return Err("gate: masked capsule not installed (no seal)");
         }

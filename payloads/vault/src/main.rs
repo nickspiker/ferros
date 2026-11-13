@@ -19,7 +19,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use core::sync::atomic::{AtomicU64, AtomicUsize};
 use ferros_store::{Domain, Nonces, Opener, Sealed, Store, Writer};
-use ferros_sys::{cap, console, freq, now, ERR};
+use ferros_sys::{cap, console, freq, now, ERR, NOTHING};
 use manifestus::{Block, BlockDev, DeletePolicy, Mirror, Vault};
 
 /// The heap: manifestus's working set (its index walks, the reap's windows) and a piece being opened or sealed. 24 MiB from 2026-11-08: a write grows a buffer of manifestus's with the vault's entries (about 926 bytes an entry, doubling: 671,760 bytes writing a 47 MB kist capsule into an empty store, 1,343,504 writing it again, measured on the host, ferros_store `rewrite_peak`), and at 8 MiB the vault process died rewriting Mahere's capsule. 56 MiB since 2026-11-12 (the arc 64 MiB): on the 8a, after Mahere's cells, three Mahere capsules and an offer of Photon cut off at 64 MiB, the open itself ran 24 MiB out ("memory allocation of 69768 bytes failed" before "open in"), every boot, and the GPU, WiFi and sensors processes, which read their firmware from this vault, ended with it. The open's high water is on the console ("open in"). 2026-11-12, the 8a: it ran out again inside manifestus's reap while a 91 MB capsule was dropped (a reap window is a sixty-fourth of the tract, 2 GiB then 4 GiB there, and its survivors were held twice); manifestus `bounded-reap` writes them out 256 blocks at a time, and the same run of offers that ended it twice then left it alive (docs/VAULT-OUT.md "Its end").
@@ -762,7 +762,8 @@ extern "C" fn work(_: u64) -> ! {
     let bound = if blank { MIRROR } else { HALF };
     say!("vault: block 0 blank {}, opening bounded at {} blocks a mirror", blank, bound);
     let mirror = Mirror::new(Half { base: 0, blocks: bound }, Half { base: HALF, blocks: bound });
-    let vault = match Vault::open(mirror, RING_LOG2, seconds(), DeletePolicy::UnlinkOnly) {
+    // Lazily (manifestus `open_lazy`): reads are served from the head's index at once, and the walk that finds what is live is stepped between requests (`settle_step`, below); every write finishes it first, so writes are as after an eager open. The eager open walked the whole index before serving anything: 10.7 s on the 8a with 462,713 live blocks (2026-11-12), and every reader waited behind it, the person's space at attest among them (the deck's kists list 4.9 s, the GPU's firmware, the wallpaper), which an attest in a boot's first seconds met as "four seconds to the deck".
+    let vault = match Vault::open_lazy(mirror, RING_LOG2, seconds(), DeletePolicy::UnlinkOnly) {
         Ok(v) => v,
         Err(e) => {
             say!("vault: the region did not open: {:?}", e);
@@ -770,7 +771,7 @@ extern "C" fn work(_: u64) -> ! {
         }
     };
     let st = vault.engine_stats();
-    say!("vault: tract {} blocks from {}, the window {} a mirror; generation {}, {} live blocks, plow {} reap {}", st.tract_blocks, vault.tract_base(), HALF, st.generation, st.live_blocks, st.plow, st.reap);
+    say!("vault: tract {} blocks from {}, the window {} a mirror; generation {}, {} live blocks, plow {} reap {}{}", st.tract_blocks, vault.tract_base(), HALF, st.generation, st.live_blocks, st.plow, st.reap, if vault.settled() { "" } else { " (not settled: the walk that counts them follows, between requests)" });
     let mut store = Store::new(vault, Entropy { pool: [0; 4096], at: 4096 }, seconds);
     store.set_clock(now);
     say!("vault: open in {} ms, serving; the heap's high water {} KiB of {} KiB, {} KiB in use", (now() - t0) * 1000 / freq(), ferros_heap::PEAK.load(Relaxed) >> 10, HEAP_BYTES >> 10, ferros_heap::IN_USE.load(Relaxed) >> 10);
@@ -796,9 +797,32 @@ extern "C" fn work(_: u64) -> ! {
     let mut epoch: Option<u32> = None;
     // The person's export being read (op 5): built at offset 0, kept until read to its end or the person locks.
     let mut export: Option<Vec<u8>> = None;
+    // The lazy open's walk (above): stepped while no request waits, a step at a time (WALK_STEP pointers, a few ms), so a request waits for at most one step. Done once settled; a step that fails stops the walk (the eager open's refusal, met later): reads go on from the index, and every write fails with the walk's error, said here once.
+    let mut walking = !store.engine().settled();
+    let t_walk = now();
 
     loop {
-        let n = ferros_sys::recv(cap(grants(), S_SERVE), &mut msg, &mut token, false);
+        let n = if walking {
+            let n = ferros_sys::recv(cap(grants(), S_SERVE), &mut msg, &mut token, true);
+            if n == NOTHING {
+                match store.engine().settle_step() {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        walking = false;
+                        let st = store.engine().engine_stats();
+                        say!("vault: settled {} ms after serving began: {} live blocks, plow {} reap {}", (now() - t_walk) * 1000 / freq(), st.live_blocks, st.plow, st.reap);
+                    }
+                    Err(e) => {
+                        walking = false;
+                        say!("vault: the open's walk refused: {:?}; serving reads only, every write will fail", e);
+                    }
+                }
+                continue;
+            }
+            n
+        } else {
+            ferros_sys::recv(cap(grants(), S_SERVE), &mut msg, &mut token, false)
+        };
         if n == ERR {
             continue;
         }

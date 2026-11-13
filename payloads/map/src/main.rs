@@ -5281,6 +5281,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The circles' labels are `&'static str`, absolute addresses fixed at link time; linked position-independent, they are relocations this applies before anything reads them. Without it the first label read faulted at its link-time address, G#D9B (2026-10-21).
     unsafe { ferros_sys::relocate() };
     unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
+    // The deck's start by part, to the console with "deck drawn" (2026-11-12, measuring attest to the deck): [the display's size, the person's kists read, the places kept, the scene sent, the view kept, the first draw], counter ticks at each end.
+    let mut t_start = [now(); 7];
     let display = cap(grants, S_DISPLAY);
     let touch = cap(grants, S_TOUCH);
     let mut r = [0u8; 256];
@@ -5291,9 +5293,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         ferros_sys::exit(1);
     }
     let (w, h) = (u16::from_le_bytes([r[0], r[1]]) as i64, u16::from_le_bytes([r[2], r[3]]) as i64);
+    t_start[1] = now();
 
     // The circles: settings, then a kist circle for each kist the person stowed (their list, `kists.list`; none readable, none shown), sized by share and placed once.
     let kists = ferros_kist::store::read_here(cap(grants, S_KIST_LIST)).unwrap_or_default();
+    t_start[2] = now();
     // WHY: the scene and the arrays hold MAX circles; kists past it get no circle until there is room (the settings' Deck page still lists them).
     let n = (1 + kists.kists.len()).min(MAX);
     let rs: [i64; MAX] = core::array::from_fn(|i| if i == 0 { radius_of(CIRCLES[0].share) } else if i < n { radius_of(KIST_SHARE) } else { 0 });
@@ -5404,6 +5408,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     let kept = map.load_places_near();
+    t_start[3] = now();
     // Whatever the vault held, no two circles start overlapping (places kept before circles pushed each other could).
     map.push_apart(MAX);
     if kept > 0 {
@@ -5413,9 +5418,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     map.send_scene();
     map.cam = map.deck_fit();
+    t_start[4] = now();
     if map.load_view() {
         console(grants, b"map: the view as it was left\n");
     }
+    t_start[5] = now();
     // Developer, once the twelve taps made it a page (release builds; always one on development builds).
     let mut dv = [0u8; 4];
     map.dev = matches!(ferros_sys::store_get(cap(grants, S_STORE), b"dev", &mut dv), Some(n) if n >= 1 && dv[0] == 1);
@@ -5440,6 +5447,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     map.draw();
+    t_start[6] = now();
     // Nothing is in focus (display op 25, icon 0): a display that outlived an older map, one with widgets that took focus, would otherwise keep redrawing one at the panel's rate.
     call(display, &[25, 0, 0, 0, 0, 0, 0], &mut r);
     // A development build can time the frame loop without a finger (FERROS_MAP_START=bench): 32 frames of a pinch with a twist, then 32 of a pan, each the whole round trip to the display server; the averages to the console, then the camera back at rest.
@@ -5516,7 +5524,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         map.cam = home;
         map.draw();
     }
-    console(grants, b"map: deck drawn; a tap on a circle opens it\n");
+    {
+        let us = |a: u64, b: u64| (b - a) * 1_000_000 / freq();
+        let mut l = Line::new();
+        let _ = write!(l, "map: deck drawn {} us after start (display {}, kists list {}, places {}, scene {}, view {}, draw {} us); a tap on a circle opens it\n", us(t_start[0], t_start[6]), us(t_start[0], t_start[1]), us(t_start[1], t_start[2]), us(t_start[2], t_start[3]), us(t_start[3], t_start[4]), us(t_start[4], t_start[5]), us(t_start[5], t_start[6]));
+        console(grants, l.as_str().as_bytes());
+    }
     // FERROS_MAP_START=crowd: 200 more circles in the display's scene only (never the vault), for timing a busy deck.
     if option_env!("FERROS_MAP_START") == Some("crowd") {
         let placed = map.crowd(200);
