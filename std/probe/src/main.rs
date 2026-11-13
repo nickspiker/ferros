@@ -69,15 +69,18 @@ fn main() {
     println!("kete: cell A#{} bytes written in A#{wrote} ms, read in A#{} ms {}", cell.len(), t.elapsed().as_millis(), if back.as_deref() == Some(&cell[..]) { "exact" } else { "WRONG" });
     store.delete_device("probe.cell").unwrap();
     // Values the size of a kist's capsule (2026-11-13: Mahere's is 53 MB, Photon's 91 MB), written and read whole thru the vault, each compared by BLAKE3: the vault process takes them a transfer at a time and must hold no value whole.
-    for mib in [32usize, 96] {
+    // All kept until the last is read, so the vault's live set grows by about 28,000 hashed blocks for each 96 MiB (its console says the set after each): the 8a's vault died twice as that set grew (2026-11-12 and 13).
+    let sizes = [32usize, 96, 96, 96, 96, 96, 96];
+    for (k, &mib) in sizes.iter().enumerate() {
         let n = mib << 20;
-        let value: Vec<u8> = (0..n).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let value: Vec<u8> = (0..n).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 ^ k as u8).collect();
         let want = blake3::hash(&value);
+        let name = format!("probe.capsule.{k}");
         let t = std::time::Instant::now();
-        let wrote = store.write_device_bulk(&[("probe.capsule".to_string(), value)]);
+        let wrote = store.write_device_bulk(&[(name.clone(), value)]);
         let wrote_ms = t.elapsed().as_millis();
         let t = std::time::Instant::now();
-        let back = store.read_device_bulk("probe.capsule");
+        let back = store.read_device_bulk(&name);
         let read_ms = t.elapsed().as_millis();
         let verdict = match (&wrote, &back) {
             (Err(e), _) => format!("write FAILED: {e}"),
@@ -86,10 +89,11 @@ fn main() {
             (_, Ok(Some(b))) if b.len() == n && blake3::hash(b) == want => "exact".to_string(),
             (_, Ok(Some(b))) => format!("WRONG (A#{} bytes back)", b.len()),
         };
-        println!("kete: A#{mib} MiB value written in A#{wrote_ms} ms, read in A#{read_ms} ms: {verdict}");
-        drop(back);
-        if let Err(e) = store.delete_device("probe.capsule") {
-            println!("kete: delete of the A#{mib} MiB value FAILED: {e}");
+        println!("kete: value A#{k}, A#{mib} MiB, written in A#{wrote_ms} ms, read in A#{read_ms} ms: {verdict}");
+    }
+    for k in 0..sizes.len() {
+        if let Err(e) = store.delete_device(&format!("probe.capsule.{k}")) {
+            println!("kete: delete of value A#{k} FAILED: {e}");
         }
     }
     let addrs = store.live_addrs().unwrap();

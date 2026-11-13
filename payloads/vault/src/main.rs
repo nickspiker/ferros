@@ -1015,9 +1015,17 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
                     writers.swap_remove(i);
                     ERR
                 } else if !more {
-                    let w = writers.swap_remove(i).w;
-                    match store.finish(&d, w) {
-                        Ok(()) => 0,
+                    let p = writers.swap_remove(i);
+                    let whole = p.next;
+                    match store.finish(&d, p.w) {
+                        Ok(()) => {
+                            // A large value's end says what the live set and the heap hold after it (2026-11-13: the live set's growth ended the process twice on the 8a).
+                            if whole >= METER_MIN {
+                                let (hashed, tree) = store.engine().live_counts();
+                                say!("vault: wrote {} B; the live set {} hashed, {} by position, {} KiB; the heap {} KiB in use, high water {} of {} KiB", whole, hashed, tree, store.engine().live_bytes() >> 10, ferros_heap::IN_USE.load(Relaxed) >> 10, ferros_heap::PEAK.load(Relaxed) >> 10, HEAP_BYTES >> 10);
+                            }
+                            0
+                        }
                         Err(e) => {
                             say!("vault: finish refused: {:?}", e);
                             ERR
