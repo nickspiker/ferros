@@ -141,8 +141,11 @@ fn main() {
     let mut app = PhotonApp::new();
     app.set_device_keypair(derive_device_keypair(&root));
     app.set_signing_bundle(SigningBundle::derive(&root));
-    // THE SEAM (2026-11-13): Photon's messenger takes `PhotonKeys` where it took the session's identity seed (photon src/crypto/photon_keys.rs, aa53a370), and the person's people where it kept its own contact rows (FACETS.md D5), but PhotonApp has no way in for either yet. Wanted from the Photon session: `PhotonApp::set_photon_keys(PhotonKeys)` (opens on the contacts, no handle screen, while `keys` is Some) and `PhotonApp::set_people(Vec<fgtw::people::Person>)` (each a contact by handle proof, pinned identity key and genesis, the name the person gave them). Until then both are held here, Photon runs on its own handle screen as before, and nothing of them reaches its vault.
-    let _held = (keys, people);
+    // The person, handed in before Photon starts (photon 47f8b360): with PhotonKeys Photon opens its vault under the alias and lands on its contacts, no handle screen; it refuses a binding that does not name this alias and this handle proof (it says "PHOTON KEYS: refused") and runs its handle screen as before. The people merge into its contacts once its vault is open.
+    if let Some(keys) = keys {
+        app.set_photon_keys(keys);
+    }
+    app.set_people(people);
     // No window controls strip (minimise, maximise, close: a desktop window manager's, nothing on ferros), as Photon's Android build has none: since 2026-11-12 the frame reaches the glass's edge under the console (WINDOWS.md "Drawn under the controls"), and the strip, cut away with the corner until then, would show in the top right under the radios' circles, which take every touch there.
     fluor::paint::DEBUG_SKIP_CONTROLS.store(true, std::sync::atomic::Ordering::Relaxed);
     let caps = fluor::host::ferros::Caps { display: 1, touch: 2, surface: 3 };
