@@ -27,6 +27,7 @@ opt-level = 3
 debug-assertions = false
 overflow-checks = false
 
+# Photon's own code at 1, measured 2026-11-13 on the 8a (docs/PHOTON.md "Photon's frame time"): at 3 the attest screen's scroll frame rendered in 65 ms against 68, and in 370 ms against 382 before the wave's fix, for about 25 s more a build.
 [profile.dev.package.photon-messenger]
 opt-level = 1
 

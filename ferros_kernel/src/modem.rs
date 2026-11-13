@@ -48,7 +48,7 @@ fn bootconfig(dtb: &ferros_hal::dtb::Dtb) -> Option<&'static [u8]> {
 }
 
 /// The last `key = value` in the bootconfig (`:=` overrides, last wins), quotes and spaces dropped.
-fn bootconfig_value(text: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn bootconfig_value(text: &[u8], key: &[u8]) -> Option<Vec<u8>> {
     let at = text.windows(key.len()).rposition(|w| w == key)?;
     let line = &text[at + key.len()..];
     let line = &line[..line.iter().position(|&c| c == b'\n').unwrap_or(line.len())];
@@ -126,6 +126,7 @@ pub fn keep_bootconfig(dtb_addr: u64) {
         return;
     };
     if let Some(t) = bootconfig(&dtb) {
+        crate::bootlock::read(t);
         unsafe { BOOTCONFIG = Some(Vec::from(t)) };
     }
 }

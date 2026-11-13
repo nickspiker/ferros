@@ -24,6 +24,9 @@ pub const PERSONAL: u8 = 1;
 /// Live: a beam, an alarm the person set: rings and takes the screen until answered, declined, or ended by the caller.
 pub const LIVE: u8 = 2;
 
+/// The source of the system's questions (`Note::source` all zeros, the system's own): anything the system waits on the person to answer, a kist offered to stow, the unstow sheet, a first start's permissions, a device asking to join or leave the fleet (docs/NOTIFY.md "System questions"). No capsule's blake3 is all zeros, so no kist is ever this source.
+pub const SYSTEM: [u8; 32] = [0; 32];
+
 /// A note's fields.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Note {
@@ -55,12 +58,15 @@ pub enum Poster {
     System,
     /// A kist: whether it holds the network (`udp`: a person's words reach a kist only over a link).
     Kist { network: bool },
+    /// The system waiting on the person's answer (source `SYSTEM`; owner, 2026-11-12, of a question: "only difference is it would be 700nm red, rather than the regular 400nm notification glow"): personal at most, so it never takes the screen or rings.
+    Question,
 }
 
-/// The kind a note gets (docs/NOTIFY.md "Who decides the kind"): the kind asked for, lowered to what the system can see, never raised. The system's own: as asked. A kist's: never live yet (a beam is live once the system's beam path says one is open, an alarm once the person set it thru the system; neither is built), personal when it names a person and the kist holds the network, else status.
+/// The kind a note gets (docs/NOTIFY.md "Who decides the kind"): the kind asked for, lowered to what the system can see, never raised. The system's own: as asked. Its questions: personal at most. A kist's: never live yet (a beam is live once the system's beam path says one is open, an alarm once the person set it thru the system; neither is built), personal when it names a person and the kist holds the network, else status.
 pub fn decide(asked: u8, names_person: bool, poster: Poster) -> u8 {
     let ceiling = match poster {
         Poster::System => LIVE,
+        Poster::Question => PERSONAL,
         Poster::Kist { network: true } if names_person => PERSONAL,
         Poster::Kist { .. } => STATUS,
     };
@@ -226,6 +232,10 @@ mod tests {
         assert_eq!(decide(PERSONAL, false, Poster::Kist { network: true }), STATUS);
         // Lowering is always the kist's.
         assert_eq!(decide(STATUS, true, Poster::Kist { network: true }), STATUS);
+        // A system question is never live: it lights the Deck button, it never takes the screen.
+        assert_eq!(decide(LIVE, false, Poster::Question), PERSONAL);
+        assert_eq!(decide(PERSONAL, false, Poster::Question), PERSONAL);
+        assert_eq!(decide(STATUS, false, Poster::Question), STATUS);
     }
 
     #[test]

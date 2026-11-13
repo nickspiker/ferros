@@ -6,7 +6,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use ferros_sys::sensor_block as sb;
-use ferros_sys::{cap, freq, mmio_write, now};
+use ferros_sys::{cap, freq, mmio_read, mmio_write, now};
 
 /// ferros's channel on com.google.usf (the HAL used 6 and 7; the kernel uses this same one, so taking the conversation over closes its subscriptions).
 const CHAN: u32 = 2;
@@ -94,6 +94,78 @@ fn region(h: usize, dir: usize) -> usize {
 fn mbox_signal(idx: u32) {
     let block = MBOX_BLOCKS[(idx / 16) as usize % 3];
     mmio_write(cap(unsafe { G }, crate::S_MBOX), block + MB_INTGR0, 1 << (idx % 16));
+}
+
+// ── The doorbell: the AoC rings the AP on a service's mailbox channel when it writes it a message (wc.c, the AoC-to-AP side of block a32, SPI 77) ──
+/// The AP's side of a block (payloads/audio aoc.rs, wc.c:100-166): INTCR1 clears what the AoC rang, INTMR1 masks it (a set bit masked), INTSR1 reads it.
+const MB_INTCR1: u64 = 0x44;
+const MB_INTMR1: u64 = 0x48;
+const MB_INTSR1: u64 = 0x4C;
+/// Bumped by the doorbell thread each time the line fires; the loop and `reply` wait on it (ferros_sys::wait: a futex, which a preference change also ends).
+pub static RUNG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Whether the kernel gave the line (its slot after the Sensors right's, process.rs): without it, a kernel from before 2026-11-12, the waits stay timed.
+static mut DOORBELL: bool = false;
+/// The doorbell thread's stack.
+const BELL_STACK: usize = 1 << 14;
+#[repr(C, align(16))]
+struct BellStack([u8; BELL_STACK]);
+static mut BSTACK: BellStack = BellStack([0; BELL_STACK]);
+
+/// The usf services' channels on block a32 unmasked (every other one of its sixteen masked: no other process takes this line), and the thread that turns the line into `RUNG` started. False when there is no line to wait on, or a service's channel is off a32 (said in `out`).
+fn doorbell_start(out: &mut String) -> bool {
+    let line = cap(unsafe { G }, crate::S_DOORBELL);
+    // A deadline already past: 2 (or 0, pending) from a line this process holds, ERR from a slot it was not given.
+    if ferros_sys::irq_wait(line, 1) == ferros_sys::ERR {
+        out.push_str("usf: no AoC mailbox line from the kernel; the loop looks every 2 ms\n");
+        return false;
+    }
+    let mut channels = 0u32;
+    for k in 0..2 {
+        let h = unsafe { SVC[k] };
+        if h == 0 {
+            continue;
+        }
+        let ch = (rd32(h + 32) >> 19) & 0x1F;
+        if ch >= 16 {
+            let _ = writeln!(out, "usf: service {k} rings channel A#{ch}, off block a32; the loop looks every 2 ms");
+            return false;
+        }
+        channels |= 1 << ch;
+    }
+    let g = cap(unsafe { G }, crate::S_MBOX);
+    mmio_write(g, MB_INTCR1, channels);
+    mmio_write(g, MB_INTMR1, !channels & 0xFFFF);
+    let stack = unsafe { &mut (*(&raw mut BSTACK)).0 };
+    if ferros_sys::thread_spawn(bell, stack, line) == ferros_sys::ERR {
+        out.push_str("usf: the doorbell thread did not start; the loop looks every 2 ms\n");
+        return false;
+    }
+    let _ = writeln!(out, "usf: doorbell on block a32, channels G#{channels:X}");
+    unsafe { DOORBELL = true };
+    true
+}
+
+/// The doorbell thread: the line fires, what the AoC rang is cleared, the line is acknowledged, and `RUNG` moves and wakes whoever waits on it. It touches nothing else: the conversation is the loop's alone.
+extern "C" fn bell(line: u64) -> ! {
+    let g = cap(unsafe { G }, crate::S_MBOX);
+    loop {
+        ferros_sys::irq_wait(line, 0);
+        let st = mmio_read(g, MB_INTSR1) as u32 & 0xFFFF;
+        mmio_write(g, MB_INTCR1, st);
+        ferros_sys::irq_ack(line);
+        RUNG.fetch_add(1, core::sync::atomic::Ordering::Release);
+        ferros_sys::wake(&RUNG, 1);
+    }
+}
+
+/// Until the AoC rings after `seen` (RUNG's value before the last drain), a preference changes, or `deadline` (0: none); the watchdog paused, as the wait is on the world. Without the line, 2 ms or the deadline, whichever first: a kernel from before the doorbell.
+pub fn wait_ring(seen: u64, deadline: u64) {
+    if unsafe { DOORBELL } {
+        ferros_sys::wait_world(&RUNG, seen, deadline);
+    } else {
+        let t = now() + freq() / 512;
+        ferros_sys::sleep_until(if deadline != 0 && deadline < t { deadline } else { t });
+    }
 }
 
 /// One message onto a queue service's DOWN ring (AP->AoC), then the AoC signalled: an 8-byte header {u16 len, 0, 0, 0}, then the payload, a byte at a time.
@@ -444,16 +516,19 @@ fn flk_data(p: &[u8]) {
     }
 }
 
-/// Wait up to `ms` for the reply to `txn`.
+/// Wait up to `ms` for the reply to `txn`: asleep between the AoC's rings (the deadline is the protocol's: an AoC that never answers).
 fn reply(txn: u32, ms: u64) -> Option<(u32, Vec<u8>)> {
-    let f = freq();
-    let t0 = now();
-    while now().wrapping_sub(t0) < f * ms / 1000 {
+    let deadline = now() + freq() * ms / 1000;
+    loop {
+        let seen = RUNG.load(core::sync::atomic::Ordering::Acquire);
         if let Some(r) = drain(Some(txn)) {
             return Some(r);
         }
+        if now() >= deadline {
+            return None;
+        }
+        wait_ring(seen, deadline);
     }
-    None
 }
 
 /// A sensor's name (sensor info, type 4).
@@ -482,6 +557,7 @@ pub fn open(out: &mut String) -> bool {
         out.push_str("usf: com.google.usf not found\n");
         return false;
     }
+    doorbell_start(out);
     let close = [0u32.to_le_bytes(), 1u32.to_le_bytes(), CHAN.to_le_bytes()].concat();
     ipc_write(h, &close);
     let open = [0u32.to_le_bytes(), 0u32.to_le_bytes(), CHAN.to_le_bytes()].concat();
@@ -709,8 +785,10 @@ pub fn registry(out: &mut String) -> bool {
     matches!(r, Some((0, _)))
 }
 
-/// Registry nodes ferros does not hand the AoC: the touch controller (`/dev/ftm5`) and the touch bus arbitration (`/tbn`): with them the AoC takes the touch IC's bus and ferros's touch goes dead (2026-10-24).
-const KEEP_OFF: &[&[u8]] = &[b"+/dev/ftm5", b"+/tbn"];
+/// Registry nodes ferros does not hand the AoC: the touch controller (husky's FTM5 `/dev/ftm5`, akita's Goodix `/dev/gtx`) and the touch bus arbitration (`/tbn`): with them the AoC takes the touch IC's bus and ferros's touch goes dead (husky, 2026-10-24).
+/// akita's `/dev/gtx/0` is husky's node for its own controller: the AoC's SPI 2 at 10 MHz, chip select GPIO 67, the controller's interrupt as the AoC's line 14, `tbn_mode=2` beside it (zuma-common-touch.dtsi on both boards), so the same reason holds. It went out on 2026-11-12: kept until then, the AoC listed "Touch Single Tap Sensor" and "Touch Long Press Sensor" on the 8a, its driver live on the controller ferros reads (the owner had seen taps lost there).
+/// Left out (two cold boots on the 8a, 2026-11-12): 38 sensors listed instead of 40, the two touch sensors gone, Gravity at handle 44 instead of 46 (found by name, `subscribe_gravity`); the proximity-gated gestures are fusions and stay listed.
+const KEEP_OFF: &[&[u8]] = &[b"+/dev/ftm5", b"+/dev/gtx", b"+/tbn"];
 
 /// Registry properties ferros sets differently from Google's scripts: the rear spectral sensor reports every reading (`g_change_thresh=0 0`, `c1_…`), which the scope widget wants (owner, 2026-10-25).
 const OVERRIDE: &[(&[u8], &[u8])] = &[(b"  g_change_thresh=100 0.1", b"  g_change_thresh=0 0"), (b"  c1_change_thresh=100 0.1", b"  c1_change_thresh=0 0")];
@@ -768,17 +846,26 @@ pub fn subscribe(handle: u32, period_ms: u64, mode: u32, wake: bool, out: &mut S
     id
 }
 
-/// Subscribe to the Gravity sensor (handle 54 in this firmware; looked up by name if it moved) every `period_ms`.
-pub fn subscribe_gravity(period_ms: u64, wake: bool, out: &mut String) -> bool {
-    let is_gravity = |n: &Option<String>| n.as_deref().is_some_and(|n| n.starts_with("Gravity"));
-    let mut handle = 54;
-    if !is_gravity(&info(handle)) {
-        handle = (18..96).find(|&k| is_gravity(&info(k))).unwrap_or(0);
-        if handle == 0 {
-            out.push_str("usf: no Gravity sensor\n");
+/// Subscribe to the fused Gravity sensor every `period_ms`, found by its name ("Gravity Sensor": handle 54 on husky, 46 on akita).
+/// The AoC lists its fused sensors after the parts they are made of, so the first sensors listed need not include it: the name is looked for again every 1/16 s, for up to 4 s from the registry's load, and how long it took is said.
+/// Before this (2026-11-12) one look right after the first sensors appeared could miss it by milliseconds (akita: 22 listed as the look began, 40 by the time Gravity was found), and a boot that missed it ran without gravity: the clock's face kept the map's own turn and never followed the device.
+pub fn subscribe_gravity(period_ms: u64, wake: bool, since: u64, out: &mut String) -> bool {
+    let f = freq();
+    let mut looks = 0u32;
+    // How many sensors the AoC listed as the first look began (measuring the race above).
+    let listed = sensor_count().unwrap_or(0);
+    let handle = loop {
+        looks += 1;
+        if let Some(h) = find("Gravity") {
+            break h;
+        }
+        if now() - since > 4 * f {
+            let _ = writeln!(out, "usf: no Gravity sensor listed in 4 s (A#{looks} looks); the clock has no gravity this boot");
             return false;
         }
-    }
+        ferros_sys::sleep_until(now() + f / 16);
+    };
+    let _ = writeln!(out, "usf: Gravity at handle A#{handle}, found on look A#{looks}, A#{} ms after the registry's load; A#{listed} sensors listed as the first look began, A#{} now", (now() - since) * 1000 / f, sensor_count().unwrap_or(0));
     subscribe(handle, period_ms, 1, wake, out) != 0
 }
 

@@ -15,11 +15,15 @@ pub const FRAME: usize = 1 << 21;
 
 /// husky's frame ranges, [start, end), each 2 MiB aligned.
 #[cfg(not(shim_handoff))]
-const HUSKY: [(usize, usize); 4] = [
+const HUSKY: [(usize, usize); 6] = [
     // The page pool (cachemap POOL): the window's top 16 MiB, ferros's own since 2026-10-26; memblock: plain memory (G#8000_0000-G#8AFF_FFFF, no reservation).
     crate::cachemap::POOL,
+    // The layer arena until 2026-11-13 (cachemap POOL_LAYERS): 128 MiB under the big pool, ferros's own since 2026-11-05, on cold boots and after jumps alike; memblock: plain memory (G#9740_0000-G#B61F_FFFF, no reservation).
+    crate::cachemap::POOL_LAYERS,
     // The big pool (cachemap POOL_BIG): 320 MiB under gpu-mem; memblock: plain memory (G#9740_0000-G#B61F_FFFF, no reservation; sec_dram begins at G#B620_0000).
     crate::cachemap::POOL_BIG,
+    // The apps' surfaces' carve-out until 2026-11-12 (cachemap POOL_SURF): 128 MiB, ferros's own since 2026-10-27, on cold boots and after jumps alike; memblock: plain memory (the nearest reservations are seclog_mem ending G#C308_FFFF and the debug snapshot from G#D810_0000).
+    crate::cachemap::POOL_SURF,
     // The high bank's first 4.97 GiB, up to the camera and video pools.
     (0x8_8000_0000, 0x9_BE40_0000),
     // The high bank past those pools, up to the frame under the hv.
@@ -28,17 +32,21 @@ const HUSKY: [(usize, usize); 4] = [
 
 /// akita's frame ranges: the two pools ferros has run its processes from, then its high bank where memblock reserves nothing (2026-11-12; memblock: plain memory under both pools too).
 #[cfg(not(shim_handoff))]
-const AKITA: [(usize, usize); 4] = [
+const AKITA: [(usize, usize); 6] = [
     crate::cachemap::POOL,
+    // memblock: plain memory (G#9740_0000-G#B61F_FFFF on akita too, BOARDS.md "Memory map").
+    crate::cachemap::POOL_LAYERS,
     crate::cachemap::POOL_BIG,
+    // memblock: plain memory (G#C309_0000 to G#E7FF_FFFF reserves nothing on akita either).
+    crate::cachemap::POOL_SURF,
     // The high bank up to the frame that holds the hv's copy of the device tree (G#8_FFF0_0000).
     (0x8_8000_0000, 0x8_FFE0_0000),
     // Past the hv's 64 MiB, up to Linux's own allocations and the camera and video pools (G#9_BC04_0000).
     (0x9_0400_0000, 0x9_BC00_0000),
 ];
-/// Either board kept to the two old pools (`map`: after a jump, or a `FERROS_FRAMES_HIGH=0` build).
+/// Either board kept to the two old pools and the old carve-outs of the layer arena and the surfaces (`map`: after a jump, or a `FERROS_FRAMES_HIGH=0` build): what ferros ran from after jumps before ARCS, the GPU's memory and surfaces included.
 #[cfg(not(shim_handoff))]
-const LOW: [(usize, usize); 2] = [crate::cachemap::POOL, crate::cachemap::POOL_BIG];
+const LOW: [(usize, usize); 4] = [crate::cachemap::POOL, crate::cachemap::POOL_LAYERS, crate::cachemap::POOL_BIG, crate::cachemap::POOL_SURF];
 
 /// The handoff path (oracle only): its 2 MiB pool.
 #[cfg(shim_handoff)]
@@ -48,7 +56,7 @@ const AKITA: [(usize, usize); 1] = [crate::cachemap::POOL];
 #[cfg(shim_handoff)]
 const LOW: [(usize, usize); 1] = [crate::cachemap::POOL];
 
-/// This board's frame ranges. A `FERROS_FRAMES_HIGH=0` build keeps either board to the two old pools: the escape if its high bank ever misbehaves, as `FERROS_X3=0` is the X3's.
+/// This board's frame ranges. A `FERROS_FRAMES_HIGH=0` build keeps either board to the two old pools and the surfaces' old carve-out: the escape if its high bank ever misbehaves, as `FERROS_X3=0` is the X3's.
 /// After a jump from Android (or a ferros restart, jump style) the high bank stays out of the pool too (2026-11-11, the Pro: a boot that came from a jump ran about a minute after attest and reset with no panic recorded): Android can leave a DMA master running, and a device still writing into high-bank frames would land in a process's memory. The two old pools are what ferros ran from after jumps before ARCS. The high bank comes back after jumps once every master Android left running is fenced or reset (the jump is a killswitch: memory feedback_jump_is_killswitch).
 pub fn map() -> &'static [(usize, usize)] {
     if option_env!("FERROS_FRAMES_HIGH") == Some("0") || crate::platform::jumped() {
@@ -168,6 +176,24 @@ pub fn take() -> Option<usize> {
     if f >= p.total {
         return None;
     }
+    p.used[w] |= 1 << (f % 64);
+    p.free -= 1;
+    if p.clean[w] & 1 << (f % 64) == 0 {
+        zero(pa(f));
+    }
+    p.clean[w] &= !(1 << (f % 64));
+    Some(f)
+}
+
+/// A free frame from the far end of the map, zeroed, now taken: a surface's (process.rs `surface_take`), so surfaces fill the pool from its top while arcs fill it from its bottom (`take`), and a big arc's growth and a run of windows never meet until the pool is nearly full. None when every frame is taken.
+pub fn take_top() -> Option<usize> {
+    let p = pool();
+    // The words from the last one that holds a frame down: bits past `total` in it are no frames, so they are counted taken here.
+    let last = (p.total - 1) / 64;
+    let past = if (p.total % 64) == 0 { 0 } else { u64::MAX << (p.total % 64) };
+    let w = (0..=last).rev().find(|&w| (p.used[w] | if w == last { past } else { 0 }) != u64::MAX)?;
+    let free = !(p.used[w] | if w == last { past } else { 0 });
+    let f = w * 64 + 63 - free.leading_zeros() as usize;
     p.used[w] |= 1 << (f % 64);
     p.free -= 1;
     if p.clean[w] & 1 << (f % 64) == 0 {

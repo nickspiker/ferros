@@ -570,7 +570,7 @@ pub const WATCHDOG_DID_NOT_FIRE: u64 = 0xDEAD_B007;
 /// A plain reset through EL3 (PSCI SYSTEM_RESET). Measured on husky: the bootloader reads it as "Reboot mode: 0x0", a normal boot of the active slot — which is what the gate's Android choice wants after `slot::set_active(0)`.
 /// Run before every reset this kernel orders (AUTH.md): the vault drops the unlocked identity's key, its bytes overwritten, so a warm reset hands nothing to whatever boots next — Android at the gate's other answer, or a crash's next boot. Registered by the service once the vault is open.
 pub static mut BEFORE_RESET: Option<fn()> = None;
-/// ferros's memory zeroed on the way out (HV.md, dual boot; owner, 2026-11-02): a warm reset keeps DRAM, so whatever boots next (Android from the gate) would find ferros's working set where it was. The roots are in registers and die with the reset; everything else that ever held a decrypted thing is in these regions: the kernel heap (both regions: the vault's working set, capsules in flight), the arc pools (every process's memory), the driver DMA pools, and the display's regions (frames, surfaces, sprites, the canvas). The image's own data and the stack this runs on stay: the stack is in use, and the image holds no secret.
+/// ferros's memory zeroed on the way out (HV.md, dual boot; owner, 2026-11-02): a warm reset keeps DRAM, so whatever boots next (Android from the gate) would find ferros's working set where it was. The roots are in registers and die with the reset; everything else that ever held a decrypted thing is in these regions: the kernel heap (both regions: the vault's working set, capsules in flight), the arc pools (every process's memory), the driver DMA pools, and the display's regions (frames, sprites, the canvas); the apps' surfaces are frames of the pool since 2026-11-12, zeroed with every other frame held. The image's own data and the stack this runs on stay: the stack is in use, and the image holds no secret.
 /// The workers are stopped first so no process writes behind the scrub. Each line is zeroed with `dc zva` and cleaned to DRAM at once, so the zeros are in memory before the reset discards the caches: about three quarters of a gigabyte, tens of milliseconds. Only with the cache map on (the zeroing instruction needs Normal memory) and the heap up: an early reset has nothing to scrub. The bytes and the microseconds go to the crumb page at G#FD60_0250 and G#FD60_0258.
 #[cfg(not(shim_handoff))]
 pub fn scrub_memory() {
@@ -581,7 +581,7 @@ pub fn scrub_memory() {
         return;
     }
     reset_step(2);
-    let regions: [(usize, usize); 12] = [
+    let regions: [(usize, usize); 10] = [
         (hb, he),
         crate::cachemap::HEAP2,
         crate::cachemap::DMA_POOL,
@@ -591,11 +591,9 @@ pub fn scrub_memory() {
         crate::cachemap::DISPLAY_PHASES,
         crate::cachemap::DISPLAY_SPRITES,
         crate::cachemap::DISPLAY_CANVAS,
-        crate::cachemap::SURFACES,
         crate::cachemap::GPU_MEM,
-        crate::cachemap::layers(),
     ];
-    // The processes' memory: every frame an arc holds (frames.rs; until 2026-11-11 the two arc pools whole). Free frames were wiped as they came back.
+    // The processes' memory: every frame an arc, a surface or a GPU block holds (frames.rs; until 2026-11-11 the two arc pools whole, until 2026-11-12 the surfaces' own region, until 2026-11-13 the layer arena). Free frames were wiped as they came back.
     let total: usize = regions.iter().map(|&(lo, hi)| if hi > lo { hi - lo } else { 0 }).sum::<usize>() + crate::frames::taken_bytes();
     // Said before the zeroing: the allocator's own lists are in the heap, so nothing may allocate after it (the first cut formatted its line after, and the reset path died short of the EL3 reboot-mode stamp: two reboots to fastboot that landed as plain boots, 2026-11-03).
     pstore(alloc::format!("memory scrub before the reset: {} MiB\n", total >> 20).as_bytes());

@@ -74,4 +74,22 @@ impl Table {
             wr64(t + idx * 8, (pa + k * PAGE) as u64 | leaf);
         }
     }
+
+    /// Map one 2 MiB block from GPU VA `va` to physical `pa` (both 2 MiB aligned) with a level-2 entry `pa | leaf` (`leaf` a block's bits, ending in 1: GPU.md "MMU"); the levels above get `table`. Its level-2 slot must not hold a table already: a client's space maps its block's range in blocks alone.
+    pub fn map_block(&self, m: &mut Mem, va: u64, pa: usize, leaf: u64, table: u64) {
+        let mut t = self.root;
+        for level in 0..2 {
+            let idx = ((va >> (39 - 9 * level)) & 511) as usize;
+            let e = rd64(t + idx * 8);
+            t = if e & 1 == 0 {
+                let n = m.alloc(1);
+                wr64(t + idx * 8, n as u64 | table);
+                n
+            } else {
+                (e & 0x0000_FFFF_FFFF_F000) as usize
+            };
+        }
+        let idx = ((va >> 21) & 511) as usize;
+        wr64(t + idx * 8, pa as u64 | leaf);
+    }
 }

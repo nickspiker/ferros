@@ -955,7 +955,7 @@ fn link_state(k: usize, state: Option<i64>) -> &'static str {
 
 /// What a right is, in the person's words and language, by its place in ferros_kist::RIGHTS (whose MEANS are the English).
 fn right_name(r: usize) -> &'static str {
-    const NAMES: [Msg; ferros_kist::RIGHTS.len()] = [Msg::RightDisplay, Msg::RightTouch, Msg::RightSurface, Msg::RightIra, Msg::RightDomain, Msg::RightEntropy, Msg::RightGps, Msg::RightUdp, Msg::RightAudio];
+    const NAMES: [Msg; ferros_kist::RIGHTS.len()] = [Msg::RightDisplay, Msg::RightTouch, Msg::RightSurface, Msg::RightIra, Msg::RightDomain, Msg::RightEntropy, Msg::RightGps, Msg::RightUdp, Msg::RightAudio, Msg::RightCamera];
     tr(NAMES[r])
 }
 
@@ -1421,8 +1421,10 @@ struct Map {
     rest: Cam,
     /// The kists that tapped the motor since the person last looked at them: one tap a kist until then.
     tapped: Vec<[u8; 32]>,
-    /// The Deck button's note as last sent (display op 66): the icon and the count in view.
-    helm_sent: (u8, u16),
+    /// The Deck button's note as last sent (display op 66): the icon, the count in view (or the questions waiting), and its glow (ferros_glow: for you, or a question).
+    helm_sent: (u8, u16, u8),
+    /// The system's questions waiting on the person, oldest first, each with its note's number when the kernel took it (notes.rs `questions_sync`, docs/NOTIFY.md "System questions").
+    questions: Vec<(notes::Question, Option<u8>)>,
     /// A live note on the screen (its source and number) and its words; the note a tap opens its kist at (`notes_front`), and one waiting for its kist's window to show.
     live_note: Option<([u8; 32], u8)>,
     live_words: Option<alloc::string::String>,
@@ -3990,6 +3992,16 @@ impl Map {
                     }
                 }
                 fact(b, &mut y, tr(Msg::Chip), v.as_str());
+                // The bootloader's lock state as ABL told this boot (fact 87; FLASHER.md step 7; owner, 2026-11-13: leaving it unlocked is a known choice, shown, never a nag). Unlocked, the device class is anyone's who holds the device (its ira has no papers), and with attest at boot on that includes the kept seed, so the sentence says so.
+                y += uu(1, 1);
+                let lock = match facts.boot_lock() {
+                    Some(ferros_sys::BootLock::Unlocked) if ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1 => Msg::BootloaderUnlockedAttest,
+                    Some(ferros_sys::BootLock::Unlocked) => Msg::BootloaderUnlocked,
+                    Some(ferros_sys::BootLock::LockedOwnKey) => Msg::BootloaderLockedFerros,
+                    Some(ferros_sys::BootLock::LockedMakersKey) => Msg::BootloaderLockedMaker,
+                    None => Msg::BootloaderNotRead,
+                };
+                row(self, b, &mut y, note, grey(), tr(lock), None);
             }
             "deck" => {
                 // Everything on the deck, each row opening its card (`card`): what it is, who made it, its rights as switches (owner, 2026-11-08: per kist, its rights; a tap changes the answer for every device of the person's, and a kist running is killed and started again with the answers as they now stand), stop, update and unstow.
@@ -4729,6 +4741,10 @@ impl Map {
     /// A still tap on the helm (WINDOWS.md "The helm"; owner, 2026-11-11). Deck (8): the app in front behind, the map as it was left; with the map on the glass, an open circle closes. Back (9): Escape to the app in front ("back should signal escape to the app and go up one page"; at its main page it does nothing more, never leaving the kist); with the map on the glass, a level back (`back_step`). Never a tap on what lies under the corner.
     fn helm_tap(&mut self, corner: u8) -> &'static str {
         if corner == 8 {
+            // A system question waiting (its ring red): straight to it (docs/NOTIFY.md "System questions"), unless it is what the glass shows already.
+            if self.question_open() {
+                return "map: deck: the question waiting opened";
+            }
             if self.send_behind(true) {
                 return "map: deck: the app in front behind";
             }
@@ -5281,6 +5297,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The circles' labels are `&'static str`, absolute addresses fixed at link time; linked position-independent, they are relocations this applies before anything reads them. Without it the first label read faulted at its link-time address, G#D9B (2026-10-21).
     unsafe { ferros_sys::relocate() };
     unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
+    // The deck's start by part, to the console with "deck drawn" (2026-11-12, measuring attest to the deck): [the display's size, the person's kists read, the places kept, the scene sent, the view kept, the first draw], counter ticks at each end.
+    let mut t_start = [now(); 7];
     let display = cap(grants, S_DISPLAY);
     let touch = cap(grants, S_TOUCH);
     let mut r = [0u8; 256];
@@ -5291,9 +5309,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         ferros_sys::exit(1);
     }
     let (w, h) = (u16::from_le_bytes([r[0], r[1]]) as i64, u16::from_le_bytes([r[2], r[3]]) as i64);
+    t_start[1] = now();
 
     // The circles: settings, then a kist circle for each kist the person stowed (their list, `kists.list`; none readable, none shown), sized by share and placed once.
     let kists = ferros_kist::store::read_here(cap(grants, S_KIST_LIST)).unwrap_or_default();
+    t_start[2] = now();
     // WHY: the scene and the arrays hold MAX circles; kists past it get no circle until there is room (the settings' Deck page still lists them).
     let n = (1 + kists.kists.len()).min(MAX);
     let rs: [i64; MAX] = core::array::from_fn(|i| if i == 0 { radius_of(CIRCLES[0].share) } else if i < n { radius_of(KIST_SHARE) } else { 0 });
@@ -5385,7 +5405,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         notes_due: None,
         rest: Cam { x: 0, y: 0, z: Z_ONE, c: ONE, s: 0 },
         tapped: Vec::new(),
-        helm_sent: (0, 0),
+        helm_sent: (0, 0, 0),
+        questions: Vec::new(),
         live_note: None,
         live_words: None,
         opening: None,
@@ -5404,6 +5425,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     let kept = map.load_places_near();
+    t_start[3] = now();
     // Whatever the vault held, no two circles start overlapping (places kept before circles pushed each other could).
     map.push_apart(MAX);
     if kept > 0 {
@@ -5413,9 +5435,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     map.send_scene();
     map.cam = map.deck_fit();
+    t_start[4] = now();
     if map.load_view() {
         console(grants, b"map: the view as it was left\n");
     }
+    t_start[5] = now();
     // Developer, once the twelve taps made it a page (release builds; always one on development builds).
     let mut dv = [0u8; 4];
     map.dev = matches!(ferros_sys::store_get(cap(grants, S_STORE), b"dev", &mut dv), Some(n) if n >= 1 && dv[0] == 1);
@@ -5440,6 +5464,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     map.draw();
+    t_start[6] = now();
     // Nothing is in focus (display op 25, icon 0): a display that outlived an older map, one with widgets that took focus, would otherwise keep redrawing one at the panel's rate.
     call(display, &[25, 0, 0, 0, 0, 0, 0], &mut r);
     // A development build can time the frame loop without a finger (FERROS_MAP_START=bench): 32 frames of a pinch with a twist, then 32 of a pan, each the whole round trip to the display server; the averages to the console, then the camera back at rest.
@@ -5516,7 +5541,12 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         map.cam = home;
         map.draw();
     }
-    console(grants, b"map: deck drawn; a tap on a circle opens it\n");
+    {
+        let us = |a: u64, b: u64| (b - a) * 1_000_000 / freq();
+        let mut l = Line::new();
+        let _ = write!(l, "map: deck drawn {} us after start (display {}, kists list {}, places {}, scene {}, view {}, draw {} us); a tap on a circle opens it\n", us(t_start[0], t_start[6]), us(t_start[0], t_start[1]), us(t_start[1], t_start[2]), us(t_start[2], t_start[3]), us(t_start[3], t_start[4]), us(t_start[4], t_start[5]), us(t_start[5], t_start[6]));
+        console(grants, l.as_str().as_bytes());
+    }
     // FERROS_MAP_START=crowd: 200 more circles in the display's scene only (never the vault), for timing a busy deck.
     if option_env!("FERROS_MAP_START") == Some("crowd") {
         let placed = map.crowd(200);
@@ -5634,6 +5664,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     if !ferros_sys::notify::doorbell(cap(grants, S_SETTINGS), &notes::WORD) {
         console(grants, b"map: the kernel has no notes' bell\n");
     }
+    // The system's questions are this map's (notes.rs `questions_sync`): any a map before this one posted (it ended, or restarted) go, and whatever still waits is posted again from what this map holds.
+    ferros_sys::notify::seen(cap(grants, S_SETTINGS), &ferros_kist::note::SYSTEM, ferros_sys::notify::ALL, false);
     let mut notes_seen = notes::WORD.load(core::sync::atomic::Ordering::Acquire);
     // What waits already (posted before this map started, or kept from before the boot) glows at once; it taps and takes over nothing: every note's bell count is at most the bell's now, where `notes_read` starts.
     map.notes_read = notes_seen;
@@ -5864,6 +5896,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if !down {
             map.show_fault();
         }
+        // The system's questions (docs/NOTIFY.md "System questions"): one that started waiting on the person posted as a note, one answered or ended cleared, from what this pass holds (the stower's offer, the sheet, the fleet, the open circle); the kernel's bell then lights the Deck button below.
+        map.questions_sync();
         // The notes' bell rang, or the earliest deadline passed (the list read again drops it in the kernel): the glows, the Deck button, a tap or a takeover (notes.rs).
         let nw = notes::WORD.load(core::sync::atomic::Ordering::Acquire);
         if nw != notes_seen || map.notes_due.is_some_and(|d| now() >= d) {

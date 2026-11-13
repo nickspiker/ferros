@@ -81,6 +81,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let jumped = matches!(ferros_sys::facts().0[31], 6 | 7);
     // The GPU too: Android ran it, and whether the hv cuts it off at the jump is still the owner's open decision (KERNEL-OUT.md); the attest screen draws on the CPU without it.
     let after_jump = |n: &[u8]| jumped && matches!(n, b"pcie1" | b"nfc" | b"bt" | b"sensors" | b"modem" | b"gpu");
+    // Whether the map was started ahead of fgtw (the device bound already at the attest).
+    let mut map_first = false;
     for (name, key, slots) in SHELL.iter() {
         if switched_off(name) {
             console(grants, b"init: ");
@@ -103,8 +105,17 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
             }
             wait_person(grants, false);
+            // A device already bound to the person who just attested (every attest but its first): the deck first, then the identity service. Each spawn holds the kernel lock while it reads its capsule (fgtw 47 ms, the map 70 ms on the 8a, 2026-11-12), and the map waited behind fgtw's; nothing of the map's start needs fgtw, which answers its Fleet page once it serves.
+            if ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true) {
+                if let Some((n, k, s)) = SHELL.iter().find(|s| s.0 == b"map") {
+                    map_first = spawn(grants, n, k, s) == 0;
+                }
+            }
         }
         if *name == b"map" {
+            if map_first {
+                continue;
+            }
             wait_person(grants, true);
         }
         // fgtw again until it starts (2026-11-10, the Pro after a release: the attest screen holds one of the big pool's two arcs and wallgen, remaking a wiped person's wallpaper, the other for about 20 s; fgtw's one try found the pool full and the device sat with no identity service, so nothing of the fleet came back). Each try a second apart, said once.

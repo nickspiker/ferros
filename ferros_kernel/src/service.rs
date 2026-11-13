@@ -897,6 +897,14 @@ fn site_text(w: u64) -> alloc::string::String {
 fn stall_lines(freq: u64) -> alloc::string::String {
     use core::sync::atomic::Ordering::Relaxed;
     let mut s = alloc::format!("lock: held longest A#{} us, taken at {}\n", crate::process::LOCK_HOLD_MAX.load(Relaxed) * 1_000_000 / freq, site_text(crate::process::LOCK_HOLD_SITE.load(Relaxed)));
+    // The long holds (process.rs LONG_HOLD), oldest first: t<ms> the take, how long, where.
+    let n = crate::process::LONG_HOLD_N.load(Relaxed) as usize;
+    // WHY saturating: fewer holds than the ring keeps start at the first; past it, the ring's oldest.
+    let first = n.saturating_sub(crate::process::LONG_HOLDS);
+    for j in first..n {
+        let h = &crate::process::LONG_HOLD[j % crate::process::LONG_HOLDS];
+        s.push_str(&alloc::format!("lock held long: t{} for A#{} us at {}\n", h[0].load(Relaxed) / (freq / 1000), h[1].load(Relaxed) * 1_000_000 / freq, site_text(h[2].load(Relaxed))));
+    }
     let prev_lock = platform::note_read(8);
     if prev_lock & 0xFF != 0 {
         s.push_str(&alloc::format!("lock at the previous boot's end: held by core A#{}, taken at {}\n", (prev_lock & 0xFF) - 1, site_text(prev_lock >> 8)));
@@ -1116,7 +1124,7 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         _ => return None,
     };
     let all = home_grants();
-    // The attest screen's two surfaces as init's spawn hands them out (SYS_SPAWN): each a free surface of the four, its own. Passed as the whole region, a restarted attest screen drew into surface 0 whoever held it, and its back buffer was its own front (2026-11-01: every board redrew in place, black between). Not for the display server, which takes the region's base (surface 0 at boot).
+    // The attest screen's two surfaces as init's spawn hands them out (SYS_SPAWN): each a free slot with frames of its own behind it. Passed as the whole region, a restarted attest screen drew into surface 0 whoever held it, and its back buffer was its own front (2026-11-01: every board redrew in place, black between). Not for the display server, which takes the region's base (surface 0 at boot).
     let own = name == b"ahau";
     Some(slots.iter().filter_map(|&s| all.get(s - 1).copied()).map(|g| match g {
         crate::process::Grant::Dma(b"surfaces") if own => crate::process::Grant::Dma(b"surface"),
@@ -1244,6 +1252,8 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
 /// Returns false when the shell is off this boot (`home.off`).
 fn start_home(store: &mut Option<ShimStore>) -> bool {
     crate::checklist::HOME.store(cntpct(), core::sync::atomic::Ordering::Relaxed);
+    // The bootloader's lock state once a boot, first on the console (bootlock.rs; owner, 2026-11-13: shown, never a nag).
+    crate::process::push_console(crate::bootlock::console_line().as_bytes());
     // FERROS_RESCUE (2026-11-03): the vault's usb, pcie1 and bt capsules replaced by the builds this kernel carries, whatever is stored (a rescue kernel is flashed only on purpose, and a broken build of either kind leaves the bridge dead). A masked build of a driver that reaches its registers by raw pointers dies at once, and with usb dead the bridge cannot put the capsule back: the chicken-and-egg this switch exists for. Flash it once, let it mend the vault, flash the ordinary kernel again.
     #[cfg(ferros_rescue)]
     if let Some(s) = store.as_mut() {
@@ -1404,6 +1414,8 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     v[82] = match ANDROID_ALLOWED.load(Relaxed) { 0 => crate::process::FACT_UNKNOWN, s => s };
     // 81: the panel's VCI (panel_power.rs): 2 on, 1 off, unknown until the service loop has read it.
     v[81] = match crate::panel_power::VCI.load(Relaxed) { 0 => crate::process::FACT_UNKNOWN, s => s };
+    // 87: the bootloader's lock state as ABL told this boot (bootlock.rs): bits 0-7 the device state (1 locked, 2 unlocked), bits 8-15 the verified boot state (1 green, 2 yellow, 3 orange, 4 red), unknown without a bootconfig (a reload). Not the person's: no capability.
+    v[87] = crate::bootlock::STATE.load(Relaxed);
     // 33-80: those drivers' own measures (SYS_STATUS), eight tagged words each, in the same order, then the usb driver's.
     for i in 0..6 {
         for w in 0..8 {
@@ -1836,6 +1848,9 @@ pub fn run(mut b: Boot) -> ! {
     }
     let mut home_started = !matches!(b.kind, BootKind::Cold);
     let t_boot = cntpct();
+    // The jumped session's 60 s note, written once (below, in the loop).
+    #[cfg(not(ferros_production))]
+    let mut escape_noted = false;
     let exc_start = crate::exception_count();
     platform::mark(0x34);
 
@@ -2431,10 +2446,16 @@ pub fn run(mut b: Boot) -> ! {
             }
             asleep += slept;
         }
-        // Development, while the jump from Android is brought up: a jumped session that the host has not reached in 60 s (no command from the USB process) leaves a note and resets warm, so the next boot reads its whole log from the pstore ring (tools/husky-pstore.sh). The killswitch, the only other way out of such a session, powers off and the log decays with the RAM (the twenty-seventh jump, 2026-11-02: ferros up, its killswitch armed, no USB, the screen still Android's).
+        // Development: a jumped session that the host has not reached in 60 s (no command from the USB process) leaves a note, once, and runs on.
+        // Until 2026-11-13 it also reset, so the next boot could read the pstore ring (the twenty-seventh jump, 2026-11-02: ferros up, no USB, the screen still Android's).
+        // That reset was the owner's "works for a minute or two, then reboots" (2026-11-13, the Pro, boot b863): every jump nobody talked to over USB within 60 s ended there, about 57 s after the jump's first flash-log line.
+        // And it kept nothing: after a jump the bootloader read the reset as a crash (RST_STAT PIN_RESET, reason G#CECA), ran its debug-dump stage (about 9 s in BL2) and power-cycled (PIN_RESET | PO_RESET), so DRAM decayed and the pstore ring and the report page with it.
+        // The flash log on UFS is what survives now, so the note goes there too.
         #[cfg(not(ferros_production))]
-        if platform::from_android() && st.proc_cmds == 0 && cntpct().wrapping_sub(t_boot) > 60 * cntfrq() {
-            platform::pstore(b"ferros: the jump's session: no host in 60 s, resetting warm to keep this log\n");
+        if !escape_noted && platform::from_android() && st.proc_cmds == 0 && cntpct().wrapping_sub(t_boot) > 60 * cntfrq() {
+            escape_noted = true;
+            crate::flashlog::line(&alloc::format!("jump: no host in 60 s (USB process commands 0); workers up G#{:X}, x3 parked {}; running on, the thread report in the pstore ring", crate::smp::up_mask(), crate::x3::parked()));
+            platform::pstore(b"ferros: the jump's session: no host in 60 s, running on\n");
             // Every thread and where it waits, so the log says what the session was stuck on (the twenty-ninth jump: the display server and the attest screen ran, init, touch and USB printed nothing).
             let mut threads = alloc::vec::Vec::new();
             crate::process::threads_report(&mut threads);
@@ -2454,8 +2475,7 @@ pub fn run(mut b: Boot) -> ! {
                 let r = |o: usize| unsafe { core::ptr::read_volatile((base + o) as *const u64) };
                 platform::pstore(alloc::format!("{}: mair G#{:X} tcr G#{:X} ttbr G#{:X} sctlr G#{:X} hcr G#{:X} vbar G#{:X} cptr G#{:X} stack G#{:X} cnthctl G#{:X}\n", name, r(0), r(8), r(16), r(24), r(32), r(40), r(48), r(56), r(88)).as_bytes());
             }
-            platform::pstore(&crate::process::take_console());
-            platform::reboot();
+            // The console is not drained into the ring any more: the session runs on, and `diag console` is the host's when it comes.
         }
         // A command the USB process handed over (ptlink.rs, USB.md): the one dispatch below. Its handlers end with `continue`, so what follows — the raw reply handed back — runs at the top of the next pass (`proc_restore`).
         if proc_restore.is_some() {
@@ -2826,6 +2846,13 @@ pub fn run(mut b: Boot) -> ! {
                     } else {
                         resp.extend_from_slice(b"key: only `key power`; the volume keys are read as levels (the killswitch, the gate) and nothing queues their presses\n");
                     }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"console kept" || cmd.params.starts_with(b"console kept ") {
+                    // `diag "console kept [KiB]"`: the console's last KiB (default 256, at most 256: a reply's room) as kept, drained or not, without draining it (process.rs `console_kept`).
+                    let kib = core::str::from_utf8(&cmd.params[12..]).ok().and_then(|t| t.trim().parse::<usize>().ok()).unwrap_or(256).clamp(1, 256);
+                    resp.extend_from_slice(&crate::process::console_kept(kib * 1024));
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }

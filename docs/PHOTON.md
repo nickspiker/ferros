@@ -74,6 +74,42 @@ Removal is bilateral (photon docs/pairing-v2.md "Chain changes"), the same as in
 
 Verified on the host: photon-interop shows the app parsing the device's `depart_req` and its consent verifying under every scheme the device holds. Not yet run against a live approver.
 
+## Photon on the 8a, the night of 2026-11-12
+
+Photon's side is the photon branch `ferros-keyboard-inset` (86419781, 72962cd5), built by tools/photon-build.sh against fluor main and signed with Photon's release key as before.
+
+- **The keyboard's rows.** fluor's ferros host tells `on_keyboard_inset`; Photon keeps the rows and its tick lays the bottom strips out again, as Android's IME inset is, so the compose bar rides above the system keyboard.
+- **The permanence warning** (the second typing of a new handle) is drawn under the button, outside the block the form lifts, and the keyboard covered its last three lines; the form now lifts by the warning's extent too while it shows.
+- **fgtw.org over plain HTTP.** Photon's one FGTW transport (`PhotonTransport` in fgtw/fleet.rs) answered "no fgtw.org from ferros", so a handle's probe could only fail.
+  On ferros it now posts over plain HTTP on port 80 (photon platform/ferros_http.rs: ip's resolver, op 10, and its client TCP, ops 4 to 7, every wait a held call; Content-Length and chunked replies).
+  The held chains still come first and fgtw.org stays the mirror asked last.
+  Still stubbed on ferros: the bootstrap's announce, the phonebook client, blobs and the relay, each its own path.
+- **Measured on the 8a** (the surfaces kernel, injected input, a test handle typed for the run and never minted): launch from the circle to the first frame in 2.8 s (the 91.6 MB capsule read from the vault in 1.9 s); the field's tap brings the keyboard ("the keyboard covers 634 rows"); typing and delete land in the field; Attest proves the handle, asks fgtw.org and gets the new handle's answer (the permanence screen), the whole warning above the keys; behind and in front again four times, Mahere in front between, no crash; Photon killed, stowed again and relaunched.
+- **Found:** an injected tap of 8 frames (the bridge's default) on Attest did nothing; one of 12 frames let the keyboard go and pressed it. Not chased: a person's tap is longer than 67 ms.
+- **Not reached:** contacts and a conversation, which need an identity; minting one on fgtw.org for a test is the owner's call.
+
+## Photon's frame time (2026-11-13)
+
+The owner: "Photon in general is stupidly slow, is that our sandboxing? Scrolling up/down usually alters the waveform and the speckles at 60-120fps, it's like 2fps on ferros."
+The Pro's console agreed: the attest screen's first frame in 22 ms when nothing moved, then every scroll frame 581-586 ms (fluor: draw 580758 us, present 3427 us, show 76 us a frame).
+
+Where it went, measured on the 8a (Photon's debug build with frame pointers, stowed with `kist stow`, scrolled by `bridge input drag`, sampled by the kernel's profiler at A#2048 Hz with tools/flame, symbolised against the build's ELF): the same screen's scroll frame took 382-383 ms there (its wave band is 1080 x 633 against the Pro's 1344 x 789).
+- **The wave, not the sandbox.** A scroll frame re-rasters the bg layer, since the wave's phase follows the scroll, and 84 % of the render was Photon's chromatic wave: on a depth wider than 8 bits (fluor's G2t16, what the ferros host runs) each pixel's three channels went thru VSF's settled gamma2tanh encoder, sqrt and tanh and then atanh at least twice to settle, plus a powf and a sin per pixel that depend on the column alone, all on the UI thread. compiler-builtins' software libm was the bulk: log1pf alone 15 % of Photon's samples, expm1f 5 %, tanhf 4 %, VSF's settle and decode 10 % more. Android draws the same wave at 8 bits thru fluor's tables, and on its big cores.
+- **The sandbox is not in it.** Photon's capsule is native (development builds only), its code runs unmasked; nothing in the samples is the kernel's doing for Photon.
+- **The opt-level is not it.** The same code with photon-messenger at opt-level 3: 370-374 ms against 382-383 at 1. After the fix: 65 ms against 68 (std/photon's Cargo.toml keeps 1).
+- **The threads.** rayon has the four A715 workers (`available_parallelism` 4, cores G#F0); the frame loop is on them too. Under the clock policy's active profile the A715 cluster (CPUCL1) runs at A#1065 MHz of its A#2367: with the policy held off and CPUCL1 at A#2367 MHz the fixed render took 31 ms against 68, linear in the clock.
+- **No timer in the way:** the frame loop sleeps to the next 1/120 s and the frames were back to back.
+
+The fix is Photon's (photon branch `ferros-render-perf`, e0c2fe86, for the Photon session to merge): the column terms once a column, tanh(√light) from a 4097-step table (within one code of VSF's at 16 bits, a test checks it), the rows across rayon's workers.
+On the 8a the scroll frame went 382-383 ms to 68 ms (the first frame 387 to 79 ms), the wave looks the same side by side.
+Not measured on the Pro (its console only is read); by its band's size its scroll frame should land near 100 ms.
+
+What the 68 ms is now (the same profile, the fixed build): the wave across the workers, the bake into the panel's codes (`Bake::row`, the present), the noise laid under the whole frame, the bg layer flattened and blitted over the whole frame, its clear (`set_bytes`, compiler-builtins' word loop), and the Photon logo drawn again every frame with its blur (`blur_horizontal_soft`) though it never changes.
+For the owner:
+- The A715s' clock while a person touches (CLOCKS_ACTIVE's A#1065 MHz): the frame time halves at A#2367, at a power cost not measured here.
+- Photon's side (the Photon session's): keep the logo and the version text rastered once and redraw only the wave's band on a scroll, instead of the whole bg layer.
+- ferros's std: memset and memcpy are compiler-builtins-mem's word loops (`set_bytes` 4.4 %, `copy_forward` 2.4 % of Photon's samples after the fix); an aarch64 pair would help every std app a little.
+
 ## Photon's device key on ferros (2026-11-12)
 
 Photon, the stowed kist, took its device key from the machine fingerprint (photon `get_machine_fingerprint`), and on ferros, with no files, that fell to tohu's last resort: the bytes `unknown`.
@@ -215,7 +251,7 @@ From then on records the person publishes (the profile, the avatar wall, their s
 - **M3. Vouched by the alias's device list**, not members of the fleet.
 - **M4. As proposed**: contacts stop taking a person's photons the old way once every device of that person's fleet is in the list.
 - **M5. A new fgtw.org slot** for the alias-sealed copy, the fleet-key copy retired at the cutover. Nothing is deployed to fgtw.org without the owner.
-- **M6. Logs keyed from the handle, as today**: a maintainer handed a handle finds that person's logs. Under the owner's threat model being found is not the harm, and support that works is worth more.
+- **M6. Logs keyed from the person key** (owner, 2026-11-13: "Flip M6, yes"; first decided the other way the night before): a key anyone who knows the handle can compute is no key, and every friend who added the person computed it; logs can hold what helps someone harm the person (device names, networks, timing). The person hands a maintainer a one-time tag when they want help; nobody finds them otherwise.
 - **M7. Removed after a census**, as the rule for text encodings has it (AGENT.md: "never keep a compatibility reader"): the old way's reader goes once the census shows nobody speaks it.
 
 **Order of work**: the person key and the kernel's alias call on ferros first (FACETS.md "To build" 0 to 2); Photon's migration is a Photon project done on every platform at once, after.

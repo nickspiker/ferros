@@ -1,10 +1,12 @@
 //! `ferros send <kist.capsule.vsf>`: stow a kist on a ferros device over USB (docs/KISTS.md "Stowing"; owner, 2026-11-11: "how do we install kists over USB? Can we make a standard method so the end user doesn't have to get them from the [catalog]", "Just seems to me that we should just make a proper checked path and start using it", and "the proper term for installing a kist is stow").
 //!
-//! The device does the checking, as it checks a kist from the directory: every egg of its signature against its developer's keys and the person's trust in them, then the kernel's gate, the sandbox checker and the seal. Nothing is stowed until the person says Stow on the device's screen. This tool carries the capsule in, offers it, and prints how it ended: `stowed`, `refused: <why>` or `cancelled`. It holds no development command (the capability it uses, `ferros.kist.offer`, is one a production build answers too).
+//! The device does the checking, as it checks a kist from the directory: every egg of its signature against its developer's keys and the person's trust in them, then the kernel's gate, the sandbox checker and the seal. Nothing is stowed until the person says Stow on the device's screen. This tool carries the capsule in, offers it, follows the device's checks, and lets the USB link go once the offer waits on the person. It holds no development command (the capability it uses, `ferros.kist.offer`, is one a production build answers too).
 //!
-//! The device: the first ferros device on USB (VID G#1209, PID G#4665), or the one on bus `FERROS_BUS` (lsusb's number) when several are plugged in. Exit 0 stowed, 1 refused or failed, 2 cancelled.
+//! **It never holds the link while the person decides** (owner, 2026-11-12: a stow left waiting on the Pro while the owner was in Mahere held the device's USB interface, and every other host tool was shut out). The claim on the interface is exclusive, and nothing the device does when the person answers reaches a host that holds no claim, so the only waits with no claim and no timer are the person's own: `ferros send` ends at "waiting on the person" (exit 3) with the link released, and `ferros sent <capsule>` asks the device once, at once, how that offer stands (the device keeps an offer's end until another offer replaces it). Meanwhile the device's Deck button is red (docs/NOTIFY.md "System questions"), and one tap on it opens the offer. A `ferros send` of a capsule the device is still asking about carries nothing again: it says so.
 //!
-//! The wire (docs/USB.md "Offering a kist", ferros_pt `caps::OFFER`, ferros_kist::offer): parts of 4 MiB (Write), the offer (Exec), then the offer's state read and held by the device until it changes (Read), each answer printed as it comes.
+//! The device: the first ferros device on USB (VID G#1209, PID G#4665), the one on bus `FERROS_BUS` (lsusb's number), or the one in socket `FERROS_PORT` (sysfs's `1-2.4`) when several are plugged in. Exit 0 stowed, 1 refused or failed, 2 cancelled, 3 waiting on the person (the link let go).
+//!
+//! The wire (docs/USB.md "Offering a kist", ferros_pt `caps::OFFER`, ferros_kist::offer): parts of 4 MiB (Write), the offer (Exec), then the offer's state read and held by the device until it changes (Read), each answer printed as it comes, until it asks the person or ends.
 
 use ferros_kist::offer;
 use ferros_kist::tatau::{Base, Fmt, Style};
@@ -16,10 +18,87 @@ use std::process::exit;
 
 fn usage() -> ! {
     eprintln!("Usage: ferros send <kist.capsule.vsf>");
+    eprintln!("       ferros sent <kist.capsule.vsf>");
     eprintln!();
-    eprintln!("Offers a kist to the ferros device on USB; the person stows or cancels it on the device's screen.");
-    eprintln!("FERROS_BUS=<bus number> picks the device when more than one is plugged in.");
+    eprintln!("send: offers a kist to the ferros device on USB and lets the link go once it waits on the person, who stows or cancels it on the device's screen (its Deck button turns red: a tap opens it).");
+    eprintln!("sent: how that offer stands now: stowed, refused, cancelled, or still waiting.");
+    eprintln!("Exit 0 stowed, 1 refused or failed, 2 cancelled, 3 waiting on the person.");
+    eprintln!("FERROS_BUS=<bus number> or FERROS_PORT=<bus>-<port path> picks the device when more than one is plugged in.");
     exit(1);
+}
+
+/// The exit codes.
+const STOWED: i32 = 0;
+const FAILED: i32 = 1;
+const CANCELLED: i32 = 2;
+const WAITING: i32 = 3;
+
+/// The offer of `address`'s state on the device: [state, why, flags]. The device answers at once when its state is not `seen`, else holds the answer until it changes or its lease (`offer::HOLD_SECONDS`) ends. `u8::MAX` is no state, answered at once.
+async fn state(link: &UsbLink, address: &[u8; 32], seen: u8) -> [u8; 3] {
+    let mut p = Vec::with_capacity(33);
+    p.extend_from_slice(address);
+    p.push(seen);
+    let r = pt::call(link, &pt::command(OFFER, Op::Read, &p)).await.unwrap_or_else(|e| {
+        eprintln!("the link failed: {e}");
+        exit(FAILED);
+    });
+    match r[..] {
+        [s, w, f, ..] => [s, w, f],
+        _ => {
+            eprintln!("the device's answer does not read ({} bytes)", r.len());
+            exit(FAILED);
+        }
+    }
+}
+
+/// A state said, and the exit code it ends with (None: not ended, the device still working on it).
+fn tell(state: u8, why: u8, flags: u8) -> Option<i32> {
+    match state {
+        offer::OFFERED => say("waiting for the device's stower to take it"),
+        offer::CHECKING => say("the device is checking it: its signature, then its code"),
+        offer::ASKING => {
+            if flags & offer::NATIVE != 0 {
+                say("unchecked code, development build only");
+            }
+            say("waiting for the person to say Stow or Cancel on the device: its Deck button is red, and a tap on it opens the offer");
+            say("the USB link is free meanwhile; `ferros sent <capsule>` says how it ended");
+            return Some(WAITING);
+        }
+        offer::STOWED => {
+            say("stowed");
+            return Some(STOWED);
+        }
+        offer::REFUSED => {
+            say(&format!("refused: {}", offer::words(why)));
+            return Some(FAILED);
+        }
+        offer::CANCELLED => {
+            say("cancelled");
+            return Some(CANCELLED);
+        }
+        offer::GONE => {
+            say("refused: the device has no such offer (another replaced it, the device restarted, or the person left)");
+            return Some(FAILED);
+        }
+        _ => {
+            say(&format!("refused: the device answered a state this tool does not know ({state})"));
+            return Some(FAILED);
+        }
+    }
+    None
+}
+
+/// The offer followed from state `seen` until it asks the person or ends: each state said as the device tells it (it holds each read until the state changes, so nothing here waits on a timer of its own). The exit code.
+async fn follow(link: &UsbLink, address: &[u8; 32], mut seen: u8) -> i32 {
+    loop {
+        let [s, why, flags] = state(link, address, seen).await;
+        if s != seen {
+            seen = s;
+            if let Some(code) = tell(s, why, flags) {
+                return code;
+            }
+        }
+    }
 }
 
 /// Numbers as a terminal reads them: decimal, words for units.
@@ -72,18 +151,19 @@ fn parts(address: &[u8; 32], capsule: &[u8]) -> Vec<(u64, Vec<u8>)> {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = match (args.get(1).map(String::as_str), args.get(2), args.len()) {
-        (Some("send"), Some(p), 3) => p.clone(),
+    let (sent, path) = match (args.get(1).map(String::as_str), args.get(2), args.len()) {
+        (Some("send"), Some(p), 3) => (false, p.clone()),
+        (Some("sent"), Some(p), 3) => (true, p.clone()),
         _ => usage(),
     };
     let capsule = std::fs::read(&path).unwrap_or_else(|e| {
         eprintln!("{path}: {e}");
-        exit(1);
+        exit(FAILED);
     });
     // What it says it is, read from its own first bytes before anything is sent (the device checks it all again, and more).
     let decl = ferros_kist::declaration(&capsule).unwrap_or_else(|e| {
         eprintln!("{path}: not a kist ({e})");
-        exit(1);
+        exit(FAILED);
     });
     let mut what = decl.name.clone();
     if let Ok(Some(v)) = ferros_kist::version_of(&capsule) {
@@ -94,8 +174,26 @@ async fn main() {
     let len = capsule.len() as u64;
     let link = UsbLink::open().await.unwrap_or_else(|e| {
         eprintln!("{e}");
-        exit(1);
+        exit(FAILED);
     });
+
+    // How the device has this capsule's offer now, answered at once: `sent` says it and ends; `send` carries nothing again for an offer the device still has under way.
+    let [s, why, flags] = state(&link, &address, u8::MAX).await;
+    if sent {
+        say(&format!("{what}: the device's offer of it is {}", offer::state_name(s)));
+        let code = tell(s, why, flags).unwrap_or(WAITING);
+        drop(link);
+        exit(code);
+    }
+    if !offer::finished(s) {
+        say(&format!("{what} is offered already ({}): nothing is carried again", offer::state_name(s)));
+        let code = match tell(s, why, flags) {
+            Some(code) => code,
+            None => follow(&link, &address, s).await,
+        };
+        drop(link);
+        exit(code);
+    }
     say(&format!("offering {what} ({}) to the device", size(len)));
 
     // The parts, in order, each kept by the device before the next goes; each said as the device keeps it (a part is a few seconds: the device writes it to its vault before it answers).
@@ -105,14 +203,14 @@ async fn main() {
         let part_len = p.len() as u64 - 41;
         let r = pt::call(&link, &pt::command(OFFER, Op::Write, &p)).await.unwrap_or_else(|e| {
             eprintln!("the link failed: {e}");
-            exit(1);
+            exit(FAILED);
         });
         if let Err(w) = plain(&r) {
             eprintln!("not sent: {w}");
             if r.first() == Some(&2) {
-                eprintln!("(the device shows that kist on its Kists page: Stow or Cancel it there first)");
+                eprintln!("(another kist waits on the person: the device's Deck button is red, and a tap on it opens that offer; Stow or Cancel it there first)");
             }
-            exit(1);
+            exit(FAILED);
         }
         say(&format!("  part {} of {n} kept: {} of {}", k + 1, size(at + part_len), size(len)));
     }
@@ -122,66 +220,18 @@ async fn main() {
     p.extend_from_slice(&len.to_le_bytes());
     let r = pt::call(&link, &pt::command(OFFER, Op::Exec, &p)).await.unwrap_or_else(|e| {
         eprintln!("the link failed: {e}");
-        exit(1);
+        exit(FAILED);
     });
     if let Err(w) = plain(&r) {
         eprintln!("not offered: {w}");
-        exit(1);
+        exit(FAILED);
     }
     say("offered");
 
-    // Its state, read again each time it changes: the device holds each read until it does (or for a few seconds, then answers it unchanged), so nothing here waits on a timer of its own.
-    let mut seen = u8::MAX;
-    loop {
-        let mut p = Vec::with_capacity(33);
-        p.extend_from_slice(&address);
-        p.push(seen);
-        let r = pt::call(&link, &pt::command(OFFER, Op::Read, &p)).await.unwrap_or_else(|e| {
-            eprintln!("the link failed: {e}");
-            exit(1);
-        });
-        let [state, why, flags] = match r[..] {
-            [s, w, f, ..] => [s, w, f],
-            _ => {
-                eprintln!("the device's answer does not read ({} bytes)", r.len());
-                exit(1);
-            }
-        };
-        if state != seen {
-            seen = state;
-            match state {
-                offer::OFFERED => say("waiting for the device's stower to take it"),
-                offer::CHECKING => say("the device is checking it: its signature, then its code"),
-                offer::ASKING => {
-                    if flags & offer::NATIVE != 0 {
-                        say("unchecked code, development build only");
-                    }
-                    say("waiting for the person to say Stow or Cancel on the device");
-                    say("(its Kists page opens on it once the person is on the map; an app in front keeps it waiting until Home)");
-                }
-                offer::STOWED => {
-                    say("stowed");
-                    exit(0);
-                }
-                offer::REFUSED => {
-                    say(&format!("refused: {}", offer::words(why)));
-                    exit(1);
-                }
-                offer::CANCELLED => {
-                    say("cancelled");
-                    exit(2);
-                }
-                offer::GONE => {
-                    say("refused: the offer is gone (the device restarted, or the person left)");
-                    exit(1);
-                }
-                _ => {
-                    say(&format!("refused: the device answered a state this tool does not know ({state})"));
-                    exit(1);
-                }
-            }
-        }
-    }
+    // Followed while the device works on it (its stower taking it, its checks), then the link let go as soon as it asks the person, or ends.
+    let code = follow(&link, &address, u8::MAX).await;
+    drop(link);
+    exit(code);
 }
 
 #[cfg(test)]
@@ -228,6 +278,14 @@ mod tests {
         for s in [offer::OFFERED, offer::CHECKING, offer::ASKING] {
             assert!(!offer::finished(s));
         }
+        // The link is let go at the person's question: asking ends this tool's part (waiting), the device's own work does not.
+        assert_eq!(tell(offer::ASKING, 0, 0), Some(WAITING));
+        assert_eq!(tell(offer::OFFERED, 0, 0), None);
+        assert_eq!(tell(offer::CHECKING, 0, 0), None);
+        assert_eq!(tell(offer::STOWED, 0, 0), Some(STOWED));
+        assert_eq!(tell(offer::CANCELLED, 0, 0), Some(CANCELLED));
+        assert_eq!(tell(offer::REFUSED, 1, 0), Some(FAILED));
+        assert_eq!(tell(offer::GONE, 0, 0), Some(FAILED));
         for w in 1..=offer::why::NATIVE_HERE {
             assert_ne!(offer::words(w), "something went wrong", "reason {w}");
             assert!(!offer::words(w).contains('\u{2014}'));

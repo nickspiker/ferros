@@ -518,7 +518,7 @@ pub mod kist {
 pub mod gpu {
     /// The GPU service's view of a client's own block of the layer arena: offset 0 of the block (payloads/gpu `ARENA_VA`). A client names its memory to its kernels as `ARENA_VA` plus an offset into its own block; nothing else of the arena is mapped for it.
     pub const ARENA_VA: u64 = 0x8000_0000;
-    /// The apps' surfaces in a client's GPU view: a surface it holds at `SURFACES_VA` plus its distance from the first surface (`SURFACES_PA`, the kernel's cachemap SURFACES); a surface it does not hold is not mapped.
+    /// The apps' surfaces in a client's GPU view: a surface it holds at `SURFACES_VA` plus its address's distance from `SURFACES_PA`; a surface it does not hold is not mapped. `SURFACES_PA` was the four surfaces' physical base until 2026-11-12, and stays the point the view is reckoned from (Mahere's build computes it so): a surface's address is now in the surfaces' window (`super::SURFACES_WINDOW`), its frames anywhere in the pool, so slot k's view is G#50_0000_0000 plus k times 32 MiB.
     pub const SURFACES_VA: u64 = 0xC000_0000;
     pub const SURFACES_PA: u64 = 0xCA00_0000;
     /// The reply's status bytes past [status][µs u32] when the job reached outside the client's memory (status `OUTSIDE`): [the GPU address u64][the GPU MMU's fault status u32].
@@ -533,20 +533,46 @@ pub mod gpu {
 
     /// The most regions a stamp names that the service maps (a client holds a block and a surface or two).
     pub const REGIONS: usize = 8;
+    /// The most frames a stamp carries: four surfaces of 16 frames and a block at the ceiling (`super::GPU_BLOCK_MOST`).
+    pub const FRAMES: usize = 64 + super::GPU_BLOCK_MOST / FRAME as usize;
+    /// A frame: what a surface's and a GPU block's physical memory comes in (the kernel's frames.rs FRAME), 16 to a surface.
+    pub const FRAME: u64 = 1 << 21;
 
-    /// The kernel's stamp ahead of a request on `gpu` (process.rs `gpu_stamp`): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build][n u8][n × (base u64, size u64)], every GPU-reachable region the caller holds. The kernel writes it for every call, so the service trusts it and nothing after it.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    pub struct Stamp {
+    /// The kernel's stamp ahead of a request on `gpu` (process.rs `gpu_stamp`): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build, bit 2 frames follow][n u8][n × (base u64, size u64)], every GPU-reachable region the caller holds, then (bit 2, since 2026-11-12) for each region in a window of frames (`in_window`: a surface, or since 2026-11-13 a GPU block), in order, its frames' physical addresses (u64 each, its size over `FRAME` of them). The kernel writes it for every call, so the service trusts it and nothing after it.
+    /// The frames stay in the message's bytes (`frames_of` reads them): a block at the ceiling carries 256, more than a fixed array beside each client is worth.
+    #[derive(Clone, Copy)]
+    pub struct Stamp<'a> {
         pub epoch: u64,
         pub kist: bool,
         pub production: bool,
         pub n: usize,
         pub regions: [(u64, u64); REGIONS],
+        /// The frames' bytes, 8 a frame, in the order of their regions (`frames_of`).
+        frames: &'a [u8],
     }
 
-    impl Stamp {
-        /// The stamp and the caller's own bytes after it; None when the message is shorter than its stamp (only a kernel from before the stamp sends one so) or names more than `REGIONS`: the service then refuses the request.
-        pub fn read(m: &[u8]) -> Option<(Stamp, &[u8])> {
+    /// What names a client's GPU memory (`Stamp::key`): its epoch and its regions. A surface's frames never change while it is held, and a block's only as it grows (the kernel appends frames, its size in its region), so the same key is the same frames.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub struct Key {
+        pub epoch: u64,
+        pub kist: bool,
+        pub n: usize,
+        pub regions: [(u64, u64); REGIONS],
+    }
+
+    /// Whether a region lies in a window of frames: a surface (the surfaces' window) or a GPU block (the blocks' window, since 2026-11-13), whose frames the stamp carries.
+    pub const fn in_window(b: u64, size: u64) -> bool {
+        (b >= super::SURFACES_WINDOW && b + size <= super::SURFACES_WINDOW + (super::SURFACE_SLOTS * super::SURFACE_BYTES) as u64) || (b >= super::GPU_BLOCKS_WINDOW && b + size <= super::GPU_BLOCKS_WINDOW + (super::GPU_BLOCK_SLOTS * super::GPU_BLOCK_MOST) as u64)
+    }
+
+    /// Whether a region is a GPU block: in the blocks' window.
+    pub const fn is_block(b: u64, size: u64) -> bool {
+        b >= super::GPU_BLOCKS_WINDOW && b + size <= super::GPU_BLOCKS_WINDOW + (super::GPU_BLOCK_SLOTS * super::GPU_BLOCK_MOST) as u64
+    }
+
+    impl<'a> Stamp<'a> {
+        /// The stamp and the caller's own bytes after it; None when the message is shorter than its stamp (only a kernel from before the stamp sends one so), names more than `REGIONS`, or carries more than `FRAMES`: the service then refuses the request. A kernel from before the frames (no bit 2) names its surfaces at their physical addresses, which lie outside the window, so none is a surface here.
+        pub fn read(m: &'a [u8]) -> Option<(Stamp<'a>, &'a [u8])> {
             if m.len() < 10 {
                 return None;
             }
@@ -556,17 +582,51 @@ pub mod gpu {
             if m.len() < end || n > REGIONS {
                 return None;
             }
-            let mut s = Stamp { epoch: u64::from_le_bytes(m[0..8].try_into().unwrap()), kist: m[8] & 1 != 0, production: m[8] & 2 != 0, n, regions: [(0, 0); REGIONS] };
+            let mut s = Stamp { epoch: u64::from_le_bytes(m[0..8].try_into().unwrap()), kist: m[8] & 1 != 0, production: m[8] & 2 != 0, n, regions: [(0, 0); REGIONS], frames: &[] };
             for k in 0..s.n {
                 let at = 10 + 16 * k;
                 s.regions[k] = (u64::from_le_bytes(m[at..at + 8].try_into().unwrap()), u64::from_le_bytes(m[at + 8..at + 16].try_into().unwrap()));
             }
-            Some((s, &m[end..]))
+            if m[8] & 4 == 0 {
+                return Some((s, &m[end..]));
+            }
+            let nf: usize = s.regions().iter().filter(|r| in_window(r.0, r.1)).map(|r| (r.1 / FRAME) as usize).sum();
+            // WHY: the frames' count follows from the regions the kernel wrote; past what the service maps, or past what arrived (a message cut at the service's buffer), the request is refused whole, as for regions.
+            if nf > FRAMES || m.len() < end + 8 * nf {
+                return None;
+            }
+            s.frames = &m[end..end + 8 * nf];
+            Some((s, &m[end + 8 * nf..]))
         }
 
         /// The regions it names.
         pub fn regions(&self) -> &[(u64, u64)] {
             &self.regions[..self.n]
+        }
+
+        /// Its client's memory as a key: the same key, the same memory.
+        pub fn key(&self) -> Key {
+            Key { epoch: self.epoch, kist: self.kist, n: self.n, regions: self.regions }
+        }
+
+        /// The frames of region `i` when it is in a window (a surface, a GPU block), in order: its physical memory, 2 MiB a frame; none for any other region.
+        pub fn frames_of(&self, i: usize) -> impl Iterator<Item = u64> + 'a {
+            let mut at = 0;
+            let mut count = 0;
+            for (k, r) in self.regions().iter().enumerate() {
+                if !in_window(r.0, r.1) {
+                    continue;
+                }
+                let n = (r.1 / FRAME) as usize;
+                if k == i {
+                    count = n;
+                    break;
+                }
+                at += n;
+            }
+            // A stamp without frames (bit 2 clear) carries none for it: nothing to map.
+            let bytes: &'a [u8] = if 8 * (at + count) <= self.frames.len() { &self.frames[8 * at..8 * (at + count)] } else { &[] };
+            bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap()))
         }
     }
 }
@@ -788,7 +848,8 @@ pub fn cutout_hole() -> (f32, f32, f32) {
     if akita() { CUTOUT_HOLE_AKITA } else { CUTOUT_HOLE }
 }
 
-/// The circle an app lives in, on a `w` × `h` screen: centre and radius in pixels. Tangent to the bottom of the camera cutout and to the bottom of the screen, centred, so the corners outside it belong to the system (owner, 2026-11-02); the display draws its hairline, and every active app's page is inscribed in it (owner, 2026-11-05: the settings page fills it, the attest mark keeps its own smaller circle).
+/// The circle an app lives in, on a `w` × `h` screen: centre and radius in pixels. Tangent to the bottom of the camera cutout and to the bottom of the screen, centred, so the corners outside it belong to the system (owner, 2026-11-02); every active app's page is inscribed in it (owner, 2026-11-05: the settings page fills it, the attest mark keeps its own smaller circle).
+/// Since 2026-11-12 a kist's window is no longer cut to it: the window fills the glass and the corners' controls float in front of it, so the circle is the kist's safe area, told to its window as `window::EV_SAFE` (WINDOWS.md "Drawn under the controls").
 pub fn active_circle(w: usize, h: usize) -> (f32, f32, f32) {
     let c = cutout_bottom();
     let r = (h as f32 - c) * 0.5;
@@ -999,8 +1060,29 @@ pub fn status_track(k: usize, word: u64) -> u64 {
 
 /// The facts' bell source (`bell`): the facts a settings page shows (the battery's share and whether it charges, the processes alive, the vault's keys, the hottest part of the chip and its throttle). Sources 0-5 are the links in the facts' order.
 pub const BELL_FACTS: u64 = 6;
-/// The windows' owners' bell source (`bell`), for the holder of the `surfaces` region alone (the display server): the word is not a count but the four app surfaces' live generations, byte k surface k's (its preference byte 8 + k while the process it was given to is alive, 0 once it has ended, however it ended), and a change count above bit 32. A window shown on a surface under a generation its byte no longer holds belongs to a process that has ended.
+/// The windows' owners' bell source (`bell`) in its old form, for the holder of the `surfaces` region alone (the display server): byte k slot k's live generation for slots 0 to 3, and a change count above bit 32. Kept for a display from before 2026-11-12; `BELL_SLOTS` carries every slot.
 pub const BELL_SURFACES: u64 = 9;
+/// The surface slots' bell source (`bell`, since 2026-11-12), for the holder of the `surfaces` region alone (the display server): the word is not a count but every slot's live generation, bits 4k to 4k + 3 slot k's (1 to 15 while the process it was given to is alive, 0 once it has ended, however it ended, or while the slot is free; `surface_generation`). A window shown on a surface under a generation its slot no longer holds belongs to a process that has ended.
+pub const BELL_SLOTS: u64 = 12;
+
+/// How many surfaces the kernel can give out at once (2026-11-12, on demand from the frame pool; four fixed ones before): slots of the surfaces' window, slot k at `SURFACES_WINDOW + k * SURFACE_BYTES`.
+pub const SURFACE_SLOTS: usize = 16;
+/// One surface slot's bytes: a whole panel at 64 bits a pixel and its porch, rounded up to a power of two (the kernel's SURFACE_SIZE).
+pub const SURFACE_BYTES: usize = 32 << 20;
+/// The surfaces' window, the kernel's cachemap SURF_VA: what `dma` answers for the whole `surfaces` region.
+pub const SURFACES_WINDOW: u64 = 0x50_0A00_0000;
+
+/// The most GPU memory one client may hold (the kernel's cachemap GPU_BLOCK_MOST, 2026-11-13): its GPU block, frames of the pool on demand, asked for by `gpu_block_ask`.
+pub const GPU_BLOCK_MOST: usize = 512 << 20;
+/// How many GPU blocks the kernel can give out at once: slots of the blocks' window, slot k at `GPU_BLOCKS_WINDOW + k * GPU_BLOCK_MOST`.
+pub const GPU_BLOCK_SLOTS: usize = 16;
+/// The GPU blocks' window, the kernel's cachemap GPUB_VA: what `dma` answers for the whole `arena` region (the GPU service's), a block at the start of its slot.
+pub const GPU_BLOCKS_WINDOW: u64 = 0x58_0000_0000;
+
+/// Slot k's generation in the slots' bell word (`BELL_SLOTS`): 0 when nobody alive holds it.
+pub const fn surface_generation(word: u64, k: usize) -> u8 {
+    (word >> (4 * k)) as u8 & 15
+}
 
 /// A doorbell on what the settings pages show (kernel SYS_BELL; owner, 2026-11-10: "Needs a doorbell"): the kernel writes `source`'s change count into `word` now and whenever it changes, waking whatever waits on it (`wait_world`). Source 0-5 a link (its measures, tracks and detail, as its driver sets them, and emptied as it ends), `BELL_FACTS` the facts. A reader that compares the word to the count it last drew with knows to draw again, and asks nothing on a timer. False for no such source, or a kernel without bells.
 pub fn bell(source: u64, word: &core::sync::atomic::AtomicU64) -> bool {
@@ -1082,6 +1164,17 @@ pub fn pet() {
 /// The device's plain facts, for its dashboard (kernel SYS_FACTS); `None` where a fact is not known.
 pub struct Facts(pub [u64; 88]);
 
+/// The bootloader's lock state (`Facts::boot_lock`; FLASHER.md step 7: re-locking ends setup, leaving it unlocked is the person's known choice).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BootLock {
+    /// Anyone holding the device can boot their own system and derive its ira, so read the device class (settings, stowed kists, cached wallpaper).
+    Unlocked,
+    /// Locked to the custom key (verified boot yellow): the key this ferros is signed with.
+    LockedOwnKey,
+    /// Locked to the maker's key (verified boot green).
+    LockedMakersKey,
+}
+
 /// Local wall time: (seconds since 1970 in local time — UTC plus the zone, `device.tz` — and the counter ticks into the current second), or None until the kernel has read the PMIC's clock. From the kernel's base (facts 8, 9) and this process's own counter.
 /// The zone's two offsets as the kernel last handed them (preferences bytes 24-31, kernel rtc.rs `packed`): (standard, legal), seconds east of UTC. Legal is daylight time while it is in effect; without a zone's rule (a manual offset) the two are the same.
 pub fn zone_offsets() -> (i64, i64) {
@@ -1114,6 +1207,17 @@ impl Facts {
     /// Which board (fact 84): 1 husky (Pixel 8 Pro), 2 akita (Pixel 8a). For a driver whose part differs between them.
     pub fn board(&self) -> Option<u64> {
         self.get(84)
+    }
+    /// The bootloader's lock state as ABL told this boot (fact 87, kernel bootlock.rs), None when not known (a reload, or ABL said neither). Unlocked when either of ABL's two words says so (the device state `unlocked`, or verified boot `orange`), so a disagreement shows the exposure rather than hiding it.
+    pub fn boot_lock(&self) -> Option<BootLock> {
+        let v = self.get(87)?;
+        let (device, vbs) = (v & 0xFF, v >> 8 & 0xFF);
+        match (device, vbs) {
+            (2, _) | (_, 3) => Some(BootLock::Unlocked),
+            (1, 2) => Some(BootLock::LockedOwnKey),
+            (1, 1) => Some(BootLock::LockedMakersKey),
+            _ => None,
+        }
     }
     /// From the press at "Ready?" to the shell starting, microseconds.
     pub fn boot_us(&self) -> Option<u64> {
@@ -1804,8 +1908,16 @@ pub fn reply(token: &[u8; 32], msg: &[u8]) -> u64 {
 pub const CALLER_SETTINGS: u64 = 1 << 8;
 /// `caller`'s answer: the caller is a kist.
 pub const CALLER_KIST: u64 = 1 << 9;
+/// `caller`'s answer: bit `CALLER_SURFACE0 + k` for surface slot k (bits 32 to 47 since 2026-11-12, sixteen slots; bits 0 to 3 for four surfaces before, which the kernel still sets for slots 0 to 3).
+pub const CALLER_SURFACE0: u32 = 32;
 
-/// What the process behind a call holds that its server decides by (kernel SYS_CALLER), asked with the call's reply token before replying: bits 0-3 the surfaces it holds (surface k its own, or inside a region holding it whole), `CALLER_SETTINGS`, `CALLER_KIST`. None for a token that is no call of this process's, or on a kernel from before (no such syscall): a server refuses then.
+/// Whether `caller`'s answer `h` holds surface slot k.
+#[inline]
+pub const fn caller_holds_surface(h: u64, k: usize) -> bool {
+    h >> (CALLER_SURFACE0 as usize + k) & 1 == 1
+}
+
+/// What the process behind a call holds that its server decides by (kernel SYS_CALLER), asked with the call's reply token before replying: bits 32 to 47 the surface slots it holds (`caller_holds_surface`: slot k its own, or inside a region holding it whole), `CALLER_SETTINGS`, `CALLER_KIST`. None for a token that is no call of this process's, or on a kernel from before (no such syscall): a server refuses then.
 pub fn caller(token: &[u8; 32]) -> Option<u64> {
     match svc(nr::CALLER, off(token.as_ptr()), 0, 0, 0, 0) {
         ERR | NOTHING => None,
@@ -1837,6 +1949,12 @@ pub fn dma(cap: u64) -> u64 {
 pub fn dma_size(cap: u64, most: u64) -> Option<u64> {
     let n = svc(nr::DMA, cap, 1, 0, 0, 0);
     (n != ERR && n <= most).then_some(n)
+}
+
+/// Ask the kernel to grow this process's GPU block (the grant at `cap`: a kist's `gpu::kist_slots` block, a spawn's `layers`) to 2^`log` bytes, in place: its base and everything in it stay. Its size after (at least what it held; asking for less leaves it as it is), or None: not a GPU block, past `GPU_BLOCK_MOST`, more than the frame pool can give (the console says which), or a kernel from before 2026-11-13 (which answers the region's base, told by its being past any block's size).
+pub fn gpu_block_ask(cap: u64, log: u32) -> Option<u64> {
+    let n = svc(nr::DMA, cap, 2, log as u64, 0, 0);
+    (n != ERR && n <= GPU_BLOCK_MOST as u64).then_some(n)
 }
 
 /// Copy spawn input into `buf`, starting at byte `off`; returns how many bytes (0 at the end). Large one-shot input (firmware) is streamed this way so the arc stays small.
@@ -2150,6 +2268,17 @@ pub mod window {
     pub const EV_TEXT: u8 = 6;
     /// The keyboard's place changed: its payload two bytes, little-endian, the screen rows it covers from the bottom up (0: gone). The window keeps what it is typing into above them.
     pub const EV_INSET: u8 = 7;
+    /// The window's safe area (WINDOWS.md "Drawn under the controls", owner 2026-11-12: "Should we draw under the controls?", then "Agreed. Build it!"): a window fills the glass, and the system's controls float in front of its corners, so it keeps its own buttons and text where nothing covers them.
+    /// The payload is `SAFE_BYTES` long: the app's circle (`active_circle`) in the window's own pixels, its top-left corner the origin, centre x and centre y as i32 and the radius as u32, each in 256ths of a pixel, little-endian; then a byte of `SAFE_TOP` and `SAFE_BOTTOM`, which of the glass outside the circle the system holds.
+    /// A point is the window's to use when it is inside the circle, or outside it on a half (above the circle's centre, or below it) whose bit is clear.
+    /// Told when the window first shows, and again whenever it changes (full screen on or off); the keyboard's place is `EV_INSET`'s, apart from it.
+    pub const EV_SAFE: u8 = 8;
+    /// `EV_SAFE`'s payload length.
+    pub const SAFE_BYTES: usize = 13;
+    /// `EV_SAFE`'s byte: the glass outside the circle above its centre is the system's (the console's circles, drawn and touched there).
+    pub const SAFE_TOP: u8 = 1;
+    /// `EV_SAFE`'s byte: the glass outside the circle below its centre is the system's (the helm's wedges, Back and Deck: touched there even in full screen, where they are not drawn).
+    pub const SAFE_BOTTOM: u8 = 2;
     /// Kinds from this one up carry a payload: the low byte is its length, and the payloads follow the reply's events, in the events' order. A kind a reader does not know is stepped over by its length.
     pub const PAYLOAD_KINDS: u8 = 6;
     /// The most bytes one event's payload holds (a typed word, a key's text); longer text is sent in pieces.
@@ -2232,11 +2361,11 @@ pub mod window {
         (call(display, &[67, number], &mut r) >= 3 && r[0] == 0).then_some((r[1], r[2]))
     }
 
-    /// The helm's Deck button as the deck's summary (display op 66; owner, 2026-11-12: "if anything on the deck has changed state, specifically 400nm notifications, we change the deck circle in the helm", then "So ideally the deck circle shows the latest item icon preview and shows the violet ring?"): `icon` the latest note's source's icon in the display's bundle (0: none, the ring alone), `count` how many wait in the deck's resting view (0: the plain Deck mark). True when the display took it.
-    pub fn helm_note(display: u64, icon: u8, count: u16) -> bool {
+    /// The helm's Deck button as the deck's summary (display op 66; owner, 2026-11-12: "if anything on the deck has changed state, specifically 400nm notifications, we change the deck circle in the helm", then "So ideally the deck circle shows the latest item icon preview and shows the violet ring?"): `icon` the latest note's source's icon in the display's bundle (0: none, the ring alone), `count` how many wait in the deck's resting view (0: the plain Deck mark), `glow` its ring and glow as ferros_glow's state byte: for you (4, 400 nm), or a question (6, 703 nm: the system waits on the person's answer; owner, 2026-11-12: "only difference is it would be 700nm red, rather than the regular 400nm notification glow"). True when the display took it.
+    pub fn helm_note(display: u64, icon: u8, count: u16, glow: u8) -> bool {
         let c = count.to_le_bytes();
         let mut r = [0u8; 4];
-        call(display, &[66, icon, c[0], c[1]], &mut r) >= 1 && r[0] == 0
+        call(display, &[66, icon, c[0], c[1], glow], &mut r) >= 1 && r[0] == 0
     }
 
     /// This window's events after `seen` (display op 62), held by the display until there is one: (the count now, behind, the events since `seen`, oldest first, at most `EVENTS`). None when the display has no such op. Call it from a thread of its own: the call waits.

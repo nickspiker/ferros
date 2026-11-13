@@ -922,7 +922,7 @@ fn mandel_once(grants: u64, arena: usize) -> (u8, u32) {
 
 /// The intruder: one workgroup of 16 stores (G#C0FF_EE00 + the invocation's id, to u0 + 4 × id: the service's first compute shader, GPU.md "Compute") aimed at each address in turn, its own block's first (the control: must land) and then every place another client's memory could be: past its own block, each other 32 MiB of the arena in the shared layout of before, every surface (it holds none), and the service's own pages it is shown read-only (its ring, its descriptors, its code). Each reply said, then an endless kernel (stopped at its guard, no host timer), then the control again, then the keeper asked whether anything of its changed.
 fn intruder(grants: u64, arena: usize) -> ! {
-    use ferros_sys::gpu::{OUTSIDE, SURFACES_VA};
+    use ferros_sys::gpu::{OUTSIDE, SURFACES_PA, SURFACES_VA};
     let size = ferros_sys::dma_size(cap(grants, S_ARENA), 1 << 30).unwrap_or(0) as u64;
     const STORE: [u64; 3] = [0x0110_C0C0_FFEE_003C, 0x01A3_C200_2027_3C80, 0x7861_4002_1800_0002];
     let control = 1u64 << 20;
@@ -937,8 +937,9 @@ fn intruder(grants: u64, arena: usize) -> ! {
     for j in 1..4u64 {
         push(ARENA_VA + (32 << 20) * j + control);
     }
+    // The first four surface slots where the view puts them (SURFACES_VA plus a slot's address less SURFACES_PA: the surfaces' window since 2026-11-12, G#50_0000_0000 up).
     for j in 0..4u64 {
-        push(SURFACES_VA + (32 << 20) * j + 64);
+        push(SURFACES_VA + (ferros_sys::SURFACES_WINDOW - SURFACES_PA) + (ferros_sys::SURFACE_BYTES as u64) * j + 64);
     }
     // The service's pages in the client's space (payloads/gpu RING_VA, DESC_VA, CODE_BIG_VA): mapped read-only for it.
     push(0x1000_0000);

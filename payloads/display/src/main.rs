@@ -2023,8 +2023,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, _tabs: &neon::Odt, mas
         // The row's edge: its masked columns and its listed edge pixels, as the columns from the left and from the right that need it.
         let g = &rows[y];
         let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), rows[y + 1].first as usize) };
-        let row_px = &plan[g.first as usize..];
-        let edge_px = &row_px[front_split(row_px)..];
+        let edge_px = &plan[g.first as usize..];
         let (el, er) = edge_cols(g, edge_px, width);
         let (hl, hr) = (g.hole_l as usize, g.hole_r as usize);
         let ((cl, cr), bw) = bar_line(y, width, height);
@@ -2783,18 +2782,19 @@ fn stripes(kind: u8, base: usize, width: usize, height: usize, r: draw::Rect) {
 
 // ---------------------------------------------------------------- the flight, prerendered
 //
-// COMPOSITOR.md "The flight, prerendered": opening or closing the open circle, two images made once — the page image (the clean window in the canvas and the text in the front layer, the region as landing shows it) and the plane image (a free app surface) — and each frame of the flight samples them through the camera, nearest, inside the publish. No scene is drawn while it flies.
+// COMPOSITOR.md "The flight, prerendered": opening or closing the open circle, two images made once — the page image (the clean window in the canvas and the text in the front layer, the region as landing shows it) and the plane image (the display's own buffer, `PLANE`) — and each frame of the flight samples them through the camera, nearest, inside the publish. No scene is drawn while it flies.
 
-/// The flight's images: the surface holding the plane image, the camera op it was made at (None until made), the page image's camera op (the region's clean window must be current for it), and the theme and scene generation the plane image was made in.
+/// The flight's images: the camera op the plane image (in `PLANE`) was made at (None until made), the page image's camera op (the region's clean window must be current for it), and the theme and scene generation the plane image was made in.
 #[derive(Clone, Copy)]
 struct FlightImages {
-    surf: usize,
     plane: Option<[u8; 18]>,
     page: [u8; 18],
     theme: u8,
     scene: u32,
 }
 static mut FLIGHT: Option<FlightImages> = None;
+/// The plane image's buffer (and the capture's, op 30, which leaves the flight none): a full screen of 64-bit pixels of the display's own heap, allocated at start (2026-11-12; until then a free app surface, which made a flight wait for one, and with surfaces given out on demand a free one has no memory behind it).
+static mut PLANE: usize = 1;
 /// What the camera op inside an op 45 does: 0 nothing (not inside one), 1 the page image (the region path, no publish), 2 the plane image (the scene into the flight's surface), 3 nothing to make (both images current).
 static mut FLIGHT_PRE: u8 = 0;
 /// One image's map from a screen pixel to its own, 16.16: the pixel (0, 0)'s centre, and the steps a pixel right and a row down.
@@ -3087,9 +3087,14 @@ unsafe fn flight_publish_row(f: &FlightFrame, canvas: *const u64, width: usize, 
 }
 
 
-/// The flight's surface still free: no window shows it and no process holds it (the kernel's generation byte 0), and no app is in front.
-fn flight_surface_free(k: usize) -> bool {
-    unsafe { (*(&raw const WINS))[k].is_none() && ferros_sys::pref(8 + k as u64) == 0 && (*(&raw const APP)).is_none() }
+/// The flight may fly: no app is in front.
+fn flight_free() -> bool {
+    unsafe { (*(&raw const APP)).is_none() }
+}
+
+/// The plane image's buffer and the capture's (`PLANE`): a full screen of the display's own pixels.
+fn plane_image(width: usize, height: usize) -> &'static mut [u64] {
+    unsafe { core::slice::from_raw_parts_mut(PLANE as *mut u64, width * height) }
 }
 
 /// The flight ends (a frame that is not a flight frame): the images go, and every phase owes the whole screen once, its compose-once bits gone with what they knew.
@@ -3121,13 +3126,14 @@ fn flight_end(width: usize, height: usize, log: &mut Log) {
 
 /// Whether any window is up (WINDOWS.md): the whole screen while one is, `None` while the map has it. The widgets and the map's frames check it.
 static mut APP: Option<draw::Rect> = None;
-/// The four surfaces' base (the `surfaces` region): surface k is the `SURFACE_BYTES` from `SURFS + k * SURFACE_BYTES`, a full screen of 64-bit pixels laid out at the screen's width.
+/// The surfaces' base (the `surfaces` region, the kernel's surfaces' window since 2026-11-12): surface k is the `SURFACE_BYTES` from `SURFS + k * SURFACE_BYTES`, a full screen of 64-bit pixels laid out at the screen's width, its frames wherever the kernel took them from its pool (a slot nobody holds maps a blank frame, so reading one never faults).
 static mut SURFS: usize = 1;
-const SURFACES: usize = 4;
-const SURFACE_BYTES: usize = 32 << 20;
+/// The surface slots (ferros_sys `SURFACE_SLOTS`: sixteen, given out on demand; four fixed ones until 2026-11-12): a window each at most.
+pub const SURFACES: usize = ferros_sys::SURFACE_SLOTS;
+const SURFACE_BYTES: usize = ferros_sys::SURFACE_BYTES;
 /// The porch before each surface's pixel 0 (the kernel's SURFACE_PORCH): clients name their surface by its address past it.
 const PORCH: usize = 64;
-/// A window (WINDOWS.md), one per surface: the surface's generation when it was shown (the kernel's preference bytes 8-11; a change or a 0 means its process ended), its level (0 an app, 1 input, 2 the system: higher is in front), when it was last shown (later is in front within a level), and the part of the screen it covers. Outside its rectangle, and wherever a pixel has `CLEAR` set, what is behind it shows.
+/// A window (WINDOWS.md), one per surface: the surface's generation when it was shown (its four bits in the windows' bell, `SURF_LIVE`; a change or a 0 means its process ended), its level (0 an app, 1 input, 2 the system: higher is in front), when it was last shown (later is in front within a level), and the part of the screen it covers. Outside its rectangle, and wherever a pixel has `CLEAR` set, what is behind it shows.
 /// Its surface's `format` says what its pixels are (op 22's optional last byte): 0 the display's own working values (gamma 2, white = Q14, bit 63 see-through); 1 fluor's 16-bit `g2t` (`G2T16`), which the display decodes itself so a fluor app hands its buffer over as it drew it (owner, 2026-10-29: fluor the one compositor, passed straight through); 2 `BAKED`, the panel's own codes (bake.rs). The first two are baked by the display every frame (`layer_row`), the third presented as it is.
 #[derive(Clone, Copy)]
 struct Win {
@@ -3140,7 +3146,7 @@ struct Win {
     mode: u8,
     /// Behind (op 60; owner, 2026-11-11: "Home backgrounds the kist so depending on how it was designed, like Photon, it doesn't die but it stops rendering everything"): kept in the table with its surface and its process, never composed, never an owner in the hit map, its shows taken (place and format) but published nowhere, until op 59 brings it to the front.
     back: bool,
-    /// Full screen for this window (op 43, the quick row's circle): no circle and no bars while it is the app in front (`FULL` follows the front app window's).
+    /// Full screen for this window (op 43, the quick row's circle, deck's swipe): no bars while it is the app in front (`FULL` follows the front app window's).
     full: bool,
 }
 /// A surface of fluor's 16-bit pixels (fluor `pixel::G2t16`): α in bits 48-63, then each channel's darkness (the top code less the channel's VSF `g2t` code, scaled by α) in bits 32-47 (R), 16-31 (G) and 0-15 (B); α 0 is see-through.
@@ -3154,18 +3160,17 @@ fn working(p: u64) -> u64 {
 }
 static mut WINS: [Option<Win>; SURFACES] = [None; SURFACES];
 static mut RAISES: u32 = 0;
-/// The windows' owners as the kernel holds them (SYS_BELL `BELL_SURFACES`): byte k surface k's live generation (0 once the process it was given to has ended, however it ended), the change count above bit 32. Written by the kernel as a surface changes hands, which wakes `reaper` waiting here.
+/// The windows' owners as the kernel holds them (SYS_BELL `BELL_SLOTS`): bits 4k to 4k + 3 slot k's live generation (0 once the process it was given to has ended, however it ended; ferros_sys `surface_generation`). Written by the kernel as a surface changes hands, which wakes `reaper` waiting here.
 static SURF_LIVE: AtomicU64 = AtomicU64::new(0);
-/// Whether that bell is registered; a kernel without it leaves the preference bytes alone, as before 2026-11-11.
+/// Whether that bell is registered: with a kernel from before 2026-11-12 (four surfaces, their generations in the preference bytes) it is not, and no window counts as live (this display needs the kernel of its day).
 static SURF_BELL: AtomicBool = AtomicBool::new(false);
-/// The windows up, for the receive thread (it never reads `WINS`): byte k the generation `WINS[k]` was shown under, 0 for none (`wins_mirror`).
+/// The windows up, for the receive thread (it never reads `WINS`): bits 4k to 4k + 3 the generation `WINS[k]` was shown under, 0 for none (`wins_mirror`).
 static WIN_GENS: AtomicU64 = AtomicU64::new(0);
 static mut REAP_STACK: [u8; 16384] = [0; 16384];
 
-/// Surface k's live generation: its preference byte (bytes 8-11, the kernel's copy in this process's page) and, with the bell registered, the bell's byte too; 0 when either says its owner is gone. The kernel changes both under its lock and only as the surface changes hands, so a disagreement is a hand-over in progress, when a window on the surface belongs to an owner that has ended anyway.
+/// Surface k's live generation, from the windows' bell (the kernel's word, rung as a surface changes hands); 0 when its owner is gone or nobody holds it, and always without the bell.
 fn live_gen(k: usize) -> u8 {
-    let g = ferros_sys::pref(8 + k as u64);
-    if SURF_BELL.load(Ordering::Acquire) && (SURF_LIVE.load(Ordering::Acquire) >> (8 * k)) as u8 != g { 0 } else { g }
+    if SURF_BELL.load(Ordering::Acquire) { ferros_sys::surface_generation(SURF_LIVE.load(Ordering::Acquire), k) } else { 0 }
 }
 
 /// `WINS` as `WIN_GENS`, after every change to it: the windows on the glass (one behind is not in front, so op 5 does not count it and the map has the glass).
@@ -3173,7 +3178,7 @@ fn wins_mirror() {
     let mut v = 0u64;
     for k in 0..SURFACES {
         if let Some(w) = unsafe { WINS[k] }.filter(|w| !w.back) {
-            v |= (w.generation as u64) << (8 * k);
+            v |= (w.generation as u64) << (4 * k);
         }
     }
     WIN_GENS.store(v, Ordering::Release);
@@ -3183,7 +3188,7 @@ fn wins_mirror() {
 fn app_live() -> bool {
     let w = WIN_GENS.load(Ordering::Acquire);
     (0..SURFACES).any(|k| {
-        let g = (w >> (8 * k)) as u8;
+        let g = ferros_sys::surface_generation(w, k);
         g != 0 && g == live_gen(k)
     })
 }
@@ -3206,7 +3211,7 @@ const CLEAR: u64 = 1 << 63;
 static mut CHROME_TOP: usize = 0;
 /// The console's rows, the bars' top band: `CHROME_TOP`, or down to the quick row's floor where that is lower (quick.rs `rows`; since 2026-11-11 the row reaches past the chrome rows to touch the glass's sides).
 static mut BAR_TOP: usize = 0;
-/// Full screen (owner, 2026-11-07, then the deck swipe; 2026-11-11 the quick row's middle circle, and later that day the deck swipe again with an app in front: "the swipe in on home whilist in a kist needs to show/hide controls"): the console, the helm and the app's circle hidden, only the glass's edge left (black, and orange on development builds). The app window in front's own flag (`Win::full`, switched by op 43), followed by `full_follow` whenever the windows change; off with no app in front. The helm is hidden but stays the system's on the hit map, undrawn, so deck's swipe there switches it back; the console and the quick row are gone, not drawn (`bar_line`) and not on the hit map (hit.rs `row`, which reads the bars' ids on the helm's rows alone while this is on), so the app has those pixels and their touches (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"). The map shuts the quick row at once when it turns this on itself (its middle circle, deck's swipe).
+/// Full screen (owner, 2026-11-07, then the deck swipe; 2026-11-11 the quick row's middle circle, and later that day the deck swipe again with an app in front: "the swipe in on home whilist in a kist needs to show/hide controls"): the console and the helm hidden (the app's circle no longer clips anything since 2026-11-12, "Drawn under the controls", so full screen is only the controls hidden), only the glass's edge left (black, and orange on development builds). The app window in front's own flag (`Win::full`, switched by op 43), followed by `full_follow` whenever the windows change; off with no app in front. The helm is hidden but stays the system's on the hit map, undrawn, so deck's swipe there switches it back; the console and the quick row are gone, not drawn (`bar_line`) and not on the hit map (hit.rs `row`, which reads the bars' ids on the helm's rows alone while this is on), so the app has those pixels and their touches (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"). The map shuts the quick row at once when it turns this on itself (its middle circle, deck's swipe).
 static mut FULL: bool = false;
 static mut CHROME_BOT: usize = 0;
 /// The bars (owner, 2026-11-07): the console, the circles at the top of the screen (the radios' switches and the system's indicators), over the `BAR_TOP` rows (the quick row with them), then the helm, deck and back at the bottom, over the `CHROME_BOT` rows. They are the frontmost layer but the glass's edge, over the deck and every app alike, in screen coordinates, so nothing transforms them. Drawn as fluor draws: front to back from empty, into fluor's 16-bit α + darkness (`G2T16`), by fluor's one `under`; redrawn only when what they show changes (`console_draw`, `helm_draw`).
@@ -3295,7 +3300,7 @@ fn names_surface(op: u8) -> bool {
     matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71)
 }
 
-/// What the process behind the call holds (kernel SYS_CALLER: bit k surface k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
+/// What the process behind the call holds (kernel SYS_CALLER: bit `CALLER_SURFACE0` + k surface slot k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
 fn caller_of(tok: &[u8; 32]) -> u64 {
     ferros_sys::caller(tok).unwrap_or(0)
 }
@@ -3303,7 +3308,7 @@ fn caller_of(tok: &[u8; 32]) -> u64 {
 /// Whether holdings `h` hold surface k: the caller's own window, its own pixels.
 #[inline]
 fn holds(h: u64, k: usize) -> bool {
-    h >> k & 1 == 1
+    ferros_sys::caller_holds_surface(h, k)
 }
 
 /// Whether holdings `h` may move the window on surface k (front, behind, full screen, a key): its holder, or the system's window management (the Settings holder: the map, the attest screen).
@@ -3393,7 +3398,7 @@ fn window_pixels(k: usize, width: usize, height: usize) -> &'static mut [u64] {
     surface(unsafe { PIXELS[k] } as usize, width, height)
 }
 
-/// The windows up, frontmost first: (surface, window), at most four.
+/// The windows up, frontmost first: (surface, window), at most one a slot.
 fn front_order() -> ([(usize, Win); SURFACES], usize) {
     let mut v = [(0usize, Win { generation: 0, level: 0, order: 0, rect: draw::Rect::EMPTY, format: 0, mode: 0, back: false, full: false }); SURFACES];
     let mut n = 0;
@@ -3415,7 +3420,7 @@ fn front_order() -> ([(usize, Win); SURFACES], usize) {
 
 /// The layer stack as bands and spans (WINDOWS.md, "The layer stack", 2026-11-02; the geometry is fluor's `layout`, shared with Photon's stacking), rebuilt only when the windows change (`layout_build`), never per frame.
 /// A span's chain is the windows covering it, frontmost first, cut after the first opaque one: nothing behind an opaque window is ever read. Publishing a row walks its band's spans: a span with one opaque working window is a copy, a chain of working windows in Normal is the branchless select, anything else (a 16-bit fluor surface with its alpha, a blend mode) is the general fold.
-/// At most four windows, so at most nine bands and nine spans a band; the chains index `ORDER`.
+/// At most a window a slot (sixteen), so at most 33 bands and 33 spans a band; the chains index `ORDER`.
 type Band = fluor::layout::Band<SURFACES, { 2 * SURFACES + 1 }>;
 static mut BANDS: [Band; 2 * SURFACES + 1] = [Band::NONE; 2 * SURFACES + 1];
 static mut NBANDS: usize = 0;
@@ -3682,31 +3687,24 @@ fn look_op(what: u8) -> [u8; 2] {
     [0, !dev_look() as u8]
 }
 
-/// The glass's shape, planned once per screen size (owner, 2026-11-02: "maintain a global compressed mask since most will be opaque for the OS in general"): the circle an app lives in (the corners outside it are the system's chrome) and the screen's own edge, as Photon draws its window on Android glass (fluor paint/edge.rs `glass_corner_params`, Nick 2026-09-17: a superellipse corner inside the glass's circular arc, cutting one and a half glass insets deeper at the diagonal, exponent 6 or the first lower one whose corners fit, nine tenths of the fitted size; the top-left and bottom-right corners twice the top-right and bottom-left, the 2:1 asymmetry).
-/// Per row: the columns of chrome from the left and from the right (the circle's outside), the columns masked from the left and from the right (the edge's outside, over the chrome), then the row's antialiased pixels in the order they apply (column, shape, coverage Q16, hairline alpha Q16): the circle's first, in column order, then the edge's, then the camera hole's knockout (every column of its range). `GLASS_ROWS` has height + 1 entries; a row's pixels run from its `first` to the next row's. Everything else on a row is glass, untouched: the publish path does no geometry at all, it copies runs and blends the listed pixels.
-/// The edge comes from fluor's walk of the corners' crossings (`walk_window_edges`, the one walk Photon's chrome draws with: a four-corner mirror and a single-pixel alias per axis), the circle from its distance field, both at plan time only.
+/// The glass's shape, planned once per screen size (owner, 2026-11-02: "maintain a global compressed mask since most will be opaque for the OS in general"): the screen's own edge, as Photon draws its window on Android glass (fluor paint/edge.rs `glass_corner_params`, Nick 2026-09-17: a superellipse corner inside the glass's circular arc, cutting one and a half glass insets deeper at the diagonal, exponent 6 or the first lower one whose corners fit, nine tenths of the fitted size; the top-left and bottom-right corners twice the top-right and bottom-left, the 2:1 asymmetry), and the camera hole's knockout.
+/// Per row: the columns masked from the left and from the right (the edge's outside), then the row's antialiased pixels in the order they apply (column, shape, coverage Q16, hairline alpha Q16): the edge's, then the camera hole's knockout (every column of its range). `GLASS_ROWS` has height + 1 entries; a row's pixels run from its `first` to the next row's. Everything else on a row is glass, untouched: the publish path does no geometry at all, it copies runs and blends the listed pixels.
+/// The edge comes from fluor's walk of the corners' crossings (`walk_window_edges`, the one walk Photon's chrome draws with: a four-corner mirror and a single-pixel alias per axis), at plan time only.
+/// Until 2026-11-12 the plan held the app's circle too (the columns outside it on the chrome rows, and its antialiased pixels), and a kist's window was cut to it; a window fills the glass now, the controls in front of it (WINDOWS.md "Drawn under the controls").
 struct GlassRow {
     first: u32,
-    chrome_l: u16,
-    chrome_r: u16,
     mask_l: u16,
     mask_r: u16,
     /// The camera hole's knockout on this row: columns hole_l..hole_r, every one of them listed (`SHAPE_HOLE`, the row's last pixels, in column order); empty (0, 0) on rows without it.
     hole_l: u16,
     hole_r: u16,
 }
-/// A listed pixel's shape: the circle (its base is the chrome under it, its hairline the ring's) or the edge (its base the mask colour, its hairline the edge's).
-const SHAPE_CIRCLE: u16 = 0;
+/// A listed pixel's shape: the edge (its base the mask colour, its hairline the edge's).
 const SHAPE_EDGE: u16 = 1;
 /// The camera hole's knockout (owner, 2026-11-08: "an anti-aliased orange knockout that is as small as possible without touching the dead px", on "the same front/first layer mask with the asymmetric squircle edges"): its base the mask colour, no hairline; listed after the edge's pixels, every column of the row's hole range, so `glass_front` finds one by its column less `hole_l`.
 const SHAPE_HOLE: u16 = 2;
 /// husky's knockout: on since its hole was measured on its glass (owner, 2026-11-08, tools/cutout-scan, as akita's was; `ferros_sys::CUTOUT_HOLE`).
 const HOLE_HUSKY: bool = true;
-/// Where the row's pixels in front of the scene begin (the edge's, then the hole's): past the circle's.
-#[inline]
-fn front_split(row_px: &[(u16, u16, u16, u16)]) -> usize {
-    row_px.iter().position(|e| e.1 != SHAPE_CIRCLE).unwrap_or(row_px.len())
-}
 /// Whether the sixteen columns from x reach the row's hole knockout (an empty range never does).
 #[inline]
 fn hole_in(g: &GlassRow, x: usize) -> bool {
@@ -3755,10 +3753,6 @@ fn plan_glass(width: usize, height: usize) {
     walk_window_edges(width as u32, height as u32, sb, &cb, ss, &cs, &mut on_clip, &mut on_hair);
     mid.extend_from_slice(&mid_h);
     mid.sort_unstable_by_key(|e| (e.0, e.1));
-    // The circle: its centre and radius, the band its edge and hairline touch (a pixel and a half either side of the radius), and the rows that reach outside it (the chrome rows, the only rows the circle's runs and pixels may land on: the chrome buffer holds those rows alone, and a plan that put the circle elsewhere would index past it, loudly).
-    let (cx, cy, rad) = circle(width, height);
-    let (rin, rout) = ((rad - 1.5) * (rad - 1.5), (rad + 1.5) * (rad + 1.5));
-    let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
     let mut rows: alloc::vec::Vec<GlassRow> = alloc::vec::Vec::with_capacity(height + 1);
     let mut px: alloc::vec::Vec<(u16, u16, u16, u16)> = alloc::vec::Vec::new();
     // The camera hole, where its knockout is on (`HOLE_HUSKY`).
@@ -3766,68 +3760,6 @@ fn plan_glass(width: usize, height: usize) {
     let mut mi = 0;
     for y in 0..height {
         let first = px.len() as u32;
-        let (mut cl, mut cr) = (0usize, width);
-        if y < top || y >= height - bot {
-            let dy = y as f32 + 0.5 - cy;
-            let dy2 = dy * dy;
-            // A pixel's coverage by the disc and the hairline's weight at it, from its centre's distance to the edge: coverage 1 with the centre half a pixel or more inside the edge, 0 half a pixel or more outside, the ramp between (by the definition of coverage; the band is wider than that pixel, it holds the hairline too, so the limits are the geometry's, not a guard); the hairline one pixel wide, centred on the radius, its profile (1 - t²)² across it, C¹ at its edges and its centre.
-            let pixel = |x: usize| -> (u32, u32) {
-                let dx = x as f32 + 0.5 - cx;
-                let d2 = dx * dx + dy2;
-                if d2 >= rout {
-                    (0, 0)
-                } else if d2 > rin {
-                    let d = libm::sqrtf(d2);
-                    let cov = rad + 0.5 - d;
-                    let cov = if cov > 1.0 { 1.0 } else if cov < 0.0 { 0.0 } else { cov };
-                    // No hairline (owner, 2026-11-09: "We can remove the big circle from the draw stack, it was just a visual guide ... Circle idea and alignment stays, just needs to be invisible"): the circle still clips the windows and lays out the corners and the keyboard, with nothing drawn on its edge.
-                    ((cov * 65536.0) as u32, 0)
-                } else {
-                    (65536, 0)
-                }
-            };
-            // One crossing per row (owner, 2026-11-02: "count the crossings vertically"): the circle's chord at this row, where its edge band begins and ends; only the band's pixels are looked at. Past the outer crossing is chrome, inside the inner one is glass; where the inner crossing does not exist (the rows at the circle's top and bottom) the band is the whole chord.
-            if dy2 >= rout {
-                cl = width;
-                cr = width;
-            } else {
-                let half_out = libm::sqrtf(rout - dy2);
-                // WHY the screen's bounds: the circle is wider than the screen (its radius exceeds half the width), so on most rows its crossings lie off the glass; the band is cut to the row.
-                let (x0, x1) = ((cx - half_out) as i64 - 2, (cx + half_out) as i64 + 2);
-                cl = if x0 < 0 { 0 } else { x0 as usize };
-                cr = if x1 > width as i64 { width } else { x1 as usize };
-                while cl < width && pixel(cl) == (0, 0) {
-                    cl += 1;
-                }
-                while cr > cl && pixel(cr - 1) == (0, 0) {
-                    cr -= 1;
-                }
-                let (li, ri) = if dy2 < rin {
-                    let half_in = libm::sqrtf(rin - dy2);
-                    let (li, ri) = ((cx - half_in) as i64 + 2, (cx + half_in) as i64 - 2);
-                    (if li < cl as i64 { cl } else { li as usize }, if ri > cr as i64 { cr } else { ri as usize })
-                } else {
-                    (cr, cr)
-                };
-                let mut band = |x: usize| {
-                    let (c, h) = pixel(x);
-                    if c != 65536 || h != 0 {
-                        px.push((x as u16, SHAPE_CIRCLE, c.min(0xFFFF) as u16, h.min(0xFFFF) as u16));
-                    }
-                };
-                for x in cl..li.min(cr) {
-                    band(x);
-                }
-                for x in li.max(ri)..cr {
-                    band(x);
-                }
-            }
-        } else if y == top {
-            // The first glass row: the circle's chord is wider than the screen here, by `chrome_rows`'s construction, so no chrome and no circle pixel lies on it or on any row until the bottom's.
-            let dx = 0.5 - cx;
-            let dy = y as f32 + 0.5 - cy;
-            assert!(dx * dx + dy * dy <= rin, "glass plan: the circle reaches a row the chrome does not hold");
-        }
         let (mut ml, mut mr) = (0usize, width);
         let d = if y < band { Some(y) } else if y >= height - band { Some(band + y - (height - band)) } else { None };
         if let Some(d) = d {
@@ -3859,7 +3791,7 @@ fn plan_glass(width: usize, height: usize) {
                 mi += 1;
             }
         }
-        // The camera hole's knockout: every column whose pixel the disc touches at all, contiguous on a row (a disc's chord), each with the glass's coverage left by it. The disc's coverage of a pixel is R + 0.5 − d with d its centre's distance to the hole's centre, 1 half a pixel or more inside the radius, 0 half a pixel or more outside, the ramp between (the same rule as the circle's: by the definition of coverage, not a guard), so the radius measured on the glass (`ferros_sys::cutout_hole`, the smallest covering every dead pixel whole) puts the ramp on live pixels only.
+        // The camera hole's knockout: every column whose pixel the disc touches at all, contiguous on a row (a disc's chord), each with the glass's coverage left by it. The disc's coverage of a pixel is R + 0.5 − d with d its centre's distance to the hole's centre, 1 half a pixel or more inside the radius, 0 half a pixel or more outside, the ramp between (by the definition of coverage, not a guard), so the radius measured on the glass (`ferros_sys::cutout_hole`, the smallest covering every dead pixel whole) puts the ramp on live pixels only.
         let (mut hl, mut hr) = (0usize, 0usize);
         if let Some((hx, hy, hrad)) = hole {
             let dy = y as f32 + 0.5 - hy;
@@ -3885,9 +3817,9 @@ fn plan_glass(width: usize, height: usize) {
                 }
             }
         }
-        rows.push(GlassRow { first, chrome_l: cl as u16, chrome_r: cr as u16, mask_l: ml as u16, mask_r: mr as u16, hole_l: hl as u16, hole_r: hr as u16 });
+        rows.push(GlassRow { first, mask_l: ml as u16, mask_r: mr as u16, hole_l: hl as u16, hole_r: hr as u16 });
     }
-    rows.push(GlassRow { first: px.len() as u32, chrome_l: 0, chrome_r: width as u16, mask_l: 0, mask_r: width as u16, hole_l: 0, hole_r: 0 });
+    rows.push(GlassRow { first: px.len() as u32, mask_l: 0, mask_r: width as u16, hole_l: 0, hole_r: 0 });
     unsafe {
         GLASS_ROWS = rows.leak().as_ptr() as usize;
         GLASS_PX = px.leak().as_ptr() as usize;
@@ -3904,21 +3836,6 @@ fn chrome_rows(width: usize, height: usize) -> (usize, usize) {
     let (cx, cy, r) = circle(width, height);
     let half = libm::sqrtf(r * r - cx * cx);
     ((cy - half) as usize + 3, (height as f32 - (cy + half)) as usize + 3)
-}
-
-/// The hairline's colour (owner, 2026-11-02). Release builds: standard-illuminant-E grey (equal VSF RGB codes) one stop darker than the theme's ring: the ring's photopic light (VSF RGB's weights, as vsf::colour::convert::vsf_rgb_to_photopic_f32 has them: R 0.2584, G 0.6346, B 0.1070, on gamma-2 codes) halved, back to a code. Development builds: bright orange in VSF RGB, full red, half-light green, no blue, so a dev image is told at a glance.
-/// Baked (bake.rs) from its working values, once per publish.
-fn hairline() -> u64 {
-    let v = if !dev_look() {
-        let ring = ferros_sys::theme::current().ring;
-        let lin = |sh: u32| { let c = (ring >> sh & 0xFF) as f32 * (1.0 / 255.0); c * c };
-        let light = 0.2584 * lin(16) + 0.6346 * lin(8) + 0.1070 * lin(0);
-        let code = libm::sqrtf(light * 0.5);
-        [code; 3]
-    } else {
-        [1., libm::sqrtf(0.5), 0.]
-    };
-    1 << 63 | bake::now().px(v)
 }
 
 /// A plan weight as Q16 with 65536 whole (the plan keeps full as G#FFFF in its u16).
@@ -3992,7 +3909,7 @@ fn glass_front(x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], c: u64,
     }
     under_pm(acc, t, p & ((1 << 48) - 1), 0).0
 }
-/// The windows into phase `k` over `r` (screen coordinates): each row composed frontmost first (a pixel comes from the first window that covers it; nothing behind the windows but black), cut to the circle with its edge antialiased, the corners from the chrome; each window's pixels baked first unless its surface already is (`layer_row`), so the compose is in the panel's codes; then each pixel presented, the dither and the pack (neon.rs `present_app16`), bit 48 set = no dither for that pixel.
+/// The windows into phase `k` over `r` (screen coordinates): each row composed frontmost first (a pixel comes from the first window that covers it; nothing behind the windows but black), to the glass's edge (since 2026-11-12, "Drawn under the controls": no longer cut to the app's circle), the bars in front of it; each window's pixels baked first unless its surface already is (`layer_row`), so the compose is in the panel's codes; then each pixel presented, the dither and the pack (neon.rs `present_app16`), bit 48 set = no dither for that pixel.
 /// `hits`: this call writes the hit map's rows too (hit.rs; the first of several phases published together, never a capture), and in development shows the map instead of the image when `k` is its phase.
 fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: usize, hits: bool) {
     publish_app_mask(r, tabs, 1 << k, width, height, hits);
@@ -4056,8 +3973,6 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
     // The development view's phase is painted whole from the hit map as it comes round (`hit::on_layer`), never here: the phases written are the others.
     let write = if hit::view() && unsafe { CAPTURE } == 0 { mask & !(1 << hit::PHASE) } else { mask };
     let cm = neon::Chans::new(CHANNELS.load(Ordering::Relaxed));
-    // The app circle's ring hairline (the edge's is the mask's own colour, `glass_front`).
-    let line = hairline();
     let mut row = [3u32; 1344];
     let mut px = [0u64; 1344];
     let (xa, xb) = (r.x0 as usize, r.x1 as usize);
@@ -4172,21 +4087,17 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
         parts[0] += t1 - t0;
         // The 16-pixel blocks (from xa) the glass composes over, bit j block j: with a `direct` row they come from `px`, the rest from the surface.
         let mut touched = 0u128;
-        // The glass's shape, from the plan (`plan_glass`), front to back: outside the app's circle is black (nothing of the windows shows there); on the circle's listed pixels its hairline is in front, then the windows by the circle's coverage, then that black; then over everything so made the glass's edge and the camera hole's knockout, the bars (the console and the helm), and that pixel last (`glass_front`), on the columns any of them touches. The circle's hairline is `line`.
+        // The glass's shape, from the plan (`plan_glass`), front to back over the windows: the glass's edge and the camera hole's knockout, the bars (the console and the helm), and that pixel last (`glass_front`), on the columns any of them touches. Nothing cuts the windows to the app's circle (owner, 2026-11-12, "Should we draw under the controls?", then "Agreed. Build it!"): a window reaches the glass's edge, and the console's circles and the helm's wedges float in front of its corners, the circle its safe area (`safe_follow`, WINDOWS.md "Drawn under the controls"). Until then everything outside the circle was black under the bars, and the circle's coverage was taken on its edge.
         {
             let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
             let g = &rows[y];
             let (first, next) = (g.first as usize, rows[y + 1].first as usize);
-            let (cl, cr, ml, mr) = (g.chrome_l as usize, g.chrome_r as usize, g.mask_l as usize, g.mask_r as usize);
-            if cl > 0 || cr < width || ml > 0 || mr < width || first != next {
-                // Full screen (`FULL`): no circle, the app to the glass's edge.
-                let full = unsafe { FULL };
+            let (ml, mr) = (g.mask_l as usize, g.mask_r as usize);
+            let ((bl, br), bw) = bar_line(y, width, height);
+            if ml > 0 || mr < width || first != next || bl < br {
                 let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), next) };
-                let row_px = &plan[first..next];
-                let split = front_split(row_px);
-                let edge_px = &row_px[split..];
+                let edge_px = &plan[first..next];
                 let (el, er) = edge_cols(g, edge_px, width);
-                let ((bl, br), bw) = bar_line(y, width, height);
                 let (hl, hr) = (g.hole_l as usize, g.hole_r as usize);
                 if let Some(front) = direct {
                     let mut mark = |a: usize, b: usize| {
@@ -4196,16 +4107,6 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
                             }
                         }
                     };
-                    if !full {
-                        mark(xa, xb.min(cl));
-                        mark(xa.max(cr), xb);
-                        for &(x, ..) in &row_px[..split] {
-                            let x = x as usize;
-                            if x >= xa && x < xb {
-                                mark(x, x + 1);
-                            }
-                        }
-                    }
                     for (a, b) in glass_cols(xa, xb, [(0, el), (er, width), (bl, br), (hl, hr)]) {
                         mark(a, b);
                     }
@@ -4216,23 +4117,6 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
                         px[a..b].copy_from_slice(&front[a..b]);
                         t &= t - 1;
                     }
-                }
-                if !full {
-                    // WHY the test: a publish covers columns xa..xb, which since the bars' worker publishes only what changed (COMPOSITOR.md step 1) need not start at the row's left; the left chrome ends at cl, which may be left of xa, and the range would then start past its end (the display panicked here after a boot, 2026-11-07).
-                    if xa < xb.min(cl) {
-                        px[xa..xb.min(cl)].fill(0);
-                    }
-                    if xa.max(cr) < xb {
-                        px[xa.max(cr)..xb].fill(0);
-                    }
-                }
-                for &(x, _, c, h) in &row_px[..if full { 0 } else { split }] {
-                    let x = x as usize;
-                    if x < xa || x >= xb {
-                        continue;
-                    }
-                    let (acc, t) = under_pm(0, 16384, scale_q16(line, q16(h)), 16384 - (q16(h) >> 2));
-                    px[x] = under_pm(acc, t, scale_q16(px[x] & ((1 << 48) - 1), q16(c)), 0).0;
                 }
                 // Only the columns something is in front of: left of the edge's columns, right of them, the bars, the hole (`glass_cols`); every other pixel of the row is the scene as it came. Each pixel was tested against all four until 2026-11-12, 4 cycles a pixel of a whole-screen app's publish on the X3 for a few dozen pixels a row.
                 for (a, b) in glass_cols(xa, xb, [(0, el), (er, width), (bl, br), (hl, hr)]) {
@@ -4410,6 +4294,7 @@ fn windows_changed(width: usize, height: usize) {
     layout_build(width, height);
     wins_mirror();
     full_follow();
+    safe_follow(width, height);
     unsafe {
         PHASE_DIRTY = [full; PHASES];
         clean_reset_all();
@@ -4474,6 +4359,36 @@ fn full_follow() -> bool {
         FULL = f;
         HITS_STALE |= was != f;
         was != f
+    }
+}
+
+/// What each surface's window was last told of its safe area (`EV_SAFE`): the generation it was told under (0 never) and the payload.
+static mut SAFE_TOLD: [(u8, [u8; ferros_sys::window::SAFE_BYTES]); SURFACES] = [(0, [0; ferros_sys::window::SAFE_BYTES]); SURFACES];
+
+/// Each app window's safe area (WINDOWS.md "Drawn under the controls"; owner, 2026-11-12, "Should we draw under the controls?", then "Agreed. Build it!"): the window fills the glass and the system's controls float in front of its corners, so it is told where they are not, `EV_SAFE`: the app's circle in the window's own pixels and which halves of the glass outside it the system holds.
+/// The top's outside is the console's (its circles drawn and touched there) unless the window is full screen, where the console is gone and its rows are the window's (hit.rs `row`); the bottom's is the helm's always, drawn or not (its wedges stay the system's on the hit map in full screen).
+/// Told when it differs from what the window was last told under its generation: at its first show, and as its full screen turns; only while its owner lives (an event under a generation the surface no longer has would start the next owner's events over, events.rs `own`). Apps alone (level 0): the levels above are the system's own windows, which lay themselves out in the circle.
+fn safe_follow(width: usize, height: usize) {
+    use ferros_sys::window::{EV_SAFE, SAFE_BOTTOM, SAFE_BYTES, SAFE_TOP};
+    let (cx, cy, r) = circle(width, height);
+    let wins = unsafe { &*(&raw const WINS) };
+    let told = unsafe { &mut *(&raw mut SAFE_TOLD) };
+    for k in 0..SURFACES {
+        let Some(w) = wins[k] else { continue };
+        if w.level != 0 || live_gen(k) != w.generation {
+            continue;
+        }
+        // 256ths of a pixel, from the window's own top-left corner.
+        let q8 = |v: f32| libm::roundf(v * (1 << 8) as f32) as i32;
+        let mut p = [0u8; SAFE_BYTES];
+        p[0..4].copy_from_slice(&q8(cx - w.rect.x0 as f32).to_le_bytes());
+        p[4..8].copy_from_slice(&q8(cy - w.rect.y0 as f32).to_le_bytes());
+        p[8..12].copy_from_slice(&(q8(r) as u32).to_le_bytes());
+        p[12] = if w.full { SAFE_BOTTOM } else { SAFE_TOP | SAFE_BOTTOM };
+        if told[k] != (w.generation, p) {
+            told[k] = (w.generation, p);
+            events::post_with(k, w.generation, (EV_SAFE as u16) << 8, &p);
+        }
     }
 }
 
@@ -5041,9 +4956,18 @@ fn attest_mark(grants: u64, bit: u32, what: &[u8]) {
     }
 }
 
-/// The render loop's side of the wallpaper, each pass of the loop: a load wanted is started, and a load's result is shown the pass it arrives. Each with its line to the console. The display draws no wallpaper itself: the one made from the person's seed is wallgen's, drawn on the GPU (op 44 when it is kept).
+/// The render loop's side of the wallpaper, each pass of the loop: a load wanted is started, and a load's result is shown the pass it arrives; a refresh finished (`wall_refresh`) is published whole. Each with its line to the console. The display draws no wallpaper itself: the one made from the person's seed is wallgen's, drawn on the GPU (op 44 when it is kept).
 fn wall_step(grants: u64, width: usize, height: usize) {
     unsafe {
+        // The refresh wrote its rows under the phases' feet: every phase owes the whole screen once, so none keeps rows baked from the codes.
+        let fresh = WALL_FRESH.load(Ordering::Acquire);
+        if fresh != WALL_FRESH_SEEN {
+            WALL_FRESH_SEEN = fresh;
+            if WALL_ON {
+                PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
+                clean_reset_all();
+            }
+        }
         if LOADING {
             let d = LOAD_DONE.load(Ordering::Acquire);
             let r = LOAD_REQ.load(Ordering::Acquire);
@@ -5079,7 +5003,7 @@ fn wall_step(grants: u64, width: usize, height: usize) {
             let seq = (LOAD_REQ.load(Ordering::Acquire) >> 8) + 1;
             LOAD_REQ.store(seq << 8 | LOAD_WANTED, Ordering::Release);
             LOAD_WANTED = 0;
-            ferros_sys::wake(&LOAD_REQ, 1);
+            loader_bell();
         }
     }
 }
@@ -5266,27 +5190,51 @@ fn read_wait(seq: u64) -> bool {
 }
 
 extern "C" fn wall_loader(grants: u64) -> ! {
-    let mut seen = 0;
+    let (mut seen, mut bell_seen) = (0, 0);
+    // The kept wallpaper the last load found (its key), which a refresh reads again; none before a load found one.
+    let mut shown: &'static [u8] = b"";
     loop {
+        let bell = LOADER_BELL.load(Ordering::Acquire);
         let r = LOAD_REQ.load(Ordering::Acquire);
-        if r == seen {
-            ferros_sys::wait(&LOAD_REQ, r, 0);
+        let (width, height) = unsafe { LOAD_SIZE };
+        if r != seen {
+            seen = r;
+            let found = if wall_own(grants, width, height, b"wallpaper") {
+                FOUND_OWN
+            } else if wall_own(grants, width, height, b"wallpaper.made") {
+                FOUND_MADE
+            } else {
+                FOUND_NONE
+            };
+            shown = match found {
+                FOUND_OWN => b"wallpaper",
+                FOUND_MADE => b"wallpaper.made",
+                _ => b"",
+            };
+            LOAD_HEAP.reset();
+            LOAD_DONE.store(r & !0xFF | found, Ordering::Release);
+            // The render thread waits on its doorbell between passes (`BELL`).
+            ring_bell();
             continue;
         }
-        seen = r;
-        let (width, height) = unsafe { LOAD_SIZE };
-        let found = if wall_own(grants, width, height, b"wallpaper") {
-            FOUND_OWN
-        } else if wall_own(grants, width, height, b"wallpaper.made") {
-            FOUND_MADE
-        } else {
-            FOUND_NONE
-        };
-        LOAD_HEAP.reset();
-        LOAD_DONE.store(r & !0xFF | found, Ordering::Release);
-        // The render thread waits on its doorbell between passes (`BELL`).
-        ring_bell();
+        if bell != bell_seen {
+            // The brightness settled (`loader_bell` from the render loop): the wallpaper baked again from its source, unless it already is with this bake.
+            bell_seen = bell;
+            if !shown.is_empty() && WALL_EXACT.load(Ordering::Acquire) != bake::generation() {
+                wall_refresh(grants, width, height, shown);
+                LOAD_HEAP.reset();
+            }
+            continue;
+        }
+        ferros_sys::wait(&LOADER_BELL, bell, 0);
     }
+}
+
+/// The loader's doorbell: a load posted (`wall_step`) or the brightness settled after a change (the render loop) counts it up and wakes the loader (`wall_loader`).
+static LOADER_BELL: AtomicU64 = AtomicU64::new(0);
+fn loader_bell() {
+    LOADER_BELL.fetch_add(1, Ordering::Release);
+    ferros_sys::wake(&LOADER_BELL, 1);
 }
 
 /// A load of the kept wallpaper wanted, started by `wall_step` next pass. The wallpaper on the glass goes now: the load writes the buffer it is published from. A read already under way is kept unless `again` (wallgen's op 44: it has just stored what that read may have missed): a display started after the person unlocked reads at once, and the attest's op 42 follows; until 2026-11-09 the second request threw the first read away and read the 24 MB again (shown at +1716 ms where one read takes about 420).
@@ -5301,14 +5249,18 @@ fn wall_load(again: bool) {
     clean_reset_all();
 }
 
-/// The person's own wallpaper (`map.wallpaper` in their space: a VSF visual, one plane of VSF RGB gamma2tanh codes at 16 bits, planar [3, height, width], as tools/wallpaper and tools/screencap write one), or the one made on this device (`map.wallpaper.made`), into `WALL_BUF`; whether it did. On the loader's thread (`wall_loader`). vsf's container locates the plane over the vault (`VaultSource`); then the plane is read from its first byte to its last, a transfer at a time at the transfer's own boundaries in the value (so the vault opens each of its pieces once, sixteen at a time on a kernel from 2026-11-11), and each code put in its pixel's lane as it arrives (the three planes one after another, red setting each pixel opaque), the whole baked in place once the plane is in (`wall_bake_rows`).
-fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> bool {
-    let c = cap(grants, S_MAP_SCOPE);
-    let Some(len) = ferros_sys::store_get(c, key, &mut []) else { return false };
+/// The kept wallpaper's plane in its value (`wall_open`): its samples' first byte and the byte past their last; how much of the value's start the first stretch buffer holds (read for the opening) and whether the opening's two stretches were read; their time, µs.
+struct WallPlane {
+    first: u64,
+    end: u64,
+    head: usize,
+    spans_ok: bool,
+    t_spans: u64,
+}
+
+/// The kept wallpaper's document opened over the vault (`VaultSource`) and its plane located and checked against this screen (`wall_own`'s load, `wall_refresh`'s), on the loader's thread: the value's first stretch and its last read whole first, into the loader's two stretch buffers, which the plane's own reads reuse once the document is dropped here. None, with its line, when the value is not such a document.
+fn wall_open(c: u64, key: &'static [u8], len: usize, width: usize, height: usize, l: &mut Log) -> Option<WallPlane> {
     let t0 = now();
-    let (calls0, call_t0) = (VAULT_CALLS.load(Ordering::Relaxed), VAULT_CALL_TICKS.load(Ordering::Relaxed));
-    VAULT_CALL_MAX.store(0, Ordering::Relaxed);
-    let mut l = Log { grants, buf: [0; 256], n: 0 };
     // The value's first stretch and its last, read whole before the document opens (two vault calls, the reader thread taking the first while this one reads the last), into the loader's two stretch buffers: vsf's opening reads come from them (`VaultSource::spans`). The last starts at a piece's boundary past the value's end less a stretch, so it is never longer than a stretch. A value no longer than a stretch is all in the first.
     let ptrs = unsafe { [(*(&raw mut STRETCH_BUFS))[0].as_mut_ptr(), (*(&raw mut STRETCH_BUFS))[1].as_mut_ptr()] };
     let whole = len as u64;
@@ -5334,7 +5286,7 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
             l.s(&why.as_bytes()[..why.len().min(160)]);
             l.s(b"; theirs from the seed shows\n");
             l.flush();
-            return false;
+            return None;
         }
     };
     let span = doc.entries().iter().find(|e| e.name.starts_with("plane.")).and_then(|e| doc.packed(e, "samples").ok().flatten());
@@ -5343,16 +5295,30 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
     let Some(span) = span.filter(|s| s.bit_depth == 16 && s.shape[..] == [3, height, width] && s.data_len == (6 * n) as u64) else {
         l.s(b"display: the person's own wallpaper is not one 16-bit plane of this screen's size; theirs from the seed shows\n");
         l.flush();
-        return false;
+        return None;
     };
     // The document is done with: its source's spans are the stretch buffers the plane's reads now reuse.
     drop(doc);
+    Some(WallPlane { first: span.data_offset, end: span.data_offset + span.data_len, head, spans_ok, t_spans })
+}
+
+/// The person's own wallpaper (`map.wallpaper` in their space: a VSF visual, one plane of VSF RGB gamma2tanh codes at 16 bits, planar [3, height, width], as tools/wallpaper and tools/screencap write one), or the one made on this device (`map.wallpaper.made`), into `WALL_BUF`; whether it did. On the loader's thread (`wall_loader`). vsf's container locates the plane over the vault (`wall_open`); then the plane is read from its first byte to its last, a transfer at a time at the transfer's own boundaries in the value (so the vault opens each of its pieces once, sixteen at a time on a kernel from 2026-11-11), and each code put in its pixel's lane as it arrives (the three planes one after another, red setting each pixel opaque), the whole baked in place once the plane is in (`wall_bake_rows`).
+fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> bool {
+    let c = cap(grants, S_MAP_SCOPE);
+    let Some(len) = ferros_sys::store_get(c, key, &mut []) else { return false };
+    let t0 = now();
+    let (calls0, call_t0) = (VAULT_CALLS.load(Ordering::Relaxed), VAULT_CALL_TICKS.load(Ordering::Relaxed));
+    VAULT_CALL_MAX.store(0, Ordering::Relaxed);
+    let mut l = Log { grants, buf: [0; 256], n: 0 };
+    let Some(WallPlane { first, end, head, spans_ok, t_spans }) = wall_open(c, key, len, width, height, &mut l) else { return false };
+    unsafe { WALL_PLANE = (len as u64, first) };
     let t_open = ferros_sys::us_since(t0);
+    let n = width * height;
+    let ptrs = unsafe { [(*(&raw mut STRETCH_BUFS))[0].as_mut_ptr(), (*(&raw mut STRETCH_BUFS))[1].as_mut_ptr()] };
     // Each code into its pixel's lane as it comes (the planes one after another, red setting the pixel opaque), and the whole baked in place once the plane is in (`wall_bake_rows`).
     let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, n) };
     // Stretches of a MiB at their own boundaries in the value (sixteen of the vault's pieces, opened as one batch; on an older kernel `vault_read` moves one in its own smaller calls, still at piece boundaries), two buffers: the reader thread fills one (`read_post`) while this thread converts the other.
     // The two stretches are statics, not the loader's arena (2026-11-11, the Pro: "memory allocation of 524288 bytes failed" at start, the 2 MiB arena already holding ~1.87 MiB of the document's reading): one load at a time uses them (`LOADING`).
-    let (first, end) = (span.data_offset, span.data_offset + span.data_len);
     // To the next stretch boundary of the value, or the plane's end.
     let next_to = |at: u64| ((at / STRETCH as u64 + 1) * STRETCH as u64).min(end);
     // The plane's first stretch is already in the first buffer (read for the opening, at the value's own offsets): converted from there, not read again.
@@ -5410,7 +5376,10 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
     let t_plane = now() - t_reads;
     // Baked whole, here on the loader's thread, before the render loop shows it (`wall_ready`).
     let t_bake = now();
+    let g = bake::generation();
     wall_bake_rows(width, height, 0, height);
+    // Exact with the bake in use, unless a brightness change came while it baked (the render thread does not bake a wallpaper still loading): then a refresh reads it again (`wall_refresh`).
+    WALL_EXACT.store(if bake::generation() == g { g } else { 0 }, Ordering::Release);
     t_conv += now() - t_bake;
     // Measuring (owner, 2026-11-08: "the unlock process took way too long"): the whole load over the vault, and where it went.
     let ms = |t: u64| t * 1000 / freq();
@@ -5537,7 +5506,7 @@ fn present_bench(width: usize, log: &mut Log) {
     log.flush();
 }
 
-/// Everything the display keeps baked, baked again with the bake now in use (a brightness change, the render thread between passes; COMPOSITOR.md "Baked"): the icons' chains in place from the bundle; the sprites, the region's front layer and its clean window, made again when next asked for; the pan's anchor and the flight's images (none in flight) dropped; the wallpaper from its codes, by stripes on the publish workers; the console, the helm and the quick row by their worker, which sees the generation move (`console_worker`), nudged; and each window told (`EV_BAKE`), so its app bakes its surface again. The canvas is the caller's: the map's last frame drawn again.
+/// Everything the display keeps baked, baked again with the bake now in use (a brightness change, the render thread between passes; COMPOSITOR.md "Baked"): the icons' chains in place from the bundle; the sprites, the region's front layer and its clean window, made again when next asked for; the pan's anchor and the flight's images (none in flight) dropped; the wallpaper from its codes, by stripes on the publish workers, and from its source once the brightness settles (`wall_refresh`); the console, the helm and the quick row by their worker, which sees the generation move (`console_worker`), nudged; and each window told (`EV_BAKE`), so its app bakes its surface again. The canvas is the caller's: the map's last frame drawn again.
 fn rebake(mips: &[draw::Mips], width: usize, height: usize) {
     let decode = icon_decode();
     for (i, m) in mips.iter().enumerate() {
@@ -5588,7 +5557,7 @@ fn wall_sample(buf: &mut [u64], n: usize, s: usize, code: u16) {
 }
 
 /// Rows `y0..y1` of the wallpaper, each pixel's three g2t codes in its lanes as the loader put them, baked in place (bake.rs `codes_in_place`), on the loader's thread as a load finishes.
-/// The wallpaper keeps no copy of its codes (a copy in the display's heap, 15 MiB on akita and 23 on husky, was tried first and dropped: the arc pool is tight, and on the 8a that day wallgen was refused for room with or without it): a brightness change bakes it again from what it holds (`wall_rebake_rows`).
+/// The wallpaper keeps no copy of its codes (a copy in the display's heap, 15 MiB on akita and 23 on husky, was tried first and dropped: the arc pool is tight, and on the 8a that day wallgen was refused for room with or without it): a brightness change bakes it again from what it holds at once (`wall_rebake_rows`), then from its source in the vault once the brightness settles (`wall_refresh`).
 fn wall_bake_rows(width: usize, height: usize, y0: usize, y1: usize) {
     let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, width * height) };
     let b = bake::now();
@@ -5600,7 +5569,7 @@ fn wall_bake_rows(width: usize, height: usize, y0: usize, y1: usize) {
 /// The tables `wall_rebake_rows` unbakes with (`Bake::unbake_tables`, the bake before this one's), made by the render thread for one brightness change in its frame scratch: (to_p, to_v).
 static mut WALL_UNBAKE: (usize, usize) = (0, 0);
 
-/// Rows `y0..y1` of the wallpaper baked again at a brightness change (`stripes` kind 5, `rebake`): each pixel unbaked with the bake before (`Bake::unbake_with`, its tables in `WALL_UNBAKE`), back to working values, and baked with the new one. A round trip thru the codes: exact but for what the old bake lost for good (a channel past the gamut, the roll-off's last stops).
+/// Rows `y0..y1` of the wallpaper baked again at a brightness change (`stripes` kind 5, `rebake`): each pixel unbaked with the bake before (`Bake::unbake_with`, its tables in `WALL_UNBAKE`), back to working values, and baked with the new one. A round trip thru the codes, so the wallpaper changes with everything else: close, but not the source (a dim bake keeps fewer steps of a gradient than the source has, and each change would start from the last one's result), so the loader bakes it again from the source once the brightness settles (`wall_refresh`).
 fn wall_rebake_rows(width: usize, height: usize, y0: usize, y1: usize) {
     let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, width * height) };
     let (to_p, to_v) = unsafe { (core::slice::from_raw_parts(WALL_UNBAKE.0 as *const f32, 1 << 16), core::slice::from_raw_parts(WALL_UNBAKE.1 as *const u16, UNBAKE_V + 1)) };
@@ -5614,28 +5583,138 @@ fn wall_rebake_rows(width: usize, height: usize, y0: usize, y1: usize) {
 /// The unbake's root table's steps (`Bake::unbake_tables`).
 const UNBAKE_V: usize = 1 << 12;
 
+/// The bake generation every row of the wallpaper was baked with from its source (a load's, or a whole refresh's); 0 when they are not all one bake's from the source. A brightness change moves the generation past it, and the loader reads the source again once the brightness settles (`wall_refresh`).
+static WALL_EXACT: AtomicU32 = AtomicU32::new(0);
+/// Counts each refresh finished: the render loop publishes every phase again (`wall_step`).
+static WALL_FRESH: AtomicU64 = AtomicU64::new(0);
+static mut WALL_FRESH_SEEN: u64 = 0;
+/// The wallpaper's rows between a refresh's writes (`wall_refresh`, a row at a time) and a brightness change on the render thread (`bake::set` and the re-bake from the codes, `rebake`): 0 free, 1 held, 2 held with a waiter. A refresh's row goes in only under it and only if the bake it was made with is still the one in use, so every row the re-bake undoes was made with the bake it undoes with.
+static WALL_LOCK: AtomicU64 = AtomicU64::new(0);
+
+fn wall_lock() {
+    if WALL_LOCK.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        return;
+    }
+    while WALL_LOCK.swap(2, Ordering::Acquire) != 0 {
+        ferros_sys::wait(&WALL_LOCK, 2, 0);
+    }
+}
+
+fn wall_unlock() {
+    if WALL_LOCK.swap(0, Ordering::Release) == 2 {
+        ferros_sys::wake(&WALL_LOCK, 1);
+    }
+}
+
+/// The kept wallpaper's value as the last load found it (`wall_own`): its length, and its plane's first byte in it. The loader's.
+static mut WALL_PLANE: (u64, u64) = (0, 0);
+/// Refreshes superseded (a brightness change or a load before they finished), said with the next one that finishes.
+static mut WALL_SUPERSEDED: u64 = 0;
+
+/// A refresh's row, baked before it goes into the wallpaper (husky's 1344, the widest screen, fits).
+static mut WALL_ROW: [u64; 1 << 11] = [0; 1 << 11];
+
+/// The wallpaper baked again from its source, the plane in the vault, with the bake in use (owner, 2026-11-12, on the 8a: "The moment you adjust the brightness on the 8a it bands terribly bad"). On the loader's thread, once the brightness has settled after a change (`loader_bell`).
+/// Why: a brightness change re-bakes the wallpaper from its own codes (`wall_rebake_rows`) at once, so it changes with everything else, but that is a round trip thru a bake that lost what it lost (a dim bake keeps far fewer steps of a smooth gradient than the source has), and each change starts from the last one's result. Measured on the 8a before this: brightness 0 to 128 and back moved 97 % of a smooth stretch of the wallpaper, 46 g2t codes darker on average, and halved its distinct values. The source is wallgen's (or the person's own), kept in the vault in VSF RGB; no copy of it is held (the arc pool has no 15 to 23 MiB to spare).
+/// How: band by band of rows (as many as three planes' rows fill the loader's two stretch buffers: 323 on akita, 260 on husky), each band's three plane stretches read, each row made from its samples and baked in `WALL_ROW` (`Bake::codes_in_place`), then copied in under `WALL_LOCK` if the bake in use is still the one it was made with. Any brightness change meanwhile, or a load wanted, ends it: the rows done stay (the re-bake carries them), and the next settling starts it again. A whole pass marks the wallpaper exact (`WALL_EXACT`) and has every phase published again (`WALL_FRESH`). Whether it finished.
+fn wall_refresh(grants: u64, width: usize, height: usize, key: &'static [u8]) -> bool {
+    let c = cap(grants, S_MAP_SCOPE);
+    let t0 = now();
+    let (g, req) = (bake::generation(), LOAD_REQ.load(Ordering::Acquire));
+    let mut l = Log { grants, buf: [0; 256], n: 0 };
+    // The plane where the load found it (`WALL_PLANE`), so a start costs no opening: one started after every step of a drag, and superseded by the next, reads at most one plane's band. A value of another length (its document written again since) is opened again.
+    let (len0, mut first) = unsafe { WALL_PLANE };
+    let Some(len) = ferros_sys::store_get(c, key, &mut []) else { return false };
+    if len as u64 != len0 {
+        let Some(p) = wall_open(c, key, len, width, height, &mut l) else { return false };
+        first = p.first;
+        unsafe { WALL_PLANE = (len as u64, first) };
+    }
+    let n = width * height;
+    // The two stretch buffers as one area (they are one static, back to back): a band's three planes, each `band` rows of 16-bit samples.
+    let area = unsafe { core::slice::from_raw_parts_mut((&raw mut STRETCH_BUFS) as *mut u8, 2 * STRETCH) };
+    let band = 2 * STRETCH / (6 * width);
+    let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, n) };
+    let row = unsafe { &mut (&mut *(&raw mut WALL_ROW))[..width] };
+    // Superseded: a brightness change since it began (the next settling starts it again with that bake), or a load wanted (it reads the plane whole).
+    let gone = || bake::generation() != g || LOAD_REQ.load(Ordering::Acquire) != req;
+    let mut y = 0;
+    while y < height {
+        // WHY the min: the last band is what is left of the screen.
+        let y1 = (y + band).min(height);
+        for p in 0..3 {
+            if gone() {
+                unsafe { WALL_SUPERSEDED += 1 };
+                return false;
+            }
+            let at = first + 2 * (p * n + y * width) as u64;
+            if !vault_read(c, key, at, &mut area[2 * p * band * width..2 * (p * band + y1 - y) * width]) {
+                l.s(b"display: the wallpaper could not be read again after a brightness change; it stays baked from its codes\n");
+                l.flush();
+                return false;
+            }
+        }
+        for yy in y..y1 {
+            let b = bake::now();
+            let o = 2 * (yy - y) * width;
+            for (x, px) in row.iter_mut().enumerate() {
+                let s = |p: usize| {
+                    let i = 2 * p * band * width + o + 2 * x;
+                    u16::from_be_bytes([area[i], area[i + 1]]) as u64
+                };
+                *px = 0xFFFF << 48 | s(0) | s(1) << 16 | s(2) << 32;
+            }
+            b.codes_in_place(row);
+            wall_lock();
+            // The bake checked under the lock, which the render thread holds from its `bake::set` to the end of its re-bake: a row made with a bake that was replaced meanwhile never goes in.
+            let same = bake::generation() == g;
+            if same {
+                buf[yy * width..(yy + 1) * width].copy_from_slice(row);
+            }
+            wall_unlock();
+            if !same {
+                unsafe { WALL_SUPERSEDED += 1 };
+                return false;
+            }
+        }
+        y = y1;
+    }
+    WALL_EXACT.store(g, Ordering::Release);
+    WALL_FRESH.fetch_add(1, Ordering::Release);
+    ring_bell();
+    l.s(b"display: wallpaper baked again from its source (");
+    l.s(key);
+    l.s(b") in ");
+    l.dec(ferros_sys::us_since(t0) / 1000);
+    l.s(b" ms, ");
+    l.dec(unsafe { core::mem::replace(&mut *(&raw mut WALL_SUPERSEDED), 0) });
+    l.s(b" superseded before it\n");
+    l.flush();
+    true
+}
+
 /// Whether the helm has been drawn (it shows nothing that changes; drawn once, at the first pass).
 static mut HELM_DRAWN: bool = false;
 /// The helm's light (the bottom corners' two buttons; owner, 2026-11-09: light them up), deck [0] and back [1]: the level a client last reported (op 54, Q16: a finger landed, how far its swipe has come, acted), and the level drawn, which follows a rise at once and halves what is left of a fall each render pass, so a release fades out by frames and never by a timer.
 static HELM_TARGET: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static mut HELM_LEVEL: [f32; 2] = [0.0; 2];
-/// The Deck button as the deck's summary (op 66, docs/NOTIFY.md "The Deck button"; owner, 2026-11-12: "if anything on the deck has changed state, specifically 400nm notifications, we change the deck circle in the helm and then the user knows to go to the deck", then "So ideally the deck circle shows the latest item icon preview and shows the violet ring?"): the latest note's source's icon in bits 16-23 (0 none), how many wait in the deck's resting view below (0: the plain Deck mark). As the map last sent it, and as last drawn.
+/// The Deck button as the deck's summary (op 66, docs/NOTIFY.md "The Deck button"; owner, 2026-11-12: "if anything on the deck has changed state, specifically 400nm notifications, we change the deck circle in the helm and then the user knows to go to the deck", then "So ideally the deck circle shows the latest item icon preview and shows the violet ring?"): the latest note's source's icon in bits 16-23 (0 none), how many wait in the deck's resting view below (0: the plain Deck mark), and the ring's glow in bits 24-31 (ferros_glow's state byte: 4 for you, 400 nm; 6 a question, 703 nm, the system waiting on the person, docs/NOTIFY.md "System questions"; 0 from a map before it: for you). As the map last sent it, and as last drawn.
 static HELM_NOTE: AtomicU32 = AtomicU32::new(0);
 static mut HELM_NOTE_DRAWN: u32 = 0;
 
-/// The for-you colour as the helm draws it (fluor's darkness, straight), its glow's peak (0 to 1) and its reach divisor, for `count` waiting: a for-you circle's on the deck (`state_glow`: ferros_glow 400 nm at the theme's ring light). None for a theme with no glow.
-fn for_you_ink(count: u16) -> Option<(u64, f32, i64)> {
-    let cir = Circle { glow: ferros_glow::Glow::ForYou as u8, count, ..NO_CIRCLE };
+/// The note's colour as the helm draws it (fluor's darkness, straight), its glow's peak (0 to 1) and its reach divisor, for `count` waiting: a for-you circle's on the deck (`state_glow`: ferros_glow 400 nm at the theme's ring light), or a question's, the same glow at 703 nm (`glow`, ferros_glow's state byte). None for a theme with no glow.
+fn note_ink(glow: u8, count: u16) -> Option<(u64, f32, i64)> {
+    let cir = Circle { glow, count, ..NO_CIRCLE };
     let (colour, peak, frac, _) = state_glow(&cir, ferros_sys::theme::current())?;
     // The colour's 8-bit gamma 2 codes as working values (white at Q14).
     let w8 = |c: u32| (c & 0xFF) as f32 * (16384.0 / 255.0);
     Some((g2t_colour((w8(colour >> 16), w8(colour >> 8), w8(colour))), peak as f32 * (1.0 / 255.0), frac))
 }
 
-/// The Deck button's note (`HELM_NOTE`) into the bars' bottom rows (`bar`, `bot` rows of `width` from screen row `height - bot`), front to back after the marks: the source's icon inside the button's circle (centre (x, y), radius `r`, inside its 2-pixel stroke), then the for-you glow around it (ferros_glow 400 nm at the theme's ring light, as a for-you circle's on the deck, `state_glow`), reaching farther with the count. No content, ever: the source's icon alone (owner: "shows the latest item icon preview"). Every edge a C∞ step (`draw::bump_step`), every layer by fluor's `under`.
-fn helm_note_draw(bar: &mut [u64], width: usize, height: usize, bot: usize, (x, y, r): (f32, f32, f32), icon_n: u8, count: u16) {
+/// The Deck button's note (`HELM_NOTE`) into the bars' bottom rows (`bar`, `bot` rows of `width` from screen row `height - bot`), front to back after the marks: the source's icon inside the button's circle (centre (x, y), radius `r`, inside its 2-pixel stroke), then the for-you glow around it (ferros_glow 400 nm at the theme's ring light, as a for-you circle's on the deck, `state_glow`; a question's at 703 nm, `glow`), reaching farther with the count. No content, ever: the source's icon alone (owner: "shows the latest item icon preview"). Every edge a C∞ step (`draw::bump_step`), every layer by fluor's `under`.
+fn helm_note_draw(bar: &mut [u64], width: usize, height: usize, bot: usize, (x, y, r): (f32, f32, f32), icon_n: u8, count: u16, glow: u8) {
     use fluor::pixel::{Blend, BlendMode};
-    let Some((violet, peak, frac)) = for_you_ink(count) else { return };
+    let Some((ink, peak, frac)) = note_ink(glow, count) else { return };
     // The glow's reach past the circle: the circle glows' own, a `frac`th of the radius (frac already shrunk by the count, ferros_glow `reach`).
     let reach = r / frac as f32;
     // The icon's disc inside the stroke (2 pixels wide on the radius's inside).
@@ -5690,7 +5769,7 @@ fn helm_note_draw(bar: &mut [u64], width: usize, height: usize, bot: usize, (x, 
             // The glow: full at the rim and inside it (under the icon, showing only where the art leaves room), down to nothing at its reach on the C∞ step.
             let a = peak * draw::bump_step(1.0 - (d - r) / reach);
             if a > 0.0 {
-                bar[i] = bar[i].under(violet | ((a * 65535.0) as u64) << 48, BlendMode::Normal);
+                bar[i] = bar[i].under(ink | ((a * 65535.0) as u64) << 48, BlendMode::Normal);
             }
         }
     }
@@ -5722,8 +5801,13 @@ fn helm_draw(width: usize, height: usize) -> bool {
         }
     }
     let (note_icon, note_count) = ((note >> 16) as u8, note as u16);
-    // While something waits in the deck's resting view, the Deck button's ring is the for-you colour (owner, 2026-11-12: "shows the violet ring").
-    let note_ink = if note_count > 0 { for_you_ink(note_count).map(|v| v.0) } else { None };
+    // The ring's glow: a map from before op 66 carried it sends none (0), which is for you.
+    let note_glow = match (note >> 24) as u8 {
+        0 => ferros_glow::Glow::ForYou as u8,
+        g => g,
+    };
+    // While something waits in the deck's resting view, the Deck button's ring is the for-you colour (owner, 2026-11-12: "shows the violet ring"); while the system waits on the person's answer, the system's red (owner, 2026-11-12: "only difference is it would be 700nm red, rather than the regular 400nm notification glow").
+    let note_ring = if note_count > 0 { note_ink(note_glow, note_count).map(|v| v.0) } else { None };
     if unsafe { HELM_DRAWN } {
         return false;
     }
@@ -5750,8 +5834,8 @@ fn helm_draw(width: usize, height: usize) -> bool {
         // Lit: the stroke brightens toward white by the button's level (its wedge's light, below).
         let lvl = unsafe { HELM_LEVEL[back as usize] };
         let lit_ink = g2t_colour((9000.0 + 7000.0 * lvl, 9000.0 + 7000.0 * lvl, 9000.0 + 7000.0 * lvl));
-        // The Deck button with a note: its ring violet, the icon and the glow under it (`helm_note_draw`), all front to back before the wedge.
-        let ring_ink = match note_ink {
+        // The Deck button with a note: its ring the note's colour (violet, or a question's red), the icon and the glow under it (`helm_note_draw`), all front to back before the wedge.
+        let ring_ink = match note_ring {
             Some(v) if !back => v,
             _ => if lvl > 0.0 { lit_ink } else { ink },
         };
@@ -5792,8 +5876,32 @@ fn helm_draw(width: usize, height: usize) -> bool {
                 }
             }
         }
-        if !back && note_ink.is_some() {
-            helm_note_draw(bar, width, height, bot, (x, y, r), note_icon, note_count);
+        if !back && note_ring.is_some() {
+            helm_note_draw(bar, width, height, bot, (x, y, r), note_icon, note_count, note_glow);
+        }
+        // The mark's dark glow (2026-11-12, "Drawn under the controls": a kist's own pixels show under the helm now, and over bright ones a grey mark on a wedge an eighth black is hard to read): a layer of black at its own α, under the mark and the note, `peak` hugging the stroke and nothing `reach` past it, falling off in log distance as the theme's glows do (draw::glow_log: down by the same step every octave), each octave of (d / d0)² counted from the stroke's outer edge d0. On the C∞ step (`bump_step`): no kink at the stroke, none where it ends. Over black (the deck with no wallpaper) it is black on black.
+        let reach = r * (1. / (1 << 2) as f32);
+        let (d0, peak) = (HALF + 1.0, 1. - 1. / (1 << 2) as f32);
+        let octaves = libm::log2f(1. + (reach / d0) * (reach / d0));
+        let black = g2t_colour((0., 0., 0.));
+        let (x0, x1, y0, y1) = ((x - r - reach - 2.0) as i64, (x + r + reach + 2.0) as i64, (y - r - reach - 2.0) as i64, (y + r + reach + 2.0) as i64);
+        for py in y0..=y1 {
+            // WHY the test: the glow's box comes from the layout's float geometry and can reach past the screen's sides or bottom; an index from there would land in another row or past the buffer.
+            if px_out(py, height) {
+                continue;
+            }
+            let row = py as usize - (height - bot);
+            for px in x0..=x1 {
+                if px < 0 || px >= width as i64 {
+                    continue;
+                }
+                let q = dist(px as f32 + 0.5, py as f32 + 0.5) / d0;
+                let a = peak * draw::bump_step(1. - libm::log2f(1. + q * q) / octaves);
+                if a > 0.0 {
+                    let i = row * width + px as usize;
+                    bar[i] = bar[i].under(black | ((a * 65535.0) as u64) << 48, BlendMode::Normal);
+                }
+            }
         }
     }
     // Each button's whole wedge (owner, 2026-11-09: "everything in that wedge should light up", "1/8 opacity black when the helm is showing, that turns white at same said opacity when tapped"): the bars' rows outside the app's circle, the left half back's and the right half deck's (op 41's regions), a layer behind the marks (front to back) at an eighth of opacity, its colour black at rest and white by the button's level; its edge along the circle a pixel wide.
@@ -7131,13 +7239,16 @@ extern "C" fn receive(grants: u64) -> ! {
             ferros_sys::reply(&tok, &[0]);
             continue;
         }
-        // 66 `helm note [icon u8][count u16]`: the Deck button as the deck's summary (docs/NOTIFY.md "The Deck button"), the system's alone: the latest note's source's icon and how many wait in the deck's resting view, drawn by the helm (`helm_draw`). → [0], or [4] (`NOT_YOURS`) from a caller that is not the system's.
+        // 66 `helm note [icon u8][count u16][glow u8]`: the Deck button as the deck's summary (docs/NOTIFY.md "The Deck button"), the system's alone: the latest note's source's icon and how many wait in the deck's resting view, or the system's question waiting (`glow` 6, ferros_glow `Question`: the ring red, docs/NOTIFY.md "System questions"), drawn by the helm (`helm_draw`). A map from before sends no glow byte: for you. → [0], or [4] (`NOT_YOURS`) from a caller that is not the system's.
         if op == 66 && n >= 4 {
             if !system(h) {
                 ferros_sys::reply(&tok, &[NOT_YOURS]);
                 continue;
             }
-            HELM_NOTE.store((msg[1] as u32) << 16 | u16::from_le_bytes([msg[2], msg[3]]) as u32, Ordering::Release);
+            let glow = if n >= 5 { msg[4] as u32 } else { 0 };
+            HELM_NOTE.store(glow << 24 | (msg[1] as u32) << 16 | u16::from_le_bytes([msg[2], msg[3]]) as u32, Ordering::Release);
+            // A pass now, so the bars' worker (nudged on every pass) draws the helm with it: an idle screen (a kist in front drawing nothing new) had no pass to show it until the next minute (2026-11-12, on the 8a: a question waited with the Deck button still grey).
+            ring_bell();
             ferros_sys::reply(&tok, &[0]);
             continue;
         }
@@ -7462,6 +7573,8 @@ fn server(grants: u64) -> ! {
     let t_lut = now();
     let lut: &'static mut [u16] = alloc::vec![0u16; 65536].leak();
     let mut bright = ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS);
+    // A brightness change not yet followed by a pass without one (the wallpaper's refresh waits for it, `wall_refresh`).
+    let mut settle_owed = false;
     let (white0, peak0, hbm0, dbv0) = brightness(bright);
     build_lut(lut, white0, peak0);
     unsafe { LUT_FOR = bright };
@@ -7555,6 +7668,8 @@ fn server(grants: u64) -> ! {
         CODES_ROWS = alloc::vec![[0u64; 16]; CODES_BLOCKS * (PUB_WORKERS + 1)].leak().as_mut_ptr() as usize;
         LAYER_ROWS = alloc::vec![[0u64; 1344]; SURFACES * (PUB_WORKERS + 1)].leak().as_mut_ptr() as usize;
         FLIGHT_TEXT = alloc::vec![0u32; height].leak().as_mut_ptr() as usize;
+        // The flight's plane image and the capture's buffer (`PLANE`): a full screen, 30.7 MiB on the Pro, 19.8 MiB on the 8a.
+        PLANE = alloc::vec![0u64; width * height].leak().as_mut_ptr() as usize;
     }
     heap_at[4] = ALLOC.used();
     // The publish workers' stacks, so the draw functions tell a worker's band of the scene by the stack it runs on (`draw::thread_slot`).
@@ -7658,7 +7773,7 @@ fn server(grants: u64) -> ! {
     log.flush();
     let surf = ferros_sys::dma(cap(grants, S_APPSURF)) as usize;
     if surf != 0 && surf != u64::MAX as usize {
-        // The four surfaces' start: from init's spawn the grant arrives as one surface, surface 0, answered past its porch; from a restart (the kernel's shell grants) as the whole region at its base. Rounded down to the surface size, both are the region's start (the native display reaches all four from there; masked, it will need the whole region as one grant either way).
+        // The surfaces' window: the whole region at its base, from init's spawn (the kernel keeps it whole for the server of `display` since 2026-11-12) and from a restart (the kernel's shell grants) alike. Rounded down to the slot size, a kernel from before that handed a surface of the region past its porch gives the same start.
         unsafe { SURFS = surf & !(SURFACE_BYTES - 1) };
     }
     let mut next_flip = now() + freq() / 10;
@@ -7728,14 +7843,14 @@ fn server(grants: u64) -> ! {
         log.flush();
     }
     // The windows' owners (`reaper`): the kernel's bell on the surfaces changing hands, then the thread asleep on it. A kernel without the bell: the preference bytes alone, read each pass, as before.
-    if ferros_sys::bell(ferros_sys::BELL_SURFACES, &SURF_LIVE) {
+    if ferros_sys::bell(ferros_sys::BELL_SLOTS, &SURF_LIVE) {
         SURF_BELL.store(true, Ordering::Release);
         if ferros_sys::thread_spawn(reaper, unsafe { &mut *(&raw mut REAP_STACK) }, 0) != 0 {
             log.s(b"display: no reaper thread\n");
             log.flush();
         }
     } else {
-        log.s(b"display: no surfaces bell (an older kernel): windows of ended processes go on the next pass\n");
+        log.s(b"display: no slots bell (a kernel from before 2026-11-12): no window counts as live, this display needs the kernel of its day\n");
         log.flush();
     }
     // The render thread on the big core (KERNEL.md "Cores": pinning by latency class — this is the one real compute path; receive and vsync stay on the workers, where the map and the touch server run, so a call hands off on the caller's own core). After the other threads are spawned: they inherit the mask.
@@ -7927,6 +8042,7 @@ fn server(grants: u64) -> ! {
                     unsafe { CLIENT_DREW = true };
                     let clip_k = unsafe { CLIP_PHASE };
                     if clip_k.is_none() {
+                        attest_mark(grants, 8, b"the map's first camera frame");
                         last_interaction = now();
                         // Gravity for this frame: under a finger the map's frames come back to back and the loop's top (where gravity is read at rest) is not reached between them, so the clock kept the turn it had when the touch began (owner, 2026-10-24).
                         gravity_poll();
@@ -7946,8 +8062,8 @@ fn server(grants: u64) -> ! {
                     }
                     // The plane image is drawn into the flight's surface, from clear, not into the canvas (which holds the page image's clean window).
                     let pixels: &mut [Px] = match unsafe { *(&raw const FLIGHT) } {
-                        Some(f) if pre == 2 => {
-                            let s = surface(f.surf, width, height);
+                        Some(_) if pre == 2 => {
+                            let s = plane_image(width, height);
                             s.fill(0);
                             s
                         }
@@ -8475,7 +8591,7 @@ fn server(grants: u64) -> ! {
                         len = 2;
                     }
                 }
-                // 45 `flight [way u8: 1 opening, 0 closing][the plane image's camera op, 18 bytes][the page image's camera op, 18 bytes]`, then the ops that make a missing image (COMPOSITOR.md "The flight, prerendered"): this header decides what they make (`FLIGHT_PRE`); the batch runner runs them after it. Status 3: no flight here (no free surface, an app in front, no front layer, no temporal phases, or the page image not on the screen to close from); the map flies the old way.
+                // 45 `flight [way u8: 1 opening, 0 closing][the plane image's camera op, 18 bytes][the page image's camera op, 18 bytes]`, then the ops that make a missing image (COMPOSITOR.md "The flight, prerendered"): this header decides what they make (`FLIGHT_PRE`); the batch runner runs them after it. Status 3: no flight here (an app in front, no front layer, no temporal phases, or the page image not on the screen to close from); the map flies the old way.
                 Some(45) if m.len() >= 38 => {
                     let t45 = now();
                     let (mut plane, mut page) = ([0u8; 18], [0u8; 18]);
@@ -8483,18 +8599,15 @@ fn server(grants: u64) -> ! {
                     page.copy_from_slice(&m[20..38]);
                     let theme = ferros_sys::theme::index() as u8;
                     let scene = unsafe { SCENE_GEN };
-                    // The surface: the flight's own while it is still free, else the last free one (the kernel gives surfaces out from the first, the capture takes the first free).
-                    let surf = match unsafe { *(&raw const FLIGHT) } {
-                        Some(f) if flight_surface_free(f.surf) => Some(f.surf),
-                        _ => (0..SURFACES).rev().find(|&k| flight_surface_free(k)),
-                    };
+                    // The plane image's buffer is the display's own (`PLANE`): the flight waits on no app's surface, only on no app being in front.
+                    let surf = flight_free().then_some(());
                     let ok = surf.is_some() && front_layer(width, height).is_some() && ten && unsafe { TEMPORAL };
                     unsafe { FLIGHT_PRE = 0 };
                     match surf {
-                        Some(k) if ok => unsafe {
+                        Some(()) if ok => unsafe {
                             let mut f = match *(&raw const FLIGHT) {
-                                Some(f) if f.surf == k && f.theme == theme && f.scene == scene => f,
-                                _ => FlightImages { surf: k, plane: None, page, theme, scene },
+                                Some(f) if f.theme == theme && f.scene == scene => f,
+                                _ => FlightImages { plane: None, page, theme, scene },
                             };
                             f.page = page;
                             let page_up = REGION_ON && CLEAN_KEY.is_some_and(|c| c.1 == page);
@@ -8504,7 +8617,7 @@ fn server(grants: u64) -> ! {
                                     if REGION_ON {
                                         out[0] = 3;
                                     } else {
-                                        surface(k, width, height).copy_from_slice(&pixels[..width * height]);
+                                        plane_image(width, height).copy_from_slice(&pixels[..width * height]);
                                         f.plane = Some(plane);
                                     }
                                 }
@@ -8540,7 +8653,7 @@ fn server(grants: u64) -> ! {
                     cam.copy_from_slice(&m[1..19]);
                     let alpha = u16::from_le_bytes([m[19], m[20]]);
                     match unsafe { *(&raw const FLIGHT) } {
-                        Some(FlightImages { surf, plane: Some(plane), page, .. }) if flight_surface_free(surf) && unsafe { REGION_ON && CLEAN_KEY.is_some_and(|c| c.1 == page) } => {
+                        Some(FlightImages { plane: Some(plane), page, .. }) if flight_free() && unsafe { REGION_ON && CLEAN_KEY.is_some_and(|c| c.1 == page) } => {
                             unsafe {
                                 // The clean window's ground, from its region op (`[cx i16][cy i16][r u16][ground]`), and the text's rows from the front layer's kept ops.
                                 let q = (*(&raw const CLEAN_KEY)).map(|c| c.0).unwrap_or([0; 10]);
@@ -8566,7 +8679,7 @@ fn server(grants: u64) -> ! {
                                     clean_reset();
                                 }
                                 FLIGHT_SEQ += 1;
-                                FLIGHT_FRAME = Some(FlightFrame { page: flight_map(&cam, &page, width, height), plane: flight_map(&cam, &plane, width, height), alpha, plane_px: surface(surf, width, height).as_ptr() as usize, ground });
+                                FLIGHT_FRAME = Some(FlightFrame { page: flight_map(&cam, &page, width, height), plane: flight_map(&cam, &plane, width, height), alpha, plane_px: PLANE, ground });
                                 CLOCK_SHOWN = false;
                                 SCOPE_SHOWN = false;
                                 PUB_TICKS = [0; 3];
@@ -8755,6 +8868,8 @@ fn server(grants: u64) -> ! {
                                     if full_follow() {
                                         clean_reset_all();
                                     }
+                                    // A window shown for the first time (or at a new place) is told its safe area.
+                                    safe_follow(width, height);
                                 }
                                 if OP22_US[4] == 0 {
                                     OP22_US[0] = t_chrome - t22;
@@ -8896,7 +9011,7 @@ fn server(grants: u64) -> ! {
                     }
                 }
                 Some(43) => {
-                    // Full screen on or off for the app window in front (`Win::full`, `FULL`; the quick row's circle since 2026-11-11, owner: full screen "moves to a quick-row circle", where the deck swipe toggled it for the whole screen until then): every phase republished, the bars and the circle gone or back, and with the publish every row of the hit map written again (hit.rs `row`: the console's rows the app's in full screen, the helm's still the system's). Replies the new state; status 3 and the state unchanged with no app in front (the deck always has its bars), 4 (`NOT_YOURS`) when the app in front is neither the caller's nor the caller the system's.
+                    // Full screen on or off for the app window in front (`Win::full`, `FULL`; the quick row's circle since 2026-11-11, owner: full screen "moves to a quick-row circle", where the deck swipe toggled it for the whole screen until then): every phase republished, the bars gone or back, the window told its safe area (`safe_follow`), and with the publish every row of the hit map written again (hit.rs `row`: the console's rows the app's in full screen, the helm's still the system's). Replies the new state; status 3 and the state unchanged with no app in front (the deck always has its bars), 4 (`NOT_YOURS`) when the app in front is neither the caller's nor the caller the system's.
                     match front_app() {
                         Some(k) if !manages(unsafe { HOLDS }, k) => out[0] = not_yours(43, k),
                         Some(k) => unsafe {
@@ -8904,6 +9019,7 @@ fn server(grants: u64) -> ! {
                                 w.full = !w.full;
                             }
                             full_follow();
+                            safe_follow(width, height);
                             PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
                             clean_reset_all();
                         },
@@ -9086,12 +9202,16 @@ fn server(grants: u64) -> ! {
                         unsafe { ATTEST_T = (now(), 0) };
                         // Read by the loader (`wall_loader`) and answered now: the deck does not wait for it (owner, 2026-11-08).
                         wall_load(false);
+                        // The load starts at the next pass's top (`wall_step`), which the bell brings at once: without it the loop slept until its next deadline, and the read began 161 ms after the attest (2026-11-12, the 8a).
+                        ring_bell();
                     }
                 }
                 // 44 `wallpaper kept`: wallgen has made the person's wallpaper on the GPU and kept it on this device (`map.wallpaper.made`): read by the loader and shown, unless their own is up. A read already under way (op 42's, which may have found nothing yet) gives way to this one.
                 Some(44) => {
                     if unsafe { WALL_BUF != 0 && !(WALL_ON && WALL_OWN) } {
                         wall_load(true);
+                        // Started at the next pass's top, at once (as op 42's).
+                        ring_bell();
                     }
                 }
                 // 32 `wallpaper state` (2026-11-10, the Pro's wallpaper gone with no line to say why): out[1] bits, 0 a buffer, 1 shown, 2 a load under way, 3 the person's own shown, 5 a load wanted; logged the same. (Bits 3 and 4 were the display's own drawing job and its waiting seed until 2026-11-11, when the wallpaper went to the GPU.)
@@ -9106,9 +9226,10 @@ fn server(grants: u64) -> ! {
                     l.flush();
                 }
                 Some(30) => {
-                    // Not the flight's: it holds the plane image.
-                    let flight_surf = unsafe { *(&raw const FLIGHT) }.map(|f| f.surf);
-                    let free = (0..SURFACES).find(|&k| unsafe { (*(&raw const WINS))[k] }.is_none() && Some(k) != flight_surf);
+                    // Into the plane image's buffer (`PLANE`): a flight's plane image is made again at its next flight.
+                    if let Some(f) = unsafe { (*(&raw mut FLIGHT)).as_mut() } {
+                        f.plane = None;
+                    }
                     let flight = unsafe { *(&raw const FLIGHT_FRAME) };
                     let wall_at = unsafe { if WALL_ON { WALL_BUF } else { 0 } };
                     // `[30, 1]`: the glass's mask alone (owner, 2026-11-10, the website's screens: "pull that screen mask for the edges/cam, de premultiply it, apply alpha"): every pixel through `glass_front` with nothing in front but the mask and only white behind it, so with the release look's black mask each pixel's working value is white times the share of the glass that shows there (the edge's and the camera hole's antialiasing exact, as the panel gets them). Whatever is on the screen, an app included.
@@ -9124,16 +9245,15 @@ fn server(grants: u64) -> ! {
                             b.unbake_with(s, &to_p, &to_v);
                         }
                     };
-                    let text: alloc::string::String = match (unsafe { APP }.is_some() && !mask, free) {
+                    let text: alloc::string::String = match unsafe { APP }.is_some() && !mask {
                         // The deck: each row as `publish_band` composes it for the glass (the edge, then the console, then the canvas), in working values, into the free surface.
-                        (false, Some(k)) => {
-                            let s = surface(k, width, height);
+                        false => {
+                            let s = plane_image(width, height);
                             let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
                             for y in 0..height {
                                 let g = &rows[y];
                                 let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), rows[y + 1].first as usize) };
-                                let row_px = &plan[g.first as usize..];
-                                let edge_px = &row_px[front_split(row_px)..];
+                                let edge_px = &plan[g.first as usize..];
                                 if mask {
                                     // White at Q14 in each of R, G and B: the mask's compose is linear (`glass_front`, `under_pm`), so this is the glass's share of white exactly, and it is not unbaked (the release look's mask is black, nothing baked in it).
                                     const WHITE: u64 = 16384 | 16384 << 16 | 16384 << 32;
@@ -9171,11 +9291,8 @@ fn server(grants: u64) -> ! {
                             }
                             alloc::format!("G#{:X}\n", s.as_ptr() as usize)
                         }
-                        // The canvas is baked and is not unbaked in place (it is the screen's): no capture without a free surface.
-                        (false, None) => "no free surface\n".into(),
-                        (true, None) => "no free surface\n".into(),
-                        (true, Some(k)) => {
-                            let s = surface(k, width, height);
+                        true => {
+                            let s = plane_image(width, height);
                             unsafe { CAPTURE = s.as_mut_ptr() as usize };
                             publish_app(draw::Rect::full(width, height), &tabs, 0, width, height, false);
                             unsafe { CAPTURE = 0 };
@@ -9346,6 +9463,9 @@ fn server(grants: u64) -> ! {
         // Where a long pass went (measuring, owner 2026-11-07: "why is the UI stupidly slow"): everything before the wallpaper's step (the clock and scope between frames, gravity, windows), the wallpaper's step, the bars drawn and published.
         let mut stage_us = [0u64; 3];
         let mut ncalls = 0u32;
+        // Which ops the pass ran (a batch by its first), and the surfaces its shows (op 22) were on, bit k surface k (`diag arcs` names their owners): who a long pass waited on (2026-11-12, "long pass 4747 ms: 285 calls" with no caller named).
+        let mut pass_ops = [0u16; 1 << 7];
+        let mut shows_on = 0u32;
         // A clock on the screen, spatial dither only (no flips): a new second, the last plain frame drawn again, as if the map had sent it (the clock reads the time as it draws).
         // The last frame again: a camera op, or each op of a batch in order.
         let mut replay = |handle: &mut dyn FnMut(&[u8], &mut [u8; 16]) -> usize| {
@@ -9589,6 +9709,15 @@ fn server(grants: u64) -> ! {
             let mut out = [0u8; 16];
             let t_call = now();
             ncalls += 1;
+            if let Some(&op) = m.first() {
+                // WHY the mask: the op byte is the client's; the table covers every op there is (under 128).
+                pass_ops[(op & 127) as usize] += 1;
+                if op == 22 && m.len() >= 17 {
+                    if let Some(sk) = surface_of(u64::from_le_bytes(m[9..17].try_into().unwrap())) {
+                        shows_on |= 1 << sk;
+                    }
+                }
+            }
             // The time since the last reply: what the client spent between calls (its own work, the scheduler, this loop's own sleep).
             let gap_us = (t_call.wrapping_sub(last_reply) * 1_000_000 / freq()).min(999_999);
             let mut op_us = [0u64; 32];
@@ -9830,10 +9959,14 @@ fn server(grants: u64) -> ! {
             bright = b;
             let (white, peak_e, hbm, dbv) = brightness(b);
             let t_rb = now();
+            // The wallpaper's rows held from the new bake to the end of the re-bake from its codes, so no row a refresh makes with the old bake goes in after it (`wall_refresh`).
+            wall_lock();
             bake::set(white, peak_e);
             bake_consts();
             tabs = bake::now().odt;
             rebake(mips, width, height);
+            wall_unlock();
+            settle_owed = true;
             // The map's last frame drawn again with the new bake, at the top of the next pass (where the clock's replays run), which the bell starts at once.
             rebake_replay = unsafe { (*(&raw const APP)).is_none() && LAST_FRAME.1 > 0 };
             ring_bell();
@@ -9873,6 +10006,10 @@ fn server(grants: u64) -> ! {
                 log.s(b")\n");
             }
             log.flush();
+        } else if settle_owed {
+            // A whole pass with the brightness as the last change left it: the loader bakes the wallpaper again from its source (`wall_refresh`), which the next change, if one comes, supersedes.
+            settle_owed = false;
+            loader_bell();
         }
         // The panel's channels or the look switched (ops 59, 60; development builds): every pixel published again from the back buffer (the present masks the channels, `neon::Chans`), so no phase keeps the old channels or the orange. With an app in front the idle fill brings the phases round.
         let g = DEV_GEN.load(Ordering::Acquire);
@@ -9987,6 +10124,21 @@ fn server(grants: u64) -> ! {
             tlog.dec(stage_us[2] / 1000);
             tlog.s(b" ms\n");
             tlog.flush();
+            if ncalls > 0 {
+                tlog.s(b"display: that pass's calls by op:");
+                for (op, &c) in pass_ops.iter().enumerate().filter(|(_, c)| **c > 0) {
+                    tlog.s(b" ");
+                    tlog.dec(op as u64);
+                    tlog.s(b" x");
+                    tlog.dec(c as u64);
+                }
+                if shows_on != 0 {
+                    tlog.s(b"; shows on surfaces (bits) ");
+                    tlog.hex(shows_on);
+                }
+                tlog.s(b"\n");
+                tlog.flush();
+            }
         }
         // Until the doorbell rings (`BELL`: a request, the bars, a window's end) or the next deadline: the second's tick; the flip, only while a flip can happen (while a finger moves the next phase stays dirty and `next_flip` falls into the past — a wake set from it made the old sleep return at once and this loop spin its slice, 2026-10-23); and a stale phase to refill once the frames have stopped coming.
         let flip_possible = unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean;

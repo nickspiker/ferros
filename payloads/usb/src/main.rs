@@ -198,6 +198,8 @@ fn serve(grants: u64) -> ! {
     let mut act: Option<([u8; 256], usize)> = None;
     let mut held = ([0u8; 256], 0usize);
     let mut attempts = 1u64;
+    // What the host did on the bus since this driver started: resets, connects done, disconnects, setup packets. Said when the driver gives up unconfigured, with the controller's registers (the jump of 2026-11-13 gave up four times a minute and said nothing of why).
+    let mut bus_seen = [0u32; 4];
     // Timing of the last command: its SPEC, its last packet, its reply from the kernel, and the reply's length.
     let (mut t_spec, mut t_whole, mut t_reply, mut reply_len) = (0u64, 0u64, 0u64, 0usize);
     // CPU time in the packet loops: decoding what came in, framing what goes out.
@@ -214,6 +216,7 @@ fn serve(grants: u64) -> ! {
         match ev {
             UsbEvent::None | UsbEvent::TransferNotReady { .. } => {}
             UsbEvent::Reset => {
+                bus_seen[0] += 1;
                 usb.handle_reset();
                 inbound = None;
                 out = None;
@@ -223,11 +226,13 @@ fn serve(grants: u64) -> ! {
                 held_spec = None;
             }
             UsbEvent::ConnectDone { .. } => {
+                bus_seen[1] += 1;
                 usb.handle_connect_done();
                 usb.ep0_start_setup();
                 usb.bulk_out_arm();
             }
             UsbEvent::Disconnect => {
+                bus_seen[2] += 1;
                 usb.handle_disconnect();
                 inbound = None;
                 out = None;
@@ -236,6 +241,7 @@ fn serve(grants: u64) -> ! {
                 held_spec = None;
             }
             UsbEvent::Ep0Setup { request } => {
+                bus_seen[3] += 1;
                 if !usb.handle_setup(&request) {
                     usb.ep0_stall();
                 }
@@ -503,7 +509,11 @@ fn serve(grants: u64) -> ! {
             attempts += 1;
             // Never configured after four tries: this driver gives up, and init's keeper starts a fresh one (the link readied again from the start).
             if attempts > 4 {
-                give_up(grants, power, "not configured after four tries");
+                // DSTS bits 18-21 the link state (4 SS.Disabled / L3 off, 5 RX.Detect, 6 SS.Inactive), 0-2 the connected speed; DCTL bit 31 run/stop; GSTS bits 0-1 the mode (0 device).
+                // One line, as `give_up`'s: the kernel keeps only a process's last line in the flash log.
+                let [dctl, dsts, gsts, dcfg] = usb.regs();
+                say!(grants, "usb: not configured after four tries (resets {}, connects {}, disconnects {}, setups {}; DCTL G#{:X} DSTS G#{:X} GSTS G#{:X} DCFG G#{:X}); this driver ends, init's keeper starts another\n", bus_seen[0], bus_seen[1], bus_seen[2], bus_seen[3], dctl, dsts, gsts, dcfg);
+                ferros_sys::exit(2)
             }
             ferros_sys::power(power, true);
             if let Some(u) = Dwc3Dev::init() {
