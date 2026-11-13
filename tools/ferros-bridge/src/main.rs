@@ -1066,7 +1066,9 @@ async fn cmd_kist_stow(path: &str) {
     key.extend_from_slice(&addr);
     let t0 = std::time::Instant::now();
     const PART: usize = 4 << 20;
-    for (k, part) in capsule.chunks(PART).enumerate() {
+    // `--stored`: the capsule is in this device's vault already (the same address: an earlier stow whose list entry was lost), so only the list entry is written. Its parts are not sent again: a big capsule's last part commits the whole value, which on a busy vault ran past the USB driver's 16 s (the 8a, 2026-11-13).
+    let stored = std::env::args().any(|a| a == "--stored");
+    for (k, part) in capsule.chunks(PART).enumerate().filter(|_| !stored) {
         let off = k * PART;
         let more = off + part.len() < capsule.len();
         let mut p = Vec::with_capacity(2 + key.len() + 9 + part.len());
