@@ -7,7 +7,7 @@
 //!
 //! `udp` requests (first byte):
 //! - 1 SEND: family (4 or 6), address (16 bytes; IPv4 in the first 4), destination port (u16 BE), source port (u16 BE), payload → [0] sent, [1] resolving the next hop (retry), [2] no address yet, [3] bad request.
-//! - 2 RECV: port (u16 BE) → family, address (16), source port, destination port, payload, or nothing (length 0). A RECV on a port, or a SEND from it, opens it: datagrams are kept only for the last eight ports asked for (a broadcast to a port nobody reads once filled the queue for good), the oldest giving way when the queue is full. IPv4 multicast and IPv6 link-scope multicast (ff02::; Photon's LAN beacons go to 239.104.199.144 and ff02::68c7:9014, port 4384) are delivered like unicast. A fourth byte, a wait in seconds (1 to 255), holds the call while the port has nothing: answered as a datagram for it lands, else with nothing when the wait runs out (a doorbell for a blocking reader, never a poll: owner, 2026-11-10, "No polling!"; 2026-11-11, Mahere fetching its map cells, "we have tcp and http so let's get the full meal deal wired up with mahere"). Without it, or 0, the answer is at once, as before. Eight bytes after the wait byte, a deadline on the counter (u64 BE, the ticks `cntvct_el0` counts; 0 at once, u64::MAX until a datagram comes), hold it to exactly then in place of the wait (2026-11-13: std apps waiting out a read timeout of their own, Photon's blocking sockets). Four bytes after that, the reader's id (u32 BE, a WATCH's, op 11): a port watched by several readers keeps each datagram until each of them has taken it, and this reader gets the oldest it has yet to take (fgtw and Photon both read 4383 and 4384; until 2026-11-13 whichever asked first took a datagram from the other). A RECV naming no reader takes the oldest for everyone, as before.
+//! - 2 RECV: port (u16 BE) → family, address (16), source port, destination port, payload, or nothing (length 0). A RECV on a port, or a SEND from it, opens it: datagrams are kept only for the last eight ports asked for (a broadcast to a port nobody reads once filled the queue for good), the oldest giving way when the queue is full. IPv4 multicast and IPv6 link-scope multicast (ff02::; Photon's LAN beacons go to 239.104.199.144 and ff02::68c7:9014, port 4384) are delivered like unicast. A fourth byte, a wait in seconds (1 to 255), holds the call while the port has nothing: answered as a datagram for it lands, else with nothing when the wait runs out (a doorbell for a blocking reader, never a poll: owner, 2026-11-10, "No polling!"; 2026-11-11, Mahere fetching its map cells, "we have tcp and http so let's get the full meal deal wired up with mahere"). Without it, or 0, the answer is at once, as before. Eight bytes after the wait byte, a deadline on the counter (u64 BE, the ticks `cntvct_el0` counts; 0 at once, u64::MAX until a datagram comes), hold it to exactly then in place of the wait (2026-11-13: std apps waiting out a read timeout of their own, Photon's blocking sockets). Four bytes after that, the reader's id (u32 BE, a WATCH's, op 11): a port watched by several readers keeps each datagram until each of them has taken it, and this reader gets the oldest it has yet to take (fgtw and Photon both read 4383 and 4384; until 2026-11-13 whichever asked first took a datagram from the other). A RECV naming no reader takes the oldest for everyone, as before; a named reader that watches no such port takes only a datagram no reader waits for (a socket opening its port never takes another reader's copy).
 //! - 3 INFO: → MAC (6), IPv4 address, mask, router (4 each), IPv6 link-local (16), IPv6 global (16), flags (bit 0 IPv4 bound, bit 1 IPv6 global, bit 2 the cellular call is up, bit 3 a person is present, so applications are served), the IPv4 DNS server (4), then the IPv6 DNS server (16): 71 bytes. The addresses and DNS servers are the ones traffic of each family leaves with: WiFi's when it has them (DHCP's option 6; the router advertisement's RDNSS), else the call's; a server of zeros when that link named none.
 //!
 //! While nobody is present (bit 3 clear) every request but INFO is answered with nothing: a SEND sends nothing, a RECV brings nothing, a CONNECT opens nothing. An application asks INFO first and says so (2026-11-12: Mahere and httptest said "DNS gave no address" all night on a locked device, their questions never sent).
@@ -1827,10 +1827,15 @@ impl Ip {
         (0..READERN).find(|&k| self.pins[k].2 != 0 && self.pins[k].0 == id && self.pins[k].1 == port)
     }
 
-    /// Whether datagram `i` is one for `port` that the reader in entry `slot` has yet to take (no entry: any datagram for the port; a datagram with no readers: anyone's).
-    fn takeable(&self, i: usize, port: u16, slot: Option<usize>) -> bool {
+    /// Who asks for `port`'s datagrams: None, a RECV naming no reader; Some(entry) for a named reader, its entry (`pins`) or None when it watches no such port.
+    fn who(&self, id: Option<u32>, port: u16) -> Option<Option<usize>> {
+        id.map(|id| self.reader_slot(id, port))
+    }
+
+    /// Whether datagram `i` is one for `port` that `who` may take: a RECV naming no reader any (as before readers); a reader with an entry those it has yet to take; a named reader with none only a datagram no reader waits for (a socket opening its port never takes another reader's copy). A datagram with no readers is anyone's.
+    fn takeable(&self, i: usize, port: u16, who: Option<Option<usize>>) -> bool {
         let d = &self.q[i];
-        d.used && d.dport == port && slot.is_none_or(|s| d.readers == 0 || d.readers & 1 << s != 0)
+        d.used && d.dport == port && (d.readers == 0 || who.is_none_or(|s| s.is_some_and(|s| d.readers & 1 << s != 0)))
     }
 
     /// Watch `w`'s ports read by its id as of now: each entry renewed, or the stalest entry taken (its reader's bit cleared from every datagram first, those left with no reader freed).
@@ -2885,8 +2890,9 @@ impl Ip {
 
     /// The port's oldest datagram into `out` (family, address, source port, destination port, payload); 0 when it has none. `id`: the reader asking (a watch's id, `pins`): the oldest it has yet to take, kept for the port's other readers until each has; None, or a reader that watches no such port: the oldest, taken for all, as before readers.
     fn udp_take(&mut self, port: u16, id: Option<u32>, out: &mut [u8]) -> usize {
-        let slot = id.and_then(|id| self.reader_slot(id, port));
-        let Some(i) = (0..QN).filter(|&i| self.takeable(i, port, slot)).min_by_key(|&i| self.q[i].seq) else { return 0 };
+        let who = self.who(id, port);
+        let slot = who.flatten();
+        let Some(i) = (0..QN).filter(|&i| self.takeable(i, port, who)).min_by_key(|&i| self.q[i].seq) else { return 0 };
         let waited = now().wrapping_sub(self.q[i].at);
         // The first four readers (port and id) in the window keep a measure; later ones are not counted.
         let who = id.unwrap_or(0);
@@ -2994,8 +3000,8 @@ impl Ip {
                     let c = &self.tcb[h.handle as usize];
                     c.state != h.state || c.state >= 3 || c.rx_len > 0
                 } else {
-                    let slot = h.id.and_then(|id| self.reader_slot(id, h.port));
-                    (0..QN).any(|i| self.takeable(i, h.port, slot))
+                    let who = self.who(h.id, h.port);
+                    (0..QN).any(|i| self.takeable(i, h.port, who))
                 };
             if ready {
                 self.answer(k, out);
@@ -3067,8 +3073,8 @@ impl Ip {
 
     /// Whether port `p` holds news for watch `w`: a datagram its reader (the watch's id, `pins`) has yet to take, numbered after the one it saw (any, in level mode).
     fn news_for(&self, w: &Watch, p: u16) -> bool {
-        let slot = self.reader_slot(w.id, p);
-        (0..QN).any(|i| self.takeable(i, p, slot) && (w.level || after(self.q[i].seq, w.seen)))
+        let who = self.who(Some(w.id), p);
+        (0..QN).any(|i| self.takeable(i, p, who) && (w.level || after(self.q[i].seq, w.seen)))
     }
 
     /// Watch `w`'s answer into `out`: [flags, the datagram told of up to (u32 BE), count, the ports holding one newer than it saw, or any in level mode (u16 BE each)]. While a person is present that number is the last datagram queued for anyone (`qseq`): every datagram of a watched port up to it is either named now or was named before. While nobody is present nothing of the ports, and the number is the one its caller saw, so what came meanwhile is named at the person's return.
