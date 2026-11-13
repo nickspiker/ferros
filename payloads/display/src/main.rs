@@ -28,7 +28,8 @@
 //! - 19 `text turned [cx i16][cy i16][px u16][colour][alpha u8][cos i16][sin i16][utf8…]`: text centred on (cx, cy), turned about it (Q14, positive sin clockwise), at opacity alpha (255 opaque): the settings' titles riding the circle.
 //! - 47 `button [cx i16][cy i16][w u16][h u16][px u16][fill][edge top-left][edge bottom-right][ink][utf8 label]` and 48 `slider [x0 i16][x1 i16][cy i16][track r u16 Q8][knob r u16 Q8][at u16 Q16][left][right][knob]`: fluor's button and slider as a page's elements (COMPOSITOR.md "Controls"), drawn like the page's text, in the front layer while a region is up.
 //! - 49 `radio` and 50 `check [cx i16][cy i16][px u16][mark u16][stroke u16 Q8][state u8][stroke colour][fill][ink][tick][utf8 label]`: a radio button or a checkbox with its label, centred together (COMPOSITOR.md "Controls").
-//! - 22 `app [x u16][y u16][w u16][h u16]`: the app in front's frame, its 16-bit pixels in the `app-surface` region (R, G, B in bits 0-15, 16-31, 32-47: working values, gamma 2, white = Q14; bit 48 = no dither), published at full precision; 23 `app done`: the screen is the map's again. Op 5's reply carries whether an app is in front (byte 12).
+//! - 22 `app [x u16][y u16][w u16][h u16]`: the app in front's frame, its 16-bit pixels in the `app-surface` region (R, G, B in bits 0-15, 16-31, 32-47; bit 48 = no dither), by the optional format byte: 0 working values (gamma 2, white = Q14), 1 fluor's G2T16, both baked by the display every frame; 2 `BAKED`, already the panel's codes (bake.rs), presented as they are; 23 `app done`: the screen is the map's again. Op 5's reply carries whether an app is in front (byte 12).
+//! - 65 `bake` → [0][generation u32][k f32][m 9 × f32][g f32]: the bake a `BAKED` surface is made with (bake.rs, ferros_sys `window::bake`); a change of it is each window's event `EV_BAKE` (op 62).
 //! - 21 `ramps [column u8]`: the present stage's test screen, or one column of it alone on black between two thin white lines (dithered bands: our 4×4 to 8 bits, 12 effective; undithered: the 8-bit truncation), straight from 16-bit working values (see `ramps`); status 3 when the pipe is not in 10 bits.
 //! - 56 `quick [offset i32][flags u8][torch level u8][held u8][unused u8][brightness ring u16 Q16][torch ring u16 Q16][unused u16]`: the quick row's state from the map (quick.rs `set`, docs/QUICK.md): its slide offset in whole pixels and its circles' looks, composed by the console's worker; answered at once with [0][the slide's length u16]. Op 41 answers the row's circles (32 + k, then x, y, r u16) while it is open, its doorway (10), the top's other ground (11) and behind it (12).
 //! - 27 `whose point` and 41 `what of the system's` read the hit map (hit.rs: a u16 a pixel, the owner the compose wrote there, front to back); 58 `hit view [0 off, 1 on, 2 toggle, 3 ask]` → [0][on]: the map shown in the fourth temporal phase, a new palette each redraw (development builds; status 1 on a release build).
@@ -43,6 +44,7 @@
 
 extern crate alloc;
 
+mod bake;
 mod draw;
 mod events;
 mod glyphs;
@@ -52,7 +54,7 @@ mod modeset;
 mod neon;
 mod odt;
 mod quick;
-use odt::{odt_tables, panel_gamma, pow};
+use odt::{panel_gamma, pow};
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -84,7 +86,7 @@ mod paint {
     pub fn fill_rect(c: &mut Canvas, x: isize, y: isize, w: isize, h: isize, colour: u32, _: Option<()>, _: Option<()>) {
         let (w, h) = (w.max(1), h.max(1));
         let (bx0, by0, bx1, by1) = draw::bounds(c.width, c.height);
-        let px = draw::at_coverage(colour & 0x00FF_FFFF, colour >> 24);
+        let px = draw::cover8(draw::opaque(colour & 0x00FF_FFFF), colour >> 24);
         for yy in (y as i64).max(by0)..((y + h) as i64).min(by1) {
             for xx in (x as i64).max(bx0)..((x + w) as i64).min(bx1) {
                 let p = &mut c.pixels[yy as usize * c.width + xx as usize];
@@ -1007,8 +1009,13 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
         return draw::disc(pixels, width, height, cx, cy, r, plate);
     }
     let (bx0, by0, bx1, by1) = draw::bounds(width, height);
-    // A point of the circle's frame at an opacity (0–1), spread over the four pixels around it by its distance to each (bilinear), under what is there.
+    // A point of the circle's frame at an opacity (0–1), spread over the four pixels around it by its distance to each (bilinear), under what is there. Its colour baked once while it stays the same from point to point (`memo`).
+    let memo = core::cell::Cell::new((u32::MAX, 0u64));
     let mut splat = |pixels: &mut [Px], u: f32, v: f32, colour: u32, a: f32| {
+        if memo.get().0 != colour {
+            memo.set((colour, draw::opaque(colour & 0x00FF_FFFF)));
+        }
+        let solid = memo.get().1;
         let (x, y) = (ox + tc * u - ts * v - 0.5, oy + ts * u + tc * v - 0.5);
         let (xf, yf) = (libm::floorf(x), libm::floorf(y));
         let (fx, fy) = (x - xf, y - yf);
@@ -1020,7 +1027,7 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
                 continue;
             }
             let p = &mut pixels[py_ as usize * width + px_ as usize];
-            *p = draw::under(*p, draw::at_coverage(colour & 0x00FF_FFFF, c.min(255)));
+            *p = draw::under(*p, draw::cover8(solid, c.min(255)));
         }
     };
     // A straight line in the circle's frame: points every half pixel, each carrying half the opacity, so a line's weight per pixel of length is `a` at any turn.
@@ -1580,7 +1587,8 @@ fn testcard(pixels: &mut [Px], width: usize, height: usize) {
             let c = if tick && (band == 3 || band == 4) { 0 } else { c };
             // The panel's peak, code 255, as a 12-pixel line between the halves: the reference both ramps' tops are judged against.
             let c = if y >= height / 2 - 6 && y < height / 2 + 6 { 255 } else { c };
-            pixels[y * width + x] = draw::opaque(c << 16 | c << 8 | c);
+            // The panel's code itself, baked as it is (bake.rs: the canvas holds the panel's codes, `code << 8`), no bake on it: the card is the panel's measured curve, applied above.
+            pixels[y * width + x] = 0xFFFF << 48 | (c as u64) << 8 | (c as u64) << 24 | (c as u64) << 40;
         }
     }
 }
@@ -1750,7 +1758,7 @@ fn brightness(v: u8) -> (f32, f32, bool, u16) {
     (white, native * e_light(), hbm, dbv)
 }
 
-/// The ordered 4×4 dither (Bayer), in sixteenths. The table's Q4 10-bit code is a Q6 8-bit code; the threshold (×4, in 64ths) is added before the six fraction bits are dropped, so each 4×4 cell (0.2 mm at 489 ppi) carries four bits below the 8-bit code the link takes: 12 bits effective. The DQE's own dither is in shift mode (kernel `start_home`), passing these 8 bits through untouched — two ordered dithers stacked partly cancelled into visible steps (owner's eyes, 2026-10-22).
+/// The old present's dither, kept for the ramps (op 21) and the start-up bench's "before" (the present's own since 2026-11-12 is neon.rs `BLUE` and `TURN`: a 16 × 16 blue-noise field of every 256th of a code, its two low bits turned each phase). The ordered 4×4 dither (Bayer), in sixteenths. The table's Q4 10-bit code is a Q6 8-bit code; the threshold (×4, in 64ths) is added before the six fraction bits are dropped, so each 4×4 cell (0.2 mm at 489 ppi) carries four bits below the 8-bit code the link takes: 12 bits effective. The DQE's own dither is in shift mode (kernel `start_home`), passing these 8 bits thru untouched: two ordered dithers stacked partly cancelled into visible steps (owner's eyes, 2026-10-22).
 const BAYER: [[u16; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
 /// A Q4 10-bit code (= Q6 8-bit) to the 10-bit word's code: dithered to 8 bits by the threshold `th` (0-63, in 64ths of an 8-bit step), the two low bits zero for the DQE's truncation.
@@ -1759,7 +1767,7 @@ fn dither8(q4: u32, th: u32) -> u32 {
     ((q4 + th) >> 6).min(255) << 2
 }
 
-/// The temporal dither (owner, 2026-10-22): four frames, flipped every 100 ms. Each pixel's threshold is its 4×4 Bayer level (4 bits, ×4) plus a temporal rank (2 bits) that differs from frame to frame, so over the four frames the pixel shows all 64 levels of the six fraction bits: 8-bit codes on the link, 14 bits effective. The rank's order is offset per 4×4 cell, so no frame is darker or lighter than another as a whole.
+/// The temporal dither (owner, 2026-10-22): four frames, flipped every 100 ms. The old one (the ramps' and the bench's; the present's since 2026-11-12 is neon.rs `TURN`): each pixel's threshold is its 4×4 Bayer level (4 bits, ×4) plus a temporal rank (2 bits) that differs from frame to frame, so over the four frames the pixel shows all 64 levels of the six fraction bits: 8-bit codes on the link, 14 bits effective. The rank's order is offset per 4×4 cell, so no frame is darker or lighter than another as a whole.
 const PHASES: usize = 4;
 const TEMPORAL_RANK: [u32; 4] = [0, 2, 1, 3];
 
@@ -1892,6 +1900,9 @@ fn pub_take(job: u64) {
         } else if unsafe { PUB_KIND } == 4 {
             // An app's publish (`publish_app_mask`): this stripe's rows into the phases.
             publish_app_rows(stripe, unsafe { &*(&raw const PUB_TABS) }, mask, w, h, unsafe { PUB_APP_HITS });
+        } else if unsafe { PUB_KIND } == 5 {
+            // The wallpaper baked again (a brightness change, `rebake`): this stripe's rows.
+            wall_rebake_rows(w, h, stripe.y0 as usize, stripe.y1 as usize);
         } else {
             let back = unsafe { core::slice::from_raw_parts(base as *const Px, w * h) };
             publish_band(back, w, h, unsafe { &*(&raw const PUB_TABS) }, mask, stripe);
@@ -1959,14 +1970,22 @@ fn publish10x4(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask:
     fps_dot(mask, width, height);
 }
 
-/// Blocks of 16 a row the codes scratch holds (`codes_row`): a power of two past the widest glass's (husky's 1344 columns, 84 blocks).
+/// Blocks of 16 a row the composed scratch holds (`codes_row`): a power of two past the widest glass's (husky's 1344 columns, 84 blocks).
 const CODES_BLOCKS: usize = 1 << 7;
-/// Each publishing thread's codes for one row's blocks (`codes_row`), set at start; non-zero initialiser (see `ALLOC`).
+/// Each publishing thread's composed blocks for one row (`codes_row`), set at start; non-zero initialiser (see `ALLOC`).
 static mut CODES_ROWS: usize = 1;
 
-/// This thread's codes scratch (`neon::Codes16`, a block of 16 each), by its place among the publish threads (`draw::thread_slot`: a worker by its stack, else the render thread, the last): a row's composed blocks worked out to their codes once, by the first phase a publish writes, and only dithered by the rest (`publish_band`, `publish_app_mask`).
-fn codes_row() -> &'static mut [neon::Codes16; CODES_BLOCKS] {
-    unsafe { &mut *((CODES_ROWS as *mut [neon::Codes16; CODES_BLOCKS]).add(draw::thread_slot())) }
+/// This thread's scratch of composed blocks (16 baked pixels each), by its place among the publish threads (`draw::thread_slot`: a worker by its stack, else the render thread, the last): a row's glass and bars blocks composed once, by the first phase a publish writes, and only presented by the rest (`publish_band`). Until the bake (2026-11-12) it held each block's codes, the ODT's work the phases shared; the codes are the pixels now.
+fn codes_row() -> &'static mut [[u64; 16]; CODES_BLOCKS] {
+    unsafe { &mut *((CODES_ROWS as *mut [[u64; 16]; CODES_BLOCKS]).add(draw::thread_slot())) }
+}
+
+/// Each publishing thread's rows for a chain of windows' layers, baked (`layer_row`), set at start; non-zero initialiser (see `ALLOC`). 43 KiB a thread: more than a worker's stack holds beside its row.
+static mut LAYER_ROWS: usize = 1;
+
+/// This thread's layer rows (`LAYER_ROWS`), by its place among the publish threads (`draw::thread_slot`).
+fn layer_rows() -> &'static mut [[u64; 1344]; SURFACES] {
+    unsafe { &mut *((LAYER_ROWS as *mut [[u64; 1344]; SURFACES]).add(draw::thread_slot())) }
 }
 
 /// The bars over the scene where the glass's edge and the camera hole's knockout are not (`glass_front` with no edge pixel): the bars' pixel `c` in front by `under_pm`, the scene `p` under it, or `p` as it came where the bars have nothing. A column of `[el, er)` (`edge_cols`) outside the hole's range has no edge pixel by `edge_cols`'s construction (every left edge pixel is left of `el`, every right one at `er` or past it), so this is exactly `glass_front` there, without its walk of the row's edge pixels (a pixel's walk, every pixel of the bars' blocks, in every phase: on the corner rows the walk is long).
@@ -1976,8 +1995,9 @@ fn bars_over(c: u64, p: u64) -> u64 {
 }
 
 /// The deck's rows into the phases `mask` names, each pixel front to back (`glass_front`): the glass's edge, then the console (its rows only), then the canvas. A 16-pixel step that touches neither is the canvas straight through the NEON present; one that does is composed first and goes through the app's present, which leaves the mask's own pixels undithered.
-/// Row by row, each row into every phase `mask` names (2026-11-11, owner on the Pro: "no reason we can't hit 120fps with a sliding console row"): a block of the glass or the bars is composed and worked out to its codes by the first phase that writes the row, and the others only dither those codes with their own thresholds (`codes_row`). Until then each phase composed and coded every such block again, four times over for the bars, whose changes go into all four.
-fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask: u32, r: draw::Rect) {
+/// Row by row, each row into every phase `mask` names (2026-11-11, owner on the Pro: "no reason we can't hit 120fps with a sliding console row"): a block of the glass or the bars is composed by the first phase that writes the row, and the others only present it with their own thresholds (`codes_row`). Until then each phase composed and coded every such block again, four times over for the bars, whose changes go into all four.
+/// Everything here is baked (bake.rs): the canvas, the wallpaper, the bars, the mask; a phase's words are the dither and the pack (neon.rs `present16`, `present_app16`), the ODT's work done before. `tabs` is the bake's ODT, for a flight's legacy needs only.
+fn publish_band(back: &[Px], width: usize, height: usize, _tabs: &neon::Odt, mask: u32, r: draw::Rect) {
     if r.is_empty() || RAW_HOLD.load(Ordering::Acquire) == 1 {
         return;
     }
@@ -1998,6 +2018,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
     let (hx0, hx1) = (r.x0 as usize, r.x1 as usize);
     let view = hit::view();
     let codes = codes_row();
+    let cm = neon::Chans::new(CHANNELS.load(Ordering::Relaxed));
     for y in r.y0 as usize..r.y1 as usize {
         // The row's edge: its masked columns and its listed edge pixels, as the columns from the left and from the right that need it.
         let g = &rows[y];
@@ -2024,18 +2045,16 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                 }
                 continue;
             }
-            let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
+            let (t0, t1) = neon::row_thresholds(y, k);
             let t_n = now();
             if let Some(f) = &flight {
                 unsafe {
-                    let thv = core::arch::aarch64::vld1q_u8(th.as_ptr());
-                    flight_publish_row(f, back.as_ptr(), width, height, tabs, k, y, x0, x1, wall, clean, clean_w, &mut row, dst, g, edge_px, (el, er, cl, cr), bw, thv);
+                    flight_publish_row(f, back.as_ptr(), width, height, k, y, x0, x1, wall, clean, clean_w, &mut row, dst, g, edge_px, (el, er, cl, cr), bw, (t0, t1, cm));
                     PUB_TICKS[0] += now() - t_n;
                 }
                 continue;
             }
             unsafe {
-                let thv = core::arch::aarch64::vld1q_u8(th.as_ptr());
                 let src = back.as_ptr().add(y * width);
                 // What the block skip asks: the canvas, or with a region up its front layer.
                 let ask = if text_layer != 0 { (text_layer as *const Px).add(y * width) } else { src };
@@ -2065,10 +2084,10 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                         continue;
                     }
                     PUB_BLOCKS[if any == 0 { 1 } else { 2 }] += 1;
-                    // A glass block an earlier phase of this row composed: its codes, dithered with this phase's thresholds.
+                    // A glass block an earlier phase of this row composed: presented with this phase's thresholds.
                     if glass && have {
                         clean[ci] &= !(bit | wbit);
-                        neon::dither_codes(&codes[x / 16], neon::thresholds_at(thv, x), row.as_mut_ptr().add(x));
+                        neon::present_app16(codes[x / 16].as_ptr(), row.as_mut_ptr().add(x), t0, t1, cm);
                         x += 16;
                         continue;
                     }
@@ -2097,7 +2116,7 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                     };
                     if glass {
                         clean[ci] &= !(bit | wbit);
-                        let mut front = [0u64; 16];
+                        let front = &mut codes[x / 16];
                         for j in 0..16 {
                             let xx = x + j;
                             let c = if xx >= cl && xx < cr { bw[xx] } else { CLEAR };
@@ -2105,11 +2124,9 @@ fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask
                             let p = *scene_at.add(j) & ((1 << 48) - 1);
                             front[j] = if xx >= el && xx < er && !(xx >= hl && xx < hr) { bars_over(c, p) } else { glass_front(xx, g, edge_px, c, p) };
                         }
-                        let c = &mut codes[x / 16];
-                        *c = neon::codes_app(tabs, front.as_ptr());
-                        neon::dither_codes(c, neon::thresholds_at(thv, x), row.as_mut_ptr().add(x));
+                        neon::present_app16(front.as_ptr(), row.as_mut_ptr().add(x), t0, t1, cm);
                     } else {
-                        neon::sixteen_canvas(tabs, scene_at as *const Px, row.as_mut_ptr().add(x), thv);
+                        neon::present16(scene_at as *const Px, row.as_mut_ptr().add(x), t0, t1, cm);
                         // The background alone, or not; and a region's clean window with no text, or not (off the region, the mode's bit says nothing).
                         let b = if bare { wbit } else { 0 } | if text_layer != 0 && any == 0 { bit } else { 0 };
                         clean[ci] = clean[ci] & !(bit | wbit) | b;
@@ -2348,11 +2365,12 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
                 let (bx0, by0, bx1, by1) = draw::bounds(width, height);
                 // The opacity as a Q16 factor on each glyph sample's coverage: 255 is 65536, the coverage itself.
                 let k = alpha * 257 + 1;
+                let solid = draw::opaque(colour(7));
                 g.cover(t, cx + tc * fx - ts * fy, cy + ts * fx + tc * fy, size, (tc, ts), |sx, sy, a| {
                     // WHY the test: a turned title's pixels come from its layout and can fall past the screen's or the clip's edge; outside them the index is another row or past the buffer.
                     if sx >= bx0 && sy >= by0 && sx < bx1 && sy < by1 {
                         let p = &mut px[sy as usize * width + sx as usize];
-                        *p = draw::under(*p, draw::at_cover16(colour(7), a * k >> 16));
+                        *p = draw::under(*p, draw::cover(solid, a * k >> 16));
                     }
                 });
                 ALLOC.reset();
@@ -2382,7 +2400,7 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
                     let mut d = Damage::new();
                     let mut c = Canvas::new(px, width, height, &mut d);
                     text(&mut c, &Font, t, cx as f32 - tw * 0.5, cy as f32 + size * 0.36, size, 0xFF00_0000 | colour(23));
-                    // Then the pill under it, drawn by fluor's own squircle kernels into a scratch the pill's size in fluor's 16-bit α + darkness, the colours as darkness of the display's gamma-2 codes (fluor's blends are linear, so the convention carries them), and each pixel brought over as premultiplied light (α − darkness, 65280 the code 255 at full α: white, Q14) under what is there.
+                    // Then the pill under it, drawn by fluor's own squircle kernels into a scratch the pill's size in fluor's 16-bit α + darkness. Its three colours go in as three channels (the fill pure red, the edge's two tones pure green and pure blue): fluor's blends are linear, so each pixel's light comes out as how much of each colour it holds (α − darkness, 65280 whole), and the pixel is that mix of the three colours baked (bake.rs), premultiplied, under what is there. The shape is fluor's to the pixel, the colours the bake's.
                     let (wu, hu) = (w as usize, h as usize);
                     let mut buf = alloc::vec![0u64; wu * hu];
                     {
@@ -2394,10 +2412,11 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
                         let (wi, hi, ei) = (w as isize, h as isize, e as isize);
                         // The fill first, in front, one edge's width inside; then the edge ring under it.
                         if wi > 2 * ei && hi > 2 * ei {
-                            sq::draw_squircle_rrect(&mut fc, ei, ei, wi - 2 * ei, hi - 2 * ei, dark(colour(11)), sq::asymmetric_radii((h - 2 * e) as f32 * 0.5), sq::SHAPE_POWER);
+                            sq::draw_squircle_rrect(&mut fc, ei, ei, wi - 2 * ei, hi - 2 * ei, dark(0xFF_0000), sq::asymmetric_radii((h - 2 * e) as f32 * 0.5), sq::SHAPE_POWER);
                         }
-                        sq::draw_squircle_rrect_two_tone(&mut fc, 0, 0, wi, hi, dark(colour(15)), dark(colour(19)), sq::asymmetric_radii(h as f32 * 0.5), sq::SHAPE_POWER, None, 0);
+                        sq::draw_squircle_rrect_two_tone(&mut fc, 0, 0, wi, hi, dark(0x00_FF00), dark(0x00_00FF), sq::asymmetric_radii(h as f32 * 0.5), sq::SHAPE_POWER, None, 0);
                     }
+                    let tones = [draw::opaque(colour(11)), draw::opaque(colour(15)), draw::opaque(colour(19))];
                     for y in seen.y0..seen.y1 {
                         let (row, src) = (y as usize * width, (y as i64 - y0) as usize * wu);
                         for x in seen.x0..seen.x1 {
@@ -2406,10 +2425,11 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
                             if a == 0 {
                                 continue;
                             }
-                            // Light from darkness, channel by channel (fluor's R is bits 32-47, the display's bits 0-15). Darkness never exceeds α here: the scratch is fluor's own drawing, and its `under` keeps darkness ≤ α.
-                            let l = |sh: u32| (a - (p >> sh & 0xFFFF)) * 16384 / 65280;
+                            // Each colour's share from darkness, channel by channel (fluor's R is bits 32-47). Darkness never exceeds α here: the scratch is fluor's own drawing, and its `under` keeps darkness ≤ α. A colour whole is 65280 of light (fluor widens a dark byte d to 256·d + 255, `from_g2t8`), and the three shares sum to at most α × 65280 / 65535, so no channel passes its colour's code.
+                            let w = [32u32, 16, 0].map(|sh| a - (p >> sh & 0xFFFF));
+                            let mix = |sh: u32| (0..3).map(|i| (tones[i] >> sh & 0xFFFF) * w[i]).sum::<u64>() / 65280 << sh;
                             let q = &mut px[row + x as usize];
-                            *q = draw::under(*q, a << 48 | l(32) | l(16) << 16 | l(0) << 32);
+                            *q = draw::under(*q, a << 48 | mix(0) | mix(16) | mix(32));
                         }
                     }
                     drop(buf);
@@ -2492,6 +2512,7 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
                         }
                     }
                     let (bx0, by0, bx1, by1) = draw::bounds(width, height);
+                    let (inside, edge) = (draw::opaque(if filled { colour(16) } else { 0 }), draw::opaque(colour(12)));
                     // WHY the bounds: the box is placed by the page and may run past the screen or the redraw's clip; outside them the index is another row or past the buffer.
                     for y in y0.max(by0)..(y0 + mk).min(by1) {
                         for x in x0.max(bx0)..(x0 + mk).min(bx1) {
@@ -2500,11 +2521,11 @@ fn page_op(m: &[u8], px: Option<&mut [Px]>, width: usize, height: usize) -> Opti
                             let q = &mut px[y as usize * width + x as usize];
                             // The inside: the fill when checked, else black (owner, 2026-11-08: "background for radio and checkbox should be black, not dk grey").
                             if ai != 0 {
-                                *q = draw::under(*q, draw::at_cover16(if filled { colour(16) } else { 0 }, ai));
+                                *q = draw::under(*q, draw::cover(inside, ai));
                             }
                             // The inner squircle lies inside the outer, so its coverage never passes the outer's.
                             if ao > ai {
-                                *q = draw::under(*q, draw::at_cover16(colour(12), ao - ai));
+                                *q = draw::under(*q, draw::cover(edge, ao - ai));
                             }
                         }
                     }
@@ -2735,6 +2756,7 @@ fn stripes(kind: u8, base: usize, width: usize, height: usize, r: draw::Rect) {
             match kind {
                 1 => scene_stripe(core::slice::from_raw_parts_mut(base as *mut Px, width * height), width, height, r),
                 2 => hit::stripe(width, height, r),
+                5 => wall_rebake_rows(width, height, r.y0 as usize, r.y1 as usize),
                 _ => hit::paint_stripe(width, r),
             }
             return;
@@ -2928,7 +2950,7 @@ unsafe fn flight_half(f: &FlightFrame, ps: &FlightSpan, ls: &FlightSpan, _canvas
     }
 }
 
-/// Each publishing thread's scratch for a flight frame: two half-resolution rows (the pair's top row and the next pair's, which the odd row between them is the mean of), each its pixels (672), its codes (`neon::codes8`, 6 words a block, 84 blocks), each block's kind and a tag (the frame and the row it holds). The workers' by their stacks, the render thread's last.
+/// Each publishing thread's scratch for a flight frame: two half-resolution rows (the pair's top row and the next pair's, which the odd row between them is the mean of), each its pixels (672), its codes (`neon::lanes8`: the samples' channels as planes, 6 words a block, 84 blocks), each block's kind and a tag (the frame and the row it holds). The workers' by their stacks, the render thread's last.
 const FLIGHT_SLOT: usize = 672 + 84 * 6 + 84 + 1;
 const FLIGHT_SCRATCH: usize = 2 * FLIGHT_SLOT;
 /// Counts flight frames, for the scratch rows' tags.
@@ -2944,8 +2966,8 @@ fn flight_row_buf() -> &'static mut [u64; FLIGHT_SCRATCH] {
 /// Sixteen zero pixels: a block of black, as the canvas path presents it.
 static ZERO16: [u64; 16] = [0; 16];
 
-/// One half-resolution row of a flight frame into a scratch slot (`FLIGHT_SLOT`): each block's eight samples composed (`flight_half`) and their codes (`neon::codes8`), and whether the block has anything of either image.
-unsafe fn flight_codes(f: &FlightFrame, canvas: *const u64, width: usize, height: usize, tabs: &neon::Odt, wall: usize, y: usize, x0: usize, x1: usize, slot: &mut [u64]) {
+/// One half-resolution row of a flight frame into a scratch slot (`FLIGHT_SLOT`): each block's eight samples composed (`flight_half`) and their codes (`neon::lanes8`), and whether the block has anything of either image.
+unsafe fn flight_codes(f: &FlightFrame, canvas: *const u64, width: usize, height: usize, wall: usize, y: usize, x0: usize, x1: usize, slot: &mut [u64]) {
     use core::arch::aarch64::vst1q_u16;
     unsafe {
         let t_s = now();
@@ -2960,7 +2982,7 @@ unsafe fn flight_codes(f: &FlightFrame, canvas: *const u64, width: usize, height
             kinds[bi] = (any != 0) as u64;
             if any != 0 {
                 hrow[x / 2..x / 2 + 8].copy_from_slice(&h);
-                let c = neon::codes8(tabs, h.as_ptr());
+                let c = neon::lanes8(h.as_ptr());
                 let at = codes.as_mut_ptr().add(bi * 6) as *mut u16;
                 for (i, v) in c.iter().enumerate() {
                     vst1q_u16(at.add(i * 8), *v);
@@ -2972,9 +2994,9 @@ unsafe fn flight_codes(f: &FlightFrame, canvas: *const u64, width: usize, height
     }
 }
 
-/// One row of a flight frame into phase k (COMPOSITOR.md "The flight, prerendered"), at half resolution made smooth: the images are sampled and their light, ODT and code worked out once each two columns of each second row (`flight_codes`), and each row's codes are spread linearly between them (an odd column the mean of its neighbours, an odd row the mean of the rows above and below), so the half resolution shows no blocks; each row then only dithers and packs with its own thresholds. A block where neither image has anything shows only the wallpaper (or black), at full resolution: skipped where the phase already holds just that (its compose-once bit), else presented from the wallpaper itself. The glass's edge and the bars go in front per pixel, as on every deck row. `edges` is the row's (el, er, cl, cr) as `publish_band` works them out.
+/// One row of a flight frame into phase k (COMPOSITOR.md "The flight, prerendered"), at half resolution made smooth: the images are sampled once each two columns of each second row (`flight_codes`; baked, their codes are the samples), and each row's codes are spread linearly between them (an odd column the mean of its neighbours, an odd row the mean of the rows above and below), so the half resolution shows no blocks; each row then only dithers and packs with its own thresholds. A block where neither image has anything shows only the wallpaper (or black), at full resolution: skipped where the phase already holds just that (its compose-once bit), else presented from the wallpaper itself. The glass's edge and the bars go in front per pixel, as on every deck row. `edges` is the row's (el, er, cl, cr) as `publish_band` works them out.
 #[inline(never)]
-unsafe fn flight_publish_row(f: &FlightFrame, canvas: *const u64, width: usize, height: usize, tabs: &neon::Odt, k: usize, y: usize, x0: usize, x1: usize, wall: usize, clean: &mut [u8], clean_w: usize, row: &mut [u32; 1344], dst: &mut [u32], g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], edges: (usize, usize, usize, usize), bw: &[u64], thv: core::arch::aarch64::uint8x16_t) {
+unsafe fn flight_publish_row(f: &FlightFrame, canvas: *const u64, width: usize, height: usize, k: usize, y: usize, x0: usize, x1: usize, wall: usize, clean: &mut [u8], clean_w: usize, row: &mut [u32; 1344], dst: &mut [u32], g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], edges: (usize, usize, usize, usize), bw: &[u64], th: (core::arch::aarch64::uint16x8_t, core::arch::aarch64::uint16x8_t, neon::Chans)) {
     use core::arch::aarch64::{uint16x8_t, vdupq_laneq_u16, vld1q_u16, vrhaddq_u16};
     unsafe {
         let scratch = flight_row_buf();
@@ -2987,7 +3009,7 @@ unsafe fn flight_publish_row(f: &FlightFrame, canvas: *const u64, width: usize, 
             let s = core::slice::from_raw_parts_mut(base.add((ty >> 1 & 1) * FLIGHT_SLOT), FLIGHT_SLOT);
             let tag = seq << 16 | ty as u64;
             if s[FLIGHT_SLOT - 1] != tag {
-                flight_codes(f, canvas, width, height, tabs, wall, ty, x0, x1, s);
+                flight_codes(f, canvas, width, height, wall, ty, x0, x1, s);
                 s[FLIGHT_SLOT - 1] = tag;
             }
             s.as_ptr()
@@ -3040,17 +3062,17 @@ unsafe fn flight_publish_row(f: &FlightFrame, canvas: *const u64, width: usize, 
                     let p = if cur.is_some() { *h.add(xx / 2) } else if wall != 0 { *(wall as *const u64).add(y * width + xx) } else { 0 };
                     front[j] = glass_front(xx, g, edge_px, c, p & ((1 << 48) - 1));
                 }
-                neon::sixteen_app(tabs, front.as_ptr(), row.as_mut_ptr().add(x), neon::thresholds_at(thv, x));
+                neon::present_app16(front.as_ptr(), row.as_mut_ptr().add(x), th.0, th.1, th.2);
                 clean[ci] &= !(bit | wbit);
             } else if let Some(c) = cur {
                 // Spread toward the next block's first codes, or held at this block's last where it has none.
                 let n = nxt.unwrap_or([vdupq_laneq_u16::<7>(c[0]), vdupq_laneq_u16::<7>(c[1]), vdupq_laneq_u16::<7>(c[2])]);
-                neon::dither_pack(neon::spread16(c, n), thv, row.as_mut_ptr().add(x));
+                neon::present_pack(neon::spread16(c, n), th.0, th.1, th.2, row.as_mut_ptr().add(x));
                 clean[ci] &= !(bit | wbit);
             } else {
                 // Only the wallpaper (or black) here, which this phase does not hold yet: presented at full resolution, and then it does.
                 let src = if wall != 0 { (wall as *const u64).add(y * width + x) } else { ZERO16.as_ptr() };
-                neon::sixteen_canvas(tabs, src, row.as_mut_ptr().add(x), thv);
+                neon::present16(src, row.as_mut_ptr().add(x), th.0, th.1, th.2);
                 clean[ci] = clean[ci] & !bit | wbit;
             }
             x += 16;
@@ -3106,7 +3128,7 @@ const SURFACE_BYTES: usize = 32 << 20;
 /// The porch before each surface's pixel 0 (the kernel's SURFACE_PORCH): clients name their surface by its address past it.
 const PORCH: usize = 64;
 /// A window (WINDOWS.md), one per surface: the surface's generation when it was shown (the kernel's preference bytes 8-11; a change or a 0 means its process ended), its level (0 an app, 1 input, 2 the system: higher is in front), when it was last shown (later is in front within a level), and the part of the screen it covers. Outside its rectangle, and wherever a pixel has `CLEAR` set, what is behind it shows.
-/// Its surface's `format` says what its pixels are (op 22's optional last byte): 0 the display's own working values (gamma 2, white = Q14, bit 63 see-through); 1 fluor's 16-bit `g2t` (`G2T16`), which the display decodes itself so a fluor app hands its buffer over as it drew it (owner, 2026-10-29: fluor the one compositor, passed straight through).
+/// Its surface's `format` says what its pixels are (op 22's optional last byte): 0 the display's own working values (gamma 2, white = Q14, bit 63 see-through); 1 fluor's 16-bit `g2t` (`G2T16`), which the display decodes itself so a fluor app hands its buffer over as it drew it (owner, 2026-10-29: fluor the one compositor, passed straight through); 2 `BAKED`, the panel's own codes (bake.rs). The first two are baked by the display every frame (`layer_row`), the third presented as it is.
 #[derive(Clone, Copy)]
 struct Win {
     generation: u8,
@@ -3123,25 +3145,12 @@ struct Win {
 }
 /// A surface of fluor's 16-bit pixels (fluor `pixel::G2t16`): α in bits 48-63, then each channel's darkness (the top code less the channel's VSF `g2t` code, scaled by α) in bits 32-47 (R), 16-31 (G) and 0-15 (B); α 0 is see-through.
 const G2T16: u8 = 1;
-/// A 16-bit `g2t` code's working value, `16384 × atanh(code / 2¹⁶)` (VSF: light = atanh(code / 2ⁿ)², and gamma 2 is its root), every code, built once at start; the top 79 codes decode past the working value's 4.0 and stop there. Fluor's own present for the display (fluor host/panel.rs `q14_from_g2t16`) is this table.
-static mut G2T16_Q14: *const u16 = core::ptr::null();
-
-/// A surface pixel as the display's working value, by its window's format: its own unchanged; a G2T16 one composited over black, thru `G2T16_Q14`, and α 0 see-through. fluor's pixels hold premultiplied darkness (`under` deposits darkness × α, so darkness ≤ α): what is still transparent is white in darkness space until something is put under it, and black under it adds darkness 1 − α, so the light over black is α − darkness, channel by channel. (Until 2026-11-07 this took the darkness as straight, (1 − darkness) × α: right only where α is whole, and every partly covered pixel came out too bright, a bright fringe on every translucent edge.)
+/// A surface already in the panel's codes (bake.rs; COMPOSITOR.md "Baked"): R, G, B in bits 0-15, 16-31, 32-47 as the canvas holds them (the panel's own codes in Q16 of its top, premultiplied), then the flags a working surface has: bit 63 see-through, bits 49-62 the transparency (Q14), bit 48 no dither. Composed and presented as they are: no per-pixel bake (2026-11-12: what a full-screen GPU app's frame cost the display).
+const BAKED: u8 = ferros_sys::window::BAKED;
+/// A working (or baked) surface's pixel as it composes: see-through is clear whatever its channels hold (a client clears by the bit alone and may leave old values under it); the fold adds channels, so they must be nothing. A fluor (`G2T16`) pixel is decoded and baked by the row (bake.rs `g2t_row`, `layer_row`): its light over black is α − darkness, channel by channel (fluor's pixels hold premultiplied darkness: `under` deposits darkness × α, so darkness ≤ α), and α 0 is see-through. (Until 2026-11-07 the darkness was taken as straight, (1 − darkness) × α: right only where α is whole, and every partly covered pixel came out too bright, a bright fringe on every translucent edge.)
 #[inline]
-fn working(p: u64, format: u8) -> u64 {
-    if format != G2T16 {
-        // A see-through working pixel is clear whatever its channels hold (a client clears by the bit alone and may leave old values under it); the fold adds channels, so they must be nothing.
-        return if p >> 63 != 0 { CLEAR } else { p };
-    }
-    let a = p >> 48;
-    if a == 0 {
-        return CLEAR;
-    }
-    let t = unsafe { core::slice::from_raw_parts(G2T16_Q14, 1 << 16) };
-    // WHY the saturating subtract: a G2T16 window is another process's memory, and darkness ≤ α is the invariant fluor's `under` keeps for it, not one the display can prove; a pixel breaking it would underflow into an index past the table and take the display server down for every app. Kept pixels decode exactly.
-    let ch = |sh: u32| t[a.saturating_sub(p >> sh & 0xFFFF) as usize] as u64;
-    // Its transparency, Q14 in bits 49-62 (`trans`), so a chain can fold what is behind it by what its alpha left; a working surface's own pixels carry only the bit.
-    ch(32) | ch(16) << 16 | ch(0) << 32 | (16384 - (a >> 2)) << 49
+fn working(p: u64) -> u64 {
+    if p >> 63 != 0 { CLEAR } else { p }
 }
 static mut WINS: [Option<Win>; SURFACES] = [None; SURFACES];
 static mut RAISES: u32 = 0;
@@ -3434,6 +3443,7 @@ fn trans(p: u64) -> u64 {
 
 /// One layer folded under the composite so far (`acc` with transparency `t`), as fluor's `Blend::under` does it front to back, on the working values: each channel gains the mode's value of (composite, layer) by what the layer's alpha fills of what was still transparent, and the transparency is the product. The mode is the one of the layer above (how that layer sits on what is beneath it). Modes are defined against white (Q14 16384) as fluor's are against the top code; brighter working values (the canvas goes to four times white) are taken as the math gives, and a channel saturates at the field: 16 bits is what a working value holds, and Add past the field is the mode's own definition, as fluor's Add saturates at its one.
 /// The composite `acc` is premultiplied (what is still transparent is black), and so is the layer: `working` decodes a fluor pixel as its light over black, α − darkness. fluor's `under` takes its top as the accumulated value and its bottom's colour straight (the bottom's α comes in once, through `consumed`), so the mode here sees the layer straight, b / α with α = 1 − its transparency, and its value is deposited by t · α. Written out, mode(a, b / α) · α is fluor's `visible` on (a · α, b) with α itself as the unit, the same function scaled: Normal gives b, Multiply a·b, Screen α − (1 − a)(α − b), Add a·α + b and so on, so no division by α is ever taken and Normal is exactly `acc + b · t`, `under_pm`. (Until 2026-11-07 the layer went in as it was decoded, premultiplied, and was multiplied by its α again: a translucent fluor window behind another came out too dark, and the other modes ran on premultiplied colour.) A working surface's pixel is opaque or see-through, α 1 or nothing, so it folds exactly as before.
+/// Baked (bake.rs), the modes other than Normal are taken against the bake's own white (`Bake::white`, a channel's code for white): the codes go into the mode as Q14 of white and come back by it, so Multiply by white is still no change. Normal needs no unit (it is `b`) and takes no division.
 #[inline]
 fn fold(acc: u64, t: u64, p: u64, mode: u8) -> (u64, u64) {
     let tp = trans(p);
@@ -3443,15 +3453,39 @@ fn fold(acc: u64, t: u64, p: u64, mode: u8) -> (u64, u64) {
     if la == 0 {
         return (acc, t);
     }
-    let ch = |sh: u32| -> u64 {
+    let normal = mode & MODE_MASK == 0;
+    let white = bake::now().white;
+    let ch = |sh: u32, c: usize| -> u64 {
         let (a, b) = ((acc >> sh & 0xFFFF) as i64, (p >> sh & 0xFFFF) as i64);
         // The mode's value on the composite and the straight layer, times the layer's α: fluor's one definition of the eight modes (BlendMode::visible) with the layer's α as its white.
-        let m = fluor::pixel::BlendMode::from_byte(mode).visible(a * la as i64 >> 14, b, la as i64);
+        let m = if normal {
+            b
+        } else {
+            // No guard on the divisor: white's code is the bake's, and at the dimmest the slider reaches (white 1/64 of its E peak, `brightness`) it is still about 9800 of 65472 on every channel.
+            let w = white[c] as i64;
+            fluor::pixel::BlendMode::from_byte(mode).visible((a * la as i64 >> 14) * 16384 / w, b * 16384 / w, la as i64) * w / 16384
+        };
         let v = a + (m * t as i64 >> 14);
         (if v < 0 { 0 } else if v > 0xFFFF { 0xFFFF } else { v } as u64) << sh
     };
     let t2 = (t * tp) >> 14;
-    ((acc & 1 << 48) | ch(0) | ch(16) | ch(32) | t2 << 49 | if t2 == 16384 { 1 << 63 } else { 0 }, t2)
+    ((acc & 1 << 48) | ch(0, 0) | ch(16, 1) | ch(32, 2) | t2 << 49 | if t2 == 16384 { 1 << 63 } else { 0 }, t2)
+}
+
+/// Window layer (surface `k`, its `format`) row `y`, columns `a..b`, into `out[a..b]` as baked pixels with their transparency (bits 49-62; the see-through bit, a see-through pixel's channels nothing whatever the client left under the bit): a baked surface's (`BAKED`) as they are, a working one's (format 0) and fluor's (`G2T16`) baked here, every frame (bake.rs): the work a baked surface spares the display.
+fn layer_row(k: usize, format: u8, y: usize, a: usize, b: usize, width: usize, height: usize, out: &mut [u64]) {
+    let src = &window_pixels(k, width, height)[y * width + a..y * width + b];
+    let dst = &mut out[a..b];
+    if format == G2T16 {
+        bake::now().g2t_row(src, dst);
+        return;
+    }
+    for (d, &p) in dst.iter_mut().zip(src) {
+        *d = if p >> 63 != 0 { CLEAR } else { p };
+    }
+    if format != BAKED {
+        bake::now().working_row(dst);
+    }
 }
 
 /// The glass's own corner radius, in panel pixels: a fact of this panel to be tuned on the device (owner, 2026-11-02: "we'll fine tune the radius on this device to squeeze as much out of it"). Android reports 68 at its 1008-wide frame, 91 at the full raster. Tuned by eye to 80; then measured (owner, 2026-11-08, tools/cutout-scan, counting a pixel dead unless it shows pure white: the top-left and bottom-left corners row by row, mirror images of each other and each symmetric about its diagonal): the smallest glass radius whose mask covers every dead pixel whole at the small corners is 80.5 (80 left a few uncovered; the big corners alone would need about 40).
@@ -3595,32 +3629,24 @@ fn dev_look() -> bool {
 }
 /// Outside the screen's edge: black on release; on development builds an orange (full red over the root of two, green at half: VSF RGB codes, half the light of full orange at gamma 2), so a dev image is told at a glance and the mask is still a mask. The edge's hairline is drawn in it too (`glass_front`).
 /// Two stops darker since 2026-11-09 (owner: "a bit bright and makes it hard to compose"): a quarter of the light, half the working value (gamma 2), red full over 2√2 and green a quarter.
-const EDGE_ORANGE: u64 = 1 << 48 | 11585 >> 1 | (8192 >> 1) << 16;
+/// The orange's working values (VSF RGB, gamma 2, white at Q14): red at full over 2√2, green a quarter.
+const EDGE_ORANGE_V: [u16; 3] = [11585 >> 1, 8192 >> 1, 0];
+/// The orange baked (bake.rs), bit 48 (no dither) with it: set with every bake (`bake_consts`), read per pixel of the glass's edge.
+static EDGE_ORANGE: AtomicU64 = AtomicU64::new(1 << 48);
 /// The mask's colour now: the orange in the development look, black (no dither) otherwise.
 #[inline(always)]
 fn edge_mask() -> u64 {
-    if dev_look() { EDGE_ORANGE } else { 1 << 48 }
+    if dev_look() { EDGE_ORANGE.load(Ordering::Relaxed) } else { 1 << 48 }
+}
+/// The bake's constants the publish reads per pixel, made again with each bake (`bake::set`'s caller): the edge's orange.
+fn bake_consts() {
+    let v = EDGE_ORANGE_V.map(|c| c as f32 * (1. / 16384.));
+    EDGE_ORANGE.store(1 << 48 | bake::now().px(v), Ordering::Relaxed);
 }
 
 /// The panel's channels (owner, 2026-11-11: "a channel picker in debug that enables/disables red/green/blue of the panel output so I can look at channels"): bit 0 red, 1 green, 2 blue, set = on; all on from the start and after every restart, never stored. Op 59 (the Developer page's three checkboxes) sets it; development builds only. An off channel is code 0 on every pixel the panel gets, in every phase: the console, the windows, the map, a flight, the hit map's view and the test patterns alike.
-/// Where: the ODT's matrix row for that panel channel is zeroed (`odt_masked`), so its light is 0 before the output table, the table's code for 0 is 0, and the dither's threshold (at most 63, under one step of 64) never lifts it: code 0, exactly, at no cost a pixel (the table is rebuilt once when the mask changes, as for a brightness). The words written without the ODT (`pack10`: the hit map's view, the patterns; the dev dot; the 8 bpc path) take the mask as one AND a word.
+/// Where: in the present, each dithered code ANDed with its channel's byte mask before the pack (neon.rs `Chans`, `present_pack`), three instructions per 16 pixels; until the bake (2026-11-12) the ODT's matrix row was zeroed and the table rebuilt, which a baked canvas no longer passes through. The words written without the present (`pack10`: the hit map's view, the patterns; the dev dot; the 8 bpc path) take the mask as one AND a word.
 static CHANNELS: AtomicU32 = AtomicU32::new(7);
-/// The ODT's tables for a white and its peak (odt.rs `odt_tables`), each panel channel the mask has off zeroed in the matrix (`CHANNELS`): its row of E's gains and of K (c0 lanes 0, 3, 4 red; 1, 5, 6 green; 2, 7 and c1 lane 0 blue), so p = 0 for that channel whatever the pixel.
-fn odt_masked(white: f32, peak_e: f32) -> neon::Odt {
-    let mut t = odt_tables(white, peak_e);
-    let m = CHANNELS.load(Ordering::Acquire);
-    use core::arch::aarch64::*;
-    // A lane kept whole (G#FFFF) where its channel is on, zeroed where it is off: the bit's two's complement.
-    let on = |c: u32| ((m >> c & 1) as u16).wrapping_neg();
-    let (r, g, b) = (on(0), on(1), on(2));
-    let lanes0 = [r, g, b, r, r, g, g, b];
-    let lanes1 = [b, 0, 0, 0, 0, 0, 0, 0];
-    unsafe {
-        t.c0 = vandq_u16(t.c0, vld1q_u16(lanes0.as_ptr()));
-        t.c1 = vandq_u16(t.c1, vld1q_u16(lanes1.as_ptr()));
-    }
-    t
-}
 /// The mask as a 10-bit word's (B[31:22] G[21:12] R[11:2] A[1:0]): each channel's ten bits where it is on, the alpha bits always.
 #[inline(always)]
 fn word_mask() -> u32 {
@@ -3881,17 +3907,18 @@ fn chrome_rows(width: usize, height: usize) -> (usize, usize) {
 }
 
 /// The hairline's colour (owner, 2026-11-02). Release builds: standard-illuminant-E grey (equal VSF RGB codes) one stop darker than the theme's ring: the ring's photopic light (VSF RGB's weights, as vsf::colour::convert::vsf_rgb_to_photopic_f32 has them: R 0.2584, G 0.6346, B 0.1070, on gamma-2 codes) halved, back to a code. Development builds: bright orange in VSF RGB, full red, half-light green, no blue, so a dev image is told at a glance.
+/// Baked (bake.rs) from its working values, once per publish.
 fn hairline() -> u64 {
-    if !dev_look() {
-        let ring = draw::opaque(ferros_sys::theme::current().ring);
-        let lin = |sh: u32| { let c = (ring >> sh & 0xFFFF) as f32 * (1.0 / 16384.0); c * c };
-        let light = 0.2584 * lin(0) + 0.6346 * lin(16) + 0.1070 * lin(32);
-        let code = (libm::sqrtf(light * 0.5) * 16384.0) as u64;
-        1 << 63 | code | code << 16 | code << 32
+    let v = if !dev_look() {
+        let ring = ferros_sys::theme::current().ring;
+        let lin = |sh: u32| { let c = (ring >> sh & 0xFF) as f32 * (1.0 / 255.0); c * c };
+        let light = 0.2584 * lin(16) + 0.6346 * lin(8) + 0.1070 * lin(0);
+        let code = libm::sqrtf(light * 0.5);
+        [code; 3]
     } else {
-        let g = (libm::sqrtf(0.5) * 16384.0) as u64;
-        1 << 63 | 16384 | g << 16
-    }
+        [1., libm::sqrtf(0.5), 0.]
+    };
+    1 << 63 | bake::now().px(v)
 }
 
 /// A plan weight as Q16 with 65536 whole (the plan keeps full as G#FFFF in its u16).
@@ -3965,13 +3992,13 @@ fn glass_front(x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], c: u64,
     }
     under_pm(acc, t, p & ((1 << 48) - 1), 0).0
 }
-/// The windows into phase `k` over `r` (screen coordinates): each row composed frontmost first (a pixel comes from the first window that covers it; nothing behind the windows but black), cut to the circle with its edge antialiased, the corners from the chrome; then each pixel's R, G, B (bits 0-15, 16-31, 32-47, working values: gamma 2, white = Q14) through the one table, E's gains and the dither, bit 48 set = no dither for that pixel.
+/// The windows into phase `k` over `r` (screen coordinates): each row composed frontmost first (a pixel comes from the first window that covers it; nothing behind the windows but black), cut to the circle with its edge antialiased, the corners from the chrome; each window's pixels baked first unless its surface already is (`layer_row`), so the compose is in the panel's codes; then each pixel presented, the dither and the pack (neon.rs `present_app16`), bit 48 set = no dither for that pixel.
 /// `hits`: this call writes the hit map's rows too (hit.rs; the first of several phases published together, never a capture), and in development shows the map instead of the image when `k` is its phase.
 fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: usize, hits: bool) {
     publish_app_mask(r, tabs, 1 << k, width, height, hits);
 }
 
-/// `publish_app` into every phase `mask` names at once (2026-11-11, owner on the Pro: "no reason we can't hit 120fps with a sliding console row"): each row composed once, its light, ODT and code worked out once (`codes_row`), and only the dither and the pack done per phase. The bars' changes go into all four phases, and until then each phase composed the windows, the glass and the bars, and coded every pixel, again.
+/// `publish_app` into every phase `mask` names at once (2026-11-11, owner on the Pro: "no reason we can't hit 120fps with a sliding console row"): each row composed once, and only the dither and the pack done per phase (the codes are the composed pixels, bake.rs). The bars' changes go into all four phases, and until then each phase composed the windows, the glass and the bars, and coded every pixel, again.
 fn publish_app_mask(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, height: usize, hits: bool) {
     let r = r.clip(width, height);
     if r.is_empty() || RAW_HOLD.load(Ordering::Acquire) == 1 {
@@ -4025,9 +4052,10 @@ static mut SHOW_US: [u64; 3] = [0; 3];
 static mut PUB_APP_HITS: bool = false;
 
 /// `publish_app_mask`'s rows `r` (one stripe of them, or all), into the phases `mask` names.
-fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, height: usize, hits: bool) {
+fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, height: usize, hits: bool) {
     // The development view's phase is painted whole from the hit map as it comes round (`hit::on_layer`), never here: the phases written are the others.
     let write = if hit::view() && unsafe { CAPTURE } == 0 { mask & !(1 << hit::PHASE) } else { mask };
+    let cm = neon::Chans::new(CHANNELS.load(Ordering::Relaxed));
     // The app circle's ring hairline (the edge's is the mask's own colour, `glass_front`).
     let line = hairline();
     let mut row = [3u32; 1344];
@@ -4073,15 +4101,20 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
                 continue;
             }
             let layer = |i: u8| order[i as usize];
-            let plain = chain.iter().all(|&i| layer(i).1 != G2T16 && layer(i).2 & MODE_MASK == 0);
+            let plain = chain.iter().all(|&i| layer(i).1 == BAKED && layer(i).2 & MODE_MASK == 0);
+            // Working windows in Normal (format 0: the attest screen, the keyboard): opaque or see-through by the bit alone, as baked ones, so the same select once their rows are baked.
+            let select = chain.iter().all(|&i| layer(i).1 != G2T16 && layer(i).2 & MODE_MASK == 0);
             let (k0, f0, m0) = layer(chain[0]);
             let front = &window_pixels(k0 as usize, width, height)[y * width..(y + 1) * width];
-            if m0 & OPAQUE != 0 && f0 != G2T16 && can_direct && a == xa && b == xb {
+            if m0 & OPAQUE != 0 && f0 == BAKED && can_direct && a == xa && b == xb {
                 direct = Some(front);
-            } else if m0 & OPAQUE != 0 && f0 != G2T16 {
+            } else if m0 & OPAQUE != 0 && f0 == BAKED {
                 px[a..b].copy_from_slice(&front[a..b]);
+            } else if m0 & OPAQUE != 0 {
+                // An opaque window not yet baked (a format 0 or 1 surface): baked here, every frame, what the old present did for every pixel.
+                layer_row(k0 as usize, f0, y, a, b, width, height, &mut px);
             } else if plain {
-                // Working windows in Normal: see-through is the bit alone, so the fold is a select. Branchless: an uncovered pixel takes this window's, a covered one keeps its own; black where every window is see-through.
+                // Baked windows in Normal: see-through is the bit alone, so the fold is a select. Branchless: an uncovered pixel takes this window's, a covered one keeps its own; black where every window is see-through.
                 px[a..b].copy_from_slice(&front[a..b]);
                 for &i in &chain[1..] {
                     let src = &window_pixels(layer(i).0 as usize, width, height)[y * width..(y + 1) * width];
@@ -4094,19 +4127,41 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
                 for p in &mut px[a..b] {
                     *p &= ((*p >> 63) ^ 1).wrapping_neg();
                 }
+            } else if select {
+                // The same select over the chain's rows baked first (`layer_row`).
+                let rows = layer_rows();
+                for (n, &i) in chain.iter().enumerate() {
+                    let (k, f, _) = layer(i);
+                    layer_row(k as usize, f, y, a, b, width, height, &mut rows[n]);
+                }
+                px[a..b].copy_from_slice(&rows[0][a..b]);
+                for row in &rows[1..chain.len()] {
+                    for x in a..b {
+                        let p = px[x];
+                        let m = (p >> 63).wrapping_neg();
+                        px[x] = (p & !m) | (row[x] & m);
+                    }
+                }
+                for p in &mut px[a..b] {
+                    *p &= ((*p >> 63) ^ 1).wrapping_neg();
+                }
             } else {
+                // Each layer's row baked first (`layer_row`: as it is when its surface is baked), then folded front to back pixel by pixel.
+                let rows = layer_rows();
+                for (n, &i) in chain.iter().enumerate() {
+                    let (k, f, _) = layer(i);
+                    layer_row(k as usize, f, y, a, b, width, height, &mut rows[n]);
+                }
                 for x in a..b {
-                    let mut acc = working(front[x], f0);
+                    let mut acc = rows[0][x];
                     let mut t = trans(acc);
                     let mut mode = m0;
-                    for &i in &chain[1..] {
+                    for (n, &i) in chain.iter().enumerate().skip(1) {
                         if t == 0 {
                             break;
                         }
-                        let (k, f, m) = layer(i);
-                        let p = working(window_pixels(k as usize, width, height)[y * width + x], f);
-                        (acc, t) = fold(acc, t, p, mode);
-                        mode = m;
+                        (acc, t) = fold(acc, t, rows[n][x], mode);
+                        mode = layer(i).2;
                     }
                     // What is still transparent at the end is over black: the premultiplied channels are the light, the transparency is spent.
                     px[x] = acc & !(0x7FFF << 49);
@@ -4189,7 +4244,7 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
                 }
             }
         }
-        // A screencap (op 30): the finished row, in working values, into the capture surface instead of through the panel's table.
+        // A screencap (op 30): the finished row, baked, into the capture surface instead of thru the dither (op 30 unbakes the surface once it is whole).
         if unsafe { CAPTURE } != 0 {
             let cap = unsafe { core::slice::from_raw_parts_mut(CAPTURE as *mut u64, width * height) };
             cap[y * width + xa..y * width + xb].copy_from_slice(&px[xa..xb]);
@@ -4198,54 +4253,44 @@ fn publish_app_rows(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
         let t2 = now();
         parts[1] += t2 - t1;
         let c2 = ferros_sys::pmu::cycles();
-        // The row's codes, once: sixteen pixels a block from xa, the last block's tail (under 16) padded.
-        let codes = codes_row();
+        // The row's last block's tail (under 16), padded once for every phase.
         let tail = (xb - xa) & 15;
-        unsafe {
-            // Block j from the surface itself when the row is `direct` and the glass left it alone, else from `px`.
-            let (src, keep) = match direct {
-                Some(f) => (f.as_ptr(), !touched),
-                None => (px.as_ptr(), 0),
-            };
-            let at = |x: usize, j: usize| if keep >> j & 1 == 1 { src.add(x) } else { px.as_ptr().add(x) };
-            let (mut x, mut j) = (xa, 0usize);
-            while x + 16 <= xb {
-                codes[j] = neon::codes_app(tabs, at(x, j));
-                x += 16;
-                j += 1;
-            }
-            if tail != 0 {
-                let mut pin = [0u64; 16];
-                pin[..tail].copy_from_slice(core::slice::from_raw_parts(at(x, j), tail));
-                codes[j] = neon::codes_app(tabs, pin.as_ptr());
-            }
+        // Block j from the surface itself when the row is `direct` and the glass left it alone, else from `px`.
+        let (src, keep) = match direct {
+            Some(f) => (f.as_ptr(), !touched),
+            None => (px.as_ptr(), 0),
+        };
+        let at = |x: usize, j: usize| unsafe { if keep >> j & 1 == 1 { src.add(x) } else { px.as_ptr().add(x) } };
+        let mut pin = [0u64; 16];
+        if tail != 0 {
+            let j = (xb - xa) >> 4;
+            pin[..tail].copy_from_slice(unsafe { core::slice::from_raw_parts(at(xb - tail, j), tail) });
         }
         let t3 = now();
         parts[2] += t3 - t2;
-        codes_cyc += ferros_sys::pmu::cycles() - c2;
-        // Then each phase: its dither on those codes, and the row's words out.
+        // Each phase: the row presented with its thresholds (baked, the codes are the pixels: dither and pack, neon.rs `present_app16`), and its words out.
         for k in 0..PHASES {
             if write >> k & 1 == 0 {
                 continue;
             }
             let dst = phase_slice(k, width * height);
-            let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
+            let (t0, t1) = neon::row_thresholds_at(y, k, xa);
             unsafe {
-                let base = core::arch::aarch64::vld1q_u8(th.as_ptr());
                 let (mut x, mut j) = (xa, 0usize);
                 while x + 16 <= xb {
-                    neon::dither_codes(&codes[j], neon::thresholds_at(base, x), row.as_mut_ptr().add(x));
+                    neon::present_app16(at(x, j), row.as_mut_ptr().add(x), t0, t1, cm);
                     x += 16;
                     j += 1;
                 }
                 if tail != 0 {
                     let mut pout = [0u32; 16];
-                    neon::dither_codes(&codes[j], neon::thresholds_at(base, x), pout.as_mut_ptr());
+                    neon::present_app16(pin.as_ptr(), pout.as_mut_ptr(), t0, t1, cm);
                     row[x..xb].copy_from_slice(&pout[..tail]);
                 }
             }
             dst[y * width + xa..y * width + xb].copy_from_slice(&row[xa..xb]);
         }
+        codes_cyc += ferros_sys::pmu::cycles() - c2;
         parts[3] += now() - t3;
     }
     let slot = draw::thread_slot();
@@ -5256,7 +5301,7 @@ fn wall_load(again: bool) {
     clean_reset_all();
 }
 
-/// The person's own wallpaper (`map.wallpaper` in their space: a VSF visual, one plane of VSF RGB gamma2tanh codes at 16 bits, planar [3, height, width], as tools/wallpaper and tools/screencap write one), or the one made on this device (`map.wallpaper.made`), into `WALL_BUF`; whether it did. On the loader's thread (`wall_loader`). vsf's container locates the plane over the vault (`VaultSource`); then the plane is read from its first byte to its last, a transfer at a time at the transfer's own boundaries in the value (so the vault opens each of its pieces once, sixteen at a time on a kernel from 2026-11-11), and each code becomes a working value by the display's own g2t table (`G2T16_Q14`) as it arrives: the three planes one after another, red setting each pixel opaque, green and blue joining it.
+/// The person's own wallpaper (`map.wallpaper` in their space: a VSF visual, one plane of VSF RGB gamma2tanh codes at 16 bits, planar [3, height, width], as tools/wallpaper and tools/screencap write one), or the one made on this device (`map.wallpaper.made`), into `WALL_BUF`; whether it did. On the loader's thread (`wall_loader`). vsf's container locates the plane over the vault (`VaultSource`); then the plane is read from its first byte to its last, a transfer at a time at the transfer's own boundaries in the value (so the vault opens each of its pieces once, sixteen at a time on a kernel from 2026-11-11), and each code put in its pixel's lane as it arrives (the three planes one after another, red setting each pixel opaque), the whole baked in place once the plane is in (`wall_bake_rows`).
 fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> bool {
     let c = cap(grants, S_MAP_SCOPE);
     let Some(len) = ferros_sys::store_get(c, key, &mut []) else { return false };
@@ -5303,8 +5348,8 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
     // The document is done with: its source's spans are the stretch buffers the plane's reads now reuse.
     drop(doc);
     let t_open = ferros_sys::us_since(t0);
+    // Each code into its pixel's lane as it comes (the planes one after another, red setting the pixel opaque), and the whole baked in place once the plane is in (`wall_bake_rows`).
     let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, n) };
-    let table = unsafe { core::slice::from_raw_parts(G2T16_Q14, 1 << 16) };
     // Stretches of a MiB at their own boundaries in the value (sixteen of the vault's pieces, opened as one batch; on an older kernel `vault_read` moves one in its own smaller calls, still at piece boundaries), two buffers: the reader thread fills one (`read_post`) while this thread converts the other.
     // The two stretches are statics, not the loader's arena (2026-11-11, the Pro: "memory allocation of 524288 bytes failed" at start, the 2 MiB arena already holding ~1.87 MiB of the document's reading): one load at a time uses them (`LOADING`).
     let (first, end) = (span.data_offset, span.data_offset + span.data_len);
@@ -5338,15 +5383,15 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
         let t = now();
         let mut i = 0;
         if let Some(hi) = carry.take() {
-            wall_sample(buf, table, n, s, u16::from_be_bytes([hi, bytes[0]]));
+            wall_sample(buf, n, s, u16::from_be_bytes([hi, bytes[0]]));
             s += 1;
             i = 1;
         }
-        // The pairs whole in this transfer, run by run within one plane.
+        // The pairs whole in this transfer, run by run within one plane, each code into its pixel's lane as it is (big-endian in the value).
         while i + 1 < bytes.len() {
             let (plane, p0) = (s / n, s % n);
             let run = ((bytes.len() - i) >> 1).min(n - p0);
-            let codes = bytes[i..i + 2 * run].chunks_exact(2).map(|b| table[u16::from_be_bytes([b[0], b[1]]) as usize] as u64);
+            let codes = bytes[i..i + 2 * run].chunks_exact(2).map(|b| u16::from_be_bytes([b[0], b[1]]) as u64);
             let px = &mut buf[p0..p0 + run];
             match plane {
                 0 => px.iter_mut().zip(codes).for_each(|(p, v)| *p = 0xFFFF << 48 | v),
@@ -5363,6 +5408,10 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
         k += 1;
     }
     let t_plane = now() - t_reads;
+    // Baked whole, here on the loader's thread, before the render loop shows it (`wall_ready`).
+    let t_bake = now();
+    wall_bake_rows(width, height, 0, height);
+    t_conv += now() - t_bake;
     // Measuring (owner, 2026-11-08: "the unlock process took way too long"): the whole load over the vault, and where it went.
     let ms = |t: u64| t * 1000 / freq();
     let total = ferros_sys::us_since(t0);
@@ -5395,13 +5444,175 @@ fn wall_own(grants: u64, width: usize, height: usize, key: &'static [u8]) -> boo
     true
 }
 
-/// Sample `s` of the three planes (each `n` pixels) into its pixel: the first plane sets it opaque with its red, the others add theirs.
-#[inline(always)]
-fn wall_sample(buf: &mut [u64], table: &[u16], n: usize, s: usize, code: u16) {
-    let (plane, p) = (s / n, s % n);
-    let v = table[code as usize] as u64;
-    buf[p] = if plane == 0 { 0xFFFF << 48 | v } else { buf[p] | v << (16 * plane) };
+/// The present before and after the bake, measured once at start on the render thread's core (development builds; COMPOSITOR.md "Baked", the owner's "measure"): 64 rows of the screen's width, warm in the caches, each kernel over them eight times and the fastest pass kept, in the core's own cycles (`pmu::cycles`) a pixel:
+/// - before: the old present on working values (light by Lambert's tanh, the ODT, the code, the old dither and pack, `sixteen_canvas`), what every pixel paid every frame until 2026-11-12;
+/// - after: the present on baked values (the dither and the pack, `present16`);
+/// - the owner's root first, on light-like values: `fsqrt`, and the estimate with one Newton step (`present_sqrt16`);
+/// - the bake itself (`bake16`), what an image or a surface that is not baked pays once per bake or per frame.
+fn present_bench(width: usize, log: &mut Log) {
+    let (rows, w) = (1usize << 6, width & !15);
+    let n = rows * width;
+    let mut src = alloc::vec![0u64; n];
+    // Black, white, mid greys and random channels to 4× white, as the GPU driver's check of the present kernel has them.
+    let mut rng = 0x2545_F491_4F6C_DD1Du64;
+    for (i, p) in src.iter_mut().enumerate() {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        *p = match i % 11 {
+            0 => 0,
+            1 => 0x4000 | 0x4000 << 16 | 0x4000 << 32,
+            2 => 0x2000 | 0x2000 << 16 | 0x2000 << 32,
+            _ => rng & 0x0000_FFFF_FFFF_FFFF,
+        };
+    }
+    let mut baked = src.clone();
+    let mut out = alloc::vec![0u32; width];
+    let b = bake::now();
+    let cm = neon::Chans::new(7);
+    let best = |f: &mut dyn FnMut()| -> u64 {
+        (0..8)
+            .map(|_| {
+                let c0 = ferros_sys::pmu::cycles();
+                f();
+                ferros_sys::pmu::cycles() - c0
+            })
+            .min()
+            .unwrap_or(0)
+    };
+    // Cycles a pixel, in hundredths.
+    let per = |c: u64| c * 100 / (rows * w) as u64;
+    let bake_c = best(&mut || {
+        baked.copy_from_slice(&src);
+        for y in 0..rows {
+            b.working_row(&mut baked[y * width..y * width + w]);
+        }
+    });
+    // The light-like values for the root: each baked code squared (Q16).
+    let light: alloc::vec::Vec<u64> = baked.iter().map(|&p| (0..3).fold(p & 0xFFFF << 48, |a, c| a | ((p >> (16 * c) & 0xFFFF) * (p >> (16 * c) & 0xFFFF) >> 16) << (16 * c))).collect();
+    let before = best(&mut || unsafe {
+        for y in 0..rows {
+            let th = neon::thresholds(y, 0, &BAYER, &TEMPORAL_RANK);
+            let thv = core::arch::aarch64::vld1q_u8(th.as_ptr());
+            for x in (0..w).step_by(16) {
+                neon::sixteen_canvas(&b.odt, src.as_ptr().add(y * width + x), out.as_mut_ptr().add(x), thv);
+            }
+        }
+    });
+    let after = best(&mut || unsafe {
+        for y in 0..rows {
+            let (t0, t1) = neon::row_thresholds(y, 0);
+            for x in (0..w).step_by(16) {
+                neon::present16(baked.as_ptr().add(y * width + x), out.as_mut_ptr().add(x), t0, t1, cm);
+            }
+        }
+    });
+    let mut root = |newton: bool| {
+        best(&mut || unsafe {
+            for y in 0..rows {
+                let (t0, t1) = neon::row_thresholds(y, 0);
+                for x in (0..w).step_by(16) {
+                    neon::present_sqrt16(light.as_ptr().add(y * width + x), out.as_mut_ptr().add(x), t0, t1, cm, newton);
+                }
+            }
+        })
+    };
+    let (fsqrt, rsqrte) = (root(false), root(true));
+    let dec2 = |log: &mut Log, v: u64| {
+        log.dec(v / 100);
+        log.s(b".");
+        log.s(&[b'0' + (v / 10 % 10) as u8, b'0' + (v % 10) as u8]);
+    };
+    log.s(b"display: present bench (64 rows warm, cycles a pixel): before (light, ODT, code, dither, pack) ");
+    dec2(log, per(before));
+    log.s(b", after (dither, pack) ");
+    dec2(log, per(after));
+    log.s(b"; with a root first, fsqrt ");
+    dec2(log, per(fsqrt));
+    log.s(b", rsqrte and a Newton step ");
+    dec2(log, per(rsqrte));
+    log.s(b"; the bake ");
+    dec2(log, per(bake_c));
+    log.s(b"\n");
+    log.flush();
 }
+
+/// Everything the display keeps baked, baked again with the bake now in use (a brightness change, the render thread between passes; COMPOSITOR.md "Baked"): the icons' chains in place from the bundle; the sprites, the region's front layer and its clean window, made again when next asked for; the pan's anchor and the flight's images (none in flight) dropped; the wallpaper from its codes, by stripes on the publish workers; the console, the helm and the quick row by their worker, which sees the generation move (`console_worker`), nudged; and each window told (`EV_BAKE`), so its app bakes its surface again. The canvas is the caller's: the map's last frame drawn again.
+fn rebake(mips: &[draw::Mips], width: usize, height: usize) {
+    let decode = icon_decode();
+    for (i, m) in mips.iter().enumerate() {
+        if let Some((px, grey, _)) = icon(i as u8 + 1) {
+            m.fill(px, grey, &decode);
+        }
+    }
+    unsafe {
+        for k in 0..256 {
+            SPRITES[k].valid = false;
+            SPRITES[k].cap = 0;
+        }
+        ARENA_NEXT = 0;
+        FRONT_OLD.k = 0;
+        FRONT_OLD.n = 0;
+        if let Some(front) = front_layer(width, height) {
+            if REGION_ON {
+                front.fill(0);
+            }
+        }
+        CLEAN_KEY = None;
+        PAN = None;
+        if (*(&raw const FLIGHT_FRAME)).is_none() {
+            FLIGHT = None;
+        }
+        if WALL_ON && !LOADING {
+            // The old bake's unbake tables in this pass's scratch, read by every stripe.
+            let (to_p, to_v) = (alloc::vec![0f32; 1 << 16].leak(), alloc::vec![0u16; UNBAKE_V + 1].leak());
+            bake::before().unbake_tables(to_p, to_v);
+            WALL_UNBAKE = (to_p.as_ptr() as usize, to_v.as_ptr() as usize);
+            stripes(5, 0, width, height, draw::Rect::full(width, height));
+        }
+    }
+    CON_NUDGE.fetch_add(1, Ordering::Release);
+    ferros_sys::wake(&CON_NUDGE, 1);
+    for k in 0..SURFACES {
+        if let Some(w) = unsafe { WINS[k] } {
+            events::post(k, w.generation, (ferros_sys::window::EV_BAKE as u16) << 8);
+        }
+    }
+}
+
+/// Sample `s` of the three planes (each `n` pixels) into its pixel's lane as the code it is: the first plane sets the pixel opaque with its red, the others add theirs.
+#[inline(always)]
+fn wall_sample(buf: &mut [u64], n: usize, s: usize, code: u16) {
+    let (plane, p) = (s / n, s % n);
+    buf[p] = if plane == 0 { 0xFFFF << 48 | code as u64 } else { buf[p] | (code as u64) << (16 * plane) };
+}
+
+/// Rows `y0..y1` of the wallpaper, each pixel's three g2t codes in its lanes as the loader put them, baked in place (bake.rs `codes_in_place`), on the loader's thread as a load finishes.
+/// The wallpaper keeps no copy of its codes (a copy in the display's heap, 15 MiB on akita and 23 on husky, was tried first and dropped: the arc pool is tight, and on the 8a that day wallgen was refused for room with or without it): a brightness change bakes it again from what it holds (`wall_rebake_rows`).
+fn wall_bake_rows(width: usize, height: usize, y0: usize, y1: usize) {
+    let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, width * height) };
+    let b = bake::now();
+    for y in y0..y1 {
+        b.codes_in_place(&mut buf[y * width..(y + 1) * width]);
+    }
+}
+
+/// The tables `wall_rebake_rows` unbakes with (`Bake::unbake_tables`, the bake before this one's), made by the render thread for one brightness change in its frame scratch: (to_p, to_v).
+static mut WALL_UNBAKE: (usize, usize) = (0, 0);
+
+/// Rows `y0..y1` of the wallpaper baked again at a brightness change (`stripes` kind 5, `rebake`): each pixel unbaked with the bake before (`Bake::unbake_with`, its tables in `WALL_UNBAKE`), back to working values, and baked with the new one. A round trip thru the codes: exact but for what the old bake lost for good (a channel past the gamut, the roll-off's last stops).
+fn wall_rebake_rows(width: usize, height: usize, y0: usize, y1: usize) {
+    let buf = unsafe { core::slice::from_raw_parts_mut(WALL_BUF as *mut u64, width * height) };
+    let (to_p, to_v) = unsafe { (core::slice::from_raw_parts(WALL_UNBAKE.0 as *const f32, 1 << 16), core::slice::from_raw_parts(WALL_UNBAKE.1 as *const u16, UNBAKE_V + 1)) };
+    let (old, new) = (bake::before(), bake::now());
+    for y in y0..y1 {
+        let row = &mut buf[y * width..(y + 1) * width];
+        old.unbake_with(row, to_p, to_v);
+        new.working_row(row);
+    }
+}
+/// The unbake's root table's steps (`Bake::unbake_tables`).
+const UNBAKE_V: usize = 1 << 12;
 
 /// Whether the helm has been drawn (it shows nothing that changes; drawn once, at the first pass).
 static mut HELM_DRAWN: bool = false;
@@ -5706,6 +5917,8 @@ extern "C" fn console_worker(arg: u64) -> ! {
     // The rows the last draw changed, and whether the helm drew then (the first console draw is whole, and the helm counts as drawn before it, so every row of the bars is decoded first).
     let mut prev_rows = (0usize, 0usize);
     let mut helm_prev = true;
+    // The bake the bars were last baked with (bake.rs): a brightness change draws the console again and bakes every row of the bars again, front and back (two passes).
+    let mut baked = (bake::generation(), 0u32);
     loop {
         let n = CON_NUDGE.load(Ordering::Acquire);
         if n == seen {
@@ -5718,7 +5931,12 @@ extern "C" fn console_worker(arg: u64) -> ! {
             continue;
         }
         let t_draw = now();
-        let console = console_draw(width, height, false);
+        let g = bake::generation();
+        if g != baked.0 {
+            baked = (g, 2);
+        }
+        let rebake = baked.1 > 0;
+        let console = console_draw(width, height, rebake);
         // The console's changed rows decoded once, here, into its own decoded layer (`CON_DEC`): a quick row step copies them from there rather than decoding the console again (2026-11-11: decoding the console's rows was most of a step's 2.8 ms compose on the Pro, for a console that had not changed).
         if console {
             let (a, b) = unsafe { CON_ROWS };
@@ -5731,11 +5949,15 @@ extern "C" fn console_worker(arg: u64) -> ! {
         // The first compose at start (from none, −1) is not a step.
         let moved = quick::composed() != was && was >= 0;
         let q_us = ferros_sys::us_since(t_q);
-        let helm = helm_draw(width, height);
+        let helm = helm_draw(width, height) || rebake;
         CON_HEAP.reset();
         let draw_us = ferros_sys::us_since(t_draw);
         if !console && !helm && quick.is_none() {
             continue;
+        }
+        // The second buffer's pass comes with the render thread's nudge after it takes this one.
+        if rebake {
+            baked.1 -= 1;
         }
         let (top, bot) = unsafe { (BAR_TOP, CHROME_BOT) };
         // Only the quick row changed: what differs from the front is known without looking (below).
@@ -5835,12 +6057,12 @@ extern "C" fn console_worker(arg: u64) -> ! {
     }
 }
 
-/// One drawn row of the bars (`BAR`, fluor's α + darkness) decoded to working values (`working`) into `out`; returns the columns holding anything, (from, to), (width, 0) for none.
+/// One drawn row of the bars (`BAR`, fluor's α + darkness) baked into `out` (bake.rs `g2t_row`: what was the decode to working values, the bake after it); returns the columns holding anything, (from, to), (width, 0) for none.
 fn decode_row(bar: &[u64], out: &mut [u64]) -> (usize, usize) {
     let width = out.len();
     let (mut l, mut rr) = (width, 0);
+    bake::now().g2t_row(bar, out);
     for xx in 0..width {
-        out[xx] = working(bar[xx], G2T16);
         if bar[xx] >> 48 != 0 {
             if l == width {
                 l = xx;
@@ -6726,22 +6948,19 @@ fn pack10(r: u32, g: u32, b: u32) -> u32 {
     (b << 22 | g << 12 | r << 2 | 3) & word_mask()
 }
 
-/// The 8-bit canvas through the present stage with the spatial dither only (temporal off): the ODT 16 pixels a step (neon.rs `sixteen_odt`) with this row's Bayer thresholds, a row at a time through a cached buffer, then one wide copy into the non-cacheable framebuffer.
-fn publish10(back: &[Px], screen: &mut [u32], width: usize, tabs: &neon::Odt) {
+/// The canvas thru the present with the spatial dither only (temporal off): phase 0's thresholds, 16 pixels a step (neon.rs `present16`), a row at a time thru a cached buffer, then one wide copy into the non-cacheable framebuffer.
+fn publish10(back: &[Px], screen: &mut [u32], width: usize, _tabs: &neon::Odt) {
     // The hit map with it (hit.rs): this path publishes the whole screen, with no phases to write it in.
     hit::refresh(width, back.len() / width, draw::Rect::full(width, back.len() / width));
     let mut row = [0u32; 4096];
     let w16 = width & !15;
+    let cm = neon::Chans::new(CHANNELS.load(Ordering::Relaxed));
     for (y, (src, dst)) in back.chunks(width).zip(screen.chunks_mut(width)).enumerate() {
-        let mut th = [0u8; 16];
-        for (x, t) in th.iter_mut().enumerate() {
-            *t = (BAYER[y & 3][x & 3] * 4) as u8;
-        }
+        let (t0, t1) = neon::row_thresholds(y, 0);
         unsafe {
-            let thv = core::arch::aarch64::vld1q_u8(th.as_ptr());
             let mut x = 0;
             while x < w16 {
-                neon::sixteen_canvas(tabs, src.as_ptr().add(x), row.as_mut_ptr().add(x), thv);
+                neon::present16(src.as_ptr().add(x), row.as_mut_ptr().add(x), t0, t1, cm);
                 x += 16;
             }
         }
@@ -6813,7 +7032,8 @@ fn publish(back: &[Px], screen: &mut [u32]) {
     // The hit map with it, as `publish10` writes it.
     let (w, h) = unsafe { SCREEN_WH };
     hit::refresh(w as usize, h as usize, draw::Rect::full(w as usize, h as usize));
-    let c8 = |v: u64| ((v & 0xFFFF) * 255 / 16384).min(255) as u32;
+    // Baked, the code is the value's high byte.
+    let c8 = |v: u64| (v >> 8 & 0xFF) as u32;
     // The panel's channels that are off (`CHANNELS`, op 63) at 0, in this path's XRGB bytes.
     let m = CHANNELS.load(Ordering::Relaxed);
     let keep = 0xFF00_0000 | (m & 1) * 0xFF << 16 | (m >> 1 & 1) * 0xFF << 8 | (m >> 2 & 1) * 0xFF;
@@ -6980,6 +7200,25 @@ extern "C" fn receive(grants: u64) -> ! {
         // 64 `look [what u8: 0 ask, 1 release]` → [0][release u8]: the release look until the display starts again (`look_op`; development builds only, status 1 on a release build). Answered here, at once.
         if op == 64 && n >= 2 {
             ferros_sys::reply(&tok, &look_op(msg[1]));
+            continue;
+        }
+        // 65 `bake` → [0][generation u32][k f32][m 9 × f32, the panel's rows][g f32] (ferros_sys `window::bake`): what a `BAKED` surface is made with (bake.rs; COMPOSITOR.md "Baked"). Answered here, at once, by anyone: the panel's matrix and the brightness are no secret. Read between two looks at the generation, so the numbers are one bake's.
+        if op == 65 {
+            let mut out = [0u8; 49];
+            loop {
+                let g0 = bake::generation();
+                let b = bake::now();
+                out[1..5].copy_from_slice(&g0.to_le_bytes());
+                out[5..9].copy_from_slice(&b.k.to_le_bytes());
+                for (i, v) in b.m.iter().flatten().enumerate() {
+                    out[9 + 4 * i..13 + 4 * i].copy_from_slice(&v.to_le_bytes());
+                }
+                out[45..49].copy_from_slice(&b.g.to_le_bytes());
+                if bake::generation() == g0 {
+                    break;
+                }
+            }
+            ferros_sys::reply(&tok, &out);
             continue;
         }
         if op == 24 {
@@ -7222,21 +7461,14 @@ fn server(grants: u64) -> ! {
     // The present stage's table and its 8-bit slice, built before the mark so they live for the process.
     let t_lut = now();
     let lut: &'static mut [u16] = alloc::vec![0u16; 65536].leak();
-    // fluor's 16-bit g2t codes to working values (`G2T16_Q14`).
-    {
-        let g2t: &'static mut [u16] = alloc::vec![0u16; 1 << 16].leak();
-        for (c, v) in g2t.iter_mut().enumerate() {
-            // WHY/PROOF: the working value is 16 bits (4.0); the top 79 codes decode past it (atanh(65535/65536) × 2¹⁴ ≈ 90 850), and `as u16` alone would also stop them there — the min names the ceiling.
-            *v = (16384. * libm::atanh(c as f64 / 65536.) + 0.5).min(65535.) as u16;
-        }
-        unsafe { G2T16_Q14 = g2t.as_ptr() };
-    }
     let mut bright = ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS);
     let (white0, peak0, hbm0, dbv0) = brightness(bright);
     build_lut(lut, white0, peak0);
     unsafe { LUT_FOR = bright };
-    // The ODT's tables for this white (neon.rs `Odt`): every pixel's path.
-    let mut tabs = odt_masked(white0, peak0);
+    // The bake for this white (bake.rs): set before anything is drawn (the icons below are baked as they are built). Its ODT's tables (neon.rs `Odt`) are what a surface not yet baked goes through, every frame.
+    bake::set(white0, peak0);
+    bake_consts();
+    let mut tabs = bake::now().odt;
     // The f16 app light against the f32 one, over every value, once (neon.rs `light_check`).
     {
         let (rel, at, steps) = neon::light_check(&tabs);
@@ -7267,7 +7499,7 @@ fn server(grants: u64) -> ! {
     unsafe {
         let sprites = ferros_sys::dma(cap(grants, S_SPRITES));
         if sprites != 0 && sprites != ferros_sys::ERR {
-            // The region's lower 32 MiB are the sprites', its upper 32 MiB the wallpaper's (a full screen of working values, 1344 × 2992 × 8 bytes, just fits).
+            // The region's lower 32 MiB are the sprites', its upper 32 MiB the wallpaper's (a full screen of baked pixels, 1344 × 2992 × 8 bytes, just fits).
             ARENA = sprites as usize;
             ARENA_WORDS = (32 << 20) / 8;
             WALL_BUF = sprites as usize + (32 << 20);
@@ -7319,8 +7551,9 @@ fn server(grants: u64) -> ! {
     // Each publishing thread's flight scratch (`flight_row_buf`), kept with the rest.
     unsafe {
         FLIGHT_ROWS = alloc::vec![0u64; FLIGHT_SCRATCH * (PUB_WORKERS + 1)].leak().as_mut_ptr() as usize;
-        // Each publishing thread's row of codes (`codes_row`): 14 KiB a thread.
-        CODES_ROWS = alloc::vec![core::mem::zeroed::<neon::Codes16>(); CODES_BLOCKS * (PUB_WORKERS + 1)].leak().as_mut_ptr() as usize;
+        // Each publishing thread's row of composed blocks (`codes_row`): 16 KiB a thread; and its windows' baked layer rows (`layer_rows`): 43 KiB a thread.
+        CODES_ROWS = alloc::vec![[0u64; 16]; CODES_BLOCKS * (PUB_WORKERS + 1)].leak().as_mut_ptr() as usize;
+        LAYER_ROWS = alloc::vec![[0u64; 1344]; SURFACES * (PUB_WORKERS + 1)].leak().as_mut_ptr() as usize;
         FLIGHT_TEXT = alloc::vec![0u32; height].leak().as_mut_ptr() as usize;
     }
     heap_at[4] = ALLOC.used();
@@ -7507,12 +7740,20 @@ fn server(grants: u64) -> ! {
     }
     // The render thread on the big core (KERNEL.md "Cores": pinning by latency class — this is the one real compute path; receive and vsync stay on the workers, where the map and the touch server run, so a call hands off on the caller's own core). After the other threads are spawned: they inherit the mask.
     ferros_sys::pin(ferros_sys::CORES_BIG);
+    // The present before and after the bake, measured on this core once (development builds), its scratch freed with the frame's.
+    if DEV {
+        ferros_sys::sleep_until(now() + freq() / 1000);
+        present_bench(width, &mut log);
+        ALLOC.reset();
+    }
     // A person already unlocked (a display restarted after attest): their wallpaper as their space keeps it, their own or the one made on this device, so a restart does not lose it until the next attest; read by the loader while the screen is drawn. Before attest their space is closed, nothing is read, and the attest screen says when it opens (op 42).
     if unsafe { WALL_BUF } != 0 {
         wall_load(false);
     }
     let (mut frames_last_tick, mut starts_last_tick) = (0u64, 0u64);
     let mut clock_due = false;
+    // The map's last frame owed a redraw with a new bake (`rebake`).
+    let mut rebake_replay = false;
     // The clock face's 60 directions, once.
     unsafe {
         for k in 0..60 {
@@ -8469,7 +8710,7 @@ fn server(grants: u64) -> ! {
                     log.flush();
                 }
                 Some(22) if m.len() >= 18 => {
-                    // A window shown or redrawn (WINDOWS.md): [x u16][y u16][w u16][h u16] the part of the screen it covers, [base u64] its surface (the client's own `dma` of it), [level u8] 0 an app, 1 input, 2 the system (above 0 the system's alone, `level_not_theirs`), and optionally [format u8] its pixels (`Win::format`: 0, the default, the display's working values; 1 fluor's 16-bit g2t). It goes in front of its level; every phase owes the whole screen; the next one is published now, the others while idle.
+                    // A window shown or redrawn (WINDOWS.md): [x u16][y u16][w u16][h u16] the part of the screen it covers, [base u64] its surface (the client's own `dma` of it), [level u8] 0 an app, 1 input, 2 the system (above 0 the system's alone, `level_not_theirs`), and optionally [format u8] its pixels (`Win::format`: 0, the default, the display's working values; 1 fluor's 16-bit g2t; 2 baked, the panel's codes). It goes in front of its level; every phase owes the whole screen; the next one is published now, the others while idle.
                     client_owned = true;
                     unsafe { CLIENT_DREW = true };
                     last_interaction = now();
@@ -8496,7 +8737,7 @@ fn server(grants: u64) -> ! {
                             // The mailbox's buffer (the 36-byte form, [buf u64] after the mode byte): a live surface the window's pixels come from from this show on, else the window's own. The receive thread answers the call once this show is taken, so the buffer shown before it is no longer read and its owner may draw there again.
                             let pixels = if m.len() >= 36 { surface_of(u64::from_le_bytes(m[28..36].try_into().unwrap())).filter(|&b| live_gen(b) != 0).unwrap_or(sk) } else { sk };
                             unsafe { PIXELS[sk] = pixels as u8 };
-                            let same = unsafe { WINS[sk] }.is_some_and(|w| w.generation == generation && w.rect == rect && w.level == m[17] && w.mode == mode) && unsafe { APP }.is_some();
+                            let same = unsafe { WINS[sk] }.is_some_and(|w| w.generation == generation && w.rect == rect && w.level == m[17] && w.mode == mode && w.format == if m.len() > 18 { m[18] } else { 0 }) && unsafe { APP }.is_some();
                             let changed = if m.len() >= 27 && same { draw::Rect { x0: v(19), y0: v(21), x1: v(19) + v(23), y1: v(21) + v(25) }.intersect(rect) } else { full };
                             let t22 = now();
                             let t_chrome = now();
@@ -8605,6 +8846,8 @@ fn server(grants: u64) -> ! {
                             let g2t = unsafe { WINS[sk] }.is_some_and(|w| w.format == G2T16);
                             // The text's grey as fluor's straight 16-bit darkness, for a G2T16 surface: the code 2¹⁶ · tanh(v / 2¹⁴) (`G2T16_Q14` inverted, as `g2t_colour`), its complement the darkness. tanh stays under 1 for every value the u16 can hold, so the code stays under 2¹⁶.
                             let ink = 65535 - (libm::tanhf(val as f32 * (1.0 / 16384.0)) * 65536.0) as u64;
+                            // The grey in the surface's own values: baked for a baked surface (bake.rs), the working value itself in each channel for a working one.
+                            let grey = if unsafe { WINS[sk] }.is_some_and(|w| w.format == BAKED) { bake::now().px([val as f32 * (1. / 16384.); 3]) } else { val as u64 * 0x0000_0001_0001_0001 };
                             glyph_engine().cover(t, x0 as f32, base as f32, px, (1.0, 0.0), |x, y, a| {
                                 if x < 0 || y < 0 || x >= width as i64 || y >= height as i64 {
                                     return;
@@ -8622,9 +8865,9 @@ fn server(grants: u64) -> ! {
                                     *d = f(48, a) | f(32, dk) | f(16, dk) | f(0, dk);
                                 } else {
                                     // Working values, premultiplied: the text's grey by its coverage, the pixel under it by the room with its own transparency (`working` empties a see-through pixel's channels), the transparency the product. Each channel is a weighted mean of two values in the field, so it stays in it. A working surface's pixel is opaque or clear; a glyph's fringe over a clear one keeps what the glyph leaves as transparency (bits 49-62, `trans`), which a chain folds by and the plain path, by the see-through bit alone, shows over black.
-                                    let old = working(*d, 0);
-                                    let v = val as u64 * a >> 16;
-                                    let (acc, tr) = under_pm(v | v << 16 | v << 32, room >> 2, old & ((1 << 48) - 1), trans(old));
+                                    let old = working(*d);
+                                    let v = |sh: u32| ((grey >> sh & 0xFFFF) * a >> 16) << sh;
+                                    let (acc, tr) = under_pm(v(0) | v(16) | v(32), room >> 2, old & ((1 << 48) - 1), trans(old));
                                     *d = (*d & 1 << 48) | acc | tr << 49;
                                 }
                             });
@@ -8870,6 +9113,17 @@ fn server(grants: u64) -> ! {
                     let wall_at = unsafe { if WALL_ON { WALL_BUF } else { 0 } };
                     // `[30, 1]`: the glass's mask alone (owner, 2026-11-10, the website's screens: "pull that screen mask for the edges/cam, de premultiply it, apply alpha"): every pixel through `glass_front` with nothing in front but the mask and only white behind it, so with the release look's black mask each pixel's working value is white times the share of the glass that shows there (the edge's and the camera hole's antialiasing exact, as the panel gets them). Whatever is on the screen, an app included.
                     let mask = m.get(1) == Some(&1);
+                    // `[30, 2]`: the frame as composed, baked (the panel's codes before the dither, bake.rs), not unbaked: what the glass gets, for comparing looks (COMPOSITOR.md "Baked"). Otherwise the capture is unbaked into working values (`Bake::unbake`), the format tools/screencap reads.
+                    let raw = m.get(1) == Some(&2);
+                    let unbake = |s: &mut [u64]| {
+                        if !raw {
+                            let mut to_p = alloc::vec![0f32; 1 << 16];
+                            let mut to_v = alloc::vec![0u16; UNBAKE_V + 1];
+                            let b = bake::now();
+                            b.unbake_tables(&mut to_p, &mut to_v);
+                            b.unbake_with(s, &to_p, &to_v);
+                        }
+                    };
                     let text: alloc::string::String = match (unsafe { APP }.is_some() && !mask, free) {
                         // The deck: each row as `publish_band` composes it for the glass (the edge, then the console, then the canvas), in working values, into the free surface.
                         (false, Some(k)) => {
@@ -8881,7 +9135,7 @@ fn server(grants: u64) -> ! {
                                 let row_px = &plan[g.first as usize..];
                                 let edge_px = &row_px[front_split(row_px)..];
                                 if mask {
-                                    // White at Q14 in each of R, G and B.
+                                    // White at Q14 in each of R, G and B: the mask's compose is linear (`glass_front`, `under_pm`), so this is the glass's share of white exactly, and it is not unbaked (the release look's mask is black, nothing baked in it).
                                     const WHITE: u64 = 16384 | 16384 << 16 | 16384 << 32;
                                     for x in 0..width {
                                         s[y * width + x] = glass_front(x, g, edge_px, CLEAR, WHITE);
@@ -8912,15 +9166,20 @@ fn server(grants: u64) -> ! {
                                     s[y * width + x] = glass_front(x, g, edge_px, c, scene & ((1 << 48) - 1));
                                 }
                             }
+                            if !mask {
+                                unbake(s);
+                            }
                             alloc::format!("G#{:X}\n", s.as_ptr() as usize)
                         }
-                        (false, None) => "canvas\n".into(),
+                        // The canvas is baked and is not unbaked in place (it is the screen's): no capture without a free surface.
+                        (false, None) => "no free surface\n".into(),
                         (true, None) => "no free surface\n".into(),
                         (true, Some(k)) => {
                             let s = surface(k, width, height);
                             unsafe { CAPTURE = s.as_mut_ptr() as usize };
                             publish_app(draw::Rect::full(width, height), &tabs, 0, width, height, false);
                             unsafe { CAPTURE = 0 };
+                            unbake(s);
                             alloc::format!("G#{:X}\n", s.as_ptr() as usize)
                         }
                     };
@@ -9114,6 +9373,11 @@ fn server(grants: u64) -> ! {
             unsafe { CLOCK_ONLY = true };
             replay(&mut handle);
             unsafe { CLOCK_ONLY = false };
+        }
+        // A brightness change baked everything again (`rebake`): the map's last frame drawn whole with the new bake.
+        if rebake_replay {
+            rebake_replay = false;
+            replay(&mut handle);
         }
         // The clock between frames (owner, 2026-10-24: its rings move at the frame rate): when this pass will flip, the clock's region alone is drawn again (`draw::CLIP`) and published into the phase the flip shows, so every phase carries the current clock while it is on the glass. Under a finger the camera ops draw it with everything else; at rest the 10 Hz flips carry it, no frame added.
         let flip_due = unsafe { CLIENT_DREW && TEMPORAL } && !screen_off && ferros_sys::pref(ferros_sys::PREF_DITHER) == 0 && unsafe { PHASE_DIRTY[(CUR_PHASE + 1) % PHASES].is_empty() } && now() >= next_flip;
@@ -9560,12 +9824,22 @@ fn server(grants: u64) -> ! {
         // The temporal dither: the next phase frame on the layer every 100 ms, once a client owns the surface (the frames are only written by its presents). Measured 2026-10-24 with the screen on (DISPLAY-POWER.md): with the 10 Hz floor set the flips cost nothing (3.03 W against 3.05 without them) — the panel idles at its floor between them; held at 120 Hz they would cost 0.37 W.
         // A frame armed by the last camera op: masked again once it has started.
         pipe.settle(&mut armed, false);
-        // Brightness (preference 3): a new white, so a new table and panel setting, and every pixel published again from the back buffer as it stands.
+        // Brightness (preference 3): a new white, so a new bake and panel setting; everything baked with the old one baked again (`rebake`: the icons, the wallpaper, the sprites, the region, the console; the windows told), the map's last frame drawn again, and every pixel published again.
         let b = ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS);
         if b != bright && ten {
             bright = b;
             let (white, peak_e, hbm, dbv) = brightness(b);
-            tabs = odt_masked(white, peak_e);
+            let t_rb = now();
+            bake::set(white, peak_e);
+            bake_consts();
+            tabs = bake::now().odt;
+            rebake(mips, width, height);
+            // The map's last frame drawn again with the new bake, at the top of the next pass (where the clock's replays run), which the bell starts at once.
+            rebake_replay = unsafe { (*(&raw const APP)).is_none() && LAST_FRAME.1 > 0 };
+            ring_bell();
+            log.s(b"display: baked again in ");
+            log.dec(ferros_sys::us_since(t_rb));
+            log.s(b" us; ");
             // The panel's own setting, by the panel thread.
             PANEL_BRIGHT.store((hbm as u64) << 16 | dbv as u64, Ordering::Release);
             PANEL_SEQ.fetch_add(1, Ordering::AcqRel);
@@ -9585,7 +9859,7 @@ fn server(grants: u64) -> ! {
                 pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                 armed = Some(pipe.arm(win));
             }
-            log.s(b"display: full publish ");
+            log.s(b"full publish ");
             log.dec(pub_us);
             log.s(b" us; brightness ");
             log.dec(b as u64);
@@ -9600,12 +9874,10 @@ fn server(grants: u64) -> ! {
             }
             log.flush();
         }
-        // The panel's channels or the look switched (ops 59, 60; development builds): the table again with the channels' rows (`odt_masked`), and every pixel published again from the back buffer as a brightness does, so no phase keeps the old channels or the orange. With an app in front the idle fill brings the phases round.
+        // The panel's channels or the look switched (ops 59, 60; development builds): every pixel published again from the back buffer (the present masks the channels, `neon::Chans`), so no phase keeps the old channels or the orange. With an app in front the idle fill brings the phases round.
         let g = DEV_GEN.load(Ordering::Acquire);
         if g != dev_seen {
             dev_seen = g;
-            let (white, peak_e, _, _) = brightness(bright);
-            tabs = odt_masked(white, peak_e);
             let full = draw::Rect::full(width, height);
             unsafe {
                 PHASE_DIRTY = [full; PHASES];

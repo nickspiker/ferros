@@ -70,6 +70,8 @@ Two things skip the pipe on purpose: the ramps test screen (op 21, straight thro
 
 **Compositing** (payloads/display `draw.rs`, fluor): front to back, premultiplied, `under` — blending in gamma 2, as decided for paint. Circles are cached as sprites per size and turn (`display-sprites`, 32 MiB) and blitted four pixels a step. The glow is the exception that proves the rule only half way: it is added in gamma 2 too (the linear-light glow was tried and looked worse, 2026-10-24), falling off in log distance — Mitchell's log2 by `clz`, the same step every octave of q = d² − r², zero at r/12 past the edge at every size, no divide, no table.
 
+**Since 2026-11-12 the transform is baked** (COMPOSITOR.md "Baked"; owner: "a straight thru render and a sqrt to get the gamma close"): steps 1-3 below run where a colour or an image is made (the palette once per colour, the icons and the wallpaper once per image, apps in their own process or on the GPU), the canvas holds the panel's codes, and the present is step 4 alone, with a 16 × 16 blue-noise dither in place of the Bayer. Steps 1-3 as they were:
+
 **The present stage** (payloads/display `neon.rs` `Odt`, one branchless path for every pixel, 16 at a time):
 1. light — canvas: u = c²/65536 (an exact u8 multiply, one fixed-point convert) into a degree-4 polynomial fitted to the roll-off `tanh²(k·√L)`, k = atanh(√(white/peak)), at each brightness; app: tanh by Lambert's continued fraction (7th order, f32), squared;
 2. the ODT (DISPLAY-CALIB.md "The ODT"), gains + K in f16 — the gains are E's white, K the red-green correction;

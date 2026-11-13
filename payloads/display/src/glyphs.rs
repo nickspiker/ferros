@@ -55,10 +55,11 @@ impl Glyphs {
     /// Draw `s` at `px` pixels with its baseline starting at (x, y), turned by (c, s) on the screen (clockwise for positive s, y down; (1, 0) upright), in `colour` (G#RRGGBB) under what is there. Returns the advance along the baseline.
     pub fn draw(&mut self, px_buf: &mut [crate::draw::Px], width: usize, height: usize, text: &str, x: f32, y: f32, px: f32, turn: (f32, f32), colour: u32) -> f32 {
         let (bx0, by0, bx1, by1) = crate::draw::bounds(width, height);
+        let solid = crate::draw::opaque(colour & 0x00FF_FFFF);
         self.cover(text, x, y, px, turn, |sx, sy, a| {
             if sx >= bx0 && sy >= by0 && sx < bx1 && sy < by1 {
                 let p = &mut px_buf[sy as usize * width + sx as usize];
-                *p = crate::draw::under(*p, crate::draw::at_cover16(colour & 0x00FF_FFFF, a));
+                *p = crate::draw::under(*p, crate::draw::cover(solid, a));
             }
         })
     }

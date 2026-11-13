@@ -125,6 +125,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Masked capsule needs a seal](masked_capsule_needs_seal.md) - after store put of a masked payload run `bridge seal` per device
 - [capsule arg order](capsule_arg_order.md) - `bridge capsule <in> <out>` first, flags after, or the old capsule ships
 - [fluor pixel depth](fluor_pixel_depth.md) - fluor generic over Argb8/G2t16; display takes G2t16 natively
+- [Baked present](baked_present.md) - colours baked into panel codes; the present is dither + pack, 1.17 cycles a pixel
 - [GPU online](gpu_online.md) - Mali-G715 CSF (payloads/gpu), Valhall compute, coherency; traps
 - [hv jump to ferros](hv_jump_to_ferros.md) - freeze Android, fresh ferros on the hv core; screen-off fixes; DPU DMA open
 - [f2fs roll-forward after a jump](f2fs_rollforward_after_jump.md) - Android data newer only in the node chain; `diag part f2fs`

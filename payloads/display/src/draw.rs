@@ -1,6 +1,6 @@
 //! The scene's rasteriser, all integer (owner, 2026-10-22: "keep it integer"): damage rectangles, antialiased discs without a square root, icons sampled through a mip chain with bilinear filtering and their own alpha, and front-to-back compositing on premultiplied pixels.
 //!
-//! Pixels are 64-bit (the 16-bit canvas, owner, 2026-10-24): R, G, B in bits 0-15, 16-31, 32-47 as VSF RGB gamma-2 working values — white at Q14 (16384), up to 4.0 (16× white in light) — and alpha in bits 48-63, colour premultiplied by it; the same layout as an app's surface. Composited front to back — what is drawn first is on top, and a pixel takes only what its alpha leaves room for. An empty pixel is 0 and shows black. Colours handed in (the theme's) are 8-bit codes G#RRGGBB, white at 255, widened here.
+//! Pixels are 64-bit (the 16-bit canvas, owner, 2026-10-24): R, G, B in bits 0-15, 16-31, 32-47 and alpha in bits 48-63, colour premultiplied by it; the same layout as an app's surface. Since 2026-11-12 the channels are baked (bake.rs; COMPOSITOR.md "Baked"): the panel's own codes, the roll-off, its primaries and its gamma applied, in Q16 of its top. Composited front to back: what is drawn first is on top, and a pixel takes only what its alpha leaves room for. An empty pixel is 0 and shows black. Colours handed in (the theme's) are 8-bit VSF RGB gamma 2 codes G#RRGGBB, white at 255, baked here once a colour (`opaque`), and a draw covers its baked colour per pixel (`cover`).
 
 /// A half-open pixel rectangle; empty when x0 >= x1 or y0 >= y1.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -76,16 +76,10 @@ pub fn bounds(width: usize, height: usize) -> (i64, i64, i64, i64) {
 pub type Px = u64;
 const ALPHA: u64 = 0xFFFF << 48;
 
-/// An 8-bit code (white at 255) as a 16-bit working value (white at Q14).
-#[inline(always)]
-pub fn wide8(c: u32) -> u64 {
-    ((c as u64 & 0xFF) * 16384 + 127) / 255
-}
-
-/// G#RRGGBB (8-bit codes) as an opaque pixel.
+/// G#RRGGBB (8-bit VSF RGB gamma 2 codes, the theme's and the ops') as an opaque pixel, baked (bake.rs): once per colour, so a draw takes its colour here once and covers it per pixel (`cover`).
 #[inline(always)]
 pub fn opaque(colour: u32) -> Px {
-    ALPHA | wide8(colour >> 16) | wide8(colour >> 8) << 16 | wide8(colour) << 32
+    ALPHA | crate::bake::now().rgb8(colour)
 }
 
 pub fn clear(px: &mut [Px], width: usize, r: Rect) {
@@ -117,21 +111,18 @@ pub fn under(dst: Px, src: Px) -> Px {
     mix(48) | mix(32) | mix(16) | mix(0)
 }
 
-/// An opaque colour (G#RRGGBB, 8-bit codes) at coverage `cov` (0-255), premultiplied: the 16-bit form at `cov` × 257 (255 to 65535).
+/// An opaque pixel (`opaque`) at 16-bit coverage `cov` (0-65535: the glyph engine's), premultiplied: each channel and α by the coverage, rounded. Blending after the bake, in the panel's codes (owner, 2026-11-12, on edges and glows mixed after the roll-off: "meh. doubt anyone will notice").
 #[inline(always)]
-pub fn at_coverage(colour: u32, cov: u32) -> Px {
-    at_cover16(colour, cov * 257)
+pub fn cover(solid: Px, cov: u32) -> Px {
+    let a = cov as u64;
+    let m = |sh: u32| ((solid >> sh & 0xFFFF) * a + 0x7FFF) / 0xFFFF << sh;
+    a << 48 | m(0) | m(16) | m(32)
 }
 
-/// An opaque colour (G#RRGGBB, 8-bit codes) at 16-bit coverage `cov` (0-65535: the glyph engine's), premultiplied.
+/// `cover` at an 8-bit coverage (0-255), as 16 bits (× 257).
 #[inline(always)]
-pub fn at_cover16(colour: u32, cov: u32) -> Px {
-    if cov >= 65535 {
-        return opaque(colour);
-    }
-    let a = cov as u64;
-    let m = |c: u32| (wide8(c) * a + 0x7FFF) / 0xFFFF;
-    a << 48 | m(colour >> 16) | m(colour >> 8) << 16 | m(colour) << 32
+pub fn cover8(solid: Px, cov: u32) -> Px {
+    cover(solid, cov * 257)
 }
 
 /// The rows a disc covers, with each row's horizontal reach found without a square root: the reach only shrinks moving away from the centre row, so it is walked down a pixel at a time as the rows go (O(r) for the whole disc). Calls `row(y, x_outer_lo, x_outer_hi, x_inner_lo, x_inner_hi)` with the outer span (every pixel the edge may touch) and the inner span (pixels wholly inside), both inclusive, unclipped.
@@ -202,7 +193,7 @@ pub fn disc(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
             if cov <= 0 {
                 continue;
             }
-            *p = under(*p, at_coverage(colour, cov.min(255) as u32));
+            *p = under(*p, cover8(solid, cov.min(255) as u32));
         }
     });
     Rect { x0: ((cx - r) >> 8) as i32 - 2, y0: ((cy - r) >> 8) as i32 - 2, x1: ((cx + r) >> 8) as i32 + 3, y1: ((cy + r) >> 8) as i32 + 3 }.clip(width, height)
@@ -252,7 +243,7 @@ pub fn capsule(px: &mut [Px], width: usize, height: usize, ax: i64, ay: i64, bx:
                 continue;
             }
             // A pixel is never more than covered: the cast to a byte's range is the coverage's own limit.
-            *p = under(*p, at_cover16(colour, (cov * 65535.0) as u16 as u32));
+            *p = under(*p, cover(solid, (cov * 65535.0) as u16 as u32));
         }
     }
 }
@@ -266,6 +257,7 @@ pub fn ring(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
     let q = 1.0 / 256.0;
     let (rf, hw) = (r as f32 * q, w as f32 * q * 0.5);
     let (r2, inv2r) = (rf * rf, 0.5 / rf);
+    let solid = opaque(colour);
     let reach = r + w / 2 + 256;
     // WHY the bounds: the ring is placed by the page and may run past the screen or the redraw's clip; outside them the index is another row or past the buffer.
     for y in (((cy - reach) >> 8) - 1).max(by0)..=(((cy + reach) >> 8) + 1).min(by1 - 1) {
@@ -284,7 +276,7 @@ pub fn ring(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
                 continue;
             }
             // A pixel is never more than covered: the cast to a byte's range is the coverage's own limit.
-            *p = under(*p, at_cover16(colour, (cov * 65535.0) as u16 as u32));
+            *p = under(*p, cover(solid, (cov * 65535.0) as u16 as u32));
         }
     }
 }
@@ -315,6 +307,7 @@ pub fn glow_log(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r:
     let span = 1i64 << (16 + oct_log2);
     let reach = r + r / frac + 256;
     let peak = peak as i64;
+    let solid = opaque(colour);
     spans(cx, cy, reach, |y, xo0, xo1, _, _| {
         if y < by0 || y >= by1 {
             return;
@@ -334,7 +327,7 @@ pub fn glow_log(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r:
             let i = (peak << 8) * (span - t) >> (16 + oct_log2);
             // The glow is a layer of its own colour at α = its intensity (i in 2⁻⁸ steps of 255, at most peak · 2⁸ ≤ G#FF00), under what is there (owner, 2026-11-07, option 3): over black the light is what the additive glow gave, overlapping glows stack as 1 − (1 − a)(1 − b) and never pass white, and the pixel carries the glow's opacity, so whatever goes under it later (a wallpaper) shows in exactly the room it leaves.
             let p = &mut px[rowb + x as usize];
-            *p = under(*p, at_cover16(colour, (i * 0xFFFF / (255 << 8)) as u32));
+            *p = under(*p, cover(solid, (i * 0xFFFF / (255 << 8)) as u32));
             // The multiply behind the light, on the same profile: black at α = dark · (span − t) / span, Q16 (the product at most 2³² · 2^oct_log2 before the shift).
             *p = under(*p, (((dark * (span - t)) >> (16 + oct_log2)) as u64) << 48);
             true
@@ -369,6 +362,7 @@ pub fn glow(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
     // The farthest q that is still at or above the floor, and a radius that surely contains it: q ≥ 2r·e, so e ≤ q / 2r.
     let q_max = num / floor.max(1) as i64;
     let reach = r + q_max / (2 * r) + 256;
+    let solid = opaque(colour);
     spans(cx, cy, reach, |y, xo0, xo1, _, _| {
         if y < by0 || y >= by1 {
             return;
@@ -391,7 +385,7 @@ pub fn glow(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
             // The intensity in 2⁻⁸ steps of `peak`'s (16 bits, as the canvas): whole steps of 1/255 banded the glows' long gradients. The `min` is the falloff's own peak: 1/distance grows without bound toward the edge and the glow holds its peak there.
             let i = ((num << 8) / q).min((peak as i64) << 8);
             // A layer of its own colour at α = its intensity, under what is there, as in `glow_log` (owner, 2026-11-07, option 3).
-            *p = under(*p, at_cover16(colour, (i * 0xFFFF / (255 << 8)) as u32));
+            *p = under(*p, cover(solid, (i * 0xFFFF / (255 << 8)) as u32));
             true
         };
         // From each end of the row inward to the circle's edge: the interior is never visited (zoomed in, it is most of the screen, and visiting it pixel by pixel was the lag, 2026-10-23).
@@ -503,6 +497,7 @@ pub fn clock(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i6
     nseg += 1;
     // Ticks first (front to back: what is drawn first stays on top): radial 1-pixel lines across each ring, inset a pixel at both ends.
     for &((ux, uy), r_in, r_out, tick) in &segs[..nseg] {
+        let tick = opaque(tick);
         {
             let (ex, ey) = (cx + (ux * r_out >> 14), cy + (uy * r_out >> 14));
             let (sx, sy) = (cx + (ux * r_in >> 14), cy + (uy * r_in >> 14));
@@ -522,7 +517,7 @@ pub fn clock(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i6
                     return;
                 }
                 let p = &mut px[y as usize * width + x as usize];
-                *p = under(*p, at_coverage(tick, cov.min(255) as u32));
+                *p = under(*p, cover8(tick, cov.min(255) as u32));
             };
             let (ldx, ldy) = (ex - sx, ey - sy);
             if ldx.abs() >= ldy.abs() {
@@ -634,24 +629,30 @@ pub fn clock(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i6
 }
 
 /// One icon's mip chain: level 0 is the bundle's size, each next one half that, averaged 2×2, down to 4×4. Texels are canvas pixels (`Px`: 16 bits a channel, premultiplied) with a transparent border of two texels around every level so the sampler never tests bounds: `rgba` in the icon's colours, `grey` in its photopic grey (the map at rest). Sixteen bits all the way down (owner, 2026-10-24: an 8-bit image averaged down gains precision — 256×256 to 8×8 averages 1024 samples a texel): level 0 is the bundle's 8-bit codes widened, and every 2×2 average keeps its fraction instead of rounding back to 8 bits.
+/// Baked (bake.rs): level 0 is each texel's straight colour baked, then premultiplied by its α, and the levels below average those; a brightness change bakes the chain again in place from the bundle (`fill`).
 #[derive(Clone, Copy)]
 pub struct Mips {
     pub size: usize,
     pub levels: usize,
     /// Level l starts at `offset[l]` texels; its rows are `size >> l` + 4 texels long (the border).
     pub offset: [usize; 8],
-    pub rgba: &'static [Px],
-    pub grey: &'static [Px],
+    rgba: *mut Px,
+    grey: *mut Px,
+    total: usize,
 }
 
 const PAD: usize = 2;
 
 impl Mips {
+    /// The chain in the icon's colours.
+    pub fn rgba(&self) -> &[Px] {
+        // SAFETY: `build` allocated `total` texels for the process; `fill` writes them only on the render thread between frames, when nothing samples them.
+        unsafe { core::slice::from_raw_parts(self.rgba, self.total) }
+    }
+
     /// From the bundle's straight-alpha RGBA and grey planes.
-    /// `decode`: each bundle code's 16-bit canvas value (gamma2tanh or gamma 2 codes to working values, white at Q14, highlights above it kept).
+    /// `decode`: each bundle code's 16-bit working value (gamma2tanh or gamma 2 codes to working values, white at Q14, highlights above it kept), baked here.
     pub fn build(rgba_in: &[u8], grey_in: &[u8], size: usize, decode: &[u16; 256]) -> Mips {
-        // The bundle's code to its 16-bit canvas value (main.rs `icon_decode`).
-        let dec = |c: u8| decode[c as usize] as u64;
         let mut total = 0;
         let mut offset = [0usize; 8];
         let mut levels = 0;
@@ -662,18 +663,37 @@ impl Mips {
             levels += 1;
             s /= 2;
         }
-        let rgba: &'static mut [Px] = alloc::vec![0u64; total].leak();
-        let grey: &'static mut [Px] = alloc::vec![0u64; total].leak();
+        let rgba = alloc::vec![0u64; total].leak().as_mut_ptr();
+        let grey = alloc::vec![0u64; total].leak().as_mut_ptr();
+        let m = Mips { size, levels, offset, rgba, grey, total };
+        m.fill(rgba_in, grey_in, decode);
+        m
+    }
+
+    /// The chain made (again) from the bundle's planes with the bake in use: level 0 a row at a time, each texel's straight working value baked (`Bake::working_row`) and then premultiplied by its α, and every level below from it.
+    pub fn fill(&self, rgba_in: &[u8], grey_in: &[u8], decode: &[u16; 256]) {
+        let (size, levels, offset) = (self.size, self.levels, self.offset);
+        // SAFETY: as `rgba`; nothing else holds these slices while the chain is made.
+        let (rgba, grey) = unsafe { (core::slice::from_raw_parts_mut(self.rgba, self.total), core::slice::from_raw_parts_mut(self.grey, self.total)) };
+        let dec = |c: u8| decode[c as usize] as u64;
         let at = |l: usize, x: usize, y: usize| offset[l] + (y + PAD) * ((size >> l) + 2 * PAD) + x + PAD;
+        let bake = crate::bake::now();
+        let mut row = alloc::vec![0u64; 2 * size];
         for y in 0..size {
+            let (c, g) = row.split_at_mut(size);
             for x in 0..size {
                 let i = y * size + x;
-                let a = rgba_in[i * 4 + 3] as u64;
-                // Premultiplied in 16 bits: the widened code times alpha.
-                let pm = |c: u8| (dec(c) * a + 127) / 255;
-                rgba[at(0, x, y)] = (a * 257) << 48 | pm(rgba_in[i * 4]) | pm(rgba_in[i * 4 + 1]) << 16 | pm(rgba_in[i * 4 + 2]) << 32;
-                let g = pm(grey_in[i]);
-                grey[at(0, x, y)] = (a * 257) << 48 | g | g << 16 | g << 32;
+                c[x] = dec(rgba_in[i * 4]) | dec(rgba_in[i * 4 + 1]) << 16 | dec(rgba_in[i * 4 + 2]) << 32;
+                g[x] = dec(grey_in[i]) * 0x0000_0001_0001_0001;
+            }
+            bake.working_row(&mut row);
+            for x in 0..size {
+                let a = rgba_in[(y * size + x) * 4 + 3] as u64;
+                // Premultiplied in 16 bits: the baked code times alpha.
+                let pm = |p: u64, sh: u32| ((p >> sh & 0xFFFF) * a + 127) / 255 << sh;
+                let (c, g) = (row[x], row[size + x]);
+                rgba[at(0, x, y)] = (a * 257) << 48 | pm(c, 0) | pm(c, 16) | pm(c, 32);
+                grey[at(0, x, y)] = (a * 257) << 48 | pm(g, 0) | pm(g, 16) | pm(g, 32);
             }
         }
         let mut s = size;
@@ -695,7 +715,6 @@ impl Mips {
             }
             s = n;
         }
-        Mips { size, levels, offset, rgba, grey }
     }
 }
 
@@ -723,7 +742,7 @@ pub fn icon(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
     }
     let size = (m.size >> l) as i64;
     let stride = size as usize + 2 * PAD;
-    let tex = &m.rgba[m.offset[l]..m.offset[l] + stride * stride];
+    let tex = &m.rgba()[m.offset[l]..m.offset[l] + stride * stride];
     // One texel in Q8 screen pixels at radius r, and the trim: the larger of 2 px and 2 texels.
     let texel = (2 * r) / size.max(1);
     let r_art = r + (2 * 256i64).max(2 * texel);
@@ -800,6 +819,12 @@ pub fn bump_step(t: f32) -> f32 {
 
 include!(concat!(env!("OUT_DIR"), "/logo.rs"));
 
+/// A piece's colour (`LOGO`'s working values, white at Q14) baked, its three channels.
+fn baked(c: [u16; 3]) -> [u16; 3] {
+    let p = crate::bake::now().px(c.map(|v| v as f32 * (1. / 16384.)));
+    [p as u16, (p >> 16) as u16, (p >> 32) as u16]
+}
+
 /// The ferros mark inside the disc of radius `r` (Q8) at (cx, cy), turned by (c, s) Q14 (screen to mark is the inverse turn, as `icon` has it), under what is there: its pieces (`LOGO`, build.rs from logo.vsf) drawn from their geometry at this size, so it is sharp at every zoom, in place of the bundle's raster (owner, 2026-11-07).
 /// A piece's coverage at a pixel is the product of its edges' C∞ steps (`bump_step` across two pixels centred on the edge, slope 1 there as area coverage rises): its outer arc, its inner arc if it is a ring, and its two radial sides if it does not go all the way round, each side a half-plane through the centre (both for a piece under half a turn, either for one over). Where two pieces meet they share the edge and their steps sum to exactly one, and pieces never overlap, so their coverages add into one layer (premultiplied, its α their sum) and that layer goes under the pixel: no seam, and nothing laid over anything.
 /// By spans, row by row: only the pixels within a step of some edge (an arc's band, a side's band) are worked out one by one; between them nothing changes, so each run takes the value of its first pixel and is filled. The first cut worked out every pixel with an arctangent and a sine per piece, about 46 ms a frame at a large zoom (2026-11-07).
@@ -822,7 +847,7 @@ pub fn logo(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
         let (a0, a1) = (start * core::f32::consts::TAU, (start + sweep) * core::f32::consts::TAU);
         let n0 = turn(-libm::sinf(a0), libm::cosf(a0));
         let n1 = turn(libm::sinf(a1), -libm::cosf(a1));
-        pieces[k] = (inner * rf, outer * rf, n0, n1, sweep >= 1.0, sweep > 0.5, if lit { colour } else { [grey; 3] });
+        pieces[k] = (inner * rf, outer * rf, n0, n1, sweep >= 1.0, sweep > 0.5, baked(if lit { colour } else { [grey; 3] }));
     }
     // The exact layer at an offset from the centre.
     let exact = |dx: f32, dy: f32| -> Px {
@@ -965,7 +990,7 @@ pub fn logo_hard(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r
         let (a0, a1) = (start * core::f32::consts::TAU, (start + sweep) * core::f32::consts::TAU);
         let n0 = turn(-libm::sinf(a0), libm::cosf(a0));
         let n1 = turn(libm::sinf(a1), -libm::cosf(a1));
-        let col = if lit { colour } else { [grey; 3] };
+        let col = baked(if lit { colour } else { [grey; 3] });
         let p = ALPHA | col[0] as u64 | (col[1] as u64) << 16 | (col[2] as u64) << 32;
         let (rin, rout) = (inner * rf, outer * rf);
         pieces[k] = (rin * rin, rout * rout, n0, n1, sweep >= 1.0, sweep > 0.5, [p, p]);

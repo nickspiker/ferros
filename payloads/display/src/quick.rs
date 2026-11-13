@@ -232,7 +232,7 @@ pub fn open_circles(width: usize, height: usize) -> Option<[(f32, f32, f32); N]>
     (slide > 0 && unsafe { COMPOSED } == slide).then(|| layout(width, height))
 }
 
-/// One circle's sprite: every pixel the circle draws (out to its reach past the radius), row by row from `y0`, each row a span of columns [x0, x1) at `at` in `data`. Drawn in fluor's α + darkness, then decoded in place to working values (`working`), as the bars are, so a frame of the slide only copies and folds.
+/// One circle's sprite: every pixel the circle draws (out to its reach past the radius), row by row from `y0`, each row a span of columns [x0, x1) at `at` in `data`. Drawn in fluor's α + darkness, then baked in place (bake.rs), as the bars are, so a frame of the slide only copies and folds.
 struct Sprite {
     y0: i64,
     span: &'static [(u16, u16, u32)],
@@ -329,14 +329,15 @@ fn look(k: usize, s: &Now) -> (f32, bool, Option<f32>, u64) {
         Item::Torch => s.torch.map(|l| s.torch_arc.unwrap_or(l as f32 * (1. / 255.))),
         _ => None,
     };
-    let mut key = 0x9E37_79B9_7F4A_7C15u64 ^ k as u64;
+    // The bake's generation in it too: a brightness change bakes every sprite again.
+    let mut key = 0x9E37_79B9_7F4A_7C15u64 ^ k as u64 ^ (bake::generation() as u64) << 40;
     for v in [grey.to_bits() as u64 | (on as u64) << 32, ring.map_or(u64::MAX, |f| f.to_bits() as u64), sound as u64 | (ferros_sys::pref(ferros_sys::PREF_LANG) as u64) << 8 | (ferros_sys::pref(ferros_sys::PREF_LANG + 1) as u64) << 16] {
         key = (key.rotate_left(7) ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
     (grey, on, ring, key | 1)
 }
 
-/// Circle k drawn into its sprite at its size, front to back from empty: its ring, its word, then its vessel under them (the console's vessel, `orb::Vessel`, by a table over the radius); then decoded in place to working values.
+/// Circle k drawn into its sprite at its size, front to back from empty: its ring, its word, then its vessel under them (the console's vessel, `orb::Vessel`, by a table over the radius); then baked in place (bake.rs `g2t_in_place`).
 /// The sprites drawn since the slide's last measurement line (main.rs `slide_shown`).
 pub static RENDERS: AtomicU64 = AtomicU64::new(0);
 
@@ -382,9 +383,7 @@ fn render(k: usize, grey: f32, on: bool, ring_share: Option<f32>, width: usize, 
             data[i] = data[i].under(rg, BlendMode::Normal).under(body, BlendMode::Normal);
         }
     }
-    for p in data.iter_mut() {
-        *p = working(*p, G2T16);
-    }
+    bake::now().g2t_in_place(data);
 }
 
 /// The worker's pass over the row (`console_worker`): any circle whose look changed drawn again into its sprite (a tap, a ring dragged, a language), and the offset taken. Returns the bars' rows owed a compose: those a changed sprite covers where it stands now, and the band where the row was and is when it moved. What it took is the next `compose`'s.

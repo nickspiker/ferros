@@ -1,8 +1,179 @@
-//! The present stage's publish in NEON: 16 pixels per step, from the 8-bit canvas or an app's 16-bit surface, through the ODT (`Odt`, below) to one temporal phase frame's 10-bit words. One branchless path for every pixel: no grey test, no scalar fallback, no clamp.
+//! The display's pixel work in NEON, 16 pixels a step, one branchless path for every pixel: no grey test, no scalar fallback.
+//! - **The present** (owner, 2026-11-12: "a straight thru render and a sqrt to get the gamma close"): the canvas and a baked surface already hold the panel's own codes (COMPOSITOR.md "Baked"), so a phase's words are each code plus its threshold, the high byte, packed (`present16`, `present_app16`, `present_pack`). About one instruction a pixel.
+//! - **The bake** (`bake16`, `bake16_lights`): working values (VSF RGB, gamma 2, white at Q14) thru the roll-off, the ODT and the panel's 1/2.19 to those codes, the ODT's tables (`Odt`) as before. What every frame paid until 2026-11-12 is now paid once per image (the wallpaper as it loads, the icons, the console's decoded rows) and per frame only for a surface that is not baked (a format 0 or 1 window).
+//! - The old present (`sixteen_canvas`, `codes_app`, `dither_codes`, `thresholds`) is kept for the start-up bench that measures one against the other and for the GPU driver's check of its present kernel (payloads/gpu).
 
 use core::arch::aarch64::*;
 
-/// The threshold vector for 16 pixels starting at a multiple of 16 on row `y`, for phase `k` (draw-side `threshold`: Bayer × 4 + the temporal rank offset per 4×4 cell).
+/// The present's dither (owner, 2026-11-12: "if I remember right, there's some tricks to get a nice dither for our four panes"): a 16 × 16 blue-noise threshold field, every rank 0-255 once (void and cluster on the torus, Ulichney's σ 1.5), so each phase alone carries the eight fraction bits a baked code has below the 8-bit code the link takes; and phase k turns each threshold's two low bits by `TURN[k]` (an XOR), so over the four phases a pixel visits four thresholds within 3/256 of a code of each other.
+/// Measured on the host against the dithers it could have been (each phase's error and the change from one phase to the next thru an eye-like blur of 0.75, 1 and 1.5 px, every fraction of a code; COMPOSITOR.md "The dither"): at rest, where each phase is held a tenth of a second, as quiet as the old 4×4 Bayer with its temporal rank and the same as a 16 × 16 Bayer; the shimmer from phase to phase 2.5 times smaller than the old one's and the smallest of every candidate (a 2 × 2 pattern turned thru the phases shimmers twice as much at arm's length, a fresh noise each phase four times).
+pub const BLUE: [[u8; 16]; 16] = [
+    [78, 190, 245, 170, 143, 39, 192, 90, 172, 247, 163, 138, 7, 187, 133, 236],
+    [3, 152, 47, 71, 210, 120, 234, 0, 213, 114, 20, 203, 83, 55, 208, 98],
+    [221, 112, 135, 229, 17, 96, 159, 70, 140, 48, 97, 232, 176, 121, 23, 165],
+    [41, 201, 26, 82, 174, 50, 200, 30, 184, 243, 155, 66, 33, 149, 240, 69],
+    [88, 252, 158, 195, 129, 248, 108, 224, 80, 118, 15, 188, 91, 215, 110, 183],
+    [14, 123, 60, 102, 5, 73, 147, 13, 169, 44, 207, 130, 251, 8, 51, 142],
+    [168, 218, 34, 209, 238, 186, 38, 217, 134, 239, 100, 59, 160, 77, 199, 235],
+    [99, 74, 179, 139, 53, 164, 122, 92, 64, 180, 4, 227, 31, 173, 119, 29],
+    [154, 246, 11, 113, 84, 22, 233, 191, 25, 153, 115, 193, 141, 94, 220, 57],
+    [136, 43, 194, 231, 151, 211, 105, 54, 253, 85, 219, 72, 49, 249, 12, 189],
+    [212, 81, 124, 65, 35, 178, 2, 145, 204, 36, 131, 19, 205, 157, 76, 111],
+    [228, 6, 167, 206, 95, 241, 128, 67, 166, 109, 185, 237, 101, 127, 181, 32],
+    [150, 106, 250, 21, 146, 46, 216, 89, 244, 10, 63, 161, 45, 1, 242, 62],
+    [177, 40, 137, 61, 196, 116, 18, 182, 42, 148, 230, 87, 214, 144, 198, 93],
+    [226, 202, 86, 223, 175, 79, 156, 225, 107, 197, 125, 28, 171, 68, 117, 16],
+    [56, 126, 27, 104, 9, 254, 58, 132, 24, 75, 52, 222, 103, 255, 37, 162],
+];
+/// Each phase's turn of the thresholds' two low bits (an XOR): the order of the four that shimmered least of the 24.
+pub const TURN: [u8; 4] = [0, 2, 3, 1];
+
+/// The present's thresholds for row `y` in phase `k`, sixteen of them (the field repeats every 16 pixels, and every publish starts its blocks at a multiple of 16), widened to two u16 vectors for the add: built once a row.
+#[inline(always)]
+pub fn row_thresholds(y: usize, k: usize) -> (uint16x8_t, uint16x8_t) {
+    row_thresholds_at(y, k, 0)
+}
+
+/// `row_thresholds` for blocks that start `x` columns past a multiple of 16 (an app's publish starts where its damage does): the row's sixteen turned by one table lookup.
+#[inline(always)]
+pub fn row_thresholds_at(y: usize, k: usize, x: usize) -> (uint16x8_t, uint16x8_t) {
+    unsafe {
+        const IDX: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let i = vandq_u8(vaddq_u8(vld1q_u8(IDX.as_ptr()), vdupq_n_u8((x & 15) as u8)), vdupq_n_u8(15));
+        let t = vqtbl1q_u8(veorq_u8(vld1q_u8(BLUE[y & 15].as_ptr()), vdupq_n_u8(TURN[k & 3])), i);
+        (vmovl_u8(vget_low_u8(t)), vmovl_high_u8(t))
+    }
+}
+
+/// The panel's channels as the present writes them (main.rs `CHANNELS`): a byte mask a channel, G#FF on and 0 off, each code ANDed with its channel's before the pack.
+#[derive(Clone, Copy)]
+pub struct Chans(pub uint8x16_t, pub uint8x16_t, pub uint8x16_t);
+impl Chans {
+    /// From the mask's bits: 0 red, 1 green, 2 blue, set = on.
+    pub fn new(m: u32) -> Chans {
+        let on = |c: u32| ((m >> c & 1) as u8).wrapping_neg();
+        unsafe { Chans(vdupq_n_u8(on(0)), vdupq_n_u8(on(1)), vdupq_n_u8(on(2))) }
+    }
+}
+
+/// 16 pixels' baked codes (Q16 of the panel's top code: red, green, blue, each two halves of eight) dithered by the row's thresholds (t0, t1) and packed into 16 words. Each code is (b + t) >> 8: the saturating add holds a code past 255.996 at 255 (a baked value is at most 65535, so only the add can pass the field), and the high bytes of sixteen sums are one unzip. Packed B[31:22] G[21:12] R[11:2] A[1:0], each code's two low bits zero for the DQE's truncation: the word's four bytes as four planes, (R << 4) | 3, (G << 6) | (R >> 4), G >> 2, B, written by one interleaving store.
+#[inline(always)]
+pub unsafe fn present_pack(q: [uint16x8_t; 6], t0: uint16x8_t, t1: uint16x8_t, cm: Chans, dst: *mut u32) {
+    unsafe {
+        let code = |a: uint16x8_t, b: uint16x8_t| vuzp2q_u8(vreinterpretq_u8_u16(vqaddq_u16(a, t0)), vreinterpretq_u8_u16(vqaddq_u16(b, t1)));
+        let (r, g, b) = (vandq_u8(code(q[0], q[1]), cm.0), vandq_u8(code(q[2], q[3]), cm.1), vandq_u8(code(q[4], q[5]), cm.2));
+        let p0 = vsliq_n_u8::<4>(vdupq_n_u8(3), r);
+        let p1 = vsliq_n_u8::<6>(vshrq_n_u8::<4>(r), g);
+        let p2 = vshrq_n_u8::<2>(g);
+        core::arch::asm!(
+            "st4 {{v28.16b, v29.16b, v30.16b, v31.16b}}, [{p}]",
+            p = in(reg) dst,
+            in("v28") p0, in("v29") p1, in("v30") p2, in("v31") b,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// 16 canvas pixels (baked, its fourth lane its α, which plays no part: the canvas is over black) presented into 16 words.
+#[inline(always)]
+pub unsafe fn present16(src: *const u64, dst: *mut u32, t0: uint16x8_t, t1: uint16x8_t, cm: Chans) {
+    unsafe {
+        let p0 = vld4q_u16(src as *const u16);
+        let p1 = vld4q_u16((src as *const u16).add(32));
+        present_pack([p0.0, p1.0, p0.1, p1.1, p0.2, p1.2], t0, t1, cm, dst);
+    }
+}
+
+/// 16 composed pixels of a surface or the glass (baked, bit 48 = no dither) presented into 16 words: a pixel with bit 48 takes threshold 0 (the mask's black and orange, flat).
+#[inline(always)]
+pub unsafe fn present_app16(src: *const u64, dst: *mut u32, t0: uint16x8_t, t1: uint16x8_t, cm: Chans) {
+    unsafe {
+        let p0 = vld4q_u16(src as *const u16);
+        let p1 = vld4q_u16((src as *const u16).add(32));
+        let one = vdupq_n_u16(1);
+        let (t0, t1) = (vbicq_u16(t0, vtstq_u16(p0.3, one)), vbicq_u16(t1, vtstq_u16(p1.3, one)));
+        present_pack([p0.0, p1.0, p0.1, p1.1, p0.2, p1.2], t0, t1, cm, dst);
+    }
+}
+
+/// The present with the owner's root first, measured against the bake's (COMPOSITOR.md "Baked"; only the start-up bench runs it): 16 pixels whose channels are the square of the panel's code (Q16: light-like values, as a canvas composited in light would hold them), each channel rooted in f16 (`fsqrt`, or with `newton` the estimate and one Newton step, x · rsqrt(x)), back to Q16, and presented.
+#[inline(never)]
+pub unsafe fn present_sqrt16(src: *const u64, dst: *mut u32, t0: uint16x8_t, t1: uint16x8_t, cm: Chans, newton: bool) {
+    unsafe {
+        let p0 = vld4q_u16(src as *const u16);
+        let p1 = vld4q_u16((src as *const u16).add(32));
+        let root = |v: uint16x8_t| -> uint16x8_t {
+            let out: uint16x8_t;
+            if newton {
+                core::arch::asm!(
+                    "ucvtf {x:v}.8h, {v:v}.8h, #16",
+                    "frsqrte {e:v}.8h, {x:v}.8h",
+                    "fmul {t:v}.8h, {x:v}.8h, {e:v}.8h",
+                    "frsqrts {t:v}.8h, {t:v}.8h, {e:v}.8h",
+                    "fmul {e:v}.8h, {e:v}.8h, {t:v}.8h",
+                    "fmul {x:v}.8h, {x:v}.8h, {e:v}.8h",
+                    "fcvtzu {o:v}.8h, {x:v}.8h, #16",
+                    v = in(vreg) v, x = out(vreg) _, e = out(vreg) _, t = out(vreg) _, o = out(vreg) out,
+                    options(pure, nomem, nostack),
+                );
+            } else {
+                core::arch::asm!(
+                    "ucvtf {x:v}.8h, {v:v}.8h, #16",
+                    "fsqrt {x:v}.8h, {x:v}.8h",
+                    "fcvtzu {o:v}.8h, {x:v}.8h, #16",
+                    v = in(vreg) v, x = out(vreg) _, o = out(vreg) out,
+                    options(pure, nomem, nostack),
+                );
+            }
+            out
+        };
+        present_pack([root(p0.0), root(p1.0), root(p0.1), root(p1.1), root(p0.2), root(p1.2)], t0, t1, cm, dst);
+    }
+}
+
+/// 16 working pixels (VSF RGB, gamma 2, white at Q14, to 4.0) baked into 16 (`dst` may be `src`): the light by Lambert's tanh (`light16h`), the ODT, the panel's code (`code16`, Q4 of a 10-bit code, its top 16368), then ×4 into the baked Q16 by a saturating shift. WHY saturating: a light past the panel's peak (a colour the panel's primaries reach only past its top, VSF red's panel red at 1.36 of the peak) codes past 16383, and its ×4 would carry out of the field into a dark code; the old present held it at 255 by its saturating narrow, and the bake holds it at the top the same way. Each pixel's fourth lane (its α or its flags) is kept as it came.
+#[inline(always)]
+pub unsafe fn bake16(o: &Odt, src: *const u64, dst: *mut u64) {
+    unsafe {
+        let p0 = vld4q_u16(src as *const u16);
+        let p1 = vld4q_u16((src as *const u16).add(32));
+        let (r0, g0, b0) = matrix8(o, light16h(o, p0.0), light16h(o, p0.1), light16h(o, p0.2));
+        let (r1, g1, b1) = matrix8(o, light16h(o, p1.0), light16h(o, p1.1), light16h(o, p1.2));
+        bake_store(o, [r0, r1, g0, g1, b0, b1], p0.3, p1.3, dst);
+    }
+}
+
+/// 16 pixels' lights (f16 bits, the E peak at 2^14, VSF RGB: red, green, blue, two halves each) thru the ODT and the panel's code into baked pixels, `a0`, `a1` their fourth lanes.
+#[inline(always)]
+pub unsafe fn bake16_lights(o: &Odt, l: [uint16x8_t; 6], a0: uint16x8_t, a1: uint16x8_t, dst: *mut u64) {
+    unsafe {
+        let (r0, g0, b0) = matrix8(o, l[0], l[2], l[4]);
+        let (r1, g1, b1) = matrix8(o, l[1], l[3], l[5]);
+        bake_store(o, [r0, r1, g0, g1, b0, b1], a0, a1, dst);
+    }
+}
+
+/// Panel lights (red, green, blue, two halves each) to codes, ×4 saturating (`bake16`'s WHY), stored as 16 pixels with their fourth lanes.
+#[inline(always)]
+unsafe fn bake_store(o: &Odt, p: [uint16x8_t; 6], a0: uint16x8_t, a1: uint16x8_t, dst: *mut u64) {
+    unsafe {
+        let (cr, cg, cb) = (code16(o, p[0], p[1]), code16(o, p[2], p[3]), code16(o, p[4], p[5]));
+        let q = |c: uint16x8_t| vqshlq_n_u16::<2>(c);
+        vst4q_u16(dst as *mut u16, uint16x8x4_t(q(cr.0), q(cg.0), q(cb.0), a0));
+        vst4q_u16((dst as *mut u16).add(32), uint16x8x4_t(q(cr.1), q(cg.1), q(cb.1), a1));
+    }
+}
+
+/// Eight baked pixels' codes, red, green and blue (a flight frame's half resolution, COMPOSITOR.md "The flight, prerendered"): the lanes themselves, the codes being what the canvas holds.
+#[inline(always)]
+pub unsafe fn lanes8(src: *const u64) -> [uint16x8_t; 3] {
+    unsafe {
+        let p = vld4q_u16(src as *const u16);
+        [p.0, p.1, p.2]
+    }
+}
+
+/// The old present's threshold vector for 16 pixels starting at a multiple of 16 on row `y`, for phase `k` (Bayer × 4 + the temporal rank offset per 4×4 cell), kept for the bench and the GPU driver's check.
 pub fn thresholds(y: usize, k: usize, bayer: &[[u16; 4]; 4], rank: &[u32; 4]) -> [u8; 16] {
     let mut t = [0u8; 16];
     for (x, e) in t.iter_mut().enumerate() {
@@ -176,7 +347,7 @@ unsafe fn code16(o: &Odt, a: uint16x8_t, b: uint16x8_t) -> (uint16x8_t, uint16x8
     }
 }
 
-/// Three channels of 16 Q4 codes, dithered by `th` (one threshold per pixel, 0-63), packed B[31:22] G[21:12] R[11:2] A[1:0] (each code's two low bits zero, for the DQE's truncation) and stored as 16 words: the word's four bytes are four planes — (R << 4) | 3, (G << 6) | (R >> 4), G >> 2, B — written by one interleaving store.
+/// The old present's dither and pack (`sixteen_canvas`): three channels of 16 Q4 codes, dithered by `th` (one threshold per pixel, 0-63), packed B[31:22] G[21:12] R[11:2] A[1:0] (each code's two low bits zero, for the DQE's truncation) and stored as 16 words: the word's four bytes are four planes: (R << 4) | 3, (G << 6) | (R >> 4), G >> 2, B, written by one interleaving store.
 #[inline(always)]
 pub unsafe fn dither_pack(q: [uint16x8_t; 6], th: uint8x16_t, dst: *mut u32) {
     unsafe {
@@ -195,51 +366,7 @@ pub unsafe fn dither_pack(q: [uint16x8_t; 6], th: uint8x16_t, dst: *mut u32) {
     }
 }
 
-/// 16 of an app's pixels (u64 each: R, G, B working values in bits 0-15, 16-31, 32-47; bit 48 = no dither) through the ODT, dithered by `th` except where bit 48 asks not, into 16 words.
-#[inline(always)]
-pub unsafe fn sixteen_app(o: &Odt, src: *const u64, dst: *mut u32, th: uint8x16_t) {
-    unsafe { dither_codes(&codes_app(o, src), th, dst) }
-}
-
-/// 16 pixels' Q4 codes before the dither, red, green, blue (two halves each), and the lanes bit 48 keeps undithered: what every phase shares of a pixel (the dither is the only per-phase step), so a publish into several phases works the light, ODT and code out once (`codes_app`) and only dithers and packs per phase (`dither_codes`).
-#[derive(Clone, Copy)]
-pub struct Codes16 {
-    q: [uint16x8_t; 6],
-    nd: uint8x16_t,
-}
-
-/// 16 of an app's pixels (as `sixteen_app` takes them) to their codes, light, ODT and code, once.
-#[inline(always)]
-pub unsafe fn codes_app(o: &Odt, src: *const u64) -> Codes16 {
-    unsafe {
-        let p0 = vld4q_u16(src as *const u16);
-        let p1 = vld4q_u16((src as *const u16).add(32));
-        let (r0, g0, b0) = matrix8(o, light16h(o, p0.0), light16h(o, p0.1), light16h(o, p0.2));
-        let (r1, g1, b1) = matrix8(o, light16h(o, p1.0), light16h(o, p1.1), light16h(o, p1.2));
-        let (cr, cg, cb) = (code16(o, r0, r1), code16(o, g0, g1), code16(o, b0, b1));
-        let one = vdupq_n_u16(1);
-        let nd = vcombine_u8(vmovn_u16(vtstq_u16(p0.3, one)), vmovn_u16(vtstq_u16(p1.3, one)));
-        Codes16 { q: [cr.0, cr.1, cg.0, cg.1, cb.0, cb.1], nd }
-    }
-}
-
-/// 16 codes (`codes_app`) dithered by one phase's thresholds `th` (but where they keep undithered) and packed into 16 words.
-#[inline(always)]
-pub unsafe fn dither_codes(c: &Codes16, th: uint8x16_t, dst: *mut u32) {
-    unsafe { dither_pack(c.q, vbicq_u8(th, c.nd), dst) }
-}
-
-/// The 16 thresholds of row `y`, phase `k`, for 16 pixels starting at any `x` (the pattern repeats every 16 pixels; `base` = `thresholds(y, k, ..)` at x = 0).
-#[inline(always)]
-pub unsafe fn thresholds_at(base: uint8x16_t, x: usize) -> uint8x16_t {
-    unsafe {
-        const IDX: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-        let i = vandq_u8(vaddq_u8(vld1q_u8(IDX.as_ptr()), vdupq_n_u8((x & 15) as u8)), vdupq_n_u8(15));
-        vqtbl1q_u8(base, i)
-    }
-}
-
-/// 16 canvas pixels — the 16-bit canvas (draw.rs `Px`: R, G, B, A in 16-bit lanes, white at Q14, to 4.0) — through the ODT with this row's thresholds into 16 words: the light by Lambert's tanh as an app's (the canvas now has headroom above white), the ODT, the code, the dither, the pack. The canvas is composited over black, so its premultiplied colour is what shows and alpha plays no part. Sixteen black pixels are 16 black words without the ODT.
+/// The old present (until 2026-11-12, the bench's "before" and the GPU driver's reference): 16 working pixels (R, G, B, A in 16-bit lanes, white at Q14, to 4.0) thru the ODT with this row's thresholds into 16 words: the light by Lambert's tanh, the ODT, the code, the old dither, the pack. Over black, so alpha plays no part. Sixteen black pixels are 16 black words without the ODT.
 #[inline(always)]
 pub unsafe fn sixteen_canvas(o: &Odt, src: *const u64, dst: *mut u32, th: uint8x16_t) {
     unsafe {
@@ -285,19 +412,6 @@ pub unsafe fn opaque_at2(p: *mut u64, a: u16) {
         let hi = vmull_high_u16(v, av);
         let q = vrshrn_high_n_u32::<16>(vrshrn_n_u32::<16>(vsraq_n_u32::<16>(lo, lo)), vsraq_n_u32::<16>(hi, hi));
         vst1q_u16(p as *mut u16, vbslq_u16(vld1q_u16(COLOUR.as_ptr()), q, av));
-    }
-}
-
-/// Eight working pixels (the 16-bit canvas's) to their codes, red, green and blue: light, ODT and code once a pixel (a flight frame's half resolution, COMPOSITOR.md "The flight, prerendered"). The canvas is over black: alpha plays no part.
-#[inline(always)]
-pub unsafe fn codes8(o: &Odt, src: *const u64) -> [uint16x8_t; 3] {
-    unsafe {
-        let p = vld4q_u16(src as *const u16);
-        let (r, g, b) = matrix8(o, light16(o, p.0), light16(o, p.1), light16(o, p.2));
-        // code16 takes two lights' eights and gives each its own codes back in order: red and green in one, blue alone.
-        let (cr, cg) = code16(o, r, g);
-        let (cb, _) = code16(o, b, b);
-        [cr, cg, cb]
     }
 }
 
