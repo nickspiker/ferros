@@ -1821,6 +1821,7 @@ fn fps_dot(mask: u32, width: usize, height: usize) {
 /// What each phase frame has not yet been given of the current content, as one rectangle (empty = current): a present writes only the phase on the layer (all four took 71 ms a frame, 2026-10-22) and adds what it changed to the others' rectangles; the idle loop brings the others up to date one at a time; the flip only moves to a phase that is current.
 static mut PHASE_DIRTY: [draw::Rect; PHASES] = [draw::Rect { x0: 0, y0: 0, x1: 4096, y1: 4096 }; PHASES];
 /// Compose once (COMPOSITOR.md step 2): a byte per 16-pixel block of the screen. Bits 4-7, one a phase (`WALL_BIT`): phase k holds there only the background as it was published (the wallpaper, or black), whatever the screen is doing, so a block with nothing in front of the background is not written again. Bits 0-3: phase k holds there what the mode's own skip asks (an open circle's region: its clean window with no text in front), cleared at every change of mode (`clean_reset`). Both cleared whenever the background itself or the table changes (`clean_reset_all`): a new wallpaper, a brightness, windows, full screen. (Until 2026-11-08 one bit served both, and every open, close and flight forgot the wallpaper the phases held: the next four frames presented the whole screen again, 24 ms each.)
+/// A byte per whole block only: a row's tail past them (a width that is not a multiple of 16, akita's last 8 columns) is the glass's, never skipped, composed by every publish that reaches it (`tail_front`).
 static mut CLEAN: usize = 1;
 static mut CLEAN_W: usize = 0;
 
@@ -1994,6 +1995,53 @@ fn bars_over(c: u64, p: u64) -> u64 {
     if c >> 63 != 0 { p } else { under_pm(c & ((1 << 48) - 1), trans(c), p & ((1 << 48) - 1), 0).0 }
 }
 
+/// A row's tail: the columns from `xt` (the width rounded down to 16) to the width, on a screen whose width is not a multiple of 16 (akita's 1080: 67 blocks and 8 columns; husky's 1344 has none).
+/// The deck's publish goes by whole blocks, and until 2026-11-13 it stopped at `xt`: only an app's publish (`publish_app_rows`, which pads its last block) wrote these columns, so once an app ended they kept its last frame in every phase (the owner on the 8a: "sometimes after crashes the right twelve pixels or so contain fragments of the crashed app"; the phases' columns 1072-1078 held the app's ground, 1079 its mask).
+/// Composed here as `publish_band` composes a glass block, front to back: the glass's edge and the hole's knockout, the bars, then the scene `p(x)` (baked, opaque) under them. The tail is always the glass's: its block reaches past the width, and the edge's columns from `er` on include everything from the masked columns' end, at most the width, so the block skip (`CLEAN`) never applies and the tail has no byte there.
+/// Columns past the width stay 0 and are never written out; `p` is asked only for the row's own columns, so nothing reads past the row (on the last row, past the buffer).
+fn tail_front(xt: usize, width: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], (el, er): (usize, usize), (cl, cr): (usize, usize), bw: &[u64], p: impl Fn(usize) -> u64) -> [u64; 16] {
+    let (hl, hr) = (g.hole_l as usize, g.hole_r as usize);
+    let mut front = [0u64; 16];
+    for xx in xt..width {
+        let c = if xx >= cl && xx < cr { bw[xx] } else { CLEAR };
+        // The scene's fourth lane is its alpha, not flags: off, so its pixels keep their dither.
+        let s = p(xx) & ((1 << 48) - 1);
+        front[xx - xt] = if xx >= el && xx < er && !(xx >= hl && xx < hr) { bars_over(c, s) } else { glass_front(xx, g, edge_px, c, s) };
+    }
+    front
+}
+
+/// A flight frame's scene over row `y`'s tail (`tail_front`), indexed by column less the width rounded down to 16: as `flight_publish_row`'s glass blocks take it, the nearest half-resolution sample of the pair's top row (on an odd row the next pair's where the top has nothing), the wallpaper (or black) at full resolution where neither image has anything.
+/// The samples are taken over the row's last 16 columns (`flight_half` from `width - 16`, which reads its 16 columns and none past them), so the tail's columns are sampled on the same even grid as the rest of the row.
+unsafe fn flight_tail(f: &FlightFrame, canvas: *const u64, width: usize, height: usize, wall: usize, y: usize) -> [u64; 16] {
+    unsafe {
+        let (xs, xt) = (width - 16, width & !15);
+        let sample = |ty: usize| -> (u64, [u64; 8]) {
+            let (ps, ls) = (flight_span(&f.page, ty, width, height), flight_span(&f.plane, ty, width, height));
+            let mut h = [0u64; 8];
+            let any = flight_half(f, &ps, &ls, canvas, xs, ty, width, wall, &mut h);
+            (any, h)
+        };
+        let top = y & !1;
+        let next = if top + 2 < height { top + 2 } else { top };
+        let (mut any, mut h) = sample(top);
+        if any == 0 && y & 1 == 1 {
+            (any, h) = sample(next);
+        }
+        let mut out = [0u64; 16];
+        for xx in xt..width {
+            out[xx - xt] = if any != 0 {
+                h[(xx - xs) / 2]
+            } else if wall != 0 {
+                *(wall as *const u64).add(y * width + xx)
+            } else {
+                0
+            };
+        }
+        out
+    }
+}
+
 /// The deck's rows into the phases `mask` names, each pixel front to back (`glass_front`): the glass's edge, then the console (its rows only), then the canvas. A 16-pixel step that touches neither is the canvas straight through the NEON present; one that does is composed first and goes through the app's present, which leaves the mask's own pixels undithered.
 /// Row by row, each row into every phase `mask` names (2026-11-11, owner on the Pro: "no reason we can't hit 120fps with a sliding console row"): a block of the glass or the bars is composed by the first phase that writes the row, and the others only present it with their own thresholds (`codes_row`). Until then each phase composed and coded every such block again, four times over for the bars, whose changes go into all four.
 /// Everything here is baked (bake.rs): the canvas, the wallpaper, the bars, the mask; a phase's words are the dither and the pack (neon.rs `present16`, `present_app16`), the ODT's work done before. `tabs` is the bake's ODT, for a flight's legacy needs only.
@@ -2001,7 +2049,10 @@ fn publish_band(back: &[Px], width: usize, height: usize, _tabs: &neon::Odt, mas
     if r.is_empty() || RAW_HOLD.load(Ordering::Acquire) == 1 {
         return;
     }
-    let (x0, x1) = ((r.x0 as usize) & !15, ((r.x1 as usize + 15) & !15).min(width & !15));
+    // The whole blocks; the row's last columns past them (`xt`, a partial block on a width that is not a multiple of 16) are the tail's (`tail_front`).
+    let xt = width & !15;
+    let (x0, x1) = ((r.x0 as usize) & !15, ((r.x1 as usize + 15) & !15).min(xt));
+    let tail = xt < width && r.x1 as usize > xt;
     let mut row = [0u32; 1344];
     let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
     // The finished wallpaper's base, 0 while there is none.
@@ -2027,6 +2078,28 @@ fn publish_band(back: &[Px], width: usize, height: usize, _tabs: &neon::Odt, mas
         let (el, er) = edge_cols(g, edge_px, width);
         let (hl, hr) = (g.hole_l as usize, g.hole_r as usize);
         let ((cl, cr), bw) = bar_line(y, width, height);
+        // The row's tail composed once for every phase it goes into: the flight's samples, or the canvas (a region's text in front of it) with the wallpaper under it, as the blocks before it have them.
+        let tail_px = if tail {
+            Some(match &flight {
+                Some(f) => {
+                    let s = unsafe { flight_tail(f, back.as_ptr(), width, height, wall, y) };
+                    tail_front(xt, width, g, edge_px, (el, er), (cl, cr), bw, |xx| s[xx - xt])
+                }
+                None => tail_front(xt, width, g, edge_px, (el, er), (cl, cr), bw, |xx| {
+                    let i = y * width + xx;
+                    let mut p = back[i];
+                    if text_layer != 0 {
+                        p = draw::under(unsafe { *(text_layer as *const Px).add(i) }, p);
+                    }
+                    if wall != 0 {
+                        p = draw::under(p, unsafe { *(wall as *const u64).add(i) });
+                    }
+                    p
+                }),
+            })
+        } else {
+            None
+        };
         // Whether this row's glass blocks have their codes in `codes` (a phase before this one wrote the row).
         let mut have = false;
         for k in 0..PHASES {
@@ -2046,6 +2119,11 @@ fn publish_band(back: &[Px], width: usize, height: usize, _tabs: &neon::Odt, mas
             }
             let (t0, t1) = neon::row_thresholds(y, k);
             let t_n = now();
+            if let Some(front) = &tail_px {
+                let mut out = [0u32; 16];
+                unsafe { neon::present_app16(front.as_ptr(), out.as_mut_ptr(), t0, t1, cm) };
+                dst[y * width + xt..(y + 1) * width].copy_from_slice(&out[..width - xt]);
+            }
             if let Some(f) = &flight {
                 unsafe {
                     flight_publish_row(f, back.as_ptr(), width, height, k, y, x0, x1, wall, clean, clean_w, &mut row, dst, g, edge_px, (el, er, cl, cr), bw, (t0, t1, cm));
@@ -7071,8 +7149,14 @@ fn publish10(back: &[Px], screen: &mut [u32], width: usize, _tabs: &neon::Odt) {
                 neon::present16(src.as_ptr().add(x), row.as_mut_ptr().add(x), t0, t1, cm);
                 x += 16;
             }
+            // The row's tail past the whole blocks (akita's last 8 columns, `tail_front`), from a padded copy: the row's own pixels and black past them, so nothing is read past the row.
+            if w16 < width {
+                let mut pad = [0u64; 16];
+                pad[..width - w16].copy_from_slice(&src[w16..]);
+                neon::present16(pad.as_ptr(), row.as_mut_ptr().add(w16), t0, t1, cm);
+            }
         }
-        dst[..w16].copy_from_slice(&row[..w16]);
+        dst.copy_from_slice(&row[..width]);
     }
 }
 
@@ -9274,6 +9358,15 @@ fn server(grants: u64) -> ! {
                                             let c = if x + j >= cl && x + j < cr { bw[x + j] } else { CLEAR };
                                             let p = if any != 0 { fl[j / 2] } else if wall_at != 0 { unsafe { *(wall_at as *const u64).add(y * width + x + j) } } else { 0 };
                                             s[y * width + x + j] = glass_front(x + j, g, edge_px, c, p & ((1 << 48) - 1));
+                                        }
+                                    }
+                                    // The row's tail past the whole blocks, as the publish takes it (`flight_tail`).
+                                    let xt = width & !15;
+                                    if xt < width {
+                                        let t = unsafe { flight_tail(&f, pixels.as_ptr(), width, height, wall_at, y) };
+                                        for x in xt..width {
+                                            let c = if x >= cl && x < cr { bw[x] } else { CLEAR };
+                                            s[y * width + x] = glass_front(x, g, edge_px, c, t[x - xt] & ((1 << 48) - 1));
                                         }
                                     }
                                     continue;

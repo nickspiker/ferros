@@ -274,6 +274,15 @@ Everything that bakes lands with the display or after it; nothing breaks either 
 0. The display (ferros branch `sqrt-present`: payloads/display, ferros_sys). Alone, it bakes its own pixels and every window's (formats 0 and 1) as before, and answers op 65.
 1. fluor (branch `baked`) for its apps (Photon, fluordemo) and Mahere (branch `ferros-baked`, needs fluor's): rebuilt against it, they find op 65 and show `BAKED`; against an older display they show formats 0 and 1 as before.
 
+## The row's tail (2026-11-13)
+
+The owner on the 8a: "sometimes after crashes the right twelve pixels or so contain fragments of the crashed app."
+- **The cause.** The deck's publish (`publish_band`, and the flight inside it) goes by whole 16-pixel blocks and stopped at the width rounded down to 16. Akita is 1080 wide, 67 blocks and 8 columns, so columns 1072-1079 were written only by an app's publish (`publish_app_rows`, which pads its last block). Once a window went, every phase kept the app's last frame there: the deck's own glass mask and wallpaper never reached them.
+- **Measured** on the 8a (the phases read over the bridge, 2026-11-13): after Mahere stopped, columns 1064-1071 held the deck's ground and 1072-1078 Mahere's (8-bit codes G#161414 against G#16161A), in all four phases and every row between the corners; column 1079 is the glass's masked column.
+- **The fix.** A row's tail is composed and presented by every publish that reaches it (`tail_front`): the glass's edge, the bars, then the scene (the canvas, a region's text in front, the wallpaper under), or a flight frame's samples (`flight_tail`). The tail is always the glass's (its block reaches past the width, where the mask is), so the block skip has no byte for it. The capture's flight path and the spatial-only `publish10` take the tail the same way.
+- **After**, on the 8a: the deck after boot, and after a kist was killed, shows the deck in columns 1072-1078 and the mask in 1079 and the corners, in every phase.
+- **husky** (1344 = 84 blocks) has no tail and no change. The left edge starts at block 0, and rows are whole, so the top and bottom have nothing like it.
+
 ## Build order
 
 0. **Measure the interactive path** (touch → map → display) to know where the 72 frames/s go.
