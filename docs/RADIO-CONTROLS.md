@@ -65,6 +65,7 @@ What each driver reports and what can be turned, as of 2026-11-07. "Next" is wha
 
 - **Measures:** state (configured is connected), the signalling rate, and the link's power state (U0 working, U1/U2 light sleep, U3 suspended).
 - **Knobs:** none. The port is a device to the development host; the role is fixed.
+- **The frame counter** (Developer's checkbox, 2026-11-13): while it is on, this circle shows frames a second instead (COMPOSITOR.md "The frame counter"); its zone and its tap stay USB's.
 
 ### Clock (the kernel's rtc.rs; link 6 of the controls)
 

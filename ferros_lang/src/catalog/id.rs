@@ -325,6 +325,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PanelChannels => "kanal panel",
         Msg::ReleaseLook => "tampilan rilis",
         Msg::UntilReboot => "sampai dimulai ulang",
+        Msg::FrameCounter => "penghitung bingkai",
         // ---- the attest screen ----
         Msg::Attest => "sahkan",
         Msg::Mint => "cetak",

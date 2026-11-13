@@ -325,6 +325,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PanelChannels => "канали панелі",
         Msg::ReleaseLook => "вигляд релізу",
         Msg::UntilReboot => "до перезавантаження",
+        Msg::FrameCounter => "лічильник кадрів",
         // ---- the attest screen ----
         Msg::Attest => "засвідчити",
         Msg::Mint => "викарбувати",
