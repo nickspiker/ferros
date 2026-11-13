@@ -10,14 +10,13 @@ fn main() {
     println!("cargo:rustc-link-arg=-z");
     println!("cargo:rustc-link-arg=notext");
     println!("cargo:rerun-if-changed={}", ld.display());
-    // The map's app icons (SHELL.md: an app is its icon), bundled on the host by tools/app-icons from each app's own codebase. Embedded rather than read at run time; without the bundle an empty one goes in, and the map draws plain circles.
+    // The map's app icons (SHELL.md: an app is its icon), bundled on the host by tools/app-icons from each app's own codebase. Embedded rather than read at run time.
+    // A missing bundle stops the build: until 2026-11-12 an empty one went in quietly, and a display built in a worktree (target/ is not in git) drew every kist as a grey disc on the 8a.
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let src = manifest.join("../../target/icons/icons.bin");
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("icons.bin");
-    match std::fs::read(&src) {
-        Ok(b) => std::fs::write(&out, b).unwrap(),
-        Err(_) => std::fs::write(&out, b"").unwrap(),
-    }
+    let b = std::fs::read(&src).unwrap_or_else(|e| panic!("{}: {e}; make it with tools/app-icons (or copy it from the main checkout into a worktree)", src.display()));
+    std::fs::write(&out, b).unwrap();
     println!("cargo:rerun-if-changed={}", src.display());
     // The ferros mark (logo.vsf, tools/logo-vsf's analytic pieces) as a table the display draws at any size (draw::logo), in place of the bundle's raster (owner, 2026-11-07). Each piece: its inner and outer radius as fractions of the mark's outer radius, where it starts and how far it sweeps (turns, from +x toward +y, the sweep made positive), and its colour as working values (gamma 2, white at Q14), lit and at rest (the grey: photopic luminance, VSF RGB's weights R 0.2584, G 0.6346, B 0.1070, as tools/app-icons makes the map's greys).
     let mark = manifest.join("../../logo.vsf");
