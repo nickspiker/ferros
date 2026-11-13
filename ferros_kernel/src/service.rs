@@ -1148,7 +1148,7 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
 
 /// A capsule the vault keeps in pieces (kvault.rs `set`, over `ferros_pieces::PIECE`), spawned without its bytes ever whole in the kernel heap: under the kernel lock, its length read, a staging arc taken from the frame pool and the pieces read straight into it one at a time (the heap holds one piece), then the gate where it lies and the process built from its code (`spawn_capsule_in_place`), and the staging arc given back. None when the capsule is not kept in pieces (stored before 2026-11-12, or under `PIECE`): the caller reads it whole as before.
 /// Why (2026-11-12, twice on the Pro, PREV_EXIT G#EE91): read whole, the display's 2.8 MB capsule was one 3 MB block of the heap and the gate's parse and clone two more, while a store put of it had needed the sealed copy and its staging, two more; with Mahere running, the 22 MiB heap had the bytes and no such holes.
-fn spawn_from_pieces(store: &mut Option<ShimStore>, name: &[u8], grants: &[crate::process::Grant], sealed: &[u8]) -> Option<Result<crate::process::Outcome, &'static str>> {
+fn spawn_from_pieces(store: &mut Option<ShimStore>, name: &[u8], input: &[u8], grants: &[crate::process::Grant], sealed: &[u8]) -> Option<Result<crate::process::Outcome, &'static str>> {
     let key = core::str::from_utf8(name).ok()?;
     // One hold of the lock from the length to the last piece, so the value read is the one the arc was sized for.
     let staged = crate::process::with_lock(|| -> Option<Result<(crate::process::Arc, usize), &'static str>> {
@@ -1176,13 +1176,30 @@ fn spawn_from_pieces(store: &mut Option<ShimStore>, name: &[u8], grants: &[crate
     crate::flashlog::line(&alloc::format!("restart {key}: capsule {total} bytes from its pieces; spawning"));
     // SAFETY: the staging arc's [CODE, CODE + total) holds the capsule just read; nothing else holds the arc until it is freed below.
     let capsule = unsafe { core::slice::from_raw_parts_mut((arc.base + crate::process::CODE) as *mut u8, total) };
-    let r = crate::process::spawn_capsule_in_place(name, capsule, b"", grants, sealed);
+    let r = crate::process::spawn_capsule_in_place(name, capsule, input, grants, sealed);
     crate::process::with_lock(|| crate::process::arc_free(arc));
     Some(r)
 }
 
 /// `diag restart <name>…`: each named shell process killed and started again from its capsule in the vault, in the order given (display before map: the map hands a fresh display server its scene at start). The development loop for the shell — build, `store put`, restart — without a reboot.
 fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Vec<u8>) {
+    restart_with(store, names, b"", rep)
+}
+
+/// Cellular (`i` 0) or WiFi (1) switched off: its driver, already stopped, started once with its power-down input, `off` for the modem (payloads/modem: the PCIe PHY down and isolated, then the CP's power pins as Android's gpio_power_off_cp drops them, its PMIC with CP_PWR) and G#F0 for pcie1 (Bluetooth off first, PERST low, the PHY down and isolated, WL_REG_ON low); each ends once its chip is down. True when that process started. Not after a jump from Android: the radios are still Android's there, and the WiFi driver's first register write once hung the bus (init leaves both drivers out then too).
+fn radio_down(store: &mut Option<ShimStore>, i: usize) -> bool {
+    if platform::jumped() {
+        return false;
+    }
+    let (name, input): (&[u8], &[u8]) = if i == 0 { (b"modem", b"off") } else { (b"pcie1", &[0xF0]) };
+    let mut rep = alloc::vec::Vec::new();
+    restart_with(store, name, input, &mut rep);
+    crate::flashlog::line(&alloc::format!("radio {} power-down: {}", core::str::from_utf8(name).unwrap_or("?"), core::str::from_utf8(&rep).unwrap_or("").trim_end()));
+    rep.ends_with(b" started\n") || rep.ends_with(b" restarted\n")
+}
+
+/// `restart` with an input for each process started (its spawn input, as `bridge spawn` gives one): the radio switches start the modem and WiFi drivers once with their power-down input (`off`, G#F0) to take their chips down.
+fn restart_with(store: &mut Option<ShimStore>, names: &[u8], input: &[u8], rep: &mut alloc::vec::Vec<u8>) {
     // Vault reads under the kernel lock (the vault's one owner at a time); the spawns below take it themselves.
     let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
     for name in names.split(|&b| b == b' ').filter(|n| !n.is_empty()) {
@@ -1219,7 +1236,7 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
         crate::flashlog::line(&alloc::format!("restart {nm}: {} ; reading the capsule", if killed { "killed" } else { "was not running" }));
         platform::crumb(0x52);
         // A capsule kept in pieces never enters the heap whole (`spawn_from_pieces`).
-        if let Some(r) = spawn_from_pieces(store, name, &grants, &sealed) {
+        if let Some(r) = spawn_from_pieces(store, name, input, &grants, &sealed) {
             platform::crumb(0x53);
             match r {
                 Ok(o) => {
@@ -1245,7 +1262,7 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
         };
         crate::flashlog::line(&alloc::format!("restart {nm}: capsule {} bytes; spawning", capsule.len()));
         platform::crumb(0x53);
-        match crate::process::spawn_capsule(name, &capsule, b"", &grants, &sealed) {
+        match crate::process::spawn_capsule(name, &capsule, input, &grants, &sealed) {
             Ok(o) => {
                 crate::process::push_console(&o.console);
                 rep.extend_from_slice(alloc::format!("{} {}\n", core::str::from_utf8(name).unwrap_or("?"), if killed { "restarted" } else { "started" }).as_bytes());
@@ -2261,6 +2278,13 @@ pub fn run(mut b: Boot) -> ! {
     let mut ipc_marked = false;
     // The radios switched off (preference 15) as the loop last applied them: init started only the ones left on.
     let mut radios_applied = crate::process::pref(crate::process::PREF_RADIOS_OFF) & 0x1F;
+    // Cellular or WiFi switched off before this boot (a restart keeps the chips as the last session left them): taken down once now, as the switch does.
+    for i in 0..2 {
+        if radios_applied >> i & 1 == 1 {
+            let r = radio_down(&mut store, i);
+            crate::flashlog::line(&alloc::format!("radio {} off at start: power {}", ["modem", "pcie1"][i], if r { "down" } else { "left" }));
+        }
+    }
     // The GPS driver started for the claims held now (process.rs CLAIMS): set as the first claim starts it, cleared as the last one goes and stops it. A driver that ends by itself while claimed is not started again until the claims go to none and back.
     let mut gps_on = false;
     // ARC_FREES when the driver's spawn was last refused for want of an arc, as the stower's below: tried again once an arc has come back.
@@ -2306,7 +2330,7 @@ pub fn run(mut b: Boot) -> ! {
         if let Some(seed) = unsafe { (*(&raw mut WALLGEN_SEED)).take() } {
             spawn_wallgen(&mut store, &seed);
         }
-        // A status circle tapped (preference 15, owner 2026-11-07): a radio switched off has its driver stopped and, where the kernel holds its power switch (Bluetooth, NFC, GPS), its chip powered down; switched on, its driver starts again from its capsule. Cellular and WiFi have no kernel switch: their drivers stop, the modem staying as it was until a power-down of its own exists.
+        // A status circle tapped (preference 15, owner 2026-11-07): a radio switched off has its driver stopped and, where the kernel holds its power switch (Bluetooth, NFC, GPS), its chip powered down; switched on, its driver starts again from its capsule. Cellular and WiFi have no kernel switch: their drivers stop, then each starts once with its power-down input (`radio_down`), which takes the chip down and ends (2026-11-13: the chips left powered with no driver drew more than with the radios on, 968 mW dark on the 8a against 782-859).
         let radios_off = crate::process::pref(crate::process::PREF_RADIOS_OFF) & 0x1F;
         if radios_off != radios_applied {
             const DRIVERS: [&[u8]; 5] = [b"modem", b"pcie1", b"bt", b"nfc", b"gps"];
@@ -2315,6 +2339,7 @@ pub fn run(mut b: Boot) -> ! {
                 if radios_off & bit != 0 && radios_applied & bit == 0 {
                     let killed = crate::process::kill(name);
                     let powered_down = match i {
+                        0 | 1 => radio_down(&mut store, i),
                         2 => crate::bt::power(false),
                         3 => crate::nfc::power(false),
                         4 => crate::gps::power(false),
