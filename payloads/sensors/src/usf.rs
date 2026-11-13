@@ -785,8 +785,10 @@ pub fn registry(out: &mut String) -> bool {
     matches!(r, Some((0, _)))
 }
 
-/// Registry nodes ferros does not hand the AoC: the touch controller (`/dev/ftm5`) and the touch bus arbitration (`/tbn`): with them the AoC takes the touch IC's bus and ferros's touch goes dead (2026-10-24).
-const KEEP_OFF: &[&[u8]] = &[b"+/dev/ftm5", b"+/tbn"];
+/// Registry nodes ferros does not hand the AoC: the touch controller (husky's FTM5 `/dev/ftm5`, akita's Goodix `/dev/gtx`) and the touch bus arbitration (`/tbn`): with them the AoC takes the touch IC's bus and ferros's touch goes dead (husky, 2026-10-24).
+/// akita's `/dev/gtx/0` is husky's node for its own controller: the AoC's SPI 2 at 10 MHz, chip select GPIO 67, the controller's interrupt as the AoC's line 14, `tbn_mode=2` beside it (zuma-common-touch.dtsi on both boards), so the same reason holds. It went out on 2026-11-12: kept until then, the AoC listed "Touch Single Tap Sensor" and "Touch Long Press Sensor" on the 8a, its driver live on the controller ferros reads (the owner had seen taps lost there).
+/// Left out (two cold boots on the 8a, 2026-11-12): 38 sensors listed instead of 40, the two touch sensors gone, Gravity at handle 44 instead of 46 (found by name, `subscribe_gravity`); the proximity-gated gestures are fusions and stay listed.
+const KEEP_OFF: &[&[u8]] = &[b"+/dev/ftm5", b"+/dev/gtx", b"+/tbn"];
 
 /// Registry properties ferros sets differently from Google's scripts: the rear spectral sensor reports every reading (`g_change_thresh=0 0`, `c1_…`), which the scope widget wants (owner, 2026-10-25).
 const OVERRIDE: &[(&[u8], &[u8])] = &[(b"  g_change_thresh=100 0.1", b"  g_change_thresh=0 0"), (b"  c1_change_thresh=100 0.1", b"  c1_change_thresh=0 0")];
