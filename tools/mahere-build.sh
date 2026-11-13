@@ -3,9 +3,10 @@
 set -e
 here=$(cd "$(dirname "$0")/.." && pwd)
 code=$(cd "$here/.." && pwd)
-# MAHERE and FLUOR name other trees (a worktree of either) in place of the siblings.
+# MAHERE, FLUOR and KETE name other trees (a worktree of any) in place of the siblings.
 mahere=${MAHERE:-$code/mahere}
 fluor=${FLUOR:-$code/fluor}
+kete=${KETE:-$code/kete}
 export __CARGO_TESTS_ONLY_SRC_ROOT="$code/ferros-rust/library"
 export CC_aarch64_unknown_ferros=aarch64-linux-gnu-gcc
 export AR_aarch64_unknown_ferros=aarch64-linux-gnu-ar
@@ -20,7 +21,7 @@ cargo +nightly build -Zjson-target-spec -Zbuild-std=core,alloc,std,panic_abort -
     --target "$here/targets/aarch64-unknown-ferros.json" \
     --config "resolver.lockfile-path='$mahere/ferros/Cargo.lock'" \
     --config "patch.crates-io.fluor.path='$fluor'" \
-    --config "patch.crates-io.kete.path='$code/kete'" \
+    --config "patch.crates-io.kete.path='$kete'" \
     --config "patch.crates-io.valhall.path='$here/valhall'" \
     --config "patch.crates-io.libc.path='$code/ferros-libc'" \
     -p mahere-ferros --features fluor/host-ferros $profile_flag "$@"
