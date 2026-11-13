@@ -203,3 +203,42 @@ Real sleep, extracted from Linux (zuma): the cores' only idle state is C2 (PSCI 
 ## 2026-11-12: heat
 
 The heat side of the power profile (the TMU zones, the hardware clock divider that took the X3 to 364 MHz under Mahere, the thermal policy and what 120 frames a second costs) is in THERMAL.md.
+
+## 2026-11-13: the adaptive clock
+
+The owner on the 8a with Mahere: "looks and runs WAY better, it's a bit toasty tho" (hottest BIG 61 °C, the X3 asked 2914 MHz at rest).
+
+**Why the 8a never rested.** The clock policy took 24 or more DECON frame-start interrupts a second as "animating" and held the active profile. On akita DECON re-triggers on every TE (payloads/display `PANEL_HOLDS` 0: the AK3B does not hold a frame), so frame starts ran at about 120 a second with nothing moving. `diag dvfs` showed one switch since boot. The Pro switched normally (15 switches); its "ferros asked 2914" in `diag thermal` came from the diag's own PT traffic, which holds the active clocks for a second.
+
+**What replaced it** (service.rs `governor`, `clock_policy`; process.rs `PRESENTS`, `note_input`):
+- The X3 and the A715s each follow their own load. Every 64th of a second, on the service loop's own passes (no tick of its own), each cluster's busy share is its busiest core's time awake (smp.rs `IDLE_TICKS`, the service loop's `X3_IDLE_TICKS`, added as each `wfe` ends).
+- The rate asked is the lowest operating point (zuma-b0-ipop.dts `pixel_em`; the A715s up to 1065 MHz, THERMAL.md decision 3) at or above a level. The level rises at once to running rate × averaged share × 5/4, or a quarter past the rate on a saturated window. Input puts both clusters at their top: a touch interrupt, or an injected batch (the touch process's op 3), as is a PT transfer. Otherwise the level decays an eighth of the way a window. Requests go out only on a change, under the thermal cap.
+- The shared domains (MIF, INT, DSU, CPUCL0, DISP) keep the three tiers. Active applies when the governor asks the X3 over 2049 or the A715s over 712 MHz, on sustained GPU calls, at 24 or more frames shown a second, or during a transfer. Rest otherwise, dark with the screen off. "Frames shown" counts the display's own new pictures (writes to DECON0's shadow update request, G#1947_0050), never the frame-start interrupt, so it means the same on both boards.
+- `diag clock` gives each cluster's rate, level, busy shares, requests and time at each operating point, the tiers' time, the frames shown, and touch to frame (from the first input after a frame to the next frame armed, in power-of-two millisecond buckets; a finger held still closes at the next frame for another reason, which fills the long buckets). `diag clock reset`, `gov on|off`, and the knobs `win|decay|avg|ramp|boost|gpu|frames <n>`. Governor off gives the tiers alone, with a touch held for a second as before.
+
+**Measured on the 8a** (RAM reload over the C kernel a25324eb, 2026-11-13; battery draw from 32 s charger-cut windows, `diag power`). "Old" is the same kernel with `clock gov off`, `dvfs policy off` and `dvfs profile active`: exactly what the 8a ran before.
+
+| state | old (always active) | old rest tier (X3 2.0 GHz) | adaptive |
+|---|---|---|---|
+| deck, nothing moving | 2030 mW | 1441 mW | **1346 mW** |
+| Mahere open, not moving | 1936 mW | | **1324 mW** |
+| screen off (dark) | | | 763 mW |
+
+At rest the X3 sat at 500 MHz 93% of the time and the A715s at 402 MHz 97% (busy shares about 46/256 and 34/256). The flashed kernel before the reload read 1969 mW on the deck. In the morning, with Mahere open, it read 2515 mW. Most of the saving is the fix (2030 → 1441); the governor adds about 95 mW under the old rest tier.
+
+Mahere panned for 3 minutes (17 injected drags, `input drag ... 64 2 --idle`, left and right) needs adjacent runs, because Mahere's load grew through the session as it fetched cells (frames armed per run 6,943, then 11,294, 15,437, 19,696, 24,371; deadline wake-to-run mean 77 → 640 us under the same clocks):
+
+| run, in order | BIG start → peak → end | input to frame |
+|---|---|---|
+| old, first (light load) | 44 → 58 → 46 °C | mean 22 ms, mostly 8-15 ms |
+| adaptive, decay ⅛ | 38 → 68 → 45 °C | mean 53 ms |
+| adaptive, decay 1/64 | 40 → 73 → 49 °C | mean 41 ms |
+| old, control | 43 → 76 → 65 °C | mean 35 ms, mostly 32-63 ms |
+| adaptive, decay ⅛, right after the control | 52 → 68 → 54 °C | **mean 11 ms, mostly 4-15 ms**; deadline wake-to-run 146 us (control 640) |
+
+In the adjacent pair the adaptive clock ran 8 °C lower at its peak and 11 °C lower at the end, from a start 9 °C warmer, and answered input faster. The two middle runs were slower to answer input than the old run before them, but the load had grown in between. The IRQ-to-thread wake (sched "interrupt") stayed at a mean of 1-2 us in every run.
+
+**Open:**
+- The tiers switch often under a pan (38 to 293 switches per 3-minute run, five or six ACPM requests each). The X3 asked 5,500 rates in 3 minutes as it rose on each batch and decayed between them. Neither costs measurable time yet (the longest request was 3.6 ms), but hysteresis may pay.
+- Under Mahere's late load the A715s ran 84% busy at their 1065 MHz ceiling, so the ceiling binds (THERMAL.md decision 3).
+- The 1 ms pollers (nfc, modem, bt, ip with the cellular call up, pcie1's exchange) wake the A715s about 4,000 times a second at rest. The radio-drivers agent's work covers them.
