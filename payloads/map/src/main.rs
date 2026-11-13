@@ -1782,6 +1782,7 @@ impl Map {
 
     /// The person's list read again, and the kist circles made to match it when a kist came or went (a stow over the bridge, one on another of their devices): placed afresh by the seeded fit, each kept place winning, then the scene sent again.
     fn refresh_circles(&mut self) {
+        let was = self.placed();
         if !self.reload_kists() {
             return;
         }
@@ -1792,24 +1793,30 @@ impl Map {
             let _ = self.send_states(false);
             return;
         }
-        self.place_circles(n);
+        self.place_circles(n, &was);
     }
 
     /// The person's kists and arrangement read again after the identity service wrote them from their fleet (payloads/fgtw space.rs: a reset device getting its deck back, a move made on another of their devices): every circle placed afresh, each kept place winning, the view as kept, then the scene sent again.
     fn reload_arrangement(&mut self) {
+        let was = self.placed();
         if !self.reload_kists() {
             return;
         }
         // WHY: the arrays hold MAX circles (as at start).
         let n = (1 + self.kists.kists.len()).min(MAX);
-        self.place_circles(n);
+        self.place_circles(n, &was);
         if self.load_view() {
             self.send_scene();
         }
     }
 
-    /// `n` circles placed by the seeded fit, each kept place winning (`load_places_near`), pushed apart, and the scene sent.
-    fn place_circles(&mut self, n: usize) {
+    /// Each circle on the deck now, by its label, and its place (x, y, radius, turn): taken before the person's list is read again, which may change which kist each index is.
+    fn placed(&self) -> Vec<(alloc::string::String, [i64; 5])> {
+        (0..self.n).map(|i| (alloc::string::String::from(self.label(i)), [self.xs[i], self.ys[i], self.rs[i], self.rc[i], self.rsn[i]])).collect()
+    }
+
+    /// `n` circles placed by the seeded fit, a circle already on the deck (`was`, by its label) where it stands, each kept place winning (`load_places_near`), pushed apart, and the scene sent. Until 2026-11-12 every circle went back to its seed first, so one the vault kept no place for jumped (owner, on the 8a: "sometimes that ferros logo just BOOP!": the settings circle, its place taken out of the vault by the fleet's sync, sent off the deck at its last size whenever the fleet wrote).
+    fn place_circles(&mut self, n: usize, was: &[(alloc::string::String, [i64; 5])]) {
         self.n = n;
         for i in 1..MAX {
             self.rs[i] = if i < n { radius_of(KIST_SHARE) } else { 0 };
@@ -1822,23 +1829,37 @@ impl Map {
             self.xs[i] = xs[i] << 8;
             self.ys[i] = ys[i] << 8;
         }
-        self.load_places_near();
+        // The vault's places win; a circle it keeps none for that is already on the deck stays where it stands; a new one (a kist just stowed) goes with the settings circle, about which the seeds are laid.
+        let mut held = self.load_places();
+        for i in 0..n {
+            if held >> i & 1 == 0 {
+                if let Some((_, p)) = was.iter().find(|(l, _)| l.as_str() == self.label(i)) {
+                    [self.xs[i], self.ys[i], self.rs[i], self.rc[i], self.rsn[i]] = *p;
+                    held |= 1 << i;
+                }
+            }
+        }
+        self.with_settings(held);
         self.push_apart(MAX);
         self.send_scene();
     }
 
     /// The places kept by hand (`load_places`), then every circle still at its seeded place moved with the settings circle: the seeded fit is about the settings circle at the origin, and a kist circle stowed after the person moved settings would otherwise land far from it, off the view they keep.
     fn load_places_near(&mut self) -> usize {
-        let seeded: [(i64, i64); MAX] = core::array::from_fn(|i| (self.xs[i], self.ys[i]));
         let kept = self.load_places();
-        let (dx, dy) = (self.xs[0] - seeded[0].0, self.ys[0] - seeded[0].1);
+        self.with_settings(kept);
+        kept.count_ones() as usize
+    }
+
+    /// Every circle not in `held` (a bit a circle) still at its seed, which is laid about the settings circle at the origin: moved by where settings stands now.
+    fn with_settings(&mut self, held: u32) {
+        let (dx, dy) = (self.xs[0], self.ys[0]);
         for i in 1..self.n {
-            if (self.xs[i], self.ys[i]) == seeded[i] {
+            if held >> i & 1 == 0 {
                 self.xs[i] += dx;
                 self.ys[i] += dy;
             }
         }
-        kept
     }
 
     /// The person's list written whole, after a change of theirs (an answer, a default); the console says when the vault did not take it. The map's copy lacks what this device leaves off its deck, so the change goes into the list as the vault holds it: the defaults, and each answer of every kist the map shows; a kist left off here keeps its own.
@@ -2053,9 +2074,9 @@ impl Map {
         6 + n
     }
 
-    /// The arrangement made by hand, from the vault: each circle's place as EWE integers (CLAUDE.md: no fixed widths on storage) — x and y in world units ×256, zigzag-mapped (they can be negative), the radius, and then (since the circles turn) its turn as cos and sin in Q14, zigzag; a place kept before turns existed has three and stays upright.
-    fn load_places(&mut self) -> usize {
-        let mut loaded = 0;
+    /// The arrangement made by hand, from the vault: each circle's place as EWE integers (CLAUDE.md: no fixed widths on storage) — x and y in world units ×256, zigzag-mapped (they can be negative), the radius, and then (since the circles turn) its turn as cos and sin in Q14, zigzag; a place kept before turns existed has three and stays upright. Which circles it placed, a bit each (MAX is 16).
+    fn load_places(&mut self) -> u32 {
+        let mut loaded = 0u32;
         for i in 0..self.n {
             let mut key = [0u8; 32];
             let kl = self.place_key(i, &mut key);
@@ -2088,7 +2109,7 @@ impl Map {
                         self.rsn[i] = sn;
                     }
                 }
-                loaded += 1;
+                loaded |= 1 << i;
             }
         }
         loaded
