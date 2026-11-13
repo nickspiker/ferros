@@ -123,6 +123,49 @@ fn sleep_ms(n: u64) {
     sleep_until(now() + freq() / 1000 * n);
 }
 
+/// The chip's interrupt line (kernel `nfc-irq`, SPI 42, added after the last grant for a holder of hsi2c0: process.rs `LINES_WITH`, 2026-11-13).
+const S_IRQ: u64 = 5;
+/// gpa7's words in gpio-alive: its pin functions, and its external-interrupt type, mask and pending words (pinctrl-gs.c zuma_pin_alive: gpa7's EINT offset G#18 in the wakeup block's ECON G#700, EMASK G#900, EPEND G#A00).
+const GPA7_CON: u64 = 0xC0;
+const GPA7_ECON: u64 = 0x700 + 0x18;
+const GPA7_EMASK: u64 = 0x900 + 0x18;
+const GPA7_EPEND: u64 = 0xA00 + 0x18;
+/// The serving loop's doorbell: counted up by `irq_thread` at each interrupt it takes. The loop's idle wait is on it, ended also by a call (`wait_world_or_call`), a preference changing (the screen: the kernel wakes every word waiter), or discovery's retry. Until 2026-11-13 the loop read the pin every millisecond (every 16 in the dark): ~950 wakes a second on the 8a with the screen on.
+static RUNG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// 1 while `irq_thread` waits on the line; 0 once it took an interrupt and left the line masked until the loop has read the chip (as payloads/pcie1).
+static ARMED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static mut IRQ_STACK: [u8; 1 << 13] = [0; 1 << 13];
+
+/// The interrupt's thread: armed, it waits on the line with no deadline, then counts `RUNG` up, wakes the loop and disarms itself (the line stays masked until `irq_ack`).
+extern "C" fn irq_thread(cap: u64) -> ! {
+    use core::sync::atomic::Ordering::{Acquire, Release};
+    loop {
+        while ARMED.load(Acquire) == 0 {
+            ferros_sys::wait_world(&ARMED, 0, 0);
+        }
+        ferros_sys::irq_wait_world(cap, 0);
+        ARMED.store(0, Release);
+        RUNG.fetch_add(1, Release);
+        ferros_sys::wake(&RUNG, 1);
+    }
+}
+
+/// The line granted and its thread started: the chip's IRQ pin (gpa7-6) an external interrupt, level high (the chip holds it high while it has a message), its pending bit cleared and unmasked. False on a kernel without the line (before 2026-11-13): the loop reads the pin every millisecond as before.
+fn irq_up(grants: u64) -> bool {
+    let n = unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + grants + 0x200) as *const u32) } as u64;
+    if n <= S_IRQ || ferros_sys::irq_wait(cap(grants, S_IRQ), 1) == ferros_sys::ERR {
+        return false;
+    }
+    let alive = cap(grants, S_ALIVE);
+    let rmw = |off: u64, clear: u32, set: u32| mmio_write(alive, off, mmio_read(alive, off) as u32 & !clear | set);
+    rmw(GPA7_CON, 0xF << (4 * IRQ_PIN), 0xF << (4 * IRQ_PIN));
+    rmw(GPA7_ECON, 0x7 << (4 * IRQ_PIN), 1 << (4 * IRQ_PIN));
+    mmio_write(alive, GPA7_EPEND, 1 << IRQ_PIN);
+    rmw(GPA7_EMASK, 1 << IRQ_PIN, 0);
+    // SAFETY: the thread's stack, given to it alone, once.
+    ferros_sys::thread_spawn(irq_thread, unsafe { &mut *(&raw mut IRQ_STACK) }, cap(grants, S_IRQ)) != ferros_sys::ERR
+}
+
 struct Nfc {
     grants: u64,
     /// The live pairing secret, while a ceremony is.
@@ -808,13 +851,23 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut retry_at = 0u64;
     // The corners' NFC circle (ferros_sys::measure), at each change: up; listening, with the carrier it listens on (NFC's 13.56 MHz); a reader's field on us (connected, while it lasts).
     let mut shown = None;
-    // The screen's state, read four times a second (`Nfc::screen`).
-    let (mut dark, mut dark_at) = (false, 0u64);
+    // The screen's state, read every pass (a memory read; its change wakes the loop) (`Nfc::screen`).
+    let mut dark = false;
+    // The chip's interrupt line (`irq_up`), and the loop's wakes said every 64 s or more: passes, and waits.
+    let irq = irq_up(grants);
+    say!(grants, "nfc: {}\n", if irq { "waiting on the chip's interrupt line, no timer" } else { "no interrupt line granted (a kernel before 2026-11-13): reading its pin every millisecond" });
+    let (mut passes, mut waits, mut said_at) = (0u32, 0u32, now());
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
-        if now().wrapping_sub(dark_at) >= freq() / 4 {
-            dark_at = now();
+        // The interrupt's count before the chip is read: an interrupt while this pass runs ends its wait at once.
+        let seen = RUNG.load(core::sync::atomic::Ordering::Acquire);
+        passes += 1;
+        if now().wrapping_sub(said_at) >= freq() << 6 {
+            say!(grants, "nfc: A#{passes} passes, A#{waits} waits in the last A#{} ms\n", (now() - said_at) * 1000 / freq());
+            (passes, waits, said_at) = (0, 0, now());
+        }
+        {
             let off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
             if off != dark && !needs_init {
                 dark = off;
@@ -934,7 +987,23 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             continue;
         }
-        // A pass a millisecond while discovery runs; while the screen is off nothing comes from the air, and a request (the state, a secret) waits at most this long.
+        if irq {
+            use core::sync::atomic::Ordering::{Acquire, Release};
+            // The line its last interrupt left masked re-armed (its pending bit cleared, the line acked, its thread woken), then the pass again before any wait: the chip read once more, so a message from before the clear is taken, one after raises the line again.
+            if ARMED.load(Acquire) == 0 {
+                mmio_write(cap(grants, S_ALIVE), GPA7_EPEND, 1 << IRQ_PIN);
+                ferros_sys::irq_ack(cap(grants, S_IRQ));
+                ARMED.store(1, Release);
+                ferros_sys::wake(&ARMED, 1);
+                continue;
+            }
+            // Then a wait on what brings work: the chip's interrupt, a call, the screen changing, and discovery's retry when it is stopped with the screen on (`retry_at`); no other deadline.
+            waits += 1;
+            let until = if !nfc.discovering && !dark { retry_at } else { 0 };
+            ferros_sys::wait_world_or_call(&RUNG, seen, until);
+            continue;
+        }
+        // Without the line: a pass a millisecond while discovery runs; while the screen is off nothing comes from the air, and a request (the state, a secret) waits at most this long.
         sleep_ms(if dark { 1 << 4 } else { 1 });
     }
 }
