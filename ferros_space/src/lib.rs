@@ -5,7 +5,7 @@
 //! | Kind | Id | Value | The device's copy |
 //! |---|---|---|---|
 //! | `KIST` | developer `ke`, option `hp` | capsule `hb`, name `a`, then per want (slot order) right `u`, reason `a` | a `kist` section of `kists.list` |
-//! | `ANSWER` | developer, option, right `u` | granted `u` (1 or 0); the entry's stamp is when | a want's answer in `kists.list` |
+//! | `ANSWER` | developer, option, right `u` | granted `u` (1 or 0); the entry's stamp is when | a want's answer in `kists.list`, or an unstowed kist's kept answer (its `kept` section) |
 //! | `DEFAULT` | right `u` | on `u` | `kists.list`'s `defaults` |
 //! | `PLACE` | scope `ke`, then `d` "settings" or developer, option | x, y `i` (world ×256), radius `i`, turn cos, sin `i` (Q14) | `map.place.<label>` (EWE, the map's) |
 //! | `VIEW` | scope `ke` | x, y, cos, sin `i` | `map.view` |
@@ -441,6 +441,12 @@ fn snapshot(list: &Kists, store: &mut impl Store, scope: &[u8; 32]) -> Result<Ve
             }
         }
     }
+    // The answers kept for an unstowed kist are the person's still: facts like any answer, so one forgotten on an unstow sheet is a removal the fleet follows.
+    for k in list.kept.iter().filter(|k| list.by_identity(&k.developer, &k.option).is_none()) {
+        for (right, granted, when) in &k.answers {
+            facts.push(Fact { kind: kind::ANSWER, id: answer_id(&k.developer, &k.option, *right), value: vec![VsfType::u(*granted as usize, false)], stamp: Some(*when) });
+        }
+    }
     for p in &list.pins {
         // No stamp of its own: a device that pinned another bundle for a developer the space already pins takes the space's (the first to reach the person's space stands, as trust on first use wants), rather than the later pin winning by its time. Two pins made apart and merged before either device synced are the space's merge to settle (the later write).
         facts.push(Fact { kind: kind::PIN, id: pin_id(&p.developer), value: pin_value(p), stamp: None });
@@ -462,12 +468,15 @@ fn snapshot(list: &Kists, store: &mut impl Store, scope: &[u8; 32]) -> Result<Ve
     Ok(facts)
 }
 
-/// Which of the space's entries this device's copy mirrors: every kist and default; an answer only for a want its kist declares here (an answer to a want an older capsule lacks waits in the space, untouched, for the update that brings it); a place only in this device's scope and only for a circle it has; the view in its scope.
-fn managed(list: &Kists, scope: &[u8; 32], k: u8, id: &[VsfType]) -> bool {
+/// Which of the space's entries this device's copy mirrors: every kist and default; an answer for a want its kist declares here (an answer to a want an older capsule lacks waits in the space, untouched, for the update that brings it), or of a kist no longer in the list whose answers the list keeps (`kept`) or that is stowed nowhere (`live`: the kists the space holds live, read before the pass), so the person's answers forgotten on an unstow sheet go from the space and from every device's kept answers (docs/KISTS.md "The unstow sheet"); a place only in this device's scope and only for a circle it has; the view in its scope.
+fn managed(list: &Kists, live: &[([u8; 32], [u8; 32])], scope: &[u8; 32], k: u8, id: &[VsfType]) -> bool {
     match k {
         kind::KIST | kind::DEFAULT | kind::PIN => true,
         kind::ANSWER => match (id.first().and_then(k32), id.get(1).and_then(k32), id.get(2).and_then(|v| v.as_u64())) {
-            (Some(d), Some(o), Some(r)) => list.kists.iter().any(|x| x.developer == d && x.option == o && x.wants.iter().any(|w| w.right as u64 == r)),
+            (Some(d), Some(o), Some(r)) => match list.by_identity(&d, &o) {
+                Some(x) => x.wants.iter().any(|w| w.right as u64 == r),
+                None => list.kept.iter().any(|x| x.developer == d && x.option == o) || !live.contains(&(d, o)),
+            },
             _ => false,
         },
         kind::PLACE => place_of(id).is_some_and(|(s, c)| s == *scope && label_of(list, &c).is_some()),
@@ -583,10 +592,35 @@ fn apply(w: Write, list: &mut Kists, list_changed: &mut bool, store: &mut impl S
     }
 }
 
+/// An answer from the space into the device's copy: the want of a kist in the list, else the answers kept for an unstowed one (made when the first comes; gone with its last).
 fn set_answer(list: &mut Kists, id: &[VsfType], answer: Option<(bool, i64)>) {
     let (Some(d), Some(o), Some(r)) = (id.first().and_then(k32), id.get(1).and_then(k32), id.get(2).and_then(|v| v.as_u64())) else { return };
-    if let Some(w) = list.kists.iter_mut().find(|k| k.developer == d && k.option == o).and_then(|k| k.wants.iter_mut().find(|w| w.right as u64 == r)) {
-        w.answer = answer;
+    if let Some(k) = list.kists.iter_mut().find(|k| k.developer == d && k.option == o) {
+        if let Some(w) = k.wants.iter_mut().find(|w| w.right as u64 == r) {
+            w.answer = answer;
+        }
+        return;
+    }
+    // WHY: the right is the space's (another device wrote it); one past the rights this build knows is no answer to keep.
+    if r as usize >= RIGHTS.len() {
+        return;
+    }
+    let r = r as u8;
+    let at = match list.kept.iter().position(|k| k.developer == d && k.option == o) {
+        Some(i) => i,
+        None if answer.is_some() => {
+            list.kept.push(ferros_kist::Kept { developer: d, option: o, answers: Vec::new() });
+            list.kept.len() - 1
+        }
+        None => return,
+    };
+    let kept = &mut list.kept[at].answers;
+    kept.retain(|a| a.0 != r);
+    if let Some((granted, when)) = answer {
+        kept.push((r, granted, when));
+    }
+    if kept.is_empty() {
+        list.kept.swap_remove(at);
     }
 }
 
@@ -610,7 +644,8 @@ pub fn sync(space: &mut Space, base: &mut Baseline, store: &mut impl Store, me: 
         let scope = if deck_sync(space, me) { FLEET } else { *me };
         let facts = snapshot(&list, store, &scope).map_err(|_| "the map's places are not readable")?;
         let before = base.clone();
-        let writes = reconcile(space, base, &facts, |k, id| managed(&list, &scope, k, id), *me, now);
+        let live: Vec<([u8; 32], [u8; 32])> = space.entries().iter().filter(|e| e.kind == kind::KIST && !e.gone).filter_map(|e| Some((e.id.first().and_then(k32)?, e.id.get(1).and_then(k32)?))).collect();
+        let writes = reconcile(space, base, &facts, |k, id| managed(&list, &live, &scope, k, id), *me, now);
         if writes.is_empty() {
             break;
         }
@@ -835,6 +870,68 @@ mod tests {
         // Settled on every device.
         assert_eq!(sync(&mut sa, &mut ba, &mut a, &PRO, 2700).unwrap().wrote, 0);
         assert_eq!(sync(&mut sb, &mut bb, &mut b, &OTHER, 2700).unwrap().wrote, 0);
+    }
+
+    /// The unstow sheet with "your answers" unticked (docs/KISTS.md "The unstow sheet"): the Pro unstows Photon and forgets its answers; once the unstow has reached the space they go from it, from the other device's kept answers, and from a fresh device; stowed again anywhere, it asks afresh.
+    #[test]
+    fn answers_forgotten_on_an_unstow_go_everywhere() {
+        let mut a = arranged_pro();
+        let (mut sa, mut ba) = (Space::new(), Baseline::default());
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2000).unwrap();
+        let mut b = Vault::default();
+        let (mut sb, mut bb) = (sa.clone(), Baseline::default());
+        sync(&mut sb, &mut bb, &mut b, &OTHER, 2100).unwrap();
+        let mut la = read_list(&mut a).unwrap();
+        assert!(la.remove(&PHOTON.0, &PHOTON.1).is_some());
+        assert!(la.forget(&PHOTON.0, &PHOTON.1));
+        a.set(Scope::Kists, ferros_kist::LIST, &la.build(2200).unwrap());
+        // The unstow reaches the space, then the answers' removal (the kist no longer live there).
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2201).unwrap();
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2202).unwrap();
+        let photon_answers = |s: &Space| s.live(kind::ANSWER).filter(|e| e.id.first().and_then(k32) == Some(PHOTON.0)).count();
+        assert_eq!(photon_answers(&sa), 0, "gone from the space");
+        assert!(read_list(&mut a).unwrap().kept.is_empty(), "and not brought back into the Pro's list");
+        sb.merge(hand_over(&sa));
+        sync(&mut sb, &mut bb, &mut b, &OTHER, 2300).unwrap();
+        sync(&mut sb, &mut bb, &mut b, &OTHER, 2301).unwrap();
+        let lb = read_list(&mut b).unwrap();
+        assert!(lb.by_identity(&PHOTON.0, &PHOTON.1).is_none());
+        assert!(lb.kept.is_empty(), "the other device forgot them too");
+        // Mahere's answers stand everywhere.
+        assert!(!lb.by_identity(&MAHERE.0, &MAHERE.1).unwrap().unanswered());
+        // A fresh device restored from the space knows none of Photon's.
+        let mut fresh = Vault::default();
+        let (mut sf, mut bf) = (hand_over(&sa), Baseline::default());
+        sync(&mut sf, &mut bf, &mut fresh, &FRESH, 2400).unwrap();
+        assert!(read_list(&mut fresh).unwrap().kept.is_empty());
+        // Stowed again on the other device: asked afresh.
+        let mut lb = read_list(&mut b).unwrap();
+        let p = lb.stow([0xB2; 32], PHOTON.0, PHOTON.1, &decl("Photon", &[(0, "to draw"), (7, "to reach your friends")]));
+        assert!(lb.kists[p].unanswered());
+        // Settled.
+        assert_eq!(sync(&mut sa, &mut ba, &mut a, &PRO, 2500).unwrap().wrote, 0);
+    }
+
+    /// An unstow that keeps the answers (the sheet's default): a device that never had the kist learns its kept answers from the space, so a stow there asks nothing either.
+    #[test]
+    fn kept_answers_reach_a_fresh_device() {
+        let mut a = arranged_pro();
+        let (mut sa, mut ba) = (Space::new(), Baseline::default());
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2000).unwrap();
+        let mut la = read_list(&mut a).unwrap();
+        la.remove(&PHOTON.0, &PHOTON.1);
+        a.set(Scope::Kists, ferros_kist::LIST, &la.build(2200).unwrap());
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2201).unwrap();
+        sync(&mut sa, &mut ba, &mut a, &PRO, 2202).unwrap();
+        assert_eq!(read_list(&mut a).unwrap().kept.len(), 1, "kept on the Pro, untouched by its own syncs");
+        let mut fresh = Vault::default();
+        let (mut sf, mut bf) = (hand_over(&sa), Baseline::default());
+        sync(&mut sf, &mut bf, &mut fresh, &FRESH, 2400).unwrap();
+        let mut lf = read_list(&mut fresh).unwrap();
+        assert_eq!(lf.kept.len(), 1, "kept on the fresh device too");
+        let p = lf.stow([0xB2; 32], PHOTON.0, PHOTON.1, &decl("Photon", &[(0, "to draw"), (7, "to reach your friends")]));
+        assert!(!lf.kists[p].unanswered());
+        assert_eq!(sync(&mut sf, &mut bf, &mut fresh, &FRESH, 2500).unwrap().wrote, 0);
     }
 
     /// Trust on first stow follows the person: a developer pinned on one device is pinned on the others and on a reset one; an unstow keeps it; a device that pinned another bundle for that developer before it synced takes the space's, the first to reach it.

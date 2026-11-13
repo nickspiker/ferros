@@ -618,17 +618,48 @@ impl<A: BlockDev, B: BlockDev, N: Nonces> Store<A, B, N> {
         Ok(Export { entries, left_out })
     }
 
-    /// Every value of the domain deleted and the pieces of its unfinished writes swept, its books going with them (an empty list is removed): nothing of the domain is left on the disk. Release, when a person leaves the device (VAULT-OUT.md). Returns how many values went.
+    /// Every value of the domain deleted and the pieces of its unfinished writes swept, its books going with them (an empty list is removed): nothing of the domain is left on the disk. Release, when a person leaves the device (VAULT-OUT.md), and a kist unstowed with what it kept for itself cleared (KISTS.md "The unstow sheet"). Returns how many values went.
+    ///
+    /// In batches: DROP_BATCH names at a time, their heads and pieces DROP_BATCH to an engine commit, and the list of names removed once at the end. One `delete` a name (until 2026-11-12) wrote the list of names again for every value, so a kist's domain of a few thousand values (Mahere's cells) cost a few thousand rewrites of a list as long as the domain. Interrupted, what is left is heads that are gone under names still listed: `len`, `size` and a drop again pass over them.
     pub fn drop_domain(&mut self, d: &Domain) -> Result<u64> {
+        let names = self.names(d)?;
+        let now = (self.now)();
         let mut n = 0;
-        for name in self.names(d)? {
-            if self.delete(d, &name)? {
-                n += 1;
+        for chunk in names.chunks(DROP_BATCH) {
+            let mut gone: Vec<[u8; 32]> = Vec::new();
+            for name in chunk {
+                if let Some((at, h)) = self.head(d, name)? {
+                    gone.push(at);
+                    gone.extend((0..h.pieces()).map(|k| Self::piece_addr(d, &h.id, k)));
+                    n += 1;
+                }
+            }
+            // Looking the heads up kept the last one.
+            self.forget();
+            for batch in gone.chunks(DROP_BATCH) {
+                let ops: Vec<(&[u8; 32], Option<&[u8]>)> = batch.iter().map(|a| (a, None)).collect();
+                self.vault.apply_batch(&ops, now)?;
             }
         }
         self.sweep(d)?;
+        if !names.is_empty() {
+            self.edit_list(d, NAMES, names_schema, "name", |l| l.clear())?;
+        }
         self.forget();
         Ok(n)
+    }
+
+    /// How many values the domain holds and their bytes in all, from their heads (no value is read): what a kist kept for itself, on its card's unstow sheet (KISTS.md "The unstow sheet"). A name whose head is gone (a drop interrupted) counts for nothing.
+    pub fn size(&mut self, d: &Domain) -> Result<(u64, u64)> {
+        let (mut values, mut bytes) = (0, 0);
+        for name in self.names(d)? {
+            if let Some(n) = self.len(d, &name)? {
+                values += 1;
+                bytes += n;
+            }
+        }
+        self.forget();
+        Ok((values, bytes))
     }
 
     /// The pieces of every value whose write never finished in this domain, removed: each pending id's pieces from the first until one is not there (a value's pieces go to the engine in order). Run when the domain's keys are at hand (the vault process does it at a domain's first request after it starts). Returns how many pieces it removed.
@@ -1013,12 +1044,37 @@ mod tests {
         s.write(&gone, &mut w, &bytes(2 * BATCH * PIECE, 8)).unwrap();
         drop(w);
         assert!(s.engine().live_keys().unwrap().len() > before);
+        assert_eq!(s.size(&gone).unwrap(), (2, 1 + 3 * PIECE as u64 + 1));
         assert_eq!(s.drop_domain(&gone).unwrap(), 2);
+        assert_eq!(s.size(&gone).unwrap(), (0, 0));
         assert!(s.names(&gone).unwrap().is_empty());
         assert_eq!(s.get(&gone, b"big").unwrap(), None);
         assert_eq!(s.engine().live_keys().unwrap().len(), before);
         assert_eq!(s.get(&kept, b"keep").unwrap().unwrap(), keep);
         assert_eq!(s.drop_domain(&gone).unwrap(), 0);
+    }
+
+    /// A domain of more names than one batch (a kist's cache: named values and kete's addressed ones, small and large) is dropped whole in batches, and leaves the disk as it was before its first write.
+    #[test]
+    fn drop_many_in_batches() {
+        let mut s = store(1 << 16);
+        let (gone, kept) = (domain(12), domain(13));
+        s.put(&kept, b"keep", b"k").unwrap();
+        let before = s.engine().live_keys().unwrap().len();
+        let mut bytes_in = 0u64;
+        for i in 0..(3 * DROP_BATCH + 5) {
+            let mut name = alloc::vec![1u8];
+            name.extend_from_slice(&[i as u8; 32]);
+            name[1] ^= (i >> 8) as u8;
+            let v = if i % 37 == 0 { bytes(PIECE + 9, i as u8) } else { bytes(i + 1, i as u8) };
+            bytes_in += v.len() as u64;
+            s.put(&gone, &name, &v).unwrap();
+        }
+        assert_eq!(s.size(&gone).unwrap(), ((3 * DROP_BATCH + 5) as u64, bytes_in));
+        assert_eq!(s.drop_domain(&gone).unwrap(), (3 * DROP_BATCH + 5) as u64);
+        assert_eq!(s.engine().live_keys().unwrap().len(), before);
+        assert_eq!(s.size(&gone).unwrap(), (0, 0));
+        assert_eq!(s.get(&kept, b"keep").unwrap().unwrap(), b"k");
     }
 
     /// An export carries every named value of each domain given, whole and under its full name, and nothing of a domain not given or of another key.

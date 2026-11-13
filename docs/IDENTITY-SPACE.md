@@ -11,7 +11,7 @@ One set of typed facts per person (fgtw::space, ferros's vocabulary in ferros_sp
 | Kind | Which | What | This device's copy |
 |---|---|---|---|
 | KIST | developer key, option | capsule (blake3), name, wants in slot order with their reasons | a `kist` section of `kists.list` |
-| ANSWER | developer, option, right | granted or not; stamped when it was given | a want's answer in `kists.list` |
+| ANSWER | developer, option, right | granted or not; stamped when it was given | a want's answer in `kists.list`, or (an unstowed kist's) its `kept` section: a kept answer is a fact like any other since 2026-11-12, so one the person forgot on the unstow sheet goes from the space and every device (KISTS.md "The unstow sheet") |
 | DEFAULT | right | on or off for new kists | `kists.list`'s `defaults` |
 | PLACE | scope, circle (settings, or a kist by developer and option) | x, y, radius, turn | `map.place.<label>` |
 | VIEW | scope | x, y, turn | `map.view` |

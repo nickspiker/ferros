@@ -146,7 +146,7 @@ Both already have a home in the vault as VAULT-OUT.md decided it (2026-11-07): e
 | who opens a body | that kist only, on this device, while the person is present | the kist that made it, any kist the person let open that kind, the person's find page, a kist handed it |
 | who sees the card | the person (title and size, part 2), and the kist | the person, and kists that may open it |
 | follows the person | no (IDENTITY-SPACE.md: a kist's own domain is the kist's business) | yes, to every device of their fleet (part 3) |
-| survives the kist's removal | kept until the person clears it (open question 4) | yes: it is the person's |
+| survives the kist's removal | as the person chooses on its unstow sheet: cleared by default (KISTS.md "The unstow sheet", 2026-11-12) | yes: it is the person's (the sheet keeps it by default) |
 | a rebuilt kist under another key | cannot open it, by design | finds it by kind, once allowed |
 | for | caches, downloads it can fetch again, its working state | anything the person would miss: saves, photos, documents, tracks |
 
@@ -357,6 +357,8 @@ The find page holds one; Genesis's load page holds one while it is up; nothing a
 - **Removed is gone**: its body's blocks are zeroed on both mirrors (VAULT.md "Deletion"), its card leaves the index, and a tombstone goes to the person's other devices so the item goes there too (the identity space's rule: a removal is a tombstone and sticks).
   Undo is offered while the find page that removed it is still open, never on a timer (open question 7: a bin, or not).
 - **A kist's own items** (its key): the person sees them per kist with their sizes on the Kists page and can remove one or clear all; the bodies need the kist's keys, which the kernel issues only against that kist's own live call (VAULT-OUT.md decision 1), so they go at its next call, or by a drop the kernel stamps as it stamps release's (open question 4).
+  Built for the whole domain at unstow (2026-11-12, KISTS.md "The unstow sheet"): the stower, with the Stow right, names the kist and the kernel stamps a size or a drop of its domain; the sheet shows the size and clears it by default.
+  The sheet's row for the items a kist made for the person (kept by default) waits for the hold: the map's `hold_items` is its hook and counts none today.
 - **Release** (the device leaves the fleet, AUTH.md): the person's items on it are dropped with their domains, as today.
   The departure's "save first" checks first that every item held only here has reached another device.
 
@@ -470,7 +472,7 @@ What this spec would add, and what it would not:
 1. **Kinds replace the common area's names?** VAULT-OUT.md decision 2 made the common area a small set of named grants (`wallpaper`, `images`, `contacts`, `theme`); this spec makes them kinds (ideas), with developers minting their own. Same idea, wider, or keep names for system state and kinds for items?
 2. **May a kist open what it made itself without asking?** Proposed yes (it is the `items` right); a rebuild under another key asks per kind.
 3. **Picks remembered.** Proposed: a picked item stays openable by that kist until the person takes it back, kept with their answers. Or a pick lasts only while the kist runs?
-4. **A kist's own items.** Do their cards (title and size, never the body) show to the person, so a download can be seen and removed? When the kist is removed, are they kept until cleared, or dropped with it? Removing them needs the kist's keys: wait for its next call, or a drop the kernel stamps as at release?
+4. **A kist's own items.** Do their cards (title and size, never the body) show to the person, so a download can be seen and removed? When the kist is removed, are they kept until cleared, or dropped with it? Removing them needs the kist's keys: wait for its next call, or a drop the kernel stamps as at release? Answered for removal (owner, 2026-11-12: "upon kist removal, I suspect it may be good to ask if the user wants to clear data? and if so, what categories?", then "Please." to the design): the unstow sheet asks, cleared by default, by a drop the kernel stamps for the stower (KISTS.md "The unstow sheet"). Their cards still open.
 5. **How many versions.** Decided (owner, 2026-11-11): none. "always overwrite for same reason. No (1) versioned bullshit": keeping an item replaces it in place; rolling back is the snaps' job ("we do have snaps so you can roll back (or at least it's in the roadmap)"), not the hold's. Every part of this spec that keeps versions is withdrawn.
 6. **Words in bodies.** Owner, 2026-11-11: "Search inside, kinda? This goes under the idea thing, don't focus too much on it." Searching inside items belongs to the ideas work (IDEAS.md); the hold indexes titles and attributes and leaves room for it.
 7. **Removed means gone.** Decided (owner, 2026-11-11): "Gone at once, no bin ever." Undoing a removal is the snaps' job.

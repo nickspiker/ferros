@@ -63,6 +63,8 @@ const S_VAULT: u64 = 4;
 const OP_DROP: u8 = 4;
 /// The person's export as one VSF document (a process's `SYS_UNLOCK` op 5, forwarded), a transfer at a time.
 const OP_EXPORT: u8 = 5;
+/// How many values each stamped domain holds and their bytes in all (`ferros_store` `size`, from the heads, no value read): a kist's own domain on its card's unstow sheet (docs/KISTS.md "The unstow sheet"), stamped by the kernel for the stower (process.rs `VOP_SIZE`). The value: the bytes; the reply's bytes: the count of values, u64 LE.
+const OP_SIZE: u8 = 6;
 
 /// Each mirror's size to start with, in 4 KiB blocks (512 MiB), and where B starts in the window (its second half).
 const MIRROR: u64 = 1 << 17;
@@ -883,6 +885,27 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
         }
         say!("vault: dropped {} domains ({} values){}", count, n, if ok { "" } else { ", some failed" });
         if ok { n } else { ERR }
+    } else if op == OP_SIZE {
+        // A kist's own domain sized for its unstow sheet: its values and their bytes, over the domains stamped (one).
+        let (mut values, mut bytes, mut ok) = (0u64, 0u64, true);
+        for i in 0..count {
+            let (_, mut d) = domain_at(m, 7 + i * 65);
+            match store.size(&d) {
+                Ok((v, b)) => {
+                    values += v;
+                    bytes += b;
+                }
+                Err(_) => ok = false,
+            }
+            wipe(&mut d);
+        }
+        if ok {
+            out[8..16].copy_from_slice(&values.to_le_bytes());
+            data = 8;
+            bytes
+        } else {
+            ERR
+        }
     } else if op == OP_EXPORT {
         // The person's export (a process's SYS_UNLOCK op 5, forwarded): built at offset 0 from the stamped domains, each with its scope's prefix after the offset and length; handed out a transfer at a time; wiped once read to its end.
         let (offset, len) = (u64_at(rest) as usize, u32::from_le_bytes(rest[8..12].try_into().unwrap()) as usize);
@@ -1123,6 +1146,7 @@ fn op_name(op: u8) -> &'static str {
         3 => "a list",
         OP_DROP => "a drop",
         OP_EXPORT => "an export",
+        OP_SIZE => "a size",
         OP_MIGRATE => "the migration",
         _ => "no request",
     }
