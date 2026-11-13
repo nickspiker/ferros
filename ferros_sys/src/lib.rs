@@ -2301,11 +2301,11 @@ pub mod window {
         (call(display, &[67, number], &mut r) >= 3 && r[0] == 0).then_some((r[1], r[2]))
     }
 
-    /// The helm's Deck button as the deck's summary (display op 66; owner, 2026-11-12: "if anything on the deck has changed state, specifically 400nm notifications, we change the deck circle in the helm", then "So ideally the deck circle shows the latest item icon preview and shows the violet ring?"): `icon` the latest note's source's icon in the display's bundle (0: none, the ring alone), `count` how many wait in the deck's resting view (0: the plain Deck mark). True when the display took it.
-    pub fn helm_note(display: u64, icon: u8, count: u16) -> bool {
+    /// The helm's Deck button as the deck's summary (display op 66; owner, 2026-11-12: "if anything on the deck has changed state, specifically 400nm notifications, we change the deck circle in the helm", then "So ideally the deck circle shows the latest item icon preview and shows the violet ring?"): `icon` the latest note's source's icon in the display's bundle (0: none, the ring alone), `count` how many wait in the deck's resting view (0: the plain Deck mark), `glow` its ring and glow as ferros_glow's state byte: for you (4, 400 nm), or a question (6, 703 nm: the system waits on the person's answer; owner, 2026-11-12: "only difference is it would be 700nm red, rather than the regular 400nm notification glow"). True when the display took it.
+    pub fn helm_note(display: u64, icon: u8, count: u16, glow: u8) -> bool {
         let c = count.to_le_bytes();
         let mut r = [0u8; 4];
-        call(display, &[66, icon, c[0], c[1]], &mut r) >= 1 && r[0] == 0
+        call(display, &[66, icon, c[0], c[1], glow], &mut r) >= 1 && r[0] == 0
     }
 
     /// This window's events after `seen` (display op 62), held by the display until there is one: (the count now, behind, the events since `seen`, oldest first, at most `EVENTS`). None when the display has no such op. Call it from a thread of its own: the call waits.

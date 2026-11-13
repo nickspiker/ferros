@@ -8,7 +8,7 @@
 # First, once: `tools/pro-kists.sh vault` stores that vault process on the Pro and seals it there, then reboot the Pro. On the 8a the old one (a 24 MiB heap) ran out opening a vault grown by Mahere's cells and the capsules (its high water was 43 MiB once it could open), every boot, and took the GPU, WiFi and sensors processes with it; it also ended mid offer when Photon's 16th part came in. Its console says the open's high water ("vault: open in ... the heap's high water ...").
 # A newer build of any of them: its own script writes target/<name>.capsule.vsf (the clock target/kists/clock.capsule.vsf); copy it into $KISTS_DIR, or run that script with the Pro on USB instead (each ends in `ferros send`).
 # The device: the first ferros device on USB, or $FERROS_BUS (lsusb's bus number) when the 8a is plugged in too.
-# Each `ferros send` holds the USB link until the person answers on the glass; the bridge cannot reach the Pro meanwhile.
+# Each `ferros send` lets the USB link go once its kist waits on the person (exit 3; since 2026-11-12, docs/NOTIFY.md "System questions": the Pro's Deck button turns red, a tap opens the offer), so the bridge reaches the Pro meanwhile; this script then waits for Enter here, the person's word that they answered, and asks the Pro how it ended (`ferros sent`). One offer waits at a time, so the next kist goes only after that.
 # Exit: 0 when every kist named was stowed, else 1 (the first one that was not, and why, is said).
 # Usage: tools/pro-kists.sh vault | [mahere] [photon] [clock]   (none: all three kists, in that order)
 set -euo pipefail
@@ -35,10 +35,10 @@ done
 cargo build -q -p ferros-send
 cat <<'CHECK'
 On the Pro, before this goes on:
-  0. It runs the new build and someone has attested (the map on the glass, no app in front: an offer waits until Home).
+  0. It runs the new build and someone has attested (the map on the glass; with an app in front, the offer waits behind a red Deck button).
 For each kist, when the console below says "waiting for the person":
-  1. The Deck page opens on the offer by itself: its name and version, "by" its developer's key, its size, "unchecked code, development build only" (Mahere and Photon are native), what it asks for and why.
-  2. Scroll to the bottom and tap Stow. The console then says "stowed" and the next kist goes.
+  1. The Deck page opens on the offer by itself (or one tap on the red Deck button opens it): its name and version, "by" its developer's key, its size, "unchecked code, development build only" (Mahere and Photon are native), what it asks for and why.
+  2. Scroll to the bottom and tap Stow, then press Enter here. The console then says "stowed" and the next kist goes.
 After the last:
   3. Deck page (the settings circle opens on it): each kist's row opens its card, Back above it.
      Mahere: made by G#BB0CCCBD, version 6.1, 51 MiB, its eight permissions "not asked yet", Unstow at the bottom.
@@ -53,6 +53,12 @@ for k in "${kists[@]}"; do
     set +e
     target/debug/ferros send "$dir/$k.capsule.vsf"
     r=$?
+    # Waiting on the person, the link let go: their word here (Enter) once they answered, then the Pro asked once how it ended. No timer, no asking again and again.
+    while [ $r -eq 3 ]; do
+        read -r -p "== answer $k on the Pro (its Deck button is red), then press Enter here: " _
+        target/debug/ferros sent "$dir/$k.capsule.vsf"
+        r=$?
+    done
     set -e
     case $r in
         0) ;;

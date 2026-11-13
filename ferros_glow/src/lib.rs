@@ -9,6 +9,7 @@
 //! | stopped | 600 | the theme's thin peak |
 //! | for you (anything waiting on the person: a notification from anyone, a question, an approval) | 400 | the theme's heavy peak at `FOR_YOU_LIGHT` of its light, reaching `FOR_YOU_REACH` farther and farther still as the count grows |
 //! | system (the settings circle, built in: never a kist) | 703 | the theme's thin peak, the VSF red primary itself, so no multiply |
+//! | a question (the system waiting on the person's answer: the helm's Deck button, docs/NOTIFY.md "System questions") | 703 | for you's glow in the system's red: the heavy peak at `FOR_YOU_LIGHT`, reaching as far by the count; no multiply |
 //!
 //! What the kist states mean, as the map sends them (payloads/map `send_states`, docs/KISTS.md "Kist states"): running, a live process of that kist (in front or behind); stopped, its last process ended without the person ending it (a fault, a panic, a kill from outside) or its last launch did not start, and it has not started since; not running, stowed and neither; for you, something waiting on the person for that kist (nothing sets it yet: there are no notifications).
 //!
@@ -49,6 +50,8 @@ pub enum Glow {
     ForYou = 4,
     /// The settings circle (the map's circle 0): built in, the system's own, never a kist's state.
     System = 5,
+    /// The system waiting on the person's answer (owner, 2026-11-12: "only difference is it would be 700nm red, rather than the regular 400nm notification glow"): the helm's Deck button's (display op 66), never a circle's.
+    Question = 6,
 }
 
 impl Glow {
@@ -60,6 +63,7 @@ impl Glow {
             3 => Glow::Stopped,
             4 => Glow::ForYou,
             5 => Glow::System,
+            6 => Glow::Question,
             _ => Glow::None,
         }
     }
@@ -101,6 +105,8 @@ pub fn spec(g: Glow) -> Option<Spec> {
         Glow::ForYou => (FOR_YOU_NM, Level::Heavy),
         // Thin, as running: a mark of what the circle is, not a call for the person's eye.
         Glow::System => (SYSTEM_NM, Level::Thin),
+        // Heavy, as for you: a call for the person's eye, in the system's colour.
+        Glow::Question => (SYSTEM_NM, Level::Heavy),
     };
     let c = line(nm);
     // WHY the floor: `ROUNDING`, a primary's other channels are the matrix's rounding, not light or a multiply.
@@ -128,18 +134,18 @@ pub fn waiting_reach(n: u16) -> f32 {
     1. + l / (1. + l)
 }
 
-/// How much farther state `g`'s glow reaches than the theme's, with `n` things waiting: for you by its count (times `FOR_YOU_REACH`), not running `waiting_reach(1)`, as far as for you with one reached before `FOR_YOU_REACH` (so its darkness reads as a ring), the rest not at all.
+/// How much farther state `g`'s glow reaches than the theme's, with `n` things waiting: for you (and a question) by its count (times `FOR_YOU_REACH`), not running `waiting_reach(1)`, as far as for you with one reached before `FOR_YOU_REACH` (so its darkness reads as a ring), the rest not at all.
 pub fn reach(g: Glow, n: u16) -> f32 {
     match g {
-        Glow::ForYou => waiting_reach(n) * FOR_YOU_REACH,
+        Glow::ForYou | Glow::Question => waiting_reach(n) * FOR_YOU_REACH,
         Glow::NotRunning => waiting_reach(1),
         _ => 1.,
     }
 }
 
-/// State `g`'s light against the theme's ring: for you `FOR_YOU_LIGHT`, the rest as the ring.
+/// State `g`'s light against the theme's ring: for you and a question `FOR_YOU_LIGHT`, the rest as the ring.
 pub fn light(g: Glow) -> f32 {
-    if g == Glow::ForYou { FOR_YOU_LIGHT } else { 1. }
+    if g == Glow::ForYou || g == Glow::Question { FOR_YOU_LIGHT } else { 1. }
 }
 
 #[cfg(test)]
@@ -172,6 +178,21 @@ mod tests {
         assert!(s.colour[0] > 0. && s.colour[1] == 0. && s.colour[2] == 0.);
         assert_eq!(code(Glow::System, 0x8A8A8A), 0xFF0000);
         assert_eq!(Glow::from_u8(5), Glow::System);
+    }
+
+    /// A question is for you's glow at 703 nm: red alone, no multiply, heavy, as far and as bright as for you.
+    #[test]
+    fn question_is_for_you_in_red() {
+        let s = spec(Glow::Question).unwrap();
+        std::println!("question: colour {:?}, grey theme G#{:06X}", s.colour, code(Glow::Question, 0x8A8A8A));
+        assert_eq!(s.mult, [0.; 3]);
+        assert_eq!(s.level, Level::Heavy);
+        assert!(s.colour[0] > 0. && s.colour[1] == 0. && s.colour[2] == 0.);
+        for n in [1, 2, 20] {
+            assert_eq!(reach(Glow::Question, n), reach(Glow::ForYou, n));
+        }
+        assert_eq!(light(Glow::Question), light(Glow::ForYou));
+        assert_eq!(Glow::from_u8(6), Glow::Question);
     }
 
     /// `ROUNDING` leaves the owner's three lines as they were: each keeps its one negative channel's multiply.

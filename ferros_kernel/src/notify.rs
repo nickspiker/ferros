@@ -4,6 +4,7 @@
 //! - **Where they live:** the person's (identity class, kvault `IDENTITY`'s `\0notes.`), one vault entry a note, written at every change (AGENT.md: every change hits disk). A note is about the person (who wrote to them, what about): it is never readable before attest, it follows the person (the fleet clears it on every device of theirs), and a release wipes it with the rest of the identity. Loaded the first time any op runs with a person present; dropped from RAM when nobody is.
 //! - **What is stored and served** is the kernel's own rebuild of what it parsed (`ferros_kist::note::build`), never the kist's bytes.
 //! - **Counts, never time:** a kist has at most `WAITING` notes waiting, and posts at most `POSTS` between two looks from the person (`seen` gives its budget back). Past either, a post is refused (NOTHING) until the person has looked.
+//! - **System questions** (source `note::SYSTEM`, posted by the map: docs/NOTIFY.md "System questions") are personal at most and live in RAM alone, as long as what asks them.
 //! - **A deadline** is the kist's (one a note): a note past it goes as if withdrawn, at the next op. The deck waits for the earliest one as for an alarm (its watch's deadline), then lists, which drops it here and rings.
 use super::*;
 use ferros_kist::note::{self, Note, Poster, LIVE, PERSONAL, POSTS, STATUS, WAITING};
@@ -36,7 +37,11 @@ fn addr(source: &[u8; 32], number: u8) -> [u8; 32] {
 }
 
 /// A note kept in the vault (`doc`) or gone from it (None). A vault that refuses says so on the console: the note stands in RAM, unkept.
+/// A system question (source `note::SYSTEM`) is never written: it lasts as long as what asks it (an offer, an open sheet, a device asking), none of which outlives the map or the device restarting, and the map posts again whatever still waits (docs/NOTIFY.md "System questions"). Its removal still goes to the vault, for one a kernel from before kept.
 fn keep(source: &[u8; 32], number: u8, doc: Option<&[u8]>) {
+    if *source == note::SYSTEM && doc.is_some() {
+        return;
+    }
     let Some(store) = (unsafe { STORE_ADDR }) else { return };
     let a = addr(source, number);
     let ok = match doc {
@@ -86,6 +91,11 @@ fn load() {
         // A record that does not read as a note (a vault from a later kernel, a torn write) is not shown; it stays until the person's next look at its kist removes it by its address.
         if let Ok(Some(doc)) = store(PREFIX, &a, AddrOp::Get) {
             if let Some(n) = note::parse(&doc).filter(|n| n.source.is_some() && n.number.is_some_and(|k| (k as usize) < WAITING)) {
+                // A system question a kernel from before kept: nothing asks it now (`keep`), so it goes.
+                if n.source == Some(note::SYSTEM) {
+                    let _ = store(PREFIX, &a, AddrOp::Remove);
+                    continue;
+                }
                 got.push(n);
             }
         }
@@ -127,9 +137,10 @@ fn holds_endpoint(p: &Process, name: &[u8]) -> bool {
     p.cspace.iter().any(|c| c.object == Object::Endpoint(e) && c.rights & RIGHT_SEND != 0)
 }
 
-/// What the system sees of a note's poster (ferros_kist::note `decide` lowers the kind by it): the system's own (`kist` None), or a kist and whether it holds the network.
-fn poster(kist: Option<&Process>) -> Poster {
+/// What the system sees of a note's poster (ferros_kist::note `decide` lowers the kind by it): the system's own (`kist` None), its question (the system's, from `note::SYSTEM`: personal at most, never the screen), or a kist and whether it holds the network.
+fn poster(source: &[u8; 32], kist: Option<&Process>) -> Poster {
     match kist {
+        None if *source == note::SYSTEM => Poster::Question,
         None => Poster::System,
         Some(p) => Poster::Kist { network: holds_endpoint(p, b"udp") },
     }
@@ -147,7 +158,7 @@ fn post(source: [u8; 32], doc: &[u8], kist: Option<&Process>) -> u64 {
         return NOTHING;
     }
     let asked = n.kind;
-    n.kind = note::decide(asked, n.person.is_some(), poster(kist));
+    n.kind = note::decide(asked, n.person.is_some(), poster(&source, kist));
     n.asked = Some(asked);
     n.source = Some(source);
     n.posted = Some(crate::settings::eagle_now());
