@@ -1238,6 +1238,8 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
 /// Returns false when the shell is off this boot (`home.off`).
 fn start_home(store: &mut Option<ShimStore>) -> bool {
     crate::checklist::HOME.store(cntpct(), core::sync::atomic::Ordering::Relaxed);
+    // The bootloader's lock state once a boot, first on the console (bootlock.rs; owner, 2026-11-13: shown, never a nag).
+    crate::process::push_console(crate::bootlock::console_line().as_bytes());
     // FERROS_RESCUE (2026-11-03): the vault's usb, pcie1 and bt capsules replaced by the builds this kernel carries, whatever is stored (a rescue kernel is flashed only on purpose, and a broken build of either kind leaves the bridge dead). A masked build of a driver that reaches its registers by raw pointers dies at once, and with usb dead the bridge cannot put the capsule back: the chicken-and-egg this switch exists for. Flash it once, let it mend the vault, flash the ordinary kernel again.
     #[cfg(ferros_rescue)]
     if let Some(s) = store.as_mut() {
@@ -1398,6 +1400,8 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     v[82] = match ANDROID_ALLOWED.load(Relaxed) { 0 => crate::process::FACT_UNKNOWN, s => s };
     // 81: the panel's VCI (panel_power.rs): 2 on, 1 off, unknown until the service loop has read it.
     v[81] = match crate::panel_power::VCI.load(Relaxed) { 0 => crate::process::FACT_UNKNOWN, s => s };
+    // 87: the bootloader's lock state as ABL told this boot (bootlock.rs): bits 0-7 the device state (1 locked, 2 unlocked), bits 8-15 the verified boot state (1 green, 2 yellow, 3 orange, 4 red), unknown without a bootconfig (a reload). Not the person's: no capability.
+    v[87] = crate::bootlock::STATE.load(Relaxed);
     // 33-80: those drivers' own measures (SYS_STATUS), eight tagged words each, in the same order, then the usb driver's.
     for i in 0..6 {
         for w in 0..8 {

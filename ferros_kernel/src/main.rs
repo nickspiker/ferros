@@ -96,6 +96,9 @@ mod flashlog;
 mod kvault;
 #[cfg(feature = "pixel8")]
 mod modem;
+// The bootloader's lock state from ABL's bootconfig: fact 87, the settings line and a console line (bootlock.rs).
+#[cfg(feature = "pixel8")]
+mod bootlock;
 // The ira-rooted vault probe and its ira/wairua sources (both boot paths now bring UFS up).
 #[cfg(feature = "pixel8")]
 mod vault_boot;

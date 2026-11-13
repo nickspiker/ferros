@@ -229,6 +229,11 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Processes => "procesy",
         Msg::InTheVault => "w skarbcu",
         Msg::Chip => "chip",
+        Msg::BootloaderUnlocked => "bootloader odblokowany: każdy, kto trzyma to urządzenie, może uruchomić własny system i odczytać jego ustawienia, schowane kisty i zapisaną tapetę; twoja tożsamość i twoi ludzie pozostają zamknięci",
+        Msg::BootloaderUnlockedAttest => "bootloader odblokowany: każdy, kto trzyma to urządzenie, może uruchomić własny system i odczytać jego ustawienia, schowane kisty, zapisaną tapetę oraz, skoro poświadczaj przy starcie jest włączone, twoją tożsamość",
+        Msg::BootloaderLockedFerros => "bootloader zablokowany kluczem ferros",
+        Msg::BootloaderLockedMaker => "bootloader zablokowany kluczem producenta",
+        Msg::BootloaderNotRead => "stanu bootloadera nie odczytano przy tym starcie",
         // ---- Kists, Permissions ----
         Msg::NoKistsStowed => "brak schowanych kistów",
         Msg::AsksForNothing => "o nic nie prosi",

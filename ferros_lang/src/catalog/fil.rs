@@ -229,6 +229,11 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Processes => "mga proseso",
         Msg::InTheVault => "nasa kaban",
         Msg::Chip => "chip",
+        Msg::BootloaderUnlocked => "naka-unlock ang bootloader: sinumang may hawak ng device na ito ay makakapag-boot ng sariling sistema at mababasa ang mga setting nito, mga naitabing kist at naka-cache na wallpaper; nananatiling sarado ang pagkakakilanlan mo at ang mga tao mo",
+        Msg::BootloaderUnlockedAttest => "naka-unlock ang bootloader: sinumang may hawak ng device na ito ay makakapag-boot ng sariling sistema at mababasa ang mga setting nito, mga naitabing kist, naka-cache na wallpaper at, dahil bukas ang magpatotoo sa pag-boot, pati ang pagkakakilanlan mo",
+        Msg::BootloaderLockedFerros => "naka-lock ang bootloader sa susi ng ferros",
+        Msg::BootloaderLockedMaker => "naka-lock ang bootloader sa susi ng gumawa nito",
+        Msg::BootloaderNotRead => "hindi nabasa ang lock ng bootloader sa boot na ito",
         // ---- Kists, Permissions ----
         Msg::NoKistsStowed => "walang naitabing kist",
         Msg::AsksForNothing => "walang hinihingi",

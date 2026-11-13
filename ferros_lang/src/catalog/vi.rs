@@ -229,6 +229,11 @@ pub fn text(m: Msg) -> &'static str {
         Msg::Processes => "tiến trình",
         Msg::InTheVault => "trong két",
         Msg::Chip => "chip",
+        Msg::BootloaderUnlocked => "bootloader đã mở khóa: ai cầm thiết bị này có thể khởi động hệ thống riêng và đọc cài đặt của nó, các kist đã cất và hình nền đã lưu đệm; danh tính và những người của bạn vẫn đóng kín",
+        Msg::BootloaderUnlockedAttest => "bootloader đã mở khóa: ai cầm thiết bị này có thể khởi động hệ thống riêng và đọc cài đặt của nó, các kist đã cất, hình nền đã lưu đệm và, vì chứng thực khi khởi động đang bật, cả danh tính của bạn",
+        Msg::BootloaderLockedFerros => "bootloader đã khóa bằng khóa của ferros",
+        Msg::BootloaderLockedMaker => "bootloader đã khóa bằng khóa của nhà sản xuất",
+        Msg::BootloaderNotRead => "chưa đọc trạng thái khóa bootloader lần khởi động này",
         // ---- Kists, Permissions ----
         Msg::NoKistsStowed => "chưa cất kist nào",
         Msg::AsksForNothing => "không xin gì",
