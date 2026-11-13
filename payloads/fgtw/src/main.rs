@@ -192,35 +192,38 @@ impl Udp {
         let mut r = [0u8; 16];
         let _ = self.call(&m, &mut r);
     }
-    /// INFO's flags byte (bit 0 IPv4 bound, bit 1 IPv6 global) and whether the stack answered at all.
+    /// INFO's flags byte (bit 0 an IPv4 route, bit 1 an IPv6 one) and whether the stack answered at all.
     fn flags(&self) -> Option<u8> {
         let mut out = [0u8; 64];
         let n = self.call(&[3], &mut out);
         (n >= 51 && n != ERR).then_some(out[50])
     }
-    /// `host`'s IPv4 address from ip's resolver (op 10 RESOLVE, the device's one cache; the call held until the lookup ends, 16 s at most), or None (nobody present, no route or server, no such name, no answer).
-    fn resolve(&self, host: &[u8]) -> Option<[u8; 4]> {
+    /// `host`'s address from ip's resolver (op 10 RESOLVE, the device's one cache; the call held until the lookup ends, 16 s at most), or None (nobody present, no route or server, no such name, no answer).
+    /// Family 0: the family the route will use, AAAA where IPv6 has a route, then A (owner, 2026-10-29: IPv6 preferred). Until 2026-11-13 this asked for IPv4 alone, and a network that gave no DHCPv4 lease but a working IPv6 left the identity service grey (the 8a: fgtw.org answered httptest over IPv6 while fgtw never saw a network).
+    fn resolve(&self, host: &[u8]) -> Option<SeedAddr> {
         let mut q = Vec::with_capacity(3 + host.len());
-        q.extend_from_slice(&[10, 4, 1 << 4]);
+        q.extend_from_slice(&[10, 0, 1 << 4]);
         q.extend_from_slice(host);
         let mut r = [0u8; 22];
         let n = self.call(&q, &mut r);
         // Status 0, found: the family and the address follow (an empty reply: nobody present).
-        if n == ERR || n < 22 || r[0] != 0 || r[1] != 4 {
+        if n == ERR || n < 22 || r[0] != 0 || (r[1] != 4 && r[1] != 6) {
             return None;
         }
-        Some([r[2], r[3], r[4], r[5]])
+        let mut ip = [0u8; 16];
+        ip.copy_from_slice(&r[2..18]);
+        Some(SeedAddr { fam: r[1], ip })
     }
 
-    /// One HTTP POST of `body` to `/` on `ip:80` (the `ip` process's client TCP, ops 4-7), as (status, body); None when the connection or the exchange fails, or takes longer than 16 s.
+    /// One HTTP POST of `body` to `/` on port 80 of `to` (the `ip` process's client TCP, ops 4-7, either family), as (status, body); None when the connection or the exchange fails, or takes longer than 16 s.
     /// The request goes into the connection's send buffer as soon as it is asked for (ip sends it once the connection opens); each receive is held by ip until data comes or the connection's state changes, a second at most, never a poll (owner, 2026-11-10: "No polling!").
-    fn post(&self, ip: [u8; 4], host: &[u8], body: &[u8]) -> Option<(u16, Vec<u8>)> {
+    fn post(&self, to: SeedAddr, host: &[u8], body: &[u8]) -> Option<(u16, Vec<u8>)> {
         let f = ferros_sys::freq();
         let deadline = now() + 16 * f;
         let mut c = [0u8; 20];
         c[0] = 4;
-        c[1] = 4;
-        c[2..6].copy_from_slice(&ip);
+        c[1] = to.fam;
+        c[2..18].copy_from_slice(&to.ip);
         c[18..20].copy_from_slice(&80u16.to_be_bytes());
         let mut r = [0u8; 16];
         if self.call(&c, &mut r) != 2 || r[0] != 0 {
@@ -326,10 +329,17 @@ const STORE_PIECE: usize = 4096;
 /// The seed (photon docs/peers-are-fgtw.md: peers first, the seed last). Plain HTTP on port 80, which fgtw.org serves (checked 2026-10-28; Claude memories/fgtw_plain_http_for_ferros.md): every call is one POST of a signed VSF document, and every answer is verified and folded here, so the transport carries no trust.
 const SEED_HOST: &[u8] = b"fgtw.org";
 
+/// The seed's address as ip's resolver gave it: the family (4 or 6) and the address (IPv4 in the first four bytes).
+#[derive(Clone, Copy)]
+struct SeedAddr {
+    fam: u8,
+    ip: [u8; 16],
+}
+
 /// fgtw's transport on ferros: one plain-HTTP POST of a request to fgtw.org through the `ip` process (Udp::post), the address resolved once and again after a failure. fgtw (feature `protocol`) builds every request and reads every answer; this only carries bytes.
 struct SeedHttp<'a> {
     udp: &'a Udp,
-    ip: core::cell::Cell<Option<[u8; 4]>>,
+    ip: core::cell::Cell<Option<SeedAddr>>,
 }
 
 impl fgtw::client::FgtwTransport for SeedHttp<'_> {
@@ -407,7 +417,7 @@ struct Client {
     radios_at: u64,
     /// A device leaving its fleet, both halves, on fgtw's machine (depart.rs): this device's own request and a fleet device's request waiting for this device's person.
     dep: depart::Departing,
-    /// Whether IPv4 has been up (the first lease triggers a look-up), and the look-up ticks spent with no network while looking.
+    /// Whether the network has been up, either family (the first address triggers a look-up), and the look-up ticks spent with no network while looking.
     net_up: bool,
     offline_looks: u8,
     last_beacon_us: u64,
@@ -423,7 +433,7 @@ struct Client {
     /// When the seed's chain was last read for this device's Add while joining (`join_check`).
     join_checked_us: u64,
     /// The seed's address, once resolved.
-    seed_ip: Option<[u8; 4]>,
+    seed_ip: Option<SeedAddr>,
     /// A sponsor named at spawn (its address; the key is learnt from its frames), handed the request directly.
     given: Option<Addr>,
     given_asked_t: i64,
@@ -1568,7 +1578,7 @@ impl Client {
                 }
                 let mut reply = Vec::with_capacity(400);
                 // Op 6: the fleet's members, for the Fleet page (`members_reply`): its own reply, nothing of the state after it.
-                // Op 7: how this device reaches its fleet, for the Fleet page: [the network up (IPv4) u8][seconds since fgtw.org last answered, u32 LE, all ones for never][fleet devices heard on this network u8].
+                // Op 7: how this device reaches its fleet, for the Fleet page: [the network up (either family) u8][seconds since fgtw.org last answered, u32 LE, all ones for never][fleet devices heard on this network u8].
                 if n >= 1 && req[0] == 7 {
                     let mut r = [0u8; 6];
                     r[0] = self.net_up as u8;
@@ -1666,12 +1676,18 @@ impl Client {
             self.space_step(t);
             // The verdict: looked up once the network is up, and again every 30 s while GREY or while a fresh handle waits (someone else may mint it meanwhile).
             // The client serves from the start, network or not (the attest screen waits on it); the network coming up is a reason to look up at once, not 30 s later.
-            let up = self.udp.flags().is_some_and(|f| f & 1 != 0);
+            // Either family will do (INFO bit 0 an IPv4 route, bit 1 an IPv6 one): fgtw.org answers on both, and the resolver picks the family the route will use. Until 2026-11-13 only IPv4 counted, and the 8a with no DHCPv4 lease but a working IPv6 stayed grey.
+            let fl = self.udp.flags().unwrap_or(0);
+            let up = fl & 3 != 0;
             if up && !self.net_up {
                 self.net_up = true;
                 self.last_lookup_us = 0;
                 self.fgtw_asked_us = 0;
-                self.log.put(b"fgtw: the network is up (IPv4)");
+                self.log.put(match fl & 3 {
+                    1 => b"fgtw: the network is up (IPv4)".as_slice(),
+                    2 => b"fgtw: the network is up (IPv6)",
+                    _ => b"fgtw: the network is up (IPv4 and IPv6)",
+                });
                 self.log.line();
                 // A departure frame or a fan-out given up on is handed again on the new network.
                 self.depart_event(fgtw::flow::Event::LinkUp);
@@ -1881,7 +1897,7 @@ extern "C" fn work(_: u64) -> ! {
     let base = ferros_sys::arc_base();
     let mut log = Log { grants, buf: Vec::new() };
     let udp = Udp { grants, base };
-    // No wait for the network here: the `fgtw` endpoint is served from the start, so the attest screen always gets an answer (until 2026-10-31 this thread waited for an IPv4 lease first, and with no network attest froze on the roots hand-over). The UDP ports and beacon groups are taken now; the IP process keeps the groups and reports them once the link is up; look-ups wait for IPv4 in the loop.
+    // No wait for the network here: the `fgtw` endpoint is served from the start, so the attest screen always gets an answer (until 2026-10-31 this thread waited for an IPv4 lease first, and with no network attest froze on the roots hand-over). The UDP ports and beacon groups are taken now; the IP process keeps the groups and reports them once the link is up; look-ups wait in the loop for an address of either family.
     // The device key, rooted in the ira.
     let Some(fingerprint) = ferros_sys::ira_key(cap(grants, S_IRA), "fgtw device") else {
         log.put(b"fgtw: no ira-derived key (no Ira grant, or the kernel has no ira this boot)");
