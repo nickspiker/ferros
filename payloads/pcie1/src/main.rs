@@ -3031,7 +3031,15 @@ fn serve_unjoined(d: &mut Drv, m: &mut Msgbuf, skip: &Option<(Vec<u8>, Vec<u8>, 
         }
         let n = svc(2, d.cap(WLAN), msg.as_mut_ptr() as u64 - d.base, msg.len() as u64, tok.as_mut_ptr() as u64 - d.base, 1);
         if n == u64::MAX - 1 || n == ERR {
-            ferros_sys::sleep_until(ferros_sys::now() + d.freq / 1000);
+            if scanning {
+                // A scan running: its results come as the firmware's events, read every millisecond (the interrupt is set up only for serving).
+                ferros_sys::sleep_until(ferros_sys::now() + d.freq / 1000);
+            } else {
+                // No scan: nothing comes from the chip unasked, so the wait is for a call (the page's WATCH, a join), the next look at the vault for the credential (a quarter second: nothing rings when a person attests and it becomes readable), or a kept credential's retry (2026-11-13: every millisecond before, the driver's whole time on a device nobody had attested).
+                // WHY the min: the earlier of two deadlines, not a bound on a value.
+                let until = (vault_at + d.freq / 4).min(if skip.is_some() { retry_at } else { u64::MAX });
+                ferros_sys::wait_world_or_call(&IRQ_RUNG, IRQ_RUNG.load(core::sync::atomic::Ordering::Acquire), until);
+            }
             continue;
         }
         let msg = unsafe { core::ptr::read_volatile(&msg) };
