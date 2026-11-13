@@ -1507,7 +1507,7 @@ impl Msgbuf {
         d.tcm_wr(self.h2d_w + 8, self.tx_w % 512);
         d.wr(MEM, 0x2140, 0xFF00_0000 | 5 << 16 | (self.tx_w % 512));
     }
-    /// One Ethernet frame onto flowring 2 (msgbuf ring 5, H2D index slot 2), unpublished until `tx_ring`: copied a word at a time into a free tx buffer (`TX_BUFS` of 2 KiB from +G#7_0000), then host_txbuf_post_t v1 (48 B): header (type G#0F, request id), the 14-byte Ethernet header, flags G#01 (802.3), seg_cnt 1, data address = the payload after the header, data_len = length − 14.
+    /// One Ethernet frame onto flowring 2 (msgbuf ring 5, H2D index slot 2), unpublished until `tx_ring`: copied a word at a time into a free tx buffer (`TX_BUFS` of 2 KiB from `TX_BASE`), then host_txbuf_post_t v1 (48 B): header (type G#0F, request id), the 14-byte Ethernet header, flags G#01 (802.3), seg_cnt 1, data address = the payload after the header, data_len = length − 14.
     /// A buffer is free once the chip has completed the frame it held (`tx_done`, from the tx completions): with every buffer still in flight the completions are read once more, and if none came the frame is refused (false), as a full transmit ring drops (TCP sends again). Until 2026-11-11 one frame went per request and eight buffers were reused in turn unchecked; a batch from the IP stack (`serve` op 8) would overwrite buffers the chip had not fetched yet.
     /// WHY the length test: the frame comes from another process; its Ethernet header must be whole and it must fit a buffer.
     fn tx_post(&mut self, d: &mut Drv, frame: &[u8]) -> bool {
@@ -1521,7 +1521,7 @@ impl Msgbuf {
             }
         }
         let k = self.tx_w % TX_BUFS;
-        let buf = self.dma + 0x7_0000 + 0x800 * k;
+        let buf = self.dma + TX_BASE + 0x800 * k;
         dma_put(buf, frame);
         let phase = if (self.tx_w / 512) % 2 == 0 { 0x80 } else { 0 };
         let a = self.dma + 0x6_0000 + 48 * (self.tx_w % 512);
@@ -2132,8 +2132,10 @@ const WLAN: u64 = 15;
 /// Receive buffers posted to the chip, 2 KiB each from RX_BASE in the DMA region (whose upper 1.5 MiB nothing else uses). 64 served the BCM4398; with 64 posted akita's BCM4383 delivered a third of its unicast and no ARP at all, so nothing on the LAN could be resolved and DNS never left (2026-11-09: Android's dhd posts 2040). With 256: every echo answered, ARP resolved, fgtw.org reached. A power of two under the rxpost ring's 512 slots; the rx queue's index fits a byte.
 const RX_BUFS: u32 = 1 << 8;
 const RX_BASE: u32 = 0x8_0000;
-/// Transmit buffers, 2 KiB each from G#7_0000 up to RX_BASE (64 KiB): a batch from the IP stack is its ACKs for a burst of segments, about 80 bytes each, up to 48 in a 4096-byte call; 32 in flight before the chip completes the first is ample.
-const TX_BUFS: u32 = 1 << 5;
+/// Transmit buffers, 2 KiB each from TX_BASE, above the receive buffers in the DMA region's upper MiB (256 KiB; nothing else is there since the vault's files moved into the arc, `vault_file`).
+/// A batch from the IP stack is mostly its ACKs, one every second segment (RFC 5681): up to 44 for a reply of 88 full frames, and a 4096-byte request holds up to 66 frames of the 60-byte minimum. 32 buffers (2026-11-11 to 2026-11-12, at G#7_0000) could refuse a batch's last ACKs while the chip had not completed its first, and a batch's last ACK refused leaves its sender waiting for its timeout; 128 hold two full requests before any completion.
+const TX_BUFS: u32 = 1 << 7;
+const TX_BASE: u32 = 0x10_0000;
 /// The largest request: 4096 bytes, all a call carries (the kernel's SYS_CALL reads at most that).
 const REQ_MAX: usize = 1 << 12;
 /// The largest reply to op 8: 128 KiB, about 88 full frames, a third of the posted buffers (the kernel carries a reply of up to 256 KiB).
