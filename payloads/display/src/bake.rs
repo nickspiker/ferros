@@ -239,7 +239,8 @@ impl Bake {
         }
     }
 
-    /// The bake undone (a screen capture, op 30, tools/screencap: VSF RGB working values, as before the bake; the wallpaper at a brightness change, baked again after): each pixel's codes to panel light (`to_p`), the ODT inverted back to VSF light, its root unrolled (`to_v`), as working values with their fourth lane kept. Opaque composites, so their premultiplied codes are their colours. Approximate where the bake lost something for good: past the panel's gamut (a channel held at 0 or the top) and in the roll-off's last stops.
+    /// The bake undone (a screen capture, op 30, tools/screencap: VSF RGB working values, as before the bake; the wallpaper at a brightness change, baked again after until its source is read again, main.rs `wall_refresh`): each pixel's codes to panel light (`to_p`), the ODT inverted back to VSF light, its root unrolled (`to_v`, linear between its steps, rounded), as working values with their fourth lane kept. Opaque composites, so their premultiplied codes are their colours. Approximate where the bake lost something for good: past the panel's gamut (a channel held at 0 or the top) and in the roll-off's last stops.
+    /// Until 2026-11-12 the root table was read at the step below: its 4096 steps run to the peak, so a dim bake (white at a quarter of the root, brightness 128) left about a thousand of them under white, and every step down was a bias toward black. One brightness change and back on the 8a moved 97 % of a smooth stretch of the wallpaper, 46 g2t codes darker on average, and halved its distinct values (1141 to 641): the banding the owner saw.
     pub fn unbake_with(&self, buf: &mut [u64], to_p: &[f32], to_v: &[u16]) {
         let n = to_v.len() - 1;
         let inv = invert(&self.m);
@@ -247,8 +248,12 @@ impl Bake {
             let q = [to_p[(*p & 0xFFFF) as usize], to_p[(*p >> 16 & 0xFFFF) as usize], to_p[(*p >> 32 & 0xFFFF) as usize]];
             let w = |r: usize| {
                 let l = inv[r][0] * q[0] + inv[r][1] * q[1] + inv[r][2] * q[2];
-                // A negative light (a colour the bake held at a channel's 0) has no root: NaN, which the cast makes index 0, black on that channel. WHY the min: the inverse of codes the bake rounded or held at the top can land past the peak's light; its root is past the table's end, and it is the top.
-                to_v[((libm::sqrtf(l) * n as f32) as usize).min(n)] as u64
+                // A negative light (a colour the bake held at a channel's 0) has no root: NaN, which the cast makes index 0 and the step NaN, so the value casts to 0, black on that channel.
+                let x = libm::sqrtf(l) * n as f32;
+                // WHY the min: the inverse of codes the bake rounded or held at the top can land past the peak's light; its root is past the table's last step, which then runs on past the top (the step's share over 1), and the cast holds it at the top.
+                let i = (x as usize).min(n - 1);
+                let (a, b) = (to_v[i] as f32, to_v[i + 1] as f32);
+                (a + (b - a) * (x - i as f32) + 0.5) as u16 as u64
             };
             *p = (*p & 0xFFFF << 48) | w(0) | w(1) << 16 | w(2) << 32;
         }
