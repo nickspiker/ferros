@@ -1567,6 +1567,12 @@ fn write_pref_all(index: usize, value: u8) {
         p.write_grants(pref_at(index) as u64, &[value]);
         crate::cachemap::grants_page(p.arc.base, false);
     }
+    wake_word_waiters();
+}
+
+/// Every thread waiting on a word made runnable, its `wait` returning 0 (every wait in the system is a loop that re-checks): a preference or a link's control block changed, and a driver asleep until its device or its next deadline looks at it now. With the kernel lock held. Interrupt waits are left alone.
+fn wake_word_waiters() {
+    let kk = k();
     for i in 0..kk.threads.len() {
         if let Some(x) = kk.threads[i].as_mut() {
             if matches!(x.state, State::Waiting(a, _) if a >= 1024) {
@@ -3923,6 +3929,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     0
                 }
             };
+            // A knob set: the drivers asleep on a word look at their blocks now (2026-11-13: the WiFi driver waits on its chip's interrupt and no longer looks every quarter second), as a preference's change wakes them.
+            if f.x[0] == 0 {
+                wake_word_waiters();
+            }
             0
         }
         SYS_CONTROLS => {
