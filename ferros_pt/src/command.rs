@@ -113,6 +113,20 @@ pub mod caps {
     /// - Exec [capsule 32][length u64 LE]: offer it, every part in → [0] offered, or [a nonzero status][words] (nobody present, another offer waiting on the person, not carried in whole, no stower).
     /// - Read [capsule 32][the state last seen u8]: its state, held until it is not the one last seen or for `ferros_kist::offer::HOLD_SECONDS` → [state][why][flags].
     pub const OFFER: &[u8] = b"ferros.kist.offer";
+    /// The end of a command the device answered `held::STILL` (docs/USB.md "Long commands"): Read, no parameters → that command's own answer once its work ends, or `STILL` again at the end of a lease, or `NOTHING` when no command is held. Answered by a production build too: it tells only the end of the host's own last command.
+    pub const HELD: &[u8] = b"ferros.pt.held";
+}
+
+/// A command whose work outlives one answer (docs/USB.md "Long commands"; 2026-11-13, the 8a: the last part of Photon's 92 MB capsule committed the whole value on a busy vault and ran past the USB driver's 16 s, which gives up on a command the kernel never answers).
+/// The device answers it `STILL` at the end of a lease and carries the work on; the host then reads its end with `caps::HELD`, a read the device holds until the work ends (its answer then the command's own) or another lease ends (`STILL` again).
+/// No timer on the host and no polling: each wait is a held call answered at a change, and the lease is the USB driver's own deadline.
+pub mod held {
+    /// The status byte of a command still at work: ask `caps::HELD` for its end.
+    pub const STILL: u8 = 6;
+    /// The status byte of a held read with no command held.
+    pub const NOTHING: u8 = 7;
+    /// How long the device keeps a command's answer before it says `STILL`, in seconds: inside the USB driver's 16 s (payloads/usb), which ends a command the kernel never answers.
+    pub const LEASE_SECONDS: u64 = 1 << 3;
 }
 
 /// Ring identifiers for the beam command.

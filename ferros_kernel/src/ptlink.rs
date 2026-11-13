@@ -21,6 +21,8 @@ pub const BIG: (usize, usize) = (0x81A0_0000, 0x8200_0000);
 pub enum Payload {
     Heap(Vec<u8>),
     Big(usize),
+    /// A large command that came while the region was held (`hold_big`): its bytes not kept.
+    Refused,
 }
 
 impl Payload {
@@ -29,6 +31,7 @@ impl Payload {
             Payload::Heap(v) => v,
             // SAFETY: BIG is kernel memory outside the heap, mapped, and nothing else writes it while a submitted command holds it (one command at a time).
             Payload::Big(n) => unsafe { core::slice::from_raw_parts(BIG.0 as *const u8, *n) },
+            Payload::Refused => &[],
         }
     }
 }
@@ -48,9 +51,11 @@ struct Link {
     /// The USB process's generation, moved by each `reset` (a new process), and the generation the command the service loop took came in: a reply to a command of a process that has ended is dropped, never handed to its successor as the answer to its own first command.
     epoch: u64,
     served: u64,
+    /// The large-command region is a long command's still (service.rs, ferros_pt::command::held): its put reads its value from there after its command was answered STILL, so a large command that comes meanwhile is not copied over it (`Payload::Refused`).
+    big_held: bool,
 }
 
-static mut LINK: Link = Link { inbox: None, outbox: None, busy: false, epoch: 0, served: 0 };
+static mut LINK: Link = Link { inbox: None, outbox: None, busy: false, epoch: 0, served: 0, big_held: false };
 
 fn link() -> &'static mut Link {
     // SAFETY: only under the kernel lock (module doc).
@@ -67,6 +72,8 @@ pub fn submit(len: usize, act: bool, fill: impl FnOnce(&mut [u8])) -> bool {
         let mut v = alloc::vec![0u8; len];
         fill(&mut v);
         Payload::Heap(v)
+    } else if l.big_held {
+        Payload::Refused
     } else if len <= BIG.1 - BIG.0 {
         // SAFETY: as Payload::bytes.
         fill(unsafe { core::slice::from_raw_parts_mut(BIG.0 as *mut u8, len) });
@@ -113,6 +120,11 @@ pub fn take(offset: usize, cap: usize, put: impl FnOnce(&[u8])) -> Option<(usize
         l.busy = false;
     }
     Some((total, replied, act))
+}
+
+/// The large-command region kept for a long command's put or let go (service.rs, ferros_pt::command::held).
+pub fn hold_big(held: bool) {
+    link().big_held = held;
 }
 
 /// Whether a command is in (op 1 tells "still running" from "nothing submitted" by it).

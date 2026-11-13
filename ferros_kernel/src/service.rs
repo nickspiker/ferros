@@ -297,6 +297,13 @@ fn offer_part(params: &[u8]) -> Result<VaultJob, alloc::vec::Vec<u8>> {
     vault_job_call(&job, params).map(|()| job)
 }
 
+/// A PT answer of a status and its words ([status][words]), as the store and offer commands give them.
+fn held_status(status: u8, words: &str) -> alloc::vec::Vec<u8> {
+    let mut r = alloc::vec![status];
+    r.extend_from_slice(words.as_bytes());
+    r
+}
+
 /// The job's next call to the vault process; Err(the PT reply) when it cannot be made.
 fn vault_job_call(job: &VaultJob, params: &[u8]) -> Result<(), alloc::vec::Vec<u8>> {
     use crate::process::{vault_stamp, VOP_DELETE, VOP_GET, VOP_SET};
@@ -1886,6 +1893,13 @@ pub fn run(mut b: Boot) -> ! {
     // A bridge `store` command the vault process is answering (`VaultJob`), or a part of a kist offered to stow, and the command it came in, kept for a put's value (ptlink takes no other until its reply is taken).
     let mut vault_job: Option<VaultJob> = None;
     let mut vault_cmd: Option<crate::ptlink::Submitted> = None;
+    // A long command (ferros_pt::command::held, docs/USB.md "Long commands"): such a job's command is answered STILL at its lease's end (`job_due`, on the counter) and the job carries on detached (`job_detached`); its own answer then goes to the host's held read (`held_read`, waiting until its own lease's end), or is kept for it (`job_end`) when it ends with none waiting.
+    // Why (2026-11-13, the 8a): the last part of Photon's 92 MB capsule committed the whole value on a busy vault and ran past the USB driver's 16 s, so the stow failed twice; no answer may depend on one fixed window.
+    let mut job_due = 0u64;
+    let mut job_detached = false;
+    let mut job_end: Option<alloc::vec::Vec<u8>> = None;
+    let mut held_read: Option<u64> = None;
+    let lease = ferros_pt::command::held::LEASE_SECONDS * freq;
     // A kist offered to stow (`offer_command`): the capsule being carried in, the offset its next part starts at and whether its last part came; a part that came while a kist job held the kernel's channel, started once it is free; a host's read of the offer's state held until it changes or its lease ends (the capsule, the state it last saw, the deadline).
     let mut offer_rx: Option<([u8; 32], u64, bool)> = None;
     let mut offer_part_waiting = false;
@@ -1911,6 +1925,7 @@ pub fn run(mut b: Boot) -> ! {
     let cap_store = ferros_pt::command::dev_cap(ferros_pt::command::caps::STORE);
     // Not a development door (docs/USB.md "Offering a kist"): a production build answers it too.
     let cap_offer = ferros_pt::command::dev_cap(ferros_pt::command::caps::OFFER);
+    let cap_held = ferros_pt::command::dev_cap(ferros_pt::command::caps::HELD);
     // RELOAD and RUN share STAGE; at most one of these is set, so a payload can never be jumped to as a kernel or vice versa.
     let mut reload_ok = false;
     let mut reload_size = 0usize;
@@ -2166,12 +2181,21 @@ pub fn run(mut b: Boot) -> ! {
                 Err(resp) => {
                     offer_rx = None;
                     vault_cmd = None;
-                    queue_pt_response(&mut pt_out_data, &resp);
+                    crate::process::with_lock(|| crate::ptlink::hold_big(false));
+                    if !job_detached {
+                        queue_pt_response(&mut pt_out_data, &resp);
+                    } else if held_read.take().is_some() {
+                        job_detached = false;
+                        queue_pt_response(&mut pt_out_data, &resp);
+                    } else {
+                        job_detached = false;
+                        job_end = Some(resp);
+                    }
                 }
             }
         }
         // A host's read of the offer's state, held until the stower tells another state or its lease ends (ferros_kist::offer::HOLD_SECONDS, inside the USB driver's 16 s): then answered, with the state as it stands.
-        let offer_waits = match offer_hold {
+        let offer_hold_waits = match offer_hold {
             Some((capsule, seen, until)) => {
                 let s = crate::process::offer_state(&capsule);
                 if s[0] != seen || cntpct() >= until {
@@ -2183,9 +2207,9 @@ pub fn run(mut b: Boot) -> ! {
                 }
             }
             None => false,
-        } || offer_part_waiting;
+        };
         // A bridge `store` command, or a part of a kist offered to stow, the vault process is answering: its next step; its reply goes out below once the last call is answered.
-        let vault_waits = match vault_job.as_mut() {
+        let job_busy = match vault_job.as_mut() {
             Some(job) => {
                 let params = vault_cmd.as_ref().and_then(|c| ferros_pt::command::parse(c.payload.bytes())).map(|c| c.params).unwrap_or(&[]);
                 match vault_job_step(job, params, &mut store) {
@@ -2204,7 +2228,19 @@ pub fn run(mut b: Boot) -> ! {
                             offer_rx = None;
                         }
                         vault_for_offer = false;
-                        queue_pt_response(&mut pt_out_data, &resp);
+                        // Its own answer: to its command, or once that was answered STILL, to the host's held read (kept for it when none waits).
+                        if job_detached {
+                            crate::flashlog::line(&alloc::format!("long command: its work ended A#{} ms after it came (status A#{})", (cntpct() - (job_due - lease)) * 1000 / freq, resp.first().copied().unwrap_or(u8::MAX)));
+                            job_detached = false;
+                            if held_read.take().is_some() {
+                                queue_pt_response(&mut pt_out_data, &resp);
+                            } else {
+                                job_end = Some(resp);
+                            }
+                        } else {
+                            queue_pt_response(&mut pt_out_data, &resp);
+                        }
+                        crate::process::with_lock(|| crate::ptlink::hold_big(false));
                         vault_job = None;
                         vault_cmd = None;
                         false
@@ -2213,7 +2249,23 @@ pub fn run(mut b: Boot) -> ! {
                 }
             }
             None => false,
-        } || offer_waits;
+        } || offer_part_waiting;
+        // Still at work at its lease's end: its command answered STILL, the job carried on (ferros_pt::command::held). A put still reading its value from the kernel's command region keeps that region from the next command (ptlink `hold_big`).
+        if job_busy && !job_detached && cntpct() > job_due {
+            crate::flashlog::line("long command: still at work at its lease's end, answered STILL; its end goes to the host's held read");
+            queue_pt_response(&mut pt_out_data, &held_status(ferros_pt::command::held::STILL, "still at work: its end is the answer to ferros.pt.held"));
+            job_detached = true;
+            let big = matches!(vault_cmd.as_ref().map(|c| &c.payload), Some(crate::ptlink::Payload::Big(_)));
+            crate::process::with_lock(|| crate::ptlink::hold_big(big));
+        }
+        // A held read whose own lease ended with the job still at work: STILL again, and the host asks again.
+        if let Some(due) = held_read {
+            if cntpct() > due {
+                queue_pt_response(&mut pt_out_data, &held_status(ferros_pt::command::held::STILL, "still at work: its end is the answer to ferros.pt.held"));
+                held_read = None;
+            }
+        }
+        let vault_waits = (job_busy && !job_detached) || held_read.is_some() || offer_hold_waits;
         // A kist launch init asked for (KISTS.md): started once the kernel's channel is free (no bridge store command or offered part, no release under way), then a read a pass until the capsule is in its arc (`kist_step`).
         let bridge_holds_channel = vault_job.is_some();
         if kist_job.is_none() && !bridge_holds_channel && !RELEASE_RESET.load(core::sync::atomic::Ordering::Acquire) {
@@ -2497,14 +2549,36 @@ pub fn run(mut b: Boot) -> ! {
         proc_restore = Some(core::mem::take(&mut pt_out_data));
         platform::RAW_REPLY.store(true, core::sync::atomic::Ordering::Relaxed);
         platform::RAW_REPLIED.store(false, core::sync::atomic::Ordering::Relaxed);
+        // A large command that came while a long command's put still reads its value from the kernel's command region: never copied over it (ptlink `hold_big`), and refused.
+        if matches!(proc_cmd.payload, crate::ptlink::Payload::Refused) {
+            queue_pt_response(&mut pt_out_data, &held_status(3, "the last command is still at work: ask ferros.pt.held for its end first"));
+            continue;
+        }
         if let Some(cmd) = ferros_pt::command::parse(payload) {
             st.last_cmd = u32::from_le_bytes([cmd.cap[0], cmd.cap[1], cmd.cap[2], cmd.cap[3]]) as u64 | (cmd.op as u64) << 56;
             platform::crumb(0xD5 | (st.last_cmd & 0xFFFF_FFFF) << 8 | (cmd.op as u64) << 40);
+            // The end of a long command is the answer to the host's next command only when that is its held read: a host that moved on to anything else has let it go.
+            if cmd.cap != cap_held {
+                job_end = None;
+            }
             // Production builds (FERROS_PRODUCTION=1) close the development doors over USB, for the locked bootloader (BOOT.md): a cable must not be able to reload the kernel, run code, read or write memory or the vault, read the screen, spawn, or drive a diagnostic, since ABL checks only what it boots. Open: a reboot, and DIAG with no parameters (status, no secrets). The portal will grant the rest to the owner's identity (STATUS.md 7); until then they are closed outright.
             // And a kist offered to stow (`ferros.kist.offer`, docs/USB.md "Offering a kist"): the person checks it on the glass, so it is no door around them.
-            let open = !cfg!(ferros_production) || (cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec) || (cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read && cmd.params.is_empty()) || cmd.cap == cap_offer;
+            // And the end of a long command (`ferros.pt.held`): only the host's own last command's answer, which an offer's part needs.
+            let open = !cfg!(ferros_production) || (cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec) || (cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read && cmd.params.is_empty()) || cmd.cap == cap_offer || cmd.cap == cap_held;
             if !open {
                 queue_pt_response(&mut pt_out_data, b"closed: a production build answers only a reboot, a plain DIAG and a kist offered to stow over USB\n");
+            } else if cmd.cap == cap_held {
+                // The end of the command answered STILL: kept already, or held until the job ends or this read's lease does (the top of the loop answers it), or NOTHING when no command is held.
+                if let Some(resp) = job_end.take() {
+                    queue_pt_response(&mut pt_out_data, &resp);
+                } else if job_detached {
+                    held_read = Some(cntpct() + lease);
+                } else {
+                    queue_pt_response(&mut pt_out_data, &held_status(ferros_pt::command::held::NOTHING, "no command is held"));
+                }
+            } else if job_detached && (cmd.cap == cap_store || (cmd.cap == cap_offer && cmd.op != ferros_pt::Op::Read)) {
+                // The kernel's one channel to the vault is the long command's until it ends: a command that needs it waits for the host to read that end.
+                queue_pt_response(&mut pt_out_data, &held_status(3, "the last command is still at work: ask ferros.pt.held for its end first"));
             } else if cmd.cap == cap_offer {
                 // A kist offered to stow (docs/KISTS.md "Stowing"): its parts kept in `capsules.`, then offered to the stower, then its state read by the host, held. Every answer but a state is [status][words]: 0 done, 1 nobody present, 2 another offer is waiting, 3 a part or an offer not as the protocol says, 4 no stower.
                 // Each refusal on the flash log too, one line: what the host was told is where an offer stopped.
@@ -2553,6 +2627,7 @@ pub fn run(mut b: Boot) -> ! {
                                 crate::flashlog::line(&alloc::format!("kist offer: a capsule carried in over USB, its first part come (G#{:02X}{:02X}{:02X}{:02X}...)", c[0], c[1], c[2], c[3]));
                             }
                             // The kernel's channel to the vault is one call at a time: a kist job reading a capsule holds it, so the part waits for it (its reply with it).
+                            job_due = cntpct() + lease;
                             if kist_job.is_some() {
                                 offer_part_waiting = true;
                             } else {
@@ -4067,7 +4142,10 @@ pub fn run(mut b: Boot) -> ! {
                 {
                 // A name the vault process holds (and the listing, while it serves): its job, the reply when its last call is answered (`vault_job_step`, at the top of a later pass).
                 match vault_job_start(&mut store, cmd.op, cmd.params) {
-                    Some(Ok(job)) => vault_job = Some(job),
+                    Some(Ok(job)) => {
+                        vault_job = Some(job);
+                        job_due = cntpct() + lease;
+                    }
                     Some(Err(resp)) => queue_pt_response(&mut pt_out_data, &resp),
                     // Under the kernel lock: syscalls on the worker cores reach the vault holding it (the map's places, a setting), so this core takes it too — one owner at a time.
                     None => {

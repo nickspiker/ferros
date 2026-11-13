@@ -108,6 +108,18 @@ Its states and reasons are ferros_kist `offer`, shared by the kernel, the stower
 - **Where an offer stopped:** each stage is one line. The kernel's go to the flash log (`diag log`, kept across console reads): the first part come, carried in whole (with the last part's time), offered, the stower took it, each state the stower says, gone when the person left, each refusal with its words. Each part's time is on the console (a part waits for the vault, and the USB driver gives up on a reply at 16 s). The stower's on the console: read back and hashed, every egg checked, the kernel's check, waiting on the person, refused and why, a state the kernel no longer had. The map's: the offer reached the page (or did not read), the Kists page opened on it, or it waits for the app in front to go behind.
 - **Measured on the Pro (2026-11-12):** Mahere's 51 MiB capsule went in as 13 parts in under 66 s (the dev `kist stow` of the same capsule took about a minute), the stower's check (read back, every egg, the kernel's native check) was done 1.5 s after the offer, and the host then read the state every 8 s for 15 minutes (the lease) without it changing: the offer waited on the person, whose screen never showed it (KISTS.md "Stowing", the first run).
 
+## Long commands (2026-11-13)
+
+Restowing Photon's 92 MB capsule on the 8a failed twice: its last part, whose put commits the whole value (and drops the value the same address held before), ran past this USB driver's 16 s while the vault was busy, and the driver gave the command up.
+The 16 s is the driver's watchdog for a kernel that never answers, and no answer may depend on it: work that can outlive one window is answered while it goes on.
+
+- **The lease:** a command whose vault job is still at work `held::LEASE_SECONDS` (8 s) after it came (a `store` command, an offered part, a part waiting for a kist job's channel) is answered `[held::STILL 6][words]`, and its job carries on in the kernel (service.rs `job_detached`; flash log "long command: still at work at its lease's end").
+- **Its end:** the host then sends `ferros.pt.held` (ferros_pt `caps::HELD`), Read, no parameters. The kernel answers with the command's own answer once its job ends (kept for it when the job ends first), or holds the read until the job ends or another lease passes (`STILL` again, and the host asks again). With no command held it answers `[held::NOTHING 7]`. The flash log says when the work ended ("long command: its work ended A#n ms after it came").
+- **No timer on the host and no polling:** each wait is a read the device holds and answers at the change; the lease is only the driver's own deadline. tools/ferros-link `pt::call_held` does it, for the bridge's `store` commands (`store put`, `kist stow`) and `ferros send`'s parts.
+- **Meanwhile:** the kernel's one channel to the vault is the job's, so a `store` command or an offer's Write or Exec that comes before the host read its end is refused (status 3), and so is any large command while the job's put still reads its value from the kernel's 6 MiB command region (ptlink `hold_big`, `Payload::Refused`: never copied over it). Every other command is answered as ever. A command other than the held read lets a kept end go: the host moved on.
+- **Production:** `ferros.pt.held` is open in a production build, beside a reboot, a plain DIAG and the offer: it tells only the end of the host's own last command, which an offer's part needs.
+- **An older host** reads `STILL` as a failed command (status 6 and its words), as it read the driver's give-up before; a host from this commit on waits it out.
+
 ## Facts
 
 | What | Value |
