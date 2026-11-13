@@ -347,7 +347,39 @@ extern "C" fn pcie1_main(grants: u64, input: u64, input_len: u64) -> ! {
     ferros_sys::exit(d.failed as u64)
 }
 
+/// The WiFi switch turned off (stage G#F0, kernel service.rs `radio_down`, 2026-11-13): the chip powered down, as Linux's exynos_pcie_rc_poweroff and dhd's wifi_platform_set_power off leave it, where a killed driver left it powered and its link up with no host (the 8a dark with the radios switched off drew 968 mW, more than with them on). Bluetooth's core off first (the REG_ON rule: never move WL_REG_ON under a powered Bluetooth core; its driver brings it back by itself, Bluetooth running with WL_REG_ON low), PERST low, the PHY's power-down (stage 1's A3-A8), the PMU's PHY isolation, WL_REG_ON low. Never the controller's ELBI or DBI: a fresh process does not know the link's state, and a PHY already isolated (a cold boot, an `off` before this one) is left as it is. A chip at rest with no link loses nothing by the order: no PME_Turn_Off, as the chip's power goes with WL_REG_ON.
+fn off(d: &mut Drv) {
+    ferros_sys::power(d.cap(BT_POWER), false);
+    d.clr(GPIO, 0x4, 1 << 0);
+    let iso = d.rd(PMU, 0x3EC8);
+    if iso & 1 == 1 {
+        d.clr(PHY, 0x204, 0xC);
+        for (off, v) in [(0x1044u64, 0x2A), (0x1048, 0xAA), (0x104C, 0xA8), (0x1050, 0x80), (0x185C, 0x0A)] {
+            d.wr(PHY, off, v);
+        }
+        d.us(1);
+        d.wr(PHY, 0x208, 0xFF);
+        d.us(1);
+        d.wr(PHY, 0x580, 0x0A);
+        d.wr(PHY, 0x928, 0xAA);
+        d.wr(PHY, 0x00C, 0x0A);
+        d.us(50);
+        d.clr(UDBG, 0xC700, 1);
+        d.us(10);
+        d.pmu_rmw(0x3EC8, 1, 0);
+        d.put(b"off: PERST low, PHY powered down and isolated\n");
+    } else {
+        d.kv(b"off: PERST low, PHY already isolated, pmu", iso);
+    }
+    d.clr(GPIO, 0x4, 1 << 4);
+    let g = d.rd(GPIO, 0x4);
+    d.kv(b"off: WL_REG_ON low, gph3.dat", g);
+}
+
 fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
+    if stage == 0xF0 {
+        return off(d);
+    }
     // ---- stage 0: survey (WIFI.md §2, §3, §9 status registers) ----
     d.put(b"pcie1 stage ");
     d.hex(stage as u32);

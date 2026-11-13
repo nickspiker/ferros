@@ -295,8 +295,18 @@ fn power_on(rep: &mut Vec<u8>, watch: bool) {
     }
 }
 
-/// `diag modem off`: the CP powered down, the first half of `power_on` (the WAKEUP pulse, NRESET, CP_WRST_N, CP_PWR and PM_WRST_N low). The PCIe side is left as it is: only the modem diags touch it, and each starts from the survey.
+/// `diag modem off`, and the cellular switch turned off (kernel service.rs `radio_down`, 2026-11-13): the link's AP side down, then the CP powered down, the first half of `power_on` (the WAKEUP pulse, NRESET, CP_WRST_N, CP_PWR and PM_WRST_N low). Android's power_off_cp in the same order: pcie_clean_dislink (s5100_poweroff_pcie: the link down, the PHY powered down), then gpio_power_off_cp, CP_PWR low dropping the modem PMIC's power-on.
+/// The link's side here is PERST low, the PHY's power-down (`phy_pwrdn`) and the PMU's PHY isolation, never the controller's ELBI or DBI: this runs in a fresh process that does not know whether the last driver had suspended the link (its PHY down), and an ELBI access with the PHY down stalls the core. A PHY already isolated (a cold boot, or an `off` before this one) is left as it is.
 pub fn off(rep: &mut Vec<u8>) {
+    PERST.out(false);
+    let iso = rd(PMU_PCIE0 as usize);
+    if iso & 1 == 1 {
+        phy_pwrdn();
+        let r = crate::hw::priv_rmw(PMU_PCIE0, 1, 0);
+        line(rep, alloc::format!("PCIe ch0: PERST low, PHY powered down, PMU isolation set (ret G#{r:X})\n"));
+    } else {
+        line(rep, alloc::format!("PCIe ch0: PERST low, PHY already isolated (PMU G#{iso:X})\n"));
+    }
     AP2CP_WAKEUP.out(true);
     ms(10);
     AP2CP_WAKEUP.out(false);
