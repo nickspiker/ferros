@@ -598,3 +598,21 @@ Expected, not yet measured (ms from power-on):
 | data call up | 17218, lost, 21149 | about 4500-7500 | Verizon's PDN setup, 640 ms measured |
 
 What is left that is not Verizon's: the 500 ms opening pause (no event from the CP's bootloader is known to replace it), Linux's 200 ms after power-on, and the CP's own turns.
+
+## 2026-11-13: nothing to the CP before it speaks (the 8a)
+
+On the 8a (akita) the build above came up to INIT_END and then got nothing more from the CP: SIT_GET_RADIO_POWER unanswered, no modem-service or remote-file frame, VSYS_PWR_MODEM 584 mW dark where the older driver drew 22.
+The older driver (its radio commands at fixed times) worked on the same device and kernel.
+
+Measured with a watch of the link's shared words after INIT_END (`Online::early_watch`, one line at each change until the CP's first frame):
+- The question went into the FMT TX ring 1 ms after INIT_END (fmt tx head A#24) and the CP never took it: the tail stayed 0 for 15 s, as did every frame after it (head A#168 by then).
+- cp2ap_msg stayed at PHONE_START (G#C8), never moving to G#83; the RX rings stayed empty; the link stayed up with CP2AP_WAKEUP high. The CP had not crashed (no CRASH_EXIT, cp2ap_status 0) and was not waiting on the link.
+- With the question held until the CP's first frame (its modem service's property write, 1.29 s after INIT_END, the moment cp2ap_msg goes to G#83), the same build ran the whole setup by 1.77 s: radio on, the manifest, UICC, the profiles, the allowed networks, data on. VSYS_PWR_MODEM 30 mW dark.
+- The other change of that build suspected, no wait after power-on, was not it: the failing and the working runs both had the CP at INIT_END 3.1 s after power-on.
+
+So the 8a's CP (its firmware g5300o, akita's own) takes a request written that early as the end of it and takes nothing after.
+Why Android's RIL can write 3 ms after INIT_END on husky (the Linux log above) is not known; the CP's own first frame is a signal ferros can see.
+Now (modem.rs `cp_spoke`): nothing is sent to the CP after INIT_END until a first frame from it, on any channel of either ring; the radio's setup opens then (SIT_GET_RADIO_POWER), the rest on its answers as before, and the registration poll waits for it too.
+On husky this changes only the moment of the first question: the modem service's first message came 1.2 to 1.6 s after INIT_END on every run there too, and until 2026-11-12 the question went at 2 s.
+
+The 8a registers on nothing with either driver (stack 0's confpack "wildcard_simless", stack 1's "wildcard"; the older driver reaches 1400000E on stack 0, emergency only), so the registration and the data call are the Pro's to show.

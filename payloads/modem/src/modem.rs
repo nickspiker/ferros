@@ -2324,6 +2324,9 @@ fn rfs(rep: &mut Vec<u8>, t_ms: u64, b: &[u8], link: &mut SitLink, st: &mut Rfs)
 
 /// The service's probe level: everything stage G#12 does except its tests (the router solicitation, the echo request, the queue reports), quiet, its DL packets queued for `rmnet`.
 const SERVICE: u8 = 9;
+/// How long after INIT_END the link's shared words are watched (`Online::early_watch`), and at most how many lines that logs.
+const EARLY_US: u64 = 1 << 24;
+const EARLY_LINES: u32 = 1 << 6;
 /// How far the radio's setup has come (`Online::ril_step`), each step sent on the answer to the one before: the opening question out (or about to go), the radios on, the data stack's carrier manifest answered, the SIM's applications enabled, the data profiles sent, the allowed networks sent, done.
 const RIL_ASKED: u8 = 0;
 const RIL_POWERED: u8 = 1;
@@ -2353,13 +2356,13 @@ struct Online {
     probe: u8,
     done: [u32; PP_QUEUES as usize],
     link: SitLink,
+    /// The CP has sent its first frame since INIT_END (`cp_spoke`): until then nothing is sent to it.
     probed: bool,
     powered: bool,
     next_reg: u64,
-    /// The radio's setup, each step sent on the answer to the one before (`ril_step`): how far it has come (`RIL_*`), the answer that moves it on (channel, message id, token), and whether the opening question went out a second time.
+    /// The radio's setup, each step sent on the answer to the one before (`ril_step`): how far it has come (`RIL_*`) and the answer that moves it on (channel, message id, token).
     ril: u8,
     ril_next: Option<(u8, u16, u32)>,
-    ril_reasked: bool,
     /// The data stack's carrier manifest: the token of the one sent last, until it is answered, and whether one has been (the setup's step after the radios).
     manifest: Option<u32>,
     manifest_in: bool,
@@ -2397,6 +2400,9 @@ struct Online {
     ul_full: u32,
     /// DL packets still to log by shape (`probe` sets it).
     dl_log: u32,
+    /// The link's shared words as last logged in the first `EARLY_US` after INIT_END (`early_watch`), and the lines left to log there.
+    early_last: [u32; 10],
+    early_left: u32,
     /// CP2AP_WAKEUP as last seen: a rise is the CP asking for the link, answered with the link acknowledgement.
     cp_wake: bool,
     /// Link acknowledgements sent (STATE).
@@ -2758,13 +2764,12 @@ impl Online {
         }
     }
 
-    /// The CP's first message on the modem service (its platform services up, 1.2 to 1.6 s after INIT_END on every run so far) with the opening question still unanswered: asked once more, in case the first went before the CP's RIL took requests.
+    /// The CP's first frame after INIT_END, on any channel of either ring (its platform services up: the modem service's property write 1.2 to 1.6 s after INIT_END on every run on both devices): the radio's setup opens with its question.
+    /// Nothing goes to the CP before it: the 8a's CP (2026-11-13) took a RIL request written within a millisecond of INIT_END as the end of it, consuming nothing from either TX ring after it, never moving cp2ap_msg off PHONE_START and sending nothing more, the modem service included (`early_watch`: fmt tx A#24/A#0 for 15 s); the same build with the question sent on this frame instead ran the whole setup by 1.8 s.
     #[inline(never)]
-    fn ril_svc_seen(&mut self, rep: &mut Vec<u8>) {
-        if self.probed && self.ril == RIL_ASKED && !self.ril_reasked {
-            self.ril_reasked = true;
-            self.ril_ask(rep);
-        }
+    fn cp_spoke(&mut self, rep: &mut Vec<u8>) {
+        self.probed = true;
+        self.ril_ask(rep);
     }
 
     /// A RIL message on channel `ch` (`h`: the first 12 bytes of its RCM message, zeros past its `len`): the CP's G#4602 indication (the SIM's identity for the carrier lookup) is answered with SIT_OEM_SET_CARRIER_CONFIG_MANIFEST on the same stack (stage G#10 on), and the answer the radio's setup waits for moves it on.
@@ -2946,7 +2951,6 @@ impl Online {
             next_reg: 5_000_000,
             ril: RIL_ASKED,
             ril_next: None,
-            ril_reasked: false,
             manifest: None,
             manifest_in: false,
             reg_last: [None, None],
@@ -2975,6 +2979,8 @@ impl Online {
             ul_sent: 0,
             ul_full: 0,
             dl_log: 0,
+            early_last: [u32::MAX; 10],
+            early_left: EARLY_LINES,
             cp_wake: false,
             link_acks: 0,
             idle_since: None,
@@ -2996,12 +3002,29 @@ impl Online {
         self.call.map(|c| CH_PDP_0 + c.cid - 1)
     }
 
+    /// Until the CP's first frame (`cp_spoke`), in the first `EARLY_US` after INIT_END: every change of the link's shared words logged (the RX and TX rings' cursors, the CP's message and status words, CP2AP_WAKEUP, the link up or down), at most `EARLY_LINES` lines.
+    /// What a CP that says nothing after INIT_END is doing: writing frames the AP does not read, waiting on the link, or silent (the 8a, 2026-11-13).
+    #[inline(never)]
+    fn early_watch(&mut self, rep: &mut Vec<u8>, wake: bool, down: bool) {
+        if self.probed || self.early_left == 0 || since_us(self.t0) > EARLY_US {
+            return;
+        }
+        let s = [rd(RXQ_HEAD), rd(RXQ_TAIL), rd(FMT_RXQ_HEAD), rd(FMT_RXQ_TAIL), rd(TXQ_HEAD), rd(TXQ_TAIL), rd(FMT_TXQ_HEAD), rd(FMT_TXQ_TAIL), rd(CP2AP_MSG), rd(IPC + 0x80C) << 2 | (wake as u32) << 1 | down as u32];
+        if s == self.early_last {
+            return;
+        }
+        self.early_last = s;
+        self.early_left -= 1;
+        line(rep, alloc::format!("t={} ms: early: raw rx A#{}/A#{} fmt rx A#{}/A#{} raw tx A#{}/A#{} fmt tx A#{}/A#{} (head/tail), cp2ap_msg G#{:X} status G#{:X}, CP2AP_WAKEUP {}, link {}\n", since_us(self.t0) / 1000, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9] >> 2, wake as u8, if down { "down" } else { "up" }));
+    }
+
     /// One pass: the CP's state words, the timed actions of the probe level, every frame waiting in the RAW and FMT RX rings (answered where the AP must answer), every DL packet. False once the CP has given up (CRASH_EXIT) or a ring is beyond reading: the caller stops.
     fn step(&mut self, rep: &mut Vec<u8>) -> bool {
         let taken0 = self.packets;
         // The CP's wakeup line: when it has something for the AP (downlink above all) it raises CP2AP_WAKEUP and waits for the link acknowledgement before it sends, as Android's driver gives it once the link is up. Ferros never powers the link down, so the link is always up: every rise is acknowledged at once. Without it the CP held downlink until some other doorbell happened to come (2026-10-31: a TCP reply 37 s late; Android, which acknowledges, never stalled in 60 fetches).
         let wake = CP2AP_WAKEUP.get();
         let down = LINK_DOWN.load(core::sync::atomic::Ordering::Relaxed);
+        self.early_watch(rep, wake, down);
         if wake != self.cp_wake && self.dl_log > 0 {
             line(rep, alloc::format!("t={} ms: CP2AP_WAKEUP {}{}\n", since_us(self.t0) / 1000, if wake { "rose" } else { "fell" }, if down { " (link down)" } else { "" }));
         }
@@ -3060,11 +3083,6 @@ impl Online {
         if probe == SERVICE {
             self.service_extras(rep);
         }
-        // The radio's setup opens at once, the rest of it on the CP's answers (`ril_step`): Android's RIL writes its first requests within milliseconds of INIT_END (the Linux log: INIT_END 8.824 s, the RIL's ipc_write on umts_ipc0 8.827 s).
-        if probe >= 1 && !self.probed {
-            self.probed = true;
-            self.ril_ask(rep);
-        }
         let link = &mut self.link;
         // Stage G#12: the internet data call once the data stack is home (registration state 1) or roaming (5): one SIT_SETUP_DATA_CALL on VZWINTERNET, as Android's RIL sends it after registering.
         if probe >= 8 && !self.call_sent && since_us(t0) > self.call_retry && matches!(self.reg_last[1], Some([1 | 5, ..])) {
@@ -3106,7 +3124,7 @@ impl Online {
             }
         }
         // The data registration polled every 5 s (the stage watch), or every 64 s once the service has its call (the CP's indications carry the changes; the poll is the backstop).
-        if probe >= 3 && since_us(t0) > self.next_reg {
+        if probe >= 3 && self.probed && since_us(t0) > self.next_reg {
             self.next_reg += if probe == SERVICE && self.call.is_some() { 64_000_000 } else { 5_000_000 };
             for ch in [CH_FMT0, CH_FMT0 + 1] {
                 if let Err(e) = sit_request(link, ch, SIT_GET_PS_REG_STATE, &[]) {
@@ -3147,6 +3165,10 @@ impl Online {
             let flen = (at(6) as u32 | (at(7) as u32) << 8).max(12);
             let ch = at(8);
             self.per_ch[ch as usize] += 1;
+            // The radio's setup opens on the CP's first frame (`cp_spoke`), the rest of it on the CP's answers (`ril_step`).
+            if probe >= 1 && !self.probed {
+                self.cp_spoke(rep);
+            }
             // Stage G#11: the gipc service on oem_ipc3 (channel 132) — a request {1 type 0, 2 channel, 3 service hash, 4 method hash, 7 sequence, payload} is answered as Android answers the CP's temperature report: {1 type 1, the same channel, hashes and sequence}, no payload.
             if probe >= 7 && name == "fmt" && ch == 132 {
                 let body: Vec<u8> = (0..flen - 12).map(|i| at(12 + i)).collect();
@@ -3168,7 +3190,6 @@ impl Online {
                 }
             }
             if probe >= 1 && name == "fmt" && ch == CH_MODEM_SVC {
-                self.ril_svc_seen(rep);
                 let body: Vec<u8> = (0..flen - 12).map(|i| at(12 + i)).collect();
                 if let Some(replies) = modem_svc(rep, since_us(t0) / 1000, &body, &mut self.props) {
                     for reply in replies {
