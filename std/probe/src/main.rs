@@ -1,4 +1,4 @@
-//! The compile-and-run probe for Photon's substrate on ferros: tokio's multi-thread runtime, kete over the kernel's vault scope, fgtw and vsf linked in. Spawn: `ferros-bridge spawn stdprobe.bin --name stdprobe --entropy --store photon`.
+//! The compile-and-run probe for Photon's substrate on ferros: tokio's multi-thread runtime, kete over the kernel's vault scope, fgtw and vsf linked in. Spawn: `ferros-bridge spawn stdprobe.bin --name stdprobe --entropy --store test` (the kernel has no `photon` scope now).
 
 fn main() {
     let t0 = std::time::Instant::now();
@@ -59,6 +59,15 @@ fn main() {
     let small = store.read_device("probe.small").unwrap();
     let back = store.read_device("probe.big").unwrap();
     println!("kete: small {:?}, big A#{} bytes {}", small.as_deref().map(|b| String::from_utf8_lossy(b).into_owned()), back.as_ref().map_or(0, |b| b.len()), if back.as_deref() == Some(&big[..]) { "exact" } else { "WRONG" });
+    // A map cell's size (Mahere's base cell on the Pro, 2026-11-12), written and read in bulk as Mahere keeps its cells: the vault's own line says how many transfers the read took.
+    let cell: Vec<u8> = (0..1_654_438u32).map(|i| (i * 13 % 251) as u8).collect();
+    let t = std::time::Instant::now();
+    store.write_device_bulk(&[("probe.cell".to_string(), cell.clone())]).unwrap();
+    let wrote = t.elapsed().as_millis();
+    let t = std::time::Instant::now();
+    let back = store.read_device_bulk("probe.cell").unwrap();
+    println!("kete: cell A#{} bytes written in A#{wrote} ms, read in A#{} ms {}", cell.len(), t.elapsed().as_millis(), if back.as_deref() == Some(&cell[..]) { "exact" } else { "WRONG" });
+    store.delete_device("probe.cell").unwrap();
     let addrs = store.live_addrs().unwrap();
     println!("kete: A#{} live addrs", addrs.len());
     store.delete_device("probe.big").unwrap();

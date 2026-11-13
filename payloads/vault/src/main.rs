@@ -340,6 +340,12 @@ static READER_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 static READER_STACK: Region<{ 1 << 16 }> = Region(UnsafeCell::new([0; 1 << 16]));
 /// A large value is being read in bulk: furrow runs may fill the window. Set around a bulk get (`serve`).
 static mut AHEAD_ON: bool = false;
+/// The value being read: blocks its windows read and blocks they gave, and whether they gave too little to go on (`ahead_run`); cleared by a get from offset 0 (`serve`), the start of a value.
+/// A value written in pieces among other writes lies scattered over the tract, not in one stretch: Mahere's map cells, written 4 KiB a call.
+/// Measured on the 8a (2026-11-12, a 1.6 MB value in three gets): the windows read 21 MB for 1.9 MB of hits, the read 74 to 83 ms; read-ahead off, 2.1 MB in 112 calls, 26 ms; with this rule, 34 to 35 ms.
+static mut AHEAD_READ: u64 = 0;
+static mut AHEAD_GOT: u64 = 0;
+static mut AHEAD_POOR: bool = false;
 
 /// `buf.len() / 4096` blocks from `at` out of the window, if it holds them all.
 fn ahead_copy(at: u64, buf: &mut [u8]) -> bool {
@@ -353,6 +359,7 @@ fn ahead_copy(at: u64, buf: &mut [u8]) -> bool {
     let from = ((at - first) << 12) as usize;
     buf.copy_from_slice(&win[from..from + buf.len()]);
     AHEAD_HITS.fetch_add(n, Relaxed);
+    unsafe { AHEAD_GOT += n };
     true
 }
 
@@ -372,6 +379,14 @@ fn ahead_run(at: u64, buf: &mut [u8], limit: u64) -> bool {
             return ahead_copy(at, buf);
         }
     }
+    // No fresh fill once two windows' worth gave under half of what they read: the value does not lie in a stretch, and its runs are read as they are asked for (the caller's `blocks_read`).
+    // SAFETY: the counters are the serving thread's alone.
+    unsafe {
+        if AHEAD_POOR || (AHEAD_READ >= (AHEAD << 1) as u64 && AHEAD_GOT << 1 < AHEAD_READ) {
+            AHEAD_POOR = true;
+            return false;
+        }
+    }
     // A fresh fill: the next buffer's read (if one runs) is let finish first, as it is reused for the one after.
     ahead_settle();
     // WHY the min: the fill is AHEAD blocks unless this mirror ends sooner, and past its end lie the other mirror's blocks (or the window's end).
@@ -383,6 +398,7 @@ fn ahead_run(at: u64, buf: &mut [u8], limit: u64) -> bool {
     }
     let ok = blocks_read(at, &mut win[..m << 12], &IO_TICKS);
     unsafe { AHEAD_AT = (at, if ok { m } else { 0 }) };
+    unsafe { AHEAD_READ += m as u64 };
     if ok {
         ahead_post_after(at, m, limit);
     }
@@ -416,6 +432,7 @@ fn ahead_post(at: u64, limit: u64) {
         NEXT_JOB = (at, m, next.as_mut_ptr() as usize);
         NEXT_AT = (at, m);
         NEXT_POSTED = true;
+        AHEAD_READ += m as u64;
     }
     NEXT_REQ.store(seq, Release);
     ferros_sys::wake(&NEXT_REQ, 1);
@@ -993,6 +1010,10 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
                     unsafe { ON_BIG = true };
                 }
                 let before = Counts::now(store.read_ticks());
+                // A value's start: its windows' yield counted afresh (`AHEAD_POOR`).
+                if offset == 0 {
+                    unsafe { (AHEAD_READ, AHEAD_GOT, AHEAD_POOR) = (0, 0, false) };
+                }
                 unsafe { AHEAD_ON = bulk };
                 let r = store.read_with(&d, name, offset, &mut out[8..8 + len], &mut Helpers::default());
                 unsafe { AHEAD_ON = false };
