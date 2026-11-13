@@ -7141,7 +7141,9 @@ fn server(grants: u64) -> ! {
     let reset = || ferros_sys::power(cap(grants, S_PANEL_POWER), true);
     let awake: Option<(&dyn Fn() -> bool, &dyn Fn() -> bool)> = if (from_off || jumped) && !panel_cold { Some((&reset, &vddd)) } else { None };
     log.at(b"modeset begins");
-    let rep = if from_off { modeset::from_off(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), cold, awake) } else { modeset::ten_bpc(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), jumped || panel_cold, jumped, cold, awake) };
+    // The jump from Android itself (fact 31 = 6, not ferros's own restart): its DQE and its panel are taken to the cold boot's state, never adopted (the panel left awake as Android set it showed the picture more contrasty than a cold boot's, 2026-11-12).
+    let android = ferros_sys::facts().0[31] == 6;
+    let rep = if from_off { modeset::from_off(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), android, cold, awake) } else { modeset::ten_bpc(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), jumped || panel_cold, jumped, android, cold, awake) };
     log.at(b"modeset done");
     if !rep.is_empty() {
         log.s(b"display: ");

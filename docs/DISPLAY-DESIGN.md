@@ -51,7 +51,7 @@ Content arrives as VSF `gamma2tanh` (vsf colour.md: `v = tanh(√L)` per channel
 5. **Panel encode**: `code = Y^(1/2.185)` — the measured EOTF (a plain power law, no toe) — at 10 bits, then the DQE's dither to the 8 bpc DSC link.
 6. **Brightness**: the setting is diffuse white in nits (the measured DBV table, 1353 = 133 nits on this unit), the panel runs at the DBV for the peak the headroom needs, HBM only when ambient asks (its timer makes H a function of time). OLED makes headroom cheap: only the highlight pixels pay.
 
-**Where it runs: the DQE.** Steps 1, 2 and 4+5 are the DQE's three blocks — a **degamma LUT** (33 points, 13-bit, with programmable x positions, so the steep top third-stop of `atanh²` gets its own points), a **3×3 gamma matrix** (14-bit coefficients and offsets), and a **regamma LUT** (33 points per channel, programmable x — on a square-root grid, since the curve is steep near black) carrying `tanh²(√(L/H))` and the 2.185 encode — at 10 bits on every pixel, in hardware (`dqe_reg.c`: set_degamma_lut / set_gamma_matrix / set_regamma_lut, registers G#1000 / G#0C00 / regamma base). The compositor writes gamma2tanh codes straight into the framebuffer and never touches a pixel for colour; a brightness change is a new regamma table and a DQE shadow update. The display server owns the tables. Untagged (plain VSF RGB) content is the same path with nothing above white.
+**Where it runs: the DQE.** Steps 1, 2 and 4+5 are the DQE's three blocks — a **degamma LUT** (33 points, 13-bit, with programmable x positions, so the steep top third-stop of `atanh²` gets its own points), a **3×3 gamma matrix** (14-bit coefficients and offsets), and a **regamma LUT** (33 points per channel, programmable x — on a square-root grid, since the curve is steep near black) carrying `tanh²(√(L/H))` and the 2.185 encode — at 10 bits on every pixel, in hardware (`dqe_reg.c`: set_degamma_lut / set_gamma_matrix / set_regamma_lut; on zuma at G#1800 / G#1400 / G#2400, not regs-dqe.h's bare G#1000 / G#0C00 / G#2000: §6b). The compositor writes gamma2tanh codes straight into the framebuffer and never touches a pixel for colour; a brightness change is a new regamma table and a DQE shadow update. The display server owns the tables. Untagged (plain VSF RGB) content is the same path with nothing above white.
 
 **Precision**: scaling white down to 1/H costs codes (at H = 4 white sits at 10-bit code 346); the 10 bpc blend and the dither are what keep 8-bit content clean there — the reason 10 bpc is the default even though the link is 8 (DISPLAY.md).
 
@@ -59,7 +59,7 @@ Content arrives as VSF `gamma2tanh` (vsf colour.md: `v = tanh(√L)` per channel
 
 ## 6a. As built (2026-10-24)
 
-§6 was the plan; this is what runs. Two decisions moved since: **white is equal-energy E** (owner, 2026-10-22; not the panel's native 6750 K), and **the transform runs in software, in NEON, not in the DQE** — the DQE is in the path only for its dither (shift mode) and the 10 bpc blend; its matrix and LUTs and the CGC are off. Software keeps the roll-off, the gamut handling and the dither's precision in our hands, and measured it is cheap enough (below).
+§6 was the plan; this is what runs. Two decisions moved since: **white is equal-energy E** (owner, 2026-10-22; not the panel's native 6750 K), and **the transform runs in software, in NEON, not in the DQE** — the DQE is in the path only for its dither (shift mode; the CGC dither at G#2800 on zuma, §6b) and the 10 bpc blend; its matrix and LUTs and the CGC are off. Software keeps the roll-off, the gamut handling and the dither's precision in our hands, and measured it is cheap enough (below).
 
 **Content** (all VSF RGB, gamma 2 — the code is √light):
 - the 8-bit canvas the display server composites (white = 255, nothing above);
@@ -82,6 +82,51 @@ Sixteen black pixels skip all of it.
 **Measured** (PMU on the cores, `ferros_sys::pmu`; synthetic pans, `FERROS_MAP_START=drag|crowd`): the ODT 86 cycles per 16 pixels on the X3 (1.9 ns a pixel), a full-frame publish 5.2 ms banded; the map's seven circles 120 frames for 120 updates at ~3.7 ms an update; a 207-circle crowd 174 frames for 175 updates (scene 3.2 ms — glow 1.8, blits 1.2 — publish 3.0). Processes build without strict-align (`cargo el0`), which is what lets NEON loads and stores be single instructions.
 
 **Tunables** (payloads/display): `GLOW_FRACTION` (12), `GLOW_OCT_LOG2` (2: four octaves), `GLOW_PEAK`, `PUB_SHARE`, `PUB_SPLIT_ROWS`; the ODT and E's gains come from `tools/panel-white-e.py`.
+
+## 6b. The DQE on zuma: its map, what it can do, and whether it could carry the bake (2026-11-12)
+
+Read from the stock driver (display-gs `cal_9865/regs-dqe.h` and `dqe_reg.c`, `cal_common/dqe_cal.h`, `exynos_drm_dqe.c`) and from the Pro's live registers after a jump (`bridge read`, read only), nothing written.
+
+**The map.** regs-dqe.h gives each block's offset as the oldest DQE had it, and the driver adds an offset per version (dqe_cal.h `regs_dqe_offset`; zuma is DQE_V4): the two dithers and the regamma blocks +G#400, the two matrices and degamma +G#800, ATC and HSC as written, the histogram +G#400 and reached only by SMC (secure on zuma: never touched). ferros used the bare offsets until 2026-11-12. What it set as the display dither (G#2800) is the CGC dither, what it cleared as the CGC dither (G#2400) is regamma 0's enable, and the never-called `dqe_quiet` cleared words that are no stage at all (G#0C00, G#1000, G#2000, G#4800). The values every boot writes stay where they were, since the glass was tuned on them; modeset.rs now names them truly.
+
+| Block | Where (dqe0 G#194D_0000 unless named) | Entries | Precision | Bypass |
+|---|---|---|---|---|
+| ATC, adaptive tone (sunlight) | G#400 | gains, weights, a tone curve from the histogram | | EN, bit 0 of G#400 |
+| HSC, hue, saturation and brightness, local and global | G#800 | gains by hue, polynomials | | EN, bit 0 of G#800 |
+| gamma matrix | G#1400, coefficients from +4 | 3×3 and 3 offsets | 14-bit coefficients and offsets | EN, bit 0 |
+| degamma | G#1800, x from +4, y from +G#48 | 33 programmable (x, y) points, one curve for all three channels (the driver takes red's) | 13-bit x and y, piecewise linear | EN, bit 0 |
+| linear matrix | G#1C00, coefficients from +4 | 3×3 and 3 offsets | 16-bit coefficients, 14-bit offsets | EN, bit 0 |
+| CGC, a 3D table | dqe0-cgc G#194F_0000: CON +0, R +G#1000, G +G#4000, B +G#7000 | 17×17×17 = A#4913 nodes a channel, two a word (A#2457 words), or by its DMA from DRAM (cgc-dma G#1990_E000) | 13-bit, interpolated between nodes (how: undocumented) | CGC_CON bit 0 |
+| CGC dither | G#2800 | one word | as the display dither's | EN, bit 0 |
+| regamma 0, 1, 2 | G#2400, G#4C00, G#5000; R, G and B x and y from +4, +G#48, +G#8C, +G#D0, +G#114, +G#158 | 33 programmable (x, y) points a channel | 13-bit x and y, piecewise linear | EN, bit 0 of each |
+| display dither | G#2C00 | one word: EN (bit 0), MODE (1: shift, a plain truncation), FRAME_CON (2: temporal), FRAME_OFFSET (3-4), table A or B by channel (5-7) | to the link's 8 bits | EN |
+
+What 1.0 is: the tables as read after the jump are identities whose degamma x runs 0 to G#3E0 by G#20 (a 10-bit input) and y 0 to G#F80 by G#80, and whose regamma x and y both run 0 to G#F80 by G#80: one is G#1000, 12 bits in a 13-bit field. Each table's 33rd entry read back as one step (G#20, G#80), not as the top: unexplained. The two matrices' unity, their sign convention and their clamp are undocumented: unmeasured.
+
+**The order** (inferred from the register order and the order the driver programs the stages; not measured): ATC, HSC, gamma matrix, degamma, linear matrix, CGC, CGC dither, regamma, display dither. The DQE's shadow latches on DECON's SHD_REG_UP_REQ bit 24.
+
+**What Android runs** (the oracle's ON capture, 2026-10-16): the CGC on with its table, 10 bpc in, 8 out, the display dither on. After the jump of 2026-11-12 every stage read off with identity tables and the display dither 0: the DECON reset at the start of the modeset looks to reset the DQE with it (Android's display dither and its LPD word G#1C read back at what look like reset values). After a jump from Android the modeset writes every stage off all the same (modeset.rs `dqe_cold`: the jump is a killswitch, nothing Android left is relied on).
+
+**Could the DQE carry the bake?** The owner (2026-11-12): "So there's a colour table we have access to that saves a click or two?" The mapping is natural:
+- degamma: the canvas's working value v (gamma 2) to light l = tanh²(k·v), the decode and the roll-off in one curve, the same for the three channels, which is what one table gives;
+- linear matrix: the ODT (E's gains, K);
+- regamma: the panel's p^(1/2.19), each channel its own if wanted;
+- the display dither down to the link's 8 bits.
+
+A brightness change is then a degamma table (34 words) and a shadow update, with nothing re-baked; the canvas, apps, icons, the wallpaper and the captures stay in working values; the present goes back to a plain 10-bit pack.
+
+What it costs, against today's software path:
+- **Shadows.** The light between degamma and regamma sits in 13-bit fields with one at G#1000, so (unless the datapath is wider than its tables) light has steps of 2^-12 of the peak there. The first step above black then lands at 8-bit code 5.7 after the 1/2.19, the next at 7.9 and 9.5: everything between black and code 5.7 is lost and the steps above it are about two codes until code 13 or so, the bottom eight stops the panel can show. The gamma-2 path keeps every code. Whether the datapath is wider than the tables is the first thing to measure.
+- **Kinks.** Every table is piecewise linear, C⁰ at its 33 knots (the CGC at its node planes), so each knot is a step in the slope of every gradient crossing it, against calculus or else. With the knots placed geometrically (about three an octave over ten octaves) the curve's error inside a segment is about 1 % of light for the roll-off's quadratic foot and 0.2 % for the 1/2.19; the slope steps at the knots are of the same order.
+- **The dither.** Ours (an ordered pattern turned thru the four phases, about 14 bits effective) can no longer be the last step: a nonlinear table after it re-quantizes to 8 bits and keeps none of its pattern. The DQE's display dither becomes the last quantizer: a fixed ordered table (A or B by channel) over the bits below the 8 (four of them, if the datapath is 12 bits), with a two-bit frame offset at the panel's frame rate under FRAME_CON, not our phases. Ours could still take the 16-bit canvas to the 10-bit layer, two dithers stacked at different depths, which the glass disliked on 2026-10-22.
+- **Unknown numbers.** The matrices' unity, sign and clamp, and the CGC's interpolation: measured, not assumed, before any of it carries a picture.
+- **The jump.** Tables in the DQE are state Android writes too: every jump rewrites them all (the modeset already resets the block).
+
+What it would buy: the per-pixel work stays one pack (the bake already made the present about one instruction a pixel), and the bake's work per colour and per brightness goes away (the palette, the icons' mips, the wallpaper's re-bake, op 65 and `EV_BAKE` for the apps, the unbake for captures). The gain is simplicity and a free brightness change; the price is the shadows and the dither, both unmeasured.
+
+**Better placed, unread: the layer's HDR block.** Each layer's DPP has one (layer 0's `hdr0` at G#1998_0000; cal_9865 regs-hdr.h): an EOTF table of A#40 points with 10-bit x and 16-bit y, a 3×3 gamut matrix (S2.16 coefficients, 14-bit offsets), a tone-mapping stage, and an OETF of A#48 points with 14-bit x and 10-bit y. Its light carries 16 bits between the tables, four more than the DQE's, which removes most of the shadow cost, and it is per layer (a window could keep its own curve). Android's dump reads it all zero (off). ferros has never read it, and whether its words are secure is unknown: nothing is read there until a cold boot's first read says it is plain (the poison rule, §8).
+
+**To measure before deciding** (the owner's go, on a cold boot, the i1 Pro on a patch): the DQE's depth (degamma and regamma as exact inverses, v² and √, and the darkest 32 codes of a 10-bit grey ramp read against the same ramp with the stages off); the matrices' unity and sign (one coefficient at a time on a grey); the same two for the HDR block once its words are read.
 
 ## 7. Open
 

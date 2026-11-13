@@ -31,9 +31,17 @@ const SHD_REG_UP_REQ_DQE: u32 = 1 << 24;
 const DQE_TOP_IMG_SIZE: u64 = 0x0004;
 const DQE_TOP_FRM_SIZE: u64 = 0x0008;
 const DQE_TOP_FRM_PXL_NUM: u64 = 0x000C;
+// The DQE's colour stages where zuma has them (DISPLAY-DESIGN.md §6b): regs-dqe.h's offsets plus the DQE_V4 table in cal_common/dqe_cal.h (dither and regamma +G#400, the two matrices and degamma +G#800; ATC and HSC as written). Until 2026-11-12 ferros used regs-dqe.h's bare offsets, so the word it set as the display dither (G#2800) is the CGC dither and the one it cleared as the CGC dither (G#2400) is regamma 0's enable.
 const DQE_ATC_CONTROL: u64 = 0x0400;
-const DQE_CGC_DITHER: u64 = 0x2400;
-const DQE_DISP_DITHER: u64 = 0x2800;
+const DQE_HSC_CONTROL: u64 = 0x0800;
+const DQE_GAMMA_MATRIX_CON: u64 = 0x1400;
+const DQE_DEGAMMA_CON: u64 = 0x1800;
+const DQE_LINEAR_MATRIX_CON: u64 = 0x1C00;
+const DQE_REGAMMA0_CON: u64 = 0x2400;
+const DQE_REGAMMA1_CON: u64 = 0x4C00;
+const DQE_REGAMMA2_CON: u64 = 0x5000;
+const DQE_CGC_DITHER: u64 = 0x2800;
+const DQE_DISP_DITHER: u64 = 0x2C00;
 const DITHER_EN: u32 = 1 << 0;
 const DQE_CGC_CON: u64 = 0x0000;
 const DPP_COM_IO_CON: u64 = 0x0038;
@@ -328,15 +336,16 @@ impl M<'_> {
         self.restore(S_DECON, 0, main, &[0x0004, GLOBAL_CON, 0x0038, 0x003C, SHD_REG_UP_REQ, DECON_INT_PEND, DECON_INT_PEND_EXTRA, 0x0100, 0x0104, 0x0108, 0x010C, 0x0110, 0x0114, 0x0118, 0x011C, 0x0120, 0x0124]);
         self.win_tail();
         self.wr(S_DECON, GLOBAL_CON, 1 << 8 | GLOBAL_CON_TEN_BPC);
-        // 10 bpc the way Android runs it (decon_reg_set_bpc_and_dither_path, __exynos_dqe_update): the DQE in the enhance path, sized for the raster, its display dither taking the blend down to the link's 8 bits; no CGC, no ATC. The layer's DPP and HDR-common blocks take the same bit.
+        // 10 bpc the way Android runs it (decon_reg_set_bpc_and_dither_path, __exynos_dqe_update): the DQE in the enhance path, sized for the raster, a dither taking the blend down to the link's 8 bits; no CGC, no ATC. The layer's DPP and HDR-common blocks take the same bit.
+        // The words written here are the ones every boot has written since 2026-10-16, at the addresses it wrote them; their true names (zuma's DQE_V4 map) are regamma 0's enable (G#2400, off) and the CGC dither (G#2800, on), not the CGC and display dithers they were taken for. The glass was tuned on exactly this, so they stay.
         let p = (self.rd(S_DECON, DATA_PATH_CON_0) & !ENHANCE_PATH_MASK) | ENHANCE_DQE_ON | ENHANCE_DITHER_ON;
         self.wr(S_DECON, DATA_PATH_CON_0, p);
         self.wr(S_DQE, DQE_TOP_IMG_SIZE, r.h << 16 | r.w);
         self.wr(S_DQE, DQE_TOP_FRM_SIZE, r.h << 16 | r.w);
         self.wr(S_DQE, DQE_TOP_FRM_PXL_NUM, r.w * r.h);
         self.wr(S_DQE, DQE_ATC_CONTROL, 0);
-        self.wr(S_DQE, DQE_CGC_DITHER, 0);
-        self.wr(S_DQE, DQE_DISP_DITHER, DITHER_EN);
+        self.wr(S_DQE, DQE_REGAMMA0_CON, 0);
+        self.wr(S_DQE, DQE_CGC_DITHER, DITHER_EN);
         self.wr(S_DQE_CGC, DQE_CGC_CON, 0);
         self.set(S_DPP0, DPP_COM_IO_CON, BPC_MODE_10);
         self.set(S_HDRCOMM0, LSI_COMM_IO_CON, BPC_MODE_10);
@@ -413,13 +422,22 @@ impl M<'_> {
         }
     }
 
-    /// A panel on its rails after a jump, asked its power mode once the link is up: awake and showing (DCS G#0A reads G#9C: booster, sleep out, normal mode, display on) it is left as it is; anything else (asleep or dozing with its rails up, or no answer) is reset through the `panel` switch and powered up as from off, display on after the first frame. Android's screen off leaves it in either state with the DPU on or off (2026-11-04: off and on, both times black until this).
-    fn wake_panel(&mut self, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, r: &Raster, reset: &dyn Fn() -> bool, vddd: &dyn Fn() -> bool) {
+    /// After the jump from Android, the DQE's every colour stage off at its true address (zuma's DQE_V4 map, the constants above) and the display dither at its reset value, whatever Android left: the cold boot's state, which the baked present assumes (COMPOSITOR.md "Baked"). Read on the jump of 2026-11-12 every one was already so (the DECON reset at the modeset's start looks to clear the DQE too: Android's display dither on, its LPD word, read back at their reset values), so this changes nothing seen; it is written so the picture never rests on that. The histogram (secure, Android reaches it only by SMC) and the RCD are not touched.
+    fn dqe_cold(&self) {
+        for off in [DQE_ATC_CONTROL, DQE_HSC_CONTROL, DQE_GAMMA_MATRIX_CON, DQE_DEGAMMA_CON, DQE_LINEAR_MATRIX_CON, DQE_REGAMMA0_CON, DQE_REGAMMA1_CON, DQE_REGAMMA2_CON, DQE_DISP_DITHER] {
+            self.wr(S_DQE, off, 0);
+        }
+        self.wr(S_DQE_CGC, DQE_CGC_CON, 0);
+    }
+
+    /// A panel on its rails after a jump, asked its power mode once the link is up. After the jump from Android (`android`) it is reset thru the `panel` switch and powered up as from off whatever it answers, display on after the first frame: the panel's own registers are Android's then (its HBM and IRC modes, ACL, the thermal gain, the analogue settings of its last power-on), the screen came up visibly more contrasty than a cold boot's with the DPU's every word matching the cold boot's (2026-11-12, the panel awake at G#9F and left as it was), and Android's state is never adopted (the jump is a killswitch). After ferros's own restart the panel is ferros's: awake and showing (DCS G#0A reads G#9C: booster, sleep out, normal mode, display on) it is left as it is; anything else (asleep or dozing with its rails up, or no answer) is reset and powered up the same way. Android's screen off leaves it in either state with the DPU on or off (2026-11-04: off and on, both times black until this).
+    fn wake_panel(&mut self, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, r: &Raster, android: bool, reset: &dyn Fn() -> bool, vddd: &dyn Fn() -> bool) {
         let mut pm = [0u8; 1];
         let read = dsi.read(0x0A, &mut pm).is_ok();
         let showing = read && pm[0] & 0x9C == 0x9C;
-        self.say(alloc::format!("panel: on its rails after a jump; power mode {}{}\n", if read { alloc::format!("G#{:02X}", pm[0]) } else { alloc::string::String::from("unread") }, if showing { ", awake: left as it is" } else { ", not showing: reset and powered up" }).as_bytes());
-        if !showing {
+        let what = if android { ", Android's: reset and powered up" } else if showing { ", awake: left as it is" } else { ", not showing: reset and powered up" };
+        self.say(alloc::format!("panel: on its rails after a jump; power mode {}{what}\n", if read { alloc::format!("G#{:02X}", pm[0]) } else { alloc::string::String::from("unread") }).as_bytes());
+        if android || !showing {
             if reset() {
                 crate::PANEL_ON_DUE.store(1, core::sync::atomic::Ordering::Release);
                 self.panel_on(dsi, r, vddd);
@@ -448,8 +466,9 @@ impl M<'_> {
 
 /// The modeset when the pipe is still at 8 bpc (ABL's), then the DQE's dither in shift mode either way. Returns what it did and what misbehaved, for the console; empty when the pipe was already at 10 bpc.
 /// `force`: run it even when DECON is already at 10 bpc (after the jump from Android, whose raster and panel mode may not be ferros's).
+/// `jumped`: the pipe is not ABL's (the jump from Android, or ferros's own restart); `android`: the jump from Android itself, whose DQE and panel are crowbarred to the cold state.
 /// `panel_cold`: the panel's power-up (state B) goes in after the link's start, with the VDDD switch to call after its init set.
-pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool, jumped: bool, panel_cold: Option<&dyn Fn() -> bool>, awake: Option<(&dyn Fn() -> bool, &dyn Fn() -> bool)>) -> Vec<u8> {
+pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool, jumped: bool, android: bool, panel_cold: Option<&dyn Fn() -> bool>, awake: Option<(&dyn Fn() -> bool, &dyn Fn() -> bool)>) -> Vec<u8> {
     let mut m = M { p, f: freq(), rep: Vec::new() };
     m.te_pin();
     if force || m.rd(S_DECON, GLOBAL_CON) & GLOBAL_CON_TEN_BPC == 0 {
@@ -501,12 +520,15 @@ pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool, j
             m.wr(S_DSIM, DSIM_CMD_TE_CTRL1, c.link[(DSIM_CMD_TE_CTRL1 / 4) as usize]);
         }
         m.decon_init(&r, &c.main, &c.sub0, &c.sub1, &c.win, c.wincon);
+        if android {
+            m.dqe_cold();
+        }
         if akita {
             // Nothing to the panel: its link, PPS, raster and rate are ABL's and unchanged (the 10 bpc blend is DECON's, dithered onto the same 8 bpc link).
         } else if let Some(vddd) = panel_cold {
             m.panel_on(dsi, &r, vddd);
         } else if let Some((reset, vddd)) = awake {
-            m.wake_panel(dsi, &r, reset, vddd);
+            m.wake_panel(dsi, &r, android, reset, vddd);
         }
 
         // The panel, just after a TE: DSC on, the PPS, the raster, the full feature block for 120 Hz, control display, FFC on. HK3's; none on akita.
@@ -538,8 +560,8 @@ pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool, j
         let ms = now().wrapping_sub(t0) * 1000 / m.f;
         m.say(alloc::format!("modeset: 8 to 10 bpc in {ms} ms\n").as_bytes());
     }
-    // The DQE's dither in shift mode (EN | MODE = plain truncation of the two low bits): the display server dithers to 8-bit codes itself, from its 14-bit table, with the low two bits of each 10-bit code zero, so the panel gets exactly that pattern (the kernel set it after its modeset until 2026-11-01).
-    m.wr(S_DQE, DQE_DISP_DITHER, 3);
+    // A dither in shift mode (EN | MODE = plain truncation of the two low bits): the display server dithers to 8-bit codes itself, with the low two bits of each 10-bit code zero, so the panel gets exactly that pattern (the kernel set it after its modeset until 2026-11-01). The word is the CGC dither on zuma (G#2800), taken for the display dither until 2026-11-12; on every boot since 2026-10-16 it is the one written, and the display dither (G#2C00) read 0 (off, its reset value) after the jump of 2026-11-12, a cold boot's not yet read.
+    m.wr(S_DQE, DQE_CGC_DITHER, 3);
     m.set(S_DECON, SHD_REG_UP_REQ, SHD_REG_UP_REQ_DQE);
     m.rep
 }
@@ -607,7 +629,8 @@ impl ColdPipe {
 
 /// The whole pipe from reset, the DPU just powered up by the kernel's `dpu` switch (DISPLAY-DESIGN.md §8, layers 4, 5 and 7): `ten_bpc`'s sequence with its snapshots from the capture of a running pipe instead of the dead one, no DSIM stop (nothing runs), and the ULPS exit before the link's start (the panel's link left in ULPS by Android's hibernation).
 /// The panel: off (`panel_cold`, its VCI off) gets its power-up (state B). On its rails (`awake`: the `panel` switch for its reset pulse, and VDDD) it is asked its power mode once the link is up: awake and showing (DCS G#0A reads G#9C: booster, sleep out, normal mode, display on) it is left as it is, as under Android's hibernation with the screen on; anything else (asleep or dozing with its rails up, or no answer) is reset and powered up as from off. A jump from an Android whose screen had gone off left the panel holding Android's last frame under ferros's running pipe (2026-11-04): the panel was taken as on.
-pub fn from_off(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, panel_cold: Option<&dyn Fn() -> bool>, awake: Option<(&dyn Fn() -> bool, &dyn Fn() -> bool)>) -> Vec<u8> {
+/// `android`: the jump from Android (SYS_FACTS 31 = 6): its panel is reset and powered up even when it answers awake, as in `ten_bpc`. The DQE needs nothing here: it comes up from its power-on reset with the DPU.
+pub fn from_off(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, android: bool, panel_cold: Option<&dyn Fn() -> bool>, awake: Option<(&dyn Fn() -> bool, &dyn Fn() -> bool)>) -> Vec<u8> {
     let mut m = M { p, f: freq(), rep: Vec::new() };
     m.te_pin();
     let t0 = now();
@@ -620,7 +643,7 @@ pub fn from_off(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, panel_cold: O
     if let Some(vddd) = panel_cold {
         m.panel_on(dsi, &r, vddd);
     } else if let Some((reset, vddd)) = awake {
-        m.wake_panel(dsi, &r, reset, vddd);
+        m.wake_panel(dsi, &r, android, reset, vddd);
     }
     m.after_te();
     let pps = ferros_dsc::pps(&r.cfg);
@@ -643,29 +666,9 @@ pub fn from_off(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, panel_cold: O
     }
     let t = m.rd(S_DECON, TRIG_CON);
     m.wr(S_DECON, TRIG_CON, (t & !HW_TRIG_EN) | HW_TRIG_MASK_DECON);
-    m.wr(S_DQE, DQE_DISP_DITHER, 3);
+    m.wr(S_DQE, DQE_CGC_DITHER, 3);
     m.set(S_DECON, SHD_REG_UP_REQ, SHD_REG_UP_REQ_DQE);
     let ms = now().wrapping_sub(t0) * 1000 / m.f;
     m.say(alloc::format!("modeset: the pipe from reset in {ms} ms\n").as_bytes());
     m.rep
-}
-
-/// After the jump from Android, with the pipe already at 10 bpc so `ten_bpc` has nothing to do: the DQE as `decon_init` leaves it on a cold boot, written over Android's colour stages (gamut correction, adaptive tone, the gamma and matrix stages: colours off and the gradients posterized on the thirty-fifth jump, 2026-11-02), and the stages' shadow latched at the next frame. Nothing of DECON's timing, DSIM or the panel is touched.
-pub fn dqe_quiet(p: &Pipe, w: u32, h: u32) {
-    let m = M { p, f: freq(), rep: Vec::new() };
-    let path = (m.rd(S_DECON, DATA_PATH_CON_0) & !ENHANCE_PATH_MASK) | ENHANCE_DQE_ON | ENHANCE_DITHER_ON;
-    m.wr(S_DECON, DATA_PATH_CON_0, path);
-    m.wr(S_DQE, DQE_TOP_IMG_SIZE, h << 16 | w);
-    m.wr(S_DQE, DQE_TOP_FRM_SIZE, h << 16 | w);
-    m.wr(S_DQE, DQE_TOP_FRM_PXL_NUM, w * h);
-    // Every colour stage off: ATC, HSC, the gamma matrix, degamma, the linear matrix, the three regamma blocks (regs-dqe.h), and the CGC with its dither.
-    for off in [DQE_ATC_CONTROL, 0x0800, 0x0C00, 0x1000, 0x1400, 0x2000, 0x4800, 0x4C00] {
-        m.wr(S_DQE, off, 0);
-    }
-    m.wr(S_DQE, DQE_CGC_DITHER, 0);
-    m.wr(S_DQE, DQE_DISP_DITHER, DITHER_EN);
-    m.wr(S_DQE_CGC, DQE_CGC_CON, 0);
-    m.set(S_DPP0, DPP_COM_IO_CON, BPC_MODE_10);
-    m.set(S_HDRCOMM0, LSI_COMM_IO_CON, BPC_MODE_10);
-    m.set(S_DECON, SHD_REG_UP_REQ, SHD_GLOBAL | SHD_CMP | SHD_REG_UP_REQ_DQE);
 }
