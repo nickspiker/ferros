@@ -1,17 +1,25 @@
-//! Photon on ferros: the app Photon's library builds, run through fluor's ferros host over the display server's app surface and the touch server. Spawned by the shell with (slot order) the display and touch endpoints, the app surface, the udp endpoint, the photon vault scope, the ira and entropy: `--use display --use touch --dma surface --use udp --store photon --ira --entropy`. The desktop main (photon's src/main.rs) does the winit things; this one does the ferros things.
+//! Photon on ferros: the app Photon's library builds, run through fluor's ferros host over the display server's app surface and the touch server. Launched as a kist (tools/photon-capsule.sh) with, in slot order, the display and touch endpoints, the app surface, the udp endpoint, its own vault domain, the ira and entropy (placements of the implicit set, KISTS.md), then be you and the person's people (asked, docs/FACETS.md); the GPU's three and sound out after them. The desktop main (photon's src/main.rs) does the winit things; this one does the ferros things.
 
+use photon_messenger::crypto::photon_keys::PhotonKeys;
 use photon_messenger::network::fgtw::derive_device_keypair;
 use photon_messenger::network::fgtw::fleet::SigningBundle;
 use photon_messenger::ui::photon_app::PhotonApp;
 
-/// The ira's grant slot, in the spawn's order above (tools/photon-capsule.sh declares it sixth: "to tie its keys to this device"). The ira is one of the implicit set since 2026-11-12 (docs/KISTS.md), never asked; Photon's capsule still declares it, so it stays in this slot.
+/// The ira's grant slot, in the spawn's order above (tools/photon-capsule.sh declares it sixth: "to tie its keys to this device"). The ira is one of the implicit set since 2026-11-12 (docs/KISTS.md), never asked; Photon's capsule still declares it, so it stays in this slot. The alias comes through the same grant (SYS_IRA x4 bit 1).
 const IRA: u64 = 6;
+/// Be you's grant slot (the capsule's eighth want): a send right on the identity service's `facets` endpoint, or an empty slot where the person said no or has not been asked.
+const BE_YOU: u64 = 8;
+/// The person's people's grant slot (the ninth want): the same endpoint, stamped by the kernel with what the person granted.
+const PEOPLE: u64 = 9;
 
-/// The kernel, as this process reaches it (ferros KERNEL.md, the process ABI): the call for the ira key and the grants page. Inlined as Mahere's, fluor's and kete's are: ferros_sys is no_std and not a published crate.
+/// The kernel, as this process reaches it (ferros KERNEL.md, the process ABI): the ira and the alias, and a call on an endpoint. Inlined as Mahere's, fluor's and kete's are: ferros_sys is no_std and not a published crate.
 mod sys {
     use core::arch::asm;
 
+    const CALL: u64 = 1;
     const IRA: u64 = 23;
+    /// ERR, the kernel's refusal (ferros_sys::ERR).
+    const ERR: u64 = u64::MAX;
 
     #[inline(always)]
     fn svc(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -44,6 +52,73 @@ mod sys {
         let r = svc(IRA, cap(slot), off(domain.as_ptr()), domain.len() as u64, off(out.as_mut_ptr()), 0);
         (r == 32).then_some(out)
     }
+
+    /// Photon's alias (ferros_sys `alias`; docs/FACETS.md "The alias"): the seed the kernel derives for this kist alone from the person key and Photon's gate identity, the same on every device of the person's. None before attest, before the identity service handed the kernel the person key, or on a kernel from before 2026-11-12.
+    pub fn alias(slot: u64) -> Option<[u8; 32]> {
+        let mut out = [0u8; 32];
+        let r = svc(IRA, cap(slot), 0, 0, off(out.as_mut_ptr()), 2);
+        (r == 32).then_some(out)
+    }
+
+    /// A call on the endpoint in `slot`, its answer in `reply`: the answer's length, or None when the kernel refused (an empty slot: the person said no).
+    pub fn call(slot: u64, msg: &[u8], reply: &mut [u8]) -> Option<usize> {
+        let r = svc(CALL, cap(slot), off(msg.as_ptr()), msg.len() as u64, off(reply.as_mut_ptr()), reply.len() as u64);
+        (r != ERR).then(|| (r as usize).min(reply.len()))
+    }
+}
+
+/// The person as Photon's messenger knows them on ferros (docs/PHOTON.md "Photon's own key: the migration"): its alias from the kernel, and from the identity service the handle proof, the pinned identity key and the binding of the alias to the person (be you, op 0 on `facets`). None without the alias or without be you: Photon then runs as before, on its own handle screen (PHOTON.md option C). Never the identity seed: ferros hands no kist a root, so `legacy_seed` is None.
+fn photon_keys() -> Option<PhotonKeys> {
+    let Some(alias) = sys::alias(IRA) else {
+        println!("photon: no alias from the kernel (before attest, or the person key not handed in yet)");
+        return None;
+    };
+    let signer = fgtw::alias::bundle(&alias);
+    let public = signer.public();
+    let bundle = public.to_bytes();
+    let eggs = fgtw::binding::possession(&signer, &public);
+    let mut req = Vec::with_capacity(3 + bundle.len() + eggs.len());
+    req.push(0);
+    req.extend_from_slice(&(bundle.len() as u16).to_le_bytes());
+    req.extend_from_slice(&bundle);
+    req.extend_from_slice(&eggs);
+    let mut reply = vec![0u8; 1 << 16];
+    let Some(n) = sys::call(BE_YOU, &req, &mut reply) else {
+        println!("photon: be you not granted: Photon runs on its own handle screen");
+        return None;
+    };
+    if n < 65 || reply[0] != 0 {
+        println!("photon: the identity service refused be you ({})", reply.first().copied().unwrap_or(0xFF));
+        return None;
+    }
+    let mut hp = [0u8; 32];
+    let mut identity = [0u8; 32];
+    hp.copy_from_slice(&reply[1..33]);
+    identity.copy_from_slice(&reply[33..65]);
+    let binding = reply[65..n].to_vec();
+    // The binding names this alias and this handle proof, or it is not taken: a check of the service's answer against what this process holds, never the chain's (that is a contact's, against the chain it fetches).
+    match fgtw::binding::Binding::from_vsf_bytes(&binding) {
+        Ok(b) if b.alias_key() == public.ed25519() && b.handle_proof == hp => {}
+        _ => {
+            println!("photon: the identity service's binding does not name this alias");
+            return None;
+        }
+    }
+    println!("photon: be you: the alias and its binding in hand ({} bytes)", binding.len());
+    Some(PhotonKeys::new(alias, hp, identity, binding, None))
+}
+
+/// The person's people Photon may know (people, op 1 on `facets`): all of them or the ones the person chose, without their fleets. Empty without the grant: no lying, nobody is nobody.
+fn people() -> Vec<fgtw::people::Person> {
+    let mut reply = vec![0u8; 1 << 18];
+    match sys::call(PEOPLE, &[1], &mut reply) {
+        Some(n) if n >= 1 && reply[0] == 0 => fgtw::people::from_doc(&reply[1..n]).unwrap_or_default(),
+        Some(_) => {
+            println!("photon: the identity service refused the people ({})", reply[0]);
+            Vec::new()
+        }
+        None => Vec::new(),
+    }
 }
 
 fn main() {
@@ -59,9 +134,15 @@ fn main() {
         println!("photon: no ira key at slot {IRA} (the ira right was not granted); Photon has no device key of its own and does not start");
         return;
     };
+    // The person, as facets (docs/FACETS.md; PHOTON.md "ferros's part"): Photon's alias and its binding, and the person's people. Asked once at start, before the first frame.
+    let keys = photon_keys();
+    let people = people();
+    println!("photon: {} of the person's people handed in", people.len());
     let mut app = PhotonApp::new();
     app.set_device_keypair(derive_device_keypair(&root));
     app.set_signing_bundle(SigningBundle::derive(&root));
+    // THE SEAM (2026-11-13): Photon's messenger takes `PhotonKeys` where it took the session's identity seed (photon src/crypto/photon_keys.rs, aa53a370), and the person's people where it kept its own contact rows (FACETS.md D5), but PhotonApp has no way in for either yet. Wanted from the Photon session: `PhotonApp::set_photon_keys(PhotonKeys)` (opens on the contacts, no handle screen, while `keys` is Some) and `PhotonApp::set_people(Vec<fgtw::people::Person>)` (each a contact by handle proof, pinned identity key and genesis, the name the person gave them). Until then both are held here, Photon runs on its own handle screen as before, and nothing of them reaches its vault.
+    let _held = (keys, people);
     // No window controls strip (minimise, maximise, close: a desktop window manager's, nothing on ferros), as Photon's Android build has none: since 2026-11-12 the frame reaches the glass's edge under the console (WINDOWS.md "Drawn under the controls"), and the strip, cut away with the corner until then, would show in the top right under the radios' circles, which take every touch there.
     fluor::paint::DEBUG_SKIP_CONTROLS.store(true, std::sync::atomic::Ordering::Relaxed);
     let caps = fluor::host::ferros::Caps { display: 1, touch: 2, surface: 3 };

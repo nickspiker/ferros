@@ -2153,8 +2153,9 @@ dependencies = [
  "fn-dsa-vrfy",
  "num-bigint",
  "rand 0.8.5",
+ "rand_chacha 0.3.1",
  "voca",
- "vsf 0.10.2",
+ "vsf",
  "x25519-dalek",
 ]
 
@@ -2224,7 +2225,7 @@ dependencies = [
  "softbuffer",
  "swash",
  "unicode-script",
- "vsf 0.10.2",
+ "vsf",
  "wgpu",
  "wide 0.7.33",
  "windows 0.58.0",
@@ -3177,19 +3178,7 @@ dependencies = [
  "i256",
  "sha2 0.10.9",
  "sha3 0.10.8",
-]
-
-[[package]]
-name = "ihi"
-version = "0.0.48"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e820ef1c51d912e9c78a84cf71319ee3b758c66a264c96bdd2c8d6f2ab4c6969"
-dependencies = [
- "blake3",
- "i256",
- "sha2 0.10.9",
- "sha3 0.10.8",
- "vsf 0.6.42",
+ "vsf",
 ]
 
 [[package]]
@@ -3622,7 +3611,7 @@ dependencies = [
  "manifestus",
  "rand 0.8.5",
  "tohu",
- "vsf 0.10.2",
+ "vsf",
 ]
 
 [[package]]
@@ -3760,7 +3749,7 @@ version = "0.0.2"
 dependencies = [
  "rawler",
  "rayon",
- "vsf 0.10.2",
+ "vsf",
 ]
 
 [[package]]
@@ -3860,7 +3849,7 @@ dependencies = [
  "blake3",
  "hashbrown 0.15.5",
  "libc",
- "vsf 0.10.2",
+ "vsf",
 ]
 
 [[package]]
@@ -4850,7 +4839,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "png 0.17.16",
  "rayon",
- "vsf 0.10.2",
+ "vsf",
  "zune-core",
  "zune-jpeg",
 ]
@@ -5061,6 +5050,7 @@ dependencies = [
 name = "photon-ferros"
 version = "0.1.0"
 dependencies = [
+ "fgtw",
  "fluor",
  "getrandom 0.2.17",
  "photon-messenger",
@@ -5068,7 +5058,7 @@ dependencies = [
 
 [[package]]
 name = "photon-messenger"
-version = "0.133.1"
+version = "0.152.1"
 dependencies = [
  "aes-gcm 0.11.0-rc.3",
  "anyhow",
@@ -5101,7 +5091,7 @@ dependencies = [
  "i256",
  "icc-profile",
  "if-watch",
- "ihi 0.0.48 (registry+https://github.com/rust-lang/crates.io-index)",
+ "ihi",
  "image",
  "img-parts",
  "jni 0.21.1",
@@ -5162,13 +5152,15 @@ dependencies = [
  "tokio-tungstenite",
  "v4l",
  "voca",
- "vsf 0.10.2",
+ "vsf",
  "wgpu",
  "windows 0.58.0",
  "winit",
  "x11",
  "x25519-dalek",
  "zeroize",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -5742,7 +5734,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "kete",
- "vsf 0.10.2",
+ "vsf",
 ]
 
 [[package]]
@@ -7042,6 +7034,7 @@ dependencies = [
  "blake3",
  "libm",
  "rayon",
+ "vsf",
 ]
 
 [[package]]
@@ -7243,10 +7236,11 @@ dependencies = [
  "base64",
  "blake3",
  "chacha20poly1305 0.11.0-rc.3",
- "ihi 0.0.48",
+ "ihi",
  "jni 0.21.1",
+ "libc",
  "rand 0.8.5",
- "vsf 0.10.2",
+ "vsf",
 ]
 
 [[package]]
@@ -7735,24 +7729,7 @@ dependencies = [
 
 [[package]]
 name = "vsf"
-version = "0.6.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c5d0a40ee257e3d1c771570668208f2daa233eab0c91badf84d00132b0218bb"
-dependencies = [
- "bitvec",
- "blake3",
- "chrono",
- "hex",
- "i256",
- "libm",
- "num-complex",
- "num-traits",
- "unicode-normalization",
-]
-
-[[package]]
-name = "vsf"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "bitvec",
@@ -7776,7 +7753,7 @@ dependencies = [
 
 [[package]]
 name = "vsf-derive"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "proc-macro2",
  "quote",

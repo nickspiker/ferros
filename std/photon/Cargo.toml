@@ -12,6 +12,8 @@ path = "src/main.rs"
 photon-messenger = { path = "../../../photon" }
 fluor = { path = "../../../fluor", default-features = false, features = ["host-ferros", "simd", "emoji"] }
 getrandom02 = { package = "getrandom", version = "0.2", features = ["custom"] }
+# fgtw itself, the same copy Photon builds against (`../../../fgtw`, Photon's `../fgtw`): the alias's keys (fgtw::alias), the binding (fgtw::binding) and the people (fgtw::people) of the facets (docs/FACETS.md). Needs fgtw with those modules (its `facets` branch until merged).
+fgtw = { path = "../../../fgtw", default-features = false, features = ["sign", "profile"] }
 
 [patch.crates-io]
 # libc with a ferros arm: the C scalar types, no functions, for the crates that spell their types through it (pqcrypto-internals, rav1d).
