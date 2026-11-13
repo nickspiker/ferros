@@ -1539,6 +1539,18 @@ struct PowerWin {
     secs: u64,
     /// The clock policy's state at each sample (CLOCK_STATE: 0 not applied, 1 rest, 2 active, 3 dark), so a reading says what it measured.
     states: [u32; 4],
+    /// At the settle (the window's true start): the counter, the gauge's integrals (hsi2c gauge `charge`: RepSOC, RepCap, QH), and the wake counts (`wakes_now`), for the drain and the wakes over the whole window.
+    start: Option<(u64, Option<(u16, u16, u16)>, [u64; 4])>,
+}
+
+/// The kernel core's idle sleeps and the ticks spent in them (the service loop's idle, plain or deep), for DIAG X3_SLEEPS and the power window's wake count.
+pub static X3_SLEEPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static X3_ASLEEP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// What a power window counts across itself: the kernel core's idle sleeps, the interrupts taken, the ticks asleep, the watchdog pets (a pass of the service loop each, more or less).
+fn wakes_now() -> [u64; 4] {
+    use core::sync::atomic::Ordering::Relaxed;
+    [X3_SLEEPS.load(Relaxed), unsafe { core::ptr::read_volatile(&raw const crate::__irq_count) }, X3_ASLEEP.load(Relaxed), crate::platform::PETS.load(Relaxed)]
 }
 static mut POWER_WIN: Option<PowerWin> = None;
 static mut POWER_RESULT: Option<alloc::string::String> = None;
@@ -1548,7 +1560,8 @@ fn power_start(secs: u64, gap16: u64, input: bool, delay: u64) -> alloc::string:
     if unsafe { (*(&raw const POWER_WIN)).is_some() } {
         return "a window is already running\n".into();
     }
-    let secs = secs.clamp(1, 64);
+    // Up to 4096 s: an hour on battery is what a drain per hour wants (the gauge's own integrals, read at the two ends, carry it; `gap` sets only how often the current is sampled beside them).
+    let secs = secs.clamp(1, 4096);
     let mut msg = alloc::string::String::new();
     let charger_prev = match crate::hsi2c::charger::set_mode(0) {
         Ok(p) => Some(p),
@@ -1562,16 +1575,26 @@ fn power_start(secs: u64, gap16: u64, input: bool, delay: u64) -> alloc::string:
     let settle = now + f / 2 + delay.min(120) * f;
     unsafe {
         POWER_RESULT = None;
-        POWER_WIN = Some(PowerWin { settle, end: settle + secs * f, next: settle, gap: (gap16.clamp(1, 64) * f / 16).max(1), charger_prev, input_prev, sum_ua: 0, sum_uv: 0, n: 0, min_ua: i32::MAX, max_ua: i32::MIN, secs, states: [0; 4] });
+        POWER_WIN = Some(PowerWin { settle, end: settle + secs * f, next: settle, gap: (gap16.clamp(1, 64) * f / 16).max(1), charger_prev, input_prev, sum_ua: 0, sum_uv: 0, n: 0, min_ua: i32::MAX, max_ua: i32::MIN, secs, states: [0; 4], start: None });
     }
     msg += &alloc::format!("power window: {secs} s from half a second after the charger cut{}; read it with `diag power`\n", if input_prev.is_some() { ", CHGIN deselected" } else { "" });
     msg
+}
+
+/// When the running power window next wants the loop (its start, its next sample, its end), for the dark idle's deadline. None without a window.
+fn power_due() -> Option<u64> {
+    let w = unsafe { (*(&raw const POWER_WIN)).as_ref() }?;
+    let next = if w.start.is_none() { w.settle } else { w.next };
+    Some(next.min(w.end))
 }
 
 /// From the service loop: the running power window's sample when one is due, and its end.
 fn power_poll() {
     let Some(w) = (unsafe { (*(&raw mut POWER_WIN)).as_mut() }) else { return };
     let now = cntpct();
+    if w.start.is_none() && now >= w.settle {
+        w.start = Some((now, crate::hsi2c::gauge::charge().ok(), wakes_now()));
+    }
     if now >= w.next && now < w.end {
         w.next = now.max(w.next) + w.gap;
         if let Ok(g) = crate::hsi2c::gauge::sample() {
@@ -1602,6 +1625,18 @@ fn power_poll() {
             r += &alloc::format!("{} s, {} samples: {ma} mA (min {}, max {}) at {mv} mV = {} mW (negative = discharging); clocks dark {}, rest {}, active {}, unset {} of the samples\n", w.secs, w.n, w.min_ua / 1000, w.max_ua / 1000, ma * mv as i64 / 1000, w.states[3], w.states[1], w.states[2], w.states[0]);
         } else {
             r += "no gauge samples\n";
+        }
+        // Over the whole window, from the settle: the gauge's integrals (RepSOC in 1/256 %, RepCap and QH in mAh at the 5 mΩ sense) and the wakes, each per hour or per second.
+        if let Some((t0, c0, k0)) = w.start {
+            let secs_x16 = (now.wrapping_sub(t0) * 16 / cntfrq()).max(1);
+            if let (Some((soc0, cap0, qh0)), Ok((soc1, cap1, qh1))) = (c0, crate::hsi2c::gauge::charge()) {
+                let dsoc = soc0 as i64 - soc1 as i64;
+                let dqh = qh0.wrapping_sub(qh1) as i16 as i64;
+                r += &alloc::format!("gauge over A#{} s: RepSOC G#{soc0:04X} -> G#{soc1:04X} ({dsoc} of 1/256 %, A#{} thousandths of a percent an hour), RepCap A#{cap0} -> A#{cap1} mAh, QH G#{qh0:04X} -> G#{qh1:04X} (A#{dqh} mAh, A#{} mA average)\n", secs_x16 / 16, dsoc * 1000 * 16 * 3600 / 256 / secs_x16 as i64, dqh * 16 * 3600 / secs_x16 as i64);
+            }
+            let k1 = wakes_now();
+            let per_s = |k: usize| (k1[k].wrapping_sub(k0[k])) * 16 / secs_x16;
+            r += &alloc::format!("wakes: the kernel core's idle sleeps A#{} a second, interrupts A#{} a second, watchdog pets A#{} a second, asleep A#{} % of the time\n", per_s(0), per_s(1), per_s(3), k1[2].wrapping_sub(k0[2]) * 100 / now.wrapping_sub(t0).max(1));
         }
         // Into the flash log too: a window run with the cable out ends before the host can ask, and if the USB link does not come back the reset that recovers it would take the result with it (2026-10-25).
         crate::flashlog::line(&alloc::format!("power: {}", r.trim_end()));
@@ -2033,7 +2068,9 @@ fn gauge_poll() {
     let (f, now) = (cntfrq(), cntpct());
     unsafe {
         let g = &mut *(&raw mut GAUGE);
-        if g.1 == 0 || now.wrapping_sub(g.1) > 2 * f {
+        // Every 2 s while the screen is on, every 64 s while it is dark: nobody reads the battery's share off a dark screen, and each read is a pass of the loop and a bus transfer the dark idle would otherwise sleep thru.
+        let period = if clock_state() == 3 { 64 } else { 2 };
+        if g.1 == 0 || now.wrapping_sub(g.1) > period * f {
             g.1 = now;
             g.0 = match crate::hsi2c::gauge::sample() {
                 Ok(s) => [s.soc as u64, s.temp_cc as i64 as u64, s.vcell_uv as u64, s.current_ua as i64 as u64],
@@ -2742,7 +2779,39 @@ pub fn run(mut b: Boot) -> ! {
         platform::crumb(0xD1);
         let ran = if !inbox_full { crate::process::run_slice() } else { false };
         platform::crumb(0xD2);
-        if !inbox_full && !ran {
+        // Dark and alone (the screen off, no worker up: every thread runs here and every interrupt comes here, the radio agent's routing): tickless (idle.rs). Woken by the next thread's deadline, the loop's own quarter-second duties (the watchdog's pet, the keys' check, the polls), a power window's sample, the UFS link's hibernate, and any interrupt.
+        let dark_alone = !inbox_full && !ran && crate::idle::TICKLESS.load(core::sync::atomic::Ordering::Relaxed) && clock_state() == 3 && crate::smp::UP.load(core::sync::atomic::Ordering::Acquire) == 0;
+        if dark_alone {
+            let t = cntpct();
+            platform::crumb(0xB5);
+            if !backstop_ppi {
+                crate::killswitch::enable_ppi(26);
+                backstop_ppi = true;
+            }
+            let mut next = crate::process::NEXT_WAKE.load(core::sync::atomic::Ordering::Acquire).min(t + (cntfrq() >> crate::idle::TICK_SHIFT));
+            // A due time already behind the counter is one the pass just handled (or could not act on: a link that is down never hibernates), never a reason to wake at once.
+            for d in [power_due(), ferros_hal::ufs::UfsController::h8_awake_since().map(|u| u + cntfrq() / 64)].into_iter().flatten() {
+                if d > t {
+                    next = next.min(d);
+                }
+            }
+            // `wfi` with the EL2 timer at the deadline, IRQs masked from the look to the `wfi` so an interrupt in between ends it at once. No event stream: `wfi` does not wake for it.
+            unsafe { core::arch::asm!("msr daifset, #2") };
+            let busy = unsafe { read_volatile(&raw const crate::process::__irq_any) } != 0 || crate::process::RUNNABLE_N.load(core::sync::atomic::Ordering::Acquire) != 0;
+            if !busy {
+                // WHY: the deadline can be behind the counter by now (a thread's, lowered while this pass ran); a wait of zero is still a timer that fires at once, but the subtraction must not wrap.
+                let wait = next.saturating_sub(cntpct());
+                unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", "wfi", "msr cnthp_ctl_el2, xzr", "isb", t = in(reg) wait, c = out(reg) _) };
+                crate::idle::SHALLOW.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            unsafe { core::arch::asm!("msr daifclr, #2") };
+            let slept = cntpct().wrapping_sub(t);
+            platform::crumb(0xB6);
+            asleep += slept;
+            X3_IDLE_TICKS.fetch_add(slept, core::sync::atomic::Ordering::Relaxed);
+            X3_SLEEPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            X3_ASLEEP.fetch_add(slept, core::sync::atomic::Ordering::Relaxed);
+        } else if !inbox_full && !ran {
             let t = cntpct();
             platform::crumb(0xB3);
             // A backstop under the event stream: the EL2 timer armed 2 ms out, so a GIC interrupt ends this `wfe` even if the event stream cannot. On battery at the rest clocks the X3 went into this `wfe` and never came out — the last crumb G#B3, its event stream still on (2026-10-25, three times) — as if the core had been taken down while it waited, where only an interrupt brings a core back. Taken at EL2 the tick only stops the timer (.Lirq_tick). The event stream wakes it first every time it can, so the timer is disarmed before it fires; a sleep that ran past 1.5 ms was ended by the backstop, and DIAG counts those.
@@ -2761,6 +2830,8 @@ pub fn run(mut b: Boot) -> ! {
             }
             asleep += slept;
             X3_IDLE_TICKS.fetch_add(slept, core::sync::atomic::Ordering::Relaxed);
+            X3_SLEEPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            X3_ASLEEP.fetch_add(slept, core::sync::atomic::Ordering::Relaxed);
         }
         // Development: a jumped session that the host has not reached in 60 s (no command from the USB process) leaves a note, once, and runs on.
         // Until 2026-11-13 it also reset, so the next boot could read the pstore ring (the twenty-seventh jump, 2026-11-02: ferros up, no USB, the screen still Android's).
@@ -4104,6 +4175,12 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params == b"idle" || cmd.params.starts_with(b"idle ") {
+                    // `diag idle [tickless on|off]`: the kernel core's dark idle (idle.rs).
+                    crate::idle::diag(core::str::from_utf8(&cmd.params[4..]).unwrap_or("").trim(), &mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params == b"smp dark on" || cmd.params == b"smp dark off" {
                     DARK_WORKERS_OFF.store(cmd.params == b"smp dark on", core::sync::atomic::Ordering::Relaxed);
                     resp.extend_from_slice(alloc::format!("workers off while dark: {}\n", cmd.params == b"smp dark on").as_bytes());
@@ -4230,6 +4307,7 @@ pub fn run(mut b: Boot) -> ! {
                     append_hex(&mut resp, b"CPU0_AFFINITY=", r as u32);
                 }
                 append_hex(&mut resp, b"BACKSTOP_WAKES=", BACKSTOP_WAKES.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                append_hex(&mut resp, b"X3_SLEEPS=", X3_SLEEPS.load(core::sync::atomic::Ordering::Relaxed) as u32);
                 append_hex(&mut resp, b"IDLE_PCT=", (asleep * 100 / cntpct().wrapping_sub(t_awake_from).max(1)) as u32);
                 append_hex(&mut resp, b"UPTIME_MS=", (cntpct().wrapping_sub(t_boot) / (freq / 1000)) as u32);
                 // The watchdog window's measurement (platform::pet_watchdogs): the longest gap between two pets from any core, when it ended (uptime), and the pets so far.

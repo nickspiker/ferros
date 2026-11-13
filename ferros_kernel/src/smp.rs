@@ -250,6 +250,8 @@ extern "C" fn ferros_core_main(block: usize) -> ! {
         // The kernel's core (or the lock's holder) silent past half the watchdog's window: where it is, kept for the post-mortem (platform::stall_check). An idle worker wakes for its own deadlines and kicks at least, so a stall that keeps every worker idle is still seen.
         crate::platform::stall_check();
         if STOP.load(Ordering::Acquire) != 0 {
+            // The keys cleared and this core marked as holding none before it goes off: power-off loses them anyway, and a worker that came back still marked as holding failed its first check every time (four check failures at each dark-to-lit switch, 2026-11-13 on the 8a). The kernel's core holds them meanwhile.
+            crate::keys::wipe_for_restart();
             UP.fetch_and(!(1 << k), Ordering::AcqRel);
             OFF.fetch_add(1, Ordering::AcqRel);
             unsafe {

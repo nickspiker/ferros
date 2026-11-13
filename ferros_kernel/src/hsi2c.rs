@@ -247,6 +247,18 @@ pub mod gauge {
         pub avg_vcell_uv: u32,
     }
 
+    /// RepCap (mAh at the 5 mΩ sense: 5 µVh / R a count).
+    pub const REP_CAP: u8 = 0x05;
+    /// QH, the coulomb counter's high word (the same unit as RepCap; it counts down while discharging and wraps).
+    pub const QH: u8 = 0x4D;
+
+    /// The gauge's own integrals, for a power window's start and end (service.rs `power_poll`): RepSOC as its whole word (1/256 % a count), RepCap and QH raw.
+    /// Read twice, an hour apart, they measure the drain with no sampling in between: the counter integrates every microsecond the window lasts, so nothing in ferros has to wake to take samples.
+    pub fn charge() -> Result<(u16, u16, u16), u32> {
+        let r = |reg| super::read_word(super::HSI2C_11, TARGET, reg);
+        Ok((r(REP_SOC)?, r(REP_CAP)?, r(QH)?))
+    }
+
     pub fn sample() -> Result<Sample, u32> {
         let r = |reg| super::read_word(super::HSI2C_11, TARGET, reg);
         let uv = |raw: u16| ((raw as u64) * 78125 / 1000) as u32;

@@ -668,6 +668,12 @@ impl UfsController {
         self.h8_wake();
     }
 
+    /// When the link last carried a command, while it is awake and hibernate is on: a sleeping caller wakes for `h8_enter_if_idle` at that plus its idle time (ferros_kernel service loop, the dark idle). None when hibernated or switched off.
+    pub fn h8_awake_since() -> Option<u64> {
+        use core::sync::atomic::Ordering::Relaxed;
+        (H8_ENABLED.load(Relaxed) && !H8_ON.load(Relaxed)).then(|| H8_LAST_USE.load(Relaxed))
+    }
+
     /// Into hibernate if the link has been idle `idle_ticks` with nothing in the doorbell (Exynos hibern8_notify ENTER: the DME command, then the post-enter cal, then the clocks stopped). Returns whether it went in. Callers hold the kernel lock, as every command does.
     pub fn h8_enter_if_idle(&self, idle_ticks: u64) -> bool {
         use core::sync::atomic::Ordering::Relaxed;

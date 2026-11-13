@@ -64,6 +64,8 @@ mod camera_events;
 mod camera_snap;
 mod x3;
 mod smp;
+// The kernel core's idle: tickless while dark, and powered down (PSCI c2) when nothing is due (POWER.md "Deep idle").
+mod idle;
 mod rtc;
 mod zone;
 mod lang;

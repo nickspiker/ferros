@@ -200,6 +200,56 @@ Screen off, every radio up, cable in: **0.93-1.01 W** after the three process ch
 
 Real sleep, extracted from Linux (zuma): the cores' only idle state is C2 (PSCI power_state G#0001_0000, X3 entry/exit 235/220 us, residency 3.5 ms), with the CPU_INFORM hint at PMU G#1546_0860 + 4 x cpu and PMU_INFORM0 G#1546_0800 = 1 once; the arch timer stops in C2, so the X3 wakes from MCT comparator 8 (SPI 766). Android's 0.31 W screen-off figure is that C2 idle at the clock floors, not suspend. Full suspend is PSCI SYSTEM_SUSPEND from CPU0 after the flexpmu SYS_SLEEP sequence (EINT wake masks, 336 CMU registers saved, UFS and power domains down); its wake sources are EINTs (power key gpa4-0, modem gpa6-5, WiFi host-wake gpa5-1, NFC, USB-PD), the RTC and mailboxes, never a timer. Order: X3 C2 idle first.
 
+## 2026-11-13: deep idle and the keeper
+
+Owner: "Losing 50% overnight with no radios on isn't great."
+
+### What the dark state cost (the 8a, before)
+
+The 8a on person-key's kernel of 09:45, screen off, radios on (as it runs), cable in with the charger cut, two 64 s windows: **782 and 859 mW**, about 4.5 to 5 % of its battery an hour, 40 % over a night.
+
+The wakes are the story, not the cores' power states:
+
+| | dark, per second |
+|---|---|
+| the kernel core's service-loop passes (watchdog pets) | ~5,700 |
+| interrupts taken | ~2,200 |
+| process slices on the X3 | ~1,700 |
+| threads woken by a deadline | ~2,400 (71,096 in 30 s) |
+
+The scheduler's trace (`diag sched`, scratchpad base/sched.txt) names them: the radio drivers sleep a millisecond at a time and poll (the modem ~1,100 wakes a second, pcie1 ~900, bt ~300, ip ~260; nfc and usb less).
+That is the owner's no-polling rule broken where it costs most; the drivers' waits move to their interrupts in separate work.
+The kernel's own loop added its event stream (every 2.7 ms) and its 2 ms backstop: at least 500 wakes a second with nothing to do.
+
+Rails (`diag odpm`, same state): CPUCL0 70 mW with every A510 off (the cluster's shared logic, the DSU and L3), the X3 40 mW, the modem's VSYS 91 mW, the GPU ~50 mW over its three rails.
+
+### What changed
+
+- **Tickless while dark** (idle.rs, service loop): with the screen off and no worker up (the dark profile's), every thread runs on the kernel's core and every interrupt reaches it, so the loop sleeps in `wfi` until the next thing due: a thread's deadline, a power window's sample, the UFS link's 16 ms to hibernate, or the loop's own quarter second (the watchdog's pet within its 1 s window, the keys' check, the polls). No event stream, no 2 ms backstop. The battery gauge is read every 64 s while dark (2 s lit). `diag idle tickless on|off`.
+- **Deep idle (on the deep-sleep branch, worktree-agent-ad6164a08c7d8c6e9, until EL3 accepts the call: below)**: when the next thing due is at least 2^-7 s away, the kernel's core powers down (PSCI CPU_SUSPEND, zuma's c2: power_state G#0001_0000; the CPU_INFORM hint at G#1546_0860 + 4 x core, 1 for c2, 2 for the cluster; PMU_INFORM0 G#1546_0800 = 1 once, as exynos-cpupm.c). The save area (callee-saved registers, the stack, the EL2 translation, HCR, CPTR, VBAR, CNTHCTL, MDCR, the GIC CPU interface, FPCR/FPSR) is in the kernel's own memory, cleaned to DRAM before the call; `ferros_x3_resume` puts it back and returns from the call. The hint is cleared at once after: a core left with a power-down hint dies at its next plain `wfi` with nothing saved. `diag idle deep on|off|c2|cpd`, `diag idle test` (one power-down of a sixteenth of a second).
+- **The keeper (on the same branch: it costs about 14 mW and pays only once c2 works)** (smp.rs, owner 2026-11-13: "how to safely keep keys when CPU is dead"): CPU1, an A510 at its cluster's floor, never powered down. It holds the ira and the wairua, so a core that powers down drops its copy (keys.rs `sleep_drop`, only while the keeper holds the current generation and checked it within the second) and asks again on its first use after; the keeper seals one for it in about a millisecond, and nothing of the keys rests in DRAM, sealed or not, while the others sleep. It wakes the kernel's core at its deadline (a powered-down core's timer stops with it: `local-timer-stop`), with SGI 4 (its doorbell; the run queue's SGI 1 stays off on it). It takes the killswitch's two key interrupts (GICD_IROUTER), so the switch answers whatever the other cores do. `diag idle keeper off|on` for its cost.
+
+### Measured (the 8a, 2026-11-13 afternoon)
+
+The kernel: forge 3088e298 (the clock governor, the radio agent's SPI routing) with this branch, by RAM reload; the person attested; dark, cable in with the charger cut. Draw from the current samples (every 4 s), drain from the gauge's RepSOC across the window (1/256 % a count; RepCap and QH moved by a scale this gauge's configuration sets, not 1 mAh a count, so they are not used).
+
+| radios | idle | window | draw | drain | kernel loop passes / interrupts a second |
+|---|---|---|---|---|---|
+| switched off (pref 15 = G#1F) | tickless | 1200 s | 968 mW | 6.96 %/h | 604 / 307 |
+| switched off | the old ticked loop | 300 s | 976 mW | 7.03 %/h | 1,652 / 512 |
+| on | tickless | 900 s | 704 mW | 5.22 %/h | 2,518 / 1,162 |
+| on | the old ticked loop | 300 s | 706 mW | 5.30 %/h | 3,875 / 1,156 |
+
+- **Switching the radios off costs power**: 968 mW against 704 with them on. The switch stops the modem's and WiFi's drivers but leaves their chips powered ("driver stopped, power left" in the flash log); a CP with no host driver never sleeps (VSYS_PWR_MODEM 119 mW against 91, the modem PMIC's feed up about 7 times). That is the owner's "50 % overnight with no radios on": 7 %/h is 56 % in eight hours. The cellular and WiFi switches need a real power-down, as Bluetooth, NFC and GPS have (radio work, given to the radio-driver agent).
+- **Tickless saves nothing measurable** (8 mW and 2 mW, within the windows' noise), though it cuts the kernel loop's passes by a third to two thirds: at the dark clocks a pass costs little next to the radios' and the SoC's floor. It stays (fewer wakes, no event stream while dark).
+- **The keeper's cost**: the little cluster's rail 58 mW with it up, 44 mW with it off (one sweep each, `diag idle keeper off|on`), about 14 mW; most of that rail is the cluster's shared logic either way.
+- The keeper takes the volume keys: GICD_IROUTER G#100, and a software-pended vol-down SPI was handled and cleared with the keeper up.
+
+### c2 is refused by EL3 (open)
+
+CPU_SUSPEND from ferros at EL2 comes back G#FFFF_FFFF_FFFF_FFFE (INVALID_PARAMETERS) every time, with nothing powered down: power_state G#10000 (zuma's and akita's c2, the DTs' `arm,psci-suspend-param`), G#1010000 (level 1), and even G#0 (standby, which takes no entry point); CPU_INFORM 1 or 2 (the write answered 0), PMU_INFORM0 1, workers up or off. PSCI 1.1, PSCI_FEATURES(CPU_SUSPEND) 0 (the original power_state format, platform-coordinated).
+Linux's identical calls work under the hv (HV.md: thousands of c2 resumes a minute), forwarded from EL2 by `forward_smc` with only the entry swapped for the hv's `_secondary`. Even standby is refused, so the power-down state is not the reason; the calls still carried ferros's entry and a non-zero context id (Linux passes 0, the hv forwards it unchanged) and a CPU_INFORM hint of 1. Next: context 0, the hint 0 for standby, and the hv's forwarded frame against ferros's. Deep idle and the keeper wait on the branch until then.
+
 ## 2026-11-12: heat
 
 The heat side of the power profile (the TMU zones, the hardware clock divider that took the X3 to 364 MHz under Mahere, the thermal policy and what 120 frames a second costs) is in THERMAL.md.
