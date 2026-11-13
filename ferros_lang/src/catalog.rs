@@ -548,6 +548,8 @@ messages! {
     ReleaseLook,
     /// Under the panel's channels and the release look: nothing there is kept past a reboot.
     UntilReboot,
+    /// The display's frame counter (frames a second and a frame's time, in the console's USB circle), a checkbox on the Developer page.
+    FrameCounter,
 
     // ---- the attest screen (payloads/ahau): its button ----
     /// The button that attests the typed handle (owner, 2026-11-10: "needs to say attest, not unlock. always attest").

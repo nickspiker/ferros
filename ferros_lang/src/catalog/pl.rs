@@ -325,6 +325,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PanelChannels => "kanały panelu",
         Msg::ReleaseLook => "wygląd wydania",
         Msg::UntilReboot => "do ponownego uruchomienia",
+        Msg::FrameCounter => "licznik klatek",
         // ---- the attest screen ----
         Msg::Attest => "poświadcz",
         Msg::Mint => "powołaj",

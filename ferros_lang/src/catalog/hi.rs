@@ -325,6 +325,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PanelChannels => "पैनल चैनल",
         Msg::ReleaseLook => "रिलीज़ रूप",
         Msg::UntilReboot => "रीबूट तक",
+        Msg::FrameCounter => "फ़्रेम गणक",
         // ---- the attest screen ----
         Msg::Attest => "अटेस्ट",
         Msg::Mint => "बनाओ",

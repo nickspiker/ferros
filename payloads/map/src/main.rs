@@ -799,6 +799,8 @@ enum Choice {
     Dither,
     /// The display's hit map in every fourth frame (Developer; display op 58).
     HitMap,
+    /// The display's frame counter in the console's USB circle (Developer; display op 72).
+    FrameCounter,
     /// One of the panel's channels on or off (Developer; display op 63): 0 red, 1 green, 2 blue.
     Channel(u8),
     /// The release look until a reboot (Developer; display op 64).
@@ -1330,6 +1332,9 @@ struct Map {
     dev: bool,
     /// Whether the display shows its hit map in every fourth frame (display op 58; development builds): the Developer page's checkbox and the two-finger swipe up from back and deck together switch it, and the display's answer is kept here.
     hit_view: bool,
+    /// Whether the display's frame counter is on (display op 72; owner, 2026-11-13: "can we get a fps counter?"): the Developer page's checkbox switches it, and the display's answer is kept here.
+    /// Off at every start, never stored, as the hit map's view.
+    frames_on: bool,
     /// The panel's channels as the display has them (display op 63; development builds): bit 0 red, 1 green, 2 blue, set = on; the Developer page's three checkboxes.
     channels: u8,
     /// The Fleet page as the identity service last answered: its state (payloads/fgtw: 0 no identity, 1 joining, 2 bound waiting for the key, 3 a member with the key, 4-7 looking up, 8 leaving), the approval words while leaving, the members (their device names, or key prefixes where there is none; which one is this device), and the remove row armed by its first tap.
@@ -4369,6 +4374,10 @@ impl Map {
                     }
                     row(self, b, &mut y, note, grey(), tr(Msg::UntilReboot), None);
                 }
+                // The frame counter (owner, 2026-11-13: "can we get a fps counter?"): the display's frames a second for what is in front and its time a frame, in the console's USB circle while checked (display op 72).
+                // On every build that has this page, off at every start, never stored, as the development views above.
+                let on = self.frames_on;
+                mark(self, b, &mut y, 50, tr(Msg::FrameCounter), on, Some(Choice::FrameCounter));
                 let sc = ferros_sys::pref(ferros_sys::PREF_SCOPE);
                 b.text(cx, y, note as u16, dim(), 1, tr(Msg::LightScope));
                 y += uu(2, 1);
@@ -4653,6 +4662,15 @@ impl Map {
         }
     }
 
+    /// The display's frame counter switched (display op 72, toggle), from the Developer page's checkbox: the display's answer kept for the checkbox, and said on the console.
+    fn frames_toggle(&mut self) {
+        let mut r = [0u8; 4];
+        if call(self.display, &[72, 2], &mut r) >= 2 && r[0] == 0 {
+            self.frames_on = r[1] == 1;
+            console(self.grants, if self.frames_on { b"map: frame counter on (the USB circle)\n" } else { b"map: frame counter off\n" });
+        }
+    }
+
     /// One of the panel's channels switched (display op 63; development builds), from the Developer page's checkboxes: `c` 0 red, 1 green, 2 blue; the display's answer kept for the checkboxes.
     fn channel_toggle(&mut self, c: u8) {
         let mut r = [0u8; 4];
@@ -4908,6 +4926,7 @@ impl Map {
                     Some(Choice::Theme(i)) => set(self, ferros_sys::PREF_THEME, i),
                     Some(Choice::Dither) => set(self, ferros_sys::PREF_DITHER, (ferros_sys::pref(ferros_sys::PREF_DITHER) != 1) as u8),
                     Some(Choice::HitMap) => self.hit_view_toggle(),
+                    Some(Choice::FrameCounter) => self.frames_toggle(),
                     Some(Choice::Channel(c)) => self.channel_toggle(c),
                     Some(Choice::ReleaseLook) => self.release_look(),
                     Some(Choice::Labels) => {
@@ -5352,6 +5371,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         armed: false,
         dev: false,
         hit_view: false,
+        frames_on: false,
         channels: 7,
         fleet: Fleet::new(),
         target: None,
@@ -5423,6 +5443,11 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if call(map.display, &[64, 0], &mut r) >= 2 && r[0] == 0 && r[1] == 1 {
             LOOK.store(false, Ordering::Relaxed);
         }
+    }
+    // The frame counter as the display has it (op 72, ask), on every build: a map started again finds it as it was left.
+    {
+        let mut r = [0u8; 4];
+        map.frames_on = call(map.display, &[72, 3], &mut r) >= 2 && r[0] == 0 && r[1] == 1;
     }
     let kept = map.load_places_near();
     t_start[3] = now();

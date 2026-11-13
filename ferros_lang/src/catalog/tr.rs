@@ -325,6 +325,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PanelChannels => "panel kanalları",
         Msg::ReleaseLook => "sürüm görünümü",
         Msg::UntilReboot => "yeniden başlatmaya kadar",
+        Msg::FrameCounter => "kare sayacı",
         // ---- the attest screen ----
         Msg::Attest => "tasdikle",
         Msg::Mint => "bas",
