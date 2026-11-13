@@ -110,7 +110,7 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         sleep_until(now() + f / 16);
     }
     say(&alloc::format!("sensors: A#{n} sensors after A#{} ms\n", (now() - t1) * 1000 / f));
-    usf::subscribe_gravity(GRAVITY_MS, false, &mut out);
+    usf::subscribe_gravity(GRAVITY_MS, false, t1, &mut out);
     let mut screen_off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
     usf::display_info(DISPLAY_DBV, !screen_off, DISPLAY_HZ, &mut out);
     if let Some(h) = usf::find("TMD3719 Proximity") {

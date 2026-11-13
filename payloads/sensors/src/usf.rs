@@ -768,17 +768,26 @@ pub fn subscribe(handle: u32, period_ms: u64, mode: u32, wake: bool, out: &mut S
     id
 }
 
-/// Subscribe to the Gravity sensor (handle 54 in this firmware; looked up by name if it moved) every `period_ms`.
-pub fn subscribe_gravity(period_ms: u64, wake: bool, out: &mut String) -> bool {
-    let is_gravity = |n: &Option<String>| n.as_deref().is_some_and(|n| n.starts_with("Gravity"));
-    let mut handle = 54;
-    if !is_gravity(&info(handle)) {
-        handle = (18..96).find(|&k| is_gravity(&info(k))).unwrap_or(0);
-        if handle == 0 {
-            out.push_str("usf: no Gravity sensor\n");
+/// Subscribe to the fused Gravity sensor every `period_ms`, found by its name ("Gravity Sensor": handle 54 on husky, 46 on akita).
+/// The AoC lists its fused sensors after the parts they are made of, so the first sensors listed need not include it: the name is looked for again every 1/16 s, for up to 4 s from the registry's load, and how long it took is said.
+/// Before this (2026-11-12) one look right after the first sensors appeared could miss it by milliseconds (akita: 22 listed as the look began, 40 by the time Gravity was found), and a boot that missed it ran without gravity: the clock's face kept the map's own turn and never followed the device.
+pub fn subscribe_gravity(period_ms: u64, wake: bool, since: u64, out: &mut String) -> bool {
+    let f = freq();
+    let mut looks = 0u32;
+    // How many sensors the AoC listed as the first look began (measuring the race above).
+    let listed = sensor_count().unwrap_or(0);
+    let handle = loop {
+        looks += 1;
+        if let Some(h) = find("Gravity") {
+            break h;
+        }
+        if now() - since > 4 * f {
+            let _ = writeln!(out, "usf: no Gravity sensor listed in 4 s (A#{looks} looks); the clock has no gravity this boot");
             return false;
         }
-    }
+        ferros_sys::sleep_until(now() + f / 16);
+    };
+    let _ = writeln!(out, "usf: Gravity at handle A#{handle}, found on look A#{looks}, A#{} ms after the registry's load; A#{listed} sensors listed as the first look began, A#{} now", (now() - since) * 1000 / f, sensor_count().unwrap_or(0));
     subscribe(handle, period_ms, 1, wake, out) != 0
 }
 
