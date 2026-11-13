@@ -2210,6 +2210,9 @@ impl Ahau {
             Mode::Grey(_) => tx(Msg::NoAnswerYet),
             Mode::Wrong => tx(Msg::RecordMismatch),
             Mode::Owned => fl(Fleet::OwnedByOther),
+            // The People page's add (docs/FACETS.md "People"): their handle, then the name the person gives them.
+            Mode::Words(2) => tx(Msg::TypeTheirHandle),
+            Mode::Words(3) => tx(Msg::WhatDoYouCallThem),
             Mode::Words(_) => fl(Fleet::TypeWords),
             Mode::Hosting | Mode::Keys => Line::new(),
             // The network page writes its own lines (`net_status`).
@@ -2478,12 +2481,11 @@ impl Ahau {
         loop {
             ferros_sys::pet();
             let keys = KEYS_WANT.load(core::sync::atomic::Ordering::Acquire);
-            // The words wanted (0 while the system keyboard is up).
-            let mut kind = 0;
+            // The words wanted (none asked while the system keyboard is up).
             if keys & 1 == 1 {
                 self.keys_up();
             } else {
-                kind = self.words_wanted();
+                let kind = self.words_wanted();
                 if kind == 0 {
                     // Asleep until the keyboard is wanted (its doorbell) or the identity service is asked again (four times a second, as before the keyboard).
                     ferros_sys::wait_world(&KEYS_WANT, keys, now() + freq() / 4);
@@ -2494,7 +2496,7 @@ impl Ahau {
                 self.retint();
                 self.all();
                 self.show();
-                console(self.grants, b"ahau: words wanted: a new device's\n");
+                console(self.grants, if kind == 1 { b"ahau: words wanted: a new device's\n".as_slice() } else { b"ahau: words wanted: a person's handle (the People page)\n" });
             }
             let mut polls = 0u32;
             while matches!(self.mode, Mode::Words(_) | Mode::Keys) {
@@ -2569,7 +2571,7 @@ impl Ahau {
                 }
                 // The identity service no longer wants them (matched on its side, the Fleet page closed the flow, the departure gone): the screen goes.
                 polls += 1;
-                if polls % 64 == 0 && matches!(self.mode, Mode::Words(_)) && self.words_wanted() != kind {
+                if polls % 64 == 0 && matches!(self.mode, Mode::Words(k) if self.words_wanted() != k) {
                     self.end_words(false);
                 }
                 if matches!(self.mode, Mode::Words(_) | Mode::Keys) && (no > 0 || self.follow_layout()) {
@@ -2584,8 +2586,8 @@ impl Ahau {
     fn words_wanted(&self) -> u8 {
         let mut o = [0u8; 4];
         let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[16], &mut o);
-        // Only a newcomer's words (1): a departure takes no words since 2026-11-10 (owner: Approve or Deny).
-        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] > 1 { 0 } else { o[0] }
+        // A newcomer's words (1), a person's handle (2) and the name the person gives them (3): a departure takes no words since 2026-11-10 (owner: Approve or Deny).
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] > 3 { 0 } else { o[0] }
     }
 
     /// The words as typed to the identity service: a newcomer's, matched at every stroke (fgtw op 11, the live matcher). The answer on the status line; a match ends the words.
@@ -2626,6 +2628,65 @@ impl Ahau {
             }
         };
         self.status(l.as_str());
+    }
+
+    /// Enter on the People page's add (docs/FACETS.md "People"; photon identity-profile.md "type it once, derive, pin, drop"). Their handle (kind 2): its identity seed and the memory-hard proof computed here, where the proof's scratch is (the identity service's heap is far smaller), both handed to the identity service (fgtw op 30), which pins the identity key the seed gives and looks them up; the text, the seed and the proof wiped at once, never kept or written anywhere. Then the name the person gives them (kind 3, fgtw op 31), and the keyboard goes. The outcome is the People page's.
+    fn person_enter(&mut self) {
+        let Mode::Words(kind) = self.mode else { return };
+        if kind == 3 {
+            let mut m = [0u8; 1 + TEXT_BYTES];
+            m[0] = 31;
+            m[1..1 + self.len].copy_from_slice(&self.handle[..self.len]);
+            let mut o = [0u8; 4];
+            let _ = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &m[..1 + self.len], &mut o);
+            self.end_words(false);
+            return;
+        }
+        if self.len == 0 {
+            return;
+        }
+        let Ok(mut seed) = core::str::from_utf8(&self.handle[..self.len]).map_err(|_| ()).and_then(|h| ahau_core::identity_seed(h).map_err(|_| ())) else {
+            self.status(tx(ferros_lang::Msg::NobodyHasHandle).as_str());
+            return;
+        };
+        self.wipe();
+        self.status(tx(ferros_lang::Msg::ComputingKeys).as_str());
+        self.entry();
+        self.show();
+        // Let the display put the status up before the proof holds the core.
+        sleep_until(now() + freq() / 30);
+        ferros_sys::pin(ferros_sys::CORES_BIG);
+        sleep_until(now() + freq() / 1000);
+        // The heap is the proof's while it runs, as at attest (HEAP_USE).
+        while HEAP_USE.compare_exchange(0, 2, core::sync::atomic::Ordering::Acquire, core::sync::atomic::Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        let proof = *ihi::handle_proof(&blake3::Hash::from(seed)).as_bytes();
+        HEAP_USE.store(0, core::sync::atomic::Ordering::Release);
+        ferros_sys::pin(0);
+        let mut m = [0u8; 65];
+        m[0] = 30;
+        m[1..33].copy_from_slice(&seed);
+        m[33..65].copy_from_slice(&proof);
+        for b in seed.iter_mut() {
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        let mut o = [0u8; 4];
+        let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &m, &mut o);
+        for b in m.iter_mut() {
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        console(self.grants, b"ahau: a person's handle handed to the identity service as its seed and proof; the text wiped\n");
+        // Taken: the name next, on the same keyboard. Refused, or the identity service gone: the keyboard goes, and the People page says why.
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 1 || o[0] != 0 || self.words_wanted() != 3 {
+            self.end_words(false);
+            return;
+        }
+        self.mode = Mode::Words(3);
+        self.wipe();
+        self.status(self.prompt().as_str());
+        self.entry();
+        self.show();
     }
 
     /// The words done: the screen goes, the text wiped; `cancel` tells the identity service they are no longer wanted (op 15 [0]).
@@ -2724,6 +2785,9 @@ impl Ahau {
 
     fn type_char(&mut self, c: char) {
         let limit = match self.mode {
+            // A person's handle as a handle is typed; the name the person gives them, a line.
+            Mode::Words(2) => MAX_CHARS,
+            Mode::Words(3) => 63,
             Mode::Words(_) => WORD_CHARS,
             // WPA2's longest passphrase.
             Mode::Pass => 63,
@@ -2768,6 +2832,11 @@ impl Ahau {
                 self.zero_text();
                 self.entry();
             }
+            // A person's handle or their name: enter hands it on (a handle with a newline in it cannot be added here; attest takes one).
+            Some(Event::Enter) if matches!(self.mode, Mode::Words(2 | 3)) => {
+                self.person_enter();
+                return;
+            }
             // Words: enter sends them as typed (they hold no newline).
             Some(Event::Enter) if matches!(self.mode, Mode::Words(_)) => {
                 self.send_words();
@@ -2787,8 +2856,8 @@ impl Ahau {
             }
             None => return,
         }
-        // Words: matched as they are typed (the newcomer's), the result on the status line.
-        if matches!(self.mode, Mode::Words(_)) {
+        // Words: matched as they are typed (the newcomer's), the result on the status line. A person's handle and name go only at enter.
+        if matches!(self.mode, Mode::Words(1)) {
             self.send_words();
             if !matches!(self.mode, Mode::Words(_)) {
                 return;

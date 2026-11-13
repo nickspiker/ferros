@@ -328,6 +328,138 @@ fn place(rs: &[i64], xs: &mut [i64], ys: &mut [i64]) {
 /// The longest device name the Fleet page keeps: two voca words (fgtw::pair::device_name_default) are at most 36 bytes.
 const NAME_BYTES: usize = 1 << 6;
 
+/// The most people the People page and a kist's card list (the identity service holds them all; past this many the page shows the first, a page of its own to scroll them is later).
+const PEOPLE_MAX: usize = 1 << 5;
+
+/// The person's people as the map knows them (docs/FACETS.md "People"): the People page (fgtw op 25: how the last add ended, then each person's handle proof and the name the person gave them), or one kist's card (op 27: all or chosen, and each person picked or not). Never a handle: the identity service has none.
+#[derive(Clone, Copy)]
+struct People {
+    /// The People page: how the last add ended (payloads/fgtw facets.rs `add`). A card: whether the kist knows all of them.
+    state: u8,
+    all: bool,
+    hp: [[u8; 32]; PEOPLE_MAX],
+    name: [[u8; NAME_BYTES]; PEOPLE_MAX],
+    name_n: [u8; PEOPLE_MAX],
+    picked: [bool; PEOPLE_MAX],
+    n: usize,
+    /// The kist a card's copy is of (developer, option); zeros for the People page's.
+    kist: [u8; 64],
+}
+
+impl People {
+    const fn new() -> Self {
+        People { state: 0, all: true, hp: [[0; 32]; PEOPLE_MAX], name: [[0; NAME_BYTES]; PEOPLE_MAX], name_n: [0; PEOPLE_MAX], picked: [false; PEOPLE_MAX], n: 0, kist: [0; 64] }
+    }
+
+    /// Read op 25's reply (`card` false) or op 27's (`card` true). WHY the checks: the counts and lengths are another process's words; a row that would run past what the reply holds ends the reading.
+    fn read(&mut self, r: &[u8], card: bool) {
+        self.n = 0;
+        if r.len() < 2 {
+            return;
+        }
+        if card {
+            self.all = r[0] != 0;
+        } else {
+            self.state = r[0];
+        }
+        let mut at = 2;
+        for i in 0..(r[1] as usize).min(PEOPLE_MAX) {
+            let head = 32 + card as usize;
+            if at + head + 1 > r.len() {
+                break;
+            }
+            self.hp[i].copy_from_slice(&r[at..at + 32]);
+            self.picked[i] = card && r[at + 32] != 0;
+            let len = r[at + head] as usize;
+            if len > NAME_BYTES || at + head + 1 + len > r.len() {
+                break;
+            }
+            self.name[i][..len].copy_from_slice(&r[at + head + 1..at + head + 1 + len]);
+            self.name_n[i] = len as u8;
+            at += head + 1 + len;
+            self.n = i + 1;
+        }
+    }
+
+    /// Person `i`'s name, or "no name".
+    fn shown(&self, i: usize) -> &str {
+        match core::str::from_utf8(&self.name[i][..self.name_n[i] as usize]) {
+            Ok(s) if !s.is_empty() => s,
+            _ => tr(Msg::NoName),
+        }
+    }
+}
+
+/// The reply buffer for ops 25 and 27: every row at its longest.
+const PEOPLE_REPLY: usize = 2 + PEOPLE_MAX * (32 + 1 + 1 + NAME_BYTES);
+
+/// A kist's card's people, as `people_thread` last read them (op 27), under a sequence count as the fleet's copy.
+static CARD_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static mut CARD_PEOPLE: People = People::new();
+
+/// One request for the identity service from the People page or a card (ops 15 [2], 26, 28, 29, and 27 to read a card), made on `people_thread` so the main loop never waits on the service: the bytes, and a count the main loop moves on with each new one.
+static PEOPLE_ASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static mut PEOPLE_REQ: [u8; 128] = [0; 128];
+static mut PEOPLE_REQ_N: usize = 0;
+
+/// Hand a request to `people_thread`.
+fn people_ask(m: &[u8]) {
+    use core::sync::atomic::Ordering;
+    unsafe {
+        (&mut *(&raw mut PEOPLE_REQ))[..m.len()].copy_from_slice(m);
+        PEOPLE_REQ_N = m.len();
+    }
+    let w = PEOPLE_ASK.fetch_add(1, Ordering::AcqRel) + 1;
+    ferros_sys::wake(&PEOPLE_ASK, w);
+}
+
+/// The People page's and the cards' requests, on a thread of their own (a call waits as long as the identity service's pass): asleep on PEOPLE_ASK between requests. A request that names a kist (27 to 29) is followed by that kist's people read again (op 27) and published for its card; the People page follows the service's doorbell (`fgtw_poller`).
+extern "C" fn people_thread(grants: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    let svc = cap(grants, S_FGTW);
+    let mut done = 0u64;
+    let mut r = [0u8; PEOPLE_REPLY];
+    loop {
+        let v = PEOPLE_ASK.load(Ordering::Acquire);
+        if v == done {
+            ferros_sys::wait_world(&PEOPLE_ASK, v, 0);
+            continue;
+        }
+        done = v;
+        let mut m = [0u8; 128];
+        let n = unsafe { PEOPLE_REQ_N };
+        m[..n].copy_from_slice(unsafe { &(&*(&raw const PEOPLE_REQ))[..n] });
+        if m[0] != 27 && ferros_sys::call_live(svc, &m[..n], &mut r[..4]) == ferros_sys::ERR {
+            console(grants, b"map: the identity service did not take a people request\n");
+        }
+        if (27..=29).contains(&m[0]) && n >= 65 {
+            let mut q = [27u8; 65];
+            q[1..].copy_from_slice(&m[1..65]);
+            let k = ferros_sys::call_live(svc, &q, &mut r);
+            let mut p = People::new();
+            if k != ferros_sys::ERR {
+                p.read(&r[..(k as usize).min(r.len())], true);
+            }
+            p.kist.copy_from_slice(&m[1..65]);
+            CARD_SEQ.fetch_add(1, Ordering::AcqRel);
+            unsafe { *(&raw mut CARD_PEOPLE) = p };
+            CARD_SEQ.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// The card's people as `people_thread` last published them: a copy, read again when it was mid-write.
+fn card_people() -> People {
+    use core::sync::atomic::Ordering;
+    loop {
+        let s0 = CARD_SEQ.load(Ordering::Acquire);
+        let v = unsafe { *(&raw const CARD_PEOPLE) };
+        if s0 & 1 == 0 && CARD_SEQ.load(Ordering::Acquire) == s0 {
+            return v;
+        }
+    }
+}
+
 /// The identity service as the map knows it (payloads/fgtw ops 1, 6, 9, 13 and 17), read by `fgtw_poller` each time the service's doorbell (op 21) rings, never on a timer; the main loop takes a copy (`fleet_take`). The page's own state (`confirm`, `leave_result`, `sent`, `left`) is the main loop's and survives each copy.
 #[derive(Clone, Copy)]
 struct Fleet {
@@ -380,11 +512,13 @@ struct Fleet {
     /// This device's own departure denied (fgtw op 13 [2]): the name of the device that denied it.
     denied_by: [u8; NAME_BYTES],
     denied_by_n: usize,
+    /// The person's people, for the People page (fgtw op 25).
+    people: People,
 }
 
 impl Fleet {
     const fn new() -> Self {
-        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, sel_name: [0; NAME_BYTES], sel_name_n: 0, sel_words: [0; 512], sel_words_n: 0, adding_name: [0; NAME_BYTES], adding_name_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0, denied_by: [0; NAME_BYTES], denied_by_n: 0, deck: None, space_gen: None, sent: false, left: [0; NAME_BYTES], left_n: 0 }
+        Fleet { state: None, words: [0; 64], words_n: 0, keys: [[0; 8]; 16], me: [false; 16], heard: [false; 16], names: [[0; NAME_BYTES]; 16], names_n: [0; 16], n: 0, confirm: false, leave_result: None, add: 0, cand_key: [[0; 8]; 8], cand_flags: [0; 8], cand_name: [[0; NAME_BYTES]; 8], cand_name_n: [0; 8], cands: 0, add_note: [0; 64], add_note_n: 0, sel_name: [0; NAME_BYTES], sel_name_n: 0, sel_words: [0; 512], sel_words_n: 0, adding_name: [0; NAME_BYTES], adding_name_n: 0, depart: None, depart_name: [0; NAME_BYTES], depart_name_n: 0, denied_by: [0; NAME_BYTES], denied_by_n: 0, deck: None, space_gen: None, sent: false, left: [0; NAME_BYTES], left_n: 0, people: People::new() }
     }
 
     /// A fresh copy from `fgtw_poller` taken in, the page's own state kept: the remove row's arming, the last request's answer, a departure sent and not yet under way, and a departure approved here that has now gone (said as left).
@@ -454,6 +588,12 @@ impl Fleet {
             self.n = cnt;
         }
         self.poll_add(svc);
+        // The person's people (op 25), for the People page.
+        let mut p = [0u8; PEOPLE_REPLY];
+        let k = ferros_sys::call_live(svc, &[25], &mut p);
+        if k != ferros_sys::ERR {
+            self.people.read(&p[..(k as usize).min(p.len())], false);
+        }
     }
 
     /// The add flow and a departure waiting (fgtw ops 9 and 13). WHY the checks: the counts and lengths are another process's words; a row or a name that would run past what the reply holds or a slot keeps ends the reading there.
@@ -823,6 +963,12 @@ enum Choice {
     Version,
     /// A neighbour page's title: one page that way.
     Page(i8),
+    /// The People page (docs/FACETS.md "People"): the add-a-person sheet (the keyboard asks for their handle, then a name; fgtw op 15 [2]), and a person's remove in two taps (its row; op 26).
+    PersonAdd,
+    PersonRemove(u8),
+    /// A kist's card, once it holds people: all of them (true) or the chosen (op 28), and a person picked or not (op 29); the kist by its place in the person's list.
+    PeopleAll(u8, bool),
+    PersonPick(u8, u8),
     /// The Fleet page's "remove this device": the first tap shows what goes with it, the second starts the departure.
     FleetRemove,
     /// The Fleet page's add flow (fgtw::sponsor through payloads/fgtw ops 8-15): open it, pick a device heard nearby (its row), type the newcomer's words (on the attest screen's keyboard, ahau), confirm a nearby pick turned green, close it.
@@ -891,7 +1037,7 @@ enum Choice {
 }
 
 /// The settings pages, the ring a swipe goes round (Photon's split, photon docs/settings-panel.md; owner, 2026-11-05: "I like the page scopes and your organization"); a page for each link after Connections (owner, 2026-11-07: a radio's numbers and config, reached from its console circle by a drag toward the centre, or from Connections). Developer is a page only on development builds, or once the twelve taps made it one. The torch after the battery (owner, 2026-11-11: its brightness, strobe, lit share and timeout; QUICK.md "Quick pages"), opened by a tap on its quick circle as well (a drag down from it, since 2026-11-12, is its level), as Appearance, the look's one page, is by a tap on the brightness ring. The clock after them (docs/RADIO-CONTROLS.md): its time, zone and sources. The language after the clock, as the zone's twin (SETTINGS.md). The Deck, first named Items (owner, 2026-11-12: "make sure it says items in settings, not kists"): everything on the deck as a circle, by kind, each row opening its card. These are the pages' keys (the code finds a page by them); what a person reads is `page_title`.
-const PAGES: [&str; 21] = ["appearance", "units", "keyboard", "security", "deck", "permissions", "fleet", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "torch", "clock", "language", "about", "developer"];
+const PAGES: [&str; 22] = ["appearance", "units", "keyboard", "security", "deck", "permissions", "fleet", "people", "power", "connections", "cellular", "WiFi", "Bluetooth", "NFC", "GPS", "USB", "battery", "torch", "clock", "language", "about", "developer"];
 /// Whether this is a development build (the display's own test, `FERROS_PRODUCTION` unset): Developer is always a page there.
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Whether it starts looking like one (the orange hairlines, as the display's): FERROS_RELEASE_LOOK set gives a development build the release look for screen captures (owner, 2026-11-10), its tools kept.
@@ -924,6 +1070,7 @@ fn page_title(key: &'static str) -> &'static str {
         "deck" => Msg::PageDeck,
         "permissions" => Msg::PagePermissions,
         "fleet" => Msg::PageFleet,
+        "people" => Msg::PagePeople,
         "power" => Msg::PagePower,
         "connections" => Msg::PageConnections,
         "cellular" => Msg::PageCellular,
@@ -1381,6 +1528,8 @@ struct Map {
     stower: stower::Stower,
     /// The Deck page's unstow armed on a kist or a puck, by its place in the person's list (the first tap of two, as "remove this device").
     unstow_armed: Option<u8>,
+    /// The People page's remove, armed by a first tap on that person's row.
+    person_armed: Option<u8>,
     /// The Deck page's card open, by the capsule of the kist or puck it is for (owner, 2026-11-12: a row opens its card, the one way to see a kist's info); None on the list. Gone with it when that thing is unstowed.
     card: Option<[u8; 32]>,
     /// The unstow sheet open on a kist's card, in the card's place (docs/KISTS.md "The unstow sheet"): what is kept and from where, as the person has it so far. Gone with the card.
@@ -3248,6 +3397,34 @@ impl Map {
                 mark(self, b, &mut y, 50, tr(if armed { Msg::AttestAtBootArmed } else { Msg::AttestAtBoot }), on, Some(Choice::UnlockAtBoot));
                 notes(b, &mut y, tr(Msg::AttestAtBootNote));
             }
+            "people" => {
+                // The person's people (docs/FACETS.md "People", D5): the people of their identity space, on every device of theirs; each with the name the person gave them and a remove in two taps; "add a person" opens the keyboard for their handle (shown as typed: a handle is not a password), then a name; how the last add ended under it. Nothing here shows a handle: none is kept.
+                let ps = self.fleet.people;
+                if ps.n == 0 {
+                    row(self, b, &mut y, small, grey(), tr(Msg::NoPeopleYet), None);
+                }
+                for i in 0..ps.n {
+                    row(self, b, &mut y, small, white(), ps.shown(i), None);
+                    y -= uu(1, 2);
+                    let armed = self.person_armed == Some(i as u8);
+                    button(self, b, &mut y, tr(if armed { Msg::TapAgainRemove } else { Msg::TagRemove }), armed, Some(Choice::PersonRemove(i as u8)));
+                }
+                y += uu(1, 2);
+                button(self, b, &mut y, tr(Msg::AddPerson), false, Some(Choice::PersonAdd));
+                let said = match ps.state {
+                    1 => Some(Msg::LookingThemUp),
+                    2 => Some(Msg::PersonAdded),
+                    3 => Some(Msg::NobodyHasHandle),
+                    4 => Some(Msg::CouldNotLookUp),
+                    5 => Some(Msg::RecordNotTheirs),
+                    6 => Some(Msg::ThatIsYou),
+                    _ => None,
+                };
+                if let Some(m) = said {
+                    row(self, b, &mut y, small, white(), tr(m), None);
+                }
+                notes(b, &mut y, tr(Msg::HandleNotKept));
+            }
             "fleet" => {
                 // The fleet this identity's devices make (payloads/fgtw): where this device stands, the members, and removing this device. Removing wipes the identity's things from it (AUTH.md: the identity class) and it restarts at the attest screen once a device of the fleet approves. Its words are fgtw's (fgtw::text), the same Photon shows, but for the deck's and what removing wipes here.
                 let f = self.fleet;
@@ -4210,6 +4387,21 @@ impl Map {
                         mark(self, b, &mut y, 50, l.as_str(), w.answer.is_some_and(|a| a.0), Some(Choice::Answer(ki as u8, j as u8)));
                         y -= uu(3, 4);
                         row(self, b, &mut y, note, dim(), &w.reason, None);
+                        // Its people, once granted (docs/FACETS.md "People": "all, or the ones you choose"): all of them, or the chosen, each of the person's people a checkbox; kept in the person's space, so every device knows the same choice. As the identity service last said (`people_thread`, asked when the card opened).
+                        if w.right == ferros_kist::PEOPLE && w.answer.is_some_and(|a| a.0) {
+                            let cp = card_people();
+                            if cp.kist[..32] == k.developer && cp.kist[32..] == k.option {
+                                radios(self, b, &mut y, &[tr(Msg::PeopleAll), tr(Msg::PeopleChosen)], (!cp.all) as usize, &|v| Choice::PeopleAll(ki as u8, v == 0));
+                                if !cp.all {
+                                    if cp.n == 0 {
+                                        row(self, b, &mut y, note, dim(), tr(Msg::NoPeopleYet), None);
+                                    }
+                                    for i in 0..cp.n {
+                                        mark(self, b, &mut y, 50, cp.shown(i), cp.picked[i], Some(Choice::PersonPick(ki as u8, i as u8)));
+                                    }
+                                }
+                            }
+                        }
                     }
                     y += uu(1, 2);
                     // Its actions. A restore or an unstow of it under way, or one that failed, first; while one is under way, no unstow.
@@ -5183,6 +5375,50 @@ impl Map {
                     Some(Choice::Card(k)) => {
                         self.card = self.kists.kists.get(k as usize).map(|kist| kist.capsule);
                         self.scroll = 0;
+                        // A kist that wants the person's people: its choice read for the card (`people_thread`).
+                        if let Some(kist) = self.kists.kists.get(k as usize).filter(|kist| kist.wants.iter().any(|w| w.right == ferros_kist::PEOPLE)) {
+                            let mut m = [27u8; 65];
+                            m[1..33].copy_from_slice(&kist.developer);
+                            m[33..].copy_from_slice(&kist.option);
+                            people_ask(&m);
+                        }
+                    }
+                    // The People page's add: the keyboard (the attest screen's, as the Fleet page's words) asks for their handle, then a name (fgtw op 15 [2]); how it ended comes back on the page.
+                    Some(Choice::PersonAdd) => {
+                        people_ask(&[15, 2]);
+                    }
+                    // A person removed in two taps: the first arms the row, the second asks the identity service (op 26), which removes them from every device of the person's.
+                    Some(Choice::PersonRemove(i)) => {
+                        let ps = self.fleet.people;
+                        if self.person_armed == Some(i) && (i as usize) < ps.n {
+                            self.person_armed = None;
+                            let mut m = [26u8; 33];
+                            m[1..].copy_from_slice(&ps.hp[i as usize]);
+                            people_ask(&m);
+                        } else {
+                            self.person_armed = Some(i);
+                        }
+                    }
+                    // A kist's people all or chosen (op 28), and a person picked for it or not (op 29); the card follows what the service then says.
+                    Some(Choice::PeopleAll(ki, all)) => {
+                        if let Some(kist) = self.kists.kists.get(ki as usize) {
+                            let mut m = [28u8; 66];
+                            m[1..33].copy_from_slice(&kist.developer);
+                            m[33..65].copy_from_slice(&kist.option);
+                            m[65] = all as u8;
+                            people_ask(&m);
+                        }
+                    }
+                    Some(Choice::PersonPick(ki, i)) => {
+                        let cp = card_people();
+                        if let Some(kist) = self.kists.kists.get(ki as usize).filter(|_| (i as usize) < cp.n) {
+                            let mut m = [29u8; 98];
+                            m[1..33].copy_from_slice(&kist.developer);
+                            m[33..65].copy_from_slice(&kist.option);
+                            m[65..97].copy_from_slice(&cp.hp[i as usize]);
+                            m[97] = !cp.picked[i as usize] as u8;
+                            people_ask(&m);
+                        }
                     }
                     Some(Choice::CardBack) => {
                         self.card = None;
@@ -5389,6 +5625,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         tag_said: 0,
         tag_adds: 0,
         unstow_armed: None,
+        person_armed: None,
         card: None,
         sheet: None,
         sheet_size: None,
@@ -5632,11 +5869,14 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut last_ignored = 0u16;
     let mut push_us = 0u64;
     // The identity service's answers come from a thread of their own (`fgtw_poller`): the main loop never waits on fgtw.
-    static mut POLL_STACK: [u8; 1 << 14] = [0; 1 << 14];
+    static mut POLL_STACK: [u8; 1 << 15] = [0; 1 << 15];
     ferros_sys::thread_spawn(fgtw_poller, unsafe { &mut *(&raw mut POLL_STACK) }, grants);
     // The add flow following the Fleet page (`fleet_page_thread`).
     static mut PAGE_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(fleet_page_thread, unsafe { &mut *(&raw mut PAGE_STACK) }, grants);
+    // The People page's and the cards' requests to the identity service (`people_thread`).
+    static mut PEOPLE_STACK: [u8; 1 << 14] = [0; 1 << 14];
+    ferros_sys::thread_spawn(people_thread, unsafe { &mut *(&raw mut PEOPLE_STACK) }, grants);
     // The stower's doorbell (payloads/kists), for the Deck page: on a thread of its own, never on a timer.
     static mut STOWER_STACK: [u8; 1 << 14] = [0; 1 << 14];
     ferros_sys::thread_spawn(stower::watch, unsafe { &mut *(&raw mut STOWER_STACK) }, grants);
