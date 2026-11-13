@@ -31,19 +31,25 @@ echo "== image: $W/boot_b_hv.img ($(stat -c %s $W/boot_b_hv.img) bytes)"
 # The gate image with its own AVB footer, as the whole partition (mkimg avb-footer): bare, it would leave Google's footer at the partition's end pointing at G#FD_C000, inside this image, and ABL refuses the slot ("invalid vbmeta header", 2026-11-06).
 $MKIMG avb-footer --key /mnt/Harbor/Code/keys/avb.vsf --google-boot $BACKUP --image $W/boot_b_hv.img -o $W/boot_b_hv_part.img
 [ $FLASH = 1 ] || { echo "not flashing (add --flash)"; exit 0; }
+# Which ferros device is the 8a: with the Pro on the same bus behind a hub (2026-11-12), "a ferros device" matched it too, and the line below rebooted whichever came first into fastboot. FERROS_PORT (the sysfs name, e.g. 1-2.4) names the 8a's socket; without it, two ferros devices on the host refuse to go on.
+ferros_here() {
+    if [ -n "${FERROS_PORT:-}" ]; then [ "$(cat /sys/bus/usb/devices/$FERROS_PORT/idProduct 2>/dev/null)" = 4665 ]; return; fi
+    [ "$(lsusb -d 1209:4665 2>/dev/null | wc -l)" -ge 1 ]
+}
+if [ -z "${FERROS_PORT:-}" ] && [ "$(lsusb -d 1209:4665 2>/dev/null | wc -l)" -gt 1 ]; then echo "two ferros devices on the host: set FERROS_PORT to the 8a's socket (lsusb -t; e.g. 1-2.4)"; exit 1; fi
 # To fastboot from wherever the 8a is.
-if lsusb -d 1209:4665 >/dev/null 2>&1; then timeout 60 target/debug/ferros-bridge reboot fastboot >/dev/null 2>&1 || true
+if ferros_here; then timeout 60 target/debug/ferros-bridge reboot fastboot >/dev/null 2>&1 || true
 elif adb devices | grep -q "^$S"; then adb -s $S reboot bootloader || true; fi
 for i in $(seq 90); do command fastboot devices | grep -q "$S" && break; sleep 2; done
 command fastboot devices | grep -q "$S" || { echo "no fastboot"; exit 1; }
 [ "${SKIP_PKVM_CHECK:-0}" = 1 ] || if fastboot oem pkvm status 2>&1 | grep -q "pKVM is enabled"; then fastboot oem pkvm disable 2>&1 | grep -i pkvm || true; fi
-fastboot flash boot_b $W/boot_b_hv_part.img 2>&1 | tail -1
-fastboot --set-active=b 2>&1 | tail -1
-fastboot reboot >/dev/null 2>&1
+fastboot -s "$S" flash boot_b $W/boot_b_hv_part.img 2>&1 | tail -1
+fastboot -s "$S" --set-active=b 2>&1 | tail -1
+fastboot -s "$S" reboot >/dev/null 2>&1
 echo "== slot b under the hv: waiting for ferros (the gate's dev timer) or Android"
 sleep 6
 for i in $(seq 60); do
-    if lsusb -d 1209:4665 >/dev/null 2>&1; then echo "== FERROS on USB after $((i * 2 + 6)) s (the gate chose ferros)"; exit 0; fi
+    if ferros_here; then echo "== FERROS on USB after $((i * 2 + 6)) s (the gate chose ferros)"; exit 0; fi
     if adb devices | grep -q "^$S.*device$"; then echo "== ANDROID on adb after $((i * 2 + 6)) s"; exit 0; fi
     if command fastboot devices | grep -q "$S"; then echo "== back in fastboot after $((i * 2 + 6)) s (slot b did not boot)"; exit 1; fi
     sleep 2
