@@ -319,3 +319,101 @@ fn params_bind_into_one_kernel() {
     }
     println!("params: {} words, {loads} loads", k.words.len());
 }
+
+/// abs of an f16 half widened to f32, both halves of the word: negative and positive, both zeros, an f16 subnormal, the largest f16, and a lane beside a different one (Mahere's labels, 2026-11-13: |−0.03| widened came out 4.8e-15, the whole 32-bit word read as an f32).
+#[test]
+fn abs_of_a_widened_half() {
+    use valhall::ssa::{self, H};
+    let _turn = RECORDING.lock().unwrap();
+    const TABLE: u64 = OUT + (1 << 12);
+    // Each word two f16s, lane 0 low; the subnormals are 2^-20 (G#10) and the smallest, 2^-24 (G#1).
+    let halves: [(u16, u16); 8] = [
+        (f32_to_f16(-0.03), f32_to_f16(0.03)),
+        (f32_to_f16(0.03), f32_to_f16(-0.03)),
+        (0x0000, 0x8000),
+        (0x8000, 0x0000),
+        (0x8010, 0x0010),
+        (0x0001, 0x8001),
+        (f32_to_f16(-65504.), f32_to_f16(1.5)),
+        (f32_to_f16(2.), f32_to_f16(-0.5)),
+    ];
+    ssa::begin();
+    let g = ssa::gid();
+    let h = H::from_bits(ssa::load(1, g, 2, 0));
+    ssa::store(0, 3, 0, h.lo_f().abs().to_bits());
+    ssa::store(0, 3, 4, h.hi_f().abs().to_bits());
+    let comp = ssa::compile();
+    // Each abs one FMAX.f32 (G#A4, opcode2 3) of the half and its negation: both sources widened from the same half (28:29 and 26:27, H0 = 1, H1 = 2, va_pack.c), the second negated (36), neither abs (39, 37).
+    let maxes: Vec<u64> = comp.words.iter().copied().filter(|w| (w >> 48) & 0x1FF == 0x0A4 && (w >> 16) & 0xF == 3).collect();
+    assert_eq!(maxes.len(), 2, "{:?}", comp.kinds);
+    for w in &maxes {
+        let (w0, w1) = ((w >> 28) & 3, (w >> 26) & 3);
+        assert!(w0 != 0 && w0 == w1, "an abs's FMAX G#{w:016X}: widens {w0} and {w1}");
+        assert_eq!((w >> 36) & 0xF, 1, "an abs's FMAX G#{w:016X}: the negate and abs bits");
+    }
+    assert_eq!(maxes.iter().map(|w| (w >> 28) & 3).fold(0, |a, b| a | 1 << b), 0b110, "the two lanes' FMAX read H0 and H1");
+    let mut uniforms = vec![OUT, TABLE];
+    uniforms.extend_from_slice(&comp.consts);
+    let mut bytes = vec![0u8; 1 << 12];
+    bytes.extend(halves.iter().flat_map(|&(lo, hi)| (lo as u32 | (hi as u32) << 16).to_le_bytes()));
+    let mut mem = Memory { base: OUT, bytes };
+    for g in 0..halves.len() as u32 {
+        run(&comp.words, &uniforms, [g, 0], &mut mem);
+    }
+    for (g, &(lo, hi)) in halves.iter().enumerate() {
+        for (k, half) in [lo, hi].into_iter().enumerate() {
+            let want = f16_to_f32(half).abs();
+            let got = f32::from_bits(mem.read32(OUT + 8 * g as u64 + 4 * k as u64));
+            assert_eq!(got.to_bits(), want.to_bits(), "word {g}, lane {k}: |{}| came out {got}", f16_to_f32(half));
+        }
+    }
+}
+
+/// A negation read thru another keeps what was folded into it first: -(-y) is y, -(h.hi()) is the high half negated in both lanes (read by a v2f16 operation, and widened by an f32 one), and -(-h2) is h2 per lane.
+/// Each of these read the negation's source bare before 2026-11-13 (the same fault as the widened abs above).
+#[test]
+fn negations_keep_their_modifiers() {
+    use valhall::ssa::{self, F, H};
+    let _turn = RECORDING.lock().unwrap();
+    const TABLE: u64 = OUT + (1 << 12);
+    // Each row: two f32s, then two words of f16 pairs (lane 0 low).
+    let rows: [(f32, f32, [f32; 2], [f32; 2]); 4] = [(1.5, 0.25, [0.5, -3.], [2., 0.125]), (-7., 2., [-0.75, 1.25], [-1., 4.]), (0.03, -0.03, [8., 0.0625], [0.5, -0.5]), (100., 1e-3, [-2., -6.], [3., 1.])];
+    ssa::begin();
+    let g = ssa::gid();
+    let x = F::from_bits(ssa::load(1, g, 4, 0));
+    let y = F::from_bits(ssa::load(1, g, 4, 4));
+    let h = H::from_bits(ssa::load(1, g, 4, 8));
+    let h2 = H::from_bits(ssa::load(1, g, 4, 12));
+    let a = x + -(-y);
+    let b = h * -(h.hi());
+    let c = (-(h.hi())).lo_f() + x;
+    let d = (-h).hi_f() + x;
+    let e = h + -(-h2);
+    // A subtraction is an add of a negation: this one read the whole word for the half.
+    let f = x - h.lo_f();
+    for (k, v) in [a.to_bits(), b.to_bits(), c.to_bits(), d.to_bits(), e.to_bits(), f.to_bits()].into_iter().enumerate() {
+        ssa::store(0, 5, 4 * k as i16, v);
+    }
+    let comp = ssa::compile();
+    let mut uniforms = vec![OUT, TABLE];
+    uniforms.extend_from_slice(&comp.consts);
+    let pair = |l: [f32; 2]| f32_to_f16(l[0]) as u32 | (f32_to_f16(l[1]) as u32) << 16;
+    let mut bytes = vec![0u8; 1 << 12];
+    bytes.extend(rows.iter().flat_map(|r| [r.0.to_bits(), r.1.to_bits(), pair(r.2), pair(r.3)]).flat_map(|w| w.to_le_bytes()));
+    let mut mem = Memory { base: OUT, bytes };
+    for g in 0..rows.len() as u32 {
+        run(&comp.words, &uniforms, [g, 0], &mut mem);
+    }
+    let lanes = |w: u32| [f16_to_f32(w as u16), f16_to_f32((w >> 16) as u16)];
+    for (g, r) in rows.iter().enumerate() {
+        let (x, y) = (r.0, r.1);
+        let (hl, h2l) = (lanes(pair(r.2)), lanes(pair(r.3)));
+        let at = |k: u64| mem.read32(OUT + 32 * g as u64 + 4 * k);
+        assert_eq!(f32::from_bits(at(0)), x + y, "row {g}: x + -(-y)");
+        assert_eq!(lanes(at(1)), [h16(hl[0] as f64 * -hl[1] as f64), h16(hl[1] as f64 * -hl[1] as f64)], "row {g}: h * -(h.hi())");
+        assert_eq!(f32::from_bits(at(2)), -hl[1] + x, "row {g}: (-(h.hi())).lo_f() + x");
+        assert_eq!(f32::from_bits(at(3)), -hl[1] + x, "row {g}: (-h).hi_f() + x");
+        assert_eq!(lanes(at(4)), [h16(hl[0] as f64 + h2l[0] as f64), h16(hl[1] as f64 + h2l[1] as f64)], "row {g}: h + -(-h2)");
+        assert_eq!(f32::from_bits(at(5)), x - hl[0], "row {g}: x - h.lo_f()");
+    }
+}

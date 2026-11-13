@@ -1035,6 +1035,23 @@ enum Kind {
     F16,
 }
 
+/// Which half of its source a v2f16 swizzle feeds into lane 1 (`lane1`) or lane 0: true for the high half (Swz16's value holds lane 0's half in bit 0 and lane 1's in bit 1).
+fn lane_half(s: Swz16, lane1: bool) -> bool {
+    (s as u8) >> (lane1 as u8) & 1 == 1
+}
+
+/// The swizzle that reads `outer`'s lanes of a value that is `inner`'s lanes of a source: one swizzle on the source.
+fn swz_then(outer: Swz16, inner: Swz16) -> Swz16 {
+    let l0 = lane_half(inner, lane_half(outer, false));
+    let l1 = lane_half(inner, lane_half(outer, true));
+    match (l0, l1) {
+        (false, false) => Swz16::H00,
+        (true, false) => Swz16::H10,
+        (false, true) => Swz16::H01,
+        (true, true) => Swz16::H11,
+    }
+}
+
 fn kind(op: &Op) -> (Kind, [u32; 3], usize) {
     use Op::*;
     match *op {
@@ -1104,10 +1121,13 @@ fn compile_rec(rec: Rec) -> Compiled {
         for p in 0..ns {
             loop {
                 let s = srcs[p] as usize;
+                // A negation folded here was itself folded first (a source comes before its reader), so its own modifiers on its source are part of what it reads: its negation, its widen, its swizzle.
+                // 2026-11-13: dropping them read |x| of a widened f16 half as the whole word (abs is max(x, -x), and -x's widen was lost), and -(-x) as -x.
                 match (kd, work[s]) {
-                    (Kind::F32 { .. }, Op::FNeg(x)) if wid[i][p] == Widen::None => {
+                    (Kind::F32 { widen }, Op::FNeg(x)) if wid[i][p] == Widen::None && (widen || wid[s][0] == Widen::None) => {
                         srcs[p] = x;
-                        negmask[i] ^= 1 << p;
+                        negmask[i] ^= (1 ^ (negmask[s] & 1)) << p;
+                        wid[i][p] = wid[s][0];
                     }
                     (Kind::F32 { widen: true }, Op::HWiden(h, hi)) if wid[i][p] == Widen::None => {
                         srcs[p] = h;
@@ -1116,7 +1136,8 @@ fn compile_rec(rec: Rec) -> Compiled {
                     // Inside a widen the source is a v2f16: its negation is the f32's, and a broadcast picks which half the widen reads.
                     (Kind::F32 { .. }, Op::HNeg(x)) if wid[i][p] != Widen::None => {
                         srcs[p] = x;
-                        negmask[i] ^= 1 << p;
+                        negmask[i] ^= (1 ^ (negmask[s] & 1)) << p;
+                        wid[i][p] = if lane_half(swz[s][0], wid[i][p] == Widen::H1) { Widen::H1 } else { Widen::H0 };
                     }
                     (Kind::F32 { .. }, Op::HBroadcast(x, hi)) if wid[i][p] != Widen::None => {
                         srcs[p] = x;
@@ -1124,7 +1145,8 @@ fn compile_rec(rec: Rec) -> Compiled {
                     }
                     (Kind::F16, Op::HNeg(x)) => {
                         srcs[p] = x;
-                        negmask[i] ^= 1 << p;
+                        negmask[i] ^= (1 ^ (negmask[s] & 1)) << p;
+                        swz[i][p] = swz_then(swz[i][p], swz[s][0]);
                     }
                     // A broadcast of a broadcast reads the inner one's half.
                     (Kind::F16, Op::HBroadcast(x, hi)) => {
