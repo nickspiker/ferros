@@ -3,7 +3,7 @@
 //! The kernel keeps the AoC's start — its rails, the firmware through GSA and Trusty: secure-world calls it makes on the `sensors` switch's word (decision 2, 2026-11-01: no FF-A door for EL0). This process turns the switch on, waits for the AoC to come online, then holds the whole conversation: the kernel has no USF of its own. Should it end, init's keeper starts another.
 //!
 //! Spawn: ferros-bridge spawn sensors.bin --name sensors --dma aoc-ipc --hw aoc-mbox --store aoc --sensors --power sensors
-//! Grant slots: 0 console, 1 the AoC's IPC block (`aoc-ipc`), 2 its mailboxes (`aoc-mbox`), 3 the vault scope `aoc.` (the registry scripts), 4 the Sensors right (publish), 5 the `sensors` power switch.
+//! Grant slots: 0 console, 1 the AoC's IPC block (`aoc-ipc`), 2 its mailboxes (`aoc-mbox`), 3 the vault scope `aoc.` (the registry scripts), 4 the Sensors right (publish), 5 the `sensors` power switch, 6 the AoC's a32 mailbox line (`aoc-mbox-a32`: the kernel adds it after the Sensors right's holder's last slot, as it adds pcie1's line).
 #![no_std]
 #![no_main]
 
@@ -19,6 +19,8 @@ pub const S_MBOX: u64 = 2;
 pub const S_STORE: u64 = 3;
 pub const S_SENSORS: u64 = 4;
 pub const S_POWER: u64 = 5;
+/// The AoC's a32 mailbox line, which the kernel hands with the Sensors right (process.rs): com.google.usf's doorbell.
+pub const S_DOORBELL: u64 = 6;
 
 global_asm!(
     r#"
@@ -129,6 +131,8 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
+        // The doorbell's count before the drain: a ring that lands while this pass runs ends the wait below at once.
+        let seen = usf::RUNG.load(core::sync::atomic::Ordering::Acquire);
         usf::drain(None);
         usf::publish();
         // The display's state follows the screen (the under-display sensor times its bursts to the panel), and the light scope follows its preference: both the kernel's to watch before the move.
@@ -146,8 +150,8 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             say(&out);
             out.clear();
         }
-        // The flicker stream sends about a hundred small messages a second into a 256-slot ring: every 2 ms is far inside it.
-        sleep_until(now() + f / 512);
+        // Asleep until the AoC rings (a message on either usf ring) or a preference changes (the kernel wakes every word waiter on one, process.rs `set_pref`): no timer (owner, 2026-11-10: push or doorbell). Before 2026-11-12 the loop woke every 2 ms to look, some 500 wakes a second whether or not anything came.
+        usf::wait_ring(seen, 0);
     }
 }
 
