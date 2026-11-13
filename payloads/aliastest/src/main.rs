@@ -8,9 +8,11 @@
 const PRINT_CONTEXT: &str = "ferros 2026-11-12 aliastest fingerprint";
 
 #[unsafe(no_mangle)]
-pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
+pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    match ferros_sys::alias(ferros_sys::cap(grants, ferros_sys::kist::IRA)) {
+    // Launched as a kist its Ira grant is in its slot (`kist::IRA`); spawned from the bridge as a plain process, the input's first byte names the slot its `--ira` grant landed in.
+    let slot = if input_len > 0 { (unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) }) as u64 } else { ferros_sys::kist::IRA };
+    match ferros_sys::alias(ferros_sys::cap(grants, slot)) {
         Some(mut a) => {
             let mut fp = blake3::derive_key(PRINT_CONTEXT, &a);
             a.fill(0);
