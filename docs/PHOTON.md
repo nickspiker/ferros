@@ -205,7 +205,22 @@ From then on records the person publishes (the profile, the avatar wall, their s
 - **std/photon**: its main asks the kernel for the alias and the identity service for the handle proof and the binding, and hands them in; Photon's capsule wants be you and people (its words in KISTS.md "The permission list").
 - **Nothing to move on ferros devices**: whatever Photon kept there is development data, as with the device key above.
 
-### Decisions for the owner
+### Decisions
+
+**Delegated** (owner, 2026-11-12: "use your best judgement"), decided by Claude, each open to the owner's change (FACETS.md "Decisions" has the reasoning):
+
+- **M0. The person key** (FACETS.md D0).
+- **M1. Fixed**: Photon's alias derives from its kist identity as first stowed, a constant on every platform, kept thru any move of the release key.
+- **M2. Keep the pinned identity key** as Photon's identifier for a person: no flag day, no friendship made again.
+- **M3. Vouched by the alias's device list**, not members of the fleet.
+- **M4. As proposed**: contacts stop taking a person's photons the old way once every device of that person's fleet is in the list.
+- **M5. A new fgtw.org slot** for the alias-sealed copy, the fleet-key copy retired at the cutover. Nothing is deployed to fgtw.org without the owner.
+- **M6. Logs keyed from the handle, as today**: a maintainer handed a handle finds that person's logs. Under the owner's threat model being found is not the harm, and support that works is worth more.
+- **M7. Removed after a census**, as the rule for text encodings has it (AGENT.md: "never keep a compatibility reader"): the old way's reader goes once the census shows nobody speaks it.
+
+**Order of work**: the person key and the kernel's alias call on ferros first (FACETS.md "To build" 0 to 2); Photon's migration is a Photon project done on every platform at once, after.
+
+### The proposals as they were put
 
 - **M0. The root** (FACETS.md D0): the identity seed, or the person key. Either way Photon on the desktop and Android derives its alias itself: from the session's seed, or from the person key its FGTW part opens with the fleet key.
 - **M1. Photon's kist identity, fixed**: the alias derivation names Photon's developer key and option as first stowed, as a constant on every platform, and keeps it if the release key ever moves (KISTS.md "Gap: custody moving").

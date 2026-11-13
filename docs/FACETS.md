@@ -239,7 +239,24 @@ The facets are a wall on ferros and a convention elsewhere; Photon keeping to it
 4. **The map**: the sheets (address, person, where I am), the people and places pages, and each kist's card rows (KISTS.md).
 5. **Photon**: PHOTON.md's migration.
 
-## Decisions for the owner
+## Decisions
+
+**Delegated** (owner, 2026-11-12: "We can discuss the security issues with handles and decide how to split it. use your best judgement."). Decided by Claude on that delegation, each open to the owner's change; the reasoning is the owner's threat model ("Claude memories/threat_model_harm_not_observation.md": design against harm and forgery, not against being watched).
+
+- **D0. The person key.** Aliases derive from 32 random bytes minted at the identity's genesis (for an existing identity, by its first device that runs this), kept by the fleet under the fleet key, never from the handle. The deciding reason is forgery, not privacy: under the identity seed anyone who ever typed the handle could sign as the person's alias in any kist, which is harm; the cost is one more secret the fleet already knows how to carry.
+- **D1. The kernel derives.** The owner's rule of 2026-11-07 stands: only the kernel issues keys. The identity service hands the person key to the kernel at unlock (Unlock right only) and the kernel wipes it at lock; a kist asks for its alias beside `SYS_IRA`, stamped by its gate identity.
+- **D2. Accepted**: the alias and language, number base and time zone are implicit.
+- **D3. Accepted** as written: "be you in Photon: your contacts find and recognise you there", a binding that vouches an alias in its kist and nothing more.
+- **D4. Accepted**: pick, don't share, with the four sheets.
+- **D5. Accepted**: the person's people live in the identity space, and a person is added only thru the system's sheet. Photon's contact list moves there on ferros with the migration, not before.
+- **D6. The never list: items 0 to 4 kept** (other kists, the fleet, the identity's root, other kists' data, device identifiers): each is a lever for a swap or a forgery. **Items 5 and 6 kept for now but marked soft**: they guard against observation more than harm, so a kist that shows a real need may be given a coarse word or a fact as an asked right later.
+- **D7. Accepted**: no public binding slot; bindings travel with what a kist sends.
+- **D8. Leave the chain's public read as it is.** Seeing how many devices a person has harms no one; gating it is work for no gain under this threat model.
+- **D9. Accepted**: "facet", "alias", "be you", "the person key", `PERSON`, `SPOT`.
+
+**The split, in one line**: on ferros no kist ever holds the person's roots (the handle, the identity seed, the person key, the identity key, the fleet key, the ira); a kist holds its alias (derived by the kernel, its own), its ira key (per device, its own) and the facets the person handed it. Until Photon's migration lands (PHOTON.md), Photon on ferros keeps its own handle screen (option C there), so the roots it holds are only those the person typed into it, as on every other platform.
+
+## The proposals as they were put
 
 - **D0. What aliases derive from.** The identity seed (simple; anyone who knows the handle computes every alias) or a person key (random, minted at genesis, kept by the fleet under the fleet key, never from the handle). Recommended: the person key.
 - **D1. Who derives them on ferros.** The kernel (your rule of 2026-11-07: only the kernel issues keys), or the identity service (the brief). Recommended: the kernel.
