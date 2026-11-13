@@ -78,6 +78,8 @@ struct Datagram {
     dport: u16,
     len: usize,
     seq: u32,
+    /// When it was queued (the counter): its wait until an application took it is measured (`Path::took`).
+    at: u64,
     data: [u8; 1472],
 }
 
@@ -214,6 +216,11 @@ struct Path {
     by_ring: u32,
     by_call: u32,
     by_timer: u32,
+    /// Applications' requests served (every op, every caller), and the watches answered (op 11): at rest, the calls the apps make.
+    requests: u32,
+    watch_answers: u32,
+    /// Datagrams an application took (op 2), by port, the first four ports seen in the window: (port, how many, their ticks in the queue in all, the longest). The wait from a datagram landing to its reader taking it: a reader that polls shows its period here, one that waits on a doorbell its wake (2026-11-13).
+    took: [(u16, u32, u64, u64); 4],
     /// When this window began (0: not yet), for the idle report every 64 s or more (`main`): with no timer bringing passes, the window's passes and waits are the stack's wakes at rest.
     t0: u64,
 }
@@ -269,6 +276,21 @@ impl Path {
             ip.dec(self.by_call as u64);
             ip.put(b", the timer A#");
             ip.dec(self.by_timer as u64);
+        }
+        ip.put(b"; app requests A#");
+        ip.dec(self.requests as u64);
+        ip.put(b", watches answered A#");
+        ip.dec(self.watch_answers as u64);
+        for &(port, n, t, most) in self.took.iter().filter(|e| e.1 > 0) {
+            ip.put(b"; port A#");
+            ip.dec(port as u64);
+            ip.put(b" took A#");
+            ip.dec(n as u64);
+            ip.put(b" datagrams, A#");
+            ip.dec(us(t) / n as u64);
+            ip.put(b" us in the queue on average, A#");
+            ip.dec(us(most));
+            ip.put(b" us longest");
         }
         ip.put(b"\n");
     }
@@ -1759,6 +1781,7 @@ impl Ip {
         let seq = self.qseq;
         let d = &mut self.q[slot];
         d.seq = seq;
+        d.at = now();
         let n = data.len().min(d.data.len());
         d.used = true;
         d.fam = fam;
@@ -1790,6 +1813,7 @@ impl Ip {
     /// Watch `w` answered as things stand (its ports pinned again: its caller is about to watch them anew).
     fn watch_send(&mut self, w: &Watch, out: &mut [u8]) {
         self.pin(w);
+        self.path.watch_answers += 1;
         let l = self.watch_answer(w, out);
         svc(REPLY, self.off(w.tok.as_ptr()), self.off(out.as_ptr()), l as u64, 0, 0);
     }
@@ -2814,6 +2838,15 @@ impl Ip {
     /// The port's oldest datagram into `out` (family, address, source port, destination port, payload); 0 when it has none.
     fn udp_take(&mut self, port: u16, out: &mut [u8]) -> usize {
         let Some(i) = (0..QN).filter(|&i| self.q[i].used && self.q[i].dport == port).min_by_key(|&i| self.q[i].seq) else { return 0 };
+        let waited = now().wrapping_sub(self.q[i].at);
+        // The first four ports in the window keep a measure; later ones are not counted.
+        if let Some(e) = self.path.took.iter_mut().find(|e| e.1 == 0 || e.0 == port) {
+            e.0 = port;
+            e.1 += 1;
+            e.2 += waited;
+            // WHY the max: the high water, for the measure.
+            e.3 = e.3.max(waited);
+        }
         let d = &mut self.q[i];
         d.used = false;
         out[0] = d.fam;
@@ -2948,6 +2981,7 @@ impl Ip {
             self.kicks[k] = None;
         }
         if kicked.is_some() || self.watch_ready(&w, now()) {
+            self.path.watch_answers += 1;
             return Some(self.watch_answer(&w, out));
         }
         // A watch of the same id answered first as things stand (one watcher an id), else a free slot, else the oldest.
@@ -3233,7 +3267,7 @@ fn csum(data: &[u8], init: u32) -> u16 {
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let (base, freq) = (ferros_sys::arc_base(), ferros_sys::freq());
     // The queue lives in `.data` (a non-zero initializer keeps it out of `.bss`, which the flat image does not carry), not on the 64 KiB stack.
-    const EMPTY: Datagram = Datagram { used: false, fam: 0, addr: [0; 16], sport: 0, dport: 0, len: 0, seq: 0, data: [1; 1472] };
+    const EMPTY: Datagram = Datagram { used: false, fam: 0, addr: [0; 16], sport: 0, dport: 0, len: 0, seq: 0, at: 0, data: [1; 1472] };
     #[unsafe(link_section = ".data.queue")]
     static mut QUEUE: [Datagram; QN] = [EMPTY; QN];
     // The connections' control state, and the request and reply buffers (a reply up to `RECV_MAX` bytes of data): statics, not the 64 KiB stack (the kernel maps .bss from the image header's tail).
@@ -3473,6 +3507,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             // WHY the min: the length is the kernel's, the request it cut at the buffer.
             let m = &msg[..(n as usize).min(msg.len())];
+            ip.path.requests += 1;
             if let Some(l) = ip.serve(m, &tok, out) {
                 svc(REPLY, ip.off(tok.as_ptr()), ip.off(out.as_ptr()), l as u64, 0, 0);
             }
