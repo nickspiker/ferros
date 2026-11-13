@@ -810,7 +810,9 @@ extern "C" fn work(_: u64) -> ! {
                     Ok(true) => {
                         walking = false;
                         let st = store.engine().engine_stats();
-                        say!("vault: settled {} ms after serving began: {} live blocks, plow {} reap {}", (now() - t_walk) * 1000 / freq(), st.live_blocks, st.plow, st.reap);
+                        live_note(store.engine());
+                        let (hashed, tree, bytes) = unsafe { LIVE };
+                        say!("vault: settled {} ms after serving began: {} live blocks ({} hashed, {} by position, the live set {} KiB), plow {} reap {}; the heap {} KiB in use, high water {} KiB", (now() - t_walk) * 1000 / freq(), st.live_blocks, hashed, tree, bytes >> 10, st.plow, st.reap, ferros_heap::IN_USE.load(Relaxed) >> 10, ferros_heap::PEAK.load(Relaxed) >> 10);
                     }
                     Err(e) => {
                         walking = false;
@@ -842,6 +844,7 @@ extern "C" fn work(_: u64) -> ! {
             migrate(&mut store);
         }
         let len = serve(&mut store, &mut writers, &mut export, m, &mut out);
+        live_note(store.engine());
         m.fill(0);
         ferros_sys::reply(&token, &out[..len]);
     }
@@ -1012,9 +1015,17 @@ fn serve(store: &mut St, writers: &mut Vec<Pending>, export: &mut Option<Vec<u8>
                     writers.swap_remove(i);
                     ERR
                 } else if !more {
-                    let w = writers.swap_remove(i).w;
-                    match store.finish(&d, w) {
-                        Ok(()) => 0,
+                    let p = writers.swap_remove(i);
+                    let whole = p.next;
+                    match store.finish(&d, p.w) {
+                        Ok(()) => {
+                            // A large value's end says what the live set and the heap hold after it (2026-11-13: the live set's growth ended the process twice on the 8a).
+                            if whole >= METER_MIN {
+                                let (hashed, tree) = store.engine().live_counts();
+                                say!("vault: wrote {} B; the live set {} hashed, {} by position, {} KiB; the heap {} KiB in use, high water {} of {} KiB", whole, hashed, tree, store.engine().live_bytes() >> 10, ferros_heap::IN_USE.load(Relaxed) >> 10, ferros_heap::PEAK.load(Relaxed) >> 10, HEAP_BYTES >> 10);
+                            }
+                            0
+                        }
                         Err(e) => {
                             say!("vault: finish refused: {:?}", e);
                             ERR
@@ -1182,6 +1193,16 @@ static mut SERVING: (u8, u64, u64, usize) = (u8::MAX, 0, 0, 0);
 /// While migrating (`migrate`): no request of a process, the kernel's old entries moving.
 const OP_MIGRATE: u8 = u8::MAX;
 
+/// The engine's live set as it stood after the last request (`live_note`), for the death report: blocks with a recorded hash, blocks live by position alone, and the bytes it holds.
+/// 2026-11-13, the 8a: "memory allocation of 21495816 bytes failed serving a set" was this set's hashbrown table doubling to 2^19 buckets (2^19 × 41 + 8 bytes), and 2026-11-12's 10,747,912 "serving a delete" the doubling before it; manifestus `live-shards` makes it a direct index by position in pages, whose largest allocation is 32 KiB.
+static mut LIVE: (usize, usize, usize) = (0, 0, 0);
+
+/// The live set's counts and bytes noted (`LIVE`). The serving thread's alone.
+fn live_note(v: &Vault<Half, Half>) {
+    let (hashed, tree) = v.live_counts();
+    unsafe { LIVE = (hashed, tree, v.live_bytes()) };
+}
+
 /// What the death report calls an op.
 fn op_name(op: u8) -> &'static str {
     match op {
@@ -1206,13 +1227,17 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         Some(h) => (h.free_bytes() >> 10, h.free_blocks(), h.largest_free() >> 10),
         None => (0, 0, 0),
     };
+    let (hashed, tree, live_bytes) = unsafe { LIVE };
     say!(
-        "vault: panic: {} serving {} (offset {}, {} bytes, a name of {} bytes); the heap: {} KiB in use, high water {} of {} KiB, {} KiB free in {} blocks, the largest {} KiB",
+        "vault: panic: {} serving {} (offset {}, {} bytes, a name of {} bytes); the live set {} hashed, {} by position, {} KiB; the heap: {} KiB in use, high water {} of {} KiB, {} KiB free in {} blocks, the largest {} KiB",
         info,
         op_name(op),
         offset,
         len,
         name,
+        hashed,
+        tree,
+        live_bytes >> 10,
         ferros_heap::IN_USE.load(Relaxed) >> 10,
         ferros_heap::PEAK.load(Relaxed) >> 10,
         HEAP_BYTES >> 10,

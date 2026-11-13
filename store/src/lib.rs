@@ -1173,6 +1173,39 @@ mod peak {
         }
     }
 
+    /// A kist capsule's size written and read as the vault process serves it (2026-11-13: Mahere's 53 MB, Photon's 91 MB): 256 KiB transfers in (ferros_sys STORE_MAX), 1 MiB gets out (STORE_GET_MAX), and no allocation anywhere near the value's size. `cargo test --release -p ferros_store capsule_sized -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn capsule_sized() {
+        let m = Mirror::new(Mem(alloc::vec![[0u8; 4096]; 1 << 16]), Mem(alloc::vec![[0u8; 4096]; 1 << 16]));
+        let v = Vault::open(m, 8, 1, DeletePolicy::UnlinkOnly).expect("vault");
+        let mut s = Store::new(v, Counter(0), || 1);
+        let d = Domain { addr: [3; 32], seal: [4; 32] };
+        for mib in [32usize, 96] {
+            let value: Vec<u8> = (0..mib << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+            BIGGEST.store(0, Ordering::Relaxed);
+            let mut w = s.begin(&d, b"capsule");
+            for c in value.chunks(1 << 18) {
+                s.write(&d, &mut w, c).unwrap();
+            }
+            s.finish(&d, w).unwrap();
+            let wrote = BIGGEST.load(Ordering::Relaxed);
+            BIGGEST.store(0, Ordering::Relaxed);
+            let mut out = alloc::vec![0u8; 1 << 20];
+            let mut at = 0;
+            while at < value.len() {
+                let whole = s.read(&d, b"capsule", at as u64, &mut out).unwrap().unwrap();
+                assert_eq!(whole as usize, value.len());
+                let n = (value.len() - at).min(out.len());
+                assert!(out[..n] == value[at..at + n], "{mib} MiB: the bytes at {at} differ");
+                at += n;
+            }
+            let read = BIGGEST.load(Ordering::Relaxed);
+            std::println!("{mib} MiB: the biggest allocation writing {wrote}, reading {read}");
+            assert!(wrote < 1 << 21 && read < 1 << 21, "{mib} MiB: an allocation of {wrote} / {read} bytes");
+        }
+    }
+
     #[test]
     #[ignore]
     fn rewrite_peak() {
