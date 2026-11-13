@@ -24,7 +24,7 @@ The BCM4398's Bluetooth core is on the APM's USI1 UART: serial_18, G#155D_0000, 
 - **Pads:** no pin modes to set.
 - **USI init:** USI_CON 1 then 0, USI_OPTION CLKREQ_ON.
 - **Port:** UMCON RTS trigger 1 with automatic flow control, interrupts masked at bring-up, FIFOs reset then on, UCON G#3C5 (receive timeout on), 8N1.
-- **Interrupt (2026-11-13):** with the kernel's `bt-uart` line (SPI 71, granted with the UART) the serving loop opens the receive and error interrupts (UINTM G#C), clears UINTP and reads the FIFO once more before each wait, and waits on the line, a call, or the 8 s look at the chip (its one deadline). Without the line it waits on a call or the look, reading the UART every 4 ms only while scanning. Until then the loop read the UART every 4 ms whatever it did (~250 wakes a second on the 8a).
+- **Interrupt (2026-11-13):** with the kernel's `bt-uart` line (SPI 71, granted with the UART) the serving loop opens the receive and error interrupts (UINTM G#C), clears UINTP and reads the FIFO once more before each wait, and waits on the line, a call, or the 8 s look at the chip (its one deadline). Without the line it waits on a call or the look, reading the UART every 4 ms only while scanning. Until then the loop read the UART every 4 ms whatever it did (~250 wakes a second on the 8a). Measured on the 8a with no line (the current kernel): A#9 passes in 64 s, against ~240-280 wakes a second before; the chip up and the patch loaded as before.
 
 ## Bring-up
 
