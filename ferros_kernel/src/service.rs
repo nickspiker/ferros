@@ -1605,12 +1605,17 @@ fn power_poll() {
     }
 }
 
-/// The clock policy (POWER.md, 2026-10-25): two operating points, chosen from what the kernel knows. Rest — nobody touching, no transfer on the USB link — puts every domain at the lowest point that still carries the rest-state work: the X3 at 2.0 GHz (its 2.9 GHz step alone is 0.66 W, and the display's between-frames redraws fit at 2.0), MIF at 1014 MHz (2028 → 1014 is 0.36 W; lower bought nothing), INT at its 178 MHz floor, the workers' cluster at its 402 MHz floor, CPU0's (parked) at its 324 MHz floor and the DSU (the clusters' shared cache and snoop) at its 324 MHz floor (90 mW; BCI at its floor bought nothing measurable and stays) (zuma-cpu.dtsi: ACPM answers Ok below a floor and the device hard-resets, so floors, never under). Active — a touch taken by the touch driver, a PT transfer moving, or the display sending frames faster than its rest flips (a focused widget), held a second after the last — is the boot's own clocks. Each entry: (ACPM DVFS domain, kHz), applied in order (the X3 first going down, MIF first going up).
+/// The clock policy (POWER.md, 2026-10-25; the adaptive clock since 2026-11-13). Two parts.
+/// The X3 and the A715s, the two clusters that run work, each follow their own load (`governor`, owner 2026-11-13: "Adaptive clock").
+/// The shared domains follow one of three tiers chosen from what the kernel knows: dark (the screen off, no transfer), active (the governor asking the X3 over `X3_REST_KHZ` or the A715s over `A715_REST_KHZ`, sustained GPU work, frames shown at 24 a second or more, or a PT transfer), rest otherwise.
+/// Rest puts every shared domain at the lowest point that still carries the rest-state work: MIF at 1014 MHz (2028 → 1014 is 0.36 W; lower bought nothing), INT at its 178 MHz floor, CPU0's cluster (parked) at its 324 MHz floor and the DSU (the clusters' shared cache and snoop) at its 324 MHz floor (90 mW; BCI at its floor bought nothing measurable and stays) (zuma-cpu.dtsi: ACPM answers Ok below a floor and the device hard-resets, so floors, never under).
+/// Active is the boot's own clocks.
+/// Each entry: (ACPM DVFS domain, kHz), applied in order (the X3 first going down, MIF first going up); the X3's and the A715s' entries are the governor's starting points (the boot's top, the floors in the dark) and otherwise its own.
 const CLOCKS_REST: [(u32, u32); 7] = [(4, 2_000_000), (0, 1_014_000), (1, 178_000), (3, 402_000), (2, 324_000), (5, 324_000), (14, 400_000)];
-/// Dark — the screen off, nobody touching, no transfer: nothing is drawn, so the X3 and MIF go to their floors and the display's clock to its 143 MHz floor (measured 70 mW under rest with the screen off).
+/// Dark: the screen off, no transfer. Nothing is drawn, so the X3 and MIF go to their floors and the display's clock to its 143 MHz floor (measured 70 mW under rest with the screen off).
 const CLOCKS_DARK: [(u32, u32); 7] = [(4, 500_000), (0, 421_000), (1, 178_000), (3, 402_000), (2, 324_000), (5, 324_000), (14, 143_000)];
 const CLOCKS_ACTIVE: [(u32, u32); 7] = [(0, 2_028_000), (5, 1_197_000), (1, 356_000), (3, 1_065_000), (2, 1_425_000), (14, 400_000), (4, 2_914_000)];
-/// The policy's state: 0 not yet applied, 1 rest, 2 active, 3 dark; and whether it runs (`diag dvfs policy off` holds the clocks wherever `dvfs set` puts them, for measuring). Switches counted for DIAG.
+/// The policy's state (the shared domains' tier): 0 not yet applied, 1 rest, 2 active, 3 dark; and whether it runs (`diag dvfs policy off` holds the clocks wherever `dvfs set` puts them, for measuring). Switches counted for DIAG.
 static mut CLOCK_STATE: u8 = 0;
 /// The clock policy's state now (`CLOCK_STATE`), for the store calls' measure (process.rs `STORE_BY_CLOCK`): a byte written by the service loop alone, read as it stands.
 pub fn clock_state() -> u8 {
@@ -1620,7 +1625,194 @@ static mut CLOCK_POLICY_ON: bool = true;
 static mut CLOCK_SWITCHES: u32 = 0;
 static mut CLOCK_WAIT_MAX_US: u64 = 0;
 
-/// The rate the clock policy wants for an ACPM DVFS domain now, before any thermal cap (thermal.rs): the operating point's entry for it, or the GPU's top or floor while a `gpu` process lives. None before the policy's first switch, while `diag dvfs policy off` holds the clocks by hand, or for a domain the policy does not set.
+/// The adaptive clock: the X3 and the A715s each at the rate their own load needs, measured from the time their cores spend asleep (smp.rs `IDLE_TICKS`, the service loop's `X3_IDLE_TICKS`), on the service loop's own passes (no tick of its own).
+/// Every window (`GOV_WIN`, a 64th of a second) each cluster's busy share is its busiest core's: time awake over the window, in 256ths.
+/// Up at once: a touch or an injected batch (process.rs `INPUT_AT`) or a PT transfer puts both clusters at their top; a saturated window (busy 7/8 or more: the load wants more than the clock gives, and how much more is unknown) moves that cluster at least a step of the ramp up (`GOV_RAMP`).
+/// Down smoothly: the load's level moves an eighth of the way a window (`GOV_DECAY`) toward the rate that would leave the averaged busy share at 4/5 (the running rate × the average × 5/4), and up to it at once when that is higher.
+/// The average takes a quarter of each window's share (`GOV_AVG`), so a 10 Hz redraw is seen as its share of the time and not as a string of busy and idle windows.
+/// The rate asked is the lowest operating point at or above the level, under the thermal cap (thermal.rs `capped`), sent only when it changes.
+struct Gov {
+    domain: u32,
+    /// The operating points, kHz, lowest first (zuma-b0-ipop.dts `pixel_em`, cpu8 and cpu4): the X3's whole table; the A715s' up to 1065 MHz, their active clock until the owner picks (THERMAL.md decision 3; 2367 trips the clock divider).
+    opps: &'static [u32],
+    /// The cores: bit k for worker k (smp.rs), or 0 for the kernel's own core.
+    cores: u32,
+    /// What the load asks, kHz: up at once, down an eighth of the way a window.
+    level: u32,
+    /// The operating point asked (before the thermal cap): its index in `opps`.
+    at: usize,
+    /// The busy share averaged over windows, and the last window's, in 256ths.
+    avg: u32,
+    last: u32,
+    /// Windows in a row with the busy share at 7/8 or more.
+    sat: u32,
+    /// Each core's idle ticks at the window's start.
+    idle: [u64; 4],
+    /// Counter ticks spent at each operating point (since boot or `diag clock reset`).
+    res: [u64; 16],
+    /// Rate requests sent.
+    asks: u64,
+}
+const X3_OPPS: [u32; 15] = [500_000, 880_000, 1_164_000, 1_298_000, 1_557_000, 1_745_000, 1_885_000, 2_049_000, 2_147_000, 2_294_000, 2_363_000, 2_556_000, 2_687_000, 2_850_000, 2_914_000];
+const A715_OPPS: [u32; 6] = [402_000, 578_000, 697_000, 712_000, 910_000, 1_065_000];
+/// The shared tier is active while the governor asks more than these (the rest profile's X3 before the adaptive clock, and the A715s' middle).
+const X3_REST_KHZ: u32 = 2_049_000;
+const A715_REST_KHZ: u32 = 712_000;
+static mut GOV: [Gov; 2] = [
+    Gov { domain: 4, opps: &X3_OPPS, cores: 0, level: 2_914_000, at: 14, avg: 0, last: 0, sat: 0, idle: [0; 4], res: [0; 16], asks: 0 },
+    Gov { domain: 3, opps: &A715_OPPS, cores: 0xF, level: 1_065_000, at: 5, avg: 0, last: 0, sat: 0, idle: [0; 4], res: [0; 16], asks: 0 },
+];
+/// Whether the governor runs (`diag clock gov on|off`; off, the X3 and the A715s follow the tier tables as before 2026-11-13).
+static GOV_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// The window, as a right shift of the counter's frequency (6: a 64th of a second, 15.6 ms, two frames at 120 Hz); the decay and the average, as shifts of the distance moved a window (3: an eighth; 2: a quarter); the GPU's sustained work, the averaged GPU calls a window in 256ths at which the shared tier goes active (128: a call every other window); the ramp past a saturated window's rate, as a right shift (2: a quarter). Each `diag clock <name> <value>`.
+static GOV_WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(6);
+static GOV_DECAY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(3);
+static GOV_AVG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
+static GOV_GPU: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(128);
+static GOV_RAMP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
+/// The operating points under the top that input boosts a cluster to (`diag clock boost <n>`; 0, the top: a finger gets the whole core at once).
+static GOV_BOOST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The window's start, the input last seen (`INPUT_AT`), the GPU calls at the window's start and their average a window (256ths), the windows looked at, and the shared tier's ticks in each state (`res` for the tiers).
+static mut GOV_AT: u64 = 0;
+static mut GOV_INPUT: u64 = 0;
+static mut GOV_GPU_SEEN: u64 = 0;
+static mut GOV_GPU_AVG: u64 = 0;
+/// Frames shown: the display's new pictures (process.rs `PRESENTS`, never DECON's frame-start interrupt, which the 8a's panel takes on every TE), averaged a window as the GPU's calls are, in 256ths; at `GOV_SHOWN` (96: 24 frames a second, the old policy's "animating") the shared tier goes active, for a focused widget or an app drawing with little CPU work (2026-10-25: the focused scope ran 61 frames a second at the rest clocks, 93 at the active ones).
+static mut GOV_SHOWN_SEEN: u64 = 0;
+static mut GOV_SHOWN_AVG: u64 = 0;
+static GOV_SHOWN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(96);
+
+/// Whether the shared domains should be at the active tier for what the governor asks of the clusters, the GPU's work, or the frames shown.
+fn tier_active(govs: &[Gov; 2]) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    govs[0].opps[govs[0].at] > X3_REST_KHZ || govs[1].opps[govs[1].at] > A715_REST_KHZ || unsafe { GOV_GPU_AVG } >= GOV_GPU.load(Relaxed) || unsafe { GOV_SHOWN_AVG } >= GOV_SHOWN.load(Relaxed)
+}
+static mut GOV_WINDOWS: u64 = 0;
+static mut TIER_RES: [u64; 4] = [0; 4];
+/// Counter ticks the kernel's core has spent asleep in the service loop's `wfe`, added as each sleep ends.
+static X3_IDLE_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The governor's operating point for a cluster set from a profile's entry: the lowest at or above it, the level at it.
+fn gov_sync(domain: u32, khz: u32) {
+    let g = unsafe { &mut *(&raw mut GOV) };
+    for g in g.iter_mut().filter(|g| g.domain == domain) {
+        g.at = g.opps.iter().position(|&o| o >= khz).unwrap_or(g.opps.len() - 1);
+        g.level = khz;
+        g.sat = 0;
+    }
+}
+
+/// One cluster's busy share over the window just ended, in 256ths: its busiest core's time awake. A core that is not up (the workers stopped in the dark) counts for nothing, its idle mark kept current.
+fn gov_share(g: &mut Gov, el: u64) -> Option<u32> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let up = crate::smp::UP.load(Relaxed);
+    let mut share = None;
+    for k in 0..4 {
+        if g.cores == 0 && k != 0 {
+            break;
+        }
+        let idle = if g.cores == 0 { X3_IDLE_TICKS.load(Relaxed) } else { crate::smp::IDLE_TICKS[k].load(Relaxed) };
+        let slept = idle.wrapping_sub(g.idle[k]);
+        g.idle[k] = idle;
+        if g.cores != 0 && (g.cores & up) & 1 << k == 0 {
+            continue;
+        }
+        // WHY the min: a sleep is added when it ends, so one begun in the window before lands whole in this one and can be longer than the window; the busy time would then wrap to a huge number.
+        let busy = el - slept.min(el);
+        let s = (busy * 256 / el) as u32;
+        share = Some(share.map_or(s, |m: u32| m.max(s)));
+    }
+    share
+}
+
+/// The governor's window: each cluster's share measured and its rate moved (`Gov`). `boost` puts both at their top. Returns whether the shared tier should be active for what the clusters ask or the GPU does.
+fn governor(now: u64, f: u64, boost: bool) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let el = now.wrapping_sub(unsafe { GOV_AT });
+    let govs = unsafe { &mut *(&raw mut GOV) };
+    // The first look only takes the marks: the time before it is the boot's, at the boot's clocks.
+    if unsafe { GOV_AT } == 0 {
+        unsafe {
+            GOV_AT = now;
+            GOV_GPU_SEEN = crate::process::GPU_CALLS.load(Relaxed);
+            GOV_SHOWN_SEEN = crate::process::PRESENTS.load(Relaxed);
+        }
+        for g in govs.iter_mut() {
+            let _ = gov_share(g, 1);
+        }
+        return false;
+    }
+    if el < f >> GOV_WIN.load(Relaxed) {
+        // Inside a window a boost moves the clusters at once and leaves the window's measure to its end.
+        if boost {
+            let up = crate::smp::UP.load(Relaxed);
+            for g in govs.iter_mut().filter(|g| g.cores == 0 || g.cores & up != 0) {
+                let b = boost_at(g);
+                if g.at < b {
+                    g.level = g.opps[b];
+                    gov_ask(g, b, f);
+                }
+            }
+        }
+        return tier_active(govs);
+    }
+    unsafe {
+        GOV_AT = now;
+        GOV_WINDOWS += 1;
+        let calls = crate::process::GPU_CALLS.load(Relaxed);
+        let n = calls.wrapping_sub(GOV_GPU_SEEN);
+        GOV_GPU_SEEN = calls;
+        let s = GOV_AVG.load(Relaxed);
+        GOV_GPU_AVG = GOV_GPU_AVG - (GOV_GPU_AVG >> s) + ((n << 8) >> s);
+        let shown = crate::process::PRESENTS.load(Relaxed);
+        let n = shown.wrapping_sub(GOV_SHOWN_SEEN);
+        GOV_SHOWN_SEEN = shown;
+        GOV_SHOWN_AVG = GOV_SHOWN_AVG - (GOV_SHOWN_AVG >> s) + ((n << 8) >> s);
+    }
+    let (avg_s, decay_s, ramp_s) = (GOV_AVG.load(Relaxed), GOV_DECAY.load(Relaxed), GOV_RAMP.load(Relaxed));
+    for g in govs.iter_mut() {
+        let Some(share) = gov_share(g, el) else { continue };
+        g.res[g.at] += el;
+        g.last = share;
+        g.avg = g.avg - (g.avg >> avg_s) + (share >> avg_s);
+        g.sat = if share >= 224 { g.sat + 1 } else { 0 };
+        let rate = g.opps[g.at];
+        // The rate that would leave the averaged share at 4/5: the running rate × the average × 5/4, in 256ths of the share.
+        let want = (rate as u64 * g.avg as u64 * 5 >> 10) as u32;
+        // A saturated window: the load wants more than this rate and how much more is unknown, so the level goes at least a step of the ramp past the rate (`GOV_RAMP` 2: a quarter, 500 MHz to the X3's top in eight windows; 0: double, in three).
+        let ramp = rate + (rate >> ramp_s);
+        let want = if g.sat != 0 && ramp > want { ramp } else { want };
+        g.level = if want >= g.level { want } else { g.level - ((g.level - want) >> decay_s) };
+        if boost && g.level < g.opps[boost_at(g)] {
+            g.level = g.opps[boost_at(g)];
+        }
+        let at = g.opps.iter().position(|&o| o >= g.level).unwrap_or(g.opps.len() - 1);
+        gov_ask(g, at, f);
+    }
+    tier_active(govs)
+}
+
+/// The operating point input boosts a cluster to: `GOV_BOOST` points under its top (0: the top).
+fn boost_at(g: &Gov) -> usize {
+    // WHY the saturating subtraction: the knob is the bridge's number, and one larger than the table would index below its first point; it then means the floor.
+    (g.opps.len() - 1).saturating_sub(GOV_BOOST.load(core::sync::atomic::Ordering::Relaxed) as usize)
+}
+
+/// A cluster to operating point `at`, if it is not there: the request under the thermal cap, then a rate read, which the firmware answers only once the request is done (`clock_profile`, why).
+fn gov_ask(g: &mut Gov, at: usize, f: u64) {
+    if at == g.at {
+        return;
+    }
+    g.at = at;
+    g.asks += 1;
+    let t0 = cntpct();
+    let _ = crate::acpm::dvfs_set(g.domain, crate::thermal::capped(g.domain, g.opps[at]));
+    let _ = crate::acpm::dvfs_get(g.domain);
+    let us = cntpct().wrapping_sub(t0) * 1_000_000 / f;
+    unsafe { CLOCK_WAIT_MAX_US = CLOCK_WAIT_MAX_US.max(us) };
+}
+
+/// The rate the clock policy wants for an ACPM DVFS domain now, before any thermal cap (thermal.rs): the governor's for the X3 and the A715s, the tier's entry for the others, or the GPU's top or floor while a `gpu` process lives. None before the policy's first switch, while `diag dvfs policy off` holds the clocks by hand, or for a domain the policy does not set.
 pub fn profile_khz(domain: u32) -> Option<u32> {
     let state = clock_state();
     if unsafe { !CLOCK_POLICY_ON } {
@@ -1628,6 +1820,11 @@ pub fn profile_khz(domain: u32) -> Option<u32> {
     }
     if domain == 7 {
         return unsafe { GPU_CLOCKED }.then_some(if state == 3 { 150_000 } else { 890_000 });
+    }
+    if state != 0 && GOV_ON.load(core::sync::atomic::Ordering::Relaxed) {
+        if let Some(g) = unsafe { (*(&raw const GOV)).iter().find(|g| g.domain == domain) } {
+            return Some(g.opps[g.at]);
+        }
     }
     let table: &[(u32, u32)] = match state {
         1 => &CLOCKS_REST,
@@ -1638,7 +1835,6 @@ pub fn profile_khz(domain: u32) -> Option<u32> {
     table.iter().find(|e| e.0 == domain).map(|e| e.1)
 }
 
-/// The process table'"s
 /// The process table's generation last looked at, and whether the GPU's clock is up for its service.
 static mut PROCS_SEEN: u32 = u32::MAX;
 static mut GPU_CLOCKED: bool = false;
@@ -1654,29 +1850,28 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
     if unsafe { !CLOCK_POLICY_ON } || booted_for < 16 * f {
         return;
     }
-    let input = crate::process::INPUT_AT.load(core::sync::atomic::Ordering::Relaxed);
-    // A PT transfer moving: the kernel's own, or one the USB process carries (it says so: ptlink.rs MOVING_AT).
+    // A PT transfer moving: the kernel's own, or one the USB process carries (it says so: ptlink.rs MOVING_AT); held a second after the last, as before the adaptive clock.
     let moving = crate::ptlink::MOVING_AT.load(core::sync::atomic::Ordering::Relaxed);
     let pt_busy = pt_busy || (moving != 0 && now.wrapping_sub(moving) < f / 16);
-    let active = pt_busy || (input != 0 && now.wrapping_sub(input) < f);
     if pt_busy {
         unsafe { PT_BUSY_AT = now };
     }
-    let active = active || now.wrapping_sub(unsafe { PT_BUSY_AT }) < f;
-    // Frames faster than the rest flips: counted over quarter seconds, six or more (24 a second; the rest flips are 10) marks the display animating — a focused widget gets the active clocks as a finger does (2026-10-25: the focused scope ran 61 frames a second at the rest clocks, 93 at the active ones).
-    unsafe {
-        if now.wrapping_sub(FRAMES_WINDOW.0) >= f / 4 {
-            let n = crate::process::FRAME_STARTS.load(core::sync::atomic::Ordering::Relaxed);
-            if n.wrapping_sub(FRAMES_WINDOW.1) >= 6 {
-                FRAMES_FAST_AT = now;
-            }
-            FRAMES_WINDOW = (now, n);
-        }
-    }
-    let active = active || (unsafe { FRAMES_FAST_AT } != 0 && now.wrapping_sub(unsafe { FRAMES_FAST_AT }) < f);
-    let dark = !active && crate::process::pref(crate::process::PREF_SCREEN_OFF) == 1;
-    let want = if active { 2 } else if dark { 3 } else { 1 };
+    let pt_hold = unsafe { PT_BUSY_AT } != 0 && now.wrapping_sub(unsafe { PT_BUSY_AT }) < f;
+    // Input since the last look: both clusters to their top at once.
+    let input = crate::process::INPUT_AT.load(core::sync::atomic::Ordering::Relaxed);
+    let touched = input != unsafe { GOV_INPUT };
+    unsafe { GOV_INPUT = input };
+    let dark = !pt_hold && crate::process::pref(crate::process::PREF_SCREEN_OFF) == 1;
     let was = unsafe { CLOCK_STATE };
+    let gov = GOV_ON.load(core::sync::atomic::Ordering::Relaxed);
+    // The governor runs in every tier once the policy has applied one; in the dark the workers are down and only the X3 moves.
+    // Governor off (or before the first switch): the tiers alone, active for a second after a touch as before 2026-11-13.
+    let busy = if gov && was != 0 { governor(now, f, (touched && !dark) || pt_busy) } else { input != 0 && now.wrapping_sub(input) < f };
+    let want = if dark { 3 } else if busy || pt_hold { 2 } else { 1 };
+    if was != 0 && unsafe { TIER_AT } != 0 {
+        unsafe { TIER_RES[was as usize] += now.wrapping_sub(TIER_AT) };
+    }
+    unsafe { TIER_AT = now };
     if want != was {
         // The workers are off while dark (2026-10-25: their cluster drew ~28 mW idle in `wfe` with the screen off; Android's 8): started before leaving the dark profile, stopped after entering it, so no clock request goes to their cluster while it is down. Threads meant for the workers run on the X3 meanwhile (process.rs: a mask with no core up runs anywhere).
         let workers_dark = DARK_WORKERS_OFF.load(core::sync::atomic::Ordering::Relaxed);
@@ -1697,6 +1892,7 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
         }
     }
 }
+static mut TIER_AT: u64 = 0;
 /// The GPU's clock at its top (G3D 890, G3DL2 900 MHz) or its floor (150 / 160 MHz), the L2 first going up and last going down (GPU.md "The GPU's clock"). At the top while a `gpu` process lives and the screen is lit; at the floor otherwise, the dark profile included (2026-11-10: the GPU's rails held ~40 mW with the screen off at its top, idle).
 fn gpu_rate(top: bool) {
     // G3D under the thermal policy's cap (thermal.rs `capped`); the L2 stays at its rate, at or above the GPU's.
@@ -1711,16 +1907,24 @@ fn gpu_rate(top: bool) {
 /// `diag smp dark on|off`: whether the workers go off with the dark profile (on by default).
 pub static DARK_WORKERS_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
-/// One of the two operating points, every domain in order; then the X3's timer control (its event stream, which wakes the idle loop's `wfe`) and the counter into note 6, and the switch count into note 7, so a hang after a switch says what the core was left with (the first policy build hung the X3 in `wfe` within a minute of going to rest, 2026-10-25).
+/// One of the three tiers, every domain in order; then the X3's timer control (its event stream, which wakes the idle loop's `wfe`) and the counter into note 6, and the switch count into note 7, so a hang after a switch says what the core was left with (the first policy build hung the X3 in `wfe` within a minute of going to rest, 2026-10-25).
+/// With the governor on, the X3's and the A715s' entries are applied only on the policy's first switch and going dark (their floors, the workers' before they stop), the governor's starting points; otherwise the governor's own.
 fn clock_profile(want: u8) {
     let table: &[(u32, u32)] = match want {
         2 => &CLOCKS_ACTIVE,
         3 => &CLOCKS_DARK,
         _ => &CLOCKS_REST,
     };
+    let own = GOV_ON.load(core::sync::atomic::Ordering::Relaxed) && unsafe { CLOCK_STATE } != 0 && want != 3;
     // Each request answered before the next and before the loop may sleep: the clusters', MIF's and INT's rate requests take no reply (as Linux sends them), so five went out back to back and the loop went straight into `wfe` with the firmware still at work — and on battery (the charger cut) the X3 never woke from that `wfe` (2026-10-25, twice). A rate read takes a reply, and the firmware answers in order: its answer means the request before it is done. The longest wait goes into DIAG.
     // Each rate under the thermal policy's cap for its domain (thermal.rs `capped`), so a switch never undoes a cap.
     for &(d, khz) in table {
+        if d == 4 || d == 3 {
+            if own {
+                continue;
+            }
+            gov_sync(d, khz);
+        }
         let t0 = cntpct();
         let _ = crate::acpm::dvfs_set(d, crate::thermal::capped(d, khz));
         let _ = crate::acpm::dvfs_get(d);
@@ -1736,9 +1940,63 @@ fn clock_profile(want: u8) {
         platform::note(7, (CLOCK_SWITCHES as u64) << 40 | cntpct() >> 16);
     }
 }
+
+/// `diag clock`: the adaptive clock's state (each cluster's rate, level, busy shares and time at each operating point), the tiers' time, and the touch-to-frame measure (process.rs `INPUT_TO_FRAME`).
+/// `diag clock reset` zeroes the times and the measure; `diag clock gov on|off`; `diag clock win|decay|avg|ramp|boost|gpu|frames <n>` sets a knob (`GOV_WIN`).
+fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let words: alloc::vec::Vec<&[u8]> = params.split(|&b| b == b' ').filter(|w| !w.is_empty()).collect();
+    let num = |w: &[u8]| core::str::from_utf8(w).ok().and_then(|t| t.parse::<u32>().ok());
+    let f = cntfrq();
+    let govs = unsafe { &mut *(&raw mut GOV) };
+    match (words.get(1).copied(), words.get(2).and_then(|w| num(w))) {
+        (Some(b"reset"), _) => {
+            for g in govs.iter_mut() {
+                g.res = [0; 16];
+                g.asks = 0;
+            }
+            unsafe { TIER_RES = [0; 4] };
+            for b in &crate::process::INPUT_TO_FRAME {
+                b.store(0, Relaxed);
+            }
+            crate::process::INPUT_TO_FRAME_SUM.store(0, Relaxed);
+            crate::process::INPUT_TO_FRAME_MAX.store(0, Relaxed);
+        }
+        (Some(b"gov"), _) => {
+            let on = words.get(2) == Some(&&b"on"[..]);
+            GOV_ON.store(on, Relaxed);
+            // Back to the tier's own table for the clusters, or the governor from there.
+            if unsafe { CLOCK_STATE } != 0 {
+                unsafe { CLOCK_STATE = 0 };
+            }
+        }
+        (Some(b"win"), Some(n)) => GOV_WIN.store(n, Relaxed),
+        (Some(b"decay"), Some(n)) => GOV_DECAY.store(n, Relaxed),
+        (Some(b"avg"), Some(n)) => GOV_AVG.store(n, Relaxed),
+        (Some(b"gpu"), Some(n)) => GOV_GPU.store(n as u64, Relaxed),
+        (Some(b"frames"), Some(n)) => GOV_SHOWN.store(n as u64, Relaxed),
+        (Some(b"ramp"), Some(n)) => GOV_RAMP.store(n, Relaxed),
+        (Some(b"boost"), Some(n)) => GOV_BOOST.store(n, Relaxed),
+        _ => {}
+    }
+    let ms = |t: u64| t * 1000 / f;
+    out.extend_from_slice(alloc::format!("adaptive clock {}: window f>>A#{} ({} us), decay >>A#{}, average >>A#{}, GPU tier at A#{}/256 (now A#{}), frames tier at A#{}/256 (now A#{}); tier {} (1 rest, 2 active, 3 dark), A#{} switches, A#{} windows\n", if GOV_ON.load(Relaxed) { "on" } else { "off" }, GOV_WIN.load(Relaxed), (f >> GOV_WIN.load(Relaxed)) * 1_000_000 / f, GOV_DECAY.load(Relaxed), GOV_AVG.load(Relaxed), GOV_GPU.load(Relaxed), unsafe { GOV_GPU_AVG }, GOV_SHOWN.load(Relaxed), unsafe { GOV_SHOWN_AVG }, clock_state(), unsafe { CLOCK_SWITCHES }, unsafe { GOV_WINDOWS }).as_bytes());
+    let tr = unsafe { TIER_RES };
+    out.extend_from_slice(alloc::format!("tiers, ms: rest A#{}, active A#{}, dark A#{}\n", ms(tr[1]), ms(tr[2]), ms(tr[3])).as_bytes());
+    for g in govs.iter() {
+        let total: u64 = g.res.iter().sum::<u64>().max(1);
+        let mean = g.res.iter().zip(g.opps).map(|(&t, &o)| t * (o / 1000) as u64).sum::<u64>() / total;
+        out.extend_from_slice(alloc::format!("{}: asked A#{} MHz (level A#{}), busy last A#{}/256, average A#{}/256, saturated A#{}, A#{} requests, time-weighted mean A#{} MHz\n  ms at each:", if g.domain == 4 { "X3" } else { "A715" }, g.opps[g.at] / 1000, g.level / 1000, g.last, g.avg, g.sat, g.asks, mean).as_bytes());
+        for (i, &o) in g.opps.iter().enumerate() {
+            out.extend_from_slice(alloc::format!(" A#{}:A#{}", o / 1000, ms(g.res[i])).as_bytes());
+        }
+        out.push(b'\n');
+    }
+    let b: alloc::vec::Vec<u64> = crate::process::INPUT_TO_FRAME.iter().map(|b| b.load(Relaxed)).collect();
+    let n: u64 = b.iter().sum();
+    out.extend_from_slice(alloc::format!("frames armed A#{}; input to frame: A#{} measured, mean A#{} us, longest A#{} us; by ms <1:A#{} 1:A#{} 2-3:A#{} 4-7:A#{} 8-15:A#{} 16-31:A#{} 32-63:A#{} 64+:A#{}\n", crate::process::PRESENTS.load(Relaxed), n, crate::process::INPUT_TO_FRAME_SUM.load(Relaxed) * 1_000_000 / f / n.max(1), crate::process::INPUT_TO_FRAME_MAX.load(Relaxed) * 1_000_000 / f, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]).as_bytes());
+}
 static mut PT_BUSY_AT: u64 = 0;
-static mut FRAMES_WINDOW: (u64, u64) = (0, 0);
-static mut FRAMES_FAST_AT: u64 = 0;
 /// Idle sleeps the EL2 timer's backstop ended (the event stream did not): DIAG BACKSTOP_WAKES.
 static BACKSTOP_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -2450,6 +2708,7 @@ pub fn run(mut b: Boot) -> ! {
                 BACKSTOP_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
             asleep += slept;
+            X3_IDLE_TICKS.fetch_add(slept, core::sync::atomic::Ordering::Relaxed);
         }
         // Development: a jumped session that the host has not reached in 60 s (no command from the USB process) leaves a note, once, and runs on.
         // Until 2026-11-13 it also reset, so the next boot could read the pstore ring (the twenty-seventh jump, 2026-11-02: ferros up, no USB, the screen still Android's).
@@ -2982,6 +3241,12 @@ pub fn run(mut b: Boot) -> ! {
                 if cmd.params == b"cam uw up" {
                     // `diag cam uw up`: power the ultrawide in its own sequence and read its identifier (camera.rs).
                     crate::camera::uw_up(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"clock" || cmd.params.starts_with(b"clock ") {
+                    // `diag clock`: the adaptive clock (clock_diag).
+                    clock_diag(&cmd.params, &mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
