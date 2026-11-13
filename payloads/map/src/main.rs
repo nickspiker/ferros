@@ -4029,7 +4029,12 @@ impl Map {
                     mark(self, b, &mut y, 50, tr(Msg::KeptForItself), sh.keep_data, Some(Choice::UnstowKeep(SHEET_DATA)));
                     y -= uu(3, 4);
                     let l = match self.sheet_size.filter(|s| s.0 == sh.capsule).and_then(|s| s.1) {
-                        Some((_, 0)) => say(Say::KeptForItself(tr(Msg::NothingYet))),
+                        // Seen on the 8a, 2026-11-12: "nothing yet, of no use without it" says more than there is.
+                        Some((_, 0)) => {
+                            let mut l = Line::new();
+                            l.s(tr(Msg::NothingYet));
+                            l
+                        }
                         Some((bytes, _)) => {
                             let mut s = Line::new();
                             let _ = tatau::size_bits(&mut s, f, bytes << 3, 1);

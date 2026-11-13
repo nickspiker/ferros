@@ -487,7 +487,7 @@ messages! {
     KeptForItself,
     /// Under it while its size is not known.
     UselessWithoutIt,
-    /// Its size when it kept nothing (a `Say::KeptForItself` hole).
+    /// In its size's place when it kept nothing.
     NothingYet,
     /// A tick: the kist's items in the person's hold (docs/STORE.md).
     ThingsMadeForYou,
@@ -631,7 +631,7 @@ pub enum Say<'a> {
     Stopped(&'a str),
     /// Who made a kist offered to stow (its developer's name as the capsule gives it): "by Nick".
     ByDeveloper(&'a str),
-    /// The unstow sheet: what a kist kept for itself, its size written already in the person's base (or `Msg::NothingYet`): "12 MiB, of no use without it".
+    /// The unstow sheet: what a kist kept for itself, its size written already in the person's base: "12 MiB, of no use without it".
     KeptForItself(&'a str),
     /// The stower fetching a kist (its name), the bytes so far written already in the person's base: "fetching Mahere: 3 MiB".
     Fetching { name: &'a str, got: &'a str },
