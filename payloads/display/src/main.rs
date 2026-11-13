@@ -2783,18 +2783,19 @@ fn stripes(kind: u8, base: usize, width: usize, height: usize, r: draw::Rect) {
 
 // ---------------------------------------------------------------- the flight, prerendered
 //
-// COMPOSITOR.md "The flight, prerendered": opening or closing the open circle, two images made once — the page image (the clean window in the canvas and the text in the front layer, the region as landing shows it) and the plane image (a free app surface) — and each frame of the flight samples them through the camera, nearest, inside the publish. No scene is drawn while it flies.
+// COMPOSITOR.md "The flight, prerendered": opening or closing the open circle, two images made once — the page image (the clean window in the canvas and the text in the front layer, the region as landing shows it) and the plane image (the display's own buffer, `PLANE`) — and each frame of the flight samples them through the camera, nearest, inside the publish. No scene is drawn while it flies.
 
-/// The flight's images: the surface holding the plane image, the camera op it was made at (None until made), the page image's camera op (the region's clean window must be current for it), and the theme and scene generation the plane image was made in.
+/// The flight's images: the camera op the plane image (in `PLANE`) was made at (None until made), the page image's camera op (the region's clean window must be current for it), and the theme and scene generation the plane image was made in.
 #[derive(Clone, Copy)]
 struct FlightImages {
-    surf: usize,
     plane: Option<[u8; 18]>,
     page: [u8; 18],
     theme: u8,
     scene: u32,
 }
 static mut FLIGHT: Option<FlightImages> = None;
+/// The plane image's buffer (and the capture's, op 30, which leaves the flight none): a full screen of 64-bit pixels of the display's own heap, allocated at start (2026-11-12; until then a free app surface, which made a flight wait for one, and with surfaces given out on demand a free one has no memory behind it).
+static mut PLANE: usize = 1;
 /// What the camera op inside an op 45 does: 0 nothing (not inside one), 1 the page image (the region path, no publish), 2 the plane image (the scene into the flight's surface), 3 nothing to make (both images current).
 static mut FLIGHT_PRE: u8 = 0;
 /// One image's map from a screen pixel to its own, 16.16: the pixel (0, 0)'s centre, and the steps a pixel right and a row down.
@@ -3087,9 +3088,14 @@ unsafe fn flight_publish_row(f: &FlightFrame, canvas: *const u64, width: usize, 
 }
 
 
-/// The flight's surface still free: no window shows it and no process holds it (the kernel's generation byte 0), and no app is in front.
-fn flight_surface_free(k: usize) -> bool {
-    unsafe { (*(&raw const WINS))[k].is_none() && ferros_sys::pref(8 + k as u64) == 0 && (*(&raw const APP)).is_none() }
+/// The flight may fly: no app is in front.
+fn flight_free() -> bool {
+    unsafe { (*(&raw const APP)).is_none() }
+}
+
+/// The plane image's buffer and the capture's (`PLANE`): a full screen of the display's own pixels.
+fn plane_image(width: usize, height: usize) -> &'static mut [u64] {
+    unsafe { core::slice::from_raw_parts_mut(PLANE as *mut u64, width * height) }
 }
 
 /// The flight ends (a frame that is not a flight frame): the images go, and every phase owes the whole screen once, its compose-once bits gone with what they knew.
@@ -3121,13 +3127,14 @@ fn flight_end(width: usize, height: usize, log: &mut Log) {
 
 /// Whether any window is up (WINDOWS.md): the whole screen while one is, `None` while the map has it. The widgets and the map's frames check it.
 static mut APP: Option<draw::Rect> = None;
-/// The four surfaces' base (the `surfaces` region): surface k is the `SURFACE_BYTES` from `SURFS + k * SURFACE_BYTES`, a full screen of 64-bit pixels laid out at the screen's width.
+/// The surfaces' base (the `surfaces` region, the kernel's surfaces' window since 2026-11-12): surface k is the `SURFACE_BYTES` from `SURFS + k * SURFACE_BYTES`, a full screen of 64-bit pixels laid out at the screen's width, its frames wherever the kernel took them from its pool (a slot nobody holds maps a blank frame, so reading one never faults).
 static mut SURFS: usize = 1;
-const SURFACES: usize = 4;
-const SURFACE_BYTES: usize = 32 << 20;
+/// The surface slots (ferros_sys `SURFACE_SLOTS`: sixteen, given out on demand; four fixed ones until 2026-11-12): a window each at most.
+pub const SURFACES: usize = ferros_sys::SURFACE_SLOTS;
+const SURFACE_BYTES: usize = ferros_sys::SURFACE_BYTES;
 /// The porch before each surface's pixel 0 (the kernel's SURFACE_PORCH): clients name their surface by its address past it.
 const PORCH: usize = 64;
-/// A window (WINDOWS.md), one per surface: the surface's generation when it was shown (the kernel's preference bytes 8-11; a change or a 0 means its process ended), its level (0 an app, 1 input, 2 the system: higher is in front), when it was last shown (later is in front within a level), and the part of the screen it covers. Outside its rectangle, and wherever a pixel has `CLEAR` set, what is behind it shows.
+/// A window (WINDOWS.md), one per surface: the surface's generation when it was shown (its four bits in the windows' bell, `SURF_LIVE`; a change or a 0 means its process ended), its level (0 an app, 1 input, 2 the system: higher is in front), when it was last shown (later is in front within a level), and the part of the screen it covers. Outside its rectangle, and wherever a pixel has `CLEAR` set, what is behind it shows.
 /// Its surface's `format` says what its pixels are (op 22's optional last byte): 0 the display's own working values (gamma 2, white = Q14, bit 63 see-through); 1 fluor's 16-bit `g2t` (`G2T16`), which the display decodes itself so a fluor app hands its buffer over as it drew it (owner, 2026-10-29: fluor the one compositor, passed straight through); 2 `BAKED`, the panel's own codes (bake.rs). The first two are baked by the display every frame (`layer_row`), the third presented as it is.
 #[derive(Clone, Copy)]
 struct Win {
@@ -3154,18 +3161,17 @@ fn working(p: u64) -> u64 {
 }
 static mut WINS: [Option<Win>; SURFACES] = [None; SURFACES];
 static mut RAISES: u32 = 0;
-/// The windows' owners as the kernel holds them (SYS_BELL `BELL_SURFACES`): byte k surface k's live generation (0 once the process it was given to has ended, however it ended), the change count above bit 32. Written by the kernel as a surface changes hands, which wakes `reaper` waiting here.
+/// The windows' owners as the kernel holds them (SYS_BELL `BELL_SLOTS`): bits 4k to 4k + 3 slot k's live generation (0 once the process it was given to has ended, however it ended; ferros_sys `surface_generation`). Written by the kernel as a surface changes hands, which wakes `reaper` waiting here.
 static SURF_LIVE: AtomicU64 = AtomicU64::new(0);
-/// Whether that bell is registered; a kernel without it leaves the preference bytes alone, as before 2026-11-11.
+/// Whether that bell is registered: with a kernel from before 2026-11-12 (four surfaces, their generations in the preference bytes) it is not, and no window counts as live (this display needs the kernel of its day).
 static SURF_BELL: AtomicBool = AtomicBool::new(false);
-/// The windows up, for the receive thread (it never reads `WINS`): byte k the generation `WINS[k]` was shown under, 0 for none (`wins_mirror`).
+/// The windows up, for the receive thread (it never reads `WINS`): bits 4k to 4k + 3 the generation `WINS[k]` was shown under, 0 for none (`wins_mirror`).
 static WIN_GENS: AtomicU64 = AtomicU64::new(0);
 static mut REAP_STACK: [u8; 16384] = [0; 16384];
 
-/// Surface k's live generation: its preference byte (bytes 8-11, the kernel's copy in this process's page) and, with the bell registered, the bell's byte too; 0 when either says its owner is gone. The kernel changes both under its lock and only as the surface changes hands, so a disagreement is a hand-over in progress, when a window on the surface belongs to an owner that has ended anyway.
+/// Surface k's live generation, from the windows' bell (the kernel's word, rung as a surface changes hands); 0 when its owner is gone or nobody holds it, and always without the bell.
 fn live_gen(k: usize) -> u8 {
-    let g = ferros_sys::pref(8 + k as u64);
-    if SURF_BELL.load(Ordering::Acquire) && (SURF_LIVE.load(Ordering::Acquire) >> (8 * k)) as u8 != g { 0 } else { g }
+    if SURF_BELL.load(Ordering::Acquire) { ferros_sys::surface_generation(SURF_LIVE.load(Ordering::Acquire), k) } else { 0 }
 }
 
 /// `WINS` as `WIN_GENS`, after every change to it: the windows on the glass (one behind is not in front, so op 5 does not count it and the map has the glass).
@@ -3173,7 +3179,7 @@ fn wins_mirror() {
     let mut v = 0u64;
     for k in 0..SURFACES {
         if let Some(w) = unsafe { WINS[k] }.filter(|w| !w.back) {
-            v |= (w.generation as u64) << (8 * k);
+            v |= (w.generation as u64) << (4 * k);
         }
     }
     WIN_GENS.store(v, Ordering::Release);
@@ -3183,7 +3189,7 @@ fn wins_mirror() {
 fn app_live() -> bool {
     let w = WIN_GENS.load(Ordering::Acquire);
     (0..SURFACES).any(|k| {
-        let g = (w >> (8 * k)) as u8;
+        let g = ferros_sys::surface_generation(w, k);
         g != 0 && g == live_gen(k)
     })
 }
@@ -3295,7 +3301,7 @@ fn names_surface(op: u8) -> bool {
     matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71)
 }
 
-/// What the process behind the call holds (kernel SYS_CALLER: bit k surface k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
+/// What the process behind the call holds (kernel SYS_CALLER: bit `CALLER_SURFACE0` + k surface slot k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
 fn caller_of(tok: &[u8; 32]) -> u64 {
     ferros_sys::caller(tok).unwrap_or(0)
 }
@@ -3303,7 +3309,7 @@ fn caller_of(tok: &[u8; 32]) -> u64 {
 /// Whether holdings `h` hold surface k: the caller's own window, its own pixels.
 #[inline]
 fn holds(h: u64, k: usize) -> bool {
-    h >> k & 1 == 1
+    ferros_sys::caller_holds_surface(h, k)
 }
 
 /// Whether holdings `h` may move the window on surface k (front, behind, full screen, a key): its holder, or the system's window management (the Settings holder: the map, the attest screen).
@@ -3393,7 +3399,7 @@ fn window_pixels(k: usize, width: usize, height: usize) -> &'static mut [u64] {
     surface(unsafe { PIXELS[k] } as usize, width, height)
 }
 
-/// The windows up, frontmost first: (surface, window), at most four.
+/// The windows up, frontmost first: (surface, window), at most one a slot.
 fn front_order() -> ([(usize, Win); SURFACES], usize) {
     let mut v = [(0usize, Win { generation: 0, level: 0, order: 0, rect: draw::Rect::EMPTY, format: 0, mode: 0, back: false, full: false }); SURFACES];
     let mut n = 0;
@@ -3415,7 +3421,7 @@ fn front_order() -> ([(usize, Win); SURFACES], usize) {
 
 /// The layer stack as bands and spans (WINDOWS.md, "The layer stack", 2026-11-02; the geometry is fluor's `layout`, shared with Photon's stacking), rebuilt only when the windows change (`layout_build`), never per frame.
 /// A span's chain is the windows covering it, frontmost first, cut after the first opaque one: nothing behind an opaque window is ever read. Publishing a row walks its band's spans: a span with one opaque working window is a copy, a chain of working windows in Normal is the branchless select, anything else (a 16-bit fluor surface with its alpha, a blend mode) is the general fold.
-/// At most four windows, so at most nine bands and nine spans a band; the chains index `ORDER`.
+/// At most a window a slot (sixteen), so at most 33 bands and 33 spans a band; the chains index `ORDER`.
 type Band = fluor::layout::Band<SURFACES, { 2 * SURFACES + 1 }>;
 static mut BANDS: [Band; 2 * SURFACES + 1] = [Band::NONE; 2 * SURFACES + 1];
 static mut NBANDS: usize = 0;
@@ -7721,6 +7727,8 @@ fn server(grants: u64) -> ! {
         CODES_ROWS = alloc::vec![[0u64; 16]; CODES_BLOCKS * (PUB_WORKERS + 1)].leak().as_mut_ptr() as usize;
         LAYER_ROWS = alloc::vec![[0u64; 1344]; SURFACES * (PUB_WORKERS + 1)].leak().as_mut_ptr() as usize;
         FLIGHT_TEXT = alloc::vec![0u32; height].leak().as_mut_ptr() as usize;
+        // The flight's plane image and the capture's buffer (`PLANE`): a full screen, 30.7 MiB on the Pro, 19.8 MiB on the 8a.
+        PLANE = alloc::vec![0u64; width * height].leak().as_mut_ptr() as usize;
     }
     heap_at[4] = ALLOC.used();
     // The publish workers' stacks, so the draw functions tell a worker's band of the scene by the stack it runs on (`draw::thread_slot`).
@@ -7824,7 +7832,7 @@ fn server(grants: u64) -> ! {
     log.flush();
     let surf = ferros_sys::dma(cap(grants, S_APPSURF)) as usize;
     if surf != 0 && surf != u64::MAX as usize {
-        // The four surfaces' start: from init's spawn the grant arrives as one surface, surface 0, answered past its porch; from a restart (the kernel's shell grants) as the whole region at its base. Rounded down to the surface size, both are the region's start (the native display reaches all four from there; masked, it will need the whole region as one grant either way).
+        // The surfaces' window: the whole region at its base, from init's spawn (the kernel keeps it whole for the server of `display` since 2026-11-12) and from a restart (the kernel's shell grants) alike. Rounded down to the slot size, a kernel from before that handed a surface of the region past its porch gives the same start.
         unsafe { SURFS = surf & !(SURFACE_BYTES - 1) };
     }
     let mut next_flip = now() + freq() / 10;
@@ -7894,14 +7902,14 @@ fn server(grants: u64) -> ! {
         log.flush();
     }
     // The windows' owners (`reaper`): the kernel's bell on the surfaces changing hands, then the thread asleep on it. A kernel without the bell: the preference bytes alone, read each pass, as before.
-    if ferros_sys::bell(ferros_sys::BELL_SURFACES, &SURF_LIVE) {
+    if ferros_sys::bell(ferros_sys::BELL_SLOTS, &SURF_LIVE) {
         SURF_BELL.store(true, Ordering::Release);
         if ferros_sys::thread_spawn(reaper, unsafe { &mut *(&raw mut REAP_STACK) }, 0) != 0 {
             log.s(b"display: no reaper thread\n");
             log.flush();
         }
     } else {
-        log.s(b"display: no surfaces bell (an older kernel): windows of ended processes go on the next pass\n");
+        log.s(b"display: no slots bell (a kernel from before 2026-11-12): no window counts as live, this display needs the kernel of its day\n");
         log.flush();
     }
     // The render thread on the big core (KERNEL.md "Cores": pinning by latency class — this is the one real compute path; receive and vsync stay on the workers, where the map and the touch server run, so a call hands off on the caller's own core). After the other threads are spawned: they inherit the mask.
@@ -8112,8 +8120,8 @@ fn server(grants: u64) -> ! {
                     }
                     // The plane image is drawn into the flight's surface, from clear, not into the canvas (which holds the page image's clean window).
                     let pixels: &mut [Px] = match unsafe { *(&raw const FLIGHT) } {
-                        Some(f) if pre == 2 => {
-                            let s = surface(f.surf, width, height);
+                        Some(_) if pre == 2 => {
+                            let s = plane_image(width, height);
                             s.fill(0);
                             s
                         }
@@ -8641,7 +8649,7 @@ fn server(grants: u64) -> ! {
                         len = 2;
                     }
                 }
-                // 45 `flight [way u8: 1 opening, 0 closing][the plane image's camera op, 18 bytes][the page image's camera op, 18 bytes]`, then the ops that make a missing image (COMPOSITOR.md "The flight, prerendered"): this header decides what they make (`FLIGHT_PRE`); the batch runner runs them after it. Status 3: no flight here (no free surface, an app in front, no front layer, no temporal phases, or the page image not on the screen to close from); the map flies the old way.
+                // 45 `flight [way u8: 1 opening, 0 closing][the plane image's camera op, 18 bytes][the page image's camera op, 18 bytes]`, then the ops that make a missing image (COMPOSITOR.md "The flight, prerendered"): this header decides what they make (`FLIGHT_PRE`); the batch runner runs them after it. Status 3: no flight here (an app in front, no front layer, no temporal phases, or the page image not on the screen to close from); the map flies the old way.
                 Some(45) if m.len() >= 38 => {
                     let t45 = now();
                     let (mut plane, mut page) = ([0u8; 18], [0u8; 18]);
@@ -8649,18 +8657,15 @@ fn server(grants: u64) -> ! {
                     page.copy_from_slice(&m[20..38]);
                     let theme = ferros_sys::theme::index() as u8;
                     let scene = unsafe { SCENE_GEN };
-                    // The surface: the flight's own while it is still free, else the last free one (the kernel gives surfaces out from the first, the capture takes the first free).
-                    let surf = match unsafe { *(&raw const FLIGHT) } {
-                        Some(f) if flight_surface_free(f.surf) => Some(f.surf),
-                        _ => (0..SURFACES).rev().find(|&k| flight_surface_free(k)),
-                    };
+                    // The plane image's buffer is the display's own (`PLANE`): the flight waits on no app's surface, only on no app being in front.
+                    let surf = flight_free().then_some(());
                     let ok = surf.is_some() && front_layer(width, height).is_some() && ten && unsafe { TEMPORAL };
                     unsafe { FLIGHT_PRE = 0 };
                     match surf {
-                        Some(k) if ok => unsafe {
+                        Some(()) if ok => unsafe {
                             let mut f = match *(&raw const FLIGHT) {
-                                Some(f) if f.surf == k && f.theme == theme && f.scene == scene => f,
-                                _ => FlightImages { surf: k, plane: None, page, theme, scene },
+                                Some(f) if f.theme == theme && f.scene == scene => f,
+                                _ => FlightImages { plane: None, page, theme, scene },
                             };
                             f.page = page;
                             let page_up = REGION_ON && CLEAN_KEY.is_some_and(|c| c.1 == page);
@@ -8670,7 +8675,7 @@ fn server(grants: u64) -> ! {
                                     if REGION_ON {
                                         out[0] = 3;
                                     } else {
-                                        surface(k, width, height).copy_from_slice(&pixels[..width * height]);
+                                        plane_image(width, height).copy_from_slice(&pixels[..width * height]);
                                         f.plane = Some(plane);
                                     }
                                 }
@@ -8706,7 +8711,7 @@ fn server(grants: u64) -> ! {
                     cam.copy_from_slice(&m[1..19]);
                     let alpha = u16::from_le_bytes([m[19], m[20]]);
                     match unsafe { *(&raw const FLIGHT) } {
-                        Some(FlightImages { surf, plane: Some(plane), page, .. }) if flight_surface_free(surf) && unsafe { REGION_ON && CLEAN_KEY.is_some_and(|c| c.1 == page) } => {
+                        Some(FlightImages { plane: Some(plane), page, .. }) if flight_free() && unsafe { REGION_ON && CLEAN_KEY.is_some_and(|c| c.1 == page) } => {
                             unsafe {
                                 // The clean window's ground, from its region op (`[cx i16][cy i16][r u16][ground]`), and the text's rows from the front layer's kept ops.
                                 let q = (*(&raw const CLEAN_KEY)).map(|c| c.0).unwrap_or([0; 10]);
@@ -8732,7 +8737,7 @@ fn server(grants: u64) -> ! {
                                     clean_reset();
                                 }
                                 FLIGHT_SEQ += 1;
-                                FLIGHT_FRAME = Some(FlightFrame { page: flight_map(&cam, &page, width, height), plane: flight_map(&cam, &plane, width, height), alpha, plane_px: surface(surf, width, height).as_ptr() as usize, ground });
+                                FLIGHT_FRAME = Some(FlightFrame { page: flight_map(&cam, &page, width, height), plane: flight_map(&cam, &plane, width, height), alpha, plane_px: PLANE, ground });
                                 CLOCK_SHOWN = false;
                                 SCOPE_SHOWN = false;
                                 PUB_TICKS = [0; 3];
@@ -9272,9 +9277,10 @@ fn server(grants: u64) -> ! {
                     l.flush();
                 }
                 Some(30) => {
-                    // Not the flight's: it holds the plane image.
-                    let flight_surf = unsafe { *(&raw const FLIGHT) }.map(|f| f.surf);
-                    let free = (0..SURFACES).find(|&k| unsafe { (*(&raw const WINS))[k] }.is_none() && Some(k) != flight_surf);
+                    // Into the plane image's buffer (`PLANE`): a flight's plane image is made again at its next flight.
+                    if let Some(f) = unsafe { (*(&raw mut FLIGHT)).as_mut() } {
+                        f.plane = None;
+                    }
                     let flight = unsafe { *(&raw const FLIGHT_FRAME) };
                     let wall_at = unsafe { if WALL_ON { WALL_BUF } else { 0 } };
                     // `[30, 1]`: the glass's mask alone (owner, 2026-11-10, the website's screens: "pull that screen mask for the edges/cam, de premultiply it, apply alpha"): every pixel through `glass_front` with nothing in front but the mask and only white behind it, so with the release look's black mask each pixel's working value is white times the share of the glass that shows there (the edge's and the camera hole's antialiasing exact, as the panel gets them). Whatever is on the screen, an app included.
@@ -9290,10 +9296,10 @@ fn server(grants: u64) -> ! {
                             b.unbake_with(s, &to_p, &to_v);
                         }
                     };
-                    let text: alloc::string::String = match (unsafe { APP }.is_some() && !mask, free) {
+                    let text: alloc::string::String = match unsafe { APP }.is_some() && !mask {
                         // The deck: each row as `publish_band` composes it for the glass (the edge, then the console, then the canvas), in working values, into the free surface.
-                        (false, Some(k)) => {
-                            let s = surface(k, width, height);
+                        false => {
+                            let s = plane_image(width, height);
                             let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
                             for y in 0..height {
                                 let g = &rows[y];
@@ -9337,11 +9343,8 @@ fn server(grants: u64) -> ! {
                             }
                             alloc::format!("G#{:X}\n", s.as_ptr() as usize)
                         }
-                        // The canvas is baked and is not unbaked in place (it is the screen's): no capture without a free surface.
-                        (false, None) => "no free surface\n".into(),
-                        (true, None) => "no free surface\n".into(),
-                        (true, Some(k)) => {
-                            let s = surface(k, width, height);
+                        true => {
+                            let s = plane_image(width, height);
                             unsafe { CAPTURE = s.as_mut_ptr() as usize };
                             publish_app(draw::Rect::full(width, height), &tabs, 0, width, height, false);
                             unsafe { CAPTURE = 0 };

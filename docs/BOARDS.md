@@ -53,7 +53,8 @@ In the high bank memblock reserves the hv's device tree copy (G#8_FFF0_0000-G#8_
 The two ranges stop a frame short of the first and at the 2 MiB frame under the last, as husky's stop under its pools; the top of the bank is the part the August chain will not let the hv touch at the handoff anyway.
 Below them the capture proves the old pools too (G#8300_0000-G#8400_0000 and G#A000_0000-G#B400_0000 lie in G#8000_0000-G#901F_FFFF and G#9740_0000-G#B61F_FFFF, plain memory with nothing reserved), and the layer arena's lower half (G#9800_0000-G#9C00_0000), so akita's arena is husky's 128 MiB since (below).
 On ferros, `diag frames test` wrote all 5058 MiB of free frames with their own addresses, read them back and wiped them: no word wrong, and the 8a ran on.
-Not in the pool on either board: the kernel's window, the DMA regions (display, USB, gpu-mem, layers, the modem's windows), the surfaces and canvas, the low bank's firmware carve-outs, and the hv.
+The apps' surfaces' old carve-out, G#CA00_0000-G#D200_0000, is in the pool on both boards since 2026-11-12, after the two old pools (cachemap `POOL_SURF`): plain memory in both memblocks (husky's nearest reservations end at G#C308_FFFF and start at G#D810_0000; akita reserves nothing from G#C309_0000 to G#E7FF_FFFF), and surfaces are frames of the pool since (WINDOWS.md "Surfaces on demand").
+Not in the pool on either board: the kernel's window, the DMA regions (display, USB, gpu-mem, layers, the modem's windows), the canvas, the low bank's firmware carve-outs, and the hv.
 
 The layer arena (cachemap `layers`) is G#9800_0000-G#A000_0000 on both boards (memblock: plain memory on each). On akita it was the upper 64 MiB alone until the capture above (2026-11-12): with the attest screen's 32 MiB block taken, Mahere's GPU map got a 32 MiB block, too small for its frame's two regions and four cells, stopped, and left its circle black; with the whole arena it gets 64 MiB and draws.
 
