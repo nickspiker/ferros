@@ -52,6 +52,11 @@ impl Facets {
 }
 
 impl Client {
+    /// Work the loop's next pass does at once: a binding held to be signed (`facets_work` signs one a pass), or an add's chain to look up now the network is up (`person_step`).
+    pub fn facets_pending(&self) -> bool {
+        !self.facets.held.is_empty() || (self.net_up && self.facets.adding.as_ref().is_some_and(|a| !a.looked))
+    }
+
     fn reply_to(&self, tok: &[u8; 32], r: &[u8]) {
         svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, r.as_ptr() as u64 - self.udp.base, r.len() as u64, 0, 0);
     }

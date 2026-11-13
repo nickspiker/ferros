@@ -7,7 +7,7 @@
 //!
 //! `udp` requests (first byte):
 //! - 1 SEND: family (4 or 6), address (16 bytes; IPv4 in the first 4), destination port (u16 BE), source port (u16 BE), payload → [0] sent, [1] resolving the next hop (retry), [2] no address yet, [3] bad request.
-//! - 2 RECV: port (u16 BE) → family, address (16), source port, destination port, payload, or nothing (length 0). A RECV on a port, or a SEND from it, opens it: datagrams are kept only for the last eight ports asked for (a broadcast to a port nobody reads once filled the queue for good), the oldest giving way when the queue is full. IPv4 multicast and IPv6 link-scope multicast (ff02::; Photon's LAN beacons go to 239.104.199.144 and ff02::68c7:9014, port 4384) are delivered like unicast. A fourth byte, a wait in seconds (1 to 255), holds the call while the port has nothing: answered as a datagram for it lands, else with nothing when the wait runs out (a doorbell for a blocking reader, never a poll: owner, 2026-11-10, "No polling!"; 2026-11-11, Mahere fetching its map cells, "we have tcp and http so let's get the full meal deal wired up with mahere"). Without it, or 0, the answer is at once, as before.
+//! - 2 RECV: port (u16 BE) → family, address (16), source port, destination port, payload, or nothing (length 0). A RECV on a port, or a SEND from it, opens it: datagrams are kept only for the last eight ports asked for (a broadcast to a port nobody reads once filled the queue for good), the oldest giving way when the queue is full. IPv4 multicast and IPv6 link-scope multicast (ff02::; Photon's LAN beacons go to 239.104.199.144 and ff02::68c7:9014, port 4384) are delivered like unicast. A fourth byte, a wait in seconds (1 to 255), holds the call while the port has nothing: answered as a datagram for it lands, else with nothing when the wait runs out (a doorbell for a blocking reader, never a poll: owner, 2026-11-10, "No polling!"; 2026-11-11, Mahere fetching its map cells, "we have tcp and http so let's get the full meal deal wired up with mahere"). Without it, or 0, the answer is at once, as before. Eight bytes after the wait byte, a deadline on the counter (u64 BE, the ticks `cntvct_el0` counts; 0 at once, u64::MAX until a datagram comes), hold it to exactly then in place of the wait (2026-11-13: std apps waiting out a read timeout of their own, Photon's blocking sockets). Four bytes after that, the reader's id (u32 BE, a WATCH's, op 11): a port watched by several readers keeps each datagram until each of them has taken it, and this reader gets the oldest it has yet to take (fgtw and Photon both read 4383 and 4384; until 2026-11-13 whichever asked first took a datagram from the other). A RECV naming no reader takes the oldest for everyone, as before; a named reader that watches no such port takes only a datagram no reader waits for (a socket opening its port never takes another reader's copy).
 //! - 3 INFO: → MAC (6), IPv4 address, mask, router (4 each), IPv6 link-local (16), IPv6 global (16), flags (bit 0 IPv4 bound, bit 1 IPv6 global, bit 2 the cellular call is up, bit 3 a person is present, so applications are served), the IPv4 DNS server (4), then the IPv6 DNS server (16): 71 bytes. The addresses and DNS servers are the ones traffic of each family leaves with: WiFi's when it has them (DHCP's option 6; the router advertisement's RDNSS), else the call's; a server of zeros when that link named none.
 //!
 //! While nobody is present (bit 3 clear) every request but INFO is answered with nothing: a SEND sends nothing, a RECV brings nothing, a CONNECT opens nothing. An application asks INFO first and says so (2026-11-12: Mahere and httptest said "DNS gave no address" all night on a locked device, their questions never sent).
@@ -28,6 +28,14 @@
 //!   - The cache (`ferros_dns::Cache`): 32 records (a name and a type each), searched in order, the least recently asked giving way. An address holds for its TTL (the least along a chain of aliases), then is kept as the last good one: asked for, it is answered at once while a lookup for it runs, and a lookup that brings no answer keeps it for another TTL (Mahere's rules, 2026-11-11, now every client's). No such address is kept for the SOA's negative TTL (RFC 2308 5), at most 256 s (8 s without an SOA). A TCP connection that opens clears its address's failures; four failures in a row (resets, or what it sent unanswered) make the address stale, so its name is asked again.
 //!   - One lookup a name and type, however many ask: the calls hold on it. A question goes from the resolver's one port (random for the session) with a random id (the entropy grant, each question), to the DNS server of each family's link (INFO's, IPv6's first, turn about), four tries a second apart (the one timer: a lost datagram never comes back); a try ip cannot send yet for want of the next hop goes again 2^-6 s on. An answer counts only from port 53 of a server a try went to, with the id, repeating the question (`ferros_dns::read`); a SERVFAIL or REFUSED moves to the next try at once. Nothing an application sends may leave from the resolver's port (op 1 answers [3]).
 //!   - Each lookup's end is a console line: the type, found or not or no answer, its time and tries; never the name or the address (they are the person's).
+//! - 11 WATCH: mode (bit 0 level), flags seen, id (u32 BE), datagram seen (u32 BE), deadline (u64 BE, counter ticks, 0 none), ports (u16 BE each, up to sixteen) → flags (INFO's byte), the newest datagram told of (u32 BE), count, the ports with news (u16 BE each).
+//!   - The readiness doorbell (2026-11-13: Photon asked RECV every 2 ms a socket, about a thousand calls a second at rest, and fgtw 150 a second; owner, 2026-11-10, "No polling!").
+//!   - Held while nothing changed; answered when a watched port holds a datagram numbered after the one seen (in level mode: any datagram waiting), when the flags differ from the ones seen, when the deadline passes, or at a KICK.
+//!   - Nothing is taken from the queue: the caller RECVs the ports named and passes the number back as seen next time, so a datagram it was told of and has not yet read never answers again (no spin while it is busy). The number is the last datagram queued for anyone while a person is present; a caller's first watch asks in level mode, its seen number meaning nothing yet.
+//!   - The ports' datagrams are kept while a watch names them and 64 s after (`pins`, sixteen apart from the eight ports the receives open), so a watcher between two watches loses nothing to other applications opening ports. While nobody is present the ports say nothing and the watch holds; the person bit is in the flags, so the person's return answers it. WATCH and KICK are served then, as INFO is.
+//!   - Eight held at once (`WATCHN`), a table of their own: a second watch with the same id answers the first as things stand, a ninth the oldest.
+//! - 12 KICK: id (u32 BE) → [0]: the watch held with that id answered at once as things stand, or, with none held, the next WATCH with that id (a process whose watcher thread sits in a WATCH tells it of a port added since; the KICK may arrive first: it is latched for the id).
+//! - 13 UNWATCH: id (u32 BE) → [0]: the reader is gone (a socket dropped): its watch answered as things stand, its KICKs dropped, its reader entries retired, so no datagram waits for it. A reader no watch of its id has named for 64 s is retired the same way at the next datagram (a process that ended).
 //!
 //! DHCPv4 (`dhcp_in`, `dhcp_retry`): DISCOVER, OFFER, REQUEST, ACK, retransmitted every 2 s until bound; four REQUESTs unanswered give the offer up for a fresh DISCOVER (RFC 2131 4.4.1). What it sent and heard since WiFi came up is a console line every 16th retransmit while unbound and once at the bind: `DHCP <no lease yet|bound>: A#<n> DISCOVERs and A#<n> REQUESTs out; A#<n> OFFERs, A#<n> ACKs, A#<n> NAKs in, A#<n> replies to other transactions; WiFi frames in A#<n> broadcast, A#<n> multicast, A#<n> unicast (A#<n> ARP, A#<n> IPv4); state A#<1 discovering, 2 requesting, 3 bound>[, lease A#<s> s]`. The DISCOVER asks for unicast replies (broadcast flag clear). No renewal yet: the lease is said, not kept to.
 //!
@@ -71,6 +79,10 @@ struct Datagram {
     dport: u16,
     len: usize,
     seq: u32,
+    /// When it was queued (the counter): its wait until an application took it is measured (`Path::took`).
+    at: u64,
+    /// The readers (`pins`, a bit each) yet to take it; 0: the first RECV of its port takes it, as before readers.
+    readers: u16,
     data: [u8; 1472],
 }
 
@@ -110,6 +122,8 @@ struct Ip {
     dns6: [u8; 16],
     ports: [u16; 8],
     ports_at: usize,
+    /// The readers of watched ports: (the watch's id, a port it named, when it last named it; 0 unused). A datagram for such a port is kept for each of its readers until each has taken it (`Datagram::readers`): fgtw and Photon both read 4383 and 4384, and until 2026-11-13 whichever asked first took a datagram from the other. Kept apart from the eight ports above, so a watcher between two watches loses nothing to an application opening ports meanwhile (Photon opens one for each LAN announcement). A reader counts while a watch of its id names the port and 64 s after (`PIN_LOG2`); the stalest gives way.
+    pins: [(u32, u16, u64); READERN],
     qseq: u32,
     /// The connections' control state (a static table) and their buffers' blocks of the arc.
     tcb: &'static mut [Tcb; TCPN],
@@ -138,6 +152,10 @@ struct Ip {
     held: [Held; HELDN],
     /// Stamps the holds in arrival order: the oldest gives way when all are taken.
     held_seq: u32,
+    /// Watches held until something changes (op 11), answered by `answer_watches`; KICKs (op 12) that came before their watch, the oldest giving way.
+    watches: [Watch; WATCHN],
+    kicks: [Option<u32>; WATCHN],
+    kicks_at: usize,
     /// The WiFi driver exchanges frames in batches (`wlan` op 8; `wifi_up` asks): frames to it wait in `txb` (the op's header, then each frame's u16 BE length and bytes; `txn` bytes used) until the next exchange. False: a driver without op 8, one frame a call (ops 1 and 2).
     batch: bool,
     txb: &'static mut [u8; MSG_MAX],
@@ -201,6 +219,11 @@ struct Path {
     by_ring: u32,
     by_call: u32,
     by_timer: u32,
+    /// Applications' requests served (every op, every caller), and the watches answered (op 11): at rest, the calls the apps make.
+    requests: u32,
+    watch_answers: u32,
+    /// Datagrams an application took (op 2), by port and reader, the first four seen in the window: (port, the reader's watch id or 0 for a RECV naming none, how many, their ticks in the queue in all, the longest). The wait from a datagram landing to its reader taking it: a reader that polls shows its period here, one that waits on a doorbell its wake (2026-11-13).
+    took: [(u16, u32, u32, u64, u64); 4],
     /// When this window began (0: not yet), for the idle report every 64 s or more (`main`): with no timer bringing passes, the window's passes and waits are the stack's wakes at rest.
     t0: u64,
 }
@@ -256,6 +279,25 @@ impl Path {
             ip.dec(self.by_call as u64);
             ip.put(b", the timer A#");
             ip.dec(self.by_timer as u64);
+        }
+        ip.put(b"; app requests A#");
+        ip.dec(self.requests as u64);
+        ip.put(b", watches answered A#");
+        ip.dec(self.watch_answers as u64);
+        for &(port, who, n, t, most) in self.took.iter().filter(|e| e.2 > 0) {
+            ip.put(b"; port A#");
+            ip.dec(port as u64);
+            ip.put(b" reader G#");
+            for k in (0..8).rev() {
+                ip.put(&[b"0123456789abcdef"[(who >> (4 * k) & 15) as usize]]);
+            }
+            ip.put(b" took A#");
+            ip.dec(n as u64);
+            ip.put(b" datagrams, A#");
+            ip.dec(us(t) / n as u64);
+            ip.put(b" us in the queue on average, A#");
+            ip.dec(us(most));
+            ip.put(b" us longest");
         }
         ip.put(b"\n");
     }
@@ -350,11 +392,45 @@ struct Held {
     handle: u8,
     state: u8,
     most: u32,
+    /// A UDP receive's reader (op 2's id: a watch's, `pins`), or None.
+    id: Option<u32>,
     seq: u32,
     until: u64,
     tok: [u8; 32],
 }
-const HELD_FREE: Held = Held { used: false, tcp: false, port: 0, handle: 0, state: 0, most: 0, seq: 0, until: 0, tok: [0; 32] };
+const HELD_FREE: Held = Held { used: false, tcp: false, port: 0, handle: 0, state: 0, most: 0, id: None, seq: 0, until: 0, tok: [0; 32] };
+
+/// Watches held at once (op 11): eight, one a reading process is enough (Photon's reactor, fgtw's doorbell helper, a blocking reader waiting out an absence), with room; a table of their own, so the receives' sixteen never push one out.
+const WATCHN: usize = 1 << 3;
+/// The most ports one watch names (sixteen, twice the eight ports kept for the apps).
+const WATCH_PORTS: usize = 1 << 4;
+/// A WATCH request's fixed part: the op, the mode, the flags seen, the id (u32 BE), the datagram seen (u32 BE), the deadline (u64 BE); its ports follow.
+const WATCH_HEAD: usize = 19;
+/// How long a watch keeps its ports after it last named them: 2^6 s (`pins`).
+const PIN_LOG2: u32 = 6;
+/// Readers of watched ports at once (`pins`): sixteen, a bit each in a datagram's `readers`.
+const READERN: usize = 1 << 4;
+
+/// One held watch (op 11): its reply token, the caller's id (op 12 KICK names it), the ports it watches, the INFO flags its caller last saw, the newest datagram its caller was told of (`level`: every datagram waiting counts, `seen` unused), when it runs out (u64::MAX never), its arrival (the oldest gives way).
+#[derive(Clone, Copy)]
+struct Watch {
+    used: bool,
+    id: u32,
+    ports: [u16; WATCH_PORTS],
+    n: usize,
+    flags: u8,
+    seen: u32,
+    level: bool,
+    until: u64,
+    seq: u32,
+    tok: [u8; 32],
+}
+const WATCH_FREE: Watch = Watch { used: false, id: 0, ports: [0; WATCH_PORTS], n: 0, flags: 0, seen: 0, level: false, until: 0, seq: 0, tok: [0; 32] };
+
+/// Whether datagram number `a` came after number `b` (the queue's numbers wrap: half the range ahead is after).
+fn after(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
+}
 
 /// The resolver's cache (op 10, `ferros_dns::Cache`): 32 records, a name and a type each, searched in order (a device's handful of hosts; no HashMap).
 const RECN: usize = 1 << 5;
@@ -869,6 +945,9 @@ impl Ip {
         }
         for h in self.held.iter().filter(|h| h.used) {
             t = t.min(h.until);
+        }
+        for w in self.watches.iter().filter(|w| w.used) {
+            t = t.min(w.until);
         }
         // The resolver's: a try running out, a held RESOLVE's wait.
         for k in (0..RECN).filter(|&k| self.res.cache.r[k].asking) {
@@ -1701,7 +1780,14 @@ impl Ip {
             self.dns_in(fam, addr, sport, data);
             return;
         }
-        if dport == 0 || !self.ports.contains(&dport) {
+        // Readers gone stale (no watch of theirs for 64 s: a process that ended, a socket dropped without UNWATCH) retired first, so no datagram waits for them.
+        for k in 0..READERN {
+            if self.pins[k].2 != 0 && !self.fresh(k) {
+                self.retire(k);
+            }
+        }
+        let readers = self.readers_of(dport);
+        if dport == 0 || !(self.ports.contains(&dport) || readers != 0) {
             return;
         }
         // A free slot, else the oldest datagram's.
@@ -1713,6 +1799,8 @@ impl Ip {
         let seq = self.qseq;
         let d = &mut self.q[slot];
         d.seq = seq;
+        d.at = now();
+        d.readers = readers;
         let n = data.len().min(d.data.len());
         d.used = true;
         d.fam = fam;
@@ -1721,6 +1809,66 @@ impl Ip {
         d.dport = dport;
         d.len = n;
         d.data[..n].copy_from_slice(&data[..n]);
+    }
+
+    /// Whether reader `k` (`pins`) reads its port now: a held watch of its id names the port, or one did in the last 64 s.
+    fn fresh(&self, k: usize) -> bool {
+        let (id, port, at) = self.pins[k];
+        at != 0 && (now().wrapping_sub(at) < self.freq << PIN_LOG2 || self.watches.iter().any(|w| w.used && w.id == id && w.ports[..w.n].contains(&port)))
+    }
+
+    /// The readers of `port` now, a bit each (`pins`): a datagram for it waits until each has taken it.
+    fn readers_of(&self, port: u16) -> u16 {
+        (0..READERN).filter(|&k| self.pins[k].1 == port && self.fresh(k)).fold(0, |m, k| m | 1 << k)
+    }
+
+    /// Reader `id`'s entry for `port` (`pins`), if it watches it.
+    fn reader_slot(&self, id: u32, port: u16) -> Option<usize> {
+        (0..READERN).find(|&k| self.pins[k].2 != 0 && self.pins[k].0 == id && self.pins[k].1 == port)
+    }
+
+    /// Who asks for `port`'s datagrams: None, a RECV naming no reader; Some(entry) for a named reader, its entry (`pins`) or None when it watches no such port.
+    fn who(&self, id: Option<u32>, port: u16) -> Option<Option<usize>> {
+        id.map(|id| self.reader_slot(id, port))
+    }
+
+    /// Whether datagram `i` is one for `port` that `who` may take: a RECV naming no reader any (as before readers); a reader with an entry those it has yet to take; a named reader with none only a datagram no reader waits for (a socket opening its port never takes another reader's copy). A datagram with no readers is anyone's.
+    fn takeable(&self, i: usize, port: u16, who: Option<Option<usize>>) -> bool {
+        let d = &self.q[i];
+        d.used && d.dport == port && (d.readers == 0 || who.is_none_or(|s| s.is_some_and(|s| d.readers & 1 << s != 0)))
+    }
+
+    /// Watch `w`'s ports read by its id as of now: each entry renewed, or the stalest entry taken (its reader's bit cleared from every datagram first, those left with no reader freed).
+    fn pin(&mut self, w: &Watch) {
+        let t = now();
+        for &p in &w.ports[..w.n] {
+            let k = match self.reader_slot(w.id, p) {
+                Some(k) => k,
+                None => {
+                    let k = (0..READERN).min_by_key(|&k| self.pins[k].2).unwrap();
+                    self.retire(k);
+                    k
+                }
+            };
+            self.pins[k] = (w.id, p, t);
+        }
+    }
+
+    /// Reader entry `k` (`pins`) forgotten: its bit cleared from every datagram (one left with no reader freed), the entry free.
+    fn retire(&mut self, k: usize) {
+        for d in self.q.iter_mut().filter(|d| d.used && d.readers & 1 << k != 0) {
+            d.readers &= !(1 << k);
+            d.used = d.readers != 0;
+        }
+        self.pins[k] = (0, 0, 0);
+    }
+
+    /// Watch `w` answered as things stand (its ports pinned again: its caller is about to watch them anew).
+    fn watch_send(&mut self, w: &Watch, out: &mut [u8]) {
+        self.pin(w);
+        self.path.watch_answers += 1;
+        let l = self.watch_answer(w, out);
+        svc(REPLY, self.off(w.tok.as_ptr()), self.off(out.as_ptr()), l as u64, 0, 0);
     }
 
     /// Keep datagrams for `port` from now on (one of the last eight opened).
@@ -2740,11 +2888,30 @@ impl Ip {
         p.say(self);
     }
 
-    /// The port's oldest datagram into `out` (family, address, source port, destination port, payload); 0 when it has none.
-    fn udp_take(&mut self, port: u16, out: &mut [u8]) -> usize {
-        let Some(i) = (0..QN).filter(|&i| self.q[i].used && self.q[i].dport == port).min_by_key(|&i| self.q[i].seq) else { return 0 };
+    /// The port's oldest datagram into `out` (family, address, source port, destination port, payload); 0 when it has none. `id`: the reader asking (a watch's id, `pins`): the oldest it has yet to take, kept for the port's other readers until each has; None, or a reader that watches no such port: the oldest, taken for all, as before readers.
+    fn udp_take(&mut self, port: u16, id: Option<u32>, out: &mut [u8]) -> usize {
+        let who = self.who(id, port);
+        let slot = who.flatten();
+        let Some(i) = (0..QN).filter(|&i| self.takeable(i, port, who)).min_by_key(|&i| self.q[i].seq) else { return 0 };
+        let waited = now().wrapping_sub(self.q[i].at);
+        // The first four readers (port and id) in the window keep a measure; later ones are not counted.
+        let who = id.unwrap_or(0);
+        if let Some(e) = self.path.took.iter_mut().find(|e| e.2 == 0 || (e.0 == port && e.1 == who)) {
+            e.0 = port;
+            e.1 = who;
+            e.2 += 1;
+            e.3 += waited;
+            // WHY the max: the high water, for the measure.
+            e.4 = e.4.max(waited);
+        }
         let d = &mut self.q[i];
-        d.used = false;
+        match slot {
+            Some(s) if d.readers != 0 => {
+                d.readers &= !(1 << s);
+                d.used = d.readers != 0;
+            }
+            _ => d.used = false,
+        }
         out[0] = d.fam;
         out[1..17].copy_from_slice(&d.addr);
         out[17..19].copy_from_slice(&d.sport.to_be_bytes());
@@ -2782,8 +2949,8 @@ impl Ip {
         1 + n
     }
 
-    /// Hold a receive (`tok` its reply token) for `wait` seconds: on UDP `port`, or on connection `handle` when `tcp` (`most` the data its reader takes). A held receive on the same connection is answered first as things stand (one reader a connection), and with every slot taken the oldest is.
-    fn hold(&mut self, tcp: bool, port: u16, handle: u8, wait: u8, most: u32, tok: &[u8; 32], out: &mut [u8]) {
+    /// Hold a receive (`tok` its reply token) until the counter passes `until` (u64::MAX: until something comes): on UDP `port`, or on connection `handle` when `tcp` (`most` the data its reader takes). A held receive on the same connection is answered first as things stand (one reader a connection), and with every slot taken the oldest is.
+    fn hold(&mut self, tcp: bool, port: u16, handle: u8, until: u64, most: u32, id: Option<u32>, tok: &[u8; 32], out: &mut [u8]) {
         let same = if tcp { (0..HELDN).find(|&k| self.held[k].used && self.held[k].tcp && self.held[k].handle == handle) } else { None };
         let k = match same.or_else(|| (0..HELDN).find(|&k| !self.held[k].used)) {
             Some(k) => k,
@@ -2794,7 +2961,7 @@ impl Ip {
         }
         self.held_seq = self.held_seq.wrapping_add(1);
         let state = if tcp { self.tcb[handle as usize].state } else { 0 };
-        self.held[k] = Held { used: true, tcp, port, handle, state, most, seq: self.held_seq, until: now() + wait as u64 * self.freq, tok: *tok };
+        self.held[k] = Held { used: true, tcp, port, handle, state, most, id, seq: self.held_seq, until, tok: *tok };
     }
 
     /// Answer hold `k` as things stand (a connection's state and data, or the port's next datagram or nothing), and free it.
@@ -2813,7 +2980,7 @@ impl Ip {
                 self.tcp_take(i, out, h.most)
             }
         } else {
-            self.udp_take(h.port, out)
+            self.udp_take(h.port, h.id, out)
         };
         svc(REPLY, self.off(h.tok.as_ptr()), self.off(out.as_ptr()), l as u64, 0, 0);
     }
@@ -2833,7 +3000,8 @@ impl Ip {
                     let c = &self.tcb[h.handle as usize];
                     c.state != h.state || c.state >= 3 || c.rx_len > 0
                 } else {
-                    (0..QN).any(|i| self.q[i].used && self.q[i].dport == h.port)
+                    let who = self.who(h.id, h.port);
+                    (0..QN).any(|i| self.takeable(i, h.port, who))
                 };
             if ready {
                 self.answer(k, out);
@@ -2845,23 +3013,165 @@ impl Ip {
         any
     }
 
+    /// INFO's flags byte: bit 0 an IPv4 route, bit 1 an IPv6 one, bit 2 the cellular call up, bit 3 a person present.
+    fn flags(&self) -> u8 {
+        let a4 = self.pick4(&[8, 8, 8, 8]);
+        let a6 = self.pick6(&[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        a4.is_some() as u8 | (a6.is_some() as u8) << 1 | (self.cell.flags & 1) << 2 | (self.person as u8) << 3
+    }
+
+    /// Op 11 WATCH: [11, mode, flags seen, id (u32 BE), datagram seen (u32 BE), deadline (u64 BE, counter ticks, 0 none), ports (u16 BE each, up to 16)]. Answered at once when it has something to say, else held (None) until it does (`answer_watches`).
+    fn watch(&mut self, m: &[u8], tok: &[u8; 32], out: &mut [u8]) -> Option<usize> {
+        // WHY the checks: the request is the caller's; shorter than its fixed part, or an odd byte of ports, is a bad request.
+        if m.len() < WATCH_HEAD || (m.len() - WATCH_HEAD) & 1 != 0 {
+            out[0] = 3;
+            return Some(1);
+        }
+        let mut w = Watch { used: true, id: u32::from_be_bytes(m[3..7].try_into().unwrap()), flags: m[2], seen: u32::from_be_bytes(m[7..11].try_into().unwrap()), level: m[1] & 1 != 0, tok: *tok, ..WATCH_FREE };
+        w.until = match u64::from_be_bytes(m[11..19].try_into().unwrap()) {
+            0 => u64::MAX,
+            d => d,
+        };
+        // WHY the min: the ports past sixteen are the caller's excess, not watched.
+        w.n = ((m.len() - WATCH_HEAD) >> 1).min(WATCH_PORTS);
+        for k in 0..w.n {
+            w.ports[k] = u16::from_be_bytes([m[WATCH_HEAD + 2 * k], m[WATCH_HEAD + 2 * k + 1]]);
+        }
+        // Its ports' datagrams kept from now on (`pins`), apart from the eight ports the receives open.
+        self.pin(&w);
+        // A KICK that came first: answered at once.
+        let kicked = self.kicks.iter().position(|&k| k == Some(w.id));
+        if let Some(k) = kicked {
+            self.kicks[k] = None;
+        }
+        if kicked.is_some() || self.watch_ready(&w, now()) {
+            self.path.watch_answers += 1;
+            return Some(self.watch_answer(&w, out));
+        }
+        // A watch of the same id answered first as things stand (one watcher an id), else a free slot, else the oldest.
+        let k = match (0..WATCHN).find(|&k| self.watches[k].used && self.watches[k].id == w.id).or_else(|| (0..WATCHN).find(|&k| !self.watches[k].used)) {
+            Some(k) => k,
+            None => (0..WATCHN).min_by_key(|&k| self.watches[k].seq).unwrap(),
+        };
+        if self.watches[k].used {
+            let old = self.watches[k];
+            self.watch_send(&old, out);
+        }
+        self.held_seq = self.held_seq.wrapping_add(1);
+        w.seq = self.held_seq;
+        self.watches[k] = w;
+        None
+    }
+
+    /// Whether watch `w` has something to say at `t`: the flags changed since its caller saw them, its deadline passed, or (a person present) a watched port holds a datagram newer than the one its caller was told of (any datagram, in level mode).
+    fn watch_ready(&self, w: &Watch, t: u64) -> bool {
+        if self.flags() != w.flags || t > w.until {
+            return true;
+        }
+        self.person && w.ports[..w.n].iter().any(|&p| self.news_for(w, p))
+    }
+
+    /// Whether port `p` holds news for watch `w`: a datagram its reader (the watch's id, `pins`) has yet to take, numbered after the one it saw (any, in level mode).
+    fn news_for(&self, w: &Watch, p: u16) -> bool {
+        let who = self.who(Some(w.id), p);
+        (0..QN).any(|i| self.takeable(i, p, who) && (w.level || after(self.q[i].seq, w.seen)))
+    }
+
+    /// Watch `w`'s answer into `out`: [flags, the datagram told of up to (u32 BE), count, the ports holding one newer than it saw, or any in level mode (u16 BE each)]. While a person is present that number is the last datagram queued for anyone (`qseq`): every datagram of a watched port up to it is either named now or was named before. While nobody is present nothing of the ports, and the number is the one its caller saw, so what came meanwhile is named at the person's return.
+    fn watch_answer(&self, w: &Watch, out: &mut [u8]) -> usize {
+        out[0] = self.flags();
+        let mut n = 0usize;
+        if self.person {
+            for &p in &w.ports[..w.n] {
+                if self.news_for(w, p) {
+                    out[6 + 2 * n..8 + 2 * n].copy_from_slice(&p.to_be_bytes());
+                    n += 1;
+                }
+            }
+        }
+        let newest = if self.person { self.qseq } else { w.seen };
+        out[1..5].copy_from_slice(&newest.to_be_bytes());
+        out[5] = n as u8;
+        6 + 2 * n
+    }
+
+    /// Op 12 KICK: the watch held with `id` answered at once as things stand; with none held, the id kept so the next WATCH with it is (the caller's new ports or flags reach it either way; the KICK may arrive before the WATCH it means).
+    fn kick(&mut self, id: u32, out: &mut [u8]) {
+        if let Some(k) = (0..WATCHN).find(|&k| self.watches[k].used && self.watches[k].id == id) {
+            let w = self.watches[k];
+            self.watches[k] = WATCH_FREE;
+            self.watch_send(&w, out);
+            return;
+        }
+        if !self.kicks.contains(&Some(id)) {
+            self.kicks[self.kicks_at] = Some(id);
+            self.kicks_at = (self.kicks_at + 1) & (WATCHN - 1);
+        }
+    }
+
+    /// Each pass: every held watch that has something to say now (`watch_ready`) answered. Returns whether any was.
+    fn answer_watches(&mut self, out: &mut [u8]) -> bool {
+        let t = now();
+        let mut any = false;
+        for k in 0..WATCHN {
+            let w = self.watches[k];
+            if w.used && self.watch_ready(&w, t) {
+                self.watches[k] = WATCH_FREE;
+                self.watch_send(&w, out);
+                any = true;
+            }
+        }
+        any
+    }
+
     /// One `udp` request (`tok` its reply token); returns the reply length written to `out`, or None when the request is held (answered later by `answer_held`).
     fn serve(&mut self, m: &[u8], tok: &[u8; 32], out: &mut [u8]) -> Option<usize> {
         // While nobody has attested no application sends, receives, connects or joins: nothing may act on what the radios bring until a person is present (the addresses, op 3, stay readable). The locate responder will be the one exception (AUTH.md "Locate").
-        if !self.person && m.first() != Some(&3) {
+        // WATCH and KICK too: a watch says nothing of what came while nobody is present, and holding through the absence is what keeps its caller from asking again and again (it is answered when the person bit of the flags changes).
+        if !self.person && !matches!(m.first(), Some(&3) | Some(&11) | Some(&12) | Some(&13)) {
             return Some(0);
         }
-        // The receives that may be held (the wait byte); every other request is answered at once.
+        // The receives that may be held (the wait byte, or op 2's deadline), and the watch; every other request is answered at once.
         match m.first() {
             Some(2) if m.len() >= 3 => {
                 let port = u16::from_be_bytes([m[1], m[2]]);
                 self.open_port(port);
-                let n = self.udp_take(port, out);
-                if n == 0 && m.len() >= 4 && m[3] > 0 {
-                    self.hold(false, port, 0, m[3], 0, tok, out);
+                // The reader (a watch's id, `pins`) after the deadline: the datagrams it has yet to take, the port's other readers keeping theirs.
+                let id = (m.len() >= 16).then(|| u32::from_be_bytes([m[12], m[13], m[14], m[15]]));
+                let n = self.udp_take(port, id, out);
+                // The deadline (counter ticks; 0 answers at once, u64::MAX holds until a datagram comes) when the request carries one, else the wait byte's seconds.
+                let until = match m.len() {
+                    12.. => match u64::from_be_bytes(m[4..12].try_into().unwrap()) {
+                        0 => None,
+                        d => Some(d),
+                    },
+                    4.. if m[3] > 0 => Some(now() + m[3] as u64 * self.freq),
+                    _ => None,
+                };
+                if let (0, Some(until)) = (n, until) {
+                    self.hold(false, port, 0, until, 0, id, tok, out);
                     return None;
                 }
                 return Some(n);
+            }
+            Some(11) => return self.watch(m, tok, out),
+            Some(12) if m.len() >= 5 => {
+                self.kick(u32::from_be_bytes([m[1], m[2], m[3], m[4]]), out);
+                out[0] = 0;
+                return Some(1);
+            }
+            Some(13) if m.len() >= 5 => {
+                let id = u32::from_be_bytes([m[1], m[2], m[3], m[4]]);
+                // Its held watch answered as things stand, then every reader entry of the id retired.
+                self.kick(id, out);
+                self.kicks.iter_mut().filter(|k| **k == Some(id)).for_each(|k| *k = None);
+                for k in 0..READERN {
+                    if self.pins[k].2 != 0 && self.pins[k].0 == id {
+                        self.retire(k);
+                    }
+                }
+                out[0] = 0;
+                return Some(1);
             }
             Some(10) => return self.resolve(m, tok, out),
             Some(6) => {
@@ -2876,7 +3186,7 @@ impl Ip {
                 let most = u32::from_be_bytes([m[3], m[4], m[5], m[6]]).min(RECV_MAX as u32);
                 let c = &self.tcb[i];
                 if c.rx_len == 0 && (c.state == 1 || c.state == 2) && m[2] > 0 {
-                    self.hold(true, 0, i as u8, m[2], most, tok, out);
+                    self.hold(true, 0, i as u8, now() + m[2] as u64 * self.freq, most, None, tok, out);
                     return None;
                 }
                 return Some(self.tcp_take(i, out, most));
@@ -2911,7 +3221,7 @@ impl Ip {
                 out[14..18].copy_from_slice(&self.router);
                 out[18..34].copy_from_slice(&self.ll);
                 out[34..50].copy_from_slice(&a6.map(|a| a.1).unwrap_or([0; 16]));
-                out[50] = a4.is_some() as u8 | (a6.is_some() as u8) << 1 | (self.cell.flags & 1) << 2 | (self.person as u8) << 3;
+                out[50] = self.flags();
                 let (d4, d6) = self.dns_servers();
                 out[51..55].copy_from_slice(&d4);
                 out[55..71].copy_from_slice(&d6);
@@ -3042,7 +3352,7 @@ fn csum(data: &[u8], init: u32) -> u16 {
 pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let (base, freq) = (ferros_sys::arc_base(), ferros_sys::freq());
     // The queue lives in `.data` (a non-zero initializer keeps it out of `.bss`, which the flat image does not carry), not on the 64 KiB stack.
-    const EMPTY: Datagram = Datagram { used: false, fam: 0, addr: [0; 16], sport: 0, dport: 0, len: 0, seq: 0, data: [1; 1472] };
+    const EMPTY: Datagram = Datagram { used: false, fam: 0, addr: [0; 16], sport: 0, dport: 0, len: 0, seq: 0, at: 0, readers: 0, data: [1; 1472] };
     #[unsafe(link_section = ".data.queue")]
     static mut QUEUE: [Datagram; QN] = [EMPTY; QN];
     // The connections' control state, and the request and reply buffers (a reply up to `RECV_MAX` bytes of data): statics, not the 64 KiB stack (the kernel maps .bss from the image header's tail).
@@ -3099,6 +3409,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         dns6: [0; 16],
         ports: [0; 8],
         ports_at: 0,
+        pins: [(0, 0, 0); READERN],
         qseq: 0,
         tcb: unsafe { &mut *(&raw mut TCBS) },
         blocks,
@@ -3118,6 +3429,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         mode: 0,
         held: [HELD_FREE; HELDN],
         held_seq: 0,
+        watches: [WATCH_FREE; WATCHN],
+        kicks: [None; WATCHN],
+        kicks_at: 0,
         batch: false,
         txb: unsafe { &mut *(&raw mut TXB) },
         txn: EXCH_HEAD,
@@ -3278,6 +3592,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             // WHY the min: the length is the kernel's, the request it cut at the buffer.
             let m = &msg[..(n as usize).min(msg.len())];
+            ip.path.requests += 1;
             if let Some(l) = ip.serve(m, &tok, out) {
                 svc(REPLY, ip.off(tok.as_ptr()), ip.off(out.as_ptr()), l as u64, 0, 0);
             }
@@ -3288,6 +3603,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         ip.dns_tick();
         // The held receives that have their answer now (after what came in and what the connections did this pass).
         if ip.answer_held(out) {
+            busy = true;
+        }
+        // The held watches likewise (op 11): a datagram for a watched port, a change of the flags, a deadline.
+        if ip.answer_watches(out) {
             busy = true;
         }
         // Membership refreshed every 60 s (a querier's interval is 125 s; an unsolicited report keeps the snooper's entry alive without one).
