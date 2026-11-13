@@ -1464,7 +1464,7 @@ fn irq_pending_take(intid: u32) -> bool {
             core::ptr::write_volatile(p, 0);
             // A finger on the glass: the clock policy's sign of someone using the device (service.rs clock_policy).
             if intid == IRQ_TOUCH_INT {
-                INPUT_AT.store(crate::platform::cntpct(), core::sync::atomic::Ordering::Relaxed);
+                note_input();
             }
             // Frames going out: the clock policy's sign that something is animating at more than the rest flips (a focused widget).
             if intid == IRQ_DECON0_FRAME_START {
@@ -1474,8 +1474,49 @@ fn irq_pending_take(intid: u32) -> bool {
         v != 0
     }
 }
-/// When a touch interrupt was last taken by the touch driver (counter ticks; 0 never): the clock policy holds the active clocks for a second after it.
+/// When a touch interrupt was last taken by the touch driver, or an injected batch handed to it (counter ticks; 0 never): the adaptive clock raises the clusters at once on a change (service.rs `governor`).
 pub static INPUT_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The first input not yet followed by a frame (counter ticks; 0 none), for the touch-to-frame measure (`present_seen`).
+static INPUT_WAIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Frames the display has armed: writes to DECON0's shadow update request (G#1947_0050, the display's `present` and `arm`), one per new picture. Unlike the frame-start interrupt (`FRAME_STARTS`), a panel that DECON re-sends on every TE (the 8a's AK3B, payloads/display `PANEL_HOLDS` 0: 120 a second at rest) does not count here.
+pub static PRESENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Touch to frame: from the first input after the last frame (`INPUT_WAIT`) to the next frame armed, counted in eight buckets by the power of two of its milliseconds (under 1, 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64 and over), with the sum and the longest in counter ticks (`diag clock`).
+/// A finger held still makes no frame, so the next frame that comes for another reason closes its wait: the long buckets hold those, the short ones a moving finger's.
+pub static INPUT_TO_FRAME: [core::sync::atomic::AtomicU64; 8] = [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+pub static INPUT_TO_FRAME_SUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static INPUT_TO_FRAME_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Calls on the GPU service (`call_endpoint`): the adaptive clock's sign of GPU work, which the cores' busy time does not show.
+pub static GPU_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The DECON0 register the display writes once per new frame (`PRESENTS`).
+const DECON0_SHD_REG_UP_REQ: usize = 0x1947_0050;
+
+/// Input arrived: a touch interrupt taken, or an injected batch handed to the touch process.
+fn note_input() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let now = crate::platform::cntpct();
+    INPUT_AT.store(now, Relaxed);
+    let _ = INPUT_WAIT.compare_exchange(0, now, Relaxed, Relaxed);
+}
+
+/// A register write from a process: a new frame when it is DECON0's shadow update request.
+fn note_write(addr: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if addr != DECON0_SHD_REG_UP_REQ {
+        return;
+    }
+    PRESENTS.fetch_add(1, Relaxed);
+    let t = INPUT_WAIT.swap(0, Relaxed);
+    if t != 0 {
+        let d = crate::platform::cntpct().wrapping_sub(t);
+        let ms = d * 1000 / crate::platform::cntfrq();
+        // The bucket: 0 under a millisecond, then one per power of two of the milliseconds (1, 2-3, 4-7, ..., 32-63).
+        // WHY the min: a wait has no upper end (a finger held still for seconds closes at the next frame), and there are eight buckets; the last holds 64 ms and over.
+        let b = (64 - ms.leading_zeros() as usize).min(7);
+        INPUT_TO_FRAME[b].fetch_add(1, Relaxed);
+        INPUT_TO_FRAME_SUM.fetch_add(d, Relaxed);
+        INPUT_TO_FRAME_MAX.fetch_max(d, Relaxed);
+    }
+}
 /// Display frame starts taken by the display server's frame thread, counted for the clock policy.
 pub static FRAME_STARTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Fills the facts (service.rs, which owns the vault, the USB link and the buses).
@@ -2471,7 +2512,16 @@ fn call_endpoint(f: &mut Frame, cur: usize, ep: usize, msg: Vec<u8>, roff: u64, 
     t.frame = *f;
     tr(TR_CALL, cur, ep as u64);
     // A call on the GPU service goes in behind the kernel's stamp of who calls and what GPU memory it holds (`gpu_stamp`): the service maps the job's address space from it alone, never from the caller's word.
-    let msg = if kk.endpoints[ep].name == b"gpu" { gpu_stamp(p, msg) } else { msg };
+    let msg = if kk.endpoints[ep].name == b"gpu" {
+        GPU_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        gpu_stamp(p, msg)
+    } else {
+        msg
+    };
+    // An injected batch (the touch process's op 3, development builds only: docs/INPUT-INJECT.md) is input as a finger's interrupt is, for the adaptive clock and the touch-to-frame measure.
+    if msg.first() == Some(&3) && kk.endpoints[ep].name == b"touch" {
+        note_input();
+    }
     // A call on the identity service's facets goes in behind the kernel's stamp of the kist that calls (`facets_stamp`).
     let msg = if kk.endpoints[ep].name == b"facets" { facets_stamp(p, msg) } else { msg };
     kk.endpoints[ep].queue.push_back((cur, msg));
@@ -3273,6 +3323,7 @@ fn mmio_fast(f: &Frame) -> Option<u64> {
     crate::platform::note_mmio((hw.base + off) as u64 | (write as u64) << 63);
     let v = if write {
         unsafe { core::ptr::write_volatile((hw.base + off) as *mut u32, f.x[2] as u32) };
+        note_write(hw.base + off);
         0
     } else {
         unsafe { core::ptr::read_volatile((hw.base + off) as *const u32) as u64 }
@@ -4666,6 +4717,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         } else {
                             unsafe { core::ptr::write_volatile((hw.base + off) as *mut u32, f.x[2] as u32) };
                         }
+                        note_write(hw.base + off);
                         0
                     }
                 }
