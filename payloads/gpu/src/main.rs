@@ -107,6 +107,8 @@ const TRANSCFG: u64 = 0x4200_0006;
 const TABLE: u64 = 0x403;
 const PAGE_RO: u64 = 0x4C3;
 const PAGE_RW: u64 = 0x443;
+/// A level-2 block of 2 MiB, read-write (kbase mmu_mode_aarch64.c: an ATE above level 3 ends in 1, ENTRY_IS_ATE_L02, where a level-3 one ends in 3), with the access flag; a client's GPU block's frames (since 2026-11-13).
+const BLOCK_RW: u64 = 0x441;
 const NC: u64 = 5 << 2;
 const NX: u64 = 1 << 54;
 
@@ -141,9 +143,9 @@ const TAB_BYTES: usize = 131072 + 5 * 1024;
 const CANV_VA: u64 = 0x7000_0000;
 const WORDS_VA: u64 = 0x7100_0000;
 const TAB_VA: u64 = 0x7200_0000;
-/// The layer arena in the group's address space (kernel cachemap LAYERS): 128 MiB since 2026-11-11, its size from the kernel (`dma_size`); 64 MiB from a kernel before that, which cannot say.
+/// A client's GPU block in its address space (ferros_sys::gpu `ARENA_VA`), its frames mapped from there in 2 MiB blocks (`Table::map_blocks`) in the order its stamp lists them, so its offsets mean what they mean on the CPU from its block's base. The grant (slot 5, `arena`): the GPU blocks' window since 2026-11-13 (kernel cachemap GPUB_VA, its size from the kernel, `dma_size`), until then the fixed layer arena (128 MiB from 2026-11-11, 64 MiB from a kernel before that, which cannot say).
 const ARENA_VA: u64 = 0x8000_0000;
-const ARENA_MOST: usize = 128 << 20;
+const ARENA_MOST: usize = ferros_sys::GPU_BLOCK_SLOTS * ferros_sys::GPU_BLOCK_MOST;
 const ARENA_BEFORE: usize = 64 << 20;
 /// The apps' surfaces in the group's address space (coherent as the arena is): a client names its own as SURFACES_VA plus its address less G#CA00_0000 (ferros_sys::gpu `SURFACES_PA`, the four surfaces' physical base until 2026-11-12, the point the view is reckoned from since), its address being its slot's in the surfaces' window (kernel cachemap SURF_VA), so slot k lies at G#50_0000_0000 plus k times 32 MiB here; each of its 16 frames mapped where the kernel's stamp says it is.
 const SURFACES_VA: u64 = 0xC000_0000;
@@ -463,8 +465,12 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     as1.map(&mut m, TAB_VA, tab, TAB_BYTES.div_ceil(PAGE), PAGE_RW | NX, TABLE);
     // The layer arena (input bit 6; grant slot 5, `layers`): all 64 MiB mapped coherent (the shared type, shareable both ways), so whatever the CPU has in its caches the GPU sees, and the other way (GPU.md "Coherency").
     let arena = ferros_sys::dma(cap(grants, S_ARENA)) as usize;
-    // The test suite (tools/husky-gpu.sh, started with input bytes): the arena only on input bit 6.
-    let arena_ok = in0 & 0x40 != 0 && arena != 0 && arena != usize::MAX;
+    // The test suite (tools/husky-gpu.sh, started with input bytes): the arena only on input bit 6, and only a fixed arena at its physical address (a kernel before 2026-11-13): since then the grant is the GPU blocks' window, addresses whose frames only a block's stamp names, and gputest covers a client's block.
+    let windowed = arena as u64 == ferros_sys::GPU_BLOCKS_WINDOW;
+    if in0 & 0x40 != 0 && windowed {
+        say!(grants, "gpu: no layer arena test: the arena is the GPU blocks' window, frames given per client (gputest tests a block)\n");
+    }
+    let arena_ok = in0 & 0x40 != 0 && arena != 0 && arena != usize::MAX && !windowed;
     let arena_bytes = ferros_sys::dma_size(cap(grants, S_ARENA), ARENA_MOST as u64).map_or(ARENA_BEFORE, |n| n as usize);
     if arena_ok {
         as1.map(&mut m, ARENA_VA, arena, arena_bytes / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
@@ -1168,7 +1174,7 @@ struct Slot {
     /// Its address space's root while a client is bound.
     root: usize,
     insert: core::cell::Cell<usize>,
-    client: Option<ferros_sys::gpu::Stamp>,
+    client: Option<ferros_sys::gpu::Key>,
     /// When it last ran a job (a count of jobs), for choosing the slot used longest ago.
     used: u64,
     /// Its group is running (started, not ended since).
@@ -1270,7 +1276,7 @@ fn stuck(grants: u64, k: usize) -> ! {
 ///
 /// One job at a time, in the order the kernel queues the calls (each caller's thread holds one call), each ended at its guard (`GUARD_SYSTEM_MS`, `GUARD_KIST_MS`) with its group: a failed job's group is ended, and started again at its client's next job, so a fault costs only that client's job. The service takes its next request only when the last job is over, which is what lets the kernel give an ended client's memory to another (process.rs `gpu_drain`).
 fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], cores: u64, grants: u64) -> ! {
-    use ferros_sys::gpu::{Stamp, OUTSIDE, SURFACES_PA, UNCHECKED};
+    use ferros_sys::gpu::{is_block, Stamp, OUTSIDE, SURFACES_PA, UNCHECKED};
     let arena = ferros_sys::dma(cap(grants, S_ARENA)) as usize;
     let arena_bytes = ferros_sys::dma_size(cap(grants, S_ARENA), ARENA_MOST as u64).map_or(ARENA_BEFORE, |n| n as usize);
     let arena_ok = arena != 0 && arena != usize::MAX;
@@ -1308,7 +1314,7 @@ fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], cores: u
     let irq = cap(grants, S_IRQ);
     let max_threads = g.rd(THREAD_MAX_THREADS);
     let mut jobs = 0u64;
-    let mut msg = [0u8; 4096];
+    let mut msg = [0u8; 1 << 13];
     let mut token = [0u8; 32];
     loop {
         let n = ferros_sys::recv(cap(grants, S_GPU), &mut msg, &mut token, false);
@@ -1361,7 +1367,7 @@ fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], cores: u
         }
         jobs += 1;
         // The client's slot: its own if bound, else a free one, else the one used longest ago (its group ended, its space given the new client's tables).
-        let k = match slots.iter().position(|sl| sl.client == Some(stamp)) {
+        let k = match slots.iter().position(|sl| sl.client == Some(stamp.key())) {
             Some(k) => k,
             None => {
                 let k = (0..SLOTS).min_by_key(|&k| (slots[k].client.is_some(), slots[k].used)).unwrap();
@@ -1377,19 +1383,31 @@ fn serve(g: &Gpu, sh: &Shared, m: &mut Mem, slot_mem: [SlotMem; SLOTS], cores: u
                 t.map(&mut tm, DESC_VA, sl.desc, 1, PAGE_RO | NC | NX, TABLE);
                 t.map(&mut tm, OUT_VA, sl.flag, 1, PAGE_RW | NC | NX, TABLE);
                 t.map(&mut tm, CODE_BIG_VA, sl.code, CODE_PAGES, PAGE_RO | NC, TABLE);
-                t.map(&mut tm, ARENA_VA, bbase as usize, bsize as usize / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
+                if is_block(bbase, bsize) {
+                    // The block's frames in 2 MiB blocks from `ARENA_VA` (2026-11-13: frames of the pool, wherever it had them), in the stamp's order, which is the CPU's from the block's base.
+                    let bi = stamp.regions().iter().position(|&r| r == (bbase, bsize)).unwrap();
+                    for (j, pa) in stamp.frames_of(bi).enumerate() {
+                        t.map_block(&mut tm, ARENA_VA + j as u64 * ferros_sys::gpu::FRAME, pa as usize, BLOCK_RW | 6 << 2 | 2 << 8 | NX, TABLE);
+                    }
+                } else {
+                    // A kernel from before 2026-11-13: a block of the fixed arena, at its physical address.
+                    t.map(&mut tm, ARENA_VA, bbase as usize, bsize as usize / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
+                }
                 // Each surface frame by frame (the stamp's frames: wherever the pool had them), at its place in the view; a stamp without frames (a kernel from before) maps none.
-                for (i, &(b, _)) in stamp.regions().iter().enumerate() {
-                    for (j, &pa) in stamp.frames_of(i).iter().enumerate() {
+                for (i, &(b, sz)) in stamp.regions().iter().enumerate() {
+                    if is_block(b, sz) {
+                        continue;
+                    }
+                    for (j, pa) in stamp.frames_of(i).enumerate() {
                         if surfaces_ok {
                             t.map(&mut tm, SURFACES_VA + (b - SURFACES_PA) + j as u64 * ferros_sys::gpu::FRAME, pa as usize, ferros_sys::gpu::FRAME as usize / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
                         }
                     }
                 }
-                // The pool's size is the bound on any stamp the kernel writes (a block of at most the arena, at most the four surfaces): past it is a bug here, loud.
+                // The pool's size is the bound on any stamp the kernel writes (a block of 2 MiB entries in one level-2 table, at most the four surfaces in pages): past it is a bug here, loud.
                 assert!(tm.used() <= TABLE_PAGES * PAGE, "gpu: a client's tables outgrew their slot");
                 sl.root = t.root;
-                sl.client = Some(stamp);
+                sl.client = Some(stamp.key());
                 k
             }
         };

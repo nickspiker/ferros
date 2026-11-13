@@ -576,7 +576,7 @@ pub enum Object {
     Stow,
     /// A slot left empty: a want the person said no to (owner, 2026-11-08: "a denied right is an empty slot, never a fake"). Its token is zeros and nothing looks it up.
     Empty,
-    /// A region of the layer arena to be (GPU-KISTS.md plan step 1, 2026-11-12): a spawn turns it into the largest free block of the arena no larger than 2^n bytes, the child's own (`Dma` of a `layers-block`), wiped as it is given (`region_take`); an empty slot when none is free. Never held, as `NewSurface` is not: a parent that passes the whole arena passes a 32 MiB one of these instead (SYS_SPAWN).
+    /// A GPU block to be (GPU-KISTS.md plan step 1, 2026-11-12; frames of the pool since 2026-11-13): a spawn turns it into a block of 2^n bytes of the blocks' window, the child's own (`Dma` of a `gpu-block`), its frames zeroed as they are taken (`block_take`), or the largest it can give down to 32 MiB (`BLOCK_LEAST_LOG`); an empty slot when none is free. Never held, as `NewSurface` is not: a parent that passes the whole window (`arena`) passes a 32 MiB one of these instead (SYS_SPAWN). Its holder asks for more by SYS_DMA x1 = 2.
     NewRegion(u8),
     /// A second surface to be, for a kist's GPU mailbox (GPU-KISTS.md 1.4): a spawn turns it into a free surface when the child already got its window's and another stays free for the next app's window; an empty slot otherwise.
     SpareSurface,
@@ -1696,16 +1696,11 @@ pub static DMA: &[Dma] = &[
     // The GPU driver process (GPU.md): the GPU's registers and doorbells, mapped for EL0 (Device), and the memory it and the GPU share (Normal non-cacheable; the GPU's S2MPU holds it to this).
     Dma { name: "gpu-regs", base: crate::cachemap::GPU_REGS.0, size: crate::cachemap::GPU_REGS.1 - crate::cachemap::GPU_REGS.0 },
     Dma { name: "gpu-mem", base: crate::cachemap::GPU_MEM.0, size: crate::cachemap::GPU_MEM.1 - crate::cachemap::GPU_MEM.0 },
-    // The layer arena whole (cachemap LAYERS; this board's as `cachemap::layers` says, answered by `region`: akita's upper half until its memblock was captured, 2026-11-12): CPU write-back, the GPU coherent. The GPU service's (it reads a client's kernel from the client's own block) and init's to pass on, which passes a block of it (SYS_SPAWN); no client holds it whole (GPU-KISTS.md plan step 1, 2026-11-12).
-    Dma { name: "arena", base: crate::cachemap::LAYERS.0, size: crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0 },
-    // The arena's blocks, each a GPU client's own region when given (`NewRegion`, `region_take`): the whole, its halves, its quarters, largest first, each a power of two at a base aligned to it so a masked client reaches it thru a handle. Must stay consecutive and in this order: `block0() + j` is block j (`LAYER_BLOCKS`). Never granted by name (`resolve`).
-    Dma { name: "layers-block", base: crate::cachemap::LAYERS.0, size: crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0 },
-    Dma { name: "layers-block", base: crate::cachemap::LAYERS.0, size: (crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 1 },
-    Dma { name: "layers-block", base: crate::cachemap::LAYERS.0 + ((crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 1), size: (crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 1 },
-    Dma { name: "layers-block", base: crate::cachemap::LAYERS.0, size: (crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 2 },
-    Dma { name: "layers-block", base: crate::cachemap::LAYERS.0 + ((crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 2), size: (crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 2 },
-    Dma { name: "layers-block", base: crate::cachemap::LAYERS.0 + 2 * ((crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 2), size: (crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 2 },
-    Dma { name: "layers-block", base: crate::cachemap::LAYERS.0 + 3 * ((crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 2), size: (crate::cachemap::LAYERS.1 - crate::cachemap::LAYERS.0) >> 2 },
+    // The GPU blocks' window whole (cachemap GPUB_VA; until 2026-11-13 the fixed 128 MiB layer arena at G#9800_0000, by the same name): CPU write-back, the GPU coherent. The GPU service's (it reads a client's kernel from the client's own block) and init's to pass on, which passes a block of it (SYS_SPAWN); no client holds it whole.
+    Dma { name: "arena", base: crate::cachemap::GPUB_VA.0, size: crate::cachemap::GPUB_VA.1 - crate::cachemap::GPUB_VA.0 },
+    // Each slot alone, a GPU client's own block when given (`NewRegion`, `block_grow`): its frames taken from the pool as it is given and as its holder asks for more (SYS_DMA x1 = 2), given back when its holder ends; its size the frames it holds (`region`). Must stay consecutive and in order: `gpub0() + k` is slot k. Never granted by name (`resolve`), only given.
+    gpu_block_slot(0), gpu_block_slot(1), gpu_block_slot(2), gpu_block_slot(3), gpu_block_slot(4), gpu_block_slot(5), gpu_block_slot(6), gpu_block_slot(7),
+    gpu_block_slot(8), gpu_block_slot(9), gpu_block_slot(10), gpu_block_slot(11), gpu_block_slot(12), gpu_block_slot(13), gpu_block_slot(14), gpu_block_slot(15),
     // The AoC's IPC control block and its services' rings (aoc.rs IPC, cachemap.rs AOC_IPC), EL0 Device memory for the sensors process: com.google.usf's rings lie in its first G#85000 bytes.
     Dma { name: "aoc-ipc", base: crate::cachemap::AOC_IPC.0, size: crate::cachemap::AOC_IPC.1 - crate::cachemap::AOC_IPC.0 },
     Dma { name: "display-fb", base: crate::cachemap::DISPLAY_FB.0, size: crate::cachemap::DISPLAY_FB.1 - crate::cachemap::DISPLAY_FB.0 },
@@ -1753,18 +1748,24 @@ static mut SURFACE_BLANK: Option<usize> = None;
 /// Slots (bit k) whose owner ended while a job of its was on the GPU: their frames kept and the slot not given out again until the GPU service has taken its next request, so that job, still running, writes nothing a new owner holds (`gpu_drain`, `gpu_drained`). Under the kernel lock.
 static mut SURF_DRAINING: u32 = 0;
 
+/// The blank frame (`SURFACE_BLANK`), taken the first time a surface or a GPU block is given out: then every surface slot maps it, so a slot given back always maps something; a GPU block given back maps it too (`block_release`). None only when the pool has no frame left. Under the lock.
+fn blank_frame() -> Option<usize> {
+    if let Some(b) = unsafe { SURFACE_BLANK } {
+        return Some(b);
+    }
+    let b = crate::frames::take_top()?;
+    unsafe { SURFACE_BLANK = Some(b) };
+    for s in 0..SURFACE_SLOTS {
+        surface_map_slot(s, &[b as u32; SURFACE_FRAMES]);
+    }
+    Some(b)
+}
+
 /// Give the process with `epoch` a surface: the first free slot, 16 frames from the top of the pool (frames.rs `take_top`, zeroed as they are taken: the last owner's pixels are never the next one's, on the CPU or the GPU), mapped in the slot (cachemap `surface_map`) and admitted thru the GPU's fence (s2mpu `gpu_admit`), its generation new. The slot's index, or why none was given. Under the lock.
 fn surface_take(epoch: u64) -> Result<usize, &'static str> {
     let slots = unsafe { &mut *(&raw mut SLOTS) };
     let k = slots.iter().position(|s| s.owner == 0 && !s.held).ok_or("no free surface (all sixteen are in use)")?;
-    // The first surface: the blank frame for every slot not held, so a slot given back always maps something.
-    if unsafe { SURFACE_BLANK }.is_none() {
-        let b = crate::frames::take_top().ok_or("the frame pool has too few free frames for a surface")?;
-        unsafe { SURFACE_BLANK = Some(b) };
-        for s in 0..SURFACE_SLOTS {
-            surface_map_slot(s, &[b as u32; SURFACE_FRAMES]);
-        }
-    }
+    blank_frame().ok_or("the frame pool has too few free frames for a surface")?;
     let mut frames = [0u32; SURFACE_FRAMES];
     for j in 0..SURFACE_FRAMES {
         match crate::frames::take_top() {
@@ -1834,11 +1835,17 @@ fn surfaces_free(epoch: u64) {
     surfaces_ring();
 }
 
-/// The GPU fence's tables made again (s2mpu `fence_gpu`): every held slot's frames admitted, as they were. Under the lock.
-pub fn surfaces_refence() {
+/// The GPU fence's tables made again (s2mpu `fence_gpu`): every held surface's and GPU block's frames admitted, as they were. Under the lock.
+pub fn gpu_refence() {
     let slots = unsafe { &*(&raw const SLOTS) };
     for s in slots.iter().filter(|s| s.held) {
         for &f in &s.frames {
+            crate::s2mpu::gpu_admit(crate::frames::pa(f as usize), true);
+        }
+    }
+    let blocks = unsafe { &*(&raw const BLOCKS) };
+    for b in blocks.iter().filter(|b| b.held) {
+        for &f in &b.frames[..b.n] {
             crate::s2mpu::gpu_admit(crate::frames::pa(f as usize), true);
         }
     }
@@ -1901,60 +1908,177 @@ fn surfaces_ring() {
     }
 }
 
-/// The layer arena's blocks in `DMA` (`layers-block`): the whole, its halves, its quarters.
-pub const LAYER_BLOCKS: usize = 7;
-fn block0() -> usize {
-    DMA.iter().position(|r| r.name == "layers-block").unwrap()
+/// The GPU blocks a spawn can give out at once (cachemap GPU_BLOCK_SLOTS), and where the first slot is in `DMA`.
+pub const GPU_BLOCK_SLOTS: usize = crate::cachemap::GPU_BLOCK_SLOTS;
+const _: () = assert!(GPU_BLOCK_SLOTS == 16, "the DMA table lists sixteen GPU block slots");
+fn gpub0() -> usize {
+    DMA.iter().position(|r| r.name == "gpu-block").unwrap()
 }
-/// Each block's owner, by process epoch (0: free). Under the kernel lock.
-static mut BLOCK_OWNER: [u64; LAYER_BLOCKS] = [0; LAYER_BLOCKS];
-/// Blocks (bit j) whose owner ended while a job of its was on the GPU: not given out again until the GPU service has taken its next request, so that job, still running, writes nothing a new owner holds (`gpu_drain`; the surfaces' own are `SURF_DRAINING`). Under the kernel lock.
-static mut GPU_DRAINING: u16 = 0;
+/// Slot k of the GPU blocks' window as a DMA region (`DMA`): its addresses, the most its block may grow to; `region` answers the bytes of frames it holds.
+const fn gpu_block_slot(k: usize) -> Dma {
+    Dma { name: "gpu-block", base: crate::cachemap::GPUB_VA.0 + k * crate::cachemap::GPU_BLOCK_MOST, size: crate::cachemap::GPU_BLOCK_MOST }
+}
+/// The most frames behind one block: the ceiling's.
+const BLOCK_FRAMES: usize = crate::cachemap::GPU_BLOCK_MOST / crate::frames::FRAME;
+/// The smallest block a spawn gives when it cannot give what was asked (2^25, 32 MiB: the old arena's quarter, what the attest screen's mark, the wallpaper's maker and gputest work in), and what a kist is given at launch, before it asks for what it wants (`kist_gpu`, SYS_DMA x1 = 2).
+const BLOCK_LEAST_LOG: u8 = 25;
+/// Frames a GPU block may never take from the pool (2^5, 64 MiB): arcs grow on demand, and a block taken to the last frame would leave the next process's first frame, or a running one's growth, with none.
+const BLOCK_RESERVE: usize = 1 << 5;
 
-/// DMA region `i`'s base and size as this board has it: the whole arena as `cachemap::layers` gives it (akita's upper half alone until 2026-11-12); every other region as `DMA` lists it.
+/// A slot of the GPU blocks' window (2026-11-13, the coordinator's call after the owner's "mahere does not load high rez" on the 8a: the fixed 128 MiB arena left Mahere 32 or 64 MiB): whose it is (a process epoch, 0 free), and the frames behind its first `n` 2 MiB blocks while `held` (given out, or given back but still draining a GPU job: `block_release` returns them).
+#[derive(Clone, Copy)]
+struct Block {
+    owner: u64,
+    held: bool,
+    n: usize,
+    frames: [u32; BLOCK_FRAMES],
+}
+/// Every slot. Under the kernel lock.
+static mut BLOCKS: [Block; GPU_BLOCK_SLOTS] = [Block { owner: 0, held: false, n: 0, frames: [0; BLOCK_FRAMES] }; GPU_BLOCK_SLOTS];
+/// Blocks (bit k) whose owner ended while a job of its was on the GPU: their frames kept and the slot not given out again until the GPU service has taken its next request, so that job, still running, writes nothing a new owner holds (`gpu_drain`; the surfaces' own are `SURF_DRAINING`). Under the kernel lock.
+static mut GPU_DRAINING: u32 = 0;
+
+/// DMA region `i`'s base and size: a GPU block's size the frames it holds now (0 while nobody holds it); every other region as `DMA` lists it.
 fn region(i: usize) -> (usize, usize) {
-    if DMA[i].name == "arena" {
-        let (a, b) = crate::cachemap::layers();
-        return (a, b - a);
+    if DMA[i].name == "gpu-block" {
+        let b = unsafe { &(*(&raw const BLOCKS))[i - gpub0()] };
+        return (DMA[i].base, if b.held && b.owner != 0 { b.n * crate::frames::FRAME } else { 0 });
     }
     (DMA[i].base, DMA[i].size)
 }
 
-/// Give the process with `epoch` the largest free block of the arena no larger than `most` bytes, wiped: its own region for the GPU (GPU-KISTS.md plan step 1, 2026-11-12). Blocks outside this board's arena (`cachemap::layers`; akita's lower half until 2026-11-12) are never given. A block is free when no block over the same memory is held or draining. Returns its index among the blocks. Under the lock.
-fn region_take(epoch: u64, most: usize) -> Option<usize> {
-    let (l0, l1) = crate::cachemap::layers();
-    let b0 = block0();
-    let owners = unsafe { &mut *(&raw mut BLOCK_OWNER) };
+/// Give the process with `epoch` a GPU block of `bytes` (a power of two from a frame to `GPU_BLOCK_MOST`): the first free slot of the blocks' window, grown to `bytes` (`block_grow`). The slot's index, or why none was given. Under the lock.
+fn block_take(epoch: u64, bytes: usize) -> Result<usize, &'static str> {
     let draining = unsafe { GPU_DRAINING };
-    let busy = |i: usize| owners[i] != 0 || draining >> i & 1 == 1;
-    let meets = |i: usize, j: usize| DMA[b0 + i].base < DMA[b0 + j].base + DMA[b0 + j].size && DMA[b0 + j].base < DMA[b0 + i].base + DMA[b0 + i].size;
-    // The table lists the blocks largest first, so the first that fits is the largest free.
-    let j = (0..LAYER_BLOCKS).find(|&j| {
-        let r = &DMA[b0 + j];
-        r.size > 0 && r.size <= most && r.base >= l0 && r.base + r.size <= l1 && !(0..LAYER_BLOCKS).any(|i| busy(i) && meets(i, j))
-    })?;
-    owners[j] = epoch;
-    // Wiped as it is given: the last owner's bytes (another kist's map, another's mark) are never the next one's to read, on the CPU or the GPU.
-    wipe(DMA[b0 + j].base, DMA[b0 + j].size);
-    Some(j)
+    let free = |b: &Block, k: usize| b.owner == 0 && !b.held && draining >> k & 1 == 0;
+    let k = unsafe { (*(&raw const BLOCKS)).iter().enumerate().position(|(k, b)| free(b, k)) }.ok_or("no free GPU block (all sixteen are in use)")?;
+    // A block given back maps the blank frame, so it is taken before the first block is.
+    blank_frame().ok_or("the frame pool has no free frame")?;
+    block_grow(k, bytes)?;
+    unsafe { (*(&raw mut BLOCKS))[k].owner = epoch };
+    Ok(k)
 }
 
-/// Zero `size` bytes of DRAM at `base` (64-byte aligned, Normal memory the kernel maps), by `dc zva`, as the scrub before a reset does: about 1.5 ms for 32 MiB on the X3 (not measured on this path yet), under the lock; a spawn is rare.
-fn wipe(base: usize, size: usize) {
-    let mut a = base;
-    while a < base + size {
-        unsafe { core::arch::asm!("dc zva, {a}", a = in(reg) a) };
-        a += 64;
+/// Grow slot k's block to `bytes` (a power of two from a frame to `GPU_BLOCK_MOST`; no smaller than it is, which leaves it as it is): the frames it lacks from the top of the pool (frames.rs `take_top`, zeroed as they are taken: the last owner's bytes are never the next one's, on the CPU or the GPU), mapped after the ones it holds (cachemap `gpub_map`), so its holder's pointers and its kernels' offsets keep their meaning, and admitted thru the GPU's fence (s2mpu `gpu_admit`). Refused, with why, when the pool would be left fewer than `BLOCK_RESERVE` free frames; nothing is taken then. Under the lock.
+fn block_grow(k: usize, bytes: usize) -> Result<(), &'static str> {
+    if !bytes.is_power_of_two() || bytes < crate::frames::FRAME || bytes > crate::cachemap::GPU_BLOCK_MOST {
+        return Err("a GPU block is a power of two from 2 MiB to the ceiling");
     }
-    unsafe { core::arch::asm!("dsb ish") };
+    let b = unsafe { &mut (*(&raw mut BLOCKS))[k] };
+    let want = bytes / crate::frames::FRAME;
+    if want <= b.n {
+        return Ok(());
+    }
+    if crate::frames::free() < want - b.n + BLOCK_RESERVE {
+        return Err("the frame pool has too few free frames for that GPU block");
+    }
+    let had = b.n;
+    for j in had..want {
+        match crate::frames::take_top() {
+            Some(f) => b.frames[j] = f as u32,
+            // WHY: the count above was taken under the same lock, so this is a pool that lied about its free frames: given back whole, loud in the reason.
+            None => {
+                for &f in &b.frames[had..j] {
+                    crate::frames::give(f as usize);
+                }
+                return Err("the frame pool ran out while giving a GPU block");
+            }
+        }
+    }
+    let va = DMA[gpub0() + k].base;
+    for j in had..want {
+        let pa = crate::frames::pa(b.frames[j] as usize);
+        crate::cachemap::gpub_map(va + j * crate::frames::FRAME, pa);
+        crate::s2mpu::gpu_admit(pa, true);
+    }
+    crate::s2mpu::gpu_sync();
+    // A slot given back before maps the blank frame where these now are: every core told to forget it.
+    crate::cachemap::surface_unmapped(va + had * crate::frames::FRAME, (want - had) * crate::frames::FRAME);
+    b.n = want;
+    b.held = true;
+    Ok(())
 }
 
-/// The blocks of the process with `epoch` back to free (or to draining, `gpu_drain`). Under the lock.
+/// Slot k's frames back to the pool: its blocks mapping the blank frame first and every TLB told, the frames shut out of the GPU's fence, then each wiped as it goes back (frames.rs `give`). Only once nothing of its owner's can still write them: its process ended and no GPU job of it running (`regions_free`, `gpu_drained`). Under the lock.
+fn block_release(k: usize) {
+    let b = unsafe { &mut (*(&raw mut BLOCKS))[k] };
+    let va = DMA[gpub0() + k].base;
+    // A held block means one was given out, and the first one given made the blank.
+    let blank = crate::frames::pa(unsafe { SURFACE_BLANK }.unwrap());
+    for j in 0..b.n {
+        crate::cachemap::gpub_map(va + j * crate::frames::FRAME, blank);
+    }
+    crate::cachemap::surface_unmapped(va, b.n * crate::frames::FRAME);
+    for &f in &b.frames[..b.n] {
+        crate::s2mpu::gpu_admit(crate::frames::pa(f as usize), false);
+    }
+    crate::s2mpu::gpu_sync();
+    for &f in &b.frames[..b.n] {
+        crate::frames::give(f as usize);
+    }
+    b.n = 0;
+    b.held = false;
+}
+
+/// The blocks of the process with `epoch` back to free, their frames to the pool (or held back while a GPU job of its runs, `gpu_drain`). Under the lock.
 fn regions_free(epoch: u64) {
-    let owners = unsafe { &mut *(&raw mut BLOCK_OWNER) };
-    for o in owners.iter_mut().filter(|o| **o == epoch) {
-        *o = 0;
+    let draining = unsafe { GPU_DRAINING };
+    for k in 0..GPU_BLOCK_SLOTS {
+        if unsafe { (*(&raw const BLOCKS))[k].owner } == epoch {
+            unsafe { (*(&raw mut BLOCKS))[k].owner = 0 };
+            if draining >> k & 1 == 0 {
+                block_release(k);
+            }
+        }
     }
+}
+
+/// SYS_DMA x1 = 2: the caller's own GPU block (DMA region `i`) grown to 2^`log` bytes (2026-11-13, the coordinator's call: a kist asks for the GPU memory it wants, in powers of two, up to `GPU_BLOCK_MOST`). Its size after, or ERR with why said on the console beside the pool's state. Under the lock.
+fn block_ask(p: &Process, i: usize, log: u64) -> u64 {
+    let j = i - gpub0();
+    let (owner, held) = unsafe { ((*(&raw const BLOCKS))[j].owner, (*(&raw const BLOCKS))[j].held) };
+    // WHY: `log` is the caller's word, and a shift past the word's width is no size; past the ceiling (or under a frame) `block_grow` says why.
+    let had = unsafe { (*(&raw const BLOCKS))[j].n } * crate::frames::FRAME;
+    let t0 = crate::platform::cntpct();
+    let r = if owner != p.epoch || !held {
+        Err("not the caller's GPU block")
+    } else if log >= usize::BITS as u64 {
+        Err("a GPU block is a power of two from 2 MiB to the ceiling")
+    } else {
+        block_grow(j, 1usize << log)
+    };
+    let have = unsafe { (*(&raw const BLOCKS))[j].n } * crate::frames::FRAME;
+    match r {
+        Ok(()) => {
+            // The growth's cost under the lock (its frames zeroed where the pool had not wiped them already), once a block.
+            if have != had {
+                let us = crate::platform::cntpct().wrapping_sub(t0) * 1_000_000 / crate::platform::cntfrq();
+                let line = alloc::format!("gpu block: {} grew from A#{} to A#{} MiB in A#{us} us, A#{} MiB of the pool free\n", core::str::from_utf8(&p.name).unwrap_or("?"), had >> 20, have >> 20, (crate::frames::free() * crate::frames::FRAME) >> 20);
+                k().console.extend_from_slice(line.as_bytes());
+            }
+            have as u64
+        }
+        Err(why) => {
+            let line = alloc::format!("gpu block: {} asked for 2^A#{log} bytes (holding A#{} MiB, the most A#{} MiB): {why}, A#{} MiB of the pool free: refused\n", core::str::from_utf8(&p.name).unwrap_or("?"), have >> 20, crate::cachemap::GPU_BLOCK_MOST >> 20, (crate::frames::free() * crate::frames::FRAME) >> 20);
+            k().console.extend_from_slice(line.as_bytes());
+            ERR
+        }
+    }
+}
+
+/// `diag arcs`'s GPU blocks: each held, its owner, its size and its first frame's address.
+fn blocks_report(s: &mut alloc::string::String) {
+    let kk = k();
+    let blocks = unsafe { &*(&raw const BLOCKS) };
+    let mut n = 0;
+    let mut bytes = 0;
+    for (j, b) in blocks.iter().enumerate().filter(|(_, x)| x.held) {
+        n += 1;
+        bytes += b.n * crate::frames::FRAME;
+        let name = kk.procs.iter().flatten().find(|p| p.epoch == b.owner).map(|p| core::str::from_utf8(&p.name).unwrap_or("?")).unwrap_or(if b.owner == 0 { "(draining)" } else { "(ended)" });
+        let _ = core::fmt::Write::write_fmt(s, format_args!("gpu block A#{j} {name} A#{} MiB at G#{:X} frames from G#{:X}\n", (b.n * crate::frames::FRAME) >> 20, DMA[gpub0() + j].base, crate::frames::pa(b.frames[0] as usize)));
+    }
+    let _ = core::fmt::Write::write_fmt(s, format_args!("gpu blocks: A#{n} of A#{GPU_BLOCK_SLOTS} held, A#{} MiB, the most a block A#{} MiB\n", bytes >> 20, crate::cachemap::GPU_BLOCK_MOST >> 20));
 }
 
 /// Whether a thread of process `pi` has a call on the `gpu` endpoint that its server has taken and not answered: a job of its may be on the GPU now. Looked at before the process's reply tokens are dropped (`end_process`, `kill_locked`). Under the lock.
@@ -1965,12 +2089,12 @@ fn gpu_job_in_flight(pi: usize) -> bool {
     kk.procs.iter().flatten().any(|q| q.cspace.iter().any(|c| matches!(c.object, Object::Endpoint(e) if e == ep) && c.rights & RIGHT_RECV != 0) && q.cspace.iter().any(|c| matches!(c.object, Object::Reply(t) if mine(t))))
 }
 
-/// A process ending with a GPU job in flight (`gpu_job_in_flight`): its blocks and surfaces held back from the next owner until the GPU service takes its next request (`gpu_drained`), a surface's frames kept in the pool's stead. The service runs one job at a time and ends a job it gives up on (its group terminated) before it takes the next request, so by then nothing of the ended process's runs on the GPU. Called before its blocks and surfaces are freed. Under the lock.
+/// A process ending with a GPU job in flight (`gpu_job_in_flight`): its blocks and surfaces held back from the next owner until the GPU service takes its next request (`gpu_drained`), their frames kept in the pool's stead. The service runs one job at a time and ends a job it gives up on (its group terminated) before it takes the next request, so by then nothing of the ended process's runs on the GPU. Called before its blocks and surfaces are freed. Under the lock.
 fn gpu_drain(epoch: u64) {
-    let owners = unsafe { &*(&raw const BLOCK_OWNER) };
+    let blocks = unsafe { &*(&raw const BLOCKS) };
     let slots = unsafe { &*(&raw const SLOTS) };
-    for (j, &o) in owners.iter().enumerate() {
-        if o == epoch {
+    for (j, b) in blocks.iter().enumerate() {
+        if b.owner == epoch {
             unsafe { GPU_DRAINING |= 1 << j };
         }
     }
@@ -1981,22 +2105,23 @@ fn gpu_drain(epoch: u64) {
     }
 }
 
-/// The kernel's stamp ahead of every call on the `gpu` endpoint (GPU-KISTS.md plan step 1, 2026-11-12; ferros_sys::gpu `Stamp` reads it): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build, bit 2 frames follow][n u8][n × (base u64, size u64)][then, for each region in the surfaces' window in the order listed, its 16 frames' physical addresses, u64 each], the regions of every GPU-reachable DMA grant it holds: its block of this board's layer arena, each surface it holds (one slot, at its address in the window). Written here, in front of the caller's bytes, for every call, so no caller can write one: the service maps a client's address space from these regions and frames and from nothing a client says. A holder of the whole window (the display, init) is stamped with none of it: no client's surface is its to have the GPU write. Under the lock.
+/// The kernel's stamp ahead of every call on the `gpu` endpoint (GPU-KISTS.md plan step 1, 2026-11-12; ferros_sys::gpu `Stamp` reads it): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build, bit 2 frames follow][n u8][n × (base u64, size u64)][then, for each region in order, its frames' physical addresses, u64 each, its size over 2 MiB of them], the regions of every GPU-reachable DMA grant it holds: its GPU block (its slot's address in the blocks' window and the bytes of frames it holds, since 2026-11-13; a block of the fixed layer arena at its physical address until then), each surface it holds (one slot, at its address in the surfaces' window). Written here, in front of the caller's bytes, for every call, so no caller can write one: the service maps a client's address space from these regions and frames and from nothing a client says. A holder of a whole window (the display, init, the GPU service) is stamped with none of it: no client's memory is its to have the GPU write. Under the lock.
+/// A block's frames change only as it grows (`block_grow` appends; nothing takes one back while it is held), and a surface's never while it is held, so the regions alone name the frames for a caller: the service keys a client's address space by them.
 fn gpu_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
-    let (l0, l1) = crate::cachemap::layers();
-    let inside = |b: usize, n: usize, lo: usize, hi: usize| lo != hi && b >= lo && b + n <= hi;
     let slots = unsafe { &*(&raw const SLOTS) };
-    let s0 = surface0();
+    let blocks = unsafe { &*(&raw const BLOCKS) };
+    let (s0, g0) = (surface0(), gpub0());
     let mut regions: Vec<(usize, usize)> = Vec::new();
     let mut frames: Vec<u64> = Vec::new();
     for c in &p.cspace {
         if let Object::Dma(i) = c.object {
             let (b, n) = region(i);
-            if regions.contains(&(b, n)) {
+            if n == 0 || regions.contains(&(b, n)) {
                 continue;
             }
-            if n > 0 && inside(b, n, l0, l1) {
+            if DMA[i].name == "gpu-block" {
                 regions.push((b, n));
+                frames.extend(blocks[i - g0].frames[..blocks[i - g0].n].iter().map(|&f| crate::frames::pa(f as usize) as u64));
             } else if DMA[i].name == "surface" && slots[i - s0].held {
                 regions.push((b, n));
                 frames.extend(slots[i - s0].frames.iter().map(|&f| crate::frames::pa(f as usize) as u64));
@@ -2019,9 +2144,16 @@ fn gpu_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
     out
 }
 
-/// The GPU service took a request: whatever waited for its last job to end may be given out again, a drained surface's frames back to the pool. Under the lock.
+/// The GPU service took a request: whatever waited for its last job to end may be given out again, a drained block's or surface's frames back to the pool. Under the lock.
 fn gpu_drained() {
+    let d = unsafe { GPU_DRAINING };
     unsafe { GPU_DRAINING = 0 };
+    for j in 0..GPU_BLOCK_SLOTS {
+        let (owner, held) = unsafe { ((*(&raw const BLOCKS))[j].owner, (*(&raw const BLOCKS))[j].held) };
+        if d >> j & 1 == 1 && owner == 0 && held {
+            block_release(j);
+        }
+    }
     let slots = unsafe { &*(&raw const SLOTS) };
     let d = unsafe { SURF_DRAINING };
     unsafe { SURF_DRAINING = 0 };
@@ -4256,10 +4388,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         whole.push((objects.len(), i));
                         objects.push((Object::NewSurface, r))
                     }
-                    // The whole layer arena passes as a 32 MiB block of it, the child's own (GPU-KISTS.md plan step 1, 2026-11-12): init hands the attest screen its region this way.
-                    Some((Object::Dma(i), r)) if DMA[i].name == "arena" => objects.push((Object::NewRegion(25), r)),
-                    // A block of the arena is its owner's alone: freed when that owner ends (`regions_free`), it could not stay a child's.
-                    Some((Object::Dma(i), _)) if DMA[i].name == "layers-block" => {
+                    // The whole blocks' window passes as a 32 MiB block of it, the child's own (GPU-KISTS.md plan step 1, 2026-11-12): init hands the attest screen its region this way.
+                    Some((Object::Dma(i), r)) if DMA[i].name == "arena" => objects.push((Object::NewRegion(BLOCK_LEAST_LOG), r)),
+                    // A GPU block is its owner's alone: freed when that owner ends (`regions_free`), it could not stay a child's.
+                    Some((Object::Dma(i), _)) if DMA[i].name == "gpu-block" => {
                         bad = true;
                         bad_at = bad_at.min(j);
                     }
@@ -4470,6 +4602,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
             f.x[0] = match p.lookup(&token).map(|i| p.cspace[i].object) {
                 // x1 = 1: the region's size in bytes instead (2026-11-11: the GPU service maps the layer arena by it, which grew from 64 to 128 MiB; a kernel from before answers the base to every call, which a caller tells by its being far past any size).
                 Some(Object::Dma(i)) if region(i).1 > 0 && f.x[1] == 1 => region(i).1 as u64,
+                // x1 = 2 (2026-11-13): the caller's GPU block grown to 2^x2 bytes, answered its size after (`block_ask`); ERR, said on the console, when it is not the caller's block, past the ceiling, or more than the pool can give.
+                Some(Object::Dma(i)) if DMA[i].name == "gpu-block" && f.x[1] == 2 => block_ask(p, i, f.x[2]),
                 // A surface is answered past its porch (cachemap SURFACE_PORCH); every other region at its base.
                 Some(Object::Dma(i)) if region(i).1 > 0 => (region(i).0 + if DMA[i].name == "surface" { crate::cachemap::SURFACE_PORCH } else { 0 }) as u64,
                 _ => ERR,
@@ -5741,12 +5875,12 @@ fn kist_object(code: u8) -> Option<(Object, u32)> {
     })
 }
 
-/// The GPU, as every kist is handed it (owner, 2026-11-12: "I feel like GPU should be implicit. If I'm running it on my machine..."; GPU-KISTS.md 1.6): asked of no one, like its CPU time, three slots right after its wants (ferros_sys::gpu `kist_slots`; `ferros_kist::slots` lays them out: after the leading implicit rights and the asked wants, or after a capsule's declared wants): the GPU service (`use gpu`, every call stamped with the kist's own memory, `gpu_stamp`), a block of the layer arena of its own (the largest free, `NewRegion`), and a second surface for a mailbox (`SpareSurface`). Each an empty slot when there is none to give. A production build gives three empty slots: a kist's GPU programs run unchecked, so they run on development builds only until the checked kernel form exists (GPU-KISTS.md plan steps 3-6), as its native code does; the kist then draws on the CPU, and its slots keep their places.
+/// The GPU, as every kist is handed it (owner, 2026-11-12: "I feel like GPU should be implicit. If I'm running it on my machine..."; GPU-KISTS.md 1.6): asked of no one, like its CPU time, three slots right after its wants (ferros_sys::gpu `kist_slots`; `ferros_kist::slots` lays them out: after the leading implicit rights and the asked wants, or after a capsule's declared wants): the GPU service (`use gpu`, every call stamped with the kist's own memory, `gpu_stamp`), a GPU block of its own (`NewRegion`: 32 MiB of frames at launch since 2026-11-13, grown to what it asks for by SYS_DMA x1 = 2 up to `GPU_BLOCK_MOST`, so a kist that never draws on the GPU holds little and one that does is not held to what the kists started first left), and a second surface for a mailbox (`SpareSurface`). Each an empty slot when there is none to give. A production build gives three empty slots: a kist's GPU programs run unchecked, so they run on development builds only until the checked kernel form exists (GPU-KISTS.md plan steps 3-6), as its native code does; the kist then draws on the CPU, and its slots keep their places.
 fn kist_gpu() -> [(Object, u32); 3] {
     if cfg!(ferros_production) {
         return [(Object::Empty, 0); 3];
     }
-    [(Object::Endpoint(endpoint(b"gpu")), RIGHT_SEND), (Object::NewRegion(27), RIGHT_SEND | RIGHT_RECV), (Object::SpareSurface, RIGHT_SEND | RIGHT_RECV)]
+    [(Object::Endpoint(endpoint(b"gpu")), RIGHT_SEND), (Object::NewRegion(BLOCK_LEAST_LOG), RIGHT_SEND | RIGHT_RECV), (Object::SpareSurface, RIGHT_SEND | RIGHT_RECV)]
 }
 
 /// `SYS_SPAWN` in kist mode (x2 bit 1; bit 2, a relaunch: a live process of that name killed first, NOTHING with none alive; bit 5, a stop: a live process of that name killed and nothing launched, 0 or NOTHING with none alive): [name length][name][the capsule's 32-byte vault address][the caller's Kists token, 32 bytes][n][n right codes, one a declared want in its order: the right, or `EMPTY` for an asked want said no to; for an implicit want what is sent does not matter, the kernel hands it anyway]. Queued for the service loop, which streams the capsule from the vault and checks every slot against the capsule's own declaration before anything runs (`spawn_kist`). 0 queued, NOTHING already running or starting, ERR refused (the reason on the console): no Kists right, a code outside the vocabulary, nobody present (a kist's data and rights are the person's), or another launch still streaming.
@@ -6263,10 +6397,10 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
             },
             Grant::Entropy => (Object::Entropy, RIGHT_SEND),
             Grant::Dma(b"surface") => (Object::NewSurface, RIGHT_SEND | RIGHT_RECV),
-            // A region of the layer arena of its own (GPU-KISTS.md plan step 1, 2026-11-12): `layers` the largest block free (a kist's ask, and Mahere's development spawn), `layers-32` a 32 MiB one (wallgen's, gputest's); a block is never granted by name, only given.
+            // A GPU block of its own (GPU-KISTS.md plan step 1, 2026-11-12; frames of the pool since 2026-11-13): `layers` 128 MiB (Mahere's development spawn; the largest block of the old arena), `layers-32` 32 MiB (wallgen's, gputest's), each grown by its holder's ask (SYS_DMA x1 = 2); a block is never granted by name, only given.
             Grant::Dma(b"layers") => (Object::NewRegion(27), RIGHT_SEND | RIGHT_RECV),
-            Grant::Dma(b"layers-32") => (Object::NewRegion(25), RIGHT_SEND | RIGHT_RECV),
-            Grant::Dma(b"layers-block") => return Err("an arena block is given (`layers`, `layers-32`), never named"),
+            Grant::Dma(b"layers-32") => (Object::NewRegion(BLOCK_LEAST_LOG), RIGHT_SEND | RIGHT_RECV),
+            Grant::Dma(b"gpu-block") => return Err("a GPU block is given (`layers`, `layers-32`), never named"),
             Grant::Dma(n) => match DMA.iter().position(|r| r.name.as_bytes() == *n) {
                 Some(i) => (Object::Dma(i), RIGHT_SEND | RIGHT_RECV),
                 None => return Err("no such DMA region"),
@@ -6394,14 +6528,24 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
                     return Err(why);
                 }
             },
-            // A region of the arena: the largest free block up to 2^n, or an empty slot (the client then has no GPU memory and draws on the CPU, as without the GPU service).
-            Object::NewRegion(n) => match region_take(epoch, 1 << n) {
-                Some(j) => Object::Dma(block0() + j),
-                None => {
-                    k().console.extend_from_slice(b"spawn: no block of the layer arena is free: an empty slot for the region\n");
-                    Object::Empty
+            // A GPU block: 2^n bytes, or the largest power of two down to 32 MiB the pool can give, or an empty slot (the client then has no GPU memory and draws on the CPU, as without the GPU service).
+            Object::NewRegion(n) => {
+                let mut got = Err("no size asked");
+                for log in (BLOCK_LEAST_LOG.min(n)..=n).rev() {
+                    got = block_take(epoch, 1 << log);
+                    if got.is_ok() {
+                        break;
+                    }
                 }
-            },
+                match got {
+                    Ok(j) => Object::Dma(gpub0() + j),
+                    Err(why) => {
+                        let line = alloc::format!("spawn: no GPU block ({why}; A#{} MiB of the pool free): an empty slot for the region\n", (crate::frames::free() * crate::frames::FRAME) >> 20);
+                        k().console.extend_from_slice(line.as_bytes());
+                        Object::Empty
+                    }
+                }
+            }
             // The GPU mailbox's second surface: only beside a surface of its own already given, and only while a slot and the frames for another stay free for the next app's window.
             Object::SpareSurface => {
                 let slots = unsafe { &*(&raw const SLOTS) };
@@ -6591,6 +6735,7 @@ pub fn arcs_report() -> alloc::string::String {
         let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{} base G#{:X} size G#{:X} frames A#{} ceiling G#{:X} window G#{:X} {} grew A#{} shrank A#{} moved A#{} gave back A#{} MiB inside\n", core::str::from_utf8(&p.name).unwrap_or("?"), p.arc.base, p.arc.size, p.arc.mapped / crate::frames::FRAME, p.arc.ceiling, p.arc.window, if p.arc.guard != 0 { "masked" } else { "native" }, p.grows, p.shrinks, p.moves, p.holes.iter().map(|h| h.1 - h.0).sum::<usize>() >> 20));
     }
     surfaces_report(&mut s);
+    blocks_report(&mut s);
     s.push_str(&crate::frames::pool_report());
     unlock();
     s

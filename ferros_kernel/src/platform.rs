@@ -581,7 +581,7 @@ pub fn scrub_memory() {
         return;
     }
     reset_step(2);
-    let regions: [(usize, usize); 11] = [
+    let regions: [(usize, usize); 10] = [
         (hb, he),
         crate::cachemap::HEAP2,
         crate::cachemap::DMA_POOL,
@@ -592,9 +592,8 @@ pub fn scrub_memory() {
         crate::cachemap::DISPLAY_SPRITES,
         crate::cachemap::DISPLAY_CANVAS,
         crate::cachemap::GPU_MEM,
-        crate::cachemap::layers(),
     ];
-    // The processes' memory: every frame an arc or a surface holds (frames.rs; until 2026-11-11 the two arc pools whole, until 2026-11-12 the surfaces' own region). Free frames were wiped as they came back.
+    // The processes' memory: every frame an arc, a surface or a GPU block holds (frames.rs; until 2026-11-11 the two arc pools whole, until 2026-11-12 the surfaces' own region, until 2026-11-13 the layer arena). Free frames were wiped as they came back.
     let total: usize = regions.iter().map(|&(lo, hi)| if hi > lo { hi - lo } else { 0 }).sum::<usize>() + crate::frames::taken_bytes();
     // Said before the zeroing: the allocator's own lists are in the heap, so nothing may allocate after it (the first cut formatted its line after, and the reset path died short of the EL3 reboot-mode stamp: two reboots to fastboot that landed as plain boots, 2026-11-03).
     pstore(alloc::format!("memory scrub before the reset: {} MiB\n", total >> 20).as_bytes());

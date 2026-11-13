@@ -155,26 +155,27 @@ static mut GPU_TABLES_FRAME: usize = 0;
 /// The most GiBs besides gpu-mem's a surface can lie in: the tables one frame holds, more than either board's map spans (husky's eleven: GiB 3 and the high bank's ten).
 const GPU_GBS_MOST: usize = 16;
 
-/// The GPU's fence: read and write to `gpu-mem` (cachemap GPU_MEM) and the layer arena (LAYERS, both in one GiB), and the frames of every surface given out (`gpu_admit`, as each is given and given back), nothing else, for every VID (only the GPU sits behind it; which VID its traffic arrives as is not measured yet). G#E4: pd_g3d not powered (left alone).
+/// The GPU's fence: read and write to `gpu-mem` (cachemap GPU_MEM), and the frames of every surface and every GPU block given out (`gpu_admit`, as each is given and given back), nothing else, for every VID (only the GPU sits behind it; which VID its traffic arrives as is not measured yet). G#E4: pd_g3d not powered (left alone).
 /// The surfaces since 2026-11-11: an app whose frame is a GPU kernel's output (Mahere's map) has the GPU write its surface, the buffer the display composes, with no copy on the CPU (GPU-KISTS.md 1.4: a GPU layer is a buffer granted to its owner and the display).
 /// Until 2026-11-12 the four surfaces were one fixed region the fence admitted whole; since then a surface is 16 frames from anywhere in the pool, admitted while it is held and shut out as it is given back, so the fence admits exactly the frames that are surfaces now and never a frame an arc holds.
-/// This fence is the wall around every GPU client together (one bus master, every VID); the walls between clients are the GPU's own address spaces (GPU-KISTS.md plan step 1, 2026-11-12): the GPU service gives each client a space of its own that maps only the block of the arena and the surfaces it holds, as the kernel stamps every call on `gpu` (process.rs `gpu_stamp`). The arena is this board's (`cachemap::layers`: akita's upper half only).
+/// The same for the GPU's own memory since 2026-11-13: until then the fixed 128 MiB layer arena beside gpu-mem, admitted whole; now each client's block of frames (process.rs `block_grow`), frame by frame as it is given and given back.
+/// This fence is the wall around every GPU client together (one bus master, every VID); the walls between clients are the GPU's own address spaces (GPU-KISTS.md plan step 1, 2026-11-12): the GPU service gives each client a space of its own that maps only the block and the surfaces it holds, as the kernel stamps every call on `gpu` (process.rs `gpu_stamp`).
 pub fn fence_gpu() -> u32 {
-    let (m, l) = (crate::cachemap::GPU_MEM, crate::cachemap::layers());
+    let m = crate::cachemap::GPU_MEM;
     let gb = m.0 >> 30;
     let r = if m.0 == m.1 {
         0xE3
     } else if unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 0 {
         0xE4
-    } else if [m.1 - 1, l.0, l.1 - 1].iter().any(|&a| a >> 30 != gb) {
+    } else if (m.1 - 1) >> 30 != gb {
         0xE3
     } else if rd(GPU_S2MPU, VERSION) & 0xFFFF_0000 != 0x9000_0000 {
         0xE1
     } else {
-        let allowed = |pa: usize| (pa >= m.0 && pa < m.1) || (pa >= l.0 && pa < l.1);
+        let allowed = |pa: usize| pa >= m.0 && pa < m.1;
         fill(gb, &raw mut GPU_TABLE, 0xC, &allowed);
-        // The surfaces given out already (none at boot, where this runs before init starts): their frames in gpu-mem's GiB put back in its table, just filled afresh; the other GiBs' tables are never refilled.
-        crate::process::with_lock(crate::process::surfaces_refence);
+        // The surfaces and blocks given out already (none at boot, where this runs before init starts): their frames in gpu-mem's GiB put back in its table, just filled afresh; the other GiBs' tables are never refilled.
+        crate::process::with_lock(crate::process::gpu_refence);
         let mut gbs: alloc::vec::Vec<(usize, *mut Smpt)> = alloc::vec![(gb, &raw mut GPU_TABLE)];
         for &(g, t) in unsafe { &(&*(&raw const GPU_GBS))[..GPU_GBS_N] } {
             gbs.push((g, t as *mut Smpt));
