@@ -13,6 +13,7 @@ Owner, 2026-11-12, after rejecting sliders and permission lists ("we have a bran
 - **The glow** is the "for you" 400 nm state with its count (ferros_glow); a kist in front shows waiting things on the Deck corner's wedge, nothing covers it.
 - **Always through:** alarms the person set and safety (battery dying).
 - Notes clear when seen on any of the person's devices (fleet doorbell, "who rang last"), never on a timer; a kist may set one deadline on a note (like an alarm).
+- **System questions** (Stow/Cancel, permission asks, unstow, pairing: anything the system waits on the person to answer), decided 2026-11-12: a personal note from Settings that always lights the Deck button whatever the view, in a **703 nm red ring** (Glow::System) instead of the 400 nm violet ("only difference is it would be 700nm red"); one tap on Deck opens the question; lit until answered; never live. Prompted by a Stow sheet that waited unseen while `ferros send` held the USB claim.
 - Open: whether a stranger's beam rings; whether updates stow themselves silently.
 
 Related: [[clipboard-capability-handoff]], [[ferros_vocabulary]], [[feedback-no-polling]].
