@@ -412,6 +412,41 @@ messages! {
     RightAudio,
     /// The cameras (KISTS.md, the asked rights: frames from the camera driver; built 2026-11-12 for Lumis).
     RightCamera,
+    /// Be you (docs/FACETS.md "Be you"; decided as the name, D9): a binding of the kist's alias to the person's identity, so their contacts find and recognise them in it.
+    RightBeYou,
+    /// The person's people (FACETS.md "People"), all or the ones they choose.
+    RightPeople,
+    // ---- People (docs/FACETS.md "People"): the system's page, its add-a-person sheet, a kist's card's chooser ----
+    /// The People page's title, a settings page.
+    PagePeople,
+    /// The People page's button: the system's add-a-person sheet (the keyboard asks for their handle, then a name).
+    AddPerson,
+    /// The People page with nobody on it.
+    NoPeopleYet,
+    /// The keyboard's prompt for the person being added: their handle, typed once (the attest screen's sentence case).
+    TypeTheirHandle,
+    /// The keyboard's prompt after it: the name the person gives them (a petname, theirs alone).
+    WhatDoYouCallThem,
+    /// Adding: their chain asked of fgtw.org.
+    LookingThemUp,
+    /// Adding: done, they are in the person's people.
+    PersonAdded,
+    /// Adding: no chain at that handle.
+    NobodyHasHandle,
+    /// Adding: fgtw.org did not answer.
+    CouldNotLookUp,
+    /// Adding: the chain at that slot is not the one the handle derives (its genesis key is not theirs).
+    RecordNotTheirs,
+    /// Adding: the handle typed was the person's own.
+    ThatIsYou,
+    /// A kist's people: all of them.
+    PeopleAll,
+    /// A kist's people: only those the person picks.
+    PeopleChosen,
+    /// Under the add button: the handle typed is used once to find them and never kept (identity-profile.md "type it once, derive, pin, drop").
+    HandleNotKept,
+    /// A person the person gave no name.
+    NoName,
     /// Why a kist the person tapped did not start (ferros_kist::launch::why), under `Say::CouldNotStart` on its open circle: no room in the memory pool.
     NotEnoughMemory,
     /// Not stowed on this device: no capsule here, or no seal.

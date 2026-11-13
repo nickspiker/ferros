@@ -514,6 +514,55 @@ pub mod kist {
     }
 }
 
+/// The identity service's `facets` endpoint (docs/FACETS.md "To build" 2, 2026-11-13): a kist granted be you or people holds a send right on it; the identity service (payloads/fgtw) serves it, as the slot after its last.
+pub mod facets {
+    /// Op 0, be you: [0][the alias's public bundle's length u16 LE][the bundle (fgtw::pq::KeyBundle bytes)][the alias's possession eggs (fgtw::binding::possession)] → [`OK`][the handle proof 32][the pinned identity key 32][the binding, a complete VSF file (fgtw::binding::Binding)], or [a refusal below]. Held until the binding is signed (once a launch: the service keeps it).
+    pub const BE_YOU: u8 = 0;
+    /// Op 1, the people: [1] → [`OK`][the people, a complete VSF file (fgtw::people::doc)], all of them or the chosen ones, or [a refusal below].
+    pub const PEOPLE: u8 = 1;
+    /// The answer's first byte: done.
+    pub const OK: u8 = 0;
+    /// Refused: the person did not grant this facet to the caller (or the caller is no kist).
+    pub const NOT_GRANTED: u8 = 1;
+    /// Refused: nobody is present, or the identity service has no identity or no fleet in hand yet.
+    pub const NOT_PRESENT: u8 = 2;
+    /// Refused: no alias (the person key not handed to the kernel yet), or the bundle is not the alias the kernel stamped, or its eggs do not hold it.
+    pub const NOT_ALIAS: u8 = 3;
+    /// Refused: a malformed request.
+    pub const MALFORMED: u8 = 4;
+    /// The kernel's stamp's length (process.rs `facets_stamp`).
+    pub const STAMP: usize = 97;
+
+    /// The kernel's stamp ahead of every call on `facets`: [flags: bit 0 a kist, bit 1 be you granted, bit 2 people granted, bit 3 the person present, bit 4 its alias held][developer 32][option 32][the alias's Ed25519 key 32]. Written by the kernel for every call, so the service trusts it and nothing after it.
+    #[derive(Clone, Copy)]
+    pub struct Stamp {
+        pub kist: bool,
+        pub be_you: bool,
+        pub people: bool,
+        pub present: bool,
+        pub alias: Option<[u8; 32]>,
+        pub developer: [u8; 32],
+        pub option: [u8; 32],
+    }
+
+    impl Stamp {
+        /// The stamp and the caller's own bytes after it; None for a message shorter than a stamp (never one the kernel wrote).
+        pub fn read(msg: &[u8]) -> Option<(Stamp, &[u8])> {
+            if msg.len() < STAMP {
+                return None;
+            }
+            let f = msg[0];
+            let k = |at: usize| -> [u8; 32] {
+                let mut o = [0u8; 32];
+                o.copy_from_slice(&msg[at..at + 32]);
+                o
+            };
+            let s = Stamp { kist: f & 1 != 0, be_you: f & 2 != 0, people: f & 4 != 0, present: f & 8 != 0, alias: (f & 16 != 0).then(|| k(65)), developer: k(1), option: k(33) };
+            Some((s, &msg[STAMP..]))
+        }
+    }
+}
+
 /// The GPU as every client reaches it (docs/GPU-KISTS.md plan step 1, 2026-11-12): what the kernel puts ahead of each call on the `gpu` endpoint, and where a kist finds its GPU grants.
 pub mod gpu {
     /// The GPU service's view of a client's own block of the layer arena: offset 0 of the block (payloads/gpu `ARENA_VA`). A client names its memory to its kernels as `ARENA_VA` plus an offset into its own block; nothing else of the arena is mapped for it.

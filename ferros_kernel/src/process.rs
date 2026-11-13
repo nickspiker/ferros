@@ -769,6 +769,8 @@ struct Process {
     kist: bool,
     /// A kist's gate identity as the gate found it at launch (`spawn_kist`): its developer's Ed25519 key and its option (`hp`), both public, what its alias is derived from (SYS_IRA's alias bit, FACETS.md). None for anything not launched by the kist job, so nothing else has an alias and no kist can name another's identity.
     gate: Option<([u8; 32], [u8; 32])>,
+    /// A kist's facets as the person granted them at launch (docs/FACETS.md): bit 0 be you, bit 1 people. Stamped on its every call on `facets` (`facets_stamp`); 0 for anything not launched by the kist job.
+    facets: u8,
     /// A kist's capsule address (its vault address, the blake3 of the signed capsule), as launched: what names it in the person's list, for the rights it is using (`CLAIMS`). None for a system process.
     capsule: Option<[u8; 32]>,
     /// The arc's top at spawn (its size, exact mode's limit): a shrink (SYS_ARC) never goes under it, so the grants page, the code, the input and the first stack stay.
@@ -2107,6 +2109,27 @@ fn gpu_drain(epoch: u64) {
     }
 }
 
+/// The kernel's stamp ahead of every call on the identity service's `facets` endpoint (docs/FACETS.md "To build" 2, 2026-11-13; ferros_sys::facets `Stamp` reads it): [flags u8: bit 0 a kist the kist job launched, bit 1 be you granted, bit 2 people granted, bit 3 the person present, bit 4 its alias held][the kist's developer key 32][its option 32][its alias's Ed25519 public key 32, zeros without bit 4]. Written here for every call, so no caller can write one: the service binds only the alias the kernel derives for the kist that calls, answers only what the person granted it, and only while they are present. The alias's public key only; the seed is wiped here. Under the lock.
+fn facets_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(97 + msg.len());
+    let (developer, option) = p.gate.filter(|_| p.kist).unwrap_or(([0; 32], [0; 32]));
+    let present = unsafe { DOMAIN_BASE }.and_then(|b| b(true)).map(|mut k| k.fill(0)).is_some();
+    let alias = match p.gate {
+        Some((d, o)) if p.kist => crate::service::alias(&d, &o).map(|mut s| {
+            let pk = ed25519_dalek::SigningKey::from_bytes(&s).verifying_key().to_bytes();
+            s.fill(0);
+            pk
+        }),
+        _ => None,
+    };
+    out.push((p.gate.is_some() && p.kist) as u8 | (p.facets & 3) << 1 | (present as u8) << 3 | (alias.is_some() as u8) << 4);
+    out.extend_from_slice(&developer);
+    out.extend_from_slice(&option);
+    out.extend_from_slice(&alias.unwrap_or([0; 32]));
+    out.extend_from_slice(&msg);
+    out
+}
+
 /// The kernel's stamp ahead of every call on the `gpu` endpoint (GPU-KISTS.md plan step 1, 2026-11-12; ferros_sys::gpu `Stamp` reads it): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build, bit 2 frames follow][n u8][n × (base u64, size u64)][then, for each region in order, its frames' physical addresses, u64 each, its size over 2 MiB of them], the regions of every GPU-reachable DMA grant it holds: its GPU block (its slot's address in the blocks' window and the bytes of frames it holds, since 2026-11-13; a block of the fixed layer arena at its physical address until then), each surface it holds (one slot, at its address in the surfaces' window). Written here, in front of the caller's bytes, for every call, so no caller can write one: the service maps a client's address space from these regions and frames and from nothing a client says. A holder of a whole window (the display, init, the GPU service) is stamped with none of it: no client's memory is its to have the GPU write. Under the lock.
 /// A block's frames change only as it grows (`block_grow` appends; nothing takes one back while it is held), and a surface's never while it is held, so the regions alone name the frames for a caller: the service keys a client's address space by them.
 fn gpu_stamp(p: &Process, msg: Vec<u8>) -> Vec<u8> {
@@ -2432,6 +2455,8 @@ fn call_endpoint(f: &mut Frame, cur: usize, ep: usize, msg: Vec<u8>, roff: u64, 
     tr(TR_CALL, cur, ep as u64);
     // A call on the GPU service goes in behind the kernel's stamp of who calls and what GPU memory it holds (`gpu_stamp`): the service maps the job's address space from it alone, never from the caller's word.
     let msg = if kk.endpoints[ep].name == b"gpu" { gpu_stamp(p, msg) } else { msg };
+    // A call on the identity service's facets goes in behind the kernel's stamp of the kist that calls (`facets_stamp`).
+    let msg = if kk.endpoints[ep].name == b"facets" { facets_stamp(p, msg) } else { msg };
     kk.endpoints[ep].queue.push_back((cur, msg));
     wake_server(ep, true);
     if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
@@ -4442,6 +4467,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
             if !bad && objects.iter().any(|o| matches!(o.0, Object::Settings)) {
                 objects.push((Object::Endpoint(endpoint(b"torch")), RIGHT_SEND));
             }
+            // The server of `fgtw`, the identity service, gets the receive right on `facets` the same way, as the slot after its last (docs/FACETS.md, 2026-11-13): init's page is full, and the facets are its to serve, to every kist the person granted be you or people.
+            if !bad && objects.iter().any(|o| matches!(o, (Object::Endpoint(e), r) if *e == endpoint(b"fgtw") && r & RIGHT_RECV != 0)) {
+                objects.push((Object::Endpoint(endpoint(b"facets")), RIGHT_RECV));
+            }
             // x2 bit 0: only if no live process has this name — init's keepers start a driver again this way (NOTHING: it is running), never a second beside one that is alive but not serving yet.
             let shown = if name.is_empty() { &key } else { &name };
             if f.x[2] & 1 != 0 && k().procs.iter().flatten().any(|q| q.name == *shown && !q.dying) {
@@ -5905,6 +5934,8 @@ fn kist_object(code: u8) -> Option<(Object, u32)> {
         "audio" => (Object::Endpoint(endpoint(b"audio")), RIGHT_SEND),
         // The cameras (docs/CAMERA.md): a send right on the camera driver's endpoint. Until a driver serves it, a call that fails at once when nobody receives (CALL_LIVE) tells the kist so, and Lumis says there is no camera driver; never a fake camera.
         "camera" => (Object::Endpoint(endpoint(b"camera")), RIGHT_SEND),
+        // Be you and the person's people (docs/FACETS.md, 2026-11-13): a send right on the identity service's `facets` endpoint, either right the same one. The kernel stamps every call on it with the caller's kist identity and which of the two it was granted (`facets_stamp`), so the service answers each op by the grant and never by the caller's word.
+        "be_you" | "people" => (Object::Endpoint(endpoint(b"facets")), RIGHT_SEND),
         _ => return None,
     })
 }
@@ -6134,6 +6165,8 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Resu
             return Err((KIST_ALREADY, "kist: a process of that name started meanwhile"));
         }
         // Every slot's object made here, laid out from the capsule's own wants (`ferros_kist::slots`; KISTS.md "The implicit set"): an implicit right's object always, whatever init sent for it (owner, 2026-11-12: "Yes on the implicit set"), an asked want's as init sent it (its right or an empty slot, checked against the declaration above), the GPU's (`kist_gpu`). Every code is in the vocabulary (checked at the request), so `kist_object` makes each.
+        // Which facets the person granted (an asked want answered yes, sent as its own code): stamped on the kist's calls on `facets`.
+        let facets = wants.iter().zip(l.codes.iter()).fold(0u8, |m, (&w, &c)| m | ((w == c && c == ferros_kist::BE_YOU) as u8) | (((w == c && c == ferros_kist::PEOPLE) as u8) << 1));
         let gpu = kist_gpu();
         let objects: Vec<(Object, u32)> = ferros_kist::slots(&wants)
             .iter()
@@ -6149,6 +6182,7 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8]) -> Resu
                     q.kist = true;
                     q.capsule = Some(l.capsule);
                     q.gate = Some(gate);
+                    q.facets = facets;
                 }
                 enqueue_back(me);
                 kist_started(&l.capsule);
@@ -6624,7 +6658,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // The register grants by slot, for `mmio_fast`: HARDWARE has fewer than 255 blocks, so an index plus one fits a byte.
     let hw = cspace.iter().map(|c| match c.object { Object::Hardware(g) => g as u8 + 1, _ => 0 }).collect();
     let fast = alloc::boxed::Box::new(Grants { hw, ended: core::sync::atomic::AtomicBool::new(false) });
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, words: Vec::new(), input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, gate: None, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), fast };
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, words: Vec::new(), input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, gate: None, facets: 0, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), fast };
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     vault_spawned(objects);
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.

@@ -24,12 +24,16 @@ use vsf::file_format::{VsfHeader, VsfSection};
 use vsf::types::EtType;
 use vsf::VsfType;
 
-/// The rights, by code (the index): the screen (`use display`), touch (`use touch`), a surface of its own, a key derived from the device's ira, its own vault domain, randomness, the GPS fix (`use gps`), the network (`use udp`), sound out (`use audio`, docs/AUDIO.md; 2026-11-11, appended so every code before it keeps its meaning), the cameras (`use camera`, docs/CAMERA.md: frames from the camera driver, asked; 2026-11-12 for Lumis, appended the same way).
-pub const RIGHTS: [&str; 10] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp", "audio", "camera"];
+/// The rights, by code (the index): the screen (`use display`), touch (`use touch`), a surface of its own, a key derived from the device's ira, its own vault domain, randomness, the GPS fix (`use gps`), the network (`use udp`), sound out (`use audio`, docs/AUDIO.md; 2026-11-11, appended so every code before it keeps its meaning), the cameras (`use camera`, docs/CAMERA.md: frames from the camera driver, asked; 2026-11-12 for Lumis, appended the same way), be you and the person's people (`use facets`, the identity service's endpoint, docs/FACETS.md "Be you" and "People": a binding of the kist's alias to the person's identity, and their people, all or chosen; 2026-11-13, appended the same way).
+pub const RIGHTS: [&str; 12] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp", "audio", "camera", "be_you", "people"];
 /// What each right is, in a person's words, for the settings pages and the first-launch question.
-pub const MEANS: [&str; 10] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound", "the cameras"];
+pub const MEANS: [&str; 12] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound", "the cameras", "be you", "your people"];
 /// A want the person said no to: an empty slot in the launch (process.rs `Object::Empty`).
 pub const EMPTY: u8 = 0xFF;
+/// Be you (docs/FACETS.md "Be you"): its code in [`RIGHTS`].
+pub const BE_YOU: u8 = 10;
+/// The person's people (docs/FACETS.md "People"): its code in [`RIGHTS`].
+pub const PEOPLE: u8 = 11;
 
 /// The implicit set, by code: the rights every kist is handed at launch without a question (owner, 2026-11-12, "Yes on the implicit set"): the screen, touch, a surface of its own, its own key sealed to this device (ira), its own vault domain, randomness, sound out. A kist the person chose to run needs a window, their touches in it, its own storage, randomness, its own key and sound; asking about those only teaches people to tap yes. The GPU is handed to every kist as well, and is no right (the kernel's `kist_gpu`). Every other right is asked once ([`Kist::unanswered`]). The codes are the same as before, so an answer the person gave one of these before 2026-11-12 keeps its meaning; it is simply no longer read.
 pub const IMPLICIT: [u8; 7] = [0, 1, 2, 3, 4, 5, 8];

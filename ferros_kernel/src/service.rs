@@ -1126,12 +1126,17 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
     let all = home_grants();
     // The attest screen's two surfaces as init's spawn hands them out (SYS_SPAWN): each a free slot with frames of its own behind it. Passed as the whole region, a restarted attest screen drew into surface 0 whoever held it, and its back buffer was its own front (2026-11-01: every board redrew in place, black between). Not for the display server, which takes the region's base (surface 0 at boot).
     let own = name == b"ahau";
-    Some(slots.iter().filter_map(|&s| all.get(s - 1).copied()).map(|g| match g {
+    let mut out: alloc::vec::Vec<crate::process::Grant<'static>> = slots.iter().filter_map(|&s| all.get(s - 1).copied()).map(|g| match g {
         crate::process::Grant::Dma(b"surfaces") if own => crate::process::Grant::Dma(b"surface"),
         // The arena as init's spawn passes it (SYS_SPAWN): a 32 MiB block, the attest screen's own (GPU-KISTS.md plan step 1).
         crate::process::Grant::Dma(b"arena") => crate::process::Grant::Dma(b"layers-32"),
         g => g,
-    }).collect())
+    }).collect();
+    // The identity service serves the facets as the slot after its last, as SYS_SPAWN hands it (docs/FACETS.md).
+    if name == b"fgtw" {
+        out.push(crate::process::Grant::Serve(b"facets"));
+    }
+    Some(out)
 }
 
 /// A capsule the vault keeps in pieces (kvault.rs `set`, over `ferros_pieces::PIECE`), spawned without its bytes ever whole in the kernel heap: under the kernel lock, its length read, a staging arc taken from the frame pool and the pieces read straight into it one at a time (the heap holds one piece), then the gate where it lies and the process built from its code (`spawn_capsule_in_place`), and the staging arc given back. None when the capsule is not kept in pieces (stored before 2026-11-12, or under `PIECE`): the caller reads it whole as before.
