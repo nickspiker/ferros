@@ -342,6 +342,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PanelChannels => "chaneli za skrini",
         Msg::ReleaseLook => "mwonekano wa toleo",
         Msg::UntilReboot => "hadi kuwasha upya",
+        Msg::FrameCounter => "kihesabu fremu",
         // ---- the attest screen ----
         Msg::Attest => "thibitisha",
         Msg::Mint => "zalisha",

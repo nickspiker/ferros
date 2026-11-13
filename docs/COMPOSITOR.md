@@ -193,6 +193,20 @@ The owner: "Need a channel picker in debug that enables/disables red/green/blue 
 - **The release look.** The development look (the orange outside the glass's edge, on its hairline and the camera hole's knockout, `EDGE_ORANGE`; the app circle's hairline, `hairline()`, until 2026-11-12, when the display stopped cutting windows to the circle and its last use went, WINDOWS.md "Drawn under the controls") is a runtime switch on development builds (`LOOK`, from `DEV_LOOK`: FERROS_RELEASE_LOOK at build time still starts a build in the release look). Op 64 `[what u8: 0 ask, 1 release]` → `[0][release]` turns it off until the display starts again: no way back but a reboot, nothing stored. The map's Developer page has its row ("release look", the box and the label in the orange while the orange shows, "until a reboot" under it), and the map's own hairline follows it (`LOOK` there too, asked of the display when the map starts).
 - **Release builds** answer both ops with status 1 (every channel on, the release look) and the map shows neither row.
 
+## The frame counter (2026-11-13)
+
+The owner: "can we get a fps counter?"
+
+- **Where.** A console circle, in the USB circle's place while it is on (display `console_draw`, `Corner::Frames`). The top has no free place: the corners hold four circles each, and the spot by the camera is the quick row's doorway (QUICK.md), which a circle there would close. USB is the development link, so the development measure stands where someone who switched it on already looks for one. The layout, the dash's zone and a tap there stay USB's (its page). Not the quick row: it shows only while pulled, and pulling it changes what is measured.
+- **The switch.** Developer's "frame counter" checkbox (map), display op 72 `[0 off, 1 on, 2 toggle, 3 ask]` → `[0][on]`, answered by the receive thread. Off at every start and never stored, as the hit map's view and the panel's channels are: a development view, not a setting. On every build that has the Developer page.
+- **What it says**, in the person's base as every console number (`frame_lines`): the frames a second as the circle's name ("fps" alone until a second has been measured), then "draw" and the time a frame took when it is known, then "deck" on the deck.
+  - An app in front (`front_app`): the display's own count of that window's shows (op 22, counted per surface as each is published), and the time its host says each frame took.
+  - On the deck: the map's camera frames published (the stats' `SEC_US` 4) and the display's scene time for each (`SEC_US` 0): the deck's frame is drawn here, from the map's camera.
+- **The host's time per frame** comes in op 22's 40-byte form: the 36-byte form and then `[frame us u32]`, the host's draw and present for this frame. A buffer of 0 in bytes 28-35 is the window's own surface (no mailbox: answered at once, as the shorter forms). fluor's ferros host sends it on every frame (fluor branch `ferros-frame-time`); an app on an older fluor shows frames a second alone. A display from before it reads the first 36 bytes as ever.
+- **No timer.** Worked out on the display's once-a-second stats tick, over the time the tick actually took, into one word (`FRAME_WORD`) the console's worker reads at its next look (it is nudged every pass).
+- **Cheap.** The console keys on the words the counter makes, not on its raw count, so the circle is drawn again only when what it says changed: at most once a second, and not at all at rest (0 fps on the deck stays as it is). A redraw is the circle's text over its region (its body is drawn once), as a battery reading is.
+- **State (2026-11-13).** Built; the display and the map stored on the 8a and booted (the deck, settings and the console as before with the counter off). Not yet switched on there: injected swipes stopped turning the settings ring short of Developer within the device slot, so the circle itself has not been seen on glass. Deploy: the display and map capsules (store, reboot, attest); fluor's apps rebuilt on `ferros-frame-time` for the time line.
+
 ## Baked (2026-11-12)
 
 Until then every frame's pixels went thru the present: the roll-off (tanh in root space), the ODT to the panel's primaries, the panel's 1/2.19, the four-phase dither and the 10-bit pack, about 9.5 cycles a pixel on NEON (8 the codes, 1.5 the dither and the store). At 4 Mpx and 120 frames/s that is 4.6 G cycles a second, which held a full-screen GPU app near 75 frames/s on the Pro.
@@ -273,6 +287,15 @@ On the 8a, 2026-11-12 (Tensor G3, the Pro's chip: its cycles a pixel are the Pro
 Everything that bakes lands with the display or after it; nothing breaks either way round:
 0. The display (ferros branch `sqrt-present`: payloads/display, ferros_sys). Alone, it bakes its own pixels and every window's (formats 0 and 1) as before, and answers op 65.
 1. fluor (branch `baked`) for its apps (Photon, fluordemo) and Mahere (branch `ferros-baked`, needs fluor's): rebuilt against it, they find op 65 and show `BAKED`; against an older display they show formats 0 and 1 as before.
+
+## The row's tail (2026-11-13)
+
+The owner on the 8a: "sometimes after crashes the right twelve pixels or so contain fragments of the crashed app."
+- **The cause.** The deck's publish (`publish_band`, and the flight inside it) goes by whole 16-pixel blocks and stopped at the width rounded down to 16. Akita is 1080 wide, 67 blocks and 8 columns, so columns 1072-1079 were written only by an app's publish (`publish_app_rows`, which pads its last block). Once a window went, every phase kept the app's last frame there: the deck's own glass mask and wallpaper never reached them.
+- **Measured** on the 8a (the phases read over the bridge, 2026-11-13): after Mahere stopped, columns 1064-1071 held the deck's ground and 1072-1078 Mahere's (8-bit codes G#161414 against G#16161A), in all four phases and every row between the corners; column 1079 is the glass's masked column.
+- **The fix.** A row's tail is composed and presented by every publish that reaches it (`tail_front`): the glass's edge, the bars, then the scene (the canvas, a region's text in front, the wallpaper under), or a flight frame's samples (`flight_tail`). The tail is always the glass's (its block reaches past the width, where the mask is), so the block skip has no byte for it. The capture's flight path and the spatial-only `publish10` take the tail the same way.
+- **After**, on the 8a: the deck after boot, and after a kist was killed, shows the deck in columns 1072-1078 and the mask in 1079 and the corners, in every phase.
+- **husky** (1344 = 84 blocks) has no tail and no change. The left edge starts at block 0, and rows are whole, so the top and bottom have nothing like it.
 
 ## Build order
 

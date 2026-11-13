@@ -342,6 +342,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PanelChannels => "panel channels",
         Msg::ReleaseLook => "release look",
         Msg::UntilReboot => "until a reboot",
+        Msg::FrameCounter => "frame counter",
         // ---- the attest screen ----
         Msg::Attest => "attest",
         Msg::Mint => "mint",

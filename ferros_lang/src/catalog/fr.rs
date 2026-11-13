@@ -342,6 +342,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PanelChannels => "canaux de l’écran",
         Msg::ReleaseLook => "apparence de version finale",
         Msg::UntilReboot => "jusqu’au redémarrage",
+        Msg::FrameCounter => "compteur d’images",
         // ---- the attest screen ----
         Msg::Attest => "attester",
         Msg::Mint => "frapper",

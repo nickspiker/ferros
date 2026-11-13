@@ -342,6 +342,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PanelChannels => "kênh màn hình",
         Msg::ReleaseLook => "giao diện bản phát hành",
         Msg::UntilReboot => "đến khi khởi động lại",
+        Msg::FrameCounter => "bộ đếm khung hình",
         // ---- the attest screen ----
         Msg::Attest => "chứng thực",
         Msg::Mint => "đúc",

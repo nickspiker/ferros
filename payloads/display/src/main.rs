@@ -1821,6 +1821,7 @@ fn fps_dot(mask: u32, width: usize, height: usize) {
 /// What each phase frame has not yet been given of the current content, as one rectangle (empty = current): a present writes only the phase on the layer (all four took 71 ms a frame, 2026-10-22) and adds what it changed to the others' rectangles; the idle loop brings the others up to date one at a time; the flip only moves to a phase that is current.
 static mut PHASE_DIRTY: [draw::Rect; PHASES] = [draw::Rect { x0: 0, y0: 0, x1: 4096, y1: 4096 }; PHASES];
 /// Compose once (COMPOSITOR.md step 2): a byte per 16-pixel block of the screen. Bits 4-7, one a phase (`WALL_BIT`): phase k holds there only the background as it was published (the wallpaper, or black), whatever the screen is doing, so a block with nothing in front of the background is not written again. Bits 0-3: phase k holds there what the mode's own skip asks (an open circle's region: its clean window with no text in front), cleared at every change of mode (`clean_reset`). Both cleared whenever the background itself or the table changes (`clean_reset_all`): a new wallpaper, a brightness, windows, full screen. (Until 2026-11-08 one bit served both, and every open, close and flight forgot the wallpaper the phases held: the next four frames presented the whole screen again, 24 ms each.)
+/// A byte per whole block only: a row's tail past them (a width that is not a multiple of 16, akita's last 8 columns) is the glass's, never skipped, composed by every publish that reaches it (`tail_front`).
 static mut CLEAN: usize = 1;
 static mut CLEAN_W: usize = 0;
 
@@ -1994,6 +1995,53 @@ fn bars_over(c: u64, p: u64) -> u64 {
     if c >> 63 != 0 { p } else { under_pm(c & ((1 << 48) - 1), trans(c), p & ((1 << 48) - 1), 0).0 }
 }
 
+/// A row's tail: the columns from `xt` (the width rounded down to 16) to the width, on a screen whose width is not a multiple of 16 (akita's 1080: 67 blocks and 8 columns; husky's 1344 has none).
+/// The deck's publish goes by whole blocks, and until 2026-11-13 it stopped at `xt`: only an app's publish (`publish_app_rows`, which pads its last block) wrote these columns, so once an app ended they kept its last frame in every phase (the owner on the 8a: "sometimes after crashes the right twelve pixels or so contain fragments of the crashed app"; the phases' columns 1072-1078 held the app's ground, 1079 its mask).
+/// Composed here as `publish_band` composes a glass block, front to back: the glass's edge and the hole's knockout, the bars, then the scene `p(x)` (baked, opaque) under them. The tail is always the glass's: its block reaches past the width, and the edge's columns from `er` on include everything from the masked columns' end, at most the width, so the block skip (`CLEAN`) never applies and the tail has no byte there.
+/// Columns past the width stay 0 and are never written out; `p` is asked only for the row's own columns, so nothing reads past the row (on the last row, past the buffer).
+fn tail_front(xt: usize, width: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], (el, er): (usize, usize), (cl, cr): (usize, usize), bw: &[u64], p: impl Fn(usize) -> u64) -> [u64; 16] {
+    let (hl, hr) = (g.hole_l as usize, g.hole_r as usize);
+    let mut front = [0u64; 16];
+    for xx in xt..width {
+        let c = if xx >= cl && xx < cr { bw[xx] } else { CLEAR };
+        // The scene's fourth lane is its alpha, not flags: off, so its pixels keep their dither.
+        let s = p(xx) & ((1 << 48) - 1);
+        front[xx - xt] = if xx >= el && xx < er && !(xx >= hl && xx < hr) { bars_over(c, s) } else { glass_front(xx, g, edge_px, c, s) };
+    }
+    front
+}
+
+/// A flight frame's scene over row `y`'s tail (`tail_front`), indexed by column less the width rounded down to 16: as `flight_publish_row`'s glass blocks take it, the nearest half-resolution sample of the pair's top row (on an odd row the next pair's where the top has nothing), the wallpaper (or black) at full resolution where neither image has anything.
+/// The samples are taken over the row's last 16 columns (`flight_half` from `width - 16`, which reads its 16 columns and none past them), so the tail's columns are sampled on the same even grid as the rest of the row.
+unsafe fn flight_tail(f: &FlightFrame, canvas: *const u64, width: usize, height: usize, wall: usize, y: usize) -> [u64; 16] {
+    unsafe {
+        let (xs, xt) = (width - 16, width & !15);
+        let sample = |ty: usize| -> (u64, [u64; 8]) {
+            let (ps, ls) = (flight_span(&f.page, ty, width, height), flight_span(&f.plane, ty, width, height));
+            let mut h = [0u64; 8];
+            let any = flight_half(f, &ps, &ls, canvas, xs, ty, width, wall, &mut h);
+            (any, h)
+        };
+        let top = y & !1;
+        let next = if top + 2 < height { top + 2 } else { top };
+        let (mut any, mut h) = sample(top);
+        if any == 0 && y & 1 == 1 {
+            (any, h) = sample(next);
+        }
+        let mut out = [0u64; 16];
+        for xx in xt..width {
+            out[xx - xt] = if any != 0 {
+                h[(xx - xs) / 2]
+            } else if wall != 0 {
+                *(wall as *const u64).add(y * width + xx)
+            } else {
+                0
+            };
+        }
+        out
+    }
+}
+
 /// The deck's rows into the phases `mask` names, each pixel front to back (`glass_front`): the glass's edge, then the console (its rows only), then the canvas. A 16-pixel step that touches neither is the canvas straight through the NEON present; one that does is composed first and goes through the app's present, which leaves the mask's own pixels undithered.
 /// Row by row, each row into every phase `mask` names (2026-11-11, owner on the Pro: "no reason we can't hit 120fps with a sliding console row"): a block of the glass or the bars is composed by the first phase that writes the row, and the others only present it with their own thresholds (`codes_row`). Until then each phase composed and coded every such block again, four times over for the bars, whose changes go into all four.
 /// Everything here is baked (bake.rs): the canvas, the wallpaper, the bars, the mask; a phase's words are the dither and the pack (neon.rs `present16`, `present_app16`), the ODT's work done before. `tabs` is the bake's ODT, for a flight's legacy needs only.
@@ -2001,7 +2049,10 @@ fn publish_band(back: &[Px], width: usize, height: usize, _tabs: &neon::Odt, mas
     if r.is_empty() || RAW_HOLD.load(Ordering::Acquire) == 1 {
         return;
     }
-    let (x0, x1) = ((r.x0 as usize) & !15, ((r.x1 as usize + 15) & !15).min(width & !15));
+    // The whole blocks; the row's last columns past them (`xt`, a partial block on a width that is not a multiple of 16) are the tail's (`tail_front`).
+    let xt = width & !15;
+    let (x0, x1) = ((r.x0 as usize) & !15, ((r.x1 as usize + 15) & !15).min(xt));
+    let tail = xt < width && r.x1 as usize > xt;
     let mut row = [0u32; 1344];
     let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
     // The finished wallpaper's base, 0 while there is none.
@@ -2027,6 +2078,28 @@ fn publish_band(back: &[Px], width: usize, height: usize, _tabs: &neon::Odt, mas
         let (el, er) = edge_cols(g, edge_px, width);
         let (hl, hr) = (g.hole_l as usize, g.hole_r as usize);
         let ((cl, cr), bw) = bar_line(y, width, height);
+        // The row's tail composed once for every phase it goes into: the flight's samples, or the canvas (a region's text in front of it) with the wallpaper under it, as the blocks before it have them.
+        let tail_px = if tail {
+            Some(match &flight {
+                Some(f) => {
+                    let s = unsafe { flight_tail(f, back.as_ptr(), width, height, wall, y) };
+                    tail_front(xt, width, g, edge_px, (el, er), (cl, cr), bw, |xx| s[xx - xt])
+                }
+                None => tail_front(xt, width, g, edge_px, (el, er), (cl, cr), bw, |xx| {
+                    let i = y * width + xx;
+                    let mut p = back[i];
+                    if text_layer != 0 {
+                        p = draw::under(unsafe { *(text_layer as *const Px).add(i) }, p);
+                    }
+                    if wall != 0 {
+                        p = draw::under(p, unsafe { *(wall as *const u64).add(i) });
+                    }
+                    p
+                }),
+            })
+        } else {
+            None
+        };
         // Whether this row's glass blocks have their codes in `codes` (a phase before this one wrote the row).
         let mut have = false;
         for k in 0..PHASES {
@@ -2046,6 +2119,11 @@ fn publish_band(back: &[Px], width: usize, height: usize, _tabs: &neon::Odt, mas
             }
             let (t0, t1) = neon::row_thresholds(y, k);
             let t_n = now();
+            if let Some(front) = &tail_px {
+                let mut out = [0u32; 16];
+                unsafe { neon::present_app16(front.as_ptr(), out.as_mut_ptr(), t0, t1, cm) };
+                dst[y * width + xt..(y + 1) * width].copy_from_slice(&out[..width - xt]);
+            }
             if let Some(f) = &flight {
                 unsafe {
                     flight_publish_row(f, back.as_ptr(), width, height, k, y, x0, x1, wall, clean, clean_w, &mut row, dst, g, edge_px, (el, er, cl, cr), bw, (t0, t1, cm));
@@ -3965,6 +4043,36 @@ fn publish_app_mask(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, he
 /// The apps' shows since the last stats line: how many, their publishes' µs, their waits for the armed frame's start.
 static mut SHOW_US: [u64; 3] = [0; 3];
 
+/// The frame counter (op 72; owner, 2026-11-13: "can we get a fps counter?"), a development measure off at every start: while on, the console's USB circle shows the frames a second of what is in front and the time it takes to make one (`frame_lines`), worked out on the once-a-second stats tick and nowhere else.
+/// The word the tick leaves for the console's worker: bit 63 on; bit 62 measured (a tick has run since it went on); bit 61 the deck's (no app in front: the map's camera frames and the display's scene time for each); bit 60 a time per frame known; bits 32-59 frames a second in thousandths; bits 0-31 the time per frame in µs, mean.
+/// The console's key mixes it in, so the circle is drawn again only when what it says changed: at most once a second, and never while nothing moves.
+static FRAME_WORD: AtomicU64 = AtomicU64::new(0);
+const FW_ON: u64 = 1 << 63;
+const FW_MEASURED: u64 = 1 << 62;
+const FW_DECK: u64 = 1 << 61;
+const FW_TIMED: u64 = 1 << 60;
+
+/// Each surface's shows since the last tick (op 22, published): how many, the host's own time for the frames that said it (op 22's 40-byte form) summed in µs, and how many said it.
+/// The render thread's alone: op 22 and the tick both run there.
+static mut WIN_SHOWS: [(u64, u64, u64); SURFACES] = [(0, 0, 0); SURFACES];
+
+/// Op 72 `frames [what u8: 0 off, 1 on, 2 toggle, 3 ask]` → [0][on u8]: the frame counter (`FRAME_WORD`).
+/// Turned on, the circle says "fps" alone until the next tick has measured a second; turned off, the USB circle is USB's again at the worker's next look.
+fn frames_op(what: u8) -> [u8; 2] {
+    let was = FRAME_WORD.load(Ordering::Acquire) & FW_ON != 0;
+    let on = match what {
+        0 => false,
+        1 => true,
+        2 => !was,
+        _ => was,
+    };
+    if on != was {
+        FRAME_WORD.store(if on { FW_ON } else { 0 }, Ordering::Release);
+        ring_bell();
+    }
+    [0, on as u8]
+}
+
 /// Whether the app publish the workers are running writes the hit map's rows too (`publish_app_mask`'s `hits`).
 static mut PUB_APP_HITS: bool = false;
 
@@ -4407,6 +4515,8 @@ enum Corner {
     Deck,
     Back,
     Spare,
+    /// The frame counter (op 72), drawn in the USB circle's place while it is on (`console_draw`); never in the layout itself, so the dash's zone and a tap there stay USB's.
+    Frames,
 }
 
 /// The glass's own outline, exact (owner, 2026-11-08: "make sure the console circles are all dimensioned properly in regards to the new screen curves and center big circle"): fluor's corners as `plan_glass` draws them, superellipses ((R − a)/R)^n + ((R − b)/R)^n = 1 with a and b the distances in from the corner's two edges, R the big radius at the top-left and bottom-right and the small at the other two (`glass_corner_params`), each a polyline of `GLASS_SEGS` segments (chord error under a thousandth of a pixel at these radii), joined by the screen's straight edges. Until 2026-11-08 the solver measured to each row's whole masked columns at the row's centre, which misses the edge between rows where the curve runs nearly flat: circles reached into the mask in one corner and stopped short of it in another.
@@ -6444,7 +6554,20 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         time_h = (time_h.rotate_left(7) ^ c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
     // A person present or not (fact 83) too: GPS on is lit by it, its driver running or not.
-    let k = (((time_h >> 9) as i64) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64 ^ (off as i64) << 40 ^ ((facts[83] & 3) as i64) << 48;
+    // The frame counter's word (`FRAME_WORD`, the stats tick's), keyed by the words it makes, not by the word itself: a count that moves by less than the circle shows (a thousandth of a frame a second, a µs) draws nothing again (owner, 2026-11-13: drawing it must not change what it measures).
+    let fw = FRAME_WORD.load(Ordering::Acquire);
+    let fk = if fw & FW_ON != 0 {
+        let (mut nm, mut ls) = (Txt::new(), [Txt::new(); 9]);
+        let nl = frame_lines(fw, &mut nm, &mut ls, 1);
+        let mut h = 0x9E37_79B9_7F4A_7C15u64;
+        for &c in nm.str().as_bytes().iter().chain(ls[1..nl].iter().flat_map(|l| l.str().as_bytes().iter().chain(b"\n"))) {
+            h = (h.rotate_left(7) ^ c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+        h | 1
+    } else {
+        0
+    };
+    let k = (((time_h >> 9) as i64) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64 ^ (off as i64) << 40 ^ ((facts[83] & 3) as i64) << 48 ^ fk as i64;
     if !force && k == unsafe { CONSOLE_KEY } {
         return false;
     }
@@ -6506,8 +6629,11 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         if y >= height as f32 * 0.5 || pass == 1 && !touched[ci] {
             continue;
         }
+        // The frame counter on: it takes the USB circle's place (the console has no free place at the top: the spot by the camera is the quick row's doorway, QUICK.md).
+        // USB is the development link, so the development measure stands where a person who switched it on already looks for one.
+        let what = if what == Corner::Usb && fw & FW_ON != 0 { Corner::Frames } else { what };
         let live = match what {
-            Corner::Clock => true,
+            Corner::Clock | Corner::Frames => true,
             Corner::Cellular => radios & 1 != 0,
             Corner::Wifi => radios & 2 != 0,
             Corner::Bluetooth => radios & 4 != 0,
@@ -6567,6 +6693,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
         match what {
             Corner::Clock => mix(time_h),
             Corner::Battery => facts[1..5].iter().for_each(|&f| mix(f)),
+            Corner::Frames => mix(fk),
             _ => {}
         }
         if let Some(ri) = radio {
@@ -6667,6 +6794,11 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 lines[nl].num(cc, 100, 1).s(" \u{B0}C");
                 nl += 1;
             }
+            // The frame counter: frames a second as the name, then the time a frame took.
+            let mut fps = Txt::new();
+            if what == Corner::Frames {
+                nl = frame_lines(fw, &mut fps, &mut lines, nl);
+            }
             let mut tech = None;
             if let Some(ri) = radio {
                 for &m in &facts[33 + 8 * ri..41 + 8 * ri] {
@@ -6698,6 +6830,7 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
                 Corner::Usb => "USB",
                 Corner::Battery if charge.n > 0 => charge.str(),
                 Corner::Battery => "batt",
+                Corner::Frames => fps.str(),
                 Corner::Deck | Corner::Back | Corner::Spare => "",
             };
             if what == Corner::Gps && live && !switched_off && !sats.is_empty() {
@@ -7071,8 +7204,14 @@ fn publish10(back: &[Px], screen: &mut [u32], width: usize, _tabs: &neon::Odt) {
                 neon::present16(src.as_ptr().add(x), row.as_mut_ptr().add(x), t0, t1, cm);
                 x += 16;
             }
+            // The row's tail past the whole blocks (akita's last 8 columns, `tail_front`), from a padded copy: the row's own pixels and black past them, so nothing is read past the row.
+            if w16 < width {
+                let mut pad = [0u64; 16];
+                pad[..width - w16].copy_from_slice(&src[w16..]);
+                neon::present16(pad.as_ptr(), row.as_mut_ptr().add(w16), t0, t1, cm);
+            }
         }
-        dst[..w16].copy_from_slice(&row[..w16]);
+        dst.copy_from_slice(&row[..width]);
     }
 }
 
@@ -7303,6 +7442,12 @@ extern "C" fn receive(grants: u64) -> ! {
             ferros_sys::reply(&tok, &hit::view_op(msg[1]));
             continue;
         }
+        // 72 `frames [what u8: 0 off, 1 on, 2 toggle, 3 ask]` → [0][on u8]: the frame counter in the console's USB circle (`frames_op`).
+        // Answered here, at once, on every build: it shows only how fast frames come, nobody's pixels.
+        if op == 72 && n >= 2 {
+            ferros_sys::reply(&tok, &frames_op(msg[1]));
+            continue;
+        }
         // 63 `channels [what u8: bits 0-2 red, green, blue on; G#80 ask]` → [0][mask u8]: the panel's channels (`channels_op`; development builds only, status 1 on a release build). Answered here, at once.
         if op == 63 && n >= 2 {
             ferros_sys::reply(&tok, &channels_op(msg[1]));
@@ -7373,7 +7518,8 @@ extern "C" fn receive(grants: u64) -> ! {
             RING_TAIL.store(tail, Ordering::Release);
         }
         ring_bell();
-        if op == 22 && n >= 36 {
+        // A buffer of 0 in the 40-byte form (a host saying its frame's time of a frame in its own surface) is no mailbox: answered at once, as the shorter forms are.
+        if op == 22 && n >= 36 && msg[28..36] != [0; 8] {
             // A mailbox show (op 22's 36-byte form): answered once the render thread has taken it, so every show before it, and the publish of the buffer shown before it, is done, and that buffer is its owner's to draw into again (GPU-KISTS.md 1.4). A wait on the ring's head, which the render thread rings as it takes each request: a doorbell, never a poll.
             let mut h = RING_HEAD.load(Ordering::Acquire);
             while h < tail {
@@ -7796,6 +7942,8 @@ fn server(grants: u64) -> ! {
     // When the map last moved its camera: while someone is touching, poll the endpoint fast enough to follow a finger; at rest, slowly, so the core sleeps.
     let mut last_interaction = 0u64;
     let mut next_tick = (now() / freq() + 1) * freq();
+    // The last tick's time: the frame counter divides by the time since it, so a late tick does not read as more frames a second.
+    let mut frames_tick_at = now();
     let mut msg = [0u8; 4096];
     let mut last_slow_log = 0u64;
     let mut last_reply = 0u64;
@@ -8823,7 +8971,7 @@ fn server(grants: u64) -> ! {
                     log.flush();
                 }
                 Some(22) if m.len() >= 18 => {
-                    // A window shown or redrawn (WINDOWS.md): [x u16][y u16][w u16][h u16] the part of the screen it covers, [base u64] its surface (the client's own `dma` of it), [level u8] 0 an app, 1 input, 2 the system (above 0 the system's alone, `level_not_theirs`), and optionally [format u8] its pixels (`Win::format`: 0, the default, the display's working values; 1 fluor's 16-bit g2t; 2 baked, the panel's codes). It goes in front of its level; every phase owes the whole screen; the next one is published now, the others while idle.
+                    // A window shown or redrawn (WINDOWS.md): [x u16][y u16][w u16][h u16] the part of the screen it covers, [base u64] its surface (the client's own `dma` of it), [level u8] 0 an app, 1 input, 2 the system (above 0 the system's alone, `level_not_theirs`), and optionally [format u8] its pixels (`Win::format`: 0, the default, the display's working values; 1 fluor's 16-bit g2t; 2 baked, the panel's codes); then the forms below by their length: 27 bytes [changed x u16][y u16][w u16][h u16], 28 [mode u8], 36 [buf u64] (a mailbox's buffer, 0 none: the window's own surface), 40 [frame us u32] (the host's own time making this frame, its draw and its present: the frame counter's, op 72). It goes in front of its level; every phase owes the whole screen; the next one is published now, the others while idle.
                     client_owned = true;
                     unsafe { CLIENT_DREW = true };
                     last_interaction = now();
@@ -8897,6 +9045,13 @@ fn server(grants: u64) -> ! {
                             let t_wait = now();
                             pipe.settle(&mut armed, true);
                             unsafe {
+                                // The frame counter's count of this window's shows, and the host's own time for this frame when it said it (the 40-byte form).
+                                let ws = &mut (*(&raw mut WIN_SHOWS))[sk];
+                                ws.0 += 1;
+                                if m.len() >= 40 {
+                                    ws.1 += u32::from_le_bytes(m[36..40].try_into().unwrap()) as u64;
+                                    ws.2 += 1;
+                                }
                                 SHOW_US[0] += 1;
                                 SHOW_US[1] += ferros_sys::us_since(t_pub) - ferros_sys::us_since(t_wait);
                                 SHOW_US[2] += ferros_sys::us_since(t_wait);
@@ -9274,6 +9429,15 @@ fn server(grants: u64) -> ! {
                                             let c = if x + j >= cl && x + j < cr { bw[x + j] } else { CLEAR };
                                             let p = if any != 0 { fl[j / 2] } else if wall_at != 0 { unsafe { *(wall_at as *const u64).add(y * width + x + j) } } else { 0 };
                                             s[y * width + x + j] = glass_front(x + j, g, edge_px, c, p & ((1 << 48) - 1));
+                                        }
+                                    }
+                                    // The row's tail past the whole blocks, as the publish takes it (`flight_tail`).
+                                    let xt = width & !15;
+                                    if xt < width {
+                                        let t = unsafe { flight_tail(&f, pixels.as_ptr(), width, height, wall_at, y) };
+                                        for x in xt..width {
+                                            let c = if x >= cl && x < cr { bw[x] } else { CLEAR };
+                                            s[y * width + x] = glass_front(x, g, edge_px, c, t[x - xt] & ((1 << 48) - 1));
                                         }
                                     }
                                     continue;
@@ -9944,6 +10108,28 @@ fn server(grants: u64) -> ! {
                 tlog.s(b"\n");
                 tlog.flush();
             }
+            // The frame counter (`FRAME_WORD`): what is in front over the second since the last tick.
+            // An app in front: the display's count of its window's shows and the time its host said each frame took; on the deck, the map's camera frames published and the scene's time for each (`SEC_US` 4 and 0), the display's own drawing of the map's frame.
+            let since = t - frames_tick_at;
+            frames_tick_at = t;
+            let fw = FRAME_WORD.load(Ordering::Acquire);
+            if fw & FW_ON != 0 {
+                let (n, sum, timed, deck) = match front_app() {
+                    Some(k) => {
+                        let s = unsafe { (*(&raw const WIN_SHOWS))[k] };
+                        (s.0, s.1, s.2, 0)
+                    }
+                    None => unsafe { (SEC_US[4], SEC_US[0], SEC_US[4], FW_DECK) },
+                };
+                // Thousandths of a frame a second over the time the tick actually took; 28 bits hold up to 268 thousand a second, so no count a panel can show reaches past them.
+                let mfps = n * 1000 * freq() / since;
+                // WHY the test: no frame that said its time this second has no mean.
+                let (us, flag) = if timed > 0 { (sum / timed, FW_TIMED) } else { (0, 0) };
+                let word = FW_ON | FW_MEASURED | deck | flag | mfps << 32 | us;
+                // Only while still on: op 72 on the receive thread may have turned it off since the load.
+                let _ = FRAME_WORD.try_update(Ordering::AcqRel, Ordering::Acquire, |w| (w & FW_ON != 0).then_some(word));
+            }
+            unsafe { WIN_SHOWS = [(0, 0, 0); SURFACES] };
             unsafe { SEC_US = [0; 8] };
             frames_last_tick = frames;
             starts_last_tick = fs;
@@ -10257,6 +10443,25 @@ fn radio_lines(what: Corner, ms: &[u64], state: Option<i64>, lines: &mut [Txt; 9
             lines[nl].s(doing);
             nl += 1;
         }
+    }
+    nl
+}
+
+/// The frame counter's lines (`FRAME_WORD`), in the device's base as every console number: the frames a second as the circle's name ("fps" alone until a tick has measured a second), then the time a frame took when it is known (an app's host said it, op 22's 40-byte form; on the deck the display's scene), then "deck" on the deck, so whose frames they are is never a guess.
+/// Returns the line count.
+fn frame_lines(fw: u64, name: &mut Txt, lines: &mut [Txt; 9], mut nl: usize) -> usize {
+    if fw & FW_MEASURED == 0 {
+        name.s("fps");
+        return nl;
+    }
+    name.num((fw >> 32 & ((1 << 28) - 1)) as i64, 1000, 0).s(" fps");
+    if fw & FW_TIMED != 0 {
+        lines[nl].s("draw ").num((fw & 0xFFFF_FFFF) as i64, 1000, 1).s(" ms");
+        nl += 1;
+    }
+    if fw & FW_DECK != 0 {
+        lines[nl].s("deck");
+        nl += 1;
     }
     nl
 }

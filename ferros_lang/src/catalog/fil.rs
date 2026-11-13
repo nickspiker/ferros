@@ -342,6 +342,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::PanelChannels => "mga channel ng panel",
         Msg::ReleaseLook => "itsura ng release",
         Msg::UntilReboot => "hanggang mag-reboot",
+        Msg::FrameCounter => "bilang ng frame",
         // ---- the attest screen ----
         Msg::Attest => "patotohanan",
         Msg::Mint => "buuin",
