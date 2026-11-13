@@ -74,6 +74,20 @@ Removal is bilateral (photon docs/pairing-v2.md "Chain changes"), the same as in
 
 Verified on the host: photon-interop shows the app parsing the device's `depart_req` and its consent verifying under every scheme the device holds. Not yet run against a live approver.
 
+## Photon on the 8a, the night of 2026-11-12
+
+Photon's side is the photon branch `ferros-keyboard-inset` (86419781, 72962cd5), built by tools/photon-build.sh against fluor main and signed with Photon's release key as before.
+
+- **The keyboard's rows.** fluor's ferros host tells `on_keyboard_inset`; Photon keeps the rows and its tick lays the bottom strips out again, as Android's IME inset is, so the compose bar rides above the system keyboard.
+- **The permanence warning** (the second typing of a new handle) is drawn under the button, outside the block the form lifts, and the keyboard covered its last three lines; the form now lifts by the warning's extent too while it shows.
+- **fgtw.org over plain HTTP.** Photon's one FGTW transport (`PhotonTransport` in fgtw/fleet.rs) answered "no fgtw.org from ferros", so a handle's probe could only fail.
+  On ferros it now posts over plain HTTP on port 80 (photon platform/ferros_http.rs: ip's resolver, op 10, and its client TCP, ops 4 to 7, every wait a held call; Content-Length and chunked replies).
+  The held chains still come first and fgtw.org stays the mirror asked last.
+  Still stubbed on ferros: the bootstrap's announce, the phonebook client, blobs and the relay, each its own path.
+- **Measured on the 8a** (the surfaces kernel, injected input, a test handle typed for the run and never minted): launch from the circle to the first frame in 2.8 s (the 91.6 MB capsule read from the vault in 1.9 s); the field's tap brings the keyboard ("the keyboard covers 634 rows"); typing and delete land in the field; Attest proves the handle, asks fgtw.org and gets the new handle's answer (the permanence screen), the whole warning above the keys; behind and in front again four times, Mahere in front between, no crash; Photon killed, stowed again and relaunched.
+- **Found:** an injected tap of 8 frames (the bridge's default) on Attest did nothing; one of 12 frames let the keyboard go and pressed it. Not chased: a person's tap is longer than 67 ms.
+- **Not reached:** contacts and a conversation, which need an identity; minting one on fgtw.org for a test is the owner's call.
+
 ## Photon's device key on ferros (2026-11-12)
 
 Photon, the stowed kist, took its device key from the machine fingerprint (photon `get_machine_fingerprint`), and on ferros, with no files, that fell to tohu's last resort: the bytes `unknown`.
