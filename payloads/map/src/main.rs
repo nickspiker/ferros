@@ -1922,6 +1922,17 @@ impl Map {
         true
     }
 
+    /// A console circle's page by its zone's id (`dash_page`), dragged toward the centre or tapped still (but a radio's, whose tap switches it), whatever is in front (owner, 2026-11-12: "The console slide to center should work with anything open..."): an app in front goes behind first, as deck's tap sends it, and the settings circle opens on the page over the map as it was left.
+    /// Until then a kist in front took the gesture to nothing (the pages live on the plane, and the map stood aside), altho the touch was the console's from its landing (op 41 gave its zone, op 27 told the app the point was not its own).
+    fn dash_open(&mut self, id: u8) {
+        if self.app_front && !self.send_behind(false) {
+            // None went behind: the app ended since the map last looked, and the map has the glass (as back's tap finds it).
+            self.app_front = false;
+            self.front_kist = None;
+        }
+        self.show_page(dash_page(id));
+    }
+
     /// Back's swipe (owner, 2026-11-11: "flip to the previous kist (this one to the background)"): the kist before the one in front, or with the map on the glass the last kist in front, launched as a tap on its circle would (init's RUNNING brings its window to the front; one that ended since starts again). The one in front goes behind first. A kist unstowed since is passed over.
     fn flip(&mut self) -> &'static str {
         let skip = if self.app_front { self.front_kist } else { None };
@@ -6096,16 +6107,14 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 let (fx, fy) = (cur[ids[0]].1, cur[ids[0]].2);
                 let (dx, dy) = (fx - corner_from.0, fy - corner_from.1);
                 if corner & 16 != 0 && corner < 32 && !corner_done {
-                    // A console circle's swipe inward, as the helm's was until 2026-11-12 (below): the finger's travel toward the screen's centre past a twelfth of the harmonic span opens its page, once a touch (with an app in front the settings circle is not on the screen: nothing).
+                    // A console circle's swipe inward, as the helm's was until 2026-11-12 (below): the finger's travel toward the screen's centre past a twelfth of the harmonic span opens its page, once a touch, whatever is in front (`dash_open`: an app in front goes behind first).
                     let (ux, uy) = ((w / 2 - corner_from.0) as f64, (h / 2 - corner_from.1) as f64);
                     let inward = (dx as f64 * ux + dy as f64 * uy) / libm::sqrt(ux * ux + uy * uy);
                     let span = (2 * w * h) as f64 / (w + h) as f64;
                     if inward > span / 12. {
                         corner_done = true;
-                        if !map.app_front {
-                            map.show_page(dash_page(corner & 15));
-                            map.draw();
-                        }
+                        map.dash_open(corner & 15);
+                        map.draw();
                     }
                 } else if corner & quick::ITEM != 0 && moved {
                     // A ring dragged down is its level (QUICK.md "Quick pages"; owner, 2026-11-12: "when dragging, once your finger goes below the torch circle it goes from 0% to 100% at the screen midpoint"): nothing while the finger is above the circle's bottom edge, then where the finger is, down to the screen's middle (`quick::level_at`). Once the drag took hold it keeps the finger whichever way it goes. Up from a ring, or up or down from a switch, moves the row as before (pushed back up, it shuts). No drag opens a page (a tap on a ring does).
@@ -6226,8 +6235,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                         let mut l = Line::new();
                         let _ = write!(l, "map: status circle {id} tapped: radios off G#{off:02X}\n");
                         console(grants, l.as_str().as_bytes());
-                    } else if !moved && !map.app_front {
-                        map.show_page(dash_page(id));
+                    } else if !moved {
+                        map.dash_open(id);
                         map.draw();
                     }
                 }
