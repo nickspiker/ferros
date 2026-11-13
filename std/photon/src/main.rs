@@ -62,6 +62,8 @@ fn main() {
     let mut app = PhotonApp::new();
     app.set_device_keypair(derive_device_keypair(&root));
     app.set_signing_bundle(SigningBundle::derive(&root));
+    // No window controls strip (minimise, maximise, close: a desktop window manager's, nothing on ferros), as Photon's Android build has none: since 2026-11-12 the frame reaches the glass's edge under the console (WINDOWS.md "Drawn under the controls"), and the strip, cut away with the corner until then, would show in the top right under the radios' circles, which take every touch there.
+    fluor::paint::DEBUG_SKIP_CONTROLS.store(true, std::sync::atomic::Ordering::Relaxed);
     let caps = fluor::host::ferros::Caps { display: 1, touch: 2, surface: 3 };
     match fluor::host::ferros::run_app(app, caps, 1.0, None) {
         Ok(()) => println!("photon: closed"),

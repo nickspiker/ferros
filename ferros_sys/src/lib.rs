@@ -830,7 +830,8 @@ pub fn cutout_hole() -> (f32, f32, f32) {
     if akita() { CUTOUT_HOLE_AKITA } else { CUTOUT_HOLE }
 }
 
-/// The circle an app lives in, on a `w` × `h` screen: centre and radius in pixels. Tangent to the bottom of the camera cutout and to the bottom of the screen, centred, so the corners outside it belong to the system (owner, 2026-11-02); the display draws its hairline, and every active app's page is inscribed in it (owner, 2026-11-05: the settings page fills it, the attest mark keeps its own smaller circle).
+/// The circle an app lives in, on a `w` × `h` screen: centre and radius in pixels. Tangent to the bottom of the camera cutout and to the bottom of the screen, centred, so the corners outside it belong to the system (owner, 2026-11-02); every active app's page is inscribed in it (owner, 2026-11-05: the settings page fills it, the attest mark keeps its own smaller circle).
+/// Since 2026-11-12 a kist's window is no longer cut to it: the window fills the glass and the corners' controls float in front of it, so the circle is the kist's safe area, told to its window as `window::EV_SAFE` (WINDOWS.md "Drawn under the controls").
 pub fn active_circle(w: usize, h: usize) -> (f32, f32, f32) {
     let c = cutout_bottom();
     let r = (h as f32 - c) * 0.5;
@@ -2207,6 +2208,17 @@ pub mod window {
     pub const EV_TEXT: u8 = 6;
     /// The keyboard's place changed: its payload two bytes, little-endian, the screen rows it covers from the bottom up (0: gone). The window keeps what it is typing into above them.
     pub const EV_INSET: u8 = 7;
+    /// The window's safe area (WINDOWS.md "Drawn under the controls", owner 2026-11-12: "Should we draw under the controls?", then "Agreed. Build it!"): a window fills the glass, and the system's controls float in front of its corners, so it keeps its own buttons and text where nothing covers them.
+    /// The payload is `SAFE_BYTES` long: the app's circle (`active_circle`) in the window's own pixels, its top-left corner the origin, centre x and centre y as i32 and the radius as u32, each in 256ths of a pixel, little-endian; then a byte of `SAFE_TOP` and `SAFE_BOTTOM`, which of the glass outside the circle the system holds.
+    /// A point is the window's to use when it is inside the circle, or outside it on a half (above the circle's centre, or below it) whose bit is clear.
+    /// Told when the window first shows, and again whenever it changes (full screen on or off); the keyboard's place is `EV_INSET`'s, apart from it.
+    pub const EV_SAFE: u8 = 8;
+    /// `EV_SAFE`'s payload length.
+    pub const SAFE_BYTES: usize = 13;
+    /// `EV_SAFE`'s byte: the glass outside the circle above its centre is the system's (the console's circles, drawn and touched there).
+    pub const SAFE_TOP: u8 = 1;
+    /// `EV_SAFE`'s byte: the glass outside the circle below its centre is the system's (the helm's wedges, Back and Deck: touched there even in full screen, where they are not drawn).
+    pub const SAFE_BOTTOM: u8 = 2;
     /// Kinds from this one up carry a payload: the low byte is its length, and the payloads follow the reply's events, in the events' order. A kind a reader does not know is stepped over by its length.
     pub const PAYLOAD_KINDS: u8 = 6;
     /// The most bytes one event's payload holds (a typed word, a key's text); longer text is sent in pieces.
