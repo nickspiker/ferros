@@ -1798,8 +1798,8 @@ impl Client {
         v.extend_from_slice(&self.add_reply());
         v.extend_from_slice(self.dep.denied_by.as_ref().map_or(&[0u8; 32][..], |d| &d[..]));
         v.extend_from_slice(&self.space_reply());
-        // The People page: an add's outcome.
-        v.push(self.facets.state);
+        // The People page: an add's outcome and the people (a change made here, or merged from another device).
+        v.extend_from_slice(&self.people_reply());
         v
     }
 

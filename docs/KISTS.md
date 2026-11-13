@@ -115,8 +115,8 @@ New codes are appended after `audio` (8) in the order approved, so the codes in 
 | **Bluetooth** | "Bluetooth: find and connect to things near you" | the bt driver's client ops, under the identity's address | proposed |
 | **NFC** | "NFC: read and write tags you hold to it" | tag reads and writes while its window is in front and the screen is on | proposed |
 | **USB** | "things plugged into the USB port" | a device on the port, once the person picks it | proposed |
-| **be you** | "be you in Photon: your contacts find and recognise you there" | the person's handle proof and a binding of its alias to their identity, signed by the fleet (FACETS.md "Be you") | proposed |
-| **people** | "your people: all of them, or the ones you choose" | the people served by the identity service, all or as chosen (FACETS.md "People") | proposed |
+| **be you** | "be you in Photon: your contacts find and recognise you there" | the person's handle proof and a binding of its alias to their identity, signed by the fleet (FACETS.md "Be you") | **built** 2026-11-13 as code 10 (`be_you`, a send right on the identity service's `facets` endpoint); words proposed |
+| **people** | "your people: all of them, or the ones you choose" | the people served by the identity service, all or as chosen (FACETS.md "People") | **built** 2026-11-13 as code 11 (`people`, the same endpoint; all or chosen on the kist's card); words proposed |
 | **places** | "your places: home, work and the spots you saved" | the saved places, all or as chosen (FACETS.md "Places"); not where you are | proposed |
 | **the hold** | "keep things for you" (making its declared kinds); "open your save states" (one question per kind it opens) | `items` and the per-kind opens of STORE.md "Two rights" | proposed in STORE.md |
 

@@ -240,6 +240,7 @@ From then on records the person publishes (the profile, the avatar wall, their s
 - **Identity service** (payloads/fgtw): the `facets` endpoint, the binding and the people (FACETS.md "To build" 2).
 - **std/photon**: its main asks the kernel for the alias and the identity service for the handle proof and the binding, and hands them in; Photon's capsule wants be you and people (its words in KISTS.md "The permission list").
 - **Nothing to move on ferros devices**: whatever Photon kept there is development data, as with the device key above.
+- **Built 2026-11-13** (FACETS.md "Built (2026-11-13 …)"): the kernel's alias call and the person key (11-12), the `facets` endpoint with the binding and the people, the rights in Photon's capsule, and std/photon's main building `PhotonKeys` (`legacy_seed` None). Waiting on Photon: `PhotonApp::set_photon_keys` and a way in for the people; until then std/photon holds them and Photon keeps its handle screen.
 
 ### Decisions
 
