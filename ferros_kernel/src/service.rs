@@ -883,6 +883,14 @@ fn site_text(w: u64) -> alloc::string::String {
 fn stall_lines(freq: u64) -> alloc::string::String {
     use core::sync::atomic::Ordering::Relaxed;
     let mut s = alloc::format!("lock: held longest A#{} us, taken at {}\n", crate::process::LOCK_HOLD_MAX.load(Relaxed) * 1_000_000 / freq, site_text(crate::process::LOCK_HOLD_SITE.load(Relaxed)));
+    // The long holds (process.rs LONG_HOLD), oldest first: t<ms> the take, how long, where.
+    let n = crate::process::LONG_HOLD_N.load(Relaxed) as usize;
+    // WHY saturating: fewer holds than the ring keeps start at the first; past it, the ring's oldest.
+    let first = n.saturating_sub(crate::process::LONG_HOLDS);
+    for j in first..n {
+        let h = &crate::process::LONG_HOLD[j % crate::process::LONG_HOLDS];
+        s.push_str(&alloc::format!("lock held long: t{} for A#{} us at {}\n", h[0].load(Relaxed) / (freq / 1000), h[1].load(Relaxed) * 1_000_000 / freq, site_text(h[2].load(Relaxed))));
+    }
     let prev_lock = platform::note_read(8);
     if prev_lock & 0xFF != 0 {
         s.push_str(&alloc::format!("lock at the previous boot's end: held by core A#{}, taken at {}\n", (prev_lock & 0xFF) - 1, site_text(prev_lock >> 8)));
@@ -2812,6 +2820,13 @@ pub fn run(mut b: Boot) -> ! {
                     } else {
                         resp.extend_from_slice(b"key: only `key power`; the volume keys are read as levels (the killswitch, the gate) and nothing queues their presses\n");
                     }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"console kept" || cmd.params.starts_with(b"console kept ") {
+                    // `diag "console kept [KiB]"`: the console's last KiB (default 256, at most 256: a reply's room) as kept, drained or not, without draining it (process.rs `console_kept`).
+                    let kib = core::str::from_utf8(&cmd.params[12..]).ok().and_then(|t| t.trim().parse::<usize>().ok()).unwrap_or(256).clamp(1, 256);
+                    resp.extend_from_slice(&crate::process::console_kept(kib * 1024));
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
