@@ -9,4 +9,4 @@ When ferros hands Linux a DTB with a carved-out region, verify the carve-out on 
 
 **Why:** the hv's `hv@afc000000` node was visible in sysfs from the first boot on 2026-10-17, and was taken as proof. Its `reg` carried the size as two cells while husky's `/reserved-memory` has `#size-cells = 1`, so Linux read size 0 and reserved nothing. Two days of "random" freezes, an SError chase and a direct-I/O hang followed, all Linux and the hv writing over each other. The pstore line that gave it away was the hv's own per-core stats turned to random bytes.
 
-**How to apply:** any new reserved node (hv, shared pages, ferros's own carve-outs) gets the iomem check in the boot script's verdict, next to the EL1 line. Match the parent's cell counts from the DTB, not from habit. See [[husky_ferros_probe_boot]] and HV.md "the reservation that never was".
+**How to apply:** any new reserved node (hv, shared pages, ferros's own carve-outs) gets the iomem check in the boot script's verdict, next to the EL1 line. Match the parent's cell counts from the DTB, not from habit. See [[husky_linux_handoff_oracle]] and HV.md "the reservation that never was".

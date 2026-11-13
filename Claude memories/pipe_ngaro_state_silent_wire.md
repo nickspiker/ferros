@@ -1,6 +1,6 @@
 ---
 name: pipe-ngaro-state-silent-wire
-description: "PIPE NGARO state (formerly FUCKED then DARK): chip gone silent. Trigger conditions: ≤3 of 8 healthy rings OR byzantine OTP fail OR interrupted burn → wire goes silent, no heartbeat."
+description: "PIPE NGARO state (formerly FUCKED then DARK): chip gone silent. Trigger conditions: <8 of 16 healthy rings OR byzantine OTP fail OR interrupted burn → wire goes silent, no heartbeat."
 metadata: 
   node_type: memory
   type: feedback

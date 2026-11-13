@@ -20,5 +20,5 @@ metadata:
 - Phrase results as "matches known-good build X", never "safe".
 - Measure both slots plus wherever the boot ROM actually loads from (likely the UFS boot areas, not only GPT partitions).
 - Known-good list = hashes from our own reverse-engineering audit and the published factory images (bl31 of ripcurrent-16.4-14540574 = SHA-256 cf009f04c52e7d092bd98dfea0ddf25edac5dfb41fa67f0d52c856e68e62d886, both slots matched on 2026-10-14).
-- Needs disk access: possible on the handoff path now, on cold slot b once the UFS link works.
+- Needs disk access: available on the cold boot since the UFS link works cold (2026-10-14).
 - Full chain-of-trust guarantees are only possible on own silicon (PIPE/TOKEN). See [[threat_model_harm_not_observation]], [[husky_cold_slot_b]].

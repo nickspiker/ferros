@@ -5,7 +5,7 @@ metadata:
   type: project
 ---
 
-**Layout:** slot b = ferros cold boot (only `boot_b` replaced; other b partitions stock, `product_b` empty), slot a = Android + handoff kernel (dev host, escape hatch). Pre-flash slot-b backups: `/mnt/Harbor/tmp/husky-backup-2026-10-14/`. See [[husky_shim_usb_service]], [[husky_ferros_probe_boot]].
+**Layout:** slot b = ferros cold boot (only `boot_b` replaced; other b partitions stock, `product_b` empty), slot a = Android + handoff kernel (dev host, escape hatch). Pre-flash slot-b backups: `/mnt/Harbor/tmp/husky-backup-2026-10-14/`. See [[husky_linux_handoff_oracle]].
 
 **Commands:**
 - `tools/husky-cold.sh`: build, reach fastboot from anywhere (adb / `bridge reboot fastboot`), flash boot_b, set b active, boot, wait for 1209:4665, DIAG.

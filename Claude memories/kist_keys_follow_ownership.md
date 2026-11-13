@@ -14,4 +14,4 @@ Owner, 2026-11-10, choosing the key that signs the Photon kist: "Photon tho? tha
 - **Lumis** and **Mahere** are the owner's own apps: signed with a developer key of his.
 - A kist's identity is (developer key, option), so custody of a project key is the ownership question. It may later move to the project (the DUNA, a threshold of maintainers); that needs a signed hand-off from one developer key to the next so a kist and everyone's answers survive it. Not built yet (KISTS.md gap).
 
-**How to apply:** never sign a commons project's kist with a personal key; when adding a kist target, ask whose it is first. Related: [[ferros-kist-term]], [[fgtw-duna-runanga]].
+**How to apply:** never sign a commons project's kist with a personal key; when adding a kist target, ask whose it is first. Related: [[ferros_vocabulary]], [[fgtw-duna-runanga]].

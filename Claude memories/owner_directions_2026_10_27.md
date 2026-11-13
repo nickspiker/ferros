@@ -14,3 +14,5 @@ Said while reviewing the first fluor frame on the phone and the std work:
 - **Rules everywhere**: Photon's AGENT.md holds the general rules; `~/.claude/CLAUDE.md` imports it so every repo's session reads it first.
 
 **How to apply:** no app draws over the map until the windowing design is agreed; plan Photon's memory on arcs, not a special heap; put an attest screen in the boot path before Photon ships; read Photon's AGENT.md as the house style for every repo.
+
+**Status 2026-11-12:** the windowing design was agreed and built ([[windows_design_pending]], WINDOWS.md); the attest screen runs at boot (`ahau`, [[ferros_attest_os_level]]); several growable arcs per process are in docs/ARCS.md; drivers keep moving out ([[kernel_out_moves]]). The rules-everywhere and HashMap lines stand.

@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: feedback
   originSessionId: 75576678-89a2-4635-8c20-1eba33babf4a
-  modified: 2026-11-05T19:26:17.578Z
+  modified: 2026-11-06T01:39:59.760Z
 ---
 
 No timers in ferros: "instant, always, no timers" (owner, 2026-10-22, after the map's 16-frame fly-to on tap). Restated with force on 2026-11-05: "NO TIMERS!!!! … that's literally a rule. the ONLY … EXCEPTION is for the 1s wait screen so I can halt the boot and that's ONLY in dev mode, outside dev it hangs on that screen forever until the user presses start. We may make it immediately boot but that's undecided."
@@ -17,6 +17,11 @@ No timers in ferros: "instant, always, no timers" (owner, 2026-10-22, after the 
 - The only exception is the dev build's 1 s auto-answer at "Ready?"; production waits for the press.
 - In the UI: camera jumps, view changes, fronts and backs appear in one frame. Gestures are recognised by movement and finger count, never by a time window (a tap = down and up without moving past the slop, however long it took).
 - Live data refreshing (the dashboard's facts) is not an animation.
+- **Motion after a finger lifts is allowed, as frame-counted physics with no clock** (owner, 2026-11-05: "we can't dead stop on a fling"). The settings pages define it:
+  - Left-right always snaps to a page. Past the halfway mark it goes to the next page, else back. Each frame the remaining offset halves (a right shift, floored), so it lands on 0 in a few frames.
+  - Vertical keeps the max of the last three per-frame finger movements and loses 1 px a frame after release (56, 62, 12 → 61, 60, 59 … 0). Then the display goes back to its 10 Hz idle.
+  - Count display frames (vsync), not rendered frames: a missed render advances the physics by every frame it missed, so motion stays smooth instead of stuttering. Owner, 2026-11-08: "it's not no timers it's a synchronous frame timer so if the compositor skips a frame our animations don't slow down. We follow shown frames, not composited." Say "frame timer on shown frames", not "no timers", when describing post-lift motion.
+  - This is physics stepped per frame, never a duration, a delay or an eased timeline.
 - A code comment that says "owner's design" does not make every number in it the owner's: check before carrying a constant forward.
 
 Related: [[settings-identity-to-device-only]].

@@ -18,9 +18,7 @@ Chords while Android runs under the hv:
 - **Verified on slot b:** the keys work in Android, and the chord lands in ferros (GATE_ANSWER 5).
 
 **Open:**
-- The reset passes through ABL, so the unlocked-device warning shows ("nag and all") and Android's RAM is lost. Fixing that needs the swap without a reset.
-- System suspend with the hv core running is not yet measured.
-- Slot a still has the old hv.
+- Superseded 2026-11-02: the chord no longer resets thru ABL; it freezes Android and jumps into a fresh ferros on the hv core ([[hv_jump_to_ferros]]). Both slots carry the same hv (husky-cold.sh). Deep sleep under the hv was fixed 2026-11-03 ([[sandbox_state_2026_11_03]], HV.md).
 - The owner's later idea: patch Linux so it knows about the hv-owned core.
 
 **Why:** the owner wants a button that gets back from Android, keeps Android's RAM ("steal whatever Android had going on"), and works even when Linux is wedged.

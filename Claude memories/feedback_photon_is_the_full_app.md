@@ -18,7 +18,7 @@ The owner, 2026-11-05: "there is no Photon core, there is FGTW that handles the 
 **How to apply:**
 - Never propose finishing, extending or porting `photon_core`, or a "ferros-native Photon client".
 - Photon work on ferros means making the real app run better there: the std target, fluor's ferros host, kete's vault backend, tokio over the `ip` server, input.
-- Identity, attest and OS sync are FGTW's.
+- Identity, attest and OS sync are FGTW's. Owner, 2026-11-08: "migrate all the fleet/identity stuff to FGTW so everything can use it. Photon is just a messenger." All fleet and identity logic (roots, attest, mint, join, add/approve, leave, chain, fleet key and fan-out, device names, pairing and beacons) lives in the shared /mnt/Harbor/Code/fgtw crate. Photon keeps messaging (photons, beams) and its UI, and calls fgtw. ferros's payloads/fgtw is a thin service over the same crate. Never implement fleet or identity logic inside Photon or a ferros payload.
 - Read "photon_core" in old docs as superseded. Retiring it (payloads/fgtw, beamtest and tools/photon-interop depend on it) is the owner's call.
 
-Related: [[std-target-status]], [[photon-on-ferros-no-bootstrap]], [[photon-terminology]].
+Related: [[std-target-status]], [[photon-on-ferros-no-bootstrap]], [[ferros_vocabulary]].

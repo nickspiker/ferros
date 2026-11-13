@@ -23,11 +23,11 @@ Ring healthy iff all three pass.
 
 **SOT-23 package context:** PIPE's target package is SOT-23 (3-pin surface-mount, ~3 × 1.4 mm body, smallest standard 3-pin package). Silicon area at a premium — Variant A's small footprint is what makes the layered health check affordable on this package envelope.
 
-**Side benefit:** the layered check also defends against physical extraction attacks. An adversary with device custody who attempts to coerce predictable output via voltage glitching, clock injection, thermal forcing, or EMI cannot succeed without producing a stuck/biased/periodic ring state — all of which the three layers detect and convert into the silent-wire FUCKED state of [[pipe-fucked-state-silent-wire]].
+**Side benefit:** the layered check also defends against physical extraction attacks. An adversary with device custody who attempts to coerce predictable output via voltage glitching, clock injection, thermal forcing, or EMI cannot succeed without producing a stuck/biased/periodic ring state — all of which the three layers detect and convert into the silent-wire NGARO state of [[pipe-ngaro-state-silent-wire]].
 
 **How to apply:**
 - The earlier popcount+toggle implementation in `trng.v` is superseded; the new health stack is RCT + APT + iterated GF(2) differencing.
 - Tight z-score check (W/2 ± J·σ where σ = √W/2) at each iterated-diff level — much tighter than the old "toggle ≥ W/256" threshold.
 - Same architectural defense layers still apply downstream: per-ring health → Byzantine threshold (8-of-16, per [[pipe-byzantine-ring-threshold]]) → silent-wire on failure → BLAKE3 conditioner on accumulated output.
 
-Related: [[pipe-slow-is-security]], [[pipe-byzantine-ring-threshold]], [[pipe-fucked-state-silent-wire]], [[pipe-pt-unified-stack]].
+Related: [[pipe-slow-is-security]], [[pipe-byzantine-ring-threshold]], [[pipe-ngaro-state-silent-wire]], [[pipe-pt-unified-stack]].

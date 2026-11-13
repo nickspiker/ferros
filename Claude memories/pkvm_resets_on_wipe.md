@@ -13,7 +13,7 @@ Reading `fastboot oem pkvm status`:
 
 After `fastboot oem pkvm disable` and a fresh wipe, Android booted through the gate in 72 s, to the setup wizard.
 
-**Why:** the hv runs Android at EL1 under it. pKVM is a hypervisor of its own and dies trying to take EL2. The 2026-10-19 handoff hit the same wall ([[ufs-linux-handoff]]).
+**Why:** the hv runs Android at EL1 under it. pKVM is a hypervisor of its own and dies trying to take EL2. The 2026-10-19 handoff hit the same wall ([[husky_linux_handoff_oracle]]).
 
 **How to apply:**
 - After any wipe (`fastboot -w`, recovery's format, a factory reset), run `fastboot oem pkvm disable` and confirm with `status` before booting Android through the gate.

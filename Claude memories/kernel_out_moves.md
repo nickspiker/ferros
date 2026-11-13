@@ -33,3 +33,5 @@ Owner goal (2026-10-31): the kernel does only kernel things, plus the killswitch
 - the boot modeset.
 
 Related: [[smp-first-cut]], [[husky-cold-slot-b]], [[feedback-measure-before-fixing]].
+
+**Row 7 built 2026-11-10 (forge merge of kernel-out-small-drivers):** shared `ferros_spi` crate (kernel keeps the clock paths); `payloads/amp` behind an `amp` power switch (spawned by hand, `usi1-spi` grant; verified on the Pro: both CS35L41 read DEVID G#35A40); haptics moved into the NFC process (ops 7 report, 8+n ROM waveform), reads lagged three behind on the first run (stale RX FIFO bytes), fixed in fb35747 and verified on the Pro: DEVID G#40A260, REVID G#A1; no buzz tested yet (needs a hand on the device); touch on ferros_spi (commit d4c7e25) merged but its capsule NOT deployed: cold-boot path, test only with the owner present.

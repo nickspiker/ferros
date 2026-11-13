@@ -7,9 +7,9 @@ metadata:
   originSessionId: 6adb97ac-ad4e-416a-9091-e8b2900d78dc
 ---
 
-PIPE's TRNG uses 16 ring oscillators with an 8-of-16 byzantine threshold for fleet-safety. The chip operates if ≥8 rings pass their health checks; ≤7 healthy means FUCKED and silent wire.
+PIPE's TRNG uses 16 ring oscillators with an 8-of-16 byzantine threshold for fleet-safety. The chip operates if ≥8 rings pass their health checks; ≤7 healthy means NGARO and silent wire.
 
-**Why:** Per-ring failure rate must be derived from the fleet operating budget. For target `P_chip < 10⁻¹⁵` per KOHI (so a fleet of 10¹¹ devices × 10 KOHIs/day × 100 years has < 1 expected false-FUCKED event total), the math:
+**Why:** Per-ring failure rate must be derived from the fleet operating budget. For target `P_chip < 10⁻¹⁵` per KOHI (so a fleet of 10¹¹ devices × 10 KOHIs/day × 100 years has < 1 expected false-NGARO event total), the math:
 
 ```
 P(≥9 fail of 16) ≈ C(16, 9) · p⁹ = 11,440 · p⁹  < 10⁻¹⁵
@@ -25,4 +25,4 @@ Per-ring failure budget = 0.79%. With our actual TOG_MIN = N/256, per-ring toggl
 - Going from 8 rings to 16 rings + byzantine threshold is the difference between "all must pass" (8× failure-rate multiplier into per-chip rate) and "≥half must pass" (combinatorial small power of per-ring p). 16 rings cost ~270 LUTs + ~290 FFs more than 8 rings — modest.
 - At silicon tapeout: per-ring physics differ (TERO, metastability cell, shot-noise diode); per-ring failure rates and ideal threshold may need re-derivation from process-corner Monte Carlo. Architecture stays.
 
-Related: [[pipe-popcount-alone-insufficient]] (the toggle counter is what brings per-ring failure rate down to fleet-safe), [[pipe-fucked-state-silent-wire]] (what happens when threshold isn't met).
+Related: [[pipe-popcount-alone-insufficient]] (the toggle counter is what brings per-ring failure rate down to fleet-safe), [[pipe-ngaro-state-silent-wire]] (what happens when threshold isn't met).

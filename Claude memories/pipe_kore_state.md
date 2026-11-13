@@ -21,7 +21,7 @@ In the PIPE project, all chip operational states are named in te reo Maori (swep
 
 **chip_state encoding (2 bits):**
 - The numeric value rises with chip vitality. KORE = 0 means "all storage zero, no identity"; ORA = 3 means "all four pairs verified, fully healthy."
-- NGARO is **not** assigned a numeric code because the chip in NGARO state does not transmit. The host infers NGARO from the absence of any wire response within the protocol timeout, which is indistinguishable at the wire from a chip not physically present. See [[pipe-fucked-state-silent-wire]] (renamed to NGARO).
+- NGARO is **not** assigned a numeric code because the chip in NGARO state does not transmit. The host infers NGARO from the absence of any wire response within the protocol timeout, which is indistinguishable at the wire from a chip not physically present. See [[pipe-ngaro-state-silent-wire]].
 - Internal to silicon, `chip_state_ngaro` is a separate 1-bit predicate orthogonal to `chip_state`. It is derived as `~byzantine_ok & ~all_kore`. The two signals can both be true simultaneously (e.g., 2 valid pairs disagreeing -> chip_state = WHARA AND chip_state_ngaro = 1). The chip in NGARO state is gated silent on the wire regardless of chip_state value.
 
 **Cosmology arc:** `KORE -> KOHI -> BLAKE3 -> TAHU -> ORA` (void -> gather -> condition -> ignite -> alive). The chip is born the way the Maori cosmos is. HARA and WHARA are post-provisioning operational states with single-pair or two-pair damage; NGARO is the silent failure terminal state.
