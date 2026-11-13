@@ -3161,7 +3161,7 @@ fn working(p: u64) -> u64 {
 }
 static mut WINS: [Option<Win>; SURFACES] = [None; SURFACES];
 static mut RAISES: u32 = 0;
-/// The windows' owners as the kernel holds them (SYS_BELL `BELL_SURFACES`): bits 4k to 4k + 3 slot k's live generation (0 once the process it was given to has ended, however it ended; ferros_sys `surface_generation`). Written by the kernel as a surface changes hands, which wakes `reaper` waiting here.
+/// The windows' owners as the kernel holds them (SYS_BELL `BELL_SLOTS`): bits 4k to 4k + 3 slot k's live generation (0 once the process it was given to has ended, however it ended; ferros_sys `surface_generation`). Written by the kernel as a surface changes hands, which wakes `reaper` waiting here.
 static SURF_LIVE: AtomicU64 = AtomicU64::new(0);
 /// Whether that bell is registered: with a kernel from before 2026-11-12 (four surfaces, their generations in the preference bytes) it is not, and no window counts as live (this display needs the kernel of its day).
 static SURF_BELL: AtomicBool = AtomicBool::new(false);
@@ -7736,14 +7736,14 @@ fn server(grants: u64) -> ! {
         log.flush();
     }
     // The windows' owners (`reaper`): the kernel's bell on the surfaces changing hands, then the thread asleep on it. A kernel without the bell: the preference bytes alone, read each pass, as before.
-    if ferros_sys::bell(ferros_sys::BELL_SURFACES, &SURF_LIVE) {
+    if ferros_sys::bell(ferros_sys::BELL_SLOTS, &SURF_LIVE) {
         SURF_BELL.store(true, Ordering::Release);
         if ferros_sys::thread_spawn(reaper, unsafe { &mut *(&raw mut REAP_STACK) }, 0) != 0 {
             log.s(b"display: no reaper thread\n");
             log.flush();
         }
     } else {
-        log.s(b"display: no surfaces bell (an older kernel): windows of ended processes go on the next pass\n");
+        log.s(b"display: no slots bell (a kernel from before 2026-11-12): no window counts as live, this display needs the kernel of its day\n");
         log.flush();
     }
     // The render thread on the big core (KERNEL.md "Cores": pinning by latency class — this is the one real compute path; receive and vsync stay on the workers, where the map and the touch server run, so a call hands off on the caller's own core). After the other threads are spawned: they inherit the mask.

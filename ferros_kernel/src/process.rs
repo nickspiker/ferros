@@ -1283,7 +1283,7 @@ const SYS_ZONE: u64 = 35;
 const SYS_LANG: u64 = 36;
 /// claim(op, …): the rights in use (`CLAIMS`; owner, 2026-11-10: GPS "stays green but no visuals for satellites since we're not rx'ing ... until something like mahere calls it or I open the GPS screen ... or Photon a friend pings for my location", and "we need to be able to see what kists are using each permission"). A right by its code (ferros_kist::RIGHTS); only GPS is claimed today. Op 0: claim x1 the right, x2 the token offset of what proves the caller may use it (for GPS: Settings, the settings page's, or the `gps` endpoint's send right, a kist's granted want) → 0 (also when it held one already), ERR refused (no such right or proof, nobody present, GPS switched off). Op 1: release x1 the right → 0. Op 2: who claims x1 the right, x2 the Settings token, x3/x4 a buffer and its length → how many claims (all of them; records past the buffer are not written), each `CLAIM_REC` bytes: 0 a system process or 1 a kist, then the kist's capsule address (32 bytes, zeros for a system process); ERR without Settings. Op 3: the GPS driver asked thru the kernel for a Settings holder that holds a GPS claim (the map's page: init's grants page has no slot left for its own `use gps`): x1 the driver's op (0 FIX, 2 SATS, payloads/gps), x2 the Settings token, x3/x4 the reply's buffer and its length with CALL_LIVE set, the call the caller's own as SYS_CALL makes it → the reply's length, ERR at once when no driver is receiving yet; or x1 = 3 | the change count last seen << 8, the driver's WATCH, its length bare (no CALL_LIVE): held until the driver's fixes or fix messages move, taken by a driver that starts later, → 4 bytes, the count now. The position passes thru, never kept. Op 4: the claims' doorbell, x1 a word in the caller's arc, x2 the Settings token: GPS_CLAIMS written there now and at every change, its waiters woken → 0.
 const SYS_CLAIM: u64 = 37;
-/// bell(source, word): a doorbell on what the settings pages show (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure. 1s poll can desync too, that needs fixd."). x0 the source: 0-5 a link in the facts' order (its eight measures, its tracks and its detail document: counted when its driver sets one to a value other than the one it held, and when the driver ends and they empty), `BELL_FACTS` the device's facts a settings page shows (`bell_facts`). `BELL_SURFACES` (9), for the holder of the `surfaces` region alone (the display server): the windows' owners, the word not a count but the sixteen surface slots' live generations, bits 4k to 4k + 3 slot k's (1 to 15 while the process it was given to is alive, 0 otherwise; since 2026-11-12, a byte for each of four surfaces and a change count before) (`surfaces_ring`; 2026-11-11, Mahere killed from outside and its window kept the glass). x1 a word in the caller's arc, 8-aligned as SYS_WAIT takes one: the kernel writes the source's change count there now and at every change, waking whatever of the process waits on it (`bell_ring`). One word a source a process; a second registration moves it. No capability: the measures, tracks and facts are what SYS_FACTS and SYS_TRACKS give anyone, and a detail's count says when it changed, never what it says. → 0, ERR for no such source (or the surfaces' without the region).
+/// bell(source, word): a doorbell on what the settings pages show (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure. 1s poll can desync too, that needs fixd."). x0 the source: 0-5 a link in the facts' order (its eight measures, its tracks and its detail document: counted when its driver sets one to a value other than the one it held, and when the driver ends and they empty), `BELL_FACTS` the device's facts a settings page shows (`bell_facts`). `BELL_SURFACES` (9), for the holder of the `surfaces` region alone (the display server): the windows' owners in their old form, the word not a count but slots 0 to 3's live generations, byte k slot k's (its preference byte 8 + k while the process it was given to is alive, 0 otherwise) and a change count above bit 32 (`surfaces_ring`; 2026-11-11, Mahere killed from outside and its window kept the glass); kept for a display from before 2026-11-12. `BELL_SLOTS` (12), for the same holder: every slot's, bits 4k to 4k + 3 slot k's generation (1 to 15) while its owner lives, no count. x1 a word in the caller's arc, 8-aligned as SYS_WAIT takes one: the kernel writes the source's change count there now and at every change, waking whatever of the process waits on it (`bell_ring`). One word a source a process; a second registration moves it. No capability: the measures, tracks and facts are what SYS_FACTS and SYS_TRACKS give anyone, and a detail's count says when it changed, never what it says. → 0, ERR for no such source (or the surfaces' or the slots' without the region).
 const SYS_BELL: u64 = 38;
 /// not_started(op, …): the kist launches init answered "started" for that the kernel's kist job did not start after all, and the kists that started and then ended by a fault, a panic or a kill from outside (`NOT_STARTED`; owner, 2026-11-11: Mahere tapped, nothing opened, "it looked stuck"; then Mahere faulting at once, "no toast or anything"), for the Settings holder alone (the map), as the claims' users list. Op 0: x1 the Settings token, x2/x3 a buffer and its length → how many records (all of them; whole records past the buffer are not written), each `NOT_STARTED_REC` bytes: the reason (ferros_kist::launch::why), the capsule's address (32 bytes), the kists' bell count it rang (u64 LE). Op 1: the kists' doorbell, x1 a word in the caller's arc, x2 the Settings token: the bell's change count written there now and whenever a launch does not start, a kist starts, or a kist ends any way, its waiters woken → 0. Op 2: the kists alive (owner, 2026-11-11: their circles glow running, stopped or not running), x1 the Settings token, x2/x3 a buffer and its length → how many (all of them; whole ones past the buffer are not written), each a capsule's address (32 bytes) of a process the kist job started that is not ending (`kists_live`). ERR without Settings, or for no such op.
 const SYS_NOT_STARTED: u64 = 39;
@@ -1775,6 +1775,7 @@ fn surface_take(epoch: u64) -> Result<usize, &'static str> {
     s.owner = epoch;
     s.held = true;
     s.frames = frames;
+    surface_pref(k, s.generation);
     Ok(k)
 }
 
@@ -1811,6 +1812,7 @@ fn surfaces_free(epoch: u64) {
     for k in 0..SURFACE_SLOTS {
         if slots[k].owner == epoch {
             slots[k].owner = 0;
+            surface_pref(k, 0);
             if draining >> k & 1 == 0 {
                 surface_release(k);
             }
@@ -1842,10 +1844,24 @@ fn surfaces_report(s: &mut alloc::string::String) {
     let _ = core::fmt::Write::write_fmt(s, format_args!("surfaces: A#{n} of A#{SURFACE_SLOTS} held, A#{} MiB\n", n * (crate::cachemap::SURFACE_SIZE >> 20)));
 }
 
-/// The surfaces' bell word as last rung (`BELL_SURFACES`): bits 4k to 4k + 3 slot k's live generation, 0 for a slot whose owner has ended or that nobody holds.
+/// The surface slots' bell word as last rung (`BELL_SLOTS`): bits 4k to 4k + 3 slot k's live generation, 0 for a slot whose owner has ended or that nobody holds.
+static SLOTS_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The old surfaces' bell word as last rung (`BELL_SURFACES`, for a display from before 2026-11-12, which knows four surfaces): byte k slot k's live generation for slots 0 to 3, the change count above bit 32.
 static SURFACES_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Bytes 8-11 of the preferences block: slots 0 to 3's generations, 0 while free, for a display from before 2026-11-12 (it reads them beside `BELL_SURFACES`); the slots' bell alone carries them all.
+const PREF_SURFACES: usize = 8;
+/// How many slots a display from before knows.
+const SURFACES_OLD: usize = 4;
 
-/// The windows' owners, from the kernel's own table (owner, 2026-11-11, on the Pro: Mahere killed with `diag kill`, its window stayed in the display's table, op 5 still said an app was in front, and the map ignored every gesture but the corners until the display was restarted): each slot's generation while the process it was given to is alive and not ending, 0 otherwise, rung into the display's bell word when that differs from what was rung last, waking its thread there. Called where a surface changes hands: freed (every end, `end_process` and `kill_locked` alike, thru `surfaces_free`) and given (once its process is in the table, `build_from`). A slot's generation changes each time it is given, so the word comes back to a value it held while a slot changed hands in between only after fifteen hand-outs of that slot between two of the display's looks. Under the lock.
+/// Slot k's preference byte, for a display from before (`PREF_SURFACES`): its generation, or 0. Under the lock.
+fn surface_pref(k: usize, g: u8) {
+    if k < SURFACES_OLD {
+        unsafe { (*(&raw mut PREFS_NOW))[PREF_SURFACES + k] = g };
+        write_pref_all(PREF_SURFACES + k, g);
+    }
+}
+
+/// The windows' owners, from the kernel's own table (owner, 2026-11-11, on the Pro: Mahere killed with `diag kill`, its window stayed in the display's table, op 5 still said an app was in front, and the map ignored every gesture but the corners until the display was restarted): each slot's generation while the process it was given to is alive and not ending, 0 otherwise, rung into the display's bell word when that differs from what was rung last, waking its thread there; and the first four in the old form (`BELL_SURFACES`). Called where a surface changes hands: freed (every end, `end_process` and `kill_locked` alike, thru `surfaces_free`) and given (once its process is in the table, `build_from`). A slot's generation changes each time it is given, so the word comes back to a value it held while a slot changed hands in between only after fifteen hand-outs of that slot between two of the display's looks. Under the lock.
 fn surfaces_ring() {
     let kk = k();
     let slots = unsafe { &*(&raw const SLOTS) };
@@ -1855,11 +1871,21 @@ fn surfaces_ring() {
             live |= (slot.generation as u64) << (4 * s);
         }
     }
-    if SURFACES_LIVE.load(core::sync::atomic::Ordering::Acquire) == live {
+    if SLOTS_LIVE.load(core::sync::atomic::Ordering::Acquire) == live {
         return;
     }
-    SURFACES_LIVE.store(live, core::sync::atomic::Ordering::Release);
-    bell_ring(BELL_SURFACES, live);
+    SLOTS_LIVE.store(live, core::sync::atomic::Ordering::Release);
+    bell_ring(BELL_SLOTS, live);
+    let mut old = 0u64;
+    for s in 0..SURFACES_OLD {
+        old |= ((live >> (4 * s)) & 15) << (8 * s);
+    }
+    let was = SURFACES_LIVE.load(core::sync::atomic::Ordering::Acquire);
+    if was & 0xFFFF_FFFF != old {
+        let v = ((was >> 32) + 1) << 32 | old;
+        SURFACES_LIVE.store(v, core::sync::atomic::Ordering::Release);
+        bell_ring(BELL_SURFACES, v);
+    }
 }
 
 /// The layer arena's blocks in `DMA` (`layers-block`): the whole, its halves, its quarters.
@@ -1996,7 +2022,7 @@ fn gpu_drained() {
 /// SYS_CALLER's bit for surface slot k: bit `CALLER_SURFACE0 + k` (bits 32 to 47 since 2026-11-12, sixteen slots; until then bits 0 to 3).
 pub const CALLER_SURFACE0: u32 = 32;
 
-/// What process `p` holds that a server decides by (SYS_CALLER): bit `CALLER_SURFACE0 + k` for surface slot k, held as its own or inside a region that holds it whole (the display's and the GPU service's whole window); `CALLER_SETTINGS` for the Settings capability; `CALLER_KIST` for a kist. From its capability table, so a surface passed on at a spawn counts for both holders, and one freed at an end for neither (the table goes with the process).
+/// What process `p` holds that a server decides by (SYS_CALLER): bit `CALLER_SURFACE0 + k` for surface slot k (and bit k for slots 0 to 3, the old layout), held as its own or inside a region that holds it whole (the display's and the GPU service's whole window); `CALLER_SETTINGS` for the Settings capability; `CALLER_KIST` for a kist. From its capability table, so a surface passed on at a spawn counts for both holders, and one freed at an end for neither (the table goes with the process).
 fn caller_holds(p: &Process) -> u64 {
     let s0 = crate::cachemap::SURF_VA.0;
     let size = crate::cachemap::SURFACE_SIZE;
@@ -2008,7 +2034,8 @@ fn caller_holds(p: &Process) -> u64 {
                 for k in 0..SURFACE_SLOTS {
                     let at = s0 + k * size;
                     if b <= at && at + size <= b + n {
-                        bits |= 1 << (CALLER_SURFACE0 as usize + k);
+                        // Slots 0 to 3 at bits 0 to 3 as well, for a display from before (four surfaces), which reads them there.
+                        bits |= 1 << (CALLER_SURFACE0 as usize + k) | if k < SURFACES_OLD { 1 << k } else { 0 };
                     }
                 }
             }
@@ -3922,6 +3949,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 bell_register(p, pi, source, f.x[1], BELL_COUNT[source].load(core::sync::atomic::Ordering::Acquire))
             } else if source == BELL_SURFACES && holds_surfaces(p) {
                 bell_register(p, pi, source, f.x[1], SURFACES_LIVE.load(core::sync::atomic::Ordering::Acquire))
+            } else if source == BELL_SLOTS && holds_surfaces(p) {
+                bell_register(p, pi, source, f.x[1], SLOTS_LIVE.load(core::sync::atomic::Ordering::Acquire))
             } else {
                 ERR
             };
@@ -4659,7 +4688,9 @@ const BELL_SURFACES: usize = 9;
 const BELL_OFFERS: usize = 10;
 /// The notes' (SYS_NOTIFY op 4, for a Settings holder): a note posted, revised, withdrawn, seen, past its deadline, or the person's loaded or gone (notify.rs).
 const BELL_NOTES: usize = 11;
-const BELLS: usize = 12;
+/// The surface slots' (2026-11-12), for the holder of the `surfaces` region: its word is `SLOTS_LIVE`, four bits a slot, no count. `BELL_SURFACES` stays in its old form (slots 0 to 3) for a display from before.
+const BELL_SLOTS: usize = 12;
+const BELLS: usize = 13;
 /// Each source's change count (the claims' is GPS_CLAIMS'), so a word registered late starts from the count now and a reader tells a change by inequality.
 static BELL_COUNT: [core::sync::atomic::AtomicU64; BELLS] = [const { core::sync::atomic::AtomicU64::new(0) }; BELLS];
 /// The bells' words (SYS_BELL, SYS_CLAIM op 4, SYS_NOT_STARTED op 1): (the process's slot, its epoch, the word's address in its arc, the source). At most one a source a process. Under the kernel lock.

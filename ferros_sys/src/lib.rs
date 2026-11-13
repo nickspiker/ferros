@@ -1041,8 +1041,10 @@ pub fn status_track(k: usize, word: u64) -> u64 {
 
 /// The facts' bell source (`bell`): the facts a settings page shows (the battery's share and whether it charges, the processes alive, the vault's keys, the hottest part of the chip and its throttle). Sources 0-5 are the links in the facts' order.
 pub const BELL_FACTS: u64 = 6;
-/// The windows' owners' bell source (`bell`), for the holder of the `surfaces` region alone (the display server): the word is not a count but the surface slots' live generations, bits 4k to 4k + 3 slot k's (1 to 15 while the process it was given to is alive, 0 once it has ended, however it ended, or while the slot is free; `surface_generation`). A window shown on a surface under a generation its slot no longer holds belongs to a process that has ended. Until 2026-11-12 a byte for each of four surfaces and a change count above bit 32.
+/// The windows' owners' bell source (`bell`) in its old form, for the holder of the `surfaces` region alone (the display server): byte k slot k's live generation for slots 0 to 3, and a change count above bit 32. Kept for a display from before 2026-11-12; `BELL_SLOTS` carries every slot.
 pub const BELL_SURFACES: u64 = 9;
+/// The surface slots' bell source (`bell`, since 2026-11-12), for the holder of the `surfaces` region alone (the display server): the word is not a count but every slot's live generation, bits 4k to 4k + 3 slot k's (1 to 15 while the process it was given to is alive, 0 once it has ended, however it ended, or while the slot is free; `surface_generation`). A window shown on a surface under a generation its slot no longer holds belongs to a process that has ended.
+pub const BELL_SLOTS: u64 = 12;
 
 /// How many surfaces the kernel can give out at once (2026-11-12, on demand from the frame pool; four fixed ones before): slots of the surfaces' window, slot k at `SURFACES_WINDOW + k * SURFACE_BYTES`.
 pub const SURFACE_SLOTS: usize = 16;
@@ -1051,7 +1053,7 @@ pub const SURFACE_BYTES: usize = 32 << 20;
 /// The surfaces' window, the kernel's cachemap SURF_VA: what `dma` answers for the whole `surfaces` region.
 pub const SURFACES_WINDOW: u64 = 0x50_0A00_0000;
 
-/// Slot k's generation in the surfaces' bell word (`BELL_SURFACES`): 0 when nobody alive holds it.
+/// Slot k's generation in the slots' bell word (`BELL_SLOTS`): 0 when nobody alive holds it.
 pub const fn surface_generation(word: u64, k: usize) -> u8 {
     (word >> (4 * k)) as u8 & 15
 }
@@ -1851,7 +1853,7 @@ pub fn reply(token: &[u8; 32], msg: &[u8]) -> u64 {
 pub const CALLER_SETTINGS: u64 = 1 << 8;
 /// `caller`'s answer: the caller is a kist.
 pub const CALLER_KIST: u64 = 1 << 9;
-/// `caller`'s answer: bit `CALLER_SURFACE0 + k` for surface slot k (bits 32 to 47 since 2026-11-12, sixteen slots; bits 0 to 3 for four surfaces before).
+/// `caller`'s answer: bit `CALLER_SURFACE0 + k` for surface slot k (bits 32 to 47 since 2026-11-12, sixteen slots; bits 0 to 3 for four surfaces before, which the kernel still sets for slots 0 to 3).
 pub const CALLER_SURFACE0: u32 = 32;
 
 /// Whether `caller`'s answer `h` holds surface slot k.
