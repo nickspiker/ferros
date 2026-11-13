@@ -11,7 +11,7 @@ The controller is an ST54L (ST21NFC NCI 2.0 interface plus an eSE) on hsi2c_0 (P
   - the motor's reset, gph2-3, in the same block (below).
 - **Process** (`payloads/nfc`, endpoint `nfc`):
   - NCI over the bus grant;
-  - the interrupt line's level (gpa7-6, read in gpio-alive, polled every millisecond);
+  - the interrupt line (gpa7-6 in gpio-alive): with the kernel's `nfc-irq` line (SPI 42, granted with hsi2c0, 2026-11-13) a level-high external interrupt the serving loop waits on, with a call, the screen preference changing, and discovery's retry while stopped; without it, its level read every millisecond as before (~950 wakes a second on the 8a with the screen on);
   - Photon's tag;
   - the vibration motor (ops 7 and 8).
 - **Dev tool:** `tools/husky-radio.sh nfc | call nfc <hex> | kill nfc`.

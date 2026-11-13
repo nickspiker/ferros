@@ -1423,7 +1423,18 @@ pub static IRQS: &[IrqLine] = &[
     IrqLine { name: "aoc-mbox-a32", intid: 32 + 77 },
     // PCIe channel 1's controller (the WiFi chip's link): zuma.h IRQ_PCIE_GEN3A_1_HSI2, SPI 439, level high (zuma-pcie.dtsi pcie_1, its first `interrupts` entry). Channel 1 has no `separated-msi`, so the Exynos RC driver takes its MSIs on this one line, thru ELBI PCIE_IRQ2 bit 17 (IRQ_MSI_RISING_ASSERT, enabled by PCIE_IRQ2_EN bit 17; pcie-exynos-rc.c exynos_pcie_rc_irq_handler and msi_init). Granted to whoever drives the controller (`build_from`), for payloads/pcie1's wait on the chip (2026-11-11).
     IrqLine { name: "pcie1", intid: 32 + 439 },
+    // PCIe channel 0's MSI control block 0 (the cellular modem's link): zuma.h IRQ_PCIE_GEN3_2L_MSI_0_HSI1, SPI 416, level high. Channel 0 has `separated-msi` (zuma-pcie.dtsi pcie_0): block k of the DesignWare MSI receiver raises its own SPI 416 + k, and the CP's four vectors (data 0-3) are block 0's (pcie-exynos-rc.c exynos_pcie_msi0_handler). For payloads/modem's wait on the CP (2026-11-13).
+    IrqLine { name: "modem-msi", intid: 32 + 416 },
+    // The CP's CP2AP_WAKEUP: gpa6-5, EINT 25 of the alive bank (pinctrl-gs.c zuma_pin_alive gpa6 from EINT 20), zuma.h IRQ_ALIVE_EINT25 = SPI 35, level high (the EINT block's own pending bit). What the CP raises when it wants the link back from its idle suspend, when no MSI can come (modem_ctrl_s5100.c ap_wakeup_handler).
+    IrqLine { name: "modem-wakeup", intid: 32 + 35 },
+    // The NFC controller's IRQ: gpa7-6, EINT 32 of the alive bank (gpa7 from EINT 26), zuma.h IRQ_ALIVE_EINT32 = SPI 42, level high. For payloads/nfc's wait on the chip instead of reading the pin every millisecond (2026-11-13).
+    IrqLine { name: "nfc-irq", intid: 32 + 42 },
+    // The Bluetooth UART (APM USI1, serial_18): zuma.h IRQ_APM_USI1_UART_INT_ALIVE, SPI 71, level high. For payloads/bt's wait on received bytes instead of a 4 ms look (2026-11-13).
+    IrqLine { name: "bt-uart", intid: 32 + 71 },
 ];
+
+/// Interrupt lines that go with a hardware grant (2026-11-11 for pcie1, the table 2026-11-13): a process granted the block on the left gets each line on the right as slots after its last, in this order (`build_from`), so init's list and the keepers' restart list (service.rs `shell_grants`) need no slots for them. A driver finds its lines by asking (`irq_wait` with a past deadline answers ERR for a slot that is no line).
+const LINES_WITH: &[(&str, &[&str])] = &[("pcie1-elbi", &["pcie1"]), ("pcie0-elbi", &["modem-msi", "modem-wakeup"]), ("hsi2c0", &["nfc-irq"]), ("apm-usi1-uart", &["bt-uart"])];
 /// Set by `.Lirq` with any pending byte (and a `sev`), cleared when `wake_sleepers` has looked: an idle core looks for interrupt waiters only when this says so.
 #[unsafe(no_mangle)]
 pub static mut __irq_any: u64 = 0;
@@ -1610,6 +1621,12 @@ fn write_pref_all(index: usize, value: u8) {
         p.write_grants(pref_at(index) as u64, &[value]);
         crate::cachemap::grants_page(p.arc.base, false);
     }
+    wake_word_waiters();
+}
+
+/// Every thread waiting on a word made runnable, its `wait` returning 0 (every wait in the system is a loop that re-checks): a preference or a link's control block changed, and a driver asleep until its device or its next deadline looks at it now. With the kernel lock held. Interrupt waits are left alone.
+fn wake_word_waiters() {
+    let kk = k();
     for i in 0..kk.threads.len() {
         if let Some(x) = kk.threads[i].as_mut() {
             if matches!(x.state, State::Waiting(a, _) if a >= 1024) {
@@ -3999,6 +4016,10 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     0
                 }
             };
+            // A knob set: the drivers asleep on a word look at their blocks now (2026-11-13: the WiFi driver waits on its chip's interrupt and no longer looks every quarter second), as a preference's change wakes them.
+            if f.x[0] == 0 {
+                wake_word_waiters();
+            }
             0
         }
         SYS_CONTROLS => {
@@ -6682,10 +6703,18 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }
     // PCIe channel 1's interrupt goes with its controller (2026-11-11): a process granted the controller's registers (pcie1-elbi) gets the line as the slot after its last, as a child handed Settings gets the torch (SYS_SPAWN). init holds every grant to hand on and its grants page is full, so it cannot hold the line to pass on; and the keepers' restart list (service.rs `shell_grants`) must give a restarted driver what a booted one has. Only when the page has room: init, full, is skipped rather than refused.
-    if cspace.iter().any(|c| matches!(c.object, Object::Hardware(h) if HARDWARE[h].name == "pcie1-elbi")) && !cspace.iter().any(|c| matches!(c.object, Object::Irq(i) if IRQS[i].name == "pcie1")) && TOKENS + 4 + 32 * (cspace.len() + 1) <= PREFS_HI {
-        if let Some(i) = IRQS.iter().position(|l| l.name == "pcie1") {
-            let object = Object::Irq(i);
-            cspace.push(CapEntry { token: mint(object, RIGHT_SEND, epoch), object, rights: RIGHT_SEND });
+    // Since 2026-11-13 the same for every line in `LINES_WITH`: the modem's MSI and wakeup with pcie0-elbi, NFC's with hsi2c0, Bluetooth's UART with its UART.
+    for (hw, lines) in LINES_WITH {
+        if !cspace.iter().any(|c| matches!(c.object, Object::Hardware(h) if HARDWARE[h].name == *hw)) {
+            continue;
+        }
+        for line in lines.iter() {
+            if !cspace.iter().any(|c| matches!(c.object, Object::Irq(i) if IRQS[i].name == *line)) && TOKENS + 4 + 32 * (cspace.len() + 1) <= PREFS_HI {
+                if let Some(i) = IRQS.iter().position(|l| l.name == *line) {
+                    let object = Object::Irq(i);
+                    cspace.push(CapEntry { token: mint(object, RIGHT_SEND, epoch), object, rights: RIGHT_SEND });
+                }
+            }
         }
     }
     // The AoC's a32 mailbox line goes with the Sensors right the same way (2026-11-12): the sensors process blocks on it until com.google.usf rings, instead of waking every 2 ms to look (payloads/sensors). The slot after its last; init, full, is skipped.
