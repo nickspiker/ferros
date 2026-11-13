@@ -29,6 +29,8 @@
 //!   - One lookup a name and type, however many ask: the calls hold on it. A question goes from the resolver's one port (random for the session) with a random id (the entropy grant, each question), to the DNS server of each family's link (INFO's, IPv6's first, turn about), four tries a second apart (the one timer: a lost datagram never comes back); a try ip cannot send yet for want of the next hop goes again 2^-6 s on. An answer counts only from port 53 of a server a try went to, with the id, repeating the question (`ferros_dns::read`); a SERVFAIL or REFUSED moves to the next try at once. Nothing an application sends may leave from the resolver's port (op 1 answers [3]).
 //!   - Each lookup's end is a console line: the type, found or not or no answer, its time and tries; never the name or the address (they are the person's).
 //!
+//! DHCPv4 (`dhcp_in`, `dhcp_retry`): DISCOVER, OFFER, REQUEST, ACK, retransmitted every 2 s until bound; four REQUESTs unanswered give the offer up for a fresh DISCOVER (RFC 2131 4.4.1). What it sent and heard since WiFi came up is a console line every 16th retransmit while unbound and once at the bind: `DHCP <no lease yet|bound>: A#<n> DISCOVERs and A#<n> REQUESTs out; A#<n> OFFERs, A#<n> ACKs, A#<n> NAKs in, A#<n> replies to other transactions; state A#<1 discovering, 2 requesting, 3 bound>[, lease A#<s> s]`. No renewal yet: the lease is said, not kept to.
+//!
 //! TCP here, client only, re-engineered for throughput on 2026-11-11 (owner: "sounds like it needs re-engineered", after Mahere's 1.6 MB base cells crawled thru two connections of a 4 KiB window, about 80 KB/s at a 50 ms round trip). The protocol's pure parts are ferros_tcp, tested on the host.
 //! - Sixteen connections (`TCPN`). An idle one costs its control state alone (`Tcb`, a static table); an open one holds a block of the arc (`Blocks`): a 1 MiB receive buffer and a 256 KiB send buffer. The kernel maps 4 MiB of heap at spawn (three blocks); the arc grows for more as connections open (SYS_ARC, docs/ARCS.md) and shrinks again when the highest blocks are free.
 //! - The receive window is the free room of the 1 MiB buffer, said with window scaling (RFC 7323, shift 5); a peer that offers no scaling gets 64 KiB of it. Its right edge moves by a segment, or half the buffer, at least (silly-window avoidance), and a read that reopens a window shrunk under half says so at once.
@@ -148,6 +150,25 @@ struct Ip {
     ring_none: bool,
     /// The resolver (op 10): a static, not the 64 KiB stack.
     res: &'static mut Dns,
+    /// DHCPv4's measures since WiFi came up (`wifi_up`), said every 16th retransmit while unbound and once at the bind (2026-11-13: the 8a got no lease for minutes on end while IPv6 worked, and nothing said why).
+    dhcp_n: DhcpCount,
+}
+
+/// What DHCPv4 sent and heard since WiFi came up (`DhcpCount::say`).
+#[derive(Default, Clone, Copy)]
+struct DhcpCount {
+    /// DISCOVERs and REQUESTs out.
+    discovers: u32,
+    requests: u32,
+    /// OFFERs, ACKs and NAKs in for our transaction; server replies for another transaction (another client's, or ours from before a restart).
+    offers: u32,
+    acks: u32,
+    naks: u32,
+    others: u32,
+    /// REQUESTs in a row with no answer: four, and the offer is given up for a fresh DISCOVER (RFC 2131 4.4.1: a client that hears no ACK goes back to INIT).
+    unanswered: u32,
+    /// The lease the ACK gave (option 51), in seconds; 0 none said.
+    lease_s: u32,
 }
 
 /// The WiFi path's measures between two connection reports (`report`), said after each on a line of their own (owner, 2026-11-11: measure the path before fixing it). Counter ticks where a time is kept.
@@ -922,6 +943,7 @@ impl Ip {
             self.put(if self.ring { b"WiFi doorbell armed: idle waits for frames, not the clock\n".as_slice() } else { b"WiFi doorbell: no thread, asking every idle millisecond\n" });
         }
         self.dhcp_state = 1;
+        self.dhcp_n = DhcpCount::default();
         self.dhcp_send(1);
         self.rs_n = 0;
         self.router_solicit();
@@ -1180,10 +1202,46 @@ impl Ip {
         u[8..].copy_from_slice(&b);
         self.ipv4_send([0xFF; 6], [0; 4], [255; 4], 17, &u);
         self.dhcp_t = now();
+        if ty == 3 {
+            self.dhcp_n.requests += 1;
+        } else {
+            self.dhcp_n.discovers += 1;
+        }
+    }
+
+    /// DHCP's line: `DHCP <what>: A#<n> DISCOVERs and A#<n> REQUESTs out; A#<n> OFFERs, A#<n> ACKs, A#<n> NAKs in, A#<n> replies to other transactions`, then the state (1 discovering, 2 requesting, 3 bound).
+    fn dhcp_say(&mut self, what: &[u8]) {
+        let c = self.dhcp_n;
+        self.put(b"DHCP ");
+        self.put(what);
+        self.put(b": A#");
+        self.dec(c.discovers as u64);
+        self.put(b" DISCOVERs and A#");
+        self.dec(c.requests as u64);
+        self.put(b" REQUESTs out; A#");
+        self.dec(c.offers as u64);
+        self.put(b" OFFERs, A#");
+        self.dec(c.acks as u64);
+        self.put(b" ACKs, A#");
+        self.dec(c.naks as u64);
+        self.put(b" NAKs in, A#");
+        self.dec(c.others as u64);
+        self.put(b" replies to other transactions; state A#");
+        self.dec(self.dhcp_state as u64);
+        if self.bound {
+            self.put(b", lease A#");
+            self.dec(c.lease_s as u64);
+            self.put(b" s");
+        }
+        self.put(b"\n");
     }
 
     fn dhcp_in(&mut self, b: &[u8]) {
-        if b.len() < 240 || b[0] != 2 || u32::from_be_bytes([b[4], b[5], b[6], b[7]]) != self.xid {
+        if b.len() < 240 || b[0] != 2 {
+            return;
+        }
+        if u32::from_be_bytes([b[4], b[5], b[6], b[7]]) != self.xid {
+            self.dhcp_n.others += 1;
             return;
         }
         let yiaddr: [u8; 4] = b[16..20].try_into().unwrap();
@@ -1213,6 +1271,8 @@ impl Ip {
                     router = v4;
                 } else if code == 6 {
                     self.dns = v4;
+                } else if code == 51 {
+                    self.dhcp_n.lease_s = u32::from_be_bytes(v4);
                 }
             }
             if code == 53 && l >= 1 {
@@ -1220,10 +1280,17 @@ impl Ip {
             }
             o += 2 + l;
         }
+        match ty {
+            2 => self.dhcp_n.offers += 1,
+            5 => self.dhcp_n.acks += 1,
+            6 => self.dhcp_n.naks += 1,
+            _ => {}
+        }
         if ty == 2 && self.dhcp_state == 1 {
             self.offer = yiaddr;
             self.server = server;
             self.dhcp_state = 2;
+            self.dhcp_n.unanswered = 0;
             self.dhcp_send(3);
         } else if ty == 5 && self.dhcp_state == 2 {
             self.v4 = yiaddr;
@@ -1238,9 +1305,25 @@ impl Ip {
             self.put(b" router ");
             self.v4_put(router);
             self.put(b"\n");
+            self.dhcp_say(b"bound");
         } else if ty == 6 {
             self.dhcp_state = 1;
             self.dhcp_send(1);
+        }
+    }
+
+    /// DHCP's retransmit, every 2 s while WiFi is up and unbound (the main loop's timer): a REQUEST again while requesting, four in a row unanswered giving the offer up for a fresh DISCOVER (RFC 2131 4.4.1; until 2026-11-13 a REQUEST for an offer the server had forgotten went out every 2 s forever), else a DISCOVER. Every 16th says the measures (`dhcp_say`), so a network that gives no lease says why.
+    fn dhcp_retry(&mut self) {
+        if self.dhcp_state == 2 {
+            self.dhcp_n.unanswered += 1;
+            if self.dhcp_n.unanswered >= 4 {
+                self.dhcp_state = 1;
+            }
+        }
+        let ty = if self.dhcp_state == 2 { 3 } else { 1 };
+        self.dhcp_send(ty);
+        if (self.dhcp_n.discovers + self.dhcp_n.requests) & 15 == 0 {
+            self.dhcp_say(b"no lease yet");
         }
     }
 
@@ -2951,6 +3034,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         txb: unsafe { &mut *(&raw mut TXB) },
         txn: EXCH_HEAD,
         path: Path::default(),
+        dhcp_n: DhcpCount { discovers: 0, requests: 0, offers: 0, acks: 0, naks: 0, others: 0, unanswered: 0, lease_s: 0 },
         ring: false,
         ring_thread: false,
         ring_none: false,
@@ -3103,8 +3187,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             ip.wifi_up();
         }
         if ip.wifi && !ip.bound && t.wrapping_sub(ip.dhcp_t) > 2 * ip.freq {
-            let ty = if ip.dhcp_state == 2 { 3 } else { 1 };
-            ip.dhcp_send(ty);
+            ip.dhcp_retry();
         }
         if ip.wifi && !ip.have_global && ip.rs_n < 3 && t.wrapping_sub(ip.rs_t) > 4 * ip.freq {
             ip.router_solicit();
