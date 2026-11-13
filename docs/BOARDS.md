@@ -56,7 +56,7 @@ On ferros, `diag frames test` wrote all 5058 MiB of free frames with their own a
 The apps' surfaces' old carve-out, G#CA00_0000-G#D200_0000, is in the pool on both boards since 2026-11-12, after the two old pools (cachemap `POOL_SURF`): plain memory in both memblocks (husky's nearest reservations end at G#C308_FFFF and start at G#D810_0000; akita reserves nothing from G#C309_0000 to G#E7FF_FFFF), and surfaces are frames of the pool since (WINDOWS.md "Surfaces on demand").
 Not in the pool on either board: the kernel's window, the DMA regions (display, USB, gpu-mem, layers, the modem's windows), the canvas, the low bank's firmware carve-outs, and the hv.
 
-The layer arena (cachemap `layers`) is G#9800_0000-G#A000_0000 on both boards (memblock: plain memory on each). On akita it was the upper 64 MiB alone until the capture above (2026-11-12): with the attest screen's 32 MiB block taken, Mahere's GPU map got a 32 MiB block, too small for its frame's two regions and four cells, stopped, and left its circle black; with the whole arena it gets 64 MiB and draws.
+The layer arena (cachemap `layers`) is G#9800_0000-G#A000_0000 on both boards (memblock: plain memory on each). On akita it was the upper 64 MiB alone until the capture above (2026-11-12): with the attest screen's 32 MiB block taken, Mahere's GPU map got a 32 MiB block, too small for its frame's two regions and four cells, stopped, and left its circle black; with the whole arena it gets 64 MiB and draws. Since 2026-11-13 that range is the frame pool's `POOL_LAYERS` on both boards, and a client's GPU memory is frames taken as it asks (GPU-KISTS.md plan step 4, seventh pass).
 
 
 ## Every new model, profiled on the unit before release (owner, 2026-11-08)

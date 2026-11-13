@@ -533,32 +533,46 @@ pub mod gpu {
 
     /// The most regions a stamp names that the service maps (a client holds a block and a surface or two).
     pub const REGIONS: usize = 8;
-    /// The most surface frames a stamp carries: four surfaces of 16 frames.
-    pub const FRAMES: usize = 64;
-    /// A frame: what a surface's physical memory comes in (the kernel's frames.rs FRAME), 16 to a surface.
+    /// The most frames a stamp carries: four surfaces of 16 frames and a block at the ceiling (`super::GPU_BLOCK_MOST`).
+    pub const FRAMES: usize = 64 + super::GPU_BLOCK_MOST / FRAME as usize;
+    /// A frame: what a surface's and a GPU block's physical memory comes in (the kernel's frames.rs FRAME), 16 to a surface.
     pub const FRAME: u64 = 1 << 21;
 
-    /// The kernel's stamp ahead of a request on `gpu` (process.rs `gpu_stamp`): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build, bit 2 frames follow][n u8][n × (base u64, size u64)], every GPU-reachable region the caller holds, then (bit 2, since 2026-11-12) for each region in the surfaces' window, in order, its frames' physical addresses (u64 each, its size over `FRAME` of them). The kernel writes it for every call, so the service trusts it and nothing after it.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    pub struct Stamp {
+    /// The kernel's stamp ahead of a request on `gpu` (process.rs `gpu_stamp`): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build, bit 2 frames follow][n u8][n × (base u64, size u64)], every GPU-reachable region the caller holds, then (bit 2, since 2026-11-12) for each region in a window of frames (`in_window`: a surface, or since 2026-11-13 a GPU block), in order, its frames' physical addresses (u64 each, its size over `FRAME` of them). The kernel writes it for every call, so the service trusts it and nothing after it.
+    /// The frames stay in the message's bytes (`frames_of` reads them): a block at the ceiling carries 256, more than a fixed array beside each client is worth.
+    #[derive(Clone, Copy)]
+    pub struct Stamp<'a> {
         pub epoch: u64,
         pub kist: bool,
         pub production: bool,
         pub n: usize,
         pub regions: [(u64, u64); REGIONS],
-        /// The surfaces' frames, in the order of their regions (`frames_of`).
-        pub nf: usize,
-        pub frames: [u64; FRAMES],
+        /// The frames' bytes, 8 a frame, in the order of their regions (`frames_of`).
+        frames: &'a [u8],
     }
 
-    /// Whether a region lies in the surfaces' window: a surface, whose frames the stamp carries.
+    /// What names a client's GPU memory (`Stamp::key`): its epoch and its regions. A surface's frames never change while it is held, and a block's only as it grows (the kernel appends frames, its size in its region), so the same key is the same frames.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub struct Key {
+        pub epoch: u64,
+        pub kist: bool,
+        pub n: usize,
+        pub regions: [(u64, u64); REGIONS],
+    }
+
+    /// Whether a region lies in a window of frames: a surface (the surfaces' window) or a GPU block (the blocks' window, since 2026-11-13), whose frames the stamp carries.
     pub const fn in_window(b: u64, size: u64) -> bool {
-        b >= super::SURFACES_WINDOW && b + size <= super::SURFACES_WINDOW + (super::SURFACE_SLOTS * super::SURFACE_BYTES) as u64
+        (b >= super::SURFACES_WINDOW && b + size <= super::SURFACES_WINDOW + (super::SURFACE_SLOTS * super::SURFACE_BYTES) as u64) || (b >= super::GPU_BLOCKS_WINDOW && b + size <= super::GPU_BLOCKS_WINDOW + (super::GPU_BLOCK_SLOTS * super::GPU_BLOCK_MOST) as u64)
     }
 
-    impl Stamp {
+    /// Whether a region is a GPU block: in the blocks' window.
+    pub const fn is_block(b: u64, size: u64) -> bool {
+        b >= super::GPU_BLOCKS_WINDOW && b + size <= super::GPU_BLOCKS_WINDOW + (super::GPU_BLOCK_SLOTS * super::GPU_BLOCK_MOST) as u64
+    }
+
+    impl<'a> Stamp<'a> {
         /// The stamp and the caller's own bytes after it; None when the message is shorter than its stamp (only a kernel from before the stamp sends one so), names more than `REGIONS`, or carries more than `FRAMES`: the service then refuses the request. A kernel from before the frames (no bit 2) names its surfaces at their physical addresses, which lie outside the window, so none is a surface here.
-        pub fn read(m: &[u8]) -> Option<(Stamp, &[u8])> {
+        pub fn read(m: &'a [u8]) -> Option<(Stamp<'a>, &'a [u8])> {
             if m.len() < 10 {
                 return None;
             }
@@ -568,7 +582,7 @@ pub mod gpu {
             if m.len() < end || n > REGIONS {
                 return None;
             }
-            let mut s = Stamp { epoch: u64::from_le_bytes(m[0..8].try_into().unwrap()), kist: m[8] & 1 != 0, production: m[8] & 2 != 0, n, regions: [(0, 0); REGIONS], nf: 0, frames: [0; FRAMES] };
+            let mut s = Stamp { epoch: u64::from_le_bytes(m[0..8].try_into().unwrap()), kist: m[8] & 1 != 0, production: m[8] & 2 != 0, n, regions: [(0, 0); REGIONS], frames: &[] };
             for k in 0..s.n {
                 let at = 10 + 16 * k;
                 s.regions[k] = (u64::from_le_bytes(m[at..at + 8].try_into().unwrap()), u64::from_le_bytes(m[at + 8..at + 16].try_into().unwrap()));
@@ -577,15 +591,11 @@ pub mod gpu {
                 return Some((s, &m[end..]));
             }
             let nf: usize = s.regions().iter().filter(|r| in_window(r.0, r.1)).map(|r| (r.1 / FRAME) as usize).sum();
-            // WHY: the frames' count follows from the regions the kernel wrote; past what the service maps, the request is refused whole, as for regions.
+            // WHY: the frames' count follows from the regions the kernel wrote; past what the service maps, or past what arrived (a message cut at the service's buffer), the request is refused whole, as for regions.
             if nf > FRAMES || m.len() < end + 8 * nf {
                 return None;
             }
-            for k in 0..nf {
-                let at = end + 8 * k;
-                s.frames[k] = u64::from_le_bytes(m[at..at + 8].try_into().unwrap());
-            }
-            s.nf = nf;
+            s.frames = &m[end..end + 8 * nf];
             Some((s, &m[end + 8 * nf..]))
         }
 
@@ -594,21 +604,29 @@ pub mod gpu {
             &self.regions[..self.n]
         }
 
-        /// The frames of region `i` when it is a surface (in the window), in order: its physical memory, 2 MiB a frame; empty for any other region.
-        pub fn frames_of(&self, i: usize) -> &[u64] {
+        /// Its client's memory as a key: the same key, the same memory.
+        pub fn key(&self) -> Key {
+            Key { epoch: self.epoch, kist: self.kist, n: self.n, regions: self.regions }
+        }
+
+        /// The frames of region `i` when it is in a window (a surface, a GPU block), in order: its physical memory, 2 MiB a frame; none for any other region.
+        pub fn frames_of(&self, i: usize) -> impl Iterator<Item = u64> + 'a {
             let mut at = 0;
+            let mut count = 0;
             for (k, r) in self.regions().iter().enumerate() {
                 if !in_window(r.0, r.1) {
                     continue;
                 }
                 let n = (r.1 / FRAME) as usize;
-                // A stamp without frames (bit 2 clear) carries none for it: nothing to map.
                 if k == i {
-                    return if at + n <= self.nf { &self.frames[at..at + n] } else { &[] };
+                    count = n;
+                    break;
                 }
                 at += n;
             }
-            &[]
+            // A stamp without frames (bit 2 clear) carries none for it: nothing to map.
+            let bytes: &'a [u8] = if 8 * (at + count) <= self.frames.len() { &self.frames[8 * at..8 * (at + count)] } else { &[] };
+            bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap()))
         }
     }
 }
@@ -1053,6 +1071,13 @@ pub const SURFACE_SLOTS: usize = 16;
 pub const SURFACE_BYTES: usize = 32 << 20;
 /// The surfaces' window, the kernel's cachemap SURF_VA: what `dma` answers for the whole `surfaces` region.
 pub const SURFACES_WINDOW: u64 = 0x50_0A00_0000;
+
+/// The most GPU memory one client may hold (the kernel's cachemap GPU_BLOCK_MOST, 2026-11-13): its GPU block, frames of the pool on demand, asked for by `gpu_block_ask`.
+pub const GPU_BLOCK_MOST: usize = 512 << 20;
+/// How many GPU blocks the kernel can give out at once: slots of the blocks' window, slot k at `GPU_BLOCKS_WINDOW + k * GPU_BLOCK_MOST`.
+pub const GPU_BLOCK_SLOTS: usize = 16;
+/// The GPU blocks' window, the kernel's cachemap GPUB_VA: what `dma` answers for the whole `arena` region (the GPU service's), a block at the start of its slot.
+pub const GPU_BLOCKS_WINDOW: u64 = 0x58_0000_0000;
 
 /// Slot k's generation in the slots' bell word (`BELL_SLOTS`): 0 when nobody alive holds it.
 pub const fn surface_generation(word: u64, k: usize) -> u8 {
@@ -1895,6 +1920,12 @@ pub fn dma(cap: u64) -> u64 {
 pub fn dma_size(cap: u64, most: u64) -> Option<u64> {
     let n = svc(nr::DMA, cap, 1, 0, 0, 0);
     (n != ERR && n <= most).then_some(n)
+}
+
+/// Ask the kernel to grow this process's GPU block (the grant at `cap`: a kist's `gpu::kist_slots` block, a spawn's `layers`) to 2^`log` bytes, in place: its base and everything in it stay. Its size after (at least what it held; asking for less leaves it as it is), or None: not a GPU block, past `GPU_BLOCK_MOST`, more than the frame pool can give (the console says which), or a kernel from before 2026-11-13 (which answers the region's base, told by its being past any block's size).
+pub fn gpu_block_ask(cap: u64, log: u32) -> Option<u64> {
+    let n = svc(nr::DMA, cap, 2, log as u64, 0, 0);
+    (n != ERR && n <= GPU_BLOCK_MOST as u64).then_some(n)
 }
 
 /// Copy spawn input into `buf`, starting at byte `off`; returns how many bytes (0 at the end). Large one-shot input (firmware) is streamed this way so the arc stays small.

@@ -15,9 +15,11 @@ pub const FRAME: usize = 1 << 21;
 
 /// husky's frame ranges, [start, end), each 2 MiB aligned.
 #[cfg(not(shim_handoff))]
-const HUSKY: [(usize, usize); 5] = [
+const HUSKY: [(usize, usize); 6] = [
     // The page pool (cachemap POOL): the window's top 16 MiB, ferros's own since 2026-10-26; memblock: plain memory (G#8000_0000-G#8AFF_FFFF, no reservation).
     crate::cachemap::POOL,
+    // The layer arena until 2026-11-13 (cachemap POOL_LAYERS): 128 MiB under the big pool, ferros's own since 2026-11-05, on cold boots and after jumps alike; memblock: plain memory (G#9740_0000-G#B61F_FFFF, no reservation).
+    crate::cachemap::POOL_LAYERS,
     // The big pool (cachemap POOL_BIG): 320 MiB under gpu-mem; memblock: plain memory (G#9740_0000-G#B61F_FFFF, no reservation; sec_dram begins at G#B620_0000).
     crate::cachemap::POOL_BIG,
     // The apps' surfaces' carve-out until 2026-11-12 (cachemap POOL_SURF): 128 MiB, ferros's own since 2026-10-27, on cold boots and after jumps alike; memblock: plain memory (the nearest reservations are seclog_mem ending G#C308_FFFF and the debug snapshot from G#D810_0000).
@@ -30,8 +32,10 @@ const HUSKY: [(usize, usize); 5] = [
 
 /// akita's frame ranges: the two pools ferros has run its processes from, then its high bank where memblock reserves nothing (2026-11-12; memblock: plain memory under both pools too).
 #[cfg(not(shim_handoff))]
-const AKITA: [(usize, usize); 5] = [
+const AKITA: [(usize, usize); 6] = [
     crate::cachemap::POOL,
+    // memblock: plain memory (G#9740_0000-G#B61F_FFFF on akita too, BOARDS.md "Memory map").
+    crate::cachemap::POOL_LAYERS,
     crate::cachemap::POOL_BIG,
     // memblock: plain memory (G#C309_0000 to G#E7FF_FFFF reserves nothing on akita either).
     crate::cachemap::POOL_SURF,
@@ -40,9 +44,9 @@ const AKITA: [(usize, usize); 5] = [
     // Past the hv's 64 MiB, up to Linux's own allocations and the camera and video pools (G#9_BC04_0000).
     (0x9_0400_0000, 0x9_BC00_0000),
 ];
-/// Either board kept to the two old pools and the surfaces' old carve-out (`map`: after a jump, or a `FERROS_FRAMES_HIGH=0` build): what ferros ran from after jumps before ARCS, surfaces included.
+/// Either board kept to the two old pools and the old carve-outs of the layer arena and the surfaces (`map`: after a jump, or a `FERROS_FRAMES_HIGH=0` build): what ferros ran from after jumps before ARCS, the GPU's memory and surfaces included.
 #[cfg(not(shim_handoff))]
-const LOW: [(usize, usize); 3] = [crate::cachemap::POOL, crate::cachemap::POOL_BIG, crate::cachemap::POOL_SURF];
+const LOW: [(usize, usize); 4] = [crate::cachemap::POOL, crate::cachemap::POOL_LAYERS, crate::cachemap::POOL_BIG, crate::cachemap::POOL_SURF];
 
 /// The handoff path (oracle only): its 2 MiB pool.
 #[cfg(shim_handoff)]
