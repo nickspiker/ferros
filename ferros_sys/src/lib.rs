@@ -518,7 +518,7 @@ pub mod kist {
 pub mod gpu {
     /// The GPU service's view of a client's own block of the layer arena: offset 0 of the block (payloads/gpu `ARENA_VA`). A client names its memory to its kernels as `ARENA_VA` plus an offset into its own block; nothing else of the arena is mapped for it.
     pub const ARENA_VA: u64 = 0x8000_0000;
-    /// The apps' surfaces in a client's GPU view: a surface it holds at `SURFACES_VA` plus its distance from the first surface (`SURFACES_PA`, the kernel's cachemap SURFACES); a surface it does not hold is not mapped.
+    /// The apps' surfaces in a client's GPU view: a surface it holds at `SURFACES_VA` plus its address's distance from `SURFACES_PA`; a surface it does not hold is not mapped. `SURFACES_PA` was the four surfaces' physical base until 2026-11-12, and stays the point the view is reckoned from (Mahere's build computes it so): a surface's address is now in the surfaces' window (`super::SURFACES_WINDOW`), its frames anywhere in the pool, so slot k's view is G#50_0000_0000 plus k times 32 MiB.
     pub const SURFACES_VA: u64 = 0xC000_0000;
     pub const SURFACES_PA: u64 = 0xCA00_0000;
     /// The reply's status bytes past [status][µs u32] when the job reached outside the client's memory (status `OUTSIDE`): [the GPU address u64][the GPU MMU's fault status u32].
@@ -533,8 +533,12 @@ pub mod gpu {
 
     /// The most regions a stamp names that the service maps (a client holds a block and a surface or two).
     pub const REGIONS: usize = 8;
+    /// The most surface frames a stamp carries: four surfaces of 16 frames.
+    pub const FRAMES: usize = 64;
+    /// A frame: what a surface's physical memory comes in (the kernel's frames.rs FRAME), 16 to a surface.
+    pub const FRAME: u64 = 1 << 21;
 
-    /// The kernel's stamp ahead of a request on `gpu` (process.rs `gpu_stamp`): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build][n u8][n × (base u64, size u64)], every GPU-reachable region the caller holds. The kernel writes it for every call, so the service trusts it and nothing after it.
+    /// The kernel's stamp ahead of a request on `gpu` (process.rs `gpu_stamp`): [the caller's epoch u64][flags u8: bit 0 a kist, bit 1 a production build, bit 2 frames follow][n u8][n × (base u64, size u64)], every GPU-reachable region the caller holds, then (bit 2, since 2026-11-12) for each region in the surfaces' window, in order, its frames' physical addresses (u64 each, its size over `FRAME` of them). The kernel writes it for every call, so the service trusts it and nothing after it.
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub struct Stamp {
         pub epoch: u64,
@@ -542,10 +546,18 @@ pub mod gpu {
         pub production: bool,
         pub n: usize,
         pub regions: [(u64, u64); REGIONS],
+        /// The surfaces' frames, in the order of their regions (`frames_of`).
+        pub nf: usize,
+        pub frames: [u64; FRAMES],
+    }
+
+    /// Whether a region lies in the surfaces' window: a surface, whose frames the stamp carries.
+    pub const fn in_window(b: u64, size: u64) -> bool {
+        b >= super::SURFACES_WINDOW && b + size <= super::SURFACES_WINDOW + (super::SURFACE_SLOTS * super::SURFACE_BYTES) as u64
     }
 
     impl Stamp {
-        /// The stamp and the caller's own bytes after it; None when the message is shorter than its stamp (only a kernel from before the stamp sends one so) or names more than `REGIONS`: the service then refuses the request.
+        /// The stamp and the caller's own bytes after it; None when the message is shorter than its stamp (only a kernel from before the stamp sends one so), names more than `REGIONS`, or carries more than `FRAMES`: the service then refuses the request. A kernel from before the frames (no bit 2) names its surfaces at their physical addresses, which lie outside the window, so none is a surface here.
         pub fn read(m: &[u8]) -> Option<(Stamp, &[u8])> {
             if m.len() < 10 {
                 return None;
@@ -556,17 +568,47 @@ pub mod gpu {
             if m.len() < end || n > REGIONS {
                 return None;
             }
-            let mut s = Stamp { epoch: u64::from_le_bytes(m[0..8].try_into().unwrap()), kist: m[8] & 1 != 0, production: m[8] & 2 != 0, n, regions: [(0, 0); REGIONS] };
+            let mut s = Stamp { epoch: u64::from_le_bytes(m[0..8].try_into().unwrap()), kist: m[8] & 1 != 0, production: m[8] & 2 != 0, n, regions: [(0, 0); REGIONS], nf: 0, frames: [0; FRAMES] };
             for k in 0..s.n {
                 let at = 10 + 16 * k;
                 s.regions[k] = (u64::from_le_bytes(m[at..at + 8].try_into().unwrap()), u64::from_le_bytes(m[at + 8..at + 16].try_into().unwrap()));
             }
-            Some((s, &m[end..]))
+            if m[8] & 4 == 0 {
+                return Some((s, &m[end..]));
+            }
+            let nf: usize = s.regions().iter().filter(|r| in_window(r.0, r.1)).map(|r| (r.1 / FRAME) as usize).sum();
+            // WHY: the frames' count follows from the regions the kernel wrote; past what the service maps, the request is refused whole, as for regions.
+            if nf > FRAMES || m.len() < end + 8 * nf {
+                return None;
+            }
+            for k in 0..nf {
+                let at = end + 8 * k;
+                s.frames[k] = u64::from_le_bytes(m[at..at + 8].try_into().unwrap());
+            }
+            s.nf = nf;
+            Some((s, &m[end + 8 * nf..]))
         }
 
         /// The regions it names.
         pub fn regions(&self) -> &[(u64, u64)] {
             &self.regions[..self.n]
+        }
+
+        /// The frames of region `i` when it is a surface (in the window), in order: its physical memory, 2 MiB a frame; empty for any other region.
+        pub fn frames_of(&self, i: usize) -> &[u64] {
+            let mut at = 0;
+            for (k, r) in self.regions().iter().enumerate() {
+                if !in_window(r.0, r.1) {
+                    continue;
+                }
+                let n = (r.1 / FRAME) as usize;
+                // A stamp without frames (bit 2 clear) carries none for it: nothing to map.
+                if k == i {
+                    return if at + n <= self.nf { &self.frames[at..at + n] } else { &[] };
+                }
+                at += n;
+            }
+            &[]
         }
     }
 }
@@ -999,8 +1041,20 @@ pub fn status_track(k: usize, word: u64) -> u64 {
 
 /// The facts' bell source (`bell`): the facts a settings page shows (the battery's share and whether it charges, the processes alive, the vault's keys, the hottest part of the chip and its throttle). Sources 0-5 are the links in the facts' order.
 pub const BELL_FACTS: u64 = 6;
-/// The windows' owners' bell source (`bell`), for the holder of the `surfaces` region alone (the display server): the word is not a count but the four app surfaces' live generations, byte k surface k's (its preference byte 8 + k while the process it was given to is alive, 0 once it has ended, however it ended), and a change count above bit 32. A window shown on a surface under a generation its byte no longer holds belongs to a process that has ended.
+/// The windows' owners' bell source (`bell`), for the holder of the `surfaces` region alone (the display server): the word is not a count but the surface slots' live generations, bits 4k to 4k + 3 slot k's (1 to 15 while the process it was given to is alive, 0 once it has ended, however it ended, or while the slot is free; `surface_generation`). A window shown on a surface under a generation its slot no longer holds belongs to a process that has ended. Until 2026-11-12 a byte for each of four surfaces and a change count above bit 32.
 pub const BELL_SURFACES: u64 = 9;
+
+/// How many surfaces the kernel can give out at once (2026-11-12, on demand from the frame pool; four fixed ones before): slots of the surfaces' window, slot k at `SURFACES_WINDOW + k * SURFACE_BYTES`.
+pub const SURFACE_SLOTS: usize = 16;
+/// One surface slot's bytes: a whole panel at 64 bits a pixel and its porch, rounded up to a power of two (the kernel's SURFACE_SIZE).
+pub const SURFACE_BYTES: usize = 32 << 20;
+/// The surfaces' window, the kernel's cachemap SURF_VA: what `dma` answers for the whole `surfaces` region.
+pub const SURFACES_WINDOW: u64 = 0x50_0A00_0000;
+
+/// Slot k's generation in the surfaces' bell word (`BELL_SURFACES`): 0 when nobody alive holds it.
+pub const fn surface_generation(word: u64, k: usize) -> u8 {
+    (word >> (4 * k)) as u8 & 15
+}
 
 /// A doorbell on what the settings pages show (kernel SYS_BELL; owner, 2026-11-10: "Needs a doorbell"): the kernel writes `source`'s change count into `word` now and whenever it changes, waking whatever waits on it (`wait_world`). Source 0-5 a link (its measures, tracks and detail, as its driver sets them, and emptied as it ends), `BELL_FACTS` the facts. A reader that compares the word to the count it last drew with knows to draw again, and asks nothing on a timer. False for no such source, or a kernel without bells.
 pub fn bell(source: u64, word: &core::sync::atomic::AtomicU64) -> bool {
@@ -1797,8 +1851,16 @@ pub fn reply(token: &[u8; 32], msg: &[u8]) -> u64 {
 pub const CALLER_SETTINGS: u64 = 1 << 8;
 /// `caller`'s answer: the caller is a kist.
 pub const CALLER_KIST: u64 = 1 << 9;
+/// `caller`'s answer: bit `CALLER_SURFACE0 + k` for surface slot k (bits 32 to 47 since 2026-11-12, sixteen slots; bits 0 to 3 for four surfaces before).
+pub const CALLER_SURFACE0: u32 = 32;
 
-/// What the process behind a call holds that its server decides by (kernel SYS_CALLER), asked with the call's reply token before replying: bits 0-3 the surfaces it holds (surface k its own, or inside a region holding it whole), `CALLER_SETTINGS`, `CALLER_KIST`. None for a token that is no call of this process's, or on a kernel from before (no such syscall): a server refuses then.
+/// Whether `caller`'s answer `h` holds surface slot k.
+#[inline]
+pub const fn caller_holds_surface(h: u64, k: usize) -> bool {
+    h >> (CALLER_SURFACE0 as usize + k) & 1 == 1
+}
+
+/// What the process behind a call holds that its server decides by (kernel SYS_CALLER), asked with the call's reply token before replying: bits 32 to 47 the surface slots it holds (`caller_holds_surface`: slot k its own, or inside a region holding it whole), `CALLER_SETTINGS`, `CALLER_KIST`. None for a token that is no call of this process's, or on a kernel from before (no such syscall): a server refuses then.
 pub fn caller(token: &[u8; 32]) -> Option<u64> {
     match svc(nr::CALLER, off(token.as_ptr()), 0, 0, 0, 0) {
         ERR | NOTHING => None,

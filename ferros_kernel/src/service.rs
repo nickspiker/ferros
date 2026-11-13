@@ -1102,7 +1102,7 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         _ => return None,
     };
     let all = home_grants();
-    // The attest screen's two surfaces as init's spawn hands them out (SYS_SPAWN): each a free surface of the four, its own. Passed as the whole region, a restarted attest screen drew into surface 0 whoever held it, and its back buffer was its own front (2026-11-01: every board redrew in place, black between). Not for the display server, which takes the region's base (surface 0 at boot).
+    // The attest screen's two surfaces as init's spawn hands them out (SYS_SPAWN): each a free slot with frames of its own behind it. Passed as the whole region, a restarted attest screen drew into surface 0 whoever held it, and its back buffer was its own front (2026-11-01: every board redrew in place, black between). Not for the display server, which takes the region's base (surface 0 at boot).
     let own = name == b"ahau";
     Some(slots.iter().filter_map(|&s| all.get(s - 1).copied()).map(|g| match g {
         crate::process::Grant::Dma(b"surfaces") if own => crate::process::Grant::Dma(b"surface"),

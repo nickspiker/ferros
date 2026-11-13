@@ -150,15 +150,23 @@ pub const DISPLAY_PHASES: (usize, usize) = (0x8C00_0000, 0x9000_0000);
 #[cfg(shim_handoff)]
 pub const DISPLAY_PHASES: (usize, usize) = (0, 0);
 
-/// The apps' surfaces (cold only): 128 MiB of Normal write-back, EL0 read/write, never executable memory, four full-panel surfaces of 32 MiB (1344 × 2992 pixels of 64 bits each). Each app is given one at spawn and draws there as it wishes; the display server holds all four and composes the windows frontmost first (WINDOWS.md). Free per the device tree: above the display's canvas (G#CA00_0000) and below the debug snapshot (G#D810_0000; the modem's carveouts are G#E800_0000 up). Replaced the single `app-surface` at G#C000_0000 (2026-10-27), which overlapped the modem image ABL loads there.
+/// The third range of the frame pool (cold only; frames.rs): 128 MiB of DRAM above the display's canvas (G#CA00_0000) and below the debug snapshot (G#D810_0000; the modem's carveouts are G#E800_0000 up), kernel-only 2 MiB blocks like the other ranges. The apps' four surfaces from 2026-10-27 (which replaced the single `app-surface` at G#C000_0000, over the modem image ABL loads there) until 2026-11-12, when surfaces became frames taken on demand (`SURF_VA`): ferros's own since then on either board, after jumps as well, as the two old pools are, so the pool after a jump keeps the memory the surfaces had.
 #[cfg(not(shim_handoff))]
-pub const SURFACES: (usize, usize) = (0xCA00_0000, 0xD200_0000);
+pub const POOL_SURF: (usize, usize) = (0xCA00_0000, 0xD200_0000);
 #[cfg(shim_handoff)]
-pub const SURFACES: (usize, usize) = (0, 0);
-/// One surface's size: a power of two that holds a full panel.
+pub const POOL_SURF: (usize, usize) = (0, 0);
+/// One surface's size: a whole panel at 64 bits a pixel and the porch before it, rounded up to a power of two so a masked process reaches it thru a handle (base and mask): the Pro's 1344 x 2992 is 30.7 MiB, the 8a's 1080 x 2400 is 19.8 MiB, so 32 MiB on both.
 pub const SURFACE_SIZE: usize = 32 << 20;
-/// The first 64 bytes of every surface are a porch nobody draws in (SANDBOX.md, "Handles"): a surface's handle spans its whole 32 MiB, and an access through it at the last offset reads up to its width less one byte past the end (63 for a structure load), into the next surface. With the porch that lands in the next surface's porch, never in its pixels. A process is told its surface 64 bytes in (SYS_DMA), so pixel 0 is at the porch's end for native pointers and handle offsets alike; a screen's pixels (1344 x 2992 x 8 bytes) fit the rest.
+/// The first 64 bytes of every surface are a porch nobody draws in (SANDBOX.md, "Handles"): a surface's handle spans its whole 32 MiB, and an access through it at the last offset reads up to its width less one byte past the end (63 for a structure load), into the next slot of the surfaces' window. With the porch that lands in the next surface's porch, never in its pixels. A process is told its surface 64 bytes in (SYS_DMA), so pixel 0 is at the porch's end for native pointers and handle offsets alike; a screen's pixels (1344 x 2992 x 8 bytes) fit the rest.
 pub const SURFACE_PORCH: usize = 64;
+/// How many surfaces may be given out at once (owner, 2026-11-12: Photon would not start, "no free surface (four are in use)", the attest screen holding two and Mahere backgrounded two): sixteen slots of the surfaces' window, each a full panel's 32 MiB of frames only while it is held, so the limit costs addresses, not memory (512 MiB with every slot held, from a pool of 5 to 9 GiB).
+pub const SURFACE_SLOTS: usize = 16;
+/// The surfaces' window (2026-11-12): `SURFACE_SLOTS` slots of `SURFACE_SIZE` addresses, slot k at `SURF_VA.0 + k * SURFACE_SIZE`, each mapping the 16 frames of the surface given out on it (process.rs `surface_take`), wherever in the pool they lie, Normal write-back, EL0 read/write, never executable, as the old carve-out was mapped; a slot never given out is unmapped, and a slot given back maps the blank frame (`surface_blank`) in every block, so a late read or text op of the display on a window whose owner just ended lands on nothing anyone owns rather than faulting.
+/// Every surface lies back to back in one window of addresses as the four lay in DRAM until then, so every client keeps naming its surface by its address (`dma` past the porch) and the display finds surface k as before; only the frames behind the addresses moved, as an arc's do (ARCS.md).
+/// G#A00_0000 into the GiB above the arcs' windows: each slot aligned to its 32 MiB (a handle's base must be), and the GPU's view of the surfaces (payloads/gpu: G#C000_0000 plus a surface's distance from G#CA00_0000, the old carve-out's base, which Mahere's build reckons from) starting on a GiB, G#50_0000_0000.
+pub const SURF_VA: (usize, usize) = (0x50_0A00_0000, 0x50_0A00_0000 + SURFACE_SLOTS * SURFACE_SIZE);
+/// The surfaces' window's level-2 table: one 2 MiB block entry per frame of a surface, invalid until the first surface is given out.
+static mut L2_SURF: Table = Table([0; 512]);
 
 /// The display's sprite cache (cold only): 32 MiB of Normal write-back, EL0 read/write, never executable memory in the same GiB, 32 MiB clear of the apps' surface (in case the bootloader's modem image runs past it): every circle's drawn pixels, kept while its size and turn stay, so a pan blits rather than redraws. A screen packed with circles needs ~20 MB of square sprites; the 6 MiB the display's heap could spare thrashed at 200 circles (2026-10-24: every icon redrawn every frame, 11 ms). Free per the device tree (the first carveout in this GiB is G#E800_0000). Granted as the region `display-sprites`.
 #[cfg(not(shim_handoff))]
@@ -330,19 +338,20 @@ pub fn enable() -> bool {
                 normal(vhe, a, BLOCK)
             };
         }
-        // The GiB above: Device blocks as before (the ramoops block, ABL's splash, the carveouts all live there), the apps' surfaces and the display's sprites and canvas Normal.
-        let (s0, s1) = SURFACES;
+        // The GiB above: Device blocks as before (the ramoops block, ABL's splash, the carveouts all live there), the display's sprites and canvas Normal, the frames of the pool's third range (POOL_SURF) the kernel's.
         let (p0, p1) = DISPLAY_SPRITES;
         let (q0, q1) = DISPLAY_CANVAS;
-        if s0 != s1 && s0 / GIB == w0 / GIB + 1 && s0 % MIB2 == 0 && s1 % MIB2 == 0 && (s1 - 1) / GIB == s0 / GIB {
+        if p0 != p1 && p0 / GIB == w0 / GIB + 1 {
             let l2h = &mut *(&raw mut L2_HI);
-            let base = s0 / GIB * GIB;
+            let base = p0 / GIB * GIB;
             for (j, e) in l2h.0.iter_mut().enumerate() {
                 let a = base + j * MIB2;
-                let normal_here = (a >= s0 && a + MIB2 <= s1) || (p0 != p1 && a >= p0 && a + MIB2 <= p1) || (q0 != q1 && a >= q0 && a + MIB2 <= q1);
+                let normal_here = (a >= p0 && a + MIB2 <= p1) || (q0 != q1 && a >= q0 && a + MIB2 <= q1);
                 let modem_here = MODEM_WINDOWS.iter().any(|w| a >= w.0 && a + MIB2 <= w.1);
                 *e = if normal_here {
                     pool(vhe, a, BLOCK) | UXN
+                } else if in_frames(a) {
+                    frame_block(vhe, a)
                 } else if modem_here && a == MODEM_TX_NC.0 & !(MIB2 - 1) {
                     let t = &mut *(&raw mut L3_MODEM);
                     for (k, p) in t.0.iter_mut().enumerate() {
@@ -356,7 +365,7 @@ pub fn enable() -> bool {
                     device(vhe, a, BLOCK)
                 };
             }
-            l1.0[s0 / GIB] = &raw const L2_HI as u64 | TABLE_OR_PAGE;
+            l1.0[p0 / GIB] = &raw const L2_HI as u64 | TABLE_OR_PAGE;
         }
         // The high bank's GiBs that hold frames (frames.rs: husky's 9 GiB from G#8_8000_0000): the frames Normal and the kernel's, every other block Device as the GiB was.
         let l2d = &mut *(&raw mut L2_DRAM);
@@ -375,6 +384,8 @@ pub fn enable() -> bool {
         for (g, t) in (*(&raw const L2_ARCS)).iter().enumerate() {
             l1.0[ARC_VA.0 / GIB + g] = &raw const t.0 as u64 | TABLE_OR_PAGE;
         }
+        // The surfaces' window: its level-2 table in place, every block invalid until the first surface is given out (`surface_map`).
+        l1.0[SURF_VA.0 / GIB] = &raw const L2_SURF as u64 | TABLE_OR_PAGE;
         // The tables went to DRAM with the MMU off. Discard any stale lines over the window (left by the loader; ours bypassed the cache) before the window becomes cacheable — including the table walker's view of the tables. Not the heap's second region (cold): it is discarded later, off the boot path, before the heap takes it (`heap2_prepare`; its 26 MiB of lines cost the boot ~235 ms here, 2026-10-26).
         asm!("dsb sy");
         let mut a = w0;
@@ -671,4 +682,23 @@ fn page_entry(a: usize) -> Option<&'static mut u64> {
     }
     let t = slot_table(a)?;
     Some(unsafe { &mut (*(t as *mut [u64; 512]))[(a / PAGE) % 512] })
+}
+
+/// Point the surfaces' window's 2 MiB block at `va` (inside `SURF_VA`, 2 MiB aligned) at the frame at `pa`: Normal write-back, EL0 read/write, never executable (the old carve-out's mapping, `pool` with UXN). Call `surface_unmapped` for the blocks once they are written: a block that held another frame (a surface's, or the blank) must leave every core's TLB before that frame is used again.
+pub fn surface_map(va: usize, pa: usize) {
+    let e = unsafe { &mut (*(&raw mut L2_SURF)).0[(va / MIB2) % 512] };
+    *e = pool(vhe(), pa, BLOCK) | UXN;
+}
+
+/// After `surface_map` over `[va, va + len)`: the table written before any core walks it, and every core's TLB told to forget the old blocks (one invalidation a block: a block's entry covers all of it).
+pub fn surface_unmapped(va: usize, len: usize) {
+    unsafe {
+        asm!("dsb ish");
+        let mut a = va;
+        while a < va + len {
+            asm!("tlbi vae1is, {x}", x = in(reg) (a as u64) >> 12);
+            a += MIB2;
+        }
+        asm!("dsb ish", "isb");
+    }
 }
