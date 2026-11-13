@@ -25,6 +25,12 @@ const S_UART: u64 = 2;
 const S_PART: u64 = 3;
 const S_POWER: u64 = 4;
 const S_ENTROPY: u64 = 5;
+/// The UART's interrupt line (kernel `bt-uart`, SPI 71, added after the last grant for a holder of apm-usi1-uart: process.rs `LINES_WITH`, 2026-11-13).
+const S_IRQ: u64 = 6;
+/// UINTM with the receive and error interrupts open (bits 0 and 1), transmit and modem kept masked.
+const UINTM_RX: u32 = 0xC;
+/// The serving loop's word when it has no interrupt line: nothing rings it; a wait on it ends on a call or its deadline.
+static IDLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 const FIRMWARE: &str = "/firmware/brcm/BCM.hcd";
 
@@ -603,9 +609,20 @@ pub extern "C" fn bt_main(grants: u64, input: u64, input_len: u64) -> ! {
     let mut token = [0u8; 32];
     let mut checked = now();
     let mut e = [0u8; 258];
+    // The UART's interrupt line (a kernel from 2026-11-13), asked with a wait whose deadline has passed: ERR for a slot that is no line.
+    let n_grants = unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + grants + 0x200) as *const u32) } as u64;
+    let irq = n_grants > S_IRQ && ferros_sys::irq_wait(cap(grants, S_IRQ), 1) != ferros_sys::ERR;
+    say!(grants, "bt: {}\n", if irq { "waiting on the UART's interrupt line, a call, and the 8 s look at the chip" } else { "no interrupt line granted (a kernel before 2026-11-13): waiting on a call and the 8 s look, the UART read every 4 ms while scanning" });
+    // The loop's wakes, said every 64 s or more: passes, and how many ended a wait.
+    let (mut passes, mut waits, mut said_at) = (0u32, 0u32, now());
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
+        passes += 1;
+        if now().wrapping_sub(said_at) >= freq() << 6 {
+            say!(grants, "bt: A#{passes} passes, A#{waits} waits in the last A#{} ms\n", (now() - said_at) * 1000 / freq());
+            (passes, waits, said_at) = (0, 0, now());
+        }
         // WiFi's driver pulling its REG_ON (a restart) resets this core to its ROM, the patch and the beacon gone, the UART answering nothing at 4 Mbaud: every 8 s Read_Local_Version_Information asks, and silence brings the chip up again with the beacon it had.
         if now() - checked > freq() * 8 {
             checked = now();
@@ -700,7 +717,31 @@ pub extern "C" fn bt_main(grants: u64, input: u64, input_len: u64) -> ! {
             }
             continue;
         }
-        sleep_ms(4);
+        // The one deadline: the next look at the chip (above), which finds a core WiFi's driver reset. Until 2026-11-13 the loop also read the UART every 4 ms, some 250 wakes a second.
+        let until = checked + freq() * 8 + 1;
+        waits += 1;
+        if irq {
+            // The UART's pending bits cleared and its receive interrupt open, the line acked, then the FIFO read once more before the wait: bytes before the clear are taken now, bytes after raise the line. The wait ends on the line, a call (this thread polls `bt`: back with 2) or the deadline.
+            bt.wr(UINTP, 0xF);
+            bt.wr(UINTM, UINTM_RX);
+            ferros_sys::irq_ack(cap(grants, S_IRQ));
+            if bt.pull() > 0 {
+                while let Some(n) = bt.event(&mut e) {
+                    if bt.adv_report(&e[..n]) {
+                        continue;
+                    }
+                    say!(grants, "bt: event {}\n", Hex(&e[..n.min(32)]));
+                }
+                continue;
+            }
+            ferros_sys::irq_wait_world(cap(grants, S_IRQ), until);
+        } else if bt.scanning {
+            // No line and the scan on: its reports read every 4 ms, as before.
+            sleep_ms(4);
+        } else {
+            // No line and nothing asked of the air: the chip has nothing to say (an unsolicited event waits in the FIFO behind RTS until the next pass); a call or the next look ends the wait.
+            ferros_sys::wait_world_or_call(&IDLE, 0, until);
+        }
     }
 }
 

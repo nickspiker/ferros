@@ -2361,9 +2361,8 @@ struct Online {
     sig_logged: u64,
     /// When the signal is next asked for (µs since online): every 2 s while the data stack is registered and the screen is on, since on NR the CP sends no G#0906 of its own. Not while the screen is off: nobody reads it, and each ask brings the link back up and wakes the CP (2026-11-10: the modem's supplies drew ~540 mW with the screen off, against Android's ~40).
     sig_ask: u64,
-    /// The screen state last told the CP (0 not yet, 1 on, 2 off) and when the screen preference is next read (µs since online).
+    /// The screen state last told the CP (0 not yet, 1 on, 2 off), the preference read every pass (a memory read; its change wakes the service loop).
     screen_sent: u8,
-    screen_check: u64,
     camp_seen: [u8; 2],
     /// The last MCC handed to the clock from IND_MCC, so the same country is said once.
     mcc_said: u16,
@@ -2398,8 +2397,7 @@ struct Online {
     suspends: u32,
     /// UL packets still to log by shape (TRACE sets both).
     ul_log: u32,
-    /// The control block (docs/RADIO-CONTROLS.md): when it was last looked at (µs since online), its generation then (None: not yet), the re-register count last acted on (None: not yet seen, the first look only records it), and when the radio goes back on after a re-register's off.
-    ctl_at: u64,
+    /// The control block (docs/RADIO-CONTROLS.md), looked at every pass: its generation when last looked at (None: not yet), the re-register count last acted on (None: not yet seen, the first look only records it), and when the radio goes back on after a re-register's off.
     ctl_gen: Option<u64>,
     rereg_seen: Option<u64>,
     rereg_on: Option<u64>,
@@ -2592,11 +2590,41 @@ impl Online {
         status(4, s.rsrq.map_or(MEASURE_NONE, |v| w(k::RSRQ, v * 1000)));
         status(5, s.snr.map_or(MEASURE_NONE, |v| w(k::SNR, v * 100)));
     }
-    /// The service's own part of a pass (docs/RADIO-CONTROLS.md): the tracks every two seconds, the detail when the call comes or goes, and the control block four times a second.
+    /// The service's next timed action in counter ticks, 0 for none (`next_deadline`): each the time its own check in `step` or `service_extras` waits for, so the wait ends when that check would act.
+    fn next_deadline(&self) -> u64 {
+        let f = crate::hw::freq();
+        // µs since online as counter ticks, one tick late so the check's `>` holds when the wait ends.
+        let at = |us: u64| self.t0 + us * f / 1_000_000 + 1;
+        let home = matches!(self.reg_last[1], Some([1 | 5, ..]));
+        let dark = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
+        let mut t = u64::MAX;
+        // WHY the mins: the earliest of the deadlines, not a bound on anyone's value.
+        if let (Some(t1), false, true) = (self.idle_since, LINK_DOWN.load(core::sync::atomic::Ordering::Relaxed), self.probe == SERVICE) {
+            t = t.min(t1 + 30_000 * f / 1_000_000 + 1);
+        }
+        if self.probe >= 3 {
+            t = t.min(at(self.next_reg));
+        }
+        if self.probe >= 8 && !self.call_sent && home {
+            t = t.min(at(self.call_retry));
+        }
+        if self.probe >= 3 && self.screen_sent == 1 && home {
+            t = t.min(at(self.sig_ask));
+        }
+        if let Some(r) = self.rereg_on {
+            t = t.min(at(r));
+        }
+        if self.probe == SERVICE && !dark {
+            t = t.min(at(self.tracks_at + 2_000_000));
+        }
+        if t == u64::MAX { 0 } else { t }
+    }
+
+    /// The service's own part of a pass (docs/RADIO-CONTROLS.md): the tracks every two seconds while the screen is on (none in the dark: nobody sees them), the detail when the call comes or goes, and the control block at every pass (a knob set wakes the service loop, kernel SYS_CONTROL; until 2026-11-13 it was looked at four times a second).
     #[inline(never)]
     fn service_extras(&mut self, rep: &mut Vec<u8>) {
         let t = since_us(self.t0);
-        if t.wrapping_sub(self.tracks_at) >= 2_000_000 {
+        if ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) != 1 && t.wrapping_sub(self.tracks_at) >= 2_000_000 {
             self.tracks_at = t;
             self.publish_tracks();
         }
@@ -2605,8 +2633,7 @@ impl Online {
             self.detail_for = Some(call);
             self.publish_detail();
         }
-        if t.wrapping_sub(self.ctl_at) >= 250_000 {
-            self.ctl_at = t;
+        {
             let c = ferros_sys::controls(ferros_sys::control::CELLULAR);
             if self.ctl_gen != Some(c[0]) {
                 self.ctl_gen = Some(c[0]);
@@ -2918,7 +2945,6 @@ impl Online {
             sig_logged: 0,
             sig_ask: 0,
             screen_sent: 0,
-            screen_check: 0,
             camp_seen: [0; 2],
             mcc_said: 0,
             call_sent: false,
@@ -2944,7 +2970,6 @@ impl Online {
             idle_since: None,
             suspends: 0,
             ul_log: 0,
-            ctl_at: 0,
             ctl_gen: None,
             rereg_seen: None,
             rereg_on: None,
@@ -3079,9 +3104,8 @@ impl Online {
                 }
             }
         }
-        // The screen's state, once the radio is on and at every change after (read every quarter second): Android's RIL says so at each screen change, and the CP holds its signal reports and stretches its own wakeups while it takes the screen for off. Then the signal asked for on the data stack's channel every 2 s while it is registered and the screen is on.
-        if probe >= 3 && self.powered && since_us(t0) > self.screen_check {
-            self.screen_check = since_us(t0) + 250_000;
+        // The screen's state, once the radio is on and at every change after (read every pass, a memory read: its change wakes the service loop): Android's RIL says so at each screen change, and the CP holds its signal reports and stretches its own wakeups while it takes the screen for off. Then the signal asked for on the data stack's channel every 2 s while it is registered and the screen is on.
+        if probe >= 3 && self.powered {
             let want = if ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1 { 2 } else { 1 };
             if want != self.screen_sent {
                 self.screen_sent = want;
@@ -3488,6 +3512,85 @@ pub fn down(rep: &mut Vec<u8>) {
     off(rep);
 }
 
+/// The service's doorbell (2026-11-13): counted up by main.rs's interrupt threads (the CP's MSI, its CP2AP_WAKEUP) and by a RESTART asked on `rmnet`; the service loop's wait is on this word, ended also by a preference or a knob changing (the kernel wakes every word waiter then) and by `next_deadline`. Until then the loop looked every millisecond, some 1,100 wakes a second on the 8a in the dark.
+pub static RUNG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The service loop's wait: until `RUNG` moves from `seen` or the next timed action is due.
+pub fn ring_wait(seen: u64) {
+    ferros_sys::wait_world(&RUNG, seen, next_deadline());
+}
+
+/// When the service's next timed action is due, in counter ticks, 0 for none (nothing timed, or no service): the link down 30 ms after the CP's wakeup line fell with nothing to send (Android's cp2ap_suspend_work), the registration asked (every 5 s until the data stack is home, then the 64 s backstop), the data call set up again after a refusal, the radio back on half a second after a re-register's off, and while the screen is on the signal asked every 2 s and the tracks published every 2 s. Nothing else is timed: the CP's frames and packets ring the MSI, its wish for the link CP2AP_WAKEUP, the screen and the knobs the kernel's word wake.
+pub fn next_deadline() -> u64 {
+    crate::hw::locked(|| unsafe { (*(&raw const ONLINE)).as_ref().map_or(0, |o| o.next_deadline()) })
+}
+
+/// The CP's MSI line re-armed: block 0's vectors (the CP's four) enabled and unmasked, its status cleared (write 1 to clear), so the next MSI raises SPI 416 again (pcie-exynos-rc.c, separated MSI: block k on SPI 416 + k). Not while the link is down: the controller's PHY is off with it, and no MSI can come (CP2AP_WAKEUP says when it wants the link back). True when armed.
+pub fn msi_arm() -> bool {
+    if LINK_DOWN.load(core::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    wr(DBI + 0x828, rd(DBI + 0x828) | 0xF);
+    wr(DBI + 0x82C, rd(DBI + 0x82C) & !0xF);
+    let s = rd(DBI + 0x830);
+    if s != 0 {
+        wr(DBI + 0x830, s);
+    }
+    true
+}
+
+/// gpa6's external-interrupt words in gpio-alive (pinctrl-gs.c zuma_pin_alive: gpa6's EINT offset G#14; the wakeup block's ECON G#700, EMASK G#900, EPEND G#A00).
+const GPA6_ECON: usize = GPIO_ALIVE + 0x700 + 0x14;
+const GPA6_EMASK: usize = GPIO_ALIVE + 0x900 + 0x14;
+const GPA6_EPEND: usize = GPIO_ALIVE + 0xA00 + 0x14;
+
+/// CP2AP_WAKEUP (gpa6-5) as an external interrupt on both edges (ECON type 4), so a rise (the CP wants the link) and a fall (its idle) each raise SPI 35. The pin's function G#F (EINT); its data word still reads the level (`Pad::get`). Once, before the first wait.
+pub fn wakeup_setup() {
+    let p = CP2AP_WAKEUP.1;
+    CP2AP_WAKEUP.func(0xF);
+    wr(GPA6_ECON, rd(GPA6_ECON) & !(0x7 << (4 * p)) | 4 << (4 * p));
+    wakeup_arm();
+    wr(GPA6_EMASK, rd(GPA6_EMASK) & !(1 << p));
+}
+
+/// CP2AP_WAKEUP's pending edge cleared (write 1 to clear), before its line is acked.
+pub fn wakeup_arm() {
+    wr(GPA6_EPEND, 1 << CP2AP_WAKEUP.1);
+}
+
+/// `rmnet` WATCH (op 9), the IP stack's doorbell (2026-11-13): one held ask, answered [1] once DL packets wait or the call's state differs from what the last answer saw, [0] when a newer ask replaces it. Until then the stack asked RECV every idle millisecond while the call was up and INFO every second while it was not.
+static mut WATCH: Option<[u8; 32]> = None;
+/// The call's state as the watcher last heard it (`call_sig`).
+static mut WATCH_SIG: u64 = 0;
+
+/// The call's state in one word: 0 no call (or no service), else its cid, PDP type, MTU and addresses folded (FNV-1a), so any change the stack must re-read INFO for moves it.
+fn call_sig(o: Option<&Online>) -> u64 {
+    let Some(c) = o.and_then(|o| o.call) else { return 0 };
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    for b in [c.cid, c.pdp].iter().chain(c.mtu.to_be_bytes().iter()).chain(c.v4.iter()).chain(c.v6.iter()).chain(c.dns4.iter()).chain(c.dns6.iter()) {
+        h = (h ^ *b as u64).wrapping_mul(0x100_0000_01B3);
+    }
+    h | 1
+}
+
+/// The held WATCH answered when there is something for it; called under the lock.
+fn watch_answer_locked() {
+    let o = unsafe { (*(&raw const ONLINE)).as_ref() };
+    let sig = call_sig(o);
+    let ready = o.is_some_and(|o| !o.dl.is_empty()) || sig != unsafe { WATCH_SIG };
+    if ready {
+        if let Some(t) = unsafe { (*(&raw mut WATCH)).take() } {
+            unsafe { WATCH_SIG = sig };
+            ferros_sys::reply(&t, &[1]);
+        }
+    }
+}
+
+/// After each service pass (main.rs): the held WATCH answered if packets wait or the call changed.
+pub fn watch_poke() {
+    crate::hw::locked(watch_answer_locked);
+}
+
 /// One service pass, from the kernel's service loop (not under the kernel lock; it takes it). Its log lines go to the flash log; a CP that gave up ends the service.
 pub fn service_poll() {
     let mut rep = Vec::new();
@@ -3572,21 +3675,34 @@ fn ul_shape(p: &[u8], down: bool) -> alloc::string::String {
 /// - 1 SEND: an IP packet → [0] sent, [1] the UL queue is full (retry), [2] no data call, [3] bad request (empty, or longer than a UL buffer).
 /// - 2 RECV: → the oldest DL packet of the call, or nothing (length 0).
 /// - 3 INFO: → flags (bit 0 the call is up, bit 1 it has IPv4, bit 2 IPv6), MTU (u16 BE), IPv4 address (4), IPv6 address (16), the first DNS server's IPv4 (4) and IPv6 (16) — 43 bytes.
-pub fn rmnet_call(req: &[u8]) -> Vec<u8> {
+/// - 9 WATCH: held until DL packets wait or the call's state changes (`WATCH`) → [1]; [0] when a newer WATCH replaces it.
+/// Returns the reply, or None for a held WATCH (its token kept; the caller does not reply).
+pub fn rmnet_call(req: &[u8], tok: &[u8; 32]) -> Option<Vec<u8>> {
     // STATE and DOWN take the lock themselves; RESTART only asks the main thread; the rest touch the call under it.
     match req.first() {
+        // WATCH: answered now when packets wait or the call changed since the last answer, else held (None: the caller does not reply) until a service pass finds either (`watch_poke`); an older ask still held is let go with [0].
+        Some(9) => crate::hw::locked(|| {
+            if let Some(t) = unsafe { (*(&raw mut WATCH)).replace(*tok) } {
+                ferros_sys::reply(&t, &[0]);
+            }
+            watch_answer_locked();
+            None
+        }),
         Some(4) => {
             let mut r = Vec::new();
             state(&mut r);
-            r
+            Some(r)
         }
         // DOWN: one shot (owner, 2026-11-08): this process ends with no teardown of its own; the CP stays as it was (the modem has no kernel power switch yet; the `off` mode powers it down on purpose).
         Some(5) => ferros_sys::exit(0),
         Some(7) => {
             RESTART.store(true, core::sync::atomic::Ordering::Relaxed);
-            alloc::vec![0]
+            // The service loop woken: it waits on its doorbell, not the clock.
+            RUNG.fetch_add(1, core::sync::atomic::Ordering::Release);
+            ferros_sys::wake(&RUNG, 1);
+            Some(alloc::vec![0])
         }
-        _ => crate::hw::locked(|| rmnet_locked(req)),
+        _ => Some(crate::hw::locked(|| rmnet_locked(req))),
     }
 }
 

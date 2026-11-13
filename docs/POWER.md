@@ -203,3 +203,14 @@ Real sleep, extracted from Linux (zuma): the cores' only idle state is C2 (PSCI 
 ## 2026-11-12: heat
 
 The heat side of the power profile (the TMU zones, the hardware clock divider that took the X3 to 364 MHz under Mahere, the thermal policy and what 120 frames a second costs) is in THERMAL.md.
+
+## 2026-11-13: the radio drivers off the clock
+
+The 8a dark with the radios on drew 782-859 mW from the battery (~40 % overnight). The deep-sleep measure: the X3's loop ran ~5,700 passes a second, mostly the radio drivers' millisecond sleeps (modem ~1,100 wakes a second, pcie1 ~900, bt ~300, ip ~260; nfc ~950 with the screen on). Each driver now waits on what signals its work (owner, 2026-11-10: "No polling! No timers unless PROVEN necessary!"); a timer is left only for a protocol's own deadline.
+- **The pattern:** one thread a line waits on it (`irq_wait`, no deadline) and counts a word up; the serving loop's wait is on that word with `wait_world_or_call`, so a call, a preference or a knob changing (the kernel wakes every word waiter) or the next real deadline also end it. The thread leaves the line masked until the loop has read its device (one interrupt an idle spell), and the loop reads it once more after re-arming, before it waits.
+- **Kernel (not yet flashed, branch of 2026-11-13):** the lines `modem-msi` (SPI 416), `modem-wakeup` (SPI 35, gpa6-5), `nfc-irq` (SPI 42, gpa7-6), `bt-uart` (SPI 71) go with their drivers' grants (process.rs `LINES_WITH`); a knob set wakes word waiters; a granted line is routed to the kernel's core (killswitch.rs `enable_spi`), never to a worker the dark profile switches off.
+- **pcie1, ip:** WIFI.md "No timers while serving", measured on the 8a: screen on pcie1 from ~2,000-3,100 passes a second to ~30, latency unchanged. In the dark the line was routed to a worker that went off (pings 785 ms on average): the routing fix above. ip's wakes at rest are now its clients' calls (Photon ~1,000 a second, fgtw ~150).
+- **modem:** waits on the CP's MSI and CP2AP_WAKEUP (an external interrupt on both edges); its deadlines are the 30 ms idle suspend, the registration asks, a call's retry, the re-register's radio on, and the signal and tracks every 2 s while the screen is on. `rmnet` op 9 WATCH is the IP stack's doorbell for DL packets and the call's changes.
+- **nfc:** waits on its IRQ pin as an external interrupt; the screen read every pass instead of four times a second.
+- **bt:** waits on the UART's receive interrupt, a call, and its 8 s look at the chip (the one timer left: it finds a core WiFi's driver reset; a doorbell from the `bt` power switch would end it).
+- Each new driver says its passes and waits every 64 s or more; each falls back to its old loop on a kernel without its line. Not yet on a device: modem, nfc, bt (they need the kernel); dark power not yet measured.

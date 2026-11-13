@@ -29,7 +29,7 @@
 //!   - One lookup a name and type, however many ask: the calls hold on it. A question goes from the resolver's one port (random for the session) with a random id (the entropy grant, each question), to the DNS server of each family's link (INFO's, IPv6's first, turn about), four tries a second apart (the one timer: a lost datagram never comes back); a try ip cannot send yet for want of the next hop goes again 2^-6 s on. An answer counts only from port 53 of a server a try went to, with the id, repeating the question (`ferros_dns::read`); a SERVFAIL or REFUSED moves to the next try at once. Nothing an application sends may leave from the resolver's port (op 1 answers [3]).
 //!   - Each lookup's end is a console line: the type, found or not or no answer, its time and tries; never the name or the address (they are the person's).
 //!
-//! DHCPv4 (`dhcp_in`, `dhcp_retry`): DISCOVER, OFFER, REQUEST, ACK, retransmitted every 2 s until bound; four REQUESTs unanswered give the offer up for a fresh DISCOVER (RFC 2131 4.4.1). What it sent and heard since WiFi came up is a console line every 16th retransmit while unbound and once at the bind: `DHCP <no lease yet|bound>: A#<n> DISCOVERs and A#<n> REQUESTs out; A#<n> OFFERs, A#<n> ACKs, A#<n> NAKs in, A#<n> replies to other transactions; state A#<1 discovering, 2 requesting, 3 bound>[, lease A#<s> s]`. No renewal yet: the lease is said, not kept to.
+//! DHCPv4 (`dhcp_in`, `dhcp_retry`): DISCOVER, OFFER, REQUEST, ACK, retransmitted every 2 s until bound; four REQUESTs unanswered give the offer up for a fresh DISCOVER (RFC 2131 4.4.1). What it sent and heard since WiFi came up is a console line every 16th retransmit while unbound and once at the bind: `DHCP <no lease yet|bound>: A#<n> DISCOVERs and A#<n> REQUESTs out; A#<n> OFFERs, A#<n> ACKs, A#<n> NAKs in, A#<n> replies to other transactions; WiFi frames in A#<n> broadcast, A#<n> multicast, A#<n> unicast (A#<n> ARP, A#<n> IPv4); state A#<1 discovering, 2 requesting, 3 bound>[, lease A#<s> s]`. The DISCOVER asks for unicast replies (broadcast flag clear). No renewal yet: the lease is said, not kept to.
 //!
 //! TCP here, client only, re-engineered for throughput on 2026-11-11 (owner: "sounds like it needs re-engineered", after Mahere's 1.6 MB base cells crawled thru two connections of a 4 KiB window, about 80 KB/s at a 50 ms round trip). The protocol's pure parts are ferros_tcp, tested on the host.
 //! - Sixteen connections (`TCPN`). An idle one costs its control state alone (`Tcb`, a static table); an open one holds a block of the arc (`Blocks`): a 1 MiB receive buffer and a 256 KiB send buffer. The kernel maps 4 MiB of heap at spawn (three blocks); the arc grows for more as connections open (SYS_ARC, docs/ARCS.md) and shrinks again when the highest blocks are free.
@@ -148,6 +148,8 @@ struct Ip {
     ring: bool,
     ring_thread: bool,
     ring_none: bool,
+    /// The call's doorbell helper (`cell_ring_thread`) started.
+    cell_thread: bool,
     /// The resolver (op 10): a static, not the 64 KiB stack.
     res: &'static mut Dns,
     /// DHCPv4's measures since WiFi came up (`wifi_up`), said every 16th retransmit while unbound and once at the bind (2026-11-13: the 8a got no lease for minutes on end while IPv6 worked, and nothing said why).
@@ -169,6 +171,12 @@ struct DhcpCount {
     unanswered: u32,
     /// The lease the ACK gave (option 51), in seconds; 0 none said.
     lease_s: u32,
+    /// WiFi frames in by Ethernet destination (broadcast, other multicast, unicast), and the ARP and IPv4 frames among them.
+    bcast_in: u32,
+    mcast_in: u32,
+    ucast_in: u32,
+    arp_in: u32,
+    v4_in: u32,
 }
 
 /// The WiFi path's measures between two connection reports (`report`), said after each on a line of their own (owner, 2026-11-11: measure the path before fixing it). Counter ticks where a time is kept.
@@ -193,6 +201,8 @@ struct Path {
     by_ring: u32,
     by_call: u32,
     by_timer: u32,
+    /// When this window began (0: not yet), for the idle report every 64 s or more (`main`): with no timer bringing passes, the window's passes and waits are the stack's wakes at rest.
+    t0: u64,
 }
 
 impl Path {
@@ -201,7 +211,13 @@ impl Path {
         let f = ip.freq;
         let us = |t: u64| t * 1_000_000 / f;
         let (pass_most, slept, call_most) = (us(self.pass_most), us(self.slept_t) / 1000, us(self.call_most));
-        ip.put(b"WiFi path since the last report: A#");
+        ip.put(b"WiFi path since the last report");
+        if self.t0 != 0 {
+            ip.put(b" (A#");
+            ip.dec(us(now().wrapping_sub(self.t0)) / 1000);
+            ip.put(b" ms)");
+        }
+        ip.put(b": A#");
         ip.dec(self.passes as u64);
         ip.put(b" passes (longest A#");
         ip.dec(pass_most);
@@ -257,14 +273,45 @@ const EXCH_REPLY: usize = 3;
 /// The exchanges' reply buffer (`wlan_batch`): a static, not the 64 KiB stack.
 static mut EXCH: [u8; EXCH_MAX] = [0; EXCH_MAX];
 
-/// The WiFi doorbell (`FERROS_WIFI_IRQ=1` builds, 2026-11-11; off, the stack asks the driver every idle millisecond as before): a second thread holds a call to the driver (`wlan` op 9) that the driver answers only once frames wait, and rings `RING`; the main thread's idle wait is on `RING`, ended also by an application's call (`wait_world_or_call`) and by its own next timer, so an idle stack stops asking the driver a thousand times a second and the driver can sleep until its chip rings (payloads/pcie1 `WIFI_IRQ`).
-const WIFI_RING: bool = option_env!("FERROS_WIFI_IRQ").is_some();
+/// The WiFi doorbell (the default since 2026-11-13; `FERROS_WIFI_IRQ=0` builds ask the driver every idle millisecond as before): a second thread holds a call to the driver (`wlan` op 9) that the driver answers only once frames wait, and rings `RING`; the main thread's idle wait is on `RING`, ended also by an application's call (`wait_world_or_call`) and by its own next timer, so an idle stack stops asking the driver a thousand times a second and the driver can sleep until its chip rings (payloads/pcie1 `WIFI_IRQ`). A driver without op 9 answers it with nothing, and the stack asks it every idle millisecond then.
+const WIFI_RING: bool = match option_env!("FERROS_WIFI_IRQ") {
+    Some(v) => !(v.len() == 1 && v.as_bytes()[0] == b'0'),
+    None => true,
+};
 /// The doorbell's word: 0 armed (the helper's call held at the driver, or about to be), 1 frames wait at the driver, 2 the driver gone (the call failed: the main thread re-arms it once `wifi_up` finds a driver again), 3 a driver without the doorbell (op 9 answered with nothing: never armed again).
 static RING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The helper's stack: it only calls and waits.
 static mut RING_STACK: [u8; 1 << 13] = [0; 1 << 13];
-/// The longest idle wait with the doorbell: 2^6 of the counter's ~1 ms (freq >> 10), when neither the cellular call (asked each idle millisecond, as before) nor a retransmit timer nor a held receive's deadline wants the stack sooner: its other timers count in seconds.
-const RING_IDLE_LOG2: u32 = 6;
+/// The main thread's doorbell: counted up by each helper (WiFi's `ring_thread`, the call's `cell_ring_thread`) when its word changes; the idle wait is on this count, so either helper ends it.
+static BELL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The cellular call's doorbell (2026-11-13; the modem's `rmnet` op 9 WATCH): 0 armed (the helper's call held at the modem driver, or about to be), 1 DL packets wait or the call changed, 2 no driver answered (asked again with INFO every second, re-armed once one answers), 3 a driver without the op (never armed again: RECV every idle millisecond while the call is up, as before). Until then the stack asked RECV every idle millisecond while the call was up and INFO every second while it was not.
+static CELL_RING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static mut CELL_RING_STACK: [u8; 1 << 13] = [0; 1 << 13];
+
+/// The call's doorbell helper: WATCH held at the modem driver, its answer into `CELL_RING`, the main thread rung, then a wait until the main thread has taken the packets and read INFO (`CELL_RING` back to 0) before asking again.
+extern "C" fn cell_ring_thread(grants: u64) -> ! {
+    use core::sync::atomic::Ordering::{Acquire, Release};
+    let base = ferros_sys::arc_base();
+    let cap = grants + 0x204 + 32 * S_RMNET;
+    let q = [9u8];
+    let mut r = [0u8; 1];
+    loop {
+        let n = svc(CALL, cap, q.as_ptr() as u64 - base, 1, r.as_mut_ptr() as u64 - base, 1 | CALL_LIVE);
+        // [0]: the driver let this ask go for a newer one, so ask again. [3] (a bad request) or nothing: a driver without WATCH.
+        let v = match n {
+            ERR => 2,
+            1 if r[0] == 1 => 1,
+            1 if r[0] == 0 => continue,
+            _ => 3,
+        };
+        CELL_RING.store(v, Release);
+        BELL.fetch_add(1, Release);
+        ferros_sys::wake(&BELL, 1);
+        while CELL_RING.load(Acquire) == v {
+            ferros_sys::wait_world(&CELL_RING, v, 0);
+        }
+    }
+}
 
 /// The doorbell's helper thread (`WIFI_RING`): the held call, its answer into `RING`, the main thread woken, then a wait until the main thread has taken the frames (`RING` back to 0) before asking again.
 extern "C" fn ring_thread(grants: u64) -> ! {
@@ -283,7 +330,8 @@ extern "C" fn ring_thread(grants: u64) -> ! {
             _ => continue,
         };
         RING.store(v, Release);
-        ferros_sys::wake(&RING, 2);
+        BELL.fetch_add(1, Release);
+        ferros_sys::wake(&BELL, 1);
         while RING.load(Acquire) == v {
             ferros_sys::wait_world(&RING, v, 0);
         }
@@ -804,12 +852,17 @@ impl Ip {
         n
     }
 
-    /// When the idle wait with the doorbell ends at the latest (`WIFI_RING`): the next idle millisecond (shifted by the screen-off backoff) while the cellular call is up, as it is asked each pass; else the earliest of a connection's retransmit timer, a held receive's deadline, and `RING_IDLE_LOG2` from now. A time already past ends the wait at once, and the pass handles it.
+    /// When the idle wait ends at the latest, 0 for no deadline (it ends sooner on a doorbell, an application's call or a preference changing): the next idle millisecond (shifted by the screen-off backoff) while the cellular call is up from a modem driver without WATCH, as `rmnet` is asked each pass then; else the earliest of the protocol timers that are running: a connection's retransmit timer, a held receive's deadline, the resolver's tries and held lookups, DHCPv4's 2 s retransmit while unbound, the router solicitation's 4 s while IPv6 has no global address, the membership reports' 60 s while a group is joined, the WiFi driver looked for every 4 s while there is none, and the cellular call's INFO every second while no modem driver answers (or until the call is up, from one without WATCH). A time already past ends the wait at once, and the pass handles it. No backstop: until 2026-11-13 the wait also ended every 2^6 ms whatever was running, some 16 wakes a second for nothing.
     fn idle_until(&self, t0: u64) -> u64 {
-        if self.cell.flags & 1 != 0 {
+        // The call's doorbell (`CELL_RING`): with it armed the modem driver rings for packets and changes, and nothing here is timed for the call.
+        let cr = CELL_RING.load(core::sync::atomic::Ordering::Acquire);
+        let cell_polled = !self.cell_thread || cr == 3;
+        if self.cell.flags & 1 != 0 && cell_polled {
             return t0 + (self.freq / 1000 << self.backoff);
         }
-        let mut t = t0 + ((self.freq >> 10) << RING_IDLE_LOG2);
+        let f = self.freq;
+        // The cellular call's INFO every second: until it is up from a driver without the doorbell, or until a driver answers at all.
+        let mut t = if cell_polled || cr == 2 { self.cell_t + f } else { u64::MAX };
         // WHY the mins: the earliest of the deadlines, not a bound on anyone's value.
         for c in self.tcb.iter().filter(|c| c.rto_t != 0) {
             t = t.min(c.rto_t);
@@ -824,7 +877,19 @@ impl Ip {
         for r in self.res.rq.iter().filter(|r| r.used) {
             t = t.min(r.until);
         }
-        t
+        if self.wifi && !self.bound {
+            t = t.min(self.dhcp_t + 2 * f);
+        }
+        if self.wifi && !self.have_global && self.rs_n < 3 {
+            t = t.min(self.rs_t + 4 * f);
+        }
+        if self.groups_n > 0 {
+            t = t.min(self.groups_t + 60 * f);
+        }
+        if !self.wifi {
+            t = t.min(self.wifi_t + 4 * f);
+        }
+        if t == u64::MAX { 0 } else { t }
     }
 
     /// The frames from the WiFi driver, a batch a call, while it says more wait or ACKs wait to go (`EXCH_PASS` calls at most): each taken (`wlan_in`), then the ACKs the batch owes (`tcp_acks`), which go with the next exchange. Returns whether any frame came or went.
@@ -879,6 +944,17 @@ impl Ip {
         self.frames += 1;
         let src_mac: [u8; 6] = f[6..12].try_into().unwrap();
         let ty = u16::from_be_bytes([f[12], f[13]]);
+        // By destination and kind, for DHCP's line: a network whose broadcasts never arrive answers no DHCP that asks for a broadcast reply (2026-11-13, the 8a: 16 DISCOVERs, no reply of any kind).
+        let c = &mut self.dhcp_n;
+        if f[..6] == [0xFF; 6] {
+            c.bcast_in += 1;
+        } else if f[0] & 1 != 0 {
+            c.mcast_in += 1;
+        } else {
+            c.ucast_in += 1;
+        }
+        c.arp_in += (ty == 0x0806) as u32;
+        c.v4_in += (ty == 0x0800) as u32;
         if ty == 0x0806 {
             self.arp_in(&f[14..]);
         } else if ty == 0x0800 {
@@ -968,8 +1044,8 @@ impl Ip {
         self.put(b"WiFi driver gone\n");
     }
 
-    /// The cellular call's state from `rmnet` INFO (43 bytes: flags, MTU BE, IPv4, IPv6, DNS IPv4, DNS IPv6). No grant, or the call not up: down. A change is logged by its shape, never its addresses.
-    fn cell_info(&mut self) {
+    /// The cellular call's state from `rmnet` INFO (43 bytes: flags, MTU BE, IPv4, IPv6, DNS IPv4, DNS IPv6). No grant, or the call not up: down. A change is logged by its shape, never its addresses. Returns whether a driver answered.
+    fn cell_info(&mut self) -> bool {
         let mut r = [0u8; 43];
         let q = [3u8];
         let n = svc(CALL, self.cap(S_RMNET), self.off(q.as_ptr()), 1, self.off(r.as_mut_ptr()), r.len() as u64 | CALL_LIVE);
@@ -993,6 +1069,7 @@ impl Ip {
                 self.put(b"\n");
             }
         }
+        n != ERR
     }
 
     /// The link and source address for an IPv4 destination: WiFi once DHCP has bound it, else the cellular call if it has an IPv4 address; broadcast, multicast and the WiFi subnet's broadcast stay on WiFi. None: no address of this family on an allowed link.
@@ -1182,7 +1259,8 @@ impl Ip {
         let mut b = [0u8; 300];
         b[0..4].copy_from_slice(&[1, 1, 6, 0]);
         b[4..8].copy_from_slice(&self.xid.to_be_bytes());
-        b[10] = 0x80;
+        // The broadcast flag clear (RFC 2131 4.1, as dhclient sends): the server answers to our MAC, unicast, which `ipv4_in` takes for port 68 before any address is bound. Set until 2026-11-13, it asked for broadcast replies, and on the 8a none came (16 DISCOVERs, no reply of any kind).
+        b[10] = 0;
         b[28..34].copy_from_slice(&self.mac);
         b[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
         let mut o = 240;
@@ -1226,7 +1304,17 @@ impl Ip {
         self.dec(c.naks as u64);
         self.put(b" NAKs in, A#");
         self.dec(c.others as u64);
-        self.put(b" replies to other transactions; state A#");
+        self.put(b" replies to other transactions; WiFi frames in A#");
+        self.dec(c.bcast_in as u64);
+        self.put(b" broadcast, A#");
+        self.dec(c.mcast_in as u64);
+        self.put(b" multicast, A#");
+        self.dec(c.ucast_in as u64);
+        self.put(b" unicast (A#");
+        self.dec(c.arp_in as u64);
+        self.put(b" ARP, A#");
+        self.dec(c.v4_in as u64);
+        self.put(b" IPv4); state A#");
         self.dec(self.dhcp_state as u64);
         if self.bound {
             self.put(b", lease A#");
@@ -3034,9 +3122,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         txb: unsafe { &mut *(&raw mut TXB) },
         txn: EXCH_HEAD,
         path: Path::default(),
-        dhcp_n: DhcpCount { discovers: 0, requests: 0, offers: 0, acks: 0, naks: 0, others: 0, unanswered: 0, lease_s: 0 },
+        dhcp_n: DhcpCount { discovers: 0, requests: 0, offers: 0, acks: 0, naks: 0, others: 0, unanswered: 0, lease_s: 0, bcast_in: 0, mcast_in: 0, ucast_in: 0, arp_in: 0, v4_in: 0 },
         ring: false,
         ring_thread: false,
+        cell_thread: false,
         ring_none: false,
         res: unsafe { &mut *(&raw mut DNS) },
     };
@@ -3079,6 +3168,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     ip.flush();
     // WiFi: the driver's MAC, then DHCP and a router solicitation (`wifi_up`). No `wlan` grant or no driver serving it: cellular only for now, the driver asked again every 4 s (an error at once while it is not serving: CALL_LIVE).
     ip.wifi_up();
+    // The call's doorbell helper (`cell_ring_thread`): it asks the modem driver's WATCH from now on.
+    // SAFETY: the helper's stack, given to it alone, once.
+    ip.cell_thread = ferros_sys::thread_spawn(cell_ring_thread, unsafe { &mut *(&raw mut CELL_RING_STACK) }, ip.grants) != ERR;
     let mut frame = [0u8; 2048];
     let msg = unsafe { &mut *(&raw mut MSG) };
     let out = unsafe { &mut *(&raw mut OUT) };
@@ -3088,6 +3180,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         ferros_sys::pet();
         let mut busy = false;
         let pass_t = now();
+        // The helpers' count before this pass looks: a ring while it runs ends its wait at once.
+        let bell_seen = BELL.load(core::sync::atomic::Ordering::Acquire);
         ip.path.passes += 1;
         // Frames from the WiFi driver: in batches, our own going with each call (`wlan_batch`), or from a driver without batches [2] → the oldest frame, or nothing. With the doorbell (`WIFI_RING`) only when it rang or frames wait to go, re-armed after the exchange: the driver answers a new ask at once while frames still wait (op 9 looks at its queue when asked), so nothing that came during the exchange is missed, and no empty exchange follows each ring.
         if ip.wifi && ip.batch {
@@ -3127,8 +3221,10 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             let n = (n as usize).min(frame.len());
             ip.wlan_in(&frame[..n]);
         }
-        // Packets from the cellular call: [2] → the oldest, or nothing.
-        for _ in 0..if ip.cell.flags & 1 != 0 { FRAMES_PASS } else { 0 } {
+        // Packets from the cellular call: [2] → the oldest, or nothing. With the call's doorbell (`CELL_RING`) only when it rang; with a driver without it, every pass as before.
+        let cr = CELL_RING.load(core::sync::atomic::Ordering::Acquire);
+        let cell_polled = !ip.cell_thread || cr == 3;
+        for _ in 0..if ip.cell.flags & 1 != 0 && (cell_polled || cr == 1) { FRAMES_PASS } else { 0 } {
             let req = [2u8];
             let n = svc(CALL, ip.cap(S_RMNET), ip.off(req.as_ptr()), 1, ip.off(frame.as_mut_ptr()), frame.len() as u64 | CALL_LIVE);
             if n == 0 || n == ERR {
@@ -3147,9 +3243,27 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         ip.tcp_acks();
         // The call's state from `rmnet` INFO: every second until it is up, then every 16 s (a call that drops and comes back may come back with new addresses).
         let t = now();
-        if t.wrapping_sub(ip.cell_t) > if ip.cell.flags & 1 != 0 { 16 } else { 1 } * ip.freq {
+        // The WiFi path said at the first pass 64 s or more after its window began, when no connection's report said it sooner: at rest its passes and waits are the stack's wakes (2026-11-13, the deep-sleep measure: ip woke ~260 times a second in the dark).
+        if t.wrapping_sub(ip.path.t0) >= 64 * ip.freq {
+            if ip.path.t0 != 0 {
+                ip.flush();
+                let p = core::mem::take(&mut ip.path);
+                p.say(&mut ip);
+            }
+            ip.path.t0 = t;
+        }
+        // The call's state: at the doorbell's ring; with no driver answering it, INFO every second until one does (then the doorbell re-armed); with a driver without it, every second until the call is up, then every 16 s, as before.
+        if cr == 1 {
             ip.cell_t = t;
             ip.cell_info();
+            CELL_RING.store(0, core::sync::atomic::Ordering::Release);
+            ferros_sys::wake(&CELL_RING, 1);
+        } else if (cr == 2 && !cell_polled && t.wrapping_sub(ip.cell_t) > ip.freq) || (cell_polled && t.wrapping_sub(ip.cell_t) > if ip.cell.flags & 1 != 0 { 16 } else { 1 } * ip.freq) {
+            ip.cell_t = t;
+            if ip.cell_info() && cr == 2 && !cell_polled {
+                CELL_RING.store(0, core::sync::atomic::Ordering::Release);
+                ferros_sys::wake(&CELL_RING, 1);
+            }
         }
         if t.wrapping_sub(ip.person_t) > ip.freq {
             ip.person_t = t;
@@ -3203,9 +3317,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             ip.backoff = 0;
         } else {
             let t0 = now();
-            if ip.ring {
-                // The doorbell (`WIFI_RING`): the wait ends when it rings, when an application calls (`udp`, polled above), or at the stack's next timer (`idle_until`).
-                match ferros_sys::wait_world_or_call(&RING, 0, ip.idle_until(t0)) {
+            if ip.ring || !ip.wifi {
+                // The doorbells (WiFi's `RING`, the call's `CELL_RING`, both counted on `BELL`), or no WiFi link to ask at all: the wait ends when a doorbell rings, when an application calls (`udp`, polled above), when a preference changes, or at the stack's next timer (`idle_until`). Only a WiFi driver without the doorbell is still asked every idle millisecond (below).
+                match ferros_sys::wait_world_or_call(&BELL, bell_seen, ip.idle_until(t0)) {
                     0 | 1 => ip.path.by_ring += 1,
                     3 => ip.path.by_call += 1,
                     _ => ip.path.by_timer += 1,

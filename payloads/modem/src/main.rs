@@ -95,14 +95,17 @@ pub extern "C" fn modem_main(grants: u64, input: u64, input_len: u64) -> ! {
     // `rmnet` on its own thread, from the start: it answers at once from the service's state ("no call" while the CP comes up), so a caller is never held by a bring-up that takes 20 s.
     static mut RMNET_STACK: [u8; 1 << 16] = [0; 1 << 16];
     ferros_sys::thread_spawn(rmnet_thread, unsafe { &mut *(&raw mut RMNET_STACK) }, 0);
+    // The interrupt lines the kernel adds after the last grant (process.rs `LINES_WITH`: the CP's MSI, then CP2AP_WAKEUP), told from a `cell` grant by asking: a wait with a past deadline answers ERR for a slot that is no line.
+    let (cell, msi, wake) = lines(grants);
     // `cell` on its own thread when it was granted (slot 25, after the partitions): the place service's serving cell (docs/LOCATION.md). init's list has no slot for it yet (its grants page is full), so under init the driver serves only `rmnet`.
-    if grant_count(grants) > S_CELL {
+    if cell {
         static mut CELL_STACK: [u8; 1 << 14] = [0; 1 << 14];
         ferros_sys::thread_spawn(cell_thread, unsafe { &mut *(&raw mut CELL_STACK) }, 0);
     }
     // Up, and up again whenever the service ends (the CP crashed, a ring went bad) or RESTART asks: the CP powered down first. The boot-channel download fails now and then on its first try (MAIN unanswered) and works the next; a CP that keeps failing is tried 16 s after, the wait doubling to 1024 s (the policy's cap: a broken modem is retried every 17 minutes), and back to 16 s once it comes up.
     let mut wait_s = 16u64;
     let mut first = true;
+    let mut threads_up = false;
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
@@ -125,28 +128,126 @@ pub extern "C" fn modem_main(grants: u64, input: u64, input_len: u64) -> ! {
             continue;
         }
         wait_s = 16;
+        // With both lines (a kernel from 2026-11-13): CP2AP_WAKEUP as an external interrupt (the bring-up left it an input), each line's thread started once, and the loop waits on them; without, it looks every millisecond as before.
+        let irq = match (msi, wake) {
+            (Some(m), Some(w)) => {
+                modem::wakeup_setup();
+                if !threads_up {
+                    threads_up = true;
+                    static mut MSI_STACK: [u8; 1 << 13] = [0; 1 << 13];
+                    static mut WAKE_STACK: [u8; 1 << 13] = [0; 1 << 13];
+                    ferros_sys::thread_spawn(irq_thread, unsafe { &mut *(&raw mut MSI_STACK) }, 0);
+                    ferros_sys::thread_spawn(irq_thread, unsafe { &mut *(&raw mut WAKE_STACK) }, 1);
+                    hw::log("modem: waiting on the CP's MSI and CP2AP_WAKEUP, no timer between its timed actions");
+                }
+                Some((m, w))
+            }
+            _ => {
+                hw::log("modem: no interrupt lines granted (a kernel before 2026-11-13): looking every millisecond");
+                None
+            }
+        };
+        let mut passes = 0u32;
+        let mut waits = 0u32;
+        let mut said_at = ferros_sys::now();
         while modem::online() && !modem::RESTART.swap(false, core::sync::atomic::Ordering::Relaxed) {
             // The watchdog's pet in the service loop proper (the outer loop is the bring-up's, once per attempt).
             ferros_sys::pet();
+            let seen = modem::RUNG.load(core::sync::atomic::Ordering::Acquire);
             modem::service_poll();
-            ferros_sys::sleep_until(ferros_sys::now() + ferros_sys::freq() / 1000);
+            modem::watch_poke();
+            passes += 1;
+            // The loop's wakes, said at the first pass 64 s or more after the last line (no timer brings one): passes, and waits on the lines.
+            if ferros_sys::now().wrapping_sub(said_at) >= ferros_sys::freq() << 6 {
+                hw::log(&alloc::format!("modem: A#{passes} passes, A#{waits} waits in the last A#{} ms", (ferros_sys::now() - said_at) * 1000 / ferros_sys::freq()));
+                (passes, waits, said_at) = (0, 0, ferros_sys::now());
+            }
+            let Some((m, w)) = irq else {
+                ferros_sys::sleep_until(ferros_sys::now() + ferros_sys::freq() / 1000);
+                continue;
+            };
+            // A line its last interrupt left masked re-armed (its latch cleared, the line acked, its thread woken), then the pass again before any wait: what came before the clear is read by it, what comes after raises the line again. The MSI only while the link is up.
+            use core::sync::atomic::Ordering::{Acquire, Release};
+            let mut again = false;
+            if ARMED[0].load(Acquire) == 0 && modem::msi_arm() {
+                ferros_sys::irq_ack(hw::cap(m));
+                ARMED[0].store(1, Release);
+                ferros_sys::wake(&ARMED[0], 1);
+                again = true;
+            }
+            if ARMED[1].load(Acquire) == 0 {
+                modem::wakeup_arm();
+                ferros_sys::irq_ack(hw::cap(w));
+                ARMED[1].store(1, Release);
+                ferros_sys::wake(&ARMED[1], 1);
+                again = true;
+            }
+            if again {
+                continue;
+            }
+            waits += 1;
+            modem::ring_wait(seen);
         }
         hw::log("the service ended or a restart was asked: the CP down and up again");
     }
 }
 
-/// The `rmnet` endpoint's server: one request at a time, each answered at once (modem.rs `rmnet_call`).
+/// The interrupt lines' grant slots (`lines`): the CP's MSI, then CP2AP_WAKEUP.
+static LINE_SLOT: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+/// 1 while a line's thread waits on it; 0 once it took an interrupt and left the line masked until the service loop has read what came (as payloads/pcie1: one interrupt an idle spell).
+static ARMED: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// After the partitions: `cell` if granted (slot 25), then the kernel's interrupt lines (process.rs `LINES_WITH`, the MSI then the wakeup). Each slot asked with a wait whose deadline has passed: ERR for a slot that is no line. Returns whether `cell` is granted and the two lines' slots.
+fn lines(grants: u64) -> (bool, Option<u64>, Option<u64>) {
+    let n = grant_count(grants);
+    let mut found: [Option<u64>; 2] = [None; 2];
+    let mut k = 0;
+    let mut cell = false;
+    for slot in S_CELL..n {
+        if ferros_sys::irq_wait(hw::cap(slot), 1) == ferros_sys::ERR {
+            cell |= slot == S_CELL;
+            continue;
+        }
+        // WHY the test: the kernel adds two lines; a third slot answering as a line is not one this driver knows.
+        if k < 2 {
+            LINE_SLOT[k].store(slot, core::sync::atomic::Ordering::Relaxed);
+            found[k] = Some(slot);
+            k += 1;
+        }
+    }
+    (cell, found[0], found[1])
+}
+
+/// A line's thread (`k` 0 the MSI, 1 the wakeup): armed, it waits on the line with no deadline; the interrupt counts the service's doorbell up and wakes the loop, and the thread disarms itself, the line left masked (the kernel masks it until `irq_ack`) until the loop re-arms it.
+extern "C" fn irq_thread(k: u64) -> ! {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    let k = k as usize;
+    let cap = hw::cap(LINE_SLOT[k].load(Relaxed));
+    loop {
+        while ARMED[k].load(Acquire) == 0 {
+            ferros_sys::wait_world(&ARMED[k], 0, 0);
+        }
+        ferros_sys::irq_wait_world(cap, 0);
+        ARMED[k].store(0, Release);
+        modem::RUNG.fetch_add(1, Release);
+        ferros_sys::wake(&modem::RUNG, 1);
+    }
+}
+
+/// The `rmnet` endpoint's server: one request at a time, each answered at once (modem.rs `rmnet_call`), but a WATCH, held until DL packets wait or the call changes.
 extern "C" fn rmnet_thread(_: u64) -> ! {
     let mut msg = [0u8; 4096];
     let mut tok = [0u8; 32];
     loop {
         let n = ferros_sys::recv(hw::cap(S_RMNET), &mut msg, &mut tok, false);
+        // A refused receive is a slot that is no endpoint this driver serves, for good: the thread ends, as `cell`'s does (until 2026-11-13 it retried every millisecond forever).
         if n == ferros_sys::ERR {
-            ferros_sys::sleep_until(ferros_sys::now() + ferros_sys::freq() / 1000);
-            continue;
+            hw::log("modem: `rmnet` refused a receive; not serving it");
+            ferros_sys::thread_exit(0);
         }
-        let r = modem::rmnet_call(&msg[..(n as usize).min(msg.len())]);
-        ferros_sys::reply(&tok, &r);
+        if let Some(r) = modem::rmnet_call(&msg[..(n as usize).min(msg.len())], &tok) {
+            ferros_sys::reply(&tok, &r);
+        }
     }
 }
 
