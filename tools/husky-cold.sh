@@ -125,7 +125,8 @@ wait_boot() {
     t0=$(date +%s)
     while :; do
         # With FERROS_BUS set (two ferros devices on the host) only that bus counts: the other device answered at once and the slot b check ran against a Pro still booting (2026-11-10).
-        if lsusb -d 1209:4665 2>/dev/null | grep -q "^Bus 0*${FERROS_BUS:-[0-9]*} "; then
+        # FERROS_PORT (the sysfs name, e.g. 1-2.2) picks the socket when both devices share a bus behind a hub (2026-11-12).
+        if { [ -n "${FERROS_PORT:-}" ] && [ "$(cat /sys/bus/usb/devices/$FERROS_PORT/idProduct 2>/dev/null)" = 4665 ]; } || { [ -z "${FERROS_PORT:-}" ] && lsusb -d 1209:4665 2>/dev/null | grep -q "^Bus 0*${FERROS_BUS:-[0-9]*} "; }; then
             echo "== ferros on USB after $(( $(date +%s) - t0 ))s"
             return 0
         fi

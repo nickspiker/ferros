@@ -39,9 +39,16 @@ impl UsbLink {
 
     fn find() -> Result<Self, String> {
         let bus: Option<u8> = std::env::var("FERROS_BUS").ok().and_then(|v| v.parse().ok());
+        // `FERROS_PORT=<bus>-<port path>` (the sysfs name, as `lsusb -t` and /sys/bus/usb/devices show it, e.g. 1-2.2) picks one by the socket it is plugged into: with a hub both devices sit on one bus (2026-11-12, the owner's new five-port card put the Pro and the 8a on bus 1), where `FERROS_BUS` cannot tell them apart.
+        let port: Option<String> = std::env::var("FERROS_PORT").ok();
         let device = nusb::list_devices()
             .map_err(|e| format!("USB enumeration failed: {e}"))?
-            .find(|d| d.vendor_id() == FERROS_VID && d.product_id() == FERROS_PID && bus.is_none_or(|b| d.bus_number() == b))
+            .find(|d| {
+                d.vendor_id() == FERROS_VID
+                    && d.product_id() == FERROS_PID
+                    && bus.is_none_or(|b| d.bus_number() == b)
+                    && port.as_deref().is_none_or(|p| d.sysfs_path().file_name().is_some_and(|n| n == p))
+            })
             .ok_or_else(|| {
                 format!("No device found with VID={FERROS_VID:04x} PID={FERROS_PID:04x}")
             })?;
