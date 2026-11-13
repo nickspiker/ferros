@@ -44,10 +44,45 @@ const IRA: u64 = 17;
 const BT_POWER: u64 = 18;
 /// PCIe channel 1's interrupt (kernel IRQS `pcie1`, SPI 439): the slot after the last, which the kernel adds for a process granted the controller (process.rs `build_from`), so a spawn with 19 or fewer slots has none.
 const IRQ: u64 = 19;
-/// Wait on the chip's interrupt instead of a millisecond's sleep (`FERROS_WIFI_IRQ=1` builds, 2026-11-11; off, the loop sleeps 1 ms as before). Proven from source: channel 1's MSIs reach the GIC on SPI 439 thru ELBI PCIE_IRQ2 bit 17 (pcie-exynos-rc.c). Not proven without the device: that the BCM4398 raises an MSI for its completions once its mailbox mask is set at the PCIe core's G#C34 (brcmfmac pcie.c, the register set of PCIe core rev 64 and up; this core is rev 130, docs/WIFI.md). The 32 s line's `irq` counts say: wakes by the line that found frames, and frames found with no interrupt.
-const WIFI_IRQ: bool = option_env!("FERROS_WIFI_IRQ").is_some();
-/// With the interrupt, the longest wait: 2^3 of the counter's ~1 ms (freq >> 10). A backstop while the interrupt is unproven (frames it missed wait at most this long); with it proven, the controls' quarter second is the bound that matters.
-const IRQ_BACKSTOP_LOG2: u32 = 3;
+/// Wait on the chip's interrupt, never on the clock (owner, 2026-11-10: "No polling! No timers unless PROVEN necessary!"; 2026-11-13, the 8a dark at 782-859 mW with this driver waking ~1,300 times a second). Channel 1's MSIs reach the GIC on SPI 439 thru ELBI PCIE_IRQ2 bit 17 (pcie-exynos-rc.c); the chip raises one for its completions once its mailbox mask is set at the PCIe core's G#C34 (brcmfmac pcie.c, the register set of PCIe core rev 64 and up: the BCM4398's is rev 130, the BCM4383's 77). `FERROS_WIFI_IRQ=0` builds keep the millisecond's sleep; otherwise a chip that raises no MSI is found at serve start (`irq_selftest`) and served with the sleep, said on the console.
+const WIFI_IRQ: bool = match option_env!("FERROS_WIFI_IRQ") {
+    Some(v) => !(v.len() == 1 && v.as_bytes()[0] == b'0'),
+    None => true,
+};
+/// The interrupt's doorbell: counted up by `irq_thread` at each interrupt it takes. The serving loop's idle wait, and an ioctl's wait for its completion, are on this word: ended by a count that moved, a call (`wait_world_or_call`), or a preference changing (the kernel wakes every word waiter then, process.rs `write_pref_all`).
+static IRQ_RUNG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// 1 while `irq_thread` waits on the line; 0 once it took an interrupt and left the line masked, until the serving loop has cleared the latches and read its rings (`irq_arm`). One interrupt an idle spell, however many completions come while the loop is busy (Linux's NAPI does the same): under load the loop reads the rings each pass anyway.
+static IRQ_ARMED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The interrupt proven and in use (`irq_selftest` passed): `Msgbuf::ioctl` waits on it then, else it spins its millisecond as during bring-up.
+static IRQ_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `irq_thread`'s stack: it only waits and counts.
+static mut IRQ_STACK: [u8; 1 << 13] = [0; 1 << 13];
+
+/// The interrupt's thread: armed, it waits on the line with no deadline; the line's interrupt counts `IRQ_RUNG` up and wakes the serving loop, and the thread disarms itself, leaving the line masked (the kernel masks it until `irq_ack`). The loop clears the chip's and the controller's latches, acks the line and re-arms it (`irq_arm`) only when it is about to wait, after reading its rings. `cap` is the line's token. A refused wait (no such grant) counts `IRQ_RUNG` to `u64::MAX`: the loop falls back to sleeping.
+extern "C" fn irq_thread(cap: u64) -> ! {
+    use core::sync::atomic::Ordering::{Acquire, Release};
+    loop {
+        while IRQ_ARMED.load(Acquire) == 0 {
+            ferros_sys::wait_world(&IRQ_ARMED, 0, 0);
+        }
+        let r = ferros_sys::irq_wait_world(cap, 0);
+        IRQ_ARMED.store(0, Release);
+        if r == ERR {
+            IRQ_RUNG.store(u64::MAX, Release);
+        } else {
+            IRQ_RUNG.fetch_add(1, Release);
+        }
+        ferros_sys::wake(&IRQ_RUNG, 1);
+    }
+}
+
+/// The line re-armed for the next idle spell: the latches cleared (`irq_clear`), the line acked (unmasked), `irq_thread` woken to wait on it. The caller reads its rings again after this and before it waits: a completion before the clear is in them, one after raises a new interrupt.
+fn irq_arm(d: &mut Drv) {
+    irq_clear(d);
+    ferros_sys::irq_ack(d.cap(IRQ));
+    IRQ_ARMED.store(1, core::sync::atomic::Ordering::Release);
+    ferros_sys::wake(&IRQ_ARMED, 1);
+}
 const ERR: u64 = u64::MAX;
 /// BAR1's offset inside the pcie1-mem window (stage 6 places it above BAR0's 64 KiB), and its size: the 4 MiB slice of the dongle backplane that cfg G#84 selects.
 const BAR1: u64 = 0x40_0000;
@@ -1794,11 +1829,21 @@ impl Msgbuf {
         self.ring(d);
         let ts = d.now();
         while d.now().wrapping_sub(ts) < 3 * d.freq {
+            let seen = IRQ_RUNG.load(core::sync::atomic::Ordering::Acquire);
             if let Some(r) = self.pump(d) {
                 self.silent = 0;
                 return Some(r);
             }
-            d.us(1000);
+            if IRQ_ON.load(core::sync::atomic::Ordering::Relaxed) {
+                // With the interrupt (serving): the completion's MSI ends the wait, the ioctl's 3 s the deadline (the firmware's own answer time, dhd's IOCTL_RESP_TIMEOUT order). The line re-armed first if it is not, and the ring read again before any wait.
+                if IRQ_ARMED.load(core::sync::atomic::Ordering::Acquire) == 0 {
+                    irq_arm(d);
+                    continue;
+                }
+                ferros_sys::wait(&IRQ_RUNG, seen, ts + 3 * d.freq);
+            } else {
+                d.us(1000);
+            }
         }
         d.put(b"no ioctl completion\n");
         self.silent += 1;
@@ -2174,13 +2219,21 @@ struct Path {
     irq_rx: u32,
     other_rx: u32,
     rings: u32,
+    /// How the idle waits ended besides the interrupt: a call (an application's request), the deadline (the measures' 2 s while the screen is on), anything else (a preference changed).
+    by_call: u32,
+    by_deadline: u32,
+    by_other: u32,
+    /// The line re-armed (`irq_arm`): once an idle spell at most.
+    arms: u32,
 }
 
 impl Path {
     /// One line: `rx path, last 32 s: A#<n> passes (A#<n> slept), rings read in A#<us> us a pass; A#<n> exchanges, A#<n> single frames; to ip A#<n> frames (most A#<n> an exchange, copied in A#<ns> ns each, waited A#<us> us on average, A#<us> us most, A#<n> most queued); from ip A#<n> frames, A#<n> refused`. Said only when frames moved, so after a request, so after a pass: `passes` is not zero.
-    fn say(&self, d: &mut Drv) {
+    fn say(&self, d: &mut Drv, ms: u64) {
         let f = d.freq;
-        d.put(b"rx path, last 32 s: ");
+        d.put(b"rx path, last A#");
+        d.dec(ms as u32);
+        d.put(b" ms: ");
         d.dec(self.passes);
         d.put(b" passes (");
         d.dec(self.sleeps);
@@ -2222,6 +2275,14 @@ impl Path {
             d.dec(self.irq_rx);
             d.put(b" with new frames; new frames with no irq ");
             d.dec(self.other_rx);
+            d.put(b"; waits ended by a call ");
+            d.dec(self.by_call);
+            d.put(b", the deadline ");
+            d.dec(self.by_deadline);
+            d.put(b", else ");
+            d.dec(self.by_other);
+            d.put(b"; armed ");
+            d.dec(self.arms);
         }
         d.put(b"\n");
     }
@@ -2241,13 +2302,39 @@ fn irq_clear(d: &mut Drv) {
     }
 }
 
+/// The interrupt proven before the loop relies on it: `irq_thread` started and armed, then one ioctl (`allmulti` 1: all multicast in, as IPv6 neighbour discovery lives on 33:33:… groups) waited for by the clock as during bring-up; its completion must have raised an interrupt within 2^4 of the counter's ~1 ms after it was seen (the MSI is posted after the completion's write). True: the loop waits on the line. False: no thread, no interrupt from this chip (a mailbox mask not where brcmfmac puts it, an MSI not routed), said on the console, and the loop sleeps a millisecond between passes as before.
+fn irq_selftest(d: &mut Drv, m: &mut Msgbuf) -> bool {
+    use core::sync::atomic::Ordering::Acquire;
+    // SAFETY: the stack is this thread's alone, started once (`serve` runs once a process: a lost link ends the driver).
+    let stack = unsafe { &mut *(&raw mut IRQ_STACK) };
+    if ferros_sys::thread_spawn(irq_thread, stack, d.cap(IRQ)) == ERR {
+        d.put(b"irq: no thread: sleeping a millisecond between passes\n");
+        d.flush();
+        let r = m.set_int(d, b"allmulti", 1);
+        d.kv(b"allmulti", r);
+        return false;
+    }
+    irq_arm(d);
+    let rung0 = IRQ_RUNG.load(Acquire);
+    let t0 = d.now();
+    let r = m.set_int(d, b"allmulti", 1);
+    d.kv(b"allmulti", r);
+    let t1 = d.now();
+    while IRQ_RUNG.load(Acquire) == rung0 && d.now().wrapping_sub(t1) < (d.freq >> 10) << 4 {
+        core::hint::spin_loop();
+    }
+    let rung = IRQ_RUNG.load(Acquire);
+    let ok = rung != rung0 && rung != u64::MAX;
+    d.kv(b"irq: self-test ioctl answered in us", (t1.wrapping_sub(t0) * 1_000_000 / d.freq) as u32);
+    d.put(if ok { b"irq: the chip's completion raised SPI 439: waiting on the line, no timer\n".as_slice() } else { b"irq: the chip's completion raised no interrupt: sleeping a millisecond between passes\n" });
+    d.flush();
+    ok
+}
+
 fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     if !flowring(d, m) {
         return;
     }
-    // All multicast in: IPv6 neighbour discovery lives on 33:33:… groups.
-    let r = m.set_int(d, b"allmulti", 1);
-    d.kv(b"allmulti", r);
     // Checksum offload: the firmware fills transmit checksums only with extended (56-byte) tx items, offered by pcie_shared flags2 bit G#40_0000 (TXPOST_EXT); receive completions flag G#800 when it verified a checksum.
     let f2 = d.tcm_rd(sh + 80);
     d.kv(b"shared flags2", f2);
@@ -2257,8 +2344,8 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     d.put(b"serving wlan\n");
     d.flush();
     enable_l1ss(d);
-    // The chip's interrupt (`WIFI_IRQ` builds with the line granted): the root complex's MSI receiver onto the controller's line, the chip's completions onto MSI.
-    let mut irq = WIFI_IRQ && unsafe { core::ptr::read_volatile((d.base + d.grants + 0x200) as *const u32) } as u64 > IRQ;
+    // The chip's interrupt (the line granted): the root complex's MSI receiver onto the controller's line, the chip's completions onto MSI, the interrupt's thread started, then proven by an ioctl's completion (`irq_selftest`).
+    let irq = WIFI_IRQ && unsafe { core::ptr::read_volatile((d.base + d.grants + 0x200) as *const u32) } as u64 > IRQ;
     if irq {
         irq_clear(d);
         // ELBI PCIE_IRQ2_EN bit 17 (IRQ_MSI_CTRL_EN_RISING_EDG): an MSI raises SPI 439 (pcie-exynos-rc.c exynos_pcie_rc_msi_init, channel 1 having no separate MSI lines). The A1 step zeroed every enable; the MSI receiver itself (DBI G#820-G#82C) is set since the firmware's download.
@@ -2272,9 +2359,20 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     } else if WIFI_IRQ {
         d.put(b"irq: no interrupt grant (fewer than 20 slots): sleeping a millisecond between passes\n");
     }
+    let mut irq = if irq {
+        irq_selftest(d, m)
+    } else {
+        // All multicast in: IPv6 neighbour discovery lives on 33:33:… groups.
+        let r = m.set_int(d, b"allmulti", 1);
+        d.kv(b"allmulti", r);
+        false
+    };
+    IRQ_ON.store(irq, core::sync::atomic::Ordering::Relaxed);
+    // The screen's state as last looked at (the preference block, a memory read): with it on, the corners' measures every 2 s; off, none.
+    let mut dark_now = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
     // The doorbell (`wlan` op 9): the reply token of a call held until frames wait.
     let mut ring: Option<[u8; 32]> = None;
-    // How the last wait ended: 0 not waited (a request was served), 1 the interrupt, 2 anything else (the backstop, a call).
+    // How the last wait ended: 0 not waited (a request was served), 1 the interrupt, 2 a call, 3 the deadline, 4 anything else (a preference changed, the kernel waking every word waiter).
     let mut woke = 0u8;
     // The link's power state as the PHY reports it (PCS G#188 bits 2:0: 0 L0, 2 L1, 5 L1.1, 6 L1.2; read without waking the link), sampled each pass and said every 32 s.
     let mut lstates = [0u32; 8];
@@ -2295,32 +2393,43 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     // The link this join made, watched while serving (`pump` reads the firmware's events): a join's own failures are behind it.
     let was_linked = m.linked;
     m.join_failed = false;
-    // The control block (docs/RADIO-CONTROLS.md), looked at four times a second with the screen's state: a generation moved since the last look is a knob set, a screen change moves an unset power save. None: not looked at yet, so the first look applies what is kept.
+    // The control block (docs/RADIO-CONTROLS.md) with the screen's state: a generation moved since the last look is a knob set, a screen change moves an unset power save. None: not looked at yet, so the first look applies what is kept. The screen is a memory read, looked at every pass; the block is a syscall, looked at after a wait no interrupt or call ended (a preference or a knob changed: the kernel wakes every word waiter then) and at most every quarter second while passes run back to back. No timer brings a look: with the line idle the loop sleeps until something happens.
     let mut control_at = 0u64;
     let mut control_gen: Option<u64> = None;
-    let mut dark_was = false;
+    let mut dark_was = !dark_now;
     loop {
         // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
         ferros_sys::pet();
-        if d.now().wrapping_sub(control_at) >= d.freq / 4 {
+        // The interrupt's count before the rings are read: an interrupt taken while this pass runs ends its wait at once.
+        let seen = IRQ_RUNG.load(core::sync::atomic::Ordering::Acquire);
+        dark_now = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
+        if dark_now != dark_was || woke == 4 || d.now().wrapping_sub(control_at) >= d.freq / 4 {
             control_at = d.now();
             let c = ferros_sys::controls(ferros_sys::control::WIFI);
-            let dark = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
-            if control_gen != Some(c[0]) || dark != dark_was {
+            if control_gen != Some(c[0]) || dark_now != dark_was {
+                // The screen back on: the corners' measures at once, not 2 s later.
+                if !dark_now && dark_was {
+                    status_at = 0;
+                }
                 control_gen = Some(c[0]);
-                dark_was = dark;
-                apply_controls(m, d, &c, dark);
+                dark_was = dark_now;
+                apply_controls(m, d, &c, dark_now);
             }
         }
-        if d.now().wrapping_sub(status_at) >= 2 * d.freq {
+        // The corners' measures only while someone can see them: none with the screen off, where they were 2 s wakes and five ioctls for nobody.
+        if !dark_now && d.now().wrapping_sub(status_at) >= 2 * d.freq {
             status_at = d.now();
             publish_measures(m, d, &mut pkts);
         }
         let ls = d.rd(PCS, 0x188) & 7;
         lstates[ls as usize] += 1;
         if d.now().wrapping_sub(lstates_at) >= 32 * d.freq {
+            // The span since the last line: 32 s or more, as no timer brings a pass.
+            let ms = d.now().wrapping_sub(lstates_at) * 1000 / d.freq;
             lstates_at = d.now();
-            d.put(b"link states, last 32 s (PCS G#188 2:0 = 0 L0, 2 L1, 5 L1.1, 6 L1.2):");
+            d.put(b"link states, passes in the last A#");
+            d.dec(ms as u32);
+            d.put(b" ms (PCS G#188 2:0 = 0 L0, 2 L1, 5 L1.1, 6 L1.2):");
             for (k, n) in lstates.iter().enumerate() {
                 if *n > 0 {
                     d.put(b" ");
@@ -2330,8 +2439,8 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
                 }
             }
             d.put(b"\n");
-            if path.to_ip + path.from_ip > 0 {
-                path.say(d);
+            if path.to_ip + path.from_ip > 0 || irq {
+                path.say(d, ms);
             }
             d.flush();
             lstates = [0; 8];
@@ -2363,7 +2472,7 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
         // New frames after a wake: announced by the interrupt, or found without one.
         if m.rxq_len > rx0 {
             path.irq_rx += (woke == 1) as u32;
-            path.other_rx += (woke == 2) as u32;
+            path.other_rx += (woke >= 2) as u32;
         }
         woke = 0;
         // WHY the max: the high water, for the measure.
@@ -2379,24 +2488,38 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
         let n = svc(2, d.cap(WLAN), msg.as_mut_ptr() as u64 - d.base, msg.len() as u64, tok.as_mut_ptr() as u64 - d.base, 1);
         if n == u64::MAX - 1 || n == ERR {
             // No request: a millisecond's sleep, not a spinning core (the driver runs from boot since init starts it, 2026-10-26), frames waiting or not. A call ends the sleep at once (the kernel wakes a polling server asleep between polls), so waiting frames lose nothing by it. Until 2026-11-11 the loop spun while frames waited, and with every worker core busy it spun thru whole 10 ms slices of poll misses while the IP stack, the one process that would take them, waited for a core (`diag sched`).
-            path.sleeps += 1;
             if irq {
-                // Or, with the interrupt, a wait on the chip: ended by its MSI (0), a call or the backstop (2). A line that fired since the last wait answers at once.
-                match ferros_sys::irq_wait_world(d.cap(IRQ), d.now() + ((d.freq >> 10) << IRQ_BACKSTOP_LOG2)) {
-                    0 => {
-                        path.irq_wakes += 1;
-                        woke = 1;
-                        irq_clear(d);
-                        ferros_sys::irq_ack(d.cap(IRQ));
-                    }
-                    ERR => {
-                        // Not an interrupt grant after all: the sleep from here on.
-                        irq = false;
-                        d.put(b"irq: the wait was refused: sleeping a millisecond between passes\n");
-                    }
-                    _ => woke = 2,
+                use core::sync::atomic::Ordering::Acquire;
+                // With the interrupt (2026-11-13): the line re-armed first if the last interrupt left it masked, and the rings read once more before any wait (`irq_arm`).
+                if IRQ_ARMED.load(Acquire) == 0 {
+                    path.arms += 1;
+                    irq_arm(d);
+                    continue;
                 }
+                path.sleeps += 1;
+                // Then a wait on nothing but what brings work: the interrupt's count moving (1, or 0 when it moved during the wait), a call (3), a preference changing (0, the count unmoved). The one deadline is the corners' measures while the screen is on; none in the dark.
+                let until = if dark_now { 0 } else { status_at + 2 * d.freq };
+                let r = ferros_sys::wait_world_or_call(&IRQ_RUNG, seen, until);
+                let rung = IRQ_RUNG.load(Acquire);
+                woke = match r {
+                    _ if rung == u64::MAX => {
+                        // The thread's wait refused: not an interrupt grant after all, the sleep from here on.
+                        irq = false;
+                        IRQ_ON.store(false, core::sync::atomic::Ordering::Relaxed);
+                        d.put(b"irq: the wait was refused: sleeping a millisecond between passes\n");
+                        4
+                    }
+                    0 | 1 if rung != seen => 1,
+                    3 => 2,
+                    2 => 3,
+                    _ => 4,
+                };
+                path.irq_wakes += (woke == 1) as u32;
+                path.by_call += (woke == 2) as u32;
+                path.by_deadline += (woke == 3) as u32;
+                path.by_other += (woke == 4) as u32;
             } else {
+                path.sleeps += 1;
                 ferros_sys::sleep_until(ferros_sys::now() + d.freq / 1000);
             }
             continue;
