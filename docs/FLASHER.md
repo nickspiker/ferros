@@ -13,6 +13,7 @@ This is the plan, shelved on 2026-11-10 to be picked up whole. The targets are t
 4. The tool backs up the phone's own calibration before it writes anything, and keeps the backup on the computer. This step is not optional.
 5. Download and flash: the tool fetches the signed ferros images, checks each against its BLAKE3, carves the partition table, flashes, provisions, and turns pKVM off (again after any wipe).
 6. First boot: the tool waits for ferros on USB and checks it answers, then hands the phone over to the attest screen.
+7. **Re-lock, the default** (owner, 2026-11-13: "3 is required"): the tool sets up the ferros key as the bootloader's custom key and walks the person through `flashing lock` on the phone's own screen, their own act (the tool never runs it: "Claude memories/feedback_lock_prep_not_lock.md"). Leaving it unlocked is an explicit choice, and the tool says what it exposes: the device's ID (the ira) has no papers, so while unlocked anyone holding the phone can boot their own image, derive it, and read the device's settings, stowed kists and cached wallpaper; the person's identity, their people and anything of the fleet stay closed without the identity. ferros shows the lock state afterwards (a settings line, never a nag).
 
 ## What exists today (2026-11-10)
 
