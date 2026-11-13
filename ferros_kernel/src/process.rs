@@ -6508,6 +6508,10 @@ fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<us
     let us = |a: u64, b: u64| b.wrapping_sub(a) * 1_000_000 / crate::platform::cntfrq();
     let t_end = crate::platform::cntpct();
     let kk = k();
+    // On a line of its own: a process's line still open (no newline yet) is broken here rather than run into.
+    if kk.console.last().is_some_and(|&c| c != b'\n') {
+        kk.console.push(b'\n');
+    }
     kk.console.extend_from_slice(b"t");
     push_dec(&mut kk.console, t_end / (crate::platform::cntfrq() / 1000));
     kk.console.extend_from_slice(b" kernel: spawned ");
