@@ -34,6 +34,40 @@ pub struct Goodix {
     point_len: usize,
     /// The contacts on the glass at the last frame, a bit per id.
     down: u16,
+    /// What the line and the frames did since this process started (measuring, 2026-11-12: whether the AoC's own touch driver, `/dev/gtx/0` in akita's sensor registry, contends for the controller; `report`).
+    stats: Stats,
+}
+
+/// The frame path's counts, each since this process started.
+#[derive(Default)]
+struct Stats {
+    /// Passes on which the line had fired (or was still low).
+    fired: u32,
+    /// Heads read as zero: nothing left at the touch-data address, the buffer already handed back.
+    empty: u32,
+    /// Frame reads whose SPI transfer failed.
+    read_fail: u32,
+    /// Heads whose checksum failed (all zeroes past the first byte or all ones count here: what a bus that is not ours reads as).
+    bad_head: u32,
+    /// Heads with a good checksum and no touch bit in the type nibble.
+    not_touch: u32,
+    /// Heads that said more than `MAX_TOUCH` contacts.
+    too_many: u32,
+    /// Point blocks whose checksum failed.
+    bad_points: u32,
+    /// Good touch frames.
+    good: u32,
+    /// Every nonzero head read, by its type nibble (`h[0] >> 4`).
+    types: [u32; 16],
+    /// Contacts that entered and left.
+    contacts: u32,
+}
+
+impl Stats {
+    /// The frames that went wrong, every kind together.
+    fn wrong(&self) -> u32 {
+        self.empty + self.read_fail + self.bad_head + self.not_touch + self.too_many + self.bad_points
+    }
 }
 
 /// Read `out.len()` bytes from `addr`, a transfer per CHUNK.
@@ -141,28 +175,59 @@ pub fn bring_up(p: &Port, grants: u64, power: u64) -> Option<Goodix> {
     if touch_data == 0 || point_len < 8 || point_len > POINT_MAX {
         return None;
     }
-    Some(Goodix { touch_data, point_len, down: 0 })
+    Some(Goodix { touch_data, point_len, down: 0, stats: Stats::default() })
 }
 
 impl Goodix {
     /// Read the frame the controller left, turn it into enter / move / leave against the last one, and hand the buffer back.
+    /// The counts go to the console when the last finger lifts, and when the frames that went wrong reach a power of two (1, 2, 4, …: bounded however many there are, and none of it on a timer).
     pub fn frame(&mut self, p: &Port, t: &mut Table) {
+        let before = self.stats.wrong();
+        self.take(p, t);
+        let after = self.stats.wrong();
+        if after != before && after.is_power_of_two() {
+            self.report(p.grants);
+        }
+    }
+
+    fn take(&mut self, p: &Port, t: &mut Table) {
+        self.stats.fired += 1;
         let mut h = [0u8; HEAD];
-        if !read(p, self.touch_data, &mut h) || h[0] == 0 {
+        if !read(p, self.touch_data, &mut h) {
+            self.stats.read_fail += 1;
             return;
         }
+        if h[0] == 0 {
+            self.stats.empty += 1;
+            return;
+        }
+        self.stats.types[(h[0] >> 4) as usize] += 1;
         let mut now = 0u16;
         let mut seen = [Contact::default(); MAX_TOUCH];
-        let mut good = checksum_ok(&h) && (h[0] >> 4) & TYPE_TOUCH != 0;
+        let head_ok = checksum_ok(&h);
+        let mut good = head_ok && (h[0] >> 4) & TYPE_TOUCH != 0;
+        if !head_ok {
+            self.stats.bad_head += 1;
+        } else if !good {
+            self.stats.not_touch += 1;
+        }
         let touches = (h[2] & 0x0F) as usize;
         // WHY: the count is the controller's word and sizes the read below; the driver ignores ids past GOODIX_MAX_TOUCH the same way.
         if good && touches > MAX_TOUCH {
+            self.stats.too_many += 1;
             good = false;
         }
         if good && touches > 0 {
             let n = touches * self.point_len + 2;
             let mut d = [0u8; MAX_TOUCH * POINT_MAX + 2];
-            good = read(p, self.touch_data + HEAD as u32, &mut d[..n]) && checksum_ok(&d[..n]);
+            let got = read(p, self.touch_data + HEAD as u32, &mut d[..n]);
+            if !got {
+                self.stats.read_fail += 1;
+            }
+            good = got && checksum_ok(&d[..n]);
+            if got && !good {
+                self.stats.bad_points += 1;
+            }
             if good {
                 for r in d[..n - 2].chunks_exact(self.point_len) {
                     let id = (r[0] >> 4) as usize;
@@ -189,6 +254,7 @@ impl Goodix {
         if !good {
             return;
         }
+        self.stats.good += 1;
         for id in 0..MAX_TOUCH {
             let (was, is) = (self.down >> id & 1 == 1, now >> id & 1 == 1);
             if is {
@@ -197,9 +263,22 @@ impl Goodix {
                 t.push(c);
             } else if was {
                 t.leave(id);
+                self.stats.contacts += 1;
             }
         }
+        let lifted = self.down != 0 && now == 0;
         self.down = now;
+        if lifted {
+            self.report(p.grants);
+        }
+    }
+
+    /// The counts since this process started as one console line (see `frame` for when): a hand test reads off the console.
+    fn report(&self, grants: u64) {
+        let s = &self.stats;
+        // The type nibbles seen, a bit each (the line holds 160 bytes).
+        let seen = s.types.iter().enumerate().fold(0u16, |m, (i, &n)| if n != 0 { m | 1 << i } else { m });
+        say!(grants, "touch: A#{} lifts, A#{} fired, A#{} good, A#{} empty, A#{} spi fail, A#{} bad head, A#{} not touch, A#{} >10, A#{} bad points, types G#{:X}\n", s.contacts, s.fired, s.good, s.empty, s.read_fail, s.bad_head, s.not_touch, s.too_many, s.bad_points, seen);
     }
 }
 
