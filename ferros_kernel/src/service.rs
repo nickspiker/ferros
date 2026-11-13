@@ -1834,6 +1834,9 @@ pub fn run(mut b: Boot) -> ! {
     }
     let mut home_started = !matches!(b.kind, BootKind::Cold);
     let t_boot = cntpct();
+    // The jumped session's 60 s note, written once (below, in the loop).
+    #[cfg(not(ferros_production))]
+    let mut escape_noted = false;
     let exc_start = crate::exception_count();
     platform::mark(0x34);
 
@@ -2429,10 +2432,16 @@ pub fn run(mut b: Boot) -> ! {
             }
             asleep += slept;
         }
-        // Development, while the jump from Android is brought up: a jumped session that the host has not reached in 60 s (no command from the USB process) leaves a note and resets warm, so the next boot reads its whole log from the pstore ring (tools/husky-pstore.sh). The killswitch, the only other way out of such a session, powers off and the log decays with the RAM (the twenty-seventh jump, 2026-11-02: ferros up, its killswitch armed, no USB, the screen still Android's).
+        // Development: a jumped session that the host has not reached in 60 s (no command from the USB process) leaves a note, once, and runs on.
+        // Until 2026-11-13 it also reset, so the next boot could read the pstore ring (the twenty-seventh jump, 2026-11-02: ferros up, no USB, the screen still Android's).
+        // That reset was the owner's "works for a minute or two, then reboots" (2026-11-13, the Pro, boot b863): every jump nobody talked to over USB within 60 s ended there, about 57 s after the jump's first flash-log line.
+        // And it kept nothing: after a jump the bootloader read the reset as a crash (RST_STAT PIN_RESET, reason G#CECA), ran its debug-dump stage (about 9 s in BL2) and power-cycled (PIN_RESET | PO_RESET), so DRAM decayed and the pstore ring and the report page with it.
+        // The flash log on UFS is what survives now, so the note goes there too.
         #[cfg(not(ferros_production))]
-        if platform::from_android() && st.proc_cmds == 0 && cntpct().wrapping_sub(t_boot) > 60 * cntfrq() {
-            platform::pstore(b"ferros: the jump's session: no host in 60 s, resetting warm to keep this log\n");
+        if !escape_noted && platform::from_android() && st.proc_cmds == 0 && cntpct().wrapping_sub(t_boot) > 60 * cntfrq() {
+            escape_noted = true;
+            crate::flashlog::line(&alloc::format!("jump: no host in 60 s (USB process commands 0); workers up G#{:X}, x3 parked {}; running on, the thread report in the pstore ring", crate::smp::up_mask(), crate::x3::parked()));
+            platform::pstore(b"ferros: the jump's session: no host in 60 s, running on\n");
             // Every thread and where it waits, so the log says what the session was stuck on (the twenty-ninth jump: the display server and the attest screen ran, init, touch and USB printed nothing).
             let mut threads = alloc::vec::Vec::new();
             crate::process::threads_report(&mut threads);
@@ -2452,8 +2461,7 @@ pub fn run(mut b: Boot) -> ! {
                 let r = |o: usize| unsafe { core::ptr::read_volatile((base + o) as *const u64) };
                 platform::pstore(alloc::format!("{}: mair G#{:X} tcr G#{:X} ttbr G#{:X} sctlr G#{:X} hcr G#{:X} vbar G#{:X} cptr G#{:X} stack G#{:X} cnthctl G#{:X}\n", name, r(0), r(8), r(16), r(24), r(32), r(40), r(48), r(56), r(88)).as_bytes());
             }
-            platform::pstore(&crate::process::take_console());
-            platform::reboot();
+            // The console is not drained into the ring any more: the session runs on, and `diag console` is the host's when it comes.
         }
         // A command the USB process handed over (ptlink.rs, USB.md): the one dispatch below. Its handlers end with `continue`, so what follows — the raw reply handed back — runs at the top of the next pass (`proc_restore`).
         if proc_restore.is_some() {

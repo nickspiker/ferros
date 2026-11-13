@@ -2036,6 +2036,12 @@ impl Dwc3Dev {
 
     /// Connected speed: DSTS.CONNECTSPD at the last connect, 0 high speed, 1 full, 2 low, 4 SuperSpeed, 5 SuperSpeed Plus.
     pub fn connected_speed(&self) -> u32 { self.connected_speed }
+
+    /// DCTL, DSTS, GSTS and DCFG as they read now: what a driver that never got configured leaves for the log (the jump of 2026-11-13: not configured after four tries, nothing said why).
+    pub fn regs(&self) -> [u32; 4] {
+        let r = |o: usize| unsafe { mmio::read32(dwc3_base() + o) };
+        [r(DCTL), r(DSTS), r(GSTS), r(DCFG)]
+    }
 }
 
 // ---------------------------------------------------------------------------
