@@ -1670,6 +1670,8 @@ static GOV_DECAY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32:
 static GOV_AVG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
 static GOV_GPU: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(128);
 static GOV_RAMP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
+/// The operating points under the top that input boosts a cluster to (`diag clock boost <n>`; 0, the top: a finger gets the whole core at once).
+static GOV_BOOST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// The window's start, the input last seen (`INPUT_AT`), the GPU calls at the window's start and their average a window (256ths), the windows looked at, and the shared tier's ticks in each state (`res` for the tiers).
 static mut GOV_AT: u64 = 0;
 static mut GOV_INPUT: u64 = 0;
@@ -1745,8 +1747,11 @@ fn governor(now: u64, f: u64, boost: bool) -> bool {
         if boost {
             let up = crate::smp::UP.load(Relaxed);
             for g in govs.iter_mut().filter(|g| g.cores == 0 || g.cores & up != 0) {
-                g.level = g.opps[g.opps.len() - 1];
-                gov_ask(g, g.opps.len() - 1, f);
+                let b = boost_at(g);
+                if g.at < b {
+                    g.level = g.opps[b];
+                    gov_ask(g, b, f);
+                }
             }
         }
         return tier_active(govs);
@@ -1771,23 +1776,26 @@ fn governor(now: u64, f: u64, boost: bool) -> bool {
         g.last = share;
         g.avg = g.avg - (g.avg >> avg_s) + (share >> avg_s);
         g.sat = if share >= 224 { g.sat + 1 } else { 0 };
-        let (top, rate) = (g.opps[g.opps.len() - 1], g.opps[g.at]);
+        let rate = g.opps[g.at];
         // The rate that would leave the averaged share at 4/5: the running rate × the average × 5/4, in 256ths of the share.
         let want = (rate as u64 * g.avg as u64 * 5 >> 10) as u32;
         // A saturated window: the load wants more than this rate and how much more is unknown, so the level goes at least a step of the ramp past the rate (`GOV_RAMP` 2: a quarter, 500 MHz to the X3's top in eight windows; 0: double, in three).
         let ramp = rate + (rate >> ramp_s);
         let want = if g.sat != 0 && ramp > want { ramp } else { want };
-        g.level = if boost {
-            top
-        } else if want >= g.level {
-            want
-        } else {
-            g.level - ((g.level - want) >> decay_s)
-        };
+        g.level = if want >= g.level { want } else { g.level - ((g.level - want) >> decay_s) };
+        if boost && g.level < g.opps[boost_at(g)] {
+            g.level = g.opps[boost_at(g)];
+        }
         let at = g.opps.iter().position(|&o| o >= g.level).unwrap_or(g.opps.len() - 1);
         gov_ask(g, at, f);
     }
     tier_active(govs)
+}
+
+/// The operating point input boosts a cluster to: `GOV_BOOST` points under its top (0: the top).
+fn boost_at(g: &Gov) -> usize {
+    // WHY the saturating subtraction: the knob is the bridge's number, and one larger than the table would index below its first point; it then means the floor.
+    (g.opps.len() - 1).saturating_sub(GOV_BOOST.load(core::sync::atomic::Ordering::Relaxed) as usize)
 }
 
 /// A cluster to operating point `at`, if it is not there: the request under the thermal cap, then a rate read, which the firmware answers only once the request is done (`clock_profile`, why).
@@ -1934,7 +1942,7 @@ fn clock_profile(want: u8) {
 }
 
 /// `diag clock`: the adaptive clock's state (each cluster's rate, level, busy shares and time at each operating point), the tiers' time, and the touch-to-frame measure (process.rs `INPUT_TO_FRAME`).
-/// `diag clock reset` zeroes the times and the measure; `diag clock gov on|off`; `diag clock win|decay|avg|ramp|gpu|frames <n>` sets a knob (`GOV_WIN`).
+/// `diag clock reset` zeroes the times and the measure; `diag clock gov on|off`; `diag clock win|decay|avg|ramp|boost|gpu|frames <n>` sets a knob (`GOV_WIN`).
 fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
     use core::sync::atomic::Ordering::Relaxed;
     let words: alloc::vec::Vec<&[u8]> = params.split(|&b| b == b' ').filter(|w| !w.is_empty()).collect();
@@ -1968,6 +1976,7 @@ fn clock_diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         (Some(b"gpu"), Some(n)) => GOV_GPU.store(n as u64, Relaxed),
         (Some(b"frames"), Some(n)) => GOV_SHOWN.store(n as u64, Relaxed),
         (Some(b"ramp"), Some(n)) => GOV_RAMP.store(n, Relaxed),
+        (Some(b"boost"), Some(n)) => GOV_BOOST.store(n, Relaxed),
         _ => {}
     }
     let ms = |t: u64| t * 1000 / f;
