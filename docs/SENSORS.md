@@ -137,6 +137,8 @@ ferros brings the sensors up by itself, 4 s into the service loop, a step a pass
 
 The AoC's own log is readable: `diag aoc log` drains the firmware's `logging` ring (256 × 128 bytes, full from boot until read), and it names what each driver is waiting for.
 
+**The doorbell (2026-11-12).** The AoC rings the AP on a service's mailbox channel when it writes it a message: com.google.usf on channel 1, its non-wake-up twin on channel 13, both on mailbox block a32 (G#1520_0000), whose AoC-to-AP line is SPI 77 (zuma-aoc.dtsi `mbox_aoc_a32`, level high). The kernel hands that line (`aoc-mbox-a32`) to whoever holds the Sensors right, as the slot after its last (process.rs, as pcie1's line goes with its controller: init's grants page is full). The sensors process unmasks the two channels in INTMR1 (masking the block's other fourteen), and a second thread waits on the line, clears INTSR1 through INTCR1, acknowledges it and bumps a word; the loop and every reply wait on that word (`ferros_sys::wait`, which a preference change also ends, so the screen state and the light scope still follow at once). Before, the loop woke every 2 ms to look: some 450 to 530 wakes a second on the 8a, whatever came. Seen on the 8a's cold boot: `usf: doorbell on block a32, channels G#2002`, the loop waiting on its word and the second thread on INTID 109, gravity streaming. Without the line (a kernel from before), the waits stay timed at 2 ms and the console says so.
+
 `diag usf` shows the rails, the stream's counters and the last vector; `diag usf reg <path>` reads a registry node; `diag usf raw <handle> <type>` sends a bare request and dumps the replies; `diag aoc services` lists the AoC's 94 services.
 
 ## SoC temperature (TMU over ACPM) — working 2026-10-23

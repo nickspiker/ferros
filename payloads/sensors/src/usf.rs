@@ -6,7 +6,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use ferros_sys::sensor_block as sb;
-use ferros_sys::{cap, freq, mmio_write, now};
+use ferros_sys::{cap, freq, mmio_read, mmio_write, now};
 
 /// ferros's channel on com.google.usf (the HAL used 6 and 7; the kernel uses this same one, so taking the conversation over closes its subscriptions).
 const CHAN: u32 = 2;
@@ -94,6 +94,78 @@ fn region(h: usize, dir: usize) -> usize {
 fn mbox_signal(idx: u32) {
     let block = MBOX_BLOCKS[(idx / 16) as usize % 3];
     mmio_write(cap(unsafe { G }, crate::S_MBOX), block + MB_INTGR0, 1 << (idx % 16));
+}
+
+// ── The doorbell: the AoC rings the AP on a service's mailbox channel when it writes it a message (wc.c, the AoC-to-AP side of block a32, SPI 77) ──
+/// The AP's side of a block (payloads/audio aoc.rs, wc.c:100-166): INTCR1 clears what the AoC rang, INTMR1 masks it (a set bit masked), INTSR1 reads it.
+const MB_INTCR1: u64 = 0x44;
+const MB_INTMR1: u64 = 0x48;
+const MB_INTSR1: u64 = 0x4C;
+/// Bumped by the doorbell thread each time the line fires; the loop and `reply` wait on it (ferros_sys::wait: a futex, which a preference change also ends).
+pub static RUNG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Whether the kernel gave the line (its slot after the Sensors right's, process.rs): without it, a kernel from before 2026-11-12, the waits stay timed.
+static mut DOORBELL: bool = false;
+/// The doorbell thread's stack.
+const BELL_STACK: usize = 1 << 14;
+#[repr(C, align(16))]
+struct BellStack([u8; BELL_STACK]);
+static mut BSTACK: BellStack = BellStack([0; BELL_STACK]);
+
+/// The usf services' channels on block a32 unmasked (every other one of its sixteen masked: no other process takes this line), and the thread that turns the line into `RUNG` started. False when there is no line to wait on, or a service's channel is off a32 (said in `out`).
+fn doorbell_start(out: &mut String) -> bool {
+    let line = cap(unsafe { G }, crate::S_DOORBELL);
+    // A deadline already past: 2 (or 0, pending) from a line this process holds, ERR from a slot it was not given.
+    if ferros_sys::irq_wait(line, 1) == ferros_sys::ERR {
+        out.push_str("usf: no AoC mailbox line from the kernel; the loop looks every 2 ms\n");
+        return false;
+    }
+    let mut channels = 0u32;
+    for k in 0..2 {
+        let h = unsafe { SVC[k] };
+        if h == 0 {
+            continue;
+        }
+        let ch = (rd32(h + 32) >> 19) & 0x1F;
+        if ch >= 16 {
+            let _ = writeln!(out, "usf: service {k} rings channel A#{ch}, off block a32; the loop looks every 2 ms");
+            return false;
+        }
+        channels |= 1 << ch;
+    }
+    let g = cap(unsafe { G }, crate::S_MBOX);
+    mmio_write(g, MB_INTCR1, channels);
+    mmio_write(g, MB_INTMR1, !channels & 0xFFFF);
+    let stack = unsafe { &mut (*(&raw mut BSTACK)).0 };
+    if ferros_sys::thread_spawn(bell, stack, line) == ferros_sys::ERR {
+        out.push_str("usf: the doorbell thread did not start; the loop looks every 2 ms\n");
+        return false;
+    }
+    let _ = writeln!(out, "usf: doorbell on block a32, channels G#{channels:X}");
+    unsafe { DOORBELL = true };
+    true
+}
+
+/// The doorbell thread: the line fires, what the AoC rang is cleared, the line is acknowledged, and `RUNG` moves and wakes whoever waits on it. It touches nothing else: the conversation is the loop's alone.
+extern "C" fn bell(line: u64) -> ! {
+    let g = cap(unsafe { G }, crate::S_MBOX);
+    loop {
+        ferros_sys::irq_wait(line, 0);
+        let st = mmio_read(g, MB_INTSR1) as u32 & 0xFFFF;
+        mmio_write(g, MB_INTCR1, st);
+        ferros_sys::irq_ack(line);
+        RUNG.fetch_add(1, core::sync::atomic::Ordering::Release);
+        ferros_sys::wake(&RUNG, 1);
+    }
+}
+
+/// Until the AoC rings after `seen` (RUNG's value before the last drain), a preference changes, or `deadline` (0: none); the watchdog paused, as the wait is on the world. Without the line, 2 ms or the deadline, whichever first: a kernel from before the doorbell.
+pub fn wait_ring(seen: u64, deadline: u64) {
+    if unsafe { DOORBELL } {
+        ferros_sys::wait_world(&RUNG, seen, deadline);
+    } else {
+        let t = now() + freq() / 512;
+        ferros_sys::sleep_until(if deadline != 0 && deadline < t { deadline } else { t });
+    }
 }
 
 /// One message onto a queue service's DOWN ring (AP->AoC), then the AoC signalled: an 8-byte header {u16 len, 0, 0, 0}, then the payload, a byte at a time.
@@ -444,16 +516,19 @@ fn flk_data(p: &[u8]) {
     }
 }
 
-/// Wait up to `ms` for the reply to `txn`.
+/// Wait up to `ms` for the reply to `txn`: asleep between the AoC's rings (the deadline is the protocol's: an AoC that never answers).
 fn reply(txn: u32, ms: u64) -> Option<(u32, Vec<u8>)> {
-    let f = freq();
-    let t0 = now();
-    while now().wrapping_sub(t0) < f * ms / 1000 {
+    let deadline = now() + freq() * ms / 1000;
+    loop {
+        let seen = RUNG.load(core::sync::atomic::Ordering::Acquire);
         if let Some(r) = drain(Some(txn)) {
             return Some(r);
         }
+        if now() >= deadline {
+            return None;
+        }
+        wait_ring(seen, deadline);
     }
-    None
 }
 
 /// A sensor's name (sensor info, type 4).
@@ -482,6 +557,7 @@ pub fn open(out: &mut String) -> bool {
         out.push_str("usf: com.google.usf not found\n");
         return false;
     }
+    doorbell_start(out);
     let close = [0u32.to_le_bytes(), 1u32.to_le_bytes(), CHAN.to_le_bytes()].concat();
     ipc_write(h, &close);
     let open = [0u32.to_le_bytes(), 0u32.to_le_bytes(), CHAN.to_le_bytes()].concat();

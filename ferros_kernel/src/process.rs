@@ -1415,6 +1415,8 @@ pub static IRQS: &[IrqLine] = &[
     IrqLine { name: "gpu-mmu", intid: 32 + 348 },
     // The AoC's mailbox block f1 (G#1522_0000), its AoC-to-AP side: zuma-aoc.dtsi `mbox_aoc_f1`, zuma.h IRQ_MAILBOX_AOCF12AP_ALIVE = SPI 78, level high. Channels 16-31 of the AoC's 48 (`mbox-channels`); the audio playback services with an interrupt sit on channel 20 (aoc_alsa.h PCM_CHANNEL), f1's bit 4: the audio service's period clock (docs/AUDIO.md).
     IrqLine { name: "aoc-mbox-f1", intid: 32 + 78 },
+    // The AoC's mailbox block a32 (G#1520_0000), its AoC-to-AP side: zuma-aoc.dtsi `mbox_aoc_a32`, zuma.h IRQ_MAILBOX_AOCA322AP_ALIVE = SPI 77, level high. Channels 0-15; com.google.usf rings channel 1 when it writes the AP a message: the sensors process's doorbell (2026-11-12: it woke every 2 ms to look before this).
+    IrqLine { name: "aoc-mbox-a32", intid: 32 + 77 },
     // PCIe channel 1's controller (the WiFi chip's link): zuma.h IRQ_PCIE_GEN3A_1_HSI2, SPI 439, level high (zuma-pcie.dtsi pcie_1, its first `interrupts` entry). Channel 1 has no `separated-msi`, so the Exynos RC driver takes its MSIs on this one line, thru ELBI PCIE_IRQ2 bit 17 (IRQ_MSI_RISING_ASSERT, enabled by PCIE_IRQ2_EN bit 17; pcie-exynos-rc.c exynos_pcie_rc_irq_handler and msi_init). Granted to whoever drives the controller (`build_from`), for payloads/pcie1's wait on the chip (2026-11-11).
     IrqLine { name: "pcie1", intid: 32 + 439 },
 ];
@@ -6415,6 +6417,13 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // PCIe channel 1's interrupt goes with its controller (2026-11-11): a process granted the controller's registers (pcie1-elbi) gets the line as the slot after its last, as a child handed Settings gets the torch (SYS_SPAWN). init holds every grant to hand on and its grants page is full, so it cannot hold the line to pass on; and the keepers' restart list (service.rs `shell_grants`) must give a restarted driver what a booted one has. Only when the page has room: init, full, is skipped rather than refused.
     if cspace.iter().any(|c| matches!(c.object, Object::Hardware(h) if HARDWARE[h].name == "pcie1-elbi")) && !cspace.iter().any(|c| matches!(c.object, Object::Irq(i) if IRQS[i].name == "pcie1")) && TOKENS + 4 + 32 * (cspace.len() + 1) <= PREFS_HI {
         if let Some(i) = IRQS.iter().position(|l| l.name == "pcie1") {
+            let object = Object::Irq(i);
+            cspace.push(CapEntry { token: mint(object, RIGHT_SEND, epoch), object, rights: RIGHT_SEND });
+        }
+    }
+    // The AoC's a32 mailbox line goes with the Sensors right the same way (2026-11-12): the sensors process blocks on it until com.google.usf rings, instead of waking every 2 ms to look (payloads/sensors). The slot after its last; init, full, is skipped.
+    if cspace.iter().any(|c| c.object == Object::Sensors) && !cspace.iter().any(|c| matches!(c.object, Object::Irq(i) if IRQS[i].name == "aoc-mbox-a32")) && TOKENS + 4 + 32 * (cspace.len() + 1) <= PREFS_HI {
+        if let Some(i) = IRQS.iter().position(|l| l.name == "aoc-mbox-a32") {
             let object = Object::Irq(i);
             cspace.push(CapEntry { token: mint(object, RIGHT_SEND, epoch), object, rights: RIGHT_SEND });
         }
