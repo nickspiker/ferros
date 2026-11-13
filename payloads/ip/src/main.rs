@@ -29,7 +29,7 @@
 //!   - One lookup a name and type, however many ask: the calls hold on it. A question goes from the resolver's one port (random for the session) with a random id (the entropy grant, each question), to the DNS server of each family's link (INFO's, IPv6's first, turn about), four tries a second apart (the one timer: a lost datagram never comes back); a try ip cannot send yet for want of the next hop goes again 2^-6 s on. An answer counts only from port 53 of a server a try went to, with the id, repeating the question (`ferros_dns::read`); a SERVFAIL or REFUSED moves to the next try at once. Nothing an application sends may leave from the resolver's port (op 1 answers [3]).
 //!   - Each lookup's end is a console line: the type, found or not or no answer, its time and tries; never the name or the address (they are the person's).
 //!
-//! DHCPv4 (`dhcp_in`, `dhcp_retry`): DISCOVER, OFFER, REQUEST, ACK, retransmitted every 2 s until bound; four REQUESTs unanswered give the offer up for a fresh DISCOVER (RFC 2131 4.4.1). What it sent and heard since WiFi came up is a console line every 16th retransmit while unbound and once at the bind: `DHCP <no lease yet|bound>: A#<n> DISCOVERs and A#<n> REQUESTs out; A#<n> OFFERs, A#<n> ACKs, A#<n> NAKs in, A#<n> replies to other transactions; state A#<1 discovering, 2 requesting, 3 bound>[, lease A#<s> s]`. No renewal yet: the lease is said, not kept to.
+//! DHCPv4 (`dhcp_in`, `dhcp_retry`): DISCOVER, OFFER, REQUEST, ACK, retransmitted every 2 s until bound; four REQUESTs unanswered give the offer up for a fresh DISCOVER (RFC 2131 4.4.1). What it sent and heard since WiFi came up is a console line every 16th retransmit while unbound and once at the bind: `DHCP <no lease yet|bound>: A#<n> DISCOVERs and A#<n> REQUESTs out; A#<n> OFFERs, A#<n> ACKs, A#<n> NAKs in, A#<n> replies to other transactions; WiFi frames in A#<n> broadcast, A#<n> multicast, A#<n> unicast (A#<n> ARP, A#<n> IPv4); state A#<1 discovering, 2 requesting, 3 bound>[, lease A#<s> s]`. The DISCOVER asks for unicast replies (broadcast flag clear). No renewal yet: the lease is said, not kept to.
 //!
 //! TCP here, client only, re-engineered for throughput on 2026-11-11 (owner: "sounds like it needs re-engineered", after Mahere's 1.6 MB base cells crawled thru two connections of a 4 KiB window, about 80 KB/s at a 50 ms round trip). The protocol's pure parts are ferros_tcp, tested on the host.
 //! - Sixteen connections (`TCPN`). An idle one costs its control state alone (`Tcb`, a static table); an open one holds a block of the arc (`Blocks`): a 1 MiB receive buffer and a 256 KiB send buffer. The kernel maps 4 MiB of heap at spawn (three blocks); the arc grows for more as connections open (SYS_ARC, docs/ARCS.md) and shrinks again when the highest blocks are free.
@@ -169,6 +169,12 @@ struct DhcpCount {
     unanswered: u32,
     /// The lease the ACK gave (option 51), in seconds; 0 none said.
     lease_s: u32,
+    /// WiFi frames in by Ethernet destination (broadcast, other multicast, unicast), and the ARP and IPv4 frames among them.
+    bcast_in: u32,
+    mcast_in: u32,
+    ucast_in: u32,
+    arp_in: u32,
+    v4_in: u32,
 }
 
 /// The WiFi path's measures between two connection reports (`report`), said after each on a line of their own (owner, 2026-11-11: measure the path before fixing it). Counter ticks where a time is kept.
@@ -902,6 +908,17 @@ impl Ip {
         self.frames += 1;
         let src_mac: [u8; 6] = f[6..12].try_into().unwrap();
         let ty = u16::from_be_bytes([f[12], f[13]]);
+        // By destination and kind, for DHCP's line: a network whose broadcasts never arrive answers no DHCP that asks for a broadcast reply (2026-11-13, the 8a: 16 DISCOVERs, no reply of any kind).
+        let c = &mut self.dhcp_n;
+        if f[..6] == [0xFF; 6] {
+            c.bcast_in += 1;
+        } else if f[0] & 1 != 0 {
+            c.mcast_in += 1;
+        } else {
+            c.ucast_in += 1;
+        }
+        c.arp_in += (ty == 0x0806) as u32;
+        c.v4_in += (ty == 0x0800) as u32;
         if ty == 0x0806 {
             self.arp_in(&f[14..]);
         } else if ty == 0x0800 {
@@ -1205,7 +1222,8 @@ impl Ip {
         let mut b = [0u8; 300];
         b[0..4].copy_from_slice(&[1, 1, 6, 0]);
         b[4..8].copy_from_slice(&self.xid.to_be_bytes());
-        b[10] = 0x80;
+        // The broadcast flag clear (RFC 2131 4.1, as dhclient sends): the server answers to our MAC, unicast, which `ipv4_in` takes for port 68 before any address is bound. Set until 2026-11-13, it asked for broadcast replies, and on the 8a none came (16 DISCOVERs, no reply of any kind).
+        b[10] = 0;
         b[28..34].copy_from_slice(&self.mac);
         b[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
         let mut o = 240;
@@ -1249,7 +1267,17 @@ impl Ip {
         self.dec(c.naks as u64);
         self.put(b" NAKs in, A#");
         self.dec(c.others as u64);
-        self.put(b" replies to other transactions; state A#");
+        self.put(b" replies to other transactions; WiFi frames in A#");
+        self.dec(c.bcast_in as u64);
+        self.put(b" broadcast, A#");
+        self.dec(c.mcast_in as u64);
+        self.put(b" multicast, A#");
+        self.dec(c.ucast_in as u64);
+        self.put(b" unicast (A#");
+        self.dec(c.arp_in as u64);
+        self.put(b" ARP, A#");
+        self.dec(c.v4_in as u64);
+        self.put(b" IPv4); state A#");
         self.dec(self.dhcp_state as u64);
         if self.bound {
             self.put(b", lease A#");
@@ -3057,7 +3085,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         txb: unsafe { &mut *(&raw mut TXB) },
         txn: EXCH_HEAD,
         path: Path::default(),
-        dhcp_n: DhcpCount { discovers: 0, requests: 0, offers: 0, acks: 0, naks: 0, others: 0, unanswered: 0, lease_s: 0 },
+        dhcp_n: DhcpCount { discovers: 0, requests: 0, offers: 0, acks: 0, naks: 0, others: 0, unanswered: 0, lease_s: 0, bcast_in: 0, mcast_in: 0, ucast_in: 0, arp_in: 0, v4_in: 0 },
         ring: false,
         ring_thread: false,
         ring_none: false,
