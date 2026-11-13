@@ -469,18 +469,31 @@ fn ints_of<const N: usize>(v: &[VsfType]) -> Option<[i64; N]> {
 
 /// A kist's fact value: its capsule, name, and wants in slot order (each right and the developer's reason), then where its capsule was fetched from when the stower fetched it (`nu`, last: a reader from before 2026-11-10 takes no URL for a name or a reason and skips it), then its version, a `z` per part as written (a reader from before takes no `z` for a right, a name or a reason and skips them).
 fn kist_value(k: &Kist) -> Vec<VsfType> {
-    let mut v = vec![VsfType::hb(k.capsule.to_vec()), VsfType::a(vsf::Ascii::checked("name", k.name.clone()))];
-    for w in &k.wants {
-        v.push(VsfType::u(w.right as usize, false));
-        v.push(VsfType::a(vsf::Ascii::checked("reason", w.reason.clone())));
+    let wants: Vec<(u8, String)> = k.wants.iter().map(|w| (w.right, w.reason.clone())).collect();
+    value_of(&k.capsule, &k.name, &wants, k.source.as_ref(), k.version.as_ref())
+}
+
+/// A kist fact's value from its parts ([`kist_value`]).
+fn value_of(capsule: &[u8; 32], name: &str, wants: &[(u8, String)], source: Option<&String>, version: Option<&ferros_kist::Version>) -> Vec<VsfType> {
+    let mut v = vec![VsfType::hb(capsule.to_vec()), VsfType::a(vsf::Ascii::checked("name", String::from(name)))];
+    for (right, reason) in wants {
+        v.push(VsfType::u(*right as usize, false));
+        v.push(VsfType::a(vsf::Ascii::checked("reason", reason.clone())));
     }
-    if let Some(u) = &k.source {
+    if let Some(u) = source {
         v.push(VsfType::nu(u.clone()));
     }
-    if let Some(ver) = &k.version {
+    if let Some(ver) = version {
         v.extend(ver.values());
     }
     v
+}
+
+/// A kist fact's value as this build reads it and would write it back: the rights it cannot name and any value of a later build left out.
+/// Equal to this device's own value when the device holds everything of the fact it can read.
+fn as_read(v: &[VsfType]) -> Option<Vec<VsfType>> {
+    let (capsule, name, wants) = kist_of(v)?;
+    Some(value_of(&capsule, &name, &wants, source_of(v).as_ref(), version_of_fact(v).as_ref()))
 }
 
 /// A kist fact's version: its `z` values in order, or None when it carries none.
@@ -535,11 +548,20 @@ fn label_of<'a>(list: &'a Kists, c: &Circle) -> Option<&'a str> {
 }
 
 /// Every fact the device's copy holds now, in `scope` for the arrangement.
-fn snapshot(list: &Kists, store: &mut impl Store, scope: &[u8; 32]) -> Result<Vec<Fact>, ()> {
+fn snapshot(list: &Kists, space: &Space, store: &mut impl Store, scope: &[u8; 32]) -> Result<Vec<Fact>, ()> {
     let mut facts = Vec::new();
     for k in &list.kists {
+        let id = kist_id(&k.developer, &k.option);
+        let mut value = kist_value(k);
+        // The space's value whole wherever this build reads in it exactly what the device holds.
+        // A want of a right this build cannot name (a later build's, on another device of the fleet) is never read here, and without this the device's own value, short of it, would read as the person's change and go out over the fleet's (2026-11-13: an older build dropped `be_you` and `people` from Photon's entry).
+        if let Some(e) = space.get(kind::KIST, &id).filter(|e| !e.gone && e.value != value) {
+            if as_read(&e.value).as_ref() == Some(&value) {
+                value = e.value.clone();
+            }
+        }
         // Stamped with when it was stowed: a stow after an unstow (here or on another device) is newer than the unstow's tombstone and wins it; with no stamp the tombstone took it straight back out.
-        facts.push(Fact { kind: kind::KIST, id: kist_id(&k.developer, &k.option), value: kist_value(k), stamp: (k.stowed != 0).then_some(k.stowed) });
+        facts.push(Fact { kind: kind::KIST, id, value, stamp: (k.stowed != 0).then_some(k.stowed) });
         for w in &k.wants {
             if let Some((granted, when)) = w.answer {
                 facts.push(Fact { kind: kind::ANSWER, id: answer_id(&k.developer, &k.option, w.right), value: vec![VsfType::u(granted as usize, false)], stamp: Some(when) });
@@ -576,8 +598,11 @@ fn snapshot(list: &Kists, store: &mut impl Store, scope: &[u8; 32]) -> Result<Ve
 /// Which of the space's entries this device's copy mirrors: every kist and default; an answer for a want its kist declares here (an answer to a want an older capsule lacks waits in the space, untouched, for the update that brings it), or of a kist no longer in the list whose answers the list keeps (`kept`) or that is stowed nowhere (`live`: the kists the space holds live, read before the pass), so the person's answers forgotten on an unstow sheet go from the space and from every device's kept answers (docs/KISTS.md "The unstow sheet"); a place only in this device's scope and only for a circle it has; the view in its scope.
 fn managed(list: &Kists, live: &[([u8; 32], [u8; 32])], scope: &[u8; 32], k: u8, id: &[VsfType]) -> bool {
     match k {
-        kind::KIST | kind::DEFAULT | kind::PIN => true,
-        kind::ANSWER => match (id.first().and_then(k32), id.get(1).and_then(k32), id.get(2).and_then(|v| v.as_u64())) {
+        kind::KIST | kind::PIN => true,
+        // A right this build cannot name (a later build's, on another device of the fleet): its default and every answer to it are left in the space as they are.
+        // The device's copy never holds one as a fact, so mirrored they would read as the person removing them (2026-11-13).
+        kind::DEFAULT => id.first().and_then(|v| v.as_u64()).is_some_and(|r| (r as usize) < RIGHTS.len()),
+        kind::ANSWER => match (id.first().and_then(k32), id.get(1).and_then(k32), id.get(2).and_then(|v| v.as_u64()).filter(|&r| (r as usize) < RIGHTS.len())) {
             (Some(d), Some(o), Some(r)) => match list.by_identity(&d, &o) {
                 Some(x) => x.wants.iter().any(|w| w.right as u64 == r),
                 None => list.kept.iter().any(|x| x.developer == d && x.option == o) || !live.contains(&(d, o)),
@@ -661,10 +686,10 @@ fn apply(w: Write, list: &mut Kists, list_changed: &mut bool, store: &mut impl S
                 VsfType::a(t) => Some(String::from(t.as_str())),
                 _ => None,
             });
-            let p = ferros_kist::Pin { developer, bundle, name, pinned: updated };
             match list.pins.iter_mut().find(|x| x.developer == developer) {
-                Some(x) => *x = p,
-                None => list.pins.push(p),
+                // What this build does not read of the pin stays as it was.
+                Some(x) => (x.bundle, x.name, x.pinned) = (bundle, name, updated),
+                None => list.pins.push(ferros_kist::Pin { developer, bundle, name, pinned: updated, unread: Vec::new() }),
             }
             *list_changed = true;
             true
@@ -714,7 +739,7 @@ fn set_answer(list: &mut Kists, id: &[VsfType], answer: Option<(bool, i64)>) {
     let at = match list.kept.iter().position(|k| k.developer == d && k.option == o) {
         Some(i) => i,
         None if answer.is_some() => {
-            list.kept.push(ferros_kist::Kept { developer: d, option: o, answers: Vec::new() });
+            list.kept.push(ferros_kist::Kept { developer: d, option: o, answers: Vec::new(), unread: Vec::new() });
             list.kept.len() - 1
         }
         None => return,
@@ -724,7 +749,7 @@ fn set_answer(list: &mut Kists, id: &[VsfType], answer: Option<(bool, i64)>) {
     if let Some((granted, when)) = answer {
         kept.push((r, granted, when));
     }
-    if kept.is_empty() {
+    if kept.is_empty() && list.kept[at].unread.is_empty() {
         list.kept.swap_remove(at);
     }
 }
@@ -747,7 +772,7 @@ pub fn sync(space: &mut Space, base: &mut Baseline, store: &mut impl Store, me: 
     for _ in 0..4 {
         let mut list = read_list(store).map_err(|_| "the person's list is not readable")?;
         let scope = if deck_sync(space, me) { FLEET } else { *me };
-        let mut facts = snapshot(&list, store, &scope).map_err(|_| "the map's places are not readable")?;
+        let mut facts = snapshot(&list, space, store, &scope).map_err(|_| "the map's places are not readable")?;
         // A place or the view this device holds where the space holds a removal: the device's, stamped past the removal (owner, 2026-11-12, on the 8a: "sometimes that ferros logo just BOOP!").
         // A circle's place goes with its circle: an unstowed kist's is left alone by every device (`managed`), so a place's tombstone only ever came from a copy that lost its place while the circle stood, and it must not stick.
         // Until this a place has no stamp of its own, so a removal stuck: the settings circle's (in the space since a copy lost it) took map.place.settings back out of the 8a's vault within 4 s of every save, the generation moved, and the map placed every circle again with settings at its seed, far off the deck and at whatever size it last had.
@@ -869,6 +894,53 @@ mod tests {
         let (hp, key) = ([0x77; 32], [0x88; 32]);
         let sealed = fgtw::space::seal(&space.to_doc(5000).unwrap(), &hp, &key).unwrap();
         Space::from_doc(&fgtw::space::open(&sealed, &hp, &key).unwrap()).unwrap()
+    }
+
+    /// 2026-11-13, on the 8a: a build that cannot name a right must leave everything of it in the person's space as it is, however often it syncs and whatever the person changes on it.
+    /// A later device's Photon wants the right after this build's last (`RIGHTS.len()`, between be you and people), the person answered it, turned its default on, and answered it for a kist stowed nowhere; this device syncs, takes Photon, changes an answer of its own, unstows and stows nothing, and every one of those entries is the later device's still, byte for byte.
+    #[test]
+    fn a_right_this_build_cannot_name_stays_in_the_space() {
+        let later = RIGHTS.len() as u8;
+        let reason = |s: &str| VsfType::a(vsf::Ascii::checked("reason", String::from(s)));
+        let mut sp = Space::new();
+        let put = |sp: &mut Space, kind: u8, id: Vec<VsfType>, value: Vec<VsfType>, updated: i64| {
+            sp.put(Entry { kind, id, value, updated, by: OTHER, gone: false });
+        };
+        let photon = vec![VsfType::hb(vec![0xA2; 32]), VsfType::a(vsf::Ascii::checked("name", String::from("Photon"))), VsfType::u(7, false), reason("to reach your people"), VsfType::u(ferros_kist::BE_YOU as usize, false), reason("to be you"), VsfType::u(later as usize, false), reason("a later reason"), VsfType::u(ferros_kist::PEOPLE as usize, false), reason("to know your people")];
+        put(&mut sp, kind::KIST, kist_id(&PHOTON.0, &PHOTON.1), photon, 1000);
+        for (r, t) in [(7, 1001), (ferros_kist::BE_YOU, 1002), (later, 1003), (ferros_kist::PEOPLE, 1004)] {
+            put(&mut sp, kind::ANSWER, answer_id(&PHOTON.0, &PHOTON.1, r), vec![VsfType::u(1, false)], t);
+        }
+        put(&mut sp, kind::DEFAULT, default_id(later), vec![VsfType::u(1, false)], 1005);
+        put(&mut sp, kind::ANSWER, answer_id(&MAHERE.0, &MAHERE.1, later), vec![VsfType::u(0, false)], 1006);
+        let theirs: Vec<Entry> = sp.entries().to_vec();
+        let unchanged = |sp: &Space| {
+            for e in theirs.iter().filter(|e| e.kind != kind::ANSWER || e.id.get(2).and_then(|v| v.as_u64()) != Some(7)) {
+                let now = sp.get(e.kind, &e.id).unwrap();
+                assert_eq!((fgtw::space::bytes_of(&now.value), now.updated, now.gone, now.by), (fgtw::space::bytes_of(&e.value), e.updated, e.gone, e.by), "kind {} {:?}", e.kind, e.id);
+            }
+        };
+        let mut v = Vault::default();
+        let mut b = Baseline::default();
+        sync(&mut sp, &mut b, &mut v, &PRO, 2000).unwrap();
+        unchanged(&sp);
+        // Photon in this device's list with the wants it can name, answered; the later right nowhere in it.
+        let l = read_list(&mut v).unwrap();
+        let k = l.by_identity(&PHOTON.0, &PHOTON.1).unwrap();
+        assert_eq!(k.wants.iter().map(|w| (w.right, w.answer.map(|a| a.0))).collect::<Vec<_>>(), vec![(7, Some(true)), (ferros_kist::BE_YOU, Some(true)), (ferros_kist::PEOPLE, Some(true))]);
+        // Settled: nothing moves on a second pass.
+        assert_eq!(sync(&mut sp, &mut b, &mut v, &PRO, 2001).unwrap(), Outcome::default());
+        // The person turns Photon's network off here: that answer goes out, nothing of the later right moves.
+        let mut l = read_list(&mut v).unwrap();
+        l.kists[0].wants[0].answer = Some((false, 2100));
+        v.set(Scope::Kists, ferros_kist::LIST, &l.build(2100).unwrap());
+        assert!(sync(&mut sp, &mut b, &mut v, &PRO, 2101).unwrap().space_changed);
+        assert_eq!(sp.get(kind::ANSWER, &answer_id(&PHOTON.0, &PHOTON.1, 7)).unwrap().value, vec![VsfType::u(0, false)]);
+        unchanged(&sp);
+        // Across the fleet and back, then a fresh pass from no baseline (a restart): still theirs.
+        let mut sp = hand_over(&sp);
+        sync(&mut sp, &mut Baseline::default(), &mut v, &PRO, 2200).unwrap();
+        unchanged(&sp);
     }
 
     /// The end test on the host: arrange, reset, attest. The Pro's arrangement goes into its space; a factory-reset device (an empty vault) takes the sealed space and comes back with the same kists, the same answers (nothing to ask), the same defaults, every circle in the same spot and turn, the same view.

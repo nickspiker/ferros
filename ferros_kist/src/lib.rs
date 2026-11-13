@@ -364,6 +364,50 @@ pub struct Kist {
     pub stowed: i64,
     /// The stowed capsule's version as its signed declaration gives it (`version`, a `z` per part, kept as written; since 2026-11-10): what the Kists page compares a listed version against, so it offers an update only when the listed one is newer. None for a kist stowed before versions, or from a capsule without one: any listed version is newer.
     pub version: Option<Version>,
+    /// The entry's fields this build does not read ([`Unread`]), each placed by how many of its wants came before it: a want of a right named after this build keeps its place in the slot order, its reason and the person's answer untouched.
+    pub unread: Vec<Unread>,
+}
+
+/// A field of the person's list this build does not read: a want or an answer of a right named after it was built, or a field a later build adds.
+/// Kept as it was read and written back where it was, so every rewrite of the list carries it untouched; nothing is ever re-derived from this build's own [`RIGHTS`] (2026-11-13, on the 8a: a stower built before `be_you` and `people` rewrote the list at an unstow, Photon's entry rebuilt from its own vocabulary lost both wants, and the person's space took the answers as removed).
+#[derive(Clone, PartialEq, Debug)]
+pub struct Unread {
+    /// How many of the fields this build reads in its place came before it when it was read: in a `kist` section its wants, in `kept` its answers, in `defaults` its rights, in a `pin` its fields.
+    /// It is written back after as many, so a want keeps its place among the wants (the slot order) whatever else of the entry changed.
+    pub after: usize,
+    pub name: String,
+    pub values: Vec<VsfType>,
+}
+
+/// A section of the person's list this build does not read, kept whole and written back after the rest.
+#[derive(Clone, PartialEq, Debug)]
+pub struct UnreadSection {
+    pub name: String,
+    pub fields: Vec<(String, Vec<VsfType>)>,
+}
+
+/// The fields of a `kist` entry this build reads besides its wants (each a right of [`RIGHTS`]): any other name is a field of a later build, carried as [`Unread`].
+const KIST_FIELDS: [&str; 7] = ["capsule", "developer", "option", "name", "source", "installed", VERSION];
+
+/// The fields of a section as this build writes them (`known`, in order), with the ones it did not read put back where they were: each after as many of `known` as came before it when read, and the rest at the end.
+fn interleave(s: &mut VsfSection, known: Vec<vsf::VsfField>, unread: &[Unread]) {
+    let mut u = unread.iter().peekable();
+    for (i, f) in known.into_iter().enumerate() {
+        while let Some(x) = u.next_if(|x| x.after <= i) {
+            s.fields.push(vsf::VsfField::with_values(x.name.clone(), x.values.clone()));
+        }
+        s.fields.push(f);
+    }
+    for x in u {
+        s.fields.push(vsf::VsfField::with_values(x.name.clone(), x.values.clone()));
+    }
+}
+
+/// The answer an unread field holds, as a kept answer writes it (the unsigned, then the Eagle time); None when it holds no unsigned and Eagle time, as every answered want writes them.
+fn answered(f: &Unread) -> Option<Vec<VsfType>> {
+    let when = f.values.iter().find(|v| matches!(v, VsfType::e(_)))?;
+    let answer = f.values.iter().find(|v| !matches!(v, VsfType::e(_)) && v.as_string().is_none() && v.as_u64().is_some())?;
+    Some(alloc::vec![answer.clone(), when.clone()])
 }
 
 /// The answers of a kist the person unstowed, kept in their list (a section `kept`: `developer`, `option`, then a field per right answered, the answer and when), so stowing the same kist again finds them and asks nothing (owner, 2026-11-07: "asked once, ever").
@@ -373,6 +417,8 @@ pub struct Kept {
     pub option: [u8; 32],
     /// Each answer: (right, granted, when).
     pub answers: Vec<(u8, bool, i64)>,
+    /// The answers of rights this build cannot name ([`Unread`], placed by how many answers came before each), kept for the build that can.
+    pub unread: Vec<Unread>,
 }
 
 /// A developer the person trusted on first stow (owner, 2026-11-10): the commitment of the key bundle (`fgtw::pq::KeyBundle::commit`, every scheme) that developer's first kist carried, kept in their list (a section `pin`: `developer` ke, `bundle` hp, `name` a when the kist named its developer, `pinned` e), so it follows them to every device of theirs. Every later kist or update from that developer key must carry a bundle with the same commitment. An unstow keeps it, as it keeps answers.
@@ -386,6 +432,8 @@ pub struct Pin {
     pub name: Option<String>,
     /// When it was pinned (Eagle oscillations): its fact's stamp in the person's space.
     pub pinned: i64,
+    /// Its fields this build does not read ([`Unread`], placed by how many of its own came before each).
+    pub unread: Vec<Unread>,
 }
 
 /// The person's list: their defaults (bit k: right k starts on at the first-launch question), their kists, the answers of the kists they unstowed, and the developers they trusted on first stow.
@@ -395,6 +443,10 @@ pub struct Kists {
     pub kists: Vec<Kist>,
     pub kept: Vec<Kept>,
     pub pins: Vec<Pin>,
+    /// The defaults of rights this build cannot name ([`Unread`], after its own).
+    pub unread_defaults: Vec<Unread>,
+    /// The sections this build does not read, written back after the rest.
+    pub unread: Vec<UnreadSection>,
 }
 
 /// What [`Kists::trust`] found for a developer's bundle.
@@ -503,11 +555,15 @@ impl Kists {
         for s in &sections {
             match s.name.as_str() {
                 "defaults" => {
+                    let mut known = 0;
                     for f in &s.fields {
-                        if let (Some(c), Some(v)) = (code(&f.name), f.values.first().and_then(|v| v.as_u64())) {
-                            if v == 1 {
-                                out.defaults |= 1 << c;
-                            }
+                        let Some(c) = code(&f.name) else {
+                            out.unread_defaults.push(Unread { after: known, name: f.name.clone(), values: f.values.clone() });
+                            continue;
+                        };
+                        known += 1;
+                        if f.values.first().and_then(|v| v.as_u64()) == Some(1) {
+                            out.defaults |= 1 << c;
                         }
                     }
                 }
@@ -523,8 +579,14 @@ impl Kists {
                     });
                     let stowed = s.get_field("installed").and_then(|f| f.values.first()).and_then(|v| v.as_eagle()).unwrap_or(0);
                     let mut wants = Vec::new();
+                    let mut unread = Vec::new();
                     for f in &s.fields {
-                        let Some(right) = code(&f.name) else { continue };
+                        let Some(right) = code(&f.name) else {
+                            if !KIST_FIELDS.contains(&f.name.as_str()) {
+                                unread.push(Unread { after: wants.len(), name: f.name.clone(), values: f.values.clone() });
+                            }
+                            continue;
+                        };
                         // Each value by its type marker (AGENT.md): the text is the reason, the unsigned the answer, the Eagle time when.
                         let mut reason = String::new();
                         let (mut answer, mut when) = (None, 0i64);
@@ -543,15 +605,21 @@ impl Kists {
                         Some(f) => Some(Version::from_values(&f.values)?),
                         None => None,
                     };
-                    out.kists.push(Kist { capsule, developer, option, name, wants, source, stowed, version });
+                    out.kists.push(Kist { capsule, developer, option, name, wants, source, stowed, version, unread });
                 }
                 "kept" => {
                     let (Some(developer), Some(option)) = (s.bytes32("developer"), s.bytes32("option")) else {
                         return Err("kept answers without their kist's identity");
                     };
                     let mut answers = Vec::new();
+                    let mut unread = Vec::new();
                     for f in &s.fields {
-                        let Some(right) = code(&f.name) else { continue };
+                        let Some(right) = code(&f.name) else {
+                            if f.name != "developer" && f.name != "option" {
+                                unread.push(Unread { after: answers.len(), name: f.name.clone(), values: f.values.clone() });
+                            }
+                            continue;
+                        };
                         let (mut answer, mut when) = (None, 0i64);
                         for v in &f.values {
                             if let VsfType::e(_) = v {
@@ -564,7 +632,7 @@ impl Kists {
                             answers.push((right, a, when));
                         }
                     }
-                    out.kept.push(Kept { developer, option, answers });
+                    out.kept.push(Kept { developer, option, answers, unread });
                 }
                 "pin" => {
                     // Each by its type marker: the developer's key `ke`, the bundle's commitment `hp`. WHY `try_from`: the lengths are the document's; it refuses any but 32 bytes rather than reading past them.
@@ -585,9 +653,18 @@ impl Kists {
                     if out.pins.iter().any(|p| p.developer == developer) {
                         return Err("a developer pinned twice");
                     }
-                    out.pins.push(Pin { developer, bundle, name, pinned });
+                    let mut unread = Vec::new();
+                    let mut known = 0;
+                    for f in &s.fields {
+                        if ["developer", "bundle", "name", "pinned"].contains(&f.name.as_str()) {
+                            known += 1;
+                        } else {
+                            unread.push(Unread { after: known, name: f.name.clone(), values: f.values.clone() });
+                        }
+                    }
+                    out.pins.push(Pin { developer, bundle, name, pinned, unread });
                 }
-                _ => {}
+                _ => out.unread.push(UnreadSection { name: s.name.clone(), fields: s.fields.iter().map(|f| (f.name.clone(), f.values.clone())).collect() }),
             }
         }
         Ok(out)
@@ -596,9 +673,8 @@ impl Kists {
     /// The list as a complete VSF document stamped `now` (Eagle oscillations), with its provenance hash.
     pub fn build(&self, now: i64) -> Result<Vec<u8>, String> {
         let mut d = VsfSection::new("defaults");
-        for (c, r) in RIGHTS.iter().enumerate() {
-            d.add_field(*r, VsfType::u((self.defaults >> c & 1) as usize, false));
-        }
+        let known = RIGHTS.iter().enumerate().map(|(c, r)| vsf::VsfField::with_values(*r, alloc::vec![VsfType::u((self.defaults >> c & 1) as usize, false)])).collect();
+        interleave(&mut d, known, &self.unread_defaults);
         let mut b = vsf::VsfBuilder::new().creation_time_oscillations(now).provenance_only().add_section_direct(d);
         for k in &self.kists {
             let mut s = VsfSection::new("kist");
@@ -615,35 +691,45 @@ impl Kists {
             if let Some(v) = k.version.as_ref().filter(|v| !v.0.is_empty()) {
                 s.add_field_multi(VERSION, v.values());
             }
-            for w in &k.wants {
-                let mut values = alloc::vec![VsfType::a(vsf::Ascii::checked("reason", w.reason.clone()))];
-                if let Some((granted, when)) = w.answer {
-                    values.push(VsfType::u(granted as usize, false));
-                    values.push(VsfType::e(EtType::e6(when)));
-                }
-                s.add_field_multi(RIGHTS[w.right as usize], values);
-            }
+            let wants = k
+                .wants
+                .iter()
+                .map(|w| {
+                    let mut values = alloc::vec![VsfType::a(vsf::Ascii::checked("reason", w.reason.clone()))];
+                    if let Some((granted, when)) = w.answer {
+                        values.push(VsfType::u(granted as usize, false));
+                        values.push(VsfType::e(EtType::e6(when)));
+                    }
+                    vsf::VsfField::with_values(RIGHTS[w.right as usize], values)
+                })
+                .collect();
+            interleave(&mut s, wants, &k.unread);
             b = b.add_section_direct(s);
         }
         for k in &self.kept {
             let mut s = VsfSection::new("kept");
             s.add_field("developer", VsfType::ke(k.developer.to_vec()));
             s.add_field("option", VsfType::hp(k.option.to_vec()));
-            for (right, granted, when) in &k.answers {
-                s.add_field_multi(RIGHTS[*right as usize], alloc::vec![VsfType::u(*granted as usize, false), VsfType::e(EtType::e6(*when))]);
-            }
+            let answers = k.answers.iter().map(|(right, granted, when)| vsf::VsfField::with_values(RIGHTS[*right as usize], alloc::vec![VsfType::u(*granted as usize, false), VsfType::e(EtType::e6(*when))])).collect();
+            interleave(&mut s, answers, &k.unread);
             b = b.add_section_direct(s);
         }
         for p in &self.pins {
             let mut s = VsfSection::new("pin");
-            s.add_field("developer", VsfType::ke(p.developer.to_vec()));
-            s.add_field("bundle", VsfType::hp(p.bundle.to_vec()));
+            let mut known = alloc::vec![vsf::VsfField::with_values("developer", alloc::vec![VsfType::ke(p.developer.to_vec())]), vsf::VsfField::with_values("bundle", alloc::vec![VsfType::hp(p.bundle.to_vec())])];
             if let Some(n) = &p.name {
-                s.add_field("name", VsfType::a(vsf::Ascii::checked("name", n.clone())));
+                known.push(vsf::VsfField::with_values("name", alloc::vec![VsfType::a(vsf::Ascii::checked("name", n.clone()))]));
             }
             if p.pinned != 0 {
-                s.add_field("pinned", VsfType::e(EtType::e6(p.pinned)));
+                known.push(vsf::VsfField::with_values("pinned", alloc::vec![VsfType::e(EtType::e6(p.pinned))]));
             }
+            interleave(&mut s, known, &p.unread);
+            b = b.add_section_direct(s);
+        }
+        for u in &self.unread {
+            // WHY try_new: the name is the document's, read back; a name VSF refuses is refused here rather than panicking in `new`.
+            let mut s = VsfSection::try_new(u.name.clone())?;
+            s.fields = u.fields.iter().map(|(n, v)| vsf::VsfField::with_values(n.clone(), v.clone())).collect();
             b = b.add_section_direct(s);
         }
         b.build()
@@ -660,7 +746,7 @@ impl Kists {
             Some(p) if p.bundle == *bundle => Trust::Same,
             Some(p) => Trust::Other(p.clone()),
             None => {
-                self.pins.push(Pin { developer: *developer, bundle: *bundle, name: name.map(String::from), pinned: now });
+                self.pins.push(Pin { developer: *developer, bundle: *bundle, name: name.map(String::from), pinned: now, unread: Vec::new() });
                 Trust::First
             }
         }
@@ -693,14 +779,22 @@ impl Kists {
                 Want { right: *right, reason: reason.clone(), answer }
             })
             .collect();
-        // Back in the list, the kept answers are its own again.
+        // Back in the list, the kept answers are its own again; the answers of rights this build cannot name stay kept for the build that can (this one's stow never wants them: `declaration` refuses a right it does not know).
         if let Some(i) = kept {
-            self.kept.swap_remove(i);
+            if self.kept[i].unread.is_empty() {
+                self.kept.swap_remove(i);
+            } else {
+                self.kept[i].answers.clear();
+            }
         }
         let (source, stowed) = old.map_or((None, 0), |i| (self.kists[i].source.clone(), self.kists[i].stowed));
         // The version is the new capsule's, which the caller sets from its declaration (`version_of`); the one before stays only while the capsule is the same.
-        let version = old.filter(|&i| self.kists[i].capsule == capsule).and_then(|i| self.kists[i].version.clone());
-        let k = Kist { capsule, developer, option, name: d.name.clone(), wants, source, stowed, version };
+        let same = old.filter(|&i| self.kists[i].capsule == capsule);
+        let version = same.and_then(|i| self.kists[i].version.clone());
+        // What this build cannot read of the entry stays while the capsule is the same (a restow, the space's copy of it): its wants are the same, so each unread field keeps its place among them.
+        // A new capsule's entry is its declaration's, which this build reads whole; an answer the old one had to a right this build cannot name stays in the person's space, which leaves such answers alone (ferros_space `managed`), as it does an answer to any right the new capsule no longer wants.
+        let unread = same.map(|i| self.kists[i].unread.clone()).unwrap_or_default();
+        let k = Kist { capsule, developer, option, name: d.name.clone(), wants, source, stowed, version, unread };
         match old {
             Some(i) => {
                 self.kists[i] = k;
@@ -722,7 +816,7 @@ impl Kists {
         let at = match self.kept.iter().position(|e| e.developer == *developer && e.option == *option) {
             Some(j) => j,
             None => {
-                self.kept.push(Kept { developer: *developer, option: *option, answers: Vec::new() });
+                self.kept.push(Kept { developer: *developer, option: *option, answers: Vec::new(), unread: Vec::new() });
                 self.kept.len() - 1
             }
         };
@@ -734,7 +828,17 @@ impl Kists {
                 None => self.kept[at].answers.push((w.right, granted, when)),
             }
         }
-        if self.kept[at].answers.is_empty() {
+        // So do the answers to its wants this build cannot name, as a kept answer writes them (the answer and when).
+        for f in &k.unread {
+            let Some(values) = answered(f) else { continue };
+            let after = self.kept[at].answers.len();
+            let kept = &mut self.kept[at].unread;
+            match kept.iter_mut().find(|e| e.name == f.name) {
+                Some(e) => e.values = values,
+                None => kept.push(Unread { after, name: f.name.clone(), values }),
+            }
+        }
+        if self.kept[at].answers.is_empty() && self.kept[at].unread.is_empty() {
             self.kept.swap_remove(at);
         }
         Some(k)
@@ -942,6 +1046,103 @@ mod tests {
         assert_eq!(&a[5..], &[Implicit(0), Implicit(1), Implicit(2), Implicit(3), Implicit(4), Implicit(5)]);
     }
 
+    /// A list as a later build writes it, in this build's order: a right after `people` this build cannot name (`later_right`), wanted and answered between `be_you` and `people`, a default for it, a field of a later build in the kist entry, a kept answer to it, a field in the pin, and a section of its own.
+    pub(crate) fn later_list(now: i64, alias: bool) -> Vec<u8> {
+        let f = |n: &str, v: Vec<VsfType>| vsf::VsfField::with_values(n, v);
+        let want = |reason: &str, granted: usize, when: i64| alloc::vec![VsfType::a(vsf::Ascii::checked("reason", String::from(reason))), VsfType::u(granted, false), VsfType::e(EtType::e6(when))];
+        let mut d = VsfSection::new("defaults");
+        for r in RIGHTS {
+            d.fields.push(f(r, alloc::vec![VsfType::u(0, false)]));
+        }
+        d.fields.push(f("later_right", alloc::vec![VsfType::u(1, false)]));
+        let mut photon = VsfSection::new("kist");
+        photon.fields.push(f("capsule", alloc::vec![VsfType::hb(alloc::vec![1; 32])]));
+        photon.fields.push(f("developer", alloc::vec![VsfType::ke(alloc::vec![2; 32])]));
+        photon.fields.push(f("option", alloc::vec![VsfType::hp(alloc::vec![3; 32])]));
+        photon.fields.push(f("name", alloc::vec![VsfType::a(vsf::Ascii::checked("name", String::from("Photon")))]));
+        photon.fields.push(f("installed", alloc::vec![VsfType::e(EtType::e6(40))]));
+        photon.fields.push(f("later_field", alloc::vec![VsfType::u(7, false), VsfType::hb(alloc::vec![9; 32])]));
+        photon.fields.push(f("udp", want("to reach your people", 1, 41)));
+        photon.fields.push(f("be_you", want("to be you", 1, 42)));
+        photon.fields.push(f("later_right", want("a later reason", 1, 43)));
+        photon.fields.push(f("people", want("to know your people", 1, 44)));
+        let mut b = vsf::VsfBuilder::new().creation_time_oscillations(now).provenance_only().add_section_direct(d).add_section_direct(photon);
+        if alias {
+            let mut a = VsfSection::new("kist");
+            a.fields.push(f("capsule", alloc::vec![VsfType::hb(alloc::vec![5; 32])]));
+            a.fields.push(f("developer", alloc::vec![VsfType::ke(alloc::vec![6; 32])]));
+            a.fields.push(f("option", alloc::vec![VsfType::hp(alloc::vec![3; 32])]));
+            a.fields.push(f("name", alloc::vec![VsfType::a(vsf::Ascii::checked("name", String::from("Alias A")))]));
+            a.fields.push(f("gps", want("to say where", 0, 45)));
+            b = b.add_section_direct(a);
+        }
+        let mut kept = VsfSection::new("kept");
+        kept.fields.push(f("developer", alloc::vec![VsfType::ke(alloc::vec![8; 32])]));
+        kept.fields.push(f("option", alloc::vec![VsfType::hp(alloc::vec![3; 32])]));
+        kept.fields.push(f("gps", alloc::vec![VsfType::u(1, false), VsfType::e(EtType::e6(46))]));
+        kept.fields.push(f("later_right", alloc::vec![VsfType::u(0, false), VsfType::e(EtType::e6(47))]));
+        kept.fields.push(f("udp", alloc::vec![VsfType::u(1, false), VsfType::e(EtType::e6(48))]));
+        let mut pin = VsfSection::new("pin");
+        pin.fields.push(f("developer", alloc::vec![VsfType::ke(alloc::vec![2; 32])]));
+        pin.fields.push(f("bundle", alloc::vec![VsfType::hp(alloc::vec![4; 32])]));
+        pin.fields.push(f("pinned", alloc::vec![VsfType::e(EtType::e6(39))]));
+        pin.fields.push(f("later_pin", alloc::vec![VsfType::u(2, false)]));
+        let mut later = VsfSection::new("later_section");
+        later.fields.push(f("anything", alloc::vec![VsfType::u(3, false)]));
+        b.add_section_direct(kept).add_section_direct(pin).add_section_direct(later).build().unwrap()
+    }
+
+    /// One section of a list document, encoded alone, by its name and its place among those of that name.
+    fn section_bytes(doc: &[u8], name: &str, nth: usize) -> Vec<u8> {
+        let (h, end) = VsfHeader::decode(doc).unwrap();
+        h.sections(doc, end).unwrap().into_iter().filter(|s| s.name == name).nth(nth).unwrap().fields.iter().flat_map(|f| f.flatten()).collect()
+    }
+
+    /// 2026-11-13, on the 8a: a stower built before `be_you` and `people` rewrote the list at an unstow of Alias A and Photon's entry lost both wants.
+    /// Whatever this build cannot read survives a rewrite byte for byte, in its place.
+    #[test]
+    fn a_right_this_build_cannot_name_survives_every_rewrite() {
+        let doc = later_list(50, true);
+        let mut k = Kists::parse(&doc).unwrap();
+        // Read and written back with nothing changed: the same document, byte for byte.
+        assert_eq!(k.build(50).unwrap(), doc);
+        // The kist's wants this build knows are read as ever; the later right is not one of them, so nothing launches or asks from it here.
+        let photon = k.by_identity(&[2; 32], &[3; 32]).unwrap();
+        assert_eq!(photon.wants.iter().map(|w| w.right).collect::<Vec<_>>(), alloc::vec![7, BE_YOU, PEOPLE]);
+        // An unstow of another kist (the 8a's rewrite): Photon's entry, the kept answers, the pin and the later section byte for byte, and the whole as the later build writes it without Alias A, beside the kept answers Alias A leaves.
+        k.remove(&[6; 32], &[3; 32]).unwrap();
+        let after = k.build(50).unwrap();
+        assert_eq!(section_bytes(&after, "kist", 0), section_bytes(&doc, "kist", 0));
+        assert_eq!(section_bytes(&after, "kept", 0), section_bytes(&doc, "kept", 0));
+        assert_eq!(section_bytes(&after, "pin", 0), section_bytes(&doc, "pin", 0));
+        assert_eq!(section_bytes(&after, "later_section", 0), section_bytes(&doc, "later_section", 0));
+        assert_eq!(section_bytes(&after, "defaults", 0), section_bytes(&doc, "defaults", 0));
+        // A restow of the same capsule (the stower's `--stored`, the space's copy): Photon's entry unchanged.
+        let decl = Decl { name: String::from("Photon"), wants: photon_decl() };
+        k.stow([1; 32], [2; 32], [3; 32], &decl);
+        assert_eq!(section_bytes(&k.build(50).unwrap(), "kist", 0), section_bytes(&doc, "kist", 0));
+        // Photon unstowed: the later right's answer is kept with the others, as a kept answer is written (the answer and when).
+        k.remove(&[2; 32], &[3; 32]).unwrap();
+        let kept = k.kept.iter().find(|e| e.developer == [2; 32]).unwrap();
+        assert_eq!(kept.answers, alloc::vec![(7, true, 41), (BE_YOU, true, 42), (PEOPLE, true, 44)]);
+        assert_eq!(kept.unread.len(), 1);
+        let f = &kept.unread[0];
+        assert_eq!(f.name, "later_right");
+        assert_eq!(vsf::VsfField::with_values("x", f.values.clone()).flatten(), vsf::VsfField::with_values("x", alloc::vec![VsfType::u(1, false), VsfType::e(EtType::e6(43))]).flatten());
+        let back = Kists::parse(&k.build(51).unwrap()).unwrap();
+        assert_eq!(back, k);
+        // Stowed again by this build: its answers back, the later right's answer still kept for the build that can name it.
+        let i = k.stow([1; 32], [2; 32], [3; 32], &decl);
+        assert_eq!(k.kists[i].wants.iter().map(|w| w.answer.map(|a| a.0)).collect::<Vec<_>>(), alloc::vec![Some(true); 3]);
+        let kept = k.kept.iter().find(|e| e.developer == [2; 32]).unwrap();
+        assert!(kept.answers.is_empty());
+        assert_eq!(kept.unread.len(), 1);
+    }
+
+    fn photon_decl() -> Vec<(u8, String)> {
+        alloc::vec![(7, String::from("to reach your people")), (BE_YOU, String::from("to be you")), (PEOPLE, String::from("to know your people"))]
+    }
+
     #[test]
     fn unstow_keeps_the_answers_and_a_restow_asks_nothing() {
         let mut k = Kists::default();
@@ -957,7 +1158,7 @@ mod tests {
         assert!(k.kists.is_empty());
         assert!(k.remove(&[2; 32], &[3; 32]).is_none());
         // Only the answered want is kept, and the kept answers round trip.
-        assert_eq!(k.kept, alloc::vec![Kept { developer: [2; 32], option: [3; 32], answers: alloc::vec![(0, true, 5)] }]);
+        assert_eq!(k.kept, alloc::vec![Kept { developer: [2; 32], option: [3; 32], answers: alloc::vec![(0, true, 5)], unread: Vec::new() }]);
         let back = Kists::parse(&k.build(11).unwrap()).unwrap();
         assert_eq!(back, k);
         // Stowed again (a newer capsule): the kept answer is back, the unanswered want still unanswered, nothing kept any more.
@@ -1501,7 +1702,7 @@ pub mod capsule {
             // The first kist by this developer pins its bundle, under the name it gives.
             let first = signed(&key, Some("Test Developer"));
             assert_eq!(stow(&mut list, &first), Ok(Trust::First));
-            assert_eq!(list.pins, alloc::vec![Pin { developer: key.public().ed25519(), bundle: key.public().commit(), name: Some(String::from("Test Developer")), pinned: 7 }]);
+            assert_eq!(list.pins, alloc::vec![Pin { developer: key.public().ed25519(), bundle: key.public().commit(), name: Some(String::from("Test Developer")), pinned: 7, unread: Vec::new() }]);
             // The pin round trips thru the list's document, and a list from before (no pin section) reads as none pinned.
             let back = Kists::parse(&list.build(8).unwrap()).unwrap();
             assert_eq!(back, list);
