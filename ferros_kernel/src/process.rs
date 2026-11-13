@@ -5544,6 +5544,8 @@ fn kist_object(code: u8) -> Option<(Object, u32)> {
         "gps" => (Object::Endpoint(endpoint(b"gps")), RIGHT_SEND),
         "udp" => (Object::Endpoint(endpoint(b"udp")), RIGHT_SEND),
         "audio" => (Object::Endpoint(endpoint(b"audio")), RIGHT_SEND),
+        // The cameras (docs/CAMERA.md): a send right on the camera driver's endpoint. Until a driver serves it, a call that fails at once when nobody receives (CALL_LIVE) tells the kist so, and Lumis says there is no camera driver; never a fake camera.
+        "camera" => (Object::Endpoint(endpoint(b"camera")), RIGHT_SEND),
         _ => return None,
     })
 }

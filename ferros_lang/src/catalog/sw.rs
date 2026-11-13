@@ -247,6 +247,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RightGps => "mahali ulipo",
         Msg::RightUdp => "mtandao",
         Msg::RightAudio => "sauti",
+        Msg::RightCamera => "kamera",
         Msg::NotEnoughMemory => "kumbukumbu haitoshi",
         Msg::NotStowedHere => "haijahifadhiwa kwenye kifaa hiki",
         Msg::FailedItsChecks => "haikupita ukaguzi wake",

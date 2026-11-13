@@ -400,6 +400,8 @@ messages! {
     RightGps,
     RightUdp,
     RightAudio,
+    /// The cameras (KISTS.md, the asked rights: frames from the camera driver; built 2026-11-12 for Lumis).
+    RightCamera,
     /// Why a kist the person tapped did not start (ferros_kist::launch::why), under `Say::CouldNotStart` on its open circle: no room in the memory pool.
     NotEnoughMemory,
     /// Not stowed on this device: no capsule here, or no seal.
