@@ -247,6 +247,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RightGps => "kung nasaan ka",
         Msg::RightUdp => "ang network",
         Msg::RightAudio => "ang tunog",
+        Msg::RightCamera => "ang mga camera",
         Msg::NotEnoughMemory => "kulang ang memorya",
         Msg::NotStowedHere => "hindi naitabi sa device na ito",
         Msg::FailedItsChecks => "hindi pumasa sa mga pagsusuri nito",

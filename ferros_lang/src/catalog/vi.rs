@@ -247,6 +247,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::RightGps => "vị trí của bạn",
         Msg::RightUdp => "mạng",
         Msg::RightAudio => "âm thanh",
+        Msg::RightCamera => "máy ảnh",
         Msg::NotEnoughMemory => "không đủ bộ nhớ",
         Msg::NotStowedHere => "chưa được cất trên thiết bị này",
         Msg::FailedItsChecks => "không vượt qua được kiểm tra",

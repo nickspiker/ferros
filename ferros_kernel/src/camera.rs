@@ -2645,6 +2645,11 @@ fn focus_on(rep: &mut Vec<u8>, cam: Cam, pos: u32) {
 }
 
 pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>>, slit_lines: u32, fast: bool, shot: Shot) {
+    // The output slices (G#A000_0000 up, 32 x 16 MiB) and the sweep's copies (G#9800_0000) were free DRAM in October; since 2026-11-11 they are the frame pool's second range, the GPU's memory, the secure carveout and the layer arena (cachemap.rs; docs/CAMERA.md "Where it stands"), and the run patterns every slice before it starts. So it runs only while no process holds a frame: a boot where nothing has started.
+    let held = crate::process::with_lock(crate::frames::taken_bytes);
+    if held != 0 {
+        return line(rep, alloc::format!("refusing: processes hold A#{held} bytes of the frame pool, and this run's output slices (G#{PDMA_BUF_PA:X} up) and sweep copies (G#{SWEEP_PA:X}) are their memory now; run it only on a boot where nothing has started (docs/CAMERA.md)\n"));
+    }
     // The viewfinder's panel is adopted first, before any camera code: adopting it after the camera bring-up hung in its first EL3 call every time (2026-10-21, flash log ends at "adopting the panel"), the pattern of the EL3 poison rule (a direct PMU read, as fe_powered and the PHY isolation readback do, leaves the next SMC hanging). present() makes no EL3 calls.
     let view_panel = if shot.view > 0 {
         crate::flashlog::line("view: adopting the panel before the camera");

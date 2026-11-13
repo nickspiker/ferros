@@ -24,10 +24,10 @@ use vsf::file_format::{VsfHeader, VsfSection};
 use vsf::types::EtType;
 use vsf::VsfType;
 
-/// The rights, by code (the index): the screen (`use display`), touch (`use touch`), a surface of its own, a key derived from the device's ira, its own vault domain, randomness, the GPS fix (`use gps`), the network (`use udp`), sound out (`use audio`, docs/AUDIO.md; 2026-11-11, appended so every code before it keeps its meaning).
-pub const RIGHTS: [&str; 9] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp", "audio"];
+/// The rights, by code (the index): the screen (`use display`), touch (`use touch`), a surface of its own, a key derived from the device's ira, its own vault domain, randomness, the GPS fix (`use gps`), the network (`use udp`), sound out (`use audio`, docs/AUDIO.md; 2026-11-11, appended so every code before it keeps its meaning), the cameras (`use camera`, docs/CAMERA.md: frames from the camera driver, asked; 2026-11-12 for Lumis, appended the same way).
+pub const RIGHTS: [&str; 10] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp", "audio", "camera"];
 /// What each right is, in a person's words, for the settings pages and the first-launch question.
-pub const MEANS: [&str; 9] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound"];
+pub const MEANS: [&str; 10] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound", "the cameras"];
 /// A want the person said no to: an empty slot in the launch (process.rs `Object::Empty`).
 pub const EMPTY: u8 = 0xFF;
 
@@ -1022,7 +1022,8 @@ mod tests {
     #[test]
     fn a_want_outside_the_vocabulary_refuses_the_declaration() {
         let mut w = VsfSection::new("wants");
-        w.add_field("camera", VsfType::a(vsf::Ascii::lit("photos")));
+        // The microphone is a proposed right, not one in the vocabulary yet (the camera was the example here until it became one, 2026-11-12).
+        w.add_field("microphone", VsfType::a(vsf::Ascii::lit("voice notes")));
         let file = vsf::VsfBuilder::new().add_section_direct(w).build().unwrap();
         assert!(declaration(&file).is_err());
     }
