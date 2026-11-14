@@ -520,6 +520,8 @@ pub mod facets {
     pub const BE_YOU: u8 = 0;
     /// Op 1, the people: [1] → [`OK`][the people, a complete VSF file (fgtw::people::doc)], all of them or the chosen ones, or [a refusal below].
     pub const PEOPLE: u8 = 1;
+    /// Op 2, wait for be you (2026-11-14): [2][the count last answered u32 LE] → [`OK`][count u32 LE][ready u8], at once when the count moved on since the caller's, else held and answered the moment it does: when the identity service comes to hold what be you needs (a fleet it is a member of, the person key handed to the kernel, so the caller's alias exists) or loses it (a lock). Ready 1 means op 0 would be answered now. Refused [`NOT_GRANTED`] at once when the person did not grant be you (the grant is the launch's and never changes under a running kist). A kist that started before attest asks this instead of asking again on a clock (owner, 2026-11-10: "No polling!").
+    pub const WAIT: u8 = 2;
     /// The answer's first byte: done.
     pub const OK: u8 = 0;
     /// Refused: the person did not grant this facet to the caller (or the caller is no kist).

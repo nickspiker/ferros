@@ -3,6 +3,7 @@
 //! **The endpoint** (grant slot 11, the receive right the kernel hands the server of `fgtw` as the slot after its last). The kernel stamps every call with the caller's kist identity, which facets the person granted it, whether the person is present, and its alias's Ed25519 key (ferros_sys::facets::Stamp); nothing the caller says names a kist or a grant.
 //! - Op 0, be you: the kist hands its alias's public bundle and its possession eggs; the service checks the bundle is the alias the kernel stamped and that the eggs hold it, then signs the binding (fgtw::binding) with this device's member key, every egg the chain knows it holds. The call is held until the loop signs it (SPHINCS+ is slow), and the answer kept for the run, so a relaunch is answered at once. The answer carries the handle proof and the pinned identity key (Ed25519 of the identity seed, public: what friends pinned, PHOTON.md M2) beside the binding.
 //! - Op 1, the people: all of them, or the ones the person chose for that kist (ferros_space::people_for), as fgtw::people::doc, without their fleets.
+//! - Op 2, wait for be you (2026-11-14): the doorbell of a kist launched before the person was in (Photon, which shows "waiting for your identity" until then). Answered with a count and whether be you would be answered now, at once when the count moved on since the caller's, else held until it does: the service coming to hold a fleet it is a member of with the person key handed to the kernel (so the caller's alias exists), or losing them. At most 8 held, as op 21's; a ninth is answered at once.
 //! - Each answer only while the person is present (the kernel's word), and only while this service holds a fleet it is a member of. It never hands a root, the person key or an alias: it holds no alias, and a kist's alias is the kernel's to give.
 //!
 //! **Adding a person** (FACETS.md "Adding a person is the person's act, never a kist's"; photon identity-profile.md "type it once, derive, pin, drop"). The People page asks for the keyboard (op 15 [2]); the attest screen's keyboard (ahau) takes the handle as typed, shown as typed (a handle is not a password), computes the identity seed and the memory-hard proof there (its 24 MiB scratch is the attest screen's; this service's heap is 2 MiB), hands both in (op 30) and wipes them with the text. Here the seed gives the identity key it must pin and is wiped at once; the chain is asked of fgtw.org by the proof in the loop; its genesis must name that key (the derivation is the verification); then the person is written into the space (`PERSON`) with the name typed next (op 31, kind 3 on the keyboard). The handle reaches no disk and no wire, and this service never sees it.
@@ -43,11 +44,16 @@ pub struct Facets {
     /// The add under way, and how the last one ended.
     adding: Option<Adding>,
     pub state: u8,
+    /// Op 2 calls held (their reply tokens) until the count moves on.
+    waiting: Vec<[u8; 32]>,
+    /// Op 2's count, moved on each time be you's readiness changes, and the readiness it was last counted at.
+    ready_gen: u32,
+    ready_seen: bool,
 }
 
 impl Facets {
     pub fn new() -> Facets {
-        Facets { held: Vec::new(), made: Vec::new(), adding: None, state: add::NONE }
+        Facets { held: Vec::new(), made: Vec::new(), adding: None, state: add::NONE, waiting: Vec::new(), ready_gen: 0, ready_seen: false }
     }
 }
 
@@ -102,6 +108,20 @@ impl Client {
                     self.facets_said(&st, "people", r[0]);
                     self.reply_to(&tok, &r);
                 }
+                Some(fx::WAIT) if body.len() >= 5 => {
+                    if !st.kist || !st.be_you {
+                        self.facets_said(&st, "the wait for be you", fx::NOT_GRANTED);
+                        self.reply_to(&tok, &[fx::NOT_GRANTED]);
+                        continue;
+                    }
+                    self.ready_count();
+                    let theirs = u32::from_le_bytes([body[1], body[2], body[3], body[4]]);
+                    if theirs != self.facets.ready_gen || self.facets.waiting.len() >= 8 {
+                        self.reply_to(&tok, &self.ready_reply());
+                    } else {
+                        self.facets.waiting.push(tok);
+                    }
+                }
                 _ => self.reply_to(&tok, &[fx::MALFORMED]),
             }
         }
@@ -121,6 +141,53 @@ impl Client {
             _ => b": refused, malformed",
         });
         self.log.line();
+    }
+
+    /// Be you would be answered now: a fleet this service is a member of, and the person key in the kernel, so a kist's alias exists. The kernel's present word follows the roots, which the member chain needs.
+    fn be_you_ready(&self) -> bool {
+        self.member_chain().is_some() && self.person_in_kernel()
+    }
+
+    /// Op 2's count moved on when be you's readiness differs from when it was last counted.
+    fn ready_count(&mut self) {
+        let ready = self.be_you_ready();
+        if ready != self.facets.ready_seen {
+            self.facets.ready_seen = ready;
+            self.facets.ready_gen = self.facets.ready_gen.wrapping_add(1);
+        }
+    }
+
+    /// Op 2's answer: [OK][count u32 LE][ready u8].
+    fn ready_reply(&self) -> [u8; 6] {
+        let mut r = [fx::OK, 0, 0, 0, 0, self.facets.ready_seen as u8];
+        r[1..5].copy_from_slice(&self.facets.ready_gen.to_le_bytes());
+        r
+    }
+
+    /// The loop's turn for op 2: every held wait answered once the readiness changed in this pass.
+    pub fn facets_ring(&mut self) {
+        if self.facets.waiting.is_empty() {
+            return;
+        }
+        let was = self.facets.ready_gen;
+        self.ready_count();
+        if self.facets.ready_gen == was {
+            return;
+        }
+        let r = self.ready_reply();
+        for tok in core::mem::take(&mut self.facets.waiting) {
+            self.reply_to(&tok, &r);
+        }
+    }
+
+    /// The identity forgotten (a lock): the bindings and the add go with it; a be you still held is refused (nobody present now), so its kist is not left waiting on a call nobody answers; the op 2 waits and their count stay, and the next pass rings them with the readiness gone.
+    pub fn facets_forget(&mut self) {
+        for (tok, _) in core::mem::take(&mut self.facets.held) {
+            self.reply_to(&tok, &[fx::NOT_PRESENT]);
+        }
+        self.facets.made.clear();
+        self.facets.adding = None;
+        self.facets.state = add::NONE;
     }
 
     /// Op 0 checked: Err a refusal, Ok(Some) the answer made before, Ok(None) to be signed in the loop.

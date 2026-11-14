@@ -621,6 +621,11 @@ impl Client {
         self.space_seed(true);
     }
 
+    /// The person key handed to the kernel this run and not superseded since (`person_to_kernel`): kists' aliases can be derived. Facets op 2's readiness.
+    pub(crate) fn person_in_kernel(&self) -> bool {
+        self.space.person_told.is_some()
+    }
+
     /// The person key to the kernel (SYS_UNLOCK op 10) when it does not hold this one: at first, after another was settled on, and after the kernel locked and unlocked again (it wipes the key at lock).
     fn person_to_kernel(&mut self) {
         let Some((key, _)) = self.space.person else { return };

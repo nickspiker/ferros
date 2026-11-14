@@ -1032,8 +1032,8 @@ impl Client {
     /// Everything held for the identity whose roots were in the vault: its roots, chain standing, key, sponsors and request.
     fn forget_identity(&mut self) {
         self.dep = depart::Departing::new();
-        // The bindings made for this identity and any add under way go with it.
-        self.facets = facets::Facets::new();
+        // The bindings made for this identity and any add under way go with it; a be you still held is refused, the waits for be you are kept (facets.rs `facets_forget`).
+        self.facets_forget();
         self.add.reset();
         if self.radios_on {
             self.radios(None);
@@ -1867,6 +1867,8 @@ impl Client {
             if !self.watchers.is_empty() {
                 self.watch_ring();
             }
+            // And the kists waiting for be you (facets op 2), of a change in its readiness made by this pass.
+            self.facets_ring();
             // Work in hand, or PT moving a frame (its acks and resends are paced by its own clock): the next pass a millisecond on, as before.
             // The person at the Fleet page (the add machine open, the radios listening for a tap or a beacon, a departure under way): every 20 ms as before, since the radios are asked for what they heard (sponsor_hear) and the machines' deadlines are theirs.
             // Otherwise nothing is asked on a clock: the wait ends when the network watch rings (`NET_BELL`), when a call comes on an endpoint this thread polls (`fgtw`, `facets`), or at the loop's next deadline (`idle_until`). Without a watch (an ip from before op 11), every 20 ms as before.
