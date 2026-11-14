@@ -31,6 +31,9 @@ pub const ADDR_REGS: [u32; 25] = [
 /// The image body's register (loch0's image path) and the PD path's: where the picture and the phase-detect rows land (docs/oracle/CAMERA.md "First frame").
 pub const IMAGE_REG: u32 = 0x1C32_05C0;
 pub const PD_REG: u32 = 0x1C32_21C0;
+/// The October slots the image body and the PD path were given (tools/camera-pdma-image.py pinned the image to slot 2 for every camera; the PD path took slot 0).
+pub const OLD_SLOT_IMAGE: usize = 2;
+pub const OLD_SLOT_PD: usize = 0;
 
 const KIB: u64 = 1 << 10;
 const MIB: u64 = 1 << 20;

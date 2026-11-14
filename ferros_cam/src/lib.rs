@@ -5,6 +5,7 @@
 
 pub mod inputs;
 pub mod job;
+pub mod raw;
 pub mod rx;
 
 /// The front end's per-frame interrupt acknowledgement, in the order a camera open does it: read the word, write the same value straight back (docs/oracle/CAMERA.md "One frame reaches the front end").

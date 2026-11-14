@@ -165,5 +165,10 @@ mod tests {
         let g = prog(p).expect("a CPR2");
         println!("CPU setup: {} before, {} program, {} after", g.before.len(), g.program.len(), g.after.len());
         assert!(g.before.iter().chain(g.after.iter()).all(|(a, _)| (0x1C00_0000..0x1D00_0000).contains(&a)));
+        // Every CPU write the October runs applied lies where the driver may write: none falls between the links and the front end (the SYSMMUs and S2MPUs).
+        let refused: Vec<_> = g.before.iter().chain(g.after.iter()).filter(|&(a, _)| (0x1C04_0000..0x1C40_0000).contains(&a) && !cpu_write_allowed(a) && !(0x1C39_0000..0x1C39_1000).contains(&a) && !(0x1C36_0000..0x1C37_0000).contains(&a)).collect();
+        assert!(refused.is_empty(), "{refused:X?}");
+        let outside = g.before.iter().chain(g.after.iter()).filter(|&(a, _)| !(0x1C04_0000..0x1C40_0000).contains(&a)).count();
+        println!("CPU setup writes outside the links and the front end (the harness skipped them too): {outside}");
     }
 }
