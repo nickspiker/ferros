@@ -312,6 +312,7 @@ The process ABI (`ferros_kernel/src/process.rs`):
 - **Time slices:** 10 ms on the EL2 timer; a preempted process continues in later slices from the service loop.
 - **Boot:** after the vault opens, the kernel spawns the vault's `init` capsule — ferros's first process.
 - **Dev:** `bridge capsule` signs a binary with the developer key, `bridge spawn` runs one (with `--serve` / `--use` endpoint grants), `bridge diag console` reads what processes said.
+- **The console (2026-11-14):** one ring of 256 KiB (ferros_console), allocated at its first write and never grown, each byte tagged with its writer. A full ring overwrites its oldest text; `diag console` drains what it has not read yet, opening with `… A#<n> bytes dropped from <name>` for each writer whose text was overwritten first, and `diag "console kept"` reads the ring's last bytes without draining. A process's write is a copy into the ring: it never allocates, fails or waits. Until then the console was a Vec that grew until drained, and a chatty process (ip saying every echo under a ping flood) ran the kernel heap out and rebooted the Pro. Measured on the 8a (2026-11-14, the ring kernel with the old chatty ip, 64 x 1400-byte pings every 200 ms for 1000 s, about 17 KB of console a second): kernel heap in use A#1080968 bytes at all 16 samples (once A#1081000), no refusal, 319869 of 319960 pings answered, and each 256 s drain opened with about A#4.4 M bytes dropped from ip.
 
 ### Bring-up order
 
