@@ -543,10 +543,23 @@ impl Client {
     }
 
     /// The person key (docs/FACETS.md D0, D1), at each join once the first pull is done: opened from the space with the fleet key; sealed again under the current fleet key when this device holds it and the space has it under an earlier one (a shrink re-seals, never rotates); minted here when the identity has none yet (its first device to run this) and written into the space, so the person's other devices open the same one. Then handed to the kernel, which derives every kist's alias from it; this service derives no alias and holds none.
+    /// The decision is fgtw's (`fgtw::person::settle`, the one Photon makes on the other platforms); this keeps what it settles on, says it once, and hands the space on when it changed.
     fn space_person(&mut self) {
         let Some((hp, fk)) = self.space_ready() else { return };
-        match fgtw::person::find(&self.space.space, &hp, &fk) {
-            fgtw::person::Found::Key { key, id, minted } => {
+        let (me, grants) = (self.me, self.log.grants);
+        let held = self.space.person.as_ref().map(|(k, m)| (k, *m));
+        let settled = fgtw::person::settle(&mut self.space.space, &hp, &fk, held, || person_eggs(grants, &fk), eagle(), &me);
+        let s = match settled {
+            Ok(s) => s,
+            Err(e) => {
+                self.log.put(b"fgtw: the person key not written: ");
+                self.log.put(e.as_bytes());
+                self.log.line();
+                return;
+            }
+        };
+        match s.what {
+            fgtw::person::Settled::Opened { key, id, minted } => {
                 if self.space.person.map(|(k, _)| k) != Some(key) {
                     self.log.put(b"fgtw: person key opened from the fleet's space (id ");
                     self.log.fp(&id);
@@ -556,32 +569,29 @@ impl Client {
                 }
                 self.space.person_said = P_HELD;
             }
-            fgtw::person::Found::Elsewhere { id, minted } => match self.space.person {
-                // Ours, from before the fleet key changed: sealed again under the current one, the same mint stamp.
-                Some((k, m)) if fgtw::person::id(&k) == id && m == minted => self.person_write(&k, m, b"sealed again under the fleet's current key"),
-                _ => {
-                    if self.space.person_said != P_ELSEWHERE {
-                        self.space.person_said = P_ELSEWHERE;
-                        self.log.put(b"fgtw: the person key (id ");
-                        self.log.fp(&id);
-                        self.log.put(b") is sealed under a fleet key this device does not hold: waiting for a device that holds it to seal it again; none is minted over it");
-                        self.log.line();
-                    }
+            // Ours, from before the fleet key changed: sealed again under the current one, the same mint stamp.
+            fgtw::person::Settled::Resealed { id, .. } => self.person_written(s.changed, &id, b"sealed again under the fleet's current key"),
+            fgtw::person::Settled::WaitingElsewhere { id, .. } => {
+                if self.space.person_said != P_ELSEWHERE {
+                    self.space.person_said = P_ELSEWHERE;
+                    self.log.put(b"fgtw: the person key (id ");
+                    self.log.fp(&id);
+                    self.log.put(b") is sealed under a fleet key this device does not hold: waiting for a device that holds it to seal it again; none is minted over it");
+                    self.log.line();
                 }
-            },
-            fgtw::person::Found::None => {
-                // The identity has none yet: this device mints it, from several eggs (the single egg rule).
-                let Some(key) = self.person_mint(&fk) else {
-                    if self.space.person_said != P_NO_EGG {
-                        self.space.person_said = P_NO_EGG;
-                        self.log.put(b"fgtw: the person key not minted: an egg was missing (no kernel entropy)");
-                        self.log.line();
-                    }
-                    return;
-                };
-                let minted = eagle();
-                self.person_write(&key, minted, b"minted for this identity (its first device to run this)");
+            }
+            // The identity had none yet: this device minted it, from several eggs (the single egg rule).
+            fgtw::person::Settled::Minted { key, id, minted } => {
+                self.person_written(s.changed, &id, b"minted for this identity (its first device to run this)");
                 self.person_hold(key, minted);
+            }
+            fgtw::person::Settled::NoEgg => {
+                if self.space.person_said != P_NO_EGG {
+                    self.space.person_said = P_NO_EGG;
+                    self.log.put(b"fgtw: the person key not minted: an egg was missing (no kernel entropy)");
+                    self.log.line();
+                }
+                return;
             }
         }
         self.person_to_kernel();
@@ -596,41 +606,19 @@ impl Client {
         self.space.person_told = None;
     }
 
-    /// The person key's fact written into the space under the current fleet key, kept, and handed to the fleet and fgtw.org (the existing space slot, sealed: fgtw.org never sees the key).
-    fn person_write(&mut self, key: &[u8; 32], minted: i64, what: &[u8]) {
-        let Some((hp, fk)) = self.space_ready() else { return };
-        let me = self.me;
-        match fgtw::person::put(&mut self.space.space, key, minted, &hp, &fk, &me, eagle()) {
-            Ok(true) => {
-                self.log.put(b"fgtw: the person key (id ");
-                self.log.fp(&fgtw::person::id(key));
-                self.log.put(b") ");
-                self.log.put(what);
-                self.log.line();
-                self.space_keep();
-                self.space_to_fleet();
-                self.space_seed(true);
-            }
-            Ok(false) => {}
-            Err(e) => {
-                self.log.put(b"fgtw: the person key not written: ");
-                self.log.put(e.as_bytes());
-                self.log.line();
-            }
+    /// The person key's fact, written into the space under the current fleet key by `settle`, said, kept, and handed to the fleet and fgtw.org (the existing space slot, sealed: fgtw.org never sees the key). Nothing when the space did not change.
+    fn person_written(&mut self, changed: bool, id: &[u8; 32], what: &[u8]) {
+        if !changed {
+            return;
         }
-    }
-
-    /// A new person key from three eggs, each its own source: the kernel's entropy (KOHI's: the firmware TRNG, RNDR and the kernel's timing jitter under a health test), this process's own timing jitter, and the fleet key (minted by whichever device founded this epoch's key, often another device). None when the kernel gives no entropy: never minted from fewer.
-    fn person_mint(&mut self, fleet_key: &[u8; 32]) -> Option<[u8; 32]> {
-        let mut kernel = [0u8; 64];
-        if ferros_sys::entropy(cap(self.log.grants, crate::S_ENTROPY), &mut kernel) != kernel.len() as u64 {
-            return None;
-        }
-        let mut jitter = jitter_egg();
-        let key = fgtw::person::mint(&[&kernel, &jitter, fleet_key]);
-        kernel.fill(0);
-        jitter.fill(0);
-        key
+        self.log.put(b"fgtw: the person key (id ");
+        self.log.fp(id);
+        self.log.put(b") ");
+        self.log.put(what);
+        self.log.line();
+        self.space_keep();
+        self.space_to_fleet();
+        self.space_seed(true);
     }
 
     /// The person key to the kernel (SYS_UNLOCK op 10) when it does not hold this one: at first, after another was settled on, and after the kernel locked and unlocked again (it wipes the key at lock).
@@ -800,6 +788,17 @@ impl Client {
         }
         0
     }
+}
+
+/// The eggs a new person key is minted from (`fgtw::person::settle` asks only when the identity has none), each its own source: the kernel's entropy (KOHI's: the firmware TRNG, RNDR and the kernel's timing jitter under a health test), this process's own timing jitter, and the fleet key (minted by whichever device founded this epoch's key, often another device).
+/// No eggs at all when the kernel gives no entropy, so settle mints nothing: never minted from fewer.
+fn person_eggs(grants: u64, fleet_key: &[u8; 32]) -> Vec<Vec<u8>> {
+    let mut kernel = alloc::vec![0u8; 64];
+    if ferros_sys::entropy(cap(grants, crate::S_ENTROPY), &mut kernel) != kernel.len() as u64 {
+        kernel.fill(0);
+        return Vec::new();
+    }
+    alloc::vec![kernel, jitter_egg(), fleet_key.to_vec()]
 }
 
 /// This process's own timing jitter, one egg of the person key's mint: the counter read around a little hashing whose input is the readings so far, so each run's timing feeds the next. Its low byte per sample, taken whole; the mint hashes it. Measured here, in EL0, apart from the kernel's own jitter source.
