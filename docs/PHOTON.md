@@ -241,6 +241,7 @@ From then on records the person publishes (the profile, the avatar wall, their s
 - **std/photon**: its main asks the kernel for the alias and the identity service for the handle proof and the binding, and hands them in; Photon's capsule wants be you and people (its words in KISTS.md "The permission list").
 - **Nothing to move on ferros devices**: whatever Photon kept there is development data, as with the device key above.
 - **Built 2026-11-13** (FACETS.md "Built (2026-11-13 …)"): the kernel's alias call and the person key (11-12), the `facets` endpoint with the binding and the people, the rights in Photon's capsule, and std/photon's main building `PhotonKeys` (`legacy_seed` None). Waiting on Photon: `PhotonApp::set_photon_keys` and a way in for the people; until then std/photon holds them and Photon keeps its handle screen.
+- **Built 2026-11-14** (FACETS.md "Built (2026-11-14 …)"): no handle screen on ferros at all (photon f6d954bf, owner: "why is that in the ferros build at all?"). Without be you at start Photon shows "waiting for your identity"; std/photon holds the identity service's wait for be you (facets op 2) and hands the person into the running app thru fluor's wake path the moment it answers. On glass on the 8a: launched before the person key was in, it waited and then opened on its own; launched after, it opened straight on its contacts.
 
 ### Decisions
 
