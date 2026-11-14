@@ -1038,7 +1038,7 @@ fn spawn_wallgen(store: &mut Option<ShimStore>, seed: &[u8; 32]) {
     match crate::process::spawn_capsule(b"wallgen", &capsule, seed, &[Store(b"map"), Use(b"display"), Use(b"gpu"), Dma(b"layers-32")], &sealed) {
         Ok(o) => {
             mark_ran(&o);
-            crate::process::push_console(&o.console);
+            crate::process::console_flashlog(&o.console);
         }
         Err(e) => crate::process::push_console(alloc::format!("home: wallgen refused: {e}\n").as_bytes()),
     }
@@ -1240,7 +1240,7 @@ fn restart_with(store: &mut Option<ShimStore>, names: &[u8], input: &[u8], rep: 
             platform::crumb(0x53);
             match r {
                 Ok(o) => {
-                    crate::process::push_console(&o.console);
+                    crate::process::console_flashlog(&o.console);
                     rep.extend_from_slice(alloc::format!("{nm} {}\n", if killed { "restarted" } else { "started" }).as_bytes());
                     crate::flashlog::line(&alloc::format!("restart {nm}: started from its pieces"));
                 }
@@ -1264,7 +1264,7 @@ fn restart_with(store: &mut Option<ShimStore>, names: &[u8], input: &[u8], rep: 
         platform::crumb(0x53);
         match crate::process::spawn_capsule(name, &capsule, input, &grants, &sealed) {
             Ok(o) => {
-                crate::process::push_console(&o.console);
+                crate::process::console_flashlog(&o.console);
                 rep.extend_from_slice(alloc::format!("{} {}\n", core::str::from_utf8(name).unwrap_or("?"), if killed { "restarted" } else { "started" }).as_bytes());
                 crate::flashlog::line(&alloc::format!("restart {nm}: started"));
             }
@@ -1303,7 +1303,7 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
                 crate::checklist::dot(0);
                 crate::board::probe(7);
                 crate::board::probe_starve(9);
-                crate::process::push_console(&o.console);
+                crate::process::console_flashlog(&o.console);
             }
             Some(Err(e)) => {
                 crate::process::push_console(b"home: akita, usb refused: ");
@@ -1337,7 +1337,7 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
         match crate::process::spawn_capsule(b"vault", VAULT_CARRIED, b"", &vault_grants(), &sealed) {
             Ok(o) => {
                 mark_ran(&o);
-                crate::process::push_console(&o.console);
+                crate::process::console_flashlog(&o.console);
                 crate::process::push_console(b"home: vault from the kernel image\n");
                 vault_up = true;
             }
@@ -1349,7 +1349,7 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
             match crate::process::spawn_capsule(b"vault", &vc, b"", &vault_grants(), &sealed) {
                 Ok(o) => {
                     mark_ran(&o);
-                    crate::process::push_console(&o.console);
+                    crate::process::console_flashlog(&o.console);
                 }
                 Err(e) => crate::process::push_console(alloc::format!("home: vault refused: {e}\n").as_bytes()),
             }
@@ -1361,7 +1361,7 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
             Some(gc) => match crate::process::spawn_capsule(b"gpu", &gc, b"", &gpu_grants(), &sealed) {
                 Ok(o) => {
                     mark_ran(&o);
-                    crate::process::push_console(&o.console);
+                    crate::process::console_flashlog(&o.console);
                 }
                 Err(e) => crate::process::push_console(alloc::format!("home: gpu refused: {e}\n").as_bytes()),
             },
@@ -1378,7 +1378,7 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
                 crate::checklist::mark(crate::checklist::Item::Syscall);
                 crate::checklist::mark(crate::checklist::Item::Caps);
             }
-            crate::process::push_console(&o.console)
+            crate::process::console_flashlog(&o.console)
         }
         Err(e) => {
             crate::process::push_console(b"home: init refused: ");
@@ -3285,14 +3285,14 @@ pub fn run(mut b: Boot) -> ! {
                     continue;
                 }
                 if cmd.params == b"console kept" || cmd.params.starts_with(b"console kept ") {
-                    // `diag "console kept [KiB]"`: the console's last KiB (default 256, at most 256: a reply's room) as kept, drained or not, without draining it (process.rs `console_kept`).
+                    // `diag "console kept [KiB]"`: the console's last KiB (default 256, at most 256: a reply's room, and the whole ring, ferros_console RING) as kept, drained or not, without draining it (process.rs `console_kept`).
                     let kib = core::str::from_utf8(&cmd.params[12..]).ok().and_then(|t| t.trim().parse::<usize>().ok()).unwrap_or(256).clamp(1, 256);
                     resp.extend_from_slice(&crate::process::console_kept(kib * 1024));
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
                 if cmd.params == b"console" {
-                    // What processes have sent their consoles since the last read (background slices included), and how many are alive.
+                    // What processes have sent their consoles since the last read (background slices included), after a line for each writer whose text the ring overwrote before this read (ferros_console), and how many are alive.
                     append_hex(&mut resp, b"ALIVE=", crate::process::alive() as u32);
                     resp.extend_from_slice(&crate::process::take_console());
                     queue_pt_response(&mut pt_out_data, &resp);

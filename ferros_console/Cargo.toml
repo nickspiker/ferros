@@ -1,0 +1,9 @@
+[package]
+name = "ferros_console"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The kernel's process console: one fixed ring, allocated once, never growing; the oldest text overwritten when it is full, the bytes a drain never read counted per process. no_std."
+
+[lib]
+path = "src/lib.rs"

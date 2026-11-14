@@ -226,6 +226,9 @@ struct Path {
     took: [(u16, u32, u32, u64, u64); 4],
     /// When this window began (0: not yet), for the idle report every 64 s or more (`main`): with no timer bringing passes, the window's passes and waits are the stack's wakes at rest.
     t0: u64,
+    /// Echo requests answered, IPv4 (WiFi and the cellular call) and IPv6: counted here, said once a window, where each was a console line of its own until 2026-11-14 (`PING_LINES`).
+    echoes4: u32,
+    echoes6: u32,
 }
 
 impl Path {
@@ -284,6 +287,13 @@ impl Path {
         ip.dec(self.requests as u64);
         ip.put(b", watches answered A#");
         ip.dec(self.watch_answers as u64);
+        if self.echoes4 != 0 || self.echoes6 != 0 {
+            ip.put(b"; echoes answered A#");
+            ip.dec(self.echoes4 as u64);
+            ip.put(b" IPv4, A#");
+            ip.dec(self.echoes6 as u64);
+            ip.put(b" IPv6");
+        }
         for &(port, who, n, t, most) in self.took.iter().filter(|e| e.2 > 0) {
             ip.put(b"; port A#");
             ip.dec(port as u64);
@@ -319,6 +329,12 @@ static mut EXCH: [u8; EXCH_MAX] = [0; EXCH_MAX];
 const WIFI_RING: bool = match option_env!("FERROS_WIFI_IRQ") {
     Some(v) => !(v.len() == 1 && v.as_bytes()[0] == b'0'),
     None => true,
+};
+/// A console line for every echo answered (`FERROS_IP_PINGS=1` builds; development only, off by default).
+/// Under a flood of 320 pings a second those lines were the device's whole console, and the kernel's console grew until its heap ran out and the Pro rebooted (2026-11-14); in steady state the echoes are counted in the WiFi path's 64 s line instead (`Path::echoes4`, `echoes6`).
+const PING_LINES: bool = match option_env!("FERROS_IP_PINGS") {
+    Some(v) => v.len() == 1 && v.as_bytes()[0] == b'1',
+    None => false,
 };
 /// The doorbell's word: 0 armed (the helper's call held at the driver, or about to be), 1 frames wait at the driver, 2 the driver gone (the call failed: the main thread re-arms it once `wifi_up` finds a driver again), 3 a driver without the doorbell (op 9 answered with nothing: never armed again).
 static RING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1293,6 +1309,7 @@ impl Ip {
                 let c = csum(&r[..n], 0);
                 r[2..4].copy_from_slice(&c.to_be_bytes());
                 self.out4(true, dst, src, 1, &r[..n]);
+                self.path.echoes4 += 1;
             }
             1 if mine && body.len() >= 8 && body[0] == 8 => {
                 let mut r = [0u8; 1480];
@@ -1306,9 +1323,12 @@ impl Ip {
                 let me = self.v4;
                 self.ipv4_send(src_mac, me, src, 1, &r[..n]);
                 self.arp_learn(src, src_mac);
-                self.put(b"ping from ");
-                self.v4_put(src);
-                self.put(b"\n");
+                self.path.echoes4 += 1;
+                if PING_LINES {
+                    self.put(b"ping from ");
+                    self.v4_put(src);
+                    self.put(b"\n");
+                }
             }
             6 if mine && body.len() >= 20 => {
                 let (mut a, mut d) = ([0u8; 16], [0u8; 16]);
@@ -1669,9 +1689,12 @@ impl Ip {
                 r[0] = 129;
                 self.icmp6_send_hop(src_mac, dst, src, &mut r[..n], HOP);
                 self.nd_learn(src, src_mac);
-                self.put(b"ping6 from ");
-                self.v6_put(src);
-                self.put(b"\n");
+                self.path.echoes6 += 1;
+                if PING_LINES {
+                    self.put(b"ping6 from ");
+                    self.v6_put(src);
+                    self.put(b"\n");
+                }
             } else if ty == 134 && p[7] == 255 && src[0] == 0xFE && src[1] & 0xC0 == 0x80 {
                 // WHY the checks (RFC 4861 6.1.2): an advertisement comes from a router's link-local address at hop limit 255, which no packet forwarded from off the link can have; it now names the DNS server too, so one from anywhere else is not believed.
                 self.router_adv(src_mac, src, body);
