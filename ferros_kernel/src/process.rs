@@ -696,6 +696,8 @@ struct Thread {
     wkind: u8,
     /// Its word wait (`State::Waiting` on an arc word) ends for a call to an endpoint it polls (SYS_WAIT x3 bit 1, `wake_server`).
     wait_call: bool,
+    /// The name it gave itself (SYS_THREAD_NAME: std's thread name), its first 16 bytes, zero past the end; all zero for none. A fault names the thread by it (`fault_report`).
+    label: [u8; 16],
 }
 
 /// The longest forwarded store call (`STORE_GETS[3]`): its caller's name (`pin_key`), and what it was (`Thread::what`); and the calls answered while the clock policy held each of its states (0 not yet applied: the boot's own clocks, 1 rest, 2 active, 3 dark; service.rs `clock_state`), so a slow read says whether the cores were at their reading clocks (2026-11-11).
@@ -784,6 +786,8 @@ struct Process {
     moves: u32,
     /// Ranges of the arc whose frames were given back while the arc kept its size (ARCS.md step 4): arc offsets, whole frames. A masked arc's power-of-two slack between its image and its first stack at spawn, and what the process gives back (SYS_ARC `ARC_RELEASE`). Unmapped: the process faults there, and no syscall buffer may lie there (`span`, `word`).
     holes: Vec<(usize, usize)>,
+    /// Pages of the arc it made kernel-only itself (SYS_ARC `ARC_GUARD`): the guards under its threads' stacks, arc offsets. Only these may be handed back by `ARC_UNGUARD`, and a fault in one says a stack ran past its end (`fault_report`).
+    guards: Vec<usize>,
     /// Its register grants for the MMIO syscall without the kernel lock (`mmio_fast`), in a box of its own: the Process moves when the process table grows, the box does not.
     fast: alloc::boxed::Box<Grants>,
 }
@@ -1302,7 +1306,7 @@ const SYS_CLAIM: u64 = 37;
 const SYS_BELL: u64 = 38;
 /// not_started(op, …): the kist launches init answered "started" for that the kernel's kist job did not start after all, and the kists that started and then ended by a fault, a panic or a kill from outside (`NOT_STARTED`; owner, 2026-11-11: Mahere tapped, nothing opened, "it looked stuck"; then Mahere faulting at once, "no toast or anything"), for the Settings holder alone (the map), as the claims' users list. Op 0: x1 the Settings token, x2/x3 a buffer and its length → how many records (all of them; whole records past the buffer are not written), each `NOT_STARTED_REC` bytes: the reason (ferros_kist::launch::why), the capsule's address (32 bytes), the kists' bell count it rang (u64 LE). Op 1: the kists' doorbell, x1 a word in the caller's arc, x2 the Settings token: the bell's change count written there now and whenever a launch does not start, a kist starts, or a kist ends any way, its waiters woken → 0. Op 2: the kists alive (owner, 2026-11-11: their circles glow running, stopped or not running), x1 the Settings token, x2/x3 a buffer and its length → how many (all of them; whole ones past the buffer are not written), each a capsule's address (32 bytes) of a process the kist job started that is not ending (`kists_live`). ERR without Settings, or for no such op.
 const SYS_NOT_STARTED: u64 = 39;
-/// arc(op, bytes): the caller's own arc grows or shrinks (ARCS.md step 2; owner, 2026-11-11: "why we cannot scale on demand, that was the whole point of ring memory"). No capability: a process reaches only its own arc, and only as far as its ceiling (`Arc::ceiling`: the most its build declared, its header's heap counted whole; fixed mode's size). Op 0 `ARC_GROW`: at least x1 more bytes (native: whole frames; ring: the mask doubles until they fit; exact: the limit moves) → x0 the new top (the arc's size, exact mode's limit), x1 the old one; the bytes between are new, zeroed, the process's. Op 1 `ARC_SHRINK`: keep the first x1 bytes (rounded up as the mode needs; never under what the process was spawned with) and give the rest back → x0 the new top, x1 the old. Op 2 `ARC_SIZE` → x0 the top, x1 the ceiling. Op 3 `ARC_RELEASE`: the frames wholly inside x2 bytes from arc offset x1 given back while the arc keeps its size (step 4; never the first frame, nor one the kernel holds a word in): a hole the process must not touch again until a grow over it → x0 the bytes given back, x1 the top. A masked arc's grow or shrink while another of its threads runs elsewhere holds the process off the cores first (`hold`, step 3): its mask or limit changes in every thread at once. Refused: x0 = ERR, x1 the reason (`ARC_WHY_*`), said on the console too.
+/// arc(op, bytes): the caller's own arc grows or shrinks (ARCS.md step 2; owner, 2026-11-11: "why we cannot scale on demand, that was the whole point of ring memory"). No capability: a process reaches only its own arc, and only as far as its ceiling (`Arc::ceiling`: the most its build declared, its header's heap counted whole; fixed mode's size). Op 0 `ARC_GROW`: at least x1 more bytes (native: whole frames; ring: the mask doubles until they fit; exact: the limit moves) → x0 the new top (the arc's size, exact mode's limit), x1 the old one; the bytes between are new, zeroed, the process's. Op 1 `ARC_SHRINK`: keep the first x1 bytes (rounded up as the mode needs; never under what the process was spawned with) and give the rest back → x0 the new top, x1 the old. Op 2 `ARC_SIZE` → x0 the top, x1 the ceiling. Op 3 `ARC_RELEASE`: the frames wholly inside x2 bytes from arc offset x1 given back while the arc keeps its size (step 4; never the first frame, nor one the kernel holds a word in): a hole the process must not touch again until a grow over it → x0 the bytes given back, x1 the top. Ops 4 `ARC_GUARD` and 5 `ARC_UNGUARD` (2026-11-14): the page at arc offset x1 (4 KiB aligned) made kernel-only, the guard under a thread's stack (ferros_rt `thread::spawn`), or made the process's data again → x0 0; guard takes only a writable data page of the process's, unguard only a page it guarded (never the grants page, its code, the entry stack's guard or a masked arc's), a release or a shrink over a guard forgets it; a kernel from before refuses both (`ARC_WHY_OP`), and the stack goes unguarded. A masked arc's grow or shrink while another of its threads runs elsewhere holds the process off the cores first (`hold`, step 3): its mask or limit changes in every thread at once. Refused: x0 = ERR, x1 the reason (`ARC_WHY_*`), said on the console too.
 const SYS_ARC: u64 = 40;
 /// offer(op, stow, …): the kist offered over USB to stow (`OFFER`; docs/KISTS.md "Stowing", ferros_kist::offer; owner, 2026-11-11: "Just seems to me that we should just make a proper checked path and start using it"), for the stower alone: x1 the offset of its Stow token (`Object::Stow`). Op 0: the offers' doorbell, x2 a word in the caller's arc: the offers' change count written there now and whenever a host offers a kist, its waiters woken (`bell_register`, `BELL_OFFERS`) → 0. Op 1: the offer not yet ended, x2/x3 a buffer and its length (40 at least) → 0 with [capsule 32][length u64 LE] written (an offer still OFFERED becomes CHECKING), NOTHING when there is none. Op 2: its state as the stower has it, x2/x3 [capsule 32][state u8][why u8][flags u8] → 0, NOTHING when that capsule is not the offer or the offer has ended; the service loop answers a host's held read (`offer_state`). ERR without the Stow right, or for no such op.
 const SYS_OFFER: u64 = 41;
@@ -1310,6 +1314,8 @@ const SYS_OFFER: u64 = 41;
 const SYS_CALLER: u64 = 42;
 /// notify(op, …): notes, what kists have waiting on the person (notify.rs, docs/NOTIFY.md; owner, 2026-11-12: "I think we try it with the in view, it can notify me, out of view, silent"). No capability for a kist: the kernel knows it by its capsule. Op 0 post: x1/x2 a note (ferros_kist::note, at most note::MAX bytes), a kist's own; or, from a Settings holder that is not a kist, x3 its Settings token and x4 a 32-byte source, the system's note on a kist's behalf → the note's number (0-15) | the kind the kernel decided << 8; NOTHING nobody present, or the kist at a count (WAITING waiting, or POSTS since the person last looked); ERR not a note. Op 1 withdraw: x1 the number (G#FF all) of the caller's own, or the system's with x2 a Settings token and x3 the source → how many went. Op 2, a kist: the note the person opened (x1 its number, x2/x3 a buffer) → the document's length (written whole if it fits), NOTHING when that is not the one opened. Ops 3-6 for a Settings holder that is not a kist (the deck): 3 the list (x1 the token, x2/x3 a buffer) → how many, each `notify::REC` bytes; 4 the doorbell (x1 a word, x2 the token; `BELL_NOTES`); 5 seen (x1 the token, x2 a 32-byte source, x3 a number or G#FF, x4 1 the person opened that note) → how many went; 6 one note's document (x1 the token, x2 [source 32][number u8], x3/x4 a buffer) → its length, NOTHING none. ERR for anything else.
 const SYS_NOTIFY: u64 = 43;
+/// thread_name(name, len): the calling thread names itself (2026-11-14: "Photon.9: FAULT" did not say which of Photon's threads it was); std passes its thread's name (`thread::Builder::name`). x0/x1 the name in the caller's arc; its first 16 bytes are kept, and a fault's console line carries them (`fault_report`). No capability: a thread names only itself, and the name is only ever printed. → 0. A kernel from before answers ERR (no such syscall), which ferros_rt ignores.
+const SYS_THREAD_NAME: u64 = 44;
 #[path = "notify.rs"]
 mod notify;
 pub use notify::{clear as notes_clear, kind_name as note_kind_name, kist_named as note_kist_named, post_system as note_post_system, report as notes_report};
@@ -1319,6 +1325,8 @@ pub const ARC_GROW: u64 = 0;
 pub const ARC_SHRINK: u64 = 1;
 pub const ARC_SIZE: u64 = 2;
 pub const ARC_RELEASE: u64 = 3;
+pub const ARC_GUARD: u64 = 4;
+pub const ARC_UNGUARD: u64 = 5;
 /// Why SYS_ARC refused: past the arc's ceiling, too few free frames in the pool, (no longer: a masked arc with another of its threads running on another core, which is held now), under what the process was spawned with, over a word the kernel holds in it (a bell, the sensors' block, the stower's word), an unknown op.
 pub const ARC_WHY_CEILING: u64 = 1;
 pub const ARC_WHY_MEMORY: u64 = 2;
@@ -1328,6 +1336,8 @@ pub const ARC_WHY_BUSY: u64 = 3;
 pub const ARC_WHY_FLOOR: u64 = 4;
 pub const ARC_WHY_HELD: u64 = 5;
 pub const ARC_WHY_OP: u64 = 6;
+/// ARC_GUARD on a page that is not a writable data page of the process's, or ARC_UNGUARD on one it did not guard.
+pub const ARC_WHY_PAGE: u64 = 7;
 /// A record of SYS_CLAIM op 2: the kind, then a capsule address.
 pub const CLAIM_REC: usize = 33;
 /// Each link's control block: words 1 to CONTROLS - 1 (word 0 is the generation, `CONTROL_GEN`), all ones until set.
@@ -3513,11 +3523,20 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 frame.x[26] = p.arc.base as u64;
                 frame.x[0] = arg;
                 let mask = t.mask;
-                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, wait_call: false });
+                let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, wait_call: false, label: [0; 16] });
                 enqueue_back(nt);
                 tr(TR_RUN, nt, 0xFFFF);
                 f.x[0] = 0;
             }
+            0
+        }
+        SYS_THREAD_NAME => {
+            // WHY the min: the name is the process's; only its first 16 bytes are kept, so only they are read.
+            let n = if f.x[1] < 16 { f.x[1] as usize } else { 16 };
+            let name = p.read(f.x[0], n);
+            t.label = [0; 16];
+            t.label[..n].copy_from_slice(&name);
+            f.x[0] = 0;
             0
         }
         SYS_PIN => {
@@ -5113,6 +5132,27 @@ fn arc_call(f: &mut Frame, cur: usize, pi: usize) -> u64 {
         }
         return 0;
     }
+    // A page of its own made kernel-only, or made its own again (2026-11-14: Photon's alias thread ran its 256 KiB heap stack 110 KiB past its end, over whatever lay below, and a thread died later on a return address it had never written). No mask or limit changes, so no hold.
+    if op == ARC_GUARD || op == ARC_UNGUARD {
+        let off = f.x[1] as usize;
+        let p = kk.procs.get_mut(pi).and_then(|x| x.as_mut()).unwrap();
+        let top = if p.arc.limit != 0 { p.arc.limit } else { p.arc.size };
+        let held = p.guards.contains(&off);
+        // WHY: the offset is the process's; one off a page boundary or with its page past the arc's top names no page of it (top - off cannot wrap once off < top).
+        let ok = off % 4096 == 0 && off < top && top - off >= 4096 && held == (op == ARC_UNGUARD) && crate::cachemap::page_guard(p.arc.base + off, op == ARC_GUARD);
+        if !ok {
+            arc_answer(pi, op, n, Err(ARC_WHY_PAGE), f);
+            return 0;
+        }
+        if op == ARC_GUARD {
+            p.guards.push(off);
+        } else {
+            p.guards.retain(|&g| g != off);
+        }
+        f.x[0] = 0;
+        f.x[1] = top as u64;
+        return 0;
+    }
     let r = arc_op(pi, op, n);
     // The caller's own x27 is live in `f` (`arc_op` set every thread off a core).
     if let (Ok(_), Some(p)) = (&r, kk.procs.get(pi).and_then(|x| x.as_ref())) {
@@ -5139,7 +5179,7 @@ fn arc_answer(pi: usize, op: u64, n: u64, r: Result<(u64, u64), u64>, f: &mut Fr
             f.x[1] = was;
         }
         Err(why) => {
-            let reason = ["", "past its ceiling", "the pool has too few free frames", "another of its threads runs on another core", "under what it was spawned with", "a word the kernel holds lies past the new end", "no such op"][why as usize];
+            let reason = ["", "past its ceiling", "the pool has too few free frames", "another of its threads runs on another core", "under what it was spawned with", "a word the kernel holds lies past the new end", "no such op", "not a page it may guard or unguard"][why as usize];
             let line = alloc::format!("{name}: arc op {op} of G#{n:X} refused: {reason}\n");
             kk.console.extend_from_slice(line.as_bytes());
             f.x[0] = ERR;
@@ -5201,6 +5241,8 @@ fn arc_op(pi: usize, op: u64, n: u64) -> Result<(u64, u64), u64> {
             h.1 = mapped;
         }
     }
+    // And the guards past it: their pages are no longer the process's.
+    p.guards.retain(|&g| g + 4096 <= size);
     let x27 = p.arc.x27() as u64;
     for (i, x) in kk.threads.iter_mut().enumerate() {
         if let Some(x) = x {
@@ -5360,6 +5402,8 @@ fn arc_release(pi: usize, p: &mut Process, lo: usize, hi: usize) -> Result<usize
         crate::frames::give(f);
     }
     p.holes.push((lo, hi));
+    // A guard in what went is gone with its frame.
+    p.guards.retain(|&g| g < lo || g >= hi);
     Ok(n)
 }
 
@@ -5583,6 +5627,15 @@ fn fault_report(f: &Frame, base: u64) {
     };
     let mut o = Vec::new();
     o.extend_from_slice(&name);
+    // The name the thread gave itself (SYS_THREAD_NAME), when it gave one.
+    if let Some(t) = kk.threads.get(cur).and_then(|x| x.as_ref()) {
+        let n = t.label.iter().position(|&c| c == 0).unwrap_or(16);
+        if n != 0 {
+            o.extend_from_slice(b" (");
+            o.extend_from_slice(&t.label[..n]);
+            o.push(b')');
+        }
+    }
     o.extend_from_slice(b": FAULT esr ");
     hex(&mut o, f.esr);
     o.extend_from_slice(b" elr+");
@@ -5592,6 +5645,11 @@ fn fault_report(f: &Frame, base: u64) {
     o.extend_from_slice(b" sp+");
     hex(&mut o, f.sp_el0.wrapping_sub(base));
     o.push(b'\n');
+    // A data abort in a page the process guarded itself (ARC_GUARD): the thread's stack ran past its end.
+    if (f.esr >> 26) & 0x3F == 0x24 && proc_of(cur).is_some_and(|p| p.guards.contains(&(f.far.wrapping_sub(base) as usize & !4095))) {
+        o.extend_from_slice(&name);
+        o.extend_from_slice(b": the fault is in the guard page under a thread's stack: the stack ran past its end\n");
+    }
     for (i, r) in f.x.iter().enumerate() {
         if i % 8 == 0 {
             o.extend_from_slice(&name);
@@ -6834,7 +6892,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // The register grants by slot, for `mmio_fast`: HARDWARE has fewer than 255 blocks, so an index plus one fits a byte.
     let hw = cspace.iter().map(|c| match c.object { Object::Hardware(g) => g as u8 + 1, _ => 0 }).collect();
     let fast = alloc::boxed::Box::new(Grants { hw, ended: core::sync::atomic::AtomicBool::new(false) });
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, words: Vec::new(), input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, gate: None, facets: 0, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), fast };
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, words: Vec::new(), input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, gate: None, facets: 0, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), guards: Vec::new(), fast };
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     vault_spawned(objects);
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.
@@ -6891,7 +6949,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // A masked arc's power-of-two slack (ARCS.md step 4): the frames wholly between its image (code, zeroed tail, input) and its first stack's guard page hold nothing it was built with, and masked code reaches only what it was linked with (its statics, its static heaps, its stacks), so they go back to the pool at once (ahau: 20 MiB of its 128). Not exact mode's, whose limit may grow into it; a native arc is whole frames already.
     // Not given back at spawn (2026-11-11, the Pro's first ARCS boot: ahau's thread 7 wrote at arc offset G#760_0000, inside the 18 MiB released here, and faulted, so the device had no attest screen): a masked no_std process's allocator grows into exactly this span, so it is not slack. A process gives back what it knows it no longer needs itself (SYS_ARC op 3).
     let _ = (masked, floor);
-    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, wait_call: false });
+    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS, called: 0, what: 0, ran: 0, ran_at: 0, woke: 0, wkind: 0, wait_call: false, label: [0; 16] });
     Ok((me, arc, in_off))
 }
 

@@ -445,6 +445,12 @@ pub fn enable() -> bool {
             "bic {t}, {t}, #(1 << 26)",
             "bic {t}, {t}, #(1 << 14)",
             "bic {t}, {t}, #(1 << 15)",
+            // Pointer authentication off for EL2 and EL0 whatever the boot path left (EnIA 31, EnIB 30, EnDA 27, EnDB 13): the four keys hold shares of the ira and wairua (keys.rs), and C built with branch protection carries PACIASP/AUTIASP, which would sign return addresses with them and hand an app a keyed value of a share.
+            // Measured clear on the Pro 2026-11-14 (SCTLR_EL2 G#30C51995 on boot b870), but inherited from the loader until now; the workers copy this register (smp.rs, x3.rs).
+            "bic {t}, {t}, #(1 << 31)",
+            "bic {t}, {t}, #(1 << 30)",
+            "bic {t}, {t}, #(1 << 27)",
+            "bic {t}, {t}, #(1 << 13)",
             "msr sctlr_el2, {t}",
             "isb",
             mair = in(reg) MAIR,
@@ -597,6 +603,22 @@ pub fn pages_open(va: usize, len: usize, open: bool) {
         a += PAGE;
     }
     unmapped(va, len);
+}
+
+/// One page of an arc taken to kernel-only (`close`) or handed back as the process's data (SYS_ARC `ARC_GUARD`/`ARC_UNGUARD`, process.rs `arc_call`): the guard under a thread's stack. Only a page that is the process's writable, never-executable data closes, and only a kernel-only page opens (the caller checks it is one the process closed itself); every core forgets the old entry. False, with nothing changed, for a page in any other state or not mapped.
+pub fn page_guard(va: usize, close: bool) -> bool {
+    if !vhe() {
+        return false;
+    }
+    let Some(e) = page_entry(va) else { return false };
+    let pa = (*e & OA) as usize;
+    let (from, to) = if close { (pool_page(true, pa, true, false), kernel_page(pa)) } else { (kernel_page(pa), pool_page(true, pa, true, false)) };
+    if *e != from {
+        return false;
+    }
+    *e = to;
+    unmapped(va, PAGE);
+    true
 }
 
 /// Map frame `pa` at the window slot `va` (2 MiB aligned, inside ARC_VA) through the frame's own level-3 table at `table` (frames.rs): its first `usable` bytes as the process's data (writable, never executable; `set_arc_wx` makes code of them), the rest kernel-only (the slack of an arc smaller than its frames, which is a masked arc's guard). The slot must be unmapped. Call `mapped` once the arc's slots are in.
