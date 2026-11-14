@@ -19,8 +19,8 @@ const DEAD: u64 = 3;
 /// The 64 KiB stack the kernel gives the entry thread at the arc's top (process.rs STACK); the heap stops below it and the guard page under it (layout.rs).
 pub const ENTRY_STACK: usize = crate::layout::ENTRY_STACK;
 
-/// What std gives a thread that names no stack size (the fork's `DEFAULT_MIN_STACK_SIZE`): 2 MiB, what std gives one on Linux, where the apps are written and run first. It was 256 KiB until 2026-11-14, and Photon's alias signing alone takes ~370 KiB (fgtw's `SigningBundle::eggs` 242 KiB of frame, fn-dsa's key decode 116 KiB under it).
-pub const DEFAULT_STACK: usize = 2 << 20;
+/// What std gives a thread that names no stack size (the fork's `DEFAULT_MIN_STACK_SIZE`): 1 MiB (owner, 2026-11-14: "1MB"), since a thread's stack is fully committed on ferros (Photon's 79 threads: ~79 MiB at 1 MiB against ~158 MiB at Linux's 2 MiB) and the guard page under every stack makes an overflow fault at once. It was 256 KiB until 2026-11-14, and Photon's alias signing alone took ~370 KiB (fgtw's `SigningBundle::eggs` 242 KiB of frame, fn-dsa's key decode 116 KiB under it).
+pub const DEFAULT_STACK: usize = 1 << 20;
 
 /// The guard page under each stack: one page, what LLVM's inline stack probes step by, so no frame can step over it.
 pub const GUARD: usize = 1 << 12;
