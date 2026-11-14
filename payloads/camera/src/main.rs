@@ -420,10 +420,10 @@ fn open(g: u64) -> Result<Open, Fail> {
     OPEN_AT.store(ferros_sys::now(), Ordering::Relaxed);
     let t0 = ferros_sys::now();
     let bus = Bus { g };
-    // The region: one run of frames side by side, anywhere in the pool (the front end's addresses carry their high halves, ferros_cam job); under 4 GiB if no run is free higher up. Whether the front end's masters drive those high bits with their SYSMMUs in bypass is not measured: a vault entry `cam.region` reading `low` asks under 4 GiB first, for the run that says it does not (its writes faulting at the fence, `diag`).
+    // The region: one run of frames side by side, under 4 GiB first, as every October run had it (coordinator, 2026-11-14). Linux never shows whether the front end drives the high address halves: its ISP DMA always goes thru the SYSMMU, whose window the driver clamps to 32 bits (samsung-iommu-v9.c `dma-window`), so the halves are always zero there. Only when no run is free under 4 GiB is one taken higher (the job carries the high halves, ferros_cam job; a write that loses them faults at the fence, `diag`). A vault entry `cam.region` reading `high` asks higher first, to measure that.
     let frames = job::MAIN.bytes / job::FRAME;
     let mut hint = [0u8; 8];
-    let low_first = get(g, b"region", &mut hint) == Some(&b"low"[..]);
+    let low_first = get(g, b"region", &mut hint) != Some(&b"high"[..]);
     let ask = |low: u64| ferros_sys::svc(ferros_sys::nr::DMA, cap(g, S_REGION), 3, frames, low, 0);
     let mut pa = ask(low_first as u64);
     if pa == ERR {
