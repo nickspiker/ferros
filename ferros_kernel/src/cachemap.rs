@@ -605,18 +605,32 @@ pub fn pages_open(va: usize, len: usize, open: bool) {
     unmapped(va, len);
 }
 
-/// One page of an arc taken to kernel-only (`close`) or handed back as the process's data (SYS_ARC `ARC_GUARD`/`ARC_UNGUARD`, process.rs `arc_call`): the guard under a thread's stack. Only a page that is the process's writable, never-executable data closes, and only a kernel-only page opens (the caller checks it is one the process closed itself); every core forgets the old entry. False, with nothing changed, for a page in any other state or not mapped.
-pub fn page_guard(va: usize, close: bool) -> bool {
+/// One page of an arc taken to kernel-only (SYS_ARC `ARC_GUARD`, process.rs `arc_call`): the guard under a thread's stack. Only a page the process may write closes (a native arc's spawn-time pages are writable and executable, grown ones writable only, `set_arc_wx`); the page's own permission bits come back for `page_unguard`. Every core forgets the old entry. None, with nothing changed, for any other page or one not mapped.
+pub fn page_guard(va: usize) -> Option<u64> {
+    if !vhe() {
+        return None;
+    }
+    let e = page_entry(va)?;
+    if *e & 1 == 0 || *e & AP_EL0 == 0 || *e & AP_RO != 0 {
+        return None;
+    }
+    let attrs = *e & !OA;
+    *e = kernel_page((*e & OA) as usize);
+    unmapped(va, PAGE);
+    Some(attrs)
+}
+
+/// A guard page handed back with the permission bits `page_guard` took from it (SYS_ARC `ARC_UNGUARD`), on whatever frame the page lies in now (a move keeps the page kernel-only, `retable`). False, with nothing changed, unless the page is kernel-only now.
+pub fn page_unguard(va: usize, attrs: u64) -> bool {
     if !vhe() {
         return false;
     }
     let Some(e) = page_entry(va) else { return false };
     let pa = (*e & OA) as usize;
-    let (from, to) = if close { (pool_page(true, pa, true, false), kernel_page(pa)) } else { (kernel_page(pa), pool_page(true, pa, true, false)) };
-    if *e != from {
+    if *e != kernel_page(pa) {
         return false;
     }
-    *e = to;
+    *e = attrs | pa as u64;
     unmapped(va, PAGE);
     true
 }

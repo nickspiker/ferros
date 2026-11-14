@@ -27,7 +27,8 @@ SECTIONS {
     }
     /DISCARD/ : { *(.comment) *(.eh_frame*) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash) *(.interp) }
 }
-__ferros_heap = DEFINED(__ferros_heap) ? __ferros_heap : 2M;
+/* The default heap ceiling, 32 MiB (2 MiB until 2026-11-14): a ceiling the arc grows to on demand, never a reservation (ARCS.md step 2), and each thread now takes a 2 MiB stack from it by default (ferros_rt thread::DEFAULT_STACK). */
+__ferros_heap = DEFINED(__ferros_heap) ? __ferros_heap : 32M;
 __ferros_tdata_size = SIZEOF(.tdata);
 __ferros_tls_size = SIZEOF(.tdata) + SIZEOF(.tbss);
 __ferros_tls_align = MAX(ALIGNOF(.tdata), ALIGNOF(.tbss));

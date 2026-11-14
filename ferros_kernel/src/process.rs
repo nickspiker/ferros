@@ -788,8 +788,8 @@ struct Process {
     moves: u32,
     /// Ranges of the arc whose frames were given back while the arc kept its size (ARCS.md step 4): arc offsets, whole frames. A masked arc's power-of-two slack between its image and its first stack at spawn, and what the process gives back (SYS_ARC `ARC_RELEASE`). Unmapped: the process faults there, and no syscall buffer may lie there (`span`, `word`).
     holes: Vec<(usize, usize)>,
-    /// Pages of the arc it made kernel-only itself (SYS_ARC `ARC_GUARD`): the guards under its threads' stacks, arc offsets. Only these may be handed back by `ARC_UNGUARD`, and a fault in one says a stack ran past its end (`fault_report`).
-    guards: Vec<usize>,
+    /// Pages of the arc it made kernel-only itself (SYS_ARC `ARC_GUARD`): the guards under its threads' stacks, arc offsets with the permission bits each page had (a native arc's spawn-time pages are executable, grown ones not). Only these may be handed back by `ARC_UNGUARD`, and a fault in one says a stack ran past its end (`fault_report`).
+    guards: Vec<(usize, u64)>,
     /// Its register grants for the MMIO syscall without the kernel lock (`mmio_fast`), in a box of its own: the Process moves when the process table grows, the box does not.
     fast: alloc::boxed::Box<Grants>,
 }
@@ -1308,7 +1308,7 @@ const SYS_CLAIM: u64 = 37;
 const SYS_BELL: u64 = 38;
 /// not_started(op, …): the kist launches init answered "started" for that the kernel's kist job did not start after all, and the kists that started and then ended by a fault, a panic or a kill from outside (`NOT_STARTED`; owner, 2026-11-11: Mahere tapped, nothing opened, "it looked stuck"; then Mahere faulting at once, "no toast or anything"), for the Settings holder alone (the map), as the claims' users list. Op 0: x1 the Settings token, x2/x3 a buffer and its length → how many records (all of them; whole records past the buffer are not written), each `NOT_STARTED_REC` bytes: the reason (ferros_kist::launch::why), the capsule's address (32 bytes), the kists' bell count it rang (u64 LE). Op 1: the kists' doorbell, x1 a word in the caller's arc, x2 the Settings token: the bell's change count written there now and whenever a launch does not start, a kist starts, or a kist ends any way, its waiters woken → 0. Op 2: the kists alive (owner, 2026-11-11: their circles glow running, stopped or not running), x1 the Settings token, x2/x3 a buffer and its length → how many (all of them; whole ones past the buffer are not written), each a capsule's address (32 bytes) of a process the kist job started that is not ending (`kists_live`). ERR without Settings, or for no such op.
 const SYS_NOT_STARTED: u64 = 39;
-/// arc(op, bytes): the caller's own arc grows or shrinks (ARCS.md step 2; owner, 2026-11-11: "why we cannot scale on demand, that was the whole point of ring memory"). No capability: a process reaches only its own arc, and only as far as its ceiling (`Arc::ceiling`: the most its build declared, its header's heap counted whole; fixed mode's size). Op 0 `ARC_GROW`: at least x1 more bytes (native: whole frames; ring: the mask doubles until they fit; exact: the limit moves) → x0 the new top (the arc's size, exact mode's limit), x1 the old one; the bytes between are new, zeroed, the process's. Op 1 `ARC_SHRINK`: keep the first x1 bytes (rounded up as the mode needs; never under what the process was spawned with) and give the rest back → x0 the new top, x1 the old. Op 2 `ARC_SIZE` → x0 the top, x1 the ceiling. Op 3 `ARC_RELEASE`: the frames wholly inside x2 bytes from arc offset x1 given back while the arc keeps its size (step 4; never the first frame, nor one the kernel holds a word in): a hole the process must not touch again until a grow over it → x0 the bytes given back, x1 the top. Ops 4 `ARC_GUARD` and 5 `ARC_UNGUARD` (2026-11-14): the page at arc offset x1 (4 KiB aligned) made kernel-only, the guard under a thread's stack (ferros_rt `thread::spawn`), or made the process's data again → x0 0; guard takes only a writable data page of the process's, unguard only a page it guarded (never the grants page, its code, the entry stack's guard or a masked arc's), a release or a shrink over a guard forgets it; a kernel from before refuses both (`ARC_WHY_OP`), and the stack goes unguarded. A masked arc's grow or shrink while another of its threads runs elsewhere holds the process off the cores first (`hold`, step 3): its mask or limit changes in every thread at once. Refused: x0 = ERR, x1 the reason (`ARC_WHY_*`), said on the console too.
+/// arc(op, bytes): the caller's own arc grows or shrinks (ARCS.md step 2; owner, 2026-11-11: "why we cannot scale on demand, that was the whole point of ring memory"). No capability: a process reaches only its own arc, and only as far as its ceiling (`Arc::ceiling`: the most its build declared, its header's heap counted whole; fixed mode's size). Op 0 `ARC_GROW`: at least x1 more bytes (native: whole frames; ring: the mask doubles until they fit; exact: the limit moves) → x0 the new top (the arc's size, exact mode's limit), x1 the old one; the bytes between are new, zeroed, the process's. Op 1 `ARC_SHRINK`: keep the first x1 bytes (rounded up as the mode needs; never under what the process was spawned with) and give the rest back → x0 the new top, x1 the old. Op 2 `ARC_SIZE` → x0 the top, x1 the ceiling. Op 3 `ARC_RELEASE`: the frames wholly inside x2 bytes from arc offset x1 given back while the arc keeps its size (step 4; never the first frame, nor one the kernel holds a word in): a hole the process must not touch again until a grow over it → x0 the bytes given back, x1 the top. Ops 4 `ARC_GUARD` and 5 `ARC_UNGUARD` (2026-11-14): the page at arc offset x1 (4 KiB aligned) made kernel-only, the guard under a thread's stack (ferros_rt `thread::spawn`), or made the process's data again → x0 0; guard takes only a page the process may write and keeps its permission bits, unguard puts them back and only on a page it guarded (never the grants page, its code, the entry stack's guard or a masked arc's), a release or a shrink over a guard forgets it; a kernel from before refuses both (`ARC_WHY_OP`), and the stack goes unguarded. A masked arc's grow or shrink while another of its threads runs elsewhere holds the process off the cores first (`hold`, step 3): its mask or limit changes in every thread at once. Refused: x0 = ERR, x1 the reason (`ARC_WHY_*`), said on the console too.
 const SYS_ARC: u64 = 40;
 /// offer(op, stow, …): the kist offered over USB to stow (`OFFER`; docs/KISTS.md "Stowing", ferros_kist::offer; owner, 2026-11-11: "Just seems to me that we should just make a proper checked path and start using it"), for the stower alone: x1 the offset of its Stow token (`Object::Stow`). Op 0: the offers' doorbell, x2 a word in the caller's arc: the offers' change count written there now and whenever a host offers a kist, its waiters woken (`bell_register`, `BELL_OFFERS`) → 0. Op 1: the offer not yet ended, x2/x3 a buffer and its length (40 at least) → 0 with [capsule 32][length u64 LE] written (an offer still OFFERED becomes CHECKING), NOTHING when there is none. Op 2: its state as the stower has it, x2/x3 [capsule 32][state u8][why u8][flags u8] → 0, NOTHING when that capsule is not the offer or the offer has ended; the service loop answers a host's held read (`offer_state`). ERR without the Stow right, or for no such op.
 const SYS_OFFER: u64 = 41;
@@ -5149,17 +5149,20 @@ fn arc_call(f: &mut Frame, cur: usize, pi: usize) -> u64 {
         let off = f.x[1] as usize;
         let p = kk.procs.get_mut(pi).and_then(|x| x.as_mut()).unwrap();
         let top = if p.arc.limit != 0 { p.arc.limit } else { p.arc.size };
-        let held = p.guards.contains(&off);
+        let held = p.guards.iter().position(|&(g, _)| g == off);
         // WHY: the offset is the process's; one off a page boundary or with its page past the arc's top names no page of it (top - off cannot wrap once off < top).
-        let ok = off % 4096 == 0 && off < top && top - off >= 4096 && held == (op == ARC_UNGUARD) && crate::cachemap::page_guard(p.arc.base + off, op == ARC_GUARD);
+        let page = off % 4096 == 0 && off < top && top - off >= 4096;
+        let ok = match (op == ARC_GUARD, held) {
+            (true, None) if page => crate::cachemap::page_guard(p.arc.base + off).map(|attrs| p.guards.push((off, attrs))).is_some(),
+            (false, Some(i)) => crate::cachemap::page_unguard(p.arc.base + off, p.guards[i].1) && {
+                p.guards.swap_remove(i);
+                true
+            },
+            _ => false,
+        };
         if !ok {
             arc_answer(pi, op, n, Err(ARC_WHY_PAGE), f);
             return 0;
-        }
-        if op == ARC_GUARD {
-            p.guards.push(off);
-        } else {
-            p.guards.retain(|&g| g != off);
         }
         f.x[0] = 0;
         f.x[1] = top as u64;
@@ -5254,7 +5257,7 @@ fn arc_op(pi: usize, op: u64, n: u64) -> Result<(u64, u64), u64> {
         }
     }
     // And the guards past it: their pages are no longer the process's.
-    p.guards.retain(|&g| g + 4096 <= size);
+    p.guards.retain(|&(g, _)| g + 4096 <= size);
     let x27 = p.arc.x27() as u64;
     for (i, x) in kk.threads.iter_mut().enumerate() {
         if let Some(x) = x {
@@ -5415,7 +5418,7 @@ fn arc_release(pi: usize, p: &mut Process, lo: usize, hi: usize) -> Result<usize
     }
     p.holes.push((lo, hi));
     // A guard in what went is gone with its frame.
-    p.guards.retain(|&g| g < lo || g >= hi);
+    p.guards.retain(|&(g, _)| g < lo || g >= hi);
     Ok(n)
 }
 
@@ -5658,7 +5661,7 @@ fn fault_report(f: &Frame, base: u64) {
     hex(&mut o, f.sp_el0.wrapping_sub(base));
     o.push(b'\n');
     // A data abort in a page the process guarded itself (ARC_GUARD): the thread's stack ran past its end.
-    if (f.esr >> 26) & 0x3F == 0x24 && proc_of(cur).is_some_and(|p| p.guards.contains(&(f.far.wrapping_sub(base) as usize & !4095))) {
+    if (f.esr >> 26) & 0x3F == 0x24 && proc_of(cur).is_some_and(|p| p.guards.iter().any(|&(g, _)| g == f.far.wrapping_sub(base) as usize & !4095)) {
         o.extend_from_slice(&name);
         o.extend_from_slice(b": the fault is in the guard page under a thread's stack: the stack ran past its end\n");
     }
