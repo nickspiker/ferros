@@ -203,6 +203,56 @@ pub fn take_top() -> Option<usize> {
     Some(f)
 }
 
+/// `n` free frames side by side in one range of the map, the run ending at or below the address `below`, zeroed, now taken: one physically contiguous run, for a device that writes it by DMA with no IOMMU in front of it (the camera's front end, its SYSMMUs in bypass: process.rs `cam_ask`). Searched from the top of the map down, as surfaces and GPU blocks are taken (`take_top`), so the low ranges arcs grow into stay theirs. The run's first frame's index; None when no range holds such a run now.
+pub fn take_run(n: usize, below: usize) -> Option<usize> {
+    let p = pool();
+    let used = |p: &Pool, f: usize| p.used[f / 64] >> (f % 64) & 1 == 1;
+    let mut starts = [0usize; 8];
+    let ranges = map();
+    let mut first = 0;
+    for (k, &(lo, hi)) in ranges.iter().enumerate() {
+        starts[k] = first;
+        first += (hi - lo) / FRAME;
+    }
+    for (k, &(lo, hi)) in ranges.iter().enumerate().rev() {
+        let count = (hi - lo) / FRAME;
+        let mut run = 0;
+        // From the range's top frame down: `run` free frames end at the one above `f`.
+        for j in (0..count).rev() {
+            let f = starts[k] + j;
+            if lo + (j + 1) * FRAME > below || used(p, f) {
+                run = 0;
+                continue;
+            }
+            run += 1;
+            if run == n {
+                for g in f..f + n {
+                    p.used[g / 64] |= 1 << (g % 64);
+                    if p.clean[g / 64] & 1 << (g % 64) == 0 {
+                        zero(pa(g));
+                    }
+                    p.clean[g / 64] &= !(1 << (g % 64));
+                }
+                p.free -= n;
+                return Some(f);
+            }
+        }
+    }
+    None
+}
+
+/// Frame `f`'s lines cleaned and invalidated to the point of coherency (`dc civac`): what the kernel's own alias left in the caches (the zeroing's lines) written out and dropped, so a device that writes the frame by DMA, and a process that reads it thru a non-cacheable mapping, see DRAM and nothing a later eviction could overwrite.
+pub fn clean_invalidate(f: usize) {
+    let a = pa(f);
+    let mut x = a;
+    unsafe { core::arch::asm!("dsb sy") };
+    while x < a + FRAME {
+        unsafe { core::arch::asm!("dc civac, {x}", x = in(reg) x) };
+        x += 64;
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+}
+
 /// A free frame for a move's copy (process.rs `arc_move`), now taken and not zeroed first: the copy fills it whole.
 pub fn take_for_copy() -> Option<usize> {
     let p = pool();

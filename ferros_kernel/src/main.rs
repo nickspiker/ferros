@@ -78,6 +78,8 @@ mod ffa;
 mod trusty;
 #[cfg(feature = "pixel8")]
 mod camera_close;
+#[cfg(feature = "pixel8")]
+mod camera_power;
 mod camera_rx;
 #[cfg(feature = "pixel8")]
 mod camera_rx_uw;

@@ -47,7 +47,7 @@ const USI14_MUX: usize = CMU_PERIC0 + 0x640;
 const USI1_MUX: usize = CMU_PERIC0 + 0x650;
 
 /// Clock divider on the 24.576 MHz oscillator: ÷8 gives a 325 ns timing unit and about 192 kHz SCL, twice the unit of the hsi2c_11 config the FS1/FS2 field values were measured on (160 ns at 200 MHz ÷32), so every timing ratio is kept and every interval is longer.
-const FS_DIV: u32 = 7;
+pub const FS_DIV: u32 = 7;
 
 /// Set one pin's 4-bit field in a GPIO bank register.
 fn pin_field(reg: usize, pin: u32, val: u32) {
@@ -1146,7 +1146,7 @@ fn pin_out(bank: usize, pin: u32, high: bool) {
 }
 
 /// Power the main camera module in `module_power_seq@0` order with its delays, after programming and verifying the rail voltages. Refuses if any camera-PMIC rail is already on. On any failure it powers back down.
-pub fn power_up(rep: &mut Vec<u8>) {
+pub fn power_up(rep: &mut Vec<u8>) -> bool {
     pmic_power_on(rep);
     let step = |rep: &mut Vec<u8>, label: &str, r: Result<alloc::string::String, alloc::string::String>| -> bool {
         match r {
@@ -1165,11 +1165,11 @@ pub fn power_up(rep: &mut Vec<u8>) {
         Ok(0) => {}
         Ok(m) => {
             line(rep, alloc::format!("refusing: camera-PMIC rails already on (MATRIX_CONF_A G#{m:02X})\n"));
-            return;
+            return false;
         }
         Err(e) => {
             line(rep, alloc::format!("refusing: camera PMIC not answering (G#{e:X})\n"));
-            return;
+            return false;
         }
     }
     // Voltages first, verified, while every rail is off.
@@ -1193,7 +1193,7 @@ pub fn power_up(rep: &mut Vec<u8>) {
         })();
         if !step(rep, name, r) {
             power_down(rep);
-            return;
+            return false;
         }
     }
     let ldo = |bit: u32| ldo_on(bit).map(|m| alloc::format!("matrix G#{m:02X}")).map_err(hex);
@@ -1211,7 +1211,7 @@ pub fn power_up(rep: &mut Vec<u8>) {
         };
         if !step(rep, label, r) {
             power_down(rep);
-            return;
+            return false;
         }
         spin_us(*us);
     }
@@ -1225,7 +1225,7 @@ pub fn power_up(rep: &mut Vec<u8>) {
     line(rep, alloc::format!("  ToF reset high: gpp15 DAT G#{:X}\n", rd(GPIO_PERIC0 + 0x1E4)));
     if !step(rep, "LDO5 on", ldo(4)) {
         power_down(rep);
-        return;
+        return false;
     }
     spin_us(1000);
     let g4 = (|| -> Result<alloc::string::String, alloc::string::String> {
@@ -1235,13 +1235,14 @@ pub fn power_up(rep: &mut Vec<u8>) {
     })();
     if !step(rep, "GPIO4 switch on", g4) {
         power_down(rep);
-        return;
+        return false;
     }
     spin_us(1000);
     // The sensor's reset released (its resume sequence), then 9 ms before the first I2C.
     pin_out(0x40, 2, true);
     spin_us(9000);
     line(rep, alloc::format!("  sensor reset released: gpp2 DAT G#{:X}\n", rd(GPIO_PERIC0 + 0x44)));
+    true
 }
 
 /// Read the main sensor's model ID (register G#0000, two bytes; Linux reads G#08EF). The sensor bus is brought up again first: its pads only go high once the module's rails are on.
@@ -1368,7 +1369,6 @@ pub fn fe_up(rep: &mut Vec<u8>) {
         return;
     }
     // The domain prepare call (SMC G#8200_0410) once per boot: made a second time, with the domain already prepared, EL3 never returned (2026-10-21: the flash log of a second `cam pdma` ends at this call, every time).
-    static PREPARED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if !PREPARED.swap(true, core::sync::atomic::Ordering::Relaxed) {
         crate::flashlog::line(&alloc::format!("fe_up: domain on (G#{before:X} -> G#{after:X}), prepare call"));
         let r = pd_prepare(PD_ISPFE_NEED_SMC);
@@ -1376,6 +1376,24 @@ pub fn fe_up(rep: &mut Vec<u8>) {
     } else {
         line(rep, alloc::format!("prepare call already made this boot; not repeated\n"));
     }
+    fe_clocks(rep);
+}
+
+/// Whether the domain prepare call (the secure world's restore, SMC G#8200_0410 with 1) has been made this boot, by `fe_up` or by the `camera` switch's domain on (pd.rs `on`, the same call): a second one never returns (2026-10-21).
+static PREPARED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The `camera` switch made the prepare call itself (pd.rs `on`, after the boot's gating saved the domain): `fe_up` must not make it again.
+pub fn mark_prepared() {
+    PREPARED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The prepare call itself, once per boot (`PREPARED`): for the `camera` switch when the domain was never gated (a switch on before the boot's gating at 16 s), as `fe_up` made it on October's cold boots.
+pub fn prepare_once() -> Option<u64> {
+    (!PREPARED.swap(true, core::sync::atomic::Ordering::Relaxed)).then(|| pd_prepare(PD_ISPFE_NEED_SMC))
+}
+
+/// The front end's clocks once its domain is on, as a camera open sets them (oracle capture 2026-10-19), with no PMU access: VDD_CAM to 600 mV, the ISPFE_NOC clock as Linux streams it, CMU_ISPFE's dividers, bus-clock mux, control word and every Q-channel requesting its clock, and SYSREG_ISPFE's two words. `fe_up`'s second half, and the `camera` switch's.
+pub fn fe_clocks(rep: &mut Vec<u8>) {
     crate::flashlog::line("fe_up: VDD_CAM over ACPM");
     cam_rail(rep);
     crate::flashlog::line("fe_up: ISPFE_NOC clock");
@@ -2086,6 +2104,11 @@ fn ispfe_dma_open(rep: &mut Vec<u8>) {
             line(rep, alloc::format!("S2MPU G#{s:X}: version G#{v:X}, left alone\n"));
         }
     }
+    sysmmu_bypass(rep);
+}
+
+/// The front end's SYSMMUs in bypass (VM 0's translation off), so a bus address is a physical address, and its core clock on: `ispfe_dma_open` without opening the S2MPUs, for the `camera` switch, which fences them to the camera's frames instead (s2mpu.rs `fence_cam`).
+pub fn sysmmu_bypass(rep: &mut Vec<u8>) {
     for (m, gate) in ISPFE_SYSMMUS {
         let g = rd(CMU_ISPFE + gate);
         if !gate_open(g) {
@@ -2802,15 +2825,7 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     const FRAME_STATUS: [usize; 6] = [0x1C32_008C, 0x1C32_0110, 0x1C32_0124, 0x1C32_0424, 0x1C32_2024, 0x1C32_049C];
     // The front end's per-frame interrupt acknowledgement, in the order a camera open does it: read the word, write the same value straight back.
     // Under Linux these look like bookkeeping, which is why the captured CPU program leaves them out — it stops deliberately "before the per-frame interrupt handling". They are not bookkeeping. Unacknowledged, the front end latches its first frame and never advances: G#1C32_008C stays at G#81 instead of alternating with G#1, the buffer index at +G#49C stays 0 instead of stepping 0-3, and the write pointer at +G#124 stays put instead of stepping by G#800 through four buffers. Nothing is ever written out (2026-10-20).
-    const FRAME_ACK: [usize; 28] = [
-        0x1C35_0160, 0x1C35_0178, 0x1C35_0190,
-        0x1C32_008C,
-        0x1C32_2004, 0x1C32_2024, 0x1C32_2038, 0x1C32_204C,
-        0x1C32_0404, 0x1C32_0424, 0x1C32_0438, 0x1C32_044C,
-        0x1C32_0110,
-        0x1C35_0058, 0x1C35_0088, 0x1C35_00B8, 0x1C35_00E8, 0x1C35_0118, 0x1C35_01AC,
-        0x1C33_1300, 0x1C33_3300, 0x1C33_5300, 0x1C33_7300, 0x1C33_9300, 0x1C33_B300, 0x1C33_C300, 0x1C33_D300, 0x1C33_E300,
-    ];
+    const FRAME_ACK: [usize; 28] = ferros_cam::FRAME_ACK;
     let mut series = alloc::string::String::new();
     // `cam pdma fast`: answer the front end the way Linux's interrupt handler does, within microseconds rather than on a 50 ms tick. Linux never touches the link's frame words; it runs off the core's aggregate (G#1C32_008C), acknowledging and advancing the PDMA as soon as it fires. If the core needs that answer inside the gap between frames, polling at 50 ms would miss it every time and leave exactly what we see: one SHADOW_UPDATE and silence.
     if fast {

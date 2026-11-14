@@ -74,6 +74,8 @@ members = [
     "payloads/pcie1",
     "ferros_sys",
     "ferros_spi",
+    "ferros_cam",
+    "payloads/camera",
     "ferros_kist",
     "ferros_lang",
     "ferros_idea",

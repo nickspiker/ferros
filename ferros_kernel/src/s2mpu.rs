@@ -186,6 +186,45 @@ pub fn fence_gpu() -> u32 {
     r
 }
 
+/// The ISP front end's three S2MPUs (zuma-s2mpu.dtsi s2mpu_s0/s1/s2_ispfe, inside pd_ispfe), in front of its SYSMMUs and so of every write the camera's front end makes: the image, its phase-detect rows and its statistics, and the PDMA engine's reads of its job. ABL leaves them as the domain's reset does; the kernel's camera tools turned their protection off for every VID (camera.rs `ispfe_dma_open`), which let the front end write anywhere at an address a program named.
+pub const ISPFE_S2MPUS: [usize; 3] = [0x1C14_0000, 0x1C18_0000, 0x1C1C_0000];
+static CAM_RESULT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The camera fence's tables: one frame of the pool, taken at the first fence and the kernel's for good (as the GPU's, `GPU_TABLES_FRAME`), its first two 128 KiB tables used: the driver's frames are one run of at most `CAM_MOST` bytes, so they lie in at most two GiBs.
+static mut CAM_TABLES_FRAME: usize = 0;
+/// The most bytes the camera's run may hold for its fence: two GiBs of tables cover any run of at most a GiB.
+pub const CAM_MOST: usize = 1 << 30;
+
+/// The camera's fence (owner, 2026-11-14: frames on demand, the S2MPUs fenced to exactly those frames): read and write to the run `[pa, pa + len)` the camera driver holds (process.rs `cam_ask`), for every VID (which one the front end's masters arrive as is not measured: its faults will say), nothing else; `len` 0 shuts all three to everything (`deny_all`). Called by the `camera` switch (camera_power.rs) and as the driver's frames are taken and given back, under the kernel lock, only while pd_ispfe is on. 1 fenced, else the first failure (G#E1 not a v9, G#E2 a sync that never completed, G#E3 a run past `CAM_MOST`).
+pub fn fence_cam(pa: usize, len: usize) -> u32 {
+    let r = if len == 0 {
+        ISPFE_S2MPUS.iter().map(|&s| deny_all(s)).find(|&r| r != 1).unwrap_or(1)
+    } else if len > CAM_MOST {
+        // WHY: a longer run could span more GiBs than the tables frame holds tables for, and `fill` would write past it into whatever frame follows; the caller (process.rs `cam_ask`) never asks for one.
+        0xE3
+    } else if ISPFE_S2MPUS.iter().any(|&s| rd(s, VERSION) & 0xFFFF_0000 != 0x9000_0000) {
+        0xE1
+    } else {
+        if unsafe { CAM_TABLES_FRAME } == 0 {
+            // A frame of the pool, zeroed, the kernel's for good. None free means a pool too full to have given the run being fenced: a bug, loud.
+            let f = crate::frames::take().expect("s2mpu: no frame for the camera fence's tables");
+            unsafe { CAM_TABLES_FRAME = crate::frames::pa(f) };
+        }
+        let t = unsafe { CAM_TABLES_FRAME };
+        let (g0, g1) = (pa >> 30, (pa + len - 1) >> 30);
+        let mut gbs: alloc::vec::Vec<(usize, *mut Smpt)> = alloc::vec::Vec::new();
+        for (k, g) in (g0..=g1).enumerate() {
+            gbs.push((g, (t + k * core::mem::size_of::<Smpt>()) as *mut Smpt));
+        }
+        let allowed = |a: usize| a >= pa && a < pa + len;
+        for &(g, table) in &gbs {
+            fill(g, table, 0xC, &allowed);
+        }
+        ISPFE_S2MPUS.iter().map(|&s| install(s, &gbs, 0xFF)).find(|&r| r != 1).unwrap_or(1)
+    };
+    CAM_RESULT.store(r, core::sync::atomic::Ordering::Relaxed);
+    r
+}
+
 /// The GPU fence's table for GiB `g`, made (all no access) when it has none: gpu-mem's own, or one of `GPU_GBS`; and whether it was made now (its L1 entries not yet written). Under the kernel lock.
 fn gpu_table(g: usize) -> (*mut Smpt, bool) {
     if g == crate::cachemap::GPU_MEM.0 >> 30 {
@@ -266,7 +305,7 @@ fn clean(a: usize, len: usize) {
 
 /// Whether `base` is one of the DMA fences: no process writes one (process.rs SYS_MMIO_WRITE refuses it), whatever its grants; the fences are the kernel's (KERNEL-OUT.md "What stays").
 pub fn is_fence(base: usize) -> bool {
-    base == BASE || base == MODEM_S2MPU || base == MISC_S2MPU || base == GPU_S2MPU || base == CPUCL0_S2MPU || DPU_S2MPUS.contains(&base)
+    base == BASE || base == MODEM_S2MPU || base == MISC_S2MPU || base == GPU_S2MPU || base == CPUCL0_S2MPU || DPU_S2MPUS.contains(&base) || ISPFE_S2MPUS.contains(&base)
 }
 
 /// One S2MPU set to let no VID reach any memory (the hv's `s2mpu_deny_all` at the jump, the same steps): every context valid, every L1 entry no-access, invalidated and synced, then protection on with error responses. 1 done, G#E1 not a v9, G#E2 the sync never completed.
@@ -395,6 +434,13 @@ pub fn report(out: &mut alloc::vec::Vec<u8>) {
     append_hex(out, b"S2MPU_GPU_SYNC_LATE=", GPU_SYNC_LATE.load(core::sync::atomic::Ordering::Relaxed));
     if unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 1 {
         faults(out, GPU_S2MPU);
+    }
+    // The camera's three, only while the camera switch has brought pd_ispfe on (an access with the domain down poisons EL3): one fault status line each.
+    append_hex(out, b"S2MPU_CAM_FENCE=", CAM_RESULT.load(core::sync::atomic::Ordering::Relaxed));
+    if crate::camera_power::fe_on() {
+        for s in ISPFE_S2MPUS {
+            faults(out, s);
+        }
     }
     append_hex(out, b"S2MPU_DPU_FENCE=", dpu_result());
     // The DPU's only while its domains are on: an access with a domain down poisons EL3 (display.rs).

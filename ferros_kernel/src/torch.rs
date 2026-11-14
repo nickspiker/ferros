@@ -56,6 +56,11 @@ pub fn power(on: bool) -> bool {
         HELD.store(false, Ordering::Release);
         return true;
     }
+    // hsi2c_14 has one owner: while the `camera` switch is on the bus is the camera's (its PMIC's rails), and bringing the controller up again under it would cut a transfer short (camera_power.rs).
+    if crate::camera_power::held() {
+        crate::flashlog::line("torch: refused, the camera holds hsi2c_14");
+        return false;
+    }
     for g in PMIC_BUS.gates {
         // WHY: a read into a block whose clock gate is closed can hang the core (camera.rs `state`); the camera tools have always found these open cold, so this only opens one something else closed.
         if !crate::camera::gate_open(rd(g)) {
