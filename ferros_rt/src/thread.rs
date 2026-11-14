@@ -1,10 +1,12 @@
 //! Threads: the kernel's THREAD_SPAWN on a stack from the heap, each with its own TLS block in TPIDR_EL0 (the kernel carries the register per thread since 2026-10-27), a join word for the futex, and a registry so a detached thread's memory comes back.
 //!
 //! A thread's last act is in assembly with no stack access: it settles its state word (1 exited-joinable, or 3 exited-detached), wakes a joiner, and traps out — so whoever frees the stack (the joiner, or the next spawn's reaper) can never free it under a still-running thread.
+//!
+//! Under every stack lies a guard page the kernel holds kernel-only (SYS_ARC `ARC_GUARD`, 2026-11-14): a stack run past its end faults there, its thread named, where until then it wrote on over whatever the heap kept below (Photon's alias thread signed on a 256 KiB stack with ~370 KiB of frames, and a thread died later on a return address nobody wrote). The thread hands the page back in its last act, before its state settles.
 
 use core::alloc::Layout;
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::lock::Lock;
 use crate::sys::{self, ERR, nr, off};
@@ -17,6 +19,20 @@ const DEAD: u64 = 3;
 /// The 64 KiB stack the kernel gives the entry thread at the arc's top (process.rs STACK); the heap stops below it and the guard page under it (layout.rs).
 pub const ENTRY_STACK: usize = crate::layout::ENTRY_STACK;
 
+/// What std gives a thread that names no stack size (the fork's `DEFAULT_MIN_STACK_SIZE`): 2 MiB, what std gives one on Linux, where the apps are written and run first. It was 256 KiB until 2026-11-14, and Photon's alias signing alone takes ~370 KiB (fgtw's `SigningBundle::eggs` 242 KiB of frame, fn-dsa's key decode 116 KiB under it).
+pub const DEFAULT_STACK: usize = 2 << 20;
+
+/// The guard page under each stack: one page, what LLVM's inline stack probes step by, so no frame can step over it.
+pub const GUARD: usize = 1 << 12;
+
+/// SYS_ARC's guard ops (kernel process.rs `ARC_GUARD`, `ARC_UNGUARD`) and the reason a kernel from before refuses them (`ARC_WHY_OP`).
+const ARC_GUARD: u64 = 4;
+const ARC_UNGUARD: u64 = 5;
+const ARC_WHY_OP: u64 = 6;
+
+/// Set once the kernel has said it has no guard op (a kernel from before 2026-11-14): stacks go unguarded from then on, and it is not asked again (each refusal is a console line).
+static NO_GUARDS: AtomicBool = AtomicBool::new(false);
+
 pub struct Block {
     state: AtomicU64,
     next: *mut Block,
@@ -26,6 +42,36 @@ pub struct Block {
     tls_layout: Layout,
     entry: extern "C" fn(u64),
     arg: u64,
+    /// The guard page's arc offset (the stack allocation's first page), 0 when the stack runs unguarded.
+    guard: u64,
+}
+
+/// Make the page at `page` (page-aligned, inside the heap) kernel-only: its arc offset when the kernel took it, 0 when it did not (a kernel from before, which is then not asked again).
+pub fn guard(page: *mut u8) -> u64 {
+    if NO_GUARDS.load(Ordering::Relaxed) {
+        return 0;
+    }
+    let at = off(page);
+    let (r, why) = sys::svc2(nr::ARC, ARC_GUARD, at);
+    if r == ERR {
+        if why == ARC_WHY_OP {
+            NO_GUARDS.store(true, Ordering::Relaxed);
+        }
+        return 0;
+    }
+    at
+}
+
+/// Hand a guard page back (its arc offset from `guard`; 0 is none).
+fn unguard(at: u64) {
+    if at != 0 {
+        sys::svc2(nr::ARC, ARC_UNGUARD, at);
+    }
+}
+
+/// Name this thread to the kernel (SYS_THREAD_NAME): a fault's console line carries the name (its first 16 bytes). A kernel from before answers ERR, which changes nothing.
+pub fn set_name(name: &[u8]) {
+    sys::svc(nr::THREAD_NAME, off(name.as_ptr()), name.len() as u64, 0, 0, 0);
 }
 
 /// A spawned thread: join it, or drop it to detach.
@@ -41,25 +87,29 @@ static REGISTRY: Lock<Head> = Lock::new(Head(core::ptr::null_mut()));
 /// Start `entry(arg)` on a fresh stack of at least `stack_bytes`. Err when the heap or the kernel refuses.
 pub fn spawn(entry: extern "C" fn(u64), stack_bytes: usize, arg: u64) -> Result<Handle, ()> {
     reap();
-    let stack_layout = Layout::from_size_align((stack_bytes.max(16 * 1024) + 4095) & !4095, 16).map_err(|_| ())?;
+    // The stack's pages, then the guard under them: the allocation page-aligned, the guard its first page.
+    let stack_layout = Layout::from_size_align(((stack_bytes.max(16 * 1024) + 4095) & !4095) + GUARD, GUARD).map_err(|_| ())?;
     let stack = unsafe { crate::alloc::alloc(stack_layout) };
     if stack.is_null() {
         return Err(());
     }
+    let guarded = guard(stack);
     let Some((tls, tls_layout)) = tls::new_block() else {
+        unguard(guarded);
         unsafe { crate::alloc::dealloc(stack, stack_layout) };
         return Err(());
     };
     let block_layout = Layout::new::<Block>();
     let block = unsafe { crate::alloc::alloc(block_layout) } as *mut Block;
     if block.is_null() {
+        unguard(guarded);
         unsafe {
             crate::alloc::dealloc(stack, stack_layout);
             crate::alloc::dealloc(tls, tls_layout);
         }
         return Err(());
     }
-    unsafe { block.write(Block { state: AtomicU64::new(RUNNING), next: core::ptr::null_mut(), stack, stack_layout, tls, tls_layout, entry, arg }) };
+    unsafe { block.write(Block { state: AtomicU64::new(RUNNING), next: core::ptr::null_mut(), stack, stack_layout, tls, tls_layout, entry, arg, guard: guarded }) };
     {
         let mut head = REGISTRY.lock();
         unsafe { (*block).next = head.0 };
@@ -68,6 +118,7 @@ pub fn spawn(entry: extern "C" fn(u64), stack_bytes: usize, arg: u64) -> Result<
     let top = unsafe { stack.add(stack_layout.size()) };
     if sys::svc(nr::THREAD_SPAWN, off(trampoline as *const u8), off(top), off(block as *const u8), 0, 0) == ERR {
         unlink(block);
+        unguard(guarded);
         unsafe { free(block) };
         return Err(());
     }
@@ -84,10 +135,18 @@ extern "C" fn trampoline(block_off: u64) -> ! {
 }
 
 /// The end of a thread, with no stack access after the state settles: 0 → 1 (joinable, wake the joiner) or 2 → 3 (detached, the reaper's).
+/// The guard page goes back first (SYS_ARC `ARC_UNGUARD`, x7 its offset, 0 none), so whoever frees the stack once the state settles finds every page of it the process's again; the trap keeps x5-x7.
 fn finish(block: *mut Block) -> ! {
     let state = unsafe { &raw const (*block).state } as *const u8;
+    let guard = unsafe { (*block).guard };
     unsafe {
         asm!(
+            "cbz x7, 5f",
+            "mov x0, #{unguard}",
+            "mov x1, x7",
+            "mov x8, #{arc}",
+            "svc #0",
+            "5:",
             "2:",
             "ldaxr x2, [x5]",
             "mov x3, #1",
@@ -106,6 +165,9 @@ fn finish(block: *mut Block) -> ! {
             "4: b 4b",
             in("x5") state,
             in("x6") off(state),
+            in("x7") guard,
+            unguard = const ARC_UNGUARD,
+            arc = const nr::ARC,
             options(noreturn, nostack)
         )
     }

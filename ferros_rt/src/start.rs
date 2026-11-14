@@ -114,11 +114,13 @@ unsafe extern "C" fn __ferros_start(grants: u64, input: u64, input_len: u64) -> 
     crate::random::detect(grant_count());
     let Some((tls, _)) = crate::thread::tls::new_block() else { exit(0xDEAD) };
     unsafe { crate::thread::tls::install(tls) };
-    let stack = unsafe { crate::alloc::alloc(Layout::from_size_align_unchecked(MAIN_STACK, 16)) };
+    // The main stack with a guard page under it, as every thread's (thread.rs): a run past its end faults there. Never handed back: the process ends on it.
+    let stack = unsafe { crate::alloc::alloc(Layout::from_size_align_unchecked(crate::thread::GUARD + MAIN_STACK, crate::thread::GUARD)) };
     if stack.is_null() {
         exit(0xDEAD);
     }
-    let top = stack as usize + MAIN_STACK;
+    crate::thread::guard(stack);
+    let top = stack as usize + crate::thread::GUARD + MAIN_STACK;
     unsafe { asm!("mov sp, {top}", "b {main}", top = in(reg) top, main = sym rt_main, options(noreturn, nostack)) }
 }
 

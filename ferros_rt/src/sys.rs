@@ -23,6 +23,7 @@ pub mod nr {
     pub const WAKE: u64 = 17;
     pub const PIN: u64 = 20;
     pub const ARC: u64 = 40;
+    pub const THREAD_NAME: u64 = 44;
 }
 
 /// The trap: number in x8, arguments in x0..x4, result in x0. The kernel may write into any buffer the arguments name, so nothing is assumed cached across it.
