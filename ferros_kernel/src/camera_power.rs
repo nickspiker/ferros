@@ -108,6 +108,14 @@ fn up() -> bool {
     } else if let Some(r) = crate::camera::prepare_once() {
         crate::flashlog::line(&alloc::format!("camera: the domain was never gated; prepare call made, G#{r:X}"));
     }
+    // CONFIGURATION is only the request: the domain's STATUS (bit 0, a plain read, as pd.rs `off` reads it before its own EL3 call every boot, and `fe_up` before its prepare call) says it is up, before any of its clocks is touched (a CMU access in a domain still down poisons EL3). Bounded at 2^13 µs: `fe_up` gave it 10 ms.
+    let until = crate::platform::cntpct() + crate::platform::cntfrq() / 1_000_000 * (1 << 13);
+    while !crate::camera::fe_powered() && crate::platform::cntpct() < until {}
+    if !crate::camera::fe_powered() {
+        crate::flashlog::line("camera: the front end's domain was asked on and its status never said so; nothing of it touched");
+        crate::camera::power_down(&mut rep);
+        return false;
+    }
     FE_ON.store(true, Ordering::Release);
     crate::flashlog::line("camera: on, the front end's clocks");
     crate::camera::fe_clocks(&mut rep);
