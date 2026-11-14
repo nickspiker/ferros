@@ -1177,7 +1177,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let cons_before = d.tcm_rd(cons + 16);
     let t0 = d.now();
     let rx_off = d.tcm_rd(sh + 36);
-    let mut m = Msgbuf { dma, h2d_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, silent: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); RX_BUFS as usize], rxq_t: [0; RX_BUFS as usize], rxq_head: 0, rxq_len: 0, nets: [Net { name: [0; 32], len: 0, rssi: 0, flags: 0, seen_in: 0 }; 32], nnets: 0, scan_gen: 0, scan_ver: 1, quiet: false, outcome: 0, rx_up: false, retry_s: 1 << 6 };
+    let mut m = Msgbuf { dma, h2d_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, silent: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, band: 0, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, sfh: false, tx_ooo: 0, tx_bad: 0, tx_busy: 0, tx_seq: [0; TX_BUFS as usize], mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); RX_BUFS as usize], rxq_t: [0; RX_BUFS as usize], rxq_head: 0, rxq_len: 0, nets: [Net { name: [0; 32], len: 0, rssi: 0, flags: 0, seen_in: 0 }; 32], nnets: 0, scan_gen: 0, scan_ver: 1, quiet: false, outcome: 0, rx_up: false, retry_s: 1 << 6 };
     // Control submit ring: 8 ioctl response buffers and 8 event buffers first (the firmware DMAs ioctl results into a posted response buffer, named by its request id in the completion).
     for b in 0..8u32 {
         m.post(d, 0x0B, 1 + b, [8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
@@ -1296,6 +1296,14 @@ struct Msgbuf {
     tx_dseq: u32,
     tx_done: u32,
     tx_status: u32,
+    /// The firmware takes frames with the LLC/SNAP header already in host memory (its `cap` list names `host_sfhllc`): each frame goes as 802.3 + LLC/SNAP, as Android's dhd sends them (HOST_SFH_LLC, `tx_post`).
+    sfh: bool,
+    /// Transmit completions whose request id was not the oldest frame still out (in order, the n-th completion names the n-th frame posted), and completions with a non-zero status: measures for the PSM assert (docs/WIFI.md), said every 32 s while serving and when serving ends.
+    tx_ooo: u32,
+    tx_bad: u32,
+    /// The transmit buffers the chip still holds, a bit each (bit k: buffer k, its frame posted with request id `TX_ID + k` and not yet completed), and the posting number of each buffer's frame (for `tx_ooo`).
+    tx_busy: u128,
+    tx_seq: [u32; TX_BUFS as usize],
     mac: [u8; 6],
     /// DHCP: transaction id, the offer (address, server), the ack and what it carried (subnet, router, DNS, lease seconds).
     xid: u32,
@@ -1529,6 +1537,14 @@ impl Msgbuf {
             }
             self.tx_dseq += 1;
             self.tx_rd = (self.tx_rd + 1) % 1024;
+            // The buffer the completion names freed, and only that one: the chip completes out of order (2026-11-14 on the Pro, Ethernet frames: 12 of 225 under load), so a count of completions could free a buffer whose frame was still in flight.
+            // WHY the test: the request id comes from the chip; one outside the transmit ids frees nothing.
+            let k = words[1].wrapping_sub(TX_ID);
+            if k < TX_BUFS {
+                self.tx_busy &= !(1u128 << k);
+                self.tx_ooo += (self.tx_seq[k as usize] != self.tx_done) as u32;
+            }
+            self.tx_bad += (words[2] & 0xFFFF != 0) as u32;
             self.tx_done += 1;
             self.tx_status = words[2] & 0xF;
         }
@@ -1536,6 +1552,22 @@ impl Msgbuf {
         if self.tx_rd != rd0 {
             d.tcm_wr(self.d2h_r + 4, self.tx_rd);
         }
+    }
+    /// One line of the transmit path's totals since serving began: `tx: A#<posted> posted, A#<done> completed, A#<n> out of order, A#<n> not sent (last status G#<s>), 802.3+LLC <0|1>`.
+    fn say_tx(&self, d: &mut Drv) {
+        d.put(b"tx: ");
+        d.dec(self.tx_w);
+        d.put(b" posted, ");
+        d.dec(self.tx_done);
+        d.put(b" completed, ");
+        d.dec(self.tx_ooo);
+        d.put(b" out of order, ");
+        d.dec(self.tx_bad);
+        d.put(b" not sent (last status ");
+        d.hex(self.tx_status);
+        d.put(b"), 802.3+LLC ");
+        d.dec(self.sfh as u32);
+        d.put(b"\n");
     }
     /// Send one Ethernet frame now: `tx_post`, then `tx_ring`. False: refused (`tx_post`).
     fn send(&mut self, d: &mut Drv, frame: &[u8]) -> bool {
@@ -1568,33 +1600,52 @@ impl Msgbuf {
         d.tcm_wr(self.h2d_w + 8, self.tx_w % 512);
         d.wr(MEM, 0x2140, 0xFF00_0000 | 5 << 16 | (self.tx_w % 512));
     }
-    /// One Ethernet frame onto flowring 2 (msgbuf ring 5, H2D index slot 2), unpublished until `tx_ring`: copied a word at a time into a free tx buffer (`TX_BUFS` of 2 KiB from `TX_BASE`), then host_txbuf_post_t v1 (48 B): header (type G#0F, request id), the 14-byte Ethernet header, flags G#01 (802.3), seg_cnt 1, data address = the payload after the header, data_len = length − 14.
-    /// A buffer is free once the chip has completed the frame it held (`tx_done`, from the tx completions): with every buffer still in flight the completions are read once more, and if none came the frame is refused (false), as a full transmit ring drops (TCP sends again). Until 2026-11-11 one frame went per request and eight buffers were reused in turn unchecked; a batch from the IP stack (`serve` op 8) would overwrite buffers the chip had not fetched yet.
+    /// One Ethernet frame onto flowring 2 (msgbuf ring 5, H2D index slot 2), unpublished until `tx_ring`: copied a word at a time into a free tx buffer (`TX_BUFS` of 2 KiB from `TX_BASE`), then host_txbuf_post_t v1 (48 B): header (type G#0F, request id `TX_ID` + the buffer), the 14-byte Ethernet header, flags G#01 (802.3), seg_cnt 1, data address = the payload after the header, data_len = length − 14 (with `sfh`, flags G#11 and the data the whole frame as 802.3 + LLC/SNAP).
+    /// A buffer is free once the chip has completed the frame it held (`tx_busy`, cleared by the completion naming it, `pump_tx`): with every buffer still in flight the completions are read once more, and if none came the frame is refused (false), as a full transmit ring drops (TCP sends again). Until 2026-11-11 one frame went per request and eight buffers were reused in turn unchecked; a batch from the IP stack (`serve` op 8) would overwrite buffers the chip had not fetched yet.
     /// WHY the length test: the frame comes from another process; its Ethernet header must be whole and it must fit a buffer.
     fn tx_post(&mut self, d: &mut Drv, frame: &[u8]) -> bool {
-        if frame.len() <= 14 || frame.len() > 0x800 {
+        // WHY the 8: with `sfh` the frame grows by its LLC/SNAP header and must still fit its 2 KiB buffer.
+        if frame.len() <= 14 || frame.len() + 8 > 0x800 {
             return false;
         }
-        if self.tx_w.wrapping_sub(self.tx_done) >= TX_BUFS {
+        if self.tx_busy == u128::MAX {
             self.pump_tx(d);
-            if self.tx_w.wrapping_sub(self.tx_done) >= TX_BUFS {
+            if self.tx_busy == u128::MAX {
                 return false;
             }
         }
-        let k = self.tx_w % TX_BUFS;
+        // The lowest free buffer: its request id names it, and stays below G#FF00 (dhd_msgbuf.c PKTID_MAX_MAP_SZ_TXFLOWRING: the BCM4398 traps at G#FF00, below).
+        let k = (!self.tx_busy).trailing_zeros();
+        self.tx_busy |= 1u128 << k;
+        self.tx_seq[k as usize] = self.tx_w;
         let buf = self.dma + TX_BASE + 0x800 * k;
-        dma_put(buf, frame);
+        let (data, len, flags) = if self.sfh {
+            // 802.3 with LLC/SNAP (dhd_common.c dhd_ether_to_8023_hdr, RFC 1042, bridge-tunnel OUI 00:00:F8 for the 802.1H types G#80F3 and G#8137): DA, SA, the length of what follows, AA AA 03, the OUI, the EtherType, the payload. The whole of it is the data (dhd posts it from the 802.3 header on, the Ethernet header still in the item), flag G#10 BCMPCIE_TXPOST_FLAGS_HOST_SFH_LLC.
+            let mut b = [0u8; 0x800];
+            let pay = &frame[14..];
+            let ty = u16::from_be_bytes([frame[12], frame[13]]);
+            b[..12].copy_from_slice(&frame[..12]);
+            b[12..14].copy_from_slice(&((pay.len() + 8) as u16).to_be_bytes());
+            b[14..20].copy_from_slice(&[0xAA, 0xAA, 0x03, 0, 0, if ty == 0x80F3 || ty == 0x8137 { 0xF8 } else { 0 }]);
+            b[20..22].copy_from_slice(&frame[12..14]);
+            b[22..22 + pay.len()].copy_from_slice(pay);
+            dma_put(buf, &b[..22 + pay.len()]);
+            (buf, frame.len() + 8, 0x11u8)
+        } else {
+            dma_put(buf, frame);
+            (buf + 14, frame.len() - 14, 0x01)
+        };
         let phase = if (self.tx_w / 512) % 2 == 0 { 0x80 } else { 0 };
         let a = self.dma + 0x6_0000 + 48 * (self.tx_w % 512);
         let mut item = [0u8; 48];
         item[0] = 0x0F;
         item[2] = phase as u8;
-        item[4..8].copy_from_slice(&(0x2000 + self.tx_w).to_le_bytes());
+        item[4..8].copy_from_slice(&(TX_ID + k).to_le_bytes());
         item[8..22].copy_from_slice(&frame[..14]);
-        item[22] = 0x01;
+        item[22] = flags;
         item[23] = 1;
-        item[32..36].copy_from_slice(&(buf + 14).to_le_bytes());
-        item[42..44].copy_from_slice(&((frame.len() - 14) as u16).to_le_bytes());
+        item[32..36].copy_from_slice(&data.to_le_bytes());
+        item[42..44].copy_from_slice(&(len as u16).to_le_bytes());
         for j in 0..12 {
             dw(a + 4 * j, u32::from_le_bytes(item[4 * j as usize..4 * j as usize + 4].try_into().unwrap()));
         }
@@ -2208,6 +2259,10 @@ const RX_BASE: u32 = 0x8_0000;
 /// Transmit buffers, 2 KiB each from TX_BASE, above the receive buffers in the DMA region's upper MiB (256 KiB; nothing else is there since the vault's files moved into the arc, `vault_file`).
 /// A batch from the IP stack is mostly its ACKs, one every second segment (RFC 5681): up to 44 for a reply of 88 full frames, and a 4096-byte request holds up to 66 frames of the 60-byte minimum. 32 buffers (2026-11-11 to 2026-11-12, at G#7_0000) could refuse a batch's last ACKs while the chip had not completed its first, and a batch's last ACK refused leaves its sender waiting for its timeout; 128 hold two full requests before any completion. Measured on the 8a with 128: a 421 KB fetch and a 17 MB one alone none refused; three font packs (9 to 17 MB) fetched at once 225 of 12864 refused, no segment resent; 256 (512 KiB, to G#18_0000) would fit, not tried yet.
 const TX_BUFS: u32 = 1 << 7;
+// One bit a buffer in `Msgbuf::tx_busy`.
+const _: () = assert!(TX_BUFS == u128::BITS);
+/// The request id of the frame in transmit buffer k is TX_ID + k: unique while the frame is out, never 0, far below G#FF00 (dhd keeps its transmit ids under DHD_MAX_PKTID_16BITS; on 2026-11-14 the Pro's BCM4398 took a data abort the moment the id G#FF00 arrived, the 57088th frame of a run when the id was G#2000 + the frame's number).
+const TX_ID: u32 = 0x2000;
 /// Ioctls in a row with no completion that end serving (`serve`): four, 12 s of waiting (the measures ask five every two seconds, each waiting 3 s), where one late completion is a slow firmware and four in a row a stopped one.
 const SILENT_MAX: u32 = 1 << 2;
 const TX_BASE: u32 = 0x10_0000;
@@ -2363,6 +2418,8 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     let f2 = d.tcm_rd(sh + 80);
     d.kv(b"shared flags2", f2);
     d.put(if f2 & 0x0040_0000 != 0 { b"tx checksum offload offered (TXPOST_EXT)\n" } else { b"no tx checksum offload (no TXPOST_EXT)\n" });
+    m.sfh = cap_has(d, m, b"host_sfhllc");
+    d.put(if m.sfh { b"tx frames as 802.3 + LLC/SNAP (the firmware's cap names host_sfhllc)\n" } else { b"tx frames as Ethernet (no host_sfhllc in the firmware's cap)\n" });
     m.serving = true;
     m.verbose = false;
     d.put(b"serving wlan\n");
@@ -2401,6 +2458,10 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     // The link's power state as the PHY reports it (PCS G#188 bits 2:0: 0 L0, 2 L1, 5 L1.1, 6 L1.2; read without waking the link), sampled each pass and said every 32 s.
     let mut lstates = [0u32; 8];
     let mut lstates_at = d.now();
+    // The firmware's console (its hnd_cons ring, found and checked by `run` before serving), said as it grows with the link states: the firmware recovers from a PSM fatal error by itself (reinitializing the MAC), so until 2026-11-14 the reinits before a final trap were seen only in the dump at the driver's end.
+    let cons = d.tcm_rd(sh + 0x14);
+    let (cbuf, csize) = (d.tcm_rd(cons + 8), d.tcm_rd(cons + 12));
+    let mut cidx = d.tcm_rd(cons + 16);
     // The receive path's measures over the same 32 s, said with the link states when frames moved.
     let mut path = Path::default();
     let mut msg = [0u8; REQ_MAX];
@@ -2465,8 +2526,23 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
             d.put(b"\n");
             if path.to_ip + path.from_ip > 0 || irq {
                 path.say(d, ms);
+                m.say_tx(d);
+            }
+            let i = d.tcm_rd(cons + 16);
+            if i != cidx {
+                console_dump(d, cbuf, csize, cidx, (i + csize - cidx) % csize);
+                cidx = i;
             }
             d.flush();
+            // The firmware trapped (pcie_shared flags G#400 PCIE_SHARED_TRAP, G#200 PCIE_SHARED_ASSERT): it ends the driver as a silent firmware does. With the screen off no ioctl is asked (the measures are not), so the silence test below never ran: on 2026-11-14 the Pro's firmware died under load with the screen off and pcie1 served on with nothing moving, the keeper never told.
+            if d.tcm_rd(sh) & 0x600 != 0 {
+                m.say_tx(d);
+                d.put(b"the firmware trapped while serving: ending; init's keeper starts this driver again\n");
+                d.flush();
+                m.serving = false;
+                d.failed = true;
+                return;
+            }
             lstates = [0; 8];
             path = Path::default();
         }
@@ -2475,6 +2551,7 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
         let _ = m.pump(d);
         // The link lost while serving (the firmware's LINK down, or a deauthentication or disassociation from the access point): until 2026-11-10 the loop served on unlinked, the IP stack heard "not linked" every 4 s and the device was off the network until someone restarted this driver (the 8a, overnight). Now it ends, saying why, and init's keeper starts it again (at most every 64 s), which brings the radio up and joins afresh: the path every boot takes.
         if was_linked && (!m.linked || m.join_failed) {
+            m.say_tx(d);
             d.put(if m.linked { b"the access point dropped this device while serving: ending; init's keeper starts this driver again\n".as_slice() } else { b"the link went down while serving: ending; init's keeper starts this driver again\n" });
             d.flush();
             m.serving = false;
@@ -2483,6 +2560,7 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
         }
         // The firmware silent (2026-11-12, the owner's Pro: hundreds of "no ioctl completion" over minutes, no transmit completions, every frame refused, each measure's ioctl waiting out its 3 s so one exchange with ip took A#21 s, and Mahere's tiles never loaded): it ends the same way, the firmware's shared flags and console said after it (`run`), and init's keeper starts it again, the chip brought up afresh.
         if m.silent >= SILENT_MAX {
+            m.say_tx(d);
             d.put(b"the firmware completes no ioctl while serving: ending; init's keeper starts this driver again\n");
             d.flush();
             m.serving = false;
@@ -2674,6 +2752,27 @@ fn dhcp(d: &mut Drv, m: &mut Msgbuf) {
         return;
     }
     dhcp_run(d, m);
+}
+
+/// Whether the firmware's `cap` iovar (its capability words, space separated; dhd_common.c FW_SUPPORTED) names `name`. The list runs past 256 bytes, so the answer may take 3 KiB (dhd_linux.c asks WLC_IOCTL_MAXBUF_FWCAP less one) and the request is 1 KiB: one of 2 KiB went unanswered on the Pro (2026-11-14), over msgbuf's largest request, MSGBUF_IOCTL_MAX_RQSTLEN (2 KiB less a control item).
+fn cap_has(d: &mut Drv, m: &mut Msgbuf, name: &[u8]) -> bool {
+    let req = m.dma + 0x1_3000;
+    for (k, c) in b"cap\0".iter().enumerate() {
+        db(req + k as u32, *c);
+    }
+    let r = m.ioctl(d, 262, req, 1024, 3072);
+    d.kv(b"cap status", r.map(|r| r.0).unwrap_or(u32::MAX));
+    let Some((0, b, len)) = r else {
+        return false;
+    };
+    d.kv(b"cap length", len);
+    let mut caps = [0u8; 3072];
+    // WHY the min: the firmware says the length; the copy is the buffer at most.
+    let len = (len as usize).min(caps.len());
+    for (k, c) in caps[..len].iter_mut().enumerate() {
+        *c = dbr(m.resp(b) + k as u32);
+    }
+    caps[..len].split(|&c| c == b' ' || c == 0).any(|w| w == name)
 }
 
 /// Create transmit flowring 2 (see `dhcp`); true when the firmware answered status 0.
