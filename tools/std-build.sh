@@ -7,7 +7,8 @@ export __CARGO_TESTS_ONLY_SRC_ROOT=/mnt/Harbor/Code/ferros-rust/library
 # C in the dependency graph (blake3's NEON kernels, the PQClean suites) cross-compiles with the GNU aarch64 toolchain, freestanding: the cc crate knows no "ferros" OS.
 export CC_aarch64_unknown_ferros=aarch64-linux-gnu-gcc
 export AR_aarch64_unknown_ferros=aarch64-linux-gnu-ar
-export CFLAGS_aarch64_unknown_ferros="-ffreestanding -fno-stack-protector -fno-builtin -O2 -isystem /mnt/Harbor/Code/ferros/tools/std-sysroot/include"
+# No branch protection in the C: Fedora's cross gcc defaults to pac-ret, and its PACIASP/AUTIASP would sign with the pointer-authentication keys, which hold shares of the ira and wairua (the kernel keeps them switched off for EL0 as well, cachemap.rs).
+export CFLAGS_aarch64_unknown_ferros="-ffreestanding -fno-stack-protector -fno-builtin -mbranch-protection=none -O2 -isystem /mnt/Harbor/Code/ferros/tools/std-sysroot/include"
 cargo +nightly build --release -Zjson-target-spec "$@"
 out=target/aarch64-unknown-ferros/release
 for elf in $(find $out -maxdepth 1 -type f -executable); do

@@ -7,7 +7,8 @@ kist="$code/genesis-kist"
 export __CARGO_TESTS_ONLY_SRC_ROOT="$code/ferros-rust/library"
 export CC_aarch64_unknown_ferros=aarch64-linux-gnu-gcc
 export AR_aarch64_unknown_ferros=aarch64-linux-gnu-ar
-export CFLAGS_aarch64_unknown_ferros="-ffreestanding -fno-stack-protector -fno-builtin -O2 -isystem $here/tools/std-sysroot/include"
+# No branch protection in the C: Fedora's cross gcc defaults to pac-ret, and its PACIASP/AUTIASP would sign with the pointer-authentication keys, which hold shares of the ira and wairua (the kernel keeps them switched off for EL0 as well, cachemap.rs).
+export CFLAGS_aarch64_unknown_ferros="-ffreestanding -fno-stack-protector -fno-builtin -mbranch-protection=none -O2 -isystem $here/tools/std-sysroot/include"
 # getrandom's custom backend is ferros_rt's; jgenesis uses float_algebraic and cfg_select, stable after the fork's nightly, so they are switched on for every crate until ferros-rust moves.
 export CARGO_TARGET_AARCH64_UNKNOWN_FERROS_RUSTFLAGS='--cfg getrandom_backend="custom" -Zcrate-attr=feature(float_algebraic) -Zcrate-attr=feature(cfg_select) -Aunused_features -Astable_features'
 export CARGO_TARGET_DIR="$kist/target/ferros"
