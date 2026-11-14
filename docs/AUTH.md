@@ -13,7 +13,7 @@ The vault holds two classes of entry.
 | Drivers and firmware | the capsules (`display`, `touch`, `pcie1`, `ip`, `modem`, `nfc`, `bt`, …), `wifi.fw`, `wifi.nvram`, `wifi.clm`, `gps.*` |
 | The attest front end | the `display`, `touch`, `ahau` capsules |
 | Hardware-owned settings | `device` (SETTINGS.md): language, number base, time zone, keyboard layout, brightness, dither, theme, proximity wake, unlock at boot |
-| A network joined before anyone attests | `wifi.net` (ATTEST-UI.md "WiFi connect": joined under a random MAC; moved into the person's on attest, still to build) |
+| A network joined before anyone attests | `wifi.net` (ATTEST-UI.md "WiFi connect": while locked joined under this boot's address; after attest under the person's, as `wifi.cred`; moved into the person's on attest, still to build) |
 | The device's own bookkeeping | `sealed`, the kernel's reserved names (`\0…`): the name list, the device-only secret, the binding flag, the identity class's address list, the kept tags (`\0tag.`, "Attest with a tag") |
 
 **The identity class** is the person's. It is sealed under a key bound to this device and to the person, and opens only while that person is present:
@@ -23,7 +23,7 @@ The vault holds two classes of entry.
 | The deck | `map.place.*` (where each circle sits), `map.view` (the camera), everything else under `map.` |
 | fgtw (the identity service) | `fgtw.*`: the chain and fleet key when kept, its phonebook |
 | The attest screen's own | `ahau.*` |
-| Networks | `wifi.cred` (networks travel with the person; the per-network MAC stays the device's, from the ira) |
+| Networks | `wifi.cred` (networks travel with the person; the per-network MAC is worn by the person present, theirs and this device's together: WIFI.md "The MAC") |
 | Where the device has been | `gps.last`, the GPS driver's last fix (2026-11-04). No GPS runs while nobody has attested. The replays the chip is aided from (`gps.replay`, `gps.replay.sky`) stay device class: Broadcom's firmware, gpsd's configuration and the orbits. Their position messages are zeroed (the gps driver's scrub, input G#02), so they keep no place. |
 | Next | the person's stowed apps (their capsules), device pairings (car, headphones), every app's data |
 
@@ -170,7 +170,7 @@ Not built; for the owner to approve before it is.
 **Pairings** (owner: pairings move with the identity, like networks).
 - Bluetooth link keys under `pair.bt.<peer>`, identity class. The `bt` driver gets an identity-class scope (`pair.`) next to its device-class one. It runs the beacon before anyone is present and reads the pairings once an identity unlocks (the way `pcie1` waits for `wifi.cred` today).
 - The address the person's devices know: the identity's, not the chip's (`radio-addresses-belong-to-identity`). Derived from the identity key, never stored, so it moves with the person and never sits on the device locked.
-- WiFi credentials are already identity class (`wifi.cred`); the per-network MAC stays the device's, from the ira.
+- WiFi credentials are already identity class (`wifi.cred`). The per-network MAC is worn by whoever is attested (owner, 2026-11-09): derived by the kernel from the person's identity and this device's ira, over the network's name, the same on every join of that network by that person on this device (WIFI.md "The MAC"), whichever vault entry the credential came from.
 
 **Moving with the person.** Every identity-class entry is what a new device of the fleet should receive: the fleet's chain carries the identity key's derivations, and the entries themselves travel sealed over Photon's fleet channel. That transport is Photon's and is not designed yet; the vault side is only "copy every `IDENTITY` name".
 
@@ -183,7 +183,7 @@ Every radio is up at the attest screen: the modem, the WiFi chip, Bluetooth and 
    - The modem (HSI1) is held to its carve-outs, the WiFi chip (HSI2) to its windows, and BLK_MISC's masters are denied everything (2026-11-04).
    - The modem's fence matters most: any base station reaches the modem before anyone attests.
 2. **No stable identifier goes on the air while locked.**
-   - Measured 2026-11-04: the WiFi driver neither scans nor joins until `wifi.cred` opens (`wait_cred`), so the chip is up but sends nothing. Since 2026-11-09 it scans when the network page asks, and joins a network handed in before attest (or kept from one, `wifi.net`) under a fresh random MAC each time; with no credential and no page asking it still sends nothing. Bluetooth advertises only when asked, under a fresh non-resolvable random address each time, and refuses to while locked. A locate beacon would rotate its keys.
+   - Measured 2026-11-04: the WiFi driver neither scans nor joins until `wifi.cred` opens (`wait_cred`), so the chip is up but sends nothing. Since 2026-11-09 it scans when the network page asks, and joins a network handed in before attest (or kept from one, `wifi.net`) under a MAC that lasts only this boot (since 2026-11-14 the kernel's per-power-session key from the wairua, the same on every restart within the boot, so restarts take no new DHCP leases; a fresh random one before); with no credential and no page asking it still sends nothing. Bluetooth advertises only when asked, under a fresh non-resolvable random address each time, and refuses to while locked. A locate beacon would rotate its keys.
    - Radio addresses that last belong to the identity (worn by the person, not the device).
 3. **Nothing acts on radio input while locked unless it carries the fleet's signature.**
    - No Bluetooth pairing, no NFC action, no listening socket, no clock set from the network.
