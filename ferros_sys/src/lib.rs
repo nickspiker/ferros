@@ -1566,6 +1566,13 @@ pub fn ira_person_key(cap: u64, domain: &str) -> Option<[u8; 32]> {
     (r == 32).then_some(out)
 }
 
+/// This power session's 32-byte key for the calling system process, through its Ira capability (SYS_IRA x4 bit 2, 2026-11-14): the same for every call in one boot, unlinkable to any other boot (the kernel derives it from the wairua and the process's name). None for a kist, with no wairua, or from a kernel before 2026-11-14 (it refuses the call: no domain is passed), so never a lasting key in its place.
+pub fn session_key(cap: u64) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    let r = svc(nr::IRA, cap, 0, 0, off(out.as_mut_ptr()), 4);
+    (r == 32).then_some(out)
+}
+
 /// A kist's alias (docs/FACETS.md "The alias"), through its Ira capability (`kist::IRA`): a 32-byte seed for this kist alone, the same on every device of the person's, derived by the kernel from the person key and this kist's gate identity. The kist makes its keys from it (fgtw::alias::bundle, agreement_secret) and never shows it. None for a process not launched as a kist, before attest, or before the identity service has handed the kernel the person key; a kernel before 2026-11-12 answers as `ira_key` with no domain, which is refused (ERR), so None too.
 pub fn alias(cap: u64) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];

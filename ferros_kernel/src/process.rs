@@ -2385,6 +2385,10 @@ const KIST_DOMAIN_CONTEXT: &str = "ferros 2026-11-08 kist domain";
 const KIST_IRA_CONTEXT: &str = "ferros 2026-11-08 kist ira";
 /// A process's ira key bound to the person present (SYS_IRA x4 bit 0): the WiFi address a person wears on a network, theirs and this device's together.
 const PERSON_IRA_CONTEXT: &str = "ferros 2026-11-09 person ira";
+/// A system process's key for this power session (SYS_IRA x4 bit 2), from the wairua: the WiFi address while nobody is present, the same on every join in one boot and unlinkable to any other boot.
+const SESSION_KEY_CONTEXT: &str = "ferros 2026-11-14 process session key";
+/// The root those keys come from (`wairua::derive`), one per power session.
+const SESSION_ROOT_CONTEXT: &str = "ferros 2026-11-14 process session root";
 /// The scope prefix every kist domain's keys are derived under, followed by the domain's name (`domain_keys`): no `STORES` prefix can collide with it (none holds a zero byte).
 const KIST_DOMAIN_PREFIX: &[u8] = b"kist\0";
 /// The vault behind `SYS_STORE`, registered by whoever owns it (service.rs): (full key, None = get / Some(value) = set) -> Ok(the value for a get, None if absent) or Err.
@@ -4451,6 +4455,20 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let token = p.read(f.x[0], 32);
             let len = f.x[2] as usize;
             f.x[0] = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+                // Bit 2 of x4 (2026-11-14): this power session's key for the calling system process, bound to its name, from the wairua (fresh each power session, never stored): the same for every call in one boot, unlinkable to any other boot. The WiFi address while nobody is present (AUTH.md rule 2: no stable identifier on the air while locked), so a driver restarted within a boot rejoins as it was and takes no new lease. The caller passes no domain (x2 = 0): every kernel from before this answers that with ERR, so no caller is ever handed a lasting key where it asked for a passing one. Not to a kist.
+                Some((Object::Ira, r)) if r & RIGHT_SEND != 0 && f.x[4] & 4 != 0 => match (!p.kist).then(|| crate::wairua::derive(SESSION_ROOT_CONTEXT)).flatten() {
+                    Some(mut root) => {
+                        let mut h = blake3::Hasher::new_derive_key(SESSION_KEY_CONTEXT);
+                        h.update(&root);
+                        h.update(&p.name);
+                        root.fill(0);
+                        let mut key = *h.finalize().as_bytes();
+                        p.write(f.x[3], &key);
+                        key.fill(0);
+                        32
+                    }
+                    None => ERR,
+                },
                 // Bit 1 of x4: the kist's alias (FACETS.md "The alias"; D1, 2026-11-12: the kernel derives): a seed for this kist alone, the same on every device of the person's, derived from the person key and the gate identity the kernel stamped at launch (the developer key and option), never from anything the caller names. Only to a kist the kist job launched, only while the person is present and their identity service has handed in the person key; else ERR. x1 and x2 are not read.
                 Some((Object::Ira, r)) if r & RIGHT_SEND != 0 && f.x[4] & 2 != 0 => {
                     let alias = match p.gate {
