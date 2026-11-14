@@ -76,6 +76,7 @@ members = [
     "ferros_spi",
     "ferros_cam",
     "payloads/camera",
+    "payloads/camtest",
     "ferros_kist",
     "ferros_lang",
     "ferros_idea",

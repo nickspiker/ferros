@@ -115,7 +115,7 @@ The owner's rule is no polling and no timers unless proven necessary: push or do
 init's grants page is full (108 slots), so init cannot hand out a `torch` server's grants, and a process that sits idle holding an arc for a torch that is mostly off is the wrong shape anyway.
 So the kernel starts it on demand (process.rs `ON_DEMAND`, service.rs): a call on `torch` that finds no server receiving asks the service loop (a `sev`, never a timer), which starts `torch` from its vault capsule with its own grants (`torch_grants`). The process ends itself once it is dark and nothing is waiting, so the arc comes back.
 - A waiting call (no CALL_LIVE) is served by the server once it receives: the caller sees one slower answer.
-- A live call (CALL_LIVE) gets ERR at once, as for any server not receiving, and the start goes ahead: the next call finds it. The torch so started waits for that next call (it does not end until it has served one and is dark). So the quick settings should call `torch` waiting (`call`, not `call_live`): the first tap lights it after the start.
+- A live call (CALL_LIVE) got ERR at once until 2026-11-14, as for any server not receiving, and the start went ahead: the next call found it. Since then a live call on an on-demand endpoint waits for its server as a plain one does (KERNEL.md "CALL_LIVE"), and gets ERR only if the server cannot be started.
 - A call that lands between the process's last look and its end stays queued; the kernel sees it as the process ends (`fail_orphaned_calls`) and starts another.
 - If it cannot start (no capsule stored, no arc free), its waiting calls are answered ERR and the next call tries again.
 - `diag restart torch` and a `bridge spawn` by hand work as for any process.
