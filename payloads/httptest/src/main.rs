@@ -2,7 +2,9 @@
 //!
 //! Spawn after `ip`: ferros-bridge spawn httptest.bin [hex of "host/path"] --name httptest --use udp
 //! With no input it fetches Broadcom's GPS orbit file, gllto2.glpals.com/7day/v5/latest/lto2.dat (GPS.md). Grant slots: 0 console, 1 udp (use).
-//! Prefixes on the input: `!` the cellular link only (ip's LINK mode, given back at the end), `~` IPv4 only.
+//! Prefixes on the input: `!` the cellular link only (ip's LINK mode, given back at the end), `~` IPv4 only, `@` start on the counter's next 8 s boundary (several spawned one after another fetch together: the parallel speed test).
+//! The host may carry a port (`host:8080/path`) and may be an IPv4 literal (`192.168.1.213:8080/x`, a server on the LAN, asked of no resolver): the speed test's other end (docs/WIFI.md "Speed").
+//! The line says the time to connect, to the first byte, and the whole fetch.
 
 #![no_std]
 #![no_main]
@@ -11,6 +13,8 @@ use ferros_sys::nr::CALL;
 use ferros_sys::{now, svc, ERR};
 
 const DEFAULT: &[u8] = b"gllto2.glpals.com/7day/v5/latest/lto2.dat";
+/// The TCP receive buffer (the state byte, then up to 256 KiB less one of data).
+static mut RX: [u8; 1 << 18] = [0; 1 << 18];
 /// A `!` run set ip to the cellular link only.
 static CELL_ONLY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -113,6 +117,39 @@ fn resolve(a: &App, want: u8, host: &[u8]) -> Result<(u8, [u8; 16]), &'static [u
     })
 }
 
+/// Decimal digits as a number; None for an empty field, anything but digits, or more than five digits (a port is at most 65535).
+fn decimal(s: &[u8]) -> Option<u32> {
+    if s.is_empty() || s.len() > 5 {
+        return None;
+    }
+    let mut v = 0u32;
+    for &c in s {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + (c - b'0') as u32;
+    }
+    Some(v)
+}
+
+/// A dotted-quad IPv4 address (four decimal fields, each at most 255), else None (a name).
+fn v4_literal(s: &[u8]) -> Option<[u8; 4]> {
+    let mut q = [0u8; 4];
+    let mut k = 0;
+    for field in s.split(|&c| c == b'.') {
+        if k == 4 || field.len() > 3 {
+            return None;
+        }
+        let v = decimal(field)?;
+        if v > 255 {
+            return None;
+        }
+        q[k] = v as u8;
+        k += 1;
+    }
+    if k == 4 { Some(q) } else { None }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let base = ferros_sys::arc_base();
@@ -139,12 +176,25 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                 CELL_ONLY.store(true, core::sync::atomic::Ordering::Relaxed);
             }
             b'~' => v4_only = true,
+            // `@`: start on the counter's next 8 s boundary, so several spawned one after another (a parallel speed test) start their fetches together.
+            b'@' => {
+                let step = ferros_sys::freq() << 3;
+                ferros_sys::sleep_until((now() / step + 1) * step);
+            }
             _ => break,
         }
         spec = &spec[1..];
     }
     let slash = spec.iter().position(|&c| c == b'/').unwrap_or(spec.len());
     let (host, path) = (&spec[..slash], if slash < spec.len() { &spec[slash..] } else { &b"/"[..] });
+    // `host:port` (the Host header keeps both, as a browser sends it); a port that is not a number is refused.
+    let (name, port) = match host.iter().position(|&c| c == b':') {
+        Some(k) => match decimal(&host[k + 1..]) {
+            Some(p) if p > 0 && p < 1 << 16 => (&host[..k], p as u16),
+            _ => a.done(b"httptest: the port is not a number"),
+        },
+        None => (host, 80),
+    };
 
     // An address of either family and a DNS server (INFO), waiting up to 16 s for DHCP, SLAAC or the cellular call; then the name from ip's resolver (op 10), IPv6 first where it has a route (`~`: IPv4 only).
     let mut out = [0u8; 1 << 14];
@@ -165,12 +215,20 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         sleep_ms(100);
     }
     let t = now();
-    let (fam, ip) = match resolve(&a, if v4_only { 4 } else { 0 }, host) {
-        Ok(f) => f,
-        Err(why) => a.done(why),
+    // An IPv4 literal (a server on the LAN, the speed test's other end) is its own address; a name goes to ip's resolver.
+    let (fam, ip) = match v4_literal(name) {
+        Some(q) => {
+            let mut ip = [0u8; 16];
+            ip[..4].copy_from_slice(&q);
+            (4, ip)
+        }
+        None => match resolve(&a, if v4_only { 4 } else { 0 }, name) {
+            Ok(f) => f,
+            Err(why) => a.done(why),
+        },
     };
     a.put(b"httptest: ");
-    a.put(host);
+    a.put(name);
     if fam == 6 {
         a.put(b" is G#");
         for g in 0..8 {
@@ -201,7 +259,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     c[0] = 4;
     c[1] = fam;
     c[2..18].copy_from_slice(&ip);
-    c[18..20].copy_from_slice(&80u16.to_be_bytes());
+    c[18..20].copy_from_slice(&port.to_be_bytes());
     let t = now();
     let mut r = [0u8; 16];
     let n = a.udp(&c, &mut r);
@@ -231,9 +289,12 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let mut tail = 0u32;
     let mut head_total = 0u64;
     let mut connected = None;
+    let mut first = None;
+    // The receive buffer: 256 KiB, the most one reply of ip carries (its RECV_MAX), so a fast link is not held to a 16 KiB call (a static: the payload's stack is far smaller).
+    let rx = unsafe { &mut *core::ptr::addr_of_mut!(RX) };
     // TCP RECV: held a second at most for data or a change of state once the request is all in ip's send buffer (never a poll), the most data the buffer takes after the state byte.
     let mut q = [6, h, 0, 0, 0, 0, 0];
-    q[3..7].copy_from_slice(&(out.len() as u32 - 1).to_be_bytes());
+    q[3..7].copy_from_slice(&(rx.len() as u32 - 1).to_be_bytes());
     loop {
         if sent < body {
             let mut s = [0u8; 600];
@@ -247,16 +308,19 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
             }
         }
         q[2] = if sent < body { 0 } else { 1 };
-        let n = a.udp(&q, &mut out);
+        let n = a.udp(&q, rx);
         if n == 0 || n == ERR {
             a.done(b"httptest: recv failed");
         }
         let n = n as usize;
-        let state = out[0];
+        let state = rx[0];
         if state >= 2 && connected.is_none() {
             connected = Some(ferros_sys::us_since(t));
         }
-        for &b in &out[1..n] {
+        if n > 1 && first.is_none() {
+            first = Some(ferros_sys::us_since(t));
+        }
+        for &b in &rx[1..n] {
             if in_body {
                 fnv = (fnv ^ b as u64).wrapping_mul(0x100_0000_01b3);
                 total += 1;
@@ -282,6 +346,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
             a.put(&hl[..line_end]);
             a.put(b", connected in ");
             a.dec(connected.unwrap_or(0) / 1000);
+            a.put(b" ms, first byte in ");
+            a.dec(first.unwrap_or(0) / 1000);
             a.put(b" ms, headers ");
             a.dec(head_total);
             a.put(b" bytes, body ");
