@@ -12,4 +12,4 @@ metadata:
 
 **Why:** the seal is per device (each device's hash differs); a plain store keeps the bytes but not the seal, and the old seal names the old bytes.
 
-**How to apply:** after storing any masked payload (tools/ferros-masked-build.sh output, e.g. ahau), on every device: `ferros-bridge seal target/masked/<name>/<name>.bin --text-len $(cat target/masked/<name>/<name>.textlen)`, then `diag "restart <name>"` to check it runs before any reboot. Kists installed thru the installer are sealed by it.
+**How to apply:** after storing any masked payload (tools/ferros-masked-build.sh output, e.g. ahau), on every device: `ferros-bridge seal target/masked/<name>/<name>.bin --text-len N`, where N is the masked build's ".text: N words" count x 4 (the same N given to `ferros-bridge capsule ... --masked --text-len N`); NOT the `.textlen` file, which is 52 bytes larger and doesn't match what the devices store (found 2026-11-14 deploying the Pro), then `diag "restart <name>"` to check it runs before any reboot. Kists installed thru the installer are sealed by it.
