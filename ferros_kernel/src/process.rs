@@ -747,7 +747,9 @@ struct Process {
     name: Vec<u8>,
     /// The process's console output is at the start of a line (so the next byte gets the name tag).
     line_start: bool,
-    /// Its last console line (the one in progress, else the last complete one), up to `WORDS_MAX` bytes: written to the flash log when it ends (`end_process`), so a process's own account of its death (a panic's line) survives a console drain or the reset that follows.
+    /// Its index among the console ring's writers (`ferros_console::ConRing::owner`), looked up at its first write and checked at each.
+    con: u8,
+    /// Its last console line (the one in progress, else the last complete one), up to `WORDS_MAX` bytes (reserved at the spawn, so a write never grows it): written to the flash log when it ends (`end_process`), so a process's own account of its death (a panic's line) survives a console drain or the reset that follows.
     words: Vec<u8>,
     /// The spawn input, kept in kernel memory and pulled in by the `input` syscall (so a driver's arc stays small while large one-shot data — firmware — streams through a chunk buffer). Inlined into the arc too only when it is small.
     input: Vec<u8>,
@@ -819,8 +821,8 @@ struct Kernel {
     threads: Vec<Option<Thread>>,
     endpoints: Vec<Endpoint>,
     runnable: alloc::collections::VecDeque<usize>,
-    /// Everything any process sent its console during the current kernel entry, each line tagged with the sender's name.
-    console: Vec<u8>,
+    /// Everything processes and the kernel sent the console, each process's lines stamped and tagged with its name: one fixed ring, overwritten oldest first (ferros_console; 2026-11-14, the `Vec` it replaced grew under a ping flood until the heap ran out and the Pro rebooted).
+    console: ferros_console::ConRing,
     /// Threads that ended during the current entry: (thread, exit value).
     exited: Vec<(usize, u64)>,
     ipc_round_trips: u32,
@@ -993,7 +995,7 @@ static KERNEL: Global<Kernel> = Global(UnsafeCell::new(Kernel {
     threads: Vec::new(),
     endpoints: Vec::new(),
     runnable: alloc::collections::VecDeque::new(),
-    console: Vec::new(),
+    console: ferros_console::ConRing::new(),
     exited: Vec::new(),
     ipc_round_trips: 0,
     trace_at: 0,
@@ -4692,29 +4694,39 @@ fn el0_trap(f: &mut Frame) -> u64 {
             }
             match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                 Some((Object::Console, r)) if r & RIGHT_SEND != 0 => {
-                    let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
-                    let at = kk.console.len();
+                    // The text read where it lies in the process's memory, with no copy on the heap: a console write never allocates, never fails and never waits (2026-11-14).
+                    let len = (f.x[2] as usize).min(4096);
+                    let msg: &[u8] = match p.view(f.x[1], len) {
+                        // SAFETY: `view` resolved all `len` bytes inside this process's arc or one of its DMA regions, identity-mapped and the kernel's to read; the slice lives only for this write, under the kernel lock, while the process's record (its line state) is updated beside it.
+                        Some(m) => unsafe { core::slice::from_raw_parts(m.as_ptr(), m.len()) },
+                        None => &[],
+                    };
+                    let o = kk.console.owner(&p.name, p.con);
+                    p.con = o;
+                    let at = kk.console.pos();
                     // Each line stamped with the kernel's clock in ms, as the flash log's lines are ("t<ms> "), so a timeline across processes reads straight off the console (2026-11-12, measuring attest to the deck).
                     let ms = crate::platform::cntpct() / (crate::platform::cntfrq() / 1000);
-                    for &c in &msg {
+                    for line in msg.split_inclusive(|&c| c == b'\n') {
                         if p.line_start {
-                            kk.console.push(b't');
-                            push_dec(&mut kk.console, ms);
-                            kk.console.push(b' ');
-                            kk.console.extend_from_slice(&p.name);
-                            kk.console.extend_from_slice(b": ");
-                            if c != b'\n' {
+                            kk.console.put(o, b"t");
+                            kk.console.dec(o, ms);
+                            kk.console.put(o, b" ");
+                            kk.console.put(o, &p.name);
+                            kk.console.put(o, b": ");
+                            if line[0] != b'\n' {
                                 p.words.clear();
                             }
                         }
-                        kk.console.push(c);
-                        // WHY the bound: the line is the process's, any length; the flash log keeps its first WORDS_MAX bytes.
-                        if c != b'\n' && p.words.len() < WORDS_MAX {
-                            p.words.push(c);
+                        kk.console.put(o, line);
+                        for &c in line {
+                            // WHY the bound: the line is the process's, any length; the flash log keeps its first WORDS_MAX bytes.
+                            if c != b'\n' && p.words.len() < WORDS_MAX {
+                                p.words.push(c);
+                            }
                         }
-                        p.line_start = c == b'\n';
+                        p.line_start = line[line.len() - 1] == b'\n';
                     }
-                    crate::platform::pstore(&kk.console[at..]);
+                    pstore_since(at);
                     let n = 2usize.min(f.x[4] as usize);
                     p.write(f.x[3], &b"ok"[..n]);
                     f.x[0] = n as u64;
@@ -5549,14 +5561,14 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         link_emptied(&name);
         fail_callers(&p.cspace);
         p.cspace.retain(|c| !matches!(c.object, Object::Reply(_)));
-        let at = kk.console.len();
+        let at = kk.console.pos();
         kk.console.extend_from_slice(&name);
         kk.console.extend_from_slice(b": exit G#");
         for i in (0..16).rev() {
             kk.console.push(b"0123456789ABCDEF"[((value >> (4 * i)) & 0xF) as usize]);
         }
         kk.console.push(b'\n');
-        crate::platform::pstore(&kk.console[at..]);
+        pstore_since(at);
         // The end in the flash log with the process's last line (2026-11-12, the 8a: the vault process died during a stow, and its panic and its exit were on the console alone, which nobody read before it drained). Under the kernel lock, which the log's UFS commands need.
         crate::flashlog::line(&alloc::format!("{}: ended, exit G#{value:016X}; its last line: {}", core::str::from_utf8(&name).unwrap_or("?"), core::str::from_utf8(&p.words).unwrap_or("(not text)")));
         vault_ended(p, value);
@@ -5726,13 +5738,17 @@ pub fn run_slice() -> bool {
     true
 }
 
-/// Append to the kernel's process console (e.g. a boot-time spawn's output, kept for `diag console`).
+/// Append the kernel's own text to the process console (kept for `diag console`).
 pub fn push_console(bytes: &[u8]) {
     lock();
     k().console.extend_from_slice(bytes);
     crate::platform::pstore(bytes);
     unlock();
-    // akita: the RAM log does not survive its resets, so the consoles go to the flash log too (in the ferros partition, board.rs).
+    console_flashlog(bytes);
+}
+
+/// akita: the RAM log does not survive its resets, so the kernel's console lines and a boot-time spawn's first slice go to the flash log too (in the ferros partition, board.rs).
+pub fn console_flashlog(bytes: &[u8]) {
     if crate::board::akita() {
         let text = alloc::string::String::from_utf8_lossy(bytes);
         let text = text.trim_end();
@@ -5742,35 +5758,28 @@ pub fn push_console(bytes: &[u8]) {
     }
 }
 
-/// Drain what processes have sent their consoles since the last drain.
+/// The ring's bytes from position `at` to now into the RAM log (`pstore`), both parts when they wrap. Under the kernel lock.
+fn pstore_since(at: u64) {
+    let (a, b) = k().console.since(at);
+    crate::platform::pstore(a);
+    if !b.is_empty() {
+        crate::platform::pstore(b);
+    }
+}
+
+/// Drain the console: a line for each writer whose text was overwritten before this read could have it (`… A#<n> bytes dropped from <name>`), then everything written since the last drain.
+/// The ring keeps what was drained too, for `diag "console kept"`: a reader that drains takes the lines from everyone else (2026-11-12: several tools on one device, and a timeline read off the console lost its middle to another's drain).
 pub fn take_console() -> Vec<u8> {
     lock();
-    let v = core::mem::take(&mut k().console);
-    // What was drained is kept too, its last CONSOLE_KEPT bytes, for `diag "console kept"`: a reader that drains takes the lines from everyone else (2026-11-12: several tools on one device, and a timeline read off the console lost its middle to another's drain).
-    let kept = unsafe { &mut *(&raw mut KEPT) };
-    kept.extend_from_slice(&v);
-    if kept.len() > CONSOLE_KEPT {
-        let cut = kept.len() - CONSOLE_KEPT / 2;
-        kept.drain(..cut);
-    }
+    let v = k().console.take();
     unlock();
     v
 }
 
-/// How much drained console `take_console` keeps (`KEPT`): it is trimmed to half of this when it passes it.
-const CONSOLE_KEPT: usize = 1 << 20;
-static mut KEPT: Vec<u8> = Vec::new();
-
-/// The console as kept, without draining it: the last `max` bytes of what was drained and what waits to be (`diag "console kept [KiB]"`).
+/// The console as kept, without draining it: the last `max` bytes the ring holds, drained or not (`diag "console kept [KiB]"`).
 pub fn console_kept(max: usize) -> Vec<u8> {
     lock();
-    let kept = unsafe { &*(&raw const KEPT) };
-    let pending = &k().console;
-    let mut v = Vec::with_capacity(max);
-    let from_pending = pending.len().min(max);
-    let from_kept = (max - from_pending).min(kept.len());
-    v.extend_from_slice(&kept[kept.len() - from_kept..]);
-    v.extend_from_slice(&pending[pending.len() - from_pending..]);
+    let v = k().console.kept(max);
     unlock();
     v
 }
@@ -5902,7 +5911,7 @@ pub fn named_alive_locked(names: &[&[u8]]) -> u64 {
 pub struct Outcome {
     /// The spawned process's exit value, or PARKED if it is still alive (blocked in recv or call).
     pub exit: u64,
-    /// Everything any process sent its console while this spawn ran, tagged with the sender's name.
+    /// A copy of what was written to the console while this spawn ran (anyone's, tagged with the sender's name); the text stays in the ring, so a caller never puts it back (`console_flashlog` for akita's flash log).
     pub console: Vec<u8>,
     /// Completed IPC call/reply round trips during this spawn.
     pub round_trips: u32,
@@ -6586,6 +6595,7 @@ fn launch(built: Result<(usize, Arc, usize), &'static str>, input_len: usize) ->
     };
     let kk = k();
     kk.exited.clear();
+    let at = kk.console.pos();
     let trips0 = kk.ipc_round_trips;
     if let Some(p) = th(me) {
         p.state = State::Running;
@@ -6603,7 +6613,8 @@ fn launch(built: Result<(usize, Arc, usize), &'static str>, input_len: usize) ->
         None if matches!(th(me).map(|p| p.state), Some(State::Runnable)) => PREEMPTED,
         None => PARKED,
     };
-    let out = Outcome { exit, console: core::mem::take(&mut kk.console), round_trips: kk.ipc_round_trips - trips0 };
+    let (a, b) = kk.console.since(at);
+    let out = Outcome { exit, console: [a, b].concat(), round_trips: kk.ipc_round_trips - trips0 };
     unlock();
     Ok(out)
 }
@@ -6834,7 +6845,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // The register grants by slot, for `mmio_fast`: HARDWARE has fewer than 255 blocks, so an index plus one fits a byte.
     let hw = cspace.iter().map(|c| match c.object { Object::Hardware(g) => g as u8 + 1, _ => 0 }).collect();
     let fast = alloc::boxed::Box::new(Grants { hw, ended: core::sync::atomic::AtomicBool::new(false) });
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, words: Vec::new(), input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, gate: None, facets: 0, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), fast };
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, con: ferros_console::KERNEL, words: Vec::with_capacity(WORDS_MAX), input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0, start: 0, pet_thread: usize::MAX, paused_at: 0, paused: 0, domain, kist: false, gate: None, facets: 0, capsule: None, floor: arc.top() - arc.base, grows: 0, shrinks: 0, hold: None, moves: 0, holes: Vec::new(), fast };
     PROCS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
     vault_spawned(objects);
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.
@@ -6909,7 +6920,7 @@ fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<us
     let t_end = crate::platform::cntpct();
     let kk = k();
     // On a line of its own: a process's line still open (no newline yet) is broken here rather than run into.
-    if kk.console.last().is_some_and(|&c| c != b'\n') {
+    if kk.console.last().is_some_and(|c| c != b'\n') {
         kk.console.push(b'\n');
     }
     kk.console.extend_from_slice(b"t");
@@ -6926,20 +6937,9 @@ fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<us
     r
 }
 
-/// The decimal digits of `v` onto `out`, for console lines built under the lock without the formatter.
-fn push_dec(out: &mut Vec<u8>, v: u64) {
-    let mut d = [0u8; 20];
-    let mut n = 0;
-    let mut v = v;
-    loop {
-        d[n] = b'0' + (v % 10) as u8;
-        n += 1;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
-    }
-    out.extend(d[..n].iter().rev());
+/// The decimal digits of `v` onto the console as the kernel's, for lines built under the lock without the formatter.
+fn push_dec(out: &mut ferros_console::ConRing, v: u64) {
+    out.dec(ferros_console::KERNEL, v);
 }
 
 /// `spawn_queued` past the gate: the seal of a masked capsule, the ihi, the process built and queued.
