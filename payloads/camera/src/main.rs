@@ -620,15 +620,74 @@ const STRIDE: usize = 0x1400;
 const HEADER: usize = 1 << 6;
 /// The largest reply: bin 2, 2040 x 1536 samples of 16 bits, and the header.
 static mut OUT: [u8; HEADER + (W / 2) * (H / 2) * 2] = [0; HEADER + (W / 2) * (H / 2) * 2];
-/// The lines a binned row pair reads (2 x bin, at most 16), copied out of the non-cacheable region in 64-byte reads, and unpacked to 16 bits.
 const BIN_MOST: usize = 1 << 3;
-static mut RAW: [u64; 2 * BIN_MOST * STRIDE / 8] = [0; 2 * BIN_MOST * STRIDE / 8];
-static mut PIX: [u16; 2 * BIN_MOST * W] = [0; 2 * BIN_MOST * W];
-/// The summed line `bin_row` works in.
-static mut ACC: [u16; W] = [0; W];
+/// How many threads bin a frame: the server thread and three binners, one for each A715 (coordinator, 2026-11-14). On one thread a frame was a 36 ms burst every 67 ms, which filled the clock governor's 15.6 ms windows, so it ramped the A715s to their top and held the active profile while streaming; four quarters of it fill none.
+const BINNERS: usize = 4;
+/// Each binner's lines: the 2 x bin lines a row pair reads (at most 16), copied out of the non-cacheable region in 64-byte reads, unpacked to 16 bits, and the summed line `bin_row` works in.
+struct Scratch {
+    raw: [u64; 2 * BIN_MOST * STRIDE / 8],
+    pix: [u16; 2 * BIN_MOST * W],
+    acc: [u16; W],
+}
+static mut SCRATCH: [Scratch; BINNERS] = [const { Scratch { raw: [0; 2 * BIN_MOST * STRIDE / 8], pix: [0; 2 * BIN_MOST * W], acc: [0; W] } }; BINNERS];
+static mut BIN_STACKS: [[u8; 1 << 14]; BINNERS - 1] = [[0; 1 << 14]; BINNERS - 1];
+/// A frame's binning handed to the binners: its count (a new one each frame, the binners' doorbell), the image's address and the bin; and how many binners have finished it.
+static BIN_JOB: AtomicU64 = AtomicU64::new(0);
+static BIN_SRC: AtomicU64 = AtomicU64::new(0);
+static BIN_BIN: AtomicU64 = AtomicU64::new(0);
+static BIN_DONE: AtomicU64 = AtomicU64::new(0);
 
-/// Counter ticks spent copying lines out of the region, summed over frames since the last console line (the rest of the binning is unpacking and averaging in cached memory).
+/// Counter ticks spent copying lines out of the region, summed over frames and binners since the last console line (the rest of the binning is unpacking and averaging in cached memory).
 static COPY_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Binner `k`'s share of a frame: every `BINNERS`th row pair from its own, into `OUT`. Row pairs are disjoint between binners, so no two write the same bytes of `OUT`.
+fn bin_part(k: usize, src: usize, bin: usize) {
+    let (bw, bh) = (W / bin, H / bin);
+    let s = unsafe { &mut (*(&raw mut SCRATCH))[k] };
+    let out = (&raw mut OUT) as *mut u8;
+    let rows = 2 * bin;
+    let words = STRIDE / 8;
+    for pair in (k..bh / 2).step_by(BINNERS) {
+        // The 2 x bin lines this row pair reads, copied out of the region whole, then unpacked (ferros_cam raw, host-tested against std/camreplay's binning of a recorded frame).
+        for r in 0..rows {
+            // 64 bytes a load (four NEON registers), not 8: each load of non-cacheable memory is its own transaction, and 8-byte ones took 121 ms a frame (the Pro, 2026-11-14).
+            let t = ferros_sys::now();
+            let line = (src + (pair * rows + r) * STRIDE) as *const u8;
+            let dst = unsafe { s.raw.as_mut_ptr().add(r * words) } as *mut u8;
+            for i in 0..STRIDE / 64 {
+                unsafe {
+                    let v = core::arch::aarch64::vld1q_u8_x4(line.add(i * 64));
+                    core::arch::aarch64::vst1q_u8_x4(dst.add(i * 64), v);
+                }
+            }
+            COPY_TICKS.fetch_add(ferros_sys::now() - t, Ordering::Relaxed);
+            let bytes = unsafe { core::slice::from_raw_parts(s.raw.as_ptr().add(r * words) as *const u8, STRIDE) };
+            ferros_cam::raw::unpack(bytes, &mut s.pix[r * W..(r + 1) * W]);
+        }
+        for phase in 0..2 {
+            let oy = pair * 2 + phase;
+            // SAFETY: row oy of the output is this binner's alone (its row pair), inside `OUT` (bw x bh samples of 2 bytes after the header, bh at most H / 2).
+            let row = unsafe { core::slice::from_raw_parts_mut(out.add(HEADER + oy * bw * 2), bw * 2) };
+            ferros_cam::raw::bin_row(&s.pix[..rows * W], W, bin, phase, &mut s.acc, row);
+        }
+    }
+}
+
+/// A binner: waits on the frame's doorbell, does its share, says so.
+extern "C" fn binner(k: u64) -> ! {
+    let mut seen = 0;
+    loop {
+        let job = BIN_JOB.load(Ordering::Acquire);
+        if job == seen {
+            ferros_sys::wait(&BIN_JOB, job, 0);
+            continue;
+        }
+        seen = job;
+        bin_part(k as usize, BIN_SRC.load(Ordering::Acquire) as usize, BIN_BIN.load(Ordering::Acquire) as usize);
+        BIN_DONE.fetch_add(1, Ordering::AcqRel);
+        ferros_sys::wake(&BIN_DONE, 1);
+    }
+}
 
 /// The image body (loch0's image path, its output slot 2 in the region): a RAW10 frame as the front end writes it.
 fn image(o: &Open) -> usize {
@@ -638,34 +697,21 @@ fn image(o: &Open) -> usize {
 /// The frame into `OUT`, binned `bin` x `bin` per colour: output sample (ox, oy) is the mean of the bin x bin same-colour samples of its 2 bin x 2 bin block, so the mosaic keeps its phase (G B / R G). The header: count, width and height after binning, bin, cfa, black and white, exposure (ns), gain, focus, when it ended (Eagle ns). Its length.
 fn bin_frame(o: &Open, bin: usize, count: u64) -> usize {
     let (bw, bh) = (W / bin, H / bin);
-    let out = unsafe { &mut *(&raw mut OUT) };
-    let raw = unsafe { &mut *(&raw mut RAW) };
-    let pix = unsafe { &mut *(&raw mut PIX) };
-    let src = image(o);
-    let rows = 2 * bin;
-    let words = STRIDE / 8;
-    for pair in 0..bh / 2 {
-        // The 2 x bin lines this row pair reads, copied out of the region whole (8-byte reads of non-cacheable memory), then unpacked (ferros_cam raw, host-tested against std/camreplay's binning of a recorded frame).
-        for r in 0..rows {
-            // 64 bytes a load (four NEON registers), not 8: each load of non-cacheable memory is its own transaction, and 8-byte ones took 121 ms a frame (the Pro, 2026-11-14), the whole of the binning's budget and more.
-            let t = ferros_sys::now();
-            let line = (src + (pair * rows + r) * STRIDE) as *const u8;
-            let dst = unsafe { raw.as_mut_ptr().add(r * words) } as *mut u8;
-            for i in 0..STRIDE / 64 {
-                unsafe {
-                    let v = core::arch::aarch64::vld1q_u8_x4(line.add(i * 64));
-                    core::arch::aarch64::vst1q_u8_x4(dst.add(i * 64), v);
-                }
-            }
-            COPY_TICKS.fetch_add(ferros_sys::now() - t, Ordering::Relaxed);
-            let bytes = unsafe { core::slice::from_raw_parts(raw.as_ptr().add(r * words) as *const u8, STRIDE) };
-            ferros_cam::raw::unpack(bytes, &mut pix[r * W..(r + 1) * W]);
+    // The binners rung with this frame, this thread doing its own share, then waiting for theirs.
+    BIN_SRC.store(image(o) as u64, Ordering::Release);
+    BIN_BIN.store(bin as u64, Ordering::Release);
+    BIN_DONE.store(0, Ordering::Release);
+    BIN_JOB.fetch_add(1, Ordering::AcqRel);
+    ferros_sys::wake(&BIN_JOB, (BINNERS - 1) as u64);
+    bin_part(0, image(o), bin);
+    loop {
+        let d = BIN_DONE.load(Ordering::Acquire);
+        if d == (BINNERS - 1) as u64 {
+            break;
         }
-        for phase in 0..2 {
-            let oy = pair * 2 + phase;
-            ferros_cam::raw::bin_row(&pix[..rows * W], W, bin, phase, unsafe { &mut *(&raw mut ACC) }, &mut out[HEADER + oy * bw * 2..HEADER + (oy + 1) * bw * 2]);
-        }
+        ferros_sys::wait(&BIN_DONE, d, 0);
     }
+    let out = unsafe { &mut *(&raw mut OUT) };
     let h = &mut out[..HEADER];
     h.fill(0);
     h[0..4].copy_from_slice(&(count as u32).to_le_bytes());
@@ -693,6 +739,9 @@ const FRAME_LATE_US: u64 = 1 << 21;
 pub extern "C" fn payload_main(g: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     ferros_sys::thread_spawn(frame_thread, unsafe { &mut *(&raw mut FRAME_STACK) }, g);
+    for k in 1..BINNERS {
+        ferros_sys::thread_spawn(binner, unsafe { &mut (*(&raw mut BIN_STACKS))[k - 1] }, k as u64);
+    }
     let mut msg = [0u8; 64];
     let mut token = [0u8; 32];
     let mut open_cam: Option<Open> = None;
@@ -798,7 +847,7 @@ pub extern "C" fn payload_main(g: u64, _input: u64, _input_len: u64) -> ! {
                 if served % 64 == 0 {
                     let us = ferros_sys::us_since(since);
                     let copy_us = COPY_TICKS.swap(0, Ordering::Relaxed) * 1_000_000 / ferros_sys::freq();
-                    say!(g, "camera: A#{served} frames served, the last 64 in A#{} ms (A#{} us apart), binning A#{} us each (copying out of the region A#{} us of it); A#{} taken by the front end\n", us / 1000, us / 64, bin_us / 64, copy_us / 64, n);
+                    say!(g, "camera: A#{served} frames served, the last 64 in A#{} ms (A#{} us apart), binning A#{} us each on A#{BINNERS} threads (copying out of the region A#{} us of their time); A#{} taken by the front end\n", us / 1000, us / 64, bin_us / 64, copy_us / 64, n);
                     (bin_us, since) = (0, ferros_sys::now());
                 }
                 if reply(&token, unsafe { &(&*(&raw const OUT))[..len] }) == ERR {
