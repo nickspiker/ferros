@@ -135,7 +135,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [GPS fix via on-chip engine](gps_onchip_fix.md) - BCM4776's own engine via a replayed gpsd session; payloads/gps
 - [NFC + BT drivers](husky_radios_nfc_bt.md) - nfc/bt processes; WiFi turns BT off before cycling WL_REG_ON
 - [AoC + USF under ferros](aoc_start_needs_trusty.md) - sensors via Trusty-started AoC, rails, registry scripts with board CDT
-- [husky camera bring-up](husky_camera_bringup.md) - main sensor frames, ISP front end, PDMA; front/tele open; traps
+- [husky camera bring-up](husky_camera_bringup.md) - main streams in the driver; ultrawide built in (untested); front/tele: LV buck guess; traps
 - [husky touch bring-up](husky_touch_bringup.md) - FTM5 cold: scan-mode two writes, event nibble, burst drain
 - [HK3 emission duty is the panel's](hk3_emission_duty_is_panel.md) - full duty down to DBV ~1246; ferros dims in pixels
 - [DPU power + secure registers](dpu_power_secure_registers.md) - `diag dpu`; never touch secure zero words (EL3 poison)

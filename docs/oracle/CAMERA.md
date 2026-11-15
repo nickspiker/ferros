@@ -388,3 +388,10 @@ Captured without hands (the Pixel Camera app driven over adb, its screen checked
 - **Tele (kraken, G#2D on hsi2c_4): init captured, stream not.** The app configures the tele at every camera open (1066 transfers, integrity 0, Samsung's 6028/602A/6F12 protocol) but under a dim red light 5x is a crop of the main sensor, in photo and video alike, so it never streams: its stream-on and receive side need a bright scene.
 
 Capture traps learned on the way: the oracle's `ARM_AFTER_MS` counts the physical counter since the last reset (the hv's start runs about 20 s ahead of Android's clock); a clean reboot wipes the console zone (the bootloader fills it with G#FF), only a crash reset keeps it; read the zone back from ferros over the bridge (G#FD3F_F000, 2 MiB, ordered from its write pointer) instead of booting Android to read pstore. And the app reopens the rear camera whatever was used last.
+
+## One supply no comparison covered (2026-11-15, from the device tree, unmeasured)
+
+The main's `enable-gpios` is the sub-PMIC's GPIO2, "CAMS_LVBUCK_EN for ldo8" in zuma-husky-camera.dtsi: the low-voltage buck behind the camera PMIC's LDO8.
+The front camera and the tele list LDO8 and no enable; under Android the main is powered at boot (`lwis,power-up-to-suspend`), so the line is high whenever they run, which fits the ACPM trap that saw no sub-PMIC command during an open or the flip.
+From a cold ferros boot it always read G#40 (output, low), and the front's and tele's power-up never touched it, so the 2026-11-06 comparison could not see it.
+The driver's power-up for both now raises it as the main's does; the test, and the next steps if it is not the cause, are in docs/CAMERA.md "The other cameras".
