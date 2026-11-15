@@ -307,6 +307,7 @@ SysMMU `sysmmu_hsi2` G#131C_0000 sits in front of PCIe ch1 only (port PCIe_CH1) 
 13. BAR placement vs the 2 MB MEM iATU limit (§10).
 14. SYSREG_HSI2: the ch1 path writes nothing there.
 15. **ferros-specific:** on husky, reading an unpowered block makes the next EL3 call hang (BOOT.md EL3 poison rule) — read the CMU gates (§2) before touching ELBI/DBI.
+16. **The PHY powered down with its isolation released stalls ELBI and DBI** (2026-11-15): Android's suspended link leaves exactly that (PMU G#4C1, the stage 1 A3-A8 values, UDBG G#C700 bit 0 clear), and the first jumps' WiFi and modem drivers hung the bus on it. With the PHY isolated (a cold boot's G#C0, or after `off`) both answer, at their reset values. Every bring-up therefore begins with `off` (stage G#F0's power-down: Bluetooth off, PERST low, the PHY powered down and isolated, WL_REG_ON low, no ELBI or DBI), and the survey reads ELBI and DBI only when the PHY is isolated or powered. HV.md "The radios after a jump" has the whole state Android leaves.
 
 ## The keeper: the driver started again after a failed join (2026-10-29)
 
