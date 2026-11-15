@@ -421,12 +421,30 @@ fn cmd_pdma_image(mut args: Vec<String>) {
     const IMAGE_SLOT: u32 = 2;
     const RING_ENTRIES: usize = 1024;
     let which = opt(&mut args, "--list").map(|v| v.parse().unwrap_or_else(|_| die("--list N"))).unwrap_or(1);
+    // --own-image: the image body alone in slot 2, at its start, whatever else shares its captured granule (akita's main puts its PD output at the granule's start and the 20.2 MB image 5 MiB in, 2026-11-15: a ring of image buffers in slot 2 would have the PD output written over buffer 0); every other address keeps its granule's slot and offset as before.
+    let own_image = args.iter().position(|a| a == "--own-image").map(|i| args.remove(i)).is_some();
     if args.len() != 2 {
-        die("pdma-image <dump.log> <out.cpr3> [--list N]");
+        die("pdma-image <dump.log> <out.cpr3> [--list N] [--own-image]");
     }
     let (mut words, loads) = pdma_list(&read_text(&args[0]), which);
     if words.is_empty() {
         die("no list words in the dump");
+    }
+    // With --own-image, a last record that would run past the buffer is left out, the only change to the captured bytes: the engine stops at the buffer's length, so it never ran it (akita's main, list 1 of 2026-11-15: its buffer's last four words repeat the record before them under a header G#0004_0000, a stale tail that ferros_cam job's walker refuses as truncated). Zero words are stepped over as single words, not taken as the end: akita's front list has zeros before its last record (the commit writes).
+    if own_image {
+        let mut i = 0usize;
+        while i < words.len() {
+            let h = words[i];
+            let n = if h == 0 { 0 } else { (h >> 14) as usize };
+            if i + 1 + n > words.len() {
+                break;
+            }
+            i += 1 + n;
+        }
+        if i < words.len() {
+            println!("program ends at word {i} of {}: the {} words after it left out (first G#{:08X})", words.len(), words.len() - i, words[i]);
+            words.truncate(i);
+        }
     }
     let is_addr = |r: u32| ADDR_ALL.contains(&(r as u64));
     // Granule (bits 31:24 of the captured IOVA) to slot, in first-seen order, the image's granule claimed for slot 2 first.
@@ -439,7 +457,7 @@ fn cmd_pdma_image(mut args: Vec<String>) {
         if op == 2 {
             let mut k2 = j + 2;
             while k2 < j + 1 + n && k2 < words.len() {
-                if ISPFE + words[k2 - 1] == IMAGE_REG && words[k2] != 0 && !slot_of.iter().any(|s| s.0 == words[k2] >> 24) {
+                if !own_image && ISPFE + words[k2 - 1] == IMAGE_REG && words[k2] != 0 && !slot_of.iter().any(|s| s.0 == words[k2] >> 24) {
                     slot_of.push((words[k2] >> 24, IMAGE_SLOT));
                 }
                 k2 += 2;
@@ -450,6 +468,11 @@ fn cmd_pdma_image(mut args: Vec<String>) {
         j += 1 + n;
     }
     let mut remap = |reg: u32, v: u32, slot_of: &mut Vec<(u32, u32)>| -> u32 {
+        if own_image && reg == IMAGE_REG {
+            let pa = BUF_PA + IMAGE_SLOT * BUF_SLICE;
+            owners.entry(pa).or_default().push(reg);
+            return pa;
+        }
         let g = v >> 24;
         let slot = match slot_of.iter().find(|s| s.0 == g) {
             Some(s) => s.1,
@@ -522,6 +545,22 @@ fn cmd_pdma_image(mut args: Vec<String>) {
     for (pa, regs) in owners.iter() {
         println!("  slot G#{pa:X}: {}", regs.iter().map(|r| format!("G#{r:X}")).collect::<Vec<_>>().join(" "));
     }
+    // For a camera whose outputs are not measured yet (ferros_cam job's sizes and skips): each slot from its lowest named offset to its granule's end, in whole frames of the pool (2 MiB), the image slot left 0 (the driver's ring fills it).
+    let mut sizes = [0u32; BUF_SLOTS as usize];
+    let mut skips = [0u32; BUF_SLOTS as usize];
+    for pa in owners.keys() {
+        let (k, off) = (((pa - BUF_PA) / BUF_SLICE) as usize, (pa - BUF_PA) % BUF_SLICE);
+        if k as u32 == IMAGE_SLOT && own_image {
+            continue;
+        }
+        if sizes[k] == 0 || off < skips[k] {
+            skips[k] = off;
+            sizes[k] = (BUF_SLICE - off).div_ceil(1 << 21) << 21;
+        }
+    }
+    let mib = |v: u32| if v == 0 { "0".to_string() } else { format!("{} * MIB", v >> 20) };
+    println!("sizes: [{}]", sizes.iter().map(|&v| mib(v)).collect::<Vec<_>>().join(", "));
+    println!("skips: [{}]", skips.iter().map(|&v| format!("0x{v:X}")).collect::<Vec<_>>().join(", "));
 }
 
 fn main() {
