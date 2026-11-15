@@ -7,7 +7,7 @@
 //! - +8 the driver's flags (payloads/camera `F_*`: 1 RAW12, 2 mid-stream, 4 PD path, 8 geometry everywhere, 16 slim program, 32 slim level 2, 64 front end left as captured), +9 a slit ring's buffers as a power of two (0: 2^8), +10 the line length (u16; 0 the mode's),
 //! - +12 the work per frame: 0 map only (the capture's ceiling), 1 read every line out of the view (64-byte loads), 2 read and add into u16 sums folded into u32 every 64 frames, 3 read and add into u32 sums,
 //! - +13 frames (or slits) in 16s (0: 64), +14 a sweep (0 none; 1 the slit's rows from 64 down to its cell, a new open each; 2 the frame length from the mode's own down, a new open each), +15 threads for whole frames (0: the four A715s).
-//! e.g. `00030400000000000000000002080100`: the main, a binned slit of 4 rows, 128 slits added into u16; `0001000000000000000000000204000000`: the main binned at its default cut frame, 64 frames added.
+//! e.g. `00030400000000000000000002080000`: the main, a binned slit of 4 rows, 128 slits added into u16; `00010000000000000000000002040000`: the main binned at its default cut frame, 64 frames added (every byte of the 16 written, little-endian halves: rows 4 is `0400`).
 //!
 //! What it says, per open: the driver's answer and the view's shape; the sensor's data formats and its mode registers read back (CAPS); the sensor's own frame rate against the front end's (RATE); per frame the read and add time on each thread, frames skipped, the cores used and left; the driver's counters (STATS); the link's and the bus's bytes a second.
 #![no_std]

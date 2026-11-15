@@ -97,3 +97,14 @@ Facts found, don't re-derive:
 - The worktree does not build in place (valhall crate collision with another worktree): build in /mnt/Harbor/tmp/othercams/ferros (siblings symlinked, plus the gitignored oracle/display/husky-hk3/cold-power/*.bin copied in).
 - **Each camera's mosaic, levels and orientation are in its 2026-10-21 calibration capture** (`pixel 8 pro calibration data/*average.vsf`, local, a fingerprint: read only the numbers): main G B/R G, ultrawide and tele B G/G R, front G R/B G; all 64/1023; EXIF 6 rear, 8 front. Their sizes match ferros's inits and every crop start is even. Read these before guessing any camera fact (the owner had to point at them).
 - **The list's IDTs come from the vault** (`cam.<key>.idt`, the repo's .idt.vsf as is) since 2026-11-15: without `cam.boitata.idt` stored the main is not listed.
+
+## 2026-11-15: modes, the bench and the slit (built on branch camtrials, not run; the Pro away)
+
+Owner: "straight as fast as possible full frame 1:1 and 2x binned for all back cams integrating into the buffer ... Then I want the slitscan wired up". docs/CAMERA.md "Modes, the bench and the slit" has the per-camera table, the arithmetic and the run plan; capsules in /mnt/Harbor/tmp/camtrials/out (build copy /mnt/Harbor/tmp/camtrials/ferros, `build.sh`).
+Facts found, don't re-derive:
+- **October's slit wrote no hold**: `w16(G#0104, 1)` writes G#0104 = 0, G#0105 = 1 (the release), and left the init's 21342-line integration in 68-576-line frames. "One geometry change a session" and "never starts before stream on" may be that, not the sensor; the driver now writes modes inside the real hold, integration inside the frame.
+- **The main's CCS addresses are 2 a pixel**: 16320 x 12288 for 8160 x 6144; binned increments 4; Samsung's G#0900/G#0901 are G#32 G#44 (the tele's G#22 G#22), not CCS's meaning. The ultrawide (Sony) bins in G#0900-2 (1, G#22, 8) with a digital crop (312, 4). The tele's addresses are 1 a pixel (8064 x 6080), 2 lanes.
+- **The front end's sizes for loch0 and the link come from the CPU's 'after' writes** (G#1C32_0474, G#1C32_2074, link +G#44/54/64), not the PDMA program; the program holds the strides (G#1C32_0554, 2154). The program's first 40 words and last 11 are loch0's DMA setup and the go bits: the slim per-frame program (176 bytes of 6620).
+- **The camera window and view moved** to their own GiB, G#51_0000_0000 (512 MiB each).
+- **cargo el0 of camera and cambench together fails** (feature unification: ferros_cam's `list` brings vsf's alloc into cambench): build each package on its own.
+- No aarch64 emulator on the host: NEON code is tested by a lane model on the host and checked against the plain path on the device (cambench does it on its first frame).
