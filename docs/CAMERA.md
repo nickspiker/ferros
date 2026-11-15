@@ -27,10 +27,21 @@ FERROS_PORT=1-2.2 FERROS_HV_CORE=1 FERROS_HV_UFS=1 FERROS_BOTH_AT_ONCE=1 tools/h
 $B spawn camtest.bin 4008 --name camtest --use camera   # 64 frames at bin 8
 $B diag console; $B diag                                # the driver's lines; S2MPU_CAM_FENCE and its faults
 ```
+**On the Pro, 2026-11-14: frames flow** (this branch's kernel RAM-reloaded, boot b874; the driver and camtest stored; nothing on the screen):
+- The first try refused at the switch: it asked whether the sensor's bus was ready before the module was powered, and its lines are held low until then (gpp2 DAT G#0, the master busy). It now asks after the power, as `diag cam up` did.
+- The region: 40 frames under 4 GiB at G#CD00_0000 (the first run G#CD20_0000), taken and cleaned in 3.4 to 5.6 ms, with 9.1 GiB of the pool free.
+- The open: switch on in 43 ms; the sensor's init (1347 writes, 2 reads) in 2095 ms, the whole of the wait; streaming 2173 ms after the open, the first SHADOW_UPDATE at once, the **first frame 2278 ms after the open** (105 ms after stream on).
+- **SPI 479 fires**: every answer of every run came on the line (2555 of 2555 in the longest), none on the tick.
+- **All 22 outputs written** in the new region, each with October's extent (the image body to +G#EFFF00, the PD path to +G#3BFF00, slots 15 and 16 to 16 MiB and 8 MiB).
+- **S2MPU faults 0** on all three, the camera's fence 1, in every run.
+- **The rate**: the front end takes a frame every 67.3 to 67.7 ms (14.8 a second), October's rate. Served at bin 2 (6 MiB) every frame, 67.3 ms apart, 1530 in one open; binning 36 ms a frame (14.4 ms copying out of the non-cacheable region with 64-byte loads, the rest at opt-level 3). It first took 121 ms (8-byte loads) and 66.8 ms (opt-level "s").
+- **The ring**: the job's 1024 descriptors, with the index written back to 0 after the last, stopped the front end for good after frame 1025. The engine now gets its own ring of 2^14 descriptors (about 18 minutes) in a frame past the job's region; the count register holds it.
+- **Power**: 1383 mW idle (the clocks at rest), 2836 mW streaming at bin 2 with every frame taken (the clocks at their active profile throughout), over the same 8 s window.
+
 **On the 8a, 2026-11-14, against std/camreplay** (this branch's kernel RAM-reloaded, nothing stored): with no server and no capsule, a call on `camera` started the on-demand path, which found no capsule and answered the waiting call ERR in 1 ms (no hang). With camreplay serving, camtest took 32 frames of 6266944 bytes at bin 2, 68.0 ms apart (camreplay's own 67.8 ms), mean sample 70: the 8 MiB reply crosses whole. Lumis, launched by hand with a kist's slots, listed the camera, opened it at bin 2 and showed the recorded frame developed through the main camera's Absolute IDT, upright, its controls under it (shutter 1/15 s, gain 1.00x, focus G#3800, display -4 stops); camreplay served 110 frames per 8 s (13.75 a second) and the display showed Lumis's window about 9 times a second. Not measured: the kernel lock's hold for a 6 MiB reply. The waiting half of the first-call change (a live call held until a capsule's server starts) needs a stored capsule and was not run.
 The region is asked under 4 GiB first by default (coordinator, 2026-11-14: what October's runs proved; `cam.region` = `high` asks higher first). The Pixel source does not settle the high halves: Linux's ISP DMA always goes thru the SYSMMU, whose window samsung-iommu-v9.c clamps to 32 bits, so the halves are always zero under Linux. On a running Pro the low ranges are likely full of arcs (the 8a's were), and the driver then takes a run higher and says so.
 
-Measured there, not yet: the frame rate, the time to the first frame, power while streaming, the S2MPU faults (0 expected), whether SPI 479 fires, which outputs are written in the new region, and the descriptor ring's wrap (1024 frames, about 70 s, untried).
+Left: Lumis on the Pro (its preview at bin 2), the controls (exposure and focus mid-stream), and the harness out (KERNEL-OUT.md decision 3).
 
 ## Where it stands (2026-11-12, measured)
 

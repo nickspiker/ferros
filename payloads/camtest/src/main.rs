@@ -1,7 +1,7 @@
 //! camtest: the camera driver's endpoint driven headless, for the measures docs/CAMERA.md asks of a run (development): LIST, OPEN, frames at one bin, CLOSE, with the time to the first frame, the frames' spacing, a frame's mean sample and its header on the console. No screen, no touch: nothing the person sees moves.
 //!
 //! ferros-bridge spawn camtest.bin <hex input> --name camtest --use camera   (e.g. `4008`: 64 frames at bin 8)
-//! Its input, two bytes given in hex: how many frames (1 to 255; none, 16) and the bin (2, 4 or 8; 8 by default, a reply under 400 KiB).
+//! Its input, bytes given in hex: how many frames (1 to 255; none, 16), the bin (2, 4 or 8; 8 by default, a reply under 400 KiB), and optionally a multiplier of the frames (`FF0205`: 1275 frames, past the descriptor ring's 1024).
 #![no_std]
 #![no_main]
 
@@ -38,7 +38,7 @@ pub extern "C" fn payload_main(g: u64, input: u64, input_len: u64) -> ! {
     let arg = |k: u64| if k < input_len { unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + k) as *const u8) } } else { 0 };
     let frames = match arg(0) {
         0 => 16,
-        n => n as u32,
+        n => n as u32 * if arg(2) == 0 { 1 } else { arg(2) as u32 },
     };
     let bin = match arg(1) {
         2 => 2u8,

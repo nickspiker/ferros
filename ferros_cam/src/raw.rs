@@ -13,19 +13,28 @@ pub fn unpack(line: &[u8], px: &mut [u16]) {
     }
 }
 
-/// One binned output row, `out.len() / 2` samples, from the 2 x `bin` unpacked lines of its row pair (`pix`, `w` samples a line, line r at `r * w`): output sample ox is the mean of the `bin` x `bin` same-colour samples of its block, so the mosaic keeps its phase (`phase` 0 the pair's even output row, 1 its odd). `bin` a power of two.
-pub fn bin_row(pix: &[u16], w: usize, bin: usize, phase: usize, out: &mut [u8]) {
+/// One binned output row, `out.len() / 2` samples, from the 2 x `bin` unpacked lines of its row pair (`pix`, `w` samples a line, line r at `r * w`): output sample ox is the mean of the `bin` x `bin` same-colour samples of its block, so the mosaic keeps its phase (`phase` 0 the pair's even output row, 1 its odd). `bin` a power of two, at most 8; `acc` a line of `w` samples to work in.
+/// The phase's `bin` lines are summed first, sample by sample (straight loops the compiler vectorises), then each output adds its `bin` same-colour samples of that sum. Sixteen bits hold every sum: at most 8 x 8 samples of 1023, 65472.
+pub fn bin_row(pix: &[u16], w: usize, bin: usize, phase: usize, acc: &mut [u16], out: &mut [u8]) {
     let shift = 2 * bin.trailing_zeros();
-    for (ox, o) in out.chunks_exact_mut(2).enumerate() {
-        let x0 = 2 * bin * (ox / 2) + (ox & 1);
-        let mut s = 0u32;
-        for j in 0..bin {
-            let line = &pix[(phase + 2 * j) * w..];
-            for i in 0..bin {
-                s += line[x0 + 2 * i] as u32;
-            }
+    let acc = &mut acc[..w];
+    acc.copy_from_slice(&pix[phase * w..(phase + 1) * w]);
+    for j in 1..bin {
+        let line = &pix[(phase + 2 * j) * w..(phase + 2 * j + 1) * w];
+        for (a, &p) in acc.iter_mut().zip(line) {
+            *a += p;
         }
-        o.copy_from_slice(&((s >> shift) as u16).to_le_bytes());
+    }
+    // Output pair k (its two colours) covers 2 x bin samples of the summed line from 2 x bin x k: colour c at offsets c, c + 2, ..
+    for (k, o) in out.chunks_exact_mut(4).enumerate() {
+        let block = &acc[2 * bin * k..2 * bin * (k + 1)];
+        let (mut s0, mut s1) = (0u16, 0u16);
+        for pair in block.chunks_exact(2) {
+            s0 += pair[0];
+            s1 += pair[1];
+        }
+        o[..2].copy_from_slice(&(s0 >> shift).to_le_bytes());
+        o[2..].copy_from_slice(&(s1 >> shift).to_le_bytes());
     }
 }
 
@@ -50,27 +59,35 @@ mod tests {
             let g = y * stride + (x / 4) * 5;
             (raw[g + (x & 3)] as u32) << 2 | (raw[g + 4] as u32 >> (2 * (x & 3))) & 3
         };
-        let (bw, bh) = (w / bin, h / bin);
-        let mut pix = vec![0u16; 2 * bin * w];
-        let mut row = vec![0u8; bw * 2];
-        let mut sum = 0u64;
-        for pair in 0..bh / 2 {
-            for r in 0..2 * bin {
-                let y = pair * 2 * bin + r;
-                unpack(&raw[y * stride..y * stride + stride], &mut pix[r * w..(r + 1) * w]);
-            }
-            for phase in 0..2 {
-                bin_row(&pix, w, bin, phase, &mut row);
-                let oy = pair * 2 + phase;
-                for ox in 0..bw {
-                    let (x0, y0) = (4 * (ox / 2) + (ox & 1), 4 * (oy / 2) + (oy & 1));
-                    let want = (px(x0, y0) + px(x0 + 2, y0) + px(x0, y0 + 2) + px(x0 + 2, y0 + 2)) / 4;
-                    let got = u16::from_le_bytes([row[ox * 2], row[ox * 2 + 1]]) as u32;
-                    assert_eq!(got, want, "sample ({ox}, {oy})");
-                    sum += got as u64;
+        // Bin 2 as std/camreplay's build bins it (its formula, written out); 4 and 8 as the same mean over their blocks.
+        for bin in [bin, 4, 8] {
+            let (bw, bh) = (w / bin, h / bin);
+            let mut pix = vec![0u16; 2 * bin * w];
+            let mut row = vec![0u8; bw * 2];
+            let mut acc = vec![0u16; w];
+            let mut sum = 0u64;
+            for pair in 0..bh / 2 {
+                for r in 0..2 * bin {
+                    let y = pair * 2 * bin + r;
+                    unpack(&raw[y * stride..y * stride + stride], &mut pix[r * w..(r + 1) * w]);
+                }
+                for phase in 0..2 {
+                    bin_row(&pix, w, bin, phase, &mut acc, &mut row);
+                    let oy = pair * 2 + phase;
+                    for ox in 0..bw {
+                        let (x0, y0) = (2 * bin * (ox / 2) + (ox & 1), 2 * bin * (oy / 2) + (oy & 1));
+                        let want = if bin == 2 {
+                            (px(x0, y0) + px(x0 + 2, y0) + px(x0, y0 + 2) + px(x0 + 2, y0 + 2)) / 4
+                        } else {
+                            (0..bin).flat_map(|j| (0..bin).map(move |i| (i, j))).map(|(i, j)| px(x0 + 2 * i, y0 + 2 * j)).sum::<u32>() / (bin * bin) as u32
+                        };
+                        let got = u16::from_le_bytes([row[ox * 2], row[ox * 2 + 1]]) as u32;
+                        assert_eq!(got, want, "bin {bin} sample ({ox}, {oy})");
+                        sum += got as u64;
+                    }
                 }
             }
+            println!("bin {bin}: {bw} x {bh}, mean sample {}", sum / (bw * bh) as u64);
         }
-        println!("bin 2: {bw} x {bh}, mean sample {}", sum / (bw * bh) as u64);
     }
 }

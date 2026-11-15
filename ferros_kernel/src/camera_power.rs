@@ -84,7 +84,8 @@ fn up() -> bool {
     let mut rep = alloc::vec::Vec::new();
     crate::flashlog::line("camera: on, the buses");
     crate::camera::buses_up(&mut rep);
-    if !crate::hsi2c::ready(PMIC_BUS.base, PMIC_BUS.usi_mode) || !crate::hsi2c::ready(SENSOR_BUS.base, SENSOR_BUS.usi_mode) {
+    // Only the PMIC's bus can be ready now: the sensor's lines are held low until the module's rails are on, so its master reads busy (the Pro, 2026-11-14: gpp2 DAT G#0, "USI1 (sensor): ready false"), and `diag cam up` brought it up again after the power, as below.
+    if !crate::hsi2c::ready(PMIC_BUS.base, PMIC_BUS.usi_mode) {
         log_tail("buses", &rep);
         return false;
     }
@@ -94,8 +95,14 @@ fn up() -> bool {
         crate::camera::power_down(&mut rep);
         return false;
     }
-    // The sensor's bus again: its pads only go high once the module's rails are on (camera.rs `sensor_id`).
+    // The sensor's bus again now its pads are powered (camera.rs `sensor_id`), and only then asked whether it is ready.
     crate::hsi2c::bring_up(SENSOR_BUS.base, SENSOR_BUS.usi_mode, crate::camera::FS_DIV, 0x2_0000);
+    if !crate::hsi2c::ready(SENSOR_BUS.base, SENSOR_BUS.usi_mode) {
+        let b = SENSOR_BUS.base;
+        crate::flashlog::line(&alloc::format!("camera: the sensor's bus not ready with the module powered (TRANS_STATUS G#{:X}, gpp2 DAT G#{:X})", rd(b + 0x50), rd(0x1084_0044)));
+        crate::camera::power_down(&mut rep);
+        return false;
+    }
     // The front end's domain thru EL3 only: CONFIGURATION, then the secure world's restore (pd.rs `on`), the pair of the save the boot's gating made. Never gated (a switch on before the gating at 16 s), the prepare call alone, once a boot, as `fe_up` made it on October's cold boots.
     crate::flashlog::line("camera: on, the front end's domain");
     if !crate::pd::is_on("ispfe") {
