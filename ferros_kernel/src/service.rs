@@ -1086,6 +1086,12 @@ fn audio_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     alloc::vec![Serve(b"audio"), Dma(b"aoc-ipc"), Hardware(b"aoc-mbox"), Irq(b"aoc-mbox-f1"), Hardware(b"usi1-spi"), Hardware(b"gpio-gpn0"), Power(b"amp"), Entropy]
 }
 
+/// The camera driver's grants in its slot order (payloads/camera, docs/CAMERA.md "The driver"): 1 serve camera, 2 hsi2c_1 (the main sensor's bus and its lens actuator), 3 the ISP front end (its core, statistics blocks and PDMA engine), 4 the CSI links and the combo D-PHY, 5 SYSREG_ISPFE, 6 the vault scope `cam.` (the sensor's init, the CPU's setup writes, the PDMA job), 7 the `camera` switch, 8 the camera's region (frames on demand, SYS_DMA x1 = 3), 9 the front end's line 0 (its frame clock). Its own list, as the torch's: init's page is full, and the kernel starts it when a call on `camera` finds no server (process.rs `ON_DEMAND`); it ends itself once its holder closes.
+fn camera_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
+    use crate::process::Grant::*;
+    alloc::vec![Serve(b"camera"), Hardware(b"hsi2c1"), Hardware(b"ispfe"), Hardware(b"csis"), Hardware(b"ispfe-sysreg"), Store(b"cam"), Power(b"camera"), Dma(b"camera"), Irq(b"ispfe0")]
+}
+
 /// Each shell process's capabilities, as init hands them out (payloads/init: the slots of `home_grants`, 1-based), for restarting one from the vault without a reboot.
 fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'static>>> {
     if name == b"vault" {
@@ -1105,6 +1111,9 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
     }
     if name == b"audio" {
         return Some(audio_grants());
+    }
+    if name == b"camera" {
+        return Some(camera_grants());
     }
     let slots: &[usize] = match name {
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
@@ -3028,7 +3037,12 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                // The camera's power domain is gated after boot (pd.rs; the TPU's too, its tools gone 2026-11-01). Its diags refuse while they are: bringing a domain back without Linux's saved CMU registers is not yet trusted (a TPU on/off by hand preceded a reset in the next power window, 2026-10-25). `diag pd on <name>` does it by hand.
+                // The camera driver holds the camera (camera_power.rs): its buses, its module and the front end are its own while its switch is on, and the kernel's tools would drive them under it.
+                if cmd.params.starts_with(b"cam") && crate::camera_power::held() {
+                    resp.extend_from_slice(b"refused: the camera driver holds the camera (its `camera` switch is on, camera_power.rs); close it, or `diag \"kill camera\"` first\n");
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }                // The camera's power domain is gated after boot (pd.rs; the TPU's too, its tools gone 2026-11-01). Its diags refuse while they are: bringing a domain back without Linux's saved CMU registers is not yet trusted (a TPU on/off by hand preceded a reset in the next power window, 2026-10-25). `diag pd on <name>` does it by hand.
                 if let Some(name) = if cmd.params.starts_with(b"cam") { Some("ispfe") } else { None } {
                     if !crate::pd::is_on(name) {
                         resp.extend_from_slice(alloc::format!("the {name} power domain is gated after boot (pd.rs); `diag pd on {name}` first (experimental: see pd.rs)\n").as_bytes());

@@ -4,6 +4,45 @@ The bring-up record, register by register, is docs/oracle/CAMERA.md.
 This is the other half: what a kist needs from the cameras, the endpoint it calls, and how far ferros is from Lumis showing a live preview.
 Started 2026-11-12 (the owner: "would be nice to have ... lumis fully working in the morning").
 
+## Built (2026-11-14): the driver, not yet run on a device
+
+The owner, 2026-11-14: "Can we get Lumis wired up?", taken as the go on "The driver" below. Everything here is built and host-tested; nothing has run on the Pro yet (it needs a kernel flash, which the owner's tag attends).
+
+- **The `camera` switch** (kernel camera_power.rs): both camera buses, the main module's power with the rails behind the overvoltage guard, the front end's domain thru EL3 only (pd.rs `on`: its configuration and the secure restore, the pair of the boot's gating save; never a PMU read, the EL3 poison pattern), `fe_clocks` (VDD_CAM, ISPFE_NOC, CMU_ISPFE, SYSREG_ISPFE), the D-PHY isolation bypass once a boot (thru the PMU's atomic set alias, as Linux sets it, with no read), the SYSMMUs in bypass, the S2MPUs fenced. Off: the sensor's stream stopped if it still runs, the engine stopped and Linux's close replayed when a job was given (camera_close.rs), the S2MPUs shut, the module down. The domain stays on once a boot has opened the camera (its off/on cycle is not trusted yet, pd.rs). The torch's switch and the `cam` tools refuse while it is on, and it refuses while the torch's is.
+- **Frame memory from the pool** (process.rs `cam_ask`, `cam_free`; frames.rs `take_run`): the driver asks for one run of frames side by side (SYS_DMA x1 = 3), taken from the top of the pool (under 4 GiB if asked), zeroed and cleaned out of the caches, mapped non-cacheable at cachemap `CAM_VA`; the three ISPFE S2MPUs admit exactly those frames for every VID (s2mpu.rs `fence_cam`) and are shut before the frames go back wiped when the driver ends (both end paths). Their faults are in the plain DIAG (`S2MPU_CAM_FENCE`, a `S2MPU_FAULT_*` group each) while the domain is on.
+- **The outputs, measured** (October's per-slice report, target/cam/run-rate.txt, every slice patterned and sampled every 256 bytes after a ten-frame run): the main camera's job writes **all 22** of its outputs (October slots 0 to 21) and none past them. Slot 2 is the image body (15 MiB), slot 0 the PD path (3.75 MiB), slots 1, 3, 7 and 20 a 16-byte header each, slots 15 and 16 written to the end of their 16 MiB and to 8 MiB (data of one kind: 15 may run on into 16), the rest statistics of 6 KiB to 1.05 MiB. The region gives each the power of two at or past twice what was seen (the frames exactly theirs), in slot order, 15 and 16 side by side: **78 MiB, 39 frames** (ferros_cam job `MAIN`). The driver patterns the outputs at each open and says on its console after the eighth frame which were written and how far, so a run re-measures it.
+- **The job, moved in Rust** (ferros_cam job, replacing what tools/camera-pdma-image.py did for fixed addresses): the October 'CPR3' from the vault (`cam.boitata.pdma`) with the ring's list addresses, the twelve block loads' sources and the 25 address registers moved into the region. Every address register's +4 is its high half, written as zero by the program (read from the main camera's list: 24 of the 25; G#1C35_4ECC's +4 holds G#C000_0000, so not there), so the region may lie past 4 GiB; whether the front end's masters drive those bits in bypass is unmeasured, and the fence is what makes the first try safe (a write that loses them lands outside the frames and faults). The driver asks for a run under 4 GiB first (below).
+- **`payloads/camera`**: started on demand by a call on `camera`, ended on CLOSE, when its holder's frame reply fails, or after 64 frames nobody asked for. An open is `cam pdma`'s order (region, switch, identity, init, job placed and patterned, the CPU's writes before, engine, receiver last, the writes after, lens, stream). A frame thread answers the front end on SPI 479 (zuma.h IRQ_ISPFE_0, which carries the CSIS core's events) instead of the kernel's spin; if no interrupt comes within the front end's own deadline it answers on a 2^15 µs tick and says so with the status words. FRAME bins by copy at 2, 4 or 8 (ferros_cam raw, matched sample for sample against std/camreplay's binning of the recorded frame); SET takes exposure (lines inside the hold), the captured gain only, and focus G#0800 to G#7800.
+- **Two kernel changes the endpoint needed**: a plain reply was capped at a store transfer (256 KiB, process.rs `SYS_REPLY`), so the preview frame (6 MiB at bin 2) could never have crossed; a reply past it now goes from the server's memory straight into the caller's, up to 8 MiB (`REPLY_MAX`). And a live call on an on-demand endpoint (`torch`, `audio`, `camera`) now waits for the server the kernel is starting instead of ERR (KERNEL.md "CALL_LIVE"): Lumis calls live, and its first call would otherwise always find the driver not yet started.
+- **Lumis's side**: the camera right (code 9) is on forge in the kernel (process.rs), the stower and the map (ferros_kist RIGHTS, the map's right names); Lumis's own parser reads the driver's list (its `main` camera with the Absolute IDT). Nothing in Lumis changed.
+- **`payloads/camtest`**: the endpoint driven headless (LIST, OPEN, frames at one bin, CLOSE), for the time to the first frame and the frames' spacing without anything on the screen.
+
+**To run it on the Pro** (each step after the owner's go; back up first, /mnt/Harbor/tmp/camera/back/):
+```
+B=target/debug/ferros-bridge
+$B store put cam.boitata.pdma @target/cam/cam.pdma      # the main camera's job (local, the vendor's settings)
+$B store put cam.frame @target/cam/cam.frame            # the init and the CPU's writes, if the vault lacks them
+$B capsule <build>/camera.bin target/camera.capsule.vsf && $B store put camera @target/camera.capsule.vsf
+FERROS_PORT=1-2.2 FERROS_HV_CORE=1 FERROS_HV_UFS=1 FERROS_BOTH_AT_ONCE=1 tools/husky-cold.sh   # the kernel
+$B spawn camtest.bin 4008 --name camtest --use camera   # 64 frames at bin 8
+$B diag console; $B diag                                # the driver's lines; S2MPU_CAM_FENCE and its faults
+```
+**On the Pro, 2026-11-14: frames flow** (this branch's kernel RAM-reloaded, boot b874; the driver and camtest stored; nothing on the screen):
+- The first try refused at the switch: it asked whether the sensor's bus was ready before the module was powered, and its lines are held low until then (gpp2 DAT G#0, the master busy). It now asks after the power, as `diag cam up` did.
+- The region: 40 frames under 4 GiB at G#CD00_0000 (the first run G#CD20_0000), taken and cleaned in 3.4 to 5.6 ms, with 9.1 GiB of the pool free.
+- The open: switch on in 43 ms; the sensor's init (1347 writes, 2 reads) in 2095 ms, the whole of the wait; streaming 2173 ms after the open, the first SHADOW_UPDATE at once, the **first frame 2278 ms after the open** (105 ms after stream on).
+- **SPI 479 fires**: every answer of every run came on the line (2555 of 2555 in the longest), none on the tick.
+- **All 22 outputs written** in the new region, each with October's extent (the image body to +G#EFFF00, the PD path to +G#3BFF00, slots 15 and 16 to 16 MiB and 8 MiB).
+- **S2MPU faults 0** on all three, the camera's fence 1, in every run.
+- **The rate**: the front end takes a frame every 67.3 to 67.7 ms (14.8 a second), October's rate. Served at bin 2 (6 MiB) every frame, 67.3 ms apart, 1530 in one open; binning 36 ms a frame (14.4 ms copying out of the non-cacheable region with 64-byte loads, the rest at opt-level 3). It first took 121 ms (8-byte loads) and 66.8 ms (opt-level "s").
+- **The ring**: the job's 1024 descriptors, with the index written back to 0 after the last, stopped the front end for good after frame 1025. The engine now gets its own ring of 2^14 descriptors (about 18 minutes) in a frame past the job's region; the count register holds it.
+- **Power**: 1383 mW idle (the clocks at rest), 2836 mW streaming at bin 2 with every frame taken (the clocks at their active profile throughout), over the same 8 s window.
+
+**On the 8a, 2026-11-14, against std/camreplay** (this branch's kernel RAM-reloaded, nothing stored): with no server and no capsule, a call on `camera` started the on-demand path, which found no capsule and answered the waiting call ERR in 1 ms (no hang). With camreplay serving, camtest took 32 frames of 6266944 bytes at bin 2, 68.0 ms apart (camreplay's own 67.8 ms), mean sample 70: the 8 MiB reply crosses whole. Lumis, launched by hand with a kist's slots, listed the camera, opened it at bin 2 and showed the recorded frame developed through the main camera's Absolute IDT, upright, its controls under it (shutter 1/15 s, gain 1.00x, focus G#3800, display -4 stops); camreplay served 110 frames per 8 s (13.75 a second) and the display showed Lumis's window about 9 times a second. Not measured: the kernel lock's hold for a 6 MiB reply. The waiting half of the first-call change (a live call held until a capsule's server starts) needs a stored capsule and was not run.
+The region is asked under 4 GiB first by default (coordinator, 2026-11-14: what October's runs proved; `cam.region` = `high` asks higher first). The Pixel source does not settle the high halves: Linux's ISP DMA always goes thru the SYSMMU, whose window samsung-iommu-v9.c clamps to 32 bits, so the halves are always zero under Linux. On a running Pro the low ranges are likely full of arcs (the 8a's were), and the driver then takes a run higher and says so.
+
+Left: Lumis on the Pro (its preview at bin 2), the controls (exposure and focus mid-stream), and the harness out (KERNEL-OUT.md decision 3).
+
 ## Where it stands (2026-11-12, measured)
 
 **Lumis's side is built.**
@@ -43,11 +82,11 @@ Started 2026-11-12 (the owner: "would be nice to have ... lumis fully working in
 |---|---|---|
 | Lumis's front on ferros | built, host-tested | run on a device (akita, without a camera: its "no driver" page) |
 | the camera right | built (code 9) | a kernel, stower and map with it on each device |
-| the endpoint | specified below | a server |
-| frame memory | none | a region of its own, out of the frame pool; the PDMA job rebuilt for it |
-| the driver | the kernel's diagnostics only | a process (below) |
-| the front end's answer | the CPU, every 15 to 50 ms, in a spin | its interrupt (ISPFE SPIs A#479 to A#483, zuma.h; zuma-isp.dtsi `isp-fe`) |
-| the PDMA job | a local file built into the kernel by tools/camera-pdma-image.py | from the vault at run time, its address registers remapped to the new region (in Rust: no new Python) |
+| the endpoint | served by payloads/camera (built 2026-11-14) | a run on the Pro |
+| frame memory | a run of 39 frames from the pool, fenced (built 2026-11-14) | a run on the Pro |
+| the driver | payloads/camera behind the `camera` switch (built 2026-11-14) | a run on the Pro, then the harness out |
+| the front end's answer | its interrupt, SPI 479, in the driver's frame thread (built 2026-11-14) | whether the line fires (else the thread's own tick, said on the console) |
+| the PDMA job | from the vault (`cam.boitata.pdma`), moved into the region in Rust (ferros_cam job, built 2026-11-14) | the vault entry on the Pro |
 | akita's cameras | nothing | power, ID, init at 26 MHz, the receiver and front end from a capture |
 
 ## The endpoint
@@ -72,9 +111,9 @@ The client's reader and the header's writer are side by side in rust/lumis-ferro
 
 A frame by copy is for the preview: husky's main at bin 2 is 2040 x 1536 samples, 6 MiB a frame, 90 MB/s at 14.5 frames a second.
 A full raw frame for a capture (25 MB at 16 bits) wants a mapping instead, a ring of frame buffers the kist reads in place (KISTS.md "Lumis"); that is an object the kernel does not have yet.
-Unchecked: how large a reply the kernel copies between two processes in one call (the store's are capped at STORE_MAX; an endpoint's reply is copied whole as far as the code shows).
+How large a reply the kernel copies between two processes in one call (read from the code, 2026-11-14): a plain reply was capped at a store transfer, 256 KiB, so the preview frame could not cross; since 2026-11-14 up to 8 MiB (`REPLY_MAX`), copied server to caller under the kernel lock (about a millisecond for 6 MiB, unmeasured).
 
-## The driver (proposed, for the owner)
+## The driver (proposed, for the owner; built 2026-11-14, "Built" above)
 
 KERNEL-OUT.md decision 3 (the camera harness) is still open: its proposal was to leave the harness until the pipeline is understood, then write the userspace driver fresh.
 The pipeline is understood now for the main camera and the ultrawide, so this is that driver, in the pattern every move followed (grants, a power switch for the privileged part, the protocol in a process, started on demand):

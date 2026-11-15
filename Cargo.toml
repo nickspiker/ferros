@@ -74,6 +74,9 @@ members = [
     "payloads/pcie1",
     "ferros_sys",
     "ferros_spi",
+    "ferros_cam",
+    "payloads/camera",
+    "payloads/camtest",
     "ferros_kist",
     "ferros_lang",
     "ferros_idea",
@@ -138,6 +141,13 @@ opt-level = 3
 
 # The attest screen's mark (tapuwae, four samples at a time): at "s" LLVM's vectoriser is off and it runs on scalar float, so it builds for speed (2026-10-29: no `.4s` ops at "s", 1850 at 3).
 [profile.release.package.ferros-payload-ahau]
+opt-level = 3
+
+# The camera driver's binning (payloads/camera, ferros_cam raw): every frame's 12.5 million samples unpacked and averaged; at "s" it took 94 ms of a 67.8 ms frame period at bin 2 (the Pro, 2026-11-14), so it builds for speed, with the crate that does the work.
+[profile.release.package.ferros-payload-camera]
+opt-level = 3
+
+[profile.release.package.ferros_cam]
 opt-level = 3
 
 # The wallpaper (wallpaper/): a Julia set worked out per pixel at attest, its orbits four lanes at a time on NEON; built for speed wherever it is linked.

@@ -70,3 +70,16 @@ Full detail: ferros/docs/oracle/CAMERA.md.
 ## 2026-11-06 night: front captured and wired, front + tele still silent from ferros
 
 Front (dokkaebi, hsi2c_2 G#10, ID G#30A1) fully captured hands-free (I2C init, ISP front end, PDMA list 3) and wired as `diag cam front up` / `cam pdma front` (FERROS_CAM_FRONT=target/cam/front; CSI link 0, csis0 lanes, SYSREG 500 = 1). It NACKs from ferros; camera-PMIC writes, voltages, pins and USI clocks all measured equal to Android's, so the sub-PMIC (ACPM) side is the suspect. Tele's init captured; it needs a bright scene to stream (5x is a main-sensor crop in dim light). Capture traps: ARM_AFTER_MS counts from the last reset; a clean reboot wipes the console zone (crash reset keeps it); read the zone from ferros (`bridge read FD3FF000 200000`, order from the write pointer at +4); the app always reopens the rear camera. Detail in docs/oracle/CAMERA.md. Flashing that night: [[husky-flash-paths]].
+
+## 2026-11-14: the driver built (payloads/camera), not yet run
+
+Owner: "Can we get Lumis wired up?" Built on branch worktree-agent-abba9f7999aaaa0a6 (CAMERA.md "Built"): the kernel's `camera` switch (camera_power.rs), the camera's frames as one run from the pool (SYS_DMA x1 = 3) with the three ISPFE S2MPUs fenced to exactly them, payloads/camera on demand, payloads/camtest headless, ferros_cam shared (job relocation, RAW10 binning, both host-tested on target/cam). Facts found on the way, don't re-derive:
+- **A plain reply was capped at 256 KiB** (STORE_MAX): the 6 MiB preview frame could never cross. Now 8 MiB (REPLY_MAX), server to caller directly.
+- **Lumis calls live**: a CALL_LIVE on an on-demand endpoint now waits for the server the kernel starts (it got ERR before).
+- **All 22 outputs are written** (run-rate.txt), slots 15/16 to 16 and 8 MiB: the region is 78 MiB / 39 frames.
+- Every address register's +4 is its high half (written 0) except G#1C35_4ECC's; whether the front end drives high bits in SYSMMU bypass is unmeasured (vault `cam.region` = `low` asks for frames under 4 GiB first).
+- The EL3 poison suspect in the camera path is the direct read of PMU G#3EBC (pd.rs and fe_up read STATUS plainly before EL3 calls without harm); the switch sets the bit thru the PMU's atomic alias (G#FEBC, value 0), no read.
+- ispfe is gated at boot (pd.rs); the switch brings it on with pd.rs `on` (the restore = the prepare call) and marks it prepared, and the gating skips it once the switch has.
+Deploy: /mnt/Harbor/tmp/camera/deploy.sh backup|store|reload|test|restore (FERROS_PORT=1-2.2).
+
+**Same day, on the Pro: frames flow thru payloads/camera** (boot b874, RAM-reloaded kernel 5c295fc8-era): first frame 2278 ms after OPEN (the init's 2.1 s of I2C is the wait), 67.3 ms a frame served at bin 2, SPI 479 fires for every frame, all 22 outputs written, S2MPU faults 0, 2.84 W streaming vs 1.38 W idle. Traps found: the sensor bus reads not-ready until the module is powered (lines held low); the PDMA index must never go back to 0 (the front end stops for good after the 1024th descriptor), so the driver gives the engine its own 2^14-descriptor ring; reading the NC region needs 64-byte loads (8-byte: 121 ms a frame).

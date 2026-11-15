@@ -1195,7 +1195,7 @@ fn endpoint(name: &[u8]) -> usize {
 }
 
 /// Endpoints whose server the kernel starts when a call finds none (docs/TORCH.md "Who starts it"; owner, 2026-11-11: the quick settings' torch). init's grants page is full, and a server that runs only while its device is in use holds no arc the rest of the time: the torch process ends itself once the LED is dark and nothing waits. Each name is a process the service loop knows how to start (service.rs `shell_grants`); its index is its bit in `ON_DEMAND_WANT`. The audio service the same way (docs/AUDIO.md, 2026-11-11): started by a kist's first call on `audio`, ended by itself once every stream has played out.
-pub static ON_DEMAND: &[&[u8]] = &[b"torch", b"audio"];
+pub static ON_DEMAND: &[&[u8]] = &[b"torch", b"audio", b"camera"];
 /// The on-demand servers a call found missing since the service loop last looked (`on_demand_take`).
 static ON_DEMAND_WANT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -1443,6 +1443,8 @@ pub static IRQS: &[IrqLine] = &[
     IrqLine { name: "nfc-irq", intid: 32 + 42 },
     // The Bluetooth UART (APM USI1, serial_18): zuma.h IRQ_APM_USI1_UART_INT_ALIVE, SPI 71, level high. For payloads/bt's wait on received bytes instead of a 4 ms look (2026-11-13).
     IrqLine { name: "bt-uart", intid: 32 + 71 },
+    // The ISP front end's line 0: zuma.h IRQ_ISPFE_0_ISPFE, SPI 479, level high (zuma-isp.dtsi `lwis_isp_fe`: csis_core_cmn_ctl and every local channel's image and PD path events ride it; lines 1 to 4 carry the statistics blocks and the PDMA). The camera driver's frame clock: it answers the front end on it (ferros_cam `FRAME_ACK`) instead of the kernel's 15 to 50 ms spin.
+    IrqLine { name: "ispfe0", intid: 32 + 479 },
 ];
 
 /// Interrupt lines that go with a hardware grant (2026-11-11 for pcie1, the table 2026-11-13): a process granted the block on the left gets each line on the right as slots after its last, in this order (`build_from`), so init's list and the keepers' restart list (service.rs `shell_grants`) need no slots for them. A driver finds its lines by asking (`irq_wait` with a past deadline answers ERR for a slot that is no line).
@@ -1851,6 +1853,8 @@ pub static DMA: &[Dma] = &[
     // Each slot alone: what an app holds. Given out by `NewSurface`, its frames taken then from the pool and given back when its process ends (`surface_take`, `surfaces_free`). Must stay consecutive and in order: `surface0() + k` is slot k. Never granted by name (`resolve`), only given.
     surface_slot(0), surface_slot(1), surface_slot(2), surface_slot(3), surface_slot(4), surface_slot(5), surface_slot(6), surface_slot(7),
     surface_slot(8), surface_slot(9), surface_slot(10), surface_slot(11), surface_slot(12), surface_slot(13), surface_slot(14), surface_slot(15),
+    // The camera driver's region (cachemap CAM_VA, docs/CAMERA.md "The driver"): one run of frames side by side, taken from the pool when the driver asks (SYS_DMA x1 = 3, `cam_ask`), non-cacheable, the front end's S2MPUs fenced to exactly them (s2mpu.rs `fence_cam`), wiped back into the pool when the driver ends (`cam_free`); its size the frames it holds (`region`).
+    Dma { name: "camera", base: crate::cachemap::CAM_VA.0, size: crate::cachemap::CAM_VA.1 - crate::cachemap::CAM_VA.0 },
     // The display's sprite cache (cachemap DISPLAY_SPRITES): cacheable, the display server's alone.
     Dma { name: "display-sprites", base: crate::cachemap::DISPLAY_SPRITES.0, size: crate::cachemap::DISPLAY_SPRITES.1 - crate::cachemap::DISPLAY_SPRITES.0 },
     // The display's 16-bit canvas (cachemap DISPLAY_CANVAS): its back buffer.
@@ -2082,7 +2086,95 @@ fn region(i: usize) -> (usize, usize) {
         let b = unsafe { &(*(&raw const BLOCKS))[i - gpub0()] };
         return (DMA[i].base, if b.held && b.owner != 0 { b.n * crate::frames::FRAME } else { 0 });
     }
+    if DMA[i].name == "camera" {
+        let c = unsafe { &*(&raw const CAM) };
+        return (DMA[i].base, c.n * crate::frames::FRAME);
+    }
     (DMA[i].base, DMA[i].size)
+}
+
+/// The camera driver's frames (docs/CAMERA.md "The driver"; owner, 2026-11-14: frames from the pool on demand, zeroed on take, wiped on give-back, the camera's S2MPUs fenced to exactly them, freed when the process ends): whose (a process epoch, 0 none), the run's first frame and how many.
+struct Cam {
+    owner: u64,
+    first: usize,
+    n: usize,
+}
+/// Under the kernel lock.
+static mut CAM: Cam = Cam { owner: 0, first: 0, n: 0 };
+/// The most frames the camera's run may hold: its window (cachemap CAM_VA).
+const CAM_FRAMES: usize = (crate::cachemap::CAM_VA.1 - crate::cachemap::CAM_VA.0) / crate::frames::FRAME;
+/// Frames the camera's run may never take from the pool: as a GPU block's (`BLOCK_RESERVE`), so the next process's first frame and a running one's growth still find one.
+const CAM_RESERVE: usize = 1 << 5;
+/// The top of the low 4 GiB: a run asked to lie under it (SYS_DMA x1 = 3, x3 bit 0) for a device whose high address bits may not reach DRAM.
+const LOW_4GIB: usize = 1 << 32;
+
+/// SYS_DMA x1 = 3 on the `camera` region: the caller takes `n` frames side by side (frames.rs `take_run`; under 4 GiB when `low`), zeroed, cleaned out of the caches (the front end writes them by DMA, the driver reads them non-cacheable), mapped in the camera's window from its start, and fenced (camera_power.rs `region_changed`). Answers the run's physical start, which the driver writes into its job (ferros_cam job). A caller already holding a run of at least `n` frames gets its start again. ERR, with why on the console: another process holds it, past the window, the pool without such a run. Under the lock.
+fn cam_ask(p: &Process, n: u64, low: bool) -> u64 {
+    let c = unsafe { &mut *(&raw mut CAM) };
+    let t0 = crate::platform::cntpct();
+    let say = |what: &str| {
+        let line = alloc::format!("camera region: {} asked for A#{n} frames{}: {what}; A#{} MiB of the pool free\n", core::str::from_utf8(&p.name).unwrap_or("?"), if low { " under 4 GiB" } else { "" }, (crate::frames::free() * crate::frames::FRAME) >> 20);
+        k().console.extend_from_slice(line.as_bytes());
+    };
+    if c.owner != 0 && c.owner != p.epoch {
+        say("another process holds the camera's region");
+        return ERR;
+    }
+    // WHY: `n` is the caller's word; a run past the window could not be mapped, and none of no frames is no region.
+    if n == 0 || n as usize > CAM_FRAMES {
+        say("not a run the camera's window holds");
+        return ERR;
+    }
+    let n = n as usize;
+    if c.owner == p.epoch {
+        if n <= c.n {
+            return crate::frames::pa(c.first) as u64;
+        }
+        say("it holds a smaller run already");
+        return ERR;
+    }
+    if crate::frames::free() < n + CAM_RESERVE {
+        say("the pool would be left too few frames");
+        return ERR;
+    }
+    let Some(first) = crate::frames::take_run(n, if low { LOW_4GIB } else { usize::MAX }) else {
+        say("no run of free frames that long");
+        return ERR;
+    };
+    for f in first..first + n {
+        crate::frames::clean_invalidate(f);
+        crate::cachemap::cam_map(crate::cachemap::CAM_VA.0 + (f - first) * crate::frames::FRAME, Some(crate::frames::pa(f)));
+    }
+    crate::cachemap::surface_unmapped(crate::cachemap::CAM_VA.0, n * crate::frames::FRAME);
+    *c = Cam { owner: p.epoch, first, n };
+    let pa = crate::frames::pa(first);
+    crate::camera_power::REGION[0].store(pa as u64, core::sync::atomic::Ordering::Release);
+    crate::camera_power::REGION[1].store((n * crate::frames::FRAME) as u64, core::sync::atomic::Ordering::Release);
+    let fenced = crate::camera_power::region_changed();
+    let us = crate::platform::cntpct().wrapping_sub(t0) * 1_000_000 / crate::platform::cntfrq();
+    say(&alloc::format!("given at G#{pa:X}, taken and cleaned in A#{us} us, S2MPUs G#{fenced:X} (0 while the switch is off)"));
+    pa as u64
+}
+
+/// The camera's run back to the pool when its holder ends (`end_process`, `kill_locked`): the front end's S2MPUs shut first while its domain is on (the engine may still be writing: a holder that ended mid-stream leaves the switch on until the service loop's next pass), the window unmapped and every TLB told, then each frame wiped as it goes back (frames.rs `give`). Under the lock.
+fn cam_free(epoch: u64) {
+    let c = unsafe { &mut *(&raw mut CAM) };
+    if c.owner != epoch || c.n == 0 {
+        return;
+    }
+    crate::camera_power::REGION[1].store(0, core::sync::atomic::Ordering::Release);
+    crate::camera_power::REGION[0].store(0, core::sync::atomic::Ordering::Release);
+    let shut = crate::camera_power::region_changed();
+    for j in 0..c.n {
+        crate::cachemap::cam_map(crate::cachemap::CAM_VA.0 + j * crate::frames::FRAME, None);
+    }
+    crate::cachemap::surface_unmapped(crate::cachemap::CAM_VA.0, c.n * crate::frames::FRAME);
+    for f in c.first..c.first + c.n {
+        crate::frames::give(f);
+    }
+    let line = alloc::format!("camera region: A#{} frames from G#{:X} wiped back into the pool, S2MPUs G#{shut:X} first (0 while the switch is off)\n", c.n, crate::frames::pa(c.first));
+    k().console.extend_from_slice(line.as_bytes());
+    *c = Cam { owner: 0, first: 0, n: 0 };
 }
 
 /// Give the process with `epoch` a GPU block of `bytes` (a power of two from a frame to `GPU_BLOCK_MOST`): the first free slot of the blocks' window, grown to `bytes` (`block_grow`). The slot's index, or why none was given. Under the lock.
@@ -2390,6 +2482,8 @@ pub static STORES: &[StoreScope] = &[
     StoreScope { name: "capsules", prefix: "capsules." },
     // The person's list of stowed kists and their answers (`kists.list`, ferros_kist; identity class, kvault IDENTITY): init reads it to launch a kist, the map shows it and writes the person's answers. Stands for the common area's `kists` until the common area's named grants exist (VAULT-OUT.md).
     StoreScope { name: "kists", prefix: "kists." },
+    // The camera driver's (payloads/camera, docs/CAMERA.md "The driver"): the main sensor's init (`cam.boitata.init`), the CPU's setup writes around the PDMA start (`cam.ispfe.prog`), or both as one bundle (`cam.frame`), and the front end's PDMA job (`cam.boitata.pdma`): the vendor's settings, generated from oracle captures, the vault's and Harbor's, never the repo.
+    StoreScope { name: "cam", prefix: "cam." },
 ];
 /// The context deriving a process's own domain name (`Process::domain`) from its ihi.
 const KIST_DOMAIN_CONTEXT: &str = "ferros 2026-11-08 kist domain";
@@ -2445,6 +2539,8 @@ static mut STORE_CACHE: Option<(Vec<u8>, Vec<u8>)> = None;
 pub const STORE_MAX: usize = 1 << 18;
 /// The largest a get (`SYS_STORE` op get, forwarded to the vault process) reads in one call: 1 MiB since 2026-11-11, sixteen pieces the vault process fetches and opens as one batch on its four cores, and a quarter of the round trips of a large value read at STORE_MAX (93 for the 24 MB wallpaper, each with its stamp, its hand-offs and the reader's turn between them). The reply goes from the vault process's buffer straight into the caller's (`SYS_REPLY`), never thru the kernel's heap. Only while the vault process serving has said it answers that much (`SYS_VAULT` op 3, `VAULT_GET`): one from before has a reply buffer of one STORE_MAX transfer. Sets, lists and the kernel's own vault stay at STORE_MAX; a larger get is refused (as a kernel from before refuses it), and a reader drops to STORE_MAX (ferros_sys STORE_GET_MAX).
 pub const STORE_GET_MAX: usize = 1 << 20;
+/// The largest plain reply (`SYS_REPLY`, 2026-11-14): 8 MiB, past the camera's preview frame at bin 2 (2040 x 1536 samples of 16 bits and a 64-byte header, 6 MiB; docs/CAMERA.md "The endpoint"). A reply past `STORE_MAX` is copied from the server's memory straight into the caller's under the kernel lock (about a millisecond for the preview frame); a full raw frame wants a mapping instead (KISTS.md "Lumis").
+pub const REPLY_MAX: usize = 1 << 23;
 
 /// The vault process's endpoint (VAULT-OUT.md, step 3). While a process receives on it, every `SYS_STORE` call is forwarded there (`store_forward`), stamped by the kernel with the domain keys of the caller's scope; while none does, the kernel's own vault answers as before. Nothing may call it directly (a message on it is the kernel's), and only a spawn holding the vault right (`Grant::Vault`) may serve it.
 const VAULT_EP: &[u8] = b"vault";
@@ -3139,6 +3235,11 @@ pub static HARDWARE: &[Hw] = &[
     Hw { name: "apm-usi1-uart", base: 0x155D_0000, size: 0x1000, via_el3: false },
     // The torch (docs/TORCH.md, payloads/torch): hsi2c_14, the LM3644 flash driver's bus, which it shares with the camera PMIC (the kernel's camera tools refuse while the `torch` switch holds it). Pins, clock source, the controller's bring-up and the chip's enable are the kernel's (`POWERS`).
     Hw { name: "hsi2c14", base: 0x1098_0000, size: 0x1000, via_el3: false },
+    // The camera driver (docs/CAMERA.md "The driver", payloads/camera): the main sensor's bus (hsi2c_1, its lens actuator on it too), the ISP front end whole (its core, statistics blocks and the PDMA engine, 1 MiB: zuma-isp.dtsi `lwis_isp_fe`), the CSI links and the combo D-PHY (`csis-link-phy`, up to the front end's first SYSMMU), and SYSREG_ISPFE's first page (the receiver's input select). The buses' pins and clocks, the module's rails, the front end's domain and clocks, the SYSMMUs and the S2MPUs are the kernel's (the `camera` switch, camera_power.rs).
+    Hw { name: "hsi2c1", base: 0x1088_0000, size: 0x1000, via_el3: false },
+    Hw { name: "ispfe", base: 0x1C30_0000, size: 0x10_0000, via_el3: false },
+    Hw { name: "csis", base: 0x1C04_0000, size: 0xD_0000, via_el3: false },
+    Hw { name: "ispfe-sysreg", base: 0x1C02_0000, size: 0x1000, via_el3: false },
 ];
 
 /// A device's power switch a spawn can grant (`bridge spawn --power NAME`): the kernel's sequence for the rails, clocks and pin modes behind a userspace driver.
@@ -3146,7 +3247,7 @@ pub struct PowerSwitch {
     pub name: &'static str,
     pub set: fn(bool) -> bool,
 }
-pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gps", set: crate::gps::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }, PowerSwitch { name: "amp", set: crate::amp::power }, PowerSwitch { name: "torch", set: crate::torch::power }];
+pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gps", set: crate::gps::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }, PowerSwitch { name: "dpu", set: crate::dpu_power::power }, PowerSwitch { name: "panel", set: crate::panel_power::power }, PowerSwitch { name: "panel-vddd", set: crate::panel_power::vddd }, PowerSwitch { name: "android", set: crate::service::android_request }, PowerSwitch { name: "amp", set: crate::amp::power }, PowerSwitch { name: "torch", set: crate::torch::power }, PowerSwitch { name: "camera", set: crate::camera_power::power }];
 /// A syscall buffer that resolved nowhere (`Process::span`): whose (the process's epoch), the offset as given, its length, and whether the kernel was to write it. The syscall that touched it traps at its end (`buf_trap`). Under the kernel lock: one syscall at a time.
 #[derive(Clone, Copy)]
 struct BufFault {
@@ -4705,7 +4806,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
         }
         SYS_CALL => {
             let token = p.read(f.x[0], 32);
-            // An on-demand server called while none runs (`ON_DEMAND`: the torch): the service loop starts it. A live call still gets ERR now; a waiting one is served by the server once it receives.
+            // An on-demand server called while none runs (`ON_DEMAND`: the torch): the service loop starts it. The call waits for it, a live one too (since 2026-11-14), and is served by the server once it receives.
             if let Some((Object::Endpoint(ep), r)) = p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                 if r & RIGHT_SEND != 0 {
                     on_demand_note(ep);
@@ -4761,7 +4862,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     0
                 }
                 // CALL_LIVE (bit 63 of the reply length) and no server receiving on the endpoint — none holds the right, or the one that does has not started receiving yet: ERR now, not a wait for a server that may never come (the IP process at a boot where the WiFi driver failed, 2026-10-29; and while the driver brings its device up).
-                Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 && f.x[4] & CALL_LIVE != 0 && !has_receiver(ep) => {
+                // Not for an endpoint whose server the kernel starts on demand (`ON_DEMAND`, 2026-11-14 for the camera): its server is coming, so the call waits for it as a plain one does, and is answered ERR if it cannot be started (`on_demand_refuse_locked`). Lumis's first call on `camera` found the driver not yet started and said so.
+                Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 && f.x[4] & CALL_LIVE != 0 && !has_receiver(ep) && kk.endpoints[ep].on_demand == 0 => {
                     f.x[0] = ERR;
                     0
                 }
@@ -4860,6 +4962,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 Some(Object::Dma(i)) if region(i).1 > 0 && f.x[1] == 1 => region(i).1 as u64,
                 // x1 = 2 (2026-11-13): the caller's GPU block grown to 2^x2 bytes, answered its size after (`block_ask`); ERR, said on the console, when it is not the caller's block, past the ceiling, or more than the pool can give.
                 Some(Object::Dma(i)) if DMA[i].name == "gpu-block" && f.x[1] == 2 => block_ask(p, i, f.x[2]),
+                // x1 = 3 (2026-11-14): the camera driver's run of x2 frames side by side (`cam_ask`; x3 bit 0: under 4 GiB), answered its physical start, which its job's addresses are moved to; the region's base (x1 = 0) is where the driver reads it.
+                Some(Object::Dma(i)) if DMA[i].name == "camera" && f.x[1] == 3 => cam_ask(p, f.x[2], f.x[3] & 1 == 1),
                 // A surface is answered past its porch (cachemap SURFACE_PORCH); every other region at its base.
                 Some(Object::Dma(i)) if region(i).1 > 0 => (region(i).0 + if DMA[i].name == "surface" { crate::cachemap::SURFACE_PORCH } else { 0 }) as u64,
                 _ => ERR,
@@ -4924,6 +5028,16 @@ fn el0_trap(f: &mut Frame) -> u64 {
                                 }
                                 STORE_BY_CLOCK[crate::service::clock_state() as usize & 3].fetch_add(1, Relaxed);
                                 STORE_GETS[4].fetch_add(crate::platform::cntpct() - t0, Relaxed);
+                            } else if (f.x[2] as usize) > len {
+                                // A reply past a store transfer (2026-11-14: the camera's preview frame, 6 MiB at bin 2; docs/CAMERA.md "The endpoint"): copied from the server's memory straight into the caller's, never thru the kernel's heap, as the forwarded store replies are, up to `REPLY_MAX` and what the caller asked for. WHY the min: both lengths are the processes' own.
+                                let n = (f.x[2] as usize).min(REPLY_MAX).min(rcap as usize);
+                                match p.view(f.x[1], n) {
+                                    Some(msg) => {
+                                        cp.write(roff, msg);
+                                        ct.frame.x[0] = n as u64;
+                                    }
+                                    None => ct.frame.x[0] = ERR,
+                                }
                             } else {
                                 let msg = p.read(f.x[1], len);
                                 let n = msg.len().min(rcap as usize);
@@ -5602,6 +5716,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         }
         surfaces_free(p.epoch);
         regions_free(p.epoch);
+        cam_free(p.epoch);
         crate::sensorlink::ended(p.epoch);
         power_orphaned(p.epoch);
         claims_orphaned(p.epoch);
@@ -5876,6 +5991,7 @@ fn kill_locked(name: &[u8]) -> bool {
     }
     surfaces_free(kk.procs[i].as_ref().unwrap().epoch);
     regions_free(kk.procs[i].as_ref().unwrap().epoch);
+    cam_free(kk.procs[i].as_ref().unwrap().epoch);
     crate::sensorlink::ended(kk.procs[i].as_ref().unwrap().epoch);
     power_orphaned(kk.procs[i].as_ref().unwrap().epoch);
     claims_orphaned(kk.procs[i].as_ref().unwrap().epoch);

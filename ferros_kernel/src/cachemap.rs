@@ -153,8 +153,21 @@ pub const SURFACE_SLOTS: usize = 16;
 /// Every surface lies back to back in one window of addresses as the four lay in DRAM until then, so every client keeps naming its surface by its address (`dma` past the porch) and the display finds surface k as before; only the frames behind the addresses moved, as an arc's do (ARCS.md).
 /// G#A00_0000 into the GiB above the arcs' windows: each slot aligned to its 32 MiB (a handle's base must be), and the GPU's view of the surfaces (payloads/gpu: G#C000_0000 plus a surface's distance from G#CA00_0000, the old carve-out's base, which Mahere's build reckons from) starting on a GiB, G#50_0000_0000.
 pub const SURF_VA: (usize, usize) = (0x50_0A00_0000, 0x50_0A00_0000 + SURFACE_SLOTS * SURFACE_SIZE);
-/// The surfaces' window's level-2 table: one 2 MiB block entry per frame of a surface, invalid until the first surface is given out.
+/// The surfaces' window's level-2 table: one 2 MiB block entry per frame of a surface, invalid until the first surface is given out. Its entries past the surfaces' slots are the camera's window (`CAM_VA`).
 static mut L2_SURF: Table = Table([0; 512]);
+
+/// The camera driver's region (2026-11-14, docs/CAMERA.md "The driver"): addresses in the surfaces' GiB above their slots, each 2 MiB block one frame of the run of frames the driver holds (process.rs `cam_ask`), Normal non-cacheable, EL0 read/write, never executable, as the DMA regions are: the front end writes the frames by DMA and does not snoop the CPU's caches. 128 MiB of addresses, more than the main camera's 78 MiB (ferros_cam job `MAIN`); unmapped while nobody holds it.
+pub const CAM_VA: (usize, usize) = (0x50_3000_0000, 0x50_3800_0000);
+const _: () = assert!(CAM_VA.0 >= SURF_VA.1 && CAM_VA.0 / GIB == SURF_VA.0 / GIB && (CAM_VA.1 - 1) / GIB == SURF_VA.0 / GIB && CAM_VA.0 % MIB2 == 0, "the camera's window: in the surfaces' GiB, past their slots");
+
+/// The camera's window: the block at `va` maps frame `pa` (Normal non-cacheable, EL0 read/write, never executable), or nothing (`pa` None). Then `surface_unmapped` over what changed.
+pub fn cam_map(va: usize, pa: Option<usize>) {
+    let e = unsafe { &mut (*(&raw mut L2_SURF)).0[(va / MIB2) % 512] };
+    *e = match pa {
+        Some(pa) => dma_pool(vhe(), pa, BLOCK),
+        None => 0,
+    };
+}
 
 /// The most GPU memory one client may hold (2026-11-13, the coordinator's call, the owner may resize it: a power of two of at least a frame): its block, frames of the pool on demand (process.rs `block_grow`). Mahere at the 8a's 1080 x 2400 names up to 376 cells of a MiB at full detail, which 384 MiB would not quite hold beside its frame regions; 512 MiB does.
 pub const GPU_BLOCK_MOST: usize = 512 << 20;
