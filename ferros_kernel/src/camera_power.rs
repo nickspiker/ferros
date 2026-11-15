@@ -2,7 +2,7 @@
 //!
 //! On:
 //! - both camera buses' pins, clock sources and controllers (hsi2c_14, the camera PMIC's, which the torch shares; hsi2c_1, the main sensor's, whose transfers are then the process's thru its `hsi2c1` grant);
-//! - the main camera module's power, as `diag cam up` runs it: the camera PMIC's supplies over ACPM channel 2, every rail's voltage programmed and read back behind the overvoltage guard while all are off, then the device tree's sequence and the sensor's reset released;
+//! - the main camera module's power, as the harness's `diag cam up` ran it: the camera PMIC's supplies over ACPM channel 2, every rail's voltage programmed and read back behind the overvoltage guard while all are off, then the device tree's sequence and the sensor's reset released;
 //! - the ISP front end's power domain thru EL3 (the boot gated it, pd.rs; pd.rs `on` writes its configuration and makes the secure world's restore, the prepare call, the pair of the boot's save), never a PMU read from here;
 //! - the front end's clocks (camera.rs `fe_clocks`: VDD_CAM, the ISPFE_NOC clock, CMU_ISPFE, SYSREG_ISPFE);
 //! - the combo D-PHY's isolation bypass (PMU G#3EBC bit 0), once per boot;
@@ -12,7 +12,7 @@
 //! Off: the sensor's stream stopped if it still runs (a holder that ended without closing), the PDMA engine stopped and Linux's close replayed (camera_close.rs) when a job was given, the S2MPUs shut to everything, then the module powered down. The front end's domain stays on: switching it off and on again is not yet trusted (pd.rs), so a boot makes its pair of calls once.
 //! A process that ends with the switch on has it turned off by the service loop's next pass (process.rs `power_offs_apply`); its frames went back to the pool already, behind a shut fence (process.rs `cam_free`).
 //!
-//! hsi2c_14 has one owner at a time: the torch switch refuses while this one is on, and this one while the torch's is (torch.rs). The kernel's camera tools (`diag cam …`) refuse while either is (service.rs).
+//! hsi2c_14 has one owner at a time: the torch switch refuses while this one is on, and this one while the torch's is (torch.rs).
 
 use crate::camera::{PMIC_BUS, SENSOR_ADDR, SENSOR_BUS};
 use core::ptr::{read_volatile, write_volatile};
@@ -47,7 +47,7 @@ fn ms_since(t0: u64) -> u64 {
     crate::platform::cntpct().wrapping_sub(t0) * 1000 / crate::platform::cntfrq()
 }
 
-/// Whether the switch is on (the torch's switch and the camera tools refuse while it is).
+/// Whether the switch is on (the torch's switch refuses while it is).
 pub fn held() -> bool {
     HELD.load(Ordering::Acquire)
 }
@@ -84,7 +84,7 @@ fn up() -> bool {
     let mut rep = alloc::vec::Vec::new();
     crate::flashlog::line("camera: on, the buses");
     crate::camera::buses_up(&mut rep);
-    // Only the PMIC's bus can be ready now: the sensor's lines are held low until the module's rails are on, so its master reads busy (the Pro, 2026-11-14: gpp2 DAT G#0, "USI1 (sensor): ready false"), and `diag cam up` brought it up again after the power, as below.
+    // Only the PMIC's bus can be ready now: the sensor's lines are held low until the module's rails are on, so its master reads busy (the Pro, 2026-11-14: gpp2 DAT G#0, "USI1 (sensor): ready false"), and the harness's `diag cam up` brought it up again after the power, as below.
     if !crate::hsi2c::ready(PMIC_BUS.base, PMIC_BUS.usi_mode) {
         log_tail("buses", &rep);
         return false;
@@ -95,7 +95,7 @@ fn up() -> bool {
         crate::camera::power_down(&mut rep);
         return false;
     }
-    // The sensor's bus again now its pads are powered (camera.rs `sensor_id`), and only then asked whether it is ready.
+    // The sensor's bus again now its pads are powered (as the harness found it, 2026-10-19), and only then asked whether it is ready.
     crate::hsi2c::bring_up(SENSOR_BUS.base, SENSOR_BUS.usi_mode, crate::camera::FS_DIV, 0x2_0000);
     if !crate::hsi2c::ready(SENSOR_BUS.base, SENSOR_BUS.usi_mode) {
         let b = SENSOR_BUS.base;
@@ -103,7 +103,7 @@ fn up() -> bool {
         crate::camera::power_down(&mut rep);
         return false;
     }
-    // The front end's domain thru EL3 only: CONFIGURATION, then the secure world's restore (pd.rs `on`), the pair of the save the boot's gating made. Never gated (a switch on before the gating at 16 s), the prepare call alone, once a boot, as `fe_up` made it on October's cold boots.
+    // The front end's domain thru EL3 only: CONFIGURATION, then the secure world's restore (pd.rs `on`), the pair of the save the boot's gating made. Never gated (a switch on before the gating at 16 s), the prepare call alone, once a boot, as the harness's `fe_up` made it on October's cold boots.
     crate::flashlog::line("camera: on, the front end's domain");
     if !crate::pd::is_on("ispfe") {
         crate::pd::on("ispfe", &mut rep);
@@ -115,7 +115,7 @@ fn up() -> bool {
     } else if let Some(r) = crate::camera::prepare_once() {
         crate::flashlog::line(&alloc::format!("camera: the domain was never gated; prepare call made, G#{r:X}"));
     }
-    // CONFIGURATION is only the request: the domain's STATUS (bit 0, a plain read, as pd.rs `off` reads it before its own EL3 call every boot, and `fe_up` before its prepare call) says it is up, before any of its clocks is touched (a CMU access in a domain still down poisons EL3). Bounded at 2^13 µs: `fe_up` gave it 10 ms.
+    // CONFIGURATION is only the request: the domain's STATUS (bit 0, a plain read, as pd.rs `off` reads it before its own EL3 call every boot, and the harness's `fe_up` before its prepare call in October) says it is up, before any of its clocks is touched (a CMU access in a domain still down poisons EL3). Bounded at 2^13 µs: `fe_up` gave it 10 ms.
     let until = crate::platform::cntpct() + crate::platform::cntfrq() / 1_000_000 * (1 << 13);
     while !crate::camera::fe_powered() && crate::platform::cntpct() < until {}
     if !crate::camera::fe_powered() {

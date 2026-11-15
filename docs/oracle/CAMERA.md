@@ -1,5 +1,7 @@
 # Camera, from the register oracle (2026-10-19)
 
+The `diag cam` tools named below are the bring-up harness, retired 2026-11-14 once the camera driver (payloads/camera, docs/CAMERA.md) streamed on the Pro: their code is in forge's history before that commit, and this file stays the record of what they found.
+
 Captured with the hv oracle (HV.md): the camera's control buses unmapped from the stage-2 map, every access trapped at EL2, emulated against the real register and logged. Decoded back to I2C transactions with `tools/oracle-decode-hsi2c.py`.
 
 ## The buses (husky, from the live device tree)
