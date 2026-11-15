@@ -374,6 +374,73 @@ mod tests {
         assert_eq!(again, to);
     }
 
+    /// The largest zoom any turn and any centre give, as the glass shows it (the Q14 turn's length in), by brute force alone: `m` turns across the half turn, each with the brute-force centre, then the best one's neighbourhood at 64 times the density.
+    /// Nothing of `fit_at` or `best_turn` in it, so it checks the two together.
+    fn truth(discs: &[Disc], room: Room, m: usize) -> (f64, f64) {
+        let f = |a: f64| {
+            let (c, s) = q14(a);
+            (1u64 << 24) as f64 / brute(discs, c / ONE, s / ONE, room) * c.hypot(s) / ONE
+        };
+        let (mut ba, mut bz) = (0., 0.);
+        for j in 0..m {
+            let a = PI * j as f64 / m as f64;
+            let z = f(a);
+            if z > bz {
+                (ba, bz) = (a, z);
+            }
+        }
+        let step = PI / m as f64;
+        for k in -64..=64 {
+            let a = ba + step * k as f64 / 64.;
+            let z = f(a);
+            if z > bz {
+                (ba, bz) = (a, z);
+            }
+        }
+        (ba, bz)
+    }
+
+    /// The swipe against brute force alone (`truth`), from several turns, on random decks of 2 to 9 circles on both screens: never short of it by more than a tie.
+    #[test]
+    fn swipe_is_the_brute_force_best() {
+        let (mut worst, mut n) = (0f64, 0);
+        for sc in screens() {
+            for l in layouts(1 << 4) {
+                let (_, best) = truth(&l.discs(), room(&sc), 1 << 9);
+                for a0 in [0f64, 0.6, 1.3, 2.4] {
+                    let from = Cam { x: 0, y: 0, z: 1 << 16, c: (a0.cos() * ONE).round() as i64, s: (a0.sin() * ONE).round() as i64 };
+                    let (_, z) = deck_turned(&sc, &l, from, false);
+                    worst = worst.max(1. - z / best);
+                    n += 1;
+                }
+            }
+        }
+        println!("the swipe against brute force: at most {:.4}% short over {n} swipes (a tie is within {:.4}%)", worst * 100., camera::TURN_TIE * 100.);
+        // Short only by a tie: a turn nearer the camera's own that fits within `TURN_TIE` (a quarter pixel across the widest screen), taken by design.
+        assert!(worst < camera::TURN_TIE + 1. / ((1 << 20) as f64), "the swipe lands {:.4}% short of the brute-force best", worst * 100.);
+    }
+
+    /// The Pro's deck as its vault held it on 2026-11-15 (`map.place.*`: settings, Mahere, Clock, Photon, Lumis; `map.view`'s turn), read with `store get`.
+    /// The map stored on the Pro then was from before e3b00a55 (its capsule has the console line "the best turn gains" but not "searched in"): the extent's middle, x⁴ / (1 + x⁴) of the way.
+    /// The swipe now lands on the brute-force best from every turn; the Pro's map lands short, as printed.
+    #[test]
+    fn the_pro_deck() {
+        let sc = screens().into_iter().nth(1).unwrap();
+        let l = Layout { xs: vec![744320, 738498, 625547, 574699, 706301], ys: vec![-395786, -615761, -502759, -677145, -806154], rs: vec![336, 336, 280, 332, 381] };
+        let (ta, best) = truth(&l.discs(), room(&sc), 1 << 11);
+        let deg = |a: f64| (a.to_degrees() % 180. + 180.) % 180.;
+        println!("the Pro's deck: the brute-force best at {:.2} degrees, zoom {best:.0}", deg(ta));
+        for (c, s) in [(-16336, -1249), (16384, 0), (14379, 7853), (5925, 15275), (-6620, 14987), (-12530, 10557)] {
+            let from = Cam { x: 661603, y: -587342, z: 1 << 16, c, s };
+            let a0 = (s as f64).atan2(c as f64);
+            let (to, z) = deck_turned(&sc, &l, from, false);
+            let (old, oz) = deck_turned(&sc, &l, from, true);
+            let a = |c: Cam| (c.s as f64).atan2(c.c as f64);
+            println!("  from {:5.1} degrees: now {:.2} degrees, {:+.4}% of the best; the Pro's map {:.2} degrees, {:+.2}%", deg(a0), deg(a(to)), (z / best - 1.) * 100., deg(a(old)), (oz / best - 1.) * 100.);
+            assert!(z >= best * (1. - 1. / ((1 << 16) as f64)), "from {a0}: {z} under the best {best}");
+        }
+    }
+
     /// A camera as a complex similarity: the world point under screen offset f is x + f·q, q = e^(−(L + iθ)).
     fn under(x: (f64, f64), l: f64, a: f64, f: (f64, f64)) -> (f64, f64) {
         let m = (-l).exp();
