@@ -113,6 +113,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 ## Project state and traps
 - [ferros process model on husky](ferros_process_model_husky.md) - VHE, EL0 arcs, capability IPC, capsules; x27/x28 reserved
 - [Sandbox state 2026-11-03](sandbox_state_2026_11_03.md) - fixed/ring/exact + BTI built; check capsule sections, many are native
+- [Vault absent after reboot = scope skew](vault_absent_after_reboot_scope_skew.md) - RAM kernel's scope moved it; flashed kernel can't see it
 - [Payload stack on .bss (fixed)](payload_stack_on_bss.md) - payloads need ferros_sys::entry! header; re-store capsules first
 - [Kernel out: moves](kernel_out_moves.md) - USB, touch, sensors, amp as processes; pattern, traps, owner decisions pending
 - [Kernel on the X3](kernel_on_x3.md) - kernel hops to the Cortex-X3; copy every per-core EL2 register; FERROS_X3=0

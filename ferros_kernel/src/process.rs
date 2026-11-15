@@ -2758,10 +2758,10 @@ fn migrate_read(p: &Process, name: &str, offset: usize, buf: u64, len: usize) ->
 
 /// `SYS_VAULT` op 2: an old entry the vault process has written and committed, removed from the kernel's vault.
 fn migrate_done(name: &str) -> u64 {
-    if scope_of(name).is_none() {
-        return ERR;
-    }
+    let Some(sc) = scope_of(name) else { return ERR };
     unsafe { *(&raw mut MIGRATE_CACHE) = None };
+    // Said apart from the removal's own line ("store remove ... (process)", which a process's delete also writes): this entry lives on in the vault process, under a scope a kernel without it will not look in.
+    crate::flashlog::line(&alloc::format!("store moved {name:?} into the vault process, scope {}", sc.name));
     match unsafe { STORE_REMOVE }.map(|rm| rm(name)) {
         Some(Ok(true)) => 0,
         Some(Ok(false)) => NOTHING,
@@ -3101,11 +3101,29 @@ pub fn vault_name(full: &str) -> Option<(&'static StoreScope, &[u8])> {
     (!rel.is_empty() && rel.len() <= 96 && rel.iter().all(|&b| (0x21..0x7F).contains(&b))).then_some((sc, rel))
 }
 
-/// A stamp for the kernel's own get, set or delete of the full name `full` (`vault_name`): its scope's domain in the name's class. None when the vault does not take the name, or the class is locked.
+/// A name under no scope this kernel knows but shaped as a scope's name (a label of lowercase letters and digits, a dot, then a name of printable ASCII up to 96 bytes): its prefix (the label and the dot) and the name within it.
+/// Such a name may be held by the vault process under a scope another kernel knows, a newer one or an older one: a domain's keys come from its prefix alone (`domain_keys`), so this kernel reaches it as that kernel did.
+/// Why (2026-11-15, the Pro): the camera kernel, RAM-reloaded on b873, knew the `cam` scope and moved `cam.frame` and `cam.boitata.pdma` from the kernel's vault into the vault process; the flashed kernel, from before that scope, looked only in its own vault after the cold boot of b875 and said absent, and the entries were stored again by hand.
+/// Only the bridge's gets and removes reach these (service.rs `foreign_job`), after the kernel's own vault said absent; a put still lands in the kernel's vault, which a kernel that knows the scope moves later.
+pub fn foreign_name(full: &str) -> Option<(&str, &[u8])> {
+    if scope_of(full).is_some() || KERNEL_HELD.iter().any(|h| full.starts_with(h)) {
+        return None;
+    }
+    let dot = full.find('.')?;
+    let (label, rel) = (&full.as_bytes()[..dot], &full.as_bytes()[dot + 1..]);
+    let label_ok = !label.is_empty() && label.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    (label_ok && !rel.is_empty() && rel.len() <= 96 && rel.iter().all(|&b| (0x21..0x7F).contains(&b))).then_some((&full[..=dot], rel))
+}
+
+/// A stamp for the kernel's own get, set or delete of the full name `full` (`vault_name`, or `foreign_name` for a get or a delete): its scope's domain in the name's class. None when the vault does not take the name, or the class is locked.
 pub fn vault_stamp(op: u8, full: &str, rest: &[u8]) -> Option<Vec<u8>> {
-    let (sc, rel) = vault_name(full)?;
+    let (prefix, rel) = match vault_name(full) {
+        Some((sc, rel)) => (sc.prefix, rel),
+        None if op != VOP_SET => foreign_name(full)?,
+        None => return None,
+    };
     // Under the kernel lock: the person's keys come from the vault's unlock state, which an unlock or a lock on another core changes.
-    with_lock_held_or(|| stamp(op, sc.prefix.as_bytes(), &[crate::kvault::identity_class(full)], rel, rest))
+    with_lock_held_or(|| stamp(op, prefix.as_bytes(), &[crate::kvault::identity_class(full)], rel, rest))
 }
 
 /// A stamp for the kernel's own call on an entry of the scope named `scope` that is named by a 32-byte address (a stowed kist's capsule, by its blake3): the scope's domain in its class. None for no such scope, or a locked class.

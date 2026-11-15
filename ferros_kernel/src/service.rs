@@ -285,6 +285,23 @@ fn vault_job_start(store: &mut Option<ShimStore>, op: ferros_pt::Op, params: &[u
     Some(vault_job_call(&job, params).map(|_| job))
 }
 
+/// A bridge get or remove of a name the kernel's vault does not hold, under a scope this kernel does not know (process.rs `foreign_name`): the vault process asked under the name's own prefix, as a kernel that knows the scope would ask it. Its job, its first call made; None when there is nothing to ask (no vault process, a put, a name of no scope's shape, the call not made).
+/// A kernel without a scope another kernel added (or one that dropped it) then still sees what that kernel moved: on 2026-11-15 the flashed kernel said `cam.frame` absent after the camera kernel had moved it, and it was stored again by hand.
+#[cfg(not(ferros_production))]
+fn foreign_job(op: ferros_pt::Op, params: &[u8]) -> Option<VaultJob> {
+    if !crate::process::vault_serving() {
+        return None;
+    }
+    let full = core::str::from_utf8(params).ok().filter(|k| crate::process::foreign_name(k).is_some()).map(alloc::string::String::from)?;
+    crate::flashlog::line(&alloc::format!("store {full:?}: not in the kernel's vault and under no scope this kernel knows; asking the vault process"));
+    let job = match op {
+        ferros_pt::Op::Read => VaultJob::Get { full, got: alloc::vec::Vec::new() },
+        ferros_pt::Op::Exec => VaultJob::Remove { full },
+        ferros_pt::Op::Write => return None,
+    };
+    vault_job_call(&job, params).ok().map(|()| job)
+}
+
 /// A part of a kist offered to stow (`ferros.kist.offer` Write: [capsule 32][offset u64 LE][more u8][bytes], checked by the caller): a put into the device's `capsules.` under the capsule's address, as the bridge's part form of `store` puts one, its first call made. Err(the PT reply) when the vault process is not serving or the call could not be made.
 fn offer_part(params: &[u8]) -> Result<VaultJob, alloc::vec::Vec<u8>> {
     if !crate::process::vault_serving() {
@@ -4303,7 +4320,14 @@ pub fn run(mut b: Boot) -> ! {
                     // Under the kernel lock: syscalls on the worker cores reach the vault holding it (the map's places, a setting), so this core takes it too — one owner at a time.
                     None => {
                         let resp = crate::process::with_lock(|| store_command(store.as_mut(), cmd.op, cmd.params));
-                        queue_pt_response(&mut pt_out_data, &resp);
+                        // Absent from the kernel's vault, a name of a scope this kernel does not know may be in the vault process (`foreign_job`).
+                        match if resp == [1] { foreign_job(cmd.op, cmd.params) } else { None } {
+                            Some(job) => {
+                                vault_job = Some(job);
+                                job_due = cntpct() + lease;
+                            }
+                            None => queue_pt_response(&mut pt_out_data, &resp),
+                        }
                     }
                 }
                 }
