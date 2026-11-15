@@ -24,3 +24,5 @@ The owner, 2026-11-05: "there is no Photon core, there is FGTW that handles the 
 Related: [[std-target-status]], [[photon-on-ferros-no-bootstrap]], [[ferros_vocabulary]].
 
 **The same for Lumis and every owner app (2026-11-14):** a session built `rust/lumis-ferros`, a separate minimal camera front, instead of running Lumis; the owner, seeing its camera list on the Pro: "Lumis, that is a camera app for Android, most is in Rust so it should be a minimal transplant." Port an app by replacing only its platform layer (JNI/Kotlin → fluor's ferros host + ferros endpoints), never by writing a lookalike front.
+
+**VSF 8B is compressed by default (owner, 2026-11-15):** "8 bit VSF can be uncompressed but it typically should be av1d since that's kinda the point of the 8 bit. HDR plus compressed so think half a meg for a still, rather than twenty megs." So an 8-bit VSF visual at rest is AV1 (rav1e) by default, uncompressed only as an option; VSF RAW stays uncompressed.
