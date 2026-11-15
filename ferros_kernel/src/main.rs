@@ -2257,6 +2257,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         // In the ferros partition (1 GiB in, ufs_device::locate), on both boards. Never akita's `klog` again (2026-11-06): that partition is the bootloader's, its first block ABL's own record, which the flash log's header overwrote at every boot; ABL then booted without its persistent record ("unable to get a real pram"), left the display down, and every ferros boot died before its gate, a power cycle not helping. `klog` was put back from the morning's backup.
         let ok = flashlog::init();
         flashlog::line(&alloc::format!("boot cold, flash log init {ok}"));
+        // How ABL saw the reset that started this boot, kept where the next bootloader run cannot overwrite it (platform::abl_reset_lines). Only when ABL booted this ferros on husky: a reload has no ABL run of its own, a jump's log is Android's boot's, and akita's log place is not measured.
+        if dtb_addr != 0 && dtb_addr & 1 == 0 && !platform::jumped() && !board::akita() {
+            flashlog::line(&alloc::format!("bootloader saw: {}", platform::abl_reset_lines()));
+        }
     }
     checklist::step(checklist::Step::Log);
     // akita too since 2026-11-06: its ira's sources read alike across eight boots (`diag "ira sources"`), its ira under its own context (ira.rs), its vault in its own ferros partition (ufs_device::locate; refused without one). Not with no link: the ira's sources include a read of the flash (devinfo), which could then wait past the cluster watchdog.
@@ -2266,7 +2270,17 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         checklist::span_from_disk(&doc);
     }
     board::probe(43);
-    let vault_ms = (platform::cntpct().wrapping_sub(t_vault) / (platform::cntfrq() / 1000)) as u32;
+    // A bootloader mode the previous boot asked for from a jumped session, where the bootloader could not be told (vault_boot `next_boot_keep`): taken from the vault first, then the reset a cold session makes, the path measured to land in fastboot. Only on a cold boot ABL started: the PMU word survives only the warm reset that follows such a boot.
+    if dtb_addr != 0 && dtb_addr & 1 == 0 && !platform::jumped() {
+        if let Some(mode) = store.as_mut().and_then(vault_boot::next_boot_take) {
+            flashlog::line(&alloc::format!("next boot: the previous boot asked for mode G#{mode:X} from its jump; resetting into it from this cold boot"));
+            let _ = platform::reboot_to_mode(mode);
+            // Back only if EL3 refused the mode or the watchdogs never reset (crumb G#B7 says the second): the memory has been scrubbed on the way, the heap with it, so no line and no allocation now, only the crumb and a plain reset. The wish is gone from the vault, so the boot after it runs on.
+            platform::crumb(0xB8);
+            platform::reset_now();
+        }
+    }
+    let vault_ms =(platform::cntpct().wrapping_sub(t_vault) / (platform::cntfrq() / 1000)) as u32;
     if probe.opened == 1 {
         checklist::mark(checklist::Item::VaultOpen);
     }

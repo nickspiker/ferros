@@ -93,6 +93,11 @@ fn open() -> bool {
     ok
 }
 
+/// This boot's number in the log (the `b<boot>` every line starts with), 0 before `init` or with no log.
+pub fn boot() -> u32 {
+    unsafe { (*(&raw const STATE)).as_ref() }.map(|s| s.boot).unwrap_or(0)
+}
+
 /// Append one line. Silently does nothing before `init` or once the region is full. Under the kernel lock: the log's blocks share the UFS with the vault, and a line written from the service loop while a syscall on another core read the vault broke that read (2026-10-24: init's spawn of touch failed at boot with "unsealed block", the touch server never started).
 pub fn line(text: &str) {
     crate::process::with_lock_held_or(|| line_locked(text))

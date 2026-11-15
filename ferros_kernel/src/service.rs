@@ -4807,9 +4807,22 @@ pub fn run(mut b: Boot) -> ! {
                 let fastboot = cmd.params.first().copied() == Some(1);
                 if fastboot {
                     report(&b, EXIT_FASTBOOT);
+                    // From a jumped session the stamped mode never reaches the bootloader (platform.rs `reboot_to_bootloader`; 2026-11-15, the Pro's b875: the ROM's USB recovery, then ferros again): the wish goes into the vault and a plain reset lands in ferros cold, which takes the cold path at once (main.rs, vault_boot `next_boot_take`).
+                    let jumped = platform::jumped();
+                    let kept = jumped && crate::process::with_lock(|| store.as_mut().map(|s| crate::vault_boot::next_boot_keep(s, platform::REBOOT_MODE_BOOTLOADER))) == Some(true);
+                    crate::flashlog::line(if !jumped {
+                        "reboot fastboot: a cold session, the mode G#FC stamped thru EL3, then the watchdogs"
+                    } else if kept {
+                        "reboot fastboot: a jumped session, the wish kept in the vault for the next boot, then a plain reset"
+                    } else {
+                        "reboot fastboot: a jumped session, and the vault did not keep the wish: the cold path anyway"
+                    });
                     unsafe {
                         let dctl = read_volatile((DWC3 + 0xC704) as *const u32);
                         write_volatile((DWC3 + 0xC704) as *mut u32, dctl & !(1 << 31));
+                    }
+                    if kept {
+                        platform::reboot();
                     }
                     // Only returns on failure: platform::WATCHDOG_DID_NOT_FIRE, or the EL3 monitor's refusal (nonzero, negative = error). Kept in report slot r[23] so the exit report says which.
                     FASTBOOT_FAIL.store(platform::reboot_to_bootloader(), core::sync::atomic::Ordering::Relaxed);
