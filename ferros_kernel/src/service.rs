@@ -1212,11 +1212,8 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
     restart_with(store, names, b"", rep)
 }
 
-/// Cellular (`i` 0) or WiFi (1) switched off: its driver, already stopped, started once with its power-down input, `off` for the modem (payloads/modem: the PCIe PHY down and isolated, then the CP's power pins as Android's gpio_power_off_cp drops them, its PMIC with CP_PWR) and G#F0 for pcie1 (Bluetooth off first, PERST low, the PHY down and isolated, WL_REG_ON low); each ends once its chip is down. True when that process started. Not after a jump from Android: the radios are still Android's there, and the WiFi driver's first register write once hung the bus (init leaves both drivers out then too).
+/// Cellular (`i` 0) or WiFi (1) switched off: its driver, already stopped, started once with its power-down input, `off` for the modem (payloads/modem: the PCIe PHY down and isolated, then the CP's power pins as Android's gpio_power_off_cp drops them, its PMIC with CP_PWR) and G#F0 for pcie1 (Bluetooth off first, PERST low, the PHY down and isolated, WL_REG_ON low); each ends once its chip is down. True when that process started. After a jump from Android too (2026-11-15): neither power-down touches the controller's ELBI or DBI, which stalled the bus when Android left its link suspended (the PHY powered down, its isolation released); both crowbar Android's chip into the cold state (the Pro, b878: WiFi's `off`, then the WiFi driver joined and leased; the modem's `off` took Android's live CP down).
 fn radio_down(store: &mut Option<ShimStore>, i: usize) -> bool {
-    if platform::jumped() {
-        return false;
-    }
     let (name, input): (&[u8], &[u8]) = if i == 0 { (b"modem", b"off") } else { (b"pcie1", &[0xF0]) };
     let mut rep = alloc::vec::Vec::new();
     restart_with(store, name, input, &mut rep);
@@ -2327,12 +2324,13 @@ pub fn run(mut b: Boot) -> ! {
         crate::flashlog::line(&alloc::format!("dpu: S2MPUs fenced at boot: G#{r:X} (1 = fenced)"));
     }
     // The CoreSight system's bus master (the debug port's memory access, STM, the trace sinks) cut off from all memory on a cold boot: ferros uses none of it, and ABL leaves its S2MPU open. Not the cores' path: deny-all on it with ferros running left every core, the display and USB running (2026-11-04). Not after a jump: closed there, the jumped ferros froze right after its vault opened (most likely Android's trace still running on the cores, its sink cut off, backing up into them); that waits for tracing switched off on every core first.
+    // The modem's link fenced to its shared memory before init starts its driver (s2mpu::fence_modem), after a jump too: the hv's deny-all would refuse the CP the boot image, and the driver takes Android's CP down before it brings one up (payloads/modem `off`).
+    // Between this and that crowbar a CP Android left linked could write only into the carve-outs, which hold nothing of ferros's until the driver loads its image after the CP is down; the jump of 2026-11-15 found the link suspended (the ch0 PHY powered down), so no DMA at all.
+    let r = crate::s2mpu::fence_modem();
+    crate::flashlog::line(&alloc::format!("modem: HSI1's S2MPU fenced to the shared-memory windows: G#{r:X} (1 = fenced)"));
     if !platform::jumped() {
         let r = crate::s2mpu::deny_all(crate::s2mpu::CPUCL0_S2MPU);
         crate::flashlog::line(&alloc::format!("cpucl0: the debug system's S2MPU denied all: G#{r:X} (1 = done)"));
-        // The modem's link fenced to its shared memory before init starts its driver (s2mpu::fence_modem). After a jump the hv has denied it all, and the modem is not started.
-        let r = crate::s2mpu::fence_modem();
-        crate::flashlog::line(&alloc::format!("modem: HSI1's S2MPU fenced to the shared-memory windows: G#{r:X} (1 = fenced)"));
         // BLK_MISC's bus masters (PDMA1, SPDMA1, DIT), none of them ferros's: denied all, as the hv denies them at the jump.
         let r = crate::s2mpu::deny_all(crate::s2mpu::MISC_S2MPU);
         crate::flashlog::line(&alloc::format!("misc: BLK_MISC's S2MPU denied all: G#{r:X} (1 = done)"));

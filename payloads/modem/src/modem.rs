@@ -240,8 +240,16 @@ fn survey(rep: &mut Vec<u8>) -> bool {
     kv(rep, "s2mpu_hsi1.version", rd(S2MPU_HSI1 + 0x60));
     kv(rep, "s2mpu_hsi1.prot_en", rd(S2MPU_HSI1 + 0x0));
     kv(rep, "sysmmu_hsi1.ctrl", rd(SYSMMU_HSI1));
-    kv(rep, "elbi.ltssm", rd(ELBI + 0x2C8));
-    kv(rep, "dbi.id", rd(DBI));
+    // ELBI and DBI only where they answer: the PHY isolated (PMU bit 0 clear) or powered (UDBG G#C700 bit 1 clear, `phy`'s ch0 enable).
+    // Android's suspended link leaves the PHY powered down with its isolation released (the jump of 2026-11-15: PMU G#4C1, C700 G#2), where an ELBI read stalled the bus (the first jump the modem ran on, 2026-11-01, the APM watchdog).
+    let pll = rd(UDBG + 0xC700);
+    kv(rep, "udbg.c700", pll);
+    if rd(PMU_PCIE0 as usize) & 1 == 0 || pll & 2 == 0 {
+        kv(rep, "elbi.ltssm", rd(ELBI + 0x2C8));
+        kv(rep, "dbi.id", rd(DBI));
+    } else {
+        line(rep, alloc::format!("ELBI/DBI not read: the PHY powered down with its isolation released\n"));
+    }
     kv(rep, "boot_stage", rd(BOOT_STAGE));
     true
 }
@@ -632,6 +640,8 @@ pub fn stages(rep: &mut Vec<u8>, n: u8) {
         return;
     }
     UP_T0.store(now(), core::sync::atomic::Ordering::Relaxed);
+    // From the CP and the link taken down, as `up_phases`.
+    off(rep);
     power_on(rep, n == 1);
     if n < 2 {
         return;
@@ -3501,6 +3511,9 @@ fn since_up_ms() -> u64 {
 
 /// `up`'s phases from power-on to the handshake, each one's end marked as it ends; whether all of them went thru.
 fn up_phases(rep: &mut Vec<u8>, marks: &mut Vec<(&'static str, u64)>) -> bool {
+    // Every bring-up starts from the CP and the link taken down (`off`), whatever ran them before: a cold boot, this driver's last run, or Android before a jump (the killswitch: its CP session and its suspended link are never adopted).
+    // `off` leaves the PHY isolated, the state `phy`'s first ELBI writes answer in (the 8a's switch off then on, 2026-11-13); Android's suspended link (the PHY powered down, its isolation released) stalls them.
+    off(rep);
     power_on(rep, false);
     ms(200);
     phy(rep);

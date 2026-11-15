@@ -380,6 +380,12 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     if stage == 0xF0 {
         return off(d);
     }
+    // Every bring-up starts from the chip taken down (`off`), whatever ran it before: a cold boot, this driver's own last run (the keeper's restart), or Android before a jump (the killswitch: nothing Android set up is adopted).
+    // The jump of 2026-11-15 (the Pro, b878) found what Android leaves: PERST low, WL_REG_ON high, the PHY in its power-down (stage 1's A3-A8 values, the external PLL unlocked) with the PMU's isolation released (G#4C1, a cold boot's G#C0), the CMU gates as a cold boot's.
+    // That is the state the controller's ELBI and DBI stall the bus in (the first jumps' hangs); `off` leaves the PHY isolated, the cold boot's state, where they answer (the 8a's switch off then on, 2026-11-13).
+    if stage >= 1 {
+        off(d);
+    }
     // ---- stage 0: survey (WIFI.md §2, §3, §9 status registers) ----
     d.put(b"pcie1 stage ");
     d.hex(stage as u32);
@@ -406,10 +412,17 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let gdat = d.rd(GPIO, 0x4);
     d.kv(b"gph3.con", gcon);
     d.kv(b"gph3.dat", gdat);
-    let lt = d.rd(ELBI, 0x2C8);
-    d.kv(b"elbi.ltssm", lt);
-    let id = d.rd(DBI, 0x0);
-    d.kv(b"dbi.id", id);
+    // ELBI and DBI only where they answer: the PHY isolated (PMU bit 0 clear) or powered (UDBG G#C700 bit 0, the external PLL's enable, set by stage 1's D2); a PHY powered down with its isolation released (Android's suspended link) stalls the bus.
+    let pll = d.rd(UDBG, 0xC700);
+    d.kv(b"udbg.c700", pll);
+    if pmu & 1 == 0 || pll & 1 == 1 {
+        let lt = d.rd(ELBI, 0x2C8);
+        d.kv(b"elbi.ltssm", lt);
+        let id = d.rd(DBI, 0x0);
+        d.kv(b"dbi.id", id);
+    } else {
+        d.put(b"ELBI/DBI not read: the PHY powered down with its isolation released\n");
+    }
     d.flush();
     if stage < 1 {
         return;

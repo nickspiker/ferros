@@ -17,6 +17,8 @@ const CMU_HSI1_GPIO_GATE: usize = 0x1200_205C;
 const CLKOUT1_SET: u64 = 0x1546_FE84;
 const CLKOUT1_CLEAR: u64 = 0x1546_BE84;
 const EXTPAD_CONTROL_EN: u32 = 16;
+/// The bus brought up by ferros once since a jump (`power`).
+static BUS_FRESH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// The bus divider for 400 kHz (the DT's clock-frequency): 7 ran it near 1 MHz (the kernel's motor tools did), so (7 + 1) × 2.5.
 const FS_DIV: u32 = 19;
 
@@ -58,7 +60,9 @@ pub fn power(on: bool) -> bool {
     }
     pin_field(GPP19, 0, 3);
     pin_field(GPP19, 1, 3);
-    if !hsi2c::ready(BUS, USI_MODE) {
+    // After a jump the bus controller is Android's, ready by ferros's test (2026-11-15, the Pro: auto mode, idle, interrupts off, Android's 400 kHz timing): brought up fresh once anyway, its configuration never adopted (the killswitch).
+    let android = crate::platform::jumped() && !BUS_FRESH.swap(true, core::sync::atomic::Ordering::Relaxed);
+    if android || !hsi2c::ready(BUS, USI_MODE) {
         hsi2c::bring_up(BUS, USI_MODE, FS_DIV, 0xFF_FFFF);
     }
     crate::platform::priv_reg(CLKOUT1_SET, true, EXTPAD_CONTROL_EN);
