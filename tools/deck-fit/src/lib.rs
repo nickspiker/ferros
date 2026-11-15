@@ -266,6 +266,114 @@ mod tests {
         println!("the old swipe: short of the best by over a thousandth at {short} of {n} swipes, by {:.1}% of the zoom on average and up to {:.1}%; those stopped {:.1} degrees short of its own best turn on average", sum_old / n as f64 * 100., worst_old * 100., turn_left / short as f64);
     }
 
+    /// The map's own camera (`Cam`): centre world ×256, zoom 16.16, turn Q14.
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    struct Cam {
+        x: i64,
+        y: i64,
+        z: i64,
+        c: i64,
+        s: i64,
+    }
+
+    fn isqrt(v: i64) -> i64 {
+        if v <= 0 {
+            return 0;
+        }
+        let (mut x, mut y) = (v, (v + 1) / 2);
+        while y < x {
+            x = y;
+            y = (x + v / x) / 2;
+        }
+        x
+    }
+
+    /// `Map::zoom_limits`, as the map has it.
+    fn zoom_limits(sc: &Screen, rs: &[i64]) -> (i64, i64) {
+        let sum_r2: i64 = rs.iter().map(|r| r * r).sum();
+        let r_min = *rs.iter().min().unwrap();
+        let den = (sum_r2 * 804 * 256 / 256).max(1);
+        let z_out = isqrt((sc.w * sc.h / den) << 32).max(1);
+        let z_in = (sc.w.min(sc.h) << 16) / (2 * r_min);
+        (z_out.min(z_in), z_in.max(z_out))
+    }
+
+    /// `Map::deck_fit_at` and `Map::deck_turned`, step for step, from the camera `from`; the old pair (the extent's middle, x⁴ / (1 + x⁴) of the way) beside them.
+    fn deck_turned(sc: &Screen, l: &Layout, from: Cam, old: bool) -> (Cam, f64) {
+        let discs = l.discs();
+        let room = room(sc);
+        let (lo, hi) = zoom_limits(sc, &l.rs);
+        let fit_at = |c: i64, s: i64| {
+            let (c0, s0) = (c as f64 / ONE, s as f64 / ONE);
+            let (wx, wy, z) = if old {
+                let z = old_fit(&discs, c0, s0, room);
+                let (mut u0, mut v0, mut u1, mut v1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+                for &(x, y, r) in &discs {
+                    let (u, v) = (c0 * x - s0 * y, s0 * x + c0 * y);
+                    (u0, v0, u1, v1) = (u0.min(u - r), v0.min(v - r), u1.max(u + r), v1.max(v + r));
+                }
+                let (um, vm) = ((u0 + u1) * 0.5, (v0 + v1) * 0.5);
+                (c0 * um + s0 * vm, c0 * vm - s0 * um, z)
+            } else {
+                camera::fit_at(&discs, c0, s0, room)
+            };
+            let z_cam = (z as i64).clamp(lo, hi);
+            let dy = sc.h / 2 - sc.ay;
+            (Cam { x: wx.round() as i64 + ((s * dy) << 10) / z_cam, y: wy.round() as i64 + ((c * dy) << 10) / z_cam, z: z_cam, c, s }, z)
+        };
+        let a0 = (from.s as f64).atan2(from.c as f64);
+        let turn = |a: f64| ((a.cos() * ONE).round() as i64, (a.sin() * ONE).round() as i64);
+        let fit = |a: f64| {
+            let (c, s) = turn(a);
+            let z = fit_at(c, s).1;
+            if old { z } else { z * (c as f64).hypot(s as f64) / ONE }
+        };
+        let hi = hi as f64;
+        let reach = |z: f64| {
+            let a = z / hi;
+            let a4 = a * a * a * a;
+            z / (1. + a4 * a4).powf(1. / 8.)
+        };
+        let (a, z, best) = camera::best_turn(a0, fit, reach);
+        let a = if old {
+            let x = (reach(best) / reach(fit(a0))).ln() * 8.;
+            let x4 = x * x * x * x;
+            a0 + x4 / (1. + x4) * (a - a0)
+        } else {
+            a
+        };
+        let (c, s) = turn(a);
+        let _ = z;
+        (fit_at(c, s).0, fit(a))
+    }
+
+    /// The owner's 8a on 2026-11-15 (the deck as she keeps it, four circles): the swipe the device logged ("map: deck: from ... circles ...") lands where the device landed, and what the swipe before would have done.
+    #[test]
+    fn the_8a_swipe() {
+        let sc = screens().into_iter().next().unwrap();
+        let l = Layout { xs: vec![633055, 690524, 782330, 806152], ys: vec![-527450, -663945, -550807, -412226], rs: vec![343, 229, 240, 301] };
+        let from = Cam { x: 727545, y: -491321, z: 1 << 16, c: -14506, s: -7616 };
+        let (to, z) = deck_turned(&sc, &l, from, false);
+        // The device: "landing at x A#729075 y A#-493147 zoom G#FE3B turn A#-12530 A#-10557".
+        assert_eq!(to, Cam { x: 729075, y: -493147, z: 0xFE3B, c: -12530, s: -10557 });
+        let (old, oz) = deck_turned(&sc, &l, from, true);
+        let deg = |c: Cam| (c.s as f64).atan2(c.c as f64).to_degrees();
+        println!("the 8a's deck: from {:.1} degrees; now {:.1} degrees at zoom {:.0}; the old swipe {:.1} degrees at zoom {:.0} ({:.1}% smaller)", deg(from), deg(to), z, deg(old), oz, (1. - oz / z) * 100.);
+        // On the glass, thru the display's transform: each circle's air to the width's edge and to the big circle's, in pixels.
+        let (wq, hq) = (sc.w << 7, sc.h << 7);
+        for i in 0..4 {
+            let (dx, dy) = (((l.xs[i] >> 8) << 8) - to.x, ((l.ys[i] >> 8) << 8) - to.y);
+            let sx = ((((to.c * dx - to.s * dy) >> 14) * to.z / 65536 + wq) & !255) | 128;
+            let sy = ((((to.s * dx + to.c * dy) >> 14) * to.z / 65536 + hq) & !255) | 128;
+            let (px, py, pr) = (sx as f64 / 256., sy as f64 / 256., (l.rs[i] * to.z >> 8) as f64 / 256.);
+            let (ex, ey) = (px - sc.w as f64 * 0.5, py - sc.ay as f64);
+            println!("  circle {i}: centre ({px:.1}, {py:.1}) radius {pr:.1}: {:.1} px to the width's edge, {:.1} px to the big circle's", sc.w as f64 * 0.5 - ex.abs() - pr, sc.ar as f64 - (ex * ex + ey * ey).sqrt() - pr);
+        }
+        // And again from where it landed: nothing to gain, nothing turned.
+        let (again, _) = deck_turned(&sc, &l, to, false);
+        assert_eq!(again, to);
+    }
+
     /// A camera as a complex similarity: the world point under screen offset f is x + f·q, q = e^(−(L + iθ)).
     fn under(x: (f64, f64), l: f64, a: f64, f: (f64, f64)) -> (f64, f64) {
         let m = (-l).exp();
