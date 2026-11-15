@@ -26,8 +26,11 @@ mod quick;
 /// Notes on the deck (docs/NOTIFY.md): the kernel's list, the glows, the resting view, the Deck button, the live takeover.
 mod notes;
 mod typed;
+/// The camera's geometry (the deck's fit and turn, a flight's spiral), pure so tools/deck-fit tests it on the host.
+mod camera;
 
 use alloc::vec::Vec;
+use camera::spring_at;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 use ferros_sys::{call, cap, console, freq, now, sleep_until};
@@ -147,6 +150,8 @@ struct Spec<'a> {
 const CIRCLES: [Spec<'static>; 1] = [Spec { label: "settings", ring: 1, lit: 0, share: 250, icon: 6 }];
 /// The most circles the map holds: settings and the kists the person stowed (KISTS.md), each a kist circle after it.
 const MAX: usize = 1 << 4;
+// The deck's fit holds every circle the map does.
+const _: () = assert!(camera::MAX == MAX);
 /// A kist circle's share of the map's area until it is sized by hand (thousandths, as `Spec::share`).
 const KIST_SHARE: u32 = 125;
 
@@ -228,14 +233,6 @@ fn spring(x0: f64, v0: f64, t: i32) -> (f64, f64) {
     spring_at(x0, v0, t, SPRING)
 }
 
-/// The critically damped spring at rate `w`: x(t) = (x0 + (v0 + w·x0)·t)·e^(−w·t), and its speed.
-fn spring_at(x0: f64, v0: f64, t: i32, w: f64) -> (f64, f64) {
-    let t = t as f64;
-    let e = libm::exp(-w * t);
-    let a = v0 + w * x0;
-    ((x0 + a * t) * e, (v0 - w * a * t) * e)
-}
-
 /// The friction on a fling, the plane's pan and a page's scroll alike: true, the owner's pixel a frame per frame that fades out as the fling stops (f = −v/√(1 + v²): 1 at any real speed, so the same reach, v²/2, and easing to nothing at the stop, the algebraic sigmoid, so the stop has no kink); false, the pixel a frame per frame exactly (owner, 2026-11-05), which stops dead (owner, 2026-11-06: "let's try b, but I'ma think we'll go for a at the end"; tried, b was "too slippery" — its friction fades with the speed, so the last pixels creep on — "let's go with a").
 const FRICTION_FADES: bool = false;
 
@@ -255,11 +252,12 @@ fn coast(v: f64) -> (f64, f64) {
     }
 }
 
-/// A camera flight in progress (`Map::fly`): where each part of the camera stood from the target when it began, in the space it looks even in — the centre's world offset (×256), the zoom's natural logarithm against the target's, the turn's angle from the target's in radians, and the fade between the plane and the open page (COMPOSITOR.md "The flight, prerendered") against where it goes — each part's speed then (a display frame), the fade's end, and the frames since.
+/// A camera flight in progress (`Map::fly`): where each part of the camera stood from the target when it began, in the space it looks even in — the world offset (×256) of the point under the spiral's pivot (`camera::Spiral`: the centre is it plus the pivot's term, nought from rest), the zoom's natural logarithm against the target's, the turn's angle from the target's in radians, and the fade between the plane and the open page (COMPOSITOR.md "The flight, prerendered") against where it goes — each part's speed then (a display frame), the spiral's pivot term, the fade's end, and the frames since.
 #[derive(Clone, Copy)]
 struct Flight {
     off: [f64; 5],
     vel: [f64; 5],
+    spiral: camera::Spiral,
     fade_to: f64,
     t: i32,
 }
@@ -867,11 +865,6 @@ struct Cam {
 }
 /// The zoom's one fixed point: on release the world is rescaled so the camera's zoom is exactly this (one world unit = one pixel) and every position and radius absorbs the factor — the integers never walk toward an extreme (owner, 2026-10-23: "rescale upon release so we never accidentally hit infinities"). The limits are all relative (`Map::zoom_limits`, `Map::radius_limits`).
 const Z_ONE: i64 = 1 << 16;
-/// The deck swipe's turn search (`Map::deck_turned`): turns sampled across a half turn, then golden-section steps between the best one's neighbours (each step keeps 0.618 of the bracket: 2⁵ steps take the two samples either side of the best, under six degrees, to about a millionth of one).
-const TURN_SAMPLES: usize = 1 << 6;
-const TURN_REFINE: usize = 1 << 5;
-/// The zoom gain (natural logarithm) at which deck's fit turns half of the way to its best turn: an eighth, about 13% larger; under half of it (6%) the turn is a sixteenth of the way or less, past twice it nearly all (`Map::deck_turned`).
-const TURN_GAIN: f64 = 1. / ((1 << 3) as f64);
 /// The circles together may not shrink below this fraction of the screen's area (1/256), nor the smallest circle grow past the screen; the largest and smallest circle may not differ by more than this in area (256×: 16× in radius).
 const AREA_FRACTION: i64 = 256;
 const RADIUS_RATIO: i64 = 16;
@@ -2681,93 +2674,40 @@ impl Map {
         call(self.display, &m, &mut r);
     }
 
-    /// The camera that shows every circle with air around them, never closer than one world unit to a pixel: every circle inside the screen's width and the big circle (`active_circle`) together, so none lands past an edge or under the console in a top corner (owner, 2026-11-08: "the fit doesn't fit to screen extents anded with the big circle"). The turn is kept; the circles' bounds are taken as the screen will turn them, their middle put on the big circle's centre, and the zoom is the largest at which each circle passes both tests, with no margin.
+    /// The camera that shows every circle with air around them, never closer than one world unit to a pixel: every circle inside the screen's width and the big circle (`active_circle`) together, so none lands past an edge or under the console in a top corner (owner, 2026-11-08: "the fit doesn't fit to screen extents anded with the big circle"). The turn is kept; the zoom is the largest at which every circle passes both tests, with no margin, about the best centre for them (`camera::fit_at`), put on the big circle's centre.
     fn deck_fit(&self) -> Cam {
         self.deck_fit_at(self.cam.c, self.cam.s).0
     }
 
-    /// The deck swipe's camera (owner, 2026-11-11: deck's swipe flies out "to fit every circle" and "let's rotate it to find the most zoom we can too so it spins into place"): every circle in view as `deck_fit` fits them, at the turn that lets them be largest. The fit's zoom is a function of the turn with period a half turn (turning by π mirrors the circles through the fit's middle, which fits alike), continuous and piecewise smooth (the fit is the least of each circle's two room ratios). A bounded search, no timer: `TURN_SAMPLES` turns across the half turn centred on the camera's own (so the answer is the nearer of each pair a half turn apart, and the flight spins the short way), then golden-section steps inside the best sample's neighbours. Where the zoom limit caps every turn alike (a few small circles), the camera keeps its own turn: nothing to gain by spinning; and where the best turn gains little, it turns little (owner, 2026-11-12), the part of the way smooth in the gain (`TURN_GAIN`). Also the gain (the natural logarithm of the zoom gained) and the turn taken, in radians, for the console.
+    /// The deck swipe's camera (owner, 2026-11-11: deck's swipe flies out "to fit every circle" and "let's rotate it to find the most zoom we can too so it spins into place"): every circle in view as `deck_fit` fits them, at the turn that lets them be largest (`camera::best_turn`); of turns that fit alike, the nearest to the camera's own, so where nothing is to gain it keeps its turn. Where the zoom limit caps every turn alike (a few small circles), the camera keeps its own turn too: the limit is a soft minimum in the comparison, z / (1 + (z / limit)⁸)^(1/8), so a turn that only gains past it gains nothing.
+    /// It lands on that best fit exactly (owner, 2026-11-15: "The circle rotate to fit isn't perfect. it's close but it's not correct."): from 2026-11-12 the camera turned only x⁴ / (1 + x⁴) of the way, x the gain over an eighth, which left it short of the best fit by 3% of the zoom on average over random layouts and up to 16% (tools/deck-fit).
+    /// Also the gain (the natural logarithm of the zoom gained against the camera's own turn) and the turn taken, in radians, for the console.
     fn deck_turned(&self) -> (Cam, f64, f64) {
         let a0 = libm::atan2(self.cam.s as f64, self.cam.c as f64);
-        let half = core::f64::consts::PI;
         let turn = |a: f64| (libm::round(libm::cos(a) * ONE as f64) as i64, libm::round(libm::sin(a) * ONE as f64) as i64);
-        let fit = |a: f64| { let (c, s) = turn(a); self.deck_fit_at(c, s).1 };
-        let step = half / TURN_SAMPLES as f64;
-        let (mut best, mut best_z) = (a0, fit(a0));
-        for j in 0..TURN_SAMPLES {
-            let a = a0 - half * 0.5 + step * (j as f64 + 0.5);
-            let z = fit(a);
-            if z > best_z {
-                (best, best_z) = (a, z);
-            }
-        }
-        // Golden-section search on [best − step, best + step]: the fit is unimodal at that scale (each sample is a 64th of a half turn, under three degrees).
-        let g = (libm::sqrt(5.) - 1.) * 0.5;
-        let (mut lo, mut hi) = (best - step, best + step);
-        let (mut p, mut q) = (hi - g * (hi - lo), lo + g * (hi - lo));
-        let (mut zp, mut zq) = (fit(p), fit(q));
-        for _ in 0..TURN_REFINE {
-            if zp < zq {
-                lo = p;
-                p = q;
-                zp = zq;
-                q = lo + g * (hi - lo);
-                zq = fit(q);
-            } else {
-                hi = q;
-                q = p;
-                zq = zp;
-                p = hi - g * (hi - lo);
-                zp = fit(p);
-            }
-        }
-        let (a, z) = if zp > zq { (p, zp) } else { (q, zq) };
-        let (best, best_z) = if z > best_z { (a, z) } else { (best, best_z) };
-        // What the turn gains: the zoom the camera may reach at the best turn against at its own, as a natural logarithm (a turn that only gains past the zoom limit gains nothing). The limit as a soft minimum, z / (1 + (z / limit)⁸)^(1/8): the fit's zoom below the limit, the limit above it, C∞ between, so the gain is smooth in the circles' places as the turn it sets is drawn. Never below zero: the camera's own turn is the search's first candidate.
+        // Each turn's fit as the glass shows it: a Q14 turn a hair off unit length scales the circles by its length (the display turns with it as it is), and the fit's zoom by its inverse, a sawtooth of 4 parts in 10⁵ across the turns that the search would chase.
+        let fit = |a: f64| { let (c, s) = turn(a); self.deck_fit_at(c, s).1 * libm::hypot(c as f64, s as f64) / ONE as f64 };
         let (_, hi_z) = self.zoom_limits();
         let hi = hi_z as f64;
         let reach = |z: f64| { let a = z / hi; let a2 = a * a; let a4 = a2 * a2; z / libm::pow(1. + a4 * a4, 1. / ((1 << 3) as f64)) };
-        let gain = libm::log(reach(best_z) / reach(fit(a0)));
-        // How much of the way the camera turns (owner, 2026-11-12, on the 8a: a 32 degree spin for a fit that gained little; "it changes orientation instantly on occasion"): x⁴ / (1 + x⁴) of the gain against `TURN_GAIN`, C∞, nothing for a gain far under it, half at it, nearly all of the way past twice it. A partial turn still fits every circle (`deck_fit_at` at that turn), only not as large.
-        let x = gain / TURN_GAIN;
-        let x4 = x * x * x * x;
-        let part = x4 / (1. + x4);
-        let a = a0 + part * (best - a0);
+        let (a, z, _) = camera::best_turn(a0, &fit, &reach);
+        let gain = libm::log(reach(z) / reach(fit(a0)));
         let (c, s) = turn(a);
         (self.deck_fit_at(c, s).0, gain, a - a0)
     }
 
     /// `deck_fit` at the turn (c, s), Q14: the camera, and the fit's own zoom before the zoom limits hold it (what the turn is chosen by).
+    /// The circles as the display draws them: its scene holds whole world units (`send_scene`), so the fit takes the same, and the outermost circle touches its edge on the glass, not a world unit off it.
     fn deck_fit_at(&self, c: i64, s: i64) -> (Cam, f64) {
-        let (cc, ss) = (c, s);
-        let (c, s, one) = (c as f64, s as f64, ONE as f64);
-        // A world offset (×256) turned as `Cam::screen` turns it.
-        let turn = |x: f64, y: f64| ((c * x - s * y) / one, (s * x + c * y) / one);
-        let (mut u0, mut v0, mut u1, mut v1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        let mut discs = [(0f64, 0f64, 0f64); camera::MAX];
         for i in 0..self.n {
-            let (u, v) = turn(self.xs[i] as f64, self.ys[i] as f64);
-            let r = (self.rs[i] << 8) as f64;
-            u0 = u0.min(u - r);
-            v0 = v0.min(v - r);
-            u1 = u1.max(u + r);
-            v1 = v1.max(v + r);
+            discs[i] = (((self.xs[i] >> 8) << 8) as f64, ((self.ys[i] >> 8) << 8) as f64, (self.rs[i] << 8) as f64);
         }
-        let (um, vm) = ((u0 + u1) * 0.5, (v0 + v1) * 0.5);
-        // The middle back into the world: the turn undone (its transpose).
-        let (wx, wy) = ((c * um + s * vm) / one, (c * vm - s * um) / one);
         let (_, ay, ar) = self.arrived();
-        let (half_w, ar) = (self.w as f64 * 0.5, ar as f64);
-        // The zoom (Q16 pixels a world unit; a world offset ×256 is (d / 256) · (z / 2¹⁶) pixels): each circle's farthest reach across, |du| + r, within the half width, and its farthest reach from the big circle's centre, √(du² + dv²) + r, within its radius.
-        // No margin (owner, 2026-11-08: "No margins."): the outermost circle touches the edge it meets.
-        let room = (1u64 << 24) as f64;
-        let mut z = f64::MAX;
-        for i in 0..self.n {
-            let (u, v) = turn(self.xs[i] as f64, self.ys[i] as f64);
-            let (du, dv, r) = (u - um, v - vm, (self.rs[i] << 8) as f64);
-            z = z.min(room * half_w / (du.abs() + r)).min(room * ar / (libm::sqrt(du * du + dv * dv) + r));
-        }
+        let room = camera::Room { half_w: self.w as f64 * 0.5, radius: ar as f64 };
+        let (wx, wy, z) = camera::fit_at(&discs[..self.n], c as f64 / ONE as f64, s as f64 / ONE as f64, room);
         let (lo, hi) = self.zoom_limits();
-        let mut cam = Cam { x: wx as i64, y: wy as i64, z: (z as i64).clamp(lo, hi), c: cc, s: ss };
+        let mut cam = Cam { x: libm::round(wx) as i64, y: libm::round(wy) as i64, z: (z as i64).clamp(lo, hi), c, s };
         // The camera's centre is the panel's: it stands off the fit's middle by the big circle's offset from the panel's centre, as `at` does.
         let (dx, dy) = cam.delta(0, self.h / 2 - ay);
         cam.x += dx;
@@ -2786,9 +2726,15 @@ impl Map {
     }
 
     /// Go to `to`: the camera flies there a display frame at a time (`step_cam`), each part of it on the critically damped spring (`spring`) in the space it looks even in (owner, 2026-11-05: the tap's flight follows the settings' snap; 2026-11-06: eased, as the pages are). From rest it eases in; a new target mid-flight keeps the speed the camera has, so a second tap turns the flight without a jolt.
+    /// The zoom and the turn spring together about the one screen point the camera now and the target show alike (`camera::Spiral`; owner, 2026-11-15: "one motion ... both at same rate"): from rest everything on the glass turns and grows about that point, which stays put.
     fn fly(&mut self, to: Cam) {
         let mut vel: [f64; 5] = match (self.target, self.flight) {
-            (Some(_), Some(f)) => core::array::from_fn(|i| spring(f.off[i], f.vel[i], f.t).1),
+            (Some(_), Some(f)) => {
+                // The camera's speed now: the zoom's, the turn's and the fade's on their springs, the centre's the old pivot point's plus its pivot term's.
+                let p: [(f64, f64); 5] = core::array::from_fn(|i| spring(f.off[i], f.vel[i], f.t));
+                let (_, cv) = f.spiral.centre(p[0], p[1], p[2], p[3]);
+                [cv.0, cv.1, p[2].1, p[3].1, p[4].1]
+            }
             _ => [0.; 5],
         };
         let (c, s) = (self.cam.c as f64, self.cam.s as f64);
@@ -2803,8 +2749,11 @@ impl Map {
                 0.
             }
         };
-        let off = [(self.cam.x - to.x) as f64, (self.cam.y - to.y) as f64, libm::log(self.cam.z as f64 / to.z as f64), libm::atan2(tc * s - ts * c, tc * c + ts * s), self.fade - fade_to];
-        self.flight = Some(Flight { off, vel, fade_to, t: 0 });
+        let mut off = [(self.cam.x - to.x) as f64, (self.cam.y - to.y) as f64, libm::log(self.cam.z as f64 / to.z as f64), libm::atan2(tc * s - ts * c, tc * c + ts * s), self.fade - fade_to];
+        // The centre's part becomes the pivot point's: its offset nought from rest, its speed the camera's less the pivot term's.
+        let (spiral, po, pv) = camera::Spiral::start((off[0], off[1]), (vel[0], vel[1]), off[2], off[3], vel[2], vel[3]);
+        (off[0], off[1], vel[0], vel[1]) = (po.0, po.1, pv.0, pv.1);
+        self.flight = Some(Flight { off, vel, spiral, fade_to, t: 0 });
         self.target = Some(to);
         self.settling = true;
         self.frame_seen = None;
@@ -2865,11 +2814,14 @@ impl Map {
         console(self.grants, l.as_str().as_bytes());
     }
 
-    /// One display frame of the camera's flight to `target`: each part where its spring has it now — the centre at its world offset, the zoom at the target's times e to the logarithm's offset (a circle grows by smooth factors), the turn at the target's direction turned by the angle's. Landed, exactly on the target, once every part and its speed are under half a pixel on the screen; then, leaving, the view is the plane again. Returns whether it is still flying.
+    /// One display frame of the camera's flight to `target`: each part where its spring has it now — the centre at the pivot point's world offset plus the pivot term (`camera::Spiral`), the zoom at the target's times e to the logarithm's offset (a circle grows by smooth factors), the turn at the target's direction turned by the angle's. Landed, exactly on the target, once every part and its speed are under half a pixel on the screen; then, leaving, the view is the plane again. Returns whether it is still flying.
     fn step_cam(&mut self) -> bool {
         let (Some(t), Some(mut f)) = (self.target, self.flight) else { return false };
         f.t += 1;
-        let p: [(f64, f64); 5] = core::array::from_fn(|i| spring(f.off[i], f.vel[i], f.t));
+        let mut p: [(f64, f64); 5] = core::array::from_fn(|i| spring(f.off[i], f.vel[i], f.t));
+        // The centre's offset and speed, pivot term and all, in the pivot point's place from here on.
+        let (co, cv) = f.spiral.centre(p[0], p[1], p[2], p[3]);
+        (p[0], p[1]) = ((co.0, cv.0), (co.1, cv.1));
         // The fade: from rest the spring never passes its end, and a flight turned round starts it with a speed under ω times its offset (each step keeps that so), so it stays between the plane and the page.
         self.fade = f.fade_to + p[4].0;
         let z = t.z as f64 * libm::exp(p[2].0);
@@ -4940,10 +4892,21 @@ impl Map {
             self.back = None;
             self.leaving = true;
         }
+        let t0 = now();
         let (to, gain, turned) = self.deck_turned();
+        let us = ferros_sys::us_since(t0);
         let mut l = Line::new();
-        let _ = write!(l, "map: deck: the best turn gains A#{} per mille of zoom; turned A#{} mrad\n", libm::round((libm::exp(gain) - 1.) * 1000.) as i64, libm::round(turned * 1000.) as i64);
+        let _ = write!(l, "map: deck: the best turn gains A#{} per mille of zoom; turned A#{} mrad; landing at x A#{} y A#{} zoom G#{:X} turn A#{} A#{} (searched in A#{} us)\n", libm::round((libm::exp(gain) - 1.) * 1000.) as i64, libm::round(turned * 1000.) as i64, to.x, to.y, to.z, to.c, to.s, us);
         console(self.grants, l.as_str().as_bytes());
+        // Development builds: the circles fitted (world ×256 x and y, the radius) and the camera they were fitted from, so a swipe can be replayed on the host (tools/deck-fit).
+        if DEV {
+            let mut s = alloc::format!("map: deck: from x A#{} y A#{} zoom G#{:X} turn A#{} A#{}; circles", self.cam.x, self.cam.y, self.cam.z, self.cam.c, self.cam.s);
+            for i in 0..self.n {
+                let _ = core::fmt::Write::write_fmt(&mut s, format_args!(" A#{},A#{},A#{}", self.xs[i], self.ys[i], self.rs[i]));
+            }
+            s.push('\n');
+            console(self.grants, s.as_bytes());
+        }
         self.fly(to);
         self.draw();
     }

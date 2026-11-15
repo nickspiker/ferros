@@ -1,0 +1,12 @@
+[package]
+name = "deck-fit"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "The map's camera geometry on the host (payloads/map/src/camera.rs, the same file): the deck's fit against a brute-force search, the swipe's turn against a dense one, the circles on the glass thru the display's own integer transform, and a flight's spiral holding its pivot still."
+
+# Standalone, outside the ferros workspace's lock.
+[workspace]
+
+[dependencies]
+libm = "0.2"
